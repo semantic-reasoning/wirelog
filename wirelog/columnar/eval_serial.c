@@ -226,7 +226,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             int rc = col_eval_relation_plan(rp, &stack, sess);
             if (rc != 0) {
                 int drain_rc = eval_stack_drain_to_session(&stack, sess);
-                if (rc == 0 && drain_rc != 0)
+                if (drain_rc != 0)
                     rc = drain_rc;
                 return rc;
             }
@@ -240,7 +240,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 int drain_rc = eval_stack_drain_to_session(&stack, sess);
                 int cleanup_rc = dispose_rc != 0 ? dispose_rc : drain_rc;
                 int primary_rc = ENOTSUP;
-                if (primary_rc == 0 && cleanup_rc != 0)
+                if (cleanup_rc != 0)
                     primary_rc = cleanup_rc;
                 return primary_rc;
             }
@@ -596,7 +596,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 int rc = col_eval_relation_plan(rp, &stack, sess);
                 if (rc != 0) {
                     int drain_rc = eval_stack_drain_to_session(&stack, sess);
-                    if (rc == 0 && drain_rc != 0)
+                    if (drain_rc != 0)
                         rc = drain_rc;
                     outer_rc = rc;
                     goto stride_error;
@@ -611,7 +611,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                     int drain_rc = eval_stack_drain_to_session(&stack, sess);
                     int cleanup_rc = dispose_rc != 0 ? dispose_rc : drain_rc;
                     outer_rc = ENOTSUP;
-                    if (outer_rc == 0 && cleanup_rc != 0)
+                    if (cleanup_rc != 0)
                         outer_rc = cleanup_rc;
                     goto stride_error;
                 }

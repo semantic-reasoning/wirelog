@@ -374,14 +374,16 @@ wl_columnar_deferred_relation_eligible(const col_rel_t *rel)
     if (!rel || rel->pool_owned || rel->arena_owned
         || col_rel_storage_owner_resolve(rel, &owner) != 0)
         return false;
-    return owner != NULL && !owner->pool_owned && !owner->arena_owned;
+    /* A shared-view alias is borrowed storage, not an independently owned
+     * relation.  Its owner may outlive the evaluator, but destroying the
+     * alias itself is not a valid deferred cleanup operation. */
+    return owner == rel && !owner->pool_owned && !owner->arena_owned;
 }
 
 int
 wl_columnar_session_defer_relation(wl_col_session_t *sess, col_rel_t *rel)
 {
-    wl_columnar_deferred_relation_t *entry;
-    wl_columnar_deferred_relation_t **tail;
+    col_rel_t **tail;
 
     if (!sess || !rel)
         return EINVAL;
@@ -390,18 +392,18 @@ wl_columnar_session_defer_relation(wl_col_session_t *sess, col_rel_t *rel)
      * making a deferred pointer outlive that allocator. */
     if (!wl_columnar_deferred_relation_eligible(rel))
         return EINVAL;
-    for (entry = sess->deferred_relations; entry; entry = entry->next) {
-        if (entry->rel == rel)
-            return 0;
+    if (rel->deferred_relation_session) {
+        /* The relation is already owned by this registry, so repeated
+        * cleanup attempts are idempotent.  A relation cannot safely be
+        * adopted by a second session without first being unlinked. */
+        return rel->deferred_relation_session == sess ? 0 : EBUSY;
     }
-    entry = (wl_columnar_deferred_relation_t *)calloc(1, sizeof(*entry));
-    if (!entry)
-        return ENOMEM;
-    entry->rel = rel;
+    rel->deferred_relation_next = NULL;
     tail = &sess->deferred_relations;
     while (*tail)
-        tail = &(*tail)->next;
-    *tail = entry;
+        tail = &(*tail)->deferred_relation_next;
+    *tail = rel;
+    rel->deferred_relation_session = sess;
     sess->deferred_relation_count++;
     return 0;
 }
@@ -409,35 +411,79 @@ wl_columnar_session_defer_relation(wl_col_session_t *sess, col_rel_t *rel)
 int
 wl_columnar_session_retry_deferred(wl_col_session_t *sess)
 {
-    wl_columnar_deferred_relation_t **slot;
+    col_rel_t **slot;
     int first_rc = 0;
 
     if (!sess)
         return EINVAL;
     slot = &sess->deferred_relations;
     while (*slot) {
-        wl_columnar_deferred_relation_t *entry = *slot;
+        col_rel_t *rel = *slot;
+        col_rel_t *next = rel->deferred_relation_next;
         int rc;
 
-        if (!wl_columnar_deferred_relation_eligible(entry->rel)) {
+        if (rel->deferred_relation_session != sess) {
             if (first_rc == 0)
-                first_rc = EINVAL;
-            slot = &entry->next;
+                first_rc = EFAULT;
+            slot = &rel->deferred_relation_next;
             continue;
         }
-        rc = col_rel_destroy_checked(entry->rel);
+        if (!wl_columnar_deferred_relation_eligible(rel)) {
+            if (first_rc == 0)
+                first_rc = EINVAL;
+            slot = &rel->deferred_relation_next;
+            continue;
+        }
+        rc = col_rel_destroy_checked(rel);
         if (rc == 0) {
-            *slot = entry->next;
-            free(entry);
+            *slot = next;
             assert(sess->deferred_relation_count > 0);
             sess->deferred_relation_count--;
             continue;
         }
         if (first_rc == 0)
             first_rc = rc;
-        slot = &entry->next;
+        slot = &rel->deferred_relation_next;
     }
     return first_rc;
+}
+
+int
+wl_columnar_session_transfer_deferred(wl_col_session_t *from,
+    wl_col_session_t *to)
+{
+    if (!from || !to || from == to)
+        return EINVAL;
+
+    while (from->deferred_relations) {
+        col_rel_t *rel = from->deferred_relations;
+        col_rel_t *next = rel->deferred_relation_next;
+        int rc;
+
+        if (rel->deferred_relation_session != from)
+            return EFAULT;
+        from->deferred_relations = next;
+        rel->deferred_relation_next = NULL;
+        rel->deferred_relation_session = NULL;
+        assert(from->deferred_relation_count > 0);
+        from->deferred_relation_count--;
+
+        rc = wl_columnar_session_defer_relation(to, rel);
+        if (rc != 0) {
+            /* The destination may already own this relation after a
+             * previous cleanup path.  Treat that as an idempotent transfer;
+             * retaining a second source link would violate single ownership.
+             */
+            if (rc == EBUSY && rel->deferred_relation_session == to)
+                continue;
+            rel->deferred_relation_next = from->deferred_relations;
+            rel->deferred_relation_session = from;
+            from->deferred_relations = rel;
+            from->deferred_relation_count++;
+            return rc;
+        }
+    }
+    return 0;
 }
 
 /* Row removal rewrites the canonical relation storage in place.  Admit the
@@ -545,6 +591,8 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
             return ENOMEM;
         *heap = *r;
         heap->pool_owned = false;
+        heap->deferred_relation_next = NULL;
+        heap->deferred_relation_session = NULL;
         heap->storage_owner = heap;
         heap->storage_owner_identity = heap->relation_identity;
         heap->storage_owner_generation = heap->storage_generation;
@@ -624,6 +672,8 @@ busy:
     if (pool_src) {
         *pool_src = *r;
         pool_src->pool_owned = true;
+        pool_src->deferred_relation_next = NULL;
+        pool_src->deferred_relation_session = NULL;
         pool_src->storage_owner = pool_src;
         pool_src->storage_owner_identity = pool_src->relation_identity;
         pool_src->storage_owner_generation = pool_src->storage_generation;
@@ -646,6 +696,8 @@ oom:
     if (pool_src) {
         *pool_src = *r;
         pool_src->pool_owned = true;
+        pool_src->deferred_relation_next = NULL;
+        pool_src->deferred_relation_session = NULL;
         pool_src->storage_owner = pool_src;
         pool_src->storage_owner_identity = pool_src->relation_identity;
         pool_src->storage_owner_generation = pool_src->storage_generation;
@@ -2073,7 +2125,15 @@ col_session_destroy(wl_session_t *session)
     wl_columnar_session_source_leases_release_all(sess);
     {
         int deferred_rc = wl_columnar_session_retry_deferred(sess);
-        assert(deferred_rc == 0);
+        if (deferred_rc != 0) {
+            /* A coordinator-owned deferred relation has no longer-lived
+             * owner.  Do not silently zero the session and leak it in NDEBUG
+             * builds if the lifecycle invariant is violated. */
+            fprintf(stderr,
+                "wirelog: coordinator deferred cleanup failed: %d\n",
+                deferred_rc);
+            abort();
+        }
     }
     session_destroy_relation_array(sess->rels, sess->nrels);
     free((void *)sess->rels);
@@ -2457,7 +2517,23 @@ col_worker_session_destroy(wl_col_session_t *worker)
     wl_columnar_session_source_leases_release_all(worker);
     {
         int deferred_rc = wl_columnar_session_retry_deferred(worker);
-        assert(deferred_rc == 0);
+        if (deferred_rc != 0 && worker->coordinator) {
+            int transfer_rc = wl_columnar_session_transfer_deferred(worker,
+                    worker->coordinator);
+            if (transfer_rc != 0) {
+                fprintf(stderr,
+                    "wirelog: worker deferred transfer failed: %d\n",
+                    transfer_rc);
+                abort();
+            }
+        } else {
+            if (deferred_rc != 0) {
+                fprintf(stderr,
+                    "wirelog: worker deferred cleanup failed: %d\n",
+                    deferred_rc);
+                abort();
+            }
+        }
     }
 
     /* Free owned relations (partition data) */

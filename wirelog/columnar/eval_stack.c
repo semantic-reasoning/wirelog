@@ -8,6 +8,9 @@
 
 #include "columnar/internal.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+
 void
 eval_stack_init(eval_stack_t *s)
 {
@@ -201,12 +204,22 @@ eval_stack_drain_to_session(eval_stack_t *s, wl_col_session_t *sess)
         if (entry->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION
             || !entry->owned || !entry->rel)
             return EFAULT;
-        if (!wl_columnar_deferred_relation_eligible(entry->rel))
-            return EINVAL;
+        if (!wl_columnar_deferred_relation_eligible(entry->rel)) {
+            fprintf(stderr,
+                "wirelog: unsafe evaluator deferred relation\n");
+            abort();
+        }
 
         rc = wl_columnar_session_defer_relation(sess, entry->rel);
-        if (rc != 0)
-            return rc;
+        if (rc != 0) {
+            /* The relation is still owned by this stack.  Returning would
+            * let the evaluator frame disappear and leak it; admission is
+            * allocation-free, so any failure is a lifecycle invariant. */
+            fprintf(stderr,
+                "wirelog: evaluator deferred relation admission failed: %d\n",
+                rc);
+            abort();
+        }
         free(entry->seg_boundaries);
         memset(entry, 0, sizeof(*entry));
         s->top--;

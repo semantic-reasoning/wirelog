@@ -3651,6 +3651,8 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     uint64_t ledger_before;
     uint64_t ledger_ts_bytes;
     uint64_t gate_state;
+    col_rel_t *deferred_relation_next;
+    struct wl_col_session_t *deferred_relation_session;
     bool has_new_reservation;
     int release_rc;
 
@@ -3684,6 +3686,8 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     storage_generation = old.storage_generation;
     ledger_before = col_rel_owned_ledger_bytes(&old);
     ledger_ts_bytes = old.ledger_ts_bytes;
+    deferred_relation_next = old.deferred_relation_next;
+    deferred_relation_session = old.deferred_relation_session;
     gate_state = atomic_load_explicit(&old.source_access.state,
             memory_order_acquire);
 
@@ -3711,6 +3715,8 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
         dst->retained_reserved_bytes = replacement->reserved_bytes;
     }
     dst->ledger_ts_bytes = ledger_ts_bytes;
+    dst->deferred_relation_next = deferred_relation_next;
+    dst->deferred_relation_session = deferred_relation_session;
     dst->storage_owner = dst;
     dst->storage_owner_identity = identity;
     dst->storage_alias_borrows = 0;

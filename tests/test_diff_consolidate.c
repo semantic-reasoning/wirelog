@@ -736,6 +736,98 @@ test_reader_admission_rejects_deferred_unsafe_storage(void)
     PASS;
 }
 
+static void
+test_intrusive_deferred_registry(void)
+{
+    TEST("deferred registry is intrusive, idempotent, and single-owner");
+    wl_col_session_t *sess = make_mock_session();
+    wl_col_session_t *other = make_mock_session();
+    col_rel_t *first = col_rel_new_auto("deferred-first", 1);
+    col_rel_t *second = col_rel_new_auto("deferred-second", 1);
+    wl_columnar_source_access_reader_t first_reader = { 0 };
+    wl_columnar_source_access_reader_t second_reader = { 0 };
+
+    ASSERT_TRUE(sess != NULL && other != NULL && first != NULL
+        && second != NULL, "intrusive registry fixture allocation");
+    ASSERT_TRUE(col_rel_source_reader_acquire(first, &first_reader) == 0,
+        "first deferred reader acquisition");
+    ASSERT_TRUE(col_rel_source_reader_acquire(second, &second_reader) == 0,
+        "second deferred reader acquisition");
+    ASSERT_TRUE(wl_columnar_session_defer_relation(sess, first) == 0,
+        "first relation deferred without an allocation");
+    ASSERT_TRUE(first->deferred_relation_session == sess
+        && sess->deferred_relations == first,
+        "first relation records its intrusive owner");
+    ASSERT_TRUE(wl_columnar_session_defer_relation(sess, first) == 0
+        && sess->deferred_relation_count == 1,
+        "duplicate deferral is idempotent");
+    ASSERT_TRUE(wl_columnar_session_defer_relation(other, first) == EBUSY,
+        "relation cannot be deferred into two sessions");
+    ASSERT_TRUE(wl_columnar_session_defer_relation(sess, second) == 0
+        && sess->deferred_relation_count == 2,
+        "second relation joins the intrusive registry");
+    ASSERT_TRUE(sess->deferred_relations == first
+        && first->deferred_relation_next == second,
+        "multiple relations form one intrusive chain");
+
+    {
+        col_rel_t *transferred = col_rel_new_auto("deferred-transfer", 1);
+        wl_columnar_source_access_reader_t transferred_reader = { 0 };
+        ASSERT_TRUE(transferred != NULL
+            && col_rel_source_reader_acquire(transferred,
+            &transferred_reader) == 0,
+            "transfer relation fixture");
+        ASSERT_TRUE(wl_columnar_session_defer_relation(sess, transferred)
+            == 0, "transfer relation deferred by source session");
+        ASSERT_TRUE(wl_columnar_session_transfer_deferred(sess, other) == 0
+            && transferred->deferred_relation_session == other
+            && sess->deferred_relation_count == 0
+            && other->deferred_relation_count == 3,
+            "deferred relations transfer ownership between sessions");
+        ASSERT_TRUE(col_rel_source_reader_release(&transferred_reader) == 0
+            && wl_columnar_session_retry_deferred(other) == EBUSY
+            && other->deferred_relation_count == 2,
+            "transferred relation is retried by destination session");
+    }
+
+    ASSERT_TRUE(col_rel_source_reader_release(&first_reader) == 0,
+        "first deferred reader release");
+    ASSERT_TRUE(wl_columnar_session_retry_deferred(other) == EBUSY
+        && other->deferred_relation_count == 1,
+        "retry removes only the relation whose reader is released");
+    ASSERT_TRUE(col_rel_source_reader_release(&second_reader) == 0,
+        "second deferred reader release");
+    ASSERT_TRUE(wl_columnar_session_retry_deferred(other) == 0
+        && other->deferred_relation_count == 0
+        && other->deferred_relations == NULL,
+        "retry drains the remaining relation");
+    {
+        delta_pool_t *pool = delta_pool_create(4, sizeof(col_rel_t), 4096);
+        wl_arena_t *arena = wl_arena_create(64 * 1024);
+        col_rel_t *pool_rel;
+        col_rel_t *arena_rel;
+
+        ASSERT_TRUE(pool != NULL && arena != NULL,
+            "unsafe deferred registry fixture allocation");
+        pool_rel = col_rel_pool_new_auto(pool, NULL, "pool-deferred", 1);
+        arena_rel = col_rel_pool_new_auto(pool, arena, "arena-deferred", 1);
+        ASSERT_TRUE(pool_rel != NULL && arena_rel != NULL,
+            "unsafe deferred relation allocation");
+        ASSERT_TRUE(wl_columnar_session_defer_relation(sess, pool_rel)
+            == EINVAL, "pool relation is rejected by deferred registry");
+        ASSERT_TRUE(wl_columnar_session_defer_relation(sess, arena_rel)
+            == EINVAL, "arena relation is rejected by deferred registry");
+        ASSERT_TRUE(col_rel_destroy_checked(pool_rel) == 0
+            && col_rel_destroy_checked(arena_rel) == 0,
+            "unsafe deferred relations clean up normally");
+        delta_pool_destroy(pool);
+        wl_arena_free(arena);
+    }
+    destroy_mock_session(other);
+    destroy_mock_session(sess);
+    PASS;
+}
+
 int
 main(void)
 {
@@ -745,6 +837,7 @@ main(void)
     test_blocked_sort_does_not_dedup_unsorted();
     test_eval_entry_dispose_retains_busy_relation();
     test_reader_admission_rejects_deferred_unsafe_storage();
+    test_intrusive_deferred_registry();
     test_single_row();
     test_already_sorted_unique();
     test_unsorted_full_sort();

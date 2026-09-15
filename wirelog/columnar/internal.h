@@ -519,6 +519,12 @@ typedef struct col_rel {
      * checked destruction.  Production read paths are wired in later
      * lifecycle units. */
     wl_columnar_source_access_gate_t source_access;
+
+    /* Intrusive session-owned deferred-destruction registry link.  A relation
+     * may be present in at most one session registry at a time; the owner
+     * pointer makes that invariant explicit even for a one-element list. */
+    struct col_rel *deferred_relation_next;
+    struct wl_col_session_t *deferred_relation_session;
 } col_rel_t;
 
 /* A private, fully staged publication for a canonical relation.  The staged
@@ -1524,14 +1530,6 @@ typedef struct wl_columnar_session_source_lease {
     struct wl_columnar_session_source_lease *next;
 } wl_columnar_session_source_lease_t;
 
-/* Owned relations whose checked destruction was refused by a live reader.
- * These entries must point only at heap-stable relation/storage objects: a
- * worker or session may outlive the evaluator stack that discovered them. */
-typedef struct wl_columnar_deferred_relation {
-    col_rel_t *rel;
-    struct wl_columnar_deferred_relation *next;
-} wl_columnar_deferred_relation_t;
-
 typedef struct wl_col_session_t {
     wl_session_t base;         /* MUST be first field (vtable dispatch)  */
     /* base.extension_snapshot is borrowed from the coordinator in workers;
@@ -1861,7 +1859,7 @@ typedef struct wl_col_session_t {
      * readers.  Membership is confined to the coordinator thread between
      * worker barriers; worker tasks only read the published relations. */
     wl_columnar_session_source_lease_t *source_leases;
-    wl_columnar_deferred_relation_t *deferred_relations;
+    col_rel_t *deferred_relations;
     uint32_t deferred_relation_count;
     /* Exchange operator state (Issue #316): W x W partition buffer matrix.
      * Allocated by coordinator before exchange scatter dispatch.
@@ -2821,6 +2819,9 @@ int
 wl_columnar_session_defer_relation(wl_col_session_t *sess, col_rel_t *rel);
 int
 wl_columnar_session_retry_deferred(wl_col_session_t *sess);
+int
+wl_columnar_session_transfer_deferred(wl_col_session_t *from,
+    wl_col_session_t *to);
 int
 col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess);
 int
