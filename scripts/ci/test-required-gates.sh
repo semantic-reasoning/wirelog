@@ -166,6 +166,16 @@ assert 'release-tag.yml release-perf correctness step sets WIRELOG_PERF_REQUIRE'
 assert 'release-tag.yml hosted timing step sets WIRELOG_PERF_REQUIRE' \
     sets_in_step release-tag.yml 'Run hosted timing evidence (advisory)' WIRELOG_PERF_REQUIRE
 
+candidate_consumer_release_gate() {
+    grep -Fq 'candidate-consumers:' "$root/.github/workflows/release-tag.yml" \
+        && grep -Fq 'run-candidate-consumer-smoke.sh' \
+            "$root/.github/workflows/release-tag.yml" \
+        && ! grep -Eq 'v0\.30|old-ref|upgrade-matrix' \
+            "$root/.github/workflows/release-tag.yml"
+}
+assert 'release workflow has candidate-only consumer gate' \
+    candidate_consumer_release_gate
+
 # release-verification must WAIT ON every verification job, not merely agree
 # with itself about how many there are. Comparing counts caught drift between
 # the `needs:` list and the hardcoded `-eq N`, but not the defect one level up:
