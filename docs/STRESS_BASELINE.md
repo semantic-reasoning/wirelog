@@ -544,14 +544,14 @@ perf hardware and a realistic budget is established.
 
 The `perf` suite is invoked by `.github/workflows/perf-nightly.yml` (via
 `meson test --suite perf`) and by the path-filtered `perf-suite-required.yml`;
-`ci-pr.yml` does NOT pass `--suite perf`. The authoritative timing coverage
-for issue #948 runs in the nightly workflow's `perf-stable` job on a
-`wirelog-perf` self-hosted Linux runner. It uses a trace build for
-`log_perf_gate` and an ERROR-ceiling build for the three evaluator timing
-gates, then verifies both Meson logs. GitHub-hosted runs remain diagnostic
-because they cannot guarantee the `performance` cpufreq governor. The
-release-tier entries (`stress-release` suite) have no automation today;
-release engineers invoke them manually.
+`ci-pr.yml` does NOT pass `--suite perf`. Graph timing remains diagnostic on
+hosted runners because they cannot guarantee the `performance` cpufreq
+governor. DOOP has a separate mandatory hosted execution lane: it runs
+W=8/repeat=5 on the pinned dataset, validates correctness and repetition
+evidence, and retains the host/oracle artifact. Hosted DOOP timing is
+advisory; strict-stable timing requires an independently calibrated runner.
+See `docs/DOOP_PERF_BASELINE.md`. The release-tier entries (`stress-release`
+suite) have no automation today; release engineers invoke them manually.
 
 All entries set `WIRELOG_PERF_GATE=1` in the meson env so the binary
 opts in. Bare invocation (`./test_rotate_latency`) without the env

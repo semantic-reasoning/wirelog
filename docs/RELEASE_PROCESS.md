@@ -315,8 +315,8 @@ SSSP, SG, and Bipartite W=1 sub-ms graph workloads. It is opt-in via
 `WIRELOG_PERF_GATE=1` and is intended for stable perf runners, not normal
 shared local/default runs. It is not a release-blocking check before 0.80.
 
-The authoritative issue #948 job uses two release/perf build directories on
-the `wirelog-perf` self-hosted Linux runner. Configure the trace build with
+The strict authoritative issue #948 timing job, when enabled, uses two
+release/perf build directories on a provisioned Linux runner. Configure the trace build with
 `-Dwirelog_log_max_level=trace` and run `log_perf_gate` there; configure the
 second with `-Dwirelog_log_max_level=error` and run `crdt_perf_gate`,
 `cspa_w1_gate`, and `sub_ms_graph_perf_gate` there. The runner preflight must
@@ -324,11 +324,13 @@ verify CPU 0 is online and its cpufreq governor reads `performance` before
 either build starts. `WIRELOG_PERF_REQUIRE=1` turns any remaining host or
 build misconfiguration from SKIP into FAIL.
 
-GitHub-hosted runners remain diagnostic only: their missing or non-
-`performance` governor intentionally causes the timing gates to SKIP. The
-stable job runs `scripts/ci/check-perf-gate-execution.sh` against both
-`meson-logs/testlog.txt` files, so a green build cannot be mistaken for timing
-coverage.
+GitHub-hosted graph timing remains diagnostic: a missing or non-`performance`
+governor intentionally causes those timing gates to SKIP. DOOP is a separate
+mandatory execution contract for issue #1351: `perf-nightly` runs the pinned
+dataset at W=8/repeat=5 on `ubuntu-latest`, rejects missing or skipped
+correctness evidence, and retains the raw log and host/oracle evidence. Its
+hosted timing is explicitly advisory until a strict-stable calibration exists;
+see `docs/DOOP_PERF_BASELINE.md`.
 
 Current enforcement is correctness sentinels plus median/mean/stdev/CoV
 reporting with a CoV <= 5% noise ceiling.  There is no absolute

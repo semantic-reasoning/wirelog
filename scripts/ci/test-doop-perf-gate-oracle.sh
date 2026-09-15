@@ -36,6 +36,10 @@ done
 printf '%s\n' \
     '#!/usr/bin/env bash' \
     'set -euo pipefail' \
+    'progress=' \
+    'while (($#)); do [[ "$1" == --repeat-progress ]] && progress=$2 && shift; shift; done' \
+    'for n in 1 2 3 4 5; do printf '\''repeat_start\tworkload=doop\trepetition=%s\trepeat=5\tworkers=8\n'\'' "$n" >> "$progress"; printf '\''repeat_complete\tworkload=doop\trepetition=%s\trepeat=5\tworkers=8\tstatus=OK\n'\'' "$n" >> "$progress"; done' \
+    'printf '\''DONE\tworkload=doop\trepeat=5\tworkers=8\tstatus=OK\n'\'' >> "$progress"' \
     'printf '\''doop\tfixture\t35\t8\t5\t1\t1\t1\t1\t%s\t%s\tOK\n'\'' "${FAKE_TUPLES:?}" "${FAKE_ITERS:?}"' \
     > "$bench"
 chmod +x "$bench"
@@ -95,6 +99,10 @@ expect_gate 'stale tuple and iteration sentinels are rejected' 1 \
 expect_gate 'schema 2 tuple, iteration, and files manifest pass' 0 \
     'doop_w8_gate OK: tuples=13828835 iterations=153' \
     WIRELOG_PERF_REQUIRE=1 WL_DOOP_PERF_GATE_TARGET_MS=10 \
+    FAKE_TUPLES=13828835 FAKE_ITERS=153
+expect_gate 'hosted required mode accepts correctness without a stable target' 0 \
+    'timing=advisory mode=required-hosted' \
+    WIRELOG_PERF_REQUIRE=1 WIRELOG_DOOP_PERF_MODE=required-hosted \
     FAKE_TUPLES=13828835 FAKE_ITERS=153
 expect_gate 'missing target fails required mode' 1 \
     'no calibrated 5-repetition W=8 target' \
