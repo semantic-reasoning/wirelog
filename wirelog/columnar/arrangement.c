@@ -2413,7 +2413,8 @@ col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
     e->key_count = key_count;
     e->generation = 1u;
 
-    e->diff_arr = col_diff_arrangement_create(key_cols, key_count, 0);
+    e->diff_arr = col_diff_arrangement_create_with_memory_governor(
+        key_cols, key_count, 0, cs->memory_governor);
     if (!e->diff_arr) {
         free(e->rel_name);
         free(e->key_cols);
@@ -2422,15 +2423,6 @@ col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
     }
     e->diff_arr->source_snapshot = (col_relation_snapshot_t){ 0, 0, 0 };
     col_diff_arrangement_attach_ledger(e->diff_arr, &cs->mem_ledger);
-    if (cs->memory_governor
-        && col_diff_arrangement_attach_memory_governor(e->diff_arr,
-        cs->memory_governor) != 0) {
-        col_diff_arrangement_destroy(e->diff_arr);
-        free(e->rel_name);
-        free(e->key_cols);
-        memset(e, 0, sizeof(*e));
-        return NULL;
-    }
     cs->diff_arr_count++;
     return e->diff_arr;
 }
@@ -2581,19 +2573,11 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
         entry->key_count = key_count;
         entry->generation = 1u;
         entry->transaction_pending = true;
-        entry->diff_arr = col_diff_arrangement_create(key_cols, key_count, 0);
+        entry->diff_arr = col_diff_arrangement_create_with_memory_governor(
+            key_cols, key_count, 0, cs->memory_governor);
         if (!entry->diff_arr) {
             free(entry->rel_name);
             free(entry->key_cols);
-            memset(entry, 0, sizeof(*entry));
-            return ENOMEM;
-        }
-        if (cs->memory_governor
-            && col_diff_arrangement_attach_memory_governor(entry->diff_arr,
-            cs->memory_governor) != 0) {
-            free(entry->rel_name);
-            free(entry->key_cols);
-            col_diff_arrangement_destroy(entry->diff_arr);
             memset(entry, 0, sizeof(*entry));
             return ENOMEM;
         }
@@ -2612,24 +2596,9 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
     txn->entry_index = entry_index;
     txn->entry_generation = txn->entry->generation;
     txn->persistent = *slot;
-    txn->working = col_diff_arrangement_deep_copy(txn->persistent);
+    txn->working = col_diff_arrangement_deep_copy_with_memory_governor(
+        txn->persistent, cs->memory_governor);
     if (!txn->working) {
-        if (txn->pending_entry) {
-            free(entry->rel_name);
-            free(entry->key_cols);
-            col_diff_arrangement_destroy(txn->persistent);
-            memset(entry, 0, sizeof(*entry));
-            cs->diff_arr_count--;
-        } else {
-            entry->transaction_pending = false;
-        }
-        memset(txn, 0, sizeof(*txn));
-        return ENOMEM;
-    }
-    if (cs->memory_governor
-        && col_diff_arrangement_attach_memory_governor(txn->working,
-        cs->memory_governor) != 0) {
-        col_diff_arrangement_destroy(txn->working);
         if (txn->pending_entry) {
             free(entry->rel_name);
             free(entry->key_cols);
