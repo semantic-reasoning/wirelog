@@ -1042,6 +1042,19 @@ test('program_lifetime_selftest', py3,
 # the Windows runner -- so the rule covers every suite.
 sh = find_program('bash', required: false)
 
+if sh.found() and host_machine.system() != 'windows'
+  # Issue #694: deterministic shell self-test for the hosted fuzz shard helper.
+  # It drives the fake target through success, failure, timeout, crash artifact,
+  # path-confinement, and two-shard corpus handoff cases.
+  # The hosted fuzz workflow is Ubuntu-only; Windows native execution is not
+  # covered by this Bash fixture.
+  test('run_hosted_fuzz_shard_selftest', sh,
+       args: [meson.project_source_root() /
+              'scripts/ci/test-run-hosted-fuzz-shard.sh'],
+       suite: ['abi', 'unit'],
+       timeout: 60)
+endif
+
 # Issue #772: release-template gate.  Asserts that the GitHub Releases
 # body for the current tag matches the corresponding CHANGELOG section.
 # SKIPs everywhere in CI today: on PR and main builds HEAD is not a tag,
