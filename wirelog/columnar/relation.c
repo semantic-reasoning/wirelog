@@ -1080,6 +1080,8 @@ col_rel_ledger_release(col_rel_t *r)
 static void
 col_rel_free_contents_impl(col_rel_t *r, bool preserve_access_gates)
 {
+    uint64_t ledger_before;
+
     if (!r)
         return;
     if (r->storage_owner == r
@@ -1089,15 +1091,11 @@ col_rel_free_contents_impl(col_rel_t *r, bool preserve_access_gates)
      * owner itself is not denied destruction here; #1494 wires this status
      * into the synchronous teardown transaction. */
     (void)col_rel_storage_alias_release(r);
-    if (r->memory_governor) {
-        if (r->retained_reserved_bytes > 0)
-            (void)wl_columnar_memory_release(&r->retained_reservation);
-        r->retained_reserved_bytes = 0;
-        wl_columnar_memory_governor_ref_release(r->memory_governor);
-        r->memory_governor = NULL;
-    }
-    /* Release only currently heap-owned, non-borrowed data buffers. */
-    col_rel_ledger_release(r);
+    ledger_before = col_rel_owned_ledger_bytes(r);
+    /* Release only currently heap-owned, non-borrowed data buffers.  The
+     * physical free precedes every accounting/admission decrement so a
+     * concurrent admission cannot reuse credit while these buffers remain
+     * resident. */
     free(r->name);
     if (!r->arena_owned) {
         if (r->col_shared && r->columns) {
@@ -1115,10 +1113,13 @@ col_rel_free_contents_impl(col_rel_t *r, bool preserve_access_gates)
         free((void *)r->columns);
     }
     free(r->col_shared);
+    r->columns = NULL;
+    r->col_shared = NULL;
     col_columns_free(r->retract_backup_columns, r->ncols);
     col_columns_free(r->merge_columns, r->ncols);
     free(r->row_scratch);
     free(r->timestamps);
+    r->timestamps = NULL;
     if (r->col_names) {
         for (uint32_t i = 0; i < r->ncols; i++)
             free(r->col_names[i]);
@@ -1129,6 +1130,14 @@ col_rel_free_contents_impl(col_rel_t *r, bool preserve_access_gates)
     free(r->compound_arity_map);
     if (r->schema_ok)
         ArrowSchemaRelease(&r->schema);
+    col_rel_ledger_reconcile(r, ledger_before);
+    if (r->memory_governor) {
+        if (r->retained_reserved_bytes > 0)
+            (void)wl_columnar_memory_release(&r->retained_reservation);
+        r->retained_reserved_bytes = 0;
+        wl_columnar_memory_governor_ref_release(r->memory_governor);
+        r->memory_governor = NULL;
+    }
     if (preserve_access_gates) {
         /* Checked destruction holds the descriptor writer (and, for roots,
          * the source writer). Keep those terminal states intact while the
@@ -2606,19 +2615,6 @@ col_rel_compact_impl(col_rel_t *r,
 
     if (r->nrows == 0) {
         bool storage_changed = r->columns != NULL || r->timestamps != NULL;
-        col_rel_ledger_release(r);
-        if (r->memory_governor) {
-            /* Empty compaction drops every retained buffer.  Release the
-             * matching admission before allowing a later append to start a
-             * new capacity; otherwise reserve_growth() would compare the
-             * new shape with a stale, larger token. */
-            if (r->retained_reserved_bytes > 0)
-                (void)wl_columnar_memory_release(
-                    &r->retained_reservation);
-            r->retained_reserved_bytes = 0;
-            wl_columnar_memory_reservation_init(
-                &r->retained_reservation);
-        }
         if (!r->arena_owned) {
             if (r->col_shared && r->columns) {
                 /* COW: free only non-shared columns (Issue #396) */
@@ -2643,6 +2639,22 @@ col_rel_compact_impl(col_rel_t *r,
         r->merge_buf_cap = 0;
         free(r->timestamps);
         r->timestamps = NULL;
+        /* Physical storage must be gone before either the ledger or the
+         * retained admission is reduced.  This keeps a concurrent observer
+         * from seeing capacity credit while the old buffers are still live. */
+        col_rel_ledger_reconcile(r, ledger_before);
+        if (r->memory_governor) {
+            /* Empty compaction drops every retained buffer.  Release the
+             * matching admission only after the corresponding storage has
+             * been freed; otherwise a later append could reuse credit while
+             * the old allocation is still resident. */
+            if (r->retained_reserved_bytes > 0)
+                (void)wl_columnar_memory_release(
+                    &r->retained_reservation);
+            r->retained_reserved_bytes = 0;
+            wl_columnar_memory_reservation_init(
+                &r->retained_reservation);
+        }
         r->sorted_nrows = 0;
         r->base_nrows = 0;
         if (storage_changed)
@@ -2710,7 +2722,6 @@ col_rel_compact_impl(col_rel_t *r,
         r->arena_owned = false;
         new_cols = NULL;
         new_ts = NULL;
-        col_rel_ledger_reconcile(r, ledger_before);
         wl_columnar_relation_touch_storage(r);
         {
             col_rel_t old_storage = { 0 };
@@ -2721,6 +2732,10 @@ col_rel_compact_impl(col_rel_t *r,
             col_rel_release_column_storage(&old_storage);
             free(old_ts);
         }
+        /* Do not return the old footprint to the ledger until its buffers
+         * have actually been freed.  The replacement remains governed by
+         * the peak reservation until the commit below. */
+        col_rel_ledger_reconcile(r, ledger_before);
         if (replacement_started) {
             /* The old allocation has been freed before the retained charge
              * is reduced.  If the accounting transition is rejected, discard
