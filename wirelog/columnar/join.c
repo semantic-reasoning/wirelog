@@ -33,6 +33,29 @@
 #include <stdlib.h>
 #include <string.h>
 
+static int
+diff_txn_commit_after_push(eval_stack_t *stack,
+    wl_columnar_arrangement_diff_txn_t *txn, col_mat_cache_t *cache,
+    const col_rel_t *cached_result)
+{
+    if (!txn->session)
+        return 0;
+    int rc = wl_columnar_arrangement_diff_txn_commit(txn);
+    if (rc == 0)
+        return 0;
+
+    col_mat_cache_remove_result(cache, cached_result);
+
+    eval_entry_t entry;
+    if (eval_stack_pop_relation(stack, &entry) == 0) {
+        free(entry.seg_boundaries);
+        if (entry.owned)
+            col_rel_destroy(entry.rel);
+    }
+    wl_columnar_arrangement_diff_txn_abort(txn);
+    return rc;
+}
+
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
@@ -2685,9 +2708,10 @@ join_success:
                 col_rel_destroy(right_filtered);
             int push_rc = eval_stack_push_delta(stack, out, true,
                     result_is_delta);
-            if (push_rc == 0)
-                wl_columnar_arrangement_diff_txn_commit(&diff_txn);
-            else {
+            if (push_rc == 0) {
+                push_rc = diff_txn_commit_after_push(stack, &diff_txn,
+                        NULL, NULL);
+            } else {
                 wl_columnar_arrangement_diff_txn_abort(&diff_txn);
                 col_rel_destroy(out);
             }
@@ -2713,7 +2737,8 @@ join_success:
                 col_rel_destroy(copy);
         }
         if (push_rc == 0)
-            wl_columnar_arrangement_diff_txn_commit(&diff_txn);
+            push_rc = diff_txn_commit_after_push(stack, &diff_txn,
+                    &sess->mat_cache, cache_rc == 0 ? out : NULL);
         else
             wl_columnar_arrangement_diff_txn_abort(&diff_txn);
         (void)col_arrangement_probe_bundle_release(&diff_bundle);
@@ -2725,7 +2750,7 @@ join_success:
         col_rel_destroy(right_filtered);
     int push_rc = eval_stack_push_delta(stack, out, true, result_is_delta);
     if (push_rc == 0)
-        wl_columnar_arrangement_diff_txn_commit(&diff_txn);
+        push_rc = diff_txn_commit_after_push(stack, &diff_txn, NULL, NULL);
     else {
         wl_columnar_arrangement_diff_txn_abort(&diff_txn);
         col_rel_destroy(out);

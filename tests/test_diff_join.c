@@ -869,7 +869,8 @@ test_diff_arrangement_txn_ledger_accounting(void)
     uint64_t working_bytes = col_diff_arrangement_bytes(txn.working);
     ASSERT_TRUE(txn.working->ledger == &sess->mem_ledger,
         "pending working copy is ledger-attached");
-    ASSERT_TRUE(sess->diff_arr_count == 0,
+    ASSERT_TRUE(sess->diff_arr_count == 1
+        && sess->diff_arr_entries[0].transaction_pending,
         "pending arrangement remains unpublished");
     ASSERT_TRUE(diff_arrangement_ledger_bytes(sess) == working_bytes,
         "pending working copy is charged");
@@ -1591,6 +1592,59 @@ test_parallel_cross_join_matches_serial(void)
     PASS;
 }
 
+static void
+test_diff_arrangement_pin_lifetime(void)
+{
+    const uint32_t key[] = { 0 };
+    const char *names[] = { "k" };
+    wl_col_session_t *s = make_mock_session();
+    col_rel_t *source = make_rel("pinned", 1, names);
+    col_diff_arrangement_pin_t pin = { 0 };
+    wl_columnar_arrangement_diff_txn_t txn = { 0 };
+    col_diff_arrangement_t *arr;
+    int rc;
+
+    TEST("differential arrangement pins defer invalidation and replacement");
+    ASSERT_TRUE(s && source, "pin fixture allocation");
+    s->rels = calloc(1, sizeof(*s->rels));
+    ASSERT_TRUE(s->rels != NULL, "pin relation registry allocation");
+    s->rels[0] = source;
+    s->nrels = 1;
+    ASSERT_TRUE(col_rel_append_row(source, (int64_t[]){ 1 }) == 0,
+        "non-empty pin source");
+    rc = col_session_pin_diff_arrangement(s, "pinned", source, key, 1,
+            &pin);
+    ASSERT_TRUE(rc == 0 && pin.active, "differential pin acquired");
+    arr = pin.arr;
+    ASSERT_TRUE(pin.entry->pin_count == 1u
+        && pin.generation == pin.entry->generation,
+        "pin records stable entry generation");
+
+    rc = wl_columnar_arrangement_diff_txn_begin(s, "pinned", source, key, 1,
+            &txn);
+    ASSERT_TRUE(rc == EBUSY, "replacement denied while arrangement pinned");
+    ASSERT_TRUE(txn.working == NULL && pin.arr == arr,
+        "denied replacement leaves pinned arrangement unchanged");
+
+    col_session_invalidate_arrangements(&s->base, "pinned");
+    ASSERT_TRUE(pin.entry->invalidation_deferred
+        && pin.entry->pin_count == 1u,
+        "invalidation deferred while pinned");
+    ASSERT_TRUE(col_session_free_diff_arrangements(s) == EBUSY,
+        "teardown denied while pinned");
+
+    col_diff_arrangement_pin_release(&pin);
+    ASSERT_TRUE(!pin.active && pin.entry == NULL,
+        "pin release clears the handle");
+    ASSERT_TRUE(col_session_free_diff_arrangements(s) == 0,
+        "teardown succeeds after release");
+
+    col_rel_destroy(source);
+    free(s->rels);
+    free(s);
+    PASS;
+}
+
 /* ========================================================================
  * MAIN
  * ======================================================================== */
@@ -1611,6 +1665,7 @@ main(void)
     test_arrangement_reuse();
     test_arrangement_incremental();
     test_diff_arrangement_txn_ledger_accounting();
+    test_diff_arrangement_pin_lifetime();
     test_late_abort_does_not_advance_arrangement();
     test_result_is_delta_flag();
     test_large_dataset();

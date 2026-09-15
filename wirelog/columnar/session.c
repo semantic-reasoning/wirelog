@@ -1994,6 +1994,14 @@ col_session_destroy(wl_session_t *session)
         sess->tdd_workers = NULL;
         sess->tdd_workers_count = 0;
     }
+    assert(sess->diff_txn_count == 0);
+    int diff_rc = col_session_free_diff_arrangements(sess);
+    assert(diff_rc == 0);
+    if (diff_rc != 0) {
+        WL_LOG(WL_LOG_SEC_SESSION, WL_LOG_ERROR,
+            "cannot tear down differential arrangements: %d", diff_rc);
+        return;
+    }
     wl_columnar_session_source_leases_release_all(sess);
     session_destroy_relation_array(sess->rels, sess->nrels);
     free((void *)sess->rels);
@@ -2016,7 +2024,6 @@ col_session_destroy(wl_session_t *session)
     free(sess->arr_entries);
     col_session_free_delta_arrangements(sess);
     col_session_free_sorted_arrangements(sess);
-    col_session_free_diff_arrangements(sess);
     col_session_free_filt_arrangements(sess);
     /* Free contents of pool-allocated relations before bulk destroy.
      * delta_pool_destroy frees the slab/arena but skips individually
@@ -2365,9 +2372,16 @@ col_worker_session_destroy(wl_col_session_t *worker)
         col_arr_detach_memory_governor(&worker->arr_entries[i].arr);
     }
     free(worker->arr_entries);
+    assert(worker->diff_txn_count == 0);
+    int diff_rc = col_session_free_diff_arrangements(worker);
+    assert(diff_rc == 0);
+    if (diff_rc != 0) {
+        WL_LOG(WL_LOG_SEC_SESSION, WL_LOG_ERROR,
+            "cannot tear down worker differential arrangements: %d", diff_rc);
+        return;
+    }
     col_session_free_delta_arrangements(worker);
     col_session_free_sorted_arrangements(worker);
-    col_session_free_diff_arrangements(worker);
     col_session_free_filt_arrangements(worker);
 
     /* Drop persistent source readers before destroying the worker relations

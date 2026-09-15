@@ -1357,7 +1357,25 @@ typedef struct {
     uint32_t *key_cols;                /* owned copy of key column array */
     uint32_t key_count;
     col_diff_arrangement_t *diff_arr;  /* owned differential arrangement */
+    uint64_t generation;               /* replacement/invalidation epoch */
+    uint32_t pin_count;                 /* active differential readers */
+    bool invalidation_deferred;         /* reset waits for last release */
+    bool transaction_pending;           /* uncommitted registry entry */
 } col_diff_arr_entry_t;
+
+/* Stable snapshot lease for a differential arrangement.  The flat registry
+ * remains address-stable while any differential pin is active; registry
+ * growth is rejected until the last lease is released. */
+typedef struct {
+    col_diff_arr_entry_t *entry;
+    col_diff_arrangement_t *arr;
+    struct wl_col_session_t *session;
+    const col_rel_t *source;
+    col_relation_snapshot_t source_snapshot;
+    wl_columnar_source_access_reader_t source_reader;
+    uint64_t generation;
+    bool active;
+} col_diff_arrangement_pin_t;
 
 /* ======================================================================== */
 /* Frontier Vtable (Issue #261)                                             */
@@ -1823,6 +1841,7 @@ typedef struct wl_col_session_t {
     col_diff_arr_entry_t *diff_arr_entries;
     uint32_t diff_arr_count;
     uint32_t diff_arr_cap;
+    uint32_t diff_txn_count;      /* active differential replacement txns */
     /* Session-level differential path master switch (Issue #264).
      * When true, differential operators may be activated based on guard logic.
      * When false, always use epoch-based operators regardless of affected_strata.
@@ -2506,6 +2525,8 @@ col_mat_cache_lookup(col_mat_cache_t *cache, const col_rel_t *left,
 int
 col_mat_cache_insert(col_mat_cache_t *cache, const col_rel_t *left,
     const col_rel_t *right, col_rel_t *result);
+void
+col_mat_cache_remove_result(col_mat_cache_t *cache, const col_rel_t *result);
 /* Insert takes ownership of result only on success.  On failure, the caller
  * retains ownership and must destroy result or push it as owned. */
 int
@@ -2647,6 +2668,8 @@ typedef struct wl_columnar_arrangement_diff_txn {
     col_diff_arrangement_t **slot;
     col_diff_arrangement_t *persistent;
     col_diff_arrangement_t *working;
+    uint32_t entry_index;
+    uint64_t entry_generation;
     bool pending_entry;
 } wl_columnar_arrangement_diff_txn_t;
 
@@ -2655,17 +2678,24 @@ col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
     const col_rel_t *source_rel,
     const uint32_t *key_cols, uint32_t key_count);
 int
+col_session_pin_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
+    const col_rel_t *source_rel, const uint32_t *key_cols, uint32_t key_count,
+    col_diff_arrangement_pin_t *pin);
+void
+col_diff_arrangement_pin_release(col_diff_arrangement_pin_t *pin);
+int
 wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
     const char *rel_name, const col_rel_t *source_rel,
     const uint32_t *key_cols, uint32_t key_count,
     wl_columnar_arrangement_diff_txn_t *txn);
-void
+int
 wl_columnar_arrangement_diff_txn_commit(
     wl_columnar_arrangement_diff_txn_t *txn);
 void
 wl_columnar_arrangement_diff_txn_abort(
     wl_columnar_arrangement_diff_txn_t *txn);
-void
+/* Returns EBUSY while a pin or replacement transaction is active. */
+int
 col_session_free_diff_arrangements(wl_col_session_t *cs);
 /* Issue #260: Deep-copy arrangement entries for K-fusion worker isolation. */
 int

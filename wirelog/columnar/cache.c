@@ -479,6 +479,20 @@ col_mat_cache_insert(col_mat_cache_t *cache, const col_rel_t *left,
     return col_mat_cache_insert_pin(cache, left, right, result, NULL);
 }
 
+void
+col_mat_cache_remove_result(col_mat_cache_t *cache, const col_rel_t *result)
+{
+    if (!cache || !result)
+        return;
+    for (uint32_t i = 0; i < cache->count; i++) {
+        if (cache->entries[i].result == result) {
+            if (cache->entries[i].pin_count == 0)
+                mat_cache_remove_at(cache, i);
+            return;
+        }
+    }
+}
+
 static wl_mem_reclaim_result_t
 mat_cache_reclaimer(void *owner)
 {

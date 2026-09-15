@@ -318,6 +318,10 @@ test_generation_consumers(void)
     CHECK(col_rel_set(worker_rel, 0, key_col, 123456) == 0,
         "worker relation mutation failed");
     wl_col_session_t worker = { 0 };
+    worker.rels = calloc(1, sizeof(*worker.rels));
+    CHECK(worker.rels != NULL, "worker relation registry allocation failed");
+    worker.rels[0] = worker_rel;
+    worker.nrels = 1;
     worker.diff_arr_entries = diff_clone;
     worker.diff_arr_count = cs->diff_arr_count;
     worker.diff_arr_cap = diff_clone_cap;
@@ -359,6 +363,7 @@ cleanup:
     wl_columnar_arrangement_diff_txn_abort(&worker_txn);
     if (worker_rel)
         col_rel_destroy(worker_rel);
+    free(worker.rels);
     free_arrangement_clones(arr_clone, arr_clone_cap);
     free_diff_clones(diff_clone, diff_clone_cap);
     if (atomic_load_explicit(&worker_ledger.current_bytes,
