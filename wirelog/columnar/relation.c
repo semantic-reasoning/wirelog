@@ -630,11 +630,20 @@ col_rel_retained_bytes(uint32_t ncols, uint32_t capacity, bool timestamps,
 }
 
 static void
+col_rel_release_reservation_or_abort(
+    wl_columnar_memory_reservation_t *reservation)
+{
+    if (reservation && reservation->bytes != 0
+        && !wl_columnar_memory_release(reservation))
+        abort();
+}
+
+static void
 col_rel_reservation_rollback(wl_columnar_memory_reservation_t *reservation)
 {
     if (!reservation)
         return;
-    (void)wl_columnar_memory_release(reservation);
+    col_rel_release_reservation_or_abort(reservation);
 }
 
 static int
@@ -683,7 +692,8 @@ col_rel_reserve_retained(const col_rel_t *r, uint32_t capacity,
 
 static int
 col_rel_publish_retained_reservation(col_rel_t *r,
-    wl_columnar_memory_reservation_t *pending, uint64_t bytes)
+    wl_columnar_memory_reservation_t *pending, uint64_t bytes,
+    wl_columnar_memory_reservation_t *previous_out)
 {
     uint64_t old_bytes;
     wl_columnar_memory_reservation_t previous;
@@ -699,23 +709,45 @@ col_rel_publish_retained_reservation(col_rel_t *r,
     if (old_bytes > 0
         && !wl_columnar_memory_reservation_move(
             &previous, &r->retained_reservation)) {
-        (void)wl_columnar_memory_release(pending);
         return ENOMEM;
     }
     if (!wl_columnar_memory_reservation_move(&r->retained_reservation,
         pending)) {
         if (old_bytes > 0) {
             wl_columnar_memory_reservation_init(&r->retained_reservation);
-            (void)wl_columnar_memory_reservation_move(
-                &r->retained_reservation, &previous);
+            if (!wl_columnar_memory_reservation_move(
+                    &r->retained_reservation, &previous))
+                abort();
         }
-        (void)wl_columnar_memory_release(pending);
         return ENOMEM;
     }
-    if (old_bytes > 0)
-        (void)wl_columnar_memory_release(&previous);
+    if (old_bytes > 0) {
+        if (previous_out) {
+            if (!wl_columnar_memory_reservation_move(previous_out,
+                &previous)) {
+                if (!wl_columnar_memory_release(
+                        &r->retained_reservation)
+                    || !wl_columnar_memory_reservation_move(
+                        &r->retained_reservation, &previous))
+                    abort();
+                return ENOMEM;
+            }
+        } else if (!wl_columnar_memory_release(&previous))
+            abort();
+    }
     r->retained_reserved_bytes = bytes;
     return 0;
+}
+
+/* A replacement reservation covers the new buffers while the old buffers
+ * are still live.  Release the old token only after those buffers have been
+ * retired.  A failed release would make the governor's accounting
+ * unrecoverable, so terminate rather than silently losing the token. */
+static void
+col_rel_release_retired_reservation(
+    wl_columnar_memory_reservation_t *previous)
+{
+    col_rel_release_reservation_or_abort(previous);
 }
 
 /* Reserve the complete private shape of an ownership transition.  The
@@ -757,6 +789,7 @@ col_rel_grow_owned_transition_impl(col_rel_t *r, uint32_t new_cap,
     bool defer_alias_release)
 {
     wl_columnar_memory_reservation_t pending;
+    wl_columnar_memory_reservation_t previous;
     int pending_rc;
     uint64_t new_bytes;
     int64_t **new_columns = NULL;
@@ -766,6 +799,8 @@ col_rel_grow_owned_transition_impl(col_rel_t *r, uint32_t new_cap,
     bool *old_shared_flags;
     bool old_arena;
     uint64_t ledger_before;
+
+    wl_columnar_memory_reservation_init(&previous);
 
     if (!r || !r->columns || r->ncols == 0 || new_cap < r->nrows)
         return EINVAL;
@@ -788,7 +823,8 @@ col_rel_grow_owned_transition_impl(col_rel_t *r, uint32_t new_cap,
             (size_t)r->nrows * sizeof(*new_timestamps));
     }
     if (pending_rc > 0
-        && col_rel_publish_retained_reservation(r, &pending, new_bytes) != 0)
+        && col_rel_publish_retained_reservation(r, &pending, new_bytes,
+        &previous) != 0)
         goto fail;
 
     old_columns = r->columns;
@@ -811,6 +847,7 @@ col_rel_grow_owned_transition_impl(col_rel_t *r, uint32_t new_cap,
     }
     free(old_shared_flags);
     free(old_timestamps);
+    col_rel_release_retired_reservation(&previous);
     col_rel_ledger_reconcile(r, ledger_before);
     if (!defer_alias_release)
         (void)col_rel_storage_alias_release(r);
@@ -846,11 +883,14 @@ col_rel_cow_unshare_impl(col_rel_t *r, uint32_t new_cap,
     bool defer_alias_release)
 {
     wl_columnar_memory_reservation_t pending;
+    wl_columnar_memory_reservation_t previous;
     int pending_rc;
     uint64_t new_bytes;
     int64_t **private_cols = NULL;
     uint32_t capacity;
     uint64_t ledger_before;
+
+    wl_columnar_memory_reservation_init(&previous);
 
     if (!r || !r->col_shared)
         return 0;
@@ -877,7 +917,8 @@ col_rel_cow_unshare_impl(col_rel_t *r, uint32_t new_cap,
             (size_t)r->nrows * sizeof(int64_t));
     }
     if (pending_rc > 0
-        && col_rel_publish_retained_reservation(r, &pending, new_bytes) != 0)
+        && col_rel_publish_retained_reservation(r, &pending, new_bytes,
+        &previous) != 0)
         goto fail;
     ledger_before = col_rel_owned_ledger_bytes(r);
     int64_t **private_cursor = private_cols;
@@ -902,6 +943,7 @@ col_rel_cow_unshare_impl(col_rel_t *r, uint32_t new_cap,
             r->col_shared = NULL;
         }
     }
+    col_rel_release_retired_reservation(&previous);
     col_rel_ledger_reconcile(r, ledger_before);
     /* Private columns replaced the borrowed view: one storage epoch. */
     if (!defer_alias_release)
@@ -987,7 +1029,8 @@ col_rel_enable_timestamps_locked(col_rel_t *r)
         goto fail;
     r->timestamps = timestamps;
     if (reserve_rc > 0
-        && col_rel_publish_retained_reservation(r, &pending, new_bytes) != 0) {
+        && col_rel_publish_retained_reservation(r, &pending, new_bytes,
+        NULL) != 0) {
         r->timestamps = NULL;
         free(timestamps);
         goto fail;
@@ -1405,7 +1448,7 @@ col_rel_set_schema_impl(col_rel_t *r, uint32_t ncols,
         if (!col_rel_retained_bytes(r->ncols, r->capacity,
             r->timestamps != NULL, &retained_bytes)
             || col_rel_publish_retained_reservation(r, &pending,
-            retained_bytes) != 0) {
+            retained_bytes, NULL) != 0) {
             failure_rc = ENOMEM;
             goto fail;
         }
@@ -1879,9 +1922,12 @@ col_rel_reserve_capacity_admitted(col_rel_t *r, uint32_t new_cap,
         }
         uint64_t ledger_before = col_rel_owned_ledger_bytes(r);
         bool admitted = r->memory_governor != NULL;
+        wl_columnar_memory_reservation_t previous;
         int64_t **new_cols = NULL;
         col_delta_timestamp_t *new_ts = NULL;
         int prepare_rc;
+
+        wl_columnar_memory_reservation_init(&previous);
 
         pending_rc = 0;
         if (admitted) {
@@ -1906,13 +1952,15 @@ col_rel_reserve_capacity_admitted(col_rel_t *r, uint32_t new_cap,
             return prepare_rc;
         }
         if (admitted && pending_rc > 0
-            && col_rel_publish_retained_reservation(r, &pending, bytes) != 0) {
+            && col_rel_publish_retained_reservation(r, &pending, bytes,
+            &previous) != 0) {
             col_rel_reservation_rollback(&pending);
             col_columns_free(new_cols, r->ncols);
             free(new_ts);
             return ENOMEM;
         }
         col_rel_publish_resize(r, new_cols, new_ts, target);
+        col_rel_release_retired_reservation(&previous);
         col_rel_ledger_reconcile(r, ledger_before);
         wl_columnar_relation_touch_storage(r);
         return 0;
@@ -1938,7 +1986,8 @@ col_rel_reserve_capacity_admitted(col_rel_t *r, uint32_t new_cap,
         return ENOMEM;
     }
     if (pending_rc > 0
-        && col_rel_publish_retained_reservation(r, &pending, bytes) != 0) {
+        && col_rel_publish_retained_reservation(r, &pending, bytes,
+        NULL) != 0) {
         col_rel_reservation_rollback(&pending);
         return ENOMEM;
     }
@@ -2038,6 +2087,8 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
             int pending_rc = 0;
             uint64_t new_bytes = 0;
             bool admitted = r->memory_governor != NULL;
+            wl_columnar_memory_reservation_t previous;
+            wl_columnar_memory_reservation_init(&previous);
             if (admitted) {
                 pending_rc = col_rel_reserve_retained(r, new_cap, &pending);
                 if (pending_rc < 0)
@@ -2060,13 +2111,14 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
             }
             if (admitted && pending_rc > 0
                 && col_rel_publish_retained_reservation(r, &pending,
-                new_bytes) != 0) {
+                new_bytes, &previous) != 0) {
                 col_rel_reservation_rollback(&pending);
                 col_columns_free(new_cols, r->ncols);
                 free(new_ts);
                 goto enomem;
             }
             col_rel_publish_resize(r, new_cols, new_ts, new_cap);
+            col_rel_release_retired_reservation(&previous);
             col_rel_ledger_reconcile(r, ledger_before);
             wl_columnar_relation_touch_storage(r);
         }
@@ -2186,6 +2238,8 @@ col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
     int pending_rc = 0;
     uint64_t new_bytes = 0;
     bool admitted = r->memory_governor != NULL;
+    wl_columnar_memory_reservation_t previous;
+    wl_columnar_memory_reservation_init(&previous);
     if (admitted) {
         pending_rc = col_rel_reserve_retained(r, new_cap, &pending);
         if (pending_rc < 0
@@ -2205,13 +2259,15 @@ col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
         return rc;
     }
     if (admitted && pending_rc > 0
-        && col_rel_publish_retained_reservation(r, &pending, new_bytes) != 0) {
+        && col_rel_publish_retained_reservation(r, &pending, new_bytes,
+        &previous) != 0) {
         col_rel_reservation_rollback(&pending);
         col_columns_free(new_cols, r->ncols);
         free(new_ts);
         return ENOMEM;
     }
     col_rel_publish_resize(r, new_cols, new_ts, new_cap);
+    col_rel_release_retired_reservation(&previous);
     col_rel_ledger_reconcile(r, ledger_before);
     wl_columnar_relation_touch_storage(r);
     return 0;
