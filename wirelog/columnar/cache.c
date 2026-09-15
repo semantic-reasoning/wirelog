@@ -155,13 +155,24 @@ mat_cache_entry_destroy(col_mat_cache_t *cache, col_mat_entry_t *e)
         wl_mem_ledger_free(cache->ledger, WL_MEM_SUBSYS_CACHE,
             e->ledger_bytes);
     e->ledger_bytes = 0;
-    col_rel_destroy(e->result);
+    if (e->owns_result)
+        col_rel_destroy(e->result);
     e->result = NULL;
     e->mem_bytes = 0;
     e->eviction_deferred = false;
     e->owner_alive = false;
     e->owns_result = false;
     e->epoch_pin_count = 0;
+}
+
+static bool
+mat_cache_result_is_exclusive(const col_rel_t *result)
+{
+    if (!result || result->pool_owned || result->arena_owned
+        || result->col_shared || result->storage_owner != result
+        || result->storage_alias_borrows != 0)
+        return false;
+    return true;
 }
 
 static void
@@ -396,6 +407,17 @@ col_mat_cache_insert_pin(col_mat_cache_t *cache, const col_rel_t *left,
 {
     if (!cache || !left || !right || !result)
         return EINVAL;
+    /* The cache destroys entries on eviction.  Borrowed, arena-backed, or
+     * aliased results must remain owned by their producer instead of being
+     * reparented into the cache ledger. */
+    if (!mat_cache_result_is_exclusive(result)
+        || result == left || result == right)
+        return EINVAL;
+    for (uint32_t i = 0; i < cache->count; i++) {
+        if (cache->entries[i].owner_alive
+            && cache->entries[i].result == result)
+            return EEXIST;
+    }
     if (pin)
         memset(pin, 0, sizeof(*pin));
     size_t result_bytes
@@ -436,15 +458,7 @@ col_mat_cache_insert_pin(col_mat_cache_t *cache, const col_rel_t *left,
     if (e->generation == 0)
         e->generation = ++cache->next_generation;
     e->owner_alive = true;
-    e->owns_result = !result->pool_owned && !result->arena_owned;
-    if (e->owns_result && result->col_shared) {
-        for (uint32_t c = 0; c < result->ncols; c++) {
-            if (result->col_shared[c]) {
-                e->owns_result = false;
-                break;
-            }
-        }
-    }
+    e->owns_result = true;
     cache->total_bytes += result_bytes;
 
     /* Issue #1380: the cache now owns result, so its bytes move from

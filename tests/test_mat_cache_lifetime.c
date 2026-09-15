@@ -6,6 +6,8 @@
  */
 
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/columnar/delta_pool.h"
+#include "../wirelog/arena/arena.h"
 
 #include <stdio.h>
 
@@ -35,6 +37,92 @@ make_relation(int64_t value)
 }
 
 static void
+test_rejects_nonexclusive_results(void)
+{
+    tests_run++;
+    col_mat_cache_t cache = { 0 };
+    col_rel_t *left = make_relation(80);
+    col_rel_t *right = make_relation(81);
+    col_rel_t *source = make_relation(82);
+    col_rel_t *shared = make_relation(83);
+    ASSERT_TRUE(left && right && source && shared,
+        "nonexclusive cache relations allocated");
+    ASSERT_TRUE(col_rel_install_shared_view(shared, source) == 0,
+        "shared result setup succeeds");
+    ASSERT_TRUE(col_mat_cache_insert(&cache, left, right, shared) == EINVAL,
+        "shared result is rejected");
+    ASSERT_TRUE(cache.count == 0 && cache.total_bytes == 0
+        && cache.active_pins == 0,
+        "shared rejection leaves cache unchanged");
+    ASSERT_TRUE(col_rel_get(shared, 0, 0) == 82,
+        "shared result remains readable after rejection");
+    col_rel_destroy(shared);
+    col_rel_destroy(source);
+
+    col_rel_t *same = make_relation(85);
+    ASSERT_TRUE(same && col_mat_cache_insert(&cache, same, same, same)
+        == EINVAL,
+        "input/result pointer alias is rejected");
+    ASSERT_TRUE(cache.count == 0 && cache.total_bytes == 0,
+        "input/result rejection leaves cache unchanged");
+    col_rel_destroy(same);
+
+    delta_pool_t *pool = delta_pool_create(4, sizeof(col_rel_t), 64 * 1024);
+    wl_arena_t *arena = wl_arena_create(64 * 1024);
+    col_rel_t *arena_result = pool && arena
+        ? col_rel_pool_new_auto(pool, arena, "arena-cache-result", 1) : NULL;
+    int64_t value = 84;
+    ASSERT_TRUE(arena_result && arena_result->arena_owned,
+        "arena result setup succeeds");
+    ASSERT_TRUE(col_rel_append_row(arena_result, &value) == 0,
+        "arena result row append succeeds");
+    ASSERT_TRUE(col_mat_cache_insert(&cache, left, right, arena_result)
+        == EINVAL,
+        "arena result is rejected");
+    ASSERT_TRUE(cache.count == 0 && cache.total_bytes == 0,
+        "arena rejection leaves cache unchanged");
+    ASSERT_TRUE(col_rel_get(arena_result, 0, 0) == value,
+        "arena result remains readable after rejection");
+    col_rel_destroy(arena_result);
+    delta_pool_destroy(pool);
+    wl_arena_free(arena);
+
+    delta_pool_t *pool_only = delta_pool_create(4, sizeof(col_rel_t),
+            64 * 1024);
+    col_rel_t *pool_result = pool_only
+        ? col_rel_pool_new_auto(pool_only, NULL, "pool-cache-result", 1)
+        : NULL;
+    ASSERT_TRUE(pool_result && pool_result->pool_owned
+        && !pool_result->arena_owned,
+        "pool-only result setup succeeds");
+    ASSERT_TRUE(col_rel_append_row(pool_result, &value) == 0,
+        "pool-only result row append succeeds");
+    ASSERT_TRUE(col_mat_cache_insert(&cache, left, right, pool_result)
+        == EINVAL,
+        "pool-only result is rejected");
+    ASSERT_TRUE(cache.count == 0 && cache.total_bytes == 0,
+        "pool rejection leaves cache unchanged");
+    col_rel_destroy(pool_result);
+    delta_pool_destroy(pool_only);
+
+    col_rel_t *alias_owner = make_relation(86);
+    col_rel_t *alias = make_relation(87);
+    ASSERT_TRUE(alias_owner && alias
+        && col_rel_install_shared_view(alias, alias_owner) == 0,
+        "owner alias setup succeeds");
+    ASSERT_TRUE(alias_owner->storage_alias_borrows > 0
+        && col_mat_cache_insert(&cache, left, right, alias_owner) == EINVAL,
+        "owner with a live alias is rejected");
+    ASSERT_TRUE(cache.count == 0 && cache.total_bytes == 0,
+        "live-alias rejection leaves cache unchanged");
+    col_rel_destroy(alias);
+    col_rel_destroy(alias_owner);
+
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+}
+
+static void
 test_lookup_clear_and_release(void)
 {
     tests_run++;
@@ -45,6 +133,10 @@ test_lookup_clear_and_release(void)
     ASSERT_TRUE(left && right && result, "relations allocated");
     ASSERT_TRUE(col_mat_cache_insert(&cache, left, right, result) == 0,
         "cache insert succeeds");
+    ASSERT_TRUE(col_mat_cache_insert(&cache, left, right, result) == EEXIST,
+        "duplicate result insertion is rejected");
+    ASSERT_TRUE(cache.count == 1,
+        "duplicate result rejection leaves the entry count unchanged");
 
     col_mat_cache_pin_t pin = { 0 };
     ASSERT_TRUE(col_mat_cache_lookup_pin(&cache, left, right, &pin) == result,
@@ -307,6 +399,7 @@ test_snapshot_invalidates_same_shape_and_poisoned_generations(void)
 int
 main(void)
 {
+    test_rejects_nonexclusive_results();
     test_lookup_clear_and_release();
     test_pin_survives_compaction_and_truncate();
     test_lru_preserves_pinned_entry();

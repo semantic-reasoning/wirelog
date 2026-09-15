@@ -668,6 +668,17 @@ contract, not a public API or a general concurrent-reader mechanism.
 Differential, sorted and materialization-cache lifetimes, plus
 relation-generation validation, remain tracked separately in issue #1435.
 
+### Materialization-cache ownership
+
+The materialization cache accepts only a result whose storage is exclusively
+heap-owned by that result: pool-owned, arena-owned, shared-view, and aliased
+relations are rejected before cache or ledger state changes. This is required
+because eviction, clear, and reclaimer paths destroy accepted results. A
+rejected result remains the producer's responsibility and may be destroyed or
+reused by the caller. An accepted result transfers its relation charge to the
+cache ledger and is destroyed exactly once when its final unpinned entry is
+removed.
+
 ## 10a. Bounded join sub-batches (#1446)
 
 `WIRELOG_JOIN_BATCH_BYTES=N` (strict decimal, default unset = off) makes an
