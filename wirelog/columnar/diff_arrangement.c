@@ -56,6 +56,48 @@ col_diff_arrangement_attach_ledger(col_diff_arrangement_t *arr,
     diff_arr_ledger_sync(arr, 0);
 }
 
+int
+col_diff_arrangement_attach_memory_governor(
+    col_diff_arrangement_t *arr,
+    wl_columnar_memory_governor_ref_t *memory_governor)
+{
+    wl_columnar_memory_governor_t *governor;
+    wl_columnar_memory_admission_status_t status;
+
+    if (!arr || !memory_governor || arr->memory_governor)
+        return EINVAL;
+    governor = wl_columnar_memory_governor_ref_get(memory_governor);
+    if (!governor)
+        return EINVAL;
+    wl_columnar_memory_reservation_init(&arr->reservation);
+    status = wl_columnar_memory_reserve_checked(governor,
+            col_diff_arrangement_bytes(arr), &arr->reservation);
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+        return ENOMEM;
+    if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+        && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+        return EINVAL;
+    if (!wl_columnar_memory_commit(&arr->reservation, arr)) {
+        (void)wl_columnar_memory_release(&arr->reservation);
+        return ENOMEM;
+    }
+    arr->memory_governor = memory_governor;
+    wl_columnar_memory_governor_ref_retain(memory_governor);
+    arr->reserved_bytes = col_diff_arrangement_bytes(arr);
+    return 0;
+}
+
+static void
+diff_arr_release_governor(col_diff_arrangement_t *arr)
+{
+    if (!arr || !arr->memory_governor)
+        return;
+    (void)wl_columnar_memory_release(&arr->reservation);
+    arr->reserved_bytes = 0;
+    wl_columnar_memory_governor_ref_release(arr->memory_governor);
+    arr->memory_governor = NULL;
+}
+
 col_diff_arrangement_t *
 col_diff_arrangement_create(const uint32_t *key_cols, uint32_t key_count,
     uint32_t worker_id)
@@ -80,6 +122,9 @@ col_diff_arrangement_create(const uint32_t *key_cols, uint32_t key_count,
     arr->ht_cap = DIFF_ARRANGEMENT_INITIAL_BUCKETS;
     arr->source_snapshot = (col_relation_snapshot_t){ 0, 0, 0 };
     arr->ledger = NULL;
+    arr->memory_governor = NULL;
+    wl_columnar_memory_reservation_init(&arr->reservation);
+    arr->reserved_bytes = 0;
 
     arr->ht_head = calloc(arr->ht_cap, sizeof(uint32_t));
     arr->ht_next = malloc(arr->ht_cap * sizeof(uint32_t));
@@ -105,6 +150,7 @@ col_diff_arrangement_destroy(col_diff_arrangement_t *arr)
         uint64_t bytes = col_diff_arrangement_bytes(arr);
         wl_mem_ledger_free(arr->ledger, WL_MEM_SUBSYS_ARRANGEMENT, bytes);
     }
+    diff_arr_release_governor(arr);
     free(arr->key_cols);
     free(arr->ht_head);
     free(arr->ht_next);
@@ -172,6 +218,9 @@ col_diff_arrangement_deep_copy(const col_diff_arrangement_t *arr)
     /* The copy belongs to whoever asked for it (a worker session); the
     * caller attaches the right ledger.  Never inherit the source's. */
     copy->ledger = NULL;
+    copy->memory_governor = NULL;
+    wl_columnar_memory_reservation_init(&copy->reservation);
+    copy->reserved_bytes = 0;
 
     return copy;
 }
@@ -186,9 +235,40 @@ int
 col_diff_arrangement_ensure_ht_capacity(col_diff_arrangement_t *arr,
     uint32_t nrows)
 {
+    wl_columnar_memory_reservation_t pending;
+    wl_columnar_memory_governor_t *governor = NULL;
+    uint64_t prospective;
+    uint32_t target_cap;
+    uint32_t target_buckets;
+    bool pending_valid = false;
+
     if (arr->ht_head && arr->ht_next
         && nrows <= arr->ht_cap && nrows <= arr->nbuckets * 3 / 4)
         return 0;
+
+    target_cap = arr->ht_cap ? arr->ht_cap : DIFF_ARRANGEMENT_INITIAL_BUCKETS;
+    while (target_cap < nrows)
+        target_cap *= 2u;
+    target_buckets = arr->nbuckets ? arr->nbuckets
+        : DIFF_ARRANGEMENT_INITIAL_BUCKETS;
+    while (nrows > target_buckets * 3 / 4)
+        target_buckets *= 2u;
+    prospective = sizeof(*arr)
+        + (uint64_t)arr->key_count * sizeof(uint32_t)
+        + (uint64_t)target_buckets * sizeof(uint32_t)
+        + (uint64_t)target_cap * sizeof(uint32_t);
+    if (arr->memory_governor && prospective > arr->reserved_bytes) {
+        wl_columnar_memory_admission_status_t status;
+        governor = wl_columnar_memory_governor_ref_get(arr->memory_governor);
+        wl_columnar_memory_reservation_init(&pending);
+        status = governor ? wl_columnar_memory_reserve_growth(governor,
+                arr->reserved_bytes, prospective, &pending)
+            : WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            return ENOMEM;
+        pending_valid = true;
+    }
 
     uint64_t before = arr->ledger ? col_diff_arrangement_bytes(arr) : 0;
 
@@ -201,6 +281,8 @@ col_diff_arrangement_ensure_ht_capacity(col_diff_arrangement_t *arr,
         uint32_t *new_next = realloc(arr->ht_next,
                 new_cap * sizeof(uint32_t));
         if (!new_next) {
+            if (pending_valid)
+                (void)wl_columnar_memory_release(&pending);
             diff_arr_ledger_sync(arr, before);
             return ENOMEM;
         }
@@ -216,6 +298,8 @@ col_diff_arrangement_ensure_ht_capacity(col_diff_arrangement_t *arr,
             new_nbuckets *= 2;
         uint32_t *new_head = calloc(new_nbuckets, sizeof(uint32_t));
         if (!new_head) {
+            if (pending_valid)
+                (void)wl_columnar_memory_release(&pending);
             diff_arr_ledger_sync(arr, before);
             return ENOMEM;
         }
@@ -223,6 +307,19 @@ col_diff_arrangement_ensure_ht_capacity(col_diff_arrangement_t *arr,
         arr->ht_head = new_head;
         arr->nbuckets = new_nbuckets;
         arr->indexed_rows = 0; /* Force full re-index by caller */
+    }
+    if (pending_valid) {
+        wl_columnar_memory_reservation_t previous;
+        wl_columnar_memory_reservation_init(&previous);
+        if (!wl_columnar_memory_reservation_move(&previous,
+            &arr->reservation)
+            || !wl_columnar_memory_reservation_move(&arr->reservation,
+            &pending)
+            || !wl_columnar_memory_release(&previous)) {
+            (void)wl_columnar_memory_release(&pending);
+            return ENOMEM;
+        }
+        arr->reserved_bytes = prospective;
     }
 
     diff_arr_ledger_sync(arr, before);
