@@ -3,158 +3,168 @@ name: Fuzz Evidence
 on:
   workflow_dispatch:
     inputs:
-      target:
-        description: Fuzz target to run
-        required: true
-        default: all
-        type: choice
-        options:
-          - all
-          - parser
-          - csv_reader
-          - intern
-          - compound_arena
       duration:
-        description: Per-target libFuzzer duration, for example 60s or 24h
+        description: Per-shard libFuzzer duration (six shards per target)
         required: true
-        default: 60s
-        type: string
-      runs_on:
-        description: JSON runner labels; use a long-running self-hosted/larger runner for 24h evidence
-        required: true
-        default: '["ubuntu-latest"]'
+        default: 4h
         type: string
       timeout_minutes:
-        description: Job timeout in minutes; separate from per-target libFuzzer duration
+        description: Maximum time for each hosted shard job
         required: true
         default: "360"
         type: string
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
-  fuzz-evidence:
-    name: libFuzzer evidence
-    runs-on: ${{ fromJSON(inputs.runs_on) }}
-    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
-    env:
-      FUZZ_TARGET: ${{ inputs.target }}
-      FUZZ_DURATION: ${{ inputs.duration }}
-      FUZZ_RUNS_ON: ${{ inputs.runs_on }}
-      FUZZ_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
-
+  validate:
+    name: Validate hosted campaign
+    runs-on: ubuntu-latest
     steps:
-      - name: Validate runner, duration, and timeout
+      - name: Validate six-shard hosted configuration
+        env:
+          DURATION: ${{ inputs.duration }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
         shell: bash
         run: |
-          readonly hosted_limit_minutes=360
-          readonly buffer_minutes=60
-
-          if [[ ! "$FUZZ_DURATION" =~ ^[0-9]+([smh])?$ ]]; then
-            echo "duration must be an integer number of seconds or use s/m/h suffix: $FUZZ_DURATION" >&2
-            exit 1
-          fi
-
-          if [[ ! "$FUZZ_TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]]; then
-            echo "timeout_minutes must be a positive integer: $FUZZ_TIMEOUT_MINUTES" >&2
-            exit 1
-          fi
-
-          value="${FUZZ_DURATION%[smh]}"
-          suffix="${FUZZ_DURATION:${#value}}"
+          set -euo pipefail
+          if [[ ! "$DURATION" =~ ^[0-9]+([smh])?$ ]]; then exit 1; fi
+          value="${DURATION%[smh]}"
+          suffix="${DURATION:${#value}}"
           case "$suffix" in
             h) seconds=$((value * 3600)) ;;
             m) seconds=$((value * 60)) ;;
             s|"") seconds=$value ;;
           esac
+          (( seconds > 0 && seconds <= 14400 )) || exit 1
+          [[ "$TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]] || exit 1
+          (( TIMEOUT_MINUTES <= 360 )) || exit 1
+          required=$(((seconds + 59) / 60 + 60))
+          (( TIMEOUT_MINUTES >= required )) || exit 1
 
-          if [ "$FUZZ_TARGET" = "all" ]; then
-            target_count=4
-          else
-            target_count=1
-          fi
+  shard_1:
+    name: Fuzz shard 1 / ${{ matrix.target }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix: {target: [parser, csv_reader, intern, compound_arena]}
+    uses: ./.github/workflows/fuzz-evidence-shard.yml
+    with:
+      target: ${{ matrix.target }}
+      duration: ${{ inputs.duration }}
+      shard_index: 1
+      shard_count: 6
+      previous_shard: 0
+      timeout_minutes: ${{ inputs.timeout_minutes }}
 
-          required_minutes=$((((seconds * target_count) + 59) / 60 + buffer_minutes))
-          if [ "$FUZZ_TIMEOUT_MINUTES" -lt "$required_minutes" ]; then
-            echo "timeout_minutes=$FUZZ_TIMEOUT_MINUTES is too small for target=$FUZZ_TARGET duration=$FUZZ_DURATION." >&2
-            echo "Estimated minimum is ${required_minutes} minutes, including ${buffer_minutes} minutes for setup, minimization, and upload." >&2
-            exit 1
-          fi
+  shard_2:
+    name: Fuzz shard 2 / ${{ matrix.target }}
+    needs: shard_1
+    strategy:
+      fail-fast: false
+      matrix: {target: [parser, csv_reader, intern, compound_arena]}
+    uses: ./.github/workflows/fuzz-evidence-shard.yml
+    with:
+      target: ${{ matrix.target }}
+      duration: ${{ inputs.duration }}
+      shard_index: 2
+      shard_count: 6
+      previous_shard: 1
+      timeout_minutes: ${{ inputs.timeout_minutes }}
 
-          compact_runs_on="${FUZZ_RUNS_ON//[[:space:]]/}"
-          if [ "$compact_runs_on" = '["ubuntu-latest"]' ] && [ "$required_minutes" -gt "$hosted_limit_minutes" ]; then
-            echo "target=$FUZZ_TARGET duration=$FUZZ_DURATION needs about ${required_minutes} minutes and cannot use the hosted default runs_on=$FUZZ_RUNS_ON." >&2
-            echo "GitHub-hosted runners are limited to about ${hosted_limit_minutes} minutes." >&2
-            echo "Use runs_on labels for a runner whose runtime policy supports the requested duration." >&2
-            exit 1
-          fi
+  shard_3:
+    name: Fuzz shard 3 / ${{ matrix.target }}
+    needs: shard_2
+    strategy:
+      fail-fast: false
+      matrix: {target: [parser, csv_reader, intern, compound_arena]}
+    uses: ./.github/workflows/fuzz-evidence-shard.yml
+    with:
+      target: ${{ matrix.target }}
+      duration: ${{ inputs.duration }}
+      shard_index: 3
+      shard_count: 6
+      previous_shard: 2
+      timeout_minutes: ${{ inputs.timeout_minutes }}
 
-      - name: Checkout
-        uses: actions/checkout@v5
+  shard_4:
+    name: Fuzz shard 4 / ${{ matrix.target }}
+    needs: shard_3
+    strategy:
+      fail-fast: false
+      matrix: {target: [parser, csv_reader, intern, compound_arena]}
+    uses: ./.github/workflows/fuzz-evidence-shard.yml
+    with:
+      target: ${{ matrix.target }}
+      duration: ${{ inputs.duration }}
+      shard_index: 4
+      shard_count: 6
+      previous_shard: 3
+      timeout_minutes: ${{ inputs.timeout_minutes }}
 
-      - name: Install fuzz build dependencies
+  shard_5:
+    name: Fuzz shard 5 / ${{ matrix.target }}
+    needs: shard_4
+    strategy:
+      fail-fast: false
+      matrix: {target: [parser, csv_reader, intern, compound_arena]}
+    uses: ./.github/workflows/fuzz-evidence-shard.yml
+    with:
+      target: ${{ matrix.target }}
+      duration: ${{ inputs.duration }}
+      shard_index: 5
+      shard_count: 6
+      previous_shard: 4
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+
+  shard_6:
+    name: Fuzz shard 6 / ${{ matrix.target }}
+    needs: shard_5
+    strategy:
+      fail-fast: false
+      matrix: {target: [parser, csv_reader, intern, compound_arena]}
+    uses: ./.github/workflows/fuzz-evidence-shard.yml
+    with:
+      target: ${{ matrix.target }}
+      duration: ${{ inputs.duration }}
+      shard_index: 6
+      shard_count: 6
+      previous_shard: 5
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+
+  verify:
+    name: Verify hosted campaign evidence
+    if: ${{ always() }}
+    needs: [shard_1, shard_2, shard_3, shard_4, shard_5, shard_6]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Download shard evidence
+        uses: actions/download-artifact@v7
+        with:
+          pattern: fuzz-evidence-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: fuzz-evidence/corpora
+          merge-multiple: true
+      - name: Download shard records
+        uses: actions/download-artifact@v7
+        with:
+          pattern: fuzz-record-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: fuzz-evidence/records
+          merge-multiple: true
+      - name: Verify all targets and corpus handoffs
         shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang ninja-build
-          clang --version
-
-      - name: Set up Meson 1.12.0
-        uses: ./.github/actions/setup-meson
-
-      - name: Configure fuzz build
-        shell: bash
-        run: |
-          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address
-
-      - name: Compile fuzz targets
-        shell: bash
-        run: |
-          meson compile -C build-fuzz \
-            parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
-
-      - name: Run libFuzzer soak
-        shell: bash
-        run: |
-          if [ "$FUZZ_TARGET" = "all" ]; then
-            target_args=(--all)
-          else
-            target_args=(--target "$FUZZ_TARGET")
-          fi
-
-          scripts/fuzz/run-libfuzzer-soak.sh \
-            --build-dir build-fuzz \
-            --work-dir fuzz-evidence/soak \
-            --duration "$FUZZ_DURATION" \
-            "${target_args[@]}"
-
-      - name: Minimize corpus
-        if: ${{ success() }}
-        shell: bash
-        run: |
-          if [ "$FUZZ_TARGET" = "all" ]; then
-            target_args=(--all)
-          else
-            target_args=(--target "$FUZZ_TARGET")
-          fi
-
-          if [ ! -d fuzz-evidence/soak ]; then
-            echo "No soak evidence root found; skipping minimization."
-            exit 0
-          fi
-
-          scripts/fuzz/minimize-libfuzzer-corpus.sh \
-            --build-dir build-fuzz \
-            --input-dir fuzz-evidence/soak \
-            --out-dir fuzz-evidence/minimized \
-            "${target_args[@]}"
-
-      - name: Upload fuzz evidence
+          set -euo pipefail
+          mapfile -t records < <(find fuzz-evidence/records -type f -name '*.json' -print | sort)
+          ((${#records[@]} == 24)) || exit 1
+          python3 scripts/fuzz/verify-hosted-campaign.py --evidence-root fuzz-evidence "${records[@]}" | tee fuzz-evidence/verification.json
+      - name: Upload verified campaign evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
-          name: fuzz-evidence-${{ inputs.target }}-${{ inputs.duration }}
+          name: fuzz-campaign-verification-${{ github.run_id }}-${{ github.run_attempt }}
           path: fuzz-evidence
           if-no-files-found: warn
           retention-days: 30
