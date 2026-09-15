@@ -205,6 +205,40 @@ jobs:
           meson compile -C build-mbedtls
           meson test -C build-mbedtls cryptographic_hashes --print-errorlogs
 
+  candidate-consumers:
+    name: Tag / installed candidate consumers
+    needs: [validate-input]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG_REF }}
+          fetch-depth: 0
+      - name: Verify tagged commit
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Checkout workflow tools
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: workflow-tools
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./workflow-tools/.github/actions/setup-meson
+      - name: Run installed candidate consumer smoke
+        run: scripts/release/run-candidate-consumer-smoke.sh --output-dir candidate-consumer-evidence
+      - name: Upload candidate consumer evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: candidate-consumers-${{ env.TAG_REF }}
+          path: candidate-consumer-evidence/
+          if-no-files-found: error
+          retention-days: 90
+
   downstream:
     name: Tag / five-workload downstream matrix (DOOP in perf-nightly)
     needs: [validate-input]
@@ -355,7 +389,7 @@ jobs:
     # Performance/RSS release gating is intentionally deferred until 0.80;
     # hosted runners do not provide the stable environment required by those
     # measurements.
-    needs: [default, abi, sbom, fuzz, mbedtls, sanitizers, downstream]
+    needs: [default, abi, sbom, fuzz, mbedtls, candidate-consumers, sanitizers, downstream]
     runs-on: ubuntu-latest
     steps:
       - name: Require every tagged verification job
@@ -368,7 +402,7 @@ jobs:
           # because `join(needs.*.result)` silently yields fewer entries if a
           # job is removed, and every remaining one could still be success --
           # the gate would pass having checked less than it names.
-          test "${#statuses[@]}" -eq 7
+          test "${#statuses[@]}" -eq 8
           for result in "${statuses[@]}"; do
             test "$result" = success
           done

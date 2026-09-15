@@ -1232,6 +1232,17 @@ if sh.found()
        timeout: 120)
 endif
 
+# Issue #752: release validation must smoke the supported public consumers
+# against the exact candidate installation, without reviving historical
+# unsupported-version comparisons.
+if sh.found()
+  test('candidate_consumer_contract', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-candidate-consumer-smoke.sh',
+              meson.project_source_root()],
+       suite: 'abi',
+       timeout: 120)
+endif
+
 # Issue #1303: the WIRELOG_*_REQUIRED escalation. Half of this asserts gate
 # behaviour, half asserts the workflows still set the variable -- without the
 # second half the escalation can be deleted from a workflow while every

@@ -160,6 +160,16 @@ assert 'ci-pr.yml walltime step (Windows) sets WIRELOG_WALLTIME_REQUIRED' \
 assert 'release-tag.yml default job sets WIRELOG_WALLTIME_REQUIRED' \
     sets_in_step release-tag.yml 'Shell gate walltime budget' WIRELOG_WALLTIME_REQUIRED
 
+candidate_consumer_release_gate() {
+    grep -Fq 'candidate-consumers:' "$root/.github/workflows/release-tag.yml" \
+        && grep -Fq 'run-candidate-consumer-smoke.sh' \
+            "$root/.github/workflows/release-tag.yml" \
+        && ! grep -Eq 'v0\.30|old-ref|upgrade-matrix' \
+            "$root/.github/workflows/release-tag.yml"
+}
+assert 'release workflow has candidate-only consumer gate' \
+    candidate_consumer_release_gate
+
 # release-verification must WAIT ON every verification job, not merely agree
 # with itself about how many there are. Comparing counts caught drift between
 # the `needs:` list and the hardcoded `-eq N`, but not the defect one level up:
