@@ -217,12 +217,21 @@ When cutting a release tag:
    the supplied tag and verifies that it resolves to the supplied SHA.
    The [release-tag verification workflow](../.github/workflows/release-tag.yml)
    runs the default and ABI suites, SBOM and mbedTLS validation, a
-   60-second-per-target fuzz seed campaign, Tier-1 sanitizers, and a hosted
-   five-workload downstream matrix on the tagged commit. The downstream
+   60-second-per-target fuzz seed campaign, Tier-1 sanitizers, a hosted
+   five-workload downstream matrix, and an explicit perf/RSS runner
+   availability status on the tagged commit. The downstream
    matrix omits DOOP, which remains in `perf-nightly`. The hosted
    `Tag / hosted performance and RSS evidence` job requires correctness and
    `rss_bounded_release`, records the immutable tag SHA plus CPU, memory, and
-   affinity evidence, and treats unstable wall-clock timing as advisory. The
+   affinity evidence, and treats unstable wall-clock timing as advisory:
+   hosted timing does not satisfy the B8 burn-in, and authoritative closure
+   still requires 30 consecutive stable-runner nights. The
+   `Tag / Perf-RSS availability status` job records an explicit perf/RSS
+   availability status for the tag, and the aggregate gate refuses to pass
+   without one. That status reads `authoritative-runner-unavailable` on every
+   run today, because `GITHUB_TOKEN` cannot read the runner inventory API and
+   the job fails closed rather than guess; it becomes a live check only once a
+   repo-scoped PAT is wired in as a secret. The
    reusable Tier-1 sanitizer workflow verifies the
    ASan/UBSan Linux GCC, Linux Clang, Linux ARM64 GCC, and macOS Apple
    Clang legs plus the Linux GCC/Clang, Linux ARM64 GCC, and macOS Apple

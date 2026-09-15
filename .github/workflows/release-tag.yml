@@ -446,26 +446,157 @@ jobs:
           meson setup build-sbom -Dtests=true --buildtype=debug
           meson test -C build-sbom --suite sbom --print-errorlogs
 
+  perf-rss-status:
+    name: Tag / Perf-RSS availability status
+    needs: [validate-input]
+    runs-on: ubuntu-latest
+    # Bounded because release-verification requires this job to succeed: an
+    # unbounded `gh api` would otherwise stall a release for the six-hour
+    # default. The query is one small paginated read; five minutes is
+    # generous. Note this bound can fail a tag: release-artifacts is gated
+    # on release-verification, which requires this job to succeed.
+    timeout-minutes: 5
+    outputs:
+      status: ${{ steps.status.outputs.status }}
+      detail: ${{ steps.status.outputs.detail }}
+    steps:
+      - name: Inspect authoritative runner availability
+        id: status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=authoritative-runner-unavailable
+          detail=runner-inventory-api-unavailable
+          # `github.token` can never hold Administration:read -- it is not a
+          # settable GITHUB_TOKEN permission scope at all, and the runner
+          # inventory API requires it. This query therefore reports
+          # authoritative-runner-unavailable on every hosted run today; it
+          # becomes meaningful only once a repo-scoped PAT is wired in as a
+          # secret. Do NOT try to fix that by granting an administration
+          # scope in a job-level `permissions:` block -- no such scope exists
+          # for GITHUB_TOKEN, and an unknown permission key makes this whole
+          # workflow unparseable, taking release signing down with it on tag
+          # day. scripts/ci/test-release-perf-rss-contract.py refuses it. Treat an
+          # unavailable inventory API as unavailable evidence; never turn an
+          # API error into a false stable-runner claim.
+          #
+          # The branches are kept separate so an API failure is distinguishable
+          # from a successful query that found no runner. Folding them together
+          # (`$(gh api ... || printf '[]')`) appends the fallback to whatever
+          # partial output a mid-pagination failure already emitted, producing
+          # invalid JSON, and discards the reason.
+          if runners_json=$(gh api --paginate --slurp \
+                "repos/${GITHUB_REPOSITORY}/actions/runners" 2>runner-api-error.txt); then
+            # One jq pass classifies the answer. A matching runner that exists
+            # but is busy is NOT the same as no runner at all, and a response
+            # this filter cannot read is not the same as a successful query
+            # that found nothing -- collapsing either into no-matching-runner
+            # would report the inventory dishonestly.
+            if detail=$(jq -r '
+                  [ .[].runners[]? | select(any(.labels[]?.name; . == "wirelog-perf")) ]
+                    as $matching
+                  | if ($matching | length) == 0 then "no-matching-runner"
+                    elif any($matching[]; .status == "online" and .busy == false)
+                      then "matching-runner-online-and-idle"
+                    elif any($matching[]; .status == "online")
+                      then "matching-runner-present-but-busy"
+                    else "matching-runner-present-but-offline"
+                    end' <<< "$runners_json" 2>/dev/null); then
+              # jq can exit 0 having printed nothing. Anything outside the
+              # closed vocabulary is an unreadable response, not a verdict.
+              case "$detail" in
+                no-matching-runner|matching-runner-online-and-idle) ;;
+                matching-runner-present-but-busy) ;;
+                matching-runner-present-but-offline) ;;
+                *) detail=runner-inventory-response-unreadable ;;
+              esac
+              # The ONLY path that may claim an authoritative runner. Never
+              # widen this to "the API answered" -- that is precisely how an
+              # API result becomes a false stable-runner claim.
+              if [ "$detail" = matching-runner-online-and-idle ]; then
+                status=authoritative-runner-available
+              fi
+            else
+              detail=runner-inventory-response-unreadable
+            fi
+          else
+            # The reason goes to the job log, never to the retained artifact:
+            # a server-echoed error body is uncontrolled content and this
+            # repository is public.
+            echo "runner inventory query failed; evidence is unavailable:" >&2
+            sed 's/^/  /' runner-api-error.txt >&2
+          fi
+          # Both values are published. Each is one token from a closed set
+          # written by this script -- never server-supplied text -- so neither
+          # can inject a newline into $GITHUB_OUTPUT.
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "detail=$detail" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Perf/RSS release evidence status"
+            echo
+            # printf, not echo: backticks inside a double-quoted string are
+            # command substitution, so `echo "- status: \`$status\`"` would
+            # execute the status value and print an empty status. The format
+            # string is single-quoted, so its backticks stay literal, and
+            # `--` guards the leading dash.
+            printf -- '- status: `%s`\n' "$status"
+            printf -- '- detail: `%s`\n' "$detail"
+            echo "- hosted correctness and RSS evidence is required by release-perf"
+            echo "- hosted timing is advisory and does not satisfy the B8 burn-in"
+            echo "- authoritative closure still requires 30 consecutive stable-runner nights"
+          } >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p release-perf-rss-status
+          # status token first, diagnostics after: the aggregate gate reads the
+          # job output, but anything parsing this file reads line 1.
+          printf '%s\n' "$status" > release-perf-rss-status/status.txt
+          printf 'detail=%s\n' "$detail" >> release-perf-rss-status/status.txt
+      - name: Upload status artifact
+        # The status is already carried by $GITHUB_OUTPUT and the step summary.
+        # release-verification requires this job to succeed, so a transient
+        # artifact-service failure must not take the release down.
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-perf-rss-status-${{ env.TAG_REF }}
+          path: release-perf-rss-status/status.txt
+          if-no-files-found: error
+          retention-days: 35
+
   release-verification:
     name: Tag / release verification gate
     if: ${{ always() }}
     # Hosted timing is advisory, but correctness, RSS, and evidence presence
     # are required by release-perf. Strict stable timing remains a separate
-    # runner contract and must not be inferred from ubuntu-latest.
-    needs: [default, abi, sbom, fuzz, mbedtls, sanitizers, downstream, release-perf]
+    # runner contract and must not be inferred from ubuntu-latest, so
+    # perf-rss-status publishes an explicit perf/RSS availability status and
+    # the gate below refuses to pass without one. That status reads
+    # authoritative-runner-unavailable on every run today -- see the job for
+    # why -- so the gate records the answer rather than discovering it.
+    needs: [default, abi, sbom, fuzz, mbedtls, sanitizers, downstream, release-perf, perf-rss-status]
     runs-on: ubuntu-latest
     steps:
       - name: Require every tagged verification job
         env:
           RESULTS: ${{ join(needs.*.result, ',') }}
+          PERF_RSS_STATUS: ${{ needs['perf-rss-status'].outputs.status }}
+          PERF_RSS_RESULT: ${{ needs['perf-rss-status'].result }}
         run: |
           echo "verification results: $RESULTS"
+          echo "perf/RSS evidence status: $PERF_RSS_STATUS"
+          case "$PERF_RSS_STATUS" in
+            authoritative-runner-unavailable|authoritative-runner-available) ;;
+            *) echo "missing explicit perf/RSS evidence status" \
+                    "(perf-rss-status result: ${PERF_RSS_RESULT:-unknown})" >&2
+               exit 1 ;;
+          esac
           IFS=',' read -ra statuses <<< "$RESULTS"
           # Count must track `needs:` above. It is asserted rather than derived
           # because `join(needs.*.result)` silently yields fewer entries if a
           # job is removed, and every remaining one could still be success --
           # the gate would pass having checked less than it names.
-          test "${#statuses[@]}" -eq 8
+          test "${#statuses[@]}" -eq 9
           for result in "${statuses[@]}"; do
             test "$result" = success
           done
