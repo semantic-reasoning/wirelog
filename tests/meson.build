@@ -855,6 +855,13 @@ endif
 # the generated header (see wirelog/meson.build's configure_file()).
 py3 = find_program('python3', 'python', required: true)
 
+# Issue #694: keep the hosted fuzz evidence verifier and its fail-closed
+# fixtures in the normal test graph so schema or handoff regressions cannot
+# be bypassed by only running the workflow manually.
+test('verify_hosted_campaign', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-verify-hosted-campaign.py'],
+     suite: 'abi', timeout: 120)
+
 test('arm_asan_strict_align_selection', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-arm-asan-strict-align-selection.py'],
      suite: 'abi', timeout: 120)
@@ -1034,6 +1041,19 @@ test('program_lifetime_selftest', py3,
 # membership is not a proxy for platform exposure -- sbom_wrap_pin runs on
 # the Windows runner -- so the rule covers every suite.
 sh = find_program('bash', required: false)
+
+if sh.found() and host_machine.system() != 'windows'
+  # Issue #694: deterministic shell self-test for the hosted fuzz shard helper.
+  # It drives the fake target through success, failure, timeout, crash artifact,
+  # path-confinement, and two-shard corpus handoff cases.
+  # The hosted fuzz workflow is Ubuntu-only; Windows native execution is not
+  # covered by this Bash fixture.
+  test('run_hosted_fuzz_shard_selftest', sh,
+       args: [meson.project_source_root() /
+              'scripts/ci/test-run-hosted-fuzz-shard.sh'],
+       suite: ['abi', 'unit'],
+       timeout: 60)
+endif
 
 # Issue #772: release-template gate.  Asserts that the GitHub Releases
 # body for the current tag matches the corresponding CHANGELOG section.

@@ -1,4 +1,3 @@
-# Local Meson setup action references introduced by the 1.12.0 CI pin.
 ./.github/actions/setup-meson@UNKNOWN:NOASSERTION
 ./.github/actions/setup-meson@UNKNOWN:NOASSERTION
 ./.github/actions/setup-meson@UNKNOWN:NOASSERTION
@@ -8,10 +7,10 @@
 ./.github/actions/setup-meson@UNKNOWN:NOASSERTION
 ./.github/actions/setup-meson@UNKNOWN:NOASSERTION
 ./.github/actions/setup-meson@UNKNOWN:NOASSERTION
+./.github/workflows/fuzz-evidence-shard.yml@UNKNOWN:NOASSERTION
 ./.github/workflows/lint-main.yml@UNKNOWN:NOASSERTION
 ./.github/workflows/lint-pr.yml@UNKNOWN:NOASSERTION
 ./.github/workflows/tier1-sanitizers.yml@UNKNOWN:NOASSERTION
-# The release workflow's helper-action declaration remains a discovered dependency.
 ./workflow-tools/.github/actions/setup-meson@UNKNOWN:NOASSERTION
 actions/attest-build-provenance@v2:NOASSERTION
 actions/cache@v4:NOASSERTION
@@ -36,6 +35,7 @@ actions/checkout@v5:NOASSERTION
 actions/checkout@v5:NOASSERTION
 actions/checkout@v5:NOASSERTION
 actions/checkout@v5:NOASSERTION
+actions/checkout@v5:NOASSERTION
 actions/checkout@v7:NOASSERTION
 actions/checkout@v7:NOASSERTION
 actions/checkout@v7:NOASSERTION
@@ -51,6 +51,8 @@ actions/checkout@v7:NOASSERTION
 actions/checkout@v7:NOASSERTION
 actions/checkout@v7:NOASSERTION
 actions/checkout@v7:NOASSERTION
+actions/download-artifact@v7:NOASSERTION
+actions/download-artifact@v7:NOASSERTION
 actions/download-artifact@v8:NOASSERTION
 actions/download-artifact@v8:NOASSERTION
 actions/setup-node@v4:NOASSERTION
@@ -69,6 +71,7 @@ actions/upload-artifact@main:NOASSERTION
 actions/upload-artifact@main:NOASSERTION
 actions/upload-artifact@v4.4.3:NOASSERTION
 actions/upload-artifact@v4:NOASSERTION
+actions/upload-artifact@v7:NOASSERTION
 actions/upload-artifact@v7:NOASSERTION
 actions/upload-artifact@v7:NOASSERTION
 actions/upload-artifact@v7:NOASSERTION
