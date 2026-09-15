@@ -384,6 +384,36 @@ test_two_copies_direct_merge(void)
     PASS();
 }
 
+static void
+test_two_copies_compare_full_raw_row_width(void)
+{
+    TEST("two-way merge compares every column of the raw output row");
+
+    col_rel_t *rel = test_rel_alloc(2);
+    ASSERT(rel != NULL, "test_rel_alloc failed");
+
+    int64_t rows[][2] = { { 1, 1 }, { 2, 5 }, { 1, 2 }, { 2, 5 } };
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++)
+        ASSERT(test_rel_append_row(rel, rows[i]) == 0, "append row");
+
+    const uint32_t boundaries[] = { 0, 2, 4 };
+    ASSERT(col_op_consolidate_kway_merge(rel, boundaries, 2) == 0,
+        "two-way merge failed");
+    ASSERT(rel->nrows == 3,
+        "full-row comparison did not deduplicate correctly");
+
+    const int64_t expected[][2] = { { 1, 1 }, { 1, 2 }, { 2, 5 } };
+    for (uint32_t i = 0; i < 3; i++) {
+        int64_t actual[2];
+        col_rel_row_copy_out(rel, i, actual);
+        ASSERT(test_row_cmp(actual, expected[i], 2) == 0,
+            "full-row merge order is incorrect");
+    }
+
+    test_rel_free(rel);
+    PASS();
+}
+
 /* ================================================================
  * Test 3: Three copies (K=3) correctly identified and merged
  *
@@ -1837,6 +1867,7 @@ main(void)
 
     test_single_copy_passthrough();
     test_two_copies_direct_merge();
+    test_two_copies_compare_full_raw_row_width();
     test_three_copies_heap_merge();
     test_two_way_merge_empty_segments_uses_no_heap_allocation();
     test_per_segment_sort_before_merge();
