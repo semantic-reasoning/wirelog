@@ -503,6 +503,11 @@ setup_publish() {
 echo "\$*" >>'$gh_calls'
 case "\$2" in
     view)
+        if [[ "\${PUBLISH_TEST_FAILURE:-}" == 1 ]]; then
+            printf 'synthetic publisher failure GH_TOKEN=super-secret ACTIONS_ID_TOKEN_REQUEST_TOKEN=should-not-leak ' >&2
+            printf '%*s\n' 12000 '' | tr ' ' x >&2
+            exit 42
+        fi
         if [[ "\$*" == *assets* ]]; then
             printf '%s\n' $(printf '%q' "$1")
             exit 0
@@ -524,10 +529,78 @@ uploads() { grep -c '^release upload' "$gh_calls" || true; }
 
 creates() { grep -c '^release create' "$gh_calls" || true; }
 
+run_publish_diagnosed() {
+    local context=$1 expected_uploads=$2 rc actual
+    local diagnostic="$tmp/publisher-diagnostic"
+
+    if run_publish 2>&1 | bounded_capture "$diagnostic"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    if ((rc != 0)); then
+        printf 'publisher failed (%s), exit status %d:\n' "$context" "$rc" >&2
+        print_bounded_diagnostic "$diagnostic"
+        printf 'publisher gh calls:\n' >&2
+        print_bounded_diagnostic "$gh_calls"
+        return "$rc"
+    fi
+    actual=$(uploads)
+    if [[ "$actual" != "$expected_uploads" ]]; then
+        printf 'publisher contract failed (%s): expected %s uploads, got %s\n' \
+            "$context" "$expected_uploads" "$actual" >&2
+        printf 'publisher gh calls:\n' >&2
+        print_bounded_diagnostic "$gh_calls"
+        return 1
+    fi
+    return 0
+}
+
+bounded_capture() {
+    local file=$1 chunk keep bytes=0 LC_ALL=C
+
+    : >"$file"
+    # LC_ALL=C makes Bash's character count a byte count. Keep reading after
+    # the cap so the publisher is never killed by a closed pipe.
+    while IFS= read -r -N 4096 chunk || [[ -n "$chunk" ]]; do
+        if ((bytes < 8192)); then
+            keep=$((8192 - bytes))
+            if ((${#chunk} > keep)); then
+                chunk=${chunk:0:keep}
+            fi
+            printf '%s' "$chunk" >>"$file"
+            bytes=$((bytes + ${#chunk}))
+        fi
+    done
+}
+
+bounded_print() {
+    local chunk keep bytes=0 LC_ALL=C
+
+    while IFS= read -r -N 4096 chunk || [[ -n "$chunk" ]]; do
+        if ((bytes < 8192)); then
+            keep=$((8192 - bytes))
+            if ((${#chunk} > keep)); then
+                chunk=${chunk:0:keep}
+            fi
+            printf '%s' "$chunk" >&2
+            bytes=$((bytes + ${#chunk}))
+        fi
+    done
+}
+
+print_bounded_diagnostic() {
+    local file=$1
+
+    sed -E \
+        -e 's/(GH_TOKEN|GITHUB_TOKEN|ACTIONS_ID_TOKEN|ACTIONS_ID_TOKEN_REQUEST_TOKEN|ACTIONS_RUNTIME_TOKEN|COSIGN_OIDC_TOKEN)=([^[:space:]]+)/\1=[REDACTED]/g' \
+        -e 's/(authorization:[[:space:]]*bearer[[:space:]]+)[^[:space:]]+/\1[REDACTED]/Ig' \
+        "$file" | bounded_print
+}
+
 setup_publish '' absent
 publish_creates() {
-    run_publish >/dev/null 2>&1 &&
-        [[ "$(creates)" == 1 ]] && [[ "$(uploads)" == 6 ]]
+    run_publish_diagnosed 'absent release creation' 6 && [[ "$(creates)" == 1 ]]
 }
 assert 'an absent release is created and receives all six assets' publish_creates
 
@@ -543,15 +616,41 @@ assert 'a created release verifies the tag exists' created_verifying_tag
 
 setup_publish '' present
 publish_fresh() {
-    run_publish >/dev/null 2>&1 && [[ "$(creates)" == 0 ]] && [[ "$(uploads)" == 6 ]]
+    run_publish_diagnosed 'existing release publication' 6 && [[ "$(creates)" == 0 ]]
 }
 assert 'an existing release with no assets is not re-created' publish_fresh
 
 setup_publish 'wirelog-9.9.9.tar.gz.sig
 wirelog-9.9.9.tar.gz.pem
 wirelog-9.9.9.tar.gz.cosign.bundle' present
-publish_complete() { run_publish >/dev/null 2>&1 && [[ "$(uploads)" == 3 ]]; }
+publish_complete() { run_publish_diagnosed 'complete signing set skip' 3; }
 assert 'a complete signing set is skipped, other assets still upload' publish_complete
+
+publisher_failure_is_diagnosed() {
+    setup_publish '' present
+    local output
+    output=$(GH_TOKEN=super-secret PUBLISH_TEST_FAILURE=1 run_publish_diagnosed \
+        'synthetic publisher failure' 6 2>&1) && return 1
+    [[ "$output" == *'publisher failed (synthetic publisher failure), exit status 42:'* \
+        && "$output" == *'synthetic publisher failure'* \
+        && "$output" == *'publisher gh calls:'* \
+        && "$output" == *'[REDACTED]'* \
+        && "$output" != *'super-secret'* \
+        && "$output" != *'should-not-leak'* \
+        && ${#output} -le 17000 ]]
+}
+assert 'publisher failures retain status, output, and gh calls' \
+    publisher_failure_is_diagnosed
+
+wrong_upload_count_is_diagnosed() {
+    setup_publish '' absent
+    local output
+    output=$(run_publish_diagnosed 'synthetic upload-count mismatch' 7 2>&1) && return 1
+    [[ "$output" == *'publisher contract failed (synthetic upload-count mismatch): expected 7 uploads, got 6'* \
+        && "$output" == *'publisher gh calls:'* ]]
+}
+assert 'upload-count mismatches retain expected, actual, and gh calls' \
+    wrong_upload_count_is_diagnosed
 
 # The exact defect: .sha256 sorts between .pem and .sig, so an interrupted
 # upload leaves two of three and the re-run would mix ephemeral keys.
