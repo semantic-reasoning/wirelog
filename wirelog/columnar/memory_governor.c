@@ -753,6 +753,126 @@ credit_reservation(wl_columnar_memory_governor_t *governor, uint64_t bytes)
     return true;
 }
 
+static wl_columnar_memory_admission_status_t
+reserve_replacement_overlap(wl_columnar_memory_governor_t *governor,
+    uint64_t bytes)
+{
+    uint64_t old;
+
+    if (!governor || bytes == 0)
+        return WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
+    old = atomic_load_explicit(&governor->reserved_bytes,
+            memory_order_relaxed);
+    for (;;) {
+        uint64_t limit = atomic_load_explicit(&governor->usable_bytes,
+                memory_order_relaxed);
+        uint64_t next;
+        if (bytes > UINT64_MAX - old) {
+            uint64_t observed = old;
+            /* Linearize the overflow verdict with a no-op CAS. */
+            if (atomic_compare_exchange_weak_explicit(
+                    &governor->reserved_bytes, &observed, old,
+                    memory_order_acquire, memory_order_relaxed))
+                return WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW;
+            old = observed;
+            continue;
+        }
+        next = old + bytes;
+        if (next > limit)
+            return WL_COLUMNAR_MEMORY_ADMISSION_DENIED;
+        if (atomic_compare_exchange_weak_explicit(
+                &governor->reserved_bytes, &old, next,
+                memory_order_relaxed, memory_order_relaxed))
+            return governor->mode == WL_COLUMNAR_MEMORY_MODE_ADVISORY
+                ? WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY
+                : WL_COLUMNAR_MEMORY_ADMISSION_OK;
+    }
+}
+
+wl_columnar_memory_admission_status_t
+wl_columnar_memory_begin_replacement(
+    wl_columnar_memory_reservation_t *reservation, uint64_t new_bytes)
+{
+    wl_columnar_memory_admission_status_t status;
+
+    if (!reservation_identity_valid(reservation) || new_bytes == 0
+        || !claim_reservation_state(reservation,
+        WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED,
+        WL_COLUMNAR_MEMORY_RESERVATION_REPLACEMENT_ADMITTING))
+        return WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
+    if (new_bytes > reservation->bytes || !reservation->governor) {
+        atomic_store_explicit(&reservation->state,
+            WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED,
+            memory_order_release);
+        return WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
+    }
+    status = reserve_replacement_overlap(reservation->governor, new_bytes);
+    if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+        && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+        atomic_store_explicit(&reservation->state,
+            WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED,
+            memory_order_release);
+        return status;
+    }
+    reservation->replacement_bytes = new_bytes;
+    atomic_store_explicit(&reservation->state,
+        WL_COLUMNAR_MEMORY_RESERVATION_REPLACING, memory_order_release);
+    return status;
+}
+
+bool
+wl_columnar_memory_commit_replacement(
+    wl_columnar_memory_reservation_t *reservation)
+{
+    uint64_t old_bytes;
+    uint64_t new_bytes;
+
+    if (!reservation_identity_valid(reservation)
+        || !claim_reservation_state(reservation,
+        WL_COLUMNAR_MEMORY_RESERVATION_REPLACING,
+        WL_COLUMNAR_MEMORY_RESERVATION_COMMITTING))
+        return false;
+    old_bytes = reservation->bytes;
+    new_bytes = reservation->replacement_bytes;
+    if (new_bytes == 0 || new_bytes > old_bytes
+        || !credit_reservation(reservation->governor, old_bytes)) {
+        atomic_store_explicit(&reservation->state,
+            WL_COLUMNAR_MEMORY_RESERVATION_REPLACING,
+            memory_order_release);
+        return false;
+    }
+    reservation->bytes = new_bytes;
+    reservation->replacement_bytes = 0;
+    atomic_store_explicit(&reservation->state,
+        WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED, memory_order_release);
+    return true;
+}
+
+bool
+wl_columnar_memory_rollback_replacement(
+    wl_columnar_memory_reservation_t *reservation)
+{
+    uint64_t replacement_bytes;
+
+    if (!reservation_identity_valid(reservation)
+        || !claim_reservation_state(reservation,
+        WL_COLUMNAR_MEMORY_RESERVATION_REPLACING,
+        WL_COLUMNAR_MEMORY_RESERVATION_COMMITTING))
+        return false;
+    replacement_bytes = reservation->replacement_bytes;
+    if (replacement_bytes == 0
+        || !credit_reservation(reservation->governor, replacement_bytes)) {
+        atomic_store_explicit(&reservation->state,
+            WL_COLUMNAR_MEMORY_RESERVATION_REPLACING,
+            memory_order_release);
+        return false;
+    }
+    reservation->replacement_bytes = 0;
+    atomic_store_explicit(&reservation->state,
+        WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED, memory_order_release);
+    return true;
+}
+
 bool
 wl_columnar_memory_reservation_downsize(
     wl_columnar_memory_reservation_t *reservation, uint64_t bytes)
