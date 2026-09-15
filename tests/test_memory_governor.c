@@ -646,23 +646,27 @@ test_replacement_reservation(void)
     wl_columnar_memory_reservation_init(&token);
     wl_columnar_memory_reservation_init(&other);
     wl_columnar_memory_reservation_init(&moved);
-    if (!wl_columnar_memory_reserve(&governor, 400, &token)
-        || !wl_columnar_memory_commit(&token, &governor)
-        || wl_columnar_memory_begin_replacement(&token, 200)
-        != WL_COLUMNAR_MEMORY_ADMISSION_OK
-        || wl_columnar_memory_reserved(&governor) != 600
-        || atomic_load_explicit(&token.state, memory_order_acquire)
-        != WL_COLUMNAR_MEMORY_RESERVATION_REPLACING
-        || wl_columnar_memory_reservation_move(&moved, &token)
-        || wl_columnar_memory_release(&token)
-        || !wl_columnar_memory_reserve(&governor, 300, &other)
-        || !wl_columnar_memory_rollback_replacement(&token)
-        || wl_columnar_memory_reserved(&governor) != 700
-        || !wl_columnar_memory_release(&token)
-        || !wl_columnar_memory_release(&other)
-        || wl_columnar_memory_reserved(&governor) != 0) {
-        FAIL("replacement rollback did not preserve accounting");
-        return 1;
+    {
+        bool a = wl_columnar_memory_reserve(&governor, 400, &token);
+        bool b = wl_columnar_memory_commit(&token, &governor);
+        int c = wl_columnar_memory_begin_replacement(&token, 200);
+        bool d = wl_columnar_memory_reserved(&governor) == 600;
+        bool e = atomic_load_explicit(&token.state, memory_order_acquire)
+            == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING;
+        bool f = wl_columnar_memory_reservation_move(&moved, &token);
+        bool g = atomic_load_explicit(&token.state, memory_order_acquire)
+            == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING;
+        bool h = wl_columnar_memory_reserve(&governor, 300, &other);
+        bool i = wl_columnar_memory_rollback_replacement(&token);
+        bool j = wl_columnar_memory_reserved(&governor) == 700;
+        bool k = wl_columnar_memory_release(&token);
+        bool l = wl_columnar_memory_release(&other);
+        bool m = wl_columnar_memory_reserved(&governor) == 0;
+        if (!(a && b && c == WL_COLUMNAR_MEMORY_ADMISSION_OK && d && e
+            && !f && g && h && i && j && k && l && m)) {
+            FAIL("replacement rollback did not preserve accounting");
+            return 1;
+        }
     }
 
     wl_columnar_memory_reservation_init(&token);
@@ -691,6 +695,19 @@ test_replacement_reservation(void)
         != WL_COLUMNAR_MEMORY_ADMISSION_INVALID
         || !wl_columnar_memory_release(&token)) {
         FAIL("replacement denial changed the committed reservation");
+        return 1;
+    }
+
+    TEST("replacement teardown release reclaims stranded overlap");
+    wl_columnar_memory_reservation_init(&token);
+    if (!wl_columnar_memory_reserve(&governor, 400, &token)
+        || !wl_columnar_memory_commit(&token, &governor)
+        || wl_columnar_memory_begin_replacement(&token, 200)
+        != WL_COLUMNAR_MEMORY_ADMISSION_OK
+        || wl_columnar_memory_reserved(&governor) != 600
+        || !wl_columnar_memory_release(&token)
+        || wl_columnar_memory_reserved(&governor) != 0) {
+        FAIL("replacement teardown did not reclaim overlap");
         return 1;
     }
     PASS();

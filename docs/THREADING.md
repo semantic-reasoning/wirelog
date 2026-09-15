@@ -571,6 +571,7 @@ the replacement transaction never releases an uncommitted token.
 | `memory_governor.c:wl_columnar_memory_rollback_replacement` | `reservation->state` | `atomic_store_explicit` | release | Restore replacing state when rollback accounting cannot complete |
 | `memory_governor.c:wl_columnar_memory_rollback_replacement#2` | `reservation->state` | `atomic_store_explicit` | release | Publish the committed state after returning the overlap credit |
 | `relation.c:col_rel_compact_impl` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Validate the retained reservation before preparing a replacement footprint |
+| `relation.c:col_rel_compact_impl#2` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Recheck a previously admitted replacement token before retrying its publication after an earlier physical-growth failure |
 | `relation.c:col_rel_compact_many` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Validate each retained reservation before compacting a relation |
 | `relation.c:col_rel_compact_many#2` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Revalidate the reservation before the second compaction path |
 
