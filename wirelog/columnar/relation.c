@@ -218,6 +218,9 @@ col_rel_source_reader_acquire(const col_rel_t *rel,
     rc = col_rel_storage_owner_resolve(rel, &owner);
     if (rc != 0)
         return rc;
+    if (rel->pool_owned || rel->arena_owned
+        || owner->pool_owned || owner->arena_owned)
+        return EINVAL;
     return wl_columnar_source_access_reader_acquire(
         &owner->source_access, token);
 }

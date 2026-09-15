@@ -68,30 +68,63 @@ eval_stack_pop(eval_stack_t *s)
     return e;
 }
 
-void
+int
 eval_entry_dispose(eval_entry_t *entry)
 {
-    if (!entry)
-        return;
+    int rc;
 
-    free(entry->seg_boundaries);
-    entry->seg_boundaries = NULL;
-    entry->seg_count = 0;
+    if (!entry)
+        return 0;
 
     if (entry->kind == WL_COLUMNAR_EVAL_ENTRY_CONTINUATION) {
         wl_columnar_continuation_destroy(entry->continuation);
         entry->continuation = NULL;
     } else if (entry->owned) {
-        col_rel_destroy(entry->rel);
+        rc = col_rel_destroy_checked(entry->rel);
+        if (rc != 0)
+            return rc;
         entry->rel = NULL;
     }
+
+    free(entry->seg_boundaries);
+    entry->seg_boundaries = NULL;
+    entry->seg_count = 0;
     entry->owned = false;
+    return 0;
+}
+
+int
+eval_stack_repush_entry(eval_stack_t *s, eval_entry_t *entry)
+{
+    if (!s || !entry)
+        return EINVAL;
+    if (s->top >= COL_STACK_MAX)
+        return ENOBUFS;
+    s->items[s->top++] = *entry;
+    memset(entry, 0, sizeof(*entry));
+    return 0;
+}
+
+int
+eval_stack_dispose_entry(eval_stack_t *s, eval_entry_t *entry)
+{
+    int rc;
+
+    if (!entry)
+        return EINVAL;
+    rc = eval_entry_dispose(entry);
+    if (rc == 0 || !s)
+        return rc;
+    if (eval_stack_repush_entry(s, entry) != 0)
+        return ENOBUFS;
+    return rc;
 }
 
 int
 eval_stack_pop_relation(eval_stack_t *s, eval_entry_t *out)
 {
-    eval_entry_t e;
+    eval_entry_t *entry;
+    int dispose_rc;
 
     if (!out)
         return EINVAL;
@@ -99,31 +132,83 @@ eval_stack_pop_relation(eval_stack_t *s, eval_entry_t *out)
     if (!s || s->top == 0)
         return EINVAL;
 
-    e = eval_stack_pop(s);
-    if (e.kind == WL_COLUMNAR_EVAL_ENTRY_CONTINUATION) {
-        eval_entry_dispose(&e);
+    entry = &s->items[s->top - 1];
+    if (entry->kind == WL_COLUMNAR_EVAL_ENTRY_CONTINUATION) {
+        dispose_rc = eval_entry_dispose(entry);
+        if (dispose_rc != 0)
+            return dispose_rc;
+        s->top--;
         return ENOTSUP;
     }
-    if (e.kind != WL_COLUMNAR_EVAL_ENTRY_RELATION) {
-        eval_entry_dispose(&e);
+    if (entry->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION) {
+        dispose_rc = eval_entry_dispose(entry);
+        if (dispose_rc != 0)
+            return dispose_rc;
+        s->top--;
         return EINVAL;
     }
     /* Relation-only operators historically reject a NULL relation.  Keep
      * that boundary distinct from raw eval_stack_pop(), which is used by
      * top-level result collection to preserve the no-result value. */
-    if (!e.rel) {
-        eval_entry_dispose(&e);
+    if (!entry->rel) {
+        dispose_rc = eval_entry_dispose(entry);
+        if (dispose_rc != 0)
+            return dispose_rc;
+        s->top--;
         return EINVAL;
     }
-    *out = e;
+    *out = *entry;
+    s->top--;
     return 0;
 }
 
-void
+int
 eval_stack_drain(eval_stack_t *s)
 {
+    int rc;
+
+    if (!s)
+        return EINVAL;
+
     while (s->top > 0) {
-        eval_entry_t e = eval_stack_pop(s);
-        eval_entry_dispose(&e);
+        rc = eval_entry_dispose(&s->items[s->top - 1]);
+        if (rc != 0)
+            return rc;
+        s->top--;
+    }
+    return 0;
+}
+
+int
+eval_stack_drain_to_session(eval_stack_t *s, wl_col_session_t *sess)
+{
+    int rc;
+
+    if (!s || !sess)
+        return EINVAL;
+
+    for (;;) {
+        rc = eval_stack_drain(s);
+        if (rc != EBUSY)
+            return rc;
+
+        /* EBUSY is expected only for the owned relation at the top of the
+         * stack.  Move that exact entry into the session-owned registry so
+         * the evaluator may return without losing its ownership. */
+        if (s->top == 0)
+            return EFAULT;
+        eval_entry_t *entry = &s->items[s->top - 1];
+        if (entry->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION
+            || !entry->owned || !entry->rel)
+            return EFAULT;
+        if (!wl_columnar_deferred_relation_eligible(entry->rel))
+            return EINVAL;
+
+        rc = wl_columnar_session_defer_relation(sess, entry->rel);
+        if (rc != 0)
+            return rc;
+        free(entry->seg_boundaries);
+        memset(entry, 0, sizeof(*entry));
+        s->top--;
     }
 }

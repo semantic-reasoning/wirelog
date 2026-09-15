@@ -233,6 +233,8 @@ wl_columnar_session_source_lease_prepare(const col_rel_t *borrower,
     rc = col_rel_storage_owner_resolve(source, &owner);
     if (rc != 0)
         return rc;
+    if (owner->pool_owned || owner->arena_owned)
+        return EINVAL;
     lease = (wl_columnar_session_source_lease_t *)calloc(1,
             sizeof(*lease));
     if (!lease)
@@ -362,6 +364,80 @@ wl_columnar_session_source_leases_release_all(wl_col_session_t *sess)
             return;
         }
     }
+}
+
+bool
+wl_columnar_deferred_relation_eligible(const col_rel_t *rel)
+{
+    col_rel_t *owner = NULL;
+
+    if (!rel || rel->pool_owned || rel->arena_owned
+        || col_rel_storage_owner_resolve(rel, &owner) != 0)
+        return false;
+    return owner != NULL && !owner->pool_owned && !owner->arena_owned;
+}
+
+int
+wl_columnar_session_defer_relation(wl_col_session_t *sess, col_rel_t *rel)
+{
+    wl_columnar_deferred_relation_t *entry;
+    wl_columnar_deferred_relation_t **tail;
+
+    if (!sess || !rel)
+        return EINVAL;
+    /* Pool/arena storage can disappear with the evaluator's worker/session
+     * allocator.  Refuse it here as an invariant violation rather than ever
+     * making a deferred pointer outlive that allocator. */
+    if (!wl_columnar_deferred_relation_eligible(rel))
+        return EINVAL;
+    for (entry = sess->deferred_relations; entry; entry = entry->next) {
+        if (entry->rel == rel)
+            return 0;
+    }
+    entry = (wl_columnar_deferred_relation_t *)calloc(1, sizeof(*entry));
+    if (!entry)
+        return ENOMEM;
+    entry->rel = rel;
+    tail = &sess->deferred_relations;
+    while (*tail)
+        tail = &(*tail)->next;
+    *tail = entry;
+    sess->deferred_relation_count++;
+    return 0;
+}
+
+int
+wl_columnar_session_retry_deferred(wl_col_session_t *sess)
+{
+    wl_columnar_deferred_relation_t **slot;
+    int first_rc = 0;
+
+    if (!sess)
+        return EINVAL;
+    slot = &sess->deferred_relations;
+    while (*slot) {
+        wl_columnar_deferred_relation_t *entry = *slot;
+        int rc;
+
+        if (!wl_columnar_deferred_relation_eligible(entry->rel)) {
+            if (first_rc == 0)
+                first_rc = EINVAL;
+            slot = &entry->next;
+            continue;
+        }
+        rc = col_rel_destroy_checked(entry->rel);
+        if (rc == 0) {
+            *slot = entry->next;
+            free(entry);
+            assert(sess->deferred_relation_count > 0);
+            sess->deferred_relation_count--;
+            continue;
+        }
+        if (first_rc == 0)
+            first_rc = rc;
+        slot = &entry->next;
+    }
+    return first_rc;
 }
 
 /* Row removal rewrites the canonical relation storage in place.  Admit the
@@ -1995,6 +2071,10 @@ col_session_destroy(wl_session_t *session)
         sess->tdd_workers_count = 0;
     }
     wl_columnar_session_source_leases_release_all(sess);
+    {
+        int deferred_rc = wl_columnar_session_retry_deferred(sess);
+        assert(deferred_rc == 0);
+    }
     session_destroy_relation_array(sess->rels, sess->nrels);
     free((void *)sess->rels);
     /* Free relation name hash table (Issue #281) */
@@ -2149,6 +2229,8 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->rel_hash_nbuckets = 0;
     out_worker->rel_hash_chain_cap = 0;
     out_worker->source_leases = NULL;
+    out_worker->deferred_relations = NULL;
+    out_worker->deferred_relation_count = 0;
     out_worker->arr_entries = NULL;
     out_worker->arr_count = 0;
     out_worker->arr_cap = 0;
@@ -2373,6 +2455,10 @@ col_worker_session_destroy(wl_col_session_t *worker)
     /* Drop persistent source readers before destroying the worker relations
      * that borrowed those sources. */
     wl_columnar_session_source_leases_release_all(worker);
+    {
+        int deferred_rc = wl_columnar_session_retry_deferred(worker);
+        assert(deferred_rc == 0);
+    }
 
     /* Free owned relations (partition data) */
     session_destroy_relation_array(worker->rels, worker->nrels);
@@ -2889,6 +2975,9 @@ col_session_step(wl_session_t *session)
 {
     wl_col_session_t *sess = COL_SESSION(session);
     const wl_plan_t *plan = sess->plan;
+    int deferred_rc = wl_columnar_session_retry_deferred(sess);
+    if (deferred_rc != 0)
+        return deferred_rc;
     sess->extension_expr_status = 0;
 
     if (sess->delta_cb && !sess->pending_input_change
@@ -3315,6 +3404,9 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
         return EINVAL;
 
     wl_col_session_t *sess = COL_SESSION(session);
+    int deferred_rc = wl_columnar_session_retry_deferred(sess);
+    if (deferred_rc != 0)
+        return deferred_rc;
     const wl_plan_t *plan = sess->plan;
     sess->extension_expr_status = 0;
     const char *tdd_profile = getenv("WIRELOG_TDD_STRATUM_PROFILE");

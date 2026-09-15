@@ -231,19 +231,32 @@ nonrec_rule_worker_fn(void *arg)
     ctx->result.owned = false;
     ctx->rc = col_eval_relation_plan(ctx->rp, &stack, ctx->worker_sess);
     if (ctx->rc != 0) {
-        eval_stack_drain(&stack);
+        int drain_rc = eval_stack_drain_to_session(&stack,
+                ctx->worker_sess);
+        if (ctx->rc == 0 && drain_rc != 0)
+            ctx->rc = drain_rc;
         return;
     }
     if (stack.top > 0) {
         ctx->result = eval_stack_pop(&stack);
         if (ctx->result.kind != WL_COLUMNAR_EVAL_ENTRY_RELATION) {
-            eval_entry_dispose(&ctx->result);
+            int dispose_rc = eval_stack_dispose_entry(&stack, &ctx->result);
             ctx->rc = ENOTSUP;
-            eval_stack_drain(&stack);
+            int drain_rc = eval_stack_drain_to_session(&stack,
+                    ctx->worker_sess);
+            if (ctx->rc == 0 && dispose_rc != 0)
+                ctx->rc = dispose_rc;
+            if (ctx->rc == 0 && drain_rc != 0)
+                ctx->rc = drain_rc;
             return;
         }
     }
-    eval_stack_drain(&stack);
+    {
+        int drain_rc = eval_stack_drain_to_session(&stack,
+                ctx->worker_sess);
+        if (drain_rc != 0)
+            ctx->rc = drain_rc;
+    }
 }
 
 static bool
@@ -1297,7 +1310,9 @@ tdd_worker_subpass_fn(void *arg)
                     "TDD relation error worker=%u rel=%s iter=%u rc=%d\n",
                     sess->worker_id, rp->name ? rp->name : "(null)",
                     eff_iter, rc);
-            eval_stack_drain(&stack);
+            int drain_rc = eval_stack_drain_to_session(&stack, sess);
+            if (drain_rc != 0 && rc == 0)
+                rc = drain_rc;
             ctx->rc = rc;
             free(snap);
             sess->tdd_subpass_active = saved_tdd_subpass;
@@ -1311,16 +1326,29 @@ tdd_worker_subpass_fn(void *arg)
 
         eval_entry_t result = eval_stack_pop(&stack);
         if (result.kind != WL_COLUMNAR_EVAL_ENTRY_RELATION) {
-            eval_entry_dispose(&result);
-            eval_stack_drain(&stack);
+            int dispose_rc = eval_stack_dispose_entry(&stack, &result);
+            int drain_rc = eval_stack_drain_to_session(&stack, sess);
+            int cleanup_rc = dispose_rc != 0 ? dispose_rc : drain_rc;
             ctx->rc = ENOTSUP;
+            if (cleanup_rc != 0 && ctx->rc == 0)
+                ctx->rc = cleanup_rc;
             free(snap);
             sess->tdd_subpass_active = saved_tdd_subpass;
             sess->tdd_outbound_only_active = saved_outbound_only;
             sess->diff_operators_active = saved_diff;
             TDD_WORKER_RETURN();
         }
-        eval_stack_drain(&stack);
+        {
+            int drain_rc = eval_stack_drain_to_session(&stack, sess);
+            if (drain_rc != 0) {
+                ctx->rc = drain_rc;
+                free(snap);
+                sess->tdd_subpass_active = saved_tdd_subpass;
+                sess->tdd_outbound_only_active = saved_outbound_only;
+                sess->diff_operators_active = saved_diff;
+                TDD_WORKER_RETURN();
+            }
+        }
 
         /* Post-eval skip: evaluation produced 0 rows.
          *

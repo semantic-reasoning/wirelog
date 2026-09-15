@@ -1524,6 +1524,14 @@ typedef struct wl_columnar_session_source_lease {
     struct wl_columnar_session_source_lease *next;
 } wl_columnar_session_source_lease_t;
 
+/* Owned relations whose checked destruction was refused by a live reader.
+ * These entries must point only at heap-stable relation/storage objects: a
+ * worker or session may outlive the evaluator stack that discovered them. */
+typedef struct wl_columnar_deferred_relation {
+    col_rel_t *rel;
+    struct wl_columnar_deferred_relation *next;
+} wl_columnar_deferred_relation_t;
+
 typedef struct wl_col_session_t {
     wl_session_t base;         /* MUST be first field (vtable dispatch)  */
     /* base.extension_snapshot is borrowed from the coordinator in workers;
@@ -1853,6 +1861,8 @@ typedef struct wl_col_session_t {
      * readers.  Membership is confined to the coordinator thread between
      * worker barriers; worker tasks only read the published relations. */
     wl_columnar_session_source_lease_t *source_leases;
+    wl_columnar_deferred_relation_t *deferred_relations;
+    uint32_t deferred_relation_count;
     /* Exchange operator state (Issue #316): W x W partition buffer matrix.
      * Allocated by coordinator before exchange scatter dispatch.
      * exchange_bufs[src_worker][dst_worker] holds rows src sends to dst.
@@ -2790,12 +2800,27 @@ eval_stack_push_continuation(eval_stack_t *s,
     wl_columnar_continuation_t *continuation);
 eval_entry_t
 eval_stack_pop(eval_stack_t *s);
-void
+int
 eval_entry_dispose(eval_entry_t *entry);
+/* Dispose a relation entry removed from @s, putting it back on the stack if
+ * checked destruction is refused.  The caller retains responsibility for
+ * deciding whether a cleanup error supersedes its primary error. */
+int
+eval_stack_dispose_entry(eval_stack_t *s, eval_entry_t *entry);
+int
+eval_stack_repush_entry(eval_stack_t *s, eval_entry_t *entry);
 int
 eval_stack_pop_relation(eval_stack_t *s, eval_entry_t *out);
-void
+int
 eval_stack_drain(eval_stack_t *s);
+int
+eval_stack_drain_to_session(eval_stack_t *s, wl_col_session_t *sess);
+bool
+wl_columnar_deferred_relation_eligible(const col_rel_t *rel);
+int
+wl_columnar_session_defer_relation(wl_col_session_t *sess, col_rel_t *rel);
+int
+wl_columnar_session_retry_deferred(wl_col_session_t *sess);
 int
 col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess);
 int
