@@ -215,10 +215,12 @@ When cutting a release tag:
    the supplied tag and verifies that it resolves to the supplied SHA.
    The [release-tag verification workflow](../.github/workflows/release-tag.yml)
    runs the default and ABI suites, SBOM and mbedTLS validation, a
-   60-second-per-target fuzz seed campaign, Tier-1 sanitizers, and a hosted
-   five-workload downstream matrix on the tagged commit. The downstream
-   matrix omits DOOP, which remains in `perf-nightly`; release performance/RSS
-   gating is deferred until 0.80. The reusable Tier-1 sanitizer workflow verifies the
+   60-second-per-target fuzz seed campaign, Tier-1 sanitizers, a hosted
+   five-workload downstream matrix, and an explicit Perf/RSS availability
+   status on the tagged commit. Hosted perf/RSS evidence is diagnostic and
+   does not satisfy B8; authoritative closure still requires 30 consecutive
+   stable-runner nights. The downstream matrix omits DOOP, which remains in
+   `perf-nightly`; release performance/RSS gating is deferred until 0.80. The reusable Tier-1 sanitizer workflow verifies the
    ASan/UBSan Linux GCC, Linux Clang, Linux ARM64 GCC, and macOS Apple
    Clang legs plus the Linux GCC/Clang, Linux ARM64 GCC, and macOS Apple
    Clang TSan legs and MSan parser/CSV/intern/compound-arena smoke.

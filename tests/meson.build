@@ -2192,6 +2192,10 @@ test('perf_nightly_doop_contract', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-perf-nightly-doop.py'],
      suite: 'abi')
 
+test('release_perf_rss_contract', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-release-perf-rss-contract.py'],
+     suite: 'abi', timeout: 60)
+
 # ============================================================================
 # CSPA W=1 perf-suite gate.
 #
