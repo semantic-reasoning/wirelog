@@ -686,6 +686,176 @@ test_retained_relation_admission(void)
     PASS();
 }
 
+static void
+test_governed_compaction_transaction(void)
+{
+    const uint64_t old_bytes = 128u * sizeof(int64_t)
+        + 128u * sizeof(col_delta_timestamp_t);
+    const uint64_t new_bytes = 64u * sizeof(int64_t)
+        + 64u * sizeof(col_delta_timestamp_t);
+    const uint64_t overlap_bytes = old_bytes + new_bytes;
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    wl_columnar_memory_governor_t *governor = NULL;
+    wl_mem_ledger_t ledger;
+    wl_mem_ledger_snapshot_t snapshot;
+    col_rel_t *rel = NULL;
+    int64_t row = 7;
+    int64_t **old_columns = NULL;
+    int64_t **failed_columns = NULL;
+    const char *failure = NULL;
+    int rc;
+
+#define COMPACTION_CHECK(condition, message) \
+        do { \
+            if (!(condition)) { \
+                failure = (message); \
+                goto cleanup; \
+            } \
+        } while (0)
+
+    TEST("governed compaction admits overlap and retries conservatively");
+    resolution.budget_bytes = overlap_bytes;
+    resolution.usable_bytes = overlap_bytes;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    wl_mem_ledger_init(&ledger, 0u);
+    COMPACTION_CHECK(ref && col_rel_alloc(&rel, "compaction-transaction") == 0,
+        "governed compaction setup");
+    governor = wl_columnar_memory_governor_ref_get(ref);
+    COMPACTION_CHECK(governor != NULL
+        && col_rel_attach_memory_governor(rel, ref) == 0
+        && col_rel_set_schema(rel, 1, NULL) == 0
+        && col_rel_enable_timestamps(rel) == 0,
+        "governed compaction admission setup");
+    for (uint32_t i = 0; i < 65u; i++)
+        COMPACTION_CHECK(col_rel_append_row(rel, &row) == 0,
+            "governed compaction growth setup");
+    rel->mem_ledger = &ledger;
+    /* The direct relation fixture owns the ledger, so normalize the
+     * baseline before checking the replacement accounting below. */
+    col_rel_ledger_reconcile(rel, 0u);
+    COMPACTION_CHECK(rel->capacity == 128u
+        && rel->nrows == 65u
+        && rel->retained_reserved_bytes == old_bytes
+        && wl_columnar_memory_reserved(governor) == old_bytes,
+        "governed compaction old admission");
+
+    old_columns = rel->columns;
+    rel->nrows = 1;
+    atomic_store_explicit(&governor->usable_bytes, overlap_bytes - 1u,
+        memory_order_release);
+    rc = col_rel_compact(rel);
+    wl_mem_ledger_snapshot(&ledger, &snapshot);
+    COMPACTION_CHECK(rc == 0 && rel->columns == old_columns
+        && rel->capacity == 128u
+        && atomic_load_explicit(&rel->retained_reservation.state,
+        memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        && wl_columnar_memory_reserved(governor) == old_bytes
+        && snapshot.current_bytes == old_bytes,
+        "governed compaction denied overlap changed state");
+
+    atomic_store_explicit(&governor->usable_bytes, overlap_bytes,
+        memory_order_release);
+    rc = col_rel_compact(rel);
+    wl_mem_ledger_snapshot(&ledger, &snapshot);
+    COMPACTION_CHECK(rc == 0 && rel->columns != old_columns
+        && rel->capacity == 64u && rel->nrows == 1u
+        && rel->retained_reserved_bytes == new_bytes
+        && atomic_load_explicit(&rel->retained_reservation.state,
+        memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        && wl_columnar_memory_reserved(governor) == new_bytes
+        && snapshot.current_bytes == new_bytes
+        && snapshot.subsys_bytes[WL_MEM_SUBSYS_RELATION]
+        == 64u * sizeof(int64_t)
+        && snapshot.subsys_bytes[WL_MEM_SUBSYS_TIMESTAMP]
+        == 64u * sizeof(col_delta_timestamp_t),
+        "governed compaction replacement accounting");
+
+    for (uint32_t i = 0; i < 64u; i++)
+        COMPACTION_CHECK(col_rel_append_row(rel, &row) == 0,
+            "governed compaction retry growth");
+    COMPACTION_CHECK(rel->capacity == 128u && rel->nrows == 65u
+        && rel->retained_reserved_bytes == old_bytes
+        && wl_columnar_memory_reserved(governor) == old_bytes,
+        "governed compaction retry old admission");
+    rel->nrows = 16;
+    old_columns = rel->columns;
+    atomic_store_explicit(&governor->usable_bytes, overlap_bytes,
+        memory_order_release);
+    COMPACTION_CHECK(
+        wl_columnar_memory_begin_replacement(&rel->retained_reservation,
+        new_bytes) == WL_COLUMNAR_MEMORY_ADMISSION_OK
+        && wl_columnar_memory_reserved(governor) == overlap_bytes,
+        "governed compaction failure admission");
+
+    /* The direct counter change simulates a governor accounting failure
+     * after overlap admission.  No production hook is needed: the token
+     * state and relation storage are the contract under test. */
+    atomic_store_explicit(&governor->reserved_bytes, 0u,
+        memory_order_release);
+    rc = col_rel_compact(rel);
+    wl_mem_ledger_snapshot(&ledger, &snapshot);
+    failed_columns = rel->columns;
+    COMPACTION_CHECK(rc == EAGAIN && failed_columns != old_columns
+        && rel->capacity == 64u
+        && rel->retained_reserved_bytes == old_bytes
+        && atomic_load_explicit(&rel->retained_reservation.state,
+        memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING
+        && rel->retained_reservation.replacement_bytes == new_bytes
+        && snapshot.current_bytes == new_bytes,
+        "governed compaction failure did not preserve retry state");
+
+    atomic_store_explicit(&governor->reserved_bytes, overlap_bytes,
+        memory_order_release);
+    rc = col_rel_compact(rel);
+    wl_mem_ledger_snapshot(&ledger, &snapshot);
+    COMPACTION_CHECK(rc == 0 && rel->columns == failed_columns
+        && rel->retained_reserved_bytes == new_bytes
+        && atomic_load_explicit(&rel->retained_reservation.state,
+        memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        && wl_columnar_memory_reserved(governor) == new_bytes
+        && snapshot.current_bytes == new_bytes,
+        "governed compaction retry did not settle token");
+
+    col_rel_destroy(rel);
+    rel = NULL;
+    wl_mem_ledger_snapshot(&ledger, &snapshot);
+    COMPACTION_CHECK(wl_columnar_memory_reserved(governor) == 0u
+        && snapshot.current_bytes == 0u,
+        "governed compaction final release consistency");
+    wl_columnar_memory_governor_ref_release(ref);
+    ref = NULL;
+    PASS();
+    goto done;
+
+cleanup:
+    if (rel && ref
+        && atomic_load_explicit(&rel->retained_reservation.state,
+        memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING) {
+        uint64_t replacement_bytes
+            = rel->retained_reservation.replacement_bytes;
+        atomic_store_explicit(&governor->reserved_bytes,
+            rel->retained_reserved_bytes + replacement_bytes,
+            memory_order_release);
+        if (col_rel_transport_bytes(rel) == replacement_bytes)
+            (void)col_rel_compact(rel);
+        else
+            (void)wl_columnar_memory_rollback_replacement(
+                &rel->retained_reservation);
+    }
+    col_rel_destroy(rel);
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+    FAIL(failure ? failure : "governed compaction test failed");
+
+done:
+#undef COMPACTION_CHECK
+    return;
+}
+
 /* ======================================================================== */
 /* Delta Collector                                                          */
 /* ======================================================================== */
@@ -2550,6 +2720,7 @@ main(void)
 
     test_session_hash_overflow_rejected();
     test_retained_relation_admission();
+    test_governed_compaction_transaction();
     test_intern_reservation_program_lifetime();
     test_intern_rebinds_to_next_session();
     test_intern_rebind_waits_for_last_holder();
