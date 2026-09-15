@@ -2224,6 +2224,29 @@ cleanup:
 
 /* ---- compaction ---------------------------------------------------------- */
 
+/* Calculate the compacted shape without mutating the relation. */
+static bool
+col_rel_compaction_shape(const col_rel_t *r, uint32_t *out_capacity,
+    uint64_t *out_bytes)
+{
+    uint32_t tight;
+
+    if (!r || r->nrows == 0
+        || r->capacity <= (uint64_t)r->nrows * 4)
+        return false;
+    tight = r->nrows * 2;
+    if (tight < r->nrows)
+        tight = UINT32_MAX;
+    if (tight < COL_REL_INIT_CAP)
+        tight = COL_REL_INIT_CAP;
+    if (out_capacity)
+        *out_capacity = tight;
+    if (out_bytes && !col_rel_retained_bytes(r->ncols, tight,
+        r->timestamps != NULL, out_bytes))
+        return false;
+    return true;
+}
+
 /*
  * col_rel_compact:
  * Shrink oversized data and timestamps buffers after bulk retraction.
@@ -2299,26 +2322,38 @@ col_rel_compact_impl(col_rel_t *r,
         goto free_merge_buf;
     }
 
-    /* Only compact when buffer is more than 4x oversized.
-     * Cast to uint64_t to prevent overflow when nrows > UINT32_MAX/4. */
-    if (r->capacity <= (uint64_t)r->nrows * 4)
-        goto free_merge_buf;
-
-    /* A retained relation's admission token covers the complete live heap
-     * shape.  The governor has no atomic shrink operation: reserving the
-     * replacement while the old token is committed would incorrectly charge
-     * the temporary overlap, while releasing first would make compaction
-     * failure observable.  Keep the existing buffers in this case; this is
-     * conservative and preserves an exact token for subsequent growth. */
-    if (r->memory_governor)
+    /* Only compact when buffer is more than 4x oversized. */
+    if (!col_rel_compaction_shape(r, NULL, NULL))
         goto free_merge_buf;
 
     {
-        uint32_t tight = r->nrows * 2;
-        if (tight < r->nrows) /* overflow guard */
-            tight = UINT32_MAX;
-        if (tight < COL_REL_INIT_CAP)
-            tight = COL_REL_INIT_CAP;
+        uint32_t tight = 0;
+        uint64_t compacted_bytes = 0;
+        bool replacement_started = false;
+        uint64_t reservation_state;
+
+        (void)col_rel_compaction_shape(r, &tight, &compacted_bytes);
+
+        if (r->memory_governor) {
+            wl_columnar_memory_admission_status_t status;
+            if (r->retained_reserved_bytes == 0)
+                goto free_merge_buf;
+            reservation_state = atomic_load_explicit(
+                &r->retained_reservation.state, memory_order_acquire);
+            if (reservation_state
+                == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING) {
+                if (r->retained_reservation.replacement_bytes
+                    != compacted_bytes)
+                    goto free_merge_buf;
+            } else {
+                status = wl_columnar_memory_begin_replacement(
+                    &r->retained_reservation, compacted_bytes);
+                if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+                    && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+                    goto free_merge_buf;
+            }
+            replacement_started = true;
+        }
 
         /* Shrinking (and, for a shared view, privatizing) is one transaction:
          * the tight private buffers are prepared first and published only
@@ -2326,11 +2361,51 @@ col_rel_compact_impl(col_rel_t *r,
          * relation, its ownership flags and its generations untouched. */
         int64_t **new_cols = NULL;
         col_delta_timestamp_t *new_ts = NULL;
-        if (col_rel_prepare_resize(r, tight, &new_cols, &new_ts) != 0)
+        int64_t **old_cols = r->columns;
+        bool *old_col_shared = r->col_shared;
+        col_delta_timestamp_t *old_ts = r->timestamps;
+        bool old_arena_owned = r->arena_owned;
+        if (col_rel_prepare_resize(r, tight, &new_cols, &new_ts) != 0) {
+            if (replacement_started)
+                (void)wl_columnar_memory_rollback_replacement(
+                    &r->retained_reservation);
             goto free_merge_buf;
-        col_rel_publish_resize(r, new_cols, new_ts, tight);
+        }
+        /* The pointer swap itself cannot fail.  Keep the old storage live
+         * until the replacement has been published; it remains charged by
+         * the governor until the old storage is actually freed below. */
+        r->columns = new_cols;
+        r->col_shared = NULL;
+        r->timestamps = new_ts;
+        r->capacity = tight;
+        r->arena_owned = false;
+        new_cols = NULL;
+        new_ts = NULL;
         col_rel_ledger_reconcile(r, ledger_before);
         wl_columnar_relation_touch_storage(r);
+        {
+            col_rel_t old_storage = { 0 };
+            old_storage.columns = old_cols;
+            old_storage.col_shared = old_col_shared;
+            old_storage.arena_owned = old_arena_owned;
+            old_storage.ncols = r->ncols;
+            col_rel_release_column_storage(&old_storage);
+            free(old_ts);
+        }
+        if (replacement_started) {
+            /* The old allocation has been freed before the retained charge
+             * is reduced.  If the accounting transition is rejected, discard
+             * only the temporary charge and retain the old reservation as a
+             * conservative upper bound for the newly published storage. */
+            if (!wl_columnar_memory_commit_replacement(
+                    &r->retained_reservation)) {
+                (void)wl_columnar_memory_rollback_replacement(
+                    &r->retained_reservation);
+                rc = EFAULT;
+            } else {
+                r->retained_reserved_bytes = compacted_bytes;
+            }
+        }
         alias_release_pending = r->storage_owner != r;
     }
 
@@ -2383,6 +2458,7 @@ col_rel_compact_many(col_rel_t *const *rels, uint32_t nrels)
 {
     col_rel_t **owners = NULL;
     wl_columnar_source_access_writer_t *writers = NULL;
+    bool *replacement_started = NULL;
     uint32_t owner_count = 0;
     int rc = 0;
 
@@ -2393,9 +2469,11 @@ col_rel_compact_many(col_rel_t *const *rels, uint32_t nrels)
     owners = (col_rel_t **)calloc(nrels, sizeof(*owners));
     writers = (wl_columnar_source_access_writer_t *)calloc(nrels,
             sizeof(*writers));
-    if (!owners || !writers) {
+    replacement_started = (bool *)calloc(nrels, sizeof(*replacement_started));
+    if (!owners || !writers || !replacement_started) {
         free((void *)owners);
         free(writers);
+        free(replacement_started);
         /* Compaction is best-effort housekeeping.  If its temporary
          * bookkeeping cannot be allocated, preserve every relation and let
          * the completed evaluation commit normally.  Source-access and
@@ -2432,6 +2510,50 @@ col_rel_compact_many(col_rel_t *const *rels, uint32_t nrels)
         if (rc != 0)
             goto cleanup;
     }
+
+    /* Admit every governed non-empty replacement before preparing or
+     * publishing any member of the batch.  A denied admission therefore
+     * leaves the entire batch unchanged; the individual compactor reuses
+     * these held replacement states below. */
+    for (uint32_t i = 0; i < nrels; i++) {
+        uint64_t state;
+        uint64_t replacement_bytes;
+        wl_columnar_memory_admission_status_t status;
+
+        if (!rels[i] || !rels[i]->memory_governor
+            || !col_rel_compaction_shape(rels[i], NULL,
+            &replacement_bytes)
+            || rels[i]->retained_reserved_bytes == 0)
+            continue;
+        state = atomic_load_explicit(&rels[i]->retained_reservation.state,
+                memory_order_acquire);
+        if (state == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING) {
+            bool duplicate = false;
+            for (uint32_t j = 0; j < i; j++) {
+                if (rels[j] == rels[i] && replacement_started[j]) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate)
+                continue;
+            rc = EBUSY;
+            goto cleanup;
+        }
+        if (state != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED) {
+            rc = EBUSY;
+            goto cleanup;
+        }
+        status = wl_columnar_memory_begin_replacement(
+            &rels[i]->retained_reservation, replacement_bytes);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            rc = 0;
+            goto cleanup;
+        }
+        replacement_started[i] = true;
+    }
+
     for (uint32_t i = 0; i < nrels; i++) {
         if (!rels[i] || rels[i]->ncols == 0)
             continue;
@@ -2458,6 +2580,14 @@ col_rel_compact_many(col_rel_t *const *rels, uint32_t nrels)
     }
 
 cleanup:
+    for (uint32_t i = 0; i < nrels; i++) {
+        if (replacement_started[i] && rels[i] && rels[i]->memory_governor
+            && atomic_load_explicit(&rels[i]->retained_reservation.state,
+            memory_order_acquire)
+            == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING)
+            (void)wl_columnar_memory_rollback_replacement(
+                &rels[i]->retained_reservation);
+    }
     for (uint32_t i = 0; i < owner_count; i++) {
         if (writers[i].owner
             && wl_columnar_source_access_writer_release(&writers[i]) != 0
@@ -2466,6 +2596,7 @@ cleanup:
     }
     free(writers);
     free((void *)owners);
+    free(replacement_started);
     return rc;
 }
 

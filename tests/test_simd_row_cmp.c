@@ -91,6 +91,7 @@ typedef struct {
     struct {
         void *governor;
         uint64_t bytes;
+        uint64_t replacement_bytes;
         uint64_t owner_bits;
         uint64_t state;
         const void *identity;
