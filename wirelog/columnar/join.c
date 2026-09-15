@@ -20,6 +20,7 @@
 #endif
 
 #include "columnar/internal.h"
+#include "columnar/diff_join_batch.h"
 #include "columnar/join_batch.h"
 #include "columnar/lftj.h"
 #include "wirelog/util/log.h"
@@ -2304,6 +2305,71 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
         if (left_e.owned)
             col_rel_destroy(left);
         return EINVAL;
+    }
+
+    /* Differential bounded mode uses a dedicated producer because the
+     * differential registry has signed/timestamped rows and a separate
+     * generation lease.  Materialized results remain on the one-shot path
+     * until their cache transaction can be made operation-atomic. */
+    if (sess->join_batch_bytes > 0 && sess->coordinator) {
+        if (sess->join_batch_strict) {
+            free(lk);
+            free(rk);
+            if (left_e.owned)
+                col_rel_destroy(left);
+            if (right_filtered)
+                col_rel_destroy(right_filtered);
+            return ENOTSUP;
+        }
+        col_join_batch_record_fallback(sess,
+            COL_JOIN_BATCH_EXCLUDED_WORKER);
+    }
+    if (sess->join_batch_bytes > 0 && !sess->coordinator && kc > 0
+        && !used_right_delta
+        && op->right_filter_expr.size == 0 && !op->materialized) {
+        wl_columnar_continuation_t *cont = NULL;
+        col_rel_t *bounded_out = col_rel_new_auto("$join_diff_batch",
+                col_join_output_width(left, right, op));
+        int bounded_rc = bounded_out
+            ? col_join_set_output_types(bounded_out, left, right, op)
+            : ENOMEM;
+        if (bounded_rc == 0 && (left->timestamps || right->timestamps))
+            bounded_rc = col_rel_enable_timestamps(bounded_out);
+        if (bounded_rc == 0)
+            bounded_rc = col_diff_join_batch_producer_create(sess, op, left,
+                    left_e.is_delta, lk, rk, kc, sess->join_batch_bytes, &cont);
+        if (bounded_rc == 0) {
+            bounded_rc = col_join_batch_run_to_relation(cont, sess,
+                    bounded_out);
+            wl_columnar_continuation_destroy(cont);
+        }
+        if (bounded_rc == 0) {
+            free(lk);
+            free(rk);
+            if (left_e.owned)
+                col_rel_destroy(left);
+            if (right_filtered)
+                col_rel_destroy(right_filtered);
+            int push_rc = eval_stack_push_delta(stack, bounded_out, true,
+                    left_e.is_delta);
+            if (push_rc != 0)
+                col_rel_destroy(bounded_out);
+            return push_rc;
+        }
+        if (cont)
+            wl_columnar_continuation_destroy(cont);
+        if (bounded_out)
+            col_rel_destroy(bounded_out);
+        if (sess->join_batch_strict || (bounded_rc != ENOTSUP
+            && bounded_rc != ENOENT)) {
+            free(lk);
+            free(rk);
+            if (left_e.owned)
+                col_rel_destroy(left);
+            if (right_filtered)
+                col_rel_destroy(right_filtered);
+            return bounded_rc;
+        }
     }
 
     uint32_t ocols = col_join_output_width(left, right, op);

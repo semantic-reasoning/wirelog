@@ -758,3 +758,14 @@ Ownership and admission:
   `rows_per_batch - 1` rows in bounded mode.  The ledger backpressure
   heuristic of the one-shot loop is not consulted per row in bounded mode;
   admission is the bound.
+
+Differential keyed joins use `wirelog/columnar/diff_join_batch.c` when bounded
+mode is enabled for a normal keyed join.  The right relation is incrementally
+indexed in a differential transaction before the continuation starts; that
+cache transaction is committed before a differential generation/source pin is
+held for the continuation.  Each batch preserves the signed timestamp
+multiplicity product (`left * right`).  Stale input, generation changes,
+overflow, cancellation, or failed admission discard the output relation and
+release the differential pin exactly once.  Materialized/cache joins and
+delta-right, filtered, cross, worker, and other unsupported shapes remain on
+their existing one-shot paths until their publication contracts are bounded.

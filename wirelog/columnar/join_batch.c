@@ -525,9 +525,13 @@ sink_append(void *context, const wl_columnar_continuation_batch_t *batch)
             if (col_rel_set_raw(s->out, row, c, payload->columns[c][i]) != 0)
                 return WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
         }
-        if (s->out->timestamps)
-            memset(&s->out->timestamps[row], 0,
-                sizeof(col_delta_timestamp_t));
+        if (s->out->timestamps) {
+            if (payload->timestamps)
+                s->out->timestamps[row] = payload->timestamps[i];
+            else
+                memset(&s->out->timestamps[row], 0,
+                    sizeof(col_delta_timestamp_t));
+        }
     }
     s->out->nrows = s->pending_begin + batch->rows;
     return WL_COLUMNAR_CONTINUATION_OK;
