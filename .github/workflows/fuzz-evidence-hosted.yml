@@ -1,0 +1,1914 @@
+name: Hosted Fuzz Evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      campaign_id:
+        description: Stable evidence campaign identifier (letters, digits, dot, underscore, hyphen)
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FUZZ_SHARD_COUNT: '24'
+  FUZZ_SHARD_SECONDS: '3600'
+
+jobs:
+  validate:
+    name: Validate hosted campaign
+    runs-on: ubuntu-latest
+    outputs:
+      campaign_id: ${{ steps.plan.outputs.campaign_id }}
+    steps:
+      - id: plan
+        shell: bash
+        env:
+          REQUESTED_CAMPAIGN_ID: ${{ inputs.campaign_id }}
+        run: |
+          set -euo pipefail
+          campaign_id="$REQUESTED_CAMPAIGN_ID"
+          if [[ -z "$campaign_id" ]]; then
+            campaign_id="fuzz-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
+          fi
+          [[ "$campaign_id" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || {
+            echo "campaign_id contains unsupported characters or is too long" >&2
+            exit 1
+          }
+          echo "campaign_id=$campaign_id" >> "$GITHUB_OUTPUT"
+
+  shard-01:
+    name: Fuzz shard 1/24
+    needs: validate
+    if: ${{ needs.validate.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Seed initial corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p shard-input
+          for target in parser csv_reader intern compound_arena; do
+            mkdir -p "shard-input/$target"
+            cp -a "tests/fuzz/corpus/$target/." "shard-input/$target/corpus"
+          done
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 1 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-01-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-02:
+    name: Fuzz shard 2/24
+    needs: [validate, shard-01]
+    if: ${{ needs.shard-01.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-01-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 2 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-02-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-03:
+    name: Fuzz shard 3/24
+    needs: [validate, shard-02]
+    if: ${{ needs.shard-02.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-02-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 3 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-03-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-04:
+    name: Fuzz shard 4/24
+    needs: [validate, shard-03]
+    if: ${{ needs.shard-03.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-03-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 4 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-04-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-05:
+    name: Fuzz shard 5/24
+    needs: [validate, shard-04]
+    if: ${{ needs.shard-04.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-04-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 5 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-05-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-06:
+    name: Fuzz shard 6/24
+    needs: [validate, shard-05]
+    if: ${{ needs.shard-05.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-05-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 6 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-06-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-07:
+    name: Fuzz shard 7/24
+    needs: [validate, shard-06]
+    if: ${{ needs.shard-06.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-06-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 7 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-07-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-08:
+    name: Fuzz shard 8/24
+    needs: [validate, shard-07]
+    if: ${{ needs.shard-07.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-07-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 8 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-08-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-09:
+    name: Fuzz shard 9/24
+    needs: [validate, shard-08]
+    if: ${{ needs.shard-08.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-08-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 9 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-09-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-10:
+    name: Fuzz shard 10/24
+    needs: [validate, shard-09]
+    if: ${{ needs.shard-09.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-09-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 10 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-10-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-11:
+    name: Fuzz shard 11/24
+    needs: [validate, shard-10]
+    if: ${{ needs.shard-10.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-10-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 11 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-11-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-12:
+    name: Fuzz shard 12/24
+    needs: [validate, shard-11]
+    if: ${{ needs.shard-11.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-11-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 12 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-12-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-13:
+    name: Fuzz shard 13/24
+    needs: [validate, shard-12]
+    if: ${{ needs.shard-12.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-12-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 13 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-13-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-14:
+    name: Fuzz shard 14/24
+    needs: [validate, shard-13]
+    if: ${{ needs.shard-13.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-13-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 14 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-14-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-15:
+    name: Fuzz shard 15/24
+    needs: [validate, shard-14]
+    if: ${{ needs.shard-14.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-14-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 15 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-15-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-16:
+    name: Fuzz shard 16/24
+    needs: [validate, shard-15]
+    if: ${{ needs.shard-15.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-15-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 16 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-16-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-17:
+    name: Fuzz shard 17/24
+    needs: [validate, shard-16]
+    if: ${{ needs.shard-16.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-16-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 17 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-17-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-18:
+    name: Fuzz shard 18/24
+    needs: [validate, shard-17]
+    if: ${{ needs.shard-17.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-17-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 18 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-18-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-19:
+    name: Fuzz shard 19/24
+    needs: [validate, shard-18]
+    if: ${{ needs.shard-18.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-18-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 19 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-19-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-20:
+    name: Fuzz shard 20/24
+    needs: [validate, shard-19]
+    if: ${{ needs.shard-19.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-19-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 20 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-20-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-21:
+    name: Fuzz shard 21/24
+    needs: [validate, shard-20]
+    if: ${{ needs.shard-20.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-20-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 21 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-21-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-22:
+    name: Fuzz shard 22/24
+    needs: [validate, shard-21]
+    if: ${{ needs.shard-21.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-21-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 22 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-22-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-23:
+    name: Fuzz shard 23/24
+    needs: [validate, shard-22]
+    if: ${{ needs.shard-22.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-22-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 23 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-23-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  shard-24:
+    name: Fuzz shard 24/24
+    needs: [validate, shard-23]
+    if: ${{ needs.shard-23.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fuzz dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-23-attempt-${{ github.run_attempt }}
+          path: previous
+      - name: Restore previous corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf previous/shard-output.tar.gz
+          mv shard-output shard-input
+      - name: Run corpus-continuous shard
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/fuzz/run-campaign-shard.py \
+            --build-dir build-fuzz \
+            --input-root shard-input \
+            --output-root shard-output \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-index 24 \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+      - name: Package shard evidence
+        if: ${{ always() }}
+        shell: bash
+        run: tar -czf shard-output.tar.gz shard-output
+      - name: Upload immutable shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-24-attempt-${{ github.run_attempt }}
+          path: shard-output.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  verify:
+    name: Verify hosted campaign
+    needs: [validate, shard-24]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout immutable commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download every retained shard
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-01-attempt-${{ github.run_attempt }}
+          path: evidence/shard-01/artifact
+        continue-on-error: true
+      - name: Download shard 2
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-02-attempt-${{ github.run_attempt }}
+          path: evidence/shard-02/artifact
+        continue-on-error: true
+      - name: Download shard 3
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-03-attempt-${{ github.run_attempt }}
+          path: evidence/shard-03/artifact
+        continue-on-error: true
+      - name: Download shard 4
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-04-attempt-${{ github.run_attempt }}
+          path: evidence/shard-04/artifact
+        continue-on-error: true
+      - name: Download shard 5
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-05-attempt-${{ github.run_attempt }}
+          path: evidence/shard-05/artifact
+        continue-on-error: true
+      - name: Download shard 6
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-06-attempt-${{ github.run_attempt }}
+          path: evidence/shard-06/artifact
+        continue-on-error: true
+      - name: Download shard 7
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-07-attempt-${{ github.run_attempt }}
+          path: evidence/shard-07/artifact
+        continue-on-error: true
+      - name: Download shard 8
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-08-attempt-${{ github.run_attempt }}
+          path: evidence/shard-08/artifact
+        continue-on-error: true
+      - name: Download shard 9
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-09-attempt-${{ github.run_attempt }}
+          path: evidence/shard-09/artifact
+        continue-on-error: true
+      - name: Download shard 10
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-10-attempt-${{ github.run_attempt }}
+          path: evidence/shard-10/artifact
+        continue-on-error: true
+      - name: Download shard 11
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-11-attempt-${{ github.run_attempt }}
+          path: evidence/shard-11/artifact
+        continue-on-error: true
+      - name: Download shard 12
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-12-attempt-${{ github.run_attempt }}
+          path: evidence/shard-12/artifact
+        continue-on-error: true
+      - name: Download shard 13
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-13-attempt-${{ github.run_attempt }}
+          path: evidence/shard-13/artifact
+        continue-on-error: true
+      - name: Download shard 14
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-14-attempt-${{ github.run_attempt }}
+          path: evidence/shard-14/artifact
+        continue-on-error: true
+      - name: Download shard 15
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-15-attempt-${{ github.run_attempt }}
+          path: evidence/shard-15/artifact
+        continue-on-error: true
+      - name: Download shard 16
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-16-attempt-${{ github.run_attempt }}
+          path: evidence/shard-16/artifact
+        continue-on-error: true
+      - name: Download shard 17
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-17-attempt-${{ github.run_attempt }}
+          path: evidence/shard-17/artifact
+        continue-on-error: true
+      - name: Download shard 18
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-18-attempt-${{ github.run_attempt }}
+          path: evidence/shard-18/artifact
+        continue-on-error: true
+      - name: Download shard 19
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-19-attempt-${{ github.run_attempt }}
+          path: evidence/shard-19/artifact
+        continue-on-error: true
+      - name: Download shard 20
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-20-attempt-${{ github.run_attempt }}
+          path: evidence/shard-20/artifact
+        continue-on-error: true
+      - name: Download shard 21
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-21-attempt-${{ github.run_attempt }}
+          path: evidence/shard-21/artifact
+        continue-on-error: true
+      - name: Download shard 22
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-22-attempt-${{ github.run_attempt }}
+          path: evidence/shard-22/artifact
+        continue-on-error: true
+      - name: Download shard 23
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-23-attempt-${{ github.run_attempt }}
+          path: evidence/shard-23/artifact
+        continue-on-error: true
+      - name: Download shard 24
+        uses: actions/download-artifact@v5
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-shard-24-attempt-${{ github.run_attempt }}
+          path: evidence/shard-24/artifact
+        continue-on-error: true
+      - name: Extract available shard evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          for shard in evidence/shard-*; do
+            archive="$shard/artifact/shard-output.tar.gz"
+            if [[ -f "$archive" ]]; then
+              tar -xzf "$archive" -C "$shard/artifact"
+              mv "$shard/artifact/shard-output" "$shard/shard-output"
+            fi
+          done
+      - name: Verify campaign and write machine-readable report
+        shell: bash
+        run: |
+          set +e
+          python3 scripts/fuzz/verify-campaign.py \
+            --evidence-root evidence \
+            --seed-root tests/fuzz/corpus \
+            --campaign-id "${{ needs.validate.outputs.campaign_id }}" \
+            --shard-count "${{ env.FUZZ_SHARD_COUNT }}" \
+            --duration-seconds "${{ env.FUZZ_SHARD_SECONDS }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}" \
+            --report fuzz-campaign-report.json
+          status=$?
+          echo "verification_status=$status" >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      - name: Install minimization dependencies
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0 for final minimization
+        if: ${{ success() }}
+        uses: ./.github/actions/setup-meson
+      - name: Build fuzz targets for final minimization
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Minimize only the final corpus
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          scripts/fuzz/minimize-libfuzzer-corpus.sh \
+            --build-dir build-fuzz \
+            --input-dir evidence/shard-24/shard-output \
+            --out-dir fuzz-evidence/minimized \
+            --all
+      - name: Upload final campaign report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-campaign-${{ needs.validate.outputs.campaign_id }}-run-${{ github.run_id }}-report-attempt-${{ github.run_attempt }}
+          path: |
+            fuzz-campaign-report.json
+            evidence/
+            fuzz-evidence/
+          if-no-files-found: warn
+          retention-days: 90

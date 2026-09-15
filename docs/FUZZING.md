@@ -71,6 +71,35 @@ been retained for `#874` / `#684`.
 
 ## Manual Fuzz Evidence Workflow
 
+### Hosted 24-hour campaign
+
+`.github/workflows/fuzz-evidence-hosted.yml` provides the hosted-runner path
+for retained 24-hour evidence. It runs 24 sequential stages on fixed
+`ubuntu-latest` runners. Every stage runs all four targets for 3,600 seconds,
+so each job remains below the hosted six-hour limit while every target reaches
+at least 86,400 cumulative fuzz seconds.
+
+Each stage downloads the previous stage's immutable archive, continues from
+the copied target corpora, and publishes a new artifact whose name contains
+the campaign ID, shard number, and workflow attempt. The final stage downloads
+all available archives and `scripts/fuzz/verify-campaign.py` verifies exact
+coverage, commit/run identity, corpus digest continuity, exit status,
+timeouts, crash artifacts, and the per-target duration threshold. It always
+writes `fuzz-campaign-report.json`; a missing or invalid stage therefore fails
+closed instead of being mistaken for partial evidence.
+
+Dispatch this workflow with an optional `campaign_id`. The workflow does not
+accept runner labels: the hosted path is intentionally pinned to the standard
+hosted runner and has read-only repository permissions. The existing
+`fuzz-evidence.yml` workflow remains available for a single uninterrupted run
+on an eligible long-running runner when that evidence policy is required.
+
+The retained hosted bundle must include the workflow run URL, the final
+machine-readable report, every shard archive, each target's metadata and
+libFuzzer log, and any crash artifacts. A hosted shard campaign is
+corpus-continuous cumulative evidence; it is not evidence of one uninterrupted
+24-hour process.
+
 `.github/workflows/fuzz-evidence.yml` is a manual `workflow_dispatch` workflow
 for release-candidate evidence. It is not scheduled, it is not triggered on PR
 or push, and it is not a required CI gate.

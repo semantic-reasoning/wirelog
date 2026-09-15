@@ -1276,6 +1276,23 @@ if sh.found()
        timeout: 120)
 endif
 
+# Hosted fuzz evidence is a 24-stage corpus-continuous campaign.  The static
+# workflow contract and the verifier fixtures run without a hosted campaign,
+# dataset, or libFuzzer binary, so regressions in handoff and fail-closed
+# validation are caught in the ordinary ABI suite.
+if py3.found()
+  test('hosted_fuzz_evidence_contract', py3,
+       args: [meson.project_source_root() /
+              'scripts/ci/test-hosted-fuzz-evidence.py'],
+       suite: 'abi',
+       timeout: 120)
+  test('fuzz_campaign_verifier', py3,
+       args: [meson.project_source_root() /
+              'scripts/ci/test-fuzz-campaign-verifier.py'],
+       suite: 'abi',
+       timeout: 120)
+endif
+
 # Issue #913: keep the weighted/semiring design proposal explicit about its
 # current Z-set baseline, future-only ABI, retraction contract, and links.
 test('weighted_semiring_design', py3,

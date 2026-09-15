@@ -8,6 +8,7 @@
 ./.github/actions/setup-meson@UNKNOWN:NOASSERTION
 ./.github/actions/setup-meson@UNKNOWN:NOASSERTION
 ./.github/actions/setup-meson@UNKNOWN:NOASSERTION
+./.github/actions/setup-meson@UNKNOWN:NOASSERTION
 ./.github/workflows/lint-main.yml@UNKNOWN:NOASSERTION
 ./.github/workflows/lint-pr.yml@UNKNOWN:NOASSERTION
 ./.github/workflows/tier1-sanitizers.yml@UNKNOWN:NOASSERTION
@@ -36,6 +37,7 @@ actions/checkout@v5:NOASSERTION
 actions/checkout@v5:NOASSERTION
 actions/checkout@v5:NOASSERTION
 actions/checkout@v5:NOASSERTION
+actions/checkout@v5:NOASSERTION
 actions/checkout@v7:NOASSERTION
 actions/checkout@v7:NOASSERTION
 actions/checkout@v7:NOASSERTION
@@ -51,6 +53,7 @@ actions/checkout@v7:NOASSERTION
 actions/checkout@v7:NOASSERTION
 actions/checkout@v7:NOASSERTION
 actions/checkout@v7:NOASSERTION
+actions/download-artifact@v5:NOASSERTION
 actions/download-artifact@v8:NOASSERTION
 actions/download-artifact@v8:NOASSERTION
 actions/setup-node@v4:NOASSERTION
@@ -69,6 +72,7 @@ actions/upload-artifact@main:NOASSERTION
 actions/upload-artifact@main:NOASSERTION
 actions/upload-artifact@v4.4.3:NOASSERTION
 actions/upload-artifact@v4:NOASSERTION
+actions/upload-artifact@v7:NOASSERTION
 actions/upload-artifact@v7:NOASSERTION
 actions/upload-artifact@v7:NOASSERTION
 actions/upload-artifact@v7:NOASSERTION
