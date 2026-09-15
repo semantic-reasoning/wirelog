@@ -1243,6 +1243,11 @@ if sh.found()
               meson.project_source_root()],
        suite: 'abi',
        timeout: 120)
+  test('release_perf_evidence', sh,
+       args: [meson.project_source_root() /
+              'scripts/ci/test-check-release-perf-evidence.sh'],
+       suite: 'abi',
+       timeout: 120)
 endif
 
 # Issue #1573: the early binary-size gate and the scoped CI builds are pinned
