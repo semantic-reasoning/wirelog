@@ -135,6 +135,103 @@ jobs:
           meson compile -C build-abi
           meson test -C build-abi --suite abi --print-errorlogs
 
+  release-perf:
+    name: Tag / hosted performance and RSS evidence
+    needs: [validate-input]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG_REF }}
+          fetch-depth: 0
+      - name: Verify tagged commit
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Checkout workflow tools
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: workflow-tools
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./workflow-tools/.github/actions/setup-meson
+      - name: Record hosted performance contract
+        run: |
+          set -euo pipefail
+          mkdir -p release-perf-evidence
+          checked_out_sha=$(git rev-parse HEAD)
+          test "$checked_out_sha" = "$EXPECTED_SHA"
+          {
+            printf 'mode=github-hosted-advisory-timing-required-correctness\n'
+            printf 'runner=%s\n' "$RUNNER_OS"
+            printf 'image=%s/%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+            printf 'sha=%s\n' "$checked_out_sha"
+            printf 'expected_sha=%s\n' "$EXPECTED_SHA"
+            printf 'cpus=%s\n' "$(nproc --all)"
+            printf 'memory_kb=%s\n' "$(awk '/MemTotal:/ {print $2; exit}' /proc/meminfo)"
+            printf 'affinity=%s\n' "$(taskset -pc $$ 2>&1 | sed 's/.*: //')"
+          } | tee release-perf-evidence/host.txt
+          test "$(nproc --all)" -ge 2
+          test -s release-perf-evidence/host.txt
+      - name: Build release performance configuration
+        run: |
+          meson setup build-release-perf --buildtype=release \
+            -Dwirelog_log_max_level=error -Dtests=true -DmbedTLS=disabled
+          meson compile -C build-release-perf
+          meson setup build-release-perf-trace --buildtype=release \
+            -Dwirelog_log_max_level=trace -Dtests=true -DmbedTLS=disabled
+          meson compile -C build-release-perf-trace test_log_perf_gate
+      - name: Run required correctness and RSS gates
+        env:
+          WIRELOG_PERF_GATE: '1'
+          WIRELOG_PERF_REQUIRE: '1'
+          WIRELOG_GATE_CORRECTNESS_ONLY: '1'
+        run: |
+          set -o pipefail
+          meson test -C build-release-perf \
+            crdt_correctness_full cspa_correctness sub_ms_graph_correctness \
+            --print-errorlogs --num-processes 1 \
+            --logbase release-correctness-testlog
+          meson test -C build-release-perf rss_bounded_release \
+            --print-errorlogs --num-processes 1 \
+            --logbase release-rss-testlog
+      - name: Run hosted timing evidence (advisory)
+        if: always()
+        env:
+          WIRELOG_PERF_GATE: '1'
+          WIRELOG_PERF_REQUIRE: '1'
+        run: |
+          meson test -C build-release-perf \
+            crdt_perf_gate cspa_w1_gate sub_ms_graph_perf_gate \
+            --print-errorlogs --num-processes 1 \
+            --logbase release-timing-testlog || true
+          meson test -C build-release-perf-trace log_perf_gate \
+            --print-errorlogs --num-processes 1 \
+            --logbase release-log-timing-testlog || true
+          cat build-release-perf-trace/meson-logs/release-log-timing-testlog.txt \
+            >> build-release-perf/meson-logs/release-timing-testlog.txt
+      - name: Verify release performance evidence
+        if: always()
+        run: |
+          scripts/ci/check-release-perf-evidence.sh \
+            build-release-perf/meson-logs/release-correctness-testlog.txt \
+            build-release-perf/meson-logs/release-rss-testlog.txt \
+            build-release-perf/meson-logs/release-timing-testlog.txt \
+            release-perf-evidence/host.txt
+      - name: Upload release performance evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-perf-${{ env.TAG_REF }}
+          path: |
+            release-perf-evidence/
+            build-release-perf/meson-logs/release-*-testlog.txt
+          if-no-files-found: error
+          retention-days: 90
+
   fuzz:
     name: Tag / fuzz smoke
     needs: [validate-input]
@@ -352,10 +449,10 @@ jobs:
   release-verification:
     name: Tag / release verification gate
     if: ${{ always() }}
-    # Performance/RSS release gating is intentionally deferred until 0.80;
-    # hosted runners do not provide the stable environment required by those
-    # measurements.
-    needs: [default, abi, sbom, fuzz, mbedtls, sanitizers, downstream]
+    # Hosted timing is advisory, but correctness, RSS, and evidence presence
+    # are required by release-perf. Strict stable timing remains a separate
+    # runner contract and must not be inferred from ubuntu-latest.
+    needs: [default, abi, sbom, fuzz, mbedtls, sanitizers, downstream, release-perf]
     runs-on: ubuntu-latest
     steps:
       - name: Require every tagged verification job
@@ -368,7 +465,7 @@ jobs:
           # because `join(needs.*.result)` silently yields fewer entries if a
           # job is removed, and every remaining one could still be success --
           # the gate would pass having checked less than it names.
-          test "${#statuses[@]}" -eq 7
+          test "${#statuses[@]}" -eq 8
           for result in "${statuses[@]}"; do
             test "$result" = success
           done

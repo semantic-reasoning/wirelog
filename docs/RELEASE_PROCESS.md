@@ -195,10 +195,12 @@ When cutting a release tag:
      PRs; the release PR consolidates).
 2. **Wait for every required CI check** to pass on the release PR,
    including the platform build matrix, ABI, mbedTLS, ASan/UBSan, and TSan
-   checks. Release performance/RSS gates are intentionally deferred until
-   0.80 because GitHub-hosted runners do not provide a stable measurement
-   environment. Do not require `--suite perf` or a self-hosted performance
-   runner for the 0.62.0 release.
+   checks. For 0.80.0 and later, the tag workflow also requires the hosted
+   release performance job's correctness, RSS, and evidence contract. Its
+   wall-clock timing observations are advisory because GitHub-hosted runners
+   do not provide a stable cpufreq governor; strict timing remains a separate
+   stable-runner contract. The former 0.30.0 upgrade matrix is unsupported and
+   is not part of release verification.
 3. **Merge** the release PR via rebase (no squash, no merge
    commit; matches project convention).
 4. **Tag** on `main`:
@@ -217,8 +219,11 @@ When cutting a release tag:
    runs the default and ABI suites, SBOM and mbedTLS validation, a
    60-second-per-target fuzz seed campaign, Tier-1 sanitizers, and a hosted
    five-workload downstream matrix on the tagged commit. The downstream
-   matrix omits DOOP, which remains in `perf-nightly`; release performance/RSS
-   gating is deferred until 0.80. The reusable Tier-1 sanitizer workflow verifies the
+   matrix omits DOOP, which remains in `perf-nightly`. The hosted
+   `Tag / hosted performance and RSS evidence` job requires correctness and
+   `rss_bounded_release`, records the immutable tag SHA plus CPU, memory, and
+   affinity evidence, and treats unstable wall-clock timing as advisory. The
+   reusable Tier-1 sanitizer workflow verifies the
    ASan/UBSan Linux GCC, Linux Clang, Linux ARM64 GCC, and macOS Apple
    Clang legs plus the Linux GCC/Clang, Linux ARM64 GCC, and macOS Apple
    Clang TSan legs and MSan parser/CSV/intern/compound-arena smoke.
@@ -308,12 +313,14 @@ When cutting a release tag:
    release record. A repository-side green build or nightly portfolio result
    is not a substitute for the tagged-tarball evidence.
 
-### Perf-suite graph gate (release gating deferred until 0.80)
+### Perf-suite graph gate (hosted release evidence; strict timing is separate)
 
 The `sub_ms_graph_perf_gate` entry in `--suite perf` covers the Reach,
 SSSP, SG, and Bipartite W=1 sub-ms graph workloads. It is opt-in via
 `WIRELOG_PERF_GATE=1` and is intended for stable perf runners, not normal
-shared local/default runs. It is not a release-blocking check before 0.80.
+shared local/default runs. The release tag job runs the corresponding
+correctness sentinel and records timing attempts; it does not promote a
+hosted timing observation to a blocking absolute-time result.
 
 The strict authoritative issue #948 timing job, when enabled, uses two
 release/perf build directories on a provisioned Linux runner. Configure the trace build with
@@ -324,13 +331,19 @@ verify CPU 0 is online and its cpufreq governor reads `performance` before
 either build starts. `WIRELOG_PERF_REQUIRE=1` turns any remaining host or
 build misconfiguration from SKIP into FAIL.
 
-GitHub-hosted graph timing remains diagnostic: a missing or non-`performance`
-governor intentionally causes those timing gates to SKIP. DOOP is a separate
-mandatory execution contract for issue #1351: `perf-nightly` runs the pinned
-dataset at W=8/repeat=5 on `ubuntu-latest`, rejects missing or skipped
-correctness evidence, and retains the raw log and host/oracle evidence. Its
-hosted timing is explicitly advisory until a strict-stable calibration exists;
-see `docs/DOOP_PERF_BASELINE.md`.
+GitHub-hosted runners are the required release evidence path: their missing or
+non-`performance` governor intentionally causes the timing gates to SKIP, and
+the release checker records that as advisory timing rather than silently
+claiming a stable measurement. Missing, failed, or skipped correctness/RSS
+evidence fails the release job. A future strict timing job must satisfy the
+documented stable-runner contract and use `WIRELOG_PERF_REQUIRE=1` with
+`scripts/ci/check-perf-gate-execution.sh`.
+
+DOOP is a separate mandatory execution contract for issue #1351:
+`perf-nightly` runs the pinned dataset at W=8/repeat=5 on `ubuntu-latest`,
+rejects missing or skipped correctness evidence, and retains the raw log and
+host/oracle evidence. Its hosted timing is explicitly advisory until a
+strict-stable calibration exists; see `docs/DOOP_PERF_BASELINE.md`.
 
 Current enforcement is correctness sentinels plus median/mean/stdev/CoV
 reporting with a CoV <= 5% noise ceiling.  There is no absolute

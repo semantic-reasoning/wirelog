@@ -159,6 +159,12 @@ assert 'ci-pr.yml walltime step (Windows) sets WIRELOG_WALLTIME_REQUIRED' \
     sets_in_step ci-pr.yml 'Shell gate walltime budget (Windows / MSVC)' WIRELOG_WALLTIME_REQUIRED
 assert 'release-tag.yml default job sets WIRELOG_WALLTIME_REQUIRED' \
     sets_in_step release-tag.yml 'Shell gate walltime budget' WIRELOG_WALLTIME_REQUIRED
+assert 'release-tag.yml release-perf correctness step sets WIRELOG_GATE_CORRECTNESS_ONLY' \
+    sets_in_step release-tag.yml 'Run required correctness and RSS gates' WIRELOG_GATE_CORRECTNESS_ONLY
+assert 'release-tag.yml release-perf correctness step sets WIRELOG_PERF_REQUIRE' \
+    sets_in_step release-tag.yml 'Run required correctness and RSS gates' WIRELOG_PERF_REQUIRE
+assert 'release-tag.yml hosted timing step sets WIRELOG_PERF_REQUIRE' \
+    sets_in_step release-tag.yml 'Run hosted timing evidence (advisory)' WIRELOG_PERF_REQUIRE
 
 # release-verification must WAIT ON every verification job, not merely agree
 # with itself about how many there are. Comparing counts caught drift between
