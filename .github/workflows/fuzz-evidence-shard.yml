@@ -1,0 +1,122 @@
+name: Fuzz Evidence Shard
+
+on:
+  workflow_call:
+    inputs:
+      target: {required: true, type: string}
+      duration: {required: true, type: string}
+      shard_index: {required: true, type: number}
+      shard_count: {required: true, type: number}
+      previous_shard: {required: true, type: number}
+      timeout_minutes: {required: true, type: string}
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
+    env:
+      TARGET: ${{ inputs.target }}
+      DURATION: ${{ inputs.duration }}
+      SHARD_INDEX: ${{ inputs.shard_index }}
+      SHARD_COUNT: ${{ inputs.shard_count }}
+      CAMPAIGN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+      EVIDENCE_NAME: fuzz-evidence-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.target }}-shard-${{ inputs.shard_index }}
+      RECORD_NAME: fuzz-record-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.target }}-shard-${{ inputs.shard_index }}
+      HANDOFF_NAME: fuzz-handoff-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.target }}-shard-${{ inputs.shard_index }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install fuzz build dependencies
+        shell: bash
+        run: sudo apt-get update && sudo apt-get install -y clang ninja-build
+      - uses: ./.github/actions/setup-meson
+      - name: Configure fuzz build
+        shell: bash
+        run: CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address
+      - name: Compile fuzz targets
+        shell: bash
+        run: meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Download previous corpus handoff
+        if: ${{ inputs.shard_index > 1 }}
+        uses: actions/download-artifact@v7
+        with:
+          name: fuzz-handoff-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.target }}-shard-${{ inputs.previous_shard }}
+          path: previous-handoff
+      - name: Prepare input corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          if (( SHARD_INDEX == 1 )); then
+            printf 'FUZZ_INPUT=%s\n' "$GITHUB_WORKSPACE/tests/fuzz/corpus/$TARGET" >> "$GITHUB_ENV"
+          else
+            test -f previous-handoff/handoff.tar.gz
+            mkdir -p previous-input
+            tar -xzf previous-handoff/handoff.tar.gz -C previous-input
+            printf 'FUZZ_INPUT=%s\n' "$GITHUB_WORKSPACE/previous-input" >> "$GITHUB_ENV"
+          fi
+      - name: Run bounded fuzz shard
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p fuzz-evidence/records/$TARGET
+          build_sha256=$(sha256sum "build-fuzz/tests/${TARGET}_fuzz" | cut -d' ' -f1)
+          set +e
+          scripts/fuzz/run-hosted-fuzz-shard.sh \
+            --build-dir build-fuzz --target "$TARGET" --input-corpus "$FUZZ_INPUT" \
+            --output-root fuzz-evidence --duration "$DURATION" --campaign-id "$CAMPAIGN_ID" \
+            --shard-index "$SHARD_INDEX" --shard-count "$SHARD_COUNT" --git-commit "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --build-id "$GITHUB_SHA" --build-sha256 "$build_sha256" \
+            --record-output "records/$TARGET/shard-$SHARD_INDEX.json" | tee shard-record.json
+          status=${PIPESTATUS[0]}
+          exit "$status"
+      - name: Upload shard corpus evidence
+        if: ${{ always() }}
+        id: upload_evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.EVIDENCE_NAME }}
+          path: fuzz-evidence/corpora
+          if-no-files-found: error
+          retention-days: 30
+      - name: Bind actual evidence artifact identity
+        if: ${{ always() && steps.upload_evidence.outputs.artifact-id != '' }}
+        env:
+          ARTIFACT_ID: ${{ steps.upload_evidence.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload_evidence.outputs.artifact-digest }}
+        shell: bash
+        run: |
+          python3 - "fuzz-evidence/records/$TARGET/shard-$SHARD_INDEX.json" \
+            "$EVIDENCE_NAME" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" <<'PY'
+          import json
+          import sys
+          path, name, artifact_id, digest = sys.argv[1:]
+          record = json.loads(open(path, encoding='utf-8').read())
+          record.update(artifact_name=name, artifact_id=int(artifact_id), artifact_sha256=digest)
+          with open(path, 'w', encoding='utf-8') as output:
+              json.dump(record, output, sort_keys=True, separators=(',', ':'))
+              output.write('\n')
+          PY
+      - name: Upload shard record
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.RECORD_NAME }}
+          path: fuzz-evidence/records
+          if-no-files-found: error
+          retention-days: 30
+      - name: Package corpus handoff
+        if: ${{ success() }}
+        shell: bash
+        run: tar -czf handoff.tar.gz -C "fuzz-evidence/corpora/$CAMPAIGN_ID/$TARGET/shard-$SHARD_INDEX/output" .
+      - name: Upload corpus handoff
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.HANDOFF_NAME }}
+          path: handoff.tar.gz
+          if-no-files-found: error
+          retention-days: 30

@@ -77,54 +77,39 @@ or push, and it is not a required CI gate.
 
 Launch it before an RC from GitHub Actions with:
 
-- `target`: `all`, `parser`, `csv_reader`, `intern`, or `compound_arena`
-  (default: `all`).
-- `duration`: per-target libFuzzer duration such as `60s`, `10m`, or `24h`
-  (default: `60s`).
-- `runs_on`: JSON runner labels for the Actions job
-  (default: `["ubuntu-latest"]`).
-- `timeout_minutes`: GitHub Actions job timeout in minutes, separate from the
-  per-target libFuzzer duration (default: `360`).
+- `duration`: per-shard libFuzzer duration from `1s` through `4h`
+  (default: `4h`).
+- `timeout_minutes`: timeout for each hosted shard job, at most `360`
+  (default: `360`).
 
-The hosted default runner is only for smoke/evidence-path validation. For a
-hosted smoke run, leave `runs_on=["ubuntu-latest"]`, `duration=60s`, and
-`timeout_minutes=360`. That default path does not produce release evidence.
-Release evidence for `#874` / `#684` / `#694` requires an explicit long run,
-normally `duration=24h`, and a runner whose runtime policy supports the
-requested duration. Use `runs_on` to select appropriate self-hosted or larger
-runner labels for planned 24h evidence.
+The workflow always runs all four targets on `ubuntu-latest`; it accepts no
+arbitrary runner labels and does not require a self-hosted runner. It uses six
+explicit sequential waves. Within each wave, parser, CSV reader, intern, and
+compound-arena targets run in parallel. Shard N downloads the corpus handoff
+produced by shard N-1 for the same target, while shard 1 starts from the
+committed seed corpus.
 
-For a single-target 24h release run, select one target such as `parser`, set
-`duration=24h`, set `runs_on` to the long-running runner labels, and set
-`timeout_minutes` above 1440 plus setup/minimization/upload buffer; `1500` is a
-reasonable starting point. The workflow validates the timeout estimate before
-building.
+The default campaign therefore provides six sequential four-hour intervals,
+or 24 cumulative fuzz hours per target. This is cumulative sequential
+evidence, not one uninterrupted 24-hour process. For an evidence-path smoke,
+dispatch with `duration=1s`; for release evidence, use the default `duration=4h`
+and let all six waves complete.
 
-The duration is per target. `target=all` runs the four targets sequentially for
-that duration each, so release evidence should usually be launched as separate
-per-target workflow runs or on a runner whose runtime policy covers the full
-all-target runtime. `target=all` with `duration=24h` is about 96h plus
-overhead. The workflow rejects runs whose estimated runtime exceeds
-`timeout_minutes`, and rejects the hosted default `["ubuntu-latest"]` runner
-labels whenever the estimate exceeds the hosted 6h limit.
-
-The workflow builds the four libFuzzer targets with Clang, writes soak evidence
-under `fuzz-evidence/soak`, and, only if the soak step succeeds, writes
-minimized corpora under `fuzz-evidence/minimized`. Artifacts are uploaded with
-`if: always()`, so crashes and nonzero exits should still retain available soak
-logs and reproducers even when minimization does not run. Artifact upload after
-runner cancellation or timeout is best-effort, and long-run artifact upload,
-token, and runtime policies are runner-dependent. Planned release evidence
-should use a runner that is not expected to time out or be cancelled.
+Each shard builds the fuzz targets with Clang, writes evidence under
+`fuzz-evidence/corpora`, and uploads its corpus, record, and next-shard handoff
+as uniquely named artifacts. Crashes and nonzero exits remain failed records;
+the final verifier rejects them rather than converting them into successful
+evidence. A cancellation or timeout may prevent artifact upload entirely, so
+the final verifier fails closed when records or shards are missing.
 
 Retained release evidence should include:
 
 - the GitHub workflow run URL,
-- the uploaded `fuzz-evidence` artifact bundle,
-- `soak/manifest.txt`,
-- each target's soak `metadata.txt` and `logs/libfuzzer.log`,
-- crash/reproducer artifacts under each target's `artifacts/`,
-- `minimized/manifest.txt` and minimized target corpus roots when soak succeeds.
+- the uploaded corpus and record artifacts,
+- `records/<target>/shard-<n>.json`,
+- each target's six corpus snapshots and logs,
+- crash/reproducer artifacts under each target's `crashes/`,
+- and `verification.json` from the final verifier.
 
 Pass/fail policy: any libFuzzer crash or nonzero target exit blocks the RC.
 Keep the uploaded reproducers/logs, file a follow-up with the failing target and
