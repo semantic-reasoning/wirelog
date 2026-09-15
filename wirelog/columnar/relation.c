@@ -3636,6 +3636,7 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     col_rel_replacement_t *replacement)
 {
     col_rel_t old;
+    col_rel_t *owner = NULL;
     col_rel_t *staged;
     wl_columnar_memory_reservation_t new_reservation;
     char *name;
@@ -3653,7 +3654,9 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
 
     if (!dst || !replacement || !replacement->staged
         || !replacement->writer_acquired
-        || replacement->writer.owner != &dst->source_access
+        || col_rel_storage_owner_resolve(dst, &owner) != 0
+        || owner != dst
+        || replacement->writer.owner != &owner->source_access
         || !wl_columnar_source_access_writer_thread_equal(
             &replacement->writer))
         return EINVAL;
