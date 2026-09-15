@@ -890,6 +890,152 @@ test_radix_sort_locked_validates_below_the_range_shortcut(void)
     cleanup_relations();
 }
 
+/* Every radix-sort entry point must reject a contended or malformed trivial
+ * range before treating it as a no-op.  The implicit-writer wrappers are
+ * checked separately with a source reader because a standalone call cannot
+ * be supplied a foreign writer. */
+static void
+test_radix_sort_family_validates_trivial_ranges(void)
+{
+    col_rel_t *rel = new_relation();
+    col_rel_t *other = new_relation();
+    col_rel_t *owner = new_relation();
+    col_rel_t *alias = new_relation();
+    wl_columnar_source_access_writer_t writer = { 0 };
+    wl_columnar_source_access_writer_t malformed = { 0 };
+    wl_columnar_source_access_reader_t reader = { 0 };
+    wl_columnar_radix_workspace_t workspace = { 0 };
+    const uint32_t boundaries[] = { 0u, 1u };
+    int64_t value = 7;
+    bool pending = true;
+    uint32_t sorted_before;
+
+    CHECK(rel && other && owner && alias, "trivial-range family relations");
+    CHECK(col_rel_append_row(rel, &value) == 0,
+        "trivial-range family row");
+    CHECK(wl_columnar_radix_workspace_prepare(rel, boundaries, 1, 0,
+        &workspace) == 0, "trivial-range workspace preparation");
+    CHECK(col_rel_source_writer_acquire(other, &writer) == 0,
+        "trivial-range foreign writer acquisition");
+    CHECK(col_rel_radix_sort_locked(rel, 0, 1, &writer, false, &pending)
+        == EINVAL, "locked sort rejects foreign writer for one row");
+    CHECK(pending == false, "locked sort clears pending on rejection");
+    CHECK(wl_columnar_relation_radix_sort_with_workspace(rel, 0, 1,
+        &writer, &workspace) == EINVAL,
+        "workspace sort rejects foreign writer for one row");
+    malformed.owner = &rel->source_access;
+    malformed.identity = (uintptr_t)&malformed;
+    CHECK(col_rel_radix_sort_locked(rel, 0, 1, &malformed, false, &pending)
+        == EINVAL, "locked sort rejects invalid writer thread token");
+    CHECK(wl_columnar_relation_radix_sort_with_workspace(rel, 0, 1,
+        &malformed, &workspace) == EINVAL,
+        "workspace sort rejects invalid writer thread token");
+    CHECK(col_rel_radix_sort_locked(rel, 0, 0, &writer, false, &pending)
+        == EINVAL, "locked sort rejects foreign writer for empty range");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "trivial-range foreign writer release");
+    wl_columnar_radix_workspace_destroy(&workspace);
+
+    CHECK(col_rel_append_row(owner, &value) == 0,
+        "trivial-range owner row");
+    CHECK(col_rel_install_shared_view(alias, owner) == 0,
+        "trivial-range owner shared view");
+    wl_columnar_radix_workspace_destroy(&workspace);
+    CHECK(wl_columnar_radix_workspace_prepare(owner, boundaries, 1, 0,
+        &workspace) == 0, "trivial-range owner workspace preparation");
+    CHECK(col_rel_source_writer_acquire(owner, &writer) == 0,
+        "trivial-range owner writer acquisition");
+    CHECK(col_rel_radix_sort_locked(owner, 0, 0, &writer, false, &pending)
+        == EBUSY, "locked sort reports owner borrow for empty range");
+    CHECK(col_rel_radix_sort_locked(owner, 0, 1, &writer, false, &pending)
+        == EBUSY, "locked sort reports owner borrow for one row");
+    CHECK(wl_columnar_relation_radix_sort_with_workspace(owner, 0, 0,
+        &writer, &workspace) == EBUSY,
+        "workspace sort reports owner borrow for empty range");
+    CHECK(wl_columnar_relation_radix_sort_with_workspace(owner, 0, 1,
+        &writer, &workspace) == EBUSY,
+        "workspace sort reports owner borrow for one row");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "trivial-range owner writer release");
+    wl_columnar_radix_workspace_destroy(&workspace);
+    sorted_before = owner->sorted_nrows;
+    CHECK(col_rel_radix_sort(owner, 0, 0) == EBUSY,
+        "standalone sort reports owner borrow for empty range");
+    CHECK(col_rel_radix_sort(owner, 0, 1) == EBUSY,
+        "standalone sort reports owner borrow for one row");
+    CHECK(col_rel_radix_sort_int64(owner) == EBUSY,
+        "int64 sort reports owner borrow for one row");
+    CHECK(owner->sorted_nrows == sorted_before,
+        "failed int64 sort preserves sorted row count");
+    CHECK(col_rel_storage_alias_release(alias) == 0,
+        "trivial-range owner alias release");
+    cleanup_relations();
+
+    rel = new_relation();
+    CHECK(rel != NULL, "trivial-range reader relation");
+    CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "trivial-range reader acquisition");
+    CHECK(col_rel_radix_sort(rel, 0, 0) == EBUSY,
+        "standalone sort reports reader contention for empty range");
+    CHECK(col_rel_radix_sort_int64(rel) == EBUSY,
+        "int64 sort reports reader contention for empty range");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "trivial-range reader release");
+    cleanup_relations();
+
+    col_rel_t *empty_owner = new_relation();
+    col_rel_t *empty_alias = new_relation();
+    CHECK(empty_owner && empty_alias, "empty borrowed-owner relations");
+    CHECK(col_rel_install_shared_view(empty_alias, empty_owner) == 0,
+        "empty borrowed-owner shared view");
+    CHECK(col_rel_radix_sort_int64(empty_owner) == EBUSY,
+        "int64 sort reports owner borrow for zero rows");
+    CHECK(col_rel_storage_alias_release(empty_alias) == 0,
+        "empty borrowed-owner alias release");
+    cleanup_relations();
+
+    col_rel_t *zero = NULL;
+    wl_columnar_source_access_writer_t zero_writer = { 0 };
+    wl_columnar_radix_workspace_t zero_workspace = { 0 };
+    const uint32_t zero_boundaries[] = { 0u, 3u };
+    CHECK(col_rel_alloc(&zero, "trivial-range-zero") == 0,
+        "zero-column relation allocation");
+    CHECK(track_relation(zero) != NULL
+        && col_rel_set_schema(zero, 0, NULL) == 0,
+        "zero-column relation schema");
+    for (uint32_t i = 0; i < 3; i++)
+        CHECK(col_rel_append_row(zero, &value) == 0,
+            "zero-column relation row");
+    CHECK(wl_columnar_radix_workspace_prepare(zero, zero_boundaries, 1, 0,
+        &zero_workspace) == 0, "zero-column workspace preparation");
+    CHECK(col_rel_source_writer_acquire(zero, &zero_writer) == 0,
+        "zero-column writer acquisition");
+    CHECK(col_rel_radix_sort_locked(zero, 0, zero->nrows, &zero_writer,
+        false, &pending) == 0,
+        "zero-column locked sort remains a validated no-op");
+    CHECK(wl_columnar_relation_radix_sort_with_workspace(zero, 0,
+        zero->nrows, &zero_writer, &zero_workspace) == 0,
+        "zero-column workspace sort remains a validated no-op");
+    CHECK(wl_columnar_source_access_writer_release(&zero_writer) == 0,
+        "zero-column writer release");
+    wl_columnar_radix_workspace_destroy(&zero_workspace);
+    CHECK(col_rel_radix_sort_int64(zero) == 0
+        && zero->sorted_nrows == zero->nrows,
+        "zero-column sort keeps its no-op behavior after validation");
+    uint64_t zero_view_before = zero->view_generation;
+    uint32_t zero_sorted_before = zero->sorted_nrows;
+    CHECK(col_rel_source_reader_acquire(zero, &reader) == 0,
+        "zero-column reader acquisition");
+    CHECK(col_rel_radix_sort_int64(zero) == EBUSY,
+        "zero-column sort reports reader contention");
+    CHECK(zero->view_generation == zero_view_before
+        && zero->sorted_nrows == zero_sorted_before,
+        "zero-column refusal preserves generation and sorted count");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "zero-column reader release");
+    cleanup_relations();
+}
+
 /* An owner with live borrows is refused with EBUSY.  The source gate is
  * deliberately left uncontended so the status can only come from the alias
  * predicate, not from a reader holding the gate. */
@@ -3485,6 +3631,7 @@ main(void)
     test_radix_sort_locked_rejects_foreign_writer();
     test_radix_sort_locked_rejects_absent_writer_and_out();
     test_radix_sort_locked_validates_below_the_range_shortcut();
+    test_radix_sort_family_validates_trivial_ranges();
     test_radix_sort_locked_owner_with_borrows_is_busy();
     test_radix_sort_locked_hands_back_the_alias();
     test_radix_sort_locked_releases_the_alias_itself();

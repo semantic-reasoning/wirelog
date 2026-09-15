@@ -5470,8 +5470,6 @@ wl_columnar_relation_radix_sort_with_workspace(col_rel_t *r,
     if (!r || !workspace || start_row > r->nrows
         || nrows > r->nrows - start_row)
         return EINVAL;
-    if (nrows <= 1)
-        return 0;
     rc = col_rel_storage_owner_resolve(r, &owner);
     if (rc != 0)
         return rc;
@@ -5484,6 +5482,8 @@ wl_columnar_relation_radix_sort_with_workspace(col_rel_t *r,
      * caller two different ways for the same condition. */
     if (r == owner && col_rel_storage_alias_borrow_count(owner) > 0)
         return EBUSY;
+    if (r->ncols == 0 || nrows <= 1)
+        return 0;
     bool alias_release_pending = false;
     rc = col_rel_radix_sort_impl(r, start_row, nrows, false,
             &alias_release_pending, workspace);
@@ -5620,7 +5620,7 @@ col_rel_radix_sort_locked(col_rel_t *r, uint32_t start_row, uint32_t nrows,
         return EINVAL;
     if (r == owner && col_rel_storage_alias_borrow_count(owner) > 0)
         return EBUSY;
-    if (nrows <= 1)
+    if (r->ncols == 0 || nrows <= 1)
         return 0;
     rc = col_rel_radix_sort_impl(r, start_row, nrows, defer_alias_release,
             out_alias_release_pending, NULL);
@@ -5644,8 +5644,6 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
 
     if (!r || start_row > r->nrows || nrows > r->nrows - start_row)
         return EINVAL;
-    if (nrows <= 1)
-        return 0;
     rc = col_rel_source_writer_acquire(r, &writer);
     if (rc != 0)
         return rc;
@@ -5670,16 +5668,9 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
 int
 col_rel_radix_sort_int64(col_rel_t *r)
 {
-    if (!r || r->ncols == 0) {
-        if (r)
-            r->sorted_nrows = r->nrows;
+    if (!r) {
         return 0;
     }
-    if (r->nrows <= 1) {
-        r->sorted_nrows = r->nrows;
-        return 0;
-    }
-
     /* col_rel_radix_sort() detaches a shared view itself (through the
      * admitted col_rel_cow_unshare) and rolls the detach back if the sort
      * cannot allocate, so no COW happens here.  It takes the canonical-owner

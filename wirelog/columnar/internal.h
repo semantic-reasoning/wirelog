@@ -2467,12 +2467,9 @@ wl_columnar_radix_workspace_destroy(wl_columnar_radix_workspace_t *workspace);
  * unshared and sorted the same relation.
  *
  * A NULL relation or workspace, and a bad range, are refused at every row
- * count.  Past those, nrows <= 1 returns 0 without reaching the writer,
- * owner-linkage, contention or workspace-capacity checks, so none of those
- * statuses is reported for a range that short.  col_rel_radix_sort_locked
- * differs deliberately -- all of its checks run at every row count -- and
- * the rest of the family short-circuits like this one.  Unifying that is
- * #1601.
+ * count.  Writer, owner-linkage and contention checks also run before the
+ * nrows <= 1 shortcut, so a malformed or contended call is never masked by
+ * a trivial range.  Workspace capacity is not needed for a trivial range.
  *
  * EBUSY here is the same predicate and the same status
  * col_rel_radix_sort_locked reports.
