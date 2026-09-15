@@ -408,9 +408,9 @@ kway_row_cmp(const int64_t *a, const int64_t *b, uint32_t ncols)
  * Direct column access for cache efficiency (Issue #334). */
 static inline int
 col_rel_row_cmp_raw(const col_rel_t *r, uint32_t row_idx,
-    const int64_t *raw_row)
+    const int64_t *raw_row, uint32_t row_width)
 {
-    for (uint32_t c = 0; c < r->ncols; c++) {
+    for (uint32_t c = 0; c < row_width; c++) {
         int64_t value = r->columns[c][row_idx];
         if (r->column_types && r->column_types[c] == WIRELOG_TYPE_FLOAT) {
             int cmp = wl_columnar_float_compare_bits(value, raw_row[c]);
@@ -763,32 +763,9 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
         return ENOMEM;
     additional_scratch_bytes = segment_total_bytes;
     if (seg_count >= 2) {
-        /* Both the zero test inside col_op_consolidate_size_multiply's
-         * `right != 0` guard and a `merged_bytes == 0` test would pin the
-         * merge-output extent to a small constant, after which the
-         * analyzer can no longer see that nc is the same width the buffer
-         * was sized with, and reports the raw_row[c] reads in
-         * col_rel_row_cmp_raw as out of bounds.  Two things keep it
-         * symbolic, and they are pinned by different checks.  Keeping nr
-         * -- known > 1 from the early return above -- as the right operand
-         * is what the tidy ratchet guards: swapping it back reintroduces
-         * clang-analyzer-security.ArrayBound, and merge.c is an
-         * allowlisted file the ratchet holds clean.  Replacing the
-         * unconditional add with a `merged_bytes == 0` test does the same.
-         * Deleting the slack outright is analyzer-clean, so the ratchet
-         * would not catch it; what it reintroduces is the zero-sized
-         * allocation below, which the zero-arity merge test pins instead.
-         *
-         * The slack also earns its place without the analyzer: a zero-arity
-         * relation (.decl p()) reaches this path with nc == 0, and
-         * col_op_consolidate_malloc is a thin malloc() wrapper whose NULL
-         * is read as exhaustion below, so a zero-sized merge output would
-         * be a spurious ENOMEM on a libc where malloc(0) returns NULL.
-         *
-         * This is defensive, not curative: it keeps the extent symbolic
-         * rather than giving the analyzer the width invariant that
-         * col_rel_row_cmp_raw actually relies on.  Issue #1592 tracks
-         * removing the need for both constructs. */
+        /* Keep one element of storage for zero-arity relations: malloc(0)
+         * is permitted to return NULL, which would otherwise look like
+         * ENOMEM to the allocation check below. */
         if (!col_op_consolidate_size_multiply(nc, sizeof(int64_t),
             &row_bytes)
             || !col_op_consolidate_size_multiply(row_bytes, nr,
@@ -960,7 +937,7 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
     while (heap_size > 0) {
         /* Dedup: skip if same as last emitted row */
         if (last_row == NULL
-            || col_rel_row_cmp_raw(rel, heap[0].cursor, last_row) != 0) {
+            || col_rel_row_cmp_raw(rel, heap[0].cursor, last_row, nc) != 0) {
             col_rel_row_copy_out(rel, heap[0].cursor,
                 merged + (size_t)out * nc);
             last_row = merged + (size_t)out * nc;
@@ -1462,7 +1439,7 @@ col_rel_compact_runs(col_rel_t *rel)
 
     while (heap_size > 0) {
         if (last_row == NULL
-            || col_rel_row_cmp_raw(rel, heap[0].cursor, last_row) != 0) {
+            || col_rel_row_cmp_raw(rel, heap[0].cursor, last_row, nc) != 0) {
             col_rel_row_copy_out(rel, heap[0].cursor,
                 merged + (size_t)out * nc);
             last_row = merged + (size_t)out * nc;
