@@ -3173,6 +3173,229 @@ test_staged_replacement_contract(void)
             wl_columnar_memory_governor_ref_release(ref);
     }
 
+    {
+        wl_columnar_source_access_writer_t *writer;
+        wl_columnar_memory_resolution_t resolution = { 0 };
+        wl_columnar_memory_governor_ref_t *ref;
+        uint64_t prepared_bytes;
+        uint64_t reserved_before;
+        uint64_t old_view;
+        uint64_t old_storage;
+
+        resolution.budget_bytes = 4096u;
+        resolution.usable_bytes = 4096u;
+        resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+        resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+        resolution.status = WL_COLUMNAR_MEMORY_OK;
+        ref = wl_columnar_memory_governor_ref_create(&resolution);
+        dst = new_relation();
+        candidate = new_relation();
+        CHECK(ref && dst && candidate, "locked replacement setup");
+        CHECK(col_rel_attach_memory_governor(dst, ref) == 0
+            && col_rel_append_row(dst, &old_value) == 0
+            && col_rel_append_row(candidate, &new_value) == 0,
+            "locked replacement rows");
+        old_view = dst->view_generation;
+        old_storage = dst->storage_generation;
+        reserved_before = wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref));
+        memset(&replacement, 0, sizeof(replacement));
+        writer = &replacement.writer;
+        CHECK(wl_columnar_source_access_writer_acquire(
+                &dst->source_access, writer) == 0,
+            "locked replacement writer admission");
+        CHECK(col_rel_prepare_replacement_locked(dst, candidate, &replacement)
+            == 0,
+            "locked replacement prepare succeeds");
+        prepared_bytes = replacement.reserved_bytes;
+        CHECK(replacement.reservation_active && prepared_bytes > 0
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref))
+            == reserved_before + prepared_bytes,
+            "locked prepare holds governed reservation");
+        CHECK(replacement.writer.identity == (uintptr_t)&replacement.writer
+            && replacement.writer.owner == &dst->source_access
+            && dst->nrows == 1 && dst->columns[0][0] == old_value
+            && dst->view_generation == old_view
+            && dst->storage_generation == old_storage,
+            "locked prepare retains the actual writer and destination state");
+        col_rel_discard_replacement(&replacement);
+        col_rel_discard_replacement(&replacement);
+        CHECK(!replacement.writer_acquired && !replacement.reservation_active
+            && replacement.staged == NULL
+            && dst->nrows == 1 && dst->columns[0][0] == old_value
+            && dst->view_generation == old_view
+            && dst->storage_generation == old_storage
+            && atomic_load_explicit(&dst->source_access.state,
+            memory_order_acquire) == 0
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == reserved_before,
+            "locked discard before commit rolls back reservation");
+
+        memset(&replacement, 0, sizeof(replacement));
+        CHECK(wl_columnar_source_access_writer_acquire(
+                &dst->source_access, &replacement.writer) == 0
+            && col_rel_prepare_replacement_locked(dst, candidate, &replacement)
+            == 0,
+            "locked replacement retries after discard");
+        prepared_bytes = replacement.reserved_bytes;
+        CHECK(col_rel_commit_replacement_locked(dst, &replacement) == 0
+            && atomic_load_explicit(&dst->source_access.state,
+            memory_order_acquire) == 0,
+            "locked replacement commit consumes writer once");
+        CHECK(!replacement.writer_acquired && !replacement.reservation_active
+            && dst->retained_reserved_bytes == prepared_bytes
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == prepared_bytes,
+            "locked commit transfers reservation and releases writer");
+        CHECK(atomic_load_explicit(&dst->source_access.state,
+            memory_order_acquire) == 0
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref))
+            == reserved_before + prepared_bytes,
+            "locked discard after commit is idempotent");
+        cleanup_relations();
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "locked committed reservation releases with destination");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+
+    {
+        uint64_t identity;
+        uint64_t old_view;
+        uint64_t old_storage;
+
+        dst = new_relation();
+        candidate = new_relation();
+        CHECK(dst && candidate, "locked replacement failure setup");
+        identity = dst->relation_identity;
+        old_view = dst->view_generation;
+        old_storage = dst->storage_generation;
+        candidate->nrows = candidate->capacity + 1u;
+        memset(&replacement, 0, sizeof(replacement));
+        CHECK(wl_columnar_source_access_writer_acquire(
+                &dst->source_access, &replacement.writer) == 0,
+            "locked replacement failure writer admission");
+        CHECK(col_rel_prepare_replacement_locked(dst, candidate, &replacement)
+            == EINVAL,
+            "locked replacement failure is reported");
+        CHECK(!replacement.writer_acquired
+            && replacement.staged == NULL
+            && atomic_load_explicit(&dst->source_access.state,
+            memory_order_acquire) == 0
+            && dst->relation_identity == identity
+            && dst->view_generation == old_view
+            && dst->storage_generation == old_storage,
+            "locked failure releases writer and preserves destination");
+        col_rel_discard_replacement(&replacement);
+        col_rel_discard_replacement(&replacement);
+        cleanup_relations();
+    }
+
+#ifdef WL_TEST_ALLOC_WRAP
+    {
+        wl_columnar_memory_resolution_t resolution = { 0 };
+        wl_columnar_memory_governor_ref_t *ref;
+        uint64_t identity;
+        uint64_t old_view;
+        uint64_t old_storage;
+        uint64_t reserved_before;
+        uint64_t retained_before;
+        uint64_t retained_identity;
+        uint64_t retained_state;
+        uint64_t retained_owner_bits;
+
+        resolution.budget_bytes = 4096u;
+        resolution.usable_bytes = 4096u;
+        resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+        resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+        resolution.status = WL_COLUMNAR_MEMORY_OK;
+        ref = wl_columnar_memory_governor_ref_create(&resolution);
+        dst = new_relation();
+        candidate = new_relation();
+        CHECK(ref && dst && candidate, "locked reservation failure setup");
+        CHECK(col_rel_attach_memory_governor(dst, ref) == 0
+            && col_rel_append_row(dst, &old_value) == 0
+            && col_rel_append_row(candidate, &new_value) == 0,
+            "locked reservation failure rows");
+        identity = dst->relation_identity;
+        old_view = dst->view_generation;
+        old_storage = dst->storage_generation;
+        reserved_before = wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref));
+        retained_before = dst->retained_reserved_bytes;
+        retained_identity =
+            (uint64_t)(uintptr_t)dst->retained_reservation.identity;
+        retained_state = atomic_load_explicit(
+            &dst->retained_reservation.state, memory_order_acquire);
+        retained_owner_bits = atomic_load_explicit(
+            &dst->retained_reservation.owner_bits, memory_order_acquire);
+        memset(&replacement, 0, sizeof(replacement));
+        CHECK(wl_columnar_source_access_writer_acquire(
+                &dst->source_access, &replacement.writer) == 0,
+            "locked reservation failure writer admission");
+        allocation_calls = 0;
+        allocation_fail_at = 0;
+        CHECK(col_rel_prepare_replacement_locked(dst, candidate, &replacement)
+            == ENOMEM,
+            "locked deep-copy failure after reservation");
+        allocation_fail_at = -1;
+        CHECK(!replacement.staged && !replacement.reservation_active
+            && replacement.reserved_bytes == 0
+            && !replacement.writer_acquired
+            && atomic_load_explicit(&dst->source_access.state,
+            memory_order_acquire) == 0
+            && dst->relation_identity == identity
+            && dst->view_generation == old_view
+            && dst->storage_generation == old_storage
+            && dst->retained_reserved_bytes == retained_before
+            && (uint64_t)(uintptr_t)dst->retained_reservation.identity
+            == retained_identity
+            && atomic_load_explicit(&dst->retained_reservation.state,
+            memory_order_acquire) == retained_state
+            && atomic_load_explicit(&dst->retained_reservation.owner_bits,
+            memory_order_acquire) == retained_owner_bits
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == reserved_before,
+            "locked reservation failure rolls back all state");
+        col_rel_discard_replacement(&replacement);
+        col_rel_discard_replacement(&replacement);
+        cleanup_relations();
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "locked reservation failure releases destination admission");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+#endif
+
+    {
+        col_rel_t *other = new_relation();
+        uint64_t dst_state;
+        uint64_t other_state;
+
+        dst = new_relation();
+        candidate = new_relation();
+        CHECK(dst && candidate && other, "wrong-owner replacement setup");
+        memset(&replacement, 0, sizeof(replacement));
+        CHECK(wl_columnar_source_access_writer_acquire(
+                &other->source_access, &replacement.writer) == 0,
+            "wrong-owner writer admission");
+        CHECK(col_rel_prepare_replacement_locked(dst, candidate, &replacement)
+            == EINVAL,
+            "wrong-owner replacement is rejected");
+        dst_state = atomic_load_explicit(&dst->source_access.state,
+                memory_order_acquire);
+        other_state = atomic_load_explicit(&other->source_access.state,
+                memory_order_acquire);
+        CHECK(dst_state == 0 && other_state == 0
+            && !replacement.writer_acquired,
+            "wrong-owner failure releases only the valid acquired writer");
+        col_rel_discard_replacement(&replacement);
+        col_rel_discard_replacement(&replacement);
+        cleanup_relations();
+    }
+
     dst = new_relation();
     candidate = new_relation();
     CHECK(dst && candidate, "replacement reader setup");
