@@ -1099,6 +1099,48 @@ read_alias_borrows_while_peer_lease_is_active(void *opaque)
     return NULL;
 }
 
+/* Bounded, yielding wait, mirroring peer_test_yield/peer_test_wait_reads in
+ * tests/test_worker_session.c.  An unbounded spin would make the
+ * reads_during_accounting assertion below unfalsifiable: it could only hang,
+ * never fail, so a future change that stops the peer sampling would surface
+ * as a CI timeout with no diagnostic instead of a named failure. */
+static void
+alias_accounting_yield(void)
+{
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_yield();
+#elif defined(_WIN32) || defined(_WIN64)
+    SwitchToThread();
+#else
+    sched_yield();
+#endif
+}
+
+static uint64_t
+alias_accounting_now_ms(void)
+{
+#if defined(_WIN32) || defined(_WIN64)
+    return (uint64_t)GetTickCount64();
+#else
+    struct timespec now;
+    if (timespec_get(&now, TIME_UTC) != TIME_UTC)
+        return 0;
+    return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+#endif
+}
+
+static bool
+alias_accounting_wait_reads(const atomic_uint_fast64_t *value)
+{
+    uint64_t start = alias_accounting_now_ms();
+    while (atomic_load_explicit(value, memory_order_relaxed) == 0) {
+        if (alias_accounting_now_ms() - start >= 5000u)
+            return false;
+        alias_accounting_yield();
+    }
+    return true;
+}
+
 static void
 test_peer_reader_alias_accounting_is_race_safe(void)
 {
@@ -1141,6 +1183,14 @@ test_peer_reader_alias_accounting_is_race_safe(void)
             col_rel_destroy(alias);
             ok = false;
         }
+        /* Wait for the peer to actually sample inside the window rather
+         * than assuming it was scheduled.  On a host with fewer cores than
+         * threads the main loop closed every round inside one quantum, the
+         * peer never ran, and the reads assertion below failed
+         * deterministically -- which is what the arm64 CI leg was
+         * reporting.  Reproducible on x86_64 with `taskset -c 0`. */
+        if (!alias_accounting_wait_reads(&args.reads_during_accounting))
+            ok = false;
         atomic_store_explicit(&args.accounting_active, false,
             memory_order_release);
         if (owner->storage_alias_borrows != 0)
@@ -2818,7 +2868,7 @@ test_sort_failure_atomicity(void)
     bool *old_flags = view->col_shared;
     uint64_t old_view = view->view_generation;
     uint64_t old_storage = view->storage_generation;
-    uint32_t old_borrows = source->storage_alias_borrows;
+    uint64_t old_borrows = source->storage_alias_borrows;
     col_rel_t *old_owner = view->storage_owner;
     allocation_calls = 0;
     allocation_fail_at = 4; /* backups and COW succeed; k8 setup fails. */
