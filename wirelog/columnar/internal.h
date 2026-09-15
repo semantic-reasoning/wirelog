@@ -1333,6 +1333,8 @@ typedef struct {
     wl_mem_ledger_t *ledger;
     uint64_t ledger_bytes;
     col_relation_snapshot_t source_snapshot;
+    uint32_t pin_count;    /* active LFTJ readers of sorted[] */
+    bool rebuild_deferred; /* source changed while pinned */
 } col_sorted_arr_t;
 
 /*
@@ -1344,6 +1346,20 @@ typedef struct {
     uint32_t key_col;
     col_sorted_arr_t sarr;
 } col_sorted_arr_entry_t;
+
+/* Lease binding a sorted arrangement to its exact source generation while an
+ * operator reads the cached row-major buffer.  The source reader also keeps
+ * the source storage stable until the lease is released. */
+typedef struct {
+    col_sorted_arr_entry_t *entry;
+    col_sorted_arr_t *arr;
+    struct wl_col_session_t *session;
+    const col_rel_t *source;
+    col_relation_snapshot_t source_snapshot;
+    wl_columnar_source_access_reader_t source_reader;
+    uintptr_t identity;
+    bool active;
+} col_sorted_arrangement_probe_t;
 
 /* ======================================================================== */
 /* Differential Arrangement Registry (Issue #263)                           */
@@ -1791,6 +1807,7 @@ typedef struct wl_col_session_t {
     *sarr_entries;     /* flat array of sorted arrangements */
     uint32_t sarr_count;
     uint32_t sarr_cap;
+    uint32_t sarr_active_pins;
 #ifdef WL_PROFILE
     wl_profile_stats_t profile; /* operator profiling counters */
 #endif
@@ -2681,6 +2698,12 @@ col_diff_arr_entries_clone(const col_diff_arr_entry_t *src, uint32_t count,
 col_sorted_arr_t *
 col_session_get_sorted_arrangement(wl_col_session_t *cs, const char *rel_name,
     uint32_t key_col);
+int
+col_session_acquire_sorted_arrangement_probe(wl_session_t *session,
+    const col_rel_t *source, uint32_t key_col,
+    col_sorted_arrangement_probe_t *probe);
+int
+col_sorted_arrangement_probe_release(col_sorted_arrangement_probe_t *probe);
 void
 col_session_free_sorted_arrangements(wl_col_session_t *cs);
 

@@ -1796,6 +1796,9 @@ col_arrangement_find_next(const col_arrangement_t *arr, uint32_t row_idx)
     return arr->ht_next[row_idx];
 }
 
+static void sarr_release(col_sorted_arr_t *sarr);
+static void sarr_mark_deferred(col_sorted_arr_t *sarr);
+
 void
 col_session_invalidate_arrangements(wl_session_t *sess, const char *rel_name)
 {
@@ -1809,6 +1812,23 @@ col_session_invalidate_arrangements(wl_session_t *sess, const char *rel_name)
                 cs->arr_entries[i].rebuild_deferred = true;
             else
                 arr_entry_mark_unbuilt(&cs->arr_entries[i]);
+        }
+    }
+
+    /* Sorted LFTJ copies have the same lifetime contract as primary
+     * arrangements: preserve a pinned buffer, otherwise retire it now. */
+    for (uint32_t i = 0; i < cs->sarr_count; i++) {
+        col_sorted_arr_entry_t *entry = &cs->sarr_entries[i];
+        if (!entry->rel_name || strcmp(entry->rel_name, rel_name) != 0)
+            continue;
+        if (entry->sarr.pin_count > 0) {
+            sarr_mark_deferred(&entry->sarr);
+        } else {
+            sarr_release(&entry->sarr);
+            entry->sarr.nrows = 0;
+            entry->sarr.indexed_rows = 0;
+            memset(&entry->sarr.source_snapshot, 0,
+                sizeof(entry->sarr.source_snapshot));
         }
     }
 
@@ -2143,6 +2163,8 @@ col_session_get_frontier(wl_session_t *session, uint32_t stratum_idx,
 static void
 sarr_release(col_sorted_arr_t *sarr)
 {
+    if (!sarr || sarr->pin_count != 0)
+        return;
     if (sarr->ledger && sarr->ledger_bytes > 0)
         wl_mem_ledger_free(sarr->ledger, WL_MEM_SUBSYS_ARRANGEMENT,
             sarr->ledger_bytes);
@@ -2154,42 +2176,87 @@ sarr_release(col_sorted_arr_t *sarr)
 static int
 sarr_build(col_sorted_arr_t *sarr, const col_rel_t *rel, uint32_t key_col)
 {
-    sarr_release(sarr);
-    sarr->nrows = 0;
-    sarr->ncols = rel->ncols;
-    sarr->key_col = key_col;
-    sarr->indexed_rows = 0;
+    col_sorted_arr_t fresh;
+    int64_t *old_sorted;
+    uint64_t old_ledger_bytes;
+
+    if (!sarr || !rel || sarr->pin_count != 0)
+        return EBUSY;
+    memset(&fresh, 0, sizeof(fresh));
+    fresh.ncols = rel->ncols;
+    fresh.key_col = key_col;
+    fresh.ledger = sarr->ledger;
 
     if (rel->nrows == 0) {
-        sarr->source_snapshot = wl_columnar_relation_snapshot(rel);
+        fresh.source_snapshot = wl_columnar_relation_snapshot(rel);
+        old_sorted = sarr->sorted;
+        old_ledger_bytes = sarr->ledger_bytes;
+        sarr->sorted = NULL;
+        sarr->ledger_bytes = 0;
+        free(old_sorted);
+        if (sarr->ledger && old_ledger_bytes > 0)
+            wl_mem_ledger_free(sarr->ledger, WL_MEM_SUBSYS_ARRANGEMENT,
+                old_ledger_bytes);
+        *sarr = fresh;
         return 0;
     }
 
     size_t bytes = (size_t)rel->nrows * rel->ncols * sizeof(int64_t);
-    sarr->sorted = (int64_t *)malloc(bytes);
-    if (!sarr->sorted)
+    fresh.sorted = (int64_t *)malloc(bytes);
+    if (!fresh.sorted)
         return ENOMEM;
-    if (sarr->ledger) {
-        wl_mem_ledger_alloc(sarr->ledger, WL_MEM_SUBSYS_ARRANGEMENT, bytes);
-        sarr->ledger_bytes = bytes;
+    if (fresh.ledger) {
+        wl_mem_ledger_alloc(fresh.ledger, WL_MEM_SUBSYS_ARRANGEMENT, bytes);
+        fresh.ledger_bytes = bytes;
     }
 
     for (uint32_t r = 0; r < rel->nrows; r++)
-        col_rel_row_copy_out(rel, r, sarr->sorted + (size_t)r * rel->ncols);
+        col_rel_row_copy_out(rel, r, fresh.sorted + (size_t)r * rel->ncols);
     /* #465: stable LSD radix sort by the single key column replaces the
      * platform-specific qsort_r path that did not exist on Android NDK
      * bionic libc.  Failure here is malloc-fail in the radix scratch
      * buffer; on that path sarr->sorted is unmodified and we propagate
      * ENOMEM so the caller can react. */
-    if (col_radix_sort_rows_by_key(sarr->sorted, rel->nrows, rel->ncols,
+    if (col_radix_sort_rows_by_key(fresh.sorted, rel->nrows, rel->ncols,
         key_col) != 0) {
-        sarr_release(sarr);
+        sarr_release(&fresh);
         return ENOMEM;
     }
-    sarr->nrows = rel->nrows;
-    sarr->indexed_rows = rel->nrows;
-    sarr->source_snapshot = wl_columnar_relation_snapshot(rel);
+    fresh.nrows = rel->nrows;
+    fresh.indexed_rows = rel->nrows;
+    fresh.source_snapshot = wl_columnar_relation_snapshot(rel);
+    old_sorted = sarr->sorted;
+    old_ledger_bytes = sarr->ledger_bytes;
+    sarr->sorted = NULL;
+    sarr->ledger_bytes = 0;
+    free(old_sorted);
+    if (sarr->ledger && old_ledger_bytes > 0)
+        wl_mem_ledger_free(sarr->ledger, WL_MEM_SUBSYS_ARRANGEMENT,
+            old_ledger_bytes);
+    *sarr = fresh;
     return 0;
+}
+
+static col_sorted_arr_entry_t *
+sarr_find_entry(wl_col_session_t *cs, const char *rel_name, uint32_t key_col)
+{
+    if (!cs || !rel_name)
+        return NULL;
+    for (uint32_t i = 0; i < cs->sarr_count; i++) {
+        col_sorted_arr_entry_t *entry = &cs->sarr_entries[i];
+        if (entry->key_col == key_col
+            && strcmp(entry->rel_name, rel_name) == 0)
+            return entry;
+    }
+    return NULL;
+}
+
+static void
+sarr_mark_deferred(col_sorted_arr_t *sarr)
+{
+    if (!sarr)
+        return;
+    sarr->rebuild_deferred = true;
 }
 
 /*
@@ -2214,17 +2281,18 @@ col_session_get_sorted_arrangement(wl_col_session_t *cs, const char *rel_name,
         return NULL;
 
     /* Search existing cache entries. */
-    for (uint32_t i = 0; i < cs->sarr_count; i++) {
-        col_sorted_arr_entry_t *e = &cs->sarr_entries[i];
-        if (e->key_col != key_col)
-            continue;
-        if (strcmp(e->rel_name, rel_name) != 0)
-            continue;
+    col_sorted_arr_entry_t *e = sarr_find_entry(cs, rel_name, key_col);
+    if (e) {
         /* indexed_rows is only a progress marker; freshness is the source
          * snapshot. */
         if (!wl_columnar_relation_snapshot_equal(e->sarr.source_snapshot,
             wl_columnar_relation_snapshot(rel))
-            || e->sarr.indexed_rows != rel->nrows) {
+            || e->sarr.indexed_rows != rel->nrows
+            || e->sarr.rebuild_deferred) {
+            if (e->sarr.pin_count != 0) {
+                sarr_mark_deferred(&e->sarr);
+                return NULL;
+            }
             if (sarr_build(&e->sarr, rel, key_col) != 0)
                 return NULL;
         }
@@ -2233,6 +2301,8 @@ col_session_get_sorted_arrangement(wl_col_session_t *cs, const char *rel_name,
 
     /* Not found: grow cache and create new entry. */
     if (cs->sarr_count >= cs->sarr_cap) {
+        if (cs->sarr_active_pins != 0)
+            return NULL;
         uint32_t new_cap = cs->sarr_cap ? cs->sarr_cap * 2u : 4u;
         col_sorted_arr_entry_t *ne = (col_sorted_arr_entry_t *)realloc(
             cs->sarr_entries, new_cap * sizeof(col_sorted_arr_entry_t));
@@ -2242,25 +2312,25 @@ col_session_get_sorted_arrangement(wl_col_session_t *cs, const char *rel_name,
         cs->sarr_cap = new_cap;
     }
 
-    col_sorted_arr_entry_t *e = &cs->sarr_entries[cs->sarr_count];
-    memset(e, 0, sizeof(*e));
+    col_sorted_arr_entry_t *new_entry = &cs->sarr_entries[cs->sarr_count];
+    memset(new_entry, 0, sizeof(*new_entry));
 
-    e->rel_name = wl_strdup(rel_name);
-    if (!e->rel_name)
+    new_entry->rel_name = wl_strdup(rel_name);
+    if (!new_entry->rel_name)
         return NULL;
 
-    e->key_col = key_col;
-    e->sarr.key_col = key_col;
-    e->sarr.ledger = &cs->mem_ledger; /* Issue #1380 */
+    new_entry->key_col = key_col;
+    new_entry->sarr.key_col = key_col;
+    new_entry->sarr.ledger = &cs->mem_ledger; /* Issue #1380 */
     cs->sarr_count++;
 
-    if (sarr_build(&e->sarr, rel, key_col) != 0) {
+    if (sarr_build(&new_entry->sarr, rel, key_col) != 0) {
         cs->sarr_count--;
-        free(e->rel_name);
-        memset(e, 0, sizeof(*e));
+        free(new_entry->rel_name);
+        memset(new_entry, 0, sizeof(*new_entry));
         return NULL;
     }
-    return &e->sarr;
+    return &new_entry->sarr;
 }
 
 /*
@@ -2269,11 +2339,146 @@ col_session_get_sorted_arrangement(wl_col_session_t *cs, const char *rel_name,
  * Free all entries in the sorted arrangement cache and reset it.
  * Called from col_session_destroy.
  */
+int
+col_sorted_arrangement_probe_release(col_sorted_arrangement_probe_t *probe)
+{
+    col_sorted_arr_entry_t *entry;
+    wl_col_session_t *session;
+    int rc;
+
+    if (!probe || !probe->active || probe->identity != (uintptr_t)probe
+        || !probe->entry || !probe->arr || !probe->session
+        || probe->entry->sarr.pin_count == 0
+        || probe->entry->sarr.pin_count > probe->session->sarr_active_pins)
+        return EINVAL;
+    if (!probe->source_reader.owner
+        || probe->source_reader.identity != (uintptr_t)&probe->source_reader)
+        return EINVAL;
+    entry = probe->entry;
+    session = probe->session;
+    /* Release the source gate first.  This is the only fallible part of
+     * probe release; do not mutate pin/deferred-generation state until it has
+     * succeeded, so a caller can retry a failed release transactionally. */
+    rc = col_rel_source_reader_release(&probe->source_reader);
+    if (rc != 0)
+        return rc;
+    if (entry->sarr.pin_count > 0)
+        entry->sarr.pin_count--;
+    if (session->sarr_active_pins > 0)
+        session->sarr_active_pins--;
+    if (entry->sarr.pin_count == 0 && entry->sarr.rebuild_deferred) {
+        entry->sarr.rebuild_deferred = false;
+        entry->sarr.indexed_rows = 0;
+        entry->sarr.nrows = 0;
+        memset(&entry->sarr.source_snapshot, 0,
+            sizeof(entry->sarr.source_snapshot));
+    }
+    memset(probe, 0, sizeof(*probe));
+    return 0;
+}
+
+int
+col_session_acquire_sorted_arrangement_probe(wl_session_t *session,
+    const col_rel_t *source, uint32_t key_col,
+    col_sorted_arrangement_probe_t *probe)
+{
+    wl_col_session_t *cs;
+    col_sorted_arr_entry_t *entry;
+    col_rel_t *resolved;
+    col_relation_snapshot_t snapshot;
+    int rc;
+
+    if (!session || !source || !source->name || !probe
+        || probe->active || probe->identity != 0
+        || probe->source_reader.owner
+        || probe->source_reader.identity != 0
+        || probe->source_reader.thread_valid
+        || probe->source_reader.transferable)
+        return EINVAL;
+    cs = COL_SESSION(session);
+    resolved = session_find_rel(cs, source->name);
+    if (resolved != source)
+        return EBUSY;
+    if (key_col >= source->ncols)
+        return EINVAL;
+    memset(probe, 0, sizeof(*probe));
+    rc = col_rel_source_reader_acquire(source, &probe->source_reader);
+    if (rc != 0)
+        return rc;
+    snapshot = wl_columnar_relation_snapshot(source);
+    entry = sarr_find_entry(cs, source->name, key_col);
+    if (entry) {
+        bool stale = !wl_columnar_relation_snapshot_equal(
+            entry->sarr.source_snapshot, snapshot)
+            || entry->sarr.indexed_rows != source->nrows
+            || entry->sarr.rebuild_deferred;
+        if (stale && entry->sarr.pin_count != 0) {
+            sarr_mark_deferred(&entry->sarr);
+            rc = EBUSY;
+            goto fail_reader;
+        }
+        if (stale && sarr_build(&entry->sarr, source, key_col) != 0) {
+            rc = ENOMEM;
+            goto fail_reader;
+        }
+    } else {
+        if (cs->sarr_count >= cs->sarr_cap && cs->sarr_active_pins != 0) {
+            rc = EBUSY;
+            goto fail_reader;
+        }
+        if (col_session_get_sorted_arrangement(cs, source->name, key_col)
+            == NULL) {
+            rc = ENOMEM;
+            goto fail_reader;
+        }
+        entry = sarr_find_entry(cs, source->name, key_col);
+        if (!entry) {
+            rc = EINVAL;
+            goto fail_reader;
+        }
+    }
+    if (!wl_columnar_relation_snapshot_equal(
+            entry->sarr.source_snapshot, snapshot)) {
+        rc = EBUSY;
+        goto fail_reader;
+    }
+    if (entry->sarr.pin_count == UINT32_MAX
+        || cs->sarr_active_pins == UINT32_MAX) {
+        rc = EOVERFLOW;
+        goto fail_reader;
+    }
+    entry->sarr.pin_count++;
+    cs->sarr_active_pins++;
+    probe->entry = entry;
+    probe->arr = &entry->sarr;
+    probe->session = cs;
+    probe->source = source;
+    probe->source_snapshot = snapshot;
+    probe->identity = (uintptr_t)probe;
+    probe->active = true;
+    return 0;
+
+fail_reader:
+    {
+        int release_rc = col_rel_source_reader_release(&probe->source_reader);
+        if (release_rc != 0)
+            return release_rc;
+    }
+    memset(probe, 0, sizeof(*probe));
+    return rc;
+}
+
 void
 col_session_free_sorted_arrangements(wl_col_session_t *cs)
 {
     if (!cs)
         return;
+    if (cs->sarr_active_pins != 0) {
+        fprintf(stderr,
+            "wirelog: fatal sorted-arrangement teardown with %u active "
+            "probe(s)\n", cs->sarr_active_pins);
+        abort();
+    }
     for (uint32_t i = 0; i < cs->sarr_count; i++) {
         free(cs->sarr_entries[i].rel_name);
         sarr_release(&cs->sarr_entries[i].sarr);

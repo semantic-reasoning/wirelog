@@ -60,7 +60,15 @@ make_session(wl_session_t **session_out, wl_plan_t **plan_out,
     if (!source)
         return -1;
     size_t used = (size_t)snprintf(source, cap,
-            ".decl edge(a: int32, b: int32)\n");
+            ".decl edge(a: int32, b: int32)\n"
+            ".decl aux0(a: int32)\n"
+            ".decl aux1(a: int32)\n"
+            ".decl aux2(a: int32)\n"
+            ".decl aux3(a: int32)\n"
+            "aux0(0).\n"
+            "aux1(1).\n"
+            "aux2(2).\n"
+            "aux3(3).\n");
     for (int i = 0; i <= 100; i++) {
         int n = snprintf(source + used, cap - used, "edge(%d, %d).\n", i, i);
         if (n < 0 || (size_t)n >= cap - used) {
@@ -267,6 +275,36 @@ test_generation_consumers(void)
         && sorted->sorted[(size_t)(sorted->nrows - 1) * sorted->ncols + 1]
         == 1000,
         "sorted arrangement did not rebuild order");
+
+    col_sorted_arrangement_probe_t sorted_probe = { 0 };
+    CHECK(col_session_acquire_sorted_arrangement_probe(session, rel, 1,
+        &sorted_probe) == 0 && sorted_probe.active
+        && cs->sarr_active_pins == 1,
+        "sorted arrangement probe acquisition failed");
+    CHECK(col_rel_set(rel, 0, 1, 2000) == EBUSY,
+        "sorted arrangement probe did not hold source reader");
+    col_session_invalidate_arrangements(session, "edge");
+    CHECK(col_session_get_sorted_arrangement(cs, "edge", 1) == NULL,
+        "sorted arrangement returned deferred buffer while pinned");
+    CHECK(sorted_probe.arr->sorted[1] == 1,
+        "sorted arrangement probe changed while pinned");
+    CHECK(col_session_get_sorted_arrangement(cs, "aux0", 0) != NULL
+        && col_session_get_sorted_arrangement(cs, "aux1", 0) != NULL
+        && col_session_get_sorted_arrangement(cs, "aux2", 0) != NULL
+        && cs->sarr_count == cs->sarr_cap,
+        "sorted arrangement setup did not fill registry capacity");
+    CHECK(col_session_get_sorted_arrangement(cs, "aux3", 0) == NULL,
+        "sorted arrangement registry relocated while pinned");
+    CHECK(col_sorted_arrangement_probe_release(&sorted_probe) == 0
+        && cs->sarr_active_pins == 0 && !sorted_probe.active,
+        "sorted arrangement probe release failed");
+    CHECK(col_rel_set(rel, 0, 1, 2000) == 0,
+        "sorted arrangement mutation after release failed");
+    sorted = col_session_get_sorted_arrangement(cs, "edge", 1);
+    CHECK(sorted != NULL && sorted->sorted[1] == 1
+        && sorted->sorted[(size_t)(sorted->nrows - 1) * sorted->ncols + 1]
+        == 2000,
+        "sorted arrangement did not rebuild after probe release");
 
     col_diff_arrangement_t *diff = col_session_get_diff_arrangement(cs,
             "edge", rel, &key_col, 1);
