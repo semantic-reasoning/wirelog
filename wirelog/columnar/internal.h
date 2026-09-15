@@ -1189,6 +1189,8 @@ typedef struct {
     uint32_t epoch_pin_count;
     uint64_t generation;
     bool owner_alive;
+    /* True for every inserted entry: insertion rejects pool/arena/shared or
+     * aliased results before transferring ledger ownership. */
     bool owns_result;
     col_relation_snapshot_t left_snapshot;
     col_relation_snapshot_t right_snapshot;
