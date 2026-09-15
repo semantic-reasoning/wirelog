@@ -117,6 +117,31 @@ reserve(bytes) -> commit/transfer(owner) -> release(bytes)
 - A realloc that needs both old and new storage reserves the new size while
   the old size is still counted; only after a successful move may it release
   the old reservation.
+- A governed replacement uses the same overlap accounting even when the new
+  footprint is smaller:
+
+  ```text
+  committed(old) -> begin_replacement(new)
+      -> commit_replacement(new) -> release
+      -> rollback_replacement(old) when publication cannot complete
+  ```
+
+  `begin_replacement` is the downsize-only primitive: it admits the complete
+  new footprint before replacement
+  storage is allocated or published, so the governor accounts for old and
+  new storage at the same time. Commit drops the old charge only after the
+  new storage is published and the old storage has been freed; rollback drops
+  only the temporary new charge. If the final accounting transition is
+  rejected after publication, rollback retains the old reservation as a
+  conservative upper bound rather than under-accounting the live storage.
+  The reservation identity, owner attribution, and generation remain on the
+  original token throughout the transition. Relation-level writer gates
+  still serialize storage publication; this reservation lifecycle provides
+  the memory admission and rollback guarantee.
+- Batch compaction admits every governed replacement before preparing any
+  member. If one overlap cannot fit, all reservations admitted for that batch
+  are rolled back and no member is published; this is a finite no-progress
+  result, not an unbounded retry.
 - Overflow in a size, sum, or headroom calculation is a distinct
   representation-overflow failure, never a wrapped small reservation.
 - A reserved cleanup/drain headroom remains available for rollback, error

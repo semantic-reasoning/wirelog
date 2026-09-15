@@ -522,7 +522,33 @@ prepare/commit would be discarded by the publication it is protecting.
 | `relation.c:col_rel_commit_replacement_locked` | `old.source_access.state` | `atomic_load_explicit` | acquire | Capture the outgoing descriptor's admission state before `*dst = *staged` overwrites it, so the writer lease the caller holds across prepare and commit survives the swap |
 | `relation.c:col_rel_commit_replacement_locked#2` | `dst->source_access.state` | `atomic_store_explicit` | release | Republish the captured admission state onto the committed descriptor; the release orders every field written above it before another thread can observe the gate |
 
-The complete source audit now contains **119 atomic call sites**.
+### 5.16 `wirelog/columnar/memory_governor.c` and `relation.c` — atomic
+replacement admission and compaction (14 rows)
+
+Replacement admission temporarily accounts for the new footprint while the
+old reservation remains committed. The overlap CAS is the admission
+linearization point; token state stores publish rollback and commit results.
+Compaction validates the retained reservation before replacing storage, so
+the replacement transaction never releases an uncommitted token.
+
+| Anchor (file:function[#N]) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `memory_governor.c:reserve_replacement_overlap` | `reserved_bytes` | `atomic_load_explicit` | relaxed | Read the current overlap total before the admission CAS loop |
+| `memory_governor.c:reserve_replacement_overlap#2` | `usable_bytes` | `atomic_load_explicit` | relaxed | Read the immutable replacement admission limit |
+| `memory_governor.c:reserve_replacement_overlap#3` | `reserved_bytes` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Linearize overflow detection without wrapping the shared total |
+| `memory_governor.c:reserve_replacement_overlap#4` | `reserved_bytes` | `atomic_compare_exchange_weak_explicit` | relaxed/relaxed | Admit the replacement overlap without exceeding the usable limit |
+| `memory_governor.c:wl_columnar_memory_begin_replacement` | `reservation->state` | `atomic_store_explicit` | release | Restore the committed state after invalid replacement input |
+| `memory_governor.c:wl_columnar_memory_begin_replacement#2` | `reservation->state` | `atomic_store_explicit` | release | Restore the committed state after overlap denial |
+| `memory_governor.c:wl_columnar_memory_begin_replacement#3` | `reservation->state` | `atomic_store_explicit` | release | Publish the replacing state after overlap admission |
+| `memory_governor.c:wl_columnar_memory_commit_replacement` | `reservation->state` | `atomic_store_explicit` | release | Restore replacing state when commit accounting cannot complete |
+| `memory_governor.c:wl_columnar_memory_commit_replacement#2` | `reservation->state` | `atomic_store_explicit` | release | Publish the committed state after the retained bytes are reduced |
+| `memory_governor.c:wl_columnar_memory_rollback_replacement` | `reservation->state` | `atomic_store_explicit` | release | Restore replacing state when rollback accounting cannot complete |
+| `memory_governor.c:wl_columnar_memory_rollback_replacement#2` | `reservation->state` | `atomic_store_explicit` | release | Publish the committed state after returning the overlap credit |
+| `relation.c:col_rel_compact_impl` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Validate the retained reservation before preparing a replacement footprint |
+| `relation.c:col_rel_compact_many` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Validate each retained reservation before compacting a relation |
+| `relation.c:col_rel_compact_many#2` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Revalidate the reservation before the second compaction path |
+
+The complete source audit now contains **133 atomic call sites**.
 
 ---
 
