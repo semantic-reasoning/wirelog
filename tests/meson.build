@@ -855,6 +855,13 @@ endif
 # the generated header (see wirelog/meson.build's configure_file()).
 py3 = find_program('python3', 'python', required: true)
 
+# Issue #694: keep the hosted fuzz evidence verifier and its fail-closed
+# fixtures in the normal test graph so schema or handoff regressions cannot
+# be bypassed by only running the workflow manually.
+test('verify_hosted_campaign', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-verify-hosted-campaign.py'],
+     suite: 'abi', timeout: 120)
+
 test('arm_asan_strict_align_selection', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-arm-asan-strict-align-selection.py'],
      suite: 'abi', timeout: 120)
