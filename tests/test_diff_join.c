@@ -1673,7 +1673,14 @@ test_diff_join_batch_signed_timestamps(void)
         && col_rel_enable_timestamps(right) == 0,
         "timestamp columns enabled");
     left->timestamps[0].multiplicity = -2;
+    left->timestamps[0].iteration = 7;
+    left->timestamps[0].stratum = 3;
+    left->timestamps[0].worker = 2;
+    left->timestamps[0]._reserved = 0;
     right->timestamps[0].multiplicity = 1;
+    right->timestamps[0].iteration = 99;
+    right->timestamps[0].stratum = 98;
+    right->timestamps[0].worker = 97;
     right->timestamps[1].multiplicity = -1;
     right->timestamps[2].multiplicity = 2;
     ASSERT_TRUE(session_add_rel(s, right) == 0, "right relation registered");
@@ -1686,6 +1693,8 @@ test_diff_join_batch_signed_timestamps(void)
     ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, left, false,
         &key, &key, 1, s->join_batch_bytes, &cont) == 0,
         "differential batch producer created");
+    ASSERT_TRUE(col_rel_destroy_checked(left) == EBUSY,
+        "left relation remains protected while continuation is live");
     out = col_rel_new_auto("diff_batch_out", 4);
     ASSERT_TRUE(out && col_join_set_output_types(out, left, right, &op) == 0
         && col_rel_enable_timestamps(out) == 0,
@@ -1713,6 +1722,13 @@ test_diff_join_batch_signed_timestamps(void)
     }
     ASSERT_TRUE(seen_neg4 && seen_pos2 && seen_neg2,
         "each signed multiplicity product is preserved");
+    for (uint32_t i = 0; i < out->nrows; i++) {
+        ASSERT_TRUE(out->timestamps[i].iteration == 7
+            && out->timestamps[i].stratum == 3
+            && out->timestamps[i].worker == 2
+            && out->timestamps[i]._reserved == 0,
+            "delta-driving provenance is preserved across differential join");
+    }
 
     wl_columnar_continuation_destroy(cont);
     col_rel_destroy(out);
