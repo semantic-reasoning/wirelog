@@ -2521,7 +2521,7 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
     memset(txn, 0, sizeof(*txn));
 
     for (uint32_t i = 0; i < cs->diff_arr_count; i++) {
-        col_diff_arr_entry_t *entry = &cs->diff_arr_entries[i];
+        entry = &cs->diff_arr_entries[i];
         if (entry->key_count != key_count
             || strcmp(entry->rel_name, rel_name) != 0)
             continue;
@@ -2584,6 +2584,11 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
         slot = &entry->diff_arr;
         cs->diff_arr_count++;
     }
+
+    /* Both registry paths above establish the entry/slot pair.  Keep the
+     * invariant explicit for static analysis before dereferencing either. */
+    if (!entry || !slot)
+        return EINVAL;
 
     txn->session = cs;
     txn->entry_index = entry_index;
