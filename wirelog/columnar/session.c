@@ -2337,6 +2337,7 @@ col_session_destroy(wl_session_t *session)
     }
     free(sess->arr_entries);
     col_session_free_delta_arrangements(sess);
+    assert(sess->sarr_active_pins == 0);
     col_session_free_sorted_arrangements(sess);
     col_session_free_filt_arrangements(sess);
     ledger_credit_allocators(sess); /* Issue #1380 */
@@ -2478,6 +2479,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->sarr_entries = NULL;
     out_worker->sarr_count = 0;
     out_worker->sarr_cap = 0;
+    out_worker->sarr_active_pins = 0;
     out_worker->filt_arr_entries = NULL;
     out_worker->filt_arr_count = 0;
     out_worker->filt_arr_cap = 0;
@@ -2770,6 +2772,7 @@ col_worker_session_destroy(wl_col_session_t *worker)
         return diff_rc;
     }
     col_session_free_delta_arrangements(worker);
+    assert(worker->sarr_active_pins == 0);
     col_session_free_sorted_arrangements(worker);
     col_session_free_filt_arrangements(worker);
 

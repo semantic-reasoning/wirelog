@@ -638,6 +638,23 @@ Checked teardown drains queued work and rejects destruction while a live source
 lease remains. The delegated #1435/#1507 work and non-primary materialization
 cache semantics are not claimed by this contract.
 
+## 11. Sorted-arrangement leases for LFTJ
+
+Sorted row-major copies used by leapfrog triejoin are session-owned storage,
+not borrowed scratch buffers. `col_session_acquire_sorted_arrangement_probe`
+acquires a source reader and pins the cache entry before LFTJ receives the
+`sorted` pointer. The lease remains active until the join, its callbacks, and
+stack publication have finished. LFTJ tracks cache-backed inputs explicitly;
+cleanup never re-queries the cache to decide whether an input may be freed.
+
+While a sorted lease is active, source writers are blocked, the entry's sorted
+buffer cannot be rebuilt or freed, and growth that would relocate the sorted
+registry is rejected. A freshness change observed against a pinned entry is
+recorded as deferred invalidation. The old buffer and its ledger charge stay
+valid until the final lease is released; the next acquisition then rebuilds it
+lazily. Every success and error path must release the lease before session or
+worker teardown.
+
 ### Filtered-relation cache leases (#1435)
 
 The filtered-relation cache (`filt_cache`, #386) carries the same lease shape.
