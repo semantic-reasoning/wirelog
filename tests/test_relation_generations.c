@@ -3220,6 +3220,26 @@ test_staged_replacement_contract(void)
 
     dst = new_relation();
     candidate = new_relation();
+    col_rel_t *replacement_candidate = new_relation();
+    CHECK(dst && candidate && replacement_candidate,
+        "replacement aliased destination setup");
+    CHECK(col_rel_append_row(dst, &old_value) == 0
+        && col_rel_install_shared_view(candidate, dst) == 0
+        && col_rel_append_row(replacement_candidate, &new_value) == 0,
+        "replacement aliased destination data");
+    CHECK(col_rel_prepare_replacement(candidate, replacement_candidate,
+        &replacement) == EBUSY,
+        "replacement resolves the aliased destination owner");
+    CHECK(dst->storage_alias_borrows == 1
+        && candidate->storage_owner == dst
+        && candidate->nrows == 1,
+        "aliased destination denial preserves owner and view");
+    CHECK(col_rel_storage_alias_release(candidate) == 0,
+        "replacement aliased destination release");
+    cleanup_relations();
+
+    dst = new_relation();
+    candidate = new_relation();
     CHECK(dst && candidate, "replacement rollback setup");
     identity = dst->relation_identity;
     view_before = dst->view_generation;
