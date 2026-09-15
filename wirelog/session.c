@@ -94,10 +94,16 @@ wl_session_operation_end(wl_session_t *session)
 }
 
 static void
-wl_session_admission_close_and_wait(wl_session_admission_t *admission)
+wl_session_admission_close_and_wait(wl_session_t *session,
+    wl_session_admission_t *admission)
 {
     wl_mutex_lock(&admission->mutex);
     admission->closing = true;
+    wl_mutex_unlock(&admission->mutex);
+#ifdef WL_SESSION_TEST_HOOKS
+    wl_session_testhook_admission_closed(session);
+#endif
+    wl_mutex_lock(&admission->mutex);
     while (admission->active_operations != 0)
         wl_cond_wait(&admission->idle, &admission->mutex);
     wl_mutex_unlock(&admission->mutex);
@@ -125,6 +131,9 @@ wl_session_options_init(wl_session_options_t *options)
 #define WL_SESSION_THREAD_LOCAL _Thread_local
 #endif
 static WL_SESSION_THREAD_LOCAL const wl_session_options_t *testhook_options;
+static wl_session_testhook_fn testhook_admission_closed;
+static wl_session_testhook_fn testhook_before_workqueue_drain;
+static wl_session_testhook_fn testhook_after_worker_lease_release;
 #undef WL_SESSION_THREAD_LOCAL
 
 void
@@ -137,6 +146,45 @@ const wl_session_options_t *
 wl_session_testhook_default_options(void)
 {
     return testhook_options;
+}
+
+void
+wl_session_testhook_set_admission_closed(wl_session_testhook_fn fn)
+{
+    testhook_admission_closed = fn;
+}
+
+void
+wl_session_testhook_admission_closed(wl_session_t *session)
+{
+    if (testhook_admission_closed)
+        testhook_admission_closed(session);
+}
+
+void
+wl_session_testhook_set_before_workqueue_drain(wl_session_testhook_fn fn)
+{
+    testhook_before_workqueue_drain = fn;
+}
+
+void
+wl_session_testhook_before_workqueue_drain(wl_session_t *session)
+{
+    if (testhook_before_workqueue_drain)
+        testhook_before_workqueue_drain(session);
+}
+
+void
+wl_session_testhook_set_after_worker_lease_release(wl_session_testhook_fn fn)
+{
+    testhook_after_worker_lease_release = fn;
+}
+
+void
+wl_session_testhook_after_worker_lease_release(wl_session_t *session)
+{
+    if (testhook_after_worker_lease_release)
+        testhook_after_worker_lease_release(session);
 }
 #endif
 
@@ -227,7 +275,7 @@ wl_session_destroy(wl_session_t *session)
     admission = session->owns_operation_admission
         ? session->operation_admission : NULL;
     if (admission)
-        wl_session_admission_close_and_wait(admission);
+        wl_session_admission_close_and_wait(session, admission);
     backend = session->backend;
     snapshot = session->owns_extension_snapshot
         ? session->extension_snapshot : NULL;

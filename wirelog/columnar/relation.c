@@ -146,8 +146,59 @@ col_rel_storage_owner_init(col_rel_t *r)
     r->storage_owner = r;
     r->storage_owner_identity = r->relation_identity;
     r->storage_owner_generation = r->storage_generation;
-    r->storage_alias_borrows = 0;
+    atomic_store_explicit(&r->storage_alias_borrows, 0,
+        memory_order_relaxed);
     wl_columnar_source_access_gate_init(&r->source_access);
+    wl_columnar_source_access_gate_init(&r->descriptor_access);
+}
+
+uint64_t
+col_rel_storage_alias_borrow_count(const col_rel_t *owner)
+{
+    if (!owner)
+        return 0;
+    return atomic_load_explicit(&owner->storage_alias_borrows,
+               memory_order_acquire);
+}
+
+int
+col_rel_storage_alias_borrow_acquire(col_rel_t *owner)
+{
+    uint64_t observed;
+
+    if (!owner || owner->storage_owner != owner
+        || owner->storage_owner_identity != owner->relation_identity)
+        return EINVAL;
+    observed = atomic_load_explicit(&owner->storage_alias_borrows,
+            memory_order_relaxed);
+    for (;;) {
+        if (observed == UINT64_MAX)
+            return EOVERFLOW;
+        if (atomic_compare_exchange_weak_explicit(
+                &owner->storage_alias_borrows, &observed, observed + 1,
+                memory_order_release, memory_order_relaxed))
+            return 0;
+    }
+}
+
+int
+col_rel_storage_alias_borrow_release(col_rel_t *owner)
+{
+    uint64_t observed;
+
+    if (!owner || owner->storage_owner != owner
+        || owner->storage_owner_identity != owner->relation_identity)
+        return EINVAL;
+    observed = atomic_load_explicit(&owner->storage_alias_borrows,
+            memory_order_acquire);
+    for (;;) {
+        if (observed == 0)
+            return EINVAL;
+        if (atomic_compare_exchange_weak_explicit(
+                &owner->storage_alias_borrows, &observed, observed - 1,
+                memory_order_acq_rel, memory_order_acquire))
+            return 0;
+    }
 }
 
 int
@@ -157,13 +208,8 @@ col_rel_storage_owner_resolve(const col_rel_t *src, col_rel_t **out_owner)
     if (!src || !out_owner)
         return EINVAL;
     owner = src->storage_owner;
-    if (!owner) {
-        owner = (col_rel_t *)src; /* legacy zero-initialized relation */
-        owner->storage_owner = owner;
-        owner->storage_owner_identity = owner->relation_identity;
-        owner->storage_owner_generation = owner->storage_generation;
-        wl_columnar_source_access_gate_init(&owner->source_access);
-    }
+    if (!owner)
+        return EINVAL;
     if (owner->storage_owner != owner
         || owner->storage_owner_identity != owner->relation_identity
         || owner->storage_owner_generation == 0
@@ -187,11 +233,18 @@ col_rel_storage_alias_release(col_rel_t *alias)
     owner = alias->storage_owner;
     if (owner->storage_owner != owner
         || owner->storage_owner_identity != owner->relation_identity
-        || owner->storage_alias_borrows == 0
+        || col_rel_storage_alias_borrow_count(owner) == 0
         || alias->storage_owner_identity != owner->relation_identity)
         return EINVAL;
-    owner->storage_alias_borrows--;
-    col_rel_storage_owner_init(alias);
+    if (col_rel_storage_alias_borrow_release(owner) != 0)
+        return EINVAL;
+    /* The alias descriptor may be pinned by the caller's operation token.
+    * Reset ownership metadata without reinitializing either live gate. */
+    alias->storage_owner = alias;
+    alias->storage_owner_identity = alias->relation_identity;
+    alias->storage_owner_generation = alias->storage_generation;
+    atomic_store_explicit(&alias->storage_alias_borrows, 0,
+        memory_order_relaxed);
     return 0;
 }
 
@@ -201,10 +254,57 @@ col_rel_storage_owner_destroy_status(const col_rel_t *owner)
     if (!owner || owner->storage_owner != owner
         || owner->storage_owner_identity != owner->relation_identity)
         return EINVAL;
-    if (owner->storage_alias_borrows != 0
+    if (col_rel_storage_alias_borrow_count(owner) != 0
         || wl_columnar_source_access_gate_busy(&owner->source_access))
         return EBUSY;
     return 0;
+}
+
+/* Legacy descriptors can predate storage_owner metadata. Initialize that
+ * metadata only under descriptor exclusion; never reinitialize their access
+ * gates, since a writer sentinel marks terminal teardown. */
+int
+col_rel_storage_owner_ensure_initialized(col_rel_t *rel)
+{
+    wl_columnar_source_access_writer_t descriptor_writer = { 0 };
+    col_rel_t *owner = NULL;
+    bool initialized;
+    int rc;
+
+    if (!rel)
+        return EINVAL;
+    rc = wl_columnar_source_access_gate_reader_acquire(
+        &rel->descriptor_access);
+    if (rc != 0)
+        return rc;
+    initialized = rel->storage_owner != NULL;
+    rc = wl_columnar_source_access_gate_reader_release(
+        &rel->descriptor_access);
+    if (rc != 0 || initialized)
+        return rc;
+
+    rc = wl_columnar_source_access_writer_acquire(&rel->descriptor_access,
+            &descriptor_writer);
+    if (rc != 0)
+        return rc;
+    if (!rel->storage_owner) {
+        if (rel->relation_identity == 0
+            || !wl_columnar_relation_generation_valid(
+                rel->storage_generation)) {
+            rc = EINVAL;
+        } else {
+            rel->storage_owner = rel;
+            rel->storage_owner_identity = rel->relation_identity;
+            rel->storage_owner_generation = rel->storage_generation;
+            rc = 0;
+        }
+    } else {
+        rc = col_rel_storage_owner_resolve(rel, &owner);
+    }
+    if (wl_columnar_source_access_writer_release(&descriptor_writer) != 0
+        && rc == 0)
+        rc = EINVAL;
+    return rc;
 }
 
 int
@@ -215,11 +315,62 @@ col_rel_source_reader_acquire(const col_rel_t *rel,
     int rc;
     if (!rel || !token)
         return EINVAL;
-    rc = col_rel_storage_owner_resolve(rel, &owner);
+    rc = col_rel_storage_owner_ensure_initialized((col_rel_t *)rel);
     if (rc != 0)
         return rc;
-    return wl_columnar_source_access_reader_acquire(
+    rc = wl_columnar_source_access_gate_reader_acquire(
+        (wl_columnar_source_access_gate_t *)&rel->descriptor_access);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_storage_owner_resolve(rel, &owner);
+    if (rc != 0) {
+        (void)wl_columnar_source_access_gate_reader_release(
+            (wl_columnar_source_access_gate_t *)&rel->descriptor_access);
+        return rc;
+    }
+    rc = wl_columnar_source_access_reader_acquire(&owner->source_access,
+            token);
+    if (rc != 0) {
+        (void)wl_columnar_source_access_gate_reader_release(
+            (wl_columnar_source_access_gate_t *)&rel->descriptor_access);
+    } else {
+        token->secondary_owner
+            = (wl_columnar_source_access_gate_t *)&rel->descriptor_access;
+    }
+    return rc;
+}
+
+int
+col_rel_source_reader_acquire_transferable(const col_rel_t *rel,
+    wl_columnar_source_access_reader_t *token)
+{
+    col_rel_t *owner = NULL;
+    int rc;
+    if (!rel || !token)
+        return EINVAL;
+    rc = col_rel_storage_owner_ensure_initialized((col_rel_t *)rel);
+    if (rc != 0)
+        return rc;
+    rc = wl_columnar_source_access_gate_reader_acquire(
+        (wl_columnar_source_access_gate_t *)&rel->descriptor_access);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_storage_owner_resolve(rel, &owner);
+    if (rc != 0) {
+        (void)wl_columnar_source_access_gate_reader_release(
+            (wl_columnar_source_access_gate_t *)&rel->descriptor_access);
+        return rc;
+    }
+    rc = wl_columnar_source_access_reader_acquire_transferable(
         &owner->source_access, token);
+    if (rc != 0) {
+        (void)wl_columnar_source_access_gate_reader_release(
+            (wl_columnar_source_access_gate_t *)&rel->descriptor_access);
+    } else {
+        token->secondary_owner
+            = (wl_columnar_source_access_gate_t *)&rel->descriptor_access;
+    }
+    return rc;
 }
 
 int
@@ -237,11 +388,26 @@ col_rel_source_writer_acquire(const col_rel_t *rel,
 
     if (!rel || !token)
         return EINVAL;
-    rc = col_rel_storage_owner_resolve(rel, &owner);
+    rc = wl_columnar_source_access_gate_reader_acquire(
+        (wl_columnar_source_access_gate_t *)&rel->descriptor_access);
     if (rc != 0)
         return rc;
-    return wl_columnar_source_access_writer_acquire(
-        &owner->source_access, token);
+    rc = col_rel_storage_owner_resolve(rel, &owner);
+    if (rc != 0) {
+        (void)wl_columnar_source_access_gate_reader_release(
+            (wl_columnar_source_access_gate_t *)&rel->descriptor_access);
+        return rc;
+    }
+    rc = wl_columnar_source_access_writer_acquire(&owner->source_access,
+            token);
+    if (rc != 0) {
+        (void)wl_columnar_source_access_gate_reader_release(
+            (wl_columnar_source_access_gate_t *)&rel->descriptor_access);
+        return rc;
+    }
+    token->secondary_owner
+        = (wl_columnar_source_access_gate_t *)&rel->descriptor_access;
+    return 0;
 }
 
 /* Metadata/type publication rewrites the canonical relation descriptor and,
@@ -256,13 +422,19 @@ col_rel_published_writer_acquire(const col_rel_t *rel,
 
     if (!rel || !token)
         return EINVAL;
-    rc = col_rel_storage_owner_resolve(rel, &owner);
+    rc = col_rel_source_writer_acquire(rel, token);
     if (rc != 0)
         return rc;
-    if (owner->storage_alias_borrows > 0)
+    rc = col_rel_storage_owner_resolve(rel, &owner);
+    if (rc != 0) {
+        (void)wl_columnar_source_access_writer_release(token);
+        return rc;
+    }
+    if (col_rel_storage_alias_borrow_count(owner) != 0) {
+        (void)wl_columnar_source_access_writer_release(token);
         return EBUSY;
-    return wl_columnar_source_access_writer_acquire(
-        &owner->source_access, token);
+    }
+    return 0;
 }
 
 int
@@ -289,7 +461,7 @@ col_rel_set(col_rel_t *r, uint32_t row, uint32_t col, int64_t val)
     rc = col_rel_source_writer_acquire(r, &writer);
     if (rc != 0)
         return rc;
-    if (r == owner && owner->storage_alias_borrows > 0) {
+    if (r == owner && col_rel_storage_alias_borrow_count(owner) > 0) {
         rc = EBUSY;
         goto release_writer;
     }
@@ -904,12 +1076,13 @@ col_rel_ledger_release(col_rel_t *r)
 
 /* ---- lifecycle ---------------------------------------------------------- */
 
-void
-col_rel_free_contents(col_rel_t *r)
+static void
+col_rel_free_contents_impl(col_rel_t *r, bool preserve_access_gates)
 {
     if (!r)
         return;
-    if (r->storage_owner == r && r->storage_alias_borrows > 0)
+    if (r->storage_owner == r
+        && col_rel_storage_alias_borrow_count(r) > 0)
         return;
     /* Alias bookkeeping is released before the relation is zeroed.  The
      * owner itself is not denied destruction here; #1494 wires this status
@@ -955,7 +1128,22 @@ col_rel_free_contents(col_rel_t *r)
     free(r->compound_arity_map);
     if (r->schema_ok)
         ArrowSchemaRelease(&r->schema);
-    memset(r, 0, sizeof(*r));
+    if (preserve_access_gates) {
+        /* Checked destruction holds the descriptor writer (and, for roots,
+         * the source writer). Keep those terminal states intact while the
+         * pool tombstone remains addressable or the heap descriptor is freed.
+         * In particular, never memset atomic gates while readers may probe
+         * them: a zeroed gate could admit a reader into retiring storage. */
+        memset(r, 0, offsetof(col_rel_t, storage_alias_borrows));
+    } else {
+        memset(r, 0, sizeof(*r));
+    }
+}
+
+void
+col_rel_free_contents(col_rel_t *r)
+{
+    col_rel_free_contents_impl(r, false);
 }
 
 /*
@@ -967,21 +1155,151 @@ col_rel_free_contents(col_rel_t *r)
 int
 col_rel_destroy_checked(col_rel_t *r)
 {
-    int owner_status;
+    col_rel_t *owner = NULL;
+    wl_columnar_source_access_writer_t descriptor_writer = { 0 };
+    wl_columnar_source_access_writer_t owner_writer = { 0 };
+    wl_columnar_source_access_reader_t owner_reader = { 0 };
+    bool owner_writer_held = false;
+    bool from_pool;
+    int rc;
+
     if (!r)
         return 0;
-    owner_status = col_rel_storage_owner_destroy_status(r);
-    if (owner_status == EBUSY)
-        return EBUSY;
-    if (owner_status == 0
-        && wl_columnar_source_access_writer_claim(&r->source_access) != 0)
-        return EBUSY;
-    bool from_pool = r->pool_owned;
-    col_rel_free_contents(r); /* memset zeroes pool_owned */
-    if (!from_pool)
+    rc = wl_columnar_source_access_writer_acquire(&r->descriptor_access,
+            &descriptor_writer);
+    if (rc != 0)
+        return rc == EINVAL ? rc : EBUSY;
+    rc = col_rel_storage_owner_resolve(r, &owner);
+    if (rc != 0)
+        goto fail;
+    if (owner == r) {
+        rc = wl_columnar_source_access_writer_acquire(&owner->source_access,
+                &owner_writer);
+        if (rc != 0) {
+            rc = EBUSY;
+            goto fail;
+        }
+        owner_writer_held = true;
+        /* Recheck after exclusive owner admission. A concurrent publication
+         * cannot add a borrow between this check and terminal destruction. */
+        if (col_rel_storage_alias_borrow_count(owner) != 0) {
+            rc = EBUSY;
+            goto fail;
+        }
+    } else {
+        /* Alias retirement needs its own descriptor exclusively, but only a
+         * reader on the canonical owner: unrelated peer readers may coexist
+         * while this alias drops its borrow. */
+        rc = wl_columnar_source_access_reader_acquire(&owner->source_access,
+                &owner_reader);
+        if (rc != 0) {
+            rc = EBUSY;
+            goto fail;
+        }
+        rc = col_rel_storage_alias_release(r);
+        if (rc != 0)
+            goto fail;
+    }
+
+    from_pool = r->pool_owned;
+    col_rel_free_contents_impl(r, true); /* memset zeroes pool_owned */
+    if (owner_reader.owner) {
+        rc = wl_columnar_source_access_reader_release(&owner_reader);
+        if (rc != 0)
+            return EINVAL;
+    }
+    atomic_store_explicit(&r->source_access.state,
+        WL_COLUMNAR_SOURCE_ACCESS_WRITER, memory_order_release);
+    atomic_store_explicit(&r->descriptor_access.state,
+        WL_COLUMNAR_SOURCE_ACCESS_WRITER, memory_order_release);
+    if (!from_pool) {
         free(r);
+    } else {
+        /* Keep a pool slot inert until its owning pool resets/reuses it. */
+        r->pool_owned = true;
+        r->relation_identity = 0;
+        r->view_generation = WL_COLUMNAR_REL_GENERATION_INVALID;
+        r->storage_generation = WL_COLUMNAR_REL_GENERATION_INVALID;
+        r->storage_owner = NULL;
+        r->storage_owner_identity = 0;
+        r->storage_owner_generation = 0;
+        atomic_store_explicit(&r->storage_alias_borrows, 0,
+            memory_order_relaxed);
+        wl_columnar_memory_reservation_init(&r->retained_reservation);
+    }
     /* If pool_owned: struct memory freed on pool_reset(), skip free(). */
     return 0;
+
+fail:
+    if (owner_reader.owner)
+        (void)wl_columnar_source_access_reader_release(&owner_reader);
+    if (owner_writer_held)
+        (void)wl_columnar_source_access_writer_release(&owner_writer);
+    if (descriptor_writer.owner)
+        (void)wl_columnar_source_access_writer_release(&descriptor_writer);
+    return rc;
+}
+
+static int
+col_rel_pool_destroy_pass_checked(delta_pool_t *pool, uint32_t first_slot,
+    uint32_t slot_limit, bool aliases)
+{
+    int result = 0;
+
+    if (!pool)
+        return first_slot == 0 && slot_limit == 0 ? 0 : EINVAL;
+    if (first_slot > slot_limit || slot_limit > pool->slot_used
+        || (slot_limit > 0 && (!pool->slab
+        || pool->slot_size < sizeof(col_rel_t)))) {
+        fprintf(stderr,
+            "wirelog: invalid pool teardown range "
+            "(first=%u limit=%u used=%u slab=%p slot_size=%zu)\n",
+            first_slot, slot_limit, pool->slot_used, (void *)pool->slab,
+            pool->slot_size);
+        return EINVAL;
+    }
+
+    for (uint32_t slot = first_slot; slot < slot_limit; slot++) {
+        col_rel_t *relation = (col_rel_t *)(pool->slab
+            + (size_t)slot * pool->slot_size);
+        if (relation->relation_identity == 0 && !relation->storage_owner)
+            continue; /* Already retired pool slot. */
+        bool is_alias = relation->storage_owner
+            && relation->storage_owner != relation;
+        if (is_alias != aliases)
+            continue;
+
+        int rc = col_rel_destroy_checked(relation);
+        if (rc != 0 && rc != EBUSY)
+            fprintf(stderr,
+                "wirelog: invalid pool relation during checked teardown "
+                "(slot=%u aliases=%d identity=%llu owner=%p rc=%d)\n",
+                slot, aliases ? 1 : 0,
+                (unsigned long long)relation->relation_identity,
+                (void *)relation->storage_owner, rc);
+        if (rc != 0 && result == 0)
+            result = rc;
+    }
+    return result;
+}
+
+/* Pool-backed aliases must be retired before roots. Keep these as separate
+ * passes so a session can retire aliases from both its heap relation array
+ * and its pool before attempting to destroy either set of roots. */
+int
+col_rel_pool_destroy_aliases_checked(delta_pool_t *pool,
+    uint32_t first_slot, uint32_t slot_limit)
+{
+    return col_rel_pool_destroy_pass_checked(pool, first_slot, slot_limit,
+               true);
+}
+
+int
+col_rel_pool_destroy_roots_checked(delta_pool_t *pool,
+    uint32_t first_slot, uint32_t slot_limit)
+{
+    return col_rel_pool_destroy_pass_checked(pool, first_slot, slot_limit,
+               false);
 }
 
 void
@@ -1685,7 +2003,8 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
          * shared views still point at those buffers, so refuse growth until
          * the aliases are released.  A shared-view destination is allowed
          * to COW/grow because it replaces its own alias safely. */
-        if (r->storage_owner == r && r->storage_alias_borrows > 0) {
+        if (r->storage_owner == r
+            && col_rel_storage_alias_borrow_count(r) > 0) {
             rc = EBUSY;
             goto release_writer;
         }
@@ -1810,9 +2129,16 @@ col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
     wl_columnar_source_access_writer_t *writer,
     bool *out_alias_release_pending)
 {
+    col_rel_t *owner = NULL;
+    int rc;
     if (!r || !writer || !out_alias_release_pending
         || additional > UINT32_MAX - r->nrows)
         return EINVAL;
+    rc = col_rel_storage_owner_resolve(r, &owner);
+    if (rc != 0 || writer->owner != &owner->source_access
+        || writer->identity != (uintptr_t)writer
+        || !wl_columnar_source_access_writer_thread_equal(writer))
+        return rc != 0 ? rc : EINVAL;
     *out_alias_release_pending = false;
     uint32_t required = r->nrows + additional;
     bool alias_release_pending = r->storage_owner
@@ -1827,7 +2153,8 @@ col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
     }
     if (required <= r->capacity)
         return col_rel_reserve_capacity_admitted(r, r->capacity, NULL);
-    if (r->storage_owner == r && r->storage_alias_borrows > 0)
+    if (r->storage_owner == r
+        && col_rel_storage_alias_borrow_count(r) > 0)
         return EBUSY;
 
     uint32_t new_cap = r->capacity ? r->capacity : COL_REL_INIT_CAP;
@@ -1860,7 +2187,7 @@ col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
     }
     int64_t **new_cols = NULL;
     col_delta_timestamp_t *new_ts = NULL;
-    int rc = col_rel_prepare_resize(r, new_cap, &new_cols, &new_ts);
+    rc = col_rel_prepare_resize(r, new_cap, &new_cols, &new_ts);
     if (rc != 0) {
         if (admitted)
             col_rel_reservation_rollback(&pending);
@@ -1891,7 +2218,7 @@ col_rel_reset_rows_locked(col_rel_t *r,
         || col_rel_storage_owner_resolve(r, &owner) != 0
         || writer->owner != &owner->source_access)
         return EINVAL;
-    if (owner->storage_alias_borrows > 0)
+    if (col_rel_storage_alias_borrow_count(owner) > 0)
         return EBUSY;
     r->nrows = 0;
     r->sorted_nrows = 0;
@@ -2044,7 +2371,8 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
     /* Replacing canonical-owner storage frees buffers still referenced by
      * live aliases.  Keep the raw-pointer alias model safe by refusing only
      * owner growth; alias destinations may still detach and grow privately. */
-    if (dst == dst_owner && dst_owner->storage_alias_borrows > 0
+    if (dst == dst_owner
+        && col_rel_storage_alias_borrow_count(dst_owner) > 0
         && new_nrows > dst->capacity) {
         rc = EBUSY;
         goto cleanup;
@@ -2365,14 +2693,13 @@ col_rel_compact(col_rel_t *r)
     if (rc != 0)
         return rc;
     /* A canonical owner cannot replace or discard storage while a shared
-     * alias still points at it.  An alias itself may compact through the
-     * transactional COW path below. */
-    if (owner == r && r->storage_alias_borrows > 0)
-        return EBUSY;
+     * alias still points at it.  Check only after writer admission so an
+     * alias publication cannot race a stale pre-writer observation. */
     rc = col_rel_source_writer_acquire(r, &writer);
     if (rc != 0)
         return rc;
-    rc = col_rel_compact_impl(r, &writer);
+    rc = owner == r && col_rel_storage_alias_borrow_count(owner) > 0
+        ? EBUSY : col_rel_compact_impl(r, &writer);
     if (wl_columnar_source_access_writer_release(&writer) != 0 && rc == 0)
         rc = EINVAL;
     return rc;
@@ -2409,8 +2736,7 @@ col_rel_compact_many(col_rel_t *const *rels, uint32_t nrels)
         if (!rels[i] || rels[i]->ncols == 0)
             continue;
         rc = col_rel_storage_owner_resolve(rels[i], &owner);
-        if (rc != 0 || (owner == rels[i]
-            && owner->storage_alias_borrows > 0)) {
+        if (rc != 0) {
             rc = rc != 0 ? rc : EBUSY;
             goto cleanup;
         }
@@ -2431,6 +2757,19 @@ col_rel_compact_many(col_rel_t *const *rels, uint32_t nrels)
             &owners[i]->source_access, &writers[i]);
         if (rc != 0)
             goto cleanup;
+    }
+    for (uint32_t i = 0; i < nrels; i++) {
+        col_rel_t *owner = NULL;
+        if (!rels[i] || rels[i]->ncols == 0)
+            continue;
+        rc = col_rel_storage_owner_resolve(rels[i], &owner);
+        if (rc != 0)
+            goto cleanup;
+        if (owner == rels[i]
+            && col_rel_storage_alias_borrow_count(owner) != 0) {
+            rc = EBUSY;
+            goto cleanup;
+        }
     }
     for (uint32_t i = 0; i < nrels; i++) {
         if (!rels[i] || rels[i]->ncols == 0)
@@ -2525,10 +2864,11 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
         return EINVAL;
     /* A relation with live flattened aliases cannot itself become an alias:
      * doing so would invalidate the children's canonical owner. */
-    if (dst->storage_alias_borrows > 0 || source_owner == dst
-        || source_owner->storage_alias_borrows == UINT32_MAX)
+    if (col_rel_storage_alias_borrow_count(dst) > 0 || source_owner == dst
+        || col_rel_storage_alias_borrow_count(source_owner) == UINT64_MAX)
         return source_owner == dst ? EINVAL : EBUSY;
-    if (old_owner != dst && old_owner->storage_alias_borrows == 0)
+    if (old_owner != dst
+        && col_rel_storage_alias_borrow_count(old_owner) == 0)
         return EINVAL;
     /* A shared-view publication is a new epoch on the destination.  Reserve
      * the next values before replacing any buffers so exhaustion cannot leave
@@ -2661,11 +3001,11 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
         bool old_arena_owned = dst->arena_owned;
         uint64_t ledger_before = col_rel_owned_ledger_bytes(dst);
 
-        /* Ownership metadata is committed with the borrowed columns. Both
-        * counters were validated before any destination state changed. */
-        if (old_owner != dst)
-            old_owner->storage_alias_borrows--;
-        source_owner->storage_alias_borrows++;
+        /* Reserve the new owner's borrow before publication. The source
+         * reader held by the wrapper prevents owner destruction until this
+         * transaction completes. No fallible work follows this increment. */
+        if (col_rel_storage_alias_borrow_acquire(source_owner) != 0)
+            goto prepare_fail;
 
         /* Commit point: all allocations and schema preparation succeeded. */
         if (!old_arena_owned && old_columns) {
@@ -2726,10 +3066,16 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
         dst->storage_owner = source_owner;
         dst->storage_owner_identity = source_owner->relation_identity;
         dst->storage_owner_generation = source_owner->storage_generation;
-        dst->storage_alias_borrows = 0;
+        atomic_store_explicit(&dst->storage_alias_borrows, 0,
+            memory_order_relaxed);
         dst->view_generation++;
         dst->storage_generation++;
         col_rel_ledger_reconcile(dst, ledger_before);
+        /* Drop the old borrow only after dst no longer refers to that owner,
+         * so a concurrent root destroy cannot observe an unborrowed live
+         * alias descriptor. */
+        if (old_owner != dst)
+            (void)col_rel_storage_alias_borrow_release(old_owner);
     }
     shared_columns = NULL;
     shared_flags = NULL;
@@ -2768,8 +3114,12 @@ wl_columnar_relation_install_shared_view_with_lease(col_rel_t *dst,
     bool lease_upgraded = false;
     int rc;
 
-    if (!dst || !src)
+    if (!dst || !src || dst == src)
         return EINVAL;
+
+    rc = col_rel_storage_owner_ensure_initialized((col_rel_t *)src);
+    if (rc != 0)
+        return rc;
     rc = col_rel_storage_owner_resolve(src, &owner);
     if (rc != 0)
         return rc;
@@ -2781,8 +3131,9 @@ wl_columnar_relation_install_shared_view_with_lease(col_rel_t *dst,
         && (destination_lease->owner != &destination_owner->source_access
         || destination_lease->identity != (uintptr_t)destination_lease
         || !destination_lease->transferable
-        || destination_lease->thread_valid))
+        || destination_lease->thread_valid)){
         return EINVAL;
+    }
     if (!same_owner) {
         rc = col_rel_source_reader_acquire(owner, &source_reader);
         if (rc != 0)
@@ -2830,7 +3181,122 @@ wl_columnar_relation_install_shared_view_with_lease(col_rel_t *dst,
 int
 col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
 {
-    return wl_columnar_relation_install_shared_view_with_lease(dst, src, NULL);
+    wl_columnar_source_access_reader_t source_owner_reader = { 0 };
+    wl_columnar_source_access_writer_t dst_descriptor_writer = { 0 };
+    wl_columnar_source_access_writer_t dst_owner_writer = { 0 };
+    wl_columnar_source_access_gate_t *src_descriptor;
+    wl_columnar_source_access_gate_t *dst_descriptor;
+    col_rel_t *source_owner = NULL;
+    col_rel_t *dst_owner = NULL;
+    bool src_descriptor_reader = false;
+    bool dst_descriptor_first = false;
+    bool source_owner_reader_held = false;
+    bool dst_owner_writer_held = false;
+    bool dst_owner_first = false;
+    int rc;
+
+    if (!dst || !src || dst == src)
+        return EINVAL;
+    rc = col_rel_storage_owner_ensure_initialized((col_rel_t *)src);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_storage_owner_ensure_initialized(dst);
+    if (rc != 0)
+        return rc;
+    src_descriptor =
+        (wl_columnar_source_access_gate_t *)&src->descriptor_access;
+    dst_descriptor = &dst->descriptor_access;
+    if ((uintptr_t)src_descriptor < (uintptr_t)dst_descriptor) {
+        rc = wl_columnar_source_access_gate_reader_acquire(src_descriptor);
+        if (rc != 0)
+            return rc;
+        src_descriptor_reader = true;
+        rc = wl_columnar_source_access_writer_acquire(dst_descriptor,
+                &dst_descriptor_writer);
+    } else {
+        dst_descriptor_first = true;
+        rc = wl_columnar_source_access_writer_acquire(dst_descriptor,
+                &dst_descriptor_writer);
+        if (rc == 0) {
+            rc = wl_columnar_source_access_gate_reader_acquire(src_descriptor);
+            if (rc == 0)
+                src_descriptor_reader = true;
+        }
+    }
+    if (rc != 0)
+        goto cleanup;
+    rc = col_rel_storage_owner_resolve(src, &source_owner);
+    if (rc != 0)
+        goto cleanup;
+    rc = col_rel_storage_owner_resolve(dst, &dst_owner);
+    if (rc != 0)
+        goto cleanup;
+    if (dst_owner == dst && source_owner == dst) {
+        rc = EINVAL;
+        goto cleanup;
+    }
+    if (dst_owner == dst) {
+        dst_owner_first = (uintptr_t)&dst_owner->source_access
+            < (uintptr_t)&source_owner->source_access;
+        if (dst_owner_first) {
+            rc = wl_columnar_source_access_writer_acquire(
+                &dst_owner->source_access, &dst_owner_writer);
+            if (rc != 0)
+                goto cleanup;
+            dst_owner_writer_held = true;
+        }
+        rc = wl_columnar_source_access_reader_acquire(
+            &source_owner->source_access, &source_owner_reader);
+        if (rc != 0)
+            goto cleanup;
+        source_owner_reader_held = true;
+        if (!dst_owner_first) {
+            rc = wl_columnar_source_access_writer_acquire(
+                &dst_owner->source_access, &dst_owner_writer);
+            if (rc != 0)
+                goto cleanup;
+            dst_owner_writer_held = true;
+        }
+    } else {
+        rc = wl_columnar_source_access_reader_acquire(
+            &source_owner->source_access, &source_owner_reader);
+        if (rc != 0)
+            goto cleanup;
+        source_owner_reader_held = true;
+    }
+    if (dst_owner == dst
+        && col_rel_storage_alias_borrow_count(dst_owner) != 0) {
+        rc = EBUSY;
+        goto cleanup;
+    }
+    rc = col_rel_install_shared_view_unprotected(dst, src);
+
+cleanup:
+    if (dst_owner_first && source_owner_reader_held
+        && wl_columnar_source_access_reader_release(&source_owner_reader) != 0
+        && rc == 0)
+        rc = EINVAL;
+    if (dst_owner_writer_held
+        && wl_columnar_source_access_writer_release(&dst_owner_writer) != 0
+        && rc == 0)
+        rc = EINVAL;
+    if (!dst_owner_first && source_owner_reader_held
+        && wl_columnar_source_access_reader_release(&source_owner_reader) != 0
+        && rc == 0)
+        rc = EINVAL;
+    if (dst_descriptor_first && src_descriptor_reader
+        && wl_columnar_source_access_gate_reader_release(src_descriptor) != 0
+        && rc == 0)
+        rc = EINVAL;
+    if (dst_descriptor_writer.owner
+        && wl_columnar_source_access_writer_release(
+            &dst_descriptor_writer) != 0 && rc == 0)
+        rc = EINVAL;
+    if (!dst_descriptor_first && src_descriptor_reader
+        && wl_columnar_source_access_gate_reader_release(src_descriptor) != 0
+        && rc == 0)
+        rc = EINVAL;
+    return rc;
 }
 
 /* ---- column name lookup ------------------------------------------------- */
@@ -3020,6 +3486,7 @@ col_rel_pool_new_like(delta_pool_t *pool, const char *name,
         r->view_generation = 1u;
         r->storage_generation = 1u;
         col_rel_storage_owner_init(r);
+        wl_columnar_memory_reservation_init(&r->retained_reservation);
         r->name = wl_strdup(name);
         if (!r->name) {
             return col_rel_pool_fallback_like(pool, r, name, like);
@@ -3081,6 +3548,7 @@ col_rel_pool_new_auto(delta_pool_t *pool, wl_arena_t *arena,
         r->view_generation = 1u;
         r->storage_generation = 1u;
         col_rel_storage_owner_init(r);
+        wl_columnar_memory_reservation_init(&r->retained_reservation);
         r->name = wl_strdup(name);
         if (!r->name) {
             return col_rel_pool_fallback_auto(pool, r, name, ncols);
@@ -3649,6 +4117,7 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     uint64_t ledger_before;
     uint64_t ledger_ts_bytes;
     uint64_t gate_state;
+    uint64_t descriptor_state;
     bool has_new_reservation;
     int release_rc;
 
@@ -3686,6 +4155,8 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     ledger_ts_bytes = old.ledger_ts_bytes;
     gate_state = atomic_load_explicit(&old.source_access.state,
             memory_order_acquire);
+    descriptor_state = atomic_load_explicit(&old.descriptor_access.state,
+            memory_order_acquire);
 
     if (old.retained_reserved_bytes > 0)
         (void)wl_columnar_memory_release(&old.retained_reservation);
@@ -3713,8 +4184,11 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     dst->ledger_ts_bytes = ledger_ts_bytes;
     dst->storage_owner = dst;
     dst->storage_owner_identity = identity;
-    dst->storage_alias_borrows = 0;
+    atomic_store_explicit(&dst->storage_alias_borrows, 0,
+        memory_order_relaxed);
     atomic_store_explicit(&dst->source_access.state, gate_state,
+        memory_order_release);
+    atomic_store_explicit(&dst->descriptor_access.state, descriptor_state,
         memory_order_release);
     col_rel_ledger_reconcile(dst, ledger_before);
     wl_columnar_relation_touch_replacement(dst);
@@ -4946,7 +5420,7 @@ wl_columnar_relation_radix_sort_with_workspace(col_rel_t *r,
     /* Contention is reported as EBUSY, matching col_rel_radix_sort_locked.
      * Folding it into the EINVAL conjunction above made one family answer a
      * caller two different ways for the same condition. */
-    if (r == owner && owner->storage_alias_borrows > 0)
+    if (r == owner && col_rel_storage_alias_borrow_count(owner) > 0)
         return EBUSY;
     bool alias_release_pending = false;
     rc = col_rel_radix_sort_impl(r, start_row, nrows, false,
@@ -5082,7 +5556,7 @@ col_rel_radix_sort_locked(col_rel_t *r, uint32_t start_row, uint32_t nrows,
         || writer->identity != (uintptr_t)writer
         || !wl_columnar_source_access_writer_thread_equal(writer))
         return EINVAL;
-    if (r == owner && owner->storage_alias_borrows > 0)
+    if (r == owner && col_rel_storage_alias_borrow_count(owner) > 0)
         return EBUSY;
     if (nrows <= 1)
         return 0;

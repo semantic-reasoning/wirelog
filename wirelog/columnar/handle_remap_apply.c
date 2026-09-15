@@ -86,7 +86,8 @@ wl_handle_remap_apply_columns(col_rel_t *rel,
     if (rc != 0)
         return rc;
     writer_acquired = true;
-    if (rel == owner && owner->storage_alias_borrows > 0) {
+    if (rel == owner
+        && col_rel_storage_alias_borrow_count(owner) > 0) {
         rc = EBUSY;
         goto cleanup;
     }

@@ -7,6 +7,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(_WIN32) && !defined(_WIN64)
+#include <sched.h>
+#include <time.h>
+#endif
 
 #ifdef WL_TEST_ALLOC_WRAP
 void *__real_malloc(size_t size);
@@ -1037,6 +1041,173 @@ test_radix_sort_with_workspace_owner_with_borrows_is_busy(void)
     CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
         "workspace busy writer release");
     wl_columnar_radix_workspace_destroy(&workspace);
+    cleanup_relations();
+}
+
+static void
+test_legacy_storage_owner_metadata_initialization(void)
+{
+    col_rel_t *rel = new_relation();
+    wl_columnar_source_access_reader_t reader = { 0 };
+
+    CHECK(rel != NULL, "legacy metadata relation allocation");
+    rel->storage_owner = NULL;
+    rel->storage_owner_identity = 0;
+    rel->storage_owner_generation = 0;
+    CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "legacy owner metadata initializes before reader publication");
+    CHECK(rel->storage_owner == rel
+        && rel->storage_owner_identity == rel->relation_identity
+        && rel->storage_owner_generation == rel->storage_generation,
+        "legacy relation gets canonical owner metadata");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "legacy source reader releases");
+    CHECK(col_rel_destroy_checked(rel) == 0,
+        "legacy initialized relation destroys cleanly");
+    owned_relation_count--;
+}
+
+typedef struct alias_borrow_reader_args {
+    col_rel_t *owner;
+    atomic_bool ready;
+    atomic_bool stop;
+    atomic_bool accounting_active;
+    atomic_uint_fast64_t reads_during_accounting;
+    int rc;
+} alias_borrow_reader_args_t;
+
+static void *
+read_alias_borrows_while_peer_lease_is_active(void *opaque)
+{
+    alias_borrow_reader_args_t *args = (alias_borrow_reader_args_t *)opaque;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    args->rc = col_rel_source_reader_acquire(args->owner, &reader);
+    atomic_store_explicit(&args->ready, true, memory_order_release);
+    if (args->rc != 0)
+        return NULL;
+
+    while (!atomic_load_explicit(&args->stop, memory_order_acquire)) {
+        uint64_t borrow_count
+            = col_rel_storage_alias_borrow_count(args->owner);
+        (void)borrow_count;
+        if (atomic_load_explicit(&args->accounting_active,
+            memory_order_acquire)) {
+            atomic_fetch_add_explicit(&args->reads_during_accounting, 1,
+                memory_order_relaxed);
+        }
+    }
+    args->rc = col_rel_source_reader_release(&reader);
+    return NULL;
+}
+
+/* Bounded, yielding wait, mirroring peer_test_yield/peer_test_wait_reads in
+ * tests/test_worker_session.c.  An unbounded spin would make the
+ * reads_during_accounting assertion below unfalsifiable: it could only hang,
+ * never fail, so a future change that stops the peer sampling would surface
+ * as a CI timeout with no diagnostic instead of a named failure. */
+static void
+alias_accounting_yield(void)
+{
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_yield();
+#elif defined(_WIN32) || defined(_WIN64)
+    SwitchToThread();
+#else
+    sched_yield();
+#endif
+}
+
+static uint64_t
+alias_accounting_now_ms(void)
+{
+#if defined(_WIN32) || defined(_WIN64)
+    return (uint64_t)GetTickCount64();
+#else
+    struct timespec now;
+    if (timespec_get(&now, TIME_UTC) != TIME_UTC)
+        return 0;
+    return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+#endif
+}
+
+static bool
+alias_accounting_wait_reads(const atomic_uint_fast64_t *value)
+{
+    uint64_t start = alias_accounting_now_ms();
+    while (atomic_load_explicit(value, memory_order_relaxed) == 0) {
+        if (alias_accounting_now_ms() - start >= 5000u)
+            return false;
+        alias_accounting_yield();
+    }
+    return true;
+}
+
+static void
+test_peer_reader_alias_accounting_is_race_safe(void)
+{
+    enum { ACCOUNTING_ROUNDS = 2048 };
+    col_rel_t *owner = new_relation();
+    wl_thread_t reader_thread;
+    alias_borrow_reader_args_t args = { .owner = owner };
+    bool thread_started = false;
+    bool ok = owner != NULL;
+
+    CHECK(ok, "peer-reader alias owner allocation");
+    atomic_init(&args.ready, false);
+    atomic_init(&args.stop, false);
+    atomic_init(&args.accounting_active, false);
+    atomic_init(&args.reads_during_accounting, 0);
+    if (wl_thread_create(&reader_thread,
+        read_alias_borrows_while_peer_lease_is_active, &args) != 0) {
+        cleanup_relations();
+        CHECK(false, "peer-reader thread creation");
+        return;
+    }
+    thread_started = true;
+    while (!atomic_load_explicit(&args.ready, memory_order_acquire)) {
+    }
+    if (args.rc != 0)
+        ok = false;
+
+    for (uint32_t i = 0; ok && i < ACCOUNTING_ROUNDS; i++) {
+        col_rel_t *alias = col_rel_new_auto("borrow-race-alias", 1);
+        if (!alias) {
+            ok = false;
+            break;
+        }
+        atomic_store_explicit(&args.accounting_active, true,
+            memory_order_release);
+        int rc = col_rel_install_shared_view(alias, owner);
+        if (rc == 0)
+            rc = col_rel_destroy_checked(alias);
+        if (rc != 0) {
+            col_rel_destroy(alias);
+            ok = false;
+        }
+        /* Wait for the peer to actually sample inside the window rather
+         * than assuming it was scheduled.  On a host with fewer cores than
+         * threads the main loop closed every round inside one quantum, the
+         * peer never ran, and the reads assertion below failed
+         * deterministically -- which is what the arm64 CI leg was
+         * reporting.  Reproducible on x86_64 with `taskset -c 0`. */
+        if (!alias_accounting_wait_reads(&args.reads_during_accounting))
+            ok = false;
+        atomic_store_explicit(&args.accounting_active, false,
+            memory_order_release);
+        if (owner->storage_alias_borrows != 0)
+            ok = false;
+    }
+
+    if (thread_started) {
+        atomic_store_explicit(&args.stop, true, memory_order_release);
+        if (wl_thread_join(&reader_thread) != 0)
+            ok = false;
+    }
+    ok = ok && args.rc == 0
+        && atomic_load_explicit(&args.reads_during_accounting,
+            memory_order_relaxed) > 0
+        && owner->storage_alias_borrows == 0;
+    CHECK(ok, "peer lease and concurrent alias accounting remain race-safe");
     cleanup_relations();
 }
 
@@ -2698,7 +2869,7 @@ test_sort_failure_atomicity(void)
     bool *old_flags = view->col_shared;
     uint64_t old_view = view->view_generation;
     uint64_t old_storage = view->storage_generation;
-    uint32_t old_borrows = source->storage_alias_borrows;
+    uint64_t old_borrows = source->storage_alias_borrows;
     col_rel_t *old_owner = view->storage_owner;
     allocation_calls = 0;
     allocation_fail_at = 4; /* backups and COW succeed; k8 setup fails. */
@@ -3300,6 +3471,8 @@ main(void)
     test_storage_only_cow_and_compaction();
     test_flattened_storage_ownership();
     test_source_reader_blocks_checked_destroy();
+    test_legacy_storage_owner_metadata_initialization();
+    test_peer_reader_alias_accounting_is_race_safe();
     test_source_reader_blocks_radix_sort();
     test_radix_sort_locked_rejects_foreign_writer();
     test_radix_sort_locked_rejects_absent_writer_and_out();

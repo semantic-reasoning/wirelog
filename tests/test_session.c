@@ -17,6 +17,7 @@
 #include "../wirelog/passes/jpp.h"
 #include "../wirelog/passes/sip.h"
 #include "../wirelog/session.h"
+#include "../wirelog/thread.h"
 #include "../wirelog/columnar/memory_governor.h"
 #include "../wirelog/arena/compound_arena.h"
 #include "../wirelog/intern.h"
@@ -29,6 +30,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(WL_HAVE_C11_THREADS) || !defined(_WIN32)
+#include <time.h>
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -70,6 +75,415 @@ static int tests_failed = 0;
             tests_failed++;                   \
             printf(" ... FAIL: %s\n", (msg)); \
         } while (0)
+
+static wl_plan_t *build_plan(const char *src);
+
+#ifdef WL_SESSION_TEST_HOOKS
+typedef struct {
+    wl_mutex_t mutex;
+    wl_cond_t changed;
+    wl_mutex_t task_mutex;
+    wl_cond_t task_changed;
+    wl_session_t *session;
+    col_rel_t *owner;
+    col_rel_t *alias;
+    bool admission_closed;
+    bool release_admission;
+    bool before_drain;
+    bool task_started;
+    bool release_task;
+    bool task_finished;
+    bool callback_entered;
+    bool release_callback;
+    bool snapshot_finished;
+    int snapshot_rc;
+    bool after_worker_lease_release;
+    bool destroy_finished;
+    uint64_t borrow_count_after_release;
+} session_destroy_probe_t;
+
+static session_destroy_probe_t *session_destroy_probe;
+
+static void
+probe_admission_closed(wl_session_t *session)
+{
+    session_destroy_probe_t *probe = session_destroy_probe;
+    wl_mutex_lock(&probe->mutex);
+    probe->session = session;
+    probe->admission_closed = true;
+    wl_cond_broadcast(&probe->changed);
+    while (!probe->release_admission)
+        wl_cond_wait(&probe->changed, &probe->mutex);
+    wl_mutex_unlock(&probe->mutex);
+}
+
+static void
+probe_before_drain(wl_session_t *session)
+{
+    session_destroy_probe_t *probe = session_destroy_probe;
+    (void)session;
+    wl_mutex_lock(&probe->mutex);
+    probe->before_drain = true;
+    wl_cond_broadcast(&probe->changed);
+    wl_mutex_unlock(&probe->mutex);
+}
+
+static void
+probe_after_worker_lease_release(wl_session_t *session)
+{
+    session_destroy_probe_t *probe = session_destroy_probe;
+    (void)session;
+    wl_mutex_lock(&probe->mutex);
+    probe->borrow_count_after_release = probe->owner
+        ? col_rel_storage_alias_borrow_count(probe->owner) : UINT64_MAX;
+    probe->after_worker_lease_release = true;
+    wl_cond_broadcast(&probe->changed);
+    wl_mutex_unlock(&probe->mutex);
+}
+
+static void
+probe_work_item(void *opaque)
+{
+    session_destroy_probe_t *probe = (session_destroy_probe_t *)opaque;
+    wl_mutex_lock(&probe->task_mutex);
+    probe->task_started = true;
+    wl_cond_broadcast(&probe->task_changed);
+    while (!probe->release_task)
+        wl_cond_wait(&probe->task_changed, &probe->task_mutex);
+    /* The worker alias remains valid until the workqueue has drained. */
+    if (probe->alias && probe->alias->name)
+        probe->task_finished = strcmp(probe->alias->name, "edge_alias") == 0;
+    wl_cond_broadcast(&probe->task_changed);
+    wl_mutex_unlock(&probe->task_mutex);
+}
+
+static void
+probe_snapshot_callback(const char *relation, const int64_t *row,
+    uint32_t ncols, void *opaque)
+{
+    session_destroy_probe_t *probe = (session_destroy_probe_t *)opaque;
+    (void)relation;
+    (void)row;
+    (void)ncols;
+    wl_mutex_lock(&probe->mutex);
+    probe->callback_entered = true;
+    wl_cond_broadcast(&probe->changed);
+    while (!probe->release_callback)
+        wl_cond_wait(&probe->changed, &probe->mutex);
+    wl_mutex_unlock(&probe->mutex);
+}
+
+static void
+probe_snapshot_noop(const char *relation, const int64_t *row,
+    uint32_t ncols, void *opaque)
+{
+    (void)relation;
+    (void)row;
+    (void)ncols;
+    (void)opaque;
+}
+
+static void *
+probe_snapshot_thread(void *opaque)
+{
+    session_destroy_probe_t *probe = (session_destroy_probe_t *)opaque;
+    int rc = wl_session_snapshot(probe->session, probe_snapshot_callback,
+            probe);
+    wl_mutex_lock(&probe->mutex);
+    probe->snapshot_rc = rc;
+    probe->snapshot_finished = true;
+    wl_cond_broadcast(&probe->changed);
+    wl_mutex_unlock(&probe->mutex);
+    return NULL;
+}
+
+static void *
+probe_destroy_thread(void *opaque)
+{
+    session_destroy_probe_t *probe = (session_destroy_probe_t *)opaque;
+    wl_session_destroy(probe->session);
+    wl_mutex_lock(&probe->mutex);
+    probe->destroy_finished = true;
+    wl_cond_broadcast(&probe->changed);
+    wl_mutex_unlock(&probe->mutex);
+    return NULL;
+}
+
+static int
+probe_cond_wait_for(wl_cond_t *cond, wl_mutex_t *mutex, unsigned timeout_ms)
+{
+#if defined(WL_HAVE_C11_THREADS)
+    struct timespec now;
+    struct timespec deadline;
+    if (timespec_get(&now, TIME_UTC) != TIME_UTC)
+        return ETIMEDOUT;
+    deadline = now;
+    deadline.tv_sec += timeout_ms / 1000u;
+    deadline.tv_nsec += (long)(timeout_ms % 1000u) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    return cnd_timedwait(&cond->c, &mutex->m, &deadline) == thrd_success
+        ? 0 : ETIMEDOUT;
+#elif defined(_WIN32) || defined(_WIN64)
+    return SleepConditionVariableCS(&cond->cv, &mutex->cs, timeout_ms)
+        ? 0 : ETIMEDOUT;
+#else
+    struct timespec now;
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0)
+        return ETIMEDOUT;
+    deadline = now;
+    deadline.tv_sec += timeout_ms / 1000u;
+    deadline.tv_nsec += (long)(timeout_ms % 1000u) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    return pthread_cond_timedwait(&cond->c, &mutex->m, &deadline) == 0
+        ? 0 : ETIMEDOUT;
+#endif
+}
+
+static bool
+probe_wait(bool *condition, session_destroy_probe_t *probe,
+    wl_cond_t *cond, wl_mutex_t *mutex)
+{
+    while (!*condition) {
+        if (probe_cond_wait_for(cond, mutex, 5000) != 0)
+            return false;
+    }
+    return true;
+}
+
+static void
+test_session_destroy_orders_worker_retirement(void)
+{
+    session_destroy_probe_t probe = { 0 };
+    wirelog_program_t *program = NULL;
+    wl_plan_t *plan = NULL;
+    wl_session_t *session = NULL;
+    wl_col_session_t *coord;
+    wl_thread_t destroy_thread;
+    wl_thread_t snapshot_thread;
+    col_rel_t *owner;
+    col_rel_t *parts[1] = { NULL };
+    int64_t edge[] = { 1 };
+    int rc;
+    bool destroy_started = false;
+    bool snapshot_started = false;
+    bool work_submitted = false;
+
+    TEST("session destroy closes admission before draining worker aliases");
+    if (wl_mutex_init(&probe.mutex) != 0) {
+        FAIL("probe synchronization setup failed");
+        return;
+    }
+    if (wl_cond_init(&probe.changed) != 0) {
+        wl_mutex_destroy(&probe.mutex);
+        FAIL("probe synchronization setup failed");
+        return;
+    }
+    if (wl_mutex_init(&probe.task_mutex) != 0) {
+        wl_cond_destroy(&probe.changed);
+        wl_mutex_destroy(&probe.mutex);
+        FAIL("probe synchronization setup failed");
+        return;
+    }
+    if (wl_cond_init(&probe.task_changed) != 0) {
+        wl_mutex_destroy(&probe.task_mutex);
+        wl_cond_destroy(&probe.changed);
+        wl_mutex_destroy(&probe.mutex);
+        FAIL("probe synchronization setup failed");
+        return;
+    }
+    plan = build_plan(".decl edge(x: int32)\n"
+            ".decl out(x: int32)\n"
+            "out(x) :- edge(x).\n");
+    rc = plan ? wl_session_create(wl_backend_columnar(), plan, 2, &session)
+              : ENOMEM;
+    coord = session ? COL_SESSION(session) : NULL;
+    owner = coord ? session_find_rel(coord, "edge") : NULL;
+    if (rc == 0)
+        rc = wl_session_insert(session, "edge", edge, 1, 1);
+    if (rc == 0)
+        rc = wl_session_snapshot(session, probe_snapshot_noop, NULL);
+    if (rc == 0)
+        rc = wl_columnar_session_ensure_tdd_worker_slots(coord, 1);
+    if (rc == 0)
+        parts[0] = col_rel_new_like("edge_alias", owner);
+    if (rc == 0 && parts[0])
+        rc = col_rel_install_shared_view(parts[0], owner);
+    if (rc == 0 && parts[0])
+        rc = col_worker_session_create(coord, 0, parts, 1,
+                &coord->tdd_workers[0]);
+    if (rc == 0)
+        coord->tdd_workers_count = 1;
+    if (rc == 0)
+        rc = wl_columnar_session_ensure_workqueue(coord, 2);
+    probe.session = session;
+    probe.owner = owner;
+    probe.alias = coord && coord->tdd_workers_count == 1
+        ? coord->tdd_workers[0].rels[0] : NULL;
+    if (rc == 0) {
+        session_destroy_probe = &probe;
+        wl_session_testhook_set_admission_closed(probe_admission_closed);
+        wl_session_testhook_set_before_workqueue_drain(probe_before_drain);
+        wl_session_testhook_set_after_worker_lease_release(
+            probe_after_worker_lease_release);
+        if (wl_thread_create(&snapshot_thread, probe_snapshot_thread, &probe)
+            != 0)
+            rc = EAGAIN;
+        else
+            snapshot_started = true;
+    }
+    if (rc == 0) {
+        wl_mutex_lock(&probe.mutex);
+        if (!probe_wait(&probe.callback_entered, &probe,
+            &probe.changed, &probe.mutex))
+            rc = ETIMEDOUT;
+        wl_mutex_unlock(&probe.mutex);
+    }
+    if (rc == 0) {
+        rc = wl_workqueue_submit(coord->wq, probe_work_item, &probe);
+        if (rc == 0)
+            work_submitted = true;
+    }
+    if (rc == 0) {
+        if (wl_thread_create(&destroy_thread, probe_destroy_thread, &probe)
+            != 0)
+            rc = EAGAIN;
+        else
+            destroy_started = true;
+    }
+    if (rc == 0) {
+        wl_mutex_lock(&probe.mutex);
+        if (!probe_wait(&probe.admission_closed, &probe,
+            &probe.changed, &probe.mutex))
+            rc = ETIMEDOUT;
+        if (wl_session_memory_governor(session) != NULL
+            || probe.destroy_finished
+            || probe.snapshot_finished
+            || col_rel_storage_alias_borrow_count(owner) != 1)
+            rc = EFAULT;
+        probe.release_admission = true;
+        wl_cond_broadcast(&probe.changed);
+        wl_mutex_unlock(&probe.mutex);
+    }
+    if (rc == 0) {
+        wl_mutex_lock(&probe.mutex);
+        probe.release_callback = true;
+        wl_cond_broadcast(&probe.changed);
+        if (!probe_wait(&probe.snapshot_finished, &probe,
+            &probe.changed, &probe.mutex))
+            rc = ETIMEDOUT;
+        if (probe.snapshot_rc != 0) {
+            rc = EFAULT;
+        }
+        wl_mutex_unlock(&probe.mutex);
+    }
+    if (rc == 0) {
+        wl_mutex_lock(&probe.mutex);
+        if (!probe_wait(&probe.before_drain, &probe,
+            &probe.changed, &probe.mutex))
+            rc = ETIMEDOUT;
+        wl_mutex_unlock(&probe.mutex);
+        if (rc == 0) {
+            wl_mutex_lock(&probe.task_mutex);
+            if (!probe_wait(&probe.task_started, &probe,
+                &probe.task_changed, &probe.task_mutex))
+                rc = ETIMEDOUT;
+            bool destroy_finished_before_release;
+            bool task_finished_before_release = probe.task_finished;
+            wl_mutex_unlock(&probe.task_mutex);
+            wl_mutex_lock(&probe.mutex);
+            destroy_finished_before_release = probe.destroy_finished;
+            wl_mutex_unlock(&probe.mutex);
+            if (destroy_finished_before_release || task_finished_before_release
+                || col_rel_storage_alias_borrow_count(owner) != 1)
+                rc = EFAULT;
+            wl_mutex_lock(&probe.task_mutex);
+            probe.release_task = true;
+            wl_cond_broadcast(&probe.task_changed);
+            wl_mutex_unlock(&probe.task_mutex);
+        }
+    }
+    if (snapshot_started && rc != 0) {
+        wl_mutex_lock(&probe.mutex);
+        probe.release_callback = true;
+        wl_cond_broadcast(&probe.changed);
+        wl_mutex_unlock(&probe.mutex);
+        wl_mutex_lock(&probe.task_mutex);
+        probe.release_task = true;
+        wl_cond_broadcast(&probe.task_changed);
+        wl_mutex_unlock(&probe.task_mutex);
+    }
+    if (!destroy_started && (snapshot_started || work_submitted)) {
+        wl_mutex_lock(&probe.mutex);
+        probe.release_admission = true;
+        probe.release_callback = true;
+        wl_cond_broadcast(&probe.changed);
+        wl_mutex_unlock(&probe.mutex);
+        wl_mutex_lock(&probe.task_mutex);
+        probe.release_task = true;
+        wl_cond_broadcast(&probe.task_changed);
+        wl_mutex_unlock(&probe.task_mutex);
+    }
+    if (destroy_started && rc != 0) {
+        /* Never leave a started destroy thread behind when an assertion
+         * above fails; both gates are owned by this test fixture. */
+        wl_mutex_lock(&probe.mutex);
+        probe.release_admission = true;
+        wl_cond_broadcast(&probe.changed);
+        wl_mutex_unlock(&probe.mutex);
+        wl_mutex_lock(&probe.task_mutex);
+        probe.release_task = true;
+        wl_cond_broadcast(&probe.task_changed);
+        wl_mutex_unlock(&probe.task_mutex);
+    }
+    if (destroy_started) {
+        if (wl_thread_join(&destroy_thread) != 0) {
+            fputs("session destroy probe: destroy thread join failed\n",
+                stderr);
+            exit(EXIT_FAILURE);
+        }
+    }
+    if (snapshot_started) {
+        if (wl_thread_join(&snapshot_thread) != 0) {
+            fputs("session destroy probe: snapshot thread join failed\n",
+                stderr);
+            exit(EXIT_FAILURE);
+        }
+    }
+    if (rc == 0) {
+        if (!probe.after_worker_lease_release || !probe.task_finished
+            || probe.borrow_count_after_release != 0)
+            rc = EFAULT;
+    }
+    session_destroy_probe = NULL;
+    wl_session_testhook_set_admission_closed(NULL);
+    wl_session_testhook_set_before_workqueue_drain(NULL);
+    wl_session_testhook_set_after_worker_lease_release(NULL);
+    if (!destroy_started && session)
+        wl_session_destroy(session);
+    if (parts[0])
+        col_rel_destroy(parts[0]);
+    if (plan)
+        wl_plan_free(plan);
+    if (program)
+        wirelog_program_free(program);
+    wl_cond_destroy(&probe.changed);
+    wl_mutex_destroy(&probe.mutex);
+    wl_cond_destroy(&probe.task_changed);
+    wl_mutex_destroy(&probe.task_mutex);
+    if (rc != 0) {
+        FAIL("session teardown did not preserve worker/lease ordering");
+        return;
+    }
+    PASS();
+}
+#endif
 
 static void
 test_session_hash_overflow_rejected(void)
@@ -2086,6 +2500,9 @@ main(void)
     test_session_remove_nonexistent();
     test_session_remove_reader_exclusion();
     test_session_remove_incremental_reader_exclusion();
+#ifdef WL_SESSION_TEST_HOOKS
+    test_session_destroy_orders_worker_retirement();
+#endif
     /* GREEN: col_session_remove returns 0 for uninitialized schema */
     /* test_session_snapshot_empty(); */
     /* test_session_snapshot_after_insert(); */
