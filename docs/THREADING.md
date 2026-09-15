@@ -329,11 +329,12 @@ the previous value for up to one cache-line propagation interval; that
 is acceptable because each worker re-polls before every tuple batch
 and the wasted work is bounded.
 
-### 5.6 `wirelog/columnar/eval.c` — shared counter (1 row)
+### 5.6 `wirelog/columnar/eval.c` — shared counter and replacement reservation (2 rows)
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
 | `eval.c:wl_columnar_eval_nonrec_relation_parallel` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Reset before workers spawn; happens-before edge is provided by `wl_thread_create()` itself |
+| `eval.c:wl_columnar_eval_owner_publication_validate_replacement` | `replacement.reservation.state` | `atomic_load_explicit` | `acquire` | Validate the staged reservation state before the commit preflight permits any replacement publication |
 
 ### 5.7 `wirelog/columnar/session.c` — worker budget snapshot (1 row)
 
@@ -575,7 +576,7 @@ the replacement transaction never releases an uncommitted token.
 | `relation.c:col_rel_compact_many` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Validate each retained reservation before compacting a relation |
 | `relation.c:col_rel_compact_many#2` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Revalidate the reservation before the second compaction path |
 
-The complete source audit now contains **149 atomic call sites**.
+The complete source audit now contains **151 atomic call sites**.
 
 ---
 

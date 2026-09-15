@@ -1931,6 +1931,350 @@ tdd_dedup_rel(col_rel_t *r)
 }
 
 static int
+wl_columnar_eval_owner_publication_entry_compare(const void *left,
+    const void *right)
+{
+    const wl_columnar_eval_owner_publication_entry_t *a = left;
+    const wl_columnar_eval_owner_publication_entry_t *b = right;
+    uint64_t ai = a->owner ? a->owner->relation_identity : UINT64_MAX;
+    uint64_t bi = b->owner ? b->owner->relation_identity : UINT64_MAX;
+
+    if (ai < bi)
+        return -1;
+    if (ai > bi)
+        return 1;
+    if (a->owner != b->owner)
+        return (uintptr_t)a->owner < (uintptr_t)b->owner ? -1 : 1;
+    if (a->session != b->session)
+        return (uintptr_t)a->session < (uintptr_t)b->session ? -1 : 1;
+    {
+        int name_cmp = strcmp(a->name, b->name);
+        if (name_cmp != 0)
+            return name_cmp;
+    }
+    if (a->target != b->target)
+        return (uintptr_t)a->target < (uintptr_t)b->target ? -1 : 1;
+    if (a->candidate != b->candidate)
+        return (uintptr_t)a->candidate < (uintptr_t)b->candidate ? -1 : 1;
+    return 0;
+}
+
+#ifdef WL_TEST_OWNER_PUBLICATION
+static wl_col_session_t *wl_columnar_eval_owner_publication_fail_session;
+static const char *wl_columnar_eval_owner_publication_fail_name;
+
+void
+wl_columnar_eval_test_owner_publication_fail_registration(
+    wl_col_session_t *session, const char *name)
+{
+    wl_columnar_eval_owner_publication_fail_session = session;
+    wl_columnar_eval_owner_publication_fail_name = name;
+}
+#endif
+
+void
+wl_columnar_eval_owner_publication_init(
+    wl_columnar_eval_owner_publication_txn_t *txn)
+{
+    if (txn)
+        memset(txn, 0, sizeof(*txn));
+}
+
+static int
+wl_columnar_eval_owner_publication_discard_entries(
+    wl_columnar_eval_owner_publication_entry_t *entries, uint32_t count)
+{
+    int first_rc = 0;
+
+    if (!entries)
+        return 0;
+    for (uint32_t i = count; i-- > 0; ) {
+        wl_columnar_eval_owner_publication_entry_t *entry = &entries[i];
+        if (entry->registered) {
+            if (session_find_rel(entry->session, entry->name)
+                == entry->candidate) {
+                int rc = session_remove_rel(entry->session, entry->name);
+                if (rc == 0) {
+                    entry->candidate = NULL;
+                } else {
+                    /* EBUSY means the session still owns the relation.  Do
+                     * not destroy or retain its pointer after the entry is
+                     * freed; the caller must resolve the busy relation and
+                     * remove it through the session before teardown. */
+                    if (first_rc == 0)
+                        first_rc = rc;
+                    entry->candidate = NULL;
+                }
+            }
+            entry->registered = false;
+        }
+        if (entry->replacement_prepared
+            || entry->replacement.writer_acquired)
+            col_rel_discard_replacement(&entry->replacement);
+        if (entry->candidate)
+            col_rel_destroy(entry->candidate);
+    }
+    return first_rc;
+}
+
+int
+wl_columnar_eval_owner_publication_add(
+    wl_columnar_eval_owner_publication_txn_t *txn, wl_col_session_t *session,
+    const char *name, col_rel_t *target, col_rel_t *candidate)
+{
+    wl_columnar_eval_owner_publication_entry_t *entries;
+    col_rel_t *candidate_owner = NULL;
+    uint32_t new_capacity;
+    size_t allocation_size;
+
+    if (!txn || !session || !name || !candidate || txn->prepared)
+        return EINVAL;
+    /* Registration does not own the pool/arena lifecycle.  Reject these
+     * candidates so a failed transaction leaves ownership with the caller. */
+    if (candidate->pool_owned || candidate->arena_owned)
+        return EINVAL;
+    if (!candidate->name || strcmp(candidate->name, name) != 0)
+        return EINVAL;
+    if (col_rel_storage_owner_resolve(candidate, &candidate_owner) != 0
+        || candidate_owner != candidate
+        || candidate->storage_alias_borrows > 0)
+        return EINVAL;
+    for (uint32_t i = 0; i < txn->count; i++) {
+        if (txn->entries[i].candidate == candidate)
+            return EEXIST;
+    }
+    if (target && (!target->name || strcmp(target->name, name) != 0
+        || session_find_rel(session, name) != target))
+        return EINVAL;
+    if (txn->count == txn->capacity) {
+        new_capacity = txn->capacity ? txn->capacity * 2u : 4u;
+        if (new_capacity < txn->capacity)
+            return EOVERFLOW;
+        allocation_size = (size_t)new_capacity * sizeof(*entries);
+        if (new_capacity != 0
+            && allocation_size / new_capacity != sizeof(*entries))
+            return EOVERFLOW;
+        entries = (wl_columnar_eval_owner_publication_entry_t *)realloc(
+            txn->entries, allocation_size);
+        if (!entries)
+            return ENOMEM;
+        txn->entries = entries;
+        txn->capacity = new_capacity;
+    }
+    entries = txn->entries;
+    entries[txn->count] = (wl_columnar_eval_owner_publication_entry_t){
+        .session = session,
+        .name = name,
+        .target = target,
+        .candidate = candidate,
+    };
+    txn->count++;
+    return 0;
+}
+
+int
+wl_columnar_eval_owner_publication_prepare(
+    wl_columnar_eval_owner_publication_txn_t *txn)
+{
+    int rc;
+
+    if (!txn || txn->prepared || txn->count == 0)
+        return EINVAL;
+    for (uint32_t i = 0; i < txn->count; i++) {
+        wl_columnar_eval_owner_publication_entry_t *entry = &txn->entries[i];
+        if (entry->target) {
+            if (!entry->target->name
+                || strcmp(entry->target->name, entry->name) != 0
+                || session_find_rel(entry->session, entry->name)
+                != entry->target) {
+                rc = EINVAL;
+                goto fail;
+            }
+            rc = col_rel_storage_owner_resolve(entry->target, &entry->owner);
+            if (rc != 0 || entry->owner != entry->target
+                || entry->owner->storage_alias_borrows > 0) {
+                rc = rc != 0 ? rc : EBUSY;
+                goto fail;
+            }
+        } else if (session_find_rel(entry->session, entry->name)) {
+            rc = EEXIST;
+            goto fail;
+        }
+    }
+    qsort(txn->entries, txn->count, sizeof(*txn->entries),
+        wl_columnar_eval_owner_publication_entry_compare);
+    for (uint32_t i = 1; i < txn->count; i++) {
+        wl_columnar_eval_owner_publication_entry_t *previous
+            = &txn->entries[i - 1];
+        wl_columnar_eval_owner_publication_entry_t *entry = &txn->entries[i];
+        if (entry->owner && previous->owner == entry->owner) {
+            rc = EBUSY;
+            goto fail;
+        }
+        if (!entry->owner && !previous->owner
+            && entry->session == previous->session
+            && strcmp(entry->name, previous->name) == 0) {
+            rc = EEXIST;
+            goto fail;
+        }
+    }
+    for (uint32_t i = 0; i < txn->count; i++) {
+        wl_columnar_eval_owner_publication_entry_t *entry = &txn->entries[i];
+        if (!entry->target)
+            continue;
+        wl_columnar_memory_reservation_init(&entry->replacement.reservation);
+        rc = wl_columnar_source_access_writer_acquire(
+            &entry->owner->source_access, &entry->replacement.writer);
+        if (rc != 0)
+            goto fail;
+        /* Declare ownership of the token before prepare: that is what makes
+         * a prepare failure release this writer rather than strand the
+         * destination's gate.  Same handshake as the TDD restore
+         * transaction below. */
+        entry->replacement.writer_acquired = true;
+        rc = col_rel_prepare_replacement_locked(entry->target,
+                entry->candidate, &entry->replacement);
+        if (rc != 0)
+            goto fail;
+        entry->replacement_prepared = true;
+        col_rel_destroy(entry->candidate);
+        entry->candidate = NULL;
+    }
+    txn->prepared = true;
+    return 0;
+
+fail:
+    wl_columnar_eval_owner_publication_discard(txn);
+    return rc;
+}
+
+int
+wl_columnar_eval_owner_publication_register(
+    wl_columnar_eval_owner_publication_txn_t *txn)
+{
+    if (!txn || !txn->prepared)
+        return EINVAL;
+    for (uint32_t i = 0; i < txn->count; i++) {
+        wl_columnar_eval_owner_publication_entry_t *entry = &txn->entries[i];
+        int rc;
+
+        if (entry->target)
+            continue;
+#ifdef WL_TEST_OWNER_PUBLICATION
+        if (wl_columnar_eval_owner_publication_fail_session == entry->session
+            && wl_columnar_eval_owner_publication_fail_name
+            && strcmp(wl_columnar_eval_owner_publication_fail_name,
+            entry->name) == 0) {
+            wl_columnar_eval_owner_publication_fail_session = NULL;
+            wl_columnar_eval_owner_publication_fail_name = NULL;
+            return ENOMEM;
+        }
+#endif
+        rc = session_add_rel(entry->session, entry->candidate);
+        if (rc != 0)
+            return rc;
+        entry->registered = true;
+    }
+    return 0;
+}
+
+static int
+wl_columnar_eval_owner_publication_validate_replacement(
+    const wl_columnar_eval_owner_publication_entry_t *entry)
+{
+    const col_rel_t *staged;
+    col_rel_t *owner = NULL;
+
+    if (!entry || !entry->target || !entry->replacement_prepared
+        || !entry->replacement.writer_acquired)
+        return EINVAL;
+    staged = entry->replacement.staged;
+    if (!staged || staged->nrows > staged->capacity
+        || entry->target->view_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+        || entry->target->storage_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+        || !entry->target->name
+        || strcmp(entry->target->name, entry->name) != 0
+        || session_find_rel(entry->session, entry->name) != entry->target
+        || col_rel_storage_owner_resolve(entry->target, &owner) != 0
+        || owner != entry->target
+        || entry->replacement.writer.owner != &owner->source_access
+        || entry->replacement.writer.identity
+        != (uintptr_t)&entry->replacement.writer
+        || !wl_columnar_source_access_writer_thread_equal(
+            &entry->replacement.writer))
+        return EINVAL;
+    if (entry->replacement.reservation_active) {
+        uint64_t state = atomic_load_explicit(
+            &entry->replacement.reservation.state, memory_order_acquire);
+        if (entry->replacement.reservation.identity
+            != &entry->replacement.reservation
+            || (state != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+            && state != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED))
+            return EINVAL;
+    }
+    return 0;
+}
+
+int
+wl_columnar_eval_owner_publication_commit(
+    wl_columnar_eval_owner_publication_txn_t *txn)
+{
+    if (!txn || !txn->prepared)
+        return EINVAL;
+    for (uint32_t i = 0; i < txn->count; i++) {
+        wl_columnar_eval_owner_publication_entry_t *entry = &txn->entries[i];
+        if (!entry->target) {
+            if (!entry->registered
+                || !entry->candidate
+                || !entry->candidate->name
+                || strcmp(entry->candidate->name, entry->name) != 0
+                || session_find_rel(entry->session, entry->name)
+                != entry->candidate)
+                return EBUSY;
+            continue;
+        }
+        if (wl_columnar_eval_owner_publication_validate_replacement(entry)
+            != 0)
+            return EINVAL;
+    }
+    for (uint32_t i = 0; i < txn->count; i++) {
+        wl_columnar_eval_owner_publication_entry_t *entry = &txn->entries[i];
+        if (entry->replacement_prepared) {
+            /* Publication is no-fail: the preflight loop above has already
+             * established every invariant commit asserts, so there is no
+             * error channel to report through and nothing left to roll
+             * back once the first destination has been replaced. */
+            col_rel_commit_replacement_locked(entry->target,
+                &entry->replacement);
+            entry->replacement_prepared = false;
+        }
+        if (entry->registered) {
+            entry->registered = false;
+            entry->candidate = NULL;
+        }
+    }
+    txn->prepared = false;
+    return 0;
+}
+
+int
+wl_columnar_eval_owner_publication_discard(
+    wl_columnar_eval_owner_publication_txn_t *txn)
+{
+    int rc;
+
+    if (!txn)
+        return EINVAL;
+    rc = wl_columnar_eval_owner_publication_discard_entries(txn->entries,
+            txn->count);
+    free(txn->entries);
+    memset(txn, 0, sizeof(*txn));
+    return rc;
+}
+
+static int
 tdd_bdx_sort_candidate(col_rel_t *candidate)
 {
     int64_t **original_columns = NULL;

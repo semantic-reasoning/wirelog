@@ -4704,9 +4704,10 @@ test_tdd_recursive_exe = executable(
   # into this executable directly and never into libwirelog.
   c_args: host_machine.system() == 'linux'
     ? ['-DWL_TEST_BDX_SEED=1', '-DWL_TEST_TDD_MERGE=1',
-       '-DWL_TEST_TDD_RESET_RESTORE=1', '-DWL_TEST_ALLOC_WRAP=1']
+       '-DWL_TEST_TDD_RESET_RESTORE=1', '-DWL_TEST_OWNER_PUBLICATION=1',
+       '-DWL_TEST_ALLOC_WRAP=1']
     : ['-DWL_TEST_BDX_SEED=1', '-DWL_TEST_TDD_MERGE=1',
-       '-DWL_TEST_TDD_RESET_RESTORE=1'],
+       '-DWL_TEST_TDD_RESET_RESTORE=1', '-DWL_TEST_OWNER_PUBLICATION=1'],
   link_args: host_machine.system() == 'linux'
     ? ['-Wl,--wrap=malloc', '-Wl,--wrap=calloc', '-Wl,--wrap=realloc'] : [],
   override_options: host_machine.system() == 'linux' ? ['b_lto=false'] : [],
