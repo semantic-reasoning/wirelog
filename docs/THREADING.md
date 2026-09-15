@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **116**).
+match the script's count (currently **152**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -458,12 +458,12 @@ gate and token state unchanged.
 | `source_access.h:wl_columnar_source_access_gate_busy` | `gate->state` | `atomic_load_explicit` | acquire | Check whether a reader or writer currently owns the source gate |
 | `source_access.h:wl_columnar_source_access_writer_claim` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Claim the terminal writer sentinel without racing active readers |
 | `source_access.h:wl_columnar_source_access_gate_init` | `gate->state` | `atomic_store_explicit` | relaxed | Establish inactive zero state before publication |
-| `source_access.h:wl_columnar_source_access_reader_acquire` | `gate->state` | `atomic_load_explicit` | acquire | Observe writer release before admitting a reader |
-| `source_access.h:wl_columnar_source_access_reader_acquire#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Linearize reader admission without overflowing the writer sentinel |
-| `source_access.h:wl_columnar_source_access_reader_acquire_transferable` | `gate->state` | `atomic_load_explicit` | acquire | Observe writer release before admitting a transferable reader |
-| `source_access.h:wl_columnar_source_access_reader_acquire_transferable#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Linearize transferable-reader admission without overflowing the writer sentinel |
-| `source_access.h:wl_columnar_source_access_reader_release` | `gate->state` | `atomic_load_explicit` | acquire | Observe the active gate before releasing this reader |
-| `source_access.h:wl_columnar_source_access_reader_release#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Publish reader payload completion and decrement atomically |
+| `source_access.h:wl_columnar_source_access_reader_gate_acquire` | `gate->state` | `atomic_load_explicit` | acquire | Observe writer release before admitting any reader gate |
+| `source_access.h:wl_columnar_source_access_reader_gate_acquire#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Linearize reader admission without overflowing the writer sentinel |
+| `source_access.h:wl_columnar_source_access_reader_release` | `gate->state` | `atomic_load_explicit` | acquire | Observe the descriptor gate before releasing an alias reader |
+| `source_access.h:wl_columnar_source_access_reader_release#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Publish alias-reader completion and decrement atomically |
+| `source_access.h:wl_columnar_source_access_reader_release#3` | `gate->state` | `atomic_load_explicit` | acquire | Observe the canonical gate before releasing this reader |
+| `source_access.h:wl_columnar_source_access_reader_release#4` | `gate->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Publish reader payload completion and decrement atomically |
 | `source_access.h:wl_columnar_source_access_writer_acquire` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Linearize exclusive writer admission and retry spurious failure |
 | `source_access.h:wl_columnar_source_access_writer_release` | `gate->state` | `atomic_load_explicit` | acquire | Validate the writer state before terminal publication |
 | `source_access.h:wl_columnar_source_access_writer_release#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Publish writer payload completion and retry spurious failure |
@@ -504,7 +504,54 @@ preparing the replacement fails.
 | `relation.c:wl_columnar_relation_install_shared_view_with_lease` | `destination_owner->source_access.state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Upgrade exactly the session's sole transferable destination-owner reader; retry spurious failure and reject additional readers before replacing descriptors |
 | `relation.c:wl_columnar_relation_install_shared_view_with_lease#2` | `destination_owner->source_access.state` | `atomic_exchange_explicit` | release | Atomically restore the session lifetime reader after publication or preparation failure; MSVC requires an interlocked operation under `/volatile:iso` |
 
-The complete source audit now contains **116 atomic call sites**.
+### 5.15 Alias accounting and lifecycle readers (33 rows)
+
+Alias publication and retirement use atomic accounting and descriptor gates.
+The owner count keeps canonical storage alive while peer readers continue;
+the descriptor gate prevents same-alias readers from racing worker teardown.
+The remaining rows are the acquire-side checks at relation mutation sites and
+the corresponding session promotion/reset stores.
+
+| Anchor (file:function[#N]) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `handle_remap_apply.c:wl_handle_remap_apply_columns` | `owner->storage_alias_borrows` | `atomic_load_explicit` | acquire | Reject remap while canonical storage has live aliases |
+| `handle_remap_apply_side.c:wl_handle_remap_apply_session_side_relations` | `owner->storage_alias_borrows` | `atomic_load_explicit` | acquire | Reject side remap while canonical storage has live aliases |
+| `merge.c:col_op_consolidate_kway_merge` | `owner->storage_alias_borrows` | `atomic_load_explicit` | acquire | Exclude consolidation from aliased owner storage |
+| `merge.c:col_op_consolidate_incremental_delta` | `rel->storage_alias_borrows` | `atomic_load_explicit` | acquire | Exclude incremental consolidation from aliased storage |
+| `merge.c:col_op_consolidate_incremental_delta#2` | `delta_out->storage_alias_borrows` | `atomic_load_explicit` | acquire | Exclude delta output mutation from aliased storage |
+| `relation.c:col_rel_storage_owner_init` | `storage_alias_borrows` | `atomic_store_explicit` | relaxed | Initialize a relation's alias count before publication |
+| `relation.c:col_rel_storage_alias_release` | `owner->storage_alias_borrows` | `atomic_load_explicit` | acquire | Validate the owner count before alias retirement |
+| `relation.c:col_rel_storage_alias_release#2` | `owner->storage_alias_borrows` | `atomic_load_explicit` | acquire | Recheck the count before the decrement CAS |
+| `relation.c:col_rel_storage_alias_release#3` | `owner->storage_alias_borrows` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Retire exactly one alias without underflow or lost updates |
+| `relation.c:col_rel_free_contents_preserve_source_gate` | `r->source_access.state` | `atomic_load_explicit` | relaxed | Preserve the descriptor writer sentinel while clearing relation contents during alias retirement |
+| `relation.c:col_rel_free_contents_preserve_source_gate#2` | `r->source_access.state` | `atomic_store_explicit` | relaxed | Restore the held descriptor writer state so release cannot reopen a freed alias |
+| `session.c:col_worker_session_destroy_checked` | `relation->storage_alias_borrows` | `atomic_load_explicit` | acquire | Admit a canonical relation only when every remaining alias belongs to this worker cohort |
+| `relation.c:col_rel_storage_alias_release#4` | `alias->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Reset the retired descriptor's local count |
+| `relation.c:col_rel_storage_owner_destroy_status` | `owner->storage_alias_borrows` | `atomic_load_explicit` | acquire | Keep an owner alive while aliases remain |
+| `relation.c:col_rel_published_writer_acquire` | `owner->storage_alias_borrows` | `atomic_load_explicit` | acquire | Exclude descriptor publication from aliased storage |
+| `relation.c:col_rel_set` | `owner->storage_alias_borrows` | `atomic_load_explicit` | acquire | Exclude cell mutation from aliased owner storage |
+| `relation.c:col_rel_free_contents` | `storage_alias_borrows` | `atomic_load_explicit` | acquire | Do not free an owner with live aliases |
+| `relation.c:col_rel_append_row_impl` | `owner->storage_alias_borrows` | `atomic_load_explicit` | acquire | Exclude append transition from aliased storage |
+| `relation.c:col_rel_reserve_rows_locked` | `owner->storage_alias_borrows` | `atomic_load_explicit` | acquire | Exclude capacity transition from aliased storage |
+| `relation.c:col_rel_reset_rows_locked` | `owner->storage_alias_borrows` | `atomic_load_explicit` | acquire | Exclude reset transition from aliased storage |
+| `relation.c:col_rel_append_all` | `owner->storage_alias_borrows` | `atomic_load_explicit` | acquire | Exclude bulk append from aliased storage |
+| `relation.c:col_rel_compact` | `owner->storage_alias_borrows` | `atomic_load_explicit` | acquire | Exclude compaction from aliased storage |
+| `relation.c:col_rel_compact_many` | `owner->storage_alias_borrows` | `atomic_load_explicit` | acquire | Exclude batch compaction from aliased storage |
+| `relation.c:col_rel_install_shared_view_unprotected` | `dst->storage_alias_borrows` | `atomic_load_explicit` | acquire | Reject publication over a live alias cohort |
+| `relation.c:col_rel_install_shared_view_unprotected#2` | `source_owner->storage_alias_borrows` | `atomic_load_explicit` | acquire | Reject owner-count overflow before publication |
+| `relation.c:col_rel_install_shared_view_unprotected#3` | `old_owner->storage_alias_borrows` | `atomic_load_explicit` | acquire | Validate the previous owner's alias state |
+| `relation.c:col_rel_install_shared_view_unprotected#4` | `old_owner->storage_alias_borrows` | `atomic_fetch_sub_explicit` | release | Remove the previous owner contribution atomically |
+| `relation.c:col_rel_install_shared_view_unprotected#5` | `source_owner->storage_alias_borrows` | `atomic_fetch_add_explicit` | release | Publish the new owner contribution atomically |
+| `relation.c:col_rel_install_shared_view_unprotected#6` | `dst->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Initialize the newly published descriptor count |
+| `relation.c:wl_columnar_relation_radix_sort_with_workspace` | `owner->storage_alias_borrows` | `atomic_load_explicit` | acquire | Exclude radix workspace mutation from aliased storage |
+| `relation.c:col_rel_radix_sort_locked` | `owner->storage_alias_borrows` | `atomic_load_explicit` | acquire | Exclude radix mutation from aliased owner storage; #1594 collapsed the lease wrappers into this single entry point |
+| `session.c:session_relation_writer_acquire` | `owner->storage_alias_borrows` | `atomic_load_explicit` | acquire | Admit a session writer only for unaliased storage |
+| `session.c:session_add_rel` | `heap->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Initialize promoted heap relation ownership |
+| `session.c:session_add_rel#2` | `pool_src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Restore pool relation ownership after refusal |
+| `session.c:session_add_rel#3` | `pool_src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Restore pool relation ownership after allocation failure |
+| `session.c:col_session_clear_idb_rows` | `owner->storage_alias_borrows` | `atomic_load_explicit` | acquire | Exclude IDB clearing from aliased owner storage |
+
+The complete source audit now contains **152 atomic call sites**.
 
 ---
 

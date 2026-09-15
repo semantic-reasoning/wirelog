@@ -150,7 +150,8 @@ wl_handle_remap_apply_session_side_relations(struct wl_col_session_t *sess,
         rc = col_rel_storage_owner_resolve(rel, &owner);
         if (rc != 0)
             goto fail;
-        if (owner->storage_alias_borrows > 0) {
+        if (atomic_load_explicit(&owner->storage_alias_borrows,
+            memory_order_acquire) > 0) {
             rc = EBUSY;
             goto fail;
         }

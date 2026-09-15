@@ -508,12 +508,18 @@ typedef struct col_rel {
      * Shared views canonicalize this pointer to the ultimate relation that
      * owns the borrowed column buffers.  Alias chains are never persisted:
      * an alias has storage_alias_borrows == 0, while the root counts its
-     * direct and flattened aliases.  The gate is intentionally not wired to
-     * production mutation/teardown until the later lifecycle units. */
+     * direct and flattened aliases.  The relation source_access gate is also
+     * the alias-descriptor gate for operation-scoped readers, so a checked
+     * worker teardown can retire an alias without racing its users. */
     struct col_rel *storage_owner;
     uint64_t storage_owner_identity;
     uint64_t storage_owner_generation;
-    uint32_t storage_alias_borrows;
+    /* Alias publication and retirement can occur while a peer session holds
+     * a source reader on the canonical owner.  Keep the count atomic so the
+     * descriptor-retirement path never races the owner's destroy/status
+     * check.  The count also keeps the canonical backing storage alive until
+     * the last alias has detached. */
+    wl_atomic_u64 storage_alias_borrows;
 
     /* Operation-scoped readers protect the ultimate storage owner from
      * checked destruction.  Production read paths are wired in later
@@ -1950,6 +1956,8 @@ typedef struct {
 
 void
 col_rel_free_contents(col_rel_t *r);
+void
+col_rel_free_contents_preserve_source_gate(col_rel_t *r);
 uint64_t
 col_rel_owned_ledger_bytes(const col_rel_t *r);
 /*
@@ -3036,8 +3044,12 @@ col_worker_session_create(wl_col_session_t *coordinator,
  * Free all resources owned by a worker session.  Does NOT free borrowed
  * resources (plan, frontier_ops) or the out_worker struct itself.
  * Safe to call on a partially-initialized worker (all owned pointers
- * are pre-NULLed during create).  Zeroes the struct on completion.
+ * are pre-NULLed during create).  Zeroes the struct on success; returns
+ * EBUSY/ENOMEM and preserves the worker for a later retry when an alias
+ * cohort cannot yet be retired.
  */
+int
+col_worker_session_destroy_checked(wl_col_session_t *worker);
 void
 col_worker_session_destroy(wl_col_session_t *worker);
 

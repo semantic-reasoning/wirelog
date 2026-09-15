@@ -220,6 +220,7 @@ void
 wl_session_destroy(wl_session_t *session)
 {
     const wl_compute_backend_t *backend;
+    bool destroy_pending = false;
     wirelog_extension_snapshot_t *snapshot;
     wl_session_admission_t *admission;
     if (!session)
@@ -231,8 +232,14 @@ wl_session_destroy(wl_session_t *session)
     backend = session->backend;
     snapshot = session->owns_extension_snapshot
         ? session->extension_snapshot : NULL;
+    session->destroy_pending_out = &destroy_pending;
     if (backend && backend->session_destroy)
         backend->session_destroy(session);
+    /* A refusal leaves the session allocation valid for a later retry.  A
+     * successful callback may free the backend session, so only the local
+     * result slot is inspected after dispatch. */
+    if (destroy_pending)
+        return;
     wirelog_extension_snapshot_release(snapshot);
     wl_session_admission_destroy(admission);
 }

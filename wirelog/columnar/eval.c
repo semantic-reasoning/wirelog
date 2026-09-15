@@ -173,13 +173,22 @@ tdd_destroy_delta_slots(col_eval_tdd_worker_ctx_t *ctxs, uint32_t W,
 static void
 tdd_cleanup_workers(wl_col_session_t *coord)
 {
+    bool teardown_blocked = false;
     for (uint32_t w = coord->tdd_workers_count; w > 0; w--) {
         uint32_t worker_index = w - 1;
+        int destroy_rc = 0;
         if (coord->tdd_workers[worker_index].coordinator != NULL)
-            col_worker_session_destroy(&coord->tdd_workers[worker_index]);
+            destroy_rc = col_worker_session_destroy_checked(
+                &coord->tdd_workers[worker_index]);
+        if (destroy_rc != 0) {
+            teardown_blocked = true;
+            break;
+        }
         memset(&coord->tdd_workers[worker_index], 0,
             sizeof(wl_col_session_t));
     }
+    if (teardown_blocked)
+        return;
     coord->tdd_workers_count = 0;
     coord->tdd_active_workers = 0;
     coord->callback_active_workers = 1;
