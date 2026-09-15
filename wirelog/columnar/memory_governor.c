@@ -901,12 +901,15 @@ finish_reservation(wl_columnar_memory_reservation_t *reservation,
     bool rollback)
 {
     uint64_t state;
+    uint64_t bytes;
     bool ok;
     if (!reservation_identity_valid(reservation))
         return false;
     state = atomic_load_explicit(&reservation->state, memory_order_acquire);
     if (state != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
-        && (rollback || state != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED))
+        && !(!rollback
+        && (state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        || state == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING)))
         return false;
     WL_MEMORY_TEST_POINT(reservation,
         WL_COLUMNAR_MEMORY_TEST_RELEASE_BEFORE_CLAIM);
@@ -915,12 +918,29 @@ finish_reservation(wl_columnar_memory_reservation_t *reservation,
         return false;
     WL_MEMORY_TEST_POINT(reservation, WL_COLUMNAR_MEMORY_TEST_RELEASE_CLAIMED);
     /* Payload cannot change until accounting is complete and state published. */
-    ok = reservation->governor && reservation->bytes != 0
-        && credit_reservation(reservation->governor, reservation->bytes);
+    bytes = reservation->bytes;
+    /* A replacing token owns both the committed old footprint and the
+     * temporary overlap footprint.  Teardown must release both after all
+     * physical storage has been freed, even if replacement rollback failed
+     * and left the token in REPLACING. */
+    if (state == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING) {
+        if (reservation->replacement_bytes > UINT64_MAX - bytes)
+            ok = false;
+        else {
+            bytes += reservation->replacement_bytes;
+            ok = reservation->governor && bytes != 0
+                && credit_reservation(reservation->governor, bytes);
+        }
+    } else {
+        ok = reservation->governor && bytes != 0
+            && credit_reservation(reservation->governor, bytes);
+    }
     WL_MEMORY_TEST_POINT(reservation, WL_COLUMNAR_MEMORY_TEST_RELEASE_CREDITED);
     atomic_store_explicit(&reservation->state,
         ok ? WL_COLUMNAR_MEMORY_RESERVATION_RELEASED : state,
         memory_order_release);
+    if (ok && state == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING)
+        reservation->replacement_bytes = 0;
     return ok;
 }
 
