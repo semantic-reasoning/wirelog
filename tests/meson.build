@@ -3517,7 +3517,22 @@ test_session_exe = executable(
   arena_src,
   thread_src,
   workqueue_src,
-  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  # b_lto=false is the portable guarantee that --wrap is applied before the
+  # linker resolves these calls internally; the project default is
+  # b_lto=true.  Keep all three ternaries on the SAME predicate so the
+  # pairing cannot drift apart.
+  #
+  # The pairing matters more here than for the jpp sweep, whose error
+  # direction is safe.  test_session_remove_wide_alias_before_allocation
+  # asserts that the arming flag was NOT consumed, so a wrap defeated by LTO
+  # leaves the flag set and the assertion passes vacuously instead of firing.
+  link_args: host_machine.system() == 'linux' ? [
+    '-Wl,--wrap=malloc', '-Wl,--wrap=calloc', '-Wl,--wrap=realloc',
+  ] : [],
+  override_options: host_machine.system() == 'linux' ? ['b_lto=false'] : [],
+  c_args: host_machine.system() == 'linux' ?
+    ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_TEST_ALLOC_WRAP=1'] :
+    ['-DWL_SESSION_TEST_HOOKS=1'],
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
