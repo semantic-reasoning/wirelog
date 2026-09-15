@@ -464,6 +464,225 @@ test_source_reader_blocks_checked_destroy(void)
     owned_relation_count--;
 }
 
+/* Issue #1594: the collapsed radix-sort entry point validates every caller
+ * uniformly.  Its predecessor col_rel_radix_sort_deferred() took no writer
+ * and checked nothing, so a caller holding no lease could reorder an
+ * owner's storage while a live alias was borrowing those exact buffers. */
+
+/* A foreign writer names a different gate.  The fixture is a shared view so
+ * a rejection that arrived after the COW would be visible as a detached
+ * relation rather than an untouched one. */
+static void
+test_radix_sort_locked_rejects_foreign_writer(void)
+{
+    col_rel_t *source = new_relation();
+    col_rel_t *view = new_relation();
+    col_rel_t *other = new_relation();
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int64_t high = 8, low = 3;
+    bool pending = true;
+    int64_t **columns_before;
+    uint64_t view_before;
+
+    CHECK(source && view && other, "foreign writer relations");
+    CHECK(col_rel_append_row(source, &high) == 0, "foreign writer row 0");
+    CHECK(col_rel_append_row(source, &low) == 0, "foreign writer row 1");
+    CHECK(col_rel_install_shared_view(view, source) == 0,
+        "foreign writer shared view");
+    CHECK(col_rel_source_writer_acquire(other, &writer) == 0,
+        "foreign writer acquisition");
+    columns_before = view->columns;
+    view_before = view->view_generation;
+    CHECK(col_rel_radix_sort_locked(view, 0, view->nrows, &writer, false,
+        &pending) == EINVAL,
+        "foreign writer refused");
+    CHECK(pending == false, "foreign writer clears the out parameter");
+    CHECK(view->col_shared != NULL && view->columns == columns_before
+        && view->view_generation == view_before
+        && source->storage_alias_borrows == 1,
+        "foreign writer refusal precedes the copy-on-write");
+    CHECK(col_rel_get(source, 0, 0) == high && col_rel_get(source, 1, 0) == low,
+        "foreign writer refusal leaves the source unsorted");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "foreign writer release");
+    cleanup_relations();
+}
+
+/* NULL writer and NULL out parameter.  The out parameter is mandatory in
+ * both modes: a caller that meant to defer but passed NULL would otherwise
+ * have its borrow released under a transaction that still holds one. */
+static void
+test_radix_sort_locked_rejects_absent_writer_and_out(void)
+{
+    col_rel_t *rel = new_relation();
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int64_t high = 5, low = 1;
+    bool pending = true;
+
+    CHECK(rel != NULL, "absent writer relation");
+    CHECK(col_rel_append_row(rel, &high) == 0, "absent writer row 0");
+    CHECK(col_rel_append_row(rel, &low) == 0, "absent writer row 1");
+    CHECK(col_rel_radix_sort_locked(rel, 0, rel->nrows, NULL, false,
+        &pending) == EINVAL,
+        "absent writer refused");
+    CHECK(pending == false, "absent writer clears the out parameter");
+    CHECK(col_rel_get(rel, 0, 0) == high,
+        "absent writer refusal leaves the relation unsorted");
+    CHECK(col_rel_source_writer_acquire(rel, &writer) == 0,
+        "mandatory out acquisition");
+    CHECK(col_rel_radix_sort_locked(rel, 0, rel->nrows, &writer, true,
+        NULL) == EINVAL,
+        "NULL out parameter refused even with a valid writer");
+    CHECK(col_rel_get(rel, 0, 0) == high,
+        "NULL out refusal leaves the relation unsorted");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "mandatory out release");
+    cleanup_relations();
+}
+
+/* Validation now runs at every row count, including the range shortcut. */
+static void
+test_radix_sort_locked_validates_below_the_range_shortcut(void)
+{
+    col_rel_t *rel = new_relation();
+    col_rel_t *other = new_relation();
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int64_t only = 4;
+    bool pending = true;
+
+    CHECK(rel && other, "range shortcut relations");
+    CHECK(col_rel_append_row(rel, &only) == 0, "range shortcut row");
+    CHECK(col_rel_source_writer_acquire(other, &writer) == 0,
+        "range shortcut foreign acquisition");
+    CHECK(col_rel_radix_sort_locked(rel, 0, rel->nrows, &writer, false,
+        &pending) == EINVAL,
+        "single-row sort still refuses a foreign writer");
+    CHECK(col_rel_radix_sort_locked(rel, 0, 0, &writer, false,
+        &pending) == EINVAL,
+        "empty sort still refuses a foreign writer");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "range shortcut release");
+    cleanup_relations();
+}
+
+/* An owner with live borrows is refused with EBUSY.  The source gate is
+ * deliberately left uncontended so the status can only come from the alias
+ * predicate, not from a reader holding the gate. */
+static void
+test_radix_sort_locked_owner_with_borrows_is_busy(void)
+{
+    col_rel_t *owner = new_relation();
+    col_rel_t *alias = new_relation();
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int64_t high = 9, low = 2;
+    bool pending = true;
+    uint64_t view_before;
+
+    CHECK(owner && alias, "busy owner relations");
+    CHECK(col_rel_append_row(owner, &high) == 0, "busy owner row 0");
+    CHECK(col_rel_append_row(owner, &low) == 0, "busy owner row 1");
+    CHECK(col_rel_install_shared_view(alias, owner) == 0,
+        "busy owner shared view");
+    CHECK(owner->storage_alias_borrows == 1, "busy owner borrow recorded");
+    CHECK(col_rel_source_writer_acquire(owner, &writer) == 0,
+        "busy owner writer acquisition");
+    view_before = owner->view_generation;
+    CHECK(col_rel_radix_sort_locked(owner, 0, owner->nrows, &writer, false,
+        &pending) == EBUSY,
+        "owner with live borrows refused");
+    CHECK(pending == false, "busy owner clears the out parameter");
+    CHECK(col_rel_get(owner, 0, 0) == high && col_rel_get(owner, 1, 0) == low
+        && owner->view_generation == view_before
+        && owner->storage_alias_borrows == 1,
+        "busy owner refusal reorders nothing");
+    CHECK(col_rel_storage_alias_release(alias) == 0, "busy owner release");
+    CHECK(col_rel_radix_sort_locked(owner, 0, owner->nrows, &writer, false,
+        &pending) == 0,
+        "owner sorts once the borrow is retired");
+    CHECK(col_rel_get(owner, 0, 0) == low && col_rel_get(owner, 1, 0) == high,
+        "retired borrow admits the sort");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "busy owner writer release");
+    cleanup_relations();
+}
+
+/* defer_alias_release == true hands the borrow back to the caller. */
+static void
+test_radix_sort_locked_hands_back_the_alias(void)
+{
+    col_rel_t *source = new_relation();
+    col_rel_t *view = new_relation();
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int64_t high = 7, low = 0;
+    bool pending = false;
+    int64_t **source_columns;
+
+    CHECK(source && view, "hand-back relations");
+    CHECK(col_rel_append_row(source, &high) == 0, "hand-back row 0");
+    CHECK(col_rel_append_row(source, &low) == 0, "hand-back row 1");
+    CHECK(col_rel_install_shared_view(view, source) == 0,
+        "hand-back shared view");
+    source_columns = source->columns;
+    CHECK(col_rel_source_writer_acquire(source, &writer) == 0,
+        "hand-back writer acquisition");
+    CHECK(col_rel_radix_sort_locked(view, 0, view->nrows, &writer, true,
+        &pending) == 0,
+        "hand-back sort admitted");
+    CHECK(pending == true, "hand-back reports the pending release");
+    CHECK(source->storage_alias_borrows == 1,
+        "hand-back keeps the borrow live");
+    CHECK(view->storage_owner == source,
+        "hand-back leaves the borrow on the original owner");
+    CHECK(view->col_shared == NULL, "hand-back detached the view");
+    CHECK(col_rel_get(view, 0, 0) == low && col_rel_get(view, 1, 0) == high,
+        "hand-back sorted the view");
+    CHECK(source->columns == source_columns
+        && col_rel_get(source, 0, 0) == high
+        && col_rel_get(source, 1, 0) == low,
+        "hand-back left the owner's storage alone");
+    CHECK(col_rel_storage_alias_release(view) == 0, "hand-back release");
+    CHECK(source->storage_alias_borrows == 0, "hand-back borrow retired");
+    CHECK(view->storage_owner == view, "hand-back view owns its storage");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "hand-back writer release");
+    cleanup_relations();
+}
+
+/* defer_alias_release == false releases the borrow here.  This is what
+ * replaces the old "NULL means never defer" guarantee. */
+static void
+test_radix_sort_locked_releases_the_alias_itself(void)
+{
+    col_rel_t *source = new_relation();
+    col_rel_t *view = new_relation();
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int64_t high = 6, low = 1;
+    bool pending = true;
+
+    CHECK(source && view, "self-release relations");
+    CHECK(col_rel_append_row(source, &high) == 0, "self-release row 0");
+    CHECK(col_rel_append_row(source, &low) == 0, "self-release row 1");
+    CHECK(col_rel_install_shared_view(view, source) == 0,
+        "self-release shared view");
+    CHECK(col_rel_source_writer_acquire(source, &writer) == 0,
+        "self-release writer acquisition");
+    CHECK(col_rel_radix_sort_locked(view, 0, view->nrows, &writer, false,
+        &pending) == 0,
+        "self-release sort admitted");
+    CHECK(pending == false, "self-release reports no pending release");
+    CHECK(source->storage_alias_borrows == 0,
+        "self-release retired the borrow");
+    CHECK(view->storage_owner == view, "self-release view owns its storage");
+    CHECK(col_rel_get(view, 0, 0) == low && col_rel_get(view, 1, 0) == high,
+        "self-release sorted the view");
+    CHECK(col_rel_get(source, 0, 0) == high
+        && col_rel_get(source, 1, 0) == low,
+        "self-release left the owner's storage alone");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "self-release writer release");
+    cleanup_relations();
+}
+
 static void
 test_source_reader_blocks_radix_sort(void)
 {
@@ -2385,6 +2604,12 @@ main(void)
     test_flattened_storage_ownership();
     test_source_reader_blocks_checked_destroy();
     test_source_reader_blocks_radix_sort();
+    test_radix_sort_locked_rejects_foreign_writer();
+    test_radix_sort_locked_rejects_absent_writer_and_out();
+    test_radix_sort_locked_validates_below_the_range_shortcut();
+    test_radix_sort_locked_owner_with_borrows_is_busy();
+    test_radix_sort_locked_hands_back_the_alias();
+    test_radix_sort_locked_releases_the_alias_itself();
     test_source_reader_blocks_direct_append_row();
     test_source_reader_blocks_append_row();
     test_source_reader_blocks_append_all();

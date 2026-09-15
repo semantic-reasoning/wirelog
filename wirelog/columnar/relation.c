@@ -4540,9 +4540,15 @@ wl_columnar_relation_radix_sort_with_workspace(col_rel_t *r,
     return col_rel_radix_sort_raw(r, start_row, nrows, workspace);
 }
 
+/* defer_alias_release describes the transactional shape of this call: the
+ * alias borrow taken by the deferred copy-on-write outlives it and the
+ * caller retires it later.  That is the window the consolidation test hook
+ * probes, so the hook is keyed on it rather than on which wrapper called in
+ * -- a caller-identity flag would silently lose hook coverage the moment a
+ * new consolidation entry point routed through a different wrapper. */
 static int
 col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
-    bool consolidation_transaction, bool *out_alias_release_pending)
+    bool defer_alias_release, bool *out_alias_release_pending)
 {
     if (out_alias_release_pending)
         *out_alias_release_pending = false;
@@ -4583,7 +4589,7 @@ col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
             return ENOMEM;
         }
 #ifdef WL_TEST_CONSOLIDATE_HOOK
-        if (consolidation_transaction
+        if (defer_alias_release
             && wl_columnar_consolidation_transition_hook)
             wl_columnar_consolidation_transition_hook(r,
                 WL_COLUMNAR_CONSOLIDATION_TEST_SORT_AFTER_DETACH);
@@ -4621,20 +4627,34 @@ col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
 }
 
 /* Sort under a writer lease the caller already holds, so a wider mutation
- * transaction can keep admission across the sort.  The alias taken by the
- * deferred COW is released here, since the sort owns that borrow. */
+ * transaction can keep admission across the sort.
+ *
+ * defer_alias_release selects what happens to the borrow the deferred COW
+ * takes: false releases it here, true hands it back through
+ * *out_alias_release_pending for the caller's own cleanup path.  The out
+ * parameter is mandatory in both modes -- a caller that meant to defer but
+ * passed NULL would otherwise have its borrow released out from under a
+ * transaction that still believes it holds one, so that mistake is refused
+ * rather than guessed at.
+ *
+ * Validation runs before the range shortcut, so a foreign, absent or
+ * wrong-thread writer is refused at every row count.  The alias predicate
+ * is deliberately r == owner rather than the unconditioned form used by
+ * col_rel_reset_rows_locked: sorting an alias while its owner has live
+ * borrows is exactly the consolidation case and must stay admissible. */
 int
-col_rel_radix_sort_with_source_writer(col_rel_t *r, uint32_t start_row,
-    uint32_t nrows, const wl_columnar_source_access_writer_t *writer)
+col_rel_radix_sort_locked(col_rel_t *r, uint32_t start_row, uint32_t nrows,
+    const wl_columnar_source_access_writer_t *writer,
+    bool defer_alias_release, bool *out_alias_release_pending)
 {
     col_rel_t *owner = NULL;
-    bool alias_release_pending = false;
     int rc;
 
+    if (!out_alias_release_pending)
+        return EINVAL;
+    *out_alias_release_pending = false;
     if (!r || start_row > r->nrows || nrows > r->nrows - start_row)
         return EINVAL;
-    if (nrows <= 1)
-        return 0;
     rc = col_rel_storage_owner_resolve(r, &owner);
     if (rc != 0)
         return rc;
@@ -4644,12 +4664,15 @@ col_rel_radix_sort_with_source_writer(col_rel_t *r, uint32_t start_row,
         return EINVAL;
     if (r == owner && owner->storage_alias_borrows > 0)
         return EBUSY;
-    rc = col_rel_radix_sort_impl(r, start_row, nrows, false,
-            &alias_release_pending);
-    if (alias_release_pending) {
+    if (nrows <= 1)
+        return 0;
+    rc = col_rel_radix_sort_impl(r, start_row, nrows, defer_alias_release,
+            out_alias_release_pending);
+    if (!defer_alias_release && *out_alias_release_pending) {
         int alias_rc = col_rel_storage_alias_release(r);
         if (alias_rc != 0 && rc == 0)
             rc = alias_rc;
+        *out_alias_release_pending = false;
     }
     return rc;
 }
@@ -4660,6 +4683,7 @@ int
 col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
 {
     wl_columnar_source_access_writer_t writer = { 0 };
+    bool alias_release_pending = false;
     int rc;
 
     if (!r || start_row > r->nrows || nrows > r->nrows - start_row)
@@ -4669,29 +4693,11 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
     rc = col_rel_source_writer_acquire(r, &writer);
     if (rc != 0)
         return rc;
-    rc = col_rel_radix_sort_with_source_writer(r, start_row, nrows, &writer);
+    rc = col_rel_radix_sort_locked(r, start_row, nrows, &writer, false,
+            &alias_release_pending);
     if (wl_columnar_source_access_writer_release(&writer) != 0 && rc == 0)
         rc = EINVAL;
     return rc;
-}
-
-/* Consolidation variant: the caller carries both the lease and the alias
- * for the rest of its transaction, so neither is released here.
- *
- * Unlike the other entry points this one validates nothing -- it takes no
- * writer and skips the storage_alias_borrows check.  The caller must have
- * resolved the canonical owner, acquired its writer, and rejected
- * outstanding alias borrows before calling; col_op_consolidate_incremental_-
- * delta does all three.  Making every mutating entry validate uniformly is
- * tracked separately. */
-int
-col_rel_radix_sort_deferred(col_rel_t *r, uint32_t start_row,
-    uint32_t nrows, bool *out_alias_release_pending)
-{
-    if (!out_alias_release_pending)
-        return EINVAL;
-    return col_rel_radix_sort_impl(r, start_row, nrows, true,
-               out_alias_release_pending);
 }
 
 /*

@@ -1559,6 +1559,7 @@ static int
 col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
     col_rel_t *delta_out, int *out_fast_path,
     wl_columnar_source_access_writer_t *delta_writer,
+    const wl_columnar_source_access_writer_t *rel_writer,
     bool *out_rel_alias_release_pending)
 {
     if (!out_rel_alias_release_pending)
@@ -1585,8 +1586,11 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
     /* Phase 1: sort only the new delta rows using radix sort.  Sorting can
      * allocate permutation buffers, so do not continue with an unsorted
      * source if admission fails. */
-    int sort_rc = col_rel_radix_sort_deferred(rel, old_nrows, delta_count,
-            out_rel_alias_release_pending);
+    /* rel_writer, never delta_writer: the latter is a lease on delta_out's
+     * canonical owner, which is a different gate whenever the two relations
+     * do not share one. */
+    int sort_rc = col_rel_radix_sort_locked(rel, old_nrows, delta_count,
+            rel_writer, true, out_rel_alias_release_pending);
     if (sort_rc != 0)
         return col_op_consolidate_incremental_delta_fail(delta_out,
                    delta_initial_nrows, sort_rc);
@@ -1989,7 +1993,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     }
 
     rc = col_op_consolidate_incremental_delta_impl(rel, old_nrows,
-            delta_out, out_fast_path, delta_writer_ptr,
+            delta_out, out_fast_path, delta_writer_ptr, &rel_writer,
             &rel_alias_release_pending);
 
 cleanup:

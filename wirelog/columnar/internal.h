@@ -2384,16 +2384,30 @@ wl_columnar_relation_radix_sort_rows_by_key_typed(int64_t *data,
  *  Phase C: permutation-apply uses col_rel_row_copy_out/in. */
 int
 col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows);
-/* Sort under an already-held source writer admission. */
-int
-col_rel_radix_sort_with_source_writer(col_rel_t *r, uint32_t start_row,
-    uint32_t nrows, const wl_columnar_source_access_writer_t *writer);
-
-/* Consolidation keeps the old canonical-owner alias lease through the full
- * mutation transaction, releasing it from its centralized cleanup path. */
-int
-col_rel_radix_sort_deferred(col_rel_t *r, uint32_t start_row, uint32_t nrows,
-    bool *out_alias_release_pending);
+/* Sort [start_row, start_row + nrows) under a source-access writer the
+* caller already holds on r's canonical storage owner.
+*
+* defer_alias_release == false: any alias borrow the deferred COW takes is
+*   released before this returns, and *out_alias_release_pending is false.
+* defer_alias_release == true: the borrow is handed back.
+*   *out_alias_release_pending is true iff the caller must call
+*   col_rel_storage_alias_release(r) once its wider mutation transaction
+*   ends.  Consolidation uses this to keep the borrow across the whole
+*   transaction and release it from its centralized cleanup path.
+*
+* out_alias_release_pending is mandatory in both modes and is written on
+* every path, including every rejection.
+*
+* EINVAL: NULL out parameter, bad range, or an absent, foreign or
+*         wrong-thread writer -- checked at every row count.
+* EBUSY:  r is its own canonical owner and has live alias borrows.  An
+*         alias of a borrowed owner is still admissible; that is the
+*         consolidation case.
+* ENOMEM: COW or permutation allocation failed; r is left unchanged. */
+WL_MUST_CHECK int
+col_rel_radix_sort_locked(col_rel_t *r, uint32_t start_row, uint32_t nrows,
+    const wl_columnar_source_access_writer_t *writer,
+    bool defer_alias_release, bool *out_alias_release_pending);
 
 /* ======================================================================== */
 /* Cache & Materialized Join (columnar/cache.c)                             */
