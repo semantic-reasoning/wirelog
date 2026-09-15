@@ -958,8 +958,9 @@ col_rel_free_contents(col_rel_t *r)
         ArrowSchemaRelease(&r->schema);
     col_rel_ledger_reconcile(r, ledger_before);
     if (r->memory_governor) {
-        if (r->retained_reserved_bytes > 0)
-            (void)wl_columnar_memory_release(&r->retained_reservation);
+        if (r->retained_reserved_bytes > 0
+            && !wl_columnar_memory_release(&r->retained_reservation))
+            abort();
         r->retained_reserved_bytes = 0;
         wl_columnar_memory_governor_ref_release(r->memory_governor);
         r->memory_governor = NULL;
@@ -2319,9 +2320,10 @@ col_rel_compact_impl(col_rel_t *r,
              * matching admission only after the corresponding storage has
              * been freed; otherwise a later append could reuse credit while
              * the old allocation is still resident. */
-            if (r->retained_reserved_bytes > 0)
-                (void)wl_columnar_memory_release(
-                    &r->retained_reservation);
+            if (r->retained_reserved_bytes > 0
+                && !wl_columnar_memory_release(
+                    &r->retained_reservation))
+                abort();
             r->retained_reserved_bytes = 0;
             wl_columnar_memory_reservation_init(
                 &r->retained_reservation);
@@ -2334,9 +2336,32 @@ col_rel_compact_impl(col_rel_t *r,
         goto free_merge_buf;
     }
 
-    /* Only compact when buffer is more than 4x oversized. */
-    if (!col_rel_compaction_shape(r, NULL, NULL))
+    /* Only compact when buffer is more than 4x oversized.  A previous
+     * replacement may have published its new storage but failed to settle
+     * the governor token.  Finish that token before treating the relation as
+     * already compact; otherwise a caller could observe success while a
+     * live REPLACING token was stranded forever. */
+    if (!col_rel_compaction_shape(r, NULL, NULL)) {
+        if (r->memory_governor
+            && atomic_load_explicit(&r->retained_reservation.state,
+            memory_order_acquire)
+            == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING) {
+            uint64_t replacement_bytes
+                = r->retained_reservation.replacement_bytes;
+            if (replacement_bytes == 0
+                || replacement_bytes != col_rel_transport_bytes(r)) {
+                rc = EBUSY;
+                goto free_merge_buf;
+            }
+            if (!wl_columnar_memory_commit_replacement(
+                    &r->retained_reservation)) {
+                rc = EFAULT;
+                goto free_merge_buf;
+            }
+            r->retained_reserved_bytes = replacement_bytes;
+        }
         goto free_merge_buf;
+    }
 
     {
         uint32_t tight = 0;
@@ -2355,8 +2380,10 @@ col_rel_compact_impl(col_rel_t *r,
             if (reservation_state
                 == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING) {
                 if (r->retained_reservation.replacement_bytes
-                    != compacted_bytes)
+                    != compacted_bytes) {
+                    rc = EBUSY;
                     goto free_merge_buf;
+                }
             } else {
                 status = wl_columnar_memory_begin_replacement(
                     &r->retained_reservation, compacted_bytes);
@@ -2378,9 +2405,10 @@ col_rel_compact_impl(col_rel_t *r,
         col_delta_timestamp_t *old_ts = r->timestamps;
         bool old_arena_owned = r->arena_owned;
         if (col_rel_prepare_resize(r, tight, &new_cols, &new_ts) != 0) {
-            if (replacement_started)
-                (void)wl_columnar_memory_rollback_replacement(
-                    &r->retained_reservation);
+            if (replacement_started
+                && !wl_columnar_memory_rollback_replacement(
+                    &r->retained_reservation))
+                rc = EAGAIN;
             goto free_merge_buf;
         }
         /* The pointer swap itself cannot fail.  Keep the old storage live
@@ -2411,12 +2439,16 @@ col_rel_compact_impl(col_rel_t *r,
             /* The old allocation has been freed before the retained charge
              * is reduced.  If the accounting transition is rejected, discard
              * only the temporary charge and retain the old reservation as a
-             * conservative upper bound for the newly published storage. */
+             * conservative upper bound for the newly published storage.  A
+             * failed rollback leaves the token in REPLACING, which is
+             * intentionally retained for a later retry. */
             if (!wl_columnar_memory_commit_replacement(
                     &r->retained_reservation)) {
-                (void)wl_columnar_memory_rollback_replacement(
-                    &r->retained_reservation);
-                rc = EFAULT;
+                if (!wl_columnar_memory_rollback_replacement(
+                        &r->retained_reservation))
+                    rc = EAGAIN;
+                else
+                    rc = EFAULT;
             } else {
                 r->retained_reserved_bytes = compacted_bytes;
             }
@@ -2599,9 +2631,11 @@ cleanup:
         if (replacement_started[i] && rels[i] && rels[i]->memory_governor
             && atomic_load_explicit(&rels[i]->retained_reservation.state,
             memory_order_acquire)
-            == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING)
-            (void)wl_columnar_memory_rollback_replacement(
-                &rels[i]->retained_reservation);
+            == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING
+            && !wl_columnar_memory_rollback_replacement(
+                &rels[i]->retained_reservation)
+            )
+            rc = EAGAIN;
     }
     for (uint32_t i = 0; i < owner_count; i++) {
         if (writers[i].owner
@@ -3796,6 +3830,10 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     uint64_t ledger_ts_bytes;
     uint64_t gate_state;
     bool has_new_reservation;
+    bool has_old_reservation;
+    uint64_t old_retained_bytes;
+    wl_columnar_memory_reservation_t old_reservation;
+    int reservation_rc;
     int release_rc;
 
     if (!dst || !replacement || !replacement->staged
@@ -3814,11 +3852,22 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
         return EINVAL;
 
     has_new_reservation = replacement->reservation_active;
+    wl_columnar_memory_reservation_init(&old_reservation);
     wl_columnar_memory_reservation_init(&new_reservation);
+    old_retained_bytes = dst->retained_reserved_bytes;
+    has_old_reservation = old_retained_bytes > 0;
+    if (has_old_reservation
+        && !wl_columnar_memory_reservation_move(&old_reservation,
+        &dst->retained_reservation))
+        return EINVAL;
     if (has_new_reservation
         && !wl_columnar_memory_reservation_move(&new_reservation,
-        &replacement->reservation))
+        &replacement->reservation)) {
+        if (has_old_reservation)
+            (void)wl_columnar_memory_reservation_move(
+                &dst->retained_reservation, &old_reservation);
         return EINVAL;
+    }
 
     old = *dst;
     name = old.name;
@@ -3832,9 +3881,6 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     ledger_ts_bytes = old.ledger_ts_bytes;
     gate_state = atomic_load_explicit(&old.source_access.state,
             memory_order_acquire);
-
-    if (old.retained_reserved_bytes > 0)
-        (void)wl_columnar_memory_release(&old.retained_reservation);
 
     *dst = *staged;
     dst->name = name;
@@ -3869,7 +3915,6 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     old.name = NULL;
     old.mem_ledger = NULL;
     old.memory_governor = NULL;
-    old.retained_reserved_bytes = 0;
     old.ledger_ts_bytes = 0;
     old.storage_owner = &old;
     old.storage_owner_identity = old.relation_identity;
@@ -3877,10 +3922,25 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     col_rel_storage_owner_init(&old);
     col_rel_free_contents(&old);
 
+    reservation_rc = 0;
+    if (has_old_reservation
+        && !wl_columnar_memory_release(&old_reservation)) {
+        /* Keep the old token reachable by the caller's discard path if the
+         * governor cannot release it yet.  The new token remains published
+         * on dst, while this conservative token can be retried without a
+         * double release. */
+        reservation_rc = EFAULT;
+        if (wl_columnar_memory_reservation_move(
+                &replacement->reservation, &old_reservation))
+            replacement->reservation_active = true;
+    }
+
     release_rc = wl_columnar_source_access_writer_release(
         &replacement->writer);
     replacement->writer_acquired = false;
-    return release_rc == 0 ? 0 : EINVAL;
+    if (release_rc != 0)
+        return EINVAL;
+    return reservation_rc;
 }
 
 void
