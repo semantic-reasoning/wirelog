@@ -1020,7 +1020,8 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
     rc = col_rel_storage_owner_resolve(rel, &owner);
     if (rc != 0)
         goto release_writer;
-    if (rel == owner && owner->storage_alias_borrows > 0) {
+    if (rel == owner
+        && col_rel_storage_alias_borrow_count(owner) > 0) {
         rc = EBUSY;
         goto release_writer;
     }
@@ -1950,14 +1951,10 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     rc = col_rel_storage_owner_resolve(rel, &rel_owner);
     if (rc != 0)
         return rc;
-    if (rel_owner == rel && rel->storage_alias_borrows > 0)
-        return EBUSY;
     if (delta_out) {
         rc = col_rel_storage_owner_resolve(delta_out, &delta_owner);
         if (rc != 0)
             return rc;
-        if (delta_owner == delta_out && delta_out->storage_alias_borrows > 0)
-            return EBUSY;
     }
 
     /* Acquire the two canonical owners in address order.  The same owner is
@@ -1993,6 +1990,17 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
             goto cleanup;
         rel_acquired = true;
         delta_writer_ptr = &delta_writer;
+    }
+
+    /* Owner alias counts are policy state, not a safe preflight snapshot.
+     * All involved writer gates are held here, so a zero count cannot become
+     * stale before the in-place operation begins. */
+    if ((rel_owner == rel
+        && col_rel_storage_alias_borrow_count(rel_owner) > 0)
+        || (delta_out && delta_owner == delta_out
+        && col_rel_storage_alias_borrow_count(delta_owner) > 0)) {
+        rc = EBUSY;
+        goto cleanup;
     }
 
     if (delta_out) {

@@ -51,6 +51,9 @@ wl_columnar_source_access_writer_claim(
 
 typedef struct wl_columnar_source_access_reader {
     wl_columnar_source_access_gate_t *owner;
+    /* Optional descriptor gate acquired before owner. Relation readers keep
+     * both gates so alias metadata cannot be replaced while in use. */
+    wl_columnar_source_access_gate_t *secondary_owner;
     uintptr_t identity;
 #if defined(WL_HAVE_C11_THREADS)
     thrd_t owner_thread;
@@ -65,6 +68,8 @@ typedef struct wl_columnar_source_access_reader {
 
 typedef struct wl_columnar_source_access_writer {
     wl_columnar_source_access_gate_t *owner;
+    /* Optional relation-descriptor reader held before owner admission. */
+    wl_columnar_source_access_gate_t *secondary_owner;
     uintptr_t identity;
 #if defined(WL_HAVE_C11_THREADS)
     thrd_t owner_thread;
@@ -81,6 +86,42 @@ wl_columnar_source_access_gate_init(wl_columnar_source_access_gate_t *gate)
 {
     if (gate)
         atomic_store_explicit(&gate->state, 0, memory_order_relaxed);
+}
+
+static inline int
+wl_columnar_source_access_gate_reader_acquire(
+    wl_columnar_source_access_gate_t *gate)
+{
+    uint64_t observed;
+    if (!gate)
+        return EINVAL;
+    observed = atomic_load_explicit(&gate->state, memory_order_acquire);
+    for (;;) {
+        if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+            return EBUSY;
+        if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER - 1u)
+            return EOVERFLOW;
+        if (atomic_compare_exchange_weak_explicit(&gate->state, &observed,
+            observed + 1u, memory_order_acquire, memory_order_relaxed))
+            return 0;
+    }
+}
+
+static inline int
+wl_columnar_source_access_gate_reader_release(
+    wl_columnar_source_access_gate_t *gate)
+{
+    uint64_t observed;
+    if (!gate)
+        return EINVAL;
+    observed = atomic_load_explicit(&gate->state, memory_order_acquire);
+    for (;;) {
+        if (observed == 0 || observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+            return EINVAL;
+        if (atomic_compare_exchange_weak_explicit(&gate->state, &observed,
+            observed - 1u, memory_order_release, memory_order_relaxed))
+            return 0;
+    }
 }
 
 static inline bool
@@ -116,36 +157,44 @@ wl_columnar_source_access_writer_thread_equal(
 }
 
 static inline int
+wl_columnar_source_access_reader_acquire_common(
+    wl_columnar_source_access_gate_t *owner_gate,
+    wl_columnar_source_access_reader_t *token, bool transferable)
+{
+    int rc;
+
+    if (!owner_gate || !token || token->owner || token->secondary_owner
+        || token->identity != 0 || token->thread_valid || token->transferable)
+        return EINVAL;
+    rc = wl_columnar_source_access_gate_reader_acquire(owner_gate);
+    if (rc != 0)
+        return rc;
+    token->owner = owner_gate;
+    token->secondary_owner = NULL;
+    token->identity = (uintptr_t)token;
+    if (transferable) {
+        token->thread_valid = false;
+    } else {
+#if defined(WL_HAVE_C11_THREADS)
+        token->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+        token->owner_thread = GetCurrentThreadId();
+#else
+        token->owner_thread = pthread_self();
+#endif
+        token->thread_valid = true;
+    }
+    token->transferable = transferable;
+    return 0;
+}
+
+static inline int
 wl_columnar_source_access_reader_acquire(
     wl_columnar_source_access_gate_t *gate,
     wl_columnar_source_access_reader_t *token)
 {
-    uint64_t observed;
-    if (!gate || !token || token->owner || token->identity != 0
-        || token->thread_valid || token->transferable)
-        return EINVAL;
-    observed = atomic_load_explicit(&gate->state, memory_order_acquire);
-    for (;;) {
-        if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER)
-            return EBUSY;
-        if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER - 1u)
-            return EOVERFLOW;
-        if (atomic_compare_exchange_weak_explicit(&gate->state, &observed,
-            observed + 1u, memory_order_acquire, memory_order_relaxed))
-            break;
-    }
-    token->owner = gate;
-    token->identity = (uintptr_t)token;
-#if defined(WL_HAVE_C11_THREADS)
-    token->owner_thread = thrd_current();
-#elif defined(_WIN32) || defined(_WIN64)
-    token->owner_thread = GetCurrentThreadId();
-#else
-    token->owner_thread = pthread_self();
-#endif
-    token->thread_valid = true;
-    token->transferable = false;
-    return 0;
+    return wl_columnar_source_access_reader_acquire_common(gate, token,
+               false);
 }
 
 /* Session-owned readers have stable token addresses but may be retired by a
@@ -157,25 +206,7 @@ wl_columnar_source_access_reader_acquire_transferable(
     wl_columnar_source_access_gate_t *gate,
     wl_columnar_source_access_reader_t *token)
 {
-    uint64_t observed;
-    if (!gate || !token || token->owner || token->identity != 0
-        || token->thread_valid || token->transferable)
-        return EINVAL;
-    observed = atomic_load_explicit(&gate->state, memory_order_acquire);
-    for (;;) {
-        if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER)
-            return EBUSY;
-        if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER - 1u)
-            return EOVERFLOW;
-        if (atomic_compare_exchange_weak_explicit(&gate->state, &observed,
-            observed + 1u, memory_order_acquire, memory_order_relaxed))
-            break;
-    }
-    token->owner = gate;
-    token->identity = (uintptr_t)token;
-    token->thread_valid = false;
-    token->transferable = true;
-    return 0;
+    return wl_columnar_source_access_reader_acquire_common(gate, token, true);
 }
 
 static inline int
@@ -191,14 +222,19 @@ wl_columnar_source_access_reader_release(
         return EINVAL;
     gate = token->owner;
     observed = atomic_load_explicit(&gate->state, memory_order_acquire);
-    for (;;) {
-        if (observed == 0 || observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER)
-            return EINVAL;
-        if (atomic_compare_exchange_weak_explicit(&gate->state, &observed,
-            observed - 1u, memory_order_release, memory_order_relaxed))
-            break;
-    }
+    if (observed == 0 || observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+        return EINVAL;
+    if (token->secondary_owner
+        && !wl_columnar_source_access_gate_busy(token->secondary_owner))
+        return EINVAL;
+    if (wl_columnar_source_access_gate_reader_release(gate) != 0)
+        return EINVAL;
+    if (token->secondary_owner
+        && wl_columnar_source_access_gate_reader_release(
+            token->secondary_owner) != 0)
+        return EINVAL;
     token->owner = NULL;
+    token->secondary_owner = NULL;
     token->identity = 0;
     token->thread_valid = false;
     token->transferable = false;
@@ -211,8 +247,8 @@ wl_columnar_source_access_writer_acquire(
     wl_columnar_source_access_writer_t *token)
 {
     uint64_t expected;
-    if (!gate || !token || token->owner || token->identity != 0
-        || token->thread_valid)
+    if (!gate || !token || token->owner || token->secondary_owner
+        || token->identity != 0 || token->thread_valid)
         return EINVAL;
     for (;;) {
         expected = 0;
@@ -224,6 +260,7 @@ wl_columnar_source_access_writer_acquire(
             return EBUSY;
     }
     token->owner = gate;
+    token->secondary_owner = NULL;
     token->identity = (uintptr_t)token;
 #if defined(WL_HAVE_C11_THREADS)
     token->owner_thread = thrd_current();
@@ -256,7 +293,12 @@ wl_columnar_source_access_writer_release(
         if (observed != WL_COLUMNAR_SOURCE_ACCESS_WRITER)
             return EBUSY;
     }
+    if (token->secondary_owner
+        && wl_columnar_source_access_gate_reader_release(
+            token->secondary_owner) != 0)
+        return EINVAL;
     token->owner = NULL;
+    token->secondary_owner = NULL;
     token->identity = 0;
     token->thread_valid = false;
     return 0;

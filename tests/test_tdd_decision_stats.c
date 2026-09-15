@@ -63,6 +63,9 @@ typedef struct count_ctx {
 } count_ctx_t;
 
 static int submission_allowance = -1;
+static int hold_reader_before_worker_cleanup;
+static int cleanup_reader_rc;
+static wl_columnar_source_access_reader_t cleanup_reader;
 
 int
 wl_columnar_eval_test_submit(wl_work_queue_t *wq,
@@ -73,6 +76,18 @@ wl_columnar_eval_test_submit(wl_work_queue_t *wq,
     if (submission_allowance > 0)
         submission_allowance--;
     return wl_workqueue_submit(wq, fn, ctx);
+}
+
+void
+wl_columnar_eval_test_before_worker_cleanup(wl_col_session_t *coord)
+{
+    if (!hold_reader_before_worker_cleanup || !coord
+        || coord->tdd_workers_count == 0)
+        return;
+    hold_reader_before_worker_cleanup = 0;
+    col_rel_t *alias = session_find_rel(&coord->tdd_workers[0], "edge");
+    cleanup_reader_rc = alias
+        ? col_rel_source_reader_acquire(alias, &cleanup_reader) : ENOENT;
 }
 
 /* Verify every tuple and uniqueness, not just a cardinality that a wrong
@@ -191,7 +206,7 @@ run_snapshot_frames(void)
 static int
 run_audit_boundary(int mode)
 {
-    const char *source = mode == 0
+    const char *source = mode == 0 || mode == 4
         ? ".decl edge(x:int32,y:int32)\n.decl r(x:int32,y:int32)\n"
         "r(x,y) :- edge(x,y).\nr(x,z) :- r(x,y), edge(y,z).\n"
         : mode == 1 || mode == 3
@@ -231,11 +246,32 @@ run_audit_boundary(int mode)
     rc = wl_session_insert(sess, "edge", rows, 100, 2);
     count_ctx_t ctx = { 0 };
     if (rc == 0) {
+        if (mode == 4) {
+            memset(&cleanup_reader, 0, sizeof(cleanup_reader));
+            cleanup_reader_rc = 0;
+            hold_reader_before_worker_cleanup = 1;
+        }
         rc = wl_session_snapshot(sess, count_cb, &ctx);
     }
     submission_allowance = -1;
     int ok;
-    if (mode == 1 || mode == 3) {
+    if (mode == 4) {
+        bool retained_worker = col->tdd_workers_count == 8
+            && col->tdd_workers[0].rels != NULL
+            && col->tdd_workers[0].nrels > 0;
+        bool refused_before_replay = rc == EBUSY && cleanup_reader_rc == 0
+            && cleanup_reader.owner != NULL && retained_worker
+            && col->tdd_audit.replay == NULL;
+        int release_rc = cleanup_reader.owner
+            ? col_rel_source_reader_release(&cleanup_reader) : EINVAL;
+        hold_reader_before_worker_cleanup = 0;
+        int retry_rc = release_rc == 0
+            ? wl_session_snapshot(sess, count_cb, &ctx) : release_rc;
+        ok = refused_before_replay && release_rc == 0 && retry_rc == 0
+            && exact_chain(sess) && col->tdd_workers_count == 0
+            && col->tdd_audit.replay
+            && strcmp(col->tdd_audit.replay, "owner_tiny_frontier") == 0;
+    } else if (mode == 1 || mode == 3) {
         ok = rc == ENOMEM && col->tdd_audit.selected_workers == 8
             && col->tdd_audit.submitted_tasks == (mode == 1 ? 0u : 4u)
             && col->tdd_audit.completed_rounds == 0;
@@ -253,7 +289,7 @@ run_audit_boundary(int mode)
             && col->tdd_audit.submitted_tasks == 0
             && col->tdd_audit.strategy == NULL;
     }
-    if (rc == 0) {
+    if (mode != 4 && rc == 0) {
         rc = wl_session_snapshot(sess, count_cb, &ctx);
         ok = ok && rc == 0 && col->tdd_audit.submitted_tasks == 0
             && col->tdd_audit.replay == NULL;
@@ -522,6 +558,8 @@ main(int argc, char **argv)
             return run_audit_boundary(1);
         if (strcmp(argv[1], "--audit-partial") == 0)
             return run_audit_boundary(3);
+        if (strcmp(argv[1], "--audit-cleanup-refusal") == 0)
+            return run_audit_boundary(4);
         if (strcmp(argv[1], "--audit-unsafe") == 0)
             return run_audit_boundary(2);
         if (strcmp(argv[1], "--audit-frames-off") == 0)
@@ -530,6 +568,8 @@ main(int argc, char **argv)
     }
     failed += expect("post-dispatch serial replay retains history",
             run_audit_boundary(0) == 0);
+    failed += expect("worker cleanup refusal blocks serial replay and retries",
+            run_audit_boundary(4) == 0);
     failed += expect("first submission error is not execution",
             run_audit_boundary(1) == 0);
     failed += expect("partial submission and drain is not a complete round",

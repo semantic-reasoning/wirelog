@@ -109,7 +109,10 @@ delta_pool_alloc_data(delta_pool_t *pool, size_t bytes);
  * delta_pool_reset:
  * @pool: Pool to reset.  NULL-safe.
  *
- * Reset all slab and arena counters to zero.  O(1) operation.
+ * Reset all slab and arena counters to zero. O(1) operation. The caller must
+ * ensure that all relation descriptors in the reclaimed slot range have
+ * completed checked teardown and that no operation or lease can still use
+ * those slots or arena allocations. Reset is not a synchronization barrier.
  */
 void
 delta_pool_reset(delta_pool_t *pool);

@@ -505,20 +505,22 @@ typedef struct col_rel {
     uint64_t storage_generation;
 
     /* Source-storage ownership for zero-copy shared views (Issue #1493).
-     * Shared views canonicalize this pointer to the ultimate relation that
-     * owns the borrowed column buffers.  Alias chains are never persisted:
-     * an alias has storage_alias_borrows == 0, while the root counts its
-     * direct and flattened aliases.  The gate is intentionally not wired to
-     * production mutation/teardown until the later lifecycle units. */
+    * Shared views canonicalize this pointer to the ultimate relation that
+    * owns the borrowed column buffers. Alias chains are never persisted:
+    * an alias has storage_alias_borrows == 0, while the root counts its
+    * direct and flattened aliases. The borrow count is atomic because
+    * worker alias retirement may update it while peer readers are active;
+    * mutation admission must still recheck it under the owner writer. */
     struct col_rel *storage_owner;
     uint64_t storage_owner_identity;
     uint64_t storage_owner_generation;
-    uint32_t storage_alias_borrows;
+    wl_atomic_u64 storage_alias_borrows;
 
     /* Operation-scoped readers protect the ultimate storage owner from
-     * checked destruction.  Production read paths are wired in later
-     * lifecycle units. */
+     * checked destruction. The descriptor gate also protects alias metadata
+     * while the canonical owner is resolved or its shared view is replaced. */
     wl_columnar_source_access_gate_t source_access;
+    wl_columnar_source_access_gate_t descriptor_access;
 } col_rel_t;
 
 /* A private, fully staged publication for a canonical relation.  The staged
@@ -1915,6 +1917,10 @@ typedef struct wl_col_session_t {
      * array is neither grown nor compacted, so lease pointers stay valid;
      * asserted zero at session and worker teardown in debug builds. */
     uint32_t filt_cache_active_pins;
+    /* A refused worker teardown is resumable but the worker must not be
+     * reused. The report flag prevents retry from double-counting metrics. */
+    bool teardown_started;
+    bool teardown_reported;
 } wl_col_session_t;
 
 /*
@@ -1983,6 +1989,10 @@ void
 col_rel_ledger_release(col_rel_t *r);
 void
 col_rel_destroy(col_rel_t *r);
+/* The caller must keep the raw descriptor alive and prevent new operations
+ * from starting until this synchronous call returns. Already-admitted source
+ * readers are counted by the access gates; a reader of this alias blocks its
+ * retirement, but a peer descriptor's reader does not. */
 int
 col_rel_destroy_checked(col_rel_t *r);
 /* Prepare a private replacement without changing @dst.  The canonical writer
@@ -2008,6 +2018,12 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
  * and idempotent after commit. */
 void
 col_rel_discard_replacement(col_rel_replacement_t *replacement);
+int
+col_rel_pool_destroy_aliases_checked(delta_pool_t *pool,
+    uint32_t first_slot, uint32_t slot_limit);
+int
+col_rel_pool_destroy_roots_checked(delta_pool_t *pool,
+    uint32_t first_slot, uint32_t slot_limit);
 int
 col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names);
 int
@@ -2389,8 +2405,13 @@ wl_columnar_relation_install_shared_view_with_lease(col_rel_t *dst,
 int col_rel_storage_owner_resolve(const col_rel_t *src,
     col_rel_t **out_owner);
 int col_rel_storage_alias_release(col_rel_t *alias);
+uint64_t col_rel_storage_alias_borrow_count(const col_rel_t *owner);
+int col_rel_storage_alias_borrow_acquire(col_rel_t *owner);
+int col_rel_storage_alias_borrow_release(col_rel_t *owner);
 int col_rel_storage_owner_destroy_status(const col_rel_t *owner);
 int col_rel_source_reader_acquire(const col_rel_t *,
+    wl_columnar_source_access_reader_t *);
+int col_rel_source_reader_acquire_transferable(const col_rel_t *,
     wl_columnar_source_access_reader_t *);
 int col_rel_source_reader_release(wl_columnar_source_access_reader_t *);
 int col_rel_source_writer_acquire(const col_rel_t *,
@@ -3107,7 +3128,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
  * Safe to call on a partially-initialized worker (all owned pointers
  * are pre-NULLed during create).  Zeroes the struct on completion.
  */
-void
+int
 col_worker_session_destroy(wl_col_session_t *worker);
 
 /* Publish a shared view owned by sess and retain its source for exactly the

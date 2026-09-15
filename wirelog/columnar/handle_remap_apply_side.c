@@ -150,10 +150,6 @@ wl_handle_remap_apply_session_side_relations(struct wl_col_session_t *sess,
         rc = col_rel_storage_owner_resolve(rel, &owner);
         if (rc != 0)
             goto fail;
-        if (owner->storage_alias_borrows > 0) {
-            rc = EBUSY;
-            goto fail;
-        }
         targets[target_count++] = (remap_target_t){ rel, owner };
         bool known = false;
         for (uint32_t j = 0; j < owner_count; j++) {
@@ -181,6 +177,16 @@ wl_handle_remap_apply_session_side_relations(struct wl_col_session_t *sess,
             &owners[i]->source_access, &writers[i]);
         if (rc != 0)
             goto fail;
+    }
+
+    /* Alias accounting may change while the target owners are collected.
+     * Recheck only after every writer is held so no stale preflight admits
+     * an in-place remap. */
+    for (uint32_t i = 0; i < target_count; i++) {
+        if (col_rel_storage_alias_borrow_count(targets[i].owner) > 0) {
+            rc = EBUSY;
+            goto fail;
+        }
     }
 
     /* All lookups happen while every owner is excluded, before any write. */

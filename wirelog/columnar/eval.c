@@ -31,6 +31,8 @@
 extern int
 wl_columnar_eval_test_submit(wl_work_queue_t *wq,
     void (*fn)(void *), void *ctx);
+extern void
+wl_columnar_eval_test_before_worker_cleanup(wl_col_session_t *coord);
 #define WL_COLUMNAR_EVAL_SUBMIT wl_columnar_eval_test_submit
 #else
 #define WL_COLUMNAR_EVAL_SUBMIT wl_workqueue_submit
@@ -170,20 +172,40 @@ tdd_destroy_delta_slots(col_eval_tdd_worker_ctx_t *ctxs, uint32_t W,
  * Destroy and zero all initialized TDD worker sessions.
  * Safe to call on a coordinator with no workers (tdd_workers_count == 0).
  */
-static void
+static int
 tdd_cleanup_workers(wl_col_session_t *coord)
 {
+    int result = 0;
+
+#ifdef WL_COLUMNAR_EVAL_TEST_SUBMISSION
+    wl_columnar_eval_test_before_worker_cleanup(coord);
+#endif
     for (uint32_t w = coord->tdd_workers_count; w > 0; w--) {
         uint32_t worker_index = w - 1;
-        if (coord->tdd_workers[worker_index].coordinator != NULL)
-            col_worker_session_destroy(&coord->tdd_workers[worker_index]);
+        int rc = col_worker_session_destroy(
+            &coord->tdd_workers[worker_index]);
+        if (rc != 0) {
+            if (result == 0)
+                result = rc;
+            continue;
+        }
         memset(&coord->tdd_workers[worker_index], 0,
             sizeof(wl_col_session_t));
     }
+    if (result != 0)
+        return result;
     coord->tdd_workers_count = 0;
     coord->tdd_active_workers = 0;
     coord->callback_active_workers = 1;
     coord->callback_parallel_execution = false;
+    return 0;
+}
+
+static int
+tdd_cleanup_preserve_error(wl_col_session_t *coord, int operation_rc)
+{
+    int cleanup_rc = tdd_cleanup_workers(coord);
+    return cleanup_rc != 0 ? cleanup_rc : operation_rc;
 }
 
 static void
@@ -490,15 +512,13 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
     if (wl_columnar_eval_checked_count_inc(coord->nrels,
         &relation_slots) != 0) {
         free(ops_copy);
-        tdd_cleanup_workers(coord);
-        return EOVERFLOW;
+        return tdd_cleanup_preserve_error(coord, EOVERFLOW);
     }
     size_t relation_slot_bytes = 0;
     if (wl_columnar_eval_checked_size_mul(relation_slots,
         sizeof(col_rel_t *), &relation_slot_bytes) != 0) {
         free(ops_copy);
-        tdd_cleanup_workers(coord);
-        return EOVERFLOW;
+        return tdd_cleanup_preserve_error(coord, EOVERFLOW);
     }
 
     col_rel_t ***worker_rels = (col_rel_t ***)calloc(W, sizeof(col_rel_t **));
@@ -508,8 +528,7 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
         free((void *)worker_rels);
         free(ctxs);
         free(ops_copy);
-        tdd_cleanup_workers(coord);
-        return ENOMEM;
+        return tdd_cleanup_preserve_error(coord, ENOMEM);
     }
 
     uint32_t built_workers = 0;
@@ -548,6 +567,7 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
         }
         if (rc != 0)
             break;
+        coord->tdd_workers_count = w + 1;
         rc = col_worker_session_create(coord, w, worker_rels[w], rels_built,
                 &coord->tdd_workers[w]);
         if (rc == 0) {
@@ -562,7 +582,8 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
             built_workers++;
         }
     }
-    coord->tdd_workers_count = built_workers;
+    if (rc == 0)
+        coord->tdd_workers_count = W;
 
     if (rc == 0) {
         for (uint32_t w = 0; w < W; w++) {
@@ -660,7 +681,9 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
         }
         free((void *)worker_rels);
     }
-    tdd_cleanup_workers(coord);
+    int cleanup_rc = tdd_cleanup_workers(coord);
+    if (cleanup_rc != 0)
+        rc = cleanup_rc;
     if (!merge_started && rc == EOVERFLOW)
         return EAGAIN;
     return rc;
@@ -678,7 +701,9 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
 static int
 tdd_init_workers(wl_col_session_t *coord, uint32_t W)
 {
-    tdd_cleanup_workers(coord);
+    int cleanup_rc = tdd_cleanup_workers(coord);
+    if (cleanup_rc != 0)
+        return cleanup_rc;
 
     if (W == 0 || W > coord->num_workers)
         return EINVAL;
@@ -694,18 +719,17 @@ tdd_init_workers(wl_col_session_t *coord, uint32_t W)
     size_t relation_ptr_bytes = 0;
     if (wl_columnar_eval_checked_size_mul(nrels, sizeof(col_rel_t *),
         &relation_ptr_bytes) != 0) {
-        tdd_cleanup_workers(coord);
-        return EOVERFLOW;
+        return tdd_cleanup_preserve_error(coord, EOVERFLOW);
     }
 
     /* No relations: create empty worker sessions */
     if (nrels == 0) {
         for (uint32_t w = 0; w < W; w++) {
+            coord->tdd_workers_count = w + 1;
             int rc = col_worker_session_create(coord, w, NULL, 0,
                     &coord->tdd_workers[w]);
             if (rc != 0) {
-                tdd_cleanup_workers(coord);
-                return rc;
+                return tdd_cleanup_preserve_error(coord, rc);
             }
             coord->tdd_workers_count = w + 1;
         }
@@ -715,8 +739,7 @@ tdd_init_workers(wl_col_session_t *coord, uint32_t W)
     /* Allocate W x nrels partition matrix */
     col_rel_t ***worker_parts = (col_rel_t ***)calloc(W, sizeof(col_rel_t **));
     if (!worker_parts) {
-        tdd_cleanup_workers(coord);
-        return ENOMEM;
+        return tdd_cleanup_preserve_error(coord, ENOMEM);
     }
 
     int rc = 0;
@@ -782,6 +805,7 @@ tdd_init_workers(wl_col_session_t *coord, uint32_t W)
     uint32_t created = 0;
     if (rc == 0) {
         for (uint32_t w = 0; w < W; w++) {
+            coord->tdd_workers_count = w + 1;
             rc = col_worker_session_create(coord, w,
                     worker_parts[w], parts_built, &coord->tdd_workers[w]);
             if (rc != 0)
@@ -796,8 +820,11 @@ tdd_init_workers(wl_col_session_t *coord, uint32_t W)
             for (uint32_t p = 0; p < parts_built; p++)
                 col_rel_destroy(worker_parts[w][p]);
         }
-        coord->tdd_workers_count = created;
-        tdd_cleanup_workers(coord);
+        /* Keep the attempted worker in the cohort: a refused partial
+         * teardown must remain reachable for a later retry. */
+        int cleanup_rc = tdd_cleanup_workers(coord);
+        if (cleanup_rc != 0)
+            rc = cleanup_rc;
     } else {
         coord->tdd_workers_count = W;
     }
@@ -824,7 +851,9 @@ tdd_init_workers(wl_col_session_t *coord, uint32_t W)
 static int
 tdd_replicate_workers(wl_col_session_t *coord, uint32_t W)
 {
-    tdd_cleanup_workers(coord);
+    int cleanup_rc = tdd_cleanup_workers(coord);
+    if (cleanup_rc != 0)
+        return cleanup_rc;
 
     if (W == 0 || W > coord->num_workers)
         return EINVAL;
@@ -840,18 +869,17 @@ tdd_replicate_workers(wl_col_session_t *coord, uint32_t W)
     size_t relation_ptr_bytes = 0;
     if (wl_columnar_eval_checked_size_mul(nrels, sizeof(col_rel_t *),
         &relation_ptr_bytes) != 0) {
-        tdd_cleanup_workers(coord);
-        return EOVERFLOW;
+        return tdd_cleanup_preserve_error(coord, EOVERFLOW);
     }
 
     /* No relations: create empty worker sessions */
     if (nrels == 0) {
         for (uint32_t w = 0; w < W; w++) {
+            coord->tdd_workers_count = w + 1;
             int rc = col_worker_session_create(coord, w, NULL, 0,
                     &coord->tdd_workers[w]);
             if (rc != 0) {
-                tdd_cleanup_workers(coord);
-                return rc;
+                return tdd_cleanup_preserve_error(coord, rc);
             }
             coord->tdd_workers_count = w + 1;
         }
@@ -861,8 +889,7 @@ tdd_replicate_workers(wl_col_session_t *coord, uint32_t W)
     /* Allocate W x nrels relation matrix */
     col_rel_t ***worker_rels = (col_rel_t ***)calloc(W, sizeof(col_rel_t **));
     if (!worker_rels) {
-        tdd_cleanup_workers(coord);
-        return ENOMEM;
+        return tdd_cleanup_preserve_error(coord, ENOMEM);
     }
 
     int rc = 0;
@@ -910,6 +937,7 @@ tdd_replicate_workers(wl_col_session_t *coord, uint32_t W)
     uint32_t created = 0;
     if (rc == 0) {
         for (uint32_t w = 0; w < W; w++) {
+            coord->tdd_workers_count = w + 1;
             rc = col_worker_session_create(coord, w,
                     worker_rels[w], rels_built, &coord->tdd_workers[w]);
             if (rc != 0)
@@ -924,8 +952,9 @@ tdd_replicate_workers(wl_col_session_t *coord, uint32_t W)
             for (uint32_t p = 0; p < rels_built; p++)
                 col_rel_destroy(worker_rels[w][p]);
         }
-        coord->tdd_workers_count = created;
-        tdd_cleanup_workers(coord);
+        int cleanup_rc = tdd_cleanup_workers(coord);
+        if (cleanup_rc != 0)
+            rc = cleanup_rc;
     } else {
         coord->tdd_workers_count = W;
     }
@@ -949,7 +978,9 @@ tdd_init_workers_global_read(wl_col_session_t *coord, uint32_t W)
     if (rc != 0)
         return rc;
 
-    tdd_cleanup_workers(coord);
+    rc = tdd_cleanup_workers(coord);
+    if (rc != 0)
+        return rc;
 
     coord->tdd_active_workers = W;
     tdd_record_active_workers(coord, W);
@@ -958,13 +989,11 @@ tdd_init_workers_global_read(wl_col_session_t *coord, uint32_t W)
     size_t relation_ptr_bytes = 0;
     if (wl_columnar_eval_checked_size_mul(nrels, sizeof(col_rel_t *),
         &relation_ptr_bytes) != 0) {
-        tdd_cleanup_workers(coord);
-        return EOVERFLOW;
+        return tdd_cleanup_preserve_error(coord, EOVERFLOW);
     }
     col_rel_t ***worker_rels = (col_rel_t ***)calloc(W, sizeof(col_rel_t **));
     if (!worker_rels) {
-        tdd_cleanup_workers(coord);
-        return ENOMEM;
+        return tdd_cleanup_preserve_error(coord, ENOMEM);
     }
 
     for (uint32_t w = 0; w < W; w++) {
@@ -982,11 +1011,11 @@ tdd_init_workers_global_read(wl_col_session_t *coord, uint32_t W)
             if (rc != 0)
                 goto cleanup;
         }
+        coord->tdd_workers_count = w + 1;
         rc = col_worker_session_create(coord, w, worker_rels[w], nrels,
                 &coord->tdd_workers[w]);
         if (rc != 0)
             goto cleanup;
-        coord->tdd_workers_count = w + 1;
     }
 
 cleanup:
@@ -1002,7 +1031,7 @@ cleanup:
         free((void *)worker_rels);
     }
     if (rc != 0)
-        tdd_cleanup_workers(coord);
+        rc = tdd_cleanup_preserve_error(coord, rc);
     return rc;
 }
 
@@ -2980,7 +3009,9 @@ static int
 tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
     bool partition_edb, uint32_t W)
 {
-    tdd_cleanup_workers(coord);
+    int cleanup_rc = tdd_cleanup_workers(coord);
+    if (cleanup_rc != 0)
+        return cleanup_rc;
 
     if (W == 0 || W > coord->num_workers)
         return EINVAL;
@@ -2996,17 +3027,16 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
     size_t relation_ptr_bytes = 0;
     if (wl_columnar_eval_checked_size_mul(nrels, sizeof(col_rel_t *),
         &relation_ptr_bytes) != 0) {
-        tdd_cleanup_workers(coord);
-        return EOVERFLOW;
+        return tdd_cleanup_preserve_error(coord, EOVERFLOW);
     }
 
     if (nrels == 0) {
         for (uint32_t w = 0; w < W; w++) {
+            coord->tdd_workers_count = w + 1;
             int rc = col_worker_session_create(coord, w, NULL, 0,
                     &coord->tdd_workers[w]);
             if (rc != 0) {
-                tdd_cleanup_workers(coord);
-                return rc;
+                return tdd_cleanup_preserve_error(coord, rc);
             }
             coord->tdd_workers_count = w + 1;
         }
@@ -3015,8 +3045,7 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
 
     col_rel_t ***worker_rels = (col_rel_t ***)calloc(W, sizeof(col_rel_t **));
     if (!worker_rels) {
-        tdd_cleanup_workers(coord);
-        return ENOMEM;
+        return tdd_cleanup_preserve_error(coord, ENOMEM);
     }
 
     int rc = 0;
@@ -3247,6 +3276,7 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
     uint32_t created = 0;
     if (rc == 0) {
         for (uint32_t w = 0; w < W; w++) {
+            coord->tdd_workers_count = w + 1;
             rc = col_worker_session_create(coord, w,
                     worker_rels[w], rels_built, &coord->tdd_workers[w]);
             if (rc != 0)
@@ -3260,8 +3290,9 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
             for (uint32_t p = 0; p < rels_built; p++)
                 col_rel_destroy(worker_rels[w][p]);
         }
-        coord->tdd_workers_count = created;
-        tdd_cleanup_workers(coord);
+        int cleanup_rc = tdd_cleanup_workers(coord);
+        if (cleanup_rc != 0)
+            rc = cleanup_rc;
     } else {
         coord->tdd_workers_count = W;
     }
@@ -4971,7 +5002,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             if (r && !r->dedup_slots) {
                 rc = WL_COLUMNAR_EVAL_DEDUP_SET_INIT_FROM_REL(r);
                 if (rc != 0) {
-                    tdd_cleanup_workers(coord);
+                    rc = tdd_cleanup_preserve_error(coord, rc);
                     tdd_free_saved_coord_idb(sp, owner_fallback_saved);
                     tdd_free_saved_coord_idb(sp, global_read_saved);
                     coord->tdd_total_ns += now_ns() - tdd_total_t0;
@@ -4984,7 +5015,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
     /* Pre-register empty IDB on each worker */
     rc = tdd_preregister_idb_on_workers(sp, coord);
     if (rc != 0) {
-        tdd_cleanup_workers(coord);
+        rc = tdd_cleanup_preserve_error(coord, rc);
         tdd_free_saved_coord_idb(sp, owner_fallback_saved);
         tdd_free_saved_coord_idb(sp, global_read_saved);
         coord->tdd_total_ns += now_ns() - tdd_total_t0;
@@ -5003,7 +5034,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             if (r && r->nrows > 1) {
                 int sort_rc = col_rel_radix_sort_int64(r);
                 if (sort_rc != 0) {
-                    tdd_cleanup_workers(coord);
+                    sort_rc = tdd_cleanup_preserve_error(coord, sort_rc);
                     tdd_free_saved_coord_idb(sp, owner_fallback_saved);
                     tdd_free_saved_coord_idb(sp, global_read_saved);
                     coord->tdd_total_ns += now_ns() - tdd_total_t0;
@@ -5025,16 +5056,16 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         for (uint32_t w = 0; w < W; w++) {
             col_rel_t *slot = col_rel_new_auto(dname, ncols_ri);
             if (!slot) {
-                tdd_cleanup_workers(coord);
+                rc = tdd_cleanup_preserve_error(coord, ENOMEM);
                 tdd_free_saved_coord_idb(sp, owner_fallback_saved);
                 tdd_free_saved_coord_idb(sp, global_read_saved);
                 coord->tdd_total_ns += now_ns() - tdd_total_t0;
-                return ENOMEM;
+                return rc;
             }
             rc = session_add_rel(&coord->tdd_workers[w], slot);
             if (rc != 0) {
                 col_rel_destroy(slot);
-                tdd_cleanup_workers(coord);
+                rc = tdd_cleanup_preserve_error(coord, rc);
                 tdd_free_saved_coord_idb(sp, owner_fallback_saved);
                 tdd_free_saved_coord_idb(sp, global_read_saved);
                 coord->tdd_total_ns += now_ns() - tdd_total_t0;
@@ -5574,26 +5605,38 @@ done:
     coord->diff_operators_active = saved_diff;
 
     if (owner_adaptive_fallback && rc == 0) {
-        if (coord->tdd_audit.enabled)
-            coord->tdd_audit.replay = "owner_tiny_frontier";
+        int cleanup_rc = tdd_cleanup_workers(coord);
+        if (cleanup_rc != 0) {
+            tdd_free_saved_coord_idb(sp, owner_fallback_saved);
+            tdd_free_saved_coord_idb(sp, global_read_saved);
+            coord->tdd_total_ns += now_ns() - tdd_total_t0;
+            return cleanup_rc;
+        }
         rc = tdd_restore_coord_idb(sp, coord, owner_fallback_saved);
-        tdd_cleanup_workers(coord);
         tdd_free_saved_coord_idb(sp, owner_fallback_saved);
         tdd_free_saved_coord_idb(sp, global_read_saved);
         coord->tdd_total_ns += now_ns() - tdd_total_t0;
         if (rc != 0)
             return rc;
+        if (coord->tdd_audit.enabled)
+            coord->tdd_audit.replay = "owner_tiny_frontier";
         coord->frontier_ops->reset_stratum_frontier(coord, stratum_idx,
             coord->outer_epoch);
         return col_eval_stratum(sp, coord, stratum_idx);
     }
     if (global_read_mode && rc == EOVERFLOW) {
+        int cleanup_rc = tdd_cleanup_workers(coord);
+        if (cleanup_rc != 0) {
+            tdd_free_saved_coord_idb(sp, owner_fallback_saved);
+            tdd_free_saved_coord_idb(sp, global_read_saved);
+            coord->tdd_total_ns += now_ns() - tdd_total_t0;
+            return cleanup_rc;
+        }
         if (coord->tdd_audit.enabled) {
             coord->tdd_audit.replay = "global_read_overflow";
             coord->tdd_audit.replay_rc = rc;
         }
         int restore_rc = tdd_restore_coord_idb(sp, coord, global_read_saved);
-        tdd_cleanup_workers(coord);
         tdd_free_saved_coord_idb(sp, owner_fallback_saved);
         tdd_free_saved_coord_idb(sp, global_read_saved);
         coord->tdd_total_ns += now_ns() - tdd_total_t0;
@@ -5651,7 +5694,9 @@ done:
         }
     }
 
-    tdd_cleanup_workers(coord);
+    int cleanup_rc = tdd_cleanup_workers(coord);
+    if (cleanup_rc != 0)
+        rc = cleanup_rc;
     coord->tdd_total_ns += now_ns() - tdd_total_t0;
     return rc;
 }
@@ -5684,8 +5729,7 @@ col_eval_stratum_tdd_nonrecursive(const wl_plan_stratum_t *sp,
         = (col_eval_tdd_worker_ctx_t *)calloc(
             W, sizeof(col_eval_tdd_worker_ctx_t));
     if (!ctxs) {
-        tdd_cleanup_workers(coord);
-        return ENOMEM;
+        return tdd_cleanup_preserve_error(coord, ENOMEM);
     }
 
     for (uint32_t w = 0; w < W; w++) {
@@ -5699,8 +5743,7 @@ col_eval_stratum_tdd_nonrecursive(const wl_plan_stratum_t *sp,
             rc = ENOMEM;
             wl_workqueue_drain(coord->wq);
             free(ctxs);
-            tdd_cleanup_workers(coord);
-            return rc;
+            return tdd_cleanup_preserve_error(coord, rc);
         }
     }
 
@@ -5743,7 +5786,9 @@ col_eval_stratum_tdd_nonrecursive(const wl_plan_stratum_t *sp,
         tdd_record_nonrecursive_convergence(coord, sp, stratum_idx);
 
     /* Phase 8: Cleanup worker state */
-    tdd_cleanup_workers(coord);
+    int cleanup_rc = tdd_cleanup_workers(coord);
+    if (cleanup_rc != 0)
+        rc = cleanup_rc;
 
     return rc;
 }

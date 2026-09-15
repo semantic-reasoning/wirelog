@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <math.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -186,26 +187,28 @@ session_note_inserted_input(wl_col_session_t *sess, const col_rel_t *relation,
  * aliases before their root; otherwise the root's owner metadata would point
  * at freed storage. A root owned by another session is left for that owner
  * to retry after its aliases have drained. */
-static void
-session_destroy_relation_array(col_rel_t **relations, uint32_t count)
+static int
+session_destroy_relation_array_pass(col_rel_t **relations, uint32_t count,
+    bool aliases)
 {
-    for (int pass = 0; pass < 2; pass++) {
-        for (uint32_t i = 0; i < count; i++) {
-            col_rel_t *relation = relations[i];
-            bool is_alias;
-            if (!relation)
-                continue;
-            is_alias = relation->storage_owner
-                && relation->storage_owner != relation;
-            if ((pass == 0) != is_alias)
-                continue;
-            if (!is_alias
-                && col_rel_storage_owner_destroy_status(relation) == EBUSY)
-                continue;
-            col_rel_destroy(relation);
+    int result = 0;
+
+    for (uint32_t i = 0; i < count; i++) {
+        col_rel_t *relation = relations[i];
+        bool is_alias;
+        if (!relation)
+            continue;
+        is_alias = relation->storage_owner
+            && relation->storage_owner != relation;
+        if (aliases != is_alias)
+            continue;
+        int rc = col_rel_destroy_checked(relation);
+        if (rc == 0)
             relations[i] = NULL;
-        }
+        else if (result == 0)
+            result = rc;
     }
+    return result;
 }
 
 static wl_columnar_session_source_lease_t **
@@ -230,22 +233,24 @@ wl_columnar_session_source_lease_prepare(const col_rel_t *borrower,
     if (!borrower || !source || !out)
         return EINVAL;
     *out = NULL;
-    rc = col_rel_storage_owner_resolve(source, &owner);
-    if (rc != 0)
-        return rc;
     lease = (wl_columnar_session_source_lease_t *)calloc(1,
             sizeof(*lease));
     if (!lease)
         return ENOMEM;
     lease->borrower = (col_rel_t *)borrower;
-    lease->owner = owner;
-    lease->owner_identity = owner->relation_identity;
-    rc = wl_columnar_source_access_reader_acquire_transferable(
-        &owner->source_access, &lease->reader);
+    rc = col_rel_source_reader_acquire_transferable(source, &lease->reader);
     if (rc != 0) {
         free(lease);
         return rc;
     }
+    rc = col_rel_storage_owner_resolve(source, &owner);
+    if (rc != 0) {
+        (void)col_rel_source_reader_release(&lease->reader);
+        free(lease);
+        return rc;
+    }
+    lease->owner = owner;
+    lease->owner_identity = owner->relation_identity;
     *out = lease;
     return 0;
 }
@@ -298,22 +303,35 @@ wl_columnar_session_adopt_shared_view(wl_col_session_t *sess,
 {
     wl_columnar_session_source_lease_t **slot;
     wl_columnar_session_source_lease_t *lease;
+    wl_columnar_source_access_reader_t reader = { 0 };
     col_rel_t *owner = NULL;
     int rc;
 
     if (!sess || !borrower)
         return EINVAL;
-    rc = col_rel_storage_owner_resolve(borrower, &owner);
+    rc = col_rel_source_reader_acquire_transferable(borrower, &reader);
     if (rc != 0)
         return rc;
-    if (owner == borrower)
+    rc = col_rel_storage_owner_resolve(borrower, &owner);
+    if (rc != 0) {
+        (void)col_rel_source_reader_release(&reader);
+        return rc;
+    }
+    if (owner == borrower) {
+        (void)col_rel_source_reader_release(&reader);
         return 0;
+    }
     slot = wl_columnar_session_source_lease_slot(sess, borrower);
-    if (*slot)
-        return ((*slot)->owner == owner
-               && (*slot)->owner_identity == owner->relation_identity)
+    if (*slot) {
+        rc = ((*slot)->owner == owner
+            && (*slot)->owner_identity == owner->relation_identity)
             ? 0 : EINVAL;
+        (void)col_rel_source_reader_release(&reader);
+        return rc;
+    }
     rc = wl_columnar_session_source_lease_prepare(borrower, owner, &lease);
+    if (col_rel_source_reader_release(&reader) != 0 && rc == 0)
+        rc = EINVAL;
     if (rc != 0)
         return rc;
     lease->next = sess->source_leases;
@@ -326,29 +344,40 @@ wl_columnar_session_retire_source_lease(wl_col_session_t *sess,
     col_rel_t *borrower)
 {
     wl_columnar_session_source_lease_t *lease;
+    wl_columnar_source_access_reader_t reader = { 0 };
     col_rel_t *owner = NULL;
     int rc;
 
     if (!sess || !borrower)
         return EINVAL;
-    rc = col_rel_storage_owner_resolve(borrower, &owner);
+    rc = col_rel_source_reader_acquire_transferable(borrower, &reader);
     if (rc != 0)
         return rc;
+    rc = col_rel_storage_owner_resolve(borrower, &owner);
+    if (rc != 0) {
+        (void)col_rel_source_reader_release(&reader);
+        return rc;
+    }
     /* A live alias still needs its lease.  Callers may retire only after a
      * successful COW/deep-copy transition made the relation self-owned. */
-    if (owner != borrower)
+    if (owner != borrower) {
+        (void)col_rel_source_reader_release(&reader);
         return EBUSY;
+    }
+    if (col_rel_source_reader_release(&reader) != 0)
+        return EINVAL;
     lease = wl_columnar_session_source_lease_take(sess, borrower);
     return wl_columnar_session_source_lease_release(lease);
 }
 
-static void
+static int
 wl_columnar_session_source_leases_release_all(wl_col_session_t *sess)
 {
     wl_columnar_session_source_lease_t *lease;
+    int result = 0;
 
     if (!sess)
-        return;
+        return EINVAL;
     while ((lease = sess->source_leases) != NULL) {
         sess->source_leases = lease->next;
         /* Stable registry tokens are explicitly transferable so an
@@ -359,9 +388,11 @@ wl_columnar_session_source_leases_release_all(wl_col_session_t *sess)
         if (rc != 0) {
             lease->next = sess->source_leases;
             sess->source_leases = lease;
-            return;
+            result = rc;
+            break;
         }
     }
+    return result;
 }
 
 /* Row removal rewrites the canonical relation storage in place.  Admit the
@@ -377,15 +408,18 @@ session_relation_writer_acquire(col_rel_t *relation, col_rel_t **owner_out,
     if (!relation || !owner_out || !writer)
         return EINVAL;
     *owner_out = NULL;
+    rc = col_rel_source_writer_acquire(relation, writer);
+    if (rc != 0)
+        return rc;
     rc = col_rel_storage_owner_resolve(relation, &owner);
-    if (rc != 0)
+    if (rc != 0) {
+        (void)wl_columnar_source_access_writer_release(writer);
         return rc;
-    if (owner->storage_alias_borrows > 0)
+    }
+    if (col_rel_storage_alias_borrow_count(owner) > 0) {
+        (void)wl_columnar_source_access_writer_release(writer);
         return EBUSY;
-    rc = wl_columnar_source_access_writer_acquire(
-        &owner->source_access, writer);
-    if (rc != 0)
-        return rc;
+    }
     *owner_out = owner;
     return 0;
 }
@@ -397,22 +431,30 @@ wl_columnar_session_install_shared_view(wl_col_session_t *sess,
     wl_columnar_session_source_lease_t **slot;
     wl_columnar_session_source_lease_t *old_lease;
     wl_columnar_session_source_lease_t *new_lease = NULL;
+    wl_columnar_source_access_reader_t source_reader = { 0 };
     col_rel_t *owner = NULL;
     int rc;
 
     if (!sess || !dst || !src)
         return EINVAL;
-    rc = col_rel_storage_owner_resolve(src, &owner);
+    rc = col_rel_source_reader_acquire_transferable(src, &source_reader);
     if (rc != 0)
         return rc;
+    rc = col_rel_storage_owner_resolve(src, &owner);
+    if (rc != 0) {
+        (void)col_rel_source_reader_release(&source_reader);
+        return rc;
+    }
     slot = wl_columnar_session_source_lease_slot(sess, dst);
     old_lease = *slot;
     if (!old_lease || old_lease->owner != owner
         || old_lease->owner_identity != owner->relation_identity) {
         rc = wl_columnar_session_source_lease_prepare(dst, owner,
                 &new_lease);
-        if (rc != 0)
+        if (rc != 0) {
+            (void)col_rel_source_reader_release(&source_reader);
             return rc;
+        }
     }
 
     /* A refresh replaces alias descriptors under the old owner's writer.
@@ -430,10 +472,13 @@ wl_columnar_session_install_shared_view(wl_col_session_t *sess,
                 = wl_columnar_session_source_lease_release(new_lease);
             assert(release_rc == 0);
         }
+        (void)col_rel_source_reader_release(&source_reader);
         return rc;
     }
-    if (!new_lease)
-        return 0;
+    if (!new_lease) {
+        rc = col_rel_source_reader_release(&source_reader);
+        return rc == 0 ? 0 : EINVAL;
+    }
 
     if (old_lease) {
         new_lease->next = old_lease->next;
@@ -441,13 +486,116 @@ wl_columnar_session_install_shared_view(wl_col_session_t *sess,
         old_lease->next = NULL;
         rc = wl_columnar_session_source_lease_release(old_lease);
         assert(rc == 0);
-        if (rc != 0)
+        if (rc != 0) {
+            (void)col_rel_source_reader_release(&source_reader);
             return rc;
+        }
     } else {
         new_lease->next = sess->source_leases;
         sess->source_leases = new_lease;
     }
+    if (col_rel_source_reader_release(&source_reader) != 0 && rc == 0)
+        rc = EINVAL;
+    return rc;
+}
+
+static void
+session_pool_rel_transfer_payload(col_rel_t *dst, col_rel_t *src)
+{
+    const size_t retained_offset
+        = offsetof(col_rel_t, retained_reservation);
+    const size_t after_retained_offset
+        = offsetof(col_rel_t, retained_reserved_bytes);
+    const size_t alias_borrows_offset
+        = offsetof(col_rel_t, storage_alias_borrows);
+
+    memcpy(dst, src, retained_offset);
+    memcpy((char *)dst + after_retained_offset,
+        (const char *)src + after_retained_offset,
+        alias_borrows_offset - after_retained_offset);
+    atomic_store_explicit(&dst->storage_alias_borrows, 0,
+        memory_order_relaxed);
+}
+
+static int
+session_pool_rel_promote(col_rel_t *src, col_rel_t **heap_out)
+{
+    wl_columnar_source_access_writer_t descriptor_writer = { 0 };
+    wl_columnar_source_access_writer_t owner_writer = { 0 };
+    col_rel_t *heap;
+    int rc;
+
+    *heap_out = NULL;
+    rc = wl_columnar_source_access_writer_acquire(&src->descriptor_access,
+            &descriptor_writer);
+    if (rc != 0)
+        return EBUSY;
+    rc = wl_columnar_source_access_writer_acquire(&src->source_access,
+            &owner_writer);
+    if (rc != 0) {
+        (void)wl_columnar_source_access_writer_release(&descriptor_writer);
+        return EBUSY;
+    }
+    if (src->storage_owner != src
+        || col_rel_storage_alias_borrow_count(src) != 0
+        || src->retained_reservation.identity
+        != &src->retained_reservation
+        || atomic_load_explicit(&src->retained_reservation.state,
+        memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+        || src->retained_reservation.bytes != 0
+        || src->retained_reserved_bytes != 0) {
+        rc = EBUSY;
+        goto fail;
+    }
+    heap = (col_rel_t *)calloc(1, sizeof(*heap));
+    if (!heap) {
+        rc = ENOMEM;
+        goto fail;
+    }
+    wl_columnar_memory_reservation_init(&heap->retained_reservation);
+    session_pool_rel_transfer_payload(heap, src);
+    wl_columnar_source_access_gate_init(&heap->source_access);
+    wl_columnar_source_access_gate_init(&heap->descriptor_access);
+    heap->pool_owned = false;
+    heap->storage_owner = heap;
+    heap->storage_owner_identity = heap->relation_identity;
+    heap->storage_owner_generation = heap->storage_generation;
+    memset(src, 0, offsetof(col_rel_t, retained_reservation));
+    memset((char *)src + offsetof(col_rel_t, retained_reserved_bytes), 0,
+        offsetof(col_rel_t, storage_alias_borrows)
+        - offsetof(col_rel_t, retained_reserved_bytes));
+    src->pool_owned = true;
+    src->relation_identity = 0;
+    src->view_generation = WL_COLUMNAR_REL_GENERATION_INVALID;
+    src->storage_generation = WL_COLUMNAR_REL_GENERATION_INVALID;
+    src->storage_owner = NULL;
+    atomic_store_explicit(&src->storage_alias_borrows, 0,
+        memory_order_relaxed);
+    wl_columnar_memory_reservation_init(&src->retained_reservation);
+    /* The pool slot remains permanently closed until pool reset/reuse. */
+    descriptor_writer.owner = NULL;
+    owner_writer.owner = NULL;
+    *heap_out = heap;
     return 0;
+
+fail:
+    (void)wl_columnar_source_access_writer_release(&owner_writer);
+    (void)wl_columnar_source_access_writer_release(&descriptor_writer);
+    return rc;
+}
+
+static void
+session_pool_rel_rollback(col_rel_t *src, col_rel_t *heap)
+{
+    session_pool_rel_transfer_payload(src, heap);
+    src->pool_owned = true;
+    src->storage_owner = src;
+    src->storage_owner_identity = src->relation_identity;
+    src->storage_owner_generation = src->storage_generation;
+    wl_columnar_source_access_gate_init(&src->source_access);
+    wl_columnar_source_access_gate_init(&src->descriptor_access);
+    free(heap);
 }
 
 int
@@ -464,17 +612,10 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
      * session, because col_session_destroy calls free() on each entry. */
     col_rel_t *pool_src = NULL;
     if (r->pool_owned) {
-        col_rel_t *heap = (col_rel_t *)calloc(1, sizeof(col_rel_t));
-        if (!heap)
-            return ENOMEM;
-        *heap = *r;
-        heap->pool_owned = false;
-        heap->storage_owner = heap;
-        heap->storage_owner_identity = heap->relation_identity;
-        heap->storage_owner_generation = heap->storage_generation;
-        heap->storage_alias_borrows = 0;
-        /* Zero out source slot so pool_reset doesn't double-free contents */
-        memset(r, 0, sizeof(*r));
+        col_rel_t *heap = NULL;
+        int promote_rc = session_pool_rel_promote(r, &heap);
+        if (promote_rc != 0)
+            return promote_rc;
         pool_src = r;
         r = heap;
     }
@@ -545,15 +686,8 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
     return 0;
 
 busy:
-    if (pool_src) {
-        *pool_src = *r;
-        pool_src->pool_owned = true;
-        pool_src->storage_owner = pool_src;
-        pool_src->storage_owner_identity = pool_src->relation_identity;
-        pool_src->storage_owner_generation = pool_src->storage_generation;
-        pool_src->storage_alias_borrows = 0;
-        free(r);
-    }
+    if (pool_src)
+        session_pool_rel_rollback(pool_src, r);
     return EBUSY;
 
 oom:
@@ -568,13 +702,7 @@ oom:
      * col_rel_pool_new_auto(), which sets pool_owned and arena_owned
      * together. */
     if (pool_src) {
-        *pool_src = *r;
-        pool_src->pool_owned = true;
-        pool_src->storage_owner = pool_src;
-        pool_src->storage_owner_identity = pool_src->relation_identity;
-        pool_src->storage_owner_generation = pool_src->storage_generation;
-        pool_src->storage_alias_borrows = 0;
-        free(r);
+        session_pool_rel_rollback(pool_src, r);
     }
     return ENOMEM;
 }
@@ -1894,7 +2022,8 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
     return 0;
 
 oom:
-    session_destroy_relation_array(sess->rels, sess->nrels);
+    (void)session_destroy_relation_array_pass(sess->rels, sess->nrels, true);
+    (void)session_destroy_relation_array_pass(sess->rels, sess->nrels, false);
     free((void *)sess->rels);
     wl_workqueue_destroy(sess->wq);       /* NULL-safe */
     delta_pool_destroy(sess->delta_pool); /* NULL-safe */
@@ -1982,20 +2111,49 @@ col_session_destroy(wl_session_t *session)
     /* Admission is closed and all backend operations are quiescent before
      * this vtable entry is called.  Finish any submit-only or in-flight batch
      * while its worker/view/relation/allocator contexts are still alive. */
-    if (sess->wq)
+    if (sess->wq) {
+#ifdef WL_SESSION_TEST_HOOKS
+        wl_session_testhook_before_workqueue_drain(&sess->base);
+#endif
         (void)wl_workqueue_drain(sess->wq);
+    }
     /* Worker views may borrow coordinator relation storage.  Drain workers
      * before coordinator relations so their owner borrows are released before
      * the coordinator root is destroyed. */
     if (sess->tdd_workers) {
-        for (uint32_t w = sess->tdd_workers_count; w > 0; w--)
-            col_worker_session_destroy(&sess->tdd_workers[w - 1]);
+        for (uint32_t w = sess->tdd_workers_count; w > 0; w--) {
+            int destroy_rc = col_worker_session_destroy(
+                &sess->tdd_workers[w - 1]);
+            if (destroy_rc != 0) {
+                fprintf(stderr,
+                    "wirelog: worker teardown failed during session "
+                    "destroy (worker=%u, rc=%d)\n", w - 1, destroy_rc);
+                abort();
+            }
+        }
         free(sess->tdd_workers);
         sess->tdd_workers = NULL;
         sess->tdd_workers_count = 0;
     }
-    wl_columnar_session_source_leases_release_all(sess);
-    session_destroy_relation_array(sess->rels, sess->nrels);
+    int lease_rc = wl_columnar_session_source_leases_release_all(sess);
+#ifdef WL_SESSION_TEST_HOOKS
+    wl_session_testhook_after_worker_lease_release(&sess->base);
+#endif
+    int relation_alias_rc = session_destroy_relation_array_pass(sess->rels,
+            sess->nrels, true);
+    int pool_alias_rc = col_rel_pool_destroy_aliases_checked(
+        sess->delta_pool, 0,
+        sess->delta_pool ? sess->delta_pool->slot_used : 0);
+    int relation_root_rc = session_destroy_relation_array_pass(sess->rels,
+            sess->nrels, false);
+    int pool_root_rc = col_rel_pool_destroy_roots_checked(sess->delta_pool,
+            0, sess->delta_pool ? sess->delta_pool->slot_used : 0);
+    if (lease_rc != 0 || relation_alias_rc != 0 || pool_alias_rc != 0
+        || relation_root_rc != 0 || pool_root_rc != 0) {
+        fputs("wirelog: relation teardown failed during session destroy\n",
+            stderr);
+        abort();
+    }
     free((void *)sess->rels);
     /* Free relation name hash table (Issue #281) */
     session_rel_free_hash(sess);
@@ -2018,19 +2176,6 @@ col_session_destroy(wl_session_t *session)
     col_session_free_sorted_arrangements(sess);
     col_session_free_diff_arrangements(sess);
     col_session_free_filt_arrangements(sess);
-    /* Free contents of pool-allocated relations before bulk destroy.
-     * delta_pool_destroy frees the slab/arena but skips individually
-     * malloc'd members (name, columns, col_names, row_scratch). */
-    {
-        delta_pool_t *dp = sess->delta_pool;
-        if (dp) {
-            for (uint32_t s = 0; s < dp->slot_used; s++) {
-                col_rel_t *pr = (col_rel_t *)(dp->slab
-                    + (size_t)s * dp->slot_size);
-                col_rel_free_contents(pr);
-            }
-        }
-    }
     ledger_credit_allocators(sess); /* Issue #1380 */
     delta_pool_destroy(sess->delta_pool);
     wl_arena_free(sess->eval_arena);
@@ -2112,6 +2257,10 @@ col_worker_session_create(wl_col_session_t *coordinator,
 {
     if (!coordinator || !out_worker || (!partitions && num_partitions > 0))
         return EINVAL;
+    /* Worker storage is reusable only after a complete destroy. A refused
+     * teardown leaves ownership in place and permanently closes this worker. */
+    if (out_worker->teardown_started)
+        return EBUSY;
 
     /* Step 1: Bitwise copy — copies all value fields (frontiers,
      * counters, booleans, plan pointer, frontier_ops). */
@@ -2120,6 +2269,8 @@ col_worker_session_create(wl_col_session_t *coordinator,
     /* Step 2: Set identity fields */
     out_worker->worker_id = worker_id;
     out_worker->coordinator = coordinator;
+    out_worker->teardown_started = false;
+    out_worker->teardown_reported = false;
     out_worker->memory_governor = coordinator->memory_governor;
     wl_columnar_memory_governor_ref_retain(out_worker->memory_governor);
     out_worker->extension_expr_status = 0;
@@ -2321,8 +2472,10 @@ col_worker_session_create(wl_col_session_t *coordinator,
     return 0;
 
 cleanup:
-    col_worker_session_destroy(out_worker);
-    return ENOMEM;
+    {
+        int destroy_rc = col_worker_session_destroy(out_worker);
+        return destroy_rc != 0 ? destroy_rc : ENOMEM;
+    }
 }
 
 /*
@@ -2330,12 +2483,15 @@ cleanup:
  * Free all resources owned by a worker session.
  * See internal.h for full documentation.
  */
-void
+int
 col_worker_session_destroy(wl_col_session_t *worker)
 {
     if (!worker)
-        return;
+        return 0;
+    worker->teardown_started = true;
     wl_columnar_delta_events_clear(worker);
+    if (worker->filt_cache_active_pins != 0)
+        return EBUSY;
 
     /* Issue #1380: worker ledgers are independent copies with their own
      * allocations and peaks.  Take a final gauge sample, fold the peak into
@@ -2343,13 +2499,73 @@ col_worker_session_destroy(wl_col_session_t *worker)
      * and print the full worker breakdown only at WL_MEM_REPORT=2 -- TDD
      * workers are torn down after every stratum, so per-worker lines are
      * noisy at level 1. */
-    col_session_mem_sample(worker);
-    col_session_mem_note_worker(worker->coordinator, worker);
+    if (!worker->teardown_reported) {
+        col_session_mem_sample(worker);
+        col_session_mem_note_worker(worker->coordinator, worker);
+        worker->teardown_reported = true;
+    }
     if (worker->mem_report_level >= 2) {
         fprintf(stderr, "[wirelog mem] scope=worker id=%u workers=%u\n",
             worker->worker_id, worker->num_workers);
         wl_mem_ledger_report(&worker->mem_ledger);
     }
+
+    /* Release the worker's own source leases before retiring its aliases. */
+    int rc = wl_columnar_session_source_leases_release_all(worker);
+    if (rc != 0) {
+        fprintf(stderr,
+            "wirelog: worker source-lease teardown failed "
+            "(worker=%u, rc=%d)\n", worker->worker_id, rc);
+        return rc;
+    }
+    uint32_t pool_slot_limit = worker->delta_pool
+        ? worker->delta_pool->slot_used : 0;
+    int relation_alias_rc = session_destroy_relation_array_pass(
+        worker->rels, worker->nrels, true);
+    int pool_alias_rc = col_rel_pool_destroy_aliases_checked(
+        worker->delta_pool, 0, pool_slot_limit);
+    int relation_root_rc = session_destroy_relation_array_pass(
+        worker->rels, worker->nrels, false);
+    int pool_root_rc = col_rel_pool_destroy_roots_checked(
+        worker->delta_pool, 0, pool_slot_limit);
+    if (relation_alias_rc != 0 || pool_alias_rc != 0
+        || relation_root_rc != 0 || pool_root_rc != 0) {
+        fprintf(stderr,
+            "wirelog: worker relation teardown refused "
+            "(worker=%u, aliases=%d/%d roots=%d/%d)\n",
+            worker->worker_id, relation_alias_rc, pool_alias_rc,
+            relation_root_rc, pool_root_rc);
+        return relation_alias_rc != 0 ? relation_alias_rc
+            : pool_alias_rc != 0 ? pool_alias_rc
+            : relation_root_rc != 0 ? relation_root_rc : pool_root_rc;
+    }
+
+    free((void *)worker->rels);
+    worker->rels = NULL;
+    worker->nrels = 0;
+    worker->rel_cap = 0;
+
+    /* A filtered result can be held by an operation-scoped reader too. Keep
+     * its cache entry intact when checked destruction refuses so teardown
+     * can be retried after that reader releases its lease. */
+    for (uint32_t i = 0; i < worker->filt_cache_count; i++) {
+        if (!worker->filt_cache[i].filtered)
+            continue;
+        rc = col_rel_destroy_checked(worker->filt_cache[i].filtered);
+        if (rc != 0)
+            return rc;
+        worker->filt_cache[i].filtered = NULL;
+    }
+    for (uint32_t i = 0; i < worker->filt_cache_count; i++) {
+        free(worker->filt_cache[i].rel_name);
+        worker->filt_cache[i].rel_name = NULL;
+        free(worker->filt_cache[i].filter_data);
+        worker->filt_cache[i].filter_data = NULL;
+    }
+    free(worker->filt_cache);
+    worker->filt_cache = NULL;
+    worker->filt_cache_count = 0;
+    worker->filt_cache_cap = 0;
 
     /* Free mat_cache entries (all worker-owned since zeroed at create) */
     col_mat_cache_release_pins(&worker->mat_cache);
@@ -2370,30 +2586,11 @@ col_worker_session_destroy(wl_col_session_t *worker)
     col_session_free_diff_arrangements(worker);
     col_session_free_filt_arrangements(worker);
 
-    /* Drop persistent source readers before destroying the worker relations
-     * that borrowed those sources. */
-    wl_columnar_session_source_leases_release_all(worker);
-
-    /* Free owned relations (partition data) */
-    session_destroy_relation_array(worker->rels, worker->nrels);
-    free((void *)worker->rels);
-
     /* Free hash table (may have been lazily built) */
     session_rel_free_hash(worker);
 
     /* Free allocators (all NULL-safe) */
     wl_workqueue_destroy(worker->wq);
-    /* Free contents of pool-allocated relations before bulk destroy. */
-    {
-        delta_pool_t *dp = worker->delta_pool;
-        if (dp) {
-            for (uint32_t s = 0; s < dp->slot_used; s++) {
-                col_rel_t *pr = (col_rel_t *)(dp->slab
-                    + (size_t)s * dp->slot_size);
-                col_rel_free_contents(pr);
-            }
-        }
-    }
     ledger_credit_allocators(worker); /* Issue #1380 */
     delta_pool_destroy(worker->delta_pool);
     wl_arena_free(worker->eval_arena);
@@ -2404,20 +2601,11 @@ col_worker_session_destroy(wl_col_session_t *worker)
     if (worker->compound_borrow.arena)
         (void)wl_compound_arena_borrow_release(&worker->compound_borrow);
 
-    /* Issue #386: Free filtered relation cache (workers own their own copy) */
-    assert(worker->filt_cache_active_pins == 0);
-    for (uint32_t i = 0; i < worker->filt_cache_count; i++) {
-        free(worker->filt_cache[i].rel_name);
-        free(worker->filt_cache[i].filter_data);
-        if (worker->filt_cache[i].filtered)
-            col_rel_destroy(worker->filt_cache[i].filtered);
-    }
-    free(worker->filt_cache);
-
     wl_columnar_memory_governor_ref_release(worker->memory_governor);
 
     /* Zero the struct to prevent dangling pointer use */
     memset(worker, 0, sizeof(*worker));
+    return 0;
 }
 
 int
@@ -3179,7 +3367,7 @@ col_session_clear_idb_rows(const wl_plan_t *plan, wl_col_session_t *sess)
                 continue;
             col_rel_t *owner = NULL;
             rc = col_rel_storage_owner_resolve(r, &owner);
-            if (rc != 0 || owner->storage_alias_borrows > 0) {
+            if (rc != 0) {
                 rc = rc != 0 ? rc : EBUSY;
                 goto cleanup;
             }
@@ -3218,6 +3406,19 @@ col_session_clear_idb_rows(const wl_plan_t *plan, wl_col_session_t *sess)
             &owners[i]->source_access, &writers[i]);
         if (rc != 0)
             goto cleanup;
+    }
+
+    /* Reset admission must use the alias count protected by each acquired
+     * owner writer, not the earlier collection-time observation. */
+    for (uint32_t i = 0; i < target_count; i++) {
+        col_rel_t *owner = NULL;
+        rc = col_rel_storage_owner_resolve(targets[i], &owner);
+        if (rc != 0)
+            goto cleanup;
+        if (col_rel_storage_alias_borrow_count(owner) > 0) {
+            rc = EBUSY;
+            goto cleanup;
+        }
     }
 
     /* Every writer is held: all logical resets below are non-fallible. */

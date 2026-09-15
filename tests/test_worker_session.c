@@ -22,9 +22,14 @@
 #include "../wirelog/wirelog.h"
 
 #include <errno.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(_WIN32) && !defined(_WIN64)
+#include <sched.h>
+#include <time.h>
+#endif
 
 /* ======================================================================== */
 /* Test Harness                                                             */
@@ -1916,13 +1921,760 @@ test_worker_alias_chain_checked_teardown(void)
     return 0;
 }
 
+static int
+test_storage_alias_borrow_accounting(void)
+{
+    col_rel_t *owner = col_rel_new_auto("alias-count", 1);
+    TEST("storage alias borrow accounting is atomic and checked");
+    if (!owner) {
+        FAIL("owner allocation");
+        return 1;
+    }
+
+    int ok = col_rel_storage_alias_borrow_count(owner) == 0
+        && col_rel_storage_alias_borrow_acquire(owner) == 0
+        && col_rel_storage_alias_borrow_count(owner) == 1
+        && col_rel_storage_alias_borrow_release(owner) == 0
+        && col_rel_storage_alias_borrow_count(owner) == 0
+        && col_rel_storage_alias_borrow_release(owner) == EINVAL
+        && col_rel_storage_alias_borrow_count(owner) == 0;
+    atomic_store_explicit(&owner->storage_alias_borrows, UINT64_MAX,
+        memory_order_relaxed);
+    ok = ok && col_rel_storage_alias_borrow_acquire(owner) == EOVERFLOW
+        && col_rel_storage_alias_borrow_count(owner) == UINT64_MAX;
+    atomic_store_explicit(&owner->storage_alias_borrows, 0,
+        memory_order_relaxed);
+    col_rel_destroy(owner);
+    if (!ok) {
+        FAIL("checked borrow accounting");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+static int
+test_pool_relation_promotion_tombstones_source(void)
+{
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *coord = make_coordinator(&plan, &prog);
+    TEST("pool relation promotion leaves a closed source tombstone");
+    if (!coord) {
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("coordinator creation");
+        return 1;
+    }
+
+    col_rel_t *pool_rel = col_rel_pool_new_auto(coord->delta_pool, NULL,
+            "pool-move-tombstone", 1);
+    int64_t row[] = { 42 };
+    if (!pool_rel || col_rel_append_row(pool_rel, row) != 0) {
+        cleanup_coordinator(coord, plan, prog);
+        FAIL("pool relation allocation or insert");
+        return 1;
+    }
+    col_rel_t *pool_slot = pool_rel;
+    int rc = session_add_rel(coord, pool_rel);
+    col_rel_t *promoted = session_find_rel(coord, "pool-move-tombstone");
+    int ok = rc == 0 && promoted && promoted != pool_slot
+        && !promoted->pool_owned && promoted->nrows == 1
+        && promoted->columns[0][0] == 42
+        && promoted->storage_owner == promoted
+        && promoted->storage_alias_borrows == 0
+        && promoted->retained_reservation.identity
+        == &promoted->retained_reservation
+        && atomic_load_explicit(&promoted->retained_reservation.state,
+            memory_order_relaxed) == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+        && pool_slot->relation_identity == 0
+        && pool_slot->storage_owner == NULL
+        && atomic_load_explicit(&pool_slot->source_access.state,
+            memory_order_acquire) == WL_COLUMNAR_SOURCE_ACCESS_WRITER
+        && atomic_load_explicit(&pool_slot->descriptor_access.state,
+            memory_order_acquire) == WL_COLUMNAR_SOURCE_ACCESS_WRITER
+        && pool_slot->retained_reservation.identity
+        == &pool_slot->retained_reservation
+        && atomic_load_explicit(&pool_slot->retained_reservation.state,
+            memory_order_relaxed) == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY;
+
+    cleanup_coordinator(coord, plan, prog);
+    if (!ok) {
+        FAIL("promoted payload or closed source tombstone");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+static int
+test_worker_teardown_refusal_is_retryable(void)
+{
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *coord = make_coordinator(&plan, &prog);
+    wl_col_session_t worker;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    memset(&worker, 0, sizeof(worker));
+    TEST("worker teardown refusal preserves retryable alias state");
+    if (!coord) {
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("coordinator creation");
+        return 1;
+    }
+
+    col_rel_t *source = session_find_rel(coord, "edge");
+    col_rel_t *alias_a = col_rel_new_auto("edge-a",
+            source ? source->ncols : 1u);
+    col_rel_t *alias_b = col_rel_new_auto("edge-b",
+            source ? source->ncols : 1u);
+    col_rel_t *parts[] = { alias_a, alias_b };
+    int ok = source != NULL && alias_a != NULL && alias_b != NULL
+        && col_rel_install_shared_view(alias_a, source) == 0
+        && col_rel_install_shared_view(alias_b, source) == 0
+        && col_worker_session_create(coord, 0, parts, 2, &worker) == 0
+        && col_rel_source_reader_acquire(alias_b, &reader) == 0;
+    if (!ok) {
+        if (reader.owner)
+            (void)col_rel_source_reader_release(&reader);
+        if (worker.coordinator)
+            (void)col_worker_session_destroy(&worker);
+        else {
+            col_rel_destroy(alias_a);
+            col_rel_destroy(alias_b);
+        }
+        cleanup_coordinator(coord, plan, prog);
+        FAIL("reader or worker setup");
+        return 1;
+    }
+
+    int first_rc = col_worker_session_destroy(&worker);
+    ok = first_rc == EBUSY && worker.teardown_started
+        && worker.rels != NULL && worker.nrels == 2
+        && worker.rels[0] == NULL && worker.rels[1] == alias_b
+        && worker.source_leases == NULL
+        && col_rel_storage_alias_borrow_count(source) == 1;
+    int reuse_rc = col_worker_session_create(coord, 0, NULL, 0, &worker);
+    ok = ok && reuse_rc == EBUSY && worker.teardown_started
+        && worker.rels != NULL && worker.rels[1] == alias_b;
+    if (col_rel_source_reader_release(&reader) != 0)
+        ok = 0;
+    int retry_rc = col_worker_session_destroy(&worker);
+    ok = ok && retry_rc == 0 && worker.coordinator == NULL
+        && col_rel_storage_alias_borrow_count(source) == 0;
+
+    cleanup_coordinator(coord, plan, prog);
+    if (!ok) {
+        FAIL("refusal discarded worker ownership or retry failed");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+static int
+test_pool_alias_teardown_refusal_is_retryable(void)
+{
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *coord = make_coordinator(&plan, &prog);
+    TEST("pool root teardown refusal preserves slots for retry");
+    if (!coord || !coord->delta_pool) {
+        if (coord)
+            cleanup_coordinator(coord, plan, prog);
+        else {
+            wl_plan_free(plan);
+            wirelog_program_free(prog);
+        }
+        FAIL("coordinator pool creation");
+        return 1;
+    }
+
+    delta_pool_t *pool = coord->delta_pool;
+    uint32_t first_slot = pool->slot_used;
+    col_rel_t *root = col_rel_pool_new_auto(pool, NULL,
+            "pool-alias-owner", 1);
+    int64_t value = 73;
+    int append_rc = root ? col_rel_append_row(root, &value) : EINVAL;
+    int borrow_rc = append_rc == 0
+        ? col_rel_storage_alias_borrow_acquire(root) : EINVAL;
+    int ok = root != NULL && append_rc == 0 && borrow_rc == 0;
+    if (!ok) {
+        fprintf(stderr,
+            "pool root setup failed (root=%p append=%d borrow=%d used=%u)\n",
+            (void *)root, append_rc, borrow_rc, pool->slot_used);
+        cleanup_coordinator(coord, plan, prog);
+        FAIL("pool root setup");
+        return 1;
+    }
+    uint32_t slot_limit = pool->slot_used;
+    int alias_rc = col_rel_pool_destroy_aliases_checked(pool, first_slot,
+            slot_limit);
+    int root_rc = col_rel_pool_destroy_roots_checked(pool, first_slot,
+            slot_limit);
+    ok = ok && alias_rc == 0 && root_rc == EBUSY
+        && pool->slot_used == slot_limit
+        && col_rel_storage_alias_borrow_count(root) == 1
+        && root->nrows == 1 && root->columns[0][0] == value;
+
+    if (col_rel_storage_alias_borrow_release(root) != 0)
+        ok = false;
+    int retry_alias_rc = col_rel_pool_destroy_aliases_checked(pool,
+            first_slot, slot_limit);
+    int retry_root_rc = col_rel_pool_destroy_roots_checked(pool,
+            first_slot, slot_limit);
+    wl_columnar_source_access_reader_t retired_reader = { 0 };
+    int retired_reader_rc = col_rel_source_reader_acquire(root,
+            &retired_reader);
+    uint64_t retired_source_gate = atomic_load_explicit(
+        &root->source_access.state, memory_order_acquire);
+    uint64_t retired_descriptor_gate = atomic_load_explicit(
+        &root->descriptor_access.state, memory_order_acquire);
+    ok = ok && retry_alias_rc == 0 && retry_root_rc == 0
+        && pool->slot_used == slot_limit
+        && root->relation_identity == 0 && root->storage_owner == NULL
+        && retired_reader_rc == EBUSY
+        && retired_source_gate == WL_COLUMNAR_SOURCE_ACCESS_WRITER
+        && retired_descriptor_gate == WL_COLUMNAR_SOURCE_ACCESS_WRITER;
+
+    if (!ok) {
+        fprintf(stderr,
+            "pool alias cleanup rc=%d/%d retry=%d/%d slots=%u:%u "
+            "root=%llu borrows=%llu\n", alias_rc, root_rc,
+            retry_alias_rc, retry_root_rc, first_slot, slot_limit,
+            (unsigned long long)(root ? root->relation_identity : 0),
+            (unsigned long long)(root
+                ? col_rel_storage_alias_borrow_count(root) : 0));
+        cleanup_coordinator(coord, plan, prog);
+        FAIL("refusal destroyed backing storage or pool retry failed");
+        return 1;
+    }
+    cleanup_coordinator(coord, plan, prog);
+    PASS();
+    return 0;
+}
+
+static int
+test_pool_relation_promotion_rejects_live_children(void)
+{
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *coord = make_coordinator(&plan, &prog);
+    TEST("pool root with a live alias borrow cannot be relocated");
+    if (!coord) {
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("coordinator creation");
+        return 1;
+    }
+
+    col_rel_t *root = col_rel_pool_new_auto(coord->delta_pool, NULL,
+            "pool-move-root", 1);
+    int ok = root != NULL;
+    if (ok)
+        ok = col_rel_storage_alias_borrow_acquire(root) == 0;
+    int rc = ok ? session_add_rel(coord, root) : EINVAL;
+    ok = ok && rc == EBUSY && root->pool_owned
+        && root->storage_owner == root
+        && col_rel_storage_alias_borrow_count(root) == 1;
+
+    if (root && col_rel_storage_alias_borrow_count(root) == 1)
+        ok = ok && col_rel_storage_alias_borrow_release(root) == 0;
+    cleanup_coordinator(coord, plan, prog);
+    if (!ok) {
+        FAIL("root relocation changed a live child alias");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+static int
+test_pool_relation_promotion_rollback_restores_token_identity(void)
+{
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *coord = make_coordinator(&plan, &prog);
+    wl_columnar_source_access_reader_t reader = { 0 };
+    TEST("failed pool relation promotion restores source tokens");
+    if (!coord) {
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("coordinator creation");
+        return 1;
+    }
+
+    col_rel_t *old = col_rel_new_auto("pool-move-rollback", 1);
+    col_rel_t *pool_rel = col_rel_pool_new_auto(coord->delta_pool, NULL,
+            "pool-move-rollback", 1);
+    int64_t row[] = { 7 };
+    int ok = old != NULL && pool_rel != NULL;
+    if (ok)
+        ok = col_rel_append_row(pool_rel, row) == 0
+            && session_add_rel(coord, old) == 0
+            && col_rel_source_reader_acquire(old, &reader) == 0;
+    int rc = ok ? session_add_rel(coord, pool_rel) : EINVAL;
+    ok = ok && rc == EBUSY && pool_rel->pool_owned
+        && pool_rel->relation_identity != 0
+        && pool_rel->storage_owner == pool_rel
+        && pool_rel->nrows == 1 && pool_rel->columns[0][0] == 7
+        && col_rel_storage_alias_borrow_count(pool_rel) == 0
+        && pool_rel->retained_reservation.identity
+        == &pool_rel->retained_reservation
+        && atomic_load_explicit(&pool_rel->retained_reservation.state,
+            memory_order_relaxed) == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+        && atomic_load_explicit(&pool_rel->source_access.state,
+            memory_order_acquire) == 0
+        && atomic_load_explicit(&pool_rel->descriptor_access.state,
+            memory_order_acquire) == 0;
+    if (reader.owner && col_rel_source_reader_release(&reader) != 0)
+        ok = 0;
+
+    cleanup_coordinator(coord, plan, prog);
+    if (!ok) {
+        FAIL("pool relation rollback lost payload or token identity");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+static int
+test_shared_view_publication_respects_destination_owner_writer(void)
+{
+    col_rel_t *dst = col_rel_new_auto("publish-dst", 1);
+    col_rel_t *src = col_rel_new_auto("publish-src", 1);
+    wl_columnar_source_access_writer_t writer = { 0 };
+    TEST("shared-view publication respects destination owner writer");
+    if (!dst || !src) {
+        col_rel_destroy(dst);
+        col_rel_destroy(src);
+        FAIL("relation allocation");
+        return 1;
+    }
+    if (wl_columnar_source_access_writer_acquire(&dst->source_access,
+        &writer) != 0) {
+        col_rel_destroy(dst);
+        col_rel_destroy(src);
+        FAIL("destination writer acquire");
+        return 1;
+    }
+
+    int rc = col_rel_install_shared_view(dst, src);
+    int ok = rc == EBUSY && dst->storage_owner == dst
+        && col_rel_storage_alias_borrow_count(dst) == 0
+        && col_rel_storage_alias_borrow_count(src) == 0;
+    if (wl_columnar_source_access_writer_release(&writer) != 0)
+        ok = 0;
+    if (col_rel_install_shared_view(dst, src) != 0
+        || dst->storage_owner != src
+        || col_rel_storage_alias_borrow_count(src) != 1)
+        ok = 0;
+    col_rel_destroy(dst);
+    col_rel_destroy(src);
+    if (!ok) {
+        FAIL("destination writer exclusion or transactional retry");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+static int
+test_alias_descriptor_reader_blocks_publication(void)
+{
+    col_rel_t *owner_a = col_rel_new_auto("alias-reader-a", 1);
+    col_rel_t *owner_b = col_rel_new_auto("alias-reader-b", 1);
+    col_rel_t *alias = col_rel_new_auto("alias-reader-view", 1);
+    wl_columnar_source_access_reader_t reader = { 0 };
+    TEST("same-alias reader excludes shared-view publication");
+    if (!owner_a || !owner_b || !alias) {
+        col_rel_destroy(owner_a);
+        col_rel_destroy(owner_b);
+        col_rel_destroy(alias);
+        FAIL("relation allocation");
+        return 1;
+    }
+    if (col_rel_install_shared_view(alias, owner_a) != 0
+        || col_rel_source_reader_acquire(alias, &reader) != 0) {
+        col_rel_destroy(alias);
+        col_rel_destroy(owner_a);
+        col_rel_destroy(owner_b);
+        FAIL("initial alias publication or reader acquire");
+        return 1;
+    }
+
+    int rc = col_rel_install_shared_view(alias, owner_b);
+    int ok = rc == EBUSY && alias->storage_owner == owner_a
+        && col_rel_storage_alias_borrow_count(owner_a) == 1
+        && col_rel_storage_alias_borrow_count(owner_b) == 0;
+    if (col_rel_source_reader_release(&reader) != 0)
+        ok = 0;
+    if (rc == EBUSY
+        && (col_rel_install_shared_view(alias, owner_b) != 0
+        || alias->storage_owner != owner_b
+        || col_rel_storage_alias_borrow_count(owner_a) != 0
+        || col_rel_storage_alias_borrow_count(owner_b) != 1))
+        ok = 0;
+    col_rel_destroy(alias);
+    col_rel_destroy(owner_a);
+    col_rel_destroy(owner_b);
+    if (!ok) {
+        FAIL("same-alias reader exclusion or retry");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+static int
+test_peer_owner_reader_does_not_block_alias_retirement(void)
+{
+    col_rel_t *owner = col_rel_new_auto("peer-reader-owner", 1);
+    col_rel_t *alias = col_rel_new_auto("peer-reader-alias", 1);
+    wl_columnar_source_access_reader_t peer_reader = { 0 };
+    TEST("peer owner reader does not block alias retirement");
+    if (!owner || !alias) {
+        col_rel_destroy(owner);
+        col_rel_destroy(alias);
+        FAIL("relation allocation");
+        return 1;
+    }
+    if (col_rel_install_shared_view(alias, owner) != 0
+        || col_rel_source_reader_acquire(owner, &peer_reader) != 0) {
+        col_rel_destroy(alias);
+        col_rel_destroy(owner);
+        FAIL("initial alias publication or peer reader acquire");
+        return 1;
+    }
+
+    int rc = col_rel_destroy_checked(alias);
+    int ok = rc == 0
+        && col_rel_storage_alias_borrow_count(owner) == 0
+        && owner->columns != NULL
+        && col_rel_destroy_checked(owner) == EBUSY;
+    if (col_rel_source_reader_release(&peer_reader) != 0)
+        ok = 0;
+    if (col_rel_destroy_checked(owner) != 0)
+        ok = 0;
+    if (!ok) {
+        FAIL("peer lease lifetime or alias retirement");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+typedef struct alias_borrow_thread_args {
+    col_rel_t *owner;
+    int failed;
+} alias_borrow_thread_args_t;
+
+typedef struct peer_reader_teardown_args {
+    col_rel_t *owner;
+    atomic_bool ready;
+    atomic_bool retiring;
+    atomic_bool done;
+    atomic_uint_fast64_t reads_during_retirement;
+    int rc;
+} peer_reader_teardown_args_t;
+
+static uint64_t
+peer_test_now_ms(void)
+{
+#if defined(_WIN32) || defined(_WIN64)
+    return (uint64_t)GetTickCount64();
+#else
+    struct timespec now;
+    if (timespec_get(&now, TIME_UTC) != TIME_UTC)
+        return 0;
+    return (uint64_t)now.tv_sec * 1000u
+           + (uint64_t)now.tv_nsec / 1000000u;
+#endif
+}
+
+static void
+peer_test_yield(void)
+{
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_yield();
+#elif defined(_WIN32) || defined(_WIN64)
+    SwitchToThread();
+#else
+    sched_yield();
+#endif
+}
+
+static bool
+peer_test_wait_bool(const atomic_bool *value)
+{
+    uint64_t start = peer_test_now_ms();
+    while (!atomic_load_explicit(value, memory_order_acquire)) {
+        if (peer_test_now_ms() - start >= 5000u)
+            return false;
+        peer_test_yield();
+    }
+    return true;
+}
+
+static bool
+peer_test_wait_reads(const atomic_uint_fast64_t *value)
+{
+    uint64_t start = peer_test_now_ms();
+    while (atomic_load_explicit(value, memory_order_acquire) == 0) {
+        if (peer_test_now_ms() - start >= 5000u)
+            return false;
+        peer_test_yield();
+    }
+    return true;
+}
+
+static void *
+exercise_peer_reads_during_alias_retirement(void *opaque)
+{
+    peer_reader_teardown_args_t *args
+        = (peer_reader_teardown_args_t *)opaque;
+    wl_columnar_source_access_reader_t reader = { 0 };
+
+    args->rc = col_rel_source_reader_acquire(args->owner, &reader);
+    if (args->rc != 0) {
+        /* Wake the coordinator on every admission outcome, not only success. */
+        atomic_store_explicit(&args->ready, true, memory_order_release);
+        return NULL;
+    }
+    atomic_store_explicit(&args->ready, true, memory_order_release);
+    while (!atomic_load_explicit(&args->done, memory_order_acquire)) {
+        volatile uint32_t rows = args->owner->nrows;
+        volatile int64_t value = rows > 0
+            ? args->owner->columns[0][0] : 0;
+        uint64_t alias_borrows
+            = col_rel_storage_alias_borrow_count(args->owner);
+        (void)value;
+        (void)alias_borrows;
+        if (atomic_load_explicit(&args->retiring, memory_order_acquire))
+            atomic_fetch_add_explicit(&args->reads_during_retirement, 1,
+                memory_order_relaxed);
+    }
+    args->rc = col_rel_source_reader_release(&reader);
+    return NULL;
+}
+
+static int
+test_peer_reader_acquire_failure_signals_completion(void)
+{
+    col_rel_t *owner = col_rel_new_auto("peer-reader-failure-owner", 1);
+    wl_columnar_source_access_writer_t writer = { 0 };
+    wl_thread_t reader_thread;
+    peer_reader_teardown_args_t args = { .owner = owner };
+    TEST("peer reader acquire failure signals completion");
+    if (!owner || col_rel_source_writer_acquire(owner, &writer) != 0) {
+        col_rel_destroy(owner);
+        FAIL("owner allocation or writer acquire");
+        return 1;
+    }
+    atomic_init(&args.ready, false);
+    atomic_init(&args.retiring, false);
+    atomic_init(&args.done, false);
+    atomic_init(&args.reads_during_retirement, 0);
+    if (wl_thread_create(&reader_thread,
+        exercise_peer_reads_during_alias_retirement, &args) != 0) {
+        (void)wl_columnar_source_access_writer_release(&writer);
+        col_rel_destroy(owner);
+        FAIL("reader thread creation");
+        return 1;
+    }
+    if (!peer_test_wait_bool(&args.ready)) {
+        atomic_store_explicit(&args.done, true, memory_order_release);
+        (void)wl_thread_join(&reader_thread);
+        (void)wl_columnar_source_access_writer_release(&writer);
+        col_rel_destroy(owner);
+        FAIL("reader thread did not publish admission result");
+        return 1;
+    }
+    atomic_store_explicit(&args.done, true, memory_order_release);
+    int thread_result = wl_thread_join(&reader_thread);
+    int writer_rc = wl_columnar_source_access_writer_release(&writer);
+    int ok = thread_result == 0 && writer_rc == 0 && args.rc == EBUSY;
+    col_rel_destroy(owner);
+    if (!ok) {
+        FAIL("failed reader admission did not terminate and report EBUSY");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+static int
+test_peer_reads_race_alias_retirement(void)
+{
+    enum { ALIAS_COUNT = 64 };
+    col_rel_t *owner = col_rel_new_auto("peer-read-race-owner", 1);
+    col_rel_t *aliases[ALIAS_COUNT] = { 0 };
+    int64_t row[] = { 73 };
+    wl_thread_t reader_thread;
+    peer_reader_teardown_args_t args = { .owner = owner };
+    TEST("peer reads overlap alias retirement and borrow accounting");
+    if (!owner || col_rel_append_row(owner, row) != 0) {
+        col_rel_destroy(owner);
+        FAIL("owner allocation or row insert");
+        return 1;
+    }
+    for (uint32_t i = 0; i < ALIAS_COUNT; i++) {
+        aliases[i] = col_rel_new_auto("peer-read-race-alias", 1);
+        if (!aliases[i]
+            || col_rel_install_shared_view(aliases[i], owner) != 0) {
+            for (uint32_t j = 0; j < i; j++)
+                col_rel_destroy(aliases[j]);
+            col_rel_destroy(aliases[i]);
+            col_rel_destroy(owner);
+            FAIL("alias setup");
+            return 1;
+        }
+    }
+    atomic_init(&args.ready, false);
+    atomic_init(&args.retiring, false);
+    atomic_init(&args.done, false);
+    atomic_init(&args.reads_during_retirement, 0);
+    if (wl_thread_create(&reader_thread,
+        exercise_peer_reads_during_alias_retirement, &args) != 0) {
+        for (uint32_t i = 0; i < ALIAS_COUNT; i++)
+            col_rel_destroy(aliases[i]);
+        col_rel_destroy(owner);
+        FAIL("reader thread creation");
+        return 1;
+    }
+    if (!peer_test_wait_bool(&args.ready)) {
+        atomic_store_explicit(&args.done, true, memory_order_release);
+        (void)wl_thread_join(&reader_thread);
+        for (uint32_t i = 0; i < ALIAS_COUNT; i++)
+            col_rel_destroy(aliases[i]);
+        col_rel_destroy(owner);
+        FAIL("reader thread did not publish admission result");
+        return 1;
+    }
+    if (args.rc != 0) {
+        atomic_store_explicit(&args.done, true, memory_order_release);
+        int thread_result = wl_thread_join(&reader_thread);
+        for (uint32_t i = 0; i < ALIAS_COUNT; i++)
+            col_rel_destroy(aliases[i]);
+        col_rel_destroy(owner);
+        FAIL(thread_result == 0
+            ? "reader thread failed source admission"
+            : "reader thread join failed after source admission error");
+        return 1;
+    }
+    atomic_store_explicit(&args.retiring, true, memory_order_release);
+    if (!peer_test_wait_reads(&args.reads_during_retirement)) {
+        atomic_store_explicit(&args.done, true, memory_order_release);
+        int thread_result = wl_thread_join(&reader_thread);
+        for (uint32_t i = 0; i < ALIAS_COUNT; i++)
+            col_rel_destroy(aliases[i]);
+        col_rel_destroy(owner);
+        FAIL(thread_result == 0
+            ? "reader did not overlap alias retirement"
+            : "reader join failed after overlap timeout");
+        return 1;
+    }
+
+    int ok = 1;
+    for (uint32_t i = 0; i < ALIAS_COUNT; i++) {
+        if (col_rel_destroy_checked(aliases[i]) != 0
+            || col_rel_storage_alias_borrow_count(owner)
+            != ALIAS_COUNT - i - 1u) {
+            ok = 0;
+            break;
+        }
+        aliases[i] = NULL;
+    }
+    atomic_store_explicit(&args.done, true, memory_order_release);
+    int thread_result = wl_thread_join(&reader_thread);
+    for (uint32_t i = 0; i < ALIAS_COUNT; i++)
+        col_rel_destroy(aliases[i]);
+    ok = ok && args.rc == 0 && thread_result == 0
+        && atomic_load_explicit(&args.reads_during_retirement,
+            memory_order_relaxed) > 0
+        && col_rel_storage_alias_borrow_count(owner) == 0
+        && atomic_load_explicit(&owner->source_access.state,
+            memory_order_acquire) == 0
+        && col_rel_destroy_checked(owner) == 0;
+    if (!ok) {
+        FAIL("peer read/retirement overlap or borrow accounting");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+#if defined(WL_HAVE_C11_THREADS)
+static int
+exercise_alias_borrow_accounting(void *opaque)
+{
+    alias_borrow_thread_args_t *args =
+        (alias_borrow_thread_args_t *)opaque;
+    for (uint32_t i = 0; i < 1000; i++) {
+        if (col_rel_storage_alias_borrow_acquire(args->owner) != 0
+            || col_rel_storage_alias_borrow_release(args->owner) != 0) {
+            args->failed = 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+#endif
+
+static int
+test_storage_alias_borrow_concurrent_accounting(void)
+{
+    TEST("concurrent storage alias borrow accounting stays balanced");
+#if defined(WL_HAVE_C11_THREADS)
+    col_rel_t *owner = col_rel_new_auto("alias-count-threaded", 1);
+    thrd_t threads[2];
+    alias_borrow_thread_args_t args[2];
+    int thread_rc[2] = { 0, 0 };
+    if (!owner) {
+        FAIL("owner allocation");
+        return 1;
+    }
+    for (uint32_t i = 0; i < 2; i++) {
+        args[i] = (alias_borrow_thread_args_t){ owner, 0 };
+        if (thrd_create(&threads[i], exercise_alias_borrow_accounting,
+            &args[i]) != thrd_success) {
+            for (uint32_t j = 0; j < i; j++)
+                (void)thrd_join(threads[j], &thread_rc[j]);
+            col_rel_destroy(owner);
+            FAIL("thread creation");
+            return 1;
+        }
+    }
+    for (uint32_t i = 0; i < 2; i++)
+        (void)thrd_join(threads[i], &thread_rc[i]);
+    int ok = !args[0].failed && !args[1].failed
+        && thread_rc[0] == 0 && thread_rc[1] == 0
+        && col_rel_storage_alias_borrow_count(owner) == 0;
+    col_rel_destroy(owner);
+    if (!ok) {
+        FAIL("concurrent checked borrow accounting");
+        return 1;
+    }
+#else
+    printf(" ... SKIP: C11 threads unavailable\n");
+    return 0;
+#endif
+    PASS();
+    return 0;
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
 int
-main(void)
+main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--peer-reader-admission-failure") == 0)
+        return test_peer_reader_acquire_failure_signals_completion();
+
     printf("Per-Worker Session State Tests (Issue #315)\n");
 
     test_create_destroy();
@@ -1950,6 +2702,18 @@ main(void)
     test_rdf_graph_metadata_auto_created_when_any_graph_column();
     test_rdf_graph_metadata_absent_when_no_graph_column();
     test_worker_alias_chain_checked_teardown();
+    test_worker_teardown_refusal_is_retryable();
+    test_pool_alias_teardown_refusal_is_retryable();
+    test_pool_relation_promotion_tombstones_source();
+    test_pool_relation_promotion_rejects_live_children();
+    test_pool_relation_promotion_rollback_restores_token_identity();
+    test_storage_alias_borrow_accounting();
+    test_shared_view_publication_respects_destination_owner_writer();
+    test_alias_descriptor_reader_blocks_publication();
+    test_peer_owner_reader_does_not_block_alias_retirement();
+    test_peer_reader_acquire_failure_signals_completion();
+    test_peer_reads_race_alias_retirement();
+    test_storage_alias_borrow_concurrent_accounting();
 
     printf("\nPassed: %d/%d\n", tests_passed, tests_run);
     printf("Failed: %d/%d\n", tests_failed, tests_run);
