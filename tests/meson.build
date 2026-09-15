@@ -878,6 +878,10 @@ test('ci_pr_build_timeout_contract', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-ci-pr-build-timeouts.py'],
      suite: 'abi')
 
+test('branch_protection_contract', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-branch-protection-contract.py'],
+     suite: 'abi')
+
 # Issue #1464: every shell-seeded test registered in this file must carry an
 # explicit positive timeout that is not Meson's 30s default (see the rule
 # above `sh = find_program('bash', ...)`).  Registered outside `if sh.found()`
