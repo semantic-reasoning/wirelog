@@ -319,8 +319,6 @@ col_diff_join_batch_producer_create(wl_col_session_t *sess,
             rk, kc, &p->pin);
     if (rc != 0)
         goto fail;
-    (void)col_rel_source_reader_release(&p->source_reader);
-    p->source_reader_active = false;
     p->arr = p->pin.arr;
     ocols = col_join_output_width(left, right, op);
     p->batch = col_rel_new_auto("$diff_join_batch", ocols);
