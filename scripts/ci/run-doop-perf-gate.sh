@@ -12,6 +12,7 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # in README DOOP row is repeat=1, not the required 5-repetition calibration.
 # A runner must record its 5-rep median and pass median*1.05 here.
 WL_DOOP_PERF_GATE_TARGET_MS="${WL_DOOP_PERF_GATE_TARGET_MS:-}"
+WIRELOG_DOOP_PERF_MODE="${WIRELOG_DOOP_PERF_MODE:-strict-stable}"
 WORKERS=8
 REPEAT=5
 
@@ -26,6 +27,11 @@ required_or_skip() {
 
 [[ "${WIRELOG_PERF_GATE:-0}" == 1 ]] || \
     skip "set WIRELOG_PERF_GATE=1 to run on dedicated performance hardware"
+
+case "$WIRELOG_DOOP_PERF_MODE" in
+    required-hosted|strict-stable) ;;
+    *) fail "unknown DOOP performance mode: $WIRELOG_DOOP_PERF_MODE" ;;
+esac
 
 # The shipped stability contract is Linux cpufreq-specific.  In particular,
 # do not turn a Windows release build's inherited PERF_REQUIRE setting into a
@@ -42,18 +48,22 @@ if [[ "${WIRELOG_PERF_LOG_COMPILE_MAX_LEVEL:-1}" -gt 1 ]]; then
     skip "log compile ceiling is above ERROR"
 fi
 
-governor_file="${WIRELOG_DOOP_PERF_GATE_GOVERNOR_FILE:-/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor}"
-if [[ "${WIRELOG_PERF_REQUIRE:-0}" == 1 ]]; then
-    if [[ ! -r "$governor_file" ]]; then
-        fail "WIRELOG_PERF_REQUIRE=1 but cpufreq governor is unavailable"
+if [[ "$WIRELOG_DOOP_PERF_MODE" == strict-stable ]]; then
+    governor_file="${WIRELOG_DOOP_PERF_GATE_GOVERNOR_FILE:-/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor}"
+    if [[ "${WIRELOG_PERF_REQUIRE:-0}" == 1 ]]; then
+        if [[ ! -r "$governor_file" ]]; then
+            fail "WIRELOG_PERF_REQUIRE=1 but cpufreq governor is unavailable"
+        fi
+        governor=$(<"$governor_file")
+        [[ "$governor" == performance ]] || \
+            fail "WIRELOG_PERF_REQUIRE=1 but cpufreq governor is '$governor'"
+    else
+        [[ -r "$governor_file" ]] || skip "cpufreq governor is unavailable"
+        [[ "$(<"$governor_file")" == performance ]] || \
+            skip "cpufreq governor is not 'performance'"
     fi
-    governor=$(<"$governor_file")
-    [[ "$governor" == performance ]] || \
-        fail "WIRELOG_PERF_REQUIRE=1 but cpufreq governor is '$governor'"
 else
-    [[ -r "$governor_file" ]] || skip "cpufreq governor is unavailable"
-    [[ "$(<"$governor_file")" == performance ]] || \
-        skip "cpufreq governor is not 'performance'"
+    governor_file="${WIRELOG_DOOP_PERF_GATE_GOVERNOR_FILE:-/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor}"
 fi
 
 data_dir="${WIRELOG_DOOP_DATA_DIR:-bench/data/doop}"
@@ -62,8 +72,10 @@ bench_bin="${WIRELOG_DOOP_BENCH_BIN:-bench/bench_flowlog}"
     required_or_skip "DOOP data directory not found: $data_dir"
 [[ -x "$bench_bin" ]] || fail "bench_flowlog not found or not executable: $bench_bin"
 
-[[ -n "$WL_DOOP_PERF_GATE_TARGET_MS" ]] || \
-    required_or_skip "no calibrated 5-repetition W=8 target; set WL_DOOP_PERF_GATE_TARGET_MS"
+if [[ "$WIRELOG_DOOP_PERF_MODE" == strict-stable ]]; then
+    [[ -n "$WL_DOOP_PERF_GATE_TARGET_MS" ]] || \
+        required_or_skip "no calibrated 5-repetition W=8 target; set WL_DOOP_PERF_GATE_TARGET_MS"
+fi
 
 oracle_file="$script_dir/../release/downstream-matrix-oracles.tsv"
 [[ -r "$oracle_file" ]] || \
@@ -189,13 +201,24 @@ actual_manifest=$(doop_dataset_manifest "$data_dir")
     fail "DOOP dataset files manifest $actual_manifest != oracle $expected_manifest"
 
 tmp=$(mktemp)
-trap 'rm -f "$tmp"' EXIT
+progress=$(mktemp)
+trap 'rm -f "$tmp" "$progress"' EXIT
 set +e
 "$bench_bin" --workload doop --data-doop "$data_dir" \
-    --workers "$WORKERS" --repeat "$REPEAT" >"$tmp" 2>&1
+    --workers "$WORKERS" --repeat "$REPEAT" \
+    --repeat-progress "$progress" >"$tmp" 2>&1
 status=$?
 set -e
 (( status == 0 )) || fail "bench_flowlog DOOP run failed (exit $status); see output below\n$(<"$tmp")"
+
+cat "$tmp"
+cat "$progress"
+[[ "$(grep -c '^repeat_start.*repeat=5.*workers=8$' "$progress")" == 5 ]] || \
+    fail "DOOP repetition evidence does not contain five starts"
+[[ "$(grep -c '^repeat_complete.*status=OK' "$progress")" == 5 ]] || \
+    fail "DOOP repetition evidence does not contain five successful completions"
+grep -Eq '^DONE.*repeat=5.*workers=8.*status=OK$' "$progress" || \
+    fail "DOOP repetition evidence has no successful DONE record"
 
 row=$(awk -F '\t' '$1 == "doop" { print; exit }' "$tmp")
 [[ -n "$row" ]] || fail "bench_flowlog produced no DOOP result row"
@@ -213,9 +236,16 @@ IFS=$'\t' read -r workload _ facts workers repeat min_ms median_ms max_ms rss tu
     fail "iteration count $iters != sentinel $EXPECTED_ITERS"
 
 [[ "$result" == OK ]] || fail "DOOP result status is '$result'"
-if ! awk -v value="$median_ms" -v target="$WL_DOOP_PERF_GATE_TARGET_MS" \
-    'BEGIN { exit !(value + 0 <= target + 0) }'; then
-    fail "median ${median_ms} ms exceeds target ${WL_DOOP_PERF_GATE_TARGET_MS} ms"
+timing_status=enforced
+if [[ "$WIRELOG_DOOP_PERF_MODE" == strict-stable ]]; then
+    if ! awk -v value="$median_ms" -v target="$WL_DOOP_PERF_GATE_TARGET_MS" \
+        'BEGIN { exit !(value + 0 <= target + 0) }'; then
+        fail "median ${median_ms} ms exceeds target ${WL_DOOP_PERF_GATE_TARGET_MS} ms"
+    fi
+else
+    timing_status=advisory
+    [[ -n "$WL_DOOP_PERF_GATE_TARGET_MS" ]] || \
+        WL_DOOP_PERF_GATE_TARGET_MS=unconfigured
 fi
 
-echo "doop_w8_gate OK: tuples=$tuples iterations=$iters median_ms=$median_ms target_ms=$WL_DOOP_PERF_GATE_TARGET_MS"
+echo "doop_w8_gate OK: tuples=$tuples iterations=$iters workers=$workers repeat=$repeat median_ms=$median_ms target_ms=$WL_DOOP_PERF_GATE_TARGET_MS timing=$timing_status mode=$WIRELOG_DOOP_PERF_MODE"

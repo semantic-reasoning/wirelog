@@ -2178,12 +2178,12 @@ test('crdt_correctness_full', test_crdt_perf_gate_exe,
        'WIRELOG_CRDT_DATA_DIR=' + meson.project_source_root() / 'bench/data/crdt',
      ])
 
-# Issue #1351: keep the authoritative stable-path evidence checker under test.
-# This deterministic fixture ensures that removing DOOP from the workflow, or
-# allowing a SKIP record, cannot silently restore a green required gate.
+# Issue #1351: keep the authoritative hosted DOOP evidence checker under test.
+# This deterministic fixture ensures that removing DOOP, allowing a SKIP, or
+# changing W=8/repeat=5 cannot silently restore a green required gate.
 if host_machine.system() == 'linux' and sh.found()
-  test('check_perf_gate_execution', sh,
-       args: [meson.project_source_root() / 'scripts/ci/test-check-perf-gate-execution.sh'],
+  test('check_doop_perf_gate_execution', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-check-doop-perf-gate-execution.sh'],
        suite: 'abi',
        timeout: 120)
 endif
