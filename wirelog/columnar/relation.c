@@ -264,7 +264,7 @@ col_rel_storage_owner_destroy_status(const col_rel_t *owner)
 /* Legacy descriptors can predate storage_owner metadata. Initialize that
  * metadata only under descriptor exclusion; never reinitialize their access
  * gates, since a writer sentinel marks terminal teardown. */
-static int
+int
 col_rel_storage_owner_ensure_initialized(col_rel_t *rel)
 {
     wl_columnar_source_access_writer_t descriptor_writer = { 0 };
@@ -3132,8 +3132,9 @@ wl_columnar_relation_install_shared_view_with_lease(col_rel_t *dst,
         && (destination_lease->owner != &destination_owner->source_access
         || destination_lease->identity != (uintptr_t)destination_lease
         || !destination_lease->transferable
-        || destination_lease->thread_valid))
+        || destination_lease->thread_valid)){
         return EINVAL;
+    }
     if (!same_owner) {
         rc = col_rel_source_reader_acquire(owner, &source_reader);
         if (rc != 0)
@@ -3181,7 +3182,122 @@ wl_columnar_relation_install_shared_view_with_lease(col_rel_t *dst,
 int
 col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
 {
-    return wl_columnar_relation_install_shared_view_with_lease(dst, src, NULL);
+    wl_columnar_source_access_reader_t source_owner_reader = { 0 };
+    wl_columnar_source_access_writer_t dst_descriptor_writer = { 0 };
+    wl_columnar_source_access_writer_t dst_owner_writer = { 0 };
+    wl_columnar_source_access_gate_t *src_descriptor;
+    wl_columnar_source_access_gate_t *dst_descriptor;
+    col_rel_t *source_owner = NULL;
+    col_rel_t *dst_owner = NULL;
+    bool src_descriptor_reader = false;
+    bool dst_descriptor_first = false;
+    bool source_owner_reader_held = false;
+    bool dst_owner_writer_held = false;
+    bool dst_owner_first = false;
+    int rc;
+
+    if (!dst || !src || dst == src)
+        return EINVAL;
+    rc = col_rel_storage_owner_ensure_initialized((col_rel_t *)src);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_storage_owner_ensure_initialized(dst);
+    if (rc != 0)
+        return rc;
+    src_descriptor =
+        (wl_columnar_source_access_gate_t *)&src->descriptor_access;
+    dst_descriptor = &dst->descriptor_access;
+    if ((uintptr_t)src_descriptor < (uintptr_t)dst_descriptor) {
+        rc = wl_columnar_source_access_gate_reader_acquire(src_descriptor);
+        if (rc != 0)
+            return rc;
+        src_descriptor_reader = true;
+        rc = wl_columnar_source_access_writer_acquire(dst_descriptor,
+                &dst_descriptor_writer);
+    } else {
+        dst_descriptor_first = true;
+        rc = wl_columnar_source_access_writer_acquire(dst_descriptor,
+                &dst_descriptor_writer);
+        if (rc == 0) {
+            rc = wl_columnar_source_access_gate_reader_acquire(src_descriptor);
+            if (rc == 0)
+                src_descriptor_reader = true;
+        }
+    }
+    if (rc != 0)
+        goto cleanup;
+    rc = col_rel_storage_owner_resolve(src, &source_owner);
+    if (rc != 0)
+        goto cleanup;
+    rc = col_rel_storage_owner_resolve(dst, &dst_owner);
+    if (rc != 0)
+        goto cleanup;
+    if (dst_owner == dst && source_owner == dst) {
+        rc = EINVAL;
+        goto cleanup;
+    }
+    if (dst_owner == dst) {
+        dst_owner_first = (uintptr_t)&dst_owner->source_access
+            < (uintptr_t)&source_owner->source_access;
+        if (dst_owner_first) {
+            rc = wl_columnar_source_access_writer_acquire(
+                &dst_owner->source_access, &dst_owner_writer);
+            if (rc != 0)
+                goto cleanup;
+            dst_owner_writer_held = true;
+        }
+        rc = wl_columnar_source_access_reader_acquire(
+            &source_owner->source_access, &source_owner_reader);
+        if (rc != 0)
+            goto cleanup;
+        source_owner_reader_held = true;
+        if (!dst_owner_first) {
+            rc = wl_columnar_source_access_writer_acquire(
+                &dst_owner->source_access, &dst_owner_writer);
+            if (rc != 0)
+                goto cleanup;
+            dst_owner_writer_held = true;
+        }
+    } else {
+        rc = wl_columnar_source_access_reader_acquire(
+            &source_owner->source_access, &source_owner_reader);
+        if (rc != 0)
+            goto cleanup;
+        source_owner_reader_held = true;
+    }
+    if (dst_owner == dst
+        && col_rel_storage_alias_borrow_count(dst_owner) != 0) {
+        rc = EBUSY;
+        goto cleanup;
+    }
+    rc = col_rel_install_shared_view_unprotected(dst, src);
+
+cleanup:
+    if (dst_owner_first && source_owner_reader_held
+        && wl_columnar_source_access_reader_release(&source_owner_reader) != 0
+        && rc == 0)
+        rc = EINVAL;
+    if (dst_owner_writer_held
+        && wl_columnar_source_access_writer_release(&dst_owner_writer) != 0
+        && rc == 0)
+        rc = EINVAL;
+    if (!dst_owner_first && source_owner_reader_held
+        && wl_columnar_source_access_reader_release(&source_owner_reader) != 0
+        && rc == 0)
+        rc = EINVAL;
+    if (dst_descriptor_first && src_descriptor_reader
+        && wl_columnar_source_access_gate_reader_release(src_descriptor) != 0
+        && rc == 0)
+        rc = EINVAL;
+    if (dst_descriptor_writer.owner
+        && wl_columnar_source_access_writer_release(
+            &dst_descriptor_writer) != 0 && rc == 0)
+        rc = EINVAL;
+    if (!dst_descriptor_first && src_descriptor_reader
+        && wl_columnar_source_access_gate_reader_release(src_descriptor) != 0
+        && rc == 0)
+        rc = EINVAL;
+    return rc;
 }
 
 /* ---- column name lookup ------------------------------------------------- */

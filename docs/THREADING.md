@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **127**).
+match the script's count (currently **129**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -476,7 +476,7 @@ those slots and arena allocations are quiescent.
 | `source_access.h:wl_columnar_source_access_writer_release` | `gate->state` | `atomic_load_explicit` | acquire | Validate the writer state before terminal publication |
 | `source_access.h:wl_columnar_source_access_writer_release#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Publish writer payload completion and retry spurious failure |
 
-### 5.14 `wirelog/columnar/relation.c` and `session.c` — alias ownership and pool promotion (14 rows)
+### 5.14 `wirelog/columnar/relation.c` and `session.c` — alias ownership and pool promotion (16 rows)
 
 The canonical owner's flattened alias count uses `wl_atomic_u64` because a
 quiesced worker can retire its alias while unrelated readers still hold the
@@ -499,11 +499,13 @@ concurrent alias removals cannot underflow the count.
 | `relation.c:col_rel_destroy_checked#2` | `r->source_access.state` | `atomic_store_explicit` | release | Keep the retired pool slot closed until allocator reset or reuse |
 | `relation.c:col_rel_destroy_checked#3` | `r->descriptor_access.state` | `atomic_store_explicit` | release | Keep the retired descriptor closed until allocator reset or reuse |
 | `relation.c:col_rel_install_shared_view_unprotected` | `dst->storage_alias_borrows` | `atomic_store_explicit` | relaxed | A newly installed alias descriptor has no child aliases of its own |
+| `relation.c:wl_columnar_relation_install_shared_view_with_lease` | `destination_owner->source_access.state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Upgrade the session's sole transferable reader lease to an exclusive publication lease without admitting a competing reader |
+| `relation.c:wl_columnar_relation_install_shared_view_with_lease#2` | `destination_owner->source_access.state` | `atomic_exchange_explicit` | release | Restore the transferable reader lease after publication, including preparation-failure rollback |
 | `session.c:session_pool_rel_transfer_payload` | `dst->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Initialize the new heap descriptor without copying its source atomic |
 | `session.c:session_pool_rel_promote` | `src->retained_reservation.state` | `atomic_load_explicit` | acquire | Admit relocation only when the pool slot's address-bound reservation is empty |
 | `session.c:session_pool_rel_promote#2` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
-102 + 11 + 14 = **127 atomic call sites**.
+102 + 11 + 16 = **129 atomic call sites**.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -523,22 +525,7 @@ to both inputs so neither depends on the other's shape.
 `scripts/ci/test-threading-doc.sh` covers the CRLF inventory case through
 a stub helper.
 
-### 5.15 `wirelog/columnar/relation.c` — session shared-view lease upgrade (2 rows)
-
-Session-managed shared-view refresh may replace destination descriptors, so
-the destination owner's source gate must exclude concurrent readers. When the
-session lends its own transferable lifetime lease, the sole reader is
-atomically upgraded to the writer sentinel and restored after publication;
-additional readers make the upgrade fail without changing the gate. The
-release exchange restores the session's lifetime protection even when
-preparing the replacement fails.
-
-| Anchor (file:function[#N]) | Field | Op | Order | Justification |
-|---|---|---|---|---|
-| `relation.c:wl_columnar_relation_install_shared_view_with_lease` | `destination_owner->source_access.state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Upgrade exactly the session's sole transferable destination-owner reader; retry spurious failure and reject additional readers before replacing descriptors |
-| `relation.c:wl_columnar_relation_install_shared_view_with_lease#2` | `destination_owner->source_access.state` | `atomic_exchange_explicit` | release | Atomically restore the session lifetime reader after publication or preparation failure; MSVC requires an interlocked operation under `/volatile:iso` |
-
-### 5.16 `wirelog/columnar/relation.c` — canonical staged replacement (6 rows)
+### 5.15 `wirelog/columnar/relation.c` — canonical staged replacement (6 rows)
 
 Staged replacement builds a candidate descriptor beside the destination and
 publishes it in one step, under a source writer the caller already holds. Two

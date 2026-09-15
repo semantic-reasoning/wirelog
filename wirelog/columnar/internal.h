@@ -2404,6 +2404,7 @@ wl_columnar_relation_install_shared_view_with_lease(col_rel_t *dst,
  * responsibility of the follow-up lifecycle units. */
 int col_rel_storage_owner_resolve(const col_rel_t *src,
     col_rel_t **out_owner);
+int col_rel_storage_owner_ensure_initialized(col_rel_t *rel);
 int col_rel_storage_alias_release(col_rel_t *alias);
 uint64_t col_rel_storage_alias_borrow_count(const col_rel_t *owner);
 int col_rel_storage_alias_borrow_acquire(col_rel_t *owner);
