@@ -497,7 +497,6 @@ wl_columnar_session_install_shared_view(wl_col_session_t *sess,
         return rc == 0 ? 0 : EINVAL;
     }
 
-    rc = 0;
     if (source_descriptor_held
         && wl_columnar_source_access_gate_reader_release(source_descriptor)
         != 0)
