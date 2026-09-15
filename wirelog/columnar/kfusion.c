@@ -36,7 +36,12 @@ col_kfusion_drain(eval_stack_t *stack, wl_col_session_t *sess,
     int primary_rc)
 {
     int drain_rc = eval_stack_drain_to_session(stack, sess);
-    return primary_rc != 0 ? primary_rc : drain_rc;
+    if (drain_rc != 0) {
+        fprintf(stderr, "wirelog: K-Fusion stack cleanup failed: %d\n",
+            drain_rc);
+        abort();
+    }
+    return primary_rc;
 }
 
 static int
@@ -415,8 +420,26 @@ col_op_k_fusion_serial(const wl_plan_op_t *op, eval_stack_t *stack,
 cleanup:
     _phase_t0 = now_ns();
     for (uint32_t d = 0; d < n_results; d++) {
-        if (results[d])
-            col_rel_destroy(results[d]);
+        if (results[d]) {
+            bool eligible = wl_columnar_deferred_relation_eligible(
+                results[d]);
+            int destroy_rc = col_rel_destroy_checked(results[d]);
+            if (destroy_rc == EBUSY && eligible) {
+                int defer_rc = wl_columnar_session_defer_relation(sess,
+                        results[d]);
+                if (defer_rc != 0) {
+                    fprintf(stderr,
+                        "wirelog: K-Fusion serial deferred result admission failed: %d\n",
+                        defer_rc);
+                    abort();
+                }
+            } else if (destroy_rc != 0) {
+                fprintf(stderr,
+                    "wirelog: K-Fusion serial result cleanup failed: %d\n",
+                    destroy_rc);
+                abort();
+            }
+        }
     }
     /* Trim mat_cache back to pre-dispatch baseline. Entries added by branches
      * are owned by the cache and must be freed the same way the parallel path
@@ -850,22 +873,31 @@ cleanup_results:
     _phase_t0 = now_ns();
     for (uint32_t d = 0; d < live_count; d++) {
         if (results[d]) {
+            bool eligible = wl_columnar_deferred_relation_eligible(
+                results[d]);
             int destroy_rc = col_rel_destroy_checked(results[d]);
-            bool eligible = wl_columnar_deferred_relation_eligible(results[d]);
             if (destroy_rc == EBUSY && eligible) {
                 int defer_rc = wl_columnar_session_defer_relation(
                     &worker_sess[d], results[d]);
-                if (rc == 0 && defer_rc != 0)
-                    rc = defer_rc;
+                if (defer_rc != 0) {
+                    fprintf(stderr,
+                        "wirelog: K-Fusion deferred result admission failed: %d\n",
+                        defer_rc);
+                    abort();
+                }
             } else if (destroy_rc == EBUSY) {
                 /* A pool/arena result must never be kept past this worker's
                  * allocator lifetime.  Reader admission should make this
                  * unreachable; retain the invariant in debug builds. */
                 assert(eligible);
-                if (rc == 0)
-                    rc = EINVAL;
-            } else if (rc == 0 && destroy_rc != 0) {
-                rc = destroy_rc;
+                fprintf(stderr,
+                    "wirelog: K-Fusion refused unsafe busy result cleanup\n");
+                abort();
+            } else if (destroy_rc != 0) {
+                fprintf(stderr,
+                    "wirelog: K-Fusion result cleanup failed: %d\n",
+                    destroy_rc);
+                abort();
             }
         }
         rc = col_kfusion_drain(&workers[d].stack, &worker_sess[d], rc);
@@ -885,7 +917,12 @@ cleanup_wq:
         rc = col_kfusion_drain(&workers[d].stack, &worker_sess[d], rc);
         int deferred_rc = wl_columnar_session_retry_deferred(
             &worker_sess[d]);
-        assert(deferred_rc == 0);
+        if (deferred_rc != 0) {
+            int transfer_rc = wl_columnar_session_transfer_deferred(
+                &worker_sess[d], sess);
+            if (transfer_rc != 0)
+                abort();
+        }
         (void)wl_compound_arena_borrow_release(
             &worker_sess[d].compound_borrow);
         /* Issue #196: worker mat_cache starts empty (zeroed above), so ALL

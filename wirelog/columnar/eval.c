@@ -255,7 +255,7 @@ nonrec_rule_worker_fn(void *arg)
     if (ctx->rc != 0) {
         int drain_rc = eval_stack_drain_to_session(&stack,
                 ctx->worker_sess);
-        if (ctx->rc == 0 && drain_rc != 0)
+        if (drain_rc != 0)
             ctx->rc = drain_rc;
         return;
     }
@@ -266,9 +266,9 @@ nonrec_rule_worker_fn(void *arg)
             ctx->rc = ENOTSUP;
             int drain_rc = eval_stack_drain_to_session(&stack,
                     ctx->worker_sess);
-            if (ctx->rc == 0 && dispose_rc != 0)
+            if (dispose_rc != 0)
                 ctx->rc = dispose_rc;
-            if (ctx->rc == 0 && drain_rc != 0)
+            if (drain_rc != 0)
                 ctx->rc = drain_rc;
             return;
         }
@@ -1340,7 +1340,7 @@ tdd_worker_subpass_fn(void *arg)
                     sess->worker_id, rp->name ? rp->name : "(null)",
                     eff_iter, rc);
             int drain_rc = eval_stack_drain_to_session(&stack, sess);
-            if (drain_rc != 0 && rc == 0)
+            if (drain_rc != 0)
                 rc = drain_rc;
             ctx->rc = rc;
             free(snap);
@@ -1359,7 +1359,7 @@ tdd_worker_subpass_fn(void *arg)
             int drain_rc = eval_stack_drain_to_session(&stack, sess);
             int cleanup_rc = dispose_rc != 0 ? dispose_rc : drain_rc;
             ctx->rc = ENOTSUP;
-            if (cleanup_rc != 0 && ctx->rc == 0)
+            if (cleanup_rc != 0)
                 ctx->rc = cleanup_rc;
             free(snap);
             sess->tdd_subpass_active = saved_tdd_subpass;
