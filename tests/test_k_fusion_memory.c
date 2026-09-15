@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 /*
  * test_k_fusion_memory.c - K-Fusion Memory Isolation Tests (Issue #196)
  *
@@ -17,6 +19,7 @@
  */
 
 #include "../wirelog/columnar/columnar_nanoarrow.h"
+#include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/ir/program.h"
 #include "../wirelog/passes/fusion.h"
@@ -30,6 +33,38 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+static int
+wl_test_setenv_(const char *name, const char *value, int overwrite)
+{
+    (void)overwrite;
+    return _putenv_s(name, value ? value : "");
+}
+
+static int
+wl_test_unsetenv_(const char *name)
+{
+    return _putenv_s(name, "");
+}
+
+#  define setenv   wl_test_setenv_
+#  define unsetenv wl_test_unsetenv_
+#  define strdup   _strdup
+#endif
+
+static void
+wl_test_restore_env(const char *name, const char *saved, int was_set)
+{
+    if (was_set)
+        (void)setenv(name, saved ? saved : "", 1);
+    else
+        (void)unsetenv(name);
+}
+
+extern void
+wl_columnar_session_get_tdd_worker_width_stats(wl_session_t *sess,
+    uint32_t *out_last_active_workers, uint32_t *out_max_active_workers);
 
 /* ----------------------------------------------------------------
  * Test framework (matches wirelog convention)
@@ -92,7 +127,7 @@ count_tuples_cb(const char *relation, const int64_t *row, uint32_t ncols,
 
 static int
 run_program_workers(const char *src, const char *tracked_rel, uint32_t nworkers,
-    int64_t *out_count, uint32_t *out_iters)
+    int64_t *out_count, uint32_t *out_iters, uint32_t *out_max_workers)
 {
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(src, &err);
@@ -139,6 +174,9 @@ run_program_workers(const char *src, const char *tracked_rel, uint32_t nworkers,
         *out_count = ctx.rel_count;
     if (out_iters)
         *out_iters = col_session_get_iteration_count(sess);
+    if (out_max_workers)
+        wl_columnar_session_get_tdd_worker_width_stats(sess, NULL,
+            out_max_workers);
 
     wl_session_destroy(sess);
     wl_plan_free(plan);
@@ -164,7 +202,7 @@ test_k2_memory_opt_correctness(void)
         "r(x, z) :- r(x, y), r(y, z).\n";
 
     int64_t count = 0;
-    int rc = run_program_workers(src, "r", 1, &count, NULL);
+    int rc = run_program_workers(src, "r", 1, &count, NULL, NULL);
     ASSERT(rc == 0, "K=2 memory-opt program execution failed");
     ASSERT(count == 6,
         "K=2 memory-opt: expected 6 tuples from 3-edge chain closure");
@@ -188,8 +226,8 @@ test_k4_matches_k2(void)
         "r(x, z) :- r(x, y), r(y, z).\n";
 
     int64_t count_k2 = 0, count_k4 = 0;
-    int rc2 = run_program_workers(src, "r", 1, &count_k2, NULL);
-    int rc4 = run_program_workers(src, "r", 4, &count_k4, NULL);
+    int rc2 = run_program_workers(src, "r", 1, &count_k2, NULL, NULL);
+    int rc4 = run_program_workers(src, "r", 4, &count_k4, NULL, NULL);
 
     ASSERT(rc2 == 0, "K=2 program failed");
     ASSERT(rc4 == 0, "K=4 program failed");
@@ -218,7 +256,7 @@ test_k2_isolation_5node_chain(void)
         "reach(x, z) :- reach(x, y), reach(y, z).\n";
 
     int64_t count = 0;
-    int rc = run_program_workers(src, "reach", 1, &count, NULL);
+    int rc = run_program_workers(src, "reach", 1, &count, NULL, NULL);
     ASSERT(rc == 0, "5-node chain K=2 program failed");
     ASSERT(count == 10, "5-node chain K=2 should produce 10 tuples");
 
@@ -242,7 +280,7 @@ test_k2_empty_mat_cache_correctness(void)
 
     int64_t count = 0;
     uint32_t iters = 0;
-    int rc = run_program_workers(src, "r", 1, &count, &iters);
+    int rc = run_program_workers(src, "r", 1, &count, &iters, NULL);
     ASSERT(rc == 0, "2-cycle K=2 program failed");
     ASSERT(count == 4, "2-cycle K=2 should produce 4 tuples");
     ASSERT(iters <= 3, "2-cycle should converge within 3 iterations");
@@ -273,10 +311,93 @@ test_nonfused_materialized_join_cleanup(void)
         "Label(x, min(l)) :- Label(y, l), Label(y, m), Edge(y, x).\n";
 
     int64_t count = 0;
-    int rc = run_program_workers(src, "Label", 1, &count, NULL);
+    int rc = run_program_workers(src, "Label", 1, &count, NULL, NULL);
     ASSERT(rc == 0, "non-fused materialized recursive program failed");
     ASSERT(count == 4,
         "non-fused materialized recursive program should produce 4 rows");
+
+    PASS();
+}
+
+/* ================================================================
+ * Test 6: Materialized join ownership survives a worker subpass reset
+ *
+ * Both ordinary and differential recursive joins use materialized cache
+ * entries.  The cache must retain heap-owned results while the worker's
+ * delta pool and evaluation arena rotate between subpasses.
+ * ================================================================ */
+static void
+test_materialized_join_cache_survives_worker_reset(void)
+{
+    TEST("materialized join cache survives worker subpass reset");
+
+    const char *src = ".decl edge(x: int32, y: int32)\n"
+        "edge(1,2). edge(2,3). edge(3,1).\n"
+        ".decl r(x: int32, y: int32)\n"
+        ".output r\n"
+        "r(x,y) :- edge(x,y).\n"
+        "r(x,z) :- r(x,y), r(y,z).\n";
+    int64_t count = 0;
+    uint32_t iters = 0;
+    uint32_t max_workers = 0;
+    const char *saved_threshold = getenv(
+        "WL_MAT_CACHE_EVICT_THRESHOLD_PERCENT");
+    const char *saved_diff = getenv("WIRELOG_DIFF_ENABLED");
+    const char *saved_rows = getenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER");
+    const char *saved_global_read = getenv("WIRELOG_TDD_GLOBAL_READ");
+    int had_threshold = saved_threshold != NULL;
+    int had_diff = saved_diff != NULL;
+    int had_rows = saved_rows != NULL;
+    int had_global_read = saved_global_read != NULL;
+    char *threshold_copy = had_threshold ? strdup(saved_threshold) : NULL;
+    char *diff_copy = had_diff ? strdup(saved_diff) : NULL;
+    char *rows_copy = had_rows ? strdup(saved_rows) : NULL;
+    char *global_read_copy = had_global_read ? strdup(saved_global_read) : NULL;
+    int rc;
+
+    if ((had_threshold && !threshold_copy) || (had_diff && !diff_copy)
+        || (had_rows && !rows_copy)
+        || (had_global_read && !global_read_copy)) {
+        free(threshold_copy);
+        free(diff_copy);
+        free(rows_copy);
+        free(global_read_copy);
+        FAIL("materialized cache environment backup");
+    }
+    if (setenv("WL_MAT_CACHE_EVICT_THRESHOLD_PERCENT", "1", 1) != 0
+        || setenv("WIRELOG_DIFF_ENABLED", "1", 1) != 0
+        || setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1", 1) != 0
+        || setenv("WIRELOG_TDD_GLOBAL_READ", "0", 1) != 0) {
+        wl_test_restore_env("WL_MAT_CACHE_EVICT_THRESHOLD_PERCENT",
+            threshold_copy, had_threshold);
+        wl_test_restore_env("WIRELOG_DIFF_ENABLED", diff_copy, had_diff);
+        wl_test_restore_env("WIRELOG_TDD_MIN_ROWS_PER_WORKER", rows_copy,
+            had_rows);
+        wl_test_restore_env("WIRELOG_TDD_GLOBAL_READ", global_read_copy,
+            had_global_read);
+        free(threshold_copy);
+        free(diff_copy);
+        free(rows_copy);
+        free(global_read_copy);
+        FAIL("materialized cache environment setup");
+    }
+    rc = run_program_workers(src, "r", 4, &count, &iters, &max_workers);
+    wl_test_restore_env("WL_MAT_CACHE_EVICT_THRESHOLD_PERCENT",
+        threshold_copy, had_threshold);
+    wl_test_restore_env("WIRELOG_DIFF_ENABLED", diff_copy, had_diff);
+    wl_test_restore_env("WIRELOG_TDD_MIN_ROWS_PER_WORKER", rows_copy,
+        had_rows);
+    wl_test_restore_env("WIRELOG_TDD_GLOBAL_READ", global_read_copy,
+        had_global_read);
+    free(threshold_copy);
+    free(diff_copy);
+    free(rows_copy);
+    free(global_read_copy);
+
+    ASSERT(rc == 0, "materialized cache worker program failed");
+    ASSERT(count == 9, "3-cycle closure should contain 9 ordered pairs");
+    ASSERT(max_workers >= 2,
+        "materialized cache fixture must use multiple worker subpasses");
 
     PASS();
 }
@@ -295,6 +416,7 @@ main(void)
     test_k2_isolation_5node_chain();
     test_k2_empty_mat_cache_correctness();
     test_nonfused_materialized_join_cleanup();
+    test_materialized_join_cache_survives_worker_reset();
 
     printf("\nResults: %d/%d passed", pass_count, test_count);
     if (fail_count > 0)
