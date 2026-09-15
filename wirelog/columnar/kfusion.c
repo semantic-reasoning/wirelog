@@ -880,7 +880,14 @@ cleanup_wq:
         /* Free worker's private delta-arrangement cache (darr_*). */
         col_session_free_delta_arrangements(&worker_sess[d]);
         /* Free worker's private diff-arrangement cache (diff_arr_*). */
-        col_session_free_diff_arrangements(&worker_sess[d]);
+        int diff_rc = col_session_free_diff_arrangements(&worker_sess[d]);
+        assert(diff_rc == 0);
+        if (diff_rc != 0) {
+            WL_LOG(WL_LOG_SEC_SESSION, WL_LOG_ERROR,
+                "cannot free worker differential arrangements: %d",
+                diff_rc);
+            return diff_rc;
+        }
         /* Free worker's private filtered arrangement cache (filt_arr_*). */
         col_session_free_filt_arrangements(&worker_sess[d]);
         assert(worker_sess[d].filt_cache_active_pins == 0);

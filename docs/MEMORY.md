@@ -643,6 +643,20 @@ contract, not a public API or a general concurrent-reader mechanism.
 Differential, sorted and materialization-cache lifetimes, plus
 relation-generation validation, remain tracked separately in issue #1435.
 
+### Differential-arrangement leases
+
+Differential hash arrangements use a separate registry-entry lease because
+their row links refer to relation positions and are replaced transactionally.
+`col_session_pin_diff_arrangement()` acquires a source-reader lease and records
+the entry generation and source snapshot; `col_diff_arrangement_pin_release()`
+releases both exactly once. While a lease is active, source invalidation is
+deferred, registry growth that would relocate entries is refused, and
+differential transaction replacement returns `EBUSY`. The final release
+applies the deferred reset and advances the entry generation. A continuation
+must treat a generation or snapshot mismatch as stale and release the lease
+before session teardown. Session teardown also rejects any still-active
+differential pin or replacement transaction before destroying relations.
+
 ## 10a. Bounded join sub-batches (#1446)
 
 `WIRELOG_JOIN_BATCH_BYTES=N` (strict decimal, default unset = off) makes an
