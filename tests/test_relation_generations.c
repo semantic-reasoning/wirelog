@@ -3127,6 +3127,7 @@ test_staged_replacement_contract(void)
         && dst->storage_generation == storage_before
         && dst->retained_reserved_bytes == reserved_before,
         "replacement preparation leaves destination unchanged");
+
     CHECK(col_rel_commit_replacement_locked(dst, &replacement) == 0,
         "replacement commit succeeds");
     CHECK(dst->relation_identity == identity && dst->name == old_name
@@ -3285,6 +3286,268 @@ test_staged_replacement_contract(void)
     cleanup_relations();
 }
 
+static void
+test_staged_replacement_commit_fault(void)
+{
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    wl_columnar_memory_governor_t *governor = NULL;
+    col_rel_t *dst = NULL;
+    col_rel_t *candidate = NULL;
+    col_rel_t *retry_candidate = NULL;
+    col_rel_replacement_t replacement = { 0 };
+    unsigned char dst_snapshot[sizeof(col_rel_t)];
+    unsigned char staged_snapshot[sizeof(col_rel_t)];
+    col_rel_t *staged_before = NULL;
+    int64_t **staged_columns_before = NULL;
+    int64_t *staged_column_before = NULL;
+    wirelog_column_type_t *staged_types_before = NULL;
+    char **staged_names_before = NULL;
+    col_delta_timestamp_t *staged_timestamps_before = NULL;
+    uint32_t *staged_arity_before = NULL;
+    struct ArrowSchema staged_schema_before;
+    const void *reservation_identity_before = NULL;
+    wl_columnar_memory_governor_t *reservation_governor_before = NULL;
+    uint64_t reservation_bytes_before = 0;
+    uint64_t reservation_owner_before = 0;
+    uint64_t reservation_state_before = 0;
+    uint64_t reserved_bytes_before = 0;
+    wl_columnar_source_access_gate_t *writer_owner_before = NULL;
+    uintptr_t writer_identity_before = 0;
+    bool writer_thread_valid_before = false;
+    uint64_t writer_gate_state_before = 0;
+    int64_t *dst_column_before = NULL;
+    int64_t **dst_columns_before = NULL;
+    wirelog_column_type_t *dst_types_before = NULL;
+    char **dst_names_before = NULL;
+    col_delta_timestamp_t *dst_timestamps_before = NULL;
+    wl_mem_ledger_t *dst_ledger_before = NULL;
+    struct ArrowSchema dst_schema_before;
+    uint64_t dst_identity_before = 0;
+    uint64_t dst_view_before = 0;
+    uint64_t dst_storage_before = 0;
+    uint64_t dst_ledger_bytes_before = 0;
+    uint64_t dst_timestamp_ledger_before = 0;
+    uint64_t dst_retained_bytes_before = 0;
+    uint64_t dst_reservation_state_before = 0;
+    uint64_t dst_reservation_bytes_before = 0;
+    uint64_t dst_reservation_owner_before = 0;
+    wl_columnar_memory_governor_t *dst_reservation_governor_before = NULL;
+    uint64_t governor_reserved_before = 0;
+    uint64_t planned_bytes = 0;
+    bool replacement_prepared = false;
+    const char *failure = NULL;
+
+#define REPLACEMENT_CHECK(condition, message) \
+        do { \
+            if (!(condition)) { \
+                failure = (message); \
+                goto cleanup; \
+            } \
+        } while (0)
+
+    resolution.budget_bytes = 4096u;
+    resolution.usable_bytes = 4096u;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    dst = new_relation();
+    candidate = new_relation();
+    REPLACEMENT_CHECK(ref && dst && candidate, "fault injection setup");
+    governor = wl_columnar_memory_governor_ref_get(ref);
+    REPLACEMENT_CHECK(governor != NULL
+        && col_rel_attach_memory_governor(dst, ref) == 0,
+        "fault injection governor attachment");
+
+    {
+        const wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+        const col_rel_logical_col_t logical = {
+            WIRELOG_COMPOUND_KIND_SIDE, 2u, 1u
+        };
+        int64_t old_value = 11;
+        int64_t new_value = 29;
+        REPLACEMENT_CHECK(col_rel_append_row(dst, &old_value) == 0
+            && col_rel_set_column_types(candidate, &type, 1u) == 0
+            && col_rel_append_row(candidate, &new_value) == 0
+            && col_rel_enable_timestamps(candidate) == 0
+            && col_rel_apply_compound_schema(candidate, &logical, 1u) == 0,
+            "fault injection replacement data");
+    }
+
+    dst_identity_before = dst->relation_identity;
+    dst_view_before = dst->view_generation;
+    dst_storage_before = dst->storage_generation;
+    dst_column_before = dst->columns[0];
+    dst_columns_before = dst->columns;
+    dst_types_before = dst->column_types;
+    dst_names_before = dst->col_names;
+    dst_timestamps_before = dst->timestamps;
+    dst_ledger_before = dst->mem_ledger;
+    dst_schema_before = dst->schema;
+    dst_ledger_bytes_before = col_rel_owned_ledger_bytes(dst);
+    dst_timestamp_ledger_before = dst->ledger_ts_bytes;
+    dst_retained_bytes_before = dst->retained_reserved_bytes;
+    dst_reservation_state_before = atomic_load_explicit(
+        &dst->retained_reservation.state, memory_order_acquire);
+    dst_reservation_bytes_before = dst->retained_reservation.bytes;
+    dst_reservation_owner_before = atomic_load_explicit(
+        &dst->retained_reservation.owner_bits, memory_order_acquire);
+    dst_reservation_governor_before = dst->retained_reservation.governor;
+    governor_reserved_before = wl_columnar_memory_reserved(governor);
+
+    REPLACEMENT_CHECK(col_rel_prepare_replacement(dst, candidate, &replacement)
+        == 0, "fault injection replacement prepare");
+    replacement_prepared = true;
+    REPLACEMENT_CHECK(replacement.staged != NULL
+        && replacement.reservation_active && replacement.writer_acquired,
+        "fault injection replacement resources");
+    memcpy(dst_snapshot, dst, sizeof(dst_snapshot));
+    staged_before = replacement.staged;
+    staged_columns_before = staged_before->columns;
+    staged_column_before = staged_before->columns[0];
+    staged_types_before = staged_before->column_types;
+    staged_names_before = staged_before->col_names;
+    staged_timestamps_before = staged_before->timestamps;
+    staged_arity_before = staged_before->compound_arity_map;
+    staged_schema_before = staged_before->schema;
+    memcpy(staged_snapshot, staged_before, sizeof(staged_snapshot));
+    reservation_identity_before = replacement.reservation.identity;
+    reservation_governor_before = replacement.reservation.governor;
+    reservation_bytes_before = replacement.reservation.bytes;
+    reservation_owner_before = atomic_load_explicit(
+        &replacement.reservation.owner_bits, memory_order_acquire);
+    reservation_state_before = atomic_load_explicit(
+        &replacement.reservation.state, memory_order_acquire);
+    reserved_bytes_before = replacement.reserved_bytes;
+    writer_owner_before = replacement.writer.owner;
+    writer_identity_before = replacement.writer.identity;
+    writer_thread_valid_before = replacement.writer.thread_valid;
+    writer_gate_state_before = atomic_load_explicit(
+        &dst->source_access.state, memory_order_acquire);
+
+    REPLACEMENT_CHECK(writer_gate_state_before
+        == WL_COLUMNAR_SOURCE_ACCESS_WRITER
+        && replacement.reservation_active && replacement.writer_acquired,
+        "fault injection active replacement contract");
+    wl_columnar_replacement_commit_fail_once = true;
+    REPLACEMENT_CHECK(col_rel_commit_replacement_locked(dst, &replacement)
+        == EAGAIN, "fault injection returns EAGAIN");
+    REPLACEMENT_CHECK(dst->relation_identity == dst_identity_before
+        && memcmp(dst_snapshot, dst, sizeof(dst_snapshot)) == 0
+        && dst->nrows == 1u && dst->columns == dst_columns_before
+        && dst->columns[0] == dst_column_before
+        && dst->column_types == dst_types_before
+        && dst->col_names == dst_names_before
+        && dst->timestamps == dst_timestamps_before
+        && dst->mem_ledger == dst_ledger_before
+        && memcmp(&dst->schema, &dst_schema_before,
+        sizeof(dst_schema_before)) == 0
+        && dst->view_generation == dst_view_before
+        && dst->storage_generation == dst_storage_before
+        && col_rel_owned_ledger_bytes(dst) == dst_ledger_bytes_before
+        && dst->ledger_ts_bytes == dst_timestamp_ledger_before
+        && dst->retained_reserved_bytes == dst_retained_bytes_before
+        && atomic_load_explicit(&dst->retained_reservation.state,
+        memory_order_acquire) == dst_reservation_state_before
+        && dst->retained_reservation.bytes == dst_reservation_bytes_before
+        && atomic_load_explicit(&dst->retained_reservation.owner_bits,
+        memory_order_acquire) == dst_reservation_owner_before
+        && dst->retained_reservation.governor
+        == dst_reservation_governor_before,
+        "fault injection changed destination");
+    REPLACEMENT_CHECK(replacement.staged == staged_before
+        && memcmp(staged_snapshot, staged_before, sizeof(staged_snapshot)) == 0
+        && staged_before->columns == staged_columns_before
+        && staged_before->columns[0] == staged_column_before
+        && staged_before->column_types == staged_types_before
+        && staged_before->col_names == staged_names_before
+        && staged_before->timestamps == staged_timestamps_before
+        && staged_before->compound_arity_map == staged_arity_before
+        && memcmp(&staged_before->schema, &staged_schema_before,
+        sizeof(staged_schema_before)) == 0,
+        "fault injection changed staged relation");
+    REPLACEMENT_CHECK(replacement.reservation.identity
+        == reservation_identity_before
+        && replacement.reservation.governor == reservation_governor_before
+        && replacement.reservation.bytes == reservation_bytes_before
+        && atomic_load_explicit(&replacement.reservation.owner_bits,
+        memory_order_acquire) == reservation_owner_before
+        && atomic_load_explicit(&replacement.reservation.state,
+        memory_order_acquire) == reservation_state_before
+        && replacement.reserved_bytes == reserved_bytes_before
+        && replacement.writer.owner == writer_owner_before
+        && replacement.writer.identity == writer_identity_before
+        && replacement.writer.thread_valid == writer_thread_valid_before
+        && atomic_load_explicit(&dst->source_access.state,
+        memory_order_acquire) == writer_gate_state_before,
+        "fault injection changed replacement resources");
+
+    col_rel_discard_replacement(&replacement);
+    replacement_prepared = false;
+    REPLACEMENT_CHECK(replacement.staged == NULL
+        && !replacement.reservation_active && !replacement.writer_acquired
+        && replacement.reserved_bytes == 0
+        && atomic_load_explicit(&dst->source_access.state,
+        memory_order_acquire) == 0
+        && atomic_load_explicit(&replacement.reservation.state,
+        memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED
+        && wl_columnar_memory_reserved(governor) == governor_reserved_before,
+        "fault injection discard did not release resources");
+
+    retry_candidate = new_relation();
+    REPLACEMENT_CHECK(retry_candidate != NULL, "fault injection retry setup");
+    {
+        const wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+        const col_rel_logical_col_t logical = {
+            WIRELOG_COMPOUND_KIND_SIDE, 2u, 1u
+        };
+        int64_t retry_value = 29;
+        REPLACEMENT_CHECK(col_rel_set_column_types(retry_candidate, &type, 1u)
+            == 0 && col_rel_append_row(retry_candidate, &retry_value) == 0
+            && col_rel_enable_timestamps(retry_candidate) == 0
+            && col_rel_apply_compound_schema(retry_candidate, &logical, 1u)
+            == 0, "fault injection retry candidate");
+    }
+    REPLACEMENT_CHECK(col_rel_prepare_replacement(dst, retry_candidate,
+        &replacement)
+        == 0, "fault injection retry prepare");
+    replacement_prepared = true;
+    planned_bytes = replacement.reserved_bytes;
+    REPLACEMENT_CHECK(col_rel_commit_replacement_locked(dst, &replacement)
+        == 0, "fault injection retry commit");
+    replacement_prepared = false;
+    REPLACEMENT_CHECK(dst->relation_identity == dst_identity_before
+        && dst->columns[0] != dst_column_before
+        && dst->columns[0][0] == 29
+        && dst->view_generation == dst_view_before + 1u
+        && dst->storage_generation == dst_storage_before + 1u
+        && dst->retained_reserved_bytes == planned_bytes
+        && wl_columnar_memory_reserved(governor) == planned_bytes
+        && replacement.staged == NULL && !replacement.reservation_active
+        && !replacement.writer_acquired
+        && atomic_load_explicit(&dst->source_access.state,
+        memory_order_acquire) == 0,
+        "fault injection retry did not publish exactly once");
+    col_rel_discard_replacement(&replacement);
+    REPLACEMENT_CHECK(replacement.reserved_bytes == 0,
+        "successful replacement cleanup left stale resources");
+    failure = NULL;
+
+cleanup:
+    wl_columnar_replacement_commit_fail_once = false;
+    if (replacement_prepared)
+        col_rel_discard_replacement(&replacement);
+    cleanup_relations();
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+    if (failure) {
+        fprintf(stderr, "FAIL: %s\n", failure);
+        failures++;
+    }
+#undef REPLACEMENT_CHECK
+}
+
 int
 main(void)
 {
@@ -3335,6 +3598,7 @@ main(void)
     test_empty_append_detaches_shared_destination();
     test_checked_reset_rows_locked();
     test_staged_replacement_contract();
+    test_staged_replacement_commit_fault();
     test_identity_exhaustion();
     if (failures != 0)
         return EXIT_FAILURE;

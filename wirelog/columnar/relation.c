@@ -33,6 +33,10 @@ wl_columnar_append_transition_hook_t wl_columnar_append_transition_hook;
 wl_columnar_set_transition_hook_t wl_columnar_set_transition_hook;
 #endif
 
+#ifdef WL_TEST_REPLACEMENT_COMMIT_HOOK
+bool wl_columnar_replacement_commit_fail_once;
+#endif
+
 static void *
 wl_columnar_relation_radix_malloc(size_t size, const char *site)
 {
@@ -3666,6 +3670,13 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
         || dst->storage_generation
         >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
         return EINVAL;
+
+#ifdef WL_TEST_REPLACEMENT_COMMIT_HOOK
+    if (wl_columnar_replacement_commit_fail_once) {
+        wl_columnar_replacement_commit_fail_once = false;
+        return EAGAIN;
+    }
+#endif
 
     has_new_reservation = replacement->reservation_active;
     wl_columnar_memory_reservation_init(&new_reservation);

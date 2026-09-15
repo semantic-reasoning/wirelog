@@ -3914,7 +3914,8 @@ test_relation_generations_exe = executable(
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
-  c_args: ['-DWL_TEST_APPEND_HOOK=1', '-DWL_TEST_SET_HOOK=1'],
+  c_args: ['-DWL_TEST_APPEND_HOOK=1', '-DWL_TEST_SET_HOOK=1',
+    '-DWL_TEST_REPLACEMENT_COMMIT_HOOK=1'],
 )
 
 test('relation_generations', test_relation_generations_exe)
@@ -3931,7 +3932,7 @@ if host_machine.system() == 'linux'
     include_directories: [wirelog_inc, wirelog_src_inc],
     dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
     c_args: ['-DWL_TEST_ALLOC_WRAP=1', '-DWL_TEST_APPEND_HOOK=1',
-      '-DWL_TEST_SET_HOOK=1'],
+      '-DWL_TEST_SET_HOOK=1', '-DWL_TEST_REPLACEMENT_COMMIT_HOOK=1'],
     link_args: [
       '-Wl,--wrap=malloc', '-Wl,--wrap=calloc', '-Wl,--wrap=realloc',
     ],

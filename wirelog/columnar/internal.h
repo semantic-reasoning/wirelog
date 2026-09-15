@@ -547,6 +547,11 @@ typedef void (*wl_columnar_set_transition_hook_t)(col_rel_t *);
 extern wl_columnar_set_transition_hook_t wl_columnar_set_transition_hook;
 #endif
 
+#ifdef WL_TEST_REPLACEMENT_COMMIT_HOOK
+/* Test-only one-shot failure before replacement publication. */
+extern bool wl_columnar_replacement_commit_fail_once;
+#endif
+
 #ifdef WL_TEST_CONSOLIDATE_HOOK
 /* Test-only probes for the two consolidation COW windows. */
 typedef enum wl_columnar_consolidation_test_stage {
