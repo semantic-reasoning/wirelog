@@ -112,6 +112,8 @@ typedef enum {
     WL_COLUMNAR_MEMORY_RESERVATION_TRANSFERRING = 6,
     WL_COLUMNAR_MEMORY_RESERVATION_DOWNSIZING = 7,
     WL_COLUMNAR_MEMORY_RESERVATION_RELEASING = 8,
+    WL_COLUMNAR_MEMORY_RESERVATION_REPLACEMENT_ADMITTING = 9,
+    WL_COLUMNAR_MEMORY_RESERVATION_REPLACING = 10,
 } wl_columnar_memory_reservation_state_t;
 
 typedef enum {
@@ -125,6 +127,7 @@ typedef enum {
 typedef struct {
     wl_columnar_memory_governor_t *governor;
     uint64_t bytes;
+    uint64_t replacement_bytes;
     wl_atomic_u64 owner_bits;
     wl_atomic_u64 state;
     /* Tokens are caller-owned and intentionally non-copyable.  A copied
@@ -155,7 +158,8 @@ void
 wl_columnar_memory_reservation_init(
     wl_columnar_memory_reservation_t *reservation);
 
-/* Move an active token to another caller-owned storage location. */
+/* Move an active non-replacing token to another caller-owned storage
+ * location. A replacement token must be committed or rolled back first. */
 bool
 wl_columnar_memory_reservation_move(
     wl_columnar_memory_reservation_t *destination,
@@ -217,6 +221,21 @@ wl_columnar_memory_reserve_checked(wl_columnar_memory_governor_t *governor,
 wl_columnar_memory_admission_status_t
 wl_columnar_memory_reserve_growth(wl_columnar_memory_governor_t *governor,
     uint64_t old_bytes, uint64_t new_bytes,
+    wl_columnar_memory_reservation_t *reservation);
+
+/* Admit the replacement footprint while the committed footprint remains
+ * live.  The token keeps the old logical size until commit or rollback. */
+wl_columnar_memory_admission_status_t
+wl_columnar_memory_begin_replacement(
+    wl_columnar_memory_reservation_t *reservation, uint64_t new_bytes);
+
+/* Publish or discard a replacement admitted by begin_replacement(). */
+bool
+wl_columnar_memory_commit_replacement(
+    wl_columnar_memory_reservation_t *reservation);
+
+bool
+wl_columnar_memory_rollback_replacement(
     wl_columnar_memory_reservation_t *reservation);
 
 bool

@@ -631,6 +631,72 @@ test_downsize_races(void)
     return 0;
 }
 
+static int
+test_replacement_reservation(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_t governor;
+    wl_columnar_memory_reservation_t token;
+    wl_columnar_memory_reservation_t other;
+    wl_columnar_memory_reservation_t moved;
+
+    TEST("replacement reservation admits overlap and rolls back");
+    make_resolution(&resolution, 1000, 900);
+    wl_columnar_memory_governor_init(&governor, &resolution);
+    wl_columnar_memory_reservation_init(&token);
+    wl_columnar_memory_reservation_init(&other);
+    wl_columnar_memory_reservation_init(&moved);
+    if (!wl_columnar_memory_reserve(&governor, 400, &token)
+        || !wl_columnar_memory_commit(&token, &governor)
+        || wl_columnar_memory_begin_replacement(&token, 200)
+        != WL_COLUMNAR_MEMORY_ADMISSION_OK
+        || wl_columnar_memory_reserved(&governor) != 600
+        || atomic_load_explicit(&token.state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_REPLACING
+        || wl_columnar_memory_reservation_move(&moved, &token)
+        || wl_columnar_memory_release(&token)
+        || !wl_columnar_memory_reserve(&governor, 300, &other)
+        || !wl_columnar_memory_rollback_replacement(&token)
+        || wl_columnar_memory_reserved(&governor) != 700
+        || !wl_columnar_memory_release(&token)
+        || !wl_columnar_memory_release(&other)
+        || wl_columnar_memory_reserved(&governor) != 0) {
+        FAIL("replacement rollback did not preserve accounting");
+        return 1;
+    }
+
+    wl_columnar_memory_reservation_init(&token);
+    if (!wl_columnar_memory_reserve(&governor, 400, &token)
+        || !wl_columnar_memory_commit(&token, &governor)
+        || wl_columnar_memory_begin_replacement(&token, 200)
+        != WL_COLUMNAR_MEMORY_ADMISSION_OK
+        || !wl_columnar_memory_commit_replacement(&token)
+        || token.bytes != 200
+        || wl_columnar_memory_reserved(&governor) != 200
+        || !wl_columnar_memory_release(&token)
+        || wl_columnar_memory_reserved(&governor) != 0) {
+        FAIL("replacement commit did not publish the new footprint");
+        return 1;
+    }
+
+    wl_columnar_memory_reservation_init(&token);
+    if (!wl_columnar_memory_reserve(&governor, 800, &token)
+        || !wl_columnar_memory_commit(&token, &governor)
+        || wl_columnar_memory_begin_replacement(&token, 200)
+        != WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+        || wl_columnar_memory_reserved(&governor) != 800
+        || atomic_load_explicit(&token.state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        || wl_columnar_memory_begin_replacement(&token, 801)
+        != WL_COLUMNAR_MEMORY_ADMISSION_INVALID
+        || !wl_columnar_memory_release(&token)) {
+        FAIL("replacement denial changed the committed reservation");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
 int
 main(void)
 {
@@ -645,6 +711,7 @@ main(void)
     test_downsize();
     test_downsize_interleavings();
     test_downsize_races();
+    test_replacement_reservation();
     printf("\nPassed %d/%d; Failed %d\n",
         tests_run - tests_failed, tests_run, tests_failed);
     return tests_failed == 0 ? 0 : 1;
