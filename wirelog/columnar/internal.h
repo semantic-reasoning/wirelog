@@ -1968,6 +1968,63 @@ typedef struct wl_col_session_t {
     bool teardown_reported;
 } wl_col_session_t;
 
+/* Standalone owner-publication transaction.  Candidates are owned by the
+ * transaction after a successful add; on an add failure the caller retains
+ * candidate ownership.  Published sessions and input relations are never
+ * mutated until register/commit. */
+typedef struct wl_columnar_eval_owner_publication_entry {
+    wl_col_session_t *session;
+    const char *name;
+    col_rel_t *target;
+    col_rel_t *owner;
+    col_rel_t *candidate;
+    col_rel_replacement_t replacement;
+    bool replacement_prepared;
+    bool registered;
+} wl_columnar_eval_owner_publication_entry_t;
+
+typedef struct wl_columnar_eval_owner_publication_txn {
+    wl_columnar_eval_owner_publication_entry_t *entries;
+    uint32_t count;
+    uint32_t capacity;
+    bool prepared;
+} wl_columnar_eval_owner_publication_txn_t;
+
+void
+wl_columnar_eval_owner_publication_init(
+    wl_columnar_eval_owner_publication_txn_t *txn);
+int
+wl_columnar_eval_owner_publication_add(
+    wl_columnar_eval_owner_publication_txn_t *txn, wl_col_session_t *session,
+    const char *name, col_rel_t *target, col_rel_t *candidate);
+int
+wl_columnar_eval_owner_publication_prepare(
+    wl_columnar_eval_owner_publication_txn_t *txn);
+int
+wl_columnar_eval_owner_publication_register(
+    wl_columnar_eval_owner_publication_txn_t *txn);
+/* Commit is the publication phase.  The caller must provide exclusive,
+ * quiescent access to all sessions/relations until commit or discard returns;
+ * this standalone builder is not wired into exchange modes yet.  All commit
+ * invariants are checked before publication.  A post-publication release
+ * failure is therefore an internal invariant error (EPROTO), and the
+ * transaction remains discardable; already-published entries are not rolled
+ * back. */
+int
+wl_columnar_eval_owner_publication_commit(
+    wl_columnar_eval_owner_publication_txn_t *txn);
+/* Discard is idempotent.  It returns the first session-removal error; in
+ * particular, EBUSY means the session-owned relation was preserved and the
+ * caller must release its busy lease before removing that relation. */
+int
+wl_columnar_eval_owner_publication_discard(
+    wl_columnar_eval_owner_publication_txn_t *txn);
+#ifdef WL_TEST_OWNER_PUBLICATION
+void
+wl_columnar_eval_test_owner_publication_fail_registration(
+    wl_col_session_t *session, const char *name);
+#endif
+
 /*
  * COL_SESSION: Cast wl_session_t* to wl_col_session_t*
  *
