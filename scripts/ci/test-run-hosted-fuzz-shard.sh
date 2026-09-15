@@ -206,6 +206,7 @@ assert not record["output_corpus_path"].startswith("/")
 
 input_snapshot = root / record["input_corpus_path"]
 output_corpus = root / record["output_corpus_path"]
+assert input_snapshot.resolve() != output_corpus.resolve()
 assert (input_snapshot / "seed").read_text() == "seed\n"
 assert (output_corpus / "generated").read_text() == "generated\n"
 assert not (input_snapshot.stat().st_mode & stat.S_IWUSR)
@@ -213,7 +214,6 @@ assert record["input_corpus_sha256"] == verifier.canonical_corpus_sha256(
     input_snapshot)
 assert record["output_corpus_sha256"] == verifier.canonical_corpus_sha256(
     output_corpus)
-assert record["input_corpus_sha256"] != record["output_corpus_sha256"]
 assert root in input_snapshot.resolve().parents
 assert root in output_corpus.resolve().parents
 PY
