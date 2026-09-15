@@ -17,6 +17,37 @@
 #include <stdlib.h>
 #include <string.h>
 
+static int
+col_op_diff_cleanup_owned_relation(eval_stack_t *stack, eval_entry_t *entry,
+    col_rel_t *rel, bool owned, int primary_rc)
+{
+    int cleanup_rc;
+
+    if (!owned)
+        return primary_rc;
+    cleanup_rc = col_rel_destroy_checked(rel);
+    if (cleanup_rc != 0) {
+        eval_entry_t retained = *entry;
+        int push_rc;
+        retained.rel = rel;
+        retained.owned = true;
+        push_rc = eval_stack_repush_entry(stack, &retained);
+        if (push_rc != 0)
+            return primary_rc != 0 ? primary_rc : push_rc;
+        if (primary_rc == 0)
+            primary_rc = cleanup_rc;
+    }
+    return primary_rc;
+}
+
+static int
+col_op_diff_dispose_entry(eval_stack_t *stack, eval_entry_t *entry,
+    int primary_rc)
+{
+    int cleanup_rc = eval_stack_dispose_entry(stack, entry);
+    return primary_rc != 0 ? primary_rc : cleanup_rc;
+}
+
 /* --- DIFFERENTIAL CONSOLIDATE -------------------------------------------- */
 
 /*
@@ -46,11 +77,7 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
 
     col_rel_t *in = e.rel;
     if (!wl_columnar_relation_float_values_valid(in)) {
-        if (e.seg_boundaries)
-            free(e.seg_boundaries);
-        if (e.owned)
-            col_rel_destroy(in);
-        return EINVAL;
+        return col_op_diff_dispose_entry(stack, &e, EINVAL);
     }
     uint32_t nc = in->ncols;
     uint32_t nr = in->nrows;
@@ -76,9 +103,13 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
         }
         int append_rc = col_rel_append_all(work, in, NULL);
         if (append_rc != 0) {
-            col_rel_destroy(work);
-            if (e.seg_boundaries)
-                free(e.seg_boundaries);
+            int cleanup_rc = col_rel_destroy_checked(work);
+            int entry_rc = eval_stack_dispose_entry(stack, &e);
+            if (cleanup_rc != 0)
+                (void)eval_stack_push(stack, work, true);
+            /* append_rc is primary; refused cleanup remains represented by
+             * an entry on the stack for a later retry. */
+            (void)entry_rc;
             return append_rc;
         }
         work_owned = true;
@@ -89,10 +120,11 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
     if (k >= 2 && e.seg_boundaries != NULL) {
         int rc = col_op_consolidate_kway_merge(work, e.seg_boundaries, k);
         free(e.seg_boundaries);
+        e.seg_boundaries = NULL;
+        e.seg_count = 0;
         if (rc != 0) {
-            if (work_owned)
-                col_rel_destroy(work);
-            return rc;
+            return col_op_diff_cleanup_owned_relation(stack, &e, work,
+                       work_owned, rc);
         }
         work->sorted_nrows = work->nrows;
         work->run_count = 1;
@@ -102,6 +134,8 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
 
     if (e.seg_boundaries)
         free(e.seg_boundaries);
+    e.seg_boundaries = NULL;
+    e.seg_count = 0;
 
     /* Trace-based incremental compaction:
      * When a sorted prefix exists, use incremental merge (O(D log D + N))
@@ -113,9 +147,8 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
         /* Phase 1: sort only the unsorted suffix using radix sort */
         int sort_rc = col_rel_radix_sort(work, sn, delta_count);
         if (sort_rc != 0) {
-            if (work_owned)
-                col_rel_destroy(work);
-            return sort_rc;
+            return col_op_diff_cleanup_owned_relation(stack, &e, work,
+                       work_owned, sort_rc);
         }
 
         /* Phase 1b: dedup within suffix */
@@ -145,16 +178,14 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
             if (work->merge_columns) {
                 if (col_columns_realloc(work->merge_columns, nc,
                     new_cap) != 0) {
-                    if (work_owned && work != in)
-                        col_rel_destroy(work);
-                    return ENOMEM;
+                    return col_op_diff_cleanup_owned_relation(stack, &e, work,
+                               work_owned, ENOMEM);
                 }
             } else {
                 work->merge_columns = col_columns_alloc(nc, new_cap);
                 if (!work->merge_columns) {
-                    if (work_owned && work != in)
-                        col_rel_destroy(work);
-                    return ENOMEM;
+                    return col_op_diff_cleanup_owned_relation(stack, &e, work,
+                               work_owned, ENOMEM);
                 }
             }
             work->merge_buf_cap = new_cap;
@@ -230,19 +261,8 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
     {
         int sort_rc = col_rel_radix_sort_int64(work);
         if (sort_rc != 0) {
-            /* Do not destroy work here.  The refusal that is most likely
-             * to land here is EBUSY from a live source reader, and
-             * col_rel_destroy_checked() refuses on exactly that predicate,
-             * so the destroy would be a guaranteed no-op and work -- already
-             * off the stack -- would leak unconditionally.  Handing it back
-             * defers the free to the evaluator's drain, which frees it
-             * whenever the reader has been released by then.  The drain's
-             * own destroy can still be refused while a reader is live; that
-             * residual belongs to eval_entry_dispose and is tracked
-             * separately. */
-            if (eval_stack_push(stack, work, work_owned) != 0 && work_owned)
-                col_rel_destroy(work);
-            return sort_rc;
+            return col_op_diff_cleanup_owned_relation(stack, &e, work,
+                       work_owned, sort_rc);
         }
     }
 
@@ -305,17 +325,14 @@ col_op_exchange(const wl_plan_op_t *op, eval_stack_t *stack,
 
     /* NULL or empty input is a no-op for exchange */
     if (!input || input->ncols == 0) {
-        if (input_entry.owned && input)
-            col_rel_destroy(input);
-        return 0;
+        return col_op_diff_dispose_entry(stack, &input_entry, 0);
     }
     /* Validate key column indices against input schema */
     if (input->ncols > 0) {
         for (uint32_t i = 0; i < meta->key_col_count; i++) {
             if (meta->key_col_idxs[i] >= input->ncols) {
-                if (input_entry.owned)
-                    col_rel_destroy(input);
-                return EINVAL;
+                return col_op_diff_dispose_entry(stack, &input_entry,
+                           EINVAL);
             }
         }
     }
@@ -325,9 +342,7 @@ col_op_exchange(const wl_plan_op_t *op, eval_stack_t *stack,
     uint32_t my_id = sess->coordinator ? sess->worker_id : 0;
 
     if (!coord->exchange_bufs || my_id >= coord->exchange_num_workers) {
-        if (input_entry.owned)
-            col_rel_destroy(input);
-        return EINVAL;
+        return col_op_diff_dispose_entry(stack, &input_entry, EINVAL);
     }
 
     /* Scatter: partition input into exchange_bufs[my_id][0..W-1] */
@@ -335,8 +350,5 @@ col_op_exchange(const wl_plan_op_t *op, eval_stack_t *stack,
             meta->key_col_count, meta->num_workers,
             coord->exchange_bufs[my_id]);
 
-    if (input_entry.owned)
-        col_rel_destroy(input);
-
-    return rc;
+    return col_op_diff_dispose_entry(stack, &input_entry, rc);
 }

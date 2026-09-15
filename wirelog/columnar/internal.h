@@ -519,6 +519,12 @@ typedef struct col_rel {
      * checked destruction.  Production read paths are wired in later
      * lifecycle units. */
     wl_columnar_source_access_gate_t source_access;
+
+    /* Intrusive session-owned deferred-destruction registry link.  A relation
+     * may be present in at most one session registry at a time; the owner
+     * pointer makes that invariant explicit even for a one-element list. */
+    struct col_rel *deferred_relation_next;
+    struct wl_col_session_t *deferred_relation_session;
 } col_rel_t;
 
 /* A private, fully staged publication for a canonical relation.  The staged
@@ -1853,6 +1859,8 @@ typedef struct wl_col_session_t {
      * readers.  Membership is confined to the coordinator thread between
      * worker barriers; worker tasks only read the published relations. */
     wl_columnar_session_source_lease_t *source_leases;
+    col_rel_t *deferred_relations;
+    uint32_t deferred_relation_count;
     /* Exchange operator state (Issue #316): W x W partition buffer matrix.
      * Allocated by coordinator before exchange scatter dispatch.
      * exchange_bufs[src_worker][dst_worker] holds rows src sends to dst.
@@ -2790,12 +2798,30 @@ eval_stack_push_continuation(eval_stack_t *s,
     wl_columnar_continuation_t *continuation);
 eval_entry_t
 eval_stack_pop(eval_stack_t *s);
-void
+int
 eval_entry_dispose(eval_entry_t *entry);
+/* Dispose a relation entry removed from @s, putting it back on the stack if
+ * checked destruction is refused.  The caller retains responsibility for
+ * deciding whether a cleanup error supersedes its primary error. */
+int
+eval_stack_dispose_entry(eval_stack_t *s, eval_entry_t *entry);
+int
+eval_stack_repush_entry(eval_stack_t *s, eval_entry_t *entry);
 int
 eval_stack_pop_relation(eval_stack_t *s, eval_entry_t *out);
-void
+int
 eval_stack_drain(eval_stack_t *s);
+int
+eval_stack_drain_to_session(eval_stack_t *s, wl_col_session_t *sess);
+bool
+wl_columnar_deferred_relation_eligible(const col_rel_t *rel);
+int
+wl_columnar_session_defer_relation(wl_col_session_t *sess, col_rel_t *rel);
+int
+wl_columnar_session_retry_deferred(wl_col_session_t *sess);
+int
+wl_columnar_session_transfer_deferred(wl_col_session_t *from,
+    wl_col_session_t *to);
 int
 col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess);
 int

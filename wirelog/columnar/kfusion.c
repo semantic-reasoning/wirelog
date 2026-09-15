@@ -31,6 +31,27 @@
 #include <stdlib.h>
 #include <string.h>
 
+static int
+col_kfusion_drain(eval_stack_t *stack, wl_col_session_t *sess,
+    int primary_rc)
+{
+    int drain_rc = eval_stack_drain_to_session(stack, sess);
+    if (drain_rc != 0) {
+        fprintf(stderr, "wirelog: K-Fusion stack cleanup failed: %d\n",
+            drain_rc);
+        abort();
+    }
+    return primary_rc;
+}
+
+static int
+col_kfusion_dispose_entry(eval_stack_t *stack, eval_entry_t *entry,
+    int primary_rc)
+{
+    int dispose_rc = eval_stack_dispose_entry(stack, entry);
+    return primary_rc != 0 ? primary_rc : dispose_rc;
+}
+
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
@@ -328,14 +349,14 @@ col_op_k_fusion_serial(const wl_plan_op_t *op, eval_stack_t *stack,
         int branch_rc = col_eval_relation_plan(&plan_data, &s, sess);
         if (branch_rc != 0) {
             rc = branch_rc;
-            eval_stack_drain(&s);
+            rc = col_kfusion_drain(&s, sess, rc);
             goto cleanup;
         }
 
         eval_entry_t e;
         rc = eval_stack_pop_relation(&s, &e);
         if (rc != 0) {
-            eval_stack_drain(&s);
+            rc = col_kfusion_drain(&s, sess, rc);
             goto cleanup;
         }
 
@@ -347,8 +368,8 @@ col_op_k_fusion_serial(const wl_plan_op_t *op, eval_stack_t *stack,
                     "<k_fusion_copy>", e.rel);
             if (!copy) {
                 rc = ENOMEM;
-                eval_entry_dispose(&e);
-                eval_stack_drain(&s);
+                rc = col_kfusion_dispose_entry(&s, &e, rc);
+                rc = col_kfusion_drain(&s, sess, rc);
                 goto cleanup;
             }
             rc = col_rel_install_shared_view(copy, e.rel);
@@ -356,7 +377,7 @@ col_op_k_fusion_serial(const wl_plan_op_t *op, eval_stack_t *stack,
                 rc = col_rel_append_all(copy, e.rel, NULL);
                 if (rc != 0) {
                     col_rel_destroy(copy);
-                    eval_stack_drain(&s);
+                    rc = col_kfusion_drain(&s, sess, rc);
                     goto cleanup;
                 }
             }
@@ -364,7 +385,9 @@ col_op_k_fusion_serial(const wl_plan_op_t *op, eval_stack_t *stack,
         } else {
             results[n_results++] = e.rel;
         }
-        eval_stack_drain(&s);
+        rc = col_kfusion_drain(&s, sess, rc);
+        if (rc != 0)
+            goto cleanup;
     }
     COL_SESSION(sess)->kfusion_dispatch_ns += now_ns() - _phase_t0;
 
@@ -397,8 +420,26 @@ col_op_k_fusion_serial(const wl_plan_op_t *op, eval_stack_t *stack,
 cleanup:
     _phase_t0 = now_ns();
     for (uint32_t d = 0; d < n_results; d++) {
-        if (results[d])
-            col_rel_destroy(results[d]);
+        if (results[d]) {
+            bool eligible = wl_columnar_deferred_relation_eligible(
+                results[d]);
+            int destroy_rc = col_rel_destroy_checked(results[d]);
+            if (destroy_rc == EBUSY && eligible) {
+                int defer_rc = wl_columnar_session_defer_relation(sess,
+                        results[d]);
+                if (defer_rc != 0) {
+                    fprintf(stderr,
+                        "wirelog: K-Fusion serial deferred result admission failed: %d\n",
+                        defer_rc);
+                    abort();
+                }
+            } else if (destroy_rc != 0) {
+                fprintf(stderr,
+                    "wirelog: K-Fusion serial result cleanup failed: %d\n",
+                    destroy_rc);
+                abort();
+            }
+        }
     }
     /* Trim mat_cache back to pre-dispatch baseline. Entries added by branches
      * are owned by the cache and must be freed the same way the parallel path
@@ -593,6 +634,8 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
         /* The shallow branch wrapper does not own the parent worker's
          * persistent source-reader registry. */
         worker_sess[d].source_leases = NULL;
+        worker_sess[d].deferred_relations = NULL;
+        worker_sess[d].deferred_relation_count = 0;
         /* The shallow session copy must not retain coordinator reclaimer
          * callbacks after the worker cache is replaced below. */
         memset(worker_sess[d].mem_ledger.reclaimers, 0,
@@ -745,7 +788,7 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
         eval_entry_t e;
         rc = eval_stack_pop_relation(&workers[d].stack, &e);
         if (rc != 0) {
-            eval_stack_drain(&workers[d].stack);
+            rc = col_kfusion_drain(&workers[d].stack, &worker_sess[d], rc);
             goto cleanup_results;
         }
 
@@ -756,8 +799,8 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
                     "<k_fusion_copy>", e.rel);
             if (!copy) {
                 rc = ENOMEM;
-                eval_entry_dispose(&e);
-                eval_stack_drain(&workers[d].stack);
+                rc = col_kfusion_dispose_entry(&workers[d].stack, &e, rc);
+                rc = col_kfusion_drain(&workers[d].stack, &worker_sess[d], rc);
                 goto cleanup_results;
             }
             rc = col_rel_install_shared_view(copy, e.rel);
@@ -765,7 +808,8 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
                 rc = col_rel_append_all(copy, e.rel, NULL);
                 if (rc != 0) {
                     col_rel_destroy(copy);
-                    eval_stack_drain(&workers[d].stack);
+                    rc = col_kfusion_drain(&workers[d].stack, &worker_sess[d],
+                            rc);
                     goto cleanup_results;
                 }
             }
@@ -773,7 +817,9 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
         } else {
             results[d] = e.rel;
         }
-        eval_stack_drain(&workers[d].stack);
+        rc = col_kfusion_drain(&workers[d].stack, &worker_sess[d], rc);
+        if (rc != 0)
+            goto cleanup_results;
     }
 
     /* Merge live branch results with deduplication.
@@ -822,9 +868,35 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
 cleanup_results:
     _phase_t0 = now_ns();
     for (uint32_t d = 0; d < live_count; d++) {
-        if (results[d])
-            col_rel_destroy(results[d]);
-        eval_stack_drain(&workers[d].stack);
+        if (results[d]) {
+            bool eligible = wl_columnar_deferred_relation_eligible(
+                results[d]);
+            int destroy_rc = col_rel_destroy_checked(results[d]);
+            if (destroy_rc == EBUSY && eligible) {
+                int defer_rc = wl_columnar_session_defer_relation(
+                    &worker_sess[d], results[d]);
+                if (defer_rc != 0) {
+                    fprintf(stderr,
+                        "wirelog: K-Fusion deferred result admission failed: %d\n",
+                        defer_rc);
+                    abort();
+                }
+            } else if (destroy_rc == EBUSY) {
+                /* A pool/arena result must never be kept past this worker's
+                 * allocator lifetime.  Reader admission should make this
+                 * unreachable; retain the invariant in debug builds. */
+                assert(eligible);
+                fprintf(stderr,
+                    "wirelog: K-Fusion refused unsafe busy result cleanup\n");
+                abort();
+            } else if (destroy_rc != 0) {
+                fprintf(stderr,
+                    "wirelog: K-Fusion result cleanup failed: %d\n",
+                    destroy_rc);
+                abort();
+            }
+        }
+        rc = col_kfusion_drain(&workers[d].stack, &worker_sess[d], rc);
     }
 
 cleanup_wq:
@@ -838,7 +910,15 @@ cleanup_wq:
      * Lock-free design: no synchronization needed because each worker owns
      * its isolated cache — no races at cleanup time. */
     for (uint32_t d = 0; d < live_count; d++) {
-        eval_stack_drain(&workers[d].stack);
+        rc = col_kfusion_drain(&workers[d].stack, &worker_sess[d], rc);
+        int deferred_rc = wl_columnar_session_retry_deferred(
+            &worker_sess[d]);
+        if (deferred_rc != 0) {
+            int transfer_rc = wl_columnar_session_transfer_deferred(
+                &worker_sess[d], sess);
+            if (transfer_rc != 0)
+                abort();
+        }
         (void)wl_compound_arena_borrow_release(
             &worker_sess[d].compound_borrow);
         /* Issue #196: worker mat_cache starts empty (zeroed above), so ALL
