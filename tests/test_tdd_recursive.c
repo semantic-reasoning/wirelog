@@ -1392,6 +1392,394 @@ test_filt_arr_bench_w4(void)
     return 0;
 }
 
+#ifdef WL_TEST_OWNER_PUBLICATION
+static col_rel_t *
+owner_publication_candidate(const char *name, int64_t value)
+{
+    col_rel_t *candidate = col_rel_new_auto(name, 1);
+    if (!candidate || col_rel_append_row(candidate, &value) != 0) {
+        col_rel_destroy(candidate);
+        return NULL;
+    }
+    return candidate;
+}
+
+static void
+owner_publication_session_cleanup(wl_col_session_t *session)
+{
+    if (!session)
+        return;
+    for (uint32_t i = 0; i < session->nrels; i++) {
+        if (session->rels[i])
+            (void)session_remove_rel(session, session->rels[i]->name);
+    }
+    session_rel_free_hash(session);
+    free(session->rels);
+    session->rels = NULL;
+}
+
+static int
+test_owner_publication_transaction(void)
+{
+    wl_col_session_t sessions[3] = { 0 };
+    wl_columnar_eval_owner_publication_txn_t txn;
+    col_rel_t *target = NULL;
+    col_rel_t *owner = NULL;
+    col_rel_t *alias = NULL;
+    int64_t initial = 1;
+    int rc = EFAULT;
+
+    wl_columnar_eval_owner_publication_init(&txn);
+
+    for (uint32_t i = 0; i < 3; i++) {
+        sessions[i].rel_cap = 8;
+        sessions[i].rels = (col_rel_t **)calloc(sessions[i].rel_cap,
+                sizeof(*sessions[i].rels));
+        if (!sessions[i].rels)
+            goto cleanup;
+    }
+    target = col_rel_new_auto("r", 1);
+    if (!target || col_rel_append_row(target, &initial) != 0
+        || session_add_rel(&sessions[0], target) != 0)
+        goto cleanup;
+    target = session_find_rel(&sessions[0], "r");
+
+#ifdef WL_TEST_ALLOC_WRAP
+    /* A failed growth keeps candidate ownership with the caller. */
+    {
+        col_rel_t *candidate = owner_publication_candidate("$d$add", 9);
+        wl_columnar_eval_owner_publication_init(&txn);
+        if (!candidate)
+            goto cleanup;
+        allocation_calls = 0;
+        allocation_fail_at = 0;
+        if (wl_columnar_eval_owner_publication_add(&txn, &sessions[1],
+            "$d$add", NULL, candidate) != ENOMEM) {
+            allocation_fail_at = -1;
+            col_rel_destroy(candidate);
+            goto cleanup;
+        }
+        allocation_fail_at = -1;
+        col_rel_destroy(candidate);
+        wl_columnar_eval_owner_publication_discard(&txn);
+    }
+#endif
+
+    /* A candidate may have only one transaction owner. */
+    {
+        col_rel_t *candidate = owner_publication_candidate("$d$duplicate", 11);
+        wl_columnar_eval_owner_publication_init(&txn);
+        if (!candidate
+            || wl_columnar_eval_owner_publication_add(&txn, &sessions[1],
+            "$d$duplicate", NULL, candidate) != 0) {
+            col_rel_destroy(candidate);
+            goto cleanup;
+        }
+        if (wl_columnar_eval_owner_publication_add(&txn, &sessions[1],
+            "$d$duplicate", NULL, candidate) != EEXIST) {
+            wl_columnar_eval_owner_publication_discard(&txn);
+            goto cleanup;
+        }
+        wl_columnar_eval_owner_publication_discard(&txn);
+    }
+
+    /* Duplicate canonical owners are rejected before either writer is held. */
+    {
+        col_rel_t *first = owner_publication_candidate("r", 2);
+        col_rel_t *second = owner_publication_candidate("r", 3);
+        wl_columnar_eval_owner_publication_init(&txn);
+        if (!first || !second) {
+            col_rel_destroy(first);
+            col_rel_destroy(second);
+            goto cleanup;
+        }
+        if (wl_columnar_eval_owner_publication_add(&txn, &sessions[0],
+            "r", target, first) != 0) {
+            col_rel_destroy(first);
+            col_rel_destroy(second);
+            goto cleanup;
+        }
+        first = NULL;
+        if (wl_columnar_eval_owner_publication_add(&txn, &sessions[0],
+            "r", target, second) != 0) {
+            col_rel_destroy(second);
+            wl_columnar_eval_owner_publication_discard(&txn);
+            goto cleanup;
+        }
+        second = NULL;
+        if (wl_columnar_eval_owner_publication_prepare(&txn) != EBUSY
+            || atomic_load_explicit(&target->source_access.state,
+            memory_order_acquire) != 0) {
+            wl_columnar_eval_owner_publication_discard(&txn);
+            goto cleanup;
+        }
+        wl_columnar_eval_owner_publication_discard(&txn);
+    }
+
+    /* A target must still be registered under the exact session/name pair. */
+    {
+        col_rel_t *candidate = owner_publication_candidate("r", 8);
+        delta_pool_t *pool = NULL;
+        col_rel_t *pool_candidate = NULL;
+
+        wl_columnar_eval_owner_publication_init(&txn);
+        if (!candidate) {
+            goto cleanup;
+        }
+        if (wl_columnar_eval_owner_publication_add(&txn, &sessions[1],
+            "r", target, candidate) != EINVAL) {
+            col_rel_destroy(candidate);
+            goto cleanup;
+        }
+        col_rel_destroy(candidate);
+        candidate = owner_publication_candidate("not-r", 9);
+        if (!candidate) {
+            goto cleanup;
+        }
+        if (wl_columnar_eval_owner_publication_add(&txn, &sessions[0],
+            "not-r", target, candidate) != EINVAL) {
+            col_rel_destroy(candidate);
+            goto cleanup;
+        }
+        col_rel_destroy(candidate);
+
+        candidate = owner_publication_candidate("$d$actual", 10);
+        if (!candidate) {
+            goto cleanup;
+        }
+        if (wl_columnar_eval_owner_publication_add(&txn, &sessions[1],
+            "$d$expected", NULL, candidate) != EINVAL) {
+            col_rel_destroy(candidate);
+            goto cleanup;
+        }
+        col_rel_destroy(candidate);
+        if (session_find_rel(&sessions[1], "$d$expected")
+            || session_find_rel(&sessions[1], "$d$actual"))
+            goto cleanup;
+
+        candidate = col_rel_new_auto("$d$alias-candidate", 1);
+        if (!candidate
+            || col_rel_install_shared_view(candidate, target) != 0) {
+            col_rel_destroy(candidate);
+            goto cleanup;
+        }
+        if (wl_columnar_eval_owner_publication_add(&txn, &sessions[1],
+            "$d$alias-candidate", NULL, candidate) != EINVAL) {
+            col_rel_destroy(candidate);
+            goto cleanup;
+        }
+        col_rel_destroy(candidate);
+        if (session_find_rel(&sessions[1], "$d$alias-candidate"))
+            goto cleanup;
+
+        pool = delta_pool_create(2, sizeof(col_rel_t), 256);
+        pool_candidate = pool
+            ? col_rel_pool_new_auto(pool, NULL, "$d$pool", 1) : NULL;
+        int pool_rc = pool_candidate
+            ? wl_columnar_eval_owner_publication_add(&txn, &sessions[1],
+                "$d$pool", NULL, pool_candidate) : EFAULT;
+        if (!pool_candidate || pool_rc != EINVAL) {
+            col_rel_free_contents(pool_candidate);
+            delta_pool_destroy(pool);
+            goto cleanup;
+        }
+        col_rel_free_contents(pool_candidate);
+        delta_pool_destroy(pool);
+        wl_columnar_eval_owner_publication_discard(&txn);
+    }
+
+    /* An alias is not a canonical publication target. */
+    owner = col_rel_new_auto("owner", 1);
+    alias = col_rel_new_auto("alias", 1);
+    if (!owner || !alias || col_rel_install_shared_view(alias, owner) != 0
+        || session_add_rel(&sessions[1], alias) != 0) {
+        wl_columnar_eval_owner_publication_discard(&txn);
+        goto cleanup;
+    }
+    {
+        col_rel_t *candidate = owner_publication_candidate("alias", 4);
+        wl_columnar_eval_owner_publication_init(&txn);
+        if (!candidate) {
+            goto cleanup;
+        }
+        if (wl_columnar_eval_owner_publication_add(&txn, &sessions[1],
+            "alias", alias, candidate) != 0) {
+            col_rel_destroy(candidate);
+            goto cleanup;
+        }
+        candidate = NULL;
+        if (wl_columnar_eval_owner_publication_prepare(&txn) != EBUSY
+            || atomic_load_explicit(&owner->source_access.state,
+            memory_order_acquire) != 0) {
+            wl_columnar_eval_owner_publication_discard(&txn);
+            goto cleanup;
+        }
+        wl_columnar_eval_owner_publication_discard(&txn);
+    }
+    if (session_remove_rel(&sessions[1], "alias") != 0)
+        goto cleanup;
+    alias = NULL;
+    col_rel_destroy(owner);
+    owner = NULL;
+
+    /* A preparation failure leaves the published target untouched. */
+    {
+        col_rel_t *bad = owner_publication_candidate("r", 5);
+        wl_columnar_eval_owner_publication_init(&txn);
+        if (!bad)
+            goto cleanup;
+        bad->nrows = bad->capacity + 1u;
+        if (wl_columnar_eval_owner_publication_add(&txn, &sessions[0], "r",
+            target, bad) != 0) {
+            col_rel_destroy(bad);
+            goto cleanup;
+        }
+        bad = NULL;
+        if (wl_columnar_eval_owner_publication_prepare(&txn) != EINVAL
+            || target->nrows != 1 || target->columns[0][0] != initial
+            || atomic_load_explicit(&target->source_access.state,
+            memory_order_acquire) != 0)
+            goto cleanup;
+    }
+
+    /* A later registration failure rolls back only registrations made here. */
+    {
+        col_rel_t *replacement = owner_publication_candidate("r", 2);
+        col_rel_t *delta0 = owner_publication_candidate("$d$r0", 6);
+        col_rel_t *delta1 = owner_publication_candidate("$d$r1", 7);
+        col_rel_t *busy_alias = NULL;
+        col_rel_t *registered_delta = NULL;
+        wl_columnar_eval_owner_publication_init(&txn);
+        if (!replacement || !delta0 || !delta1) {
+            col_rel_destroy(replacement);
+            col_rel_destroy(delta0);
+            col_rel_destroy(delta1);
+            goto cleanup;
+        }
+        if (wl_columnar_eval_owner_publication_add(&txn, &sessions[2],
+            "$d$r1", NULL, delta1) != 0) {
+            col_rel_destroy(replacement);
+            col_rel_destroy(delta0);
+            col_rel_destroy(delta1);
+            goto cleanup;
+        }
+        delta1 = NULL;
+        if (wl_columnar_eval_owner_publication_add(&txn, &sessions[0],
+            "r", target, replacement) != 0) {
+            col_rel_destroy(replacement);
+            col_rel_destroy(delta0);
+            wl_columnar_eval_owner_publication_discard(&txn);
+            goto cleanup;
+        }
+        replacement = NULL;
+        if (wl_columnar_eval_owner_publication_add(&txn, &sessions[1],
+            "$d$r0", NULL, delta0) != 0) {
+            col_rel_destroy(delta0);
+            wl_columnar_eval_owner_publication_discard(&txn);
+            goto cleanup;
+        }
+        delta0 = NULL;
+        if (wl_columnar_eval_owner_publication_prepare(&txn) != 0)
+            goto cleanup;
+        wl_columnar_eval_test_owner_publication_fail_registration(
+            &sessions[2], "$d$r1");
+        if (wl_columnar_eval_owner_publication_register(&txn) != ENOMEM)
+            goto cleanup;
+        wl_columnar_eval_test_owner_publication_fail_registration(NULL, NULL);
+        registered_delta = session_find_rel(&sessions[1], "$d$r0");
+        busy_alias = col_rel_new_auto("$d$r0-alias", 1);
+        if (!registered_delta || !busy_alias
+            || col_rel_install_shared_view(busy_alias, registered_delta) != 0
+            || session_add_rel(&sessions[2], busy_alias) != 0) {
+            col_rel_destroy(busy_alias);
+            goto cleanup;
+        }
+        col_rel_t *registered_alias = busy_alias;
+        busy_alias = NULL;
+        if (wl_columnar_eval_owner_publication_discard(&txn) != EBUSY
+            || session_find_rel(&sessions[1], "$d$r0")
+            != registered_delta
+            || session_find_rel(&sessions[2], "$d$r0-alias")
+            != registered_alias
+            || target->nrows != 1
+            || atomic_load_explicit(&target->source_access.state,
+            memory_order_acquire) != 0)
+            goto cleanup;
+        busy_alias = NULL;
+        if (session_remove_rel(&sessions[2], "$d$r0-alias") != 0
+            || session_remove_rel(&sessions[1], "$d$r0") != 0)
+            goto cleanup;
+        if (session_find_rel(&sessions[1], "$d$r0")
+            || session_find_rel(&sessions[2], "$d$r1")
+            || target->nrows != 1
+            || atomic_load_explicit(&target->source_access.state,
+            memory_order_acquire) != 0)
+            goto cleanup;
+        wl_columnar_eval_owner_publication_discard(&txn);
+    }
+
+    /* The same shape succeeds after the failed transaction was discarded. */
+    {
+        col_rel_t *replacement = owner_publication_candidate("r", 2);
+        col_rel_t *delta0 = owner_publication_candidate("$d$r0", 6);
+        col_rel_t *delta1 = owner_publication_candidate("$d$r1", 7);
+        wl_columnar_eval_owner_publication_init(&txn);
+        if (!replacement || !delta0 || !delta1) {
+            col_rel_destroy(replacement);
+            col_rel_destroy(delta0);
+            col_rel_destroy(delta1);
+            goto cleanup;
+        }
+        if (wl_columnar_eval_owner_publication_add(&txn, &sessions[2],
+            "$d$r1", NULL, delta1) != 0) {
+            col_rel_destroy(replacement);
+            col_rel_destroy(delta0);
+            col_rel_destroy(delta1);
+            goto cleanup;
+        }
+        delta1 = NULL;
+        if (wl_columnar_eval_owner_publication_add(&txn, &sessions[0],
+            "r", target, replacement) != 0) {
+            col_rel_destroy(replacement);
+            col_rel_destroy(delta0);
+            wl_columnar_eval_owner_publication_discard(&txn);
+            goto cleanup;
+        }
+        replacement = NULL;
+        if (wl_columnar_eval_owner_publication_add(&txn, &sessions[1],
+            "$d$r0", NULL, delta0) != 0) {
+            col_rel_destroy(delta0);
+            wl_columnar_eval_owner_publication_discard(&txn);
+            goto cleanup;
+        }
+        delta0 = NULL;
+        if (wl_columnar_eval_owner_publication_prepare(&txn) != 0
+            || wl_columnar_eval_owner_publication_register(&txn) != 0
+            || wl_columnar_eval_owner_publication_commit(&txn) != 0
+            || target->nrows != 1 || target->columns[0][0] != 2
+            || !session_find_rel(&sessions[1], "$d$r0")
+            || !session_find_rel(&sessions[2], "$d$r1"))
+            goto cleanup;
+        wl_columnar_eval_owner_publication_discard(&txn);
+        wl_columnar_eval_owner_publication_discard(&txn);
+        rc = 0;
+    }
+
+cleanup:
+    wl_columnar_eval_test_owner_publication_fail_registration(NULL, NULL);
+    wl_columnar_eval_owner_publication_discard(&txn);
+    if (alias)
+        col_rel_destroy(alias);
+    if (owner)
+        col_rel_destroy(owner);
+    for (uint32_t i = 0; i < 3; i++)
+        owner_publication_session_cleanup(&sessions[i]);
+    if (target)
+        target = NULL;
+    return rc;
+}
+#endif
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -1420,6 +1808,13 @@ main(void)
     test_bdx_seed_sort_failure_is_atomic();
     test_bdx_seed_allocation_failure_is_atomic();
     test_bdx_seed_success_preserves_timestamps();
+#ifdef WL_TEST_OWNER_PUBLICATION
+    TEST("owner publication transaction lifecycle");
+    if (test_owner_publication_transaction() == 0)
+        PASS();
+    else
+        FAIL("owner publication transaction");
+#endif
     test_filt_arr_bench_w1();
     test_filt_arr_bench_w4();
 

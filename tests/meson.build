@@ -4617,8 +4617,9 @@ test_tdd_recursive_exe = executable(
   # its define travels with it; test_bdx_seed_allocation_failure_is_atomic has
   # an #else branch for the platforms that do not get it.
   c_args: host_machine.system() == 'linux'
-    ? ['-DWL_TEST_BDX_SEED=1', '-DWL_TEST_ALLOC_WRAP=1']
-    : ['-DWL_TEST_BDX_SEED=1'],
+    ? ['-DWL_TEST_BDX_SEED=1', '-DWL_TEST_OWNER_PUBLICATION=1',
+      '-DWL_TEST_ALLOC_WRAP=1']
+    : ['-DWL_TEST_BDX_SEED=1', '-DWL_TEST_OWNER_PUBLICATION=1'],
   link_args: host_machine.system() == 'linux'
     ? ['-Wl,--wrap=malloc', '-Wl,--wrap=calloc', '-Wl,--wrap=realloc'] : [],
   override_options: host_machine.system() == 'linux' ? ['b_lto=false'] : [],

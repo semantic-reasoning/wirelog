@@ -329,11 +329,12 @@ the previous value for up to one cache-line propagation interval; that
 is acceptable because each worker re-polls before every tuple batch
 and the wasted work is bounded.
 
-### 5.6 `wirelog/columnar/eval.c` — shared counter (1 row)
+### 5.6 `wirelog/columnar/eval.c` — shared counter and replacement reservation (2 rows)
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
 | `eval.c:wl_columnar_eval_nonrec_relation_parallel` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Reset before workers spawn; happens-before edge is provided by `wl_thread_create()` itself |
+| `eval.c:wl_columnar_eval_owner_publication_validate_replacement` | `replacement.reservation.state` | `atomic_load_explicit` | `acquire` | Validate the staged reservation state before the commit preflight permits any replacement publication |
 
 ### 5.7 `wirelog/columnar/session.c` — worker budget snapshot (1 row)
 
@@ -522,7 +523,7 @@ prepare/commit would be discarded by the publication it is protecting.
 | `relation.c:col_rel_commit_replacement_locked` | `old.source_access.state` | `atomic_load_explicit` | acquire | Capture the outgoing descriptor's admission state before `*dst = *staged` overwrites it, so the writer lease the caller holds across prepare and commit survives the swap |
 | `relation.c:col_rel_commit_replacement_locked#2` | `dst->source_access.state` | `atomic_store_explicit` | release | Republish the captured admission state onto the committed descriptor; the release orders every field written above it before another thread can observe the gate |
 
-The complete source audit now contains **119 atomic call sites**.
+The complete source audit now contains **120 atomic call sites**.
 
 ---
 
