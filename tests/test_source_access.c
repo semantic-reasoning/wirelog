@@ -179,11 +179,10 @@ enum publication_phase {
     PUBLICATION_START,
     PUBLICATION_WRITER_HELD,
     PUBLICATION_READER_BLOCKED,
+    PUBLICATION_WRITER_RELEASED,
     PUBLICATION_DONE,
     PUBLICATION_FAILED,
 };
-
-enum { PUBLICATION_WAIT_LIMIT = 1000000u };
 
 struct publication_payload {
     uint64_t first;
@@ -193,6 +192,10 @@ struct publication_payload {
 
 struct publication_arg {
     wl_columnar_source_access_gate_t *gate;
+    wl_mutex_t control_lock;
+    wl_cond_t control_changed;
+    wl_mutex_t release_lock;
+    wl_cond_t release_changed;
     atomic_int phase;
     struct publication_payload payload;
     atomic_int reader_busy;
@@ -201,10 +204,41 @@ struct publication_arg {
 };
 
 static void
+publication_set_phase(struct publication_arg *arg, enum publication_phase phase)
+{
+    if (wl_mutex_lock(&arg->control_lock) != 0)
+        return;
+    atomic_store_explicit(&arg->phase, phase, memory_order_release);
+    (void)wl_cond_broadcast(&arg->control_changed);
+    (void)wl_mutex_unlock(&arg->control_lock);
+}
+
+static int
+publication_wait_for(struct publication_arg *arg,
+    enum publication_phase expected)
+{
+    if (wl_mutex_lock(&arg->control_lock) != 0)
+        return -1;
+    while (atomic_load_explicit(&arg->phase, memory_order_acquire)
+        != (int)expected
+        && atomic_load_explicit(&arg->phase, memory_order_acquire)
+        != PUBLICATION_FAILED) {
+        if (wl_cond_wait(&arg->control_changed, &arg->control_lock) != 0) {
+            (void)wl_mutex_unlock(&arg->control_lock);
+            return -1;
+        }
+    }
+    int result = atomic_load_explicit(&arg->phase, memory_order_acquire)
+        == (int)expected ? 0 : -1;
+    (void)wl_mutex_unlock(&arg->control_lock);
+    return result;
+}
+
+static void
 publication_fail(struct publication_arg *arg)
 {
-    atomic_store_explicit(&arg->phase, PUBLICATION_FAILED,
-        memory_order_release);
+    publication_set_phase(arg, PUBLICATION_FAILED);
+    (void)wl_cond_broadcast(&arg->release_changed);
 }
 
 static void *
@@ -218,23 +252,22 @@ publication_writer(void *opaque)
     }
 
     atomic_store_explicit(&arg->writer_success, 1, memory_order_relaxed);
-    atomic_store_explicit(&arg->phase, PUBLICATION_WRITER_HELD,
-        memory_order_release);
-    unsigned waited = 0;
-    while (atomic_load_explicit(&arg->phase, memory_order_acquire)
-        != PUBLICATION_READER_BLOCKED && waited++ < PUBLICATION_WAIT_LIMIT) {
-        if (atomic_load_explicit(&arg->phase, memory_order_acquire)
-            == PUBLICATION_FAILED) {
-            (void)wl_columnar_source_access_writer_release(&token);
-            return NULL;
-        }
+    publication_set_phase(arg, PUBLICATION_WRITER_HELD);
+    if (publication_wait_for(arg, PUBLICATION_READER_BLOCKED) != 0) {
+        (void)wl_columnar_source_access_writer_release(&token);
+        return NULL;
     }
-    if (atomic_load_explicit(&arg->phase, memory_order_acquire)
-        != PUBLICATION_READER_BLOCKED) {
+
+    /* The reader holds release_lock while entering cond_wait.  Acquiring it
+     * here proves that the wait has atomically released the lock, so the
+     * post-release broadcast below cannot be lost.  Unlock before writing
+     * the payload so this coordination mutex cannot publish the payload. */
+    if (wl_mutex_lock(&arg->release_lock) != 0) {
         (void)wl_columnar_source_access_writer_release(&token);
         publication_fail(arg);
         return NULL;
     }
+    (void)wl_mutex_unlock(&arg->release_lock);
 
     /* The reader has already observed EBUSY.  Write only after that
      * coordination so the gate's release/acquire edge is the publication
@@ -248,6 +281,13 @@ publication_writer(void *opaque)
         publication_fail(arg);
         return NULL;
     }
+    /* Do not take the coordination mutex after publishing the payload: the
+     * source gate release/acquire pair must remain the only publication edge
+     * visible to the reader.  This phase is only a scheduling hint, so it
+     * must not itself publish the payload. */
+    atomic_store_explicit(&arg->phase, PUBLICATION_WRITER_RELEASED,
+        memory_order_relaxed);
+    (void)wl_cond_broadcast(&arg->release_changed);
     return NULL;
 }
 
@@ -256,15 +296,7 @@ publication_reader(void *opaque)
 {
     struct publication_arg *arg = opaque;
     wl_columnar_source_access_reader_t token = { 0 };
-    unsigned waited = 0;
-    while (atomic_load_explicit(&arg->phase, memory_order_acquire)
-        != PUBLICATION_WRITER_HELD && waited++ < PUBLICATION_WAIT_LIMIT) {
-        if (atomic_load_explicit(&arg->phase, memory_order_acquire)
-            == PUBLICATION_FAILED)
-            return NULL;
-    }
-    if (atomic_load_explicit(&arg->phase, memory_order_acquire)
-        != PUBLICATION_WRITER_HELD) {
+    if (publication_wait_for(arg, PUBLICATION_WRITER_HELD) != 0) {
         publication_fail(arg);
         return NULL;
     }
@@ -277,22 +309,31 @@ publication_reader(void *opaque)
         return NULL;
     }
     atomic_store_explicit(&arg->reader_busy, 1, memory_order_relaxed);
-    atomic_store_explicit(&arg->phase, PUBLICATION_READER_BLOCKED,
-        memory_order_release);
-
-    for (waited = 0; waited < PUBLICATION_WAIT_LIMIT; waited++) {
-        int rc = wl_columnar_source_access_reader_acquire(arg->gate, &token);
-        if (rc == 0)
-            break;
-        if (rc != EBUSY) {
-            publication_fail(arg);
-            return NULL;
-        }
-        if (atomic_load_explicit(&arg->phase, memory_order_acquire)
-            == PUBLICATION_FAILED)
-            return NULL;
+    if (wl_mutex_lock(&arg->release_lock) != 0) {
+        publication_fail(arg);
+        return NULL;
     }
-    if (token.owner == NULL) {
+    publication_set_phase(arg, PUBLICATION_READER_BLOCKED);
+    int wait_rc = 0;
+    int acquired = 0;
+    while (!acquired
+        && atomic_load_explicit(&arg->phase, memory_order_relaxed)
+        != PUBLICATION_FAILED) {
+        if (wl_cond_wait(&arg->release_changed, &arg->release_lock) != 0) {
+            wait_rc = -1;
+            break;
+        }
+        int acquire_rc = wl_columnar_source_access_reader_acquire(arg->gate,
+                &token);
+        if (acquire_rc == 0)
+            acquired = 1;
+        else if (acquire_rc != EBUSY) {
+            wait_rc = -1;
+            break;
+        }
+    }
+    (void)wl_mutex_unlock(&arg->release_lock);
+    if (wait_rc != 0 || !acquired) {
         publication_fail(arg);
         return NULL;
     }
@@ -320,6 +361,23 @@ test_writer_publication(void)
     struct publication_arg arg = { .gate = &gate };
     wl_thread_t writer, reader;
     wl_columnar_source_access_gate_init(&gate);
+    if (wl_mutex_init(&arg.control_lock) != 0)
+        CHECK(0, "publication mutex init");
+    if (wl_cond_init(&arg.control_changed) != 0) {
+        wl_mutex_destroy(&arg.control_lock);
+        CHECK(0, "publication condition init");
+    }
+    if (wl_mutex_init(&arg.release_lock) != 0) {
+        wl_cond_destroy(&arg.control_changed);
+        wl_mutex_destroy(&arg.control_lock);
+        CHECK(0, "publication release mutex init");
+    }
+    if (wl_cond_init(&arg.release_changed) != 0) {
+        wl_mutex_destroy(&arg.release_lock);
+        wl_cond_destroy(&arg.control_changed);
+        wl_mutex_destroy(&arg.control_lock);
+        CHECK(0, "publication release condition init");
+    }
     atomic_init(&arg.phase, PUBLICATION_START);
     atomic_init(&arg.reader_busy, 0);
     atomic_init(&arg.writer_success, 0);
@@ -333,6 +391,10 @@ test_writer_publication(void)
             (void)wl_thread_join(&writer);
         if (reader_created == 0)
             (void)wl_thread_join(&reader);
+        wl_cond_destroy(&arg.release_changed);
+        wl_mutex_destroy(&arg.release_lock);
+        wl_cond_destroy(&arg.control_changed);
+        wl_mutex_destroy(&arg.control_lock);
         CHECK(0, "publication thread create");
     }
     int writer_joined = wl_thread_join(&writer) == 0;
@@ -344,6 +406,10 @@ test_writer_publication(void)
         && atomic_load_explicit(&arg.writer_success, memory_order_relaxed)
         && atomic_load_explicit(&arg.reader_success, memory_order_relaxed)
         && atomic_load_explicit(&gate.state, memory_order_relaxed) == 0;
+    wl_cond_destroy(&arg.release_changed);
+    wl_mutex_destroy(&arg.release_lock);
+    wl_cond_destroy(&arg.control_changed);
+    wl_mutex_destroy(&arg.control_lock);
     CHECK(publication_ok, "writer publication ordering and balance");
 }
 
