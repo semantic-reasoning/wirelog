@@ -3737,6 +3737,7 @@ test_diff_arrangement_deep_copy_buckets_exe = executable(
   files('test_diff_arrangement_deep_copy_buckets.c'),
   '../wirelog/columnar/diff_arrangement.c',
   '../wirelog/columnar/mem_ledger.c',
+  '../wirelog/columnar/memory_governor.c',
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [threads_dep],
 )
