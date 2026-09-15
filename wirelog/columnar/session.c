@@ -2285,6 +2285,18 @@ col_session_destroy(wl_session_t *session)
         sess->tdd_workers = NULL;
         sess->tdd_workers_count = 0;
     }
+    /* Issue #1435: differential arrangements hold registry-entry leases and
+     * row links into relation positions.  Reject teardown while any lease or
+     * replacement transaction is still active, before any relation storage is
+     * destroyed. */
+    assert(sess->diff_txn_count == 0);
+    int diff_rc = col_session_free_diff_arrangements(sess);
+    assert(diff_rc == 0);
+    if (diff_rc != 0) {
+        WL_LOG(WL_LOG_SEC_SESSION, WL_LOG_ERROR,
+            "cannot tear down differential arrangements: %d", diff_rc);
+        return;
+    }
     int lease_rc = wl_columnar_session_source_leases_release_all(sess);
     int deferred_rc = wl_columnar_session_retry_deferred(sess);
 #ifdef WL_SESSION_TEST_HOOKS
@@ -2326,7 +2338,6 @@ col_session_destroy(wl_session_t *session)
     free(sess->arr_entries);
     col_session_free_delta_arrangements(sess);
     col_session_free_sorted_arrangements(sess);
-    col_session_free_diff_arrangements(sess);
     col_session_free_filt_arrangements(sess);
     ledger_credit_allocators(sess); /* Issue #1380 */
     delta_pool_destroy(sess->delta_pool);
@@ -2750,9 +2761,16 @@ col_worker_session_destroy(wl_col_session_t *worker)
         col_arr_detach_memory_governor(&worker->arr_entries[i].arr);
     }
     free(worker->arr_entries);
+    assert(worker->diff_txn_count == 0);
+    int diff_rc = col_session_free_diff_arrangements(worker);
+    assert(diff_rc == 0);
+    if (diff_rc != 0) {
+        WL_LOG(WL_LOG_SEC_SESSION, WL_LOG_ERROR,
+            "cannot tear down worker differential arrangements: %d", diff_rc);
+        return diff_rc;
+    }
     col_session_free_delta_arrangements(worker);
     col_session_free_sorted_arrangements(worker);
-    col_session_free_diff_arrangements(worker);
     col_session_free_filt_arrangements(worker);
 
     /* Free hash table (may have been lazily built) */
