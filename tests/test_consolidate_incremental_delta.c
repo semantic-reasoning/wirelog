@@ -1027,6 +1027,52 @@ test_fastpath_counter_interleaved(void)
     PASS();
 }
 
+static void
+test_shared_single_delta_fallback_detaches_view(void)
+{
+    TEST("shared one-row fallback detaches before mutating storage");
+
+    col_rel_t *owner = test_rel_alloc(1);
+    col_rel_t *view = test_rel_alloc(1);
+    col_rel_t *delta_out = test_rel_alloc(1);
+    ASSERT(owner && view && delta_out, "shared fallback relations");
+
+    int64_t values[] = { 10, 30, 20 };
+    for (uint32_t i = 0; i < 3; i++)
+        ASSERT(test_rel_append_row(owner, &values[i]) == 0,
+            "shared fallback source row");
+    ASSERT(col_rel_install_shared_view(view, owner) == 0,
+        "shared fallback view installation");
+    int64_t *owner_columns = owner->columns[0];
+    int fast_path = -1;
+
+    ASSERT(col_op_consolidate_incremental_delta(view, 2, delta_out,
+        &fast_path) == 0, "shared fallback consolidation succeeds");
+    ASSERT(fast_path == 0, "interleaved one-row delta uses fallback");
+    ASSERT(view->col_shared == NULL && view->storage_owner == view
+        && owner->storage_alias_borrows == 0,
+        "shared fallback retires the view alias");
+    ASSERT(owner->columns[0] == owner_columns
+        && owner->columns[0][0] == 10
+        && owner->columns[0][1] == 30
+        && owner->columns[0][2] == 20,
+        "shared fallback preserves the canonical owner");
+    ASSERT(view->nrows == 3 && view->sorted_nrows == 3
+        && view->run_count == 1 && view->run_ends[0] == 3
+        && test_rel_is_sorted(view) && test_rel_is_unique(view)
+        && view->columns[0][0] == 10
+        && view->columns[0][1] == 20
+        && view->columns[0][2] == 30,
+        "shared fallback publishes sorted private storage");
+    ASSERT(delta_out->nrows == 1 && delta_out->columns[0][0] == 20,
+        "shared fallback emits the novel row");
+
+    test_rel_free(delta_out);
+    test_rel_free(view);
+    test_rel_free(owner);
+    PASS();
+}
+
 /* ================================================================
  * Test 15: NULL out_fast_path does not crash (Issue #278)
  *
@@ -1325,6 +1371,7 @@ main(void)
     test_fastpath_counter_empty_old();
     test_fastpath_counter_sorted_after();
     test_fastpath_counter_interleaved();
+    test_shared_single_delta_fallback_detaches_view();
     test_fastpath_counter_null_safe();
     test_initialized_zero_column_relation();
     test_source_exclusion_is_transactional();

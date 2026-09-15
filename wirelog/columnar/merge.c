@@ -1682,6 +1682,18 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
         return 0;
     }
 
+    /* A one-row deferred sort is a valid no-op, but the fallback and binary
+     * search paths below still mutate relation storage.  Detach a shared
+     * view before those mutations so the deferred cleanup can retire its
+     * alias borrow while the owner writer remains held. */
+    if (rel->col_shared) {
+        int cow_rc = col_rel_cow_unshare_with_source_writer(rel, rel_writer);
+        if (cow_rc != 0)
+            return col_op_consolidate_incremental_delta_fail(delta_out,
+                       delta_initial_nrows, cow_rc);
+        *out_rel_alias_release_pending = true;
+    }
+
     /* Adaptive dispatch (#369): use binary-search dedup when D << N,
      * fall back to 2-pointer merge when D is large (first iterations). */
     if (d_unique <= old_nrows / 16 && rel->run_count > 0) {
