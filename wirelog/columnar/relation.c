@@ -4911,10 +4911,14 @@ no_memory:
     return ENOMEM;
 }
 
-/* Requires !r->col_shared, which is exactly the condition that makes the
-* COW/rollback block in col_rel_radix_sort_impl a no-op, so this calls
-* col_rel_radix_sort_raw directly to thread the caller's workspace through.
-* It takes no alias and performs no COW, so it has nothing to release. */
+static int
+col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
+    bool defer_alias_release, bool *out_alias_release_pending,
+    const wl_columnar_radix_workspace_t *workspace);
+
+/* Sort under a writer lease, using the caller's scratch workspace.  Shared
+* views take the same transactional COW path as the locked/consolidation
+* entry point; the alias lease is released after successful publication. */
 int
 wl_columnar_relation_radix_sort_with_workspace(col_rel_t *r,
     uint32_t start_row,
@@ -4934,15 +4938,22 @@ wl_columnar_relation_radix_sort_with_workspace(col_rel_t *r,
         return rc;
     if (!writer || writer->owner != &owner->source_access
         || writer->identity != (uintptr_t)writer
-        || !wl_columnar_source_access_writer_thread_equal(writer)
-        || r->col_shared)
+        || !wl_columnar_source_access_writer_thread_equal(writer))
         return EINVAL;
     /* Contention is reported as EBUSY, matching col_rel_radix_sort_locked.
      * Folding it into the EINVAL conjunction above made one family answer a
      * caller two different ways for the same condition. */
     if (r == owner && owner->storage_alias_borrows > 0)
         return EBUSY;
-    return col_rel_radix_sort_raw(r, start_row, nrows, workspace);
+    bool alias_release_pending = false;
+    rc = col_rel_radix_sort_impl(r, start_row, nrows, false,
+            &alias_release_pending, workspace);
+    if (alias_release_pending) {
+        int alias_rc = col_rel_storage_alias_release(r);
+        if (alias_rc != 0 && rc == 0)
+            rc = alias_rc;
+    }
+    return rc;
 }
 
 /* defer_alias_release describes the transactional shape of this call: the
@@ -4953,7 +4964,8 @@ wl_columnar_relation_radix_sort_with_workspace(col_rel_t *r,
  * new consolidation entry point routed through a different wrapper. */
 static int
 col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
-    bool defer_alias_release, bool *out_alias_release_pending)
+    bool defer_alias_release, bool *out_alias_release_pending,
+    const wl_columnar_radix_workspace_t *workspace)
 {
     if (out_alias_release_pending)
         *out_alias_release_pending = false;
@@ -5001,7 +5013,7 @@ col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
 #endif
     }
 
-    int rc = col_rel_radix_sort_raw(r, start_row, nrows, NULL);
+    int rc = col_rel_radix_sort_raw(r, start_row, nrows, workspace);
     if (rc != 0 && borrowed) {
         for (uint32_t c = 0; c < r->ncols; c++) {
             int64_t *current = NULL;
@@ -5072,7 +5084,7 @@ col_rel_radix_sort_locked(col_rel_t *r, uint32_t start_row, uint32_t nrows,
     if (nrows <= 1)
         return 0;
     rc = col_rel_radix_sort_impl(r, start_row, nrows, defer_alias_release,
-            out_alias_release_pending);
+            out_alias_release_pending, NULL);
     if (!defer_alias_release && *out_alias_release_pending) {
         int alias_rc = col_rel_storage_alias_release(r);
         if (alias_rc != 0 && rc == 0)

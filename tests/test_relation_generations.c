@@ -1080,6 +1080,142 @@ test_source_reader_blocks_radix_sort(void)
 }
 
 static void
+test_workspace_sort_cows_shared_view(void)
+{
+    col_rel_t *source = new_relation();
+    col_rel_t *view = new_relation();
+    wl_columnar_source_access_writer_t writer = { 0 };
+    wl_columnar_radix_workspace_t workspace = { 0 };
+    uint32_t boundaries[2];
+    bool *old_shared;
+    int64_t *old_column;
+
+    CHECK(source && view, "workspace shared-view relation allocation");
+    for (int64_t value = 40; value > 0; value--)
+        CHECK(col_rel_append_row(source, &value) == 0,
+            "workspace shared-view seed");
+    CHECK(col_rel_install_shared_view(view, source) == 0,
+        "workspace shared-view install");
+    boundaries[0] = 0;
+    boundaries[1] = view->nrows;
+    CHECK(wl_columnar_radix_workspace_prepare(view, boundaries, 1, 0,
+        &workspace) == 0, "workspace shared-view preparation");
+    CHECK(wl_columnar_source_access_writer_acquire(
+            &source->source_access, &writer) == 0,
+        "workspace shared-view writer admission");
+    old_column = view->columns[0];
+    old_shared = view->col_shared;
+    CHECK(wl_columnar_relation_radix_sort_with_workspace(view, 0,
+        view->nrows, &writer, &workspace) == 0,
+        "workspace sort COWs shared view");
+    CHECK(view->columns[0] != old_column && view->col_shared == NULL
+        && source->storage_alias_borrows == 0
+        && view->columns[0][0] == 1 && view->columns[0][view->nrows - 1u] == 40,
+        "workspace sort publishes detached sorted storage");
+    CHECK(old_shared != NULL, "workspace sort started from shared storage");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "workspace shared-view writer release");
+    wl_columnar_radix_workspace_destroy(&workspace);
+    cleanup_relations();
+}
+
+static void
+test_source_writer_cow_shared_view(void)
+{
+    col_rel_t *source = new_relation();
+    col_rel_t *view = new_relation();
+    wl_columnar_source_access_writer_t writer = { 0 };
+    bool alias_release_pending = true;
+    int64_t source_first;
+
+    CHECK(source && view, "source-writer shared-view relation allocation");
+    for (int64_t value = 40; value > 0; value--)
+        CHECK(col_rel_append_row(source, &value) == 0,
+            "source-writer shared-view seed");
+    CHECK(col_rel_install_shared_view(view, source) == 0,
+        "source-writer shared-view install");
+    source_first = source->columns[0][0];
+    CHECK(wl_columnar_source_access_writer_acquire(
+            &source->source_access, &writer) == 0,
+        "source-writer shared-view admission");
+    /* defer_alias_release == false is the self-releasing mode the wrapper
+     * this test was written against provided before #1594 collapsed the
+     * radix-sort lease wrappers into col_rel_radix_sort_locked. */
+    CHECK(col_rel_radix_sort_locked(view, 0, view->nrows, &writer, false,
+        &alias_release_pending) == 0,
+        "source-writer sorts shared view through COW");
+    CHECK(alias_release_pending == false,
+        "source-writer COW released the alias itself");
+    CHECK(source->columns[0][0] == source_first
+        && view->col_shared == NULL
+        && source->storage_alias_borrows == 0
+        && view->columns[0][0] == 1
+        && view->columns[0][view->nrows - 1u] == 40,
+        "source-writer COW preserves source and detaches view");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "source-writer shared-view release");
+    cleanup_relations();
+}
+
+/* The workspace entry point must thread the caller's scratch buffers into
+ * the sort rather than quietly allocating its own: a workspace prepared for
+ * a smaller range is refused.  That refusal is also the only reachable way
+ * to exercise the shared-view rollback, so this pins both -- the detach is
+ * undone and the alias borrow survives, leaving the view readable through
+ * the source exactly as before the attempt. */
+static void
+test_workspace_sort_rejects_undersized_workspace_and_rolls_back(void)
+{
+    col_rel_t *source = new_relation();
+    col_rel_t *view = new_relation();
+    col_rel_t *sorted = new_relation();
+    wl_columnar_radix_workspace_t undersized = { 0 };
+    wl_columnar_source_access_writer_t writer = { 0 };
+    uint32_t boundaries[2];
+    int64_t low = 1;
+    int64_t high = 2;
+    int64_t *source_column;
+
+    CHECK(source && view && sorted, "undersized workspace relations");
+    for (int64_t value = 40; value > 0; value--)
+        CHECK(col_rel_append_row(source, &value) == 0,
+            "undersized workspace seed");
+    CHECK(col_rel_install_shared_view(view, source) == 0,
+        "undersized workspace shared view");
+    source_column = source->columns[0];
+
+    /* Preparing over an already-sorted two-row segment leaves every
+     * capacity at zero, so the same workspace cannot serve a 40-row sort. */
+    CHECK(col_rel_append_row(sorted, &low) == 0, "undersized workspace row 0");
+    CHECK(col_rel_append_row(sorted, &high) == 0, "undersized workspace row 1");
+    boundaries[0] = 0u;
+    boundaries[1] = 2u;
+    CHECK(wl_columnar_radix_workspace_prepare(sorted, boundaries, 1, 0,
+        &undersized) == 0,
+        "undersized workspace preparation");
+    CHECK(undersized.k8_capacity == 0 && undersized.k16_capacity == 0
+        && undersized.insertion_capacity == 0,
+        "undersized workspace really is undersized");
+
+    CHECK(wl_columnar_source_access_writer_acquire(
+            &source->source_access, &writer) == 0,
+        "undersized workspace writer admission");
+    CHECK(wl_columnar_relation_radix_sort_with_workspace(view, 0,
+        view->nrows, &writer, &undersized) == EINVAL,
+        "undersized workspace refused rather than silently reallocated");
+    CHECK(view->col_shared != NULL && view->storage_owner == source
+        && source->storage_alias_borrows == 1,
+        "refused workspace sort rolls the detach back");
+    CHECK(source->columns[0] == source_column
+        && col_rel_get(source, 0, 0) == 40 && col_rel_get(view, 0, 0) == 40,
+        "refused workspace sort leaves both relations unsorted");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "undersized workspace writer release");
+    wl_columnar_radix_workspace_destroy(&undersized);
+    cleanup_relations();
+}
+
+static void
 test_source_reader_blocks_direct_append_row(void)
 {
     col_rel_t *rel = new_relation();
@@ -3152,6 +3288,9 @@ main(void)
     test_radix_sort_locked_hands_back_the_alias();
     test_radix_sort_locked_releases_the_alias_itself();
     test_radix_sort_with_workspace_owner_with_borrows_is_busy();
+    test_workspace_sort_cows_shared_view();
+    test_workspace_sort_rejects_undersized_workspace_and_rolls_back();
+    test_source_writer_cow_shared_view();
     test_source_reader_blocks_direct_append_row();
     test_source_reader_blocks_append_row();
     test_source_reader_blocks_append_all();
