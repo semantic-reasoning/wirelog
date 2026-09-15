@@ -3542,7 +3542,7 @@ col_rel_replacement_old_reservation_valid(const col_rel_t *dst)
 }
 
 int
-col_rel_prepare_replacement(col_rel_t *dst, const col_rel_t *candidate,
+col_rel_prepare_replacement_locked(col_rel_t *dst, const col_rel_t *candidate,
     col_rel_replacement_t *replacement)
 {
     uint64_t planned_bytes;
@@ -3550,27 +3550,52 @@ col_rel_prepare_replacement(col_rel_t *dst, const col_rel_t *candidate,
     uint32_t compound_entries;
     int rc;
 
-    if (!dst || !candidate || !replacement || dst == candidate)
+    col_rel_t *owner = NULL;
+
+    if (!replacement)
         return EINVAL;
-    memset(replacement, 0, sizeof(*replacement));
+    if (replacement->staged || replacement->reservation_active
+        || replacement->writer_acquired)
+        return EINVAL;
+
+    /* Only a token that names this exact replacement object and current
+     * thread may be released.  A valid token for another gate is still ours
+     * to clean up; a copied or otherwise invalid token is not. */
+    if (!replacement->writer.owner
+        || replacement->writer.identity != (uintptr_t)&replacement->writer
+        || !wl_columnar_source_access_writer_thread_equal(
+            &replacement->writer))
+        return EINVAL;
+    replacement->writer_acquired = true;
+    if (!dst || col_rel_storage_owner_resolve(dst, &owner) != 0) {
+        rc = EINVAL;
+        goto fail;
+    }
+    if (owner != dst) {
+        rc = EBUSY;
+        goto fail;
+    }
+    if (replacement->writer.owner != &owner->source_access) {
+        rc = EINVAL;
+        goto fail;
+    }
+    if (!candidate || dst == candidate) {
+        rc = EINVAL;
+        goto fail;
+    }
     wl_columnar_memory_reservation_init(&replacement->reservation);
 
     rc = col_rel_replacement_validate_candidate(candidate);
     if (rc != 0)
-        return rc;
+        goto fail;
     if (dst->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
         || dst->storage_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
-        return EOVERFLOW;
+        goto overflow;
     if (!col_rel_replacement_old_reservation_valid(dst))
-        return EINVAL;
+        goto invalid;
     if (!col_rel_retained_bytes(candidate->ncols, candidate->capacity,
         candidate->timestamps != NULL, &planned_bytes))
-        return EOVERFLOW;
-
-    rc = col_rel_published_writer_acquire(dst, &replacement->writer);
-    if (rc != 0)
-        return rc;
-    replacement->writer_acquired = true;
+        goto overflow;
 
     /* Reserve the complete private shape before deep_copy allocates it.  The
      * candidate may borrow arena/shared storage, but publication always owns
@@ -3632,6 +3657,22 @@ fail:
 }
 
 int
+col_rel_prepare_replacement(col_rel_t *dst, const col_rel_t *candidate,
+    col_rel_replacement_t *replacement)
+{
+    int rc;
+
+    if (!dst || !candidate || !replacement || dst == candidate)
+        return EINVAL;
+    memset(replacement, 0, sizeof(*replacement));
+    wl_columnar_memory_reservation_init(&replacement->reservation);
+    rc = col_rel_published_writer_acquire(dst, &replacement->writer);
+    if (rc != 0)
+        return rc;
+    return col_rel_prepare_replacement_locked(dst, candidate, replacement);
+}
+
+int
 col_rel_commit_replacement_locked(col_rel_t *dst,
     col_rel_replacement_t *replacement)
 {
@@ -3657,6 +3698,7 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
         || col_rel_storage_owner_resolve(dst, &owner) != 0
         || owner != dst
         || replacement->writer.owner != &owner->source_access
+        || replacement->writer.identity != (uintptr_t)&replacement->writer
         || !wl_columnar_source_access_writer_thread_equal(
             &replacement->writer))
         return EINVAL;

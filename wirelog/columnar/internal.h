@@ -1990,6 +1990,11 @@ col_rel_destroy_checked(col_rel_t *r);
 int
 col_rel_prepare_replacement(col_rel_t *dst, const col_rel_t *candidate,
     col_rel_replacement_t *replacement);
+/* Prepare with replacement->writer already acquired for dst's canonical
+ * owner.  The token remains in that exact object until commit or discard. */
+int
+col_rel_prepare_replacement_locked(col_rel_t *dst, const col_rel_t *candidate,
+    col_rel_replacement_t *replacement);
 /* Publish a prepared replacement while its canonical writer is held.  This
 * path performs no allocation, schema construction, or memory admission. */
 int
