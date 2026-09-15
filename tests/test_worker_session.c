@@ -1172,8 +1172,9 @@ test_shared_view_relation_destroy(void)
         ok = 0;
     worker_rel->view_generation = saved_view;
     for (int i = 0; i < 16; i++) {
-        if (wl_columnar_session_install_shared_view(&worker, worker_rel,
-            src) != 0) {
+        int refresh_rc = wl_columnar_session_install_shared_view(&worker,
+                worker_rel, src);
+        if (refresh_rc != 0) {
             col_worker_session_destroy(&worker);
             col_rel_destroy(src);
             cleanup_coordinator(coord, plan, prog);

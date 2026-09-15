@@ -431,28 +431,39 @@ wl_columnar_session_install_shared_view(wl_col_session_t *sess,
     wl_columnar_session_source_lease_t **slot;
     wl_columnar_session_source_lease_t *old_lease;
     wl_columnar_session_source_lease_t *new_lease = NULL;
-    wl_columnar_source_access_reader_t source_reader = { 0 };
     col_rel_t *owner = NULL;
+    wl_columnar_source_access_gate_t *source_descriptor = NULL;
+    bool source_descriptor_held = false;
     int rc;
+    int descriptor_release_rc = 0;
 
     if (!sess || !dst || !src)
         return EINVAL;
-    rc = col_rel_source_reader_acquire_transferable(src, &source_reader);
+    rc = col_rel_storage_owner_ensure_initialized((col_rel_t *)src);
     if (rc != 0)
         return rc;
     rc = col_rel_storage_owner_resolve(src, &owner);
-    if (rc != 0) {
-        (void)col_rel_source_reader_release(&source_reader);
+    if (rc != 0)
         return rc;
-    }
     slot = wl_columnar_session_source_lease_slot(sess, dst);
     old_lease = *slot;
+    /* The publication helper acquires the owner reader it needs.  This
+     * wrapper only holds the source descriptor gate, avoiding a second owner
+     * reader that would make a same-owner lease refresh look busy. */
+    source_descriptor =
+        (wl_columnar_source_access_gate_t *)&src->descriptor_access;
+    rc = wl_columnar_source_access_gate_reader_acquire(source_descriptor);
+    if (rc != 0)
+        return rc;
+    source_descriptor_held = true;
     if (!old_lease || old_lease->owner != owner
         || old_lease->owner_identity != owner->relation_identity) {
         rc = wl_columnar_session_source_lease_prepare(dst, owner,
                 &new_lease);
         if (rc != 0) {
-            (void)col_rel_source_reader_release(&source_reader);
+            if (source_descriptor_held)
+                (void)wl_columnar_source_access_gate_reader_release(
+                    source_descriptor);
             return rc;
         }
     }
@@ -472,31 +483,40 @@ wl_columnar_session_install_shared_view(wl_col_session_t *sess,
                 = wl_columnar_session_source_lease_release(new_lease);
             assert(release_rc == 0);
         }
-        (void)col_rel_source_reader_release(&source_reader);
+        if (source_descriptor_held)
+            (void)wl_columnar_source_access_gate_reader_release(
+                source_descriptor);
         return rc;
     }
     if (!new_lease) {
-        rc = col_rel_source_reader_release(&source_reader);
+        rc = 0;
+        if (source_descriptor_held
+            && wl_columnar_source_access_gate_reader_release(
+                source_descriptor) != 0 && rc == 0)
+            rc = EINVAL;
         return rc == 0 ? 0 : EINVAL;
     }
+
+    rc = 0;
+    if (source_descriptor_held
+        && wl_columnar_source_access_gate_reader_release(source_descriptor)
+        != 0)
+        descriptor_release_rc = EINVAL;
 
     if (old_lease) {
         new_lease->next = old_lease->next;
         *slot = new_lease;
         old_lease->next = NULL;
-        rc = wl_columnar_session_source_lease_release(old_lease);
-        assert(rc == 0);
-        if (rc != 0) {
-            (void)col_rel_source_reader_release(&source_reader);
-            return rc;
-        }
+        int old_release_rc
+            = wl_columnar_session_source_lease_release(old_lease);
+        assert(old_release_rc == 0);
+        if (old_release_rc != 0)
+            return old_release_rc;
     } else {
         new_lease->next = sess->source_leases;
         sess->source_leases = new_lease;
     }
-    if (col_rel_source_reader_release(&source_reader) != 0 && rc == 0)
-        rc = EINVAL;
-    return rc;
+    return descriptor_release_rc;
 }
 
 static void
