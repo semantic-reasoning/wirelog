@@ -30,6 +30,43 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef WL_TEST_ALLOC_WRAP
+void *__real_malloc(size_t size);
+void *__real_calloc(size_t count, size_t size);
+void *__real_realloc(void *ptr, size_t size);
+static bool fail_next_alloc;
+
+void *
+__wrap_malloc(size_t size)
+{
+    if (fail_next_alloc) {
+        fail_next_alloc = false;
+        return NULL;
+    }
+    return __real_malloc(size);
+}
+
+void *
+__wrap_calloc(size_t count, size_t size)
+{
+    if (fail_next_alloc) {
+        fail_next_alloc = false;
+        return NULL;
+    }
+    return __real_calloc(count, size);
+}
+
+void *
+__wrap_realloc(void *ptr, size_t size)
+{
+    if (fail_next_alloc) {
+        fail_next_alloc = false;
+        return NULL;
+    }
+    return __real_realloc(ptr, size);
+}
+#endif
+
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -1621,6 +1658,228 @@ test_session_relation(wl_session_t *session, const char *name)
     return NULL;
 }
 
+static bool
+test_session_remove_alias_borrow_case(bool incremental)
+{
+    const int64_t rows[] = { 1, 2, 3 };
+    const int64_t remove_row[] = { 2 };
+    wl_plan_t *ffi = NULL;
+    wl_session_t *session = NULL;
+    col_rel_t *alias = NULL;
+    col_rel_t *input = NULL;
+    col_rel_t *derived = NULL;
+    wl_col_session_t *sess = NULL;
+    delta_collector_t deltas = { 0 };
+    uint32_t before_nrels = 0;
+    uint32_t before_outer_epoch = 0;
+    uint32_t before_input_rows = 0;
+    uint32_t before_derived_rows = 0;
+    uint32_t before_input_base = 0;
+    uint32_t before_delta_count = 0;
+    uint64_t before_input_view = 0;
+    uint64_t before_input_storage = 0;
+    uint64_t before_derived_view = 0;
+    uint64_t before_derived_storage = 0;
+    const char *before_last_inserted = NULL;
+    const char *before_last_removed = NULL;
+    bool before_pending = false;
+    bool before_pending_full = false;
+    bool before_snapshot_stable = false;
+    bool before_delta_seeded = false;
+    bool before_retraction_seeded = false;
+    bool before_rdelta_present = false;
+    bool before_d_delta_present = false;
+    bool ok = false;
+    int rc;
+
+    ffi = build_plan(".decl a(x: int32)\n"
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
+    if (!ffi)
+        goto cleanup;
+    rc = wl_session_create(wl_backend_columnar(), ffi, 1, &session);
+    if (rc != 0 || !session)
+        goto cleanup;
+    if (incremental)
+        wl_session_set_delta_cb(session, collect_delta, &deltas);
+    rc = wl_session_insert(session, "a", rows, 3, 1);
+    if (rc == 0)
+        rc = wl_session_step(session);
+    if (rc != 0)
+        goto cleanup;
+
+    sess = COL_SESSION(session);
+    input = test_session_relation(session, "a");
+    derived = test_session_relation(session, "r");
+    if (!input || !derived || input->nrows != 3 || derived->nrows != 3)
+        goto cleanup;
+    alias = col_rel_new_auto("test_alias_a", input->ncols);
+    if (!alias || col_rel_install_shared_view(alias, input) != 0)
+        goto cleanup;
+
+    before_nrels = sess->nrels;
+    before_outer_epoch = sess->outer_epoch;
+    before_input_rows = input->nrows;
+    before_derived_rows = derived->nrows;
+    before_input_base = input->base_nrows;
+    before_input_view = input->view_generation;
+    before_input_storage = input->storage_generation;
+    before_derived_view = derived->view_generation;
+    before_derived_storage = derived->storage_generation;
+    before_last_inserted = sess->last_inserted_relation;
+    before_last_removed = sess->last_removed_relation;
+    before_pending = sess->pending_input_change;
+    before_pending_full = sess->pending_full_input_eval;
+    before_snapshot_stable = sess->snapshot_stable_valid;
+    before_delta_seeded = sess->delta_seeded;
+    before_retraction_seeded = sess->retraction_seeded;
+    before_delta_count = (uint32_t)deltas.count;
+    before_rdelta_present = test_session_relation(session, "$r$a") != NULL;
+    before_d_delta_present = test_session_relation(session, "$d$a") != NULL;
+
+    rc = wl_session_remove(session, "a", remove_row, 1, 1);
+    if (rc != EBUSY || input->storage_alias_borrows != 1
+        || input->nrows != before_input_rows
+        || input->columns[0][0] != rows[0]
+        || input->columns[0][1] != rows[1]
+        || input->columns[0][2] != rows[2]
+        || derived->nrows != before_derived_rows
+        || derived->columns[0][0] != rows[0]
+        || derived->columns[0][1] != rows[1]
+        || derived->columns[0][2] != rows[2]
+        || input->base_nrows != before_input_base
+        || input->view_generation != before_input_view
+        || input->storage_generation != before_input_storage
+        || derived->view_generation != before_derived_view
+        || derived->storage_generation != before_derived_storage
+        || sess->nrels != before_nrels
+        || sess->outer_epoch != before_outer_epoch
+        || sess->last_inserted_relation != before_last_inserted
+        || sess->last_removed_relation != before_last_removed
+        || sess->pending_input_change != before_pending
+        || sess->pending_full_input_eval != before_pending_full
+        || sess->snapshot_stable_valid != before_snapshot_stable
+        || sess->delta_seeded != before_delta_seeded
+        || sess->retraction_seeded != before_retraction_seeded
+        || (uint32_t)deltas.count != before_delta_count
+        || (test_session_relation(session, "$r$a") != NULL)
+        != before_rdelta_present
+        || (test_session_relation(session, "$d$a") != NULL)
+        != before_d_delta_present)
+        goto cleanup;
+
+    col_rel_destroy(alias);
+    alias = NULL;
+    if (input->storage_alias_borrows != 0)
+        goto cleanup;
+    rc = wl_session_remove(session, "a", remove_row, 1, 1);
+    if (rc != 0 || input->nrows != 2 || input->columns[0][0] != rows[0]
+        || input->columns[0][1] != rows[2])
+        goto cleanup;
+    if (incremental) {
+        col_rel_t *rdelta = test_session_relation(session, "$r$a");
+        if (!rdelta || rdelta->nrows != 1
+            || rdelta->columns[0][0] != remove_row[0]
+            || sess->nrels != before_nrels + 1u
+            || sess->last_removed_relation != input->name)
+            goto cleanup;
+    } else if (sess->nrels != before_nrels
+        || test_session_relation(session, "$r$a") != NULL) {
+        goto cleanup;
+    }
+    ok = true;
+
+cleanup:
+    if (alias)
+        col_rel_destroy(alias);
+    if (session)
+        wl_session_destroy(session);
+    if (ffi)
+        wl_plan_free(ffi);
+    return ok;
+}
+
+static void
+test_session_remove_live_alias(void)
+{
+    TEST(
+        "session: direct removal rejects a live storage alias transactionally");
+    if (!test_session_remove_alias_borrow_case(false)) {
+        FAIL("direct alias-blocked removal changed state or retry failed");
+        return;
+    }
+    PASS();
+
+    TEST(
+        "session: incremental removal rejects a live storage alias transactionally");
+    if (!test_session_remove_alias_borrow_case(true)) {
+        FAIL("incremental alias-blocked removal changed state or retry failed");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_session_remove_wide_alias_before_allocation(void)
+{
+    TEST("session: direct removal rejects wide live aliases before allocation");
+
+    wl_plan_t *ffi = build_plan(".decl a(x: int32)\n");
+    wl_session_t *session = NULL;
+    col_rel_t *wide = NULL;
+    col_rel_t *alias = NULL;
+    int64_t remove_row[COL_STACK_MAX + 1u] = { 0 };
+    int rc = ffi ? wl_session_create(wl_backend_columnar(), ffi, 1, &session)
+                 : ENOMEM;
+    if (rc != 0 || !session)
+        goto fail;
+
+    wide = col_rel_new_auto("wide", COL_STACK_MAX + 1u);
+    alias = col_rel_new_auto("wide_alias", COL_STACK_MAX + 1u);
+    if (!wide || !alias || session_add_rel(COL_SESSION(session), wide) != 0)
+        goto fail;
+    wide = NULL;
+    if (col_rel_install_shared_view(alias,
+        test_session_relation(session, "wide")) != 0)
+        goto fail;
+
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = true;
+#endif
+    rc = wl_session_remove(session, "wide", remove_row, 1,
+            COL_STACK_MAX + 1u);
+#ifdef WL_TEST_ALLOC_WRAP
+    bool allocation_was_not_attempted = fail_next_alloc;
+    fail_next_alloc = false;
+    if (rc != EBUSY || !allocation_was_not_attempted)
+        goto fail;
+#else
+    if (rc != EBUSY)
+        goto fail;
+#endif
+
+    col_rel_destroy(alias);
+    alias = NULL;
+    wl_session_destroy(session);
+    wl_plan_free(ffi);
+    PASS();
+    return;
+
+fail:
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = false;
+#endif
+    if (alias)
+        col_rel_destroy(alias);
+    if (wide)
+        col_rel_destroy(wide);
+    if (session)
+        wl_session_destroy(session);
+    if (ffi)
+        wl_plan_free(ffi);
+    FAIL("wide alias removal attempted allocation or did not return EBUSY");
+}
+
 static void
 test_session_remove_reader_exclusion(void)
 {
@@ -1746,6 +2005,245 @@ test_session_remove_incremental_reader_exclusion(void)
     }
     wl_session_destroy(session);
     wl_plan_free(ffi);
+    PASS();
+}
+
+static void
+test_session_full_idb_clear_reader_exclusion(void)
+{
+    TEST("session: full IDB clear is transactional across source owners");
+
+    wl_plan_t *ffi = build_plan(".decl a(x: int32)\n"
+            ".decl b(x: int32)\n"
+            ".decl r(x: int32)\n"
+            ".decl s(x: int32)\n"
+            "r(x) :- a(x).\n"
+            "s(x) :- b(x).\n");
+    wl_session_t *session = NULL;
+    tuple_collector_t tuples = { 0 };
+    tuple_collector_t retry_tuples = { 0 };
+    wl_columnar_source_access_reader_t reader = { 0 };
+    bool reader_active = false;
+    col_rel_t *reader_owner = NULL;
+    col_rel_t *r = NULL;
+    col_rel_t *s = NULL;
+    col_rel_t *a = NULL;
+    col_rel_t *b = NULL;
+    wl_col_session_t *sess = NULL;
+    uint32_t before_r_rows = 0;
+    uint32_t before_s_rows = 0;
+    uint32_t before_a_rows = 0;
+    uint32_t before_b_rows = 0;
+    int64_t before_r_value = 0;
+    int64_t before_s_value = 0;
+    int64_t before_a_first = 0;
+    int64_t before_a_last = 0;
+    int64_t before_b_first = 0;
+    int64_t before_b_last = 0;
+    uint64_t before_r_view_generation = 0;
+    uint64_t before_s_view_generation = 0;
+    uint64_t before_r_storage_generation = 0;
+    uint64_t before_s_storage_generation = 0;
+    uint64_t before_a_view_generation = 0;
+    uint64_t before_b_view_generation = 0;
+    uint64_t before_a_storage_generation = 0;
+    uint64_t before_b_storage_generation = 0;
+    uint32_t before_tuple_count = 0;
+    uint32_t before_outer_epoch = 0;
+    const char *before_last_inserted = NULL;
+    const char *before_last_removed = NULL;
+    bool before_pending_input_change = false;
+    bool before_pending_full_input_eval = false;
+    bool before_snapshot_stable_valid = false;
+    bool before_delta_seeded = false;
+    bool before_retraction_seeded = false;
+    int rc = 0;
+    const char *failure = NULL;
+
+    if (!ffi) {
+        failure = "could not generate FFI plan";
+        goto cleanup;
+    }
+    rc = wl_session_create(wl_backend_columnar(), ffi, 1, &session);
+    if (rc != 0 || !session) {
+        failure = "session_create failed";
+        goto cleanup;
+    }
+
+    int64_t a_initial = 1;
+    int64_t b_initial = 2;
+    rc = wl_session_insert(session, "a", &a_initial, 1, 1);
+    if (rc == 0)
+        rc = wl_session_insert(session, "b", &b_initial, 1, 1);
+    if (rc == 0)
+        rc = wl_session_snapshot(session, collect_tuple, &tuples);
+    if (rc != 0) {
+        failure = "initial IDB snapshot failed";
+        goto cleanup;
+    }
+
+    r = test_session_relation(session, "r");
+    s = test_session_relation(session, "s");
+    a = test_session_relation(session, "a");
+    b = test_session_relation(session, "b");
+    sess = COL_SESSION(session);
+    col_rel_t *r_owner = NULL;
+    col_rel_t *s_owner = NULL;
+    uint32_t r_plan_pos = UINT32_MAX;
+    uint32_t s_plan_pos = UINT32_MAX;
+    if (!a || !b || !r || !s
+        || col_rel_storage_owner_resolve(r, &r_owner) != 0
+        || col_rel_storage_owner_resolve(s, &s_owner) != 0
+        || r_owner == s_owner) {
+        failure = "could not resolve source and distinct IDB owners";
+        goto cleanup;
+    }
+
+    uint32_t plan_pos = 0;
+    for (uint32_t si = 0; si < sess->plan->stratum_count; si++) {
+        const wl_plan_stratum_t *sp = &sess->plan->strata[si];
+        for (uint32_t ri = 0; ri < sp->relation_count; ri++, plan_pos++) {
+            if (strcmp(sp->relations[ri].name, "r") == 0)
+                r_plan_pos = plan_pos;
+            if (strcmp(sp->relations[ri].name, "s") == 0)
+                s_plan_pos = plan_pos;
+        }
+    }
+    if (r_plan_pos >= s_plan_pos) {
+        failure = "test plan does not place r before s";
+        goto cleanup;
+    }
+
+    if (r->nrows != 1u || s->nrows != 1u
+        || a->nrows != 1u || b->nrows != 1u
+        || r->ncols != 1u || s->ncols != 1u
+        || a->ncols != 1u || b->ncols != 1u) {
+        failure = "initial source or IDB targets were not as expected";
+        goto cleanup;
+    }
+    before_r_rows = r->nrows;
+    before_s_rows = s->nrows;
+    before_a_rows = a->nrows;
+    before_b_rows = b->nrows;
+    before_r_value = r->columns[0][0];
+    before_s_value = s->columns[0][0];
+    before_a_first = a->columns[0][0];
+    before_a_last = before_a_first;
+    before_b_first = b->columns[0][0];
+    before_b_last = before_b_first;
+    before_r_view_generation = r->view_generation;
+    before_s_view_generation = s->view_generation;
+    before_r_storage_generation = r->storage_generation;
+    before_s_storage_generation = s->storage_generation;
+    before_a_view_generation = a->view_generation;
+    before_b_view_generation = b->view_generation;
+    before_a_storage_generation = a->storage_generation;
+    before_b_storage_generation = b->storage_generation;
+
+    /* The plan visits s after r.  Holding s's reader ensures a clear that
+     * mutates targets in plan order cannot leave r changed before it notices
+     * the later owner is busy. */
+    reader_owner = s_owner;
+    rc = col_rel_source_reader_acquire(reader_owner, &reader);
+    if (rc != 0) {
+        failure = "reader acquisition on an IDB owner failed";
+        goto cleanup;
+    }
+    reader_active = true;
+
+    int64_t a_next = 3;
+    int64_t b_next = 4;
+    rc = wl_session_insert(session, "a", &a_next, 1, 1);
+    if (rc == 0)
+        rc = wl_session_insert(session, "b", &b_next, 1, 1);
+    if (rc != 0) {
+        failure = "source updates for full IDB clear setup failed";
+        goto cleanup;
+    }
+    before_a_rows = a->nrows;
+    before_b_rows = b->nrows;
+    before_a_first = a->columns[0][0];
+    before_b_first = b->columns[0][0];
+    before_a_view_generation = a->view_generation;
+    before_b_view_generation = b->view_generation;
+    before_a_storage_generation = a->storage_generation;
+    before_b_storage_generation = b->storage_generation;
+    before_tuple_count = (uint32_t)tuples.count;
+    before_outer_epoch = sess->outer_epoch;
+    before_last_inserted = sess->last_inserted_relation;
+    before_last_removed = sess->last_removed_relation;
+    before_pending_input_change = sess->pending_input_change;
+    before_pending_full_input_eval = sess->pending_full_input_eval;
+    before_snapshot_stable_valid = sess->snapshot_stable_valid;
+    before_delta_seeded = sess->delta_seeded;
+    before_retraction_seeded = sess->retraction_seeded;
+    before_a_last = a->columns[0][a->nrows - 1u];
+    before_b_last = b->columns[0][b->nrows - 1u];
+    rc = wl_session_snapshot(session, collect_tuple, &tuples);
+    if (rc != EBUSY) {
+        failure =
+            "full IDB clear did not return EBUSY for a later owner reader";
+        goto cleanup;
+    }
+    if ((uint32_t)tuples.count != before_tuple_count
+        || a->nrows != before_a_rows
+        || b->nrows != before_b_rows
+        || a->columns[0][0] != before_a_first
+        || a->columns[0][a->nrows - 1u] != before_a_last
+        || b->columns[0][0] != before_b_first
+        || b->columns[0][b->nrows - 1u] != before_b_last
+        || sess->outer_epoch != before_outer_epoch
+        || sess->last_inserted_relation != before_last_inserted
+        || sess->last_removed_relation != before_last_removed
+        || sess->pending_input_change != before_pending_input_change
+        || sess->pending_full_input_eval != before_pending_full_input_eval
+        || sess->snapshot_stable_valid != before_snapshot_stable_valid
+        || sess->delta_seeded != before_delta_seeded
+        || sess->retraction_seeded != before_retraction_seeded) {
+        failure = "reader-blocked full clear changed input state";
+        goto cleanup;
+    }
+    if (r->nrows != before_r_rows || s->nrows != before_s_rows
+        || r->columns[0][0] != before_r_value
+        || s->columns[0][0] != before_s_value
+        || r->view_generation != before_r_view_generation
+        || s->view_generation != before_s_view_generation
+        || r->storage_generation != before_r_storage_generation
+        || s->storage_generation != before_s_storage_generation
+        || a->view_generation != before_a_view_generation
+        || b->view_generation != before_b_view_generation
+        || a->storage_generation != before_a_storage_generation
+        || b->storage_generation != before_b_storage_generation
+        || r_owner->storage_generation != before_r_storage_generation
+        || s_owner->storage_generation != before_s_storage_generation) {
+        failure = "reader-blocked full clear changed an IDB relation";
+        goto cleanup;
+    }
+
+cleanup:
+    if (reader_active) {
+        int release_rc = col_rel_source_reader_release(&reader);
+        reader_active = false;
+        if (!failure && release_rc != 0)
+            failure = "source reader release failed";
+    }
+    if (!failure && session) {
+        rc = wl_session_snapshot(session, collect_tuple, &retry_tuples);
+        if (rc != 0 || retry_tuples.count != 4
+            || !has_tuple(&retry_tuples, "r", (int64_t[]){ 1 }, 1)
+            || !has_tuple(&retry_tuples, "r", (int64_t[]){ 3 }, 1)
+            || !has_tuple(&retry_tuples, "s", (int64_t[]){ 2 }, 1)
+            || !has_tuple(&retry_tuples, "s", (int64_t[]){ 4 }, 1))
+            failure = "full IDB snapshot retry failed after reader release";
+    }
+    if (session)
+        wl_session_destroy(session);
+    if (ffi)
+        wl_plan_free(ffi);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
     PASS();
 }
 
@@ -2084,8 +2582,11 @@ main(void)
     /* GREEN: diff=-1 retraction deltas now implemented */
     test_session_remove_single_delta();
     test_session_remove_nonexistent();
+    test_session_remove_live_alias();
+    test_session_remove_wide_alias_before_allocation();
     test_session_remove_reader_exclusion();
     test_session_remove_incremental_reader_exclusion();
+    test_session_full_idb_clear_reader_exclusion();
     /* GREEN: col_session_remove returns 0 for uninitialized schema */
     /* test_session_snapshot_empty(); */
     /* test_session_snapshot_after_insert(); */
