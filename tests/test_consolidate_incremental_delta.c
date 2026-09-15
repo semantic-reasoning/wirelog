@@ -1129,6 +1129,82 @@ test_source_exclusion_is_transactional(void)
 }
 
 #ifdef WL_TEST_CONSOLIDATE_HOOK
+/* Issue #1594: the sort hook fires on the deferred-alias shape, not on which
+ * wrapper called in.  This pins the scope so the re-key can neither widen it
+ * (every plain col_rel_radix_sort would fire, and the paused hook used by the
+ * tests above blocks on a condvar, so a widened scope hangs the suite rather
+ * than failing an assertion) nor drop it.  A counting hook is used here for
+ * exactly that reason: it can observe an unexpected fire without deadlocking. */
+static uint32_t sort_hook_fire_count;
+static wl_columnar_consolidation_test_stage_t sort_hook_last_stage;
+
+static void
+counting_sort_hook(col_rel_t *rel,
+    wl_columnar_consolidation_test_stage_t stage)
+{
+    (void)rel;
+    if (stage == WL_COLUMNAR_CONSOLIDATION_TEST_SORT_AFTER_DETACH) {
+        sort_hook_fire_count++;
+        sort_hook_last_stage = stage;
+    }
+}
+
+static void
+test_sort_hook_scope_follows_the_deferred_alias(void)
+{
+    TEST("sort hook fires for the deferred alias shape only");
+
+    col_rel_t *owner = test_rel_alloc(1);
+    col_rel_t *view = test_rel_alloc(1);
+    int64_t values[] = { 30, 10, 20 };
+    bool standalone_ok;
+    bool consolidation_ok;
+
+    ASSERT(owner && view, "allocate hook scope relations");
+    for (uint32_t i = 0; i < 3; i++)
+        ASSERT(test_rel_append_row(owner, &values[i]) == 0,
+            "append hook scope row");
+    ASSERT(col_rel_install_shared_view(view, owner) == 0,
+        "install hook scope view");
+
+    sort_hook_fire_count = 0;
+    sort_hook_last_stage = 0;
+    wl_columnar_consolidation_transition_hook = counting_sort_hook;
+
+    /* Self-releasing shape: col_rel_radix_sort takes and retires the borrow
+     * itself, so the hook must stay silent. */
+    standalone_ok = col_rel_radix_sort(view, 0, view->nrows) == 0
+        && sort_hook_fire_count == 0;
+
+    /* Deferred shape: consolidation hands the borrow back, so the hook fires
+     * exactly once. */
+    col_rel_t *owner2 = test_rel_alloc(1);
+    col_rel_t *rel2 = test_rel_alloc(1);
+    consolidation_ok = owner2 && rel2;
+    if (consolidation_ok) {
+        for (uint32_t i = 0; i < 3; i++)
+            consolidation_ok = consolidation_ok
+                && test_rel_append_row(owner2, &values[i]) == 0;
+        consolidation_ok = consolidation_ok
+            && col_rel_install_shared_view(rel2, owner2) == 0;
+        sort_hook_fire_count = 0;
+        consolidation_ok = consolidation_ok
+            && col_op_consolidate_incremental_delta(rel2, 1, NULL, NULL) == 0
+            && sort_hook_fire_count == 1
+            && sort_hook_last_stage
+            == WL_COLUMNAR_CONSOLIDATION_TEST_SORT_AFTER_DETACH;
+    }
+
+    wl_columnar_consolidation_transition_hook = NULL;
+    ASSERT(standalone_ok, "self-releasing sort does not fire the hook");
+    ASSERT(consolidation_ok, "deferred consolidation sort fires it once");
+    test_rel_free(owner);
+    test_rel_free(view);
+    test_rel_free(owner2);
+    test_rel_free(rel2);
+    PASS();
+}
+
 static void
 test_shared_source_reader_excluded_through_sort(void)
 {
@@ -1253,6 +1329,7 @@ main(void)
     test_initialized_zero_column_relation();
     test_source_exclusion_is_transactional();
 #ifdef WL_TEST_CONSOLIDATE_HOOK
+    test_sort_hook_scope_follows_the_deferred_alias();
     test_shared_source_reader_excluded_through_sort();
     test_shared_delta_reader_excluded_through_append();
 #endif
