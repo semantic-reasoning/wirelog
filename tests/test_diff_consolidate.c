@@ -66,6 +66,8 @@ make_mock_session(void)
 static void
 destroy_mock_session(wl_col_session_t *s)
 {
+    if (s->deferred_relations)
+        (void)wl_columnar_session_retry_deferred(s);
     delta_pool_destroy(s->delta_pool);
     free(s);
 }
@@ -599,39 +601,138 @@ test_blocked_sort_does_not_dedup_unsorted(void)
     eval_stack_push(&stack, rel, true);
     rc = col_op_consolidate_diff(&stack, sess);
 
-    if (col_rel_source_reader_release(&reader) != 0) {
-        eval_stack_drain(&stack);
+    if (eval_stack_drain_to_session(&stack, sess) != 0) {
+        (void)col_rel_source_reader_release(&reader);
         destroy_mock_session(sess);
-        FAIL("source reader release failed");
+        FAIL("evaluator cleanup must transfer the busy entry");
+        return;
+    }
+    if (stack.top != 0 || sess->deferred_relation_count != 1) {
+        (void)col_rel_source_reader_release(&reader);
+        destroy_mock_session(sess);
+        FAIL("busy entry must survive evaluator return in session registry");
         return;
     }
     if (rc == 0) {
-        col_rel_destroy(rel);
+        (void)col_rel_source_reader_release(&reader);
+        (void)wl_columnar_session_retry_deferred(sess);
         destroy_mock_session(sess);
         FAIL("blocked sort must not report success");
         return;
     }
     /* rel is still live to inspect because the operator hands it back to
-     * the stack rather than destroying it on this path.  The reader is
-     * released above, so the destroy below succeeds. */
+     * the stack rather than destroying it on this path.  The evaluator
+     * cleanup above transferred that exact entry to the session registry. */
     /* Nothing may have moved: not the row count, not the order, and not
      * the sorted marking. */
     if (rel->nrows != 4 || rel->sorted_nrows != 0) {
-        col_rel_destroy(rel);
+        (void)col_rel_source_reader_release(&reader);
+        (void)wl_columnar_session_retry_deferred(sess);
         destroy_mock_session(sess);
         FAIL("blocked sort must leave rows and sorted_nrows untouched");
         return;
     }
     for (uint32_t i = 0; i < 4; i++) {
         if (col_rel_get(rel, i, 0) != rows[i]) {
-            col_rel_destroy(rel);
+            (void)col_rel_source_reader_release(&reader);
+            (void)wl_columnar_session_retry_deferred(sess);
             destroy_mock_session(sess);
             FAIL("blocked sort must not reorder or drop rows");
             return;
         }
     }
-    col_rel_destroy(rel);
+    if (col_rel_source_reader_release(&reader) != 0) {
+        (void)wl_columnar_session_retry_deferred(sess);
+        destroy_mock_session(sess);
+        FAIL("source reader release failed");
+        return;
+    }
+    if (wl_columnar_session_retry_deferred(sess) != 0
+        || sess->deferred_relation_count != 0) {
+        destroy_mock_session(sess);
+        FAIL("session retry must destroy the transferred relation");
+        return;
+    }
     destroy_mock_session(sess);
+    PASS;
+}
+
+static void
+test_eval_entry_dispose_retains_busy_relation(void)
+{
+    TEST("eval entry disposal retains a relation while its reader is held");
+    col_rel_t *rel = col_rel_new_auto("busy-dispose", 1);
+    wl_columnar_source_access_reader_t reader = { 0 };
+    eval_entry_t entry;
+    eval_stack_t stack;
+
+    ASSERT_TRUE(rel != NULL, "busy disposal relation allocation");
+    ASSERT_TRUE(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "busy disposal reader acquisition");
+    entry = (eval_entry_t){
+        .rel = rel,
+        .owned = true,
+        .kind = WL_COLUMNAR_EVAL_ENTRY_RELATION,
+    };
+    ASSERT_TRUE(eval_entry_dispose(&entry) == EBUSY,
+        "busy disposal reports EBUSY");
+    ASSERT_TRUE(entry.rel == rel && entry.owned,
+        "busy disposal preserves relation ownership");
+    ASSERT_TRUE(col_rel_source_reader_release(&reader) == 0,
+        "busy disposal reader release");
+    ASSERT_TRUE(eval_entry_dispose(&entry) == 0,
+        "disposal retries after reader release");
+    ASSERT_TRUE(entry.rel == NULL && !entry.owned,
+        "successful disposal clears the entry");
+
+    rel = col_rel_new_auto("busy-drain", 1);
+    ASSERT_TRUE(rel != NULL, "busy drain relation allocation");
+    ASSERT_TRUE(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "busy drain reader acquisition");
+    eval_stack_init(&stack);
+    ASSERT_TRUE(eval_stack_push(&stack, rel, true) == 0,
+        "busy drain relation push");
+    ASSERT_TRUE(eval_stack_drain(&stack) == EBUSY,
+        "busy drain reports EBUSY");
+    ASSERT_TRUE(stack.top == 1 && stack.items[0].rel == rel
+        && stack.items[0].owned,
+        "busy drain retains the exact entry");
+    ASSERT_TRUE(col_rel_source_reader_release(&reader) == 0,
+        "busy drain reader release");
+    ASSERT_TRUE(eval_stack_drain(&stack) == 0 && stack.top == 0,
+        "busy drain retries successfully");
+    PASS;
+}
+
+static void
+test_reader_admission_rejects_deferred_unsafe_storage(void)
+{
+    TEST("pool and arena relations cannot enter deferred reader tracking");
+    delta_pool_t *pool = delta_pool_create(4, sizeof(col_rel_t), 4096);
+    wl_arena_t *arena = wl_arena_create(64 * 1024);
+    wl_columnar_source_access_reader_t reader = { 0 };
+    col_rel_t *pool_rel;
+    col_rel_t *arena_rel;
+
+    ASSERT_TRUE(pool != NULL && arena != NULL,
+        "unsafe-storage fixture allocation");
+    pool_rel = col_rel_pool_new_auto(pool, NULL, "pool-reader", 1);
+    ASSERT_TRUE(pool_rel != NULL && pool_rel->pool_owned,
+        "pool relation allocation");
+    ASSERT_TRUE(col_rel_source_reader_acquire(pool_rel, &reader) == EINVAL,
+        "pool-backed reader admission must be rejected");
+    ASSERT_TRUE(col_rel_destroy_checked(pool_rel) == 0,
+        "pool-backed relation cleanup");
+
+    arena_rel = col_rel_pool_new_auto(pool, arena, "arena-reader", 1);
+    ASSERT_TRUE(arena_rel != NULL && arena_rel->pool_owned
+        && arena_rel->arena_owned, "arena-backed relation allocation");
+    ASSERT_TRUE(col_rel_source_reader_acquire(arena_rel, &reader) == EINVAL,
+        "arena-backed reader admission must be rejected");
+    ASSERT_TRUE(col_rel_destroy_checked(arena_rel) == 0,
+        "arena-backed relation cleanup");
+    delta_pool_destroy(pool);
+    wl_arena_free(arena);
     PASS;
 }
 
@@ -642,6 +743,8 @@ main(void)
 
     test_empty_relation();
     test_blocked_sort_does_not_dedup_unsorted();
+    test_eval_entry_dispose_retains_busy_relation();
+    test_reader_admission_rejects_deferred_unsafe_storage();
     test_single_row();
     test_already_sorted_unique();
     test_unsorted_full_sort();
