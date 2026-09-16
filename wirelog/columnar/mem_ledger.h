@@ -44,6 +44,7 @@ typedef volatile bool atomic_bool;
 typedef volatile int atomic_int;
 typedef volatile uint_fast64_t atomic_uint_fast64_t;
 #define ATOMIC_VAR_INIT(x) (x)
+#define atomic_init(ptr, val) (*(ptr) = (val))
 
 /* MSVC atomic macros using intrinsics that are guaranteed to exist */
 #define atomic_load_explicit(ptr, order) (*(ptr))
