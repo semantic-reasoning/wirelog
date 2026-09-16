@@ -887,9 +887,10 @@ cleanup_results:
                 }
             } else if (destroy_rc == EBUSY) {
                 /* A pool/arena result must never be kept past this worker's
-                 * allocator lifetime.  Reader admission should make this
-                 * unreachable; retain the invariant in debug builds. */
-                assert(eligible);
+                 * allocator lifetime, so it cannot be deferred and the
+                 * refusal is terminal here.  @eligible is false by
+                 * construction on this branch -- the arm above consumed
+                 * every eligible EBUSY -- so do not assert it. */
                 fprintf(stderr,
                     "wirelog: K-Fusion refused unsafe busy result cleanup\n");
                 abort();

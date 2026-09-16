@@ -704,35 +704,104 @@ test_eval_entry_dispose_retains_busy_relation(void)
     PASS;
 }
 
+/* Reader admission is a short-lived, operator-scoped gate, not the place
+ * that decides deferred ownership.  Pool- and arena-backed relations are
+ * read by ordinary operators -- the join builds its owned right-hand filter
+ * in sess->delta_pool -- so admission must accept them.  What must refuse
+ * them is the session's deferred-destruction registry, because only that
+ * makes a pointer outlive the allocator it came from (Issue #1593). */
 static void
-test_reader_admission_rejects_deferred_unsafe_storage(void)
+test_deferred_registry_refuses_unsafe_storage(void)
 {
-    TEST("pool and arena relations cannot enter deferred reader tracking");
+    TEST("pool and arena relations read fine but never defer");
+    wl_col_session_t *sess = make_mock_session();
     delta_pool_t *pool = delta_pool_create(4, sizeof(col_rel_t), 4096);
     wl_arena_t *arena = wl_arena_create(64 * 1024);
     wl_columnar_source_access_reader_t reader = { 0 };
     col_rel_t *pool_rel;
     col_rel_t *arena_rel;
 
-    ASSERT_TRUE(pool != NULL && arena != NULL,
+    ASSERT_TRUE(sess != NULL && pool != NULL && arena != NULL,
         "unsafe-storage fixture allocation");
+
     pool_rel = col_rel_pool_new_auto(pool, NULL, "pool-reader", 1);
     ASSERT_TRUE(pool_rel != NULL && pool_rel->pool_owned,
         "pool relation allocation");
-    ASSERT_TRUE(col_rel_source_reader_acquire(pool_rel, &reader) == EINVAL,
-        "pool-backed reader admission must be rejected");
-    ASSERT_TRUE(col_rel_destroy_checked(pool_rel) == 0,
-        "pool-backed relation cleanup");
+    ASSERT_TRUE(col_rel_source_reader_acquire(pool_rel, &reader) == 0,
+        "pool-backed reader admission must be accepted");
+    ASSERT_TRUE(col_rel_source_reader_release(&reader) == 0,
+        "pool-backed reader release");
+    ASSERT_TRUE(!wl_columnar_deferred_relation_eligible(pool_rel),
+        "pool relation is not deferral-eligible");
+    ASSERT_TRUE(wl_columnar_session_defer_relation(sess, pool_rel) == EINVAL,
+        "pool relation is refused by the deferred registry");
 
     arena_rel = col_rel_pool_new_auto(pool, arena, "arena-reader", 1);
     ASSERT_TRUE(arena_rel != NULL && arena_rel->pool_owned
         && arena_rel->arena_owned, "arena-backed relation allocation");
-    ASSERT_TRUE(col_rel_source_reader_acquire(arena_rel, &reader) == EINVAL,
-        "arena-backed reader admission must be rejected");
+    ASSERT_TRUE(col_rel_source_reader_acquire(arena_rel, &reader) == 0,
+        "arena-backed reader admission must be accepted");
+    ASSERT_TRUE(col_rel_source_reader_release(&reader) == 0,
+        "arena-backed reader release");
+    ASSERT_TRUE(!wl_columnar_deferred_relation_eligible(arena_rel),
+        "arena relation is not deferral-eligible");
+    ASSERT_TRUE(wl_columnar_session_defer_relation(sess, arena_rel) == EINVAL,
+        "arena relation is refused by the deferred registry");
+
+    /* A refused admission must leave no intrusive link behind. */
+    ASSERT_TRUE(sess->deferred_relations == NULL
+        && sess->deferred_relation_count == 0,
+        "refused admissions leave the registry empty");
+    ASSERT_TRUE(pool_rel->deferred_relation_session == NULL
+        && arena_rel->deferred_relation_session == NULL,
+        "refused admissions record no owning session");
+
+    ASSERT_TRUE(col_rel_destroy_checked(pool_rel) == 0,
+        "pool-backed relation cleanup");
     ASSERT_TRUE(col_rel_destroy_checked(arena_rel) == 0,
         "arena-backed relation cleanup");
     delta_pool_destroy(pool);
     wl_arena_free(arena);
+    destroy_mock_session(sess);
+    PASS;
+}
+
+/* A busy relation that cannot be deferred is a cleanup refusal, not a
+ * reason to kill the host process.  The entry stays on the stack and owned
+ * by it, so the caller can release the reader and retry. */
+static void
+test_drain_to_session_reports_unsafe_refusal(void)
+{
+    TEST("drain reports an undeferrable busy relation without aborting");
+    wl_col_session_t *sess = make_mock_session();
+    wl_columnar_source_access_reader_t reader = { 0 };
+    eval_stack_t stack;
+    col_rel_t *pool_rel;
+
+    ASSERT_TRUE(sess != NULL, "drain refusal fixture allocation");
+    pool_rel = col_rel_pool_new_auto(sess->delta_pool, NULL, "drain-pool", 1);
+    ASSERT_TRUE(pool_rel != NULL && pool_rel->pool_owned,
+        "drain pool relation allocation");
+    ASSERT_TRUE(col_rel_source_reader_acquire(pool_rel, &reader) == 0,
+        "drain reader acquisition");
+
+    eval_stack_init(&stack);
+    ASSERT_TRUE(eval_stack_push(&stack, pool_rel, true) == 0,
+        "drain relation push");
+    ASSERT_TRUE(eval_stack_drain_to_session(&stack, sess) == EBUSY,
+        "undeferrable busy relation reports EBUSY");
+    ASSERT_TRUE(stack.top == 1 && stack.items[0].rel == pool_rel
+        && stack.items[0].owned,
+        "refused drain retains the exact entry");
+    ASSERT_TRUE(sess->deferred_relations == NULL
+        && sess->deferred_relation_count == 0,
+        "refused drain admits nothing to the registry");
+
+    ASSERT_TRUE(col_rel_source_reader_release(&reader) == 0,
+        "drain reader release");
+    ASSERT_TRUE(eval_stack_drain_to_session(&stack, sess) == 0
+        && stack.top == 0, "drain retries successfully");
+    destroy_mock_session(sess);
     PASS;
 }
 
@@ -836,7 +905,8 @@ main(void)
     test_empty_relation();
     test_blocked_sort_does_not_dedup_unsorted();
     test_eval_entry_dispose_retains_busy_relation();
-    test_reader_admission_rejects_deferred_unsafe_storage();
+    test_deferred_registry_refuses_unsafe_storage();
+    test_drain_to_session_reports_unsafe_refusal();
     test_intrusive_deferred_registry();
     test_single_row();
     test_already_sorted_unique();

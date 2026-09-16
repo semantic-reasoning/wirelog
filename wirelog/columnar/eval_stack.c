@@ -205,20 +205,31 @@ eval_stack_drain_to_session(eval_stack_t *s, wl_col_session_t *sess)
             || !entry->owned || !entry->rel)
             return EFAULT;
         if (!wl_columnar_deferred_relation_eligible(entry->rel)) {
+            /* Pool/arena storage must never be recorded in the session
+             * registry: it can disappear with the evaluator's allocator.
+             * The exact entry is still on @s and still owned by it, so
+             * propagate the refusal rather than aborting -- a library must
+             * not kill its host over a recoverable cleanup refusal.  Note
+             * the evaluator stacks are block-local, so a caller that
+             * unwinds abandons the retained entry; and col_kfusion_drain()
+             * still escalates any non-zero return here to abort(), so the
+             * K-Fusion path's contract is deliberately unchanged. */
             fprintf(stderr,
                 "wirelog: unsafe evaluator deferred relation\n");
-            abort();
+            return EBUSY;
         }
 
         rc = wl_columnar_session_defer_relation(sess, entry->rel);
         if (rc != 0) {
-            /* The relation is still owned by this stack.  Returning would
-            * let the evaluator frame disappear and leak it; admission is
-            * allocation-free, so any failure is a lifecycle invariant. */
+            /* The relation is still owned by this stack and the entry is
+             * still on it, so the caller can retry or unwind.  Admission is
+             * allocation-free, so a failure here is a lifecycle invariant
+             * worth reporting loudly -- but not worth aborting the host
+             * process over. */
             fprintf(stderr,
                 "wirelog: evaluator deferred relation admission failed: %d\n",
                 rc);
-            abort();
+            return rc;
         }
         free(entry->seg_boundaries);
         memset(entry, 0, sizeof(*entry));
