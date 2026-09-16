@@ -428,8 +428,8 @@ wl_columnar_session_defer_relation(wl_col_session_t *sess, col_rel_t *rel)
         return EINVAL;
     if (rel->deferred_relation_session) {
         /* The relation is already owned by this registry, so repeated
-         * cleanup attempts are idempotent.  A relation cannot safely be
-         * adopted by a second session without first being unlinked. */
+        * cleanup attempts are idempotent.  A relation cannot safely be
+        * adopted by a second session without first being unlinked. */
         return rel->deferred_relation_session == sess ? 0 : EBUSY;
     }
     rel->deferred_relation_next = NULL;
