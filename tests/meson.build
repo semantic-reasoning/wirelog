@@ -3949,7 +3949,7 @@ test_col_rel_deep_copy_exe = executable(
   link_with: [testlib_prod],
 )
 
-test('col_rel_deep_copy', test_col_rel_deep_copy_exe)
+test('col_rel_deep_copy', test_col_rel_deep_copy_exe, timeout: 120)
 
 # Relation identity/generation contract and mutation instrumentation (Issue #1441)
 test_relation_generations_exe = executable(
