@@ -73,6 +73,28 @@ libdir=$(dirname "$candidate_lib")
 if [[ -n "$expected_library" ]]; then
     candidate_lib=$expected_library
 fi
+
+candidate_library_loaded() {
+    local trace=$1
+    local candidate_real alias alias_real
+
+    if [[ -n "$expected_library" ]]; then
+        grep -Fq "calling init: $candidate_lib" "$trace"
+        return
+    fi
+
+    candidate_real=$(readlink -f -- "$candidate_lib")
+    while IFS= read -r -d '' alias; do
+        alias_real=$(readlink -f -- "$alias")
+        if [[ "$alias_real" == "$candidate_real" ]] \
+            && grep -Fq "calling init: $alias" "$trace"; then
+            return 0
+        fi
+    done < <(find "$libdir" -maxdepth 1 \( -type f -o -type l \) \
+        -name 'libwirelog.so.*' -print0)
+    return 1
+}
+
 if [[ -n "$expected_output" ]]; then
     [[ -f "$expected_output" ]] || { echo "expected output not found: $expected_output" >&2; exit 2; }
     expected=$(cat "$expected_output")
@@ -99,7 +121,7 @@ run_consumer() {
         echo "missing loader trace for $name" >&2
         exit 1
     }
-    grep -Fq "calling init: $candidate_lib" "$trace" || {
+    candidate_library_loaded "$trace" || {
         echo "candidate library provenance check failed for $name" >&2
         exit 1
     }
