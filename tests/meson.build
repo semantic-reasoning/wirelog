@@ -1260,11 +1260,20 @@ endif
 # against the exact candidate installation, without reviving historical
 # unsupported-version comparisons.
 if sh.found()
+  # The self-test performs a full from-scratch release build, install, and
+  # consumer link/run.  Run it alone: a nested parallel ninja inside an
+  # ncpu-wide test scheduler measured 21.42 s .. >120.10 s for identical work
+  # across the legs of CI run 35064688453, and starved col_rel_deep_copy
+  # (28.83 s on the sibling TSan/clang leg of that run, against Meson's 30 s
+  # default) into a 30 s timeout.  600 s is ~5x the worst leg observed there,
+  # and keeps the 50% budget in scripts/ci/check-shell-gate-walltime.py
+  # satisfied up to 300 s.
   test('candidate_consumer_contract', sh,
        args: [meson.project_source_root() / 'scripts/ci/test-candidate-consumer-smoke.sh',
               meson.project_source_root()],
        suite: 'abi',
-       timeout: 120)
+       is_parallel: false,
+       timeout: 600)
 endif
 
 # Issue #1303: the WIRELOG_*_REQUIRED escalation. Half of this asserts gate
