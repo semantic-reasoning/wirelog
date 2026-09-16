@@ -229,6 +229,7 @@ col_op_concat(eval_stack_t *stack, wl_col_session_t *sess)
      * A refused checked destroy puts the exact entry back on @stack. */
     rc = col_op_concat_cleanup(stack, &a_e, &b_e, 0);
     if (rc != 0) {
+        free(out_boundaries);
         col_rel_destroy(out);
         return rc;
     }
