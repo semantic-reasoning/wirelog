@@ -96,7 +96,9 @@ class AuditTests(unittest.TestCase):
 
     def test_complete_pair_prefix_is_not_complete_inventory(self):
         root = Path(__file__).resolve().parents[1]
-        inventory = json.loads((root / "docs/tdd-execution-audit/inventory.json").read_text())
+        inventory = json.loads(
+            (root / "docs/tdd-execution-audit/inventory.json").read_text(
+                encoding="utf-8"))
         record = copy.deepcopy(next(r for r in inventory["runs"] if r.get("workload") == "polonius"
                                     and r.get("requested_workers") == 8))
         lines = record["logs"][".stderr"]["text"].splitlines()
@@ -118,7 +120,9 @@ class AuditTests(unittest.TestCase):
 
     def test_committed_evidence_matches_full_logs(self):
         root = Path(__file__).resolve().parents[1]
-        inventory = json.loads((root / "docs/tdd-execution-audit/inventory.json").read_text())
+        inventory = json.loads(
+            (root / "docs/tdd-execution-audit/inventory.json").read_text(
+                encoding="utf-8"))
         expected = {"cspa-fast": (20381, 6), "galen": (5568, 23),
                     "polonius": (1983, 23), "ddisasm": (704, 0), "crdt": (2152328, 14148)}
         measured = [r for r in inventory["runs"] if r["disposition"] == "measured_verified"]
