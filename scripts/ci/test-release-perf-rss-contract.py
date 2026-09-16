@@ -5,8 +5,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-RELEASE = (ROOT / ".github/workflows/release-tag.yml").read_text()
-DOCS = (ROOT / "docs/RELEASE_PROCESS.md").read_text()
+RELEASE = (ROOT / ".github/workflows/release-tag.yml").read_text(
+    encoding="utf-8")
+DOCS = (ROOT / "docs/RELEASE_PROCESS.md").read_text(encoding="utf-8")
 DOCS_FLAT = " ".join(DOCS.split())
 
 
