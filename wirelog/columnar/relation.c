@@ -4355,7 +4355,6 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     bool has_old_reservation;
     uint64_t old_retained_bytes;
     wl_columnar_memory_reservation_t old_reservation;
-    int reservation_rc;
     int release_rc;
 
     /* Preparation establishes all fallible invariants.  Publication is a
@@ -4385,8 +4384,10 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     has_old_reservation = old_retained_bytes > 0;
     if (has_old_reservation
         && !wl_columnar_memory_reservation_move(&old_reservation,
-        &dst->retained_reservation))
-        return EINVAL;
+        &dst->retained_reservation)) {
+        assert(false && "retained replacement reservation must be movable");
+        abort();
+    }
     if (has_new_reservation
         && !wl_columnar_memory_reservation_move(&new_reservation,
         &replacement->reservation)) {
@@ -4456,14 +4457,12 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     col_rel_storage_owner_init(&old);
     col_rel_free_contents(&old);
 
-    reservation_rc = 0;
     if (has_old_reservation
         && !wl_columnar_memory_release(&old_reservation)) {
         /* Keep the old token reachable by the caller's discard path if the
          * governor cannot release it yet.  The new token remains published
          * on dst, while this conservative token can be retried without a
          * double release. */
-        reservation_rc = EFAULT;
         if (wl_columnar_memory_reservation_move(
                 &replacement->reservation, &old_reservation))
             replacement->reservation_active = true;
