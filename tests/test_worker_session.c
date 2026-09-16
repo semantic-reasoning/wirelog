@@ -2668,6 +2668,109 @@ test_storage_alias_borrow_concurrent_accounting(void)
     return 0;
 }
 
+static int
+test_worker_deferred_relation_transfer_and_retry(void)
+{
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *coord = make_coordinator(&plan, &prog);
+    wl_col_session_t worker;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    col_rel_t *rel = NULL;
+    int64_t value = 91;
+    int ok = 1;
+
+    TEST("worker deferred relation transfer and coordinator retry");
+    memset(&worker, 0, sizeof(worker));
+    if (!coord
+        || col_worker_session_create(coord, 0, NULL, 0, &worker) != 0)
+        ok = 0;
+    rel = ok ? col_rel_new_auto("deferred-worker-result", 1) : NULL;
+    if (!rel || col_rel_append_row(rel, &value) != 0
+        || col_rel_source_reader_acquire(rel, &reader) != 0
+        || wl_columnar_session_defer_relation(&worker, rel) != 0)
+        ok = 0;
+    if (ok && col_worker_session_destroy(&worker) != 0)
+        ok = 0;
+    if (ok) {
+        ok = worker.deferred_relation_count == 0
+            && coord->deferred_relation_count == 1
+            && coord->deferred_relations == rel
+            && rel->deferred_relation_session == coord
+            && rel->deferred_relation_next == NULL
+            && !rel->pool_owned && !rel->arena_owned
+            && rel->nrows == 1 && rel->columns[0][0] == value;
+    }
+    if (ok && wl_columnar_session_retry_deferred(coord) != EBUSY)
+        ok = 0;
+    if (reader.owner && col_rel_source_reader_release(&reader) != 0)
+        ok = 0;
+    if (ok && wl_columnar_session_retry_deferred(coord) != 0)
+        ok = 0;
+    if (ok)
+        ok = coord->deferred_relation_count == 0
+            && coord->deferred_relations == NULL;
+    if (!ok && reader.owner)
+        (void)col_rel_source_reader_release(&reader);
+    if (coord)
+        cleanup_coordinator(coord, plan, prog);
+    else {
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+    }
+    if (!ok) {
+        FAIL("busy relation was not transferred and retried safely");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+static int
+test_worker_deferred_relation_retries_locally(void)
+{
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *coord = make_coordinator(&plan, &prog);
+    wl_col_session_t worker;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    col_rel_t *rel = NULL;
+    int64_t value = 37;
+    int ok = 1;
+
+    TEST("worker deferred relation retries after reader release");
+    memset(&worker, 0, sizeof(worker));
+    if (!coord
+        || col_worker_session_create(coord, 0, NULL, 0, &worker) != 0)
+        ok = 0;
+    rel = ok ? col_rel_new_auto("deferred-worker-local", 1) : NULL;
+    if (!rel || col_rel_append_row(rel, &value) != 0
+        || col_rel_source_reader_acquire(rel, &reader) != 0
+        || wl_columnar_session_defer_relation(&worker, rel) != 0)
+        ok = 0;
+    if (reader.owner && col_rel_source_reader_release(&reader) != 0)
+        ok = 0;
+    if (ok && col_worker_session_destroy(&worker) != 0)
+        ok = 0;
+    if (ok)
+        ok = coord->deferred_relation_count == 0
+            && coord->deferred_relations == NULL;
+    if (!ok && reader.owner)
+        (void)col_rel_source_reader_release(&reader);
+    if (coord)
+        cleanup_coordinator(coord, plan, prog);
+    else {
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+    }
+    if (!ok) {
+        FAIL("released relation was not reclaimed by worker teardown");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -2706,6 +2809,8 @@ main(int argc, char **argv)
     test_rdf_graph_metadata_absent_when_no_graph_column();
     test_worker_alias_chain_checked_teardown();
     test_worker_teardown_refusal_is_retryable();
+    test_worker_deferred_relation_transfer_and_retry();
+    test_worker_deferred_relation_retries_locally();
     test_pool_alias_teardown_refusal_is_retryable();
     test_pool_relation_promotion_tombstones_source();
     test_pool_relation_promotion_rejects_live_children();

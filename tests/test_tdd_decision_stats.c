@@ -66,6 +66,9 @@ static int submission_allowance = -1;
 static int hold_reader_before_worker_cleanup;
 static int cleanup_reader_rc;
 static wl_columnar_source_access_reader_t cleanup_reader;
+static int cleanup_deferred_rc;
+static col_rel_t *cleanup_deferred_rel;
+static wl_columnar_source_access_reader_t cleanup_deferred_reader;
 
 int
 wl_columnar_eval_test_submit(wl_work_queue_t *wq,
@@ -88,6 +91,21 @@ wl_columnar_eval_test_before_worker_cleanup(wl_col_session_t *coord)
     col_rel_t *alias = session_find_rel(&coord->tdd_workers[0], "edge");
     cleanup_reader_rc = alias
         ? col_rel_source_reader_acquire(alias, &cleanup_reader) : ENOENT;
+    cleanup_deferred_rel = col_rel_new_auto("deferred-tdd-result", 1);
+    cleanup_deferred_rc = cleanup_deferred_rel
+        ? col_rel_source_reader_acquire(cleanup_deferred_rel,
+            &cleanup_deferred_reader) : ENOMEM;
+    if (cleanup_deferred_rc == 0)
+        cleanup_deferred_rc = wl_columnar_session_defer_relation(
+            &coord->tdd_workers[0], cleanup_deferred_rel);
+    if (cleanup_deferred_rc != 0) {
+        if (cleanup_deferred_reader.owner)
+            (void)col_rel_source_reader_release(&cleanup_deferred_reader);
+        if (cleanup_deferred_rel) {
+            col_rel_destroy(cleanup_deferred_rel);
+            cleanup_deferred_rel = NULL;
+        }
+    }
 }
 
 /* Verify every tuple and uniqueness, not just a cardinality that a wrong
@@ -249,6 +267,10 @@ run_audit_boundary(int mode)
         if (mode == 4) {
             memset(&cleanup_reader, 0, sizeof(cleanup_reader));
             cleanup_reader_rc = 0;
+            memset(&cleanup_deferred_reader, 0,
+                sizeof(cleanup_deferred_reader));
+            cleanup_deferred_rel = NULL;
+            cleanup_deferred_rc = 0;
             hold_reader_before_worker_cleanup = 1;
         }
         rc = wl_session_snapshot(sess, count_cb, &ctx);
@@ -260,15 +282,22 @@ run_audit_boundary(int mode)
             && col->tdd_workers[0].rels != NULL
             && col->tdd_workers[0].nrels > 0;
         bool refused_before_replay = rc == EBUSY && cleanup_reader_rc == 0
+            && cleanup_deferred_rc == 0
             && cleanup_reader.owner != NULL && retained_worker
+            && col->deferred_relation_count == 1
+            && col->deferred_relations == cleanup_deferred_rel
             && col->tdd_audit.replay == NULL;
         int release_rc = cleanup_reader.owner
             ? col_rel_source_reader_release(&cleanup_reader) : EINVAL;
+        int deferred_release_rc = cleanup_deferred_reader.owner
+            ? col_rel_source_reader_release(&cleanup_deferred_reader) : EINVAL;
         hold_reader_before_worker_cleanup = 0;
-        int retry_rc = release_rc == 0
+        int retry_rc = release_rc == 0 && deferred_release_rc == 0
             ? wl_session_snapshot(sess, count_cb, &ctx) : release_rc;
         ok = refused_before_replay && release_rc == 0 && retry_rc == 0
+            && deferred_release_rc == 0
             && exact_chain(sess) && col->tdd_workers_count == 0
+            && col->deferred_relation_count == 0
             && col->tdd_audit.replay
             && strcmp(col->tdd_audit.replay, "owner_tiny_frontier") == 0;
     } else if (mode == 1 || mode == 3) {
