@@ -4565,6 +4565,329 @@ cleanup:
 #undef OBS_CHECK
 }
 
+extern void (*wl_columnar_eval_delta_test_consolidation_boundary)(
+    wl_col_session_t *, col_rel_t *, col_rel_t *, unsigned);
+static unsigned idb_failure_mode;
+static bool idb_timestamped;
+static int idb_hook_rc;
+static wl_columnar_source_access_reader_t idb_reader;
+static col_rel_t *idb_held;
+static uint64_t idb_saved_limit;
+static wl_columnar_memory_mode_t idb_saved_mode;
+static bool idb_budget_changed;
+static int64_t **idb_target_columns;
+static uint64_t idb_target_view, idb_target_storage;
+static col_delta_timestamp_t idb_timestamp(uint32_t row)
+{
+    return (col_delta_timestamp_t){ .iteration = row + 10, .stratum = row + 20,
+                                    .worker = row + 30,
+                                    .multiplicity = row %
+                                        2 ? -(int64_t)(row + 1)
+        : (int64_t)(row + 1) };
+}
+
+static void
+idb_set_budget(wl_col_session_t *sess)
+{
+    wl_columnar_memory_governor_t *budget =
+        wl_columnar_memory_governor_ref_get(sess->memory_governor);
+    idb_saved_limit = atomic_load_explicit(&budget->usable_bytes,
+            memory_order_relaxed);
+    idb_saved_mode = budget->mode;
+    budget->mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    atomic_store_explicit(&budget->usable_bytes,
+        wl_columnar_memory_reserved(budget), memory_order_relaxed);
+    idb_budget_changed = true;
+}
+
+static void
+idb_restore_budget(wl_col_session_t *sess)
+{
+    if (!idb_budget_changed)
+        return;
+    wl_columnar_memory_governor_t *budget =
+        wl_columnar_memory_governor_ref_get(sess->memory_governor);
+    budget->mode = idb_saved_mode;
+    atomic_store_explicit(&budget->usable_bytes, idb_saved_limit,
+        memory_order_relaxed);
+    idb_budget_changed = false;
+}
+
+static void
+idb_after_eval(wl_col_session_t *sess)
+{
+    col_rel_t *target = session_find_rel(sess, "output");
+    idb_hook_rc = EINVAL;
+    if (!target || target->nrows != 4)
+        return;
+    if (idb_timestamped) {
+        if (col_rel_enable_timestamps(target) != 0)
+            return;
+        for (uint32_t row = 0; row < target->nrows; row++)
+            target->timestamps[row] = idb_timestamp(row);
+        if (!target->compound_arity_map) {
+            target->compound_arity_map = malloc(sizeof(uint32_t));
+            if (!target->compound_arity_map)
+                return;
+        }
+        target->compound_arity_map[0] = 1;
+        target->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+        target->compound_count = 1;
+    }
+    idb_target_columns = target->columns;
+    idb_target_view = target->view_generation;
+    idb_target_storage = target->storage_generation;
+    if (idb_failure_mode == 7)
+        idb_set_budget(sess);
+#ifdef WL_TEST_ALLOC_WRAP
+    if (idb_failure_mode == 6)
+        fail_calloc_size = sizeof(col_rel_t);
+#endif
+    idb_hook_rc = 0;
+}
+
+static void
+idb_consolidation_boundary(wl_col_session_t *sess, col_rel_t *target,
+    col_rel_t *candidate, unsigned boundary)
+{
+    if ((idb_failure_mode == 0 && boundary == 2)
+        || (idb_failure_mode == 1 && boundary == 3)
+        || (idb_failure_mode == 10 && boundary == 1)) {
+        idb_held = idb_failure_mode == 0 ? target : candidate;
+        idb_hook_rc = col_rel_source_reader_acquire(idb_held, &idb_reader);
+    } else if (idb_failure_mode == 2 && boundary == 2) {
+        wl_columnar_relation_touch_replacement(target);
+        idb_target_view = target->view_generation;
+        idb_target_storage = target->storage_generation;
+    } else if (idb_failure_mode == 3 && boundary == 1) {
+        idb_set_budget(sess);
+#ifdef WL_TEST_ALLOC_WRAP
+    } else if ((idb_failure_mode == 4 && boundary == 1)
+        || (idb_failure_mode == 5 && boundary == 2)) {
+        fail_next_alloc = true;
+#endif
+    } else {
+        return;
+    }
+    wl_columnar_eval_delta_test_consolidation_boundary = NULL;
+}
+
+static void
+test_idb_consolidation(unsigned mode, bool timestamped)
+{
+    TEST("IDB consolidation: checked failure, provenance and exact retry");
+    wl_plan_op_t op = { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" };
+    wl_plan_relation_t output = { .name = "output", .ops = &op, .op_count = 1 };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess = NULL;
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    delta_collector_t deltas = { 0 };
+    const char *failure = NULL;
+    int64_t values[] = { 300, -2, 300, 1 };
+    int64_t sorted[] = { -2, 1, 300 };
+    uint32_t representatives[] = { 1, 3, 0 };
+    if (mode == 9) {
+        double floats[] = { -0.0, -2.5, 0.0, 1.5 };
+        double expected[] = { -2.5, 0.0, 1.5 };
+        memcpy(values, floats, sizeof(values));
+        memcpy(sorted, expected, sizeof(sorted));
+        representatives[1] = 0;
+        representatives[2] = 3;
+    }
+#define IDB_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    idb_failure_mode = mode;
+    idb_timestamped = timestamped;
+    idb_hook_rc = EINVAL;
+    idb_budget_changed = false;
+    idb_held = NULL;
+    memset(&idb_reader, 0, sizeof(idb_reader));
+    IDB_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1, &session) == 0,
+        "create");
+    sess = COL_SESSION(session);
+    governor = sess->memory_governor;
+    wl_columnar_memory_governor_ref_retain(governor);
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    if (mode == 9) {
+        wirelog_column_type_t type = WIRELOG_TYPE_FLOAT;
+        col_rel_t *input = session_find_rel(sess, "input");
+        IDB_CHECK(col_rel_set_schema(input, 1, NULL) == 0
+            && col_rel_set_column_types(input, &type, 1) == 0,
+            "float input type");
+    }
+    IDB_CHECK(wl_session_insert(session, "input", values, 4, 1) == 0, "insert");
+    wl_columnar_eval_delta_test_after_eval = idb_after_eval;
+    wl_columnar_eval_delta_test_consolidation_boundary =
+        idb_consolidation_boundary;
+    int rc = wl_session_step(session);
+    idb_restore_budget(sess);
+    col_rel_t *target = session_find_rel(sess, "output");
+    if (mode < 8 || mode == 10) {
+        int expected = mode <= 2 ||
+            mode == 10 ? EBUSY : (mode == 3 || mode == 7)
+            ? ENOSPC : ENOMEM;
+        IDB_CHECK(rc == expected && idb_hook_rc == 0 && deltas.count == 0
+            && target && target->nrows == 4
+            && target->columns == idb_target_columns
+            && target->view_generation == idb_target_view
+            && target->storage_generation == idb_target_storage,
+            "failure changed target or hid error");
+        for (uint32_t row = 0; row < 4; row++) {
+            IDB_CHECK(col_rel_get(target, row, 0) == values[row],
+                "target rows changed on refusal");
+            if (timestamped) {
+                col_delta_timestamp_t expected_ts = idb_timestamp(row);
+                IDB_CHECK(memcmp(target->timestamps + row, &expected_ts,
+                    sizeof(expected_ts)) == 0, "failure timestamp change");
+            }
+        }
+        if (mode <= 1 || mode == 10) {
+            IDB_CHECK(idb_reader.owner && (mode == 0
+                || sess->cleanup_pending_count == 1), "retained owner");
+            if (mode == 10) {
+                IDB_CHECK(idb_held->nrows == 4, "held candidate geometry");
+                for (uint32_t row = 0; row < 4; row++) {
+                    col_delta_timestamp_t expected_ts = idb_timestamp(row);
+                    IDB_CHECK(col_rel_get(idb_held, row, 0) == values[row]
+                        && memcmp(idb_held->timestamps + row, &expected_ts,
+                        sizeof(expected_ts)) == 0,
+                        "reader observed normalization mutation");
+                }
+            }
+            uint64_t retained = wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(governor));
+            for (unsigned retry = 0; retry < 2; retry++)
+                IDB_CHECK(wl_session_step(session) == EBUSY
+                    && deltas.count == 0 &&
+                    target->columns == idb_target_columns
+                    && wl_columnar_memory_reserved(
+                        wl_columnar_memory_governor_ref_get(governor)) ==
+                    retained,
+                    "repeated refusal changed ownership");
+            IDB_CHECK(col_rel_source_reader_release(&idb_reader) == 0,
+                "release held reader");
+        }
+        idb_failure_mode = 8;
+        wl_columnar_eval_delta_test_consolidation_boundary = NULL;
+        rc = wl_session_step(session);
+    }
+    IDB_CHECK(rc == 0 && idb_hook_rc == 0 && target->nrows == 3
+        && deltas.count == 3 && !sess->cleanup_pending && !sess->delta_observer,
+        "exact completion");
+    for (uint32_t row = 0; row < 3; row++) {
+        int64_t value = sorted[row];
+        IDB_CHECK(col_rel_get(target, row, 0) == value
+            && has_delta(&deltas, "output", &value, 1, +1), "sorted set");
+        if (timestamped) {
+            col_delta_timestamp_t expected_ts =
+                idb_timestamp(representatives[row]);
+            IDB_CHECK(target->timestamps && memcmp(target->timestamps + row,
+                &expected_ts, sizeof(expected_ts)) == 0,
+                "row provenance lost or duplicate multiplicity summed");
+        }
+    }
+    IDB_CHECK(!timestamped ||
+        (target->compound_kind == WIRELOG_COMPOUND_KIND_INLINE
+        && target->compound_count == 1 && target->compound_arity_map
+        && target->compound_arity_map[0] == 1), "compound metadata lost");
+    deltas.count = 0;
+    IDB_CHECK(wl_session_step(session) == 0 && deltas.count == 0,
+        "duplicate notifications");
+cleanup:
+    wl_columnar_eval_delta_test_after_eval = NULL;
+    wl_columnar_eval_delta_test_consolidation_boundary = NULL;
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = false;
+    fail_calloc_size = 0;
+#endif
+    if (idb_reader.owner)
+        (void)col_rel_source_reader_release(&idb_reader);
+    if (sess)
+        idb_restore_budget(sess);
+    wl_session_destroy(session);
+    if (governor) {
+        if (wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                governor)) != 0)
+            failure = "consolidation reservation leak";
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef IDB_CHECK
+}
+
+static bool idb_small_invalid;
+static int idb_small_hook_rc;
+static void
+idb_small_after_eval(wl_col_session_t *sess)
+{
+    col_rel_t *target = session_find_rel(sess, "output");
+    idb_small_hook_rc = EINVAL;
+    if (!target || target->nrows > 1)
+        return;
+    target->sorted_nrows = 0;
+    target->run_count = 0;
+    if (idb_small_invalid) {
+        wirelog_column_type_t type = WIRELOG_TYPE_FLOAT;
+        if (target->nrows != 1 || col_rel_set_column_types(target, NULL, 1) != 0
+            || col_rel_set_column_types(target, &type, 1) != 0)
+            return;
+        target->columns[0][0] = (int64_t)UINT64_C(0x7ff0000000000000);
+    }
+    idb_small_hook_rc = col_rel_source_reader_acquire(target, &idb_reader);
+}
+
+static void
+test_idb_small_input(bool empty, bool invalid)
+{
+    TEST(
+        "IDB consolidation: zero/one-row validation does not mutate held metadata");
+    wl_plan_op_t op = { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" };
+    wl_plan_relation_t output = { .name = "output", .ops = &op, .op_count = 1 };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    const char *failure = NULL;
+    delta_collector_t deltas = { 0 };
+    int64_t value = 42;
+#define SMALL_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    memset(&idb_reader, 0, sizeof(idb_reader));
+    idb_small_invalid = invalid;
+    idb_small_hook_rc = EINVAL;
+    SMALL_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "create");
+    if (!empty)
+        SMALL_CHECK(wl_session_insert(session, "input", &value, 1, 1) == 0,
+            "insert");
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    wl_columnar_eval_delta_test_after_eval = idb_small_after_eval;
+    int rc = col_stratum_step_with_delta(&stratum, COL_SESSION(session), 0);
+    col_rel_t *target = session_find_rel(COL_SESSION(session), "output");
+    SMALL_CHECK(rc == (invalid ? EINVAL : 0) && idb_small_hook_rc == 0
+        && target && target->sorted_nrows == 0 && target->run_count == 0
+        && deltas.count == (invalid || empty ? 0 : 1),
+        "small input skipped validation or mutated held metadata");
+cleanup:
+    wl_columnar_eval_delta_test_after_eval = NULL;
+    if (idb_reader.owner)
+        (void)col_rel_source_reader_release(&idb_reader);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef SMALL_CHECK
+}
+
 static unsigned observer_boundary_mode, observer_boundary_calls;
 static wl_columnar_source_access_reader_t observer_compaction_reader;
 
@@ -5765,6 +6088,25 @@ main(void)
     test_observer_callback_binding(0, true);
     test_observer_callback_binding(1, true);
     test_observer_callback_binding(2, true);
+    test_idb_small_input(true, false);
+    test_idb_small_input(false, false);
+    test_idb_small_input(false, true);
+    test_idb_consolidation(0, false);
+    test_idb_consolidation(1, false);
+    test_idb_consolidation(0, true);
+    test_idb_consolidation(1, true);
+    test_idb_consolidation(2, true);
+    test_idb_consolidation(3, true);
+    test_idb_consolidation(7, false);
+    test_idb_consolidation(8, true);
+    test_idb_consolidation(9, true);
+    test_idb_consolidation(10, true);
+#ifdef WL_TEST_ALLOC_WRAP
+    test_idb_consolidation(4, false);
+    test_idb_consolidation(4, true);
+    test_idb_consolidation(5, false);
+    test_idb_consolidation(6, false);
+#endif
     test_observer_completion_retry(0, false);
     test_observer_completion_retry(0, true);
     test_observer_completion_retry(2, false);

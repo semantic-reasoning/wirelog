@@ -706,6 +706,21 @@ bookkeeping. Recursive delta-step refusal drains retained frames before storage
 rollback restores detached relations. The whole-step observer keeps the original
 notification baseline throughout both recovery stages.
 
+Delta IDB consolidation also owns a persistent frame. It reads the registered
+source into a governed private relation and prepares a checked replacement.
+The temporary must be disposed before publication; refusal discards replacement
+staging and releases the destination writer while the frame retains its owner.
+Recovery drains that frame before storage rollback. Zero/one-row inputs validate
+float values and return without mutating sort metadata.
+
+Timestamped private candidates use typed set normalization that moves complete
+provenance records with their rows. Equal tuples retain the earliest original
+row's timestamp, including its signed multiplicity; this is set normalization,
+not weighted aggregation. The original-index scratch is admitted and included
+in active cleanup temporary accounting, then released before publication or
+unwind. This path requires a private candidate and a replacement copy, increasing
+peak admitted memory. Generic sorting timestamp correspondence remains #1689.
+
 Cleanup refusal remains an integration gap for worker evaluation and
 higher-worker-count fallback: #1647 covers lost popped results,
 #1648 covers K-Fusion refusal handling, and #1661 covers retention of whole
