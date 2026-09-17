@@ -8,6 +8,7 @@
 
 #include "columnar/internal.h"
 
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -235,4 +236,196 @@ eval_stack_drain_to_session(eval_stack_t *s, wl_col_session_t *sess)
         memset(entry, 0, sizeof(*entry));
         s->top--;
     }
+}
+
+/* Persistent cleanup ownership, not yet enabled in evaluator callers. */
+struct wl_columnar_eval_stack_cleanup_frame {
+    wl_col_session_t *session;
+    wl_columnar_eval_stack_cleanup_frame_t *next;
+    eval_stack_t stack;
+    eval_entry_t result;
+    wl_columnar_memory_reservation_t reservation;
+    wl_columnar_memory_governor_ref_t *governor;
+};
+
+int
+wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
+    wl_columnar_eval_stack_cleanup_frame_t **out)
+{
+    wl_columnar_memory_reservation_t reservation;
+    wl_columnar_eval_stack_cleanup_frame_t *frame;
+    uint64_t bytes;
+    if (!sess || !out || *out)
+        return EINVAL;
+    if (sess->cleanup_pending)
+        return EBUSY;
+    if (sess->cleanup_active_count >= WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES
+        || sess->cleanup_pending_count
+        >= WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES
+        - sess->cleanup_active_count)
+        return ENOBUFS;
+    if (!wl_columnar_memory_size_add(sess->cleanup_reserved_bytes,
+        sizeof(*frame), &bytes))
+        return EOVERFLOW;
+    wl_columnar_memory_reservation_init(&reservation);
+    if (sess->memory_governor) {
+        wl_columnar_memory_admission_status_t status
+            = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(sess->memory_governor),
+                sizeof(*frame), &reservation);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
+                : EINVAL;
+    }
+    frame = calloc(1, sizeof(*frame));
+    if (!frame) {
+        if (sess->memory_governor)
+            (void)wl_columnar_memory_rollback(&reservation);
+        return ENOMEM;
+    }
+    wl_columnar_memory_reservation_init(&frame->reservation);
+    if (sess->memory_governor) {
+        if (!wl_columnar_memory_reservation_move(&frame->reservation,
+            &reservation)) {
+            (void)wl_columnar_memory_rollback(&reservation);
+            free(frame);
+            return EINVAL;
+        }
+        if (!wl_columnar_memory_commit(&frame->reservation, frame)) {
+            (void)wl_columnar_memory_rollback(&frame->reservation);
+            free(frame);
+            return EINVAL;
+        }
+        frame->governor = sess->memory_governor;
+        wl_columnar_memory_governor_ref_retain(frame->governor);
+    }
+    frame->session = sess;
+    frame->next = sess->cleanup_active;
+    sess->cleanup_active = frame;
+    sess->cleanup_active_count++;
+    sess->cleanup_reserved_bytes = bytes;
+    *out = frame;
+    return 0;
+}
+
+eval_stack_t *
+wl_columnar_eval_stack_cleanup_stack(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    return frame ? &frame->stack : NULL;
+}
+
+eval_entry_t *
+wl_columnar_eval_stack_cleanup_result(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    return frame ? &frame->result : NULL;
+}
+
+static void
+wl_columnar_eval_stack_cleanup_continuations(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    if (frame->result.kind == WL_COLUMNAR_EVAL_ENTRY_CONTINUATION)
+        (void)eval_entry_dispose(&frame->result);
+    for (uint32_t i = 0; i < frame->stack.top; i++)
+        if (frame->stack.items[i].kind == WL_COLUMNAR_EVAL_ENTRY_CONTINUATION)
+            (void)eval_entry_dispose(&frame->stack.items[i]);
+}
+
+static int
+wl_columnar_eval_stack_cleanup_dispose(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    int result = eval_entry_dispose(&frame->result);
+    /* Visit lower entries even if a higher one refuses. Their destruction
+     * can release dependencies needed by other pending frames. */
+    for (uint32_t i = frame->stack.top; i > 0; i--) {
+        int rc = eval_entry_dispose(&frame->stack.items[i - 1]);
+        if (result == 0)
+            result = rc;
+    }
+    if (result == 0)
+        frame->stack.top = 0;
+    return result;
+}
+
+static int
+wl_columnar_eval_stack_cleanup_free(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    wl_columnar_memory_reservation_t reservation;
+    wl_columnar_memory_governor_ref_t *governor = frame->governor;
+    wl_columnar_memory_reservation_init(&reservation);
+    if (governor && !wl_columnar_memory_reservation_move(&reservation,
+        &frame->reservation))
+        return EINVAL;
+    frame->session->cleanup_reserved_bytes -= sizeof(*frame);
+    free(frame);
+    if (governor) {
+        bool released = wl_columnar_memory_release(&reservation);
+        assert(released);
+        (void)released;
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_cleanup_finish(
+    wl_columnar_eval_stack_cleanup_frame_t **handle)
+{
+    if (!handle || !*handle)
+        return EINVAL;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = *handle;
+    wl_col_session_t *sess = frame->session;
+    if (sess->cleanup_active != frame)
+        return EBUSY;
+    sess->cleanup_active = frame->next;
+    sess->cleanup_active_count--;
+    *handle = NULL;
+    wl_columnar_eval_stack_cleanup_continuations(frame);
+    int rc = wl_columnar_eval_stack_cleanup_dispose(frame);
+    if (rc == 0)
+        rc = wl_columnar_eval_stack_cleanup_free(frame);
+    if (rc != 0) {
+        frame->next = sess->cleanup_pending;
+        sess->cleanup_pending = frame;
+        sess->cleanup_pending_count++;
+    }
+    return rc;
+}
+
+int
+wl_columnar_eval_stack_cleanup_retry(wl_col_session_t *sess)
+{
+    if (!sess)
+        return EINVAL;
+    if (sess->cleanup_active)
+        return EBUSY;
+    /* Release readers held by continuations in every frame before trying
+     * any relation, including dependencies between pending frames. */
+    for (wl_columnar_eval_stack_cleanup_frame_t *frame = sess->cleanup_pending;
+        frame; frame = frame->next)
+        wl_columnar_eval_stack_cleanup_continuations(frame);
+    int result = 0;
+    wl_columnar_eval_stack_cleanup_frame_t **slot = &sess->cleanup_pending;
+    while (*slot) {
+        wl_columnar_eval_stack_cleanup_frame_t *frame = *slot;
+        wl_columnar_eval_stack_cleanup_frame_t *next = frame->next;
+        int rc = wl_columnar_eval_stack_cleanup_dispose(frame);
+        if (rc == 0)
+            rc = wl_columnar_eval_stack_cleanup_free(frame);
+        if (rc == 0) {
+            *slot = next;
+            sess->cleanup_pending_count--;
+        } else {
+            if (result == 0)
+                result = rc;
+            slot = &frame->next;
+        }
+    }
+    return result;
 }

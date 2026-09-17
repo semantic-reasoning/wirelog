@@ -1567,6 +1567,9 @@ typedef struct wl_columnar_session_source_lease {
     struct wl_columnar_session_source_lease *next;
 } wl_columnar_session_source_lease_t;
 
+typedef struct wl_columnar_eval_stack_cleanup_frame
+    wl_columnar_eval_stack_cleanup_frame_t;
+
 typedef struct wl_col_session_t {
     wl_session_t base;         /* MUST be first field (vtable dispatch)  */
     /* base.extension_snapshot is borrowed from the coordinator in workers;
@@ -1900,6 +1903,13 @@ typedef struct wl_col_session_t {
     wl_columnar_session_source_lease_t *source_leases;
     col_rel_t *deferred_relations;
     uint32_t deferred_relation_count;
+    /* Inactive evaluator-cleanup prerequisite (#1661). Production callers
+     * must not activate until allocator and operation boundaries are wired. */
+    wl_columnar_eval_stack_cleanup_frame_t *cleanup_active;
+    wl_columnar_eval_stack_cleanup_frame_t *cleanup_pending;
+    uint32_t cleanup_active_count;
+    uint32_t cleanup_pending_count;
+    uint64_t cleanup_reserved_bytes;
     /* Exchange operator state (Issue #316): W x W partition buffer matrix.
      * Allocated by coordinator before exchange scatter dispatch.
      * exchange_bufs[src_worker][dst_worker] holds rows src sends to dst.
@@ -2063,6 +2073,33 @@ typedef struct {
     eval_entry_t items[COL_STACK_MAX];
     uint32_t top;
 } eval_stack_t;
+
+/* Bounds this internal primitive, not public evaluation nesting. */
+#define WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES 32u
+
+/* Allocate/admit before evaluating. Pending cleanup blocks begin. ENOSPC
+ * denotes governor denial, ENOMEM allocation failure, ENOBUFS the frame cap.
+ * Session access must be serialized. No production caller is wired yet. */
+int
+wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
+    wl_columnar_eval_stack_cleanup_frame_t **out);
+eval_stack_t *
+wl_columnar_eval_stack_cleanup_stack(
+    wl_columnar_eval_stack_cleanup_frame_t *frame);
+/* Move a popped entry only into an empty result slot; clear it on transfer. */
+eval_entry_t *
+wl_columnar_eval_stack_cleanup_result(
+    wl_columnar_eval_stack_cleanup_frame_t *frame);
+/* Valid LIFO finish consumes the handle, including on cleanup refusal.
+ * Non-LIFO rejection preserves it. Retained frames pin no allocator by
+ * themselves: callers must keep every owner/allocator alive until retry. */
+int
+wl_columnar_eval_stack_cleanup_finish(
+    wl_columnar_eval_stack_cleanup_frame_t **frame);
+/* Refuses while any active frame remains. A finite continuation-first sweep
+ * precedes disposal across all pending frames; no promotion or allocation. */
+int
+wl_columnar_eval_stack_cleanup_retry(wl_col_session_t *sess);
 
 /* ======================================================================== */
 /* Relation Storage (columnar/relation.c)                                   */

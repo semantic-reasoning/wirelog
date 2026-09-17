@@ -1505,7 +1505,7 @@ col_session_mem_sample(wl_col_session_t *sess)
      * through col_rel_free_contents are zeroed and contribute 0.  Pool
      * temporaries that also carry a mem_ledger (join outputs) are charged
      * to RELATION as they grow and are skipped here. */
-    uint64_t temporary = 0;
+    uint64_t temporary = sess->cleanup_reserved_bytes;
     const delta_pool_t *dp = sess->delta_pool;
     if (dp && dp->slab) {
         for (uint32_t sidx = 0; sidx < dp->slot_used; sidx++) {
@@ -2466,6 +2466,11 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->source_leases = NULL;
     out_worker->deferred_relations = NULL;
     out_worker->deferred_relation_count = 0;
+    out_worker->cleanup_active = NULL;
+    out_worker->cleanup_pending = NULL;
+    out_worker->cleanup_active_count = 0;
+    out_worker->cleanup_pending_count = 0;
+    out_worker->cleanup_reserved_bytes = 0;
     out_worker->arr_entries = NULL;
     out_worker->arr_count = 0;
     out_worker->arr_cap = 0;
