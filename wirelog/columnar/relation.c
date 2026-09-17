@@ -1362,6 +1362,37 @@ col_rel_destroy(col_rel_t *r)
     (void)col_rel_destroy_checked(r);
 }
 
+/* Initialize Arrow metadata independently of heap or arena column storage. */
+static int
+wl_columnar_relation_init_arrow_schema(col_rel_t *r)
+{
+    if (r->schema_ok) {
+        ArrowSchemaRelease(&r->schema);
+        r->schema_ok = false;
+    }
+    ArrowSchemaInit(&r->schema);
+    if (ArrowSchemaSetTypeStruct(&r->schema, (int64_t)r->ncols)
+        != NANOARROW_OK)
+        goto fail;
+    for (uint32_t i = 0; i < r->ncols; i++) {
+        enum ArrowType type = r->column_types
+            && r->column_types[i] == WIRELOG_TYPE_FLOAT
+            ? NANOARROW_TYPE_DOUBLE : NANOARROW_TYPE_INT64;
+        ArrowSchemaRelease(r->schema.children[i]);
+        if (ArrowSchemaInitFromType(r->schema.children[i], type)
+            != NANOARROW_OK
+            || ArrowSchemaSetName(r->schema.children[i],
+            r->col_names && r->col_names[i] ? r->col_names[i] : "")
+            != NANOARROW_OK)
+            goto fail;
+    }
+    r->schema_ok = true;
+    return 0;
+fail:
+    ArrowSchemaRelease(&r->schema);
+    return ENOMEM;
+}
+
 /*
  * col_rel_set_schema:
  * Initialise ncols, col_names[], data buffer, and ArrowSchema.
@@ -1417,33 +1448,10 @@ col_rel_set_schema_impl(col_rel_t *r, uint32_t ncols,
         }
     }
 
-    /* Arrow schema: struct<col0:i64, col1:i64, ...> */
-    /* Release any prior schema (handles ncols==0 → ncols>0 upgrade;
-     * col_rel_new_auto with ncols=0 sets schema_ok=true with an empty
-     * struct schema, and a later set_schema with ncols>0 must release
-     * the old schema before reinitializing). */
-    if (r->schema_ok) {
-        ArrowSchemaRelease(&r->schema);
-        r->schema_ok = false;
-    }
-    ArrowSchemaInit(&r->schema);
-    if (ArrowSchemaSetTypeStruct(&r->schema, (int64_t)ncols) != NANOARROW_OK) {
+    if (wl_columnar_relation_init_arrow_schema(r) != 0) {
+        failure_rc = ENOMEM;
         goto fail;
     }
-    for (uint32_t i = 0; i < ncols; i++) {
-        enum ArrowType arrow_type = r->column_types
-            && r->column_types[i] == WIRELOG_TYPE_FLOAT
-            ? NANOARROW_TYPE_DOUBLE : NANOARROW_TYPE_INT64;
-        ArrowSchemaRelease(r->schema.children[i]);
-        if (ArrowSchemaInitFromType(r->schema.children[i], arrow_type)
-            != NANOARROW_OK) {
-            goto fail;
-        }
-        const char *cname
-            = (r->col_names && r->col_names[i]) ? r->col_names[i] : "";
-        ArrowSchemaSetName(r->schema.children[i], cname);
-    }
-    r->schema_ok = true;
     if (pending_rc > 0) {
         if (!col_rel_retained_bytes(r->ncols, r->capacity,
             r->timestamps != NULL, &retained_bytes)
@@ -1458,11 +1466,11 @@ col_rel_set_schema_impl(col_rel_t *r, uint32_t ncols,
 
 fail:
     col_rel_reservation_rollback(&pending);
-    /* ArrowSchemaSetTypeStruct/InitFromType can fail after partially
-     * initializing the freshly-created schema while schema_ok is still
-     * false.  Release unconditionally: ArrowSchemaRelease is the matching
-     * cleanup for every initialized schema state. */
-    ArrowSchemaRelease(&r->schema);
+    /* A pooled descriptor may fail before Arrow initialization, and the
+     * Arrow-only initializer already releases its partial schema on error.
+     * Only a live release callback denotes owned schema state here. */
+    if (r->schema.release)
+        ArrowSchemaRelease(&r->schema);
     r->schema_ok = false;
     col_columns_free(r->columns, ncols);
     r->columns = NULL;
@@ -3762,7 +3770,9 @@ col_rel_clone_compound_meta(col_rel_t *dst, const col_rel_t *src)
     uint32_t logical_count = 0u;
     uint32_t acc = 0u;
     while (acc < src->ncols) {
-        if (src->compound_arity_map[logical_count] == 0u) {
+        if (logical_count >= src->ncols
+            || src->compound_arity_map[logical_count] == 0u
+            || src->compound_arity_map[logical_count] > src->ncols - acc) {
             /* Corrupt width -- leave compound metadata cleared rather
              * than propagating the inconsistency. */
             return -1;
@@ -3838,20 +3848,15 @@ wl_columnar_relation_new_like_impl(const char *name, const col_rel_t *src,
      * __graph_id consistently with their source relation. */
     r->has_graph_column = src->has_graph_column;
     r->graph_col_idx = src->graph_col_idx;
-    /* Issue #534 Task #1: inherit compound metadata so FILTER/PROJECT/LFTJ
-     * outputs remain INLINE-kind and the logical<->physical translation
-     * stays valid for downstream ops. compound_arity_map is a separately
-     * owned heap array; we deep-copy it so dst and src destroy paths stay
-     * independent (K-Fusion isolation). Failure is non-fatal: the helper
-     * leaves dst's compound metadata cleared (NONE-kind), matching the
-     * pre-#553 graceful-degrade contract. */
+    r->declared_ncols = src->declared_ncols;
+    /* Required metadata cannot be silently dropped: that would change
+     * interpretation of the same physical columns. Deep-copy retains its
+     * separate historical contract. */
     if (src->compound_kind != WIRELOG_COMPOUND_KIND_NONE
-        && src->compound_arity_map && src->ncols > 0u) {
-        int rc = col_rel_clone_compound_meta(r, src);
-        if (preserve_metadata && rc != 0) {
-            col_rel_destroy(r);
-            return NULL;
-        }
+        && (!src->compound_arity_map || src->ncols == 0u
+        || col_rel_clone_compound_meta(r, src) != 0)) {
+        col_rel_destroy(r);
+        return NULL;
     }
     if (preserve_metadata && src->timestamps
         && col_rel_enable_timestamps(r) != 0) {
@@ -3932,28 +3937,10 @@ col_rel_pool_new_like(delta_pool_t *pool, const char *name,
         if (!r->name) {
             return col_rel_pool_fallback_like(pool, r, name, like);
         }
-        r->ncols = like->ncols;
-        r->capacity = COL_REL_INIT_CAP;
-        if (like->ncols > 0) {
-            r->columns = col_columns_alloc(like->ncols, r->capacity);
-            if (!r->columns) {
-                return col_rel_pool_fallback_like(pool, r, name, like);
-            }
-        }
-        /* Copy col_names so col_rel_col_idx works for downstream operators */
-        if (like->col_names && like->ncols > 0) {
-            r->col_names = (char **)calloc(like->ncols, sizeof(char *));
-            if (!r->col_names)
-                return col_rel_pool_fallback_like(pool, r, name, like);
-            for (uint32_t i = 0; i < like->ncols; i++) {
-                if (like->col_names[i]) {
-                    r->col_names[i] = wl_strdup(like->col_names[i]);
-                    if (!r->col_names[i])
-                        return col_rel_pool_fallback_like(pool, r, name,
-                                   like);
-                }
-            }
-        }
+        if (col_rel_set_schema(r, like->ncols,
+            (const char *const *)like->col_names) != 0)
+            return col_rel_pool_fallback_like(pool, r, name, like);
+        r->declared_ncols = like->declared_ncols;
         r->has_graph_column = like->has_graph_column;
         r->graph_col_idx = like->graph_col_idx;
         if (like->column_types
@@ -3962,8 +3949,9 @@ col_rel_pool_new_like(delta_pool_t *pool, const char *name,
             return col_rel_pool_fallback_like(pool, r, name, like);
         }
         if (like->compound_kind != WIRELOG_COMPOUND_KIND_NONE
-            && like->compound_arity_map && like->ncols > 0u)
-            (void)col_rel_clone_compound_meta(r, like);
+            && (!like->compound_arity_map || like->ncols == 0u
+            || col_rel_clone_compound_meta(r, like) != 0))
+            return col_rel_pool_fallback_like(pool, r, name, like);
         r->nrows = 0;
         return r;
     }
@@ -4038,6 +4026,8 @@ col_rel_pool_new_auto(delta_pool_t *pool, wl_arena_t *arena,
                     return col_rel_pool_fallback_auto(pool, r, name, ncols);
             }
         }
+        if (wl_columnar_relation_init_arrow_schema(r) != 0)
+            return col_rel_pool_fallback_auto(pool, r, name, ncols);
         r->nrows = 0;
         return r;
     }
@@ -4329,9 +4319,10 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
      * source carries an INLINE-tier arity map, deep-copy it through the
      * shared col_rel_clone_compound_meta helper.  Helper failure is
      * handled with the existing graceful-degrade contract (compound
-     * metadata cleared to NONE-kind on dst), keeping behavior aligned
-     * with col_rel_new_like.  Sources with WIRELOG_COMPOUND_KIND_NONE
-     * leave dst at the zero default already established by calloc.
+     * metadata cleared to NONE-kind on dst). Unlike new_like constructors,
+     * this legacy deep-copy contract is unchanged. Sources with
+     * WIRELOG_COMPOUND_KIND_NONE leave dst at the zero default established
+     * by calloc.
      */
     if (src->compound_kind != WIRELOG_COMPOUND_KIND_NONE
         && src->compound_arity_map && src->ncols > 0u) {
