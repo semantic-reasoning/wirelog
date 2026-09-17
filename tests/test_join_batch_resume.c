@@ -155,10 +155,10 @@ make_rel(const char *name, uint32_t ncols, const char *const *col_names)
 
 /* right(k, r): @fanout rows per key in [0, @keys). */
 static col_rel_t *
-make_right(uint32_t keys, uint32_t fanout)
+make_right_named(const char *name, uint32_t keys, uint32_t fanout)
 {
     const char *cn[] = { "k", "r" };
-    col_rel_t *right = make_rel("right", 2, cn);
+    col_rel_t *right = make_rel(name, 2, cn);
     if (!right)
         return NULL;
     for (uint32_t k = 0; k < keys; k++) {
@@ -171,6 +171,12 @@ make_right(uint32_t keys, uint32_t fanout)
         }
     }
     return right;
+}
+
+static col_rel_t *
+make_right(uint32_t keys, uint32_t fanout)
+{
+    return make_right_named("right", keys, fanout);
 }
 
 /* left(k, v) from an explicit key list. */
@@ -203,6 +209,15 @@ init_join_op(wl_plan_op_t *op, const char *const *lkeys,
     op->right_keys = rkeys;
     op->delta_mode = WL_DELTA_FORCE_FULL;
 }
+
+/* VAR("col1") CONST_INT(150) CMP_GT: keep the right rows whose payload is
+ * above 150.  This is the same compact postfix fixture used by the owned
+ * right-filter cleanup tests. */
+static uint8_t right_filter_bytes[] = {
+    WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1',
+    WL_PLAN_EXPR_CONST_INT, 150, 0, 0, 0, 0, 0, 0, 0,
+    WL_PLAN_EXPR_CMP_GT
+};
 
 /* One-shot oracle through the operator with the knob off. */
 static col_rel_t *
@@ -1158,6 +1173,160 @@ out:
     fixture_fini(&f);
 }
 
+/* Run one excluded operator shape in both modes.  The non-strict invocation
+ * must preserve the one-shot result and record exactly one reason; strict
+ * mode must reject before recording another fallback. */
+static bool
+run_excluded_operator_case(fixture_t *f, wl_plan_op_t *op,
+    col_join_batch_eligibility_t reason, const char *label)
+{
+    eval_stack_t stack;
+    eval_entry_t result;
+    col_rel_t *oracle = run_oracle(f->sess, f->left, op);
+    int rc;
+    bool ok = true;
+
+    if (!oracle)
+        return false;
+    f->sess->join_batch_bytes = 9u * 32u;
+    eval_stack_init(&stack);
+    eval_stack_push(&stack, f->left, false);
+    rc = col_op_join(op, &stack, f->sess);
+    if (rc != 0 || stack.top == 0) {
+        printf("(%s: non-strict dispatch) ", label);
+        ok = false;
+        goto strict;
+    }
+    result = eval_stack_pop(&stack);
+    if (!result.owned || !same_rows(oracle, result.rel)
+        || f->sess->join_batch_fallback_count != 1u
+        || f->sess->join_batch_last_reason != reason) {
+        printf("(%s: result/count/reason) ", label);
+        ok = false;
+    }
+    if (result.owned)
+        col_rel_destroy(result.rel);
+
+strict:
+    f->sess->join_batch_strict = true;
+    eval_stack_init(&stack);
+    eval_stack_push(&stack, f->left, false);
+    rc = col_op_join(op, &stack, f->sess);
+    if (rc != ENOTSUP || f->sess->join_batch_fallback_count != 1u) {
+        printf("(%s: strict ENOTSUP/count) ", label);
+        ok = false;
+        if (rc == 0 && stack.top > 0) {
+            result = eval_stack_pop(&stack);
+            if (result.owned)
+                col_rel_destroy(result.rel);
+        }
+    }
+    f->sess->join_batch_strict = false;
+    col_rel_destroy(oracle);
+    return ok;
+}
+
+/* #1656: delta-right and filtered-right are excluded after the operator has
+ * selected the effective right relation.  Both paths must still equal their
+ * own one-shot oracle and must not enter bounded mode in strict mode. */
+static void
+test_operator_delta_and_filtered_fallbacks(void)
+{
+    const int64_t keys[] = { 0, 1, 1, 0 };
+    bool ok = true;
+
+    TEST("delta-right and filtered-right fall back with stable reasons");
+    {
+        fixture_t f;
+        wl_plan_op_t op;
+        col_rel_t *delta = NULL;
+
+        if (!fixture_init(&f, 1u << 24, keys, 4, 2, 2)) {
+            FAIL("delta fixture");
+            fixture_fini(&f);
+            return;
+        }
+        delta = make_right_named("$d$right", 2, 1);
+        if (!delta || session_add_rel(f.sess, delta) != 0) {
+            FAIL("delta registration");
+            if (delta)
+                col_rel_destroy(delta);
+            fixture_fini(&f);
+            return;
+        }
+        init_join_op(&op, f.lkeys, f.rkeys);
+        op.delta_mode = WL_DELTA_FORCE_DELTA;
+        ok = ok && run_excluded_operator_case(&f, &op,
+                COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT, "delta-right");
+        fixture_fini(&f);
+    }
+    {
+        fixture_t f;
+        wl_plan_op_t op;
+
+        if (!fixture_init(&f, 1u << 24, keys, 4, 2, 2)) {
+            FAIL("filtered fixture");
+            fixture_fini(&f);
+            return;
+        }
+        init_join_op(&op, f.lkeys, f.rkeys);
+        op.right_filter_expr.data = right_filter_bytes;
+        op.right_filter_expr.size = sizeof(right_filter_bytes);
+        ok = ok && run_excluded_operator_case(&f, &op,
+                COL_JOIN_BATCH_EXCLUDED_FILTERED_RIGHT, "filtered-right");
+        fixture_fini(&f);
+    }
+    if (ok)
+        PASS();
+    else
+        FAIL("operator fallback matrix");
+}
+
+/* The no-arrangement verdict is emitted after arrangement probing, while the
+ * public eligibility helper covers the pre-probe ordering.  Keep this test
+ * focused on that stable contract: it avoids fabricating a malformed
+ * session-owned relation merely to force an unreachable probe miss. */
+static void
+test_eligibility_ordering_and_no_arrangement_reason(void)
+{
+    wl_col_session_t *sess = make_session(1u << 24);
+    bool ok = sess != NULL;
+
+    TEST("eligibility ordering names no-arrangement fallback explicitly");
+    if (!ok) {
+        FAIL("session");
+        return;
+    }
+    ok = ok && col_join_batch_eligibility(NULL, 1, false, false)
+        == COL_JOIN_BATCH_EXCLUDED_OFF;
+    sess->join_batch_bytes = 1u;
+    ok = ok && col_join_batch_eligibility(sess, 0, false, false)
+        == COL_JOIN_BATCH_EXCLUDED_CROSS;
+    ok = ok && col_join_batch_eligibility(sess, 1, true, true)
+        == COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT;
+    ok = ok && col_join_batch_eligibility(sess, 1, false, true)
+        == COL_JOIN_BATCH_EXCLUDED_FILTERED_RIGHT;
+    sess->coordinator = sess;
+    ok = ok && col_join_batch_eligibility(sess, 1, false, false)
+        == COL_JOIN_BATCH_EXCLUDED_WORKER;
+    sess->coordinator = NULL;
+    ok = ok && col_join_batch_eligibility(sess, 1, false, false)
+        == COL_JOIN_BATCH_ELIGIBLE;
+
+    col_join_batch_record_fallback(sess,
+        COL_JOIN_BATCH_EXCLUDED_NO_ARRANGEMENT);
+    ok = ok && sess->join_batch_fallback_count == 1u
+        && sess->join_batch_last_reason
+        == COL_JOIN_BATCH_EXCLUDED_NO_ARRANGEMENT
+        && strcmp(col_join_batch_eligibility_name(
+                COL_JOIN_BATCH_EXCLUDED_NO_ARRANGEMENT), "no-arrangement") == 0;
+    if (ok)
+        PASS();
+    else
+        FAIL("eligibility ordering or no-arrangement reason");
+    destroy_session(sess);
+}
+
 /* (11a) A probe that reports no persistent arrangement must take the
  * operator's ordinary fallback path, while strict mode turns the same
  * excluded shape into ENOTSUP.  The test-only seam is one-shot so the final
@@ -1810,6 +1979,8 @@ main(void)
     test_row_cap_trips_after_a_committed_batch();
     test_operator_dispatch_and_eligibility();
     test_operator_no_arrangement_probe_failure();
+    test_operator_delta_and_filtered_fallbacks();
+    test_eligibility_ordering_and_no_arrangement_reason();
     test_producer_empty_right_single_lease();
     test_operator_empty_right_and_row_too_large();
     test_join_batch_eligibility_order();
