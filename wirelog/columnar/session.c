@@ -2993,6 +2993,9 @@ col_session_make_compound(wl_session_t *session, const char *functor,
         return EINVAL;
     if (sess->delta_observer || sess->delta_publish_active)
         return EBUSY;
+    int cleanup_rc = wl_columnar_session_cleanup_ready_quiescent(sess);
+    if (cleanup_rc != 0)
+        return cleanup_rc;
     if (sess->compound_arena->frozen)
         return EBUSY;
     if (sess->compound_arena->current_epoch >= sess->compound_arena->max_epochs)
@@ -3785,14 +3788,34 @@ cleanup:
     return rc;
 }
 
+/* Call only after the dispatch barrier. A retained worker frame may still
+ * borrow coordinator registry/cache owners even after checked worker teardown
+ * refused it. Externally owned generic worker arrays are not this cohort. */
+static bool
+wl_columnar_session_has_retained_cleanup(const wl_col_session_t *sess)
+{
+    if (!sess)
+        return false;
+    if (sess->cleanup_active || sess->cleanup_pending || sess->delta_rollback)
+        return true;
+    if (!sess->coordinator) {
+        for (uint32_t w = 0; w < sess->tdd_workers_count; w++) {
+            const wl_col_session_t *worker = &sess->tdd_workers[w];
+            if (worker->cleanup_active || worker->cleanup_pending
+                || worker->delta_rollback)
+                return true;
+        }
+    }
+    return false;
+}
+
 /* Snapshot/step completion is the coordinator's quiescent boundary.  Explicit
  * pins must already have been released by join.c; only then may the ledger
  * callback reclaim owned cache entries under memory pressure. */
 static void
 col_session_reclaim_quiescent(wl_col_session_t *sess)
 {
-    if (!sess || sess->cleanup_active || sess->cleanup_pending
-        || sess->delta_rollback)
+    if (!sess || wl_columnar_session_has_retained_cleanup(sess))
         return;
     col_mat_cache_release_pins(&sess->mat_cache);
     if (!sess->mat_cache.reclaimer_owner_alive)
@@ -4269,7 +4292,7 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
         }
 
         if (rc != 0) {
-            if (sess->cleanup_pending) {
+            if (wl_columnar_session_has_retained_cleanup(sess)) {
                 sess->tdd_decision_tracking_active = false;
                 return rc;
             }

@@ -292,8 +292,7 @@ int
 col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t stratum_idx)
 {
-    bool framed = !sess->coordinator;
-    if (framed && sess->cleanup_active)
+    if (sess->cleanup_active)
         return EBUSY;
     int readiness_rc = wl_columnar_session_cleanup_ready(sess);
     if (readiness_rc != 0)
@@ -320,91 +319,10 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 return par_rc;
             }
 
-            if (framed) {
-                int rc = wl_columnar_eval_serial_framed_relation(rp, sess,
-                        false);
-                if (rc != 0)
-                    return rc;
-                continue;
-            }
-
-            eval_stack_t stack;
-            eval_stack_init(&stack);
-
-            int rc = col_eval_relation_plan(rp, &stack, sess);
-            if (rc != 0) {
-                int drain_rc = eval_stack_drain_to_session(&stack, sess);
-                if (drain_rc != 0)
-                    rc = drain_rc;
+            int rc = wl_columnar_eval_serial_framed_relation(rp, sess,
+                    false);
+            if (rc != 0)
                 return rc;
-            }
-
-            if (stack.top == 0)
-                continue;
-
-            eval_entry_t result = eval_stack_pop(&stack);
-            if (result.kind != WL_COLUMNAR_EVAL_ENTRY_RELATION) {
-                int dispose_rc = eval_stack_dispose_entry(&stack, &result);
-                int drain_rc = eval_stack_drain_to_session(&stack, sess);
-                int cleanup_rc = dispose_rc != 0 ? dispose_rc : drain_rc;
-                int primary_rc = ENOTSUP;
-                if (cleanup_rc != 0)
-                    primary_rc = cleanup_rc;
-                return primary_rc;
-            }
-            /* The final relation no longer needs intra-plan CONCAT metadata. */
-            free(result.seg_boundaries);
-            result.seg_boundaries = NULL;
-            result.seg_count = 0;
-            int drain_rc = eval_stack_drain_to_session(&stack, sess);
-            if (drain_rc != 0)
-                return drain_rc; /* retain the refused entry on the stack */
-
-            if (!result.rel)
-                continue;
-
-            col_rel_t *target = session_find_rel(sess, rp->name);
-            if (!target) {
-                /* First time: create and register the relation */
-                if (result.owned) {
-                    /* Rename the result relation */
-                    free(result.rel->name);
-                    result.rel->name = wl_strdup(rp->name);
-                    if (!result.rel->name) {
-                        col_rel_destroy(result.rel);
-                        return ENOMEM;
-                    }
-                    rc = session_add_rel(sess, result.rel);
-                    if (rc != 0) {
-                        col_rel_destroy(result.rel);
-                        return rc;
-                    }
-                    result.owned = false;
-                } else {
-                    col_rel_t *copy = col_rel_pool_new_like(
-                        sess->delta_pool, rp->name, result.rel);
-                    if (!copy)
-                        return ENOMEM;
-                    rc = col_rel_append_all(copy, result.rel,
-                            sess->eval_arena);
-                    if (rc != 0) {
-                        col_rel_destroy(copy);
-                        return rc;
-                    }
-                    rc = session_add_rel(sess, copy);
-                    if (rc != 0) {
-                        col_rel_destroy(copy);
-                        return rc;
-                    }
-                }
-            } else {
-                /* Append new results to existing relation */
-                rc = col_rel_append_all(target, result.rel, sess->eval_arena);
-                if (result.owned)
-                    col_rel_destroy(result.rel);
-                if (rc != 0)
-                    return rc;
-            }
         }
         col_mat_cache_release_pins(&sess->mat_cache);
         assert(sess->mat_cache.active_pins == 0);
@@ -707,129 +625,15 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                     continue;
                 }
 
-                if (framed) {
-                    /* Previous-pass publication transferred every private
-                     * delta before a rule may retain cleanup dependencies. */
-                    for (uint32_t di = 0; di < nrels; di++)
-                        assert(delta_rels[di] == NULL);
-                    int rc = wl_columnar_eval_serial_framed_relation(rp,
-                            sess, true);
-                    if (rc != 0) {
-                        outer_rc = rc;
-                        goto stride_error;
-                    }
-                    continue;
-                }
-
-                eval_stack_t stack;
-                eval_stack_init(&stack);
-
-                int rc = col_eval_relation_plan(rp, &stack, sess);
+                /* Previous-pass publication transferred every private
+                 * delta before a rule may retain cleanup dependencies. */
+                for (uint32_t di = 0; di < nrels; di++)
+                    assert(delta_rels[di] == NULL);
+                int rc = wl_columnar_eval_serial_framed_relation(rp, sess,
+                        true);
                 if (rc != 0) {
-                    int drain_rc = eval_stack_drain_to_session(&stack, sess);
-                    if (drain_rc != 0)
-                        rc = drain_rc;
                     outer_rc = rc;
                     goto stride_error;
-                }
-
-                if (stack.top == 0)
-                    continue;
-
-                eval_entry_t result = eval_stack_pop(&stack);
-                if (result.kind != WL_COLUMNAR_EVAL_ENTRY_RELATION) {
-                    int dispose_rc = eval_stack_dispose_entry(&stack, &result);
-                    int drain_rc = eval_stack_drain_to_session(&stack, sess);
-                    int cleanup_rc = dispose_rc != 0 ? dispose_rc : drain_rc;
-                    outer_rc = ENOTSUP;
-                    if (cleanup_rc != 0)
-                        outer_rc = cleanup_rc;
-                    goto stride_error;
-                }
-                /* Segment boundaries are consumed once plan evaluation ends. */
-                free(result.seg_boundaries);
-                result.seg_boundaries = NULL;
-                result.seg_count = 0;
-                {
-                    int drain_rc = eval_stack_drain_to_session(&stack, sess);
-                    if (drain_rc != 0) {
-                        outer_rc = drain_rc;
-                        goto stride_error;
-                    }
-                }
-
-                /* Post-eval skip: evaluation produced 0 rows — safety net for
-                 * cases not caught by pre-scan (e.g. filters eliminating all
-                 * rows).
-                 *
-                 * The relation-only pop above has already rejected
-                 * continuation and malformed entries, so a NULL here is only
-                 * the ordinary empty-result representation.
-                 * Otherwise the statements below dereference result.rel:
-                 * ->name on the rename arm, ->ncols on the schema-adoption
-                 * arm.  col_rel_destroy(NULL) is a no-op, so the continue
-                 * leaks nothing. */
-                if (!result.rel || result.rel->nrows == 0) {
-                    if (result.owned)
-                        col_rel_destroy(result.rel);
-                    continue;
-                }
-
-                col_rel_t *target = session_find_rel(sess, rp->name);
-                if (!target) {
-                    col_rel_t *copy;
-                    if (result.owned) {
-                        copy = result.rel;
-                        free(copy->name);
-                        copy->name = wl_strdup(rp->name);
-                        if (!copy->name) {
-                            col_rel_destroy(copy);
-                            outer_rc = ENOMEM;
-                            goto stride_error;
-                        }
-                        result.owned = false;
-                    } else {
-                        copy = col_rel_pool_new_like(
-                            sess->delta_pool, rp->name, result.rel);
-                        if (!copy) {
-                            outer_rc = ENOMEM;
-                            goto stride_error;
-                        }
-                        rc = col_rel_append_all(copy, result.rel,
-                                sess->eval_arena);
-                        if (rc != 0) {
-                            col_rel_destroy(copy);
-                            outer_rc = rc;
-                            goto stride_error;
-                        }
-                    }
-                    rc = session_add_rel(sess, copy);
-                    if (rc != 0) {
-                        col_rel_destroy(copy);
-                        outer_rc = rc;
-                        goto stride_error;
-                    }
-                } else {
-                    /* Adopt schema from result if target is still uninitialised */
-                    if (target->ncols == 0 && result.rel->ncols > 0) {
-                        rc = col_rel_set_schema(
-                            target, result.rel->ncols,
-                            (const char *const *)result.rel->col_names);
-                        if (rc != 0) {
-                            if (result.owned)
-                                col_rel_destroy(result.rel);
-                            outer_rc = rc;
-                            goto stride_error;
-                        }
-                    }
-                    rc = col_rel_append_all(target, result.rel,
-                            sess->eval_arena);
-                    if (result.owned)
-                        col_rel_destroy(result.rel);
-                    if (rc != 0) {
-                        outer_rc = rc;
-                        goto stride_error;
-                    }
                 }
             }
 
@@ -994,7 +798,7 @@ stride_error:
         if (outer_rc != 0) {
             /* Issue #282: Restore diff_operators_active on error path */
             sess->diff_operators_active = saved_diff_operators_active;
-            if (framed && sess->cleanup_pending) {
+            if (sess->cleanup_pending) {
                 /* Retained rule entries may borrow any registered delta or
                  * cache. Only local bookkeeping can be released here. */
                 for (uint32_t ri = 0; ri < nrels; ri++)

@@ -251,9 +251,9 @@ sessions retain the same governor reference and release it during every
 normal or partial teardown path. The fixed eval arenas now use
 `wl_arena_create_managed()`: their complete backing capacity is admitted before
 `malloc`, retained across reset, and released exactly once at destruction.
-Worker evaluators retire final CONCAT segment boundaries after validating the
-popped relation entry and before lower-stack cleanup. These arrays describe
-intra-plan merging and have no publication-time consumer; relation source
+Direct recursive TDD subpasses retire final CONCAT segment boundaries after
+validating the popped relation entry and before lower-stack cleanup. These arrays
+describe intra-plan merging and have no publication-time consumer; relation source
 readers protect descriptor/storage, not the consumed entry metadata. This
 metadata retirement does not supply retained worker result/stack ownership:
 worker refusal and allocator-lifetime integration remain tracked by #1661
@@ -700,8 +700,8 @@ contract for admitted allocations, not a claim that all allocation classes,
 spill access or downstream pipelines are already bounded (#1369, #1372,
 #1475).
 
-Coordinator serial evaluation and fallback, including recursive snapshot and
-delta steps in multi-worker sessions, admit a persistent cleanup frame before
+Every `col_eval_stratum` caller, including worker sessions, coordinator fallback,
+recursive snapshot and delta steps, admits a persistent cleanup frame before
 executing each relation plan. The frame owns its stack,
 popped result and segment metadata until publication or checked disposal.
 Refusal preserves allocators, caches and registry owners until session readiness
@@ -745,7 +745,25 @@ replay skips result restoration and releases only its independent saved copies.
 Pending frames keep registered partial replay state and allocator storage alive
 until snapshot retry drains them; no callbacks or arena reset precede recovery.
 
-Cleanup refusal remains an integration gap for worker evaluation: #1647 covers lost popped results,
+At quiescent snapshot failure and cache-reclaim boundaries, the coordinator
+checks both its own cleanup owners and the retained TDD worker cohort. A pending
+worker frame therefore prevents coordinator delta removal, registry compaction
+and cache-pin release/reclamation. Worker lists are inspected only after the
+dispatch barrier; checked teardown retains refused workers for readiness retry.
+Callback-free public steps exercise nonrecursive TDD dispatch and error-time
+cache reclamation. Snapshot selection currently excludes nonrecursive TDD; its
+post-evaluation cohort guard prepares for further worker frame adoption.
+Public compound construction also checks quiescent cleanup readiness before
+creating a side relation or allocating a handle, preserving pending input state
+when coordinator or worker cleanup refuses.
+
+Generic `col_eval_stratum_multiworker` arrays remain caller-owned. Their caller
+must join, release readers and perform checked destruction; a full nonrecursive
+retry recreates workers rather than rerunning partially published worker state.
+They are not implicitly included in the coordinator's retained TDD cohort.
+
+Cleanup refusal remains an integration gap for direct TDD recursive subpasses
+and specialized parallel rule evaluation: #1647 covers lost popped results,
 #1648 covers K-Fusion refusal handling, and #1661 covers retention of whole
 refused evaluator stacks and their allocators across unwind. In particular,
 retaining an entry on a block-local stack does not preserve ownership after
