@@ -711,6 +711,18 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
  * Any previously initialized workers are destroyed first.
  * On failure, any partially-created workers are destroyed.
  */
+#ifdef WL_TEST_BDX_SEED
+void (*wl_columnar_eval_test_initializer_boundary)(unsigned, unsigned,
+    uint32_t, wl_col_session_t *);
+#define WL_COLUMNAR_EVAL_INIT_BOUNDARY(mode, phase, worker, coord) \
+        do { if (wl_columnar_eval_test_initializer_boundary) \
+             wl_columnar_eval_test_initializer_boundary(mode, phase, worker, \
+                 coord); \
+        } while (0)
+#else
+#define WL_COLUMNAR_EVAL_INIT_BOUNDARY(mode, phase, worker, coord) ((void)0)
+#endif
+
 static int
 tdd_init_workers(wl_col_session_t *coord, uint32_t W)
 {
@@ -780,6 +792,7 @@ tdd_init_workers(wl_col_session_t *coord, uint32_t W)
         if (rel->ncols == 0 || rel->nrows == 0) {
             /* Empty: give each worker an empty relation */
             for (uint32_t w = 0; w < W && rc == 0; w++) {
+                WL_COLUMNAR_EVAL_INIT_BOUNDARY(0, 0, w, coord);
                 worker_parts[w][parts_built]
                     = col_rel_new_auto(name, rel->ncols);
                 if (!worker_parts[w][parts_built])
@@ -794,6 +807,7 @@ tdd_init_workers(wl_col_session_t *coord, uint32_t W)
                 if (rc == 0) {
                     for (uint32_t w = 0; w < W && rc == 0; w++) {
                         free(parts[w]->name);
+                        WL_COLUMNAR_EVAL_INIT_BOUNDARY(0, 1, w, coord);
                         parts[w]->name = wl_strdup(name);
                         if (!parts[w]->name) {
                             rc = ENOMEM;
@@ -815,22 +829,22 @@ tdd_init_workers(wl_col_session_t *coord, uint32_t W)
     }
 
     /* Create worker sessions */
-    uint32_t created = 0;
     if (rc == 0) {
         for (uint32_t w = 0; w < W; w++) {
             coord->tdd_workers_count = w + 1;
+            WL_COLUMNAR_EVAL_INIT_BOUNDARY(0, 3, w, coord);
             rc = col_worker_session_create(coord, w,
                     worker_parts[w], parts_built, &coord->tdd_workers[w]);
             if (rc != 0)
                 break;
-            created++;
         }
     }
 
-    /* On failure: destroy successfully-created workers; free unclaimed partitions */
+    /* Transfer NULLs are the ownership ledger, including incomplete rows.
+     * Construction counts cannot exclude a partially built relation. */
     if (rc != 0) {
-        for (uint32_t w = created; w < W; w++) {
-            for (uint32_t p = 0; p < parts_built; p++)
+        for (uint32_t w = 0; w < W; w++) {
+            for (uint32_t p = 0; p < nrels; p++)
                 col_rel_destroy(worker_parts[w][p]);
         }
         /* Keep the attempted worker in the cohort: a refused partial
@@ -927,12 +941,14 @@ tdd_replicate_workers(wl_col_session_t *coord, uint32_t W)
         const char *name = rel->name;
 
         for (uint32_t w = 0; w < W && rc == 0; w++) {
+            WL_COLUMNAR_EVAL_INIT_BOUNDARY(1, 0, w, coord);
             col_rel_t *copy = col_rel_new_auto(name, rel->ncols);
             if (!copy) {
                 rc = ENOMEM;
                 break;
             }
             if (rel->nrows > 0) {
+                WL_COLUMNAR_EVAL_INIT_BOUNDARY(1, 2, w, coord);
                 rc = col_rel_append_all(copy, rel, NULL);
                 if (rc != 0) {
                     col_rel_destroy(copy);
@@ -947,22 +963,21 @@ tdd_replicate_workers(wl_col_session_t *coord, uint32_t W)
     }
 
     /* Create worker sessions */
-    uint32_t created = 0;
     if (rc == 0) {
         for (uint32_t w = 0; w < W; w++) {
             coord->tdd_workers_count = w + 1;
+            WL_COLUMNAR_EVAL_INIT_BOUNDARY(1, 3, w, coord);
             rc = col_worker_session_create(coord, w,
                     worker_rels[w], rels_built, &coord->tdd_workers[w]);
             if (rc != 0)
                 break;
-            created++;
         }
     }
 
-    /* On failure: destroy successfully-created workers; free unclaimed rels */
+    /* Inspect all original slots: transferred entries are already NULL. */
     if (rc != 0) {
-        for (uint32_t w = created; w < W; w++) {
-            for (uint32_t p = 0; p < rels_built; p++)
+        for (uint32_t w = 0; w < W; w++) {
+            for (uint32_t p = 0; p < nrels; p++)
                 col_rel_destroy(worker_rels[w][p]);
         }
         int cleanup_rc = tdd_cleanup_workers(coord);
@@ -1020,11 +1035,13 @@ tdd_init_workers_global_read(wl_col_session_t *coord, uint32_t W)
             col_rel_t *src = coord->rels[r];
             if (!src)
                 continue;
+            WL_COLUMNAR_EVAL_INIT_BOUNDARY(2, 0, w, coord);
             rc = nonrec_make_shared_relation_view(src, &worker_rels[w][r]);
             if (rc != 0)
                 goto cleanup;
         }
         coord->tdd_workers_count = w + 1;
+        WL_COLUMNAR_EVAL_INIT_BOUNDARY(2, 3, w, coord);
         rc = col_worker_session_create(coord, w, worker_rels[w], nrels,
                 &coord->tdd_workers[w]);
         if (rc != 0)
@@ -1033,7 +1050,8 @@ tdd_init_workers_global_read(wl_col_session_t *coord, uint32_t W)
 
 cleanup:
     if (worker_rels) {
-        for (uint32_t w = coord->tdd_workers_count; w < W; w++) {
+        /* An attempted worker can still leave every input caller-owned. */
+        for (uint32_t w = 0; w < W; w++) {
             if (!worker_rels[w])
                 continue;
             for (uint32_t r = 0; r < nrels; r++)
@@ -1047,6 +1065,20 @@ cleanup:
         rc = tdd_cleanup_preserve_error(coord, rc);
     return rc;
 }
+
+#ifdef WL_TEST_BDX_SEED
+int
+wl_columnar_eval_test_initializer(unsigned mode, wl_col_session_t *coord,
+    uint32_t workers)
+{
+    switch (mode) {
+    case 0: return tdd_init_workers(coord, workers);
+    case 1: return tdd_replicate_workers(coord, workers);
+    case 2: return tdd_init_workers_global_read(coord, workers);
+    default: return EINVAL;
+    }
+}
+#endif
 
 static int
 tdd_refresh_global_read_relation(const wl_plan_stratum_t *sp,

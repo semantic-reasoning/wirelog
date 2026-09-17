@@ -31,6 +31,9 @@ void *__real_realloc(void *ptr, size_t size);
 
 static long allocation_fail_at = -1;
 static long allocation_calls;
+static size_t allocation_fail_calloc_size;
+static wl_col_session_t *allocation_failure_worker;
+static bool allocation_failed_after_transfer;
 
 static bool
 fail_this_allocation(void)
@@ -48,6 +51,14 @@ __wrap_malloc(size_t size)
 void *
 __wrap_calloc(size_t count, size_t size)
 {
+    if (allocation_fail_calloc_size && count == 1
+        && size == allocation_fail_calloc_size) {
+        allocation_fail_calloc_size = 0;
+        allocation_failed_after_transfer = allocation_failure_worker
+            && allocation_failure_worker->nrels > 0
+            && allocation_failure_worker->rels != NULL;
+        return NULL;
+    }
     return fail_this_allocation() ? NULL : __real_calloc(count, size);
 }
 
@@ -2455,6 +2466,174 @@ hybrid_fail_later_worker(unsigned phase, uint32_t worker)
 }
 #endif
 
+extern int wl_columnar_eval_test_initializer(unsigned, wl_col_session_t *,
+    uint32_t);
+extern void (*wl_columnar_eval_test_initializer_boundary)(unsigned, unsigned,
+    uint32_t, wl_col_session_t *);
+
+#ifdef WL_TEST_ALLOC_WRAP
+static unsigned initializer_fault_mode, initializer_fault_phase;
+static bool initializer_hold_worker, initializer_fault_hit,
+    initializer_clone_fault;
+static int initializer_reader_rc;
+static wl_columnar_source_access_reader_t initializer_reader;
+static col_rel_t *initializer_held;
+static uint64_t initializer_held_identity;
+
+static void
+fail_initializer_later_worker(unsigned mode, unsigned phase, uint32_t worker,
+    wl_col_session_t *coord)
+{
+    if (mode != initializer_fault_mode || phase != initializer_fault_phase
+        || worker != 1)
+        return;
+    initializer_fault_hit = true;
+    wl_columnar_eval_test_initializer_boundary = NULL;
+    if (initializer_hold_worker) {
+        initializer_held = session_find_rel(&coord->tdd_workers[0], "input");
+        initializer_reader_rc = col_rel_source_reader_acquire(initializer_held,
+                &initializer_reader);
+        initializer_held_identity = initializer_held->relation_identity;
+    }
+    if (initializer_clone_fault) {
+        allocation_fail_calloc_size = sizeof(col_arr_entry_t);
+        allocation_failure_worker = &coord->tdd_workers[worker];
+        allocation_failed_after_transfer = false;
+    } else {
+        allocation_calls = 0;
+        allocation_fail_at = 0;
+    }
+}
+
+static void
+test_initializer_unwind(uint32_t workers, unsigned mode, unsigned phase,
+    bool held, bool clone_failure)
+{
+    TEST(
+        "initializer unwind: all caller slots, retained worker and exact retry");
+    wl_plan_t plan = { 0 };
+    wl_session_t *session = NULL;
+    col_rel_t *unowned = NULL, *source = NULL, *empty = NULL;
+    const char *failure = NULL;
+    int64_t value = 42;
+    initializer_fault_mode = mode;
+    initializer_fault_phase = phase;
+    initializer_hold_worker = held;
+    initializer_clone_fault = clone_failure;
+    initializer_fault_hit = false;
+    initializer_reader_rc = EINVAL;
+    initializer_held = NULL;
+    memset(&initializer_reader, 0, sizeof(initializer_reader));
+#define INIT_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    INIT_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "create");
+    wl_col_session_t *coord = (wl_col_session_t *)session;
+    unowned = col_rel_new_auto("input", 1);
+    INIT_CHECK(unowned, "input allocation");
+    for (unsigned i = 0; i < 128; i++)
+        INIT_CHECK(col_rel_append_row(unowned, &value) == 0, "input rows");
+    INIT_CHECK(session_add_rel(coord, unowned) == 0, "input registration");
+    source = unowned;
+    unowned = NULL;
+    unowned = col_rel_new_auto("empty", 1);
+    INIT_CHECK(unowned && session_add_rel(coord, unowned) == 0,
+        "empty relation");
+    empty = unowned;
+    unowned = NULL;
+    if (clone_failure) {
+        uint32_t key = 0;
+        INIT_CHECK(col_session_get_arrangement(&coord->base, "input", &key, 1)
+            && coord->arr_count == 1, "coordinator arrangement");
+    }
+    INIT_CHECK(wl_columnar_eval_test_initializer(mode, coord, workers) == 0
+        && wl_columnar_eval_test_hybrid_cleanup(coord) == 0,
+        "warm infrastructure");
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(coord->memory_governor);
+    uint64_t reserved = wl_columnar_memory_reserved(governor);
+    uint64_t source_view = source->view_generation;
+    uint64_t source_storage = source->storage_generation;
+    int64_t **source_columns = source->columns;
+    wl_columnar_eval_test_initializer_boundary = fail_initializer_later_worker;
+    int rc = wl_columnar_eval_test_initializer(mode, coord, workers);
+    allocation_fail_at = -1;
+    allocation_fail_calloc_size = 0;
+    allocation_failure_worker = NULL;
+    wl_columnar_eval_test_initializer_boundary = NULL;
+    INIT_CHECK(initializer_fault_hit && rc == (held ? EBUSY : ENOMEM),
+        "real late allocation failure not propagated");
+    if (clone_failure)
+        INIT_CHECK(allocation_failed_after_transfer,
+            "clone failed before transfer");
+    INIT_CHECK(source->nrows == 128 && source->columns == source_columns
+        && source->view_generation == source_view
+        && source->storage_generation == source_storage && empty->nrows == 0
+        && col_rel_get(source, 127, 0) == 42,
+        "coordinator source mutated");
+    if (held) {
+        INIT_CHECK(initializer_reader_rc == 0 && coord->tdd_workers_count == 2
+            && session_find_rel(&coord->tdd_workers[0],
+            "input") == initializer_held
+            && initializer_held->relation_identity == initializer_held_identity,
+            "refused worker ownership lost");
+        INIT_CHECK(wl_columnar_eval_test_hybrid_cleanup(coord) == EBUSY,
+            "repeated teardown ignored reader");
+        INIT_CHECK(col_rel_source_reader_release(&initializer_reader) == 0,
+            "release worker reader");
+        INIT_CHECK(wl_columnar_eval_test_hybrid_cleanup(coord) == 0,
+            "released cohort teardown");
+    }
+    INIT_CHECK(coord->tdd_workers_count == 0
+        && wl_columnar_memory_reserved(governor) == reserved
+        && col_rel_storage_alias_borrow_count(source) == 0
+        && col_rel_storage_alias_borrow_count(empty) == 0
+        && atomic_load(&source->source_access.state) == 0
+        && atomic_load(&empty->source_access.state) == 0,
+        "failure leaked allocation credit or source leases");
+    INIT_CHECK(wl_columnar_eval_test_initializer(mode, coord, workers) == 0
+        && coord->tdd_workers_count == workers, "initializer retry");
+    uint32_t total = 0;
+    for (uint32_t w = 0; w < workers; w++) {
+        col_rel_t *r = session_find_rel(&coord->tdd_workers[w], "input");
+        col_rel_t *e = session_find_rel(&coord->tdd_workers[w], "empty");
+        INIT_CHECK(r && e && r->ncols == 1 && e->ncols == 1 && e->nrows == 0,
+            "retry worker relations");
+        total += r->nrows;
+        for (uint32_t row = 0; row < r->nrows; row++)
+            INIT_CHECK(col_rel_get(r, row, 0) == 42, "exact retry rows");
+        if (mode == 2)
+            INIT_CHECK(r->storage_owner == source && e->storage_owner == empty,
+                "global-read retry source leases");
+        else
+            INIT_CHECK(r->storage_owner == r, "private retry relation");
+    }
+    INIT_CHECK(total == (mode == 0 ? 128u : 128u * workers),
+        "exact retry count");
+    INIT_CHECK(wl_columnar_eval_test_hybrid_cleanup(coord) == 0
+        && wl_columnar_memory_reserved(governor) == reserved
+        && col_rel_storage_alias_borrow_count(source) == 0
+        && col_rel_storage_alias_borrow_count(empty) == 0,
+        "retry teardown accounting");
+cleanup:
+    wl_columnar_eval_test_initializer_boundary = NULL;
+    allocation_fail_at = -1;
+    allocation_fail_calloc_size = 0;
+    allocation_failure_worker = NULL;
+    if (initializer_reader.owner)
+        (void)col_rel_source_reader_release(&initializer_reader);
+    if (session)
+        (void)wl_columnar_eval_test_hybrid_cleanup((wl_col_session_t *)session);
+    col_rel_destroy(unowned);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef INIT_CHECK
+}
+#endif
+
 static void
 test_hybrid_empty_idb_ownership(unsigned fault)
 {
@@ -3199,6 +3378,16 @@ main(void)
     test_hybrid_empty_idb_ownership(1);
     test_hybrid_empty_idb_ownership(2);
     test_hybrid_empty_idb_ownership(3);
+    for (uint32_t workers = 2; workers <= 8; workers += 6) {
+        for (unsigned mode = 0; mode < 3; mode++) {
+            test_initializer_unwind(workers, mode, 0, false, false);
+            test_initializer_unwind(workers, mode, 3, false, false);
+            test_initializer_unwind(workers, mode, 3, true, false);
+            test_initializer_unwind(workers, mode, 3, false, true);
+        }
+        test_initializer_unwind(workers, 0, 1, false, false);
+        test_initializer_unwind(workers, 1, 2, false, false);
+    }
 #endif
 #endif
     test_tdd_existing_empty_idb(2, false, false);
