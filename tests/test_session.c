@@ -3621,6 +3621,47 @@ cleanup:
 #undef PUB_CHECK
 }
 
+static bool
+compound_cleanup_refusal_unchanged(wl_session_t *session)
+{
+    wl_col_session_t *sess = COL_SESSION(session);
+    wl_compound_arena_t *arena = sess->compound_arena;
+    uint32_t epoch = sess->outer_epoch, nrels = sess->nrels;
+    uint32_t arena_epoch = arena->current_epoch;
+    uint64_t live = arena->live_handles;
+    wl_compound_gen_t generation = arena->gens[arena_epoch];
+    bool pending = sess->pending_input_change;
+    const char *last = sess->last_inserted_relation;
+    wirelog_compound_arg_t arg = { WIRELOG_TYPE_INT64, 42 };
+    uint64_t handle = 123;
+    int rc = wl_session_make_compound(session, "cleanup_guard", 1, &arg,
+            &handle);
+    return rc == EBUSY && handle == WIRELOG_COMPOUND_HANDLE_NULL
+           && sess->outer_epoch == epoch && sess->nrels == nrels
+           && sess->pending_input_change == pending &&
+           sess->last_inserted_relation == last
+           && arena->current_epoch == arena_epoch && arena->live_handles == live
+           && arena->gens[arena_epoch].base == generation.base
+           && arena->gens[arena_epoch].capacity == generation.capacity
+           && arena->gens[arena_epoch].used == generation.used
+           && arena->gens[arena_epoch].entry_count == generation.entry_count;
+}
+
+static bool
+compound_cleanup_retry_once(wl_session_t *session)
+{
+    wl_col_session_t *sess = COL_SESSION(session);
+    uint64_t live = sess->compound_arena->live_handles;
+    uint32_t epoch = sess->outer_epoch;
+    wirelog_compound_arg_t arg = { WIRELOG_TYPE_INT64, 42 };
+    uint64_t handle = WIRELOG_COMPOUND_HANDLE_NULL;
+    return wl_session_make_compound(session, "cleanup_guard", 1, &arg,
+               &handle) == 0
+           && handle != WIRELOG_COMPOUND_HANDLE_NULL
+           && sess->compound_arena->live_handles == live + 1
+           && sess->outer_epoch == epoch + 1;
+}
+
 static void
 test_pending_cleanup_operation_guards(unsigned storage, bool in_worker)
 {
@@ -3698,6 +3739,8 @@ test_pending_cleanup_operation_guards(unsigned storage, bool in_worker)
     uint64_t view = held->view_generation,
         generation = held->storage_generation;
     for (int attempt = 0; attempt < 2; attempt++) {
+        GUARD_CHECK(compound_cleanup_refusal_unchanged(session),
+            "compound mutation bypassed cleanup");
         GUARD_CHECK(wl_session_insert(session, "input", &extra, 0, 1) == 0,
             "zero insert is no-op");
         GUARD_CHECK(wl_session_insert(session, "input", &extra, 1, 1) == EBUSY,
@@ -3747,6 +3790,12 @@ test_pending_cleanup_operation_guards(unsigned storage, bool in_worker)
         "released cleanup retry exact oracle");
     GUARD_CHECK(!owner->cleanup_pending && owner->cleanup_reserved_bytes == 0,
         "cleanup accounting not released");
+    if (in_worker) {
+        GUARD_CHECK(col_worker_session_destroy(owner) == 0,
+            "release manually retained worker arena borrow");
+        sess->tdd_workers_count = 0;
+    }
+    GUARD_CHECK(compound_cleanup_retry_once(session), "compound release retry");
 cleanup:
     if (reader_active)
         (void)col_rel_source_reader_release(&reader);
@@ -4626,11 +4675,420 @@ cleanup:
 #undef SEG_CHECK
 }
 
+static unsigned worker_frame_storage;
+static uint32_t worker_frame_iteration;
+static bool worker_frame_injected;
+static int worker_frame_hook_rc;
+static eval_entry_t *worker_frame_entry;
+static col_rel_t *worker_frame_delta;
+static wl_columnar_source_access_reader_t worker_frame_reader;
+static wl_columnar_source_access_reader_t worker_frame_delta_reader;
+
+/* Configuration and hook pointer remain fixed until the dispatch barrier.
+ * Only worker zero writes these captures; the caller reads them after join. */
 static void
-test_recursive_cleanup_excluded_scope(unsigned mode)
+hold_worker_frame(wl_col_session_t *worker, eval_stack_t *stack,
+    eval_entry_t *result)
+{
+    if (!worker->coordinator || worker->worker_id != 0)
+        return;
+    if (worker_frame_injected ||
+        worker->current_iteration != worker_frame_iteration
+        || !result->owned || !result->rel || result->seg_count != 2)
+        return;
+    worker_frame_injected = true;
+    worker_frame_hook_rc = EINVAL;
+    if (worker_frame_iteration != 0) {
+        worker_frame_delta = session_find_rel(worker, "$d$output");
+        if (!worker_frame_delta
+            || eval_stack_push(stack, worker_frame_delta, false) != 0
+            || col_rel_source_reader_acquire_transferable(worker_frame_delta,
+            &worker_frame_delta_reader) != 0)
+            return;
+    }
+    worker_frame_entry = result;
+    if (worker_frame_storage >= 1 && worker_frame_storage <= 3) {
+        col_rel_t *lower = worker_frame_storage == 1
+            ? col_rel_new_auto("worker_lower", 1)
+            : col_rel_pool_new_auto(worker->delta_pool,
+                worker_frame_storage == 3 ? worker->eval_arena : NULL,
+                "worker_lower", 1);
+        int64_t value = 42;
+        if (!lower || col_rel_append_row(lower, &value) != 0
+            || eval_stack_push(stack, lower, true) != 0) {
+            col_rel_destroy(lower);
+            return;
+        }
+        worker_frame_entry = &stack->items[stack->top - 1];
+        worker_frame_entry->seg_boundaries = malloc(3 * sizeof(uint32_t));
+        if (!worker_frame_entry->seg_boundaries)
+            return;
+        worker_frame_entry->seg_boundaries[0] = 0;
+        worker_frame_entry->seg_boundaries[1] = 1;
+        worker_frame_entry->seg_boundaries[2] = 1;
+        worker_frame_entry->seg_count = 2;
+    } else if (worker_frame_storage == 4) {
+        col_rel_t *heap = NULL;
+        if (col_rel_deep_copy(result->rel, &heap, NULL) != 0)
+            return;
+        col_rel_destroy(result->rel);
+        result->rel = heap;
+    }
+    worker_frame_hook_rc = col_rel_source_reader_acquire_transferable(
+        worker_frame_entry->rel, &worker_frame_reader);
+}
+
+static void
+test_worker_frame_retention(uint32_t workers, unsigned storage,
+    bool public_step, bool recursive, uint32_t iteration)
 {
     TEST(
-        "recursive frame scope includes coordinator fallback, excludes workers");
+        "worker frame: actual dispatch retains result, stack and coordinator owners");
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input",
+          .delta_mode = WL_DELTA_FORCE_FULL },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input",
+          .delta_mode = WL_DELTA_FORCE_FULL },
+        { .op = WL_PLAN_OP_CONCAT }
+    };
+    wl_plan_relation_t output = { .name = "output", .delta_name = "$d$output",
+                                  .ops = ops, .op_count = 3 };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1,
+                                  .is_recursive = recursive };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *external = NULL;
+    uint32_t initialized = 0;
+    col_rel_t *unowned = NULL, *cache_left = NULL, *cache_right = NULL;
+    col_rel_t *cache_result = NULL, *marker = NULL;
+    col_mat_entry_t cache_before = { 0 };
+    int64_t *values = NULL;
+    tuple_collector_t tuples = { 0 };
+    const char *failure = NULL;
+    worker_frame_storage = storage;
+    worker_frame_iteration = iteration;
+    worker_frame_injected = false;
+    worker_frame_hook_rc = EINVAL;
+    worker_frame_entry = NULL;
+    worker_frame_delta = NULL;
+    memset(&worker_frame_reader, 0, sizeof(worker_frame_reader));
+    memset(&worker_frame_delta_reader, 0, sizeof(worker_frame_delta_reader));
+#define FRAME_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    FRAME_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "create");
+    wl_col_session_t *sess = COL_SESSION(session);
+    uint32_t count = public_step ? 65536 : 1;
+    values = malloc((size_t)count * sizeof(*values));
+    FRAME_CHECK(values, "input allocation");
+    for (uint32_t row = 0; row < count; row++)
+        values[row] = 42;
+    FRAME_CHECK(wl_session_insert(session, "input", values, count, 1) == 0,
+        "insert");
+    if (public_step) {
+        /* Existing untyped IDB isolates cleanup from schema-clone defects
+         * tracked in #1698 (empty/pool targets and typed partitions). */
+        unowned = col_rel_new_auto("output", 1);
+        FRAME_CHECK(unowned && col_rel_append_row(unowned, values) == 0
+            && session_add_rel(sess, unowned) == 0, "existing output");
+        unowned = NULL;
+        unowned = col_rel_new_auto("$d$guard", 1);
+        FRAME_CHECK(unowned && col_rel_append_row(unowned, values) == 0
+            && session_add_rel(sess, unowned) == 0, "registry marker");
+        marker = unowned;
+        unowned = NULL;
+        cache_left = col_rel_new_auto("cache_left", 1);
+        cache_right = col_rel_new_auto("cache_right", 1);
+        unowned = col_rel_new_auto("cache_result", 1);
+        FRAME_CHECK(cache_left && cache_right && unowned
+            && col_rel_append_row(cache_left, values) == 0
+            && col_rel_append_row(cache_right, values) == 0
+            && col_rel_append_row(unowned, values) == 0
+            && col_mat_cache_insert(&sess->mat_cache, cache_left, cache_right,
+            unowned) == 0, "cache fixture");
+        cache_result = unowned;
+        unowned = NULL;
+        FRAME_CHECK(col_mat_cache_lookup(&sess->mat_cache, cache_left,
+            cache_right) == cache_result, "cache epoch pin");
+        col_mat_cache_clear(&sess->mat_cache);
+        FRAME_CHECK(sess->mat_cache.count == 1
+            && sess->mat_cache.entries[0].eviction_deferred
+            && sess->mat_cache.active_pins == 1, "deferred cache owner");
+        cache_before = sess->mat_cache.entries[0];
+    } else {
+        FRAME_CHECK(wl_columnar_session_ensure_workqueue(sess, workers) == 0,
+            "workqueue");
+        external = calloc(workers, sizeof(*external));
+        FRAME_CHECK(external, "worker array");
+        for (uint32_t w = 0; w < workers; w++) {
+            FRAME_CHECK(col_worker_session_create(sess, w, NULL, 0,
+                &external[w]) == 0, "worker create");
+            initialized++;
+            external[w].frontier_ops->reset_rule_frontier(&external[w], 0,
+                external[w].outer_epoch);
+            unowned = col_rel_new_auto("input", 1);
+            FRAME_CHECK(unowned && col_rel_append_row(unowned, values) == 0
+                && col_rel_enable_timestamps(unowned) == 0
+                && session_add_rel(&external[w], unowned) == 0,
+                "worker input");
+            unowned->timestamps[0].multiplicity = 1;
+            unowned = NULL;
+        }
+    }
+    wl_columnar_eval_serial_test_after_plan = hold_worker_frame;
+    int rc = public_step
+        ? wl_session_step(session)
+        : col_eval_stratum_multiworker(&stratum, sess, 0, external, workers);
+    FRAME_CHECK(rc == EBUSY && worker_frame_injected
+        && worker_frame_hook_rc == 0 && tuples.count == 0,
+        "actual worker cleanup refusal");
+    wl_col_session_t *worker =
+        public_step ? &sess->tdd_workers[0] : external;
+    FRAME_CHECK(worker->cleanup_pending_count == 1 && !worker->cleanup_active
+        && worker_frame_entry && worker_frame_entry->rel
+        && worker_frame_entry->seg_boundaries &&
+        worker_frame_entry->seg_count == 2,
+        "retained worker frame and segments");
+    col_rel_t *held = worker_frame_entry->rel;
+    int64_t **columns = held->columns;
+    uint32_t *segments = worker_frame_entry->seg_boundaries;
+    uint64_t bytes = worker->cleanup_reserved_bytes;
+    size_t arena_used = worker->eval_arena->used;
+    uint32_t slots = worker->delta_pool->slot_used;
+    if (public_step)
+        FRAME_CHECK(sess->tdd_workers_count == workers
+            && sess->tdd_workers_cap >= workers &&
+            worker->coordinator == sess,
+            "actual public TDD worker cohort");
+    for (unsigned retry = 0; retry < 2; retry++) {
+        int retry_rc = public_step
+            ? wl_session_snapshot(session, collect_tuple, &tuples)
+            : col_eval_stratum(&stratum, worker, 0);
+        FRAME_CHECK(retry_rc == EBUSY && tuples.count == 0
+            && worker->cleanup_pending_count == 1
+            && worker->cleanup_reserved_bytes == bytes
+            && worker->eval_arena->used == arena_used
+            && worker->delta_pool->slot_used == slots
+            && worker_frame_entry->rel == held && held->columns == columns
+            && worker_frame_entry->seg_boundaries == segments
+            && col_rel_get(held, 0, 0) == 42,
+            "retry changed retained worker storage");
+        if (iteration != 0)
+            FRAME_CHECK(session_find_rel(worker,
+                "$d$output") == worker_frame_delta
+                && worker_frame_delta->nrows == 1,
+                "next-subpass registered delta reclaimed");
+        if (public_step) {
+            FRAME_CHECK(compound_cleanup_refusal_unchanged(session),
+                "compound mutation bypassed worker cleanup");
+            FRAME_CHECK(wl_session_step(session) == EBUSY,
+                "step bypassed worker readiness");
+            FRAME_CHECK(wl_session_insert(session, "input", values, 1,
+                1) == EBUSY
+                && wl_session_remove(session, "input", values, 1, 1) == EBUSY,
+                "mutation bypassed worker readiness");
+            col_mat_entry_t *entry = &sess->mat_cache.entries[0];
+            FRAME_CHECK(session_find_rel(sess, "$d$guard") == marker
+                && col_rel_get(marker, 0, 0) == 42
+                && sess->mat_cache.count == 1 &&
+                sess->mat_cache.active_pins == 1
+                && entry->result == cache_result && entry->owner_alive
+                && entry->identity == cache_before.identity
+                && entry->generation == cache_before.generation
+                && entry->pin_epoch == cache_before.pin_epoch
+                && entry->epoch_pin_count == cache_before.epoch_pin_count
+                && entry->pin_count == cache_before.pin_count
+                && entry->ledger_bytes == cache_before.ledger_bytes
+                && col_rel_get(cache_result, 0, 0) == 42,
+                "coordinator reclaimed retained worker dependencies");
+        } else {
+            FRAME_CHECK(col_worker_session_destroy(worker) == EBUSY
+                && worker->cleanup_pending_count == 1,
+                "caller-owned worker destroyed live frame");
+        }
+    }
+    FRAME_CHECK(col_rel_source_reader_release(&worker_frame_reader) == 0,
+        "release result/lower reader");
+    if (worker_frame_delta_reader.owner)
+        FRAME_CHECK(col_rel_source_reader_release(&worker_frame_delta_reader) ==
+            0,
+            "release registered delta reader");
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    if (public_step) {
+        rc = wl_session_step(session);
+        FRAME_CHECK(rc == 0, "public step retry");
+        FRAME_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0
+            && tuples.count == 1 && tuples.rows[0][0] == 42
+            && strcmp(tuples.relations[0], "output") == 0
+            && sess->tdd_workers_count == 0,
+            "exact public snapshot retry");
+        FRAME_CHECK(compound_cleanup_retry_once(session),
+            "compound retry after actual worker cleanup");
+    } else {
+        /* The external caller owns the entire cohort. Recreate all workers
+         * before a whole-evaluation retry so earlier nonrecursive publications
+         * cannot be appended a second time. */
+        for (uint32_t w = 0; w < initialized; w++)
+            FRAME_CHECK(col_worker_session_destroy(&external[w]) == 0,
+                "checked caller-owned cleanup");
+        initialized = 0;
+        memset(external, 0, (size_t)workers * sizeof(*external));
+        for (uint32_t w = 0; w < workers; w++) {
+            FRAME_CHECK(col_worker_session_create(sess, w, NULL, 0,
+                &external[w]) == 0, "retry worker create");
+            initialized++;
+            external[w].frontier_ops->reset_rule_frontier(&external[w], 0,
+                external[w].outer_epoch);
+            unowned = col_rel_new_auto("input", 1);
+            FRAME_CHECK(unowned && col_rel_append_row(unowned, values) == 0
+                && col_rel_enable_timestamps(unowned) == 0
+                && session_add_rel(&external[w], unowned) == 0, "retry input");
+            unowned->timestamps[0].multiplicity = 1;
+            unowned = NULL;
+        }
+        FRAME_CHECK(col_eval_stratum_multiworker(&stratum, sess, 0, external,
+            workers) == 0, "caller-owned cohort retry");
+        for (uint32_t w = 0; w < workers; w++) {
+            col_rel_t *r = session_find_rel(&external[w], "output");
+            FRAME_CHECK(r && r->nrows == (recursive ? 1u : 2u)
+                && col_rel_get(r, 0, 0) == 42
+                && !external[w].cleanup_pending
+                && external[w].cleanup_reserved_bytes == 0,
+                "exact recreated worker result");
+        }
+    }
+cleanup:
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    if (worker_frame_reader.owner)
+        (void)col_rel_source_reader_release(&worker_frame_reader);
+    if (worker_frame_delta_reader.owner)
+        (void)col_rel_source_reader_release(&worker_frame_delta_reader);
+    for (uint32_t w = 0; w < initialized; w++)
+        (void)col_worker_session_destroy(&external[w]);
+    free(external);
+    col_rel_destroy(unowned);
+    free(values);
+    wl_session_destroy(session);
+    col_rel_destroy(cache_left);
+    col_rel_destroy(cache_right);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef FRAME_CHECK
+}
+
+static void
+test_worker_frame_admission(bool recursive)
+{
+    TEST("worker frame: active parent and admission gate operator execution");
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_CONCAT }
+    };
+    wl_plan_relation_t relation = { .name = "output", .delta_name = "$d$output",
+                                    .ops = ops, .op_count = 3 };
+    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1,
+                                  .is_recursive = recursive };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *worker = NULL;
+    bool initialized = false;
+    col_rel_t *unowned = NULL;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    const char *failure = NULL;
+#define ADMISSION_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    ADMISSION_CHECK(wl_session_create(wl_backend_columnar(), &plan, 2,
+        &session) == 0, "create");
+    wl_col_session_t *sess = COL_SESSION(session);
+    wl_columnar_memory_governor_t *budget =
+        wl_columnar_memory_governor_ref_get(sess->memory_governor);
+    uint64_t baseline = wl_columnar_memory_reserved(budget);
+    worker = calloc(1, sizeof(*worker));
+    ADMISSION_CHECK(worker && col_worker_session_create(sess, 0, NULL, 0,
+        worker) == 0, "worker create");
+    initialized = true;
+    wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    int64_t value = 42;
+    unowned = col_rel_new_auto("input", 1);
+    ADMISSION_CHECK(unowned && col_rel_set_column_types(unowned, &type, 1) == 0
+        && col_rel_append_row(unowned, &value) == 0
+        && session_add_rel(worker, unowned) == 0, "input");
+    unowned = col_rel_new_auto("output", 1);
+    ADMISSION_CHECK(unowned && col_rel_set_column_types(unowned, &type, 1) == 0
+        && session_add_rel(worker, unowned) == 0, "output");
+    col_rel_t *output = unowned;
+    unowned = NULL;
+    uint64_t generation = output->view_generation;
+    worker->current_iteration = 7;
+    worker->frontier_ops->reset_rule_frontier(worker, 0, worker->outer_epoch);
+    ADMISSION_CHECK(wl_columnar_eval_stack_cleanup_begin(worker, &frame) == 0,
+        "active frame");
+    uint32_t slots = worker->delta_pool->slot_used;
+    size_t used = worker->eval_arena->used;
+    serial_scope_hook_calls = 0;
+    wl_columnar_eval_serial_test_after_plan = count_serial_scope_hook;
+    ADMISSION_CHECK(col_eval_stratum(&stratum, worker, 0) == EBUSY
+        && worker->cleanup_active_count == 1 && worker->current_iteration == 7
+        && worker->delta_pool->slot_used == slots &&
+        worker->eval_arena->used == used
+        && output->nrows == 0 && output->view_generation == generation
+        && serial_scope_hook_calls == 0, "active frame did not gate entry");
+    ADMISSION_CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0,
+        "finish active frame");
+    uint64_t saved_limit = atomic_load_explicit(&budget->usable_bytes,
+            memory_order_relaxed);
+    wl_columnar_memory_mode_t saved_mode = budget->mode;
+    budget->mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    atomic_store_explicit(&budget->usable_bytes,
+        wl_columnar_memory_reserved(budget), memory_order_relaxed);
+    int rc = col_eval_stratum(&stratum, worker, 0);
+    budget->mode = saved_mode;
+    atomic_store_explicit(&budget->usable_bytes, saved_limit,
+        memory_order_relaxed);
+    ADMISSION_CHECK(rc == ENOSPC && serial_scope_hook_calls == 0
+        && !worker->cleanup_active && !worker->cleanup_pending
+        && worker->cleanup_reserved_bytes == 0 &&
+        worker->delta_pool->slot_used == slots
+        && worker->eval_arena->used == used && output->nrows == 0
+        && output->view_generation == generation,
+        "admission ran plan or changed owner");
+    ADMISSION_CHECK(col_eval_stratum(&stratum, worker, 0) == 0
+        && serial_scope_hook_calls > 0 && output->nrows == (recursive ? 1u : 2u)
+        && col_rel_get(output, 0, 0) == value && !worker->cleanup_pending
+        && !worker->cleanup_active && worker->cleanup_reserved_bytes == 0,
+        "exact admitted retry");
+    ADMISSION_CHECK(col_worker_session_destroy(worker) == 0, "worker destroy");
+    initialized = false;
+    ADMISSION_CHECK(wl_columnar_memory_reserved(budget) == baseline,
+        "worker admission leaked reservation");
+cleanup:
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    if (frame)
+        (void)wl_columnar_eval_stack_cleanup_finish(&frame);
+    col_rel_destroy(unowned);
+    if (initialized)
+        (void)col_worker_session_destroy(worker);
+    free(worker);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef ADMISSION_CHECK
+}
+
+static void
+test_recursive_cleanup_scope(unsigned mode)
+{
+    TEST(
+        "recursive frame scope includes coordinator fallback and workers");
     wl_plan_op_t op = { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" };
     wl_plan_relation_t relation = { .name = "output", .delta_name = "$d$output",
                                     .ops = &op, .op_count = 1 };
@@ -4677,14 +5135,13 @@ test_recursive_cleanup_excluded_scope(unsigned mode)
         rc = col_eval_stratum(&stratum, owner, 0);
     }
     wl_columnar_eval_serial_test_after_plan = NULL;
-    SCOPE_CHECK(rc == 0 && (mode != 1 ? serial_scope_hook_calls > 0
-        : serial_scope_hook_calls == 0)
+    SCOPE_CHECK(rc == 0 && serial_scope_hook_calls > 0
         && !owner->cleanup_active && !owner->cleanup_pending,
-        "excluded path activated frames");
+        "caller did not complete framed evaluation");
     col_rel_t *output = session_find_rel(owner, "output");
     SCOPE_CHECK(output && output->nrows == 1
         && col_rel_get(output, 0, 0) == value,
-        "excluded path result changed");
+        "framed path result changed");
     SCOPE_CHECK(mode != 0 || (deltas.count == 1
         && has_delta(&deltas, "output", &value, 1, +1)), "delta callback");
 cleanup:
@@ -6390,9 +6847,21 @@ main(void)
         test_worker_serial_segments(false, mode);
         test_worker_serial_segments(true, mode);
     }
-    test_recursive_cleanup_excluded_scope(0);
-    test_recursive_cleanup_excluded_scope(1);
-    test_recursive_cleanup_excluded_scope(2);
+    for (unsigned storage = 0; storage < 5; storage++) {
+        test_worker_frame_retention(2, storage, true, false, 0);
+        test_worker_frame_retention(2, storage, false, true, 0);
+    }
+    test_worker_frame_admission(false);
+    test_worker_frame_admission(true);
+    test_worker_frame_retention(8, 0, true, false, 0);
+    test_worker_frame_retention(8, 3, true, false, 0);
+    test_worker_frame_retention(8, 0, false, true, 1);
+    test_worker_frame_retention(8, 3, false, true, 1);
+    test_worker_frame_retention(2, 0, false, false, 0);
+    test_worker_frame_retention(8, 3, false, false, 0);
+    test_recursive_cleanup_scope(0);
+    test_recursive_cleanup_scope(1);
+    test_recursive_cleanup_scope(2);
     test_observer_retry(false, false, false, false);
     test_observer_retry(true, false, false, false);
     test_observer_retry(false, true, false, false);
