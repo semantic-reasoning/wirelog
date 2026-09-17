@@ -3806,14 +3806,19 @@ col_rel_new_auto(const char *name, uint32_t ncols)
  * callers obtain their template from a lookup that can miss and check only
  * the returned relation, so failing here is what makes that check
  * sufficient. */
-col_rel_t *
-col_rel_new_like(const char *name, const col_rel_t *src)
+static col_rel_t *
+wl_columnar_relation_new_like_impl(const char *name, const col_rel_t *src,
+    wl_columnar_memory_governor_ref_t *governor, bool preserve_metadata)
 {
     if (!src)
         return NULL;
     col_rel_t *r = NULL;
     if (col_rel_alloc(&r, name) != 0)
         return NULL;
+    if (governor && col_rel_attach_memory_governor(r, governor) != 0) {
+        col_rel_destroy(r);
+        return NULL;
+    }
     if (src->column_types && src->ncols > 0) {
         r->column_types = (wirelog_column_type_t *)malloc(
             (size_t)src->ncols * sizeof(*r->column_types));
@@ -3842,9 +3847,31 @@ col_rel_new_like(const char *name, const col_rel_t *src)
      * pre-#553 graceful-degrade contract. */
     if (src->compound_kind != WIRELOG_COMPOUND_KIND_NONE
         && src->compound_arity_map && src->ncols > 0u) {
-        (void)col_rel_clone_compound_meta(r, src);
+        int rc = col_rel_clone_compound_meta(r, src);
+        if (preserve_metadata && rc != 0) {
+            col_rel_destroy(r);
+            return NULL;
+        }
+    }
+    if (preserve_metadata && src->timestamps
+        && col_rel_enable_timestamps(r) != 0) {
+        col_rel_destroy(r);
+        return NULL;
     }
     return r;
+}
+
+col_rel_t *
+col_rel_new_like(const char *name, const col_rel_t *src)
+{
+    return wl_columnar_relation_new_like_impl(name, src, NULL, false);
+}
+
+col_rel_t *
+wl_columnar_relation_new_like_governed(const char *name, const col_rel_t *src,
+    wl_columnar_memory_governor_ref_t *governor)
+{
+    return wl_columnar_relation_new_like_impl(name, src, governor, true);
 }
 
 /* Pool-aware col_rel constructor wrappers.
@@ -6131,4 +6158,24 @@ col_rel_radix_sort_int64(col_rel_t *r)
         WL_LOG(WL_LOG_SEC_CONSOLIDATION, WL_LOG_WARN,
             "radix sort refused for %s: rc=%d", r->name ? r->name : "?", rc);
     return rc;
+}
+
+int
+wl_columnar_relation_rename_checked(col_rel_t *rel, const char *name)
+{
+    if (!rel || !name)
+        return EINVAL;
+    char *replacement = wl_strdup(name);
+    if (!replacement)
+        return ENOMEM;
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int rc = wl_columnar_source_access_writer_acquire(&rel->descriptor_access,
+            &writer);
+    if (rc != 0) {
+        free(replacement);
+        return rc;
+    }
+    free(rel->name);
+    rel->name = replacement;
+    return wl_columnar_source_access_writer_release(&writer);
 }

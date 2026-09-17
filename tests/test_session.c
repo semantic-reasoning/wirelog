@@ -3764,6 +3764,395 @@ cleanup:
 #undef GUARD_CHECK
 }
 
+extern void (*wl_columnar_eval_serial_test_after_plan)(wl_col_session_t *,
+    eval_stack_t *, eval_entry_t *);
+static wl_columnar_source_access_reader_t serial_cleanup_reader;
+static col_rel_t *serial_cleanup_held;
+static unsigned serial_cleanup_storage;
+static bool serial_cleanup_lower;
+static int serial_cleanup_hook_rc;
+
+static void
+inject_serial_cleanup_reader(wl_col_session_t *sess, eval_stack_t *stack,
+    eval_entry_t *result)
+{
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    serial_cleanup_hook_rc = EINVAL;
+    if (!result->owned || !result->rel || result->seg_count != 2
+        || !result->seg_boundaries || result->seg_boundaries[2] != 2)
+        return;
+    serial_cleanup_held = result->rel;
+    if (serial_cleanup_lower) {
+        col_rel_t *lower = serial_cleanup_storage == 0
+            ? col_rel_new_auto("lower", 1)
+            : col_rel_pool_new_auto(sess->delta_pool,
+                serial_cleanup_storage == 2 ? sess->eval_arena : NULL,
+                "lower", 1);
+        int64_t value = 42;
+        if (!lower || col_rel_append_row(lower, &value) != 0
+            || eval_stack_push(stack, lower, true) != 0) {
+            col_rel_destroy(lower);
+            return;
+        }
+        serial_cleanup_held = lower;
+    }
+    serial_cleanup_hook_rc = col_rel_source_reader_acquire(
+        serial_cleanup_held, &serial_cleanup_reader);
+}
+
+static void
+test_serial_cleanup_caller(unsigned storage, bool lower, bool existing)
+{
+    TEST(lower ? "serial caller: lower owner refusal retains production frame"
+        : "serial caller: CONCAT result refusal retains production frame");
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_CONCAT }
+    };
+    wl_plan_relation_t relation = { .name = "output", .ops = ops,
+                                    .op_count = 3 };
+    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess = NULL;
+    delta_pool_t *saved_pool = NULL;
+    const char *failure = NULL;
+    tuple_collector_t tuples = { 0 };
+    int64_t value = 42;
+    uint64_t target_generation = 0;
+#define SERIAL_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    memset(&serial_cleanup_reader, 0, sizeof(serial_cleanup_reader));
+    serial_cleanup_held = NULL;
+    SERIAL_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0
+        && wl_session_insert(session, "input", &value, 1, 1) == 0, "fixture");
+    sess = COL_SESSION(session);
+    if (existing) {
+        col_rel_t *target = col_rel_new_auto("output", 1);
+        SERIAL_CHECK(target, "existing target allocation");
+        int add_rc = session_add_rel(sess, target);
+        if (add_rc != 0)
+            col_rel_destroy(target);
+        SERIAL_CHECK(add_rc == 0, "existing target registration");
+        target_generation = target->view_generation;
+    }
+    if (!lower && storage == 0) {
+        saved_pool = sess->delta_pool;
+        sess->delta_pool = NULL;
+    }
+    serial_cleanup_storage = storage;
+    serial_cleanup_lower = lower;
+    wl_columnar_eval_serial_test_after_plan = inject_serial_cleanup_reader;
+    int rc = wl_session_snapshot(session, collect_tuple, &tuples);
+    if (saved_pool) {
+        sess->delta_pool = saved_pool;
+        saved_pool = NULL;
+    }
+    SERIAL_CHECK(rc == EBUSY && serial_cleanup_hook_rc == 0
+        && sess->cleanup_pending_count == 1 && !sess->cleanup_active,
+        "caller did not retain refusal");
+    SERIAL_CHECK(serial_cleanup_held->pool_owned == (storage != 0)
+        && serial_cleanup_held->arena_owned == (storage == 2), "storage");
+    SERIAL_CHECK(!existing || (session_find_rel(sess, "output")->nrows == 0
+        && session_find_rel(sess,
+        "output")->view_generation == target_generation),
+        "cleanup refusal published rows before retry");
+    char *name = serial_cleanup_held->name;
+    int64_t **columns = serial_cleanup_held->columns;
+    uint32_t slots = sess->delta_pool->slot_used;
+    size_t used = sess->eval_arena->used;
+    uint32_t nrels = sess->nrels;
+    uint64_t bytes = sess->cleanup_reserved_bytes;
+    SERIAL_CHECK(strcmp(name, lower ? "lower" : "$concat") == 0,
+        "rename modified reader-held relation");
+    for (unsigned retry = 0; retry < 2; retry++) {
+        SERIAL_CHECK(wl_session_snapshot(session, collect_tuple, &tuples)
+            == EBUSY, "pending caller did not refuse");
+        SERIAL_CHECK(serial_cleanup_held->name == name
+            && serial_cleanup_held->columns == columns
+            && col_rel_get(serial_cleanup_held, 0, 0) == value
+            && sess->delta_pool->slot_used == slots
+            && sess->eval_arena->used == used && sess->nrels == nrels
+            && sess->cleanup_reserved_bytes == bytes && bytes != 0
+            && tuples.count == 0
+            && (!existing || (session_find_rel(sess, "output")->nrows == 0
+            && session_find_rel(sess,
+            "output")->view_generation == target_generation)),
+            "pending state changed");
+    }
+    SERIAL_CHECK(col_rel_source_reader_release(&serial_cleanup_reader) == 0,
+        "reader release");
+    serial_cleanup_held = NULL;
+    SERIAL_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0
+        && tuples.count == 2 && tuples.rows[0][0] == value
+        && tuples.rows[1][0] == value
+        && strcmp(tuples.relations[0], "output") == 0
+        && !sess->cleanup_pending && sess->cleanup_reserved_bytes == 0,
+        "same-session exact retry");
+cleanup:
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    if (serial_cleanup_reader.owner)
+        (void)col_rel_source_reader_release(&serial_cleanup_reader);
+    if (saved_pool)
+        sess->delta_pool = saved_pool;
+    if (sess)
+        (void)wl_columnar_eval_stack_cleanup_retry(sess);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef SERIAL_CHECK
+}
+
+#ifdef WL_TEST_ALLOC_WRAP
+static bool serial_fail_promotion;
+static bool serial_deny_copy;
+static void
+inject_serial_publication_failure(wl_col_session_t *sess, eval_stack_t *stack,
+    eval_entry_t *result)
+{
+    (void)stack;
+    (void)result;
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    if (serial_deny_copy) {
+        wl_columnar_memory_governor_t *budget =
+            wl_columnar_memory_governor_ref_get(sess->memory_governor);
+        budget->mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+        atomic_store_explicit(&budget->usable_bytes,
+            wl_columnar_memory_reserved(budget), memory_order_relaxed);
+    } else if (serial_fail_promotion)
+        fail_calloc_size = sizeof(col_rel_t);
+    else
+        fail_next_alloc = true;
+}
+#endif
+
+static void
+test_serial_cleanup_admission_and_failures(void)
+{
+    TEST("serial caller: admission and publication failures release ownership");
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_CONCAT }
+    };
+    wl_plan_relation_t relation = { .name = "output", .ops = ops,
+                                    .op_count = 3 };
+    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess = NULL;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    const char *failure = NULL;
+    tuple_collector_t tuples = { 0 };
+    int64_t value = 42;
+#define SERIAL_FAIL_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    SERIAL_FAIL_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0
+        && wl_session_insert(session, "input", &value, 1, 1) == 0, "fixture");
+    sess = COL_SESSION(session);
+    SERIAL_FAIL_CHECK(wl_columnar_eval_stack_cleanup_begin(sess, &frame) == 0,
+        "parent frame");
+    uint32_t slots = sess->delta_pool->slot_used;
+    SERIAL_FAIL_CHECK(col_eval_stratum(&stratum, sess, 0) == EBUSY
+        && sess->cleanup_active_count == 1
+        && sess->delta_pool->slot_used == slots, "active parent not excluded");
+    SERIAL_FAIL_CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0,
+        "finish parent");
+    wl_columnar_memory_governor_t *budget = wl_columnar_memory_governor_ref_get(
+        sess->memory_governor);
+    uint64_t saved_limit = atomic_load_explicit(&budget->usable_bytes,
+            memory_order_relaxed);
+    wl_columnar_memory_mode_t saved_mode = budget->mode;
+    budget->mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    atomic_store_explicit(&budget->usable_bytes,
+        wl_columnar_memory_reserved(budget), memory_order_relaxed);
+    int rc = col_eval_stratum(&stratum, sess, 0);
+    budget->mode = saved_mode;
+    atomic_store_explicit(&budget->usable_bytes, saved_limit,
+        memory_order_relaxed);
+    SERIAL_FAIL_CHECK(rc == ENOSPC && !sess->cleanup_active
+        && !sess->cleanup_pending && sess->cleanup_reserved_bytes == 0
+        && sess->delta_pool->slot_used == slots
+        && !session_find_rel(sess, "output"), "admission ran operators");
+#ifdef WL_TEST_ALLOC_WRAP
+    for (unsigned mode = 0; mode < 2; mode++) {
+        serial_fail_promotion = mode != 0;
+        wl_columnar_eval_serial_test_after_plan =
+            inject_serial_publication_failure;
+        rc = col_eval_stratum(&stratum, sess, 0);
+        SERIAL_FAIL_CHECK(rc == ENOMEM && !fail_next_alloc
+            && fail_calloc_size == 0 && !sess->cleanup_active
+            && !sess->cleanup_pending && sess->cleanup_reserved_bytes == 0
+            && !session_find_rel(sess, "output"),
+            "publication failure lost ownership");
+    }
+    col_rel_t *target = col_rel_new_auto("output", 1);
+    SERIAL_FAIL_CHECK(target, "existing target allocation");
+    rc = session_add_rel(sess, target);
+    if (rc != 0)
+        col_rel_destroy(target);
+    SERIAL_FAIL_CHECK(rc == 0, "existing target registration");
+    uint64_t target_generation = target->view_generation;
+    uint64_t reserved_before = wl_columnar_memory_reserved(budget);
+    for (unsigned mode = 0; mode < 2; mode++) {
+        serial_fail_promotion = false;
+        serial_deny_copy = mode != 0;
+        wl_columnar_eval_serial_test_after_plan =
+            inject_serial_publication_failure;
+        rc = col_eval_stratum(&stratum, sess, 0);
+        budget->mode = saved_mode;
+        atomic_store_explicit(&budget->usable_bytes, saved_limit,
+            memory_order_relaxed);
+        serial_deny_copy = false;
+        SERIAL_FAIL_CHECK(rc == ENOMEM
+            && !fail_next_alloc && target->nrows == 0
+            && target->view_generation == target_generation
+            && wl_columnar_memory_reserved(budget) == reserved_before
+            && !sess->cleanup_pending && sess->cleanup_reserved_bytes == 0,
+            "private copy failure changed target or accounting");
+    }
+#endif
+    SERIAL_FAIL_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0
+        && tuples.count == 2 && tuples.rows[0][0] == value
+        && tuples.rows[1][0] == value && sess->cleanup_reserved_bytes == 0,
+        "publication retry oracle");
+cleanup:
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = false;
+    fail_calloc_size = 0;
+    serial_deny_copy = false;
+#endif
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    if (frame)
+        (void)wl_columnar_eval_stack_cleanup_finish(&frame);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef SERIAL_FAIL_CHECK
+}
+
+static int serial_metadata_rc;
+static void
+inject_serial_metadata(wl_col_session_t *sess, eval_stack_t *stack,
+    eval_entry_t *result)
+{
+    (void)stack;
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    serial_metadata_rc = EINVAL;
+    col_rel_t *source = result->rel;
+    if (!source || source->nrows != 2 || col_rel_enable_timestamps(source) != 0)
+        return;
+    source->timestamps[0] = (col_delta_timestamp_t){
+        .iteration = 7, .stratum = 3, .worker = 2, .multiplicity = -4
+    };
+    source->timestamps[1] = (col_delta_timestamp_t){
+        .iteration = 8, .stratum = 4, .worker = 1, .multiplicity = 6
+    };
+    source->compound_arity_map = malloc(sizeof(uint32_t));
+    if (!source->compound_arity_map)
+        return;
+    source->compound_arity_map[0] = 1;
+    source->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+    source->compound_count = 1;
+    col_rel_t *copy = wl_columnar_relation_new_like_governed("metadata", source,
+            sess->memory_governor);
+    if (!copy)
+        return;
+    bool preserved = copy->compound_kind == source->compound_kind
+        && copy->compound_count == 1 && copy->compound_arity_map
+        && copy->compound_arity_map != source->compound_arity_map
+        && copy->compound_arity_map[0] == 1 && copy->timestamps;
+    col_rel_destroy(copy);
+    if (!preserved)
+        return;
+#ifdef WL_TEST_ALLOC_WRAP
+    uint64_t before = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(sess->memory_governor));
+    fail_malloc_size = sizeof(uint32_t);
+    copy = wl_columnar_relation_new_like_governed("metadata", source,
+            sess->memory_governor);
+    bool refused = !copy && fail_malloc_size == 0;
+    fail_malloc_size = 0;
+    col_rel_destroy(copy);
+    if (!refused || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(sess->memory_governor)) !=
+        before)
+        return;
+#endif
+    serial_metadata_rc = 0;
+}
+
+static void
+test_serial_staging_metadata(void)
+{
+    TEST(
+        "serial caller: governed staging preserves timestamp and compound metadata");
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_CONCAT }
+    };
+    wl_plan_relation_t relation = { .name = "output", .ops = ops,
+                                    .op_count = 3 };
+    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    col_rel_t *target = NULL;
+    const char *failure = NULL;
+    int64_t value = 42;
+#define META_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    META_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0
+        && wl_session_insert(session, "input", &value, 1, 1) == 0, "fixture");
+    wl_col_session_t *sess = COL_SESSION(session);
+    target = col_rel_new_auto("output", 1);
+    META_CHECK(target && col_rel_enable_timestamps(target) == 0, "target");
+    col_rel_t *registered = target;
+    META_CHECK(session_add_rel(sess, target) == 0, "register");
+    target = NULL;
+    wl_columnar_eval_serial_test_after_plan = inject_serial_metadata;
+    META_CHECK(col_eval_stratum(&stratum, sess,
+        0) == 0 && serial_metadata_rc == 0,
+        "metadata staging");
+    META_CHECK(registered->nrows == 2 && registered->timestamps
+        && registered->timestamps[0].iteration == 7
+        && registered->timestamps[0].stratum == 3
+        && registered->timestamps[0].worker == 2
+        && registered->timestamps[0].multiplicity == -4
+        && registered->timestamps[1].iteration == 8
+        && registered->timestamps[1].stratum == 4
+        && registered->timestamps[1].worker == 1
+        && registered->timestamps[1].multiplicity == 6
+        && !sess->cleanup_pending && sess->cleanup_reserved_bytes == 0,
+        "staging lost provenance or multiplicity");
+cleanup:
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    col_rel_destroy(target);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef META_CHECK
+}
+
 static void
 test_pending_cleanup_synchronous_destroy(void)
 {
@@ -4493,6 +4882,14 @@ main(void)
     test_delta_alias_rollback(false);
     test_delta_alias_rollback(true);
     test_pending_cleanup_synchronous_destroy();
+    test_serial_cleanup_admission_and_failures();
+    test_serial_staging_metadata();
+    test_serial_cleanup_caller(0, false, false);
+    test_serial_cleanup_caller(1, false, false);
+    test_serial_cleanup_caller(0, true, false);
+    test_serial_cleanup_caller(1, true, false);
+    test_serial_cleanup_caller(2, true, false);
+    test_serial_cleanup_caller(1, false, true);
     test_pending_cleanup_operation_guards(0, false);
     test_pending_cleanup_operation_guards(1, false);
     test_pending_cleanup_operation_guards(2, false);
