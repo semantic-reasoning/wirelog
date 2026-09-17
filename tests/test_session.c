@@ -4691,7 +4691,7 @@ static wl_columnar_source_access_reader_t worker_frame_reader;
 static wl_columnar_source_access_reader_t worker_frame_delta_reader;
 
 /* Configuration and hook pointer remain fixed until the dispatch barrier.
- * Only worker zero writes these captures; the caller reads them after join. */
+ * Only the selected worker writes these captures; the caller reads them after join. */
 static void
 hold_worker_frame(wl_col_session_t *worker, eval_stack_t *stack,
     eval_entry_t *result)
@@ -4995,12 +4995,297 @@ cleanup:
 #undef FRAME_CHECK
 }
 
+extern void (*wl_columnar_eval_test_outbound_after_plan)(wl_col_session_t *,
+    eval_stack_t *, eval_entry_t *);
+static bool global_read_frame_flags;
 static void
-test_tdd_ordinary_frame_retention(uint32_t workers, unsigned storage,
-    uint32_t held_worker)
+hold_global_read_frame(wl_col_session_t *worker, eval_stack_t *stack,
+    eval_entry_t *result)
+{
+    if (worker->worker_id == worker_frame_target)
+        global_read_frame_flags = worker->tdd_outbound_only_active &&
+            worker->diff_operators_active;
+    hold_worker_frame(worker, stack, result);
+}
+
+static void
+test_tdd_recursive_frame_retention(uint32_t workers, unsigned storage,
+    uint32_t held_worker, bool global_read)
 {
     TEST(
-        "ordinary TDD frames: shared prior delta and result survive public retry");
+        "recursive TDD frames: retained dependencies survive public readiness");
+    uint32_t width = global_read ? 2 : 1;
+    uint32_t key = 0, projection[] = { 0, 1 };
+    const char *keys[] = { global_read ? "col1" : "col0" };
+    uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
+    wl_plan_op_exchange_t exchange = { .num_workers = 1,
+                                       .key_col_idxs = &key,
+                                       .key_col_count = 1 };
+    wl_plan_op_t output_ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "output" },
+        { .op = WL_PLAN_OP_JOIN,
+          .right_relation = global_read ? "input" : "output", .left_keys = keys,
+          .right_keys = keys, .key_count = 1, .project_indices = projection,
+          .project_count = width },
+        { .op = WL_PLAN_OP_VARIABLE,
+          .relation_name = global_read ? "input" : "relay" },
+        { .op = WL_PLAN_OP_CONCAT },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    wl_plan_op_t relay_ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    wl_plan_relation_t relations[] = {
+        { .name = "output", .delta_name = "$d$output", .ops = output_ops,
+          .op_count = 5 },
+        { .name = "relay", .delta_name = "$d$relay", .ops = relay_ops,
+          .op_count = 3 }
+    };
+    wl_plan_stratum_t stratum = { .relations = relations, .relation_count = 2,
+                                  .is_recursive = true };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    col_rel_t *unowned = NULL, *cache_left = NULL, *cache_right = NULL;
+    col_rel_t *cache_result = NULL, *marker = NULL;
+    int64_t *values = NULL;
+    const char *failure = NULL;
+    tuple_collector_t tuples = { 0 };
+    global_read_frame_flags = false;
+    worker_frame_target = held_worker;
+    worker_frame_storage = storage;
+    worker_frame_iteration = global_read ? 0 : 1;
+    worker_frame_delta_name = "$d$relay";
+    worker_frame_injected = false;
+    worker_frame_hook_rc = EINVAL;
+    worker_frame_entry = NULL;
+    worker_frame_delta = worker_frame_delta_owner = NULL;
+    memset(&worker_frame_reader, 0, sizeof(worker_frame_reader));
+    memset(&worker_frame_delta_reader, 0, sizeof(worker_frame_delta_reader));
+#define TDD_FRAME_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    TDD_FRAME_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "create");
+    wl_col_session_t *sess = COL_SESSION(session);
+    values = malloc((size_t)65536 * width * sizeof(*values));
+    TDD_FRAME_CHECK(values, "input allocation");
+    for (uint32_t i = 0; i < 65536 * width; i++) values[i] = 42;
+    TDD_FRAME_CHECK(wl_session_insert(session, "input", values, 65536,
+        width) == 0,
+        "input");
+    wirelog_column_type_t types[] = { WIRELOG_TYPE_INT64, WIRELOG_TYPE_INT64 };
+    for (unsigned i = 0; i < 2; i++) {
+        unowned = col_rel_new_auto(relations[i].name, width);
+        TDD_FRAME_CHECK(unowned && col_rel_set_column_types(unowned, types,
+            width) == 0
+            && session_add_rel(sess, unowned) == 0, "typed empty IDB");
+        unowned = NULL;
+    }
+    unowned = col_rel_new_auto("$d$guard", 1);
+    TDD_FRAME_CHECK(unowned && col_rel_append_row(unowned, values) == 0
+        && session_add_rel(sess, unowned) == 0, "coordinator delta owner");
+    marker = unowned;
+    unowned = NULL;
+    cache_left = col_rel_new_auto("cache_left", 1);
+    cache_right = col_rel_new_auto("cache_right", 1);
+    unowned = col_rel_new_auto("cache_result", 1);
+    TDD_FRAME_CHECK(cache_left && cache_right && unowned
+        && col_rel_append_row(cache_left, values) == 0
+        && col_rel_append_row(cache_right, values) == 0
+        && col_rel_append_row(unowned, values) == 0
+        && col_mat_cache_insert(&sess->mat_cache, cache_left, cache_right,
+        unowned) == 0, "cache owner");
+    cache_result = unowned;
+    unowned = NULL;
+    TDD_FRAME_CHECK(col_mat_cache_lookup(&sess->mat_cache, cache_left,
+        cache_right)
+        == cache_result, "cache epoch pin");
+    col_mat_cache_clear(&sess->mat_cache);
+    col_mat_entry_t cache_before = sess->mat_cache.entries[0];
+    if (global_read)
+        wl_columnar_eval_test_outbound_after_plan = hold_global_read_frame;
+    else
+        wl_columnar_eval_serial_test_after_plan = hold_worker_frame;
+    int rc = wl_session_snapshot(session, collect_tuple, &tuples);
+    TDD_FRAME_CHECK(rc == EBUSY && (!global_read || global_read_frame_flags) &&
+        worker_frame_injected
+        && worker_frame_hook_rc == 0 && tuples.count == 0
+        && sess->tdd_executed_strata == 1 && sess->tdd_workers_count == workers,
+        "actual recursive worker refusal");
+    wl_col_session_t *worker = &sess->tdd_workers[held_worker];
+    TDD_FRAME_CHECK(worker->cleanup_pending_count == 1 &&
+        !worker->cleanup_active
+        && (global_read || (worker_frame_delta && worker_frame_delta_owner
+        && (held_worker == 0 ? worker_frame_delta == worker_frame_delta_owner
+            : worker_frame_delta != worker_frame_delta_owner))),
+        "natural shared root or alias dependency");
+    col_rel_t *held = worker_frame_entry->rel;
+    uint32_t *segments = worker_frame_entry->seg_boundaries;
+    int64_t **columns = held->columns;
+    uint64_t bytes = worker->cleanup_reserved_bytes;
+    uint32_t slots = worker->delta_pool->slot_used;
+    size_t used = worker->eval_arena->used;
+    uint32_t epoch = sess->outer_epoch;
+    uint32_t root_rows = global_read ? 0 : worker_frame_delta_owner->nrows;
+    col_delta_timestamp_t *timestamps =
+        global_read ? NULL : worker_frame_delta_owner->timestamps;
+    TDD_FRAME_CHECK(segments && worker_frame_entry->seg_count == 2 && bytes > 0,
+        "retained entry metadata");
+    for (unsigned attempt = 0; attempt < 2; attempt++) {
+        TDD_FRAME_CHECK(wl_session_snapshot(session, collect_tuple,
+            &tuples) == EBUSY
+            && wl_session_step(session) == EBUSY
+            && wl_session_insert(session, "input", values, 1, 1) == EBUSY
+            && wl_session_remove(session, "input", values, 1, 1) == EBUSY
+            && compound_cleanup_refusal_unchanged(session), "public readiness");
+        TDD_FRAME_CHECK(tuples.count == 0 && sess->outer_epoch == epoch
+            && worker->cleanup_pending_count == 1
+            && worker->cleanup_reserved_bytes == bytes
+            && worker->delta_pool->slot_used == slots &&
+            worker->eval_arena->used == used
+            && worker_frame_entry->rel == held && held->columns == columns
+            && worker_frame_entry->seg_boundaries == segments
+            && worker_frame_entry->seg_count == 2 && col_rel_get(held, 0,
+            0) == 42,
+            "retained entry or allocator changed");
+        if (!global_read)
+            TDD_FRAME_CHECK(session_find_rel(worker,
+                "$d$relay") == worker_frame_delta
+                && worker_frame_delta->view_generation ==
+                worker_frame_delta_view
+                && worker_frame_delta->nrows == 1
+                && worker_frame_delta_owner->nrows == root_rows &&
+                root_rows == 1
+                && worker_frame_delta_owner->view_generation ==
+                worker_frame_owner_view
+                && worker_frame_delta_owner->storage_generation ==
+                worker_frame_owner_storage
+                && worker_frame_delta_owner->timestamps == timestamps
+                && col_rel_get(worker_frame_delta_owner, 0, 0) == 42,
+                "shared prior delta reclaimed or invalidated");
+        col_mat_entry_t *cache = &sess->mat_cache.entries[0];
+        TDD_FRAME_CHECK(session_find_rel(sess, "$d$guard") == marker
+            && col_rel_get(marker, 0, 0) == 42 && sess->mat_cache.count == 1
+            && sess->mat_cache.active_pins == 1 && cache->result == cache_result
+            && cache->identity == cache_before.identity
+            && cache->generation == cache_before.generation
+            && cache->pin_count == cache_before.pin_count
+            && cache->epoch_pin_count == cache_before.epoch_pin_count
+            && cache->ledger_bytes == cache_before.ledger_bytes
+            && col_rel_get(cache_result, 0, 0) == 42,
+            "coordinator dependencies reclaimed");
+    }
+    TDD_FRAME_CHECK(col_rel_source_reader_release(&worker_frame_reader) == 0
+        && (global_read ||
+        col_rel_source_reader_release(&worker_frame_delta_reader) == 0),
+        "release readers");
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    wl_columnar_eval_test_outbound_after_plan = NULL;
+    if (global_read) {
+        /* #1704 owns successful global-read exchange. Readiness drains the
+         * frames; checked cohort teardown retires its ordinary input views
+         * before public mutation, without reevaluating that exchange. */
+        TDD_FRAME_CHECK(wl_columnar_session_cleanup_ready_quiescent(sess) == 0,
+            "global-read frame readiness");
+        for (uint32_t w = 0; w < workers; w++) {
+            TDD_FRAME_CHECK(!sess->tdd_workers[w].cleanup_active
+                && !sess->tdd_workers[w].cleanup_pending
+                && sess->tdd_workers[w].cleanup_reserved_bytes == 0,
+                "global-read worker frame not drained");
+            TDD_FRAME_CHECK(col_worker_session_destroy(&sess->tdd_workers[w]) ==
+                0,
+                "checked global-read cohort teardown");
+        }
+        sess->tdd_workers_count = 0;
+        TDD_FRAME_CHECK(wl_session_insert(session, "input", values, 1,
+            width) == 0
+            && tuples.count == 0 && session_find_rel(sess,
+            "input")->nrows == 65537,
+            "public mutation after checked frame and cohort cleanup");
+    } else
+        TDD_FRAME_CHECK(wl_session_snapshot(session, collect_tuple,
+            &tuples) == 0
+            && tuples.count == 2 && tuples.rows[0][0] == 42 &&
+            tuples.rows[1][0] == 42
+            && strcmp(tuples.relations[0], "output") == 0
+            && strcmp(tuples.relations[1],
+            "relay") == 0 && sess->tdd_workers_count == 0,
+            "exact public snapshot retry");
+cleanup:
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    wl_columnar_eval_test_outbound_after_plan = NULL;
+    worker_frame_target = 0;
+    worker_frame_delta_name = "$d$output";
+    if (worker_frame_reader.owner)
+        (void)col_rel_source_reader_release(&worker_frame_reader);
+    if (worker_frame_delta_reader.owner)
+        (void)col_rel_source_reader_release(&worker_frame_delta_reader);
+    col_rel_destroy(unowned);
+    free(values);
+    wl_session_destroy(session);
+    col_rel_destroy(cache_left);
+    col_rel_destroy(cache_right);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef TDD_FRAME_CHECK
+}
+
+extern void (*wl_columnar_eval_test_outbound_after_plan)(wl_col_session_t *,
+    eval_stack_t *, eval_entry_t *);
+extern void (*wl_columnar_eval_test_outbound_before_publish)(wl_col_session_t *,
+    eval_entry_t *);
+static col_delta_timestamp_t *outbound_frame_timestamps;
+static uint64_t outbound_frame_storage_generation;
+static uint32_t outbound_frame_rows;
+static bool outbound_frame_prefix;
+
+static void
+hold_outbound_frame(wl_col_session_t *worker, eval_stack_t *stack,
+    eval_entry_t *result)
+{
+    if (worker->worker_id == worker_frame_target && result->seg_count == 2) {
+        wl_mem_ledger_snapshot_t ledger;
+        wl_mem_ledger_snapshot(&worker->coordinator->mem_ledger, &ledger);
+        outbound_frame_prefix = ledger.subsys_bytes[WL_MEM_SUBSYS_CHANNEL]
+            > worker->coordinator->mem_channel_ring_bytes;
+    }
+    if (worker_frame_storage < 5) {
+        hold_worker_frame(worker, stack, result);
+        return;
+    }
+    if (worker->worker_id == worker_frame_target && result->rel
+        && result->seg_count == 2 && worker_frame_storage == 5)
+        worker_frame_hook_rc = col_rel_enable_timestamps(result->rel);
+}
+
+static void
+hold_outbound_candidate(wl_col_session_t *worker, eval_entry_t *result)
+{
+    if (worker_frame_storage < 5 || worker->worker_id != worker_frame_target
+        || worker_frame_injected || !result->rel
+        || worker->current_iteration != worker_frame_iteration
+        || strcmp(result->rel->name, "$d$output") != 0)
+        return;
+    worker_frame_injected = true;
+    worker_frame_entry = result;
+    outbound_frame_timestamps = result->rel->timestamps;
+    outbound_frame_storage_generation = result->rel->storage_generation;
+    outbound_frame_rows = result->rel->nrows;
+    worker_frame_hook_rc = col_rel_source_reader_acquire_transferable(
+        result->rel, &worker_frame_reader);
+}
+
+static void
+test_tdd_outbound_frame_retention(uint32_t workers, unsigned storage,
+    uint32_t held_worker, bool later)
+{
+    TEST(
+        "outbound TDD frames: queue prefix and retained owners survive public retry");
     uint32_t key = 0, projection[] = { 0 };
     const char *keys[] = { "col0" };
     uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
@@ -5027,6 +5312,15 @@ test_tdd_ordinary_frame_retention(uint32_t workers, unsigned storage,
         { .name = "relay", .delta_name = "$d$relay", .ops = relay_ops,
           .op_count = 3 }
     };
+    output_ops[0].relation_name = "input";
+    output_ops[1] = (wl_plan_op_t){ .op = WL_PLAN_OP_FILTER,
+                                    .filter_expr = { predicate, 2 } };
+    output_ops[2].relation_name = "input";
+    output_ops[0].delta_mode = WL_DELTA_FORCE_FULL;
+    output_ops[2].delta_mode = WL_DELTA_FORCE_FULL;
+    wl_plan_relation_t tmp = relations[0];
+    relations[0] = relations[1];
+    relations[1] = tmp;
     wl_plan_stratum_t stratum = { .relations = relations, .relation_count = 2,
                                   .is_recursive = true };
     const char *edb[] = { "input" };
@@ -5038,9 +5332,10 @@ test_tdd_ordinary_frame_retention(uint32_t workers, unsigned storage,
     int64_t *values = NULL;
     const char *failure = NULL;
     tuple_collector_t tuples = { 0 };
+    outbound_frame_prefix = false;
     worker_frame_target = held_worker;
     worker_frame_storage = storage;
-    worker_frame_iteration = 1;
+    worker_frame_iteration = later ? 1 : 0;
     worker_frame_delta_name = "$d$relay";
     worker_frame_injected = false;
     worker_frame_hook_rc = EINVAL;
@@ -5058,14 +5353,6 @@ test_tdd_ordinary_frame_retention(uint32_t workers, unsigned storage,
     for (uint32_t i = 0; i < 65536; i++) values[i] = 42;
     TDD_FRAME_CHECK(wl_session_insert(session, "input", values, 65536, 1) == 0,
         "input");
-    wirelog_column_type_t type = WIRELOG_TYPE_INT64;
-    for (unsigned i = 0; i < 2; i++) {
-        unowned = col_rel_new_auto(relations[i].name, 1);
-        TDD_FRAME_CHECK(unowned && col_rel_set_column_types(unowned, &type,
-            1) == 0
-            && session_add_rel(sess, unowned) == 0, "typed empty IDB");
-        unowned = NULL;
-    }
     unowned = col_rel_new_auto("$d$guard", 1);
     TDD_FRAME_CHECK(unowned && col_rel_append_row(unowned, values) == 0
         && session_add_rel(sess, unowned) == 0, "coordinator delta owner");
@@ -5087,29 +5374,33 @@ test_tdd_ordinary_frame_retention(uint32_t workers, unsigned storage,
         == cache_result, "cache epoch pin");
     col_mat_cache_clear(&sess->mat_cache);
     col_mat_entry_t cache_before = sess->mat_cache.entries[0];
-    wl_columnar_eval_serial_test_after_plan = hold_worker_frame;
+    wl_columnar_eval_test_outbound_after_plan = hold_outbound_frame;
+    wl_columnar_eval_test_outbound_before_publish = hold_outbound_candidate;
     int rc = wl_session_snapshot(session, collect_tuple, &tuples);
     TDD_FRAME_CHECK(rc == EBUSY && worker_frame_injected
         && worker_frame_hook_rc == 0 && tuples.count == 0
         && sess->tdd_executed_strata == 1 && sess->tdd_workers_count == workers,
-        "actual ordinary worker refusal");
+        "actual outbound worker refusal");
+    TDD_FRAME_CHECK(later || outbound_frame_prefix,
+        "earlier rule did not publish a queue prefix");
     wl_col_session_t *worker = &sess->tdd_workers[held_worker];
     TDD_FRAME_CHECK(worker->cleanup_pending_count == 1 &&
-        !worker->cleanup_active
-        && worker_frame_delta && worker_frame_delta_owner
-        && (held_worker == 0 ? worker_frame_delta == worker_frame_delta_owner
-            : worker_frame_delta != worker_frame_delta_owner),
-        "natural shared root or alias dependency");
+        !worker->cleanup_active,
+        "retained outbound frame");
+    if (later && storage < 5)
+        TDD_FRAME_CHECK(worker_frame_delta && worker_frame_delta_owner,
+            "later-round registered delta dependency");
     col_rel_t *held = worker_frame_entry->rel;
+    if (later && storage >= 5)
+        TDD_FRAME_CHECK(held->nrows == 0, "empty prepared candidate");
     uint32_t *segments = worker_frame_entry->seg_boundaries;
     int64_t **columns = held->columns;
     uint64_t bytes = worker->cleanup_reserved_bytes;
     uint32_t slots = worker->delta_pool->slot_used;
     size_t used = worker->eval_arena->used;
     uint32_t epoch = sess->outer_epoch;
-    uint32_t root_rows = worker_frame_delta_owner->nrows;
-    col_delta_timestamp_t *timestamps = worker_frame_delta_owner->timestamps;
-    TDD_FRAME_CHECK(segments && worker_frame_entry->seg_count == 2 && bytes > 0,
+    TDD_FRAME_CHECK((storage >= 5 ||
+        (segments && worker_frame_entry->seg_count == 2)) && bytes > 0,
         "retained entry metadata");
     for (unsigned attempt = 0; attempt < 2; attempt++) {
         TDD_FRAME_CHECK(wl_session_snapshot(session, collect_tuple,
@@ -5125,21 +5416,30 @@ test_tdd_ordinary_frame_retention(uint32_t workers, unsigned storage,
             worker->eval_arena->used == used
             && worker_frame_entry->rel == held && held->columns == columns
             && worker_frame_entry->seg_boundaries == segments
-            && worker_frame_entry->seg_count == 2 && col_rel_get(held, 0,
-            0) == 42,
+            && (storage >= 5 || worker_frame_entry->seg_count == 2) &&
+            (held->nrows == 0 || col_rel_get(held, 0, 0) == 42),
             "retained entry or allocator changed");
-        TDD_FRAME_CHECK(session_find_rel(worker,
-            "$d$relay") == worker_frame_delta
-            && worker_frame_delta->view_generation == worker_frame_delta_view
-            && worker_frame_delta->nrows == 1
-            && worker_frame_delta_owner->nrows == root_rows && root_rows == 1
-            && worker_frame_delta_owner->view_generation ==
-            worker_frame_owner_view
-            && worker_frame_delta_owner->storage_generation ==
-            worker_frame_owner_storage
-            && worker_frame_delta_owner->timestamps == timestamps
-            && col_rel_get(worker_frame_delta_owner, 0, 0) == 42,
-            "shared prior delta reclaimed or invalidated");
+        if (storage >= 5)
+            TDD_FRAME_CHECK(held->timestamps == outbound_frame_timestamps
+                && held->storage_generation == outbound_frame_storage_generation
+                && held->nrows == outbound_frame_rows
+                && ((held->timestamps != NULL) == (storage == 5)),
+                "late candidate mutated before reader release");
+        wl_mem_ledger_snapshot_t queue_ledger;
+        wl_mem_ledger_snapshot(&sess->mem_ledger, &queue_ledger);
+        TDD_FRAME_CHECK(queue_ledger.subsys_bytes[WL_MEM_SUBSYS_CHANNEL] == 0
+            && !sess->delta_queue && sess->mem_channel_ring_bytes == 0,
+            "earlier queue prefix not reclaimed");
+        if (later && storage < 5)
+            TDD_FRAME_CHECK(session_find_rel(worker,
+                "$d$relay") == worker_frame_delta
+                && worker_frame_delta->view_generation ==
+                worker_frame_delta_view
+                && worker_frame_delta_owner->view_generation ==
+                worker_frame_owner_view
+                && worker_frame_delta_owner->storage_generation ==
+                worker_frame_owner_storage,
+                "prior-round dependency invalidated");
         col_mat_entry_t *cache = &sess->mat_cache.entries[0];
         TDD_FRAME_CHECK(session_find_rel(sess, "$d$guard") == marker
             && col_rel_get(marker, 0, 0) == 42 && sess->mat_cache.count == 1
@@ -5152,19 +5452,24 @@ test_tdd_ordinary_frame_retention(uint32_t workers, unsigned storage,
             && col_rel_get(cache_result, 0, 0) == 42,
             "coordinator dependencies reclaimed");
     }
-    TDD_FRAME_CHECK(col_rel_source_reader_release(&worker_frame_reader) == 0
-        && col_rel_source_reader_release(&worker_frame_delta_reader) == 0,
+    TDD_FRAME_CHECK(col_rel_source_reader_release(&worker_frame_reader) == 0,
         "release readers");
-    wl_columnar_eval_serial_test_after_plan = NULL;
+    if (later && storage < 5)
+        TDD_FRAME_CHECK(col_rel_source_reader_release(
+                &worker_frame_delta_reader) == 0,
+            "release prior delta reader");
+    wl_columnar_eval_test_outbound_after_plan = NULL;
+    wl_columnar_eval_test_outbound_before_publish = NULL;
     TDD_FRAME_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0
         && tuples.count == 2 && tuples.rows[0][0] == 42 &&
         tuples.rows[1][0] == 42
-        && strcmp(tuples.relations[0], "output") == 0
+        && strcmp(tuples.relations[0], "relay") == 0
         && strcmp(tuples.relations[1],
-        "relay") == 0 && sess->tdd_workers_count == 0,
+        "output") == 0 && sess->tdd_workers_count == 0,
         "exact public snapshot retry");
 cleanup:
-    wl_columnar_eval_serial_test_after_plan = NULL;
+    wl_columnar_eval_test_outbound_after_plan = NULL;
+    wl_columnar_eval_test_outbound_before_publish = NULL;
     worker_frame_target = 0;
     worker_frame_delta_name = "$d$output";
     if (worker_frame_reader.owner)
@@ -5217,11 +5522,11 @@ ordinary_worker_gate_boundary(wl_col_session_t *coord, uint32_t iteration,
         ordinary_gate_workers = coord->tdd_workers_count;
         ordinary_gate_slots = worker->delta_pool->slot_used;
         ordinary_gate_used = worker->eval_arena->used;
-        if (ordinary_gate_mode == 0) {
+        if (ordinary_gate_mode == 0 || ordinary_gate_mode == 3) {
             worker->current_iteration = 7;
             ordinary_gate_rc = wl_columnar_eval_stack_cleanup_begin(worker,
                     &ordinary_gate_frame);
-        } else if (ordinary_gate_mode == 1) {
+        } else if (ordinary_gate_mode == 1 || ordinary_gate_mode == 4) {
             ordinary_gate_budget =
                 wl_columnar_memory_governor_ref_get(coord->memory_governor);
             ordinary_gate_saved_mode = ordinary_gate_budget->mode;
@@ -5241,14 +5546,14 @@ ordinary_worker_gate_boundary(wl_col_session_t *coord, uint32_t iteration,
             ordinary_gate_saved_limit, memory_order_relaxed);
         ordinary_gate_budget_changed = false;
     }
-    if (ordinary_gate_mode == 0)
+    if (ordinary_gate_mode == 0 || ordinary_gate_mode == 3)
         ordinary_gate_verified = ordinary_gate_rc == 0 && ordinary_gate_frame
             && worker->cleanup_active_count == 1 &&
             worker->current_iteration == 7
             && !worker->tdd_subpass_active && !worker->tdd_outbound_only_active
             && worker->delta_pool->slot_used == ordinary_gate_slots
             && worker->eval_arena->used == ordinary_gate_used;
-    else if (ordinary_gate_mode == 1) {
+    else if (ordinary_gate_mode == 1 || ordinary_gate_mode == 4) {
         ordinary_gate_verified = worker->delta_pool->slot_used ==
             ordinary_gate_slots
             && worker->eval_arena->used == ordinary_gate_used;
@@ -5280,7 +5585,7 @@ test_tdd_ordinary_frame_gates(uint32_t workers, unsigned mode)
         { .op = WL_PLAN_OP_CONCAT },
         { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
     };
-    if (mode == 2) {
+    if (mode >= 2) {
         ops[0].relation_name = "input";
         ops[1] = (wl_plan_op_t){ .op = WL_PLAN_OP_FILTER,
                                  .filter_expr = { predicate, 2 } };
@@ -5312,7 +5617,7 @@ test_tdd_ordinary_frame_gates(uint32_t workers, unsigned mode)
     for (uint32_t i = 0; i < 65536; i++) values[i] = 42;
     TDD_GATE_CHECK(wl_session_insert(session, "input", values, 65536, 1) == 0,
         "input");
-    if (mode != 2) {
+    if (mode < 2) {
         wirelog_column_type_t type = WIRELOG_TYPE_INT64;
         unowned = col_rel_new_auto("output", 1);
         TDD_GATE_CHECK(unowned && col_rel_set_column_types(unowned, &type,
@@ -5329,7 +5634,8 @@ test_tdd_ordinary_frame_gates(uint32_t workers, unsigned mode)
         && ordinary_gate_calls == 0 && sess->tdd_executed_strata == 1,
         "actual dispatch bypassed gate or outbound exclusion");
     if (mode != 2) {
-        TDD_GATE_CHECK(rc == (mode == 0 ? EBUSY : ENOSPC) && tuples.count == 0,
+        TDD_GATE_CHECK(rc == ((mode == 0 || mode == 3) ? EBUSY : ENOSPC) &&
+            tuples.count == 0,
             "failure not propagated before output");
         if (ordinary_gate_frame)
             TDD_GATE_CHECK(wl_columnar_eval_stack_cleanup_finish(
@@ -5360,6 +5666,148 @@ cleanup:
     }
     PASS();
 #undef TDD_GATE_CHECK
+}
+
+static void
+test_outbound_publisher_ownership(unsigned mode)
+{
+    TEST("outbound publisher: refusal retains owner and retry transfers once");
+    wl_plan_t plan = { 0 };
+    wl_session_t *session = NULL;
+    wl_col_session_t worker = { 0 };
+    bool initialized = false, budget_changed = false;
+    col_rel_t *candidate = NULL, *alias = NULL;
+    col_rel_t *slots[1] = { NULL };
+    wl_columnar_source_access_reader_t reader = { 0 };
+    wl_columnar_memory_governor_t *budget = NULL;
+    wl_columnar_memory_mode_t saved_mode = 0;
+    uint64_t saved_limit = 0;
+    const char *failure = NULL;
+    int64_t value = 42;
+#define PUB_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    PUB_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1, &session) == 0,
+        "create");
+    wl_col_session_t *coord = COL_SESSION(session);
+    PUB_CHECK(col_worker_session_create(coord, 0, NULL, 0, &worker) == 0,
+        "worker");
+    initialized = true;
+    col_eval_tdd_worker_ctx_t ctx = { .worker_sess = &worker,
+                                      .delta_rels = slots, .stratum_idx = 3 };
+    candidate = col_rel_new_auto("$d$output", 1);
+    PUB_CHECK(candidate && col_rel_attach_memory_governor(candidate,
+        coord->memory_governor) == 0, "candidate governor");
+    if (mode != 0)
+        PUB_CHECK(col_rel_append_row(candidate, &value) == 0, "candidate row");
+    if (mode == 2 || mode == 3)
+        PUB_CHECK(col_rel_enable_timestamps(candidate) == 0, "timestamps");
+    col_rel_t *original = candidate;
+    col_delta_timestamp_t *timestamps = candidate->timestamps;
+    uint64_t generation = candidate->storage_generation;
+    if (mode <= 2)
+        PUB_CHECK(col_rel_source_reader_acquire(candidate, &reader) == 0,
+            "held reader");
+    if (mode == 3) {
+        alias = col_rel_new_auto("alias", 1);
+        PUB_CHECK(alias && col_rel_install_shared_view(alias, candidate) == 0,
+            "alias");
+    }
+    if (mode == 4) {
+        coord->delta_queue = wl_mpsc_queue_create(1, 2);
+        PUB_CHECK(coord->delta_queue, "queue");
+        for (unsigned i = 0; i < 2; i++) {
+            col_rel_t *prefix = col_rel_new_auto("prefix", 1);
+            PUB_CHECK(prefix && col_rel_append_row(prefix, &value) == 0,
+                "prefix");
+            int rc = wl_columnar_eval_tdd_queue_publish_delta(&ctx, &worker,
+                    &prefix, 0, 4);
+            if (rc != 0) col_rel_destroy(prefix);
+            PUB_CHECK(rc == 0 && !prefix, "prefix transfer");
+        }
+    }
+#ifdef WL_TEST_ALLOC_WRAP
+    if (mode == 5)
+        fail_next_alloc = true;
+#endif
+    if (mode == 6) {
+        budget = wl_columnar_memory_governor_ref_get(coord->memory_governor);
+        saved_mode = budget->mode;
+        saved_limit = atomic_load_explicit(&budget->usable_bytes,
+                memory_order_relaxed);
+        budget->mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+        atomic_store_explicit(&budget->usable_bytes, 0, memory_order_relaxed);
+        budget_changed = true;
+    }
+    int rc = wl_columnar_eval_tdd_queue_publish_delta(&ctx, &worker,
+            &candidate, 0, 7);
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = false;
+#endif
+    if (budget_changed) {
+        budget->mode = saved_mode;
+        atomic_store_explicit(&budget->usable_bytes, saved_limit,
+            memory_order_relaxed);
+        budget_changed = false;
+    }
+    PUB_CHECK(rc != 0 && candidate == original && !slots[0],
+        "refusal lost candidate ownership");
+    if (mode <= 3)
+        PUB_CHECK(rc == EBUSY && candidate->timestamps == timestamps
+            && candidate->storage_generation == generation,
+            "reader/alias refusal mutated candidate");
+    if (reader.owner)
+        PUB_CHECK(col_rel_source_reader_release(&reader) == 0, "release");
+    col_rel_destroy(alias);
+    alias = NULL;
+    if (coord->delta_queue) {
+        wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(
+            coord->delta_queue,
+            &coord->mem_ledger);
+        wl_mpsc_queue_destroy(coord->delta_queue);
+        coord->delta_queue = NULL;
+        wl_mem_ledger_snapshot_t ledger;
+        wl_mem_ledger_snapshot(&coord->mem_ledger, &ledger);
+        PUB_CHECK(ledger.subsys_bytes[WL_MEM_SUBSYS_CHANNEL] == 0,
+            "prefix accounting leaked");
+    }
+    PUB_CHECK(wl_columnar_eval_tdd_queue_publish_delta(&ctx, &worker,
+        &candidate, 0, 7) == 0 && !candidate, "retry transfer");
+    PUB_CHECK(mode == 0 ? slots[0] == NULL : slots[0] == original,
+        "matrix ownership");
+    if (mode != 0)
+        PUB_CHECK(slots[0]->nrows == 1 && col_rel_get(slots[0], 0, 0) == 42
+            && slots[0]->timestamps[0].iteration == 7
+            && slots[0]->timestamps[0].stratum == 3
+            && slots[0]->timestamps[0].multiplicity == 1,
+            "provenance or exact row");
+cleanup:
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = false;
+#endif
+    if (budget_changed) {
+        budget->mode = saved_mode;
+        atomic_store_explicit(&budget->usable_bytes, saved_limit,
+            memory_order_relaxed);
+    }
+    if (reader.owner) (void)col_rel_source_reader_release(&reader);
+    col_rel_destroy(alias);
+    col_rel_destroy(candidate);
+    col_rel_destroy(slots[0]);
+    if (session && COL_SESSION(session)->delta_queue) {
+        wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(
+            COL_SESSION(session)->delta_queue,
+            &COL_SESSION(session)->mem_ledger);
+        wl_mpsc_queue_destroy(COL_SESSION(session)->delta_queue);
+        COL_SESSION(session)->delta_queue = NULL;
+    }
+    if (initialized && col_worker_session_destroy(&worker) != 0)
+        failure = "worker teardown";
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef PUB_CHECK
 }
 
 static void
@@ -7234,10 +7682,28 @@ main(void)
         test_worker_frame_retention(2, storage, false, true, 0);
     }
     for (unsigned storage = 0; storage < 5; storage++)
-        test_tdd_ordinary_frame_retention(2, storage, 0);
-    test_tdd_ordinary_frame_retention(8, 0, 1);
-    test_tdd_ordinary_frame_retention(8, 3, 1);
-    for (unsigned mode = 0; mode < 3; mode++) {
+        test_tdd_recursive_frame_retention(2, storage, 0, false);
+    test_tdd_recursive_frame_retention(8, 0, 1, false);
+    test_tdd_recursive_frame_retention(8, 3, 1, false);
+    for (unsigned storage = 0; storage < 7; storage++)
+        test_tdd_outbound_frame_retention(2, storage, 0, false);
+    test_tdd_outbound_frame_retention(8, 0, 1, false);
+    test_tdd_outbound_frame_retention(8, 3, 1, false);
+    test_tdd_outbound_frame_retention(8, 5, 1, false);
+    test_tdd_outbound_frame_retention(8, 6, 1, false);
+    test_tdd_outbound_frame_retention(2, 0, 0, true);
+    test_tdd_outbound_frame_retention(8, 3, 0, true);
+    test_tdd_outbound_frame_retention(2, 5, 0, true);
+    test_tdd_outbound_frame_retention(8, 6, 1, true);
+    test_tdd_recursive_frame_retention(2, 0, 0, true);
+    test_tdd_recursive_frame_retention(8, 3, 1, true);
+    for (unsigned mode = 0; mode < 7; mode++) {
+#ifndef WL_TEST_ALLOC_WRAP
+        if (mode == 5) continue;
+#endif
+        test_outbound_publisher_ownership(mode);
+    }
+    for (unsigned mode = 0; mode < 5; mode++) {
         test_tdd_ordinary_frame_gates(2, mode);
         test_tdd_ordinary_frame_gates(8, mode);
     }
