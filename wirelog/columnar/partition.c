@@ -122,20 +122,14 @@ col_rel_partition_by_key(const col_rel_t *src,
         snprintf(name_buf, sizeof(name_buf), "%s_p%u",
             src->name ? src->name : "rel", w);
 
-        col_rel_t *part = NULL;
-        rc = col_rel_alloc(&part, name_buf);
-        if (rc != 0)
-            goto cleanup;
-
-        rc = col_rel_set_schema(part, ncols,
-                (const char *const *)src->col_names);
-        if (rc != 0) {
-            col_rel_destroy(part);
+        col_rel_t *part = col_rel_new_like(name_buf, src);
+        if (!part) {
+            rc = ENOMEM;
             goto cleanup;
         }
 
-        /* Resize data buffer to exact partition size.  Safe because
-         * col_rel_alloc + col_rel_set_schema always heap-allocates. */
+        /* new_like owns heap columns and leaves timestamp allocation to
+         * the row-correlated scatter below. */
         assert(!part->arena_owned);
         assert(!part->pool_owned);
         if (counts[w] != part->capacity && counts[w] > 0) {

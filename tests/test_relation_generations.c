@@ -19,12 +19,16 @@ void *__real_realloc(void *ptr, size_t size);
 
 static long allocation_fail_at = -1;
 static long allocation_calls;
+static bool allocation_fail_persistent;
 
 static bool
 fail_this_allocation(void)
 {
-    return allocation_fail_at >= 0
-           && allocation_calls++ == allocation_fail_at;
+    if (allocation_fail_at < 0)
+        return false;
+    long call = allocation_calls++;
+    return allocation_fail_persistent ? call >= allocation_fail_at
+                                      : call == allocation_fail_at;
 }
 
 void *
@@ -2634,6 +2638,252 @@ test_shared_view_metadata_and_pool_rejection(void)
     cleanup_relations();
 }
 
+static bool
+clone_schema_matches(const col_rel_t *src, const col_rel_t *copy)
+{
+    if (!copy || !copy->schema_ok || !copy->schema.release
+        || copy->ncols != src->ncols
+        || copy->declared_ncols != src->declared_ncols
+        || copy->has_graph_column != src->has_graph_column
+        || copy->graph_col_idx != src->graph_col_idx
+        || copy->compound_kind != src->compound_kind
+        || copy->compound_count != src->compound_count
+        || copy->inline_physical_offset != src->inline_physical_offset
+        || (copy->column_types == NULL) != (src->column_types == NULL))
+        return false;
+    for (uint32_t c = 0; c < src->ncols; c++) {
+        if (strcmp(copy->col_names[c], src->col_names[c]) != 0
+            || copy->col_names[c] == src->col_names[c]
+            || strcmp(copy->schema.children[c]->format,
+            src->schema.children[c]->format) != 0
+            || strcmp(copy->schema.children[c]->name,
+            src->schema.children[c]->name) != 0
+            || (src->column_types &&
+            copy->column_types[c] != src->column_types[c]))
+            return false;
+    }
+    if (src->compound_arity_map) {
+        if (!copy->compound_arity_map
+            || copy->compound_arity_map == src->compound_arity_map)
+            return false;
+        /* Fixtures have two one-slot logical columns. */
+        if (memcmp(copy->compound_arity_map, src->compound_arity_map,
+            2 * sizeof(uint32_t)) != 0)
+            return false;
+    }
+    return true;
+}
+
+static void
+test_constructor_schema_parity(void)
+{
+    const char *failure = NULL;
+    col_rel_t *src = NULL, *heap = NULL, *pooled = NULL, *automatic = NULL;
+    col_rel_t *parts[8] = { 0 };
+    delta_pool_t *pool = NULL;
+    wl_arena_t *arena = NULL;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+#define SCHEMA_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    pool = delta_pool_create(128, sizeof(col_rel_t), 4096);
+    arena = wl_arena_create(65536);
+    SCHEMA_CHECK(pool && arena, "schema pool/arena");
+    for (unsigned typed = 0; typed < 2; typed++) {
+        for (unsigned kind = 0; kind < 3; kind++) {
+            for (uint32_t width = 0; width <= 2; width += 2) {
+                if (width == 0 && kind != 0)
+                    continue;
+                SCHEMA_CHECK(col_rel_alloc(&src, "source") == 0,
+                    "schema source");
+                const char *names[] = { "key", "value" };
+                SCHEMA_CHECK(col_rel_set_schema(src, width, names) == 0,
+                    "source names");
+                wirelog_column_type_t types[] = {
+                    WIRELOG_TYPE_INT64, WIRELOG_TYPE_FLOAT
+                };
+                if (typed && width)
+                    SCHEMA_CHECK(col_rel_set_column_types(src, types, width)
+                        == 0, "source types");
+                src->declared_ncols = width;
+                src->has_graph_column = width > 0;
+                src->graph_col_idx = 0;
+                if (kind) {
+                    src->compound_kind = kind == 1
+                        ? WIRELOG_COMPOUND_KIND_INLINE
+                        : WIRELOG_COMPOUND_KIND_SIDE;
+                    src->compound_count = kind == 1 ? 1 : 0;
+                    src->compound_arity_map = malloc(2 * sizeof(uint32_t));
+                    SCHEMA_CHECK(src->compound_arity_map, "source map");
+                    src->compound_arity_map[0] = 1;
+                    src->compound_arity_map[1] = 1;
+                }
+                for (unsigned populated = 0; populated < 2; populated++) {
+                    if (populated && width) {
+                        SCHEMA_CHECK(col_rel_enable_timestamps(src) == 0,
+                            "source timestamps");
+                        for (int64_t key = 0; key < 17; key++) {
+                            int64_t row[] = { key, 0 };
+                            SCHEMA_CHECK(col_rel_append_row(src, row) == 0,
+                                "source row");
+                            src->timestamps[key].iteration = (uint32_t)key + 7;
+                            src->timestamps[key].multiplicity = -1;
+                        }
+                    }
+                    heap = col_rel_new_like("heap", src);
+                    pooled = col_rel_pool_new_like(pool, "pooled", src);
+                    SCHEMA_CHECK(clone_schema_matches(src, heap)
+                        && clone_schema_matches(src, pooled)
+                        && pooled->pool_owned && !heap->timestamps
+                        && !pooled->timestamps, "heap/pool metadata parity");
+                    col_rel_destroy(heap); heap = NULL;
+                    col_rel_destroy(pooled); pooled = NULL;
+                    if (width) {
+                        uint32_t key_col = 0;
+                        SCHEMA_CHECK(col_rel_partition_by_key(src, &key_col,
+                            1, 8, parts) == 0, "metadata partition");
+                        uint32_t total = 0;
+                        for (unsigned w = 0; w < 8; w++) {
+                            SCHEMA_CHECK(clone_schema_matches(src, parts[w]),
+                                "partition metadata parity");
+                            total += parts[w]->nrows;
+                            for (uint32_t row = 0; row < parts[w]->nrows;
+                                row++) {
+                                uint32_t key =
+                                    (uint32_t)parts[w]->columns[0][row];
+                                SCHEMA_CHECK(parts[w]->timestamps
+                                    && parts[w]->timestamps[row].iteration ==
+                                    key + 7
+                                    && parts[w]->timestamps[row].multiplicity ==
+                                    -1,
+                                    "partition timestamp correspondence");
+                            }
+                            col_rel_destroy(parts[w]); parts[w] = NULL;
+                        }
+                        SCHEMA_CHECK(total == src->nrows,
+                            "partition complete row count");
+                    }
+                }
+                col_rel_destroy(src); src = NULL;
+            }
+        }
+    }
+    for (uint32_t width = 0; width <= 2; width += 2) {
+        src = col_rel_new_auto("source", width);
+        automatic = col_rel_pool_new_auto(pool, arena, "arena", width);
+        SCHEMA_CHECK(src && clone_schema_matches(src, automatic)
+            && automatic->pool_owned && (!width || automatic->arena_owned),
+            "auto Arrow schema preserves arena storage");
+        if (width) {
+            int64_t row[] = { 31, 41 };
+            SCHEMA_CHECK(col_rel_append_row(automatic, row) == 0
+                && automatic->columns[1][0] == 41, "arena clone usable");
+        }
+        col_rel_destroy(src); src = NULL;
+        col_rel_destroy(automatic); automatic = NULL;
+    }
+    src = col_rel_new_auto("source", 2);
+    SCHEMA_CHECK(src, "fault source");
+    src->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+    src->compound_count = 1;
+    src->compound_arity_map = malloc(2 * sizeof(uint32_t));
+    SCHEMA_CHECK(src->compound_arity_map, "fault map");
+    src->compound_arity_map[0] = 1;
+    src->compound_arity_map[1] = 1;
+#ifdef WL_TEST_ALLOC_WRAP
+    for (unsigned persistent = 0; persistent < 2; persistent++) {
+        bool complete = false;
+        for (long fail_at = 0; fail_at < 128 && !complete; fail_at++) {
+            uint32_t used = pool->slot_used;
+            allocation_calls = 0;
+            allocation_fail_at = fail_at;
+            allocation_fail_persistent = persistent != 0;
+            pooled = col_rel_pool_new_like(pool, "fault", src);
+            long calls = allocation_calls;
+            allocation_fail_at = -1;
+            allocation_fail_persistent = false;
+            if (pooled)
+                SCHEMA_CHECK(clone_schema_matches(src, pooled),
+                    "fault fallback changed metadata");
+            if (!pooled || !pooled->pool_owned)
+                SCHEMA_CHECK(pool->slot_used == used,
+                    "fault fallback consumed pool slot");
+            if (persistent && calls > fail_at)
+                SCHEMA_CHECK(!pooled, "sustained failure succeeded");
+            complete = calls <= fail_at;
+            col_rel_destroy(pooled); pooled = NULL;
+        }
+        SCHEMA_CHECK(complete, "complete constructor allocation sweep");
+    }
+    {
+        uint32_t key = 0;
+        bool complete = false;
+        for (long fail_at = 0; fail_at < 256 && !complete; fail_at++) {
+            allocation_calls = 0;
+            allocation_fail_at = fail_at;
+            int rc = col_rel_partition_by_key(src, &key, 1, 8, parts);
+            long calls = allocation_calls;
+            allocation_fail_at = -1;
+            if (rc) {
+                SCHEMA_CHECK(rc == ENOMEM, "partition allocation error");
+                for (unsigned w = 0; w < 8; w++)
+                    SCHEMA_CHECK(!parts[w], "partition failure leaked slot");
+            } else {
+                for (unsigned w = 0; w < 8; w++) {
+                    SCHEMA_CHECK(clone_schema_matches(src, parts[w]),
+                        "partition allocation metadata");
+                    col_rel_destroy(parts[w]); parts[w] = NULL;
+                }
+            }
+            complete = calls <= fail_at;
+        }
+        SCHEMA_CHECK(complete, "complete partition allocation sweep");
+    }
+#endif
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    resolution.budget_bytes = 1;
+    resolution.usable_bytes = 1;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    SCHEMA_CHECK(ref, "schema governor");
+    heap = wl_columnar_relation_new_like_governed("denied", src, ref);
+    SCHEMA_CHECK(!heap && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0,
+        "governed metadata clone denial balanced");
+    for (unsigned malformed = 0; malformed < 3; malformed++) {
+        src->compound_arity_map[0] = malformed == 0 ? 0 : UINT32_MAX;
+        if (malformed == 2) {
+            free(src->compound_arity_map);
+            src->compound_arity_map = NULL;
+            src->compound_kind = WIRELOG_COMPOUND_KIND_SIDE;
+        }
+        uint32_t used = pool->slot_used;
+        heap = col_rel_new_like("bad", src);
+        pooled = col_rel_pool_new_like(pool, "bad", src);
+        SCHEMA_CHECK(!heap && !pooled && pool->slot_used == used,
+            "malformed required metadata silently degraded");
+    }
+cleanup:
+#ifdef WL_TEST_ALLOC_WRAP
+    allocation_fail_at = -1;
+    allocation_fail_persistent = false;
+#endif
+    for (unsigned w = 0; w < 8; w++)
+        col_rel_destroy(parts[w]);
+    col_rel_destroy(src);
+    col_rel_destroy(heap);
+    col_rel_destroy(pooled);
+    col_rel_destroy(automatic);
+    delta_pool_destroy(pool);
+    wl_arena_free(arena);
+    wl_columnar_memory_governor_ref_release(ref);
+    if (failure) {
+        fprintf(stderr, "FAIL: %s\n", failure);
+        failures++;
+    }
+#undef SCHEMA_CHECK
+}
+
 static void
 test_exact_publication_epochs(void)
 {
@@ -4168,6 +4418,7 @@ main(void)
     test_overflow_boundary();
     test_direct_publication_paths();
     test_shared_view_metadata_and_pool_rejection();
+    test_constructor_schema_parity();
     test_shared_mutation_cow_and_append_validation();
     test_exact_publication_epochs();
     test_large_sort_epochs();

@@ -2506,6 +2506,91 @@ fail_initializer_later_worker(unsigned mode, unsigned phase, uint32_t worker,
 }
 
 static void
+test_initializer_schema_parity(uint32_t workers, unsigned mode, bool typed)
+{
+    TEST("worker initializer preserves empty and populated schema");
+    wl_plan_t plan = { 0 };
+    wl_session_t *session = NULL;
+    col_rel_t *unowned = NULL;
+    const char *failure = NULL;
+#define META_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    META_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "metadata session");
+    wl_col_session_t *coord = (wl_col_session_t *)session;
+    for (unsigned populated = 0; populated < 2; populated++) {
+        unowned = col_rel_new_auto(populated ? "input" : "empty", 2);
+        META_CHECK(unowned, "metadata input");
+        wirelog_column_type_t types[] = { WIRELOG_TYPE_INT64,
+                                          WIRELOG_TYPE_FLOAT };
+        if (typed)
+            META_CHECK(col_rel_set_column_types(unowned, types, 2) == 0,
+                "metadata types");
+        unowned->declared_ncols = 1;
+        unowned->has_graph_column = true;
+        unowned->graph_col_idx = 0;
+        unowned->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+        unowned->compound_count = 1;
+        unowned->compound_arity_map = malloc(sizeof(uint32_t));
+        META_CHECK(unowned->compound_arity_map, "metadata map");
+        unowned->compound_arity_map[0] = 2;
+        META_CHECK(col_rel_enable_timestamps(unowned) == 0,
+            "metadata timestamps");
+        if (populated) {
+            int64_t row[] = { 42, 0 };
+            META_CHECK(col_rel_append_row(unowned, row) == 0, "metadata row");
+            unowned->timestamps[0].iteration = 29;
+            unowned->timestamps[0].multiplicity = -1;
+        }
+        META_CHECK(session_add_rel(coord, unowned) == 0,
+            "metadata registration");
+        unowned = NULL;
+    }
+    META_CHECK(wl_columnar_eval_test_initializer(mode, coord, workers) == 0,
+        "metadata initialize");
+    uint32_t total = 0;
+    for (uint32_t w = 0; w < workers; w++) {
+        for (unsigned populated = 0; populated < 2; populated++) {
+            const char *name = populated ? "input" : "empty";
+            col_rel_t *r = session_find_rel(&coord->tdd_workers[w], name);
+            col_rel_t *source = session_find_rel(coord, name);
+            META_CHECK(r && r->schema_ok && r->declared_ncols == 1
+                && r->has_graph_column && r->graph_col_idx == 0
+                && r->compound_kind == WIRELOG_COMPOUND_KIND_INLINE
+                && r->compound_count == 1 && r->compound_arity_map
+                && r->compound_arity_map != source->compound_arity_map
+                && r->compound_arity_map[0] == 2
+                && (r->column_types != NULL) == typed,
+                "worker metadata differs");
+            if (typed)
+                META_CHECK(r->column_types[1] == WIRELOG_TYPE_FLOAT
+                    && strcmp(r->schema.children[1]->format, "g") == 0,
+                    "worker float schema");
+            if (!populated)
+                META_CHECK(r->nrows == 0 && r->timestamps,
+                    "empty worker timestamp mode");
+            total += r->nrows;
+            for (uint32_t row = 0; row < r->nrows; row++)
+                META_CHECK(r->columns[0][row] == 42 && r->timestamps
+                    && r->timestamps[row].iteration == 29
+                    && r->timestamps[row].multiplicity == -1,
+                    "worker row provenance");
+        }
+    }
+    META_CHECK(total == (mode == 0 ? 1 : workers), "worker exact row total");
+    META_CHECK(wl_columnar_eval_test_hybrid_cleanup(coord) == 0,
+        "metadata cleanup");
+cleanup:
+    col_rel_destroy(unowned);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef META_CHECK
+}
+
+static void
 test_initializer_unwind(uint32_t workers, unsigned mode, unsigned phase,
     bool held, bool clone_failure)
 {
@@ -3373,6 +3458,12 @@ main(void)
     printf("==========================================\n");
 
 #ifdef WL_TEST_BDX_SEED
+#ifdef WL_TEST_ALLOC_WRAP
+    for (uint32_t workers = 2; workers <= 8; workers += 6)
+        for (unsigned mode = 0; mode < 2; mode++)
+            for (unsigned typed = 0; typed < 2; typed++)
+                test_initializer_schema_parity(workers, mode, typed != 0);
+#endif
     test_hybrid_empty_idb_ownership(0);
 #ifdef WL_TEST_ALLOC_WRAP
     test_hybrid_empty_idb_ownership(1);

@@ -267,6 +267,15 @@ entries remain caller-owned; worker creation NULLs entries only on transfer.
 Attempted-worker counts control checked teardown, never caller-slot cleanup.
 A refused worker stays in the coordinator cohort until release and retry.
 
+Heap and pooled constructors create independently owned Arrow schemas, including
+untyped and zero-width relations. Clones preserve declared width, names, types,
+graph metadata and required compound maps; a failed required map copy fails
+construction instead of changing tuple interpretation. Arena-backed pooled
+construction initializes schema without replacing arena columns. Partitions
+preserve that metadata and scatter timestamps with their rows. Empty and
+replicated worker inputs use governed clones; legacy partition buffer allocation
+still follows its existing admission contract.
+
 The fixed delta-pool slab and data arena follow the same lifecycle through
 `delta_pool_create_managed()`. Coordinator, ordinary worker, and K-fusion
 branch arenas and pools all use the same shared governor; legacy standalone

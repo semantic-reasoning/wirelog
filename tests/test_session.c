@@ -4609,6 +4609,87 @@ cleanup:
 #undef REPLAY_CHECK
 }
 
+static _Atomic uint32_t schema_parity_workers;
+
+static void
+observe_schema_parity_worker(wl_col_session_t *worker, eval_stack_t *stack,
+    eval_entry_t *result)
+{
+    (void)stack;
+    (void)result;
+    if (worker->coordinator)
+        atomic_fetch_or(&schema_parity_workers, 1u << worker->worker_id);
+}
+
+static void
+test_parallel_schema_parity(uint32_t workers, bool typed, bool existing)
+{
+    TEST("parallel schema parity: clean step and exact snapshot");
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_CONCAT }
+    };
+    wl_plan_relation_t output = { .name = "output", .delta_name = "$d$output",
+                                  .ops = ops, .op_count = 3 };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    col_rel_t *unowned = NULL;
+    int64_t *values = NULL;
+    const char *failure = NULL;
+    tuple_collector_t tuples = { 0 };
+#define PARITY_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    PARITY_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "create parity session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    values = malloc(65536 * sizeof(*values));
+    PARITY_CHECK(values, "parity rows");
+    for (unsigned i = 0; i < 65536; i++)
+        values[i] = 42;
+    PARITY_CHECK(wl_session_insert(session, "input", values, 65536, 1) == 0,
+        "parity input");
+    wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    if (typed)
+        PARITY_CHECK(col_rel_set_column_types(session_find_rel(coord, "input"),
+            &type, 1) == 0, "typed input");
+    if (existing) {
+        unowned = col_rel_new_like("output", session_find_rel(coord, "input"));
+        PARITY_CHECK(unowned && session_add_rel(coord, unowned) == 0,
+            "empty existing output");
+        unowned = NULL;
+    }
+    atomic_store(&schema_parity_workers, 0);
+    wl_columnar_eval_serial_test_after_plan = observe_schema_parity_worker;
+    int step_rc = wl_session_step(session);
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    PARITY_CHECK(step_rc == 0
+        && atomic_load(&schema_parity_workers) == (1u << workers) - 1u,
+        "clean actual parallel step");
+    col_rel_t *result = session_find_rel(coord, "output");
+    PARITY_CHECK(result && result->nrows == 1
+        && col_rel_get(result, 0, 0) == 42
+        && (result->column_types != NULL) == typed,
+        "parallel step exact output schema");
+    PARITY_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0
+        && tuples.count == 1 && tuples.rows[0][0] == 42
+        && strcmp(tuples.relations[0], "output") == 0,
+        "parallel exact snapshot");
+cleanup:
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    col_rel_destroy(unowned);
+    free(values);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef PARITY_CHECK
+}
+
 static void
 test_worker_serial_segments(bool recursive, unsigned mode)
 {
@@ -7669,6 +7750,12 @@ main(void)
     test_serial_cleanup_caller(1, false, false, 7, 8);
     test_serial_cleanup_caller(1, false, false, 8, 8);
     test_recursive_delta_operator_error();
+    for (uint32_t workers = 2; workers <= 8; workers += 6)
+        for (unsigned typed = 0; typed < 2; typed++)
+            for (unsigned existing = 0; existing < 2; existing++)
+                test_parallel_schema_parity(workers, typed != 0, existing != 0);
+
+
     test_coordinator_specialized_parallel();
     test_correctness_replay_refusal(0);
     test_correctness_replay_refusal(1);

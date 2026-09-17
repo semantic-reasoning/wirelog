@@ -794,7 +794,8 @@ tdd_init_workers(wl_col_session_t *coord, uint32_t W)
             for (uint32_t w = 0; w < W && rc == 0; w++) {
                 WL_COLUMNAR_EVAL_INIT_BOUNDARY(0, 0, w, coord);
                 worker_parts[w][parts_built]
-                    = col_rel_new_auto(name, rel->ncols);
+                    = wl_columnar_relation_new_like_governed(name, rel,
+                        coord->memory_governor);
                 if (!worker_parts[w][parts_built])
                     rc = ENOMEM;
             }
@@ -942,7 +943,8 @@ tdd_replicate_workers(wl_col_session_t *coord, uint32_t W)
 
         for (uint32_t w = 0; w < W && rc == 0; w++) {
             WL_COLUMNAR_EVAL_INIT_BOUNDARY(1, 0, w, coord);
-            col_rel_t *copy = col_rel_new_auto(name, rel->ncols);
+            col_rel_t *copy = wl_columnar_relation_new_like_governed(name,
+                    rel, coord->memory_governor);
             if (!copy) {
                 rc = ENOMEM;
                 break;
