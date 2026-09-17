@@ -629,8 +629,36 @@ Delta-step rollback preserves the existing empty-descriptor restoration policy:
 only a relation actually detached by the step, still registered with the same
 identity, and still without columns is restored. Populated partial evaluation
 results and replacement registrations are preserved. This is not a transaction
-that rolls back the entire stratum. No delta callbacks are published by a failed
-step; callers must not infer recovery of callbacks for unrelated partial results.
+that rolls back the entire stratum. Storage rollback alone does not recover
+notifications for partial results; whole-step observer ownership below provides
+that guarantee for public incremental steps. Failed steps publish no callbacks.
+
+Whole-step notification ownership is separate from per-stratum storage rollback.
+An observer transaction captures admitted, owned logical output names and flat
+row sets before any affected stratum runs. Duplicate output names are captured
+once, including absent or empty outputs. A compound GC hold protects handles
+through retry and callback delivery. Relation replacement does not invalidate
+this baseline; changed arity yields old removals and new additions with their
+respective row widths.
+
+Evaluation failures retain the original observer baseline and affected mask.
+After evaluation succeeds, the transaction remembers that phase, so compaction
+or event-staging failure retries completion without rerunning evaluation. Final
+sets are sorted and deduplicated with the same comparator before constructing
+net signed events. All fallible preparation precedes delivery. Metadata, baseline
+payload and staging have stable governor reservations; temporary accounting
+includes all retained observer bytes. Buffers are freed before reservations are
+released, and worker clones do not inherit observer ownership.
+
+Pending transactions refuse nonzero input mutation, compound construction and
+snapshot; step is the retry route. Callback publication also refuses reentrant
+step. Each event reads the current callback/data pair, so replacement receives
+the remaining suffix. NULL cancels the transaction's remaining notifications
+without freeing active storage. Cancellation stays effective even if observation
+is re-enabled, and retains evaluation phase until completion or teardown. This
+preserves reconstruction on retry with a NULL callback. Successful completion
+releases the observer hold before replaying coalesced frontier GC; failure and
+teardown do not replay GC. Callback-triggered destruction remains unsupported.
 
 One active or pending rollback record is permitted per session. Metadata and flat
 payloads are admitted before allocation, and the governor reference and compound
@@ -674,8 +702,8 @@ copy; admission denial leaves the target unchanged.
 Recursive rule-frame refusal preserves registered delta owners and caches.
 Successful previous-pass publication empties all private delta slots before
 rule evaluation; the error path asserts this invariant and releases only local
-bookkeeping. Recursive delta-step evaluation remains excluded because its
-partial-progress notification baseline needs separate retry handling (#1682).
+bookkeeping. Recursive delta-step evaluation remains excluded from rule-frame
+activation pending its separate caller integration under #1661.
 
 Cleanup refusal remains an integration gap for recursive delta-step evaluation,
 worker evaluation and higher-worker-count fallback: #1647 covers lost popped results,
