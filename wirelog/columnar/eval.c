@@ -1378,6 +1378,95 @@ wl_columnar_eval_test_retire_prior_deltas(const wl_plan_stratum_t *sp,
 }
 #endif
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_eval_test_outbound_after_plan)(wl_col_session_t *,
+    eval_stack_t *, eval_entry_t *);
+void (*wl_columnar_eval_test_outbound_before_publish)(wl_col_session_t *,
+    eval_entry_t *);
+#endif
+
+static int
+wl_columnar_eval_outbound_framed_relation(col_eval_tdd_worker_ctx_t *ctx,
+    uint32_t ri, bool *produced)
+{
+    wl_col_session_t *sess = ctx->worker_sess;
+    const wl_plan_relation_t *rp = &ctx->sp->relations[ri];
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    int rc = wl_columnar_eval_stack_cleanup_begin(sess, &frame);
+    if (rc != 0)
+        return rc;
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame);
+    eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(frame);
+    rc = col_eval_relation_plan(rp, stack, sess);
+    if (rc == 0 && stack->top != 0)
+        *result = eval_stack_pop(stack);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_test_outbound_after_plan)
+        wl_columnar_eval_test_outbound_after_plan(sess, stack, result);
+#endif
+    if (rc != 0)
+        goto done;
+    if (result->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION) {
+        rc = ENOTSUP;
+        goto done;
+    }
+    rc = eval_stack_drain(stack);
+    if (rc != 0 || !result->rel || result->rel->nrows == 0)
+        goto done;
+
+    col_rel_t *delta = wl_columnar_relation_new_like_governed(
+        rp->delta_name, result->rel, sess->memory_governor);
+    if (!delta) {
+        rc = ENOMEM;
+        goto done;
+    }
+    /* Lower entries have drained, so this push has a vacant slot. */
+    rc = eval_stack_push(stack, delta, true);
+    if (rc != 0) {
+        col_rel_destroy(delta);
+        goto done;
+    }
+    rc = col_rel_append_all(delta, result->rel, NULL);
+    if (rc == 0)
+        rc = eval_entry_dispose(result);
+    if (rc != 0)
+        goto done;
+    *result = eval_stack_pop(stack);
+
+    /* This independent candidate has not escaped. Keep preparation private:
+     * the existing diff/dedup helpers may acquire their own source writers. */
+    col_rel_t *target = session_find_rel(sess, rp->name);
+    if (target && target->nrows > 0 && !ctx->force_diff) {
+        rc = bdx_hash_diff(delta, target);
+        if (rc != 0)
+            goto done;
+    }
+    if (sess->coordinator && delta->nrows > 0) {
+        col_rel_t *coord_target = session_find_rel(sess->coordinator, rp->name);
+        if (coord_target && coord_target->nrows > 0) {
+            rc = tdd_hashset_diff(delta, coord_target);
+            if (rc != 0)
+                goto done;
+        }
+    }
+    if (delta->nrows > 1)
+        tdd_dedup_rel(delta);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_test_outbound_before_publish)
+        wl_columnar_eval_test_outbound_before_publish(sess, result);
+#endif
+    bool nonempty = delta->nrows > 0;
+    rc = wl_columnar_eval_tdd_queue_publish_delta(ctx, sess, &result->rel,
+            ri, ctx->eff_iter);
+    if (!result->rel)
+        result->owned = false;
+    if (rc == 0 && nonempty)
+        *produced = true;
+done:;
+    int cleanup_rc = wl_columnar_eval_stack_cleanup_finish(&frame);
+    return cleanup_rc != 0 ? cleanup_rc : rc;
+}
+
 static void
 tdd_worker_subpass_fn(void *arg)
 {
@@ -1388,14 +1477,12 @@ tdd_worker_subpass_fn(void *arg)
     uint32_t nrels = sp->relation_count;
     uint64_t worker_t0 = now_ns();
 
-    if (!ctx->outbound_only) {
-        int readiness_rc = sess->cleanup_active ? EBUSY
-            : wl_columnar_session_cleanup_ready(sess);
-        if (readiness_rc != 0) {
-            ctx->rc = readiness_rc;
-            ctx->runtime_ns = now_ns() - worker_t0;
-            return;
-        }
+    int readiness_rc = sess->cleanup_active ? EBUSY
+        : wl_columnar_session_cleanup_ready(sess);
+    if (readiness_rc != 0) {
+        ctx->rc = readiness_rc;
+        ctx->runtime_ns = now_ns() - worker_t0;
+        return;
     }
 
     /* Issue #282: Enable differential operators from eff_iter 1 onward.
@@ -1494,159 +1581,11 @@ tdd_worker_subpass_fn(void *arg)
             continue;
         }
 
-        eval_stack_t stack;
-        eval_stack_init(&stack);
-
-        int rc = col_eval_relation_plan(rp, &stack, sess);
+        int rc = wl_columnar_eval_outbound_framed_relation(ctx, ri, &any_new);
         if (rc != 0) {
-            if (getenv("WIRELOG_TDD_GLOBAL_READ_DEBUG"))
-                fprintf(stderr,
-                    "TDD relation error worker=%u rel=%s iter=%u rc=%d\n",
-                    sess->worker_id, rp->name ? rp->name : "(null)",
-                    eff_iter, rc);
-            int drain_rc = eval_stack_drain_to_session(&stack, sess);
-            if (drain_rc != 0)
-                rc = drain_rc;
             ctx->rc = rc;
             free(snap);
-            sess->tdd_subpass_active = saved_tdd_subpass;
-            sess->tdd_outbound_only_active = saved_outbound_only;
-            sess->diff_operators_active = saved_diff;
             TDD_WORKER_RETURN();
-        }
-
-        if (stack.top == 0)
-            continue;
-
-        eval_entry_t result = eval_stack_pop(&stack);
-        if (result.kind != WL_COLUMNAR_EVAL_ENTRY_RELATION) {
-            int dispose_rc = eval_stack_dispose_entry(&stack, &result);
-            int drain_rc = eval_stack_drain_to_session(&stack, sess);
-            int cleanup_rc = dispose_rc != 0 ? dispose_rc : drain_rc;
-            ctx->rc = ENOTSUP;
-            if (cleanup_rc != 0)
-                ctx->rc = cleanup_rc;
-            free(snap);
-            sess->tdd_subpass_active = saved_tdd_subpass;
-            sess->tdd_outbound_only_active = saved_outbound_only;
-            sess->diff_operators_active = saved_diff;
-            TDD_WORKER_RETURN();
-        }
-        /* Publication consumes the relation only; CONCAT boundaries have
-         * completed their intra-plan lifetime before any lower-stack drain. */
-        free(result.seg_boundaries);
-        result.seg_boundaries = NULL;
-        result.seg_count = 0;
-        {
-            int drain_rc = eval_stack_drain_to_session(&stack, sess);
-            if (drain_rc != 0) {
-                ctx->rc = drain_rc;
-                free(snap);
-                sess->tdd_subpass_active = saved_tdd_subpass;
-                sess->tdd_outbound_only_active = saved_outbound_only;
-                sess->diff_operators_active = saved_diff;
-                TDD_WORKER_RETURN();
-            }
-        }
-
-        /* Post-eval skip: evaluation produced 0 rows.
-         *
-         * The relation-only pop above has already rejected continuation and
-         * malformed entries, so a NULL here is only the ordinary empty-result
-         * representation.
-         *
-         * The outbound copy below requires a nonempty relation. Ordinary
-         * publication already returned through the framed helper above. */
-        if (!result.rel || result.rel->nrows == 0) {
-            if (result.owned)
-                col_rel_destroy(result.rel);
-            continue;
-        }
-
-        col_rel_t *target = session_find_rel(sess, rp->name);
-        if (ctx->outbound_only) {
-            const char *dname = sp->relations[ri].delta_name;
-            col_rel_t *delta = col_rel_new_like(dname, result.rel);
-            if (!delta) {
-                if (result.owned)
-                    col_rel_destroy(result.rel);
-                ctx->rc = ENOMEM;
-                free(snap);
-                sess->tdd_subpass_active = saved_tdd_subpass;
-                sess->tdd_outbound_only_active = saved_outbound_only;
-                sess->diff_operators_active = saved_diff;
-                TDD_WORKER_RETURN();
-            }
-            int rc = col_rel_append_all(delta, result.rel, sess->eval_arena);
-            if (result.owned)
-                col_rel_destroy(result.rel);
-            if (rc != 0) {
-                col_rel_destroy(delta);
-                ctx->rc = rc;
-                free(snap);
-                sess->tdd_subpass_active = saved_tdd_subpass;
-                sess->tdd_outbound_only_active = saved_outbound_only;
-                sess->diff_operators_active = saved_diff;
-                TDD_WORKER_RETURN();
-            }
-            if (target && target->nrows > 0
-                && !(ctx->force_diff && ctx->outbound_only)) {
-                rc = bdx_hash_diff(delta, target);
-                if (rc != 0) {
-                    if (getenv("WIRELOG_TDD_GLOBAL_READ_DEBUG"))
-                        fprintf(stderr,
-                            "TDD local diff error worker=%u rel=%s iter=%u "
-                            "delta_cols=%u target_cols=%u rc=%d\n",
-                            sess->worker_id, rp->name ? rp->name : "(null)",
-                            eff_iter, delta->ncols, target->ncols, rc);
-                    col_rel_destroy(delta);
-                    ctx->rc = rc;
-                    free(snap);
-                    sess->tdd_subpass_active = saved_tdd_subpass;
-                    sess->tdd_outbound_only_active = saved_outbound_only;
-                    sess->diff_operators_active = saved_diff;
-                    TDD_WORKER_RETURN();
-                }
-            }
-            if (sess->coordinator && delta->nrows > 0) {
-                col_rel_t *coord_target = session_find_rel(
-                    sess->coordinator, rp->name);
-                if (coord_target && coord_target->nrows > 0) {
-                    rc = tdd_hashset_diff(delta, coord_target);
-                    if (rc != 0) {
-                        if (getenv("WIRELOG_TDD_GLOBAL_READ_DEBUG"))
-                            fprintf(stderr,
-                                "TDD coord diff error worker=%u rel=%s "
-                                "iter=%u delta_cols=%u target_cols=%u rc=%d\n",
-                                sess->worker_id,
-                                rp->name ? rp->name : "(null)", eff_iter,
-                                delta->ncols, coord_target->ncols, rc);
-                        col_rel_destroy(delta);
-                        ctx->rc = rc;
-                        free(snap);
-                        sess->tdd_subpass_active = saved_tdd_subpass;
-                        sess->tdd_outbound_only_active = saved_outbound_only;
-                        sess->diff_operators_active = saved_diff;
-                        TDD_WORKER_RETURN();
-                    }
-                }
-            }
-            if (delta->nrows > 1)
-                tdd_dedup_rel(delta);
-            bool produced = delta->nrows > 0;
-            rc = wl_columnar_eval_tdd_queue_publish_delta(ctx, sess, delta,
-                    ri, eff_iter);
-            if (rc != 0) {
-                ctx->rc = rc;
-                free(snap);
-                sess->tdd_subpass_active = saved_tdd_subpass;
-                sess->tdd_outbound_only_active = saved_outbound_only;
-                sess->diff_operators_active = saved_diff;
-                TDD_WORKER_RETURN();
-            }
-            if (produced)
-                any_new = true;
-            continue;
         }
     }
 

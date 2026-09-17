@@ -3529,9 +3529,11 @@ void
 wl_columnar_eval_tdd_queue_discard_delta_queue_with_destroyer(
     wl_mpsc_queue_t *queue, wl_mpsc_payload_destroy_fn destroy_payload);
 
+/* Refusal retains *delta; transfer clears it before releasing the writer.
+ * Consumers must wait for the worker barrier before reading the payload. */
 int
 wl_columnar_eval_tdd_queue_publish_delta(col_eval_tdd_worker_ctx_t *ctx,
-    wl_col_session_t *sess, col_rel_t *delta, uint32_t rel_idx,
+    wl_col_session_t *sess, col_rel_t **delta, uint32_t rel_idx,
     uint32_t eff_iter);
 
 /*

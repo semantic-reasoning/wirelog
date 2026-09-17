@@ -138,44 +138,61 @@ wl_columnar_eval_tdd_queue_discard_delta_queue(wl_mpsc_queue_t *queue,
 
 int
 wl_columnar_eval_tdd_queue_publish_delta(col_eval_tdd_worker_ctx_t *ctx,
-    wl_col_session_t *sess, col_rel_t *delta, uint32_t rel_idx,
+    wl_col_session_t *sess, col_rel_t **candidate, uint32_t rel_idx,
     uint32_t eff_iter)
 {
+    if (!ctx || !sess || !candidate || !*candidate)
+        return EINVAL;
+    col_rel_t *delta = *candidate;
     if (delta->nrows == 0) {
-        col_rel_destroy(delta);
-        return 0;
+        int rc = col_rel_destroy_checked(delta);
+        if (rc == 0)
+            *candidate = NULL;
+        return rc;
     }
 
-    delta->timestamps = (col_delta_timestamp_t *)calloc(
-        delta->nrows, sizeof(col_delta_timestamp_t));
-    if (!delta->timestamps) {
-        col_rel_destroy(delta);
-        return ENOMEM;
+    /* Reuse any timestamp allocation inherited from the governed copy. */
+    int rc = col_rel_enable_timestamps(delta);
+    if (rc != 0)
+        return rc;
+    wl_columnar_source_access_writer_t writer = { 0 };
+    rc = col_rel_source_writer_acquire(delta, &writer);
+    if (rc != 0)
+        return rc;
+    if (col_rel_storage_alias_borrow_count(delta) != 0) {
+        rc = EBUSY;
+        goto done;
     }
-    wl_columnar_relation_touch_storage(delta);
     for (uint32_t ti = 0; ti < delta->nrows; ti++) {
         delta->timestamps[ti].iteration = eff_iter;
         delta->timestamps[ti].stratum = ctx->stratum_idx;
         delta->timestamps[ti].worker = (uint16_t)sess->worker_id;
         delta->timestamps[ti].multiplicity = 1;
     }
+    wl_columnar_relation_touch_storage(delta);
 
     if (sess->coordinator && sess->coordinator->delta_queue) {
-        /* Issue #1380: ownership transfers to the coordinator on success,
-         * so the in-flight bytes are charged to the coordinator's CHANNEL
-         * and credited when it drains the queue.  Measure before the
-         * enqueue; the payload must not be touched afterwards. */
         uint64_t transport_bytes = col_rel_transport_bytes(delta);
-        int rc = wl_mpsc_enqueue(sess->coordinator->delta_queue,
+        rc = wl_mpsc_enqueue(sess->coordinator->delta_queue,
                 sess->worker_id, delta, ctx->stratum_idx, rel_idx);
         if (rc != 0) {
-            col_rel_destroy(delta);
-            return ENOMEM;
+            rc = ENOMEM;
+            goto done;
         }
+        *candidate = NULL;
         wl_mem_ledger_alloc(&sess->coordinator->mem_ledger,
             WL_MEM_SUBSYS_CHANNEL, transport_bytes);
     } else {
+        if (ctx->delta_rels[rel_idx]) {
+            rc = EBUSY;
+            goto done;
+        }
         ctx->delta_rels[rel_idx] = delta;
+        *candidate = NULL;
     }
-    return 0;
+done:;
+    /* Consumers join all workers before reading or destroying any payload.
+     * Once transferred, caller ownership stays cleared even if release fails. */
+    int release_rc = wl_columnar_source_access_writer_release(&writer);
+    return rc != 0 ? rc : release_rc;
 }

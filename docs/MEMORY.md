@@ -251,13 +251,10 @@ sessions retain the same governor reference and release it during every
 normal or partial teardown path. The fixed eval arenas now use
 `wl_arena_create_managed()`: their complete backing capacity is admitted before
 `malloc`, retained across reset, and released exactly once at destruction.
-Outbound recursive TDD subpasses retire final CONCAT segment boundaries after
-validating the popped relation entry and before lower-stack cleanup. These arrays
-describe intra-plan merging and have no publication-time consumer; relation source
-readers protect descriptor/storage, not the consumed entry metadata. This
-metadata retirement does not supply retained worker result/stack ownership:
-worker refusal and allocator-lifetime integration remain tracked by #1661
-and #1686.
+Recursive TDD subpasses retain popped results, lower stack entries and CONCAT
+segment boundaries in persistent cleanup frames. Segment metadata is disposed
+with its entry; a refused owned relation keeps its metadata and allocator
+storage reachable. Specialized rule evaluators remain tracked by #1661.
 
 Hybrid TDD initialization gives existing empty IDBs private governed worker
 relations, preserving schema, graph/compound metadata and timestamp mode.
@@ -703,7 +700,8 @@ spill access or downstream pipelines are already bounded (#1369, #1372,
 Every `col_eval_stratum` caller, including worker sessions, coordinator fallback,
 recursive snapshot and delta steps, admits a persistent cleanup frame before
 executing each relation plan. Ordinary direct recursive TDD subpasses use the
-same framed relation helper; outbound subpasses remain separate. The frame owns its stack,
+same framed relation helper. Outbound subpasses have a separate framed publisher.
+The frame owns its stack,
 popped result and segment metadata until publication or checked disposal.
 Refusal preserves allocators, caches and registry owners until session readiness
 can drain the frame; snapshot errors return before delta cleanup in this state.
@@ -771,13 +769,27 @@ Empty registrations preserve later-round outbound AUTO semantics. Preparation
 failure changes no registration; publication is atomic per registration, so a
 successful prefix remains owned while a refused owner and its lease stay intact.
 Exchange aborts on refusal and releases only newly produced queue/matrix deltas.
-Ordinary recursive TDD workers check local cleanup readiness before changing
+Recursive TDD workers check local cleanup readiness before changing
 iteration state or worker flags. Their retained frames keep prior-round delta
-dependencies alive; no fresh queue delta is produced until every rule finishes.
+dependencies alive. Ordinary subpasses produce fresh deltas after all rules
+finish; outbound subpasses may publish independent deltas after each rule.
 A refused frame therefore stops exchange and retains the cohort for public retry.
 
-Cleanup refusal remains an integration gap for outbound TDD recursive subpasses
-and specialized parallel rule evaluation: #1647 covers lost popped results,
+Outbound frames own a governed independent delta candidate and dispose the
+original result and lower entries before publication. Diff/dedup preparation
+keeps the candidate private. Publication reuses checked timestamp storage and
+holds its source writer through provenance stamping and queue/slot transfer,
+refusing live readers or aliases. Transfer clears the frame's pointer before
+releasing the writer; consumers wait for the worker barrier. Failure retains
+the candidate for checked disposal. Earlier queued payloads remain independent
+and are reclaimed after the barrier if a later rule fails.
+
+Global-read coordinator publication still conflicts with its worker IDB views
+and has incomplete failed-exchange payload cleanup (#1704). Frame recovery is
+covered separately from that outstanding successful-exchange contract.
+
+Cleanup refusal remains an integration gap for specialized parallel rule
+evaluation: #1647 covers lost popped results,
 #1648 covers K-Fusion refusal handling, and #1661 covers retention of whole
 refused evaluator stacks and their allocators across unwind. In particular,
 retaining an entry on a block-local stack does not preserve ownership after
