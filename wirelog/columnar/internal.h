@@ -1568,6 +1568,7 @@ typedef struct wl_columnar_session_source_lease {
 } wl_columnar_session_source_lease_t;
 
 typedef struct wl_columnar_eval_delta_rollback wl_columnar_eval_delta_rollback_t;
+typedef struct wl_columnar_eval_delta_observer wl_columnar_eval_delta_observer_t;
 
 typedef struct wl_columnar_eval_stack_cleanup_frame
     wl_columnar_eval_stack_cleanup_frame_t;
@@ -1915,6 +1916,10 @@ typedef struct wl_col_session_t {
     uint64_t cleanup_reserved_bytes;
     wl_columnar_eval_delta_rollback_t *delta_rollback;
     uint64_t delta_rollback_reserved_bytes;
+    wl_columnar_eval_delta_observer_t *delta_observer;
+    uint64_t delta_observer_reserved_bytes;
+    bool delta_publish_active;
+    bool delta_publish_cancelled;
     /* Exchange operator state (Issue #316): W x W partition buffer matrix.
      * Allocated by coordinator before exchange scatter dispatch.
      * exchange_bufs[src_worker][dst_worker] holds rows src sends to dst.
@@ -2081,6 +2086,32 @@ typedef struct {
 
 /* Bounds this internal primitive, not public evaluation nesting. */
 #define WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES 32u
+
+/* Whole-public-step observer ownership is independent of storage rollback. */
+int
+wl_columnar_eval_delta_observer_begin(wl_col_session_t *sess,
+    uint64_t mask);
+bool
+wl_columnar_eval_delta_observer_active(const wl_col_session_t *sess);
+bool
+wl_columnar_eval_delta_observer_evaluated(const wl_col_session_t *sess);
+uint64_t
+wl_columnar_eval_delta_observer_mask(const wl_col_session_t *sess);
+void
+wl_columnar_eval_delta_observer_set_active(wl_col_session_t *sess,
+    bool active);
+void
+wl_columnar_eval_delta_observer_set_evaluated(wl_col_session_t *sess);
+void
+wl_columnar_eval_delta_observer_cancel(wl_col_session_t *sess);
+int
+wl_columnar_eval_delta_observer_prepare(wl_col_session_t *sess);
+void
+wl_columnar_eval_delta_observer_publish(wl_col_session_t *sess);
+int
+wl_columnar_eval_delta_observer_finish(wl_col_session_t *sess);
+int
+wl_columnar_eval_delta_observer_discard(wl_col_session_t *sess);
 
 /* Allocate/admit before evaluating. Pending cleanup blocks begin. ENOSPC
  * denotes governor denial, ENOMEM allocation failure, ENOBUFS the frame cap.

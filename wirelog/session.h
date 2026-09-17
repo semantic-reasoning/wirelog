@@ -182,7 +182,8 @@ wl_session_memory_governor(wl_session_t *session);
  * Returns:
  *    0 on success.
  *    ENOSPC if the compound arena is saturated.
- *    EBUSY if the compound arena is temporarily frozen.
+ *    EBUSY if the compound arena is temporarily frozen, an observed step is
+ *    pending retry, or a delta callback is running.
  *    ENOMEM on allocation failure.
  *    EINVAL or another errno-style value for invalid arguments/backend errors.
  */
@@ -215,6 +216,12 @@ wl_session_remove(wl_session_t *session, const char *relation,
  *
  * Advance an incremental session, evaluating any newly inserted/removed facts.
  * Triggers the delta callback registered via wl_session_set_delta_cb.
+ * The columnar backend delivers the net change from the start of the whole
+ * step only after evaluation and event preparation succeed. Failed observed
+ * steps retain that baseline; retry with wl_session_step. Until completion,
+ * snapshot and nonzero input mutation (including compound construction)
+ * return EBUSY. Zero-row insert/remove remain no-ops.
+ * Reentrant step, snapshot and input mutation from delta callbacks return EBUSY.
  *
  * Returns:
  *    0 on success.
@@ -231,6 +238,12 @@ wl_session_step(wl_session_t *session);
  *
  * Register a callback for receiving incremental updates (insertions/removals)
  * on output records as the session advances via wl_session_step.
+ * Replacing the callback during delivery affects the remaining events. Setting
+ * it to NULL cancels remaining notifications for the current step, even if a
+ * callback is registered again before that step completes. Re-enabling then
+ * observes subsequent steps. Cancellation does not cancel evaluation: a failed
+ * step still requires retry. Callback row/name pointers are valid only for the
+ * callback invocation. Destruction from a callback remains unsupported.
  */
 void
 wl_session_set_delta_cb(wl_session_t *session, wirelog_on_delta_fn callback,

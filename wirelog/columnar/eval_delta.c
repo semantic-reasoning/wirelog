@@ -60,11 +60,18 @@ wl_columnar_delta_events_publish(wl_col_session_t *sess)
 {
     if (!sess || !sess->delta_cb)
         return;
-    for (size_t i = 0; i < sess->delta_event_count; i++) {
+    sess->delta_publish_active = true;
+    sess->delta_publish_cancelled = false;
+    for (size_t i = 0; i < sess->delta_event_count
+        && !sess->delta_publish_cancelled; i++) {
+        wirelog_on_delta_fn callback = sess->delta_cb;
+        void *data = sess->delta_data;
+        if (!callback)
+            break;
         wl_col_delta_event_t *event = &sess->delta_events[i];
-        sess->delta_cb(event->relation, event->row, event->ncols,
-            event->diff, sess->delta_data);
+        callback(event->relation, event->row, event->ncols, event->diff, data);
     }
+    sess->delta_publish_active = false;
 }
 
 static bool
@@ -450,6 +457,8 @@ struct wl_columnar_eval_delta_rollback {
 
 #ifdef WL_SESSION_TEST_HOOKS
 void (*wl_columnar_eval_delta_test_after_eval)(wl_col_session_t *sess);
+void (*wl_columnar_eval_delta_test_observer_boundary)(wl_col_session_t *sess,
+    unsigned boundary);
 #endif
 
 static int
@@ -470,6 +479,526 @@ wl_columnar_eval_delta_reserve(wl_col_session_t *sess, uint64_t bytes,
         : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : EINVAL;
 }
 
+typedef struct {
+    const char *capture_name;
+    char *name;
+    int64_t *rows;
+    int64_t *current;
+    uint32_t nrows, ncols;
+    uint32_t current_nrows, current_ncols;
+    wl_columnar_source_access_reader_t reader;
+} wl_columnar_eval_delta_observer_entry_t;
+
+struct wl_columnar_eval_delta_observer {
+    wl_columnar_memory_reservation_t metadata, payload, staging;
+    wl_columnar_memory_governor_ref_t *governor;
+    wl_arena_compound_arena_gc_hold_t compound_hold;
+    uint64_t affected_mask, metadata_bytes, payload_bytes, staging_bytes;
+    uint32_t count;
+    bool active, evaluated, cancelled, delivered, gc_requested;
+    wl_col_delta_event_t *events;
+    size_t event_count;
+    wl_columnar_eval_delta_observer_entry_t entries[];
+};
+
+static void
+wl_columnar_eval_delta_observer_swap(int64_t *rows, uint32_t a, uint32_t b,
+    uint32_t ncols)
+{
+    for (uint32_t c = 0; c < ncols; c++) {
+        int64_t tmp = rows[(size_t)a * ncols + c];
+        rows[(size_t)a * ncols + c] = rows[(size_t)b * ncols + c];
+        rows[(size_t)b * ncols + c] = tmp;
+    }
+}
+
+static void
+wl_columnar_eval_delta_observer_sift(int64_t *rows, uint32_t root,
+    uint32_t count, uint32_t ncols)
+{
+    while (root < count / 2) {
+        uint32_t child = root * 2 + 1;
+        if (child + 1 < count && memcmp(rows + (size_t)child * ncols,
+            rows + (size_t)(child + 1) * ncols,
+            (size_t)ncols * sizeof(*rows)) < 0)
+            child++;
+        if (memcmp(rows + (size_t)root * ncols, rows + (size_t)child * ncols,
+            (size_t)ncols * sizeof(*rows)) >= 0)
+            break;
+        wl_columnar_eval_delta_observer_swap(rows, root, child, ncols);
+        root = child;
+    }
+}
+
+/* An independent byte order is sufficient for exact row identity. Sort both
+ * sets identically, without assuming the engine's typed sort uses this order. */
+static uint32_t
+wl_columnar_eval_delta_observer_normalize(int64_t *rows, uint32_t count,
+    uint32_t ncols)
+{
+    if (count < 2)
+        return count;
+    if (ncols == 0)
+        return 1;
+    for (uint32_t i = count / 2; i > 0; i--)
+        wl_columnar_eval_delta_observer_sift(rows, i - 1, count, ncols);
+    for (uint32_t end = count; end > 1; end--) {
+        wl_columnar_eval_delta_observer_swap(rows, 0, end - 1, ncols);
+        wl_columnar_eval_delta_observer_sift(rows, 0, end - 1, ncols);
+    }
+    uint32_t out = 1;
+    size_t width = (size_t)ncols * sizeof(*rows);
+    for (uint32_t i = 1; i < count; i++) {
+        if (memcmp(rows + (size_t)(out - 1) * ncols,
+            rows + (size_t)i * ncols, width) != 0) {
+            if (out != i)
+                memcpy(rows + (size_t)out * ncols, rows + (size_t)i * ncols,
+                    width);
+            out++;
+        }
+    }
+    return out;
+}
+
+static bool
+wl_columnar_eval_delta_observer_row_bytes(uint32_t nrows, uint32_t ncols,
+    uint64_t *bytes)
+{
+    uint64_t cells;
+    if (!wl_columnar_memory_size_mul(nrows, ncols, &cells))
+        return false;
+    /* Give an inhabited zero-column set a valid address for callbacks. */
+    if (nrows && !cells)
+        cells = 1;
+    return wl_columnar_memory_size_mul(cells, sizeof(int64_t), bytes)
+           && *bytes <= SIZE_MAX;
+}
+
+static void
+wl_columnar_eval_delta_observer_release_token(
+    wl_columnar_memory_reservation_t *token)
+{
+    uint64_t state = atomic_load_explicit(&token->state, memory_order_acquire);
+    if (state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        || state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED) {
+        bool released = wl_columnar_memory_release(token);
+        assert(released);
+        (void)released;
+    }
+    wl_columnar_memory_reservation_init(token);
+}
+
+static void
+wl_columnar_eval_delta_observer_readers(
+    wl_columnar_eval_delta_observer_t *observer)
+{
+    for (uint32_t i = 0; i < observer->count; i++) {
+        if (observer->entries[i].reader.owner) {
+            int rc =
+                col_rel_source_reader_release(&observer->entries[i].reader);
+            assert(rc == 0);
+            (void)rc;
+        }
+    }
+}
+
+static void
+wl_columnar_eval_delta_observer_clear_stage(wl_col_session_t *sess)
+{
+    wl_columnar_eval_delta_observer_t *observer = sess->delta_observer;
+    for (uint32_t i = 0; i < observer->count; i++) {
+        free(observer->entries[i].current);
+        observer->entries[i].current = NULL;
+        observer->entries[i].current_nrows = 0;
+        observer->entries[i].current_ncols = 0;
+    }
+    free(observer->events);
+    observer->events = NULL;
+    observer->event_count = 0;
+    wl_columnar_eval_delta_observer_release_token(&observer->staging);
+    observer->staging_bytes = 0;
+    sess->delta_observer_reserved_bytes = observer->metadata_bytes
+        + observer->payload_bytes;
+}
+
+bool
+wl_columnar_eval_delta_observer_active(const wl_col_session_t *sess)
+{
+    return sess->delta_observer && sess->delta_observer->active;
+}
+
+bool
+wl_columnar_eval_delta_observer_evaluated(const wl_col_session_t *sess)
+{
+    return sess->delta_observer && sess->delta_observer->evaluated;
+}
+
+uint64_t
+wl_columnar_eval_delta_observer_mask(const wl_col_session_t *sess)
+{
+    return sess->delta_observer->affected_mask;
+}
+
+void
+wl_columnar_eval_delta_observer_set_active(wl_col_session_t *sess, bool active)
+{
+    if (sess->delta_observer)
+        sess->delta_observer->active = active;
+}
+
+void
+wl_columnar_eval_delta_observer_set_evaluated(wl_col_session_t *sess)
+{
+    if (sess->delta_observer) {
+        sess->delta_observer->evaluated = true;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_eval_delta_test_observer_boundary)
+            wl_columnar_eval_delta_test_observer_boundary(sess, 1);
+#endif
+    }
+}
+
+void
+wl_columnar_eval_delta_observer_cancel(wl_col_session_t *sess)
+{
+    if (sess->delta_observer)
+        sess->delta_observer->cancelled = true;
+}
+
+int
+wl_columnar_eval_delta_observer_discard(wl_col_session_t *sess)
+{
+    wl_columnar_eval_delta_observer_t *observer = sess->delta_observer;
+    if (!observer)
+        return 0;
+    if (observer->active || sess->delta_publish_active)
+        return EBUSY;
+    wl_columnar_eval_delta_observer_readers(observer);
+    wl_columnar_eval_delta_observer_clear_stage(sess);
+    for (uint32_t i = 0; i < observer->count; i++) {
+        free(observer->entries[i].rows);
+        free(observer->entries[i].name);
+    }
+    if (observer->compound_hold.arena) {
+        int rc =
+            wl_arena_compound_arena_gc_hold_release(&observer->compound_hold);
+        assert(rc == 0);
+        (void)rc;
+    }
+    wl_columnar_memory_governor_ref_t *governor = observer->governor;
+    wl_columnar_memory_reservation_t metadata;
+    wl_columnar_memory_reservation_init(&metadata);
+    wl_columnar_eval_delta_observer_release_token(&observer->payload);
+    if (governor) {
+        bool moved = wl_columnar_memory_reservation_move(&metadata,
+                &observer->metadata);
+        assert(moved);
+        (void)moved;
+    }
+    free(observer);
+    sess->delta_observer = NULL;
+    sess->delta_observer_reserved_bytes = 0;
+    wl_columnar_eval_delta_observer_release_token(&metadata);
+    if (governor)
+        wl_columnar_memory_governor_ref_release(governor);
+    return 0;
+}
+
+int
+wl_columnar_eval_delta_observer_begin(wl_col_session_t *sess, uint64_t mask)
+{
+    if (sess->delta_observer)
+        return 0;
+    uint64_t count = 0, bytes, payload_bytes = 0;
+    const wl_plan_t *plan = sess->plan;
+    for (uint32_t si = 0; si < plan->stratum_count; si++)
+        if (!wl_columnar_memory_size_add(count,
+            plan->strata[si].relation_count, &count))
+            return EOVERFLOW;
+    if (count > UINT32_MAX || !wl_columnar_memory_size_mul(count,
+        sizeof(wl_columnar_eval_delta_observer_entry_t), &bytes)
+        || !wl_columnar_memory_size_add(bytes,
+        sizeof(wl_columnar_eval_delta_observer_t), &bytes) || bytes > SIZE_MAX
+        || bytes < sizeof(wl_columnar_eval_delta_observer_t))
+        return EOVERFLOW;
+    wl_columnar_memory_reservation_t metadata;
+    int rc = wl_columnar_eval_delta_reserve(sess, bytes, &metadata);
+    if (rc != 0)
+        return rc;
+    wl_columnar_eval_delta_observer_t *observer = calloc(1, (size_t)bytes);
+    if (!observer) {
+        wl_columnar_eval_delta_observer_release_token(&metadata);
+        return ENOMEM;
+    }
+    wl_columnar_memory_reservation_init(&observer->metadata);
+    wl_columnar_memory_reservation_init(&observer->payload);
+    wl_columnar_memory_reservation_init(&observer->staging);
+    observer->metadata_bytes = bytes;
+    observer->affected_mask = mask;
+    if (sess->memory_governor) {
+        bool moved = wl_columnar_memory_reservation_move(&observer->metadata,
+                &metadata);
+        assert(moved);
+        (void)moved;
+        observer->governor = sess->memory_governor;
+        wl_columnar_memory_governor_ref_retain(observer->governor);
+    }
+    sess->delta_observer = observer;
+    sess->delta_observer_reserved_bytes = bytes;
+    if (sess->compound_arena) {
+        rc = wl_arena_compound_arena_gc_hold_acquire(sess->compound_arena,
+                &observer->compound_hold);
+        if (rc != 0)
+            goto fail;
+    }
+    for (uint32_t si = 0; si < plan->stratum_count; si++) {
+        const wl_plan_stratum_t *sp = &plan->strata[si];
+        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+            const char *name = sp->relations[ri].name;
+            if (!name) {
+                rc = EINVAL;
+                goto fail;
+            }
+            bool found = false;
+            for (uint32_t i = 0; i < observer->count; i++)
+                if (strcmp(observer->entries[i].capture_name, name) == 0)
+                    found = true;
+            if (found)
+                continue;
+            wl_columnar_eval_delta_observer_entry_t *entry =
+                &observer->entries[observer->count++];
+            entry->capture_name = name;
+            col_rel_t *rel = session_find_rel(sess, name);
+            if (rel) {
+                rc = col_rel_source_reader_acquire(rel, &entry->reader);
+                if (rc != 0)
+                    goto fail;
+                entry->nrows = rel->nrows;
+                entry->ncols = rel->ncols;
+            }
+            uint64_t row_bytes;
+            if (!wl_columnar_eval_delta_observer_row_bytes(entry->nrows,
+                entry->ncols, &row_bytes)
+                || !wl_columnar_memory_size_add(payload_bytes, row_bytes,
+                &payload_bytes)
+                || !wl_columnar_memory_size_add(payload_bytes,
+                strlen(name) + 1, &payload_bytes)) {
+                rc = EOVERFLOW;
+                goto fail;
+            }
+        }
+    }
+    if (!wl_columnar_memory_size_add(bytes, payload_bytes, &bytes)) {
+        rc = EOVERFLOW;
+        goto fail;
+    }
+    rc = wl_columnar_eval_delta_reserve(sess, payload_bytes,
+            &observer->payload);
+    if (rc != 0)
+        goto fail;
+    observer->payload_bytes = payload_bytes;
+    sess->delta_observer_reserved_bytes = bytes;
+    for (uint32_t i = 0; i < observer->count; i++) {
+        wl_columnar_eval_delta_observer_entry_t *entry = &observer->entries[i];
+        entry->name = wl_strdup(entry->capture_name);
+        if (!entry->name) {
+            rc = ENOMEM;
+            goto fail;
+        }
+        if (entry->nrows) {
+            uint64_t row_bytes;
+            if (!wl_columnar_eval_delta_observer_row_bytes(entry->nrows,
+                entry->ncols, &row_bytes)) {
+                rc = EOVERFLOW;
+                goto fail;
+            }
+            entry->rows = malloc((size_t)row_bytes);
+            if (!entry->rows) {
+                rc = ENOMEM;
+                goto fail;
+            }
+            col_rel_t *rel = session_find_rel(sess, entry->name);
+            for (uint32_t row = 0; row < entry->nrows; row++)
+                for (uint32_t col = 0; col < entry->ncols; col++)
+                    entry->rows[(size_t)row * entry->ncols + col]
+                        = rel->columns[col][row];
+            entry->nrows = wl_columnar_eval_delta_observer_normalize(
+                entry->rows, entry->nrows, entry->ncols);
+        }
+        entry->capture_name = NULL;
+    }
+    wl_columnar_eval_delta_observer_readers(observer);
+    if (observer->governor) {
+        bool committed = wl_columnar_memory_commit(&observer->metadata,
+                observer)
+            && (!payload_bytes || wl_columnar_memory_commit(&observer->payload,
+            observer));
+        assert(committed);
+        (void)committed;
+    }
+    return 0;
+fail:
+    (void)wl_columnar_eval_delta_observer_discard(sess);
+    return rc;
+}
+
+static void
+wl_columnar_eval_delta_observer_event(
+    wl_columnar_eval_delta_observer_t *observer,
+    const char *name, int64_t *row, uint32_t ncols, int32_t diff)
+{
+    observer->events[observer->event_count++] = (wl_col_delta_event_t){
+        name, row, ncols, diff
+    };
+}
+
+int
+wl_columnar_eval_delta_observer_prepare(wl_col_session_t *sess)
+{
+    wl_columnar_eval_delta_observer_t *observer = sess->delta_observer;
+    if (!observer || observer->cancelled || observer->delivered)
+        return 0;
+    wl_columnar_eval_delta_observer_clear_stage(sess);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_delta_test_observer_boundary)
+        wl_columnar_eval_delta_test_observer_boundary(sess, 2);
+#endif
+    uint64_t bytes = 0, event_capacity = 0, event_bytes;
+    int rc = 0;
+    for (uint32_t i = 0; i < observer->count; i++) {
+        wl_columnar_eval_delta_observer_entry_t *entry = &observer->entries[i];
+        col_rel_t *rel = session_find_rel(sess, entry->name);
+        if (rel) {
+            rc = col_rel_source_reader_acquire(rel, &entry->reader);
+            if (rc != 0)
+                goto fail;
+            entry->current_nrows = rel->nrows;
+            entry->current_ncols = rel->ncols;
+        }
+        uint64_t row_bytes;
+        if (!wl_columnar_eval_delta_observer_row_bytes(entry->current_nrows,
+            entry->current_ncols, &row_bytes)
+            || !wl_columnar_memory_size_add(bytes, row_bytes, &bytes)
+            || !wl_columnar_memory_size_add(event_capacity,
+            (uint64_t)entry->nrows + entry->current_nrows, &event_capacity)) {
+            rc = EOVERFLOW;
+            goto fail;
+        }
+    }
+    if (!wl_columnar_memory_size_mul(event_capacity, sizeof(*observer->events),
+        &event_bytes) || event_bytes > SIZE_MAX
+        || !wl_columnar_memory_size_add(bytes, event_bytes, &bytes)
+        || bytes > SIZE_MAX
+        || bytes >
+        UINT64_MAX - observer->metadata_bytes - observer->payload_bytes) {
+        rc = EOVERFLOW;
+        goto fail;
+    }
+    rc = wl_columnar_eval_delta_reserve(sess, bytes, &observer->staging);
+    if (rc != 0)
+        goto fail;
+    observer->staging_bytes = bytes;
+    sess->delta_observer_reserved_bytes += bytes;
+    if (event_bytes) {
+        observer->events = malloc((size_t)event_bytes);
+        if (!observer->events) {
+            rc = ENOMEM;
+            goto fail;
+        }
+    }
+    for (uint32_t i = 0; i < observer->count; i++) {
+        wl_columnar_eval_delta_observer_entry_t *entry = &observer->entries[i];
+        if (entry->current_nrows) {
+            uint64_t row_bytes;
+            if (!wl_columnar_eval_delta_observer_row_bytes(
+                    entry->current_nrows, entry->current_ncols, &row_bytes)) {
+                rc = EOVERFLOW;
+                goto fail;
+            }
+            entry->current = malloc((size_t)row_bytes);
+            if (!entry->current) {
+                rc = ENOMEM;
+                goto fail;
+            }
+            col_rel_t *rel = session_find_rel(sess, entry->name);
+            for (uint32_t row = 0; row < entry->current_nrows; row++)
+                for (uint32_t col = 0; col < entry->current_ncols; col++)
+                    entry->current[(size_t)row * entry->current_ncols + col]
+                        = rel->columns[col][row];
+            entry->current_nrows = wl_columnar_eval_delta_observer_normalize(
+                entry->current, entry->current_nrows, entry->current_ncols);
+        }
+        uint32_t old = 0, current = 0;
+        while (old < entry->nrows || current < entry->current_nrows) {
+            int cmp = old == entry->nrows ? 1
+                : current == entry->current_nrows ? -1
+                : entry->ncols != entry->current_ncols ? -1
+                : memcmp(entry->rows + (size_t)old * entry->ncols,
+                    entry->current + (size_t)current * entry->current_ncols,
+                    (size_t)entry->ncols * sizeof(int64_t));
+            if (cmp <= 0) {
+                if (cmp < 0)
+                    wl_columnar_eval_delta_observer_event(observer, entry->name,
+                        entry->rows + (size_t)old * entry->ncols, entry->ncols,
+                        -1);
+                old++;
+            }
+            if (cmp >= 0) {
+                if (cmp > 0)
+                    wl_columnar_eval_delta_observer_event(observer, entry->name,
+                        entry->current + (size_t)current * entry->current_ncols,
+                        entry->current_ncols, +1);
+                current++;
+            }
+        }
+    }
+    wl_columnar_eval_delta_observer_readers(observer);
+    if (observer->governor && bytes) {
+        bool committed = wl_columnar_memory_commit(&observer->staging,
+                observer);
+        assert(committed);
+        (void)committed;
+    }
+    return 0;
+fail:
+    wl_columnar_eval_delta_observer_readers(observer);
+    wl_columnar_eval_delta_observer_clear_stage(sess);
+    return rc;
+}
+
+void
+wl_columnar_eval_delta_observer_publish(wl_col_session_t *sess)
+{
+    wl_columnar_eval_delta_observer_t *observer = sess->delta_observer;
+    if (!observer || observer->delivered)
+        return;
+    sess->delta_publish_active = true;
+    for (size_t i = 0; i < observer->event_count && !observer->cancelled; i++) {
+        wirelog_on_delta_fn callback = sess->delta_cb;
+        void *data = sess->delta_data;
+        if (!callback) {
+            observer->cancelled = true;
+            break;
+        }
+        wl_col_delta_event_t *event = &observer->events[i];
+        callback(event->relation, event->row, event->ncols, event->diff, data);
+    }
+    sess->delta_publish_active = false;
+    observer->delivered = true;
+}
+
+int
+wl_columnar_eval_delta_observer_finish(wl_col_session_t *sess)
+{
+    bool gc_requested = sess->delta_observer->gc_requested;
+    sess->delta_observer->active = false;
+    int rc = wl_columnar_eval_delta_observer_discard(sess);
+    if (rc == 0 && gc_requested && !sess->coordinator && sess->compound_arena
+        && sess->rotation_ops && sess->rotation_ops->gc_epoch_boundary)
+        sess->rotation_ops->gc_epoch_boundary(sess);
+    return rc;
+}
+
 bool
 wl_columnar_eval_delta_rollback_active(const wl_col_session_t *sess)
 {
@@ -479,7 +1008,13 @@ wl_columnar_eval_delta_rollback_active(const wl_col_session_t *sess)
 bool
 wl_columnar_eval_delta_defer_gc(wl_col_session_t *sess)
 {
-    if (!sess || !sess->delta_rollback)
+    if (!sess)
+        return false;
+    if (sess->delta_observer) {
+        sess->delta_observer->gc_requested = true;
+        return true;
+    }
+    if (!sess->delta_rollback)
         return false;
     sess->delta_rollback->gc_requested = true;
     return true;
@@ -788,6 +1323,10 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         if (rc != 0)
             goto cleanup;
 
+        /* A public step compares all outputs against its durable baseline
+        * only after every stratum and final compaction have succeeded. */
+        if (sess->delta_observer)
+            continue;
         uint32_t ncols = r->ncols;
 
         /* Gather current state into flat buffer for col_row_in_sorted */

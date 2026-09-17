@@ -594,7 +594,16 @@ the replacement transaction never releases an uncommitted token.
 | `relation.c:col_rel_compact_many` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Validate each retained reservation before compacting a relation |
 | `relation.c:col_rel_compact_many#2` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Revalidate the reservation before the second compaction path |
 
-The complete source audit now contains **153 atomic call sites**.
+### 5.17 `wirelog/columnar/eval_delta.c` — observer reservations (1 row)
+
+Observer cleanup releases only admitted tokens. The session owns these stable
+reservation objects exclusively; their state follows the governor protocol.
+
+| Anchor (file:function[#N]) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `eval_delta.c:wl_columnar_eval_delta_observer_release_token` | `token->state` | `atomic_load_explicit` | acquire | Observe admission or commit state before releasing the observer reservation, then reinitialize the exclusively owned token |
+
+The complete source audit now contains **154 atomic call sites**.
 
 ---
 

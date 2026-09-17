@@ -4308,6 +4308,590 @@ cleanup:
 #undef SCOPE_CHECK
 }
 
+extern void (*wl_columnar_eval_delta_test_observer_boundary)(wl_col_session_t *,
+    unsigned);
+static unsigned observer_seen_plans;
+static wl_columnar_source_access_reader_t observer_result_reader;
+
+static void
+observer_hold_second_result(wl_col_session_t *sess, eval_stack_t *stack,
+    eval_entry_t *result)
+{
+    (void)sess;
+    (void)stack;
+    if (++observer_seen_plans != 2)
+        return;
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    if (result->owned && result->rel)
+        (void)col_rel_source_reader_acquire(result->rel,
+            &observer_result_reader);
+}
+
+static void
+test_observer_retry(bool separate_strata, bool recursive, unsigned cancel,
+    bool destroy_pending)
+{
+    TEST(
+        "observer: whole-step retry preserves signed notifications and ownership");
+    wl_plan_op_t a_ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_CONCAT }
+    };
+    /* Recursive observer retry uses borrowed results; legacy recursive CONCAT
+     * segment cleanup is tracked separately in #1686. Nonrecursive cases below
+     * retain the real owned-CONCAT reader-refusal boundary. */
+    wl_plan_op_t b_ops[3];
+    memcpy(b_ops, a_ops, sizeof(b_ops));
+    wl_plan_relation_t relations[] = {
+        { .name = "A", .delta_name = "$d$A", .ops = a_ops,
+          .op_count = recursive ? 2 : 3 },
+        { .name = "B", .delta_name = "$d$B", .ops = b_ops,
+          .op_count = recursive ? 2 : 3 }
+    };
+    wl_plan_stratum_t strata[] = {
+        { .relations = relations, .relation_count = separate_strata ? 1 : 2,
+          .is_recursive = recursive },
+        { .relations = &relations[1], .relation_count = 1,
+          .is_recursive = recursive }
+    };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = strata,
+                       .stratum_count = separate_strata ? 2 : 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess = NULL;
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    delta_collector_t deltas = { 0 }, replacement = { 0 };
+    tuple_collector_t tuples = { 0 };
+    const char *failure = NULL;
+    int64_t initial[] = { 300, -2, 1 }, add = 2, remove = 300, later = 9;
+#define OBS_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    memset(&observer_result_reader, 0, sizeof(observer_result_reader));
+    OBS_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1, &session) == 0,
+        "create");
+    sess = COL_SESSION(session);
+    governor = sess->memory_governor;
+    wl_columnar_memory_governor_ref_retain(governor);
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    OBS_CHECK(wl_session_insert(session, "input", initial, 3, 1) == 0
+        && wl_session_step(session) == 0 && deltas.count == 6, "baseline");
+    deltas.count = 0;
+    OBS_CHECK(wl_session_insert(session, "input", &add, 1, 1) == 0
+        && wl_session_remove(session, "input", &remove, 1, 1) == 0,
+        "mixed input changes");
+    if (recursive)
+        b_ops[1].relation_name = "missing";
+    else {
+        observer_seen_plans = 0;
+        wl_columnar_eval_serial_test_after_plan = observer_hold_second_result;
+    }
+    int expected = recursive ? ENOENT : EBUSY;
+    OBS_CHECK(wl_session_step(session) == expected && deltas.count == 0
+        && sess->delta_observer &&
+        !wl_columnar_eval_delta_observer_active(sess),
+        "failed step lost observer baseline");
+    if (!recursive)
+        OBS_CHECK(observer_result_reader.owner &&
+            sess->cleanup_pending_count == 1,
+            "actual result refusal missing");
+    uint64_t observer_bytes = sess->delta_observer_reserved_bytes;
+    uint32_t epoch = sess->outer_epoch, nrels = sess->nrels;
+    OBS_CHECK(wl_session_insert(session, "input", &later, 1, 1) == EBUSY
+        && wl_session_remove(session, "input", &add, 1, 1) == EBUSY
+        && wl_session_snapshot(session, collect_tuple, &tuples) == EBUSY
+        && wl_session_insert(session, "input", &later, 0, 1) == 0
+        && wl_session_remove(session, "input", &later, 0, 1) == 0,
+        "pending input/snapshot guards");
+    wirelog_compound_arg_t arg = { WIRELOG_TYPE_INT64, 1 };
+    uint64_t handle = 123;
+    OBS_CHECK(wl_session_make_compound(session, "blocked", 1, &arg, &handle)
+        == EBUSY && handle == WIRELOG_COMPOUND_HANDLE_NULL
+        && sess->outer_epoch == epoch && sess->nrels == nrels,
+        "compound input bypassed observer guard");
+    for (unsigned retry = 0; retry < 2; retry++)
+        OBS_CHECK(wl_session_step(session) == expected && deltas.count == 0
+            && sess->delta_observer_reserved_bytes == observer_bytes,
+            "repeated refusal changed baseline");
+    if (cancel) {
+        wl_session_set_delta_cb(session, NULL, NULL);
+        if (cancel == 1)
+            wl_session_set_delta_cb(session, collect_delta, &replacement);
+    }
+    if (observer_result_reader.owner)
+        OBS_CHECK(col_rel_source_reader_release(&observer_result_reader) == 0,
+            "reader release");
+    b_ops[1].relation_name = "input";
+    if (destroy_pending)
+        goto cleanup;
+    OBS_CHECK(wl_session_step(session) == 0 && !sess->delta_observer
+        && !sess->delta_rollback && !sess->cleanup_pending,
+        "retry completion");
+    for (unsigned i = 0; i < 2; i++) {
+        col_rel_t *rel = session_find_rel(sess, relations[i].name);
+        OBS_CHECK(rel && rel->nrows == 3, "exact final row count");
+        if (!cancel)
+            OBS_CHECK(has_delta(&deltas, relations[i].name, &add, 1, +1)
+                && has_delta(&deltas, relations[i].name, &remove, 1, -1),
+                "missing signed notification after retry");
+    }
+    OBS_CHECK(deltas.count == (cancel ? 0 : 4) && replacement.count == 0,
+        "duplicate or cancelled notifications");
+    OBS_CHECK(wl_session_step(session) == 0
+        && deltas.count == (cancel ? 0 : 4) && replacement.count == 0,
+        "no-change retry duplicated events");
+    if (cancel) {
+        wl_session_set_delta_cb(session, collect_delta, &replacement);
+        OBS_CHECK(wl_session_insert(session, "input", &later, 1, 1) == 0
+            && wl_session_step(session) == 0 && replacement.count == 2
+            && has_delta(&replacement, "A", &later, 1, +1)
+            && has_delta(&replacement, "B", &later, 1, +1),
+            "replacement did not observe subsequent transaction");
+    }
+cleanup:
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    if (observer_result_reader.owner)
+        (void)col_rel_source_reader_release(&observer_result_reader);
+    wl_session_destroy(session);
+    if (governor) {
+        if (wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                governor)) != 0)
+            failure = "observer teardown reservation leak";
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef OBS_CHECK
+}
+
+static unsigned observer_boundary_mode, observer_boundary_calls;
+static wl_columnar_source_access_reader_t observer_compaction_reader;
+
+static void
+observer_inject_boundary(wl_col_session_t *sess, unsigned boundary)
+{
+    if (boundary != (observer_boundary_mode == 0 ? 1u : 2u))
+        return;
+    wl_columnar_eval_delta_test_observer_boundary = NULL;
+    observer_boundary_calls++;
+    if (observer_boundary_mode == 0) {
+        (void)col_rel_source_reader_acquire(session_find_rel(sess, "input"),
+            &observer_compaction_reader);
+    }
+#ifdef WL_TEST_ALLOC_WRAP
+    else if (observer_boundary_mode == 1) {
+        fail_next_alloc = true;
+    }
+#endif
+    else if (observer_boundary_mode == 2) {
+        wl_columnar_memory_governor_t *budget =
+            wl_columnar_memory_governor_ref_get(sess->memory_governor);
+        budget->mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+        atomic_store_explicit(&budget->usable_bytes,
+            wl_columnar_memory_reserved(budget), memory_order_relaxed);
+    }
+}
+
+static void
+test_observer_completion_retry(unsigned mode, bool cancel)
+{
+    TEST(
+        "observer: completion retry does not repeat evaluation or lose baseline");
+    wl_plan_op_t op = { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" };
+    wl_plan_relation_t relation = { .name = "A", .ops = &op, .op_count = 1 };
+    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess = NULL;
+    delta_collector_t deltas = { 0 };
+    const char *failure = NULL;
+    int64_t one = 1, two = 2;
+#define COMPLETE_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    memset(&observer_compaction_reader, 0, sizeof(observer_compaction_reader));
+    COMPLETE_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0,
+        "create");
+    sess = COL_SESSION(session);
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    COMPLETE_CHECK(wl_session_insert(session, "input", &one, 1, 1) == 0
+        && wl_session_step(session) == 0, "baseline");
+    deltas.count = 0;
+    COMPLETE_CHECK(wl_session_insert(session, "input", &two, 1, 1) == 0,
+        "insert");
+    wl_columnar_memory_governor_t *budget =
+        wl_columnar_memory_governor_ref_get(sess->memory_governor);
+    uint64_t saved_limit = atomic_load_explicit(&budget->usable_bytes,
+            memory_order_relaxed);
+    wl_columnar_memory_mode_t saved_mode = budget->mode;
+    observer_boundary_mode = mode;
+    observer_boundary_calls = 0;
+    wl_columnar_eval_delta_test_observer_boundary = observer_inject_boundary;
+    int rc = wl_session_step(session);
+    budget->mode = saved_mode;
+    atomic_store_explicit(&budget->usable_bytes, saved_limit,
+        memory_order_relaxed);
+    COMPLETE_CHECK(rc == (mode == 0 ? EBUSY : mode == 1 ? ENOMEM : ENOSPC)
+        && observer_boundary_calls == 1 && sess->delta_observer
+        && wl_columnar_eval_delta_observer_evaluated(sess)
+        && !wl_columnar_eval_delta_observer_active(sess) && deltas.count == 0,
+        "completion failure lost evaluated phase");
+    uint64_t bytes = sess->delta_observer_reserved_bytes;
+    if (mode == 0)
+        COMPLETE_CHECK(wl_session_step(session) == EBUSY
+            && sess->delta_observer_reserved_bytes == bytes &&
+            deltas.count == 0,
+            "repeated compaction refusal lost phase");
+    if (cancel)
+        wl_session_set_delta_cb(session, NULL, NULL);
+    if (observer_compaction_reader.owner)
+        COMPLETE_CHECK(col_rel_source_reader_release(
+                &observer_compaction_reader) == 0,
+            "compaction reader release");
+    serial_scope_hook_calls = 0;
+    wl_columnar_eval_serial_test_after_plan = count_serial_scope_hook;
+    COMPLETE_CHECK(wl_session_step(session) == 0 && serial_scope_hook_calls == 0
+        && !sess->delta_observer && sess->delta_observer_reserved_bytes == 0
+        && session_find_rel(sess, "A")->nrows == 2
+        && deltas.count == (cancel ? 0 : 1)
+        && (cancel || has_delta(&deltas, "A", &two, 1, +1)),
+        "completion retry reevaluated or changed delivery");
+cleanup:
+    wl_columnar_eval_delta_test_observer_boundary = NULL;
+    wl_columnar_eval_serial_test_after_plan = NULL;
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = false;
+#endif
+    if (observer_compaction_reader.owner)
+        (void)col_rel_source_reader_release(&observer_compaction_reader);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef COMPLETE_CHECK
+}
+
+#ifdef WL_TEST_ALLOC_WRAP
+static void
+test_observer_capture_failure(unsigned mode)
+{
+    TEST("observer: baseline allocation failure leaves evaluation unstarted");
+    wl_plan_op_t op = { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" };
+    wl_plan_relation_t relations[] = {
+        { .name = "A", .ops = &op, .op_count = 1 },
+        { .name = "B", .ops = &op, .op_count = 1 }
+    };
+    wl_plan_stratum_t stratum = { .relations = relations, .relation_count = 2 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess = NULL;
+    delta_collector_t deltas = { 0 };
+    const char *failure = NULL;
+    int64_t one = 1, two = 2;
+#define BASE_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    BASE_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0,
+        "create");
+    sess = COL_SESSION(session);
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    BASE_CHECK(wl_session_insert(session, "input", &one, 1, 1) == 0
+        && wl_session_step(session) == 0
+        && wl_session_insert(session, "input", &two, 1, 1) == 0, "baseline");
+    deltas.count = 0;
+    col_rel_t *a = session_find_rel(sess, "A"),
+        *b = session_find_rel(sess, "B");
+    int64_t **a_columns = a->columns, **b_columns = b->columns;
+    uint64_t a_generation = a->view_generation,
+        b_generation = b->view_generation;
+    uint64_t before = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(sess->memory_governor));
+    for (unsigned retry = 0; retry < 2; retry++) {
+        if (mode == 0)
+            fail_next_alloc = true;
+        else {
+            fail_malloc_size = sizeof(int64_t);
+            fail_malloc_matches_to_skip = mode - 1;
+        }
+        int rc = wl_session_step(session);
+        BASE_CHECK(rc == ENOMEM && !fail_next_alloc && fail_malloc_size == 0
+            && !sess->delta_observer && !sess->delta_rollback
+            && a->columns == a_columns && b->columns == b_columns
+            && a->view_generation == a_generation &&
+            b->view_generation == b_generation
+            && a->nrows == 1 && b->nrows == 1 && deltas.count == 0
+            && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                sess->memory_governor)) == before,
+            "capture failure changed baseline or admission");
+    }
+    BASE_CHECK(wl_session_step(session) == 0 && deltas.count == 2
+        && has_delta(&deltas, "A", &two, 1, +1)
+        && has_delta(&deltas, "B", &two, 1, +1), "capture retry oracle");
+cleanup:
+    fail_next_alloc = false;
+    fail_malloc_size = 0;
+    fail_malloc_matches_to_skip = 0;
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef BASE_CHECK
+}
+#endif
+
+typedef struct {
+    wl_session_t *session;
+    delta_collector_t first, remaining;
+    unsigned mode;
+    bool guards_ok;
+} observer_callback_context_t;
+
+static void
+observer_mutating_callback(const char *name, const int64_t *row,
+    uint32_t ncols, int32_t diff, void *opaque)
+{
+    observer_callback_context_t *context = opaque;
+    collect_delta(name, row, ncols, diff, &context->first);
+    wl_col_session_t *sess = COL_SESSION(context->session);
+    uint32_t epoch = sess->outer_epoch, nrels = sess->nrels;
+    int64_t value = 42;
+    tuple_collector_t tuples = { 0 };
+    wirelog_compound_arg_t arg = { WIRELOG_TYPE_INT64, 1 };
+    uint64_t handle = 123;
+    context->guards_ok = wl_session_step(context->session) == EBUSY
+        && wl_session_snapshot(context->session, collect_tuple,
+            &tuples) == EBUSY
+        && wl_session_insert(context->session, "input", &value, 1, 1) == EBUSY
+        && wl_session_remove(context->session, "input", &value, 1, 1) == EBUSY
+        && wl_session_make_compound(context->session, "callback", 1, &arg,
+            &handle) == EBUSY && handle == WIRELOG_COMPOUND_HANDLE_NULL
+        && sess->outer_epoch == epoch && sess->nrels == nrels;
+    if (context->mode != 0)
+        wl_session_set_delta_cb(context->session, NULL, NULL);
+    if (context->mode != 1)
+        wl_session_set_delta_cb(context->session, collect_delta,
+            &context->remaining);
+}
+
+static void
+test_observer_callback_binding(unsigned mode, bool direct)
+{
+    TEST(
+        "observer: callback replacement/cancellation protects active batch storage");
+    wl_plan_op_t op = { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" };
+    wl_plan_relation_t relation = { .name = "A", .ops = &op, .op_count = 1 };
+    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    observer_callback_context_t context = { .mode = mode };
+    const char *failure = NULL;
+    int64_t values[] = { 1, 2, 3 }, later = 4;
+#define CALLBACK_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    CALLBACK_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0,
+        "create");
+    context.session = session;
+    wl_session_set_delta_cb(session, observer_mutating_callback, &context);
+    CALLBACK_CHECK(wl_session_insert(session, "input", values, 3, 1) == 0,
+        "insert");
+    int rc = direct ? col_stratum_step_with_delta(&stratum,
+            COL_SESSION(session), 0)
+        : wl_session_step(session);
+    CALLBACK_CHECK(rc == 0 && context.guards_ok && context.first.count == 1
+        && context.remaining.count == (mode == 0 ? 2 : 0)
+        && !COL_SESSION(session)->delta_publish_active
+        && !COL_SESSION(session)->delta_observer,
+        "binding or reentry contract");
+    if (!direct) {
+        context.remaining.count = 0;
+        wl_session_set_delta_cb(session, collect_delta, &context.remaining);
+        CALLBACK_CHECK(wl_session_insert(session, "input", &later, 1, 1) == 0
+            && wl_session_step(session) == 0 && context.remaining.count == 1
+            && has_delta(&context.remaining, "A", &later, 1, +1),
+            "next transaction binding");
+    }
+cleanup:
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef CALLBACK_CHECK
+}
+
+static void
+test_observer_logical_identity(unsigned mode)
+{
+    TEST(
+        "observer: logical names survive absence, replacement and arity changes");
+    wl_plan_relation_t outputs[] = { { .name = "A" }, { .name = "A" },
+                                     { .name = "B" } };
+    wl_plan_stratum_t strata[] = {
+        { .relations = outputs, .relation_count = 1 },
+        { .relations = outputs + 1, .relation_count = 2 }
+    };
+    wl_plan_t plan = { .strata = strata, .stratum_count = 2 };
+    wl_session_t *session = NULL;
+    col_rel_t *owned = NULL;
+    delta_collector_t deltas = { 0 };
+    const char *failure = NULL;
+    int64_t old = 7, replacement[] = { 9, 11 };
+#define IDENTITY_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    IDENTITY_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "create");
+    wl_col_session_t *sess = COL_SESSION(session);
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    col_rel_t *a = session_find_rel(sess, "A");
+    if (a)
+        IDENTITY_CHECK(session_remove_rel(sess, "A") == 0,
+            "remove placeholder");
+    owned = col_rel_new_auto("A", 1);
+    IDENTITY_CHECK(owned && col_rel_append_row(owned, &old) == 0
+        && session_add_rel(sess, owned) == 0, "old output");
+    owned = NULL;
+    IDENTITY_CHECK(wl_columnar_eval_delta_observer_begin(sess, 3) == 0,
+        "baseline capture");
+    IDENTITY_CHECK(session_remove_rel(sess, "A") == 0, "replace descriptor");
+    if (mode != 0) {
+        owned = col_rel_new_auto("A", mode == 2 ? 2 : 1);
+        IDENTITY_CHECK(owned && col_rel_append_row(owned, replacement) == 0
+            && session_add_rel(sess, owned) == 0, "new output");
+        owned = NULL;
+    }
+    /* B was absent or empty at capture and becomes populated afterwards. */
+    if (session_find_rel(sess, "B"))
+        IDENTITY_CHECK(session_remove_rel(sess, "B") == 0, "remove empty B");
+    owned = col_rel_new_auto("B", 1);
+    IDENTITY_CHECK(owned && col_rel_append_row(owned, &old) == 0
+        && session_add_rel(sess, owned) == 0, "new B");
+    owned = NULL;
+    IDENTITY_CHECK(wl_columnar_eval_delta_observer_prepare(sess) == 0,
+        "prepare difference");
+    wl_columnar_eval_delta_observer_publish(sess);
+    IDENTITY_CHECK(deltas.count == (mode ? 3 : 2)
+        && has_delta(&deltas, "A", &old, 1, -1)
+        && has_delta(&deltas, "B", &old, 1, +1)
+        && (!mode || has_delta(&deltas, "A", replacement,
+        mode == 2 ? 2 : 1, +1)), "logical signed set oracle");
+    IDENTITY_CHECK(wl_columnar_eval_delta_observer_finish(sess) == 0,
+        "finish");
+cleanup:
+    if (owned)
+        col_rel_destroy(owned);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef IDENTITY_CHECK
+}
+
+typedef struct {
+    wl_compound_arena_t *arena;
+    uint64_t handle;
+    delta_collector_t deltas;
+    bool live;
+} observer_compound_context_t;
+
+static void
+observer_compound_callback(const char *name, const int64_t *row,
+    uint32_t ncols, int32_t diff, void *opaque)
+{
+    observer_compound_context_t *context = opaque;
+    if (diff < 0 && ncols == 1 && (uint64_t)row[0] == context->handle)
+        context->live = wl_compound_arena_lookup(context->arena,
+                context->handle, NULL) != NULL;
+    collect_delta(name, row, ncols, diff, &context->deltas);
+}
+
+static void
+test_observer_compound_removal(void)
+{
+    TEST("observer: removed compound handle survives failed step and delivery");
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_CONCAT }
+    };
+    wl_plan_relation_t outputs[] = {
+        { .name = "A", .ops = ops, .op_count = 3 },
+        { .name = "B", .ops = ops, .op_count = 3 }
+    };
+    wl_plan_stratum_t stratum = { .relations = outputs, .relation_count = 2 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    observer_compound_context_t context = { 0 };
+    const char *failure = NULL;
+#define HANDLE_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    HANDLE_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "create");
+    wl_col_session_t *sess = COL_SESSION(session);
+    context.arena = sess->compound_arena;
+    context.handle = wl_compound_arena_alloc(context.arena, 16);
+    HANDLE_CHECK(context.handle != 0, "compound allocate");
+    wl_compound_arena_freeze(context.arena);
+    int64_t initial[] = { (int64_t)context.handle, 42 };
+    wl_session_set_delta_cb(session, observer_compound_callback, &context);
+    HANDLE_CHECK(wl_session_insert(session, "input", initial, 2, 1) == 0
+        && wl_session_step(session) == 0, "initial step");
+    wl_compound_arena_unfreeze(context.arena);
+    context.deltas.count = 0;
+    HANDLE_CHECK(wl_session_remove(session, "input", initial, 1, 1) == 0,
+        "remove handle row");
+    observer_seen_plans = 0;
+    wl_columnar_eval_serial_test_after_plan = observer_hold_second_result;
+    HANDLE_CHECK(wl_session_step(session) == EBUSY && sess->delta_observer
+        && context.deltas.count == 0, "failed step");
+    HANDLE_CHECK(wl_compound_arena_retain(context.arena, context.handle, -1)
+        == 0, "drop multiplicity");
+    uint32_t epoch = context.arena->current_epoch;
+    (void)wl_compound_arena_gc_epoch_boundary(context.arena);
+    HANDLE_CHECK(context.arena->current_epoch == epoch
+        && wl_compound_arena_lookup(context.arena, context.handle, NULL)
+        && wl_session_step(session) == EBUSY, "hold through retry");
+    HANDLE_CHECK(col_rel_source_reader_release(&observer_result_reader) == 0,
+        "release reader");
+    HANDLE_CHECK(wl_session_step(session) == 0 && context.live
+        && context.deltas.count == 2
+        && has_delta(&context.deltas, "A", initial, 1, -1)
+        && has_delta(&context.deltas, "B", initial, 1, -1),
+        "removed handle live through delivery");
+    (void)wl_compound_arena_gc_epoch_boundary(context.arena);
+    HANDLE_CHECK(context.arena->current_epoch > epoch, "GC resumes");
+cleanup:
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    if (observer_result_reader.owner)
+        (void)col_rel_source_reader_release(&observer_result_reader);
+    if (context.arena)
+        wl_compound_arena_unfreeze(context.arena);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef HANDLE_CHECK
+}
+
 static void
 test_pending_cleanup_synchronous_destroy(void)
 {
@@ -5057,6 +5641,33 @@ main(void)
     test_recursive_cleanup_excluded_scope(0);
     test_recursive_cleanup_excluded_scope(1);
     test_recursive_cleanup_excluded_scope(2);
+    test_observer_retry(false, false, false, false);
+    test_observer_retry(true, false, false, false);
+    test_observer_retry(false, true, false, false);
+    test_observer_retry(true, true, false, false);
+    test_observer_retry(false, false, true, false);
+    test_observer_retry(false, false, false, true);
+    test_observer_retry(false, false, 2, false);
+    test_observer_retry(false, false, 2, true);
+    test_observer_logical_identity(0);
+    test_observer_logical_identity(1);
+    test_observer_logical_identity(2);
+    test_observer_compound_removal();
+    test_observer_callback_binding(0, false);
+    test_observer_callback_binding(1, false);
+    test_observer_callback_binding(2, false);
+    test_observer_callback_binding(0, true);
+    test_observer_callback_binding(1, true);
+    test_observer_callback_binding(2, true);
+    test_observer_completion_retry(0, false);
+    test_observer_completion_retry(0, true);
+    test_observer_completion_retry(2, false);
+#ifdef WL_TEST_ALLOC_WRAP
+    test_observer_completion_retry(1, false);
+    test_observer_capture_failure(0);
+    test_observer_capture_failure(1);
+    test_observer_capture_failure(2);
+#endif
     test_pending_cleanup_operation_guards(0, false);
     test_pending_cleanup_operation_guards(1, false);
     test_pending_cleanup_operation_guards(2, false);

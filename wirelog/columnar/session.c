@@ -490,6 +490,8 @@ wl_columnar_session_cleanup_ready(wl_col_session_t *sess)
 {
     if (!sess)
         return EINVAL;
+    if (sess->delta_publish_active)
+        return EBUSY;
     /* Active-only nesting is valid. Retry must never consume an active frame;
      * active plus pending cleanup is rejected by the cleanup primitive. */
     int rc = sess->cleanup_pending
@@ -1547,6 +1549,8 @@ col_session_mem_sample(wl_col_session_t *sess)
     uint64_t temporary = sess->cleanup_reserved_bytes;
     temporary = sess->delta_rollback_reserved_bytes > UINT64_MAX - temporary
         ? UINT64_MAX : temporary + sess->delta_rollback_reserved_bytes;
+    temporary = sess->delta_observer_reserved_bytes > UINT64_MAX - temporary
+        ? UINT64_MAX : temporary + sess->delta_observer_reserved_bytes;
     const delta_pool_t *dp = sess->delta_pool;
     if (dp && dp->slab) {
         for (uint32_t sidx = 0; sidx < dp->slot_used; sidx++) {
@@ -2334,6 +2338,8 @@ col_session_destroy(wl_session_t *session)
         : wl_columnar_eval_stack_cleanup_retry(sess);
     if (cleanup_rc == 0)
         cleanup_rc = wl_columnar_eval_delta_rollback_discard(sess);
+    if (cleanup_rc == 0)
+        cleanup_rc = wl_columnar_eval_delta_observer_discard(sess);
     if (cleanup_rc != 0) {
         fputs("wirelog: evaluator cleanup failed during session destroy\n",
             stderr);
@@ -2527,6 +2533,10 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->cleanup_reserved_bytes = 0;
     out_worker->delta_rollback = NULL;
     out_worker->delta_rollback_reserved_bytes = 0;
+    out_worker->delta_observer = NULL;
+    out_worker->delta_observer_reserved_bytes = 0;
+    out_worker->delta_publish_active = false;
+    out_worker->delta_publish_cancelled = false;
     out_worker->arr_entries = NULL;
     out_worker->arr_count = 0;
     out_worker->arr_cap = 0;
@@ -2723,6 +2733,8 @@ col_worker_session_destroy(wl_col_session_t *worker)
     int cleanup_rc = wl_columnar_eval_stack_cleanup_retry(worker);
     if (cleanup_rc == 0)
         cleanup_rc = wl_columnar_eval_delta_rollback_discard(worker);
+    if (cleanup_rc == 0)
+        cleanup_rc = wl_columnar_eval_delta_observer_discard(worker);
     if (cleanup_rc != 0)
         return cleanup_rc;
     worker->teardown_started = true;
@@ -2874,9 +2886,11 @@ col_session_insert(wl_session_t *session, const char *relation,
 {
     if (!session || !relation || !data)
         return EINVAL;
-
     if (num_rows == 0)
         return 0;
+    if (COL_SESSION(session)->delta_observer
+        || COL_SESSION(session)->delta_publish_active)
+        return EBUSY;
 
     /* Issue #662: When a delta callback is installed, EDB inserts must take
      * the incremental path so arrangement caches are invalidated and the
@@ -2977,6 +2991,8 @@ col_session_make_compound(wl_session_t *session, const char *functor,
     wl_col_session_t *sess = COL_SESSION(session);
     if (!sess || !sess->compound_arena)
         return EINVAL;
+    if (sess->delta_observer || sess->delta_publish_active)
+        return EBUSY;
     if (sess->compound_arena->frozen)
         return EBUSY;
     if (sess->compound_arena->current_epoch >= sess->compound_arena->max_epochs)
@@ -3056,9 +3072,11 @@ col_session_insert_incremental(wl_session_t *session, const char *relation,
 {
     if (!session || !relation || !data)
         return EINVAL;
-
     if (num_rows == 0)
-        return 0; /* true no-op */
+        return 0;
+    if (COL_SESSION(session)->delta_observer
+        || COL_SESSION(session)->delta_publish_active)
+        return EBUSY;
 
     int cleanup_rc = wl_columnar_session_cleanup_ready_quiescent(
         COL_SESSION(session));
@@ -3107,6 +3125,11 @@ col_session_remove(wl_session_t *session, const char *relation,
 {
     if (!session || !relation || !data)
         return EINVAL;
+    if (num_rows == 0)
+        return 0;
+    if (COL_SESSION(session)->delta_observer
+        || COL_SESSION(session)->delta_publish_active)
+        return EBUSY;
 
     wl_col_session_t *sess = COL_SESSION(session);
     if (sess->delta_cb != NULL)
@@ -3203,6 +3226,11 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
 {
     if (!session || !relation || !data)
         return EINVAL;
+    if (num_rows == 0)
+        return 0;
+    if (COL_SESSION(session)->delta_observer
+        || COL_SESSION(session)->delta_publish_active)
+        return EBUSY;
 
     wl_col_session_t *sess = COL_SESSION(session);
 
@@ -3356,6 +3384,10 @@ static int
 col_session_step(wl_session_t *session)
 {
     wl_col_session_t *sess = COL_SESSION(session);
+    if (sess->delta_publish_active || sess->cleanup_active
+        || wl_columnar_eval_delta_rollback_active(sess)
+        || wl_columnar_eval_delta_observer_active(sess))
+        return EBUSY;
     int cleanup_rc = wl_columnar_session_cleanup_ready_quiescent(sess);
     if (cleanup_rc != 0)
         return cleanup_rc;
@@ -3365,19 +3397,12 @@ col_session_step(wl_session_t *session)
     const wl_plan_t *plan = sess->plan;
     sess->extension_expr_status = 0;
 
-    if (sess->delta_cb && !sess->pending_input_change
+    if (!sess->delta_observer && sess->delta_cb && !sess->pending_input_change
         && sess->last_inserted_relation == NULL
         && sess->last_removed_relation == NULL){
         col_session_reclaim_quiescent(sess);
         return 0;
     }
-
-    /* EBUSY from compaction is reported after evaluation has staged the delta
-     * events but before publication or pending-state cleanup.  Resume at the
-     * compaction boundary so retry neither repeats evaluation nor drops the
-     * staged observer transaction. */
-    if (sess->delta_cb && sess->delta_event_transaction)
-        goto compact_staged_deltas;
 
     /* Compute affected strata bitmask (Phase 4 incremental skip).
      * A step may carry both an insertion and a removal, and the two
@@ -3401,6 +3426,17 @@ col_session_step(wl_session_t *session)
                 session, sess->last_removed_relation);
         }
     }
+
+    if (sess->delta_observer) {
+        affected_mask = wl_columnar_eval_delta_observer_mask(sess);
+    } else if (sess->delta_cb) {
+        int rc = wl_columnar_eval_delta_observer_begin(sess, affected_mask);
+        if (rc != 0)
+            return rc;
+    }
+    wl_columnar_eval_delta_observer_set_active(sess, true);
+    if (wl_columnar_eval_delta_observer_evaluated(sess))
+        goto compact_staged_deltas;
 
     /* Issue #158: Pre-seed retraction deltas.  If last_removed_relation is
      * set (removal via col_session_remove_incremental), check if $r$<name>
@@ -3455,27 +3491,26 @@ col_session_step(wl_session_t *session)
         }
     }
 
-    if (sess->delta_cb) {
-        wl_columnar_delta_events_clear(sess);
-        sess->delta_event_transaction = true;
-    }
+    wl_columnar_delta_events_clear(sess);
+    sess->delta_event_transaction = false;
     for (uint32_t si = 0; si < plan->stratum_count; si++) {
         /* Skip strata not affected by the last incremental insertion */
         if (!col_affected_mask_contains(affected_mask, si))
             continue;
 
         const wl_plan_stratum_t *sp = &plan->strata[si];
-        int rc = sess->delta_cb ? col_stratum_step_with_delta(sp, sess, si)
-                                : col_eval_stratum_tdd(sp, sess, si);
+        int rc = sess->delta_observer
+            ? col_stratum_step_with_delta(sp, sess, si)
+            : col_eval_stratum_tdd(sp, sess, si);
         if (rc != 0) {
-            if (sess->delta_cb) {
-                sess->delta_event_transaction = false;
-                wl_columnar_delta_events_clear(sess);
-            }
+            sess->delta_event_transaction = false;
+            wl_columnar_delta_events_clear(sess);
+            wl_columnar_eval_delta_observer_set_active(sess, false);
             col_session_reclaim_quiescent(sess);
             return rc;
         }
     }
+    wl_columnar_eval_delta_observer_set_evaluated(sess);
 compact_staged_deltas:
     /* Compaction is a source mutation.  Perform it before clearing the
      * pending operation state or removing temporary retraction relations so
@@ -3483,21 +3518,18 @@ compact_staged_deltas:
      * publishing duplicate delta events. */
     int compact_rc = col_rel_compact_many(sess->rels, sess->nrels);
     if (compact_rc != 0) {
-        /* Only EBUSY leaves a completed evaluation safe to resume.  Other
-         * compaction failures retain their error behavior and discard staged
-         * observer state just as evaluation failures do. */
-        if (sess->delta_cb && compact_rc != EBUSY) {
-            sess->delta_event_transaction = false;
-            wl_columnar_delta_events_clear(sess);
-        }
+        wl_columnar_eval_delta_observer_set_active(sess, false);
         col_session_reclaim_quiescent(sess);
         return compact_rc;
     }
 
-    if (sess->delta_cb) {
-        sess->delta_event_transaction = false;
-        wl_columnar_delta_events_publish(sess);
-        wl_columnar_delta_events_clear(sess);
+    if (sess->delta_observer) {
+        int prepare_rc = wl_columnar_eval_delta_observer_prepare(sess);
+        if (prepare_rc != 0) {
+            wl_columnar_eval_delta_observer_set_active(sess, false);
+            return prepare_rc;
+        }
+        wl_columnar_eval_delta_observer_publish(sess);
     }
 
     /* Issue #158: Cleanup retraction state and delta relations after step */
@@ -3526,6 +3558,11 @@ compact_staged_deltas:
             r->base_nrows = r->nrows;
     }
     sess->snapshot_stable_valid = true;
+    if (sess->delta_observer) {
+        int finish_rc = wl_columnar_eval_delta_observer_finish(sess);
+        if (finish_rc != 0)
+            return finish_rc;
+    }
     col_session_reclaim_quiescent(sess);
     return 0;
 }
@@ -3552,6 +3589,11 @@ col_session_set_delta_cb(wl_session_t *session, wirelog_on_delta_fn callback,
     wl_col_session_t *sess = COL_SESSION(session);
     sess->delta_cb = callback;
     sess->delta_data = user_data;
+    if (!callback) {
+        if (sess->delta_publish_active)
+            sess->delta_publish_cancelled = true;
+        wl_columnar_eval_delta_observer_cancel(sess);
+    }
 }
 
 static void
@@ -3803,6 +3845,8 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
         return EINVAL;
 
     wl_col_session_t *sess = COL_SESSION(session);
+    if (sess->delta_observer || sess->delta_publish_active)
+        return EBUSY;
     int cleanup_rc = wl_columnar_session_cleanup_ready_quiescent(sess);
     if (cleanup_rc != 0)
         return cleanup_rc;
