@@ -880,7 +880,7 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         || !cache_backed || !ncols || !lftj_offsets || !binary_offsets) {
         free(inputs);
         free(sorted_probes);
-        free(relations);
+        free((void *)relations);
         free(source_readers);
         free(cache_backed);
         free(ncols);
@@ -1056,7 +1056,7 @@ cleanup_arrays:
     }
     free(inputs);
     free(sorted_probes);
-    free(relations);
+    free((void *)relations);
     free(source_readers);
     free(cache_backed);
     free(ncols);
