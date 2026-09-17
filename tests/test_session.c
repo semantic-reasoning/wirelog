@@ -3211,6 +3211,101 @@ test_session_tc_insert(void)
 /* Main                                                                     */
 /* ======================================================================== */
 
+static void
+test_snapshot_error_preserves_delta_reader(void)
+{
+    TEST("snapshot: error cleanup preserves reader-busy delta owners");
+    wl_plan_op_t op = { .op = WL_PLAN_OP_VARIABLE,
+                        .relation_name = "missing" };
+    wl_plan_relation_t relation = { .name = "output", .ops = &op,
+                                    .op_count = 1 };
+    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess = NULL;
+    col_rel_t *held = NULL;
+    col_rel_t *unregistered = NULL;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    bool reader_active = false;
+    tuple_collector_t tuples = { 0 };
+    const char *failure = NULL;
+    int64_t value = 42;
+#define SNAP_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    SNAP_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1, &session)
+        == 0, "create");
+    sess = COL_SESSION(session);
+    SNAP_CHECK(wl_session_insert(session, "input", &value, 1, 1) == 0,
+        "insert input");
+    const char *names[] = { "$d$free", "$d$held", "survivor" };
+    for (uint32_t i = 0; i < 3; i++) {
+        unregistered = col_rel_new_auto(names[i], 1);
+        SNAP_CHECK(unregistered
+            && col_rel_append_row(unregistered, &value) == 0, "delta fixture");
+        SNAP_CHECK(session_add_rel(sess, unregistered) == 0, "registration");
+        if (i == 1)
+            held = unregistered;
+        unregistered = NULL;
+    }
+    SNAP_CHECK(session_rel_build_hash(sess) == 0 && sess->rel_hash_head,
+        "lookup hash fixture");
+    SNAP_CHECK(col_rel_source_reader_acquire(held, &reader) == 0, "reader");
+    reader_active = true;
+    uint64_t view = held->view_generation;
+    uint64_t storage = held->storage_generation;
+    int64_t **columns = held->columns;
+    int failed_rc = wl_session_snapshot(session, collect_tuple, &tuples);
+    SNAP_CHECK(session_find_rel(sess, "$d$held") == held
+        && !session_find_rel(sess, "$d$free")
+        && session_find_rel(sess, "survivor") != NULL
+        && session_find_rel(sess, "input") != NULL && tuples.count == 0,
+        "ownership or compacted lookup lost");
+    SNAP_CHECK(failed_rc == EBUSY, "cleanup refusal must take precedence");
+    uint32_t nrels = sess->nrels;
+    uint64_t reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(sess->memory_governor));
+    SNAP_CHECK(session_rel_build_hash(sess) == 0, "rebuild lookup hash");
+    SNAP_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == EBUSY,
+        "repeated refusal");
+    SNAP_CHECK(session_find_rel(sess, "$d$held") == held
+        && held->columns == columns && held->nrows == 1
+        && held->columns[0][0] == value && held->view_generation == view
+        && held->storage_generation == storage && sess->nrels == nrels
+        && tuples.count == 0
+        && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            sess->memory_governor)) == reserved,
+        "refusal changed retained state");
+    SNAP_CHECK(col_rel_source_reader_release(&reader) == 0, "reader release");
+    reader_active = false;
+    held = NULL; /* The session owns the relation until cleanup consumes it. */
+    SNAP_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == ENOENT,
+        "original evaluation error after cleanup");
+    SNAP_CHECK(!session_find_rel(sess, "$d$held") && tuples.count == 0,
+        "delta not removed after release");
+    op.relation_name = "input";
+    SNAP_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0,
+        "valid plan retry");
+    SNAP_CHECK(tuples.count == 1 && strcmp(tuples.relations[0], "output") == 0
+        && tuples.ncols[0] == 1 && tuples.rows[0][0] == value,
+        "retry differs from exact oracle");
+cleanup:
+    if (reader_active)
+        (void)col_rel_source_reader_release(&reader);
+    /* The red baseline drops the registry owner; clean that fixture too. */
+    if (held && session_find_rel(sess, "$d$held") != held)
+        col_rel_destroy(held);
+    col_rel_destroy(unregistered);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef SNAP_CHECK
+}
+
 int
 main(void)
 {
@@ -3248,6 +3343,7 @@ main(void)
     test_session_destroy_orders_worker_retirement();
 #endif
     test_session_full_idb_clear_reader_exclusion();
+    test_snapshot_error_preserves_delta_reader();
     /* GREEN: col_session_remove returns 0 for uninitialized schema */
     /* test_session_snapshot_empty(); */
     /* test_session_snapshot_after_insert(); */

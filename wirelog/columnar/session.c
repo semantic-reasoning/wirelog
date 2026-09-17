@@ -4102,15 +4102,16 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
         }
 
         if (rc != 0) {
-            /* Issue #177: Cleanup pre-seeded $d$ deltas on error.
-             * If evaluation fails, remove temporary delta relations created
-             * during delta-seeded incremental eval. Benign to leave them
-             * (replaced on next snapshot), but cleaner to remove. */
+            /* A reader may still depend on a delta after evaluation fails.
+             * Checked removal keeps that exact registry owner on refusal;
+             * continue reclaiming other deltas without losing the busy one. */
+            int cleanup_rc = 0;
             for (uint32_t i = 0; i < sess->nrels; i++) {
                 col_rel_t *r = sess->rels[i];
                 if (r && strncmp(r->name, "$d$", 3) == 0) {
-                    col_rel_destroy(r);
-                    sess->rels[i] = NULL;
+                    int remove_rc = session_remove_rel(sess, r->name);
+                    if (cleanup_rc == 0)
+                        cleanup_rc = remove_rc;
                 }
             }
             /* Compact rels[] to close holes */
@@ -4120,9 +4121,10 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
                     sess->rels[out++] = sess->rels[in];
             }
             sess->nrels = out;
+            session_rel_free_hash(sess);
             sess->tdd_decision_tracking_active = false;
             col_session_reclaim_quiescent(sess);
-            return rc;
+            return cleanup_rc != 0 ? cleanup_rc : rc;
         }
         if (sess->eval_arena)
             wl_arena_reset(sess->eval_arena);
