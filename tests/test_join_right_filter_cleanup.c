@@ -362,12 +362,61 @@ test_success_path_uses_owned_filter(void)
     return 0;
 }
 
+static int
+test_probe_error_releases_filter(void)
+{
+    TEST("join: probe overflow releases filter and permits retry");
+    wl_col_session_t *sess = make_mock_session();
+    if (!sess || register_right(sess) != 0) {
+        FAIL("fixture");
+        if (sess)
+            destroy_mock_session(sess);
+        return 1;
+    }
+    uint32_t before = sess->delta_pool->slot_used;
+    sess->join_output_limit = 1;
+    col_rel_t *out = NULL;
+    int rc = run_op(sess, wl_columnar_join_op, WL_PLAN_OP_JOIN, false, &out);
+    int ok = rc == EOVERFLOW && out == NULL;
+    if (out)
+        col_rel_destroy(out);
+    if (!filter_slot_released(sess, before, 2, "probe overflow"))
+        ok = 0;
+
+    sess->join_output_limit = 0;
+    before = sess->delta_pool->slot_used;
+    rc = run_op(sess, wl_columnar_join_op, WL_PLAN_OP_JOIN, false, &out);
+    if (rc != 0 || !out || out->nrows != 4 || out->ncols != 4) {
+        ok = 0;
+    } else {
+        for (uint32_t k = 0; k < 4; k++) {
+            if (out->columns[0][k] != (int64_t)k
+                || out->columns[1][k] != 10 + (int64_t)k
+                || out->columns[2][k] != (int64_t)k
+                || out->columns[3][k] != 200 + (int64_t)k)
+                ok = 0;
+        }
+    }
+    if (out)
+        col_rel_destroy(out);
+    if (!filter_slot_released(sess, before, 2, "probe retry"))
+        ok = 0;
+    destroy_mock_session(sess);
+    if (!ok) {
+        FAIL("probe error retained filter or retry differed from oracle");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
 int
 main(void)
 {
     printf("Join right-filter cleanup tests (Issue #1505)\n");
 
     test_success_path_uses_owned_filter();
+    test_probe_error_releases_filter();
     test_backpressure_exit("join: backpressure exit releases the filter",
         wl_columnar_join_op, WL_PLAN_OP_JOIN);
     test_backpressure_exit("join(diff): backpressure exit releases the filter",
