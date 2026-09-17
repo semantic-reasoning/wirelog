@@ -407,15 +407,33 @@ the relocation paths preserve identity and transfer ownership explicitly.
 | `arrangement.c:filt_arr_entry_relocate` | `src->arr.reservation.state` | `atomic_load_explicit` | `acquire` | Validate the filtered source token before relocation |
 | `arrangement.c:filt_arr_entry_relocate#2` | `dst->arr.reservation.state` | `atomic_load_explicit` | `acquire` | Revalidate the moved filtered token before owner transfer |
 
-### 5.10 `wirelog/arena/compound_arena.c` — mutation gate (5 rows)
+### 5.10 `wirelog/arena/compound_arena.c` — mutation gate and GC holds (7 rows)
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `compound_arena.c:compound_gate_load` | `arena->access_gate` | `atomic_load_explicit` | `acquire` | Observe the writer/readers gate before acquiring a read lease or validating mutation teardown |
-| `compound_arena.c:compound_gate_store` | `arena->access_gate` | `atomic_store_explicit` | `release` | Initialize the gate before publication; on portable builds this helper is also the release-side gate store |
+| `compound_arena.c:compound_gate_load` | `arena->access_gate`, `arena->gc_hold_count` | `atomic_load_explicit` | `acquire` | Observe the access gate or lifetime count; collectors pair acquire loads with hold release |
+| `compound_arena.c:compound_gate_store` | `arena->access_gate`, `arena->gc_hold_count` | `atomic_store_explicit` | `release` | Initialize the gate and hold count before publication; on portable builds this helper is also the release-side gate store |
 | `compound_arena.c:wl_compound_arena_borrow` | `arena->access_gate` | `atomic_compare_exchange_weak_explicit` | `acquire`/`relaxed` | Admit one reader only while no writer owns the gate |
 | `compound_arena.c:wl_compound_arena_borrow_release` | `arena->access_gate` | `atomic_compare_exchange_weak_explicit` | `release`/`relaxed` | Remove exactly one reader lease without reopening a writer-owned gate |
 | `compound_arena.c:wl_compound_arena_mutation_begin` | `arena->access_gate` | `atomic_compare_exchange_weak_explicit` | `acquire`/`relaxed` | Claim exclusive mutation ownership after all reader leases have drained |
+| `compound_arena.c:wl_arena_compound_arena_gc_hold_acquire` | `arena->gc_hold_count` | `atomic_compare_exchange_weak_explicit` | `acquire`/`relaxed` | Publish a bounded lifetime contribution while a temporary reader prevents collection or destruction |
+| `compound_arena.c:wl_arena_compound_arena_gc_hold_release` | `arena->gc_hold_count` | `atomic_compare_exchange_weak_explicit` | `release`/`relaxed` | Publish completion before removing the lifetime contribution; no arena access follows success |
+
+GC holds preserve handle IDs without changing multiplicities or retaining raw
+payload pointers. Acquisition requires an independently live arena and publishes
+its count before releasing a temporary reader gate. Collection and destruction
+hold the writer gate and refuse while an acquire-load sees a positive count.
+Ordinary allocation and multiplicity updates remain permitted. A payload pointer
+still needs an ordinary borrow to prevent relocation.
+
+Each stable, noncopyable token contributes one count until release. Release clears
+the token before its atomic decrement; its own contribution keeps the arena alive
+through retries. After a successful decrement it never accesses the arena, so a
+collector may immediately observe zero and retire storage. Release needs no gate
+and succeeds during ordinary mutation; it does not run deferred GC. Concurrent
+use of the same token and first acquisition against an otherwise unowned arena
+being freed are unsupported. Checked GC reports EBUSY without changing output on
+hold, freeze, or gate refusal; legacy GC retains its unchanged-epoch skip result.
 
 On MSVC the helper load/store use interlocked intrinsics because the shared
 `wl_atomic_u64` compatibility type cannot use C11 atomic operations directly.
@@ -441,7 +459,7 @@ measured by `bench/bench_intern.c`; baselines are in `docs/INTERN_PERF.md`
 
 ### 5.12 Existing inventory total
 
-21 + 4 + 5 + 19 + 1 + 1 + 1 + 37 + 5 + 5 + 3 = **102 atomic call sites**
+21 + 4 + 5 + 19 + 1 + 1 + 1 + 37 + 5 + 7 + 3 = **104 atomic call sites**
 before the source-access contract below.
 
 ### 5.13 `wirelog/columnar/source_access.h` — relation source gate (11 rows)
@@ -506,7 +524,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote` | `src->retained_reservation.state` | `atomic_load_explicit` | acquire | Admit relocation only when the pool slot's address-bound reservation is empty |
 | `session.c:session_pool_rel_promote#2` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
-102 + 11 + 16 = **129 atomic call sites**.
+104 + 11 + 16 = **131 atomic call sites**.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -576,7 +594,7 @@ the replacement transaction never releases an uncommitted token.
 | `relation.c:col_rel_compact_many` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Validate each retained reservation before compacting a relation |
 | `relation.c:col_rel_compact_many#2` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Revalidate the reservation before the second compaction path |
 
-The complete source audit now contains **151 atomic call sites**.
+The complete source audit now contains **153 atomic call sites**.
 
 ---
 

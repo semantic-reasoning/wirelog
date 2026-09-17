@@ -17,6 +17,7 @@
 #include "wirelog/util/log.h"
 
 #include <inttypes.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -337,6 +338,7 @@ compound_arena_create_impl(uint32_t session_seed, uint32_t default_gen_cap,
     arena->frozen = false;
     arena->live_handles = 0;
     compound_gate_store(&arena->access_gate, 0);
+    compound_gate_store(&arena->gc_hold_count, 0);
     arena->test_failpoint = WL_COMPOUND_FAIL_NONE;
     arena->admission_context = admission_context;
     arena->admission_release = admission_release;
@@ -465,6 +467,63 @@ wl_compound_arena_test_fail_next(wl_compound_arena_t *arena,
         arena->test_failpoint = (uint32_t)failpoint;
 }
 
+int
+wl_arena_compound_arena_gc_hold_acquire(wl_compound_arena_t *arena,
+    wl_arena_compound_arena_gc_hold_t *hold)
+{
+    wl_compound_arena_borrow_t borrow = { 0 };
+    uint64_t observed;
+
+    if (!arena || !hold || hold->arena || hold->identity != 0)
+        return EINVAL;
+    if (!wl_compound_arena_borrow(arena, &borrow))
+        return EBUSY;
+    observed = compound_gate_load(&arena->gc_hold_count);
+    for (;;) {
+        if (observed == UINT64_MAX) {
+            (void)wl_compound_arena_borrow_release(&borrow);
+            return EOVERFLOW;
+        }
+        if (atomic_compare_exchange_weak_explicit(&arena->gc_hold_count,
+            &observed, observed + 1u, memory_order_acquire,
+            memory_order_relaxed))
+            break;
+    }
+    hold->arena = arena;
+    hold->identity = (uintptr_t)hold;
+    (void)wl_compound_arena_borrow_release(&borrow);
+    return 0;
+}
+
+int
+wl_arena_compound_arena_gc_hold_release(wl_arena_compound_arena_gc_hold_t *hold)
+{
+    wl_compound_arena_t *arena;
+    uint64_t observed;
+
+    if (!hold || !hold->arena || hold->identity != (uintptr_t)hold)
+        return EINVAL;
+    arena = hold->arena;
+    observed = compound_gate_load(&arena->gc_hold_count);
+    if (observed == 0)
+        return EINVAL;
+    hold->arena = NULL;
+    hold->identity = 0;
+    for (;;) {
+        /* A valid token contributes one count, keeping arena alive through
+         * retries. After publishing its removal, never access arena again. */
+        if (atomic_compare_exchange_weak_explicit(&arena->gc_hold_count,
+            &observed, observed - 1u, memory_order_release,
+            memory_order_relaxed))
+            return 0;
+        if (observed == 0) {
+            hold->arena = arena;
+            hold->identity = (uintptr_t)hold;
+            return EINVAL;
+        }
+    }
+}
+
 bool
 wl_compound_arena_free_checked(wl_compound_arena_t *arena)
 {
@@ -474,6 +533,10 @@ wl_compound_arena_free_checked(wl_compound_arena_t *arena)
         return true;
     if (!wl_compound_arena_mutation_begin(arena, &mutation))
         return false;
+    if (compound_gate_load(&arena->gc_hold_count) != 0) {
+        (void)wl_compound_arena_mutation_end(&mutation);
+        return false;
+    }
     if (arena->gens) {
         for (uint32_t e = 0; e < arena->max_epochs; e++)
             gen_release_admission(arena, &arena->gens[e]);
@@ -780,7 +843,29 @@ wl_compound_arena_gc_epoch_boundary(wl_compound_arena_t *arena)
 
     if (!wl_compound_arena_mutation_begin(arena, &mutation))
         return arena ? arena->current_epoch : (uint32_t)-1;
-    result = wl_compound_arena_gc_epoch_boundary_mutating(arena);
+    if (compound_gate_load(&arena->gc_hold_count) != 0)
+        result = arena->current_epoch;
+    else
+        result = wl_compound_arena_gc_epoch_boundary_mutating(arena);
     (void)wl_compound_arena_mutation_end(&mutation);
     return result;
+}
+
+int
+wl_arena_compound_arena_gc_epoch_boundary_checked(wl_compound_arena_t *arena,
+    uint32_t *reclaimed)
+{
+    wl_compound_arena_mutation_t mutation = { 0 };
+
+    if (!arena || !reclaimed)
+        return EINVAL;
+    if (!wl_compound_arena_mutation_begin(arena, &mutation))
+        return EBUSY;
+    if (compound_gate_load(&arena->gc_hold_count) != 0 || arena->frozen) {
+        (void)wl_compound_arena_mutation_end(&mutation);
+        return EBUSY;
+    }
+    *reclaimed = wl_compound_arena_gc_epoch_boundary_mutating(arena);
+    (void)wl_compound_arena_mutation_end(&mutation);
+    return 0;
 }

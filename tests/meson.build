@@ -5589,3 +5589,13 @@ test('bench_intern_smoke', test_bench_intern_smoke_exe,
   args: [bench_intern_exe.full_path()],
   depends: [bench_intern_exe],
 )
+
+# GC-only ownership of compound handle IDs during retained cleanup.
+test_compound_gc_hold_exe = executable(
+  'test_compound_gc_hold',
+  files('test_compound_gc_hold.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('compound_gc_hold', test_compound_gc_hold_exe, timeout: 60)
