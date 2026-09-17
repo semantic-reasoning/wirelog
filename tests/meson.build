@@ -3819,12 +3819,24 @@ test_diff_join_exe = executable(
 test('diff_join', test_diff_join_exe)
 
 # Issue #1446: bounded keyed-join sub-batches over persistent arrangements.
+# This target needs an arrangement-probe fault seam.  Recompile only the
+# arrangement TU with the test define; keeping the rest of testlib_prod shared
+# prevents the hook from entering production test-library or installed ABI.
+test_join_batch_resume_arrangement = static_library(
+  'test_join_batch_resume_arrangement',
+  files('../wirelog/columnar/arrangement.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_COLUMNAR_ARRANGEMENT_PROBE_TEST_HOOKS=1'],
+)
+
 test_join_batch_resume_exe = executable(
   'test_join_batch_resume',
   files('test_join_batch_resume.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
-  link_with: [testlib_prod],
+  c_args: ['-DWL_COLUMNAR_ARRANGEMENT_PROBE_TEST_HOOKS=1'],
+  link_with: [test_join_batch_resume_arrangement, testlib_prod],
 )
 
 test('join_batch_resume', test_join_batch_resume_exe)
