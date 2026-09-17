@@ -192,7 +192,7 @@ void (*wl_columnar_eval_serial_test_after_plan)(wl_col_session_t *sess,
     eval_stack_t *stack, eval_entry_t *result);
 #endif
 
-static int
+int
 wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
     wl_col_session_t *sess, bool recursive)
 {

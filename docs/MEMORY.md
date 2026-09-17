@@ -251,7 +251,7 @@ sessions retain the same governor reference and release it during every
 normal or partial teardown path. The fixed eval arenas now use
 `wl_arena_create_managed()`: their complete backing capacity is admitted before
 `malloc`, retained across reset, and released exactly once at destruction.
-Direct recursive TDD subpasses retire final CONCAT segment boundaries after
+Outbound recursive TDD subpasses retire final CONCAT segment boundaries after
 validating the popped relation entry and before lower-stack cleanup. These arrays
 describe intra-plan merging and have no publication-time consumer; relation source
 readers protect descriptor/storage, not the consumed entry metadata. This
@@ -702,7 +702,8 @@ spill access or downstream pipelines are already bounded (#1369, #1372,
 
 Every `col_eval_stratum` caller, including worker sessions, coordinator fallback,
 recursive snapshot and delta steps, admits a persistent cleanup frame before
-executing each relation plan. The frame owns its stack,
+executing each relation plan. Ordinary direct recursive TDD subpasses use the
+same framed relation helper; outbound subpasses remain separate. The frame owns its stack,
 popped result and segment metadata until publication or checked disposal.
 Refusal preserves allocators, caches and registry owners until session readiness
 can drain the frame; snapshot errors return before delta cleanup in this state.
@@ -752,7 +753,7 @@ and cache-pin release/reclamation. Worker lists are inspected only after the
 dispatch barrier; checked teardown retains refused workers for readiness retry.
 Callback-free public steps exercise nonrecursive TDD dispatch and error-time
 cache reclamation. Snapshot selection currently excludes nonrecursive TDD; its
-post-evaluation cohort guard prepares for further worker frame adoption.
+post-evaluation cohort guard also protects ordinary recursive TDD frames.
 Public compound construction also checks quiescent cleanup readiness before
 creating a side relation or allocating a handle, preserving pending input state
 when coordinator or worker cleanup refuses.
@@ -770,9 +771,12 @@ Empty registrations preserve later-round outbound AUTO semantics. Preparation
 failure changes no registration; publication is atomic per registration, so a
 successful prefix remains owned while a refused owner and its lease stay intact.
 Exchange aborts on refusal and releases only newly produced queue/matrix deltas.
-This boundary does not activate direct recursive TDD evaluator cleanup frames.
+Ordinary recursive TDD workers check local cleanup readiness before changing
+iteration state or worker flags. Their retained frames keep prior-round delta
+dependencies alive; no fresh queue delta is produced until every rule finishes.
+A refused frame therefore stops exchange and retains the cohort for public retry.
 
-Cleanup refusal remains an integration gap for direct TDD recursive subpasses
+Cleanup refusal remains an integration gap for outbound TDD recursive subpasses
 and specialized parallel rule evaluation: #1647 covers lost popped results,
 #1648 covers K-Fusion refusal handling, and #1661 covers retention of whole
 refused evaluator stacks and their allocators across unwind. In particular,

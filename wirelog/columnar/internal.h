@@ -3209,6 +3209,10 @@ retraction_rel_name(const char *rel, char *buf, size_t sz);
 bool
 has_empty_forced_delta(const wl_plan_relation_t *rp, wl_col_session_t *sess,
     uint32_t iteration);
+/* Ordinary serial and TDD rules share admitted persistent ownership. */
+int
+wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
+    wl_col_session_t *sess, bool recursive);
 int
 col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t stratum_idx);
