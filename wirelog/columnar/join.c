@@ -1578,14 +1578,15 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             col_rel_destroy(out);
             free(lk);
             free(rk);
-            if (right_filtered)
-                col_rel_destroy(right_filtered);
-            if (left_e.owned)
-                col_rel_destroy(left);
+            /* Release source readers before destroying their owned inputs. */
             if (arr_bundle.active)
                 release_rc = col_arrangement_probe_bundle_release(
                     &arr_bundle);
             col_arrangement_pin_release(&arr_pin);
+            if (right_filtered)
+                col_rel_destroy(right_filtered);
+            if (left_e.owned)
+                col_rel_destroy(left);
             if (release_rc != 0)
                 return release_rc;
             return join_rc;
