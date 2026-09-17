@@ -1906,9 +1906,9 @@ typedef struct wl_col_session_t {
     wl_columnar_session_source_lease_t *source_leases;
     col_rel_t *deferred_relations;
     uint32_t deferred_relation_count;
-    /* Persistent cleanup for W=1 coordinator nonrecursive evaluation and
-     * recursive snapshot/direct evaluation outside delta rollback. Worker,
-     * recursive delta-step and W>1 caller adoption remains under #1661. */
+    /* Persistent cleanup for all W=1 coordinator evaluation, including
+     * recursive delta steps. Worker and W>1 caller adoption remains under
+     * #1661. */
     wl_columnar_eval_stack_cleanup_frame_t *cleanup_active;
     wl_columnar_eval_stack_cleanup_frame_t *cleanup_pending;
     uint32_t cleanup_active_count;
@@ -2115,8 +2115,8 @@ wl_columnar_eval_delta_observer_discard(wl_col_session_t *sess);
 
 /* Allocate/admit before evaluating. Pending cleanup blocks begin. ENOSPC
  * denotes governor denial, ENOMEM allocation failure, ENOBUFS the frame cap.
- * Session access must be serialized. W=1 coordinator evaluation uses this
- * boundary except for recursive delta-step evaluation. */
+ * Session access must be serialized. All W=1 coordinator evaluation uses
+ * this boundary, including recursive delta steps. */
 int
 wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
     wl_columnar_eval_stack_cleanup_frame_t **out);

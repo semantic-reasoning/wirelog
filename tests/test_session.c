@@ -3815,12 +3815,33 @@ inject_serial_cleanup_reader(wl_col_session_t *sess, eval_stack_t *stack,
         serial_cleanup_held, &serial_cleanup_reader);
 }
 
+static int
+serial_cleanup_run(wl_session_t *session, tuple_collector_t *tuples,
+    delta_collector_t *deltas, bool delta_step)
+{
+    if (!delta_step)
+        return wl_session_snapshot(session, collect_tuple, tuples);
+    int rc = wl_session_step(session);
+    if (rc != 0)
+        return rc;
+    for (int i = 0; i < deltas->count; i++) {
+        if (deltas->diffs[i] != 1)
+            return EINVAL;
+        collect_tuple(deltas->relations[i], deltas->rows[i], deltas->ncols[i],
+            tuples);
+    }
+    return 0;
+}
+
 static void
 test_serial_cleanup_caller(unsigned storage, bool lower, bool existing,
     unsigned recursive_mode)
 {
     TEST(lower ? "serial caller: lower owner refusal retains production frame"
         : "serial caller: CONCAT result refusal retains production frame");
+    bool delta_step = recursive_mode >= 5;
+    if (delta_step)
+        recursive_mode -= 4;
     wl_plan_op_t ops[] = {
         { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
         { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
@@ -3855,6 +3876,7 @@ test_serial_cleanup_caller(unsigned storage, bool lower, bool existing,
     delta_pool_t *saved_pool = NULL;
     const char *failure = NULL;
     tuple_collector_t tuples = { 0 };
+    delta_collector_t deltas = { 0 };
     int64_t value = 42;
     uint64_t target_generation = 0;
 #define SERIAL_CHECK(condition, message) \
@@ -3870,6 +3892,8 @@ test_serial_cleanup_caller(unsigned storage, bool lower, bool existing,
         &session) == 0
         && wl_session_insert(session, "input", &value, 1, 1) == 0, "fixture");
     sess = COL_SESSION(session);
+    if (delta_step)
+        wl_session_set_delta_cb(session, collect_delta, &deltas);
     if (existing) {
         col_rel_t *target = col_rel_new_auto("output", 1);
         SERIAL_CHECK(target, "existing target allocation");
@@ -3886,7 +3910,7 @@ test_serial_cleanup_caller(unsigned storage, bool lower, bool existing,
     serial_cleanup_storage = storage;
     serial_cleanup_lower = lower;
     wl_columnar_eval_serial_test_after_plan = inject_serial_cleanup_reader;
-    int rc = wl_session_snapshot(session, collect_tuple, &tuples);
+    int rc = serial_cleanup_run(session, &tuples, &deltas, delta_step);
     if (saved_pool) {
         sess->delta_pool = saved_pool;
         saved_pool = NULL;
@@ -3914,7 +3938,7 @@ test_serial_cleanup_caller(unsigned storage, bool lower, bool existing,
     SERIAL_CHECK(strcmp(name, lower ? "lower" : "$concat") == 0,
         "rename modified reader-held relation");
     for (unsigned retry = 0; retry < 2; retry++) {
-        SERIAL_CHECK(wl_session_snapshot(session, collect_tuple, &tuples)
+        SERIAL_CHECK(serial_cleanup_run(session, &tuples, &deltas, delta_step)
             == EBUSY, "pending caller did not refuse");
         SERIAL_CHECK(serial_cleanup_held->name == name
             && serial_cleanup_held->columns == columns
@@ -3923,7 +3947,7 @@ test_serial_cleanup_caller(unsigned storage, bool lower, bool existing,
             && sess->delta_pool->slot_used == slots
             && sess->eval_arena->used == used && sess->nrels == nrels
             && sess->cleanup_reserved_bytes == bytes && bytes != 0
-            && tuples.count == 0
+            && tuples.count == 0 && deltas.count == 0
             && (recursive_mode != 2 || (session_find_rel(sess, "$d$output")
             == serial_cleanup_delta && col_rel_get(serial_cleanup_delta, 0,
             0) == value))
@@ -3940,7 +3964,7 @@ test_serial_cleanup_caller(unsigned storage, bool lower, bool existing,
                 &serial_cleanup_delta_reader) == 0,
             "delta reader release");
     serial_cleanup_delta = NULL;
-    SERIAL_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0
+    SERIAL_CHECK(serial_cleanup_run(session, &tuples, &deltas, delta_step) == 0
         && tuples.count ==
         (recursive_mode == 4 ? 0 : recursive_mode ==
         3 ? 2 : recursive_mode ? 1 : 2)
@@ -3954,6 +3978,11 @@ test_serial_cleanup_caller(unsigned storage, bool lower, bool existing,
             : strcmp(tuples.relations[0], "output") == 0))
         && !sess->cleanup_pending && sess->cleanup_reserved_bytes == 0,
         "same-session exact retry");
+    if (delta_step) {
+        deltas.count = 0;
+        SERIAL_CHECK(wl_session_step(session) == 0 && deltas.count == 0,
+            "completed delta step duplicated notifications");
+    }
 cleanup:
     wl_columnar_eval_serial_test_after_plan = NULL;
     if (serial_cleanup_reader.owner)
@@ -4224,6 +4253,68 @@ cleanup:
 #undef META_CHECK
 }
 
+static void
+test_recursive_delta_operator_error(void)
+{
+    TEST(
+        "recursive delta: operator error releases CONCAT metadata before retry");
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_CONCAT },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "missing" }
+    };
+    wl_plan_relation_t output = { .name = "output", .delta_name = "$d$output",
+                                  .ops = ops, .op_count = 3 };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1,
+                                  .is_recursive = true };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    delta_collector_t deltas = { 0 };
+    const char *failure = NULL;
+    int64_t one = 1, two = 2;
+#define ERROR_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    ERROR_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "create");
+    wl_col_session_t *sess = COL_SESSION(session);
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    ERROR_CHECK(wl_session_insert(session, "input", &one, 1, 1) == 0
+        && wl_session_step(session) == 0 && deltas.count == 1, "baseline");
+    deltas.count = 0;
+    ERROR_CHECK(wl_session_insert(session, "input", &two, 1, 1) == 0,
+        "new input");
+    output.op_count = 4;
+    uint64_t retained = 0;
+    for (unsigned retry = 0; retry < 3; retry++) {
+        ERROR_CHECK(wl_session_step(session) == ENOENT && deltas.count == 0
+            && sess->delta_observer && !sess->cleanup_pending
+            && !sess->cleanup_active && sess->cleanup_reserved_bytes == 0,
+            "operator error lost observer or leaked frame");
+        uint64_t now = wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(sess->memory_governor));
+        ERROR_CHECK(retry == 0 || now == retained, "retry accounting growth");
+        retained = now;
+    }
+    output.op_count = 3;
+    ERROR_CHECK(wl_session_step(session) == 0 && deltas.count == 1
+        && has_delta(&deltas, "output", &two, 1, +1)
+        && session_find_rel(sess, "output")->nrows == 2,
+        "exact successful retry");
+    deltas.count = 0;
+    ERROR_CHECK(wl_session_step(session) == 0 && deltas.count == 0,
+        "duplicate notification");
+cleanup:
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef ERROR_CHECK
+}
+
 static unsigned serial_scope_hook_calls;
 static void
 count_serial_scope_hook(wl_col_session_t *sess, eval_stack_t *stack,
@@ -4238,7 +4329,7 @@ count_serial_scope_hook(wl_col_session_t *sess, eval_stack_t *stack,
 static void
 test_recursive_cleanup_excluded_scope(unsigned mode)
 {
-    TEST("recursive frame scope excludes delta-step, workers and W>1");
+    TEST("recursive frame scope includes delta-step, excludes workers and W>1");
     wl_plan_op_t op = { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" };
     wl_plan_relation_t relation = { .name = "output", .delta_name = "$d$output",
                                     .ops = &op, .op_count = 1 };
@@ -4285,7 +4376,8 @@ test_recursive_cleanup_excluded_scope(unsigned mode)
         rc = col_eval_stratum(&stratum, owner, 0);
     }
     wl_columnar_eval_serial_test_after_plan = NULL;
-    SCOPE_CHECK(rc == 0 && serial_scope_hook_calls == 0
+    SCOPE_CHECK(rc == 0 && (mode == 0 ? serial_scope_hook_calls > 0
+        : serial_scope_hook_calls == 0)
         && !owner->cleanup_active && !owner->cleanup_pending,
         "excluded path activated frames");
     col_rel_t *output = session_find_rel(owner, "output");
@@ -4317,9 +4409,10 @@ static void
 observer_hold_second_result(wl_col_session_t *sess, eval_stack_t *stack,
     eval_entry_t *result)
 {
-    (void)sess;
     (void)stack;
-    if (++observer_seen_plans != 2)
+    /* A recursive stratum may execute several plans before the next stratum.
+     * Stop at the next first-pass rule, not A's second subpass. */
+    if (++observer_seen_plans < 2 || sess->current_iteration != 0)
         return;
     wl_columnar_eval_serial_test_after_plan = NULL;
     if (result->owned && result->rel)
@@ -4338,16 +4431,13 @@ test_observer_retry(bool separate_strata, bool recursive, unsigned cancel,
         { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
         { .op = WL_PLAN_OP_CONCAT }
     };
-    /* Recursive observer retry uses borrowed results; legacy recursive CONCAT
-     * segment cleanup is tracked separately in #1686. Nonrecursive cases below
-     * retain the real owned-CONCAT reader-refusal boundary. */
     wl_plan_op_t b_ops[3];
     memcpy(b_ops, a_ops, sizeof(b_ops));
     wl_plan_relation_t relations[] = {
         { .name = "A", .delta_name = "$d$A", .ops = a_ops,
-          .op_count = recursive ? 2 : 3 },
+          .op_count = 3 },
         { .name = "B", .delta_name = "$d$B", .ops = b_ops,
-          .op_count = recursive ? 2 : 3 }
+          .op_count = 3 }
     };
     wl_plan_stratum_t strata[] = {
         { .relations = relations, .relation_count = separate_strata ? 1 : 2,
@@ -4381,21 +4471,28 @@ test_observer_retry(bool separate_strata, bool recursive, unsigned cancel,
     OBS_CHECK(wl_session_insert(session, "input", &add, 1, 1) == 0
         && wl_session_remove(session, "input", &remove, 1, 1) == 0,
         "mixed input changes");
-    if (recursive)
-        b_ops[1].relation_name = "missing";
-    else {
-        observer_seen_plans = 0;
-        wl_columnar_eval_serial_test_after_plan = observer_hold_second_result;
-    }
-    int expected = recursive ? ENOENT : EBUSY;
+    observer_seen_plans = 0;
+    wl_columnar_eval_serial_test_after_plan = observer_hold_second_result;
+    int expected = EBUSY;
     OBS_CHECK(wl_session_step(session) == expected && deltas.count == 0
         && sess->delta_observer &&
         !wl_columnar_eval_delta_observer_active(sess),
         "failed step lost observer baseline");
-    if (!recursive)
-        OBS_CHECK(observer_result_reader.owner &&
-            sess->cleanup_pending_count == 1,
-            "actual result refusal missing");
+    OBS_CHECK(observer_result_reader.owner && sess->cleanup_pending_count == 1,
+        "actual result refusal missing");
+    col_rel_t *prefix = session_find_rel(sess, "A");
+    col_rel_t *pending = session_find_rel(sess, "B");
+    bool prefix_added = false, prefix_removed = false, pending_added = false;
+    OBS_CHECK(prefix && pending && (!separate_strata || prefix->nrows == 3),
+        "completed prefix stratum");
+    for (uint32_t row = 0; row < prefix->nrows; row++) {
+        prefix_added |= col_rel_get(prefix, row, 0) == add;
+        prefix_removed |= col_rel_get(prefix, row, 0) == remove;
+    }
+    for (uint32_t row = 0; row < pending->nrows; row++)
+        pending_added |= col_rel_get(pending, row, 0) == add;
+    OBS_CHECK(prefix_added && !prefix_removed && !pending_added,
+        "refusal did not occur after completed prefix output");
     uint64_t observer_bytes = sess->delta_observer_reserved_bytes;
     uint32_t epoch = sess->outer_epoch, nrels = sess->nrels;
     OBS_CHECK(wl_session_insert(session, "input", &later, 1, 1) == EBUSY
@@ -5638,6 +5735,15 @@ main(void)
     test_serial_cleanup_caller(1, false, false, 2);
     test_serial_cleanup_caller(1, false, false, 3);
     test_serial_cleanup_caller(1, false, false, 4);
+    test_serial_cleanup_caller(0, false, false, 5);
+    test_serial_cleanup_caller(1, false, false, 5);
+    test_serial_cleanup_caller(0, true, false, 5);
+    test_serial_cleanup_caller(1, true, false, 5);
+    test_serial_cleanup_caller(2, true, false, 5);
+    test_serial_cleanup_caller(1, false, false, 6);
+    test_serial_cleanup_caller(1, false, false, 7);
+    test_serial_cleanup_caller(1, false, false, 8);
+    test_recursive_delta_operator_error();
     test_recursive_cleanup_excluded_scope(0);
     test_recursive_cleanup_excluded_scope(1);
     test_recursive_cleanup_excluded_scope(2);
