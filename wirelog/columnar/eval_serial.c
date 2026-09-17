@@ -447,6 +447,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     for (iter = 0; iter < MAX_ITERATIONS; iter++) {
         bool outer_any_new = false; /* any sub-pass produced new tuples  */
         int outer_rc = 0;           /* error propagated from inner loop  */
+        bool publication_failed = false;
         bool stride_all_skipped
             = true; /* true until a sub-pass actually runs */
         bool outer_continue_next
@@ -503,11 +504,15 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             for (uint32_t ri = 0; ri < nrels; ri++) {
                 if (!delta_rels[ri])
                     continue;
-                const char *dname = sp->relations[ri].delta_name;
-                session_remove_rel(sess, dname);
                 int rc = session_add_rel(sess, delta_rels[ri]);
-                if (rc != 0)
-                    col_rel_destroy(delta_rels[ri]);
+                if (rc != 0) {
+                    /* This delta is still private. Preserve its local owner
+                     * for stride_error cleanup; replacement failure leaves the
+                     * previous registered delta intact. */
+                    outer_rc = rc;
+                    publication_failed = true;
+                    goto stride_error;
+                }
                 delta_rels[ri] = NULL; /* session now owns it */
             }
 
@@ -860,7 +865,11 @@ stride_error:
             /* Issue #282: Restore diff_operators_active on error path */
             sess->diff_operators_active = saved_diff_operators_active;
             for (uint32_t ri = 0; ri < nrels; ri++) {
-                session_remove_rel(sess, sp->relations[ri].delta_name);
+                /* Publication is atomic per relation. Preserve the old owner
+                 * and any successfully published prefix even if their readers
+                 * have released before this cleanup executes. */
+                if (!publication_failed)
+                    session_remove_rel(sess, sp->relations[ri].delta_name);
                 if (delta_rels[ri])
                     col_rel_destroy(delta_rels[ri]);
             }
