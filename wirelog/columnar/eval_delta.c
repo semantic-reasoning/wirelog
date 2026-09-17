@@ -449,36 +449,55 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         return ENOMEM;
     }
 
-    /* Step 1: pointer-swap snapshot for each IDB relation (issue #300).
-     * Instead of malloc+memcpy, save the live data pointer and give the
-     * relation a NULL buffer.  col_eval_stratum will allocate a fresh
-     * buffer via append, so the old pointer stays valid for comparison. */
+    /* Capture all flat prior-state snapshots before changing any live IDB.
+     * A failed later allocation must not detach an already captured prefix. */
+    int capture_rc = 0;
     for (uint32_t ri = 0; ri < rc_cnt; ri++) {
         col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
         if (!r || r->ncols == 0)
             continue;
         prev_ncols[ri] = r->ncols;
-        if (r->nrows > 0) {
-            /* Gather into flat buffer for col_row_in_sorted */
-            uint32_t nc = r->ncols;
-            int64_t *flat = (int64_t *)malloc(
-                (size_t)r->nrows * nc * sizeof(int64_t));
-            if (flat) {
-                for (uint32_t row = 0; row < r->nrows; row++)
-                    col_rel_row_copy_out(r, row, flat + (size_t)row * nc);
-            }
-            prev_data[ri] = flat;
-            prev_nrows[ri] = flat ? r->nrows : 0;
-            /* Free and detach columns; eval will allocate fresh */
-            col_columns_free(r->columns, r->ncols);
-            r->columns = NULL;
-            r->nrows = 0;
-            r->capacity = 0;
-            r->sorted_nrows = 0;
-            wl_columnar_relation_touch_replacement(r);
-        } else {
-            prev_nrows[ri] = 0;
+        if (r->nrows == 0)
+            continue;
+        uint64_t cells = 0, bytes = 0;
+        if (!wl_columnar_memory_size_mul(r->nrows, r->ncols, &cells)
+            || !wl_columnar_memory_size_mul(cells, sizeof(int64_t), &bytes)
+            || bytes > SIZE_MAX) {
+            capture_rc = EOVERFLOW;
+            break;
         }
+        prev_data[ri] = (int64_t *)malloc((size_t)bytes);
+        if (!prev_data[ri]) {
+            capture_rc = ENOMEM;
+            break;
+        }
+        prev_nrows[ri] = r->nrows;
+        for (uint32_t row = 0; row < r->nrows; row++)
+            col_rel_row_copy_out(r, row,
+                prev_data[ri] + (size_t)row * r->ncols);
+    }
+    if (capture_rc != 0) {
+        /* No live storage has changed, so rollback restoration must not run. */
+        for (uint32_t ri = 0; ri < rc_cnt; ri++)
+            free(prev_data[ri]);
+        free((void *)prev_data);
+        free(prev_nrows);
+        free(prev_ncols);
+        return capture_rc;
+    }
+
+    /* Complete capture permits detachment. Evaluation allocates fresh columns;
+     * missing, untyped and zero-row relations keep their original behavior. */
+    for (uint32_t ri = 0; ri < rc_cnt; ri++) {
+        if (!prev_data[ri])
+            continue;
+        col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
+        col_columns_free(r->columns, r->ncols);
+        r->columns = NULL;
+        r->nrows = 0;
+        r->capacity = 0;
+        r->sorted_nrows = 0;
+        wl_columnar_relation_touch_replacement(r);
     }
 
     /* Step 2: evaluate stratum (appends new rows to IDB relations).

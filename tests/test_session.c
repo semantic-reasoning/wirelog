@@ -41,6 +41,8 @@ void *__real_calloc(size_t count, size_t size);
 void *__real_realloc(void *ptr, size_t size);
 static bool fail_next_alloc;
 static size_t fail_malloc_size;
+static unsigned fail_malloc_matches_to_skip;
+static unsigned fail_malloc_match_count;
 static size_t fail_calloc_size;
 static wl_columnar_source_access_reader_t *release_on_calloc_failure;
 static int calloc_reader_release_rc;
@@ -49,8 +51,13 @@ void *
 __wrap_malloc(size_t size)
 {
     if (fail_malloc_size != 0 && size == fail_malloc_size) {
-        fail_malloc_size = 0;
-        return NULL;
+        fail_malloc_match_count++;
+        if (fail_malloc_matches_to_skip != 0) {
+            fail_malloc_matches_to_skip--;
+        } else {
+            fail_malloc_size = 0;
+            return NULL;
+        }
     }
     if (fail_next_alloc) {
         fail_next_alloc = false;
@@ -3799,6 +3806,132 @@ test_pending_cleanup_synchronous_destroy(void)
     PASS();
 }
 
+#ifdef WL_TEST_ALLOC_WRAP
+static void
+test_delta_snapshot_capture_failure(unsigned skip)
+{
+    TEST(skip ==
+        0 ? "delta step: first snapshot allocation preserves prior state"
+        : "delta step: later snapshot allocation preserves all prior state");
+    wl_plan_op_t op = { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" };
+    wl_plan_relation_t relations[] = {
+        { .name = "a", .ops = &op, .op_count = 1 },
+        { .name = "empty" },
+        { .name = "b", .ops = &op, .op_count = 1 }
+    };
+    wl_plan_stratum_t stratum = { .relations = relations, .relation_count = 3 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess = NULL;
+    col_rel_t *unowned = NULL;
+    delta_collector_t deltas = { 0 };
+    const char *failure = NULL;
+    int64_t one = 1, two = 2;
+#define CAPTURE_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    CAPTURE_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0,
+        "create");
+    sess = COL_SESSION(session);
+    unowned = col_rel_new_auto("empty", 1);
+    CAPTURE_CHECK(unowned && session_add_rel(sess, unowned) == 0,
+        "empty sibling");
+    unowned = NULL;
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    CAPTURE_CHECK(wl_session_insert(session, "input", &one, 1, 1) == 0
+        && wl_session_step(session) == 0 && deltas.count == 2
+        && has_delta(&deltas, "a", &one, 1, +1)
+        && has_delta(&deltas, "b", &one, 1, +1), "baseline oracle");
+    deltas.count = 0;
+    CAPTURE_CHECK(wl_session_insert(session, "input", &two, 1, 1) == 0,
+        "next input");
+    struct {
+        col_rel_t *rel;
+        int64_t **columns;
+        uint32_t nrows, ncols, capacity, sorted_nrows;
+        uint64_t identity, view, storage;
+    } prior[3];
+    for (uint32_t i = 0; i < 3; i++) {
+        col_rel_t *r = session_find_rel(sess, relations[i].name);
+        CAPTURE_CHECK(r, "prior relation missing");
+        prior[i].rel = r;
+        prior[i].columns = r->columns;
+        prior[i].nrows = r->nrows;
+        prior[i].ncols = r->ncols;
+        prior[i].capacity = r->capacity;
+        prior[i].sorted_nrows = r->sorted_nrows;
+        prior[i].identity = r->relation_identity;
+        prior[i].view = r->view_generation;
+        prior[i].storage = r->storage_generation;
+    }
+    uint32_t epoch = sess->outer_epoch;
+    const char *inserted = sess->last_inserted_relation;
+    uint64_t reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(sess->memory_governor));
+    for (unsigned attempt = 0; attempt < 2; attempt++) {
+        /* Both populated IDBs have one int64 cell. The empty sibling has no
+         * flat allocation. Skipping one match proves capture of a succeeded
+         * before allocation of b was rejected. */
+        fail_malloc_size = sizeof(int64_t);
+        fail_malloc_matches_to_skip = skip;
+        fail_malloc_match_count = 0;
+        int rc = wl_session_step(session);
+        bool fault_fired = fail_malloc_size == 0
+            && fail_malloc_matches_to_skip == 0
+            && fail_malloc_match_count == skip + 1;
+        fail_malloc_size = 0;
+        fail_malloc_matches_to_skip = 0;
+        CAPTURE_CHECK(fault_fired, "intended snapshot allocation did not fail");
+        CAPTURE_CHECK(rc == ENOMEM, "snapshot allocation failure ignored");
+        for (uint32_t i = 0; i < 3; i++) {
+            col_rel_t *r = session_find_rel(sess, relations[i].name);
+            CAPTURE_CHECK(r == prior[i].rel && r->columns == prior[i].columns
+                && r->nrows == prior[i].nrows && r->ncols == prior[i].ncols
+                && r->capacity == prior[i].capacity
+                && r->sorted_nrows == prior[i].sorted_nrows
+                && r->relation_identity == prior[i].identity
+                && r->view_generation == prior[i].view
+                && r->storage_generation == prior[i].storage
+                && (i == 1 || r->columns[0][0] == one),
+                "failed capture changed prior relation");
+        }
+        CAPTURE_CHECK(deltas.count == 0 && !sess->delta_event_transaction
+            && sess->delta_event_count == 0 && sess->pending_input_change
+            && sess->last_inserted_relation == inserted &&
+            sess->outer_epoch == epoch
+            && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                sess->memory_governor)) == reserved,
+            "failed capture published or consumed pending state");
+    }
+    CAPTURE_CHECK(wl_session_step(session) == 0 && deltas.count == 2
+        && has_delta(&deltas, "a", &two, 1, +1)
+        && has_delta(&deltas, "b", &two, 1, +1), "retry delta oracle");
+    for (uint32_t i = 0; i < 3; i++) {
+        col_rel_t *r = session_find_rel(sess, relations[i].name);
+        CAPTURE_CHECK(r && (i == 1 ? r->nrows == 0
+            : r->nrows == 2 && r->columns[0][0] == one
+            && r->columns[0][1] == two), "retry relation oracle");
+    }
+    deltas.count = 0;
+    CAPTURE_CHECK(wl_session_step(session) == 0 && deltas.count == 0,
+        "unchanged step repeated callbacks");
+cleanup:
+    fail_malloc_size = 0;
+    fail_malloc_matches_to_skip = 0;
+    fail_malloc_match_count = 0;
+    col_rel_destroy(unowned);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef CAPTURE_CHECK
+}
+#endif
+
 int
 main(void)
 {
@@ -3836,6 +3969,10 @@ main(void)
     test_session_destroy_orders_worker_retirement();
 #endif
     test_session_full_idb_clear_reader_exclusion();
+#ifdef WL_TEST_ALLOC_WRAP
+    test_delta_snapshot_capture_failure(0);
+    test_delta_snapshot_capture_failure(1);
+#endif
     test_pending_cleanup_synchronous_destroy();
     test_pending_cleanup_operation_guards(0, false);
     test_pending_cleanup_operation_guards(1, false);
