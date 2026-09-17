@@ -762,6 +762,16 @@ must join, release readers and perform checked destruction; a full nonrecursive
 retry recreates workers rather than rerunning partially published worker state.
 They are not implicitly included in the coordinator's retained TDD cohort.
 
+Prior registered TDD deltas remain immutable throughout worker dispatch. After
+all workers join successfully and have no retained cleanup, the coordinator
+prepares admitted, independent empty replacements before exchange. It retires
+aliases across the cohort before roots, using checked registration replacement.
+Empty registrations preserve later-round outbound AUTO semantics. Preparation
+failure changes no registration; publication is atomic per registration, so a
+successful prefix remains owned while a refused owner and its lease stay intact.
+Exchange aborts on refusal and releases only newly produced queue/matrix deltas.
+This boundary does not activate direct recursive TDD evaluator cleanup frames.
+
 Cleanup refusal remains an integration gap for direct TDD recursive subpasses
 and specialized parallel rule evaluation: #1647 covers lost popped results,
 #1648 covers K-Fusion refusal handling, and #1661 covers retention of whole
