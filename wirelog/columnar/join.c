@@ -1015,7 +1015,10 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
      * the cache key is based on content hash, not ownership. This enables
      * cache reuse in K-fusion worker sessions, eliminating redundant joins. */
     bool projected_join = op->project_count > 0 && op->project_indices;
-    if (op->materialized && !projected_join) {
+    /* An owned filtered fallback has a fresh identity for every operation.
+    * It cannot hit again during the lease window, so bypass the
+    * materialization cache rather than occupying a slot until eviction. */
+    if (op->materialized && !projected_join && !right_filtered) {
         col_mat_cache_pin_t cache_pin = { 0 };
         col_rel_t *cached
             = col_mat_cache_lookup_pin(&sess->mat_cache, left_e.rel, right,
@@ -1319,10 +1322,12 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 }
             } else {
                 /* Issue #433: filtered right arrangement cache.
-                 * `right` is the cached filtered relation from filt_cache;
-                 * filt_arr persists across sub-passes to avoid ephemeral
-                 * hash table rebuild on every semi-naive iteration. */
-                if (!sess->coordinator) {
+                 * `right` is normally the cached filtered relation from
+                 * filt_cache; an owned fallback is deliberately ephemeral
+                 * and must not enter either cache during a lease window.
+                 * The cached path persists filt_arr across sub-passes to
+                 * avoid rebuilding an ephemeral hash table. */
+                if (!sess->coordinator && !right_filtered) {
                     int dependency_rc
                         = col_arrangement_probe_bundle_acquire_dependency(
                             &arr_bundle, right);
@@ -1616,7 +1621,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
      * computed result only after a successful insert, so retain an independent
      * copy for the evaluation stack.  This keeps cache lifetime entirely
      * inside this operation and avoids borrowed stack entries. */
-    if (op->materialized && !projected_join) {
+    /* Owned filtered fallbacks are operation-local; see the ordinary path. */
+    if (op->materialized && !projected_join && !right_filtered) {
         col_rel_t *copy = NULL;
         int copy_rc = col_rel_deep_copy(out, &copy, NULL);
         if (copy_rc != 0) {
@@ -2250,7 +2256,8 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
 
     /* Materialization cache check */
     bool projected_join = op->project_count > 0 && op->project_indices;
-    if (op->materialized && !projected_join) {
+    /* Owned filtered fallbacks are operation-local; see the ordinary path. */
+    if (op->materialized && !projected_join && !right_filtered) {
         col_mat_cache_pin_t cache_pin = { 0 };
         col_rel_t *cached
             = col_mat_cache_lookup_pin(&sess->mat_cache, left_e.rel, right,
@@ -2765,7 +2772,8 @@ join_success:
 
     /* Materialization cache: insert BEFORE destroying left, because
      * col_mat_cache_key_content dereferences left to compute content hash. */
-    if (op->materialized && !projected_join) {
+    /* Owned filtered fallbacks are operation-local; see the ordinary path. */
+    if (op->materialized && !projected_join && !right_filtered) {
         col_rel_t *copy = NULL;
         int copy_rc = col_rel_deep_copy(out, &copy, NULL);
         if (copy_rc != 0) {
