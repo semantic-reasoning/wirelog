@@ -123,6 +123,8 @@ destroy_session(wl_col_session_t *s)
     col_session_free_delta_arrangements(s);
     col_session_free_sorted_arrangements(s);
     col_session_free_filt_arrangements(s);
+    col_mat_cache_clear(&s->mat_cache);
+    session_rel_free_hash(s);
     for (uint32_t i = 0; i < s->filt_cache_count; i++) {
         free(s->filt_cache[i].rel_name);
         free(s->filt_cache[i].filter_data);
@@ -130,8 +132,6 @@ destroy_session(wl_col_session_t *s)
             col_rel_destroy(s->filt_cache[i].filtered);
     }
     free(s->filt_cache);
-    col_mat_cache_clear(&s->mat_cache);
-    session_rel_free_hash(s);
     delta_pool_destroy(s->delta_pool);
     wl_columnar_memory_governor_ref_release(s->memory_governor);
     free(s);
@@ -210,12 +210,12 @@ init_join_op(wl_plan_op_t *op, const char *const *lkeys,
     op->delta_mode = WL_DELTA_FORCE_FULL;
 }
 
-/* VAR("col1") CONST_INT(150) CMP_GT: keep the right rows whose payload is
- * above 150.  This is the same compact postfix fixture used by the owned
- * right-filter cleanup tests. */
+/* VAR("col1") CONST_INT(50) CMP_GT: keep the right rows whose payload is
+ * above 50.  This fixture retains some rows and rejects others, so filtered
+ * fallback comparisons cannot pass vacuously. */
 static uint8_t right_filter_bytes[] = {
     WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1',
-    WL_PLAN_EXPR_CONST_INT, 150, 0, 0, 0, 0, 0, 0, 0,
+    WL_PLAN_EXPR_CONST_INT, 50, 0, 0, 0, 0, 0, 0, 0,
     WL_PLAN_EXPR_CMP_GT
 };
 
@@ -233,8 +233,10 @@ run_oracle(wl_col_session_t *sess, col_rel_t *left, const wl_plan_op_t *op)
     eval_stack_push(&stack, left, false);
     rc = col_op_join(op, &stack, sess);
     sess->join_batch_bytes = saved;
-    if (rc != 0)
+    if (rc != 0) {
+        eval_stack_drain(&stack);
         return NULL;
+    }
     result = eval_stack_pop(&stack);
     return result.owned ? result.rel : NULL;
 }
@@ -292,6 +294,7 @@ typedef struct {
     wl_col_session_t *sess;
     col_rel_t *left;
     col_rel_t *right;   /* owned by the session after registration */
+    bool right_registered;
     col_rel_t *out;
     wl_plan_op_t op;
     const char *lkeys[1];
@@ -310,7 +313,9 @@ fixture_init(fixture_t *f, uint64_t budget, const int64_t *left_keys,
     f->left = make_left(left_keys, nleft);
     if (!f->sess || !f->right || !f->left)
         return false;
-    session_add_rel(f->sess, f->right);
+    if (session_add_rel(f->sess, f->right) != 0)
+        return false;
+    f->right_registered = true;
     init_join_op(&f->op, f->lkeys, f->rkeys);
     f->out = col_rel_new_auto("$join", 4);
     if (!f->out || col_join_set_output_types(f->out, f->left, f->right,
@@ -326,6 +331,8 @@ fixture_fini(fixture_t *f)
         col_rel_destroy(f->out);
     if (f->left)
         col_rel_destroy(f->left);
+    if (f->right && !f->right_registered)
+        col_rel_destroy(f->right);
     destroy_session(f->sess);
     memset(f, 0, sizeof(*f));
 }
@@ -1120,6 +1127,7 @@ test_operator_dispatch_and_eligibility(void)
     rc = col_op_join(&f.op, &stack, f.sess);
     if (rc != 0) {
         FAIL("bounded join through the operator failed");
+        eval_stack_drain(&stack);
         goto out;
     }
     result = eval_stack_pop(&stack);
@@ -1130,6 +1138,7 @@ test_operator_dispatch_and_eligibility(void)
             "bounded operator result is not a governed heap copy of the oracle");
         if (result.owned)
             col_rel_destroy(result.rel);
+        eval_stack_drain(&stack);
         goto out;
     }
     col_rel_destroy(result.rel);
@@ -1142,11 +1151,12 @@ test_operator_dispatch_and_eligibility(void)
     if (rc != 0 || f.sess->join_batch_fallback_count != 1u
         || f.sess->join_batch_last_reason != COL_JOIN_BATCH_EXCLUDED_CROSS) {
         FAIL("cross join did not fall back with its reason recorded");
-        if (rc == 0) {
+        if (rc == 0 && stack.top > 0) {
             result = eval_stack_pop(&stack);
             if (result.owned)
                 col_rel_destroy(result.rel);
         }
+        eval_stack_drain(&stack);
         goto out;
     }
     result = eval_stack_pop(&stack);
@@ -1159,13 +1169,15 @@ test_operator_dispatch_and_eligibility(void)
     rc = col_op_join(&cross, &stack, f.sess);
     if (rc != ENOTSUP) {
         FAIL("strict mode did not refuse an excluded shape");
-        if (rc == 0) {
+        if (rc == 0 && stack.top > 0) {
             result = eval_stack_pop(&stack);
             if (result.owned)
                 col_rel_destroy(result.rel);
         }
+        eval_stack_drain(&stack);
         goto out;
     }
+    eval_stack_drain(&stack);
     PASS();
 out:
     if (oracle)
@@ -1178,16 +1190,18 @@ out:
  * mode must reject before recording another fallback. */
 static bool
 run_excluded_operator_case(fixture_t *f, wl_plan_op_t *op,
-    col_join_batch_eligibility_t reason, const char *label)
+    col_join_batch_eligibility_t reason, uint32_t expected_rows,
+    const char *label)
 {
     eval_stack_t stack;
     eval_entry_t result;
-    col_rel_t *oracle = run_oracle(f->sess, f->left, op);
+    col_rel_t *oracle = NULL;
     int rc;
     bool ok = true;
 
-    if (!oracle)
-        return false;
+    /* Exercise the excluded operator before running the oracle.  In
+     * particular, the filtered-right case must not be turned into a cache-hit
+     * test by pre-populating the same filtered relation first. */
     f->sess->join_batch_bytes = 9u * 32u;
     eval_stack_init(&stack);
     eval_stack_push(&stack, f->left, false);
@@ -1195,19 +1209,24 @@ run_excluded_operator_case(fixture_t *f, wl_plan_op_t *op,
     if (rc != 0 || stack.top == 0) {
         printf("(%s: non-strict dispatch) ", label);
         ok = false;
-        goto strict;
+        eval_stack_drain(&stack);
+    } else {
+        result = eval_stack_pop(&stack);
+        oracle = run_oracle(f->sess, f->left, op);
+        if (!result.owned || !oracle || oracle->nrows != expected_rows
+            || !same_rows(oracle, result.rel)
+            || f->sess->join_batch_fallback_count != 1u
+            || f->sess->join_batch_last_reason != reason) {
+            printf("(%s: result/count/reason) ", label);
+            ok = false;
+        }
+        if (oracle)
+            col_rel_destroy(oracle);
+        if (result.owned)
+            col_rel_destroy(result.rel);
+        eval_stack_drain(&stack);
     }
-    result = eval_stack_pop(&stack);
-    if (!result.owned || !same_rows(oracle, result.rel)
-        || f->sess->join_batch_fallback_count != 1u
-        || f->sess->join_batch_last_reason != reason) {
-        printf("(%s: result/count/reason) ", label);
-        ok = false;
-    }
-    if (result.owned)
-        col_rel_destroy(result.rel);
 
-strict:
     f->sess->join_batch_strict = true;
     eval_stack_init(&stack);
     eval_stack_push(&stack, f->left, false);
@@ -1215,14 +1234,14 @@ strict:
     if (rc != ENOTSUP || f->sess->join_batch_fallback_count != 1u) {
         printf("(%s: strict ENOTSUP/count) ", label);
         ok = false;
-        if (rc == 0 && stack.top > 0) {
+        if (stack.top > 0) {
             result = eval_stack_pop(&stack);
             if (result.owned)
                 col_rel_destroy(result.rel);
         }
     }
+    eval_stack_drain(&stack);
     f->sess->join_batch_strict = false;
-    col_rel_destroy(oracle);
     return ok;
 }
 
@@ -1257,7 +1276,7 @@ test_operator_delta_and_filtered_fallbacks(void)
         init_join_op(&op, f.lkeys, f.rkeys);
         op.delta_mode = WL_DELTA_FORCE_DELTA;
         ok = ok && run_excluded_operator_case(&f, &op,
-                COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT, "delta-right");
+                COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT, 4u, "delta-right");
         fixture_fini(&f);
     }
     {
@@ -1273,7 +1292,8 @@ test_operator_delta_and_filtered_fallbacks(void)
         op.right_filter_expr.data = right_filter_bytes;
         op.right_filter_expr.size = sizeof(right_filter_bytes);
         ok = ok && run_excluded_operator_case(&f, &op,
-                COL_JOIN_BATCH_EXCLUDED_FILTERED_RIGHT, "filtered-right");
+                COL_JOIN_BATCH_EXCLUDED_FILTERED_RIGHT, 4u,
+                "filtered-right");
         fixture_fini(&f);
     }
     if (ok)
@@ -1282,17 +1302,13 @@ test_operator_delta_and_filtered_fallbacks(void)
         FAIL("operator fallback matrix");
 }
 
-/* The no-arrangement verdict is emitted after arrangement probing, while the
- * public eligibility helper covers the pre-probe ordering.  Keep this test
- * focused on that stable contract: it avoids fabricating a malformed
- * session-owned relation merely to force an unreachable probe miss. */
 static void
-test_eligibility_ordering_and_no_arrangement_reason(void)
+test_eligibility_ordering(void)
 {
     wl_col_session_t *sess = make_session(1u << 24);
     bool ok = sess != NULL;
 
-    TEST("eligibility ordering names no-arrangement fallback explicitly");
+    TEST("bounded join eligibility ordering");
     if (!ok) {
         FAIL("session");
         return;
@@ -1313,17 +1329,10 @@ test_eligibility_ordering_and_no_arrangement_reason(void)
     ok = ok && col_join_batch_eligibility(sess, 1, false, false)
         == COL_JOIN_BATCH_ELIGIBLE;
 
-    col_join_batch_record_fallback(sess,
-        COL_JOIN_BATCH_EXCLUDED_NO_ARRANGEMENT);
-    ok = ok && sess->join_batch_fallback_count == 1u
-        && sess->join_batch_last_reason
-        == COL_JOIN_BATCH_EXCLUDED_NO_ARRANGEMENT
-        && strcmp(col_join_batch_eligibility_name(
-                COL_JOIN_BATCH_EXCLUDED_NO_ARRANGEMENT), "no-arrangement") == 0;
     if (ok)
         PASS();
     else
-        FAIL("eligibility ordering or no-arrangement reason");
+        FAIL("eligibility ordering");
     destroy_session(sess);
 }
 
@@ -1980,7 +1989,7 @@ main(void)
     test_operator_dispatch_and_eligibility();
     test_operator_no_arrangement_probe_failure();
     test_operator_delta_and_filtered_fallbacks();
-    test_eligibility_ordering_and_no_arrangement_reason();
+    test_eligibility_ordering();
     test_producer_empty_right_single_lease();
     test_operator_empty_right_and_row_too_large();
     test_join_batch_eligibility_order();
