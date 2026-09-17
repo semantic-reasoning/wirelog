@@ -1497,6 +1497,30 @@ col_arrangement_probe_bundle_init(col_arrangement_probe_bundle_t *bundle)
     bundle->active = true;
 }
 
+#ifdef WL_COLUMNAR_ARRANGEMENT_PROBE_TEST_HOOKS
+static int wl_columnar_arrangement_probe_test_failure_rc;
+
+void
+wl_columnar_arrangement_probe_test_fail_next_acquire(int rc)
+{
+    wl_columnar_arrangement_probe_test_failure_rc = rc;
+}
+
+void
+wl_columnar_arrangement_probe_test_clear(void)
+{
+    wl_columnar_arrangement_probe_test_failure_rc = 0;
+}
+
+static int
+wl_columnar_arrangement_probe_test_take_failure(void)
+{
+    int rc = wl_columnar_arrangement_probe_test_failure_rc;
+    wl_columnar_arrangement_probe_test_failure_rc = 0;
+    return rc;
+}
+#endif
+
 int
 col_arrangement_probe_bundle_acquire_primary(
     col_arrangement_probe_bundle_t *bundle, wl_session_t *sess,
@@ -1512,6 +1536,11 @@ col_arrangement_probe_bundle_acquire_primary(
         || !bundle->active)
         return EINVAL;
     *out_probe = NULL;
+#ifdef WL_COLUMNAR_ARRANGEMENT_PROBE_TEST_HOOKS
+    rc = wl_columnar_arrangement_probe_test_take_failure();
+    if (rc != 0)
+        return rc;
+#endif
     if (bundle->count >= COL_ARRANGEMENT_PROBE_BUNDLE_MAX) {
         rc = col_arrangement_probe_bundle_release(bundle);
         if (rc != 0)
@@ -1629,6 +1658,11 @@ col_arrangement_probe_bundle_acquire_dependency(
     if (!bundle || bundle->identity != (uintptr_t)bundle || !bundle->active
         || !relation)
         return EINVAL;
+#ifdef WL_COLUMNAR_ARRANGEMENT_PROBE_TEST_HOOKS
+    rc = wl_columnar_arrangement_probe_test_take_failure();
+    if (rc != 0)
+        return rc;
+#endif
     rc = col_rel_storage_owner_resolve(relation, &owner);
     if (rc != 0)
         return rc;

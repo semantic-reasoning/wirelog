@@ -2208,6 +2208,12 @@ col_arrangement_probe_bundle_acquire_dependency(
     col_arrangement_probe_bundle_t *bundle, const col_rel_t *relation);
 int
 col_arrangement_probe_bundle_release(col_arrangement_probe_bundle_t *bundle);
+#ifdef WL_COLUMNAR_ARRANGEMENT_PROBE_TEST_HOOKS
+void
+wl_columnar_arrangement_probe_test_fail_next_acquire(int rc);
+void
+wl_columnar_arrangement_probe_test_clear(void);
+#endif
 int
 col_rel_alloc(col_rel_t **out, const char *name);
 int

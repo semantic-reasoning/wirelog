@@ -1131,6 +1131,112 @@ out:
     fixture_fini(&f);
 }
 
+/* (11a) A probe that reports no persistent arrangement must take the
+ * operator's ordinary fallback path, while strict mode turns the same
+ * excluded shape into ENOTSUP.  The test-only seam is one-shot so the final
+ * retry also proves that a later normal probe still succeeds. */
+static void
+test_operator_no_arrangement_probe_failure(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1, 1, 0 };
+    const col_arr_entry_t *entry;
+    eval_stack_t stack;
+    eval_entry_t result = { 0 };
+    col_rel_t *oracle = NULL;
+    uint32_t fallback_count;
+    int rc;
+
+    TEST("operator handles no-arrangement probe failure in both modes");
+    if (!fixture_init(&f, 1u << 24, keys, 4, 2, 50)) {
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    oracle = run_oracle(f.sess, f.left, &f.op);
+    entry = find_entry(f.sess, "right");
+    f.sess->join_batch_bytes = 9u * 32u;
+    if (!oracle || !entry || entry->pin_count != 0u
+        || entry->rebuild_deferred) {
+        FAIL("oracle did not establish a clean arrangement");
+        goto out;
+    }
+
+    /* Non-strict mode maps ENOENT from the probe to the explicit fallback. */
+    wl_columnar_arrangement_probe_test_fail_next_acquire(ENOENT);
+    eval_stack_init(&stack);
+    if (eval_stack_push(&stack, f.left, false) != 0) {
+        FAIL("push non-strict input");
+        goto out;
+    }
+    rc = col_op_join(&f.op, &stack, f.sess);
+    if (rc != 0 || stack.top != 1u) {
+        FAIL("non-strict probe failure did not return a result");
+        goto out;
+    }
+    result = eval_stack_pop(&stack);
+    fallback_count = f.sess->join_batch_fallback_count;
+    if (!result.owned || !same_rows(oracle, result.rel)
+        || fallback_count != 1u
+        || f.sess->join_batch_last_reason
+        != COL_JOIN_BATCH_EXCLUDED_NO_ARRANGEMENT
+        || entry->pin_count != 0u || entry->rebuild_deferred) {
+        FAIL("non-strict fallback result, reason, or lease cleanup");
+        if (result.owned)
+            col_rel_destroy(result.rel);
+        goto out;
+    }
+    col_rel_destroy(result.rel);
+
+    /* Strict mode must consume the next injected failure without leaving an
+     * output or the input on the evaluation stack. */
+    f.sess->join_batch_fallback_count = 0;
+    f.sess->join_batch_strict = true;
+    wl_columnar_arrangement_probe_test_fail_next_acquire(ENOENT);
+    eval_stack_init(&stack);
+    if (eval_stack_push(&stack, f.left, false) != 0) {
+        FAIL("push strict input");
+        goto out;
+    }
+    rc = col_op_join(&f.op, &stack, f.sess);
+    if (rc != ENOTSUP || stack.top != 0u
+        || f.sess->join_batch_fallback_count != 0u
+        || entry->pin_count != 0u || entry->rebuild_deferred) {
+        FAIL("strict probe failure leaked a result, fallback, or lease");
+        goto out;
+    }
+
+    /* The one-shot hook is consumed by the strict attempt; normal bounded
+     * dispatch must work again and must not record a fallback. */
+    f.sess->join_batch_strict = false;
+    eval_stack_init(&stack);
+    if (eval_stack_push(&stack, f.left, false) != 0) {
+        FAIL("push retry input");
+        goto out;
+    }
+    rc = col_op_join(&f.op, &stack, f.sess);
+    if (rc != 0 || stack.top != 1u) {
+        FAIL("normal retry after injected failure failed");
+        goto out;
+    }
+    result = eval_stack_pop(&stack);
+    if (!result.owned || !same_rows(oracle, result.rel)
+        || f.sess->join_batch_fallback_count != 0u
+        || entry->pin_count != 0u || entry->rebuild_deferred) {
+        FAIL("normal retry differed or left arrangement state behind");
+        if (result.owned)
+            col_rel_destroy(result.rel);
+        goto out;
+    }
+    col_rel_destroy(result.rel);
+    PASS();
+out:
+    wl_columnar_arrangement_probe_test_clear();
+    if (oracle)
+        col_rel_destroy(oracle);
+    fixture_fini(&f);
+}
+
 /* (11b) A direct producer over an empty right relation holds the single
  * lease itself (no operator pin ahead of it), runs to completion with zero
  * rows, and tears down cleanly: the producer's empty-relation support stays
@@ -1351,6 +1457,7 @@ main(void)
     test_unsupported_budget_and_pooled_output();
     test_row_cap_trips_after_a_committed_batch();
     test_operator_dispatch_and_eligibility();
+    test_operator_no_arrangement_probe_failure();
     test_producer_empty_right_single_lease();
     test_operator_empty_right_and_row_too_large();
     test_env_parse();
