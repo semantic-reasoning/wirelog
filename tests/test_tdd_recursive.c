@@ -2434,6 +2434,233 @@ cleanup:
 }
 #endif
 
+#ifdef WL_TEST_BDX_SEED
+extern int wl_columnar_eval_test_hybrid_init(const wl_plan_stratum_t *,
+    wl_col_session_t *, uint32_t);
+extern int wl_columnar_eval_test_hybrid_cleanup(wl_col_session_t *);
+extern void (*wl_columnar_eval_test_hybrid_boundary)(unsigned, uint32_t);
+
+#ifdef WL_TEST_ALLOC_WRAP
+static unsigned hybrid_failure_phase;
+static bool hybrid_failure_hit;
+static void
+hybrid_fail_later_worker(unsigned phase, uint32_t worker)
+{
+    if (phase == hybrid_failure_phase && worker == 1) {
+        hybrid_failure_hit = true;
+        allocation_calls = 0;
+        allocation_fail_at = 0;
+        wl_columnar_eval_test_hybrid_boundary = NULL;
+    }
+}
+#endif
+
+static void
+test_hybrid_empty_idb_ownership(unsigned fault)
+{
+    TEST("hybrid empty IDB: private metadata, partial failure and exact retry");
+    wl_plan_relation_t output = { .name = "output", .delta_name = "$d$output" };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1,
+                                  .is_recursive = true };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    col_rel_t *output_rel = NULL;
+    const char *failure = NULL;
+#define HYBRID_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    HYBRID_CHECK(wl_session_create(wl_backend_columnar(), &plan, 2,
+        &session) == 0, "create");
+    wl_col_session_t *sess = (wl_col_session_t *)session;
+    int64_t value = 42;
+    HYBRID_CHECK(wl_session_insert(session, "input", &value, 1, 1) == 0,
+        "insert");
+    col_rel_t *input = session_find_rel(sess, "input");
+    output_rel = col_rel_new_auto("output", 2);
+    HYBRID_CHECK(output_rel, "output allocation");
+    output_rel->column_types = malloc(2 * sizeof(*output_rel->column_types));
+    output_rel->compound_arity_map = malloc(sizeof(uint32_t));
+    HYBRID_CHECK(output_rel->column_types && output_rel->compound_arity_map,
+        "metadata allocation");
+    output_rel->column_types[0] = WIRELOG_TYPE_INT64;
+    output_rel->column_types[1] = WIRELOG_TYPE_FLOAT;
+    output_rel->compound_arity_map[0] = 2;
+    output_rel->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+    output_rel->compound_count = 1;
+    output_rel->inline_physical_offset = 0;
+    output_rel->declared_ncols = 1;
+    output_rel->has_graph_column = true;
+    output_rel->graph_col_idx = 1;
+    HYBRID_CHECK(col_rel_enable_timestamps(output_rel) == 0, "timestamps");
+    HYBRID_CHECK(session_add_rel(sess, output_rel) == 0, "register output");
+    col_rel_t *source = output_rel;
+    output_rel = NULL;
+    /* Warm coordinator infrastructure before comparing reservation totals. */
+    HYBRID_CHECK(wl_columnar_eval_test_hybrid_init(&stratum, sess, 2) == 0,
+        "warm initialization");
+    HYBRID_CHECK(wl_columnar_eval_test_hybrid_cleanup(sess) == 0,
+        "warm cleanup");
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(sess->memory_governor);
+    uint64_t baseline = wl_columnar_memory_reserved(governor);
+#ifdef WL_TEST_ALLOC_WRAP
+    if (fault > 0) {
+        hybrid_failure_phase = fault - 1;
+        hybrid_failure_hit = false;
+        wl_columnar_eval_test_hybrid_boundary = hybrid_fail_later_worker;
+        int rc = wl_columnar_eval_test_hybrid_init(&stratum, sess, 2);
+        allocation_fail_at = -1;
+        wl_columnar_eval_test_hybrid_boundary = NULL;
+        HYBRID_CHECK(rc == ENOMEM && hybrid_failure_hit
+            && sess->tdd_workers_count == 0,
+            "later worker allocation failure");
+        HYBRID_CHECK(wl_columnar_memory_reserved(governor) == baseline
+            && col_rel_storage_alias_borrow_count(source) == 0
+            && col_rel_storage_alias_borrow_count(input) == 0
+            && atomic_load(&source->source_access.state) == 0
+            && atomic_load(&input->source_access.state) == 0,
+            "failure leaked reservations or source leases");
+    }
+#else
+    (void)fault;
+#endif
+    HYBRID_CHECK(wl_columnar_eval_test_hybrid_init(&stratum, sess, 2) == 0,
+        "retry initialization");
+    HYBRID_CHECK(sess->tdd_workers_count == 2
+        && col_rel_storage_alias_borrow_count(source) == 0
+        && atomic_load(&source->source_access.state) == 0
+        && col_rel_storage_alias_borrow_count(input) == 2,
+        "IDB private ownership or EDB sharing");
+    for (uint32_t worker = 0; worker < 2; worker++) {
+        col_rel_t *r = session_find_rel(&sess->tdd_workers[worker], "output");
+        col_rel_t *root = NULL;
+        HYBRID_CHECK(r && col_rel_storage_owner_resolve(r, &root) == 0
+            && root == r && r != source && r->nrows == 0
+            && r->columns != source->columns
+            && r->memory_governor == sess->memory_governor
+            && r->dedup_slots && r->timestamps
+            && r->ncols == 2 && r->declared_ncols == 1
+            && r->column_types[0] == WIRELOG_TYPE_INT64
+            && r->column_types[1] == WIRELOG_TYPE_FLOAT
+            && strcmp(r->col_names[1], source->col_names[1]) == 0
+            && r->has_graph_column && r->graph_col_idx == 1
+            && r->compound_kind == WIRELOG_COMPOUND_KIND_INLINE
+            && r->compound_count == 1 && r->inline_physical_offset == 0
+            && r->compound_arity_map != source->compound_arity_map
+            && r->compound_arity_map[0] == 2,
+            "private worker metadata");
+    }
+    HYBRID_CHECK(wl_columnar_eval_test_hybrid_cleanup(sess) == 0
+        && wl_columnar_memory_reserved(governor) == baseline
+        && col_rel_storage_alias_borrow_count(input) == 0,
+        "retry cleanup accounting");
+cleanup:
+#ifdef WL_TEST_ALLOC_WRAP
+    allocation_fail_at = -1;
+#endif
+    wl_columnar_eval_test_hybrid_boundary = NULL;
+    col_rel_destroy(output_rel);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef HYBRID_CHECK
+}
+#endif
+
+static void
+collect_empty_idb_result(const char *relation, const int64_t *row,
+    uint32_t ncols, void *data)
+{
+    unsigned *counts = data;
+    counts[0]++;
+    if (strcmp(relation, "output") == 0 && ncols == 1 && row[0] == 42)
+        counts[1]++;
+}
+
+static void
+test_tdd_existing_empty_idb(uint32_t workers, bool held, bool public_call)
+{
+    TEST(
+        "TDD existing empty IDB: actual workers, checked refusal and exact rows");
+    uint32_t key = 0;
+    wl_plan_op_exchange_t exchange = { .num_workers = 1,
+                                       .key_col_idxs = &key,
+                                       .key_col_count = 1 };
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    wl_plan_relation_t output = { .name = "output", .delta_name = "$d$output",
+                                  .ops = ops, .op_count = 2 };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1,
+                                  .is_recursive = true };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    col_rel_t *unregistered = NULL;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    int64_t *values = NULL;
+    const char *failure = NULL;
+    const uint32_t count = 65536;
+#define EMPTY_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    EMPTY_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "create");
+    wl_col_session_t *sess = (wl_col_session_t *)session;
+    values = malloc((size_t)count * sizeof(*values));
+    EMPTY_CHECK(values, "allocate input");
+    for (uint32_t row = 0; row < count; row++)
+        values[row] = 42;
+    EMPTY_CHECK(wl_session_insert(session, "input", values, count, 1) == 0,
+        "insert");
+    unregistered = col_rel_new_auto("output", 1);
+    EMPTY_CHECK(unregistered, "allocate empty output");
+    unregistered->column_types = malloc(sizeof(*unregistered->column_types));
+    EMPTY_CHECK(unregistered->column_types, "allocate type");
+    unregistered->column_types[0] = WIRELOG_TYPE_INT64;
+    EMPTY_CHECK(session_add_rel(sess, unregistered) == 0, "register output");
+    col_rel_t *result = unregistered;
+    unregistered = NULL;
+    sess->tdd_audit.enabled = true;
+    if (held) {
+        EMPTY_CHECK(col_rel_source_reader_acquire(result, &reader) == 0,
+            "reader");
+        EMPTY_CHECK(col_eval_stratum_tdd(&stratum, sess, 0) == EBUSY
+            && result->nrows == 0 && sess->tdd_workers_count == 0,
+            "external reader did not safely refuse");
+        EMPTY_CHECK(col_rel_source_reader_release(&reader) == 0, "release");
+    }
+    unsigned counts[2] = { 0, 0 };
+    int rc = public_call
+        ? wl_session_snapshot(session, collect_empty_idb_result, counts)
+        : col_eval_stratum_tdd(&stratum, sess, 0);
+    EMPTY_CHECK(rc == 0, "TDD empty output evaluation");
+    EMPTY_CHECK((public_call
+        ? sess->tdd_executed_strata == 1 && sess->tdd_workers_cap >= workers
+        && counts[0] == 1 && counts[1] == 1
+        : sess->tdd_audit.selected_workers == workers
+        && sess->tdd_audit.submitted_tasks >= workers)
+        && sess->tdd_workers_count == 0 && result->nrows == 1
+        && col_rel_get(result, 0, 0) == 42
+        && col_rel_storage_alias_borrow_count(result) == 0,
+        "actual worker execution or exact output");
+cleanup:
+    if (reader.owner)
+        (void)col_rel_source_reader_release(&reader);
+    free(values);
+    col_rel_destroy(unregistered);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef EMPTY_CHECK
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -2444,6 +2671,19 @@ main(void)
     printf("TDD Recursive Distributed Evaluator Tests\n");
     printf("==========================================\n");
 
+#ifdef WL_TEST_BDX_SEED
+    test_hybrid_empty_idb_ownership(0);
+#ifdef WL_TEST_ALLOC_WRAP
+    test_hybrid_empty_idb_ownership(1);
+    test_hybrid_empty_idb_ownership(2);
+    test_hybrid_empty_idb_ownership(3);
+#endif
+#endif
+    test_tdd_existing_empty_idb(2, false, false);
+    test_tdd_existing_empty_idb(2, false, true);
+    test_tdd_existing_empty_idb(8, false, false);
+    test_tdd_existing_empty_idb(8, false, true);
+    test_tdd_existing_empty_idb(2, true, false);
     test_tc_w1_baseline();
     test_tc_w2_correctness();
     test_tc_w4_correctness();

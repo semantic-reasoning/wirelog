@@ -3377,6 +3377,10 @@ exchange_done:
  * coverage: IDB-EDB joins are always complete because EDB is replicated.
  * The hash-partitioned delta exchange maintains the partition invariant.
  */
+#ifdef WL_TEST_BDX_SEED
+void (*wl_columnar_eval_test_hybrid_boundary)(unsigned, uint32_t);
+#endif
+
 static int
 tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
     bool partition_edb, uint32_t W)
@@ -3533,7 +3537,36 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
             break;
         }
 
-        if (is_idb && rel->nrows > 0 && rel->ncols > 0) {
+        if (is_idb && rel->nrows == 0) {
+            /* Empty IDBs are writable worker state, not shared EDB views.
+             * Their leases would otherwise prevent coordinator publication. */
+            wl_columnar_source_access_reader_t reader = { 0 };
+            rc = col_rel_source_reader_acquire(rel, &reader);
+            if (rc != 0)
+                break;
+            for (uint32_t w = 0; w < W && rc == 0; w++) {
+#ifdef WL_TEST_BDX_SEED
+                if (wl_columnar_eval_test_hybrid_boundary)
+                    wl_columnar_eval_test_hybrid_boundary(0, w);
+#endif
+                col_rel_t *empty = wl_columnar_relation_new_like_governed(
+                    name, rel, coord->memory_governor);
+                if (!empty) {
+                    rc = ENOMEM;
+                    break;
+                }
+                empty->declared_ncols = rel->declared_ncols;
+                worker_rels[w][rels_built] = empty;
+#ifdef WL_TEST_BDX_SEED
+                if (wl_columnar_eval_test_hybrid_boundary)
+                    wl_columnar_eval_test_hybrid_boundary(2, w);
+#endif
+                rc = WL_COLUMNAR_EVAL_DEDUP_SET_INIT_FROM_REL(empty);
+            }
+            int release_rc = col_rel_source_reader_release(&reader);
+            if (rc == 0)
+                rc = release_rc;
+        } else if (is_idb && rel->nrows > 0 && rel->ncols > 0) {
             uint32_t default_key[] = { 0 };
             const uint32_t *key = (exchange_key && exchange_key_count > 0)
                 ? exchange_key : default_key;
@@ -3633,10 +3666,6 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
                         break;
                     }
                 }
-                /* Init hash-set dedup for empty IDB workers so
-                 * consolidation uses O(D) instead of O(N) merge. */
-                if (is_idb && rel->nrows == 0)
-                    WL_COLUMNAR_EVAL_DEDUP_SET_INIT_FROM_REL(view);
                 worker_rels[w][rels_built] = view;
             }
         }
@@ -3649,6 +3678,10 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
     if (rc == 0) {
         for (uint32_t w = 0; w < W; w++) {
             coord->tdd_workers_count = w + 1;
+#ifdef WL_TEST_BDX_SEED
+            if (wl_columnar_eval_test_hybrid_boundary)
+                wl_columnar_eval_test_hybrid_boundary(1, w);
+#endif
             rc = col_worker_session_create(coord, w,
                     worker_rels[w], rels_built, &coord->tdd_workers[w]);
             if (rc != 0)
@@ -3659,7 +3692,9 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
 
     if (rc != 0) {
         for (uint32_t w = created; w < W; w++) {
-            for (uint32_t p = 0; p < rels_built; p++)
+            /* Untransferred slots include the partly constructed current
+             * relation; successful transfers are explicitly NULLed. */
+            for (uint32_t p = 0; p < nrels; p++)
                 col_rel_destroy(worker_rels[w][p]);
         }
         int cleanup_rc = tdd_cleanup_workers(coord);
@@ -3675,6 +3710,21 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
 
     return rc;
 }
+
+#ifdef WL_TEST_BDX_SEED
+int
+wl_columnar_eval_test_hybrid_init(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord, uint32_t workers)
+{
+    return tdd_init_workers_hybrid(sp, coord, true, workers);
+}
+
+int
+wl_columnar_eval_test_hybrid_cleanup(wl_col_session_t *coord)
+{
+    return tdd_cleanup_workers(coord);
+}
+#endif
 
 static int
 tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
