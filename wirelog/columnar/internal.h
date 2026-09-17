@@ -3037,6 +3037,18 @@ bool
 wl_columnar_deferred_relation_eligible(const col_rel_t *rel);
 int
 wl_columnar_session_defer_relation(wl_col_session_t *sess, col_rel_t *rel);
+/* Local, serialized evaluator/worker entry. Active-only nesting is allowed;
+ * existing pending cleanup must finish before any owner/allocator mutation. */
+int
+wl_columnar_session_cleanup_ready(wl_col_session_t *sess);
+/* Backend-operation boundary only: drain coordinator work before inspecting
+ * worker frames, retry workers before the coordinator, and retain unresolved
+ * owners. Worker contexts use only local readiness, never coordinator lists.
+ * These guards do not activate evaluator frames or protect newly pending
+ * cleanup from later rollback/reset paths; caller integration remains pending. */
+int
+wl_columnar_session_cleanup_ready_quiescent(wl_col_session_t *sess);
+
 int
 wl_columnar_session_retry_deferred(wl_col_session_t *sess);
 int

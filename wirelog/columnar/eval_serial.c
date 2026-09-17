@@ -199,6 +199,10 @@ int
 col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t stratum_idx)
 {
+    int readiness_rc = wl_columnar_session_cleanup_ready(sess);
+    if (readiness_rc != 0)
+        return readiness_rc;
+
     if (!sp->is_recursive) {
         /* Issue #914: a non-recursive stratum is always the base case. The
          * recursive-stratum loop leaves sess->current_iteration > 0 and never

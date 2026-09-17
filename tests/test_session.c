@@ -3614,6 +3614,191 @@ cleanup:
 #undef PUB_CHECK
 }
 
+static void
+test_pending_cleanup_operation_guards(unsigned storage, bool in_worker)
+{
+    TEST(in_worker ? "session: retained worker cleanup gates operations"
+        : storage == 0 ? "session: retained heap cleanup gates operations"
+        : storage == 1 ? "session: retained pool cleanup gates operations"
+        : "session: retained arena cleanup gates operations");
+    wl_plan_op_t op = { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" };
+    wl_plan_relation_t relation = { .name = "output", .ops = &op,
+                                    .op_count = 1 };
+    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess = NULL, *owner = NULL;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    bool reader_active = false;
+    col_rel_t *unowned = NULL;
+    col_rel_t *held = NULL;
+    tuple_collector_t tuples = { 0 };
+    delta_collector_t deltas = { 0 };
+    const char *failure = NULL;
+    int64_t value = 42, extra = 43;
+#define GUARD_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    GUARD_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0
+        && wl_session_insert(session, "input", &value, 1, 1) == 0, "fixture");
+    sess = COL_SESSION(session);
+    owner = sess;
+    if (in_worker) {
+        GUARD_CHECK(wl_columnar_session_ensure_tdd_worker_slots(sess, 1) == 0,
+            "worker slots");
+        owner = &sess->tdd_workers[0];
+        sess->tdd_workers_count = 1;
+        GUARD_CHECK(col_worker_session_create(sess, 0, NULL, 0, owner) == 0,
+            "worker create");
+    }
+    unowned = storage == 0 ? col_rel_new_auto("held", 1)
+        : col_rel_pool_new_auto(owner->delta_pool,
+            storage == 2 ? owner->eval_arena : NULL, "held", 1);
+    GUARD_CHECK(unowned && col_rel_append_row(unowned, &value) == 0,
+        "held relation");
+    held = unowned;
+    GUARD_CHECK(col_rel_source_reader_acquire(held, &reader) == 0, "reader");
+    reader_active = true;
+    GUARD_CHECK(wl_columnar_eval_stack_cleanup_begin(owner, &frame) == 0,
+        "begin frame");
+    eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(frame);
+    result->rel = unowned;
+    result->owned = true;
+    unowned = NULL;
+    result->seg_boundaries = malloc(2 * sizeof(uint32_t));
+    GUARD_CHECK(result->seg_boundaries, "result segments");
+    result->seg_boundaries[0] = 0;
+    result->seg_boundaries[1] = 1;
+    result->seg_count = 1;
+    unowned = col_rel_new_auto("lower", 1);
+    GUARD_CHECK(unowned && eval_stack_push(
+            wl_columnar_eval_stack_cleanup_stack(frame), unowned, true) == 0,
+        "lower stack owner");
+    unowned = NULL;
+    GUARD_CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == EBUSY,
+        "retain frame");
+    uint64_t bytes = owner->cleanup_reserved_bytes;
+    uint64_t reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(sess->memory_governor));
+    uint32_t epoch = sess->outer_epoch;
+    uint32_t nrels = sess->nrels;
+    uint32_t slots = owner->delta_pool->slot_used;
+    size_t arena_used = owner->eval_arena->used;
+    int64_t **columns = held->columns;
+    uint64_t view = held->view_generation,
+        generation = held->storage_generation;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        GUARD_CHECK(wl_session_insert(session, "input", &extra, 0, 1) == 0,
+            "zero insert is no-op");
+        GUARD_CHECK(wl_session_insert(session, "input", &extra, 1, 1) == EBUSY,
+            "insert bypassed cleanup");
+        GUARD_CHECK(wl_session_remove(session, "input", &value, 1, 1) == EBUSY,
+            "remove bypassed cleanup");
+        wl_session_set_delta_cb(session, collect_delta, &deltas);
+        GUARD_CHECK(wl_session_insert(session, "input", &extra, 0, 1) == 0,
+            "zero incremental insert is no-op");
+        GUARD_CHECK(wl_session_insert(session, "input", &extra, 1, 1) == EBUSY
+            && wl_session_remove(session, "input", &value, 1, 1) == EBUSY,
+            "incremental update bypassed cleanup");
+        GUARD_CHECK(wl_session_step(session) == EBUSY, "step bypassed cleanup");
+        wl_session_set_delta_cb(session, NULL, NULL);
+        GUARD_CHECK(wl_session_snapshot(session, collect_tuple,
+            &tuples) == EBUSY,
+            "snapshot bypassed cleanup");
+        if (!in_worker) {
+            GUARD_CHECK(col_eval_stratum(&stratum, sess, 0) == EBUSY,
+                "serial direct entry bypassed cleanup");
+            GUARD_CHECK(col_stratum_step_with_delta(&stratum, sess, 0) == EBUSY,
+                "delta direct entry bypassed cleanup");
+        } else {
+            GUARD_CHECK(col_worker_session_destroy(owner) == EBUSY
+                && !owner->teardown_started, "worker teardown mutated state");
+        }
+        GUARD_CHECK(held->columns == columns && held->columns[0][0] == value
+            && held->view_generation == view &&
+            held->storage_generation == generation
+            && owner->cleanup_pending_count == 1 &&
+            owner->cleanup_reserved_bytes == bytes
+            && owner->delta_pool->slot_used == slots
+            && owner->eval_arena->used == arena_used
+            && sess->outer_epoch == epoch && sess->nrels == nrels
+            && session_find_rel(sess, "input")->nrows == 1
+            && tuples.count == 0 && deltas.count == 0
+            && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                sess->memory_governor)) == reserved,
+            "refusal changed owned state");
+    }
+    GUARD_CHECK(col_rel_source_reader_release(&reader) == 0, "release");
+    reader_active = false;
+    held = NULL;
+    GUARD_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0
+        && tuples.count == 1 && tuples.rows[0][0] == value
+        && strcmp(tuples.relations[0], "output") == 0,
+        "released cleanup retry exact oracle");
+    GUARD_CHECK(!owner->cleanup_pending && owner->cleanup_reserved_bytes == 0,
+        "cleanup accounting not released");
+cleanup:
+    if (reader_active)
+        (void)col_rel_source_reader_release(&reader);
+    if (frame)
+        (void)wl_columnar_eval_stack_cleanup_finish(&frame);
+    if (owner)
+        (void)wl_columnar_eval_stack_cleanup_retry(owner);
+    col_rel_destroy(unowned);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef GUARD_CHECK
+}
+
+static void
+test_pending_cleanup_synchronous_destroy(void)
+{
+    TEST("session: synchronous destroy retries released cleanup");
+    wl_plan_t plan = { 0 };
+    wl_session_t *session = NULL;
+    if (wl_session_create(wl_backend_columnar(), &plan, 1, &session) != 0) {
+        FAIL("create");
+        return;
+    }
+    wl_col_session_t *sess = COL_SESSION(session);
+    wl_columnar_memory_governor_ref_t *governor = sess->memory_governor;
+    wl_columnar_memory_governor_ref_retain(governor);
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    col_rel_t *held = col_rel_new_auto("destroy-held", 1);
+    wl_columnar_source_access_reader_t reader = { 0 };
+    if (!held || col_rel_source_reader_acquire(held, &reader) != 0
+        || wl_columnar_eval_stack_cleanup_begin(sess, &frame) != 0) {
+        if (reader.owner)
+            (void)col_rel_source_reader_release(&reader);
+        col_rel_destroy(held);
+        wl_session_destroy(session);
+        wl_columnar_memory_governor_ref_release(governor);
+        FAIL("frame fixture");
+        return;
+    }
+    eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(frame);
+    result->rel = held;
+    result->owned = true;
+    int finish_rc = wl_columnar_eval_stack_cleanup_finish(&frame);
+    int release_rc = col_rel_source_reader_release(&reader);
+    wl_session_destroy(session);
+    uint64_t remaining = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(governor));
+    wl_columnar_memory_governor_ref_release(governor);
+    if (finish_rc != EBUSY || release_rc != 0 || remaining != 0) {
+        FAIL("synchronous destroy abandoned cleanup ownership");
+        return;
+    }
+    PASS();
+}
+
 int
 main(void)
 {
@@ -3651,6 +3836,11 @@ main(void)
     test_session_destroy_orders_worker_retirement();
 #endif
     test_session_full_idb_clear_reader_exclusion();
+    test_pending_cleanup_synchronous_destroy();
+    test_pending_cleanup_operation_guards(0, false);
+    test_pending_cleanup_operation_guards(1, false);
+    test_pending_cleanup_operation_guards(2, false);
+    test_pending_cleanup_operation_guards(2, true);
     test_snapshot_error_preserves_delta_reader();
     test_recursive_delta_publication_failure(false);
 #ifdef WL_TEST_ALLOC_WRAP
