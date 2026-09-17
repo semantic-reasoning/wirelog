@@ -41,6 +41,9 @@ void *__real_calloc(size_t count, size_t size);
 void *__real_realloc(void *ptr, size_t size);
 static bool fail_next_alloc;
 static size_t fail_malloc_size;
+static size_t fail_calloc_size;
+static wl_columnar_source_access_reader_t *release_on_calloc_failure;
+static int calloc_reader_release_rc;
 
 void *
 __wrap_malloc(size_t size)
@@ -59,6 +62,15 @@ __wrap_malloc(size_t size)
 void *
 __wrap_calloc(size_t count, size_t size)
 {
+    if (fail_calloc_size != 0 && count == 1 && size == fail_calloc_size) {
+        fail_calloc_size = 0;
+        if (release_on_calloc_failure) {
+            calloc_reader_release_rc = col_rel_source_reader_release(
+                release_on_calloc_failure);
+            release_on_calloc_failure = NULL;
+        }
+        return NULL;
+    }
     if (fail_next_alloc) {
         fail_next_alloc = false;
         return NULL;
@@ -3445,6 +3457,163 @@ cleanup:
 #undef SEED_CHECK
 }
 
+static void
+test_recursive_delta_publication_failure(bool allocation_failure)
+{
+    TEST(allocation_failure
+        ? "recursive: delta promotion allocation failure is propagated"
+        : "recursive: delta publication preserves reader-busy owner");
+    wl_plan_op_t op = { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" };
+    wl_plan_relation_t relations[] = {
+        { .name = "prefix", .delta_name = "$d$prefix", .ops = &op,
+          .op_count = 1 },
+        { .name = "output", .delta_name = "$d$output", .ops = &op,
+          .op_count = 1 }
+    };
+    wl_plan_stratum_t stratum = { .relations = allocation_failure
+        ? &relations[1] : relations,
+                                  .relation_count = allocation_failure ? 1 : 2,
+                                  .is_recursive = true };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess = NULL;
+    col_rel_t *held = NULL;
+    col_rel_t *unregistered = NULL;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    bool reader_active = false;
+    const char *failure = NULL;
+#define PUB_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    PUB_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1, &session) == 0,
+        "create");
+    sess = COL_SESSION(session);
+    if (!allocation_failure) {
+        unregistered = col_rel_new_auto("prefix", 1);
+        PUB_CHECK(unregistered && session_add_rel(sess, unregistered) == 0,
+            "precreate prefix output");
+        unregistered = NULL;
+    }
+    unregistered = col_rel_new_auto("output", 1);
+    PUB_CHECK(unregistered && session_add_rel(sess, unregistered) == 0,
+        "precreate output");
+    unregistered = NULL;
+    int64_t marker = 99;
+    unregistered = col_rel_new_auto("$d$output", 1);
+    PUB_CHECK(unregistered && col_rel_append_row(unregistered, &marker) == 0
+        && col_rel_enable_timestamps(unregistered) == 0, "old delta fixture");
+    unregistered->timestamps[0].multiplicity = 1;
+    PUB_CHECK(session_add_rel(sess, unregistered) == 0, "register old delta");
+    held = unregistered;
+    unregistered = NULL;
+    PUB_CHECK(col_rel_source_reader_acquire(held, &reader) == 0, "reader");
+    reader_active = true;
+    uint64_t view = held->view_generation;
+    uint64_t storage = held->storage_generation;
+    int64_t **columns = held->columns;
+    col_delta_timestamp_t *timestamps = held->timestamps;
+    bool saved_diff = sess->diff_operators_active;
+    for (int attempt = 1; attempt <= 2; attempt++) {
+        int64_t input = attempt;
+        PUB_CHECK(wl_session_insert(session, "input", &input, 1, 1) == 0,
+            "insert next input");
+#ifdef WL_TEST_ALLOC_WRAP
+        /* Output and old delta descriptors already exist. The generated delta
+         * uses a pool slot; this allocation is its iteration-1 promotion. */
+        if (allocation_failure) {
+            if (!reader_active) {
+                PUB_CHECK(col_rel_source_reader_acquire(held, &reader) == 0,
+                    "reacquire before next promotion");
+                reader_active = true;
+            }
+            release_on_calloc_failure = &reader;
+            calloc_reader_release_rc = EINVAL;
+        }
+        fail_calloc_size = allocation_failure ? sizeof(col_rel_t) : 0;
+#endif
+        int rc = col_eval_stratum(&stratum, sess, 0);
+#ifdef WL_TEST_ALLOC_WRAP
+        bool fault_fired = fail_calloc_size == 0;
+        fail_calloc_size = 0;
+        if (allocation_failure && release_on_calloc_failure == NULL
+            && calloc_reader_release_rc == 0)
+            reader_active = false;
+        PUB_CHECK(fault_fired, "promotion allocation fault did not fire");
+        PUB_CHECK(!allocation_failure || (!reader_active
+            && calloc_reader_release_rc == 0),
+            "promotion reader release failed");
+#endif
+        PUB_CHECK(rc == (allocation_failure ? ENOMEM : EBUSY)
+            && sess->current_iteration == 1,
+            "publication failure not propagated");
+        PUB_CHECK(session_find_rel(sess, "$d$output") == held
+            && held->columns == columns && held->timestamps == timestamps
+            && held->nrows == 1 && held->columns[0][0] == marker
+            && held->timestamps[0].multiplicity == 1
+            && held->view_generation == view &&
+            held->storage_generation == storage
+            && sess->diff_operators_active == saved_diff,
+            "retained owner changed");
+        PUB_CHECK(!allocation_failure
+            || !wl_columnar_source_access_gate_busy(&held->source_access),
+            "old owner is still pinned after allocation failure");
+        col_rel_t *output = session_find_rel(sess, "output");
+        PUB_CHECK(output && output->nrows == (uint32_t)attempt,
+            "partial output count");
+        for (int row = 0; row < attempt; row++)
+            PUB_CHECK(output->columns[0][row] == row + 1,
+                "partial output oracle");
+        if (!allocation_failure) {
+            col_rel_t *prefix = session_find_rel(sess, "$d$prefix");
+            PUB_CHECK(prefix && prefix->nrows == 1
+                && prefix->columns[0][0] == attempt,
+                "successfully published prefix lost");
+        }
+        /* The failed delta follows any prefix slot. Resetting the pool does
+        * not free its heap payload; destruction must clear that payload. */
+        col_rel_t *retired = (col_rel_t *)(sess->delta_pool->slab
+            + (allocation_failure ? 0 : sess->delta_pool->slot_size));
+        PUB_CHECK(retired->name == NULL && retired->columns == NULL
+            && retired->timestamps == NULL, "unpublished delta payload leaked");
+    }
+    if (reader_active) {
+        PUB_CHECK(col_rel_source_reader_release(&reader) == 0, "release");
+        reader_active = false;
+    }
+    held = NULL;
+    int64_t input = 3;
+    PUB_CHECK(wl_session_insert(session, "input", &input, 1, 1) == 0
+        && col_eval_stratum(&stratum, sess, 0) == 0, "retry evaluation");
+    col_rel_t *output = session_find_rel(sess, "output");
+    PUB_CHECK(output && output->nrows == 3
+        && output->columns[0][0] == 1 && output->columns[0][1] == 2
+        && output->columns[0][2] == 3 && !session_find_rel(sess, "$d$output")
+        && sess->diff_operators_active == saved_diff, "retry exact oracle");
+    if (!allocation_failure) {
+        col_rel_t *prefix = session_find_rel(sess, "prefix");
+        PUB_CHECK(prefix && prefix->nrows == 3 && prefix->columns[0][0] == 1
+            && prefix->columns[0][1] == 2 && prefix->columns[0][2] == 3
+            && !session_find_rel(sess, "$d$prefix"),
+            "prefix retry exact oracle");
+    }
+cleanup:
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_calloc_size = 0;
+    release_on_calloc_failure = NULL;
+#endif
+    if (reader_active)
+        (void)col_rel_source_reader_release(&reader);
+    col_rel_destroy(unregistered);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef PUB_CHECK
+}
+
 int
 main(void)
 {
@@ -3483,6 +3652,10 @@ main(void)
 #endif
     test_session_full_idb_clear_reader_exclusion();
     test_snapshot_error_preserves_delta_reader();
+    test_recursive_delta_publication_failure(false);
+#ifdef WL_TEST_ALLOC_WRAP
+    test_recursive_delta_publication_failure(true);
+#endif
     test_snapshot_preseed_failure(0);
 #ifdef WL_TEST_ALLOC_WRAP
     test_snapshot_preseed_failure(1);
