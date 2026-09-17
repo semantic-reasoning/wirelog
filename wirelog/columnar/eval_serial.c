@@ -352,6 +352,10 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                     primary_rc = cleanup_rc;
                 return primary_rc;
             }
+            /* The final relation no longer needs intra-plan CONCAT metadata. */
+            free(result.seg_boundaries);
+            result.seg_boundaries = NULL;
+            result.seg_count = 0;
             int drain_rc = eval_stack_drain_to_session(&stack, sess);
             if (drain_rc != 0)
                 return drain_rc; /* retain the refused entry on the stack */
@@ -742,6 +746,10 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                         outer_rc = cleanup_rc;
                     goto stride_error;
                 }
+                /* Segment boundaries are consumed once plan evaluation ends. */
+                free(result.seg_boundaries);
+                result.seg_boundaries = NULL;
+                result.seg_count = 0;
                 {
                     int drain_rc = eval_stack_drain_to_session(&stack, sess);
                     if (drain_rc != 0) {

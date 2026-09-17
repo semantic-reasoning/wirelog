@@ -1367,6 +1367,11 @@ tdd_worker_subpass_fn(void *arg)
             sess->diff_operators_active = saved_diff;
             TDD_WORKER_RETURN();
         }
+        /* Publication consumes the relation only; CONCAT boundaries have
+         * completed their intra-plan lifetime before any lower-stack drain. */
+        free(result.seg_boundaries);
+        result.seg_boundaries = NULL;
+        result.seg_count = 0;
         {
             int drain_rc = eval_stack_drain_to_session(&stack, sess);
             if (drain_rc != 0) {
