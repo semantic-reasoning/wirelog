@@ -3818,6 +3818,15 @@ test_diff_join_exe = executable(
 
 test('diff_join', test_diff_join_exe)
 
+test_eval_cleanup_exe = executable(
+  'test_eval_cleanup',
+  files('test_eval_cleanup.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('eval_cleanup', test_eval_cleanup_exe, suite: 'unit')
+
 # Issue #1446: bounded keyed-join sub-batches over persistent arrangements.
 # This target needs an arrangement-probe fault seam.  Recompile only the
 # arrangement TU with the test define; keeping the rest of testlib_prod shared
