@@ -4609,6 +4609,262 @@ cleanup:
 #undef REPLAY_CHECK
 }
 
+extern void (*wl_columnar_eval_serial_test_before_aggregate)(
+    wl_col_session_t *, col_rel_t *);
+
+static void
+test_aggregate_publication_guard(unsigned mode, bool maximum)
+{
+    TEST("aggregate publication: refuse dependencies and preserve provenance");
+    wl_plan_relation_t output = {
+        .name = "output",
+        .recursive_agg = { .has_spec = true,
+                           .fn = maximum ? WIRELOG_AGG_MAX : WIRELOG_AGG_MIN,
+                           .operand_type = WL_PLAN_AGG_OPERAND_SCALAR,
+                           .group_by_count = 1, .aggregate_index = 1 }
+    };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1,
+                                  .is_recursive = true };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1 };
+    wl_session_t *session = NULL;
+    col_rel_t *unowned = NULL, *alias = NULL, *root = NULL;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    const char *failure = NULL;
+#define AGG_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    AGG_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "aggregate session");
+    wl_col_session_t *sess = COL_SESSION(session);
+    unowned = col_rel_new_auto("output", 2);
+    AGG_CHECK(unowned && col_rel_enable_timestamps(unowned) == 0,
+        "aggregate relation");
+    int64_t rows[][2] = { { 42, 30 }, { 42, 10 }, { 43, 20 } };
+    for (unsigned i = 0; i < 3; i++) {
+        AGG_CHECK(col_rel_append_row(unowned, rows[i]) == 0, "aggregate rows");
+        unowned->timestamps[i].iteration = 10 + i;
+        unowned->timestamps[i].multiplicity = (int32_t)i + 1;
+    }
+    AGG_CHECK(session_add_rel(sess, unowned) == 0, "aggregate register");
+    root = unowned;
+    unowned = NULL;
+    uint32_t key = 0;
+    AGG_CHECK(col_session_get_arrangement(session, "output", &key, 1),
+        "aggregate arrangement");
+    col_arr_entry_t arrangement = sess->arr_entries[0];
+    uint64_t view = root->view_generation, storage = root->storage_generation;
+    col_delta_timestamp_t timestamps[3];
+    memcpy(timestamps, root->timestamps, sizeof(timestamps));
+    int64_t **columns = root->columns;
+    if (mode >= 1 && mode <= 3) {
+        alias = col_rel_new_like("alias", root);
+        AGG_CHECK(alias && col_rel_install_shared_view(alias, root) == 0,
+            "aggregate shared alias");
+    }
+    if (mode <= 1)
+        AGG_CHECK(col_rel_source_reader_acquire(mode ? alias : root,
+            &reader) == 0, "aggregate reader");
+    if (mode == 3) {
+        AGG_CHECK(session_add_rel(sess, alias) == 0, "alias destination");
+        alias = NULL;
+        output.name = "alias";
+    }
+    for (unsigned attempt = 0; attempt < 2; attempt++) {
+#ifdef WL_TEST_ALLOC_WRAP
+        if (mode == 4)
+            fail_next_alloc = true;
+#endif
+        if (mode == 5)
+            output.recursive_agg.group_by_count = 2;
+        int rc = wl_columnar_eval_serial_canonicalize_aggregates(&stratum,
+                sess);
+        AGG_CHECK(rc == (mode == 4 ? ENOMEM : mode == 5 ? EINVAL : EBUSY),
+            "aggregate refusal code");
+        AGG_CHECK(root->nrows == 3 && root->columns == columns
+            && root->view_generation == view &&
+            root->storage_generation == storage
+            && memcmp(timestamps, root->timestamps, sizeof(timestamps)) == 0
+            && memcmp(&arrangement, &sess->arr_entries[0],
+            sizeof(arrangement)) == 0,
+            "refusal mutated relation or arrangement");
+        for (unsigned row = 0; row < 3; row++)
+            AGG_CHECK(root->columns[0][row] == rows[row][0]
+                && root->columns[1][row] == rows[row][1],
+                "refusal changed rows");
+        if (mode >= 4) {
+            wl_columnar_source_access_writer_t writer = { 0 };
+            AGG_CHECK(col_rel_source_writer_acquire(root, &writer) == 0
+                && wl_columnar_source_access_writer_release(&writer) == 0,
+                "failed aggregate retained writer");
+        }
+    }
+    if (reader.owner)
+        AGG_CHECK(col_rel_source_reader_release(&reader) == 0,
+            "release reader");
+    if (mode == 3) {
+        AGG_CHECK(session_remove_rel(sess, "alias") == 0, "retire alias");
+        output.name = "output";
+    }
+    col_rel_destroy(alias); alias = NULL;
+    output.recursive_agg.group_by_count = 1;
+    AGG_CHECK(wl_columnar_eval_serial_canonicalize_aggregates(&stratum,
+        sess) == 0
+        && root->nrows == 2 && root->columns[0][0] == 42
+        && root->columns[1][0] == (maximum ? 30 : 10)
+        && root->timestamps[0].iteration == (maximum ? 10u : 11u)
+        && root->timestamps[0].multiplicity == (maximum ? 1 : 2)
+        && root->columns[0][1] == 43 && root->columns[1][1] == 20
+        && root->timestamps[1].iteration == 12,
+        "exact aggregate/provenance retry");
+    view = root->view_generation;
+    AGG_CHECK(wl_columnar_eval_serial_canonicalize_aggregates(&stratum,
+        sess) == 0
+        && root->nrows == 2 && root->view_generation == view,
+        "aggregate retry not idempotent");
+cleanup:
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = false;
+#endif
+    if (reader.owner)
+        (void)col_rel_source_reader_release(&reader);
+    col_rel_destroy(alias);
+    col_rel_destroy(unowned);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef AGG_CHECK
+}
+
+static wl_columnar_source_access_reader_t aggregate_public_reader;
+static col_rel_t *aggregate_public_target;
+static int aggregate_public_hook_rc;
+static _Atomic uint32_t aggregate_public_workers;
+extern void (*wl_columnar_eval_test_outbound_after_plan)(wl_col_session_t *,
+    eval_stack_t *, eval_entry_t *);
+
+static void
+observe_aggregate_worker(wl_col_session_t *worker, eval_stack_t *stack,
+    eval_entry_t *result)
+{
+    (void)stack;
+    (void)result;
+    if (worker->coordinator)
+        atomic_fetch_or(&aggregate_public_workers, 1u << worker->worker_id);
+}
+
+static void
+hold_aggregate_publication(wl_col_session_t *sess, col_rel_t *rel)
+{
+    if (sess->coordinator || aggregate_public_target || !rel || rel->nrows < 2)
+        return;
+    aggregate_public_target = rel;
+    aggregate_public_hook_rc = col_rel_source_reader_acquire(rel,
+            &aggregate_public_reader);
+}
+
+static void
+test_aggregate_public_retry(uint32_t workers)
+{
+    TEST("public aggregate: final publication refusal and exact retry");
+    uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
+    uint32_t key = 0;
+    wl_plan_op_exchange_t exchange = { .num_workers = 1,
+                                       .key_col_idxs = &key,
+                                       .key_col_count = 1 };
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    wl_plan_relation_t output = {
+        .name = "output", .delta_name = "$d$output", .ops = ops, .op_count = 3,
+        .recursive_agg = { .has_spec = true, .fn = WIRELOG_AGG_MIN,
+                           .operand_type = WL_PLAN_AGG_OPERAND_SCALAR,
+                           .group_by_count = 1, .aggregate_index = 1 }
+    };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1,
+                                  .is_recursive = true };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    int64_t *values = NULL;
+    const char *failure = NULL;
+    tuple_collector_t tuples = { 0 };
+    memset(&aggregate_public_reader, 0, sizeof(aggregate_public_reader));
+    aggregate_public_target = NULL;
+    aggregate_public_hook_rc = EINVAL;
+#define PUBLIC_AGG_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    PUBLIC_AGG_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "public aggregate session");
+    wl_col_session_t *sess = COL_SESSION(session);
+    values = malloc(65536 * 2 * sizeof(*values));
+    PUBLIC_AGG_CHECK(values, "public aggregate input");
+    for (unsigned i = 0; i < 65536; i++) {
+        values[2 * i] = 42;
+        values[2 * i + 1] = i % 2 ? 10 : 30;
+    }
+    PUBLIC_AGG_CHECK(wl_session_insert(session, "input", values, 65536, 2) == 0,
+        "public aggregate insert");
+    atomic_store(&aggregate_public_workers, 0);
+    wl_columnar_eval_test_outbound_after_plan = observe_aggregate_worker;
+    wl_columnar_eval_serial_test_before_aggregate = hold_aggregate_publication;
+    int rc = wl_session_snapshot(session, collect_tuple, &tuples);
+    wl_columnar_eval_serial_test_before_aggregate = NULL;
+    wl_columnar_eval_test_outbound_after_plan = NULL;
+    PUBLIC_AGG_CHECK(rc == EBUSY && aggregate_public_hook_rc == 0
+        && aggregate_public_target && aggregate_public_target->nrows == 2
+        && tuples.count == 0, "public final aggregate refusal");
+    if (workers > 1)
+        PUBLIC_AGG_CHECK(sess->tdd_executed_strata == 1
+            && atomic_load(&aggregate_public_workers) == (1u << workers) - 1u,
+            "actual aggregate workers");
+    uint64_t view = aggregate_public_target->view_generation;
+    int64_t **columns = aggregate_public_target->columns;
+    /* #1709 tracks raw TDD final normalization before this boundary.
+     * Repeat the shared aggregate guard here; public retry follows release. */
+    col_delta_timestamp_t saved_timestamps[2];
+    bool timestamped = aggregate_public_target->timestamps != NULL;
+    if (timestamped)
+        memcpy(saved_timestamps, aggregate_public_target->timestamps,
+            sizeof(saved_timestamps));
+    for (unsigned attempt = 0; attempt < 2; attempt++) {
+        int retry_rc = workers == 1
+            ? wl_session_snapshot(session, collect_tuple, &tuples)
+            : wl_columnar_eval_serial_canonicalize_aggregates(&stratum, sess);
+        PUBLIC_AGG_CHECK(retry_rc == EBUSY && tuples.count == 0
+            && aggregate_public_target->nrows == 2
+            && aggregate_public_target->view_generation == view
+            && aggregate_public_target->columns == columns
+            && (!timestamped || memcmp(saved_timestamps,
+            aggregate_public_target->timestamps,
+            sizeof(saved_timestamps)) == 0),
+            "repeated aggregate boundary refusal");
+    }
+    PUBLIC_AGG_CHECK(col_rel_source_reader_release(&aggregate_public_reader) ==
+        0,
+        "public aggregate release");
+    PUBLIC_AGG_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0
+        && tuples.count == 1 && tuples.rows[0][0] == 42
+        && tuples.rows[0][1] == 10
+        && strcmp(tuples.relations[0], "output") == 0,
+        "public exact aggregate retry");
+cleanup:
+    wl_columnar_eval_serial_test_before_aggregate = NULL;
+    wl_columnar_eval_test_outbound_after_plan = NULL;
+    if (aggregate_public_reader.owner)
+        (void)col_rel_source_reader_release(&aggregate_public_reader);
+    free(values);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef PUBLIC_AGG_CHECK
+}
+
 static _Atomic uint32_t schema_parity_workers;
 
 static void
@@ -7756,6 +8012,17 @@ main(void)
                 test_parallel_schema_parity(workers, typed != 0, existing != 0);
 
 
+    for (unsigned mode = 0; mode < 6; mode++) {
+#ifndef WL_TEST_ALLOC_WRAP
+        if (mode == 4)
+            continue;
+#endif
+        test_aggregate_publication_guard(mode, false);
+        test_aggregate_publication_guard(mode, true);
+    }
+    test_aggregate_public_retry(1);
+    test_aggregate_public_retry(2);
+    test_aggregate_public_retry(8);
     test_coordinator_specialized_parallel();
     test_correctness_replay_refusal(0);
     test_correctness_replay_refusal(1);
