@@ -3932,6 +3932,513 @@ cleanup:
 }
 #endif
 
+#ifdef WL_SESSION_TEST_HOOKS
+static wl_columnar_source_access_reader_t rollback_frame_reader;
+static wl_columnar_source_access_reader_t rollback_idb_reader;
+static int rollback_hook_rc;
+static bool rollback_hook_replace;
+static bool rollback_hook_shared;
+
+static void
+inject_rollback_refusal(wl_col_session_t *sess)
+{
+    wl_columnar_eval_delta_test_after_eval = NULL;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    col_rel_t *held = col_rel_new_auto("rollback-held", 1);
+    col_rel_t *target = session_find_rel(sess, "a");
+    rollback_hook_rc = EINVAL;
+    sess->rotation_ops->gc_epoch_boundary(sess);
+    if (!held || !target)
+        goto fail;
+    if (rollback_hook_replace) {
+        int64_t replacement_row = 99;
+        col_rel_t *replacement = col_rel_new_auto("a", 1);
+        if (!replacement || col_rel_append_row(replacement,
+            &replacement_row) != 0
+            || session_add_rel(sess, replacement) != 0) {
+            col_rel_destroy(replacement);
+            goto fail;
+        }
+        target = replacement;
+    }
+    if (rollback_hook_shared
+        && wl_columnar_session_install_shared_view(sess, target,
+        session_find_rel(sess, "input")) != 0)
+        goto fail;
+    rollback_hook_rc = wl_columnar_eval_stack_cleanup_begin(sess, &frame);
+    if (rollback_hook_rc != 0)
+        goto fail;
+    eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(frame);
+    result->rel = held;
+    result->owned = true;
+    held = NULL;
+    if (col_rel_source_reader_acquire(result->rel, &rollback_frame_reader) != 0
+        || col_rel_source_reader_acquire(target, &rollback_idb_reader) != 0)
+        goto fail;
+    rollback_hook_rc = wl_columnar_eval_stack_cleanup_finish(&frame);
+    return;
+fail:
+    if (frame)
+        (void)wl_columnar_eval_stack_cleanup_finish(&frame);
+    col_rel_destroy(held);
+}
+
+static void
+test_persistent_delta_rollback(bool destroy_pending)
+{
+    TEST(destroy_pending ?
+        "delta rollback: pending teardown needs no allocation"
+        : "delta rollback: new frame and restore refusal retain prior state");
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "missing" }
+    };
+    wl_plan_relation_t relation = { .name = "a", .ops = ops, .op_count = 1 };
+    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess = NULL;
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    delta_collector_t deltas = { 0 };
+    const char *failure = NULL;
+    int64_t one = 1, two = 2;
+#define ROLLBACK_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    memset(&rollback_frame_reader, 0, sizeof(rollback_frame_reader));
+    memset(&rollback_idb_reader, 0, sizeof(rollback_idb_reader));
+    ROLLBACK_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "create");
+    sess = COL_SESSION(session);
+    governor = sess->memory_governor;
+    wl_columnar_memory_governor_ref_retain(governor);
+    if (!sess->compound_arena)
+        sess->compound_arena = wl_compound_arena_create(7, 16, 4);
+    ROLLBACK_CHECK(sess->compound_arena, "compound arena");
+    uint64_t handle = wl_compound_arena_alloc(sess->compound_arena, 8);
+    ROLLBACK_CHECK(handle != 0, "compound handle");
+    one = (int64_t)handle;
+    wl_compound_arena_freeze(sess->compound_arena);
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    ROLLBACK_CHECK(wl_session_insert(session, "input", &one, 1, 1) == 0
+        && wl_session_step(session) == 0 && deltas.count == 1, "baseline");
+    wl_compound_arena_unfreeze(sess->compound_arena);
+    col_rel_t *target = session_find_rel(sess, "a");
+    uint64_t identity = target->relation_identity;
+    ROLLBACK_CHECK(wl_session_insert(session, "input", &two, 1, 1) == 0,
+        "pending insertion");
+    deltas.count = 0;
+    relation.op_count = 2;
+    wl_columnar_eval_delta_test_after_eval = inject_rollback_refusal;
+    int step_rc = wl_session_step(session);
+    ROLLBACK_CHECK(step_rc == EBUSY && rollback_hook_rc == EBUSY,
+        "new evaluator cleanup refusal");
+    ROLLBACK_CHECK(sess->delta_rollback &&
+        sess->delta_rollback_reserved_bytes > 0
+        && sess->cleanup_pending && target->columns == NULL
+        && target->nrows == 0 && target->relation_identity == identity
+        && deltas.count == 0 && sess->pending_input_change,
+        "rollback ownership or callback state");
+    uint64_t retained = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(governor));
+    ROLLBACK_CHECK(wl_session_step(session) == EBUSY
+        && wl_session_step(session) == EBUSY
+        && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            governor)) == retained,
+        "repeated frame refusal");
+    ROLLBACK_CHECK(col_rel_source_reader_release(&rollback_frame_reader) == 0,
+        "release frame reader");
+    ROLLBACK_CHECK(wl_session_step(session) == EBUSY && !sess->cleanup_pending
+        && sess->delta_rollback && !target->columns,
+        "restore must respect descriptor reader");
+    uint32_t epoch = sess->compound_arena->current_epoch;
+    ROLLBACK_CHECK(wl_compound_arena_retain(sess->compound_arena, handle,
+        -1) == 0
+        && wl_compound_arena_alloc(sess->compound_arena, 8192) != 0,
+        "compound mutation while rollback retained");
+    (void)wl_compound_arena_gc_epoch_boundary(sess->compound_arena);
+    ROLLBACK_CHECK(sess->compound_arena->current_epoch == epoch
+        && wl_compound_arena_lookup(sess->compound_arena, handle, NULL),
+        "compound backup handle reclaimed");
+    ROLLBACK_CHECK(col_rel_source_reader_release(&rollback_idb_reader) == 0,
+        "release IDB reader");
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = true;
+    if (!destroy_pending) {
+        ROLLBACK_CHECK(wl_session_step(session) == ENOMEM && !fail_next_alloc
+            && sess->delta_rollback && !target->columns && deltas.count == 0,
+            "restoration allocation failure lost backup");
+    }
+#endif
+    if (!destroy_pending) {
+        relation.op_count = 1;
+        ROLLBACK_CHECK(wl_session_step(session) == 0 && !sess->delta_rollback
+            && sess->delta_rollback_reserved_bytes == 0 && target->nrows == 2
+            && deltas.count == 1 && has_delta(&deltas, "a", &two, 1, +1),
+            "exact retry after retained restore");
+        deltas.count = 0;
+        ROLLBACK_CHECK(wl_session_step(session) == 0 && deltas.count == 0,
+            "duplicate callbacks after retry");
+    }
+    wl_session_destroy(session);
+    session = NULL;
+#ifdef WL_TEST_ALLOC_WRAP
+    ROLLBACK_CHECK(!destroy_pending || fail_next_alloc,
+        "pending teardown attempted restoration allocation");
+    fail_next_alloc = false;
+#endif
+    ROLLBACK_CHECK(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)) == 0,
+        "reservation leak");
+cleanup:
+    wl_columnar_eval_delta_test_after_eval = NULL;
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = false;
+#endif
+    if (rollback_frame_reader.owner)
+        (void)col_rel_source_reader_release(&rollback_frame_reader);
+    if (rollback_idb_reader.owner)
+        (void)col_rel_source_reader_release(&rollback_idb_reader);
+    wl_session_destroy(session);
+    if (governor)
+        wl_columnar_memory_governor_ref_release(governor);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef ROLLBACK_CHECK
+}
+#endif
+
+static void
+test_delta_alias_rollback(bool hold_second)
+{
+    TEST(hold_second ? "delta rollback: alias prefix recovers on reader refusal"
+        : "delta rollback: sibling aliases detach without owner write exclusion");
+    wl_plan_op_t op = { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" };
+    wl_plan_relation_t relations[] = {
+        { .name = "a", .ops = &op, .op_count = 1 },
+        { .name = "b", .ops = &op, .op_count = 1 }
+    };
+    wl_plan_stratum_t stratum = { .relations = relations, .relation_count = 2 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess = NULL;
+    col_rel_t *unowned = NULL;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    delta_collector_t deltas = { 0 };
+    const char *failure = NULL;
+    int64_t one = 1, two = 2;
+#define ALIAS_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    ALIAS_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0,
+        "create");
+    sess = COL_SESSION(session);
+    uint32_t no_request_epoch = sess->compound_arena->current_epoch;
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    ALIAS_CHECK(wl_session_insert(session, "input", &one, 1, 1) == 0
+        && wl_session_step(session) == 0 && deltas.count == 2, "baseline");
+    ALIAS_CHECK(wl_session_insert(session, "input", &two, 1, 1) == 0,
+        "pending insertion");
+    wl_columnar_memory_governor_t *budget
+        = wl_columnar_memory_governor_ref_get(sess->memory_governor);
+    uint64_t saved_limit = atomic_load_explicit(&budget->usable_bytes,
+            memory_order_relaxed);
+    wl_columnar_memory_mode_t saved_mode = budget->mode;
+    uint64_t before_reserved = wl_columnar_memory_reserved(budget);
+    int64_t **before_a = session_find_rel(sess, "a")->columns;
+    int64_t **before_b = session_find_rel(sess, "b")->columns;
+    deltas.count = 0;
+    wl_columnar_eval_stack_cleanup_frame_t *outer = NULL;
+    int begin_rc = wl_columnar_eval_stack_cleanup_begin(sess, &outer);
+    int nested_rc = begin_rc == 0 ? wl_session_step(session) : begin_rc;
+    int finish_rc =
+        outer ? wl_columnar_eval_stack_cleanup_finish(&outer) : EINVAL;
+    ALIAS_CHECK(begin_rc == 0 && nested_rc == EBUSY && finish_rc == 0
+        && !sess->delta_rollback && deltas.count == 0
+        && session_find_rel(sess, "a")->columns == before_a
+        && session_find_rel(sess, "b")->columns == before_b,
+        "active-frame delta entry published or mutated");
+    budget->mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    atomic_store_explicit(&budget->usable_bytes, before_reserved,
+        memory_order_relaxed);
+    int denial_rc = wl_session_step(session);
+    int repeat_denial_rc = wl_session_step(session);
+    atomic_store_explicit(&budget->usable_bytes, saved_limit,
+        memory_order_relaxed);
+    budget->mode = saved_mode;
+    ALIAS_CHECK(denial_rc == ENOSPC && repeat_denial_rc == ENOSPC
+        && !sess->delta_rollback && deltas.count == 0
+        && wl_columnar_memory_reserved(budget) == before_reserved
+        && session_find_rel(sess, "a")->columns == before_a
+        && session_find_rel(sess, "b")->columns == before_b,
+        "capture budget denial changed prior state");
+    unowned = col_rel_new_auto("alias-owner", 1);
+    ALIAS_CHECK(unowned && col_rel_append_row(unowned, &one) == 0
+        && session_add_rel(sess, unowned) == 0, "alias owner");
+    col_rel_t *owner = unowned;
+    unowned = NULL;
+    col_rel_t *a = session_find_rel(sess, "a");
+    col_rel_t *b = session_find_rel(sess, "b");
+    ALIAS_CHECK(wl_columnar_session_install_shared_view(sess, a, owner) == 0
+        && wl_columnar_session_install_shared_view(sess, b, owner) == 0,
+        "sibling aliases");
+    int64_t **owner_columns = owner->columns;
+    deltas.count = 0;
+    if (hold_second) {
+        int64_t **b_columns = b->columns;
+        uint64_t b_generation = b->view_generation;
+        ALIAS_CHECK(col_rel_source_reader_acquire(b, &reader) == 0,
+            "alias reader");
+        ALIAS_CHECK(wl_session_step(session) == EBUSY && deltas.count == 0
+            && sess->pending_input_change && b->columns == b_columns
+            && b->view_generation == b_generation && b->storage_owner == owner
+            && a->storage_owner == a && a->nrows == 1 && col_rel_get(a, 0,
+            0) == one
+            && owner->columns == owner_columns && owner->nrows == 1
+            && col_rel_storage_alias_borrow_count(owner) == 1,
+            "prefix restoration or reader stability");
+        ALIAS_CHECK(col_rel_source_reader_release(&reader) == 0,
+            "release alias reader");
+    }
+    int alias_rc = wl_session_step(session);
+    ALIAS_CHECK(alias_rc == 0 && deltas.count == 2
+        && has_delta(&deltas, "a", &two, 1, +1)
+        && has_delta(&deltas, "b", &two, 1, +1)
+        && a->storage_owner == a && b->storage_owner == b
+        && a->nrows == 2 && b->nrows == 2
+        && col_rel_storage_alias_borrow_count(owner) == 0
+        && owner->nrows == 1 && col_rel_get(owner, 0, 0) == one
+        && !sess->delta_rollback && !sess->source_leases,
+        "alias exact retry or owner corruption");
+    ALIAS_CHECK(sess->compound_arena->current_epoch == no_request_epoch,
+        "nonrecursive evaluation invented a frontier request");
+cleanup:
+    if (reader.owner)
+        (void)col_rel_source_reader_release(&reader);
+    col_rel_destroy(unowned);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef ALIAS_CHECK
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+static void
+test_delta_rollback_preserves_progress(bool replace, bool shared)
+{
+    TEST(shared ?
+        "delta rollback: populated shared-view progress retains its lease"
+        : replace ? "delta rollback: replacement identity is never overwritten"
+        : "delta rollback: populated partial results are preserved");
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "missing" }
+    };
+    wl_plan_relation_t relation = { .name = "a", .ops = ops, .op_count = 1 };
+    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    delta_collector_t deltas = { 0 };
+    const char *failure = NULL;
+    int64_t one = 1, two = 2;
+#define PROGRESS_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    PROGRESS_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0,
+        "create");
+    wl_col_session_t *sess = COL_SESSION(session);
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    PROGRESS_CHECK(wl_session_insert(session, "input", &one, 1, 1) == 0
+        && wl_session_step(session) == 0, "baseline");
+    uint64_t old_identity = session_find_rel(sess, "a")->relation_identity;
+    PROGRESS_CHECK(wl_session_insert(session, "input", &two, 1, 1) == 0,
+        "pending input");
+    deltas.count = 0;
+    relation.op_count = replace ? 2 : 1;
+    rollback_hook_replace = replace;
+    rollback_hook_shared = shared;
+    wl_columnar_eval_delta_test_after_eval = inject_rollback_refusal;
+    PROGRESS_CHECK(wl_session_step(session) == EBUSY &&
+        rollback_hook_rc == EBUSY
+        && deltas.count == 0 && sess->delta_rollback, "pending boundary");
+    col_rel_t *target = session_find_rel(sess, "a");
+    int64_t **columns = target->columns;
+    uint64_t generation = target->view_generation;
+    PROGRESS_CHECK(target->nrows == (replace ? 1u : 2u)
+        && (target->relation_identity != old_identity) == replace,
+        "fixture progress or replacement");
+    PROGRESS_CHECK(col_rel_source_reader_release(&rollback_frame_reader) == 0
+        && col_rel_source_reader_release(&rollback_idb_reader) == 0,
+        "release readers");
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = true;
+#endif
+    PROGRESS_CHECK(wl_columnar_session_cleanup_ready(sess) == 0
+        && !sess->delta_rollback && !sess->cleanup_pending
+        && target->columns == columns && target->view_generation == generation
+        && target->nrows == (replace ? 1u : 2u)
+        && col_rel_get(target, 0, 0) == (replace ? 99 : one)
+        && deltas.count == 0 && sess->pending_input_change,
+        "rollback overwrote newer state");
+    PROGRESS_CHECK(!shared ||
+        (target->storage_owner != target && sess->source_leases),
+        "populated shared-view lease retired");
+#ifdef WL_TEST_ALLOC_WRAP
+    PROGRESS_CHECK(fail_next_alloc, "unnecessary restoration allocation");
+#endif
+cleanup:
+    wl_columnar_eval_delta_test_after_eval = NULL;
+    rollback_hook_replace = false;
+    rollback_hook_shared = false;
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = false;
+#endif
+    if (rollback_frame_reader.owner)
+        (void)col_rel_source_reader_release(&rollback_frame_reader);
+    if (rollback_idb_reader.owner)
+        (void)col_rel_source_reader_release(&rollback_idb_reader);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef PROGRESS_CHECK
+}
+#endif
+
+static void
+test_delta_rollback_timestamp_charge(void)
+{
+    TEST("delta rollback: retained timestamp charge follows physical lifetime");
+    wl_mem_ledger_t ledger;
+    wl_mem_ledger_snapshot_t snapshot;
+    wl_mem_ledger_init(&ledger, 0);
+    col_rel_t *rel = col_rel_new_auto("timestamp-rollback", 1);
+    const char *failure = NULL;
+    int64_t one = 1, two = 2;
+#define TIMESTAMP_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    TIMESTAMP_CHECK(rel && col_rel_append_row(rel, &one) == 0
+        && col_rel_enable_timestamps(rel) == 0, "fixture");
+    rel->mem_ledger = &ledger;
+    col_rel_ledger_reconcile(rel, 0);
+    uint64_t timestamp_bytes = rel->ledger_ts_bytes;
+    col_delta_timestamp_t *timestamps = rel->timestamps;
+    TIMESTAMP_CHECK(timestamp_bytes > sizeof(col_delta_timestamp_t),
+        "spare capacity");
+    TIMESTAMP_CHECK(wl_columnar_relation_delta_detach(rel,
+        rel->relation_identity) == 0,
+        "detach");
+    wl_mem_ledger_snapshot(&ledger, &snapshot);
+    TIMESTAMP_CHECK(rel->timestamps == timestamps &&
+        rel->ledger_ts_bytes == timestamp_bytes
+        && snapshot.subsys_bytes[WL_MEM_SUBSYS_TIMESTAMP] == timestamp_bytes
+        && snapshot.subsys_bytes[WL_MEM_SUBSYS_RELATION] == 0,
+        "detachment prematurely credited timestamp storage");
+    TIMESTAMP_CHECK(wl_columnar_relation_delta_restore_flat(rel,
+        rel->relation_identity, &one, 1, 1) == 0, "restore");
+    wl_mem_ledger_snapshot(&ledger, &snapshot);
+    TIMESTAMP_CHECK(rel->timestamps == timestamps &&
+        rel->ledger_ts_bytes == timestamp_bytes
+        && snapshot.subsys_bytes[WL_MEM_SUBSYS_TIMESTAMP] == timestamp_bytes
+        && snapshot.subsys_bytes[WL_MEM_SUBSYS_RELATION] == sizeof(int64_t),
+        "restore charged logical timestamp capacity");
+    TIMESTAMP_CHECK(col_rel_append_row(rel, &two) == 0,
+        "timestamp replacement growth");
+    wl_mem_ledger_snapshot(&ledger, &snapshot);
+    TIMESTAMP_CHECK(snapshot.subsys_bytes[WL_MEM_SUBSYS_TIMESTAMP]
+        == (uint64_t)rel->capacity * sizeof(col_delta_timestamp_t),
+        "replacement timestamp charge");
+cleanup:
+    col_rel_destroy(rel);
+    wl_mem_ledger_snapshot(&ledger, &snapshot);
+    if (!failure && snapshot.current_bytes != 0)
+        failure = "ledger leak";
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef TIMESTAMP_CHECK
+}
+
+static void
+test_delta_rollback_frontier_gc(bool pinned)
+{
+    TEST(pinned ?
+        "delta rollback: pinned strategy resumes requested frontier GC"
+        : "delta rollback: standard strategy resumes requested frontier GC");
+    wl_plan_t *plan = build_plan(
+        ".decl edge(x: int32, y: int32)\n"
+        ".decl path(x: int32, y: int32)\n"
+        "path(x, y) :- edge(x, y).\n"
+        "path(x, z) :- path(x, y), edge(y, z).\n");
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess = NULL;
+    wl_arena_compound_arena_gc_hold_t external = { 0 };
+    delta_collector_t deltas = { 0 };
+    const char *failure = NULL;
+#define GC_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    GC_CHECK(plan && wl_session_create(wl_backend_columnar(), plan, 1,
+        &session) == 0,
+        "create");
+    sess = COL_SESSION(session);
+    sess->rotation_ops =
+        pinned ? &col_rotation_pinned_ops : &col_rotation_standard_ops;
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    for (int64_t i = 0; i < 5; i++) {
+        int64_t edge[] = { i, i + 1 };
+        uint32_t epoch = sess->compound_arena->current_epoch;
+        if (i == 2)
+            wl_compound_arena_freeze(sess->compound_arena);
+        if (i == 3)
+            GC_CHECK(wl_arena_compound_arena_gc_hold_acquire(
+                    sess->compound_arena,
+                    &external) == 0, "external hold");
+        deltas.count = 0;
+        GC_CHECK(wl_session_insert(session, "edge", edge, 1, 2) == 0
+            && wl_session_step(session) == 0 &&
+            deltas.count == (uint32_t)(i + 1),
+            "recursive exact delta");
+        GC_CHECK(sess->compound_arena->current_epoch
+            == epoch + ((i == 2 || i == 3) ? 0u : 1u),
+            "deferred frontier progress or skip");
+        if (i == 2)
+            wl_compound_arena_unfreeze(sess->compound_arena);
+        if (external.arena) {
+            GC_CHECK(wl_arena_compound_arena_gc_hold_release(&external) == 0
+                && sess->compound_arena->current_epoch == epoch,
+                "external release implicitly collected");
+        }
+    }
+cleanup:
+    if (external.arena)
+        (void)wl_arena_compound_arena_gc_hold_release(&external);
+    if (sess)
+        wl_compound_arena_unfreeze(sess->compound_arena);
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef GC_CHECK
+}
+
 int
 main(void)
 {
@@ -3973,6 +4480,18 @@ main(void)
     test_delta_snapshot_capture_failure(0);
     test_delta_snapshot_capture_failure(1);
 #endif
+#ifdef WL_SESSION_TEST_HOOKS
+    test_persistent_delta_rollback(false);
+    test_persistent_delta_rollback(true);
+    test_delta_rollback_preserves_progress(false, false);
+    test_delta_rollback_preserves_progress(false, true);
+    test_delta_rollback_preserves_progress(true, false);
+#endif
+    test_delta_rollback_frontier_gc(false);
+    test_delta_rollback_frontier_gc(true);
+    test_delta_rollback_timestamp_charge();
+    test_delta_alias_rollback(false);
+    test_delta_alias_rollback(true);
     test_pending_cleanup_synchronous_destroy();
     test_pending_cleanup_operation_guards(0, false);
     test_pending_cleanup_operation_guards(1, false);

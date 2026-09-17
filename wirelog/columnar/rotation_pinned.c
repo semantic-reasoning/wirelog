@@ -51,7 +51,7 @@ static void
 pinned_gc_epoch_boundary(struct wl_col_session_t *sess)
 {
     /* Placeholder: behave like STANDARD. */
-    if (sess && sess->compound_arena)
+    if (sess && sess->compound_arena && !wl_columnar_eval_delta_defer_gc(sess))
         wl_compound_arena_gc_epoch_boundary(sess->compound_arena);
 }
 

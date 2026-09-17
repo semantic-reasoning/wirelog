@@ -27,7 +27,7 @@ standard_rotate_eval_arena(struct wl_col_session_t *sess)
 static void
 standard_gc_epoch_boundary(struct wl_col_session_t *sess)
 {
-    if (sess && sess->compound_arena)
+    if (sess && sess->compound_arena && !wl_columnar_eval_delta_defer_gc(sess))
         wl_compound_arena_gc_epoch_boundary(sess->compound_arena);
 }
 

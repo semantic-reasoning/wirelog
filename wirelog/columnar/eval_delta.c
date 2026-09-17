@@ -8,8 +8,11 @@
 #define _GNU_SOURCE
 
 #include "columnar/internal.h"
+#include "arena/compound_arena.h"
+#include "../wirelog-internal.h"
 
 #include <errno.h>
+#include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -420,6 +423,293 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
     return 0;
 }
 
+typedef struct {
+    char *name;
+    uint64_t identity;
+    int64_t *rows;
+    uint32_t nrows;
+    uint32_t ncols;
+    bool detached;
+    bool completed;
+    bool alias;
+    wl_columnar_source_access_reader_t capture_reader;
+} wl_columnar_eval_delta_snapshot_t;
+
+struct wl_columnar_eval_delta_rollback {
+    wl_columnar_memory_reservation_t metadata_reservation;
+    wl_columnar_memory_reservation_t payload_reservation;
+    wl_columnar_memory_governor_ref_t *governor;
+    wl_arena_compound_arena_gc_hold_t compound_hold;
+    uint32_t count;
+    bool active;
+    bool payload_reserved;
+    bool gc_requested;
+    int evaluation_error;
+    wl_columnar_eval_delta_snapshot_t entries[];
+};
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_eval_delta_test_after_eval)(wl_col_session_t *sess);
+#endif
+
+static int
+wl_columnar_eval_delta_reserve(wl_col_session_t *sess, uint64_t bytes,
+    wl_columnar_memory_reservation_t *reservation)
+{
+    wl_columnar_memory_reservation_init(reservation);
+    if (!sess->memory_governor || bytes == 0)
+        return 0;
+    wl_columnar_memory_admission_status_t status
+        = wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(sess->memory_governor),
+            bytes, reservation);
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+        || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+        return 0;
+    return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+        : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : EINVAL;
+}
+
+bool
+wl_columnar_eval_delta_rollback_active(const wl_col_session_t *sess)
+{
+    return sess && sess->delta_rollback && sess->delta_rollback->active;
+}
+
+bool
+wl_columnar_eval_delta_defer_gc(wl_col_session_t *sess)
+{
+    if (!sess || !sess->delta_rollback)
+        return false;
+    sess->delta_rollback->gc_requested = true;
+    return true;
+}
+
+int
+wl_columnar_eval_delta_rollback_discard(wl_col_session_t *sess)
+{
+    wl_columnar_eval_delta_rollback_t *record;
+    wl_columnar_memory_reservation_t metadata, payload;
+    if (!sess)
+        return EINVAL;
+    record = sess->delta_rollback;
+    if (!record)
+        return 0;
+    if (record->active || sess->cleanup_active || sess->cleanup_pending)
+        return EBUSY;
+    for (uint32_t i = 0; i < record->count; i++) {
+        wl_columnar_eval_delta_snapshot_t *entry = &record->entries[i];
+        if (entry->capture_reader.owner) {
+            int rc = col_rel_source_reader_release(&entry->capture_reader);
+            if (rc != 0)
+                return rc;
+        }
+    }
+    wl_columnar_memory_governor_ref_t *governor = record->governor;
+    bool payload_reserved = record->payload_reserved;
+    wl_columnar_memory_reservation_init(&metadata);
+    wl_columnar_memory_reservation_init(&payload);
+    if (governor) {
+        if (!wl_columnar_memory_reservation_move(&metadata,
+            &record->metadata_reservation))
+            return EINVAL;
+        if (record->payload_reserved
+            && !wl_columnar_memory_reservation_move(&payload,
+            &record->payload_reservation)) {
+            (void)wl_columnar_memory_reservation_move(
+                &record->metadata_reservation, &metadata);
+            return EINVAL;
+        }
+    }
+    if (record->compound_hold.arena) {
+        int rc =
+            wl_arena_compound_arena_gc_hold_release(&record->compound_hold);
+        if (rc != 0) {
+            if (governor) {
+                (void)wl_columnar_memory_reservation_move(
+                    &record->metadata_reservation, &metadata);
+                if (record->payload_reserved)
+                    (void)wl_columnar_memory_reservation_move(
+                        &record->payload_reservation, &payload);
+            }
+            return rc;
+        }
+    }
+    for (uint32_t i = 0; i < record->count; i++) {
+        free(record->entries[i].rows);
+        free(record->entries[i].name);
+    }
+    sess->delta_rollback = NULL;
+    sess->delta_rollback_reserved_bytes = 0;
+    free(record);
+    if (governor) {
+        bool released = !payload_reserved ||
+            wl_columnar_memory_release(&payload);
+        assert(released);
+        released = wl_columnar_memory_release(&metadata);
+        assert(released);
+        (void)released;
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+    return 0;
+}
+
+int
+wl_columnar_eval_delta_rollback_retry(wl_col_session_t *sess)
+{
+    if (!sess)
+        return EINVAL;
+    wl_columnar_eval_delta_rollback_t *record = sess->delta_rollback;
+    if (!record || record->active)
+        return 0;
+    if (sess->cleanup_pending || sess->cleanup_active)
+        return EBUSY;
+    int result = 0;
+    for (uint32_t i = 0; i < record->count; i++) {
+        wl_columnar_eval_delta_snapshot_t *entry = &record->entries[i];
+        if (!entry->detached || entry->completed)
+            continue;
+        col_rel_t *rel = session_find_rel(sess, entry->name);
+        /* Replacement/removal is not an invitation to overwrite new state. */
+        if (!rel || rel->relation_identity != entry->identity) {
+            entry->completed = true;
+            continue;
+        }
+        int rc = wl_columnar_relation_delta_restore_flat(rel, entry->identity,
+                entry->rows, entry->nrows, entry->ncols);
+        /* A populated shared view is partial progress with its own live
+         * source lease. Preserve it, rather than attempting to retire it. */
+        if (rc == 0 && rel->storage_owner == rel)
+            rc = wl_columnar_session_retire_source_lease(sess, rel);
+        if (rc == 0)
+            entry->completed = true;
+        else if (result == 0)
+            result = rc;
+    }
+    return result != 0 ? result : wl_columnar_eval_delta_rollback_discard(sess);
+}
+
+static int
+wl_columnar_eval_delta_capture(const wl_plan_stratum_t *sp,
+    wl_col_session_t *sess)
+{
+    uint64_t metadata_bytes, payload_bytes = 0;
+    wl_columnar_memory_reservation_t reservation;
+    if (sess->delta_rollback || sess->cleanup_active)
+        return EBUSY;
+    if (!wl_columnar_memory_size_mul(sp->relation_count,
+        sizeof(wl_columnar_eval_delta_snapshot_t), &metadata_bytes)
+        || !wl_columnar_memory_size_add(metadata_bytes,
+        sizeof(wl_columnar_eval_delta_rollback_t), &metadata_bytes)
+        || metadata_bytes > SIZE_MAX
+        || metadata_bytes < sizeof(wl_columnar_eval_delta_rollback_t))
+        return EOVERFLOW;
+    int rc = wl_columnar_eval_delta_reserve(sess, metadata_bytes, &reservation);
+    if (rc != 0)
+        return rc;
+    wl_columnar_eval_delta_rollback_t *record = calloc(1,
+            (size_t)metadata_bytes);
+    if (!record) {
+        if (sess->memory_governor)
+            (void)wl_columnar_memory_rollback(&reservation);
+        return ENOMEM;
+    }
+    wl_columnar_memory_reservation_init(&record->metadata_reservation);
+    wl_columnar_memory_reservation_init(&record->payload_reservation);
+    if (sess->memory_governor) {
+        if (!wl_columnar_memory_reservation_move(&record->metadata_reservation,
+            &reservation)) {
+            (void)wl_columnar_memory_rollback(&reservation);
+            free(record);
+            return EINVAL;
+        }
+        record->governor = sess->memory_governor;
+        wl_columnar_memory_governor_ref_retain(record->governor);
+    }
+    record->count = sp->relation_count;
+    sess->delta_rollback = record;
+    sess->delta_rollback_reserved_bytes = metadata_bytes;
+    if (sess->compound_arena) {
+        rc = wl_arena_compound_arena_gc_hold_acquire(sess->compound_arena,
+                &record->compound_hold);
+        if (rc != 0)
+            goto fail;
+    }
+    for (uint32_t i = 0; i < record->count; i++) {
+        wl_columnar_eval_delta_snapshot_t *entry = &record->entries[i];
+        col_rel_t *rel = session_find_rel(sess, sp->relations[i].name);
+        uint64_t cells = 0, bytes = 0;
+        if (!rel || !rel->ncols)
+            continue;
+        rc = col_rel_source_reader_acquire(rel, &entry->capture_reader);
+        if (rc != 0)
+            goto fail;
+        entry->identity = rel->relation_identity;
+        entry->nrows = rel->nrows;
+        entry->ncols = rel->ncols;
+        entry->alias = rel->storage_owner != rel;
+        if (!wl_columnar_memory_size_mul(entry->nrows, entry->ncols, &cells)
+            || !wl_columnar_memory_size_mul(cells, sizeof(int64_t), &bytes)
+            || bytes > SIZE_MAX
+            || !wl_columnar_memory_size_add(payload_bytes, bytes,
+            &payload_bytes)
+            || !wl_columnar_memory_size_add(payload_bytes,
+            strlen(sp->relations[i].name) + 1, &payload_bytes)) {
+            rc = EOVERFLOW;
+            goto fail;
+        }
+    }
+    if (!wl_columnar_memory_size_add(metadata_bytes, payload_bytes,
+        &metadata_bytes)) {
+        rc = EOVERFLOW;
+        goto fail;
+    }
+    rc = wl_columnar_eval_delta_reserve(sess, payload_bytes,
+            &record->payload_reservation);
+    if (rc != 0)
+        goto fail;
+    record->payload_reserved = record->governor && payload_bytes != 0;
+    sess->delta_rollback_reserved_bytes = metadata_bytes;
+    for (uint32_t i = 0; i < record->count; i++) {
+        wl_columnar_eval_delta_snapshot_t *entry = &record->entries[i];
+        if (!entry->identity)
+            continue;
+        entry->name = wl_strdup(sp->relations[i].name);
+        if (!entry->name) {
+            rc = ENOMEM;
+            goto fail;
+        }
+        if (!entry->nrows)
+            continue;
+        entry->rows = malloc((size_t)entry->nrows * entry->ncols *
+                sizeof(int64_t));
+        if (!entry->rows) {
+            rc = ENOMEM;
+            goto fail;
+        }
+        col_rel_t *rel = session_find_rel(sess, entry->name);
+        for (uint32_t row = 0; row < entry->nrows; row++)
+            col_rel_row_copy_out(rel, row,
+                entry->rows + (size_t)row * entry->ncols);
+    }
+    if (record->governor
+        && (!wl_columnar_memory_commit(&record->metadata_reservation, record)
+        || (record->payload_reserved
+        && !wl_columnar_memory_commit(&record->payload_reservation, record)))) {
+        rc = EINVAL;
+        goto fail;
+    }
+    for (uint32_t i = 0; i < record->count; i++)
+        if (record->entries[i].capture_reader.owner)
+            (void)col_rel_source_reader_release(
+                &record->entries[i].capture_reader);
+    record->active = true;
+    return 0;
+fail:
+    (void)wl_columnar_eval_delta_rollback_discard(sess);
+    return rc;
+}
+
 int
 col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t stratum_idx)
@@ -438,66 +728,26 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
 
     uint32_t rc_cnt = sp->relation_count;
 
-    /* Allocate snapshot arrays */
-    int64_t **prev_data = (int64_t **)calloc(rc_cnt, sizeof(int64_t *));
-    uint32_t *prev_nrows = (uint32_t *)calloc(rc_cnt, sizeof(uint32_t));
-    uint32_t *prev_ncols = (uint32_t *)calloc(rc_cnt, sizeof(uint32_t));
-    if (!prev_data || !prev_nrows || !prev_ncols) {
-        free((void *)prev_data);
-        free(prev_nrows);
-        free(prev_ncols);
-        return ENOMEM;
-    }
-
-    /* Capture all flat prior-state snapshots before changing any live IDB.
-     * A failed later allocation must not detach an already captured prefix. */
-    int capture_rc = 0;
-    for (uint32_t ri = 0; ri < rc_cnt; ri++) {
-        col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
-        if (!r || r->ncols == 0)
-            continue;
-        prev_ncols[ri] = r->ncols;
-        if (r->nrows == 0)
-            continue;
-        uint64_t cells = 0, bytes = 0;
-        if (!wl_columnar_memory_size_mul(r->nrows, r->ncols, &cells)
-            || !wl_columnar_memory_size_mul(cells, sizeof(int64_t), &bytes)
-            || bytes > SIZE_MAX) {
-            capture_rc = EOVERFLOW;
-            break;
+    int rc = wl_columnar_eval_delta_capture(sp, sess);
+    if (rc != 0)
+        return rc;
+    wl_columnar_eval_delta_rollback_t *rollback = sess->delta_rollback;
+    /* Retire aliases before their roots. A refused later target leaves a
+     * recoverable detached prefix, never an unowned snapshot. */
+    for (unsigned pass = 0; pass < 2; pass++) {
+        for (uint32_t i = 0; i < rc_cnt; i++) {
+            wl_columnar_eval_delta_snapshot_t *entry = &rollback->entries[i];
+            if (!entry->rows || entry->alias != (pass == 0))
+                continue;
+            col_rel_t *rel = session_find_rel(sess, entry->name);
+            rc = wl_columnar_relation_delta_detach(rel, entry->identity);
+            if (rc != 0)
+                goto cleanup;
+            entry->detached = true;
+            rc = wl_columnar_session_retire_source_lease(sess, rel);
+            if (rc != 0)
+                goto cleanup;
         }
-        prev_data[ri] = (int64_t *)malloc((size_t)bytes);
-        if (!prev_data[ri]) {
-            capture_rc = ENOMEM;
-            break;
-        }
-        prev_nrows[ri] = r->nrows;
-        for (uint32_t row = 0; row < r->nrows; row++)
-            col_rel_row_copy_out(r, row,
-                prev_data[ri] + (size_t)row * r->ncols);
-    }
-    if (capture_rc != 0) {
-        /* No live storage has changed, so rollback restoration must not run. */
-        for (uint32_t ri = 0; ri < rc_cnt; ri++)
-            free(prev_data[ri]);
-        free((void *)prev_data);
-        free(prev_nrows);
-        free(prev_ncols);
-        return capture_rc;
-    }
-
-    /* Complete capture permits detachment. Evaluation allocates fresh columns;
-     * missing, untyped and zero-row relations keep their original behavior. */
-    for (uint32_t ri = 0; ri < rc_cnt; ri++) {
-        if (!prev_data[ri])
-            continue;
-        col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
-        col_columns_free(r->columns, r->ncols);
-        r->columns = NULL;
-        r->nrows = 0;
-        r->capacity = 0;
-        r->sorted_nrows = 0;
-        wl_columnar_relation_touch_replacement(r);
     }
 
     /* Step 2: evaluate stratum (appends new rows to IDB relations).
@@ -515,7 +765,13 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         sess->retraction_right_pass = false;
         sess->diff_operators_active = false;
     }
-    int rc = col_eval_stratum(sp, sess, stratum_idx);
+    rc = col_eval_stratum(sp, sess, stratum_idx);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_delta_test_after_eval)
+        wl_columnar_eval_delta_test_after_eval(sess);
+#endif
+    if (sess->cleanup_pending && rc == 0)
+        rc = EBUSY;
     sess->retraction_seeded = saved_retraction_seeded;
     sess->diff_operators_active = saved_diff_operators_active;
     if (rc != 0)
@@ -554,7 +810,8 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         if (r->nrows > 0 && cur_flat) {
             for (uint32_t row = 0; row < r->nrows; row++) {
                 const int64_t *rowp = cur_flat + (size_t)row * ncols;
-                if (!col_row_in_sorted(prev_data[ri], prev_nrows[ri], ncols,
+                if (!col_row_in_sorted(rollback->entries[ri].rows,
+                    rollback->entries[ri].nrows, ncols,
                     rowp)) {
                     rc = wl_delta_event_append(sess, r->name, rowp, ncols,
                             +1);
@@ -569,14 +826,16 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
 
         /* Fire delta_cb(-1) for rows present in prev sorted state but not in new
          */
-        if (prev_nrows[ri] > 0) {
-            for (uint32_t row = 0; row < prev_nrows[ri]; row++) {
+        if (rollback->entries[ri].nrows > 0) {
+            for (uint32_t row = 0; row < rollback->entries[ri].nrows; row++) {
                 const int64_t *rowp
-                    = prev_data[ri] + (size_t)row * prev_ncols[ri];
-                if (!col_row_in_sorted(cur_flat, r->nrows, prev_ncols[ri],
+                    = rollback->entries[ri].rows + (size_t)row *
+                    rollback->entries[ri].ncols;
+                if (!col_row_in_sorted(cur_flat, r->nrows,
+                    rollback->entries[ri].ncols,
                     rowp)) {
                     rc = wl_delta_event_append(sess, r->name, rowp,
-                            prev_ncols[ri], -1);
+                            rollback->entries[ri].ncols, -1);
                     if (rc != 0) {
                         free(cur_flat);
                         cur_flat = NULL;
@@ -588,56 +847,29 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         free(cur_flat);
     }
 
-    /* Publish only after every relation has evaluated and consolidated. */
+cleanup:
+    rollback->active = false;
+    rollback->evaluation_error = rc;
+    if (rc != 0) {
+        wl_columnar_delta_events_clear(sess);
+        int cleanup_rc = wl_columnar_session_cleanup_ready(sess);
+        return cleanup_rc != 0 ? cleanup_rc : rc;
+    }
+    bool gc_requested = rollback->gc_requested;
+    int discard_rc = wl_columnar_eval_delta_rollback_discard(sess);
+    if (discard_rc != 0) {
+        wl_columnar_delta_events_clear(sess);
+        return discard_rc;
+    }
+    /* All frontier requests inside the protected evaluation window coalesce
+     * into one explicit collection after the snapshots cease to need handles.
+     * Failed recovery and generic hold release never replay collection. */
+    if (gc_requested && !sess->coordinator && sess->compound_arena
+        && sess->rotation_ops && sess->rotation_ops->gc_epoch_boundary)
+        sess->rotation_ops->gc_epoch_boundary(sess);
     if (!sess->delta_event_transaction) {
         wl_columnar_delta_events_publish(sess);
         wl_columnar_delta_events_clear(sess);
     }
-
-cleanup:
-    if (rc != 0)
-        wl_columnar_delta_events_clear(sess);
-    for (uint32_t i = 0; i < rc_cnt; i++) {
-        if (rc != 0 && prev_data[i]) {
-            /* Error path: restore from flat snapshot into column-major */
-            col_rel_t *r = session_find_rel(sess, sp->relations[i].name);
-            if (r && !r->columns) {
-                uint32_t nc = prev_ncols[i];
-                uint32_t nr = prev_nrows[i];
-                r->columns = col_columns_alloc(nc, nr > 0 ? nr : 1);
-                if (r->columns) {
-                    /* Issue #1076: the buffer above is nc wide, and
-                     * col_rel_row_copy_in() bounds its loop by r->ncols.
-                     * Every other geometry field is restored below;
-                     * ncols has to be restored here because the copy
-                     * loop reads it.  nc == r->ncols on every reachable
-                     * path today -- ncols is fixed at construction, and
-                     * the only post-construction writer reachable from
-                     * evaluation is col_rel_set_schema(), which is a
-                     * no-op once non-zero -- so this makes the
-                     * invariant a property of this block rather than of
-                     * the whole call graph. */
-                    r->ncols = nc;
-                    for (uint32_t row = 0; row < nr; row++) {
-                        const int64_t *rowp
-                            = prev_data[i] + (size_t)row * nc;
-                        col_rel_row_copy_in_raw(r, row, rowp);
-                    }
-                    r->nrows = nr;
-                    r->capacity = nr > 0 ? nr : 1;
-                    r->sorted_nrows = nr;
-                    r->run_count = 1;
-                    r->run_ends[0] = nr;
-                    wl_columnar_relation_touch_replacement(r);
-                }
-                free(prev_data[i]);
-                prev_data[i] = NULL;
-            }
-        }
-        free(prev_data[i]);
-    }
-    free((void *)prev_data);
-    free(prev_nrows);
-    free(prev_ncols);
-    return rc;
+    return 0;
 }

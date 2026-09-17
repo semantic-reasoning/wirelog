@@ -2304,6 +2304,183 @@ col_rel_reset_rows_locked(col_rel_t *r,
     return 0;
 }
 
+static void
+wl_columnar_relation_delta_ledger_columns(col_rel_t *rel, uint64_t before)
+{
+    if (!rel->mem_ledger)
+        return;
+    uint64_t after = col_rel_owned_ledger_bytes(rel);
+    if (after > before)
+        wl_mem_ledger_alloc(rel->mem_ledger, WL_MEM_SUBSYS_RELATION,
+            after - before);
+    else if (before > after)
+        wl_mem_ledger_free(rel->mem_ledger, WL_MEM_SUBSYS_RELATION,
+            before - after);
+    /* Timestamp storage is unchanged even though logical capacity changes.
+     * Keep its physical charge until ordinary growth or destruction frees it. */
+}
+
+/* Delta snapshots change only row storage; schema and auxiliary buffers stay
+ * with the registered descriptor. Aliases retire under a descriptor writer
+ * and an owner reader, so sibling aliases need not compete for a writer. */
+int
+wl_columnar_relation_delta_detach(col_rel_t *rel, uint64_t expected_identity)
+{
+    wl_columnar_source_access_writer_t descriptor = { 0 }, writer = { 0 };
+    wl_columnar_source_access_reader_t reader = { 0 };
+    col_rel_t *owner = NULL;
+    uint64_t before;
+    int rc;
+    if (!rel)
+        return EINVAL;
+    rc = wl_columnar_source_access_writer_acquire(&rel->descriptor_access,
+            &descriptor);
+    if (rc != 0)
+        return rc;
+    if (rel->relation_identity != expected_identity
+        || col_rel_storage_owner_resolve(rel, &owner) != 0) {
+        rc = EINVAL;
+        goto done;
+    }
+    if (rel->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+        || rel->storage_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u) {
+        rc = EOVERFLOW;
+        goto done;
+    }
+    if (owner == rel) {
+        rc = wl_columnar_source_access_writer_acquire(&owner->source_access,
+                &writer);
+        if (rc == 0 && col_rel_storage_alias_borrow_count(owner) != 0)
+            rc = EBUSY;
+    } else {
+        rc = wl_columnar_source_access_reader_acquire(&owner->source_access,
+                &reader);
+    }
+    if (rc != 0)
+        goto done;
+    before = col_rel_owned_ledger_bytes(rel);
+    /* The temporary owner reader keeps the old root alive after its alias
+     * contribution is removed and until all borrowed pointers are detached. */
+    rc = col_rel_storage_alias_release(rel);
+    if (rc != 0)
+        goto done;
+    if (rel->columns) {
+        if (!rel->arena_owned)
+            for (uint32_t c = 0; c < rel->ncols; c++)
+                if (!rel->col_shared || !rel->col_shared[c])
+                    free(rel->columns[c]);
+        free((void *)rel->columns);
+    }
+    free(rel->col_shared);
+    rel->columns = NULL;
+    rel->col_shared = NULL;
+    rel->arena_owned = false;
+    rel->nrows = 0;
+    rel->capacity = 0;
+    rel->sorted_nrows = 0;
+    rel->run_count = 0;
+    memset(rel->run_ends, 0, sizeof(rel->run_ends));
+    wl_columnar_relation_delta_ledger_columns(rel, before);
+    wl_columnar_relation_touch_replacement(rel);
+done:
+    if (reader.owner)
+        (void)wl_columnar_source_access_reader_release(&reader);
+    if (writer.owner)
+        (void)wl_columnar_source_access_writer_release(&writer);
+    (void)wl_columnar_source_access_writer_release(&descriptor);
+    return rc;
+}
+
+int
+wl_columnar_relation_delta_restore_flat(col_rel_t *rel,
+    uint64_t expected_identity, const int64_t *rows,
+    uint32_t nrows, uint32_t ncols)
+{
+    wl_columnar_source_access_writer_t descriptor = { 0 }, writer = { 0 };
+    wl_columnar_memory_reservation_t pending, previous;
+    col_rel_t *owner = NULL;
+    int64_t **columns = NULL;
+    uint64_t bytes = 0;
+    int pending_rc = 0, rc;
+    if (!rel || !rows || !nrows || !ncols)
+        return EINVAL;
+    wl_columnar_memory_reservation_init(&pending);
+    wl_columnar_memory_reservation_init(&previous);
+    rc = wl_columnar_source_access_writer_acquire(&rel->descriptor_access,
+            &descriptor);
+    if (rc != 0)
+        return rc;
+    if (rel->relation_identity != expected_identity) {
+        rc = EINVAL;
+        goto done;
+    }
+    /* Preserve populated partial evaluation results, as before. */
+    if (rel->columns) {
+        rc = 0;
+        goto done;
+    }
+    if (rel->ncols != ncols
+        || col_rel_storage_owner_resolve(rel, &owner) != 0 || owner != rel) {
+        rc = EINVAL;
+        goto done;
+    }
+    rc = wl_columnar_source_access_writer_acquire(&rel->source_access, &writer);
+    if (rc != 0)
+        goto done;
+    if (col_rel_storage_alias_borrow_count(rel) != 0) {
+        rc = EBUSY;
+        goto done;
+    }
+    if (rel->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+        || rel->storage_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+        || !col_rel_retained_bytes(ncols, nrows,
+        rel->timestamps != NULL, &bytes)) {
+        rc = EOVERFLOW;
+        goto done;
+    }
+    pending_rc = col_rel_reserve_retained_shape(rel, nrows,
+            rel->timestamps != NULL, &pending);
+    if (pending_rc < 0) {
+        rc = ENOMEM;
+        goto done;
+    }
+    columns = col_columns_alloc(ncols, nrows);
+    if (!columns) {
+        rc = ENOMEM;
+        goto done;
+    }
+    for (uint32_t row = 0; row < nrows; row++)
+        for (uint32_t col = 0; col < ncols; col++)
+            columns[col][row] = rows[(size_t)row * ncols + col];
+    if (pending_rc > 0
+        && col_rel_publish_retained_reservation(rel, &pending, bytes,
+        &previous) != 0) {
+        rc = ENOMEM;
+        goto done;
+    }
+    uint64_t before = col_rel_owned_ledger_bytes(rel);
+    rel->columns = columns;
+    columns = NULL;
+    rel->nrows = nrows;
+    rel->capacity = nrows;
+    rel->sorted_nrows = nrows;
+    rel->run_count = 1;
+    rel->run_ends[0] = nrows;
+    wl_columnar_relation_delta_ledger_columns(rel, before);
+    wl_columnar_relation_touch_replacement(rel);
+    col_rel_release_retired_reservation(&previous);
+    rc = 0;
+done:
+    if (columns)
+        col_columns_free(columns, ncols);
+    if (rc != 0 && pending_rc > 0)
+        col_rel_reservation_rollback(&pending);
+    if (writer.owner)
+        (void)wl_columnar_source_access_writer_release(&writer);
+    (void)wl_columnar_source_access_writer_release(&descriptor);
+    return rc;
+}
+
 /* Copy all rows from src into dst (must have same ncols).
  * If src has timestamps and dst has timestamp tracking enabled, the source
  * timestamps are propagated to the newly appended rows.
