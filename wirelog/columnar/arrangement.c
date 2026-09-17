@@ -2376,15 +2376,44 @@ col_sorted_arrangement_probe_release(col_sorted_arrangement_probe_t *probe)
     return 0;
 }
 
+static int
+col_sorted_arrangement_probe_source_reader_ready(
+    const col_rel_t *source, const wl_columnar_source_access_reader_t *reader)
+{
+    col_rel_t *storage_owner = NULL;
+    wl_columnar_source_access_gate_t *descriptor_access;
+    int rc;
+
+    if (!source || !reader || !reader->owner)
+        return EINVAL;
+    rc = col_rel_storage_owner_resolve(source, &storage_owner);
+    if (rc != 0)
+        return rc;
+    descriptor_access
+        = (wl_columnar_source_access_gate_t *)&source->descriptor_access;
+    if (!storage_owner || reader->owner != &storage_owner->source_access
+        || reader->secondary_owner != descriptor_access
+        || reader->identity != (uintptr_t)reader
+        || (!reader->transferable
+        && !wl_columnar_source_access_reader_thread_equal(reader))
+        || (reader->transferable && reader->thread_valid)
+        || !wl_columnar_source_access_gate_busy(reader->owner)
+        || !wl_columnar_source_access_gate_busy(reader->secondary_owner))
+        return EINVAL;
+    return 0;
+}
+
 int
-col_session_acquire_sorted_arrangement_probe(wl_session_t *session,
-    const col_rel_t *source, uint32_t key_col,
-    col_sorted_arrangement_probe_t *probe)
+col_session_acquire_sorted_arrangement_probe_with_source_reader(
+    wl_session_t *session, const col_rel_t *source, uint32_t key_col,
+    col_sorted_arrangement_probe_t *probe,
+    wl_columnar_source_access_reader_t *source_reader)
 {
     wl_col_session_t *cs;
     col_sorted_arr_entry_t *entry;
     col_rel_t *resolved;
     col_relation_snapshot_t snapshot;
+    wl_columnar_source_access_reader_t *reader = NULL;
     int rc;
 
     if (!session || !source || !source->name || !probe
@@ -2400,10 +2429,21 @@ col_session_acquire_sorted_arrangement_probe(wl_session_t *session,
         return EBUSY;
     if (key_col >= source->ncols)
         return EINVAL;
+    if (source_reader) {
+        rc = col_sorted_arrangement_probe_source_reader_ready(source,
+                source_reader);
+        if (rc != 0)
+            return rc;
+        reader = source_reader;
+    } else {
+        reader = &probe->source_reader;
+    }
     memset(probe, 0, sizeof(*probe));
-    rc = col_rel_source_reader_acquire(source, &probe->source_reader);
-    if (rc != 0)
-        return rc;
+    if (!source_reader) {
+        rc = col_rel_source_reader_acquire(source, &probe->source_reader);
+        if (rc != 0)
+            return rc;
+    }
     snapshot = wl_columnar_relation_snapshot(source);
     entry = sarr_find_entry(cs, source->name, key_col);
     if (entry) {
@@ -2453,18 +2493,32 @@ col_session_acquire_sorted_arrangement_probe(wl_session_t *session,
     probe->session = cs;
     probe->source = source;
     probe->source_snapshot = snapshot;
+    if (source_reader) {
+        probe->source_reader = *reader;
+        probe->source_reader.identity = (uintptr_t)&probe->source_reader;
+        memset(reader, 0, sizeof(*reader));
+    }
     probe->identity = (uintptr_t)probe;
     probe->active = true;
     return 0;
 
 fail_reader:
-    {
+    if (!source_reader && probe->source_reader.owner) {
         int release_rc = col_rel_source_reader_release(&probe->source_reader);
         if (release_rc != 0)
             return release_rc;
     }
     memset(probe, 0, sizeof(*probe));
     return rc;
+}
+
+int
+col_session_acquire_sorted_arrangement_probe(wl_session_t *session,
+    const col_rel_t *source, uint32_t key_col,
+    col_sorted_arrangement_probe_t *probe)
+{
+    return col_session_acquire_sorted_arrangement_probe_with_source_reader(
+        session, source, key_col, probe, NULL);
 }
 
 void

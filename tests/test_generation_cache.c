@@ -206,6 +206,11 @@ test_generation_consumers(void)
     col_diff_arr_entry_t *diff_clone = NULL;
     uint32_t diff_clone_cap = 0;
     col_rel_t *worker_rel = NULL;
+    col_sorted_arrangement_probe_t sorted_probe = { 0 };
+    col_sorted_arrangement_probe_t failed_adopted_probe = { 0 };
+    wl_columnar_source_access_reader_t failed_adopted_reader = { 0 };
+    col_sorted_arrangement_probe_t adopted_probe = { 0 };
+    wl_columnar_source_access_reader_t adopted_reader = { 0 };
     wl_mem_ledger_t worker_ledger;
     wl_mem_ledger_init(&worker_ledger, 0);
     wl_columnar_arrangement_diff_txn_t worker_txn = { 0 };
@@ -276,7 +281,6 @@ test_generation_consumers(void)
         == 1000,
         "sorted arrangement did not rebuild order");
 
-    col_sorted_arrangement_probe_t sorted_probe = { 0 };
     CHECK(col_session_acquire_sorted_arrangement_probe(session, rel, 1,
         &sorted_probe) == 0 && sorted_probe.active
         && cs->sarr_active_pins == 1,
@@ -288,6 +292,15 @@ test_generation_consumers(void)
         "sorted arrangement returned deferred buffer while pinned");
     CHECK(sorted_probe.arr->sorted[1] == 1,
         "sorted arrangement probe changed while pinned");
+    CHECK(col_rel_source_reader_acquire(rel, &failed_adopted_reader) == 0,
+        "failed sorted probe source reader setup failed");
+    CHECK(col_session_acquire_sorted_arrangement_probe_with_source_reader(
+            session, rel, 1, &failed_adopted_probe, &failed_adopted_reader)
+        == EBUSY && !failed_adopted_probe.active
+        && failed_adopted_reader.owner,
+        "failed sorted probe adoption consumed caller reader");
+    CHECK(col_rel_source_reader_release(&failed_adopted_reader) == 0,
+        "failed sorted probe caller reader release failed");
     CHECK(col_session_get_sorted_arrangement(cs, "aux0", 0) != NULL
         && col_session_get_sorted_arrangement(cs, "aux1", 0) != NULL
         && col_session_get_sorted_arrangement(cs, "aux2", 0) != NULL
@@ -305,6 +318,20 @@ test_generation_consumers(void)
         && sorted->sorted[(size_t)(sorted->nrows - 1) * sorted->ncols + 1]
         == 2000,
         "sorted arrangement did not rebuild after probe release");
+    CHECK(col_rel_source_reader_acquire(rel, &adopted_reader) == 0,
+        "sorted probe adoption source reader setup failed");
+    CHECK(col_session_acquire_sorted_arrangement_probe_with_source_reader(
+            session, rel, 1, &adopted_probe, &adopted_reader) == 0
+        && adopted_probe.active && !adopted_reader.owner
+        && cs->sarr_active_pins == 1,
+        "sorted probe adoption failed to transfer caller reader");
+    CHECK(col_rel_set(rel, 0, 1, 3000) == EBUSY,
+        "adopted sorted probe did not hold source reader");
+    CHECK(col_sorted_arrangement_probe_release(&adopted_probe) == 0
+        && cs->sarr_active_pins == 0,
+        "adopted sorted probe release failed");
+    CHECK(col_rel_set(rel, 0, 1, 3000) == 0,
+        "adopted sorted probe retained source reader after release");
 
     col_diff_arrangement_t *diff = col_session_get_diff_arrangement(cs,
             "edge", rel, &key_col, 1);
@@ -398,6 +425,16 @@ test_generation_consumers(void)
     result = 1;
 
 cleanup:
+    if (adopted_probe.active)
+        (void)col_sorted_arrangement_probe_release(&adopted_probe);
+    if (adopted_reader.owner)
+        (void)col_rel_source_reader_release(&adopted_reader);
+    if (failed_adopted_probe.active)
+        (void)col_sorted_arrangement_probe_release(&failed_adopted_probe);
+    if (failed_adopted_reader.owner)
+        (void)col_rel_source_reader_release(&failed_adopted_reader);
+    if (sorted_probe.active)
+        (void)col_sorted_arrangement_probe_release(&sorted_probe);
     wl_columnar_arrangement_diff_txn_abort(&worker_txn);
     if (worker_rel)
         col_rel_destroy(worker_rel);

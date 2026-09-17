@@ -2792,6 +2792,11 @@ col_session_acquire_sorted_arrangement_probe(wl_session_t *session,
     const col_rel_t *source, uint32_t key_col,
     col_sorted_arrangement_probe_t *probe);
 int
+col_session_acquire_sorted_arrangement_probe_with_source_reader(
+    wl_session_t *session, const col_rel_t *source, uint32_t key_col,
+    col_sorted_arrangement_probe_t *probe,
+    wl_columnar_source_access_reader_t *source_reader);
+int
 col_sorted_arrangement_probe_release(col_sorted_arrangement_probe_t *probe);
 void
 col_session_free_sorted_arrangements(wl_col_session_t *cs);

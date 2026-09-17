@@ -930,8 +930,10 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         /* Use a leased pre-sorted arrangement when available.  The lease
          * covers the source generation, sorted buffer, and registry entry
          * until the join and all callbacks have stopped reading it. */
-        int pin_rc = col_session_acquire_sorted_arrangement_probe(
-            (wl_session_t *)sess, rel, kc, &sorted_probes[i]);
+        int pin_rc
+            = col_session_acquire_sorted_arrangement_probe_with_source_reader(
+                (wl_session_t *)sess, rel, kc, &sorted_probes[i],
+                &source_readers[i]);
         if (pin_rc == 0) {
             col_sorted_arr_t *sarr = sorted_probes[i].arr;
             inputs[i].data = sarr->sorted;
