@@ -153,6 +153,11 @@ typedef struct {
     uintptr_t identity;
 } wl_compound_arena_mutation_t;
 
+typedef struct {
+    wl_compound_arena_t *arena;
+    uintptr_t identity;
+} wl_arena_compound_arena_gc_hold_t;
+
 typedef enum {
     WL_COMPOUND_FAIL_NONE = 0,
     WL_COMPOUND_FAIL_PAYLOAD = 1,
@@ -205,6 +210,7 @@ struct wl_compound_arena {
     wl_compound_admission_abort_fn admission_abort;
     wl_compound_admission_release_fn admission_release_reservation;
     wl_atomic_u64 access_gate;
+    wl_atomic_u64 gc_hold_count;
     uint32_t test_failpoint;
 };
 
@@ -257,6 +263,30 @@ bool
 wl_compound_arena_mutation_end(wl_compound_arena_mutation_t *mutation);
 bool
 wl_compound_arena_free_checked(wl_compound_arena_t *arena);
+
+/** Protect handle IDs from GC and destruction without blocking allocation or
+ * multiplicity updates. Tokens must be zero-initialized, remain at a stable
+ * address, and must not be copied or manipulated concurrently. The caller must
+ * already own a live arena when acquiring. A hold does not protect payload
+ * pointers from relocation; use an ordinary borrow for pointer access.
+ * Returns 0, EINVAL (invalid token), EBUSY (writer), or EOVERFLOW. */
+int
+wl_arena_compound_arena_gc_hold_acquire(wl_compound_arena_t *arena,
+    wl_arena_compound_arena_gc_hold_t *hold);
+
+/** Release without acquiring the mutation gate or implicitly running GC.
+ * Returns 0 or EINVAL; invalid tokens are unchanged. */
+int
+wl_arena_compound_arena_gc_hold_release(
+    wl_arena_compound_arena_gc_hold_t *hold);
+
+/** Collect only when no hold, borrow, writer, or freeze prevents collection.
+ * Returns EINVAL for invalid arguments, EBUSY without changing *reclaimed on
+ * refusal, or 0 with the reclaimed count. Saturated arenas return 0 reclaimed.
+ */
+int
+wl_arena_compound_arena_gc_epoch_boundary_checked(wl_compound_arena_t *arena,
+    uint32_t *reclaimed);
 void
 wl_compound_arena_test_fail_next(wl_compound_arena_t *arena,
     wl_compound_alloc_failpoint_t failpoint);
@@ -376,7 +406,7 @@ wl_compound_arena_unfreeze(wl_compound_arena_t *arena);
  *
  * Returns:
  *   - (uint32_t)-1 if @arena is NULL.
- *   - arena->current_epoch (unchanged) if @arena is frozen.
+ *   - arena->current_epoch (unchanged) if frozen, held, or the gate is busy.
  *   - the number of handles reclaimed (>= 0) otherwise.
  */
 uint32_t
