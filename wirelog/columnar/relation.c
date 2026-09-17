@@ -4273,9 +4273,15 @@ col_rel_prepare_replacement_impl(col_rel_t *dst, const col_rel_t *candidate,
 
     if (writer_held) {
         col_rel_t *owner = NULL;
+        /* Only a token that names this exact replacement object and the
+         * current thread is ours to hold and later release.  A copied or
+         * otherwise forged token would make discard release a gate this
+         * replacement never admitted. */
         if (!replacement->writer_acquired
             || col_rel_storage_owner_resolve(dst, &owner) != 0
             || replacement->writer.owner != &owner->source_access
+            || replacement->writer.identity
+            != (uintptr_t)&replacement->writer
             || !wl_columnar_source_access_writer_thread_equal(
                 &replacement->writer)) {
             rc = EINVAL;
@@ -4426,6 +4432,7 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
         abort();
     assert(replacement->writer_acquired
         && replacement->writer.owner == &owner->source_access
+        && replacement->writer.identity == (uintptr_t)&replacement->writer
         && wl_columnar_source_access_writer_thread_equal(
             &replacement->writer));
     staged = replacement->staged;
