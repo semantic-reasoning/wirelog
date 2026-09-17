@@ -193,8 +193,8 @@ void (*wl_columnar_eval_serial_test_after_plan)(wl_col_session_t *sess,
 #endif
 
 static int
-wl_columnar_eval_serial_nonrec_relation(const wl_plan_relation_t *rp,
-    wl_col_session_t *sess)
+wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
+    wl_col_session_t *sess, bool recursive)
 {
     wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
     int rc = wl_columnar_eval_stack_cleanup_begin(sess, &frame);
@@ -216,7 +216,7 @@ wl_columnar_eval_serial_nonrec_relation(const wl_plan_relation_t *rp,
         goto done;
     }
     rc = eval_stack_drain(stack);
-    if (rc != 0 || !result->rel)
+    if (rc != 0 || !result->rel || (recursive && result->rel->nrows == 0))
         goto done;
     col_rel_t *target = session_find_rel(sess, rp->name);
     if (target) {
@@ -241,6 +241,12 @@ wl_columnar_eval_serial_nonrec_relation(const wl_plan_relation_t *rp,
             if (rc != 0)
                 goto done;
             *result = eval_stack_pop(stack);
+        }
+        if (recursive && target->ncols == 0 && result->rel->ncols > 0) {
+            rc = col_rel_set_schema(target, result->rel->ncols,
+                    (const char *const *)result->rel->col_names);
+            if (rc != 0)
+                goto done;
         }
         rc = col_rel_append_all(target, result->rel, sess->eval_arena);
         goto done;
@@ -286,8 +292,9 @@ int
 col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t stratum_idx)
 {
-    if (!sp->is_recursive && !sess->coordinator && sess->num_workers <= 1
-        && sess->cleanup_active)
+    bool framed = !sess->coordinator && sess->num_workers <= 1
+        && (!sp->is_recursive || !sess->delta_rollback);
+    if (framed && sess->cleanup_active)
         return EBUSY;
     int readiness_rc = wl_columnar_session_cleanup_ready(sess);
     if (readiness_rc != 0)
@@ -314,8 +321,9 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 return par_rc;
             }
 
-            if (!sess->coordinator && sess->num_workers <= 1) {
-                int rc = wl_columnar_eval_serial_nonrec_relation(rp, sess);
+            if (framed) {
+                int rc = wl_columnar_eval_serial_framed_relation(rp, sess,
+                        false);
                 if (rc != 0)
                     return rc;
                 continue;
@@ -696,6 +704,20 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                     continue;
                 }
 
+                if (framed) {
+                    /* Previous-pass publication transferred every private
+                     * delta before a rule may retain cleanup dependencies. */
+                    for (uint32_t di = 0; di < nrels; di++)
+                        assert(delta_rels[di] == NULL);
+                    int rc = wl_columnar_eval_serial_framed_relation(rp,
+                            sess, true);
+                    if (rc != 0) {
+                        outer_rc = rc;
+                        goto stride_error;
+                    }
+                    continue;
+                }
+
                 eval_stack_t stack;
                 eval_stack_init(&stack);
 
@@ -965,6 +987,15 @@ stride_error:
         if (outer_rc != 0) {
             /* Issue #282: Restore diff_operators_active on error path */
             sess->diff_operators_active = saved_diff_operators_active;
+            if (framed && sess->cleanup_pending) {
+                /* Retained rule entries may borrow any registered delta or
+                 * cache. Only local bookkeeping can be released here. */
+                for (uint32_t ri = 0; ri < nrels; ri++)
+                    assert(delta_rels[ri] == NULL);
+                free(snap);
+                free((void *)delta_rels);
+                return outer_rc;
+            }
             for (uint32_t ri = 0; ri < nrels; ri++) {
                 /* Publication is atomic per relation. Preserve the old owner
                  * and any successfully published prefix even if their readers
