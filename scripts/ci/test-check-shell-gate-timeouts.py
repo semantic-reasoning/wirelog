@@ -105,6 +105,17 @@ class GateCase(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("ok 3 shell-seeded tests", out)
 
+    def test_darwin_platform_passes_shell_gate(self) -> None:
+        self.write([shell_test("check-macos", 120)])
+        saved = self.gate.sys.platform
+        self.gate.sys.platform = "darwin"
+        try:
+            rc, out, _ = self.run_gate()
+        finally:
+            self.gate.sys.platform = saved
+        self.assertEqual(rc, 0)
+        self.assertIn("ok 1 shell-seeded tests", out)
+
     def test_rule_is_suite_agnostic(self) -> None:
         self.write([shell_test("check-sbom", 30, suite="wirelog:sbom")])
         rc, _, err = self.run_gate()
