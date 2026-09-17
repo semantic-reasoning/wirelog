@@ -1364,10 +1364,12 @@ cleanup:
     return rc;
 }
 
-#ifdef WL_TEST_BDX_SEED
+#if defined(WL_TEST_BDX_SEED) || defined(WL_SESSION_TEST_HOOKS)
 void (*wl_columnar_eval_test_subpass_boundary)(wl_col_session_t *, uint32_t,
     bool);
+#endif
 
+#ifdef WL_TEST_BDX_SEED
 int
 wl_columnar_eval_test_retire_prior_deltas(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord, uint32_t workers)
@@ -1385,6 +1387,16 @@ tdd_worker_subpass_fn(void *arg)
     uint32_t eff_iter = ctx->eff_iter;
     uint32_t nrels = sp->relation_count;
     uint64_t worker_t0 = now_ns();
+
+    if (!ctx->outbound_only) {
+        int readiness_rc = sess->cleanup_active ? EBUSY
+            : wl_columnar_session_cleanup_ready(sess);
+        if (readiness_rc != 0) {
+            ctx->rc = readiness_rc;
+            ctx->runtime_ns = now_ns() - worker_t0;
+            return;
+        }
+    }
 
     /* Issue #282: Enable differential operators from eff_iter 1 onward.
      * Mirrors eval_serial.c:395-396 / Clarification 3.
@@ -1467,6 +1479,21 @@ tdd_worker_subpass_fn(void *arg)
         if (has_empty_forced_delta(rp, sess, eff_iter))
             continue;
 
+        if (!ctx->outbound_only) {
+            /* Fresh queue/matrix deltas are produced only after every
+             * ordinary rule frame has finished. Prior-round dependencies
+             * remain registered until checked retirement after the barrier. */
+            for (uint32_t di = 0; di < nrels; di++)
+                assert(ctx->delta_rels[di] == NULL);
+            int rc = wl_columnar_eval_serial_framed_relation(rp, sess, true);
+            if (rc != 0) {
+                ctx->rc = rc;
+                free(snap);
+                TDD_WORKER_RETURN();
+            }
+            continue;
+        }
+
         eval_stack_t stack;
         eval_stack_init(&stack);
 
@@ -1528,11 +1555,8 @@ tdd_worker_subpass_fn(void *arg)
          * malformed entries, so a NULL here is only the ordinary empty-result
          * representation.
          *
-         * Two dereferences follow otherwise: ->name / ->ncols on the
-         * non-outbound path.  col_rel_new_like() below no longer needs one:
-         * since Issue #1140 it rejects a NULL src and returns NULL, which
-         * its caller already checks.  col_rel_destroy(NULL) is a no-op, so
-         * the continue leaks nothing. */
+         * The outbound copy below requires a nonempty relation. Ordinary
+         * publication already returned through the framed helper above. */
         if (!result.rel || result.rel->nrows == 0) {
             if (result.owned)
                 col_rel_destroy(result.rel);
@@ -1623,82 +1647,6 @@ tdd_worker_subpass_fn(void *arg)
             if (produced)
                 any_new = true;
             continue;
-        }
-
-        if (!target) {
-            col_rel_t *copy;
-            if (result.owned) {
-                copy = result.rel;
-                free(copy->name);
-                copy->name = wl_strdup(rp->name);
-                if (!copy->name) {
-                    col_rel_destroy(copy);
-                    ctx->rc = ENOMEM;
-                    free(snap);
-                    sess->tdd_subpass_active = saved_tdd_subpass;
-                    sess->tdd_outbound_only_active = saved_outbound_only;
-                    sess->diff_operators_active = saved_diff;
-                    TDD_WORKER_RETURN();
-                }
-                result.owned = false;
-            } else {
-                copy = col_rel_pool_new_like(sess->delta_pool, rp->name,
-                        result.rel);
-                if (!copy) {
-                    ctx->rc = ENOMEM;
-                    free(snap);
-                    sess->tdd_subpass_active = saved_tdd_subpass;
-                    sess->tdd_outbound_only_active = saved_outbound_only;
-                    sess->diff_operators_active = saved_diff;
-                    TDD_WORKER_RETURN();
-                }
-                rc = col_rel_append_all(copy, result.rel, sess->eval_arena);
-                if (rc != 0) {
-                    col_rel_destroy(copy);
-                    ctx->rc = rc;
-                    free(snap);
-                    sess->tdd_subpass_active = saved_tdd_subpass;
-                    sess->tdd_outbound_only_active = saved_outbound_only;
-                    sess->diff_operators_active = saved_diff;
-                    TDD_WORKER_RETURN();
-                }
-            }
-            rc = session_add_rel(sess, copy);
-            if (rc != 0) {
-                col_rel_destroy(copy);
-                ctx->rc = rc;
-                free(snap);
-                sess->tdd_subpass_active = saved_tdd_subpass;
-                sess->tdd_outbound_only_active = saved_outbound_only;
-                sess->diff_operators_active = saved_diff;
-                TDD_WORKER_RETURN();
-            }
-        } else {
-            if (target->ncols == 0 && result.rel->ncols > 0) {
-                rc = col_rel_set_schema(target, result.rel->ncols,
-                        (const char *const *)result.rel->col_names);
-                if (rc != 0) {
-                    if (result.owned)
-                        col_rel_destroy(result.rel);
-                    ctx->rc = rc;
-                    free(snap);
-                    sess->tdd_subpass_active = saved_tdd_subpass;
-                    sess->tdd_outbound_only_active = saved_outbound_only;
-                    sess->diff_operators_active = saved_diff;
-                    TDD_WORKER_RETURN();
-                }
-            }
-            rc = col_rel_append_all(target, result.rel, sess->eval_arena);
-            if (result.owned)
-                col_rel_destroy(result.rel);
-            if (rc != 0) {
-                ctx->rc = rc;
-                free(snap);
-                sess->tdd_subpass_active = saved_tdd_subpass;
-                sess->tdd_outbound_only_active = saved_outbound_only;
-                sess->diff_operators_active = saved_diff;
-                TDD_WORKER_RETURN();
-            }
         }
     }
 
@@ -5877,7 +5825,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 ctxs[w].runtime_ns = 0;
                 ctxs[w].rc = 0;
             }
-#ifdef WL_TEST_BDX_SEED
+#if defined(WL_TEST_BDX_SEED) || defined(WL_SESSION_TEST_HOOKS)
             if (wl_columnar_eval_test_subpass_boundary)
                 wl_columnar_eval_test_subpass_boundary(coord, eff_iter, true);
 #endif
@@ -5936,7 +5884,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             if (wait_ns > worker_max_ns)
                 coord->tdd_idle_estimate_ns += wait_ns - worker_max_ns;
 
-#ifdef WL_TEST_BDX_SEED
+#if defined(WL_TEST_BDX_SEED) || defined(WL_SESSION_TEST_HOOKS)
             if (wl_columnar_eval_test_subpass_boundary)
                 wl_columnar_eval_test_subpass_boundary(coord, eff_iter, false);
 #endif
