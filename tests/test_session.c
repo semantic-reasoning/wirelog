@@ -4561,6 +4561,72 @@ cleanup:
 }
 
 static void
+test_worker_serial_segments(bool recursive, unsigned mode)
+{
+    TEST("worker serial CONCAT: consumed metadata, empty and error retry");
+    uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, mode == 1 ? 0 : 1 };
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } },
+        { .op = WL_PLAN_OP_CONCAT },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "missing" }
+    };
+    wl_plan_relation_t output = { .name = "output", .delta_name = "$d$output",
+                                  .ops = ops, .op_count = mode == 2 ? 6 : 5 };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1,
+                                  .is_recursive = recursive };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *worker = NULL;
+    col_rel_t *partition = NULL;
+    const char *failure = NULL;
+    bool initialized = false;
+#define SEG_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    SEG_CHECK(wl_session_create(wl_backend_columnar(), &plan, 2,
+        &session) == 0, "create");
+    worker = calloc(1, sizeof(*worker));
+    SEG_CHECK(worker && col_worker_session_create(COL_SESSION(session), 0,
+        NULL, 0, worker) == 0, "worker create");
+    initialized = true;
+    partition = col_rel_new_auto("input", 1);
+    int64_t value = 42;
+    SEG_CHECK(partition && col_rel_append_row(partition, &value) == 0,
+        "worker input");
+    SEG_CHECK(session_add_rel(worker, partition) == 0, "register input");
+    partition = NULL;
+    if (mode == 2) {
+        SEG_CHECK(col_eval_stratum(&stratum, worker, 0) == ENOENT,
+            "post-CONCAT operator error");
+        output.op_count = 5;
+    }
+    SEG_CHECK(col_eval_stratum(&stratum, worker, 0) == 0,
+        "worker evaluation/retry");
+    col_rel_t *result = session_find_rel(worker, "output");
+    uint32_t expected = mode == 1 ? 0 : recursive ? 1 : 2;
+    SEG_CHECK(result && result->nrows == expected
+        && !worker->cleanup_active && !worker->cleanup_pending,
+        "legacy worker exact count or accidental frame activation");
+    for (uint32_t row = 0; row < expected; row++)
+        SEG_CHECK(col_rel_get(result, row, 0) == 42, "exact worker rows");
+cleanup:
+    col_rel_destroy(partition);
+    if (initialized && col_worker_session_destroy(worker) != 0)
+        failure = "worker cleanup";
+    free(worker);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef SEG_CHECK
+}
+
+static void
 test_recursive_cleanup_excluded_scope(unsigned mode)
 {
     TEST(
@@ -6320,6 +6386,10 @@ main(void)
     test_correctness_replay_refusal(0);
     test_correctness_replay_refusal(1);
     test_correctness_replay_refusal(2);
+    for (unsigned mode = 0; mode < 3; mode++) {
+        test_worker_serial_segments(false, mode);
+        test_worker_serial_segments(true, mode);
+    }
     test_recursive_cleanup_excluded_scope(0);
     test_recursive_cleanup_excluded_scope(1);
     test_recursive_cleanup_excluded_scope(2);

@@ -2661,6 +2661,99 @@ cleanup:
 #undef EMPTY_CHECK
 }
 
+static void
+test_tdd_worker_segments(uint32_t workers, unsigned mode, bool ordinary)
+{
+    TEST("TDD worker CONCAT: actual dispatch, empty result and error retry");
+    uint32_t key = 0;
+    uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, mode == 1 ? 0 : 1 };
+    wl_plan_op_exchange_t exchange = { .num_workers = 1,
+                                       .key_col_idxs = &key,
+                                       .key_col_count = 1 };
+    const char *keys[] = { "col0" };
+    uint32_t projection[] = { 0 };
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } },
+        { .op = WL_PLAN_OP_CONCAT },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "missing" }
+    };
+    if (ordinary) {
+        ops[0].relation_name = "output";
+        ops[1] = (wl_plan_op_t) { .op = WL_PLAN_OP_JOIN,
+                                  .right_relation = "output", .left_keys = keys,
+                                  .right_keys = keys,
+                                  .key_count = 1, .project_indices = projection,
+                                  .project_count = 1 };
+    }
+    wl_plan_relation_t output = { .name = "output", .delta_name = "$d$output",
+                                  .ops = ops, .op_count = mode == 2 ? 7 : 6 };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1,
+                                  .is_recursive = true };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    int64_t *values = NULL;
+    col_rel_t *unregistered = NULL;
+    const char *failure = NULL;
+    const uint32_t count = 65536;
+#define WORKER_SEG_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    WORKER_SEG_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "create");
+    wl_col_session_t *sess = (wl_col_session_t *)session;
+    values = malloc((size_t)count * sizeof(*values));
+    WORKER_SEG_CHECK(values, "input allocation");
+    for (uint32_t row = 0; row < count; row++)
+        values[row] = 42;
+    WORKER_SEG_CHECK(wl_session_insert(session, "input", values, count, 1) == 0,
+        "insert");
+    /* Union an aligned IDB self-join with filtered input to exercise ordinary
+     * publication; the other fixture uses outbound owner publication. */
+    if (ordinary) {
+        unregistered = col_rel_new_auto("output", 1);
+        WORKER_SEG_CHECK(unregistered, "empty IDB allocation");
+        unregistered->column_types =
+            malloc(sizeof(*unregistered->column_types));
+        WORKER_SEG_CHECK(unregistered->column_types, "empty IDB type");
+        unregistered->column_types[0] = WIRELOG_TYPE_INT64;
+        WORKER_SEG_CHECK(session_add_rel(sess, unregistered) == 0, "empty IDB");
+        unregistered = NULL;
+    }
+    sess->tdd_audit.enabled = true;
+    if (mode == 2) {
+        WORKER_SEG_CHECK(col_eval_stratum_tdd(&stratum, sess, 0) == ENOENT
+            && sess->tdd_audit.selected_workers == workers
+            && sess->tdd_audit.submitted_tasks >= workers
+            && sess->tdd_workers_count == 0, "actual worker error");
+        output.op_count = 6;
+    }
+    int eval_rc = col_eval_stratum_tdd(&stratum, sess, 0);
+    WORKER_SEG_CHECK(eval_rc == 0, "worker evaluation/retry");
+    col_rel_t *result = session_find_rel(sess, "output");
+    WORKER_SEG_CHECK(sess->tdd_audit.selected_workers == workers
+        && sess->tdd_audit.submitted_tasks >= workers
+        && strcmp(sess->tdd_audit.strategy, ordinary ? "aligned" : "owner") == 0
+        && sess->tdd_workers_count == 0
+        && result && result->nrows == (mode == 1 ? 0u : 1u),
+        "actual outbound workers or exact row count");
+    if (mode != 1)
+        WORKER_SEG_CHECK(col_rel_get(result, 0, 0) == 42, "exact row");
+cleanup:
+    col_rel_destroy(unregistered);
+    free(values);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef WORKER_SEG_CHECK
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -2684,6 +2777,12 @@ main(void)
     test_tdd_existing_empty_idb(8, false, false);
     test_tdd_existing_empty_idb(8, false, true);
     test_tdd_existing_empty_idb(2, true, false);
+    for (unsigned mode = 0; mode < 3; mode++) {
+        test_tdd_worker_segments(2, mode, false);
+        test_tdd_worker_segments(8, mode, false);
+        test_tdd_worker_segments(2, mode, true);
+        test_tdd_worker_segments(8, mode, true);
+    }
     test_tc_w1_baseline();
     test_tc_w2_correctness();
     test_tc_w4_correctness();

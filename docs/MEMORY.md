@@ -251,6 +251,14 @@ sessions retain the same governor reference and release it during every
 normal or partial teardown path. The fixed eval arenas now use
 `wl_arena_create_managed()`: their complete backing capacity is admitted before
 `malloc`, retained across reset, and released exactly once at destruction.
+Worker evaluators retire final CONCAT segment boundaries after validating the
+popped relation entry and before lower-stack cleanup. These arrays describe
+intra-plan merging and have no publication-time consumer; relation source
+readers protect descriptor/storage, not the consumed entry metadata. This
+metadata retirement does not supply retained worker result/stack ownership:
+worker refusal and allocator-lifetime integration remain tracked by #1661
+and #1686.
+
 Hybrid TDD initialization gives existing empty IDBs private governed worker
 relations, preserving schema, graph/compound metadata and timestamp mode.
 Only EDB/earlier-stratum inputs use shared views: borrowing empty IDB storage
