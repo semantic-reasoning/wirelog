@@ -187,6 +187,93 @@ wl_columnar_eval_serial_canonicalize_aggregates(const wl_plan_stratum_t *sp,
     return 0;
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_eval_serial_test_after_plan)(wl_col_session_t *sess,
+    eval_stack_t *stack, eval_entry_t *result);
+#endif
+
+static int
+wl_columnar_eval_serial_nonrec_relation(const wl_plan_relation_t *rp,
+    wl_col_session_t *sess)
+{
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    int rc = wl_columnar_eval_stack_cleanup_begin(sess, &frame);
+    if (rc != 0)
+        return rc;
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame);
+    eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(frame);
+    rc = col_eval_relation_plan(rp, stack, sess);
+    if (rc == 0 && stack->top != 0)
+        *result = eval_stack_pop(stack);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_serial_test_after_plan)
+        wl_columnar_eval_serial_test_after_plan(sess, stack, result);
+#endif
+    if (rc != 0)
+        goto done;
+    if (result->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION) {
+        rc = ENOTSUP;
+        goto done;
+    }
+    rc = eval_stack_drain(stack);
+    if (rc != 0 || !result->rel)
+        goto done;
+    col_rel_t *target = session_find_rel(sess, rp->name);
+    if (target) {
+        if (result->owned) {
+            /* Dispose the externally observable result before publication.
+            * Otherwise a refused destroy after append duplicates rows on
+            * an initial snapshot retry. The private copy never escapes. */
+            col_rel_t *copy = wl_columnar_relation_new_like_governed(
+                "$publish", result->rel, sess->memory_governor);
+            if (!copy) {
+                rc = ENOMEM;
+                goto done;
+            }
+            rc = eval_stack_push(stack, copy, true);
+            if (rc != 0) {
+                col_rel_destroy(copy);
+                goto done;
+            }
+            rc = col_rel_append_all(copy, result->rel, NULL);
+            if (rc == 0)
+                rc = eval_entry_dispose(result);
+            if (rc != 0)
+                goto done;
+            *result = eval_stack_pop(stack);
+        }
+        rc = col_rel_append_all(target, result->rel, sess->eval_arena);
+        goto done;
+    }
+    if (result->owned) {
+        rc = wl_columnar_relation_rename_checked(result->rel, rp->name);
+        if (rc != 0)
+            goto done;
+    } else {
+        col_rel_t *source = result->rel;
+        col_rel_t *copy = col_rel_pool_new_like(sess->delta_pool,
+                rp->name, source);
+        if (!copy) {
+            rc = ENOMEM;
+            goto done;
+        }
+        result->rel = copy;
+        result->owned = true;
+        rc = col_rel_append_all(copy, source, sess->eval_arena);
+        if (rc != 0)
+            goto done;
+    }
+    rc = session_add_rel(sess, result->rel);
+    if (rc == 0) {
+        /* Pool promotion may have retired the original descriptor. */
+        result->rel = NULL;
+        result->owned = false;
+    }
+done:;
+    int cleanup_rc = wl_columnar_eval_stack_cleanup_finish(&frame);
+    return cleanup_rc != 0 ? cleanup_rc : rc;
+}
+
 /*
  * col_eval_stratum:
  * Evaluate one stratum, writing results into session relations.
@@ -199,6 +286,9 @@ int
 col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t stratum_idx)
 {
+    if (!sp->is_recursive && !sess->coordinator && sess->num_workers <= 1
+        && sess->cleanup_active)
+        return EBUSY;
     int readiness_rc = wl_columnar_session_cleanup_ready(sess);
     if (readiness_rc != 0)
         return readiness_rc;
@@ -222,6 +312,13 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                     fprintf(stderr, "nonrec_tdd failed rel=%s rc=%d\n",
                         rp->name ? rp->name : "(null)", par_rc);
                 return par_rc;
+            }
+
+            if (!sess->coordinator && sess->num_workers <= 1) {
+                int rc = wl_columnar_eval_serial_nonrec_relation(rp, sess);
+                if (rc != 0)
+                    return rc;
+                continue;
             }
 
             eval_stack_t stack;

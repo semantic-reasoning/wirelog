@@ -4204,6 +4204,10 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
         }
 
         if (rc != 0) {
+            if (sess->cleanup_pending) {
+                sess->tdd_decision_tracking_active = false;
+                return rc;
+            }
             /* A reader may still depend on a delta after evaluation fails.
              * Checked removal keeps that exact registry owner on refusal;
              * continue reclaiming other deltas without losing the busy one. */

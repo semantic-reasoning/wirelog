@@ -1905,8 +1905,8 @@ typedef struct wl_col_session_t {
     wl_columnar_session_source_lease_t *source_leases;
     col_rel_t *deferred_relations;
     uint32_t deferred_relation_count;
-    /* Inactive evaluator-cleanup prerequisite (#1661). Production callers
-     * must not activate until allocator and operation boundaries are wired. */
+    /* Persistent cleanup for W=1 coordinator nonrecursive evaluation.
+     * Worker, recursive and W>1 caller adoption remains under #1661. */
     wl_columnar_eval_stack_cleanup_frame_t *cleanup_active;
     wl_columnar_eval_stack_cleanup_frame_t *cleanup_pending;
     uint32_t cleanup_active_count;
@@ -2083,7 +2083,8 @@ typedef struct {
 
 /* Allocate/admit before evaluating. Pending cleanup blocks begin. ENOSPC
  * denotes governor denial, ENOMEM allocation failure, ENOBUFS the frame cap.
- * Session access must be serialized. No production caller is wired yet. */
+ * Session access must be serialized. W=1 coordinator nonrecursive evaluation
+ * uses this ownership boundary. */
 int
 wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
     wl_columnar_eval_stack_cleanup_frame_t **out);
@@ -2109,6 +2110,8 @@ wl_columnar_eval_stack_cleanup_retry(wl_col_session_t *sess);
 /* Relation Storage (columnar/relation.c)                                   */
 /* ======================================================================== */
 
+int
+wl_columnar_relation_rename_checked(col_rel_t *rel, const char *name);
 void
 col_rel_free_contents(col_rel_t *r);
 uint64_t
@@ -2485,6 +2488,12 @@ col_rel_t *
 col_rel_new_auto(const char *name, uint32_t ncols);
 col_rel_t *
 col_rel_new_like(const char *name, const col_rel_t *src);
+/* Admit column/timestamp buffers before allocation; preserve required
+ * compound and timestamp metadata or fail. Descriptor/name overhead follows
+ * the existing constructor contract. NULL includes admission denial. */
+col_rel_t *
+wl_columnar_relation_new_like_governed(const char *name, const col_rel_t *src,
+    wl_columnar_memory_governor_ref_t *governor);
 #ifdef WL_TEST_BDX_SEED
 int
 wl_columnar_eval_test_bdx_seed(col_rel_t *cidb,
