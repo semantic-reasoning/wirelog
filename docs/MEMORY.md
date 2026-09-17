@@ -260,7 +260,12 @@ Hybrid TDD initialization gives existing empty IDBs private governed worker
 relations, preserving schema, graph/compound metadata and timestamp mode.
 Only EDB/earlier-stratum inputs use shared views: borrowing empty IDB storage
 would prevent the coordinator from publishing the first delta. Partial setup
-reclaims every untransferred slot, including the current incomplete relation.
+reclaims every untransferred slot, including the current incomplete relation. The
+partitioned, replicated and global-read initializers likewise inspect every
+allocated worker row and original relation slot on failure. Non-NULL matrix
+entries remain caller-owned; worker creation NULLs entries only on transfer.
+Attempted-worker counts control checked teardown, never caller-slot cleanup.
+A refused worker stays in the coordinator cohort until release and retry.
 
 The fixed delta-pool slab and data arena follow the same lifecycle through
 `delta_pool_create_managed()`. Coordinator, ordinary worker, and K-fusion
