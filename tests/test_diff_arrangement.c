@@ -13,7 +13,9 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#ifndef _MSC_VER
 #include <stdatomic.h>
+#endif
 #include <string.h>
 
 /* Include the headers we need */
