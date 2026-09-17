@@ -51,6 +51,7 @@ wirelog/columnar/delta_pool_admission.c
 wirelog/columnar/diff.c
 wirelog/columnar/diff_arrangement.c
 wirelog/columnar/diff_bridge.c
+wirelog/columnar/diff_join_batch.c
 wirelog/columnar/diff_trace.c
 wirelog/columnar/diff_vtable.c
 wirelog/columnar/eval.c
