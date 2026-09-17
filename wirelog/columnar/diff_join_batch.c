@@ -110,6 +110,8 @@ producer_validate(void *context,
         return false;
     if (pos.rr != UINT32_MAX && pos.rr >= p->arr->ht_cap)
         return false;
+    if (pos.lr > p->left->nrows)
+        return false;
     if (c->timestamps != (p->left->timestamps != NULL
         || p->right->timestamps != NULL))
         return false;
@@ -125,6 +127,7 @@ producer_produce(void *context,
     col_join_batch_pos_t pos;
     col_join_batch_pos_t next;
     uint32_t n = 0;
+    bool complete = false;
     uint64_t bytes;
 
     if (!p || !cursor || !batch || !p->batch)
@@ -182,6 +185,7 @@ producer_produce(void *context,
         next.lr = lr + 1u;
         next.rr = UINT32_MAX;
     }
+    complete = true;
 
 emit:
     if (n == 0) {
@@ -198,7 +202,7 @@ emit:
     batch->payload = p->batch;
     batch->bytes = bytes;
     batch->rows = n;
-    batch->complete = next.lr >= p->left->nrows;
+    batch->complete = complete;
     batch->next_cursor = *cursor;
     batch->next_cursor.position = pos_pack(next.lr, next.rr);
     batch->next_cursor.sequence = cursor->sequence + 1u;

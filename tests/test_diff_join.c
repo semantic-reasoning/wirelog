@@ -355,6 +355,18 @@ relation_contents_equal(const col_rel_t *left, const col_rel_t *right)
     return true;
 }
 
+static uint32_t
+packed_cursor_lr(uint64_t position)
+{
+    return (uint32_t)(position >> 32);
+}
+
+static uint32_t
+packed_cursor_rr(uint64_t position)
+{
+    return (uint32_t)position;
+}
+
 /* ========================================================================
  * TEST CASES
  * ======================================================================== */
@@ -1737,6 +1749,138 @@ test_diff_join_batch_signed_timestamps(void)
     PASS;
 }
 
+static void
+test_diff_join_batch_rejects_invalid_resume_cursor(void)
+{
+    const char *names[] = { "k", "v" };
+    const uint32_t key = 0;
+    char *left_keys[] = { "k" };
+    char *right_keys[] = { "k" };
+    wl_plan_op_t op = { 0 };
+    wl_col_session_t *s = make_mock_session();
+    col_rel_t *left = make_rel("invalid_left", 2, names);
+    col_rel_t *right = make_rel("invalid_right", 2, names);
+    col_rel_t *out = NULL;
+    wl_columnar_continuation_t *cont = NULL;
+    wl_columnar_continuation_sink_t sink;
+    col_join_batch_relation_sink_t sink_ctx;
+    wl_columnar_continuation_status_t st;
+    uint32_t saved_nrows;
+    int64_t left0[] = { 1, 10 };
+    int64_t left1[] = { 2, 20 };
+    int64_t right0[] = { 1, 100 };
+
+    TEST("differential batch rejects invalid resume cursor before produce");
+    ASSERT_TRUE(s && left && right, "invalid cursor fixture allocation");
+    ASSERT_TRUE(col_rel_append_row(left, left0) == 0
+        && col_rel_append_row(left, left1) == 0,
+        "left rows appended");
+    ASSERT_TRUE(col_rel_append_row(right, right0) == 0, "right row appended");
+    ASSERT_TRUE(session_add_rel(s, right) == 0, "right relation registered");
+    op.op = WL_PLAN_OP_JOIN;
+    op.right_relation = "invalid_right";
+    op.left_keys = (const char *const *)left_keys;
+    op.right_keys = (const char *const *)right_keys;
+    op.key_count = 1;
+    ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, left, false,
+        &key, &key, 1, 32, &cont) == 0,
+        "differential batch producer created");
+    out = col_rel_new_auto("invalid_out", 4);
+    ASSERT_TRUE(out && col_join_set_output_types(out, left, right, &op) == 0,
+        "differential batch output created");
+    ASSERT_TRUE(col_join_batch_relation_sink_init(&sink_ctx, &sink, s, out)
+        == 0, "relation sink initialized");
+
+    st = wl_columnar_continuation_publish(cont, &sink);
+    ASSERT_TRUE(st == WL_COLUMNAR_CONTINUATION_OK && out->nrows == 1,
+        "first batch committed");
+    ASSERT_TRUE(wl_columnar_continuation_cursor(cont) != NULL
+        && packed_cursor_lr(wl_columnar_continuation_cursor(cont)->position)
+        == 1u, "cursor advanced to the second left row");
+
+    saved_nrows = left->nrows;
+    left->nrows = 0;
+    st = wl_columnar_continuation_publish(cont, &sink);
+    left->nrows = saved_nrows;
+    ASSERT_TRUE(st == WL_COLUMNAR_CONTINUATION_STALE,
+        "invalid resume cursor is rejected during validation");
+    ASSERT_TRUE(out->nrows == 1, "stale cursor did not append rows");
+
+    wl_columnar_continuation_destroy(cont);
+    col_rel_destroy(out);
+    col_rel_destroy(left);
+    destroy_mock_session(s);
+    PASS;
+}
+
+static void
+test_diff_join_batch_last_row_multimatch_continuation(void)
+{
+    const char *names[] = { "k", "v" };
+    const uint32_t key = 0;
+    char *left_keys[] = { "k" };
+    char *right_keys[] = { "k" };
+    wl_plan_op_t op = { 0 };
+    wl_col_session_t *s = make_mock_session();
+    col_rel_t *left = make_rel("last_left", 2, names);
+    col_rel_t *right = make_rel("last_right", 2, names);
+    col_rel_t *out = NULL;
+    wl_columnar_continuation_t *cont = NULL;
+    wl_columnar_continuation_sink_t sink;
+    col_join_batch_relation_sink_t sink_ctx;
+    const wl_columnar_continuation_cursor_t *cursor;
+    wl_columnar_continuation_status_t st;
+    int64_t left0[] = { 1, 10 };
+
+    TEST("differential batch continues after final-row multi-match batches");
+    ASSERT_TRUE(s && left && right, "last-row fixture allocation");
+    ASSERT_TRUE(col_rel_append_row(left, left0) == 0, "left row appended");
+    for (int64_t i = 0; i < 4; i++) {
+        int64_t right_row[] = { 1, 100 + i };
+        ASSERT_TRUE(col_rel_append_row(right, right_row) == 0,
+            "right row appended");
+    }
+    ASSERT_TRUE(session_add_rel(s, right) == 0, "right relation registered");
+    op.op = WL_PLAN_OP_JOIN;
+    op.right_relation = "last_right";
+    op.left_keys = (const char *const *)left_keys;
+    op.right_keys = (const char *const *)right_keys;
+    op.key_count = 1;
+    ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, left, false,
+        &key, &key, 1, 64, &cont) == 0,
+        "differential batch producer created");
+    out = col_rel_new_auto("last_out", 4);
+    ASSERT_TRUE(out && col_join_set_output_types(out, left, right, &op) == 0,
+        "differential batch output created");
+    ASSERT_TRUE(col_join_batch_relation_sink_init(&sink_ctx, &sink, s, out)
+        == 0, "relation sink initialized");
+
+    st = wl_columnar_continuation_publish(cont, &sink);
+    ASSERT_TRUE(st == WL_COLUMNAR_CONTINUATION_OK && out->nrows == 2
+        && !wl_columnar_continuation_is_done(cont),
+        "first final-row batch parks mid-chain without completing");
+
+    st = wl_columnar_continuation_publish(cont, &sink);
+    cursor = wl_columnar_continuation_cursor(cont);
+    ASSERT_TRUE(st == WL_COLUMNAR_CONTINUATION_OK && out->nrows == 4
+        && !wl_columnar_continuation_is_done(cont),
+        "batch filled on final match but completion is deferred");
+    ASSERT_TRUE(cursor != NULL && packed_cursor_lr(cursor->position) == 1u
+        && packed_cursor_rr(cursor->position) == UINT32_MAX,
+        "cursor parks after the final left row for completion publish");
+
+    st = wl_columnar_continuation_publish(cont, &sink);
+    ASSERT_TRUE(st == WL_COLUMNAR_CONTINUATION_DONE && out->nrows == 4
+        && wl_columnar_continuation_is_done(cont),
+        "following publish observes actual input exhaustion");
+
+    wl_columnar_continuation_destroy(cont);
+    col_rel_destroy(out);
+    col_rel_destroy(left);
+    destroy_mock_session(s);
+    PASS;
+}
+
 /* ========================================================================
  * MAIN
  * ======================================================================== */
@@ -1759,6 +1903,8 @@ main(void)
     test_diff_arrangement_txn_ledger_accounting();
     test_diff_arrangement_pin_lifetime();
     test_diff_join_batch_signed_timestamps();
+    test_diff_join_batch_rejects_invalid_resume_cursor();
+    test_diff_join_batch_last_row_multimatch_continuation();
     test_late_abort_does_not_advance_arrangement();
     test_result_is_delta_flag();
     test_large_dataset();
