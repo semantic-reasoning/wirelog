@@ -3835,7 +3835,7 @@ serial_cleanup_run(wl_session_t *session, tuple_collector_t *tuples,
 
 static void
 test_serial_cleanup_caller(unsigned storage, bool lower, bool existing,
-    unsigned recursive_mode)
+    unsigned recursive_mode, uint32_t workers)
 {
     TEST(lower ? "serial caller: lower owner refusal retains production frame"
         : "serial caller: CONCAT result refusal retains production frame");
@@ -3888,10 +3888,17 @@ test_serial_cleanup_caller(unsigned storage, bool lower, bool existing,
         sizeof(serial_cleanup_delta_reader));
     serial_cleanup_iteration = recursive_mode == 2 ? 1 : 0;
     serial_cleanup_expected_rows = recursive_mode == 4 ? 0 : 2;
-    SERIAL_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+    SERIAL_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
         &session) == 0
         && wl_session_insert(session, "input", &value, 1, 1) == 0, "fixture");
     sess = COL_SESSION(session);
+    SERIAL_CHECK(sess->num_workers == workers, "requested worker count");
+    if (workers > 1 && !recursive_mode) {
+        uint32_t registered = sess->nrels;
+        SERIAL_CHECK(wl_columnar_eval_nonrec_relation_parallel(&relations[1],
+            sess) == EAGAIN && sess->nrels == registered
+            && sess->tdd_workers_count == 0, "real parallel fallback boundary");
+    }
     if (delta_step)
         wl_session_set_delta_cb(session, collect_delta, &deltas);
     if (existing) {
@@ -3918,6 +3925,8 @@ test_serial_cleanup_caller(unsigned storage, bool lower, bool existing,
     SERIAL_CHECK(rc == EBUSY && serial_cleanup_hook_rc == 0
         && sess->cleanup_pending_count == 1 && !sess->cleanup_active,
         "caller did not retain refusal");
+    SERIAL_CHECK(workers == 1 || sess->tdd_workers_count == 0,
+        "fallback unexpectedly dispatched workers");
     SERIAL_CHECK(serial_cleanup_held->pool_owned == (storage != 0)
         && serial_cleanup_held->arena_owned == (storage == 2), "storage");
     SERIAL_CHECK(!existing || (session_find_rel(sess, "output")->nrows == 0
@@ -4028,7 +4037,7 @@ inject_serial_publication_failure(wl_col_session_t *sess, eval_stack_t *stack,
 #endif
 
 static void
-test_serial_cleanup_admission_and_failures(bool recursive)
+test_serial_cleanup_admission_and_failures(bool recursive, uint32_t workers)
 {
     TEST("serial caller: admission and publication failures release ownership");
     wl_plan_op_t ops[] = {
@@ -4052,7 +4061,7 @@ test_serial_cleanup_admission_and_failures(bool recursive)
     int64_t value = 42;
 #define SERIAL_FAIL_CHECK(condition, message) \
         do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
-    SERIAL_FAIL_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+    SERIAL_FAIL_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
         &session) == 0
         && wl_session_insert(session, "input", &value, 1, 1) == 0, "fixture");
     sess = COL_SESSION(session);
@@ -4327,9 +4336,235 @@ count_serial_scope_hook(wl_col_session_t *sess, eval_stack_t *stack,
 }
 
 static void
+test_coordinator_specialized_parallel(void)
+{
+    TEST("coordinator: safe parallel evaluation still bypasses serial frames");
+    wl_plan_op_t op = { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" };
+    wl_plan_relation_t output = { .name = "output", .ops = &op, .op_count = 1 };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    int64_t *values = NULL;
+    const char *failure = NULL;
+    const uint32_t count = 65536;
+#define PARALLEL_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    PARALLEL_CHECK(wl_session_create(wl_backend_columnar(), &plan, 2,
+        &session) == 0, "create");
+    values = malloc((size_t)count * sizeof(*values));
+    PARALLEL_CHECK(values, "allocate input");
+    for (uint32_t row = 0; row < count; row++)
+        values[row] = row;
+    PARALLEL_CHECK(wl_session_insert(session, "input", values, count, 1) == 0,
+        "insert");
+    serial_scope_hook_calls = 0;
+    wl_columnar_eval_serial_test_after_plan = count_serial_scope_hook;
+    wl_col_session_t *sess = COL_SESSION(session);
+    PARALLEL_CHECK(col_eval_stratum(&stratum, sess, 0) == 0
+        && sess->tdd_workers_cap >= 2 && sess->tdd_workers_count == 0
+        && serial_scope_hook_calls == 0 && !sess->cleanup_pending,
+        "specialized worker path did not complete");
+    col_rel_t *result = session_find_rel(sess, "output");
+    PARALLEL_CHECK(result && result->nrows == count, "parallel row count");
+    for (uint32_t row = 0; row < count; row++)
+        PARALLEL_CHECK(col_rel_get(result, row, 0) == (int64_t)row,
+            "parallel exact rows");
+cleanup:
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    free(values);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef PARALLEL_CHECK
+}
+
+extern bool wl_columnar_session_test_enable_correctness_replay;
+extern void (*wl_columnar_session_test_before_correctness_replay)(
+    wl_col_session_t *);
+static bool correctness_replay_entered, correctness_replay_lower;
+static wl_plan_op_t *correctness_replay_fault_op;
+static wl_plan_relation_t *correctness_replay_plan;
+static wl_plan_op_t *correctness_replay_ops;
+static int correctness_replay_hook_rc;
+static wl_columnar_source_access_reader_t correctness_replay_reader;
+static col_rel_t *correctness_replay_held;
+static col_rel_t *correctness_replay_target;
+static uint64_t correctness_replay_target_view;
+static uint32_t correctness_replay_target_rows;
+static int64_t **correctness_replay_target_columns;
+
+static void
+correctness_replay_before(wl_col_session_t *sess)
+{
+    correctness_replay_entered = sess->tdd_executed_strata > 0
+        && sess->tdd_workers_cap >= 2 && sess->tdd_workers_count == 0;
+    correctness_replay_plan->ops = correctness_replay_ops;
+    correctness_replay_plan->op_count = 4;
+    if (correctness_replay_fault_op)
+        correctness_replay_fault_op->relation_name = "missing_replay_input";
+}
+
+static void
+correctness_replay_hold(wl_col_session_t *sess, eval_stack_t *stack,
+    eval_entry_t *result)
+{
+    if (sess->coordinator || !correctness_replay_entered || !result->owned
+        || !result->rel || result->seg_count != 2)
+        return;
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    correctness_replay_hook_rc = EINVAL;
+    correctness_replay_held = result->rel;
+    if (correctness_replay_lower) {
+        col_rel_t *lower = col_rel_pool_new_auto(sess->delta_pool,
+                sess->eval_arena, "replay_lower", 1);
+        int64_t value = 42;
+        if (!lower || col_rel_append_row(lower, &value) != 0
+            || eval_stack_push(stack, lower, true) != 0) {
+            col_rel_destroy(lower);
+            return;
+        }
+        correctness_replay_held = lower;
+    }
+    correctness_replay_target = session_find_rel(sess, "output");
+    if (!correctness_replay_target)
+        return;
+    correctness_replay_target_view = correctness_replay_target->view_generation;
+    correctness_replay_target_rows = correctness_replay_target->nrows;
+    correctness_replay_target_columns = correctness_replay_target->columns;
+    correctness_replay_hook_rc = col_rel_source_reader_acquire(
+        correctness_replay_held, &correctness_replay_reader);
+}
+
+static void
+test_correctness_replay_refusal(unsigned mode)
+{
+    TEST(
+        "TDD correctness replay: refusal preserves live owners before restoration");
+    uint32_t key = 0;
+    wl_plan_op_exchange_t exchange = { .num_workers = 1,
+                                       .key_col_idxs = &key,
+                                       .key_col_count = 1 };
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_CONCAT },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    /* Worker CONCAT metadata is tracked separately by #1686. Run real TDD
+     * with VARIABLE+EXCHANGE, then substitute a set-equivalent duplicate
+     * CONCAT only after workers drain, at the production replay boundary. */
+    wl_plan_op_t worker_ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    wl_plan_relation_t output = { .name = "output", .delta_name = "$d$output",
+                                  .ops = worker_ops, .op_count = 2 };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1,
+                                  .is_recursive = true };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    int64_t *values = NULL;
+    tuple_collector_t tuples = { 0 };
+    const char *failure = NULL;
+    const uint32_t count = 8192;
+#define REPLAY_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    correctness_replay_plan = &output;
+    correctness_replay_ops = ops;
+    correctness_replay_entered = false;
+    correctness_replay_lower = mode == 1;
+    correctness_replay_fault_op = mode == 2 ? &ops[0] : NULL;
+    correctness_replay_hook_rc = EINVAL;
+    correctness_replay_held = NULL;
+    memset(&correctness_replay_reader, 0, sizeof(correctness_replay_reader));
+    REPLAY_CHECK(wl_session_create(wl_backend_columnar(), &plan, 2,
+        &session) == 0, "create");
+    values = malloc((size_t)count * sizeof(*values));
+    REPLAY_CHECK(values, "allocate input");
+    for (uint32_t row = 0; row < count; row++)
+        values[row] = 42;
+    REPLAY_CHECK(wl_session_insert(session, "input", values, count, 1) == 0,
+        "insert");
+    wl_columnar_session_test_enable_correctness_replay = true;
+    wl_columnar_session_test_before_correctness_replay =
+        correctness_replay_before;
+    wl_columnar_eval_serial_test_after_plan = correctness_replay_hold;
+    int rc = wl_session_snapshot(session, collect_tuple, &tuples);
+    wl_col_session_t *sess = COL_SESSION(session);
+    if (mode == 2) {
+        REPLAY_CHECK(rc == ENOENT && correctness_replay_entered
+            && !sess->cleanup_pending && sess->cleanup_reserved_bytes == 0
+            && tuples.count == 0, "replay operator error not propagated");
+        ops[0].relation_name = "input";
+        correctness_replay_fault_op = NULL;
+        goto retry;
+    }
+    REPLAY_CHECK(rc == EBUSY && correctness_replay_entered
+        && correctness_replay_hook_rc == 0 && sess->cleanup_pending_count == 1
+        && tuples.count == 0, "actual replay refusal not propagated");
+    REPLAY_CHECK(correctness_replay_target->columns ==
+        correctness_replay_target_columns
+        && correctness_replay_target->nrows == correctness_replay_target_rows
+        && correctness_replay_target->view_generation ==
+        correctness_replay_target_view,
+        "TDD restoration changed pending replay target");
+    size_t arena_used = sess->eval_arena->used;
+    uint32_t pool_slots = sess->delta_pool->slot_used;
+    uint64_t bytes = sess->cleanup_reserved_bytes;
+    int64_t **held_columns = correctness_replay_held->columns;
+    for (unsigned retry = 0; retry < 2; retry++) {
+        output.ops = worker_ops;
+        output.op_count = 2;
+        REPLAY_CHECK(wl_session_snapshot(session, collect_tuple,
+            &tuples) == EBUSY
+            && tuples.count == 0 && sess->cleanup_reserved_bytes == bytes
+            && sess->eval_arena->used == arena_used
+            && sess->delta_pool->slot_used == pool_slots
+            && correctness_replay_held->columns == held_columns
+            && col_rel_get(correctness_replay_held, 0, 0) == 42,
+            "retry reset retained replay storage");
+    }
+    REPLAY_CHECK(col_rel_source_reader_release(&correctness_replay_reader) == 0,
+        "release");
+retry:
+    output.ops = worker_ops;
+    output.op_count = 2;
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    int retry_rc = wl_session_snapshot(session, collect_tuple, &tuples);
+    REPLAY_CHECK(retry_rc == 0
+        && tuples.count == 1 && tuples.rows[0][0] == 42
+        && strcmp(tuples.relations[0], "output") == 0
+        && !sess->cleanup_pending && sess->cleanup_reserved_bytes == 0,
+        "exact snapshot retry");
+cleanup:
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    wl_columnar_session_test_before_correctness_replay = NULL;
+    wl_columnar_session_test_enable_correctness_replay = false;
+    correctness_replay_fault_op = NULL;
+    correctness_replay_plan = NULL;
+    correctness_replay_ops = NULL;
+    if (correctness_replay_reader.owner)
+        (void)col_rel_source_reader_release(&correctness_replay_reader);
+    free(values);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef REPLAY_CHECK
+}
+
+static void
 test_recursive_cleanup_excluded_scope(unsigned mode)
 {
-    TEST("recursive frame scope includes delta-step, excludes workers and W>1");
+    TEST(
+        "recursive frame scope includes coordinator fallback, excludes workers");
     wl_plan_op_t op = { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" };
     wl_plan_relation_t relation = { .name = "output", .delta_name = "$d$output",
                                     .ops = &op, .op_count = 1 };
@@ -4376,7 +4611,7 @@ test_recursive_cleanup_excluded_scope(unsigned mode)
         rc = col_eval_stratum(&stratum, owner, 0);
     }
     wl_columnar_eval_serial_test_after_plan = NULL;
-    SCOPE_CHECK(rc == 0 && (mode == 0 ? serial_scope_hook_calls > 0
+    SCOPE_CHECK(rc == 0 && (mode != 1 ? serial_scope_hook_calls > 0
         : serial_scope_hook_calls == 0)
         && !owner->cleanup_active && !owner->cleanup_pending,
         "excluded path activated frames");
@@ -6041,32 +6276,50 @@ main(void)
     test_delta_alias_rollback(false);
     test_delta_alias_rollback(true);
     test_pending_cleanup_synchronous_destroy();
-    test_serial_cleanup_admission_and_failures(false);
-    test_serial_cleanup_admission_and_failures(true);
+    test_serial_cleanup_admission_and_failures(false, 1);
+    test_serial_cleanup_admission_and_failures(false, 2);
+    test_serial_cleanup_admission_and_failures(true, 1);
+    test_serial_cleanup_admission_and_failures(true, 8);
     test_serial_staging_metadata();
-    test_serial_cleanup_caller(0, false, false, 0);
-    test_serial_cleanup_caller(1, false, false, 0);
-    test_serial_cleanup_caller(0, true, false, 0);
-    test_serial_cleanup_caller(1, true, false, 0);
-    test_serial_cleanup_caller(2, true, false, 0);
-    test_serial_cleanup_caller(1, false, true, 0);
-    test_serial_cleanup_caller(0, false, false, 1);
-    test_serial_cleanup_caller(1, false, false, 1);
-    test_serial_cleanup_caller(0, true, false, 1);
-    test_serial_cleanup_caller(1, true, false, 1);
-    test_serial_cleanup_caller(2, true, false, 1);
-    test_serial_cleanup_caller(1, false, false, 2);
-    test_serial_cleanup_caller(1, false, false, 3);
-    test_serial_cleanup_caller(1, false, false, 4);
-    test_serial_cleanup_caller(0, false, false, 5);
-    test_serial_cleanup_caller(1, false, false, 5);
-    test_serial_cleanup_caller(0, true, false, 5);
-    test_serial_cleanup_caller(1, true, false, 5);
-    test_serial_cleanup_caller(2, true, false, 5);
-    test_serial_cleanup_caller(1, false, false, 6);
-    test_serial_cleanup_caller(1, false, false, 7);
-    test_serial_cleanup_caller(1, false, false, 8);
+    test_serial_cleanup_caller(0, false, false, 0, 1);
+    test_serial_cleanup_caller(1, false, false, 0, 1);
+    test_serial_cleanup_caller(0, true, false, 0, 1);
+    test_serial_cleanup_caller(1, true, false, 0, 1);
+    test_serial_cleanup_caller(2, true, false, 0, 1);
+    test_serial_cleanup_caller(1, false, true, 0, 1);
+    test_serial_cleanup_caller(0, false, false, 1, 1);
+    test_serial_cleanup_caller(1, false, false, 1, 1);
+    test_serial_cleanup_caller(0, true, false, 1, 1);
+    test_serial_cleanup_caller(1, true, false, 1, 1);
+    test_serial_cleanup_caller(2, true, false, 1, 1);
+    test_serial_cleanup_caller(1, false, false, 2, 1);
+    test_serial_cleanup_caller(1, false, false, 3, 1);
+    test_serial_cleanup_caller(1, false, false, 4, 1);
+    test_serial_cleanup_caller(0, false, false, 5, 1);
+    test_serial_cleanup_caller(1, false, false, 5, 1);
+    test_serial_cleanup_caller(0, true, false, 5, 1);
+    test_serial_cleanup_caller(1, true, false, 5, 1);
+    test_serial_cleanup_caller(2, true, false, 5, 1);
+    test_serial_cleanup_caller(1, false, false, 6, 1);
+    test_serial_cleanup_caller(1, false, false, 7, 1);
+    test_serial_cleanup_caller(1, false, false, 8, 1);
+    test_serial_cleanup_caller(1, false, false, 0, 2);
+    test_serial_cleanup_caller(0, true, false, 0, 2);
+    test_serial_cleanup_caller(1, true, false, 0, 8);
+    test_serial_cleanup_caller(2, true, false, 0, 8);
+    test_serial_cleanup_caller(1, false, false, 1, 2);
+    test_serial_cleanup_caller(1, false, false, 2, 2);
+    test_serial_cleanup_caller(1, false, false, 3, 8);
+    test_serial_cleanup_caller(1, false, false, 4, 8);
+    test_serial_cleanup_caller(1, false, false, 5, 2);
+    test_serial_cleanup_caller(1, false, false, 6, 2);
+    test_serial_cleanup_caller(1, false, false, 7, 8);
+    test_serial_cleanup_caller(1, false, false, 8, 8);
     test_recursive_delta_operator_error();
+    test_coordinator_specialized_parallel();
+    test_correctness_replay_refusal(0);
+    test_correctness_replay_refusal(1);
+    test_correctness_replay_refusal(2);
     test_recursive_cleanup_excluded_scope(0);
     test_recursive_cleanup_excluded_scope(1);
     test_recursive_cleanup_excluded_scope(2);

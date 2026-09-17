@@ -692,8 +692,8 @@ contract for admitted allocations, not a claim that all allocation classes,
 spill access or downstream pipelines are already bounded (#1369, #1372,
 #1475).
 
-Single-worker coordinator evaluation, including recursive snapshot and delta
-steps, admits a persistent cleanup frame before
+Coordinator serial evaluation and fallback, including recursive snapshot and
+delta steps in multi-worker sessions, admit a persistent cleanup frame before
 executing each relation plan. The frame owns its stack,
 popped result and segment metadata until publication or checked disposal.
 Refusal preserves allocators, caches and registry owners until session readiness
@@ -727,8 +727,17 @@ in active cleanup temporary accounting, then released before publication or
 unwind. This path requires a private candidate and a replacement copy, increasing
 peak admitted memory. Generic sorting timestamp correspondence remains #1689.
 
-Cleanup refusal remains an integration gap for worker evaluation and
-higher-worker-count fallback: #1647 covers lost popped results,
+The specialized parallel evaluator remains separate. An unsafe parallel plan
+(such as CONCAT) returns EAGAIN before dispatch and then uses the framed serial
+fallback. A late overflow fallback follows checked worker cleanup; cleanup
+refusal must retain its error rather than trigger serial evaluation.
+
+TDD correctness-check replay follows the same error boundary: failed serial
+replay skips result restoration and releases only its independent saved copies.
+Pending frames keep registered partial replay state and allocator storage alive
+until snapshot retry drains them; no callbacks or arena reset precede recovery.
+
+Cleanup refusal remains an integration gap for worker evaluation: #1647 covers lost popped results,
 #1648 covers K-Fusion refusal handling, and #1661 covers retention of whole
 refused evaluator stacks and their allocators across unwind. In particular,
 retaining an entry on a block-local stack does not preserve ownership after

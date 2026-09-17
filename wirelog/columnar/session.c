@@ -3596,6 +3596,11 @@ col_session_set_delta_cb(wl_session_t *session, wirelog_on_delta_fn callback,
     }
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+bool wl_columnar_session_test_enable_correctness_replay;
+void (*wl_columnar_session_test_before_correctness_replay)(wl_col_session_t *);
+#endif
+
 static void
 col_session_reset_snapshot_profile(wl_col_session_t *sess)
 {
@@ -4086,7 +4091,11 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
             const char *env = getenv("WIRELOG_TDD_CORRECTNESS_CHECK");
             tdd_cc = (env && env[0] == '1') ? 1 : 0;
         }
-        bool tdd_cc_active = tdd_cc
+        bool tdd_cc_enabled = tdd_cc != 0;
+#ifdef WL_SESSION_TEST_HOOKS
+        tdd_cc_enabled |= wl_columnar_session_test_enable_correctness_replay;
+#endif
+        bool tdd_cc_active = tdd_cc_enabled
             && use_tdd && plan->strata[si].is_recursive;
         const wl_plan_stratum_t *csp = &plan->strata[si];
         uint32_t cnrels = csp->relation_count;
@@ -4200,7 +4209,13 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
                 }
 
                 /* Re-evaluate single-threaded */
+#ifdef WL_SESSION_TEST_HOOKS
+                if (wl_columnar_session_test_before_correctness_replay)
+                    wl_columnar_session_test_before_correctness_replay(sess);
+#endif
                 int st_rc = col_eval_stratum(csp, sess, si);
+                if (st_rc != 0)
+                    rc = st_rc;
 
                 if (st_rc == 0) {
                     for (uint32_t ri = 0; ri < cnrels; ri++) {
@@ -4217,8 +4232,14 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
                     }
                 }
 
-                /* Restore TDD results */
+                /* Failed replay may retain registered dependencies. Free
+                 * only private backups; let the existing error path preserve
+                 * pending frames and their allocators before any reset. */
                 for (uint32_t ri = 0; ri < cnrels; ri++) {
+                    if (st_rc != 0) {
+                        col_rel_destroy(tdd_saved[ri]);
+                        continue;
+                    }
                     col_rel_t *r = session_find_rel(
                         sess, csp->relations[ri].name);
                     if (r) {
