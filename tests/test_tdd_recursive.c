@@ -2754,6 +2754,423 @@ cleanup:
 #undef WORKER_SEG_CHECK
 }
 
+extern int wl_columnar_eval_test_retire_prior_deltas(const wl_plan_stratum_t *,
+    wl_col_session_t *, uint32_t);
+extern void (*wl_columnar_eval_test_subpass_boundary)(wl_col_session_t *,
+    uint32_t,
+    bool);
+
+static void
+test_tdd_prior_delta_retirement(uint32_t workers, unsigned mode)
+{
+    TEST("prior TDD delta retirement: checked aliases, roots and preparation");
+    bool schema_less = mode >= 7;
+    if (schema_less)
+        mode = mode == 7 ? 0 : mode == 8 ? 1 : 6;
+    wl_plan_relation_t relation = { .name = "output",
+                                    .delta_name = "$d$output" };
+    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1 };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1 };
+    wl_session_t *session = NULL;
+    col_rel_t *unowned = NULL;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    const char *failure = NULL;
+#define RETIRE_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    RETIRE_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "create");
+    wl_col_session_t *sess = COL_SESSION(session);
+    wl_columnar_memory_governor_t *budget =
+        wl_columnar_memory_governor_ref_get(sess->memory_governor);
+    RETIRE_CHECK(wl_columnar_session_ensure_tdd_worker_slots(sess,
+        workers) == 0,
+        "worker slots");
+    uint64_t baseline = wl_columnar_memory_reserved(budget);
+    for (uint32_t w = 0; w < workers; w++) {
+        sess->tdd_workers_count = w + 1;
+        RETIRE_CHECK(col_worker_session_create(sess, w, NULL, 0,
+            &sess->tdd_workers[w]) == 0, "worker create");
+    }
+    int64_t value = 42;
+    wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    unowned = col_rel_new_auto("$d$output", 1);
+    RETIRE_CHECK(unowned && (schema_less || col_rel_set_column_types(unowned,
+        &type, 1) == 0)
+        && col_rel_append_row(unowned, &value) == 0
+        && col_rel_enable_timestamps(unowned) == 0, "root");
+    unowned->timestamps[0] = (col_delta_timestamp_t){ .iteration = 7,
+                                                      .stratum = 2,
+                                                      .multiplicity = -3 };
+    col_rel_t *root = unowned;
+    RETIRE_CHECK(session_add_rel(&sess->tdd_workers[0], unowned) == 0,
+        "register root");
+    unowned = NULL;
+    for (uint32_t w = 1; w < workers; w++) {
+        unowned = col_rel_new_auto("$d$output", 1);
+        RETIRE_CHECK(unowned && col_rel_install_shared_view(unowned, root) == 0,
+            "shared alias");
+        col_rel_t *alias = unowned;
+        RETIRE_CHECK(session_add_rel(&sess->tdd_workers[w], alias) == 0,
+            "register alias");
+        unowned = NULL;
+        RETIRE_CHECK(wl_columnar_session_adopt_shared_view(
+                &sess->tdd_workers[w],
+                alias) == 0, "adopt lease");
+    }
+    col_rel_t *prior[8];
+    uint64_t identities[8], generations[8];
+    for (uint32_t w = 0; w < workers; w++) {
+        prior[w] = session_find_rel(&sess->tdd_workers[w], "$d$output");
+        /* Match legacy pool-derived registrations without an Arrow schema,
+         * releasing this fixture's constructor-owned schema first. */
+        if (schema_less) {
+            ArrowSchemaRelease(&prior[w]->schema);
+            memset(&prior[w]->schema, 0, sizeof(prior[w]->schema));
+            prior[w]->schema_ok = false;
+        }
+        identities[w] = prior[w]->relation_identity;
+        generations[w] = prior[w]->view_generation;
+    }
+    uint64_t prepared_baseline = wl_columnar_memory_reserved(budget);
+    if (mode == 1 || mode == 2)
+        RETIRE_CHECK(col_rel_source_reader_acquire(prior[mode == 1 ? 0 : 1],
+            &reader) == 0, "held prior reader");
+    if (mode == 3) {
+        unowned = col_rel_new_auto("held", 1);
+        RETIRE_CHECK(unowned && col_rel_append_row(unowned, &value) == 0
+            && col_rel_source_reader_acquire(unowned, &reader) == 0
+            && wl_columnar_eval_stack_cleanup_begin(&sess->tdd_workers[1],
+            &frame) == 0, "pending frame");
+        eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(frame);
+        result->rel = unowned;
+        result->owned = true;
+        unowned = NULL;
+        RETIRE_CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == EBUSY,
+            "retain frame");
+    }
+    uint64_t saved_limit = atomic_load_explicit(&budget->usable_bytes,
+            memory_order_relaxed);
+    wl_columnar_memory_mode_t saved_mode = budget->mode;
+    if (mode == 5) {
+        budget->mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+        atomic_store_explicit(&budget->usable_bytes,
+            wl_columnar_memory_reserved(budget), memory_order_relaxed);
+    }
+#ifdef WL_TEST_ALLOC_WRAP
+    if (mode == 4 || mode == 6)
+        allocation_fail_at = mode == 4 ? 0 : 8;
+    allocation_calls = 0;
+#endif
+    int rc = wl_columnar_eval_test_retire_prior_deltas(&stratum, sess, workers);
+#ifdef WL_TEST_ALLOC_WRAP
+    allocation_fail_at = -1;
+#endif
+    budget->mode = saved_mode;
+    atomic_store_explicit(&budget->usable_bytes, saved_limit,
+        memory_order_relaxed);
+    if (mode != 0) {
+        int expected = mode <= 3 ? EBUSY : mode == 5 ? ENOSPC : ENOMEM;
+        RETIRE_CHECK(rc == expected, "retirement failure code");
+        uint32_t stable_to = mode == 1 ? 1 : workers;
+        for (uint32_t w = 0; w < stable_to; w++) {
+            col_rel_t *current = session_find_rel(&sess->tdd_workers[w],
+                    "$d$output");
+            RETIRE_CHECK(current == prior[w] &&
+                current->relation_identity == identities[w]
+                && current->view_generation == generations[w] &&
+                current->nrows == 1
+                && col_rel_get(current, 0, 0) == value && current->timestamps
+                && current->timestamps[0].multiplicity == -3,
+                "refusal mutated retained registration");
+        }
+        if (mode == 1) {
+            for (uint32_t w = 1; w < workers; w++) {
+                col_rel_t *current = session_find_rel(&sess->tdd_workers[w],
+                        "$d$output");
+                RETIRE_CHECK(current->relation_identity != identities[w]
+                    && current->nrows == 0 && !current->col_shared,
+                    "alias prefix was not independently retired");
+            }
+        }
+        if (mode >= 4)
+            RETIRE_CHECK(wl_columnar_memory_reserved(budget) ==
+                prepared_baseline,
+                "preparation leaked admission");
+        if (reader.owner) {
+            RETIRE_CHECK(wl_columnar_eval_test_retire_prior_deltas(&stratum,
+                sess, workers) == EBUSY, "repeated refusal");
+            RETIRE_CHECK(col_rel_source_reader_release(&reader) == 0,
+                "release");
+        }
+        if (mode == 3)
+            RETIRE_CHECK(wl_columnar_eval_stack_cleanup_retry(
+                    &sess->tdd_workers[1]) == 0,
+                "drain frame");
+        rc = wl_columnar_eval_test_retire_prior_deltas(&stratum, sess, workers);
+    }
+    RETIRE_CHECK(rc == 0, "retirement retry");
+    for (uint32_t w = 0; w < workers; w++) {
+        col_rel_t *current = session_find_rel(&sess->tdd_workers[w],
+                "$d$output");
+        RETIRE_CHECK(current && current->nrows == 0 && current->ncols == 1
+            && (schema_less ? current->column_types == NULL
+                : current->column_types &&
+            current->column_types[0] == WIRELOG_TYPE_INT64)
+            && !current->col_shared && current->schema_ok == !schema_less,
+            "empty registration lost metadata or independence");
+        unowned = col_rel_new_auto("output", 1);
+        RETIRE_CHECK(unowned && col_rel_append_row(unowned, &value) == 0
+            && session_add_rel(&sess->tdd_workers[w], unowned) == 0,
+            "full relation for outbound AUTO");
+        unowned = NULL;
+        sess->tdd_workers[w].tdd_subpass_active = true;
+        sess->tdd_workers[w].tdd_outbound_only_active = true;
+        sess->tdd_workers[w].current_iteration = 1;
+        wl_plan_op_t variable = { .op = WL_PLAN_OP_VARIABLE,
+                                  .relation_name = "output",
+                                  .delta_mode = WL_DELTA_AUTO };
+        eval_stack_t stack;
+        eval_stack_init(&stack);
+        RETIRE_CHECK(col_op_variable(&variable, &stack,
+            &sess->tdd_workers[w]) == 0
+            && stack.top == 1 && stack.items[0].rel == current
+            && stack.items[0].rel->nrows == 0 && eval_stack_drain(&stack) == 0,
+            "outbound AUTO replayed full input after empty retirement");
+        RETIRE_CHECK(col_worker_session_destroy(&sess->tdd_workers[w]) == 0,
+            "checked worker teardown");
+    }
+    sess->tdd_workers_count = 0;
+    RETIRE_CHECK(wl_columnar_memory_reserved(budget) == baseline,
+        "retirement leaked worker reservation");
+cleanup:
+#ifdef WL_TEST_ALLOC_WRAP
+    allocation_fail_at = -1;
+#endif
+    if (reader.owner)
+        (void)col_rel_source_reader_release(&reader);
+    if (frame)
+        (void)wl_columnar_eval_stack_cleanup_finish(&frame);
+    col_rel_destroy(unowned);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef RETIRE_CHECK
+}
+
+static unsigned retire_dispatch_mode;
+static uint32_t retire_dispatch_workers, retire_dispatch_rounds;
+static bool retire_dispatch_captured, retire_dispatch_verified;
+static int retire_dispatch_rc;
+static col_rel_t *retire_dispatch_root, *retire_dispatch_alias;
+static uint64_t retire_dispatch_view, retire_dispatch_storage;
+static col_delta_timestamp_t *retire_dispatch_timestamps;
+static wl_columnar_source_access_reader_t retire_dispatch_reader;
+static wl_columnar_source_access_reader_t retire_dispatch_frame_reader;
+
+/* Both boundaries run on the coordinator, before submit or after wait_all.
+ * Hook configuration remains fixed while workers run. */
+static void
+hold_prior_delta_across_dispatch(wl_col_session_t *coord, uint32_t iteration,
+    bool before)
+{
+    if (!before)
+        retire_dispatch_rounds++;
+    if (iteration != 1)
+        return;
+    if (before) {
+        if (retire_dispatch_captured)
+            return;
+        retire_dispatch_captured = true;
+        retire_dispatch_workers = coord->tdd_workers_count;
+        retire_dispatch_rc = EINVAL;
+        retire_dispatch_root = session_find_rel(&coord->tdd_workers[0],
+                "$d$relay");
+        retire_dispatch_alias = session_find_rel(&coord->tdd_workers[1],
+                "$d$relay");
+        col_rel_t *owner = NULL;
+        if (!retire_dispatch_root || !retire_dispatch_alias
+            || retire_dispatch_root->nrows != 1 ||
+            retire_dispatch_alias->nrows != 1
+            || col_rel_storage_owner_resolve(retire_dispatch_alias, &owner) != 0
+            || owner != retire_dispatch_root)
+            return;
+        retire_dispatch_view = retire_dispatch_root->view_generation;
+        retire_dispatch_storage = retire_dispatch_root->storage_generation;
+        retire_dispatch_timestamps = retire_dispatch_root->timestamps;
+        retire_dispatch_rc = col_rel_source_reader_acquire_transferable(
+            retire_dispatch_mode ==
+            0 ? retire_dispatch_root : retire_dispatch_alias,
+            &retire_dispatch_reader);
+        return;
+    }
+    if (!retire_dispatch_captured || retire_dispatch_rc != 0)
+        return;
+    retire_dispatch_verified = retire_dispatch_root->nrows == 1
+        && retire_dispatch_alias->nrows == 1
+        && retire_dispatch_root->view_generation == retire_dispatch_view
+        && retire_dispatch_root->storage_generation == retire_dispatch_storage
+        && retire_dispatch_root->timestamps == retire_dispatch_timestamps
+        && col_rel_get(retire_dispatch_root, 0, 0) == 42
+        && col_rel_get(retire_dispatch_alias, 0, 0) == 42;
+    if (retire_dispatch_mode == 2 && retire_dispatch_verified) {
+        wl_col_session_t *worker = &coord->tdd_workers[1];
+        wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+        col_rel_t *held = col_rel_new_auto("held", 1);
+        if (!held) {
+            retire_dispatch_rc = ENOMEM; return;
+        }
+        retire_dispatch_rc = wl_columnar_eval_stack_cleanup_begin(worker,
+                &frame);
+        if (retire_dispatch_rc != 0) {
+            col_rel_destroy(held); return;
+        }
+        eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(frame);
+        result->rel = held;
+        result->owned = true;
+        retire_dispatch_rc =
+            eval_stack_push(wl_columnar_eval_stack_cleanup_stack(frame),
+                retire_dispatch_alias, false);
+        if (retire_dispatch_rc == 0)
+            retire_dispatch_rc =
+                col_rel_source_reader_acquire_transferable(held,
+                    &retire_dispatch_frame_reader);
+        int finish_rc = wl_columnar_eval_stack_cleanup_finish(&frame);
+        if (retire_dispatch_rc == 0 && finish_rc != EBUSY)
+            retire_dispatch_rc = EINVAL;
+    }
+}
+
+typedef struct { unsigned count, seen; bool invalid; } retire_dispatch_rows_t;
+
+static void
+collect_retirement_rows(const char *relation, const int64_t *row,
+    uint32_t ncols,
+    void *user)
+{
+    retire_dispatch_rows_t *rows = user;
+    rows->count++;
+    unsigned bit = strcmp(relation, "output") == 0 ? 1u
+        : strcmp(relation, "relay") == 0 ? 2u : 0u;
+    rows->invalid |= !bit || ncols != 1 || row[0] != 42 ||
+        (rows->seen & bit) != 0;
+    rows->seen |= bit;
+}
+
+static void
+test_tdd_retirement_actual_dispatch(uint32_t workers, unsigned mode)
+{
+    TEST(
+        "prior TDD deltas: actual shared dispatch, barrier refusal and exact retry");
+    uint32_t key = 0;
+    wl_plan_op_exchange_t exchange = { .num_workers = 1, .key_col_idxs = &key,
+                                       .key_col_count = 1 };
+    const char *keys[] = { "col0" };
+    uint32_t projection[] = { 0 };
+    uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
+    wl_plan_op_t output_ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "output" },
+        { .op = WL_PLAN_OP_JOIN, .right_relation = "output", .left_keys = keys,
+          .right_keys = keys, .key_count = 1, .project_indices = projection,
+          .project_count = 1 },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "relay" },
+        { .op = WL_PLAN_OP_CONCAT },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    wl_plan_op_t relay_ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    wl_plan_relation_t relations[] = {
+        { .name = "output", .delta_name = "$d$output", .ops = output_ops,
+          .op_count = 5 },
+        { .name = "relay", .delta_name = "$d$relay", .ops = relay_ops,
+          .op_count = 3 }
+    };
+    wl_plan_stratum_t stratum = { .relations = relations, .relation_count = 2,
+                                  .is_recursive = true };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    col_rel_t *unowned = NULL;
+    int64_t *values = NULL;
+    const char *failure = NULL;
+    retire_dispatch_rows_t rows = { 0 };
+    retire_dispatch_mode = mode;
+    retire_dispatch_workers = retire_dispatch_rounds = 0;
+    retire_dispatch_captured = retire_dispatch_verified = false;
+    retire_dispatch_rc = EINVAL;
+    memset(&retire_dispatch_reader, 0, sizeof(retire_dispatch_reader));
+    memset(&retire_dispatch_frame_reader, 0,
+        sizeof(retire_dispatch_frame_reader));
+#define DISPATCH_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    DISPATCH_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "create");
+    wl_col_session_t *sess = COL_SESSION(session);
+    values = malloc(65536 * sizeof(*values));
+    DISPATCH_CHECK(values, "input allocation");
+    for (uint32_t i = 0; i < 65536; i++) values[i] = 42;
+    DISPATCH_CHECK(wl_session_insert(session, "input", values, 65536, 1) == 0,
+        "input");
+    wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    for (unsigned i = 0; i < 2; i++) {
+        unowned = col_rel_new_auto(relations[i].name, 1);
+        DISPATCH_CHECK(unowned && col_rel_set_column_types(unowned, &type,
+            1) == 0
+            && session_add_rel(sess, unowned) == 0, "typed empty IDB");
+        unowned = NULL;
+    }
+    sess->tdd_audit.enabled = true;
+    wl_columnar_eval_test_subpass_boundary = hold_prior_delta_across_dispatch;
+    int rc = wl_session_snapshot(session, collect_retirement_rows, &rows);
+    DISPATCH_CHECK(rc == EBUSY && retire_dispatch_captured
+        && retire_dispatch_verified && retire_dispatch_rc == 0 &&
+        rows.count == 0
+        && retire_dispatch_workers == workers && retire_dispatch_rounds >= 2
+        && sess->tdd_executed_strata == 1,
+        "actual shared prior delta refusal");
+    for (unsigned attempt = 0; attempt < 2; attempt++) {
+        DISPATCH_CHECK(wl_session_snapshot(session, collect_retirement_rows,
+            &rows) == EBUSY
+            && rows.count == 0 && retire_dispatch_root->nrows == 1
+            && retire_dispatch_root->view_generation == retire_dispatch_view
+            && retire_dispatch_root->storage_generation ==
+            retire_dispatch_storage
+            && retire_dispatch_root->timestamps == retire_dispatch_timestamps,
+            "repeated refusal changed held root");
+    }
+    DISPATCH_CHECK(col_rel_source_reader_release(&retire_dispatch_reader) == 0,
+        "release prior delta reader");
+    if (retire_dispatch_frame_reader.owner)
+        DISPATCH_CHECK(col_rel_source_reader_release(
+                &retire_dispatch_frame_reader) == 0,
+            "release retained frame");
+    wl_columnar_eval_test_subpass_boundary = NULL;
+    DISPATCH_CHECK(wl_session_snapshot(session, collect_retirement_rows,
+        &rows) == 0
+        && rows.count == 2 && rows.seen == 3 && !rows.invalid
+        && sess->tdd_workers_count == 0, "exact snapshot retry");
+cleanup:
+    wl_columnar_eval_test_subpass_boundary = NULL;
+    if (retire_dispatch_reader.owner)
+        (void)col_rel_source_reader_release(&retire_dispatch_reader);
+    if (retire_dispatch_frame_reader.owner)
+        (void)col_rel_source_reader_release(&retire_dispatch_frame_reader);
+    col_rel_destroy(unowned);
+    free(values);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef DISPATCH_CHECK
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -2761,6 +3178,18 @@ cleanup:
 int
 main(void)
 {
+    for (unsigned mode = 0; mode < 10; mode++) {
+#ifndef WL_TEST_ALLOC_WRAP
+        if (mode == 4 || mode == 6 || mode == 9)
+            continue;
+#endif
+        test_tdd_prior_delta_retirement(2, mode);
+        test_tdd_prior_delta_retirement(8, mode);
+    }
+    for (unsigned mode = 0; mode < 3; mode++) {
+        test_tdd_retirement_actual_dispatch(2, mode);
+        test_tdd_retirement_actual_dispatch(8, mode);
+    }
     printf("TDD Recursive Distributed Evaluator Tests\n");
     printf("==========================================\n");
 

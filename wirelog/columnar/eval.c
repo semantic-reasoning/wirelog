@@ -1238,6 +1238,144 @@ tdd_install_empty_delta_on_workers(wl_col_session_t *coord,
     return 0;
 }
 
+typedef struct {
+    wl_col_session_t *worker;
+    col_rel_t *prior;
+    col_rel_t *empty;
+    wl_columnar_source_access_reader_t reader;
+    bool alias;
+} wl_columnar_eval_delta_retirement_t;
+
+/* The dispatch barrier and successful worker/cleanup checks precede this
+ * transaction. Empty registrations preserve later-iteration AUTO semantics.
+ * Preparation is atomic; publication is atomic per registration. On refusal,
+ * already installed empty owners remain valid and the refused owner/lease is
+ * unchanged. The caller aborts exchange and cleans up fresh delta payloads. */
+static int
+wl_columnar_eval_retire_prior_deltas(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord,
+    uint32_t workers)
+{
+    if (!sp || !coord || workers > coord->tdd_workers_count)
+        return EINVAL;
+    for (uint32_t w = 0; w < workers; w++) {
+        const wl_col_session_t *worker = &coord->tdd_workers[w];
+        if (worker->cleanup_active || worker->cleanup_pending ||
+            worker->delta_rollback)
+            return EBUSY;
+    }
+    size_t count = 0;
+    int rc = wl_columnar_eval_tdd_matrix_size(workers, sp->relation_count,
+            sizeof(wl_columnar_eval_delta_retirement_t), &count);
+    if (rc != 0 || count == 0)
+        return rc;
+    size_t bytes = count * sizeof(wl_columnar_eval_delta_retirement_t);
+    wl_columnar_memory_reservation_t reservation;
+    wl_columnar_memory_reservation_init(&reservation);
+    bool admitted = coord->memory_governor != NULL;
+    if (admitted) {
+        wl_columnar_memory_admission_status_t status =
+            wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(coord->memory_governor),
+            bytes, &reservation);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
+                : EINVAL;
+    }
+    wl_columnar_eval_delta_retirement_t *entries = calloc(count,
+            sizeof(*entries));
+    if (!entries) {
+        if (admitted)
+            (void)wl_columnar_memory_rollback(&reservation);
+        return ENOMEM;
+    }
+    if (admitted && !wl_columnar_memory_commit(&reservation, entries)) {
+        (void)wl_columnar_memory_rollback(&reservation);
+        free(entries);
+        return EINVAL;
+    }
+    size_t used = 0;
+    for (uint32_t w = 0; w < workers; w++) {
+        wl_col_session_t *worker = &coord->tdd_workers[w];
+        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+            const char *name = sp->relations[ri].delta_name;
+            col_rel_t *prior = name ? session_find_rel(worker, name) : NULL;
+            if (!prior)
+                continue;
+            bool duplicate = false;
+            for (size_t i = 0; i < used; i++)
+                if (entries[i].worker == worker && entries[i].prior == prior)
+                    duplicate = true;
+            if (duplicate)
+                continue;
+            wl_columnar_eval_delta_retirement_t *entry = &entries[used++];
+            entry->worker = worker;
+            entry->prior = prior;
+            col_rel_t *owner = NULL;
+            rc = col_rel_source_reader_acquire(prior, &entry->reader);
+            if (rc == 0)
+                rc = col_rel_storage_owner_resolve(prior, &owner);
+            if (rc != 0)
+                goto cleanup;
+            entry->alias = owner != prior;
+            entry->empty = wl_columnar_relation_new_like_governed(name, prior,
+                    coord->memory_governor);
+            if (!entry->empty) {
+                rc = ENOMEM;
+                goto cleanup;
+            }
+            entry->empty->declared_ncols = prior->declared_ncols;
+            if (!prior->schema_ok && entry->empty->schema_ok) {
+                ArrowSchemaRelease(&entry->empty->schema);
+                memset(&entry->empty->schema, 0, sizeof(entry->empty->schema));
+                entry->empty->schema_ok = false;
+            }
+        }
+    }
+    for (size_t i = 0; i < used; i++) {
+        rc = col_rel_source_reader_release(&entries[i].reader);
+        if (rc != 0)
+            goto cleanup;
+    }
+    /* Every alias across the cohort precedes every root, independently of
+     * worker numbering. Checked replacement also retires its session lease. */
+    for (unsigned phase = 0; phase < 2; phase++) {
+        for (size_t i = 0; i < used; i++) {
+            wl_columnar_eval_delta_retirement_t *entry = &entries[i];
+            if (entry->alias != (phase == 0))
+                continue;
+            rc = session_add_rel(entry->worker, entry->empty);
+            if (rc != 0)
+                goto cleanup;
+            entry->empty = NULL;
+        }
+    }
+cleanup:
+    for (size_t i = 0; i < used; i++) {
+        if (entries[i].reader.owner)
+            (void)col_rel_source_reader_release(&entries[i].reader);
+        col_rel_destroy(entries[i].empty);
+    }
+    free(entries);
+    if (admitted)
+        (void)wl_columnar_memory_release(&reservation);
+    return rc;
+}
+
+#ifdef WL_TEST_BDX_SEED
+void (*wl_columnar_eval_test_subpass_boundary)(wl_col_session_t *, uint32_t,
+    bool);
+
+int
+wl_columnar_eval_test_retire_prior_deltas(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord, uint32_t workers)
+{
+    return wl_columnar_eval_retire_prior_deltas(sp, coord, workers);
+}
+#endif
+
 static void
 tdd_worker_subpass_fn(void *arg)
 {
@@ -1561,20 +1699,6 @@ tdd_worker_subpass_fn(void *arg)
                 sess->diff_operators_active = saved_diff;
                 TDD_WORKER_RETURN();
             }
-        }
-    }
-
-    /* Issue #361: Clear delta relations instead of removing them.
-     * Pre-installed $d$ persists across iterations; nrows=0 triggers
-     * has_empty_forced_delta skip, same as absent $d$. */
-    for (uint32_t ri = 0; ri < nrels; ri++) {
-        const char *dname = sp->relations[ri].delta_name;
-        col_rel_t *d = session_find_rel(sess, dname);
-        if (d) {
-            d->nrows = 0;
-            free(d->timestamps);
-            d->timestamps = NULL;
-            wl_columnar_relation_touch_replacement(d);
         }
     }
 
@@ -3762,7 +3886,7 @@ tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
             for (uint32_t w = 0; w < W; w++) {
                 col_rel_destroy(ctxs[w].delta_rels[ri]);
                 ctxs[w].delta_rels[ri] = NULL;
-                /* Existing $d$ already cleared by worker (nrows=0) */
+                /* Prior $d$ was retired to an empty owner after the barrier. */
             }
             continue;
         }
@@ -5753,6 +5877,10 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 ctxs[w].runtime_ns = 0;
                 ctxs[w].rc = 0;
             }
+#ifdef WL_TEST_BDX_SEED
+            if (wl_columnar_eval_test_subpass_boundary)
+                wl_columnar_eval_test_subpass_boundary(coord, eff_iter, true);
+#endif
             /* DISPATCH */
             bool submit_ok = true;
             uint64_t dispatch_t0 = now_ns();
@@ -5808,12 +5936,21 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             if (wait_ns > worker_max_ns)
                 coord->tdd_idle_estimate_ns += wait_ns - worker_max_ns;
 
+#ifdef WL_TEST_BDX_SEED
+            if (wl_columnar_eval_test_subpass_boundary)
+                wl_columnar_eval_test_subpass_boundary(coord, eff_iter, false);
+#endif
             /* Collect first worker error */
             for (uint32_t w = 0; w < W; w++) {
                 record_worker_expr_status(coord, ctxs[w].worker_sess,
                     ctxs[w].rc);
                 if (ctxs[w].rc != 0 && rc == 0)
                     rc = ctxs[w].rc;
+                wl_col_session_t *worker = ctxs[w].worker_sess;
+                if (rc == 0 &&
+                    (worker->cleanup_active || worker->cleanup_pending
+                    || worker->delta_rollback))
+                    rc = EBUSY;
             }
 
             if (rc != 0) {
@@ -5932,6 +6069,12 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 break;
             }
             coord->tdd_convergence_ns += now_ns() - convergence_t0;
+
+            rc = wl_columnar_eval_retire_prior_deltas(sp, coord, W);
+            if (rc != 0) {
+                tdd_destroy_delta_slots(ctxs, W, nrels);
+                goto done;
+            }
 
             /* EXCHANGE: BDX for Category C, hash scatter/gather for
              * standard hybrid, broadcast for replicate/self_join_mode.
