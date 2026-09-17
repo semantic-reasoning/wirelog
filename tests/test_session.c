@@ -40,10 +40,15 @@ void *__real_malloc(size_t size);
 void *__real_calloc(size_t count, size_t size);
 void *__real_realloc(void *ptr, size_t size);
 static bool fail_next_alloc;
+static size_t fail_malloc_size;
 
 void *
 __wrap_malloc(size_t size)
 {
+    if (fail_malloc_size != 0 && size == fail_malloc_size) {
+        fail_malloc_size = 0;
+        return NULL;
+    }
     if (fail_next_alloc) {
         fail_next_alloc = false;
         return NULL;
@@ -3306,6 +3311,140 @@ cleanup:
 #undef SNAP_CHECK
 }
 
+static void
+test_snapshot_preseed_failure(int fault)
+{
+    TEST(fault == 0 ? "snapshot: preseed replacement preserves a busy owner"
+        : fault == 1 ? "snapshot: preseed construction failure is retryable"
+        : "snapshot: preseed append growth failure is retryable");
+    wl_plan_op_t op = { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" };
+    wl_plan_relation_t relation = { .name = "output", .ops = &op,
+                                    .op_count = 1 };
+    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1 };
+    const char *edb[] = { "prefix", "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 2 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess = NULL;
+    col_rel_t *held = NULL;
+    col_rel_t *unregistered = NULL;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    bool reader_active = false;
+    tuple_collector_t tuples = { 0 };
+    const char *failure = NULL;
+    int64_t values[COL_REL_INIT_CAP + 1];
+    for (uint32_t i = 0; i < COL_REL_INIT_CAP + 1; i++)
+        values[i] = (int64_t)i + 1;
+#define SEED_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    SEED_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0,
+        "create");
+    sess = COL_SESSION(session);
+    int64_t base = 0;
+    SEED_CHECK(wl_session_insert(session, "prefix", &base, 1, 1) == 0
+        && wl_session_insert(session, "input", &base, 1, 1) == 0
+        && wl_session_snapshot(session, collect_tuple, &tuples) == 0,
+        "baseline snapshot");
+    SEED_CHECK(tuples.count == 1 && tuples.rows[0][0] == base,
+        "baseline oracle");
+    unregistered = col_rel_new_auto("$d$input", 1);
+    SEED_CHECK(unregistered && col_rel_append_row(unregistered, &base) == 0,
+        "old delta fixture");
+    SEED_CHECK(session_add_rel(sess, unregistered) == 0, "old delta register");
+    held = unregistered;
+    unregistered = NULL;
+    /* Two public input inserts request full evaluation. Construct the first
+     * source's pending suffix internally to exercise partial preseed progress. */
+    if (fault == 0)
+        SEED_CHECK(col_rel_append_row(session_find_rel(sess, "prefix"),
+            values) == 0,
+            "prefix suffix fixture");
+    uint32_t count = fault == 2 ? COL_REL_INIT_CAP + 1 : 1;
+    delta_collector_t deltas = { 0 };
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    SEED_CHECK(wl_session_insert(session, "input", values, count, 1) == 0
+        && !sess->pending_full_input_eval, "incremental insert");
+    wl_session_set_delta_cb(session, NULL, NULL);
+    if (fault == 0) {
+        SEED_CHECK(col_rel_source_reader_acquire(held, &reader) == 0, "reader");
+        reader_active = true;
+    }
+    uint64_t view = held->view_generation;
+    uint64_t storage = held->storage_generation;
+    int64_t **columns = held->columns;
+    uint64_t reserved = 0;
+    uint32_t nrels = 0;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        tuples.count = 0;
+#ifdef WL_TEST_ALLOC_WRAP
+        fail_next_alloc = fault == 1;
+        fail_malloc_size = fault == 2
+            ? 2 * COL_REL_INIT_CAP * sizeof(int64_t) : 0;
+#endif
+        int rc = wl_session_snapshot(session, collect_tuple, &tuples);
+#ifdef WL_TEST_ALLOC_WRAP
+        bool fault_fired = !fail_next_alloc && fail_malloc_size == 0;
+        fail_next_alloc = false;
+        fail_malloc_size = 0;
+        SEED_CHECK(fault_fired, "intended allocation fault did not fire");
+#endif
+        SEED_CHECK(rc == (fault == 0 ? EBUSY : ENOMEM) && tuples.count == 0,
+            "preseed failure was not propagated");
+        SEED_CHECK(session_find_rel(sess, "$d$input") == held
+            && held->columns == columns && held->nrows == 1
+            && held->columns[0][0] == base && held->view_generation == view
+            && held->storage_generation == storage
+            && session_find_rel(sess, "input")->base_nrows == 1,
+            "preseed failure changed old owner or input boundary");
+        if (fault == 0) {
+            col_rel_t *prefix = session_find_rel(sess, "$d$prefix");
+            SEED_CHECK(prefix && prefix->nrows == 1 &&
+                prefix->columns[0][0] == 1,
+                "successful prefix was lost");
+        }
+        uint64_t now = wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(sess->memory_governor));
+        if (attempt == 0) {
+            reserved = now;
+            nrels = sess->nrels;
+        } else {
+            SEED_CHECK(now == reserved && sess->nrels == nrels,
+                "repeated failure leaked accounting or registrations");
+        }
+    }
+    if (reader_active) {
+        SEED_CHECK(col_rel_source_reader_release(&reader) == 0, "release");
+        reader_active = false;
+    }
+    held = NULL;
+    SEED_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0,
+        "retry snapshot");
+    SEED_CHECK(tuples.count == (int)count + 1, "retry tuple count");
+    for (uint32_t i = 0; i <= count; i++) {
+        int64_t expected = i;
+        SEED_CHECK(has_tuple(&tuples, "output", &expected, 1),
+            "retry exact oracle");
+    }
+cleanup:
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = false;
+    fail_malloc_size = 0;
+#endif
+    if (reader_active)
+        (void)col_rel_source_reader_release(&reader);
+    if (held && session_find_rel(sess, "$d$input") != held && fault == 0)
+        col_rel_destroy(held);
+    col_rel_destroy(unregistered);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef SEED_CHECK
+}
+
 int
 main(void)
 {
@@ -3344,6 +3483,11 @@ main(void)
 #endif
     test_session_full_idb_clear_reader_exclusion();
     test_snapshot_error_preserves_delta_reader();
+    test_snapshot_preseed_failure(0);
+#ifdef WL_TEST_ALLOC_WRAP
+    test_snapshot_preseed_failure(1);
+    test_snapshot_preseed_failure(2);
+#endif
     /* GREEN: col_session_remove returns 0 for uninitialized schema */
     /* test_session_snapshot_empty(); */
     /* test_session_snapshot_after_insert(); */
