@@ -658,8 +658,9 @@ contract for admitted allocations, not a claim that all allocation classes,
 spill access or downstream pipelines are already bounded (#1369, #1372,
 #1475).
 
-Single-worker coordinator nonrecursive evaluation now admits a persistent
-cleanup frame before executing each relation plan. The frame owns its stack,
+Single-worker coordinator nonrecursive evaluation and recursive snapshot/direct
+evaluation outside delta-step rollback admit a persistent cleanup frame before
+executing each relation plan. The frame owns its stack,
 popped result and segment metadata until publication or checked disposal.
 Refusal preserves allocators, caches and registry owners until session readiness
 can drain the frame; snapshot errors return before delta cleanup in this state.
@@ -670,8 +671,14 @@ publication follows successful disposal, so refusal cannot append duplicate
 rows on initial snapshot retry. This requires an additional full temporary
 copy; admission denial leaves the target unchanged.
 
-Cleanup refusal remains an integration gap for recursive evaluation, worker
-evaluation and higher-worker-count fallback: #1647 covers lost popped results,
+Recursive rule-frame refusal preserves registered delta owners and caches.
+Successful previous-pass publication empties all private delta slots before
+rule evaluation; the error path asserts this invariant and releases only local
+bookkeeping. Recursive delta-step evaluation remains excluded because its
+partial-progress notification baseline needs separate retry handling (#1682).
+
+Cleanup refusal remains an integration gap for recursive delta-step evaluation,
+worker evaluation and higher-worker-count fallback: #1647 covers lost popped results,
 #1648 covers K-Fusion refusal handling, and #1661 covers retention of whole
 refused evaluator stacks and their allocators across unwind. In particular,
 retaining an entry on a block-local stack does not preserve ownership after
