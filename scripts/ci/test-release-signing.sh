@@ -561,8 +561,9 @@ bounded_capture() {
 
     : >"$file"
     # LC_ALL=C makes Bash's character count a byte count. Keep reading after
-    # the cap so the publisher is never killed by a closed pipe.
-    while IFS= read -r -N 4096 chunk || [[ -n "$chunk" ]]; do
+    # the cap so the publisher is never killed by a closed pipe. The macOS
+    # system Bash supports -n, but not the GNU-specific -N option.
+    while IFS= read -r -n 4096 chunk || [[ -n "$chunk" ]]; do
         if ((bytes < 8192)); then
             keep=$((8192 - bytes))
             if ((${#chunk} > keep)); then
@@ -577,7 +578,7 @@ bounded_capture() {
 bounded_print() {
     local chunk keep bytes=0 LC_ALL=C
 
-    while IFS= read -r -N 4096 chunk || [[ -n "$chunk" ]]; do
+    while IFS= read -r -n 4096 chunk || [[ -n "$chunk" ]]; do
         if ((bytes < 8192)); then
             keep=$((8192 - bytes))
             if ((${#chunk} > keep)); then
