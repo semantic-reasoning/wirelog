@@ -267,6 +267,14 @@ entries remain caller-owned; worker creation NULLs entries only on transfer.
 Attempted-worker counts control checked teardown, never caller-slot cleanup.
 A refused worker stays in the coordinator cohort until release and retry.
 
+Final recursive aggregate canonicalization takes the canonical relation's source
+writer and excludes live storage aliases before changing rows or timestamps.
+Borrowed destinations refuse publication. Reader/alias refusal and group-map
+allocation failure preserve the relation; access is released before arrangement
+invalidation. This protects the shared aggregate boundary for serial and TDD
+callers. Repeated public TDD retry can also pass through separate final relation
+normalization; its checked-publication repair remains tracked by #1709.
+
 Heap and pooled constructors create independently owned Arrow schemas, including
 untyped and zero-width relations. Clones preserve declared width, names, types,
 graph metadata and required compound maps; a failed required map copy fails

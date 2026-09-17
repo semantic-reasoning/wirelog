@@ -59,7 +59,7 @@ col_group_hash(const col_rel_t *rel, uint32_t row, uint32_t group_by_count,
 }
 
 static int
-col_canonicalize_recursive_aggregate_relation(col_rel_t *rel,
+wl_columnar_eval_serial_canonicalize_aggregate_locked(col_rel_t *rel,
     const wl_plan_agg_spec_t *spec, const wl_intern_t *intern)
 {
     if (!rel || !spec || !spec->has_spec || rel->nrows < 2)
@@ -144,6 +144,33 @@ col_canonicalize_recursive_aggregate_relation(col_rel_t *rel,
     return 0;
 }
 
+static int
+wl_columnar_eval_serial_canonicalize_aggregate(col_rel_t *rel,
+    const wl_plan_agg_spec_t *spec, const wl_intern_t *intern)
+{
+    if (!rel || !spec || !spec->has_spec || rel->nrows < 2)
+        return 0;
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int rc = col_rel_source_writer_acquire(rel, &writer);
+    if (rc != 0)
+        return rc;
+    col_rel_t *owner = NULL;
+    rc = col_rel_storage_owner_resolve(rel, &owner);
+    if (rc == 0 && (owner != rel
+        || col_rel_storage_alias_borrow_count(owner) != 0))
+        rc = EBUSY;
+    if (rc == 0)
+        rc = wl_columnar_eval_serial_canonicalize_aggregate_locked(rel,
+                spec, intern);
+    int release_rc = wl_columnar_source_access_writer_release(&writer);
+    return rc != 0 ? rc : release_rc;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_eval_serial_test_before_aggregate)(wl_col_session_t *,
+    col_rel_t *);
+#endif
+
 int
 wl_columnar_eval_serial_canonicalize_aggregates(const wl_plan_stratum_t *sp,
     wl_col_session_t *sess)
@@ -178,7 +205,11 @@ wl_columnar_eval_serial_canonicalize_aggregates(const wl_plan_stratum_t *sp,
         if (!rp->recursive_agg.has_spec)
             continue;
         col_rel_t *rel = session_find_rel(sess, rp->name);
-        int rc = col_canonicalize_recursive_aggregate_relation(rel,
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_eval_serial_test_before_aggregate)
+            wl_columnar_eval_serial_test_before_aggregate(sess, rel);
+#endif
+        int rc = wl_columnar_eval_serial_canonicalize_aggregate(rel,
                 &rp->recursive_agg, sess->intern);
         if (rc != 0)
             return rc;
