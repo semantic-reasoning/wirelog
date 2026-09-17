@@ -96,47 +96,11 @@ col_row_in_sorted(const int64_t *sorted_data, uint32_t nrows, uint32_t ncols,
 }
 
 /*
- * col_idb_consolidate: Sort + dedup one IDB relation in-place.
- *
- * Reuses the eval stack + col_op_consolidate operator so sort order
- * is consistent with the rest of the evaluation pipeline.
+ * col_idb_consolidate: Privately normalize and publish one IDB relation.
+ * Untimestamped inputs reuse the consolidation operator; timestamped inputs
+ * use typed set normalization that preserves complete row provenance.
  */
-static int
-col_idb_consolidate(col_rel_t *r, wl_col_session_t *sess)
-{
-    eval_stack_t stk;
-    eval_stack_init(&stk);
-    int rc = eval_stack_push(&stk, r, false); /* borrowed */
-    if (rc != 0)
-        return rc;
-    col_op_consolidate(&stk, sess);
-    if (stk.top > 0) {
-        eval_entry_t ce;
-        int pop_rc = eval_stack_pop_relation(&stk, &ce);
-        if (pop_rc != 0)
-            return pop_rc;
-        if (ce.owned && ce.rel != r) {
-            /*
-             * r is an IDB relation from the coordinator session, not a
-             * worker or $d$ shared view.  Consolidation preserves the input
-             * arity: single-row inputs are returned unchanged, while a
-             * borrowed input is copied by col_rel_pool_new_like().  The
-             * copied result owns freshly allocated columns, so r->columns
-             * is owned here as well.  A future caller that permits shared IDB
-             * views, or a schema-changing consolidator, must replace this
-             * with ownership-aware release and arity validation.
-             */
-            col_columns_free(r->columns, r->ncols);
-            r->columns = ce.rel->columns;
-            r->nrows = ce.rel->nrows;
-            r->capacity = ce.rel->capacity;
-            wl_columnar_relation_touch_replacement(r);
-            ce.rel->columns = NULL;
-            col_rel_destroy(ce.rel);
-        }
-    }
-    return 0;
-}
+static int col_idb_consolidate(col_rel_t *r, wl_col_session_t *sess);
 
 /*
  * col_stratum_step_with_delta: Evaluate one stratum and fire delta callbacks.
@@ -1243,6 +1207,232 @@ wl_columnar_eval_delta_capture(const wl_plan_stratum_t *sp,
 fail:
     (void)wl_columnar_eval_delta_rollback_discard(sess);
     return rc;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_eval_delta_test_consolidation_boundary)(
+    wl_col_session_t *sess, col_rel_t *target, col_rel_t *candidate,
+    unsigned boundary);
+#endif
+
+static int
+wl_columnar_eval_delta_timestamp_cmp(const col_rel_t *rel,
+    const uint32_t *original, uint32_t a, uint32_t b)
+{
+    int cmp = col_rel_row_cmp(rel, a, b);
+    if (cmp != 0)
+        return cmp;
+    return (original[a] > original[b]) - (original[a] < original[b]);
+}
+
+static void
+wl_columnar_eval_delta_timestamp_swap(col_rel_t *rel, uint32_t *original,
+    uint32_t a, uint32_t b)
+{
+    for (uint32_t col = 0; col < rel->ncols; col++) {
+        int64_t value = rel->columns[col][a];
+        rel->columns[col][a] = rel->columns[col][b];
+        rel->columns[col][b] = value;
+    }
+    col_delta_timestamp_t timestamp = rel->timestamps[a];
+    rel->timestamps[a] = rel->timestamps[b];
+    rel->timestamps[b] = timestamp;
+    uint32_t index = original[a];
+    original[a] = original[b];
+    original[b] = index;
+}
+
+static void
+wl_columnar_eval_delta_timestamp_sift(col_rel_t *rel, uint32_t *original,
+    uint32_t root, uint32_t count)
+{
+    while (root < count / 2) {
+        uint32_t child = root * 2 + 1;
+        if (child + 1 < count && wl_columnar_eval_delta_timestamp_cmp(rel,
+            original, child, child + 1) < 0)
+            child++;
+        if (wl_columnar_eval_delta_timestamp_cmp(rel, original, root, child)
+            >= 0)
+            break;
+        wl_columnar_eval_delta_timestamp_swap(rel, original, root, child);
+        root = child;
+    }
+}
+
+/* Private set normalization preserves the complete provenance of the earliest
+ * original representative. Shared sorting's timestamp repair is #1689. */
+static int
+wl_columnar_eval_delta_timestamp_normalize_locked(wl_col_session_t *sess,
+    col_rel_t *rel)
+{
+    uint64_t bytes, temporary;
+    if (!wl_columnar_memory_size_mul(rel->nrows, sizeof(uint32_t), &bytes)
+        || bytes > SIZE_MAX
+        || !wl_columnar_memory_size_add(sess->cleanup_reserved_bytes, bytes,
+        &temporary))
+        return EOVERFLOW;
+    wl_columnar_memory_reservation_t reservation;
+    int rc = wl_columnar_eval_delta_reserve(sess, bytes, &reservation);
+    if (rc != 0)
+        return rc;
+    uint32_t *original = malloc((size_t)bytes);
+    if (!original) {
+        wl_columnar_eval_delta_observer_release_token(&reservation);
+        return ENOMEM;
+    }
+    if (sess->memory_governor && bytes
+        && !wl_columnar_memory_commit(&reservation, original)) {
+        free(original);
+        wl_columnar_eval_delta_observer_release_token(&reservation);
+        return EINVAL;
+    }
+    sess->cleanup_reserved_bytes = temporary;
+    col_session_mem_sample(sess);
+    uint32_t count = rel->nrows;
+    for (uint32_t i = 0; i < count; i++)
+        original[i] = i;
+    for (uint32_t root = count / 2; root > 0; root--)
+        wl_columnar_eval_delta_timestamp_sift(rel, original, root - 1, count);
+    for (uint32_t end = count; end > 1; end--) {
+        wl_columnar_eval_delta_timestamp_swap(rel, original, 0, end - 1);
+        wl_columnar_eval_delta_timestamp_sift(rel, original, 0, end - 1);
+    }
+    uint32_t out = 1;
+    for (uint32_t row = 1; row < count; row++) {
+        if (col_rel_row_cmp(rel, out - 1, row) == 0)
+            continue;
+        if (out != row) {
+            col_rel_row_move_raw(rel, out, row);
+            rel->timestamps[out] = rel->timestamps[row];
+        }
+        out++;
+    }
+    rel->nrows = out;
+    rel->sorted_nrows = out;
+    rel->run_count = 1;
+    rel->run_ends[0] = out;
+    free(original);
+    sess->cleanup_reserved_bytes -= bytes;
+    wl_columnar_eval_delta_observer_release_token(&reservation);
+    return 0;
+}
+
+static int
+wl_columnar_eval_delta_timestamp_normalize(wl_col_session_t *sess,
+    col_rel_t *rel)
+{
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int rc = col_rel_source_writer_acquire(rel, &writer);
+    if (rc != 0)
+        return rc;
+    if (col_rel_storage_alias_borrow_count(rel) != 0)
+        rc = EBUSY;
+    else
+        rc = wl_columnar_eval_delta_timestamp_normalize_locked(sess, rel);
+    int release_rc = wl_columnar_source_access_writer_release(&writer);
+    return rc != 0 ? rc : release_rc;
+}
+
+static int
+col_idb_consolidate(col_rel_t *target, wl_col_session_t *sess)
+{
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    wl_columnar_source_access_reader_t source_reader = { 0 };
+    wl_columnar_source_access_reader_t candidate_reader = { 0 };
+    col_rel_replacement_t replacement = { 0 };
+    uint64_t identity = 0, view = 0, storage = 0;
+    int rc = wl_columnar_eval_stack_cleanup_begin(sess, &frame);
+    if (rc != 0)
+        return rc;
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame);
+    eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(frame);
+    rc = col_rel_source_reader_acquire(target, &source_reader);
+    if (rc != 0)
+        goto done;
+    identity = target->relation_identity;
+    view = target->view_generation;
+    storage = target->storage_generation;
+    if (!wl_columnar_relation_float_values_valid(target)) {
+        rc = EINVAL;
+        goto done;
+    }
+    if (target->nrows <= 1)
+        goto done;
+    col_rel_t *candidate = wl_columnar_relation_new_like_governed(
+        "$consol", target, sess->memory_governor);
+    if (!candidate) {
+        rc = ENOMEM;
+        goto done;
+    }
+    result->rel = candidate;
+    result->owned = true;
+    rc = col_rel_append_all(candidate, target, NULL);
+    if (rc != 0)
+        goto done;
+    rc = col_rel_source_reader_release(&source_reader);
+    if (rc != 0)
+        goto done;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_delta_test_consolidation_boundary)
+        wl_columnar_eval_delta_test_consolidation_boundary(sess, target,
+            candidate, 1);
+#endif
+    if (candidate->timestamps) {
+        rc = wl_columnar_eval_delta_timestamp_normalize(sess, candidate);
+    } else {
+        rc = eval_stack_push(stack, candidate, true);
+        if (rc != 0)
+            goto done;
+        memset(result, 0, sizeof(*result));
+        rc = col_op_consolidate(stack, sess);
+        if (rc == 0)
+            rc = eval_stack_pop_relation(stack, result);
+    }
+    if (rc != 0)
+        goto done;
+    candidate = result->rel;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_delta_test_consolidation_boundary)
+        wl_columnar_eval_delta_test_consolidation_boundary(sess, target,
+            candidate, 2);
+#endif
+    rc = col_rel_source_reader_acquire(candidate, &candidate_reader);
+    if (rc != 0)
+        goto done;
+    rc = col_rel_prepare_replacement(target, candidate, &replacement);
+    if (rc != 0)
+        goto done;
+    if (target->relation_identity != identity || target->view_generation != view
+        || target->storage_generation != storage) {
+        rc = EBUSY;
+        goto done;
+    }
+    rc = col_rel_source_reader_release(&candidate_reader);
+    if (rc != 0)
+        goto done;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_delta_test_consolidation_boundary)
+        wl_columnar_eval_delta_test_consolidation_boundary(sess, target,
+            candidate, 3);
+#endif
+    rc = eval_entry_dispose(result);
+    if (rc != 0)
+        goto done;
+    col_rel_commit_replacement_locked(target, &replacement);
+done:
+    if (source_reader.owner) {
+        int release_rc = col_rel_source_reader_release(&source_reader);
+        if (rc == 0)
+            rc = release_rc;
+    }
+    if (candidate_reader.owner) {
+        int release_rc = col_rel_source_reader_release(&candidate_reader);
+        if (rc == 0)
+            rc = release_rc;
+    }
+    col_rel_discard_replacement(&replacement);
+    int cleanup_rc = wl_columnar_eval_stack_cleanup_finish(&frame);
+    return cleanup_rc != 0 ? cleanup_rc : rc;
 }
 
 int
