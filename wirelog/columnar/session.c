@@ -372,7 +372,10 @@ wl_columnar_session_retire_source_lease(wl_col_session_t *sess,
     if (col_rel_source_reader_release(&reader) != 0)
         return EINVAL;
     lease = wl_columnar_session_source_lease_take(sess, borrower);
-    return wl_columnar_session_source_lease_release(lease);
+    rc = wl_columnar_session_source_lease_release(lease);
+    if (rc != 0)
+        wl_columnar_session_source_lease_restore(sess, lease);
+    return rc;
 }
 
 static int
@@ -489,8 +492,9 @@ wl_columnar_session_cleanup_ready(wl_col_session_t *sess)
         return EINVAL;
     /* Active-only nesting is valid. Retry must never consume an active frame;
      * active plus pending cleanup is rejected by the cleanup primitive. */
-    return sess->cleanup_pending
+    int rc = sess->cleanup_pending
         ? wl_columnar_eval_stack_cleanup_retry(sess) : 0;
+    return rc != 0 ? rc : wl_columnar_eval_delta_rollback_retry(sess);
 }
 
 int
@@ -1541,6 +1545,8 @@ col_session_mem_sample(wl_col_session_t *sess)
      * temporaries that also carry a mem_ledger (join outputs) are charged
      * to RELATION as they grow and are skipped here. */
     uint64_t temporary = sess->cleanup_reserved_bytes;
+    temporary = sess->delta_rollback_reserved_bytes > UINT64_MAX - temporary
+        ? UINT64_MAX : temporary + sess->delta_rollback_reserved_bytes;
     const delta_pool_t *dp = sess->delta_pool;
     if (dp && dp->slab) {
         for (uint32_t sidx = 0; sidx < dp->slot_used; sidx++) {
@@ -2323,8 +2329,11 @@ col_session_destroy(wl_session_t *session)
     /* Public destruction has already closed admission and drained workers.
      * Refused internal readers violate the same synchronous teardown invariant
      * as refused relation destruction below; never free their allocators. */
-    int cleanup_rc = sess->cleanup_active ? EBUSY
-        : wl_columnar_session_cleanup_ready(sess);
+    int cleanup_rc = (sess->cleanup_active
+        || wl_columnar_eval_delta_rollback_active(sess)) ? EBUSY
+        : wl_columnar_eval_stack_cleanup_retry(sess);
+    if (cleanup_rc == 0)
+        cleanup_rc = wl_columnar_eval_delta_rollback_discard(sess);
     if (cleanup_rc != 0) {
         fputs("wirelog: evaluator cleanup failed during session destroy\n",
             stderr);
@@ -2516,6 +2525,8 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->cleanup_active_count = 0;
     out_worker->cleanup_pending_count = 0;
     out_worker->cleanup_reserved_bytes = 0;
+    out_worker->delta_rollback = NULL;
+    out_worker->delta_rollback_reserved_bytes = 0;
     out_worker->arr_entries = NULL;
     out_worker->arr_count = 0;
     out_worker->arr_cap = 0;
@@ -2706,9 +2717,12 @@ col_worker_session_destroy(wl_col_session_t *worker)
     if (!worker)
         return 0;
     /* Nesting is allowed during evaluation, never during destruction. */
-    if (worker->cleanup_active)
+    if (worker->cleanup_active
+        || wl_columnar_eval_delta_rollback_active(worker))
         return EBUSY;
-    int cleanup_rc = wl_columnar_session_cleanup_ready(worker);
+    int cleanup_rc = wl_columnar_eval_stack_cleanup_retry(worker);
+    if (cleanup_rc == 0)
+        cleanup_rc = wl_columnar_eval_delta_rollback_discard(worker);
     if (cleanup_rc != 0)
         return cleanup_rc;
     worker->teardown_started = true;
@@ -3730,7 +3744,8 @@ cleanup:
 static void
 col_session_reclaim_quiescent(wl_col_session_t *sess)
 {
-    if (!sess)
+    if (!sess || sess->cleanup_active || sess->cleanup_pending
+        || sess->delta_rollback)
         return;
     col_mat_cache_release_pins(&sess->mat_cache);
     if (!sess->mat_cache.reclaimer_owner_alive)

@@ -1567,6 +1567,8 @@ typedef struct wl_columnar_session_source_lease {
     struct wl_columnar_session_source_lease *next;
 } wl_columnar_session_source_lease_t;
 
+typedef struct wl_columnar_eval_delta_rollback wl_columnar_eval_delta_rollback_t;
+
 typedef struct wl_columnar_eval_stack_cleanup_frame
     wl_columnar_eval_stack_cleanup_frame_t;
 
@@ -1910,6 +1912,8 @@ typedef struct wl_col_session_t {
     uint32_t cleanup_active_count;
     uint32_t cleanup_pending_count;
     uint64_t cleanup_reserved_bytes;
+    wl_columnar_eval_delta_rollback_t *delta_rollback;
+    uint64_t delta_rollback_reserved_bytes;
     /* Exchange operator state (Issue #316): W x W partition buffer matrix.
      * Allocated by coordinator before exchange scatter dispatch.
      * exchange_bufs[src_worker][dst_worker] holds rows src sends to dst.
@@ -2461,6 +2465,18 @@ col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
 int
 col_rel_reset_rows_locked(col_rel_t *r,
     wl_columnar_source_access_writer_t *writer);
+/* Detach only row storage under descriptor/owner exclusion. The caller must
+ * already own a rollback copy. Shared/arena payloads are not individually
+ * freed. On success a former alias is self-owned; retire its session lease
+ * after this function returns. Failure does not mutate the relation. */
+int
+wl_columnar_relation_delta_detach(col_rel_t *rel, uint64_t expected_identity);
+/* Restore only a matching self-owned empty descriptor. Existing columns are
+ * preserved; allocation/admission and reader refusal leave it unchanged. */
+int
+wl_columnar_relation_delta_restore_flat(col_rel_t *rel,
+    uint64_t expected_identity, const int64_t *rows,
+    uint32_t nrows, uint32_t ncols);
 int
 col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena);
 int
@@ -3198,6 +3214,18 @@ tdd_stratum_mixed_slice_candidate(const wl_plan_stratum_t *sp);
 int
 col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t stratum_idx);
+/* Retry after evaluator frames drain. Active evaluation permits nested entry.
+ * Pending snapshots survive any refusal; discard is teardown-only while an
+ * error remains and never allocates replacement columns. */
+int wl_columnar_eval_delta_rollback_retry(wl_col_session_t *sess);
+int wl_columnar_eval_delta_rollback_discard(wl_col_session_t *sess);
+bool wl_columnar_eval_delta_rollback_active(const wl_col_session_t *sess);
+/* Rotation strategies defer frontier GC while snapshots own compound IDs.
+ * Only successful evaluation replays one coalesced request after release. */
+bool wl_columnar_eval_delta_defer_gc(wl_col_session_t *sess);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_eval_delta_test_after_eval)(wl_col_session_t *sess);
+#endif
 void
 wl_columnar_delta_events_clear(wl_col_session_t *sess);
 void

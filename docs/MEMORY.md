@@ -366,7 +366,7 @@ every stratum that ran under TDD.
 | `TIMESTAMP` | event | `timestamps[]` arrays (24 bytes per row of capacity) of ledger-attached relations. Reconciled together with RELATION. | `relation.c` |
 | `CHANNEL` | event | TDD delta transport: the MPSC ring storage for the stratum (charged at queue creation) plus every delta payload (columns + timestamps) between the worker's enqueue and the coordinator's drain or discard. Charged on the coordinator's ledger because ownership transfers on enqueue. | `eval.c`, `eval_tdd_queue.c` |
 | `STORED` | gauge | Session-owned relations in `rels[]`: EDB and IDB relations on the coordinator, partitions on a worker. Column buffers plus timestamps; arena-owned columns count 0. | sampled, see §2.2 |
-| `TEMPORARY` | gauge | Delta-pool temporaries whose column buffers spilled to the heap because the pool arena was full (`pool_owned && !arena_owned`), excluding those already attached to RELATION. | sampled, see §2.2 |
+| `TEMPORARY` | gauge | Delta-pool temporaries whose column buffers spilled to the heap because the pool arena was full (`pool_owned && !arena_owned`), excluding those already attached to RELATION, plus admitted evaluator cleanup frames and retained delta-step rollback records. | sampled, see §2.2 |
 
 The per-subsystem cap printed in the report is `budget × share / 100` with
 shares `50/10/10/10/5/5/5/5` in the order above.  Only the RELATION share
@@ -623,7 +623,30 @@ the evaluation stack. Paths below are relative to `wirelog/columnar/`.
 | Materialization cache | Cache exclusively owns accepted heap results; lookup pin protects copying | JOIN exposes an independent copy to the stack; eviction/clear waits for pins and destroys the cached result once | `cache.c`, `join.c` |
 | Delta transport payload | Producer transfers owned relation to queue, then coordinator matrix/consumer | Reconstruction deduplicates malformed aliases; discard destroys each owned queued payload; current matrix retains one payload per worker/relation, not an arbitrary batch stream | `eval_tdd_queue.c`, `eval.c` |
 | Continuation scratch and published batches | Producer owns scratch and input/index leases; synchronous sink owns committed output | Cursor advances at publication commit; destroy releases producer state; no asynchronous lifetime is implied for scratch-backed payloads | `continuation.c`, `join_batch.c`, `diff_join_batch.c` |
-| Retraction rollback columns and ordering metadata | Relation retains original buffers and metadata while reevaluation uses replacement storage | Error restores backups; successful reevaluation reconciles results before backup ownership ends | `eval_delta.c` |
+| Delta-step rollback snapshots | Session owns admitted metadata, copied names and flat rows; stable relation identities prevent restoration into replacement registrations; a GC-only compound hold preserves handle IDs | Capture completes before detachment; checked restoration retains refused backups; successful evaluation or recovery releases them once; teardown discards pending backups after evaluator cleanup | `eval_delta.c`, `relation.c`, `session.c` |
+
+Delta-step rollback preserves the existing empty-descriptor restoration policy:
+only a relation actually detached by the step, still registered with the same
+identity, and still without columns is restored. Populated partial evaluation
+results and replacement registrations are preserved. This is not a transaction
+that rolls back the entire stratum. No delta callbacks are published by a failed
+step; callers must not infer recovery of callbacks for unrelated partial results.
+
+One active or pending rollback record is permitted per session. Metadata and flat
+payloads are admitted before allocation, and the governor reference and compound
+hold remain owned until all snapshots are released. Capture failure changes no
+live IDB. Detachment processes aliases before their owners; a later reader refusal
+may leave a detached prefix, which is restored or retained for retry. Readiness
+first drains evaluator frames, then attempts a finite restoration sweep. Repeated
+reader or allocation refusal preserves unresolved backups and blocks mutation.
+Quiescent cache reclamation is suppressed while this ownership remains pending.
+Synchronous teardown rejects active work and discards pending backups after
+frame cleanup without allocating restoration columns. Frontier GC requests made
+through the rotation strategy while a record is active are coalesced. Successful
+evaluation releases the backups and hold, then explicitly dispatches one requested
+frontier collection before observer publication. Failed recovery and teardown do
+not replay GC, and generic hold release still performs no collection. Independent
+holds or a frozen arena can still defer that explicit collection attempt.
 
 An iteration or frontier boundary alone does not authorize reclamation. All
 queued tasks, consumer-held values, active probes and rollback obligations
