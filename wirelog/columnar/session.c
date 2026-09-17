@@ -3787,13 +3787,23 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
             uint32_t delta_nrows = r->nrows - r->base_nrows;
             col_rel_t *delta = col_rel_new_auto(dname, r->ncols);
             if (!delta)
-                continue; /* best-effort; falls back to full eval */
+                return ENOMEM;
             for (uint32_t row = 0; row < delta_nrows; row++) {
-                col_rel_append_row(
+                int seed_rc = col_rel_append_row(
                     delta, col_rel_row(r, r->base_nrows + row));
+                if (seed_rc != 0) {
+                    col_rel_destroy(delta);
+                    return seed_rc;
+                }
             }
-            session_remove_rel(sess, dname);
-            session_add_rel(sess, delta);
+            /* Replacement is atomic per relation. On failure session_add_rel
+            * leaves delta with its caller and preserves the registered owner;
+            * hash allocation failure uses the successful linear fallback. */
+            int seed_rc = session_add_rel(sess, delta);
+            if (seed_rc != 0) {
+                col_rel_destroy(delta);
+                return seed_rc;
+            }
         }
         sess->delta_seeded = true;
     }
