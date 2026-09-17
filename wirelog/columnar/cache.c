@@ -405,6 +405,8 @@ int
 col_mat_cache_insert_pin(col_mat_cache_t *cache, const col_rel_t *left,
     const col_rel_t *right, col_rel_t *result, col_mat_cache_pin_t *pin)
 {
+    if (pin)
+        memset(pin, 0, sizeof(*pin));
     if (!cache || !left || !right || !result)
         return EINVAL;
     /* The cache destroys entries on eviction.  Borrowed, arena-backed, or
@@ -418,8 +420,6 @@ col_mat_cache_insert_pin(col_mat_cache_t *cache, const col_rel_t *left,
             && cache->entries[i].result == result)
             return EEXIST;
     }
-    if (pin)
-        memset(pin, 0, sizeof(*pin));
     size_t result_bytes
         = (result->nrows > 0 && result->ncols > 0)
               ? (size_t)result->nrows * result->ncols * sizeof(int64_t)

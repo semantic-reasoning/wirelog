@@ -36,6 +36,23 @@ make_relation(int64_t value)
     return rel;
 }
 
+static col_mat_cache_pin_t
+make_stale_pin(col_mat_cache_t *cache)
+{
+    col_mat_cache_pin_t pin = {
+        .cache = cache,
+        .identity = 12345,
+        .active = true,
+    };
+    return pin;
+}
+
+static bool
+pin_is_inactive(const col_mat_cache_pin_t *pin)
+{
+    return pin->cache == NULL && pin->identity == 0 && !pin->active;
+}
+
 static void
 test_rejects_nonexclusive_results(void)
 {
@@ -118,6 +135,52 @@ test_rejects_nonexclusive_results(void)
     col_rel_destroy(alias);
     col_rel_destroy(alias_owner);
 
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+}
+
+static void
+test_insert_pin_failure_zeros_stale_pin(void)
+{
+    tests_run++;
+    col_mat_cache_t cache = { 0 };
+    col_rel_t *left = make_relation(90);
+    col_rel_t *right = make_relation(91);
+    col_rel_t *result = make_relation(92);
+    ASSERT_TRUE(left && right && result,
+        "stale-pin failure relations allocated");
+
+    col_mat_cache_pin_t pin = make_stale_pin(&cache);
+    ASSERT_TRUE(col_mat_cache_insert_pin(NULL, left, right, result, &pin)
+        == EINVAL,
+        "NULL cache insertion reports EINVAL");
+    ASSERT_TRUE(pin_is_inactive(&pin),
+        "NULL cache insertion clears stale out pin");
+
+    ASSERT_TRUE(col_mat_cache_insert(&cache, left, right, result) == 0,
+        "stale-pin duplicate setup insert succeeds");
+    pin = make_stale_pin(&cache);
+    ASSERT_TRUE(col_mat_cache_insert_pin(&cache, left, right, result, &pin)
+        == EEXIST,
+        "duplicate result insertion reports EEXIST");
+    ASSERT_TRUE(pin_is_inactive(&pin),
+        "duplicate result insertion clears stale out pin");
+
+    col_rel_t *alias_owner = make_relation(93);
+    col_rel_t *alias = make_relation(94);
+    ASSERT_TRUE(alias_owner && alias
+        && col_rel_install_shared_view(alias, alias_owner) == 0,
+        "stale-pin alias setup succeeds");
+    pin = make_stale_pin(&cache);
+    ASSERT_TRUE(col_mat_cache_insert_pin(&cache, left, right, alias_owner,
+        &pin) == EINVAL,
+        "nonexclusive insertion reports EINVAL");
+    ASSERT_TRUE(pin_is_inactive(&pin),
+        "nonexclusive insertion clears stale out pin");
+    col_rel_destroy(alias);
+    col_rel_destroy(alias_owner);
+
+    col_mat_cache_clear(&cache);
     col_rel_destroy(left);
     col_rel_destroy(right);
 }
@@ -400,6 +463,7 @@ int
 main(void)
 {
     test_rejects_nonexclusive_results();
+    test_insert_pin_failure_zeros_stale_pin();
     test_lookup_clear_and_release();
     test_pin_survives_compaction_and_truncate();
     test_lru_preserves_pinned_entry();
