@@ -483,6 +483,41 @@ wl_columnar_session_retry_deferred(wl_col_session_t *sess)
 }
 
 int
+wl_columnar_session_cleanup_ready(wl_col_session_t *sess)
+{
+    if (!sess)
+        return EINVAL;
+    /* Active-only nesting is valid. Retry must never consume an active frame;
+     * active plus pending cleanup is rejected by the cleanup primitive. */
+    return sess->cleanup_pending
+        ? wl_columnar_eval_stack_cleanup_retry(sess) : 0;
+}
+
+int
+wl_columnar_session_cleanup_ready_quiescent(wl_col_session_t *sess)
+{
+    if (!sess)
+        return EINVAL;
+    if (sess->coordinator)
+        return wl_columnar_session_cleanup_ready(sess);
+    /* Worker frame lists are thread-confined until this barrier. Never inspect
+     * them before submitted callbacks have finished, including drain failure. */
+    if (sess->wq) {
+        int rc = wl_workqueue_drain(sess->wq);
+        if (rc != 0)
+            return rc;
+    }
+    int result = 0;
+    for (uint32_t w = 0; w < sess->tdd_workers_count; w++) {
+        int rc = wl_columnar_session_cleanup_ready(&sess->tdd_workers[w]);
+        if (result == 0)
+            result = rc;
+    }
+    int rc = wl_columnar_session_cleanup_ready(sess);
+    return result != 0 ? result : rc;
+}
+
+int
 wl_columnar_session_transfer_deferred(wl_col_session_t *from,
     wl_col_session_t *to)
 {
@@ -2285,6 +2320,16 @@ col_session_destroy(wl_session_t *session)
         sess->tdd_workers = NULL;
         sess->tdd_workers_count = 0;
     }
+    /* Public destruction has already closed admission and drained workers.
+     * Refused internal readers violate the same synchronous teardown invariant
+     * as refused relation destruction below; never free their allocators. */
+    int cleanup_rc = sess->cleanup_active ? EBUSY
+        : wl_columnar_session_cleanup_ready(sess);
+    if (cleanup_rc != 0) {
+        fputs("wirelog: evaluator cleanup failed during session destroy\n",
+            stderr);
+        abort();
+    }
     /* Issue #1435: differential arrangements hold registry-entry leases and
      * row links into relation positions.  Reject teardown while any lease or
      * replacement transaction is still active, before any relation storage is
@@ -2660,6 +2705,12 @@ col_worker_session_destroy(wl_col_session_t *worker)
 {
     if (!worker)
         return 0;
+    /* Nesting is allowed during evaluation, never during destruction. */
+    if (worker->cleanup_active)
+        return EBUSY;
+    int cleanup_rc = wl_columnar_session_cleanup_ready(worker);
+    if (cleanup_rc != 0)
+        return cleanup_rc;
     worker->teardown_started = true;
     wl_columnar_delta_events_clear(worker);
     if (worker->filt_cache_active_pins != 0)
@@ -2824,6 +2875,11 @@ col_session_insert(wl_session_t *session, const char *relation,
     if (sess->delta_cb != NULL)
         return col_session_insert_incremental(session, relation, data,
                    num_rows, num_cols);
+
+    int cleanup_rc = wl_columnar_session_cleanup_ready_quiescent(
+        COL_SESSION(session));
+    if (cleanup_rc != 0)
+        return cleanup_rc;
 
     col_rel_t *r = session_find_rel(sess, relation);
     if (!r)
@@ -2990,6 +3046,11 @@ col_session_insert_incremental(wl_session_t *session, const char *relation,
     if (num_rows == 0)
         return 0; /* true no-op */
 
+    int cleanup_rc = wl_columnar_session_cleanup_ready_quiescent(
+        COL_SESSION(session));
+    if (cleanup_rc != 0)
+        return cleanup_rc;
+
     col_rel_t *r = session_find_rel(COL_SESSION(session), relation);
     if (!r)
         return ENOENT;
@@ -3037,6 +3098,11 @@ col_session_remove(wl_session_t *session, const char *relation,
     if (sess->delta_cb != NULL)
         return col_session_remove_incremental(session, relation, data, num_rows,
                    num_cols);
+
+    int cleanup_rc = wl_columnar_session_cleanup_ready_quiescent(
+        COL_SESSION(session));
+    if (cleanup_rc != 0)
+        return cleanup_rc;
 
     col_rel_t *r = session_find_rel(sess, relation);
     if (!r)
@@ -3127,6 +3193,11 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
     wl_col_session_t *sess = COL_SESSION(session);
 
     /* Find EDB relation */
+    int cleanup_rc = wl_columnar_session_cleanup_ready_quiescent(
+        COL_SESSION(session));
+    if (cleanup_rc != 0)
+        return cleanup_rc;
+
     col_rel_t *r = session_find_rel(sess, relation);
     if (!r)
         return ENOENT;
@@ -3271,6 +3342,9 @@ static int
 col_session_step(wl_session_t *session)
 {
     wl_col_session_t *sess = COL_SESSION(session);
+    int cleanup_rc = wl_columnar_session_cleanup_ready_quiescent(sess);
+    if (cleanup_rc != 0)
+        return cleanup_rc;
     int deferred_rc = wl_columnar_session_retry_deferred(sess);
     if (deferred_rc != 0)
         return deferred_rc;
@@ -3714,6 +3788,9 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
         return EINVAL;
 
     wl_col_session_t *sess = COL_SESSION(session);
+    int cleanup_rc = wl_columnar_session_cleanup_ready_quiescent(sess);
+    if (cleanup_rc != 0)
+        return cleanup_rc;
     int deferred_rc = wl_columnar_session_retry_deferred(sess);
     if (deferred_rc != 0)
         return deferred_rc;

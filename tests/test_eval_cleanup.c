@@ -68,6 +68,7 @@ test_admission_and_nesting(void)
         WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES] = { 0 };
     wl_columnar_eval_stack_cleanup_frame_t *extra = NULL;
     CHECK(wl_columnar_eval_stack_cleanup_begin(s, &frames[0]) == 0);
+    CHECK(wl_columnar_session_cleanup_ready(s) == 0);
     uint64_t bytes = reserved(s);
     CHECK(bytes > 0 && s->cleanup_reserved_bytes == bytes);
     wl_col_session_t *worker = calloc(1, sizeof(*worker));
@@ -76,6 +77,19 @@ test_admission_and_nesting(void)
         && worker->cleanup_active_count == 0 &&
         worker->cleanup_pending_count == 0
         && worker->cleanup_reserved_bytes == 0);
+    wl_columnar_eval_stack_cleanup_frame_t *worker_frame = NULL;
+    CHECK(wl_columnar_eval_stack_cleanup_begin(worker, &worker_frame) == 0);
+    CHECK(wl_columnar_session_cleanup_ready(worker) == 0);
+    delta_pool_t *worker_pool = worker->delta_pool;
+    wl_arena_t *worker_arena = worker->eval_arena;
+    uint64_t active_bytes = reserved(s);
+    CHECK(col_worker_session_destroy(worker) == EBUSY);
+    CHECK(!worker->teardown_started && worker->cleanup_active == worker_frame
+        && worker->cleanup_active_count == 1 &&
+        worker->delta_pool == worker_pool
+        && worker->eval_arena == worker_arena && reserved(s) == active_bytes);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&worker_frame) == 0);
+    CHECK(!worker_frame && !worker->cleanup_active);
     CHECK(col_worker_session_destroy(worker) == 0);
     free(worker);
     atomic_store_explicit(
@@ -172,6 +186,7 @@ test_progress_past_refusal(void)
     CHECK(eval_stack_push(wl_columnar_eval_stack_cleanup_stack(b), two,
         true) == 0);
     CHECK(wl_columnar_eval_stack_cleanup_finish(&b) == EBUSY && !b);
+    CHECK(wl_columnar_session_cleanup_ready(s) == EBUSY);
     CHECK(wl_columnar_eval_stack_cleanup_retry(s) == EBUSY);
     CHECK(wl_columnar_eval_stack_cleanup_finish(&a) == EBUSY && !a);
     CHECK(s->cleanup_pending_count == 2);

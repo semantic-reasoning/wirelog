@@ -424,6 +424,10 @@ int
 col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t stratum_idx)
 {
+    int readiness_rc = wl_columnar_session_cleanup_ready(sess);
+    if (readiness_rc != 0)
+        return readiness_rc;
+
     /* Issue #158: For now, use full re-evaluation for retraction.
      * When retraction_seeded is set, the standard delta callback logic
      * compares prev state with new state (recomputed from affected input),
