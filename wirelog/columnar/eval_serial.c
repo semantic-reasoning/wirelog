@@ -292,8 +292,7 @@ int
 col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t stratum_idx)
 {
-    bool framed = !sess->coordinator && sess->num_workers <= 1
-        && (!sp->is_recursive || !sess->delta_rollback);
+    bool framed = !sess->coordinator && sess->num_workers <= 1;
     if (framed && sess->cleanup_active)
         return EBUSY;
     int readiness_rc = wl_columnar_session_cleanup_ready(sess);
