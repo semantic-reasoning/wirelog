@@ -603,12 +603,56 @@ the governor and the standalone fuzz target.
 
 ## 10. Primary arrangement leases (#1384)
 
+### Integrated ownership and reader boundaries
+
+The following matrix describes the implemented ownership mechanisms. A cache
+pin protects its entry; a source reader protects the relation version that an
+operator actually reads. Neither is implied merely by putting a pointer on
+the evaluation stack. Paths below are relative to `wirelog/columnar/`.
+
+| Resource | Owner and reader protection | Release / invalidation boundary | Implementation |
+|---|---|---|---|
+| Session relation columns, schema and timestamps | Session owns the relation; source readers bind its descriptor and ultimate storage owner | Checked mutation/destruction requires writer access; identity, view and storage generations invalidate dependent views | `relation.c`, `session.c` |
+| Worker relation views and compound arena | Worker owns private descriptors/arrangements and borrows coordinator storage through source/arena leases | Drain tasks and release aliases/read leases before coordinator storage is destroyed | `session.c`, `../arena/compound_arena.c` |
+| Owned evaluation-stack result and segment boundaries | Stack entry owns destruction of its relation and its segment array | `eval_entry_dispose` destroys the relation before freeing segment metadata; a refused disposal retains the entry | `eval_stack.c` |
+| Borrowed evaluation-stack result | Relation remains owned by its session, cache or enclosing operation; the entry does not acquire a general-purpose pin | Owner must outlive every consuming operator; disposing the entry does not destroy the borrowed relation | `eval_stack.c`, `eval_plan.c` |
+| Primary hash arrangement | Session cache owns buckets/chains; probe bundle holds index pin and source readers | Eviction skips pins; invalidation defers; final release permits lazy rebuild | `arrangement.c`, `join.c` |
+| Sorted arrangement | Session owns sorted copy; LFTJ probe pins entry and source | Release probe before teardown; source changes require rebuild, deferred while pinned | `arrangement.c`, `lftj.c` |
+| Differential arrangement | Session owns persistent index; transaction owns unpublished replacement; pin binds source snapshot | Replacement/invalidation cannot overwrite a leased index; abort discards staged work; final release applies deferred reset | `diff_arrangement.c`, `diff_join_batch.c` |
+| Filtered-relation cache | Cache owns filtered relation; explicit cache pins defer replacement | Last pin release destroys an invalidated entry; immediate-release lookup wrapper does not retain a pin for its caller | `filter.c` |
+| Materialization cache | Cache exclusively owns accepted heap results; lookup pin protects copying | JOIN exposes an independent copy to the stack; eviction/clear waits for pins and destroys the cached result once | `cache.c`, `join.c` |
+| Delta transport payload | Producer transfers owned relation to queue, then coordinator matrix/consumer | Reconstruction deduplicates malformed aliases; discard destroys each owned queued payload; current matrix retains one payload per worker/relation, not an arbitrary batch stream | `eval_tdd_queue.c`, `eval.c` |
+| Continuation scratch and published batches | Producer owns scratch and input/index leases; synchronous sink owns committed output | Cursor advances at publication commit; destroy releases producer state; no asynchronous lifetime is implied for scratch-backed payloads | `continuation.c`, `join_batch.c`, `diff_join_batch.c` |
+| Retraction rollback columns and ordering metadata | Relation retains original buffers and metadata while reevaluation uses replacement storage | Error restores backups; successful reevaluation reconciles results before backup ownership ends | `eval_delta.c` |
+
+An iteration or frontier boundary alone does not authorize reclamation. All
+queued tasks, consumer-held values, active probes and rollback obligations
+must be accounted for first. The resident floor includes pinned inputs,
+required indexes, rollback state and the scratch needed to make progress.
+Admission may fail when that floor and the next required allocation cannot
+fit; it must not retry indefinitely without released capacity. This is a
+contract for admitted allocations, not a claim that all allocation classes,
+spill access or downstream pipelines are already bounded (#1369, #1372,
+#1475).
+
+Cleanup refusal is still an integration gap: #1647 covers lost popped results,
+#1648 covers K-Fusion refusal handling, and #1661 covers retention of whole
+refused evaluator stacks and their allocators across unwind. In particular,
+retaining an entry on a block-local stack does not preserve ownership after
+its caller returns. Pool/arena relations cannot use the heap-only deferred
+registry, and a live reader prevents promoting their descriptors. Internal
+checked cleanup can return `EBUSY`; public session destruction remains
+synchronous and does not offer recoverable deferred destruction. See
+`wirelog/session.c` and `session.c` for that distinction. These open cases
+remain prerequisites to closing #1384.
+
 Primary hash arrangements are session-owned cache entries. A join that probes
 one through `col_session_pin_arrangement()` holds a non-public lease until the
 probe has finished; the lease protects both the hash-table buffers and the
 embedded entry identity from cache eviction. The flat entry registry is never
-grown while a lease is active, so a caller that needs a new slot falls back to
-an ephemeral arrangement. `col_arrangement_pin_release()` must be called
+grown while a lease is active, so lookup may report the arrangement unavailable.
+The caller decides whether that status permits an ephemeral fallback or must
+be propagated as an error. `col_arrangement_pin_release()` must be called
 exactly once, including on allocation and join-error paths.
 
 | Event | Pinned entry | Unpinned entry |
@@ -634,9 +678,10 @@ operation. Mutation is denied with `EBUSY` while the bundle is live and may be
 retried after release; aborted differential work leaves the persistent index
 and accounting unchanged.
 
-Checked teardown drains queued work and rejects destruction while a live source
-lease remains. The delegated #1435/#1507 work and non-primary materialization
-cache semantics are not claimed by this contract.
+Checked internal teardown drains queued work and rejects destruction while a
+live source lease remains. Filtered, materialization, differential and sorted
+cache ownership is described below; those mechanisms do not remove the
+cleanup-refusal limitations in the matrix's accompanying contract.
 
 ## 11. Sorted-arrangement leases for LFTJ
 
@@ -677,13 +722,19 @@ build disables assertions).
 | cache growth on a miss | refused while any lease is active | grow |
 | final lease release | destroy the deferred relation; next lookup rebuilds | no action |
 
-A caller that receives NULL uses an owned filtered relation for that
-operation. The keyed join is wired to the lease variant in a later unit.
+A keyed join whose cache lookup returns NULL uses an owned filtered relation
+for that operation. Production JOIN currently calls the immediate-release
+wrapper, not the explicit cache-pin interface. Its source-reader bundle is a
+separate mechanism and must not be described as a retained filtered-cache pin.
+Owned filtered fallbacks bypass the non-delta filtered-arrangement and
+materialization caches; their operation-local descriptors cannot become cache
+keys or retained cache dependencies.
 
 The filtered-cache lease is likewise an internal coordinator/worker-session
 contract, not a public API or a general concurrent-reader mechanism.
-Differential, sorted and materialization-cache lifetimes, plus
-relation-generation validation, remain tracked separately in issue #1435.
+Relation-generation validation and the other cache-specific lifetime
+mechanisms are integrated, as described in the ownership matrix and adjacent
+sections. This does not establish a universal pin for borrowed stack values.
 
 ### Materialization-cache ownership
 
@@ -723,8 +774,8 @@ join; the session records the fallback count and last reason and logs one
 `JOIN` warning per reason.  `WIRELOG_JOIN_BATCH_STRICT=1` (ignored unless
 the bytes knob is set) turns a fallback into an `ENOTSUP` failure, which is
 the explicit bounded-mode result for unsupported shapes.  Differential
-keyed joins are tracked separately in #1453; pipeline consumption of
-batches on the eval stack (JOIN -> FILTER* -> MAP) is a follow-up.
+keyed joins have the separate producer described below; pipeline consumption
+of batches on the eval stack (JOIN -> FILTER* -> MAP) remains #1475.
 
 Ownership and admission:
 

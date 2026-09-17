@@ -1062,8 +1062,9 @@ relation invalidation inspect the lease count: eviction skips pinned entries,
 and invalidation is deferred until the final release. This keeps the
 arrangement buffers and their embedded cache-entry identity stable for the
 borrower's lifetime. The flat registry refuses `realloc()` while any lease is
-active; callers that cannot obtain a new cache slot must use their ephemeral
-fallback until the lease is released.
+active; callers that cannot obtain a new cache slot receive an unavailable
+status. Fallback or error propagation depends on the operator path; a protected
+primary-probe failure is not universally an ephemeral-fallback request.
 
 The lease is internal and must not be copied or released twice. The source
 reader is acquired with the arrangement pin in the operation-local bundle and
@@ -1074,8 +1075,24 @@ every earlier pin and reader. Mutation takes the same source gate and returns
 aliases and checked teardown follow the same rule: no queued task or borrowed
 source may outlive the operation/session boundary.
 
-This is not a general concurrent-reader API. Filtered/materialization-cache
-extensions and the delegated #1435/#1507 work remain separate contracts.
+This is not a general concurrent-reader API. Cache pin counters are confined
+to the owning session's serialized work; source-reader gates provide the
+separate exclusion against source mutation. Filtered, materialization,
+differential and sorted caches now have distinct ownership mechanisms; see
+[MEMORY.md's integrated ownership matrix](MEMORY.md#integrated-ownership-and-reader-boundaries).
+The production filtered JOIN lookup uses the immediate-release cache wrapper,
+so its source-reader bundle must not be mistaken for a retained cache-entry
+pin. Materialization hits are copied under a pin before reaching the stack.
+
+Checked internal cleanup can refuse with `EBUSY`, but synchronous public
+`wirelog_session_destroy` does not expose a retryable teardown result. It
+delegates to internal `wl_session_destroy`, which closes operation admission
+and waits for admitted operations before backend teardown; the public facade
+then releases its wrapper. Reader lifetimes must end within those boundaries.
+Refused evaluator-stack ownership and K-Fusion cleanup remain open in #1647,
+#1648 and #1661; a local stack cannot retain an entry after its caller unwinds.
+These contracts must not be read as support for arbitrary pool/arena borrowers
+surviving an operation or allocator reset.
 
 ## 14. Sorted-arrangement lease contract
 
