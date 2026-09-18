@@ -3024,6 +3024,128 @@ extern void (*wl_columnar_eval_test_subpass_boundary)(wl_col_session_t *,
     uint32_t,
     bool);
 
+extern int wl_columnar_eval_test_global_exchange(const wl_plan_stratum_t *,
+    wl_col_session_t *, col_eval_tdd_worker_ctx_t *, uint32_t);
+
+static void
+test_global_exchange_metadata(uint32_t workers, bool schema_less)
+{
+    TEST(
+        "global exchange: full metadata adoption and timestamp correspondence");
+    wl_plan_relation_t relation = { .name = "output",
+                                    .delta_name = "$d$output" };
+    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1 };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1 };
+    wl_session_t *session = NULL;
+    col_eval_tdd_worker_ctx_t *ctxs = NULL;
+    col_rel_t *prototype = NULL, *unowned = NULL;
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    const char *failure = NULL;
+#define GLOBAL_META_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    GLOBAL_META_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "create");
+    wl_col_session_t *coord = (wl_col_session_t *)session;
+    governor = coord->memory_governor;
+    wl_columnar_memory_governor_ref_retain(governor);
+    prototype = col_rel_new_auto("prototype", 2);
+    GLOBAL_META_CHECK(prototype, "prototype");
+    GLOBAL_META_CHECK(col_rel_attach_memory_governor(prototype, governor) == 0,
+        "attach governor");
+    wirelog_column_type_t types[] = { WIRELOG_TYPE_INT64, WIRELOG_TYPE_INT64 };
+    GLOBAL_META_CHECK(col_rel_set_column_types(prototype, types, 2) == 0,
+        "types");
+    prototype->compound_arity_map = malloc(sizeof(uint32_t));
+    GLOBAL_META_CHECK(prototype->compound_arity_map, "compound map");
+    prototype->compound_arity_map[0] = 2;
+    prototype->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+    prototype->compound_count = 1;
+    prototype->inline_physical_offset = 0;
+    prototype->declared_ncols = 1;
+    prototype->has_graph_column = true;
+    prototype->graph_col_idx = 1;
+    GLOBAL_META_CHECK(col_rel_enable_timestamps(prototype) == 0,
+        "timestamp mode");
+    if (schema_less)
+        GLOBAL_META_CHECK(col_rel_alloc(&unowned, "output") == 0, "schemaless");
+    else unowned = wl_columnar_relation_new_like_governed("output", prototype,
+                governor);
+    GLOBAL_META_CHECK(unowned && session_add_rel(coord, unowned) == 0,
+        "target");
+    col_rel_t *target = unowned;
+    unowned = NULL;
+    GLOBAL_META_CHECK(wl_columnar_eval_test_initializer(2, coord, workers) == 0,
+        "global workers");
+    ctxs = calloc(workers, sizeof(*ctxs));
+    GLOBAL_META_CHECK(ctxs, "contexts");
+    for (uint32_t w = 0; w < workers; w++) {
+        ctxs[w].delta_rels = calloc(1, sizeof(col_rel_t *));
+        GLOBAL_META_CHECK(ctxs[w].delta_rels, "matrix");
+        col_rel_t *delta = wl_columnar_relation_new_like_governed("$d$output",
+                prototype, governor);
+        ctxs[w].delta_rels[0] = delta;
+        GLOBAL_META_CHECK(delta, "payload");
+        int64_t rows[][2] = { { 42, 42 }, { 7, 7 }, { 42, 42 } };
+        for (unsigned row = 0; row < 3; row++) {
+            GLOBAL_META_CHECK(col_rel_append_row(delta, rows[row]) == 0, "row");
+            delta->timestamps[row] = (col_delta_timestamp_t){ .iteration = row +
+                                                                  10,
+                                                              .worker = w,
+                                                              .stratum = 3,
+                                                              .multiplicity =
+                                                                  row + 1 };
+        }
+    }
+    GLOBAL_META_CHECK(wl_columnar_eval_test_global_exchange(&stratum, coord,
+        ctxs, workers) == 0, "metadata exchange");
+    GLOBAL_META_CHECK(target == session_find_rel(coord, "output")
+        && target->nrows == 2 && target->ncols == 2 &&
+        target->declared_ncols == 1
+        && target->column_types && target->column_types[0] == WIRELOG_TYPE_INT64
+        && target->has_graph_column && target->graph_col_idx == 1
+        && target->compound_kind == WIRELOG_COMPOUND_KIND_INLINE
+        && target->compound_count == 1 && target->compound_arity_map
+        && target->compound_arity_map[0] == 2 && target->timestamps
+        && col_rel_get(target, 0, 0) == 7 && col_rel_get(target, 1, 0) == 42
+        && target->timestamps[0].iteration == 11
+        && target->timestamps[0].multiplicity == 2
+        && target->timestamps[1].iteration == 10
+        && target->timestamps[1].multiplicity == 1,
+        "metadata adoption or timestamp correspondence");
+    for (uint32_t w = 0; w < workers; w++) {
+        col_rel_t *view = session_find_rel(&coord->tdd_workers[w], "output");
+        GLOBAL_META_CHECK(ctxs[w].delta_rels[0] == NULL && view &&
+            view->nrows == 2
+            && view->declared_ncols == 1 && view->has_graph_column
+            && view->compound_kind == WIRELOG_COMPOUND_KIND_INLINE
+            && view->compound_arity_map && view->compound_arity_map[0] == 2
+            && view->timestamps && view->timestamps[0].iteration == 11,
+            "refreshed worker metadata");
+    }
+cleanup:
+    if (ctxs) {
+        for (uint32_t w = 0; w < workers; w++) {
+            if (ctxs[w].delta_rels) col_rel_destroy(ctxs[w].delta_rels[0]);
+            free(ctxs[w].delta_rels);
+        }
+        free(ctxs);
+    }
+    col_rel_destroy(unowned);
+    col_rel_destroy(prototype);
+    wl_session_destroy(session);
+    if (governor) {
+        if (wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                governor)) != 0
+            && !failure) failure = "metadata reservation leak";
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef GLOBAL_META_CHECK
+}
+
 static void
 test_tdd_prior_delta_retirement(uint32_t workers, unsigned mode)
 {
@@ -3442,6 +3564,10 @@ cleanup:
 int
 main(void)
 {
+    for (uint32_t workers = 2; workers <= 8; workers *= 4) {
+        test_global_exchange_metadata(workers, false);
+        test_global_exchange_metadata(workers, true);
+    }
     for (unsigned mode = 0; mode < 10; mode++) {
 #ifndef WL_TEST_ALLOC_WRAP
         if (mode == 4 || mode == 6 || mode == 9)

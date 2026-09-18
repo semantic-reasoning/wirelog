@@ -1105,6 +1105,16 @@ wl_columnar_eval_test_initializer(unsigned mode, wl_col_session_t *coord,
 }
 #endif
 
+#ifdef WL_SESSION_TEST_HOOKS
+int (*wl_columnar_eval_test_global_publication)(wl_col_session_t *, uint32_t,
+    unsigned);
+#define WL_COLUMNAR_EVAL_GLOBAL_BOUNDARY(coord, ri, phase) \
+        (wl_columnar_eval_test_global_publication \
+    ? wl_columnar_eval_test_global_publication(coord, ri, phase) : 0)
+#else
+#define WL_COLUMNAR_EVAL_GLOBAL_BOUNDARY(coord, ri, phase) (0)
+#endif
+
 static int
 tdd_refresh_global_read_relation(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord, uint32_t ri, uint32_t W)
@@ -1114,16 +1124,20 @@ tdd_refresh_global_read_relation(const wl_plan_stratum_t *sp,
 
     const char *name = sp->relations[ri].name;
     col_rel_t *src = session_find_rel(coord, name);
-    if (!src)
-        return 0;
+    if (!src || src->ncols == 0)
+        return EINVAL;
 
     for (uint32_t w = 0; w < W; w++) {
+        int boundary_rc = WL_COLUMNAR_EVAL_GLOBAL_BOUNDARY(coord, ri, 5 + w);
+        if (boundary_rc != 0)
+            return boundary_rc;
         col_rel_t *dst = session_find_rel(&coord->tdd_workers[w], name);
         if (!dst)
             continue;
         if (src->ncols > 0) {
             if (dst->ncols != src->ncols) {
-                col_rel_t *view = col_rel_new_like(src->name, src);
+                col_rel_t *view = wl_columnar_relation_new_like_governed(
+                    src->name, src, coord->memory_governor);
                 if (!view)
                     return ENOMEM;
                 int rc = col_rel_install_shared_view(view, src);
@@ -1160,9 +1174,6 @@ tdd_refresh_global_read_relation(const wl_plan_stratum_t *sp,
                 if (rc != 0)
                     return rc;
             }
-        } else {
-            dst->nrows = 0;
-            wl_columnar_relation_touch_view(dst);
         }
         col_session_invalidate_arrangements(&coord->tdd_workers[w].base,
             name);
@@ -1309,11 +1320,13 @@ typedef struct {
  * already installed empty owners remain valid and the refused owner/lease is
  * unchanged. The caller aborts exchange and cleans up fresh delta payloads. */
 static int
-wl_columnar_eval_retire_prior_deltas(const wl_plan_stratum_t *sp,
+wl_columnar_eval_retire_worker_relations(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord,
-    uint32_t workers)
+    uint32_t workers, uint32_t first, uint32_t relation_count, bool full)
 {
-    if (!sp || !coord || workers > coord->tdd_workers_count)
+    if (!sp || !coord || workers > coord->tdd_workers_count
+        || first > sp->relation_count
+        || relation_count > sp->relation_count - first)
         return EINVAL;
     for (uint32_t w = 0; w < workers; w++) {
         const wl_col_session_t *worker = &coord->tdd_workers[w];
@@ -1322,7 +1335,7 @@ wl_columnar_eval_retire_prior_deltas(const wl_plan_stratum_t *sp,
             return EBUSY;
     }
     size_t count = 0;
-    int rc = wl_columnar_eval_tdd_matrix_size(workers, sp->relation_count,
+    int rc = wl_columnar_eval_tdd_matrix_size(workers, relation_count,
             sizeof(wl_columnar_eval_delta_retirement_t), &count);
     if (rc != 0 || count == 0)
         return rc;
@@ -1356,8 +1369,9 @@ wl_columnar_eval_retire_prior_deltas(const wl_plan_stratum_t *sp,
     size_t used = 0;
     for (uint32_t w = 0; w < workers; w++) {
         wl_col_session_t *worker = &coord->tdd_workers[w];
-        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
-            const char *name = sp->relations[ri].delta_name;
+        for (uint32_t ri = first; ri < first + relation_count; ri++) {
+            const char *name = full ? sp->relations[ri].name
+                : sp->relations[ri].delta_name;
             col_rel_t *prior = name ? session_find_rel(worker, name) : NULL;
             if (!prior)
                 continue;
@@ -1419,6 +1433,14 @@ cleanup:
     if (admitted)
         (void)wl_columnar_memory_release(&reservation);
     return rc;
+}
+
+static int
+wl_columnar_eval_retire_prior_deltas(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord, uint32_t workers)
+{
+    return wl_columnar_eval_retire_worker_relations(sp, coord, workers, 0,
+               sp ? sp->relation_count : 0, false);
 }
 
 #if defined(WL_TEST_BDX_SEED) || defined(WL_SESSION_TEST_HOOKS)
@@ -5127,11 +5149,8 @@ tdd_global_read_exchange_deltas(const wl_plan_stratum_t *sp,
         const char *dname = sp->relations[ri].delta_name;
         const char *rel_name = sp->relations[ri].name;
 
-        for (uint32_t w = W; w-- > 0; )
-            session_remove_rel(&coord->tdd_workers[w], dname);
-
         uint32_t total = 0;
-        uint32_t ncols = 0;
+        const col_rel_t *prototype = NULL;
         for (uint32_t w = 0; w < W; w++) {
             col_rel_t *d = ctxs[w].delta_rels[ri];
             if (d && d->nrows > 0) {
@@ -5140,8 +5159,8 @@ tdd_global_read_exchange_deltas(const wl_plan_stratum_t *sp,
                     tdd_destroy_delta_slots(ctxs, W, nrels);
                     return EOVERFLOW;
                 }
-                if (ncols == 0)
-                    ncols = d->ncols;
+                if (!prototype)
+                    prototype = d;
             }
         }
         if (total == 0) {
@@ -5152,7 +5171,11 @@ tdd_global_read_exchange_deltas(const wl_plan_stratum_t *sp,
             continue;
         }
 
-        col_rel_t *combined = col_rel_new_auto(dname, ncols);
+        rc = WL_COLUMNAR_EVAL_GLOBAL_BOUNDARY(coord, ri, 0);
+        if (rc != 0)
+            return rc;
+        col_rel_t *combined = wl_columnar_relation_new_like_governed(dname,
+                prototype, coord->memory_governor);
         if (!combined)
             return ENOMEM;
 
@@ -5168,8 +5191,11 @@ tdd_global_read_exchange_deltas(const wl_plan_stratum_t *sp,
             }
         }
 
-        if (combined->nrows > 1)
-            tdd_dedup_rel(combined);
+        rc = wl_columnar_eval_delta_consolidate(combined, coord);
+        if (rc != 0) {
+            col_rel_destroy(combined);
+            return rc;
+        }
 
         col_rel_t *coord_idb = session_find_rel(coord, rel_name);
         if (coord_idb && coord_idb->nrows > 0 && combined->nrows > 0) {
@@ -5180,10 +5206,7 @@ tdd_global_read_exchange_deltas(const wl_plan_stratum_t *sp,
             }
         }
         if (combined->nrows == 0) {
-            rc = tdd_install_empty_delta_on_workers(coord, dname, ncols, W);
             col_rel_destroy(combined);
-            if (rc != 0)
-                return rc;
             continue;
         }
 
@@ -5199,22 +5222,40 @@ tdd_global_read_exchange_deltas(const wl_plan_stratum_t *sp,
         }
 
         if (coord_idb) {
-            if (coord_idb->ncols == 0 && combined->ncols > 0) {
-                rc = col_rel_set_schema(coord_idb, combined->ncols,
-                        (const char *const *)combined->col_names);
-                if (rc != 0) {
-                    col_rel_destroy(combined);
-                    return rc;
-                }
+            rc = WL_COLUMNAR_EVAL_GLOBAL_BOUNDARY(coord, ri, 1);
+            if (rc == 0)
+                rc = wl_columnar_eval_retire_worker_relations(sp, coord, W,
+                        ri, 1, true);
+            if (rc != 0) {
+                col_rel_destroy(combined);
+                return rc;
             }
-            rc = col_rel_append_all(coord_idb, combined, NULL);
+            rc = WL_COLUMNAR_EVAL_GLOBAL_BOUNDARY(coord, ri, 2);
+            if (rc != 0) {
+                col_rel_destroy(combined);
+                return rc;
+            }
+            if (coord_idb->ncols == 0 && combined->ncols > 0) {
+                col_rel_replacement_t replacement = { 0 };
+                rc = col_rel_prepare_replacement(coord_idb, combined,
+                        &replacement);
+                if (rc == 0)
+                    col_rel_commit_replacement_locked(coord_idb, &replacement);
+                col_rel_discard_replacement(&replacement);
+            } else {
+                rc = col_rel_append_all(coord_idb, combined, NULL);
+            }
             if (rc != 0) {
                 col_rel_destroy(combined);
                 return rc;
             }
             tdd_dedup_set_insert_rel(coord_idb, combined);
             col_session_invalidate_arrangements(&coord->base, rel_name);
-            rc = tdd_refresh_global_read_relation(sp, coord, ri, W);
+            rc = WL_COLUMNAR_EVAL_GLOBAL_BOUNDARY(coord, ri, 3);
+            if (rc == 0)
+                rc = tdd_refresh_global_read_relation(sp, coord, ri, W);
+            if (rc == 0)
+                rc = WL_COLUMNAR_EVAL_GLOBAL_BOUNDARY(coord, ri, 4);
             if (rc != 0) {
                 if (getenv("WIRELOG_TDD_GLOBAL_READ_DEBUG")) {
                     fprintf(stderr,
@@ -5309,6 +5350,19 @@ tdd_global_read_exchange_deltas(const wl_plan_stratum_t *sp,
 
     return 0;
 }
+
+#ifdef WL_TEST_BDX_SEED
+int
+wl_columnar_eval_test_global_exchange(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs, uint32_t workers)
+{
+    int rc = tdd_global_read_exchange_deltas(sp, coord, ctxs, workers,
+            NULL, NULL);
+    if (rc != 0)
+        tdd_destroy_delta_slots(ctxs, workers, sp->relation_count);
+    return rc;
+}
+#endif
 
 /*
  * col_eval_stratum_tdd_recursive:
@@ -6054,6 +6108,8 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                         "owner=%d global=%d bdx=%d replicate=%d\n",
                         stratum_idx, eff_iter, brc, owner_exchange_mode,
                         global_read_mode, bdx_mode, replicate_mode);
+                if (global_read_mode)
+                    tdd_destroy_delta_slots(ctxs, W, nrels);
                 rc = brc;
                 goto done;
             }
