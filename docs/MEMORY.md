@@ -396,7 +396,7 @@ every stratum that ran under TDD.
 
 | Subsystem | Style | What is counted | Where |
 |---|---|---|---|
-| `RELATION` | event | Column buffers of operator output relations whose `col_rel_t.mem_ledger` is attached; today that is every join output (`col_join_attach_ledger`). Capacity-based (`capacity × owned columns × 8`). A **heap-owned** join output additionally holds a governor reservation for its live capacity (§10b); pooled outputs remain ledger-only. | `relation.c` growth, compaction and free paths |
+| `RELATION` | event | Column buffers of operator output relations whose `col_rel_t.mem_ledger` is attached; today that is every join output (`col_join_attach_ledger`). Capacity-based (`capacity × owned columns × 8`). | `relation.c` growth, compaction and free paths |
 | `ARENA` | event | Fixed capacity of the session's delta pool (slot slab + data arena) and eval arena, plus the compound arena object, generation table, payload buffers, and entry metadata. Each retained capacity is admitted before allocation with old/new peak overlap and released at destruction; the ledger remains attribution-only. `delta_pool_reset()`/`wl_arena_reset()` and compound epoch GC do not return retained capacity. K-fusion branch sessions charge their per-branch pool/arena to the parent. | `session.c`, `kfusion.c`, `arena.c`, `delta_pool.c`, `compound_arena.c` |
 | `CACHE` | event | Materialization-cache entries. On insert the cached result is re-parented: its RELATION (and TIMESTAMP) charge is credited and the same bytes are charged to CACHE, so a cached join is counted once. Credited on eviction, truncation and clear. | `cache.c` |
 | `ARRANGEMENT` | event | Hash arrangements (`ht_head` + `ht_next`), delta and filtered arrangements, sorted copies for LFTJ (`nrows × ncols × 8`, a full duplicate of the relation) and differential arrangements (struct + keys + buckets + chain). Worker clones are charged to the worker ledger. | `arrangement.c`, `diff_arrangement.c` |
@@ -1035,7 +1035,7 @@ release the differential pin exactly once.  Materialized/cache joins and
 delta-right, filtered, cross, worker, and other unsupported shapes remain on
 their existing one-shot paths until their publication contracts are bounded.
 
-## 10b. Governed join output capacity (#1477)
+## 10b. Plain STEP completion recovery (#1713)
 
 A join output that is **heap-owned** is admitted under the session governor
 and holds a reservation covering its live capacity.  A **pool-owned** output
