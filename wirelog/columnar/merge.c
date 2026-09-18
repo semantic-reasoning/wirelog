@@ -1056,9 +1056,9 @@ cleanup:
     return result;
 }
 
-int
-col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
-    uint32_t seg_count)
+static int
+wl_columnar_merge_consolidate_checked(col_rel_t *rel,
+    const uint32_t *seg_boundaries, uint32_t seg_count, bool finalize)
 {
     wl_columnar_source_access_writer_t writer = { 0 };
     col_rel_t *owner = NULL;
@@ -1074,7 +1074,7 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
         rc = EINVAL;
         goto release_writer;
     }
-    if (rel->nrows <= 1) {
+    if (rel->nrows <= 1 && !finalize) {
         rc = 0;
         goto release_writer;
     }
@@ -1089,6 +1089,11 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
 
     rc = col_op_consolidate_kway_merge_impl(rel, seg_boundaries, seg_count,
             &writer, &alias_release_pending);
+    if (rc == 0 && finalize) {
+        rel->sorted_nrows = rel->nrows;
+        rel->run_count = 1;
+        rel->run_ends[0] = rel->nrows;
+    }
 release_writer:
     if (alias_release_pending) {
         int alias_rc = col_rel_storage_alias_release(rel);
@@ -1101,6 +1106,84 @@ release_writer:
 }
 
 int
+col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
+    uint32_t seg_count)
+{
+    return wl_columnar_merge_consolidate_checked(rel, seg_boundaries,
+               seg_count, false);
+}
+
+/* Timestamped SET consolidation shares the checked stable k-way engine.
+ * Keep the popped entry intact until success: its original stack slot remains
+ * available even when the caller entered with a completely full stack. */
+static int
+wl_columnar_merge_consolidate_timestamped(eval_stack_t *stack,
+    wl_col_session_t *sess, eval_entry_t entry)
+{
+    col_rel_t *work = entry.rel;
+    col_rel_t *copy = NULL;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    int rc = 0;
+    if (!entry.owned) {
+        rc = col_rel_source_reader_acquire(entry.rel, &reader);
+        if (rc != 0)
+            goto failed;
+        governor = sess && sess->memory_governor
+            ? sess->memory_governor : entry.rel->memory_governor;
+        /* Use a governed heap clone so constructor, timestamp, growth, and
+         * merge scratch allocations are admitted before any mutation. */
+        copy = wl_columnar_relation_new_like_governed("$consol", entry.rel,
+                governor);
+        if (!copy) {
+            rc = ENOMEM;
+            goto failed;
+        }
+        rc = col_rel_enable_timestamps(copy);
+        if (rc == 0)
+            rc = col_rel_append_all(copy, entry.rel, NULL);
+        int release_rc = col_rel_source_reader_release(&reader);
+        if (rc == 0)
+            rc = release_rc;
+        if (rc != 0)
+            goto failed;
+        work = copy;
+    }
+    uint32_t local_boundaries[3] = { 0, work->nrows, work->nrows };
+    const uint32_t *boundaries = local_boundaries;
+    uint32_t segments = 1;
+    if (entry.seg_boundaries && entry.seg_count >= 2) {
+        boundaries = entry.seg_boundaries;
+        segments = entry.seg_count;
+    } else if (entry.rel->sorted_nrows > 0
+        && entry.rel->sorted_nrows < work->nrows) {
+        local_boundaries[1] = entry.rel->sorted_nrows;
+        segments = 2;
+    }
+    rc = wl_columnar_merge_consolidate_checked(work, boundaries, segments,
+            true);
+    if (rc != 0)
+        goto failed;
+    free(entry.seg_boundaries);
+    entry.seg_boundaries = NULL;
+    entry.seg_count = 0;
+    entry.rel = work;
+    entry.owned = true;
+    stack->items[stack->top++] = entry;
+    return 0;
+failed:
+    if (reader.owner) {
+        int release_rc = col_rel_source_reader_release(&reader);
+        if (release_rc != 0)
+            rc = release_rc;
+    }
+    /* The private copy is never exposed to a reader or another owner. */
+    col_rel_destroy(copy);
+    stack->items[stack->top++] = entry;
+    return rc;
+}
+
+int
 col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
 {
     eval_entry_t e;
@@ -1109,6 +1192,8 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
         return pop_rc;
 
     col_rel_t *in = e.rel;
+    if (in->timestamps)
+        return wl_columnar_merge_consolidate_timestamped(stack, sess, e);
     if (!wl_columnar_relation_float_values_valid(in)) {
         return col_op_dispose_entry_primary(stack, &e, EINVAL);
     }
