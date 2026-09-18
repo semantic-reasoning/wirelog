@@ -1369,6 +1369,8 @@ test_small_cons_metadata_guard(void)
                                : stack.items[0].seg_boundaries == bounds),
                     "small retry finalizes metadata");
                 ASSERT_TRUE(eval_stack_drain(&stack) == 0, "small stack drain");
+                if (!owned)
+                    col_rel_destroy(rel);
             }
     {
         col_rel_t *alias = col_rel_new_auto("small-alias", 1);
