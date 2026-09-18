@@ -879,6 +879,14 @@ test('ci_pr_build_timeout_contract', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-ci-pr-build-timeouts.py'],
      suite: 'abi')
 
+# Issue #1728: every runtime POSIX TSan leg runs `meson test -t 3`, and the
+# tsan-native compile smoke deliberately does not.  The multiplier only helps
+# if no workflow drifts, so pin the literal command text and keep the number
+# in docs/THREADING.md tied to the number in the workflows.
+test('tsan_timeout_policy', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-tsan-timeout-policy.py'],
+     suite: 'abi')
+
 test('branch_protection_contract', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-branch-protection-contract.py'],
      suite: 'abi')
