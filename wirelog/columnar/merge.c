@@ -1215,13 +1215,15 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
         if (!e.owned || (in->sorted_nrows == nr && in->run_count == 1
             && in->run_ends[0] == nr && e.seg_boundaries == NULL))
             return eval_stack_repush_entry(stack, &e);
-        if (col_rel_storage_alias_borrow_count(in) != 0)
-            return eval_stack_repush_entry(stack, &e) == 0 ? EBUSY : ENOBUFS;
         wl_columnar_source_access_writer_t writer = { 0 };
         int writer_rc = col_rel_source_writer_acquire(in, &writer);
         if (writer_rc != 0)
             return eval_stack_repush_entry(stack,
                        &e) == 0 ? writer_rc : ENOBUFS;
+        if (col_rel_storage_alias_borrow_count(in) != 0) {
+            (void)wl_columnar_source_access_writer_release(&writer);
+            return eval_stack_repush_entry(stack, &e) == 0 ? EBUSY : ENOBUFS;
+        }
         /* Nothing to deduplicate */
         if (e.seg_boundaries) {
             free(e.seg_boundaries);
