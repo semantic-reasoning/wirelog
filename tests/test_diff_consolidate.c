@@ -911,6 +911,109 @@ test_eval_entry_dispose_retains_busy_relation(void)
     PASS;
 }
 
+static void
+test_plain_kway_cleanup_retains_metadata(void)
+{
+    TEST("plain k-way consolidate retains metadata across refusal");
+    wl_col_session_t *sess = make_mock_session();
+    wl_arena_t *arena = wl_arena_create(64 * 1024);
+    ASSERT_TRUE(sess != NULL && arena != NULL, "plain k-way session");
+
+    for (unsigned mode = 0; mode < 3; mode++) {
+        col_rel_t *rel = mode == 0
+            ? col_rel_new_auto("plain-kway", 1)
+            : col_rel_pool_new_auto(sess->delta_pool, NULL,
+                "plain-kway", 1);
+        eval_stack_t stack;
+        wl_columnar_source_access_reader_t reader = { 0 };
+        int64_t rows[] = { 3, 1, 2, 1 };
+        ASSERT_TRUE(rel != NULL, "plain k-way relation");
+        if (mode == 2) {
+            /* Exercise the arena-backed allocator as well. */
+            col_rel_destroy(rel);
+            rel = col_rel_pool_new_auto(sess->delta_pool, arena,
+                    "plain-kway-arena", 1);
+            ASSERT_TRUE(rel != NULL, "plain k-way arena relation");
+            /* The arena is intentionally kept alive by the session fixture. */
+        }
+        for (unsigned i = 0; i < 4; i++)
+            ASSERT_TRUE(col_rel_append_row(rel, &rows[i]) == 0,
+                "plain k-way rows");
+        eval_stack_init(&stack);
+        for (unsigned i = 0; i < COL_STACK_MAX - 1; i++) {
+            col_rel_t *lower = col_rel_new_auto("plain-kway-lower", 1);
+            int64_t value = (int64_t)i;
+            ASSERT_TRUE(lower != NULL
+                && col_rel_append_row(lower, &value) == 0
+                && eval_stack_push(&stack, lower, true) == 0,
+                "plain k-way lower stack");
+        }
+        ASSERT_TRUE(eval_stack_push(&stack, rel, true) == 0,
+            "plain k-way push");
+        uint32_t *bounds = malloc(3 * sizeof(*bounds));
+        ASSERT_TRUE(bounds != NULL, "plain k-way bounds");
+        bounds[0] = 0; bounds[1] = 2; bounds[2] = 4;
+        stack.items[COL_STACK_MAX - 1].seg_boundaries = bounds;
+        stack.items[COL_STACK_MAX - 1].seg_count = 2;
+        ASSERT_TRUE(col_rel_source_reader_acquire(rel, &reader) == 0,
+            "plain k-way reader");
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == EBUSY
+            && stack.top == COL_STACK_MAX
+            && stack.items[COL_STACK_MAX - 1].seg_boundaries == bounds,
+            "plain k-way refusal retains bounds");
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == EBUSY
+            && stack.items[COL_STACK_MAX - 1].seg_boundaries == bounds,
+            "plain k-way repeated refusal retains bounds");
+        ASSERT_TRUE(col_rel_source_reader_release(&reader) == 0,
+            "plain k-way reader release");
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == 0
+            && stack.top == COL_STACK_MAX
+            && stack.items[COL_STACK_MAX - 1].seg_boundaries == NULL
+            && stack.items[COL_STACK_MAX - 1].rel->nrows == 3,
+            "plain k-way retry consumes bounds");
+        ASSERT_TRUE(col_rel_get(stack.items[COL_STACK_MAX - 1].rel, 0, 0) == 1
+            && col_rel_get(stack.items[COL_STACK_MAX - 1].rel, 1, 0) == 2
+            && col_rel_get(stack.items[COL_STACK_MAX - 1].rel, 2, 0) == 3,
+            "plain k-way retry sorted output");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "plain k-way drain");
+    }
+
+#ifdef WL_SESSION_TEST_HOOKS
+    {
+        col_rel_t *borrowed = col_rel_new_auto("plain-copy-fail", 1);
+        eval_stack_t stack;
+        uint32_t *bounds = malloc(3 * sizeof(*bounds));
+        int64_t values[] = { 7, 8 };
+        ASSERT_TRUE(borrowed != NULL && bounds != NULL
+            && col_rel_append_row(borrowed, &values[0]) == 0
+            && col_rel_append_row(borrowed, &values[1]) == 0,
+            "plain borrowed copy fixture");
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
+            "plain borrowed push");
+        bounds[0] = 0; bounds[1] = 1; bounds[2] = 2;
+        stack.items[0].seg_boundaries = bounds;
+        stack.items[0].seg_count = 2;
+        wl_columnar_merge_test_fail_copy_alloc = true;
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == ENOMEM
+            && stack.top == 1 && stack.items[0].rel == borrowed
+            && !stack.items[0].owned
+            && stack.items[0].seg_boundaries == bounds,
+            "plain copy allocation failure retains metadata");
+        wl_columnar_merge_test_fail_copy_alloc = false;
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == 0
+            && stack.top == 1 && stack.items[0].rel != borrowed
+            && stack.items[0].seg_boundaries == NULL,
+            "plain copy allocation retry");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "plain copy drain");
+        col_rel_destroy(borrowed);
+    }
+#endif
+    wl_arena_free(arena);
+    destroy_mock_session(sess);
+    PASS;
+}
+
 /* Reader admission is a short-lived, operator-scoped gate, not the place
  * that decides deferred ownership.  Pool- and arena-backed relations are
  * read by ordinary operators -- the join builds its owned right-hand filter
@@ -1112,6 +1215,7 @@ main(void)
     test_empty_relation();
     test_blocked_sort_does_not_dedup_unsorted();
     test_blocked_kway_merge_retains_boundaries();
+    test_plain_kway_cleanup_retains_metadata();
     test_eval_entry_dispose_retains_busy_relation();
     test_deferred_registry_refuses_unsafe_storage();
     test_drain_to_session_reports_unsafe_refusal();
