@@ -31,6 +31,7 @@
 
 #include <assert.h>
 #include <stdint.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -649,11 +650,201 @@ test_right_filter_preserves_timestamps(void)
     }
     PASS();
     return 0;
+static wl_columnar_memory_governor_ref_t *
+right_filter_governor(uint64_t bytes)
+{
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    resolution.budget_bytes = resolution.usable_bytes = bytes;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    return wl_columnar_memory_governor_ref_create(&resolution);
+}
+
+static void
+test_managed_right_filter(op_fn_t fn, wl_plan_op_type_t type, bool grow,
+    bool exhaust)
+{
+    TEST("right-filter denial preserves held JOIN input and retries");
+    wl_col_session_t *sess = make_mock_session();
+    wl_columnar_memory_governor_ref_t *ref = right_filter_governor(
+        grow ? (uint64_t)COL_REL_INIT_CAP * 2 * sizeof(int64_t) : 0);
+    col_rel_t *left = make_left(false);
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    wl_columnar_source_access_reader_t reader = { 0 };
+    bool held = false, local = true;
+    uint32_t *segments = NULL;
+    int ok = sess && ref && left && register_right(sess) == 0;
+    if (!ok) goto cleanup;
+    sess->memory_governor = ref;
+    if (grow) {
+        const char *names[] = { "right", "$d$right" };
+        for (unsigned n = 0; n < 2 && ok; n++) {
+            col_rel_t *r = session_find_rel(sess, names[n]);
+            for (uint32_t i = 0; i < COL_REL_INIT_CAP + 1 && ok; i++) {
+                int64_t row[] = { 100 + i, 200 + i };
+                ok = col_rel_append_row(r, row) == 0;
+            }
+        }
+        if (!ok) goto cleanup;
+    }
+    if (exhaust) {
+        while (sess->delta_pool->slot_used < sess->delta_pool->slot_cap) {
+            col_rel_t *filler = col_rel_pool_new_like(sess->delta_pool,
+                    "fill", left);
+            ok = filler && filler->pool_owned;
+            col_rel_destroy(filler);
+            if (!ok) goto cleanup;
+        }
+    }
+    wl_plan_op_t op;
+
+    init_op(&op, type);
+    ok = eval_stack_push(&stack, left, false) == 0;
+    if (!ok) goto cleanup;
+    ok = fn(&op, &stack, sess) == ENOMEM && stack.top == 0;
+    if (!ok) goto cleanup;
+    ok = col_rel_source_reader_acquire(left, &reader) == 0;
+    if (!ok) goto cleanup;
+    held = true;
+    ok = eval_stack_push(&stack, left, true) == 0;
+    if (!ok) goto cleanup;
+    local = false;
+    stack.items[0].seg_boundaries = malloc(2 * sizeof(uint32_t));
+    ok = stack.items[0].seg_boundaries != NULL;
+    if (!ok) goto cleanup;
+    segments = stack.items[0].seg_boundaries;
+    segments[0] = 0; segments[1] = left->nrows;
+    stack.items[0].seg_count = 1;
+    for (unsigned i = 0; i < 2 && ok; i++)
+        ok = fn(&op, &stack, sess) == EBUSY && stack.top == 1
+            && stack.items[0].rel == left && stack.items[0].owned
+            && stack.items[0].seg_boundaries == segments
+            && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                    ref)) == 0;
+    if (!ok) goto cleanup;
+    ok = col_rel_source_reader_release(&reader) == 0;
+    held = false;
+    /* Keep the identical entry and segment metadata through the retry.
+     * #1749 tracks terminal JOIN metadata retirement; this test does not
+     * claim that separate success-path ownership gap is fixed. */
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes,
+        1u << 20, memory_order_release);
+    ok = ok && fn(&op, &stack, sess) == 0 && stack.top == 1
+        && stack.items[0].rel->nrows == (type == WL_PLAN_OP_ANTIJOIN ? 0u : 4u);
+cleanup:
+    if (held) (void)col_rel_source_reader_release(&reader);
+    /* #1749: if successful JOIN dropped the segment owner, reclaim the
+     * fixture allocation explicitly after observing the actual retry. */
+    for (uint32_t i = 0; i < stack.top; i++)
+        if (stack.items[i].seg_boundaries == segments) segments = NULL;
+    (void)eval_stack_drain(&stack);
+    free(segments);
+    if (local) col_rel_destroy(left);
+    if (sess) {
+        sess->memory_governor = NULL; destroy_mock_session(sess);
+    }
+    if (ref) {
+        ok = ok &&
+            wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                    ref)) == 0;
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (ok) PASS(); else FAIL("governed JOIN refusal/retry");
+}
+
+static void
+test_managed_filter_cache(void)
+{
+    TEST("right-filter cache governor identity and pinned fallback");
+    wl_col_session_t *sess = make_mock_session();
+    wl_columnar_memory_governor_ref_t *a = right_filter_governor(1u << 20);
+    wl_columnar_memory_governor_ref_t *b = right_filter_governor(1u << 20);
+    col_filt_cache_pin_t pin = { 0 }, second = { 0 };
+    col_rel_t *fallback = NULL;
+    int ok = sess && a && b && register_right(sess) == 0;
+    if (!ok) goto cleanup;
+    col_rel_t *right = session_find_rel(sess, "right");
+    wl_plan_expr_buffer_t expr = { filter_bytes, sizeof(filter_bytes) };
+    ok = col_rel_attach_memory_governor(right, b) == 0;
+    sess->memory_governor = a;
+    col_rel_t *cached = wl_columnar_filter_apply_right_filter_cached_pin(
+        sess, &expr, "right", right, &pin);
+    ok = ok && cached && cached->memory_governor == a && cached->nrows == 4;
+    if (!ok) goto cleanup;
+    ok = wl_columnar_filter_apply_right_filter_cached_pin(sess, &expr,
+            "right", right, &second) == cached;
+    col_filt_cache_pin_release(&second);
+    sess->memory_governor = NULL; /* source fallback changes effective governor */
+    ok = ok && !wl_columnar_filter_apply_right_filter_cached_pin(sess, &expr,
+            "right", right, &second) && pin.active && cached->nrows == 4;
+    fallback = wl_columnar_filter_apply_right_filter_governed(&expr, right,
+            sess->delta_pool, sess->intern, b);
+    ok = ok && fallback && fallback->memory_governor == b &&
+        fallback->nrows == 4;
+    col_rel_destroy(fallback); fallback = NULL;
+    col_filt_cache_pin_release(&pin);
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(b)->usable_bytes,
+        0, memory_order_release);
+    ok = ok && !wl_columnar_filter_apply_right_filter_cached_pin(sess, &expr,
+            "right", right, &second) && !second.active;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(b)->usable_bytes,
+        1u << 20, memory_order_release);
+    cached = wl_columnar_filter_apply_right_filter_cached_pin(sess, &expr,
+            "right", right, &second);
+    ok = ok && cached && cached->memory_governor == b && cached->nrows == 4;
+cleanup:
+    col_filt_cache_pin_release(&second);
+    col_filt_cache_pin_release(&pin);
+    col_rel_destroy(fallback);
+    if (sess) {
+        for (uint32_t i = 0; i < sess->filt_cache_count; i++) {
+            col_rel_destroy(sess->filt_cache[i].filtered);
+            free(sess->filt_cache[i].rel_name);
+            free(sess->filt_cache[i].filter_data);
+        }
+        free(sess->filt_cache);
+        sess->filt_cache = NULL; sess->filt_cache_count = 0;
+        sess->memory_governor = NULL;
+        destroy_mock_session(sess);
+    }
+    if (a) {
+        ok = ok &&
+            wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                    a)) == 0;
+        wl_columnar_memory_governor_ref_release(a);
+    }
+    if (b) {
+        ok = ok &&
+            wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                    b)) == 0;
+        wl_columnar_memory_governor_ref_release(b);
+    }
+    if (ok) PASS(); else FAIL("cache governor admission contract");
 }
 
 int
 main(void)
 {
+    test_managed_filter_cache();
+    for (unsigned grow = 0; grow < 2; grow++)
+        for (unsigned exhaust = 0; exhaust < 2; exhaust++)
+            test_managed_right_filter(wl_columnar_join_op, WL_PLAN_OP_JOIN,
+                grow != 0, exhaust != 0);
+    for (unsigned grow = 0; grow < 2; grow++)
+        for (unsigned exhaust = 0; exhaust < 2; exhaust++)
+            test_managed_right_filter(wl_columnar_join_diff_op, WL_PLAN_OP_JOIN,
+                grow != 0, exhaust != 0);
+    for (unsigned grow = 0; grow < 2; grow++)
+        for (unsigned exhaust = 0; exhaust < 2; exhaust++)
+            test_managed_right_filter(wl_columnar_antijoin_op,
+                WL_PLAN_OP_ANTIJOIN, grow != 0, exhaust != 0);
+    for (unsigned grow = 0; grow < 2; grow++)
+        for (unsigned exhaust = 0; exhaust < 2; exhaust++)
+            test_managed_right_filter(wl_columnar_semijoin_op,
+                WL_PLAN_OP_SEMIJOIN, grow != 0, exhaust != 0);
     printf("Join right-filter cleanup tests (Issue #1505)\n");
 
     test_success_path_uses_owned_filter();

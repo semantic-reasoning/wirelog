@@ -1003,11 +1003,13 @@ fill_filtered_rel(const uint8_t *buf, uint32_t bsz, col_rel_t *rel,
  * of dereferencing it.
  */
 col_rel_t *
-wl_columnar_filter_apply_right_filter(const wl_plan_expr_buffer_t *fexpr,
-    col_rel_t *rel,
-    delta_pool_t *pool, wl_intern_t *intern)
+wl_columnar_filter_apply_right_filter_governed(
+    const wl_plan_expr_buffer_t *fexpr,
+    col_rel_t *rel, delta_pool_t *pool, wl_intern_t *intern,
+    wl_columnar_memory_governor_ref_t *governor)
 {
-    col_rel_t *out = col_rel_pool_new_like(pool, "$rfilter", rel);
+    col_rel_t *out = wl_columnar_relation_pool_new_like_governed(
+        pool, "$rfilter", rel, governor);
     if (!out)
         return NULL;
     if (rel->timestamps && col_rel_enable_timestamps(out) != 0) {
@@ -1020,6 +1022,14 @@ wl_columnar_filter_apply_right_filter(const wl_plan_expr_buffer_t *fexpr,
         return NULL;
     }
     return out;
+}
+
+col_rel_t *
+wl_columnar_filter_apply_right_filter(const wl_plan_expr_buffer_t *fexpr,
+    col_rel_t *rel, delta_pool_t *pool, wl_intern_t *intern)
+{
+    return wl_columnar_filter_apply_right_filter_governed(fexpr, rel,
+               pool, intern, NULL);
 }
 
 /**
@@ -1083,6 +1093,8 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
     memset(pin, 0, sizeof(*pin));
     if (!sess || !fexpr || !rel_name || !rel)
         return NULL;
+    wl_columnar_memory_governor_ref_t *governor = sess->memory_governor
+        ? sess->memory_governor : rel->memory_governor;
     uint64_t fhash = wl_columnar_filter_fnv1a_hash(fexpr->data, fexpr->size);
 
     /* Linear scan: filt_cache is tiny (one entry per unique filter predicate) */
@@ -1103,6 +1115,7 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
         /* Cache hit: the freshness token is the contract (Issue #1438);
          * the row count is kept as a cheap second guard. */
         bool fresh = e->filtered
+            && e->filtered->memory_governor == governor
             && wl_columnar_relation_snapshot_equal(e->source_snapshot,
                 wl_columnar_relation_snapshot(rel))
             && e->source_nrows == rel->nrows;
@@ -1116,7 +1129,8 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
             /* Source changed and nobody reads the old copy: rebuild in place */
             if (e->filtered)
                 col_rel_destroy(e->filtered);
-            e->filtered = col_rel_new_like("$rfilter_cache", rel);
+            e->filtered = wl_columnar_relation_pool_new_like_governed(NULL,
+                    "$rfilter_cache", rel, governor);
             if (!e->filtered)
                 return NULL;
             if (rel->timestamps &&
@@ -1172,7 +1186,9 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
     sess->filt_cache[idx].source_nrows = 0; /* will be set after fill */
     sess->filt_cache[idx].source_snapshot = (col_relation_snapshot_t){ 0, 0,
                                                                        0 };
-    sess->filt_cache[idx].filtered = col_rel_new_like("$rfilter_cache", rel);
+    sess->filt_cache[idx].filtered =
+        wl_columnar_relation_pool_new_like_governed(NULL,
+            "$rfilter_cache", rel, governor);
     if (!sess->filt_cache[idx].filtered) {
         free(sess->filt_cache[idx].filter_data);
         free(sess->filt_cache[idx].rel_name);

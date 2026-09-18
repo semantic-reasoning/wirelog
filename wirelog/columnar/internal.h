@@ -3086,6 +3086,12 @@ wl_columnar_filter_next_pow2(uint32_t n);
 col_rel_t *
 wl_columnar_filter_apply_right_filter(const wl_plan_expr_buffer_t *fexpr,
     col_rel_t *rel, delta_pool_t *pool, wl_intern_t *intern);
+/* Explicit governor is preserved through pool exhaustion and heap fallback. */
+col_rel_t *
+wl_columnar_filter_apply_right_filter_governed(
+    const wl_plan_expr_buffer_t *fexpr,
+    col_rel_t *rel, delta_pool_t *pool, wl_intern_t *intern,
+    wl_columnar_memory_governor_ref_t *governor);
 uint64_t
 wl_columnar_filter_fnv1a_hash(const uint8_t *buf, uint32_t len);
 col_rel_t *
