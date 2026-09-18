@@ -181,6 +181,7 @@ testlib_prod = static_library(
   thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
 )
 
 source_access_exe = executable(
