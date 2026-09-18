@@ -747,7 +747,7 @@ test_blocked_kway_merge_retains_boundaries(void)
         eval_stack_init(&stack);
         ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
             "borrowed k-way stack");
-        boundaries = malloc(3 * sizeof(*boundaries));
+        boundaries = malloc(4 * sizeof(*boundaries));
         ASSERT_TRUE(boundaries != NULL, "borrowed k-way metadata");
         boundaries[0] = 0;
         boundaries[1] = 1;
@@ -777,7 +777,7 @@ test_blocked_kway_merge_retains_boundaries(void)
         eval_stack_init(&stack);
         ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
             "copy failure stack");
-        boundaries = malloc(3 * sizeof(*boundaries));
+        boundaries = malloc(4 * sizeof(*boundaries));
         ASSERT_TRUE(boundaries != NULL, "copy failure metadata");
         boundaries[0] = 0;
         boundaries[1] = 1;
@@ -812,7 +812,7 @@ test_blocked_kway_merge_retains_boundaries(void)
         eval_stack_init(&stack);
         ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
             "append failure stack");
-        boundaries = malloc(3 * sizeof(*boundaries));
+        boundaries = malloc(4 * sizeof(*boundaries));
         ASSERT_TRUE(boundaries != NULL, "append failure metadata");
         boundaries[0] = 0;
         boundaries[1] = 1;
@@ -836,7 +836,7 @@ test_blocked_kway_merge_retains_boundaries(void)
     {
         col_rel_t *borrowed = col_rel_new_auto("plain-append-fail", 1);
         eval_stack_t stack;
-        uint32_t *bounds = malloc(3 * sizeof(*bounds));
+        uint32_t *bounds = malloc(4 * sizeof(*bounds));
         int64_t values[] = { 9, 10 };
         ASSERT_TRUE(borrowed != NULL && bounds != NULL
             && col_rel_append_row(borrowed, &values[0]) == 0
@@ -863,7 +863,7 @@ test_blocked_kway_merge_retains_boundaries(void)
     {
         col_rel_t *borrowed = col_rel_new_auto("plain-merge-fail", 1);
         eval_stack_t stack;
-        uint32_t *bounds = malloc(3 * sizeof(*bounds));
+        uint32_t *bounds = malloc(4 * sizeof(*bounds));
         int64_t values[] = { 11, 12 };
         ASSERT_TRUE(borrowed != NULL && bounds != NULL
             && col_rel_append_row(borrowed, &values[0]) == 0
@@ -898,7 +898,7 @@ test_blocked_kway_merge_retains_boundaries(void)
         eval_stack_init(&stack);
         ASSERT_TRUE(eval_stack_push(&stack, invalid, true) == 0,
             "invalid k-way stack");
-        boundaries = malloc(3 * sizeof(*boundaries));
+        boundaries = malloc(4 * sizeof(*boundaries));
         ASSERT_TRUE(boundaries != NULL, "invalid k-way metadata");
         boundaries[0] = 0;
         boundaries[1] = 3;
@@ -1000,7 +1000,7 @@ test_plain_kway_cleanup_retains_metadata(void)
         }
         ASSERT_TRUE(eval_stack_push(&stack, rel, true) == 0,
             "plain k-way push");
-        uint32_t *bounds = malloc(3 * sizeof(*bounds));
+        uint32_t *bounds = malloc(4 * sizeof(*bounds));
         ASSERT_TRUE(bounds != NULL, "plain k-way bounds");
         bounds[0] = 0; bounds[1] = 2; bounds[2] = 4;
         stack.items[COL_STACK_MAX - 1].seg_boundaries = bounds;
@@ -1032,7 +1032,7 @@ test_plain_kway_cleanup_retains_metadata(void)
     {
         col_rel_t *borrowed = col_rel_new_auto("plain-copy-fail", 1);
         eval_stack_t stack;
-        uint32_t *bounds = malloc(3 * sizeof(*bounds));
+        uint32_t *bounds = malloc(4 * sizeof(*bounds));
         int64_t values[] = { 7, 8 };
         ASSERT_TRUE(borrowed != NULL && bounds != NULL
             && col_rel_append_row(borrowed, &values[0]) == 0
