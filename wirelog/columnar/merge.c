@@ -756,6 +756,18 @@ col_op_consolidate_hash_dedup(col_rel_t *rel,
  * @return         0 on success; EBUSY if a source reader or storage alias
  *                 prevents exclusive mutation; ENOMEM on allocation failure.
  */
+/* Stable segment order makes equal tuples keep the earliest incoming record.
+ * Stable sorting within each segment preserves its original representative. */
+static int
+wl_columnar_merge_heap_compare(const col_rel_t *rel, uint32_t left,
+    uint32_t right, uint32_t left_segment, uint32_t right_segment)
+{
+    int cmp = col_rel_row_cmp(rel, left, right);
+    if (cmp == 0 && rel->timestamps)
+        return (left_segment > right_segment) - (left_segment < right_segment);
+    return cmp;
+}
+
 static int
 col_op_consolidate_kway_merge_impl(col_rel_t *rel,
     const uint32_t *seg_boundaries, uint32_t seg_count,
@@ -788,12 +800,14 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
     size_t row_bytes = 0;
     size_t merged_bytes = 0;
     size_t merged_alloc_bytes = 0;
+    size_t timestamp_bytes = 0;
     size_t segment_total_bytes;
     size_t additional_scratch_bytes;
     wl_columnar_radix_workspace_t sort_workspace = { 0 };
     uint32_t *seg_starts = NULL;
     uint32_t *seg_ends = NULL;
     int64_t *merged = NULL;
+    col_delta_timestamp_t *merged_timestamps = NULL;
     heap_entry_t stack_heap[2];
     heap_entry_t *heap = stack_heap;
     heap_entry_t *heap_storage = NULL;
@@ -822,6 +836,13 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
             merged_alloc_bytes, &additional_scratch_bytes))
             return ENOMEM;
     }
+    if (rel->timestamps && seg_count >= 2) {
+        if (!col_op_consolidate_size_multiply(nr,
+            sizeof(*merged_timestamps), &timestamp_bytes)
+            || !col_op_consolidate_size_add(additional_scratch_bytes,
+            timestamp_bytes, &additional_scratch_bytes))
+            return ENOMEM;
+    }
     if (seg_count >= 3
         && !col_op_consolidate_size_add(additional_scratch_bytes, heap_bytes,
         &additional_scratch_bytes))
@@ -830,7 +851,10 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
     /* Hash-based dedup for large datasets (#369): O(N) scan + O(U log U) sort
      * where U is the unique count.  When U << N (common in recursive Datalog
      * joins), this is much faster than sorting all N rows. */
-    if (nr > 10000) {
+    /* Timestamped set normalization preserves the first incoming record,
+     * including signed/zero multiplicity. The hash shortcut does not carry
+     * that provenance, so retain stable segment sorting for these inputs. */
+    if (nr > 10000 && !rel->timestamps) {
         int rc = col_op_consolidate_hash_dedup(rel, writer,
                 alias_release_pending);
         if (rc == 0)
@@ -855,13 +879,17 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
     if (seg_count >= 2)
         merged = (int64_t *)col_op_consolidate_malloc(
             merged_alloc_bytes, "merge_output");
+    if (timestamp_bytes > 0)
+        merged_timestamps = col_op_consolidate_malloc(timestamp_bytes,
+                "merge_timestamps");
     if (seg_count >= 3)
         heap_storage = (heap_entry_t *)col_op_consolidate_malloc(heap_bytes,
                 "merge_heap");
     if (heap_storage)
         heap = heap_storage;
     if (!seg_starts || !seg_ends || (seg_count >= 2 && !merged)
-        || (seg_count >= 3 && !heap_storage)) {
+        || (seg_count >= 3 && !heap_storage)
+        || (timestamp_bytes > 0 && !merged_timestamps)) {
         result = ENOMEM;
         goto cleanup;
     }
@@ -913,6 +941,8 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
                 if (col_rel_row_cmp(rel, out_r - 1, r) != 0) {
                     if (out_r != r)
                         col_rel_row_move_raw(rel, out_r, r);
+                    if (rel->timestamps && out_r != r)
+                        rel->timestamps[out_r] = rel->timestamps[r];
                     out_r++;
                 }
             }
@@ -954,12 +984,12 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
             while (2 * _p + 1 < (size)) {                                    \
                 uint32_t _c = 2 * _p + 1;                                    \
                 if (_c + 1 < (size)                                          \
-                    && col_rel_row_cmp(rel, heap[_c + 1].cursor,             \
-                    heap[_c].cursor)                                  \
+                    && wl_columnar_merge_heap_compare(rel, heap[_c + 1].cursor,             \
+                    heap[_c].cursor, heap[_c + 1].seg, heap[_c].seg)       \
                     < 0)                                              \
                 _c++;                                                    \
-                if (col_rel_row_cmp(rel, heap[_p].cursor,                    \
-                    heap[_c].cursor)                                     \
+                if (wl_columnar_merge_heap_compare(rel, heap[_p].cursor,                    \
+                    heap[_c].cursor, heap[_p].seg, heap[_c].seg)          \
                     <= 0)                                                    \
                 break;                                                   \
                 heap_entry_t _tmp = heap[_p];                                \
@@ -985,6 +1015,8 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
             || col_rel_row_cmp_raw(rel, heap[0].cursor, last_row, nc) != 0) {
             col_rel_row_copy_out(rel, heap[0].cursor,
                 merged + (size_t)out * nc);
+            if (merged_timestamps)
+                merged_timestamps[out] = rel->timestamps[heap[0].cursor];
             last_row = merged + (size_t)out * nc;
             out++;
         }
@@ -1005,11 +1037,15 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
     /* Scatter flat merged buffer back into column-major */
     for (uint32_t r = 0; r < out; r++)
         col_rel_row_copy_in_raw(rel, r, merged + (size_t)r * nc);
+    if (merged_timestamps)
+        memcpy(rel->timestamps, merged_timestamps,
+            (size_t)out * sizeof(*merged_timestamps));
     rel->nrows = out;
     wl_columnar_relation_touch_view(rel);
 
 cleanup:
     free(merged);
+    free(merged_timestamps);
     free(heap_storage);
     free(seg_starts);
     free(seg_ends);

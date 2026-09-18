@@ -1858,6 +1858,126 @@ test_zero_arity_merge_output_is_never_zero_sized(void)
 /* ----------------------------------------------------------------
  * main
  * ---------------------------------------------------------------- */
+static col_delta_timestamp_t
+kway_timestamp(uint32_t original)
+{
+    return (col_delta_timestamp_t){ .iteration = original + 1,
+                                    .stratum = original + 11,
+                                    .worker = original + 21,
+                                    .multiplicity = original % 3 ==
+                                        0 ? -5 : original % 3 == 1 ? 0 : 7 };
+}
+static bool
+kway_timestamp_equal(col_delta_timestamp_t a, col_delta_timestamp_t b)
+{
+    return a.iteration == b.iteration && a.stratum == b.stratum
+           && a.worker == b.worker && a.multiplicity == b.multiplicity;
+}
+
+static void
+test_timestamp_set_merge(uint32_t segments, uint32_t rows_per_segment,
+    unsigned failure_mode, bool alias, bool empty_segment)
+{
+    TEST("timestamped k-way set merge keeps first full input record");
+    uint32_t boundaries[6] = { 0 };
+    uint32_t first[17];
+    for (uint32_t k = 0; k < 17; k++) first[k] = UINT32_MAX;
+    col_rel_t *source = col_rel_new_auto("timestamp_source", 1);
+    col_rel_t *view = NULL;
+    col_rel_t *rel = source;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    const char *failure = NULL;
+    uint32_t total = 0;
+#define KTS_CHECK(c, m) do { if (!(c)) { failure = m; goto cleanup; \
+                             } } while (0)
+    KTS_CHECK(source && col_rel_enable_timestamps(source) == 0, "setup");
+    for (uint32_t s = 0; s < segments; s++) {
+        uint32_t count = empty_segment && s == 1 ? 0 : rows_per_segment;
+        for (uint32_t r = 0; r < count; r++) {
+            int64_t key = (total * 13u + 7u) % 17;
+            KTS_CHECK(col_rel_append_row(source, &key) == 0, "append");
+            source->timestamps[total] = kway_timestamp(total);
+            if (first[key] == UINT32_MAX) first[key] = total;
+            total++;
+        }
+        boundaries[s + 1] = total;
+    }
+    if (alias) {
+        view = col_rel_new_like("timestamp_view", source);
+        KTS_CHECK(view && col_rel_install_shared_view(view, source) == 0,
+            "shared view");
+        rel = view;
+    }
+    ref = test_consolidate_governor_create(UINT64_C(1) << 30);
+    KTS_CHECK(ref && col_rel_attach_memory_governor(rel, ref) == 0,
+        "governor");
+    wl_columnar_memory_governor_t *g = wl_columnar_memory_governor_ref_get(ref);
+    uint64_t baseline = wl_columnar_memory_reserved(g);
+    uint64_t generation = rel->view_generation;
+    uint64_t storage = rel->storage_generation;
+    int64_t *column = rel->columns[0];
+    if (failure_mode == 1)
+        KTS_CHECK(col_rel_source_reader_acquire(rel, &reader) == 0, "reader");
+    else if (failure_mode == 2)
+        fail_consolidate_allocation_at("merge_timestamps");
+    else if (failure_mode == 3)
+        fail_consolidate_allocation_at("radix_workspace_timestamps");
+    else if (failure_mode == 4)
+        atomic_store_explicit(&g->usable_bytes, baseline, memory_order_relaxed);
+    if (failure_mode) {
+        int rc = col_op_consolidate_kway_merge(rel, boundaries, segments);
+        atomic_store_explicit(&g->usable_bytes, UINT64_C(1) << 30,
+            memory_order_relaxed);
+        KTS_CHECK(rc == (failure_mode == 1 ? EBUSY : ENOMEM), "refusal status");
+        if (failure_mode == 2 || failure_mode == 3)
+            KTS_CHECK(consolidate_fail_used, "allocation fault witness");
+        KTS_CHECK(rel->nrows == total && rel->columns[0] == column
+            && rel->view_generation == generation
+            && rel->storage_generation == storage
+            && wl_columnar_memory_reserved(g) == baseline,
+            "refusal changed ownership, generations or reservation");
+        for (uint32_t r = 0; r < total; r++)
+            KTS_CHECK(col_rel_get(rel, r, 0) == (int64_t)((r * 13u + 7u) % 17)
+                && kway_timestamp_equal(rel->timestamps[r], kway_timestamp(r)),
+                "refusal changed row or timestamp");
+        clear_consolidate_allocation_failure();
+        if (reader.owner)
+            KTS_CHECK(col_rel_source_reader_release(&reader) == 0, "release");
+    }
+    KTS_CHECK(col_op_consolidate_kway_merge(rel, boundaries, segments) == 0,
+        "merge/retry");
+    KTS_CHECK(rel->nrows == 17 && rel->timestamps, "unique rows and mode");
+    for (uint32_t key = 0; key < 17; key++)
+        KTS_CHECK(col_rel_get(rel, key, 0) == key
+            && kway_timestamp_equal(rel->timestamps[key],
+            kway_timestamp(first[key])),
+            "set representative must be first entire record, not weight sum");
+    if (alias)
+        for (uint32_t r = 0; r < total; r++)
+            KTS_CHECK(col_rel_get(source, r,
+                0) == (int64_t)((r * 13u + 7u) % 17)
+                && kway_timestamp_equal(source->timestamps[r],
+                kway_timestamp(r)),
+                "COW changed source provenance");
+cleanup:
+    clear_consolidate_allocation_failure();
+    if (reader.owner) (void)col_rel_source_reader_release(&reader);
+    col_rel_destroy(view);
+    col_rel_destroy(source);
+    if (ref) {
+        if (wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                ref))
+            != 0 && !failure) failure = "reservation leak";
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (failure) {
+        FAIL(failure);
+    }
+    PASS();
+#undef KTS_CHECK
+}
+
 int
 main(void)
 {
@@ -1892,6 +2012,14 @@ main(void)
     test_hash_heuristic_fallback_succeeds();
     test_k16_workspace_is_preallocated();
     test_float_insertion_workspace();
+    test_timestamp_set_merge(1, 34, 0, false, false);
+    test_timestamp_set_merge(2, 34, 0, false, false);
+    test_timestamp_set_merge(3, 34, 0, false, true);
+    test_timestamp_set_merge(3, 4001, 0, false, false);
+    test_timestamp_set_merge(3, 34, 1, true, false);
+    test_timestamp_set_merge(3, 34, 2, true, false);
+    test_timestamp_set_merge(3, 34, 3, false, false);
+    test_timestamp_set_merge(3, 34, 4, false, false);
 
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n", pass_count,
         fail_count, test_count);
