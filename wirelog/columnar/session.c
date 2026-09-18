@@ -702,6 +702,24 @@ session_pool_rel_transfer_payload(col_rel_t *dst, col_rel_t *src)
         memory_order_relaxed);
 }
 
+/* Both descriptors are private or exclusively gated. Move the token without
+ * crediting live storage, and rebind its logical owner to the new descriptor. */
+static bool
+wl_columnar_session_pool_rel_move_reservation(col_rel_t *dst, col_rel_t *src)
+{
+    if (src->retained_reserved_bytes == 0)
+        return true;
+    if (!wl_columnar_memory_transfer(&src->retained_reservation, dst))
+        return false;
+    if (!wl_columnar_memory_reservation_move(&dst->retained_reservation,
+        &src->retained_reservation)) {
+        if (!wl_columnar_memory_transfer(&src->retained_reservation, src))
+            abort();
+        return false;
+    }
+    return true;
+}
+
 static int
 session_pool_rel_promote(col_rel_t *src, col_rel_t **heap_out)
 {
@@ -721,15 +739,24 @@ session_pool_rel_promote(col_rel_t *src, col_rel_t **heap_out)
         (void)wl_columnar_source_access_writer_release(&descriptor_writer);
         return EBUSY;
     }
+    uint64_t state = atomic_load_explicit(&src->retained_reservation.state,
+            memory_order_acquire);
+    bool empty = state == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+        && src->retained_reservation.bytes == 0
+        && src->retained_reserved_bytes == 0;
+    bool committed = state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        && src->retained_reserved_bytes > 0
+        && src->retained_reservation.bytes == src->retained_reserved_bytes
+        && src->retained_reservation.replacement_bytes == 0
+        && src->memory_governor
+        && src->retained_reservation.governor
+        == wl_columnar_memory_governor_ref_get(src->memory_governor)
+        && atomic_load_explicit(&src->retained_reservation.owner_bits,
+            memory_order_acquire) == (uintptr_t)src;
     if (src->storage_owner != src
         || col_rel_storage_alias_borrow_count(src) != 0
-        || src->retained_reservation.identity
-        != &src->retained_reservation
-        || atomic_load_explicit(&src->retained_reservation.state,
-        memory_order_acquire)
-        != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
-        || src->retained_reservation.bytes != 0
-        || src->retained_reserved_bytes != 0) {
+        || src->retained_reservation.identity != &src->retained_reservation
+        || (!empty && !committed)) {
         rc = EBUSY;
         goto fail;
     }
@@ -739,6 +766,11 @@ session_pool_rel_promote(col_rel_t *src, col_rel_t **heap_out)
         goto fail;
     }
     wl_columnar_memory_reservation_init(&heap->retained_reservation);
+    if (!wl_columnar_session_pool_rel_move_reservation(heap, src)) {
+        free(heap);
+        rc = EBUSY;
+        goto fail;
+    }
     session_pool_rel_transfer_payload(heap, src);
     wl_columnar_source_access_gate_init(&heap->source_access);
     wl_columnar_source_access_gate_init(&heap->descriptor_access);
@@ -777,6 +809,8 @@ fail:
 static void
 session_pool_rel_rollback(col_rel_t *src, col_rel_t *heap)
 {
+    if (!wl_columnar_session_pool_rel_move_reservation(src, heap))
+        abort();
     session_pool_rel_transfer_payload(src, heap);
     src->pool_owned = true;
     src->storage_owner = src;
