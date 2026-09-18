@@ -4839,6 +4839,17 @@ test_memory_admission_relation_exe = executable(
 test('memory_admission_relation', test_memory_admission_relation_exe,
      suite: 'unit')
 
+test_memory_admission_join_exe = executable(
+  'test_memory_admission_join',
+  files('test_memory_admission_join.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+
+test('memory_admission_join', test_memory_admission_join_exe,
+     suite: 'unit')
+
 test_tdd_decision_stats_exe = executable(
   'test_tdd_decision_stats',
   files('test_tdd_decision_stats.c'),

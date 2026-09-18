@@ -396,7 +396,7 @@ every stratum that ran under TDD.
 
 | Subsystem | Style | What is counted | Where |
 |---|---|---|---|
-| `RELATION` | event | Column buffers of operator output relations whose `col_rel_t.mem_ledger` is attached; today that is every join output (`col_join_attach_ledger`). Capacity-based (`capacity × owned columns × 8`). | `relation.c` growth, compaction and free paths |
+| `RELATION` | event | Column buffers of operator output relations whose `col_rel_t.mem_ledger` is attached; today that is every join output (`col_join_attach_ledger`). Capacity-based (`capacity × owned columns × 8`). A **heap-owned** join output additionally holds a governor reservation for its live capacity (§10b); pooled outputs remain ledger-only. | `relation.c` growth, compaction and free paths |
 | `ARENA` | event | Fixed capacity of the session's delta pool (slot slab + data arena) and eval arena, plus the compound arena object, generation table, payload buffers, and entry metadata. Each retained capacity is admitted before allocation with old/new peak overlap and released at destruction; the ledger remains attribution-only. `delta_pool_reset()`/`wl_arena_reset()` and compound epoch GC do not return retained capacity. K-fusion branch sessions charge their per-branch pool/arena to the parent. | `session.c`, `kfusion.c`, `arena.c`, `delta_pool.c`, `compound_arena.c` |
 | `CACHE` | event | Materialization-cache entries. On insert the cached result is re-parented: its RELATION (and TIMESTAMP) charge is credited and the same bytes are charged to CACHE, so a cached join is counted once. Credited on eviction, truncation and clear. | `cache.c` |
 | `ARRANGEMENT` | event | Hash arrangements (`ht_head` + `ht_next`), delta and filtered arrangements, sorted copies for LFTJ (`nrows × ncols × 8`, a full duplicate of the relation) and differential arrangements (struct + keys + buckets + chain). Worker clones are charged to the worker ledger. | `arrangement.c`, `diff_arrangement.c` |
@@ -1009,3 +1009,114 @@ overflow, cancellation, or failed admission discard the output relation and
 release the differential pin exactly once.  Materialized/cache joins and
 delta-right, filtered, cross, worker, and other unsupported shapes remain on
 their existing one-shot paths until their publication contracts are bounded.
+
+## 10b. Governed join output capacity (#1477)
+
+A join output that is **heap-owned** is admitted under the session governor
+and holds a reservation covering its live capacity.  A **pool-owned** output
+is not: `delta_pool_reset()` rewinds counters without freeing slot contents,
+so a governor reference on a pooled relation would leak.  The discriminator
+is `col_rel_t.pool_owned`, not `wl_plan_op_t.materialized` -- bounded mode
+forces a heap output with `materialized == false`, and a materialized join
+*with a projection* is pool allocated.
+
+The ordering invariant, which `tests/test_memory_admission_join.c` asserts at
+every observation point as
+`col_rel_retained_bytes_for(r, r->capacity) == r->retained_reserved_bytes`:
+
+> No relation reachable from `join.c` whose `memory_governor` is non-NULL
+> ever has its `capacity` increased without a reservation covering the new
+> footprint committed first, and the previous token is released only after
+> the old buffers are freed.
+
+Both growth shapes obey it.  Row append goes through
+`col_rel_reserve_capacity_admitted()` one doubling at a time.  Bulk sizing
+through `col_join_reserve_exact()` routes governed relations to the same
+helper, which is what admits the parallel cross-join output -- that path
+allocates its own relation, sizes it to `left->nrows * right->nrows` and
+substitutes it for the caller's, so without admission the largest single
+allocation in `join.c` would reach the materialization cache ungoverned.
+Ungoverned callers keep the plain `realloc()` path, which is what leaves the
+pool-owned semijoin output unchanged.
+
+In `col_join_reserve_exact()` the governed branch runs **before** the
+`nrows <= capacity` early return, and must stay there.  `col_rel_new_auto()`
+allocates `COL_REL_INIT_CAP` rows up front, so a cross product that fits
+inside the initial capacity performs no growth at all; with the branch below
+the early return, a relation attached to the governor by
+`col_join_parallel_cross()` would hold live buffers against a zero token.
+
+The population is wider than "materialized".  A **bounded-mode** output is
+also heap-owned, and when its batch producer cannot be created the operator
+falls back to the serial loop without ever reaching
+`col_join_batch_relation_sink_init()`.  That output was heap-owned and
+ungoverned before this unit and is admitted now, so a finite budget can deny
+a bounded-fallback join that previously succeeded.
+
+Denial surfaces as `ENOMEM` and never truncates a result, and it is never
+retried against a still-full governor.  Two paths matter, and they differ:
+
+- In the **nonrecursive parallel** path, the only retry conversion is
+  `EOVERFLOW` to `EAGAIN` after a round that published nothing, which the
+  serial caller turns into exactly one serial re-evaluation.  `ENOMEM`
+  passes through unchanged and aborts the stratum.
+- In the **TDD delta** path, `EOVERFLOW` and `ENOMEM` are both hard errors
+  requiring coordinator intervention; neither is retried.
+
+Either way a denial is a non-zero status with nothing published, so it
+cannot be mistaken for the empty-result backpressure path that would cause
+premature fixed-point convergence.
+
+Accounting notes, so two numbers that legitimately differ are not read as a
+bug:
+
+- `col_mat_cache` re-parents the **ledger** on insert (RELATION to CACHE) and
+  leaves the governor token with the relation, so a cached join output is
+  charged once on each axis.  The token is released when the entry is
+  evicted, cleared or destroyed.
+- `cache->total_bytes` is **nrows**-based while a governor token is
+  **capacity**-based and includes timestamps, so the governor charge can run
+  up to about 2x the cache's own accounting.
+- `COL_MAT_CACHE_LIMIT_BYTES` is not a hard ceiling: a single oversized
+  result is admitted once eviction has emptied the cache, so the bound is
+  "limit plus one oversized entry".
+- A **pinned** cache entry defers its release at `col_mat_cache_clear()`
+  until the final pin is dropped.  The mechanism is pre-existing and
+  unchanged, but the consequence is new: the deferral now holds governor
+  bytes, not only ledger bytes.  Note also that `col_mat_cache_lookup()`
+  itself takes an epoch pin despite its header describing the result as an
+  unpinned borrowed pointer, so a diagnostic lookup before a clear defers
+  that entry.
+- The parallel cross-join path holds **two charged** footprints transiently
+  -- the caller's placeholder plus the substitute's own token -- and briefly
+  **three physical** ones, because the substitute's initial
+  `COL_REL_INIT_CAP` buffers are resident and uncharged between
+  `col_rel_new_auto()` and the bulk reserve's publish.  The substitute is
+  attached without an admission and enters its bulk reserve with a zero
+  token, so no retired token is produced.  That uncharged window is
+  single-threaded inside `col_join_parallel_cross()` and always closes,
+  since the bulk reserve admits `max(nrows, capacity)`.  A cross join
+  therefore needs roughly `COL_REL_INIT_CAP x ocols x 8` of headroom beyond
+  its result, and `wl_columnar_memory_reserved()` sampled after the join
+  reports the residual, not that peak.
+
+**Residual R1 (accepted, tracked separately).** On the materialized path the
+operator deep-copies its output for the evaluation stack with a NULL governor
+and hands the governed original to the cache.  Both buffers are live and
+physically identical, so the governor charges once for twice the resident
+bytes.  Governing the copy would place a governed relation on the evaluation
+stack, whose consumers have their own ownership contracts; that is the
+eval-stack admission class and is out of scope here.
+
+**Untested by construction.** The `col_join_reserve_exact()` caller inside
+`wl_columnar_join_diff_op` is not driven end to end by
+`tests/test_memory_admission_join.c`; the parallel cross path covers the same
+branch. Reaching the diff-op caller requires all of: a heap-owned right
+relation registered under `op->right_relation`; `key_count > 0`; no right
+filter expression; `!used_right_delta`; `left->nrows >= num_workers *
+WIRELOG_JOIN_PAR_MIN_LEFT_ROWS`; and more than `COL_REL_INIT_CAP` output
+rows, since a smaller result makes the bulk reserve a no-op.
+
+`WL_MEM_REPORT` total reconciliation is asserted only narrowly here: the
+cache-clear case proves that clearing releases exactly the output's token.
+A full report-level reconciliation for join outputs is not covered.

@@ -155,6 +155,43 @@ col_join_attach_ledger(wl_col_session_t *sess, col_rel_t *rel)
     col_rel_ledger_reconcile(rel, 0);
 }
 
+/*
+ * Issue #1477: bind a heap-owned join output to the session governor.
+ *
+ * A heap output outlives the current delta-pool epoch -- the
+ * materialization cache owns it after a successful insert, and the
+ * evaluation stack owns it when that insert fails -- so it is admitted
+ * exactly like the bounded producer's output does in
+ * col_join_batch_relation_sink_init().  Pooled outputs stay ledger-sampled:
+ * delta_pool_reset() never frees slot contents, so a governor reference on
+ * a pooled relation would leak (see the allocation comment in col_op_join).
+ *
+ * Attaching is idempotent for the bounded path, which attaches the same
+ * reference again later: col_rel_attach_memory_governor() short-circuits on
+ * an identical reference before its EBUSY test.
+ *
+ * @admit_capacity reserves the capacity the relation already owns, so a
+ * bulk writer cannot publish rows into unadmitted buffers.  Callers that
+ * immediately size the output with col_join_reserve_exact() pass false:
+ * that helper admits the real target, and an intermediate reservation
+ * would only raise the transient peak by one initial footprint.
+ */
+static int
+col_join_admit_output(wl_col_session_t *sess, col_rel_t *out,
+    bool admit_capacity)
+{
+    int rc;
+
+    if (!sess || !out || !sess->memory_governor || out->pool_owned)
+        return 0;
+    rc = col_rel_attach_memory_governor(out, sess->memory_governor);
+    if (rc != 0)
+        return rc;
+    if (!admit_capacity)
+        return 0;
+    return col_rel_reserve_capacity_admitted(out, out->capacity, NULL);
+}
+
 bool
 col_join_output_limit_reached(wl_col_session_t *sess, const col_rel_t *out)
 {
@@ -208,6 +245,30 @@ col_join_reserve_exact(col_rel_t *rel, uint32_t nrows)
 {
     if (!rel)
         return EINVAL;
+    if (rel->memory_governor) {
+        /* Issue #1477: a governed output admits the exact target before the
+         * buffers exist.  col_rel_reserve_capacity_admitted() reserves the
+         * new footprint while the old token is still committed, publishes
+         * the resize, then retires the old token exactly once -- so the
+         * capacity never moves ahead of the reservation covering it.
+         *
+         * This runs BEFORE the nrows <= capacity early return below, and
+         * must stay there.  col_rel_new_auto() allocates COL_REL_INIT_CAP
+         * rows up front, so a caller that attaches the governor and leaves
+         * the admission to this helper (col_join_parallel_cross) would
+         * otherwise leave those buffers uncharged whenever the exact target
+         * fits inside the initial capacity.  The helper is idempotent for
+         * an already-covered relation: it admits the buffers the relation
+         * already owns and returns 0 when the committed token covers them.
+         *
+         * The two paths are equivalent for the timestamp-free relations
+         * that reach here (neither governed output enables timestamps);
+         * for a timestamped relation the admitted path is the stricter of
+         * the two, because it also resizes the timestamp array.  Ungoverned
+         * callers keep the realloc path below unchanged, which is what
+         * keeps the pooled semijoin output bit-identical. */
+        return col_rel_reserve_capacity_admitted(rel, nrows, NULL);
+    }
     if (nrows <= rel->capacity)
         return 0;
     uint64_t ledger_before = col_rel_owned_ledger_bytes(rel);
@@ -732,6 +793,12 @@ col_join_parallel_cross(wl_col_session_t *sess, const col_rel_t *left,
         return ENOMEM;
     }
     col_join_attach_ledger(sess, out);
+    /* Attach only: the reserve below admits the real target, so admitting
+     * the initial capacity first would just raise the transient peak. */
+    if (col_join_admit_output(sess, out, false) != 0) {
+        col_rel_destroy(out);
+        return ENOMEM;
+    }
     if (col_join_reserve_exact(out, nrows) != 0) {
         col_rel_destroy(out);
         return ENOMEM;
@@ -1137,6 +1204,18 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     }
     /* Attach ledger so row growth is tracked under RELATION subsystem */
     col_join_attach_ledger(sess, out);
+    /* Issue #1477: a heap output is retained past this delta-pool epoch, so
+     * admit it under the session governor before any row is written. */
+    if (col_join_admit_output(sess, out, true) != 0) {
+        col_rel_destroy(out);
+        free(lk);
+        free(rk);
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
+        if (left_e.owned)
+            col_rel_destroy(left);
+        return ENOMEM;
+    }
 
     /* Backpressure check (Issue #224): when RELATION subsystem reaches >= 80%
      * of its budget, skip row generation and push an empty result instead of
@@ -1246,9 +1325,9 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 join_rc = col_join_append_pair(out, left, lr, right, rr,
                         op->project_indices, op->project_count, tmp);
                 if (join_rc != 0) {
-                    fprintf(stderr,
-                        "ERROR: col_rel_append_row failed with rc=%d at "
-                        "unary join\n",
+                    WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_ERROR,
+                        "col_rel_append_row failed with rc=%d at "
+                        "unary join",
                         join_rc);
                     break;
                 }
@@ -1509,9 +1588,13 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                                     rr, op->project_indices, op->project_count,
                                     tmp);
                             if (join_rc != 0) {
-                                fprintf(stderr,
-                                    "ERROR: col_rel_append_row failed in "
-                                    "arrangement probe with rc=%d\n",
+                                /* Issue #1477: a governed output makes
+                                 * rc=ENOMEM a routine budget denial, so this
+                                 * goes through the structured logger rather
+                                 * than unconditional consumer stderr. */
+                                WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_ERROR,
+                                    "col_rel_append_row failed in "
+                                    "arrangement probe with rc=%d",
                                     join_rc);
                                 break;
                             }
@@ -1542,9 +1625,9 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                         join_rc = col_join_append_pair(out, left, lr, right, rr,
                                 op->project_indices, op->project_count, tmp);
                         if (join_rc != 0) {
-                            fprintf(stderr,
-                                "ERROR: col_rel_append_row failed in ephemeral "
-                                "hash probe with rc=%d\n",
+                            WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_ERROR,
+                                "col_rel_append_row failed in ephemeral "
+                                "hash probe with rc=%d",
                                 join_rc);
                             break;
                         }
@@ -2408,6 +2491,17 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
         return ENOMEM;
     }
     col_join_attach_ledger(sess, out);
+    /* Issue #1477: same contract as the ordinary join output above. */
+    if (col_join_admit_output(sess, out, true) != 0) {
+        col_rel_destroy(out);
+        free(lk);
+        free(rk);
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
+        if (left_e.owned)
+            col_rel_destroy(left);
+        return ENOMEM;
+    }
 
     /* Backpressure check (Issue #224) */
     if (wl_mem_ledger_should_backpressure(&sess->mem_ledger,
