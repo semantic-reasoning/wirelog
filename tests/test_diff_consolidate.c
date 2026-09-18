@@ -1365,6 +1365,47 @@ test_small_cons_metadata_guard(void)
             "small retry finalizes metadata");
         ASSERT_TRUE(eval_stack_drain(&stack) == 0, "small stack drain");
     }
+    {
+        col_rel_t *alias = col_rel_new_auto("small-alias", 1);
+        eval_stack_t stack;
+        int64_t v = 3;
+        ASSERT_TRUE(alias != NULL && col_rel_append_row(alias, &v) == 0,
+            "small alias fixture");
+        alias->sorted_nrows = 77; alias->run_count = 2;
+        eval_stack_init(&stack);
+        for (unsigned i = 0; i < COL_STACK_MAX - 1; i++) {
+            col_rel_t *lower = col_rel_new_auto("small-lower", 1);
+            ASSERT_TRUE(lower != NULL && eval_stack_push(&stack, lower,
+                true) == 0,
+                "small lower push");
+        }
+        ASSERT_TRUE(col_rel_storage_alias_borrow_acquire(alias) == 0
+            && eval_stack_push(&stack, alias, true) == 0,
+            "small alias stack");
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == EBUSY
+            && stack.top == COL_STACK_MAX
+            && stack.items[COL_STACK_MAX - 1].rel == alias
+            && alias->sorted_nrows == 77,
+            "small alias refusal preserves full stack");
+        ASSERT_TRUE(col_rel_storage_alias_borrow_release(alias) == 0
+            && eval_stack_drain(&stack) == 0, "small alias cleanup");
+    }
+    {
+        col_rel_t *borrowed = col_rel_new_auto("small-borrowed-noop", 1);
+        eval_stack_t stack;
+        int64_t v = 4;
+        ASSERT_TRUE(borrowed != NULL && col_rel_append_row(borrowed, &v) == 0,
+            "small borrowed fixture");
+        borrowed->sorted_nrows = 1; borrowed->run_count = 1;
+        borrowed->run_ends[0] = 1;
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0
+            && col_op_consolidate(&stack, sess) == 0
+            && stack.items[0].rel == borrowed && !stack.items[0].owned,
+            "small borrowed canonical no-op");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "small borrowed cleanup");
+        col_rel_destroy(borrowed);
+    }
     destroy_mock_session(sess);
     PASS;
 }
