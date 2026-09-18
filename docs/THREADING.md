@@ -984,8 +984,11 @@ meson setup build-tsan \
     -Dthreads=posix \
     -Doptimization=1 \
     -Dwirelog_log_max_level=error
-meson test -C build-tsan --suite tsan
+meson test -C build-tsan --timeout-multiplier 4 --suite tsan
 ```
+
+CI's gating legs run the **whole** suite, not `--suite tsan`, and
+always with the `--timeout-multiplier 4` described below.
 
 The `-Dthreads=posix` requirement is non-negotiable for race gating.
 Issue #826 showed that the Linux glibc C11 `<threads.h>` backend is
@@ -1023,6 +1026,72 @@ The compile-only native leg exists to keep `wirelog/thread_c11.c`
 buildable under sanitizer flags. It is not evidence that libtsan has
 observed C11-thread happens-before edges. On all platforms the posix
 backend remains the only reliable TSan option.
+
+### TSan test timeout policy (#1728)
+
+Every runtime POSIX TSan leg runs `meson test` with
+`--timeout-multiplier 4`.
+It multiplies each test's declared Meson timeout for that run only; no
+timeout in `tests/meson.build` is changed, so non-TSan configurations keep
+their budgets unaltered. The multiplier is applied in exactly three places
+and `scripts/ci/test-tsan-timeout-policy.py` (Meson test `tsan_timeout_policy`,
+suite `abi`) fails if any of them reverts, if they disagree, or if the number
+here stops matching the number there:
+
+```
+.github/workflows/ci-pr.yml             tsan job
+.github/workflows/ci-main.yml           tsan job
+.github/workflows/tier1-sanitizers.yml  tsan job (4-way matrix)
+```
+
+The `tsan-native` compile-smoke leg in `ci-pr.yml` is **excluded by design**
+and the same gate fails if a multiplier is ever added to it.
+
+**Why a multiplier rather than per-test budgets.** Under TSan the problem is
+distributional, not confined to one test. Measured on `ubuntu-latest`:
+
+| test | gcc, passing run | gcc, failing run | declared budget |
+| --- | --- | --- | --- |
+| `session` | 111.08 s | timed out at 180.02 s | 180 s |
+| `tdd_recursive` | 26.10 s | timed out at 30.01 s | 30 s |
+| `cspa_correctness` | 111.83 s | 200.12 s | 300 s |
+
+Raising one test's budget only moves the failure to the next test: a
+per-test bump for `session` landed immediately before this policy and the
+next run still timed out at the new 180 s ceiling.
+
+**Why 4.** The dominant factor is run-to-run variance on identical hardware
+and compiler, not compiler choice. `cspa_correctness` took 111.83 s and
+200.12 s in two gcc runs on the same runner image, a spread of 1.79x, while
+the gcc-versus-clang spread across uncensored tests in the same run is only
+1.0x-1.9x. A multiplier of 2 cannot be shown to be enough, because
+`tdd_recursive`'s worst time is not known: the failing run killed it at
+30.01 s. Against the one completed measurement, 26.10 s, a 60 s ceiling is
+2.30x -- above the 1.79x spread, but resting on the observation that did not
+fail. 3 is therefore the floor: it puts that ceiling at 3.45x and stays
+clear of the spread even if the censored run was half as fast again. 4 sits
+above the floor and leaves room for the `ubuntu-24.04-arm` and
+`macos-latest` legs, whose TSan durations have never been measured because
+that workflow is not exercised by PR CI.
+
+The ceiling is bounded above by the longest budget among tests that actually
+execute under TSan -- 1800 s for the stress soak tests; the 3600 s
+`doop_w8_gate` skips there. At 4 a single hung soak costs 7200 s, still
+inside GitHub's 360-minute job limit, so a hang is always reported rather
+than truncated by the job cap. That bound is what keeps the multiplier from
+growing further.
+
+**What this does not do.** It does not mask sanitizer findings:
+`TSAN_OPTIONS=halt_on_error=1` aborts on a race immediately, independently
+of any timeout. It does not disable timeouts; a genuine hang is still killed
+and still fails the job, only later. The failing run that motivated this
+policy reported two timeouts and zero `WARNING: ThreadSanitizer` findings,
+so no latent race is being hidden behind the multiplier.
+
+`scripts/ci/check-shell-gate-walltime.py` is unaffected. It runs only against
+the unscaled `builddir` and `build-default` directories, and its denominator
+is the declared timeout read from `meson-info/intro-tests.json`, which is
+written at configure time and is not changed by `meson test -t`.
 
 Cross-references: Risk C5, issue #708 (-Dthreads=native + TSan
 advisory leg); issue #826 (native TSan SEGV triage);

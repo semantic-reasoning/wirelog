@@ -33,6 +33,14 @@ All notable changes to wirelog are documented in this file.
 
 ### Changed
 
+- **The POSIX TSan timeout multiplier is documented and enforced** (#1728).
+  The multiplier itself landed separately; this adds the policy write-up in
+  `docs/THREADING.md` -- the measured basis, the bound, and why the
+  `tsan-native` compile smoke is excluded -- and a `tsan_timeout_policy` gate
+  (suite `abi`) that fails if a runtime leg reverts to the unscaled command,
+  if the three legs disagree, if the value drifts, if the native leg is ever
+  scaled, or if the documented number stops matching the workflows.
+
 - **Radix-sort family reports contention uniformly as `EBUSY`** (#1594).
   `wl_columnar_relation_radix_sort_with_workspace()` folded "the relation is
   its own canonical storage owner and has live alias borrows" into the same
