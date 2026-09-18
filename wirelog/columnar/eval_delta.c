@@ -96,11 +96,10 @@ col_row_in_sorted(const int64_t *sorted_data, uint32_t nrows, uint32_t ncols,
 }
 
 /*
- * col_idb_consolidate: Privately normalize and publish one IDB relation.
+ * wl_columnar_eval_delta_consolidate: Privately normalize and publish one IDB relation.
  * Untimestamped inputs reuse the consolidation operator; timestamped inputs
  * use typed set normalization that preserves complete row provenance.
  */
-static int col_idb_consolidate(col_rel_t *r, wl_col_session_t *sess);
 
 /*
  * col_stratum_step_with_delta: Evaluate one stratum and fire delta callbacks.
@@ -260,7 +259,7 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
             continue;
 
         if (r->nrows > 0) {
-            rc = col_idb_consolidate(r, sess);
+            rc = wl_columnar_eval_delta_consolidate(r, sess);
             if (rc != 0) {
                 /* Restore any relations still holding backup state */
                 for (uint32_t i = 0; i < rc_cnt; i++) {
@@ -1333,8 +1332,8 @@ wl_columnar_eval_delta_timestamp_normalize(wl_col_session_t *sess,
     return rc != 0 ? rc : release_rc;
 }
 
-static int
-col_idb_consolidate(col_rel_t *target, wl_col_session_t *sess)
+int
+wl_columnar_eval_delta_consolidate(col_rel_t *target, wl_col_session_t *sess)
 {
     wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
     wl_columnar_source_access_reader_t source_reader = { 0 };
@@ -1509,7 +1508,7 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             continue;
 
         /* Consolidate: sort + dedup so binary search is valid */
-        rc = col_idb_consolidate(r, sess);
+        rc = wl_columnar_eval_delta_consolidate(r, sess);
         if (rc != 0)
             goto cleanup;
 

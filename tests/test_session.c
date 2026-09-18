@@ -4738,6 +4738,8 @@ cleanup:
 
 static wl_columnar_source_access_reader_t aggregate_public_reader;
 static col_rel_t *aggregate_public_target;
+static col_rel_t *aggregate_public_alias;
+static bool aggregate_public_hold_alias;
 static int aggregate_public_hook_rc;
 static _Atomic uint32_t aggregate_public_workers;
 extern void (*wl_columnar_eval_test_outbound_after_plan)(wl_col_session_t *,
@@ -4759,12 +4761,24 @@ hold_aggregate_publication(wl_col_session_t *sess, col_rel_t *rel)
     if (sess->coordinator || aggregate_public_target || !rel || rel->nrows < 2)
         return;
     aggregate_public_target = rel;
-    aggregate_public_hook_rc = col_rel_source_reader_acquire(rel,
-            &aggregate_public_reader);
+    if (aggregate_public_hold_alias) {
+        aggregate_public_alias = col_rel_new_like("aggregate_alias", rel);
+        if (!aggregate_public_alias) {
+            aggregate_public_hook_rc = ENOMEM;
+            return;
+        }
+        aggregate_public_hook_rc = col_rel_install_shared_view(
+            aggregate_public_alias, rel);
+        if (aggregate_public_hook_rc != 0)
+            return;
+    }
+    aggregate_public_hook_rc = col_rel_source_reader_acquire(
+        aggregate_public_hold_alias ? aggregate_public_alias : rel,
+        &aggregate_public_reader);
 }
 
 static void
-test_aggregate_public_retry(uint32_t workers)
+test_aggregate_public_retry(uint32_t workers, bool alias_reader)
 {
     TEST("public aggregate: final publication refusal and exact retry");
     uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
@@ -4794,6 +4808,8 @@ test_aggregate_public_retry(uint32_t workers)
     tuple_collector_t tuples = { 0 };
     memset(&aggregate_public_reader, 0, sizeof(aggregate_public_reader));
     aggregate_public_target = NULL;
+    aggregate_public_alias = NULL;
+    aggregate_public_hold_alias = alias_reader;
     aggregate_public_hook_rc = EINVAL;
 #define PUBLIC_AGG_CHECK(condition, message) \
         do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
@@ -4821,23 +4837,36 @@ test_aggregate_public_retry(uint32_t workers)
         PUBLIC_AGG_CHECK(sess->tdd_executed_strata == 1
             && atomic_load(&aggregate_public_workers) == (1u << workers) - 1u,
             "actual aggregate workers");
+    PUBLIC_AGG_CHECK(col_session_get_arrangement(session, "output", &key, 1),
+        "held target arrangement");
+    uint32_t arrangement_index = 0;
+    while (arrangement_index < sess->arr_count &&
+        strcmp(sess->arr_entries[arrangement_index].rel_name, "output") != 0)
+        arrangement_index++;
+    PUBLIC_AGG_CHECK(arrangement_index < sess->arr_count,
+        "held arrangement registration");
+    col_arr_entry_t held_arrangement = sess->arr_entries[arrangement_index];
     uint64_t view = aggregate_public_target->view_generation;
+    uint64_t storage = aggregate_public_target->storage_generation;
+    uint32_t capacity = aggregate_public_target->capacity;
     int64_t **columns = aggregate_public_target->columns;
-    /* #1709 tracks raw TDD final normalization before this boundary.
-     * Repeat the shared aggregate guard here; public retry follows release. */
+    /* Repeated public evaluation must also preserve this held target
+     * through the earlier final relation normalization boundary. */
     col_delta_timestamp_t saved_timestamps[2];
     bool timestamped = aggregate_public_target->timestamps != NULL;
     if (timestamped)
         memcpy(saved_timestamps, aggregate_public_target->timestamps,
             sizeof(saved_timestamps));
     for (unsigned attempt = 0; attempt < 2; attempt++) {
-        int retry_rc = workers == 1
-            ? wl_session_snapshot(session, collect_tuple, &tuples)
-            : wl_columnar_eval_serial_canonicalize_aggregates(&stratum, sess);
+        int retry_rc = wl_session_snapshot(session, collect_tuple, &tuples);
         PUBLIC_AGG_CHECK(retry_rc == EBUSY && tuples.count == 0
             && aggregate_public_target->nrows == 2
             && aggregate_public_target->view_generation == view
             && aggregate_public_target->columns == columns
+            && aggregate_public_target->storage_generation == storage
+            && aggregate_public_target->capacity == capacity
+            && memcmp(&held_arrangement, &sess->arr_entries[arrangement_index],
+            sizeof(held_arrangement)) == 0
             && (!timestamped || memcmp(saved_timestamps,
             aggregate_public_target->timestamps,
             sizeof(saved_timestamps)) == 0),
@@ -4846,6 +4875,8 @@ test_aggregate_public_retry(uint32_t workers)
     PUBLIC_AGG_CHECK(col_rel_source_reader_release(&aggregate_public_reader) ==
         0,
         "public aggregate release");
+    col_rel_destroy(aggregate_public_alias);
+    aggregate_public_alias = NULL;
     PUBLIC_AGG_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0
         && tuples.count == 1 && tuples.rows[0][0] == 42
         && tuples.rows[0][1] == 10
@@ -4856,6 +4887,8 @@ cleanup:
     wl_columnar_eval_test_outbound_after_plan = NULL;
     if (aggregate_public_reader.owner)
         (void)col_rel_source_reader_release(&aggregate_public_reader);
+    col_rel_destroy(aggregate_public_alias);
+    aggregate_public_alias = NULL;
     free(values);
     wl_session_destroy(session);
     if (failure) {
@@ -6597,6 +6630,220 @@ idb_consolidation_boundary(wl_col_session_t *sess, col_rel_t *target,
     wl_columnar_eval_delta_test_consolidation_boundary = NULL;
 }
 
+extern void (*wl_columnar_eval_test_before_final_normalize)(
+    wl_col_session_t *, col_rel_t *);
+
+static unsigned final_normalize_mode;
+static bool final_normalize_hit;
+static int final_normalize_hook_rc;
+static col_rel_t *final_normalize_target, *final_normalize_alias;
+static wl_columnar_source_access_reader_t final_normalize_reader;
+static uint64_t final_normalize_view, final_normalize_storage;
+static int64_t **final_normalize_columns;
+static col_delta_timestamp_t final_normalize_timestamps[3];
+static int64_t final_normalize_values[3];
+static col_frontier_2d_t final_normalize_frontier, final_normalize_rule;
+static uint32_t final_normalize_iterations;
+
+static void
+inject_final_normalization(wl_col_session_t *coord, col_rel_t *target)
+{
+    if (final_normalize_hit || coord->coordinator ||
+        strcmp(target->name, "output") != 0)
+        return;
+    final_normalize_hit = true;
+    wl_columnar_eval_test_before_final_normalize = NULL;
+    final_normalize_hook_rc = EINVAL;
+    final_normalize_target = target;
+    if (coord->tdd_workers_count != 0 || target->nrows < 2)
+        return;
+    /* Set a controlled duplicate/provenance oracle at the publication
+     * boundary, after internal worker dependencies have retired. */
+    if (col_rel_enable_timestamps(target) != 0)
+        return;
+    int64_t low = 7, high = 42;
+    if (target->nrows > 2) {
+        /* Specialized merging can still have one pair per worker. */
+        if (wl_columnar_eval_delta_consolidate(target, coord) != 0)
+            return;
+    }
+    if (target->nrows != 2 || col_rel_set(target, 0, 0, low) != 0 ||
+        col_rel_set(target, 1, 0, high) != 0)
+        return;
+    target->timestamps[0] = idb_timestamp(0);
+    target->timestamps[1] = idb_timestamp(1);
+    if (col_rel_append_row(target, &low) != 0)
+        return;
+    target->timestamps[2] = idb_timestamp(2);
+    final_normalize_columns = target->columns;
+    final_normalize_view = target->view_generation;
+    final_normalize_storage = target->storage_generation;
+    final_normalize_frontier = coord->frontiers[0];
+    final_normalize_rule = coord->rule_frontiers[0];
+    final_normalize_iterations = coord->total_iterations;
+    memcpy(final_normalize_timestamps, target->timestamps,
+        sizeof(final_normalize_timestamps));
+    for (unsigned row = 0; row < 3; row++)
+        final_normalize_values[row] = target->columns[0][row];
+    if (final_normalize_mode == 1 || final_normalize_mode == 2) {
+        final_normalize_alias = col_rel_new_like("external_alias", target);
+        if (!final_normalize_alias ||
+            col_rel_install_shared_view(final_normalize_alias, target) != 0)
+            return;
+    }
+    if (final_normalize_mode <= 1)
+        final_normalize_hook_rc = col_rel_source_reader_acquire(
+            final_normalize_mode ? final_normalize_alias : target,
+            &final_normalize_reader);
+    else
+        final_normalize_hook_rc = 0;
+#ifdef WL_TEST_ALLOC_WRAP
+    if (final_normalize_mode == 3)
+        fail_next_alloc = true;
+#endif
+    if (final_normalize_mode == 4)
+        idb_set_budget(coord);
+}
+
+static void
+test_final_normalization(uint32_t workers, unsigned route, unsigned mode)
+{
+    TEST("TDD final normalization: checked ownership, provenance and retry");
+    uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
+    uint32_t key = 0;
+    wl_plan_op_exchange_t exchange = { .num_workers = 1,
+                                       .key_col_idxs = &key,
+                                       .key_col_count = 1 };
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } },
+        { .op = route == 0 ? WL_PLAN_OP_EXCHANGE : WL_PLAN_OP_CONSOLIDATE,
+          .opaque_data = route == 0 ? &exchange : NULL },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    wl_plan_relation_t output = { .name = "output", .delta_name = "$d$output",
+                                  .ops = ops, .op_count = route == 1 ? 4 : 3 };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1,
+                                  .is_recursive = route == 0 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    int64_t *values = NULL;
+    tuple_collector_t tuples = { 0 };
+    const char *failure = NULL;
+    final_normalize_mode = mode;
+    final_normalize_hit = false;
+    final_normalize_target = final_normalize_alias = NULL;
+    idb_budget_changed = false;
+    memset(&final_normalize_reader, 0, sizeof(final_normalize_reader));
+#define FINAL_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    FINAL_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "final session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    governor = coord->memory_governor;
+    wl_columnar_memory_governor_ref_retain(governor);
+    uint32_t count = route == 2 ? workers * 32768 : 65536;
+    values = malloc((size_t)count * sizeof(*values));
+    FINAL_CHECK(values, "final input");
+    for (uint32_t row = 0; row < count; row++)
+        values[row] = row % 2 ? 42 : 7;
+    FINAL_CHECK(wl_session_insert(session, "input", values, count, 1) == 0,
+        "final insert");
+    wl_columnar_eval_test_before_final_normalize = inject_final_normalization;
+    int rc = route == 0 ? wl_session_snapshot(session, collect_tuple, &tuples)
+        : route == 1 ? wl_session_step(session)
+        : wl_columnar_eval_nonrec_relation_parallel(&output, coord);
+    idb_restore_budget(coord);
+    FINAL_CHECK(final_normalize_hit && final_normalize_hook_rc == 0
+        && coord->tdd_workers_cap >= workers && coord->tdd_workers_count == 0,
+        "final route or worker retirement");
+    if (mode != 5) {
+        FINAL_CHECK(rc == (mode <= 2 ? EBUSY : mode == 3 ? ENOMEM : ENOSPC)
+            && tuples.count == 0 && final_normalize_target->nrows == 3
+            && final_normalize_target->columns == final_normalize_columns
+            && final_normalize_target->view_generation == final_normalize_view
+            && final_normalize_target->storage_generation ==
+            final_normalize_storage
+            && memcmp(final_normalize_target->timestamps,
+            final_normalize_timestamps, sizeof(final_normalize_timestamps)) == 0
+            && memcmp(final_normalize_target->columns[0],
+            final_normalize_values, sizeof(final_normalize_values)) == 0,
+            "failed finalization changed target");
+        FINAL_CHECK(coord->total_iterations == final_normalize_iterations
+            && memcmp(&coord->frontiers[0], &final_normalize_frontier,
+            sizeof(final_normalize_frontier)) == 0
+            && memcmp(&coord->rule_frontiers[0], &final_normalize_rule,
+            sizeof(final_normalize_rule)) == 0,
+            "failed finalization recorded convergence");
+        if (mode <= 2) {
+            for (unsigned attempt = 0; attempt < 2; attempt++)
+                FINAL_CHECK(wl_columnar_eval_delta_consolidate(
+                        final_normalize_target, coord) == EBUSY
+                    && final_normalize_target->view_generation ==
+                    final_normalize_view
+                    && final_normalize_target->nrows == 3,
+                    "repeated normalization refusal");
+            if (final_normalize_reader.owner)
+                FINAL_CHECK(col_rel_source_reader_release(
+                        &final_normalize_reader)
+                    == 0, "final release reader");
+            col_rel_destroy(final_normalize_alias);
+            final_normalize_alias = NULL;
+        }
+        FINAL_CHECK(wl_columnar_eval_delta_consolidate(final_normalize_target,
+            coord) == 0, "final direct recovery");
+    } else {
+        FINAL_CHECK(rc == 0, "final successful normalization");
+    }
+    FINAL_CHECK(final_normalize_target->nrows == 2
+        && final_normalize_target->columns[0][0] == 7
+        && final_normalize_target->columns[0][1] == 42
+        && memcmp(final_normalize_target->timestamps,
+        final_normalize_timestamps,
+        2 * sizeof(*final_normalize_timestamps)) == 0,
+        "duplicate normalization lost row provenance");
+    if (route == 1 && mode != 5)
+        FINAL_CHECK(wl_session_step(session) == 0,
+            "nonrecursive final step retry");
+    /* #1711 tracks earlier specialized merge publication with existing
+     * outputs; this route validates its final normalization boundary. */
+    if (route != 2 && (mode != 5 || route != 0)) {
+        memset(&tuples, 0, sizeof(tuples));
+        int retry_rc = wl_session_snapshot(session, collect_tuple, &tuples);
+        FINAL_CHECK(retry_rc == 0 && tuples.count == 2
+            && has_tuple(&tuples, "output", (int64_t[]){ 7 }, 1)
+            && has_tuple(&tuples, "output", (int64_t[]){ 42 }, 1),
+            "final exact public retry");
+    }
+cleanup:
+    wl_columnar_eval_test_before_final_normalize = NULL;
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = false;
+#endif
+    if (session)
+        idb_restore_budget(COL_SESSION(session));
+    if (final_normalize_reader.owner)
+        (void)col_rel_source_reader_release(&final_normalize_reader);
+    col_rel_destroy(final_normalize_alias);
+    final_normalize_alias = NULL;
+    free(values);
+    wl_session_destroy(session);
+    if (governor) {
+        if (wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(governor)) != 0)
+            failure = "finalization leaked governor reservation";
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef FINAL_CHECK
+}
+
 static void
 test_idb_consolidation(unsigned mode, bool timestamped)
 {
@@ -8020,9 +8267,11 @@ main(void)
         test_aggregate_publication_guard(mode, false);
         test_aggregate_publication_guard(mode, true);
     }
-    test_aggregate_public_retry(1);
-    test_aggregate_public_retry(2);
-    test_aggregate_public_retry(8);
+    test_aggregate_public_retry(1, false);
+    test_aggregate_public_retry(2, false);
+    test_aggregate_public_retry(2, true);
+    test_aggregate_public_retry(8, false);
+    test_aggregate_public_retry(8, true);
     test_coordinator_specialized_parallel();
     test_correctness_replay_refusal(0);
     test_correctness_replay_refusal(1);
@@ -8093,6 +8342,19 @@ main(void)
     test_idb_small_input(true, false);
     test_idb_small_input(false, false);
     test_idb_small_input(false, true);
+    for (uint32_t workers = 2; workers <= 8; workers += 6) {
+        for (unsigned mode = 0; mode < 6; mode++) {
+#ifndef WL_TEST_ALLOC_WRAP
+            if (mode == 3)
+                continue;
+#endif
+            test_final_normalization(workers, 0, mode);
+        }
+        for (unsigned route = 1; route <= 2; route++) {
+            test_final_normalization(workers, route, 0);
+            test_final_normalization(workers, route, 5);
+        }
+    }
     test_idb_consolidation(0, false);
     test_idb_consolidation(1, false);
     test_idb_consolidation(0, true);

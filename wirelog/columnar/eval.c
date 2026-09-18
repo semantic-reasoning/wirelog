@@ -235,6 +235,28 @@ record_worker_expr_status(wl_col_session_t *coord,
 static void
 tdd_dedup_rel(col_rel_t *r);
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_eval_test_before_final_normalize)(wl_col_session_t *,
+    col_rel_t *);
+#endif
+
+static int
+wl_columnar_eval_finalize_relation(wl_col_session_t *coord, col_rel_t *target)
+{
+    if (!target)
+        return 0;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_test_before_final_normalize)
+        wl_columnar_eval_test_before_final_normalize(coord, target);
+#endif
+    if (target->nrows <= 1)
+        return 0;
+    int rc = wl_columnar_eval_delta_consolidate(target, coord);
+    if (rc == 0)
+        col_session_invalidate_arrangements(&coord->base, target->name);
+    return rc;
+}
+
 typedef struct {
     const wl_plan_relation_t *rp;
     wl_col_session_t *worker_sess;
@@ -671,8 +693,6 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
                 target = NULL;
             }
         }
-        if (rc == 0 && target && nonrec_plan_has_consolidate(rp))
-            tdd_dedup_rel(target);
     }
 
     for (uint32_t w = 0; w < W; w++) {
@@ -697,6 +717,9 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
     int cleanup_rc = tdd_cleanup_workers(coord);
     if (cleanup_rc != 0)
         rc = cleanup_rc;
+    if (rc == 0 && merge_started && nonrec_plan_has_consolidate(rp))
+        rc = wl_columnar_eval_finalize_relation(coord,
+                session_find_rel(coord, rp->name));
     if (!merge_started && rc == EOVERFLOW)
         return EAGAIN;
     return rc;
@@ -6140,54 +6163,30 @@ done:
     tdd_free_saved_coord_idb(sp, owner_fallback_saved);
     tdd_free_saved_coord_idb(sp, global_read_saved);
 
-    /* Issue #416: Accumulate instead of assign so total_iterations stays > 0
-     * after any completed evaluation.  Assigning final_eff_iter (which is 0
-     * when a replicate-mode stratum converges with no new tuples) would
-     * incorrectly reset the first-snapshot guard used by col_snapshot and
-     * col_eval_stratum_tdd_recursive (total_iterations > 0). */
-    coord->total_iterations += final_eff_iter;
-
-    if (rc == 0) {
-        /* Record stratum and per-rule frontiers
-         * (mirrors eval_serial.c:753-776) */
-        tdd_record_recursive_convergence(coord, sp, stratum_idx,
-            rule_id_base, final_eff_iter);
-
-        if (bdx_mode || owner_exchange_mode || global_read_mode) {
-            /* Coordinator-owned modes maintain IDB monotonically during
-             * exchange.  Just dedup final. */
-            uint64_t merge_t0 = now_ns();
-            for (uint32_t ri = 0; ri < nrels; ri++) {
-                col_rel_t *r = session_find_rel(coord,
-                        sp->relations[ri].name);
-                if (r && r->nrows > 1)
-                    tdd_dedup_rel(r);
-            }
-            rc = wl_columnar_eval_serial_canonicalize_aggregates(sp, coord);
-            coord->tdd_final_merge_ns += now_ns() - merge_t0;
-        } else {
-            /* Non-BDX: Merge worker IDB into coordinator */
-            uint64_t merge_t0 = now_ns();
-            rc = tdd_merge_worker_results(sp, coord);
-
-            /* Dedup coordinator IDB (broadcast exchange may introduce
-             * duplicates when equal-length paths exist across partitions). */
-            if (rc == 0) {
-                for (uint32_t ri = 0; ri < nrels; ri++) {
-                    col_rel_t *r = session_find_rel(coord,
-                            sp->relations[ri].name);
-                    if (r && r->nrows > 1)
-                        tdd_dedup_rel(r);
-                }
-                rc = wl_columnar_eval_serial_canonicalize_aggregates(sp, coord);
-            }
-            coord->tdd_final_merge_ns += now_ns() - merge_t0;
-        }
-    }
-
+    uint64_t merge_t0 = now_ns();
+    /* Merge while worker results are still owned by the cohort. Coordinator
+     * owned modes already accumulated their results during exchange. */
+    if (rc == 0 && !bdx_mode && !owner_exchange_mode && !global_read_mode)
+        rc = tdd_merge_worker_results(sp, coord);
     int cleanup_rc = tdd_cleanup_workers(coord);
     if (cleanup_rc != 0)
         rc = cleanup_rc;
+
+    /* All internal worker views must retire before coordinator publication. */
+    for (uint32_t ri = 0; rc == 0 && ri < nrels; ri++)
+        rc = wl_columnar_eval_finalize_relation(coord,
+                session_find_rel(coord, sp->relations[ri].name));
+    if (rc == 0)
+        rc = wl_columnar_eval_serial_canonicalize_aggregates(sp, coord);
+    coord->tdd_final_merge_ns += now_ns() - merge_t0;
+
+    if (rc == 0) {
+        tdd_record_recursive_convergence(coord, sp, stratum_idx,
+            rule_id_base, final_eff_iter);
+        /* Preserve completed history, but never mark refused finalization
+         * as a completed evaluation for the first-snapshot guard. */
+        coord->total_iterations += final_eff_iter;
+    }
     coord->tdd_total_ns += now_ns() - tdd_total_t0;
     return rc;
 }
@@ -6260,26 +6259,17 @@ col_eval_stratum_tdd_nonrecursive(const wl_plan_stratum_t *sp,
         coord->exchange_time_ns += now_ns() - t0;
     }
 
-    /* Dedup coordinator IDB (multiple workers evaluating the same rules on
-     * different partitions may produce overlapping tuples). */
-    if (rc == 0) {
-        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
-            col_rel_t *r = session_find_rel(coord,
-                    sp->relations[ri].name);
-            if (r && r->nrows > 1)
-                tdd_dedup_rel(r);
-        }
-    }
-
-    /* Phase 7: Record stratum and per-rule frontiers
-     * (mirrors eval_serial.c:232-264) */
-    if (rc == 0)
-        tdd_record_nonrecursive_convergence(coord, sp, stratum_idx);
-
-    /* Phase 8: Cleanup worker state */
+    /* Worker results have been merged; retire their dependencies before
+     * normalizing any registered coordinator relation. */
     int cleanup_rc = tdd_cleanup_workers(coord);
     if (cleanup_rc != 0)
         rc = cleanup_rc;
+    for (uint32_t ri = 0; rc == 0 && ri < sp->relation_count; ri++)
+        rc = wl_columnar_eval_finalize_relation(coord,
+                session_find_rel(coord, sp->relations[ri].name));
+
+    if (rc == 0)
+        tdd_record_nonrecursive_convergence(coord, sp, stratum_idx);
 
     return rc;
 }

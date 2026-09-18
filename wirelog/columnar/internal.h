@@ -3280,6 +3280,10 @@ stratum_has_preseeded_delta(const wl_plan_stratum_t *sp,
     wl_col_session_t *sess);
 uint32_t
 rule_index_to_stratum_index(const wl_plan_t *plan, uint32_t rule_id);
+/* Normalize a registered relation through an admitted private candidate.
+ * Refusal retains the original target and any pending candidate cleanup. */
+int
+wl_columnar_eval_delta_consolidate(col_rel_t *target, wl_col_session_t *sess);
 /* Defined in columnar/eval_serial.c; also called from the TDD final-merge
  * path in columnar/eval.c. */
 int
