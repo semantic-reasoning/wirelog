@@ -8403,6 +8403,7 @@ test_filter_timestamp_allocation_failure_retry(void)
     wl_plan_op_t op = { 0 };
     wl_columnar_source_access_reader_t reader = { 0 };
     bool reader_active = false;
+    bool input_owned = true;
     const char *failure = NULL;
     int64_t value = 7;
     eval_stack_init(&stack);
@@ -8430,6 +8431,7 @@ test_filter_timestamp_allocation_failure_retry(void)
         failure = "stack push";
         goto cleanup;
     }
+    input_owned = false;
     fail_calloc_size = input->capacity * sizeof(col_delta_timestamp_t);
     int rc = wl_columnar_filter_op(&op, &stack, &sess);
     if (fail_calloc_size != 0 || rc != EBUSY || stack.top != 1) {
@@ -8471,6 +8473,8 @@ cleanup:
         if (leftover.owned)
             col_rel_destroy(leftover.rel);
     }
+    if (input_owned)
+        col_rel_destroy(input);
     if (pool)
         delta_pool_destroy(pool);
     if (failure) {
@@ -8480,7 +8484,139 @@ cleanup:
     }
     PASS();
 }
+
+static void
+test_filter_timestamp_allocation_failure_without_reader(void)
+{
+    TEST("FILTER timestamp allocation failure returns ENOMEM without a reader");
+    col_rel_t *input = col_rel_new_auto("filter-fault-clean", 1);
+    delta_pool_t *pool = NULL;
+    wl_col_session_t sess = { 0 };
+    eval_stack_t stack;
+    wl_plan_op_t op = { 0 };
+    const char *failure = NULL;
+    bool input_owned = true;
+    int64_t value = 7;
+    eval_stack_init(&stack);
+    if (!input || col_rel_enable_timestamps(input) != 0
+        || col_rel_append_row(input, &value) != 0) {
+        failure = "fixture setup";
+        goto cleanup;
+    }
+    pool = delta_pool_create(4, sizeof(col_rel_t), 4096);
+    if (!pool || eval_stack_push(&stack, input, true) != 0) {
+        failure = "pool setup";
+        goto cleanup;
+    }
+    sess.delta_pool = pool;
+    fail_calloc_size = input->capacity * sizeof(col_delta_timestamp_t);
+    input_owned = false;
+    int rc = wl_columnar_filter_op(&op, &stack, &sess);
+    if (rc != ENOMEM || fail_calloc_size != 0 || stack.top != 0)
+        failure = "unheld allocation denial did not dispose input";
+cleanup:
+    fail_next_alloc = false;
+    fail_calloc_size = 0;
+    while (stack.top > 0) {
+        eval_entry_t leftover = eval_stack_pop(&stack);
+        if (leftover.owned)
+            col_rel_destroy(leftover.rel);
+    }
+    if (input_owned)
+        col_rel_destroy(input);
+    if (pool)
+        delta_pool_destroy(pool);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+}
 #endif
+
+static void
+test_filter_timestamp_pool_and_heap_routes(void)
+{
+    TEST("FILTER timestamp pool and heap routes preserve records");
+    uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
+    wl_plan_op_t op = { .filter_expr = { predicate, sizeof(predicate) } };
+    int64_t values[] = { 7, 42 };
+    col_rel_t *input = col_rel_new_auto("filter-routes", 1);
+    delta_pool_t *pool = NULL;
+    wl_col_session_t sess = { 0 };
+    eval_stack_t stack;
+    const char *failure = NULL;
+    eval_stack_init(&stack);
+    if (!input || col_rel_enable_timestamps(input) != 0) {
+        failure = "route fixture";
+        goto cleanup;
+    }
+    for (uint32_t i = 0; i < 2; i++) {
+        if (col_rel_append_row(input, &values[i]) != 0) {
+            failure = "route input";
+            goto cleanup;
+        }
+        input->timestamps[i] = (col_delta_timestamp_t){
+            .iteration = 10 + i, .stratum = 20 + i,
+            .worker = 30 + i, .multiplicity = i ? -2 : 3
+        };
+    }
+    pool = delta_pool_create(4, sizeof(col_rel_t), 4096);
+    if (!pool) {
+        failure = "route pool";
+        goto cleanup;
+    }
+    sess.delta_pool = pool;
+    if (eval_stack_push(&stack, input, false) != 0
+        || wl_columnar_filter_op(&op, &stack, &sess) != 0
+        || stack.top != 1) {
+        failure = "pool route";
+        goto cleanup;
+    }
+    eval_entry_t pooled = eval_stack_pop(&stack);
+    if (!pooled.rel || !pooled.rel->pool_owned || pooled.rel->nrows != 2
+        || !pooled.rel->timestamps
+        || pooled.rel->columns[0][0] != 7
+        || pooled.rel->columns[0][1] != 42
+        || memcmp(pooled.rel->timestamps, input->timestamps,
+        2 * sizeof(*input->timestamps)) != 0) {
+        failure = "pool provenance";
+        if (pooled.owned) col_rel_destroy(pooled.rel);
+        goto cleanup;
+    }
+    col_rel_destroy(pooled.rel);
+    while (pool->slot_used < pool->slot_cap)
+        if (!delta_pool_alloc_slot(pool)) {
+            failure = "pool exhaustion setup";
+            goto cleanup;
+        }
+    if (eval_stack_push(&stack, input, false) != 0
+        || wl_columnar_filter_op(&op, &stack, &sess) != 0
+        || stack.top != 1) {
+        failure = "heap route";
+        goto cleanup;
+    }
+    eval_entry_t heap = eval_stack_pop(&stack);
+    if (!heap.rel || heap.rel->pool_owned || heap.rel->nrows != 2
+        || !heap.rel->timestamps
+        || heap.rel->columns[0][0] != 7
+        || heap.rel->columns[0][1] != 42
+        || memcmp(heap.rel->timestamps, input->timestamps,
+        2 * sizeof(*input->timestamps)) != 0){
+        failure = "heap provenance";
+    }
+    if (heap.owned) col_rel_destroy(heap.rel);
+cleanup:
+    while (stack.top > 0) {
+        eval_entry_t leftover = eval_stack_pop(&stack);
+        if (leftover.owned) col_rel_destroy(leftover.rel);
+    }
+    if (pool) delta_pool_destroy(pool);
+    col_rel_destroy(input);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+}
 
 int
 main(void)
@@ -8736,8 +8872,10 @@ main(void)
     test_snapshot_preseed_failure(1);
     test_snapshot_preseed_failure(2);
 #ifdef WL_TEST_ALLOC_WRAP
+    test_filter_timestamp_allocation_failure_without_reader();
     test_filter_timestamp_allocation_failure_retry();
 #endif
+    test_filter_timestamp_pool_and_heap_routes();
 #endif
     /* GREEN: col_session_remove returns 0 for uninitialized schema */
     /* test_session_snapshot_empty(); */
