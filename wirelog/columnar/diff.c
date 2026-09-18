@@ -17,6 +17,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef WL_SESSION_TEST_HOOKS
+bool wl_columnar_diff_test_fail_copy_alloc;
+bool wl_columnar_diff_test_fail_copy_append;
+#endif
+
 static int
 col_op_diff_cleanup_owned_relation(eval_stack_t *stack, eval_entry_t *entry,
     col_rel_t *rel, bool owned, int primary_rc)
@@ -101,6 +106,11 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
     col_rel_t *work = in;
     bool work_owned = e.owned;
     if (!work_owned) {
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_diff_test_fail_copy_alloc)
+            work = NULL;
+        else
+#endif
         work = col_rel_pool_new_like(sess->delta_pool, "$consol_diff", in);
         if (!work) {
             /* Preserve the borrowed input and its segment metadata so a
@@ -109,7 +119,13 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
                 return ENOBUFS;
             return ENOMEM;
         }
-        int append_rc = col_rel_append_all(work, in, NULL);
+        int append_rc;
+#ifdef WL_SESSION_TEST_HOOKS
+        append_rc = wl_columnar_diff_test_fail_copy_append
+            ? ENOMEM : col_rel_append_all(work, in, NULL);
+#else
+        append_rc = col_rel_append_all(work, in, NULL);
+#endif
         if (append_rc != 0) {
             int cleanup_rc = col_rel_destroy_checked(work);
             if (cleanup_rc != 0) {

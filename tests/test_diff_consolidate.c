@@ -762,6 +762,103 @@ test_blocked_kway_merge_retains_boundaries(void)
         ASSERT_TRUE(eval_stack_drain(&stack) == 0, "borrowed k-way drain");
         col_rel_destroy(borrowed);
     }
+#ifdef WL_SESSION_TEST_HOOKS
+    {
+        col_rel_t *borrowed = col_rel_new_auto("kway-copy-fail", 1);
+        eval_stack_t stack;
+        uint32_t *boundaries;
+        int64_t values[] = { 7, 8 };
+
+        ASSERT_TRUE(borrowed != NULL
+            && col_rel_append_row(borrowed, &values[0]) == 0
+            && col_rel_append_row(borrowed, &values[1]) == 0,
+            "copy failure relation");
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
+            "copy failure stack");
+        boundaries = malloc(3 * sizeof(*boundaries));
+        ASSERT_TRUE(boundaries != NULL, "copy failure metadata");
+        boundaries[0] = 0;
+        boundaries[1] = 1;
+        boundaries[2] = 2;
+        stack.items[0].seg_boundaries = boundaries;
+        stack.items[0].seg_count = 2;
+        wl_columnar_diff_test_fail_copy_alloc = true;
+        ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == ENOMEM
+            && stack.top == 1 && stack.items[0].rel == borrowed
+            && !stack.items[0].owned
+            && stack.items[0].seg_boundaries == boundaries
+            && stack.items[0].seg_count == 2,
+            "copy allocation failure retains borrowed metadata");
+        wl_columnar_diff_test_fail_copy_alloc = false;
+        ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == 0
+            && stack.top == 1 && stack.items[0].rel != borrowed
+            && stack.items[0].owned && stack.items[0].seg_boundaries == NULL,
+            "copy allocation retry");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "copy failure drain");
+        col_rel_destroy(borrowed);
+    }
+    {
+        col_rel_t *borrowed = col_rel_new_auto("append-fail", 1);
+        eval_stack_t stack;
+        uint32_t *boundaries;
+        int64_t values[] = { 9, 10 };
+
+        ASSERT_TRUE(borrowed != NULL
+            && col_rel_append_row(borrowed, &values[0]) == 0
+            && col_rel_append_row(borrowed, &values[1]) == 0,
+            "append failure relation");
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
+            "append failure stack");
+        boundaries = malloc(3 * sizeof(*boundaries));
+        ASSERT_TRUE(boundaries != NULL, "append failure metadata");
+        boundaries[0] = 0;
+        boundaries[1] = 1;
+        boundaries[2] = 2;
+        stack.items[0].seg_boundaries = boundaries;
+        stack.items[0].seg_count = 2;
+        wl_columnar_diff_test_fail_copy_append = true;
+        ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == ENOMEM
+            && stack.top == 1 && stack.items[0].rel == borrowed
+            && !stack.items[0].owned
+            && stack.items[0].seg_boundaries == boundaries,
+            "copy append failure retains borrowed metadata");
+        wl_columnar_diff_test_fail_copy_append = false;
+        ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == 0
+            && stack.top == 1 && stack.items[0].rel != borrowed
+            && stack.items[0].owned && stack.items[0].seg_boundaries == NULL,
+            "copy append retry");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "append failure drain");
+        col_rel_destroy(borrowed);
+    }
+#endif
+    {
+        col_rel_t *invalid = col_rel_new_auto("kway-invalid", 1);
+        eval_stack_t stack;
+        uint32_t *boundaries;
+        int64_t values[] = { 1, 2, 3, 4 };
+
+        ASSERT_TRUE(invalid != NULL
+            && col_rel_append_row(invalid, &values[0]) == 0
+            && col_rel_append_row(invalid, &values[1]) == 0
+            && col_rel_append_row(invalid, &values[2]) == 0
+            && col_rel_append_row(invalid, &values[3]) == 0,
+            "invalid k-way relation");
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, invalid, true) == 0,
+            "invalid k-way stack");
+        boundaries = malloc(3 * sizeof(*boundaries));
+        ASSERT_TRUE(boundaries != NULL, "invalid k-way metadata");
+        boundaries[0] = 0;
+        boundaries[1] = 3;
+        boundaries[2] = 2;
+        stack.items[0].seg_boundaries = boundaries;
+        stack.items[0].seg_count = 2;
+        ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == EINVAL
+            && stack.top == 0,
+            "invalid k-way cleanup releases metadata");
+    }
     wl_arena_free(arena);
     destroy_mock_session(sess);
     PASS;
