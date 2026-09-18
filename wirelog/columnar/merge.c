@@ -1728,6 +1728,7 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
         if (rel->timestamps) {
             free(rel->timestamps);
             rel->timestamps = NULL;
+            rel->timestamp_capacity = 0;
             wl_columnar_relation_touch_storage(rel);
         }
         if (out_fast_path)
@@ -1827,6 +1828,7 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
         if (rel->timestamps) {
             free(rel->timestamps);
             rel->timestamps = NULL;
+            rel->timestamp_capacity = 0;
         }
         if (out_fast_path)
             *out_fast_path = 0;
@@ -1972,6 +1974,7 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
     if (rel->timestamps) {
         free(rel->timestamps);
         rel->timestamps = NULL;
+        rel->timestamp_capacity = 0;
         wl_columnar_relation_touch_storage(rel);
     }
     if (out_fast_path)

@@ -178,6 +178,7 @@ test_rel_append_row_mult(col_rel_t *r, const int64_t *row, int64_t multiplicity)
         if (!nt)
             return -1;
         r->timestamps = nt;
+        r->timestamp_capacity = cap;
         r->capacity = cap;
     }
     if (r->ncols > 0)
@@ -549,8 +550,9 @@ test_timestamps_dst_rejected(void)
     ASSERT(test_rel_append_row_mult(lhs, lrow, 2) == 0, "append lhs row");
     ASSERT(test_rel_append_row_mult(rhs, rrow, 3) == 0, "append rhs row");
 
-    dst->timestamps = (col_delta_timestamp_t *)malloc(
-        sizeof(*dst->timestamps));
+    dst->timestamps = (col_delta_timestamp_t *)malloc(sizeof(*dst->timestamps));
+
+    dst->timestamp_capacity = dst->timestamps ? 1 : 0;
     ASSERT(dst->timestamps != NULL, "timestamp allocation failed");
 
     int rc = col_op_join_weighted(lhs, rhs, 0, dst);

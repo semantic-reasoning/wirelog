@@ -354,8 +354,10 @@ typedef struct col_rel {
     uint32_t base_nrows;
     /* Timestamp tracking (optional): NULL when disabled.
      * When non-NULL, timestamps[i] records the provenance of data row i.
-     * Capacity tracks with the data array (capacity entries allocated). */
+     * Physical capacity can exceed columns during rollback or shrink. */
     col_delta_timestamp_t *timestamps;
+    /* Physical timestamp allocation, independent of column capacity. */
+    uint32_t timestamp_capacity;
     /* Pool ownership flag (issue #123).
      * true  = struct was allocated from delta_pool; do not free() the struct
      *         (lifecycle managed by allocator pool).
@@ -2168,7 +2170,7 @@ col_rel_free_contents(col_rel_t *r);
 uint64_t
 col_rel_owned_ledger_bytes(const col_rel_t *r);
 /*
- * col_rel_timestamp_ledger_bytes: bytes held by r->timestamps (capacity
+ * col_rel_timestamp_ledger_bytes: bytes held by r->timestamps (timestamp_capacity
  * entries of col_delta_timestamp_t), or 0 when timestamps are disabled.
  */
 uint64_t

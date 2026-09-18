@@ -121,6 +121,7 @@ col_op_join_weighted(const col_rel_t *lhs, const col_rel_t *rhs,
                     rc = ENOMEM;
                     break;
                 }
+                work.timestamp_capacity = new_cap;
                 work.timestamps = nt;
                 work.capacity = new_cap;
                 storage_changed = true;
@@ -145,6 +146,9 @@ col_op_join_weighted(const col_rel_t *lhs, const col_rel_t *rhs,
         dst->ncols = work.ncols;
         dst->columns = work.columns;
         dst->timestamps = work.timestamps;
+        dst->timestamp_capacity = work.timestamp_capacity;
+        work.timestamps = NULL;
+        work.timestamp_capacity = 0;
         dst->capacity = work.capacity;
         dst->nrows = work.nrows;
         dst->arena_owned = false;
@@ -258,6 +262,7 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
                     (size_t)new_cap * sizeof(col_delta_timestamp_t));             \
                 if (!nt)                                                          \
                 DELTA_FAIL();                                                 \
+                work.timestamp_capacity = new_cap;                              \
                 work.timestamps = nt;                                             \
                 work.capacity = new_cap;                                          \
                 storage_changed = true;                                          \
@@ -334,6 +339,9 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
         out_delta->ncols = work.ncols;
         out_delta->columns = work.columns;
         out_delta->timestamps = work.timestamps;
+        out_delta->timestamp_capacity = work.timestamp_capacity;
+        work.timestamps = NULL;
+        work.timestamp_capacity = 0;
         out_delta->capacity = work.capacity;
         out_delta->nrows = work.nrows;
         out_delta->arena_owned = false;

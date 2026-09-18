@@ -741,6 +741,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                         outer_rc = ENOMEM;
                         goto stride_error;
                     }
+                    delta->timestamp_capacity = delta->nrows;
                     wl_columnar_relation_touch_storage(delta);
                     for (uint32_t ti = 0; ti < delta->nrows; ti++) {
                         delta->timestamps[ti].iteration = eff_iter;

@@ -739,8 +739,11 @@ run_nested_asan_workload(uint32_t num_workers, uint32_t cycles)
                  * in sync; we only need to seed it on the first row
                  * of the relation. */
                 if (rels[i]->timestamps == NULL && rels[i]->capacity > 0u) {
-                    rels[i]->timestamps = (col_delta_timestamp_t *)calloc(
-                        rels[i]->capacity, sizeof(col_delta_timestamp_t));
+                    rels[i]->timestamps =
+                        (col_delta_timestamp_t *)calloc(rels[i]->capacity,
+                            sizeof(col_delta_timestamp_t));
+                    rels[i]->timestamp_capacity =
+                        rels[i]->timestamps ? rels[i]->capacity : 0;
                     if (!rels[i]->timestamps) {
                         printf(
                             "FAIL: cycle %u rel %u row %u timestamps alloc\n",

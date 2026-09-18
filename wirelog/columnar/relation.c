@@ -566,6 +566,7 @@ col_rel_publish_resize(col_rel_t *r, int64_t **columns,
     free(r->timestamps);
     r->columns = columns;
     r->timestamps = timestamps;
+    r->timestamp_capacity = timestamps ? new_cap : 0;
     r->capacity = new_cap;
     r->arena_owned = false;
 }
@@ -593,10 +594,10 @@ col_rel_owned_ledger_bytes(const col_rel_t *r)
 uint64_t
 col_rel_timestamp_ledger_bytes(const col_rel_t *r)
 {
-    if (!r || !r->timestamps || r->capacity == 0)
+    if (!r || !r->timestamps || r->timestamp_capacity == 0)
         return 0;
     /* capacity is uint32_t, so the product cannot overflow uint64_t. */
-    return (uint64_t)r->capacity * sizeof(col_delta_timestamp_t);
+    return (uint64_t)r->timestamp_capacity * sizeof(col_delta_timestamp_t);
 }
 
 uint64_t
@@ -753,10 +754,13 @@ col_rel_release_retired_reservation(
 /* Reserve the complete private shape of an ownership transition.  The
  * ordinary retained path deliberately rejects shared and arena-backed
  * relations because those buffers are not yet heap-owned; transition paths
- * use this helper instead and charge the replacement only once. */
+ * use this helper instead and charge the replacement only once. Column-only
+ * COW retains physical timestamp capacity; growth supplies its new allocation
+ * capacity. These shapes must not be inferred from the same column bound. */
 static int
 col_rel_reserve_transition(const col_rel_t *r, uint32_t capacity,
-    wl_columnar_memory_reservation_t *pending, uint64_t *bytes_out)
+    uint32_t timestamp_capacity, wl_columnar_memory_reservation_t *pending,
+    uint64_t *bytes_out)
 {
     uint64_t bytes;
     wl_columnar_memory_admission_status_t status;
@@ -764,9 +768,13 @@ col_rel_reserve_transition(const col_rel_t *r, uint32_t capacity,
     if (!r || !pending || !bytes_out)
         return -1;
     wl_columnar_memory_reservation_init(pending);
-    if (!col_rel_retained_bytes(r->ncols, capacity,
-        r->timestamps != NULL, &bytes))
+    if (!col_rel_retained_bytes(r->ncols, capacity, false, &bytes))
         return -1;
+    uint64_t timestamp_bytes = (uint64_t)timestamp_capacity
+        * sizeof(col_delta_timestamp_t);
+    if (bytes > UINT64_MAX - timestamp_bytes)
+        return -1;
+    bytes += timestamp_bytes;
     *bytes_out = bytes;
     if (!r->memory_governor || bytes == 0 ||
         bytes <= r->retained_reserved_bytes)
@@ -804,7 +812,8 @@ col_rel_grow_owned_transition_impl(col_rel_t *r, uint32_t new_cap,
 
     if (!r || !r->columns || r->ncols == 0 || new_cap < r->nrows)
         return EINVAL;
-    pending_rc = col_rel_reserve_transition(r, new_cap, &pending,
+    pending_rc = col_rel_reserve_transition(r, new_cap,
+            r->timestamps ? new_cap : 0, &pending,
             &new_bytes);
     if (pending_rc < 0)
         return ENOMEM;
@@ -834,6 +843,7 @@ col_rel_grow_owned_transition_impl(col_rel_t *r, uint32_t new_cap,
     ledger_before = col_rel_owned_ledger_bytes(r);
     r->columns = new_columns;
     r->timestamps = new_timestamps;
+    r->timestamp_capacity = new_timestamps ? new_cap : 0;
     r->capacity = new_cap;
     r->arena_owned = false;
     r->col_shared = NULL;
@@ -899,7 +909,8 @@ col_rel_cow_unshare_impl(col_rel_t *r, uint32_t new_cap,
     if (capacity > r->capacity)
         return col_rel_grow_owned_transition_impl(r, capacity,
                    defer_alias_release);
-    pending_rc = col_rel_reserve_transition(r, capacity, &pending,
+    pending_rc = col_rel_reserve_transition(r, capacity,
+            r->timestamps ? r->timestamp_capacity : 0, &pending,
             &new_bytes);
     if (pending_rc < 0)
         return ENOMEM;
@@ -1014,6 +1025,7 @@ col_rel_enable_timestamps_locked(col_rel_t *r)
             r->capacity, sizeof(*r->timestamps));
         if (!r->timestamps)
             return ENOMEM;
+        r->timestamp_capacity = r->capacity;
         wl_columnar_relation_touch_storage(r);
         return 0;
     }
@@ -1028,10 +1040,12 @@ col_rel_enable_timestamps_locked(col_rel_t *r)
     if (!timestamps)
         goto fail;
     r->timestamps = timestamps;
+    r->timestamp_capacity = timestamps ? r->capacity : 0;
     if (reserve_rc > 0
         && col_rel_publish_retained_reservation(r, &pending, new_bytes,
         NULL) != 0) {
         r->timestamps = NULL;
+        r->timestamp_capacity = 0;
         free(timestamps);
         goto fail;
     }
@@ -1163,6 +1177,7 @@ col_rel_free_contents_impl(col_rel_t *r, bool preserve_access_gates)
     free(r->row_scratch);
     free(r->timestamps);
     r->timestamps = NULL;
+    r->timestamp_capacity = 0;
     if (r->col_names) {
         for (uint32_t i = 0; i < r->ncols; i++)
             free(r->col_names[i]);
@@ -1979,23 +1994,35 @@ col_rel_reserve_capacity_admitted(col_rel_t *r, uint32_t new_cap,
     if (!r->memory_governor || r->col_shared || r->arena_owned
         || r->ncols == 0)
         return 0;
-    if (!col_rel_retained_bytes(r->ncols, target, r->timestamps != NULL,
-        &bytes)) {
+    if (!col_rel_retained_bytes(r->ncols, target, false, &bytes)) {
         if (denied)
             *denied = true;
         return ENOMEM;
+    }
+    if (r->timestamps) {
+        uint64_t timestamp_bytes = (uint64_t)r->timestamp_capacity
+            * sizeof(col_delta_timestamp_t);
+        if (bytes > UINT64_MAX - timestamp_bytes) {
+            if (denied)
+                *denied = true;
+            return ENOMEM;
+        }
+        bytes += timestamp_bytes;
     }
     if (bytes <= r->retained_reserved_bytes)
         return 0;
-    pending_rc = col_rel_reserve_retained(r, target, &pending);
-    if (pending_rc < 0) {
+    wl_columnar_memory_reservation_init(&pending);
+    wl_columnar_memory_admission_status_t status =
+        wl_columnar_memory_reserve_growth(
+        wl_columnar_memory_governor_ref_get(r->memory_governor),
+        r->retained_reserved_bytes, bytes, &pending);
+    if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+        && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
         if (denied)
             *denied = true;
         return ENOMEM;
     }
-    if (pending_rc > 0
-        && col_rel_publish_retained_reservation(r, &pending, bytes,
-        NULL) != 0) {
+    if (col_rel_publish_retained_reservation(r, &pending, bytes, NULL) != 0) {
         col_rel_reservation_rollback(&pending);
         return ENOMEM;
     }
@@ -2303,6 +2330,7 @@ col_rel_reset_rows_locked(col_rel_t *r,
     uint64_t ledger_before = col_rel_owned_ledger_bytes(r);
     free(r->timestamps);
     r->timestamps = NULL;
+    r->timestamp_capacity = 0;
     free(r->dedup_slots);
     r->dedup_slots = NULL;
     r->dedup_cap = 0;
@@ -2693,6 +2721,7 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
             free(dst->timestamps);
             dst->columns = new_columns;
             dst->timestamps = new_timestamps;
+            dst->timestamp_capacity = new_timestamps ? new_cap : 0;
             dst->capacity = new_cap;
             /* Arena columns are not charged to RELATION, but timestamps are
              * heap-backed and may have grown.  Keep the attached ledger in
@@ -2881,6 +2910,7 @@ col_rel_compact_impl(col_rel_t *r,
         r->merge_buf_cap = 0;
         free(r->timestamps);
         r->timestamps = NULL;
+        r->timestamp_capacity = 0;
         /* Physical storage must be gone before either the ledger or the
          * retained admission is reduced.  This keeps a concurrent observer
          * from seeing capacity credit while the old buffers are still live. */
@@ -2987,6 +3017,7 @@ col_rel_compact_impl(col_rel_t *r,
         r->columns = new_cols;
         r->col_shared = NULL;
         r->timestamps = new_ts;
+        r->timestamp_capacity = new_ts ? tight : 0;
         r->capacity = tight;
         r->arena_owned = false;
         new_cols = NULL;
@@ -3259,6 +3290,7 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
     int64_t **shared_columns = NULL;
     bool *shared_flags = NULL;
     col_delta_timestamp_t *shared_timestamps = NULL;
+    uint32_t shared_timestamp_capacity = 0;
     char **shared_names = NULL;
     uint32_t *shared_arity_map = NULL;
     uint32_t shared_arity_len = 0;
@@ -3377,23 +3409,21 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
                 goto prepare_fail;
         }
     }
-    if (src->timestamps && src->capacity > 0) {
-        shared_timestamps = (col_delta_timestamp_t *)malloc(
-            (size_t)src->capacity * sizeof(*shared_timestamps));
-        if (!shared_timestamps)
-            goto prepare_fail;
-        memcpy(shared_timestamps, src->timestamps,
-            (size_t)src->capacity * sizeof(*shared_timestamps));
-    } else if (dst->timestamps && src->capacity > 0) {
-        /* The destination enabled timestamp tracking before it became a
-        * view (Issue #1434: the retained-EDB admission tests rely on that
-        * tracking surviving installation and the later growth transition).
-        * Keep it enabled with a zeroed array sized like the borrowed
-        * columns instead of dropping it because the source has none. */
-        shared_timestamps = (col_delta_timestamp_t *)calloc(
-            (size_t)src->capacity, sizeof(*shared_timestamps));
-        if (!shared_timestamps)
-            goto prepare_fail;
+    if (src->timestamps || dst->timestamps) {
+        shared_timestamp_capacity = src->capacity;
+        if (src->timestamps &&
+            src->timestamp_capacity > shared_timestamp_capacity)
+            shared_timestamp_capacity = src->timestamp_capacity;
+        if (shared_timestamp_capacity > 0) {
+            shared_timestamps = calloc(shared_timestamp_capacity,
+                    sizeof(*shared_timestamps));
+            if (!shared_timestamps)
+                goto prepare_fail;
+            if (src->timestamps)
+                memcpy(shared_timestamps, src->timestamps,
+                    (size_t)src->timestamp_capacity *
+                    sizeof(*shared_timestamps));
+        }
     }
     /* Prepare a complete schema for every destination, including a relation
      * whose schema was never initialized.  The installed buffers and their
@@ -3468,6 +3498,7 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
         dst->col_shared = shared_flags;
         dst->column_types = shared_types;
         dst->timestamps = shared_timestamps;
+        dst->timestamp_capacity = shared_timestamp_capacity;
         dst->has_graph_column = shared_has_graph_column;
         dst->graph_col_idx = shared_graph_col_idx;
         dst->declared_ncols = shared_declared_ncols;
@@ -4301,16 +4332,18 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
      * buffer in lockstep with the columns buffer.  Skipped when src has
      * timestamp tracking disabled (timestamps == NULL).
      */
-    if (src->timestamps && src->capacity > 0u) {
-        dst->timestamps = (col_delta_timestamp_t *)malloc(
-            (size_t)src->capacity * sizeof(col_delta_timestamp_t));
+    if (src->timestamps) {
+        uint32_t timestamp_capacity = src->timestamp_capacity > dst->capacity
+        ? src->timestamp_capacity : dst->capacity;
+        dst->timestamps = calloc(timestamp_capacity, sizeof(*dst->timestamps));
         if (!dst->timestamps) {
             col_rel_free_contents(dst);
             free(dst);
             return ENOMEM;
         }
+        dst->timestamp_capacity = timestamp_capacity;
         memcpy(dst->timestamps, src->timestamps,
-            (size_t)src->capacity * sizeof(col_delta_timestamp_t));
+            (size_t)src->timestamp_capacity * sizeof(*dst->timestamps));
     }
 
     /*
@@ -4465,6 +4498,14 @@ col_rel_prepare_replacement_impl(col_rel_t *dst, const col_rel_t *candidate,
     if (!col_rel_retained_bytes(candidate->ncols, candidate->capacity,
         candidate->timestamps != NULL, &planned_bytes))
         return EOVERFLOW;
+    if (candidate->timestamps
+        && candidate->timestamp_capacity > candidate->capacity) {
+        uint64_t extra = (uint64_t)(candidate->timestamp_capacity
+            - candidate->capacity) * sizeof(col_delta_timestamp_t);
+        if (planned_bytes > UINT64_MAX - extra)
+            return EOVERFLOW;
+        planned_bytes += extra;
+    }
 
     if (writer_held) {
         col_rel_t *owner = NULL;
