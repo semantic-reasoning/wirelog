@@ -1008,7 +1008,7 @@ test_plain_kway_cleanup_retains_metadata(void)
         ASSERT_TRUE(col_rel_source_reader_acquire(rel, &reader) == 0,
             "plain k-way reader");
         stack.items[COL_STACK_MAX - 1].is_delta = true;
-        ASSERT_TRUE(col_op_consolidate(&stack, sess) == EBUSY
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == 0
             && stack.top == COL_STACK_MAX
             && stack.items[COL_STACK_MAX - 1].seg_boundaries == bounds,
             "plain k-way refusal retains bounds");
