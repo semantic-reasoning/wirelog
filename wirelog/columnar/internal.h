@@ -1567,6 +1567,8 @@ typedef struct wl_columnar_session_source_lease {
     struct wl_columnar_session_source_lease *next;
 } wl_columnar_session_source_lease_t;
 
+struct wl_columnar_retained_eval_entry;
+
 typedef struct wl_col_session_t {
     wl_session_t base;         /* MUST be first field (vtable dispatch)  */
     /* base.extension_snapshot is borrowed from the coordinator in workers;
@@ -1900,6 +1902,10 @@ typedef struct wl_col_session_t {
     wl_columnar_session_source_lease_t *source_leases;
     col_rel_t *deferred_relations;
     uint32_t deferred_relation_count;
+    /* Serial K-Fusion retains refused evaluator entries here until the
+     * parent allocator and any operation-scoped readers are quiescent. */
+    struct wl_columnar_retained_eval_entry *retained_eval_entries;
+    uint32_t retained_eval_entry_count;
     /* Exchange operator state (Issue #316): W x W partition buffer matrix.
      * Allocated by coordinator before exchange scatter dispatch.
      * exchange_bufs[src_worker][dst_worker] holds rows src sends to dst.
@@ -2006,6 +2012,11 @@ typedef struct {
     eval_entry_t items[COL_STACK_MAX];
     uint32_t top;
 } eval_stack_t;
+
+typedef struct wl_columnar_retained_eval_entry {
+    eval_entry_t entry;
+    struct wl_columnar_retained_eval_entry *next;
+} wl_columnar_retained_eval_entry_t;
 
 /* ======================================================================== */
 /* Relation Storage (columnar/relation.c)                                   */
@@ -2933,6 +2944,14 @@ int
 eval_stack_drain(eval_stack_t *s);
 int
 eval_stack_drain_to_session(eval_stack_t *s, wl_col_session_t *sess);
+int
+wl_columnar_session_retain_eval_entry(wl_col_session_t *sess,
+    eval_entry_t *entry);
+int
+wl_columnar_session_retain_eval_stack(wl_col_session_t *sess,
+    eval_stack_t *stack);
+int
+wl_columnar_session_retry_retained_eval_entries(wl_col_session_t *sess);
 bool
 wl_columnar_deferred_relation_eligible(const col_rel_t *rel);
 int

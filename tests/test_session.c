@@ -2714,6 +2714,62 @@ test_session_tc_insert(void)
 /* ======================================================================== */
 
 #ifdef WL_SESSION_TEST_HOOKS
+static void
+test_kfusion_retained_pool_entry_retry(void)
+{
+    TEST("K-Fusion retains a busy pool entry for retry");
+    const char *failure = NULL;
+#define KRETAIN_CHECK(c, m) \
+        do { if (!(c)) { failure = (m); goto kfusion_retained_cleanup; \
+             } } while (0)
+    wl_col_session_t sess;
+    memset(&sess, 0, sizeof(sess));
+    sess.delta_pool = delta_pool_create(8, sizeof(col_rel_t), 4096);
+    KRETAIN_CHECK(sess.delta_pool != NULL, "pool allocation failed");
+
+    col_rel_t *rel = col_rel_pool_new_auto(sess.delta_pool, NULL,
+            "kfusion-held", 1);
+    KRETAIN_CHECK(rel != NULL, "pool relation allocation failed");
+    KRETAIN_CHECK(col_rel_append_row(rel, (int64_t[]){ 7 }) == 0,
+        "pool relation append failed");
+    wl_columnar_source_access_reader_t reader = { 0 };
+    KRETAIN_CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "pool reader acquire failed");
+
+    eval_entry_t entry = {
+        .rel = rel,
+        .owned = true,
+        .kind = WL_COLUMNAR_EVAL_ENTRY_RELATION,
+    };
+    KRETAIN_CHECK(wl_columnar_session_retain_eval_entry(&sess, &entry) == 0,
+        "retaining pool entry failed");
+    KRETAIN_CHECK(entry.rel == NULL && sess.retained_eval_entry_count == 1,
+        "retained entry ownership was not transferred");
+    KRETAIN_CHECK(wl_columnar_session_retry_retained_eval_entries(&sess) ==
+        EBUSY,
+        "held pool entry should refuse cleanup");
+    KRETAIN_CHECK(sess.retained_eval_entry_count == 1,
+        "busy entry was lost during retry");
+    KRETAIN_CHECK(col_rel_source_reader_release(&reader) == 0,
+        "pool reader release failed");
+    KRETAIN_CHECK(wl_columnar_session_retry_retained_eval_entries(&sess) == 0,
+        "released pool entry did not retry");
+    KRETAIN_CHECK(sess.retained_eval_entry_count == 0,
+        "released pool entry remained retained");
+
+kfusion_retained_cleanup:
+    if (reader.owner)
+        (void)col_rel_source_reader_release(&reader);
+    (void)wl_columnar_session_retry_retained_eval_entries(&sess);
+    delta_pool_destroy(sess.delta_pool);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef KRETAIN_CHECK
+}
+
 static bool map_dispose_hook_hit;
 static wl_columnar_source_access_reader_t map_dispose_reader;
 
@@ -3260,6 +3316,7 @@ main(void)
     test_session_remove_reader_exclusion();
     test_session_remove_incremental_reader_exclusion();
 #ifdef WL_SESSION_TEST_HOOKS
+    test_kfusion_retained_pool_entry_retry();
     test_map_input_cleanup_retry();
 #endif
     test_map_entry_storage_modes();

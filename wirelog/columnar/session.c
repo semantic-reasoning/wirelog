@@ -520,6 +520,75 @@ wl_columnar_session_transfer_deferred(wl_col_session_t *from,
     return 0;
 }
 
+/* Keep a refused evaluator entry alive in the parent session.  This registry
+ * deliberately accepts pool/arena relations: those allocators belong to the
+ * parent session and therefore outlive the block-local evaluator stack. */
+int
+wl_columnar_session_retain_eval_entry(wl_col_session_t *sess,
+    eval_entry_t *entry)
+{
+    wl_columnar_retained_eval_entry_t *retained;
+
+    if (!sess || !entry)
+        return EINVAL;
+    retained = (wl_columnar_retained_eval_entry_t *)calloc(1,
+            sizeof(*retained));
+    if (!retained)
+        return ENOMEM;
+    retained->entry = *entry;
+    memset(entry, 0, sizeof(*entry));
+    retained->next = sess->retained_eval_entries;
+    sess->retained_eval_entries = retained;
+    sess->retained_eval_entry_count++;
+    return 0;
+}
+
+int
+wl_columnar_session_retain_eval_stack(wl_col_session_t *sess,
+    eval_stack_t *stack)
+{
+    int first_rc = 0;
+
+    if (!sess || !stack)
+        return EINVAL;
+    while (stack->top > 0) {
+        int rc = wl_columnar_session_retain_eval_entry(sess,
+                &stack->items[stack->top - 1]);
+        if (rc != 0) {
+            first_rc = rc;
+            break;
+        }
+        stack->top--;
+    }
+    return first_rc;
+}
+
+int
+wl_columnar_session_retry_retained_eval_entries(wl_col_session_t *sess)
+{
+    wl_columnar_retained_eval_entry_t **slot;
+    int first_rc = 0;
+
+    if (!sess)
+        return EINVAL;
+    slot = &sess->retained_eval_entries;
+    while (*slot) {
+        wl_columnar_retained_eval_entry_t *retained = *slot;
+        int rc = eval_entry_dispose(&retained->entry);
+        if (rc != 0) {
+            if (first_rc == 0)
+                first_rc = rc;
+            slot = &retained->next;
+            continue;
+        }
+        *slot = retained->next;
+        assert(sess->retained_eval_entry_count > 0);
+        sess->retained_eval_entry_count--;
+        free(retained);
+    }
+    return first_rc;
+}
+
 /* Row removal rewrites the canonical relation storage in place.  Admit the
  * operation before the first source read so a competing reader, writer, or
  * live storage alias cannot observe a partially compacted relation. */
@@ -2299,6 +2368,8 @@ col_session_destroy(wl_session_t *session)
     }
     int lease_rc = wl_columnar_session_source_leases_release_all(sess);
     int deferred_rc = wl_columnar_session_retry_deferred(sess);
+    int retained_eval_rc
+        = wl_columnar_session_retry_retained_eval_entries(sess);
 #ifdef WL_SESSION_TEST_HOOKS
     wl_session_testhook_after_worker_lease_release(&sess->base);
 #endif
@@ -2311,7 +2382,8 @@ col_session_destroy(wl_session_t *session)
             sess->nrels, false);
     int pool_root_rc = col_rel_pool_destroy_roots_checked(sess->delta_pool,
             0, sess->delta_pool ? sess->delta_pool->slot_used : 0);
-    if (lease_rc != 0 || deferred_rc != 0 || relation_alias_rc != 0
+    if (lease_rc != 0 || deferred_rc != 0 || retained_eval_rc != 0
+        || relation_alias_rc != 0
         || pool_alias_rc != 0 || relation_root_rc != 0
         || pool_root_rc != 0) {
         fputs("wirelog: relation teardown failed during session destroy\n",
@@ -2466,6 +2538,8 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->source_leases = NULL;
     out_worker->deferred_relations = NULL;
     out_worker->deferred_relation_count = 0;
+    out_worker->retained_eval_entries = NULL;
+    out_worker->retained_eval_entry_count = 0;
     out_worker->arr_entries = NULL;
     out_worker->arr_count = 0;
     out_worker->arr_cap = 0;
