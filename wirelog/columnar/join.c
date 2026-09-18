@@ -1064,13 +1064,13 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         } else {
             /* Delta path, no relation name, or cache unavailable:
              * pool-allocated filter owned by this op */
-            filtered = wl_columnar_filter_apply_right_filter(
-                &op->right_filter_expr, right, sess->delta_pool,
-                sess->intern);
+            filtered = wl_columnar_filter_apply_right_filter_governed(
+                &op->right_filter_expr, right, sess->delta_pool, sess->intern,
+                sess->memory_governor ? sess->memory_governor :
+                right->memory_governor);
             if (!filtered) {
-                if (left_e.owned)
-                    col_rel_destroy(left_e.rel);
-                return ENOMEM;
+                int cleanup_rc = eval_stack_dispose_entry(stack, &left_e);
+                return cleanup_rc != 0 ? cleanup_rc : ENOMEM;
             }
             right = filtered;
             right_filtered = filtered;
@@ -1769,13 +1769,13 @@ wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
      * but a candidate for follow-up optimization. */
     if (op->right_filter_expr.size > 0) {
         col_rel_t *filtered
-            = wl_columnar_filter_apply_right_filter(&op->right_filter_expr,
-                right,
-                sess->delta_pool, sess->intern);
+            = wl_columnar_filter_apply_right_filter_governed(
+                &op->right_filter_expr, right, sess->delta_pool, sess->intern,
+                sess->memory_governor ? sess->memory_governor :
+                right->memory_governor);
         if (!filtered) {
-            if (left_e.owned)
-                col_rel_destroy(left_e.rel);
-            return ENOMEM;
+            int cleanup_rc = eval_stack_dispose_entry(stack, &left_e);
+            return cleanup_rc != 0 ? cleanup_rc : ENOMEM;
         }
         right = filtered;
         right_filtered = filtered;
@@ -1924,13 +1924,13 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
      * but a candidate for follow-up optimization. */
     if (op->right_filter_expr.size > 0) {
         col_rel_t *filtered
-            = wl_columnar_filter_apply_right_filter(&op->right_filter_expr,
-                right,
-                sess->delta_pool, sess->intern);
+            = wl_columnar_filter_apply_right_filter_governed(
+                &op->right_filter_expr, right, sess->delta_pool, sess->intern,
+                sess->memory_governor ? sess->memory_governor :
+                right->memory_governor);
         if (!filtered) {
-            if (left_e.owned)
-                col_rel_destroy(left_e.rel);
-            return ENOMEM;
+            int cleanup_rc = eval_stack_dispose_entry(stack, &left_e);
+            return cleanup_rc != 0 ? cleanup_rc : ENOMEM;
         }
         right = filtered;
         right_filtered = filtered;
@@ -2325,13 +2325,13 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
         } else {
             /* Delta path, no relation name, or cache unavailable:
              * pool-allocated filter owned by this op */
-            filtered = wl_columnar_filter_apply_right_filter(
-                &op->right_filter_expr, right, sess->delta_pool,
-                sess->intern);
+            filtered = wl_columnar_filter_apply_right_filter_governed(
+                &op->right_filter_expr, right, sess->delta_pool, sess->intern,
+                sess->memory_governor ? sess->memory_governor :
+                right->memory_governor);
             if (!filtered) {
-                if (left_e.owned)
-                    col_rel_destroy(left_e.rel);
-                return ENOMEM;
+                int cleanup_rc = eval_stack_dispose_entry(stack, &left_e);
+                return cleanup_rc != 0 ? cleanup_rc : ENOMEM;
             }
             right = filtered;
             right_filtered = filtered;
