@@ -976,6 +976,24 @@ collect_tuple(const char *relation, const int64_t *row, uint32_t ncols,
         c->rows[idx][i] = row[i];
 }
 
+static void
+count_tuple_only(const char *relation, const int64_t *row, uint32_t ncols,
+    void *user_data)
+{
+    (void)relation;
+    (void)row;
+    (void)ncols;
+    (*(uint64_t *)user_data)++;
+}
+
+static void
+count_delta_tuple_only(const char *relation, const int64_t *row, uint32_t ncols,
+    int diff, void *user_data)
+{
+    (void)diff;
+    count_tuple_only(relation, row, ncols, user_data);
+}
+
 /* ======================================================================== */
 /* Delta Query Helpers                                                      */
 /* ======================================================================== */
@@ -6639,6 +6657,136 @@ static int64_t final_normalize_values[3];
 static col_frontier_2d_t final_normalize_frontier, final_normalize_rule;
 static uint32_t final_normalize_iterations;
 
+static bool later_completion_hit;
+static col_rel_t *later_completion_target;
+static wl_columnar_source_access_reader_t later_completion_reader;
+
+static void
+inject_later_completion_refusal(wl_col_session_t *coord, col_rel_t *target)
+{
+    if (later_completion_hit || strcmp(target->name, "later") != 0)
+        return;
+    later_completion_hit = true;
+    later_completion_target = target;
+    wl_columnar_eval_test_before_final_normalize = NULL;
+    (void)col_rel_source_reader_acquire(target, &later_completion_reader);
+    (void)coord;
+}
+
+static void
+test_later_stratum_completion_retry(uint32_t workers)
+{
+    TEST("plain STEP later-stratum completion resumes without replay");
+    uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
+    uint32_t key = 0;
+    wl_plan_op_exchange_t exchange = { .num_workers = 1,
+                                       .key_col_idxs = &key,
+                                       .key_col_count = 1 };
+    wl_plan_op_t first_ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } },
+        { .op = WL_PLAN_OP_CONSOLIDATE },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    wl_plan_op_t later_ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } },
+        { .op = WL_PLAN_OP_CONSOLIDATE },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    wl_plan_relation_t first = { .name = "output", .delta_name = "$d$output",
+                                 .ops = first_ops, .op_count = 4 };
+    wl_plan_relation_t later = { .name = "later", .delta_name = "$d$later",
+                                 .ops = later_ops, .op_count = 4 };
+    wl_plan_stratum_t strata[] = {
+        { .relations = &first, .relation_count = 1, .is_recursive = false },
+        { .relations = &later, .relation_count = 1, .is_recursive = false }
+    };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = strata, .stratum_count = 2,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    int64_t *values = NULL;
+    uint64_t tuple_count = 0;
+    uint64_t delta_count = 0;
+    wl_columnar_source_access_reader_t compaction_reader = { 0 };
+    const char *failure = NULL;
+#define LATER_CHECK(c, m) do { if (!(c)) { failure = (m); goto later_cleanup; \
+                               } } while (0)
+    later_completion_hit = false;
+    later_completion_target = NULL;
+    memset(&later_completion_reader, 0, sizeof(later_completion_reader));
+    LATER_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "later session");
+    values = malloc(65536 * sizeof(*values));
+    LATER_CHECK(values, "later values");
+    for (uint32_t i = 0; i < 65536; i++)
+        values[i] = i & 1 ? 42 : 7;
+    LATER_CHECK(wl_session_insert(session, "input", values, 65536, 1) == 0,
+        "later input");
+    wl_columnar_eval_test_before_final_normalize =
+        inject_later_completion_refusal;
+    int later_rc = wl_session_step(session);
+    LATER_CHECK(later_rc == EBUSY && later_completion_hit, "later refusal");
+    int64_t blocked = 9;
+    LATER_CHECK(wl_session_insert(session, "input", &blocked, 1, 1) == EBUSY,
+        "later mutation guard");
+    LATER_CHECK(wl_session_snapshot(session, count_tuple_only, &tuple_count)
+        == EBUSY && tuple_count == 0, "later repeated refusal");
+    LATER_CHECK(col_rel_source_reader_release(&later_completion_reader) == 0,
+        "later release");
+    wl_col_session_t *pre_retry_coord = COL_SESSION(session);
+    col_rel_t *pre_retry_output = session_find_rel(pre_retry_coord, "output");
+    LATER_CHECK(pre_retry_output
+        && col_rel_source_reader_acquire(pre_retry_output,
+        &compaction_reader) == 0, "later compaction refusal setup");
+    tuple_count = 0;
+    wl_session_set_delta_cb(session, count_delta_tuple_only, &delta_count);
+    LATER_CHECK(wl_session_snapshot(session, count_tuple_only, &tuple_count)
+        == EBUSY && tuple_count == 0,
+        "later compaction refusal");
+    LATER_CHECK(COL_SESSION(session)->plain_step_completion_pending
+        && !COL_SESSION(session)->plain_step_completion_active,
+        "later compaction retry remains bounded");
+    LATER_CHECK(col_rel_source_reader_release(&compaction_reader) == 0,
+        "later compaction release");
+    tuple_count = 0;
+    LATER_CHECK(wl_session_snapshot(session, count_tuple_only, &tuple_count)
+        == 0,
+        "later callback-enabled retry");
+    LATER_CHECK(!COL_SESSION(session)->plain_step_completion_pending
+        && !COL_SESSION(session)->plain_step_completion_active,
+        "later callback retry cleared completion");
+    LATER_CHECK(tuple_count == 4, "later exact callback count");
+    LATER_CHECK(delta_count == 0, "later callback emitted no deferred deltas");
+    wl_session_set_delta_cb(session, NULL, NULL);
+    tuple_count = 0;
+    wl_col_session_t *later_coord = COL_SESSION(session);
+    col_rel_t *later_output = session_find_rel(later_coord, "output");
+    col_rel_t *later_relation = session_find_rel(later_coord, "later");
+    LATER_CHECK(later_output && later_relation
+        && later_output->nrows == 2 && later_relation->nrows == 2,
+        "later exact stored rows");
+    LATER_CHECK(later_output->columns[0][0] == 7
+        && later_output->columns[0][1] == 42
+        && later_relation->columns[0][0] == 7
+        && later_relation->columns[0][1] == 42,
+        "later exact stored values");
+later_cleanup:
+    wl_columnar_eval_test_before_final_normalize = NULL;
+    if (later_completion_reader.owner)
+        (void)col_rel_source_reader_release(&later_completion_reader);
+    if (compaction_reader.owner)
+        (void)col_rel_source_reader_release(&compaction_reader);
+    free(values);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef LATER_CHECK
+}
+
 static void
 inject_final_normalization(wl_col_session_t *coord, col_rel_t *target)
 {
@@ -6957,8 +7105,22 @@ test_final_normalization(uint32_t workers, unsigned route, unsigned mode)
                                   .ops = ops, .op_count = route == 1 ? 4 : 3 };
     wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1,
                                   .is_recursive = route == 0 };
+    uint8_t later_predicate[] = { WL_PLAN_EXPR_BOOL, 0 };
+    wl_plan_op_t later_ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "output" },
+        { .op = WL_PLAN_OP_FILTER,
+          .filter_expr = { later_predicate, sizeof(later_predicate) } },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    wl_plan_relation_t later = { .name = "later", .delta_name = "$d$later",
+                                 .ops = later_ops, .op_count = 3 };
+    wl_plan_stratum_t later_stratum = { .relations = &later,
+                                        .relation_count = 1,
+                                        .is_recursive = false };
+    wl_plan_stratum_t strata[] = { stratum, later_stratum };
     const char *edb[] = { "input" };
-    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+    wl_plan_t plan = { .strata = strata,
+                       .stratum_count = route == 1 ? 2 : 1,
                        .edb_relations = edb, .edb_count = 1 };
     wl_session_t *session = NULL;
     wl_columnar_memory_governor_ref_t *governor = NULL;
@@ -7018,6 +7180,19 @@ test_final_normalization(uint32_t workers, unsigned route, unsigned mode)
                     final_normalize_view
                     && final_normalize_target->nrows == 3,
                     "repeated normalization refusal");
+            if (route == 1) {
+                int64_t blocked_input = 7;
+                FINAL_CHECK(wl_session_insert(session, "input",
+                    &blocked_input, 1, 1) == EBUSY,
+                    "pending completion blocks input mutation");
+                delta_collector_t blocked_deltas = { 0 };
+                wl_session_set_delta_cb(session, collect_delta,
+                    &blocked_deltas);
+                FINAL_CHECK(wl_session_remove(session, "input",
+                    &blocked_input, 1, 1) == EBUSY,
+                    "pending completion blocks incremental removal");
+                wl_session_set_delta_cb(session, NULL, NULL);
+            }
             if (final_normalize_reader.owner)
                 FINAL_CHECK(col_rel_source_reader_release(
                         &final_normalize_reader)
@@ -7025,8 +7200,18 @@ test_final_normalization(uint32_t workers, unsigned route, unsigned mode)
             col_rel_destroy(final_normalize_alias);
             final_normalize_alias = NULL;
         }
-        FINAL_CHECK(wl_columnar_eval_delta_consolidate(final_normalize_target,
-            coord) == 0, "final direct recovery");
+        if (route == 1 && mode <= 2) {
+            memset(&tuples, 0, sizeof(tuples));
+            FINAL_CHECK(wl_session_snapshot(session, collect_tuple, &tuples)
+                == 0 && tuples.count == 2
+                && has_tuple(&tuples, "output", (int64_t[]){ 7 }, 1)
+                && has_tuple(&tuples, "output", (int64_t[]){ 42 }, 1),
+                "mixed STEP to SNAPSHOT recovery");
+        } else {
+            FINAL_CHECK(wl_columnar_eval_delta_consolidate(
+                    final_normalize_target,
+                    coord) == 0, "final direct recovery");
+        }
     } else {
         FINAL_CHECK(rc == 0, "final successful normalization");
     }
@@ -8685,6 +8870,7 @@ main(void)
     test_idb_small_input(false, false);
     test_idb_small_input(false, true);
     for (uint32_t workers = 2; workers <= 8; workers += 6) {
+        test_later_stratum_completion_retry(workers);
         for (unsigned mode = 0; mode < 6; mode++) {
 #ifndef WL_TEST_ALLOC_WRAP
             if (mode == 3)

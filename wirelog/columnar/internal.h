@@ -1570,6 +1570,17 @@ typedef struct wl_columnar_session_source_lease {
 typedef struct wl_columnar_eval_delta_rollback wl_columnar_eval_delta_rollback_t;
 typedef struct wl_columnar_eval_delta_observer wl_columnar_eval_delta_observer_t;
 
+/* Durable continuation for a plain STEP whose worker merge completed but
+ * checked publication/compaction was refused.  This state contains only
+ * bounded scalar cursors; worker contexts and temporary plans are never
+ * retained across the public retry. */
+enum wl_columnar_plain_step_completion_phase {
+    WL_COLUMNAR_PLAIN_STEP_COMPLETION_NONE = 0,
+    WL_COLUMNAR_PLAIN_STEP_COMPLETION_FINALIZE_NONREC = 1,
+    WL_COLUMNAR_PLAIN_STEP_COMPLETION_EVALUATE_REMAINING = 2,
+    WL_COLUMNAR_PLAIN_STEP_COMPLETION_COMPACT = 3,
+};
+
 typedef struct wl_columnar_eval_stack_cleanup_frame
     wl_columnar_eval_stack_cleanup_frame_t;
 
@@ -1604,6 +1615,14 @@ typedef struct wl_col_session_t {
      * Unlike total_iterations, this remains true when a pass converges
      * without performing a fixpoint iteration. */
     bool has_evaluated;
+    bool plain_step_completion_pending;
+    bool plain_step_completion_active;
+    bool plain_step_completion_step_context;
+    uint64_t plain_step_completion_mask;
+    uint32_t plain_step_completion_stratum;
+    uint32_t plain_step_completion_phase;
+    uint32_t plain_step_completion_relation;
+    bool plain_step_completion_workers_retired;
     /* Issue #176: Per-iteration cache eviction for recursive strata.
      * cache_evict_threshold: target cache size (bytes) for LRU eviction
      * in recursive stratum iteration loop. When cache exceeds this threshold,
@@ -3223,6 +3242,8 @@ col_eval_stratum_multiworker(const wl_plan_stratum_t *sp,
 int
 col_eval_stratum_tdd(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord, uint32_t stratum_idx);
+int
+wl_columnar_eval_resume_nonrecursive_completion(wl_col_session_t *coord);
 int
 wl_columnar_session_ensure_workqueue(wl_col_session_t *sess,
     uint32_t active_workers);

@@ -6315,19 +6315,85 @@ col_eval_stratum_tdd_nonrecursive(const wl_plan_stratum_t *sp,
         coord->exchange_time_ns += now_ns() - t0;
     }
 
+    if (coord->plain_step_completion_step_context && rc == 0) {
+        /* Arm before checked worker retirement: a refusal here is also a
+         * post-merge completion failure and must be retryable. */
+        coord->plain_step_completion_pending = true;
+        coord->plain_step_completion_active = true;
+        coord->plain_step_completion_stratum = stratum_idx;
+        coord->plain_step_completion_phase =
+            WL_COLUMNAR_PLAIN_STEP_COMPLETION_FINALIZE_NONREC;
+        coord->plain_step_completion_relation = 0;
+        coord->plain_step_completion_workers_retired = false;
+    }
+
     /* Worker results have been merged; retire their dependencies before
      * normalizing any registered coordinator relation. */
     int cleanup_rc = tdd_cleanup_workers(coord);
     if (cleanup_rc != 0)
         rc = cleanup_rc;
-    for (uint32_t ri = 0; rc == 0 && ri < sp->relation_count; ri++)
-        rc = wl_columnar_eval_finalize_relation(coord,
-                session_find_rel(coord, sp->relations[ri].name));
+    if (rc != 0) {
+        coord->plain_step_completion_active = false;
+        return rc;
+    }
+    coord->plain_step_completion_workers_retired =
+        coord->plain_step_completion_step_context;
 
-    if (rc == 0)
+    if (!coord->plain_step_completion_step_context) {
+        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+            rc = wl_columnar_eval_finalize_relation(coord,
+                    session_find_rel(coord, sp->relations[ri].name));
+            if (rc != 0)
+                return rc;
+        }
         tdd_record_nonrecursive_convergence(coord, sp, stratum_idx);
+        return 0;
+    }
 
-    return rc;
+    /* Worker merge is complete.  Keep the finalization cursor outside the
+     * worker contexts so a checked reader refusal can be retried through a
+     * later public STEP or SNAPSHOT without dispatching the stratum again. */
+    return wl_columnar_eval_resume_nonrecursive_completion(coord);
+}
+
+int
+wl_columnar_eval_resume_nonrecursive_completion(wl_col_session_t *coord)
+{
+    if (!coord || !coord->plain_step_completion_pending)
+        return EINVAL;
+    if (coord->plain_step_completion_phase
+        != WL_COLUMNAR_PLAIN_STEP_COMPLETION_FINALIZE_NONREC)
+        return EINVAL;
+    if (!coord->plan
+        || coord->plain_step_completion_stratum >= coord->plan->stratum_count)
+        return EINVAL;
+
+    const wl_plan_stratum_t *sp =
+        &coord->plan->strata[coord->plain_step_completion_stratum];
+    if (!coord->plain_step_completion_workers_retired) {
+        int cleanup_rc = tdd_cleanup_workers(coord);
+        if (cleanup_rc != 0) {
+            coord->plain_step_completion_active = false;
+            return cleanup_rc;
+        }
+        coord->plain_step_completion_workers_retired = true;
+    }
+    while (coord->plain_step_completion_relation < sp->relation_count) {
+        uint32_t ri = coord->plain_step_completion_relation;
+        int rc = wl_columnar_eval_finalize_relation(coord,
+                session_find_rel(coord, sp->relations[ri].name));
+        if (rc != 0) {
+            coord->plain_step_completion_active = false;
+            return rc;
+        }
+        coord->plain_step_completion_relation++;
+    }
+    tdd_record_nonrecursive_convergence(coord, sp,
+        coord->plain_step_completion_stratum);
+    coord->plain_step_completion_phase =
+        WL_COLUMNAR_PLAIN_STEP_COMPLETION_EVALUATE_REMAINING;
+    coord->plain_step_completion_relation = 0;
+    return 0;
 }
 
 /*
