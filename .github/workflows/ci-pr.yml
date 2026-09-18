@@ -704,7 +704,9 @@ jobs:
         run: meson compile -C builddir-tsan
 
       - name: Test with TSan
-        run: meson test -C builddir-tsan --print-errorlogs
+        # TSan instrumentation makes the full suite materially slower; keep
+        # the same bounded multiplier as main and tier1 TSan jobs.
+        run: meson test -C builddir-tsan --timeout-multiplier 4 --print-errorlogs
         env:
           TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
 
