@@ -854,7 +854,7 @@ test_blocked_kway_merge_retains_boundaries(void)
             && !stack.items[0].owned && stack.items[0].seg_boundaries == bounds,
             "plain append failure retains source metadata");
         wl_columnar_merge_test_fail_copy_append = false;
-        ASSERT_TRUE(col_op_consolidate(&stack, sess) == 0
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == EBUSY
             && stack.items[0].rel != borrowed,
             "plain append retry succeeds");
         ASSERT_TRUE(eval_stack_drain(&stack) == 0, "plain append drain");
