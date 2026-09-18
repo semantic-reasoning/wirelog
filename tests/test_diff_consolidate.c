@@ -1094,7 +1094,7 @@ test_plain_kway_cleanup_retains_metadata(void)
         eval_stack_init(&stack);
         ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
             "plain merge push");
-        bounds[0] = 0; bounds[1] = 1; bounds[2] = 2; bounds[3] = 2;
+        bounds[0] = 0; bounds[1] = 1; bounds[2] = 2; bounds[3] = 1;
         stack.items[0].seg_boundaries = bounds; stack.items[0].seg_count = 3;
         ASSERT_TRUE(col_op_consolidate(&stack, sess) != 0
             && stack.items[0].rel == borrowed && !stack.items[0].owned
