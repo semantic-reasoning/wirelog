@@ -522,7 +522,8 @@ concurrent alias removals cannot underflow the count.
 | `relation.c:wl_columnar_relation_install_shared_view_with_lease#2` | `destination_owner->source_access.state` | `atomic_exchange_explicit` | release | Restore the transferable reader lease after publication, including preparation-failure rollback |
 | `session.c:session_pool_rel_transfer_payload` | `dst->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Initialize the new heap descriptor without copying its source atomic |
 | `session.c:session_pool_rel_promote` | `src->retained_reservation.state` | `atomic_load_explicit` | acquire | Admit relocation only when the pool slot's address-bound reservation is empty |
-| `session.c:session_pool_rel_promote#2` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
+| `session.c:session_pool_rel_promote#2` | `src->retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Promote a committed reservation only when the pool slot still owns it |
+| `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 104 + 11 + 16 = **131 atomic call sites**.
 
@@ -603,7 +604,7 @@ reservation objects exclusively; their state follows the governor protocol.
 |---|---|---|---|---|
 | `eval_delta.c:wl_columnar_eval_delta_observer_release_token` | `token->state` | `atomic_load_explicit` | acquire | Observe admission or commit state before releasing the observer reservation, then reinitialize the exclusively owned token |
 
-The complete source audit now contains **154 atomic call sites**.
+The complete source audit now contains **155 atomic call sites**.
 
 ---
 

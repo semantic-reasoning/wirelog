@@ -3652,6 +3652,289 @@ cleanup:
 #undef PUB_CHECK
 }
 
+extern void (*wl_columnar_eval_serial_test_after_delta_stamp)(
+    wl_col_session_t *, col_rel_t *, col_rel_t *);
+static void recursive_delta_after_stamp(wl_col_session_t *, col_rel_t *,
+    col_rel_t *);
+static bool recursive_delta_stamp_seen;
+static col_delta_timestamp_t recursive_delta_first_stamp;
+static col_delta_timestamp_t recursive_delta_last_stamp;
+static wl_columnar_memory_governor_ref_t *recursive_delta_governor;
+static uint32_t recursive_delta_stamp_rows;
+
+static void
+test_recursive_nullary_delta_stamping(void)
+{
+    TEST("recursive: nullary delta reserves timestamp storage");
+    wl_plan_op_t op = { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" };
+    wl_plan_relation_t output = { .name = "output", .delta_name = "$d$output",
+                                  .ops = &op, .op_count = 1 };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1,
+                                  .is_recursive = true };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    col_rel_t *input = NULL;
+    const char *failure = NULL;
+#define NULLARY_CHECK(c, m) do { if (!(c)) { failure = m; goto cleanup; \
+                                 } } while (0)
+    NULLARY_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "create");
+    wl_col_session_t *sess = COL_SESSION(session);
+    input = col_rel_new_auto("input", 0);
+    int64_t marker = 0;
+    NULLARY_CHECK(input && col_rel_append_row(input, &marker) == 0
+        && session_add_rel(sess, input) == 0, "nullary input");
+    input = NULL;
+    recursive_delta_stamp_seen = false;
+    recursive_delta_stamp_rows = 0;
+    wl_columnar_eval_serial_test_after_delta_stamp =
+        recursive_delta_after_stamp;
+    NULLARY_CHECK(col_eval_stratum(&stratum, sess, 0) == 0,
+        "recursive nullary evaluation");
+    wl_columnar_eval_serial_test_after_delta_stamp = NULL;
+    col_rel_t *published = session_find_rel(sess, "output");
+    NULLARY_CHECK(published && published->ncols == 0 && published->nrows == 1,
+        "nullary output");
+    NULLARY_CHECK(recursive_delta_stamp_seen && recursive_delta_stamp_rows == 1
+        && recursive_delta_governor == sess->memory_governor
+        && recursive_delta_first_stamp.iteration == 0
+        && recursive_delta_first_stamp.stratum == 0
+        && recursive_delta_first_stamp.worker == 0
+        && recursive_delta_first_stamp.multiplicity == 1,
+        "nullary provenance");
+cleanup:
+    wl_columnar_eval_serial_test_after_delta_stamp = NULL;
+    col_rel_destroy(input);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef NULLARY_CHECK
+}
+
+extern void (*wl_columnar_eval_serial_test_before_delta_consolidate)(
+    wl_col_session_t *, col_rel_t *, col_rel_t *);
+extern void (*wl_columnar_eval_serial_test_before_delta_clone)(
+    wl_col_session_t *, col_rel_t *);
+extern void (*wl_columnar_eval_serial_test_before_delta_timestamps)(
+    wl_col_session_t *, col_rel_t *, col_rel_t *);
+extern void (*wl_columnar_eval_serial_test_after_delta_stamp)(
+    wl_col_session_t *, col_rel_t *, col_rel_t *);
+static bool recursive_delta_admission_hit;
+static uint64_t recursive_delta_saved_limit;
+static wl_columnar_memory_mode_t recursive_delta_saved_mode;
+static unsigned recursive_delta_admission_stage;
+static col_rel_t *recursive_delta_source;
+static uint32_t recursive_delta_source_rows;
+static int64_t recursive_delta_source_first;
+
+static void
+recursive_delta_force_budget(wl_col_session_t *sess, col_rel_t *source)
+{
+    recursive_delta_source = source;
+    recursive_delta_source_rows = source->nrows;
+    recursive_delta_source_first = source->nrows ? source->columns[0][0] : 0;
+    wl_columnar_memory_governor_t *budget =
+        wl_columnar_memory_governor_ref_get(sess->memory_governor);
+    recursive_delta_saved_limit = atomic_load_explicit(&budget->usable_bytes,
+            memory_order_relaxed);
+    recursive_delta_saved_mode = budget->mode;
+    budget->mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    atomic_store_explicit(&budget->usable_bytes,
+        wl_columnar_memory_reserved(budget), memory_order_relaxed);
+    recursive_delta_admission_hit = true;
+}
+
+static void
+recursive_delta_deny_before_consolidate(wl_col_session_t *sess,
+    col_rel_t *source, col_rel_t *delta)
+{
+    (void)delta;
+    if (recursive_delta_admission_stage == 3)
+        recursive_delta_force_budget(sess, source);
+}
+
+static void
+recursive_delta_deny_before_clone(wl_col_session_t *sess, col_rel_t *source)
+{
+    if (recursive_delta_admission_stage != 1)
+        return;
+    recursive_delta_source = source;
+    recursive_delta_source_rows = source->nrows;
+    recursive_delta_source_first = source->nrows ? source->columns[0][0] : 0;
+    recursive_delta_force_budget(sess, source);
+}
+
+static void
+recursive_delta_deny_before_timestamps(wl_col_session_t *sess,
+    col_rel_t *source, col_rel_t *delta)
+{
+    if (recursive_delta_admission_stage != 2)
+        return;
+    recursive_delta_source = source;
+    recursive_delta_source_rows = source->nrows;
+    recursive_delta_source_first = source->nrows ? source->columns[0][0] : 0;
+    recursive_delta_force_budget(sess, source);
+}
+
+static void
+recursive_delta_after_stamp(wl_col_session_t *sess, col_rel_t *source,
+    col_rel_t *delta)
+{
+    (void)source;
+    recursive_delta_stamp_seen = true;
+    recursive_delta_stamp_rows = delta->nrows;
+    if (delta->nrows) {
+        recursive_delta_first_stamp = delta->timestamps[0];
+        recursive_delta_last_stamp = delta->timestamps[delta->nrows - 1];
+    }
+    recursive_delta_governor = delta->memory_governor;
+    if (recursive_delta_governor != sess->memory_governor)
+        recursive_delta_governor = NULL;
+}
+
+static void
+test_recursive_delta_admission_retry(unsigned stage)
+{
+    TEST("recursive: delta admission refusal preserves retry state");
+    wl_plan_op_t op = { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" };
+    wl_plan_relation_t relations[] = {
+        { .name = "prefix", .delta_name = "$d$prefix", .ops = &op,
+          .op_count = 1 },
+        { .name = "output", .delta_name = "$d$output", .ops = &op,
+          .op_count = 1 }
+    };
+    wl_plan_stratum_t stratum = { .relations = relations, .relation_count = 2,
+                                  .is_recursive = true };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    col_rel_t *output_rel = NULL;
+    col_rel_t *old_delta = NULL;
+    col_rel_t *prefix_rel = NULL;
+    col_rel_t *old_prefix_delta = NULL;
+    int64_t *values = NULL;
+    wl_columnar_memory_governor_ref_t *held_governor = NULL;
+    const char *failure = NULL;
+#define ADMISSION_CHECK(c, m) do { if (!(c)) { failure = m; goto cleanup; \
+                                   } } while (0)
+    ADMISSION_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "create");
+    wl_col_session_t *sess = COL_SESSION(session);
+    held_governor = sess->memory_governor;
+    wl_columnar_memory_governor_ref_retain(held_governor);
+    uint32_t value_count = stage == 3 ? 100u : 1u;
+    values = calloc(value_count, sizeof(*values));
+    ADMISSION_CHECK(values, "values");
+    for (uint32_t i = 0; i < value_count; i++) values[i] = (int64_t)(i + 7);
+    ADMISSION_CHECK(wl_session_insert(session, "input", values, value_count,
+        1) == 0,
+        "insert");
+    output_rel = col_rel_new_auto("output", 1);
+    ADMISSION_CHECK(output_rel && session_add_rel(sess, output_rel) == 0,
+        "output setup");
+    output_rel = NULL;
+    prefix_rel = col_rel_new_auto("prefix", 1);
+    ADMISSION_CHECK(prefix_rel && session_add_rel(sess, prefix_rel) == 0,
+        "prefix setup");
+    prefix_rel = NULL;
+    old_delta = col_rel_new_auto("$d$output", 1);
+    ADMISSION_CHECK(old_delta && session_add_rel(sess, old_delta) == 0,
+        "delta setup");
+    old_delta = NULL;
+    old_prefix_delta = col_rel_new_auto("$d$prefix", 1);
+    ADMISSION_CHECK(old_prefix_delta
+        && session_add_rel(sess, old_prefix_delta) == 0,
+        "prefix delta setup");
+    old_prefix_delta = NULL;
+    col_rel_t *input = session_find_rel(sess, "input");
+    uint32_t input_rows = input ? input->nrows : 0;
+    uint64_t baseline = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(sess->memory_governor));
+    recursive_delta_admission_stage = stage;
+    recursive_delta_admission_hit = false;
+    recursive_delta_source = NULL;
+    recursive_delta_source_rows = 0;
+    recursive_delta_source_first = 0;
+    recursive_delta_stamp_seen = false;
+    recursive_delta_stamp_rows = 0;
+    recursive_delta_governor = NULL;
+    wl_columnar_eval_serial_test_before_delta_clone =
+        recursive_delta_deny_before_clone;
+    wl_columnar_eval_serial_test_before_delta_timestamps =
+        recursive_delta_deny_before_timestamps;
+    wl_columnar_eval_serial_test_after_delta_stamp =
+        recursive_delta_after_stamp;
+    wl_columnar_eval_serial_test_before_delta_consolidate =
+        recursive_delta_deny_before_consolidate;
+    int rc = wl_session_step(session);
+    wl_columnar_eval_serial_test_before_delta_consolidate = NULL;
+    wl_columnar_eval_serial_test_before_delta_clone = NULL;
+    wl_columnar_eval_serial_test_before_delta_timestamps = NULL;
+    wl_columnar_eval_serial_test_after_delta_stamp = NULL;
+    wl_columnar_memory_governor_t *budget =
+        wl_columnar_memory_governor_ref_get(sess->memory_governor);
+    budget->mode = recursive_delta_saved_mode;
+    atomic_store_explicit(&budget->usable_bytes, recursive_delta_saved_limit,
+        memory_order_relaxed);
+    ADMISSION_CHECK(recursive_delta_admission_hit
+        && (rc == ENOMEM || rc == ENOSPC),
+        "admission refusal not observed");
+    ADMISSION_CHECK(recursive_delta_source
+        && recursive_delta_source->nrows == recursive_delta_source_rows
+        && (!recursive_delta_source_rows
+        || recursive_delta_source->columns[0][0]
+        == recursive_delta_source_first)
+        && input && input->nrows == input_rows
+        && wl_columnar_memory_reserved(budget) == baseline,
+        "refusal changed source or reservation");
+    wl_columnar_eval_serial_test_after_delta_stamp =
+        recursive_delta_after_stamp;
+    ADMISSION_CHECK(wl_session_step(session) == 0,
+        "retry");
+    col_rel_t *retry_output = session_find_rel(sess, "output");
+    ADMISSION_CHECK(retry_output, "retry output relation");
+    ADMISSION_CHECK(retry_output->nrows
+        == value_count, "retry output rows");
+    ADMISSION_CHECK(retry_output->columns[0][0] == 7
+        && retry_output->columns[0][value_count - 1]
+        == (int64_t)(value_count + 6), "retry output values");
+    int64_t extra_value = (int64_t)(value_count + 6);
+    ADMISSION_CHECK(wl_session_insert(session, "input", &extra_value, 1, 1)
+        == 0 && col_eval_stratum(&stratum, sess, 0) == 0,
+        "next sub-pass retry");
+    retry_output = session_find_rel(sess, "output");
+    ADMISSION_CHECK(retry_output, "next sub-pass output");
+cleanup:
+    wl_columnar_eval_serial_test_before_delta_consolidate = NULL;
+    wl_columnar_eval_serial_test_before_delta_clone = NULL;
+    wl_columnar_eval_serial_test_before_delta_timestamps = NULL;
+    wl_columnar_eval_serial_test_after_delta_stamp = NULL;
+    col_rel_destroy(output_rel);
+    col_rel_destroy(old_delta);
+    col_rel_destroy(prefix_rel);
+    col_rel_destroy(old_prefix_delta);
+    free(values);
+    if (session)
+        wl_session_destroy(session);
+    if (held_governor) {
+        if (wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(held_governor)) != 0
+            && !failure)
+            failure = "reservation remained after teardown";
+        wl_columnar_memory_governor_ref_release(held_governor);
+    }
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef ADMISSION_CHECK
+}
+
 static bool
 compound_cleanup_refusal_unchanged(wl_session_t *session)
 {
@@ -10667,6 +10950,10 @@ main(void)
     test_pending_cleanup_operation_guards(2, true);
     test_snapshot_error_preserves_delta_reader();
     test_recursive_delta_publication_failure(false);
+    test_recursive_nullary_delta_stamping();
+    test_recursive_delta_admission_retry(1);
+    test_recursive_delta_admission_retry(2);
+    test_recursive_delta_admission_retry(3);
 #ifdef WL_TEST_ALLOC_WRAP
     test_recursive_delta_publication_failure(true);
 #endif

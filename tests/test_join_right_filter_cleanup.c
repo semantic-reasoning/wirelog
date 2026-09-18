@@ -122,10 +122,6 @@ destroy_mock_session(wl_col_session_t *s)
         free(s->filt_cache[i].filter_data);
         if (s->filt_cache[i].filtered)
             col_rel_destroy(s->filt_cache[i].filtered);
-    for (uint32_t i = 0; i < s->filt_cache_count; i++) {
-        col_rel_destroy(s->filt_cache[i].filtered);
-        free(s->filt_cache[i].rel_name);
-        free(s->filt_cache[i].filter_data);
     }
     free(s->filt_cache);
     session_rel_free_hash(s);
@@ -655,6 +651,8 @@ test_right_filter_preserves_timestamps(void)
     }
     PASS();
     return 0;
+}
+
 static wl_columnar_memory_governor_ref_t *
 right_filter_governor(uint64_t bytes)
 {

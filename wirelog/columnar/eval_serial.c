@@ -221,6 +221,14 @@ wl_columnar_eval_serial_canonicalize_aggregates(const wl_plan_stratum_t *sp,
 #ifdef WL_SESSION_TEST_HOOKS
 void (*wl_columnar_eval_serial_test_after_plan)(wl_col_session_t *sess,
     eval_stack_t *stack, eval_entry_t *result);
+void (*wl_columnar_eval_serial_test_before_delta_consolidate)(
+    wl_col_session_t *sess, col_rel_t *source, col_rel_t *delta);
+void (*wl_columnar_eval_serial_test_before_delta_clone)(
+    wl_col_session_t *sess, col_rel_t *source);
+void (*wl_columnar_eval_serial_test_before_delta_timestamps)(
+    wl_col_session_t *sess, col_rel_t *source, col_rel_t *delta);
+void (*wl_columnar_eval_serial_test_after_delta_stamp)(
+    wl_col_session_t *sess, col_rel_t *source, col_rel_t *delta);
 #endif
 
 int
@@ -699,12 +707,74 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 }
 
                 const char *dname = sp->relations[ri].delta_name;
-                col_rel_t *delta = col_rel_pool_new_like(
-                    sess->delta_pool, dname, r);
-                if (!delta) {
-                    outer_rc = ENOMEM;
+                wl_columnar_memory_governor_ref_t *governor =
+                    sess->memory_governor ? sess->memory_governor
+                                          : r->memory_governor;
+                wl_columnar_source_access_reader_t reader = { 0 };
+                int reader_rc = col_rel_source_reader_acquire(r, &reader);
+                if (reader_rc != 0) {
+                    outer_rc = reader_rc;
                     goto stride_error;
                 }
+#ifdef WL_SESSION_TEST_HOOKS
+                if (wl_columnar_eval_serial_test_before_delta_clone)
+                    wl_columnar_eval_serial_test_before_delta_clone(sess, r);
+#endif
+                col_rel_t *delta = wl_columnar_relation_pool_new_like_governed(
+                    sess->delta_pool, dname, r, governor);
+                int reader_release_rc =
+                    col_rel_source_reader_release(&reader);
+                if (reader_release_rc != 0 && delta) {
+                    col_rel_destroy(delta);
+                    delta = NULL;
+                }
+                if (!delta) {
+                    outer_rc = reader_release_rc != 0 ? reader_release_rc
+                                                      : ENOMEM;
+                    goto stride_error;
+                }
+
+                /* Nullary pool clones have no initial row capacity, so make
+                 * one timestamp slot admissible before consolidation can emit
+                 * their first tuple. */
+                if (delta->capacity == 0) {
+                    wl_columnar_source_access_writer_t writer = { 0 };
+                    bool alias_release_pending = false;
+                    int reserve_rc = col_rel_source_writer_acquire(delta,
+                            &writer);
+                    if (reserve_rc == 0)
+                        reserve_rc = col_rel_reserve_rows_locked(delta, 1,
+                                &writer, &alias_release_pending);
+                    int release_rc =
+                        wl_columnar_source_access_writer_release(&writer);
+                    if (reserve_rc == 0)
+                        reserve_rc = release_rc;
+                    if (reserve_rc != 0) {
+                        col_rel_destroy(delta);
+                        outer_rc = reserve_rc;
+                        goto stride_error;
+                    }
+                }
+
+                /* Reserve provenance storage before consolidation mutates the
+                 * source.  This makes timestamp admission part of the same
+                 * pre-mutation allocation contract as the delta rows. */
+#ifdef WL_SESSION_TEST_HOOKS
+                if (wl_columnar_eval_serial_test_before_delta_timestamps)
+                    wl_columnar_eval_serial_test_before_delta_timestamps(
+                        sess, r, delta);
+#endif
+                int timestamp_rc = col_rel_enable_timestamps(delta);
+                if (timestamp_rc != 0) {
+                    col_rel_destroy(delta);
+                    outer_rc = timestamp_rc;
+                    goto stride_error;
+                }
+#ifdef WL_SESSION_TEST_HOOKS
+                if (wl_columnar_eval_serial_test_before_delta_consolidate)
+                    wl_columnar_eval_serial_test_before_delta_consolidate(
+                        sess, r, delta);
+#endif
 
                 /* Consolidate WITH delta output (no separate merge walk) */
                 uint32_t cons_old = snap[ri];
@@ -743,15 +813,14 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
 
                 if (delta->nrows > 0) {
                     /* Stamp each new row with its provenance (eff_iter, stratum).
-                     * worker=0 indicates the sequential (non-K-fusion) path. */
-                    delta->timestamps = (col_delta_timestamp_t *)calloc(
-                        delta->nrows, sizeof(col_delta_timestamp_t));
-                    if (!delta->timestamps) {
-                        col_rel_destroy(delta);
-                        outer_rc = ENOMEM;
-                        goto stride_error;
-                    }
-                    delta->timestamp_capacity = delta->nrows;
+                     * worker=0 indicates the sequential (non-K-fusion) path.
+                     *
+                     * The array was allocated and admitted above by
+                     * col_rel_enable_timestamps(); reallocating it here would
+                     * leak that one and leave timestamp_capacity describing
+                     * storage the governor never reserved.  It is calloc'd to
+                     * capacity >= nrows, so the stamping loop can write
+                     * straight into it. */
                     wl_columnar_relation_touch_storage(delta);
                     for (uint32_t ti = 0; ti < delta->nrows; ti++) {
                         delta->timestamps[ti].iteration = eff_iter;
@@ -759,11 +828,16 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                         /* worker left zero: sequential evaluation path */
                         delta->timestamps[ti].multiplicity = 1;
                     }
+#ifdef WL_SESSION_TEST_HOOKS
+                    if (wl_columnar_eval_serial_test_after_delta_stamp)
+                        wl_columnar_eval_serial_test_after_delta_stamp(
+                            sess, r, delta);
+#endif
 
                     /* Phase 4: Enable timestamp tracking on target relation to
                      * preserve provenance through consolidation.  This enables
                      * frontier computation to determine convergence. */
-                    int timestamp_rc = col_rel_enable_timestamps(r);
+                    timestamp_rc = col_rel_enable_timestamps(r);
                     if (timestamp_rc != 0) {
                         col_rel_destroy(delta);
                         outer_rc = timestamp_rc;
