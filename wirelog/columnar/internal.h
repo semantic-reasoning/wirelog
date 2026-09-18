@@ -3661,6 +3661,9 @@ arr_hash_rows_batch(const col_rel_t *rel, uint32_t row_begin, uint32_t row_end,
 extern void (*wl_columnar_ops_test_before_map_dispose)(eval_stack_t *,
     eval_entry_t *);
 extern bool wl_columnar_ops_test_map_fail_output_alloc;
+extern void (*wl_columnar_ops_test_before_reduce_dispose)(eval_stack_t *,
+    eval_entry_t *);
+extern bool wl_columnar_ops_test_reduce_fail_output_alloc;
 #endif
 
 #endif /* WL_COLUMNAR_INTERNAL_H */
