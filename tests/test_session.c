@@ -10196,9 +10196,195 @@ cleanup:
 #undef FILTER_CHECK
 }
 
+static unsigned serial_clone_denial;
+static wl_atomic_u64 serial_clone_workers;
+static wl_atomic_u64 serial_clone_bad_result;
+
+static void
+observe_serial_borrowed_clone(wl_col_session_t *sess, eval_stack_t *stack,
+    eval_entry_t *result)
+{
+    (void)stack;
+    if (!result->rel || result->owned
+        || result->rel != session_find_rel(sess, "input"))
+        atomic_store_explicit(&serial_clone_bad_result, 1,
+            memory_order_release);
+    if (sess->coordinator) {
+        record_actual_worker(&serial_clone_workers, sess->worker_id);
+        return;
+    }
+    if (serial_clone_denial) {
+        idb_set_budget(sess); /* Frame is already admitted; target clone is next. */
+        if (serial_clone_denial == 2) {
+            wl_columnar_memory_governor_t *g =
+                wl_columnar_memory_governor_ref_get(sess->memory_governor);
+            atomic_store_explicit(&g->usable_bytes,
+                reserved_on(sess->memory_governor)
+                + (uint64_t)COL_REL_INIT_CAP * sizeof(int64_t),
+                memory_order_release);
+        }
+    }
+}
+
+static void
+test_serial_borrowed_clone_admission(uint32_t workers, unsigned denial,
+    unsigned pool_route, bool source_fallback)
+{
+    TEST("serial borrowed publication retains governor and retries admission");
+    wl_plan_op_t op = { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" };
+    wl_plan_relation_t output = { .name = "output", .delta_name = "$d$output",
+                                  .ops = &op, .op_count = 1 };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    int64_t *rows = NULL;
+    wl_columnar_memory_governor_ref_t *source_ref = NULL;
+    col_rel_t *unowned = NULL;
+    delta_pool_t *saved_pool = NULL;
+    bool pool_detached = false;
+    wl_columnar_source_access_writer_t writer = { 0 };
+    bool writer_held = false;
+    const char *failure = NULL;
+#define CLONE_CHECK(c, m) do { if (!(c)) { failure = m; goto cleanup; \
+                               } } while (0)
+    CLONE_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "session");
+    wl_col_session_t *sess = COL_SESSION(session);
+    ref = sess->memory_governor;
+    wl_columnar_memory_governor_ref_retain(ref);
+    uint32_t count = workers == 1 ? COL_REL_INIT_CAP + 1 : 65536;
+    rows = malloc((size_t)count * sizeof(*rows));
+    CLONE_CHECK(rows, "rows");
+    for (uint32_t i = 0; i < count; i++) rows[i] = 42;
+    if (workers == 1) {
+        source_ref = enforcing_governor(1u << 20);
+        unowned = col_rel_new_auto("input", 1);
+        CLONE_CHECK(source_ref && unowned, "independent source governor");
+        for (uint32_t i = 0; i < count; i++)
+            CLONE_CHECK(col_rel_append_row(unowned, &rows[i]) == 0,
+                "source rows");
+        CLONE_CHECK(col_rel_attach_memory_governor(unowned, source_ref) == 0
+            && session_add_rel(sess, unowned) == 0, "source registration");
+        unowned = NULL;
+    } else
+        CLONE_CHECK(wl_session_insert(session, "input", rows, count, 1) == 0,
+            "input");
+
+    col_rel_t *input = session_find_rel(sess, "input");
+    int64_t **columns = input->columns;
+    uint64_t generation = input->view_generation;
+    if (pool_route == 1) {
+        saved_pool = sess->delta_pool;
+        sess->delta_pool = NULL;
+        pool_detached = true;
+    } else if (pool_route == 2) {
+        CLONE_CHECK(sess->delta_pool, "pool exists");
+        while (sess->delta_pool->slot_used < sess->delta_pool->slot_cap) {
+            col_rel_t *filler = col_rel_pool_new_like(sess->delta_pool, "fill",
+                    input);
+            bool pooled = filler && filler->pool_owned;
+            col_rel_destroy(filler);
+            CLONE_CHECK(pooled, "real pool exhaustion");
+        }
+    }
+    uint64_t baseline = reserved_on(ref);
+
+    serial_clone_denial = denial;
+    atomic_store_explicit(&serial_clone_workers, 0, memory_order_release);
+    atomic_store_explicit(&serial_clone_bad_result, 0, memory_order_release);
+    wl_columnar_eval_serial_test_after_plan = observe_serial_borrowed_clone;
+    if (denial) {
+        for (unsigned attempt = 0; attempt < 2; attempt++) {
+            int rc = wl_columnar_eval_serial_framed_relation(&output, sess,
+                    false);
+            idb_restore_budget(sess);
+            CLONE_CHECK(rc == ENOMEM && !session_find_rel(sess, "output")
+                && input->columns == columns &&
+                input->view_generation == generation
+                && input->nrows == count && !sess->cleanup_active
+                && !sess->cleanup_pending && reserved_on(ref) == baseline,
+                "clone or growth refusal preserves source and frame ownership");
+        }
+    }
+    serial_clone_denial = 0;
+    if (workers == 1) {
+        CLONE_CHECK(col_rel_source_writer_acquire(input, &writer) == 0,
+            "source writer");
+        writer_held = true;
+        CLONE_CHECK(wl_columnar_eval_serial_framed_relation(&output, sess,
+            false) == EBUSY
+            && !session_find_rel(sess,
+            "output") && reserved_on(ref) == baseline,
+            "source writer refuses metadata snapshot");
+        CLONE_CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+            "writer release");
+        writer_held = false;
+        if (source_fallback) sess->memory_governor = NULL;
+    }
+    int rc
+        = workers == 1
+        ? wl_columnar_eval_serial_framed_relation(&output, sess, false)
+        : wl_session_step(session);
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    CLONE_CHECK(rc == 0 && atomic_load_explicit(&serial_clone_bad_result,
+        memory_order_acquire) == 0, "borrowed route and retry");
+    col_rel_t *published = session_find_rel(sess, "output");
+    CLONE_CHECK(published && published->nrows == (workers == 1 ? count : 1)
+        && published->columns[0][0] == 42, "exact publication rows");
+    if (workers == 1)
+        CLONE_CHECK(published->memory_governor ==
+            (source_fallback ? source_ref : ref)
+            && published->retained_reserved_bytes > 0,
+            "published clone remains governed");
+    else
+        CLONE_CHECK(atomic_load_explicit(&serial_clone_workers,
+            memory_order_acquire) == ((UINT64_C(1) << workers) - 1),
+            "actual worker borrowed-plan dispatch");
+    if (workers == 1)
+        for (uint32_t i = 0; i < count; i++)
+            CLONE_CHECK(published->columns[0][i] == rows[i],
+                "all published rows");
+cleanup:
+    if (writer_held) (void)wl_columnar_source_access_writer_release(&writer);
+    if (session) {
+        COL_SESSION(session)->memory_governor = ref;
+        if (pool_detached) COL_SESSION(session)->delta_pool = saved_pool;
+    }
+    col_rel_destroy(unowned);
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    serial_clone_denial = 0;
+    if (session) idb_restore_budget(COL_SESSION(session));
+    free(rows);
+    wl_session_destroy(session);
+    if (ref) {
+        if (reserved_on(ref) != 0) failure = "clone reservation leak";
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (source_ref) {
+        if (reserved_on(source_ref) !=
+            0) failure = "source governor reservation leak";
+        wl_columnar_memory_governor_ref_release(source_ref);
+    }
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef CLONE_CHECK
+}
+
 int
 main(void)
 {
+    for (unsigned route = 0; route < 3; route++)
+        for (unsigned fallback = 0; fallback < 2; fallback++)
+            test_serial_borrowed_clone_admission(1, 0, route, fallback != 0);
+    test_serial_borrowed_clone_admission(1, 1, 0, false);
+    test_serial_borrowed_clone_admission(1, 2, 0, false);
+    test_serial_borrowed_clone_admission(2, 0, 0, false);
+    test_serial_borrowed_clone_admission(8, 0, 0, false);
     for (unsigned route = 0; route < 3; route++)
         for (unsigned ts = 0; ts < 2; ts++)
             for (unsigned phase = 0; phase < 4; phase++)
