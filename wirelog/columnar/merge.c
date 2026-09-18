@@ -1097,8 +1097,11 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
             return eval_stack_repush_entry(stack,
                        &e) == 0 ? writer_rc : ENOBUFS;
         /* Nothing to deduplicate */
-        if (e.seg_boundaries)
+        if (e.seg_boundaries) {
             free(e.seg_boundaries);
+            e.seg_boundaries = NULL;
+            e.seg_count = 0;
+        }
         in->sorted_nrows = nr;
         in->run_count = 1;
         in->run_ends[0] = nr;
