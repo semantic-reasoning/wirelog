@@ -1978,6 +1978,203 @@ cleanup:
 #undef KTS_CHECK
 }
 
+static void
+test_timestamp_cons_entry(unsigned ownership, unsigned route, unsigned fault)
+{
+    TEST(
+        "timestamp CONS owned/borrowed/COW entry preserves provenance and retry");
+    const int64_t values[] = { 1, 3, 2, 1, 3, 2 };
+    const uint32_t representatives[] = { 0, 2, 1 };
+    uint32_t count = route == 3 ? 0 : route == 4 ? 1 : 6;
+    col_rel_t *source = col_rel_new_auto("cons_source", 1);
+    col_rel_t *unowned = NULL;
+    col_rel_t *input = source;
+    delta_pool_t *pool = NULL;
+    wl_col_session_t sess = { 0 };
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    wl_columnar_source_access_reader_t reader = { 0 };
+    wl_columnar_source_access_writer_t writer = { 0 };
+    wl_columnar_memory_governor_ref_t *source_governor = NULL;
+    bool source_owned = true;
+    const char *failure = NULL;
+#define CONS_TS_CHECK(c, m) do { if (!(c)) { failure = m; goto cleanup; \
+                                 } } while (0)
+    CONS_TS_CHECK(source && col_rel_enable_timestamps(source) == 0, "source");
+    for (uint32_t i = 0; i < count; i++) {
+        CONS_TS_CHECK(col_rel_append_row(source, &values[i]) == 0, "append");
+        source->timestamps[i] = kway_timestamp(i);
+    }
+    if (ownership == 1 && route == 0 && fault == 0) {
+        source_governor = test_consolidate_governor_create(UINT64_C(1) << 30);
+        CONS_TS_CHECK(source_governor
+            && col_rel_attach_memory_governor(source, source_governor) == 0,
+            "source governor");
+    }
+    if (route == 1) source->sorted_nrows = 2;
+    uint64_t source_view = source->view_generation;
+    uint32_t source_sorted = source->sorted_nrows;
+    if (ownership == 2) {
+        unowned = col_rel_new_like("cons_view", source);
+        CONS_TS_CHECK(unowned && col_rel_install_shared_view(unowned,
+            source) == 0,
+            "view");
+        input = unowned;
+    }
+    if (ownership == 1) {
+        pool = delta_pool_create(4, sizeof(col_rel_t), 4096);
+        CONS_TS_CHECK(pool, "pool");
+        sess.delta_pool = pool;
+    }
+    /* A full stack proves failed CONS can restore its one original entry. */
+    for (uint32_t i = 0; i < COL_STACK_MAX - 1; i++)
+        CONS_TS_CHECK(eval_stack_push(&stack, source, false) == 0,
+            "lower push");
+    CONS_TS_CHECK(eval_stack_push(&stack, input, ownership != 1) == 0,
+        "input push");
+    if (ownership == 0) source_owned = false;
+    if (ownership == 2) unowned = NULL;
+    eval_entry_t *entry = &stack.items[stack.top - 1];
+    if (route == 2) {
+        entry->seg_boundaries = malloc(4 * sizeof(uint32_t));
+        CONS_TS_CHECK(entry->seg_boundaries, "segments");
+        const uint32_t boundaries[] = { 0, 2, 4, 6 };
+        memcpy(entry->seg_boundaries, boundaries, sizeof(boundaries));
+        entry->seg_count = 3;
+    }
+    uint32_t *segments = entry->seg_boundaries;
+    if (fault == 1) {
+        if (ownership == 1)
+            CONS_TS_CHECK(col_rel_source_writer_acquire(input, &writer) == 0,
+                "block borrowed capture");
+        else
+            CONS_TS_CHECK(col_rel_source_reader_acquire(input, &reader) == 0,
+                "block owned normalize");
+    } else if (fault == 2)
+        fail_consolidate_allocation_at(route == 0
+            ? "radix_workspace_timestamps" : "merge_timestamps");
+    if (fault) {
+        int rc = col_op_consolidate(&stack, &sess);
+        CONS_TS_CHECK(rc == (fault == 1 ? EBUSY : ENOMEM)
+            && stack.top == COL_STACK_MAX && entry->rel == input
+            && entry->owned == (ownership != 1)
+            && entry->seg_boundaries == segments,
+            "retry entry or segments lost");
+        if (fault == 2) CONS_TS_CHECK(consolidate_fail_used, "fault witness");
+        for (uint32_t i = 0; i < count; i++)
+            CONS_TS_CHECK(col_rel_get(input, i, 0) == values[i]
+                && kway_timestamp_equal(input->timestamps[i],
+                kway_timestamp(i)),
+                "refusal changed input");
+        clear_consolidate_allocation_failure();
+        if (reader.owner)
+            CONS_TS_CHECK(col_rel_source_reader_release(&reader) == 0,
+                "release reader");
+        if (writer.owner)
+            CONS_TS_CHECK(wl_columnar_source_access_writer_release(&writer) ==
+                0,
+                "release writer");
+    }
+    CONS_TS_CHECK(col_op_consolidate(&stack, &sess) == 0
+        && stack.top == COL_STACK_MAX, "CONS retry");
+    entry = &stack.items[stack.top - 1];
+    col_rel_t *out = entry->rel;
+    uint32_t expected = count > 1 ? 3 : count;
+    CONS_TS_CHECK(out && entry->owned && out->timestamps
+        && out->nrows == expected && out->sorted_nrows == expected
+        && out->run_count == 1 && out->run_ends[0] == expected
+        && !entry->seg_boundaries && entry->seg_count == 0, "output metadata");
+    if (source_governor)
+        CONS_TS_CHECK(out->memory_governor != NULL,
+            "borrowed clone lost governor");
+    for (uint32_t i = 0; i < expected; i++) {
+        uint32_t original = count > 1 ? representatives[i] : 0;
+        CONS_TS_CHECK(col_rel_get(out, i, 0) == (int64_t)i + 1
+            && kway_timestamp_equal(out->timestamps[i],
+            kway_timestamp(original)),
+            "first whole representative record");
+    }
+    if (ownership != 0) {
+        CONS_TS_CHECK(source->view_generation == source_view
+            && source->sorted_nrows == source_sorted && source->nrows == count,
+            "source metadata changed");
+        for (uint32_t i = 0; i < count; i++)
+            CONS_TS_CHECK(col_rel_get(source, i, 0) == values[i]
+                && kway_timestamp_equal(source->timestamps[i],
+                kway_timestamp(i)),
+                "source provenance changed");
+    }
+cleanup:
+    clear_consolidate_allocation_failure();
+    if (reader.owner) (void)col_rel_source_reader_release(&reader);
+    if (writer.owner) (void)wl_columnar_source_access_writer_release(&writer);
+    while (stack.top) {
+        eval_entry_t e = eval_stack_pop(&stack);
+        free(e.seg_boundaries);
+        if (e.owned) col_rel_destroy(e.rel);
+    }
+    col_rel_destroy(unowned);
+    if (source_owned) col_rel_destroy(source);
+    if (source_governor) wl_columnar_memory_governor_ref_release(
+            source_governor);
+    if (pool) delta_pool_destroy(pool);
+    if (failure) {
+        FAIL(failure);
+    }
+    PASS();
+#undef CONS_TS_CHECK
+}
+
+static void
+test_timestamp_cons_governor_denial(void)
+{
+    TEST("timestamp CONS borrowed clone admission denial retains entry");
+    col_rel_t *source = col_rel_new_auto("governed_source", 1);
+    wl_columnar_memory_governor_ref_t *denied = NULL, *allowed = NULL;
+    wl_col_session_t sess = { 0 };
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    const char *failure = NULL;
+#define GOV_CHECK(c, m) do { if (!(c)) { failure = m; goto cleanup; \
+                             } } while (0)
+    GOV_CHECK(source && col_rel_enable_timestamps(source) == 0, "source");
+    int64_t value = 42;
+    GOV_CHECK(col_rel_append_row(source, &value) == 0, "append");
+    source->timestamps[0] = kway_timestamp(7);
+    GOV_CHECK(eval_stack_push(&stack, source, false) == 0, "stack");
+    denied = test_consolidate_governor_create(1);
+    GOV_CHECK(denied, "denied governor");
+    sess.memory_governor = denied;
+    eval_entry_t *entry = &stack.items[stack.top - 1];
+    GOV_CHECK(col_op_consolidate(&stack, &sess) == ENOMEM
+        && stack.top == 1 && entry->rel == source && !entry->owned
+        && source->nrows == 1 && source->timestamps[0].iteration == 8,
+        "denial lost borrowed entry");
+    GOV_CHECK(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(denied)) == 0,
+        "denial reservation leak");
+    wl_columnar_memory_governor_ref_release(denied);
+    denied = NULL;
+    allowed = test_consolidate_governor_create(UINT64_C(1) << 30);
+    GOV_CHECK(allowed, "allowed governor");
+    sess.memory_governor = allowed;
+    GOV_CHECK(col_op_consolidate(&stack, &sess) == 0
+        && stack.top == 1 && stack.items[0].owned
+        && stack.items[0].rel->memory_governor == allowed,
+        "governed retry");
+cleanup:
+    while (stack.top) {
+        eval_entry_t e = eval_stack_pop(&stack);
+        free(e.seg_boundaries);
+        if (e.owned) col_rel_destroy(e.rel);
+    }
+    col_rel_destroy(source);
+    if (denied) wl_columnar_memory_governor_ref_release(denied);
+    if (allowed) wl_columnar_memory_governor_ref_release(allowed);
+    if (failure) FAIL(failure); else PASS();
+#undef GOV_CHECK
+}
+
 int
 main(void)
 {
@@ -2012,6 +2209,14 @@ main(void)
     test_hash_heuristic_fallback_succeeds();
     test_k16_workspace_is_preallocated();
     test_float_insertion_workspace();
+    for (unsigned ownership = 0; ownership < 3; ownership++) {
+        for (unsigned route = 0; route < 5; route++)
+            test_timestamp_cons_entry(ownership, route, 0);
+        test_timestamp_cons_entry(ownership, 2, 1);
+        test_timestamp_cons_entry(ownership, 2, 2);
+        test_timestamp_cons_entry(ownership, 0, 2);
+    }
+    test_timestamp_cons_governor_denial();
     test_timestamp_set_merge(1, 34, 0, false, false);
     test_timestamp_set_merge(2, 34, 0, false, false);
     test_timestamp_set_merge(3, 34, 0, false, true);
