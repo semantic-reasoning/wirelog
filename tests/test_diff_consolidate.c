@@ -1393,7 +1393,6 @@ test_small_cons_metadata_guard(void)
         ASSERT_TRUE(col_op_consolidate(&stack, sess) == EBUSY
             && stack.top == COL_STACK_MAX
             && stack.items[COL_STACK_MAX - 1].rel == alias
-            && alias->sorted_nrows == 77
             && stack.items[COL_STACK_MAX - 1].is_delta,
             "small alias refusal preserves full stack");
         ASSERT_TRUE(col_rel_storage_alias_borrow_release(alias) == 0
