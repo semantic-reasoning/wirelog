@@ -700,11 +700,12 @@ test_blocked_kway_merge_retains_boundaries(void)
         }
         ASSERT_TRUE(eval_stack_push(&stack, rel, true) == 0,
             "k-way stack push");
-        boundaries = malloc(3 * sizeof(*boundaries));
+        boundaries = malloc(4 * sizeof(*boundaries));
         ASSERT_TRUE(boundaries != NULL, "k-way boundary allocation");
         boundaries[0] = 0;
         boundaries[1] = 2;
         boundaries[2] = 4;
+        boundaries[3] = 4;
         stack.items[COL_STACK_MAX - 1].seg_boundaries = boundaries;
         stack.items[COL_STACK_MAX - 1].seg_count = 2;
         ASSERT_TRUE(col_rel_source_reader_acquire(rel, &reader) == 0,
