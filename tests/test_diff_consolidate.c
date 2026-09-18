@@ -698,7 +698,7 @@ test_blocked_kway_merge_retains_boundaries(void)
                 stack.items[0].seg_boundaries[1] = 1;
             }
         }
-        ASSERT_TRUE(eval_stack_push(&stack, rel, owned != 0) == 0,
+        ASSERT_TRUE(eval_stack_push(&stack, rel, true) == 0,
             "k-way stack push");
         boundaries = malloc(4 * sizeof(*boundaries));
         ASSERT_TRUE(boundaries != NULL, "k-way boundary allocation");
@@ -1344,7 +1344,7 @@ test_small_cons_metadata_guard(void)
                 rel->run_ends[1] = rel->nrows;
                 bounds[0] = 0; bounds[1] = rel->nrows;
                 eval_stack_init(&stack);
-                ASSERT_TRUE(eval_stack_push(&stack, rel, true) == 0,
+                ASSERT_TRUE(eval_stack_push(&stack, rel, owned != 0) == 0,
                     "small relation push");
                 stack.items[0].seg_boundaries = bounds;
                 stack.items[0].seg_count = 1;
