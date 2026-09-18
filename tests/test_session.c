@@ -4736,12 +4736,24 @@ cleanup:
 #undef AGG_CHECK
 }
 
+/* Use the repository's 64-bit CAS abstraction: MSVC has no C11 atomic
+ * qualifier, atomic_uint, or generic atomic_fetch_or shim. */
+static void
+record_actual_worker(wl_atomic_u64 *workers, uint32_t worker_id)
+{
+    uint64_t expected = atomic_load_explicit(workers, memory_order_relaxed);
+    uint64_t bit = UINT64_C(1) << worker_id;
+    while (!atomic_compare_exchange_weak_explicit(workers, &expected,
+        expected | bit, memory_order_relaxed, memory_order_relaxed)) {
+    }
+}
+
 static wl_columnar_source_access_reader_t aggregate_public_reader;
 static col_rel_t *aggregate_public_target;
 static col_rel_t *aggregate_public_alias;
 static bool aggregate_public_hold_alias;
 static int aggregate_public_hook_rc;
-static _Atomic uint32_t aggregate_public_workers;
+static wl_atomic_u64 aggregate_public_workers;
 extern void (*wl_columnar_eval_test_outbound_after_plan)(wl_col_session_t *,
     eval_stack_t *, eval_entry_t *);
 
@@ -4752,7 +4764,7 @@ observe_aggregate_worker(wl_col_session_t *worker, eval_stack_t *stack,
     (void)stack;
     (void)result;
     if (worker->coordinator)
-        atomic_fetch_or(&aggregate_public_workers, 1u << worker->worker_id);
+        record_actual_worker(&aggregate_public_workers, worker->worker_id);
 }
 
 static void
@@ -4824,7 +4836,7 @@ test_aggregate_public_retry(uint32_t workers, bool alias_reader)
     }
     PUBLIC_AGG_CHECK(wl_session_insert(session, "input", values, 65536, 2) == 0,
         "public aggregate insert");
-    atomic_store(&aggregate_public_workers, 0);
+    atomic_store_explicit(&aggregate_public_workers, 0, memory_order_relaxed);
     wl_columnar_eval_test_outbound_after_plan = observe_aggregate_worker;
     wl_columnar_eval_serial_test_before_aggregate = hold_aggregate_publication;
     int rc = wl_session_snapshot(session, collect_tuple, &tuples);
@@ -4835,7 +4847,8 @@ test_aggregate_public_retry(uint32_t workers, bool alias_reader)
         && tuples.count == 0, "public final aggregate refusal");
     if (workers > 1)
         PUBLIC_AGG_CHECK(sess->tdd_executed_strata == 1
-            && atomic_load(&aggregate_public_workers) == (1u << workers) - 1u,
+            && atomic_load_explicit(&aggregate_public_workers,
+            memory_order_relaxed) == (1u << workers) - 1u,
             "actual aggregate workers");
     PUBLIC_AGG_CHECK(col_session_get_arrangement(session, "output", &key, 1),
         "held target arrangement");
@@ -4898,7 +4911,7 @@ cleanup:
 #undef PUBLIC_AGG_CHECK
 }
 
-static _Atomic uint32_t schema_parity_workers;
+static wl_atomic_u64 schema_parity_workers;
 
 static void
 observe_schema_parity_worker(wl_col_session_t *worker, eval_stack_t *stack,
@@ -4907,7 +4920,7 @@ observe_schema_parity_worker(wl_col_session_t *worker, eval_stack_t *stack,
     (void)stack;
     (void)result;
     if (worker->coordinator)
-        atomic_fetch_or(&schema_parity_workers, 1u << worker->worker_id);
+        record_actual_worker(&schema_parity_workers, worker->worker_id);
 }
 
 static void
@@ -4951,12 +4964,13 @@ test_parallel_schema_parity(uint32_t workers, bool typed, bool existing)
             "empty existing output");
         unowned = NULL;
     }
-    atomic_store(&schema_parity_workers, 0);
+    atomic_store_explicit(&schema_parity_workers, 0, memory_order_relaxed);
     wl_columnar_eval_serial_test_after_plan = observe_schema_parity_worker;
     int step_rc = wl_session_step(session);
     wl_columnar_eval_serial_test_after_plan = NULL;
     PARITY_CHECK(step_rc == 0
-        && atomic_load(&schema_parity_workers) == (1u << workers) - 1u,
+        && atomic_load_explicit(&schema_parity_workers,
+        memory_order_relaxed) == (1u << workers) - 1u,
         "clean actual parallel step");
     col_rel_t *result = session_find_rel(coord, "output");
     PARITY_CHECK(result && result->nrows == 1
@@ -6692,7 +6706,7 @@ static col_rel_t *global_publication_held, *global_publication_alias;
 static wl_columnar_source_access_reader_t global_publication_reader;
 static uint64_t global_publication_view, global_publication_storage;
 static uint32_t global_publication_rows;
-static atomic_uint global_publication_workers;
+static wl_atomic_u64 global_publication_workers;
 
 static void
 global_publication_worker(wl_col_session_t *worker, eval_stack_t *stack,
@@ -6701,7 +6715,7 @@ global_publication_worker(wl_col_session_t *worker, eval_stack_t *stack,
     (void)stack;
     (void)result;
     if (worker->tdd_outbound_only_active && worker->diff_operators_active)
-        atomic_fetch_or(&global_publication_workers, 1u << worker->worker_id);
+        record_actual_worker(&global_publication_workers, worker->worker_id);
 }
 
 static int
@@ -6804,7 +6818,7 @@ test_global_read_publication(uint32_t workers, unsigned initial,
     global_publication_hit = false;
     global_publication_held = global_publication_alias = NULL;
     memset(&global_publication_reader, 0, sizeof(global_publication_reader));
-    atomic_store(&global_publication_workers, 0);
+    atomic_store_explicit(&global_publication_workers, 0, memory_order_relaxed);
 #define GLOBAL_CHECK(condition, message) \
         do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
     GLOBAL_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
@@ -6840,10 +6854,13 @@ test_global_read_publication(uint32_t workers, unsigned initial,
     wl_columnar_eval_test_outbound_after_plan = global_publication_worker;
     wl_columnar_eval_test_global_publication = global_publication_boundary;
     int rc = wl_session_snapshot(session, collect_tuple, &tuples);
+#ifdef WL_TEST_ALLOC_WRAP
     fail_next_alloc = false;
+#endif
     idb_restore_budget(coord);
     GLOBAL_CHECK(global_publication_hit && global_publication_hook_rc == 0
-        && atomic_load(&global_publication_workers) == (1u << workers) - 1,
+        && atomic_load_explicit(&global_publication_workers,
+        memory_order_relaxed) == (1u << workers) - 1,
         "actual global-read boundary and workers");
     if (mode != 0) {
         GLOBAL_CHECK(rc == (mode <= 3 ? EBUSY : mode == 8 ? ENOSPC : ENOMEM) &&
@@ -6896,7 +6913,9 @@ test_global_read_publication(uint32_t workers, unsigned initial,
 cleanup:
     wl_columnar_eval_test_global_publication = NULL;
     wl_columnar_eval_test_outbound_after_plan = NULL;
+#ifdef WL_TEST_ALLOC_WRAP
     fail_next_alloc = false;
+#endif
     if (session) idb_restore_budget(COL_SESSION(session));
     if (global_publication_reader.owner)
         (void)col_rel_source_reader_release(&global_publication_reader);
@@ -8513,11 +8532,17 @@ main(void)
         for (unsigned initial = 0; initial < 3; initial++)
             test_global_read_publication(workers, initial, 0, 0, false);
         for (unsigned mode = 1; mode <= 8; mode++) {
+#ifndef WL_TEST_ALLOC_WRAP
+            if (mode == 4 || mode == 5)
+                continue;
+#endif
             test_global_read_publication(workers, 1, mode, 0, false);
             test_global_read_publication(workers, 1, mode, 1, false);
         }
+#ifdef WL_TEST_ALLOC_WRAP
         test_global_read_publication(workers, 0, 9, 0, false);
         test_global_read_publication(workers, 0, 9, 1, false);
+#endif
         test_global_read_publication(workers, 1, 0, 1, true);
         test_global_read_publication(workers, 1, 1, 1, true);
         test_global_read_publication(workers, 1, 3, 1, true);
