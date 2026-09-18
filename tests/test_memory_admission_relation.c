@@ -703,9 +703,86 @@ test_cow_ledger_reconcile_is_exact_once(void)
         col_rel_destroy(source);
 }
 
+static void
+test_governed_pool_clone_fallback(void)
+{
+    for (unsigned route = 0; route < 3; route++) {
+        wl_columnar_memory_resolution_t resolution;
+        make_resolution(&resolution, 1024 * 1024);
+        wl_columnar_memory_governor_ref_t *ref =
+            wl_columnar_memory_governor_ref_create(&resolution);
+        CHECK(ref != NULL, "clone governor setup");
+        if (!ref) continue;
+        wl_columnar_memory_governor_t *g =
+            wl_columnar_memory_governor_ref_get(ref);
+        delta_pool_t *pool = route ?
+            delta_pool_create_managed(1, sizeof(col_rel_t), 64, g) : NULL;
+        col_rel_t *src = col_rel_new_auto("source", 1);
+        col_rel_t *occupied = NULL, *clone = NULL;
+        CHECK(src && (!route || pool), "clone fixture setup");
+        if (!src || (route && !pool)) goto cleanup;
+        int64_t value = 42;
+        CHECK(col_rel_append_row(src, &value) == 0, "source seed");
+        CHECK(col_rel_enable_timestamps(src) == 0, "source timestamp mode");
+        if (route == 2) {
+            occupied = col_rel_pool_new_like(pool, "occupied", src);
+            CHECK(occupied && occupied->pool_owned, "actual pool exhaustion");
+            if (!occupied) goto cleanup;
+        }
+        uint64_t baseline = wl_columnar_memory_reserved(g);
+        uint64_t payload = (uint64_t)COL_REL_INIT_CAP * sizeof(int64_t);
+        uint32_t used = pool ? pool->slot_used : 0;
+        atomic_store_explicit(&g->usable_bytes, baseline + payload - 1,
+            memory_order_release);
+        clone = wl_columnar_relation_pool_new_like_governed(pool, "denied", src,
+                ref);
+        CHECK(!clone, "constructor cannot escape admission via fallback");
+        CHECK(!pool || pool->slot_used == used, "failed slot restored");
+        CHECK(wl_columnar_memory_reserved(g) == baseline,
+            "failed reservation restored");
+        if (clone) goto cleanup;
+        atomic_store_explicit(&g->usable_bytes, baseline + payload,
+            memory_order_release);
+        clone = wl_columnar_relation_pool_new_like_governed(pool, "retry", src,
+                ref);
+        CHECK(clone && clone->memory_governor == ref,
+            "effective governor retained");
+        if (!clone) goto cleanup;
+        CHECK(clone->pool_owned == (route == 1), "expected pool or heap route");
+        CHECK(!clone->timestamps, "legacy timestamp mode unchanged");
+        CHECK(col_rel_enable_timestamps(clone) != 0 && !clone->timestamps,
+            "timestamp admission refusal");
+        for (uint32_t i = 0; i < COL_REL_INIT_CAP; i++)
+            CHECK(col_rel_append_row(clone, &value) == 0,
+                "fill admitted capacity");
+        CHECK(col_rel_append_row(clone, &value) != 0
+            && clone->nrows == COL_REL_INIT_CAP,
+            "growth denial preserves rows");
+        atomic_store_explicit(&g->usable_bytes, 1024 * 1024,
+            memory_order_release);
+        CHECK(col_rel_enable_timestamps(clone) == 0
+            && col_rel_append_row(clone, &value) == 0,
+            "timestamp and growth retry");
+        CHECK(src->nrows == 1 && src->columns[0][0] == value,
+            "source unchanged");
+        col_rel_destroy(clone); clone = NULL;
+        CHECK(wl_columnar_memory_reserved(g) == baseline,
+            "clone reservation balanced");
+cleanup:
+        col_rel_destroy(clone);
+        col_rel_destroy(occupied);
+        col_rel_destroy(src);
+        delta_pool_destroy(pool);
+        CHECK(wl_columnar_memory_reserved(g) == 0,
+            "slab and payload charged once and released");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
 int
 main(void)
 {
+    test_governed_pool_clone_fallback();
     test_cow_exact_fit_and_denial();
     test_cow_multi_column_cleanup();
     test_append_transitions();

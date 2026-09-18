@@ -2562,6 +2562,14 @@ wl_columnar_eval_test_tdd_free_saved(const wl_plan_stratum_t *sp,
 col_rel_t *
 col_rel_pool_new_like(delta_pool_t *pool, const char *name,
     const col_rel_t *like);
+
+/* Explicit admission for heap payloads, including every pool fallback.
+ * Like the legacy constructor, does not enable timestamp mode. Pool slab
+ * accounting remains separate; NULL governor retains unmanaged semantics. */
+col_rel_t *wl_columnar_relation_pool_new_like_governed(delta_pool_t *pool,
+    const char *name, const col_rel_t *like,
+    wl_columnar_memory_governor_ref_t *governor);
+
 /*
  * col_rel_deep_copy (Issue #553):
  * Produce a fully independent deep copy of `src`.  Unlike col_rel_new_like

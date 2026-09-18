@@ -3889,12 +3889,13 @@ wl_columnar_relation_new_like_governed(const char *name, const col_rel_t *src,
  * internals. */
 static col_rel_t *
 col_rel_pool_fallback_like(delta_pool_t *pool, col_rel_t *r,
-    const char *name, const col_rel_t *like)
+    const char *name, const col_rel_t *like,
+    wl_columnar_memory_governor_ref_t *governor)
 {
     col_rel_free_contents(r);
     if (pool->slot_used > 0)
         pool->slot_used--;
-    return col_rel_new_like(name, like);
+    return wl_columnar_relation_new_like_impl(name, like, governor, false);
 }
 
 static col_rel_t *
@@ -3908,15 +3909,16 @@ col_rel_pool_fallback_auto(delta_pool_t *pool, col_rel_t *r,
 }
 
 col_rel_t *
-col_rel_pool_new_like(delta_pool_t *pool, const char *name,
-    const col_rel_t *like)
+wl_columnar_relation_pool_new_like_governed(delta_pool_t *pool,
+    const char *name,
+    const col_rel_t *like, wl_columnar_memory_governor_ref_t *governor)
 {
     /* Issue #1140: reject before delta_pool_alloc_slot() so a rejected call
      * does not burn a pool slot. */
     if (!like)
         return NULL;
     if (!pool)
-        return col_rel_new_like(name, like); /* Fallback to malloc */
+        return wl_columnar_relation_new_like_impl(name, like, governor, false); /* Fallback to malloc */
     /* Reserve the identity before consuming a slab slot.  The allocator is
      * deliberately non-wrapping; exhaustion is a hard rejection and must
      * not make a subsequent valid pool allocation appear exhausted. */
@@ -3926,37 +3928,47 @@ col_rel_pool_new_like(delta_pool_t *pool, const char *name,
             return NULL;
         col_rel_t *r = (col_rel_t *)delta_pool_alloc_slot(pool);
         if (!r)
-            return col_rel_new_like(name, like);
+            return wl_columnar_relation_new_like_impl(name, like, governor,
+                       false);
         r->pool_owned = true;
         r->relation_identity = identity;
         r->view_generation = 1u;
         r->storage_generation = 1u;
         col_rel_storage_owner_init(r);
         wl_columnar_memory_reservation_init(&r->retained_reservation);
+        if (governor && col_rel_attach_memory_governor(r, governor) != 0)
+            return col_rel_pool_fallback_like(pool, r, name, like, governor);
         r->name = wl_strdup(name);
         if (!r->name) {
-            return col_rel_pool_fallback_like(pool, r, name, like);
+            return col_rel_pool_fallback_like(pool, r, name, like, governor);
         }
         if (col_rel_set_schema(r, like->ncols,
             (const char *const *)like->col_names) != 0)
-            return col_rel_pool_fallback_like(pool, r, name, like);
+            return col_rel_pool_fallback_like(pool, r, name, like, governor);
         r->declared_ncols = like->declared_ncols;
         r->has_graph_column = like->has_graph_column;
         r->graph_col_idx = like->graph_col_idx;
         if (like->column_types
             && col_rel_set_column_types(r, like->column_types,
             like->ncols) != 0) {
-            return col_rel_pool_fallback_like(pool, r, name, like);
+            return col_rel_pool_fallback_like(pool, r, name, like, governor);
         }
         if (like->compound_kind != WIRELOG_COMPOUND_KIND_NONE
             && (!like->compound_arity_map || like->ncols == 0u
             || col_rel_clone_compound_meta(r, like) != 0))
-            return col_rel_pool_fallback_like(pool, r, name, like);
+            return col_rel_pool_fallback_like(pool, r, name, like, governor);
         r->nrows = 0;
         return r;
     }
     /* Pool exhausted: retain the historical heap fallback. */
-    return col_rel_new_like(name, like);
+    return wl_columnar_relation_new_like_impl(name, like, governor, false);
+}
+
+col_rel_t *
+col_rel_pool_new_like(delta_pool_t *pool, const char *name,
+    const col_rel_t *like)
+{
+    return wl_columnar_relation_pool_new_like_governed(pool, name, like, NULL);
 }
 
 col_rel_t *
