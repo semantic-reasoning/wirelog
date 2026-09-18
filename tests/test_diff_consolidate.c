@@ -1415,41 +1415,40 @@ test_small_cons_metadata_guard(void)
             && stack.items[0].is_delta
             && eval_stack_drain(&stack) == 0, "small differential alias retry");
     }
-}
-{
-    col_rel_t *owned = col_rel_new_auto("small-owned-noop", 1);
-    eval_stack_t stack; wl_columnar_source_access_reader_t reader = { 0 };
-    int64_t v = 6;
-    ASSERT_TRUE(owned != NULL && col_rel_append_row(owned, &v) == 0,
-        "small owned no-op fixture");
-    owned->sorted_nrows = 1; owned->run_count = 1; owned->run_ends[0] = 1;
-    eval_stack_init(&stack);
-    ASSERT_TRUE(eval_stack_push(&stack, owned, true) == 0
-        && col_rel_source_reader_acquire(owned, &reader) == 0
-        && col_op_consolidate(&stack, sess) == 0
-        && stack.items[0].rel == owned,
-        "small owned canonical no-op with reader");
-    ASSERT_TRUE(col_rel_source_reader_release(&reader) == 0
-        && eval_stack_drain(&stack) == 0, "small owned no-op cleanup");
-}
-{
-    col_rel_t *borrowed = col_rel_new_auto("small-borrowed-noop", 1);
-    eval_stack_t stack;
-    int64_t v = 4;
-    ASSERT_TRUE(borrowed != NULL && col_rel_append_row(borrowed, &v) == 0,
-        "small borrowed fixture");
-    borrowed->sorted_nrows = 1; borrowed->run_count = 1;
-    borrowed->run_ends[0] = 1;
-    eval_stack_init(&stack);
-    ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0
-        && col_op_consolidate(&stack, sess) == 0
-        && stack.items[0].rel == borrowed && !stack.items[0].owned,
-        "small borrowed canonical no-op");
-    ASSERT_TRUE(eval_stack_drain(&stack) == 0, "small borrowed cleanup");
-    col_rel_destroy(borrowed);
-}
-destroy_mock_session(sess);
-PASS;
+    {
+        col_rel_t *owned = col_rel_new_auto("small-owned-noop", 1);
+        eval_stack_t stack; wl_columnar_source_access_reader_t reader = { 0 };
+        int64_t v = 6;
+        ASSERT_TRUE(owned != NULL && col_rel_append_row(owned, &v) == 0,
+            "small owned no-op fixture");
+        owned->sorted_nrows = 1; owned->run_count = 1; owned->run_ends[0] = 1;
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, owned, true) == 0
+            && col_rel_source_reader_acquire(owned, &reader) == 0
+            && col_op_consolidate(&stack, sess) == 0
+            && stack.items[0].rel == owned,
+            "small owned canonical no-op with reader");
+        ASSERT_TRUE(col_rel_source_reader_release(&reader) == 0
+            && eval_stack_drain(&stack) == 0, "small owned no-op cleanup");
+    }
+    {
+        col_rel_t *borrowed = col_rel_new_auto("small-borrowed-noop", 1);
+        eval_stack_t stack;
+        int64_t v = 4;
+        ASSERT_TRUE(borrowed != NULL && col_rel_append_row(borrowed, &v) == 0,
+            "small borrowed fixture");
+        borrowed->sorted_nrows = 1; borrowed->run_count = 1;
+        borrowed->run_ends[0] = 1;
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0
+            && col_op_consolidate(&stack, sess) == 0
+            && stack.items[0].rel == borrowed && !stack.items[0].owned,
+            "small borrowed canonical no-op");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "small borrowed cleanup");
+        col_rel_destroy(borrowed);
+    }
+    destroy_mock_session(sess);
+    PASS;
 }
 
 int
