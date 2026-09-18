@@ -1015,7 +1015,10 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
             || col_rel_row_cmp_raw(rel, heap[0].cursor, last_row, nc) != 0) {
             col_rel_row_copy_out(rel, heap[0].cursor,
                 merged + (size_t)out * nc);
-            if (merged_timestamps)
+            /* Test the source too: clang-analyzer cannot follow that
+             * merged_timestamps is allocated only when rel->timestamps is
+             * non-NULL, because the link runs through timestamp_bytes. */
+            if (merged_timestamps && rel->timestamps)
                 merged_timestamps[out] = rel->timestamps[heap[0].cursor];
             last_row = merged + (size_t)out * nc;
             out++;
@@ -1037,7 +1040,7 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
     /* Scatter flat merged buffer back into column-major */
     for (uint32_t r = 0; r < out; r++)
         col_rel_row_copy_in_raw(rel, r, merged + (size_t)r * nc);
-    if (merged_timestamps)
+    if (merged_timestamps && rel->timestamps)
         memcpy(rel->timestamps, merged_timestamps,
             (size_t)out * sizeof(*merged_timestamps));
     rel->nrows = out;
