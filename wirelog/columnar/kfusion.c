@@ -39,7 +39,8 @@ col_kfusion_drain(eval_stack_t *stack, wl_col_session_t *sess,
     if (drain_rc != 0) {
         fprintf(stderr, "wirelog: K-Fusion stack cleanup failed: %d\n",
             drain_rc);
-        abort();
+        if (primary_rc == 0)
+            primary_rc = drain_rc;
     }
     return primary_rc;
 }
