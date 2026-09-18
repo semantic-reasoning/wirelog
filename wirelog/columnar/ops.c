@@ -767,6 +767,7 @@ col_op_reduce_weighted(const col_rel_t *src, col_rel_t *dst)
     dst->columns = new_columns;
     dst->col_shared = NULL;
     dst->timestamps = new_timestamps;
+    dst->timestamp_capacity = 1;
     dst->arena_owned = false;
     dst->ncols = ncols;
     dst->capacity = 1;

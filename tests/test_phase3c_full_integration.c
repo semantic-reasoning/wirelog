@@ -227,6 +227,7 @@ test_rel_append_row_mult(col_rel_t *r, const int64_t *row, uint32_t iter,
         if (!nt)
             return -1;
         r->timestamps = nt;
+        r->timestamp_capacity = cap;
         r->capacity = cap;
     }
 

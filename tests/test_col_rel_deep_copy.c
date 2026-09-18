@@ -375,6 +375,7 @@ test_timestamps_round_trip(void)
      * here we wire it up directly to keep the test self-contained. */
     src->timestamps = (col_delta_timestamp_t *)calloc(src->capacity,
             sizeof(col_delta_timestamp_t));
+    src->timestamp_capacity = src->timestamps ? src->capacity : 0;
     ASSERT(src->timestamps != NULL, "calloc src timestamps failed");
     for (uint32_t i = 0; i < src->nrows; i++) {
         src->timestamps[i].iteration = i + 1u;
