@@ -805,6 +805,123 @@ main(void)
                 WL_COLUMNAR_EXPR_EXTENSION_MALFORMED);
     }
 
+    /* FILTER preserves complete selected-row timestamp records. */
+    {
+        wl_col_session_t filter_session = { 0 };
+        col_rel_t *input = col_rel_new_auto("input", 1);
+        eval_stack_t filter_stack;
+        wl_plan_op_t filter_op = { 0 };
+        uint8_t filter_buf[64];
+        uint32_t filter_size = put_var(filter_buf, 0);
+        filter_buf[filter_size++] = (uint8_t)WL_PLAN_EXPR_CONST_INT;
+        memset(filter_buf + filter_size, 0, sizeof(int64_t));
+        filter_size += sizeof(int64_t);
+        filter_buf[filter_size++] = (uint8_t)WL_PLAN_EXPR_CMP_GT;
+        int64_t values[] = { 0, 7, 0, 9 };
+        int filter_rc;
+
+        filter_session.base.extension_snapshot = snapshot;
+        callback_mode = 0;
+        failures += check(input && col_rel_enable_timestamps(input) == 0,
+                "timestamped filter input");
+        for (uint32_t i = 0; input && i < 4; i++) {
+            failures += check(col_rel_append_row(input, &values[i]) == 0,
+                    "timestamped filter input row");
+            if (input->timestamps)
+                input->timestamps[i] = (col_delta_timestamp_t){
+                    .iteration = i + 10, .stratum = i + 20,
+                    .worker = i + 30, .multiplicity = i == 1 ? -3 : 7
+                };
+        }
+        filter_op.filter_expr.data = filter_buf;
+        filter_op.filter_expr.size = filter_size;
+        eval_stack_init(&filter_stack);
+        if (input)
+            eval_stack_push(&filter_stack, input, true);
+        filter_rc = input ? wl_columnar_filter_op(&filter_op, &filter_stack,
+                &filter_session) : ENOMEM;
+        failures += check(filter_rc == 0 && filter_stack.top == 1,
+                "timestamped filter execution");
+        if (filter_stack.top == 1) {
+            eval_entry_t filtered = eval_stack_pop(&filter_stack);
+            failures += check(filtered.rel->timestamps != NULL
+                    && filtered.rel->nrows == 2
+                    && filtered.rel->columns[0][0] == 7
+                    && filtered.rel->columns[0][1] == 9
+                    && filtered.rel->timestamps[0].iteration == 11
+                    && filtered.rel->timestamps[0].multiplicity == -3
+                    && filtered.rel->timestamps[1].iteration == 13
+                    && filtered.rel->timestamps[1].worker == 33
+                    && filtered.rel->timestamps[1].multiplicity == 7,
+                    "selected rows retain exact timestamps");
+            if (filtered.owned)
+                col_rel_destroy(filtered.rel);
+        }
+        while (filter_stack.top > 0) {
+            eval_entry_t leftover = eval_stack_pop(&filter_stack);
+            if (leftover.owned)
+                col_rel_destroy(leftover.rel);
+        }
+    }
+
+    /* A real extension call forces the timestamped slow/bytecode path. */
+    {
+        wl_col_session_t filter_session = { 0 };
+        col_rel_t *input = col_rel_new_auto("extension-input", 1);
+        eval_stack_t filter_stack;
+        wl_plan_op_t filter_op = { 0 };
+        uint8_t filter_buf[64];
+        uint32_t filter_size = put_bool(filter_buf, 0, 1);
+        int filter_rc;
+
+        filter_size = put_call(filter_buf, filter_size, "test.pred", 1);
+        filter_session.base.extension_snapshot = snapshot;
+        failures += check(input && col_rel_enable_timestamps(input) == 0,
+                "extension timestamped input");
+        for (uint32_t i = 0; input && i < 9; i++) {
+            int64_t value = (int64_t)i + 1;
+            failures += check(col_rel_append_row(input, &value) == 0,
+                    "extension timestamped input row");
+            if (input)
+                input->timestamps[i] = (col_delta_timestamp_t){
+                    .iteration = i + 40, .stratum = i + 50,
+                    .worker = i + 60,
+                    .multiplicity = i == 4 ? -9 : (int64_t)i + 1
+                };
+        }
+        filter_op.filter_expr.data = filter_buf;
+        filter_op.filter_expr.size = filter_size;
+        eval_stack_init(&filter_stack);
+        if (input)
+            eval_stack_push(&filter_stack, input, true);
+        callback_mode = 0;
+        filter_rc = input ? wl_columnar_filter_op(&filter_op, &filter_stack,
+                &filter_session) : ENOMEM;
+        failures += check(filter_rc == 0 && filter_stack.top == 1,
+                "extension timestamped filter execution");
+        if (filter_stack.top == 1) {
+            eval_entry_t filtered = eval_stack_pop(&filter_stack);
+            failures += check(filtered.rel->timestamps != NULL
+                    && filtered.rel->nrows == 9,
+                    "extension filter keeps all rows");
+            for (uint32_t i = 0; i < 9 && filtered.rel->timestamps; i++)
+                failures += check(filtered.rel->timestamps[i].iteration ==
+                        i + 40
+                        && filtered.rel->timestamps[i].stratum == i + 50
+                        && filtered.rel->timestamps[i].worker == i + 60
+                        && filtered.rel->timestamps[i].multiplicity
+                        == (i == 4 ? -9 : (int64_t)i + 1),
+                        "extension filter preserves complete timestamp");
+            if (filtered.owned)
+                col_rel_destroy(filtered.rel);
+        }
+        while (filter_stack.top > 0) {
+            eval_entry_t leftover = eval_stack_pop(&filter_stack);
+            if (leftover.owned)
+                col_rel_destroy(leftover.rel);
+        }
+    }
+
     /* Missing addon and wrong arity must not become false. */
     size = put_bool(buf, 0, 1);
     size = put_call(buf, size, "missing.pred", 1);

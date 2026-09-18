@@ -575,6 +575,24 @@ col_filter_select_rows(const int64_t *col_a, const int64_t *col_b,
     return out;
 }
 
+static int
+wl_columnar_filter_append_selected(col_rel_t *out, const col_rel_t *src,
+    uint32_t src_row, const int64_t *row)
+{
+    int rc = col_rel_append_row(out, row);
+    if (rc == 0 && src->timestamps)
+        out->timestamps[out->nrows - 1] = src->timestamps[src_row];
+    return rc;
+}
+
+static int
+wl_columnar_filter_dispose_input(eval_stack_t *stack, eval_entry_t *entry,
+    int primary_rc)
+{
+    int cleanup_rc = eval_stack_dispose_entry(stack, entry);
+    return cleanup_rc != 0 ? cleanup_rc : primary_rc;
+}
+
 int
 wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
@@ -586,9 +604,13 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
 
     col_rel_t *out = col_rel_pool_new_like(sess->delta_pool, "$filter", e.rel);
     if (!out) {
-        if (e.owned)
-            col_rel_destroy(e.rel);
-        return ENOMEM;
+        return wl_columnar_filter_dispose_input(stack, &e, ENOMEM);
+    }
+
+    bool timestamped = e.rel->timestamps != NULL;
+    if (timestamped && col_rel_enable_timestamps(out) != 0) {
+        (void)col_rel_destroy_checked(out);
+        return wl_columnar_filter_dispose_input(stack, &e, ENOMEM);
     }
 
     const uint8_t *buf = op->filter_expr.data;
@@ -608,6 +630,81 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
         const int64_t *col_a = columns[cmp.col_a];
         const int64_t *col_b_ptr = (!cmp.b_is_const && cmp.col_b < ncols)
             ? columns[cmp.col_b] : NULL;
+
+        if (timestamped) {
+            int64_t *row = (int64_t *)malloc((size_t)ncols * sizeof(*row));
+            if (!row) {
+                (void)col_rel_destroy_checked(out);
+                return wl_columnar_filter_dispose_input(stack, &e, ENOMEM);
+            }
+            bool use_selection = false;
+#ifdef __AVX2__
+            use_selection = true;
+#endif
+            if (use_selection) {
+                uint32_t *sel = (uint32_t *)malloc(
+                    ((size_t)COL_FILTER_TILE + COL_FILTER_SEL_SLACK)
+                    * sizeof(*sel));
+                if (!sel) {
+                    free(row);
+                    (void)col_rel_destroy_checked(out);
+                    return wl_columnar_filter_dispose_input(stack, &e,
+                               ENOMEM);
+                }
+                for (uint32_t base = 0; base < nrows;) {
+                    uint32_t chunk = nrows - base;
+                    if (chunk > COL_FILTER_TILE)
+                        chunk = COL_FILTER_TILE;
+                    uint32_t nsel = col_filter_select_rows(col_a + base,
+                            col_b_ptr ? col_b_ptr + base : NULL, cmp.const_b,
+                            chunk, cmp.cmp_op, sel);
+                    if (base == 0 && nsel > chunk - (chunk / 8)) {
+                        use_selection = false;
+                        break;
+                    }
+                    for (uint32_t i = 0; i < nsel; i++) {
+                        uint32_t src_row = base + sel[i];
+                        for (uint32_t c = 0; c < ncols; c++)
+                            row[c] = columns[c][src_row];
+                        int rc = wl_columnar_filter_append_selected(out,
+                                e.rel, src_row, row);
+                        if (rc != 0) {
+                            free(sel);
+                            free(row);
+                            (void)col_rel_destroy_checked(out);
+                            return wl_columnar_filter_dispose_input(stack,
+                                       &e, rc);
+                        }
+                    }
+                    base += chunk;
+                }
+                free(sel);
+            }
+            if (!use_selection) {
+                out->nrows = 0;
+                for (uint32_t r = 0; r < nrows; r++) {
+                    int64_t b_val = col_b_ptr ? col_b_ptr[r] : cmp.const_b;
+                    if (!col_filter_cmp_scalar(col_a[r], b_val, cmp.cmp_op))
+                        continue;
+                    for (uint32_t c = 0; c < ncols; c++)
+                        row[c] = columns[c][r];
+                    int rc = wl_columnar_filter_append_selected(out, e.rel, r,
+                            row);
+                    if (rc != 0) {
+                        free(row);
+                        (void)col_rel_destroy_checked(out);
+                        return wl_columnar_filter_dispose_input(stack, &e, rc);
+                    }
+                }
+            }
+            free(row);
+            int cleanup_rc = wl_columnar_filter_dispose_input(stack, &e, 0);
+            if (cleanup_rc != 0) {
+                (void)col_rel_destroy_checked(out);
+                return cleanup_rc;
+            }
+            return eval_stack_push(stack, out, true);
+        }
 
         /* Pre-allocate output buffer sized for worst-case (all rows pass) */
         size_t cap = (size_t)nrows * ncols;
@@ -739,10 +836,8 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
     col_row_buf_t row_rb;
     if (!col_row_buf_init(&row_rb, e.rel->ncols)) {
         wl_columnar_expr_compiled_free(ce);
-        col_rel_destroy(out);
-        if (e.owned)
-            col_rel_destroy(e.rel);
-        return ENOMEM;
+        (void)col_rel_destroy_checked(out);
+        return wl_columnar_filter_dispose_input(stack, &e, ENOMEM);
     }
 
     int64_t *const row = row_rb.ptr;
@@ -776,33 +871,33 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     sess->extension_expr_status = status;
                 col_row_buf_release(&row_rb);
                 wl_columnar_expr_compiled_free(ce);
-                col_rel_destroy(out);
-                if (e.owned)
-                    col_rel_destroy(e.rel);
+                (void)col_rel_destroy_checked(out);
                 /* A refused string allocation fails the step as a memory
                  * error (Issue #1470). */
-                return status == WL_COLUMNAR_EXPR_ALLOCATION_FAILURE
-                       ? ENOMEM : err;
+                return wl_columnar_filter_dispose_input(stack, &e,
+                           status == WL_COLUMNAR_EXPR_ALLOCATION_FAILURE
+                    ? ENOMEM : err);
             }
             pass = err == WL_COLUMNAR_EXPR_OK && val != 0;
         }
         if (pass) {
-            int rc = col_rel_append_row(out, row);
+            int rc = wl_columnar_filter_append_selected(out, e.rel, r, row);
             if (rc != 0) {
                 col_row_buf_release(&row_rb);
                 wl_columnar_expr_compiled_free(ce);
-                col_rel_destroy(out);
-                if (e.owned)
-                    col_rel_destroy(e.rel);
-                return rc;
+                (void)col_rel_destroy_checked(out);
+                return wl_columnar_filter_dispose_input(stack, &e, rc);
             }
         }
     }
     col_row_buf_release(&row_rb);
     wl_columnar_expr_compiled_free(ce);
 
-    if (e.owned)
-        col_rel_destroy(e.rel);
+    int cleanup_rc = wl_columnar_filter_dispose_input(stack, &e, 0);
+    if (cleanup_rc != 0) {
+        (void)col_rel_destroy_checked(out);
+        return cleanup_rc;
+    }
     return eval_stack_push(stack, out, true);
 }
 

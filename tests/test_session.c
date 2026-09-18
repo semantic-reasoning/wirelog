@@ -69,7 +69,9 @@ __wrap_malloc(size_t size)
 void *
 __wrap_calloc(size_t count, size_t size)
 {
-    if (fail_calloc_size != 0 && count == 1 && size == fail_calloc_size) {
+    if (fail_calloc_size != 0 && size != 0
+        && count <= SIZE_MAX / size
+        && count * size == fail_calloc_size) {
         fail_calloc_size = 0;
         if (release_on_calloc_failure) {
             calloc_reader_release_rc = col_rel_source_reader_release(
@@ -8389,6 +8391,97 @@ cleanup:
 #undef GC_CHECK
 }
 
+#ifdef WL_TEST_ALLOC_WRAP
+static void
+test_filter_timestamp_allocation_failure_retry(void)
+{
+    TEST("FILTER timestamp allocation failure retains held input for retry");
+    col_rel_t *input = col_rel_new_auto("filter-fault", 1);
+    delta_pool_t *pool = NULL;
+    wl_col_session_t sess = { 0 };
+    eval_stack_t stack;
+    wl_plan_op_t op = { 0 };
+    wl_columnar_source_access_reader_t reader = { 0 };
+    bool reader_active = false;
+    const char *failure = NULL;
+    int64_t value = 7;
+    eval_stack_init(&stack);
+
+    if (!input || col_rel_enable_timestamps(input) != 0
+        || col_rel_append_row(input, &value) != 0) {
+        failure = "fixture setup";
+        goto cleanup;
+    }
+    input->timestamps[0] = (col_delta_timestamp_t){
+        .iteration = 71, .stratum = 72, .worker = 73, .multiplicity = -5
+    };
+    if (col_rel_source_reader_acquire(input, &reader) != 0) {
+        failure = "reader acquire";
+        goto cleanup;
+    }
+    reader_active = true;
+    pool = delta_pool_create(4, sizeof(col_rel_t), 4096);
+    if (!pool) {
+        failure = "pool setup";
+        goto cleanup;
+    }
+    sess.delta_pool = pool;
+    if (eval_stack_push(&stack, input, true) != 0) {
+        failure = "stack push";
+        goto cleanup;
+    }
+    fail_calloc_size = input->capacity * sizeof(col_delta_timestamp_t);
+    int rc = wl_columnar_filter_op(&op, &stack, &sess);
+    if (fail_calloc_size != 0 || rc != EBUSY || stack.top != 1) {
+        failure = "timestamp fault did not yield EBUSY/retention";
+        goto cleanup;
+    }
+    eval_entry_t retained = eval_stack_pop(&stack);
+    if (retained.rel != input || !retained.owned
+        || eval_stack_push(&stack, retained.rel, retained.owned) != 0) {
+        failure = "retained input ownership";
+        goto cleanup;
+    }
+    if (col_rel_source_reader_release(&reader) != 0) {
+        failure = "reader release";
+        goto cleanup;
+    }
+    reader_active = false;
+    rc = wl_columnar_filter_op(&op, &stack, &sess);
+    if (rc != 0 || stack.top != 1) {
+        failure = "retry execution";
+        goto cleanup;
+    }
+    eval_entry_t result = eval_stack_pop(&stack);
+    if (!result.rel->timestamps || result.rel->nrows != 1
+        || result.rel->timestamps[0].iteration != 71
+        || result.rel->timestamps[0].stratum != 72
+        || result.rel->timestamps[0].worker != 73
+        || result.rel->timestamps[0].multiplicity != -5)
+        failure = "retry timestamp provenance";
+    if (result.owned)
+        col_rel_destroy(result.rel);
+cleanup:
+    fail_next_alloc = false;
+    fail_calloc_size = 0;
+    if (reader_active)
+        (void)col_rel_source_reader_release(&reader);
+    while (stack.top > 0) {
+        eval_entry_t leftover = eval_stack_pop(&stack);
+        if (leftover.owned)
+            col_rel_destroy(leftover.rel);
+    }
+    if (pool)
+        delta_pool_destroy(pool);
+    if (failure) {
+        FAIL(failure ? failure :
+            "FILTER allocation failure did not retain and retry input");
+        return;
+    }
+    PASS();
+}
+#endif
+
 int
 main(void)
 {
@@ -8642,6 +8735,9 @@ main(void)
 #ifdef WL_TEST_ALLOC_WRAP
     test_snapshot_preseed_failure(1);
     test_snapshot_preseed_failure(2);
+#ifdef WL_TEST_ALLOC_WRAP
+    test_filter_timestamp_allocation_failure_retry();
+#endif
 #endif
     /* GREEN: col_session_remove returns 0 for uninitialized schema */
     /* test_session_snapshot_empty(); */
