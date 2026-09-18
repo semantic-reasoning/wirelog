@@ -1222,7 +1222,7 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
         in->sorted_nrows = nr;
         in->run_count = 1;
         in->run_ends[0] = nr;
-        (void)col_rel_source_writer_release(&writer);
+        (void)wl_columnar_source_access_writer_release(&writer);
         return eval_stack_push(stack, in, e.owned);
     }
 
