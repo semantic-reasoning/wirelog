@@ -288,17 +288,27 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
             goto done;
     } else {
         col_rel_t *source = result->rel;
-        col_rel_t *copy = col_rel_pool_new_like(sess->delta_pool,
-                rp->name, source);
-        if (!copy) {
-            rc = ENOMEM;
-            goto done;
-        }
-        result->rel = copy;
-        result->owned = true;
-        rc = col_rel_append_all(copy, source, sess->eval_arena);
+        wl_columnar_source_access_reader_t reader = { 0 };
+        rc = col_rel_source_reader_acquire(source, &reader);
         if (rc != 0)
             goto done;
+        wl_columnar_memory_governor_ref_t *governor = sess->memory_governor
+            ? sess->memory_governor : source->memory_governor;
+        col_rel_t *copy = wl_columnar_relation_pool_new_like_governed(
+            sess->delta_pool, rp->name, source, governor);
+        if (!copy) {
+            rc = ENOMEM;
+        } else {
+            result->rel = copy;
+            result->owned = true;
+            rc = col_rel_append_all(copy, source, sess->eval_arena);
+        }
+        int release_rc = col_rel_source_reader_release(&reader);
+        if (rc == 0)
+            rc = release_rc;
+        if (rc != 0)
+            goto done;
+
     }
     rc = session_add_rel(sess, result->rel);
     if (rc == 0) {
