@@ -13,6 +13,7 @@
 
 #include "../wirelog/columnar/internal.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -553,6 +554,166 @@ test_float_order(void)
 /* Main                                                                     */
 /* ======================================================================== */
 
+/* Provenance is an independent oracle: duplicate keys retain input order. */
+typedef struct { int64_t key; uint32_t original; } timestamp_sort_oracle_t;
+static int
+timestamp_sort_compare(const void *a, const void *b)
+{
+    const timestamp_sort_oracle_t *x = a, *y = b;
+    if (x->key != y->key)
+        return (x->key > y->key) - (x->key < y->key);
+    return (x->original > y->original) - (x->original < y->original);
+}
+static col_delta_timestamp_t
+timestamp_sort_record(uint32_t row)
+{
+    return (col_delta_timestamp_t){ .iteration = row + 11,
+                                    .stratum = row + 22, .worker = row + 33,
+                                    .multiplicity = row % 2 ? -7 : 9 };
+}
+static bool
+timestamp_sort_equal(col_delta_timestamp_t a, col_delta_timestamp_t b)
+{
+    return a.iteration == b.iteration && a.stratum == b.stratum
+           && a.worker == b.worker && a.multiplicity == b.multiplicity;
+}
+static void
+test_timestamp_sort(uint32_t count, bool prepared, bool floating, bool alias)
+{
+    TEST(
+        "timestamp stable sort: insertion/k8/k16, partial range and workspace");
+    col_rel_t *source = col_rel_new_auto("timestamp", 1);
+    col_rel_t *view = NULL;
+    col_rel_t *r = source;
+    timestamp_sort_oracle_t *expected = calloc(count, sizeof(*expected));
+    wl_columnar_radix_workspace_t workspace = { 0 };
+    wl_columnar_source_access_reader_t reader = { 0 };
+    wl_columnar_source_access_writer_t writer = { 0 };
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    const char *failure = NULL;
+#define TS_CHECK(c, m) do { if (!(c)) { failure = m; goto cleanup; } } while (0)
+    TS_CHECK(source && expected, "fixture allocation");
+    if (floating) {
+        wirelog_column_type_t type = WIRELOG_TYPE_FLOAT;
+        TS_CHECK(col_rel_set_column_types(source, &type, 1) == 0, "float type");
+    }
+    TS_CHECK(col_rel_enable_timestamps(source) == 0, "timestamp allocation");
+    for (uint32_t i = 0; i < count + 2; i++) {
+        int64_t key = i == 0 || i == count + 1 ? 9999
+            : (int64_t)((count - i) % 57) - 28;
+        int64_t value = floating ? wl_columnar_float_to_bits((double)key) : key;
+        TS_CHECK(col_rel_append_row(source, &value) == 0, "append");
+        source->timestamps[i] = timestamp_sort_record(i);
+        if (i > 0 && i <= count)
+            expected[i - 1] = (timestamp_sort_oracle_t){ key, i };
+    }
+    if (alias) {
+        view = col_rel_new_like("view", source);
+        TS_CHECK(view && col_rel_install_shared_view(view, source) == 0,
+            "shared view");
+        r = view;
+    }
+    TS_CHECK(col_rel_source_reader_acquire(r, &reader) == 0, "hold reader");
+    uint64_t generation = r->view_generation;
+    TS_CHECK(col_rel_radix_sort(r, 1, count) == EBUSY
+        && r->view_generation == generation, "held sort must refuse");
+    for (uint32_t i = 0; i < count + 2; i++)
+        TS_CHECK(timestamp_sort_equal(r->timestamps[i],
+            timestamp_sort_record(i)),
+            "refusal provenance unchanged");
+    TS_CHECK(col_rel_source_reader_release(&reader) == 0, "release reader");
+    if (!alias) {
+        wl_columnar_memory_resolution_t resolution = { 0 };
+        resolution.budget_bytes = UINT64_C(1) << 30;
+        resolution.usable_bytes = resolution.budget_bytes;
+        resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+        resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+        resolution.status = WL_COLUMNAR_MEMORY_OK;
+        governor = wl_columnar_memory_governor_ref_create(&resolution);
+        TS_CHECK(governor && col_rel_attach_memory_governor(r, governor) == 0,
+            "governor attachment");
+        wl_columnar_memory_governor_t *g =
+            wl_columnar_memory_governor_ref_get(governor);
+        uint64_t baseline = wl_columnar_memory_reserved(g);
+        atomic_store_explicit(&g->usable_bytes, baseline, memory_order_relaxed);
+        uint32_t bounds[] = { 1, count + 1 };
+        int denied = prepared ? wl_columnar_radix_workspace_prepare(r,
+                bounds, 1, 0, &workspace) : col_rel_radix_sort(r, 1, count);
+        atomic_store_explicit(&g->usable_bytes, resolution.usable_bytes,
+            memory_order_relaxed);
+        TS_CHECK(denied == ENOMEM && wl_columnar_memory_reserved(g) == baseline
+            && r->view_generation == generation,
+            "timestamp scratch denial must preserve state and reservations");
+        for (uint32_t i = 1; i <= count; i++) {
+            int64_t key = (int64_t)((count - i) % 57) - 28;
+            int64_t bits =
+                floating ? wl_columnar_float_to_bits((double)key) : key;
+            TS_CHECK(col_rel_get(r, i, 0) == bits
+                && timestamp_sort_equal(r->timestamps[i],
+                timestamp_sort_record(i)),
+                "denied scratch changed row or timestamp");
+        }
+    }
+    if (prepared) {
+        uint32_t bounds[] = { 1, count + 1 };
+        TS_CHECK(wl_columnar_radix_workspace_prepare(r, bounds, 1, 0,
+            &workspace) == 0, "prepare workspace");
+        TS_CHECK(workspace.timestamps && workspace.timestamp_capacity >= count,
+            "timestamp scratch admitted in workspace");
+        TS_CHECK(col_rel_source_writer_acquire(r, &writer) == 0, "writer");
+        int rc = wl_columnar_relation_radix_sort_with_workspace(r, 1, count,
+                &writer, &workspace);
+        TS_CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+            "release writer");
+        TS_CHECK(rc == 0, "prepared sort");
+    } else {
+        TS_CHECK(col_rel_radix_sort(r, 1, count) == 0, "sort retry");
+    }
+    qsort(expected, count, sizeof(*expected), timestamp_sort_compare);
+    for (uint32_t i = 0; i < count; i++) {
+        int64_t value = floating
+            ? wl_columnar_float_to_bits((double)expected[i].key) :
+            expected[i].key;
+        TS_CHECK(col_rel_get(r, i + 1, 0) == value
+            && timestamp_sort_equal(r->timestamps[i + 1],
+            timestamp_sort_record(expected[i].original)),
+            "row-record association or duplicate stability");
+    }
+    int64_t sentinel = floating ? wl_columnar_float_to_bits(9999.0) : 9999;
+    TS_CHECK(col_rel_get(r, 0, 0) == sentinel
+        && col_rel_get(r, count + 1, 0) == sentinel
+        && timestamp_sort_equal(r->timestamps[0], timestamp_sort_record(0))
+        && timestamp_sort_equal(r->timestamps[count + 1],
+        timestamp_sort_record(count + 1)), "outside range changed");
+    if (alias)
+        for (uint32_t i = 1; i <= count; i++) {
+            int64_t key = (int64_t)((count - i) % 57) - 28;
+            TS_CHECK(col_rel_get(source, i, 0) == key
+                && timestamp_sort_equal(source->timestamps[i],
+                timestamp_sort_record(i)), "COW source changed");
+        }
+cleanup:
+    if (writer.owner)
+        (void)wl_columnar_source_access_writer_release(&writer);
+    if (reader.owner)
+        (void)col_rel_source_reader_release(&reader);
+    wl_columnar_radix_workspace_destroy(&workspace);
+    col_rel_destroy(view);
+    col_rel_destroy(source);
+    free(expected);
+    if (governor) {
+        if (wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(governor)) != 0 && !failure)
+            failure = "sort reservation leak";
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef TS_CHECK
+}
+
 int
 main(void)
 {
@@ -574,6 +735,13 @@ main(void)
     test_k16_boundary();
     test_k16_path();
     test_float_order();
+    for (unsigned prepared = 0; prepared < 2; prepared++) {
+        test_timestamp_sort(16, prepared, false, false);
+        test_timestamp_sort(128, prepared, false, false);
+        test_timestamp_sort(50000, prepared, false, false);
+        test_timestamp_sort(64, prepared, true, false);
+        test_timestamp_sort(128, prepared, false, true);
+    }
 
     printf("\n");
     printf("Passed: %d/%d\n", tests_passed, tests_run);
