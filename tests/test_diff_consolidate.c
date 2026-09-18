@@ -832,6 +832,55 @@ test_blocked_kway_merge_retains_boundaries(void)
         ASSERT_TRUE(eval_stack_drain(&stack) == 0, "append failure drain");
         col_rel_destroy(borrowed);
     }
+    {
+        col_rel_t *borrowed = col_rel_new_auto("plain-append-fail", 1);
+        eval_stack_t stack;
+        uint32_t *bounds = malloc(3 * sizeof(*bounds));
+        int64_t values[] = { 9, 10 };
+        ASSERT_TRUE(borrowed != NULL && bounds != NULL
+            && col_rel_append_row(borrowed, &values[0]) == 0
+            && col_rel_append_row(borrowed, &values[1]) == 0,
+            "plain append failure fixture");
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
+            "plain append failure push");
+        bounds[0] = 0; bounds[1] = 1; bounds[2] = 2;
+        stack.items[0].seg_boundaries = bounds;
+        stack.items[0].seg_count = 2;
+        wl_columnar_merge_test_fail_copy_append = true;
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == ENOMEM
+            && stack.top == 1 && stack.items[0].rel == borrowed
+            && !stack.items[0].owned && stack.items[0].seg_boundaries == bounds,
+            "plain append failure retains source metadata");
+        wl_columnar_merge_test_fail_copy_append = false;
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == 0
+            && stack.items[0].rel != borrowed,
+            "plain append retry succeeds");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "plain append drain");
+        col_rel_destroy(borrowed);
+    }
+    {
+        col_rel_t *borrowed = col_rel_new_auto("plain-merge-fail", 1);
+        eval_stack_t stack;
+        uint32_t *bounds = malloc(3 * sizeof(*bounds));
+        int64_t values[] = { 11, 12 };
+        ASSERT_TRUE(borrowed != NULL && bounds != NULL
+            && col_rel_append_row(borrowed, &values[0]) == 0
+            && col_rel_append_row(borrowed, &values[1]) == 0,
+            "plain merge failure fixture");
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
+            "plain merge failure push");
+        bounds[0] = 0; bounds[1] = 1; bounds[2] = 2;
+        stack.items[0].seg_boundaries = bounds;
+        stack.items[0].seg_count = 3;
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) != 0
+            && stack.top == 1 && stack.items[0].rel == borrowed
+            && !stack.items[0].owned && stack.items[0].seg_boundaries == bounds,
+            "plain merge failure restores borrowed entry");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "plain merge failure drain");
+        col_rel_destroy(borrowed);
+    }
 #endif
     {
         col_rel_t *invalid = col_rel_new_auto("kway-invalid", 1);
