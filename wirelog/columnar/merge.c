@@ -39,8 +39,8 @@
 #endif
 
 #ifdef WL_SESSION_TEST_HOOKS
-bool wl_columnar_consolidate_test_fail_copy_alloc;
-bool wl_columnar_consolidate_test_fail_copy_append;
+bool wl_columnar_merge_test_fail_copy_alloc;
+bool wl_columnar_merge_test_fail_copy_append;
 #endif
 
 static void *
@@ -138,6 +138,12 @@ col_op_cleanup_owned_relation(eval_stack_t *stack, eval_entry_t *entry,
     if (!owned)
         return primary_rc;
     cleanup_rc = col_rel_destroy_checked(rel);
+    if (cleanup_rc == 0) {
+        free(entry->seg_boundaries);
+        entry->seg_boundaries = NULL;
+        entry->seg_count = 0;
+        return primary_rc;
+    }
     if (cleanup_rc != 0) {
         eval_entry_t retained = *entry;
         int push_rc;
@@ -1097,7 +1103,7 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
     if (!work_owned) {
         work =
 #ifdef WL_SESSION_TEST_HOOKS
-            wl_columnar_consolidate_test_fail_copy_alloc
+            wl_columnar_merge_test_fail_copy_alloc
                 ? NULL :
 #endif
             col_rel_pool_new_like(sess->delta_pool, "$consol", in);
@@ -1110,7 +1116,7 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
         }
         int append_rc =
 #ifdef WL_SESSION_TEST_HOOKS
-            wl_columnar_consolidate_test_fail_copy_append
+            wl_columnar_merge_test_fail_copy_append
                 ? ENOMEM :
 #endif
             col_rel_append_all(work, in, NULL);
@@ -1139,6 +1145,20 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
     if (k >= 2 && e.seg_boundaries != NULL) {
         int rc = col_op_consolidate_kway_merge(work, e.seg_boundaries, k);
         if (rc != 0) {
+            if (!e.owned) {
+                int cleanup_rc = col_rel_destroy_checked(work);
+                if (cleanup_rc == 0) {
+                    /* The private copy is gone; retain the original
+                     * borrowed entry and its boundaries for retry. */
+                    (void)eval_stack_repush_entry(stack, &e);
+                } else {
+                    eval_entry_t retained = e;
+                    retained.rel = work;
+                    retained.owned = true;
+                    (void)eval_stack_repush_entry(stack, &retained);
+                }
+                return rc;
+            }
             return col_op_cleanup_owned_relation(stack, &e, work,
                        work_owned, rc);
         }
