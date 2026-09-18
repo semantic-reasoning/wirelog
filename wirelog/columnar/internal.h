@@ -3440,4 +3440,11 @@ void
 arr_hash_rows_batch(const col_rel_t *rel, uint32_t row_begin, uint32_t row_end,
     const uint32_t *key_cols, uint32_t key_count, uint32_t *out_hashes);
 
+#ifdef WL_SESSION_TEST_HOOKS
+/* Test-only seam for exercising MAP input cleanup refusal. */
+extern void (*wl_columnar_ops_test_before_map_dispose)(eval_stack_t *,
+    eval_entry_t *);
+extern bool wl_columnar_ops_test_map_fail_output_alloc;
+#endif
+
 #endif /* WL_COLUMNAR_INTERNAL_H */

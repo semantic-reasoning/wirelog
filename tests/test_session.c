@@ -2713,6 +2713,269 @@ test_session_tc_insert(void)
 /* Main                                                                     */
 /* ======================================================================== */
 
+#ifdef WL_SESSION_TEST_HOOKS
+static bool map_dispose_hook_hit;
+static wl_columnar_source_access_reader_t map_dispose_reader;
+
+static void
+map_dispose_refusal_hook(eval_stack_t *stack, eval_entry_t *entry)
+{
+    col_rel_t *heap = NULL;
+    (void)stack;
+    if (map_dispose_hook_hit || !entry->owned || !entry->rel)
+        return;
+    if (col_rel_deep_copy(entry->rel, &heap, NULL) != 0)
+        return;
+    col_rel_destroy(entry->rel);
+    entry->rel = heap;
+    map_dispose_hook_hit = true;
+    (void)col_rel_source_reader_acquire(entry->rel, &map_dispose_reader);
+}
+
+static void
+test_map_input_cleanup_retry(void)
+{
+    TEST("MAP retains reader-busy input for exact retry");
+    uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
+    uint32_t project[] = { 0 };
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } },
+        { .op = WL_PLAN_OP_MAP, .project_count = 1,
+          .project_indices = project }
+    };
+    wl_plan_relation_t output = { .name = "output", .delta_name = "$d$output",
+                                  .ops = ops, .op_count = 3 };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    int64_t values[] = { 7, 42 };
+    tuple_collector_t tuples = { 0 };
+    const char *failure = NULL;
+#define MAP_CHECK(c, m) do { if (!(c)) { failure = (m); goto map_cleanup; \
+                             } } while (0)
+    map_dispose_hook_hit = false;
+    memset(&map_dispose_reader, 0, sizeof(map_dispose_reader));
+#ifdef WL_SESSION_TEST_HOOKS
+    wl_columnar_ops_test_before_map_dispose = map_dispose_refusal_hook;
+#endif
+    MAP_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1, &session) == 0,
+        "MAP session");
+    MAP_CHECK(wl_session_insert(session, "input", values, 2, 1) == 0,
+        "MAP input");
+    MAP_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == EBUSY
+        && tuples.count == 0 && map_dispose_hook_hit,
+        "MAP refusal");
+    MAP_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == EBUSY
+        && tuples.count == 0, "MAP repeated refusal");
+    MAP_CHECK(col_rel_source_reader_release(&map_dispose_reader) == 0,
+        "MAP reader release");
+    memset(&tuples, 0, sizeof(tuples));
+    MAP_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0
+        && tuples.count == 2
+        && has_tuple(&tuples, "output", (int64_t[]){ 7 }, 1)
+        && has_tuple(&tuples, "output", (int64_t[]){ 42 }, 1),
+        "MAP retry");
+map_cleanup:
+#ifdef WL_SESSION_TEST_HOOKS
+    wl_columnar_ops_test_before_map_dispose = NULL;
+#endif
+    if (map_dispose_reader.owner)
+        (void)col_rel_source_reader_release(&map_dispose_reader);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef MAP_CHECK
+}
+#endif
+
+static void
+test_map_entry_storage_modes(void)
+{
+    TEST("MAP preserves heap/pool/arena entries and lower metadata");
+    wl_plan_relation_t output = { .name = "output", .delta_name = "$d$output" };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1 };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1 };
+    wl_plan_op_t map_op = { .op = WL_PLAN_OP_MAP, .project_count = 1 };
+    wl_session_t *session = NULL;
+    const char *failure = NULL;
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    wl_columnar_source_access_reader_t active_reader = { 0 };
+    col_rel_t *unstacked_input = NULL;
+    col_rel_t *unowned_cleanup = NULL;
+#define STORAGE_CHECK(c, m) \
+        do { if (!(c)) { failure = (m); goto map_storage_cleanup; } } while (0)
+    STORAGE_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0,
+        "MAP storage session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    for (unsigned mode = 0; mode < 3; mode++) {
+        eval_stack_init(&stack);
+        memset(&active_reader, 0, sizeof(active_reader));
+        unstacked_input = NULL;
+        col_rel_t *input = mode == 0 ? col_rel_new_auto("heap", 1)
+            : col_rel_pool_new_auto(coord->delta_pool,
+                mode == 2 ? coord->eval_arena : NULL, "owned", 1);
+        STORAGE_CHECK(input, "MAP storage relation");
+        unstacked_input = input;
+        int64_t value = 42;
+        STORAGE_CHECK(col_rel_append_row(input, &value) == 0,
+            "MAP storage rows");
+        for (unsigned lower_idx = 0; lower_idx < COL_STACK_MAX - 1;
+            lower_idx++) {
+            col_rel_t *lower = col_rel_new_auto("lower", 1);
+            int64_t lower_value = (int64_t)lower_idx;
+            STORAGE_CHECK(lower, "MAP storage lower relation");
+            if (col_rel_append_row(lower, &lower_value) != 0
+                || eval_stack_push(&stack, lower, true) != 0) {
+                col_rel_destroy(lower);
+                failure = "MAP storage stack";
+                goto map_storage_cleanup;
+            }
+            if (lower_idx == 0) {
+                stack.items[0].seg_boundaries =
+                    malloc(2 * sizeof(uint32_t));
+                STORAGE_CHECK(stack.items[0].seg_boundaries,
+                    "MAP lower metadata");
+                stack.items[0].seg_count = 1;
+                stack.items[0].seg_boundaries[0] = 0;
+                stack.items[0].seg_boundaries[1] = 1;
+            }
+        }
+        STORAGE_CHECK(eval_stack_push(&stack, input, true) == 0,
+            "MAP storage input stack");
+        unstacked_input = NULL;
+        stack.items[COL_STACK_MAX - 1].seg_boundaries =
+            malloc(3 * sizeof(uint32_t));
+        STORAGE_CHECK(stack.items[COL_STACK_MAX - 1].seg_boundaries,
+            "MAP input metadata");
+        stack.items[COL_STACK_MAX - 1].seg_count = 2;
+        stack.items[COL_STACK_MAX - 1].seg_boundaries[0] = 0;
+        stack.items[COL_STACK_MAX - 1].seg_boundaries[1] = 1;
+        stack.items[COL_STACK_MAX - 1].seg_boundaries[2] = 1;
+        uint32_t *input_segments =
+            stack.items[COL_STACK_MAX - 1].seg_boundaries;
+        uint32_t *lower_segments = stack.items[0].seg_boundaries;
+        STORAGE_CHECK(col_rel_source_reader_acquire(input, &active_reader) == 0,
+            "MAP storage reader");
+        col_rel_t *held = input;
+        STORAGE_CHECK(col_op_map(&map_op, &stack, coord) == EBUSY
+            && stack.top == COL_STACK_MAX &&
+            stack.items[COL_STACK_MAX - 1].rel == held
+            && stack.items[COL_STACK_MAX - 1].seg_boundaries == input_segments
+            && stack.items[COL_STACK_MAX - 1].seg_count == 2
+            && stack.items[COL_STACK_MAX - 1].seg_boundaries[1] == 1
+            && stack.items[0].seg_boundaries == lower_segments,
+            "MAP storage refusal");
+        STORAGE_CHECK(col_op_map(&map_op, &stack, coord) == EBUSY
+            && stack.top == COL_STACK_MAX
+            && stack.items[COL_STACK_MAX - 1].rel == held
+            && stack.items[COL_STACK_MAX - 1].seg_boundaries == input_segments,
+            "MAP storage repeated refusal");
+        STORAGE_CHECK(col_rel_source_reader_release(&active_reader) == 0,
+            "MAP storage release");
+        STORAGE_CHECK(col_op_map(&map_op, &stack, coord) == 0
+            && stack.top == COL_STACK_MAX
+            && stack.items[COL_STACK_MAX - 1].rel != held
+            && stack.items[COL_STACK_MAX - 1].rel->nrows == 1
+            && col_rel_get(stack.items[COL_STACK_MAX - 1].rel, 0, 0) == 42,
+            "MAP storage retry");
+        STORAGE_CHECK(eval_stack_drain(&stack) == 0, "MAP storage drain");
+    }
+    eval_stack_init(&stack);
+    col_rel_t *borrowed = col_rel_new_auto("borrowed", 1);
+    STORAGE_CHECK(borrowed, "MAP borrowed relation");
+    unowned_cleanup = borrowed;
+    int64_t borrowed_value = 99;
+    STORAGE_CHECK(col_rel_append_row(borrowed, &borrowed_value) == 0
+        && eval_stack_push(&stack, borrowed, false) == 0,
+        "MAP borrowed stack");
+    stack.items[0].seg_boundaries = malloc(2 * sizeof(uint32_t));
+    STORAGE_CHECK(stack.items[0].seg_boundaries, "MAP borrowed metadata");
+    stack.items[0].seg_count = 1;
+    stack.items[0].seg_boundaries[0] = 0;
+    stack.items[0].seg_boundaries[1] = 1;
+    STORAGE_CHECK(col_rel_source_reader_acquire(borrowed, &active_reader) == 0,
+        "MAP borrowed reader");
+    STORAGE_CHECK(col_op_map(&map_op, &stack, coord) == 0
+        && stack.top == 1 && stack.items[0].rel->nrows == 1
+        && col_rel_get(stack.items[0].rel, 0, 0) == 99,
+        "MAP borrowed cleanup");
+    STORAGE_CHECK(col_rel_source_reader_release(&active_reader) == 0,
+        "MAP borrowed release");
+    col_rel_destroy(borrowed);
+    unowned_cleanup = NULL;
+    STORAGE_CHECK(eval_stack_drain(&stack) == 0, "MAP borrowed drain");
+    eval_stack_init(&stack);
+    col_rel_t *error_input = col_rel_new_auto("error_input", 1);
+    STORAGE_CHECK(error_input, "MAP error relation");
+    unstacked_input = error_input;
+    int64_t error_value = 11;
+    STORAGE_CHECK(col_rel_append_row(error_input, &error_value) == 0
+        && eval_stack_push(&stack, error_input, true) == 0,
+        "MAP error stack");
+    unstacked_input = NULL;
+    uint8_t bad_expr[] = { WL_PLAN_EXPR_EXTENSION_CALL, 0 };
+    wl_plan_expr_buffer_t map_expr = { bad_expr, sizeof(bad_expr) };
+    wl_plan_op_t error_op = { .op = WL_PLAN_OP_MAP, .project_count = 1,
+                              .map_exprs = &map_expr, .map_expr_count = 1 };
+    STORAGE_CHECK(col_rel_source_reader_acquire(error_input,
+        &active_reader) == 0,
+        "MAP error reader");
+    STORAGE_CHECK(col_op_map(&error_op, &stack, coord) == EBUSY
+        && stack.top == 1 && stack.items[0].rel == error_input,
+        "MAP error refusal precedence");
+    STORAGE_CHECK(col_rel_source_reader_release(&active_reader) == 0,
+        "MAP error release");
+    STORAGE_CHECK(col_op_map(&error_op, &stack, coord)
+        == WL_COLUMNAR_EXPR_EXTENSION_MALFORMED && stack.top == 0,
+        "MAP error retry");
+#ifdef WL_SESSION_TEST_HOOKS
+    eval_stack_init(&stack);
+    col_rel_t *alloc_input = col_rel_new_auto("alloc_input", 1);
+    STORAGE_CHECK(alloc_input, "MAP allocation relation");
+    unstacked_input = alloc_input;
+    STORAGE_CHECK(col_rel_append_row(alloc_input, &error_value) == 0
+        && eval_stack_push(&stack, alloc_input, true) == 0,
+        "MAP allocation stack");
+    unstacked_input = NULL;
+    STORAGE_CHECK(col_rel_source_reader_acquire(alloc_input,
+        &active_reader) == 0, "MAP allocation reader");
+    wl_columnar_ops_test_map_fail_output_alloc = true;
+    wl_plan_op_t alloc_op = { .op = WL_PLAN_OP_MAP, .project_count = 1 };
+    STORAGE_CHECK(col_op_map(&alloc_op, &stack, coord) == EBUSY
+        && stack.top == 1 && stack.items[0].rel == alloc_input,
+        "MAP allocation refusal precedence");
+    STORAGE_CHECK(col_rel_source_reader_release(&active_reader) == 0,
+        "MAP allocation release");
+    STORAGE_CHECK(col_op_map(&alloc_op, &stack, coord) == ENOMEM
+        && stack.top == 0, "MAP allocation retry");
+    wl_columnar_ops_test_map_fail_output_alloc = false;
+#endif
+map_storage_cleanup:
+#ifdef WL_SESSION_TEST_HOOKS
+    wl_columnar_ops_test_map_fail_output_alloc = false;
+#endif
+    if (active_reader.owner)
+        (void)col_rel_source_reader_release(&active_reader);
+    (void)eval_stack_drain(&stack);
+    if (unstacked_input)
+        col_rel_destroy(unstacked_input);
+    if (unowned_cleanup)
+        col_rel_destroy(unowned_cleanup);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef STORAGE_CHECK
+}
+
 int
 main(void)
 {
@@ -2744,6 +3007,10 @@ main(void)
     test_session_remove_nonexistent();
     test_session_remove_reader_exclusion();
     test_session_remove_incremental_reader_exclusion();
+#ifdef WL_SESSION_TEST_HOOKS
+    test_map_input_cleanup_retry();
+#endif
+    test_map_entry_storage_modes();
 #ifdef WL_SESSION_TEST_HOOKS
     test_session_destroy_orders_worker_retirement();
 #endif
