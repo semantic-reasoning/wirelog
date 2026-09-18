@@ -575,6 +575,7 @@ col_filter_select_rows(const int64_t *col_a, const int64_t *col_b,
     return out;
 }
 
+/* Append a selected row and retain its complete provenance record. */
 static int
 wl_columnar_filter_append_selected(col_rel_t *out, const col_rel_t *src,
     uint32_t src_row, const int64_t *row)
@@ -951,7 +952,8 @@ fill_filtered_rel(const uint8_t *buf, uint32_t bsz, col_rel_t *rel,
         for (uint32_t r = 0; r < rel->nrows; r++) {
             col_rel_row_copy_out(rel, r, row_buf);
             if (col_filter_cmp_row(row_buf, rel->ncols, &cmp)) {
-                if (col_rel_append_row(out, row_buf) != 0) {
+                if (wl_columnar_filter_append_selected(out, rel, r,
+                    row_buf) != 0) {
                     col_row_buf_release(&rb);
                     return ENOMEM;
                 }
@@ -980,7 +982,8 @@ fill_filtered_rel(const uint8_t *buf, uint32_t bsz, col_rel_t *rel,
                     intern);
             pass = (err == 0) ? (val != 0 ? 1 : 0) : 0; /* fail-closed */
         }
-        if (pass && col_rel_append_row(out, row_buf) != 0) {
+        if (pass && wl_columnar_filter_append_selected(out, rel, r,
+            row_buf) != 0) {
             col_row_buf_release(&rb);
             wl_columnar_expr_compiled_free(ce);
             return ENOMEM;
@@ -1007,6 +1010,10 @@ wl_columnar_filter_apply_right_filter(const wl_plan_expr_buffer_t *fexpr,
     col_rel_t *out = col_rel_pool_new_like(pool, "$rfilter", rel);
     if (!out)
         return NULL;
+    if (rel->timestamps && col_rel_enable_timestamps(out) != 0) {
+        col_rel_destroy(out);
+        return NULL;
+    }
 
     if (fill_filtered_rel(fexpr->data, fexpr->size, rel, out, intern) != 0) {
         col_rel_destroy(out);
@@ -1112,6 +1119,12 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
             e->filtered = col_rel_new_like("$rfilter_cache", rel);
             if (!e->filtered)
                 return NULL;
+            if (rel->timestamps &&
+                col_rel_enable_timestamps(e->filtered) != 0) {
+                col_rel_destroy(e->filtered);
+                e->filtered = NULL;
+                return NULL;
+            }
             if (fill_filtered_rel(fexpr->data, fexpr->size, rel, e->filtered,
                 sess->intern) != 0) {
                 col_rel_destroy(e->filtered);
@@ -1161,6 +1174,14 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
                                                                        0 };
     sess->filt_cache[idx].filtered = col_rel_new_like("$rfilter_cache", rel);
     if (!sess->filt_cache[idx].filtered) {
+        free(sess->filt_cache[idx].filter_data);
+        free(sess->filt_cache[idx].rel_name);
+        return NULL;
+    }
+    if (rel->timestamps
+        && col_rel_enable_timestamps(sess->filt_cache[idx].filtered) != 0) {
+        col_rel_destroy(sess->filt_cache[idx].filtered);
+        sess->filt_cache[idx].filtered = NULL;
         free(sess->filt_cache[idx].filter_data);
         free(sess->filt_cache[idx].rel_name);
         return NULL;

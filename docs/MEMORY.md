@@ -762,9 +762,13 @@ peak admitted memory. Generic sorting timestamp correspondence remains #1689.
 
 Normal FILTER output preserves the complete timestamp record for every selected
 source row, including signed multiplicity and empty timestamp-enabled results.
-Untimestamped output retains the legacy representation. Right-filter variants
-use a separate follow-up tracked by #1720; sorting and deduplication remain
-tracked by #1689.
+Untimestamped output retains the legacy representation.
+
+Right-side FILTER paths preserve the complete timestamp record for each selected
+row in both pool-owned and cached filtered relations, and cached relations
+retain the same correspondence across rebuilds and leases (#1720). Deterministic
+allocation-failure and admission-retry coverage remains tracked separately in
+#1729; normal FILTER provenance is #1715 and shared sort/deduplication is #1689.
 
 The specialized parallel evaluator remains separate. An unsafe parallel plan
 (such as CONCAT) returns EAGAIN before dispatch and then uses the framed serial
