@@ -10,6 +10,12 @@
  * backend vtable dispatch.
  */
 
+#ifndef _WIN32
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#endif
+
 #include "../wirelog/backend.h"
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
@@ -7085,6 +7091,371 @@ cleanup:
 #undef GLOBAL_CHECK
 }
 
+extern void (*wl_columnar_eval_test_nonrec_worker)(wl_col_session_t *,
+    eval_stack_t *, eval_entry_t *, int *);
+extern int (*wl_columnar_eval_test_nonrec_boundary)(wl_col_session_t *,
+    unsigned, uint32_t, col_rel_t *);
+static unsigned specialized_mode, specialized_worker;
+static wl_atomic_u64 specialized_workers;
+static bool specialized_injected;
+static int specialized_hook_rc;
+static wl_columnar_source_access_reader_t specialized_reader;
+static col_rel_t *specialized_alias, *specialized_held;
+static eval_entry_t *specialized_entry;
+static col_arr_entry_t specialized_arrangement;
+static bool specialized_arrangement_captured;
+static wl_columnar_eval_stack_cleanup_frame_t *specialized_active;
+
+static void
+specialized_worker_boundary(wl_col_session_t *worker, eval_stack_t *stack,
+    eval_entry_t *result, int *rc)
+{
+    record_actual_worker(&specialized_workers, worker->worker_id);
+    /* FILTER loses upstream timestamps (#1715). Stamp this owned post-plan
+     * fixture explicitly to test only the new staging/publication boundary.
+     * VARIABLE-only cases below preserve real input timestamps end to end. */
+    if (*rc == 0 && result->owned && result->rel && specialized_mode != 16) {
+        *rc = col_rel_enable_timestamps(result->rel);
+        if (*rc == 0)
+            for (uint32_t row = 0; row < result->rel->nrows; row++)
+                result->rel->timestamps[row] = idb_timestamp(worker->worker_id);
+
+
+    }
+
+    if (worker->worker_id != specialized_worker || specialized_injected
+        || specialized_mode < 3 ||
+        (specialized_mode > 8 && specialized_mode < 21))
+        return;
+    specialized_injected = true;
+    specialized_hook_rc = 0;
+    if (specialized_mode == 8) {
+        *rc = ENOMEM; return;
+    }
+    if (!result->rel) {
+        specialized_hook_rc = EINVAL; return;
+    }
+    if (specialized_mode == 3) {
+        col_rel_t *heap = NULL;
+        specialized_hook_rc = col_rel_deep_copy(result->rel, &heap, NULL);
+        if (specialized_hook_rc != 0) return;
+        specialized_hook_rc = eval_entry_dispose(result);
+        if (specialized_hook_rc != 0) {
+            col_rel_destroy(heap); return;
+        }
+        result->rel = heap; result->owned = true;
+    } else if (specialized_mode == 22) {
+        col_rel_t *arena = col_rel_pool_new_auto(worker->delta_pool,
+                worker->eval_arena, "arena_result", result->rel->ncols);
+        if (!arena) {
+            specialized_hook_rc = ENOMEM; return;
+        }
+        specialized_hook_rc = col_rel_enable_timestamps(arena);
+        if (specialized_hook_rc == 0)
+            specialized_hook_rc = col_rel_append_all(arena, result->rel,
+                    worker->eval_arena);
+        if (specialized_hook_rc == 0)
+            specialized_hook_rc = eval_entry_dispose(result);
+        if (specialized_hook_rc != 0) {
+            col_rel_destroy(arena); return;
+        }
+        result->rel = arena; result->owned = true;
+    } else if (specialized_mode >= 4 && specialized_mode <= 6) {
+        col_rel_t *lower = specialized_mode == 4 ? col_rel_new_auto("lower", 1)
+            : col_rel_pool_new_auto(worker->delta_pool,
+                specialized_mode == 6 ? worker->eval_arena : NULL, "lower", 1);
+        int64_t value = 42;
+        if (!lower || col_rel_append_row(lower, &value) != 0
+            || eval_stack_push(stack, lower, true) != 0) {
+            col_rel_destroy(lower); specialized_hook_rc = ENOMEM; return;
+        }
+        result = &stack->items[stack->top - 1];
+    } else if (specialized_mode == 7) {
+        specialized_hook_rc = eval_entry_dispose(result);
+        if (specialized_hook_rc != 0) return;
+        result->rel = session_find_rel(worker, "$nonrec$input");
+        result->owned = false;
+    }
+    /* The specialized whitelist excludes CONCAT. These synthetic boundaries
+     * exercise entry metadata ownership without claiming a native CONCAT path. */
+    result->seg_boundaries = malloc(3 * sizeof(uint32_t));
+    if (!result->seg_boundaries) {
+        specialized_hook_rc = ENOMEM; return;
+    }
+    result->seg_count = 2;
+    result->seg_boundaries[0] = 0;
+    result->seg_boundaries[1] = result->rel->nrows;
+    result->seg_boundaries[2] = result->rel->nrows;
+    specialized_entry = result;
+    specialized_held = result->rel;
+    specialized_hook_rc =
+        col_rel_source_reader_acquire_transferable(result->rel,
+            &specialized_reader);
+}
+
+static int
+specialized_publication_boundary(wl_col_session_t *coord, unsigned phase,
+    uint32_t worker, col_rel_t *candidate)
+{
+    if (specialized_injected) return 0;
+    unsigned wanted = specialized_mode == 9 || specialized_mode == 13 ? 0
+        : specialized_mode == 10 ? 3
+        : specialized_mode == 11 || specialized_mode == 15 ? 4
+        : specialized_mode == 14 || specialized_mode == 19 ? 1 : 5;
+    if (phase != wanted) return 0;
+    if (specialized_mode == 0 ||
+        (specialized_mode >= 3 && specialized_mode <= 8)
+        || specialized_mode == 16 || specialized_mode == 17 ||
+        specialized_mode == 18)
+        return 0;
+    if (specialized_mode == 14 && worker != 1) return 0;
+    if (specialized_mode == 19 && worker != specialized_worker) return 0;
+    specialized_injected = true;
+    specialized_hook_rc = 0;
+    if (specialized_mode == 14) return ENOMEM;
+    if (specialized_mode == 19)
+        return wl_columnar_eval_stack_cleanup_begin(&coord->tdd_workers[worker],
+                   &specialized_active);
+    if (specialized_mode == 13 || specialized_mode == 15) {
+        idb_set_budget(coord); return 0;
+    }
+#ifdef WL_TEST_ALLOC_WRAP
+    if (specialized_mode >= 9 && specialized_mode <= 12) {
+        fail_next_alloc = true; return 0;
+    }
+#endif
+    col_rel_t *target = specialized_mode == 20 ? candidate
+        : session_find_rel(coord, "output");
+    if (specialized_mode == 1 || specialized_mode == 2) {
+        uint32_t key = 0;
+        if (!col_session_get_arrangement(&coord->base, "output", &key, 1))
+            return ENOMEM;
+        specialized_arrangement = coord->arr_entries[0];
+        specialized_arrangement_captured = true;
+    }
+
+    if (specialized_mode == 2) {
+        specialized_alias = col_rel_new_like("external", target);
+        if (!specialized_alias) return ENOMEM;
+        int rc = col_rel_install_shared_view(specialized_alias, target);
+        if (rc != 0) return rc;
+        target = specialized_alias;
+    }
+    specialized_held = target;
+    specialized_hook_rc = col_rel_source_reader_acquire(target,
+            &specialized_reader);
+    return specialized_hook_rc;
+}
+
+static void
+specialized_set_threshold(const char *value)
+{
+#ifdef _WIN32
+    (void)_putenv_s("WIRELOG_NONREC_TDD_MIN_ROWS_PER_WORKER",
+        value ? value : "");
+#else
+    if (value)
+        (void)setenv("WIRELOG_NONREC_TDD_MIN_ROWS_PER_WORKER", value, 1);
+    else
+        (void)unsetenv("WIRELOG_NONREC_TDD_MIN_ROWS_PER_WORKER");
+#endif
+}
+
+static void
+test_specialized_publication(uint32_t workers, unsigned initial, unsigned mode,
+    bool baseline)
+{
+    TEST("specialized nonrecursive: persistent owners and atomic publication");
+    uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, mode == 17 ? 0 : 1 };
+    if (mode == 18) predicate[0] = WL_PLAN_EXPR_EXTENSION_CALL;
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } },
+        { .op = WL_PLAN_OP_CONSOLIDATE }
+    };
+    wl_plan_relation_t output = { .name = "output", .delta_name = "$d$output",
+                                  .ops = ops, .op_count = mode == 16 ? 1 : 3 };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    col_rel_t *unowned = NULL, *target = NULL;
+    tuple_collector_t tuples = { 0 };
+    int64_t *values = NULL;
+    const char *failure = NULL;
+    const char *old_env = getenv("WIRELOG_NONREC_TDD_MIN_ROWS_PER_WORKER");
+    char *saved_env = old_env ? malloc(strlen(old_env) + 1) : NULL;
+    if (saved_env) memcpy(saved_env, old_env, strlen(old_env) + 1);
+    specialized_set_threshold(baseline ? "32768" : "64");
+    specialized_mode = mode;
+    specialized_worker = workers - 1;
+    specialized_injected = false;
+    specialized_hook_rc = 0;
+    specialized_alias = specialized_held = NULL;
+    specialized_entry = NULL;
+    specialized_arrangement_captured = false;
+    specialized_active = NULL;
+    memset(&specialized_reader, 0, sizeof(specialized_reader));
+    atomic_store_explicit(&specialized_workers, 0, memory_order_relaxed);
+#define SPECIAL_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    SPECIAL_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "specialized session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    governor = coord->memory_governor;
+    wl_columnar_memory_governor_ref_retain(governor);
+    uint32_t count = workers * (baseline ? 32768 : 64);
+    values = malloc((size_t)count * sizeof(*values));
+    SPECIAL_CHECK(values, "specialized input allocation");
+    for (uint32_t row = 0; row < count; row++) values[row] = 42;
+    SPECIAL_CHECK(wl_session_insert(session, "input", values, count, 1) == 0,
+        "specialized input");
+    col_rel_t *input = session_find_rel(coord, "input");
+    wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    SPECIAL_CHECK(col_rel_set_column_types(input, &type, 1) == 0
+        && col_rel_enable_timestamps(input) == 0,
+        "specialized source metadata");
+    for (uint32_t row = 0; row < count;
+        row++) input->timestamps[row] = idb_timestamp(row);
+    if (initial) {
+        unowned = col_rel_new_like("output", input);
+        SPECIAL_CHECK(unowned && col_rel_enable_timestamps(unowned) == 0,
+            "specialized initial target");
+        if (initial == 2) {
+            int64_t seed = 7;
+            SPECIAL_CHECK(col_rel_append_row(unowned, &seed) == 0,
+                "specialized seed");
+            unowned->timestamps[0] = idb_timestamp(0);
+        }
+        SPECIAL_CHECK(session_add_rel(coord, unowned) == 0,
+            "specialized register");
+        target = unowned; unowned = NULL;
+    }
+    uint64_t view = target ? target->view_generation : 0;
+    uint64_t storage = target ? target->storage_generation : 0;
+    int64_t **columns = target ? target->columns : NULL;
+    wl_columnar_eval_test_nonrec_worker = specialized_worker_boundary;
+    wl_columnar_eval_test_nonrec_boundary = specialized_publication_boundary;
+    int rc = wl_session_snapshot(session, collect_tuple, &tuples);
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = false;
+#endif
+    idb_restore_budget(coord);
+    bool healthy = mode == 0 || mode == 16 || mode == 17;
+    if (mode != 9 && mode != 13 && mode != 14 && mode != 19)
+        SPECIAL_CHECK(atomic_load_explicit(&specialized_workers,
+            memory_order_relaxed) == (1u << workers) - 1,
+            "actual specialized workers");
+    SPECIAL_CHECK(specialized_hook_rc == 0, "specialized test seam");
+    if (!healthy) {
+        int expected = (mode <= 7 || mode == 19 || mode == 20 ||
+            mode >= 21) ? EBUSY
+            : mode == 13 || mode == 15 ? ENOSPC : ENOMEM;
+        bool expected_status = mode == 18
+            ? coord->extension_expr_status
+            == WL_COLUMNAR_EXPR_EXTENSION_MALFORMED
+            : rc == expected;
+        SPECIAL_CHECK(rc != 0 && expected_status && tuples.count == 0,
+            "specialized refusal code or callbacks");
+        if (target)
+            SPECIAL_CHECK(target == session_find_rel(coord, "output")
+                && target->nrows == (initial == 2 ? 1u : 0u)
+                && target->columns == columns && target->view_generation == view
+                && target->storage_generation == storage,
+                "specialized refused target changed");
+        if (mode <= 7 || mode == 19 || mode == 20 || mode >= 21) {
+            for (unsigned retry = 0; retry < 2; retry++) {
+                SPECIAL_CHECK(wl_session_snapshot(session, collect_tuple,
+                    &tuples) == EBUSY
+                    && tuples.count == 0, "specialized repeated refusal");
+                if (specialized_arrangement_captured)
+                    SPECIAL_CHECK(memcmp(&specialized_arrangement,
+                        &coord->arr_entries[0],
+                        sizeof(specialized_arrangement)) == 0,
+                        "specialized refused arrangement changed");
+                if ((mode >= 3 && mode <= 6) || mode >= 21)
+                    SPECIAL_CHECK(specialized_entry->rel == specialized_held
+                        && specialized_entry->seg_count == 2
+                        && specialized_entry->seg_boundaries
+                        && col_rel_get(specialized_held, 0, 0) == 42,
+                        "specialized retained descriptor or segments");
+            }
+        }
+        if (specialized_reader.owner)
+            SPECIAL_CHECK(col_rel_source_reader_release(&specialized_reader) ==
+                0,
+                "specialized release reader");
+        if (specialized_active)
+            SPECIAL_CHECK(wl_columnar_eval_stack_cleanup_finish(
+                    &specialized_active) == 0,
+                "specialized active guard release");
+        col_rel_destroy(specialized_alias); specialized_alias = NULL;
+        wl_columnar_eval_test_nonrec_boundary = NULL;
+        predicate[0] = WL_PLAN_EXPR_BOOL;
+        SPECIAL_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0,
+            "specialized public retry");
+    } else SPECIAL_CHECK(rc == 0, "specialized healthy evaluation");
+    target = session_find_rel(coord, "output");
+    uint32_t expected_rows = mode == 16 ? count + (initial == 2)
+        : mode == 17 ? (initial == 2) : 1 + (initial == 2);
+    SPECIAL_CHECK(target && target->nrows == expected_rows &&
+        coord->tdd_workers_count == 0
+        && !coord->cleanup_pending && coord->cleanup_reserved_bytes == 0,
+        "specialized exact result or ownership");
+    if (expected_rows && mode != 16 && mode != 17) {
+        SPECIAL_CHECK(target->column_types && target->timestamps
+            && col_rel_get(target, target->nrows - 1, 0) == 42
+            && target->timestamps[target->nrows - 1].iteration == 10,
+            "specialized metadata or provenance");
+    }
+    if (mode == 16) {
+        SPECIAL_CHECK(target->timestamps, "VARIABLE timestamp mode");
+        for (uint32_t row = 0; row < count; row++) {
+            col_delta_timestamp_t expected = idb_timestamp(row);
+            SPECIAL_CHECK(memcmp(&target->timestamps[row + (initial == 2)],
+                &expected, sizeof(expected)) == 0,
+                "VARIABLE complete signed row provenance");
+        }
+    }
+    if (mode != 16) {
+        memset(&tuples, 0, sizeof(tuples));
+        SPECIAL_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0
+            && tuples.count == expected_rows && target->nrows == expected_rows,
+            "specialized repeated exact snapshot");
+    }
+cleanup:
+    wl_columnar_eval_test_nonrec_worker = NULL;
+    wl_columnar_eval_test_nonrec_boundary = NULL;
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = false;
+#endif
+    if (session) idb_restore_budget(COL_SESSION(session));
+    if (specialized_reader.owner)
+        (void)col_rel_source_reader_release(&specialized_reader);
+    if (specialized_active)
+        (void)wl_columnar_eval_stack_cleanup_finish(&specialized_active);
+    col_rel_destroy(specialized_alias);
+    col_rel_destroy(unowned);
+    free(values);
+    wl_session_destroy(session);
+    if (governor) {
+        if (reserved_on(governor) != 0 &&
+            !failure) failure = "specialized reservation leak";
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+    if (saved_env) {
+        specialized_set_threshold(saved_env);
+        free(saved_env);
+    }else specialized_set_threshold(NULL);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef SPECIAL_CHECK
+}
+
 static void
 test_final_normalization(uint32_t workers, unsigned route, unsigned mode)
 {
@@ -8961,6 +9332,18 @@ main(void)
         test_global_read_publication(workers, 1, 1, 1, true);
         test_global_read_publication(workers, 1, 3, 1, true);
     }
+    for (uint32_t workers = 2; workers <= 8; workers *= 4) {
+        for (unsigned initial = 0; initial < 3; initial++)
+            test_specialized_publication(workers, initial, 0, initial == 2);
+        for (unsigned mode = 1; mode <= 22; mode++) {
+#ifndef WL_TEST_ALLOC_WRAP
+            if (mode >= 9 && mode <= 12)
+                continue;
+#endif
+            test_specialized_publication(workers, 2, mode, false);
+        }
+        test_specialized_publication(workers, 0, 20, false);
+    }
     test_tdd_recursive_frame_retention(2, 0, 0, true);
     test_tdd_recursive_frame_retention(8, 3, 1, true);
     for (unsigned mode = 0; mode < 7; mode++) {
@@ -9014,7 +9397,7 @@ main(void)
 #endif
             test_final_normalization(workers, 0, mode);
         }
-        for (unsigned route = 1; route <= 2; route++) {
+        for (unsigned route = 1; route <= 1; route++) {
             test_final_normalization(workers, route, 0);
             test_final_normalization(workers, route, 5);
         }

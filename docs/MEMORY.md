@@ -276,8 +276,8 @@ candidate and checked publication after worker dependencies retire. Merge paths
 consume worker results before teardown; finalization errors do not record
 convergence or advance completed iteration history. Private exchange intermediates
 and global-read exchange publication remain separate from this final boundary.
-Specialized nonrecursive publication to an existing output must also retire its
-worker input views before merge; that earlier boundary is tracked by #1711.
+Specialized nonrecursive publication stages independent worker results before
+retiring input views, then publishes one checked normalized replacement.
 
 Heap and pooled constructors create independently owned Arrow schemas, including
 untyped and zero-width relations. Clones preserve declared width, names, types,
@@ -833,17 +833,32 @@ Publication is atomic per target, not per exchange: a successful prefix can
 remain, and public snapshot retry completes the exact set after dependencies
 release without emitting callbacks for the failed attempt.
 
-Cleanup refusal remains an integration gap for specialized parallel rule
-evaluation: #1647 covers lost popped results,
-#1648 covers K-Fusion refusal handling, and #1661 covers retention of whole
-refused evaluator stacks and their allocators across unwind. In particular,
-retaining an entry on a block-local stack does not preserve ownership after
-its caller returns. Pool/arena relations cannot use the heap-only deferred
-registry, and a live reader prevents promoting their descriptors. Internal
-checked cleanup can return `EBUSY`; public session destruction remains
+Specialized nonrecursive workers evaluate in persistent worker-owned cleanup
+frames. A coordinator frame admits a fixed slot for each worker before dispatch;
+workers copy into separate governed slots and finish their original results,
+lower entries and segment metadata on their own threads. The coordinator reads
+those slots only after the dispatch barrier, clears transient join-counter
+pointers and retires worker views through checked teardown. A refused worker
+frame retains its allocator and dependencies for public retry.
+
+A governed final candidate combines existing output and worker rows, preserving
+append behavior without CONSOLIDATE and performing checked private normalization
+when requested. Existing outputs use prepared replacement: all staging cleanup
+must succeed before commit, and replacement reservations are always discarded.
+Missing outputs transfer the private candidate only when the registry owns it.
+Reader, admission or allocation failure leaves an existing target unchanged.
+This costs independent staging and replacement storage, admitted before use; it
+is an atomic relation publication, not a transaction across a whole stratum.
+Specialized slices and staging preserve incoming timestamp records. FILTER's
+pre-existing loss of selected-row provenance is tracked separately by #1715,
+and generic sorting/consolidation provenance remains #1689.
+
+K-Fusion refusal handling (#1648) and the remaining #1661 integration audit
+still precede closing #1384. Pool/arena relations cannot use the heap-only
+deferred registry, and a live reader prevents promoting their descriptors.
+Internal checked cleanup can return `EBUSY`; public session destruction remains
 synchronous and does not offer recoverable deferred destruction. See
-`wirelog/session.c` and `session.c` for that distinction. These open cases
-remain prerequisites to closing #1384.
+`wirelog/session.c` and `session.c` for that distinction.
 
 Primary hash arrangements are session-owned cache entries. A join that probes
 one through `col_session_pin_arrangement()` holds a non-public lease until the
