@@ -1850,6 +1850,7 @@ tdd_worker_subpass_fn(void *arg)
                 sess->diff_operators_active = saved_diff;
                 TDD_WORKER_RETURN();
             }
+            delta->timestamp_capacity = delta->nrows;
             wl_columnar_relation_touch_storage(delta);
             for (uint32_t ti = 0; ti < delta->nrows; ti++) {
                 delta->timestamps[ti].iteration = eff_iter;
@@ -4487,6 +4488,7 @@ tdd_empty_relation_candidate(const col_rel_t *source, col_rel_t **out)
     memset(candidate->run_ends, 0, sizeof(candidate->run_ends));
     free(candidate->timestamps);
     candidate->timestamps = NULL;
+    candidate->timestamp_capacity = 0;
     candidate->ledger_ts_bytes = 0;
     tdd_clear_relation_dedup_set(candidate);
     return 0;

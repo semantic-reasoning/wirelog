@@ -187,6 +187,7 @@ test_rel_append_row_mult(col_rel_t *r, const int64_t *row, int64_t multiplicity)
         if (!nt)
             return -1;
         r->timestamps = nt;
+        r->timestamp_capacity = cap;
         r->capacity = cap;
     }
     if (r->ncols > 0)
@@ -582,8 +583,9 @@ test_timestamps_out_delta_rejected(void)
     int64_t row[] = { 42 };
     ASSERT(test_rel_append_row_mult(curr, row, 1) == 0, "append curr row");
 
-    out->timestamps = (col_delta_timestamp_t *)malloc(
-        sizeof(*out->timestamps));
+    out->timestamps = (col_delta_timestamp_t *)malloc(sizeof(*out->timestamps));
+
+    out->timestamp_capacity = out->timestamps ? 1 : 0;
     ASSERT(out->timestamps != NULL, "timestamp allocation failed");
 
     int rc = col_compute_delta_mobius(prev, curr, out);

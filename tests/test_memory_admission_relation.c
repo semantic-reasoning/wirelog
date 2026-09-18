@@ -703,9 +703,140 @@ test_cow_ledger_reconcile_is_exact_once(void)
         col_rel_destroy(source);
 }
 
+static void
+test_physical_timestamp_capacity(void)
+{
+    col_rel_t *r = col_rel_new_auto("physical-ts", 1);
+    col_rel_t *copy = NULL;
+    col_rel_t *view = col_rel_new_auto("physical-view", 1);
+    col_rel_t *replacement_target = col_rel_new_auto("physical-replacement", 1);
+    col_rel_replacement_t replacement = { 0 };
+    wl_mem_ledger_t ledger;
+    wl_mem_ledger_snapshot_t snapshot;
+    wl_mem_ledger_init(&ledger, 0);
+    CHECK(r && view, "physical timestamp fixture");
+    if (!r || !view) goto cleanup;
+    int64_t value = 42;
+    CHECK(col_rel_append_row(r, &value) == 0
+        && col_rel_enable_timestamps(r) == 0, "physical timestamp seed");
+    r->timestamps[0].multiplicity = -7;
+    uint32_t physical = r->timestamp_capacity;
+    uint64_t bytes = (uint64_t)physical * sizeof(col_delta_timestamp_t);
+    CHECK(physical == r->capacity && bytes > 0, "initial physical capacity");
+    r->mem_ledger = &ledger;
+    col_rel_ledger_reconcile(r, 0);
+    /* Mirror the column-only rollback detachment: the timestamp allocation
+     * remains live while the logical relation has no rows/column capacity. */
+    int64_t **columns = r->columns;
+    uint32_t capacity = r->capacity;
+    uint64_t before = col_rel_owned_ledger_bytes(r);
+    r->columns = NULL;
+    r->capacity = 0;
+    r->nrows = 0;
+    col_rel_ledger_reconcile(r, before);
+    wl_mem_ledger_snapshot(&ledger, &snapshot);
+    CHECK(r->timestamp_capacity == physical
+        && col_rel_timestamp_ledger_bytes(r) == bytes
+        && col_rel_transport_bytes(r) == bytes
+        && snapshot.subsys_bytes[WL_MEM_SUBSYS_TIMESTAMP] == bytes,
+        "detached columns must not credit retained timestamps");
+    CHECK(col_rel_deep_copy(r, &copy, NULL) == 0 && copy
+        && copy->timestamp_capacity == physical
+        && col_rel_timestamp_ledger_bytes(copy) == bytes
+        && copy->timestamps[0].multiplicity == -7,
+        "detached deep copy preserves physical timestamps");
+    CHECK(col_rel_install_shared_view(view, r) == 0
+        && view->timestamp_capacity == physical
+        && view->timestamps != r->timestamps
+        && col_rel_transport_bytes(view) == bytes,
+        "alias owns independent retained timestamp allocation");
+    col_rel_destroy(view); view = NULL;
+    if (copy && replacement_target) {
+        int rc = col_rel_prepare_replacement(replacement_target, copy,
+                &replacement);
+        CHECK(rc == 0, "replacement plans retained physical timestamp bytes");
+        if (rc == 0) col_rel_commit_replacement_locked(replacement_target,
+                &replacement);
+        col_rel_discard_replacement(&replacement);
+        CHECK(replacement_target->timestamp_capacity == physical
+            && col_rel_transport_bytes(replacement_target) == bytes,
+            "replacement transfers physical capacity");
+    }
+    /* Restore smaller logical storage without reallocating timestamp memory. */
+    r->columns = columns;
+    r->capacity = capacity / 2;
+    r->nrows = 1;
+    col_rel_ledger_reconcile(r, 0);
+    CHECK(col_rel_timestamp_ledger_bytes(r) == bytes,
+        "smaller restored columns must not shrink timestamp accounting");
+    before = col_rel_owned_ledger_bytes(r);
+    r->capacity = capacity;
+    col_rel_ledger_reconcile(r, before);
+    CHECK(col_rel_compact(r) == 0
+        && r->timestamp_capacity == r->capacity
+        && col_rel_timestamp_ledger_bytes(r) ==
+        (uint64_t)r->timestamp_capacity * sizeof(col_delta_timestamp_t),
+        "physical compaction updates timestamp capacity");
+cleanup:
+    col_rel_discard_replacement(&replacement);
+    col_rel_destroy(replacement_target);
+    col_rel_destroy(view);
+    col_rel_destroy(copy);
+    col_rel_destroy(r);
+    wl_mem_ledger_snapshot(&ledger, &snapshot);
+    CHECK(snapshot.current_bytes == 0,
+        "physical timestamp ledger release once");
+}
+
+static void
+test_cow_retained_timestamp_capacity_admission(void)
+{
+    const uint32_t physical = COL_REL_INIT_CAP * 2u;
+    const uint64_t bytes = (uint64_t)COL_REL_INIT_CAP * sizeof(int64_t)
+        + (uint64_t)physical * sizeof(col_delta_timestamp_t);
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    col_rel_t *source = NULL;
+    col_rel_t *view = NULL;
+    int64_t value = 9;
+
+    make_resolution(&resolution, bytes - 1u);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    source = col_rel_new_auto("skew-source", 1);
+    view = col_rel_new_auto("skew-view", 1);
+    CHECK(ref && source && view, "skewed timestamp COW setup");
+    if (!ref || !source || !view) goto cleanup;
+    CHECK(col_rel_append_row(source, &value) == 0
+        && col_rel_enable_timestamps(source) == 0,
+        "skewed timestamp seed");
+    if (!source->timestamps) goto cleanup;
+    col_delta_timestamp_t *expanded = realloc(source->timestamps,
+            (size_t)physical * sizeof(*expanded));
+    CHECK(expanded != NULL, "expand physical timestamp capacity");
+    if (!expanded) goto cleanup;
+    source->timestamps = expanded;
+    source->timestamp_capacity = physical;
+    CHECK(col_rel_attach_memory_governor(view, ref) == 0
+        && col_rel_install_shared_view(view, source) == 0,
+        "install skewed timestamp view");
+    int64_t *old_column = view->columns[0];
+    bool *old_shared = view->col_shared;
+    CHECK(col_rel_cow_unshare(view, 0) == ENOMEM
+        && view->columns[0] == old_column && view->col_shared == old_shared
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0,
+        "retained timestamp capacity denial preserves state");
+cleanup:
+    col_rel_destroy(view);
+    col_rel_destroy(source);
+    if (ref) wl_columnar_memory_governor_ref_release(ref);
+}
+
 int
 main(void)
 {
+    test_physical_timestamp_capacity();
+    test_cow_retained_timestamp_capacity_admission();
     test_cow_exact_fit_and_denial();
     test_cow_multi_column_cleanup();
     test_append_transitions();

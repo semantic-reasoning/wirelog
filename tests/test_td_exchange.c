@@ -492,6 +492,7 @@ test_exchange_preserves_timestamps(void)
         return;
     }
 
+    rel->timestamp_capacity = nrows;
     for (uint32_t i = 0; i < nrows; i++) {
         rel->timestamps[i].iteration = i;
         rel->timestamps[i].stratum = 0;

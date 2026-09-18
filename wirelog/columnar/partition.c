@@ -190,6 +190,7 @@ col_rel_partition_by_key(const col_rel_t *src,
                 rc = ENOMEM;
                 goto cleanup;
             }
+            out_parts[w]->timestamp_capacity = counts[w];
             wl_columnar_relation_touch_storage(out_parts[w]);
         }
         memset(offsets, 0, num_workers * sizeof(uint32_t));
@@ -321,6 +322,7 @@ col_rel_merge_partitions(col_rel_t **parts, uint32_t num_workers,
             col_rel_destroy(merged); return ENOMEM;
         }
         wl_columnar_relation_touch_storage(merged);
+        merged->timestamp_capacity = total_rows;
         uint32_t off = 0;
         for (uint32_t w = 0; w < num_workers; w++) {
             if (parts[w]->nrows > 0 && parts[w]->timestamps)

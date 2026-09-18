@@ -2505,6 +2505,7 @@ test_shared_view_metadata_and_pool_rejection(void)
     CHECK(col_rel_append_row(src, &row) == 0, "metadata source row");
     src->timestamps = (col_delta_timestamp_t *)calloc(src->capacity,
             sizeof(*src->timestamps));
+    src->timestamp_capacity = src->timestamps ? src->capacity : 0;
     CHECK(src->timestamps != NULL, "source timestamps");
     src->timestamps[0].multiplicity = -3;
     src->run_count = 1;
@@ -2512,6 +2513,8 @@ test_shared_view_metadata_and_pool_rejection(void)
 
     dst->timestamps = (col_delta_timestamp_t *)calloc(dst->capacity,
             sizeof(*dst->timestamps));
+
+    dst->timestamp_capacity = dst->timestamps ? dst->capacity : 0;
     dst->merge_columns = col_columns_alloc(dst->ncols, 1);
     dst->merge_buf_cap = 1;
     dst->retract_backup_columns = col_columns_alloc(dst->ncols, 1);
@@ -3075,8 +3078,9 @@ test_shared_mutation_cow_and_append_validation(void)
             CHECK(col_rel_append_row(resize, &value) == 0,
                 "append allocation-failure seed");
         }
-        resize->timestamps = (col_delta_timestamp_t *)calloc(
-            resize->capacity, sizeof(*resize->timestamps));
+        resize->timestamps = (col_delta_timestamp_t *)calloc(resize->capacity,
+                sizeof(*resize->timestamps));
+        resize->timestamp_capacity = resize->timestamps ? resize->capacity : 0;
         CHECK(resize->timestamps != NULL,
             "append allocation-failure timestamps");
         int64_t **old_columns = resize->columns;
@@ -3348,8 +3352,10 @@ test_failure_atomicity(void)
         "Mobius failure input rows");
     prev->timestamps = (col_delta_timestamp_t *)calloc(prev->capacity,
             sizeof(*prev->timestamps));
+    prev->timestamp_capacity = prev->timestamps ? prev->capacity : 0;
     curr->timestamps = (col_delta_timestamp_t *)calloc(curr->capacity,
             sizeof(*curr->timestamps));
+    curr->timestamp_capacity = curr->timestamps ? curr->capacity : 0;
     CHECK(prev->timestamps && curr->timestamps, "Mobius failure timestamps");
     prev->timestamps[0].multiplicity = 1;
     curr->timestamps[0].multiplicity = 2;
@@ -3402,8 +3408,9 @@ test_resize_failure_atomicity(void)
                 CHECK(col_rel_append_row(src, &row) == 0,
                     "resize failure source rows");
             }
-            src->timestamps = (col_delta_timestamp_t *)calloc(
-                src->capacity, sizeof(*src->timestamps));
+            src->timestamps = (col_delta_timestamp_t *)calloc(src->capacity,
+                    sizeof(*src->timestamps));
+            src->timestamp_capacity = src->timestamps ? src->capacity : 0;
             CHECK(src->timestamps != NULL, "resize failure timestamps");
             if (operation == 1) {
                 int64_t extra = 999;
