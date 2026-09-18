@@ -5554,36 +5554,14 @@ test_tdd_recursive_frame_retention(uint32_t workers, unsigned storage,
         "release readers");
     wl_columnar_eval_serial_test_after_plan = NULL;
     wl_columnar_eval_test_outbound_after_plan = NULL;
-    if (global_read) {
-        /* #1704 owns successful global-read exchange. Readiness drains the
-         * frames; checked cohort teardown retires its ordinary input views
-         * before public mutation, without reevaluating that exchange. */
-        TDD_FRAME_CHECK(wl_columnar_session_cleanup_ready_quiescent(sess) == 0,
-            "global-read frame readiness");
-        for (uint32_t w = 0; w < workers; w++) {
-            TDD_FRAME_CHECK(!sess->tdd_workers[w].cleanup_active
-                && !sess->tdd_workers[w].cleanup_pending
-                && sess->tdd_workers[w].cleanup_reserved_bytes == 0,
-                "global-read worker frame not drained");
-            TDD_FRAME_CHECK(col_worker_session_destroy(&sess->tdd_workers[w]) ==
-                0,
-                "checked global-read cohort teardown");
-        }
-        sess->tdd_workers_count = 0;
-        TDD_FRAME_CHECK(wl_session_insert(session, "input", values, 1,
-            width) == 0
-            && tuples.count == 0 && session_find_rel(sess,
-            "input")->nrows == 65537,
-            "public mutation after checked frame and cohort cleanup");
-    } else
-        TDD_FRAME_CHECK(wl_session_snapshot(session, collect_tuple,
-            &tuples) == 0
-            && tuples.count == 2 && tuples.rows[0][0] == 42 &&
-            tuples.rows[1][0] == 42
-            && strcmp(tuples.relations[0], "output") == 0
-            && strcmp(tuples.relations[1],
-            "relay") == 0 && sess->tdd_workers_count == 0,
-            "exact public snapshot retry");
+    TDD_FRAME_CHECK(wl_session_snapshot(session, collect_tuple,
+        &tuples) == 0
+        && tuples.count == 2 && tuples.rows[0][0] == 42 &&
+        tuples.rows[1][0] == 42
+        && strcmp(tuples.relations[0], "output") == 0
+        && strcmp(tuples.relations[1],
+        "relay") == 0 && sess->tdd_workers_count == 0,
+        "exact public snapshot retry");
 cleanup:
     wl_columnar_eval_serial_test_after_plan = NULL;
     wl_columnar_eval_test_outbound_after_plan = NULL;
@@ -6703,6 +6681,239 @@ inject_final_normalization(wl_col_session_t *coord, col_rel_t *target)
 #endif
     if (final_normalize_mode == 4)
         idb_set_budget(coord);
+}
+
+extern int (*wl_columnar_eval_test_global_publication)(wl_col_session_t *,
+    uint32_t, unsigned);
+static unsigned global_publication_mode, global_publication_relation;
+static bool global_publication_hit;
+static int global_publication_hook_rc;
+static col_rel_t *global_publication_held, *global_publication_alias;
+static wl_columnar_source_access_reader_t global_publication_reader;
+static uint64_t global_publication_view, global_publication_storage;
+static uint32_t global_publication_rows;
+static atomic_uint global_publication_workers;
+
+static void
+global_publication_worker(wl_col_session_t *worker, eval_stack_t *stack,
+    eval_entry_t *result)
+{
+    (void)stack;
+    (void)result;
+    if (worker->tdd_outbound_only_active && worker->diff_operators_active)
+        atomic_fetch_or(&global_publication_workers, 1u << worker->worker_id);
+}
+
+static int
+global_publication_boundary(wl_col_session_t *coord, uint32_t ri,
+    unsigned phase)
+{
+    if (global_publication_hit || ri != global_publication_relation)
+        return 0;
+    unsigned wanted = global_publication_mode == 9 ? 6
+        : global_publication_mode == 4 ? 0
+        : global_publication_mode == 5 ? 1
+        : global_publication_mode == 6 ? 3
+        : global_publication_mode == 7 ? 4 : 1;
+    if (phase != wanted)
+        return 0;
+    global_publication_hit = true;
+    global_publication_hook_rc = 0;
+    if (global_publication_mode == 0)
+        return 0;
+    if (global_publication_mode == 8) {
+        idb_set_budget(coord);
+        return 0;
+    }
+    if (global_publication_mode == 6 || global_publication_mode == 7)
+        return ENOMEM;
+#ifdef WL_TEST_ALLOC_WRAP
+    if (global_publication_mode == 4 || global_publication_mode == 5
+        || global_publication_mode == 9) {
+        fail_next_alloc = true;
+        return 0;
+    }
+#endif
+    const char *name = ri == 0 ? "output" : "relay";
+    col_rel_t *target = session_find_rel(coord, name);
+    if (global_publication_mode == 3)
+        target = session_find_rel(&coord->tdd_workers[coord->tdd_workers_count -
+                1],
+                name);
+    if (global_publication_mode == 2) {
+        global_publication_alias = col_rel_new_like("external", target);
+        if (!global_publication_alias) return ENOMEM;
+        int rc = col_rel_install_shared_view(global_publication_alias, target);
+        if (rc != 0) return rc;
+        target = global_publication_alias;
+    }
+    global_publication_held = target;
+    global_publication_rows = target->nrows;
+    global_publication_view = target->view_generation;
+    global_publication_storage = target->storage_generation;
+    global_publication_hook_rc = col_rel_source_reader_acquire(target,
+            &global_publication_reader);
+    return global_publication_hook_rc;
+}
+
+static void
+test_global_read_publication(uint32_t workers, unsigned initial,
+    unsigned mode, uint32_t target_relation, bool later)
+{
+    TEST("global-read publication: ownership, prefix failure and exact retry");
+    uint32_t key = 0, projection[] = { 0, 1 };
+    const char *keys[] = { "col1" };
+    uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
+    wl_plan_op_exchange_t exchange = { .num_workers = 1,
+                                       .key_col_idxs = &key,
+                                       .key_col_count = 1 };
+    wl_plan_op_t output_ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "output" },
+        { .op = WL_PLAN_OP_JOIN, .right_relation = "input", .left_keys = keys,
+          .right_keys = keys, .key_count = 1, .project_indices = projection,
+          .project_count = 2 },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_CONCAT },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    wl_plan_op_t relay_ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE,
+          .relation_name = later ? "output" : "input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    wl_plan_relation_t relations[] = {
+        { .name = "output", .delta_name = "$d$output", .ops = output_ops,
+          .op_count = 5 },
+        { .name = "relay", .delta_name = "$d$relay", .ops = relay_ops,
+          .op_count = 3 }
+    };
+    wl_plan_stratum_t stratum = { .relations = relations, .relation_count = 2,
+                                  .is_recursive = true };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    col_rel_t *unowned = NULL;
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    int64_t *values = NULL;
+    tuple_collector_t tuples = { 0 };
+    const char *failure = NULL;
+    global_publication_mode = mode;
+    global_publication_relation = target_relation;
+    global_publication_hit = false;
+    global_publication_held = global_publication_alias = NULL;
+    memset(&global_publication_reader, 0, sizeof(global_publication_reader));
+    atomic_store(&global_publication_workers, 0);
+#define GLOBAL_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    GLOBAL_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "global session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    governor = coord->memory_governor;
+    wl_columnar_memory_governor_ref_retain(governor);
+    uint32_t input_rows = mode == 0 && initial == 0 ? 65536 : workers * 4096;
+    values = malloc((size_t)input_rows * 2 * sizeof(*values));
+    GLOBAL_CHECK(values, "global input allocation");
+    for (uint32_t i = 0; i < input_rows * 2; i++) values[i] = 42;
+    GLOBAL_CHECK(wl_session_insert(session, "input", values, input_rows,
+        2) == 0,
+        "global input");
+    wirelog_column_type_t types[] = { WIRELOG_TYPE_INT64, WIRELOG_TYPE_INT64 };
+    if (initial != 0) {
+        for (uint32_t ri = 0; ri < 2; ri++) {
+            unowned = col_rel_new_auto(relations[ri].name, 2);
+            GLOBAL_CHECK(unowned && col_rel_set_column_types(unowned, types,
+                2) == 0
+                && col_rel_enable_timestamps(unowned) == 0,
+                "global typed target");
+            if (initial == 2) {
+                int64_t seed[] = { 7, 7 };
+                GLOBAL_CHECK(col_rel_append_row(unowned, seed) == 0,
+                    "global populated seed");
+                unowned->timestamps[0] = idb_timestamp(0);
+            }
+            GLOBAL_CHECK(session_add_rel(coord, unowned) == 0, "global target");
+            unowned = NULL;
+        }
+    }
+    wl_columnar_eval_test_outbound_after_plan = global_publication_worker;
+    wl_columnar_eval_test_global_publication = global_publication_boundary;
+    int rc = wl_session_snapshot(session, collect_tuple, &tuples);
+    fail_next_alloc = false;
+    idb_restore_budget(coord);
+    GLOBAL_CHECK(global_publication_hit && global_publication_hook_rc == 0
+        && atomic_load(&global_publication_workers) == (1u << workers) - 1,
+        "actual global-read boundary and workers");
+    if (mode != 0) {
+        GLOBAL_CHECK(rc == (mode <= 3 ? EBUSY : mode == 8 ? ENOSPC : ENOMEM) &&
+            tuples.count == 0,
+            "global publication failure status or callbacks");
+        GLOBAL_CHECK(coord->mem_channel_ring_bytes == 0 &&
+            coord->delta_queue == NULL,
+            "global failed channel ownership");
+        if (mode <= 3) {
+            for (unsigned retry = 0; retry < 2; retry++) {
+                GLOBAL_CHECK(global_publication_held->nrows ==
+                    global_publication_rows
+                    && global_publication_held->view_generation ==
+                    global_publication_view
+                    && global_publication_held->storage_generation ==
+                    global_publication_storage,
+                    "held global relation changed");
+                GLOBAL_CHECK(wl_session_snapshot(session, collect_tuple,
+                    &tuples) == EBUSY
+                    && tuples.count == 0, "repeated global refusal");
+            }
+            GLOBAL_CHECK(col_rel_source_reader_release(
+                    &global_publication_reader) == 0,
+                "global reader release");
+            col_rel_destroy(global_publication_alias);
+            global_publication_alias = NULL;
+        }
+        wl_columnar_eval_test_global_publication = NULL;
+        GLOBAL_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0,
+            "global exact public retry");
+    } else GLOBAL_CHECK(rc == 0, "global healthy snapshot");
+    unsigned expected = initial == 2 ? 4 : 2;
+    GLOBAL_CHECK(tuples.count == expected && coord->tdd_workers_count == 0,
+        "global exact tuple count and teardown");
+    for (uint32_t ri = 0; ri < 2; ri++) {
+        col_rel_t *r = session_find_rel(coord, relations[ri].name);
+        GLOBAL_CHECK(r && r->nrows == expected / 2 && r->ncols == 2
+            && col_rel_get(r, r->nrows - 1, 0) == 42
+            && col_rel_get(r, r->nrows - 1, 1) == 42,
+            "global exact stored set");
+        if (initial != 0)
+            GLOBAL_CHECK(r->column_types &&
+                r->column_types[0] == WIRELOG_TYPE_INT64
+                && r->timestamps, "global metadata and timestamps");
+        if (initial == 2)
+            GLOBAL_CHECK(col_rel_get(r, 0, 0) == 7 && col_rel_get(r, 0, 1) == 7
+                && r->timestamps[0].iteration == idb_timestamp(0).iteration,
+                "global seed provenance");
+    }
+cleanup:
+    wl_columnar_eval_test_global_publication = NULL;
+    wl_columnar_eval_test_outbound_after_plan = NULL;
+    fail_next_alloc = false;
+    if (session) idb_restore_budget(COL_SESSION(session));
+    if (global_publication_reader.owner)
+        (void)col_rel_source_reader_release(&global_publication_reader);
+    col_rel_destroy(global_publication_alias);
+    col_rel_destroy(unowned);
+    free(values);
+    wl_session_destroy(session);
+    if (governor) {
+        if (reserved_on(governor) != 0 &&
+            !failure) failure = "global retained reservation leak";
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef GLOBAL_CHECK
 }
 
 static void
@@ -8298,6 +8509,19 @@ main(void)
     test_tdd_outbound_frame_retention(8, 3, 0, true);
     test_tdd_outbound_frame_retention(2, 5, 0, true);
     test_tdd_outbound_frame_retention(8, 6, 1, true);
+    for (uint32_t workers = 2; workers <= 8; workers *= 4) {
+        for (unsigned initial = 0; initial < 3; initial++)
+            test_global_read_publication(workers, initial, 0, 0, false);
+        for (unsigned mode = 1; mode <= 8; mode++) {
+            test_global_read_publication(workers, 1, mode, 0, false);
+            test_global_read_publication(workers, 1, mode, 1, false);
+        }
+        test_global_read_publication(workers, 0, 9, 0, false);
+        test_global_read_publication(workers, 0, 9, 1, false);
+        test_global_read_publication(workers, 1, 0, 1, true);
+        test_global_read_publication(workers, 1, 1, 1, true);
+        test_global_read_publication(workers, 1, 3, 1, true);
+    }
     test_tdd_recursive_frame_retention(2, 0, 0, true);
     test_tdd_recursive_frame_retention(8, 3, 1, true);
     for (unsigned mode = 0; mode < 7; mode++) {

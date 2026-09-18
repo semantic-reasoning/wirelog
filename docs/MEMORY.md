@@ -810,9 +810,18 @@ releasing the writer; consumers wait for the worker barrier. Failure retains
 the candidate for checked disposal. Earlier queued payloads remain independent
 and are reclaimed after the barrier if a later rule fails.
 
-Global-read coordinator publication still conflicts with its worker IDB views
-and has incomplete failed-exchange payload cleanup (#1704). Frame recovery is
-covered separately from that outstanding successful-exchange contract.
+Global-read exchange prepares admitted empty replacements for every worker view
+of a changed IDB, then retires those views with checked registration replacement
+before publishing coordinator rows. External readers still refuse publication;
+a retired prefix remains independently owned. Combined deltas preserve schema,
+compound metadata and timestamps and use checked normalization. First publication
+into a schema-less target adopts complete metadata through checked replacement.
+Worker views refresh only after publication; zero-progress targets and empty
+next-delta registrations retain their existing semantics. An exchange failure
+reclaims every untransferred fresh matrix payload before checked cohort cleanup.
+Publication is atomic per target, not per exchange: a successful prefix can
+remain, and public snapshot retry completes the exact set after dependencies
+release without emitting callbacks for the failed attempt.
 
 Cleanup refusal remains an integration gap for specialized parallel rule
 evaluation: #1647 covers lost popped results,
