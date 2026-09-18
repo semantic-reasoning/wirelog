@@ -3815,6 +3815,7 @@ test_diff_consolidate_exe = executable(
   files('test_diff_consolidate.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   link_with: [testlib_prod],
 )
 
