@@ -603,7 +603,10 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
     if (pop_rc != 0)
         return pop_rc;
 
-    col_rel_t *out = col_rel_pool_new_like(sess->delta_pool, "$filter", e.rel);
+    wl_columnar_memory_governor_ref_t *governor = sess->memory_governor
+        ? sess->memory_governor : e.rel->memory_governor;
+    col_rel_t *out = wl_columnar_relation_pool_new_like_governed(
+        sess->delta_pool, "$filter", e.rel, governor);
     if (!out) {
         return wl_columnar_filter_dispose_input(stack, &e, ENOMEM);
     }
@@ -712,9 +715,7 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
         int64_t *tmp = (int64_t *)malloc(cap * sizeof(int64_t));
         if (!tmp) {
             col_rel_destroy(out);
-            if (e.owned)
-                col_rel_destroy(e.rel);
-            return ENOMEM;
+            return wl_columnar_filter_dispose_input(stack, &e, ENOMEM);
         }
 
         uint32_t nout = 0;
@@ -739,9 +740,7 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
             if (!sel) {
                 free(tmp);
                 col_rel_destroy(out);
-                if (e.owned)
-                    col_rel_destroy(e.rel);
-                return ENOMEM;
+                return wl_columnar_filter_dispose_input(stack, &e, ENOMEM);
             }
 
             /*
@@ -816,14 +815,15 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
             if (rc != 0) {
                 free(tmp);
                 col_rel_destroy(out);
-                if (e.owned)
-                    col_rel_destroy(e.rel);
-                return rc;
+                return wl_columnar_filter_dispose_input(stack, &e, rc);
             }
         }
         free(tmp);
-        if (e.owned)
-            col_rel_destroy(e.rel);
+        int cleanup_rc = wl_columnar_filter_dispose_input(stack, &e, 0);
+        if (cleanup_rc != 0) {
+            (void)col_rel_destroy_checked(out);
+            return cleanup_rc;
+        }
         return eval_stack_push(stack, out, true);
     }
 

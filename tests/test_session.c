@@ -10071,9 +10071,140 @@ cleanup:
 #undef PROMOTE_CHECK
 }
 
+static void
+test_filter_governed_admission(unsigned route, bool timestamped,
+    unsigned phase, bool session_governor)
+{
+    TEST("FILTER managed allocation and held-input retry");
+    const char *failure = NULL;
+    wl_columnar_memory_governor_ref_t *ref = enforcing_governor(1u << 20);
+    wl_columnar_memory_governor_ref_t *other = enforcing_governor(1u << 20);
+    wl_col_session_t sess = { 0 };
+    col_rel_t *input = col_rel_new_auto("filter-managed", 1);
+    col_rel_t *occupied = NULL;
+    delta_pool_t *pool = NULL;
+    eval_stack_t stack;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    bool held = false, local_owner = true;
+    eval_stack_init(&stack);
+#define FILTER_CHECK(c, msg) do { if (!(c)) { failure = msg; goto cleanup; \
+                                  } } while (0)
+    FILTER_CHECK(ref && other && input, "setup");
+    wl_columnar_memory_governor_t *g = wl_columnar_memory_governor_ref_get(ref);
+    for (uint32_t i = 0; i < COL_REL_INIT_CAP + 1; i++) {
+        int64_t value = i + 1;
+        FILTER_CHECK(col_rel_append_row(input, &value) == 0, "input rows");
+    }
+    if (timestamped) {
+        FILTER_CHECK(col_rel_enable_timestamps(input) == 0, "input timestamps");
+        for (uint32_t i = 0; i < input->nrows; i++)
+            input->timestamps[i] = (col_delta_timestamp_t){
+                .iteration = i + 10, .stratum = i + 20, .worker = i + 30,
+                .multiplicity = i % 2 ? -3 : 5
+            };
+    }
+    FILTER_CHECK(col_rel_attach_memory_governor(input,
+        session_governor ? other : ref) == 0, "source governor");
+    sess.memory_governor = session_governor ? ref : NULL;
+    if (route) {
+        pool = delta_pool_create_managed(8, sizeof(col_rel_t), 64, g);
+        FILTER_CHECK(pool, "managed pool");
+        if (route == 2) {
+            /* Consume real slab slots, retaining only the last descriptor:
+             * earlier empty descriptors are destroyed before the next alloc. */
+            while (pool->slot_used < pool->slot_cap) {
+                col_rel_destroy(occupied);
+                occupied = col_rel_pool_new_like(pool, "occupied", input);
+                FILTER_CHECK(occupied && occupied->pool_owned,
+                    "pool exhaustion");
+            }
+        }
+    }
+    sess.delta_pool = pool;
+    uint64_t baseline = reserved_on(ref);
+    uint64_t payload = (uint64_t)COL_REL_INIT_CAP * sizeof(int64_t);
+    uint64_t ts = (uint64_t)COL_REL_INIT_CAP * sizeof(col_delta_timestamp_t);
+    uint64_t allowance = phase == 0 ? 0 : payload;
+    if (phase >= 2 && timestamped) allowance += ts;
+    if (phase == 3) allowance = 1u << 19;
+    atomic_store_explicit(&g->usable_bytes, baseline + allowance,
+        memory_order_release);
+    FILTER_CHECK(col_rel_source_reader_acquire(input, &reader) == 0, "reader");
+    held = true;
+    FILTER_CHECK(eval_stack_push(&stack, input, true) == 0, "push");
+    local_owner = false;
+    stack.items[0].seg_boundaries = malloc(2 * sizeof(uint32_t));
+    FILTER_CHECK(stack.items[0].seg_boundaries, "segments");
+    stack.items[0].seg_boundaries[0] = 0;
+    stack.items[0].seg_boundaries[1] = input->nrows;
+    stack.items[0].seg_count = 1;
+    uint32_t *segments = stack.items[0].seg_boundaries;
+    uint64_t generation = input->view_generation;
+    uint8_t expr[] = { WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '0',
+                       WL_PLAN_EXPR_CONST_INT, 0, 0, 0, 0, 0, 0, 0, 0,
+                       WL_PLAN_EXPR_CMP_GT };
+    wl_plan_op_t op = { .op = WL_PLAN_OP_FILTER,
+                        .filter_expr = { expr, sizeof(expr) } };
+    for (unsigned attempt = 0; attempt < 2; attempt++) {
+        FILTER_CHECK(wl_columnar_filter_op(&op, &stack, &sess) == EBUSY,
+            "held input cleanup must refuse");
+        FILTER_CHECK(stack.top == 1 && stack.items[0].rel == input
+            && stack.items[0].owned && stack.items[0].seg_boundaries == segments
+            && input->view_generation == generation,
+            "refusal preserves input and segments");
+        FILTER_CHECK(reserved_on(ref) == baseline, "private output released");
+    }
+    FILTER_CHECK(col_rel_source_reader_release(&reader) == 0, "release");
+    held = false;
+    atomic_store_explicit(&g->usable_bytes, 1u << 20, memory_order_release);
+    FILTER_CHECK(wl_columnar_filter_op(&op, &stack, &sess) == 0,
+        "retry succeeds");
+    input = NULL;
+    FILTER_CHECK(stack.top == 1 && stack.items[0].rel->memory_governor == ref,
+        "effective governor on output");
+    col_rel_t *out = stack.items[0].rel;
+    FILTER_CHECK(out->pool_owned == (route == 1)
+        && out->nrows == COL_REL_INIT_CAP + 1, "route and row count");
+    for (uint32_t i = 0; i < out->nrows; i++) {
+        FILTER_CHECK(out->columns[0][i] == i + 1, "exact rows");
+        if (timestamped)
+            FILTER_CHECK(out->timestamps &&
+                out->timestamps[i].iteration == i + 10
+                && out->timestamps[i].stratum == i + 20
+                && out->timestamps[i].worker == i + 30
+                && out->timestamps[i].multiplicity == (i % 2 ? -3 : 5),
+                "exact timestamp record");
+    }
+cleanup:
+    if (held) (void)col_rel_source_reader_release(&reader);
+    (void)eval_stack_drain(&stack);
+    if (local_owner) col_rel_destroy(input);
+    col_rel_destroy(occupied);
+    delta_pool_destroy(pool);
+    if (ref) {
+        if (reserved_on(ref) != 0) failure = "reservation leak";
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (other) {
+        if (reserved_on(other) != 0) failure = "source governor leak";
+        wl_columnar_memory_governor_ref_release(other);
+    }
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef FILTER_CHECK
+}
+
 int
 main(void)
 {
+    for (unsigned route = 0; route < 3; route++)
+        for (unsigned ts = 0; ts < 2; ts++)
+            for (unsigned phase = 0; phase < 4; phase++)
+                for (unsigned sg = 0; sg < 2; sg++)
+                    test_filter_governed_admission(route, ts != 0, phase,
+                        sg != 0);
     test_governed_worker_filter_publication(2);
     test_governed_worker_filter_publication(8);
     test_governed_pool_publication(0);
