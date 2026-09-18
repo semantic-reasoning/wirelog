@@ -1593,7 +1593,6 @@ col_session_get_mem_stats(wl_session_t *session, wl_columnar_mem_stats_t *out)
     if (!session)
         return;
     wl_col_session_t *sess = COL_SESSION(session);
-
     wl_mem_ledger_snapshot_t snap;
     wl_mem_ledger_snapshot(&sess->mem_ledger, &snap);
     out->budget_bytes = snap.total_budget;
@@ -2498,6 +2497,17 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->memory_governor = coordinator->memory_governor;
     wl_columnar_memory_governor_ref_retain(out_worker->memory_governor);
     out_worker->extension_expr_status = 0;
+    /* Recovery continuations belong only to the coordinator; workers are
+     * disposable execution clones and must never inherit one. */
+    out_worker->plain_step_completion_pending = false;
+    out_worker->plain_step_completion_active = false;
+    out_worker->plain_step_completion_step_context = false;
+    out_worker->plain_step_completion_mask = UINT64_MAX;
+    out_worker->plain_step_completion_stratum = 0;
+    out_worker->plain_step_completion_phase =
+        WL_COLUMNAR_PLAIN_STEP_COMPLETION_NONE;
+    out_worker->plain_step_completion_relation = 0;
+    out_worker->plain_step_completion_workers_retired = false;
     out_worker->callback_session_key = coordinator->callback_session_key;
     out_worker->delta_events = NULL;
     out_worker->delta_event_count = 0;
@@ -2900,6 +2910,8 @@ col_session_insert(wl_session_t *session, const char *relation,
      * which already reroutes to col_session_remove_incremental in the same
      * condition. */
     wl_col_session_t *sess = COL_SESSION(session);
+    if (sess->plain_step_completion_pending)
+        return EBUSY;
     if (sess->delta_cb != NULL)
         return col_session_insert_incremental(session, relation, data,
                    num_rows, num_cols);
@@ -2991,6 +3003,8 @@ col_session_make_compound(wl_session_t *session, const char *functor,
     wl_col_session_t *sess = COL_SESSION(session);
     if (!sess || !sess->compound_arena)
         return EINVAL;
+    if (sess->plain_step_completion_pending)
+        return EBUSY;
     if (sess->delta_observer || sess->delta_publish_active)
         return EBUSY;
     int cleanup_rc = wl_columnar_session_cleanup_ready_quiescent(sess);
@@ -3080,6 +3094,8 @@ col_session_insert_incremental(wl_session_t *session, const char *relation,
     if (COL_SESSION(session)->delta_observer
         || COL_SESSION(session)->delta_publish_active)
         return EBUSY;
+    if (COL_SESSION(session)->plain_step_completion_pending)
+        return EBUSY;
 
     int cleanup_rc = wl_columnar_session_cleanup_ready_quiescent(
         COL_SESSION(session));
@@ -3133,8 +3149,12 @@ col_session_remove(wl_session_t *session, const char *relation,
     if (COL_SESSION(session)->delta_observer
         || COL_SESSION(session)->delta_publish_active)
         return EBUSY;
+    if (COL_SESSION(session)->plain_step_completion_pending)
+        return EBUSY;
 
     wl_col_session_t *sess = COL_SESSION(session);
+    if (sess->plain_step_completion_pending)
+        return EBUSY;
     if (sess->delta_cb != NULL)
         return col_session_remove_incremental(session, relation, data, num_rows,
                    num_cols);
@@ -3233,6 +3253,8 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
         return 0;
     if (COL_SESSION(session)->delta_observer
         || COL_SESSION(session)->delta_publish_active)
+        return EBUSY;
+    if (COL_SESSION(session)->plain_step_completion_pending)
         return EBUSY;
 
     wl_col_session_t *sess = COL_SESSION(session);
@@ -3387,6 +3409,11 @@ static int
 col_session_step(wl_session_t *session)
 {
     wl_col_session_t *sess = COL_SESSION(session);
+    if (sess->plain_step_completion_pending
+        && sess->plain_step_completion_active)
+        return EBUSY;
+    if (!sess->plain_step_completion_pending)
+        sess->plain_step_completion_step_context = false;
     if (sess->delta_publish_active || sess->cleanup_active
         || wl_columnar_eval_delta_rollback_active(sess)
         || wl_columnar_eval_delta_observer_active(sess))
@@ -3398,9 +3425,38 @@ col_session_step(wl_session_t *session)
     if (deferred_rc != 0)
         return deferred_rc;
     const wl_plan_t *plan = sess->plan;
+    if (!sess->plain_step_completion_pending)
+        sess->plain_step_completion_step_context =
+            sess->delta_observer == NULL && sess->delta_cb == NULL;
+    uint32_t completion_start = 0;
+    bool completing_plain_step = sess->plain_step_completion_pending;
+    uint64_t completion_mask = UINT64_MAX;
+    if (completing_plain_step) {
+        if (sess->plain_step_completion_active)
+            return EBUSY;
+        sess->plain_step_completion_active = true;
+        if (sess->plain_step_completion_phase
+            == WL_COLUMNAR_PLAIN_STEP_COMPLETION_COMPACT)
+            goto compact_staged_deltas;
+        if (sess->plain_step_completion_phase
+            != WL_COLUMNAR_PLAIN_STEP_COMPLETION_FINALIZE_NONREC
+            && sess->plain_step_completion_phase
+            != WL_COLUMNAR_PLAIN_STEP_COMPLETION_EVALUATE_REMAINING)
+            return EBUSY;
+        completion_start = sess->plain_step_completion_stratum + 1;
+        completion_mask = sess->plain_step_completion_mask;
+        if (sess->plain_step_completion_phase
+            == WL_COLUMNAR_PLAIN_STEP_COMPLETION_FINALIZE_NONREC) {
+            int resume_rc =
+                wl_columnar_eval_resume_nonrecursive_completion(sess);
+            if (resume_rc != 0)
+                return resume_rc;
+        }
+    }
     sess->extension_expr_status = 0;
 
-    if (!sess->delta_observer && sess->delta_cb && !sess->pending_input_change
+    if (!completing_plain_step && !sess->delta_observer && sess->delta_cb
+        && !sess->pending_input_change
         && sess->last_inserted_relation == NULL
         && sess->last_removed_relation == NULL){
         col_session_reclaim_quiescent(sess);
@@ -3415,8 +3471,9 @@ col_session_step(wl_session_t *session)
      * neither pointer is set (regular step) UINT64_MAX means all strata are
      * evaluated, and pending_full_input_eval ("this step cannot be
      * incremental") keeps that default no matter what is pending. */
-    uint64_t affected_mask = UINT64_MAX;
-    if (!sess->pending_full_input_eval
+    uint64_t affected_mask =
+        completing_plain_step ? completion_mask : UINT64_MAX;
+    if (!completing_plain_step && !sess->pending_full_input_eval
         && (sess->last_inserted_relation != NULL
         || sess->last_removed_relation != NULL)) {
         affected_mask = 0;
@@ -3429,15 +3486,19 @@ col_session_step(wl_session_t *session)
                 session, sess->last_removed_relation);
         }
     }
+    if (sess->plain_step_completion_step_context
+        && !completing_plain_step)
+        sess->plain_step_completion_mask = affected_mask;
 
-    if (sess->delta_observer) {
+    if (!completing_plain_step && sess->delta_observer) {
         affected_mask = wl_columnar_eval_delta_observer_mask(sess);
-    } else if (sess->delta_cb) {
+    } else if (!completing_plain_step && sess->delta_cb) {
         int rc = wl_columnar_eval_delta_observer_begin(sess, affected_mask);
         if (rc != 0)
             return rc;
     }
-    wl_columnar_eval_delta_observer_set_active(sess, true);
+    if (!completing_plain_step)
+        wl_columnar_eval_delta_observer_set_active(sess, true);
     if (wl_columnar_eval_delta_observer_evaluated(sess))
         goto compact_staged_deltas;
 
@@ -3467,7 +3528,7 @@ col_session_step(wl_session_t *session)
      * Selective reset based on pre-seeded delta is only in col_session_snapshot.
      *
      * @see col_session_snapshot for selective rule frontier reset (Issue #107) */
-    if (affected_mask == UINT64_MAX) {
+    if (affected_mask == UINT64_MAX && !completing_plain_step) {
         /* Full evaluation (non-incremental): reset all rules to (current_epoch, UINT32_MAX)
          * sentinel. Prevents premature skip across different evaluation contexts. */
         for (uint32_t ri = 0; ri < MAX_RULES; ri++) {
@@ -3478,7 +3539,8 @@ col_session_step(wl_session_t *session)
         /* Incremental (delta callback mode): reset affected rules to (current_epoch, UINT32_MAX).
          * No pre-seeded deltas in this path, so reset unconditionally. */
         for (uint32_t si = 0; si < plan->stratum_count; si++) {
-            if (col_affected_mask_contains(affected_mask, si)) {
+            if (col_affected_mask_contains(affected_mask, si)
+                && (!completing_plain_step || si >= completion_start)) {
                 uint32_t rule_base = 0;
                 for (uint32_t j = 0; j < si; j++)
                     rule_base += plan->strata[j].relation_count;
@@ -3496,21 +3558,27 @@ col_session_step(wl_session_t *session)
 
     wl_columnar_delta_events_clear(sess);
     sess->delta_event_transaction = false;
-    for (uint32_t si = 0; si < plan->stratum_count; si++) {
+    for (uint32_t si = completion_start; si < plan->stratum_count; si++) {
         /* Skip strata not affected by the last incremental insertion */
         if (!col_affected_mask_contains(affected_mask, si))
             continue;
 
         const wl_plan_stratum_t *sp = &plan->strata[si];
-        int rc = sess->delta_observer
+        int rc = (!completing_plain_step && sess->delta_observer)
             ? col_stratum_step_with_delta(sp, sess, si)
             : col_eval_stratum_tdd(sp, sess, si);
         if (rc != 0) {
             sess->delta_event_transaction = false;
             wl_columnar_delta_events_clear(sess);
             wl_columnar_eval_delta_observer_set_active(sess, false);
+            sess->plain_step_completion_active = false;
             col_session_reclaim_quiescent(sess);
             return rc;
+        }
+        if (sess->plain_step_completion_step_context) {
+            sess->plain_step_completion_stratum = si;
+            sess->plain_step_completion_phase =
+                WL_COLUMNAR_PLAIN_STEP_COMPLETION_EVALUATE_REMAINING;
         }
     }
     wl_columnar_eval_delta_observer_set_evaluated(sess);
@@ -3519,14 +3587,21 @@ compact_staged_deltas:
      * pending operation state or removing temporary retraction relations so
      * EBUSY can be retried without committing session bookkeeping or
      * publishing duplicate delta events. */
+    if (sess->plain_step_completion_step_context) {
+        sess->plain_step_completion_pending = true;
+        sess->plain_step_completion_active = true;
+        sess->plain_step_completion_phase =
+            WL_COLUMNAR_PLAIN_STEP_COMPLETION_COMPACT;
+    }
     int compact_rc = col_rel_compact_many(sess->rels, sess->nrels);
     if (compact_rc != 0) {
+        sess->plain_step_completion_active = false;
         wl_columnar_eval_delta_observer_set_active(sess, false);
         col_session_reclaim_quiescent(sess);
         return compact_rc;
     }
 
-    if (sess->delta_observer) {
+    if (!completing_plain_step && sess->delta_observer) {
         int prepare_rc = wl_columnar_eval_delta_observer_prepare(sess);
         if (prepare_rc != 0) {
             wl_columnar_eval_delta_observer_set_active(sess, false);
@@ -3555,6 +3630,11 @@ compact_staged_deltas:
     sess->pending_input_change = false;
     sess->pending_full_input_eval = false;
     sess->has_evaluated = true;
+    sess->plain_step_completion_pending = false;
+    sess->plain_step_completion_active = false;
+    sess->plain_step_completion_phase =
+        WL_COLUMNAR_PLAIN_STEP_COMPLETION_NONE;
+    sess->plain_step_completion_step_context = false;
     for (uint32_t i = 0; i < sess->nrels; i++) {
         col_rel_t *r = sess->rels[i];
         if (r)
@@ -3873,6 +3953,11 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
         return EINVAL;
 
     wl_col_session_t *sess = COL_SESSION(session);
+    if (sess->plain_step_completion_pending
+        && sess->plain_step_completion_active)
+        return EBUSY;
+    if (!sess->plain_step_completion_pending)
+        sess->plain_step_completion_step_context = false;
     if (sess->delta_observer || sess->delta_publish_active)
         return EBUSY;
     int cleanup_rc = wl_columnar_session_cleanup_ready_quiescent(sess);
@@ -3881,6 +3966,12 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
     int deferred_rc = wl_columnar_session_retry_deferred(sess);
     if (deferred_rc != 0)
         return deferred_rc;
+    if (sess->plain_step_completion_pending) {
+        /* Drain a refused plain STEP before snapshot callbacks are emitted. */
+        int resume_rc = col_session_step(session);
+        if (resume_rc != 0)
+            return resume_rc;
+    }
     const wl_plan_t *plan = sess->plan;
     sess->extension_expr_status = 0;
     const char *tdd_profile = getenv("WIRELOG_TDD_STRATUM_PROFILE");

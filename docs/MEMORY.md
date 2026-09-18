@@ -1126,3 +1126,15 @@ rows, since a smaller result makes the bulk reserve a no-op.
 `WL_MEM_REPORT` total reconciliation is asserted only narrowly here: the
 cache-clear case proves that clearing releases exactly the output's token.
 A full report-level reconciliation for join outputs is not covered.
+
+## 10c. Plain STEP completion recovery (#1713)
+
+When a nonrecursive TDD plain `STEP` has merged worker results but checked
+relation finalization or compaction returns `EBUSY`, the coordinator retains a
+bounded scalar completion cursor. A later public `STEP` or `SNAPSHOT` resumes
+that cursor before evaluating or emitting anything else; completed worker
+publication is not replayed. Relation and alias readers therefore keep their
+rows, generations, provenance, and reservations unchanged across refusal.
+Input and compound mutations remain refused while completion is pending. The
+continuation is limited to post-merge nonrecursive completion; arbitrary
+mid-operator or partial-merge rollback is outside this contract.
