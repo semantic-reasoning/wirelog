@@ -2976,6 +2976,258 @@ map_storage_cleanup:
 #undef STORAGE_CHECK
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+static bool reduce_dispose_hook_hit;
+static wl_columnar_source_access_reader_t reduce_dispose_reader;
+
+static void
+reduce_dispose_refusal_hook(eval_stack_t *stack, eval_entry_t *entry)
+{
+    col_rel_t *heap = NULL;
+    (void)stack;
+    if (reduce_dispose_hook_hit || !entry->owned || !entry->rel)
+        return;
+    if (col_rel_deep_copy(entry->rel, &heap, NULL) != 0)
+        return;
+    col_rel_destroy(entry->rel);
+    entry->rel = heap;
+    reduce_dispose_hook_hit = true;
+    (void)col_rel_source_reader_acquire(entry->rel, &reduce_dispose_reader);
+}
+
+static void
+test_reduce_input_cleanup_retry(void)
+{
+    TEST("REDUCE retains reader-busy input for exact retry");
+    uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } },
+        { .op = WL_PLAN_OP_REDUCE, .aggregate_index = 0,
+          .agg_fn = WIRELOG_AGG_COUNT }
+    };
+    wl_plan_relation_t output = { .name = "output", .delta_name = "$d$output",
+                                  .ops = ops, .op_count = 3 };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    int64_t values[] = { 7, 42 };
+    tuple_collector_t tuples = { 0 };
+    const char *failure = NULL;
+#define REDUCE_CHECK(c, m) \
+        do { if (!(c)) { failure = (m); goto reduce_cleanup; } } while (0)
+    reduce_dispose_hook_hit = false;
+    memset(&reduce_dispose_reader, 0, sizeof(reduce_dispose_reader));
+    wl_columnar_ops_test_before_reduce_dispose = reduce_dispose_refusal_hook;
+    REDUCE_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0,
+        "REDUCE session");
+    REDUCE_CHECK(wl_session_insert(session, "input", values, 2, 1) == 0,
+        "REDUCE input");
+    REDUCE_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == EBUSY
+        && tuples.count == 0 && reduce_dispose_hook_hit,
+        "REDUCE refusal");
+    REDUCE_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == EBUSY
+        && tuples.count == 0, "REDUCE repeated refusal");
+    REDUCE_CHECK(col_rel_source_reader_release(&reduce_dispose_reader) == 0,
+        "REDUCE reader release");
+    memset(&tuples, 0, sizeof(tuples));
+    REDUCE_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0
+        && tuples.count == 1 && has_tuple(&tuples, "output",
+        (int64_t[]){ 2 }, 1), "REDUCE retry");
+reduce_cleanup:
+    wl_columnar_ops_test_before_reduce_dispose = NULL;
+    if (reduce_dispose_reader.owner)
+        (void)col_rel_source_reader_release(&reduce_dispose_reader);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef REDUCE_CHECK
+}
+
+static void
+test_reduce_entry_storage_modes(void)
+{
+    TEST("REDUCE preserves heap/pool/arena entries and error precedence");
+    wl_plan_relation_t output = { .name = "output", .delta_name = "$d$output" };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1 };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1 };
+    wl_plan_op_t reduce_op = { .op = WL_PLAN_OP_REDUCE,
+                               .aggregate_index = 0,
+                               .agg_fn = WIRELOG_AGG_COUNT };
+    wl_session_t *session = NULL;
+    const char *failure = NULL;
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    wl_columnar_source_access_reader_t reader = { 0 };
+    col_rel_t *unstacked = NULL, *unowned = NULL;
+#define REDUCE_STORAGE_CHECK(c, m) \
+        do { if (!(c)) { failure = (m); goto reduce_storage_cleanup; \
+             } } while (0)
+    REDUCE_STORAGE_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "REDUCE storage session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    for (unsigned mode = 0; mode < 3; mode++) {
+        eval_stack_init(&stack);
+        memset(&reader, 0, sizeof(reader));
+        unstacked = NULL;
+        col_rel_t *input = mode == 0 ? col_rel_new_auto("heap", 1)
+            : col_rel_pool_new_auto(coord->delta_pool,
+                mode == 2 ? coord->eval_arena : NULL, "owned", 1);
+        REDUCE_STORAGE_CHECK(input, "REDUCE storage relation");
+        unstacked = input;
+        int64_t value = 42;
+        REDUCE_STORAGE_CHECK(col_rel_append_row(input, &value) == 0,
+            "REDUCE storage row");
+        for (unsigned lower_idx = 0; lower_idx < COL_STACK_MAX - 1;
+            lower_idx++) {
+            col_rel_t *lower = col_rel_new_auto("lower", 1);
+            int64_t lower_value = (int64_t)lower_idx;
+            REDUCE_STORAGE_CHECK(lower, "REDUCE lower relation");
+            if (col_rel_append_row(lower, &lower_value) != 0
+                || eval_stack_push(&stack, lower, true) != 0) {
+                col_rel_destroy(lower);
+                failure = "REDUCE lower stack";
+                goto reduce_storage_cleanup;
+            }
+            if (lower_idx == 0) {
+                stack.items[0].seg_boundaries =
+                    malloc(2 * sizeof(uint32_t));
+                REDUCE_STORAGE_CHECK(stack.items[0].seg_boundaries,
+                    "REDUCE lower metadata");
+                stack.items[0].seg_count = 1;
+                stack.items[0].seg_boundaries[0] = 0;
+                stack.items[0].seg_boundaries[1] = 1;
+            }
+        }
+        REDUCE_STORAGE_CHECK(eval_stack_push(&stack, input, true) == 0,
+            "REDUCE input stack");
+        unstacked = NULL;
+        stack.items[COL_STACK_MAX - 1].seg_boundaries =
+            malloc(3 * sizeof(uint32_t));
+        REDUCE_STORAGE_CHECK(stack.items[COL_STACK_MAX - 1].seg_boundaries,
+            "REDUCE input metadata");
+        stack.items[COL_STACK_MAX - 1].seg_count = 2;
+        stack.items[COL_STACK_MAX - 1].seg_boundaries[0] = 0;
+        stack.items[COL_STACK_MAX - 1].seg_boundaries[1] = 1;
+        stack.items[COL_STACK_MAX - 1].seg_boundaries[2] = 1;
+        uint32_t *input_segments = stack.items[COL_STACK_MAX -
+                1].seg_boundaries;
+        REDUCE_STORAGE_CHECK(col_rel_source_reader_acquire(input, &reader) == 0,
+            "REDUCE storage reader");
+        col_rel_t *held = input;
+        REDUCE_STORAGE_CHECK(col_op_reduce(&reduce_op, &stack, coord) == EBUSY
+            && stack.top == COL_STACK_MAX
+            && stack.items[COL_STACK_MAX - 1].rel == held
+            && stack.items[COL_STACK_MAX - 1].seg_boundaries == input_segments,
+            "REDUCE storage refusal");
+        REDUCE_STORAGE_CHECK(col_op_reduce(&reduce_op, &stack, coord) == EBUSY
+            && stack.top == COL_STACK_MAX
+            && stack.items[COL_STACK_MAX - 1].rel == held,
+            "REDUCE storage repeated refusal");
+        REDUCE_STORAGE_CHECK(col_rel_source_reader_release(&reader) == 0,
+            "REDUCE storage release");
+        REDUCE_STORAGE_CHECK(col_op_reduce(&reduce_op, &stack, coord) == 0
+            && stack.top == COL_STACK_MAX
+            && stack.items[COL_STACK_MAX - 1].rel != held
+            && col_rel_get(stack.items[COL_STACK_MAX - 1].rel, 0, 0) == 1,
+            "REDUCE storage retry");
+        REDUCE_STORAGE_CHECK(eval_stack_drain(&stack) == 0,
+            "REDUCE storage drain");
+    }
+    eval_stack_init(&stack);
+    col_rel_t *borrowed = col_rel_new_auto("borrowed", 1);
+    REDUCE_STORAGE_CHECK(borrowed, "REDUCE borrowed relation");
+    unowned = borrowed;
+    int64_t borrowed_value = 99;
+    REDUCE_STORAGE_CHECK(col_rel_append_row(borrowed, &borrowed_value) == 0
+        && eval_stack_push(&stack, borrowed, false) == 0,
+        "REDUCE borrowed stack");
+    stack.items[0].seg_boundaries = malloc(2 * sizeof(uint32_t));
+    REDUCE_STORAGE_CHECK(stack.items[0].seg_boundaries,
+        "REDUCE borrowed metadata");
+    stack.items[0].seg_count = 1;
+    stack.items[0].seg_boundaries[0] = 0;
+    stack.items[0].seg_boundaries[1] = 1;
+    REDUCE_STORAGE_CHECK(col_rel_source_reader_acquire(borrowed, &reader) == 0,
+        "REDUCE borrowed reader");
+    REDUCE_STORAGE_CHECK(col_op_reduce(&reduce_op, &stack, coord) == 0
+        && stack.top == 1 && col_rel_get(stack.items[0].rel, 0, 0) == 1,
+        "REDUCE borrowed cleanup");
+    REDUCE_STORAGE_CHECK(col_rel_source_reader_release(&reader) == 0,
+        "REDUCE borrowed release");
+    col_rel_destroy(borrowed);
+    unowned = NULL;
+    REDUCE_STORAGE_CHECK(eval_stack_drain(&stack) == 0,
+        "REDUCE borrowed drain");
+    eval_stack_init(&stack);
+    col_rel_t *error_input = col_rel_new_auto("error", 1);
+    REDUCE_STORAGE_CHECK(error_input, "REDUCE error relation");
+    unstacked = error_input;
+    REDUCE_STORAGE_CHECK(col_rel_append_row(error_input, &borrowed_value) == 0
+        && eval_stack_push(&stack, error_input, true) == 0,
+        "REDUCE error stack");
+    unstacked = NULL;
+    uint8_t bad_expr[] = { WL_PLAN_EXPR_EXTENSION_CALL, 0 };
+    wl_plan_expr_buffer_t expr = { bad_expr, sizeof(bad_expr) };
+    wl_plan_op_t error_op = reduce_op;
+    error_op.agg_fn = WIRELOG_AGG_SUM;
+    error_op.agg_expr = expr;
+    REDUCE_STORAGE_CHECK(col_rel_source_reader_acquire(error_input,
+        &reader) == 0,
+        "REDUCE error reader");
+    REDUCE_STORAGE_CHECK(col_op_reduce(&error_op, &stack, coord) == EBUSY
+        && stack.top == 1, "REDUCE error refusal");
+    REDUCE_STORAGE_CHECK(col_rel_source_reader_release(&reader) == 0,
+        "REDUCE error release");
+    int reduce_error_rc = col_op_reduce(&error_op, &stack, coord);
+    REDUCE_STORAGE_CHECK(reduce_error_rc
+        == ERANGE && stack.top == 0,
+        "REDUCE error retry");
+#ifdef WL_SESSION_TEST_HOOKS
+    eval_stack_init(&stack);
+    col_rel_t *alloc_input = col_rel_new_auto("alloc", 1);
+    REDUCE_STORAGE_CHECK(alloc_input, "REDUCE allocation relation");
+    unstacked = alloc_input;
+    REDUCE_STORAGE_CHECK(col_rel_append_row(alloc_input, &borrowed_value) == 0
+        && eval_stack_push(&stack, alloc_input, true) == 0,
+        "REDUCE allocation stack");
+    unstacked = NULL;
+    REDUCE_STORAGE_CHECK(col_rel_source_reader_acquire(alloc_input,
+        &reader) == 0,
+        "REDUCE allocation reader");
+    wl_columnar_ops_test_reduce_fail_output_alloc = true;
+    REDUCE_STORAGE_CHECK(col_op_reduce(&reduce_op, &stack, coord) == EBUSY
+        && stack.top == 1, "REDUCE allocation refusal");
+    REDUCE_STORAGE_CHECK(col_rel_source_reader_release(&reader) == 0,
+        "REDUCE allocation release");
+    REDUCE_STORAGE_CHECK(col_op_reduce(&reduce_op, &stack, coord) == ENOMEM
+        && stack.top == 0, "REDUCE allocation retry");
+#endif
+reduce_storage_cleanup:
+#ifdef WL_SESSION_TEST_HOOKS
+    wl_columnar_ops_test_reduce_fail_output_alloc = false;
+#endif
+    if (reader.owner)
+        (void)col_rel_source_reader_release(&reader);
+    (void)eval_stack_drain(&stack);
+    if (unstacked)
+        col_rel_destroy(unstacked);
+    if (unowned)
+        col_rel_destroy(unowned);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef REDUCE_STORAGE_CHECK
+}
+#endif
+
 int
 main(void)
 {
@@ -3012,7 +3264,11 @@ main(void)
 #endif
     test_map_entry_storage_modes();
 #ifdef WL_SESSION_TEST_HOOKS
+    test_reduce_entry_storage_modes();
+#endif
+#ifdef WL_SESSION_TEST_HOOKS
     test_session_destroy_orders_worker_retirement();
+    test_reduce_input_cleanup_retry();
 #endif
     /* GREEN: col_session_remove returns 0 for uninitialized schema */
     /* test_session_snapshot_empty(); */
