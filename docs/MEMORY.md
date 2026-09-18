@@ -271,9 +271,13 @@ Final recursive aggregate canonicalization takes the canonical relation's source
 writer and excludes live storage aliases before changing rows or timestamps.
 Borrowed destinations refuse publication. Reader/alias refusal and group-map
 allocation failure preserve the relation; access is released before arrangement
-invalidation. This protects the shared aggregate boundary for serial and TDD
-callers. Repeated public TDD retry can also pass through separate final relation
-normalization; its checked-publication repair remains tracked by #1709.
+invalidation. TDD final relation normalization likewise uses an admitted private
+candidate and checked publication after worker dependencies retire. Merge paths
+consume worker results before teardown; finalization errors do not record
+convergence or advance completed iteration history. Private exchange intermediates
+and global-read exchange publication remain separate from this final boundary.
+Specialized nonrecursive publication to an existing output must also retire its
+worker input views before merge; that earlier boundary is tracked by #1711.
 
 Heap and pooled constructors create independently owned Arrow schemas, including
 untyped and zero-width relations. Clones preserve declared width, names, types,
