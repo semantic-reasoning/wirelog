@@ -38,6 +38,11 @@
 #include <arm_neon.h>
 #endif
 
+#ifdef WL_SESSION_TEST_HOOKS
+bool wl_columnar_consolidate_test_fail_copy_alloc;
+bool wl_columnar_consolidate_test_fail_copy_append;
+#endif
+
 static void *
 col_op_consolidate_malloc(size_t size, const char *site)
 {
@@ -1214,23 +1219,40 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
     col_rel_t *work = in;
     bool work_owned = e.owned;
     if (!work_owned) {
-        work = col_rel_pool_new_like(sess->delta_pool, "$consol", in);
+        work =
+#ifdef WL_SESSION_TEST_HOOKS
+            wl_columnar_consolidate_test_fail_copy_alloc
+                ? NULL :
+#endif
+            col_rel_pool_new_like(sess->delta_pool, "$consol", in);
         if (!work) {
-            if (e.seg_boundaries)
-                free(e.seg_boundaries);
+            /* Keep the borrowed input and its segment metadata available for
+             * a retry after transient allocation pressure. */
+            if (eval_stack_repush_entry(stack, &e) != 0)
+                return ENOBUFS;
             return ENOMEM;
         }
-        int append_rc = col_rel_append_all(work, in, NULL);
+        int append_rc =
+#ifdef WL_SESSION_TEST_HOOKS
+            wl_columnar_consolidate_test_fail_copy_append
+                ? ENOMEM :
+#endif
+            col_rel_append_all(work, in, NULL);
         if (append_rc != 0) {
             int cleanup_rc = col_rel_destroy_checked(work);
-            int entry_rc = eval_stack_dispose_entry(stack, &e);
-            if (cleanup_rc != 0)
-                (void)eval_stack_push(stack, work, true);
-            /* append_rc is the primary failure; both cleanup paths have
-             * nevertheless been attempted and any refused entry is back on
-             * the stack for a later retry. */
-            (void)entry_rc;
-            (void)cleanup_rc;
+            if (cleanup_rc != 0) {
+                /* The copied relation becomes the retry owner when its
+                 * cleanup is refused.  Preserve the original k-way
+                 * boundaries on the retained entry. */
+                eval_entry_t retained = e;
+                retained.rel = work;
+                retained.owned = true;
+                (void)eval_stack_repush_entry(stack, &retained);
+            } else {
+                /* The borrowed source remains usable and retains its
+                 * metadata for a later copy attempt. */
+                (void)eval_stack_repush_entry(stack, &e);
+            }
             return append_rc;
         }
         work_owned = true;
@@ -1240,13 +1262,13 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
     uint32_t k = e.seg_count > 0 ? e.seg_count : 1;
     if (k >= 2 && e.seg_boundaries != NULL) {
         int rc = col_op_consolidate_kway_merge(work, e.seg_boundaries, k);
-        free(e.seg_boundaries);
-        e.seg_boundaries = NULL;
-        e.seg_count = 0;
         if (rc != 0) {
             return col_op_cleanup_owned_relation(stack, &e, work,
                        work_owned, rc);
         }
+        free(e.seg_boundaries);
+        e.seg_boundaries = NULL;
+        e.seg_count = 0;
         work->sorted_nrows = work->nrows;
         work->run_count = 1;
         work->run_ends[0] = work->nrows;
