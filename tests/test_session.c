@@ -50,6 +50,7 @@ static size_t fail_malloc_size;
 static unsigned fail_malloc_matches_to_skip;
 static unsigned fail_malloc_match_count;
 static size_t fail_calloc_size;
+static size_t fail_realloc_size;
 static wl_columnar_source_access_reader_t *release_on_calloc_failure;
 static int calloc_reader_release_rc;
 
@@ -96,6 +97,10 @@ __wrap_calloc(size_t count, size_t size)
 void *
 __wrap_realloc(void *ptr, size_t size)
 {
+    if (fail_realloc_size != 0 && size == fail_realloc_size) {
+        fail_realloc_size = 0;
+        return NULL;
+    }
     if (fail_next_alloc) {
         fail_next_alloc = false;
         return NULL;
@@ -9908,9 +9913,176 @@ reduce_storage_cleanup:
 }
 #endif
 
+static wl_atomic_u64 promotion_worker_mask;
+static wl_atomic_u64 promotion_worker_error;
+
+/* Observe the actual worker result before publication, and attach a governed
+ * timestamp allocation to model the managed FILTER caller migration. */
+static void
+make_worker_filter_result_governed(wl_col_session_t *sess,
+    eval_stack_t *stack, eval_entry_t *result)
+{
+    (void)stack;
+    if (!sess->coordinator || !result->rel || !result->owned)
+        return;
+    if (!result->rel->pool_owned
+        || col_rel_attach_memory_governor(result->rel,
+        sess->memory_governor) != 0
+        || col_rel_enable_timestamps(result->rel) != 0
+        || result->rel->retained_reserved_bytes == 0)
+        atomic_store_explicit(&promotion_worker_error, 1, memory_order_release);
+    record_actual_worker(&promotion_worker_mask, sess->worker_id);
+}
+
+static void
+test_governed_worker_filter_publication(uint32_t workers)
+{
+    atomic_store_explicit(&promotion_worker_mask, 0, memory_order_release);
+    atomic_store_explicit(&promotion_worker_error, 0, memory_order_release);
+    wl_columnar_eval_serial_test_after_plan =
+        make_worker_filter_result_governed;
+    test_final_normalization(workers, 1, 5);
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    TEST("actual governed worker FILTER publication route");
+    if (atomic_load_explicit(&promotion_worker_error, memory_order_acquire) != 0
+        || atomic_load_explicit(&promotion_worker_mask, memory_order_acquire)
+        != ((UINT64_C(1) << workers) - 1)) {
+        FAIL("governed worker publication witness");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_governed_pool_publication(unsigned mode)
+{
+    TEST("governed pool publication transfers and restores token ownership");
+    const char *failure = NULL;
+    wl_columnar_memory_governor_ref_t *ref = enforcing_governor(1u << 20);
+    delta_pool_t *pool = NULL;
+    col_rel_t *source = col_rel_new_auto("source", 1), *candidate = NULL;
+    col_rel_t *old = NULL;
+    wl_col_session_t sess = { 0 };
+    wl_columnar_source_access_reader_t reader = { 0 };
+    bool held = false, published = false;
+#define PROMOTE_CHECK(c, m) do { if (!(c)) { failure = m; goto cleanup; \
+                                 } } while (0)
+    PROMOTE_CHECK(ref && source, "setup");
+    pool = delta_pool_create_managed(2, sizeof(col_rel_t), 64,
+            wl_columnar_memory_governor_ref_get(ref));
+    PROMOTE_CHECK(pool, "managed pool");
+    candidate = wl_columnar_relation_pool_new_like_governed(pool, "output",
+            source, ref);
+    int64_t row = 42;
+    PROMOTE_CHECK(candidate && candidate->pool_owned
+        && col_rel_append_row(candidate, &row) == 0
+        && col_rel_enable_timestamps(candidate) == 0, "governed result");
+    candidate->timestamps[0] = (col_delta_timestamp_t){
+        .iteration = 11, .stratum = 12, .worker = 13, .multiplicity = -3
+    };
+    uint64_t bytes = candidate->retained_reserved_bytes;
+    uint64_t reserved = reserved_on(ref);
+    uint64_t identity = candidate->relation_identity;
+    int64_t **columns = candidate->columns;
+    col_delta_timestamp_t *timestamps = candidate->timestamps;
+    if (mode == 1) {
+        old = col_rel_new_auto("output", 1);
+        PROMOTE_CHECK(old && session_add_rel(&sess, old) == 0,
+            "old registration");
+        PROMOTE_CHECK(col_rel_source_reader_acquire(old, &reader) == 0,
+            "old reader");
+        held = true;
+    }
+#ifdef WL_TEST_ALLOC_WRAP
+    if (mode == 2) fail_calloc_size = sizeof(col_rel_t);
+    if (mode == 3) fail_realloc_size = 16 * sizeof(col_rel_t *);
+#endif
+    if (mode == 4)
+        atomic_store_explicit(&candidate->retained_reservation.state,
+            WL_COLUMNAR_MEMORY_RESERVATION_REPLACING, memory_order_release);
+    int rc = session_add_rel(&sess, candidate);
+    if (mode == 4)
+        atomic_store_explicit(&candidate->retained_reservation.state,
+            WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED, memory_order_release);
+    if (mode != 0) {
+        PROMOTE_CHECK(rc == ((mode == 1 || mode == 4) ? EBUSY : ENOMEM),
+            "publication failure");
+#ifdef WL_TEST_ALLOC_WRAP
+        PROMOTE_CHECK(fail_calloc_size == 0 && fail_realloc_size == 0,
+            "fault hit");
+#endif
+        PROMOTE_CHECK(candidate->pool_owned && candidate->columns == columns
+            && candidate->timestamps == timestamps
+            && candidate->relation_identity == identity
+            && candidate->retained_reserved_bytes == bytes
+            && candidate->retained_reservation.identity ==
+            &candidate->retained_reservation
+            && atomic_load_explicit(&candidate->retained_reservation.owner_bits,
+            memory_order_acquire) == (uintptr_t)candidate
+            && candidate->retained_reservation.bytes == bytes
+            && reserved_on(ref) == reserved,
+            "rollback retains owner and charge");
+        if (held) {
+            PROMOTE_CHECK(session_add_rel(&sess, candidate) == EBUSY
+                && reserved_on(ref) == reserved, "repeated refusal");
+            PROMOTE_CHECK(col_rel_source_reader_release(&reader) == 0,
+                "release");
+            held = false;
+        }
+        rc = session_add_rel(&sess, candidate);
+    }
+    PROMOTE_CHECK(rc == 0, "publication retry");
+    published = true;
+    col_rel_t *result = session_find_rel(&sess, "output");
+    PROMOTE_CHECK(result && result != candidate && !result->pool_owned
+        && result->memory_governor == ref && result->columns == columns
+        && result->timestamps == timestamps &&
+        result->relation_identity == identity
+        && result->retained_reservation.identity ==
+        &result->retained_reservation
+        && atomic_load_explicit(&result->retained_reservation.owner_bits,
+        memory_order_acquire) == (uintptr_t)result
+        && result->retained_reserved_bytes == bytes
+        && reserved_on(ref) == reserved
+        && candidate->memory_governor == NULL
+        && candidate->retained_reserved_bytes == 0
+        && result->timestamps[0].multiplicity == -3,
+        "heap owns unchanged payload and token");
+cleanup:
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_calloc_size = fail_realloc_size = 0;
+#endif
+    if (held) (void)col_rel_source_reader_release(&reader);
+    if (!published) col_rel_destroy(candidate);
+    for (uint32_t i = 0; i < sess.nrels; i++) col_rel_destroy(sess.rels[i]);
+    free(sess.rels);
+    free(sess.rel_hash_head);
+    free(sess.rel_hash_next);
+    col_rel_destroy(source);
+    delta_pool_destroy(pool);
+    if (ref) {
+        if (reserved_on(ref) != 0) failure = "reservation leak";
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef PROMOTE_CHECK
+}
+
 int
 main(void)
 {
+    test_governed_worker_filter_publication(2);
+    test_governed_worker_filter_publication(8);
+    test_governed_pool_publication(0);
+    test_governed_pool_publication(1);
+    test_governed_pool_publication(4);
+#ifdef WL_TEST_ALLOC_WRAP
+    test_governed_pool_publication(2);
+    test_governed_pool_publication(3);
+#endif
     printf("test_session: persistent columnar session delta tests\n");
 
     test_session_hash_overflow_rejected();
