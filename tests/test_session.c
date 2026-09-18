@@ -9174,6 +9174,169 @@ cleanup:
     PASS();
 }
 
+/* Capture producer results before serial publication. The parent consumes only
+ * these independent buffers after the real workqueue barrier (#1736). */
+typedef struct {
+    unsigned calls;
+    bool valid;
+    uint32_t count;
+    int64_t keys[16];
+    int64_t selected[16];
+    col_delta_timestamp_t timestamps[16];
+} filter_worker_capture_t;
+static filter_worker_capture_t filter_worker_capture[8];
+static wl_col_session_t *filter_worker_coordinator;
+static uint32_t filter_worker_count;
+static wl_atomic_u64 filter_worker_bits;
+
+static col_delta_timestamp_t
+filter_worker_timestamp(uint32_t key)
+{
+    return (col_delta_timestamp_t){ .iteration = 100 + key,
+                                    .stratum = 200 + key, .worker = 300 + key,
+                                    .multiplicity = key % 4 == 1 ? -3 : 5 };
+}
+
+static void
+capture_filter_worker(wl_col_session_t *worker, eval_stack_t *stack,
+    eval_entry_t *result)
+{
+    (void)stack;
+    if (worker->coordinator != filter_worker_coordinator
+        || worker->worker_id >= filter_worker_count)
+        return;
+    uint32_t w = worker->worker_id;
+    filter_worker_capture_t *capture = &filter_worker_capture[w];
+    capture->calls++;
+    record_actual_worker(&filter_worker_bits, w);
+    col_rel_t *input = session_find_rel(worker, "input");
+    capture->valid = result->rel && result->owned && input
+        && result->rel != input && result->rel->ncols == 2
+        && result->rel->nrows == 16 && result->rel->timestamps
+        && strcmp(result->rel->name, "$filter") == 0;
+    if (!capture->valid)
+        return;
+    capture->count = result->rel->nrows;
+    for (uint32_t r = 0; r < capture->count; r++) {
+        capture->keys[r] = col_rel_get(result->rel, r, 0);
+        capture->selected[r] = col_rel_get(result->rel, r, 1);
+        capture->timestamps[r] = result->rel->timestamps[r];
+    }
+}
+
+static void
+test_filter_worker_provenance(uint32_t count)
+{
+    TEST("actual W2/W8 FILTER producers preserve complete signed provenance");
+    uint8_t expr[32];
+    uint32_t size = 0;
+    expr[size++] = WL_PLAN_EXPR_VAR;
+    expr[size++] = 4; expr[size++] = 0;
+    memcpy(expr + size, "col1", 4); size += 4;
+    expr[size++] = WL_PLAN_EXPR_CONST_INT;
+    int64_t zero = 0;
+    memcpy(expr + size, &zero, sizeof(zero)); size += sizeof(zero);
+    expr[size++] = WL_PLAN_EXPR_CMP_GT;
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { expr, size } }
+    };
+    wl_plan_relation_t relation = { .name = "output", .ops = ops,
+                                    .op_count = 2 };
+    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *workers = NULL;
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    col_rel_t *unowned = NULL;
+    uint32_t initialized = 0;
+    const char *failure = NULL;
+#define FILTER_WORKER_CHECK(c, m) do { if (!(c)) { failure = (m); goto cleanup; \
+                                       } } while (0)
+    memset(filter_worker_capture, 0, sizeof(filter_worker_capture));
+    atomic_store_explicit(&filter_worker_bits, 0, memory_order_relaxed);
+    FILTER_WORKER_CHECK(wl_session_create(wl_backend_columnar(), &plan, count,
+        &session) == 0, "worker provenance session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    governor = coord->memory_governor;
+    wl_columnar_memory_governor_ref_retain(governor);
+    FILTER_WORKER_CHECK(wl_columnar_session_ensure_workqueue(coord, count) == 0,
+        "worker provenance workqueue");
+    workers = calloc(count, sizeof(*workers));
+    FILTER_WORKER_CHECK(workers, "worker provenance cohort");
+    for (uint32_t w = 0; w < count; w++) {
+        FILTER_WORKER_CHECK(col_worker_session_create(coord, w, NULL, 0,
+            &workers[w]) == 0, "worker provenance create");
+        initialized++;
+        workers[w].frontier_ops->reset_rule_frontier(&workers[w], 0,
+            workers[w].outer_epoch);
+        unowned = col_rel_new_auto("input", 2);
+        FILTER_WORKER_CHECK(unowned && col_rel_enable_timestamps(unowned) == 0,
+            "worker provenance input");
+        for (uint32_t r = 0; r < 32; r++) {
+            uint32_t key = w * 100 + r;
+            int64_t row[] = { key, r % 2 ? 1 : -1 };
+            FILTER_WORKER_CHECK(col_rel_append_row(unowned, row) == 0,
+                "worker provenance append");
+            unowned->timestamps[r] = filter_worker_timestamp(key);
+        }
+        FILTER_WORKER_CHECK(session_add_rel(&workers[w], unowned) == 0,
+            "worker provenance registration");
+        unowned = NULL;
+    }
+    filter_worker_coordinator = coord;
+    filter_worker_count = count;
+    wl_columnar_eval_serial_test_after_plan = capture_filter_worker;
+    int rc = col_eval_stratum_multiworker(&stratum, coord, 0, workers, count);
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    FILTER_WORKER_CHECK(rc == 0, "worker provenance evaluation");
+    FILTER_WORKER_CHECK(atomic_load_explicit(&filter_worker_bits,
+        memory_order_relaxed) == (UINT64_C(1) << count) - 1,
+        "every actual worker dispatched");
+    for (uint32_t w = 0; w < count; w++) {
+        filter_worker_capture_t *capture = &filter_worker_capture[w];
+        FILTER_WORKER_CHECK(capture->valid && capture->calls == 1
+            && capture->count == 16, "one FILTER producer per worker");
+        for (uint32_t r = 0; r < 16; r++) {
+            uint32_t key = w * 100 + 2 * r + 1;
+            col_delta_timestamp_t expected = filter_worker_timestamp(key);
+            col_delta_timestamp_t actual = capture->timestamps[r];
+            FILTER_WORKER_CHECK(capture->keys[r] == key
+                && capture->selected[r] == 1
+                && actual.iteration == expected.iteration
+                && actual.stratum == expected.stratum
+                && actual.worker == expected.worker
+                && actual.multiplicity == expected.multiplicity,
+                "consumer exact row and complete signed provenance");
+        }
+        FILTER_WORKER_CHECK(!workers[w].cleanup_active
+            && !workers[w].cleanup_pending
+            && workers[w].cleanup_reserved_bytes == 0,
+            "worker frame balance");
+    }
+cleanup:
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    filter_worker_coordinator = NULL;
+    for (uint32_t w = 0; w < initialized; w++)
+        if (col_worker_session_destroy(&workers[w]) != 0 && !failure)
+            failure = "worker provenance checked teardown";
+    free(workers);
+    col_rel_destroy(unowned);
+    wl_session_destroy(session);
+    if (governor) {
+        if (reserved_on(governor) != 0 && !failure)
+            failure = "worker provenance reservation leak";
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef FILTER_WORKER_CHECK
+}
+
 int
 main(void)
 {
@@ -9288,6 +9451,8 @@ main(void)
     test_aggregate_public_retry(8, false);
     test_aggregate_public_retry(8, true);
     test_coordinator_specialized_parallel();
+    test_filter_worker_provenance(2);
+    test_filter_worker_provenance(8);
     test_correctness_replay_refusal(0);
     test_correctness_replay_refusal(1);
     test_correctness_replay_refusal(2);
