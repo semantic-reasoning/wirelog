@@ -1058,6 +1058,51 @@ test_plain_kway_cleanup_retains_metadata(void)
         ASSERT_TRUE(eval_stack_drain(&stack) == 0, "plain copy drain");
         col_rel_destroy(borrowed);
     }
+    {
+        col_rel_t *borrowed = col_rel_new_auto("plain-append-fail", 1);
+        eval_stack_t stack;
+        uint32_t *bounds = malloc(4 * sizeof(*bounds));
+        int64_t v[] = { 9, 10 };
+        ASSERT_TRUE(borrowed && bounds && col_rel_append_row(borrowed,
+            &v[0]) == 0
+            && col_rel_append_row(borrowed, &v[1]) == 0,
+            "plain append fixture");
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
+            "plain append push");
+        bounds[0] = 0; bounds[1] = 1; bounds[2] = 2;
+        stack.items[0].seg_boundaries = bounds; stack.items[0].seg_count = 2;
+        wl_columnar_merge_test_fail_copy_append = true;
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == ENOMEM
+            && stack.items[0].rel == borrowed && !stack.items[0].owned
+            && stack.items[0].seg_boundaries == bounds,
+            "plain append retains entry");
+        wl_columnar_merge_test_fail_copy_append = false;
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == 0,
+            "plain append retry");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "plain append drain");
+        col_rel_destroy(borrowed);
+    }
+    {
+        col_rel_t *borrowed = col_rel_new_auto("plain-merge-fail", 1);
+        eval_stack_t stack;
+        uint32_t *bounds = malloc(4 * sizeof(*bounds));
+        int64_t v[] = { 11, 12 };
+        ASSERT_TRUE(borrowed && bounds && col_rel_append_row(borrowed,
+            &v[0]) == 0
+            && col_rel_append_row(borrowed, &v[1]) == 0, "plain merge fixture");
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
+            "plain merge push");
+        bounds[0] = 0; bounds[1] = 1; bounds[2] = 2; bounds[3] = 2;
+        stack.items[0].seg_boundaries = bounds; stack.items[0].seg_count = 3;
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) != 0
+            && stack.items[0].rel == borrowed && !stack.items[0].owned
+            && stack.items[0].seg_boundaries == bounds,
+            "plain merge restores entry");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "plain merge drain");
+        col_rel_destroy(borrowed);
+    }
 #endif
     wl_arena_free(arena);
     destroy_mock_session(sess);
