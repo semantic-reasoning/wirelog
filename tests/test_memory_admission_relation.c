@@ -660,7 +660,18 @@ test_cow_capacity_denial_preserves_state(void)
         CHECK(wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref)) == 0,
             "COW capacity denial left reservation");
+        wl_columnar_memory_governor_ref_get(ref)->budget_bytes = grown_bytes;
+        atomic_store_explicit(&wl_columnar_memory_governor_ref_get(ref)
+            ->usable_bytes, grown_bytes, memory_order_relaxed);
+        CHECK(col_rel_append_row(view, &value) == 0
+            && view->capacity == COL_REL_INIT_CAP * 2u
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == grown_bytes,
+            "COW capacity denial retry");
         col_rel_destroy(view);
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "COW capacity retry teardown balance");
         col_rel_destroy(source);
     }
     if (ref)
@@ -819,17 +830,202 @@ test_cow_retained_timestamp_capacity_admission(void)
     CHECK(col_rel_attach_memory_governor(view, ref) == 0
         && col_rel_install_shared_view(view, source) == 0,
         "install skewed timestamp view");
+    col_delta_timestamp_t *view_timestamps = realloc(view->timestamps,
+            (size_t)physical * sizeof(*view_timestamps));
+    CHECK(view_timestamps != NULL, "expand view timestamp capacity");
+    if (!view_timestamps) goto cleanup;
+    view->timestamps = view_timestamps;
+    view->timestamp_capacity = physical;
     int64_t *old_column = view->columns[0];
     bool *old_shared = view->col_shared;
+    col_delta_timestamp_t *old_timestamps = view->timestamps;
+    uint64_t old_view_generation = view->view_generation;
+    uint64_t old_storage_generation = view->storage_generation;
+    uint64_t old_aliases = col_rel_storage_alias_borrow_count(source);
+    col_delta_timestamp_t old_timestamp = view->timestamps[0];
     CHECK(col_rel_cow_unshare(view, 0) == ENOMEM
         && view->columns[0] == old_column && view->col_shared == old_shared
+        && view->timestamps == old_timestamps
+        && view->timestamps[0].multiplicity == old_timestamp.multiplicity
+        && view->view_generation == old_view_generation
+        && view->storage_generation == old_storage_generation
+        && col_rel_storage_alias_borrow_count(source) == old_aliases
         && wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(ref)) == 0,
         "retained timestamp capacity denial preserves state");
+    wl_columnar_memory_governor_ref_get(ref)->budget_bytes = bytes;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(ref)
+        ->usable_bytes, bytes, memory_order_relaxed);
+    CHECK(col_rel_cow_unshare(view, 0) == 0
+        && view->col_shared == NULL
+        && view->columns[0] != old_column
+        && view->timestamps == old_timestamps
+        && view->timestamp_capacity == physical
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == bytes,
+        "retained timestamp capacity exact-fit retry");
 cleanup:
     col_rel_destroy(view);
     col_rel_destroy(source);
-    if (ref) wl_columnar_memory_governor_ref_release(ref);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "retained timestamp capacity teardown balance");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_cow_reduced_timestamp_capacity_admission(void)
+{
+    const uint32_t columns_capacity = COL_REL_INIT_CAP;
+    const uint32_t physical = COL_REL_INIT_CAP / 2u;
+    const uint64_t bytes = (uint64_t)columns_capacity * sizeof(int64_t)
+        + (uint64_t)physical * sizeof(col_delta_timestamp_t);
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    col_rel_t *source = col_rel_new_auto("reduced-source", 1);
+    col_rel_t *view = col_rel_new_auto("reduced-view", 1);
+    int64_t value = 17;
+
+    make_resolution(&resolution, bytes - 1u);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && source && view, "reduced timestamp COW setup");
+    if (!ref || !source || !view) goto cleanup;
+    CHECK(col_rel_append_row(source, &value) == 0
+        && col_rel_enable_timestamps(source) == 0,
+        "reduced timestamp seed");
+    if (!source->timestamps) goto cleanup;
+    col_delta_timestamp_t *reduced = realloc(source->timestamps,
+            (size_t)physical * sizeof(*reduced));
+    CHECK(reduced != NULL, "reduce physical timestamp capacity");
+    if (!reduced) goto cleanup;
+    source->timestamps = reduced;
+    source->timestamp_capacity = physical;
+    source->timestamps[0] = (col_delta_timestamp_t){
+        .iteration = 7, .stratum = 3, .worker = 2, .multiplicity = -4
+    };
+    CHECK(col_rel_attach_memory_governor(view, ref) == 0
+        && col_rel_install_shared_view(view, source) == 0,
+        "install reduced timestamp view");
+    col_delta_timestamp_t *view_timestamps = realloc(view->timestamps,
+            (size_t)physical * sizeof(*view_timestamps));
+    CHECK(view_timestamps != NULL, "reduce view timestamp capacity");
+    if (!view_timestamps) goto cleanup;
+    view->timestamps = view_timestamps;
+    view->timestamp_capacity = physical;
+    int64_t *old_column = view->columns[0];
+    col_delta_timestamp_t *old_timestamps = view->timestamps;
+    col_delta_timestamp_t old_timestamp = view->timestamps[0];
+    uint64_t old_view_generation = view->view_generation;
+    uint64_t old_storage_generation = view->storage_generation;
+    uint64_t old_aliases = col_rel_storage_alias_borrow_count(source);
+    CHECK(col_rel_cow_unshare(view, 0) == ENOMEM
+        && view->columns[0] == old_column && view->timestamps == old_timestamps
+        && memcmp(&view->timestamps[0], &old_timestamp,
+        sizeof(old_timestamp)) == 0
+        && view->col_shared != NULL
+        && view->view_generation == old_view_generation
+        && view->storage_generation == old_storage_generation
+        && col_rel_storage_alias_borrow_count(source) == old_aliases
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0,
+        "reduced timestamp denial preserves state");
+    wl_columnar_memory_governor_t *budget =
+        wl_columnar_memory_governor_ref_get(ref);
+    budget->budget_bytes = bytes;
+    atomic_store_explicit(&budget->usable_bytes, bytes, memory_order_relaxed);
+    CHECK(col_rel_cow_unshare(view, 0) == 0
+        && view->col_shared == NULL && view->columns[0] != old_column
+        && view->timestamps == old_timestamps
+        && memcmp(&view->timestamps[0], &old_timestamp,
+        sizeof(old_timestamp)) == 0
+        && view->timestamp_capacity == physical
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == bytes,
+        "reduced timestamp exact-fit retry");
+cleanup:
+    col_rel_destroy(view);
+    col_rel_destroy(source);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "reduced timestamp teardown balance");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_cow_timestamp_growth_replacement(void)
+{
+    const uint32_t old_capacity = COL_REL_INIT_CAP;
+    const uint32_t physical = COL_REL_INIT_CAP / 2u;
+    const uint32_t grown_capacity = old_capacity * 2u;
+    const uint64_t grown_bytes = (uint64_t)grown_capacity * sizeof(int64_t)
+        + (uint64_t)grown_capacity * sizeof(col_delta_timestamp_t);
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    col_rel_t *source = col_rel_new_auto("growth-source", 1);
+    col_rel_t *view = col_rel_new_auto("growth-view", 1);
+    int64_t value = 21;
+
+    make_resolution(&resolution, grown_bytes - 1u);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && source && view, "timestamp growth setup");
+    if (!ref || !source || !view) goto cleanup;
+    CHECK(col_rel_append_row(source, &value) == 0
+        && col_rel_enable_timestamps(source) == 0,
+        "timestamp growth seed");
+    if (!source->timestamps) goto cleanup;
+    col_delta_timestamp_t *reduced = realloc(source->timestamps,
+            (size_t)physical * sizeof(*reduced));
+    CHECK(reduced != NULL, "timestamp growth reduction");
+    if (!reduced) goto cleanup;
+    source->timestamps = reduced;
+    source->timestamp_capacity = physical;
+    source->timestamps[0] = (col_delta_timestamp_t){
+        .iteration = 11, .stratum = 5, .worker = 1, .multiplicity = 6
+    };
+    CHECK(col_rel_attach_memory_governor(view, ref) == 0
+        && col_rel_install_shared_view(view, source) == 0,
+        "timestamp growth shared view");
+    col_delta_timestamp_t *view_timestamps = realloc(view->timestamps,
+            (size_t)physical * sizeof(*view_timestamps));
+    CHECK(view_timestamps != NULL, "timestamp growth view reduction");
+    if (!view_timestamps) goto cleanup;
+    view->timestamps = view_timestamps;
+    view->timestamp_capacity = physical;
+    col_delta_timestamp_t expected = view->timestamps[0];
+    int64_t *old_column = view->columns[0];
+    CHECK(col_rel_cow_unshare(view, grown_capacity) == ENOMEM
+        && view->capacity == old_capacity &&
+        view->timestamp_capacity == physical
+        && view->columns[0] == old_column && view->col_shared != NULL
+        && memcmp(&view->timestamps[0], &expected, sizeof(expected)) == 0
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0,
+        "timestamp growth denial preserves state");
+    wl_columnar_memory_governor_t *budget =
+        wl_columnar_memory_governor_ref_get(ref);
+    budget->budget_bytes = grown_bytes;
+    atomic_store_explicit(&budget->usable_bytes, grown_bytes,
+        memory_order_relaxed);
+    CHECK(col_rel_cow_unshare(view, grown_capacity) == 0
+        && view->capacity == grown_capacity
+        && view->timestamp_capacity == grown_capacity
+        && memcmp(&view->timestamps[0], &expected, sizeof(expected)) == 0
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == grown_bytes,
+        "timestamp growth exact-fit retry");
+cleanup:
+    col_rel_destroy(view);
+    col_rel_destroy(source);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "timestamp growth teardown balance");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
 }
 
 int
@@ -837,6 +1033,8 @@ main(void)
 {
     test_physical_timestamp_capacity();
     test_cow_retained_timestamp_capacity_admission();
+    test_cow_reduced_timestamp_capacity_admission();
+    test_cow_timestamp_growth_replacement();
     test_cow_exact_fit_and_denial();
     test_cow_multi_column_cleanup();
     test_append_transitions();
