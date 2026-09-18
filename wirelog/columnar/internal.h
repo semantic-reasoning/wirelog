@@ -2646,6 +2646,8 @@ typedef struct {
     uint32_t *count16;
     int64_t *temp_column;
     int64_t *insertion_rows;
+    col_delta_timestamp_t *timestamps;
+    uint32_t timestamp_capacity;
     uint32_t k8_capacity;
     uint32_t k16_capacity;
     uint32_t insertion_capacity;

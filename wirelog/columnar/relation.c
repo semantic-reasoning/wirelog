@@ -4862,7 +4862,8 @@ col_radix_sort_rows_by_key(int64_t *data, uint32_t nrows, uint32_t ncols,
  */
 static int
 col_rel_insertion_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows,
-    const wl_columnar_radix_workspace_t *workspace)
+    const wl_columnar_radix_workspace_t *workspace,
+    col_delta_timestamp_t *timestamps)
 {
     uint32_t nc = r->ncols;
 #if SIZE_MAX <= UINT32_MAX
@@ -4884,7 +4885,13 @@ col_rel_insertion_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows,
     for (uint32_t i = 0; i < nrows; i++)
         col_rel_row_copy_out(r, start_row + i, work + (size_t)i * nc);
 
+    if (timestamps)
+        memcpy(timestamps, r->timestamps + start_row,
+            (size_t)nrows * sizeof(*timestamps));
     for (uint32_t i = 1; i < nrows; i++) {
+        col_delta_timestamp_t saved_timestamp = { 0 };
+        if (timestamps)
+            saved_timestamp = timestamps[i];
         int64_t *tbuf = work + (size_t)nrows * nc;
         memcpy(tbuf, work + (size_t)i * nc,
             (size_t)nc * sizeof(*work));
@@ -4920,8 +4927,12 @@ col_rel_insertion_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows,
             memcpy(work + (size_t)j * nc,
                 work + (size_t)(j - 1) * nc,
                 (size_t)nc * sizeof(*work));
+            if (timestamps)
+                timestamps[j] = timestamps[j - 1];
             j--;
         }
+        if (timestamps)
+            timestamps[j] = saved_timestamp;
         memcpy(work + (size_t)j * nc, tbuf,
             (size_t)nc * sizeof(*work));
     }
@@ -4929,6 +4940,9 @@ col_rel_insertion_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows,
     for (uint32_t c = 0; c < nc; c++)
         for (uint32_t i = 0; i < nrows; i++)
             r->columns[c][start_row + i] = work[(size_t)i * nc + c];
+    if (timestamps)
+        memcpy(r->timestamps + start_row, timestamps,
+            (size_t)nrows * sizeof(*timestamps));
     if (owns_work)
         free(work);
     return 0;
@@ -5353,7 +5367,8 @@ radix_uniform_count_fused_k16_scalar(const int64_t *col_data,
  */
 static int
 radix_sort_k16(col_rel_t *r, uint32_t start_row, uint32_t nrows,
-    const wl_columnar_radix_workspace_t *workspace)
+    const wl_columnar_radix_workspace_t *workspace,
+    col_delta_timestamp_t *timestamps)
 {
     uint32_t nc = r->ncols;
 
@@ -5387,7 +5402,7 @@ radix_sort_k16(col_rel_t *r, uint32_t start_row, uint32_t nrows,
          * small inputs.  Running O(n^2) insertion sort for a failed 50K-row
          * k16 allocation would turn an allocation failure into a timeout. */
         return nrows <= 32 ? col_rel_insertion_sort(r, start_row, nrows,
-                   workspace)
+                   workspace, timestamps)
                            : ENOMEM;
     }
 
@@ -5480,6 +5495,12 @@ radix_sort_k16(col_rel_t *r, uint32_t start_row, uint32_t nrows,
         }
         memcpy(col + start_row, temp_col, nrows * sizeof(int64_t));
     }
+    if (timestamps) {
+        for (uint32_t i = 0; i < nrows; i++)
+            timestamps[i] = r->timestamps[start_row + src[i]];
+        memcpy(r->timestamps + start_row, timestamps,
+            (size_t)nrows * sizeof(*timestamps));
+    }
     if (owns_workspace) {
         free(temp_col);
         free(perm_a);
@@ -5525,8 +5546,10 @@ radix_sort_k16(col_rel_t *r, uint32_t start_row, uint32_t nrows,
  * Falls back to insertion sort on allocation failure.
  */
 static int
-col_rel_radix_sort_raw(col_rel_t *r, uint32_t start_row, uint32_t nrows,
-    const wl_columnar_radix_workspace_t *workspace)
+wl_columnar_relation_radix_sort_rows(col_rel_t *r, uint32_t start_row,
+    uint32_t nrows,
+    const wl_columnar_radix_workspace_t *workspace,
+    col_delta_timestamp_t *timestamps)
 {
     if (nrows <= 1)
         return 0;
@@ -5562,7 +5585,7 @@ col_rel_radix_sort_raw(col_rel_t *r, uint32_t start_row, uint32_t nrows,
      * already yields fewer total iterations than 8-pass k=8+SIMD, and a
      * 256KB histogram makes SIMD gather impractical (cache pressure). */
     if (nrows >= 50000u) {
-        int rc = radix_sort_k16(r, start_row, nrows, workspace);
+        int rc = radix_sort_k16(r, start_row, nrows, workspace, timestamps);
         if (rc == 0)
             wl_columnar_relation_touch_view(r);
         return rc;
@@ -5594,7 +5617,7 @@ col_rel_radix_sort_raw(col_rel_t *r, uint32_t start_row, uint32_t nrows,
             free(bv_cache);
         }
         return nrows <= 32 ? col_rel_insertion_sort(r, start_row, nrows,
-                   workspace)
+                   workspace, timestamps)
                            : ENOMEM;
     }
 
@@ -5694,6 +5717,12 @@ col_rel_radix_sort_raw(col_rel_t *r, uint32_t start_row, uint32_t nrows,
         }
         memcpy(col + start_row, temp_col, nrows * sizeof(int64_t));
     }
+    if (timestamps) {
+        for (uint32_t i = 0; i < nrows; i++)
+            timestamps[i] = r->timestamps[start_row + src[i]];
+        memcpy(r->timestamps + start_row, timestamps,
+            (size_t)nrows * sizeof(*timestamps));
+    }
     if (owns_workspace) {
         free(temp_col);
         free(perm_a);
@@ -5720,7 +5749,8 @@ col_rel_radix_sort_raw(col_rel_t *r, uint32_t start_row, uint32_t nrows,
 
 insertion:
     {
-        int rc = col_rel_insertion_sort(r, start_row, nrows, workspace);
+        int rc = col_rel_insertion_sort(r, start_row, nrows, workspace,
+                timestamps);
         if (rc == 0)
             wl_columnar_relation_touch_view(r);
         return rc;
@@ -5756,6 +5786,7 @@ wl_columnar_radix_workspace_destroy(wl_columnar_radix_workspace_t *workspace)
     free(workspace->count16);
     free(workspace->temp_column);
     free(workspace->insertion_rows);
+    free(workspace->timestamps);
     if (workspace->admission_active)
         (void)wl_columnar_memory_release(&workspace->admission);
     memset(workspace, 0, sizeof(*workspace));
@@ -5776,6 +5807,7 @@ wl_columnar_radix_workspace_prepare(const col_rel_t *rel,
     size_t bucket_bytes = 0;
     size_t count16_bytes = 0;
     size_t insertion_bytes = 0;
+    size_t timestamp_bytes = 0;
     size_t workspace_bytes = 0;
     uint64_t total_scratch_bytes;
 
@@ -5851,6 +5883,15 @@ wl_columnar_radix_workspace_prepare(const col_rel_t *rel,
             &workspace_bytes))
             goto overflow;
     }
+    uint32_t timestamp_rows = permutation_rows > insertion_rows
+        ? permutation_rows : insertion_rows;
+    if (rel->timestamps && timestamp_rows > 0) {
+        if (!col_rel_size_multiply(timestamp_rows,
+            sizeof(col_delta_timestamp_t), &timestamp_bytes)
+            || !col_rel_size_add(workspace_bytes, timestamp_bytes,
+            &workspace_bytes))
+            goto overflow;
+    }
     if ((uint64_t)workspace_bytes > UINT64_MAX - additional_scratch_bytes)
         goto overflow;
     total_scratch_bytes = (uint64_t)workspace_bytes
@@ -5867,6 +5908,13 @@ wl_columnar_radix_workspace_prepare(const col_rel_t *rel,
         workspace->admission_active = true;
     }
 
+    if (timestamp_bytes > 0) {
+        workspace->timestamps = wl_columnar_relation_radix_malloc(
+            timestamp_bytes, "radix_workspace_timestamps");
+        if (!workspace->timestamps)
+            goto no_memory;
+        workspace->timestamp_capacity = timestamp_rows;
+    }
     if (permutation_rows > 0) {
         workspace->perm_a = (uint32_t *)wl_columnar_relation_radix_malloc(
             permutation_bytes, "radix_workspace_perm_a");
@@ -5911,6 +5959,47 @@ overflow:
 no_memory:
     wl_columnar_radix_workspace_destroy(workspace);
     return ENOMEM;
+}
+
+static int
+col_rel_radix_sort_raw(col_rel_t *r, uint32_t start_row, uint32_t nrows,
+    const wl_columnar_radix_workspace_t *workspace)
+{
+    if (!r->timestamps || nrows <= 1)
+        return wl_columnar_relation_radix_sort_rows(r, start_row, nrows,
+                   workspace, NULL);
+    if (workspace) {
+        if (!workspace->timestamps || workspace->timestamp_capacity < nrows)
+            return EINVAL;
+        return wl_columnar_relation_radix_sort_rows(r, start_row, nrows,
+                   workspace,
+                   workspace->timestamps);
+    }
+    size_t bytes = 0;
+    if (!col_rel_size_multiply(nrows, sizeof(col_delta_timestamp_t), &bytes))
+        return ENOMEM;
+    wl_columnar_memory_reservation_t admission;
+    wl_columnar_memory_reservation_init(&admission);
+    bool admitted = false;
+    if (r->memory_governor) {
+        wl_columnar_memory_admission_status_t status =
+            wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(r->memory_governor),
+            bytes, &admission);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            return ENOMEM;
+        admitted = true;
+    }
+    col_delta_timestamp_t *timestamps = wl_columnar_relation_radix_malloc(
+        bytes, "radix_timestamps");
+    int rc = timestamps ? wl_columnar_relation_radix_sort_rows(r, start_row,
+            nrows,
+            NULL, timestamps) : ENOMEM;
+    free(timestamps);
+    if (admitted)
+        (void)wl_columnar_memory_release(&admission);
+    return rc;
 }
 
 static int
