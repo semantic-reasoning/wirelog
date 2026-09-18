@@ -872,10 +872,10 @@ test_blocked_kway_merge_retains_boundaries(void)
         eval_stack_init(&stack);
         ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
             "plain merge failure push");
-        bounds[0] = 0; bounds[1] = 1; bounds[2] = 2;
+        bounds[0] = 0; bounds[1] = 1; bounds[2] = 2; bounds[3] = 1;
         stack.items[0].seg_boundaries = bounds;
         stack.items[0].seg_count = 3;
-        ASSERT_TRUE(col_op_consolidate(&stack, sess) != 0
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == EINVAL
             && stack.top == 1 && stack.items[0].rel == borrowed
             && !stack.items[0].owned && stack.items[0].seg_boundaries == bounds,
             "plain merge failure restores borrowed entry");
