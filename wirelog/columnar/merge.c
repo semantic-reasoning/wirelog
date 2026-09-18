@@ -1212,10 +1212,14 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
     uint32_t nr = in->nrows;
 
     if (nr <= 1) {
+        if (!e.owned || (in->sorted_nrows == nr && in->run_count == 1
+            && e.seg_boundaries == NULL))
+            return eval_stack_repush_entry(stack, &e);
         wl_columnar_source_access_writer_t writer = { 0 };
         int writer_rc = col_rel_source_writer_acquire(in, &writer);
         if (writer_rc != 0)
-            return col_op_dispose_entry_primary(stack, &e, writer_rc);
+            return eval_stack_repush_entry(stack,
+                       &e) == 0 ? writer_rc : ENOBUFS;
         /* Nothing to deduplicate */
         if (e.seg_boundaries)
             free(e.seg_boundaries);
@@ -1223,7 +1227,7 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
         in->run_count = 1;
         in->run_ends[0] = nr;
         (void)wl_columnar_source_access_writer_release(&writer);
-        return eval_stack_push(stack, in, e.owned);
+        return eval_stack_repush_entry(stack, &e);
     }
 
     /* Sort in-place if we own the relation, otherwise copy first */
