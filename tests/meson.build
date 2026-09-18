@@ -3554,7 +3554,9 @@ test_session_exe = executable(
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
-test('session', test_session_exe)
+# Expanded multiworker ownership/retry coverage takes 109s under TSan.
+# Keep a bounded per-test budget with headroom for sanitizer/runner overhead.
+test('session', test_session_exe, timeout: 180)
 
 # ============================================================================
 # Rotation Strategy Vtable (Issue #600)
