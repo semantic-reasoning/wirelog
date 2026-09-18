@@ -658,6 +658,116 @@ test_blocked_sort_does_not_dedup_unsorted(void)
 }
 
 static void
+test_blocked_kway_merge_retains_boundaries(void)
+{
+    TEST("reader-blocked k-way merge retains boundaries for retry");
+    wl_col_session_t *sess = make_mock_session();
+    wl_arena_t *arena = wl_arena_create(64 * 1024);
+    const int64_t rows[] = { 1, 3, 0, 2 };
+
+    ASSERT_TRUE(sess != NULL && arena != NULL,
+        "k-way fixture allocation");
+    for (unsigned mode = 0; mode < 3; mode++) {
+        col_rel_t *rel = mode == 0
+            ? col_rel_new_auto("kway-heap", 1)
+            : col_rel_pool_new_auto(sess->delta_pool,
+                mode == 2 ? arena : NULL, "kway-owned", 1);
+        wl_columnar_source_access_reader_t reader = { 0 };
+        eval_stack_t stack;
+        uint32_t *boundaries;
+
+        ASSERT_TRUE(rel != NULL, "k-way relation allocation");
+        for (uint32_t i = 0; i < 4; i++)
+            ASSERT_TRUE(col_rel_append_row(rel, &rows[i]) == 0,
+                "k-way rows");
+        eval_stack_init(&stack);
+        for (unsigned lower = 0; lower < COL_STACK_MAX - 1; lower++) {
+            col_rel_t *lower_rel = col_rel_new_auto("kway-lower", 1);
+            int64_t value = (int64_t)lower;
+            ASSERT_TRUE(lower_rel != NULL
+                && col_rel_append_row(lower_rel, &value) == 0
+                && eval_stack_push(&stack, lower_rel, true) == 0,
+                "k-way lower stack");
+            if (lower == 0) {
+                stack.items[0].seg_boundaries =
+                    malloc(2 * sizeof(uint32_t));
+                ASSERT_TRUE(stack.items[0].seg_boundaries != NULL,
+                    "k-way lower metadata");
+                stack.items[0].seg_count = 1;
+                stack.items[0].seg_boundaries[0] = 0;
+                stack.items[0].seg_boundaries[1] = 1;
+            }
+        }
+        ASSERT_TRUE(eval_stack_push(&stack, rel, true) == 0,
+            "k-way stack push");
+        boundaries = malloc(3 * sizeof(*boundaries));
+        ASSERT_TRUE(boundaries != NULL, "k-way boundary allocation");
+        boundaries[0] = 0;
+        boundaries[1] = 2;
+        boundaries[2] = 4;
+        stack.items[COL_STACK_MAX - 1].seg_boundaries = boundaries;
+        stack.items[COL_STACK_MAX - 1].seg_count = 2;
+        ASSERT_TRUE(col_rel_source_reader_acquire(rel, &reader) == 0,
+            "k-way reader acquisition");
+
+        ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == EBUSY
+            && stack.top == COL_STACK_MAX
+            && stack.items[COL_STACK_MAX - 1].rel == rel
+            && stack.items[COL_STACK_MAX - 1].seg_boundaries == boundaries
+            && stack.items[COL_STACK_MAX - 1].seg_count == 2,
+            "k-way refusal retains relation and boundaries");
+        ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == EBUSY
+            && stack.top == COL_STACK_MAX
+            && stack.items[COL_STACK_MAX - 1].seg_boundaries == boundaries,
+            "k-way repeated refusal retains metadata");
+        ASSERT_TRUE(col_rel_source_reader_release(&reader) == 0,
+            "k-way reader release");
+        ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == 0
+            && stack.top == COL_STACK_MAX
+            && stack.items[COL_STACK_MAX - 1].rel->nrows == 4
+            && stack.items[COL_STACK_MAX - 1].seg_boundaries == NULL
+            && stack.items[COL_STACK_MAX - 1].seg_count == 0,
+            "k-way retry uses retained boundaries");
+        for (uint32_t i = 0; i < 4; i++)
+            ASSERT_TRUE(col_rel_get(stack.items[COL_STACK_MAX - 1].rel,
+                i, 0) == (int64_t)i, "k-way retry sorted output");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "k-way stack drain");
+    }
+    {
+        col_rel_t *borrowed = col_rel_new_auto("kway-borrowed", 1);
+        eval_stack_t stack;
+        uint32_t *boundaries;
+        int64_t values[] = { 7, 8 };
+
+        ASSERT_TRUE(borrowed != NULL
+            && col_rel_append_row(borrowed, &values[0]) == 0
+            && col_rel_append_row(borrowed, &values[1]) == 0,
+            "borrowed k-way relation");
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
+            "borrowed k-way stack");
+        boundaries = malloc(3 * sizeof(*boundaries));
+        ASSERT_TRUE(boundaries != NULL, "borrowed k-way metadata");
+        boundaries[0] = 0;
+        boundaries[1] = 1;
+        boundaries[2] = 2;
+        stack.items[0].seg_boundaries = boundaries;
+        stack.items[0].seg_count = 2;
+        ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == 0
+            && stack.top == 1 && stack.items[0].rel != borrowed
+            && stack.items[0].owned == true
+            && stack.items[0].seg_boundaries == NULL
+            && stack.items[0].seg_count == 0,
+            "borrowed copy consumes metadata exactly once");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "borrowed k-way drain");
+        col_rel_destroy(borrowed);
+    }
+    wl_arena_free(arena);
+    destroy_mock_session(sess);
+    PASS;
+}
+
+static void
 test_eval_entry_dispose_retains_busy_relation(void)
 {
     TEST("eval entry disposal retains a relation while its reader is held");
@@ -904,6 +1014,7 @@ main(void)
 
     test_empty_relation();
     test_blocked_sort_does_not_dedup_unsorted();
+    test_blocked_kway_merge_retains_boundaries();
     test_eval_entry_dispose_retains_busy_relation();
     test_deferred_registry_refuses_unsafe_storage();
     test_drain_to_session_reports_unsafe_refusal();
