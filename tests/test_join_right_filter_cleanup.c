@@ -109,6 +109,7 @@ destroy_mock_session(wl_col_session_t *s)
      * (col_session_get_delta_arrangement); free its registry as the real
      * session teardown does. */
     col_session_free_delta_arrangements(s);
+    col_session_free_filt_arrangements(s);
     col_mat_cache_clear(&s->mat_cache);
     /* The cached right-filter path owns its filtered relations and the entry
      * array itself; free them exactly as the real session teardown does in
@@ -121,6 +122,10 @@ destroy_mock_session(wl_col_session_t *s)
         free(s->filt_cache[i].filter_data);
         if (s->filt_cache[i].filtered)
             col_rel_destroy(s->filt_cache[i].filtered);
+    for (uint32_t i = 0; i < s->filt_cache_count; i++) {
+        col_rel_destroy(s->filt_cache[i].filtered);
+        free(s->filt_cache[i].rel_name);
+        free(s->filt_cache[i].filter_data);
     }
     free(s->filt_cache);
     session_rel_free_hash(s);
@@ -661,6 +666,132 @@ right_filter_governor(uint64_t bytes)
     return wl_columnar_memory_governor_ref_create(&resolution);
 }
 
+static bool
+exact_join_rows(const col_rel_t *out, bool filtered, bool semi)
+{
+    if (!out || out->nrows != (filtered || semi ? 4u : 8u)
+        || out->ncols != (semi ? 2u : 4u)) return false;
+    unsigned seen[4] = { 0 };
+    for (uint32_t r = 0; r < out->nrows; r++) {
+        int64_t k = col_rel_get(out, r, 0);
+        if (k < 0 || k >= 4 || col_rel_get(out, r, 1) != 10 + k) return false;
+        if (!semi) {
+            int64_t v = col_rel_get(out, r, 3);
+            if (col_rel_get(out, r, 2) != k
+                || (v != 200 + k && (filtered || v != 100 + k))) return false;
+            unsigned bit = v == 200 + k ? 2u : 1u;
+            if (seen[k] & bit) return false;
+            seen[k] |= bit;
+        } else {
+            if (seen[k]) return false;
+            seen[k] = 1;
+        }
+    }
+    for (unsigned k = 0; k < 4; k++)
+        if (seen[k] != (semi ? 1u : filtered ? 2u : 3u)) return false;
+    return true;
+}
+
+static void
+test_terminal_cache_retry(op_fn_t fn, bool hit, bool differential_txn)
+{
+    TEST("JOIN terminal refusal preserves cache/transaction and retries");
+    wl_col_session_t *sess = make_mock_session();
+    col_rel_t *left = make_left(false);
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    wl_columnar_source_access_reader_t reader = { 0 };
+    bool held = false, local = true;
+    int ok = sess && left && register_right(sess) == 0;
+    if (!ok) goto cleanup;
+    wl_plan_op_t op;
+    init_op(&op, WL_PLAN_OP_JOIN);
+    op.delta_mode = WL_DELTA_FORCE_FULL;
+    op.materialized = !differential_txn;
+    if (differential_txn) op.right_filter_expr.size = 0;
+    if (hit) {
+        ok = eval_stack_push(&stack, left, false) == 0
+            && fn(&op, &stack, sess) == 0;
+        if (!ok) goto cleanup;
+        (void)eval_stack_drain(&stack);
+        ok = sess->mat_cache.count > 0;
+        if (!ok) goto cleanup;
+    }
+    uint32_t old_cache_count = sess->mat_cache.count;
+    const col_rel_t *old_cached =
+        hit ? sess->mat_cache.entries[0].result : NULL;
+    ok = col_rel_source_reader_acquire(left, &reader) == 0;
+    if (!ok) goto cleanup;
+    held = true;
+    ok = eval_stack_push(&stack, left, true) == 0;
+    if (!ok) goto cleanup;
+    local = false;
+    stack.items[0].seg_boundaries = malloc(2 * sizeof(uint32_t));
+    ok = stack.items[0].seg_boundaries != NULL;
+    if (!ok) goto cleanup;
+    uint32_t *segments = stack.items[0].seg_boundaries;
+    segments[0] = 0; segments[1] = left->nrows;
+    stack.items[0].seg_count = 1;
+    uint64_t generation = left->view_generation;
+    for (unsigned attempt = 0; attempt < 2 && ok; attempt++) {
+        ok = fn(&op, &stack, sess) == EBUSY && stack.top == 1
+            && stack.items[0].rel == left && stack.items[0].owned
+            && stack.items[0].seg_boundaries == segments
+            && stack.items[0].seg_count == 1 &&
+            left->view_generation == generation
+            && sess->mat_cache.count == old_cache_count;
+        if (hit) ok = ok && sess->mat_cache.entries[0].result == old_cached;
+        if (differential_txn)
+            ok = ok && sess->diff_txn_count == 0 && sess->diff_arr_count == 0;
+    }
+    if (!ok) goto cleanup;
+    ok = col_rel_source_reader_release(&reader) == 0;
+    held = false;
+    ok = ok && fn(&op, &stack, sess) == 0 && stack.top == 1
+        && exact_join_rows(stack.items[0].rel, !differential_txn, false);
+    if (differential_txn)
+        ok = ok && sess->diff_txn_count == 0 && sess->diff_arr_count == 1;
+cleanup:
+    if (held) (void)col_rel_source_reader_release(&reader);
+    (void)eval_stack_drain(&stack);
+    if (local) col_rel_destroy(left);
+    if (sess) destroy_mock_session(sess);
+    if (ok) PASS(); else FAIL("cache/transaction terminal ownership");
+}
+
+static void
+test_missing_right_entry(op_fn_t fn, wl_plan_op_type_t type, bool owned)
+{
+    TEST("missing-right passthrough preserves complete evaluator entry");
+    wl_col_session_t *sess = make_mock_session();
+    col_rel_t *left = make_left(false);
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    int ok = sess && left;
+    bool transferred = false;
+    if (!ok) goto cleanup;
+    wl_plan_op_t op;
+    init_op(&op, type);
+    ok = eval_stack_push_delta(&stack, left, owned, true) == 0;
+    if (!ok) goto cleanup;
+    transferred = owned;
+    stack.items[0].seg_boundaries = malloc(2 * sizeof(uint32_t));
+    ok = stack.items[0].seg_boundaries != NULL;
+    if (!ok) goto cleanup;
+    uint32_t *segments = stack.items[0].seg_boundaries;
+    segments[0] = 0; segments[1] = left->nrows;
+    stack.items[0].seg_count = 1;
+    ok = fn(&op, &stack, sess) == 0 && stack.top == 1
+        && stack.items[0].rel == left && stack.items[0].owned == owned
+        && stack.items[0].is_delta && stack.items[0].seg_boundaries == segments
+        && stack.items[0].seg_count == 1 && segments[1] == left->nrows;
+cleanup:
+    (void)eval_stack_drain(&stack);
+    if (!transferred) col_rel_destroy(left);
+    if (sess) destroy_mock_session(sess);
+    if (ok) PASS(); else FAIL("passthrough lost metadata");
+}
+
 static void
 test_managed_right_filter(op_fn_t fn, wl_plan_op_type_t type, bool grow,
     bool exhaust)
@@ -708,40 +839,55 @@ test_managed_right_filter(op_fn_t fn, wl_plan_op_type_t type, bool grow,
     ok = col_rel_source_reader_acquire(left, &reader) == 0;
     if (!ok) goto cleanup;
     held = true;
+    for (uint32_t i = 0; i < COL_STACK_MAX - 1; i++) {
+        ok = eval_stack_push(&stack, session_find_rel(sess, "right"),
+                false) == 0;
+        if (!ok) goto cleanup;
+    }
     ok = eval_stack_push(&stack, left, true) == 0;
     if (!ok) goto cleanup;
     local = false;
-    stack.items[0].seg_boundaries = malloc(2 * sizeof(uint32_t));
-    ok = stack.items[0].seg_boundaries != NULL;
+    stack.items[COL_STACK_MAX - 1].seg_boundaries = malloc(2 *
+            sizeof(uint32_t));
+    ok = stack.items[COL_STACK_MAX - 1].seg_boundaries != NULL;
     if (!ok) goto cleanup;
-    segments = stack.items[0].seg_boundaries;
+    segments = stack.items[COL_STACK_MAX - 1].seg_boundaries;
     segments[0] = 0; segments[1] = left->nrows;
-    stack.items[0].seg_count = 1;
+    stack.items[COL_STACK_MAX - 1].seg_count = 1;
     for (unsigned i = 0; i < 2 && ok; i++)
-        ok = fn(&op, &stack, sess) == EBUSY && stack.top == 1
-            && stack.items[0].rel == left && stack.items[0].owned
-            && stack.items[0].seg_boundaries == segments
+        ok = fn(&op, &stack, sess) == EBUSY && stack.top == COL_STACK_MAX
+            && stack.items[COL_STACK_MAX - 1].rel == left &&
+            stack.items[COL_STACK_MAX - 1].owned
+            && stack.items[COL_STACK_MAX - 1].seg_boundaries == segments
             && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
                     ref)) == 0;
     if (!ok) goto cleanup;
-    ok = col_rel_source_reader_release(&reader) == 0;
-    held = false;
-    /* Keep the identical entry and segment metadata through the retry.
-     * #1749 tracks terminal JOIN metadata retirement; this test does not
-     * claim that separate success-path ownership gap is fixed. */
+    /* With allocation allowed, refuse terminal cleanup after computing the
+    * output. No result may replace the held entry or lose its metadata. */
     atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
             ref)->usable_bytes,
         1u << 20, memory_order_release);
-    ok = ok && fn(&op, &stack, sess) == 0 && stack.top == 1
-        && stack.items[0].rel->nrows == (type == WL_PLAN_OP_ANTIJOIN ? 0u : 4u);
+    for (unsigned i = 0; i < 2 && ok; i++)
+        ok = fn(&op, &stack, sess) == EBUSY && stack.top == COL_STACK_MAX
+            && stack.items[COL_STACK_MAX - 1].rel == left
+            && stack.items[COL_STACK_MAX - 1].owned
+            && stack.items[COL_STACK_MAX - 1].seg_boundaries == segments
+            && stack.items[COL_STACK_MAX - 1].seg_count == 1;
+    if (!ok) goto cleanup;
+    ok = col_rel_source_reader_release(&reader) == 0;
+
+    held = false;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes,
+        1u << 20, memory_order_release);
+    ok = ok && fn(&op, &stack, sess) == 0 && stack.top == COL_STACK_MAX
+        && (type == WL_PLAN_OP_ANTIJOIN
+            ? stack.items[COL_STACK_MAX - 1].rel->nrows == 0
+            : exact_join_rows(stack.items[COL_STACK_MAX - 1].rel, true,
+        type == WL_PLAN_OP_SEMIJOIN));
 cleanup:
     if (held) (void)col_rel_source_reader_release(&reader);
-    /* #1749: if successful JOIN dropped the segment owner, reclaim the
-     * fixture allocation explicitly after observing the actual retry. */
-    for (uint32_t i = 0; i < stack.top; i++)
-        if (stack.items[i].seg_boundaries == segments) segments = NULL;
     (void)eval_stack_drain(&stack);
-    free(segments);
     if (local) col_rel_destroy(left);
     if (sess) {
         sess->memory_governor = NULL; destroy_mock_session(sess);
@@ -828,6 +974,17 @@ cleanup:
 int
 main(void)
 {
+    test_terminal_cache_retry(wl_columnar_join_op, false, false);
+    test_terminal_cache_retry(wl_columnar_join_op, true, false);
+    test_terminal_cache_retry(wl_columnar_join_diff_op, false, false);
+    test_terminal_cache_retry(wl_columnar_join_diff_op, true, false);
+    test_terminal_cache_retry(wl_columnar_join_diff_op, false, true);
+    for (unsigned owned = 0; owned < 2; owned++) {
+        test_missing_right_entry(wl_columnar_antijoin_op, WL_PLAN_OP_ANTIJOIN,
+            owned != 0);
+        test_missing_right_entry(wl_columnar_semijoin_op, WL_PLAN_OP_SEMIJOIN,
+            owned != 0);
+    }
     test_managed_filter_cache();
     for (unsigned grow = 0; grow < 2; grow++)
         for (unsigned exhaust = 0; exhaust < 2; exhaust++)
