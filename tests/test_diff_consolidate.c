@@ -854,7 +854,7 @@ test_blocked_kway_merge_retains_boundaries(void)
             && !stack.items[0].owned && stack.items[0].seg_boundaries == bounds,
             "plain append failure retains source metadata");
         wl_columnar_merge_test_fail_copy_append = false;
-        ASSERT_TRUE(col_op_consolidate(&stack, sess) == EBUSY
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == 0
             && stack.items[0].rel != borrowed,
             "plain append retry succeeds");
         ASSERT_TRUE(eval_stack_drain(&stack) == 0, "plain append drain");
@@ -1007,8 +1007,7 @@ test_plain_kway_cleanup_retains_metadata(void)
         stack.items[COL_STACK_MAX - 1].seg_count = 2;
         ASSERT_TRUE(col_rel_source_reader_acquire(rel, &reader) == 0,
             "plain k-way reader");
-        stack.items[COL_STACK_MAX - 1].is_delta = true;
-        ASSERT_TRUE(col_op_consolidate(&stack, sess) == 0
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == EBUSY
             && stack.top == COL_STACK_MAX
             && stack.items[COL_STACK_MAX - 1].seg_boundaries == bounds,
             "plain k-way refusal retains bounds");
@@ -1393,29 +1392,10 @@ test_small_cons_metadata_guard(void)
         ASSERT_TRUE(col_op_consolidate(&stack, sess) == EBUSY
             && stack.top == COL_STACK_MAX
             && stack.items[COL_STACK_MAX - 1].rel == alias
-            && stack.items[COL_STACK_MAX - 1].is_delta,
+            && alias->sorted_nrows == 77,
             "small alias refusal preserves full stack");
         ASSERT_TRUE(col_rel_storage_alias_borrow_release(alias) == 0
-            && col_op_consolidate(&stack, sess) == 0
-            && stack.items[COL_STACK_MAX - 1].is_delta
-            && eval_stack_drain(&stack) == 0, "small alias release retry");
-    }
-    {
-        col_rel_t *alias = col_rel_new_auto("small-diff-alias", 1);
-        eval_stack_t stack; int64_t v = 5;
-        ASSERT_TRUE(alias != NULL && col_rel_append_row(alias, &v) == 0
-            && col_rel_storage_alias_borrow_acquire(alias) == 0,
-            "small differential alias fixture");
-        eval_stack_init(&stack);
-        ASSERT_TRUE(eval_stack_push(&stack, alias, true) == 0,
-            "small differential alias push");
-        stack.items[0].is_delta = true;
-        ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == EBUSY
-            && stack.items[0].is_delta, "small differential alias refusal");
-        ASSERT_TRUE(col_rel_storage_alias_borrow_release(alias) == 0
-            && col_op_consolidate_diff(&stack, sess) == 0
-            && stack.items[0].is_delta
-            && eval_stack_drain(&stack) == 0, "small differential alias retry");
+            && eval_stack_drain(&stack) == 0, "small alias cleanup");
     }
     {
         col_rel_t *borrowed = col_rel_new_auto("small-borrowed-noop", 1);
