@@ -1103,6 +1103,23 @@ test_plain_kway_cleanup_retains_metadata(void)
         ASSERT_TRUE(eval_stack_drain(&stack) == 0, "plain merge drain");
         col_rel_destroy(borrowed);
     }
+    {
+        col_rel_t *owned = col_rel_new_auto("plain-owned-invalid", 1);
+        eval_stack_t stack;
+        uint32_t *bounds = malloc(4 * sizeof(*bounds));
+        int64_t v[] = { 13, 14 };
+        ASSERT_TRUE(owned && bounds && col_rel_append_row(owned, &v[0]) == 0
+            && col_rel_append_row(owned, &v[1]) == 0,
+            "plain owned cleanup fixture");
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, owned, true) == 0,
+            "plain owned cleanup push");
+        bounds[0] = 0; bounds[1] = 1; bounds[2] = 2; bounds[3] = 1;
+        stack.items[0].seg_boundaries = bounds; stack.items[0].seg_count = 3;
+        ASSERT_TRUE(col_op_consolidate(&stack,
+            sess) == EINVAL && stack.top == 0,
+            "plain owned terminal cleanup releases metadata");
+    }
 #endif
     wl_arena_free(arena);
     destroy_mock_session(sess);
