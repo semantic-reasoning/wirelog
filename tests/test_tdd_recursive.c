@@ -2673,8 +2673,10 @@ test_initializer_unwind(uint32_t workers, unsigned mode, unsigned phase,
         && wl_columnar_memory_reserved(governor) == reserved
         && col_rel_storage_alias_borrow_count(source) == 0
         && col_rel_storage_alias_borrow_count(empty) == 0
-        && atomic_load(&source->source_access.state) == 0
-        && atomic_load(&empty->source_access.state) == 0,
+        && atomic_load_explicit(&source->source_access.state,
+        memory_order_seq_cst) == 0
+        && atomic_load_explicit(&empty->source_access.state,
+        memory_order_seq_cst) == 0,
         "failure leaked allocation credit or source leases");
     INIT_CHECK(wl_columnar_eval_test_initializer(mode, coord, workers) == 0
         && coord->tdd_workers_count == workers, "initializer retry");
@@ -2782,8 +2784,10 @@ test_hybrid_empty_idb_ownership(unsigned fault)
         HYBRID_CHECK(wl_columnar_memory_reserved(governor) == baseline
             && col_rel_storage_alias_borrow_count(source) == 0
             && col_rel_storage_alias_borrow_count(input) == 0
-            && atomic_load(&source->source_access.state) == 0
-            && atomic_load(&input->source_access.state) == 0,
+            && atomic_load_explicit(&source->source_access.state,
+            memory_order_seq_cst) == 0
+            && atomic_load_explicit(&input->source_access.state,
+            memory_order_seq_cst) == 0,
             "failure leaked reservations or source leases");
     }
 #else
@@ -2793,7 +2797,8 @@ test_hybrid_empty_idb_ownership(unsigned fault)
         "retry initialization");
     HYBRID_CHECK(sess->tdd_workers_count == 2
         && col_rel_storage_alias_borrow_count(source) == 0
-        && atomic_load(&source->source_access.state) == 0
+        && atomic_load_explicit(&source->source_access.state,
+        memory_order_seq_cst) == 0
         && col_rel_storage_alias_borrow_count(input) == 2,
         "IDB private ownership or EDB sharing");
     for (uint32_t worker = 0; worker < 2; worker++) {
