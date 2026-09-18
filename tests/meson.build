@@ -3861,12 +3861,25 @@ test_join_batch_resume_exe = executable(
 test('join_batch_resume', test_join_batch_resume_exe)
 
 # Issue #1505: owned right-filter cleanup on early join exits.
+# Issue #1720: the Linux allocation-failure cases need -Wl,--wrap=calloc, and
+# a b_lto=false target cannot link the LTO'd libtestlib_prod.a under clang --
+# "libtestlib_prod.a: error adding symbols: file format not recognized".  gcc
+# only survives because its driver always loads the LTO plugin.  Compile the
+# bundles directly on Linux instead, the same way test_program_oom and
+# test_plan_gen_oom do (see the note above testlib_prod).  Every ternary below
+# is on the SAME predicate so the pairing cannot drift: off Linux the target
+# keeps linking the shared archive and is unchanged.
 test_join_right_filter_cleanup_exe = executable(
   'test_join_right_filter_cleanup',
   files('test_join_right_filter_cleanup.c'),
+  host_machine.system() == 'linux' ? [backend_src, parser_src, ir_src,
+    optimizer_src, arena_src, io_src, thread_src, workqueue_src] : [],
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
-  link_with: [testlib_prod],
+  c_args: host_machine.system() == 'linux' ? ['-DWL_TEST_ALLOC_WRAP=1'] : [],
+  link_args: host_machine.system() == 'linux' ? ['-Wl,--wrap=calloc'] : [],
+  override_options: host_machine.system() == 'linux' ? ['b_lto=false'] : [],
+  link_with: host_machine.system() == 'linux' ? [] : [testlib_prod],
 )
 
 test('join_right_filter_cleanup', test_join_right_filter_cleanup_exe)

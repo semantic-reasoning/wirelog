@@ -29,18 +29,18 @@ testlib_prod = static_library(
 - Compiled once per build directory with the project defaults
   (`buildtype=release`, `optimization=s`, `b_lto=true`, no sanitizers)
   and **without** `-DWIRELOG_BUILDING` / `config.h` — exactly the
-  translation set and flags the 156 converted targets previously used
+  translation set and flags the 155 converted targets previously used
   to compile these TUs themselves. On Windows, `threads_dep` is wrapped
   with `compile_args: ['-DWIRELOG_STATIC']` so public API declarations in
   wirelog headers expand with plain static linkage rather than
   `__declspec(dllimport)`, avoiding unresolved `__imp_*` symbols during
   static archive extraction.
-- 156 converted targets: their `*_src` bundle arguments were removed and
+- 155 converted targets: their `*_src` bundle arguments were removed and
   `link_with: [testlib_prod]` added. Their `files()`,
   `include_directories`, and `dependencies` are byte-identical to the
   pre-change form, and they carry no per-target `c_args` / `c_link_args`
   / `link_args` / `scc_args` / `override_options` / `wrap=` / `env:`.
-- 104 targets retained (table in §3), each with an individual
+- 105 targets retained (table in §3), each with an individual
   justification.
 - No `test()` registration changed: 377 before and after, and the
   normalized `test()` bodies are identical multisets.
@@ -78,8 +78,13 @@ testlib_prod = static_library(
    `testlib_prod` contains each such TU exactly once, which removes the
    duplicate by construction (and keeps the LTO bitcode job free of
    duplicate modules). No archive member may be re-listed directly in a
-   converted target, and none is (reviewer-verified: TU union of the
-   converted targets == the library set, both directions).
+   converted target, and none is: a target that compiles bundles directly
+   is retained and does not link the archive at all.  The TU union of the
+   converted targets still equals the library set -- #1720 moved
+   test_join_right_filter_cleanup back out of the converted set, but every
+   bundle it used (parser/ir/optimizer/backend/arena/io/thread/workqueue)
+   is still contributed by other converted targets, so the union is
+   unchanged.
 4. **Single-archive link resolution.** The converted targets link exactly
    one shared archive in addition to their own objects, so the linker's
    iterative archive rescan resolves every intra-library dependency
@@ -96,7 +101,7 @@ testlib_prod = static_library(
    `wirelog_thread_src` selection and no host conditionals; CI exercises
    GCC/Clang on Linux/macOS/Windows.
 
-## 3. Retained targets (104) and why
+## 3. Retained targets (105) and why
 
 | target | reason for independent compilation |
 |---|---|
@@ -146,6 +151,7 @@ testlib_prod = static_library(
 | test_io_dispatch | defines `TEST_DISPATCH_PRESENT, ` WIRELOG_BUILDING`; `WIRELOG_BUILDING` plugin build; dep subset `threads_dep` |
 | test_ir | `b_lto=false`; dep subset `threads_dep` |
 | test_join_hash_probe | dep subset `(none)` |
+| test_join_right_filter_cleanup | `b_lto=false` + `-Wl,--wrap=calloc` on Linux (#1720 allocation-failure coverage) |
 | test_jpp | `b_lto=false`; dep subset `threads_dep` |
 | test_k_fusion_adaptive | dep subset `(none)` |
 | test_k_fusion_dispatch | dep subset `(none)` |
@@ -227,7 +233,7 @@ options, same checkout (before: clean `c5b7017`; after: this change),
 
 Cold builds — the case the issue targets (fresh checkout/PR builds of
 ~15k steps) — drop 74% of ninja steps and 42% of wall time. In the warm
-single-TU case the 156 converted targets pay only relink cost; the
+single-TU case the 155 converted targets pay only relink cost; the
 removed work was compiler-parallel, so on a 16-core box the remaining
 LTO relinks dominate both sides and wall time is flat.
 
@@ -248,7 +254,7 @@ LTO relinks dominate both sides and wall time is flat.
 - **ABI surface**: no installed header changed; the
   `check-public-header-surface.py` gate is unaffected.
 
-## 6. Converted targets (156)
+## 6. Converted targets (155)
 
 bench_incremental_frontier, incremental_insertion, test_2d_frontier_init, test_2d_frontier_skip
 test_affected_rules, test_affected_strata, test_affected_strata_rewrites, test_arithmetic_overflow
@@ -271,7 +277,7 @@ test_frontier_progress, test_frontier_skip_mobius, test_frontier_vtable, test_gc
 test_gc_freeze_guard, test_generation_cache, test_handle_remap_apply, test_handle_remap_side_apply
 test_hash_eval, test_hash_integration, test_host_insert_width, test_inline_compound_wiring
 test_input_arity, test_intern_parallel_determinism, test_issue914_nonrec_after_recursive, test_join_arrangement
-test_join_batch_resume, test_join_limit, test_join_overflow, test_join_right_filter_cleanup
+test_join_batch_resume, test_join_limit, test_join_overflow
 test_k_fusion_correctness, test_k_fusion_e2e, test_k_fusion_inline_shadow, test_k_fusion_memory
 test_lftj, test_lftj_integration, test_magic_sets, test_malloc_optimization
 test_mat_cache_lifetime, test_max_workers, test_memory_admission_relation, test_mixed_insert_remove_mask
@@ -292,7 +298,7 @@ test_wirelog_easy_inline_facts, test_worker_arena_borrow, test_worker_borrow_w2_
 test_workers_as_cap, test_workqueue
 
 
-## 7. Converted targets (156)
+## 7. Converted targets (155)
 
 - bench_incremental_frontier, incremental_insertion, test_2d_frontier_init, test_2d_frontier_skip, test_affected_rules, test_affected_strata
 - test_affected_strata_rewrites, test_arithmetic_overflow, test_arr_hash_rows_batch, test_arrangement, test_arrangement_cache_reuse, test_arrangement_incremental_invalidation
@@ -308,7 +314,7 @@ test_workers_as_cap, test_workqueue
 - test_filter_select_rows, test_fpga_backend, test_frontier_progress, test_frontier_skip_mobius, test_frontier_vtable, test_gc_epoch_boundary
 - test_gc_freeze_guard, test_generation_cache, test_handle_remap_apply, test_handle_remap_side_apply, test_hash_eval, test_hash_integration
 - test_host_insert_width, test_inline_compound_wiring, test_input_arity, test_intern_parallel_determinism, test_issue914_nonrec_after_recursive, test_join_arrangement
-- test_join_batch_resume, test_join_limit, test_join_overflow, test_join_right_filter_cleanup, test_k_fusion_correctness, test_k_fusion_e2e
+- test_join_batch_resume, test_join_limit, test_join_overflow, test_k_fusion_correctness, test_k_fusion_e2e
 - test_k_fusion_inline_shadow, test_k_fusion_memory, test_lftj, test_lftj_integration, test_magic_sets, test_malloc_optimization
 - test_mat_cache_lifetime, test_max_workers, test_memory_admission_relation, test_mixed_insert_remove_mask, test_mobius_count_signed, test_mobius_delta_formula
 - test_mobius_join_weighted, test_monotone_detection, test_multi_stratum_rule_frontier, test_multi_worker, test_optimizer_equivalence, test_option2_doop

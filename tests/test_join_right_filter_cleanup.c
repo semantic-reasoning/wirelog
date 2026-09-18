@@ -29,10 +29,27 @@
 
 #include "../wirelog/columnar/internal.h"
 
+#include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef WL_TEST_ALLOC_WRAP
+void *__real_calloc(size_t count, size_t size);
+static size_t fail_calloc_bytes;
+static unsigned fail_calloc_hits;
+void *__wrap_calloc(size_t count, size_t size)
+{
+    if (fail_calloc_bytes != 0 && count > 0
+        && count * size == fail_calloc_bytes) {
+        fail_calloc_bytes = 0;
+        fail_calloc_hits++;
+        return NULL;
+    }
+    return __real_calloc(count, size);
+}
+#endif
 
 static int tests_run = 0;
 static int tests_passed = 0;
@@ -92,6 +109,19 @@ destroy_mock_session(wl_col_session_t *s)
      * session teardown does. */
     col_session_free_delta_arrangements(s);
     col_mat_cache_clear(&s->mat_cache);
+    /* The cached right-filter path owns its filtered relations and the entry
+     * array itself; free them exactly as the real session teardown does in
+     * wirelog/columnar/session.c.  Every lease must already be released, as
+     * it asserts there -- this is a final teardown, not a per-relation
+     * eviction, so it does not unwind pins. */
+    assert(s->filt_cache_active_pins == 0);
+    for (uint32_t i = 0; i < s->filt_cache_count; i++) {
+        free(s->filt_cache[i].rel_name);
+        free(s->filt_cache[i].filter_data);
+        if (s->filt_cache[i].filtered)
+            col_rel_destroy(s->filt_cache[i].filtered);
+    }
+    free(s->filt_cache);
     session_rel_free_hash(s);
     delta_pool_destroy(s->delta_pool);
     free(s);
@@ -410,6 +440,217 @@ test_probe_error_releases_filter(void)
     return 0;
 }
 
+static int
+test_right_filter_preserves_timestamps(void)
+{
+    TEST("right FILTER preserves timestamps in cached and uncached paths");
+    const char *names[] = { "k", "r" };
+    col_rel_t *rel = make_rel("timestamp-right", 2, names);
+    delta_pool_t *pool = delta_pool_create(32, sizeof(col_rel_t), 4096);
+    wl_col_session_t *sess = make_mock_session();
+    wl_plan_expr_buffer_t expr = { filter_bytes, sizeof(filter_bytes) };
+    uint8_t empty_bytes[sizeof(filter_bytes)];
+    memcpy(empty_bytes, filter_bytes, sizeof(empty_bytes));
+    /* CONST_INT is little-endian at offset 8; make the predicate false. */
+    empty_bytes[8] = (uint8_t)232;
+    wl_plan_expr_buffer_t empty_expr = { empty_bytes, sizeof(empty_bytes) };
+    static uint8_t fallback_bytes[] = {
+        WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1',
+        WL_PLAN_EXPR_CONST_INT, 1, 0, 0, 0, 0, 0, 0, 0,
+        WL_PLAN_EXPR_ARITH_ADD,
+        WL_PLAN_EXPR_CONST_INT, 0, 0, 0, 0, 0, 0, 0, 0,
+        WL_PLAN_EXPR_CMP_GT
+    };
+    wl_plan_expr_buffer_t fallback_expr = {
+        fallback_bytes, sizeof(fallback_bytes)
+    };
+    col_filt_cache_pin_t pin = { 0 };
+    col_rel_t *uncached = NULL;
+    col_rel_t *cached = NULL;
+    int ok = rel && pool && sess && col_rel_enable_timestamps(rel) == 0;
+
+    for (int64_t i = 0; ok && i < 6; i++) {
+        int64_t row[] = { i, i < 3 ? 100 + i : 200 + i };
+        ok = col_rel_append_row(rel, row) == 0;
+        if (ok)
+            rel->timestamps[i] = (col_delta_timestamp_t){
+                .iteration = (uint32_t)(40 + i),
+                .stratum = (uint32_t)(50 + i),
+                .worker = (uint32_t)(60 + i),
+                .multiplicity = i == 4 ? -7 : i + 1
+            };
+    }
+    if (ok) {
+        uncached = wl_columnar_filter_apply_right_filter(&expr, rel, pool,
+                NULL);
+        cached = wl_columnar_filter_apply_right_filter_cached_pin(sess, &expr,
+                "timestamp-right", rel, &pin);
+        ok = uncached && cached && uncached->timestamps && cached->timestamps
+            && uncached->nrows == 3 && cached->nrows == 3;
+    }
+    for (col_rel_t *out = uncached; ok && out;
+        out = out == uncached ? cached : NULL) {
+        for (uint32_t i = 0; i < 3; i++) {
+            uint32_t src = i + 3;
+            ok = ok && out->columns[0][i] == (int64_t)src
+                && out->columns[1][i] == (int64_t)(200 + src)
+                && out->timestamps[i].iteration == 40 + src
+                && out->timestamps[i].stratum == 50 + src
+                && out->timestamps[i].worker == 60 + src
+                && out->timestamps[i].multiplicity
+                == (src == 4 ? -7 : (int64_t)src + 1);
+        }
+    }
+#ifdef WL_TEST_ALLOC_WRAP
+    if (ok) {
+        /* Exercise timestamp allocation failure on cache creation and retry. */
+        wl_col_session_t *fault_sess = make_mock_session();
+        col_filt_cache_pin_t fault_pin = { 0 };
+        size_t ts_bytes = (size_t)rel->capacity * sizeof(*rel->timestamps);
+        fail_calloc_bytes = ts_bytes;
+        fail_calloc_hits = 0;
+        col_rel_t *failed = wl_columnar_filter_apply_right_filter_cached_pin(
+            fault_sess, &expr, "fault-right", rel, &fault_pin);
+        ok = failed == NULL && !fault_pin.active && fail_calloc_hits == 1;
+        if (ok) {
+            col_rel_t *retried = wl_columnar_filter_apply_right_filter_cached(
+                fault_sess, &expr, "fault-right", rel);
+            ok = retried && retried->timestamps && retried->nrows == 3
+                && retried->timestamps[1].multiplicity == -7;
+        }
+        /* The pin is inactive on this path only because the call failed.
+         * Release it unconditionally so a wrap that stops firing reports a
+         * readable test failure instead of aborting in teardown. */
+        col_filt_cache_pin_release(&fault_pin);
+        if (fault_sess)
+            destroy_mock_session(fault_sess);
+    }
+#endif
+    col_filt_cache_pin_release(&pin);
+    if (ok) {
+        /* A fresh lookup is a cache hit and must retain the same records. */
+        col_rel_t *hit = wl_columnar_filter_apply_right_filter_cached(sess,
+                &expr, "timestamp-right", rel);
+        ok = hit && hit->timestamps && hit->nrows == 3
+            && hit->timestamps[1].multiplicity == -7;
+    }
+    if (ok) {
+        /* Source growth invalidates the entry and rebuilds it in place. */
+        int64_t row[] = { 9, 209 };
+        ok = col_rel_append_row(rel, row) == 0;
+        if (ok) {
+            rel->timestamps[6] = (col_delta_timestamp_t){
+                .iteration = 99, .stratum = 98, .worker = 97,
+                .multiplicity = -11
+            };
+            col_rel_t *rebuilt =
+                wl_columnar_filter_apply_right_filter_cached(sess, &expr,
+                    "timestamp-right", rel);
+            ok = rebuilt && rebuilt->timestamps && rebuilt->nrows == 4
+                && rebuilt->timestamps[3].iteration == 99
+                && rebuilt->timestamps[3].multiplicity == -11;
+        }
+    }
+#ifdef WL_TEST_ALLOC_WRAP
+    if (ok) {
+        /* The same fault during stale rebuild leaves a retryable cache entry. */
+        int64_t row[] = { 11, 211 };
+        ok = col_rel_append_row(rel, row) == 0;
+        if (ok) {
+            rel->timestamps[7] = (col_delta_timestamp_t){
+                .iteration = 117, .stratum = 118, .worker = 119,
+                .multiplicity = -13
+            };
+            size_t ts_bytes = (size_t)rel->capacity
+                * sizeof(*rel->timestamps);
+            fail_calloc_bytes = ts_bytes;
+            fail_calloc_hits = 0;
+            col_filt_cache_pin_t rebuild_pin = { 0 };
+            col_rel_t *failed =
+                wl_columnar_filter_apply_right_filter_cached_pin(
+                sess, &expr, "timestamp-right", rel, &rebuild_pin);
+            ok = failed == NULL && !rebuild_pin.active
+                && fail_calloc_hits == 1;
+            if (ok) {
+                col_rel_t *retried =
+                    wl_columnar_filter_apply_right_filter_cached(
+                    sess, &expr, "timestamp-right", rel);
+                ok = retried && retried->timestamps && retried->nrows == 5
+                    && retried->timestamps[4].iteration == 117
+                    && retried->timestamps[4].multiplicity == -13;
+            }
+            /* Same reason as fault_pin above. */
+            col_filt_cache_pin_release(&rebuild_pin);
+        }
+    }
+#endif
+    if (ok) {
+        /* A non-simple compiled predicate must copy timestamps as well. */
+        col_rel_t *fallback = wl_columnar_filter_apply_right_filter(
+            &fallback_expr, rel, pool, NULL);
+        ok = fallback && fallback->timestamps && fallback->nrows == rel->nrows
+            && fallback->timestamps[5].iteration == 45;
+        if (fallback)
+            col_rel_destroy(fallback);
+    }
+    if (ok) {
+        /* An empty timestamp-enabled result remains timestamp-enabled. */
+        col_rel_t *empty = wl_columnar_filter_apply_right_filter(
+            &empty_expr, rel, pool, NULL);
+        ok = empty && empty->timestamps && empty->nrows == 0;
+        if (empty)
+            col_rel_destroy(empty);
+    }
+    if (ok) {
+        /* A held lease defers stale eviction until its final release. */
+        col_filt_cache_pin_t held = { 0 };
+        col_filt_cache_pin_t blocked = { 0 };
+        col_rel_t *leased = wl_columnar_filter_apply_right_filter_cached_pin(
+            sess, &expr, "timestamp-right", rel, &held);
+        uint32_t held_src = rel->nrows;
+        uint32_t held_expected = 1;
+        for (uint32_t i = 0; i < rel->nrows; i++)
+            if (rel->columns[1][i] > 150)
+                held_expected++;
+        int64_t row[] = { 10, 210 };
+        ok = leased && col_rel_append_row(rel, row) == 0;
+        if (ok) {
+            rel->timestamps[held_src] = (col_delta_timestamp_t){
+                .iteration = 107, .stratum = 108, .worker = 109,
+                .multiplicity = -12
+            };
+            ok = wl_columnar_filter_apply_right_filter_cached_pin(
+                sess, &expr, "timestamp-right", rel, &blocked) == NULL;
+        }
+        col_filt_cache_pin_release(&blocked);
+        col_filt_cache_pin_release(&held);
+        if (ok) {
+            col_rel_t *retry = wl_columnar_filter_apply_right_filter_cached(
+                sess, &expr, "timestamp-right", rel);
+            ok = retry && retry->timestamps
+                && retry->nrows == held_expected
+                && retry->timestamps[held_expected - 1].iteration == 107
+                && retry->timestamps[held_expected - 1].multiplicity == -12;
+        }
+    }
+    if (uncached)
+        col_rel_destroy(uncached);
+    if (sess) {
+        /* The cached result is owned by the session cache. */
+        destroy_mock_session(sess);
+    }
+    if (rel)
+        col_rel_destroy(rel);
+    if (pool)
+        delta_pool_destroy(pool);
+    if (!ok) {
+        FAIL("right FILTER timestamp correspondence mismatch");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
 int
 main(void)
 {
@@ -417,6 +658,7 @@ main(void)
 
     test_success_path_uses_owned_filter();
     test_probe_error_releases_filter();
+    test_right_filter_preserves_timestamps();
     test_backpressure_exit("join: backpressure exit releases the filter",
         wl_columnar_join_op, WL_PLAN_OP_JOIN);
     test_backpressure_exit("join(diff): backpressure exit releases the filter",
