@@ -257,50 +257,67 @@ wl_columnar_eval_finalize_relation(wl_col_session_t *coord, col_rel_t *target)
     return rc;
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_eval_test_nonrec_worker)(wl_col_session_t *, eval_stack_t *,
+    eval_entry_t *, int *);
+int (*wl_columnar_eval_test_nonrec_boundary)(wl_col_session_t *, unsigned,
+    uint32_t, col_rel_t *);
+#define WL_COLUMNAR_EVAL_NONREC_BOUNDARY(coord, phase, worker, candidate) \
+        (wl_columnar_eval_test_nonrec_boundary \
+    ? wl_columnar_eval_test_nonrec_boundary(coord, phase, worker, \
+        candidate) : 0)
+#else
+#define WL_COLUMNAR_EVAL_NONREC_BOUNDARY(coord, phase, worker, candidate) (0)
+#endif
+
 typedef struct {
     const wl_plan_relation_t *rp;
     wl_col_session_t *worker_sess;
-    eval_entry_t result;
+    eval_entry_t *stage;
     int rc;
 } nonrec_rule_worker_ctx_t;
 
 static void
 nonrec_rule_worker_fn(void *arg)
 {
-    nonrec_rule_worker_ctx_t *ctx = (nonrec_rule_worker_ctx_t *)arg;
-    eval_stack_t stack;
-    eval_stack_init(&stack);
-
-    ctx->result.rel = NULL;
-    ctx->result.owned = false;
-    ctx->rc = col_eval_relation_plan(ctx->rp, &stack, ctx->worker_sess);
-    if (ctx->rc != 0) {
-        int drain_rc = eval_stack_drain_to_session(&stack,
-                ctx->worker_sess);
-        if (drain_rc != 0)
-            ctx->rc = drain_rc;
+    nonrec_rule_worker_ctx_t *ctx = arg;
+    wl_col_session_t *worker = ctx->worker_sess;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    if (worker->cleanup_active || worker->cleanup_pending) {
+        ctx->rc = EBUSY;
         return;
     }
-    if (stack.top > 0) {
-        ctx->result = eval_stack_pop(&stack);
-        if (ctx->result.kind != WL_COLUMNAR_EVAL_ENTRY_RELATION) {
-            int dispose_rc = eval_stack_dispose_entry(&stack, &ctx->result);
-            ctx->rc = ENOTSUP;
-            int drain_rc = eval_stack_drain_to_session(&stack,
-                    ctx->worker_sess);
-            if (dispose_rc != 0)
-                ctx->rc = dispose_rc;
-            if (drain_rc != 0)
-                ctx->rc = drain_rc;
-            return;
+    ctx->rc = wl_columnar_session_cleanup_ready_quiescent(worker);
+    if (ctx->rc != 0)
+        return;
+    ctx->rc = wl_columnar_eval_stack_cleanup_begin(worker, &frame);
+    if (ctx->rc != 0)
+        return;
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame);
+    eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(frame);
+    ctx->rc = col_eval_relation_plan(ctx->rp, stack, worker);
+    if (ctx->rc == 0 && stack->top > 0)
+        ctx->rc = eval_stack_pop_relation(stack, result);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_test_nonrec_worker)
+        wl_columnar_eval_test_nonrec_worker(worker, stack, result, &ctx->rc);
+#endif
+    if (ctx->rc == 0 && result->rel) {
+        col_rel_t *copy = wl_columnar_relation_new_like_governed(ctx->rp->name,
+                result->rel, worker->memory_governor);
+        if (!copy) {
+            ctx->rc = ENOMEM;
+        } else {
+            /* The coordinator admitted and initialized this disjoint slot
+             * before dispatch. It observes it only after the worker barrier. */
+            ctx->stage->rel = copy;
+            ctx->stage->owned = true;
+            ctx->rc = col_rel_append_all(copy, result->rel, NULL);
         }
     }
-    {
-        int drain_rc = eval_stack_drain_to_session(&stack,
-                ctx->worker_sess);
-        if (drain_rc != 0)
-            ctx->rc = drain_rc;
-    }
+    int cleanup_rc = wl_columnar_eval_stack_cleanup_finish(&frame);
+    if (cleanup_rc != 0)
+        ctx->rc = cleanup_rc;
 }
 
 static bool
@@ -367,33 +384,44 @@ nonrec_parallel_min_rows_per_worker(void)
 
 static int
 nonrec_copy_relation_slice(const col_rel_t *src, const char *name,
-    uint32_t begin, uint32_t end, col_rel_t **out)
+    uint32_t begin, uint32_t end, wl_columnar_memory_governor_ref_t *governor,
+    col_rel_t **out)
 {
     if (!src || !out || begin > end || end > src->nrows)
         return EINVAL;
-    col_rel_t *dst = col_rel_new_like(name, src);
-    if (!dst)
-        return ENOMEM;
-
-    int64_t *row = (int64_t *)malloc(
-        sizeof(int64_t) * (src->ncols ? src->ncols : 1));
-    if (!row) {
-        col_rel_destroy(dst);
-        return ENOMEM;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    int rc = col_rel_source_reader_acquire(src, &reader);
+    if (rc != 0)
+        return rc;
+    col_rel_t *dst = wl_columnar_relation_new_like_governed(name, src,
+            governor);
+    int64_t *row = NULL;
+    if (!dst) {
+        rc = ENOMEM;
+        goto done;
     }
-    int rc = 0;
+    row = malloc(sizeof(int64_t) * (src->ncols ? src->ncols : 1));
+    if (!row) {
+        rc = ENOMEM;
+        goto done;
+    }
     for (uint32_t r = begin; r < end && rc == 0; r++) {
         for (uint32_t c = 0; c < src->ncols; c++)
             row[c] = src->columns[c][r];
         rc = col_rel_append_row(dst, row);
+        if (rc == 0 && src->timestamps)
+            dst->timestamps[dst->nrows - 1] = src->timestamps[r];
     }
+done:
     free(row);
-    if (rc != 0) {
+    int release_rc = col_rel_source_reader_release(&reader);
+    if (rc == 0)
+        rc = release_rc;
+    if (rc == 0)
+        *out = dst;
+    else
         col_rel_destroy(dst);
-        return rc;
-    }
-    *out = dst;
-    return 0;
+    return rc;
 }
 
 static int
@@ -479,6 +507,8 @@ int
 wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
     wl_col_session_t *coord)
 {
+    if (coord->cleanup_active || coord->cleanup_pending)
+        return EBUSY;
     const char *driver_name = NULL;
     if (!nonrec_plan_parallel_safe(rp, &driver_name))
         return EAGAIN;
@@ -489,6 +519,11 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
         return EAGAIN;
     if (coord->num_workers <= 1 || coord->nrels == 0)
         return EAGAIN;
+    int ready_rc = wl_columnar_session_cleanup_ready_quiescent(coord);
+    if (ready_rc == 0)
+        ready_rc = tdd_cleanup_workers(coord);
+    if (ready_rc != 0)
+        return ready_rc;
 
     col_rel_t *driver = session_find_rel(coord, driver_name);
     if (!driver || driver->nrows == 0)
@@ -502,6 +537,8 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
         W = 32;
     if (W <= 1)
         return EAGAIN;
+    if (W > COL_STACK_MAX)
+        return ENOBUFS;
 
     char slice_name[256];
     int sn = snprintf(slice_name, sizeof(slice_name), "$nonrec$%s",
@@ -566,7 +603,21 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
         return tdd_cleanup_preserve_error(coord, ENOMEM);
     }
 
-    uint32_t built_workers = 0;
+    wl_columnar_eval_stack_cleanup_frame_t *stage_frame = NULL;
+    rc = WL_COLUMNAR_EVAL_NONREC_BOUNDARY(coord, 0, 0, NULL);
+    if (rc == 0)
+        rc = wl_columnar_eval_stack_cleanup_begin(coord, &stage_frame);
+    if (rc != 0) {
+        free((void *)worker_rels);
+        free(ctxs);
+        free(ops_copy);
+        return rc;
+    }
+    eval_stack_t *stages = wl_columnar_eval_stack_cleanup_stack(stage_frame);
+    eval_entry_t *final = wl_columnar_eval_stack_cleanup_result(stage_frame);
+    stages->top = W;
+    for (uint32_t w = 0; w < W; w++)
+        ctxs[w].stage = &stages->items[w];
     uint32_t chunk = (driver->nrows + W - 1u) / W;
     atomic_uint_fast64_t shared_join_count;
     atomic_store_explicit(&shared_join_count, 0, memory_order_relaxed);
@@ -596,7 +647,7 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
                 end = driver->nrows;
             col_rel_t *slice = NULL;
             rc = nonrec_copy_relation_slice(driver, slice_name, begin, end,
-                    &slice);
+                    coord->memory_governor, &slice);
             if (rc == 0)
                 worker_rels[w][rels_built++] = slice; /* NOLINT(clang-analyzer-security.ArrayBound) */
         }
@@ -614,7 +665,6 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
                 coord->tdd_workers[w].join_output_shared_limit =
                     coord->join_output_limit;
             }
-            built_workers++;
         }
     }
     if (rc == 0)
@@ -624,6 +674,9 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
         for (uint32_t w = 0; w < W; w++) {
             ctxs[w].rp = &rp_copy;
             ctxs[w].worker_sess = &coord->tdd_workers[w];
+            rc = WL_COLUMNAR_EVAL_NONREC_BOUNDARY(coord, 1, w, NULL);
+            if (rc != 0)
+                break;
             if (wl_workqueue_submit(coord->wq, nonrec_rule_worker_fn,
                 &ctxs[w]) != 0) {
                 rc = ENOMEM;
@@ -639,88 +692,120 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
         }
     }
 
-    bool merge_started = false;
-    if (rc == 0) {
-        merge_started = true;
-        col_rel_t *target = session_find_rel(coord, rp->name);
-        const col_rel_t *schema_rel = NULL;
-        for (uint32_t w = 0; w < W && rc == 0; w++) {
-            col_rel_t *wr = ctxs[w].result.rel;
-            if (!wr)
-                continue;
-            if (!schema_rel && wr->ncols > 0)
-                schema_rel = wr;
-            if (wr->nrows == 0)
-                continue;
-            if (!target) {
-                target = col_rel_new_auto(rp->name, wr->ncols);
-                if (!target) {
-                    rc = ENOMEM;
-                    break;
-                }
-                rc = session_add_rel(coord, target);
-                if (rc != 0) {
-                    col_rel_destroy(target);
-                    target = NULL;
-                    break;
-                }
-            }
-            if (target->ncols == 0 && wr->ncols > 0) {
-                rc = col_rel_set_schema(target, wr->ncols,
-                        (const char *const *)wr->col_names);
-                if (rc != 0)
-                    break;
-            }
-            rc = col_rel_append_all(target, wr, coord->eval_arena);
-        }
-        if (rc == 0 && !target) {
-            uint32_t ncols = schema_rel ? schema_rel->ncols : 0;
-            target = col_rel_new_auto(rp->name, ncols);
-            if (!target) {
-                rc = ENOMEM;
-            } else if (schema_rel && ncols > 0) {
-                rc = col_rel_set_schema(target, ncols,
-                        (const char *const *)schema_rel->col_names);
-            }
-            if (rc == 0) {
-                rc = session_add_rel(coord, target);
-                if (rc != 0) {
-                    col_rel_destroy(target);
-                    target = NULL;
-                }
-            } else if (target) {
-                col_rel_destroy(target);
-                target = NULL;
-            }
-        }
+    bool evaluation_complete = rc == 0;
+    /* No retained cohort may refer to this function's stack-local counter. */
+    for (uint32_t w = 0; w < coord->tdd_workers_count; w++) {
+        coord->tdd_workers[w].join_output_shared_count = NULL;
+        coord->tdd_workers[w].join_output_shared_limit = 0;
     }
-
-    for (uint32_t w = 0; w < W; w++) {
-        if (ctxs[w].result.rel && ctxs[w].result.owned
-            && !ctxs[w].result.rel->pool_owned)
-            col_rel_destroy(ctxs[w].result.rel);
-    }
-    free(ctxs);
-    free(ops_copy);
-    if (worker_rels) {
-        for (uint32_t w = 0; w < W; w++) {
-            if (worker_rels[w]) {
-                if (w >= built_workers) {
-                    for (size_t ri = 0; ri < relation_slots; ri++)
-                        col_rel_destroy(worker_rels[w][ri]);
-                }
-                free((void *)worker_rels[w]);
-            }
-        }
-        free((void *)worker_rels);
-    }
+    if (rc == 0)
+        rc = WL_COLUMNAR_EVAL_NONREC_BOUNDARY(coord, 2, 0, NULL);
     int cleanup_rc = tdd_cleanup_workers(coord);
     if (cleanup_rc != 0)
         rc = cleanup_rc;
-    if (rc == 0 && merge_started && nonrec_plan_has_consolidate(rp))
-        rc = wl_columnar_eval_finalize_relation(coord,
-                session_find_rel(coord, rp->name));
-    if (!merge_started && rc == EOVERFLOW)
+    bool publication_started = false;
+    col_rel_replacement_t replacement = { 0 };
+    col_rel_t *target = NULL;
+    uint64_t identity = 0, view = 0, storage = 0;
+    if (rc == 0) {
+        target = session_find_rel(coord, rp->name);
+        const col_rel_t *prototype = target && target->ncols ? target : NULL;
+        for (uint32_t w = 0; !prototype && w < W; w++)
+            if (stages->items[w].rel)
+                prototype = stages->items[w].rel;
+        rc = WL_COLUMNAR_EVAL_NONREC_BOUNDARY(coord, 3, 0, NULL);
+        if (rc == 0 && prototype) {
+            final->rel = wl_columnar_relation_new_like_governed(rp->name,
+                    prototype, coord->memory_governor);
+            final->owned = final->rel != NULL;
+            if (!final->rel)
+                rc = ENOMEM;
+        } else if (rc == 0) {
+            rc = col_rel_alloc(&final->rel, rp->name);
+            final->owned = final->rel != NULL;
+            if (rc == 0)
+                rc = col_rel_attach_memory_governor(final->rel,
+                        coord->memory_governor);
+        }
+        for (uint32_t w = 0; rc == 0 && w < W; w++) {
+            col_rel_t *part = stages->items[w].rel;
+            if (part && part->timestamps && !final->rel->timestamps)
+                rc = col_rel_enable_timestamps(final->rel);
+        }
+        wl_columnar_source_access_reader_t reader = { 0 };
+        if (rc == 0 && target) {
+            rc = col_rel_source_reader_acquire(target, &reader);
+            if (rc == 0) {
+                identity = target->relation_identity;
+                view = target->view_generation;
+                storage = target->storage_generation;
+                if (target->nrows > 0)
+                    rc = col_rel_append_all(final->rel, target, NULL);
+                int release_rc = col_rel_source_reader_release(&reader);
+                if (rc == 0)
+                    rc = release_rc;
+            }
+        }
+        for (uint32_t w = 0; rc == 0 && w < W; w++)
+            if (stages->items[w].rel)
+                rc = col_rel_append_all(final->rel, stages->items[w].rel, NULL);
+
+
+        if (rc == 0)
+            rc = WL_COLUMNAR_EVAL_NONREC_BOUNDARY(coord, 4, 0, final->rel);
+        if (rc == 0 && nonrec_plan_has_consolidate(rp))
+            rc = wl_columnar_eval_delta_consolidate(final->rel, coord);
+        if (rc == 0)
+            rc = WL_COLUMNAR_EVAL_NONREC_BOUNDARY(coord, 5, 0, final->rel);
+        if (rc == 0 && target) {
+            rc = col_rel_prepare_replacement(target, final->rel, &replacement);
+            if (rc == 0 && (session_find_rel(coord, rp->name) != target
+                || target->relation_identity != identity
+                || target->view_generation != view
+                || target->storage_generation != storage))
+                rc = EBUSY;
+            if (rc == 0) {
+                rc = wl_columnar_eval_stack_cleanup_finish(&stage_frame);
+                if (rc == 0) {
+                    col_rel_commit_replacement_locked(target, &replacement);
+                    publication_started = true;
+                }
+            }
+        } else if (rc == 0) {
+            rc = eval_stack_drain(stages);
+            if (rc == 0)
+                rc = wl_columnar_relation_rename_checked(final->rel, rp->name);
+            if (rc == 0) {
+                col_rel_t *candidate = final->rel;
+                rc = session_add_rel(coord, candidate);
+                if (session_find_rel(coord, rp->name) == candidate) {
+                    memset(final, 0, sizeof(*final));
+                    publication_started = true;
+                }
+            }
+        }
+    }
+    col_rel_discard_replacement(&replacement);
+    if (stage_frame) {
+        int stage_rc = wl_columnar_eval_stack_cleanup_finish(&stage_frame);
+        if (stage_rc != 0)
+            rc = stage_rc;
+    }
+    if (publication_started)
+        col_session_invalidate_arrangements(&coord->base, rp->name);
+    free(ctxs);
+    free(ops_copy);
+    for (uint32_t w = 0; w < W; w++) {
+        if (worker_rels[w]) {
+            for (size_t ri = 0; ri < relation_slots; ri++)
+                col_rel_destroy(worker_rels[w][ri]);
+            free((void *)worker_rels[w]);
+        }
+    }
+    free((void *)worker_rels);
+    if (!evaluation_complete && !publication_started && rc == EOVERFLOW
+        && cleanup_rc == 0
+        && !coord->cleanup_pending && coord->tdd_workers_count == 0)
         return EAGAIN;
     return rc;
 }
