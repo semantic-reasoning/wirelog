@@ -171,6 +171,21 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
 
 /* --- MAP ----------------------------------------------------------------- */
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_ops_test_before_map_dispose)(eval_stack_t *,
+    eval_entry_t *);
+bool wl_columnar_ops_test_map_fail_output_alloc;
+#endif
+
+/* Preserve the complete input entry when cleanup is refused. */
+static int
+wl_columnar_ops_dispose_map_input(eval_stack_t *stack, eval_entry_t *entry,
+    int result)
+{
+    int rc = eval_stack_dispose_entry(stack, entry);
+    return rc != 0 ? rc : result;
+}
+
 int
 col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
 {
@@ -178,22 +193,25 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     int pop_rc = eval_stack_pop_relation(stack, &e);
     if (pop_rc != 0)
         return pop_rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_ops_test_before_map_dispose)
+        wl_columnar_ops_test_before_map_dispose(stack, &e);
+#endif
 
     uint32_t pc = op->project_count;
-    col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
+    col_rel_t *out = NULL;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (!wl_columnar_ops_test_map_fail_output_alloc)
+#endif
+    out = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
             "$map", pc);
-    if (!out) {
-        if (e.owned)
-            col_rel_destroy(e.rel);
-        return ENOMEM;
-    }
+    if (!out)
+        return wl_columnar_ops_dispose_map_input(stack, &e, ENOMEM);
 
     int64_t *tmp = (int64_t *)malloc(sizeof(int64_t) * pc);
     if (!tmp) {
         col_rel_destroy(out);
-        if (e.owned)
-            col_rel_destroy(e.rel);
-        return ENOMEM;
+        return wl_columnar_ops_dispose_map_input(stack, &e, ENOMEM);
     }
 
     /* Pre-compile map expressions once to avoid per-row strtol. */
@@ -224,9 +242,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         }
         free(tmp);
         col_rel_destroy(out);
-        if (e.owned)
-            col_rel_destroy(e.rel);
-        return ENOMEM;
+        return wl_columnar_ops_dispose_map_input(stack, &e, ENOMEM);
     }
 
     int64_t *const row = row_rb.ptr;
@@ -257,9 +273,8 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                         col_row_buf_release(&row_rb);
                         free(tmp);
                         col_rel_destroy(out);
-                        if (e.owned)
-                            col_rel_destroy(e.rel);
-                        return ERANGE;
+                        return wl_columnar_ops_dispose_map_input(stack, &e,
+                                   ERANGE);
                     }
                     tmp[c] = val;
                 } else {
@@ -277,8 +292,6 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                         col_row_buf_release(&row_rb);
                         free(tmp);
                         col_rel_destroy(out);
-                        if (e.owned)
-                            col_rel_destroy(e.rel);
                         if (sess && expr_status
                             >= WL_COLUMNAR_EXPR_EXTENSION_MALFORMED
                             && expr_status
@@ -289,10 +302,12 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                          * was destroyed above. */
                         if (expr_status
                             == WL_COLUMNAR_EXPR_ALLOCATION_FAILURE)
-                            return ENOMEM;
-                        return expr_status
-                               >= WL_COLUMNAR_EXPR_EXTENSION_MALFORMED
-                            ? expr_status : ERANGE;
+                            return wl_columnar_ops_dispose_map_input(stack, &e,
+                                       ENOMEM);
+                        return wl_columnar_ops_dispose_map_input(stack, &e,
+                                   expr_status >=
+                                   WL_COLUMNAR_EXPR_EXTENSION_MALFORMED
+                            ? expr_status : ERANGE);
                     }
                     tmp[c] = val;
                 }
@@ -311,9 +326,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             col_row_buf_release(&row_rb);
             free(tmp);
             col_rel_destroy(out);
-            if (e.owned)
-                col_rel_destroy(e.rel);
-            return rc;
+            return wl_columnar_ops_dispose_map_input(stack, &e, rc);
         }
     }
 
@@ -325,8 +338,11 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     col_row_buf_release(&row_rb);
     free(tmp);
 
-    if (e.owned)
-        col_rel_destroy(e.rel);
+    int input_rc = wl_columnar_ops_dispose_map_input(stack, &e, 0);
+    if (input_rc != 0) {
+        col_rel_destroy(out);
+        return input_rc;
+    }
     return eval_stack_push(stack, out, true);
 }
 
