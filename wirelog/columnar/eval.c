@@ -609,6 +609,7 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
         rc = wl_columnar_eval_stack_cleanup_begin(coord, &stage_frame);
     if (rc != 0) {
         free((void *)worker_rels);
+        free(worker_rels);
         free(ctxs);
         free(ops_copy);
         return rc;
@@ -803,6 +804,10 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
         }
     }
     free((void *)worker_rels);
+            free(worker_rels[w]);
+        }
+    }
+    free(worker_rels);
     if (!evaluation_complete && !publication_started && rc == EOVERFLOW
         && cleanup_rc == 0
         && !coord->cleanup_pending && coord->tdd_workers_count == 0)
