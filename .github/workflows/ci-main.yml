@@ -401,7 +401,7 @@ jobs:
         run: meson compile -C builddir-tsan
 
       - name: Test
-        run: meson test -C builddir-tsan --print-errorlogs
+        run: meson test -C builddir-tsan --timeout-multiplier 4 --print-errorlogs
         env:
           TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
 
