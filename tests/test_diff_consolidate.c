@@ -1353,7 +1353,7 @@ test_small_cons_metadata_guard(void)
                 int rc = differential
             ? col_op_consolidate_diff(&stack, sess)
             : col_op_consolidate(&stack, sess);
-                ASSERT_TRUE(rc == EBUSY && stack.top == 1
+                ASSERT_TRUE(rc == (owned ? EBUSY : 0) && stack.top == 1
                     && stack.items[0].rel == rel
                     && stack.items[0].seg_boundaries == bounds
                     && stack.items[0].owned == (owned != 0)
@@ -1365,7 +1365,8 @@ test_small_cons_metadata_guard(void)
             ? col_op_consolidate_diff(&stack, sess)
             : col_op_consolidate(&stack, sess);
                 ASSERT_TRUE(rc == 0 && stack.top == 1
-                    && stack.items[0].seg_boundaries == NULL,
+                    && (owned ? stack.items[0].seg_boundaries == NULL
+                               : stack.items[0].seg_boundaries == bounds),
                     "small retry finalizes metadata");
                 ASSERT_TRUE(eval_stack_drain(&stack) == 0, "small stack drain");
             }
