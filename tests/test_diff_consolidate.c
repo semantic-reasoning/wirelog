@@ -698,7 +698,7 @@ test_blocked_kway_merge_retains_boundaries(void)
                 stack.items[0].seg_boundaries[1] = 1;
             }
         }
-        ASSERT_TRUE(eval_stack_push(&stack, rel, true) == 0,
+        ASSERT_TRUE(eval_stack_push(&stack, rel, owned != 0) == 0,
             "k-way stack push");
         boundaries = malloc(4 * sizeof(*boundaries));
         ASSERT_TRUE(boundaries != NULL, "k-way boundary allocation");
@@ -1324,47 +1324,51 @@ test_small_cons_metadata_guard(void)
 {
     TEST("empty/singleton CONS metadata respects readers");
     wl_col_session_t *sess = make_mock_session();
-    for (unsigned differential = 0; differential < 2; differential++) {
-        col_rel_t *rel = col_rel_new_auto("small-cons", 1);
-        eval_stack_t stack;
-        wl_columnar_source_access_reader_t reader = { 0 };
-        uint32_t *bounds = malloc(2 * sizeof(*bounds));
-        ASSERT_TRUE(rel != NULL && bounds != NULL, "small relation fixture");
-        if (differential) {
-            int64_t v = 7;
-            ASSERT_TRUE(col_rel_append_row(rel, &v) == 0,
-                "singleton relation row");
-        }
-        rel->sorted_nrows = 99;
-        rel->run_count = 2;
-        rel->run_ends[0] = 0;
-        rel->run_ends[1] = rel->nrows;
-        bounds[0] = 0; bounds[1] = rel->nrows;
-        eval_stack_init(&stack);
-        ASSERT_TRUE(eval_stack_push(&stack, rel, true) == 0,
-            "small relation push");
-        stack.items[0].seg_boundaries = bounds;
-        stack.items[0].seg_count = 1;
-        ASSERT_TRUE(col_rel_source_reader_acquire(rel, &reader) == 0,
-            "small relation reader");
-        int rc = differential
+    for (unsigned differential = 0; differential < 2; differential++)
+        for (unsigned singleton = 0; singleton < 2; singleton++)
+            for (unsigned owned = 0; owned < 2; owned++) {
+                col_rel_t *rel = col_rel_new_auto("small-cons", 1);
+                eval_stack_t stack;
+                wl_columnar_source_access_reader_t reader = { 0 };
+                uint32_t *bounds = malloc(2 * sizeof(*bounds));
+                ASSERT_TRUE(rel != NULL && bounds != NULL,
+                    "small relation fixture");
+                if (singleton) {
+                    int64_t v = 7;
+                    ASSERT_TRUE(col_rel_append_row(rel, &v) == 0,
+                        "singleton relation row");
+                }
+                rel->sorted_nrows = 99;
+                rel->run_count = 2;
+                rel->run_ends[0] = 0;
+                rel->run_ends[1] = rel->nrows;
+                bounds[0] = 0; bounds[1] = rel->nrows;
+                eval_stack_init(&stack);
+                ASSERT_TRUE(eval_stack_push(&stack, rel, true) == 0,
+                    "small relation push");
+                stack.items[0].seg_boundaries = bounds;
+                stack.items[0].seg_count = 1;
+                ASSERT_TRUE(col_rel_source_reader_acquire(rel, &reader) == 0,
+                    "small relation reader");
+                int rc = differential
             ? col_op_consolidate_diff(&stack, sess)
             : col_op_consolidate(&stack, sess);
-        ASSERT_TRUE(rc == EBUSY && stack.top == 1
-            && stack.items[0].rel == rel
-            && stack.items[0].seg_boundaries == bounds
-            && rel->sorted_nrows == 99 && rel->run_count == 2,
-            "small reader refusal preserves metadata");
-        ASSERT_TRUE(col_rel_source_reader_release(&reader) == 0,
-            "small reader release");
-        rc = differential
+                ASSERT_TRUE(rc == EBUSY && stack.top == 1
+                    && stack.items[0].rel == rel
+                    && stack.items[0].seg_boundaries == bounds
+                    && stack.items[0].owned == (owned != 0)
+                    && rel->sorted_nrows == 99 && rel->run_count == 2,
+                    "small reader refusal preserves metadata");
+                ASSERT_TRUE(col_rel_source_reader_release(&reader) == 0,
+                    "small reader release");
+                rc = differential
             ? col_op_consolidate_diff(&stack, sess)
             : col_op_consolidate(&stack, sess);
-        ASSERT_TRUE(rc == 0 && stack.top == 1
-            && stack.items[0].seg_boundaries == NULL,
-            "small retry finalizes metadata");
-        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "small stack drain");
-    }
+                ASSERT_TRUE(rc == 0 && stack.top == 1
+                    && stack.items[0].seg_boundaries == NULL,
+                    "small retry finalizes metadata");
+                ASSERT_TRUE(eval_stack_drain(&stack) == 0, "small stack drain");
+            }
     {
         col_rel_t *alias = col_rel_new_auto("small-alias", 1);
         eval_stack_t stack;
