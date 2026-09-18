@@ -760,6 +760,12 @@ in active cleanup temporary accounting, then released before publication or
 unwind. This path requires a private candidate and a replacement copy, increasing
 peak admitted memory. Generic sorting timestamp correspondence remains #1689.
 
+Normal FILTER output preserves the complete timestamp record for every selected
+source row, including signed multiplicity and empty timestamp-enabled results.
+Untimestamped output retains the legacy representation. Right-filter variants
+use a separate follow-up tracked by #1720; sorting and deduplication remain
+tracked by #1689.
+
 The specialized parallel evaluator remains separate. An unsafe parallel plan
 (such as CONCAT) returns EAGAIN before dispatch and then uses the framed serial
 fallback. A late overflow fallback follows checked worker cleanup; cleanup

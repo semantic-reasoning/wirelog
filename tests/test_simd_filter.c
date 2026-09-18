@@ -545,6 +545,191 @@ test_filter_multi_tile_dense(void)
     PASS();
 }
 
+static void
+test_timestamped_simple_filter(void)
+{
+    TEST("simple filter preserves selected timestamp records");
+    col_rel_t *input = col_rel_new_auto("input", 1);
+    eval_stack_t stack;
+    wl_plan_op_t op = { 0 };
+    uint8_t expr[32];
+    uint32_t size = 0;
+    enum { NROWS = COL_FILTER_TILE * 2 + 9 };
+    int64_t values[NROWS];
+    int rc;
+
+    ASSERT(input != NULL && col_rel_enable_timestamps(input) == 0,
+        "timestamped input allocation");
+    for (uint32_t i = 0; i < NROWS; i++) {
+        values[i] = (i % 5 == 0) ? -1 : (int64_t)i + 1;
+        ASSERT(col_rel_append_row(input, &values[i]) == 0,
+            "timestamped input row");
+        input->timestamps[i] = (col_delta_timestamp_t){
+            .iteration = i + 100, .stratum = i + 200, .worker = i + 300,
+            .multiplicity = i == 1 ? -2 : (int64_t)i - 7
+        };
+    }
+    expr[size++] = (uint8_t)WL_PLAN_EXPR_VAR;
+    expr[size++] = 4;
+    expr[size++] = 0;
+    memcpy(expr + size, "col0", 4);
+    size += 4;
+    expr[size++] = (uint8_t)WL_PLAN_EXPR_CONST_INT;
+    memset(expr + size, 0, sizeof(int64_t));
+    size += sizeof(int64_t);
+    expr[size++] = (uint8_t)WL_PLAN_EXPR_CMP_GT;
+    op.filter_expr.data = expr;
+    op.filter_expr.size = size;
+    eval_stack_init(&stack);
+    ASSERT(eval_stack_push(&stack, input, true) == 0, "push input");
+    rc = wl_columnar_filter_op(&op, &stack, &(wl_col_session_t){ 0 });
+    ASSERT(rc == 0 && stack.top == 1, "timestamped fast filter execution");
+    eval_entry_t result = eval_stack_pop(&stack);
+    ASSERT(result.rel->timestamps != NULL
+        && result.rel->nrows == (uint32_t)(NROWS - (NROWS + 4) / 5),
+        "timestamped sparse selection row count");
+    for (uint32_t i = 0, out_i = 0; i < NROWS; i++) {
+        if (values[i] <= 0)
+            continue;
+        ASSERT(result.rel->columns[0][out_i] == values[i]
+            && result.rel->timestamps[out_i].iteration == i + 100
+            && result.rel->timestamps[out_i].stratum == i + 200
+            && result.rel->timestamps[out_i].worker == i + 300
+            && result.rel->timestamps[out_i].multiplicity ==
+            (i == 1 ? -2 : (int64_t)i - 7),
+            "complete timestamp record follows selected row");
+        out_i++;
+    }
+    col_rel_destroy(result.rel);
+
+    /* A populated timestamped relation with one rejected row keeps timestamp mode
+     * while exercising the dense/high-selectivity fallback decision. */
+    input = col_rel_new_auto("dense", 1);
+    ASSERT(input != NULL && col_rel_enable_timestamps(input) == 0,
+        "dense timestamped input allocation");
+    for (uint32_t i = 0; i < NROWS; i++) {
+        int64_t value = i + 1;
+        if (i + 1 == NROWS)
+            value = -1;
+        ASSERT(col_rel_append_row(input, &value) == 0,
+            "dense timestamped input row");
+        input->timestamps[i] = (col_delta_timestamp_t){
+            .iteration = i + 500, .stratum = i + 600,
+            .worker = i + 700, .multiplicity = 1
+        };
+    }
+    eval_stack_init(&stack);
+    ASSERT(eval_stack_push(&stack, input, true) == 0, "push dense input");
+    rc = wl_columnar_filter_op(&op, &stack, &(wl_col_session_t){ 0 });
+    ASSERT(rc == 0 && stack.top == 1, "dense timestamped filter execution");
+    result = eval_stack_pop(&stack);
+    ASSERT(result.rel->timestamps != NULL && result.rel->nrows == NROWS - 1,
+        "dense timestamped selection count");
+    ASSERT(result.rel->timestamps[NROWS - 2].iteration == NROWS - 2 + 500,
+        "dense timestamped fallback provenance");
+    col_rel_destroy(result.rel);
+
+    /* A populated relation with a false predicate must produce an empty,
+    * timestamp-enabled result rather than silently dropping the mode. */
+    input = col_rel_new_auto("false", 1);
+    ASSERT(input != NULL && col_rel_enable_timestamps(input) == 0,
+        "false timestamped input allocation");
+    int64_t false_value = 1;
+    ASSERT(col_rel_append_row(input, &false_value) == 0,
+        "false timestamped input row");
+    eval_stack_init(&stack);
+    ASSERT(eval_stack_push(&stack, input, true) == 0, "push false input");
+    uint8_t false_expr[32];
+    uint32_t false_size = 0;
+    false_expr[false_size++] = (uint8_t)WL_PLAN_EXPR_VAR;
+    false_expr[false_size++] = 4; false_expr[false_size++] = 0;
+    memcpy(false_expr + false_size, "col0", 4); false_size += 4;
+    false_expr[false_size++] = (uint8_t)WL_PLAN_EXPR_CONST_INT;
+    int64_t false_const = 0;
+    memcpy(false_expr + false_size, &false_const, sizeof(false_const));
+    false_size += sizeof(false_const);
+    false_expr[false_size++] = (uint8_t)WL_PLAN_EXPR_CMP_LT;
+    op.filter_expr.data = false_expr; op.filter_expr.size = false_size;
+    rc = wl_columnar_filter_op(&op, &stack, &(wl_col_session_t){ 0 });
+    ASSERT(rc == 0 && stack.top == 1, "false timestamped filter execution");
+    result = eval_stack_pop(&stack);
+    ASSERT(result.rel->timestamps != NULL && result.rel->nrows == 0,
+        "false timestamped filter remains enabled");
+    col_rel_destroy(result.rel);
+
+    /* Restore the original predicate for the empty-input check below. */
+    op.filter_expr.data = expr; op.filter_expr.size = size;
+
+    input = col_rel_new_auto("empty", 1);
+    ASSERT(input != NULL && col_rel_enable_timestamps(input) == 0,
+        "empty timestamped input allocation");
+    eval_stack_init(&stack);
+    ASSERT(eval_stack_push(&stack, input, true) == 0, "push empty input");
+    rc = wl_columnar_filter_op(&op, &stack, &(wl_col_session_t){ 0 });
+    ASSERT(rc == 0 && stack.top == 1, "empty timestamped filter execution");
+    result = eval_stack_pop(&stack);
+    ASSERT(result.rel->timestamps != NULL && result.rel->nrows == 0,
+        "empty timestamp mode is preserved");
+    col_rel_destroy(result.rel);
+
+    /* Exercise the normal pool-backed destination as well as heap fallback. */
+    delta_pool_t *pool = delta_pool_create(4, sizeof(col_rel_t), 4096);
+    wl_col_session_t pooled_session = { 0 };
+    input = col_rel_new_auto("pooled", 1);
+    ASSERT(pool != NULL && input != NULL &&
+        col_rel_enable_timestamps(input) == 0,
+        "pooled timestamped input allocation");
+    int64_t pooled_value = 3;
+    ASSERT(col_rel_append_row(input, &pooled_value) == 0,
+        "pooled timestamped input row");
+    input->timestamps[0] = (col_delta_timestamp_t){
+        .iteration = 901, .stratum = 902, .worker = 903, .multiplicity = -4
+    };
+    pooled_session.delta_pool = pool;
+    op.filter_expr.data = expr; op.filter_expr.size = size;
+    eval_stack_init(&stack);
+    ASSERT(eval_stack_push(&stack, input, true) == 0, "push pooled input");
+    rc = wl_columnar_filter_op(&op, &stack, &pooled_session);
+    ASSERT(rc == 0 && stack.top == 1, "pooled timestamped filter execution");
+    result = eval_stack_pop(&stack);
+    ASSERT(result.rel->timestamps != NULL && result.rel->pool_owned
+        && result.rel->nrows == 1 && result.rel->columns[0][0] == 3
+        && result.rel->timestamps[0].iteration == 901
+        && result.rel->timestamps[0].stratum == 902
+        && result.rel->timestamps[0].worker == 903
+        && result.rel->timestamps[0].multiplicity == -4,
+        "pooled output preserves timestamp");
+    col_rel_destroy(result.rel);
+    delta_pool_destroy(pool);
+
+    /* A held source remains on the stack when cleanup is refused and can be
+     * retried after the reader releases its admission gate. */
+    input = col_rel_new_auto("held", 1);
+    ASSERT(input != NULL && col_rel_enable_timestamps(input) == 0,
+        "held timestamped input allocation");
+    ASSERT(col_rel_append_row(input, &pooled_value) == 0,
+        "held timestamped input row");
+    wl_columnar_source_access_reader_t reader = { 0 };
+    ASSERT(col_rel_source_reader_acquire(input, &reader) == 0,
+        "held source reader acquire");
+    eval_stack_init(&stack);
+    ASSERT(eval_stack_push(&stack, input, true) == 0, "push held input");
+    rc = wl_columnar_filter_op(&op, &stack, &(wl_col_session_t){ 0 });
+    ASSERT(rc == EBUSY && stack.top == 1,
+        "held input remains retryable after cleanup refusal");
+    eval_entry_t held = eval_stack_pop(&stack);
+    ASSERT(held.rel == input && held.owned, "held input ownership is retained");
+    ASSERT(eval_stack_push(&stack, held.rel, held.owned) == 0,
+        "re-push held input");
+    ASSERT(col_rel_source_reader_release(&reader) == 0,
+        "held source reader release");
+    rc = wl_columnar_filter_op(&op, &stack, &(wl_col_session_t){ 0 });
+    ASSERT(rc == 0 && stack.top == 1, "held input retry succeeds");
+    result = eval_stack_pop(&stack);
+    col_rel_destroy(result.rel);
+    PASS();
+}
+
 /* ----------------------------------------------------------------
  * main
  * ---------------------------------------------------------------- */
@@ -563,6 +748,7 @@ main(void)
     test_lt_filter();
     test_filter_multi_tile_sparse();
     test_filter_multi_tile_dense();
+    test_timestamped_simple_filter();
 
     printf("\n--- Results: %d/%d passed", pass_count, test_count);
     if (fail_count > 0)
