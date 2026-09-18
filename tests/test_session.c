@@ -7384,6 +7384,7 @@ extern void (*wl_columnar_eval_test_nonrec_worker)(wl_col_session_t *,
 extern int (*wl_columnar_eval_test_nonrec_boundary)(wl_col_session_t *,
     unsigned, uint32_t, col_rel_t *);
 static unsigned specialized_mode, specialized_worker;
+static const char *specialized_target_name;
 static wl_atomic_u64 specialized_workers;
 static bool specialized_injected;
 static int specialized_hook_rc;
@@ -7513,7 +7514,8 @@ specialized_publication_boundary(wl_col_session_t *coord, unsigned phase,
     }
 #endif
     col_rel_t *target = specialized_mode == 20 ? candidate
-        : session_find_rel(coord, "output");
+        : session_find_rel(coord, specialized_target_name
+            ? specialized_target_name : "output");
     if (specialized_mode == 1 || specialized_mode == 2) {
         uint32_t key = 0;
         if (!col_session_get_arrangement(&coord->base, "output", &key, 1))
@@ -7550,6 +7552,177 @@ specialized_set_threshold(const char *value)
 }
 
 static void
+inject_prefix_completion_refusal(wl_col_session_t *coord, col_rel_t *target)
+{
+    if (later_completion_hit || strcmp(target->name, "output") != 0)
+        return;
+    later_completion_hit = true;
+    later_completion_target = target;
+    wl_columnar_eval_test_before_final_normalize = NULL;
+    (void)col_rel_source_reader_acquire(target, &later_completion_reader);
+    (void)coord;
+}
+
+static void
+test_mixed_completion_specialized_retry(uint32_t workers)
+{
+    TEST("mixed plain completion and specialized refusal retry");
+    uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
+    wl_plan_op_t first_ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } },
+        { .op = WL_PLAN_OP_CONSOLIDATE }
+    };
+    wl_plan_op_t later_ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "later_input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } },
+        { .op = WL_PLAN_OP_CONSOLIDATE }
+    };
+    wl_plan_relation_t first = { .name = "output", .delta_name = "$d$output",
+                                 .ops = first_ops, .op_count = 3 };
+    wl_plan_relation_t later = { .name = "later", .delta_name = "$d$later",
+                                 .ops = later_ops, .op_count = 3 };
+    wl_plan_stratum_t strata[] = {
+        { .relations = &first, .relation_count = 1, .is_recursive = false },
+        { .relations = &later, .relation_count = 1, .is_recursive = false }
+    };
+    const char *edb[] = { "input", "later_input" };
+    wl_plan_t plan = { .strata = strata, .stratum_count = 2,
+                       .edb_relations = edb, .edb_count = 2 };
+    wl_session_t *session = NULL;
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    int64_t *values = NULL, *later_values = NULL;
+    tuple_collector_t tuples = { 0 };
+    uint64_t prefix_rows = 0, prefix_view = 0, prefix_storage = 0;
+    col_frontier_2d_t prefix_frontier;
+    const char *failure = NULL;
+    const char *old_env = getenv("WIRELOG_NONREC_TDD_MIN_ROWS_PER_WORKER");
+    char *saved_env = old_env ? strdup(old_env) : NULL;
+    specialized_set_threshold("64");
+    later_completion_hit = false;
+    later_completion_target = NULL;
+    memset(&later_completion_reader, 0, sizeof(later_completion_reader));
+    specialized_mode = 20;
+    specialized_target_name = "later";
+    specialized_worker = workers - 1;
+    specialized_injected = false;
+    specialized_hook_rc = 0;
+    specialized_active = NULL;
+    memset(&specialized_reader, 0, sizeof(specialized_reader));
+    atomic_store_explicit(&specialized_workers, 0, memory_order_relaxed);
+#define MIXED_CHECK(c, m) do { if (!(c)) { failure = (m); goto mixed_cleanup; \
+                               } } while (0)
+    MIXED_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "mixed session");
+    values = malloc(65536 * sizeof(*values));
+    later_values = malloc((size_t)workers * 64 * sizeof(*later_values));
+    MIXED_CHECK(values && later_values, "mixed inputs");
+    for (uint32_t i = 0; i < 65536; i++) values[i] = i & 1 ? 42 : 7;
+    for (uint32_t i = 0; i < workers * 64; i++) later_values[i] = 42;
+    MIXED_CHECK(wl_session_insert(session, "input", values, 65536, 1) == 0,
+        "mixed first input");
+    MIXED_CHECK(wl_session_insert(session, "later_input", later_values,
+        workers * 64, 1) == 0, "mixed later input");
+    wl_columnar_eval_test_before_final_normalize =
+        inject_prefix_completion_refusal;
+    MIXED_CHECK(wl_session_step(session) == EBUSY && later_completion_hit,
+        "mixed plain completion refusal");
+    MIXED_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == EBUSY
+        && tuples.count == 0, "mixed repeated plain refusal");
+    MIXED_CHECK(col_rel_source_reader_release(&later_completion_reader) == 0,
+        "mixed plain release");
+    wl_col_session_t *coord = COL_SESSION(session);
+    governor = coord->memory_governor;
+    wl_columnar_memory_governor_ref_retain(governor);
+    wl_columnar_eval_test_nonrec_worker = specialized_worker_boundary;
+    wl_columnar_eval_test_nonrec_boundary = specialized_publication_boundary;
+    memset(&tuples, 0, sizeof(tuples));
+    MIXED_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == EBUSY
+        && tuples.count == 0 && specialized_injected
+        && specialized_hook_rc == 0
+        && atomic_load_explicit(&specialized_workers,
+        memory_order_relaxed) == (1u << workers) - 1,
+        "mixed specialized refusal");
+    col_rel_t *output = session_find_rel(coord, "output");
+    MIXED_CHECK(output, "mixed prefix target");
+    prefix_rows = output->nrows;
+    prefix_view = output->view_generation;
+    prefix_storage = output->storage_generation;
+    prefix_frontier = coord->frontiers[0];
+    MIXED_CHECK(wl_session_step(session) == EBUSY && tuples.count == 0,
+        "mixed repeated specialized refusal");
+    MIXED_CHECK(output->nrows == prefix_rows
+        && output->view_generation == prefix_view
+        && output->storage_generation == prefix_storage
+        && memcmp(&coord->frontiers[0], &prefix_frontier,
+        sizeof(prefix_frontier)) == 0,
+        "mixed prefix changed");
+    MIXED_CHECK(col_rel_source_reader_release(&specialized_reader) == 0,
+        "mixed specialized release");
+    MIXED_CHECK(specialized_active == NULL
+        || wl_columnar_eval_stack_cleanup_finish(&specialized_active) == 0,
+        "mixed specialized cleanup");
+    specialized_active = NULL;
+    memset(&tuples, 0, sizeof(tuples));
+    MIXED_CHECK(wl_session_step(session) == 0, "mixed STEP retry");
+    MIXED_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0,
+        "mixed SNAPSHOT retry");
+    MIXED_CHECK(atomic_load_explicit(&specialized_workers,
+        memory_order_relaxed) == (1u << workers) - 1,
+        "mixed specialized workers");
+    output = session_find_rel(coord, "output");
+    col_rel_t *later_output = session_find_rel(coord, "later");
+    MIXED_CHECK(output && output->nrows == prefix_rows && output->nrows == 2
+        && output->columns[0][0] == 7 && output->columns[0][1] == 42
+        && later_output && later_output->nrows == 1
+        && later_output->columns[0][0] == 42
+        && memcmp(&coord->frontiers[0], &prefix_frontier,
+        sizeof(prefix_frontier)) == 0
+        && coord->cleanup_pending == false &&
+        coord->cleanup_reserved_bytes == 0,
+        "mixed exact result");
+    MIXED_CHECK(tuples.count == 3
+        && has_tuple(&tuples, "output", (int64_t[]){ 7 }, 1)
+        && has_tuple(&tuples, "output", (int64_t[]){ 42 }, 1)
+        && has_tuple(&tuples, "later", (int64_t[]){ 42 }, 1),
+        "mixed callback rows");
+    uint64_t callback_rows = tuples.count;
+    memset(&tuples, 0, sizeof(tuples));
+    MIXED_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0
+        && tuples.count == callback_rows
+        && has_tuple(&tuples, "output", (int64_t[]){ 7 }, 1)
+        && has_tuple(&tuples, "output", (int64_t[]){ 42 }, 1)
+        && has_tuple(&tuples, "later", (int64_t[]){ 42 }, 1),
+        "mixed duplicate callback");
+mixed_cleanup:
+    wl_columnar_eval_test_before_final_normalize = NULL;
+    wl_columnar_eval_test_nonrec_worker = NULL;
+    wl_columnar_eval_test_nonrec_boundary = NULL;
+    specialized_target_name = NULL;
+    if (later_completion_reader.owner)
+        (void)col_rel_source_reader_release(&later_completion_reader);
+    if (specialized_reader.owner)
+        (void)col_rel_source_reader_release(&specialized_reader);
+    if (specialized_active)
+        (void)wl_columnar_eval_stack_cleanup_finish(&specialized_active);
+    free(values); free(later_values);
+    wl_session_destroy(session);
+    if (governor) {
+        if (reserved_on(governor) != 0 && !failure)
+            failure = "mixed reservation leak";
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+    if (saved_env) {
+        specialized_set_threshold(saved_env); free(saved_env);
+    }else specialized_set_threshold(NULL);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef MIXED_CHECK
+}
+
+static void
 test_specialized_publication(uint32_t workers, unsigned initial, unsigned mode,
     bool baseline)
 {
@@ -7578,6 +7751,7 @@ test_specialized_publication(uint32_t workers, unsigned initial, unsigned mode,
     if (saved_env) memcpy(saved_env, old_env, strlen(old_env) + 1);
     specialized_set_threshold(baseline ? "32768" : "64");
     specialized_mode = mode;
+    specialized_target_name = NULL;
     specialized_worker = workers - 1;
     specialized_injected = false;
     specialized_hook_rc = 0;
@@ -10907,6 +11081,7 @@ main(void)
     test_idb_small_input(false, true);
     for (uint32_t workers = 2; workers <= 8; workers += 6) {
         test_later_stratum_completion_retry(workers);
+        test_mixed_completion_specialized_retry(workers);
         for (unsigned mode = 0; mode < 6; mode++) {
 #ifndef WL_TEST_ALLOC_WRAP
             if (mode == 3)
