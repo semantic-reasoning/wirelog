@@ -171,6 +171,24 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
 
 /* --- MAP ----------------------------------------------------------------- */
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_ops_test_before_map_dispose)(eval_stack_t *,
+    eval_entry_t *);
+bool wl_columnar_ops_test_map_fail_output_alloc;
+void (*wl_columnar_ops_test_before_reduce_dispose)(eval_stack_t *,
+    eval_entry_t *);
+bool wl_columnar_ops_test_reduce_fail_output_alloc;
+#endif
+
+/* Preserve the complete input entry when cleanup is refused. */
+static int
+wl_columnar_ops_dispose_entry(eval_stack_t *stack, eval_entry_t *entry,
+    int result)
+{
+    int rc = eval_stack_dispose_entry(stack, entry);
+    return rc != 0 ? rc : result;
+}
+
 int
 col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
 {
@@ -178,22 +196,25 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     int pop_rc = eval_stack_pop_relation(stack, &e);
     if (pop_rc != 0)
         return pop_rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_ops_test_before_map_dispose)
+        wl_columnar_ops_test_before_map_dispose(stack, &e);
+#endif
 
     uint32_t pc = op->project_count;
-    col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
+    col_rel_t *out = NULL;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (!wl_columnar_ops_test_map_fail_output_alloc)
+#endif
+    out = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
             "$map", pc);
-    if (!out) {
-        if (e.owned)
-            col_rel_destroy(e.rel);
-        return ENOMEM;
-    }
+    if (!out)
+        return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
 
     int64_t *tmp = (int64_t *)malloc(sizeof(int64_t) * pc);
     if (!tmp) {
         col_rel_destroy(out);
-        if (e.owned)
-            col_rel_destroy(e.rel);
-        return ENOMEM;
+        return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
     }
 
     /* Pre-compile map expressions once to avoid per-row strtol. */
@@ -224,9 +245,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         }
         free(tmp);
         col_rel_destroy(out);
-        if (e.owned)
-            col_rel_destroy(e.rel);
-        return ENOMEM;
+        return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
     }
 
     int64_t *const row = row_rb.ptr;
@@ -257,9 +276,8 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                         col_row_buf_release(&row_rb);
                         free(tmp);
                         col_rel_destroy(out);
-                        if (e.owned)
-                            col_rel_destroy(e.rel);
-                        return ERANGE;
+                        return wl_columnar_ops_dispose_entry(stack, &e,
+                                   ERANGE);
                     }
                     tmp[c] = val;
                 } else {
@@ -277,8 +295,6 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                         col_row_buf_release(&row_rb);
                         free(tmp);
                         col_rel_destroy(out);
-                        if (e.owned)
-                            col_rel_destroy(e.rel);
                         if (sess && expr_status
                             >= WL_COLUMNAR_EXPR_EXTENSION_MALFORMED
                             && expr_status
@@ -289,10 +305,12 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                          * was destroyed above. */
                         if (expr_status
                             == WL_COLUMNAR_EXPR_ALLOCATION_FAILURE)
-                            return ENOMEM;
-                        return expr_status
-                               >= WL_COLUMNAR_EXPR_EXTENSION_MALFORMED
-                            ? expr_status : ERANGE;
+                            return wl_columnar_ops_dispose_entry(stack, &e,
+                                       ENOMEM);
+                        return wl_columnar_ops_dispose_entry(stack, &e,
+                                   expr_status >=
+                                   WL_COLUMNAR_EXPR_EXTENSION_MALFORMED
+                            ? expr_status : ERANGE);
                     }
                     tmp[c] = val;
                 }
@@ -311,9 +329,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             col_row_buf_release(&row_rb);
             free(tmp);
             col_rel_destroy(out);
-            if (e.owned)
-                col_rel_destroy(e.rel);
-            return rc;
+            return wl_columnar_ops_dispose_entry(stack, &e, rc);
         }
     }
 
@@ -325,8 +341,11 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     col_row_buf_release(&row_rb);
     free(tmp);
 
-    if (e.owned)
-        col_rel_destroy(e.rel);
+    int input_rc = wl_columnar_ops_dispose_entry(stack, &e, 0);
+    if (input_rc != 0) {
+        col_rel_destroy(out);
+        return input_rc;
+    }
     return eval_stack_push(stack, out, true);
 }
 
@@ -342,6 +361,10 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
     int pop_rc = eval_stack_pop_relation(stack, &e);
     if (pop_rc != 0)
         return pop_rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_ops_test_before_reduce_dispose)
+        wl_columnar_ops_test_before_reduce_dispose(stack, &e);
+#endif
 
     col_rel_t *in = e.rel;
     uint32_t gc = op->group_by_count;
@@ -350,12 +373,14 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
     uint32_t ocols = gc + 1;
     uint32_t agg_index = op->aggregate_index < ocols
         ? op->aggregate_index : gc;
-    col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
+    col_rel_t *out = NULL;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (!wl_columnar_ops_test_reduce_fail_output_alloc)
+#endif
+    out = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
             "$reduce", ocols);
     if (!out) {
-        if (e.owned)
-            col_rel_destroy(in);
-        return ENOMEM;
+        return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
     }
 
     bool float_agg = op->agg_operand_type == WL_PLAN_AGG_OPERAND_FLOAT;
@@ -364,9 +389,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
             (size_t)ocols * sizeof(*types));
         if (!types) {
             col_rel_destroy(out);
-            if (e.owned)
-                col_rel_destroy(in);
-            return ENOMEM;
+            return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
         }
         for (uint32_t c = 0; c < gc; c++) {
             uint32_t src = op->group_by_indices ? op->group_by_indices[c] : c;
@@ -380,18 +403,14 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         free(types);
         if (type_rc != 0) {
             col_rel_destroy(out);
-            if (e.owned)
-                col_rel_destroy(in);
-            return type_rc;
+            return wl_columnar_ops_dispose_entry(stack, &e, type_rc);
         }
     }
 
     int64_t *tmp = (int64_t *)malloc(sizeof(int64_t) * (ocols ? ocols : 1));
     if (!tmp) {
         col_rel_destroy(out);
-        if (e.owned)
-            col_rel_destroy(in);
-        return ENOMEM;
+        return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
     }
 
     wl_columnar_expr_compiled_t *agg_ce = NULL;
@@ -405,9 +424,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         wl_columnar_expr_compiled_free(agg_ce);
         free(tmp);
         col_rel_destroy(out);
-        if (e.owned)
-            col_rel_destroy(in);
-        return ENOMEM;
+        return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
     }
 
     typedef struct {
@@ -423,9 +440,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         wl_columnar_expr_compiled_free(agg_ce);
         free(tmp);
         col_rel_destroy(out);
-        if (e.owned)
-            col_rel_destroy(in);
-        return ENOMEM;
+        return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
     }
     reduce_group_slot_t *groups = (reduce_group_slot_t *)calloc(map_cap,
             sizeof(*groups));
@@ -434,9 +449,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         wl_columnar_expr_compiled_free(agg_ce);
         free(tmp);
         col_rel_destroy(out);
-        if (e.owned)
-            col_rel_destroy(in);
-        return ENOMEM;
+        return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
     }
     double *sums = (double *)calloc(map_cap, sizeof(*sums));
     uint64_t *counts = (uint64_t *)calloc(map_cap, sizeof(*counts));
@@ -448,9 +461,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         wl_columnar_expr_compiled_free(agg_ce);
         free(tmp);
         col_rel_destroy(out);
-        if (e.owned)
-            col_rel_destroy(in);
-        return ENOMEM;
+        return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
     }
     uint32_t map_mask = map_cap - 1;
     int set_rc = 0;
@@ -476,9 +487,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                     free(groups);
                     free(tmp);
                     col_rel_destroy(out);
-                    if (e.owned)
-                        col_rel_destroy(in);
-                    return ERANGE;
+                    return wl_columnar_ops_dispose_entry(stack, &e, ERANGE);
                 }
             } else {
                 int64_t val = 0;
@@ -494,9 +503,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                     free(groups);
                     free(tmp);
                     col_rel_destroy(out);
-                    if (e.owned)
-                        col_rel_destroy(in);
-                    return ERANGE;
+                    return wl_columnar_ops_dispose_entry(stack, &e, ERANGE);
                 }
             }
         }
@@ -505,8 +512,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
             col_row_buf_release(&row_rb);
             wl_columnar_expr_compiled_free(agg_ce); free(tmp);
             col_rel_destroy(out);
-            if (e.owned) col_rel_destroy(in);
-            return EINVAL;
+            return wl_columnar_ops_dispose_entry(stack, &e, EINVAL);
         }
 
         /* Use an open-addressed key index instead of scanning all output
@@ -565,8 +571,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                         col_row_buf_release(&row_rb);
                         wl_columnar_expr_compiled_free(agg_ce); free(tmp);
                         col_rel_destroy(out);
-                        if (e.owned) col_rel_destroy(in);
-                        return ERANGE;
+                        return wl_columnar_ops_dispose_entry(stack, &e, ERANGE);
                     }
                     sums[slot] = next_value;
                     set_rc = col_rel_set(out, group_row, agg_index,
@@ -586,9 +591,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                     free(groups);
                     free(tmp);
                     col_rel_destroy(out);
-                    if (e.owned)
-                        col_rel_destroy(in);
-                    return ERANGE;
+                    return wl_columnar_ops_dispose_entry(stack, &e, ERANGE);
                 }
                 set_rc = col_rel_set(out, group_row, agg_index, next);
                 if (set_rc != 0)
@@ -626,8 +629,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                     col_row_buf_release(&row_rb);
                     wl_columnar_expr_compiled_free(agg_ce); free(tmp);
                     col_rel_destroy(out);
-                    if (e.owned) col_rel_destroy(in);
-                    return ERANGE;
+                    return wl_columnar_ops_dispose_entry(stack, &e, ERANGE);
                 }
                 set_rc = col_rel_set(out, group_row, agg_index,
                         (int64_t)wl_columnar_float_canonical_bits(
@@ -667,9 +669,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                 free(groups);
                 free(tmp);
                 col_rel_destroy(out);
-                if (e.owned)
-                    col_rel_destroy(in);
-                return rc;
+                return wl_columnar_ops_dispose_entry(stack, &e, rc);
             }
             groups[slot].hash = hash;
             groups[slot].row = out->nrows - 1;
@@ -682,8 +682,11 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
     free(sums);
     free(counts);
     free(tmp);
-    if (e.owned)
-        col_rel_destroy(in);
+    int input_rc = wl_columnar_ops_dispose_entry(stack, &e, 0);
+    if (input_rc != 0) {
+        col_rel_destroy(out);
+        return input_rc;
+    }
     return eval_stack_push(stack, out, true);
 
 set_failure:
@@ -694,9 +697,7 @@ set_failure:
     free(counts);
     free(tmp);
     col_rel_destroy(out);
-    if (e.owned)
-        col_rel_destroy(in);
-    return set_rc;
+    return wl_columnar_ops_dispose_entry(stack, &e, set_rc);
 }
 
 /* --- REDUCE WEIGHTED (Z-set / Mobius COUNT) ------------------------------ */

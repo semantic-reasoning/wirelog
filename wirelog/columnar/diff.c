@@ -17,6 +17,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef WL_SESSION_TEST_HOOKS
+bool wl_columnar_diff_test_fail_copy_alloc;
+bool wl_columnar_diff_test_fail_copy_append;
+#endif
+
 static int
 col_op_diff_cleanup_owned_relation(eval_stack_t *stack, eval_entry_t *entry,
     col_rel_t *rel, bool owned, int primary_rc)
@@ -36,6 +41,12 @@ col_op_diff_cleanup_owned_relation(eval_stack_t *stack, eval_entry_t *entry,
             return primary_rc != 0 ? primary_rc : push_rc;
         if (primary_rc == 0)
             primary_rc = cleanup_rc;
+    } else {
+        /* The relation is gone; release metadata that was retained only for
+         * the failed operation. */
+        free(entry->seg_boundaries);
+        entry->seg_boundaries = NULL;
+        entry->seg_count = 0;
     }
     return primary_rc;
 }
@@ -83,33 +94,69 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
     uint32_t nr = in->nrows;
 
     if (nr <= 1) {
-        if (e.seg_boundaries)
+        if (!e.owned || (in->sorted_nrows == nr && in->run_count == 1
+            && in->run_ends[0] == nr && e.seg_boundaries == NULL))
+            return eval_stack_repush_entry(stack, &e);
+        wl_columnar_source_access_writer_t writer = { 0 };
+        int writer_rc = col_rel_source_writer_acquire(in, &writer);
+        if (writer_rc != 0)
+            return eval_stack_repush_entry(stack,
+                       &e) == 0 ? writer_rc : ENOBUFS;
+        if (col_rel_storage_alias_borrow_count(in) != 0) {
+            (void)wl_columnar_source_access_writer_release(&writer);
+            return eval_stack_repush_entry(stack, &e) == 0 ? EBUSY : ENOBUFS;
+        }
+        if (e.seg_boundaries) {
             free(e.seg_boundaries);
+            e.seg_boundaries = NULL;
+            e.seg_count = 0;
+        }
         in->sorted_nrows = nr;
         in->run_count = 1;
         in->run_ends[0] = nr;
-        return eval_stack_push(stack, in, e.owned);
+        (void)wl_columnar_source_access_writer_release(&writer);
+        return eval_stack_repush_entry(stack, &e);
     }
 
     /* Own the relation for in-place sort */
     col_rel_t *work = in;
     bool work_owned = e.owned;
     if (!work_owned) {
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_diff_test_fail_copy_alloc)
+            work = NULL;
+        else
+#endif
         work = col_rel_pool_new_like(sess->delta_pool, "$consol_diff", in);
         if (!work) {
-            if (e.seg_boundaries)
-                free(e.seg_boundaries);
+            /* Preserve the borrowed input and its segment metadata so a
+             * caller can retry after transient allocation pressure. */
+            if (eval_stack_repush_entry(stack, &e) != 0)
+                return ENOBUFS;
             return ENOMEM;
         }
-        int append_rc = col_rel_append_all(work, in, NULL);
+        int append_rc;
+#ifdef WL_SESSION_TEST_HOOKS
+        append_rc = wl_columnar_diff_test_fail_copy_append
+            ? ENOMEM : col_rel_append_all(work, in, NULL);
+#else
+        append_rc = col_rel_append_all(work, in, NULL);
+#endif
         if (append_rc != 0) {
             int cleanup_rc = col_rel_destroy_checked(work);
-            int entry_rc = eval_stack_dispose_entry(stack, &e);
-            if (cleanup_rc != 0)
-                (void)eval_stack_push(stack, work, true);
-            /* append_rc is primary; refused cleanup remains represented by
-             * an entry on the stack for a later retry. */
-            (void)entry_rc;
+            if (cleanup_rc != 0) {
+                /* The copied work relation owns the retry state when its
+                 * cleanup is refused.  Keep the original segment metadata
+                 * attached to that retained relation. */
+                eval_entry_t retained = e;
+                retained.rel = work;
+                retained.owned = true;
+                (void)eval_stack_repush_entry(stack, &retained);
+            } else {
+                /* The borrowed source remains usable; retain it together
+                 * with its metadata for a later retry. */
+                (void)eval_stack_repush_entry(stack, &e);
+            }
             return append_rc;
         }
         work_owned = true;
@@ -119,13 +166,17 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
     uint32_t k = e.seg_count > 0 ? e.seg_count : 1;
     if (k >= 2 && e.seg_boundaries != NULL) {
         int rc = col_op_consolidate_kway_merge(work, e.seg_boundaries, k);
-        free(e.seg_boundaries);
-        e.seg_boundaries = NULL;
-        e.seg_count = 0;
         if (rc != 0) {
+            /* Keep the segment metadata with a retained entry.  A refused
+             * writer lease leaves the relation on the evaluator stack for a
+             * later retry, and the retry still needs the original k-way
+             * boundaries. */
             return col_op_diff_cleanup_owned_relation(stack, &e, work,
                        work_owned, rc);
         }
+        free(e.seg_boundaries);
+        e.seg_boundaries = NULL;
+        e.seg_count = 0;
         work->sorted_nrows = work->nrows;
         work->run_count = 1;
         work->run_ends[0] = work->nrows;

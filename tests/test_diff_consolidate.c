@@ -658,6 +658,263 @@ test_blocked_sort_does_not_dedup_unsorted(void)
 }
 
 static void
+test_blocked_kway_merge_retains_boundaries(void)
+{
+    TEST("reader-blocked k-way merge retains boundaries for retry");
+    wl_col_session_t *sess = make_mock_session();
+    wl_arena_t *arena = wl_arena_create(64 * 1024);
+    const int64_t rows[] = { 1, 3, 0, 2 };
+
+    ASSERT_TRUE(sess != NULL && arena != NULL,
+        "k-way fixture allocation");
+    for (unsigned mode = 0; mode < 3; mode++) {
+        col_rel_t *rel = mode == 0
+            ? col_rel_new_auto("kway-heap", 1)
+            : col_rel_pool_new_auto(sess->delta_pool,
+                mode == 2 ? arena : NULL, "kway-owned", 1);
+        wl_columnar_source_access_reader_t reader = { 0 };
+        eval_stack_t stack;
+        uint32_t *boundaries;
+
+        ASSERT_TRUE(rel != NULL, "k-way relation allocation");
+        for (uint32_t i = 0; i < 4; i++)
+            ASSERT_TRUE(col_rel_append_row(rel, &rows[i]) == 0,
+                "k-way rows");
+        eval_stack_init(&stack);
+        for (unsigned lower = 0; lower < COL_STACK_MAX - 1; lower++) {
+            col_rel_t *lower_rel = col_rel_new_auto("kway-lower", 1);
+            int64_t value = (int64_t)lower;
+            ASSERT_TRUE(lower_rel != NULL
+                && col_rel_append_row(lower_rel, &value) == 0
+                && eval_stack_push(&stack, lower_rel, true) == 0,
+                "k-way lower stack");
+            if (lower == 0) {
+                stack.items[0].seg_boundaries =
+                    malloc(2 * sizeof(uint32_t));
+                ASSERT_TRUE(stack.items[0].seg_boundaries != NULL,
+                    "k-way lower metadata");
+                stack.items[0].seg_count = 1;
+                stack.items[0].seg_boundaries[0] = 0;
+                stack.items[0].seg_boundaries[1] = 1;
+            }
+        }
+        ASSERT_TRUE(eval_stack_push(&stack, rel, true) == 0,
+            "k-way stack push");
+        boundaries = malloc(4 * sizeof(*boundaries));
+        ASSERT_TRUE(boundaries != NULL, "k-way boundary allocation");
+        boundaries[0] = 0;
+        boundaries[1] = 2;
+        boundaries[2] = 4;
+        boundaries[3] = 4;
+        stack.items[COL_STACK_MAX - 1].seg_boundaries = boundaries;
+        stack.items[COL_STACK_MAX - 1].seg_count = 2;
+        ASSERT_TRUE(col_rel_source_reader_acquire(rel, &reader) == 0,
+            "k-way reader acquisition");
+
+        ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == EBUSY
+            && stack.top == COL_STACK_MAX
+            && stack.items[COL_STACK_MAX - 1].rel == rel
+            && stack.items[COL_STACK_MAX - 1].seg_boundaries == boundaries
+            && stack.items[COL_STACK_MAX - 1].seg_count == 2,
+            "k-way refusal retains relation and boundaries");
+        ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == EBUSY
+            && stack.top == COL_STACK_MAX
+            && stack.items[COL_STACK_MAX - 1].seg_boundaries == boundaries,
+            "k-way repeated refusal retains metadata");
+        ASSERT_TRUE(col_rel_source_reader_release(&reader) == 0,
+            "k-way reader release");
+        ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == 0
+            && stack.top == COL_STACK_MAX
+            && stack.items[COL_STACK_MAX - 1].rel->nrows == 4
+            && stack.items[COL_STACK_MAX - 1].seg_boundaries == NULL
+            && stack.items[COL_STACK_MAX - 1].seg_count == 0,
+            "k-way retry uses retained boundaries");
+        for (uint32_t i = 0; i < 4; i++)
+            ASSERT_TRUE(col_rel_get(stack.items[COL_STACK_MAX - 1].rel,
+                i, 0) == (int64_t)i, "k-way retry sorted output");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "k-way stack drain");
+    }
+    {
+        col_rel_t *borrowed = col_rel_new_auto("kway-borrowed", 1);
+        eval_stack_t stack;
+        uint32_t *boundaries;
+        int64_t values[] = { 7, 8 };
+
+        ASSERT_TRUE(borrowed != NULL
+            && col_rel_append_row(borrowed, &values[0]) == 0
+            && col_rel_append_row(borrowed, &values[1]) == 0,
+            "borrowed k-way relation");
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
+            "borrowed k-way stack");
+        boundaries = malloc(4 * sizeof(*boundaries));
+        ASSERT_TRUE(boundaries != NULL, "borrowed k-way metadata");
+        boundaries[0] = 0;
+        boundaries[1] = 1;
+        boundaries[2] = 2;
+        stack.items[0].seg_boundaries = boundaries;
+        stack.items[0].seg_count = 2;
+        ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == 0
+            && stack.top == 1 && stack.items[0].rel != borrowed
+            && stack.items[0].owned == true
+            && stack.items[0].seg_boundaries == NULL
+            && stack.items[0].seg_count == 0,
+            "borrowed copy consumes metadata exactly once");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "borrowed k-way drain");
+        col_rel_destroy(borrowed);
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    {
+        col_rel_t *borrowed = col_rel_new_auto("kway-copy-fail", 1);
+        eval_stack_t stack;
+        uint32_t *boundaries;
+        int64_t values[] = { 7, 8 };
+
+        ASSERT_TRUE(borrowed != NULL
+            && col_rel_append_row(borrowed, &values[0]) == 0
+            && col_rel_append_row(borrowed, &values[1]) == 0,
+            "copy failure relation");
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
+            "copy failure stack");
+        boundaries = malloc(4 * sizeof(*boundaries));
+        ASSERT_TRUE(boundaries != NULL, "copy failure metadata");
+        boundaries[0] = 0;
+        boundaries[1] = 1;
+        boundaries[2] = 2;
+        stack.items[0].seg_boundaries = boundaries;
+        stack.items[0].seg_count = 2;
+        wl_columnar_diff_test_fail_copy_alloc = true;
+        ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == ENOMEM
+            && stack.top == 1 && stack.items[0].rel == borrowed
+            && !stack.items[0].owned
+            && stack.items[0].seg_boundaries == boundaries
+            && stack.items[0].seg_count == 2,
+            "copy allocation failure retains borrowed metadata");
+        wl_columnar_diff_test_fail_copy_alloc = false;
+        ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == 0
+            && stack.top == 1 && stack.items[0].rel != borrowed
+            && stack.items[0].owned && stack.items[0].seg_boundaries == NULL,
+            "copy allocation retry");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "copy failure drain");
+        col_rel_destroy(borrowed);
+    }
+    {
+        col_rel_t *borrowed = col_rel_new_auto("append-fail", 1);
+        eval_stack_t stack;
+        uint32_t *boundaries;
+        int64_t values[] = { 9, 10 };
+
+        ASSERT_TRUE(borrowed != NULL
+            && col_rel_append_row(borrowed, &values[0]) == 0
+            && col_rel_append_row(borrowed, &values[1]) == 0,
+            "append failure relation");
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
+            "append failure stack");
+        boundaries = malloc(4 * sizeof(*boundaries));
+        ASSERT_TRUE(boundaries != NULL, "append failure metadata");
+        boundaries[0] = 0;
+        boundaries[1] = 1;
+        boundaries[2] = 2;
+        stack.items[0].seg_boundaries = boundaries;
+        stack.items[0].seg_count = 2;
+        wl_columnar_diff_test_fail_copy_append = true;
+        ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == ENOMEM
+            && stack.top == 1 && stack.items[0].rel == borrowed
+            && !stack.items[0].owned
+            && stack.items[0].seg_boundaries == boundaries,
+            "copy append failure retains borrowed metadata");
+        wl_columnar_diff_test_fail_copy_append = false;
+        ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == 0
+            && stack.top == 1 && stack.items[0].rel != borrowed
+            && stack.items[0].owned && stack.items[0].seg_boundaries == NULL,
+            "copy append retry");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "append failure drain");
+        col_rel_destroy(borrowed);
+    }
+    {
+        col_rel_t *borrowed = col_rel_new_auto("plain-append-fail", 1);
+        eval_stack_t stack;
+        uint32_t *bounds = malloc(4 * sizeof(*bounds));
+        int64_t values[] = { 9, 10 };
+        ASSERT_TRUE(borrowed != NULL && bounds != NULL
+            && col_rel_append_row(borrowed, &values[0]) == 0
+            && col_rel_append_row(borrowed, &values[1]) == 0,
+            "plain append failure fixture");
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
+            "plain append failure push");
+        bounds[0] = 0; bounds[1] = 1; bounds[2] = 2;
+        stack.items[0].seg_boundaries = bounds;
+        stack.items[0].seg_count = 2;
+        wl_columnar_merge_test_fail_copy_append = true;
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == ENOMEM
+            && stack.top == 1 && stack.items[0].rel == borrowed
+            && !stack.items[0].owned && stack.items[0].seg_boundaries == bounds,
+            "plain append failure retains source metadata");
+        wl_columnar_merge_test_fail_copy_append = false;
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == 0
+            && stack.items[0].rel != borrowed,
+            "plain append retry succeeds");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "plain append drain");
+        col_rel_destroy(borrowed);
+    }
+    {
+        col_rel_t *borrowed = col_rel_new_auto("plain-merge-fail", 1);
+        eval_stack_t stack;
+        uint32_t *bounds = malloc(4 * sizeof(*bounds));
+        int64_t values[] = { 11, 12 };
+        ASSERT_TRUE(borrowed != NULL && bounds != NULL
+            && col_rel_append_row(borrowed, &values[0]) == 0
+            && col_rel_append_row(borrowed, &values[1]) == 0,
+            "plain merge failure fixture");
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
+            "plain merge failure push");
+        bounds[0] = 0; bounds[1] = 1; bounds[2] = 2; bounds[3] = 1;
+        stack.items[0].seg_boundaries = bounds;
+        stack.items[0].seg_count = 3;
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == EINVAL
+            && stack.top == 1 && stack.items[0].rel == borrowed
+            && !stack.items[0].owned && stack.items[0].seg_boundaries == bounds,
+            "plain merge failure restores borrowed entry");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "plain merge failure drain");
+        col_rel_destroy(borrowed);
+    }
+#endif
+    {
+        col_rel_t *invalid = col_rel_new_auto("kway-invalid", 1);
+        eval_stack_t stack;
+        uint32_t *boundaries;
+        int64_t values[] = { 1, 2, 3, 4 };
+
+        ASSERT_TRUE(invalid != NULL
+            && col_rel_append_row(invalid, &values[0]) == 0
+            && col_rel_append_row(invalid, &values[1]) == 0
+            && col_rel_append_row(invalid, &values[2]) == 0
+            && col_rel_append_row(invalid, &values[3]) == 0,
+            "invalid k-way relation");
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, invalid, true) == 0,
+            "invalid k-way stack");
+        boundaries = malloc(4 * sizeof(*boundaries));
+        ASSERT_TRUE(boundaries != NULL, "invalid k-way metadata");
+        boundaries[0] = 0;
+        boundaries[1] = 3;
+        boundaries[2] = 2;
+        stack.items[0].seg_boundaries = boundaries;
+        stack.items[0].seg_count = 2;
+        ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == EINVAL
+            && stack.top == 0,
+            "invalid k-way cleanup releases metadata");
+    }
+    wl_arena_free(arena);
+    destroy_mock_session(sess);
+    PASS;
+}
+
+static void
 test_eval_entry_dispose_retains_busy_relation(void)
 {
     TEST("eval entry disposal retains a relation while its reader is held");
@@ -701,6 +958,171 @@ test_eval_entry_dispose_retains_busy_relation(void)
         "busy drain reader release");
     ASSERT_TRUE(eval_stack_drain(&stack) == 0 && stack.top == 0,
         "busy drain retries successfully");
+    PASS;
+}
+
+static void
+test_plain_kway_cleanup_retains_metadata(void)
+{
+    TEST("plain k-way consolidate retains metadata across refusal");
+    wl_col_session_t *sess = make_mock_session();
+    wl_arena_t *arena = wl_arena_create(64 * 1024);
+    ASSERT_TRUE(sess != NULL && arena != NULL, "plain k-way session");
+
+    for (unsigned mode = 0; mode < 3; mode++) {
+        col_rel_t *rel = mode == 0
+            ? col_rel_new_auto("plain-kway", 1)
+            : col_rel_pool_new_auto(sess->delta_pool, NULL,
+                "plain-kway", 1);
+        eval_stack_t stack;
+        wl_columnar_source_access_reader_t reader = { 0 };
+        int64_t rows[] = { 3, 1, 2, 1 };
+        ASSERT_TRUE(rel != NULL, "plain k-way relation");
+        if (mode == 2) {
+            /* Exercise the arena-backed allocator as well. */
+            col_rel_destroy(rel);
+            rel = col_rel_pool_new_auto(sess->delta_pool, arena,
+                    "plain-kway-arena", 1);
+            ASSERT_TRUE(rel != NULL, "plain k-way arena relation");
+            /* The arena is intentionally kept alive by the session fixture. */
+        }
+        for (unsigned i = 0; i < 4; i++)
+            ASSERT_TRUE(col_rel_append_row(rel, &rows[i]) == 0,
+                "plain k-way rows");
+        eval_stack_init(&stack);
+        for (unsigned i = 0; i < COL_STACK_MAX - 1; i++) {
+            col_rel_t *lower = col_rel_new_auto("plain-kway-lower", 1);
+            int64_t value = (int64_t)i;
+            ASSERT_TRUE(lower != NULL
+                && col_rel_append_row(lower, &value) == 0
+                && eval_stack_push(&stack, lower, true) == 0,
+                "plain k-way lower stack");
+        }
+        ASSERT_TRUE(eval_stack_push(&stack, rel, true) == 0,
+            "plain k-way push");
+        uint32_t *bounds = malloc(4 * sizeof(*bounds));
+        ASSERT_TRUE(bounds != NULL, "plain k-way bounds");
+        bounds[0] = 0; bounds[1] = 2; bounds[2] = 4;
+        stack.items[COL_STACK_MAX - 1].seg_boundaries = bounds;
+        stack.items[COL_STACK_MAX - 1].seg_count = 2;
+        ASSERT_TRUE(col_rel_source_reader_acquire(rel, &reader) == 0,
+            "plain k-way reader");
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == EBUSY
+            && stack.top == COL_STACK_MAX
+            && stack.items[COL_STACK_MAX - 1].seg_boundaries == bounds,
+            "plain k-way refusal retains bounds");
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == EBUSY
+            && stack.items[COL_STACK_MAX - 1].seg_boundaries == bounds,
+            "plain k-way repeated refusal retains bounds");
+        ASSERT_TRUE(col_rel_source_reader_release(&reader) == 0,
+            "plain k-way reader release");
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == 0
+            && stack.top == COL_STACK_MAX
+            && stack.items[COL_STACK_MAX - 1].seg_boundaries == NULL
+            && stack.items[COL_STACK_MAX - 1].rel->nrows == 3,
+            "plain k-way retry consumes bounds");
+        ASSERT_TRUE(col_rel_get(stack.items[COL_STACK_MAX - 1].rel, 0, 0) == 1
+            && col_rel_get(stack.items[COL_STACK_MAX - 1].rel, 1, 0) == 2
+            && col_rel_get(stack.items[COL_STACK_MAX - 1].rel, 2, 0) == 3,
+            "plain k-way retry sorted output");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "plain k-way drain");
+    }
+
+#ifdef WL_SESSION_TEST_HOOKS
+    {
+        col_rel_t *borrowed = col_rel_new_auto("plain-copy-fail", 1);
+        eval_stack_t stack;
+        uint32_t *bounds = malloc(4 * sizeof(*bounds));
+        int64_t values[] = { 7, 8 };
+        ASSERT_TRUE(borrowed != NULL && bounds != NULL
+            && col_rel_append_row(borrowed, &values[0]) == 0
+            && col_rel_append_row(borrowed, &values[1]) == 0,
+            "plain borrowed copy fixture");
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
+            "plain borrowed push");
+        bounds[0] = 0; bounds[1] = 1; bounds[2] = 2;
+        stack.items[0].seg_boundaries = bounds;
+        stack.items[0].seg_count = 2;
+        wl_columnar_merge_test_fail_copy_alloc = true;
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == ENOMEM
+            && stack.top == 1 && stack.items[0].rel == borrowed
+            && !stack.items[0].owned
+            && stack.items[0].seg_boundaries == bounds,
+            "plain copy allocation failure retains metadata");
+        wl_columnar_merge_test_fail_copy_alloc = false;
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == 0
+            && stack.top == 1 && stack.items[0].rel != borrowed
+            && stack.items[0].seg_boundaries == NULL,
+            "plain copy allocation retry");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "plain copy drain");
+        col_rel_destroy(borrowed);
+    }
+    {
+        col_rel_t *borrowed = col_rel_new_auto("plain-append-fail", 1);
+        eval_stack_t stack;
+        uint32_t *bounds = malloc(4 * sizeof(*bounds));
+        int64_t v[] = { 9, 10 };
+        ASSERT_TRUE(borrowed && bounds && col_rel_append_row(borrowed,
+            &v[0]) == 0
+            && col_rel_append_row(borrowed, &v[1]) == 0,
+            "plain append fixture");
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
+            "plain append push");
+        bounds[0] = 0; bounds[1] = 1; bounds[2] = 2;
+        stack.items[0].seg_boundaries = bounds; stack.items[0].seg_count = 2;
+        wl_columnar_merge_test_fail_copy_append = true;
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == ENOMEM
+            && stack.items[0].rel == borrowed && !stack.items[0].owned
+            && stack.items[0].seg_boundaries == bounds,
+            "plain append retains entry");
+        wl_columnar_merge_test_fail_copy_append = false;
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == 0,
+            "plain append retry");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "plain append drain");
+        col_rel_destroy(borrowed);
+    }
+    {
+        col_rel_t *borrowed = col_rel_new_auto("plain-merge-fail", 1);
+        eval_stack_t stack;
+        uint32_t *bounds = malloc(4 * sizeof(*bounds));
+        int64_t v[] = { 11, 12 };
+        ASSERT_TRUE(borrowed && bounds && col_rel_append_row(borrowed,
+            &v[0]) == 0
+            && col_rel_append_row(borrowed, &v[1]) == 0, "plain merge fixture");
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
+            "plain merge push");
+        bounds[0] = 0; bounds[1] = 1; bounds[2] = 2; bounds[3] = 1;
+        stack.items[0].seg_boundaries = bounds; stack.items[0].seg_count = 3;
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) != 0
+            && stack.items[0].rel == borrowed && !stack.items[0].owned
+            && stack.items[0].seg_boundaries == bounds,
+            "plain merge restores entry");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "plain merge drain");
+        col_rel_destroy(borrowed);
+    }
+    {
+        col_rel_t *owned = col_rel_new_auto("plain-owned-invalid", 1);
+        eval_stack_t stack;
+        uint32_t *bounds = malloc(4 * sizeof(*bounds));
+        int64_t v[] = { 13, 14 };
+        ASSERT_TRUE(owned && bounds && col_rel_append_row(owned, &v[0]) == 0
+            && col_rel_append_row(owned, &v[1]) == 0,
+            "plain owned cleanup fixture");
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, owned, true) == 0,
+            "plain owned cleanup push");
+        bounds[0] = 0; bounds[1] = 1; bounds[2] = 2; bounds[3] = 1;
+        stack.items[0].seg_boundaries = bounds; stack.items[0].seg_count = 3;
+        ASSERT_TRUE(col_op_consolidate(&stack,
+            sess) == EINVAL && stack.top == 0,
+            "plain owned terminal cleanup releases metadata");
+    }
+#endif
+    wl_arena_free(arena);
+    destroy_mock_session(sess);
     PASS;
 }
 
@@ -897,6 +1319,138 @@ test_intrusive_deferred_registry(void)
     PASS;
 }
 
+static void
+test_small_cons_metadata_guard(void)
+{
+    TEST("empty/singleton CONS metadata respects readers");
+    wl_col_session_t *sess = make_mock_session();
+    for (unsigned differential = 0; differential < 2; differential++)
+        for (unsigned singleton = 0; singleton < 2; singleton++)
+            for (unsigned owned = 0; owned < 2; owned++) {
+                col_rel_t *rel = col_rel_new_auto("small-cons", 1);
+                eval_stack_t stack;
+                wl_columnar_source_access_reader_t reader = { 0 };
+                uint32_t *bounds = malloc(2 * sizeof(*bounds));
+                ASSERT_TRUE(rel != NULL && bounds != NULL,
+                    "small relation fixture");
+                if (singleton) {
+                    int64_t v = 7;
+                    ASSERT_TRUE(col_rel_append_row(rel, &v) == 0,
+                        "singleton relation row");
+                }
+                rel->sorted_nrows = 99;
+                rel->run_count = 2;
+                rel->run_ends[0] = 0;
+                rel->run_ends[1] = rel->nrows;
+                bounds[0] = 0; bounds[1] = rel->nrows;
+                eval_stack_init(&stack);
+                ASSERT_TRUE(eval_stack_push(&stack, rel, owned != 0) == 0,
+                    "small relation push");
+                stack.items[0].seg_boundaries = bounds;
+                stack.items[0].seg_count = 1;
+                ASSERT_TRUE(col_rel_source_reader_acquire(rel, &reader) == 0,
+                    "small relation reader");
+                int rc = differential
+            ? col_op_consolidate_diff(&stack, sess)
+            : col_op_consolidate(&stack, sess);
+                ASSERT_TRUE(rc == (owned ? EBUSY : 0) && stack.top == 1
+                    && stack.items[0].rel == rel
+                    && stack.items[0].seg_boundaries == bounds
+                    && stack.items[0].owned == (owned != 0)
+                    && rel->sorted_nrows == 99 && rel->run_count == 2,
+                    "small reader refusal preserves metadata");
+                ASSERT_TRUE(col_rel_source_reader_release(&reader) == 0,
+                    "small reader release");
+                rc = differential
+            ? col_op_consolidate_diff(&stack, sess)
+            : col_op_consolidate(&stack, sess);
+                ASSERT_TRUE(rc == 0 && stack.top == 1
+                    && (owned ? stack.items[0].seg_boundaries == NULL
+                               : stack.items[0].seg_boundaries == bounds),
+                    "small retry finalizes metadata");
+                ASSERT_TRUE(eval_stack_drain(&stack) == 0, "small stack drain");
+                if (!owned)
+                    col_rel_destroy(rel);
+            }
+    {
+        col_rel_t *alias = col_rel_new_auto("small-alias", 1);
+        eval_stack_t stack;
+        int64_t v = 3;
+        ASSERT_TRUE(alias != NULL && col_rel_append_row(alias, &v) == 0,
+            "small alias fixture");
+        alias->sorted_nrows = 77; alias->run_count = 2;
+        eval_stack_init(&stack);
+        for (unsigned i = 0; i < COL_STACK_MAX - 1; i++) {
+            col_rel_t *lower = col_rel_new_auto("small-lower", 1);
+            ASSERT_TRUE(lower != NULL && eval_stack_push(&stack, lower,
+                true) == 0,
+                "small lower push");
+        }
+        ASSERT_TRUE(col_rel_storage_alias_borrow_acquire(alias) == 0
+            && eval_stack_push(&stack, alias, true) == 0,
+            "small alias stack");
+        ASSERT_TRUE(col_op_consolidate(&stack, sess) == EBUSY
+            && stack.top == COL_STACK_MAX
+            && stack.items[COL_STACK_MAX - 1].rel == alias
+            && alias->sorted_nrows == 77,
+            "small alias refusal preserves full stack");
+        ASSERT_TRUE(col_rel_storage_alias_borrow_release(alias) == 0
+            && col_op_consolidate(&stack, sess) == 0
+            && eval_stack_drain(&stack) == 0, "small alias release retry");
+    }
+    {
+        col_rel_t *alias = col_rel_new_auto("small-diff-alias", 1);
+        eval_stack_t stack; int64_t v = 5;
+        ASSERT_TRUE(alias != NULL && col_rel_append_row(alias, &v) == 0
+            && col_rel_storage_alias_borrow_acquire(alias) == 0,
+            "small differential alias fixture");
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, alias, true) == 0,
+            "small differential alias push");
+        stack.items[0].is_delta = true;
+        ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == EBUSY
+            && stack.items[0].is_delta, "small differential alias refusal");
+        ASSERT_TRUE(col_rel_storage_alias_borrow_release(alias) == 0
+            && col_op_consolidate_diff(&stack, sess) == 0
+            && stack.items[0].is_delta
+            && eval_stack_drain(&stack) == 0, "small differential alias retry");
+    }
+    {
+        col_rel_t *owned = col_rel_new_auto("small-owned-noop", 1);
+        eval_stack_t stack; wl_columnar_source_access_reader_t reader = { 0 };
+        int64_t v = 6;
+        ASSERT_TRUE(owned != NULL && col_rel_append_row(owned, &v) == 0,
+            "small owned no-op fixture");
+        owned->sorted_nrows = 1; owned->run_count = 1; owned->run_ends[0] = 1;
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, owned, true) == 0
+            && col_rel_source_reader_acquire(owned, &reader) == 0
+            && col_op_consolidate(&stack, sess) == 0
+            && stack.items[0].rel == owned,
+            "small owned canonical no-op with reader");
+        ASSERT_TRUE(col_rel_source_reader_release(&reader) == 0
+            && eval_stack_drain(&stack) == 0, "small owned no-op cleanup");
+    }
+    {
+        col_rel_t *borrowed = col_rel_new_auto("small-borrowed-noop", 1);
+        eval_stack_t stack;
+        int64_t v = 4;
+        ASSERT_TRUE(borrowed != NULL && col_rel_append_row(borrowed, &v) == 0,
+            "small borrowed fixture");
+        borrowed->sorted_nrows = 1; borrowed->run_count = 1;
+        borrowed->run_ends[0] = 1;
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0
+            && col_op_consolidate(&stack, sess) == 0
+            && stack.items[0].rel == borrowed && !stack.items[0].owned,
+            "small borrowed canonical no-op");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0, "small borrowed cleanup");
+        col_rel_destroy(borrowed);
+    }
+    destroy_mock_session(sess);
+    PASS;
+}
+
 int
 main(void)
 {
@@ -904,6 +1458,8 @@ main(void)
 
     test_empty_relation();
     test_blocked_sort_does_not_dedup_unsorted();
+    test_blocked_kway_merge_retains_boundaries();
+    test_plain_kway_cleanup_retains_metadata();
     test_eval_entry_dispose_retains_busy_relation();
     test_deferred_registry_refuses_unsafe_storage();
     test_drain_to_session_reports_unsafe_refusal();
@@ -919,6 +1475,7 @@ main(void)
     test_large_dataset_correctness();
     test_merge_buffer_reuse();
     test_sorted_nrows_set_correctly();
+    test_small_cons_metadata_guard();
 
     printf("\n=== Results: %d/%d passed ===\n",
         tests_passed, tests_passed + tests_failed);

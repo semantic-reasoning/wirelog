@@ -39,7 +39,13 @@ col_kfusion_drain(eval_stack_t *stack, wl_col_session_t *sess,
     if (drain_rc != 0) {
         fprintf(stderr, "wirelog: K-Fusion stack cleanup failed: %d\n",
             drain_rc);
-        abort();
+        /* A block-local stack cannot be allowed to disappear while it still
+         * owns a pool/arena relation.  Transfer every remaining entry to the
+         * parent session; its allocator outlives this evaluator and the
+         * registry retries the exact entry after readers release. */
+        int retain_rc = wl_columnar_session_retain_eval_stack(sess, stack);
+        if (primary_rc == 0)
+            primary_rc = retain_rc != 0 ? retain_rc : drain_rc;
     }
     return primary_rc;
 }
@@ -306,6 +312,10 @@ col_op_k_fusion_serial(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_plan_op_k_fusion_t *meta = (wl_plan_op_k_fusion_t *)op->opaque_data;
     uint32_t k = meta->k;
 
+    int retained_rc = wl_columnar_session_retry_retained_eval_entries(sess);
+    if (retained_rc != 0)
+        return retained_rc;
+
     uint64_t _phase_t0 = now_ns();
     col_rel_t **results = (col_rel_t **)calloc(k, sizeof(col_rel_t *));
     COL_SESSION(sess)->kfusion_alloc_ns += now_ns() - _phase_t0;
@@ -431,13 +441,30 @@ cleanup:
                     fprintf(stderr,
                         "wirelog: K-Fusion serial deferred result admission failed: %d\n",
                         defer_rc);
-                    abort();
+                    eval_entry_t retained = {
+                        .rel = results[d],
+                        .owned = true,
+                        .kind = WL_COLUMNAR_EVAL_ENTRY_RELATION,
+                    };
+                    int retain_rc = wl_columnar_session_retain_eval_entry(
+                        sess, &retained);
+                    if (retain_rc == 0)
+                        results[d] = NULL;
+                    if (rc == 0)
+                        rc = retain_rc != 0 ? retain_rc : defer_rc;
                 }
             } else if (destroy_rc != 0) {
-                fprintf(stderr,
-                    "wirelog: K-Fusion serial result cleanup failed: %d\n",
-                    destroy_rc);
-                abort();
+                eval_entry_t retained = {
+                    .rel = results[d],
+                    .owned = true,
+                    .kind = WL_COLUMNAR_EVAL_ENTRY_RELATION,
+                };
+                int retain_rc = wl_columnar_session_retain_eval_entry(sess,
+                        &retained);
+                if (retain_rc == 0)
+                    results[d] = NULL;
+                if (rc == 0)
+                    rc = retain_rc != 0 ? retain_rc : destroy_rc;
             }
         }
     }
