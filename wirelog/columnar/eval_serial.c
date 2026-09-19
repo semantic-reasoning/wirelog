@@ -341,6 +341,9 @@ int
 col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t stratum_idx)
 {
+    /* Cleared here so every exit below reports "heads not final" unless one
+     * of the two completion points is reached. */
+    sess->eval_stratum_heads_final = false;
     if (sess->cleanup_active)
         return EBUSY;
     int readiness_rc = wl_columnar_session_cleanup_ready(sess);
@@ -373,6 +376,13 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             if (rc != 0)
                 return rc;
         }
+        /* Completion point for the non-recursive branch: the rule loop above
+         * is the last thing that can fail, so every head is final from here.
+         * This must stay below that loop -- setting it where the branch opens
+         * would report true on the two rule failures that return from it, and
+         * the caller would skip a restore the heads still need.  Move this
+         * with the completion boundary if the loop ever grows a new exit. */
+        sess->eval_stratum_heads_final = true;
         col_mat_cache_release_pins(&sess->mat_cache);
         assert(sess->mat_cache.active_pins == 0);
         col_mat_cache_clear(&sess->mat_cache);
@@ -1010,6 +1020,14 @@ stride_error:
         free((void *)delta_rels);
         return agg_rc;
     }
+
+    /* Completion point for the recursive branch: aggregate canonicalization
+     * above is the last step here whose failure is propagated, so every
+     * head's content is final from here.  The terminal delta removal below
+     * can still be refused -- see the comment on it -- but that concerns a
+     * $d$ delta, not a head.  Move this with that boundary if a step whose
+     * failure is propagated is added below. */
+    sess->eval_stratum_heads_final = true;
 
     /* Cleanup all delta relations after frontier has been computed.  A
      * refusal keeps the registry owner; see the sub-pass removal above for

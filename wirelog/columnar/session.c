@@ -2655,6 +2655,12 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->delta_publish_cancelled = false;
     out_worker->retained_eval_entries = NULL;
     out_worker->retained_eval_entry_count = 0;
+    /* This struct began as a copy of the coordinator, so clear the flag
+     * rather than inherit a value.  Nothing reads it before col_eval_stratum
+     * writes it, so no observation depends on this -- but it is not a fold
+     * point either: the worker's flag describes the worker's own stratum and
+     * must never be merged upward. */
+    out_worker->eval_stratum_heads_final = false;
     out_worker->arr_entries = NULL;
     out_worker->arr_count = 0;
     out_worker->arr_cap = 0;
