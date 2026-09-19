@@ -1929,8 +1929,9 @@ typedef struct wl_col_session_t {
     col_rel_t *deferred_relations;
     uint32_t deferred_relation_count;
     /* Persistent cleanup for all col_eval_stratum callers, including worker
-     * sessions and recursive delta steps. Direct TDD recursive subpasses and
-     * specialized parallel rule evaluators remain under #1661. */
+     * sessions, recursive delta steps, direct TDD recursive subpasses and
+     * the specialized nonrecursive parallel rule evaluators. K-Fusion is the
+     * one evaluator that still drains an unframed stack; see #1648. */
     wl_columnar_eval_stack_cleanup_frame_t *cleanup_active;
     wl_columnar_eval_stack_cleanup_frame_t *cleanup_pending;
     uint32_t cleanup_active_count;

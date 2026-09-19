@@ -686,10 +686,24 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 }
             }
 
-            /* Remove delta relations from session (evaluation is complete) */
+            /* Remove delta relations from session (evaluation is complete).
+             * A successful removal is the normal case: every sub-pass after
+             * the first removes the delta its predecessor published.  ENOENT
+             * arises whenever a relation published no delta -- the first
+             * sub-pass, a relation with no new rows, one absent from the
+             * registry, or a delta that came back empty and was destroyed
+             * unpublished.  A refusal keeps the registry owner, so nothing is
+             * lost; it surfaces one sub-pass later if that relation publishes
+             * again, and otherwise falls through to the terminal removal at
+             * the end of the stratum.  It is not propagated from here
+             * because a bare EBUSY out of col_eval_stratum is
+             * indistinguishable from an evaluation failure, and
+             * col_stratum_step_with_delta would then restore its pre-step
+             * snapshot over heads this stratum correctly emptied.  See
+             * #1661. */
             for (uint32_t ri = 0; ri < nrels; ri++) {
                 const char *dname = sp->relations[ri].delta_name;
-                session_remove_rel(sess, dname);
+                (void)session_remove_rel(sess, dname);
             }
 
             /* Phase 4: Frontier is computed incrementally as deltas are created
@@ -927,8 +941,10 @@ stride_error:
                 /* Publication is atomic per relation. Preserve the old owner
                  * and any successfully published prefix even if their readers
                  * have released before this cleanup executes. */
+                /* Best effort: outer_rc already carries the failure. */
                 if (!publication_failed)
-                    session_remove_rel(sess, sp->relations[ri].delta_name);
+                    (void)session_remove_rel(sess,
+                        sp->relations[ri].delta_name);
                 if (delta_rels[ri])
                     col_rel_destroy(delta_rels[ri]);
             }
@@ -995,12 +1011,24 @@ stride_error:
         return agg_rc;
     }
 
-    /* Cleanup all delta relations after frontier has been computed */
+    /* Cleanup all delta relations after frontier has been computed.  A
+     * refusal keeps the registry owner; see the sub-pass removal above for
+     * the shared reason it is not propagated from here.  Two differences
+     * matter to #1661.  This site is terminal: no fallible step follows it,
+     * and among the steps that do are delta_pool_reset, rotate_eval_arena
+     * and the mat-cache teardown, before an unconditional "return 0".  So a
+     * refusal here reports success with a reader-held delta still
+     * registered -- the contract violation the issue names, where the
+     * sub-pass site above only loses provenance -- and the allocator reset
+     * runs behind it.  Propagating from here must keep that reset
+     * reachable, or pool and arena usage grow on every retry, and must
+     * reset the frontier recorded above, or should_skip_iteration will
+     * starve the retry. */
     for (uint32_t ri = 0; ri < nrels; ri++) {
         if (delta_rels[ri])
             col_rel_destroy(delta_rels[ri]);
         const char *dname = sp->relations[ri].delta_name;
-        session_remove_rel(sess, dname);
+        (void)session_remove_rel(sess, dname);
     }
     free(snap);
     free((void *)delta_rels);

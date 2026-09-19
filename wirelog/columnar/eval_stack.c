@@ -210,11 +210,17 @@ eval_stack_drain_to_session(eval_stack_t *s, wl_col_session_t *sess)
              * registry: it can disappear with the evaluator's allocator.
              * The exact entry is still on @s and still owned by it, so
              * propagate the refusal rather than aborting -- a library must
-             * not kill its host over a recoverable cleanup refusal.  Note
-             * the evaluator stacks are block-local, so a caller that
-             * unwinds abandons the retained entry; and col_kfusion_drain()
-             * still escalates any non-zero return here to abort(), so the
-             * K-Fusion path's contract is deliberately unchanged. */
+             * not kill its host over a recoverable cleanup refusal.  The
+             * one caller in the library is col_kfusion_drain(), whose stack
+             * does not outlive the evaluator; tests drain directly too.  It
+             * does not abort on this return: it hands the remaining entries
+             * to wl_columnar_session_retain_eval_stack(), best effort,
+             * which stops at the first entry it cannot take.  On the serial
+             * path that registry belongs to the parent session, which
+             * retries the exact entry once readers release.  On the
+             * parallel path it belongs to a shallow per-branch session copy
+             * that is freed without merging the list back, so those entries
+             * are never retried; see #1765. */
             fprintf(stderr,
                 "wirelog: unsafe evaluator deferred relation\n");
             return EBUSY;
@@ -238,7 +244,8 @@ eval_stack_drain_to_session(eval_stack_t *s, wl_col_session_t *sess)
     }
 }
 
-/* Persistent cleanup ownership, not yet enabled in evaluator callers. */
+/* Persistent cleanup ownership. Every evaluator caller uses this boundary
+ * except K-Fusion, which still drains an unframed stack; see #1648. */
 struct wl_columnar_eval_stack_cleanup_frame {
     wl_col_session_t *session;
     wl_columnar_eval_stack_cleanup_frame_t *next;

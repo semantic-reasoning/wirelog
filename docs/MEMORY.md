@@ -254,7 +254,9 @@ normal or partial teardown path. The fixed eval arenas now use
 Recursive TDD subpasses retain popped results, lower stack entries and CONCAT
 segment boundaries in persistent cleanup frames. Segment metadata is disposed
 with its entry; a refused owned relation keeps its metadata and allocator
-storage reachable. Specialized rule evaluators remain tracked by #1661.
+storage reachable. The specialized nonrecursive parallel rule evaluators use
+the same frames; K-Fusion is the one evaluator still draining an unframed
+stack, tracked by #1648.
 
 Hybrid TDD initialization gives existing empty IDBs private governed worker
 relations, preserving schema, graph/compound metadata and timestamp mode.
@@ -853,9 +855,15 @@ Specialized slices and staging preserve incoming timestamp records. FILTER's
 pre-existing loss of selected-row provenance is tracked separately by #1715,
 and generic sorting/consolidation provenance remains #1689.
 
-K-Fusion refusal handling (#1648) and the remaining #1661 integration audit
-still precede closing #1384. Pool/arena relations cannot use the heap-only
-deferred registry, and a live reader prevents promoting their descriptors.
+K-Fusion refusal handling (#1648, and the parallel-branch retention orphan
+#1765) still precedes closing #1384; #1661's
+integration audit is discharged for the framed callers. What remains there is
+propagating a refused delta removal out of `col_eval_stratum` and the TDD
+delta-exchange paths, plus the worker-registry gap: `col_worker_session_create`
+writes partitions straight into the registry without the pool and arena
+promotion `session_add_rel` performs. Pool/arena relations cannot use the
+heap-only deferred registry, and a live reader prevents promoting their
+descriptors.
 Internal checked cleanup can return `EBUSY`; public session destruction remains
 synchronous and does not offer recoverable deferred destruction. See
 `wirelog/session.c` and `session.c` for that distinction.

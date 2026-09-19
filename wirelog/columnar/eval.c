@@ -1275,8 +1275,12 @@ tdd_seed_global_read_initial_deltas(const wl_plan_stratum_t *sp,
         const char *rel_name = sp->relations[ri].name;
         col_rel_t *src = session_find_rel(coord, rel_name);
 
+        /* A successful removal is the normal case; ENOENT means this worker
+         * holds no stale delta yet.  A refusal keeps the worker's registry
+         * owner and is surfaced by the same-name registration that follows,
+         * unless the new delta is empty and never re-registered (#1661). */
         for (uint32_t w = W; w-- > 0; )
-            session_remove_rel(&coord->tdd_workers[w], dname);
+            (void)session_remove_rel(&coord->tdd_workers[w], dname);
 
         if (!src || src->nrows == 0)
             continue;
@@ -3094,8 +3098,12 @@ tdd_broadcast_relation_delta(const wl_plan_stratum_t *sp, uint32_t ri,
 {
     const char *dname = sp->relations[ri].delta_name;
 
+    /* A successful removal is the normal case; ENOENT means this worker
+     * holds no stale delta yet.  A refusal keeps the worker's registry
+     * owner and is surfaced by the same-name registration that follows,
+     * unless the new delta is empty and is never re-registered (#1661). */
     for (uint32_t w = W; w-- > 0; )
-        session_remove_rel(&coord->tdd_workers[w], dname);
+        (void)session_remove_rel(&coord->tdd_workers[w], dname);
 
     uint32_t total = 0, ncols = 0;
     for (uint32_t w = 0; w < W; w++) {
@@ -3396,9 +3404,13 @@ tdd_exchange_deltas(const wl_plan_stratum_t *sp,
             }
         }
 
-        /* Remove stale $d$ from every worker before scatter. */
+        /* Remove stale $d$ from every worker before scatter.  A successful
+         * removal is the normal case; ENOENT means this worker holds no
+         * stale delta yet.  A refusal keeps the worker's registry owner and
+         * is surfaced by the same-name registration that follows, unless the
+         * new delta is empty and is never re-registered (#1661). */
         for (uint32_t w = W; w-- > 0; )
-            session_remove_rel(&coord->tdd_workers[w], dname);
+            (void)session_remove_rel(&coord->tdd_workers[w], dname);
 
         /* Issue #361: Relations without EXCHANGE ops use default col0
          * hash-exchange when default_hash is set (hybrid init partitions
@@ -4582,6 +4594,21 @@ tdd_restore_entry_compare(const void *left, const void *right)
     return strcmp(a->name, b->name);
 }
 
+/* Roll back a failed tdd_restore_coord_idb transaction.
+ *
+ * This unwinds registered candidates with unchecked col_rel_destroy and
+ * clears the registry slot unconditionally -- the shape #1661's integration
+ * audit flags elsewhere.  It is safe here only because the registered set is
+ * closed: every candidate comes from col_rel_alloc, tdd_snapshot_relation or
+ * tdd_empty_relation_candidate, is heap-backed, and is never leased,
+ * evaluated or aliased between registration and this rollback, so
+ * col_rel_destroy_checked cannot refuse.  Reachability is the whole
+ * invariant; the slot arithmetic is not a second line of defence, because on
+ * a refusal the slot would stay live and the coord->nrels truncation below
+ * would strand it.  The branch that would need repair first is the
+ * hash-fallback recovery in tdd_restore_coord_idb, which removes a
+ * registered candidate without setting entry->registered.  If candidates
+ * ever become leasable, fix that branch before this one. */
 static void
 tdd_restore_entries_discard(wl_col_session_t *coord,
     tdd_restore_entry_t *entries, uint32_t count, uint32_t initial_nrels)
@@ -4814,9 +4841,13 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
 
         uint64_t prepare_t0 = now_ns();
 
-        /* Remove stale $d$ from workers */
+        /* Remove stale $d$ from workers.  A successful removal is the
+         * normal case; ENOENT means this worker holds no stale delta yet.
+         * A refusal keeps the worker's registry owner and is surfaced by the
+         * same-name registration that follows, unless the new delta is empty
+         * and is never re-registered (#1661). */
         for (uint32_t w = W; w-- > 0; )
-            session_remove_rel(&coord->tdd_workers[w], dname);
+            (void)session_remove_rel(&coord->tdd_workers[w], dname);
 
         /* Step 1: Union all worker deltas */
         uint32_t total = 0, ncols = 0;
@@ -5034,8 +5065,12 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
         const char *rel_name = sp->relations[ri].name;
         uint64_t prepare_t0 = now_ns();
 
+        /* A successful removal is the normal case; ENOENT means this worker
+         * holds no stale delta yet.  A refusal keeps the worker's registry
+         * owner and is surfaced by the same-name registration that follows,
+         * unless the new delta is empty and never re-registered (#1661). */
         for (uint32_t w = W; w-- > 0; )
-            session_remove_rel(&coord->tdd_workers[w], dname);
+            (void)session_remove_rel(&coord->tdd_workers[w], dname);
 
         uint32_t total = 0, ncols = 0;
         for (uint32_t w = 0; w < W; w++) {
