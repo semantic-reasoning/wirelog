@@ -62,6 +62,7 @@ typedef struct {
     char **col_names;
     struct ArrowSchema *arrow_schema;
     col_delta_timestamp_t *timestamps;
+    uint32_t timestamp_capacity;
     int64_t *row_scratch;
 } col_rel_t;
 
