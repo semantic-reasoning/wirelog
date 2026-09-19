@@ -1187,7 +1187,18 @@ delegates to internal `wl_session_destroy`, which closes operation admission
 and waits for admitted operations before backend teardown; the public facade
 then releases its wrapper. Reader lifetimes must end within those boundaries.
 Refused evaluator-stack ownership and K-Fusion cleanup remain open in #1647,
-#1648 and #1661; a local stack cannot retain an entry after its caller unwinds.
+#1648 and #1765. K-Fusion is the one evaluator that still drains an unframed
+stack; the framed callers retain their entries in cleanup frames. On the serial
+K-Fusion path a refused drain hands the remaining entries to the parent
+session's retained registry, which retries them once readers release. On the
+parallel path they go to a shallow per-branch session copy that is freed
+without merging the list back, so they are orphaned along with the relations
+they own; that is #1765. What remains
+under #1661 is propagating a refused delta removal out of `col_eval_stratum`
+and the TDD delta-exchange paths, and the worker-registry gap:
+`col_worker_session_create` writes partitions straight into the registry
+without the pool and arena promotion `session_add_rel` performs, so
+bounded-allocator reclamation is not yet proven for them.
 These contracts must not be read as support for arbitrary pool/arena borrowers
 surviving an operation or allocator reset.
 
