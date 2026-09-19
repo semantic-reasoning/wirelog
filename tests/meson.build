@@ -133,6 +133,7 @@ testlib_prod = static_library(
     '../wirelog/columnar/inline.c',
     '../wirelog/columnar/join.c',
     '../wirelog/columnar/join_batch.c',
+    '../wirelog/columnar/join_pipeline.c',
     '../wirelog/columnar/diff_join_batch.c',
     '../wirelog/columnar/kfusion.c',
     '../wirelog/columnar/kfusion_adaptive.c',
@@ -1755,6 +1756,7 @@ backend_src = files(
   '../wirelog/columnar/delta_pool_admission.c',
   '../wirelog/columnar/continuation.c',
   '../wirelog/columnar/join_batch.c',
+  '../wirelog/columnar/join_pipeline.c',
   '../wirelog/columnar/diff_join_batch.c',
   '../wirelog/columnar/lftj.c',
   '../wirelog/columnar/mem_ledger.c',
@@ -1807,6 +1809,15 @@ test_eval_continuation_publication_exe = executable(
 )
 test('eval_continuation_publication', test_eval_continuation_publication_exe,
      suite: 'unit')
+
+test_join_pipeline_exe = executable(
+  'test_join_pipeline',
+  files('test_join_pipeline.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('join_pipeline', test_join_pipeline_exe, suite: 'unit')
 
 test_optimizer_equivalence_exe = executable(
   'test_optimizer_equivalence',
