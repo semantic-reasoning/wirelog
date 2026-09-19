@@ -1937,6 +1937,22 @@ typedef struct wl_col_session_t {
     uint32_t cleanup_active_count;
     uint32_t cleanup_pending_count;
     uint64_t cleanup_reserved_bytes;
+    /* Set false on entry to col_eval_stratum, and true only at each of its
+     * two completion points.  col_stratum_step_with_delta clears it again on
+     * its own entry, which is the load-bearing clear: its detach loop can
+     * reach cleanup without calling col_eval_stratum at all, and a stale true
+     * would then skip a restore those heads need.
+     *
+     * It answers the one question no later observer can: whether a head that
+     * is empty was emptied by a stratum that ran to the end, or was never
+     * reached.  Those are otherwise identical -- delta detach leaves every
+     * head at the same generation pair and the paths that produce nothing
+     * never touch one.
+     *
+     * Read only by col_stratum_step_with_delta, once, for the call it just
+     * made; it is neither a gate nor a predicate, and nothing may consult it
+     * later.  False is the safe default: it makes the caller restore. */
+    bool eval_stratum_heads_final;
     wl_columnar_eval_delta_rollback_t *delta_rollback;
     uint64_t delta_rollback_reserved_bytes;
     wl_columnar_eval_delta_observer_t *delta_observer;

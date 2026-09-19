@@ -414,6 +414,13 @@ struct wl_columnar_eval_delta_rollback {
     bool active;
     bool payload_reserved;
     bool gc_requested;
+    /* col_eval_stratum reached its completion point, so every head's content
+     * below is final.  Restoring the pre-step snapshot over them would
+     * un-retract facts this step correctly removed.  Content, not state: a
+     * head can still be mid-consolidation on the paths that fail after
+     * evaluation, but restore_flat only ever writes an empty head and an
+     * empty one cannot be mid-consolidated. */
+    bool retained;
     int evaluation_error;
     wl_columnar_eval_delta_snapshot_t entries[];
 };
@@ -1062,6 +1069,16 @@ wl_columnar_eval_delta_rollback_retry(wl_col_session_t *sess)
         return 0;
     if (sess->cleanup_pending || sess->cleanup_active)
         return EBUSY;
+    if (record->retained) {
+        /* The stratum ran to completion, so an empty head is empty because
+         * this step emptied it.  restore_flat already declines a populated
+         * head, so restoring here would touch only the correctly-emptied
+         * ones -- exactly the rows that must stay gone.  Mark every entry
+         * done and fall through, so the record and its reservation are still
+         * discarded on this call. */
+        for (uint32_t i = 0; i < record->count; i++)
+            record->entries[i].completed = true;
+    }
     int result = 0;
     for (uint32_t i = 0; i < record->count; i++) {
         wl_columnar_eval_delta_snapshot_t *entry = &record->entries[i];
@@ -1438,6 +1455,11 @@ int
 col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t stratum_idx)
 {
+    /* The detach loop below can reach cleanup: without ever calling
+     * col_eval_stratum, so clear the flag here rather than relying on that
+     * call to do it.  Otherwise a stale true from the previous window would
+     * skip a restore these heads need. */
+    sess->eval_stratum_heads_final = false;
     int readiness_rc = wl_columnar_session_cleanup_ready(sess);
     if (readiness_rc != 0)
         return readiness_rc;
@@ -1577,8 +1599,16 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
 
 cleanup:
     rollback->active = false;
+    rollback->retained = sess->eval_stratum_heads_final;
     rollback->evaluation_error = rc;
     if (rc != 0) {
+        /* When retained is set the heads carry this step's result and are
+        * correct, but the step still returns non-zero and the events for
+        * that change are dropped here -- so the facts moved and nothing
+        * announced it.  Propagating a refused removal (#1661) has to settle
+        * that: either keep the events on this path or re-emit them on the
+        * retry.  Note a failure before the emission loop above has no events
+        * to clear, so this only bites on the paths that fail after it. */
         wl_columnar_delta_events_clear(sess);
         int cleanup_rc = wl_columnar_session_cleanup_ready(sess);
         return cleanup_rc != 0 ? cleanup_rc : rc;

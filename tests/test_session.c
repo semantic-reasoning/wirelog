@@ -8953,6 +8953,273 @@ fail:
     col_rel_destroy(held);
 }
 
+static bool heads_final_at_hook;
+static bool heads_final_hook_fired;
+
+static void
+capture_heads_final(wl_col_session_t *sess)
+{
+    heads_final_hook_fired = true;
+    heads_final_at_hook = sess->eval_stratum_heads_final;
+}
+
+/* col_eval_stratum must report whether it reached its completion point, so a
+ * caller can tell an emptied head from one the stratum never got to.  The
+ * two are otherwise indistinguishable: both sit at the post-detach generation
+ * pair, because the paths that produce nothing never touch the head. */
+static void
+test_eval_stratum_heads_final(bool fail_eval, bool recursive)
+{
+    TEST(recursive
+        ? (fail_eval
+            ? "heads_final: a recursive stratum that fails leaves it clear"
+            : "heads_final: a recursive stratum that completes sets it")
+        : (fail_eval
+            ? "heads_final: a stratum that fails leaves the flag clear"
+            : "heads_final: a stratum that completes sets the flag"));
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "missing" }
+    };
+    /* delta_name is required by the recursive branch and unused by the
+     * non-recursive one. */
+    wl_plan_relation_t relation = { .name = "a", .delta_name = "$d$a",
+                                    .ops = ops, .op_count = 1 };
+    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess = NULL;
+    delta_collector_t deltas = { 0 };
+    const char *failure = NULL;
+    int64_t one = 1, two = 2;
+    /* The recursive branch reaches its completion point at a different site,
+     * after aggregate canonicalization.  U3 propagates from there, so that
+     * site needs its own coverage rather than inheriting the non-recursive
+     * one. */
+    stratum.is_recursive = recursive;
+#define HEADS_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    heads_final_at_hook = false;
+    heads_final_hook_fired = false;
+    HEADS_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "create");
+    sess = COL_SESSION(session);
+    /* Without a delta callback the step takes the fast path straight to
+     * col_eval_stratum and never enters col_stratum_step_with_delta, which is
+     * where the flag is consumed. */
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    HEADS_CHECK(wl_session_insert(session, "input", &one, 1, 1) == 0
+        && wl_session_step(session) == 0, "baseline");
+    HEADS_CHECK(wl_session_insert(session, "input", &two, 1, 1) == 0,
+        "pending insertion");
+
+    /* op_count 2 references a relation the plan never registers, so the
+     * evaluator returns before its completion point -- from the rule loop on
+     * the non-recursive branch, from the fixpoint loop on the recursive one.
+     * Mutating a plan the session is already holding works only because the
+     * session borrows it rather than copying it. */
+    if (fail_eval)
+        relation.op_count = 2;
+    wl_columnar_eval_delta_test_after_eval = capture_heads_final;
+    int step_rc = wl_session_step(session);
+    wl_columnar_eval_delta_test_after_eval = NULL;
+
+    HEADS_CHECK(heads_final_hook_fired, "hook did not fire");
+    if (fail_eval) {
+        HEADS_CHECK(step_rc != 0, "expected the stratum to fail");
+        /* The flag must be clear here.  Setting it at the top of the
+         * non-recursive branch instead of after its rule loop would report
+         * true on this path, and the caller would skip a restore the heads
+         * still need. */
+        HEADS_CHECK(!heads_final_at_hook, "flag set on a failed stratum");
+    } else {
+        HEADS_CHECK(step_rc == 0, "expected the stratum to complete");
+        HEADS_CHECK(heads_final_at_hook, "flag clear on a completed stratum");
+    }
+    /* Read after the step returns, which the field contract calls out as
+     * unsupported; asserted here only to show the flag does not leak a true
+     * past a failure.  Not a pattern to copy. */
+    HEADS_CHECK(!sess->eval_stratum_heads_final
+        || step_rc == 0, "flag outlives a failed evaluation");
+cleanup:
+    wl_columnar_eval_delta_test_after_eval = NULL;
+    relation.op_count = 1;
+    if (session)
+        wl_session_destroy(session);
+    if (failure)
+        FAIL(failure);
+    else
+        PASS();
+#undef HEADS_CHECK
+}
+
+/* The recursive completion point sits below aggregate canonicalization, which
+ * is the last step there that can fail.  A write placed above it would report
+ * heads final after a failed canonicalization, and the caller would skip a
+ * restore the heads still need.  group_by_count 2 makes that step return
+ * EINVAL after the rule loop has already succeeded. */
+static void
+test_heads_final_recursive_agg_failure(void)
+{
+    TEST("heads_final: a failed aggregate canonicalization leaves it clear");
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" }
+    };
+    wl_plan_relation_t relation = { .name = "a", .delta_name = "$d$a",
+                                    .ops = ops, .op_count = 1 };
+    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1,
+                                  .is_recursive = true };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    delta_collector_t deltas = { 0 };
+    const char *failure = NULL;
+    int64_t one = 1, two = 2;
+#define AGGF_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    heads_final_at_hook = false;
+    heads_final_hook_fired = false;
+    AGGF_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "create");
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    AGGF_CHECK(wl_session_insert(session, "input", &one, 1, 1) == 0
+        && wl_session_step(session) == 0, "baseline");
+    AGGF_CHECK(wl_session_insert(session, "input", &two, 1, 1) == 0,
+        "pending insertion");
+    /* Two rows matter: canonicalization returns 0 early below two, so the
+     * second insert above is what lets the group_by_count check be reached
+     * at all. */
+    relation.recursive_agg.has_spec = true;
+    relation.recursive_agg.group_by_count = 2;
+    wl_columnar_eval_delta_test_after_eval = capture_heads_final;
+    int step_rc = wl_session_step(session);
+    wl_columnar_eval_delta_test_after_eval = NULL;
+    AGGF_CHECK(heads_final_hook_fired, "hook did not fire");
+    AGGF_CHECK(step_rc != 0, "canonicalization did not fail");
+    AGGF_CHECK(!heads_final_at_hook,
+        "flag set after a failed canonicalization");
+cleanup:
+    wl_columnar_eval_delta_test_after_eval = NULL;
+    relation.recursive_agg.has_spec = false;
+    relation.recursive_agg.group_by_count = 0;
+    if (session)
+        wl_session_destroy(session);
+    if (failure)
+        FAIL(failure);
+    else
+        PASS();
+#undef AGGF_CHECK
+}
+
+static wl_columnar_source_access_reader_t heads_skip_reader;
+static int heads_skip_hook_rc;
+
+/* Capture the flag, then leave a refusing cleanup frame behind so
+ * col_stratum_step_with_delta converts a SUCCESSFUL evaluation into EBUSY at
+ * its cleanup_pending check.  That is the shape where the heads are final and
+ * the pre-step snapshot must not be restored over them. */
+static void
+inject_heads_final_refusal(wl_col_session_t *sess)
+{
+    wl_columnar_eval_delta_test_after_eval = NULL;
+    heads_final_hook_fired = true;
+    heads_final_at_hook = sess->eval_stratum_heads_final;
+    heads_skip_hook_rc = EINVAL;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    col_rel_t *held = col_rel_new_auto("heads-held", 1);
+    if (!held)
+        return;
+    if (wl_columnar_eval_stack_cleanup_begin(sess, &frame) != 0) {
+        col_rel_destroy(held);
+        return;
+    }
+    eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(frame);
+    result->rel = held;
+    result->owned = true;
+    if (col_rel_source_reader_acquire(held, &heads_skip_reader) != 0) {
+        (void)wl_columnar_eval_stack_cleanup_finish(&frame);
+        return;
+    }
+    heads_skip_hook_rc = wl_columnar_eval_stack_cleanup_finish(&frame);
+}
+
+/* A retraction empties the head to zero rows.  restore_flat declines a
+ * populated head, so that empty head is the one and only case where a
+ * rollback can put back rows the step correctly removed. */
+static void
+test_heads_final_skips_restore(void)
+{
+    TEST("heads_final: a completed retraction is not un-retracted by rollback");
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" }
+    };
+    wl_plan_relation_t relation = { .name = "a", .ops = ops, .op_count = 1 };
+    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess = NULL;
+    delta_collector_t deltas = { 0 };
+    const char *failure = NULL;
+    int64_t one = 1;
+#define SKIP_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    memset(&heads_skip_reader, 0, sizeof(heads_skip_reader));
+    heads_final_at_hook = false;
+    heads_final_hook_fired = false;
+    heads_skip_hook_rc = EINVAL;
+    SKIP_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "create");
+    sess = COL_SESSION(session);
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    SKIP_CHECK(wl_session_insert(session, "input", &one, 1, 1) == 0
+        && wl_session_step(session) == 0, "baseline");
+    col_rel_t *target = session_find_rel(sess, "a");
+    SKIP_CHECK(target && target->nrows == 1, "baseline head");
+
+    /* Retract the only input row, so the stratum empties "a" to zero. */
+    SKIP_CHECK(wl_session_remove(session, "input", &one, 1, 1) == 0,
+        "retraction");
+    deltas.count = 0;
+    wl_columnar_eval_delta_test_after_eval = inject_heads_final_refusal;
+    int step_rc = wl_session_step(session);
+    SKIP_CHECK(heads_final_hook_fired, "hook did not fire");
+    SKIP_CHECK(heads_skip_hook_rc == EBUSY, "frame did not refuse");
+    SKIP_CHECK(step_rc == EBUSY, "step did not surface the refusal");
+    /* The evaluation itself completed, so the flag is set even though the
+     * step returns non-zero. */
+    SKIP_CHECK(heads_final_at_hook, "flag clear after a completed stratum");
+    /* The record's retained flag is file-local to eval_delta.c; the
+    * observable consequence below is the assertion that matters. */
+    SKIP_CHECK(sess->delta_rollback, "no rollback record to retain");
+
+    /* Release the reader and let the retained cleanup drain.  The rollback
+     * must discard without putting the retracted row back. */
+    SKIP_CHECK(col_rel_source_reader_release(&heads_skip_reader) == 0,
+        "reader release");
+    SKIP_CHECK(wl_columnar_session_cleanup_ready(sess) == 0, "cleanup ready");
+    target = session_find_rel(sess, "a");
+    SKIP_CHECK(!sess->delta_rollback, "rollback record not discarded");
+    SKIP_CHECK(sess->delta_rollback_reserved_bytes == 0, "reservation leaked");
+    SKIP_CHECK(!target || target->nrows == 0,
+        "rollback resurrected the retracted row");
+cleanup:
+    wl_columnar_eval_delta_test_after_eval = NULL;
+    if (heads_skip_reader.owner)
+        (void)col_rel_source_reader_release(&heads_skip_reader);
+    if (session)
+        wl_session_destroy(session);
+    if (failure)
+        FAIL(failure);
+    else
+        PASS();
+#undef SKIP_CHECK
+}
+
 static void
 test_persistent_delta_rollback(bool destroy_pending)
 {
@@ -10905,6 +11172,12 @@ main(void)
     test_delta_snapshot_capture_failure(1);
 #endif
 #ifdef WL_SESSION_TEST_HOOKS
+    test_eval_stratum_heads_final(false, false);
+    test_eval_stratum_heads_final(true, false);
+    test_eval_stratum_heads_final(false, true);
+    test_eval_stratum_heads_final(true, true);
+    test_heads_final_recursive_agg_failure();
+    test_heads_final_skips_restore();
     test_persistent_delta_rollback(false);
     test_persistent_delta_rollback(true);
     test_delta_rollback_preserves_progress(false, false);
