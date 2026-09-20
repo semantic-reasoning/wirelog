@@ -141,7 +141,7 @@ void col_diff_arrangement_get_delta_range(
  *   The Option (iii) immutable-during-epoch strategy guarantees those
  *   column buffers are not written during the worker read phase, so
  *   concurrent retrieves of inline compounds are race-free without any
- *   locking. See tests/test_k_fusion_inline_shadow.c.
+ *   locking. See tests/test_diff_arrangement_inline_shadow.c.
  *
  * @param arr: Source arrangement
  *

@@ -208,7 +208,7 @@ Concretely (K-Fusion contract, invariants #3 and #4 in
   `(ht_head, ht_next, key_cols)` is allocated fresh per worker by
   `col_diff_arrangement_deep_copy` (`wirelog/columnar/diff_arrangement.c:91`).
   Pointer non-aliasing is empirically asserted in
-  `tests/test_k_fusion_inline_shadow.c:213-216`.
+  `tests/test_diff_arrangement_inline_shadow.c:213-216`.
 - **C3. Column buffers are immutable during the epoch.** Workers read the
   shared `col_rel_t` column buffers under the Option (iii) immutable-during-
   epoch invariant. No worker mutates column payload during the read phase, so
@@ -241,9 +241,9 @@ per row.
 
 Invariant coverage: Z-set transparency is validated by
 `tests/test_k_fusion_correctness.c` (K=1 vs K=4 fingerprint equivalence) and
-`tests/test_e2e_kfusion_k4_inline.c` (authorization use case). TSan cleanliness
+`tests/test_inline_authorization_multiworker.c` (authorization use case). TSan cleanliness
 under K=4 x 10k iterations is validated by
-`tests/test_e2e_tsan_inline_kfusion.c`. See
+`tests/test_inline_concurrent_read.c`. See
 `docs/k-fusion-5-invariant-audit.md` for the full coverage matrix.
 
 ### 5.3 Side-Relation Contract
@@ -284,7 +284,7 @@ by per-worker mutation.
 | Index ownership     | Deep-copied (C2)                              | Deep-copied (C2)                                |
 | Payload mutability  | Immutable during epoch (C3)                   | Immutable during epoch (C3)                    |
 | Reclamation         | Tied to parent row lifecycle                  | Epoch-frontier GC                               |
-| Empirical proof     | `tests/test_k_fusion_inline_shadow.c`         | Covered under general arrangement isolation tests |
+| Empirical proof     | `tests/test_diff_arrangement_inline_shadow.c`         | Covered under general arrangement isolation tests |
 | Audit cross-ref     | `docs/k-fusion-5-invariant-audit.md` #4       | `docs/k-fusion-5-invariant-audit.md` #4        |
 
 ### 5.5 Forbidden Patterns

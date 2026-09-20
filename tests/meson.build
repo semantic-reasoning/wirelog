@@ -4589,18 +4589,18 @@ test_compound_arena_trace_exe = executable(
 test('compound_arena_trace', test_compound_arena_trace_exe, suite: 'log')
 
 # ============================================================================
-# K-Fusion deep-copy + inline compound visibility (Issue #532 Task 4)
+# Differential arrangement deep-copy + inline compound visibility (Issue #532 Task 4)
 # ============================================================================
 
-test_k_fusion_inline_shadow_exe = executable(
-  'test_k_fusion_inline_shadow',
-  files('test_k_fusion_inline_shadow.c'),
+test_diff_arrangement_inline_shadow_exe = executable(
+  'test_diff_arrangement_inline_shadow',
+  files('test_diff_arrangement_inline_shadow.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],
 )
 
-test('k_fusion_inline_shadow', test_k_fusion_inline_shadow_exe, timeout: 60)
+test('diff_arrangement_inline_shadow', test_diff_arrangement_inline_shadow_exe, timeout: 60)
 
 # ============================================================================
 # K-Fusion Correctness Tests (Issue #534 Task 5)
@@ -4618,42 +4618,42 @@ test_k_fusion_correctness_exe = executable(
 test('k_fusion_correctness', test_k_fusion_correctness_exe, timeout: 60)
 
 # ============================================================================
-# K=4 Inline Compound Authorization E2E (Issue #534 Task 5 - Auth Use Case)
+# Multi-worker inline compound authorization results (Issue #534 Task 5 - Auth Use Case)
 # ============================================================================
 
-test_e2e_kfusion_k4_inline_exe = executable(
-  'test_e2e_kfusion_k4_inline',
-  files('test_e2e_kfusion_k4_inline.c'),
+test_inline_authorization_multiworker_exe = executable(
+  'test_inline_authorization_multiworker',
+  files('test_inline_authorization_multiworker.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],
 )
 
-test('e2e_kfusion_k4_inline', test_e2e_kfusion_k4_inline_exe, timeout: 60)
+test('inline_authorization_multiworker', test_inline_authorization_multiworker_exe, timeout: 60)
 
 # ============================================================================
-# TSan stress: K=4 concurrent readers over nested inline compound (Issue #534 Task 3)
+# TSan stress: concurrent readers over nested inline compound (Issue #534 Task 3)
 # K=4 workers x 10k iterations over scope(metadata(t,ts,loc,risk)) inline/4.
 # + 100 insert/delete lifecycle cycles with K=4 concurrent readers per epoch.
 # TSan clean == 0 data races on inline column buffers.
 # ============================================================================
 
-test_e2e_tsan_inline_kfusion_exe = executable(
-  'test_e2e_tsan_inline_kfusion',
-  files('test_e2e_tsan_inline_kfusion.c'),
+test_inline_concurrent_read_exe = executable(
+  'test_inline_concurrent_read',
+  files('test_inline_concurrent_read.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],
 )
 
-test('e2e_tsan_inline_kfusion', test_e2e_tsan_inline_kfusion_exe,
+test('inline_concurrent_read', test_inline_concurrent_read_exe,
      suite: 'tsan',
      timeout: 180)
 
 # ============================================================================
 # ASan stress: K=4 workers, nested inline + side-relation arena GC (Issue #534 Task 4)
 # K=4 independent workers x 2500 cycles: arena alloc/retain/gc + inline store/retrieve.
-# + arena freeze/unfreeze correctness under K-Fusion epoch model.
+# + arena freeze/unfreeze correctness under the concurrent reader epoch model.
 # ASan clean == 0 leaks, 0 use-after-free.
 # ============================================================================
 
