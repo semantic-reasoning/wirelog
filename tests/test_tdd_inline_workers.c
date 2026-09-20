@@ -273,7 +273,7 @@ main(void)
     setenv("WIRELOG_TDD_STRATUM_PROFILE", "1", 1);
     int rc = run_lifecycle(1, false);
     if (rc == 0)
-        rc = run_lifecycle(8, false);
+        rc = run_lifecycle(8, true);
     if (rc == 0)
         rc = run_scalar_dispatch_probe();
     if (saved_threshold) {
