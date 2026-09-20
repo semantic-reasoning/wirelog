@@ -1210,7 +1210,12 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
         sess->intern) != 0) {
         col_rel_destroy(out);
         sess->filt_cache[idx].filtered = NULL;
-        /* Leave the entry in cache with NULL filtered; harmless on next lookup */
+        free(sess->filt_cache[idx].filter_data);
+        free(sess->filt_cache[idx].rel_name);
+        memset(&sess->filt_cache[idx], 0, sizeof(sess->filt_cache[idx]));
+        /* The entry was never published: roll the count back so a failed
+         * build cannot strand a cache slot or make later growth skip it. */
+        sess->filt_cache_count--;
         return NULL;
     }
     sess->filt_cache[idx].source_nrows = rel->nrows;

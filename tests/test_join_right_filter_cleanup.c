@@ -969,6 +969,83 @@ cleanup:
     if (ok) PASS(); else FAIL("cache governor admission contract");
 }
 
+static void
+test_filter_cache_admission_and_growth(void)
+{
+    TEST("right-filter admission refusal and pinned cache growth retry");
+    wl_col_session_t *sess = make_mock_session();
+    wl_columnar_memory_governor_ref_t *ref = right_filter_governor(1u);
+    col_filt_cache_pin_t pin = { 0 }, held = { 0 };
+    wl_plan_expr_buffer_t expr = { filter_bytes, sizeof(filter_bytes) };
+    col_rel_t *right = NULL;
+    col_rel_t *out = NULL;
+    bool ok = sess && ref && register_right(sess) == 0;
+    if (!ok)
+        goto cleanup;
+    sess->memory_governor = ref;
+    right = session_find_rel(sess, "right");
+    out = wl_columnar_filter_apply_right_filter_cached_pin(sess, &expr,
+            "admission", right, &pin);
+    ok = !out && !pin.active && sess->filt_cache_count == 0
+        && sess->filt_cache_active_pins == 0
+        && wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref)) == 0;
+    col_filt_cache_pin_release(&pin);
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes,
+        1u << 20, memory_order_release);
+    out = wl_columnar_filter_apply_right_filter_cached_pin(sess, &expr,
+            "admission", right, &pin);
+    ok = ok && out && out->nrows == 4 && pin.active;
+    col_filt_cache_pin_release(&pin);
+
+    /* Fill the cache to its initial capacity, then hold a lease while a
+     * distinct miss would need to realloc the entry array. */
+    for (unsigned i = 0; ok && i < 3; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "growth-%u", i);
+        out = wl_columnar_filter_apply_right_filter_cached_pin(sess, &expr,
+                name, right, &pin);
+        ok = out && out->nrows == 4 && pin.active;
+        col_filt_cache_pin_release(&pin);
+    }
+    ok = ok && sess->filt_cache_count == sess->filt_cache_cap
+        && sess->filt_cache_cap == 4;
+    out = wl_columnar_filter_apply_right_filter_cached_pin(sess, &expr,
+            "growth-0", right, &held);
+    uint32_t count_before = sess->filt_cache_count;
+    uint32_t cap_before = sess->filt_cache_cap;
+    ok = ok && out && held.active && sess->filt_cache_active_pins == 1;
+    col_filt_cache_pin_t blocked = { 0 };
+    out = wl_columnar_filter_apply_right_filter_cached_pin(sess, &expr,
+            "growth-new", right, &blocked);
+    ok = ok && !out && !blocked.active
+        && sess->filt_cache_count == count_before
+        && sess->filt_cache_cap == cap_before
+        && sess->filt_cache_active_pins == 1;
+    col_filt_cache_pin_release(&blocked);
+    col_filt_cache_pin_release(&held);
+    out = wl_columnar_filter_apply_right_filter_cached_pin(sess, &expr,
+            "growth-new", right, &pin);
+    ok = ok && out && out->nrows == 4 && pin.active
+        && sess->filt_cache_count == count_before + 1
+        && sess->filt_cache_cap > cap_before;
+    col_filt_cache_pin_release(&pin);
+cleanup:
+    col_filt_cache_pin_release(&pin);
+    col_filt_cache_pin_release(&held);
+    if (sess) {
+        sess->memory_governor = NULL;
+        destroy_mock_session(sess);
+    }
+    if (ref) {
+        ok = ok && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0;
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (ok) PASS(); else FAIL("admission or pinned cache growth contract");
+}
+
 int
 main(void)
 {
@@ -984,6 +1061,7 @@ main(void)
             owned != 0);
     }
     test_managed_filter_cache();
+    test_filter_cache_admission_and_growth();
     for (unsigned grow = 0; grow < 2; grow++)
         for (unsigned exhaust = 0; exhaust < 2; exhaust++)
             test_managed_right_filter(wl_columnar_join_op, WL_PLAN_OP_JOIN,
