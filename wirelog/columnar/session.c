@@ -2591,6 +2591,33 @@ col_worker_session_create(wl_col_session_t *coordinator,
     if (out_worker->teardown_started)
         return EBUSY;
 
+    /* #1661: the worker registry is heap-only, and this is the one registry
+     * population path that does not go through session_add_rel -- so it also
+     * skips the pool->heap and arena->heap promotions that let an entry
+     * outlive its backing storage.  A pool slot lives only as long as its
+     * delta_pool slab, and arena columns die at the next arena reset, while
+     * the worker registry must survive both.  Every partition producer today
+     * heap-allocates (col_rel_partition_by_key and col_rel_merge_partitions
+     * even assert it), so refusing costs nothing and makes the invariant
+     * enforced at the boundary instead of conventional at the producers.
+     * Rejecting here, before any field of *out_worker is written and before
+     * the adopt loop runs, leaves every partition caller-owned.
+     * NULL slots are holes, not storage: tdd_init_workers_global_read passes
+     * a count with gaps where relations were removed. */
+    for (uint32_t i = 0; i < num_partitions; i++) {
+        if (partitions[i]
+            && (partitions[i]->pool_owned || partitions[i]->arena_owned)) {
+            WL_LOG(WL_LOG_SEC_SESSION, WL_LOG_ERROR,
+                "worker partition rejected: unpromoted storage "
+                "(worker=%u, index=%u, rel=%s, pool=%d, arena=%d)",
+                worker_id, i,
+                partitions[i]->name ? partitions[i]->name : "(unnamed)",
+                (int)partitions[i]->pool_owned,
+                (int)partitions[i]->arena_owned);
+            return EINVAL;
+        }
+    }
+
     /* Step 1: Bitwise copy — copies all value fields (frontiers,
      * counters, booleans, plan pointer, frontier_ops). */
     *out_worker = *coordinator;

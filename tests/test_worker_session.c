@@ -2010,6 +2010,129 @@ test_pool_relation_promotion_tombstones_source(void)
     return 0;
 }
 
+/*
+ * Issue #1661: col_worker_session_create bypasses session_add_rel, so it also
+ * bypasses the pool->heap and arena->heap promotions that make a registry
+ * entry safe to outlive its backing allocator.  Every partition producer
+ * today heap-allocates, so the promotion would be a no-op -- this gate keeps
+ * that true by refusing unpromoted storage at the boundary instead of leaving
+ * it to convention.  The refusal happens before any ownership transfer, so
+ * every partition stays caller-owned.
+ */
+static int
+test_worker_create_refuses_unpromoted_storage(void)
+{
+    TEST("worker create refuses pool/arena-owned partitions");
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *coord = make_coordinator(&plan, &prog);
+    delta_pool_t *pool = delta_pool_create(4, sizeof(col_rel_t), 4096);
+    wl_arena_t *arena = wl_arena_create(64 * 1024);
+    col_rel_t *parts[2] = { NULL, NULL };
+    wl_col_session_t worker;
+    int ok;
+
+    if (!coord || !pool || !arena) {
+        cleanup_coordinator(coord, plan, prog);
+        if (pool)
+            delta_pool_destroy(pool);
+        if (arena)
+            wl_arena_free(arena);
+        FAIL("fixture allocation");
+        return 1;
+    }
+
+    /* 1. pool-owned partition is refused, and stays caller-owned. */
+    parts[0] = col_rel_pool_new_auto(pool, NULL, "edge", 2);
+    memset(&worker, 0, sizeof(worker));
+    ok = parts[0] != NULL && parts[0]->pool_owned;
+    ok = ok && col_worker_session_create(coord, 0, parts, 1, &worker)
+        == EINVAL;
+    ok = ok && parts[0] != NULL          /* not transferred */
+        && worker.rels == NULL && worker.nrels == 0;
+    if (parts[0]) {
+        (void)col_rel_destroy_checked(parts[0]);
+        parts[0] = NULL;
+    }
+
+    /* 2. A pool slot with arena-backed columns.  This does NOT independently
+     * cover the arena_owned disjunct: col_rel_pool_new_auto sets pool_owned
+     * (relation.c) before arena_owned, so `pool_owned ||` short-circuits and
+     * step 1's branch decides.  Kept because it is a real allocator shape;
+     * step 2b is what covers the second disjunct. */
+    parts[0] = col_rel_pool_new_auto(pool, arena, "edge", 2);
+    memset(&worker, 0, sizeof(worker));
+    ok = ok && parts[0] != NULL && parts[0]->arena_owned
+        && parts[0]->pool_owned;
+    ok = ok && col_worker_session_create(coord, 0, parts, 1, &worker)
+        == EINVAL;
+    ok = ok && parts[0] != NULL
+        && worker.rels == NULL && worker.nrels == 0;
+    if (parts[0]) {
+        (void)col_rel_destroy_checked(parts[0]);
+        parts[0] = NULL;
+    }
+
+    /* 2b. The arena_owned disjunct, actually exercised.  relation.c has one
+     * `arena_owned = true` site and it runs on an already-pooled slot, so no
+     * constructor yields arena-only storage; forge the flag on a heap
+     * relation to make the second disjunct the deciding condition.  Without
+     * this, deleting `|| arena_owned` leaves the suite green.  Clear the flag
+     * before destroy so teardown frees the heap columns. */
+    parts[0] = col_rel_new_auto("edge", 2);
+    memset(&worker, 0, sizeof(worker));
+    ok = ok && parts[0] != NULL;
+    if (parts[0])
+        parts[0]->arena_owned = true;
+    ok = ok && col_worker_session_create(coord, 0, parts, 1, &worker)
+        == EINVAL;
+    ok = ok && parts[0] != NULL && !parts[0]->pool_owned
+        && worker.rels == NULL && worker.nrels == 0;
+    if (parts[0]) {
+        parts[0]->arena_owned = false;
+        col_rel_destroy(parts[0]);
+        parts[0] = NULL;
+    }
+
+    /* 3. NEGATIVE CONTROL.  Without this the assertions above would hold for
+     * a create that refused everything.  A heap partition must still be
+     * accepted and transferred. */
+    parts[0] = col_rel_new_auto("edge", 2);
+    memset(&worker, 0, sizeof(worker));
+    ok = ok && parts[0] != NULL && !parts[0]->pool_owned
+        && !parts[0]->arena_owned;
+    ok = ok && col_worker_session_create(coord, 0, parts, 1, &worker) == 0;
+    ok = ok && parts[0] == NULL          /* ownership transferred */
+        && worker.nrels == 1;
+    if (worker.rels)
+        (void)col_worker_session_destroy(&worker);
+    if (parts[0])
+        col_rel_destroy(parts[0]);
+
+    /* 4. A NULL hole must not be mistaken for unpromoted storage.
+     * tdd_init_workers_global_read passes genuine NULL slots. */
+    parts[0] = NULL;
+    parts[1] = col_rel_new_auto("edge", 2);
+    memset(&worker, 0, sizeof(worker));
+    ok = ok && parts[1] != NULL;
+    ok = ok && col_worker_session_create(coord, 0, parts, 2, &worker) == 0;
+    if (worker.rels)
+        (void)col_worker_session_destroy(&worker);
+    if (parts[1])
+        col_rel_destroy(parts[1]);
+
+    delta_pool_destroy(pool);
+    wl_arena_free(arena);
+    cleanup_coordinator(coord, plan, prog);
+
+    if (!ok) {
+        FAIL("unpromoted partition storage must be refused at the boundary");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
 static int
 test_worker_teardown_refusal_is_retryable(void)
 {
@@ -2809,6 +2932,7 @@ main(int argc, char **argv)
     test_rdf_graph_metadata_absent_when_no_graph_column();
     test_worker_alias_chain_checked_teardown();
     test_worker_teardown_refusal_is_retryable();
+    test_worker_create_refuses_unpromoted_storage();
     test_worker_deferred_relation_transfer_and_retry();
     test_worker_deferred_relation_retries_locally();
     test_pool_alias_teardown_refusal_is_retryable();
