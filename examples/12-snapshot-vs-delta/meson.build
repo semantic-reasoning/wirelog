@@ -29,4 +29,5 @@ test(
   ],
   depends: snapshot_demo,
   suite: 'examples',
+  timeout: 120,
 )

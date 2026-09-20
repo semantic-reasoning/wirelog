@@ -662,7 +662,7 @@ test('bench_flowlog_tdd_bdx_json', bench_flowlog_json_py3,
      ],
      depends: bench_flowlog,
      suite: 'bench',
-     timeout: 30)
+     timeout: 120)
 
 test('bench_flowlog_tdd_bdx_json_nofusion', bench_flowlog_json_py3,
      args: [bench_flowlog_tdd_json_validator[0], bench_flowlog_seq.full_path(),
@@ -897,10 +897,10 @@ test('branch_protection_contract', py3,
 # above `sh = find_program('bash', ...)`).  Registered outside `if sh.found()`
 # on purpose: the gate needs only python3 and the build introspection, so on a
 # runner without bash it still reports its SKIP instead of vanishing.  It
-# skips off Linux/macOS; between them the Linux and macOS introspections see
-# every shell registration in this file (the Windows-only abi_symbols_windows
-# is PowerShell and outside the rule).  Python-seeded tests, including this
-# one, are outside the rule by construction.  Being a .py gate it is outside
+# runs on Linux, macOS, and Windows; the timeout gate classifies POSIX shell,
+# PowerShell, and Python registrations whose source makes a real process call.
+# Pure in-process Python tests, including this one, remain outside the rule.
+# Being a .py gate it is outside
 # test-gate-skip-exit-codes.sh's coverage scan (which lists .sh basenames),
 # by design.
 test('shell_gate_timeouts', py3,
@@ -938,7 +938,7 @@ test('shell_gate_walltime_selftest', py3,
 # output; meson.build runs it with check: false, so only a test can see that.
 test('uncrustify_hook_selftest', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-setup-uncrustify-hook.py'],
-     suite: 'abi')
+     suite: 'abi', timeout: 120)
 
 test('version_sync', py3,
      args: [meson.project_source_root() / 'scripts/ci/check-version-sync.py',
@@ -1047,7 +1047,7 @@ test('program_lifetime_selftest', py3,
 # re-deriving per-gate platform exposure -- which is how the 30s default
 # became invisible in the first place.
 #
-# Issue #1464: the rule is enforced by shell_gate_timeouts below over Meson's
+# Issue #1464/#1488: the rule is enforced by shell_gate_timeouts below over Meson's
 # introspection.  Introspection exposes only the effective value and cannot
 # tell an inherited 30 from a written one, so the gate asserts a bright line:
 # never write `timeout: 30` on a shell gate (pick another value and justify
@@ -1081,7 +1081,7 @@ if sh.found()
   test('bash_construct_ratchet', py3,
        args: [meson.project_source_root() / 'scripts/ci/check-bash-constructs.py',
               meson.project_build_root(), meson.project_source_root()],
-       suite: 'abi')
+       suite: 'abi', timeout: 120)
   test('bash_construct_ratchet_selftest', sh,
        args: [meson.project_source_root() / 'scripts/ci/test-check-bash-constructs.sh'],
        suite: 'abi',
@@ -1428,7 +1428,7 @@ if host_machine.system() == 'windows' and powershell.found()
               '-ExecutionPolicy', 'Bypass',
               '-File', meson.project_source_root() / 'scripts/ci/check-abi-symbols-windows.ps1',
               meson.project_build_root()],
-       suite: 'abi_advisory')
+       suite: 'abi_advisory', timeout: 120)
 endif
 
 # Issue #786 (cross-link #690 libabigail half): libabigail manifest gate.
@@ -5218,7 +5218,7 @@ if not is_android
     ],
     depends: wirelog_cli,
     workdir: baseline_fixture_dir,
-    suite: 'baseline',
+    suite: 'baseline', timeout: 120,
   )
 
   test('baseline_sym_family',
@@ -5231,7 +5231,7 @@ if not is_android
     ],
     depends: wirelog_cli,
     workdir: baseline_fixture_dir,
-    suite: 'baseline',
+    suite: 'baseline', timeout: 120,
   )
 
   test('baseline_tab_nodes',
@@ -5244,7 +5244,7 @@ if not is_android
     ],
     depends: wirelog_cli,
     workdir: baseline_fixture_dir,
-    suite: 'baseline',
+    suite: 'baseline', timeout: 120,
   )
 
   # ============================================================================
@@ -5259,7 +5259,7 @@ if not is_android
       wirelog_cli.full_path(),
     ],
     depends: wirelog_cli,
-    suite: 'cli',
+    suite: 'cli', timeout: 120,
   )
 
   test('string_compare_ops',
@@ -5269,7 +5269,7 @@ if not is_android
       wirelog_cli.full_path(),
     ],
     depends: wirelog_cli,
-    suite: 'cli',
+    suite: 'cli', timeout: 120,
   )
 
   test('inline_slot_types',
@@ -5279,7 +5279,7 @@ if not is_android
       wirelog_cli.full_path(),
     ],
     depends: wirelog_cli,
-    suite: 'cli',
+    suite: 'cli', timeout: 120,
   )
 
   test('cli_version',
@@ -5290,7 +5290,7 @@ if not is_android
       meson.project_version(),
     ],
     depends: wirelog_cli,
-    suite: 'cli',
+    suite: 'cli', timeout: 120,
   )
 endif
 

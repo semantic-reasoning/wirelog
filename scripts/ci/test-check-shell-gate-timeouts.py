@@ -47,6 +47,17 @@ def py_test(name: str, timeout: int) -> dict:
             "cmd": ["/usr/bin/python3", f"/src/scripts/ci/{name}.py"]}
 
 
+def real_py_test(name: str, timeout: int) -> dict:
+    return {"name": name, "suite": ["wirelog:abi"], "timeout": timeout,
+            "cmd": [sys.executable, str(SCRIPT_DIR / name)]}
+
+
+def powershell_test(name: str, timeout: int) -> dict:
+    return {"name": name, "suite": ["wirelog:abi"], "timeout": timeout,
+            "cmd": ["pwsh.exe", "-NoProfile", "-File",
+                    f"/src/scripts/ci/{name}.ps1"]}
+
+
 class GateCase(unittest.TestCase):
     def setUp(self) -> None:
         self.gate = load(GATE, "_shell_gate_timeouts")
@@ -93,17 +104,29 @@ class GateCase(unittest.TestCase):
         self.assertIn("check-args", err)
 
     def test_non_shell_tests_are_ignored(self) -> None:
-        self.write([py_test("gate-py", 30), shell_test("check-ok", 120)])
+        self.write([real_py_test("test-check-shell-gate-timeouts.py", 30), shell_test("check-ok", 120)])
         rc, out, _ = self.run_gate()
         self.assertEqual(rc, 0)
-        self.assertIn("ok 1 shell-seeded tests", out)
+        self.assertIn("ok 1 shell-seeded or process-spawning Python tests", out)
+
+    def test_python_process_gate_default_fails(self) -> None:
+        self.write([real_py_test("check-bash-constructs.py", 30)])
+        rc, _, err = self.run_gate()
+        self.assertEqual(rc, 1)
+        self.assertIn("check-bash-constructs.py", err)
+
+    def test_powershell_default_fails(self) -> None:
+        self.write([powershell_test("check-abi-symbols-windows", 30)])
+        rc, _, err = self.run_gate()
+        self.assertEqual(rc, 1)
+        self.assertIn("check-abi-symbols-windows", err)
 
     def test_explicit_non_default_values_pass(self) -> None:
         self.write([shell_test("check-a", 90), shell_test("check-b", 180),
                     shell_test("check-c", 3600, suite="wirelog:perf")])
         rc, out, _ = self.run_gate()
         self.assertEqual(rc, 0)
-        self.assertIn("ok 3 shell-seeded tests", out)
+        self.assertIn("ok 3 shell-seeded or process-spawning Python tests", out)
 
     def test_darwin_platform_passes_shell_gate(self) -> None:
         self.write([shell_test("check-macos", 120)])
@@ -114,7 +137,7 @@ class GateCase(unittest.TestCase):
         finally:
             self.gate.sys.platform = saved
         self.assertEqual(rc, 0)
-        self.assertIn("ok 1 shell-seeded tests", out)
+        self.assertIn("ok 1 shell-seeded or process-spawning Python tests", out)
 
     def test_rule_is_suite_agnostic(self) -> None:
         self.write([shell_test("check-sbom", 30, suite="wirelog:sbom")])
@@ -133,7 +156,7 @@ class GateCase(unittest.TestCase):
         self.write([py_test("only-python", 120)])
         rc, _, err = self.run_gate()
         self.assertEqual(rc, 1)
-        self.assertIn("no shell-seeded tests", err)
+        self.assertIn("no shell-seeded or process-spawning Python tests", err)
 
     def test_missing_intro_skips(self) -> None:
         rc, out, _ = self.run_gate()
@@ -151,16 +174,27 @@ class GateCase(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("gate required but would skip", err)
 
-    def test_unsupported_platform_skips(self) -> None:
-        self.write([shell_test("check-ok", 120)])
+    def test_windows_platform_runs(self) -> None:
+        self.write([powershell_test("check-ok", 120)])
         saved = self.gate.sys.platform
         self.gate.sys.platform = "win32"
         try:
             rc, out, _ = self.run_gate()
         finally:
             self.gate.sys.platform = saved
+        self.assertEqual(rc, 0)
+        self.assertIn("ok 1", out)
+
+    def test_unsupported_platform_skips(self) -> None:
+        self.write([shell_test("check-ok", 120)])
+        saved = self.gate.sys.platform
+        self.gate.sys.platform = "freebsd"
+        try:
+            rc, out, _ = self.run_gate()
+        finally:
+            self.gate.sys.platform = saved
         self.assertEqual(rc, 77)
-        self.assertIn("Linux and macOS only", out)
+        self.assertIn("Linux, macOS, and Windows only", out)
 
     def test_usage(self) -> None:
         out, err = io.StringIO(), io.StringIO()

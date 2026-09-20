@@ -21,4 +21,5 @@ test(
   ],
   depends: arithmetic_demo,
   suite: 'examples',
+  timeout: 120,
 )
