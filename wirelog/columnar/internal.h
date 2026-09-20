@@ -3468,6 +3468,15 @@ col_rel_exchange_partition(const col_rel_t *src,
  * out_worker must be caller-allocated (e.g., from calloc'd array).
  * partitions[] ownership transfers to the worker on success;
  * on failure, partitions[] are NOT consumed (caller must free).
+ * Precondition (#1661): no non-NULL partition may itself be pool_owned or
+ * arena_owned; such a partition is refused with EINVAL before any transfer,
+ * because this path bypasses session_add_rel and therefore its pool/arena
+ * promotion, and that storage cannot safely outlive its allocator in the
+ * worker registry.  This checks the partition's OWN flags only -- a
+ * shared-view alias whose storage owner is pool/arena-backed carries clear
+ * flags and is refused separately, by the lease prepare inside
+ * wl_columnar_session_adopt_shared_view.  NULL slots are permitted and
+ * skipped.
  *
  * Returns 0 on success, EINVAL for bad arguments, ENOMEM on failure.
  */
