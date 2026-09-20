@@ -14,15 +14,13 @@
 ./.github/workflows/tier1-sanitizers.yml@UNKNOWN:NOASSERTION
 ./workflow-tools/.github/actions/setup-meson@UNKNOWN:NOASSERTION
 actions/attest-build-provenance@v2:NOASSERTION
-actions/cache@v4:NOASSERTION
 actions/cache@v6:NOASSERTION
 actions/cache@v6:NOASSERTION
 actions/cache@v6:NOASSERTION
 actions/cache@v6:NOASSERTION
 actions/cache@v6:NOASSERTION
 actions/cache@v6:NOASSERTION
-actions/checkout@v4.2.2:NOASSERTION
-actions/checkout@v4.2.2:NOASSERTION
+actions/cache@v6:NOASSERTION
 actions/checkout@v5:NOASSERTION
 actions/checkout@v5:NOASSERTION
 actions/checkout@v5:NOASSERTION
@@ -38,6 +36,9 @@ actions/checkout@v5:NOASSERTION
 actions/checkout@v5:NOASSERTION
 actions/checkout@v5:NOASSERTION
 actions/checkout@v5:NOASSERTION
+actions/checkout@v7.0.1:NOASSERTION
+actions/checkout@v7.0.1:NOASSERTION
+actions/checkout@v7.0.1:NOASSERTION
 actions/checkout@v7:NOASSERTION
 actions/checkout@v7:NOASSERTION
 actions/checkout@v7:NOASSERTION
@@ -53,12 +54,12 @@ actions/checkout@v7:NOASSERTION
 actions/checkout@v7:NOASSERTION
 actions/checkout@v7:NOASSERTION
 actions/checkout@v7:NOASSERTION
-actions/download-artifact@v7:NOASSERTION
-actions/download-artifact@v7:NOASSERTION
 actions/download-artifact@v5:NOASSERTION
+actions/download-artifact@v7:NOASSERTION
+actions/download-artifact@v7:NOASSERTION
 actions/download-artifact@v8:NOASSERTION
 actions/download-artifact@v8:NOASSERTION
-actions/setup-node@v4:NOASSERTION
+actions/setup-node@v7:NOASSERTION
 actions/setup-python@v7:NOASSERTION
 actions/setup-python@v7:NOASSERTION
 actions/setup-python@v7:NOASSERTION
@@ -72,8 +73,8 @@ actions/upload-artifact@main:NOASSERTION
 actions/upload-artifact@main:NOASSERTION
 actions/upload-artifact@main:NOASSERTION
 actions/upload-artifact@main:NOASSERTION
-actions/upload-artifact@v4.4.3:NOASSERTION
 actions/upload-artifact@v4:NOASSERTION
+actions/upload-artifact@v7.0.1:NOASSERTION
 actions/upload-artifact@v7:NOASSERTION
 actions/upload-artifact@v7:NOASSERTION
 actions/upload-artifact@v7:NOASSERTION
@@ -86,16 +87,16 @@ astral-sh/setup-uv@v10.1.0:NOASSERTION
 codecov/codecov-action@v7:NOASSERTION
 docker/login-action@v4.6.0:NOASSERTION
 docker/setup-buildx-action@v4.3.0:NOASSERTION
-docker/setup-qemu-action@v4.2.0:NOASSERTION
-docker/setup-qemu-action@v4.2.0:NOASSERTION
+docker/setup-qemu-action@v4.3.0:NOASSERTION
+docker/setup-qemu-action@v4.3.0:NOASSERTION
 github/codeql-action/upload-sarif@v2.14.5:NOASSERTION
 ilammy/msvc-dev-cmd@v1:NOASSERTION
 mozilla-actions/sccache-action@v0.0.10:NOASSERTION
-msys2/setup-msys2@v2:NOASSERTION
-mymindstorm/setup-emsdk@v14:NOASSERTION
+msys2/setup-msys2@v2.32.0:NOASSERTION
+mymindstorm/setup-emsdk@v16:NOASSERTION
 nanoarrow@0.9.0.9000:Apache
 nttld/setup-ndk@v1:NOASSERTION
-ossf/scorecard-action@v2.3.1:NOASSERTION
+ossf/scorecard-action@v2.4.4:NOASSERTION
 r-lib/actions/check-r-package@v2:NOASSERTION
 r-lib/actions/setup-pandoc@v2:NOASSERTION
 r-lib/actions/setup-pandoc@v2:NOASSERTION
@@ -105,4 +106,4 @@ r-lib/actions/setup-r@v2:NOASSERTION
 r-lib/actions/setup-r@v2:NOASSERTION
 r-lib/actions/setup-tinytex@v2:NOASSERTION
 sigstore/cosign-installer@v4.1.2:NOASSERTION
-# nanoarrow-resolved-sha: 3f824063f59848e05692ab520de8ab4d9ebb1880
+# nanoarrow-resolved-sha: ec8a58cae18beaa241c7fea7cb26816ac27c280f
