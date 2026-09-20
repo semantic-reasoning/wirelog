@@ -556,6 +556,13 @@ typedef void (*wl_columnar_set_transition_hook_t)(col_rel_t *);
 extern wl_columnar_set_transition_hook_t wl_columnar_set_transition_hook;
 #endif
 
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+/* Test-only seam for forcing the private resize preparation to fail. */
+extern bool wl_columnar_relation_test_fail_prepare_resize;
+void wl_columnar_relation_test_fail_next_prepare_resize(void);
+void wl_columnar_relation_test_clear_prepare_resize(void);
+#endif
+
 #ifdef WL_TEST_CONSOLIDATE_HOOK
 /* Test-only probes for the two consolidation COW windows. */
 typedef enum wl_columnar_consolidation_test_stage {
@@ -2336,6 +2343,9 @@ void
 wl_columnar_arrangement_probe_test_fail_next_acquire(int rc);
 void
 wl_columnar_arrangement_probe_test_clear(void);
+void
+wl_columnar_arrangement_test_force_stale(wl_col_session_t *sess,
+    const char *rel_name);
 #endif
 int
 col_rel_alloc(col_rel_t **out, const char *name);

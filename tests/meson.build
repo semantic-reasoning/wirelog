@@ -182,7 +182,7 @@ testlib_prod = static_library(
   thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
-  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_TEST_RELATION_RESIZE_HOOK=1'],
 )
 
 source_access_exe = executable(
@@ -3855,7 +3855,8 @@ test_join_batch_resume_exe = executable(
   files('test_join_batch_resume.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
-  c_args: ['-DWL_COLUMNAR_ARRANGEMENT_PROBE_TEST_HOOKS=1'],
+  c_args: ['-DWL_COLUMNAR_ARRANGEMENT_PROBE_TEST_HOOKS=1',
+    '-DWL_TEST_RELATION_RESIZE_HOOK=1'],
   link_with: [test_join_batch_resume_arrangement, testlib_prod],
 )
 

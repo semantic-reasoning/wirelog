@@ -34,6 +34,22 @@ wl_columnar_append_transition_hook_t wl_columnar_append_transition_hook;
 wl_columnar_set_transition_hook_t wl_columnar_set_transition_hook;
 #endif
 
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+bool wl_columnar_relation_test_fail_prepare_resize;
+
+void
+wl_columnar_relation_test_fail_next_prepare_resize(void)
+{
+    wl_columnar_relation_test_fail_prepare_resize = true;
+}
+
+void
+wl_columnar_relation_test_clear_prepare_resize(void)
+{
+    wl_columnar_relation_test_fail_prepare_resize = false;
+}
+#endif
+
 static void *
 wl_columnar_relation_radix_malloc(size_t size, const char *site)
 {
@@ -506,6 +522,13 @@ col_rel_prepare_resize(const col_rel_t *r, uint32_t new_cap,
 {
     int64_t **columns = NULL;
     col_delta_timestamp_t *timestamps = NULL;
+
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    if (wl_columnar_relation_test_fail_prepare_resize) {
+        wl_columnar_relation_test_fail_prepare_resize = false;
+        return ENOMEM;
+    }
+#endif
 
     if (!r || !out_columns || !out_timestamps)
         return EINVAL;

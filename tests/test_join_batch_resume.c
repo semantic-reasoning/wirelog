@@ -120,6 +120,16 @@ destroy_session(wl_col_session_t *s)
     }
     free(s->arr_entries);
     col_session_free_diff_arrangements(s);
+    col_session_free_delta_arrangements(s);
+    col_session_free_sorted_arrangements(s);
+    col_session_free_filt_arrangements(s);
+    for (uint32_t i = 0; i < s->filt_cache_count; i++) {
+        free(s->filt_cache[i].rel_name);
+        free(s->filt_cache[i].filter_data);
+        if (s->filt_cache[i].filtered)
+            col_rel_destroy(s->filt_cache[i].filtered);
+    }
+    free(s->filt_cache);
     col_mat_cache_clear(&s->mat_cache);
     session_rel_free_hash(s);
     delta_pool_destroy(s->delta_pool);
@@ -312,6 +322,23 @@ find_entry(const wl_col_session_t *sess, const char *name)
         if (strcmp(sess->arr_entries[i].rel_name, name) == 0)
             return &sess->arr_entries[i];
     return NULL;
+}
+
+static int
+register_relation(wl_col_session_t *sess, col_rel_t **owned,
+    const char *name)
+{
+    int rc;
+
+    if (!sess || !owned || !*owned || !name)
+        return EINVAL;
+    rc = wl_columnar_relation_rename_checked(*owned, name);
+    if (rc != 0)
+        return rc;
+    rc = session_add_rel(sess, *owned);
+    if (rc == 0)
+        *owned = NULL;
+    return rc;
 }
 
 /* Fault-injecting wrapper around the real relation sink. */
@@ -1314,8 +1341,10 @@ test_operator_empty_right_and_row_too_large(void)
         FAIL("fixture");
         goto out;
     }
-    session_add_rel(sess, right);
-    right = NULL;
+    if (register_relation(sess, &right, "right") != 0) {
+        FAIL("register empty right");
+        goto out;
+    }
     init_join_op(&op, lk, rk);
     sess->join_batch_bytes = 4u * 32u;
     /* Strict mode must not fail an empty right side: the shape is eligible
@@ -1357,11 +1386,10 @@ test_operator_empty_right_and_row_too_large(void)
         FAIL("second right");
         goto out;
     }
-    if (session_add_rel(sess, big_right) != 0) {
+    if (register_relation(sess, &big_right, "right") != 0) {
         FAIL("replace right relation");
         goto out;
     }
-    big_right = NULL;
     oracle = run_oracle(sess, left, &op);
     sess->join_batch_bytes = 1u;
     eval_stack_init(&stack);
@@ -1391,6 +1419,330 @@ out:
     if (left)
         col_rel_destroy(left);
     destroy_session(sess);
+}
+
+static void
+test_join_batch_eligibility_order(void)
+{
+    wl_col_session_t session;
+    wl_col_session_t worker;
+
+    TEST("bounded join eligibility has deterministic exclusion ordering");
+    memset(&session, 0, sizeof(session));
+    memset(&worker, 0, sizeof(worker));
+    session.join_batch_bytes = 4096;
+    worker.join_batch_bytes = 4096;
+    worker.coordinator = &session;
+    if (col_join_batch_eligibility(NULL, 1, true, true)
+        != COL_JOIN_BATCH_EXCLUDED_OFF
+        || col_join_batch_eligibility(&session, 0, true, true)
+        != COL_JOIN_BATCH_EXCLUDED_CROSS
+        || col_join_batch_eligibility(&worker, 1, true, true)
+        != COL_JOIN_BATCH_EXCLUDED_WORKER
+        || col_join_batch_eligibility(&session, 1, true, true)
+        != COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT
+        || col_join_batch_eligibility(&session, 1, false, true)
+        != COL_JOIN_BATCH_EXCLUDED_FILTERED_RIGHT
+        || col_join_batch_eligibility(&session, 1, false, false)
+        != COL_JOIN_BATCH_ELIGIBLE) {
+        FAIL("eligibility precedence changed");
+        return;
+    }
+    PASS();
+}
+
+static bool
+run_operator_fallback_case(const char *label, wl_plan_op_t *op,
+    const wl_plan_op_t *oracle_op, fixture_t *f,
+    col_join_batch_eligibility_t reason)
+{
+    eval_stack_t stack;
+    eval_entry_t result = { 0 };
+    col_rel_t *oracle = NULL;
+    uint32_t before;
+    int rc;
+
+    oracle = run_oracle(f->sess, f->left, oracle_op);
+    f->sess->join_batch_bytes = 9u * 32u;
+    before = f->sess->join_batch_fallback_count;
+    eval_stack_init(&stack);
+    if (eval_stack_push(&stack, f->left, false) != 0)
+        goto fail;
+    rc = col_op_join(op, &stack, f->sess);
+    if (rc != 0 || stack.top != 1u)
+        goto fail;
+    result = eval_stack_pop(&stack);
+    if (!result.owned || !oracle || !same_rows(oracle, result.rel)
+        || f->sess->join_batch_fallback_count != before + 1u
+        || f->sess->join_batch_last_reason != reason)
+        goto fail;
+    col_rel_destroy(result.rel);
+    result.rel = NULL;
+    f->sess->join_batch_strict = true;
+    f->sess->join_batch_fallback_count = before;
+    eval_stack_init(&stack);
+    if (eval_stack_push(&stack, f->left, false) != 0)
+        goto fail;
+    rc = col_op_join(op, &stack, f->sess);
+    f->sess->join_batch_strict = false;
+    if (rc != ENOTSUP || stack.top != 0u
+        || f->sess->join_batch_fallback_count != before)
+        goto fail;
+    col_rel_destroy(oracle);
+    return true;
+fail:
+    f->sess->join_batch_strict = false;
+    if (result.owned)
+        col_rel_destroy(result.rel);
+    if (oracle)
+        col_rel_destroy(oracle);
+    printf("%s ", label);
+    return false;
+}
+
+static void
+test_operator_delta_and_filter_fallbacks(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1, 1, 0 };
+    col_rel_t *delta = NULL;
+    wl_plan_op_t delta_op;
+    wl_plan_op_t filter_op;
+    wl_plan_op_t oracle_op;
+    static const uint8_t true_expr[] = { WL_PLAN_EXPR_BOOL, 1 };
+    bool ok = true;
+
+    TEST(
+        "delta-right and filtered-right fallbacks preserve oracle and strict mode");
+    if (!fixture_init(&f, 1u << 24, keys, 4, 2, 4)) {
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    delta = make_right(2, 4);
+    if (!delta || register_relation(f.sess, &delta, "$d$right") != 0) {
+        FAIL("delta relation");
+        col_rel_destroy(delta);
+        fixture_fini(&f);
+        return;
+    }
+    delta_op = f.op;
+    delta_op.delta_mode = WL_DELTA_FORCE_DELTA;
+    oracle_op = f.op;
+    ok = run_operator_fallback_case("delta-right", &delta_op, &oracle_op, &f,
+            COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT);
+    filter_op = f.op;
+    filter_op.right_filter_expr.data = (uint8_t *)(uintptr_t)true_expr;
+    filter_op.right_filter_expr.size = sizeof(true_expr);
+    ok = run_operator_fallback_case("filtered-right", &filter_op, &oracle_op,
+            &f,
+            COL_JOIN_BATCH_EXCLUDED_FILTERED_RIGHT) && ok;
+    if (ok)
+        PASS();
+    else
+        FAIL("operator fallback matrix");
+    fixture_fini(&f);
+}
+
+static void
+test_stale_by_arrangement_rebuild(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0 };
+    wl_columnar_continuation_t *cont = NULL;
+    wl_columnar_continuation_sink_t sink;
+    col_join_batch_relation_sink_t sctx;
+    const col_arr_entry_t *entry;
+    col_join_batch_cursor_t cur;
+    uint32_t rows;
+    wl_columnar_continuation_status_t st;
+
+    TEST("arrangement rebuild stales a continuation and releases its pin");
+    if (!fixture_init(&f, 1u << 24, keys, 1, 1, 20)
+        || col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1, 3u * 32u, &cont) != 0
+        || col_join_batch_relation_sink_init(&sctx, &sink, f.sess, f.out)
+        != 0) {
+        FAIL("fixture or producer");
+        if (cont)
+            wl_columnar_continuation_destroy(cont);
+        fixture_fini(&f);
+        return;
+    }
+    entry = find_entry(f.sess, "right");
+    st = wl_columnar_continuation_publish(cont, &sink);
+    rows = f.out->nrows;
+    if (st != WL_COLUMNAR_CONTINUATION_OK || rows == 0 || !entry
+        || entry->pin_count != 1) {
+        FAIL("initial publish did not establish a pinned arrangement");
+        goto out;
+    }
+    wl_columnar_arrangement_test_force_stale(f.sess, "right");
+    st = wl_columnar_continuation_publish(cont, &sink);
+    if (st != WL_COLUMNAR_CONTINUATION_STALE || f.out->nrows != rows
+        || !col_join_batch_cursor_get(cont, &cur)
+        || cur.sequence != 1u || entry->pin_count != 1) {
+        FAIL("stale rebuild changed output or cursor state");
+        goto out;
+    }
+    wl_columnar_continuation_destroy(cont);
+    cont = NULL;
+    if (entry->pin_count != 0) {
+        FAIL("stale continuation did not release its arrangement pin");
+        goto out;
+    }
+    PASS();
+out:
+    if (cont)
+        wl_columnar_continuation_destroy(cont);
+    fixture_fini(&f);
+}
+
+static void
+test_sink_prepare_resize_failure(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0 };
+    wl_columnar_continuation_t *cont = NULL;
+    wl_columnar_continuation_sink_t sink;
+    col_join_batch_relation_sink_t sctx;
+    col_join_batch_cursor_t before;
+    uint64_t reserved;
+    uint32_t rows;
+    wl_columnar_continuation_status_t st;
+
+    TEST("relation sink classifies resize preparation failure and retries");
+    if (!fixture_init(&f, 1u << 24, keys, 1, 1, 100)
+        || col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1, 16u * 32u, &cont) != 0
+        || col_join_batch_relation_sink_init(&sctx, &sink, f.sess, f.out)
+        != 0
+        || !col_join_batch_cursor_get(cont, &before)) {
+        FAIL("fixture or producer");
+        if (cont)
+            wl_columnar_continuation_destroy(cont);
+        fixture_fini(&f);
+        return;
+    }
+    for (uint32_t i = 0; i < 4u; i++) {
+        st = wl_columnar_continuation_publish(cont, &sink);
+        if (st != WL_COLUMNAR_CONTINUATION_OK) {
+            FAIL("setup publish did not fill the output capacity");
+            goto out;
+        }
+    }
+    rows = f.out->nrows;
+    if (rows != 64u) {
+        FAIL("setup publishes did not fill the output capacity");
+        goto out;
+    }
+    reserved = reserved_of(f.sess);
+    wl_columnar_relation_test_fail_next_prepare_resize();
+    st = wl_columnar_continuation_publish(cont, &sink);
+    if (st != WL_COLUMNAR_CONTINUATION_SINK_FAILURE
+        || f.out->nrows != rows || reserved_of(f.sess) != reserved
+        || !col_join_batch_cursor_get(cont, &before)
+        || before.sequence != 4u) {
+        FAIL("resize preparation failure was misclassified or not rolled back");
+        goto out;
+    }
+    st = wl_columnar_continuation_publish(cont, &sink);
+    if (st != WL_COLUMNAR_CONTINUATION_OK || f.out->nrows != 80u) {
+        FAIL("retry after resize preparation failure did not commit");
+        goto out;
+    }
+    PASS();
+out:
+    wl_columnar_relation_test_clear_prepare_resize();
+    if (cont)
+        wl_columnar_continuation_destroy(cont);
+    fixture_fini(&f);
+}
+
+static void
+test_cross_key_collision_boundary(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0 };
+    col_arrangement_t *arr;
+    const col_arr_entry_t *entry;
+    uint32_t head = UINT32_MAX;
+    uint32_t next = UINT32_MAX;
+    uint32_t bucket;
+    wl_columnar_continuation_t *cont = NULL;
+    wl_columnar_continuation_sink_t sink;
+    col_join_batch_relation_sink_t sctx;
+    col_join_batch_cursor_t cur;
+    wl_columnar_continuation_status_t st;
+    bool found = false;
+
+    TEST("cross-key hash collision is preserved at a batch boundary");
+    if (!fixture_init(&f, 1u << 24, keys, 1, 1024, 1)) {
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    arr = col_session_get_arrangement((wl_session_t *)f.sess, "right", KEY0,
+            1);
+    entry = find_entry(f.sess, "right");
+    if (!arr || !entry || arr->nbuckets == 0) {
+        FAIL("arrangement");
+        fixture_fini(&f);
+        return;
+    }
+    for (bucket = 0; bucket < arr->nbuckets && !found; bucket++) {
+        uint64_t tagged = arr->ht_head[bucket];
+        uint32_t row = tagged == UINT64_MAX
+            ? UINT32_MAX : (uint32_t)(tagged & UINT64_C(0xffffffff));
+        while (row != UINT32_MAX) {
+            uint32_t candidate = arr->ht_next[row];
+            if (candidate != UINT32_MAX
+                && f.right->columns[0][row]
+                != f.right->columns[0][candidate]) {
+                head = row;
+                next = candidate;
+                found = true;
+                break;
+            }
+            row = candidate;
+        }
+    }
+    if (!found || col_rel_set_raw(f.left, 0, 0, f.right->columns[0][head])
+        != 0
+        || col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1, 1u * 32u, &cont) != 0
+        || col_join_batch_relation_sink_init(&sctx, &sink, f.sess, f.out)
+        != 0) {
+        FAIL("could not construct a cross-key collision boundary");
+        if (cont)
+            wl_columnar_continuation_destroy(cont);
+        fixture_fini(&f);
+        return;
+    }
+    st = wl_columnar_continuation_publish(cont, &sink);
+    if (st != WL_COLUMNAR_CONTINUATION_OK || f.out->nrows != 1u
+        || !col_join_batch_cursor_get(cont, &cur) || cur.next.lr != 0u
+        || cur.next.rr != next) {
+        FAIL("collision row was not retained as the resume boundary");
+        goto out;
+    }
+    if (col_join_batch_run_to_relation(cont, f.sess, f.out) != 0) {
+        FAIL("collision retry failed");
+        goto out;
+    }
+    {
+        col_rel_t *oracle = run_oracle(f.sess, f.left, &f.op);
+        if (!oracle || !same_rows(oracle, f.out))
+            FAIL("collision result differs from oracle");
+        else
+            PASS();
+        if (oracle)
+            col_rel_destroy(oracle);
+    }
+out:
+    if (cont)
+        wl_columnar_continuation_destroy(cont);
+    fixture_fini(&f);
 }
 
 /* (11b) Session creation parses the knobs strictly. */
@@ -1460,6 +1812,11 @@ main(void)
     test_operator_no_arrangement_probe_failure();
     test_producer_empty_right_single_lease();
     test_operator_empty_right_and_row_too_large();
+    test_join_batch_eligibility_order();
+    test_operator_delta_and_filter_fallbacks();
+    test_stale_by_arrangement_rebuild();
+    test_sink_prepare_resize_failure();
+    test_cross_key_collision_boundary();
     test_env_parse();
     printf("\n  %d tests: %d passed, %d failed\n", tests_run, tests_passed,
         tests_failed);
