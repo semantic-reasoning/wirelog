@@ -1512,6 +1512,25 @@ wl_columnar_arrangement_probe_test_clear(void)
     wl_columnar_arrangement_probe_test_failure_rc = 0;
 }
 
+void
+wl_columnar_arrangement_test_force_stale(wl_col_session_t *sess,
+    const char *rel_name)
+{
+    if (!sess || !rel_name)
+        return;
+    /* Change only the generation observed by an active producer.  The lease
+     * and indexed storage remain intact so cleanup can be asserted. */
+    for (uint32_t i = 0; i < sess->arr_count; i++) {
+        col_arr_entry_t *entry = &sess->arr_entries[i];
+        if (entry->rel_name && strcmp(entry->rel_name, rel_name) == 0) {
+            entry->arr.generation++;
+            if (entry->arr.generation == 0)
+                entry->arr.generation = 1;
+            return;
+        }
+    }
+}
+
 static int
 wl_columnar_arrangement_probe_test_take_failure(void)
 {
