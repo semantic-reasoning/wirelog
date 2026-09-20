@@ -25,4 +25,14 @@ const char *
 wl_columnar_join_pipeline_eligibility_name(
     wl_columnar_join_pipeline_eligibility_t reason);
 
+/* Consume an eligible JOIN -> FILTER* -> projection MAP pipeline directly
+ * from a bounded join continuation.  Returns 0 when the shape is not
+ * eligible, 1 when the pipeline was evaluated and pushed, or an errno value
+ * when an eligible pipeline could not be completed.  The caller may then
+ * restore the original stack entry and use the ordinary join path. */
+int
+wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
+    uint32_t join_index, eval_stack_t *stack, wl_col_session_t *sess,
+    uint32_t *next_index);
+
 #endif /* WL_COLUMNAR_JOIN_PIPELINE_H */

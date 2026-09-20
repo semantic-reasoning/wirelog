@@ -36,6 +36,7 @@ typedef enum {
     COL_JOIN_BATCH_EXCLUDED_WORKER = 5,         /* TDD worker session */
     COL_JOIN_BATCH_EXCLUDED_NO_ARRANGEMENT = 6, /* no persistent arrangement */
     COL_JOIN_BATCH_EXCLUDED_ROW_TOO_LARGE = 7,  /* batch budget < one row */
+    COL_JOIN_BATCH_EXCLUDED_PIPELINE = 8,       /* downstream not consumable */
 } col_join_batch_eligibility_t;
 
 col_join_batch_eligibility_t

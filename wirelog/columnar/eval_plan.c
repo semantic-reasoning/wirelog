@@ -7,6 +7,8 @@
 #define _GNU_SOURCE
 
 #include "columnar/internal.h"
+#include "columnar/join_batch.h"
+#include "columnar/join_pipeline.h"
 #include "wirelog/util/log.h"
 
 #include "../wirelog-internal.h"
@@ -141,6 +143,31 @@ normal_eval:
             rc = wl_columnar_filter_op(op, stack, sess);
             break;
         case WL_PLAN_OP_JOIN:
+            if (!sess->diff_operators_active && sess->join_batch_bytes > 0) {
+                uint32_t next_index = i;
+                int pipeline_rc = wl_columnar_join_pipeline_try_eval(rplan, i,
+                        stack, sess, &next_index);
+                if (pipeline_rc == 1) {
+                    i = next_index;
+                    continue;
+                }
+                if (pipeline_rc != 0 && pipeline_rc != ENOENT
+                    && pipeline_rc != ENOTSUP && pipeline_rc != EAGAIN)
+                    return pipeline_rc;
+                /* A final JOIN already has a supported bounded relation sink
+                 * in wl_columnar_join_op().  Only a JOIN with downstream
+                 * operators is a pipeline request that strict mode must
+                 * reject when this fused consumer cannot handle it. */
+                bool has_downstream = i + 1u < rplan->op_count;
+                if (pipeline_rc == 0 && !has_downstream)
+                    goto ordinary_join;
+                col_join_batch_record_fallback(sess,
+                    COL_JOIN_BATCH_EXCLUDED_PIPELINE);
+                if (sess->join_batch_strict) {
+                    return ENOTSUP;
+                }
+            }
+ordinary_join:
             rc = sess->diff_operators_active
                 ? wl_columnar_join_diff_op(op, stack, sess)
                 : wl_columnar_join_op(op, stack, sess);
