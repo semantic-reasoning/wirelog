@@ -22,7 +22,7 @@ K-Fusion inline compound execution must satisfy 5 invariants across all phases:
   - K=1 vs K=4 fingerprint match proves multiplicity preservation across workers
   - **Evidence**: All K values produce identical fingerprint when input is identical
 
-- `test_inline_authorization_multiworker` (tests/test_inline_authorization_multiworker.c)
+- `test_nonrecursive_multiworker_authorization` (tests/test_nonrecursive_multiworker_authorization.c)
   - Authorization use case with inline scopes; 20 inserts validated against K=1 baseline
   - K=1 vs K=4 fingerprint equivalence confirms Z-set consolidation correctness
   - **Evidence**: Fingerprint(K=1) == Fingerprint(K=4) for identical insert sequences
@@ -133,7 +133,7 @@ K-Fusion inline compound execution must satisfy 5 invariants across all phases:
 | Invariant | #1 Z-set | #2 C11 | #3 SIMD | #4 Isolation | #5 Backend |
 |-----------|---------|--------|--------|--------------|-----------|
 | k_fusion_correctness | ✓✓✓ | ✓ | - | ✓✓ | ✓ |
-| inline_authorization_multiworker | ✓✓ | ✓ | - | ✓ | ✓ |
+| nonrecursive_multiworker_authorization | ✓✓ | ✓ | - | ✓ | ✓ |
 | inline_concurrent_read | ✓✓✓ | ✓ | ✓ | ✓✓ | ✓ |
 | diff_arrangement_inline_shadow | ✓✓ | ✓ | - | ✓✓✓ | - |
 | simd_row_cmp | - | ✓ | ✓✓ | - | ✓ |
@@ -155,7 +155,7 @@ Legend: ✓ = covered, ✓✓ = strong coverage, ✓✓✓ = primary proof
 - [ ] C11 compliance: `ninja -C build -k0` with -std=c11 -pedantic (zero warnings)
 - [ ] SIMD throughput: test_simd_row_cmp baseline established (optional: compare K=1 vs K=4)
 - [ ] Z-set equivalence: k_fusion_correctness fingerprints K=1 == K=2 == K=4 == K=8
-- [ ] Authorization use case: inline_authorization_multiworker passes with 20/50-row auth fact graphs
+- [ ] Authorization use case: nonrecursive_multiworker_authorization passes with 20/50-row auth fact graphs
 
 ---
 
@@ -164,7 +164,7 @@ Legend: ✓ = covered, ✓✓ = strong coverage, ✓✓✓ = primary proof
 **Verifier**: Multi-worker K-Fusion inline compound execution is verified to satisfy all 5 invariants across test suite.
 
 **Evidence Summary**:
-1. Fingerprint-based Z-set validation across K=1,2,4,8 (test_k_fusion_correctness + inline_authorization_multiworker)
+1. Fingerprint-based Z-set validation across K=1,2,4,8 (test_k_fusion_correctness + nonrecursive_multiworker_authorization)
 2. TSan/ASan stress validation of per-worker isolation (inline_concurrent_read, e2e_asan_side_relation_nested)
 3. Deep-copy isolation proof via arrangement indices audit (diff_arrangement_inline_shadow, diff_arrangement.c)
 4. Backend-agnostic executor wiring (pending Task #1 completion; plan_gen audit + proposed inline_compound_wiring tests)
