@@ -9220,6 +9220,295 @@ cleanup:
 #undef SKIP_CHECK
 }
 
+/* ------------------------------------------------------------------
+ * #1661 U3: a refused terminal delta removal propagates out of
+ * col_eval_stratum.
+ *
+ * The seam is the frontier vtable.  record_rule_convergence fires in the
+ * unconditional loop below the fixpoint loop and above both the completion
+ * point and the terminal removal, so a delta registered from there is the
+ * only one the epilogue sees -- the loop's own per-sub-pass removals have
+ * already cleared the real ones.  The same shim counts arena rotations, so
+ * the teardown assertion pins where the teardown runs rather than depending
+ * on where this fixture happens to converge.
+ * ------------------------------------------------------------------ */
+static col_frontier_ops_t u3_ops;
+static bool u3_inject;
+static bool u3_inject_second;
+static bool u3_injected;
+static bool u3_second_present;
+static const col_frontier_ops_t *u3_saved_frontier_ops;
+static const col_rotation_ops_t *u3_saved_rotation_ops;
+static wl_columnar_source_access_reader_t u3_held;
+/* The per-sub-pass epilogue resets the pool and rotates the arena before the
+ * convergence break, so by the terminal epilogue both are already clean and no
+ * state assertion can tell whether the terminal teardown ran -- comparing
+ * delta_pool->slot_used across refused calls is 0 == 0.  Count the rotations
+ * instead and latch the count at the convergence record, which is a
+ * production call site below the stride loop, so exactly one rotation -- the
+ * teardown -- follows.  That pins the teardown's position rather than its
+ * effect, and measures production rather than the instrumentation. */
+static col_rotation_ops_t u3_rot_ops;
+static unsigned u3_rotations;
+static unsigned u3_rotations_at_convergence;
+
+static void
+u3_record_rule_convergence(void *arg, uint32_t rule_id, uint32_t outer_epoch,
+    uint32_t iteration)
+{
+    wl_col_session_t *sess = (wl_col_session_t *)arg;
+
+    if (u3_inject && !u3_injected) {
+        u3_injected = true;
+        /* Empty: eval_serial.c dereferences delta->timestamps[row]
+         * unconditionally when delta->nrows > 0, and a hand-built relation
+         * has no timestamp array. */
+        col_rel_t *da = col_rel_new_auto("$d$a", 1);
+        if (da && session_add_rel(sess, da) == 0)
+            (void)col_rel_source_reader_acquire(da, &u3_held);
+        if (u3_inject_second) {
+            col_rel_t *db = col_rel_new_auto("$d$b", 1);
+            if (db && session_add_rel(sess, db) == 0)
+                u3_second_present =
+                    session_find_rel(sess, "$d$b") != NULL;
+        }
+    }
+    /* Latch here rather than in a hook of our own: this fires after the
+     * stride loop and after every per-sub-pass rotation, so exactly one
+     * rotation -- the terminal teardown -- follows.  Anchoring on a
+     * production call site makes the assertion measure the teardown instead
+     * of measuring the instrumentation.  Delegate so the real frontier is
+     * still recorded. */
+    u3_rotations_at_convergence = u3_rotations;
+    u3_saved_frontier_ops->record_rule_convergence(arg, rule_id, outer_epoch,
+        iteration);
+}
+
+static void
+u3_rotate_eval_arena(struct wl_col_session_t *sess)
+{
+    u3_rotations++;
+    u3_saved_rotation_ops->rotate_eval_arena(sess);
+}
+
+static void
+u3_install_shim(wl_col_session_t *sess)
+{
+    u3_saved_frontier_ops = sess->frontier_ops;
+    u3_ops = *sess->frontier_ops;
+    u3_ops.record_rule_convergence = u3_record_rule_convergence;
+    sess->frontier_ops = &u3_ops;
+    /* Copy from the session's own vtable and restore that exact pointer:
+     * WIRELOG_ROTATION=pinned selects a different one, and the suite sets
+     * that variable elsewhere. */
+    u3_saved_rotation_ops = sess->rotation_ops;
+    u3_rot_ops = *sess->rotation_ops;
+    u3_rot_ops.rotate_eval_arena = u3_rotate_eval_arena;
+    sess->rotation_ops = &u3_rot_ops;
+}
+
+static void
+test_terminal_removal_propagates(void)
+{
+    TEST(
+        "terminal removal: a refused delta propagates and the retry converges");
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" }
+    };
+    wl_plan_relation_t relation = { .name = "a", .delta_name = "$d$a",
+                                    .ops = ops, .op_count = 1 };
+    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1,
+                                  .is_recursive = true };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess = NULL;
+    const char *failure = NULL;
+    int64_t one = 1, two = 2;
+#define TRP_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    memset(&u3_held, 0, sizeof(u3_held));
+    u3_inject = true; u3_inject_second = false; u3_injected = false;
+    u3_rotations = 0; u3_rotations_at_convergence = 0;
+    /* One worker: frontier_ops is copied bitwise into worker sessions, so a
+     * wider pool would leak the shim and race the inject-once guard. */
+    TRP_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "create");
+    sess = COL_SESSION(session);
+    u3_install_shim(sess);
+    TRP_CHECK(wl_session_insert(session, "input", &one, 1, 1) == 0,
+        "seed input");
+
+    TRP_CHECK(col_eval_stratum(&stratum, sess, 0) == EBUSY,
+        "refusal did not propagate");
+    TRP_CHECK(u3_injected, "shim never fired");
+    TRP_CHECK(session_find_rel(sess, "$d$a") != NULL,
+        "refusal lost the registry owner");
+    /* Read after return is outside the field contract; asserted only to show
+     * the refusal does not clear it. */
+    TRP_CHECK(sess->eval_stratum_heads_final,
+        "refusal cleared the completion flag");
+
+    /* The teardown must stay reachable on the refusal path: exactly one arena
+     * rotation after the convergence record.  Returning above it would leave
+     * pool and arena usage growing on every retry. */
+    TRP_CHECK(u3_rotations == u3_rotations_at_convergence + 1,
+        "refusal path skipped the allocator teardown");
+    for (int attempt = 0; attempt < 2; attempt++) {
+        unsigned before = u3_rotations;
+        TRP_CHECK(col_eval_stratum(&stratum, sess, 0) == EBUSY,
+            "repeat refusal changed its verdict");
+        TRP_CHECK(u3_rotations > before
+            && u3_rotations == u3_rotations_at_convergence + 1,
+            "repeat refusal skipped the allocator teardown");
+    }
+
+    /* Retry with no insert first, as a retry-idempotence guard.  It is not
+     * evidence about the frontier: epoch_init_stratum rewrites a recorded
+     * iteration of 0 back to UINT32_MAX at the top of every recursive call
+     * and this fixture converges at 0, so the stratum skip predicate never
+     * fires here whatever the epoch.  It leaves rule_frontiers alone, so the
+     * rule predicate does fire from effective iteration 1 -- which is why
+     * this retry exercises a partially skipped stride and still reaches the
+     * sweep.  Why no reset is needed is structural and lives at the
+     * sweep. */
+    TRP_CHECK(col_rel_source_reader_release(&u3_held) == 0, "release");
+    u3_inject = false;
+    TRP_CHECK(col_eval_stratum(&stratum, sess, 0) == 0,
+        "same-epoch retry did not clear");
+    TRP_CHECK(session_find_rel(sess, "$d$a") == NULL,
+        "same-epoch retry left the delta registered");
+    TRP_CHECK(wl_session_insert(session, "input", &two, 1, 1) == 0,
+        "second input");
+    TRP_CHECK(col_eval_stratum(&stratum, sess, 0) == 0, "retry did not clear");
+    TRP_CHECK(session_find_rel(sess, "$d$a") == NULL,
+        "retry left the delta registered");
+    col_rel_t *head = session_find_rel(sess, "a");
+    TRP_CHECK(head && head->nrows == 2, "retry did not derive both rows");
+cleanup:
+    u3_inject = false;
+    if (u3_held.owner)
+        (void)col_rel_source_reader_release(&u3_held);
+    if (sess) {
+        if (u3_saved_frontier_ops)
+            sess->frontier_ops = u3_saved_frontier_ops;
+        if (u3_saved_rotation_ops)
+            sess->rotation_ops = u3_saved_rotation_ops;
+    }
+    if (session)
+        wl_session_destroy(session);
+    if (failure)
+        FAIL(failure);
+    else
+        PASS();
+#undef TRP_CHECK
+}
+
+static void
+test_terminal_removal_enoent_is_not_a_failure(void)
+{
+    TEST("terminal removal: ENOENT does not fail the stratum");
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" }
+    };
+    wl_plan_relation_t relation = { .name = "a", .delta_name = "$d$a",
+                                    .ops = ops, .op_count = 1 };
+    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1,
+                                  .is_recursive = true };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess = NULL;
+    const char *failure = NULL;
+    int64_t one = 1;
+#define TRE_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    u3_inject = false; u3_inject_second = false; u3_injected = false;
+    TRE_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "create");
+    sess = COL_SESSION(session);
+    u3_install_shim(sess);
+    TRE_CHECK(wl_session_insert(session, "input", &one, 1, 1) == 0, "seed");
+    TRE_CHECK(col_eval_stratum(&stratum, sess, 0) == 0,
+        "ENOENT was treated as a failure");
+cleanup:
+    if (sess) {
+        if (u3_saved_frontier_ops)
+            sess->frontier_ops = u3_saved_frontier_ops;
+        if (u3_saved_rotation_ops)
+            sess->rotation_ops = u3_saved_rotation_ops;
+    }
+    if (session)
+        wl_session_destroy(session);
+    if (failure)
+        FAIL(failure);
+    else
+        PASS();
+#undef TRE_CHECK
+}
+
+static void
+test_terminal_removal_sweeps_past_refusal(void)
+{
+    TEST("terminal removal: a refusal does not abandon the rest of the sweep");
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" }
+    };
+    /* "a" must be relations[0]: if the refused relation came second the sweep
+     * would remove $d$b before ever reaching the refusal. */
+    wl_plan_relation_t relations[] = {
+        { .name = "a", .delta_name = "$d$a", .ops = ops, .op_count = 1 },
+        { .name = "b", .delta_name = "$d$b", .ops = ops, .op_count = 1 }
+    };
+    wl_plan_stratum_t stratum = { .relations = relations, .relation_count = 2,
+                                  .is_recursive = true };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess = NULL;
+    const char *failure = NULL;
+    int64_t one = 1;
+#define TRS_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    memset(&u3_held, 0, sizeof(u3_held));
+    u3_inject = true; u3_inject_second = true; u3_injected = false;
+    u3_second_present = false;
+    TRS_CHECK(strcmp(relations[0].name, "a") == 0,
+        "fixture order changed; the refused relation must be first");
+    TRS_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "create");
+    sess = COL_SESSION(session);
+    u3_install_shim(sess);
+    TRS_CHECK(wl_session_insert(session, "input", &one, 1, 1) == 0, "seed");
+    TRS_CHECK(col_eval_stratum(&stratum, sess, 0) == EBUSY, "no refusal");
+    /* Without this the next assertion is satisfied by a relation that was
+     * never registered, which proves nothing about the sweep. */
+    TRS_CHECK(u3_second_present, "the second delta was never registered");
+    TRS_CHECK(session_find_rel(sess, "$d$a") != NULL, "refused owner lost");
+    TRS_CHECK(session_find_rel(sess, "$d$b") == NULL,
+        "sweep stopped at the first refusal");
+cleanup:
+    u3_inject = false; u3_inject_second = false;
+    if (u3_held.owner)
+        (void)col_rel_source_reader_release(&u3_held);
+    if (sess) {
+        if (u3_saved_frontier_ops)
+            sess->frontier_ops = u3_saved_frontier_ops;
+        if (u3_saved_rotation_ops)
+            sess->rotation_ops = u3_saved_rotation_ops;
+    }
+    if (session)
+        wl_session_destroy(session);
+    if (failure)
+        FAIL(failure);
+    else
+        PASS();
+#undef TRS_CHECK
+}
+
 static void
 test_persistent_delta_rollback(bool destroy_pending)
 {
@@ -11178,6 +11467,9 @@ main(void)
     test_eval_stratum_heads_final(true, true);
     test_heads_final_recursive_agg_failure();
     test_heads_final_skips_restore();
+    test_terminal_removal_propagates();
+    test_terminal_removal_enoent_is_not_a_failure();
+    test_terminal_removal_sweeps_past_refusal();
     test_persistent_delta_rollback(false);
     test_persistent_delta_rollback(true);
     test_delta_rollback_preserves_progress(false, false);

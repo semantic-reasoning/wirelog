@@ -858,8 +858,9 @@ and generic sorting/consolidation provenance remains #1689.
 K-Fusion refusal handling (#1648, and the parallel-branch retention orphan
 #1765) still precedes closing #1384; #1661's
 integration audit is discharged for the framed callers. What remains there is
-propagating a refused delta removal out of `col_eval_stratum` and the TDD
-delta-exchange paths, plus the worker-registry gap: `col_worker_session_create`
+the per-sub-pass delta removal, which stays a discard deliberately now that
+the terminal one propagates; the TDD delta-exchange paths; and the
+worker-registry gap: `col_worker_session_create`
 writes partitions straight into the registry without the pool and arena
 promotion `session_add_rel` performs. Pool/arena relations cannot use the
 heap-only deferred registry, and a live reader prevents promoting their
