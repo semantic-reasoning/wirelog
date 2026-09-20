@@ -241,7 +241,7 @@ per row.
 
 Invariant coverage: Z-set transparency is validated by
 `tests/test_k_fusion_correctness.c` (K=1 vs K=4 fingerprint equivalence) and
-`tests/test_inline_authorization_multiworker.c` (authorization use case). TSan cleanliness
+`tests/test_nonrecursive_multiworker_authorization.c` (authorization use case). TSan cleanliness
 under K=4 x 10k iterations is validated by
 `tests/test_inline_concurrent_read.c`. See
 `docs/k-fusion-5-invariant-audit.md` for the full coverage matrix.
