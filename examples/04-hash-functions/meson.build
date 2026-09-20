@@ -30,4 +30,5 @@ test(
   ],
   depends: wirelog_cli,
   suite: 'examples',
+  timeout: 120,
 )

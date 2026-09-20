@@ -29,4 +29,5 @@ test(
   ],
   depends: retract_demo,
   suite: 'examples',
+  timeout: 120,
 )

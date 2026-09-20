@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enforce the shell-gate timeout rule over Meson's introspected tests (#1464).
+"""Enforce timeout coverage for process-spawning Meson tests (#1464/#1488).
 
 Every test whose command runs a shell script (argv[0] is a ``.sh`` file, or
 argv[0] is ``bash``/``sh`` and argv[1] is a ``.sh`` file) must carry an
@@ -12,15 +12,13 @@ justifies it in tests/meson.build.  Timeouts are hang detectors; this gate
 never measures wall time (that gap is recorded separately).
 
 The rule is suite-agnostic on purpose: suite membership is not a proxy for
-platform exposure, and the #1462 outage was a bash gate inheriting the default
-on the Windows runner.  Between them the Linux and macOS introspections see
-every shell registration in tests/meson.build (Linux covers the
-``if not is_windows`` block, macOS the ``darwin`` block); the gate SKIPs
-(exit 77) on other platforms and when the build directory or its
-introspection is missing.  ``WIRELOG_ABI_REQUIRED=1`` turns every skip into a
-failure.  Tests seeded by python3 or any other non-shell interpreter are
-outside the rule by construction.  The classifier is shared with
-check-bash-constructs.py so both gates agree on which tests are shell-seeded.
+platform exposure.  It covers shell registrations on every platform and
+Python registrations whose script makes an actual subprocess or OS process
+call; pure in-process Python tests remain outside the rule.  The gate SKIPs
+(exit 77) when the build directory or its introspection is missing.
+``WIRELOG_ABI_REQUIRED=1`` turns every skip into a failure.  The shell
+classifier is shared with check-bash-constructs.py so both gates agree on
+which tests are shell-seeded.
 
 Usage: check-shell-gate-timeouts.py <builddir>
 """
@@ -28,6 +26,7 @@ Usage: check-shell-gate-timeouts.py <builddir>
 from __future__ import annotations
 
 import importlib.util
+import ast
 import json
 import os
 import sys
@@ -38,6 +37,9 @@ from pathlib import Path
 MESON_DEFAULT_TIMEOUT = 30
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+SOURCE_ROOT = SCRIPT_DIR.parents[1]
+PYTHON_PROCESS_CALLS = frozenset({"run", "Popen", "call", "check_call", "check_output"})
+OS_PROCESS_CALLS = frozenset({"system", "popen", "spawn", "spawnv", "spawnve"})
 
 
 def fail(message: str) -> int:
@@ -69,6 +71,53 @@ def load_classifier():
     return module.shell_seed_from_cmd
 
 
+def python_process_seed_from_cmd(cmd: object, root: Path = SOURCE_ROOT) -> str | None:
+    """Return the Python script when its AST contains a process launch.
+
+    Python tests which only exercise functions in-process stay outside this
+    rule.  Looking for actual calls, rather than merely an ``import
+    subprocess``, also keeps self-tests that patch subprocess objects out of
+    the process-spawning set.
+    """
+    if not isinstance(cmd, list) or len(cmd) < 2:
+        return None
+    interpreter = Path(str(cmd[0])).name.lower()
+    if interpreter not in {"python", "python.exe", "python3", "python3.exe", "py.exe"} and not interpreter.startswith("python3."):
+        return None
+    script = next((str(arg) for arg in cmd[1:] if str(arg).endswith(".py")), None)
+    if script is None:
+        return None
+    path = Path(script)
+    if not path.is_absolute():
+        path = root / path
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, SyntaxError):
+        return None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr in PYTHON_PROCESS_CALLS and isinstance(node.func.value, ast.Name) and node.func.value.id == "subprocess":
+            return str(path)
+        if node.func.attr in OS_PROCESS_CALLS and isinstance(node.func.value, ast.Name) and node.func.value.id == "os":
+            return str(path)
+    return None
+
+
+def powershell_seed_from_cmd(cmd: object) -> str | None:
+    if not isinstance(cmd, list) or not cmd:
+        return None
+    first = Path(str(cmd[0])).name.lower()
+    if first.endswith(".ps1"):
+        return str(cmd[0])
+    if first not in {"pwsh", "pwsh.exe", "powershell", "powershell.exe"}:
+        return None
+    for index, arg in enumerate(cmd[:-1]):
+        if str(arg).lower() in {"-file", "--file"} and str(cmd[index + 1]).lower().endswith(".ps1"):
+            return str(cmd[index + 1])
+    return None
+
+
 def shell_seeds(intro: Path) -> list[tuple[dict, str]]:
     """Return (test entry, shell script) for every shell-seeded test."""
     data = json.loads(intro.read_text(encoding="utf-8"))
@@ -85,11 +134,35 @@ def shell_seeds(intro: Path) -> list[tuple[dict, str]]:
     return seeds
 
 
+def python_process_seeds(intro: Path) -> list[tuple[dict, str]]:
+    """Return process-spawning Python tests from Meson's introspection."""
+    data = json.loads(intro.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("introspection is not a list of tests")
+    seeds: list[tuple[dict, str]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        script = python_process_seed_from_cmd(item.get("cmd"))
+        if script is not None:
+            seeds.append((item, script))
+    return seeds
+
+
+def powershell_seeds(intro: Path) -> list[tuple[dict, str]]:
+    data = json.loads(intro.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("introspection is not a list of tests")
+    return [(item, script) for item in data if isinstance(item, dict)
+            for script in [powershell_seed_from_cmd(item.get("cmd"))] if script is not None]
+
+
 def offenders_from_intro(intro: Path) -> tuple[int, list[str]]:
     """Return (shell-seeded test count, offender lines) for ``intro``."""
     checked = 0
     offenders: list[str] = []
-    for item, _ in shell_seeds(intro):
+    seeds = shell_seeds(intro) + powershell_seeds(intro) + python_process_seeds(intro)
+    for item, _ in seeds:
         checked += 1
         name = str(item.get("name", "?"))
         suites = item.get("suite")
@@ -117,8 +190,8 @@ def main(argv: list[str]) -> int:
     if len(argv) != 2:
         return fail("usage: check-shell-gate-timeouts.py <builddir>")
     build = Path(argv[1]).resolve()
-    if sys.platform not in ("linux", "darwin"):
-        return skip(f"introspection is checked on Linux and macOS only: {sys.platform}")
+    if sys.platform not in ("linux", "darwin", "win32"):
+        return skip(f"introspection is checked on Linux, macOS, and Windows only: {sys.platform}")
     if not build.is_dir():
         return skip(f"meson introspection unavailable: build directory missing: {build}")
     intro = build / "meson-info" / "intro-tests.json"
@@ -131,11 +204,12 @@ def main(argv: list[str]) -> int:
     if checked == 0:
         # "Nothing to check" and "the scan no longer matches registrations"
         # are the same result unless the count is floored.
-        return fail("introspection contained no shell-seeded tests; the "
-                    "classifier or tests/meson.build has changed shape")
+        return fail("introspection contained no shell-seeded or process-spawning "
+                    "Python tests; the classifier or tests/meson.build has changed shape")
     if offenders:
         return fail("\n".join(offenders))
-    print(f"check-shell-gate-timeouts: ok {checked} shell-seeded tests carry "
+    print(f"check-shell-gate-timeouts: ok {checked} shell-seeded or "
+          "process-spawning Python tests carry "
           f"an explicit positive timeout (none at the {MESON_DEFAULT_TIMEOUT}s default)")
     return 0
 

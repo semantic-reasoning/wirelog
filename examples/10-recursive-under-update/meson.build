@@ -29,4 +29,5 @@ test(
   ],
   depends: tc_demo,
   suite: 'examples',
+  timeout: 120,
 )
