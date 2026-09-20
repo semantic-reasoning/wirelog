@@ -47,10 +47,38 @@ wl_columnar_eval_test_submit(wl_work_queue_t *wq, void (*fn)(void *),
     return wl_workqueue_submit(wq, fn, ctx);
 }
 
+/* #1661 U4: stage a refusal at cohort teardown rather than at prior-delta
+ * retirement.  test_tdd_recursive's retirement test covers the retire path;
+ * this covers the gate below it -- col_worker_session_destroy tearing the
+ * worker registry down with checked destroys -- which is what makes the
+ * exchange-site session_remove_rel discards safe even on the branches that
+ * register nothing after a sweep. */
+static bool teardown_hold_armed;
+static bool teardown_hold_fired;
+static wl_columnar_source_access_reader_t teardown_reader;
+
 void
 wl_columnar_eval_test_before_worker_cleanup(wl_col_session_t *coord)
 {
-    (void)coord;
+    if (!teardown_hold_armed || teardown_hold_fired || !coord)
+        return;
+    /* Gate on a populated cohort.  Every TDD initializer calls
+     * tdd_cleanup_workers on entry with tdd_workers_count == 0, so an
+     * arm-once flag alone would be consumed before any worker exists and the
+     * test would pass without ever holding anything. */
+    if (coord->tdd_workers_count == 0)
+        return;
+    wl_col_session_t *worker = &coord->tdd_workers[0];
+    for (uint32_t i = 0; i < worker->nrels; i++) {
+        col_rel_t *rel = worker->rels[i];
+        if (!rel)
+            continue;
+        if (col_rel_source_reader_acquire_transferable(rel,
+            &teardown_reader) != 0)
+            continue;
+        teardown_hold_fired = true;
+        return;
+    }
 }
 
 typedef struct {
@@ -262,6 +290,110 @@ cleanup:
     return rc == 0 ? 0 : 1;
 }
 
+/* A reader held across worker teardown must fail the enclosing snapshot, keep
+ * the cohort for a retry, and clear once released.  If this ever passes with
+ * the snapshot returning 0, a worker relation stayed registered while the
+ * call reported success -- the contract #1661 names. */
+static int
+run_teardown_refusal_gate(void)
+{
+    const char *source =
+        ".decl edge(x: int32, y: int32)\n"
+        ".decl reach(x: int32, y: int32, p: pair/2 inline)\n"
+        "reach(x,y,7,8) :- edge(x,y).\n"
+        "reach(x,z,a,b) :- reach(x,y,a,b), edge(y,z).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    wl_plan_t *plan = NULL;
+    wl_session_t *session = NULL;
+    wl_col_session_t *columnar = NULL;
+    int rc;
+
+    if (!program)
+        return 1;
+    wl_fusion_apply(program, NULL);
+    wl_jpp_apply(program, NULL);
+    wl_sip_apply(program, NULL);
+    rc = wl_plan_from_program(program, &plan);
+    if (rc != 0 || !plan)
+        goto fail;
+    plan_fixture_hold(program);
+    rc = wl_session_create(wl_backend_columnar(), plan, 8, &session);
+    if (rc != 0)
+        goto fail;
+    columnar = COL_SESSION(session);
+    int64_t facts[200];
+    for (int i = 0; i < 100; i++) {
+        facts[i * 2] = (int64_t)i;
+        facts[i * 2 + 1] = (int64_t)i + 1;
+    }
+    rc = wl_session_insert(session, "edge", facts, 100, 2);
+    if (rc != 0)
+        goto cleanup;
+
+    memset(&teardown_reader, 0, sizeof(teardown_reader));
+    teardown_hold_armed = true;
+    teardown_hold_fired = false;
+    rc = snapshot_oracle(session, 5050, true);
+    /* The hook must have run on a populated cohort, or the assertions below
+     * would hold for want of anything to refuse. */
+    if (!teardown_hold_fired) {
+        rc = EIO;
+        goto cleanup;
+    }
+    /* A sanity guard, not the discriminating assertion.  The snapshot
+     * reports a generic 1 here both with and without the propagation
+     * under test, so this never fires on the mutation below.  It is kept
+     * because a snapshot reporting success outright would invalidate
+     * everything after it. */
+    if (rc == 0) {
+        rc = EIO;
+        goto cleanup;
+    }
+    /* This is the assertion that carries the test.  col_worker_session_destroy
+     * refuses at session.c's alias pass -- measured, relation_alias_rc == EBUSY
+     * with pool_alias_rc, relation_root_rc and pool_root_rc all 0, so the
+     * refusal travels out through the FIRST arm of that function's fold, not
+     * the relation_root_rc arm.  Dropping that arm makes the caller read the
+     * teardown as successful and retire the cohort: tdd_workers_count goes 8
+     * -> 0 and the retry below has nothing to run on. */
+    if (columnar->tdd_workers_count == 0) {
+        /* The cohort was retired despite the refusal -- the regression this
+         * gate exists to catch.  The worker relation the reader points at has
+         * been freed with it, so drop the reader without touching it rather
+         * than turning a clean failure into a use-after-free. */
+        memset(&teardown_reader, 0, sizeof(teardown_reader));
+        rc = EIO;
+        goto cleanup;
+    }
+
+    teardown_hold_armed = false;
+    if (col_rel_source_reader_release(&teardown_reader) != 0) {
+        rc = EIO;
+        goto cleanup;
+    }
+    rc = snapshot_oracle(session, 5050, true);
+    if (rc == 0 && columnar->tdd_workers_count != 0)
+        rc = EIO;
+cleanup:
+    teardown_hold_armed = false;
+    /* Release before destroy: col_session_destroy aborts when a worker
+     * teardown refuses. */
+    if (teardown_reader.owner)
+        (void)col_rel_source_reader_release(&teardown_reader);
+    if (session)
+        wl_session_destroy(session);
+    if (plan)
+        wl_plan_free(plan);
+    return rc == 0 ? 0 : 1;
+fail:
+    if (plan)
+        wl_plan_free(plan);
+    else if (program)
+        wirelog_program_free(program);
+    return 1;
+}
+
 int
 main(void)
 {
@@ -276,6 +408,8 @@ main(void)
         rc = run_lifecycle(8, false);
     if (rc == 0)
         rc = run_scalar_dispatch_probe();
+    if (rc == 0)
+        rc = run_teardown_refusal_gate();
     if (saved_threshold) {
         setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", saved_threshold, 1);
         free(saved_threshold);

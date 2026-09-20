@@ -3519,10 +3519,21 @@ test_tdd_retirement_actual_dispatch(uint32_t workers, unsigned mode)
     sess->tdd_audit.enabled = true;
     wl_columnar_eval_test_subpass_boundary = hold_prior_delta_across_dispatch;
     int rc = wl_session_snapshot(session, collect_retirement_rows, &rows);
+    /* #1661 U4: rounds == 2, not >= 2.  The exact count pins that
+     * wl_columnar_eval_retire_prior_deltas refused and aborted the sub-pass
+     * before the exchange dispatch ran -- a third round would mean the
+     * exchange executed and the refusal surfaced somewhere below it instead.
+     * That is what makes the exchange-site session_remove_rel discards
+     * correct: the refusal is pre-empted upstream, not swallowed there.
+     *
+     * Modes 0 and 1 hold a reader and are pinned by this.  Mode 2 also arms a
+     * refusing cleanup frame, so its rc comes from the worker-state check
+     * above retire and it stays at 2 either way -- it does not pin
+     * retirement.  Do not read its passing as coverage. */
     DISPATCH_CHECK(rc == EBUSY && retire_dispatch_captured
         && retire_dispatch_verified && retire_dispatch_rc == 0 &&
         rows.count == 0
-        && retire_dispatch_workers == workers && retire_dispatch_rounds >= 2
+        && retire_dispatch_workers == workers && retire_dispatch_rounds == 2
         && sess->tdd_executed_strata == 1,
         "actual shared prior delta refusal");
     for (unsigned attempt = 0; attempt < 2; attempt++) {

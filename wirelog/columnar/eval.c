@@ -1244,6 +1244,20 @@ tdd_refresh_global_read_relation(const wl_plan_stratum_t *sp,
                     rc = wl_columnar_session_adopt_shared_view(
                         &coord->tdd_workers[w], view);
                     if (rc != 0) {
+                        /* #1661: this discard stays a discard.  The entry was
+                         * registered by the session_add_rel just above, and
+                         * every failure path in
+                         * wl_columnar_session_adopt_shared_view releases its
+                         * reader before returning -- so nothing holds one here
+                         * and the removal cannot refuse.  The exception is
+                         * the path where the release itself fails: the reader
+                         * is then still held either way, and only the code
+                         * differs -- EINVAL when the preceding lease_prepare
+                         * succeeded (the `&& rc == 0` guard), otherwise
+                         * prepare's own code.  Either way this
+                         * function returns the adopt failure below, so
+                         * propagating EBUSY from the rollback could only
+                         * replace a specific diagnosis with a vaguer one. */
                         (void)session_remove_rel(&coord->tdd_workers[w],
                             view->name);
                         return rc;
@@ -1275,10 +1289,19 @@ tdd_seed_global_read_initial_deltas(const wl_plan_stratum_t *sp,
         const char *rel_name = sp->relations[ri].name;
         col_rel_t *src = session_find_rel(coord, rel_name);
 
-        /* A successful removal is the normal case; ENOENT means this worker
-         * holds no stale delta yet.  A refusal keeps the worker's registry
-         * owner and is surfaced by the same-name registration that follows,
-         * unless the new delta is empty and never re-registered (#1661). */
+        /* #1661: the discard is safe because a refusal here cannot go
+         * unnoticed, not because refusals cannot happen.  A refusal leaves
+         * the worker's registry owner in place; the same-name session_add_rel
+         * below then re-attempts col_rel_destroy_checked on that owner,
+         * restores its lease and returns EBUSY, so the refusal surfaces
+         * there.  TWO paths reach `return 0` without registering: the
+         * empty-source `continue` just below, and the per-worker
+         * `!part || part->nrows == 0` skip in the partition loop, which
+         * bypasses session_add_rel for that worker alone.  A stale owner left
+         * by either is caught when the cohort is torn down:
+         * col_worker_session_destroy refuses through its relation-alias pass
+         * and the caller keeps the cohort for retry
+         * (tests/test_tdd_inline_workers.c). */
         for (uint32_t w = W; w-- > 0; )
             (void)session_remove_rel(&coord->tdd_workers[w], dname);
 
@@ -3098,10 +3121,13 @@ tdd_broadcast_relation_delta(const wl_plan_stratum_t *sp, uint32_t ri,
 {
     const char *dname = sp->relations[ri].delta_name;
 
-    /* A successful removal is the normal case; ENOENT means this worker
-     * holds no stale delta yet.  A refusal keeps the worker's registry
-     * owner and is surfaced by the same-name registration that follows,
-     * unless the new delta is empty and is never re-registered (#1661). */
+    /* #1661: a refusal leaves the worker's registry owner in place and is
+     * surfaced by the same-name session_add_rel below, which re-attempts
+     * col_rel_destroy_checked on that owner and returns EBUSY.  The
+     * `total == 0` early return below registers nothing, so a refusal on
+     * that path surfaces later instead, at cohort teardown: the
+     * relation-alias pass of col_worker_session_destroy refuses and the
+     * cohort is kept for retry (tests/test_tdd_inline_workers.c). */
     for (uint32_t w = W; w-- > 0; )
         (void)session_remove_rel(&coord->tdd_workers[w], dname);
 
@@ -3146,15 +3172,16 @@ tdd_broadcast_relation_delta(const wl_plan_stratum_t *sp, uint32_t ri,
     /* Issue #390: Dedup broadcast union to prevent duplicate delta
      * amplification.  In self_join_mode, workers hold disjoint 1/W IDB
      * partitions but can independently derive the same tuple via
-     * different join paths.  Matches tdd_broadcast_deltas (line 3299). */
+     * different join paths.  Matches the Issue #388 dedup in
+     * tdd_broadcast_deltas. */
     if (union_d->nrows > 1)
         tdd_dedup_rel(union_d);
 
     /* Issue #390: zero-copy broadcast via col_shared.
      * Anchor union_d in worker 0's session; workers 1..W-1 borrow
      * column pointers via col_rel_install_shared_view (O(ncols) pointer
-     * setup) instead of O(|delta|) deep copies.  Mirrors the pattern
-     * in tdd_broadcast_deltas (lines 3307-3354). */
+     * setup) instead of O(|delta|) deep copies.  Mirrors the Issue #396
+     * shared-view broadcast in tdd_broadcast_deltas. */
     rc = session_add_rel(&coord->tdd_workers[0], union_d);
     if (rc != 0) {
         col_rel_destroy(union_d);
@@ -3185,6 +3212,8 @@ tdd_broadcast_relation_delta(const wl_plan_stratum_t *sp, uint32_t ri,
             rc = wl_columnar_session_adopt_shared_view(
                 &coord->tdd_workers[dst], view);
             if (rc != 0) {
+                /* #1661: rollback discard; see the note in
+                 * tdd_refresh_global_read_relation. */
                 (void)session_remove_rel(&coord->tdd_workers[dst], dname);
                 return rc;
             }
@@ -3404,11 +3433,29 @@ tdd_exchange_deltas(const wl_plan_stratum_t *sp,
             }
         }
 
-        /* Remove stale $d$ from every worker before scatter.  A successful
-         * removal is the normal case; ENOENT means this worker holds no
-         * stale delta yet.  A refusal keeps the worker's registry owner and
-         * is surfaced by the same-name registration that follows, unless the
-         * new delta is empty and is never re-registered (#1661). */
+        /* Remove stale $d$ from every worker before scatter.  #1661: as at
+         * the other exchange sites, a refusal leaves the worker's registry
+         * owner in place and the same-name registration that follows
+         * re-attempts the destroy and returns EBUSY.  This sweep precedes
+         * both arms below, but only the scatter arm is reachable from here:
+         * the `!default_hash` early return above means default_hash is true
+         * past it, so key_count is never left at 0 -- either EXCHANGE
+         * metadata supplied key cols, or the default at the top of this loop
+         * supplies col0 -- and the broadcast arm's `total == 0` path, and the
+         * arm itself, cannot run.  The live non-registering path is
+         * a NULL `gathered` in the scatter arm, where tdd_gather_for_worker
+         * yields nothing for a destination and the `if (gathered)` guard
+         * skips session_add_rel; it defers to cohort teardown.  A refusal is
+         * in any case pre-empted upstream by
+         * wl_columnar_eval_retire_prior_deltas, which runs unconditionally
+         * immediately before the exchange dispatch and re-registers every
+         * delta name each worker currently holds.
+         *
+         * Unlike the other four, this claim rests on reading alone: no test
+         * in the suite reaches this site.  Counting executions of all five
+         * removal loops over a full `meson test` run recorded zero hits here
+         * while the others ran 5840 times between them.  Treat the reasoning
+         * above as unverified for this path. */
         for (uint32_t w = W; w-- > 0; )
             (void)session_remove_rel(&coord->tdd_workers[w], dname);
 
@@ -4055,6 +4102,8 @@ tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
                     rc = wl_columnar_session_adopt_shared_view(
                         &coord->tdd_workers[w], new_d);
                     if (rc != 0) {
+                        /* #1661: rollback discard; see the note in
+                         * tdd_refresh_global_read_relation. */
                         (void)session_remove_rel(&coord->tdd_workers[w],
                             dname);
                         return rc;
@@ -4841,11 +4890,15 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
 
         uint64_t prepare_t0 = now_ns();
 
-        /* Remove stale $d$ from workers.  A successful removal is the
-         * normal case; ENOENT means this worker holds no stale delta yet.
-         * A refusal keeps the worker's registry owner and is surfaced by the
-         * same-name registration that follows, unless the new delta is empty
-         * and is never re-registered (#1661). */
+        /* Remove stale $d$ from workers.  #1661: a refusal leaves the
+         * worker's registry owner in place and the same-name session_add_rel
+         * further down re-attempts col_rel_destroy_checked on it and returns
+         * EBUSY.  This site has TWO empty-delta paths that register nothing
+         * -- `total == 0` and the post-diff `combined->nrows == 0` -- and
+         * neither installs an empty delta, so a refusal on either defers to
+         * cohort teardown, where col_worker_session_destroy's relation-alias
+         * pass refuses and the cohort is kept for retry
+         * (tests/test_tdd_inline_workers.c). */
         for (uint32_t w = W; w-- > 0; )
             (void)session_remove_rel(&coord->tdd_workers[w], dname);
 
@@ -5036,6 +5089,8 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
                 rc = wl_columnar_session_adopt_shared_view(
                     &coord->tdd_workers[dst], view);
                 if (rc != 0) {
+                    /* #1661: rollback discard; see the note in
+                     * tdd_refresh_global_read_relation. */
                     (void)session_remove_rel(&coord->tdd_workers[dst],
                         dname);
                     return rc;
@@ -5065,10 +5120,28 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
         const char *rel_name = sp->relations[ri].name;
         uint64_t prepare_t0 = now_ns();
 
-        /* A successful removal is the normal case; ENOENT means this worker
-         * holds no stale delta yet.  A refusal keeps the worker's registry
-         * owner and is surfaced by the same-name registration that follows,
-         * unless the new delta is empty and never re-registered (#1661). */
+        /* #1661: a refusal leaves the worker's registry owner in place and
+         * the same-name session_add_rel re-attempts col_rel_destroy_checked
+         * on it and returns EBUSY.  The empty-delta paths here differ, and
+         * the difference matters: the post-diff `combined->nrows == 0` branch
+         * DOES register, via tdd_install_empty_delta_on_workers, whose
+         * session_add_rel surfaces the refusal like any other.  Two paths do
+         * not register -- `total == 0`, and the per-worker
+         * `!part || part->nrows == 0` skip in the scatter loop below, which
+         * bypasses session_add_rel for that worker alone.  Do not read the
+         * contrast above as licence to drop the teardown fallback by
+         * installing an empty delta on `total == 0`: the per-worker skip
+         * would still strand a refusal.
+         *
+         * Both non-registering paths defer to cohort teardown, where
+         * col_worker_session_destroy's relation-alias pass refuses and the
+         * cohort is kept for retry (tests/test_tdd_inline_workers.c).  A
+         * refusal is in any case pre-empted upstream:
+         * wl_columnar_eval_retire_prior_deltas runs unconditionally
+         * immediately before the exchange dispatch and re-registers every
+         * delta name each worker currently holds (it skips a name with no
+         * entry), so a held reader aborts the stratum before this sweep
+         * runs. */
         for (uint32_t w = W; w-- > 0; )
             (void)session_remove_rel(&coord->tdd_workers[w], dname);
 
@@ -5943,9 +6016,12 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                     } else if (shared) {
                         rc = wl_columnar_session_adopt_shared_view(
                             &coord->tdd_workers[w], dw);
-                        if (rc != 0)
+                        if (rc != 0) {
+                            /* #1661: rollback discard; see the note in
+                             * tdd_refresh_global_read_relation. */
                             (void)session_remove_rel(
                                 &coord->tdd_workers[w], dname);
+                        }
                     }
                 }
             }
@@ -6190,6 +6266,10 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             }
             coord->tdd_convergence_ns += now_ns() - convergence_t0;
 
+            /* #1661: the sweep comments in tdd_exchange_deltas and
+             * tdd_owner_exchange_deltas depend on this call staying
+             * immediately before the exchange dispatch below.  Moving or
+             * guarding it invalidates them. */
             rc = wl_columnar_eval_retire_prior_deltas(sp, coord, W);
             if (rc != 0) {
                 tdd_destroy_delta_slots(ctxs, W, nrels);
