@@ -177,6 +177,8 @@ static col_rel_t *
 make_right(uint32_t keys, uint32_t fanout)
 {
     return make_right_named("right", keys, fanout);
+}
+
 /* The ordinary sequential fixture is intentionally compact and can happen
  * to be injective in the low bucket bits.  This deterministic permutation
  * supplies a broad key distribution while the test still discovers the
@@ -918,6 +920,7 @@ test_true_cross_key_collision_resumes(void)
         fixture_fini(&f);
         return;
     }
+    f.right_registered = true;
     f.right = session_find_rel(f.sess, "right");
     f.lkeys[0] = "k";
     f.rkeys[0] = "k";
