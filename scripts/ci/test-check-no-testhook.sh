@@ -118,6 +118,14 @@ cat > "$leaky_session" <<'EOF'
 EOF
 expect_status 'a session testhook symbol is a leak' 1 run "$leaky_session" "$clean_syms" --check=leak
 expect_says   'the session leak names the symbol' 'wl_session_testhook_default_options'
+# #1658: the bounded-join resize seam must remain outside libwirelog too.
+leaky_relation="$tmp/leaky-relation.txt"
+cat > "$leaky_relation" <<'EOF'
+0000000000001100 T wl_log_init
+00000000000011a0 T wl_columnar_relation_test_fail_next_prepare_resize
+EOF
+expect_status 'a relation resize testhook symbol is a leak' 1 run "$leaky_relation" "$clean_syms" --check=leak
+expect_says   'the relation leak names the symbol' 'wl_columnar_relation_test_fail_next_prepare_resize'
 
 # --- (b) the provenance check ------------------------------------------------
 # The regression itself: with line info present the check must reach a verdict.

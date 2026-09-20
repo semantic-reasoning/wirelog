@@ -2078,7 +2078,15 @@ test_sink_prepare_resize_failure(void)
     wl_columnar_continuation_sink_t sink;
     col_join_batch_relation_sink_t sctx;
     col_join_batch_cursor_t before;
+    col_join_batch_cursor_t cursor_before;
+    col_rel_t *before_output = NULL;
+    col_rel_t *oracle = NULL;
     uint64_t reserved;
+    uint32_t capacity;
+    uint32_t timestamp_capacity;
+    uint64_t view_generation;
+    uint64_t storage_generation;
+    uint64_t retained_reserved;
     uint32_t rows;
     wl_columnar_continuation_status_t st;
 
@@ -2107,13 +2115,33 @@ test_sink_prepare_resize_failure(void)
         FAIL("setup publishes did not fill the output capacity");
         goto out;
     }
+    if (col_rel_deep_copy(f.out, &before_output, NULL) != 0) {
+        FAIL("could not snapshot output before resize failure");
+        goto out;
+    }
+    capacity = f.out->capacity;
+    timestamp_capacity = f.out->timestamp_capacity;
+    view_generation = f.out->view_generation;
+    storage_generation = f.out->storage_generation;
+    retained_reserved = f.out->retained_reserved_bytes;
+    if (!col_join_batch_cursor_get(cont, &cursor_before)) {
+        FAIL("could not snapshot cursor before resize failure");
+        goto out;
+    }
     reserved = reserved_of(f.sess);
     wl_columnar_relation_test_fail_next_prepare_resize();
     st = wl_columnar_continuation_publish(cont, &sink);
     if (st != WL_COLUMNAR_CONTINUATION_SINK_FAILURE
-        || f.out->nrows != rows || reserved_of(f.sess) != reserved
+        || st == WL_COLUMNAR_CONTINUATION_RESERVATION_DENIED
+        || f.out->nrows != rows || f.out->capacity != capacity
+        || f.out->timestamp_capacity != timestamp_capacity
+        || f.out->view_generation != view_generation
+        || f.out->storage_generation != storage_generation
+        || f.out->retained_reserved_bytes != retained_reserved
+        || reserved_of(f.sess) != reserved
+        || !same_rows(before_output, f.out)
         || !col_join_batch_cursor_get(cont, &before)
-        || before.sequence != 4u) {
+        || !same_join_batch_cursor(&before, &cursor_before)) {
         FAIL("resize preparation failure was misclassified or not rolled back");
         goto out;
     }
@@ -2122,9 +2150,19 @@ test_sink_prepare_resize_failure(void)
         FAIL("retry after resize preparation failure did not commit");
         goto out;
     }
+    if (col_join_batch_run_to_relation(cont, f.sess, f.out) != 0
+        || (oracle = run_oracle(f.sess, f.left, &f.op)) == NULL
+        || !same_rows(oracle, f.out)) {
+        FAIL("retry result differs from one-shot oracle");
+        goto out;
+    }
     PASS();
 out:
     wl_columnar_relation_test_clear_prepare_resize();
+    if (oracle)
+        col_rel_destroy(oracle);
+    if (before_output)
+        col_rel_destroy(before_output);
     if (cont)
         wl_columnar_continuation_destroy(cont);
     fixture_fini(&f);
