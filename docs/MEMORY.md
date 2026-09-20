@@ -1176,7 +1176,7 @@ the mapping below is the assertion inventory for the rename.
 | --- | --- | --- |
 | `k_fusion_inline_shadow` / `test_k_fusion_inline_shadow.c` | `diff_arrangement_inline_shadow` / `test_diff_arrangement_inline_shadow.c` | Four-worker immutable inline reads, arrangement deep-copy isolation, and worker-state mutation independence |
 | `e2e_tsan_inline_kfusion` / `test_e2e_tsan_inline_kfusion.c` | `inline_concurrent_read` / `test_inline_concurrent_read.c` | Concurrent inline reads plus insert/retract lifecycle cycles at the original TSan stress sizes |
-| `e2e_kfusion_k4_inline` / `test_e2e_kfusion_k4_inline.c` | `inline_authorization_multiworker` / `test_inline_authorization_multiworker.c` | Authorization result fingerprints, counts, and insert/retract cycle comparisons for the existing worker widths |
+| `e2e_kfusion_k4_inline` / `test_e2e_kfusion_k4_inline.c` | `nonrecursive_multiworker_authorization` / `test_nonrecursive_multiworker_authorization.c` | Scalar, nonrecursive authorization result fingerprints and counts at the existing worker widths; no compound or retraction claim |
 
 These names identify arrangement isolation, concurrent inline access, and
 multi-worker authorization results. They do not claim that these tests prove

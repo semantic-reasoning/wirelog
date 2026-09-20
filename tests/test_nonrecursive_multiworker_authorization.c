@@ -1,18 +1,13 @@
 /*
- * test_inline_authorization_multiworker.c - Multi-worker inline compound
+ * test_nonrecursive_multiworker_authorization.c - Nonrecursive multi-worker
  * authorization result checks
  *
  * Copyright (C) CleverPlant
  * Licensed under LGPL-3.0
  *
- * End-to-end test: K=4 workers over inline compound columns in authorization
- * context. Validates that Z-set multiplicity (+1 insert, -1 retract) is correctly
- * maintained across multi-worker execution with compound terms.
- *
- * Scenario:
- *  Graph: auth(principal, resource, action, scope_ts, scope_loc, scope_risk)
- *  Rule: hasAccess(P,R,A) :- auth(P,R,A,Ts,Loc,Risk), policy(R,A), Loc<100, Risk<=3
- *  Tests: K=1 vs K=4 fingerprint equivalence with insert/retract cycles.
+ * This fixture exercises the existing scalar authorization program at the
+ * configured worker widths and compares result fingerprints. It does not
+ * claim inline compound storage or recursive TDD dispatch.
  */
 
 #include "../wirelog/exec_plan_gen.h"
@@ -30,7 +25,7 @@
 #include <string.h>
 
 /* ================================================================
- * Authorization program with inline compound scopes
+ * Scalar authorization program
  *
  * Fact: auth(principal, resource, action, scope_ts, scope_loc, scope_risk)
  * Rule: hasAccess(P,R,A) :- auth(P,R,A,Ts,Loc,Risk), policy(R,A), Loc<100, Risk<=3
@@ -189,11 +184,11 @@ make_auth_program_with_facts(int insert_count, int retract_count)
 }
 
 static int
-test_inline_authorization_multiworker_basic(void)
+test_nonrecursive_multiworker_authorization_basic(void)
 {
     int status = EXIT_FAILURE;
 
-    printf("TEST: K=4 inline compound basic (20 inserts) ... ");
+    printf("TEST: K=4 scalar authorization basic (20 inserts) ... ");
     fflush(stdout);
 
     char *prog = make_auth_program_with_facts(20, 0);
@@ -235,11 +230,11 @@ cleanup:
 }
 
 static int
-test_inline_authorization_multiworker_medium(void)
+test_nonrecursive_multiworker_authorization_medium(void)
 {
     int status = EXIT_FAILURE;
 
-    printf("TEST: K=4 inline compound medium (50 inserts) ... ");
+    printf("TEST: K=4 scalar authorization medium (50 inserts) ... ");
     fflush(stdout);
 
     char *prog = make_auth_program_with_facts(50, 0);
@@ -289,9 +284,9 @@ main(void)
 
     int failures = 0;
 
-    if (test_inline_authorization_multiworker_basic() != EXIT_SUCCESS)
+    if (test_nonrecursive_multiworker_authorization_basic() != EXIT_SUCCESS)
         failures++;
-    if (test_inline_authorization_multiworker_medium() != EXIT_SUCCESS)
+    if (test_nonrecursive_multiworker_authorization_medium() != EXIT_SUCCESS)
         failures++;
 
     printf("\n===== Tests Complete =====\n");
