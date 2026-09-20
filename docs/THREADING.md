@@ -1198,8 +1198,10 @@ they own; that is #1765. A refused delta removal now propagates out of
 success while a reader-held delta stays registered. What remains under #1661
 is the per-sub-pass removal, which stays a discard deliberately because the
 terminal one already closes the contract and propagating earlier would
-suppress head mutation no rollback can undo; the TDD delta-exchange paths;
-and the worker-registry gap:
+suppress head mutation no rollback can undo; one TDD delta-exchange removal
+that no test reaches (`tdd_exchange_deltas`' stale-$d$ sweep, whose reachable
+arm is the scatter/gather one), whose audit rests on reading alone; and the
+worker-registry gap:
 `col_worker_session_create` writes partitions straight into the registry
 without the pool and arena promotion `session_add_rel` performs, so
 bounded-allocator reclamation is not yet proven for them.
