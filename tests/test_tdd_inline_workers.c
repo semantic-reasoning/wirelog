@@ -13,7 +13,6 @@
 #include <stdbool.h>
 #include <inttypes.h>
 #include <stdint.h>
-#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -208,8 +207,6 @@ run_lifecycle(uint32_t workers, bool require_dispatch)
     if (rc != 0 || !session) {
         goto cleanup;
     }
-    COL_SESSION(session)->tdd_audit.enabled = true;
-
     int64_t facts[200];
     for (uint32_t i = 0; i < 100; i++) {
         facts[i * 2] = (int64_t)i;

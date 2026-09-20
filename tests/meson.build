@@ -4905,7 +4905,7 @@ test_tdd_decision_stats_seq_exe = executable(
 test('tdd_decision_stats_nofusion', test_tdd_decision_stats_seq_exe, timeout: 300)
 
 
-# Actual W>1 TDD dispatch with inline compound logical-output and
+# Actual W>1 TDD dispatch plus inline compound logical-output and
 # insert/remove/reinsert lifecycle coverage (Issue #1396 unit 2).
 test_tdd_inline_workers_exe = executable(
   'test_tdd_inline_workers',
