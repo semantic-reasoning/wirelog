@@ -258,8 +258,8 @@ sudo cpupower frequency-set -g powersave
    not measured by `bench_compound` at this iteration. The theoretical
    near-linear scaling hypothesis from the design doc remains unvalidated by
    microbenchmark. K=4 correctness is covered by
-   `tests/test_e2e_kfusion_k4_inline.c` and
-   `tests/test_e2e_tsan_inline_kfusion.c`.
+   `tests/test_inline_authorization_multiworker.c` and
+   `tests/test_inline_concurrent_read.c`.
 
 4. **No comparable compound baseline for bench_flowlog.** Running
    `bench_flowlog` on a compound-enabled vs compound-free program to isolate

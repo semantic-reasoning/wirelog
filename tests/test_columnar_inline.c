@@ -38,7 +38,7 @@
  *       is the behavioural sibling.
  *
  * The K-Fusion shadow test (K=4 / 100k rows) already landed in
- * tests/test_k_fusion_inline_shadow.c (Task #4); no duplication here.
+ * tests/test_diff_arrangement_inline_shadow.c (Task #4); no duplication here.
  */
 
 #include "../wirelog/columnar/internal.h"

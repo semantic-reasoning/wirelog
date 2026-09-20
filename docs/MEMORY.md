@@ -1165,3 +1165,20 @@ rows, generations, provenance, and reservations unchanged across refusal.
 Input and compound mutations remain refused while completion is pending. The
 continuation is limited to post-merge nonrecursive completion; arbitrary
 mid-operator or partial-merge rollback is outside this contract.
+
+## 10d. TDD coverage assertion migration (#1396, unit 1)
+
+The first coverage unit for #1396 gives three tests names that describe the
+behavior they actually exercise. Test bodies and stress sizes are unchanged;
+the mapping below is the assertion inventory for the rename.
+
+| Previous test target/file | Current target/file | Preserved assertions |
+| --- | --- | --- |
+| `k_fusion_inline_shadow` / `test_k_fusion_inline_shadow.c` | `diff_arrangement_inline_shadow` / `test_diff_arrangement_inline_shadow.c` | Four-worker immutable inline reads, arrangement deep-copy isolation, and worker-state mutation independence |
+| `e2e_tsan_inline_kfusion` / `test_e2e_tsan_inline_kfusion.c` | `inline_concurrent_read` / `test_inline_concurrent_read.c` | Concurrent inline reads plus insert/retract lifecycle cycles at the original TSan stress sizes |
+| `e2e_kfusion_k4_inline` / `test_e2e_kfusion_k4_inline.c` | `inline_authorization_multiworker` / `test_inline_authorization_multiworker.c` | Authorization result fingerprints, counts, and insert/retract cycle comparisons for the existing worker widths |
+
+These names identify arrangement isolation, concurrent inline access, and
+multi-worker authorization results. They do not claim that these tests prove
+recursive TDD worker dispatch; that end-to-end assertion is the follow-up
+unit in this issue.
