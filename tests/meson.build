@@ -4904,6 +4904,26 @@ test_tdd_decision_stats_seq_exe = executable(
 )
 test('tdd_decision_stats_nofusion', test_tdd_decision_stats_seq_exe, timeout: 300)
 
+
+# Actual W>1 TDD dispatch with inline compound logical-output and
+# insert/remove/reinsert lifecycle coverage (Issue #1396 unit 2).
+test_tdd_inline_workers_exe = executable(
+  'test_tdd_inline_workers',
+  files('test_tdd_inline_workers.c'),
+  backend_src,
+  parser_src,
+  ir_src,
+  optimizer_src,
+  arena_src,
+  io_src,
+  thread_src,
+  workqueue_src,
+  c_args: ['-DWL_COLUMNAR_EVAL_TEST_SUBMISSION'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+test('tdd_inline_workers', test_tdd_inline_workers_exe, timeout: 300)
+
 test('mem_report_contract_selftest', bench_flowlog_json_py3,
      args: [files('test_mem_report_contract_selftest.py')[0]],
      suite: 'bench')
