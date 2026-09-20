@@ -177,6 +177,28 @@ static col_rel_t *
 make_right(uint32_t keys, uint32_t fanout)
 {
     return make_right_named("right", keys, fanout);
+/* The ordinary sequential fixture is intentionally compact and can happen
+ * to be injective in the low bucket bits.  This deterministic permutation
+ * supplies a broad key distribution while the test still discovers the
+ * actual collision by inspecting the built arrangement. */
+static col_rel_t *
+make_hashed_right(uint32_t keys, uint32_t fanout)
+{
+    const char *cn[] = { "k", "r" };
+    col_rel_t *right = make_rel("right", 2, cn);
+    if (!right)
+        return NULL;
+    for (uint32_t k = 0; k < keys; k++) {
+        int64_t key = (int64_t)((uint64_t)k * UINT64_C(2654435761));
+        for (uint32_t f = 0; f < fanout; f++) {
+            int64_t row[] = { key, (int64_t)(1000 * k + f) };
+            if (col_rel_append_row(right, row) != 0) {
+                col_rel_destroy(right);
+                return NULL;
+            }
+        }
+    }
+    return right;
 }
 
 /* left(k, v) from an explicit key list. */
@@ -287,6 +309,34 @@ same_rows(const col_rel_t *a, const col_rel_t *b)
     return equal;
 }
 
+static bool
+same_join_batch_cursor(const col_join_batch_cursor_t *a,
+    const col_join_batch_cursor_t *b)
+{
+    return a && b && a->next.lr == b->next.lr && a->next.rr == b->next.rr
+           && a->sequence == b->sequence
+           && a->left_identity == b->left_identity
+           && a->left_view_gen == b->left_view_gen
+           && a->left_storage_gen == b->left_storage_gen
+           && a->right_identity == b->right_identity
+           && a->right_view_gen == b->right_view_gen
+           && a->right_storage_gen == b->right_storage_gen
+           && a->arr_generation == b->arr_generation
+           && a->arr_indexed_rows == b->arr_indexed_rows
+           && a->left_is_delta == b->left_is_delta
+           && a->timestamps == b->timestamps;
+}
+
+static bool
+same_continuation_cursor(const wl_columnar_continuation_cursor_t *a,
+    const wl_columnar_continuation_cursor_t *b)
+{
+    return a && b && a->input_identity == b->input_identity
+           && a->arrangement_identity == b->arrangement_identity
+           && a->generation == b->generation && a->position == b->position
+           && a->sequence == b->sequence;
+}
+
 /* Resolved key positions: column 0 on both sides in every fixture. */
 static const uint32_t KEY0[1] = { 0 };
 
@@ -361,6 +411,70 @@ register_relation(wl_col_session_t *sess, col_rel_t **owned,
     if (rc == 0)
         *owned = NULL;
     return rc;
+}
+
+/* Arrangement heads carry the generation in their upper 32 bits.  Only a
+ * head from the currently active generation, with a real row index, may be
+ * traversed as a chain; zero/stale heads are not valid row indices. */
+static bool
+arrangement_bucket_head(const col_arrangement_t *arr, uint32_t bucket,
+    uint32_t *row_out)
+{
+    uint64_t encoded;
+    uint32_t row;
+
+    if (!arr || !row_out || !arr->ht_head || bucket >= arr->nbuckets)
+        return false;
+    encoded = arr->ht_head[bucket];
+    if ((uint32_t)(encoded >> 32) != arr->generation)
+        return false;
+    row = (uint32_t)encoded;
+    if (row == UINT32_MAX || row >= arr->indexed_rows)
+        return false;
+    *row_out = row;
+    return true;
+}
+
+/* Select a real collision from the arrangement that the test fixture built.
+ * Do not encode assumptions about the hash function or bucket count here: the
+ * chain is the source of truth, and the selected key must also have at least
+ * two matching rows so a one-row batch can park inside that chain. */
+static bool
+find_true_collision(const col_arrangement_t *arr, const col_rel_t *rel,
+    int64_t *match_key, int64_t *other_key, uint32_t *bucket_out)
+{
+    if (!arr || !rel || !match_key || !other_key || !bucket_out
+        || !arr->ht_head || !arr->ht_next)
+        return false;
+    for (uint32_t bucket = 0; bucket < arr->nbuckets; bucket++) {
+        uint32_t head;
+        if (!arrangement_bucket_head(arr, bucket, &head))
+            continue;
+        for (uint32_t first = head; first != UINT32_MAX;
+            first = arr->ht_next[first]) {
+            int64_t candidate = col_rel_get(rel, first, 0);
+            uint32_t matches = 0;
+            int64_t distinct = 0;
+            bool has_distinct = false;
+            for (uint32_t row = head; row != UINT32_MAX;
+                row = arr->ht_next[row]) {
+                int64_t key = col_rel_get(rel, row, 0);
+                if (key == candidate)
+                    matches++;
+                else if (!has_distinct) {
+                    distinct = key;
+                    has_distinct = true;
+                }
+            }
+            if (matches >= 2u && has_distinct) {
+                *match_key = candidate;
+                *other_key = distinct;
+                *bucket_out = bucket;
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 /* Fault-injecting wrapper around the real relation sink. */
@@ -673,6 +787,15 @@ test_stale_inputs_are_rejected(void)
     wl_columnar_continuation_sink_t sink;
     col_join_batch_relation_sink_t sctx;
     int64_t extra[] = { 1, 999 };
+    const col_arr_entry_t *entry;
+    const col_arrangement_t *arr;
+    col_join_batch_cursor_t before;
+    col_join_batch_cursor_t after;
+    wl_columnar_continuation_cursor_t raw_before = { 0 };
+    wl_columnar_continuation_cursor_t raw_after = { 0 };
+    int64_t output_before[16];
+    uint64_t output_view_generation;
+    uint32_t generation;
     wl_columnar_continuation_status_t st;
 
     TEST("appending to the right relation between batches reports STALE");
@@ -690,22 +813,173 @@ test_stale_inputs_are_rejected(void)
         return;
     }
     st = wl_columnar_continuation_publish(cont, &sink);
-    if (st != WL_COLUMNAR_CONTINUATION_OK || f.out->nrows != 4u) {
+    if (st != WL_COLUMNAR_CONTINUATION_OK || f.out->nrows != 4u
+        || !col_join_batch_cursor_get(cont, &before)
+        || !wl_columnar_continuation_cursor(cont)) {
         FAIL("first batch");
         goto out;
     }
+    raw_before = *wl_columnar_continuation_cursor(cont);
+    for (uint32_t row = 0; row < f.out->nrows; row++)
+        for (uint32_t col = 0; col < f.out->ncols; col++)
+            output_before[row * 4u + col] = col_rel_get(f.out, row, col);
+    output_view_generation = f.out->view_generation;
+    entry = find_entry(f.sess, "right");
+    arr = entry ? &entry->arr : NULL;
+    generation = arr ? arr->generation : 0u;
     if (col_rel_append_row(f.right, extra) != 0) {
         FAIL("append");
         goto out;
     }
+    col_session_invalidate_arrangements(&f.sess->base, "right");
+    if (!entry || entry->pin_count != 1u || !entry->rebuild_deferred) {
+        FAIL("pinned arrangement invalidation was not deferred");
+        goto out;
+    }
     st = wl_columnar_continuation_publish(cont, &sink);
-    if (st != WL_COLUMNAR_CONTINUATION_STALE || f.out->nrows != 4u) {
+    if (st != WL_COLUMNAR_CONTINUATION_STALE || f.out->nrows != 4u
+        || !col_join_batch_cursor_get(cont, &after)
+        || !same_join_batch_cursor(&after, &before)
+        || !wl_columnar_continuation_cursor(cont)) {
         FAIL("stale right relation was not rejected");
+        goto out;
+    }
+    raw_after = *wl_columnar_continuation_cursor(cont);
+    if (!same_continuation_cursor(&raw_after, &raw_before)
+        || f.out->view_generation != output_view_generation) {
+        FAIL("stale right relation was not rejected");
+        goto out;
+    }
+    for (uint32_t row = 0; row < f.out->nrows; row++)
+        for (uint32_t col = 0; col < f.out->ncols; col++)
+            if (output_before[row * 4u + col] != col_rel_get(f.out, row,
+                col)) {
+                FAIL("stale publish changed visible output rows");
+                goto out;
+            }
+    wl_columnar_continuation_destroy(cont);
+    cont = NULL;
+    if (entry->pin_count != 0u || entry->rebuild_deferred
+        || entry->arr.indexed_rows != 0u) {
+        FAIL("destroy did not transition deferred invalidation to unbuilt");
+        goto out;
+    }
+    arr = col_session_get_arrangement(&f.sess->base, "right", KEY0, 1);
+    if (!arr || arr != &entry->arr || entry->pin_count != 0u
+        || entry->rebuild_deferred || arr->indexed_rows != f.right->nrows
+        || arr->generation == 0u || arr->generation == generation) {
+        FAIL("lazy arrangement lookup did not rebuild after release");
         goto out;
     }
     PASS();
 out:
     wl_columnar_continuation_destroy(cont);
+    fixture_fini(&f);
+}
+
+/* A one-row batch must be able to park on a genuine cross-key hash collision,
+ * then resume the same chain without losing either key's matches. */
+static void
+test_true_cross_key_collision_resumes(void)
+{
+    fixture_t f;
+    const col_arr_entry_t *entry;
+    const col_arrangement_t *arr;
+    col_rel_t *oracle = NULL;
+    wl_columnar_continuation_t *cont = NULL;
+    wl_columnar_continuation_sink_t sink;
+    col_join_batch_relation_sink_t sctx;
+    col_join_batch_cursor_t cur;
+    wl_columnar_continuation_status_t st;
+    int64_t left_keys[2];
+    int64_t match_key;
+    int64_t other_key;
+    uint32_t bucket;
+    bool parked_in_bucket = false;
+    bool done = false;
+
+    TEST("true cross-key bucket collision parks and resumes exactly");
+    memset(&f, 0, sizeof(f));
+    f.sess = make_session(1u << 24);
+    f.right = make_hashed_right(512, 2);
+    if (!f.sess || !f.right) {
+        FAIL("fixture");
+        if (!f.sess && f.right) {
+            col_rel_destroy(f.right);
+            f.right = NULL;
+        }
+        fixture_fini(&f);
+        return;
+    }
+    if (session_add_rel(f.sess, f.right) != 0) {
+        FAIL("register right relation");
+        col_rel_destroy(f.right);
+        f.right = NULL;
+        fixture_fini(&f);
+        return;
+    }
+    f.right = session_find_rel(f.sess, "right");
+    f.lkeys[0] = "k";
+    f.rkeys[0] = "k";
+    init_join_op(&f.op, f.lkeys, f.rkeys);
+    arr = col_session_get_arrangement(&f.sess->base, "right", KEY0, 1);
+    entry = find_entry(f.sess, "right");
+    if (!arr || !entry || !find_true_collision(arr, f.right, &match_key,
+        &other_key, &bucket)) {
+        FAIL("fixture did not contain an inspectable true collision");
+        fixture_fini(&f);
+        return;
+    }
+    left_keys[0] = match_key;
+    left_keys[1] = other_key;
+    f.left = make_left(left_keys, 2);
+    f.out = col_rel_new_auto("$join", 4);
+    if (!f.left || !f.out || col_join_set_output_types(f.out, f.left,
+        f.right, &f.op) != 0) {
+        FAIL("collision output fixture");
+        fixture_fini(&f);
+        return;
+    }
+    oracle = run_oracle(f.sess, f.left, &f.op);
+    if (!oracle || col_join_batch_producer_create(f.sess, &f.op, f.left,
+        false, KEY0, KEY0, 1, 32u, &cont) != 0
+        || col_join_batch_relation_sink_init(&sctx, &sink, f.sess, f.out)
+        != 0) {
+        FAIL("collision producer or sink");
+        goto out;
+    }
+    st = wl_columnar_continuation_publish(cont, &sink);
+    if (st != WL_COLUMNAR_CONTINUATION_OK || f.out->nrows != 1u
+        || !col_join_batch_cursor_get(cont, &cur) || cur.next.lr != 0u
+        || cur.next.rr == UINT32_MAX) {
+        FAIL("first batch did not park inside the collision chain");
+        goto out;
+    }
+    {
+        uint32_t row;
+        if (arrangement_bucket_head(arr, bucket, &row))
+            for (; row != UINT32_MAX; row = arr->ht_next[row])
+                if (row == cur.next.rr)
+                    parked_in_bucket = true;
+    }
+    if (!parked_in_bucket) {
+        FAIL("cursor did not remain in the selected collision bucket");
+        goto out;
+    }
+    while (st == WL_COLUMNAR_CONTINUATION_OK)
+        st = wl_columnar_continuation_publish(cont, &sink);
+    done = st == WL_COLUMNAR_CONTINUATION_DONE && f.out->nrows == 4u
+        && same_rows(oracle, f.out);
+    if (!done)
+        FAIL("collision chain did not resume to the one-shot result");
+    else
+        PASS();
+out:
+    (void)bucket;
+    if (oracle)
+        col_rel_destroy(oracle);
+    if (cont)
+        wl_columnar_continuation_destroy(cont);
     fixture_fini(&f);
 }
 
@@ -1996,6 +2270,7 @@ main(void)
     test_boundary_mid_chain();
     test_sink_failure_before_and_after_commit();
     test_stale_inputs_are_rejected();
+    test_true_cross_key_collision_resumes();
     test_exact_fit_and_one_byte_over();
     test_lease_released_on_every_path();
     test_projected_output();
