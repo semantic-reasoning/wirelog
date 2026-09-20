@@ -1323,9 +1323,25 @@ test_eligibility_ordering(void)
     ok = ok && col_join_batch_eligibility(sess, 1, false, true)
         == COL_JOIN_BATCH_EXCLUDED_FILTERED_RIGHT;
     sess->coordinator = sess;
-    ok = ok && col_join_batch_eligibility(sess, 1, false, false)
+    /* Worker sessions take precedence over every keyed/cross and
+     * right-shape exclusion. */
+    ok = ok && col_join_batch_eligibility(sess, 0, false, false)
+        == COL_JOIN_BATCH_EXCLUDED_WORKER;
+    ok = ok && col_join_batch_eligibility(sess, 0, true, true)
+        == COL_JOIN_BATCH_EXCLUDED_WORKER;
+    ok = ok && col_join_batch_eligibility(sess, 1, true, true)
         == COL_JOIN_BATCH_EXCLUDED_WORKER;
     sess->coordinator = NULL;
+    /* Cross joins are checked before either right-side exclusion. */
+    ok = ok && col_join_batch_eligibility(sess, 0, true, true)
+        == COL_JOIN_BATCH_EXCLUDED_CROSS;
+    ok = ok && col_join_batch_eligibility(sess, 0, false, true)
+        == COL_JOIN_BATCH_EXCLUDED_CROSS;
+    /* With a keyed join, delta-right precedes filtered-right. */
+    ok = ok && col_join_batch_eligibility(sess, 1, true, true)
+        == COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT;
+    ok = ok && col_join_batch_eligibility(sess, 1, false, true)
+        == COL_JOIN_BATCH_EXCLUDED_FILTERED_RIGHT;
     ok = ok && col_join_batch_eligibility(sess, 1, false, false)
         == COL_JOIN_BATCH_ELIGIBLE;
 
