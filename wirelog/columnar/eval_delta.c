@@ -1602,13 +1602,28 @@ cleanup:
     rollback->retained = sess->eval_stratum_heads_final;
     rollback->evaluation_error = rc;
     if (rc != 0) {
-        /* When retained is set the heads carry this step's result and are
-        * correct, but the step still returns non-zero and the events for
-        * that change are dropped here -- so the facts moved and nothing
-        * announced it.  Propagating a refused removal (#1661) has to settle
-        * that: either keep the events on this path or re-emit them on the
-        * retry.  Note a failure before the emission loop above has no events
-        * to clear, so this only bites on the paths that fail after it. */
+        /* This clear drops nothing this function produced on the only
+         * production caller.  session.c selects col_stratum_step_with_delta
+         * only when sess->delta_observer is set -- the other textual call site
+         * is inside the UNUSED retraction helper above, which nothing wires --
+         * and the emission loop above
+         * declines at its own "if (sess->delta_observer) continue" -- so
+         * neither wl_delta_event_append call site has run.  sess->delta_events
+         * is session-scoped and cleared once before the stratum loop, so an
+         * earlier stratum's events are still discarded here; that holds for
+         * every non-zero rc and is not specific to a refused removal.
+         *
+         * Direct callers in tests run without an observer and do reach the
+         * emission loop.  For them, and for any caller that clears the
+         * observer, retained heads plus a non-zero rc would mean the facts
+         * moved and nothing announced it.  Re-emitting on the retry cannot
+         * repair it: capture refuses while delta_rollback is live, and once
+         * cleanup_ready discards the record the retry re-baselines against the
+         * already-moved heads, so its set difference is empty.  Producing the
+         * events on this failing path is the only option left, and that is a
+         * callback-contract decision covering both producers -- the
+         * cleanup_pending conversion above and the refused terminal removal
+         * #1661 added.  Tracked as #1769. */
         wl_columnar_delta_events_clear(sess);
         int cleanup_rc = wl_columnar_session_cleanup_ready(sess);
         return cleanup_rc != 0 ? cleanup_rc : rc;

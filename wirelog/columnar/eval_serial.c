@@ -705,12 +705,34 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
              * unpublished.  A refusal keeps the registry owner, so nothing is
              * lost; it surfaces one sub-pass later if that relation publishes
              * again, and otherwise falls through to the terminal removal at
-             * the end of the stratum.  It is not propagated from here
-             * because a bare EBUSY out of col_eval_stratum is
-             * indistinguishable from an evaluation failure, and
-             * col_stratum_step_with_delta would then restore its pre-step
-             * snapshot over heads this stratum correctly emptied.  See
-             * #1661. */
+             * the end of the stratum, which does propagate.
+             *
+             * It is deliberately not propagated from here.  The terminal
+             * removal is enough for the contract: every other exit from
+             * col_eval_stratum already returns non-zero -- the two entry
+             * guards, the recursive setup failures, the cleanup_pending
+             * branch, stride_error, and the aggregate failure -- and the
+             * non-recursive branch removes no delta at all, so the only
+             * success exit that could report success with a reader-held
+             * delta still registered is the terminal one.  That closes the
+             * contract, though not the state: a refusal here followed by an
+             * unrelated later stride_error still returns non-zero with the
+             * delta registered.  What handles that depends on the caller:
+             * col_session_snapshot sweeps every $d$ relation on its error
+             * path, while col_session_step has no such sweep and leaves it
+             * to the session's lease release at teardown.  The sweep is also
+             * skipped when the session holds retained cleanup, which is the
+             * case likeliest to have caused the refusal in the first place,
+             * so do not read it as a general backstop.
+             *
+             * Propagating from here would also suppress work rather than
+             * merely report it.  Between this refusal and the same-name
+             * registration that surfaces it, a whole sub-pass runs and any
+             * rows it derives are appended to head relations; restore_flat
+             * declines a populated head, so no rollback undoes them.  The rc
+             * and the completion flag would be identical either way, so the
+             * only difference is head content this unit is not required to
+             * change.  See #1661. */
             for (uint32_t ri = 0; ri < nrels; ri++) {
                 const char *dname = sp->relations[ri].delta_name;
                 (void)session_remove_rel(sess, dname);
@@ -1002,7 +1024,15 @@ stride_error:
 
         /* Issue #317: Report recursive convergence to coordinator's progress
          * tracker so col_eval_stratum_multiworker can compute the global
-         * minimum frontier after the workqueue barrier. */
+         * minimum frontier after the workqueue barrier.
+         *
+         * A worker that records converged progress here can now return EBUSY
+         * from the terminal removal below, leaving a stale converged slot.
+         * progress.h offers only a per-stratum reset across all workers, so a
+         * worker must not undo its own entry without clobbering its siblings.
+         * Harmless today: the slot is read only after the barrier, which is
+         * skipped when any worker rc is non-zero, and the next multiworker
+         * call resets the stratum's slots first.  See #1661. */
         if (sess->coordinator) {
             wl_frontier_progress_record(&sess->coordinator->progress,
                 sess->worker_id, stratum_idx, sess->outer_epoch,
@@ -1030,23 +1060,52 @@ stride_error:
     sess->eval_stratum_heads_final = true;
 
     /* Cleanup all delta relations after frontier has been computed.  A
-     * refusal keeps the registry owner; see the sub-pass removal above for
-     * the shared reason it is not propagated from here.  Two differences
-     * matter to #1661.  This site is terminal: no fallible step follows it,
-     * and among the steps that do are delta_pool_reset, rotate_eval_arena
-     * and the mat-cache teardown, before an unconditional "return 0".  So a
-     * refusal here reports success with a reader-held delta still
-     * registered -- the contract violation the issue names, where the
-     * sub-pass site above only loses provenance -- and the allocator reset
-     * runs behind it.  Propagating from here must keep that reset
-     * reachable, or pool and arena usage grow on every retry, and must
-     * reset the frontier recorded above, or should_skip_iteration will
-     * starve the retry. */
+     * refusal keeps the registry owner, and unlike the sub-pass removal
+     * above it is returned: this is the only success exit that could
+     * otherwise report success with a reader-held delta still registered,
+     * which is the contract violation #1661 names.  See the enumeration at
+     * the sub-pass site for why every other exit already returns non-zero.
+     *
+     * The refusal is captured and returned below the whole teardown rather
+     * than from here, so no refusal path can skip delta_pool_reset,
+     * rotate_eval_arena or the mat-cache release and leave state growing on
+     * each retry.  The test pins that control flow reaches the arena
+     * rotation, so every step up to it is covered against an early return;
+     * the mat-cache release follows the rotation and rides on the single
+     * bottom return alone, and nothing is pinned against a step being
+     * skipped in place.
+     *
+     * It deliberately does not touch the frontier, and no reset is performed
+     * here.  U1's comment claimed a propagated refusal must reset it or
+     * should_skip_iteration would starve the retry.  That is false twice
+     * over.  This sweep sits outside the stride loop, so the loop's skipping
+     * cannot keep an evaluation from reaching it; and a fully skipped retry
+     * cannot arise anyway, because both vtables skip only when eff_iter is
+     * strictly greater than the recorded iteration, so effective iteration 0
+     * is never skippable.
+     * The refusal also happens below the completion point above, so the
+     * heads are already final and a retry has nothing to re-derive -- it
+     * needs this sweep, and it gets it.  The convergence record left
+     * standing is true for the same reason the heads are final, and
+     * col_session_get_frontier reports it more accurately for being left
+     * alone. */
+    int removal_rc = 0;
     for (uint32_t ri = 0; ri < nrels; ri++) {
         if (delta_rels[ri])
             col_rel_destroy(delta_rels[ri]);
         const char *dname = sp->relations[ri].delta_name;
-        (void)session_remove_rel(sess, dname);
+        int rm = session_remove_rel(sess, dname);
+        /* session_remove_rel returns exactly {0, EBUSY, ENOENT}, and
+         * session.c launders any non-zero from col_rel_destroy_checked into a
+         * literal EBUSY, so this is equivalent to "== EBUSY" today and cannot
+         * be told apart from it by a test.  The negative form is a
+         * forward-compatibility preference: a third code should propagate
+         * rather than vanish.  ENOENT is the common case and not a failure --
+         * a relation that published no delta this stratum has nothing to
+         * remove.  Keep sweeping so a later relation's private delta is still
+         * destroyed and its registration still cleared. */
+        if (rm != 0 && rm != ENOENT && removal_rc == 0)
+            removal_rc = rm;
     }
     free(snap);
     free((void *)delta_rels);
@@ -1058,7 +1117,10 @@ stride_error:
     col_mat_cache_clear(&sess->mat_cache);
     assert(sess->mat_cache.active_pins == 0);
 
-    return 0;
+    /* One return, below the teardown, so no refusal path can skip
+     * delta_pool_reset or rotate_eval_arena -- otherwise pool and arena usage
+     * would grow on every retry. */
+    return removal_rc;
 }
 static col_frontier_t
 col_frontier_compute(const col_rel_t *rel)
