@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
 """Enforce timeout coverage for process-spawning Meson tests (#1464/#1488).
 
-Every test whose command runs a shell script (argv[0] is a ``.sh`` file, or
-argv[0] is ``bash``/``sh`` and argv[1] is a ``.sh`` file) must carry an
-explicit, positive ``timeout:``.  Meson only exposes the *effective* value
-through ``meson-info/intro-tests.json`` and does not record whether the kwarg
-was written, so the gate asserts a bright line: a shell-seeded test may not
-sit at Meson's 30 s default, and may not disable its timeout with a
-non-positive value.  A gate that genuinely wants 30 s writes another value and
-justifies it in tests/meson.build.  Timeouts are hang detectors; this gate
-never measures wall time (that gap is recorded separately).
+Every test whose command spawns a process must carry an explicit, positive
+``timeout:``.  Three registration shapes are in the closure: a shell test
+(argv[0] is a ``.sh`` file, or argv[0] is ``bash``/``sh`` and argv[1] is a
+``.sh`` file); a PowerShell test (argv[0] is a ``.ps1`` file, or argv[0] is
+``pwsh``/``powershell`` and ``-File`` names a ``.ps1``); and a Python test
+whose script's AST contains a ``subprocess`` or ``os`` process call.  Meson
+only exposes the *effective* value through ``meson-info/intro-tests.json``
+and does not record whether the kwarg was written, so the gate asserts a
+bright line: such a test may not sit at Meson's 30 s default, and may not
+disable its timeout with a non-positive value.  A gate that genuinely
+wants 30 s writes another value and justifies it in tests/meson.build.
+Timeouts are hang detectors; this gate never measures wall time (that
+gap is recorded separately).
 
 The rule is suite-agnostic on purpose: suite membership is not a proxy for
-platform exposure.  It covers shell registrations on every platform and
-Python registrations whose script makes an actual subprocess or OS process
-call; pure in-process Python tests remain outside the rule.  The gate SKIPs
-(exit 77) when the build directory or its introspection is missing.
-``WIRELOG_ABI_REQUIRED=1`` turns every skip into a failure.  The shell
-classifier is shared with check-bash-constructs.py so both gates agree on
-which tests are shell-seeded.
+platform exposure.  It covers every shape above on every platform, including
+the PowerShell registrations that exist only under
+``host_machine.system() == 'windows'`` (#1489); pure in-process Python tests
+remain outside the rule.  The gate SKIPs (exit 77) when the build directory
+or its introspection is missing.  ``WIRELOG_ABI_REQUIRED=1`` turns every skip
+into a failure.  The *shell* third of the classifier is shared with
+check-bash-constructs.py so both gates agree on which tests are shell-seeded;
+the PowerShell and Python shapes are this gate's alone and deliberately stay
+outside that ratchet's closure.
 
 Usage: check-shell-gate-timeouts.py <builddir>
 """
@@ -105,6 +111,18 @@ def python_process_seed_from_cmd(cmd: object, root: Path = SOURCE_ROOT) -> str |
 
 
 def powershell_seed_from_cmd(cmd: object) -> str | None:
+    """Return the PowerShell script an introspected test command runs, or None.
+
+    A test is PowerShell-seeded when argv[0] is a ``.ps1`` file or when argv[0]
+    is ``pwsh``/``powershell`` and ``-File`` names a ``.ps1``.  Deliberately
+    *not* shared with check-bash-constructs.py: a ``.ps1`` in that gate's
+    closure would be lexed as Bash (#1489).
+
+    Only the spelled-out ``-File``/``--file`` is recognised.  PowerShell also
+    accepts unambiguous prefix abbreviations (``-f``, ``-Fi``), so a
+    registration written that way would escape this gate; no such registration
+    exists today.
+    """
     if not isinstance(cmd, list) or not cmd:
         return None
     first = Path(str(cmd[0])).name.lower()
@@ -150,6 +168,7 @@ def python_process_seeds(intro: Path) -> list[tuple[dict, str]]:
 
 
 def powershell_seeds(intro: Path) -> list[tuple[dict, str]]:
+    """Return (test entry, PowerShell script) for every PowerShell-seeded test."""
     data = json.loads(intro.read_text(encoding="utf-8"))
     if not isinstance(data, list):
         raise ValueError("introspection is not a list of tests")
@@ -158,7 +177,7 @@ def powershell_seeds(intro: Path) -> list[tuple[dict, str]]:
 
 
 def offenders_from_intro(intro: Path) -> tuple[int, list[str]]:
-    """Return (shell-seeded test count, offender lines) for ``intro``."""
+    """Return (process-spawning test count, offender lines) for ``intro``."""
     checked = 0
     offenders: list[str] = []
     seeds = shell_seeds(intro) + powershell_seeds(intro) + python_process_seeds(intro)
@@ -204,12 +223,13 @@ def main(argv: list[str]) -> int:
     if checked == 0:
         # "Nothing to check" and "the scan no longer matches registrations"
         # are the same result unless the count is floored.
-        return fail("introspection contained no shell-seeded or process-spawning "
-                    "Python tests; the classifier or tests/meson.build has changed shape")
+        return fail("introspection contained no process-spawning tests "
+                    "(shell, PowerShell, Python); the classifier or "
+                    "tests/meson.build has changed shape")
     if offenders:
         return fail("\n".join(offenders))
-    print(f"check-shell-gate-timeouts: ok {checked} shell-seeded or "
-          "process-spawning Python tests carry "
+    print(f"check-shell-gate-timeouts: ok {checked} process-spawning tests "
+          "(shell, PowerShell, Python) carry "
           f"an explicit positive timeout (none at the {MESON_DEFAULT_TIMEOUT}s default)")
     return 0
 
