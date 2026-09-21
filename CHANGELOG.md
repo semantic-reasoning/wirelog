@@ -72,6 +72,15 @@ All notable changes to wirelog are documented in this file.
 
 ### Documentation
 
+- **Shell-gate timeout rule text now matches the gate's closure**
+  (#1489): after #1488 widened the gate to PowerShell-seeded and
+  process-spawning Python registrations, the gate's opening paragraph and
+  `CONTRIBUTING.md` still described the rule as `.sh`-only, and neither
+  mentioned PowerShell. Also pins the constraint that a `.ps1` seed stays
+  out of the bash-construct ratchet's closure, states that the walltime
+  budget gate still measures only `.sh`-seeded tests, and records why
+  `abi_symbols_windows` carries an explicit 120s timeout.
+
 ## [0.62.0] - 2026-09-12
 
 ### Added

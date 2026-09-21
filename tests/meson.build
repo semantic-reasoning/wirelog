@@ -1422,6 +1422,11 @@ if host_machine.system() == 'darwin' and sh.found()
        timeout: 120)
 endif
 
+# Issue #1489: PowerShell-seeded, and registered only on Windows -- the one
+# runner where process creation is expensive enough that the 30s default is
+# the #1462 exposure class. The timeout gate classifies it (a `.ps1` behind
+# `-File`) and reports it from the Windows introspection, so the 120 below is
+# enforced, not advisory.
 powershell = find_program('pwsh', 'powershell', required: false)
 if host_machine.system() == 'windows' and powershell.found()
   test('abi_symbols_windows', powershell,

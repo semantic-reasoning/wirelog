@@ -136,7 +136,15 @@ explicit `timeout:` enforced by the *timeout* gate
 detector, not a drift detector: a gate that quietly goes from 3s to 110s still
 passes everything. The *walltime budget* gate closes that gap.
 
-Because its measurement input (`build/meson-logs/testlog.json`) exists only
+Since #1488 the timeout gate's closure is wider than this section's: it also
+covers PowerShell-seeded registrations (argv[0] a `.ps1`, or
+`pwsh`/`powershell` with `-File`) and Python registrations whose script makes
+a real process call. The walltime budget below still measures only
+`.sh`-seeded tests, so `abi_symbols_windows` carries a hang detector but no
+drift detector (#1489).
+
+Because the walltime gate's measurement input
+(`build/meson-logs/testlog.json`) exists only
 after `meson test`, it runs as a **post-suite CI step** in
 `ci-pr.yml` (`build-matrix`, all three OSes) and `release-tag.yml` (the
 `default` job), not as a suite member -- a suite-registered gate would always
