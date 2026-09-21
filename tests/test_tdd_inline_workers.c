@@ -6,6 +6,7 @@
 #include "../wirelog/passes/fusion.h"
 #include "../wirelog/passes/jpp.h"
 #include "../wirelog/passes/sip.h"
+#include "../wirelog/ir/program.h"
 #include "../wirelog/session.h"
 #include "../wirelog/wirelog.h"
 #include "plan_fixture.h"
@@ -136,6 +137,27 @@ relation_shape(wl_col_session_t *session, const char *name)
     return false;
 }
 
+static bool
+program_relation_shape(const wirelog_program_t *program, const char *name)
+{
+    for (uint32_t i = 0; i < program->relation_count; i++) {
+        const wl_ir_relation_info_t *rel = &program->relations[i];
+        if (rel->name && strcmp(rel->name, name) == 0) {
+            return rel->column_count == 3
+                   && rel->columns
+                   && rel->columns[0].compound_kind
+                   == WIRELOG_COMPOUND_KIND_NONE
+                   && rel->columns[1].compound_kind
+                   == WIRELOG_COMPOUND_KIND_NONE
+                   && rel->columns[2].compound_kind
+                   == WIRELOG_COMPOUND_KIND_INLINE
+                   && rel->columns[2].compound_arity == 2
+                   && wl_ir_relation_physical_width(rel) == 4;
+        }
+    }
+    return false;
+}
+
 static void
 count_rows(const char *relation, const int64_t *row, uint32_t ncols, void *arg)
 {
@@ -225,6 +247,10 @@ run_lifecycle(uint32_t workers, bool require_dispatch)
     wl_fusion_apply(program, NULL);
     wl_jpp_apply(program, NULL);
     wl_sip_apply(program, NULL);
+    if (!program_relation_shape(program, "reach")) {
+        wirelog_program_free(program);
+        return 1;
+    }
     rc = wl_plan_from_program(program, &plan);
     if (rc != 0 || !plan) {
         wirelog_program_free(program);
@@ -271,6 +297,23 @@ run_lifecycle(uint32_t workers, bool require_dispatch)
         || (columnar->tdd_audit.replay
         && strcmp(columnar->tdd_audit.replay,
         "owner_tiny_frontier") != 0))) {
+        rc = EIO;
+        goto cleanup;
+    }
+    if (!require_dispatch
+        && (columnar->tdd_audit.selected_workers != 0
+        || columnar->tdd_audit.submitted_tasks != 0
+        || columnar->tdd_audit.completed_rounds != 0
+        || adaptive != 0)) {
+        rc = EIO;
+        goto cleanup;
+    }
+    if (require_dispatch
+        && (fallback != 0 || ineligible != 0 || no_exchange != 0
+        || unsafe != 0 || adaptive != 0
+        || (reason && reason[0] != '\0'
+        && strcmp(reason, "none") != 0
+        && strcmp(reason, "owner_tiny_frontier") != 0))) {
         rc = EIO;
         goto cleanup;
     }
