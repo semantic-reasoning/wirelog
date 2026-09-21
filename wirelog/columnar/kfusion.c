@@ -667,6 +667,23 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
         worker_sess[d].source_leases = NULL;
         worker_sess[d].deferred_relations = NULL;
         worker_sess[d].deferred_relation_count = 0;
+        /* #1765: the wrapper is a shallow copy, so without this the branch
+         * shares the parent's retained-entry head pointer.  A branch that
+         * retains then prepends in front of the parent's own list, and any
+         * later splice of the two links a shared node to itself -- a cyclic
+         * list whose next walk never terminates.  Starting empty keeps the
+         * branch's retentions its own.
+         *
+         * Entries the branch does retain are still lost when the wrapper is
+         * released with free() below; that leak is deliberately left alone.
+         * The relations behind them come from this branch's delta_pool and
+         * eval_arena, which are destroyed a few lines after any hand-off
+         * could happen, so exporting them to the parent would replace a leak
+         * with a use-after-free.  K-Fusion is slated for removal, so the
+         * orphan is left to go with it rather than carrying a transfer path
+         * for a doomed component. */
+        worker_sess[d].retained_eval_entries = NULL;
+        worker_sess[d].retained_eval_entry_count = 0;
         /* The shallow session copy must not retain coordinator reclaimer
          * callbacks after the worker cache is replaced below. */
         memset(worker_sess[d].mem_ledger.reclaimers, 0,
