@@ -3890,7 +3890,9 @@ test_join_right_filter_cleanup_exe = executable(
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   c_args: host_machine.system() == 'linux' ? ['-DWL_TEST_ALLOC_WRAP=1'] : [],
-  link_args: host_machine.system() == 'linux' ? ['-Wl,--wrap=calloc'] : [],
+  link_args: host_machine.system() == 'linux' ? [
+    '-Wl,--wrap=malloc', '-Wl,--wrap=calloc',
+  ] : [],
   override_options: host_machine.system() == 'linux' ? ['b_lto=false'] : [],
   link_with: host_machine.system() == 'linux' ? [] : [testlib_prod],
 )
