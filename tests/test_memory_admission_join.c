@@ -307,6 +307,40 @@ run_join(wl_col_session_t *sess, col_rel_t *left, const wl_plan_op_t *op,
     return 0;
 }
 
+/* Run the differential operator directly so its persistent arrangement and
+ * parallel keyed reserve path are exercised rather than the ordinary join. */
+static int
+run_diff_join(wl_col_session_t *sess, col_rel_t *left,
+    const wl_plan_op_t *op, eval_entry_t *out)
+{
+    eval_stack_t stack;
+    int rc;
+
+    eval_stack_init(&stack);
+    eval_stack_push(&stack, left, false);
+    rc = wl_columnar_join_diff_op(op, &stack, sess);
+    if (rc != 0) {
+        if (out) {
+            out->rel = NULL;
+            out->owned = false;
+        }
+        while (stack.top > 0) {
+            eval_entry_t e = eval_stack_pop(&stack);
+            if (e.owned)
+                col_rel_destroy(e.rel);
+        }
+        return rc;
+    }
+    if (out)
+        *out = eval_stack_pop(&stack);
+    else {
+        eval_entry_t e = eval_stack_pop(&stack);
+        if (e.owned)
+            col_rel_destroy(e.rel);
+    }
+    return 0;
+}
+
 /* ---- case 1: attach + baseline ----------------------------------------- */
 
 static void
@@ -384,6 +418,22 @@ init_cross_op(wl_plan_op_t *op)
     op->op = WL_PLAN_OP_JOIN;
     op->right_relation = "right";
     op->key_count = 0;
+    op->delta_mode = WL_DELTA_FORCE_FULL;
+    op->materialized = true;
+}
+
+static void
+init_diff_keyed_op(wl_plan_op_t *op)
+{
+    static const char *const left_keys[] = { "k" };
+    static const char *const right_keys[] = { "k" };
+
+    memset(op, 0, sizeof(*op));
+    op->op = WL_PLAN_OP_JOIN;
+    op->right_relation = "right";
+    op->key_count = 1;
+    op->left_keys = left_keys;
+    op->right_keys = right_keys;
     op->delta_mode = WL_DELTA_FORCE_FULL;
     op->materialized = true;
 }
@@ -1039,6 +1089,174 @@ out:
     destroy_session(sess);
 }
 
+/* ---- cases 11 and 12: parallel keyed differential join ---------------- */
+
+static bool
+measure_parallel_diff_peak(uint64_t *peak_out)
+{
+    const uint32_t expected_rows = 130u;
+    wl_col_session_t *sess = make_session_workers(64ull * 1024 * 1024, 2);
+    col_rel_t *right = make_right(1, 2);
+    col_rel_t *left = make_left(65, 1);
+    wl_plan_op_t op;
+    eval_entry_t result = { 0 };
+    const col_rel_t *governed;
+    uint64_t final_bytes;
+    uint64_t initial_bytes;
+    uint64_t other_bytes;
+    bool ok = false;
+
+    setenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS", "2", 1);
+    if (!sess || !right || !left)
+        goto out;
+    if (session_add_rel(sess, right) != 0)
+        goto out;
+    right = NULL;
+    init_diff_keyed_op(&op);
+    if (run_diff_join(sess, left, &op, &result) != 0)
+        goto out;
+    governed = cached_output(sess, left);
+    if (!governed || governed->nrows != expected_rows
+        || governed->capacity != expected_rows
+        || governed->pool_owned || governed->memory_governor == NULL
+        || sess->wq == NULL || sess->diff_arr_count != 1
+        || !admission_invariant(governed))
+        goto out_entry;
+    if (!col_rel_retained_bytes_for(governed, governed->capacity,
+        &final_bytes)
+        || !col_rel_retained_bytes_for(governed, COL_REL_INIT_CAP,
+        &initial_bytes)
+        || governed->retained_reserved_bytes != final_bytes)
+        goto out_entry;
+    other_bytes = reserved_of(sess) - governed->retained_reserved_bytes;
+    /* A diff transaction deep-copies the persistent arrangement while the
+     * output grows, so include that second arrangement footprint and the
+     * output's initial token in the one-byte-short budget. */
+    if (other_bytes > UINT64_MAX - initial_bytes
+        || reserved_of(sess) > UINT64_MAX - other_bytes - initial_bytes)
+        goto out_entry;
+    *peak_out = reserved_of(sess) + other_bytes + initial_bytes;
+    ok = *peak_out > 0;
+out_entry:
+    if (result.owned && result.rel)
+        col_rel_destroy(result.rel);
+out:
+    unsetenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS");
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+    return ok;
+}
+
+static void
+test_parallel_diff_output_is_governed(void)
+{
+    const uint32_t expected_rows = 130u;
+    wl_col_session_t *sess = make_session_workers(64ull * 1024 * 1024, 2);
+    col_rel_t *right = make_right(1, 2);
+    col_rel_t *left = make_left(65, 1);
+    wl_plan_op_t op;
+    eval_entry_t result = { 0 };
+    const col_rel_t *governed;
+
+    TEST("parallel keyed diff output is governed after bulk reserve");
+    setenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS", "2", 1);
+    if (!sess || !right || !left) {
+        FAIL("fixture");
+        goto out;
+    }
+    if (session_add_rel(sess, right) != 0) {
+        FAIL("right relation registration failed");
+        goto out;
+    }
+    right = NULL;
+    init_diff_keyed_op(&op);
+    if (op.key_count == 0 || op.right_filter_expr.size != 0
+        || !op.materialized) {
+        FAIL("diff fixture does not select the governed keyed path");
+        goto out;
+    }
+    if (run_diff_join(sess, left, &op, &result) != 0) {
+        FAIL("parallel keyed diff join failed under a generous budget");
+        goto out;
+    }
+    governed = cached_output(sess, left);
+    if (!governed || governed->pool_owned || governed->memory_governor == NULL
+        || governed->nrows != expected_rows
+        || governed->capacity != expected_rows
+        || governed->memory_governor != sess->memory_governor
+        || col_rel_get(governed, 0, 0) != 0
+        || col_rel_get(governed, expected_rows - 1u, 0) != 0) {
+        FAIL("parallel keyed diff output did not reach governed exact reserve");
+        goto out_entry;
+    }
+    if (sess->wq == NULL || sess->diff_arr_count != 1) {
+        FAIL("persistent parallel keyed diff path was not reached");
+        goto out_entry;
+    }
+    if (!admission_invariant(governed)
+        || governed->retained_reserved_bytes == 0u) {
+        FAIL("governed diff output token does not cover capacity");
+        goto out_entry;
+    }
+    PASS();
+out_entry:
+    if (result.owned && result.rel)
+        col_rel_destroy(result.rel);
+out:
+    unsetenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS");
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+}
+
+static void
+test_parallel_diff_denial(void)
+{
+    wl_col_session_t *sess = NULL;
+    col_rel_t *right = make_right(1, 2);
+    col_rel_t *left = make_left(65, 1);
+    wl_plan_op_t op;
+    uint64_t peak = 0;
+    eval_entry_t denied_result = { 0 };
+
+    TEST("parallel keyed diff bulk reserve denies one byte below peak");
+    setenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS", "2", 1);
+    if (!measure_parallel_diff_peak(&peak) || peak <= 1u) {
+        FAIL("could not measure the parallel diff overlap peak");
+        goto out;
+    }
+    sess = make_session_workers(peak - 1u, 2);
+    if (!sess || !right || !left) {
+        FAIL("fixture");
+        goto out;
+    }
+    if (session_add_rel(sess, right) != 0) {
+        FAIL("right relation registration failed");
+        goto out;
+    }
+    right = NULL;
+    init_diff_keyed_op(&op);
+    int rc = run_diff_join(sess, left, &op, &denied_result);
+    if (rc != ENOMEM) {
+        FAIL("unaffordable parallel keyed diff was not denied with ENOMEM");
+        goto out;
+    }
+    if (reserved_of(sess) != 0u || sess->mat_cache.count != 0
+        || sess->diff_arr_count != 0) {
+        FAIL("denied diff join left reservations or arrangement state behind");
+        goto out;
+    }
+    if (denied_result.owned && denied_result.rel)
+        col_rel_destroy(denied_result.rel);
+    PASS();
+out:
+    unsetenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS");
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 int
@@ -1067,6 +1285,8 @@ main(void)
     test_parallel_cross_output_is_governed();
     test_parallel_cross_denial();
     test_small_parallel_cross_is_admitted();
+    test_parallel_diff_output_is_governed();
+    test_parallel_diff_denial();
 
     printf("\n  %d run, %d passed, %d failed\n",
         tests_run, tests_passed, tests_failed);
