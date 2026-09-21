@@ -17,6 +17,21 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* glibc's C11 <threads.h> trampoline is not a reliable ThreadSanitizer
+ * runtime surface.  Keep this worker test on the POSIX TSan gate, while the
+ * native C11 configuration remains compile-smoke coverage. */
+#if defined(__SANITIZE_THREAD__)
+#define WL_TEST_THREAD_SANITIZER 1
+#elif defined(__clang__)
+#if __has_feature(thread_sanitizer)
+#define WL_TEST_THREAD_SANITIZER 1
+#endif
+#endif
+
+#if defined(WL_HAVE_C11_THREADS) && defined(WL_TEST_THREAD_SANITIZER)
+#define WL_SKIP_NATIVE_C11_TSAN 1
+#endif
+
 #ifdef _WIN32
 static int
 wl_test_setenv_(const char *name, const char *value, int overwrite)
@@ -397,6 +412,13 @@ fail:
 int
 main(void)
 {
+#if defined(WL_SKIP_NATIVE_C11_TSAN)
+    fprintf(stderr,
+        "tdd_inline_workers: SKIP: native C11 threads are not a reliable "
+        "ThreadSanitizer runtime surface; use -Dthreads=posix for TSan "
+        "runtime coverage\n");
+    return 77;
+#endif
     const char *old_threshold = getenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER");
     char *saved_threshold = old_threshold ? strdup(old_threshold) : NULL;
     const char *old_profile = getenv("WIRELOG_TDD_STRATUM_PROFILE");
