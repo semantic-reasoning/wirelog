@@ -36,6 +36,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef WL_TEST_JOIN_TIMESTAMP_HOOK
+extern bool wl_columnar_join_test_enable_semijoin_timestamps;
+#endif
+
 #ifdef WL_TEST_ALLOC_WRAP
 void *__real_malloc(size_t size);
 void *__real_calloc(size_t count, size_t size);
@@ -712,6 +716,81 @@ test_right_filter_preserves_timestamps(void)
     return 0;
 }
 
+#ifdef WL_TEST_JOIN_TIMESTAMP_HOOK
+static int
+test_semijoin_timestamp_exact_resize(void)
+{
+    TEST("semijoin timestamp storage grows with exact reserve");
+    const char *left_names[] = { "k" };
+    const char *right_names[] = { "k" };
+    const uint32_t rows = COL_REL_INIT_CAP + 1;
+    wl_col_session_t *sess = make_mock_session();
+    col_rel_t *left = make_rel("timestamp-left", 1, left_names);
+    col_rel_t *right = make_rel("timestamp-right", 1, right_names);
+    eval_stack_t stack;
+    wl_plan_op_t op = { 0 };
+    const char *keys[] = { "k" };
+    bool ok = sess && left && right;
+    bool left_owned = true;
+    eval_stack_init(&stack);
+    if (ok) {
+        sess->num_workers = 2;
+        sess->coordinator = false;
+        ok = col_rel_enable_timestamps(left) == 0;
+        for (uint32_t i = 0; ok && i < rows; i++) {
+            int64_t value = (int64_t)i;
+            ok = col_rel_append_row(left, &value) == 0
+                && col_rel_append_row(right, &value) == 0;
+            if (ok)
+                left->timestamps[i] = (col_delta_timestamp_t){
+                    .iteration = 100 + i, .stratum = 200 + i,
+                    .worker = 300 + i, .multiplicity = -((int64_t)i + 1)
+                };
+        }
+        ok = ok && session_add_rel(sess, right) == 0
+            && eval_stack_push(&stack, left, true) == 0;
+        if (ok)
+            left_owned = false;
+    }
+    op.op = WL_PLAN_OP_SEMIJOIN;
+    op.right_relation = "timestamp-right";
+    op.left_keys = keys;
+    op.right_keys = keys;
+    op.key_count = 1;
+    setenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS", "1", 1);
+    wl_columnar_join_test_enable_semijoin_timestamps = true;
+    if (ok) {
+        ok = wl_columnar_semijoin_op(&op, &stack, sess) == 0
+            && stack.top == 1;
+    }
+    wl_columnar_join_test_enable_semijoin_timestamps = false;
+    if (ok) {
+        eval_entry_t result = eval_stack_pop(&stack);
+        ok = result.rel->nrows == rows && result.rel->capacity >= rows
+            && result.rel->timestamps
+            && result.rel->timestamp_capacity >= result.rel->capacity;
+        for (uint32_t i = 0; ok && i < rows; i++) {
+            col_delta_timestamp_t zero = { 0 };
+            ok = memcmp(&result.rel->timestamps[i], &zero, sizeof(zero)) == 0;
+        }
+        if (result.owned)
+            col_rel_destroy(result.rel);
+    }
+    unsetenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS");
+    while (stack.top > 0) {
+        eval_entry_t entry = eval_stack_pop(&stack);
+        if (entry.owned)
+            col_rel_destroy(entry.rel);
+    }
+    if (left_owned && left)
+        col_rel_destroy(left);
+    if (sess)
+        destroy_mock_session(sess);
+    if (ok) PASS(); else FAIL("timestamp reserve mismatch");
+    return ok ? 0 : 1;
+}
+#endif
+
 static wl_columnar_memory_governor_ref_t *
 right_filter_governor(uint64_t bytes)
 {
@@ -1142,6 +1221,9 @@ main(void)
     test_success_path_uses_owned_filter();
     test_probe_error_releases_filter();
     test_right_filter_preserves_timestamps();
+#ifdef WL_TEST_JOIN_TIMESTAMP_HOOK
+    test_semijoin_timestamp_exact_resize();
+#endif
     test_backpressure_exit("join: backpressure exit releases the filter",
         wl_columnar_join_op, WL_PLAN_OP_JOIN);
     test_backpressure_exit("join(diff): backpressure exit releases the filter",
