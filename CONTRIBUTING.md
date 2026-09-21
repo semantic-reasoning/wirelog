@@ -141,7 +141,7 @@ covers PowerShell-seeded registrations (argv[0] a `.ps1`, or
 `pwsh`/`powershell` with `-File`) and Python registrations whose script makes
 a real process call. The walltime budget below still measures only
 `.sh`-seeded tests, so `abi_symbols_windows` carries a hang detector but no
-drift detector (#1489).
+drift detector (#1797).
 
 Because the walltime gate's measurement input
 (`build/meson-logs/testlog.json`) exists only
