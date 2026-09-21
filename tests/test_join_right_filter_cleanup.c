@@ -37,9 +37,22 @@
 #include <string.h>
 
 #ifdef WL_TEST_ALLOC_WRAP
+void *__real_malloc(size_t size);
 void *__real_calloc(size_t count, size_t size);
+static size_t fail_malloc_bytes;
+static unsigned fail_malloc_hits;
 static size_t fail_calloc_bytes;
 static unsigned fail_calloc_hits;
+void *__wrap_malloc(size_t size)
+{
+    if (fail_malloc_bytes != 0 && size == fail_malloc_bytes) {
+        fail_malloc_bytes = 0;
+        fail_malloc_hits++;
+        return NULL;
+    }
+    return __real_malloc(size);
+}
+
 void *__wrap_calloc(size_t count, size_t size)
 {
     if (fail_calloc_bytes != 0 && count > 0
@@ -526,6 +539,52 @@ test_right_filter_preserves_timestamps(void)
         col_filt_cache_pin_release(&fault_pin);
         if (fault_sess)
             destroy_mock_session(fault_sess);
+
+        /* Force timestamp storage growth while materializing an uncached
+         * output.  The failure must abort before a selected row can write
+         * through a missing destination timestamp array, and retry must
+         * preserve the final row's provenance. */
+        const char *grow_names[] = { "grow-k", "grow-r" };
+        col_rel_t *grow_rel = make_rel("timestamp-grow", 2, grow_names);
+        col_rel_t *grow_out = NULL;
+        const uint32_t grow_rows = COL_REL_INIT_CAP + 1;
+        if (ok && grow_rel && col_rel_enable_timestamps(grow_rel) == 0) {
+            for (uint32_t i = 0; i < grow_rows; i++) {
+                int64_t row[] = { (int64_t)i, 200 + (int64_t)i };
+                if (col_rel_append_row(grow_rel, row) != 0) {
+                    ok = 0;
+                    break;
+                }
+                grow_rel->timestamps[i] = (col_delta_timestamp_t){
+                    .iteration = 700 + i, .stratum = 800 + i,
+                    .worker = 900 + i, .multiplicity = -((int64_t)i + 1)
+                };
+            }
+        } else {
+            ok = 0;
+        }
+        if (ok) {
+            fail_malloc_bytes = (size_t)COL_REL_INIT_CAP * 2
+                * sizeof(*grow_rel->timestamps);
+            fail_malloc_hits = 0;
+            grow_out = wl_columnar_filter_apply_right_filter(&expr, grow_rel,
+                    pool, NULL);
+            ok = !grow_out && fail_malloc_hits == 1;
+        }
+        fail_malloc_bytes = 0;
+        if (ok) {
+            grow_out = wl_columnar_filter_apply_right_filter(&expr, grow_rel,
+                    pool, NULL);
+            ok = grow_out && grow_out->nrows == grow_rows
+                && grow_out->timestamps[grow_rows - 1].iteration
+                == 700 + grow_rows - 1
+                && grow_out->timestamps[grow_rows - 1].multiplicity
+                == -(int64_t)grow_rows;
+        }
+        if (grow_out)
+            col_rel_destroy(grow_out);
+        if (grow_rel)
+            col_rel_destroy(grow_rel);
     }
 #endif
     col_filt_cache_pin_release(&pin);

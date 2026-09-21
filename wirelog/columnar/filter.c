@@ -577,12 +577,30 @@ col_filter_select_rows(const int64_t *col_a, const int64_t *col_b,
 
 /* Append a selected row and retain its complete provenance record. */
 static int
+wl_columnar_filter_prepare_timestamps(col_rel_t *out, const col_rel_t *src)
+{
+    if (!src->timestamps)
+        return 0;
+    int rc = col_rel_enable_timestamps(out);
+    if (rc != 0)
+        return rc;
+    /* col_rel_enable_timestamps() is allowed to be a no-op for a
+     * zero-capacity relation.  A timestamped source still requires a real
+     * destination array before the first selected row is appended. */
+    return out->timestamps ? 0 : ENOMEM;
+}
+
+static int
 wl_columnar_filter_append_selected(col_rel_t *out, const col_rel_t *src,
     uint32_t src_row, const int64_t *row)
 {
+    if (!out || !src || !row || src_row >= src->nrows
+        || (src->timestamps && !out->timestamps))
+        return EINVAL;
+    uint32_t dst_row = out->nrows;
     int rc = col_rel_append_row(out, row);
     if (rc == 0 && src->timestamps)
-        out->timestamps[out->nrows - 1] = src->timestamps[src_row];
+        out->timestamps[dst_row] = src->timestamps[src_row];
     return rc;
 }
 
@@ -612,7 +630,8 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
     }
 
     bool timestamped = e.rel->timestamps != NULL;
-    if (timestamped && col_rel_enable_timestamps(out) != 0) {
+    if (timestamped && wl_columnar_filter_prepare_timestamps(out, e.rel)
+        != 0) {
         (void)col_rel_destroy_checked(out);
         return wl_columnar_filter_dispose_input(stack, &e, ENOMEM);
     }
@@ -1012,7 +1031,8 @@ wl_columnar_filter_apply_right_filter_governed(
         pool, "$rfilter", rel, governor);
     if (!out)
         return NULL;
-    if (rel->timestamps && col_rel_enable_timestamps(out) != 0) {
+    if (rel->timestamps && wl_columnar_filter_prepare_timestamps(out, rel)
+        != 0) {
         col_rel_destroy(out);
         return NULL;
     }
@@ -1134,7 +1154,8 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
             if (!e->filtered)
                 return NULL;
             if (rel->timestamps &&
-                col_rel_enable_timestamps(e->filtered) != 0) {
+                wl_columnar_filter_prepare_timestamps(e->filtered, rel)
+                != 0) {
                 col_rel_destroy(e->filtered);
                 e->filtered = NULL;
                 return NULL;
@@ -1195,7 +1216,8 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
         return NULL;
     }
     if (rel->timestamps
-        && col_rel_enable_timestamps(sess->filt_cache[idx].filtered) != 0) {
+        && wl_columnar_filter_prepare_timestamps(
+            sess->filt_cache[idx].filtered, rel) != 0) {
         col_rel_destroy(sess->filt_cache[idx].filtered);
         sess->filt_cache[idx].filtered = NULL;
         free(sess->filt_cache[idx].filter_data);
