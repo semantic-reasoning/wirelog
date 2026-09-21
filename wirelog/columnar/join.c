@@ -34,6 +34,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef WL_TEST_JOIN_TIMESTAMP_HOOK
+bool wl_columnar_join_test_enable_semijoin_timestamps;
+#endif
+
 /* Retire the whole evaluator entry; refusal keeps its relation and segment
  * metadata together in the caller's vacated stack slot. */
 static int
@@ -267,57 +271,9 @@ col_join_reserve_exact(col_rel_t *rel, uint32_t nrows)
 {
     if (!rel)
         return EINVAL;
-    if (rel->memory_governor) {
-        /* Issue #1477: a governed output admits the exact target before the
-         * buffers exist.  col_rel_reserve_capacity_admitted() reserves the
-         * new footprint while the old token is still committed, publishes
-         * the resize, then retires the old token exactly once -- so the
-         * capacity never moves ahead of the reservation covering it.
-         *
-         * This runs BEFORE the nrows <= capacity early return below, and
-         * must stay there.  col_rel_new_auto() allocates COL_REL_INIT_CAP
-         * rows up front, so a caller that attaches the governor and leaves
-         * the admission to this helper (col_join_parallel_cross) would
-         * otherwise leave those buffers uncharged whenever the exact target
-         * fits inside the initial capacity.  The helper is idempotent for
-         * an already-covered relation: it admits the buffers the relation
-         * already owns and returns 0 when the committed token covers them.
-         *
-         * The two paths are equivalent for the timestamp-free relations
-         * that reach here (neither governed output enables timestamps);
-         * for a timestamped relation the admitted path is the stricter of
-         * the two, because it also resizes the timestamp array.  Ungoverned
-         * callers keep the realloc path below unchanged, which is what
-         * keeps the pooled semijoin output bit-identical. */
-        return col_rel_reserve_capacity_admitted(rel, nrows, NULL);
-    }
-    if (nrows <= rel->capacity)
-        return 0;
-    uint64_t ledger_before = col_rel_owned_ledger_bytes(rel);
-    uint32_t old_cap = rel->capacity;
-    if (rel->arena_owned) {
-        int64_t **new_cols = col_columns_alloc(rel->ncols, nrows);
-        if (!new_cols)
-            return ENOMEM;
-        for (uint32_t c = 0; c < rel->ncols; c++)
-            memcpy(new_cols[c], rel->columns[c],
-                sizeof(int64_t) * rel->nrows);
-        free((void *)rel->columns);
-        rel->columns = new_cols;
-        rel->arena_owned = false;
-    } else if (rel->columns) {
-        if (col_columns_realloc_atomic(rel->columns, rel->ncols, old_cap,
-            nrows) != 0)
-            return ENOMEM;
-    } else {
-        rel->columns = col_columns_alloc(rel->ncols, nrows);
-        if (!rel->columns)
-            return ENOMEM;
-    }
-    rel->capacity = nrows;
-    col_rel_ledger_reconcile(rel, ledger_before);
-    wl_columnar_relation_touch_storage(rel);
-    return 0;
+    /* The relation-level transaction resizes columns and timestamps together
+     * and leaves all ownership/capacity metadata unchanged on failure. */
+    return col_rel_reserve_capacity_admitted(rel, nrows, NULL);
 }
 
 typedef struct {
@@ -1939,6 +1895,17 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
             col_rel_destroy(right_filtered);
         return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
     }
+#ifdef WL_TEST_JOIN_TIMESTAMP_HOOK
+    if (wl_columnar_join_test_enable_semijoin_timestamps
+        && col_rel_enable_timestamps(out) != 0) {
+        col_rel_destroy(out);
+        free(lk);
+        free(rk);
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
+        return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
+    }
+#endif
 
     int64_t *tmp = (int64_t *)malloc(sizeof(int64_t) * (ocols ? ocols : 1));
     if (!tmp) {

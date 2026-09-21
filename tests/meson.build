@@ -3889,7 +3889,10 @@ test_join_right_filter_cleanup_exe = executable(
     optimizer_src, arena_src, io_src, thread_src, workqueue_src] : [],
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
-  c_args: host_machine.system() == 'linux' ? ['-DWL_TEST_ALLOC_WRAP=1'] : [],
+  c_args: host_machine.system() == 'linux' ? [
+    '-DWL_TEST_ALLOC_WRAP=1',
+    '-DWL_TEST_JOIN_TIMESTAMP_HOOK=1',
+  ] : [],
   link_args: host_machine.system() == 'linux' ? [
     '-Wl,--wrap=malloc', '-Wl,--wrap=calloc',
   ] : [],
