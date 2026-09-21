@@ -1644,11 +1644,19 @@ cleanup:
          * moved and nothing announced it.  Re-emitting on the retry cannot
          * repair it: capture refuses while delta_rollback is live, and once
          * cleanup_ready discards the record the retry re-baselines against the
-         * already-moved heads, so its set difference is empty.  Producing the
-         * events on this failing path is the only option left, and that is a
-         * callback-contract decision covering both producers -- the
-         * cleanup_pending conversion above and the refused terminal removal
-         * #1661 added.  Tracked as #1769. */
+         * already-moved heads, so its set difference is empty.
+         *
+         * #1769 settled this as documentation, not code.  No public caller
+         * reaches the emission body -- it declines at the observer check
+         * above -- so the loss is a test-visible property of this path rather
+         * than a contract wl_session_step owes anyone; emitting on the
+         * failing path would change the callback contract for a public
+         * caller that does not exist.  wirelog/session.h instead scopes
+         * the retry guarantee to the whole-step observer baseline, which
+         * covers both producers -- the cleanup_pending conversion above and
+         * the refused terminal removal #1661 added.  A caller that clears
+         * the observer and drives this function directly still loses the
+         * events; that is the accepted cost. */
         wl_columnar_delta_events_clear(sess);
         int cleanup_rc = wl_columnar_session_cleanup_ready(sess);
         return cleanup_rc != 0 ? cleanup_rc : rc;
