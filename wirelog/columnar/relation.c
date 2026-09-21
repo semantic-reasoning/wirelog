@@ -2450,15 +2450,18 @@ done:
     return rc;
 }
 
-int
-wl_columnar_relation_delta_restore_flat(col_rel_t *rel,
+static int
+wl_columnar_relation_delta_restore_flat_impl(col_rel_t *rel,
     uint64_t expected_identity, const int64_t *rows,
-    uint32_t nrows, uint32_t ncols)
+    uint32_t nrows, uint32_t ncols, bool overwrite)
 {
     wl_columnar_source_access_writer_t descriptor = { 0 }, writer = { 0 };
     wl_columnar_memory_reservation_t pending, previous;
     col_rel_t *owner = NULL;
     int64_t **columns = NULL;
+    int64_t **old_columns = NULL;
+    bool *old_col_shared = NULL;
+    bool old_arena_owned = false;
     uint64_t bytes = 0;
     int pending_rc = 0, rc;
     if (!rel || !rows || !nrows || !ncols)
@@ -2473,8 +2476,11 @@ wl_columnar_relation_delta_restore_flat(col_rel_t *rel,
         rc = EINVAL;
         goto done;
     }
-    /* Preserve populated partial evaluation results, as before. */
-    if (rel->columns) {
+    /* Preserve populated partial evaluation results unless the caller is the
+     * incomplete-evaluation rollback path and explicitly requests replacement.
+     * The overwrite path still allocates the replacement before publishing it.
+     */
+    if (rel->columns && !overwrite) {
         rc = 0;
         goto done;
     }
@@ -2518,8 +2524,15 @@ wl_columnar_relation_delta_restore_flat(col_rel_t *rel,
         goto done;
     }
     uint64_t before = col_rel_owned_ledger_bytes(rel);
+    if (overwrite && rel->columns) {
+        old_columns = rel->columns;
+        old_col_shared = rel->col_shared;
+        old_arena_owned = rel->arena_owned;
+    }
     rel->columns = columns;
     columns = NULL;
+    rel->col_shared = NULL;
+    rel->arena_owned = false;
     rel->nrows = nrows;
     rel->capacity = nrows;
     rel->sorted_nrows = nrows;
@@ -2528,6 +2541,14 @@ wl_columnar_relation_delta_restore_flat(col_rel_t *rel,
     wl_columnar_relation_delta_ledger_columns(rel, before);
     wl_columnar_relation_touch_replacement(rel);
     col_rel_release_retired_reservation(&previous);
+    if (old_columns) {
+        if (!old_arena_owned)
+            for (uint32_t c = 0; c < rel->ncols; c++)
+                if (!old_col_shared || !old_col_shared[c])
+                    free(old_columns[c]);
+        free(old_columns);
+        free(old_col_shared);
+    }
     rc = 0;
 done:
     if (columns)
@@ -2538,6 +2559,24 @@ done:
         (void)wl_columnar_source_access_writer_release(&writer);
     (void)wl_columnar_source_access_writer_release(&descriptor);
     return rc;
+}
+
+int
+wl_columnar_relation_delta_restore_flat(col_rel_t *rel,
+    uint64_t expected_identity, const int64_t *rows,
+    uint32_t nrows, uint32_t ncols)
+{
+    return wl_columnar_relation_delta_restore_flat_impl(rel,
+               expected_identity, rows, nrows, ncols, false);
+}
+
+int
+wl_columnar_relation_delta_restore_flat_overwrite(col_rel_t *rel,
+    uint64_t expected_identity, const int64_t *rows,
+    uint32_t nrows, uint32_t ncols)
+{
+    return wl_columnar_relation_delta_restore_flat_impl(rel,
+               expected_identity, rows, nrows, ncols, true);
 }
 
 /* Copy all rows from src into dst (must have same ncols).

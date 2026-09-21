@@ -2569,6 +2569,14 @@ int
 wl_columnar_relation_delta_restore_flat(col_rel_t *rel,
     uint64_t expected_identity, const int64_t *rows,
     uint32_t nrows, uint32_t ncols);
+
+/* Restore a captured snapshot over a populated self-owned head.  The
+ * conservative restore_flat variant intentionally preserves populated heads;
+ * rollback uses this form only when evaluation failed before completion. */
+int
+wl_columnar_relation_delta_restore_flat_overwrite(col_rel_t *rel,
+    uint64_t expected_identity, const int64_t *rows,
+    uint32_t nrows, uint32_t ncols);
 int
 col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena);
 int

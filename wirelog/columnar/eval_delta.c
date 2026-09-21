@@ -1090,10 +1090,35 @@ wl_columnar_eval_delta_rollback_retry(wl_col_session_t *sess)
             entry->completed = true;
             continue;
         }
-        int rc = wl_columnar_relation_delta_restore_flat(rel, entry->identity,
-                entry->rows, entry->nrows, entry->ncols);
-        /* A populated shared view is partial progress with its own live
-         * source lease. Preserve it, rather than attempting to retire it. */
+        int rc;
+        /* An incomplete evaluation may have populated this detached head
+         * before failing on a later relation.  restore_flat intentionally
+         * preserves populated storage for the completed-evaluation cleanup
+         * path, but doing that here would leave a mixed old/new stratum.  Drop
+         * the partial storage first so the captured pre-step snapshot is the
+         * state that becomes visible again. */
+        bool incomplete = !record->retained && record->evaluation_error != 0;
+        if (incomplete && rel->columns
+            && (entry->nrows == 0 || rel->storage_owner != rel)) {
+            rc = wl_columnar_relation_delta_detach(rel, entry->identity);
+            if (rc != 0) {
+                if (result == 0)
+                    result = rc;
+                continue;
+            }
+        }
+        if (incomplete && entry->nrows == 0)
+            rc = 0;
+        else
+            rc = incomplete
+                ? wl_columnar_relation_delta_restore_flat_overwrite(rel,
+                    entry->identity, entry->rows, entry->nrows,
+                    entry->ncols)
+                : wl_columnar_relation_delta_restore_flat(rel,
+                    entry->identity, entry->rows, entry->nrows,
+                    entry->ncols);
+        /* Retire any source lease only after the captured state is restored;
+         * a failed detach or restore remains retryable. */
         if (rc == 0 && rel->storage_owner == rel)
             rc = wl_columnar_session_retire_source_lease(sess, rel);
         if (rc == 0)
@@ -1483,7 +1508,7 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     for (unsigned pass = 0; pass < 2; pass++) {
         for (uint32_t i = 0; i < rc_cnt; i++) {
             wl_columnar_eval_delta_snapshot_t *entry = &rollback->entries[i];
-            if (!entry->rows || entry->alias != (pass == 0))
+            if (!entry->identity || entry->alias != (pass == 0))
                 continue;
             col_rel_t *rel = session_find_rel(sess, entry->name);
             rc = wl_columnar_relation_delta_detach(rel, entry->identity);

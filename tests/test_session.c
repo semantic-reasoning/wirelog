@@ -9842,6 +9842,93 @@ cleanup:
     PASS();
 #undef PROGRESS_CHECK
 }
+
+/* An incomplete stratum must roll every detached head back to the same
+ * pre-step snapshot.  If the first relation publishes new rows before a
+ * later relation fails, restoring only empty heads leaves a hybrid state that
+ * is neither retryable old state nor a published new state. */
+static void
+test_delta_rollback_restores_incomplete_heads(bool empty_baseline)
+{
+    TEST(empty_baseline
+        ? "delta rollback: incomplete evaluation restores empty heads"
+        : "delta rollback: incomplete evaluation restores populated heads");
+    wl_plan_op_t input_op = {
+        .op = WL_PLAN_OP_VARIABLE, .relation_name = "input"
+    };
+    wl_plan_op_t bad_ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "missing" }
+    };
+    wl_plan_relation_t relations[] = {
+        { .name = "a", .ops = &input_op, .op_count = 1 },
+        { .name = "b", .ops = bad_ops, .op_count = 1 }
+    };
+    wl_plan_stratum_t stratum = { .relations = relations,
+                                  .relation_count = 2 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess = NULL;
+    delta_collector_t deltas = { 0 };
+    const char *failure = NULL;
+    int64_t one = 1, two = 2;
+#define INCOMPLETE_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    INCOMPLETE_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "create");
+    sess = COL_SESSION(session);
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    INCOMPLETE_CHECK(wl_session_insert(session, "input", &one, 1, 1) == 0
+        && wl_session_step(session) == 0, "baseline");
+    INCOMPLETE_CHECK(session_find_rel(sess, "a")->nrows == 1
+        && session_find_rel(sess, "b")->nrows == 1, "baseline heads");
+    if (empty_baseline) {
+        INCOMPLETE_CHECK(wl_session_remove(session, "input", &one, 1, 1)
+            == 0 && wl_session_step(session) == 0, "empty baseline");
+        INCOMPLETE_CHECK(session_find_rel(sess, "a")->nrows == 0
+            && session_find_rel(sess, "b")->nrows == 0,
+            "baseline heads not empty");
+    }
+    INCOMPLETE_CHECK(wl_session_insert(session, "input", &two, 1, 1) == 0,
+        "pending input");
+    deltas.count = 0;
+
+    /* The second relation fails after the first has already been evaluated. */
+    relations[1].op_count = 2;
+    int step_rc = wl_session_step(session);
+    INCOMPLETE_CHECK(step_rc != 0, "incomplete stratum did not fail");
+    col_rel_t *a = session_find_rel(sess, "a");
+    col_rel_t *b = session_find_rel(sess, "b");
+    INCOMPLETE_CHECK(a && b
+        && (empty_baseline
+            ? (a->nrows == 0 && b->nrows == 0)
+            : (a->nrows == 1 && b->nrows == 1
+        && col_rel_get(a, 0, 0) == one
+        && col_rel_get(b, 0, 0) == one)),
+        "rollback left hybrid heads");
+    INCOMPLETE_CHECK(!sess->delta_rollback && deltas.count == 0,
+        "rollback state or events leaked");
+
+    relations[1].op_count = 1;
+    INCOMPLETE_CHECK(wl_session_step(session) == 0, "retry failed");
+    INCOMPLETE_CHECK(a->nrows == (empty_baseline ? 1u : 2u)
+        && b->nrows == (empty_baseline ? 1u : 2u)
+        && col_rel_get(a, empty_baseline ? 0 : 1, 0) == two
+        && col_rel_get(b, empty_baseline ? 0 : 1, 0) == two
+        && count_deltas(&deltas, "a", +1) == 1
+        && count_deltas(&deltas, "b", +1) == 1,
+        "retry did not publish both heads");
+cleanup:
+    if (session)
+        wl_session_destroy(session);
+    if (failure)
+        FAIL(failure);
+    else
+        PASS();
+#undef INCOMPLETE_CHECK
+}
 #endif
 
 static void
@@ -11475,6 +11562,8 @@ main(void)
     test_delta_rollback_preserves_progress(false, false);
     test_delta_rollback_preserves_progress(false, true);
     test_delta_rollback_preserves_progress(true, false);
+    test_delta_rollback_restores_incomplete_heads(false);
+    test_delta_rollback_restores_incomplete_heads(true);
 #endif
     test_delta_rollback_frontier_gc(false);
     test_delta_rollback_frontier_gc(true);
