@@ -70,21 +70,28 @@ test_pin_generation_and_idempotence(void)
 
     assert(col_mat_cache_lookup(&cache, left, right) == result);
     assert(cache.entries[0].pin_count == 1);
+    assert(cache.entries[0].epoch_pin_count == 1);
+    assert(cache.active_pins == 1);
     /* Repeated hits in one evaluation epoch take only one pin. */
     assert(col_mat_cache_lookup(&cache, left, right) == result);
     assert(cache.entries[0].pin_count == 1);
+    assert(cache.entries[0].epoch_pin_count == 1);
+    assert(cache.active_pins == 1);
+    size_t charged_bytes = cache.total_bytes;
+    assert(charged_bytes > 0);
+    col_mat_cache_clear(&cache);
+    assert(cache.count == 1 && cache.entries[0].eviction_deferred);
+    assert(cache.total_bytes == charged_bytes);
+    assert(col_mat_cache_lookup(&cache, left, right) == NULL);
+    assert(cache.active_pins == 1);
     wl_mem_reclaim_result_t reclaim = wl_mem_ledger_reclaim(&ledger);
     assert(reclaim.bytes_released == 0 && reclaim.candidates == 0);
     assert(cache.count == 1);
 
     col_mat_cache_release_pins(&cache);
-    assert(cache.entries[0].pin_count == 0);
-    reclaim = wl_mem_ledger_reclaim(&ledger);
-    assert(reclaim.bytes_released == capacity);
-    assert(reclaim.candidates == 1 && cache.count == 0);
-
-    reclaim = wl_mem_ledger_reclaim(&ledger);
-    assert(reclaim.bytes_released == 0 && reclaim.candidates == 0);
+    assert(cache.count == 0);
+    assert(cache.active_pins == 0);
+    assert(cache.total_bytes == 0);
     col_rel_destroy(left);
     col_rel_destroy(right);
     col_mat_cache_detach_reclaimer(&cache);
