@@ -196,10 +196,9 @@ cached_output(wl_col_session_t *sess, const col_rel_t *left)
     if (!sess)
         return NULL;
     /* Read the entry directly rather than through col_mat_cache_lookup():
-     * that helper takes a pin (cache.c, one per pin_epoch) despite its
-     * header describing the result as unpinned, and a pinned entry makes
-     * col_mat_cache_clear() DEFER its release -- which would hide the very
-     * accounting this file checks. */
+     * the legacy helper takes one implicit epoch pin, and a pinned entry
+     * makes col_mat_cache_clear() defer its release (including governed
+     * bytes), which would hide the accounting this file checks. */
     for (uint32_t i = 0; i < sess->mat_cache.count; i++) {
         if (sess->mat_cache.entries[i].result
             && sess->mat_cache.entries[i].owns_result)

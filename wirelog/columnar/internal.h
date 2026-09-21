@@ -2828,10 +2828,14 @@ col_mat_cache_evict_until(col_mat_cache_t *cache, size_t target_bytes);
 col_rel_t *
 col_mat_cache_lookup(col_mat_cache_t *cache, const col_rel_t *left,
     const col_rel_t *right);
-/* Legacy diagnostic lookup.  The returned relation is an unpinned borrowed
- * pointer and must not outlive the immediate cache operation.  Production
- * callers that need a stable result must use lookup_pin(), deep-copy while
- * pinned, and release the pin before retaining the copy. */
+/* Legacy diagnostic lookup.  The returned relation is borrowed.  For an
+ * eligible live entry, the first hit in the current pin epoch takes one
+ * implicit epoch pin (subsequent hits in that epoch are idempotent).  The
+ * pin is released by col_mat_cache_release_pins(); until then clear,
+ * eviction, and reclaim defer destruction and keep cache-ledger and
+ * governor reservations charged.  Production callers that need a stable
+ * result must use lookup_pin(), deep-copy while pinned, and release the
+ * explicit pin before retaining the copy. */
 int
 col_mat_cache_insert(col_mat_cache_t *cache, const col_rel_t *left,
     const col_rel_t *right, col_rel_t *result);
@@ -2847,8 +2851,10 @@ col_mat_cache_lookup_pin(col_mat_cache_t *cache, const col_rel_t *left,
     const col_rel_t *right, col_mat_cache_pin_t *pin);
 void
 col_mat_cache_pin_release(col_mat_cache_pin_t *pin);
-/* Release only implicit epoch pins from the legacy lookup path.  Explicit
- * col_mat_cache_pin_t handles remain owned by their callers. */
+/* Release only implicit epoch pins from the legacy lookup path and advance
+ * the epoch.  Deferred entries whose final implicit pin is released are
+ * removed here.  Explicit col_mat_cache_pin_t handles remain owned by their
+ * callers. */
 void
 col_mat_cache_release_pins(col_mat_cache_t *cache);
 /*
