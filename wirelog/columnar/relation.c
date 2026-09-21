@@ -4166,13 +4166,15 @@ col_rel_pool_new_auto(delta_pool_t *pool, wl_arena_t *arena,
  *   - Group G: compound_arity_map cloned via col_rel_clone_compound_meta;
  *     corrupt arity maps degrade dst to NONE-kind (matches new_like).
  *   - Group H: has_graph_column, graph_col_idx direct copy.
- *   - Group I: pool_owned, arena_owned, mem_ledger always reset.
+ *   - Group I: pool_owned, arena_owned, mem_ledger, memory_governor and
+ *     retained_reserved_bytes always reset.
  *   - Group J: dedup_*, col_shared, row_scratch always reset; any cache
  *     state will be rebuilt lazily on demand.
  *
  * Memory-ledger policy (Issue #554, design rule R-1):
- *   The deep copy is treated as a TRANSIENT relation.  dst->mem_ledger
- *   is unconditionally set to NULL regardless of whether src is wired
+ *   The deep copy is treated as a TRANSIENT relation.  dst->mem_ledger and
+ *   dst->memory_governor are unconditionally set to NULL and
+ *   dst->retained_reserved_bytes remains zero regardless of whether src is wired
  *   up to a ledger.  Rationale: a deep copy is a short-lived workspace
  *   relation (K-Fusion fork point, retraction backup, debug snapshot)
  *   whose buffer growth and free events must NOT charge against the
@@ -4202,9 +4204,9 @@ col_rel_pool_new_auto(delta_pool_t *pool, wl_arena_t *arena,
  *                 col_rel_free_contents + free(dst); calloc-zero-init
  *                 makes that safe at any unwind point.
  *
- * @note The result inherits no pool/arena/ledger affiliation from
- *       @p src.  Callers that need ledger accounting on the copy must
- *       wire up dst->mem_ledger themselves.
+ * @note The result inherits no pool/arena/ledger/governor affiliation from
+ *       @p src and starts with retained_reserved_bytes == 0.  Callers that
+ *       need governed ownership must use an admission path before publication.
  */
 int
 col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)

@@ -1134,13 +1134,17 @@ bug:
   its result, and `wl_columnar_memory_reserved()` sampled after the join
   reports the residual, not that peak.
 
-**Residual R1 (accepted, tracked separately).** On the materialized path the
-operator deep-copies its output for the evaluation stack with a NULL governor
-and hands the governed original to the cache.  Both buffers are live and
-physically identical, so the governor charges once for twice the resident
-bytes.  Governing the copy would place a governed relation on the evaluation
-stack, whose consumers have their own ownership contracts; that is the
-eval-stack admission class and is out of scope here.
+**Residual R1 (accepted, tracked in #1724 and follow-up #1801).** On the
+materialized path the operator deep-copies its output for the evaluation stack
+with a NULL governor and hands the governed original to the cache. Both
+buffers are live and physically identical, so the governor currently charges
+once for twice the resident bytes. The deep-copy API explicitly resets
+`memory_governor` and `retained_reserved_bytes` for this transient-copy
+contract; it is not a general admission policy for governed ownership.
+Governing the copy requires auditing every stack consumer's success, failure,
+unwind, replacement and teardown paths. That work is tracked in #1801 under
+the eval-stack admission class and remains separate from the contract test
+added for #1724.
 
 **Untested by construction.** The `col_join_reserve_exact()` caller inside
 `wl_columnar_join_diff_op` is not driven end to end by

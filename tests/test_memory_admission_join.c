@@ -1257,6 +1257,75 @@ out:
     destroy_session(sess);
 }
 
+/* ---- case 13: materialized cache/eval-stack twin contract ------------- */
+
+static void
+test_materialized_stack_copy_contract(void)
+{
+    wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+    col_rel_t *right = make_right(2, 1);
+    col_rel_t *left = make_left(4, 2);
+    wl_plan_op_t op;
+    eval_entry_t result = { 0 };
+    const col_rel_t *cached;
+    uint64_t reserved;
+
+    TEST("materialized join stack copy keeps the transient twin contract");
+    if (!sess || !right || !left) {
+        FAIL("fixture");
+        goto out;
+    }
+    if (session_add_rel(sess, right) != 0) {
+        FAIL("right relation registration failed");
+        goto out;
+    }
+    right = NULL;
+    init_cross_op(&op);
+    if (run_join(sess, left, &op, &result) != 0 || !result.rel
+        || !result.owned) {
+        FAIL("materialized join did not return an owned stack copy");
+        goto out;
+    }
+    cached = cached_output(sess, left);
+    if (!cached || cached == result.rel || cached->pool_owned
+        || cached->memory_governor != sess->memory_governor
+        || !admission_invariant(cached)
+        || result.rel->memory_governor != NULL
+        || result.rel->retained_reserved_bytes != 0u
+        || result.rel->pool_owned
+        || result.rel->nrows != cached->nrows
+        || result.rel->ncols != cached->ncols
+        || col_rel_get(result.rel, 0, 0) != col_rel_get(cached, 0, 0)) {
+        FAIL("cache and stack twin contract mismatch");
+        goto out_entry;
+    }
+    reserved = reserved_of(sess);
+    if (reserved != cached->retained_reserved_bytes) {
+        FAIL("transient stack twin changed governor accounting");
+        goto out_entry;
+    }
+    col_rel_destroy(result.rel);
+    result.rel = NULL;
+    if (reserved_of(sess) != reserved) {
+        FAIL("destroying stack twin changed cache reservation");
+        goto out;
+    }
+    col_mat_cache_clear(&sess->mat_cache);
+    if (reserved_of(sess) != 0u) {
+        FAIL("cache clear did not release the governed original once");
+        goto out;
+    }
+    PASS();
+    goto out;
+out_entry:
+    if (result.owned && result.rel)
+        col_rel_destroy(result.rel);
+out:
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 int
@@ -1287,6 +1356,7 @@ main(void)
     test_small_parallel_cross_is_admitted();
     test_parallel_diff_output_is_governed();
     test_parallel_diff_denial();
+    test_materialized_stack_copy_contract();
 
     printf("\n  %d run, %d passed, %d failed\n",
         tests_run, tests_passed, tests_failed);

@@ -2644,8 +2644,9 @@ col_rel_t *wl_columnar_relation_pool_new_like_governed(delta_pool_t *pool,
  *
  * On success, *out is set to a heap-allocated col_rel_t whose fields are
  * deep copies or fresh zero state per the field-group taxonomy in #553.
- * Pool/arena ownership is reset (always heap-owned), col_shared/dedup_*
- * caches are cleared, and the schema is rebuilt via manual reinit (the
+ * Pool/arena ownership is reset (always heap-owned), memory_governor and
+ * retained_reserved_bytes are reset, col_shared/dedup_* caches are cleared,
+ * and the schema is rebuilt via manual reinit (the
  * Arrow release callback cannot be aliased across copies).
  *
  * Returns 0 on success, EINVAL when src or out is NULL, ENOMEM on
