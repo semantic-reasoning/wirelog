@@ -217,10 +217,18 @@ wl_session_remove(wl_session_t *session, const char *relation,
  * Advance an incremental session, evaluating any newly inserted/removed facts.
  * Triggers the delta callback registered via wl_session_set_delta_cb.
  * The columnar backend delivers the net change from the start of the whole
- * step only after evaluation and event preparation succeed. Failed observed
- * steps retain that baseline; retry with wl_session_step. Until completion,
- * snapshot and nonzero input mutation (including compound construction)
- * return EBUSY. Zero-row insert/remove remain no-ops.
+ * step only after evaluation and event preparation succeed. A step that
+ * fails evaluation, compaction or event preparation delivers nothing, including
+ * for relations it already finished: the error can surface after the outputs
+ * have moved, so a non-zero return is not evidence that the outputs are
+ * unchanged. The baseline the net change is measured against survives such a
+ * failure, so a later successful wl_session_step reports the change relative
+ * to the state before the failed step -- retry rather than treat the failure
+ * as a lost update. The net change is then measured from that first attempt,
+ * not from the retry. Cancelling notifications before the retry completes is
+ * the one case retrying cannot recover; see wl_session_set_delta_cb. Until
+ * completion, snapshot and nonzero input mutation (including compound
+ * construction) return EBUSY. Zero-row insert/remove remain no-ops.
  * Reentrant step, snapshot and input mutation from delta callbacks return EBUSY.
  *
  * Returns:
@@ -242,8 +250,14 @@ wl_session_step(wl_session_t *session);
  * it to NULL cancels remaining notifications for the current step, even if a
  * callback is registered again before that step completes. Re-enabling then
  * observes subsequent steps. Cancellation does not cancel evaluation: a failed
- * step still requires retry. Callback row/name pointers are valid only for the
- * callback invocation. Destruction from a callback remains unsupported.
+ * step still requires retry, and once notifications are cancelled that retry
+ * reports nothing at all -- neither the changes the cancelled step had already
+ * applied nor any the retry newly derives. Re-read the outputs with
+ * wl_session_snapshot after the retry completes to resynchronize. Cancelling
+ * from inside delivery is different: that step still succeeds and only the
+ * events after the cancelling one are dropped. Callback row/name pointers
+ * are valid only for the callback invocation. Destruction from a callback
+ * remains unsupported.
  */
 void
 wl_session_set_delta_cb(wl_session_t *session, wirelog_on_delta_fn callback,
