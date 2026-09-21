@@ -2546,7 +2546,7 @@ wl_columnar_relation_delta_restore_flat_impl(col_rel_t *rel,
             for (uint32_t c = 0; c < rel->ncols; c++)
                 if (!old_col_shared || !old_col_shared[c])
                     free(old_columns[c]);
-        free(old_columns);
+        free((void *)old_columns);
         free(old_col_shared);
     }
     rc = 0;
