@@ -163,7 +163,7 @@ class AuditTests(unittest.TestCase):
     def test_manifest_uses_release_relative_filename_format(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "input.csv").write_text("1,2\n")
+            (root / "input.csv").write_text("1,2\n", encoding="utf-8")
             manifest, files = audit.data_manifest(root)
             expected = audit.hashlib.sha256(
                 (audit.sha(root / "input.csv") + "  input.csv\n").encode()).hexdigest()
@@ -229,21 +229,21 @@ class AuditTests(unittest.TestCase):
         env["WIRELOG_TDD_DECISION_DEBUG"] = "1"
         for binary in RUNTIME_BINS:
             proc = subprocess.run([binary, "--audit-frames"], env=env, capture_output=True,
-                                  text=True, timeout=30, check=True)
+                                  text=True, timeout=30, check=True, encoding="utf-8")
             frames = ["TDD snapshot begin " + s for s in proc.stderr.split("TDD snapshot begin ")[1:]]
             self.assertEqual(len(frames), 3)
             rows = [audit.parse_strata(s, 8, require_full=False) for s in frames]
             self.assertEqual([[r["idx"] for r in snapshot] for snapshot in rows], [[0, 1, 2], [0, 2], []])
             for option in ("--audit-error", "--audit-partial"):
                 proc = subprocess.run([binary, option], env=env, capture_output=True,
-                                      text=True, timeout=30, check=True)
+                                      text=True, timeout=30, check=True, encoding="utf-8")
                 self.assertIn("TDD snapshot begin ", proc.stderr)
                 self.assertNotIn("TDD snapshot complete ", proc.stderr)
                 with self.assertRaises(ValueError):
                     audit.parse_strata(proc.stderr, 8)
             proc = subprocess.run([binary, "--audit-frames-off"], env={k: v for k, v in env.items()
                                   if k != "WIRELOG_TDD_DECISION_DEBUG"}, capture_output=True,
-                                  text=True, timeout=30, check=True)
+                                  text=True, timeout=30, check=True, encoding="utf-8")
             self.assertNotIn("TDD ", proc.stderr)
 
     def test_missing_duplicate_truncated_and_malformed(self):

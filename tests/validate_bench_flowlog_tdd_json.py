@@ -46,6 +46,7 @@ def main():
         stderr=subprocess.PIPE,
         env=env,
         timeout=20,
+        encoding="utf-8",
     )
     if proc.returncode != 0:
         print(proc.stdout, end="")
@@ -73,14 +74,14 @@ def main():
     quiet_env = env.copy()
     del quiet_env["WIRELOG_TDD_STRATUM_PROFILE"]
     quiet = subprocess.run(proc.args, capture_output=True, text=True,
-                           env=quiet_env, timeout=20, check=True)
+                           env=quiet_env, timeout=20, check=True, encoding="utf-8")
     assert "TDD stratum " not in quiet.stderr, quiet.stderr
     assert extract_json(quiet.stdout)["tuples"] == 4950
 
     adaptive_env = env.copy()
     adaptive_env["WIRELOG_TDD_MIN_ROWS_PER_WORKER"] = "1000000000"
     adaptive = subprocess.run(proc.args, capture_output=True, text=True,
-                              env=adaptive_env, timeout=20, check=True)
+                              env=adaptive_env, timeout=20, check=True, encoding="utf-8")
     assert extract_json(adaptive.stdout)["tuples"] == 4950
     assert "selected_workers=1 submitted_tasks=0 completed_rounds=0" in adaptive.stderr
     tdd_phase = row.get("tdd_phase_ms")

@@ -101,7 +101,7 @@ def run(exe, program, tmpdir, name, rows):
     env = dict(os.environ)
     env.pop("WL_LOG", None)
     return subprocess.run([exe, dl], capture_output=True, text=True,
-                          timeout=60, env=env)
+                          timeout=60, env=env, encoding="utf-8")
 
 
 def main() -> int:

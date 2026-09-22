@@ -44,9 +44,9 @@ def main():
         profile_cmd = [sys.executable, str(Path(__file__).with_name("size-profile.py")), "capture",
                        "--build-dir", a.build_dir, "--source-dir", a.source_dir,
                        "--source-sha", a.sha, "--output", str(profile_path)]
-        subprocess.run(profile_cmd, check=True, capture_output=True, text=True)
+        subprocess.run(profile_cmd, check=True, capture_output=True, text=True, encoding="utf-8")
         profile = json.loads(profile_path.read_text(encoding="utf-8"))
-        measured = subprocess.check_output(["size", "--format=sysv", a.library], text=True)
+        measured = subprocess.check_output(["size", "--format=sysv", a.library], text=True, encoding="utf-8")
         values = [line.split()[1] for line in measured.splitlines()
                   if line.split() and line.split()[0] == ".text"]
         if len(values) != 1 or not values[0].isdigit():

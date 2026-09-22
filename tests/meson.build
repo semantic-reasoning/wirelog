@@ -1366,6 +1366,9 @@ if sh.found()
        suite: 'abi', timeout: 120)
 endif
 if py3.found()
+  test('python_encoding', py3,
+       args: [meson.project_source_root() / 'scripts/ci/test-check-python-encoding.py'],
+       suite: 'abi', timeout: 120)
   test('size_baseline_provenance', py3,
        args: [meson.project_source_root() / 'scripts/ci/test-size-baseline-provenance.py'],
        suite: 'abi', timeout: 120)

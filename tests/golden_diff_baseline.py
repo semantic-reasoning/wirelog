@@ -27,6 +27,7 @@ def main() -> int:
         [exe, dl_path],
         capture_output=True,
         text=True,
+        encoding="utf-8",
     )
     if result.returncode != 0:
         sys.stderr.write(

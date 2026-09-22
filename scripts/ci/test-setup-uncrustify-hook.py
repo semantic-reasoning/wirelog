@@ -48,7 +48,7 @@ class HookInstallCase(unittest.TestCase):
         env.update(env_extra)
         proc = subprocess.run(
             [sys.executable, "-c", DRIVER, str(SCRIPTS_DIR), str(root)],
-            env=env, capture_output=True, text=True, errors="replace")
+            env=env, capture_output=True, text=True, errors="replace", encoding="utf-8")
         return proc.returncode, root / ".git" / "hooks" / "pre-commit", \
             proc.stdout + proc.stderr
 
@@ -82,7 +82,7 @@ class HookInstallCase(unittest.TestCase):
                                           encoding="utf-8")
         proc = subprocess.run(
             [sys.executable, "-c", DRIVER, str(SCRIPTS_DIR), str(root)],
-            capture_output=True, text=True)
+            capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("already contains", proc.stdout)
 

@@ -56,7 +56,7 @@ def fixture_provenance(**changes):
 
 def exercise(provenance, corrupt=None):
     with tempfile.TemporaryDirectory() as temp:
-        p=Path(temp)/"provenance.json"; p.write_text(json.dumps(provenance))
+        p=Path(temp)/"provenance.json"; p.write_text(json.dumps(provenance), encoding="utf-8")
         run={"path":".github/workflows/ci-main.yml","event":"push","head_branch":"main",
              "conclusion":"success","head_sha":"source123"}
         artifact={"id":22,"expired":False,"name":"wirelog-size-monitor-ubuntu-latest",
@@ -78,7 +78,7 @@ def exercise(provenance, corrupt=None):
             # For a correct artifact checksum path, align API digest with the rebuilt fixture.
             artifact["digest"]="sha256:"+hashlib.sha256(body).hexdigest()
             provenance["artifact_sha256"]=hashlib.sha256(body).hexdigest()
-            p.write_text(json.dumps(provenance))
+            p.write_text(json.dumps(provenance), encoding="utf-8")
         def request(url, token, binary=False):
             if url.endswith("/actions/runs/11"): return run
             if url.endswith("/actions/runs/11/artifacts"): return {"artifacts":[] if corrupt=="missing" else [artifact]}
@@ -90,7 +90,7 @@ def exercise(provenance, corrupt=None):
                 build=Path(cmd[cmd.index("-C")+1]); build.mkdir(parents=True,exist_ok=True)
                 (build/"libwirelog.so").write_bytes(library)
             if isinstance(cmd,list) and "size-profile.py" in " ".join(map(str,cmd)):
-                output=Path(cmd[cmd.index("--output")+1]); output.write_text(json.dumps(profile))
+                output=Path(cmd[cmd.index("--output")+1]); output.write_text(json.dumps(profile), encoding="utf-8")
             return SimpleNamespace(returncode=0)
         def subprocess_output(cmd,*args,**kwargs):
             if cmd[:3]==["git","archive","--format=tar"]:

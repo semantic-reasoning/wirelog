@@ -96,7 +96,7 @@ class CampaignVerifierFixtures(unittest.TestCase):
             "--run-attempt", "1",
             "--report", str(report),
         ]
-        result = subprocess.run(command, capture_output=True, text=True)
+        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8")
         return result.returncode, json.loads(report.read_text(encoding="utf-8"))
 
     def test_complete_campaign(self):

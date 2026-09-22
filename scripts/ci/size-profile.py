@@ -16,7 +16,7 @@ EXCLUDED_OPTIONS = {"prefix", "bindir", "datadir", "includedir", "infodir", "lib
                     "sharedstatedir", "sysconfdir"}
 
 def run(*args):
-    return subprocess.check_output(args, text=True, stderr=subprocess.PIPE)
+    return subprocess.check_output(args, text=True, stderr=subprocess.PIPE, encoding="utf-8")
 
 def replace_root(value, root, placeholder):
     # Replace a complete path prefix only, so /repo does not alter /repo-old.
@@ -45,7 +45,7 @@ def selected_linker_fingerprint(compiler, parameters):
         output = Path(temp) / "linker-version-probe"
         command = list(compiler) + selected + ["-Wl,--version", "-x", "c", "/dev/null", "-o", str(output)]
         try:
-            result = subprocess.run(command, text=True, capture_output=True, check=False)
+            result = subprocess.run(command, text=True, capture_output=True, check=False, encoding="utf-8")
         except OSError as exc:
             raise ValueError(f"could not query selected linker: {exc}") from exc
         transcript = result.stdout + "\n" + result.stderr

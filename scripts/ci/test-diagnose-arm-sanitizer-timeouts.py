@@ -38,12 +38,12 @@ class DiagnosticTests(unittest.TestCase):
         result = self.child("print('profile output')")
         self.assertEqual(result["status"], "pass")
         self.assertEqual(result["rc"], 0)
-        self.assertIn("profile output", (self.root / "stdout.log").read_text())
+        self.assertIn("profile output", (self.root / "stdout.log").read_text(encoding="utf-8"))
 
     def test_nonzero(self):
         result = self.child("import sys; print('error', file=sys.stderr); sys.exit(7)")
         self.assertEqual((result["status"], result["rc"]), ("fail", 7))
-        self.assertIn("error", (self.root / "stderr.log").read_text())
+        self.assertIn("error", (self.root / "stderr.log").read_text(encoding="utf-8"))
 
     def test_timeout_kills_and_reaps(self):
         result = self.child("import time; time.sleep(20)", 0.2)
@@ -90,7 +90,7 @@ class DiagnosticTests(unittest.TestCase):
         with mock.patch.object(Path, "read_text", side_effect=PermissionError("denied")):
             event = diagnose.snapshot_proc(123, self.root / "proc.log")
         self.assertEqual(event["status"], "unavailable")
-        self.assertIn("denied", (self.root / "proc.log").read_text())
+        self.assertIn("denied", (self.root / "proc.log").read_text(encoding="utf-8"))
 
     def test_environment_separation(self):
         with mock.patch.dict(os.environ, {"LD_LIBRARY_PATH": "/sanitized",

@@ -34,7 +34,7 @@ def _run(exe, *args):
     # timeout=30 fails closed if a future regression makes a flag stop
     # short-circuiting and instead block on stdin (e.g. via watch mode).
     return subprocess.run(
-        [exe, *args], capture_output=True, text=True, timeout=30)
+        [exe, *args], capture_output=True, text=True, timeout=30, encoding="utf-8")
 
 
 def _fail(msg):
