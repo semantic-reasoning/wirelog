@@ -4536,7 +4536,8 @@ wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
             (size_t)src->ncols * sizeof(*dst->column_types));
     }
     if (src->ncols > 0) {
-        dst->col_names = calloc(src->ncols, sizeof(*dst->col_names));
+        dst->col_names = (char **)calloc(src->ncols,
+                sizeof(*dst->col_names));
         if (!dst->col_names) {
             rc = ENOMEM;
             goto done;
