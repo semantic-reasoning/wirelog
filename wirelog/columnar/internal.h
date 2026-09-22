@@ -530,6 +530,16 @@ typedef struct col_rel {
     struct wl_col_session_t *deferred_relation_session;
 } col_rel_t;
 
+/* Prepared terminal retirement of an independent heap relation. The token
+ * holds the descriptor and source writers from prepare through cancel or
+ * commit; callers must keep the descriptor pointer stable and must not copy,
+ * move, or use the token from another thread during that interval. */
+typedef struct wl_columnar_relation_retirement_token {
+    col_rel_t *relation;
+    wl_columnar_source_access_writer_t descriptor_writer;
+    wl_columnar_source_access_writer_t source_writer;
+} wl_columnar_relation_retirement_token_t;
+
 /* A private, fully staged publication for a canonical relation.  The staged
  * relation owns every buffer until commit or discard; the writer token keeps
  * the destination's canonical owner stable across that interval. */
@@ -2250,6 +2260,21 @@ col_rel_destroy(col_rel_t *r);
  * retirement, but a peer descriptor's reader does not. */
 int
 col_rel_destroy_checked(col_rel_t *r);
+/* Prepare/cancel/commit an allocation-free retirement. Preparation rejects
+ * pool, arena, shared-column, and alias-backed relations without mutation.
+ * Commit consumes and frees an independent heap relation and cannot fail. */
+void
+wl_columnar_relation_retirement_init(
+    wl_columnar_relation_retirement_token_t *token);
+int
+wl_columnar_relation_retirement_prepare(col_rel_t *relation,
+    wl_columnar_relation_retirement_token_t *token);
+int
+wl_columnar_relation_retirement_cancel(
+    wl_columnar_relation_retirement_token_t *token);
+void
+wl_columnar_relation_retirement_commit(
+    wl_columnar_relation_retirement_token_t *token);
 /* Prepare a private replacement without changing @dst.  The canonical writer
  * remains held in @replacement until commit or discard. */
 int
