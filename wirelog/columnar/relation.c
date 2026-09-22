@@ -5144,8 +5144,11 @@ col_rel_prepare_replacement_impl(col_rel_t *dst, const col_rel_t *candidate,
         status = wl_columnar_memory_reserve_checked(governor, planned_bytes,
                 &replacement->reservation);
         if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
-            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                dst->memory_budget_denial_pending = true;
             goto allocation_failure;
+        }
         if (!wl_columnar_memory_commit(&replacement->reservation, dst))
             goto allocation_failure;
         replacement->reservation_active = true;
@@ -6560,8 +6563,11 @@ wl_columnar_radix_workspace_prepare(const col_rel_t *rel,
                 wl_columnar_memory_governor_ref_get(rel->memory_governor),
                 total_scratch_bytes, &workspace->admission);
         if (admission_status != WL_COLUMNAR_MEMORY_ADMISSION_OK
-            && admission_status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            && admission_status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (admission_status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                ((col_rel_t *)rel)->memory_budget_denial_pending = true;
             goto no_memory;
+        }
         workspace->admission_active = true;
     }
 
@@ -6644,8 +6650,11 @@ col_rel_radix_sort_raw(col_rel_t *r, uint32_t start_row, uint32_t nrows,
             wl_columnar_memory_governor_ref_get(r->memory_governor),
             bytes, &admission);
         if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
-            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                r->memory_budget_denial_pending = true;
             return ENOMEM;
+        }
         admitted = true;
     }
     col_delta_timestamp_t *timestamps = wl_columnar_relation_radix_malloc(

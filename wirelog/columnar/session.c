@@ -3764,6 +3764,16 @@ wl_columnar_session_budget_denied(const wl_col_session_t *sess)
         if (sess->tdd_workers[i].memory_budget_denied)
             return true;
     }
+    for (uint32_t i = 0; i < sess->nrels; i++) {
+        if (sess->rels[i] && sess->rels[i]->memory_budget_denial_pending)
+            return true;
+    }
+    for (uint32_t i = 0; i < sess->diff_arr_count; i++) {
+        if (sess->diff_arr_entries[i].diff_arr
+            && sess->diff_arr_entries[i].diff_arr
+                ->memory_budget_denial_pending)
+            return true;
+    }
     return false;
 }
 
@@ -3775,6 +3785,18 @@ wl_columnar_session_budget_denial_clear(wl_col_session_t *sess)
     sess->memory_budget_denied = false;
     for (uint32_t i = 0; i < sess->tdd_workers_count; i++)
         sess->tdd_workers[i].memory_budget_denied = false;
+    for (uint32_t i = 0; i < sess->nrels; i++)
+        if (sess->rels[i])
+            sess->rels[i]->memory_budget_denial_pending = false;
+    for (uint32_t i = 0; i < sess->diff_arr_count; i++)
+        if (sess->diff_arr_entries[i].diff_arr)
+            sess->diff_arr_entries[i].diff_arr
+                ->memory_budget_denial_pending = false;
+    for (uint32_t i = 0; i < sess->tdd_workers_count; i++)
+        for (uint32_t r = 0; r < sess->tdd_workers[i].nrels; r++)
+            if (sess->tdd_workers[i].rels[r])
+                sess->tdd_workers[i].rels[r]
+                    ->memory_budget_denial_pending = false;
 }
 
 static int

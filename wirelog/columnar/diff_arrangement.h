@@ -58,6 +58,7 @@ typedef struct col_diff_arrangement {
     * until col_diff_arrangement_attach_ledger(); deep copies start NULL. */
     struct wl_mem_ledger *ledger;
     wl_columnar_memory_governor_ref_t *memory_governor;
+    uint8_t memory_budget_denial_pending;
     wl_columnar_memory_reservation_t reservation;
     uint64_t reserved_bytes;
 } col_diff_arrangement_t;
