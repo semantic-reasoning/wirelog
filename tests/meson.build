@@ -802,6 +802,17 @@ if not is_windows
        suite: 'abi',
        timeout: 180)
 
+  # Issue #1799: the gate's selftest.  60 rather than the gate's 180 because
+  # meson is stubbed on PATH, so no compiler runs and the whole file is under
+  # two seconds; explicit and not Meson's 30s default, per the #1464 rule.
+  # It drives the acceptance criterion directly -- N concurrent invocations
+  # must record N distinct scratch directories -- plus a rejection case per
+  # exit path, and it fails seven ways against the pre-#1799 gate.
+  test('log_abi_compile_erasure_selftest',
+       find_program(meson.project_source_root() / 'scripts/ci/test-check-log-erasure.sh'),
+       suite: 'abi',
+       timeout: 60)
+
   # Header must not leak into public surface; testhook symbols must not
   # appear in libwirelog.
   # Issue #1301: meson reads exit 0 as a pass, so a gate that prints "SKIP:"

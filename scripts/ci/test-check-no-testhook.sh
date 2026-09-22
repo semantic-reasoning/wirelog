@@ -242,7 +242,7 @@ macho="$tmp/macho.txt"
 printf '0000000000001119 t _wl_log_emit\t/x/wirelog/util/log_emit.c:51\n' > "$macho"
 expect_status 'a Mach-O underscored symbol resolves' 0 run "$clean_syms" "$macho" --check=provenance
 
-# An optimised build can emit only a clone. build-erasure-check contains
+# An optimised build can emit only a clone; the erasure gate's scratch build contains
 # wl_log_emit.constprop.0 and no plain wl_log_emit, so without this the gate
 # silently SKIPs there -- a registered check that can never reach a verdict,
 # which is the shape of the bug this issue is about.
