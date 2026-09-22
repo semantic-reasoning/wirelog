@@ -5493,7 +5493,8 @@ tdd_owner_build_candidate(col_rel_t *target, const char *name,
             }
         }
     }
-    if (target && target->ncols == 0 && source && source->ncols > 0) {
+    if (target && target->nrows == 0 && target->ncols == 0
+        && source && source->ncols > 0) {
         /* Preserve the previous exchange behavior for an existing empty,
          * schema-less IDB: the first accepted delta supplies its schema.
          * The target has no rows to carry over, so building from the input
@@ -5677,6 +5678,7 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
     col_rel_t **empty_inputs = NULL;
     tdd_owner_input_retirement_t *retirements = NULL;
     size_t retirement_count = 0;
+    uint64_t exchange_t0 = now_ns();
     wl_columnar_eval_owner_publication_init(&txn);
     if (out_any_accepted)
         *out_any_accepted = false;
@@ -5806,8 +5808,10 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
             goto fail;
         }
         if (accepted_rows > 0) {
+            uint64_t scatter_t0 = now_ns();
             rc = col_rel_exchange_partition(combined, key_cols, key_count,
                     W, parts);
+            coord->tdd_exchange_scatter_ns += now_ns() - scatter_t0;
             if (rc != 0)
                 goto fail;
         }
@@ -5896,6 +5900,7 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
     rc = wl_columnar_eval_owner_publication_discard(&txn);
     if (rc != 0)
         abort();
+    coord->tdd_exchange_coordinator_ns += now_ns() - exchange_t0;
     return 0;
 
 fail:
@@ -5915,6 +5920,7 @@ fail:
         if (discard_rc != 0)
             return discard_rc;
     }
+    coord->tdd_exchange_coordinator_ns += now_ns() - exchange_t0;
     return rc;
 }
 
@@ -6926,7 +6932,8 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
              * tdd_owner_exchange_deltas depend on this call staying
              * immediately before the exchange dispatch below.  Moving or
              * guarding it invalidates them. */
-            rc = wl_columnar_eval_retire_prior_deltas(sp, coord, W);
+            if (!owner_exchange_mode && !global_read_mode)
+                rc = wl_columnar_eval_retire_prior_deltas(sp, coord, W);
             if (rc != 0) {
                 if (coord->tdd_owner_lifetime) {
                     int cleanup_rc =
