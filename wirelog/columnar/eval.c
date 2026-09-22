@@ -6941,7 +6941,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
              * tdd_owner_exchange_deltas depend on this call staying
              * immediately before the exchange dispatch below.  Moving or
              * guarding it invalidates them. */
-            if (!owner_exchange_mode && !global_read_mode)
+            if (!owner_exchange_mode)
                 rc = wl_columnar_eval_retire_prior_deltas(sp, coord, W);
             if (rc != 0) {
                 if (coord->tdd_owner_lifetime) {
