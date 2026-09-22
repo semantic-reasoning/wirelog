@@ -4878,6 +4878,7 @@ test_memory_admission_relation_exe = executable(
   files('test_memory_admission_relation.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_TEST_RELATION_RESIZE_HOOK=1'],
   link_with: [testlib_prod],
 )
 

@@ -139,6 +139,188 @@ test_cow_exact_fit_and_denial(void)
 }
 
 static void
+test_governed_logical_copy(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    col_rel_t *source = col_rel_new_auto("logical-copy", 1);
+    col_rel_t *copy = NULL;
+    uint64_t expected = 0;
+    int64_t value = 42;
+
+    CHECK(source && col_rel_append_row(source, &value) == 0
+        && col_rel_enable_timestamps(source) == 0,
+        "governed logical-copy source");
+    if (!source)
+        return;
+    CHECK(source->timestamps != NULL,
+        "logical-copy timestamp allocation");
+    if (!source->timestamps)
+        goto cleanup;
+    source->timestamps[0].multiplicity = -3;
+    uint32_t timestamp_capacity = source->capacity + 8u;
+    col_delta_timestamp_t *expanded = realloc(source->timestamps,
+            (size_t)timestamp_capacity * sizeof(*expanded));
+    CHECK(expanded != NULL, "logical-copy timestamp expansion");
+    if (!expanded)
+        goto cleanup;
+    memset(expanded + source->timestamp_capacity, 0,
+        (size_t)(timestamp_capacity - source->timestamp_capacity)
+        * sizeof(*expanded));
+    source->timestamps = expanded;
+    source->timestamp_capacity = timestamp_capacity;
+    source->sorted_nrows = source->nrows;
+    source->base_nrows = 1;
+    source->run_count = 1;
+    source->run_ends[0] = source->nrows;
+    expected = (uint64_t)source->ncols * source->capacity * sizeof(int64_t)
+        + (uint64_t)timestamp_capacity * sizeof(col_delta_timestamp_t);
+    make_resolution(&resolution, expected);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref != NULL, "logical-copy governor");
+    if (!ref)
+        goto cleanup;
+
+    int copy_rc = wl_columnar_relation_deep_copy_governed(source, &copy, ref);
+    if (copy_rc != 0)
+        fprintf(stderr, "logical copy rc=%d cap=%u ts=%u expected=%llu\n",
+            copy_rc, source->capacity, source->timestamp_capacity,
+            (unsigned long long)expected);
+    CHECK(copy_rc == 0 && copy,
+        "exact-fit governed logical copy");
+    if (copy) {
+        CHECK(copy->relation_identity != source->relation_identity
+            && copy->nrows == source->nrows &&
+            copy->capacity == source->capacity
+            && copy->base_nrows == source->base_nrows
+            && copy->columns[0] != source->columns[0]
+            && copy->columns[0][0] == value,
+            "logical copy has independent rows and identity");
+        CHECK(copy->sorted_nrows == source->sorted_nrows
+            && copy->run_count == 1
+            && copy->run_ends[0] == source->run_ends[0],
+            "logical copy preserves valid sort metadata");
+        CHECK(copy->timestamps && copy->timestamp_capacity
+            == timestamp_capacity
+            && copy->timestamps[0].multiplicity == -3,
+            "logical copy preserves timestamps");
+        CHECK(copy->memory_governor == ref
+            && copy->retained_reserved_bytes == expected
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == expected,
+            "logical copy carries exact payload reservation");
+        col_rel_destroy(copy);
+        copy = NULL;
+    }
+    CHECK(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0,
+        "logical-copy reservation released");
+
+    wl_columnar_source_access_writer_t writer = { 0 };
+    CHECK(col_rel_source_writer_acquire(source, &writer) == 0,
+        "logical-copy source writer setup");
+    CHECK(wl_columnar_relation_deep_copy_governed(source, &copy,
+        ref) == EBUSY && !copy
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0,
+        "logical copy refuses a concurrently published source");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "logical-copy source writer release");
+
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes,
+        expected - 1u, memory_order_release);
+    CHECK(wl_columnar_relation_deep_copy_governed(source, &copy,
+        ref) == ENOMEM && !copy
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0
+        && source->nrows == 1 && source->columns[0][0] == value,
+        "denied logical copy leaves source and governor unchanged");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes,
+        expected, memory_order_release);
+    wl_columnar_relation_test_fail_next_governed_copy_payload_alloc();
+    CHECK(wl_columnar_relation_deep_copy_governed(source, &copy, ref) == ENOMEM
+        && !copy && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0
+        && source->nrows == 1 && source->columns[0][0] == value,
+        "post-admission allocation failure rolls back reservation");
+    CHECK(wl_columnar_relation_deep_copy_governed(source, &copy,
+        ref) == 0 && copy,
+        "denied logical copy can retry");
+cleanup:
+    col_rel_destroy(copy);
+    col_rel_destroy(source);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "logical-copy retry reservation released");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_governed_empty_compound_copy(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    col_rel_t *source = col_rel_new_auto("empty-compound-copy", 2);
+    col_rel_t *copy = NULL;
+    uint32_t arity = 2;
+
+    CHECK(source != NULL, "empty compound-copy source");
+    if (!source)
+        return;
+    source->compound_arity_map = malloc(sizeof(arity));
+    CHECK(source->compound_arity_map != NULL,
+        "empty compound-copy arity allocation");
+    if (!source->compound_arity_map)
+        goto cleanup;
+    source->compound_arity_map[0] = arity;
+    source->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+    source->compound_count = 1;
+    if (!source->column_types)
+        source->column_types = calloc(source->ncols,
+                sizeof(*source->column_types));
+    CHECK(source->column_types != NULL,
+        "empty compound-copy type allocation");
+    if (!source->column_types)
+        goto cleanup;
+    source->column_types[0] = WIRELOG_TYPE_INT64;
+    source->column_types[1] = WIRELOG_TYPE_INT64;
+    uint64_t expected = (uint64_t)source->ncols * source->capacity
+        * sizeof(int64_t);
+    make_resolution(&resolution, expected);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref != NULL, "empty compound-copy governor");
+    if (!ref)
+        goto cleanup;
+
+    CHECK(wl_columnar_relation_deep_copy_governed(source, &copy, ref) == 0
+        && copy, "governed empty compound copy");
+    if (copy) {
+        CHECK(copy->nrows == 0 && copy->ncols == 2
+            && copy->compound_kind == WIRELOG_COMPOUND_KIND_INLINE
+            && copy->compound_count == 1 && copy->compound_arity_map
+            && copy->compound_arity_map[0] == arity,
+            "empty compound copy preserves logical schema metadata");
+        CHECK(copy->column_types && source->column_types
+            && copy->column_types[0] == source->column_types[0]
+            && copy->column_types[1] == source->column_types[1],
+            "empty compound copy preserves column types");
+    }
+cleanup:
+    col_rel_destroy(copy);
+    col_rel_destroy(source);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "empty compound-copy reservation released");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
 test_cow_multi_column_cleanup(void)
 {
     const uint64_t private_bytes = 2u * 64u * sizeof(int64_t);
@@ -911,6 +1093,8 @@ cleanup:
 int
 main(void)
 {
+    test_governed_logical_copy();
+    test_governed_empty_compound_copy();
     test_physical_timestamp_capacity();
     test_cow_retained_timestamp_capacity_admission();
     test_governed_pool_clone_fallback();
