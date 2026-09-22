@@ -1608,6 +1608,20 @@ typedef struct wl_columnar_eval_stack_cleanup_frame
     wl_columnar_eval_stack_cleanup_frame_t;
 struct wl_columnar_retained_eval_entry;
 struct wl_columnar_kfusion_cohort;
+typedef struct wl_columnar_tdd_owner_lifetime {
+    uint32_t worker_count;
+    uint32_t relation_count;
+    size_t matrix_slots;
+    size_t overflow_slots;
+    bool evaluation_active;
+    bool dispatch_active;
+    void *worker_ctxs;
+    wl_mpsc_queue_t *queue;
+    uint64_t queue_ring_bytes;
+    /* First matrix_slots entries are the worker/relation matrix. The tail
+     * owns overflow queue payloads, with capacity reserved before dispatch. */
+    col_rel_t *relations[];
+} wl_columnar_eval_tdd_owner_lifetime_t;
 
 typedef struct wl_col_session_t {
     wl_session_t base;         /* MUST be first field (vtable dispatch)  */
@@ -2010,6 +2024,9 @@ typedef struct wl_col_session_t {
     struct wl_col_session_t *tdd_workers; /* owned array [tdd_workers_cap] */
     uint32_t tdd_workers_cap;           /* allocated slots in tdd_workers */
     uint32_t tdd_workers_count;         /* number of initialized workers */
+    /* Retains owner-mode TDD delta slots/queue when checked cleanup refuses.
+     * This record owns no plan or execution context and is cleanup-only. */
+    wl_columnar_eval_tdd_owner_lifetime_t *tdd_owner_lifetime;
     uint32_t tdd_active_workers;        /* current adaptive TDD width */
     uint32_t tdd_last_active_workers;   /* last selected TDD width */
     uint32_t tdd_max_active_workers;    /* max selected width this eval */
@@ -3427,6 +3444,11 @@ col_eval_stratum_multiworker(const wl_plan_stratum_t *sp,
 int
 col_eval_stratum_tdd(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord, uint32_t stratum_idx);
+/* Cleanup-only retry for a coordinator-owned owner-mode delta lifetime. */
+int
+wl_columnar_eval_tdd_owner_lifetime_retry(wl_col_session_t *coord);
+int
+wl_columnar_eval_tdd_owner_lifetime_quiesce(wl_col_session_t *coord);
 int
 wl_columnar_eval_resume_nonrecursive_completion(wl_col_session_t *coord);
 int

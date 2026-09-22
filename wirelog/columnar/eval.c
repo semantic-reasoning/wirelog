@@ -38,10 +38,267 @@ wl_columnar_eval_test_before_worker_cleanup(wl_col_session_t *coord);
 #define WL_COLUMNAR_EVAL_SUBMIT wl_workqueue_submit
 #endif
 
+#ifdef WL_COLUMNAR_EVAL_TEST_OWNER_LIFETIME
+extern void
+wl_columnar_eval_test_tdd_worker_start(wl_col_session_t *worker);
+#endif
+
 static void
 tdd_destroy_delta_payload(void *payload)
 {
     col_rel_destroy((col_rel_t *)payload);
+}
+
+static bool
+wl_columnar_eval_tdd_owner_lifetime_contains(
+    const wl_columnar_eval_tdd_owner_lifetime_t *lifetime,
+    const col_rel_t *relation)
+{
+    size_t count = lifetime->matrix_slots + lifetime->overflow_slots;
+    for (size_t i = 0; i < count; i++)
+        if (lifetime->relations[i] == relation)
+            return true;
+    return false;
+}
+
+static int
+wl_columnar_eval_tdd_owner_lifetime_capture_queue(wl_col_session_t *coord,
+    wl_columnar_eval_tdd_owner_lifetime_t *lifetime)
+{
+    wl_delta_msg_t msg;
+
+    if (!lifetime->queue)
+        return 0;
+    while (wl_mpsc_dequeue(lifetime->queue, &msg)) {
+        if (!msg.delta)
+            continue;
+        wl_mem_ledger_free(&coord->mem_ledger, WL_MEM_SUBSYS_CHANNEL,
+            col_rel_transport_bytes((const col_rel_t *)msg.delta));
+        col_rel_t *relation = (col_rel_t *)msg.delta;
+        if (wl_columnar_eval_tdd_owner_lifetime_contains(lifetime, relation))
+            continue;
+        size_t slot = lifetime->matrix_slots;
+        if (msg.worker_id < lifetime->worker_count
+            && msg.rel_idx < lifetime->relation_count) {
+            size_t candidate = (size_t)msg.worker_id
+                * lifetime->relation_count + msg.rel_idx;
+            if (!lifetime->relations[candidate])
+                slot = candidate;
+        }
+        if (slot == lifetime->matrix_slots) {
+            size_t overflow = 0;
+            while (overflow < lifetime->overflow_slots
+                && lifetime->relations[lifetime->matrix_slots + overflow])
+                overflow++;
+            if (overflow == lifetime->overflow_slots) {
+                /* This storage was sized for every message slot in every
+                 * worker ring before dispatch. Losing the dequeued payload
+                 * here would violate the queue's single-owner contract. */
+                abort();
+            }
+            slot = lifetime->matrix_slots + overflow;
+        }
+        lifetime->relations[slot] = relation;
+    }
+    return 0;
+}
+
+static int
+wl_columnar_eval_tdd_owner_lifetime_dispose_slots(
+    wl_columnar_eval_tdd_owner_lifetime_t *lifetime, size_t destroy_count);
+
+int
+wl_columnar_eval_tdd_owner_lifetime_retry(wl_col_session_t *coord)
+{
+    wl_columnar_eval_tdd_owner_lifetime_t *lifetime;
+    size_t count;
+
+    if (!coord)
+        return EINVAL;
+    lifetime = coord->tdd_owner_lifetime;
+    if (!lifetime)
+        return 0;
+    if (lifetime->evaluation_active || lifetime->dispatch_active)
+        return EBUSY;
+    int rc = wl_columnar_eval_tdd_owner_lifetime_capture_queue(coord, lifetime);
+    if (rc != 0)
+        return rc;
+    count = lifetime->matrix_slots + lifetime->overflow_slots;
+    rc = wl_columnar_eval_tdd_owner_lifetime_dispose_slots(lifetime, count);
+    if (rc != 0)
+        return rc;
+
+    if (lifetime->queue) {
+        wl_mem_ledger_free(&coord->mem_ledger, WL_MEM_SUBSYS_CHANNEL,
+            lifetime->queue_ring_bytes);
+        if (coord->delta_queue == lifetime->queue) {
+            coord->delta_queue = NULL;
+            coord->mem_channel_ring_bytes = 0;
+        }
+        wl_mpsc_queue_destroy(lifetime->queue);
+        lifetime->queue = NULL;
+    }
+    coord->tdd_owner_lifetime = NULL;
+    free(lifetime);
+    return 0;
+}
+
+int
+wl_columnar_eval_tdd_owner_lifetime_quiesce(wl_col_session_t *coord)
+{
+    if (!coord)
+        return EINVAL;
+    wl_columnar_eval_tdd_owner_lifetime_t *lifetime
+        = coord->tdd_owner_lifetime;
+    if (!lifetime)
+        return 0;
+    if (lifetime->evaluation_active)
+        return EBUSY;
+    if (!lifetime->dispatch_active)
+        return 0;
+    if (!coord->wq)
+        return EBUSY;
+    int rc = wl_workqueue_drain(coord->wq);
+    if (rc != 0)
+        return rc;
+    lifetime->dispatch_active = false;
+    free(lifetime->worker_ctxs);
+    lifetime->worker_ctxs = NULL;
+    return 0;
+}
+
+static int
+wl_columnar_eval_tdd_owner_lifetime_create(wl_col_session_t *coord,
+    col_eval_tdd_worker_ctx_t *ctxs, uint32_t workers, uint32_t nrels,
+    uint32_t queue_capacity)
+{
+    size_t matrix_slots;
+    size_t overflow_slots;
+    size_t total_slots;
+    size_t slot_bytes;
+    size_t allocation_bytes;
+    uint32_t ring_capacity = 2;
+    int rc;
+
+    if (!coord || !ctxs || workers == 0 || nrels == 0
+        || coord->tdd_owner_lifetime)
+        return EINVAL;
+    rc = wl_columnar_eval_checked_size_mul(workers, nrels, &matrix_slots);
+    if (rc != 0)
+        return rc;
+    while (ring_capacity < queue_capacity) {
+        if (ring_capacity > UINT32_MAX / 2u)
+            return EOVERFLOW;
+        ring_capacity *= 2u;
+    }
+    rc = wl_columnar_eval_checked_size_mul(workers, ring_capacity,
+            &overflow_slots);
+    if (rc != 0 || overflow_slots > SIZE_MAX - matrix_slots)
+        return EOVERFLOW;
+    total_slots = matrix_slots + overflow_slots;
+    rc = wl_columnar_eval_checked_size_mul(total_slots, sizeof(col_rel_t *),
+            &slot_bytes);
+    if (rc != 0 || slot_bytes > SIZE_MAX - sizeof(
+            wl_columnar_eval_tdd_owner_lifetime_t))
+        return EOVERFLOW;
+    allocation_bytes = sizeof(wl_columnar_eval_tdd_owner_lifetime_t) +
+        slot_bytes;
+    wl_columnar_eval_tdd_owner_lifetime_t *lifetime = calloc(1,
+            allocation_bytes);
+    if (!lifetime)
+        return ENOMEM;
+    lifetime->worker_count = workers;
+    lifetime->relation_count = nrels;
+    lifetime->matrix_slots = matrix_slots;
+    lifetime->overflow_slots = overflow_slots;
+    lifetime->evaluation_active = true;
+    lifetime->worker_ctxs = ctxs;
+    for (uint32_t w = 0; w < workers; w++)
+        ctxs[w].delta_rels = lifetime->relations + (size_t)w * nrels;
+    coord->tdd_owner_lifetime = lifetime;
+    return 0;
+}
+
+static int
+wl_columnar_eval_tdd_owner_lifetime_dispose_all(
+    wl_columnar_eval_tdd_owner_lifetime_t *lifetime)
+{
+    if (!lifetime)
+        return EINVAL;
+    return wl_columnar_eval_tdd_owner_lifetime_dispose_slots(lifetime,
+               lifetime->matrix_slots + lifetime->overflow_slots);
+}
+
+static int
+wl_columnar_eval_tdd_owner_lifetime_dispose_slots(
+    wl_columnar_eval_tdd_owner_lifetime_t *lifetime, size_t destroy_count)
+{
+    size_t total;
+    int first_rc = 0;
+    if (!lifetime)
+        return EINVAL;
+    total = lifetime->matrix_slots + lifetime->overflow_slots;
+    if (destroy_count > total)
+        return EINVAL;
+    /* Canonicalize every aliased pointer before a destructor can free it. */
+    for (size_t i = 0; i < total; i++) {
+        col_rel_t *relation = lifetime->relations[i];
+        if (!relation)
+            continue;
+        for (size_t j = 0; j < i; j++) {
+            if (lifetime->relations[j] == relation) {
+                lifetime->relations[i] = NULL;
+                break;
+            }
+        }
+    }
+    /* Keep making progress so aliases can release roots that refused earlier
+     * in the same pass. The number of successful disposals is bounded. */
+    for (size_t pass = 0; pass <= destroy_count; pass++) {
+        bool progress = false;
+        first_rc = 0;
+        for (size_t i = 0; i < destroy_count; i++) {
+            col_rel_t *relation = lifetime->relations[i];
+            if (!relation)
+                continue;
+            int rc = col_rel_destroy_checked(relation);
+            if (rc == 0) {
+                lifetime->relations[i] = NULL;
+                progress = true;
+            } else if (first_rc == 0) {
+                first_rc = rc;
+            }
+        }
+        if (!progress)
+            break;
+    }
+    for (size_t i = 0; i < destroy_count; i++)
+        if (lifetime->relations[i])
+            return first_rc != 0 ? first_rc : EBUSY;
+    return 0;
+}
+
+static int
+wl_columnar_eval_tdd_owner_lifetime_dispose_slot(wl_col_session_t *coord,
+    col_rel_t **slot)
+{
+    if (!coord || !slot)
+        return EINVAL;
+    if (!*slot)
+        return 0;
+    if (!coord->tdd_owner_lifetime)
+        return EINVAL;
+    size_t total = coord->tdd_owner_lifetime->matrix_slots
+        + coord->tdd_owner_lifetime->overflow_slots;
+    for (size_t i = 0; i < total; i++) {
+        if (&coord->tdd_owner_lifetime->relations[i] != slot
+            && coord->tdd_owner_lifetime->relations[i] == *slot)
+            coord->tdd_owner_lifetime->relations[i] = NULL;
+    }
+    int rc = col_rel_destroy_checked(*slot);
+    if (rc == 0)
+        *slot = NULL;
+    return rc;
 }
 
 #define WL_COLUMNAR_EVAL_DEDUP_ROW_HASH wl_columnar_eval_dedup_row_hash
@@ -176,6 +433,16 @@ static int
 tdd_cleanup_workers(wl_col_session_t *coord)
 {
     int result = 0;
+
+    if (coord->tdd_owner_lifetime) {
+        int quiesce_rc
+            = wl_columnar_eval_tdd_owner_lifetime_quiesce(coord);
+        if (quiesce_rc != 0)
+            return quiesce_rc;
+        int rc = wl_columnar_eval_tdd_owner_lifetime_retry(coord);
+        if (rc != 0)
+            return rc;
+    }
 
 #ifdef WL_COLUMNAR_EVAL_TEST_SUBMISSION
     wl_columnar_eval_test_before_worker_cleanup(coord);
@@ -1667,6 +1934,10 @@ tdd_worker_subpass_fn(void *arg)
     uint32_t eff_iter = ctx->eff_iter;
     uint32_t nrels = sp->relation_count;
     uint64_t worker_t0 = now_ns();
+
+#ifdef WL_COLUMNAR_EVAL_TEST_OWNER_LIFETIME
+    wl_columnar_eval_test_tdd_worker_start(sess);
+#endif
 
     int readiness_rc = sess->cleanup_active ? EBUSY
         : wl_columnar_session_cleanup_ready(sess);
@@ -5295,7 +5566,11 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
             if (d && d->nrows > 0) {
                 if (wl_columnar_eval_checked_row_add(total, d->nrows,
                     &total) != 0) {
-                    tdd_destroy_delta_slots(ctxs, W, nrels);
+                    int cleanup_rc =
+                        wl_columnar_eval_tdd_owner_lifetime_dispose_all(
+                        coord->tdd_owner_lifetime);
+                    if (cleanup_rc != 0)
+                        return cleanup_rc;
                     return EOVERFLOW;
                 }
                 if (ncols == 0)
@@ -5304,8 +5579,11 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
         }
         if (total == 0) {
             for (uint32_t w = 0; w < W; w++) {
-                col_rel_destroy(ctxs[w].delta_rels[ri]);
-                ctxs[w].delta_rels[ri] = NULL;
+                int cleanup_rc =
+                    wl_columnar_eval_tdd_owner_lifetime_dispose_slot(coord,
+                        &ctxs[w].delta_rels[ri]);
+                if (cleanup_rc != 0)
+                    return cleanup_rc;
             }
             coord->tdd_exchange_coordinator_ns += now_ns() - prepare_t0;
             continue;
@@ -5317,10 +5595,14 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
 
         for (uint32_t w = 0; w < W; w++) {
             col_rel_t *d = ctxs[w].delta_rels[ri];
-            ctxs[w].delta_rels[ri] = NULL;
             if (d && d->nrows > 0)
                 rc = col_rel_append_all(combined, d, NULL);
-            col_rel_destroy(d);
+            if (rc != 0) {
+                col_rel_destroy(combined);
+                return rc;
+            }
+            rc = wl_columnar_eval_tdd_owner_lifetime_dispose_slot(coord,
+                    &ctxs[w].delta_rels[ri]);
             if (rc != 0) {
                 col_rel_destroy(combined);
                 return rc;
@@ -5352,7 +5634,6 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
             if (wl_columnar_eval_checked_row_add(*out_accepted_rows,
                 combined->nrows, out_accepted_rows) != 0) {
                 col_rel_destroy(combined);
-                tdd_destroy_delta_slots(ctxs, W, nrels);
                 return EOVERFLOW;
             }
         }
@@ -5720,6 +6001,17 @@ static int
 col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord, uint32_t stratum_idx)
 {
+    /* A retained record is cleanup-only. Once it is cleared, this invocation
+     * is a fresh evaluation with its own plan/context. */
+    if (coord && coord->tdd_owner_lifetime) {
+        int quiesce_rc
+            = wl_columnar_eval_tdd_owner_lifetime_quiesce(coord);
+        if (quiesce_rc != 0)
+            return quiesce_rc;
+        int cleanup_rc = wl_columnar_eval_tdd_owner_lifetime_retry(coord);
+        if (cleanup_rc != 0)
+            return cleanup_rc;
+    }
     uint32_t W = coord->num_workers;
     uint32_t nrels = sp->relation_count;
     size_t delta_rel_bytes = 0;
@@ -6007,6 +6299,8 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
      * (~14k iterations for CRDT). */
     /* Keep this initialized before any goto done path. */
     uint32_t *bdx_snap = NULL;
+    bool owner_slots_embedded = false;
+    bool owner_dispatch_quiesced = true;
     col_eval_tdd_worker_ctx_t *ctxs
         = (col_eval_tdd_worker_ctx_t *)calloc(
             W, sizeof(col_eval_tdd_worker_ctx_t));
@@ -6014,16 +6308,24 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         rc = ENOMEM;
         goto done;
     }
-    for (uint32_t w = 0; w < W; w++) {
-        ctxs[w].delta_rels = (col_rel_t **)calloc(
-            nrels, sizeof(col_rel_t *));
-        if (!ctxs[w].delta_rels) {
-            for (uint32_t j = 0; j < w; j++)
-                free((void *)ctxs[j].delta_rels);
-            free(ctxs);
-            ctxs = NULL;
-            rc = ENOMEM;
+    if (owner_exchange_mode) {
+        rc = wl_columnar_eval_tdd_owner_lifetime_create(coord, ctxs, W, nrels,
+                delta_queue_capacity);
+        if (rc != 0)
             goto done;
+        owner_slots_embedded = true;
+    } else {
+        for (uint32_t w = 0; w < W; w++) {
+            ctxs[w].delta_rels = (col_rel_t **)calloc(
+                nrels, sizeof(col_rel_t *));
+            if (!ctxs[w].delta_rels) {
+                for (uint32_t j = 0; j < w; j++)
+                    free((void *)ctxs[j].delta_rels);
+                free(ctxs);
+                ctxs = NULL;
+                rc = ENOMEM;
+                goto done;
+            }
         }
     }
 
@@ -6034,9 +6336,14 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
      * state allocation, using the evaluator's ENOMEM failure signal. */
     coord->delta_queue = wl_mpsc_queue_create_with_destructor(
         W, delta_queue_capacity, tdd_destroy_delta_payload);
+    if (coord->tdd_owner_lifetime)
+        coord->tdd_owner_lifetime->queue = coord->delta_queue;
     /* Issue #1380: ring storage is fixed for the stratum; charge once. */
     coord->mem_channel_ring_bytes
         = wl_mpsc_queue_footprint_bytes(coord->delta_queue);
+    if (coord->tdd_owner_lifetime)
+        coord->tdd_owner_lifetime->queue_ring_bytes
+            = coord->mem_channel_ring_bytes;
     wl_mem_ledger_alloc(&coord->mem_ledger, WL_MEM_SUBSYS_CHANNEL,
         coord->mem_channel_ring_bytes);
 
@@ -6227,10 +6534,16 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             for (uint32_t w = 0; w < W; w++) {
                 if (WL_COLUMNAR_EVAL_SUBMIT(coord->wq, tdd_worker_subpass_fn,
                     &ctxs[w]) != 0) {
-                    wl_workqueue_drain(coord->wq);
+                    int drain_rc = wl_workqueue_drain(coord->wq);
+                    owner_dispatch_quiesced = drain_rc == 0;
+                    if (owner_dispatch_quiesced && coord->tdd_owner_lifetime)
+                        coord->tdd_owner_lifetime->dispatch_active = false;
                     submit_ok = false;
                     break;
                 }
+                owner_dispatch_quiesced = false;
+                if (coord->tdd_owner_lifetime)
+                    coord->tdd_owner_lifetime->dispatch_active = true;
                 if (coord->tdd_audit.enabled)
                     coord->tdd_audit.submitted_tasks++;
             }
@@ -6238,18 +6551,32 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             coord->tdd_submit_loop_ns += submit_ns;
 
             if (!submit_ok) {
-                wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(
-                    coord->delta_queue, &coord->mem_ledger);
-                for (uint32_t w = 0; w < W; w++)
-                    for (uint32_t ri = 0; ri < nrels; ri++)
-                        col_rel_destroy(ctxs[w].delta_rels[ri]);
+                if (!coord->tdd_owner_lifetime) {
+                    wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(
+                        coord->delta_queue, &coord->mem_ledger);
+                    for (uint32_t w = 0; w < W; w++)
+                        for (uint32_t ri = 0; ri < nrels; ri++)
+                            col_rel_destroy(ctxs[w].delta_rels[ri]);
+                }
                 rc = ENOMEM;
                 goto done;
             }
 
             /* BARRIER */
             uint64_t wait_t0 = now_ns();
-            wl_workqueue_wait_all(coord->wq);
+            int wait_rc = wl_workqueue_wait_all(coord->wq);
+            owner_dispatch_quiesced = wait_rc == 0;
+            if (coord->tdd_owner_lifetime)
+                coord->tdd_owner_lifetime->dispatch_active
+                    = !owner_dispatch_quiesced;
+            if (wait_rc != 0) {
+                int drain_rc = wl_workqueue_drain(coord->wq);
+                owner_dispatch_quiesced = drain_rc == 0;
+                if (owner_dispatch_quiesced && coord->tdd_owner_lifetime)
+                    coord->tdd_owner_lifetime->dispatch_active = false;
+                rc = wait_rc;
+                goto done;
+            }
             if (coord->tdd_audit.enabled)
                 coord->tdd_audit.completed_rounds++;
             uint64_t wait_ns = now_ns() - wait_t0;
@@ -6298,11 +6625,13 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                     fprintf(stderr,
                         "TDD worker error stratum=%u iter=%u rc=%d\n",
                         stratum_idx, eff_iter, rc);
-                wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(
-                    coord->delta_queue, &coord->mem_ledger);
-                for (uint32_t w = 0; w < W; w++)
-                    for (uint32_t ri = 0; ri < nrels; ri++)
-                        col_rel_destroy(ctxs[w].delta_rels[ri]);
+                if (!coord->tdd_owner_lifetime) {
+                    wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(
+                        coord->delta_queue, &coord->mem_ledger);
+                    for (uint32_t w = 0; w < W; w++)
+                        for (uint32_t ri = 0; ri < nrels; ri++)
+                            col_rel_destroy(ctxs[w].delta_rels[ri]);
+                }
                 goto done;
             }
 
@@ -6311,48 +6640,59 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
              * ctx and queue; shadow assert verifies agreement (debug only). */
             if (coord->delta_queue) {
                 uint64_t queue_t0 = now_ns();
-                size_t matrix_count = 0;
-                if (wl_columnar_eval_tdd_matrix_size(W, nrels,
-                    sizeof(wl_delta_msg_t), &matrix_count) != 0) {
-                    wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(
-                        coord->delta_queue, &coord->mem_ledger);
-                    rc = EOVERFLOW;
-                    goto done;
-                }
-                uint32_t max_msgs = (uint32_t)matrix_count;
-                wl_delta_msg_t *msgs = (wl_delta_msg_t *)calloc(
-                    max_msgs > 0 ? max_msgs : 1u, sizeof(wl_delta_msg_t));
-                if (!msgs) {
-                    /* Queue-only workers have not written ctxs yet.  Drain
-                     * and destroy their queued deltas before aborting; do
-                     * not continue with a silently empty exchange. */
-                    wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(
-                        coord->delta_queue, &coord->mem_ledger);
-                    rc = ENOMEM;
+                if (coord->tdd_owner_lifetime) {
+                    /* The owner record is the allocation-free queue
+                     * destination. It retains every rejected/duplicate slot
+                     * message instead of invoking the legacy destructor. */
+                    rc = wl_columnar_eval_tdd_owner_lifetime_capture_queue(
+                        coord, coord->tdd_owner_lifetime);
                     coord->tdd_queue_drain_ns += now_ns() - queue_t0;
-                    goto done;
-                }
-                uint32_t msg_count = wl_mpsc_dequeue_all(
-                    coord->delta_queue, msgs, max_msgs);
-                /* Issue #1380: payloads leave the channel here; whatever
-                 * the matrix keeps becomes a coordinator-side delta. */
-                for (uint32_t mi = 0; mi < msg_count && mi < max_msgs;
-                    mi++) {
-                    if (msgs[mi].delta)
-                        wl_mem_ledger_free(&coord->mem_ledger,
-                            WL_MEM_SUBSYS_CHANNEL,
-                            col_rel_transport_bytes(
-                                (const col_rel_t *)msgs[mi].delta));
-                }
+                    if (rc != 0)
+                        goto done;
+                } else {
+                    size_t matrix_count = 0;
+                    if (wl_columnar_eval_tdd_matrix_size(W, nrels,
+                        sizeof(wl_delta_msg_t), &matrix_count) != 0) {
+                        wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(
+                            coord->delta_queue, &coord->mem_ledger);
+                        rc = EOVERFLOW;
+                        goto done;
+                    }
+                    uint32_t max_msgs = (uint32_t)matrix_count;
+                    wl_delta_msg_t *msgs = (wl_delta_msg_t *)calloc(
+                        max_msgs > 0 ? max_msgs : 1u, sizeof(wl_delta_msg_t));
+                    if (!msgs) {
+                        /* Queue-only workers have not written ctxs yet.  Drain
+                         * and destroy their queued deltas before aborting; do
+                         * not continue with a silently empty exchange. */
+                        wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(
+                            coord->delta_queue, &coord->mem_ledger);
+                        rc = ENOMEM;
+                        coord->tdd_queue_drain_ns += now_ns() - queue_t0;
+                        goto done;
+                    }
+                    uint32_t msg_count = wl_mpsc_dequeue_all(
+                        coord->delta_queue, msgs, max_msgs);
+                    /* Issue #1380: payloads leave the channel here; whatever
+                     * the matrix keeps becomes a coordinator-side delta. */
+                    for (uint32_t mi = 0; mi < msg_count && mi < max_msgs;
+                        mi++) {
+                        if (msgs[mi].delta)
+                            wl_mem_ledger_free(&coord->mem_ledger,
+                                WL_MEM_SUBSYS_CHANNEL,
+                                col_rel_transport_bytes(
+                                    (const col_rel_t *)msgs[mi].delta));
+                    }
 
-                /* Clear and reconstruct from queue messages. */
-                for (uint32_t w = 0; w < W; w++)
-                    memset((void *)ctxs[w].delta_rels, 0,
-                        delta_rel_bytes);
-                wl_columnar_eval_tdd_queue_reconstruct_delta_matrix(
-                    ctxs, msgs, msg_count, W, nrels);
-                free(msgs);
-                coord->tdd_queue_drain_ns += now_ns() - queue_t0;
+                    /* Clear and reconstruct from queue messages. */
+                    for (uint32_t w = 0; w < W; w++)
+                        memset((void *)ctxs[w].delta_rels, 0,
+                            delta_rel_bytes);
+                    wl_columnar_eval_tdd_queue_reconstruct_delta_matrix(
+                        ctxs, msgs, msg_count, W, nrels);
+                    free(msgs);
+                    coord->tdd_queue_drain_ns += now_ns() - queue_t0;
+                }
             }
 
             /* Queue mode transfers ownership out of ctxs in the worker.
@@ -6378,9 +6718,16 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             }
             if (all_workers_empty) {
                 coord->tdd_convergence_ns += now_ns() - convergence_t0;
-                for (uint32_t w = 0; w < W; w++)
-                    for (uint32_t ri = 0; ri < nrels; ri++)
-                        col_rel_destroy(ctxs[w].delta_rels[ri]);
+                if (coord->tdd_owner_lifetime) {
+                    rc = wl_columnar_eval_tdd_owner_lifetime_dispose_all(
+                        coord->tdd_owner_lifetime);
+                    if (rc != 0)
+                        goto done;
+                } else {
+                    for (uint32_t w = 0; w < W; w++)
+                        for (uint32_t ri = 0; ri < nrels; ri++)
+                            col_rel_destroy(ctxs[w].delta_rels[ri]);
+                }
                 outer_continue_next = true;
                 break;
             }
@@ -6416,7 +6763,15 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
              * guarding it invalidates them. */
             rc = wl_columnar_eval_retire_prior_deltas(sp, coord, W);
             if (rc != 0) {
-                tdd_destroy_delta_slots(ctxs, W, nrels);
+                if (coord->tdd_owner_lifetime) {
+                    int cleanup_rc =
+                        wl_columnar_eval_tdd_owner_lifetime_dispose_all(
+                        coord->tdd_owner_lifetime);
+                    if (cleanup_rc != 0)
+                        rc = cleanup_rc;
+                } else {
+                    tdd_destroy_delta_slots(ctxs, W, nrels);
+                }
                 goto done;
             }
 
@@ -6500,21 +6855,37 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
     } /* end outer loop */
 
 done:
-    /* Issue #410: Destroy MPSC delta queue created for this stratum eval. */
-    /* Issue #1380: drain with accounting first so the destructor path has
-     * nothing left to reclaim, then release the ring charge. */
-    wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(coord->delta_queue,
-        &coord->mem_ledger);
-    wl_mem_ledger_free(&coord->mem_ledger, WL_MEM_SUBSYS_CHANNEL,
-        coord->mem_channel_ring_bytes);
-    coord->mem_channel_ring_bytes = 0;
-    wl_mpsc_queue_destroy(coord->delta_queue);
-    coord->delta_queue = NULL;
+    /* An owner lifetime record owns queue messages and slot arrays across a
+     * refused checked destroy. Do not let the queue destructor consume them. */
+    if (coord->tdd_owner_lifetime) {
+        coord->tdd_owner_lifetime->evaluation_active = false;
+        if (owner_dispatch_quiesced) {
+            coord->tdd_owner_lifetime->dispatch_active = false;
+            coord->tdd_owner_lifetime->worker_ctxs = NULL;
+        }
+        int lifetime_rc
+            = wl_columnar_eval_tdd_owner_lifetime_retry(coord);
+        if (lifetime_rc != 0 && rc == 0)
+            rc = lifetime_rc;
+    } else {
+        /* Issue #410: Destroy MPSC delta queue created for this stratum. */
+        /* Issue #1380: drain with accounting first so the destructor path has
+         * nothing left to reclaim, then release the ring charge. */
+        wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(
+            coord->delta_queue, &coord->mem_ledger);
+        wl_mem_ledger_free(&coord->mem_ledger, WL_MEM_SUBSYS_CHANNEL,
+            coord->mem_channel_ring_bytes);
+        coord->mem_channel_ring_bytes = 0;
+        wl_mpsc_queue_destroy(coord->delta_queue);
+        coord->delta_queue = NULL;
+    }
 
     /* Free pre-allocated worker contexts */
-    if (ctxs) {
-        for (uint32_t w = 0; w < W; w++)
-            free((void *)ctxs[w].delta_rels);
+    if (ctxs && (!coord->tdd_owner_lifetime
+        || !coord->tdd_owner_lifetime->dispatch_active)) {
+        if (!owner_slots_embedded)
+            for (uint32_t w = 0; w < W; w++)
+                free((void *)ctxs[w].delta_rels);
         free(ctxs);
     }
     free(bdx_snap);

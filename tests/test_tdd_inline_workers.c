@@ -54,12 +54,18 @@ wl_columnar_session_get_tdd_decision_stats(wl_session_t *, uint32_t *,
     uint32_t *, uint32_t *, uint32_t *, uint32_t *, uint32_t *, uint32_t *,
     const char **);
 
+static bool owner_partial_submit_armed;
+static unsigned owner_partial_submit_count;
+
 /* Enable the production TDD submission path while keeping this test's
  * dispatch hook deterministic. */
 int
 wl_columnar_eval_test_submit(wl_work_queue_t *wq, void (*fn)(void *),
     void *ctx)
 {
+    if (owner_partial_submit_armed
+        && ++owner_partial_submit_count == 2)
+        return ENOMEM;
     return wl_workqueue_submit(wq, fn, ctx);
 }
 
@@ -72,6 +78,10 @@ wl_columnar_eval_test_submit(wl_work_queue_t *wq, void (*fn)(void *),
 static bool teardown_hold_armed;
 static bool teardown_hold_fired;
 static wl_columnar_source_access_reader_t teardown_reader;
+static bool owner_queue_hold_armed;
+static bool owner_queue_hold_fired;
+static col_rel_t *owner_queue_relation;
+static wl_columnar_source_access_reader_t owner_queue_reader;
 
 void
 wl_columnar_eval_test_before_worker_cleanup(wl_col_session_t *coord)
@@ -95,6 +105,40 @@ wl_columnar_eval_test_before_worker_cleanup(wl_col_session_t *coord)
         teardown_hold_fired = true;
         return;
     }
+}
+
+void
+wl_columnar_eval_test_tdd_worker_start(wl_col_session_t *worker)
+{
+    /* Worker zero invokes this hook serially across TDD rounds, and the
+     * coordinator reads the result only after the workqueue barrier. */
+    if (!owner_queue_hold_armed || !worker || worker->worker_id != 0
+        || !worker->coordinator
+        || !worker->coordinator->tdd_owner_lifetime
+        || !worker->coordinator->delta_queue || owner_queue_hold_fired)
+        return;
+    owner_queue_hold_fired = true;
+    wl_col_session_t *coord = worker->coordinator;
+    col_rel_t *relation = col_rel_new_auto("queued_retained_delta", 0);
+    if (!relation || col_rel_source_reader_acquire_transferable(relation,
+        &owner_queue_reader) != 0) {
+        col_rel_destroy(relation);
+        owner_queue_hold_fired = false;
+        return;
+    }
+    /* Invalid rel_idx forces the payload into the lifetime's reserved
+     * overflow slots while preserving the real worker matrix output. */
+    int rc = wl_mpsc_enqueue(coord->delta_queue, worker->worker_id,
+            relation, worker->current_iteration, UINT32_MAX);
+    if (rc != 0) {
+        (void)col_rel_source_reader_release(&owner_queue_reader);
+        col_rel_destroy(relation);
+        owner_queue_hold_fired = false;
+        return;
+    }
+    owner_queue_relation = relation;
+    wl_mem_ledger_alloc(&coord->mem_ledger, WL_MEM_SUBSYS_CHANNEL,
+        col_rel_transport_bytes(relation));
 }
 
 typedef struct {
@@ -452,6 +496,119 @@ fail:
     return 1;
 }
 
+/* Inject one queue-owned payload from a real worker producer. The reader
+ * forces owner cleanup to retain the captured overflow slot, then a fresh
+ * quiescent retry releases it after the reader is dropped. */
+static int
+run_owner_queue_lifetime_retry(void)
+{
+    const char *source =
+        ".decl edge(x: int32, y: int32)\n"
+        ".decl reach(x: int32, y: int32, p: pair/2 inline)\n"
+        "reach(x,y,7,8) :- edge(x,y).\n"
+        "reach(x,z,a,b) :- reach(x,y,a,b), edge(y,z).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    wl_plan_t *plan = NULL;
+    wl_session_t *session = NULL;
+    bool fixture_held = false;
+    wl_mem_ledger_snapshot_t baseline_ledger;
+    int rc = 0;
+    if (!program)
+        return 1;
+    wl_fusion_apply(program, NULL);
+    wl_jpp_apply(program, NULL);
+    wl_sip_apply(program, NULL);
+    rc = wl_plan_from_program(program, &plan);
+    if (rc != 0 || !plan)
+        goto fail;
+    plan_fixture_hold(program);
+    fixture_held = true;
+    rc = wl_session_create(wl_backend_columnar(), plan, 8, &session);
+    if (rc != 0)
+        goto fail;
+    wl_col_session_t *columnar = COL_SESSION(session);
+    int64_t facts[200];
+    for (int i = 0; i < 100; i++) {
+        facts[i * 2] = (int64_t)i;
+        facts[i * 2 + 1] = (int64_t)i + 1;
+    }
+    rc = wl_session_insert(session, "edge", facts, 100, 2);
+    if (rc != 0)
+        goto cleanup;
+    wl_mem_ledger_snapshot(&columnar->mem_ledger, &baseline_ledger);
+
+    memset(&owner_queue_reader, 0, sizeof(owner_queue_reader));
+    owner_queue_relation = NULL;
+    owner_queue_hold_fired = false;
+    owner_partial_submit_count = 0;
+    owner_partial_submit_armed = true;
+    owner_queue_hold_armed = true;
+    rc = snapshot_oracle(session, 5050, true);
+    owner_partial_submit_armed = false;
+    owner_queue_hold_armed = false;
+    if (rc == 0 || !owner_queue_hold_fired
+        || !owner_queue_reader.owner || !owner_queue_relation
+        || !columnar->tdd_owner_lifetime) {
+        rc = EPROTO;
+        goto cleanup;
+    }
+    wl_columnar_eval_tdd_owner_lifetime_t *lifetime
+        = columnar->tdd_owner_lifetime;
+    size_t total = lifetime->matrix_slots + lifetime->overflow_slots;
+    bool retained = false;
+    for (size_t i = lifetime->matrix_slots; i < total; i++)
+        retained |= lifetime->relations[i] == owner_queue_relation;
+    if (!retained) {
+        rc = EPROTO;
+        goto cleanup;
+    }
+    for (unsigned attempt = 0; attempt < 2; attempt++) {
+        if (wl_columnar_session_cleanup_ready(columnar) != EBUSY
+            || columnar->tdd_owner_lifetime != lifetime) {
+            rc = EPROTO;
+            goto cleanup;
+        }
+    }
+    if (col_rel_source_reader_release(&owner_queue_reader) != 0) {
+        memset(&owner_queue_reader, 0, sizeof(owner_queue_reader));
+        rc = EIO;
+        goto cleanup;
+    }
+    memset(&owner_queue_reader, 0, sizeof(owner_queue_reader));
+    rc = wl_columnar_session_cleanup_ready_quiescent(columnar);
+    if (rc != 0 || columnar->tdd_owner_lifetime || columnar->delta_queue) {
+        rc = EPROTO;
+        goto cleanup;
+    }
+    wl_mem_ledger_snapshot_t after_retry_ledger;
+    wl_mem_ledger_snapshot(&columnar->mem_ledger, &after_retry_ledger);
+    if (after_retry_ledger.subsys_bytes[WL_MEM_SUBSYS_CHANNEL]
+        != baseline_ledger.subsys_bytes[WL_MEM_SUBSYS_CHANNEL]) {
+        rc = EPROTO;
+        goto cleanup;
+    }
+    rc = snapshot_oracle(session, 5050, true);
+cleanup:
+    owner_partial_submit_armed = false;
+    owner_queue_hold_armed = false;
+    if (owner_queue_reader.owner)
+        (void)col_rel_source_reader_release(&owner_queue_reader);
+    if (session)
+        wl_session_destroy(session);
+    if (plan)
+        wl_plan_free(plan);
+    if (program && !fixture_held)
+        wirelog_program_free(program);
+    return rc == 0 ? 0 : 1;
+fail:
+    if (plan)
+        wl_plan_free(plan);
+    if (program && !fixture_held)
+        wirelog_program_free(program);
+    return 1;
+}
+
 int
 main(void)
 {
@@ -475,6 +632,8 @@ main(void)
         rc = run_scalar_dispatch_probe();
     if (rc == 0)
         rc = run_teardown_refusal_gate();
+    if (rc == 0)
+        rc = run_owner_queue_lifetime_retry();
     if (saved_threshold) {
         setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", saved_threshold, 1);
         free(saved_threshold);
