@@ -6,7 +6,11 @@
 # Keep in sync with meson.build when new public headers are installed.
 set -euo pipefail
 
-ROOT="$(git rev-parse --show-toplevel)"
+SCRIPT_DIR="$(CDPATH= cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+if ! ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null)"; then
+    echo "ERROR: check_log_header_not_public: could not resolve the source root from ${SCRIPT_DIR}" >&2
+    exit 2
+fi
 cd "$ROOT"
 
 PUBLIC_HEADERS=(

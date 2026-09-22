@@ -17,7 +17,7 @@ ir_src = files(
   '../wirelog/ir/stratify.c',
   '../wirelog/ir/api.c',
   '../wirelog/intern.c',
-  '../wirelog/session.c', '../wirelog/evaluation_control.c',
+  '../wirelog/session.c',
   '../wirelog/exec_plan_gen.c',
   '../wirelog/session_facts.c',
   '../wirelog/extension_registry.c',
@@ -170,7 +170,7 @@ testlib_prod = static_library(
     '../wirelog/passes/magic_sets.c',
     '../wirelog/passes/sip.c',
     '../wirelog/passes/subsumption.c',
-    '../wirelog/session.c', '../wirelog/evaluation_control.c',
+    '../wirelog/session.c',
     '../wirelog/session_facts.c',
     '../wirelog/string_ops.c',
     '../wirelog/util/lockfree_queue.c',
@@ -812,6 +812,13 @@ if not is_windows
        find_program(meson.project_source_root() / 'scripts/ci/test-check-log-erasure.sh'),
        suite: 'abi',
        timeout: 60)
+
+  # Issue #1663: source-root discovery must follow each gate's script path,
+  # including linked worktrees and callers outside the source checkout.
+  test('log_abi_source_root_selftest',
+       find_program(meson.project_source_root() / 'scripts/ci/test-log-abi-source-root.sh'),
+       suite: 'abi',
+       timeout: 120)
 
   # Header must not leak into public surface; testhook symbols must not
   # appear in libwirelog.
@@ -5384,7 +5391,7 @@ test('extension_registry', test_extension_registry_exe)
 test_session_extension_snapshot_exe = executable(
   'test_session_extension_snapshot',
   files('test_session_extension_snapshot.c',
-        '../wirelog/session.c', '../wirelog/evaluation_control.c', '../wirelog/extension_registry.c'),
+        '../wirelog/session.c', '../wirelog/extension_registry.c'),
   thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   c_args: ['-DWIRELOG_BUILDING'],
@@ -5397,7 +5404,7 @@ test('session_extension_snapshot', test_session_extension_snapshot_exe)
 # fake backend verifies options dispatch without requiring a Windows host.
 test_session_options_exe = executable(
   'test_session_options',
-  files('test_session_options.c', '../wirelog/session.c', '../wirelog/evaluation_control.c',
+  files('test_session_options.c', '../wirelog/session.c',
         '../wirelog/extension_registry.c'),
   thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
@@ -5410,7 +5417,7 @@ test('session_options', test_session_options_exe)
 # Internal operation admission closes synchronously around backend teardown.
 test_session_admission_exe = executable(
   'test_session_admission',
-  files('test_session_admission.c', '../wirelog/session.c', '../wirelog/evaluation_control.c',
+  files('test_session_admission.c', '../wirelog/session.c',
         '../wirelog/extension_registry.c'),
   thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
@@ -5715,15 +5722,3 @@ test_compound_gc_hold_exe = executable(
   link_with: [testlib_prod],
 )
 test('compound_gc_hold', test_compound_gc_hold_exe, timeout: 60)
-
-# Internal foundation; cancellation and shared admission use real threads.
-test_evaluation_control_exe = executable(
-  'test_evaluation_control',
-  files('test_evaluation_control.c', '../wirelog/evaluation_control.c'),
-  thread_src,
-  include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [threads_dep],
-  install: false,
-)
-test('evaluation_control', test_evaluation_control_exe,
-     suite: ['unit', 'tsan'], timeout: 60)
