@@ -1,96 +1,72 @@
 #!/bin/sh
-# check-text-size.sh - Binary-size regression gate for libwirelog (Issue #460)
-#
-# Computes .text section size of the built library, compares against
-# the committed baseline in tests/baseline_size.txt, and fails if
-# growth exceeds the 5120-byte budget (section 14, Issue #446).
-#
-# Usage: scripts/ci/check-text-size.sh <path-to-library>
-# Example: scripts/ci/check-text-size.sh builddir/libwirelog.so
-#
-# To update the baseline after legitimate growth:
-#   echo <new-size> > tests/baseline_size.txt
+# Measure libwirelog's .text section and emit a stable JSON evidence record.
+set -eu
 
-set -e
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd -P)
+threshold=5120
+baseline_file="$repo_root/tests/baseline_size.txt"
+json_out=
+source_sha=${SOURCE_SHA:-unknown}
+profile_file=${SIZE_PROFILE_FILE:-}
+measure_only=no
 
-THRESHOLD=5120
-SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
-BASELINE_FILE="$REPO_ROOT/tests/baseline_size.txt"
-
-die() {
-    printf 'error: %s\n' "$1" >&2
-    exit 1
-}
-
-if [ $# -lt 1 ]; then
-    die "usage: $0 <path-to-library>"
-fi
-
-LIB="$1"
-
-if [ ! -f "$LIB" ]; then
-    die "library not found: $LIB"
-fi
-
-# Extract .text section size (platform-aware)
-extract_text_size() {
-    case "$(uname -s)" in
-        Linux)
-            size --format=sysv "$1" | awk '/^\.text[[:space:]]/ { print $2 }'
-            ;;
-        Darwin)
-            size -m "$1" | awk '/Section __text:/ { print $3 }'
-            ;;
-        *)
-            die "unsupported platform: $(uname -s)"
-            ;;
+usage() { echo "usage: $0 <library> [--baseline-file FILE] [--json FILE] [--source-sha SHA] [--profile FILE]" >&2; exit 2; }
+[ "$#" -ge 1 ] || usage
+library=$1; shift
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --baseline-file) [ "$#" -ge 2 ] || usage; baseline_file=$2; shift 2 ;;
+        --json) [ "$#" -ge 2 ] || usage; json_out=$2; shift 2 ;;
+        --source-sha) [ "$#" -ge 2 ] || usage; source_sha=$2; shift 2 ;;
+        --profile) [ "$#" -ge 2 ] || usage; profile_file=$2; shift 2 ;;
+        --measure-only) measure_only=yes; shift ;;
+        *) usage ;;
     esac
-}
+done
+fail() { printf 'error: %s\n' "$1" >&2; exit 2; }
+[ -f "$library" ] || fail "library not found: $library"
+[ "$measure_only" = yes ] || [ -f "$baseline_file" ] || fail "baseline file not found: $baseline_file"
 
-TEXT_SIZE=$(extract_text_size "$LIB")
-
-if [ -z "$TEXT_SIZE" ]; then
-    die "could not extract .text section size from $LIB"
-fi
-
-# Validate extracted size is numeric
-case "$TEXT_SIZE" in
-    ''|*[!0-9]*)
-        die "non-numeric .text size extracted: '$TEXT_SIZE'"
-        ;;
+case $(uname -s) in
+    Linux) raw=$(size --format=sysv "$library") || fail "size failed for $library"; section=.text ;;
+    Darwin) raw=$(size -m "$library") || fail "size failed for $library"; section=__text ;;
+    *) fail "unsupported platform: $(uname -s)" ;;
 esac
-
-# Read baseline
-if [ ! -f "$BASELINE_FILE" ]; then
-    die "baseline file not found: $BASELINE_FILE"
-fi
-
-BASELINE=$(tr -d '[:space:]' < "$BASELINE_FILE")
-
-case "$BASELINE" in
-    ''|*[!0-9]*)
-        die "invalid baseline value in $BASELINE_FILE: '$BASELINE'"
-        ;;
-esac
-
-# Compute delta (positive = growth, negative = shrinkage)
-DELTA=$((TEXT_SIZE - BASELINE))
-
-printf '.text size:  %d bytes\n' "$TEXT_SIZE"
-printf 'baseline:    %d bytes\n' "$BASELINE"
-if [ "$DELTA" -ge 0 ]; then
-    printf 'delta:       +%d bytes\n' "$DELTA"
+if [ "$section" = .text ]; then
+    measured=$(printf '%s\n' "$raw" | awk '$1==".text" { n++; value=$2 } END { if (n==1) print value; else exit 2 }') || fail "expected exactly one .text section size in $library"
 else
-    printf 'delta:       %d bytes\n' "$DELTA"
+    measured=$(printf '%s\n' "$raw" | awk '/Section __text:/ { n++; value=$3 } END { if (n==1) print value; else exit 2 }') || fail "expected exactly one __text section size in $library"
 fi
-printf 'threshold:   +%d bytes\n' "$THRESHOLD"
-
-if [ "$DELTA" -gt "$THRESHOLD" ]; then
-    printf '\nFAIL: .text growth (+%d) exceeds %d-byte budget\n' "$DELTA" "$THRESHOLD" >&2
-    printf 'To update the baseline after a legitimate change:\n' >&2
-    printf '  echo %d > tests/baseline_size.txt\n' "$TEXT_SIZE" >&2
+baseline=0
+[ "$measure_only" = yes ] || baseline=$(cat "$baseline_file")
+for value in "$measured" "$baseline"; do
+    case "$value" in ''|*[!0-9]*) fail "invalid non-negative byte count: $value" ;; esac
+    [ "${#value}" -le 18 ] || fail "byte count is out of range: $value"
+done
+delta=$((measured - baseline))
+status=measured
+[ "$measure_only" = yes ] || status=pass
+[ "$measure_only" = yes ] || [ "$delta" -le "$threshold" ] || status=over-budget
+printf '.text size:  %s bytes\nbaseline:    %s bytes\ndelta:       %+d bytes\nthreshold:   +%s bytes\n' "$measured" "$baseline" "$delta" "$threshold"
+if [ -n "$json_out" ]; then
+    python3 - "$json_out" "$measured" "$baseline" "$delta" "$threshold" "$status" "$source_sha" "$profile_file" "$library" <<'PY'
+import json, os, sys
+path, measured, baseline, delta, threshold, status, source, profile, library = sys.argv[1:]
+data = {"schema_version": 1, "status": status, "library": os.path.basename(library),
+        "measured_bytes": int(measured), "baseline_bytes": int(baseline),
+        "delta_bytes": int(delta), "budget_bytes": int(threshold),
+        "source_sha": source, "profile": profile or None}
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(data, stream, sort_keys=True, indent=2)
+    stream.write("\n")
+PY
+fi
+if [ "$measure_only" = yes ]; then
+    exit 0
+fi
+if [ "$status" = over-budget ]; then
+    printf '\nFAIL: .text growth (%+d) exceeds %s-byte budget\n' "$delta" "$threshold" >&2
     exit 1
 fi
-
 printf '\nPASS: .text delta within budget\n'

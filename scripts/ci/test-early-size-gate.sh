@@ -4,7 +4,7 @@
 # Two halves, asserting different things (pattern: test-required-gates.sh):
 #
 #   1. Wiring -- ci-pr.yml still compiles the `wirelog` target early in
-#      build-primary and runs the size gate on that library BEFORE the full
+#      build-primary and runs the exact-base comparison BEFORE the full
 #      Build and Test steps (exactly once), and the mbedtls / tsan-native
 #      legs still compile explicit targets (not the default set) while
 #      keeping their documented test steps.  Without this half, reverting
@@ -69,7 +69,10 @@ anchors=$(awk '
     /^  build-mbedtls:/  { in_job = "mb"; next }
     /^  tsan-native:/    { in_job = "ts"; next }
     in_job == "bp" && /meson compile -C builddir wirelog/ && !/#/ { print "bp early " NR }
-    in_job == "bp" && /run: scripts\/ci\/check-text-size\.sh builddir\/libwirelog\.so/ { print "bp gate " NR }
+    in_job == "bp" && /run: scripts\/ci\/run-size-comparison\.sh builddir/ { print "bp gate " NR }
+    in_job == "bp" && /BASE_SHA: \$\{\{ github.event.pull_request.base.sha \}\}/ { print "bp base-sha " NR }
+    in_job == "bp" && /TESTED_SHA: \$\{\{ github.sha \}\}/ { print "bp head-sha " NR }
+    in_job == "bp" && /PR_HEAD_SHA: \$\{\{ github.event.pull_request.head.sha \}\}/ { print "bp pr-sha " NR }
     in_job == "bp" && /run: meson compile -C builddir$/ { print "bp full " NR }
     in_job == "bp" && /run: meson test -C builddir --print-errorlogs/ { print "bp test " NR }
     in_job == "mb" && /meson compile -C builddir-mbedtls test_cryptographic_hashes test_symbol_digests/ { print "mb explicit " NR }
@@ -96,12 +99,20 @@ gate_line=$(get bp gate)
 full=$(get bp full)
 test_line=$(get bp test)
 gate_count=$(count bp gate)
+base_sha_line=$(get bp base-sha)
+head_sha_line=$(get bp head-sha)
+pr_head_line=$(get bp pr-sha)
 
 assert 'build-primary compiles the wirelog target early' test -n "$early"
 assert 'build-primary runs the size gate on that library' test -n "$gate_line"
+assert 'size comparison receives exact pull_request base SHA' test -n "$base_sha_line"
+assert 'size comparison receives tested merge SHA' test -n "$head_sha_line"
+assert 'size comparison receives event PR head SHA for exact parent verification' test -n "$pr_head_line"
 assert 'build-primary still has the full Build step' test -n "$full"
 assert 'build-primary still runs the test suite' test -n "$test_line"
 assert 'build-primary has EXACTLY ONE size-gate instance (no early+late duplicate)' test "$gate_count" = 1
+pr_gate_name_count=$(grep -c '^      - name: Check binary size$' "$wf" || true)
+assert 'PR binary-size step keeps its required check identity' test "$pr_gate_name_count" = 1
 
 early_gate_order() {
     [ -n "$early" ] && [ -n "$gate_line" ] && [ -n "$full" ] && [ -n "$test_line" ] \
@@ -129,6 +140,18 @@ tssmoke=$(get ts smoke)
 assert 'tsan-native leg compiles the wirelog target' test -n "$tse"
 assert 'tsan-native leg does not full-compile the default set' test -z "$tsfull"
 assert 'tsan-native leg still runs the threading_doc smoke' test -n "$tssmoke"
+
+# Main monitoring must stay advisory and publish a report even after earlier
+# build/test steps fail. Keep the existing required PR job identities intact.
+main_wf="$root/.github/workflows/ci-main.yml"
+assert 'main workflow retains advisory job identity' grep -Fq 'name: Build / ${{ matrix.os_display || matrix.os }} / ${{ matrix.compiler }}' "$main_wf"
+assert 'main size reporter runs through always()' grep -A5 -F 'name: Report binary size monitoring' "$main_wf" | grep -Fq 'if: always()'
+assert 'main size reporter is advisory' grep -A4 -F 'name: Report binary size monitoring' "$main_wf" | grep -Fq 'continue-on-error: true'
+assert 'main size report is uploaded through always()' grep -A6 -F 'name: Upload binary size monitoring evidence' "$main_wf" | grep -Fq 'if: always()'
+assert 'main artifacts have unique platform-qualified names' grep -Fq 'name: wirelog-size-monitor-${{ matrix.os }}' "$main_wf"
+assert 'baseline verifier trusts only canonical ubuntu artifact' grep -Fq 'wirelog-size-monitor-ubuntu-latest' "$root/scripts/ci/verify-size-baseline.py"
+assert 'main workflow grants no write permission' sh -c '! grep -Eq "^[[:space:]]+(actions|contents):[[:space:]]+write" "$1"' sh "$main_wf"
+assert 'PR required build job identity remains unchanged' grep -Fq 'name: Build / ubuntu-latest / gcc' "$wf"
 
 # The production size gate has format-aware readers only for ELF and Mach-O.
 # Keep enforcing the platform-independent wiring assertions above, but do not
@@ -166,12 +189,8 @@ fi
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/wirelog-early-size.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 
-# Negative control: an intentionally oversize library must FAIL the gate.
-# One function of ~400 KB of nops lands well past baseline + 5120 budget,
-# with margin against either direction of future baseline movement.  The
-# fixture is assembled rather than compiled so it costs milliseconds instead
-# of the ~40 s a 40k-function C file takes at -O0 (meson timeout is 120 s
-# and CI runners are slower than a dev box).
+# Negative control: size it relative to the committed baseline so it remains
+# a bounded, meaningful failure if the baseline changes in a later update.
 #
 # The gate itself is platform-aware (ELF `size --format=sysv` on Linux,
 # Mach-O `size -m` on Darwin), so this fixture has to assemble on both or
@@ -189,13 +208,18 @@ case "$(uname -s)" in
         ;;
 esac
 big_asm="$tmp/oversize.s"
+baseline=$(tr -d '[:space:]' < "$root/tests/baseline_size.txt")
+case "$baseline" in ''|*[!0-9]*) printf 'test-early-size-gate: invalid fixture baseline\n' >&2; exit 1 ;; esac
+required_size=$((baseline + 5120 + 8192))
+[ "$required_size" -le 50000000 ] || { printf 'test-early-size-gate: fixture size exceeds safe bound\n' >&2; exit 1; }
+nop_count=$required_size
 {
     printf '.text\n.globl %s\n' "$fixture_sym"
     if [ -n "$fixture_type" ]; then
         printf '%s\n' "$fixture_type"
     fi
     printf '%s:\n' "$fixture_sym"
-    awk 'BEGIN { for (i = 1; i <= 400000; i++) print "\tnop" }'
+    awk -v count="$nop_count" 'BEGIN { for (i = 1; i <= count; i++) print "\tnop" }'
     printf '\tret\n'
 } >"$big_asm"
 big_so="$tmp/oversize.so"
@@ -207,6 +231,15 @@ if ! cc -shared -o "$big_so" "$big_asm" 2>"$tmp/oversize.err"; then
     sed 's/^/test-early-size-gate:   /' "$tmp/oversize.err" >&2
     check 'oversize library FAILs the size gate (negative control)' 1
 else
+    case "$(uname -s)" in
+        Darwin) actual_size=$(size -m "$big_so" | awk '/Section __text:/ { print $3 }') ;;
+        *) actual_size=$(size --format=sysv "$big_so" | awk '$1==".text" { print $2 }') ;;
+    esac
+    budget_limit=$((baseline + 5120))
+    if [ "$actual_size" -le "$budget_limit" ]; then
+        printf 'test-early-size-gate: generated fixture is not above the budget (%s <= %s)\n' "$actual_size" "$budget_limit" >&2
+        failures=$((failures + 1))
+    fi
     negative_control() {
         local st=0
         "$gate" "$big_so" >/dev/null 2>&1 || st=$?

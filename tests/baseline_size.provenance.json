@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "status": "legacy-unverified",
+  "baseline_bytes": 354887,
+  "reason": "The original measurement's source revision, compiler profile, and CI artifact could not be recovered."
+}

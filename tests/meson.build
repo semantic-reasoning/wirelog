@@ -1357,6 +1357,30 @@ if sh.found()
        timeout: 120)
 endif
 
+# Issue #1646: exact-base size admission, production-profile identity,
+# authenticated baseline provenance, and always-run main monitoring.
+if sh.found()
+  test('text_size_policy', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-text-size-policy.sh',
+              meson.project_source_root()],
+       suite: 'abi', timeout: 120)
+endif
+if py3.found()
+  test('size_baseline_provenance', py3,
+       args: [meson.project_source_root() / 'scripts/ci/test-size-baseline-provenance.py'],
+       suite: 'abi', timeout: 120)
+endif
+if py3.found() and host_machine.system() == 'linux'
+  test('main_size_monitor', py3,
+       args: [meson.project_source_root() / 'scripts/ci/test-main-size-monitor.py',
+              meson.project_source_root(), meson.project_build_root()],
+       suite: 'abi', timeout: 120)
+  test('size_comparison_merge', py3,
+       args: [meson.project_source_root() / 'scripts/ci/test-size-comparison.py',
+              meson.project_source_root()],
+       suite: 'abi', timeout: 300)
+endif
+
 # Issue #750: the release workflow's signing and publication steps and the
 # published verifier must agree on identity, issuer and artifact naming, and
 # the signing step must stay behind the verification gate. The release workflow
