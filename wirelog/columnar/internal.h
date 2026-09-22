@@ -380,6 +380,8 @@ typedef struct col_rel {
      * accounting ledger: the token represents the relation's live heap
      * footprint and is only attached to session-owned input relations. */
     wl_columnar_memory_governor_ref_t *memory_governor;
+    /* Set when governed admission was denied while preparing this relation. */
+    uint8_t memory_budget_denial_pending;
     wl_columnar_memory_reservation_t retained_reservation;
     uint64_t retained_reserved_bytes;
     /* Bytes currently charged to WL_MEM_SUBSYS_TIMESTAMP for this relation's

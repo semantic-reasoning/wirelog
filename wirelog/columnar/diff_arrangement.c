@@ -188,8 +188,10 @@ col_diff_arrangement_attach_memory_governor(
         return EOVERFLOW;
     status = wl_columnar_memory_reserve_checked(governor, bytes,
             &arr->reservation);
-    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED) {
+        arr->memory_budget_denial_pending = true;
         return ENOMEM;
+    }
     if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
         && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
         return EINVAL;
@@ -502,8 +504,11 @@ col_diff_arrangement_ensure_ht_capacity(col_diff_arrangement_t *arr,
             wl_columnar_memory_governor_ref_get(arr->memory_governor),
             arr->reserved_bytes, prospective, &pending);
         if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
-            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                arr->memory_budget_denial_pending = true;
             return ENOMEM;
+        }
         pending_valid = true;
     }
 
