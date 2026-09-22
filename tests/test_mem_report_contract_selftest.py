@@ -51,7 +51,7 @@ class MemReportContractTest(unittest.TestCase):
                 expected_env["WL_MEM_REPORT"] = "1"
             self.assertEqual(call, mock.call(
                 [binary], capture_output=True, text=True, env=expected_env,
-                timeout=300, check=False))
+                timeout=300, check=False, encoding="utf-8"))
 
     def test_timeout_partial_output(self):
         for mode in ("off", "on"):
