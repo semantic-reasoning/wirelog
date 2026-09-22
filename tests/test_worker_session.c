@@ -2375,6 +2375,424 @@ test_pool_alias_teardown_refusal_is_retryable(void)
 }
 
 static int
+test_worker_retained_pool_alias_teardown_is_retryable(void)
+{
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *coord = make_coordinator(&plan, &prog);
+    wl_col_session_t worker = { 0 };
+    eval_stack_t stack = { 0 };
+    wl_columnar_source_access_reader_t descriptor_reader = { 0 };
+    col_rel_t *root = NULL;
+    col_rel_t *alias = NULL;
+    col_rel_t *arena_relation = NULL;
+    col_rel_t *arena_slot = NULL;
+    col_rel_t *independent = NULL;
+    uint32_t *boundaries = NULL;
+    uint32_t *expected_boundaries = NULL;
+    uint64_t session_baseline = coord
+        ? wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                coord->memory_governor)) : 0;
+    TEST("retained pooled alias survives refused worker teardown and retries");
+    if (!coord || col_worker_session_create(coord, 0, NULL, 0, &worker) != 0)
+        goto fail;
+
+    delta_pool_t *pool = worker.delta_pool;
+    wl_arena_t *arena = worker.eval_arena;
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(worker.memory_governor);
+    uint64_t worker_baseline = wl_columnar_memory_reserved(governor);
+    if (worker_baseline < session_baseline)
+        goto fail;
+    root = col_rel_new_auto("retained-pool-root", 1);
+    if (!root || root->pool_owned || root->arena_owned)
+        goto fail;
+    alias = col_rel_pool_new_like(pool, "retained-pool-alias", root);
+    int install_rc = alias ? col_rel_install_shared_view(alias, root) : EINVAL;
+    if (!alias || !alias->pool_owned || alias->arena_owned || install_rc != 0)
+        goto fail;
+    /* This read lease is specifically on the alias descriptor: destruction
+     * must refuse before its slot can be retired by pool inventory. */
+    if (wl_columnar_source_access_reader_acquire(
+            &alias->descriptor_access, &descriptor_reader) != 0)
+        goto fail;
+
+    independent = col_rel_new_auto("retained-independent", 1);
+    bool denied = false;
+    if (!independent
+        || col_rel_attach_memory_governor(independent,
+        worker.memory_governor) != 0
+        || col_rel_reserve_capacity_admitted(independent,
+        independent->capacity, &denied) != 0 || denied)
+        goto fail;
+    arena_relation = col_rel_pool_new_auto(pool, arena,
+            "retained-arena-control", 1);
+    if (!arena_relation || !arena_relation->pool_owned
+        || !arena_relation->arena_owned)
+        goto fail;
+    arena_slot = arena_relation;
+    uint64_t independent_token = independent->retained_reserved_bytes;
+    if (independent_token == 0
+        || independent->retained_reservation.identity
+        != &independent->retained_reservation
+        || atomic_load_explicit(&independent->retained_reservation.state,
+        memory_order_relaxed) != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        || independent_token > UINT64_MAX - worker_baseline
+        || wl_columnar_memory_reserved(governor)
+        != worker_baseline + independent_token)
+        goto fail;
+
+    boundaries = (uint32_t *)malloc(2u * sizeof(*boundaries));
+    if (!boundaries)
+        goto fail;
+    boundaries[0] = 0;
+    boundaries[1] = 0;
+    expected_boundaries = boundaries;
+    stack.items[0] = (eval_entry_t) {
+        .rel = alias, .owned = true, .seg_boundaries = boundaries,
+        .seg_count = 1, .kind = WL_COLUMNAR_EVAL_ENTRY_RELATION,
+    };
+    stack.items[1] = (eval_entry_t) {
+        .rel = arena_relation, .owned = true,
+        .kind = WL_COLUMNAR_EVAL_ENTRY_RELATION,
+    };
+    stack.items[2] = (eval_entry_t) {
+        .rel = independent, .owned = true,
+        .kind = WL_COLUMNAR_EVAL_ENTRY_RELATION,
+    };
+    stack.top = 3;
+    int retain_rc = wl_columnar_session_retain_eval_stack(&worker, &stack);
+    bool alias_transferred = false;
+    bool arena_transferred = false;
+    bool independent_transferred = false;
+    for (wl_columnar_retained_eval_entry_t *node
+            = worker.retained_eval_entries; node; node = node->next) {
+        alias_transferred = alias_transferred || node->entry.rel == alias;
+        arena_transferred = arena_transferred
+            || node->entry.rel == arena_relation;
+        independent_transferred = independent_transferred
+            || node->entry.rel == independent;
+        if (node->entry.seg_boundaries == boundaries)
+            boundaries = NULL;
+    }
+    if (arena_transferred)
+        arena_relation = NULL;
+    if (independent_transferred)
+        independent = NULL;
+    if (retain_rc != 0 || stack.top != 0
+        || worker.retained_eval_entry_count != 3)
+        goto fail;
+    /* Full transfer leaves the stack empty; its segment array belongs to the
+     * retained alias entry now. */
+    if (alias_transferred)
+        boundaries = NULL;
+    eval_entry_t *retained = &worker.retained_eval_entries->entry;
+    if (retained->rel != alias || !retained->owned
+        || retained->seg_boundaries != expected_boundaries
+        || retained->seg_count != 1)
+        goto fail;
+
+    int first_rc = col_worker_session_destroy(&worker);
+    retained = worker.retained_eval_entries
+        ? &worker.retained_eval_entries->entry : NULL;
+    bool first_ok = first_rc == EBUSY && worker.teardown_started
+        && worker.retained_eval_entry_count == 1 && retained
+        && retained->rel == alias && retained->owned
+        && retained->seg_boundaries == expected_boundaries
+        && retained->seg_count == 1
+        && alias->relation_identity != 0 && alias->pool_owned
+        && alias->storage_owner == root
+        && col_rel_storage_alias_borrow_count(root) == 1
+        && atomic_load_explicit(&alias->descriptor_access.state,
+            memory_order_acquire) > 0
+        && arena_slot && arena_slot->relation_identity == 0
+        && arena_slot->pool_owned && !arena_slot->arena_owned
+        && worker.delta_pool == pool && worker.eval_arena == arena
+        && worker.memory_governor != NULL
+        && wl_columnar_memory_reserved(governor) == worker_baseline;
+    int repeat_rc = col_worker_session_destroy(&worker);
+    retained = worker.retained_eval_entries
+        ? &worker.retained_eval_entries->entry : NULL;
+    bool repeat_ok = repeat_rc == EBUSY && worker.retained_eval_entry_count == 1
+        && retained && retained->rel == alias && retained->owned
+        && retained->seg_boundaries == expected_boundaries
+        && retained->seg_count == 1
+        && alias->relation_identity != 0 && alias->storage_owner == root
+        && col_rel_storage_alias_borrow_count(root) == 1
+        && worker.delta_pool == pool && worker.eval_arena == arena
+        && wl_columnar_memory_reserved(governor) == worker_baseline;
+    if (!first_ok || !repeat_ok) {
+        fprintf(stderr,
+            "retained state first=%d repeat=%d count=%u entry=%p/%p "
+            "seg=%p/%p borrows=%llu gate=%llu arena_slot=%llu "
+            "reserved=%llu expected=%llu worker=%p/%p/%p\n",
+            first_ok, repeat_ok, worker.retained_eval_entry_count,
+            (void *)(retained ? retained->rel : NULL), (void *)alias,
+            (void *)(retained ? retained->seg_boundaries : NULL),
+            (void *)expected_boundaries,
+            (unsigned long long)col_rel_storage_alias_borrow_count(root),
+            (unsigned long long)atomic_load_explicit(
+                &alias->descriptor_access.state, memory_order_acquire),
+            (unsigned long long)(arena_slot
+                ? arena_slot->relation_identity : 0),
+            (unsigned long long)wl_columnar_memory_reserved(governor),
+            (unsigned long long)worker_baseline,
+            (void *)worker.delta_pool, (void *)pool,
+            (void *)worker.eval_arena);
+    }
+    int reuse_rc = col_worker_session_create(coord, 0, NULL, 0, &worker);
+    bool reuse_ok = reuse_rc == EBUSY && worker.retained_eval_entry_count == 1
+        && worker.retained_eval_entries->entry.rel == alias;
+    int release_rc = wl_columnar_source_access_reader_release(
+        &descriptor_reader);
+    uint64_t alias_identity_before_retry = alias->relation_identity;
+    col_rel_t *alias_owner_before_retry = alias->storage_owner;
+    uint64_t arena_identity_before_retry = arena_slot->relation_identity;
+    int retry_rc = col_worker_session_destroy(&worker);
+    if (retry_rc == 0) {
+        col_rel_destroy(root);
+        root = NULL;
+        alias = NULL;
+        arena_slot = NULL;
+    } else {
+        int cleanup_retry_rc = col_worker_session_destroy(&worker);
+        if (cleanup_retry_rc == 0) {
+            col_rel_destroy(root);
+            root = NULL;
+            alias = NULL;
+            arena_slot = NULL;
+        }
+    }
+    bool retry_ok = release_rc == 0 && retry_rc == 0
+        && worker.coordinator == NULL && worker.delta_pool == NULL
+        && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                coord->memory_governor)) == session_baseline;
+    if (first_ok && repeat_ok && reuse_ok && retry_ok) {
+        wl_col_session_t recreated = { 0 };
+        bool recreated_ok = col_worker_session_create(coord, 0, NULL, 0,
+                &recreated) == 0
+            && col_worker_session_destroy(&recreated) == 0
+            && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                    coord->memory_governor)) == session_baseline;
+        cleanup_coordinator(coord, plan, prog);
+        if (!recreated_ok) {
+            FAIL("worker reuse after retained cleanup");
+            return 1;
+        }
+        PASS();
+        return 0;
+    }
+    fprintf(stderr,
+        "retained worker teardown checks=%d/%d/%d/%d rc=%d/%d reuse=%d release=%d retry=%d "
+        "count=%u alias=%llu owner=%p arena_slot=%llu "
+        "baseline=%llu reserved=%llu\n",
+        first_ok, repeat_ok, reuse_ok, retry_ok, first_rc, repeat_rc,
+        reuse_rc, release_rc, retry_rc,
+        worker.retained_eval_entry_count,
+        (unsigned long long)alias_identity_before_retry,
+        (void *)alias_owner_before_retry,
+        (unsigned long long)arena_identity_before_retry,
+        (unsigned long long)worker_baseline,
+        (unsigned long long)wl_columnar_memory_reserved(governor));
+    cleanup_coordinator(coord, plan, prog);
+    FAIL("retained descriptor or worker backing changed across refusal");
+    return 1;
+
+fail:
+    if (descriptor_reader.owner)
+        (void)wl_columnar_source_access_reader_release(&descriptor_reader);
+    bool stack_cleanup_ok = true;
+    while (stack.top > 0) {
+        eval_entry_t *entry = &stack.items[stack.top - 1];
+        col_rel_t *entry_relation = entry->rel;
+        uint32_t *entry_boundaries = entry->seg_boundaries;
+        int dispose_rc = eval_entry_dispose(entry);
+        if (dispose_rc != 0 && worker.coordinator) {
+            int retain_rc = wl_columnar_session_retain_eval_entry(&worker,
+                    entry);
+            if (retain_rc != 0) {
+                fprintf(stderr,
+                    "could not preserve remaining test stack entry: %d/%d\n",
+                    dispose_rc, retain_rc);
+                stack_cleanup_ok = false;
+                break;
+            }
+        }
+        if (entry_boundaries == boundaries)
+            boundaries = NULL;
+        if (entry_relation == independent)
+            independent = NULL;
+        if (entry_relation == arena_relation)
+            arena_relation = NULL;
+        stack.top--;
+    }
+    for (uint32_t i = 0; i < stack.top; i++) {
+        if (stack.items[i].seg_boundaries == boundaries)
+            boundaries = NULL;
+    }
+    if (worker.coordinator) {
+        for (wl_columnar_retained_eval_entry_t *node
+                = worker.retained_eval_entries; node; node = node->next) {
+            if (node->entry.seg_boundaries == boundaries)
+                boundaries = NULL;
+            if (node->entry.rel == arena_relation)
+                arena_relation = NULL;
+            if (node->entry.rel == independent)
+                independent = NULL;
+        }
+        if (stack_cleanup_ok) {
+            int destroy_rc = col_worker_session_destroy(&worker);
+            if (destroy_rc == 0) {
+                alias = NULL;
+                arena_relation = NULL;
+                arena_slot = NULL;
+            }
+        } else {
+            fprintf(stderr,
+                "worker fixture teardown skipped with %u local stack entries\n",
+                stack.top);
+        }
+        bool independent_retained = false;
+        for (wl_columnar_retained_eval_entry_t *node
+                = worker.retained_eval_entries; node; node = node->next)
+            independent_retained = independent_retained
+                || node->entry.rel == independent;
+        if (independent && !independent_retained) {
+            col_rel_destroy(independent);
+            independent = NULL;
+        }
+    } else {
+        free(boundaries);
+        col_rel_destroy(alias);
+        col_rel_destroy(arena_relation);
+        col_rel_destroy(independent);
+    }
+    free(boundaries);
+    col_rel_destroy(root);
+    cleanup_coordinator(coord, plan, prog);
+    FAIL("fixture setup or retained entry transfer");
+    return 1;
+}
+
+static int
+test_worker_retained_entries_progress_alias_dependencies(void)
+{
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *coord = make_coordinator(&plan, &prog);
+    wl_col_session_t worker = { 0 };
+    col_rel_t *root = NULL;
+    col_rel_t *pool_alias = NULL;
+    col_rel_t *registered_alias = NULL;
+    col_rel_t *unadopted_part = NULL;
+    bool root_owned_by_worker = false;
+    TEST(
+        "retained entry disposal progresses pool and registry alias dependencies");
+    if (!coord)
+        goto fail;
+
+    /* A retained heap root is blocked by an unretained pool alias. The
+     * alias sweep must retire the dependent slot, then retry the root. */
+    if (col_worker_session_create(coord, 0, NULL, 0, &worker) != 0)
+        goto fail;
+    root = col_rel_new_auto("retained-root-before-pool-alias", 1);
+    pool_alias = root ? col_rel_pool_new_like(worker.delta_pool,
+            "unretained-pool-alias", root) : NULL;
+    if (!root || !pool_alias
+        || col_rel_install_shared_view(pool_alias, root) != 0)
+        goto fail;
+    eval_entry_t retained_root = {
+        .rel = root, .owned = true,
+        .kind = WL_COLUMNAR_EVAL_ENTRY_RELATION,
+    };
+    int retain_root_rc = wl_columnar_session_retain_eval_entry(&worker,
+            &retained_root);
+    if (retain_root_rc != 0)
+        goto fail;
+    root_owned_by_worker = true;
+    if (retained_root.rel != NULL || worker.retained_eval_entry_count != 1)
+        goto fail;
+    int root_retry_rc = col_worker_session_destroy(&worker);
+    bool root_dependency_ok = root_retry_rc == 0
+        && worker.coordinator == NULL && worker.retained_eval_entry_count == 0;
+    /* The retained root was disposed by worker teardown. */
+    if (root_retry_rc == 0) {
+        root = NULL;
+        pool_alias = NULL; /* pool memory was freed; never dereference it */
+        root_owned_by_worker = false;
+    }
+    if (!root_dependency_ok)
+        goto fail;
+
+    /* A retained heap alias owns the borrow on a registered worker root.
+     * It must be disposed before the relation-array root pass. */
+    unadopted_part = col_rel_new_auto("registered-retained-owner", 1);
+    col_rel_t *parts[1] = { unadopted_part };
+    if (!parts[0]
+        || col_worker_session_create(coord, 0, parts, 1, &worker) != 0)
+        goto fail;
+    unadopted_part = NULL;
+    root_owned_by_worker = true;
+    root = worker.rels[0];
+    registered_alias = col_rel_new_like(
+        "retained-alias-of-registry-root", root);
+    if (!registered_alias
+        || col_rel_install_shared_view(registered_alias, root) != 0)
+        goto fail;
+    eval_entry_t retained_alias = {
+        .rel = registered_alias, .owned = true,
+        .kind = WL_COLUMNAR_EVAL_ENTRY_RELATION,
+    };
+    int retain_alias_rc = wl_columnar_session_retain_eval_entry(&worker,
+            &retained_alias);
+    if (retain_alias_rc != 0)
+        goto fail;
+    registered_alias = NULL; /* worker's retained entry owns the alias */
+    if (retained_alias.rel != NULL || worker.retained_eval_entry_count != 1
+        || col_rel_storage_alias_borrow_count(root) != 1)
+        goto fail;
+    int alias_cleanup_rc = col_worker_session_destroy(&worker);
+    bool alias_dependency_ok = alias_cleanup_rc == 0
+        && worker.coordinator == NULL && worker.rels == NULL;
+    if (alias_cleanup_rc == 0) {
+        root = NULL; /* worker teardown owned and destroyed the registry root */
+        root_owned_by_worker = false;
+    }
+    if (!alias_dependency_ok)
+        goto fail;
+
+    cleanup_coordinator(coord, plan, prog);
+    PASS();
+    return 0;
+
+fail:
+    if (registered_alias) {
+        col_rel_destroy(registered_alias);
+        registered_alias = NULL;
+    }
+    if (worker.coordinator) {
+        if (col_worker_session_destroy(&worker) == 0) {
+            if (root_owned_by_worker)
+                root = NULL;
+            pool_alias = NULL; /* do not inspect pool descriptors after teardown */
+            root_owned_by_worker = false;
+        }
+    } else {
+        col_rel_destroy(unadopted_part);
+        unadopted_part = NULL;
+        if (!root_owned_by_worker)
+            col_rel_destroy(root);
+        root = NULL;
+    }
+    if (root && !root_owned_by_worker)
+        col_rel_destroy(root);
+    (void)pool_alias;
+    cleanup_coordinator(coord, plan, prog);
+    FAIL("retained/root dependency made no bounded cleanup progress");
+    return 1;
+}
+
+static int
 test_pool_relation_promotion_rejects_live_children(void)
 {
     wl_plan_t *plan = NULL;
@@ -3026,6 +3444,8 @@ main(int argc, char **argv)
     test_worker_alias_chain_checked_teardown();
     test_partial_worker_adoption_cleanup_and_retry();
     test_worker_teardown_refusal_is_retryable();
+    test_worker_retained_pool_alias_teardown_is_retryable();
+    test_worker_retained_entries_progress_alias_dependencies();
     test_worker_create_refuses_unpromoted_storage();
     test_worker_deferred_relation_transfer_and_retry();
     test_worker_deferred_relation_retries_locally();
