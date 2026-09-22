@@ -6173,6 +6173,18 @@ wl_columnar_eval_test_global_exchange(const wl_plan_stratum_t *sp,
 }
 #endif
 
+#ifdef WL_TEST_OWNER_PUBLICATION
+int
+wl_columnar_eval_test_owner_exchange(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs, uint32_t workers)
+{
+    int rc = tdd_owner_exchange_deltas(sp, coord, ctxs, workers, NULL, NULL);
+    if (rc != 0)
+        tdd_destroy_delta_slots(ctxs, workers, sp->relation_count);
+    return rc;
+}
+#endif
+
 /*
  * col_eval_stratum_tdd_recursive:
  * Coordinator-driven semi-naive fixed-point for recursive strata.
