@@ -176,7 +176,13 @@ own timeout:
 The next 32 gates all sit at 3.1% or below, the remainder under 1%. So the
 50% budget is ~1.7x the single worst case and an order of magnitude above the
 next cluster: it flags a genuine drift without tripping on the slow-but-stable
-gates above. Regenerate the table from any Linux build with:
+gates above.
+
+The `log_abi_compile_erasure` row above was measured before #1808, which gave
+that gate a second configure/compile/link phase. Its share roughly doubles, to
+around 22%, which leaves it second worst and does not move the 50% budget's
+justification -- `doop_validation` at 30.0% is still the worst case. Regenerate
+before relying on the row. Regenerate the table from any Linux build with:
 
 ```sh
 python3 scripts/ci/check-shell-gate-walltime.py build --fraction 0.5

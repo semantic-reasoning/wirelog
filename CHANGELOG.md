@@ -14,6 +14,40 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **`log_abi_compile_erasure` asserted nothing** (#1808): the gate
+  compiled libwirelog at `-Dwirelog_log_max_level=error` and checked
+  that the TRACE sentinel string was absent from the artifact.  But
+  nothing references `wl_log_erasure_sentinel()`, and the library is
+  built `b_lto=true` with hidden visibility, so LTO discarded it at
+  *every* ceiling: the sentinel was absent at `trace` as well, and the
+  gate was green on a build where erasure did nothing.
+  `wirelog/util/log.c` now anchors the sentinel with `WL_LOG_ATTR_USED`,
+  and `scripts/ci/check-log-erasure.sh` runs a positive control first --
+  compile at `trace` and require the sentinel to be *present*, then
+  `meson configure` the same build directory to `error` and require it
+  gone.  A dead probe exits 2 naming the failed control instead of
+  passing.  Cost to the shipped library is +48 bytes at either ceiling;
+  `.text` grows 1 byte at `ceiling=error` and 46 at the default `trace`
+  ceiling, which is the configuration `check-text-size.sh` measures (11
+  KB under budget).  The self-test's `meson` stubs are phase-aware: they
+  parse the ceiling out of the real `-Dwirelog_log_max_level=` argument,
+  refuse a `setup` or `configure` carrying none, and the suite asserts
+  the recorded sequence is exactly `trace` then `error`, so dropping the
+  flag or a whole phase cannot leave it green.  On both the `setup` and
+  the `meson configure` they accept only the arguments the gate is
+  supposed to pass -- a positional, `--buildtype=release` or
+  `-Dbuildtype=release`, and `-Dwirelog_log_max_level=<lvl>` -- and
+  refuse every other option by name, so `-Db_lto=` is refused however it
+  is spelled, and so are `-Doptimization=`, a native file and anything
+  else that would move the probe off the shipped configuration.  A
+  `compile` must name the `wirelog` target.  Guarding only `setup` would
+  have left the assertion phase reachable by moving a flag one line
+  down, since meson applies build options at either verb.  It is a
+  tripwire against an accidental edit, not a proof: the environment is
+  not an argument.  The Meson timeout stays at 180: twice the worst
+  observed CI leg is ~40 s, and raising it would slacken the #1487
+  walltime alarm.
+
 ### Performance
 
 ### Security

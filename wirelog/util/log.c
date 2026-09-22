@@ -258,7 +258,35 @@ wl_log_sink_get_(void)
  * from .rodata when -Dwirelog_log_max_level=error. Not called from any
  * hot path; intended to exist solely as a build-property probe.
  * DO NOT MODIFY without updating the script's sentinel list.
+ *
+ * WL_LOG_ATTR_USED is what makes that assertion mean anything (#1808).
+ * Nothing calls this function and the library is built b_lto=true with
+ * hidden visibility, so without the attribute LTO discards it -- and its
+ * format string -- at EVERY ceiling.  The gate then passed on a library
+ * where erasure did nothing.  Measured as occurrences at
+ * ceiling=trace/ceiling=error: without the attribute 0/0, with it 1/0.
+ * Re-measured across eight configurations -- gcc 16.2.1 and clang 22.1.8 at
+ * the project default, clang ThinLTO, gcc at -O3 and at -Os, and gcc
+ * linking with gold -- and every anchored build gave 1/0 while both
+ * unanchored ones gave 0/0.  Cost: +48 bytes of libwirelog.so at either
+ * ceiling.  .text grows 1 byte at ceiling=error -- the retained body is a
+ * single `ret`, because the WL_LOG guard still folds the call away -- and
+ * 46 bytes at the default trace ceiling, which is the configuration the
+ * binary-size gate measures.
+ *
+ * No ABI gate sees it: the symbol is LOCAL, it adds no .dynsym entry (180
+ * either way), the exported name set check-abi-symbols.sh compares is
+ * unchanged, and abidiff reports no difference.  .dynsym is NOT
+ * byte-identical, though -- six st_value fields shift by the added .text
+ * byte.  Stated precisely because a comment that overclaims a measurement
+ * is the defect this whole change exists to remove.
+ *
+ * Removing the attribute does not fail the gate.  It makes the gate
+ * vacuous, which is worse, and only its positive control would notice.
+ * WL_LOG_ATTR_USED is a no-op under MSVC (log.h), so nothing is anchored
+ * there; the gate is not registered on Windows.
  */
+WL_LOG_ATTR_USED
 void
 wl_log_erasure_sentinel(void)
 {

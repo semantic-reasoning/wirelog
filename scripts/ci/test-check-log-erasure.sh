@@ -85,31 +85,173 @@ under_work() {
 }
 
 RECORD="$work/record"
+CEILINGS="$work/ceilings"
 : >"$RECORD"
-export RECORD
+: >"$CEILINGS"
+export RECORD CEILINGS
 
 cat >"$work/bin/meson" <<'STUB'
 #!/usr/bin/env bash
 # Stub meson.  setup: $2 = build dir, $3 = source root.
-# compile: $3 = build dir.
+# configure: $2 = build dir.  compile: $3 = build dir.
+#
+# The ceiling is parsed out of the actual -Dwirelog_log_max_level= argument
+# and appended to $CEILINGS, so the selftest can assert the gate asks for
+# trace and then error BY NAME.  A setup or configure that carries no such
+# argument is a hard error, not a default: without that, a gate edit that
+# dropped the flag, or dropped a whole phase, would leave this file green
+# while asserting nothing -- which is the #1808 shape one level up.
 mode="${STUB_MODE:-ok}"
+
+# ONE pass over argv, for both the ceiling and the refusals.  Two parsers
+# disagreed about spelling once already: the refusals learned the two-token
+# form and the ceiling lookup did not, so rewriting the gate to `-D <opt>=`
+# reported "carried no -Dwirelog_log_max_level" about a command line that
+# carried it.  Sharing the walk makes that divergence unrepresentable.
+#
+# The rule is an ALLOWLIST: the stub accepts the arguments this gate is
+# supposed to pass and refuses every other option by name.  It was a
+# denylist first, and review widened it four times -- joined spelling, then
+# the two-token spelling, then three spellings of `false` -- and it was
+# still incomplete, because meson lower-cases a boolean's value, so
+# `-Db_lto=fAlSe` disables LTO and got through.  The set a denylist has to
+# enumerate is meson's option grammar, which this stub has no business
+# modelling.  Under an allowlist an unexpected option is refused whatever it
+# means, so -Db_lto= in any spelling, -Dbuildtype=, -Doptimization=,
+# --native-file and whatever meson adds next all close under one rule.  The
+# matching rule models no part of meson's option grammar; the two facts
+# about meson below are about its argument SYNTAX, which the join has to
+# mirror, and about why the denylist failed.
+#
+# Why refuse at all: the gate's whole argument for option (B) is that it
+# measures the SHIPPED configuration.  -Db_lto=false would silently turn it
+# into the option (A) its own header rejects, and a non-release buildtype
+# would measure a build nobody ships.  No stub can observe a build flag's
+# EFFECT, so the arguments themselves are what it asserts on.  It runs for
+# `configure` as well as `setup`, and that is the point: phase 2's
+# configuration is set by `meson configure`, meson applies build options
+# there too, and guarding only `setup` left the assertion phase reachable by
+# moving a flag one line down.
+#
+# Tokens are joined before matching because meson accepts `-D <opt>=<val>`
+# and `--buildtype <val>` as two tokens and applies them, so the allowlist
+# has to see what meson sees.  That is syntax, which is stable, not policy.
+#
+# What still gets past it: anything that is not an argument.  CFLAGS, CC and
+# the rest of the environment are invisible here.
+#
+# Sets CEILING to the -Dwirelog_log_max_level= value, empty if absent, and
+# BUILDTYPES to the number of buildtype specifications seen.
+scan_args() {
+    verb="$1"; shift
+    CEILING=""
+    BUILDTYPES=0
+    prev=""
+    for a in "$@"; do
+        if [ -n "$prev" ]; then
+            case "$prev" in
+                -D)          a="-D$a" ;;
+                --buildtype) a="--buildtype=$a" ;;
+            esac
+            prev=""
+        else
+            case "$a" in
+                -D|--buildtype) prev="$a"; continue ;;
+            esac
+        fi
+        case "$a" in
+            -Dwirelog_log_max_level=*)
+                CEILING="${a#*=}"
+                ;;
+            --buildtype=release|-Dbuildtype=release)
+                BUILDTYPES=$((BUILDTYPES + 1))
+                ;;
+            -*)
+                echo "stub: meson ${verb} carried an option the gate is not supposed to pass: ${a}" >&2
+                echo "      The gate must measure the configuration wirelog ships, so this stub allows only the arguments it needs (#1808)." >&2
+                echo "      If the option is deliberate, add it to scan_args' accepted set and record here why it does not move the probe off that configuration." >&2
+                return 1
+                ;;
+        esac
+    done
+    return 0
+}
+
 case "$1" in
 setup)
     [ "$mode" = setup_fail ] && { echo "stub: setup refused"; exit 1; }
+    scan_args "$@" || exit 1
+    lvl="$CEILING"
+    if [ -z "$lvl" ]; then
+        echo "stub: meson setup carried no -Dwirelog_log_max_level" >&2
+        exit 1
+    fi
+    if [ "$BUILDTYPES" -ne 1 ]; then
+        echo "stub: meson setup named ${BUILDTYPES} buildtypes; it must name exactly one, release" >&2
+        exit 1
+    fi
     mkdir -p "$2"
     # One short line, one O_APPEND write: atomic across concurrent stubs.
     printf '%s\n' "$2" >>"$RECORD"
+    printf '%s\n' "$lvl" >>"$CEILINGS"
+    printf '%s\n' "$lvl" >"$2/.ceiling"
     [ "$mode" = slow ] && sleep 0.3
+    exit 0
+    ;;
+configure)
+    [ "$mode" = configure_fail ] && { echo "stub: configure refused"; exit 1; }
+    scan_args "$@" || exit 1
+    lvl="$CEILING"
+    if [ -z "$lvl" ]; then
+        echo "stub: meson configure carried no -Dwirelog_log_max_level" >&2
+        exit 1
+    fi
+    # Phase 2 moves the ceiling and NOTHING else.  A buildtype spec here is
+    # refused outright rather than checked for =release: the gate has no
+    # reason to change buildtype after setup, so any attempt is an edit that
+    # wants reviewing.
+    if [ "$BUILDTYPES" -ne 0 ]; then
+        echo "stub: meson configure changed buildtype; phase 2 moves the ceiling only" >&2
+        exit 1
+    fi
+    printf '%s\n' "$lvl" >>"$CEILINGS"
+    printf '%s\n' "$lvl" >"$2/.ceiling"
     exit 0
     ;;
 compile)
     [ "$mode" = compile_fail ] && { echo "stub: compile refused"; exit 1; }
-    [ "$mode" = noartifact ] && exit 0
-    if [ "$mode" = leak ]; then
+    # Naming the target matters: without it meson builds EVERY target, which
+    # is minutes of work against a 180 s timeout rather than one library.
+    case " $* " in
+        *" wirelog "*) ;;
+        *)
+            echo "stub: meson compile did not name the wirelog target" >&2
+            exit 1
+            ;;
+    esac
+    lvl=$(cat "$3/.ceiling" 2>/dev/null || echo unknown)
+    # noartifact removes the artifact only at the error phase, so the control
+    # still passes and the case exercises phase 2's discovery path.
+    if [ "$mode" = noartifact ] && [ "$lvl" = error ]; then
+        rm -f "$3"/libwirelog.so*
+        exit 0
+    fi
+    if [ "$mode" = noartifact_trace ] && [ "$lvl" = trace ]; then
+        rm -f "$3"/libwirelog.so*
+        exit 0
+    fi
+    # The sentinel belongs in the library at trace and not at error.  `leak`
+    # inverts that for the error build; `no_control` inverts it for trace,
+    # which is exactly the state #1808 was about.
+    want_sentinel=no
+    [ "$lvl" = trace ] && want_sentinel=yes
+    [ "$mode" = leak ] && [ "$lvl" = error ] && want_sentinel=yes
+    [ "$mode" = no_control ] && [ "$lvl" = trace ] && want_sentinel=no
+    if [ "$want_sentinel" = yes ]; then
         # Sentinel first, then bulk, so the needle is found early and the
         # upstream process dies of SIGPIPE under the old pipeline.  ~200 KB is
-        # past the 64 KiB pipe buffer, which is what makes this case reproduce
-        # the silent-green defect instead of passing over it.
+        # past the 64 KiB pipe buffer, which is what makes the leak case
+        # reproduce the silent-green defect instead of passing over it.
         { echo "wl_log_erasure_sentinel_trace %d"
           head -c 150000 /dev/urandom | base64; } >"$3/libwirelog.so"
     else
@@ -118,7 +260,8 @@ compile)
     exit 0
     ;;
 esac
-exit 0
+echo "stub: unrecognised meson verb '$1'" >&2
+exit 1
 STUB
 chmod +x "$work/bin/meson"
 export PATH="$work/bin:$PATH"
@@ -199,6 +342,45 @@ STUB_MODE=compile_fail expect_status "a compile failure exits 2" 2
 STUB_MODE=noartifact expect_status "a missing artifact exits 2" 2
 STUB_MODE=noartifact run_gate; expect_says "a missing artifact is named as such" "no libwirelog artifact was found"
 
+# 6b. Phase 1 is a positive control, so a compile that yields no artifact there
+#     must also be an error -- and an error, not a leak verdict.  Phase 2's
+#     missing artifact (case 6) exits 2 for the same reason: "nothing to
+#     search" and "searched and found nothing" must never share an exit code.
+STUB_MODE=noartifact_trace \
+    expect_status "a missing artifact at ceiling=trace exits 2" 2
+
+# 6c. THE #1808 case.  The sentinel is absent at ceiling=trace, so the probe is
+#     dead: its absence at ceiling=error proves nothing.  Before #1808 this was
+#     the gate's green path -- LTO dropped the unreferenced sentinel at every
+#     ceiling and the gate passed while asserting nothing.  It must now exit 2,
+#     NOT 0, and say the positive control failed.
+STUB_MODE=no_control expect_status "a dead probe exits 2, not 0" 2
+STUB_MODE=no_control run_gate
+expect_says "a dead probe names the positive control" "positive control failed"
+expect_says "a dead probe says the absence proves nothing" \
+    "would prove nothing"
+
+# 6d. meson configure is the step that moves the ceiling from trace to error.
+#     If it fails, the second build is still at ceiling=trace and the sentinel
+#     is legitimately present; reporting that as a LEAK would be a false alarm.
+STUB_MODE=configure_fail expect_status "a configure failure exits 2, not 1" 2
+
+# 6e. The gate must ask for BOTH ceilings BY NAME, in order.  Without this, a
+#     future edit that drops -Dwirelog_log_max_level, drops the configure call,
+#     or drops a whole phase leaves every case above green while the gate
+#     asserts nothing -- the #1808 shape one level up.  The stub exits non-zero
+#     on a setup or configure carrying no ceiling, so a dropped flag is caught
+#     even if it never reaches this assertion.
+: >"$CEILINGS"
+run_gate
+seq=$(tr '\n' ' ' <"$CEILINGS" | sed 's/ $//')
+if [ "$seq" = "trace error" ]; then
+    echo "ok: the gate builds at ceiling=trace and then at ceiling=error"
+else
+    echo "FAIL: ceiling sequence was '$seq', expected 'trace error'" >&2
+    failures=$((failures + 1))
+fi
+
 # 7/8. The scratch directory is removed on success, and was never inside the
 #      source tree.  Both read the last recorded path; neither touches it.
 : >"$RECORD"
@@ -234,11 +416,39 @@ else
     : >"$RECORD"
     cat >"$work/bin/meson" <<'STUB2'
 #!/usr/bin/env bash
+# Phase-aware like the main stub, for the same reason: an unrecognised verb
+# must not fall through to a silent success.
+# The same `-D` join as scan_args above -- only that, since these
+# fixtures pass no buildtype and read one ceiling.  They drive the real
+# gate, so a spelling they did not understand would fail their case for
+# a reason that has nothing to do with what the case tests.
+lvl_of() {
+    prev=""
+    for a in "$@"; do
+        if [ "$prev" = -D ]; then a="-D$a"; prev=""
+        else
+            case "$a" in -D) prev=-D; continue ;; esac
+        fi
+        case "$a" in
+            -Dwirelog_log_max_level=*) printf '%s\n' "${a#*=}"; return 0 ;;
+        esac
+    done
+    return 1
+}
 case "$1" in
-setup)   mkdir -p "$2"; printf '%s\n' "$2" >>"$RECORD"; exit 0 ;;
-compile) head -c 1000 /dev/urandom | base64 >"$3/libwirelog.so"; exit 0 ;;
+setup)     lvl=$(lvl_of "$@") || exit 1
+           mkdir -p "$2"; printf '%s\n' "$2" >>"$RECORD"
+           printf '%s\n' "$lvl" >"$2/.ceiling"; exit 0 ;;
+configure) lvl=$(lvl_of "$@") || exit 1
+           printf '%s\n' "$lvl" >"$2/.ceiling"; exit 0 ;;
+compile)   if [ "$(cat "$3/.ceiling" 2>/dev/null)" = trace ]; then
+               echo "wl_log_erasure_sentinel_trace %d" >"$3/libwirelog.so"
+           else
+               head -c 1000 /dev/urandom | base64 >"$3/libwirelog.so"
+           fi
+           exit 0 ;;
 esac
-exit 0
+exit 1
 STUB2
     chmod +x "$work/bin/meson"
     # Do not chmod anything until the gate has told us where its scratch is and
@@ -256,15 +466,43 @@ STUB2
         # exist first.
         cat >"$work/bin/meson" <<'STUB3'
 #!/usr/bin/env bash
+# The same `-D` join as scan_args above -- only that, since these
+# fixtures pass no buildtype and read one ceiling.  They drive the real
+# gate, so a spelling they did not understand would fail their case for
+# a reason that has nothing to do with what the case tests.
+lvl_of() {
+    prev=""
+    for a in "$@"; do
+        if [ "$prev" = -D ]; then a="-D$a"; prev=""
+        else
+            case "$a" in -D) prev=-D; continue ;; esac
+        fi
+        case "$a" in
+            -Dwirelog_log_max_level=*) printf '%s\n' "${a#*=}"; return 0 ;;
+        esac
+    done
+    return 1
+}
 case "$1" in
-setup)   mkdir -p "$2"; printf '%s\n' "$2" >>"$RECORD"; exit 0 ;;
-compile) [ -n "${WORK_SANDBOX:-}" ] || exit 1
-         head -c 1000 /dev/urandom | base64 >"$3/libwirelog.so"
-         parent="$(dirname -- "$3")"
-         case "$parent" in "$WORK_SANDBOX"/*) chmod 500 "$parent" ;; esac
-         exit 0 ;;
+setup)     lvl=$(lvl_of "$@") || exit 1
+           mkdir -p "$2"; printf '%s\n' "$2" >>"$RECORD"
+           printf '%s\n' "$lvl" >"$2/.ceiling"; exit 0 ;;
+configure) lvl=$(lvl_of "$@") || exit 1
+           printf '%s\n' "$lvl" >"$2/.ceiling"; exit 0 ;;
+compile)   [ -n "${WORK_SANDBOX:-}" ] || exit 1
+           lvl=$(cat "$3/.ceiling" 2>/dev/null)
+           if [ "$lvl" = trace ]; then
+               echo "wl_log_erasure_sentinel_trace %d" >"$3/libwirelog.so"
+               exit 0
+           fi
+           head -c 1000 /dev/urandom | base64 >"$3/libwirelog.so"
+           # Seal the scratch root only on the LAST build, so the earlier
+           # phases run normally and the failure under test is cleanup.
+           parent="$(dirname -- "$3")"
+           case "$parent" in "$WORK_SANDBOX"/*) chmod 500 "$parent" ;; esac
+           exit 0 ;;
 esac
-exit 0
+exit 1
 STUB3
         chmod +x "$work/bin/meson"
         WORK_SANDBOX="$work" export WORK_SANDBOX
