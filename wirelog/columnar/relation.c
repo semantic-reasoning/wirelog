@@ -1489,9 +1489,12 @@ wl_columnar_relation_retirement_reservation_valid(const col_rel_t *relation)
 }
 
 static bool
-wl_columnar_relation_retirement_valid_locked(const col_rel_t *relation)
+wl_columnar_relation_retirement_valid_locked(const col_rel_t *relation,
+    bool transient_backing_allowed)
 {
-    return relation && !relation->pool_owned && !relation->arena_owned
+    return relation
+           && (transient_backing_allowed
+           || (!relation->pool_owned && !relation->arena_owned))
            && relation->storage_owner == relation && !relation->col_shared
            && relation->storage_owner_identity == relation->relation_identity
            && relation->storage_owner_generation == relation->storage_generation
@@ -1513,9 +1516,10 @@ wl_columnar_relation_retirement_writer_valid(
            == WL_COLUMNAR_SOURCE_ACCESS_WRITER;
 }
 
-int
-wl_columnar_relation_retirement_prepare(col_rel_t *relation,
-    wl_columnar_relation_retirement_token_t *token)
+static int
+wl_columnar_relation_retirement_prepare_impl(col_rel_t *relation,
+    wl_columnar_relation_retirement_token_t *token,
+    bool transient_backing_allowed)
 {
     int rc;
 
@@ -1531,7 +1535,8 @@ wl_columnar_relation_retirement_prepare(col_rel_t *relation,
         &relation->descriptor_access, &token->descriptor_writer);
     if (rc != 0)
         return rc == EINVAL ? rc : EBUSY;
-    if (relation->pool_owned || relation->arena_owned
+    if ((!transient_backing_allowed
+        && (relation->pool_owned || relation->arena_owned))
         || relation->storage_owner != relation || relation->col_shared
         || relation->storage_owner_identity != relation->relation_identity
         || relation->storage_owner_generation != relation->storage_generation
@@ -1550,14 +1555,32 @@ wl_columnar_relation_retirement_prepare(col_rel_t *relation,
     }
     /* Recheck alias state after exclusive admission; no alias may be added
      * while this source writer is held. */
-    if (!wl_columnar_relation_retirement_valid_locked(relation)) {
+    if (!wl_columnar_relation_retirement_valid_locked(relation,
+        transient_backing_allowed)) {
         (void)wl_columnar_source_access_writer_release(&token->source_writer);
         (void)wl_columnar_source_access_writer_release(
             &token->descriptor_writer);
         return EBUSY;
     }
     token->relation = relation;
+    token->transient_backing_allowed = transient_backing_allowed;
     return 0;
+}
+
+int
+wl_columnar_relation_retirement_prepare(col_rel_t *relation,
+    wl_columnar_relation_retirement_token_t *token)
+{
+    return wl_columnar_relation_retirement_prepare_impl(relation, token,
+               false);
+}
+
+int
+wl_columnar_relation_retirement_prepare_transient(col_rel_t *relation,
+    wl_columnar_relation_retirement_token_t *token)
+{
+    return wl_columnar_relation_retirement_prepare_impl(relation, token,
+               true);
 }
 
 int
@@ -1591,6 +1614,7 @@ wl_columnar_relation_retirement_commit(
     wl_columnar_relation_retirement_token_t *token)
 {
     col_rel_t *relation;
+    bool from_pool;
 
     if (!token || !token->relation
         || !token->descriptor_writer.owner || !token->source_writer.owner
@@ -1600,15 +1624,30 @@ wl_columnar_relation_retirement_commit(
             &token->descriptor_writer, &token->relation->descriptor_access)
         || !wl_columnar_relation_retirement_writer_valid(
             &token->source_writer, &token->relation->source_access)
-        || !wl_columnar_relation_retirement_valid_locked(token->relation))
+        || !wl_columnar_relation_retirement_valid_locked(token->relation,
+        token->transient_backing_allowed))
         abort();
     relation = token->relation;
+    from_pool = relation->pool_owned;
     /* Do not release terminal writers: their gate storage is part of the
      * descriptor about to be freed. Physical contents retire before the
      * retained governor credit is returned by free_contents_impl(). */
     memset(token, 0, sizeof(*token));
     col_rel_free_contents_impl(relation, true);
-    free(relation);
+    if (!from_pool) {
+        free(relation);
+    } else {
+        relation->pool_owned = true;
+        relation->relation_identity = 0;
+        relation->view_generation = WL_COLUMNAR_REL_GENERATION_INVALID;
+        relation->storage_generation = WL_COLUMNAR_REL_GENERATION_INVALID;
+        relation->storage_owner = NULL;
+        relation->storage_owner_identity = 0;
+        relation->storage_owner_generation = 0;
+        atomic_store_explicit(&relation->storage_alias_borrows, 0,
+            memory_order_relaxed);
+        wl_columnar_memory_reservation_init(&relation->retained_reservation);
+    }
 }
 
 static int
