@@ -203,7 +203,13 @@ When cutting a release tag:
    is not part of release verification.
 3. **Merge** the release PR via rebase (no squash, no merge
    commit; matches project convention).
-4. **Tag** on `main`:
+4. **Confirm tag protection** before tagging. The active repository ruleset
+   **protect release tags** covers `refs/tags/*` and restricts tag creation,
+   update and deletion to maintainers or administrators. This repository
+   setting is outside the checkout and cannot be asserted by CI; a maintainer
+   must verify it in Settings > Rules > Rulesets before the first signed
+   release.
+5. **Tag** on `main`:
    ```bash
    git checkout main && git pull --ff-only
    git tag -s vX.Y.Z -m "wirelog X.Y.Z"

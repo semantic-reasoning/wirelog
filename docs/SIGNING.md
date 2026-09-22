@@ -144,13 +144,17 @@ what this signature is worth rather than assume:
   a token that can mint this identity
   ([#1319](https://github.com/semantic-reasoning/wirelog/issues/1319)).
 - **Which tag.** `refs/tags/` accepts any tag name, and the attacker picks the
-  name, so no regex closes this. It needs tag protection or a protected Actions
-  environment ([#1318](https://github.com/semantic-reasoning/wirelog/issues/1318)).
+  name, so no regex closes this. The repository ruleset **protect release tags**
+  protects creation, update and deletion for `refs/tags/*`; only maintainers
+  and administrators may bypass it. The corresponding release prerequisite is
+  documented in `docs/RELEASE_PROCESS.md` ([#1318](https://github.com/semantic-reasoning/wirelog/issues/1318)).
 
 Both require repository write access, and neither affects any published artifact
 today: signing landed after `v0.60.0`, so no release certificate has been minted
 in this repository yet. The first is now bounded by the workflow's permissions
-block; the second remains open.
+block and the second by the repository tag ruleset. The ruleset is a repository
+setting that CI cannot observe from a checkout; verify it in repository Settings
+before the first signed release.
 
 ### With the bundle — the recipe that keeps working
 

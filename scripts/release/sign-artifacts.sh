@@ -65,15 +65,12 @@ set -euo pipefail
 # review protects main.  refs/heads/main anchored at the end, or any
 # refs/tags/, admits both real cases and neither of those.
 #
-# RESIDUAL 2, and deliberate: refs/tags/ still admits the same forgery, and by
-# an even shorter route than dispatch.  `on: push: tags:` runs the workflow file as
-# it exists AT THE PUSHED TAG, so pushing v1.99.0 with a modified
-# release-tag.yml needs no dispatch at all; dispatching at a tag is the second
-# route.  No pattern over the tag name closes either, because the attacker
-# chooses the name -- tightening to tags/v[01]\. only invites v1.99.0.  Bounding
-# it needs tag protection or a protected Actions environment, which this script
-# can neither express nor observe.  Tracked in #1318; do not "fix" it here by
-# narrowing the regex.
+# RESIDUAL 2, and deliberate: refs/tags/ still admits any tag name. No pattern
+# over the tag name closes this because the attacker chooses the name. The active
+# repository ruleset "protect release tags" bounds creation, update and deletion
+# for refs/tags/* to maintainers and administrators. This script cannot express
+# or observe that repository setting; verify it in Settings before a release.
+# Do not narrow the regex as a substitute for the ruleset.
 #
 # @refs/ is also the right-hand bound.  A bare trailing @ is not: a workflow
 # file named release-tag.yml@evil.yml is legal in git, satisfies the .yml
