@@ -154,6 +154,246 @@ cleanup_session(wl_col_session_t *sess, wl_plan_t *plan,
 }
 
 static int
+test_tdd_owner_lifetime_retry_gate(void)
+{
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *sess = make_tc_session(2, &plan, &prog);
+    if (!sess)
+        return 1;
+
+    col_rel_t *relation = col_rel_new_auto("retained_delta", 0);
+    size_t bytes = sizeof(wl_columnar_eval_tdd_owner_lifetime_t)
+        + sizeof(col_rel_t *);
+    wl_columnar_eval_tdd_owner_lifetime_t *lifetime
+        = (wl_columnar_eval_tdd_owner_lifetime_t *)calloc(1, bytes);
+    wl_columnar_source_access_reader_t reader = { 0 };
+    int rc = relation && lifetime ? 0 : ENOMEM;
+    bool attached = false;
+    if (rc == 0)
+        rc = col_rel_source_reader_acquire_transferable(relation, &reader);
+    if (rc == 0) {
+        lifetime->matrix_slots = 1;
+        lifetime->relations[0] = relation;
+        lifetime->evaluation_active = true;
+        sess->tdd_owner_lifetime = lifetime;
+        attached = true;
+        if (wl_columnar_session_cleanup_ready(sess) != EBUSY
+            || sess->tdd_owner_lifetime != lifetime
+            || wl_columnar_session_ensure_tdd_worker_slots(sess, 2) != EBUSY)
+            rc = EPROTO;
+    }
+    if (rc == 0) {
+        lifetime->evaluation_active = false;
+        for (unsigned attempt = 0; attempt < 2; attempt++) {
+            if (wl_columnar_session_cleanup_ready(sess) != EBUSY
+                || sess->tdd_owner_lifetime != lifetime
+                || lifetime->relations[0] != relation) {
+                rc = EPROTO;
+                break;
+            }
+        }
+    }
+    if (reader.owner) {
+        int release_rc = col_rel_source_reader_release(&reader);
+        if (rc == 0)
+            rc = release_rc;
+    }
+    if (rc == 0)
+        rc = wl_columnar_session_cleanup_ready(sess);
+    if (rc == 0 && (sess->tdd_owner_lifetime != NULL
+        || wl_columnar_session_ensure_tdd_worker_slots(sess, 2) != 0))
+        rc = EPROTO;
+    if (attached && sess->tdd_owner_lifetime) {
+        sess->tdd_owner_lifetime->evaluation_active = false;
+        int cleanup_rc = wl_columnar_eval_tdd_owner_lifetime_retry(sess);
+        if (rc == 0)
+            rc = cleanup_rc;
+        if (cleanup_rc == 0)
+            lifetime = NULL;
+    }
+    if (!attached) {
+        free(lifetime);
+        col_rel_destroy(relation);
+    }
+    cleanup_session(sess, plan, prog);
+    return rc == 0 ? 0 : 1;
+}
+
+static int
+test_tdd_owner_lifetime_alias_progress_and_dedup(void)
+{
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *sess = make_tc_session(2, &plan, &prog);
+    if (!sess)
+        return 1;
+
+    col_rel_t *root = col_rel_new_auto("lifetime-root", 1);
+    col_rel_t *alias = col_rel_new_auto("lifetime-alias", 1);
+    size_t bytes = sizeof(wl_columnar_eval_tdd_owner_lifetime_t)
+        + 3 * sizeof(col_rel_t *);
+    wl_columnar_eval_tdd_owner_lifetime_t *lifetime = calloc(1, bytes);
+    wl_columnar_source_access_reader_t reader = { 0 };
+    int64_t value = 19;
+    int rc = root && alias && lifetime ? 0 : ENOMEM;
+    bool attached = false;
+    if (rc == 0)
+        rc = col_rel_append_row(root, &value);
+    if (rc == 0)
+        rc = col_rel_install_shared_view(alias, root);
+    if (rc == 0)
+        rc = col_rel_source_reader_acquire_transferable(root, &reader);
+    if (rc == 0) {
+        lifetime->matrix_slots = 3;
+        lifetime->relations[0] = root;
+        lifetime->relations[1] = root;
+        lifetime->relations[2] = alias;
+        sess->tdd_owner_lifetime = lifetime;
+        attached = true;
+        if (wl_columnar_eval_tdd_owner_lifetime_retry(sess) != EBUSY
+            || lifetime->relations[0] != root || lifetime->relations[1]
+            || lifetime->relations[2] != NULL)
+            rc = EPROTO;
+    }
+    if (reader.owner) {
+        int release_rc = col_rel_source_reader_release(&reader);
+        if (rc == 0)
+            rc = release_rc;
+    }
+    if (rc == 0)
+        rc = wl_columnar_eval_tdd_owner_lifetime_retry(sess);
+    if (rc == 0 && sess->tdd_owner_lifetime)
+        rc = EPROTO;
+    if (!attached) {
+        free(lifetime);
+        col_rel_destroy(alias);
+        col_rel_destroy(root);
+    }
+    cleanup_session(sess, plan, prog);
+    return rc == 0 ? 0 : 1;
+}
+
+static int
+test_tdd_owner_lifetime_mixed_backing_retention(void)
+{
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *sess = make_tc_session(2, &plan, &prog);
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    delta_pool_t *pool = NULL;
+    wl_arena_t *arena = NULL;
+    col_rel_t *heap = NULL;
+    col_rel_t *pooled = NULL;
+    col_rel_t *arena_rel = NULL;
+    wl_columnar_source_access_reader_t readers[3] = { 0 };
+    wl_columnar_eval_tdd_owner_lifetime_t *lifetime = NULL;
+    bool attached = false;
+    int rc = sess ? 0 : ENOMEM;
+
+    if (rc == 0) {
+        resolution.budget_bytes = 1u << 20;
+        resolution.usable_bytes = resolution.budget_bytes;
+        resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+        resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+        resolution.status = WL_COLUMNAR_MEMORY_OK;
+        ref = wl_columnar_memory_governor_ref_create(&resolution);
+        pool = delta_pool_create(2, sizeof(col_rel_t), 4096);
+        arena = wl_arena_create(4096);
+        heap = col_rel_new_auto("lifetime-governed", 1);
+        pooled = pool ? col_rel_pool_new_auto(pool, NULL,
+                "lifetime-pooled", 1) : NULL;
+        arena_rel = pool && arena ? col_rel_pool_new_auto(pool, arena,
+                "lifetime-arena", 1) : NULL;
+        if (!ref || !pool || !arena || !heap || !pooled || !arena_rel)
+            rc = ENOMEM;
+    }
+    if (rc == 0)
+        rc = col_rel_attach_memory_governor(heap, ref);
+    int64_t value = 23;
+    for (uint32_t i = 0; rc == 0 && i <= COL_REL_INIT_CAP; i++)
+        rc = col_rel_append_row(heap, &value);
+    if (rc == 0)
+        rc = col_rel_append_row(pooled, &value);
+    if (rc == 0)
+        rc = col_rel_append_row(arena_rel, &value);
+    if (rc == 0)
+        rc = col_rel_source_reader_acquire_transferable(heap, &readers[0]);
+    if (rc == 0)
+        rc = col_rel_source_reader_acquire_transferable(pooled, &readers[1]);
+    if (rc == 0)
+        rc = col_rel_source_reader_acquire_transferable(arena_rel, &readers[2]);
+    if (rc == 0) {
+        size_t bytes = sizeof(*lifetime) + 3 * sizeof(col_rel_t *);
+        lifetime = calloc(1, bytes);
+        if (!lifetime)
+            rc = ENOMEM;
+        else {
+            lifetime->matrix_slots = 3;
+            lifetime->relations[0] = heap;
+            lifetime->relations[1] = pooled;
+            lifetime->relations[2] = arena_rel;
+            sess->tdd_owner_lifetime = lifetime;
+            attached = true;
+        }
+    }
+    uint64_t reserved = ref ? wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref)) : 0;
+    uint64_t reservation_bytes = heap ? heap->retained_reservation.bytes : 0;
+    const void *reservation_identity = heap
+        ? heap->retained_reservation.identity : NULL;
+    for (unsigned attempt = 0; rc == 0 && attempt < 2; attempt++) {
+        int retry_rc = wl_columnar_eval_tdd_owner_lifetime_retry(sess);
+        if (retry_rc != EBUSY
+            || lifetime->relations[0] != heap
+            || lifetime->relations[1] != pooled
+            || lifetime->relations[2] != arena_rel
+            || !pooled->pool_owned || !arena_rel->arena_owned
+            || heap->retained_reservation.identity != reservation_identity
+            || heap->retained_reservation.bytes != reservation_bytes
+            || wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) != reserved){
+            rc = EPROTO;
+        }
+    }
+    for (size_t i = 0; i < 3; i++) {
+        if (!readers[i].owner)
+            continue;
+        int release_rc = col_rel_source_reader_release(&readers[i]);
+        if (rc == 0)
+            rc = release_rc;
+    }
+    if (rc == 0)
+        rc = wl_columnar_eval_tdd_owner_lifetime_retry(sess);
+    if (rc == 0 && sess->tdd_owner_lifetime)
+        rc = EPROTO;
+    if (!attached) {
+        if (lifetime)
+            free(lifetime);
+        if (arena_rel)
+            col_rel_destroy(arena_rel);
+        if (pooled)
+            col_rel_destroy(pooled);
+        if (heap)
+            col_rel_destroy(heap);
+    }
+    if (sess)
+        cleanup_session(sess, plan, prog);
+    if (pool)
+        delta_pool_destroy(pool);
+    if (arena)
+        wl_arena_free(arena);
+    if (ref) {
+        if (wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) != 0)
+            rc = EPROTO;
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    return rc == 0 ? 0 : 1;
+}
+
+static int
 insert_edges(wl_col_session_t *sess, const int64_t *rows, uint32_t nrows)
 {
     return wl_session_insert(&sess->base, "edge", rows, nrows, 2);
@@ -4258,6 +4498,22 @@ main(void)
     test_bdx_seed_sort_failure_is_atomic();
     test_bdx_seed_allocation_failure_is_atomic();
     test_bdx_seed_success_preserves_timestamps();
+    TEST("owner lifetime refusal is retained and cleanup readiness retries");
+    if (test_tdd_owner_lifetime_retry_gate() == 0)
+        PASS();
+    else
+        FAIL("owner lifetime refusal/retry readiness");
+    TEST("owner lifetime deduplicates slots and retries roots after aliases");
+    if (test_tdd_owner_lifetime_alias_progress_and_dedup() == 0)
+        PASS();
+    else
+        FAIL("owner lifetime alias progress/dedup");
+    TEST(
+        "owner lifetime retains governed heap, pool, and arena backing on refusal");
+    if (test_tdd_owner_lifetime_mixed_backing_retention() == 0)
+        PASS();
+    else
+        FAIL("owner lifetime mixed backing retention/accounting");
 #ifdef WL_TEST_TDD_RESET_RESTORE
     test_tdd_reset_restore_transaction();
 #endif

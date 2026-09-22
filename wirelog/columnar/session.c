@@ -611,6 +611,14 @@ wl_columnar_session_cleanup_ready(wl_col_session_t *sess)
         return EINVAL;
     if (sess->delta_publish_active)
         return EBUSY;
+    if (sess->tdd_owner_lifetime) {
+        if (sess->tdd_owner_lifetime->evaluation_active
+            || sess->tdd_owner_lifetime->dispatch_active)
+            return EBUSY;
+        int lifetime_rc = wl_columnar_eval_tdd_owner_lifetime_retry(sess);
+        if (lifetime_rc != 0)
+            return lifetime_rc;
+    }
     int kfusion_rc = wl_columnar_kfusion_retry_pending(sess);
     if (kfusion_rc != 0)
         return kfusion_rc;
@@ -626,6 +634,12 @@ wl_columnar_session_cleanup_ready_quiescent(wl_col_session_t *sess)
 {
     if (!sess)
         return EINVAL;
+    if (sess->tdd_owner_lifetime) {
+        int quiesce_rc
+            = wl_columnar_eval_tdd_owner_lifetime_quiesce(sess);
+        if (quiesce_rc != 0)
+            return quiesce_rc;
+    }
     if (sess->coordinator)
         return wl_columnar_session_cleanup_ready(sess);
     /* Worker frame lists are thread-confined until this barrier. Never inspect
@@ -1602,6 +1616,8 @@ wl_columnar_session_ensure_tdd_worker_slots(wl_col_session_t *sess,
 {
     if (!sess)
         return EINVAL;
+    if (sess->tdd_owner_lifetime)
+        return EBUSY;
     if (active_workers == 0 || active_workers > sess->num_workers)
         return EINVAL;
     if (sess->tdd_workers_cap >= active_workers)
@@ -2529,6 +2545,19 @@ col_session_destroy(wl_session_t *session)
         (unsigned long long)sess->join_output_limit,
         sess->num_workers);
 
+    /* A failed owner-mode dispatch retains worker callback contexts in its
+     * lifetime record. Quiesce them before the rotation hook can release any
+     * backing state they may still reference. */
+    if (sess->tdd_owner_lifetime) {
+        int quiesce_rc
+            = wl_columnar_eval_tdd_owner_lifetime_quiesce(sess);
+        if (quiesce_rc != 0) {
+            fputs("wirelog: owner TDD delta dispatch did not quiesce before "
+                "rotation teardown\n", stderr);
+            abort();
+        }
+    }
+
     /* Issue #600: tear down rotation strategy first so the destroy hook
      * still sees a fully-populated session (eval_arena, compound_arena,
      * etc.) before any of the other teardown frees them. NULL-safe. */
@@ -2542,6 +2571,21 @@ col_session_destroy(wl_session_t *session)
         wl_session_testhook_before_workqueue_drain(&sess->base);
 #endif
         (void)wl_workqueue_drain(sess->wq);
+    }
+    if (sess->tdd_owner_lifetime) {
+        int quiesce_rc
+            = wl_columnar_eval_tdd_owner_lifetime_quiesce(sess);
+        if (quiesce_rc != 0) {
+            fputs("wirelog: owner TDD delta dispatch did not quiesce during "
+                "session destroy\n", stderr);
+            abort();
+        }
+        int lifetime_rc = wl_columnar_eval_tdd_owner_lifetime_retry(sess);
+        if (lifetime_rc != 0) {
+            fputs("wirelog: owner TDD delta cleanup failed during session "
+                "destroy\n", stderr);
+            abort();
+        }
     }
     /* Worker views may borrow coordinator relation storage.  Drain workers
      * before coordinator relations so their owner borrows are released before
@@ -2812,6 +2856,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->delta_publish_cancelled = false;
     out_worker->retained_eval_entries = NULL;
     out_worker->retained_eval_entry_count = 0;
+    out_worker->tdd_owner_lifetime = NULL;
     /* This struct began as a copy of the coordinator, so clear the flag
      * rather than inherit a value.  Nothing reads it before col_eval_stratum
      * writes it, so no observation depends on this -- but it is not a fold

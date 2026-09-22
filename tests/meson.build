@@ -4983,7 +4983,8 @@ test_tdd_inline_workers_exe = executable(
   io_src,
   thread_src,
   workqueue_src,
-  c_args: ['-DWL_COLUMNAR_EVAL_TEST_SUBMISSION'],
+  c_args: ['-DWL_COLUMNAR_EVAL_TEST_SUBMISSION',
+           '-DWL_COLUMNAR_EVAL_TEST_OWNER_LIFETIME'],
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
