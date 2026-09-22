@@ -21,6 +21,16 @@
 
 #include <limits.h>
 
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+static bool wl_columnar_memory_governor_test_refuse_release;
+
+void
+wl_columnar_memory_governor_test_refuse_next_release(void)
+{
+    wl_columnar_memory_governor_test_refuse_release = true;
+}
+#endif
+
 #define WL_MEMORY_PATH_MAX 4096
 
 #ifdef WL_COLUMNAR_MEMORY_TEST_HOOKS
@@ -954,6 +964,12 @@ wl_columnar_memory_rollback(
 bool
 wl_columnar_memory_release(wl_columnar_memory_reservation_t *reservation)
 {
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    if (wl_columnar_memory_governor_test_refuse_release) {
+        wl_columnar_memory_governor_test_refuse_release = false;
+        return false;
+    }
+#endif
     return finish_reservation(reservation, false);
 }
 
