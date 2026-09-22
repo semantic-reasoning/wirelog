@@ -183,7 +183,8 @@ testlib_prod = static_library(
   thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
-  c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_TEST_RELATION_RESIZE_HOOK=1'],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_TEST_RELATION_RESIZE_HOOK=1',
+           '-DWL_TEST_JOIN_CACHE_HOOK=1'],
 )
 
 source_access_exe = executable(
@@ -4890,6 +4891,8 @@ test_memory_admission_join_exe = executable(
   files('test_memory_admission_join.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_TEST_RELATION_RESIZE_HOOK=1',
+           '-DWL_TEST_JOIN_CACHE_HOOK=1'],
   link_with: [testlib_prod],
 )
 

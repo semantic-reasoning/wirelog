@@ -58,6 +58,66 @@ wl_test_unsetenv_(const char *name)
 static int tests_run;
 static int tests_passed;
 static int tests_failed;
+static bool test_cache_reclaim_attempt;
+static bool test_cache_pin_protected;
+static wl_col_session_t *test_reclaim_sess;
+static const col_rel_t *test_reclaim_source;
+static bool test_fail_diff_commit;
+static bool test_diff_commit_failure_injected;
+
+void wl_columnar_relation_test_fail_next_governed_copy_payload_alloc(void);
+
+static void
+try_reclaim_during_governed_copy(const col_rel_t *source)
+{
+    if (!test_cache_reclaim_attempt)
+        return;
+    test_cache_reclaim_attempt = false;
+    wl_col_session_t *sess = test_reclaim_sess;
+    if (!sess || source != test_reclaim_source)
+        return;
+    uint64_t copy_bytes = 0;
+    uint64_t already_charged = source->memory_governor
+        == sess->memory_governor
+        ? source->retained_reserved_bytes : 0;
+    uint64_t governor_reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(sess->memory_governor));
+    bool admission_committed = col_rel_retained_bytes_for(source,
+            source->capacity, &copy_bytes)
+        && already_charged <= UINT64_MAX - copy_bytes
+        && governor_reserved >= already_charged + copy_bytes;
+    bool source_reader_held = wl_columnar_source_access_gate_busy(
+        &source->source_access);
+    for (uint32_t i = 0; i < sess->mat_cache.count; i++) {
+        col_mat_entry_t *entry = &sess->mat_cache.entries[i];
+        if (entry->result != source)
+            continue;
+        const col_rel_t *retained = entry->result;
+        uint32_t count = sess->mat_cache.count;
+        uint64_t identity = entry->identity;
+        uint64_t generation = entry->generation;
+        wl_mem_reclaim_result_t reclaimed = col_mat_cache_reclaim_entry(
+            &sess->mat_cache, i, generation);
+        test_cache_pin_protected = reclaimed.candidates == 0
+            && sess->mat_cache.count == count
+            && sess->mat_cache.entries[i].identity == identity
+            && sess->mat_cache.entries[i].result == retained
+            && sess->mat_cache.entries[i].pin_count > 0
+            && admission_committed && source_reader_held;
+        return;
+    }
+}
+
+static void
+fail_next_diff_commit_after_mutation(
+    wl_columnar_arrangement_diff_txn_t *txn)
+{
+    if (!test_fail_diff_commit || !txn || !txn->entry)
+        return;
+    test_fail_diff_commit = false;
+    txn->entry->invalidation_deferred = true;
+    test_diff_commit_failure_injected = true;
+}
 
 #define TEST(name)                                     \
         do {                                               \
@@ -160,6 +220,13 @@ reserved_of(const wl_col_session_t *s)
         wl_columnar_memory_governor_ref_get(s->memory_governor));
 }
 
+static uint64_t
+reserved_for(wl_columnar_memory_governor_ref_t *ref)
+{
+    return wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+}
+
 /*
  * The invariant, as an assertion: a governed relation's committed token
  * covers exactly the footprint of its current capacity.  Checked at every
@@ -183,11 +250,8 @@ admission_invariant(const col_rel_t *r)
  * The relation a materialized join leaves GOVERNED.
  *
  * col_op_join deep-copies its output for the evaluation stack and hands the
- * original to the materialization cache (the copy is taken with a NULL
- * governor, which is residual R1: the governor charges once while two
- * physically identical buffers are live).  So the popped stack entry is the
- * ungoverned copy, and the admission contract has to be observed on the
- * cached original.
+ * original to the materialization cache. Both retained owners have committed
+ * reservations while they are live.
  */
 static col_rel_t *
 cached_output(wl_col_session_t *sess, const col_rel_t *left)
@@ -460,10 +524,8 @@ measure_output_bytes(uint64_t *out_bytes)
         if (!governed || governed->nrows > COL_REL_INIT_CAP
             || governed->retained_reserved_bytes == 0u)
             goto out_entry;
-        /* The output must be the ONLY governed allocation, or the boundary
-         * below would be about something else. */
-        if (reserved_of(sess) != governed->retained_reserved_bytes)
-            goto out_entry;
+        /* A governed stack twin now lives alongside the cached output; this
+         * boundary measures the output owner itself. */
         *out_bytes = governed->retained_reserved_bytes;
     }
     ok = true;
@@ -503,16 +565,12 @@ run_at_budget(const char *name, uint64_t budget, bool expect_ok)
             goto out;
         }
         governed = cached_output(sess, left);
-        if (!governed) {
-            FAIL("the materialized output did not reach the cache");
-            goto out_entry;
-        }
-        if (!admission_invariant(governed)) {
+        if (governed && !admission_invariant(governed)) {
             FAIL("committed token does not cover the output capacity");
             goto out_entry;
         }
         if (reserved_of(sess) != budget) {
-            FAIL("exact fit did not consume exactly the budget");
+            FAIL("exact-fit single-owner fallback did not consume the budget");
             goto out_entry;
         }
         PASS();
@@ -688,7 +746,8 @@ test_reuse_after_denial(void)
     uint64_t peak = 0;
     uint64_t before;
 
-    TEST("a session denied one join still serves a smaller one");
+    TEST(
+        "a session falls back to one governed owner and serves a smaller join");
     if (!measure_big_join_peak(&peak)) {
         FAIL("could not measure the growing join budget");
         goto out;
@@ -702,10 +761,15 @@ test_reuse_after_denial(void)
     right = NULL;
     init_join_op(&op, lk, rk);
     before = reserved_of(sess);
-    if (run_join(sess, big, &op, NULL) != ENOMEM) {
-        FAIL("the growing join was not denied");
+    if (run_join(sess, big, &op, &result) != 0 || !result.rel
+        || result.rel->memory_governor != sess->memory_governor
+        || !admission_invariant(result.rel)) {
+        FAIL(
+            "copy admission failure did not safely publish one accounted owner");
         goto out;
     }
+    col_rel_destroy(result.rel);
+    result.rel = NULL;
     if (reserved_of(sess) < before) {
         FAIL("the denial released session state it did not own");
         goto out;
@@ -977,7 +1041,7 @@ measure_cross_residual(uint64_t *residual_out)
     init_cross_op(&op);
     if (run_join(sess, left, &op, &result) != 0)
         goto out;
-    *residual_out = reserved_of(sess);
+    *residual_out = cached_output(sess, left)->retained_reserved_bytes;
     ok = *residual_out != 0u;
 out:
     if (result.owned && result.rel)
@@ -1199,6 +1263,47 @@ test_parallel_diff_output_is_governed(void)
         FAIL("governed diff output token does not cover capacity");
         goto out_entry;
     }
+    {
+        uint64_t cached_bytes = governed->retained_reserved_bytes;
+        uint64_t before = reserved_of(sess);
+        if (!result.rel || result.rel->memory_governor != sess->memory_governor
+            || result.rel->retained_reserved_bytes == 0
+            || reserved_of(sess) != before) {
+            FAIL("diff miss did not charge its governed stack twin");
+            goto out_entry;
+        }
+        uint64_t result_bytes = result.rel->retained_reserved_bytes;
+        eval_stack_t cons_stack;
+        eval_stack_init(&cons_stack);
+        if (eval_stack_push(&cons_stack, result.rel, true) != 0) {
+            col_rel_destroy(result.rel);
+            result.rel = NULL;
+            FAIL("could not push differential result for CONS");
+            goto out_entry;
+        }
+        result.rel = NULL;
+        if (col_op_consolidate_diff(&cons_stack, sess) != 0
+            || cons_stack.top != 1 || cons_stack.items[0].rel->nrows
+            != expected_rows
+            || cons_stack.items[0].rel->memory_governor
+            != sess->memory_governor
+            || cons_stack.items[0].rel->retained_reserved_bytes != result_bytes
+            || reserved_of(sess) != before) {
+            (void)eval_stack_drain(&cons_stack);
+            FAIL("differential CONS changed governed output accounting");
+            goto out_entry;
+        }
+        (void)eval_stack_drain(&cons_stack);
+        if (reserved_of(sess) != before - result_bytes) {
+            FAIL("differential CONS teardown did not release its copy token");
+            goto out_entry;
+        }
+        if (cached_output(sess, left) != governed
+            || governed->retained_reserved_bytes != cached_bytes) {
+            FAIL("differential CONS mutated its cached materialized output");
+            goto out_entry;
+        }
+    }
     PASS();
 out_entry:
     if (result.owned && result.rel)
@@ -1220,7 +1325,7 @@ test_parallel_diff_denial(void)
     uint64_t peak = 0;
     eval_entry_t denied_result = { 0 };
 
-    TEST("parallel keyed diff bulk reserve denies one byte below peak");
+    TEST("parallel keyed diff copy OOM publishes one accounted result");
     setenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS", "2", 1);
     if (!measure_parallel_diff_peak(&peak) || peak <= 1u) {
         FAIL("could not measure the parallel diff overlap peak");
@@ -1238,20 +1343,161 @@ test_parallel_diff_denial(void)
     right = NULL;
     init_diff_keyed_op(&op);
     int rc = run_diff_join(sess, left, &op, &denied_result);
-    if (rc != ENOMEM) {
-        FAIL("unaffordable parallel keyed diff was not denied with ENOMEM");
+    if (rc != 0 || !denied_result.rel || !denied_result.owned
+        || denied_result.rel->memory_governor != sess->memory_governor
+        || !admission_invariant(denied_result.rel)
+        || cached_output(sess, left) != NULL || sess->diff_arr_count != 1) {
+        FAIL(
+            "twin-copy OOM did not commit the differential result as one owner");
         goto out;
     }
-    if (reserved_of(sess) != 0u || sess->mat_cache.count != 0
-        || sess->diff_arr_count != 0) {
-        FAIL("denied diff join left reservations or arrangement state behind");
+    if (reserved_of(sess) < denied_result.rel->retained_reserved_bytes) {
+        FAIL("single-owner fallback reservation is missing");
         goto out;
     }
-    if (denied_result.owned && denied_result.rel)
-        col_rel_destroy(denied_result.rel);
+    col_rel_destroy(denied_result.rel);
+    denied_result.rel = NULL;
     PASS();
 out:
     unsetenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS");
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+}
+
+static void
+test_differential_cache_hit_reclaim_pin(void)
+{
+    wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+    col_rel_t *right = make_right(1, 2);
+    col_rel_t *left = make_left(65, 1);
+    col_rel_t *cached_result = make_left(1, 1);
+    wl_plan_op_t op;
+    eval_entry_t result = { 0 };
+    bool cache_owns_result = false;
+
+    TEST("differential cache pin protects cached result during governed copy");
+    if (!sess || !right || !left || !cached_result) {
+        FAIL("fixture");
+        goto out;
+    }
+    if (session_add_rel(sess, right) != 0) {
+        FAIL("right relation registration failed");
+        goto out;
+    }
+    right = NULL;
+    if (col_mat_cache_insert(&sess->mat_cache, left,
+        session_find_rel(sess, "right"), cached_result) != 0) {
+        FAIL("could not seed differential cache hit");
+        goto out;
+    }
+    cache_owns_result = true;
+    init_diff_keyed_op(&op);
+    test_cache_pin_protected = false;
+    test_cache_reclaim_attempt = true;
+    test_reclaim_sess = sess;
+    test_reclaim_source = cached_result;
+    if (run_diff_join(sess, left, &op, &result) != 0 || !result.rel
+        || !result.owned || !test_cache_pin_protected
+        || cached_output(sess, left) != cached_result
+        || result.rel == cached_result
+        || result.rel->memory_governor != sess->memory_governor
+        || !admission_invariant(result.rel)
+        || reserved_of(sess) != result.rel->retained_reserved_bytes) {
+        FAIL("differential cache hit did not retain pin and charge its copy");
+        goto out_result;
+    }
+    col_rel_destroy(result.rel);
+    result.rel = NULL;
+    if (reserved_of(sess) != 0u) {
+        FAIL("differential cache-hit copy did not release its reservation");
+        goto out;
+    }
+    PASS();
+    goto out;
+out_result:
+    if (result.owned && result.rel)
+        col_rel_destroy(result.rel);
+out:
+    if (!cache_owns_result)
+        col_rel_destroy(cached_result);
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+}
+
+static void
+test_parallel_diff_true_admission_denial_rolls_back(void)
+{
+    wl_col_session_t *sess = make_session_workers(1u, 2);
+    col_rel_t *right = make_right(1, 2);
+    col_rel_t *left = make_left(65, 1);
+    wl_plan_op_t op;
+    eval_entry_t result = { 0 };
+
+    TEST("parallel keyed diff admission denial rolls back transaction state");
+    setenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS", "2", 1);
+    if (!sess || !right || !left) {
+        FAIL("fixture");
+        goto out;
+    }
+    if (session_add_rel(sess, right) != 0) {
+        FAIL("right relation registration failed");
+        goto out;
+    }
+    right = NULL;
+    init_diff_keyed_op(&op);
+    if (run_diff_join(sess, left, &op, &result) != ENOMEM || result.rel
+        || reserved_of(sess) != 0u || sess->mat_cache.count != 0
+        || sess->diff_arr_count != 0) {
+        FAIL("true admission denial published output or committed diff state");
+        goto out;
+    }
+    PASS();
+out:
+    unsetenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS");
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+}
+
+static void
+test_diff_commit_failure_unwinds_pushed_materialization(void)
+{
+    wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+    col_rel_t *right = make_right(2, 1);
+    col_rel_t *left = make_left(4, 2);
+    wl_plan_op_t op;
+    eval_entry_t result = { 0 };
+
+    TEST(
+        "post-push diff commit refusal rolls back cache, twin and reservation");
+    if (!sess || !right || !left) {
+        FAIL("fixture");
+        goto out;
+    }
+    if (session_add_rel(sess, right) != 0) {
+        FAIL("right relation registration failed");
+        goto out;
+    }
+    right = NULL;
+    init_diff_keyed_op(&op);
+    test_diff_commit_failure_injected = false;
+    test_fail_diff_commit = true;
+    int rc = run_diff_join(sess, left, &op, &result);
+    if (rc != EBUSY || !test_diff_commit_failure_injected || result.rel
+        || sess->mat_cache.count != 0 || sess->diff_arr_count != 0
+        || sess->diff_txn_count != 0 || reserved_of(sess) != 0u) {
+        FAIL("commit refusal published or retained differential output state");
+        goto out_entry;
+    }
+    PASS();
+    goto out;
+out_entry:
+    if (result.owned && result.rel)
+        col_rel_destroy(result.rel);
+out:
+    test_fail_diff_commit = false;
     col_rel_destroy(left);
     col_rel_destroy(right);
     destroy_session(sess);
@@ -1268,7 +1514,7 @@ test_materialized_stack_copy_contract(void)
     wl_plan_op_t op;
     eval_entry_t result = { 0 };
     const col_rel_t *cached;
-    uint64_t reserved;
+    uint64_t reserved, cache_bytes, copy_bytes;
 
     TEST("materialized join stack copy keeps the transient twin contract");
     if (!sess || !right || !left) {
@@ -1290,8 +1536,8 @@ test_materialized_stack_copy_contract(void)
     if (!cached || cached == result.rel || cached->pool_owned
         || cached->memory_governor != sess->memory_governor
         || !admission_invariant(cached)
-        || result.rel->memory_governor != NULL
-        || result.rel->retained_reserved_bytes != 0u
+        || result.rel->memory_governor != sess->memory_governor
+        || !admission_invariant(result.rel)
         || result.rel->pool_owned
         || result.rel->nrows != cached->nrows
         || result.rel->ncols != cached->ncols
@@ -1300,16 +1546,58 @@ test_materialized_stack_copy_contract(void)
         goto out_entry;
     }
     reserved = reserved_of(sess);
-    if (reserved != cached->retained_reserved_bytes) {
-        FAIL("transient stack twin changed governor accounting");
+    cache_bytes = cached->retained_reserved_bytes;
+    copy_bytes = result.rel->retained_reserved_bytes;
+    if (cache_bytes == 0 || copy_bytes == 0
+        || reserved != cache_bytes + copy_bytes) {
+        FAIL("cache and stack twin reservations are not both charged");
         goto out_entry;
     }
     col_rel_destroy(result.rel);
     result.rel = NULL;
-    if (reserved_of(sess) != reserved) {
-        FAIL("destroying stack twin changed cache reservation");
+    if (reserved_of(sess) != cache_bytes) {
+        FAIL("destroying stack twin did not release exactly its reservation");
         goto out;
     }
+    test_cache_pin_protected = false;
+    test_cache_reclaim_attempt = true;
+    test_reclaim_sess = sess;
+    test_reclaim_source = cached;
+    if (run_join(sess, left, &op, &result) != 0 || !result.rel
+        || !test_cache_pin_protected
+        || result.rel == cached || result.rel->memory_governor
+        != sess->memory_governor
+        || result.rel->retained_reserved_bytes != copy_bytes
+        || col_rel_get(result.rel, 0, 0) != col_rel_get(cached, 0, 0)
+        || reserved_of(sess) != cache_bytes + copy_bytes) {
+        FAIL("cache hit did not return a governed, value-identical copy");
+        goto out_entry;
+    }
+    col_rel_destroy(result.rel);
+    result.rel = NULL;
+    if (reserved_of(sess) != cache_bytes) {
+        FAIL("cache-hit copy release changed cache reservation");
+        goto out;
+    }
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            sess->memory_governor)->usable_bytes, cache_bytes - 1u,
+        memory_order_release);
+    if (run_join(sess, left, &op, &result) != ENOMEM || result.rel
+        || cached_output(sess, left) != cached
+        || reserved_of(sess) != cache_bytes) {
+        FAIL(
+            "reclaim pressure evicted or changed the cache entry during its pin");
+        goto out_entry;
+    }
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            sess->memory_governor)->usable_bytes, 64ull * 1024 * 1024,
+        memory_order_release);
+    if (run_join(sess, left, &op, &result) != 0 || !result.rel) {
+        FAIL("cache-hit copy did not recover after admission was restored");
+        goto out_entry;
+    }
+    col_rel_destroy(result.rel);
+    result.rel = NULL;
     col_mat_cache_clear(&sess->mat_cache);
     if (reserved_of(sess) != 0u) {
         FAIL("cache clear did not release the governed original once");
@@ -1326,12 +1614,411 @@ out:
     destroy_session(sess);
 }
 
+static void
+test_cache_copy_governor_precedence(void)
+{
+    wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+    wl_columnar_memory_governor_ref_t *source_governor
+        = sess ? sess->memory_governor : NULL;
+    wl_columnar_memory_governor_ref_t *other = make_governor(
+        64ull * 1024 * 1024);
+    col_rel_t *right = make_right(2, 1);
+    col_rel_t *left = make_left(4, 2);
+    col_rel_t *cached = NULL;
+    wl_plan_op_t op;
+    eval_entry_t result = { 0 };
+    bool cache_owns_result = false;
+    uint64_t source_bytes = 0;
+    uint64_t copy_bytes = 0;
+
+    TEST("materialized cache copy prefers session then source governor");
+    if (!sess || !other || !right || !left
+        || col_rel_deep_copy(left, &cached, NULL) != 0
+        || col_rel_attach_memory_governor(cached, sess->memory_governor) != 0) {
+        FAIL("fixture");
+        goto out;
+    }
+    if (session_add_rel(sess, right) != 0) {
+        FAIL("right relation registration failed");
+        goto out;
+    }
+    right = NULL;
+    source_bytes = cached->retained_reserved_bytes;
+    if (col_mat_cache_insert(&sess->mat_cache, left,
+        session_find_rel(sess, "right"), cached) != 0) {
+        FAIL("could not seed governed cache result");
+        goto out;
+    }
+    cache_owns_result = true;
+    init_cross_op(&op);
+
+    sess->memory_governor = other;
+    if (run_join(sess, left, &op, &result) != 0 || !result.rel
+        || result.rel->memory_governor != other
+        || cached->memory_governor != source_governor
+        || !admission_invariant(result.rel)) {
+        FAIL("cache hit did not select the session governor");
+        goto out_result;
+    }
+    copy_bytes = result.rel->retained_reserved_bytes;
+    if (reserved_for(source_governor) != source_bytes
+        || reserved_for(other) != copy_bytes || copy_bytes == 0) {
+        FAIL("session-governor copy changed source accounting");
+        goto out_result;
+    }
+    col_rel_destroy(result.rel);
+    result.rel = NULL;
+    if (reserved_for(other) != 0u) {
+        FAIL("session-governor copy did not release its own token");
+        goto out;
+    }
+
+    sess->memory_governor = NULL;
+    if (run_join(sess, left, &op, &result) != 0 || !result.rel
+        || result.rel->memory_governor != source_governor
+        || !admission_invariant(result.rel)
+        || reserved_for(source_governor)
+        != source_bytes + result.rel->retained_reserved_bytes
+        || reserved_for(other) != 0u) {
+        FAIL("cache hit did not fall back to the source governor");
+        goto out_result;
+    }
+    col_rel_destroy(result.rel);
+    result.rel = NULL;
+    sess->memory_governor = source_governor;
+    if (reserved_for(source_governor) != source_bytes) {
+        FAIL("source-governor copy did not release its own token");
+        goto out;
+    }
+    col_mat_cache_clear(&sess->mat_cache);
+    if (reserved_for(source_governor) != 0u) {
+        FAIL("cache teardown did not release source-governed result");
+        goto out;
+    }
+    PASS();
+    goto out;
+out_result:
+    if (result.owned && result.rel)
+        col_rel_destroy(result.rel);
+out:
+    if (sess)
+        sess->memory_governor = source_governor;
+    if (cache_owns_result && sess)
+        col_mat_cache_clear(&sess->mat_cache);
+    if (!cache_owns_result)
+        col_rel_destroy(cached);
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+    if (other) {
+        if (reserved_for(other) != 0u) {
+            fprintf(stderr,
+                "session governor precedence test leaked B reservation\n");
+            tests_failed++;
+        }
+        wl_columnar_memory_governor_ref_release(other);
+    }
+}
+
+static void
+test_governed_copy_payload_failure_falls_back_to_accounted_original(void)
+{
+    wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+    col_rel_t *right = make_right(2, 1);
+    col_rel_t *left = make_left(4, 2);
+    wl_plan_op_t op;
+    eval_entry_t result = { 0 };
+
+    TEST(
+        "post-admission twin allocation failure publishes one accounted owner");
+    if (!sess || !right || !left) {
+        FAIL("fixture");
+        goto out;
+    }
+    if (session_add_rel(sess, right) != 0) {
+        FAIL("right relation registration failed");
+        goto out;
+    }
+    right = NULL;
+    init_cross_op(&op);
+    wl_columnar_relation_test_fail_next_governed_copy_payload_alloc();
+    if (run_join(sess, left, &op, &result) != 0 || !result.rel
+        || !result.owned || result.rel->memory_governor != sess->memory_governor
+        || !admission_invariant(result.rel)
+        || cached_output(sess, left) != NULL
+        || reserved_of(sess) != result.rel->retained_reserved_bytes) {
+        FAIL(
+            "failed twin admission leaked a token or published an unaccounted result");
+        goto out_entry;
+    }
+    col_rel_destroy(result.rel);
+    result.rel = NULL;
+    if (reserved_of(sess) != 0u) {
+        FAIL("single-owner cleanup left its reservation behind");
+        goto out;
+    }
+    PASS();
+    goto out;
+out_entry:
+    if (result.owned && result.rel)
+        col_rel_destroy(result.rel);
+out:
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+}
+
+static void
+test_materialized_cache_insert_failure_unwinds_both_results(void)
+{
+    wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+    col_rel_t *right = make_right(2, 1);
+    col_rel_t *left = make_left(4, 2);
+    col_mat_cache_pin_t pins[COL_MAT_CACHE_MAX] = { 0 };
+    wl_plan_op_t op;
+    eval_entry_t ordinary = { 0 }, differential = { 0 };
+    bool fixture_ok = sess && right && left;
+
+    TEST("full pinned cache falls back to one accounted JOIN owner");
+    if (!fixture_ok) {
+        FAIL("fixture");
+        goto out;
+    }
+    if (session_add_rel(sess, right) != 0) {
+        FAIL("right relation registration failed");
+        goto out;
+    }
+    right = NULL;
+    for (uint32_t i = 0; i < COL_MAT_CACHE_MAX; i++) {
+        col_rel_t *fill_left = make_left(1, 1);
+        col_rel_t *fill_right = make_right(1, 1);
+        col_rel_t *fill_result = make_left(1, 1);
+        if (!fill_left || !fill_right || !fill_result) {
+            col_rel_destroy(fill_left);
+            col_rel_destroy(fill_right);
+            col_rel_destroy(fill_result);
+            fixture_ok = false;
+            break;
+        }
+        fill_right->columns[0][0] = (int64_t)i + 100;
+        if (col_mat_cache_insert_pin(&sess->mat_cache, fill_left,
+            fill_right, fill_result, &pins[i]) != 0) {
+            col_rel_destroy(fill_left);
+            col_rel_destroy(fill_right);
+            col_rel_destroy(fill_result);
+            fixture_ok = false;
+            break;
+        }
+        col_rel_destroy(fill_left);
+        col_rel_destroy(fill_right);
+    }
+    if (!fixture_ok || sess->mat_cache.count != COL_MAT_CACHE_MAX) {
+        FAIL("could not fill and pin every cache slot");
+        goto out;
+    }
+    init_cross_op(&op);
+    if (run_join(sess, left, &op, &ordinary) != 0 || !ordinary.rel
+        || !ordinary.owned
+        || ordinary.rel->memory_governor != sess->memory_governor
+        || !admission_invariant(ordinary.rel)
+        || sess->mat_cache.count != COL_MAT_CACHE_MAX
+        || reserved_of(sess) != ordinary.rel->retained_reserved_bytes) {
+        FAIL("ENOSPC did not publish one already-accounted JOIN result");
+        goto out;
+    }
+    col_rel_destroy(ordinary.rel);
+    ordinary.rel = NULL;
+    if (reserved_of(sess) != 0u) {
+        FAIL("ordinary single-owner fallback failed to release its token");
+        goto out;
+    }
+
+    init_diff_keyed_op(&op);
+    if (run_diff_join(sess, left, &op, &differential) != 0
+        || !differential.rel || !differential.owned
+        || differential.rel->memory_governor != sess->memory_governor
+        || !admission_invariant(differential.rel)
+        || sess->mat_cache.count != COL_MAT_CACHE_MAX
+        || sess->diff_arr_count != 1) {
+        FAIL(
+            "ENOSPC did not commit differential fallback as one accounted owner");
+        goto out;
+    }
+    uint64_t diff_reserved = reserved_of(sess);
+    uint64_t differential_bytes = differential.rel->retained_reserved_bytes;
+    if (diff_reserved < differential_bytes || differential_bytes == 0) {
+        FAIL("differential fallback has no retained reservation");
+        col_rel_destroy(differential.rel);
+        differential.rel = NULL;
+        goto out;
+    }
+    col_rel_destroy(differential.rel);
+    differential.rel = NULL;
+    differential.owned = false;
+    if (reserved_of(sess) != diff_reserved - differential_bytes) {
+        FAIL("differential fallback did not release its single output token");
+        goto out;
+    }
+    PASS();
+out:
+    if (ordinary.owned && ordinary.rel)
+        col_rel_destroy(ordinary.rel);
+    if (differential.owned && differential.rel)
+        col_rel_destroy(differential.rel);
+    for (uint32_t i = 0; i < COL_MAT_CACHE_MAX; i++)
+        col_mat_cache_pin_release(&pins[i]);
+    if (sess)
+        col_mat_cache_clear(&sess->mat_cache);
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+}
+
+static void
+test_governed_join_consumers_release_exactly_once(void)
+{
+    static const uint32_t map_col[] = { 0u };
+    static uint8_t filter_bytes[] = {
+        WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '3',
+        WL_PLAN_EXPR_CONST_INT, 0, 0, 0, 0, 0, 0, 0, 0,
+        WL_PLAN_EXPR_CMP_GT
+    };
+    wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+    col_rel_t *right = make_right(2, 1);
+    col_rel_t *left = make_left(4, 2);
+    eval_stack_t stack;
+    wl_plan_op_t join_op, filter_op, map_op;
+    col_rel_t *cache_entry = NULL;
+    uint64_t cache_bytes = 0;
+    bool stack_ready = false;
+
+    TEST(
+        "governed materialized JOIN survives FILTER/MAP and CONCAT/CONSOLIDATE");
+    if (!sess || !right || !left) {
+        FAIL("fixture");
+        goto out;
+    }
+    if (session_add_rel(sess, right) != 0) {
+        FAIL("right relation registration failed");
+        goto out;
+    }
+    right = NULL;
+    init_cross_op(&join_op);
+    memset(&filter_op, 0, sizeof(filter_op));
+    filter_op.op = WL_PLAN_OP_FILTER;
+    filter_op.filter_expr.data = filter_bytes;
+    filter_op.filter_expr.size = sizeof(filter_bytes);
+    memset(&map_op, 0, sizeof(map_op));
+    map_op.op = WL_PLAN_OP_MAP;
+    map_op.project_indices = map_col;
+    map_op.project_count = 1;
+
+    eval_stack_init(&stack);
+    stack_ready = true;
+    if (eval_stack_push(&stack, left, false) != 0
+        || wl_columnar_join_op(&join_op, &stack, sess) != 0
+        || stack.top != 1 || !stack.items[0].rel
+        || !stack.items[0].owned
+        || stack.items[0].rel->memory_governor != sess->memory_governor) {
+        FAIL("materialized JOIN did not leave its governed stack copy");
+        goto out;
+    }
+    cache_entry = cached_output(sess, left);
+    if (!cache_entry || !admission_invariant(cache_entry)
+        || stack.items[0].rel->retained_reserved_bytes == 0
+        || reserved_of(sess) != cache_entry->retained_reserved_bytes
+        + stack.items[0].rel->retained_reserved_bytes) {
+        FAIL("JOIN did not charge cache and stack outputs exactly");
+        goto out;
+    }
+    cache_bytes = cache_entry->retained_reserved_bytes;
+    int filter_rc = wl_columnar_filter_op(&filter_op, &stack, sess);
+    if (filter_rc != 0 || stack.top != 1 || stack.items[0].rel->nrows != 4
+        || stack.items[0].rel->memory_governor != sess->memory_governor
+        || reserved_of(sess) != cache_bytes
+        + stack.items[0].rel->retained_reserved_bytes) {
+        FAIL(
+            "FILTER did not consume the governed copy and preserve cache charge");
+        goto out;
+    }
+    if (col_op_map(&map_op, &stack, sess) != 0
+        || stack.top != 1 || stack.items[0].rel->ncols != 1
+        || stack.items[0].rel->nrows != 4
+        || reserved_of(sess) != cache_bytes) {
+        FAIL("MAP changed retained JOIN cache accounting");
+        goto out;
+    }
+    if (eval_stack_drain(&stack) != 0 || reserved_of(sess) != cache_bytes) {
+        FAIL("downstream output teardown changed the cache reservation");
+        goto out;
+    }
+    stack_ready = false;
+
+    eval_entry_t joined = { 0 };
+    col_rel_t *duplicate = NULL;
+    if (run_join(sess, left, &join_op, &joined) != 0 || !joined.rel
+        || col_rel_deep_copy(joined.rel, &duplicate, NULL) != 0) {
+        FAIL("could not prepare CONCAT/CONSOLIDATE inputs");
+        if (joined.owned && joined.rel)
+            col_rel_destroy(joined.rel);
+        goto out;
+    }
+    eval_stack_init(&stack);
+    stack_ready = true;
+    if (eval_stack_push(&stack, joined.rel, joined.owned) != 0) {
+        col_rel_destroy(joined.rel);
+        col_rel_destroy(duplicate);
+        FAIL("could not push governed CONCAT input");
+        goto out;
+    }
+    joined.rel = NULL;
+    if (eval_stack_push(&stack, duplicate, true) != 0) {
+        col_rel_destroy(duplicate);
+        FAIL("could not push duplicate CONCAT input");
+        goto out;
+    }
+    duplicate = NULL;
+    if (col_op_concat(&stack, sess) != 0 || stack.top != 1
+        || reserved_of(sess) != cache_bytes) {
+        FAIL("CONCAT did not release the governed input twin once");
+        goto out;
+    }
+    if (col_op_consolidate(&stack, sess) != 0 || stack.top != 1
+        || stack.items[0].rel->nrows != 8u
+        || reserved_of(sess) != cache_bytes) {
+        FAIL("CONSOLIDATE changed result or retained-cache accounting");
+        goto out;
+    }
+    if (eval_stack_drain(&stack) != 0) {
+        FAIL("could not release consolidated output");
+        goto out;
+    }
+    stack_ready = false;
+    col_mat_cache_clear(&sess->mat_cache);
+    if (reserved_of(sess) != 0u) {
+        FAIL("cache teardown did not release the final governed owner");
+        goto out;
+    }
+    PASS();
+out:
+    if (stack_ready)
+        (void)eval_stack_drain(&stack);
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 int
 main(void)
 {
     uint64_t out_bytes = 0;
+
+    wl_columnar_relation_test_after_governed_copy_admission =
+        try_reclaim_during_governed_copy;
+    wl_columnar_join_test_before_diff_commit =
+        fail_next_diff_commit_after_mutation;
 
     printf("Memory admission: JOIN output capacity (Issue #1477)\n");
 
@@ -1356,7 +2043,17 @@ main(void)
     test_small_parallel_cross_is_admitted();
     test_parallel_diff_output_is_governed();
     test_parallel_diff_denial();
+    test_parallel_diff_true_admission_denial_rolls_back();
+    test_diff_commit_failure_unwinds_pushed_materialization();
+    test_differential_cache_hit_reclaim_pin();
     test_materialized_stack_copy_contract();
+    test_cache_copy_governor_precedence();
+    test_governed_copy_payload_failure_falls_back_to_accounted_original();
+    test_materialized_cache_insert_failure_unwinds_both_results();
+    test_governed_join_consumers_release_exactly_once();
+
+    wl_columnar_relation_test_after_governed_copy_admission = NULL;
+    wl_columnar_join_test_before_diff_commit = NULL;
 
     printf("\n  %d run, %d passed, %d failed\n",
         tests_run, tests_passed, tests_failed);
