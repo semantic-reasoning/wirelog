@@ -3252,6 +3252,14 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
 int
 wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess);
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+extern void (*wl_columnar_relation_test_after_governed_copy_admission)(
+    const col_rel_t *);
+#endif
+#ifdef WL_TEST_JOIN_CACHE_HOOK
+extern void (*wl_columnar_join_test_before_diff_commit)(
+    wl_columnar_arrangement_diff_txn_t *);
+#endif
 int
 wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess);

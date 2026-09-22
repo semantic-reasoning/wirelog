@@ -49,6 +49,8 @@ wl_columnar_relation_test_clear_prepare_resize(void)
     wl_columnar_relation_test_fail_prepare_resize = false;
 }
 static bool wl_columnar_relation_fail_governed_copy_payload_alloc;
+void (*wl_columnar_relation_test_after_governed_copy_admission)(
+    const col_rel_t *);
 
 void
 wl_columnar_relation_test_fail_next_governed_copy_payload_alloc(void)
@@ -4580,6 +4582,10 @@ wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
         rc = ENOMEM;
         goto done;
     }
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    if (wl_columnar_relation_test_after_governed_copy_admission)
+        wl_columnar_relation_test_after_governed_copy_admission(src);
+#endif
 #ifdef WL_TEST_RELATION_RESIZE_HOOK
     if (wl_columnar_relation_fail_governed_copy_payload_alloc) {
         wl_columnar_relation_fail_governed_copy_payload_alloc = false;

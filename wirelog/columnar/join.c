@@ -37,6 +37,10 @@
 #ifdef WL_TEST_JOIN_TIMESTAMP_HOOK
 bool wl_columnar_join_test_enable_semijoin_timestamps;
 #endif
+#ifdef WL_TEST_JOIN_CACHE_HOOK
+void (*wl_columnar_join_test_before_diff_commit)(
+    wl_columnar_arrangement_diff_txn_t *);
+#endif
 
 /* Retire the whole evaluator entry; refusal keeps its relation and segment
  * metadata together in the caller's vacated stack slot. */
@@ -60,6 +64,38 @@ wl_columnar_join_publish_after_left(eval_stack_t *stack, eval_entry_t *left,
     return rc;
 }
 
+static wl_columnar_memory_governor_ref_t *
+wl_columnar_join_effective_governor(const wl_col_session_t *sess,
+    const col_rel_t *source)
+{
+    return sess && sess->memory_governor ? sess->memory_governor
+                                         : (source ? source->memory_governor
+                                                   : NULL);
+}
+
+/* ENOMEM may leave the single original result publishable only when its
+ * complete retained footprint was already committed to the effective
+ * governor.  An unmanaged source is eligible only in an unmanaged session. */
+static bool
+wl_columnar_join_original_is_accounted(const col_rel_t *source,
+    wl_columnar_memory_governor_ref_t *effective)
+{
+    uint64_t needed = 0;
+    if (!source)
+        return false;
+    if (!effective)
+        return source->memory_governor == NULL
+               && source->retained_reserved_bytes == 0;
+    return source->memory_governor == effective
+           && source->retained_reservation.governor
+           == wl_columnar_memory_governor_ref_get(effective)
+           && atomic_load_explicit(&source->retained_reservation.state,
+               memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+           && col_rel_retained_bytes_for(source, source->capacity, &needed)
+           && source->retained_reserved_bytes >= needed
+           && source->retained_reservation.bytes >= needed;
+}
+
 static int
 diff_txn_commit_after_push(eval_stack_t *stack,
     wl_columnar_arrangement_diff_txn_t *txn, col_mat_cache_t *cache,
@@ -67,6 +103,10 @@ diff_txn_commit_after_push(eval_stack_t *stack,
 {
     if (!txn->session)
         return 0;
+#ifdef WL_TEST_JOIN_CACHE_HOOK
+    if (wl_columnar_join_test_before_diff_commit)
+        wl_columnar_join_test_before_diff_commit(txn);
+#endif
     int rc = wl_columnar_arrangement_diff_txn_commit(txn);
     if (rc == 0)
         return 0;
@@ -1056,7 +1096,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 &cache_pin);
         if (cached) {
             col_rel_t *copy = NULL;
-            int copy_rc = col_rel_deep_copy(cached, &copy, NULL);
+            int copy_rc = wl_columnar_relation_deep_copy_governed(cached,
+                    &copy, wl_columnar_join_effective_governor(sess, cached));
             col_mat_cache_pin_release(&cache_pin);
 #ifdef WL_PROFILE
             sess->profile.join_cache_hit_ns += now_ns() - _t0_join;
@@ -1637,11 +1678,26 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         sess->profile.join_compute_ns += now_ns() - _t0_join;
 #endif
         col_rel_t *copy = NULL;
-        int copy_rc = col_rel_deep_copy(out, &copy, NULL);
-        if (copy_rc != 0)
-            return wl_columnar_join_publish_after_left(stack, &left_e, out,
-                       result_is_delta);
+        wl_columnar_memory_governor_ref_t *effective
+            = wl_columnar_join_effective_governor(sess, out);
+        int copy_rc = wl_columnar_relation_deep_copy_governed(out, &copy,
+                effective);
+        if (copy_rc != 0) {
+            if (copy_rc == ENOMEM
+                && wl_columnar_join_original_is_accounted(out, effective))
+                return wl_columnar_join_publish_after_left(stack, &left_e,
+                           out, result_is_delta);
+            col_rel_destroy(out);
+            return wl_columnar_join_dispose_left(stack, &left_e, copy_rc);
+        }
         int cache_rc = col_mat_cache_insert(&sess->mat_cache, left, right, out);
+        bool publish_original = (cache_rc == ENOMEM || cache_rc == ENOSPC)
+            && wl_columnar_join_original_is_accounted(out, effective);
+        if (cache_rc != 0 && !publish_original) {
+            col_rel_destroy(copy);
+            col_rel_destroy(out);
+            return wl_columnar_join_dispose_left(stack, &left_e, cache_rc);
+        }
         int cleanup_rc = wl_columnar_join_dispose_left(stack, &left_e, 0);
         if (cleanup_rc != 0) {
             if (cache_rc == 0)
@@ -1656,8 +1712,11 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             col_rel_destroy(copy);
         int push_rc = eval_stack_push_delta(stack, publish, true,
                 result_is_delta);
-        if (push_rc != 0)
+        if (push_rc != 0) {
+            if (cache_rc == 0)
+                col_mat_cache_remove_result(&sess->mat_cache, out);
             col_rel_destroy(publish);
+        }
         return push_rc;
     }
 #ifdef WL_PROFILE
@@ -2238,7 +2297,8 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 &cache_pin);
         if (cached) {
             col_rel_t *copy = NULL;
-            int copy_rc = col_rel_deep_copy(cached, &copy, NULL);
+            int copy_rc = wl_columnar_relation_deep_copy_governed(cached,
+                    &copy, wl_columnar_join_effective_governor(sess, cached));
             col_mat_cache_pin_release(&cache_pin);
             if (right_filtered)
                 col_rel_destroy(right_filtered);
@@ -2716,15 +2776,39 @@ join_success:
     /* Owned filtered fallbacks are operation-local; see the ordinary path. */
     col_rel_t *publish = out;
     bool cached = false;
+    int primary_rc = 0;
     if (op->materialized && !projected_join && !right_filtered) {
         col_rel_t *copy = NULL;
-        if (col_rel_deep_copy(out, &copy, NULL) == 0) {
-            if (col_mat_cache_insert(&sess->mat_cache, left, right, out) == 0) {
+        wl_columnar_memory_governor_ref_t *effective
+            = wl_columnar_join_effective_governor(sess, out);
+        int copy_rc = wl_columnar_relation_deep_copy_governed(out, &copy,
+                effective);
+        if (copy_rc == 0) {
+            int cache_rc = col_mat_cache_insert(&sess->mat_cache, left, right,
+                    out);
+            if (cache_rc == 0) {
                 publish = copy;
                 cached = true;
+            } else if ((cache_rc == ENOMEM || cache_rc == ENOSPC)
+                && wl_columnar_join_original_is_accounted(out, effective)) {
+                col_rel_destroy(copy);
+                copy = NULL;
             } else {
                 col_rel_destroy(copy);
+                copy = NULL;
+                col_rel_destroy(out);
+                out = NULL;
+                publish = NULL;
+                primary_rc = cache_rc;
             }
+        } else if (copy_rc == ENOMEM
+            && wl_columnar_join_original_is_accounted(out, effective)) {
+            /* The existing committed token covers the one published owner. */
+        } else {
+            col_rel_destroy(out);
+            out = NULL;
+            publish = NULL;
+            primary_rc = copy_rc;
         }
     }
     /* End internal source readers before testing externally held input
@@ -2733,13 +2817,20 @@ join_success:
         ? col_arrangement_probe_bundle_release(&diff_bundle) : 0;
     if (right_filtered)
         col_rel_destroy(right_filtered);
+    if (release_rc == 0)
+        release_rc = primary_rc;
     int cleanup_rc = wl_columnar_join_dispose_left(stack, &left_e, release_rc);
     if (cleanup_rc != 0) {
         wl_columnar_arrangement_diff_txn_abort(&diff_txn);
         if (cached)
             col_mat_cache_remove_result(&sess->mat_cache, out);
-        col_rel_destroy(publish);
+        if (publish)
+            col_rel_destroy(publish);
         return cleanup_rc;
+    }
+    if (primary_rc != 0) {
+        wl_columnar_arrangement_diff_txn_abort(&diff_txn);
+        return primary_rc;
     }
     int push_rc = eval_stack_push_delta(stack, publish, true, result_is_delta);
     if (push_rc == 0)
