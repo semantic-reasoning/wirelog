@@ -1594,6 +1594,7 @@ enum wl_columnar_plain_step_completion_phase {
 typedef struct wl_columnar_eval_stack_cleanup_frame
     wl_columnar_eval_stack_cleanup_frame_t;
 struct wl_columnar_retained_eval_entry;
+struct wl_columnar_kfusion_cohort;
 
 typedef struct wl_col_session_t {
     wl_session_t base;         /* MUST be first field (vtable dispatch)  */
@@ -1971,6 +1972,8 @@ typedef struct wl_col_session_t {
      * parent allocator and any operation-scoped readers are quiescent. */
     struct wl_columnar_retained_eval_entry *retained_eval_entries;
     uint32_t retained_eval_entry_count;
+    /* Parallel K-Fusion invocation retained across refused worker cleanup. */
+    struct wl_columnar_kfusion_cohort *kfusion_pending_cohort;
     /* Exchange operator state (Issue #316): W x W partition buffer matrix.
      * Allocated by coordinator before exchange scatter dispatch.
      * exchange_bufs[src_worker][dst_worker] holds rows src sends to dst.
@@ -3193,6 +3196,8 @@ wl_columnar_session_retain_eval_stack(wl_col_session_t *sess,
     eval_stack_t *stack);
 int
 wl_columnar_session_retry_retained_eval_entries(wl_col_session_t *sess);
+int
+wl_columnar_kfusion_retry_pending(wl_col_session_t *sess);
 bool
 wl_columnar_deferred_relation_eligible(const col_rel_t *rel);
 int
@@ -3375,6 +3380,11 @@ bool wl_columnar_eval_delta_rollback_active(const wl_col_session_t *sess);
 bool wl_columnar_eval_delta_defer_gc(wl_col_session_t *sess);
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_eval_delta_test_after_eval)(wl_col_session_t *sess);
+extern void (*wl_columnar_kfusion_test_before_cleanup)(
+    wl_col_session_t *sess, eval_stack_t *stack, col_rel_t **results,
+    uint32_t result_count);
+extern int (*wl_columnar_kfusion_test_submit)(wl_work_queue_t *wq,
+    void (*work_fn)(void *ctx), void *ctx);
 #endif
 void
 wl_columnar_delta_events_clear(wl_col_session_t *sess);
