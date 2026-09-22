@@ -2126,8 +2126,8 @@ wl_columnar_eval_owner_publication_register(
  * discard. Successful add transfers candidate ownership to the transaction;
  * prepare may consume candidates for existing targets. Registration prepares
  * private registry/hash images without changing sessions; commit swaps those
- * images and publishes replacements with no fallible work remaining. This
- * standalone builder is not wired into exchange modes yet. */
+ * images and publishes replacements with no fallible work remaining. The TDD
+ * owner exchange uses this builder for its multi-session publication. */
 int
 wl_columnar_eval_owner_publication_commit(
     wl_columnar_eval_owner_publication_txn_t *txn);
