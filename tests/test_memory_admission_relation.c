@@ -11,6 +11,12 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#ifndef _WIN32
+#include <signal.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 static int failures;
 
@@ -1090,6 +1096,223 @@ cleanup:
     }
 }
 
+static void
+test_relation_retirement_token(void)
+{
+    wl_columnar_relation_retirement_token_t token;
+    wl_columnar_relation_retirement_token_t copied_token;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    wl_columnar_source_access_reader_t descriptor_reader = { 0 };
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    col_rel_t *relation = col_rel_new_auto("retirement", 1);
+    uint64_t baseline;
+    int64_t value = 19;
+
+    make_resolution(&resolution, 1024 * 1024);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(relation && ref, "retirement fixture setup");
+    if (!relation || !ref)
+        goto cleanup;
+    CHECK(col_rel_attach_memory_governor(relation, ref) == 0,
+        "retirement fixture admission");
+    for (uint32_t i = 0; i < COL_REL_INIT_CAP; i++)
+        CHECK(col_rel_append_row(relation, &value) == 0,
+            "retirement fixture growth");
+    CHECK(col_rel_enable_timestamps(relation) == 0,
+        "retirement fixture timestamp admission");
+    baseline = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+    CHECK(baseline > 0, "retirement has a live reservation");
+
+    /* Descriptor readers prevent even the first writer from being admitted. */
+    CHECK(wl_columnar_source_access_reader_acquire(
+            &relation->descriptor_access, &descriptor_reader) == 0,
+        "retirement descriptor reader acquire");
+    wl_columnar_relation_retirement_init(&token);
+    CHECK(wl_columnar_relation_retirement_prepare(relation, &token) == EBUSY
+        && atomic_load_explicit(&relation->source_access.state,
+        memory_order_acquire) == 0,
+        "retirement refuses an active descriptor reader");
+    CHECK(wl_columnar_source_access_reader_release(&descriptor_reader) == 0,
+        "retirement descriptor reader release");
+
+    /* A source reader lets descriptor admission succeed and source admission
+     * fail. The partial writer must be released so the same token can retry. */
+    CHECK(wl_columnar_source_access_reader_acquire(&relation->source_access,
+        &reader) == 0, "retirement reader acquire");
+    CHECK(wl_columnar_relation_retirement_prepare(relation, &token) == EBUSY,
+        "retirement refuses an active source reader");
+    CHECK(atomic_load_explicit(&relation->descriptor_access.state,
+        memory_order_acquire) == 0
+        && atomic_load_explicit(&relation->source_access.state,
+        memory_order_acquire) == 1,
+        "partial retirement admission released descriptor writer");
+    CHECK(relation->nrows == COL_REL_INIT_CAP
+        && relation->columns[0][0] == value
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == baseline,
+        "refused retirement preserves data and accounting");
+    CHECK(wl_columnar_source_access_reader_release(&reader) == 0,
+        "retirement reader release");
+
+    /* A damaged/non-releasable credit must be refused before payload teardown. */
+    const void *saved_identity = relation->retained_reservation.identity;
+    wl_columnar_memory_governor_t *saved_governor =
+        relation->retained_reservation.governor;
+    relation->retained_reservation.identity = NULL;
+    CHECK(wl_columnar_relation_retirement_prepare(relation, &token) == EBUSY
+        && relation->nrows == COL_REL_INIT_CAP
+        && relation->retained_reserved_bytes > 0
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == baseline
+        && atomic_load_explicit(&relation->descriptor_access.state,
+        memory_order_acquire) == 0,
+        "unreleasable reservation refuses retirement unchanged");
+    relation->retained_reservation.identity = saved_identity;
+    relation->retained_reservation.governor = NULL;
+    CHECK(wl_columnar_relation_retirement_prepare(relation, &token) == EBUSY
+        && relation->nrows == COL_REL_INIT_CAP
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == baseline,
+        "reservation with mismatched governor refuses retirement unchanged");
+    relation->retained_reservation.governor = saved_governor;
+
+    CHECK(wl_columnar_relation_retirement_prepare(relation, &token) == 0,
+        "retirement retry prepares");
+    CHECK(atomic_load_explicit(&relation->descriptor_access.state,
+        memory_order_acquire) == WL_COLUMNAR_SOURCE_ACCESS_WRITER
+        && atomic_load_explicit(&relation->source_access.state,
+        memory_order_acquire) == WL_COLUMNAR_SOURCE_ACCESS_WRITER,
+        "prepared retirement holds both writers");
+    CHECK(wl_columnar_source_access_reader_acquire(&relation->source_access,
+        &reader) == EBUSY
+        && col_rel_append_row(relation, &value) != 0
+        && relation->nrows == COL_REL_INIT_CAP,
+        "prepared retirement blocks readers and relation mutation");
+    copied_token = token;
+    CHECK(wl_columnar_relation_retirement_cancel(&copied_token) == EINVAL
+        && atomic_load_explicit(&relation->descriptor_access.state,
+        memory_order_acquire) == WL_COLUMNAR_SOURCE_ACCESS_WRITER,
+        "copied retirement token cannot release original writers");
+#ifndef _WIN32
+    pid_t child = fork();
+    CHECK(child >= 0, "fork copied-token commit witness");
+    if (child == 0) {
+        struct rlimit core_limit = { 0, 0 };
+        (void)setrlimit(RLIMIT_CORE, &core_limit);
+        fclose(stderr);
+        copied_token = token;
+        wl_columnar_relation_retirement_commit(&copied_token);
+        _exit(0);
+    }
+    if (child > 0) {
+        int status = 0;
+        CHECK(waitpid(child, &status, 0) == child
+            && WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT,
+            "copied retirement token commit is rejected");
+    }
+#endif
+    CHECK(wl_columnar_relation_retirement_cancel(&token) == 0,
+        "prepared retirement cancels");
+    CHECK(relation->nrows == COL_REL_INIT_CAP
+        && relation->columns[0][0] == value
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == baseline,
+        "cancel preserves relation contents and accounting");
+    CHECK(wl_columnar_relation_retirement_cancel(&token) == 0,
+        "retirement cancel is idempotent");
+
+    CHECK(wl_columnar_relation_retirement_prepare(relation, &token) == 0,
+        "retirement prepares for commit");
+    wl_columnar_relation_retirement_commit(&token);
+    relation = NULL;
+    CHECK(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0,
+        "retirement commit releases reservation after contents");
+
+cleanup:
+    col_rel_destroy(relation);
+    if (reader.owner)
+        (void)wl_columnar_source_access_reader_release(&reader);
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+}
+
+static void
+test_relation_retirement_rejects_borrowed_ownership(void)
+{
+    wl_columnar_relation_retirement_token_t token;
+    col_rel_t *source = NULL;
+    col_rel_t *view = NULL;
+    delta_pool_t *pool = NULL;
+    wl_arena_t *arena = NULL;
+    col_rel_t *arena_relation = NULL;
+    int64_t value = 7;
+
+    wl_columnar_relation_retirement_init(&token);
+    source = col_rel_new_auto("retirement-source", 1);
+    view = col_rel_new_auto("retirement-view", 1);
+    CHECK(source && view && col_rel_append_row(source, &value) == 0
+        && col_rel_install_shared_view(view, source) == 0,
+        "retirement alias setup");
+    if (source && view) {
+        uint64_t borrows = col_rel_storage_alias_borrow_count(source);
+        CHECK(wl_columnar_relation_retirement_prepare(source, &token) == EBUSY
+            && col_rel_storage_alias_borrow_count(source) == borrows
+            && source->nrows == 1 && source->columns[0][0] == value
+            && atomic_load_explicit(&source->source_access.state,
+            memory_order_acquire) == 0,
+            "retirement rejects a root with a live alias without mutation");
+        CHECK(wl_columnar_relation_retirement_prepare(view, &token) == EBUSY
+            && view->storage_owner == source && view->nrows == 1,
+            "retirement rejects alias descriptors without mutation");
+    }
+    col_rel_destroy(view);
+    view = NULL;
+    col_rel_destroy(source);
+    source = NULL;
+
+    pool = delta_pool_create(1, sizeof(col_rel_t), 4096);
+    col_rel_t *pool_relation = pool
+        ? col_rel_pool_new_auto(pool, NULL, "retirement-pool", 1) : NULL;
+    CHECK(pool_relation && pool_relation->pool_owned,
+        "retirement pool fixture setup");
+    if (pool_relation) {
+        CHECK(wl_columnar_relation_retirement_prepare(pool_relation, &token)
+            == EBUSY && pool_relation->pool_owned
+            && atomic_load_explicit(&pool_relation->descriptor_access.state,
+            memory_order_acquire) == 0,
+            "retirement rejects pool ownership without gate mutation");
+    }
+    col_rel_destroy(pool_relation);
+    delta_pool_destroy(pool);
+
+    arena = wl_arena_create(4096);
+    arena_relation = col_rel_new_auto("retirement-arena", 1);
+    CHECK(arena && arena_relation, "retirement arena fixture setup");
+    if (arena && arena_relation) {
+        int64_t *arena_column = wl_arena_alloc(arena,
+                COL_REL_INIT_CAP * sizeof(*arena_column));
+        CHECK(arena_column != NULL, "retirement arena column allocation");
+        if (arena_column) {
+            memcpy(arena_column, arena_relation->columns[0],
+                arena_relation->nrows * sizeof(*arena_column));
+            free(arena_relation->columns[0]);
+            arena_relation->columns[0] = arena_column;
+            arena_relation->arena_owned = true;
+            CHECK(wl_columnar_relation_retirement_prepare(arena_relation,
+                &token) == EBUSY && arena_relation->arena_owned
+                && atomic_load_explicit(
+                    &arena_relation->descriptor_access.state,
+                    memory_order_acquire) == 0,
+                "retirement rejects arena ownership without gate mutation");
+        }
+    }
+    col_rel_destroy(arena_relation);
+    wl_arena_free(arena);
+}
+
 int
 main(void)
 {
@@ -1098,6 +1321,8 @@ main(void)
     test_physical_timestamp_capacity();
     test_cow_retained_timestamp_capacity_admission();
     test_governed_pool_clone_fallback();
+    test_relation_retirement_token();
+    test_relation_retirement_rejects_borrowed_ownership();
     test_cow_exact_fit_and_denial();
     test_cow_multi_column_cleanup();
     test_append_transitions();
