@@ -966,9 +966,96 @@ cleanup:
 /* Main                                                                     */
 /* ======================================================================== */
 
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+static int
+test_governed_compaction_retry_policy(void)
+{
+    TEST("governed compaction retains replacement for retry");
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    resolution.budget_bytes = 1024 * 1024;
+    resolution.usable_bytes = resolution.budget_bytes;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    col_rel_t *rel = col_rel_new_auto("compact-retry", 1);
+    if (!ref || !rel) {
+        FAIL("governed compaction fixture allocation failed");
+        col_rel_destroy(rel);
+        if (ref) wl_columnar_memory_governor_ref_release(ref);
+        return 1;
+    }
+    for (int64_t i = 0; i < 65; i++)
+        if (col_rel_append_row(rel, &i) != 0) {
+            FAIL("governed compaction seed failed");
+            goto done;
+        }
+    rel->nrows = 1;
+    if (col_rel_attach_memory_governor(rel, ref) != 0
+        || col_rel_reserve_capacity_admitted(rel, rel->capacity, NULL) != 0) {
+        FAIL("governed compaction admission failed");
+        goto done;
+    }
+    wl_columnar_relation_test_fail_next_prepare_resize();
+    wl_columnar_relation_test_fail_next_compact_rollback();
+    if (col_rel_compact(rel) != EAGAIN
+        || atomic_load_explicit(&rel->retained_reservation.state,
+        memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_REPLACING
+        || rel->capacity != 128 || rel->columns[0][0] != 0) {
+        FAIL("pre-publication rollback refusal did not retain original");
+        goto done;
+    }
+    if (col_rel_compact(rel) != 0 || rel->capacity >= 128
+        || rel->columns[0][0] != 0) {
+        FAIL("pre-publication compaction retry failed");
+        goto done;
+    }
+
+    /* Restore an oversized shape by growing and retracting again, then force
+     * both post-publication accounting decisions to refuse once. */
+    for (int64_t i = 1; i < 65; i++)
+        if (col_rel_append_row(rel, &i) != 0) {
+            FAIL("post-publication fixture regrowth failed");
+            goto done;
+        }
+    rel->nrows = 1;
+    wl_columnar_relation_test_fail_next_compact_commit();
+    wl_columnar_relation_test_fail_next_compact_rollback();
+    if (col_rel_compact(rel) != EAGAIN || rel->capacity >= 128
+        || atomic_load_explicit(&rel->retained_reservation.state,
+        memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_REPLACING
+        || rel->columns[0][0] != 0) {
+        FAIL("post-publication refusal did not retain valid replacement");
+        goto done;
+    }
+    if (col_rel_compact(rel) != 0
+        || atomic_load_explicit(&rel->retained_reservation.state,
+        memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        || rel->columns[0][0] != 0) {
+        FAIL("post-publication token retry failed");
+        goto done;
+    }
+    PASS();
+done:
+    col_rel_destroy(rel);
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != 0)
+        FAIL("governed compaction retry leaked reservation");
+    wl_columnar_memory_governor_ref_release(ref);
+    return tests_failed ? 1 : 0;
+}
+#endif
+
 int
 main(void)
 {
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    test_governed_compaction_retry_policy();
+#endif
     printf("Compaction Tests (Issue #217)\n");
     printf("==============================\n\n");
 

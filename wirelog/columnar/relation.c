@@ -36,6 +36,12 @@ wl_columnar_set_transition_hook_t wl_columnar_set_transition_hook;
 
 #ifdef WL_TEST_RELATION_RESIZE_HOOK
 bool wl_columnar_relation_test_fail_prepare_resize;
+static bool wl_columnar_relation_test_fail_compact_rollback;
+static bool wl_columnar_relation_test_fail_compact_commit;
+static bool wl_columnar_relation_test_fail_reservation_commit;
+static bool wl_columnar_relation_test_watch_rollback_cleanup;
+static bool wl_columnar_relation_test_resize_columns_retired;
+static bool wl_columnar_relation_test_rollback_cleanup_observed;
 
 void
 wl_columnar_relation_test_fail_next_prepare_resize(void)
@@ -48,9 +54,43 @@ wl_columnar_relation_test_clear_prepare_resize(void)
 {
     wl_columnar_relation_test_fail_prepare_resize = false;
 }
+
+void
+wl_columnar_relation_test_fail_next_compact_rollback(void)
+{
+    wl_columnar_relation_test_fail_compact_rollback = true;
+}
+
+void
+wl_columnar_relation_test_fail_next_compact_commit(void)
+{
+    wl_columnar_relation_test_fail_compact_commit = true;
+}
+
+void
+wl_columnar_relation_test_fail_next_reservation_commit(void)
+{
+    wl_columnar_relation_test_fail_reservation_commit = true;
+}
+
+void
+wl_columnar_relation_test_watch_next_rollback_cleanup(void)
+{
+    wl_columnar_relation_test_watch_rollback_cleanup = true;
+    wl_columnar_relation_test_resize_columns_retired = false;
+    wl_columnar_relation_test_rollback_cleanup_observed = false;
+}
+
+bool
+wl_columnar_relation_test_rollback_cleanup_was_ordered(void)
+{
+    return wl_columnar_relation_test_rollback_cleanup_observed;
+}
+
 static bool wl_columnar_relation_fail_governed_copy_payload_alloc;
 void (*wl_columnar_relation_test_after_governed_copy_admission)(
     const col_rel_t *);
+void (*wl_columnar_relation_test_after_retired_storage_free)(const col_rel_t *);
 
 void
 wl_columnar_relation_test_fail_next_governed_copy_payload_alloc(void)
@@ -65,6 +105,15 @@ wl_columnar_relation_test_fail_next_commit_publication(void)
     wl_columnar_relation_fail_commit_publication = true;
 }
 #endif
+
+static void
+wl_columnar_relation_test_note_resize_columns_retired(void)
+{
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    if (wl_columnar_relation_test_watch_rollback_cleanup)
+        wl_columnar_relation_test_resize_columns_retired = true;
+#endif
+}
 
 static void *
 wl_columnar_relation_radix_malloc(size_t size, const char *site)
@@ -683,6 +732,17 @@ col_rel_reservation_rollback(wl_columnar_memory_reservation_t *reservation)
 {
     if (!reservation)
         return;
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    if (wl_columnar_relation_test_watch_rollback_cleanup) {
+        wl_columnar_relation_test_rollback_cleanup_observed
+            = wl_columnar_relation_test_resize_columns_retired
+            && reservation->bytes != 0
+            && atomic_load_explicit(&reservation->state,
+                memory_order_acquire)
+            == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED;
+        wl_columnar_relation_test_watch_rollback_cleanup = false;
+    }
+#endif
     col_rel_release_reservation_or_abort(reservation);
 }
 
@@ -742,6 +802,12 @@ col_rel_publish_retained_reservation(col_rel_t *r,
         return EINVAL;
     if (!r->memory_governor || bytes == 0)
         return 0;
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    if (wl_columnar_relation_test_fail_reservation_commit) {
+        wl_columnar_relation_test_fail_reservation_commit = false;
+        return ENOMEM;
+    }
+#endif
     if (!wl_columnar_memory_commit(pending, r))
         return ENOMEM;
     old_bytes = r->retained_reserved_bytes;
@@ -788,6 +854,32 @@ col_rel_release_retired_reservation(
     wl_columnar_memory_reservation_t *previous)
 {
     col_rel_release_reservation_or_abort(previous);
+}
+
+static bool
+wl_columnar_relation_compaction_rollback_replacement(
+    wl_columnar_memory_reservation_t *reservation)
+{
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    if (wl_columnar_relation_test_fail_compact_rollback) {
+        wl_columnar_relation_test_fail_compact_rollback = false;
+        return false;
+    }
+#endif
+    return wl_columnar_memory_rollback_replacement(reservation);
+}
+
+static bool
+wl_columnar_relation_compaction_commit_replacement(
+    wl_columnar_memory_reservation_t *reservation)
+{
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    if (wl_columnar_relation_test_fail_compact_commit) {
+        wl_columnar_relation_test_fail_compact_commit = false;
+        return false;
+    }
+#endif
+    return wl_columnar_memory_commit_replacement(reservation);
 }
 
 /* Reserve the complete private shape of an ownership transition.  The
@@ -904,9 +996,10 @@ col_rel_grow_owned_transition_impl(col_rel_t *r, uint32_t new_cap,
     return 0;
 
 fail:
-    col_rel_reservation_rollback(&pending);
     col_columns_free(new_columns, r->ncols);
     free(new_timestamps);
+    wl_columnar_relation_test_note_resize_columns_retired();
+    col_rel_reservation_rollback(&pending);
     return ENOMEM;
 }
 
@@ -1002,13 +1095,14 @@ col_rel_cow_unshare_impl(col_rel_t *r, uint32_t new_cap,
     return 0;
 
 fail:
-    col_rel_reservation_rollback(&pending);
     if (private_cols) {
         int64_t **cursor = private_cols;
         for (uint32_t c = 0; c < r->ncols; c++, cursor++)
             free(*cursor); /* NOLINT(clang-analyzer-security.ArrayBound) */
         free((void *)private_cols);
     }
+    wl_columnar_relation_test_note_resize_columns_retired();
+    col_rel_reservation_rollback(&pending);
     return ENOMEM;
 }
 
@@ -2185,9 +2279,10 @@ col_rel_reserve_capacity_admitted(col_rel_t *r, uint32_t new_cap,
         if (admitted && pending_rc > 0
             && col_rel_publish_retained_reservation(r, &pending, bytes,
             &previous) != 0) {
-            col_rel_reservation_rollback(&pending);
             col_columns_free(new_cols, r->ncols);
             free(new_ts);
+            wl_columnar_relation_test_note_resize_columns_retired();
+            col_rel_reservation_rollback(&pending);
             return ENOMEM;
         }
         col_rel_publish_resize(r, new_cols, new_ts, target);
@@ -2355,9 +2450,10 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
             if (admitted && pending_rc > 0
                 && col_rel_publish_retained_reservation(r, &pending,
                 new_bytes, &previous) != 0) {
-                col_rel_reservation_rollback(&pending);
                 col_columns_free(new_cols, r->ncols);
                 free(new_ts);
+                wl_columnar_relation_test_note_resize_columns_retired();
+                col_rel_reservation_rollback(&pending);
                 goto enomem;
             }
             col_rel_publish_resize(r, new_cols, new_ts, new_cap);
@@ -2504,9 +2600,10 @@ col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
     if (admitted && pending_rc > 0
         && col_rel_publish_retained_reservation(r, &pending, new_bytes,
         &previous) != 0) {
-        col_rel_reservation_rollback(&pending);
         col_columns_free(new_cols, r->ncols);
         free(new_ts);
+        wl_columnar_relation_test_note_resize_columns_retired();
+        col_rel_reservation_rollback(&pending);
         return ENOMEM;
     }
     col_rel_publish_resize(r, new_cols, new_ts, new_cap);
@@ -2725,7 +2822,6 @@ wl_columnar_relation_delta_restore_flat_impl(col_rel_t *rel,
     rel->run_ends[0] = nrows;
     wl_columnar_relation_delta_ledger_columns(rel, before);
     wl_columnar_relation_touch_replacement(rel);
-    col_rel_release_retired_reservation(&previous);
     if (old_columns) {
         if (!old_arena_owned)
             for (uint32_t c = 0; c < rel->ncols; c++)
@@ -2734,6 +2830,11 @@ wl_columnar_relation_delta_restore_flat_impl(col_rel_t *rel,
         free((void *)old_columns);
         free(old_col_shared);
     }
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    if (old_columns && wl_columnar_relation_test_after_retired_storage_free)
+        wl_columnar_relation_test_after_retired_storage_free(rel);
+#endif
+    col_rel_release_retired_reservation(&previous);
     rc = 0;
 done:
     if (columns)
@@ -3200,7 +3301,7 @@ col_rel_compact_impl(col_rel_t *r,
                 rc = EBUSY;
                 goto free_merge_buf;
             }
-            if (!wl_columnar_memory_commit_replacement(
+            if (!wl_columnar_relation_compaction_commit_replacement(
                     &r->retained_reservation)) {
                 rc = EFAULT;
                 goto free_merge_buf;
@@ -3253,7 +3354,7 @@ col_rel_compact_impl(col_rel_t *r,
         bool old_arena_owned = r->arena_owned;
         if (col_rel_prepare_resize(r, tight, &new_cols, &new_ts) != 0) {
             if (replacement_started
-                && !wl_columnar_memory_rollback_replacement(
+                && !wl_columnar_relation_compaction_rollback_replacement(
                     &r->retained_reservation))
                 rc = EAGAIN;
             goto free_merge_buf;
@@ -3290,9 +3391,9 @@ col_rel_compact_impl(col_rel_t *r,
              * conservative upper bound for the newly published storage.  A
              * failed rollback leaves the token in REPLACING, which is
              * intentionally retained for a later retry. */
-            if (!wl_columnar_memory_commit_replacement(
+            if (!wl_columnar_relation_compaction_commit_replacement(
                     &r->retained_reservation)) {
-                if (!wl_columnar_memory_rollback_replacement(
+                if (!wl_columnar_relation_compaction_rollback_replacement(
                         &r->retained_reservation))
                     rc = EAGAIN;
                 else

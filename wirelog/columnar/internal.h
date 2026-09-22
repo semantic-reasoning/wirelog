@@ -569,10 +569,18 @@ extern wl_columnar_set_transition_hook_t wl_columnar_set_transition_hook;
 #ifdef WL_TEST_RELATION_RESIZE_HOOK
 /* Test-only seam for forcing the private resize preparation to fail. */
 extern bool wl_columnar_relation_test_fail_prepare_resize;
+extern void (*wl_columnar_relation_test_after_retired_storage_free)(
+    const col_rel_t *);
 void wl_columnar_relation_test_fail_next_prepare_resize(void);
-void wl_columnar_relation_test_clear_prepare_resize(void);
+void wl_columnar_relation_test_fail_next_reservation_commit(void);
+void wl_columnar_relation_test_watch_next_rollback_cleanup(void);
+bool wl_columnar_relation_test_rollback_cleanup_was_ordered(void);
+void wl_columnar_relation_test_fail_next_compact_rollback(void);
+void wl_columnar_relation_test_fail_next_compact_commit(void);
 void wl_columnar_relation_test_fail_next_governed_copy_payload_alloc(void);
+void wl_columnar_relation_test_clear_prepare_resize(void);
 void wl_columnar_relation_test_fail_next_commit_publication(void);
+void wl_columnar_memory_governor_test_refuse_next_release(void);
 int wl_columnar_relation_test_commit_replacement_locked(col_rel_t *dst,
     col_rel_replacement_t *replacement);
 #endif

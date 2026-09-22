@@ -19,6 +19,9 @@
 #endif
 
 static int failures;
+static uint64_t overwrite_expected_peak;
+static uint64_t overwrite_expected_live;
+static unsigned overwrite_retirement_witnesses;
 
 #define CHECK(condition, message) do { \
             if (!(condition)) { \
@@ -26,6 +29,19 @@ static int failures;
                 failures++; \
             } \
 } while (0)
+
+static void
+observe_overwrite_retirement(const col_rel_t *rel)
+{
+    overwrite_retirement_witnesses++;
+    CHECK(rel && rel->memory_governor
+        && rel->retained_reserved_bytes == overwrite_expected_live
+        && col_rel_owned_ledger_bytes(rel) == overwrite_expected_live
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(rel->memory_governor))
+        == overwrite_expected_peak,
+        "overwrite frees old physical storage before releasing its token");
+}
 
 static void
 make_resolution(wl_columnar_memory_resolution_t *resolution,
@@ -1313,6 +1329,169 @@ test_relation_retirement_rejects_borrowed_ownership(void)
     wl_arena_free(arena);
 }
 
+static void
+test_governed_delta_restore_overwrite_order(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    make_resolution(&resolution, 1024 * 1024);
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    col_rel_t *rel = col_rel_new_auto("restore-overwrite", 1);
+    int64_t old_value = 7;
+    int64_t restored[100];
+    CHECK(ref && rel, "overwrite fixture setup");
+    if (!ref || !rel) goto cleanup;
+    CHECK(col_rel_append_row(rel, &old_value) == 0,
+        "overwrite seed row");
+    CHECK(col_rel_attach_memory_governor(rel, ref) == 0
+        && col_rel_reserve_capacity_admitted(rel, rel->capacity, NULL) == 0,
+        "overwrite old storage admission");
+    for (uint32_t i = 0; i < 100; i++) restored[i] = (int64_t)i + 100;
+    overwrite_expected_peak = rel->retained_reserved_bytes
+        + sizeof(restored);
+    overwrite_expected_live = sizeof(restored);
+    overwrite_retirement_witnesses = 0;
+    wl_columnar_relation_test_after_retired_storage_free =
+        observe_overwrite_retirement;
+    CHECK(wl_columnar_relation_delta_restore_flat_overwrite(rel,
+        rel->relation_identity, restored, 100, 1) == 0,
+        "governed delta overwrite succeeds");
+    wl_columnar_relation_test_after_retired_storage_free = NULL;
+    CHECK(overwrite_retirement_witnesses == 1
+        && rel->capacity == 100 && rel->nrows == 100
+        && rel->columns[0][0] == 100 && rel->columns[0][99] == 199
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == sizeof(restored),
+        "overwrite installs complete rows and releases retired charge once");
+cleanup:
+    wl_columnar_relation_test_after_retired_storage_free = NULL;
+    col_rel_destroy(rel);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "overwrite reservation teardown balanced");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_resize_allocation_cleanup_precedes_rollback(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    make_resolution(&resolution, 1024 * 1024);
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    col_rel_t *rel = col_rel_new_auto("resize-rollback-order", 1);
+    int64_t value = 11;
+    CHECK(ref && rel, "resize rollback fixture setup");
+    if (!ref || !rel) goto cleanup;
+    CHECK(col_rel_append_row(rel, &value) == 0
+        && col_rel_attach_memory_governor(rel, ref) == 0
+        && col_rel_reserve_capacity_admitted(rel, rel->capacity, NULL) == 0,
+        "resize rollback fixture admitted");
+    uint64_t baseline = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+    wl_columnar_relation_test_watch_next_rollback_cleanup();
+    wl_columnar_relation_test_fail_next_reservation_commit();
+    CHECK(col_rel_reserve_capacity_admitted(rel, rel->capacity + 1, NULL)
+        == ENOMEM,
+        "injected reservation publication refusal after resize allocation");
+    CHECK(wl_columnar_relation_test_rollback_cleanup_was_ordered()
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == baseline
+        && rel->capacity == COL_REL_INIT_CAP && rel->nrows == 1
+        && rel->columns[0][0] == value,
+        "private columns retire before pending rollback restores credit");
+cleanup:
+    col_rel_destroy(rel);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "resize rollback fixture reservation balanced");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_cow_private_cleanup_precedes_rollback(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    make_resolution(&resolution, 1024 * 1024);
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    col_rel_t *source = NULL;
+    col_rel_t *view = ref ? make_shared_view(ref, &source) : NULL;
+    CHECK(ref && source && view, "COW rollback fixture setup");
+    if (!ref || !source || !view) goto cleanup;
+    wl_columnar_relation_test_watch_next_rollback_cleanup();
+    wl_columnar_relation_test_fail_next_reservation_commit();
+    CHECK(col_rel_cow_unshare(view, 0) == ENOMEM,
+        "injected COW publication refusal");
+    CHECK(wl_columnar_relation_test_rollback_cleanup_was_ordered()
+        && view->col_shared && view->col_shared[0]
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0,
+        "private COW column retires before pending rollback");
+cleanup:
+    col_rel_destroy(view);
+    col_rel_destroy(source);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "COW rollback fixture reservation balanced");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+#ifndef _WIN32
+static void
+test_terminal_release_policy_child(bool retired_release)
+{
+    pid_t child = fork();
+    CHECK(child >= 0, "terminal release test fork");
+    if (child < 0) return;
+    if (child == 0) {
+        wl_columnar_memory_resolution_t resolution;
+        make_resolution(&resolution, 1024 * 1024);
+        wl_columnar_memory_governor_ref_t *ref =
+            wl_columnar_memory_governor_ref_create(&resolution);
+        col_rel_t *rel = col_rel_new_auto("terminal-release", 1);
+        int64_t value = 3;
+        if (!ref || !rel || col_rel_append_row(rel, &value) != 0
+            || col_rel_attach_memory_governor(rel, ref) != 0
+            || col_rel_reserve_capacity_admitted(rel, rel->capacity,
+            NULL) != 0)
+            _exit(10);
+        if (retired_release) {
+            int64_t rows[100];
+            for (uint32_t i = 0; i < 100; i++) rows[i] = i;
+            wl_columnar_memory_governor_test_refuse_next_release();
+            (void)wl_columnar_relation_delta_restore_flat_overwrite(rel,
+                rel->relation_identity, rows, 100, 1);
+        } else {
+            wl_columnar_relation_test_fail_next_prepare_resize();
+            wl_columnar_memory_governor_test_refuse_next_release();
+            (void)col_rel_reserve_capacity_admitted(rel,
+                rel->capacity * 2, NULL);
+        }
+        _exit(0);
+    }
+    int status = 0;
+    CHECK(waitpid(child, &status, 0) == child
+        && WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT,
+        retired_release
+            ? "retired release refusal follows terminal policy"
+            : "pending rollback refusal follows terminal policy");
+}
+
+static void
+test_terminal_release_policy(void)
+{
+    test_terminal_release_policy_child(false);
+    test_terminal_release_policy_child(true);
+}
+#endif
+
 int
 main(void)
 {
@@ -1321,6 +1500,12 @@ main(void)
     test_physical_timestamp_capacity();
     test_cow_retained_timestamp_capacity_admission();
     test_governed_pool_clone_fallback();
+    test_governed_delta_restore_overwrite_order();
+    test_resize_allocation_cleanup_precedes_rollback();
+    test_cow_private_cleanup_precedes_rollback();
+#ifndef _WIN32
+    test_terminal_release_policy();
+#endif
     test_relation_retirement_token();
     test_relation_retirement_rejects_borrowed_ownership();
     test_cow_exact_fit_and_denial();

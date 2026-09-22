@@ -1340,3 +1340,23 @@ defines charge-before-work accounting, retry/publication obligations and future
 256-unit checkpoints. These are not additional memory-governor reservations,
 RSS limits or wall-clock deadlines. #1820–#1823 implement recovery, engine
 coverage and public access; #1824 validates the combined behavior.
+
+# Relation replacement ordering and recovery
+
+Relation growth, copy-on-write, delta overwrite, and compaction keep the old
+storage charge until the old physical buffers have been retired. A prepared
+replacement is admitted before publication; if preparation or publication
+fails, private replacement buffers are freed before the pending reservation
+is rolled back. On successful overwrite, the replacement is published, old
+columns are freed, and only then is the old reservation released. This keeps
+reusable budget from becoming visible while the corresponding allocation is
+still resident.
+
+Ordinary reservation-release refusal is terminal: the relation cannot safely
+return with a live token whose accounting state is unknown, so that path
+aborts rather than pretending the operation rolled back. Compaction has a
+retryable exception because its replacement token is owned by the relation.
+If commit and rollback both refuse, compaction returns `EAGAIN` and retains
+the valid relation storage plus its `REPLACING` token. A later compaction call
+resolves that token before reporting success; callers must preserve the
+relation and its governor until that retry or checked teardown completes.
