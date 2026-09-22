@@ -5499,7 +5499,8 @@ tdd_owner_build_candidate(col_rel_t *target, const char *name,
          * schema-less IDB: the first accepted delta supplies its schema.
          * The target has no rows to carry over, so building from the input
          * also preserves its complete logical metadata. */
-        candidate = col_rel_new_like(name, source);
+        candidate = wl_columnar_relation_new_like_governed(name, source,
+                governor ? governor : source->memory_governor);
         if (!candidate)
             return ENOMEM;
         if (target->timestamps && col_rel_enable_timestamps(candidate) != 0) {
@@ -5507,7 +5508,8 @@ tdd_owner_build_candidate(col_rel_t *target, const char *name,
             return ENOMEM;
         }
     } else if (target && preserve_target_rows) {
-        rc = col_rel_deep_copy(target, &candidate, NULL);
+        rc = wl_columnar_relation_deep_copy_governed(target, &candidate,
+                governor ? governor : target->memory_governor);
         if (rc != 0)
             return rc;
         free(candidate->name);
@@ -5517,8 +5519,8 @@ tdd_owner_build_candidate(col_rel_t *target, const char *name,
             return ENOMEM;
         }
     } else if (source) {
-        candidate = target ? col_rel_new_like(name, source)
-            : wl_columnar_relation_new_like_governed(name, source, governor);
+        candidate = wl_columnar_relation_new_like_governed(name, source,
+                governor ? governor : source->memory_governor);
         if (!candidate)
             return ENOMEM;
         if (target && target->timestamps
@@ -5714,8 +5716,10 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
         }
         if (!schema_source) {
             for (uint32_t w = 0; w < W; w++) {
-                col_rel_t *old = session_find_rel(&coord->tdd_workers[w],
-                        dname);
+                col_rel_t *old =
+                    wl_columnar_eval_owner_publication_find_rel_linear(
+                    &coord->tdd_workers[w],
+                    dname);
                 if (old) {
                     schema_source = old;
                     ncols = old->ncols;
@@ -5751,7 +5755,8 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
                 goto fail;
             tdd_dedup_rel(combined);
         }
-        col_rel_t *coord_idb = session_find_rel(coord, rel_name);
+        col_rel_t *coord_idb =
+            wl_columnar_eval_owner_publication_find_rel_linear(coord, rel_name);
         if (coord_idb && combined->nrows > 0) {
             if (coord_idb->ncols != 0
                 && !tdd_relation_schema_compatible(coord_idb, combined)) {
@@ -5817,7 +5822,9 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
         }
         for (uint32_t w = 0; w < W; w++) {
             wl_col_session_t *worker = &coord->tdd_workers[w];
-            col_rel_t *widb = session_find_rel(worker, rel_name);
+            col_rel_t *widb =
+                wl_columnar_eval_owner_publication_find_rel_linear(worker,
+                    rel_name);
             col_rel_t *part = parts[w];
             if (widb && part && part->nrows > 0) {
                 col_rel_t *candidate = NULL;
@@ -5833,7 +5840,9 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
                     goto fail;
                 }
             }
-            col_rel_t *old_delta = session_find_rel(worker, dname);
+            col_rel_t *old_delta =
+                wl_columnar_eval_owner_publication_find_rel_linear(worker,
+                    dname);
             /* Preserve the old empty-partition behavior: a worker with no
              * prior delta and no rows must not receive a synthetic empty
              * relation.  Existing deltas still get an empty replacement so
