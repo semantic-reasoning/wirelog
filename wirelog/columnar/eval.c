@@ -278,29 +278,6 @@ wl_columnar_eval_tdd_owner_lifetime_dispose_slots(
     return 0;
 }
 
-static int
-wl_columnar_eval_tdd_owner_lifetime_dispose_slot(wl_col_session_t *coord,
-    col_rel_t **slot)
-{
-    if (!coord || !slot)
-        return EINVAL;
-    if (!*slot)
-        return 0;
-    if (!coord->tdd_owner_lifetime)
-        return EINVAL;
-    size_t total = coord->tdd_owner_lifetime->matrix_slots
-        + coord->tdd_owner_lifetime->overflow_slots;
-    for (size_t i = 0; i < total; i++) {
-        if (&coord->tdd_owner_lifetime->relations[i] != slot
-            && coord->tdd_owner_lifetime->relations[i] == *slot)
-            coord->tdd_owner_lifetime->relations[i] = NULL;
-    }
-    int rc = col_rel_destroy_checked(*slot);
-    if (rc == 0)
-        *slot = NULL;
-    return rc;
-}
-
 #define WL_COLUMNAR_EVAL_DEDUP_ROW_HASH wl_columnar_eval_dedup_row_hash
 #define WL_COLUMNAR_EVAL_DEDUP_SET_INSERT wl_columnar_eval_dedup_set_insert
 #define WL_COLUMNAR_EVAL_DEDUP_SET_CONTAINS wl_columnar_eval_dedup_set_contains
@@ -1663,28 +1640,6 @@ tdd_seed_global_read_initial_deltas(const wl_plan_stratum_t *sp,
  */
 static int bdx_hash_diff(col_rel_t *delta, const col_rel_t *base);
 static int tdd_hashset_diff(col_rel_t *delta, const col_rel_t *base);
-static int
-tdd_install_empty_delta_on_workers(wl_col_session_t *coord,
-    const char *dname, uint32_t ncols, uint32_t W)
-{
-    for (uint32_t w = 0; w < W; w++) {
-        col_rel_t *empty = col_rel_new_auto(dname, ncols);
-        if (!empty)
-            return ENOMEM;
-        int rc = session_add_rel(&coord->tdd_workers[w], empty);
-        if (rc != 0) {
-            if (getenv("WIRELOG_TDD_GLOBAL_READ_DEBUG")) {
-                fprintf(stderr,
-                    "TDD install empty delta error rel=%s worker=%u cols=%u rc=%d\n",
-                    dname, w, ncols, rc);
-            }
-            col_rel_destroy(empty);
-            return rc;
-        }
-    }
-    return 0;
-}
-
 typedef struct {
     wl_col_session_t *worker;
     col_rel_t *prior;
@@ -5521,7 +5476,8 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
 
 static int
 tdd_owner_build_candidate(col_rel_t *target, const char *name,
-    col_rel_t *const *inputs, uint32_t input_count, col_rel_t **out)
+    col_rel_t *const *inputs, uint32_t input_count, bool preserve_target_rows,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out)
 {
     col_rel_t *source = target;
     col_rel_t *candidate = NULL;
@@ -5531,7 +5487,7 @@ tdd_owner_build_candidate(col_rel_t *target, const char *name,
     *out = NULL;
     if (!source || source->ncols == 0) {
         for (uint32_t i = 0; i < input_count; i++) {
-            if (inputs[i] && inputs[i]->nrows > 0) {
+            if (inputs[i] && inputs[i]->ncols > 0) {
                 source = inputs[i];
                 break;
             }
@@ -5549,7 +5505,7 @@ tdd_owner_build_candidate(col_rel_t *target, const char *name,
             col_rel_destroy(candidate);
             return ENOMEM;
         }
-    } else if (target) {
+    } else if (target && preserve_target_rows) {
         rc = col_rel_deep_copy(target, &candidate, NULL);
         if (rc != 0)
             return rc;
@@ -5560,13 +5516,24 @@ tdd_owner_build_candidate(col_rel_t *target, const char *name,
             return ENOMEM;
         }
     } else if (source) {
-        candidate = col_rel_new_like(name, source);
+        candidate = target ? col_rel_new_like(name, source)
+            : wl_columnar_relation_new_like_governed(name, source, governor);
         if (!candidate)
             return ENOMEM;
+        if (target && target->timestamps
+            && col_rel_enable_timestamps(candidate) != 0) {
+            col_rel_destroy(candidate);
+            return ENOMEM;
+        }
     } else {
         candidate = col_rel_new_auto(name, 0);
         if (!candidate)
             return ENOMEM;
+        if (!target && governor
+            && col_rel_attach_memory_governor(candidate, governor) != 0) {
+            col_rel_destroy(candidate);
+            return ENOMEM;
+        }
     }
     for (uint32_t i = 0; i < input_count; i++) {
         if (!inputs[i] || inputs[i]->nrows == 0)
@@ -5581,8 +5548,118 @@ tdd_owner_build_candidate(col_rel_t *target, const char *name,
             return rc;
         }
     }
+    if (target && target->dedup_slots) {
+        rc = WL_COLUMNAR_EVAL_DEDUP_SET_INIT_FROM_REL(candidate);
+        if (rc != 0) {
+            col_rel_destroy(candidate);
+            return rc;
+        }
+    }
     *out = candidate;
     return 0;
+}
+
+#ifdef WL_TEST_OWNER_PUBLICATION
+int
+wl_columnar_eval_test_owner_build_candidate(col_rel_t *target,
+    const char *name, col_rel_t *const *inputs, uint32_t input_count,
+    bool preserve_target_rows, col_rel_t **out)
+{
+    return tdd_owner_build_candidate(target, name, inputs, input_count,
+               preserve_target_rows, NULL, out);
+}
+#endif
+
+typedef struct {
+    col_rel_t *relation;
+    wl_columnar_relation_retirement_token_t token;
+} tdd_owner_input_retirement_t;
+
+static int
+tdd_owner_prepare_input_retirements(wl_col_session_t *coord,
+    col_eval_tdd_worker_ctx_t *ctxs, uint32_t workers, uint32_t nrels,
+    tdd_owner_input_retirement_t **out, size_t *out_count)
+{
+    tdd_owner_input_retirement_t *entries;
+    size_t count;
+    int rc;
+
+    if (!coord || !ctxs || !out || !out_count)
+        return EINVAL;
+    *out = NULL;
+    *out_count = 0;
+    rc = wl_columnar_eval_tdd_matrix_size(workers, nrels, sizeof(*entries),
+            &count);
+    if (rc != 0 || count == 0)
+        return rc;
+    entries = calloc(count, sizeof(*entries));
+    if (!entries)
+        return ENOMEM;
+    size_t used = 0;
+    for (uint32_t w = 0; w < workers; w++) {
+        for (uint32_t ri = 0; ri < nrels; ri++) {
+            col_rel_t *relation = ctxs[w].delta_rels[ri];
+            bool duplicate = false;
+            if (!relation)
+                continue;
+            for (size_t i = 0; i < used; i++) {
+                if (entries[i].relation == relation) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate)
+                continue;
+            entries[used].relation = relation;
+            wl_columnar_relation_retirement_init(&entries[used].token);
+            rc = wl_columnar_relation_retirement_prepare_transient(relation,
+                    &entries[used].token);
+            if (rc != 0)
+                goto fail;
+            used++;
+        }
+    }
+    *out = entries;
+    *out_count = used;
+    return 0;
+
+fail:
+    while (used > 0) {
+        used--;
+        int cancel_rc = wl_columnar_relation_retirement_cancel(
+            &entries[used].token);
+        if (cancel_rc != 0 && rc == 0)
+            rc = cancel_rc;
+    }
+    free(entries);
+    return rc;
+}
+
+static int
+tdd_owner_cancel_input_retirements(tdd_owner_input_retirement_t *entries,
+    size_t count)
+{
+    int first_rc = 0;
+    for (size_t i = count; i-- > 0; ) {
+        int rc = wl_columnar_relation_retirement_cancel(&entries[i].token);
+        if (rc != 0 && first_rc == 0)
+            first_rc = rc;
+    }
+    free(entries);
+    return first_rc;
+}
+
+static void
+tdd_owner_commit_input_retirements(col_eval_tdd_worker_ctx_t *ctxs,
+    uint32_t workers, uint32_t nrels,
+    tdd_owner_input_retirement_t *entries, size_t count)
+{
+    for (uint32_t w = 0; w < workers; w++)
+        for (uint32_t ri = 0; ri < nrels; ri++)
+            ctxs[w].delta_rels[ri] = NULL;
+    for (size_t i = 0; i < count; i++)
+        wl_columnar_relation_retirement_commit(&entries[i].token);
+    free(entries);
 }
 
 static int
@@ -5598,6 +5675,8 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
     col_rel_t *combined = NULL;
     col_rel_t **parts = NULL;
     col_rel_t **empty_inputs = NULL;
+    tdd_owner_input_retirement_t *retirements = NULL;
+    size_t retirement_count = 0;
     wl_columnar_eval_owner_publication_init(&txn);
     if (out_any_accepted)
         *out_any_accepted = false;
@@ -5642,9 +5721,17 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
                 }
             }
         }
-        combined = schema_source ? col_rel_new_like(dname, schema_source)
+        combined = schema_source
+            ? wl_columnar_relation_new_like_governed(dname, schema_source,
+                coord->memory_governor)
             : col_rel_new_auto(dname, ncols);
         if (!combined) {
+            rc = ENOMEM;
+            goto fail;
+        }
+        if (!schema_source && coord->memory_governor
+            && col_rel_attach_memory_governor(combined,
+            coord->memory_governor) != 0) {
             rc = ENOMEM;
             goto fail;
         }
@@ -5657,6 +5744,9 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
             }
         }
         if (combined->nrows > 1) {
+            rc = tdd_bdx_sort_candidate(combined);
+            if (rc != 0)
+                goto fail;
             tdd_dedup_rel(combined);
         }
         col_rel_t *coord_idb = session_find_rel(coord, rel_name);
@@ -5682,7 +5772,8 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
         if (accepted_rows > 0 && coord_idb) {
             col_rel_t *candidate = NULL;
             rc = tdd_owner_build_candidate(coord_idb, rel_name,
-                    (col_rel_t *const[]){ combined }, 1, &candidate);
+                    (col_rel_t *const[]){ combined }, 1, true,
+                    coord->memory_governor, &candidate);
             if (rc != 0)
                 goto fail;
             rc = wl_columnar_eval_owner_publication_add(&txn, coord, rel_name,
@@ -5727,7 +5818,8 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
             if (widb && part && part->nrows > 0) {
                 col_rel_t *candidate = NULL;
                 rc = tdd_owner_build_candidate(widb, rel_name,
-                        (col_rel_t *const[]){ part }, 1, &candidate);
+                        (col_rel_t *const[]){ part }, 1, true,
+                        worker->memory_governor, &candidate);
                 if (rc != 0)
                     goto fail;
                 rc = wl_columnar_eval_owner_publication_add(&txn, worker,
@@ -5746,7 +5838,8 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
                 col_rel_t *candidate = NULL;
                 empty_inputs[0] = part;
                 rc = tdd_owner_build_candidate(old_delta, dname,
-                        empty_inputs, 1, &candidate);
+                        empty_inputs, 1, false, worker->memory_governor,
+                        &candidate);
                 if (rc != 0)
                     goto fail;
                 rc = wl_columnar_eval_owner_publication_add(&txn, worker,
@@ -5772,24 +5865,37 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
 
     if (txn.count > 0) {
         rc = wl_columnar_eval_owner_publication_prepare(&txn);
-        if (rc == 0)
+        if (rc == 0) {
             rc = wl_columnar_eval_owner_publication_register(&txn);
-        if (rc == 0)
-            rc = wl_columnar_eval_owner_publication_commit(&txn);
+        }
     }
     if (rc != 0)
         goto fail;
-    for (uint32_t w = 0; w < W; w++)
-        for (uint32_t ri = 0; ri < nrels; ri++)
-            (void)wl_columnar_eval_tdd_owner_lifetime_dispose_slot(coord,
-                &ctxs[w].delta_rels[ri]);
+    rc = tdd_owner_prepare_input_retirements(coord, ctxs, W, nrels,
+            &retirements, &retirement_count);
+    if (rc != 0)
+        goto fail;
+    if (txn.count > 0) {
+        rc = wl_columnar_eval_owner_publication_commit(&txn);
+    }
+    if (rc != 0)
+        goto fail;
+    for (uint32_t i = 0; i < txn.count; i++)
+        col_session_invalidate_arrangements(&txn.entries[i].session->base,
+            txn.entries[i].name);
+    tdd_owner_commit_input_retirements(ctxs, W, nrels, retirements,
+        retirement_count);
+    retirements = NULL;
+    retirement_count = 0;
     if (out_any_accepted)
         *out_any_accepted = any_accepted;
     if (out_accepted_rows)
         *out_accepted_rows = accepted_total;
     /* Commit transfers published candidates and replacement state; release
      * the transaction container itself without touching published objects. */
-    (void)wl_columnar_eval_owner_publication_discard(&txn);
+    rc = wl_columnar_eval_owner_publication_discard(&txn);
+    if (rc != 0)
+        abort();
     return 0;
 
 fail:
@@ -5800,11 +5906,15 @@ fail:
     free(parts);
     free(empty_inputs);
     col_rel_destroy(combined);
-    (void)wl_columnar_eval_owner_publication_discard(&txn);
-    for (uint32_t w = 0; w < W; w++)
-        for (uint32_t ri = 0; ri < nrels; ri++)
-            (void)wl_columnar_eval_tdd_owner_lifetime_dispose_slot(coord,
-                &ctxs[w].delta_rels[ri]);
+    {
+        int cancel_rc = tdd_owner_cancel_input_retirements(retirements,
+                retirement_count);
+        int discard_rc = wl_columnar_eval_owner_publication_discard(&txn);
+        if (cancel_rc != 0)
+            return cancel_rc;
+        if (discard_rc != 0)
+            return discard_rc;
+    }
     return rc;
 }
 

@@ -2310,6 +2310,58 @@ owner_publication_candidate(const char *name, int64_t value)
     return candidate;
 }
 
+static int
+test_owner_exchange_candidate_contract(void)
+{
+    col_rel_t *old_delta = owner_publication_candidate("$d$output", 7);
+    col_rel_t *part = owner_publication_candidate("$d$output", 9);
+    col_rel_t *candidate = NULL;
+    col_rel_t *empty_idb = col_rel_new_auto("output", 0);
+    col_rel_t *wide = owner_publication_candidate("output", 11);
+    col_rel_t *typed = owner_publication_candidate("output", 13);
+    const char *failure = NULL;
+#define CANDIDATE_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    CANDIDATE_CHECK(old_delta && part && empty_idb && wide && typed,
+        "candidate fixture allocation");
+    CANDIDATE_CHECK(wl_columnar_eval_test_owner_build_candidate(old_delta,
+        "$d$output", (col_rel_t *const[]){ part }, 1, false,
+        &candidate) == 0 && candidate && candidate->nrows == 1
+        && col_rel_get(candidate, 0, 0) == 9 && old_delta->nrows == 1
+        && col_rel_get(old_delta, 0, 0) == 7,
+        "delta replacement retained old rows");
+    col_rel_destroy(candidate);
+    candidate = NULL;
+    CANDIDATE_CHECK(wl_columnar_eval_test_owner_build_candidate(empty_idb,
+        "output", (col_rel_t *const[]){ wide }, 1, true,
+        &candidate) == 0 && candidate && candidate->ncols == 1
+        && candidate->nrows == 1 && col_rel_get(candidate, 0, 0) == 11,
+        "empty IDB did not adopt a positive-width schema");
+    col_rel_destroy(candidate);
+    candidate = NULL;
+    typed->column_types = malloc(sizeof(*typed->column_types));
+    CANDIDATE_CHECK(typed->column_types, "typed input allocation");
+    typed->column_types[0] = WIRELOG_TYPE_FLOAT;
+    CANDIDATE_CHECK(wl_columnar_eval_test_owner_build_candidate(old_delta,
+        "$d$output", (col_rel_t *const[]){ typed }, 1, false,
+        &candidate) == EINVAL && !candidate && old_delta->nrows == 1
+        && col_rel_get(old_delta, 0, 0) == 7,
+        "incompatible schema did not preserve the published input");
+cleanup:
+    col_rel_destroy(candidate);
+    col_rel_destroy(typed);
+    col_rel_destroy(wide);
+    col_rel_destroy(empty_idb);
+    col_rel_destroy(part);
+    col_rel_destroy(old_delta);
+    if (failure) {
+        fprintf(stderr, "owner exchange candidate fixture: %s\n", failure);
+        return 1;
+    }
+    return 0;
+#undef CANDIDATE_CHECK
+}
+
 static void
 owner_publication_session_cleanup(wl_col_session_t *session)
 {
@@ -4523,6 +4575,11 @@ main(void)
     test_tdd_merge_schema_mismatch_rollback();
 #endif
 #ifdef WL_TEST_OWNER_PUBLICATION
+    TEST("owner exchange candidate replacement and rollback contract");
+    if (test_owner_exchange_candidate_contract() == 0)
+        PASS();
+    else
+        FAIL("owner exchange candidate contract");
     TEST("owner publication preserves populated hashless registries");
     if (test_owner_publication_hashless_registry() == 0)
         PASS();

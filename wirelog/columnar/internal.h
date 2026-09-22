@@ -538,6 +538,7 @@ typedef struct wl_columnar_relation_retirement_token {
     col_rel_t *relation;
     wl_columnar_source_access_writer_t descriptor_writer;
     wl_columnar_source_access_writer_t source_writer;
+    bool transient_backing_allowed;
 } wl_columnar_relation_retirement_token_t;
 
 /* A private, fully staged publication for a canonical relation.  The staged
@@ -2135,6 +2136,10 @@ int
 wl_columnar_eval_owner_publication_discard(
     wl_columnar_eval_owner_publication_txn_t *txn);
 #ifdef WL_TEST_OWNER_PUBLICATION
+int
+wl_columnar_eval_test_owner_build_candidate(col_rel_t *target,
+    const char *name, col_rel_t *const *inputs, uint32_t input_count,
+    bool preserve_target_rows, col_rel_t **out);
 void
 wl_columnar_eval_test_owner_publication_fail_registration(
     wl_col_session_t *session, const char *name);
@@ -2293,6 +2298,12 @@ wl_columnar_relation_retirement_init(
     wl_columnar_relation_retirement_token_t *token);
 int
 wl_columnar_relation_retirement_prepare(col_rel_t *relation,
+    wl_columnar_relation_retirement_token_t *token);
+/* Owner-evaluator delta slots may use pool or arena backing.  This variant
+ * holds the same terminal writers but permits those transient descriptors;
+ * commit leaves pool slots as inert tombstones and never frees arena data. */
+int
+wl_columnar_relation_retirement_prepare_transient(col_rel_t *relation,
     wl_columnar_relation_retirement_token_t *token);
 int
 wl_columnar_relation_retirement_cancel(
