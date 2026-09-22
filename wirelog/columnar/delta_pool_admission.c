@@ -48,15 +48,29 @@ delta_pool_t *
 delta_pool_create_managed(uint32_t max_slots, size_t slot_size,
     size_t arena_bytes, wl_columnar_memory_governor_t *governor)
 {
+    return delta_pool_create_managed_status(max_slots, slot_size, arena_bytes,
+               governor, NULL);
+}
+
+delta_pool_t *
+delta_pool_create_managed_status(uint32_t max_slots, size_t slot_size,
+    size_t arena_bytes, wl_columnar_memory_governor_t *governor,
+    wl_columnar_memory_admission_status_t *status_out)
+{
     wl_delta_pool_admission_t *admission;
     wl_columnar_memory_admission_status_t status;
     delta_pool_t *pool;
     uint64_t footprint;
 
+    if (status_out)
+        *status_out = WL_COLUMNAR_MEMORY_ADMISSION_OK;
     if (!governor)
         return delta_pool_create(max_slots, slot_size, arena_bytes);
-    if (!delta_pool_footprint(max_slots, slot_size, arena_bytes, &footprint))
+    if (!delta_pool_footprint(max_slots, slot_size, arena_bytes, &footprint)) {
+        if (status_out)
+            *status_out = WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW;
         return NULL;
+    }
     admission = (wl_delta_pool_admission_t *)malloc(sizeof(*admission));
     if (!admission)
         return NULL;
@@ -65,6 +79,8 @@ delta_pool_create_managed(uint32_t max_slots, size_t slot_size,
             &admission->reservation);
     if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
         && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+        if (status_out)
+            *status_out = status;
         free(admission);
         return NULL;
     }
