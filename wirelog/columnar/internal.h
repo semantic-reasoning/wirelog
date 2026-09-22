@@ -2045,6 +2045,9 @@ typedef struct wl_col_session_t {
     bool teardown_reported;
 } wl_col_session_t;
 
+typedef struct wl_columnar_session_hash_registry_image
+    wl_columnar_session_hash_registry_image_t;
+
 /* Standalone owner-publication transaction.  Candidates are owned by the
  * transaction after a successful add; on an add failure the caller retains
  * candidate ownership.  Published sessions and input relations are never
@@ -2057,13 +2060,15 @@ typedef struct wl_columnar_eval_owner_publication_entry {
     col_rel_t *candidate;
     col_rel_replacement_t replacement;
     bool replacement_prepared;
-    bool registered;
 } wl_columnar_eval_owner_publication_entry_t;
 
 typedef struct wl_columnar_eval_owner_publication_txn {
     wl_columnar_eval_owner_publication_entry_t *entries;
     uint32_t count;
     uint32_t capacity;
+    wl_columnar_session_hash_registry_image_t *registry_images;
+    uint32_t registry_image_count;
+    bool registry_images_prepared;
     bool prepared;
 } wl_columnar_eval_owner_publication_txn_t;
 
@@ -2083,16 +2088,14 @@ wl_columnar_eval_owner_publication_register(
 /* The caller must provide exclusive, quiescent access to every participating
  * session, target, and candidate from the first add through commit or
  * discard. Successful add transfers candidate ownership to the transaction;
- * prepare may consume candidates for existing targets, while registered
- * candidates transfer to their session at commit. This standalone builder is
- * not wired into exchange modes yet. Commit preflights every fallible
- * invariant before publishing; publication itself is no-fail. */
+ * prepare may consume candidates for existing targets. Registration prepares
+ * private registry/hash images without changing sessions; commit swaps those
+ * images and publishes replacements with no fallible work remaining. This
+ * standalone builder is not wired into exchange modes yet. */
 int
 wl_columnar_eval_owner_publication_commit(
     wl_columnar_eval_owner_publication_txn_t *txn);
-/* Discard is idempotent.  It returns the first session-removal error; in
- * particular, EBUSY means the session-owned relation was preserved and the
- * caller must release its busy lease before removing that relation. */
+/* Discard is idempotent and leaves published sessions unchanged. */
 int
 wl_columnar_eval_owner_publication_discard(
     wl_columnar_eval_owner_publication_txn_t *txn);
@@ -2107,6 +2110,11 @@ bool
 wl_columnar_eval_test_owner_publication_prepare_failure_hit(void);
 bool
 wl_columnar_eval_test_owner_publication_prepare_failure_followed_prepared(
+    void);
+bool
+wl_columnar_eval_test_owner_publication_registration_failure_hit(void);
+bool
+wl_columnar_eval_test_owner_publication_registration_failure_followed_image(
     void);
 #endif
 
@@ -2962,6 +2970,50 @@ int
 session_rel_hash_remove(wl_col_session_t *sess, uint32_t idx);
 void
 session_rel_free_hash(wl_col_session_t *sess);
+
+/* Private relation-registry image used by owner publication.  Preparation
+ * copies the current registry and builds its complete hash off to the side;
+ * publication validates the original identities and then swaps pointers
+ * without allocation. */
+struct wl_columnar_session_hash_registry_image {
+    wl_col_session_t *session;
+    col_rel_t **expected_rels;
+    uint32_t expected_nrels;
+    uint32_t expected_rel_cap;
+    uint32_t *expected_hash_head;
+    uint32_t *expected_hash_next;
+    uint32_t expected_hash_nbuckets;
+    uint32_t expected_hash_chain_cap;
+    col_rel_t **expected_rel_contents;
+    col_rel_t **rels;
+    uint32_t nrels;
+    uint32_t rel_cap;
+    uint32_t *hash_head;
+    uint32_t *hash_next;
+    uint32_t hash_nbuckets;
+    uint32_t hash_chain_cap;
+};
+
+int
+wl_columnar_session_hash_registry_image_prepare(wl_col_session_t *session,
+    col_rel_t *const *additions, uint32_t addition_count,
+    wl_columnar_session_hash_registry_image_t *image);
+int
+wl_columnar_session_hash_registry_image_validate(
+    const wl_columnar_session_hash_registry_image_t *image);
+void
+wl_columnar_session_hash_registry_image_publish(
+    wl_columnar_session_hash_registry_image_t *image);
+void
+wl_columnar_session_hash_registry_image_discard(
+    wl_columnar_session_hash_registry_image_t *image);
+#ifdef WL_TEST_OWNER_PUBLICATION
+void
+wl_columnar_session_hash_test_fail_registry_image_prepare(
+    wl_col_session_t *session);
+bool
+wl_columnar_session_hash_test_registry_image_prepare_failure_hit(void);
+#endif
 
 /* ======================================================================== */
 /* Arrangement Layer (columnar/arrangement.c)                               */

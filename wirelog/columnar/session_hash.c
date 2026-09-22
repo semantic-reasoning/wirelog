@@ -14,6 +14,7 @@
 
 #include "../wirelog-internal.h"
 
+#include <assert.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -205,4 +206,218 @@ session_rel_free_hash(wl_col_session_t *sess)
     sess->rel_hash_next = NULL;
     sess->rel_hash_nbuckets = 0;
     sess->rel_hash_chain_cap = 0;
+}
+
+#ifdef WL_TEST_OWNER_PUBLICATION
+static wl_col_session_t *wl_columnar_session_hash_fail_image_session;
+static bool wl_columnar_session_hash_fail_image_hit;
+
+void
+wl_columnar_session_hash_test_fail_registry_image_prepare(
+    wl_col_session_t *session)
+{
+    wl_columnar_session_hash_fail_image_session = session;
+    wl_columnar_session_hash_fail_image_hit = false;
+}
+
+bool
+wl_columnar_session_hash_test_registry_image_prepare_failure_hit(void)
+{
+    return wl_columnar_session_hash_fail_image_hit;
+}
+#endif
+
+void
+wl_columnar_session_hash_registry_image_discard(
+    wl_columnar_session_hash_registry_image_t *image)
+{
+    if (!image)
+        return;
+    free(image->rels);
+    free(image->hash_head);
+    free(image->hash_next);
+    free(image->expected_rel_contents);
+    memset(image, 0, sizeof(*image));
+}
+
+int
+wl_columnar_session_hash_registry_image_prepare(wl_col_session_t *session,
+    col_rel_t *const *additions, uint32_t addition_count,
+    wl_columnar_session_hash_registry_image_t *image)
+{
+    size_t bytes;
+    uint32_t needed, append_count = 0, holes = 0, buckets, cap;
+
+    if (!session || !additions || addition_count == 0 || !image)
+        return EINVAL;
+    memset(image, 0, sizeof(*image));
+    if (session->nrels > 0) {
+        if (!session->rels) {
+            return EINVAL;
+        }
+        for (uint32_t i = 0; i < session->nrels; i++)
+            if (!session->rels[i])
+                holes++;
+    }
+    append_count = addition_count > holes ? addition_count - holes : 0;
+    if (append_count > UINT32_MAX - session->nrels)
+        return EOVERFLOW;
+    needed = session->nrels + append_count;
+    cap = session->rel_cap > needed ? session->rel_cap : needed;
+    bytes = (size_t)cap * sizeof(*image->rels);
+    if (cap != 0 && bytes / cap != sizeof(*image->rels))
+        return EOVERFLOW;
+    image->rels = malloc(bytes);
+    if (!image->rels)
+        return ENOMEM;
+    if (session->nrels > 0) {
+        image->expected_rel_contents = malloc(
+            (size_t)session->nrels * sizeof(*image->expected_rel_contents));
+        if (!image->expected_rel_contents) {
+            wl_columnar_session_hash_registry_image_discard(image);
+            return ENOMEM;
+        }
+        memcpy(image->expected_rel_contents, session->rels,
+            (size_t)session->nrels * sizeof(*image->expected_rel_contents));
+        memcpy(image->rels, session->rels,
+            (size_t)session->nrels * sizeof(*image->rels));
+    }
+#ifdef WL_TEST_OWNER_PUBLICATION
+    if (wl_columnar_session_hash_fail_image_session == session) {
+        wl_columnar_session_hash_fail_image_session = NULL;
+        wl_columnar_session_hash_fail_image_hit = true;
+        wl_columnar_session_hash_registry_image_discard(image);
+        return ENOMEM;
+    }
+#endif
+    image->nrels = session->nrels;
+    for (uint32_t i = 0; i < addition_count; i++) {
+        col_rel_t *candidate = additions[i];
+        if (!candidate || !candidate->name || !candidate->name[0]) {
+            wl_columnar_session_hash_registry_image_discard(image);
+            return EINVAL;
+        }
+        for (uint32_t j = 0; j < session->nrels; j++) {
+            col_rel_t *existing = session->rels[j];
+            if (existing && existing->name
+                && strcmp(existing->name, candidate->name) == 0) {
+                wl_columnar_session_hash_registry_image_discard(image);
+                return EEXIST;
+            }
+        }
+        for (uint32_t j = 0; j < i; j++) {
+            if (strcmp(additions[j]->name, candidate->name) == 0) {
+                wl_columnar_session_hash_registry_image_discard(image);
+                return EEXIST;
+            }
+        }
+        uint32_t slot = 0;
+        while (slot < image->nrels && image->rels[slot])
+            slot++;
+        if (slot == image->nrels)
+            image->nrels++;
+        image->rels[slot] = candidate;
+    }
+    image->rel_cap = cap;
+    if (needed > UINT32_MAX / 2u) {
+        wl_columnar_session_hash_registry_image_discard(image);
+        return EOVERFLOW;
+    }
+    buckets = session_rel_next_pow2(needed ? needed * 2u : 16u);
+    if (!buckets) {
+        wl_columnar_session_hash_registry_image_discard(image);
+        return EOVERFLOW;
+    }
+    size_t head_bytes = (size_t)buckets * sizeof(*image->hash_head);
+    size_t next_bytes = (size_t)needed * sizeof(*image->hash_next);
+    if (head_bytes / buckets != sizeof(*image->hash_head)
+        || next_bytes / needed != sizeof(*image->hash_next)) {
+        wl_columnar_session_hash_registry_image_discard(image);
+        return EOVERFLOW;
+    }
+    image->hash_head = malloc(head_bytes);
+    image->hash_next = malloc(next_bytes);
+    if (!image->hash_head || !image->hash_next) {
+        wl_columnar_session_hash_registry_image_discard(image);
+        return ENOMEM;
+    }
+    memset(image->hash_head, 0xFF,
+        (size_t)buckets * sizeof(*image->hash_head));
+    for (uint32_t i = 0; i < needed; i++) {
+        col_rel_t *relation = image->rels[i];
+        if (!relation)
+            continue;
+        if (!relation->name) {
+            wl_columnar_session_hash_registry_image_discard(image);
+            return EINVAL;
+        }
+        uint32_t bucket = session_rel_hash_string(relation->name, buckets);
+        image->hash_next[i] = image->hash_head[bucket];
+        image->hash_head[bucket] = i;
+    }
+    image->hash_nbuckets = buckets;
+    image->hash_chain_cap = needed;
+    image->session = session;
+    image->expected_rels = session->rels;
+    image->expected_nrels = session->nrels;
+    image->expected_rel_cap = session->rel_cap;
+    image->expected_hash_head = session->rel_hash_head;
+    image->expected_hash_next = session->rel_hash_next;
+    image->expected_hash_nbuckets = session->rel_hash_nbuckets;
+    image->expected_hash_chain_cap = session->rel_hash_chain_cap;
+    return 0;
+}
+
+int
+wl_columnar_session_hash_registry_image_validate(
+    const wl_columnar_session_hash_registry_image_t *image)
+{
+    const wl_col_session_t *session;
+
+    if (!image || !image->session || !image->rels || !image->hash_head
+        || !image->hash_next)
+        return EINVAL;
+    session = image->session;
+    if (session->rels != image->expected_rels
+        || session->nrels != image->expected_nrels
+        || session->rel_cap != image->expected_rel_cap
+        || session->rel_hash_head != image->expected_hash_head
+        || session->rel_hash_next != image->expected_hash_next
+        || session->rel_hash_nbuckets != image->expected_hash_nbuckets
+        || session->rel_hash_chain_cap != image->expected_hash_chain_cap)
+        return EBUSY;
+    for (uint32_t i = 0; i < image->expected_nrels; i++)
+        if (session->rels[i] != image->expected_rel_contents[i])
+            return EBUSY;
+    return 0;
+}
+
+void
+wl_columnar_session_hash_registry_image_publish(
+    wl_columnar_session_hash_registry_image_t *image)
+{
+    wl_col_session_t *session;
+    col_rel_t **old_rels;
+    uint32_t *old_head, *old_next;
+
+    assert(wl_columnar_session_hash_registry_image_validate(image) == 0);
+    session = image->session;
+    old_rels = session->rels;
+    old_head = session->rel_hash_head;
+    old_next = session->rel_hash_next;
+    session->rels = image->rels;
+    session->nrels = image->nrels;
+    session->rel_cap = image->rel_cap;
+    session->rel_hash_head = image->hash_head;
+    session->rel_hash_next = image->hash_next;
+    session->rel_hash_nbuckets = image->hash_nbuckets;
+    session->rel_hash_chain_cap = image->hash_chain_cap;
+    image->rels = NULL;
+    image->hash_head = NULL;
+    image->hash_next = NULL;
+    free(old_rels);
+    free(old_head);
+    free(old_next);
+    free(image->expected_rel_contents);
+    memset(image, 0, sizeof(*image));
 }
