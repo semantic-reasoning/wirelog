@@ -211,6 +211,125 @@ session_destroy_relation_array_pass(col_rel_t **relations, uint32_t count,
     return result;
 }
 
+static bool
+wl_columnar_session_retained_eval_has_relation(
+    const wl_col_session_t *sess,
+    const col_rel_t *relation)
+{
+    for (const wl_columnar_retained_eval_entry_t *retained
+            = sess ? sess->retained_eval_entries : NULL;
+        retained; retained = retained->next) {
+        if (retained->entry.kind == WL_COLUMNAR_EVAL_ENTRY_RELATION
+            && retained->entry.rel == relation)
+            return true;
+    }
+    return false;
+}
+
+/* During worker teardown, retained entries are the authoritative owners of
+ * descriptors still waiting for an external reader.  Retire other aliases
+ * while leaving every retained descriptor reachable for its next disposal
+ * attempt. */
+static int
+wl_columnar_session_destroy_worker_relation_aliases(
+    wl_col_session_t *worker,
+    uint32_t *destroyed_out)
+{
+    int first_rc = 0;
+    uint32_t destroyed = 0;
+
+    for (uint32_t i = 0; i < worker->nrels; i++) {
+        col_rel_t *relation = worker->rels ? worker->rels[i] : NULL;
+        if (!relation || wl_columnar_session_retained_eval_has_relation(
+                worker, relation))
+            continue;
+        if (!relation->storage_owner || relation->storage_owner == relation)
+            continue;
+        int rc = col_rel_destroy_checked(relation);
+        if (rc == 0) {
+            worker->rels[i] = NULL;
+            destroyed++;
+        } else if (first_rc == 0) {
+            first_rc = rc;
+        }
+    }
+    if (destroyed_out)
+        *destroyed_out = destroyed;
+    return first_rc;
+}
+
+/* Validate all arithmetic before deriving a descriptor address.  The
+ * checked pool helper validates each range too; this outer check also
+ * protects our retained-slot exclusions from malformed pool geometry. */
+static int
+wl_columnar_session_validate_worker_pool_geometry(const delta_pool_t *pool,
+    uint32_t slot_limit)
+{
+    if (!pool)
+        return slot_limit == 0 ? 0 : EINVAL;
+    if (slot_limit > pool->slot_used || pool->slot_used > pool->slot_cap
+        || slot_limit > pool->slot_cap)
+        return EINVAL;
+    if (slot_limit == 0)
+        return 0;
+    if (!pool->slab || pool->slot_size < sizeof(col_rel_t)
+        || pool->slot_size % _Alignof(col_rel_t) != 0
+        || (uintptr_t)pool->slab % _Alignof(col_rel_t) != 0)
+        return EINVAL;
+    if ((size_t)slot_limit > SIZE_MAX / pool->slot_size)
+        return EOVERFLOW;
+    size_t span = (size_t)slot_limit * pool->slot_size;
+    if (span > UINTPTR_MAX - (uintptr_t)pool->slab)
+        return EOVERFLOW;
+    return 0;
+}
+
+/* Reuse the relation layer's checked range destroyer for each contiguous
+ * non-retained alias slot.  A retained alias slot is never passed to the
+ * pool sweep, so the inventory cannot tombstone the entry's descriptor. */
+static int
+wl_columnar_session_destroy_worker_pool_aliases(wl_col_session_t *worker,
+    uint32_t slot_limit, uint32_t *destroyed_out)
+{
+    delta_pool_t *pool = worker->delta_pool;
+    int rc = wl_columnar_session_validate_worker_pool_geometry(pool,
+            slot_limit);
+    int first_rc = rc;
+    uint32_t destroyed = 0;
+
+    if (rc != 0) {
+        if (destroyed_out)
+            *destroyed_out = 0;
+        return rc;
+    }
+    if (!pool) {
+        if (destroyed_out)
+            *destroyed_out = 0;
+        return 0;
+    }
+
+    for (uint32_t slot = 0; slot < slot_limit; slot++) {
+        col_rel_t *relation = (col_rel_t *)(pool->slab
+            + (size_t)slot * pool->slot_size);
+        if (wl_columnar_session_retained_eval_has_relation(worker, relation)
+            || (relation->relation_identity == 0
+            && !relation->storage_owner)
+            || !relation->storage_owner
+            || relation->storage_owner == relation)
+            continue;
+
+        int destroy_rc = col_rel_pool_destroy_aliases_checked(pool, slot,
+                slot + 1);
+        if (destroy_rc == 0 && relation->relation_identity == 0)
+            destroyed++;
+        else if (destroy_rc != 0 && first_rc == 0)
+            first_rc = destroy_rc;
+    }
+    if (destroyed_out)
+        *destroyed_out = destroyed;
+    return first_rc;
+}
+
 static wl_columnar_session_source_lease_t **
 wl_columnar_session_source_lease_slot(wl_col_session_t *sess,
     const col_rel_t *borrower)
@@ -2945,6 +3064,40 @@ col_worker_session_destroy(wl_col_session_t *worker)
     }
     uint32_t pool_slot_limit = worker->delta_pool
         ? worker->delta_pool->slot_used : 0;
+    int pool_geometry_rc = wl_columnar_session_validate_worker_pool_geometry(
+        worker->delta_pool, pool_slot_limit);
+    if (pool_geometry_rc != 0)
+        return pool_geometry_rc;
+    while (worker->retained_eval_entry_count != 0) {
+        uint32_t retained_before = worker->retained_eval_entry_count;
+        uint32_t relation_aliases_destroyed = 0;
+        uint32_t pool_aliases_destroyed = 0;
+        int pass_rc = 0;
+        int retained_rc
+            = wl_columnar_session_retry_retained_eval_entries(worker);
+        if (retained_rc != 0)
+            pass_rc = retained_rc;
+        uint64_t progress = retained_before
+            - worker->retained_eval_entry_count;
+
+        int relation_rc
+            = wl_columnar_session_destroy_worker_relation_aliases(worker,
+                &relation_aliases_destroyed);
+        if (pass_rc == 0 && relation_rc != 0)
+            pass_rc = relation_rc;
+        progress += relation_aliases_destroyed;
+
+        int pool_rc = wl_columnar_session_destroy_worker_pool_aliases(worker,
+                pool_slot_limit, &pool_aliases_destroyed);
+        if (pass_rc == 0 && pool_rc != 0)
+            pass_rc = pool_rc;
+        progress += pool_aliases_destroyed;
+
+        if (worker->retained_eval_entry_count == 0)
+            break;
+        if (progress == 0)
+            return pass_rc != 0 ? pass_rc : EBUSY;
+    }
     int relation_alias_rc = session_destroy_relation_array_pass(
         worker->rels, worker->nrels, true);
     int pool_alias_rc = col_rel_pool_destroy_aliases_checked(
