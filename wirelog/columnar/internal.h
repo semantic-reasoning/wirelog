@@ -2080,13 +2080,13 @@ wl_columnar_eval_owner_publication_prepare(
 int
 wl_columnar_eval_owner_publication_register(
     wl_columnar_eval_owner_publication_txn_t *txn);
-/* Commit is the publication phase.  The caller must provide exclusive,
- * quiescent access to all sessions/relations until commit or discard returns;
- * this standalone builder is not wired into exchange modes yet.  All commit
- * invariants are checked before publication.  A post-publication release
- * failure is therefore an internal invariant error (EPROTO), and the
- * transaction remains discardable; already-published entries are not rolled
- * back. */
+/* The caller must provide exclusive, quiescent access to every participating
+ * session, target, and candidate from the first add through commit or
+ * discard. Successful add transfers candidate ownership to the transaction;
+ * prepare may consume candidates for existing targets, while registered
+ * candidates transfer to their session at commit. This standalone builder is
+ * not wired into exchange modes yet. Commit preflights every fallible
+ * invariant before publishing; publication itself is no-fail. */
 int
 wl_columnar_eval_owner_publication_commit(
     wl_columnar_eval_owner_publication_txn_t *txn);
@@ -2100,6 +2100,14 @@ wl_columnar_eval_owner_publication_discard(
 void
 wl_columnar_eval_test_owner_publication_fail_registration(
     wl_col_session_t *session, const char *name);
+void
+wl_columnar_eval_test_owner_publication_fail_prepare(
+    wl_col_session_t *session, const char *name);
+bool
+wl_columnar_eval_test_owner_publication_prepare_failure_hit(void);
+bool
+wl_columnar_eval_test_owner_publication_prepare_failure_followed_prepared(
+    void);
 #endif
 
 /*

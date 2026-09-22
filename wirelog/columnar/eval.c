@@ -2170,6 +2170,10 @@ wl_columnar_eval_owner_publication_entry_compare(const void *left,
 #ifdef WL_TEST_OWNER_PUBLICATION
 static wl_col_session_t *wl_columnar_eval_owner_publication_fail_session;
 static const char *wl_columnar_eval_owner_publication_fail_name;
+static wl_col_session_t *wl_columnar_eval_owner_publication_prepare_fail_session;
+static const char *wl_columnar_eval_owner_publication_prepare_fail_name;
+static bool wl_columnar_eval_owner_publication_prepare_fail_hit;
+static bool wl_columnar_eval_owner_publication_prepare_fail_after_prior;
 
 void
 wl_columnar_eval_test_owner_publication_fail_registration(
@@ -2177,6 +2181,29 @@ wl_columnar_eval_test_owner_publication_fail_registration(
 {
     wl_columnar_eval_owner_publication_fail_session = session;
     wl_columnar_eval_owner_publication_fail_name = name;
+}
+
+void
+wl_columnar_eval_test_owner_publication_fail_prepare(
+    wl_col_session_t *session, const char *name)
+{
+    wl_columnar_eval_owner_publication_prepare_fail_session = session;
+    wl_columnar_eval_owner_publication_prepare_fail_name = name;
+    wl_columnar_eval_owner_publication_prepare_fail_hit = false;
+    wl_columnar_eval_owner_publication_prepare_fail_after_prior = false;
+}
+
+bool
+wl_columnar_eval_test_owner_publication_prepare_failure_hit(void)
+{
+    return wl_columnar_eval_owner_publication_prepare_fail_hit;
+}
+
+bool
+wl_columnar_eval_test_owner_publication_prepare_failure_followed_prepared(
+    void)
+{
+    return wl_columnar_eval_owner_publication_prepare_fail_after_prior;
 }
 #endif
 
@@ -2340,6 +2367,23 @@ wl_columnar_eval_owner_publication_prepare(
          * destination's gate.  Same handshake as the TDD restore
          * transaction below. */
         entry->replacement.writer_acquired = true;
+#ifdef WL_TEST_OWNER_PUBLICATION
+        if (wl_columnar_eval_owner_publication_prepare_fail_session
+            == entry->session
+            && wl_columnar_eval_owner_publication_prepare_fail_name
+            && strcmp(wl_columnar_eval_owner_publication_prepare_fail_name,
+            entry->name) == 0) {
+            wl_columnar_eval_owner_publication_prepare_fail_hit = true;
+            for (uint32_t prior = 0; prior < i; prior++)
+                if (txn->entries[prior].replacement_prepared)
+                    wl_columnar_eval_owner_publication_prepare_fail_after_prior
+                        = true;
+            wl_columnar_eval_owner_publication_prepare_fail_session = NULL;
+            wl_columnar_eval_owner_publication_prepare_fail_name = NULL;
+            rc = ENOMEM;
+            goto fail;
+        }
+#endif
         rc = col_rel_prepare_replacement_locked(entry->target,
                 entry->candidate, &entry->replacement);
         if (rc != 0)
