@@ -2136,6 +2136,10 @@ int
 wl_columnar_eval_owner_publication_discard(
     wl_columnar_eval_owner_publication_txn_t *txn);
 #ifdef WL_TEST_OWNER_PUBLICATION
+typedef struct col_eval_tdd_worker_ctx col_eval_tdd_worker_ctx_t;
+int
+wl_columnar_eval_test_owner_exchange(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs, uint32_t workers);
 int
 wl_columnar_eval_test_owner_build_candidate(col_rel_t *target,
     const char *name, col_rel_t *const *inputs, uint32_t input_count,
@@ -3731,7 +3735,7 @@ typedef struct {
     bool tdd_safe;                 /* true: worker TDD, false: fallback */
 } wl_tdd_rule_slice_t;
 
-typedef struct {
+typedef struct col_eval_tdd_worker_ctx {
     const wl_plan_stratum_t *sp;   /* borrowed: stratum plan          */
     wl_col_session_t *worker_sess; /* borrowed: isolated worker       */
     const wl_tdd_rule_slice_t *rule_slices; /* optional mixed TDD slices */

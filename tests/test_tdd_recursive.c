@@ -3342,6 +3342,94 @@ cleanup:
         target = NULL;
     return rc;
 }
+
+static void
+test_owner_exchange_dispatch_registration_failure(void)
+{
+    TEST("owner exchange dispatch rolls back later worker registration");
+    const char *failure = NULL;
+    const uint32_t workers = 2;
+    uint32_t key = 0;
+    wl_plan_op_exchange_t exchange = { .num_workers = workers,
+                                       .key_col_idxs = &key,
+                                       .key_col_count = 1 };
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    wl_plan_relation_t relations[] = {
+        { .name = "first", .delta_name = "$d$first", .ops = ops,
+          .op_count = 1 },
+        { .name = "second", .delta_name = "$d$second", .ops = ops,
+          .op_count = 1 }
+    };
+    wl_plan_stratum_t stratum = { .relations = relations,
+                                  .relation_count = 2, .is_recursive = true };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1 };
+    wl_session_t *session = NULL;
+    col_eval_tdd_worker_ctx_t *ctxs = NULL;
+    extern int wl_columnar_eval_test_initializer(unsigned, wl_col_session_t *,
+        uint32_t);
+
+    if (wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) != 0) {
+        FAIL("create");
+        return;
+    }
+    wl_col_session_t *coord = COL_SESSION(session);
+    if (wl_columnar_eval_test_initializer(2, coord, workers) != 0) {
+        failure = "worker initializer";
+        goto cleanup;
+    }
+    ctxs = calloc(workers, sizeof(*ctxs));
+    if (!ctxs) {
+        failure = "contexts";
+        goto cleanup;
+    }
+    for (uint32_t w = 0; w < workers; w++) {
+        ctxs[w].delta_rels = calloc(2, sizeof(col_rel_t *));
+        if (!ctxs[w].delta_rels) {
+            failure = "delta matrix";
+            goto cleanup;
+        }
+        for (uint32_t ri = 0; ri < 2; ri++) {
+            const char *name = relations[ri].delta_name;
+            ctxs[w].delta_rels[ri] = col_rel_new_auto(name, 1);
+            if (!ctxs[w].delta_rels[ri]
+                || col_rel_append_row(ctxs[w].delta_rels[ri],
+                (int64_t[]){ (int64_t)(w + ri + 1) }) != 0) {
+                failure = "delta";
+                goto cleanup;
+            }
+        }
+    }
+    wl_columnar_eval_test_owner_publication_fail_registration(
+        &coord->tdd_workers[1], "$d$second");
+    if (wl_columnar_eval_test_owner_exchange(&stratum, coord, ctxs, workers)
+        != ENOMEM
+        || wl_columnar_eval_test_owner_publication_registration_failure_hit()
+        == false
+        || coord->tdd_workers[0].nrels != 0
+        || coord->tdd_workers[1].nrels != 0) {
+        failure = "later registration changed published worker state";
+    }
+    wl_columnar_eval_test_owner_publication_fail_registration(NULL, NULL);
+cleanup:
+    if (ctxs) {
+        for (uint32_t w = 0; w < workers; w++) {
+            if (ctxs[w].delta_rels) {
+                for (uint32_t ri = 0; ri < 2; ri++)
+                    col_rel_destroy(ctxs[w].delta_rels[ri]);
+                free(ctxs[w].delta_rels);
+            }
+        }
+        free(ctxs);
+    }
+    wl_session_destroy(session);
+    if (failure)
+        FAIL(failure);
+    else
+        PASS();
+}
 #endif
 
 #ifdef WL_TEST_BDX_SEED
@@ -4595,6 +4683,7 @@ main(void)
         PASS();
     else
         FAIL("owner publication transaction");
+    test_owner_exchange_dispatch_registration_failure();
 #endif
     test_filt_arr_bench_w1();
     test_filt_arr_bench_w4();
