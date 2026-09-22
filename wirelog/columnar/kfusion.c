@@ -898,6 +898,7 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
          * arrangement caches are zeroed below, so workers rebuild private
          * entries on demand instead of cloning coordinator state. */
         worker_sess[d] = *sess;
+        worker_sess[d].base.owns_evaluation_control = false;
         worker_sess[d].wq = NULL; /* prevent nested K-fusion from workers */
         worker_sess[d].wq_workers = 0;
         worker_sess[d].kfusion_adaptive = NULL;

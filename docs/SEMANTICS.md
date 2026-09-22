@@ -530,3 +530,119 @@ testing the actual optimizer pipeline.
   paths.
 - `tests/test_optimizer_equivalence.c` — 16-combination equivalence matrix.
 - `stable-release-plan.md` — v0.43 milestone scope.
+
+## Evaluation-control foundation (#1819; engine integration pending)
+
+`wirelog/evaluation_control.h` is internal and uninstalled. It provides a
+retained control, exclusive logical-session ownership, attempt accounting,
+cooperative cancellation requests and completed reports. Internal session
+options v3 append `evaluation_control`; v2 callers retain their existing
+memory-governor/Windows-handle behavior. Creation normalizes a verified prefix
+into a full v3 object; v2 unknown tails are ignored. Options storage is borrowed
+only during creation. A control on a backend without the options hook is refused.
+
+**Controlled evaluation is not implemented yet.** An attached control makes
+`wl_session_step()` and `wl_session_snapshot()` return `ENOTSUP` before backend
+evaluation, even when its limit is zero. Calls without a control retain existing
+behavior. #1820 owns recovery, #1821/#1822 own engine instrumentation, and #1823
+owns installed APIs. This foundation does not close #1817 or expose a partially
+enforced public option.
+
+### Implemented primitive contract
+
+- `create(limit)` gives the caller one reference. `attach(control, owner)`
+  claims a non-NULL stable logical-owner key and retains a separate reference.
+  A second attachment, including the same key, returns `EBUSY`. `detach` is
+  quiescent and drops that reference; `transfer` changes the key without an
+  extra attachment/reference. The session wrapper claims with its admission
+  object before backend construction, unwinds failed construction, and detaches
+  after backend destruction drains borrowers. Worker copies borrow the pointer
+  and clear their ownership marker.
+- The future easy wrapper must claim at open, including lazy open, and transfer
+  its logical claim when materializing the backend. Host references remain
+  independently owned; a cancelling thread retains one across its request.
+  No operation accepts a dangling pointer or makes session destruction generally
+  concurrent with arbitrary host calls.
+- `begin(control, owner)` starts exactly one attempt, freezes the configured
+  limit, increments its identity and resets consumption/stop/error. Identity
+  exhaustion returns `EOVERFLOW` before starting; IDs never wrap. A successful
+  begin always needs finish, including pre-cancelled attempts.
+- Zero limit means unlimited. `charge(work)` accounts **admitted logical work**
+  before processing; `charge(0)` polls. Exact allowance is legal; a charge larger
+  than remaining allowance fails without consuming it. Arithmetic uses checked
+  subtraction. Unlimited accounting past `UINT64_MAX` latches `EOVERFLOW`, an
+  accounting failure rather than budget exhaustion, without wrapping.
+- Cancellation is sticky until quiescent `reset`. At a check with no prior
+  disposition, cancellation observed there wins over a new budget denial.
+  `WL_EVALUATION_CONTROL_CANCELLED` and `WL_EVALUATION_CONTROL_WORK_LIMIT` are
+  distinct negative dispositions, not errno aliases. A previously latched stop
+  or accounting error persists; subsequent charges do no work.
+- Concurrent worker charges share one allowance under the control mutex.
+  Configuration, reset, owner transfer and detach refuse active attempts.
+  A host serializes lifecycle calls with session operations; finish requires
+  all worker charges drained. `request_cancel` alone needs no control/session
+  mutex and can run from another thread with its own live reference.
+- `finish(owner, execution_status, cleanup_status)` preserves both errors and
+  the independently latched stop. Return precedence is genuine execution error
+  (including accounting overflow), cleanup error, then control stop. A control
+  stop passed as execution status becomes the stop field rather than an engine
+  failure. Finish does **not** poll: its caller must perform the final check at
+  the publication cutoff. Late requests remain sticky for the next attempt.
+- `report` returns `ENOENT` until the first finish, then a coherent last-completed
+  record: attempt ID, frozen limit, admitted consumption, stop, execution error,
+  cleanup error and final result. Configuration/reset and the next active attempt
+  do not erase or mutate that completed report. Counts are not CPU instructions
+  or proof that all admitted work completed; interruption can leave admitted
+  work unprocessed. No refund/reservation machinery is implemented here.
+
+### Required downstream work metric and checkpoint placement
+
+The table is an **integration contract**, not a claim of current instrumentation.
+One logical unit charges one listed primitive action before performing it.
+Implementations must check at entry and after at most
+`WL_EVALUATION_CONTROL_QUANTUM` (**256**) admitted units per active worker or
+coordinator; final tails check too. This limits work between checks, not elapsed
+return time. Bulk reservation must disclose unused admitted slack (at most one
+quantum per active worker), never report it as measured completed work.
+
+| Engine path | Charged primitive and checkpoint obligation |
+|---|---|
+| `columnar/eval_plan.c`, `eval_serial.c`, `eval.c` | One operator dispatch or recursive progress transition, including empty progress; internal replay keeps the same attempt |
+| `columnar/ops.c`, `filter.c`, `expr.c` | One input-row visit/expression evaluation; rejected rows count |
+| `columnar/join.c`, `join_batch.c`, `diff_join_batch.c`, `join_pipeline.c` | One hash/build/probe-chain visit or candidate-pair inspection; unsuccessful probes and rejected candidates count |
+| `columnar/lftj.c` | One seek/comparison/traversal action, including unsuccessful seeks |
+| `columnar/relation.c`, `arrangement.c`, `eval_dedup.c`, `merge.c`, `partition.c` | One compare/hash action or copied/visited scalar cell; sort, consolidation, materialization and coordinator partitioning require bounded chunks |
+| `columnar/eval_tdd_plan.c`, `eval_tdd_queue.c`, `kfusion.c`, `workqueue.c` | One dispatch/exchange/progress action; payload processing additionally charges rows/cells, and blocking waits must observe stop |
+
+Fixed serial plan/data/configuration must give reproducible admitted work.
+Worker schedules, optimizer choices and releases can change totals; cross-width
+iteration/count equality is not promised. Parsing, planning and input ingestion
+are outside the evaluation-work count. Output cardinality and iteration count
+alone cannot bound an expensive acyclic JOIN with no matching output.
+
+Synchronous allocator/runtime calls, whole-input library sorts/copies, host
+scalar addons, and output callback bodies cannot be preempted by this token.
+Downstream integration must split engine-owned large sorts/copies into bounded
+work or reject unsupported controlled paths before execution; merely polling
+around an arbitrary whole-input operation does not satisfy the table. Host
+addon/callback duration and mandatory cleanup/rollback/task drain are excluded
+from the unit-to-return bound. There is no millisecond deadline guarantee.
+Cleanup remains permitted after exhaustion so recovery can retain/release owners.
+
+### Required recovery and publication contract (not implemented here)
+
+One external STEP or evaluating SNAPSHOT is one attempt, including an internal
+snapshot-to-step resume. Internal fallback/replay shares its consumption.
+An explicit retry begins fresh accounting but preserves the logical STEP's
+original notification baseline, pending inputs and retractions. Configure/reset
+must remain possible between stopped attempts even if input mutation is `EBUSY`.
+Callback-free retry needs its own recovery proof; observer baseline retention
+alone does not establish that property.
+
+Perform a final stop check before observable tuple/delta publication. Before
+that cutoff a stopped evaluation delivers nothing; after publication starts,
+finish the successful batch and leave late cancellation for the next attempt.
+Host callback side effects cannot be rolled back. Notification-only cancellation
+remains distinct from evaluation cancellation. The future public surface must
+provide retained opaque handles, request/configure/reset, completed reports and
+distinct stop errors through both facades, without exposing these internal types.

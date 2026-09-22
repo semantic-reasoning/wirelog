@@ -84,6 +84,7 @@ wirelog/columnar/rotation_standard.c
 wirelog/columnar/session.c
 wirelog/columnar/session_hash.c
 wirelog/crc32.c
+wirelog/evaluation_control.c
 wirelog/exec_plan_gen.c
 wirelog/extension_registry.c
 wirelog/intern.c

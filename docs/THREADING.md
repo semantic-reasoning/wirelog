@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **149**).
+match the script's count (currently **165**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -605,7 +605,7 @@ reservation objects exclusively; their state follows the governor protocol.
 |---|---|---|---|---|
 | `eval_delta.c:wl_columnar_eval_delta_observer_release_token` | `token->state` | `atomic_load_explicit` | acquire | Observe admission or commit state before releasing the observer reservation, then reinitialize the exclusively owned token |
 
-The complete source audit now contains **156 atomic call sites**.
+The complete source audit now contains **165 atomic call sites**.
 
 ---
 
@@ -831,10 +831,13 @@ wirelog is **not async-signal-safe**.
   memory. Mutexes are not async-signal-safe; `malloc` is not
   async-signal-safe. Do not call `wirelog_*` from a signal handler.
 
-If a host process needs to interrupt a long-running
-`wirelog_session_step`, the supported pattern is to set the
-`wirelog_session_*` cancellation flag from the signal-handling
-thread (not from inside the handler itself).
+There is currently no installed `wirelog_session_*` cancellation API.
+The internal #1819 evaluation-control foundation offers an independently retained
+control whose cancellation request uses an atomic operation without acquiring a
+session/control mutex. Controlled STEP/SNAPSHOT are still refused with `ENOTSUP`
+until engine integration lands; setting that internal flag does not interrupt an
+ordinary uncontrolled evaluation. Future host signal integration must forward a
+request to a normal host thread; no control operation is async-signal-safe.
 
 Cross-reference: Risk C6, issue #709 (consolidated in
 `docs/ERROR_MODEL.md`).
@@ -1218,3 +1221,41 @@ released on every normal and error path. A live probe prevents source writes,
 sorted-buffer rebuild/free, and registry relocation. Stale entries are marked
 for deferred rebuild and become available again only after the final probe is
 released; teardown requires zero active sorted probes.
+
+
+## Internal evaluation-control synchronization (#1819)
+
+`wirelog/evaluation_control.c` uses the existing portable `wl_atomic_u64`
+representation privately. Its mutex protects ownership, attempt lifecycle,
+shared admission and completed reports. Host lifecycle calls are externally
+serialized with session operations; worker charge calls serialize internally.
+Finish and owner teardown require all workers drained. Cancellation request
+alone takes neither the control mutex nor session admission lock. The requester
+must hold an independent live reference; last-release cannot race an unretained
+pointer. Reset is quiescent relative to evaluation; a request racing reset is
+ordered by the atomic exchange, and hosts must coordinate reset if that request
+must not be cleared.
+
+The nine sites below extend the existing exact inventory. RMW reads use the
+existing MSVC Interlocked shim instead of assuming volatile loads publish state.
+Cancellation carries no payload, so relaxed ordering suffices. References use
+release decrement plus acquire RMW at last release before destruction. The
+reference count is capped at `UINT32_MAX` so the shim's signed arithmetic cannot
+overflow. Ownership/charge state publication is through the mutex, not the flag.
+
+| Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `evaluation_control.c:wl_evaluation_control_create` | references | `atomic_init` | initialization | Initialize before publication |
+| `evaluation_control.c:wl_evaluation_control_create#2` | cancelled | `atomic_init` | initialization | Initialize before publication |
+| `evaluation_control.c:wl_evaluation_control_retain` | references | `atomic_fetch_add_explicit` | relaxed | Atomic read through RMW shim; caller already holds a live reference |
+| `evaluation_control.c:wl_evaluation_control_retain#2` | references | `atomic_compare_exchange_weak_explicit` | relaxed/relaxed | Increment without wrapping or reviving freed storage |
+| `evaluation_control.c:wl_evaluation_control_release` | references | `atomic_fetch_sub_explicit` | release | Publish prior accesses before releasing the reference |
+| `evaluation_control.c:wl_evaluation_control_release#2` | references | `atomic_fetch_add_explicit` | acquire | Last release acquires preceding release sequence before destruction |
+| `evaluation_control.c:wl_evaluation_control_reset` | cancelled | `atomic_exchange_explicit` | relaxed | Quiescent reset serialized with requests by atomic modification order |
+| `evaluation_control.c:wl_evaluation_control_request_cancel` | cancelled | `atomic_exchange_explicit` | relaxed | Sticky request, no payload or session lock dependency |
+| `evaluation_control.c:wl_evaluation_control_charge` | cancelled | `atomic_fetch_add_explicit` | relaxed | Poll using Interlocked-compatible atomic read; mutex protects resulting stop state |
+
+See the [evaluation-control contract](SEMANTICS.md#evaluation-control-foundation-1819-engine-integration-pending)
+for prospective checkpoint coverage and the publication cutoff. The future
+256-unit quantum excludes host callbacks, synchronous runtime calls and mandatory
+cleanup/drain; it is not a return-time guarantee or existing engine enforcement.

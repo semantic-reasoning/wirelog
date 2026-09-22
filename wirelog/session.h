@@ -28,6 +28,7 @@ extern "C" {
 #endif
 
 #include "backend.h"
+#include "evaluation_control.h"
 #include "wirelog/wirelog-extension.h"
 
 typedef struct wl_session_admission wl_session_admission_t;
@@ -56,6 +57,9 @@ struct wl_session {
      */
     wl_session_admission_t *operation_admission;
     bool owns_operation_admission;
+    /* Owner key is operation_admission; copied workers borrow the control. */
+    wl_evaluation_control_t *evaluation_control;
+    bool owns_evaluation_control;
 };
 
 /* Wrapper functions that delegate to the backend vtable */
