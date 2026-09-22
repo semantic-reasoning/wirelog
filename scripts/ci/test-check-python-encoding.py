@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
-import sys
 
 HERE = Path(__file__).resolve().parent
 GATE = HERE / "check-python-encoding.py"
@@ -53,6 +57,22 @@ def bad(path):
         self.assertTrue(any("open()" in message for message in messages))
         self.assertTrue(any("subprocess" in message for message in messages))
 
+    def test_none_encoding_and_import_aliases_are_reported(self):
+        source = """
+import subprocess as child
+from subprocess import run as invoke
+
+def bad(path):
+    path.read_text(encoding=None)
+    child.run(['tool'], text=True, encoding=None)
+    invoke(['tool'], universal_newlines=True, encoding=None)
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bad_alias.py"
+            path.write_text(source, encoding="utf-8")
+            messages = [item.message for item in self.gate.scan_file(path)]
+        self.assertEqual(3, len(messages))
+
     def test_binary_and_explicit_encoding_are_allowed(self):
         source = """
 import subprocess
@@ -74,6 +94,25 @@ def good(path):
         audit = (ROOT / "scripts/perf/audit-tdd-execution.py").read_text(encoding="utf-8")
         self.assertIn('read_text(encoding="utf-8", errors="strict")', audit)
         self.assertIn('disposition="invalid_evidence"', audit)
+
+    def test_invalid_evidence_preserves_raw_log_and_hash(self):
+        audit_path = ROOT / "scripts/perf/audit-tdd-execution.py"
+        spec = importlib.util.spec_from_file_location("audit_tdd_encoding", audit_path)
+        self.assertIsNotNone(spec and spec.loader)
+        audit = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(audit)
+        raw = b"valid\xe2\x80\x94prefix\xff\n"
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = Path(directory) / "evidence"
+            record = audit.run_process(
+                [sys.executable, "-c", "import sys; sys.stdout.buffer.write(" + repr(raw) + ")"],
+                os.environ.copy(), prefix, 30, Path(directory))
+            log = prefix.with_suffix(".stdout")
+            self.assertEqual(record["disposition"], "invalid_evidence")
+            self.assertEqual(log.read_bytes(), raw)
+            self.assertEqual(record["logs"][".stdout"]["sha256"], hashlib.sha256(raw).hexdigest())
+            self.assertNotIn("\ufffd", json.dumps(record))
 
 
 if __name__ == "__main__":

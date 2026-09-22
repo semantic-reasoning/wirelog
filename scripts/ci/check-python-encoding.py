@@ -37,12 +37,23 @@ def _keyword(node: ast.Call, name: str) -> ast.keyword | None:
     return next((item for item in node.keywords if item.arg == name), None)
 
 
+def _has_explicit_encoding(node: ast.Call) -> bool:
+    keyword = _keyword(node, "encoding")
+    return keyword is not None and not (
+        isinstance(keyword.value, ast.Constant) and keyword.value.value is None
+    )
+
+
 def _is_true(node: ast.AST | None) -> bool:
     return isinstance(node, ast.Constant) and node.value is True
 
 
 def _text_mode(node: ast.Call, mode_index: int) -> bool:
-    mode = _constant_string(node.args[mode_index]) if len(node.args) > mode_index else None
+    mode_node = node.args[mode_index] if len(node.args) > mode_index else None
+    if mode_node is None:
+        mode_keyword = _keyword(node, "mode")
+        mode_node = mode_keyword.value if mode_keyword else None
+    mode = _constant_string(mode_node)
     return mode is None or "b" not in mode
 
 
@@ -50,6 +61,21 @@ class EncodingVisitor(ast.NodeVisitor):
     def __init__(self, path: Path) -> None:
         self.path = path
         self.violations: list[Violation] = []
+        self.subprocess_names = {"subprocess"}
+        self.subprocess_calls: set[str] = set()
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            if alias.name == "subprocess":
+                self.subprocess_names.add(alias.asname or alias.name)
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if node.module == "subprocess":
+            for alias in node.names:
+                if alias.name in {"run", "check_output", "check_call", "Popen"}:
+                    self.subprocess_calls.add(alias.asname or alias.name)
+        self.generic_visit(node)
 
     def add(self, node: ast.AST, message: str) -> None:
         self.violations.append(Violation(self.path, node.lineno, node.col_offset + 1, message))
@@ -59,9 +85,9 @@ class EncodingVisitor(ast.NodeVisitor):
         name = function.id if isinstance(function, ast.Name) else None
         attr = function.attr if isinstance(function, ast.Attribute) else None
 
-        if attr in {"read_text", "write_text"} and _keyword(node, "encoding") is None:
+        if attr in {"read_text", "write_text"} and not _has_explicit_encoding(node):
             self.add(node, f"Path.{attr}() must specify encoding=\"utf-8\"")
-        elif (attr == "open" and _keyword(node, "encoding") is None
+        elif (attr == "open" and not _has_explicit_encoding(node)
               and not (isinstance(function.value, ast.Call)
                        and isinstance(function.value.func, ast.Name)
                        and function.value.func.id == "__import__"
@@ -71,7 +97,7 @@ class EncodingVisitor(ast.NodeVisitor):
                        and function.value.id in {"tarfile", "zipfile"})
               and _text_mode(node, 0)):
             self.add(node, "text Path.open() must specify encoding=\"utf-8\"")
-        elif name == "open" and _keyword(node, "encoding") is None and _text_mode(node, 1):
+        elif name == "open" and not _has_explicit_encoding(node) and _text_mode(node, 1):
             self.add(node, "text open() must specify encoding=\"utf-8\"")
 
         # Only subprocess calls are relevant; qualified-name matching keeps
@@ -80,9 +106,10 @@ class EncodingVisitor(ast.NodeVisitor):
         is_subprocess = (isinstance(function, ast.Attribute)
                          and function.attr in {"run", "check_output", "check_call", "Popen"}
                          and isinstance(function.value, ast.Name)
-                         and function.value.id == "subprocess")
+                         and function.value.id in self.subprocess_names) \
+            or (isinstance(function, ast.Name) and function.id in self.subprocess_calls)
         if is_subprocess and text_keyword is not None and _is_true(text_keyword.value):
-            if _keyword(node, "encoding") is None:
+            if not _has_explicit_encoding(node):
                 self.add(node, "subprocess text output must specify encoding=\"utf-8\"")
         self.generic_visit(node)
 
@@ -99,8 +126,9 @@ def scan_file(path: Path) -> list[Violation]:
 
 def targets(root: Path) -> list[Path]:
     paths = sorted((root / "scripts" / "ci").glob("*.py"))
+    paths += sorted((root / "scripts" / "perf").glob("*.py"))
+    paths += sorted((root / "scripts" / "fuzz").glob("*.py"))
     paths += sorted((root / "tests").glob("*.py"))
-    paths.append(root / "scripts" / "perf" / "audit-tdd-execution.py")
     return [path for path in paths if path.is_file() and path.name != Path(__file__).name]
 
 
