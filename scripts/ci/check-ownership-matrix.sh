@@ -45,14 +45,14 @@ awk '
     started { exit }
 ' "$section" | grep -vE '^\|[ -]*-[ -|-]*\|' | grep -vF '| Class |' >"$rows" || true
 row_count=$(wc -l <"$rows")
-expected_rows="${WIRELOG_OWNERSHIP_EXPECTED_ROWS:-15}"
+expected_rows="${WIRELOG_OWNERSHIP_EXPECTED_ROWS:-16}"
 [ "$row_count" -eq "$expected_rows" ] || {
     echo "check-ownership-matrix: FAIL: expected exactly $expected_rows matrix rows, found $row_count" >&2
     exit 1
 }
 
 read_rows=$(grep -cE '\| read \|$' "$rows" || true)
-expected_read="${WIRELOG_OWNERSHIP_EXPECTED_READ:-15}"
+expected_read="${WIRELOG_OWNERSHIP_EXPECTED_READ:-16}"
 [ "$read_rows" -eq "$expected_read" ] || {
     echo "check-ownership-matrix: FAIL: expected exactly $expected_read rows marked read, found $read_rows" >&2
     exit 1

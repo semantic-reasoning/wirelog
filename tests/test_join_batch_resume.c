@@ -879,8 +879,112 @@ out:
     fixture_fini(&f);
 }
 
-/* A one-row batch must be able to park on a genuine cross-key hash collision,
- * then resume the same chain without losing either key's matches. */
+/* Eviction between healthy batches must preserve the producer's leases. */
+static void
+test_suspended_producer_survives_eviction(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1 };
+    wl_columnar_continuation_t *cont = NULL;
+    wl_columnar_continuation_sink_t sink;
+    col_join_batch_relation_sink_t sctx;
+    col_rel_t *cold = NULL;
+    col_rel_t *pressure = NULL;
+
+    TEST("eviction preserves a suspended producer until its final release");
+    if (!fixture_init(&f, 1u << 24, keys, 2, 2, 20)) {
+        FAIL("fixture");
+        goto out;
+    }
+    f.sess->arr_cache_limit_bytes = SIZE_MAX;
+    cold = make_right_named("cold", 1, 2);
+    pressure = make_right_named("pressure", 1, 2);
+    if (!cold || !pressure || session_add_rel(f.sess, cold) != 0) {
+        FAIL("eviction control relations");
+        goto out;
+    }
+    cold = NULL; /* session owns it */
+    if (session_add_rel(f.sess, pressure) != 0) {
+        FAIL("pressure registration");
+        goto out;
+    }
+    pressure = NULL;
+    if (!col_session_get_arrangement(&f.sess->base, "cold", KEY0, 1)
+        || col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1, 4u * 32u, &cont) != 0
+        || col_join_batch_relation_sink_init(&sctx, &sink, f.sess, f.out) != 0
+        || wl_columnar_continuation_publish(cont, &sink)
+        != WL_COLUMNAR_CONTINUATION_OK) {
+        FAIL("first batch and unpinned control");
+        goto out;
+    }
+    const col_arr_entry_t *entry = find_entry(f.sess, "right");
+    const col_arr_entry_t *control = find_entry(f.sess, "cold");
+    if (!entry || entry->pin_count != 1 || !entry->mem_bytes
+        || !control || control->pin_count != 0 || !control->mem_bytes
+        || f.out->nrows != 4) {
+        FAIL("eviction prerequisites");
+        goto out;
+    }
+    wl_columnar_continuation_cursor_t cursor =
+        *wl_columnar_continuation_cursor(cont);
+    uint64_t source_identity = f.right->relation_identity;
+    uint64_t source_generation = f.right->storage_generation;
+    const void *buckets = entry->arr.ht_head;
+    size_t bytes = entry->mem_bytes;
+    f.sess->arr_cache_limit_bytes = 1;
+    /* Building another index runs normal LRU eviction. The cold index is
+     * evicted/reused, while the producer's leased index must survive. */
+    if (!col_session_get_arrangement(&f.sess->base, "pressure", KEY0, 1)) {
+        FAIL("eviction trigger");
+        goto out;
+    }
+    control = find_entry(f.sess, "cold");
+    if ((control && control->mem_bytes != 0)
+        || find_entry(f.sess, "right") != entry
+        || entry->pin_count != 1 || !entry->evict_deferred
+        || entry->arr.ht_head != buckets || entry->mem_bytes != bytes
+        || f.right->relation_identity != source_identity
+        || f.right->storage_generation != source_generation
+        || !same_continuation_cursor(&cursor,
+        wl_columnar_continuation_cursor(cont))) {
+        FAIL("eviction did not distinguish pinned and unpinned indexes");
+        goto out;
+    }
+    if (col_join_batch_run_to_relation(cont, f.sess, f.out) != 0
+        || f.out->nrows != 40) {
+        FAIL("resume did not complete");
+        goto out;
+    }
+    bool seen[2][20] = { { false } };
+    for (uint32_t row = 0; row < f.out->nrows; row++) {
+        int64_t key = col_rel_get(f.out, row, 0);
+        int64_t payload = col_rel_get(f.out, row, 3);
+        int64_t offset = payload - key * 1000;
+        if (key < 0 || key >= 2 || offset < 0 || offset >= 20
+            || col_rel_get(f.out, row, 1) != key
+            || col_rel_get(f.out, row, 2) != key || seen[key][offset]) {
+            FAIL("resumed output differs from the independent 40-row oracle");
+            goto out;
+        }
+        seen[key][offset] = true;
+    }
+    wl_columnar_continuation_destroy(cont);
+    cont = NULL;
+    if (entry->pin_count != 0 || entry->evict_deferred
+        || entry->mem_bytes != 0 || entry->arr.ht_head != NULL) {
+        FAIL("final release did not allow deferred eviction");
+        goto out;
+    }
+    PASS();
+out:
+    wl_columnar_continuation_destroy(cont);
+    col_rel_destroy(cold);
+    col_rel_destroy(pressure);
+    fixture_fini(&f);
+}
+
+/* A collision control is separate from the eviction/lifetime control. */
 static void
 test_true_cross_key_collision_resumes(void)
 {
@@ -2312,6 +2416,7 @@ main(void)
     test_sink_failure_before_and_after_commit();
     test_stale_inputs_are_rejected();
     test_true_cross_key_collision_resumes();
+    test_suspended_producer_survives_eviction();
     test_exact_fit_and_one_byte_over();
     test_lease_released_on_every_path();
     test_projected_output();

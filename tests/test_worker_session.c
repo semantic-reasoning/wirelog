@@ -1925,6 +1925,99 @@ test_worker_alias_chain_checked_teardown(void)
 }
 
 static int
+test_partial_worker_adoption_cleanup_and_retry(void)
+{
+    TEST("partial worker adoption releases leases and permits retry");
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *coord = make_coordinator(&plan, &prog);
+    wl_col_session_t worker = { 0 };
+    col_rel_t *parts[2] = { NULL, NULL };
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int64_t initial[] = { 1, 2 };
+    int64_t followup[] = { 2, 3 };
+    int ok = 0;
+
+    if (!coord || insert_edges(coord, initial, 1) != 0)
+        goto out;
+    col_rel_t *source = session_find_rel(coord, "edge");
+    parts[0] = col_rel_new_auto("edge", 2);
+    parts[1] = col_rel_new_auto("blocked", 2);
+    if (!source || !parts[0] || !parts[1]
+        || col_rel_install_shared_view(parts[0], source) != 0
+        || col_rel_append_row(parts[1], followup) != 0
+        || col_rel_source_writer_acquire(parts[1], &writer) != 0)
+        goto out;
+    col_rel_t *first = parts[0];
+    col_rel_t *second = parts[1];
+    uint64_t readers = atomic_load_explicit(&source->source_access.state,
+            memory_order_acquire);
+    uint64_t aliases = col_rel_storage_alias_borrow_count(source);
+    uint64_t arena_gate =
+        atomic_load_explicit(&coord->compound_arena->access_gate,
+            memory_order_acquire);
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(coord->memory_governor);
+    uint64_t reserved = wl_columnar_memory_reserved(governor);
+
+    /* Both heap partitions pass the early storage check. Step 6 adopts
+     * the first view, then the second reader encounters our writer. The
+     * constructor cleans its partial registry/lease/compound borrow before
+     * returning ENOMEM. No partition transfers until ALL adoptions pass. */
+    int rc = col_worker_session_create(coord, 0, parts, 2, &worker);
+    if (rc != ENOMEM || parts[0] != first || parts[1] != second
+        || worker.rels || worker.nrels || worker.source_leases
+        || worker.compound_borrow.arena || worker.memory_governor
+        || worker.teardown_started
+        || atomic_load_explicit(&source->source_access.state,
+        memory_order_acquire) != readers
+        || col_rel_storage_alias_borrow_count(source) != aliases
+        || atomic_load_explicit(&coord->compound_arena->access_gate,
+        memory_order_acquire) != arena_gate
+        || wl_columnar_memory_reserved(governor) != reserved
+        || first->nrows != 1 || col_rel_get(first, 0, 0) != 1
+        || col_rel_get(first, 0, 1) != 2
+        || second->nrows != 1 || col_rel_get(second, 0, 0) != 2
+        || col_rel_get(second, 0, 1) != 3)
+        goto out;
+    if (wl_columnar_source_access_writer_release(&writer) != 0
+        || col_worker_session_create(coord, 0, parts, 2, &worker) != 0)
+        goto out;
+    if (parts[0] || parts[1] || worker.nrels != 2
+        || session_find_rel(&worker, "edge") != first
+        || session_find_rel(&worker, "blocked") != second
+        || !worker.source_leases || !worker.compound_borrow.arena
+        || atomic_load_explicit(&source->source_access.state,
+        memory_order_acquire) != readers + 1)
+        goto out;
+    if (col_worker_session_destroy(&worker) != 0
+        || col_rel_storage_alias_borrow_count(source) != 0
+        || atomic_load_explicit(&source->source_access.state,
+        memory_order_acquire) != 0
+        || atomic_load_explicit(&coord->compound_arena->access_gate,
+        memory_order_acquire) != arena_gate
+        || wl_columnar_memory_reserved(governor) != reserved
+        || wl_session_insert(&coord->base, "edge", followup, 1, 2) != 0)
+        goto out;
+    ok = source->nrows == 2 && col_rel_get(source, 0, 0) == 1
+        && col_rel_get(source, 0, 1) == 2 && col_rel_get(source, 1, 0) == 2
+        && col_rel_get(source, 1, 1) == 3;
+out:
+    if (writer.owner)
+        (void)wl_columnar_source_access_writer_release(&writer);
+    (void)col_worker_session_destroy(&worker);
+    col_rel_destroy(parts[0]);
+    col_rel_destroy(parts[1]);
+    cleanup_coordinator(coord, plan, prog);
+    if (!ok) {
+        FAIL("partial adoption ownership, cleanup, or retry");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+static int
 test_storage_alias_borrow_accounting(void)
 {
     col_rel_t *owner = col_rel_new_auto("alias-count", 1);
@@ -2931,6 +3024,7 @@ main(int argc, char **argv)
     test_rdf_graph_metadata_auto_created_when_any_graph_column();
     test_rdf_graph_metadata_absent_when_no_graph_column();
     test_worker_alias_chain_checked_teardown();
+    test_partial_worker_adoption_cleanup_and_retry();
     test_worker_teardown_refusal_is_retryable();
     test_worker_create_refuses_unpromoted_storage();
     test_worker_deferred_relation_transfer_and_retry();

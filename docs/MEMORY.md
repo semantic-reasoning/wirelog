@@ -664,6 +664,51 @@ the evaluation stack. Paths below are relative to `wirelog/columnar/`.
 | Continuation scratch and published batches | Producer owns scratch and input/index leases; synchronous sink owns committed output | Cursor advances at publication commit; destroy releases producer state; no asynchronous lifetime is implied for scratch-backed payloads | `continuation.c`, `join_batch.c`, `diff_join_batch.c` |
 | Delta-step rollback snapshots | Session owns admitted metadata, copied names and flat rows; stable relation identities prevent restoration into replacement registrations; a GC-only compound hold preserves handle IDs | Capture completes before detachment; checked restoration retains refused backups; successful evaluation or recovery releases them once; teardown discards pending backups after evaluator cleanup | `eval_delta.c`, `relation.c`, `session.c` |
 
+### Residual lifetime evidence (#1812)
+
+`timestamp_capacity` counts timestamp rows, not columns (`ncols`). Auditing
+`col_rel_prepare_resize`, `col_rel_publish_resize`, `col_rel_compact_impl`,
+`col_rel_install_shared_view_unprotected` and `col_rel_free_contents_impl` gives these
+boundaries: nonempty compaction prepares both replacements before publication,
+sets timestamp capacity to the tight row capacity, advances storage generation,
+and frees the old timestamps before settling accounting. Preparation failure
+keeps the old buffers; a later accounting refusal can conservatively retain a
+reservation after publication. Empty non-nullary compaction frees timestamps and
+zeros their capacity; nullary compaction is a no-op. A shared-column view owns
+its copied timestamp array, sized to the larger of source row capacity and
+source timestamp capacity. Column-only COW can retain that array. Consequently
+row capacity and timestamp capacity must be accounted separately; shrinking
+columns is not proof that the timestamp allocation shrank. Row reset frees the
+array, while copying/transferring replacements must preserve its metadata.
+
+The existing **Delta-step rollback snapshots** row is the live rollback-buffer
+policy, rather than a second row for dormant `retract_backup_*` fields. Its six
+axes are: **owner**, the session's `delta_rollback` record; **acquire**,
+`wl_columnar_eval_delta_capture`, before detachment; **last reader**, active
+evaluation or a pending recovery attempt; **invalidation**, stable relation
+identity checks prevent restoring into a replacement registration; **destruction**,
+`wl_columnar_eval_delta_rollback_discard`, after cleanup permits it; and
+**rebuildability**, not reconstructible from mutated live rows, so refused
+restoration retains the captured names/flat rows and compound GC hold.
+`wl_columnar_eval_delta_rollback_retry` consumes that record in recovery, and
+session/worker teardown calls discard after evaluator cleanup. This flat-row
+snapshot is not a claim to preserve arbitrary timestamp provenance.
+
+The following controls establish specific assertions, not merely that a named
+binary runs under a sanitizer:
+
+| Obligation | Assertion-bearing evidence |
+|---|---|
+| Pinned cache value resists reclaim | `test_cache_reclaimer.c:test_pin_generation_and_idempotence` holds an epoch pin through clear/reclaim; final release permits destruction. `test_borrowed_stack_keeps_independent_cache_pin` keeps exact borrowed rows and charge through reclaim and stack drain; the enclosing operation, not the stack entry, owns the explicit pin. |
+| Suspended reader resists eviction | `test_join_batch_resume.c:test_suspended_producer_survives_eviction` publishes a nonterminal batch, triggers normal LRU eviction with an unpinned control, preserves the live cursor/index, resumes to 40 exact unique rows, then permits eviction on release. |
+| Reordered rules preserve exact results | `test_recursive_scc.c:check_scc` runs both `original` and `reordered` at W1/W8 in the default and unfused test binaries; it checks all 66 `p` pairs and three `r` tuples and rejects duplicates/unexpected rows. |
+| Partial worker construction is cleaned and retryable | `test_worker_session.c:test_partial_worker_adoption_cleanup_and_retry` refuses the second partition's reader after adopting the first view; checks caller ownership, released leases/compound borrow and balanced charges; releases the writer and retries successfully. This fails before worker arena/pool creation. |
+| Checked destruction and coordinator reuse | `test_worker_session.c:test_worker_alias_chain_checked_teardown` releases two aliases in order and then inserts into the coordinator. `test_worker_teardown_refusal_is_retryable` retains owned resources across a refused destroy. `test_worker_arena_borrow.c` separately checks borrowed-arena survival and frozen lookup semantics. |
+
+Normal, ASan/UBSan and POSIX TSan executions of these controls validate the
+primitive lifetime contract. They do not replace the downstream bounded JOIN,
+transport and full DOOP integration acceptance in #1382/#1383/#1385.
+
 ### Pin acquisition and release sites
 
 The table above names the mechanism and the file.  This one names the call
@@ -684,11 +729,11 @@ table.
 proves each row's subject exists, resolves uniquely, and has a caller under
 `wirelog/`.  It does not prove that no further ownership class exists, because
 the class list is a reading result, not something derivable from a regex.  Do
-not read completeness into it.  Two of the classes #1384 enumerates are
-deliberately absent: the timestamp sub-resource, which the relation owns rather
-than being a peer class, and the rollback buffer, whose delta-step snapshot is
-already covered by the table above and whose per-relation `retract_backup_*`
-form is dormant infrastructure with no production producer.
+not read completeness into it. The timestamp row describes a relation-owned
+sub-resource, not an independently pinned peer. Live rollback snapshots are
+covered by the table above and the explicit lifecycle mapping above; the
+per-relation `retract_backup_*` form remains dormant infrastructure with no
+production producer and does not get a misleading live-resource row.
 
 It also does not prove a row's *cells* are true, so the rows carry their own
 audit state.  At least nine cells across seven of these rows were wrong on
@@ -709,6 +754,7 @@ that a second reader confirmed it.
 | Class | Owner | Acquire | Last reader | Invalidation | Destruction | Rebuildable | Read |
 |---|---|---|---|---|---|---|---|
 | Session relation storage | Session registry | `relation.c:col_rel_source_reader_acquire` | Operator holding the reader | Identity, view and storage generations invalidate dependent cached state; the held reader itself ends only at release | `relation.c:col_rel_destroy` | No | read |
+| Timestamp sub-resource | Containing relation owns its timestamp allocation, including a private copy in a shared-column view | `relation.c:col_rel_enable_timestamps` allocates under writer exclusion; containing-relation access uses `relation.c:col_rel_source_reader_acquire` | Operator holding the relation reader; there is no separate timestamp pin | Physical resize/compaction changes storage generation; row reset clears timestamp storage | `relation.c:col_rel_free_contents_impl` frees timestamps; `relation.c:col_rel_compact_impl` replaces or frees them under its writer; `relation.c:col_rel_reset_rows_locked` frees them on reset | Not from columns alone: signed differences and timestamp provenance require an explicit producer | read |
 | Worker relation view | Worker, borrowing coordinator storage | `session.c:wl_columnar_session_adopt_shared_view` | Worker task before drain | Lease retirement | `session.c:wl_columnar_session_source_leases_release_all` releases the lease; `session.c:session_destroy_relation_array_pass` destroys the view | Yes, from coordinator storage | read |
 | Coordinator compound arena | Coordinator, borrowed by workers | `compound_arena.c:wl_compound_arena_borrow` | Worker holding the borrow | None; a live borrow holds the access gate against the writer, so only the holder ends it | `compound_arena.c:wl_compound_arena_borrow_release` | No | read |
 | Owned evaluation-stack result | Stack entry, until it transfers out | `eval_stack.c:eval_stack_push` with `owned` true | Consuming operator | Ownership transfers out at `eval_stack.c:eval_stack_drain_to_session`, and where a consumer clears `owned` after handing the relation on (`eval_serial.c:wl_columnar_eval_serial_framed_relation`, and after a TDD delta publish in `eval.c`); otherwise the entry is the owner | `eval_stack.c:eval_entry_dispose`, which propagates a refusal, and `eval_stack.c:eval_stack_dispose_entry`, which re-pushes the entry on one; `join.c:diff_txn_commit_after_push` open-codes a second disposal with the unchecked `relation.c:col_rel_destroy`, so a refusal is not retained there | No | read |
@@ -793,6 +839,9 @@ evaluation releases the backups and hold, then explicitly dispatches one request
 frontier collection before observer publication. Failed recovery and teardown do
 not replay GC, and generic hold release still performs no collection. Independent
 holds or a frozen arena can still defer that explicit collection attempt.
+
+The resident-floor contract below applies across the managed session, including
+coordinator and worker dependencies; it is not limited to arrangement leases.
 
 An iteration or frontier boundary alone does not authorize reclamation. All
 queued tasks, consumer-held values, active probes and rollback obligations

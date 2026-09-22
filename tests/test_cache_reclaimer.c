@@ -98,6 +98,50 @@ test_pin_generation_and_idempotence(void)
 }
 
 static void
+test_borrowed_stack_keeps_independent_cache_pin(void)
+{
+    wl_mem_ledger_t ledger;
+    wl_mem_ledger_init(&ledger, 0);
+    col_mat_cache_t cache = { 0 };
+    cache.ledger = &ledger;
+    assert(col_mat_cache_attach_reclaimer(&cache) == 0);
+    col_rel_t *left = make_relation(6);
+    col_rel_t *right = make_relation(8);
+    col_rel_t *result = make_relation(7);
+    assert(col_mat_cache_insert(&cache, left, right, result) == 0);
+    col_mat_cache_pin_t pin = { 0 };
+    assert(col_mat_cache_lookup_pin(&cache, left, right, &pin) == result);
+    uint64_t identity = result->relation_identity;
+    size_t charged = cache.total_bytes;
+    assert(charged > 0);
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    assert(eval_stack_push(&stack, result, false) == 0);
+
+    col_mat_cache_clear(&cache);
+    wl_mem_reclaim_result_t reclaim = wl_mem_ledger_reclaim(&ledger);
+    assert(reclaim.bytes_released == 0);
+    assert(cache.count == 1 && cache.total_bytes == charged);
+    assert(cache.active_pins == 1 && cache.entries[0].eviction_deferred);
+    assert(result->relation_identity == identity && result->nrows == 1);
+    assert(col_rel_get(result, 0, 0) == 7);
+
+    /* A borrowed stack entry neither owns the result nor releases the pin
+     * held by its enclosing operation. */
+    assert(eval_stack_drain(&stack) == 0);
+    assert(pin.active && cache.active_pins == 1);
+    assert(cache.total_bytes == charged &&
+        result->relation_identity == identity);
+    assert(col_rel_get(result, 0, 0) == 7);
+    col_mat_cache_pin_release(&pin);
+    assert(cache.count == 0 && cache.total_bytes == 0);
+    assert(cache.active_pins == 0 && !pin.active);
+    col_mat_cache_detach_reclaimer(&cache);
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+}
+
+static void
 test_generation_mismatch(void)
 {
     wl_mem_ledger_t ledger;
@@ -245,6 +289,7 @@ main(void)
 {
     test_unregister_during_teardown();
     test_pin_generation_and_idempotence();
+    test_borrowed_stack_keeps_independent_cache_pin();
     test_generation_mismatch();
     test_shared_storage_is_rejected();
     test_lru_evicts_oldest_unpinned_entry();
