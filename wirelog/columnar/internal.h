@@ -561,6 +561,7 @@ extern wl_columnar_set_transition_hook_t wl_columnar_set_transition_hook;
 extern bool wl_columnar_relation_test_fail_prepare_resize;
 void wl_columnar_relation_test_fail_next_prepare_resize(void);
 void wl_columnar_relation_test_clear_prepare_resize(void);
+void wl_columnar_relation_test_fail_next_governed_copy_payload_alloc(void);
 #endif
 
 #ifdef WL_TEST_CONSOLIDATE_HOOK
@@ -2658,6 +2659,12 @@ col_rel_t *wl_columnar_relation_pool_new_like_governed(delta_pool_t *pool,
  */
 int
 col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena);
+/* Create an independent logical relation copy whose column and timestamp
+* buffers are admitted to @governor (or src->memory_governor when NULL).
+* Execution scratch and rollback backups are intentionally not copied. */
+int
+wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
+    wl_columnar_memory_governor_ref_t *governor);
 col_rel_t *
 col_rel_pool_new_auto(delta_pool_t *pool, wl_arena_t *arena,
     const char *name, uint32_t ncols);

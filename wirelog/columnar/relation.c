@@ -48,6 +48,13 @@ wl_columnar_relation_test_clear_prepare_resize(void)
 {
     wl_columnar_relation_test_fail_prepare_resize = false;
 }
+static bool wl_columnar_relation_fail_governed_copy_payload_alloc;
+
+void
+wl_columnar_relation_test_fail_next_governed_copy_payload_alloc(void)
+{
+    wl_columnar_relation_fail_governed_copy_payload_alloc = true;
+}
 #endif
 
 static void *
@@ -3849,7 +3856,7 @@ col_rel_col_idx(const col_rel_t *r, const char *name)
  * src->compound_arity_map != NULL, src->ncols > 0. Callers gate on these.
  *
  * Returns 0 on success (compound metadata installed on dst), -1 on
- * width-inconsistency or allocation failure (dst's compound metadata is
+ * width-inconsistency, -2 on allocation failure (dst's compound metadata is
  * left untouched, matching the existing graceful-degrade behaviour).
  */
 static int
@@ -3879,7 +3886,7 @@ col_rel_clone_compound_meta(col_rel_t *dst, const col_rel_t *src)
     uint32_t *copy = (uint32_t *)malloc(
         (size_t)logical_count * sizeof(uint32_t));
     if (!copy)
-        return -1;
+        return -2;
     memcpy(copy, src->compound_arity_map,
         (size_t)logical_count * sizeof(uint32_t));
     dst->compound_arity_map = copy;
@@ -4468,6 +4475,202 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
 
     *out = dst;
     return 0;
+}
+
+/* Materialized JOINs need a governed logical twin for the evaluator stack.
+ * Keep this separate from the legacy transient deep copy: that API also
+ * clones execution scratch and intentionally carries no governor.  Admit the
+ * destination's physical columns and timestamp allocation before allocating
+ * either buffer, while a source-reader lease keeps the observed shape stable. */
+int
+wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
+    wl_columnar_memory_governor_ref_t *governor)
+{
+    wl_columnar_source_access_reader_t reader = { 0 };
+    wl_columnar_memory_reservation_t pending;
+    col_rel_t *dst = NULL;
+    uint32_t timestamp_capacity = 0;
+    uint64_t reserved_bytes = 0;
+    int reserve_rc = 0;
+    int rc;
+
+    if (!src || !out)
+        return EINVAL;
+    *out = NULL;
+    rc = col_rel_source_reader_acquire(src, &reader);
+    if (rc != 0)
+        return rc;
+    if (src->nrows > src->capacity || (src->ncols > 0
+        && src->capacity > 0 && !src->columns)
+        || (src->timestamp_capacity > 0 && !src->timestamps)) {
+        rc = EINVAL;
+        goto done;
+    }
+    if (!governor)
+        governor = src->memory_governor;
+    rc = col_rel_alloc(&dst, src->name ? src->name : "");
+    if (rc != 0)
+        goto done;
+    if (!src->name) {
+        free(dst->name);
+        dst->name = NULL;
+    }
+    if (governor && col_rel_attach_memory_governor(dst, governor) != 0) {
+        rc = ENOMEM;
+        goto done;
+    }
+    dst->ncols = src->ncols;
+    dst->declared_ncols = src->declared_ncols;
+    dst->has_graph_column = src->has_graph_column;
+    dst->graph_col_idx = src->graph_col_idx;
+    if (src->column_types && src->ncols > 0) {
+        dst->column_types = malloc((size_t)src->ncols
+                * sizeof(*dst->column_types));
+        if (!dst->column_types) {
+            rc = ENOMEM;
+            goto done;
+        }
+        memcpy(dst->column_types, src->column_types,
+            (size_t)src->ncols * sizeof(*dst->column_types));
+    }
+    if (src->ncols > 0) {
+        dst->col_names = calloc(src->ncols, sizeof(*dst->col_names));
+        if (!dst->col_names) {
+            rc = ENOMEM;
+            goto done;
+        }
+        for (uint32_t c = 0; c < src->ncols; c++) {
+            char fallback[32];
+            const char *name = src->col_names && src->col_names[c]
+                ? src->col_names[c] : NULL;
+            if (!name) {
+                snprintf(fallback, sizeof(fallback), "col%u", c);
+                name = fallback;
+            }
+            dst->col_names[c] = wl_strdup(name);
+            if (!dst->col_names[c]) {
+                rc = ENOMEM;
+                goto done;
+            }
+        }
+    }
+    if (wl_columnar_relation_init_arrow_schema(dst) != 0) {
+        rc = ENOMEM;
+        goto done;
+    }
+    if (src->compound_kind != WIRELOG_COMPOUND_KIND_NONE) {
+        int compound_rc = (!src->compound_arity_map || src->ncols == 0)
+            ? -1 : col_rel_clone_compound_meta(dst, src);
+        if (compound_rc != 0) {
+            rc = compound_rc == -2 ? ENOMEM : EINVAL;
+            goto done;
+        }
+    }
+    dst->capacity = src->capacity;
+    timestamp_capacity = src->timestamps
+        ? (src->timestamp_capacity > src->capacity
+            ? src->timestamp_capacity : src->capacity) : 0;
+    if (src->timestamps && src->timestamp_capacity < src->nrows) {
+        rc = EINVAL;
+        goto done;
+    }
+    reserve_rc = col_rel_reserve_transition(dst, dst->capacity,
+            timestamp_capacity, &pending, &reserved_bytes);
+    if (reserve_rc < 0) {
+        rc = ENOMEM;
+        goto done;
+    }
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    if (wl_columnar_relation_fail_governed_copy_payload_alloc) {
+        wl_columnar_relation_fail_governed_copy_payload_alloc = false;
+        rc = ENOMEM;
+        goto rollback;
+    }
+#endif
+    if (dst->ncols > 0 && dst->capacity > 0) {
+        dst->columns = col_columns_alloc(dst->ncols, dst->capacity);
+        if (!dst->columns) {
+            rc = ENOMEM;
+            goto rollback;
+        }
+        if (src->nrows > 0) {
+            if (!src->columns) {
+                rc = EINVAL;
+                goto rollback;
+            }
+            for (uint32_t c = 0; c < src->ncols; c++) {
+                if (!src->columns[c]) {
+                    rc = EINVAL;
+                    goto rollback;
+                }
+                memcpy(dst->columns[c], src->columns[c],
+                    (size_t)src->nrows * sizeof(int64_t));
+            }
+        }
+    }
+    if (timestamp_capacity > 0) {
+        dst->timestamps = calloc(timestamp_capacity, sizeof(*dst->timestamps));
+        if (!dst->timestamps) {
+            rc = ENOMEM;
+            goto rollback;
+        }
+        dst->timestamp_capacity = timestamp_capacity;
+        if (src->nrows > 0)
+            memcpy(dst->timestamps, src->timestamps,
+                (size_t)src->nrows * sizeof(*dst->timestamps));
+    }
+    dst->nrows = src->nrows;
+    dst->base_nrows = src->base_nrows;
+    dst->sorted_nrows = src->sorted_nrows <= src->nrows
+        ? src->sorted_nrows : 0;
+    bool run_metadata_valid = src->run_count <= COL_MAX_RUNS;
+    uint32_t previous_end = 0;
+    if (run_metadata_valid) {
+        for (uint32_t i = 0; i < src->run_count; i++) {
+            uint32_t end = src->run_ends[i];
+            if (end <= previous_end || end > src->nrows) {
+                run_metadata_valid = false;
+                break;
+            }
+            previous_end = end;
+        }
+        if (src->run_count > 0 && previous_end != src->nrows)
+            run_metadata_valid = false;
+    }
+    if (run_metadata_valid) {
+        dst->run_count = src->run_count;
+        memcpy(dst->run_ends, src->run_ends, sizeof(dst->run_ends));
+    } else {
+        dst->run_count = 0;
+        memset(dst->run_ends, 0, sizeof(dst->run_ends));
+        dst->sorted_nrows = 0;
+    }
+    if (reserve_rc > 0) {
+        rc = col_rel_publish_retained_reservation(dst, &pending,
+                reserved_bytes, NULL);
+        if (rc != 0)
+            goto rollback;
+    }
+    *out = dst;
+    dst = NULL;
+    rc = 0;
+    goto done;
+
+rollback:
+    if (reserve_rc > 0)
+        col_rel_reservation_rollback(&pending);
+done:
+    if (dst)
+        col_rel_destroy(dst);
+    {
+        int release_rc = col_rel_source_reader_release(&reader);
+        if (rc == 0 && release_rc != 0) {
+            col_rel_destroy(*out);
+            *out = NULL;
+            rc = release_rc;
+        }
+    }
+    return rc;
 }
 
 static int
