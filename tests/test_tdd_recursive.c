@@ -2197,6 +2197,158 @@ owner_publication_add_candidate(
 }
 
 static int
+test_owner_publication_hashless_registry(void)
+{
+    wl_col_session_t sessions[2] = { 0 };
+    wl_columnar_eval_owner_publication_txn_t txn;
+    col_rel_t *target[2] = { NULL, NULL };
+    owner_publication_snapshot_t before[2] = { 0 };
+    col_rel_t **registry[2] = { NULL, NULL };
+    col_rel_t *registry_contents[2][4] = { { NULL } };
+    uint32_t registry_counts[2] = { 0, 0 };
+    const char *failure = NULL;
+    int rc = EFAULT;
+
+#define HASHLESS_CHECK(condition, message) \
+        do { if (!(condition)) { failure = (message); goto cleanup; \
+             } } while (0)
+    wl_columnar_eval_owner_publication_init(&txn);
+    for (uint32_t i = 0; i < 2; i++) {
+        sessions[i].rel_cap = 4;
+        sessions[i].rels = calloc(sessions[i].rel_cap,
+                sizeof(*sessions[i].rels));
+        HASHLESS_CHECK(sessions[i].rels, "hashless registry allocation");
+        target[i] = owner_publication_candidate(i == 0
+            ? "hashless-a" : "hashless-b", 10 + i);
+        HASHLESS_CHECK(target[i], "hashless target allocation");
+        if (session_add_rel(&sessions[i], target[i]) != 0) {
+            col_rel_destroy(target[i]);
+            target[i] = NULL;
+            failure = "hashless target registration";
+            goto cleanup;
+        }
+        target[i] = sessions[i].rels[0];
+        before[i] = owner_publication_snapshot(target[i]);
+        registry[i] = sessions[i].rels;
+        registry_counts[i] = sessions[i].nrels;
+        memcpy(registry_contents[i], sessions[i].rels,
+            sessions[i].rel_cap * sizeof(*registry_contents[i]));
+        session_rel_free_hash(&sessions[i]);
+        HASHLESS_CHECK(!sessions[i].rel_hash_head
+            && !sessions[i].rel_hash_next
+            && sessions[i].rel_hash_nbuckets == 0
+            && sessions[i].rel_hash_chain_cap == 0,
+            "clear built hash for populated session");
+    }
+
+    /* Both target lookup and registration-image staging must leave the
+     * populated-but-hashless sessions untouched on a later image failure. */
+    {
+        col_rel_t *candidate = owner_publication_candidate("hashless-a", 20);
+        HASHLESS_CHECK(candidate, "hashless replacement candidate A");
+        HASHLESS_CHECK(owner_publication_add_candidate(&txn, &sessions[0],
+            "hashless-a", target[0], &candidate) == 0,
+            "add hashless replacement A");
+        candidate = owner_publication_candidate("$new-a", 30);
+        HASHLESS_CHECK(candidate, "hashless registration candidate A");
+        HASHLESS_CHECK(owner_publication_add_candidate(&txn, &sessions[0],
+            "$new-a", NULL, &candidate) == 0,
+            "add hashless registration A");
+        candidate = owner_publication_candidate("hashless-b", 40);
+        HASHLESS_CHECK(candidate, "hashless replacement candidate B");
+        HASHLESS_CHECK(owner_publication_add_candidate(&txn, &sessions[1],
+            "hashless-b", target[1], &candidate) == 0,
+            "add hashless replacement B");
+        candidate = owner_publication_candidate("$new-b", 50);
+        HASHLESS_CHECK(candidate, "hashless registration candidate B");
+        HASHLESS_CHECK(owner_publication_add_candidate(&txn, &sessions[1],
+            "$new-b", NULL, &candidate) == 0,
+            "add hashless registration B");
+        HASHLESS_CHECK(!sessions[0].rel_hash_head
+            && !sessions[1].rel_hash_head,
+            "add leaves hashless registries unchanged");
+        HASHLESS_CHECK(wl_columnar_eval_owner_publication_prepare(&txn) == 0
+            && !sessions[0].rel_hash_head && !sessions[1].rel_hash_head,
+            "prepare does not lazily publish session hashes");
+        wl_columnar_eval_test_owner_publication_fail_registration(
+            &sessions[1], "$new-b");
+        HASHLESS_CHECK(wl_columnar_eval_owner_publication_register(&txn)
+            == ENOMEM
+            && wl_columnar_eval_test_owner_publication_registration_failure_hit()
+            &&
+            wl_columnar_eval_test_owner_publication_registration_failure_followed_image(),
+            "later image preparation fault after first image");
+        wl_columnar_eval_test_owner_publication_fail_registration(NULL, NULL);
+        for (uint32_t i = 0; i < 2; i++) {
+            HASHLESS_CHECK(sessions[i].rels == registry[i]
+                && sessions[i].nrels == registry_counts[i]
+                && memcmp(sessions[i].rels, registry_contents[i],
+                sessions[i].rel_cap * sizeof(*registry_contents[i])) == 0
+                && !sessions[i].rel_hash_head && !sessions[i].rel_hash_next
+                && sessions[i].rel_hash_nbuckets == 0
+                && sessions[i].rel_hash_chain_cap == 0
+                && owner_publication_snapshot_matches(&before[i]),
+                "failed preparation preserves hashless registry and target");
+        }
+        HASHLESS_CHECK(wl_columnar_eval_owner_publication_discard(&txn) == 0,
+            "discard failed hashless transaction");
+        for (uint32_t i = 0; i < 2; i++)
+            HASHLESS_CHECK(sessions[i].rels == registry[i]
+                && sessions[i].nrels == registry_counts[i]
+                && memcmp(sessions[i].rels, registry_contents[i],
+                sessions[i].rel_cap * sizeof(*registry_contents[i])) == 0
+                && !sessions[i].rel_hash_head && !sessions[i].rel_hash_next
+                && sessions[i].rel_hash_nbuckets == 0
+                && sessions[i].rel_hash_chain_cap == 0,
+                "discard preserves populated hashless session");
+    }
+
+    /* The same populated hashless shape succeeds, proving commit preflight
+     * also avoids lookups that would mutate the old session hash. */
+    {
+        col_rel_t *candidate;
+        wl_columnar_eval_owner_publication_init(&txn);
+        candidate = owner_publication_candidate("hashless-a", 21);
+        HASHLESS_CHECK(candidate && owner_publication_add_candidate(&txn,
+            &sessions[0], "hashless-a", target[0], &candidate) == 0,
+            "add hashless retry replacement A");
+        candidate = owner_publication_candidate("$new-a", 31);
+        HASHLESS_CHECK(candidate && owner_publication_add_candidate(&txn,
+            &sessions[0], "$new-a", NULL, &candidate) == 0,
+            "add hashless retry registration A");
+        candidate = owner_publication_candidate("hashless-b", 41);
+        HASHLESS_CHECK(candidate && owner_publication_add_candidate(&txn,
+            &sessions[1], "hashless-b", target[1], &candidate) == 0,
+            "add hashless retry replacement B");
+        candidate = owner_publication_candidate("$new-b", 51);
+        HASHLESS_CHECK(candidate && owner_publication_add_candidate(&txn,
+            &sessions[1], "$new-b", NULL, &candidate) == 0,
+            "add hashless retry registration B");
+        HASHLESS_CHECK(wl_columnar_eval_owner_publication_prepare(&txn) == 0
+            && !sessions[0].rel_hash_head && !sessions[1].rel_hash_head
+            && wl_columnar_eval_owner_publication_register(&txn) == 0
+            && wl_columnar_eval_owner_publication_commit(&txn) == 0,
+            "commit hashless sessions atomically");
+        HASHLESS_CHECK(target[0]->columns[0][0] == 21
+            && target[1]->columns[0][0] == 41
+            && sessions[0].nrels == 2 && sessions[1].nrels == 2
+            && session_find_rel(&sessions[0], "$new-a")
+            && session_find_rel(&sessions[1], "$new-b"),
+            "hashless commit publishes relations and hash tables");
+    }
+    rc = 0;
+cleanup:
+    wl_columnar_eval_test_owner_publication_fail_registration(NULL, NULL);
+    (void)wl_columnar_eval_owner_publication_discard(&txn);
+    for (uint32_t i = 0; i < 2; i++)
+        owner_publication_session_cleanup(&sessions[i]);
+    if (failure)
+        fprintf(stderr, "owner publication hashless fixture: %s\n", failure);
+#undef HASHLESS_CHECK
+    return rc == 0 ? 0 : 1;
+}
+
+static int
 test_owner_publication_existing_targets(void)
 {
     wl_col_session_t sessions[2] = { 0 };
@@ -2663,20 +2815,77 @@ test_owner_publication_transaction(void)
             goto cleanup;
     }
 
-    /* A later registration failure rolls back only registrations made here. */
+    /* A later private image failure leaves both earlier and later session
+    * registries, hashes, and the existing target exactly as published. */
     {
         col_rel_t *replacement = owner_publication_candidate("r", 2);
         col_rel_t *delta0 = owner_publication_candidate("$d$r0", 6);
         col_rel_t *delta1 = owner_publication_candidate("$d$r1", 7);
-        col_rel_t *busy_alias = NULL;
-        col_rel_t *registered_delta = NULL;
+        col_rel_t *keep1 = owner_publication_candidate("keep-one", 80);
+        col_rel_t *hole = owner_publication_candidate("remove-hole", 81);
+        col_rel_t **registry1;
+        col_rel_t **registry2;
+        uint32_t *hash1, *hash1_next, *hash2, *hash2_next;
+        uint32_t nrels1, nrels2;
+        uint32_t hash1_nbuckets, hash1_chain_cap, hash2_nbuckets,
+            hash2_chain_cap;
+        col_rel_t *registry1_contents[8] = { 0 };
+        col_rel_t *registry2_contents[8] = { 0 };
+        uint32_t hash1_heads[16] = { 0 }, hash1_next_contents[8] = { 0 };
         wl_columnar_eval_owner_publication_init(&txn);
-        if (!replacement || !delta0 || !delta1) {
+        if (!replacement || !delta0 || !delta1 || !keep1 || !hole) {
+            col_rel_destroy(replacement);
+            col_rel_destroy(delta0);
+            col_rel_destroy(delta1);
+            col_rel_destroy(keep1);
+            col_rel_destroy(hole);
+            goto cleanup;
+        }
+        if (session_add_rel(&sessions[1], keep1) != 0) {
+            col_rel_destroy(keep1);
+            col_rel_destroy(replacement);
+            col_rel_destroy(delta0);
+            col_rel_destroy(delta1);
+            col_rel_destroy(hole);
+            goto cleanup;
+        }
+        keep1 = NULL;
+        if (session_add_rel(&sessions[1], hole) != 0) {
+            col_rel_destroy(hole);
             col_rel_destroy(replacement);
             col_rel_destroy(delta0);
             col_rel_destroy(delta1);
             goto cleanup;
         }
+        hole = NULL;
+        if (session_remove_rel(&sessions[1], "remove-hole") != 0)
+            goto cleanup;
+        if (session_find_rel(&sessions[1], "keep-one") == NULL
+            || sessions[2].rel_hash_nbuckets != 0)
+            goto cleanup;
+        registry1 = sessions[1].rels;
+        registry2 = sessions[2].rels;
+        hash1 = sessions[1].rel_hash_head;
+        hash1_next = sessions[1].rel_hash_next;
+        hash2 = sessions[2].rel_hash_head;
+        hash2_next = sessions[2].rel_hash_next;
+        nrels1 = sessions[1].nrels;
+        nrels2 = sessions[2].nrels;
+        hash1_nbuckets = sessions[1].rel_hash_nbuckets;
+        hash1_chain_cap = sessions[1].rel_hash_chain_cap;
+        hash2_nbuckets = sessions[2].rel_hash_nbuckets;
+        hash2_chain_cap = sessions[2].rel_hash_chain_cap;
+        if (nrels1 > 8 || nrels2 > 8 || hash1_nbuckets > 16
+            || hash1_chain_cap > 8)
+            goto cleanup;
+        memcpy(registry1_contents, sessions[1].rels,
+            sessions[1].rel_cap * sizeof(*registry1_contents));
+        memcpy(registry2_contents, sessions[2].rels,
+            sessions[2].rel_cap * sizeof(*registry2_contents));
+        memcpy(hash1_heads, sessions[1].rel_hash_head,
+            hash1_nbuckets * sizeof(*hash1_heads));
+        memcpy(hash1_next_contents, sessions[1].rel_hash_next,
+            hash1_chain_cap * sizeof(*hash1_next_contents));
         if (wl_columnar_eval_owner_publication_add(&txn, &sessions[2],
             "$d$r1", NULL, delta1) != 0) {
             col_rel_destroy(replacement);
@@ -2704,31 +2913,51 @@ test_owner_publication_transaction(void)
             goto cleanup;
         wl_columnar_eval_test_owner_publication_fail_registration(
             &sessions[2], "$d$r1");
-        if (wl_columnar_eval_owner_publication_register(&txn) != ENOMEM)
+        if (wl_columnar_eval_owner_publication_register(&txn) != ENOMEM
+            || !wl_columnar_eval_test_owner_publication_registration_failure_hit()
+            || !
+            wl_columnar_eval_test_owner_publication_registration_failure_followed_image())
+
+
             goto cleanup;
         wl_columnar_eval_test_owner_publication_fail_registration(NULL, NULL);
-        registered_delta = session_find_rel(&sessions[1], "$d$r0");
-        busy_alias = col_rel_new_auto("$d$r0-alias", 1);
-        if (!registered_delta || !busy_alias
-            || col_rel_install_shared_view(busy_alias, registered_delta) != 0
-            || session_add_rel(&sessions[2], busy_alias) != 0) {
-            col_rel_destroy(busy_alias);
-            goto cleanup;
-        }
-        col_rel_t *registered_alias = busy_alias;
-        busy_alias = NULL;
-        if (wl_columnar_eval_owner_publication_discard(&txn) != EBUSY
+        if (sessions[1].rels != registry1 || sessions[2].rels != registry2
+            || sessions[1].rel_hash_head != hash1
+            || sessions[1].rel_hash_next != hash1_next
+            || sessions[2].rel_hash_head != hash2
+            || sessions[2].rel_hash_next != hash2_next
+            || sessions[1].nrels != nrels1 || sessions[2].nrels != nrels2
+            || sessions[1].rel_hash_nbuckets != hash1_nbuckets
+            || sessions[1].rel_hash_chain_cap != hash1_chain_cap
+            || sessions[2].rel_hash_nbuckets != hash2_nbuckets
+            || sessions[2].rel_hash_chain_cap != hash2_chain_cap
+            || memcmp(sessions[1].rels, registry1_contents,
+            sessions[1].rel_cap * sizeof(*registry1_contents)) != 0
+            || memcmp(sessions[2].rels, registry2_contents,
+            sessions[2].rel_cap * sizeof(*registry2_contents)) != 0
+            || memcmp(sessions[1].rel_hash_head, hash1_heads,
+            hash1_nbuckets * sizeof(*hash1_heads)) != 0
+            || memcmp(sessions[1].rel_hash_next, hash1_next_contents,
+            hash1_chain_cap * sizeof(*hash1_next_contents)) != 0
+            || session_find_rel(&sessions[1], "keep-one") == NULL
             || session_find_rel(&sessions[1], "$d$r0")
-            != registered_delta
-            || session_find_rel(&sessions[2], "$d$r0-alias")
-            != registered_alias
+            || session_find_rel(&sessions[2], "$d$r1")
             || target->nrows != 1
             || atomic_load_explicit(&target->source_access.state,
-            memory_order_acquire) != 0)
+            memory_order_acquire) == 0)
             goto cleanup;
-        busy_alias = NULL;
-        if (session_remove_rel(&sessions[2], "$d$r0-alias") != 0
-            || session_remove_rel(&sessions[1], "$d$r0") != 0)
+        if (wl_columnar_eval_owner_publication_discard(&txn) != 0
+            || sessions[1].rels != registry1 || sessions[2].rels != registry2
+            || sessions[1].rel_hash_head != hash1
+            || sessions[1].rel_hash_next != hash1_next
+            || sessions[2].rel_hash_head != hash2
+            || sessions[2].rel_hash_next != hash2_next
+            || memcmp(sessions[1].rels, registry1_contents,
+            sessions[1].rel_cap * sizeof(*registry1_contents)) != 0
+            || memcmp(sessions[1].rel_hash_head, hash1_heads,
+            hash1_nbuckets * sizeof(*hash1_heads)) != 0
+            || memcmp(sessions[1].rel_hash_next, hash1_next_contents,
+            hash1_chain_cap * sizeof(*hash1_next_contents)) != 0)
             goto cleanup;
         if (session_find_rel(&sessions[1], "$d$r0")
             || session_find_rel(&sessions[2], "$d$r1")
@@ -2744,11 +2973,14 @@ test_owner_publication_transaction(void)
         col_rel_t *replacement = owner_publication_candidate("r", 2);
         col_rel_t *delta0 = owner_publication_candidate("$d$r0", 6);
         col_rel_t *delta1 = owner_publication_candidate("$d$r1", 7);
+        col_rel_t *delta0_extra = owner_publication_candidate(
+            "$d$r0-extra", 8);
         wl_columnar_eval_owner_publication_init(&txn);
-        if (!replacement || !delta0 || !delta1) {
+        if (!replacement || !delta0 || !delta1 || !delta0_extra) {
             col_rel_destroy(replacement);
             col_rel_destroy(delta0);
             col_rel_destroy(delta1);
+            col_rel_destroy(delta0_extra);
             goto cleanup;
         }
         if (wl_columnar_eval_owner_publication_add(&txn, &sessions[2],
@@ -2756,6 +2988,7 @@ test_owner_publication_transaction(void)
             col_rel_destroy(replacement);
             col_rel_destroy(delta0);
             col_rel_destroy(delta1);
+            col_rel_destroy(delta0_extra);
             goto cleanup;
         }
         delta1 = NULL;
@@ -2763,6 +2996,7 @@ test_owner_publication_transaction(void)
             "r", target, replacement) != 0) {
             col_rel_destroy(replacement);
             col_rel_destroy(delta0);
+            col_rel_destroy(delta0_extra);
             wl_columnar_eval_owner_publication_discard(&txn);
             goto cleanup;
         }
@@ -2770,16 +3004,30 @@ test_owner_publication_transaction(void)
         if (wl_columnar_eval_owner_publication_add(&txn, &sessions[1],
             "$d$r0", NULL, delta0) != 0) {
             col_rel_destroy(delta0);
+            col_rel_destroy(delta0_extra);
             wl_columnar_eval_owner_publication_discard(&txn);
             goto cleanup;
         }
         delta0 = NULL;
+        if (wl_columnar_eval_owner_publication_add(&txn, &sessions[1],
+            "$d$r0-extra", NULL, delta0_extra) != 0) {
+            col_rel_destroy(delta0_extra);
+            wl_columnar_eval_owner_publication_discard(&txn);
+            goto cleanup;
+        }
+        delta0_extra = NULL;
         if (wl_columnar_eval_owner_publication_prepare(&txn) != 0
             || wl_columnar_eval_owner_publication_register(&txn) != 0
             || wl_columnar_eval_owner_publication_commit(&txn) != 0
             || target->nrows != 1 || target->columns[0][0] != 2
             || !session_find_rel(&sessions[1], "$d$r0")
-            || !session_find_rel(&sessions[2], "$d$r1"))
+            || !session_find_rel(&sessions[2], "$d$r1")
+            || !session_find_rel(&sessions[1], "keep-one")
+            || !session_find_rel(&sessions[1], "$d$r0-extra")
+            || sessions[1].nrels != 3 || sessions[2].nrels != 1
+            || strcmp(sessions[1].rels[0]->name, "keep-one") != 0
+            || strcmp(sessions[1].rels[1]->name, "$d$r0") != 0
+            || strcmp(sessions[1].rels[2]->name, "$d$r0-extra") != 0)
             goto cleanup;
         if (wl_columnar_eval_owner_publication_discard(&txn) != 0
             || wl_columnar_eval_owner_publication_discard(&txn) != 0
@@ -4018,6 +4266,11 @@ main(void)
     test_tdd_merge_schema_mismatch_rollback();
 #endif
 #ifdef WL_TEST_OWNER_PUBLICATION
+    TEST("owner publication preserves populated hashless registries");
+    if (test_owner_publication_hashless_registry() == 0)
+        PASS();
+    else
+        FAIL("owner publication hashless registry");
     TEST("owner publication with existing targets sorts and retries");
     if (test_owner_publication_existing_targets() == 0)
         PASS();

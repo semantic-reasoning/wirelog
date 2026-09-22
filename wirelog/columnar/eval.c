@@ -2167,9 +2167,24 @@ wl_columnar_eval_owner_publication_entry_compare(const void *left,
     return 0;
 }
 
+static col_rel_t *
+wl_columnar_eval_owner_publication_find_rel_linear(wl_col_session_t *session,
+    const char *name)
+{
+    if (!session || !name || (session->nrels > 0 && !session->rels))
+        return NULL;
+    for (uint32_t i = 0; i < session->nrels; i++)
+        if (session->rels[i] && session->rels[i]->name
+            && strcmp(session->rels[i]->name, name) == 0)
+            return session->rels[i];
+    return NULL;
+}
+
 #ifdef WL_TEST_OWNER_PUBLICATION
 static wl_col_session_t *wl_columnar_eval_owner_publication_fail_session;
 static const char *wl_columnar_eval_owner_publication_fail_name;
+static bool wl_columnar_eval_owner_publication_registration_fail_hit;
+static bool wl_columnar_eval_owner_publication_registration_fail_after_image;
 static wl_col_session_t *wl_columnar_eval_owner_publication_prepare_fail_session;
 static const char *wl_columnar_eval_owner_publication_prepare_fail_name;
 static bool wl_columnar_eval_owner_publication_prepare_fail_hit;
@@ -2181,6 +2196,22 @@ wl_columnar_eval_test_owner_publication_fail_registration(
 {
     wl_columnar_eval_owner_publication_fail_session = session;
     wl_columnar_eval_owner_publication_fail_name = name;
+    wl_columnar_eval_owner_publication_registration_fail_hit = false;
+    wl_columnar_eval_owner_publication_registration_fail_after_image = false;
+    wl_columnar_session_hash_test_fail_registry_image_prepare(NULL);
+}
+
+bool
+wl_columnar_eval_test_owner_publication_registration_failure_hit(void)
+{
+    return wl_columnar_eval_owner_publication_registration_fail_hit;
+}
+
+bool
+wl_columnar_eval_test_owner_publication_registration_failure_followed_image(
+    void)
+{
+    return wl_columnar_eval_owner_publication_registration_fail_after_image;
 }
 
 void
@@ -2219,37 +2250,30 @@ static int
 wl_columnar_eval_owner_publication_discard_entries(
     wl_columnar_eval_owner_publication_entry_t *entries, uint32_t count)
 {
-    int first_rc = 0;
-
     if (!entries)
         return 0;
     for (uint32_t i = count; i-- > 0; ) {
         wl_columnar_eval_owner_publication_entry_t *entry = &entries[i];
-        if (entry->registered) {
-            if (session_find_rel(entry->session, entry->name)
-                == entry->candidate) {
-                int rc = session_remove_rel(entry->session, entry->name);
-                if (rc == 0) {
-                    entry->candidate = NULL;
-                } else {
-                    /* EBUSY means the session still owns the relation.  Do
-                     * not destroy or retain its pointer after the entry is
-                     * freed; the caller must resolve the busy relation and
-                     * remove it through the session before teardown. */
-                    if (first_rc == 0)
-                        first_rc = rc;
-                    entry->candidate = NULL;
-                }
-            }
-            entry->registered = false;
-        }
         if (entry->replacement_prepared
             || entry->replacement.writer_acquired)
             col_rel_discard_replacement(&entry->replacement);
         if (entry->candidate)
             col_rel_destroy(entry->candidate);
     }
-    return first_rc;
+    return 0;
+}
+
+static void
+wl_columnar_eval_owner_publication_discard_registry_images(
+    wl_columnar_eval_owner_publication_txn_t *txn)
+{
+    for (uint32_t i = 0; i < txn->registry_image_count; i++)
+        wl_columnar_session_hash_registry_image_discard(
+            &txn->registry_images[i]);
+    free(txn->registry_images);
+    txn->registry_images = NULL;
+    txn->registry_image_count = 0;
+    txn->registry_images_prepared = false;
 }
 
 int
@@ -2279,7 +2303,8 @@ wl_columnar_eval_owner_publication_add(
             return EEXIST;
     }
     if (target && (!target->name || strcmp(target->name, name) != 0
-        || session_find_rel(session, name) != target))
+        || wl_columnar_eval_owner_publication_find_rel_linear(session, name)
+        != target))
         return EINVAL;
     if (txn->count == txn->capacity) {
         new_capacity = txn->capacity ? txn->capacity * 2u : 4u;
@@ -2320,7 +2345,8 @@ wl_columnar_eval_owner_publication_prepare(
         if (entry->target) {
             if (!entry->target->name
                 || strcmp(entry->target->name, entry->name) != 0
-                || session_find_rel(entry->session, entry->name)
+                || wl_columnar_eval_owner_publication_find_rel_linear(
+                    entry->session, entry->name)
                 != entry->target) {
                 rc = EINVAL;
                 goto fail;
@@ -2331,7 +2357,8 @@ wl_columnar_eval_owner_publication_prepare(
                 rc = rc != 0 ? rc : EBUSY;
                 goto fail;
             }
-        } else if (session_find_rel(entry->session, entry->name)) {
+        } else if (wl_columnar_eval_owner_publication_find_rel_linear(
+                entry->session, entry->name)) {
             rc = EEXIST;
             goto fail;
         }
@@ -2406,27 +2433,87 @@ wl_columnar_eval_owner_publication_register(
 {
     if (!txn || !txn->prepared)
         return EINVAL;
+    if (txn->registry_images_prepared)
+        return 0;
+    uint32_t additions = 0;
+    for (uint32_t i = 0; i < txn->count; i++) {
+        if (!txn->entries[i].target)
+            additions++;
+    }
+    if (additions == 0) {
+        txn->registry_images_prepared = true;
+        return 0;
+    }
+    txn->registry_images = calloc(additions, sizeof(*txn->registry_images));
+    if (!txn->registry_images)
+        return ENOMEM;
     for (uint32_t i = 0; i < txn->count; i++) {
         wl_columnar_eval_owner_publication_entry_t *entry = &txn->entries[i];
+        uint32_t nadd = 0;
+        col_rel_t **candidates;
+        bool prior_image = false;
         int rc;
 
         if (entry->target)
             continue;
-#ifdef WL_TEST_OWNER_PUBLICATION
-        if (wl_columnar_eval_owner_publication_fail_session == entry->session
-            && wl_columnar_eval_owner_publication_fail_name
-            && strcmp(wl_columnar_eval_owner_publication_fail_name,
-            entry->name) == 0) {
-            wl_columnar_eval_owner_publication_fail_session = NULL;
-            wl_columnar_eval_owner_publication_fail_name = NULL;
+        for (uint32_t p = 0; p < txn->registry_image_count; p++)
+            if (txn->registry_images[p].session == entry->session) {
+                prior_image = true;
+                break;
+            }
+        if (prior_image)
+            continue;
+        for (uint32_t j = i; j < txn->count; j++)
+            if (!txn->entries[j].target
+                && txn->entries[j].session == entry->session)
+                nadd++;
+        candidates = malloc((size_t)nadd * sizeof(*candidates));
+        if (!candidates) {
+            wl_columnar_eval_owner_publication_discard_registry_images(txn);
             return ENOMEM;
         }
+        uint32_t at = 0;
+        for (uint32_t j = i; j < txn->count; j++)
+            if (!txn->entries[j].target
+                && txn->entries[j].session == entry->session)
+                candidates[at++] = txn->entries[j].candidate;
+#ifdef WL_TEST_OWNER_PUBLICATION
+        if (wl_columnar_eval_owner_publication_fail_session == entry->session
+            && wl_columnar_eval_owner_publication_fail_name) {
+            for (uint32_t j = 0; j < nadd; j++) {
+                if (candidates[j]->name
+                    && strcmp(candidates[j]->name,
+                    wl_columnar_eval_owner_publication_fail_name) == 0) {
+                    wl_columnar_session_hash_test_fail_registry_image_prepare(
+                        entry->session);
+                    wl_columnar_eval_owner_publication_fail_session = NULL;
+                    wl_columnar_eval_owner_publication_fail_name = NULL;
+                    break;
+                }
+            }
+        }
 #endif
-        rc = session_add_rel(entry->session, entry->candidate);
-        if (rc != 0)
+        rc = wl_columnar_session_hash_registry_image_prepare(entry->session,
+                candidates, nadd,
+                &txn->registry_images[txn->registry_image_count]);
+        free(candidates);
+        if (rc != 0) {
+#ifdef WL_TEST_OWNER_PUBLICATION
+            if (wl_columnar_session_hash_test_registry_image_prepare_failure_hit())
+            {
+                wl_columnar_eval_owner_publication_registration_fail_hit = true;
+                wl_columnar_eval_owner_publication_registration_fail_after_image
+                    = txn->registry_image_count > 0;
+                wl_columnar_eval_owner_publication_fail_session = NULL;
+                wl_columnar_eval_owner_publication_fail_name = NULL;
+            }
+#endif
+            wl_columnar_eval_owner_publication_discard_registry_images(txn);
             return rc;
-        entry->registered = true;
+        }
+        txn->registry_image_count++;
     }
+    txn->registry_images_prepared = true;
     return 0;
 }
 
@@ -2448,7 +2535,8 @@ wl_columnar_eval_owner_publication_validate_replacement(
         >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
         || !entry->target->name
         || strcmp(entry->target->name, entry->name) != 0
-        || session_find_rel(entry->session, entry->name) != entry->target
+        || wl_columnar_eval_owner_publication_find_rel_linear(
+            entry->session, entry->name) != entry->target
         || col_rel_storage_owner_resolve(entry->target, &owner) != 0
         || owner != entry->target
         || entry->replacement.writer.owner != &owner->source_access
@@ -2475,15 +2563,20 @@ wl_columnar_eval_owner_publication_commit(
 {
     if (!txn || !txn->prepared)
         return EINVAL;
+    if (!txn->registry_images_prepared)
+        return EINVAL;
+    for (uint32_t i = 0; i < txn->registry_image_count; i++)
+        if (wl_columnar_session_hash_registry_image_validate(
+                &txn->registry_images[i]) != 0)
+            return EBUSY;
     for (uint32_t i = 0; i < txn->count; i++) {
         wl_columnar_eval_owner_publication_entry_t *entry = &txn->entries[i];
         if (!entry->target) {
-            if (!entry->registered
-                || !entry->candidate
+            if (!entry->candidate
                 || !entry->candidate->name
                 || strcmp(entry->candidate->name, entry->name) != 0
-                || session_find_rel(entry->session, entry->name)
-                != entry->candidate)
+                || wl_columnar_eval_owner_publication_find_rel_linear(
+                    entry->session, entry->name))
                 return EBUSY;
             continue;
         }
@@ -2491,6 +2584,14 @@ wl_columnar_eval_owner_publication_commit(
             != 0)
             return EINVAL;
     }
+    for (uint32_t i = 0; i < txn->registry_image_count; i++) {
+        wl_columnar_session_hash_registry_image_publish(
+            &txn->registry_images[i]);
+    }
+    free(txn->registry_images);
+    txn->registry_images = NULL;
+    txn->registry_image_count = 0;
+    txn->registry_images_prepared = false;
     for (uint32_t i = 0; i < txn->count; i++) {
         wl_columnar_eval_owner_publication_entry_t *entry = &txn->entries[i];
         if (entry->replacement_prepared) {
@@ -2502,10 +2603,8 @@ wl_columnar_eval_owner_publication_commit(
                 &entry->replacement);
             entry->replacement_prepared = false;
         }
-        if (entry->registered) {
-            entry->registered = false;
+        if (!entry->target)
             entry->candidate = NULL;
-        }
     }
     txn->prepared = false;
     return 0;
@@ -2519,6 +2618,7 @@ wl_columnar_eval_owner_publication_discard(
 
     if (!txn)
         return EINVAL;
+    wl_columnar_eval_owner_publication_discard_registry_images(txn);
     rc = wl_columnar_eval_owner_publication_discard_entries(txn->entries,
             txn->count);
     free(txn->entries);
