@@ -3101,8 +3101,10 @@ tdd_compound_map_entries(const col_rel_t *rel, uint32_t *entries_out)
     return true;
 }
 
-/* Worker results must have identical physical and logical schema metadata
- * before any result row is copied into the private candidate. */
+/* Worker results must have compatible physical and logical schema metadata
+* before any result row is copied into the private candidate.  A missing
+* type vector is the legacy spelling of an all-INT64 schema; append promotes
+* that destination metadata transactionally when the source is explicit. */
 static bool
 tdd_relation_schema_compatible(const col_rel_t *expected,
     const col_rel_t *actual)
@@ -3121,14 +3123,13 @@ tdd_relation_schema_compatible(const col_rel_t *expected,
         != actual->inline_physical_offset)
         return false;
 
-    if ((expected->column_types == NULL)
-        != (actual->column_types == NULL))
-        return false;
-    if (expected->column_types) {
-        for (uint32_t col = 0; col < expected->ncols; col++) {
-            if (expected->column_types[col] != actual->column_types[col])
-                return false;
-        }
+    for (uint32_t col = 0; col < expected->ncols; col++) {
+        wirelog_column_type_t expected_type = expected->column_types
+            ? expected->column_types[col] : WIRELOG_TYPE_INT64;
+        wirelog_column_type_t actual_type = actual->column_types
+            ? actual->column_types[col] : WIRELOG_TYPE_INT64;
+        if (expected_type != actual_type)
+            return false;
     }
 
     if ((expected->col_names == NULL) != (actual->col_names == NULL))
@@ -5528,7 +5529,7 @@ tdd_owner_build_candidate(col_rel_t *target, const char *name,
     if (!name || !out || (!inputs && input_count > 0))
         return EINVAL;
     *out = NULL;
-    if (!source) {
+    if (!source || source->ncols == 0) {
         for (uint32_t i = 0; i < input_count; i++) {
             if (inputs[i] && inputs[i]->nrows > 0) {
                 source = inputs[i];
@@ -5536,7 +5537,19 @@ tdd_owner_build_candidate(col_rel_t *target, const char *name,
             }
         }
     }
-    if (target) {
+    if (target && target->ncols == 0 && source && source->ncols > 0) {
+        /* Preserve the previous exchange behavior for an existing empty,
+         * schema-less IDB: the first accepted delta supplies its schema.
+         * The target has no rows to carry over, so building from the input
+         * also preserves its complete logical metadata. */
+        candidate = col_rel_new_like(name, source);
+        if (!candidate)
+            return ENOMEM;
+        if (target->timestamps && col_rel_enable_timestamps(candidate) != 0) {
+            col_rel_destroy(candidate);
+            return ENOMEM;
+        }
+    } else if (target) {
         rc = col_rel_deep_copy(target, &candidate, NULL);
         if (rc != 0)
             return rc;
@@ -5725,17 +5738,23 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
                 }
             }
             col_rel_t *old_delta = session_find_rel(worker, dname);
-            col_rel_t *candidate = NULL;
-            empty_inputs[0] = part;
-            rc = tdd_owner_build_candidate(old_delta, dname, empty_inputs, 1,
-                    &candidate);
-            if (rc != 0)
-                goto fail;
-            rc = wl_columnar_eval_owner_publication_add(&txn, worker, dname,
-                    old_delta, candidate);
-            if (rc != 0) {
-                col_rel_destroy(candidate);
-                goto fail;
+            /* Preserve the old empty-partition behavior: a worker with no
+             * prior delta and no rows must not receive a synthetic empty
+             * relation.  Existing deltas still get an empty replacement so
+             * their registration is retired transactionally. */
+            if (old_delta || (part && part->nrows > 0)) {
+                col_rel_t *candidate = NULL;
+                empty_inputs[0] = part;
+                rc = tdd_owner_build_candidate(old_delta, dname,
+                        empty_inputs, 1, &candidate);
+                if (rc != 0)
+                    goto fail;
+                rc = wl_columnar_eval_owner_publication_add(&txn, worker,
+                        dname, old_delta, candidate);
+                if (rc != 0) {
+                    col_rel_destroy(candidate);
+                    goto fail;
+                }
             }
         }
         free(empty_inputs);
@@ -5751,11 +5770,13 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
         any_accepted = any_accepted || accepted_rows > 0;
     }
 
-    rc = wl_columnar_eval_owner_publication_prepare(&txn);
-    if (rc == 0)
-        rc = wl_columnar_eval_owner_publication_register(&txn);
-    if (rc == 0)
-        rc = wl_columnar_eval_owner_publication_commit(&txn);
+    if (txn.count > 0) {
+        rc = wl_columnar_eval_owner_publication_prepare(&txn);
+        if (rc == 0)
+            rc = wl_columnar_eval_owner_publication_register(&txn);
+        if (rc == 0)
+            rc = wl_columnar_eval_owner_publication_commit(&txn);
+    }
     if (rc != 0)
         goto fail;
     for (uint32_t w = 0; w < W; w++)
@@ -5766,6 +5787,9 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
         *out_any_accepted = any_accepted;
     if (out_accepted_rows)
         *out_accepted_rows = accepted_total;
+    /* Commit transfers published candidates and replacement state; release
+     * the transaction container itself without touching published objects. */
+    (void)wl_columnar_eval_owner_publication_discard(&txn);
     return 0;
 
 fail:
