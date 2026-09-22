@@ -64,6 +64,13 @@ static wl_col_session_t *test_reclaim_sess;
 static const col_rel_t *test_reclaim_source;
 static bool test_fail_diff_commit;
 static bool test_diff_commit_failure_injected;
+static eval_stack_t *test_diff_commit_stack;
+static wl_columnar_source_access_reader_t test_diff_commit_reader;
+static col_rel_t *test_diff_commit_retained_rel;
+static const col_rel_t *test_diff_commit_cache_original;
+static const col_rel_t *test_diff_commit_control_cache;
+static uint32_t *test_diff_commit_segments;
+static bool test_diff_commit_refusal_witnessed;
 
 void wl_columnar_relation_test_fail_next_governed_copy_payload_alloc(void);
 
@@ -114,6 +121,47 @@ fail_next_diff_commit_after_mutation(
 {
     if (!test_fail_diff_commit || !txn || !txn->entry)
         return;
+    if (test_diff_commit_stack) {
+        if (test_diff_commit_stack->top == 0)
+            return;
+        eval_entry_t *entry = &test_diff_commit_stack->items[
+            test_diff_commit_stack->top - 1];
+        if (entry->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION || !entry->owned
+            || !entry->rel || !entry->rel->memory_governor
+            || !entry->rel->retained_reserved_bytes
+            || col_rel_source_reader_acquire(entry->rel,
+            &test_diff_commit_reader) != 0)
+            return;
+        for (uint32_t i = 0; i < txn->session->mat_cache.count; i++) {
+            const col_rel_t *cached = txn->session->mat_cache.entries[i].result;
+            if (cached && cached != entry->rel
+                && cached != test_diff_commit_control_cache) {
+                test_diff_commit_cache_original = cached;
+                break;
+            }
+        }
+        if (!test_diff_commit_cache_original) {
+            int release_rc = col_rel_source_reader_release(
+                &test_diff_commit_reader);
+            (void)release_rc;
+            return;
+        }
+        test_diff_commit_segments = calloc(3, sizeof(uint32_t));
+        if (!test_diff_commit_segments) {
+            int release_rc = col_rel_source_reader_release(
+                &test_diff_commit_reader);
+            (void)release_rc;
+            return;
+        }
+        test_diff_commit_segments[0] = 0;
+        test_diff_commit_segments[1] = 1;
+        test_diff_commit_segments[2] = entry->rel->nrows;
+        entry->seg_boundaries = test_diff_commit_segments;
+        entry->seg_count = 2;
+        entry->is_delta = true;
+        test_diff_commit_retained_rel = entry->rel;
+        test_diff_commit_refusal_witnessed = true;
+    }
     test_fail_diff_commit = false;
     txn->entry->invalidation_deferred = true;
     test_diff_commit_failure_injected = true;
@@ -1503,6 +1551,181 @@ out:
     destroy_session(sess);
 }
 
+static bool
+run_refused_diff_result_cleanup(uint32_t stack_depth)
+{
+    wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+    col_rel_t *right = make_right(2, 1);
+    col_rel_t *left = make_left(4, 2);
+    col_rel_t *control_left = make_left(1, 2);
+    wl_plan_op_t op;
+    wl_plan_op_t control_op;
+    eval_stack_t stack = { 0 };
+    eval_entry_t retry = { 0 };
+    eval_entry_t control_result = { 0 };
+    bool ok = false;
+    uint64_t baseline = 0;
+    uint64_t charged = 0;
+    uint64_t owner_bits = 0;
+    uint64_t reservation_state = 0;
+    wl_columnar_memory_reservation_t *reservation = NULL;
+    wl_columnar_memory_governor_t *reservation_governor = NULL;
+    const void *reservation_identity = NULL;
+    uint32_t *segments = NULL;
+
+    if (!sess || !right || !left || !control_left || stack_depth == 0
+        || stack_depth > COL_STACK_MAX)
+        goto out;
+    if (session_add_rel(sess, right) != 0)
+        goto out;
+    right = NULL;
+    const char *left_keys[] = { "k" };
+    const char *right_keys[] = { "k" };
+    init_join_op(&control_op, left_keys, right_keys);
+    if (run_join(sess, control_left, &control_op, &control_result) != 0
+        || !control_result.rel || !control_result.owned
+        || sess->mat_cache.count != 1)
+        goto out;
+    test_diff_commit_control_cache = sess->mat_cache.entries[0].result;
+    if (!test_diff_commit_control_cache || control_result.rel
+        == test_diff_commit_control_cache)
+        goto out;
+    col_rel_destroy(control_result.rel);
+    control_result.rel = NULL;
+    baseline = reserved_of(sess);
+    init_diff_keyed_op(&op);
+    eval_stack_init(&stack);
+    for (uint32_t i = 0; i < stack_depth; i++) {
+        if (eval_stack_push(&stack, left, false) != 0)
+            goto out;
+    }
+    test_diff_commit_stack = &stack;
+    test_diff_commit_cache_original = NULL;
+    test_diff_commit_retained_rel = NULL;
+    test_diff_commit_segments = NULL;
+    test_diff_commit_refusal_witnessed = false;
+    memset(&test_diff_commit_reader, 0, sizeof(test_diff_commit_reader));
+    test_diff_commit_failure_injected = false;
+    test_fail_diff_commit = true;
+    int rc = wl_columnar_join_diff_op(&op, &stack, sess);
+    test_diff_commit_stack = NULL;
+    if (rc != EBUSY || !test_diff_commit_failure_injected
+        || !test_diff_commit_refusal_witnessed || stack.top != stack_depth
+        || !test_diff_commit_retained_rel || !test_diff_commit_segments
+        || sess->mat_cache.count != 1
+        || sess->mat_cache.entries[0].result
+        != test_diff_commit_control_cache
+        || sess->diff_arr_count != 0
+        || sess->diff_txn_count != 0)
+        goto out;
+    eval_entry_t *retained = &stack.items[stack.top - 1];
+    segments = retained->seg_boundaries;
+    charged = retained->rel->retained_reserved_bytes;
+    reservation = &retained->rel->retained_reservation;
+    reservation_governor = reservation->governor;
+    reservation_identity = reservation->identity;
+    owner_bits = atomic_load_explicit(&reservation->owner_bits,
+            memory_order_acquire);
+    reservation_state = atomic_load_explicit(&reservation->state,
+            memory_order_acquire);
+    if (retained->rel != test_diff_commit_retained_rel
+        || retained->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION
+        || !retained->owned || !retained->is_delta
+        || retained->seg_count != 2 || segments != test_diff_commit_segments
+        || segments[0] != 0 || segments[1] != 1
+        || segments[2] != retained->rel->nrows
+        || retained->rel->memory_governor != sess->memory_governor
+        || reservation_governor
+        != wl_columnar_memory_governor_ref_get(sess->memory_governor)
+        || !reservation_identity || owner_bits == 0
+        || reservation_state != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        || reservation->bytes != charged
+        || !charged || reserved_of(sess) != baseline + charged)
+        goto out;
+    for (uint32_t i = 0; i + 1 < stack_depth; i++) {
+        if (stack.items[i].rel != left || stack.items[i].owned)
+            goto out;
+    }
+    if (eval_stack_drain(&stack) != EBUSY || stack.top != stack_depth
+        || stack.items[stack.top - 1].rel != test_diff_commit_retained_rel
+        || stack.items[stack.top - 1].seg_boundaries != segments
+        || stack.items[stack.top - 1].seg_count != 2
+        || stack.items[stack.top - 1].rel->retained_reserved_bytes != charged
+        || &stack.items[stack.top - 1].rel->retained_reservation
+        != reservation
+        || reservation->identity != reservation_identity
+        || reservation->governor != reservation_governor
+        || atomic_load_explicit(&reservation->owner_bits,
+        memory_order_acquire) != owner_bits
+        || atomic_load_explicit(&reservation->state,
+        memory_order_acquire) != reservation_state
+        || reservation->bytes != charged
+        || reserved_of(sess) != baseline + charged)
+        goto out;
+    if (col_rel_source_reader_release(&test_diff_commit_reader) != 0)
+        goto out;
+    if (eval_stack_drain(&stack) != 0 || stack.top != 0
+        || reserved_of(sess) != baseline)
+        goto out;
+    test_diff_commit_retained_rel = NULL;
+    test_diff_commit_segments = NULL;
+
+    static const int64_t expected[][4] = {
+        { 0, 0, 0, 0 }, { 1, 1, 1, 1000 },
+        { 0, 2, 0, 0 }, { 1, 3, 1, 1000 },
+    };
+    if (run_diff_join(sess, left, &op, &retry) != 0 || !retry.rel
+        || retry.rel->nrows != 4 || retry.rel->ncols != 4)
+        goto out;
+    for (uint32_t row = 0; row < 4; row++) {
+        for (uint32_t col = 0; col < 4; col++) {
+            if (col_rel_get(retry.rel, row, col) != expected[row][col])
+                goto out;
+        }
+    }
+    if (retry.owned) {
+        col_rel_destroy(retry.rel);
+        retry.rel = NULL;
+    }
+    ok = true;
+out:
+    test_diff_commit_stack = NULL;
+    test_fail_diff_commit = false;
+    if (test_diff_commit_reader.owner) {
+        int release_rc = col_rel_source_reader_release(
+            &test_diff_commit_reader);
+        (void)release_rc;
+    }
+    if (retry.owned && retry.rel)
+        col_rel_destroy(retry.rel);
+    if (control_result.owned && control_result.rel)
+        col_rel_destroy(control_result.rel);
+    if (stack.top > 0)
+        (void)eval_stack_drain(&stack);
+    test_diff_commit_retained_rel = NULL;
+    test_diff_commit_cache_original = NULL;
+    test_diff_commit_control_cache = NULL;
+    test_diff_commit_segments = NULL;
+    col_rel_destroy(left);
+    col_rel_destroy(control_left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+    return ok;
+}
+
+static void
+test_diff_commit_refusal_retains_complete_stack_entry(void)
+{
+    TEST(
+        "post-push disposal refusal retains complete JOIN result at stack limit");
+    if (!run_refused_diff_result_cleanup(1)
+        || !run_refused_diff_result_cleanup(COL_STACK_MAX)) {
+        FAIL("refused destruction lost entry ownership or accounting");
+        return;
+    }
+    PASS();
+}
+
 /* ---- case 13: materialized cache/eval-stack twin contract ------------- */
 
 static void
@@ -2045,6 +2268,7 @@ main(void)
     test_parallel_diff_denial();
     test_parallel_diff_true_admission_denial_rolls_back();
     test_diff_commit_failure_unwinds_pushed_materialization();
+    test_diff_commit_refusal_retains_complete_stack_entry();
     test_differential_cache_hit_reclaim_pin();
     test_materialized_stack_copy_contract();
     test_cache_copy_governor_precedence();

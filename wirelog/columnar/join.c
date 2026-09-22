@@ -59,6 +59,7 @@ wl_columnar_join_publish_after_left(eval_stack_t *stack, eval_entry_t *left,
     int rc = wl_columnar_join_dispose_left(stack, left, 0);
     if (rc == 0)
         rc = eval_stack_push_delta(stack, out, true, is_delta);
+    /* @out has not escaped to the stack or cache if this push fails. */
     if (rc != 0)
         col_rel_destroy(out); /* Private result has never escaped this call. */
     return rc;
@@ -114,13 +115,11 @@ diff_txn_commit_after_push(eval_stack_t *stack,
     col_mat_cache_remove_result(cache, cached_result);
 
     eval_entry_t entry;
-    if (eval_stack_pop_relation(stack, &entry) == 0) {
-        free(entry.seg_boundaries);
-        if (entry.owned)
-            col_rel_destroy(entry.rel);
-    }
+    int dispose_rc = eval_stack_pop_relation(stack, &entry);
+    if (dispose_rc == 0)
+        dispose_rc = eval_stack_dispose_entry(stack, &entry);
     wl_columnar_arrangement_diff_txn_abort(txn);
-    return rc;
+    return dispose_rc != 0 ? dispose_rc : rc;
 }
 
 #ifdef __AVX2__
@@ -772,6 +771,8 @@ col_join_cross_fill_worker_fn(void *arg)
     }
 }
 
+/* The output stays function-private until *outp is replaced. Every failure
+ * after worker submission waits for all workers before destroying it. */
 static int
 col_join_parallel_cross(wl_col_session_t *sess, const col_rel_t *left,
     const col_rel_t *right, const wl_plan_op_t *op, col_rel_t **outp,
@@ -936,6 +937,11 @@ int
 wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
 {
+    /* Raw destroys of out/copy below apply only before publication or after a
+     * failed push. Successful cache insertion transfers out to the cache and
+     * is undone with col_mat_cache_remove_result. right_filtered is the owned,
+     * uncached fallback; this operator is synchronous and retires its probe
+     * and worker users before each cleanup edge. */
     eval_entry_t left_e;
     int pop_rc = eval_stack_pop_relation(stack, &left_e);
     if (pop_rc != 0)
@@ -1735,6 +1741,9 @@ int
 wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
 {
+    /* out and its copies remain private until push; right_filtered is the
+     * uncached operation-owned fallback. Antijoin completes its synchronous
+     * probes before cleanup, and no filtered relation is transferred to cache. */
     eval_entry_t left_e;
     int pop_rc = eval_stack_pop_relation(stack, &left_e);
     if (pop_rc != 0)
@@ -1878,6 +1887,9 @@ int
 wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
 {
+    /* out and its copies remain private until push; right_filtered is the
+     * uncached operation-owned fallback. Semijoin completes its synchronous
+     * probes before cleanup, and no filtered relation is transferred to cache. */
     col_rel_t *right_filtered = NULL;
     eval_entry_t left_e;
     int pop_rc = eval_stack_pop_relation(stack, &left_e);
@@ -2168,6 +2180,9 @@ int
 wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
 {
+    /* out/copy are local until a successful stack push. Cache-owned originals
+     * are removed through the cache API; worker/probe dependencies are joined
+     * or released before local results and right_filtered are destroyed. */
     col_rel_t *right_filtered = NULL;
     eval_entry_t left_e;
     int pop_rc = eval_stack_pop_relation(stack, &left_e);
