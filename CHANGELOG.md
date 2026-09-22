@@ -6,6 +6,24 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Performance
+
+### Security
+
+### Documentation
+
+## [0.70.0] - 2026-09-22
+
+### Added
+
 - **Shell-gate walltime budget gate** (#1487):
   `scripts/ci/check-shell-gate-walltime.py` reads
   `builddir/meson-logs/testlog.json` after the suite and fails when
