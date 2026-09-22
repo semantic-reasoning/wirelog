@@ -5758,12 +5758,21 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
         col_rel_t *coord_idb =
             wl_columnar_eval_owner_publication_find_rel_linear(coord, rel_name);
         if (coord_idb && combined->nrows > 0) {
+            wl_columnar_source_access_reader_t reader = { 0 };
             if (coord_idb->ncols != 0
                 && !tdd_relation_schema_compatible(coord_idb, combined)) {
                 rc = EINVAL;
                 goto fail;
             }
+            rc = col_rel_source_reader_acquire(coord_idb, &reader);
+            if (rc != 0)
+                goto fail;
             rc = tdd_hashset_diff(combined, coord_idb);
+            {
+                int release_rc = col_rel_source_reader_release(&reader);
+                if (rc == 0)
+                    rc = release_rc;
+            }
             if (rc != 0)
                 goto fail;
         }
