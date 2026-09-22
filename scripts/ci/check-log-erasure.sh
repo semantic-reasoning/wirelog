@@ -61,7 +61,11 @@ erasure_cleanup() {
     exit "${status}"
 }
 
-ROOT="$(git rev-parse --show-toplevel)"
+SCRIPT_DIR="$(CDPATH= cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+if ! ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null)"; then
+    echo "ERROR: check-log-erasure: could not resolve the source root from ${SCRIPT_DIR}" >&2
+    exit 2
+fi
 
 if ! SCRATCH_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/wirelog-log-erasure.XXXXXX")"; then
     echo "ERROR: check-log-erasure: cannot create a scratch directory under ${TMPDIR:-/tmp}" >&2
