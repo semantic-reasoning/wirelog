@@ -2083,6 +2083,362 @@ owner_publication_session_cleanup(wl_col_session_t *session)
     session->rels = NULL;
 }
 
+typedef struct owner_publication_snapshot {
+    col_rel_t *relation;
+    uint64_t identity;
+    uint64_t view_generation;
+    uint64_t storage_generation;
+    uint32_t nrows;
+    uint32_t capacity;
+    uint32_t base_nrows;
+    uint32_t sorted_nrows;
+    uint32_t run_count;
+    uint32_t run_end;
+    int64_t row0;
+    wirelog_column_type_t type0;
+} owner_publication_snapshot_t;
+
+static owner_publication_snapshot_t
+owner_publication_snapshot(col_rel_t *rel)
+{
+    return (owner_publication_snapshot_t){
+               .relation = rel,
+               .identity = rel->relation_identity,
+               .view_generation = rel->view_generation,
+               .storage_generation = rel->storage_generation,
+               .nrows = rel->nrows,
+               .capacity = rel->capacity,
+               .base_nrows = rel->base_nrows,
+               .sorted_nrows = rel->sorted_nrows,
+               .run_count = rel->run_count,
+               .run_end = rel->run_count ? rel->run_ends[0] : 0,
+               .row0 = rel->nrows ? rel->columns[0][0] : 0,
+               .type0 = rel->column_types ? rel->column_types[0]
+                                   : WIRELOG_TYPE_INT64,
+    };
+}
+
+static bool
+owner_publication_snapshot_matches(const owner_publication_snapshot_t *snap)
+{
+    const col_rel_t *rel = snap ? snap->relation : NULL;
+    return rel && rel->relation_identity == snap->identity
+           && rel->view_generation == snap->view_generation
+           && rel->storage_generation == snap->storage_generation
+           && rel->nrows == snap->nrows && rel->capacity == snap->capacity
+           && rel->base_nrows == snap->base_nrows
+           && rel->sorted_nrows == snap->sorted_nrows
+           && rel->run_count == snap->run_count
+           && (!snap->run_count || rel->run_ends[0] == snap->run_end)
+           && (!rel->nrows || rel->columns[0][0] == snap->row0)
+           && (!rel->column_types || rel->column_types[0] == snap->type0);
+}
+
+static col_rel_t *
+owner_publication_governed_target(const char *name, int64_t value,
+    wl_columnar_memory_governor_ref_t *ref)
+{
+    col_rel_t *rel = owner_publication_candidate(name, value);
+    wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    if (!rel || col_rel_set_column_types(rel, &type, 1) != 0)
+        goto fail;
+    rel->base_nrows = 1;
+    rel->sorted_nrows = 1;
+    rel->run_count = 1;
+    rel->run_ends[0] = 1;
+    if (col_rel_attach_memory_governor(rel, ref) != 0
+        || col_rel_reserve_capacity_admitted(rel, rel->capacity, NULL) != 0)
+        goto fail;
+    return rel;
+fail:
+    col_rel_destroy(rel);
+    return NULL;
+}
+
+static col_rel_t *
+owner_publication_large_candidate(const char *name, int64_t first)
+{
+    col_rel_t *candidate = col_rel_new_auto(name, 1);
+    wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    if (!candidate || col_rel_set_column_types(candidate, &type, 1) != 0)
+        goto fail;
+    for (uint32_t i = 0; i < COL_REL_INIT_CAP + 1u; i++) {
+        int64_t value = first + i;
+        if (col_rel_append_row(candidate, &value) != 0)
+            goto fail;
+    }
+    candidate->base_nrows = 1;
+    candidate->sorted_nrows = candidate->nrows;
+    candidate->run_count = 1;
+    candidate->run_ends[0] = candidate->nrows;
+    return candidate;
+fail:
+    col_rel_destroy(candidate);
+    return NULL;
+}
+
+static int
+owner_publication_add_candidate(
+    wl_columnar_eval_owner_publication_txn_t *txn,
+    wl_col_session_t *session, const char *name, col_rel_t *target,
+    col_rel_t **candidate)
+{
+    if (!candidate || !*candidate)
+        return EINVAL;
+    int rc = wl_columnar_eval_owner_publication_add(txn, session, name,
+            target, *candidate);
+    if (rc == 0)
+        *candidate = NULL;
+    else {
+        col_rel_destroy(*candidate);
+        *candidate = NULL;
+    }
+    return rc;
+}
+
+static int
+test_owner_publication_existing_targets(void)
+{
+    wl_col_session_t sessions[2] = { 0 };
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    col_rel_t *low = NULL, *high = NULL;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    bool reader_held = false;
+    wl_columnar_eval_owner_publication_txn_t txn;
+    owner_publication_snapshot_t low_before = { 0 }, high_before = { 0 };
+    col_rel_t **low_registry = NULL, **high_registry = NULL;
+    uint32_t low_registry_count = 0, high_registry_count = 0;
+    const char *failure = NULL;
+    uint64_t budget_baseline = 0;
+    int rc = EFAULT;
+
+#define OWNER_CHECK(condition, message) \
+        do { if (!(condition)) { failure = (message); goto cleanup; \
+             } } while (0)
+    wl_columnar_eval_owner_publication_init(&txn);
+    resolution.budget_bytes = UINT64_C(1) << 20;
+    resolution.usable_bytes = resolution.budget_bytes;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    OWNER_CHECK(ref, "governor setup");
+    for (uint32_t i = 0; i < 2; i++) {
+        sessions[i].rel_cap = 4;
+        sessions[i].rels = calloc(sessions[i].rel_cap,
+                sizeof(*sessions[i].rels));
+        OWNER_CHECK(sessions[i].rels, "session registry setup");
+    }
+    low = owner_publication_governed_target("owner-low", 10, ref);
+    high = owner_publication_governed_target("owner-high", 20, ref);
+    OWNER_CHECK(low && high && low->relation_identity < high->relation_identity
+        && session_add_rel(&sessions[0], low) == 0
+        && session_add_rel(&sessions[1], high) == 0,
+        "existing target setup and canonical identity order");
+    low_before = owner_publication_snapshot(low);
+    high_before = owner_publication_snapshot(high);
+    low_registry = sessions[0].rels;
+    high_registry = sessions[1].rels;
+    low_registry_count = sessions[0].nrels;
+    high_registry_count = sessions[1].nrels;
+    budget_baseline = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+
+    /* Add in reverse canonical order. A reader on the later owner must fail
+     * preparation after the earlier writer was acquired, which discard must
+     * release without changing either session registry or target. */
+    {
+        col_rel_t *candidate_high = owner_publication_candidate("owner-high",
+                200);
+        if (!candidate_high) {
+            failure = "reader candidates";
+            goto cleanup;
+        }
+        OWNER_CHECK(owner_publication_add_candidate(&txn, &sessions[1],
+            "owner-high", high, &candidate_high) == 0,
+            "add later target first");
+        col_rel_t *candidate_low = owner_publication_candidate("owner-low",
+                100);
+        if (!candidate_low) {
+            failure = "reader candidate allocation";
+            goto cleanup;
+        }
+        OWNER_CHECK(owner_publication_add_candidate(&txn, &sessions[0],
+            "owner-low", low, &candidate_low) == 0,
+            "add earlier target second");
+        OWNER_CHECK(col_rel_source_reader_acquire(high, &reader) == 0,
+            "acquire reader on later owner");
+        reader_held = true;
+        OWNER_CHECK(wl_columnar_eval_owner_publication_prepare(&txn) == EBUSY
+            && txn.count == 0
+            && atomic_load_explicit(&low->source_access.state,
+            memory_order_acquire) == 0
+            && session_find_rel(&sessions[0], "owner-low") == low
+            && session_find_rel(&sessions[1], "owner-high") == high
+            && sessions[0].rels == low_registry
+            && sessions[1].rels == high_registry
+            && sessions[0].nrels == low_registry_count
+            && sessions[1].nrels == high_registry_count
+            && owner_publication_snapshot_matches(&low_before)
+            && owner_publication_snapshot_matches(&high_before)
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == budget_baseline,
+            "later reader refusal releases earlier writer without publication");
+        OWNER_CHECK(col_rel_source_reader_release(&reader) == 0,
+            "release later owner reader");
+        reader_held = false;
+        OWNER_CHECK(wl_columnar_eval_owner_publication_discard(&txn) == 0,
+            "reader-failure transaction discard is idempotent");
+    }
+
+    /* Fail at the later existing-target prepare after the earlier target has
+     * a private replacement and committed charge, then retry that same
+     * logical two-target publication with fresh candidates. */
+    {
+        col_rel_t *candidate_high = owner_publication_large_candidate(
+            "owner-high", 2000);
+        if (!candidate_high) {
+            failure = "fault candidates";
+            goto cleanup;
+        }
+        OWNER_CHECK(owner_publication_add_candidate(&txn, &sessions[1],
+            "owner-high", high, &candidate_high) == 0,
+            "fault add later target first");
+        col_rel_t *candidate_low = owner_publication_large_candidate(
+            "owner-low", 1000);
+        if (!candidate_low) {
+            failure = "fault candidate allocation";
+            goto cleanup;
+        }
+        OWNER_CHECK(owner_publication_add_candidate(&txn, &sessions[0],
+            "owner-low", low, &candidate_low) == 0,
+            "fault add earlier target second");
+        wl_columnar_eval_test_owner_publication_fail_prepare(&sessions[1],
+            "owner-high");
+        OWNER_CHECK(wl_columnar_eval_owner_publication_prepare(&txn) == ENOMEM
+            && wl_columnar_eval_test_owner_publication_prepare_failure_hit()
+            &&
+            wl_columnar_eval_test_owner_publication_prepare_failure_followed_prepared()
+            && txn.count == 0
+            && owner_publication_snapshot_matches(&low_before)
+            && owner_publication_snapshot_matches(&high_before)
+            && atomic_load_explicit(&low->source_access.state,
+            memory_order_acquire) == 0
+            && atomic_load_explicit(&high->source_access.state,
+            memory_order_acquire) == 0
+            && session_find_rel(&sessions[0], "owner-low") == low
+            && session_find_rel(&sessions[1], "owner-high") == high
+            && sessions[0].rels == low_registry
+            && sessions[1].rels == high_registry
+            && sessions[0].nrels == low_registry_count
+            && sessions[1].nrels == high_registry_count
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == budget_baseline,
+            "later prepare failure discards earlier replacement and charge");
+        OWNER_CHECK(wl_columnar_eval_owner_publication_discard(&txn) == 0,
+            "failed prepare leaves an idempotently empty transaction");
+    }
+
+    {
+        col_rel_t *candidate_high = owner_publication_large_candidate(
+            "owner-high", 3000);
+        if (!candidate_high) {
+            failure = "retry candidates";
+            goto cleanup;
+        }
+        OWNER_CHECK(owner_publication_add_candidate(&txn, &sessions[1],
+            "owner-high", high, &candidate_high) == 0,
+            "retry add later target first");
+        col_rel_t *candidate_low = owner_publication_large_candidate(
+            "owner-low", 4000);
+        if (!candidate_low) {
+            failure = "retry candidate allocation";
+            goto cleanup;
+        }
+        OWNER_CHECK(owner_publication_add_candidate(&txn, &sessions[0],
+            "owner-low", low, &candidate_low) == 0,
+            "retry add earlier target second");
+        OWNER_CHECK(wl_columnar_eval_owner_publication_prepare(&txn) == 0
+            && txn.entries[0].target == low && txn.entries[1].target == high
+            && txn.entries[0].replacement_prepared
+            && txn.entries[1].replacement_prepared
+            && txn.entries[0].candidate == NULL
+            && txn.entries[1].candidate == NULL
+            && owner_publication_snapshot_matches(&low_before)
+            && owner_publication_snapshot_matches(&high_before)
+            && session_find_rel(&sessions[0], "owner-low") == low
+            && session_find_rel(&sessions[1], "owner-high") == high
+            && sessions[0].rels == low_registry
+            && sessions[1].rels == high_registry
+            && sessions[0].nrels == low_registry_count
+            && sessions[1].nrels == high_registry_count
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) > budget_baseline,
+            "prepare sorts owners and keeps all publication private");
+        OWNER_CHECK(wl_columnar_eval_owner_publication_register(&txn) == 0
+            && wl_columnar_eval_owner_publication_commit(&txn) == 0
+            && low->nrows == COL_REL_INIT_CAP + 1u
+            && high->nrows == COL_REL_INIT_CAP + 1u
+            && low->columns[0][0] == 4000
+            && high->columns[0][0] == 3000
+            && low->columns[0][low->nrows - 1] == 4000 + low->nrows - 1
+            && high->columns[0][high->nrows - 1]
+            == 3000 + high->nrows - 1
+            && low->base_nrows == 1 && high->base_nrows == 1
+            && low->sorted_nrows == low->nrows
+            && high->sorted_nrows == high->nrows
+            && low->run_count == 1 && high->run_count == 1
+            && low->run_ends[0] == low->nrows
+            && high->run_ends[0] == high->nrows
+            && low->column_types[0] == WIRELOG_TYPE_INT64
+            && high->column_types[0] == WIRELOG_TYPE_INT64,
+            "retry commits both outputs and replacement metadata");
+        for (uint32_t row = 0; row < low->nrows; row++) {
+            if (low->columns[0][row] != 4000 + row
+                || high->columns[0][row] != 3000 + row) {
+                failure = "retry output row contents";
+                goto cleanup;
+            }
+        }
+        uint64_t live_charge = low->retained_reserved_bytes
+            + high->retained_reserved_bytes;
+        OWNER_CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == live_charge
+            && wl_columnar_eval_owner_publication_discard(&txn) == 0
+            && wl_columnar_eval_owner_publication_discard(&txn) == 0
+            && txn.entries == NULL && txn.count == 0 && txn.capacity == 0,
+            "retry leaves exact live charges and repeated discard is safe");
+    }
+    rc = 0;
+cleanup:
+    wl_columnar_eval_test_owner_publication_fail_prepare(NULL, NULL);
+    if (reader_held)
+        (void)col_rel_source_reader_release(&reader);
+    (void)wl_columnar_eval_owner_publication_discard(&txn);
+    if (low && session_find_rel(&sessions[0], "owner-low") != low)
+        col_rel_destroy(low);
+    if (high && session_find_rel(&sessions[1], "owner-high") != high)
+        col_rel_destroy(high);
+    for (uint32_t i = 0; i < 2; i++)
+        owner_publication_session_cleanup(&sessions[i]);
+    low = high = NULL;
+    if (ref) {
+        if (wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) != 0) {
+            failure = "target reservation teardown leaked governor charge";
+            rc = EFAULT;
+        }
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (failure) {
+        fprintf(stderr, "owner publication fixture: %s\n", failure);
+        return 1;
+    }
+    return rc == 0 ? 0 : 1;
+#undef OWNER_CHECK
+}
+
 static int
 test_owner_publication_transaction(void)
 {
@@ -2425,8 +2781,10 @@ test_owner_publication_transaction(void)
             || !session_find_rel(&sessions[1], "$d$r0")
             || !session_find_rel(&sessions[2], "$d$r1"))
             goto cleanup;
-        wl_columnar_eval_owner_publication_discard(&txn);
-        wl_columnar_eval_owner_publication_discard(&txn);
+        if (wl_columnar_eval_owner_publication_discard(&txn) != 0
+            || wl_columnar_eval_owner_publication_discard(&txn) != 0
+            || txn.entries != NULL || txn.count != 0 || txn.capacity != 0)
+            goto cleanup;
         rc = 0;
     }
 
@@ -3660,6 +4018,11 @@ main(void)
     test_tdd_merge_schema_mismatch_rollback();
 #endif
 #ifdef WL_TEST_OWNER_PUBLICATION
+    TEST("owner publication with existing targets sorts and retries");
+    if (test_owner_publication_existing_targets() == 0)
+        PASS();
+    else
+        FAIL("owner publication existing-target retry");
     TEST("owner publication transaction lifecycle");
     if (test_owner_publication_transaction() == 0)
         PASS();
