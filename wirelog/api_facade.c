@@ -28,10 +28,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 
 #define WIRELOG_EXECUTOR_MAGIC UINT64_C(0x574c455845433831)
 
 int wl_facade_session_error_code(int rc, int expr_status);
+int wl_facade_session_error_code_with_budget(int rc, int expr_status,
+    bool budget_denied);
 
 struct wirelog_executor {
     uint64_t magic;
@@ -814,10 +817,11 @@ wirelog_evaluate(wirelog_executor_t *executor, wirelog_error_t *error)
         wirelog_result_free(result);
         set_error(error, ctx.failed ? WIRELOG_ERR_MEMORY
                                     : (wirelog_error_t)
-            wl_facade_session_error_code(
+            wl_facade_session_error_code_with_budget(
                 snapshot_rc,
                 col_session_get_expression_status(
-                    executor->session)));
+                    executor->session),
+                wl_session_budget_denied(executor->session)));
         return NULL;
     }
     if (!result_set_types_from_program(result, executor->program)) {

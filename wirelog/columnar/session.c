@@ -3755,10 +3755,33 @@ incremental_release_no_buf:
  */
 static void col_session_reclaim_quiescent(wl_col_session_t *sess);
 
+bool
+wl_columnar_session_budget_denied(const wl_col_session_t *sess)
+{
+    if (!sess || sess->memory_budget_denied)
+        return sess != NULL && sess->memory_budget_denied;
+    for (uint32_t i = 0; i < sess->tdd_workers_count; i++) {
+        if (sess->tdd_workers[i].memory_budget_denied)
+            return true;
+    }
+    return false;
+}
+
+void
+wl_columnar_session_budget_denial_clear(wl_col_session_t *sess)
+{
+    if (!sess)
+        return;
+    sess->memory_budget_denied = false;
+    for (uint32_t i = 0; i < sess->tdd_workers_count; i++)
+        sess->tdd_workers[i].memory_budget_denied = false;
+}
+
 static int
 col_session_step(wl_session_t *session)
 {
     wl_col_session_t *sess = COL_SESSION(session);
+    wl_columnar_session_budget_denial_clear(sess);
     if (sess->plain_step_completion_pending
         && sess->plain_step_completion_active)
         return EBUSY;
@@ -4303,6 +4326,7 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
         return EINVAL;
 
     wl_col_session_t *sess = COL_SESSION(session);
+    wl_columnar_session_budget_denial_clear(sess);
     if (sess->plain_step_completion_pending
         && sess->plain_step_completion_active)
         return EBUSY;

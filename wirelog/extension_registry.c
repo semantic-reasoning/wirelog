@@ -81,7 +81,7 @@ wl_extension_error_set_expr_status(int status)
 int
 wl_facade_session_error_code(int rc, int expr_status)
 {
-    if (rc == ENOSPC || rc == WL_ERR_MEMORY_BUDGET)
+    if (rc == WL_ERR_MEMORY_BUDGET)
         return WIRELOG_ERR_MEMORY_BUDGET;
     if (rc == ENOMEM || expr_status == 8) {
         if (expr_status == 8)
@@ -91,6 +91,15 @@ wl_facade_session_error_code(int rc, int expr_status)
     if (rc != 0)
         wl_extension_error_set_expr_status(expr_status);
     return rc == 0 ? WIRELOG_OK : WIRELOG_ERR_EXEC;
+}
+
+int
+wl_facade_session_error_code_with_budget(int rc, int expr_status,
+    bool budget_denied)
+{
+    if (budget_denied && rc == ENOSPC)
+        return WIRELOG_ERR_MEMORY_BUDGET;
+    return wl_facade_session_error_code(rc, expr_status);
 }
 
 static char *

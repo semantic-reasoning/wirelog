@@ -284,6 +284,11 @@ int
 wl_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
     void *user_data);
 
+/* True when the most recent step/snapshot stopped on governed admission
+ * denial.  Other ENOSPC meanings remain untyped at this internal boundary. */
+bool
+wl_session_budget_denied(wl_session_t *session);
+
 #ifdef __cplusplus
 }
 #endif

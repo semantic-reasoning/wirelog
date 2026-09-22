@@ -445,6 +445,8 @@ wl_columnar_eval_delta_reserve(wl_col_session_t *sess, uint64_t bytes,
     if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
         || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
         return 0;
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+        sess->memory_budget_denied = true;
     return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
         : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : EINVAL;
 }

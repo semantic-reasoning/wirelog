@@ -568,8 +568,10 @@ wirelog_session_step(wirelog_session_t *session)
     if (!session)
         return WIRELOG_ERR_EXEC;
     int rc = wl_session_step(session->inner);
-    wirelog_error_t error = (wirelog_error_t)wl_facade_session_error_code(rc,
-            COL_SESSION(session->inner)->extension_expr_status);
+    wirelog_error_t error = (wirelog_error_t)
+        wl_facade_session_error_code_with_budget(rc,
+            COL_SESSION(session->inner)->extension_expr_status,
+            wl_columnar_session_budget_denied(COL_SESSION(session->inner)));
     if (error != WIRELOG_OK)
         return error;
     return session->typed_callback_failed ? WIRELOG_ERR_EXEC : WIRELOG_OK;
@@ -692,8 +694,10 @@ wirelog_session_snapshot_typed(wirelog_session_t *session,
     session->typed_callback_failed = false;
     struct typed_snapshot_context ctx = { session, callback, user_data };
     int rc = wl_session_snapshot(session->inner, typed_snapshot_bridge, &ctx);
-    wirelog_error_t error = (wirelog_error_t)wl_facade_session_error_code(rc,
-            COL_SESSION(session->inner)->extension_expr_status);
+    wirelog_error_t error = (wirelog_error_t)
+        wl_facade_session_error_code_with_budget(rc,
+            COL_SESSION(session->inner)->extension_expr_status,
+            wl_columnar_session_budget_denied(COL_SESSION(session->inner)));
     if (error != WIRELOG_OK)
         return error;
     return session->typed_callback_failed ? WIRELOG_ERR_EXEC : WIRELOG_OK;
@@ -709,8 +713,9 @@ wirelog_session_snapshot(wirelog_session_t *session,
     if (session_has_float_relation(session))
         return WIRELOG_ERR_EXEC;
     int rc = wl_session_snapshot(session->inner, callback, user_data);
-    return (wirelog_error_t)wl_facade_session_error_code(rc,
-               COL_SESSION(session->inner)->extension_expr_status);
+    return (wirelog_error_t)wl_facade_session_error_code_with_budget(rc,
+               COL_SESSION(session->inner)->extension_expr_status,
+               wl_columnar_session_budget_denied(COL_SESSION(session->inner)));
 }
 
 wirelog_error_t

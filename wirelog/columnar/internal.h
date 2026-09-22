@@ -1832,6 +1832,10 @@ typedef struct wl_col_session_t {
     /* Last scalar-extension evaluator status.  Written by the coordinator
      * after worker barriers, never by a worker into caller TLS. */
     int extension_expr_status;
+    /* Set by evaluator admission sites when a governor denial caused the
+     * current operation to stop.  Kept separate from ENOSPC because cache
+     * refusal and compound saturation use that status too. */
+    bool memory_budget_denied;
     /* Delta-seeded incremental evaluation (issue #83).
      * When true, EDB delta relations have been pre-seeded into the session
      * before re-evaluation. FORCE_DELTA at iteration 0 pushes empty (not full)
@@ -2080,6 +2084,11 @@ typedef struct wl_col_session_t {
     bool teardown_started;
     bool teardown_reported;
 } wl_col_session_t;
+
+bool
+wl_columnar_session_budget_denied(const wl_col_session_t *sess);
+void
+wl_columnar_session_budget_denial_clear(wl_col_session_t *sess);
 
 typedef struct wl_columnar_session_hash_registry_image
     wl_columnar_session_hash_registry_image_t;
