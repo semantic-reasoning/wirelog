@@ -4349,9 +4349,35 @@ test_staged_replacement_prepared_window(void)
         == 0, "retry prepare");
     replacement_prepared = true;
     planned_bytes = replacement.reserved_bytes;
+    staged_before = replacement.staged;
+    reservation_identity_before = replacement.reservation.identity;
+    reservation_governor_before = replacement.reservation.governor;
+    reservation_bytes_before = replacement.reservation.bytes;
+    reservation_owner_before = atomic_load_explicit(
+        &replacement.reservation.owner_bits, memory_order_acquire);
+    reservation_state_before = atomic_load_explicit(
+        &replacement.reservation.state, memory_order_acquire);
+    governor_reserved_before = wl_columnar_memory_reserved(governor);
+    memcpy(dst_snapshot, dst, sizeof(dst_snapshot));
+    wl_columnar_relation_test_fail_next_commit_publication();
+    REPLACEMENT_CHECK(wl_columnar_relation_test_commit_replacement_locked(
+            dst, &replacement) == EBUSY, "retry publication fault");
+    REPLACEMENT_CHECK(replacement.staged == staged_before
+        && replacement.reservation.identity == reservation_identity_before
+        && replacement.reservation.governor == reservation_governor_before
+        && replacement.reservation.bytes == reservation_bytes_before
+        && atomic_load_explicit(&replacement.reservation.owner_bits,
+        memory_order_acquire) == reservation_owner_before
+        && atomic_load_explicit(&replacement.reservation.state,
+        memory_order_acquire) == reservation_state_before
+        && replacement.reservation_active && replacement.writer_acquired
+        && memcmp(dst_snapshot, dst, sizeof(dst_snapshot)) == 0
+        && wl_columnar_memory_reserved(governor) == governor_reserved_before,
+        "publication fault changed prepared replacement");
     /* Publication is no-fail once prepare has succeeded; the assertions
      * below are what "committed exactly once" is measured by. */
-    col_rel_commit_replacement_locked(dst, &replacement);
+    REPLACEMENT_CHECK(wl_columnar_relation_test_commit_replacement_locked(
+            dst, &replacement) == 0, "retry publication");
     replacement_prepared = false;
     REPLACEMENT_CHECK(dst->relation_identity == dst_identity_before
         && dst->columns[0] != dst_column_before
@@ -4368,6 +4394,26 @@ test_staged_replacement_prepared_window(void)
     col_rel_discard_replacement(&replacement);
     REPLACEMENT_CHECK(replacement.reserved_bytes == 0,
         "successful replacement cleanup left stale resources");
+
+    /* A rejected handoff must also be safe to discard without publishing or
+     * retaining the private writer/reservation. */
+    governor_reserved_before = wl_columnar_memory_reserved(governor);
+    REPLACEMENT_CHECK(col_rel_prepare_replacement(dst, candidate, &replacement)
+        == 0, "discard-path prepare");
+    replacement_prepared = true;
+    memcpy(dst_snapshot, dst, sizeof(dst_snapshot));
+    wl_columnar_relation_test_fail_next_commit_publication();
+    REPLACEMENT_CHECK(wl_columnar_relation_test_commit_replacement_locked(
+            dst, &replacement) == EBUSY, "discard-path publication fault");
+    col_rel_discard_replacement(&replacement);
+    replacement_prepared = false;
+    REPLACEMENT_CHECK(dst->relation_identity == dst_identity_before
+        && dst->view_generation == dst_view_before + 1u
+        && dst->storage_generation == dst_storage_before + 1u
+        && atomic_load_explicit(&dst->source_access.state,
+        memory_order_acquire) == 0
+        && wl_columnar_memory_reserved(governor) == governor_reserved_before,
+        "discard-path fault retained published state");
     failure = NULL;
 
 cleanup:

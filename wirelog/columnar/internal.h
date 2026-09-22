@@ -562,6 +562,9 @@ extern bool wl_columnar_relation_test_fail_prepare_resize;
 void wl_columnar_relation_test_fail_next_prepare_resize(void);
 void wl_columnar_relation_test_clear_prepare_resize(void);
 void wl_columnar_relation_test_fail_next_governed_copy_payload_alloc(void);
+void wl_columnar_relation_test_fail_next_commit_publication(void);
+int wl_columnar_relation_test_commit_replacement_locked(col_rel_t *dst,
+    col_rel_replacement_t *replacement);
 #endif
 
 #ifdef WL_TEST_CONSOLIDATE_HOOK

@@ -57,6 +57,13 @@ wl_columnar_relation_test_fail_next_governed_copy_payload_alloc(void)
 {
     wl_columnar_relation_fail_governed_copy_payload_alloc = true;
 }
+static bool wl_columnar_relation_fail_commit_publication;
+
+void
+wl_columnar_relation_test_fail_next_commit_publication(void)
+{
+    wl_columnar_relation_fail_commit_publication = true;
+}
 #endif
 
 static void *
@@ -5062,6 +5069,20 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     (void)release_rc;
     replacement->writer_acquired = false;
 }
+
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+int
+wl_columnar_relation_test_commit_replacement_locked(
+    col_rel_t *dst, col_rel_replacement_t *replacement)
+{
+    if (wl_columnar_relation_fail_commit_publication) {
+        wl_columnar_relation_fail_commit_publication = false;
+        return EBUSY;
+    }
+    col_rel_commit_replacement_locked(dst, replacement);
+    return 0;
+}
+#endif
 
 void
 col_rel_discard_replacement(col_rel_replacement_t *replacement)
