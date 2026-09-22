@@ -99,7 +99,10 @@ WL_LOG_ATTR_FORMAT(5, 6);
 
 /* Compile-erasure sentinel. Stripped from libwirelog when
  * -Dwirelog_log_max_level=error. Verified by scripts/ci/check-log-erasure.sh.
- * DO NOT MODIFY: the script depends on this sentinel's TRACE-level shape. */
+ * DO NOT MODIFY: the script depends on this sentinel's TRACE-level shape.
+ * The definition carries WL_LOG_ATTR_USED; without it LTO drops the sentinel
+ * at every ceiling and the gate becomes vacuous rather than failing
+ * (#1808). */
 void wl_log_erasure_sentinel(void);
 
 /* End-to-end demo helper used by tests/test_log_integration.c. Emits a single

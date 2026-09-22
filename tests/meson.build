@@ -794,9 +794,23 @@ test('log_legacy_shim', test_log_legacy_shim_exe,
 # does not ship bash. Linux/macOS coverage is sufficient for the invariants
 # they check (compile-erasure, header non-leakage, testhook symbol absence).
 if not is_windows
-  # Compile-erasure: rebuild libwirelog with -Dwirelog_log_max_level=error
-  # in an isolated build dir; assert TRACE-level WL_LOG() sentinels are
-  # absent from .rodata.
+  # Compile-erasure: in one isolated build dir, compile libwirelog at
+  # -Dwirelog_log_max_level=trace and assert the TRACE-level WL_LOG()
+  # sentinels ARE present, then reconfigure to =error and assert they are
+  # gone.  Issue #1808: the first phase is a positive control.  Without it
+  # "erased" and "never emitted" were indistinguishable, and the sentinel is
+  # unreferenced in a b_lto=true, hidden-visibility library, so LTO dropped
+  # it at both ceilings and the gate passed while asserting nothing.
+  #
+  # #1808 doubled the work -- a second full configure, compile and LTO
+  # link -- so the timeout was re-derived rather than assumed.  Measured on
+  # the #1799 run 35717520140, single-phase, across all ten CI legs: 7.69 s
+  # (TSan gcc) to 19.94 s (ubuntu clang sanitizers), macOS second-worst at
+  # 17.31 s.  Twice the worst leg is ~40 s, which is 22% of 180, so 180
+  # still holds and is KEPT.  Raising it would have cost something:
+  # the #1487 walltime gate fails a shell test that exceeds 50% of its Meson
+  # timeout, so 180 keeps that alarm at 90 s where 300 would move it to
+  # 150 s.
   test('log_abi_compile_erasure',
        find_program(meson.project_source_root() / 'scripts/ci/check-log-erasure.sh'),
        suite: 'abi',
@@ -808,6 +822,23 @@ if not is_windows
   # It drives the acceptance criterion directly -- N concurrent invocations
   # must record N distinct scratch directories -- plus a rejection case per
   # exit path, and it fails seven ways against the pre-#1799 gate.
+  #
+  # Issue #1808 made the stubs phase-aware: they parse the ceiling out of the
+  # actual -Dwirelog_log_max_level= argument, refuse a setup or configure
+  # that carries none, and record the sequence, so the suite asserts the gate
+  # asks for trace and then error BY NAME.  Without that, dropping the flag
+  # or a whole phase would leave every case green while asserting nothing --
+  # the defect #1808 fixed, reproduced one level up.  A stub cannot observe a
+  # build flag's EFFECT, so the arguments themselves are what it asserts on.
+  # The rule is an allowlist: on both setup and configure it accepts only a
+  # positional, --buildtype=release or -Dbuildtype=release, and
+  # -Dwirelog_log_max_level=<lvl>, each in the joined and the two-token
+  # spelling; every other option is refused by name -- so -Db_lto= (that is
+  # option (A), which the gate header rejects) is refused however it is
+  # spelled, and so is -Doptimization= or a native file.  Setup must name
+  # exactly one buildtype and configure none; compile must name the wirelog
+  # target.  It is a tripwire against an accidental edit, not a proof -- the
+  # environment is not an argument.
   test('log_abi_compile_erasure_selftest',
        find_program(meson.project_source_root() / 'scripts/ci/test-check-log-erasure.sh'),
        suite: 'abi',
