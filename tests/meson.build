@@ -4953,13 +4953,15 @@ test('tdd_inline_workers', test_tdd_inline_workers_exe, timeout: 300)
 test('mem_report_contract_selftest', bench_flowlog_json_py3,
      args: [files('test_mem_report_contract_selftest.py')[0]],
      suite: 'bench')
+# Two binaries, each run sequentially with WL_MEM_REPORT off and on.
+# Allow all four 300-second child budgets plus 60 seconds for the wrapper.
 test('mem_report_contract', bench_flowlog_json_py3,
      args: [files('test_mem_report_contract.py')[0],
             test_tdd_decision_stats_exe.full_path(),
             test_tdd_decision_stats_seq_exe.full_path()],
      depends: [test_tdd_decision_stats_exe, test_tdd_decision_stats_seq_exe],
      suite: 'bench',
-     timeout: 660)
+     timeout: 1260)
 
 # Issue #1380: memory ledger coverage, WL_MEM_REPORT result identity and
 # fixture baseline emission.  Built for both fusion configurations because
