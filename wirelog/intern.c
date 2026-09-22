@@ -453,7 +453,7 @@ wl_intern_attach_memory_governor(
         && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
         wl_mutex_unlock(&intern->lock);
         return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
-            ? ENOMEM : EOVERFLOW;
+            ? WL_INTERN_ERR_MEMORY_BUDGET : EOVERFLOW;
     }
     if (rebind) {
         /* Admit under the new governor first: publish commits @pending,

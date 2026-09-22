@@ -118,7 +118,8 @@ typedef enum {
  *
  * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on bad arguments or
  * backend selection, WIRELOG_ERR_INVALID_IR on plan generation failure,
- * WIRELOG_ERR_MEMORY on allocation failure.
+ * WIRELOG_ERR_MEMORY on allocation failure, WIRELOG_ERR_MEMORY_BUDGET when
+ * the configured memory budget denies admission.
  */
 WIRELOG_API wirelog_error_t
 wirelog_session_create(wirelog_program_t *program,

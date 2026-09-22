@@ -417,7 +417,7 @@ test_denied_growth_on_populated_table(void)
 }
 
 /* Attach admits the bytes the table already holds transactionally: a
- * budget one byte short of the footprint is refused with ENOMEM, no
+ * budget one byte short of the footprint is refused with the budget status, no
  * governor is retained and the table is untouched. */
 static int
 test_attach_denied_when_existing_bytes_exceed_budget(void)
@@ -437,7 +437,8 @@ test_attach_denied_when_existing_bytes_exceed_budget(void)
     fits = test_governor(old_bytes);
     if (!ref || !fits)
         return 1;
-    ok = wl_intern_attach_memory_governor(intern, ref) == ENOMEM
+    ok = wl_intern_attach_memory_governor(intern, ref)
+        == WL_INTERN_ERR_MEMORY_BUDGET
         && wl_columnar_memory_reserved(
         wl_columnar_memory_governor_ref_get(ref)) == 0
         && symbols_intact(intern, 10u) && wl_intern_count(intern) == 10u
@@ -542,7 +543,8 @@ test_denied_rebind_leaves_both_unchanged(void)
     owner = NULL;
     /* Reading the orphaned owner is valid here only because the denied
      * rebind did not free it: the table still holds its reference. */
-    ok = wl_intern_attach_memory_governor(intern, tight) == ENOMEM
+    ok = wl_intern_attach_memory_governor(intern, tight)
+        == WL_INTERN_ERR_MEMORY_BUDGET
         && wl_columnar_memory_reserved(
         wl_columnar_memory_governor_ref_get(tight)) == 0
         && wl_columnar_memory_reserved(owner_governor) == footprint

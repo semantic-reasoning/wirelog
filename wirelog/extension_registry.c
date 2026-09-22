@@ -1,6 +1,7 @@
 #include "wirelog/wirelog-extension.h"
 #include "wirelog/wirelog-internal.h"
 #include "wirelog/wirelog.h"
+#include "wirelog/intern.h"
 #include "wirelog/thread.h"
 #include <errno.h>
 #include <stdbool.h>
@@ -80,6 +81,8 @@ wl_extension_error_set_expr_status(int status)
 int
 wl_facade_session_error_code(int rc, int expr_status)
 {
+    if (rc == ENOSPC || rc == WL_ERR_MEMORY_BUDGET)
+        return WIRELOG_ERR_MEMORY_BUDGET;
     if (rc == ENOMEM || expr_status == 8) {
         if (expr_status == 8)
             wl_extension_error_set(NULL);

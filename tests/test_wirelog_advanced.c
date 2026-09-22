@@ -2369,7 +2369,7 @@ test_issue_665_partial_conjunction_multi_worker(void)
 }
 
 /* ======================================================================== */
-/* Issue #1473: create-time governor denial maps to WIRELOG_ERR_MEMORY      */
+/* Issue #1473: create-time governor denial maps to WIRELOG_ERR_MEMORY_BUDGET */
 /* ======================================================================== */
 
 static wl_columnar_memory_governor_ref_t *
@@ -2456,7 +2456,7 @@ count_denied_eval_rows(const char *relation, const int64_t *row,
 /* A governor sized to the create-time floor plus a slack that admits the
  * fact relations but not the cat() results denies the interning of the
  * derived strings (#1470 makes the step return ENOMEM).  The public
- * facades must report that as WIRELOG_ERR_MEMORY, and must not leave a
+ * facades must report that as WIRELOG_ERR_MEMORY_BUDGET, and must not leave a
  * scalar-extension diagnostic behind for a program that uses no
  * extension.  1024 bytes of slack is enough for the two one-row fact
  * relations and short of the derived strings; the same program with more
@@ -2521,7 +2521,7 @@ test_denied_eval_interning_maps_to_memory(void)
         if (denying) {
             /* The denial is a memory verdict with no row published and no
              * extension diagnostic. */
-            if (snap_err != WIRELOG_ERR_MEMORY || denied_eval_rows != 0
+            if (snap_err != WIRELOG_ERR_MEMORY_BUDGET || denied_eval_rows != 0
                 || (ext && ext[0] != '\0')) {
                 fprintf(stderr,
                     "T-1521: denial err=%d rows=%d ext='%s'\n", snap_err,
@@ -2580,7 +2580,7 @@ test_injected_governor_denial_maps_to_memory(void)
     error = wirelog_session_create(prog, WIRELOG_BACKEND_COLUMNAR, 1,
             &session);
     wl_session_testhook_set_default_options(NULL);
-    if (error != WIRELOG_ERR_MEMORY || session != NULL
+    if (error != WIRELOG_ERR_MEMORY_BUDGET || session != NULL
         || reserved_on(ref) != 0) {
         fprintf(stderr, "T-1473: create denial err=%d s=%p\n", error,
             (void *)session);
@@ -2590,7 +2590,7 @@ test_injected_governor_denial_maps_to_memory(void)
     error = wirelog_session_create_with_snapshot(prog,
             WIRELOG_BACKEND_COLUMNAR, 1, NULL, &session);
     wl_session_testhook_set_default_options(NULL);
-    if (error != WIRELOG_ERR_MEMORY || session != NULL
+    if (error != WIRELOG_ERR_MEMORY_BUDGET || session != NULL
         || reserved_on(ref) != 0) {
         fprintf(stderr, "T-1473: create_with_snapshot denial err=%d s=%p\n",
             error, (void *)session);
@@ -2642,7 +2642,7 @@ out:
 }
 
 /* Governor arithmetic overflow is EOVERFLOW at the session layer; the
- * advanced facade must report it as the memory verdict, not ERR_EXEC. */
+ * advanced facade must preserve it as ERR_EXEC, distinct from budget denial. */
 static int
 test_injected_governor_overflow_maps_to_memory(void)
 {
@@ -2676,7 +2676,7 @@ test_injected_governor_overflow_maps_to_memory(void)
     error = wirelog_session_create(prog, WIRELOG_BACKEND_COLUMNAR, 1,
             &session);
     wl_session_testhook_set_default_options(NULL);
-    if (error != WIRELOG_ERR_MEMORY || session != NULL
+    if (error != WIRELOG_ERR_EXEC || session != NULL
         || reserved_on(ref) != UINT64_MAX - 16u) {
         fprintf(stderr, "T-1473-overflow: create err=%d s=%p\n", error,
             (void *)session);
@@ -2686,7 +2686,7 @@ test_injected_governor_overflow_maps_to_memory(void)
     error = wirelog_session_create_with_snapshot(prog,
             WIRELOG_BACKEND_COLUMNAR, 1, NULL, &session);
     wl_session_testhook_set_default_options(NULL);
-    if (error != WIRELOG_ERR_MEMORY || session != NULL
+    if (error != WIRELOG_ERR_EXEC || session != NULL
         || reserved_on(ref) != UINT64_MAX - 16u) {
         fprintf(stderr, "T-1473-overflow: create_with_snapshot err=%d s=%p\n",
             error, (void *)session);

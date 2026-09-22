@@ -15,6 +15,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Internal status for governor admission denial.  Keep it distinct from
+ * ENOMEM and ENOSPC so compound saturation and allocator failures retain
+ * their existing meanings until the public facade boundary. */
+#define WL_ERR_MEMORY_BUDGET 0x10001
+
 /* Internal bridge used when evaluator failures are reported after worker
  * threads have joined.  The implementation stores the message in the
  * caller's thread-local error slot. */

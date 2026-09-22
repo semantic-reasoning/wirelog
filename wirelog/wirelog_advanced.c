@@ -455,12 +455,12 @@ wirelog_session_create_impl(wirelog_program_t *program,
             num_workers > 0 ? num_workers : 1, snapshot, &inner);
     if (rc != 0 || !inner) {
         wl_plan_free(plan);
-        /* ENOMEM is an allocation failure; EOVERFLOW is the memory
-         * governor refusing to admit the program's intern table (#1431).
-         * Both are memory verdicts under the docs/MEMORY.md contract, as
-         * the easy and executor facades already report (#1473). */
-        return (rc == ENOMEM || rc == EOVERFLOW)
-            ? WIRELOG_ERR_MEMORY : WIRELOG_ERR_EXEC;
+        /* EOVERFLOW here is governor budget exhaustion, not representation
+         * overflow: session creation reports the distinction at this edge. */
+        return rc == WL_INTERN_ERR_MEMORY_BUDGET
+            ? WIRELOG_ERR_MEMORY_BUDGET
+            : rc == ENOMEM ? WIRELOG_ERR_MEMORY
+            : WIRELOG_ERR_EXEC;
     }
 
     /* Issue #718 contract: inline `.dl` facts must be observable in
