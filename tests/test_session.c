@@ -10443,6 +10443,123 @@ cleanup:
 }
 
 #ifdef WL_SESSION_TEST_HOOKS
+static wl_columnar_source_access_reader_t kfusion_refusal_reader;
+static wl_columnar_source_access_reader_t kfusion_arena_reader;
+static bool kfusion_refusal_hook_hit;
+static col_rel_t *kfusion_refusal_source;
+static delta_pool_t *kfusion_retained_worker_pool;
+static unsigned kfusion_submit_calls;
+static wl_col_session_t *kfusion_parent_session;
+static bool kfusion_registered_during_submit;
+static wl_columnar_memory_reservation_t *kfusion_retained_reservation;
+static uintptr_t kfusion_refusal_token_identity;
+static uintptr_t kfusion_arena_token_identity;
+static bool kfusion_arena_owned_observed;
+static bool kfusion_alias_dependency_mode;
+static bool kfusion_alias_dependency_hit;
+
+static int
+kfusion_fail_second_submit(wl_work_queue_t *wq, void (*work_fn)(void *ctx),
+    void *ctx)
+{
+    kfusion_submit_calls++;
+    if (kfusion_submit_calls == 2) {
+        kfusion_registered_during_submit = kfusion_parent_session
+            && kfusion_parent_session->kfusion_pending_cohort != NULL;
+        return ENOMEM;
+    }
+    return wl_workqueue_submit(wq, work_fn, ctx);
+}
+
+static void
+kfusion_inject_mixed_cleanup_refusal(wl_col_session_t *sess,
+    eval_stack_t *stack, col_rel_t **results, uint32_t result_count)
+{
+    if (kfusion_alias_dependency_mode) {
+        if (kfusion_alias_dependency_hit || result_count == 0
+            || !results[0] || !sess->delta_pool)
+            return;
+        col_rel_t *owner = col_rel_new_like("kfusion-alias-owner",
+                results[0]);
+        col_rel_t *alias = col_rel_new_auto("kfusion-alias-result",
+                results[0]->ncols);
+        int owner_rc = owner ? col_rel_append_all(owner, results[0], NULL)
+                             : ENOMEM;
+        int alias_rc = owner_rc == 0 && alias
+            ? col_rel_install_shared_view(alias, owner) : ENOMEM;
+        if (!owner || !alias || owner_rc != 0 || alias_rc != 0) {
+            if (owner)
+                (void)col_rel_destroy_checked(owner);
+            if (alias)
+                (void)col_rel_destroy_checked(alias);
+            return;
+        }
+        if (eval_stack_push(stack, owner, true) != 0) {
+            (void)col_rel_destroy_checked(alias);
+            (void)col_rel_destroy_checked(owner);
+            return;
+        }
+        if (col_rel_destroy_checked(results[0]) != 0) {
+            (void)eval_stack_drain(stack);
+            (void)col_rel_destroy_checked(alias);
+            return;
+        }
+        results[0] = alias;
+        kfusion_alias_dependency_hit = true;
+        return;
+    }
+    if (kfusion_refusal_hook_hit || !sess->memory_governor)
+        return;
+    col_rel_t *source = kfusion_refusal_source;
+    if (!source || !sess->delta_pool)
+        return;
+    kfusion_retained_worker_pool = sess->delta_pool;
+    col_rel_t *heap = wl_columnar_relation_new_like_governed(
+        "kfusion-governed", source, sess->memory_governor);
+    if (!heap || col_rel_append_all(heap, source, NULL) != 0) {
+        if (heap)
+            col_rel_destroy(heap);
+        return;
+    }
+    col_rel_t *held = col_rel_pool_new_auto(sess->delta_pool, NULL,
+            "kfusion-cohort-held", 1);
+    col_rel_t *arena_held = col_rel_pool_new_auto(sess->delta_pool,
+            sess->eval_arena, "kfusion-arena-held", 1);
+    if (!held || col_rel_append_row(held, (int64_t[]){ 99 }) != 0
+        || col_rel_source_reader_acquire_transferable(held,
+        &kfusion_refusal_reader) != 0
+        || !arena_held
+        || !arena_held->arena_owned
+        || col_rel_append_row(arena_held, (int64_t[]){ 100 }) != 0
+        || col_rel_source_reader_acquire_transferable(arena_held,
+        &kfusion_arena_reader) != 0) {
+        if (held)
+            (void)col_rel_destroy_checked(held);
+        if (arena_held)
+            (void)col_rel_destroy_checked(arena_held);
+        col_rel_destroy(heap);
+        return;
+    }
+    kfusion_refusal_token_identity = kfusion_refusal_reader.identity;
+    kfusion_arena_token_identity = kfusion_arena_reader.identity;
+    kfusion_arena_owned_observed = arena_held->arena_owned;
+    if (eval_stack_push(stack, heap, true) != 0
+        || eval_stack_push(stack, arena_held, true) != 0
+        || eval_stack_push(stack, held, true) != 0) {
+        (void)col_rel_source_reader_release(&kfusion_refusal_reader);
+        (void)col_rel_source_reader_release(&kfusion_arena_reader);
+        (void)col_rel_destroy_checked(held);
+        (void)col_rel_destroy_checked(arena_held);
+        (void)col_rel_destroy_checked(heap);
+        return;
+    }
+    kfusion_retained_reservation = &heap->retained_reservation;
+    kfusion_refusal_hook_hit = true;
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_calloc_size = sizeof(wl_columnar_retained_eval_entry_t);
+#endif
+}
+
 static void
 test_kfusion_retained_pool_entry_retry(void)
 {
@@ -10497,6 +10614,223 @@ kfusion_retained_cleanup:
     }
     PASS();
 #undef KRETAIN_CHECK
+}
+
+static void
+test_kfusion_parallel_cohort_refusal_retry(void)
+{
+    TEST("parallel K-Fusion retains mixed worker state across refusal");
+    const char *failure = NULL;
+#define KCOHORT_CHECK(c, m) \
+        do { if (!(c)) { failure = (m); goto kfusion_cohort_cleanup; \
+             } } while (0)
+    wl_col_session_t sess = { 0 };
+    wl_plan_op_t branches[4][2] = { 0 };
+    wl_plan_op_t *branch_ptrs[4];
+    uint32_t branch_counts[4] = { 2, 2, 2, 2 };
+    wl_plan_op_k_fusion_t meta = { 4, branch_ptrs, branch_counts };
+    wl_plan_op_t op = { 0 };
+    eval_stack_t stack;
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    uint64_t pending_charge = 0;
+    col_rel_t *input = col_rel_new_auto("input", 1);
+    KCOHORT_CHECK(input != NULL, "input allocation failed");
+    KCOHORT_CHECK(col_rel_append_row(input, (int64_t[]){ 7 }) == 0,
+        "input append failed");
+    sess.num_workers = 4;
+    sess.callback_configured_workers = 4;
+    sess.callback_active_workers = 1;
+    sess.callback_parallel_execution = false;
+    /* K-Fusion allocates a minimum 4 MiB pool per active worker. */
+    resolution.budget_bytes = 256u * 1024u * 1024u;
+    resolution.usable_bytes = 256u * 1024u * 1024u;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    governor = wl_columnar_memory_governor_ref_create(&resolution);
+    KCOHORT_CHECK(governor != NULL, "governor allocation failed");
+    sess.memory_governor = governor;
+    sess.compound_arena = wl_compound_arena_create(73, 16, 4);
+    KCOHORT_CHECK(sess.compound_arena != NULL,
+        "compound arena allocation failed");
+    sess.delta_pool = delta_pool_create(32, sizeof(col_rel_t), 16384);
+    KCOHORT_CHECK(sess.delta_pool != NULL, "delta pool allocation failed");
+    KCOHORT_CHECK(session_add_rel(&sess, input) == 0,
+        "input registration failed");
+    for (uint32_t i = 0; i < 4; i++) {
+        branches[i][0].op = WL_PLAN_OP_VARIABLE;
+        branches[i][0].relation_name = "input";
+        branches[i][0].delta_mode = WL_DELTA_FORCE_FULL;
+        branches[i][1].op = WL_PLAN_OP_CONSOLIDATE;
+        branch_ptrs[i] = branches[i];
+    }
+    op.op = WL_PLAN_OP_K_FUSION;
+    op.relation_name = "out";
+    op.opaque_data = &meta;
+    eval_stack_init(&stack);
+    kfusion_refusal_hook_hit = false;
+    kfusion_alias_dependency_mode = false;
+    kfusion_alias_dependency_hit = false;
+    kfusion_retained_reservation = NULL;
+    kfusion_refusal_token_identity = 0;
+    kfusion_arena_token_identity = 0;
+    kfusion_arena_owned_observed = false;
+    kfusion_refusal_source = input;
+    kfusion_retained_worker_pool = NULL;
+    memset(&kfusion_refusal_reader, 0, sizeof(kfusion_refusal_reader));
+    memset(&kfusion_arena_reader, 0, sizeof(kfusion_arena_reader));
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_calloc_size = 0;
+#endif
+    wl_columnar_kfusion_test_before_cleanup =
+        kfusion_inject_mixed_cleanup_refusal;
+    kfusion_submit_calls = 0;
+    kfusion_parent_session = &sess;
+    kfusion_registered_during_submit = false;
+    wl_columnar_kfusion_test_submit = kfusion_fail_second_submit;
+    int rc = col_op_k_fusion(&op, &stack, &sess);
+    wl_columnar_kfusion_test_before_cleanup = NULL;
+    wl_columnar_kfusion_test_submit = NULL;
+    kfusion_parent_session = NULL;
+    kfusion_refusal_source = NULL;
+    KCOHORT_CHECK(rc == EBUSY, "busy worker cleanup was not retained");
+    KCOHORT_CHECK(sess.kfusion_pending_cohort != NULL,
+        "pending cohort ownership was not retained");
+    KCOHORT_CHECK(stack.top == 0,
+        "merged output was published before worker cleanup");
+    KCOHORT_CHECK(kfusion_refusal_hook_hit,
+        "mixed heap/pool cleanup entries were not installed");
+    KCOHORT_CHECK(kfusion_retained_worker_pool != NULL,
+        "worker delta pool was not retained with the cohort");
+    KCOHORT_CHECK(kfusion_submit_calls == 2,
+        "partial submission path was not exercised");
+    KCOHORT_CHECK(kfusion_registered_during_submit,
+        "cohort was not registered before worker submission");
+    KCOHORT_CHECK(atomic_load_explicit(&sess.compound_arena->access_gate,
+        memory_order_acquire) == 2,
+        "submitted worker borrow was not retained across refusal");
+    KCOHORT_CHECK(kfusion_arena_reader.owner != NULL,
+        "arena-backed blocker was not installed");
+    KCOHORT_CHECK(kfusion_arena_owned_observed,
+        "arena-backed blocker did not own arena storage");
+    KCOHORT_CHECK(kfusion_refusal_token_identity
+        == (uintptr_t)&kfusion_refusal_reader
+        && kfusion_arena_token_identity == (uintptr_t)&kfusion_arena_reader,
+        "reader token identities changed during cohort retention");
+    KCOHORT_CHECK(kfusion_retained_reservation != NULL
+        && atomic_load_explicit(&kfusion_retained_reservation->state,
+        memory_order_acquire)
+        == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        && kfusion_retained_reservation->bytes > 0,
+        "governed heap reservation token was not retained");
+    pending_charge = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(governor));
+    KCOHORT_CHECK(pending_charge > 0,
+        "governed heap reservation was released before retry");
+#ifdef WL_TEST_ALLOC_WRAP
+    KCOHORT_CHECK(fail_calloc_size == sizeof(wl_columnar_retained_eval_entry_t),
+        "retention unexpectedly allocated a fallback node");
+#endif
+    KCOHORT_CHECK(wl_columnar_kfusion_retry_pending(&sess) == EBUSY,
+        "first repeated refusal did not preserve the cohort");
+    KCOHORT_CHECK(wl_columnar_kfusion_retry_pending(&sess) == EBUSY,
+        "second repeated refusal did not preserve the cohort");
+    KCOHORT_CHECK(wl_columnar_session_cleanup_ready(&sess) == EBUSY,
+        "session readiness gate ignored a pending cohort");
+    KCOHORT_CHECK(sess.kfusion_pending_cohort != NULL,
+        "repeated refusal lost cohort ownership");
+    KCOHORT_CHECK(atomic_load_explicit(&sess.compound_arena->access_gate,
+        memory_order_acquire) == 2,
+        "compound arena borrow was released during repeated refusal");
+    KCOHORT_CHECK(kfusion_retained_worker_pool->slot_used > 0,
+        "worker pool storage was released during repeated refusal");
+    KCOHORT_CHECK(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)) == pending_charge,
+        "repeated refusal changed the exact governor charge");
+#ifdef WL_TEST_ALLOC_WRAP
+    KCOHORT_CHECK(fail_calloc_size == sizeof(wl_columnar_retained_eval_entry_t),
+        "repeated refusal attempted retained-node allocation");
+    fail_calloc_size = 0;
+#endif
+    KCOHORT_CHECK(col_rel_source_reader_release(&kfusion_refusal_reader) == 0,
+        "reader release failed");
+    KCOHORT_CHECK(wl_columnar_kfusion_retry_pending(&sess) == EBUSY,
+        "arena-backed relation should still refuse after pool release");
+    KCOHORT_CHECK(kfusion_retained_worker_pool->slot_used > 0,
+        "worker allocator was released while arena relation remained busy");
+    KCOHORT_CHECK(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)) == pending_charge,
+        "arena refusal changed the exact governor charge");
+    KCOHORT_CHECK(col_rel_source_reader_release(&kfusion_arena_reader) == 0,
+        "arena reader release failed");
+    KCOHORT_CHECK(wl_columnar_session_cleanup_ready(&sess) == 0,
+        "public cleanup-ready retry failed");
+    kfusion_retained_worker_pool = NULL;
+    KCOHORT_CHECK(atomic_load_explicit(&sess.compound_arena->access_gate,
+        memory_order_acquire) == 0,
+        "compound arena borrow remained after cleanup");
+    KCOHORT_CHECK(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)) == 0,
+        "governed heap reservation leaked after retry");
+    KCOHORT_CHECK(sess.kfusion_pending_cohort == NULL,
+        "cohort remained pending after cleanup");
+
+    /* A subsequent operation must evaluate afresh and publish one healthy
+     * merged result. The alias fixture proves that result cleanup can release
+     * an owner which refused from its worker stack in the same pass. */
+    kfusion_alias_dependency_mode = true;
+    kfusion_alias_dependency_hit = false;
+    wl_columnar_kfusion_test_before_cleanup =
+        kfusion_inject_mixed_cleanup_refusal;
+    int reevaluate_rc = col_op_k_fusion(&op, &stack, &sess);
+    wl_columnar_kfusion_test_before_cleanup = NULL;
+    kfusion_alias_dependency_mode = false;
+    KCOHORT_CHECK(reevaluate_rc == 0 && stack.top == 1,
+        "fresh K-Fusion evaluation did not publish its merged result");
+    KCOHORT_CHECK(kfusion_alias_dependency_hit,
+        "result-owner alias dependency was not exercised");
+    KCOHORT_CHECK(stack.items[0].rel->nrows == 1
+        && col_rel_get(stack.items[0].rel, 0, 0) == 7,
+        "fresh merged output was incomplete or duplicated");
+    KCOHORT_CHECK(eval_stack_drain(&stack) == 0,
+        "fresh merged result cleanup failed");
+
+kfusion_cohort_cleanup:
+    wl_columnar_kfusion_test_before_cleanup = NULL;
+    wl_columnar_kfusion_test_submit = NULL;
+    kfusion_parent_session = NULL;
+    kfusion_refusal_source = NULL;
+    kfusion_retained_worker_pool = NULL;
+    if (kfusion_refusal_reader.owner)
+        (void)col_rel_source_reader_release(&kfusion_refusal_reader);
+    if (kfusion_arena_reader.owner)
+        (void)col_rel_source_reader_release(&kfusion_arena_reader);
+    if (sess.kfusion_pending_cohort)
+        (void)wl_columnar_kfusion_retry_pending(&sess);
+    if (sess.wq)
+        wl_workqueue_destroy(sess.wq);
+    if (sess.compound_arena)
+        (void)wl_compound_arena_free_checked(sess.compound_arena);
+    if (sess.delta_pool) {
+        (void)col_rel_pool_destroy_aliases_checked(sess.delta_pool, 0,
+            sess.delta_pool->slot_used);
+        (void)col_rel_pool_destroy_roots_checked(sess.delta_pool, 0,
+            sess.delta_pool->slot_used);
+        delta_pool_destroy(sess.delta_pool);
+    }
+    session_rel_free_hash(&sess);
+    free(sess.rels);
+    if (input)
+        col_rel_destroy(input);
+    if (governor)
+        wl_columnar_memory_governor_ref_release(governor);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef KCOHORT_CHECK
 }
 
 static bool map_dispose_hook_hit;
@@ -11532,6 +11866,7 @@ main(void)
     test_session_remove_incremental_reader_exclusion();
 #ifdef WL_SESSION_TEST_HOOKS
     test_kfusion_retained_pool_entry_retry();
+    test_kfusion_parallel_cohort_refusal_retry();
     test_map_input_cleanup_retry();
 #endif
     test_map_entry_storage_modes();

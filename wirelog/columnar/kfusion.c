@@ -273,7 +273,240 @@ typedef struct {
     wl_col_session_t
     *sess;        /* Per-worker session wrapper (isolated mat_cache) */
     int rc;       /* Return code from evaluation */
+    bool initialized;
+    bool submitted;
 } col_op_k_fusion_worker_t;
+
+struct wl_columnar_kfusion_cohort {
+    wl_col_session_t *parent;
+    col_rel_t **results;
+    col_op_k_fusion_worker_t *workers;
+    wl_col_session_t *worker_sess;
+    uint32_t *live_indices;
+    uint32_t live_count;
+    uint32_t initialized_count;
+    uint32_t submitted_count;
+    bool dispatch_active;
+    bool barrier_complete;
+    bool resources_cleaned;
+    col_rel_t *merged;
+    int operation_rc;
+    atomic_uint_fast64_t shared_join_count;
+};
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_kfusion_test_before_cleanup)(wl_col_session_t *sess,
+    eval_stack_t *stack, col_rel_t **results, uint32_t result_count);
+int (*wl_columnar_kfusion_test_submit)(wl_work_queue_t *wq,
+    void (*work_fn)(void *ctx), void *ctx);
+#endif
+
+static int
+col_kfusion_prepare_cohort_cleanup(struct wl_columnar_kfusion_cohort *cohort)
+{
+    wl_col_session_t *parent = cohort->parent;
+    if (!cohort->barrier_complete && cohort->submitted_count > 0) {
+        int rc = wl_workqueue_drain(parent->wq);
+        if (rc != 0)
+            return rc;
+        cohort->barrier_complete = true;
+    }
+    for (;;) {
+        size_t before = 0;
+        size_t after = 0;
+        int first_rc = 0;
+        for (uint32_t d = 0; d < cohort->initialized_count; d++) {
+            wl_col_session_t *worker_sess = &cohort->worker_sess[d];
+            before += cohort->workers[d].stack.top;
+            before += worker_sess->deferred_relation_count;
+            before += worker_sess->retained_eval_entry_count;
+        }
+        for (uint32_t d = 0; d < cohort->live_count; d++)
+            before += cohort->results[d] != NULL;
+
+        /* Visit every owner before retrying. A result alias can be the reason
+         * a lower worker-stack owner refuses destruction; freeing that alias
+         * makes the next pass able to drain the stack. */
+        for (uint32_t d = 0; d < cohort->initialized_count; d++) {
+            int rc = eval_stack_drain_to_session(&cohort->workers[d].stack,
+                    &cohort->worker_sess[d]);
+            if (rc != 0 && first_rc == 0)
+                first_rc = rc;
+        }
+        for (uint32_t d = 0; d < cohort->initialized_count; d++) {
+            int rc = wl_columnar_session_retry_deferred(
+                &cohort->worker_sess[d]);
+            if (rc != 0 && first_rc == 0)
+                first_rc = rc;
+            rc = wl_columnar_session_retry_retained_eval_entries(
+                &cohort->worker_sess[d]);
+            if (rc != 0 && first_rc == 0)
+                first_rc = rc;
+        }
+        for (uint32_t d = 0; d < cohort->live_count; d++) {
+            if (!cohort->results[d])
+                continue;
+            int rc = col_rel_destroy_checked(cohort->results[d]);
+            if (rc == 0)
+                cohort->results[d] = NULL;
+            else if (first_rc == 0)
+                first_rc = rc;
+        }
+
+        for (uint32_t d = 0; d < cohort->initialized_count; d++) {
+            wl_col_session_t *worker_sess = &cohort->worker_sess[d];
+            after += cohort->workers[d].stack.top;
+            after += worker_sess->deferred_relation_count;
+            after += worker_sess->retained_eval_entry_count;
+        }
+        for (uint32_t d = 0; d < cohort->live_count; d++)
+            after += cohort->results[d] != NULL;
+        if (after == 0)
+            return 0;
+        if (after >= before)
+            return first_rc != 0 ? first_rc : EBUSY;
+    }
+}
+
+static int
+col_kfusion_cleanup_cohort(struct wl_columnar_kfusion_cohort *cohort)
+{
+    wl_col_session_t *parent = cohort->parent;
+    int rc = col_kfusion_prepare_cohort_cleanup(cohort);
+    if (rc != 0)
+        return rc;
+
+    for (uint32_t d = 0; d < cohort->initialized_count; d++) {
+        wl_col_session_t *worker = &cohort->worker_sess[d];
+        rc = col_session_free_diff_arrangements(worker);
+        if (rc != 0)
+            return rc;
+        if (worker->filt_cache_active_pins != 0)
+            return EBUSY;
+    }
+
+    for (uint32_t d = 0; d < cohort->initialized_count; d++) {
+        wl_col_session_t *worker = &cohort->worker_sess[d];
+        if (worker->compound_borrow.arena
+            && !wl_compound_arena_borrow_release(
+                &worker->compound_borrow))
+            return EBUSY;
+        col_mat_cache_release_pins(&worker->mat_cache);
+        col_mat_cache_clear(&worker->mat_cache);
+        if (worker->mat_cache.active_pins != 0)
+            return EBUSY;
+        {
+            wl_col_session_t *co = COL_SESSION(parent);
+            uint32_t shared = worker->arr_count < co->arr_count
+                ? worker->arr_count : co->arr_count;
+            for (uint32_t i = 0; i < shared; i++) {
+                if (worker->arr_entries[i].lru_clock
+                    > co->arr_entries[i].lru_clock)
+                    co->arr_entries[i].lru_clock
+                        = worker->arr_entries[i].lru_clock;
+            }
+            if (worker->arr_clock > co->arr_clock)
+                co->arr_clock = worker->arr_clock;
+        }
+        for (uint32_t i = 0; i < worker->arr_count; i++) {
+            col_arr_entry_t *entry = &worker->arr_entries[i];
+            free(entry->rel_name);
+            free(entry->key_cols);
+            arr_free_contents(&entry->arr);
+            col_arr_detach_memory_governor(&entry->arr);
+        }
+        free(worker->arr_entries);
+        worker->arr_entries = NULL;
+        worker->arr_count = worker->arr_cap = 0;
+        col_session_free_delta_arrangements(worker);
+        col_session_free_filt_arrangements(worker);
+        for (uint32_t i = 0; i < worker->filt_cache_count; i++) {
+            col_filt_cache_entry_t *entry = &worker->filt_cache[i];
+            if (entry->filtered) {
+                rc = col_rel_destroy_checked(entry->filtered);
+                if (rc != 0)
+                    return rc;
+                entry->filtered = NULL;
+            }
+            free(entry->rel_name);
+            entry->rel_name = NULL;
+            free(entry->filter_data);
+            entry->filter_data = NULL;
+        }
+        free(worker->filt_cache);
+        worker->filt_cache = NULL;
+        worker->filt_cache_count = worker->filt_cache_cap = 0;
+    }
+
+    for (uint32_t d = 0; d < cohort->initialized_count; d++) {
+        wl_col_session_t *worker = &cohort->worker_sess[d];
+        delta_pool_t *pool = worker->delta_pool;
+        if (pool) {
+            rc = col_rel_pool_destroy_aliases_checked(pool, 0,
+                    pool->slot_used);
+            if (rc != 0)
+                return rc;
+            rc = col_rel_pool_destroy_roots_checked(pool, 0,
+                    pool->slot_used);
+            if (rc != 0)
+                return rc;
+        }
+    }
+
+    for (uint32_t d = 0; d < cohort->initialized_count; d++) {
+        wl_col_session_t *worker = &cohort->worker_sess[d];
+        uint64_t bytes = 0;
+        if (worker->delta_pool)
+            bytes += (uint64_t)worker->delta_pool->slot_cap
+                * worker->delta_pool->slot_size
+                + worker->delta_pool->arena_cap;
+        if (worker->eval_arena)
+            bytes += worker->eval_arena->capacity;
+        if (bytes > 0)
+            wl_mem_ledger_free(&parent->mem_ledger, WL_MEM_SUBSYS_ARENA,
+                bytes);
+        delta_pool_destroy(worker->delta_pool);
+        worker->delta_pool = NULL;
+        wl_arena_free(worker->eval_arena);
+        worker->eval_arena = NULL;
+    }
+    cohort->resources_cleaned = true;
+    return 0;
+}
+
+static void
+col_kfusion_free_cohort(struct wl_columnar_kfusion_cohort *cohort)
+{
+    if (!cohort)
+        return;
+    if (cohort->merged)
+        col_rel_destroy(cohort->merged);
+    free(cohort->worker_sess);
+    free(cohort->workers);
+    free(cohort->results);
+    free(cohort->live_indices);
+    free(cohort);
+}
+
+int
+wl_columnar_kfusion_retry_pending(wl_col_session_t *sess)
+{
+    struct wl_columnar_kfusion_cohort *cohort;
+    int rc;
+    if (!sess)
+        return EINVAL;
+    cohort = sess->kfusion_pending_cohort;
+    if (!cohort)
+        return 0;
+    if (cohort->dispatch_active)
+        return EBUSY;
+    rc = col_kfusion_cleanup_cohort(cohort);
+    if (rc != 0)
+        return rc;
+    sess->kfusion_pending_cohort = NULL;
+    col_kfusion_free_cohort(cohort);
+    return 0;
+}
 
 /**
  * Worker thread function for K-fusion parallel evaluation.
@@ -606,14 +839,26 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
      * caches so concurrent branch evaluation does not race on cache state. */
     wl_col_session_t *worker_sess
         = (wl_col_session_t *)calloc(live_count, sizeof(wl_col_session_t));
+    struct wl_columnar_kfusion_cohort *cohort
+        = (struct wl_columnar_kfusion_cohort *)calloc(1, sizeof(*cohort));
     COL_SESSION(sess)->kfusion_alloc_ns += now_ns() - _phase_t0;
-    if (!results || !workers || !worker_sess) {
+    if (!results || !workers || !worker_sess || !cohort) {
         free(live_indices);
         free((void *)results);
         free(workers);
         free(worker_sess);
+        free(cohort);
         return ENOMEM;
     }
+
+    cohort->parent = COL_SESSION(sess);
+    cohort->results = results;
+    cohort->workers = workers;
+    cohort->worker_sess = worker_sess;
+    cohort->live_indices = live_indices;
+    cohort->live_count = live_count;
+    cohort->dispatch_active = true;
+    sess->kfusion_pending_cohort = cohort;
 
     int rc = 0;
 
@@ -635,8 +880,8 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
      * The TDD worker path (eval.c) has used it since #426; this is the same
      * treatment on the K-fusion branch path, so the cap bounds the aggregate
      * across branches -- which is what a global row budget means. */
-    atomic_uint_fast64_t shared_join_count;
-    atomic_store_explicit(&shared_join_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&cohort->shared_join_count, 0,
+        memory_order_relaxed);
 
     /* Issue #196: Workers start with zeroed mat_cache (no shared entries).
      * All worker cache entries are worker-owned; cleanup frees all of them
@@ -684,6 +929,7 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
          * for a doomed component. */
         worker_sess[d].retained_eval_entries = NULL;
         worker_sess[d].retained_eval_entry_count = 0;
+        worker_sess[d].kfusion_pending_cohort = NULL;
         /* The shallow session copy must not retain coordinator reclaimer
          * callbacks after the worker cache is replaced below. */
         memset(worker_sess[d].mem_ledger.reclaimers, 0,
@@ -691,7 +937,8 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
         worker_sess[d].mem_ledger.next_reclaimer_handle = 0;
         if (worker_sess[d].join_output_limit > 0 && live_count > 1) {
             /* Issue #959: share one budget instead of splitting it. */
-            worker_sess[d].join_output_shared_count = &shared_join_count;
+            worker_sess[d].join_output_shared_count
+                = &cohort->shared_join_count;
             worker_sess[d].join_output_shared_limit =
                 worker_sess[d].join_output_limit;
         }
@@ -766,6 +1013,9 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
         * been nulled, so failed acquisition can use common cleanup safely. */
         memset(&worker_sess[d].compound_borrow, 0,
             sizeof(worker_sess[d].compound_borrow));
+        eval_stack_init(&workers[d].stack);
+        workers[d].initialized = true;
+        cohort->initialized_count = d + 1;
         if (worker_sess[d].compound_arena
             && !wl_compound_arena_borrow(worker_sess[d].compound_arena,
             &worker_sess[d].compound_borrow)) {
@@ -781,12 +1031,28 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
 
         if (wq) {
             /* Parallel path: submit to session workqueue (issue #99) */
-            if (wl_workqueue_submit(wq, col_op_k_fusion_worker, &workers[d])
-                != 0) {
+            int submit_rc;
+#ifdef WL_SESSION_TEST_HOOKS
+            submit_rc = wl_columnar_kfusion_test_submit
+                ? wl_columnar_kfusion_test_submit(wq,
+                    col_op_k_fusion_worker, &workers[d])
+                : wl_workqueue_submit(wq, col_op_k_fusion_worker,
+                    &workers[d]);
+#else
+            submit_rc = wl_workqueue_submit(wq, col_op_k_fusion_worker,
+                    &workers[d]);
+#endif
+            if (submit_rc != 0) {
                 rc = ENOMEM;
-                wl_workqueue_drain(wq);
+                int barrier_rc = wl_workqueue_drain(wq);
+                if (barrier_rc == 0)
+                    cohort->barrier_complete = true;
+                else
+                    rc = barrier_rc;
                 goto cleanup_wq;
             }
+            workers[d].submitted = true;
+            cohort->submitted_count++;
         } else {
             /* Sequential fallback: execute directly (num_workers=1) */
             col_op_k_fusion_worker(&workers[d]);
@@ -796,9 +1062,15 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
     /* Barrier: wait for all parallel workers to complete.
      * Skipped when wq is NULL (sequential path already finished). */
     if (wq && wl_workqueue_wait_all(wq) != 0) {
-        rc = -1;
+        rc = wl_workqueue_drain(wq);
+        if (rc == 0)
+            cohort->barrier_complete = true;
+        else
+            goto cleanup_wq;
+        rc = EIO;
         goto cleanup_wq;
     }
+    cohort->barrier_complete = true;
     COL_SESSION(sess)->kfusion_dispatch_ns += now_ns() - _phase_t0;
 
     /* Issue #177: Merge worker profile counters back to session.
@@ -907,166 +1179,39 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
             rc = ENOMEM;
             goto cleanup_results;
         }
-        rc = eval_stack_push(stack, merged, true);
-        if (rc != 0)
-            col_rel_destroy(merged);
+        cohort->merged = merged;
+        rc = 0;
     }
     COL_SESSION(sess)->kfusion_merge_ns += now_ns() - _phase_t0;
 
 cleanup_results:
-    _phase_t0 = now_ns();
-    for (uint32_t d = 0; d < live_count; d++) {
-        if (results[d]) {
-            bool eligible = wl_columnar_deferred_relation_eligible(
-                results[d]);
-            int destroy_rc = col_rel_destroy_checked(results[d]);
-            if (destroy_rc == EBUSY && eligible) {
-                int defer_rc = wl_columnar_session_defer_relation(
-                    &worker_sess[d], results[d]);
-                if (defer_rc != 0) {
-                    fprintf(stderr,
-                        "wirelog: K-Fusion deferred result admission failed: %d\n",
-                        defer_rc);
-                    abort();
-                }
-            } else if (destroy_rc == EBUSY) {
-                /* A pool/arena result must never be kept past this worker's
-                 * allocator lifetime, so it cannot be deferred and the
-                 * refusal is terminal here.  @eligible is false by
-                 * construction on this branch -- the arm above consumed
-                 * every eligible EBUSY -- so do not assert it. */
-                fprintf(stderr,
-                    "wirelog: K-Fusion refused unsafe busy result cleanup\n");
-                abort();
-            } else if (destroy_rc != 0) {
-                fprintf(stderr,
-                    "wirelog: K-Fusion result cleanup failed: %d\n",
-                    destroy_rc);
-                abort();
-            }
-        }
-        rc = col_kfusion_drain(&workers[d].stack, &worker_sess[d], rc);
-    }
-
 cleanup_wq:
-    /* On early-exit paths (submit failure, wait failure) _phase_t0 may hold
-    * a stale dispatch value; reset it here so cleanup timing is correct. */
     _phase_t0 = now_ns();
-    /* wq is session-owned and reused across iterations — do not destroy here.
-     * Workers start with empty mat_cache (Issue #196), so all entries are
-     * worker-owned and freed from index 0.
-     * Free each worker's private arrangement caches (arr_* and darr_*).
-     * Lock-free design: no synchronization needed because each worker owns
-     * its isolated cache — no races at cleanup time. */
-    for (uint32_t d = 0; d < live_count; d++) {
-        rc = col_kfusion_drain(&workers[d].stack, &worker_sess[d], rc);
-        int deferred_rc = wl_columnar_session_retry_deferred(
-            &worker_sess[d]);
-        if (deferred_rc != 0) {
-            int transfer_rc = wl_columnar_session_transfer_deferred(
-                &worker_sess[d], sess);
-            if (transfer_rc != 0)
-                abort();
+    cohort->dispatch_active = false;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_kfusion_test_before_cleanup
+        && cohort->initialized_count > 0)
+        wl_columnar_kfusion_test_before_cleanup(&cohort->worker_sess[0],
+            &cohort->workers[0].stack, cohort->results, cohort->live_count);
+#endif
+    cohort->operation_rc = rc;
+    {
+        int cleanup_rc = col_kfusion_cleanup_cohort(cohort);
+        if (cleanup_rc != 0) {
+            /* The cohort itself is the durable ownership node.  No allocation
+             * or list-node construction is needed after refusal. */
+            sess->kfusion_pending_cohort = cohort;
+            COL_SESSION(sess)->kfusion_cleanup_ns += now_ns() - _phase_t0;
+            return cleanup_rc;
         }
-        (void)wl_compound_arena_borrow_release(
-            &worker_sess[d].compound_borrow);
-        /* Issue #196: worker mat_cache starts empty (zeroed above), so ALL
-         * entries were created by this worker — free from index 0.  The
-         * worker cache has no ledger (Issue #1380), so this is a plain
-         * destroy of every entry. */
-        assert(worker_sess[d].mat_cache.active_pins == 0);
-        col_mat_cache_release_pins(&worker_sess[d].mat_cache);
-        col_mat_cache_clear(&worker_sess[d].mat_cache);
-        assert(worker_sess[d].mat_cache.active_pins == 0);
-        /* Issue #216: merge worker lru_clocks back into coordinator so
-         * arrangements accessed by any worker are counted as recently used.
-         * Worker entries were cloned in the same order as coordinator entries,
-         * so index-matched comparison is valid. */
-        {
-            wl_col_session_t *cs = COL_SESSION(sess);
-            uint32_t shared = worker_sess[d].arr_count < cs->arr_count
-                ? worker_sess[d].arr_count
-                : cs->arr_count;
-            for (uint32_t i = 0; i < shared; i++) {
-                col_arr_entry_t *wk = &worker_sess[d].arr_entries[i];
-                col_arr_entry_t *co = &cs->arr_entries[i];
-                if (wk->lru_clock > co->lru_clock)
-                    co->lru_clock = wk->lru_clock;
-            }
-            /* Advance coordinator clock once outside the loop. */
-            if (worker_sess[d].arr_clock > cs->arr_clock)
-                cs->arr_clock = worker_sess[d].arr_clock;
-        }
-        /* Free worker's private full-arrangement cache (arr_*). */
-        for (uint32_t i = 0; i < worker_sess[d].arr_count; i++) {
-            col_arr_entry_t *e = &worker_sess[d].arr_entries[i];
-            free(e->rel_name);
-            free(e->key_cols);
-            arr_free_contents(&e->arr);
-            col_arr_detach_memory_governor(&e->arr);
-        }
-        free(worker_sess[d].arr_entries);
-        /* Free worker's private delta-arrangement cache (darr_*). */
-        col_session_free_delta_arrangements(&worker_sess[d]);
-        /* Free worker's private diff-arrangement cache (diff_arr_*). */
-        int diff_rc = col_session_free_diff_arrangements(&worker_sess[d]);
-        assert(diff_rc == 0);
-        if (diff_rc != 0) {
-            WL_LOG(WL_LOG_SEC_SESSION, WL_LOG_ERROR,
-                "cannot free worker differential arrangements: %d",
-                diff_rc);
-            return diff_rc;
-        }
-        /* Free worker's private filtered arrangement cache (filt_arr_*). */
-        col_session_free_filt_arrangements(&worker_sess[d]);
-        assert(worker_sess[d].filt_cache_active_pins == 0);
-        for (uint32_t i = 0; i < worker_sess[d].filt_cache_count; i++) {
-            free(worker_sess[d].filt_cache[i].rel_name);
-            free(worker_sess[d].filt_cache[i].filter_data);
-            if (worker_sess[d].filt_cache[i].filtered)
-                col_rel_destroy(worker_sess[d].filt_cache[i].filtered);
-        }
-        free(worker_sess[d].filt_cache);
-        /* These per-invocation sessions are quiescent after the workqueue
-         * join. Refusal here is an internal lifetime invariant violation;
-         * stop before releasing the backing pool rather than losing the
-         * retained aliases or freeing their owner storage. */
-        {
-            delta_pool_t *dp = worker_sess[d].delta_pool;
-            if (dp) {
-                int alias_rc = col_rel_pool_destroy_aliases_checked(dp, 0,
-                        dp->slot_used);
-                int root_rc = col_rel_pool_destroy_roots_checked(dp, 0,
-                        dp->slot_used);
-                int cleanup_rc = alias_rc != 0 ? alias_rc : root_rc;
-                if (cleanup_rc != 0) {
-                    fprintf(stderr,
-                        "wirelog: K-Fusion pool relation teardown failed "
-                        "(worker=%u, rc=%d)\n", d, cleanup_rc);
-                    abort();
-                }
-            }
-        }
-        /* Issue #1380: credit the parent ledger for the branch allocators. */
-        {
-            const delta_pool_t *dp = worker_sess[d].delta_pool;
-            uint64_t bytes = 0;
-            if (dp)
-                bytes += (uint64_t)dp->slot_cap * dp->slot_size
-                    + dp->arena_cap;
-            if (worker_sess[d].eval_arena)
-                bytes += worker_sess[d].eval_arena->capacity;
-            if (bytes > 0)
-                wl_mem_ledger_free(&sess->mem_ledger, WL_MEM_SUBSYS_ARENA,
-                    bytes);
-        }
-        delta_pool_destroy(worker_sess[d].delta_pool);
-        wl_arena_free(worker_sess[d].eval_arena);
     }
-    free(worker_sess);
-    free((void *)results);
-    free(workers);
-    free(live_indices);
+    if (rc == 0 && cohort->merged) {
+        rc = eval_stack_push(stack, cohort->merged, true);
+        if (rc == 0)
+            cohort->merged = NULL;
+    }
+    sess->kfusion_pending_cohort = NULL;
+    col_kfusion_free_cohort(cohort);
     COL_SESSION(sess)->kfusion_cleanup_ns += now_ns() - _phase_t0;
     return rc;
 }
@@ -1083,6 +1228,10 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
 {
     if (!op || !op->opaque_data || !stack || !sess)
         return EINVAL;
+
+    int pending_rc = wl_columnar_kfusion_retry_pending(COL_SESSION(sess));
+    if (pending_rc != 0)
+        return pending_rc;
 
     wl_plan_op_k_fusion_t *meta = (wl_plan_op_k_fusion_t *)op->opaque_data;
     uint32_t k = meta->k;

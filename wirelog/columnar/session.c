@@ -492,6 +492,9 @@ wl_columnar_session_cleanup_ready(wl_col_session_t *sess)
         return EINVAL;
     if (sess->delta_publish_active)
         return EBUSY;
+    int kfusion_rc = wl_columnar_kfusion_retry_pending(sess);
+    if (kfusion_rc != 0)
+        return kfusion_rc;
     /* Active-only nesting is valid. Retry must never consume an active frame;
      * active plus pending cleanup is rejected by the cleanup primitive. */
     int rc = sess->cleanup_pending
@@ -2349,6 +2352,13 @@ col_session_destroy(wl_session_t *session)
     if (!session)
         return;
     wl_col_session_t *sess = COL_SESSION(session);
+    if (sess->kfusion_pending_cohort
+        && wl_columnar_kfusion_retry_pending(sess) != 0) {
+        fputs(
+            "wirelog: K-Fusion cohort cleanup refused during session destroy\n",
+            stderr);
+        abort();
+    }
     wl_columnar_delta_events_clear(sess);
 
     /* Issue #1380: emit the memory baseline before teardown when explicitly
