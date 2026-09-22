@@ -97,6 +97,10 @@ col_diff_arrangement_t *col_diff_arrangement_create(
 col_diff_arrangement_t *col_diff_arrangement_create_with_memory_governor(
     const uint32_t *key_cols, uint32_t key_count, uint32_t worker_id,
     wl_columnar_memory_governor_ref_t *memory_governor);
+col_diff_arrangement_t *col_diff_arrangement_create_with_memory_governor_status(
+    const uint32_t *key_cols, uint32_t key_count, uint32_t worker_id,
+    wl_columnar_memory_governor_ref_t *memory_governor,
+    wl_columnar_memory_admission_status_t *status_out);
 
 /**
  * col_diff_arrangement_destroy - Deallocate a differential arrangement.
@@ -154,6 +158,11 @@ col_diff_arrangement_t *col_diff_arrangement_deep_copy(
 col_diff_arrangement_t *col_diff_arrangement_deep_copy_with_memory_governor(
     const col_diff_arrangement_t *arr,
     wl_columnar_memory_governor_ref_t *memory_governor);
+col_diff_arrangement_t *
+col_diff_arrangement_deep_copy_with_memory_governor_status(
+    const col_diff_arrangement_t *arr,
+    wl_columnar_memory_governor_ref_t *memory_governor,
+    wl_columnar_memory_admission_status_t *status_out);
 
 /**
  * col_diff_arrangement_reset_delta - Mark current rows as base for next epoch.

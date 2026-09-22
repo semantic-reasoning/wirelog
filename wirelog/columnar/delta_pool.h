@@ -77,6 +77,10 @@ delta_pool_create(uint32_t max_slots, size_t slot_size, size_t arena_bytes);
 delta_pool_t *
 delta_pool_create_managed(uint32_t max_slots, size_t slot_size,
     size_t arena_bytes, wl_columnar_memory_governor_t *governor);
+delta_pool_t *
+delta_pool_create_managed_status(uint32_t max_slots, size_t slot_size,
+    size_t arena_bytes, wl_columnar_memory_governor_t *governor,
+    wl_columnar_memory_admission_status_t *status_out);
 
 /* Internal constructor used by the managed-admission glue. */
 delta_pool_t *

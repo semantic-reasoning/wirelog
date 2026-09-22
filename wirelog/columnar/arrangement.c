@@ -2725,9 +2725,13 @@ col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
     e->key_count = key_count;
     e->generation = 1u;
 
-    e->diff_arr = col_diff_arrangement_create_with_memory_governor(
-        key_cols, key_count, 0, cs->memory_governor);
+    wl_columnar_memory_admission_status_t admission_status =
+        WL_COLUMNAR_MEMORY_ADMISSION_OK;
+    e->diff_arr = col_diff_arrangement_create_with_memory_governor_status(
+        key_cols, key_count, 0, cs->memory_governor, &admission_status);
     if (!e->diff_arr) {
+        if (admission_status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+            cs->memory_budget_denied = true;
         free(e->rel_name);
         free(e->key_cols);
         memset(e, 0, sizeof(*e));
@@ -2885,9 +2889,15 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
         entry->key_count = key_count;
         entry->generation = 1u;
         entry->transaction_pending = true;
-        entry->diff_arr = col_diff_arrangement_create_with_memory_governor(
-            key_cols, key_count, 0, cs->memory_governor);
+        wl_columnar_memory_admission_status_t admission_status =
+            WL_COLUMNAR_MEMORY_ADMISSION_OK;
+        entry->diff_arr =
+            col_diff_arrangement_create_with_memory_governor_status(
+            key_cols, key_count, 0, cs->memory_governor,
+            &admission_status);
         if (!entry->diff_arr) {
+            if (admission_status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                cs->memory_budget_denied = true;
             free(entry->rel_name);
             free(entry->key_cols);
             memset(entry, 0, sizeof(*entry));
@@ -2908,9 +2918,13 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
     txn->entry_index = entry_index;
     txn->entry_generation = txn->entry->generation;
     txn->persistent = *slot;
-    txn->working = col_diff_arrangement_deep_copy_with_memory_governor(
-        txn->persistent, cs->memory_governor);
+    wl_columnar_memory_admission_status_t admission_status =
+        WL_COLUMNAR_MEMORY_ADMISSION_OK;
+    txn->working = col_diff_arrangement_deep_copy_with_memory_governor_status(
+        txn->persistent, cs->memory_governor, &admission_status);
     if (!txn->working) {
+        if (admission_status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+            cs->memory_budget_denied = true;
         if (txn->pending_entry) {
             free(entry->rel_name);
             free(entry->key_cols);

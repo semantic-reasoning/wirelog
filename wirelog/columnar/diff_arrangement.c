@@ -229,6 +229,16 @@ col_diff_arrangement_create_with_memory_governor(
     const uint32_t *key_cols, uint32_t key_count, uint32_t worker_id,
     wl_columnar_memory_governor_ref_t *memory_governor)
 {
+    return col_diff_arrangement_create_with_memory_governor_status(
+        key_cols, key_count, worker_id, memory_governor, NULL);
+}
+
+col_diff_arrangement_t *
+col_diff_arrangement_create_with_memory_governor_status(
+    const uint32_t *key_cols, uint32_t key_count, uint32_t worker_id,
+    wl_columnar_memory_governor_ref_t *memory_governor,
+    wl_columnar_memory_admission_status_t *status_out)
+{
     wl_columnar_memory_reservation_t pending;
     uint64_t key_bytes;
     uint64_t next_bytes;
@@ -238,6 +248,8 @@ col_diff_arrangement_create_with_memory_governor(
     bool pending_valid = false;
     col_diff_arrangement_t *arr = NULL;
 
+    if (status_out)
+        *status_out = WL_COLUMNAR_MEMORY_ADMISSION_OK;
     if (key_count > 0 && !key_cols)
         return NULL;
     if (!wl_columnar_memory_size_mul(key_count, sizeof(uint32_t),
@@ -257,8 +269,11 @@ col_diff_arrangement_create_with_memory_governor(
                 wl_columnar_memory_governor_ref_get(memory_governor),
                 initial_bytes, &pending);
         if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
-            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status_out)
+                *status_out = status;
             return NULL;
+        }
         pending_valid = true;
     }
 
@@ -362,6 +377,16 @@ col_diff_arrangement_deep_copy_with_memory_governor(
     const col_diff_arrangement_t *arr,
     wl_columnar_memory_governor_ref_t *memory_governor)
 {
+    return col_diff_arrangement_deep_copy_with_memory_governor_status(
+        arr, memory_governor, NULL);
+}
+
+col_diff_arrangement_t *
+col_diff_arrangement_deep_copy_with_memory_governor_status(
+    const col_diff_arrangement_t *arr,
+    wl_columnar_memory_governor_ref_t *memory_governor,
+    wl_columnar_memory_admission_status_t *status_out)
+{
     wl_columnar_memory_reservation_t pending;
     uint64_t copy_bytes;
     uint64_t key_bytes;
@@ -373,6 +398,8 @@ col_diff_arrangement_deep_copy_with_memory_governor(
     bool pending_valid = false;
     col_diff_arrangement_t *copy = NULL;
 
+    if (status_out)
+        *status_out = WL_COLUMNAR_MEMORY_ADMISSION_OK;
     if (!arr
         || (arr->key_count > 0 && !arr->key_cols)
         || (arr->nbuckets > 0 && !arr->ht_head)
@@ -397,8 +424,11 @@ col_diff_arrangement_deep_copy_with_memory_governor(
                 wl_columnar_memory_governor_ref_get(memory_governor),
                 copy_bytes, &pending);
         if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
-            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status_out)
+                *status_out = status;
             return NULL;
+        }
         pending_valid = true;
     }
 

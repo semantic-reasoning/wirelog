@@ -2211,11 +2211,16 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
     /* Create delta pool for per-iteration temporaries.
      * Slab: 256 relations (cover ~20 rules x 5 ops + headroom)
      * Arena: 64MB initial (for row data buffers) */
+    wl_columnar_memory_admission_status_t pool_status =
+        WL_COLUMNAR_MEMORY_ADMISSION_OK;
     sess->delta_pool
-        = delta_pool_create_managed(256, sizeof(col_rel_t),
+        = delta_pool_create_managed_status(256, sizeof(col_rel_t),
             64UL * 1024 * 1024,
-            wl_columnar_memory_governor_ref_get(sess->memory_governor));
+            wl_columnar_memory_governor_ref_get(sess->memory_governor),
+            &pool_status);
     if (!sess->delta_pool) {
+        if (pool_status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+            sess->memory_budget_denied = true;
         /* Non-fatal: pool allocation failed, fall back to malloc */
     }
 
@@ -2997,11 +3002,16 @@ col_worker_session_create(wl_col_session_t *coordinator,
         uint32_t pool_slots = 128 / k;
         if (pool_slots < 16)
             pool_slots = 16;
+        wl_columnar_memory_admission_status_t pool_status =
+            WL_COLUMNAR_MEMORY_ADMISSION_OK;
         out_worker->delta_pool
-            = delta_pool_create_managed(pool_slots, sizeof(col_rel_t),
+            = delta_pool_create_managed_status(pool_slots, sizeof(col_rel_t),
                 pool_arena,
                 wl_columnar_memory_governor_ref_get(
-                    out_worker->memory_governor));
+                    out_worker->memory_governor), &pool_status);
+        if (!out_worker->delta_pool
+            && pool_status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+            out_worker->memory_budget_denied = true;
         /* Non-fatal if NULL: operators fall back to malloc */
     }
     ledger_charge_allocators(out_worker); /* Issue #1380: ARENA */
@@ -3771,7 +3781,7 @@ wl_columnar_session_budget_denied(const wl_col_session_t *sess)
     for (uint32_t i = 0; i < sess->diff_arr_count; i++) {
         if (sess->diff_arr_entries[i].diff_arr
             && sess->diff_arr_entries[i].diff_arr
-                ->memory_budget_denial_pending)
+            ->memory_budget_denial_pending)
             return true;
     }
     return false;
@@ -3791,12 +3801,12 @@ wl_columnar_session_budget_denial_clear(wl_col_session_t *sess)
     for (uint32_t i = 0; i < sess->diff_arr_count; i++)
         if (sess->diff_arr_entries[i].diff_arr)
             sess->diff_arr_entries[i].diff_arr
-                ->memory_budget_denial_pending = false;
+            ->memory_budget_denial_pending = false;
     for (uint32_t i = 0; i < sess->tdd_workers_count; i++)
         for (uint32_t r = 0; r < sess->tdd_workers[i].nrels; r++)
             if (sess->tdd_workers[i].rels[r])
                 sess->tdd_workers[i].rels[r]
-                    ->memory_budget_denial_pending = false;
+                ->memory_budget_denial_pending = false;
 }
 
 static int
