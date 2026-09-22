@@ -22,24 +22,24 @@ with tempfile.TemporaryDirectory(prefix="wirelog-main-size-test-") as d:
     # this test. Capture the same tiny project from nested and external builds.
     profile_source=temp/"profile source with spaces"
     profile_source.mkdir()
-    (profile_source/"meson.build").write_text("project('profile-fixture', 'c')\nshared_library('wirelog', 'wirelog.c', install: false)\n")
-    (profile_source/"wirelog.c").write_text("int wirelog_fixture(void) { return 7; }\n")
+    (profile_source/"meson.build").write_text("project('profile-fixture', 'c')\nshared_library('wirelog', 'wirelog.c', install: false)\n", encoding="utf-8")
+    (profile_source/"wirelog.c").write_text("int wirelog_fixture(void) { return 7; }\n", encoding="utf-8")
     (profile_source/"tests").mkdir()
-    (profile_source/"tests/baseline_size.txt").write_text("1000000\n")
+    (profile_source/"tests/baseline_size.txt").write_text("1000000\n", encoding="utf-8")
     nested_build=profile_source/"nested build"
     external_build=temp/"external-meson-build"
     subprocess.run(["meson","setup",str(nested_build),str(profile_source)],check=True,
-                   stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True)
+                   stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True, encoding="utf-8")
     subprocess.run(["meson","setup",str(external_build),str(profile_source)],check=True,
-                   stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True)
+                   stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True, encoding="utf-8")
     profile_script=root/"scripts/ci/size-profile.py"
     nested_profile=temp/"nested-profile.json"; external_profile=temp/"external-profile.json"
     for builddir,destination in ((nested_build,nested_profile),(external_build,external_profile)):
         subprocess.run([sys.executable,str(profile_script),"capture","--build-dir",str(builddir),
                         "--source-dir",str(profile_source),"--source-sha","profile-fixture","--output",str(destination)],
-                       check=True,capture_output=True,text=True)
+                       check=True,capture_output=True,text=True, encoding="utf-8")
     subprocess.run([sys.executable,str(profile_script),"compare",str(nested_profile),str(external_profile)],
-                   check=True,capture_output=True,text=True)
+                   check=True,capture_output=True,text=True, encoding="utf-8")
 
     # Linker identity is queried through the configured compiler driver, not
     # an unrelated linker found on PATH. Unknown output fails closed.
@@ -68,8 +68,8 @@ with tempfile.TemporaryDirectory(prefix="wirelog-main-size-test-") as d:
         if baseline: args.extend(["--baseline-file",str(baseline)])
         use_env=env.copy()
         if extra_path: use_env["PATH"]=str(extra_path)+os.pathsep+use_env["PATH"]
-        result=subprocess.run(args,env=use_env,text=True,capture_output=True,check=True)
-        data=json.loads(report.read_text())
+        result=subprocess.run(args,env=use_env,text=True,capture_output=True,check=True, encoding="utf-8")
+        data=json.loads(report.read_text(encoding="utf-8"))
         if data["status"] in ("monitoring-error","over-budget"):
             assert "::warning title=Binary size monitor" in result.stdout, result.stdout
         else:
@@ -77,8 +77,8 @@ with tempfile.TemporaryDirectory(prefix="wirelog-main-size-test-") as d:
         assert data["commit_sha"]=="deadbeef" and data["run_id"]=="12345"
         assert data["runner_os"]=="ubuntu-latest" and data["compiler"]=="gcc"
         assert data["run_url"].endswith("/12345")
-        assert summary.exists() and "deadbeef" in summary.read_text() and "12345" in summary.read_text()
-        assert "`ubuntu-latest` / `gcc`" in summary.read_text()
+        assert summary.exists() and "deadbeef" in summary.read_text(encoding="utf-8") and "12345" in summary.read_text(encoding="utf-8")
+        assert "`ubuntu-latest` / `gcc`" in summary.read_text(encoding="utf-8")
         assert report.with_suffix(".profile.json").exists() or data["status"]=="monitoring-error"
         return data
     absent=invoke(temp/"missing.so",nested_build)
@@ -87,23 +87,23 @@ with tempfile.TemporaryDirectory(prefix="wirelog-main-size-test-") as d:
     unavailable=invoke(lib,temp/"missing-build")
     assert unavailable["status"]=="monitoring-error" and "profile unavailable" in unavailable["error"]
     badbin=temp/"bin"; badbin.mkdir()
-    size=badbin/"size"; size.write_text("#!/bin/sh\nprintf 'not a size report\\n'\n"); size.chmod(0o755)
+    size=badbin/"size"; size.write_text("#!/bin/sh\nprintf 'not a size report\\n'\n", encoding="utf-8"); size.chmod(0o755)
     malformed=invoke(lib,nested_build,extra_path=badbin)
     assert malformed["status"]=="monitoring-error" and "exactly one .text" in malformed["error"], malformed
     # Small and over-budget real ELF fixtures drive both measurement verdicts.
-    small=temp/"small.c"; small.write_text("int size_fixture(void) { return 1; }\n")
+    small=temp/"small.c"; small.write_text("int size_fixture(void) { return 1; }\n", encoding="utf-8")
     smalllib=temp/"small.so"
     subprocess.run(["cc","-shared","-fPIC","-O0","-o",str(smalllib),str(small)],check=True)
-    baseline=temp/"baseline.txt"; baseline.write_text("1000000\n")
+    baseline=temp/"baseline.txt"; baseline.write_text("1000000\n", encoding="utf-8")
     small_report=invoke(smalllib,nested_build,baseline)
     assert small_report["status"]=="within-budget" and small_report["profile_sha256"]
     assert report.with_suffix(".profile.json").is_file(), "profile output in fresh report directory was not created"
     asm=temp/"large.s"
     asm.write_text(".text\n.globl large_fixture\n.type large_fixture, @function\nlarge_fixture:\n"+
-                   "\tnop\n"*7000+"\tret\n")
+                   "\tnop\n"*7000+"\tret\n", encoding="utf-8")
     largelib=temp/"large.so"
     subprocess.run(["cc","-shared","-o",str(largelib),str(asm)],check=True)
-    baseline.write_text("0\n")
+    baseline.write_text("0\n", encoding="utf-8")
     large_report=invoke(largelib,nested_build,baseline)
     assert large_report["status"]=="over-budget" and large_report["measured_bytes"]>5120
     # Prove a failed build cannot be reported as a clean measurement.
@@ -112,7 +112,7 @@ with tempfile.TemporaryDirectory(prefix="wirelog-main-size-test-") as d:
                  "--run-url","https://example.invalid/actions/runs/12345",
                  "--runner-os","ubuntu-latest","--compiler","gcc",
                  "--configure-status","success","--build-status","failure","--test-status","skipped"]
-    result=subprocess.run(failed_args,env=env,text=True,capture_output=True,check=True)
-    failed_report=json.loads(report.read_text())
+    result=subprocess.run(failed_args,env=env,text=True,capture_output=True,check=True, encoding="utf-8")
+    failed_report=json.loads(report.read_text(encoding="utf-8"))
     assert failed_report["status"]=="monitoring-error" and failed_report["phase"]=="build", failed_report
 print("test-main-size-monitor: all cases passed")

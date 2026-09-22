@@ -104,7 +104,7 @@ def authorize(repo, base_sha, candidate_sha, base_value, candidate_value, proven
         if canonical_hash(reproduced_profile) != p["profile_sha256"]:
             fail("recorded toolchain/profile is unavailable or differs from reproducible source")
         library = build / "libwirelog.so"
-        size_output = subprocess.check_output(["size", "--format=sysv", str(library)], text=True)
+        size_output = subprocess.check_output(["size", "--format=sysv", str(library)], text=True, encoding="utf-8")
         sizes = [int(line.split()[1]) for line in size_output.splitlines()
                  if line.split() and line.split()[0] == ".text"]
         if len(sizes) != 1 or sizes[0] != candidate_value:

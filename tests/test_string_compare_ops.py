@@ -96,7 +96,7 @@ def main() -> int:
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(PROGRAM)
         r = subprocess.run([exe, path], capture_output=True, text=True,
-                           timeout=60, env=env)
+                           timeout=60, env=env, encoding="utf-8")
 
     if r.returncode != 0:
         sys.stderr.write("exit %d; stderr=%r\n" % (r.returncode, r.stderr))

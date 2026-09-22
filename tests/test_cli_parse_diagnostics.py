@@ -165,7 +165,7 @@ def _run(exe, program_text, tmpdir, name):
         fh.write(program_text)
     return subprocess.run(
         [exe, path], capture_output=True, text=True, timeout=60,
-        env=_scrubbed_env())
+        env=_scrubbed_env(), encoding="utf-8")
 
 
 def _fail(msg):

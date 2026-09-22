@@ -120,7 +120,7 @@ def run_script(server_url, *extra):
     proc = subprocess.run(
         [sys.executable, os.path.join(HERE, "prune-gha-cache.py"),
          "--repo", "mock/owner-name", "--api-base", server_url, *extra],
-        capture_output=True, text=True, env=env, timeout=300)
+        capture_output=True, text=True, env=env, timeout=300, encoding="utf-8")
     return proc
 
 

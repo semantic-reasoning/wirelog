@@ -713,6 +713,7 @@ def main(argv: list[str]) -> int:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
+                encoding="utf-8",
             )
             if checked.returncode:
                 detail = checked.stderr.strip() or "bash -n returned non-zero"

@@ -322,7 +322,7 @@ def resolve_clang_tidy() -> str:
 def check_version(exe: str, require_supported: bool = True) -> str:
     try:
         proc = subprocess.run([exe, "--version"], capture_output=True,
-                              text=True, check=False)
+                              text=True, check=False, encoding="utf-8")
     except OSError as exc:
         raise SkipGate(f"cannot run {exe}: {exc}") from exc
     match = VERSION_RE.search(proc.stdout)
@@ -371,7 +371,7 @@ def effective_checks(exe: str) -> list[str]:
     try:
         proc = subprocess.run(
             [exe, f"--config-file={CONFIG_FILE}", "--list-checks"],
-            cwd=str(REPO_ROOT), capture_output=True, text=True, check=False)
+            cwd=str(REPO_ROOT), capture_output=True, text=True, check=False, encoding="utf-8")
     except OSError as exc:
         raise GateError(f"cannot run {exe} --list-checks: {exc}") from exc
     if proc.returncode != 0:
@@ -464,7 +464,7 @@ def check_config_baseline(exe: str, version: str) -> None:
         raise GateError(f"clang-tidy config baseline missing: {path}")
     proc = subprocess.run(
         [exe, f"--config-file={CONFIG_FILE}", "--dump-config"],
-        cwd=str(REPO_ROOT), capture_output=True, text=True, check=False)
+        cwd=str(REPO_ROOT), capture_output=True, text=True, check=False, encoding="utf-8")
     if proc.returncode != 0:
         raise GateError(f"{exe} --dump-config failed with exit "
                         f"{proc.returncode}: {proc.stderr.strip()}")
@@ -561,7 +561,7 @@ def run_clang_tidy(exe: str, db_dir: pathlib.Path, entry: dict,
     argv = [exe, f"--config-file={CONFIG_FILE}", "-p", str(db_dir),
             str(source)]
     proc = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True,
-                          check=False)
+                          check=False, encoding="utf-8")
     return Result(source, proc.returncode, proc.stdout, proc.stderr,
                   parse_diagnostics(proc.stdout, cwd), configuration,
                   parse_nolint_count(proc.stderr))

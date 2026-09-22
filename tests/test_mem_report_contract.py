@@ -34,7 +34,7 @@ def run(binary, enabled):
     started = time.monotonic()
     try:
         result = subprocess.run([binary], capture_output=True, text=True,
-                                env=env, timeout=300, check=False)
+                                env=env, timeout=300, check=False, encoding="utf-8")
     except subprocess.TimeoutExpired as exc:
         raise ContractFailure(diagnostic(
             binary, enabled,

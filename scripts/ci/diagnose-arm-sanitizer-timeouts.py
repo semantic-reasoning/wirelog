@@ -38,7 +38,7 @@ def child_env(build):
 def manifest(build):
     sha = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
                          text=True, check=True, timeout=5,
-                         env=observer_env()).stdout.strip()
+                         env=observer_env(), encoding="utf-8").stdout.strip()
     return {"sha": sha, "platform": platform.platform(),
             "python": platform.python_version(), "build": str(build),
             "meson": MESON, "targets": TARGETS,
@@ -47,7 +47,7 @@ def manifest(build):
 
 
 def observe_command(command, path, env, timeout=2):
-    with path.open("w") as output:
+    with path.open("w", encoding="utf-8") as output:
         try:
             result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT,
                                     env=env, timeout=timeout, check=False)
@@ -62,12 +62,12 @@ def observe_command(command, path, env, timeout=2):
 
 def snapshot_proc(pid, path):
     status = "ok"
-    with path.open("w") as output:
+    with path.open("w", encoding="utf-8") as output:
         # These fields do not include the process environment or command line.
         for name in ("status", "stat", "wchan", "stack"):
             print(f"--- {name} ---", file=output)
             try:
-                print(Path(f"/proc/{pid}/{name}").read_text(), file=output)
+                print(Path(f"/proc/{pid}/{name}").read_text(encoding="utf-8"), file=output)
             except OSError as exc:
                 status = "unavailable"
                 print(exc, file=output)
@@ -80,7 +80,7 @@ def observe(pid, deadline, directory):
     gdb_at = deadline - min(10, max(0, (deadline - time.monotonic()) / 2))
     gdb_done = False
     count = 0
-    with (directory / "observer.jsonl").open("w", buffering=1) as events:
+    with (directory / "observer.jsonl").open("w", buffering=1, encoding="utf-8") as events:
         while time.monotonic() < deadline:
             try:
                 os.kill(pid, 0)
@@ -126,9 +126,9 @@ def run_child(command, timeout, directory, env, observer_environment):
     observer = None
     result = {"command": command, "deadline_seconds": timeout,
               "observer_status": "unavailable"}
-    with (directory / "stdout.log").open("w") as stdout, \
-            (directory / "stderr.log").open("w") as stderr, \
-            (directory / "observer.log").open("w") as observer_log:
+    with (directory / "stdout.log").open("w", encoding="utf-8") as stdout, \
+            (directory / "stderr.log").open("w", encoding="utf-8") as stderr, \
+            (directory / "observer.log").open("w", encoding="utf-8") as observer_log:
         try:
             child = subprocess.Popen(command, stdout=stdout, stderr=stderr,
                                      env=env, start_new_session=True)
@@ -162,12 +162,12 @@ def run_child(command, timeout, directory, env, observer_environment):
     events = directory / "observer.jsonl"
     result["observer_events"] = []
     if events.exists():
-        for line in events.read_text().splitlines():
+        for line in events.read_text(encoding="utf-8").splitlines():
             try:
                 result["observer_events"].append(json.loads(line))
             except json.JSONDecodeError:
                 result["observer_events"].append({"status": "interrupted"})
-    (directory / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+    (directory / "result.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     return result
 
 
@@ -182,15 +182,15 @@ def main():
     build, output = args.build.resolve(), args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     try:
-        (output / "manifest.json").write_text(json.dumps(manifest(build), indent=2) + "\n")
+        (output / "manifest.json").write_text(json.dumps(manifest(build), indent=2) + "\n", encoding="utf-8")
         results = []
         for name, timeout in TARGETS.items():
             results.append(run_child([str(build / "tests" / name)], timeout,
                                      output / name, child_env(build), observer_env()))
-        (output / "summary.json").write_text(json.dumps(results, indent=2) + "\n")
+        (output / "summary.json").write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
         return int(any(result["status"] != "pass" for result in results))
     except (OSError, subprocess.SubprocessError) as exc:
-        (output / "harness-error.log").write_text(str(exc) + "\n")
+        (output / "harness-error.log").write_text(str(exc) + "\n", encoding="utf-8")
         return 1
 
 

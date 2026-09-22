@@ -258,7 +258,7 @@ def data_manifest(directory, doop=False):
 
 def capture(command, cwd):
     return subprocess.run(command, cwd=cwd, check=True, capture_output=True,
-                          text=True, timeout=30).stdout.strip()
+                          text=True, timeout=30, encoding="utf-8").stdout.strip()
 
 
 def memory_observation():
@@ -268,7 +268,7 @@ def memory_observation():
     for name in ("/proc/meminfo", "/proc/self/cgroup"):
         path = Path(name)
         if path.exists():
-            result[name] = path.read_text()
+            result[name] = path.read_text(encoding="utf-8")
     for line in result.get("/proc/self/cgroup", "").splitlines():
         if line.startswith("0::"):
             root = Path("/sys/fs/cgroup")
@@ -277,7 +277,7 @@ def memory_observation():
                 for name in ("memory.max", "memory.current", "cpuset.cpus.effective"):
                     path = location / name
                     if path.is_file():
-                        result[str(path)] = path.read_text().strip()
+                        result[str(path)] = path.read_text(encoding="utf-8").strip()
                 if location == root:
                     break
                 location = location.parent
@@ -286,7 +286,7 @@ def memory_observation():
 
 def run_process(command, env, prefix, timeout, cwd):
     record = dict(command=command, started_utc=datetime.now(timezone.utc).isoformat())
-    with prefix.with_suffix(".stdout").open("w") as stdout, prefix.with_suffix(".stderr").open("w") as stderr:
+    with prefix.with_suffix(".stdout").open("w", encoding="utf-8") as stdout, prefix.with_suffix(".stderr").open("w", encoding="utf-8") as stderr:
         try:
             proc = subprocess.run(command, env=env, cwd=cwd, stdout=stdout,
                                   stderr=stderr, timeout=timeout, check=False)
@@ -296,10 +296,16 @@ def run_process(command, env, prefix, timeout, cwd):
             record.update(returncode=None, disposition="timeout", timeout_seconds=timeout)
         except OSError as error:
             record.update(returncode=None, disposition="execution_error", error=str(error))
-    record["logs"] = {suffix: {"file": prefix.with_suffix(suffix).name,
-                               "sha256": sha(prefix.with_suffix(suffix)),
-                               "text": prefix.with_suffix(suffix).read_text(errors="replace")}
-                      for suffix in (".stdout", ".stderr")}
+    logs = {}
+    for suffix in (".stdout", ".stderr"):
+        log_path = prefix.with_suffix(suffix)
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            record.update(disposition="invalid_evidence", error=f"{log_path.name} is not UTF-8: {error}")
+            text = ""
+        logs[suffix] = {"file": log_path.name, "sha256": sha(log_path), "text": text}
+    record["logs"] = logs
     return record
 
 
@@ -347,8 +353,8 @@ def main():
                      memory=memory_observation(),
                      environment={k: v for k, v in env.items() if k.startswith(
                          ("WIRELOG_", "OMP_", "MALLOC_", "ASAN_", "UBSAN_")) or k == "LC_ALL"},
-                     build_options=json.loads((info / "intro-buildoptions.json").read_text()),
-                     compilers=json.loads((info / "intro-compilers.json").read_text()),
+                     build_options=json.loads((info / "intro-buildoptions.json").read_text(encoding="utf-8")),
+                     compilers=json.loads((info / "intro-compilers.json").read_text(encoding="utf-8")),
                      compile_commands_sha256=sha(build / "compile_commands.json"),
                      binaries={}, data={}, runs=[], controls=[])
     inventory["runtime_patch_sha256"] = hashlib.sha256(inventory["runtime_patch"].encode()).hexdigest()
@@ -357,7 +363,7 @@ def main():
         inventory["binaries"][config] = dict(path=str(binary), sha256=sha(binary))
     pins = root / "scripts/release/downstream-matrix-oracles.tsv"
     inventory["oracles_sha256"] = sha(pins)
-    rows = [line.split("\t") for line in pins.read_text().splitlines() if line and not line.startswith("#")]
+    rows = [line.split("\t") for line in pins.read_text(encoding="utf-8").splitlines() if line and not line.startswith("#")]
     require(tuple(row[0] for row in rows) == WORKLOADS, "unexpected workload pins")
     failed = False
     for workload, tuples, iterations, data_path, expected, provenance, acquisition in rows:
@@ -389,7 +395,7 @@ def main():
                 validate_record(record, workload, workers, int(tuples), int(iterations), config)
                 failed |= record["disposition"] != "measured_verified"
                 inventory["runs"].append(record)
-                (output / "inventory.json").write_text(json.dumps(inventory, indent=2) + "\n")
+                (output / "inventory.json").write_text(json.dumps(inventory, indent=2) + "\n", encoding="utf-8")
                 print(name, record["disposition"], flush=True)
     # Separate synthetic controls, never counted as additional portfolio data.
     graph = root / "bench/data/graph_100.csv"
@@ -421,7 +427,7 @@ def main():
                 inventory["iteration_comparisons"].append(dict(workload=workload, workers=workers,
                     iterations=values, equal=len(set(values.values())) == 1))
                 failed |= len(set(values.values())) != 1
-    (output / "inventory.json").write_text(json.dumps(inventory, indent=2) + "\n")
+    (output / "inventory.json").write_text(json.dumps(inventory, indent=2) + "\n", encoding="utf-8")
     return 1 if failed else 0
 
 
