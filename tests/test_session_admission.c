@@ -75,6 +75,14 @@ fake_create(const wl_plan_t *plan, uint32_t num_workers, wl_session_t **out)
     return 0;
 }
 
+static int
+fake_create_with_options(const wl_plan_t *plan, uint32_t workers,
+    const wl_session_options_t *options, wl_session_t **out)
+{
+    (void)options;
+    return fake_create(plan, workers, out);
+}
+
 static void
 fake_destroy(wl_session_t *base)
 {
@@ -161,6 +169,7 @@ fake_memory_governor(wl_session_t *base)
 static const wl_compute_backend_t fake_backend = {
     .name = "admission-test",
     .session_create = fake_create,
+    .session_create_with_options = fake_create_with_options,
     .session_destroy = fake_destroy,
     .session_insert = fake_insert,
     .session_make_compound = fake_make_compound,
@@ -176,7 +185,10 @@ operation_thread(void *opaque)
 {
     thread_context_t *ctx = (thread_context_t *)opaque;
 
-    if (ctx->operation == TEST_OP_STEP)
+    if (ctx->operation == TEST_OP_INSERT) {
+        int64_t row = 1;
+        ctx->rc = wl_session_insert(ctx->session, "r", &row, 1, 1);
+    } else if (ctx->operation == TEST_OP_STEP)
         ctx->rc = wl_session_step(ctx->session);
     else
         ctx->rc = wl_session_snapshot(ctx->session, NULL, NULL);
@@ -216,7 +228,7 @@ expect(bool condition, const char *message)
 }
 
 static int
-run_destroy_race(test_operation_t blocked_operation)
+run_destroy_race(test_operation_t blocked_operation, bool controlled)
 {
     test_sync_t sync = { 0 };
     thread_context_t operation_ctx = { 0 };
@@ -224,6 +236,8 @@ run_destroy_race(test_operation_t blocked_operation)
     wl_thread_t operation_tid;
     wl_thread_t destroy_tid;
     wl_session_t *session = NULL;
+    wl_evaluation_control_t *control = NULL;
+    wl_session_options_t options;
     unsigned before[TEST_OP_COUNT];
     int64_t row = 1;
     wirelog_compound_arg_t arg = { WIRELOG_TYPE_INT64, 1 };
@@ -242,7 +256,12 @@ run_destroy_race(test_operation_t blocked_operation)
     }
     sync.blocked_operation = blocked_operation;
     creation_sync = &sync;
-    if (wl_session_create(&fake_backend, NULL, 1, &session) != 0
+    wl_session_options_init(&options);
+    if (controlled && wl_evaluation_control_create(0, &control) != 0)
+        return 1;
+    options.evaluation_control = control;
+    if (wl_session_create_with_options(&fake_backend, NULL, 1, &options,
+        &session) != 0
         || !session) {
         wl_cond_destroy(&sync.changed);
         wl_mutex_destroy(&sync.mutex);
@@ -285,7 +304,8 @@ run_destroy_race(test_operation_t blocked_operation)
     /* The active backend call proves destroy cannot complete.  Probe the
      * other quick operation until destroy has closed admission. */
     for (unsigned attempt = 0; attempt < 1000000; attempt++) {
-        denied_rc = blocked_operation == TEST_OP_SNAPSHOT
+        denied_rc = controlled ? wl_session_remove(session, "r", NULL, 0, 0)
+            : blocked_operation == TEST_OP_SNAPSHOT
             ? wl_session_step(session)
             : wl_session_snapshot(session, NULL, NULL);
         if (denied_rc == EBUSY || denied_rc != 0)
@@ -316,6 +336,11 @@ run_destroy_race(test_operation_t blocked_operation)
     failures += expect(wl_session_memory_governor(session) == NULL,
             "memory governor access denied after admission closes");
 
+    /* The admitted insert is still blocked and destroy is waiting. The
+     * independent control request must complete without waiting for either. */
+    if (control)
+        wl_evaluation_control_request_cancel(control);
+
     wl_mutex_lock(&sync.mutex);
     for (unsigned i = 0; i < TEST_OP_COUNT; i++)
         failures += expect(sync.calls[i] == before[i],
@@ -335,6 +360,19 @@ run_destroy_race(test_operation_t blocked_operation)
             "session destroy returns synchronously");
     wl_mutex_unlock(&sync.mutex);
 
+    if (control) {
+        int owner;
+        failures += expect(wl_evaluation_control_attach(control, &owner) == 0,
+                "destroy releases logical owner");
+        failures += expect(wl_evaluation_control_begin(control, &owner) == 0,
+                "retained caller reference survives destroy");
+        failures += expect(wl_evaluation_control_charge(control, 0)
+                == WL_EVALUATION_CONTROL_CANCELLED,
+                "request during admission drain remains sticky");
+        (void)wl_evaluation_control_finish(control, &owner, 0, 0);
+        (void)wl_evaluation_control_detach(control, &owner);
+        wl_evaluation_control_release(control);
+    }
     wl_cond_destroy(&sync.changed);
     wl_mutex_destroy(&sync.mutex);
     return failures;
@@ -345,8 +383,9 @@ main(void)
 {
     int failures = 0;
 
-    failures += run_destroy_race(TEST_OP_SNAPSHOT);
-    failures += run_destroy_race(TEST_OP_STEP);
+    failures += run_destroy_race(TEST_OP_SNAPSHOT, false);
+    failures += run_destroy_race(TEST_OP_STEP, false);
+    failures += run_destroy_race(TEST_OP_INSERT, true);
     if (failures)
         fprintf(stderr, "session_admission: %d failure(s)\n", failures);
     return failures != 0;

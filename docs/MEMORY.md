@@ -1315,3 +1315,28 @@ These names identify arrangement isolation, concurrent inline access, and
 multi-worker authorization results. They do not claim that these tests prove
 recursive TDD worker dispatch; that end-to-end assertion is the follow-up
 unit in this issue.
+
+## Evaluation-control foundation and memory admission (#1819)
+
+The internal `wl_session_options_t` v3 appends a retained evaluation-control
+reference beside the memory governor. Verified v2 prefixes remain accepted;
+`memory_governor` still overrides environment/host memory-limit resolution and
+the Windows handle exactly as before. Session creation retains its own control
+reference, claims a unique logical owner, and unwinds both on construction
+failure; the options structure itself is never retained. Worker clones borrow
+the control until the coordinator's backend teardown has drained them.
+
+Work allowance is independent of byte admission: zero means unlimited work,
+not unlimited managed memory. Exhaustion/cancellation have dedicated internal
+dispositions; memory denial and accounting overflow remain genuine execution
+errors. Completed attempt reports retain execution and cleanup errors separately
+from the stop cause. Stopping must never discard a checked-disposal refusal or
+skip required release/drain simply because work allowance is exhausted.
+
+This commit provides primitives/attachment only. Controlled STEP/SNAPSHOT
+currently return `ENOTSUP`; no public host API enables the feature yet. The
+[SEMANTICS evaluation-control contract](SEMANTICS.md#evaluation-control-foundation-1819-engine-integration-pending)
+defines charge-before-work accounting, retry/publication obligations and future
+256-unit checkpoints. These are not additional memory-governor reservations,
+RSS limits or wall-clock deadlines. #1820–#1823 implement recovery, engine
+coverage and public access; #1824 validates the combined behavior.

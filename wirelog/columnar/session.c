@@ -2662,6 +2662,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->base.owns_extension_snapshot = false;
     out_worker->base.operation_admission = NULL;
     out_worker->base.owns_operation_admission = false;
+    out_worker->base.owns_evaluation_control = false;
 
     /* Step 3: NULL all owned pointers (safe for cleanup on early abort) */
     out_worker->wq = NULL;

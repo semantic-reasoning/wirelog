@@ -23,6 +23,7 @@
 #include "session.h"
 #include "thread.h"
 #include <errno.h>
+#include <string.h>
 #include <stddef.h>
 #include <stdlib.h>
 
@@ -118,6 +119,7 @@ wl_session_options_init(wl_session_options_t *options)
     options->version = WL_SESSION_OPTIONS_VERSION;
     options->windows_job_handle = NULL;
     options->memory_governor = NULL;
+    options->evaluation_control = NULL;
 }
 
 #ifdef WL_SESSION_TEST_HOOKS
@@ -189,12 +191,37 @@ wl_session_testhook_after_worker_lease_release(wl_session_t *session)
 #endif
 
 static int
-wl_session_options_valid(const wl_session_options_t *options)
+wl_session_options_normalize(const wl_session_options_t *options,
+    wl_session_options_t *normalized)
 {
+    /* Frozen v2 storage: never access its tail through a v3 typed lvalue. */
+    typedef struct {
+        uint32_t size;
+        uint32_t version;
+        void *windows_job_handle;
+        wl_columnar_memory_governor_ref_t *memory_governor;
+    } wl_session_options_v2_t;
+    uint32_t size;
+    uint32_t version;
+    wl_session_options_init(normalized);
     if (!options)
         return 1;
-    return options->version == WL_SESSION_OPTIONS_VERSION
-           && options->size >= (uint32_t)sizeof(*options);
+    memcpy(&size, options, sizeof(size));
+    if (size < sizeof(size) + sizeof(version))
+        return 0;
+    memcpy(&version, (const char *)options + sizeof(size), sizeof(version));
+    if (version == 2 && size >= sizeof(wl_session_options_v2_t)) {
+        wl_session_options_v2_t legacy;
+        memcpy(&legacy, options, sizeof(legacy));
+        normalized->windows_job_handle = legacy.windows_job_handle;
+        normalized->memory_governor = legacy.memory_governor;
+        return 1;
+    }
+    if (version != WL_SESSION_OPTIONS_VERSION || size < sizeof(*normalized))
+        return 0;
+    memcpy(normalized, options, sizeof(*normalized));
+    normalized->size = (uint32_t)sizeof(*normalized);
+    return 1;
 }
 
 int
@@ -231,21 +258,36 @@ wl_session_create_with_snapshot_options(const wl_compute_backend_t *backend,
 {
     int rc;
     wl_session_admission_t *admission;
+    wl_session_options_t normalized;
+    wl_evaluation_control_t *control;
 #ifdef WL_SESSION_TEST_HOOKS
     if (!options)
         options = testhook_options;
 #endif
-    if (!backend || !backend->session_create || !out
-        || !wl_session_options_valid(options))
+    if (!out)
         return -1;
+    *out = NULL;
+    if (!backend || !backend->session_create
+        || !wl_session_options_normalize(options, &normalized))
+        return -1;
+    control = normalized.evaluation_control;
+    if (control && !backend->session_create_with_options)
+        return ENOTSUP;
 
     admission = wl_session_admission_create();
     if (!admission)
         return ENOMEM;
+    if (control) {
+        rc = wl_evaluation_control_attach(control, admission);
+        if (rc != 0) {
+            wl_session_admission_destroy(admission);
+            return rc;
+        }
+    }
 
     if (options && backend->session_create_with_options)
-        rc = backend->session_create_with_options(plan, num_workers, options,
-                out);
+        rc = backend->session_create_with_options(plan, num_workers,
+                &normalized, out);
     else
         rc = backend->session_create(plan, num_workers, out);
     if (rc == 0 && *out) {
@@ -253,13 +295,19 @@ wl_session_create_with_snapshot_options(const wl_compute_backend_t *backend,
         (*out)->backend = backend;
         (*out)->operation_admission = admission;
         (*out)->owns_operation_admission = true;
+        (*out)->evaluation_control = control;
+        (*out)->owns_evaluation_control = control != NULL;
         if (snapshot) {
             wirelog_extension_snapshot_retain(snapshot);
             (*out)->extension_snapshot = snapshot;
             (*out)->owns_extension_snapshot = true;
         }
     } else {
+        if (control)
+            (void)wl_evaluation_control_detach(control, admission);
         wl_session_admission_destroy(admission);
+        if (rc == 0)
+            rc = -1;
     }
     return rc;
 }
@@ -270,6 +318,7 @@ wl_session_destroy(wl_session_t *session)
     const wl_compute_backend_t *backend;
     wirelog_extension_snapshot_t *snapshot;
     wl_session_admission_t *admission;
+    wl_evaluation_control_t *control;
     if (!session)
         return;
     admission = session->owns_operation_admission
@@ -279,9 +328,13 @@ wl_session_destroy(wl_session_t *session)
     backend = session->backend;
     snapshot = session->owns_extension_snapshot
         ? session->extension_snapshot : NULL;
+    control = session->owns_evaluation_control
+        ? session->evaluation_control : NULL;
     if (backend && backend->session_destroy)
         backend->session_destroy(session);
     wirelog_extension_snapshot_release(snapshot);
+    if (control)
+        (void)wl_evaluation_control_detach(control, admission);
     wl_session_admission_destroy(admission);
 }
 
@@ -370,6 +423,8 @@ wl_session_step(wl_session_t *session)
     if (!session->backend || !session->backend->session_step
         || session->input_load_failed)
         rc = -1;
+    else if (session->evaluation_control)
+        rc = ENOTSUP; /* #1820-#1822 replace after complete enforcement. */
     else
         rc = session->backend->session_step(session);
     wl_session_operation_end(session);
@@ -402,6 +457,8 @@ wl_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
     if (!session->backend || !session->backend->session_snapshot
         || session->input_load_failed)
         rc = -1;
+    else if (session->evaluation_control)
+        rc = ENOTSUP; /* Never silently evaluate an attached control. */
     else
         rc = session->backend->session_snapshot(session, callback, user_data);
     wl_session_operation_end(session);

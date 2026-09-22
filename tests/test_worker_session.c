@@ -66,7 +66,8 @@ static int extension_destroy_calls;
 static wl_col_session_t *
 make_coordinator_with_snapshot(wl_plan_t **plan_out,
     wirelog_program_t **prog_out,
-    wirelog_extension_snapshot_t *snapshot)
+    wirelog_extension_snapshot_t *snapshot,
+    wl_evaluation_control_t *control)
 {
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(
@@ -89,8 +90,11 @@ make_coordinator_with_snapshot(wl_plan_t **plan_out,
     }
 
     wl_session_t *session = NULL;
-    rc = wl_session_create_with_snapshot(wl_backend_columnar(), plan, 2,
-            snapshot, &session);
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control;
+    rc = wl_session_create_with_snapshot_options(wl_backend_columnar(), plan, 2,
+            snapshot, &options, &session);
     if (rc != 0 || !session) {
         wl_plan_free(plan);
         wirelog_program_free(prog);
@@ -105,7 +109,49 @@ make_coordinator_with_snapshot(wl_plan_t **plan_out,
 static wl_col_session_t *
 make_coordinator(wl_plan_t **plan_out, wirelog_program_t **prog_out)
 {
-    return make_coordinator_with_snapshot(plan_out, prog_out, NULL);
+    return make_coordinator_with_snapshot(plan_out, prog_out, NULL, NULL);
+}
+
+static void
+test_worker_borrows_evaluation_control(void)
+{
+    TEST("worker borrows evaluation control");
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_evaluation_control_t *control = NULL;
+    if (wl_evaluation_control_create(10, &control) != 0) {
+        FAIL("control allocation");
+        return;
+    }
+    wl_col_session_t *coord = make_coordinator_with_snapshot(&plan, &prog,
+            NULL, control);
+    if (!coord) {
+        wl_evaluation_control_release(control);
+        FAIL("coordinator creation");
+        return;
+    }
+    wl_col_session_t worker = { 0 };
+    int rc = col_worker_session_create(coord, 0, NULL, 0, &worker);
+    bool ok = rc == 0;
+    if (ok) {
+        ok = worker.base.evaluation_control == control
+            && !worker.base.owns_evaluation_control;
+        col_worker_session_destroy(&worker);
+        ok = ok && wl_evaluation_control_begin(control,
+                coord->base.operation_admission) == 0;
+        if (ok)
+            ok = wl_evaluation_control_finish(control,
+                    coord->base.operation_admission, 0, 0) == 0;
+    }
+    wl_session_destroy(&coord->base);
+    wl_plan_free(plan);
+    wirelog_program_free(prog);
+    wl_evaluation_control_release(control);
+    if (ok) {
+        PASS();
+    } else {
+        FAIL("borrow/owner lifecycle");
+    }
 }
 
 static int
@@ -283,7 +329,7 @@ test_worker_borrows_extension_snapshot(void)
     snapshot = wirelog_extension_snapshot_acquire(registry);
     if (!snapshot)
         failures++;
-    coord = make_coordinator_with_snapshot(&plan, &prog, snapshot);
+    coord = make_coordinator_with_snapshot(&plan, &prog, snapshot, NULL);
     if (!coord)
         failures++;
     if (snapshot)
@@ -3001,6 +3047,7 @@ main(int argc, char **argv)
 
     test_create_destroy();
     test_worker_borrows_extension_snapshot();
+    test_worker_borrows_evaluation_control();
     test_identity_fields();
     test_borrowed_fields();
     test_rels_independent();

@@ -15,7 +15,9 @@
 typedef struct wl_columnar_memory_governor_ref
     wl_columnar_memory_governor_ref_t;
 
-#define WL_SESSION_OPTIONS_VERSION UINT32_C(2)
+typedef struct wl_evaluation_control wl_evaluation_control_t;
+
+#define WL_SESSION_OPTIONS_VERSION UINT32_C(3)
 
 /*
  * Options are valid only for the duration of session creation.  The Windows
@@ -31,12 +33,18 @@ typedef struct wl_columnar_memory_governor_ref
  * reference until the program is freed, so the governor can outlive the
  * session.  When it is set, @windows_job_handle and WIRELOG_MEMORY_BUDGET
  * are ignored.
+ *
+ * Version 3 (#1819) adds a retained evaluation-control reference. The common
+ * wrapper claims one logical owner; workers only borrow it. This is foundation
+ * plumbing: controlled step/snapshot return ENOTSUP until engine enforcement
+ * lands. Version 2 prefixes remain accepted, with no evaluation control.
  */
 typedef struct {
     uint32_t size;
     uint32_t version;
     void *windows_job_handle;
     wl_columnar_memory_governor_ref_t *memory_governor;
+    wl_evaluation_control_t *evaluation_control;
 } wl_session_options_t;
 
 void
