@@ -1,7 +1,7 @@
 # Intern Write-Path Performance
 
-**Last Updated:** 2026-09-10
-**Baseline SHA:** `4e4690cc` (main at the time of measurement)
+**Last Updated:** 2026-09-23
+**Baseline SHA:** `bbaf2b56` (main plus the #1526 warm-up change at measurement time)
 **Issue:** #1472 (benchmark and baseline); measures the write path from #958,
 #961 and #1431
 
@@ -79,18 +79,18 @@ helper pins the process to one CPU, which would serialize the writers.
 
 | Mode | Writers | Governor | agg_ns_put | ns_put | p50 ns | p99 ns | grow_events | grow_share |
 |------|---------|----------|-----------:|-------:|-------:|-------:|------------:|-----------:|
-| unique | 1 | off | 300 | 273 | 149 | 1493 | 1377 | 31.9% |
-| unique | 1 | on | 346 | 319 | 216 | 841 | 217 | 21.6% |
-| unique | 4 | off | 811 | 2964 | 1420 | 17790 | n/a | n/a |
-| unique | 4 | on | 1102 | 4160 | 2207 | 21066 | n/a | n/a |
-| unique | 8 | off | 1036 | 8122 | 5024 | 37881 | n/a | n/a |
-| unique | 8 | on | 1242 | 9718 | 5896 | 43663 | n/a | n/a |
-| dup | 1 | off | 140 | 110 | 103 | 196 | 31 | 1.1% |
-| dup | 1 | on | 139 | 112 | 103 | 247 | 28 | 1.1% |
-| dup | 4 | off | 302 | 1145 | 326 | 10145 | n/a | n/a |
-| dup | 4 | on | 318 | 1158 | 324 | 10369 | n/a | n/a |
-| dup | 8 | off | 347 | 2668 | 424 | 19250 | n/a | n/a |
-| dup | 8 | on | 333 | 2585 | 405 | 19308 | n/a | n/a |
+| unique | 1 | off | 266 | 239 | 145 | 775 | 372 | 23.8% |
+| unique | 1 | on | 332 | 307 | 215 | 831 | 321 | 19.3% |
+| unique | 4 | off | 604 | 2343 | 1161 | 13953 | n/a | n/a |
+| unique | 4 | on | 897 | 3396 | 1739 | 17649 | n/a | n/a |
+| unique | 8 | off | 859 | 6408 | 3591 | 30842 | n/a | n/a |
+| unique | 8 | on | 1001 | 7775 | 4348 | 34317 | n/a | n/a |
+| dup | 1 | off | 145 | 115 | 104 | 254 | 30 | 1.0% |
+| dup | 1 | on | 144 | 113 | 104 | 247 | 29 | 1.0% |
+| dup | 4 | off | 241 | 909 | 309 | 7228 | n/a | n/a |
+| dup | 4 | on | 226 | 857 | 322 | 6858 | n/a | n/a |
+| dup | 8 | off | 290 | 2254 | 481 | 16468 | n/a | n/a |
+| dup | 8 | on | 295 | 2267 | 493 | 15713 | n/a | n/a |
 
 Clock pair cost (median of the three runs): 25 ns per bracketed put.
 
@@ -102,27 +102,26 @@ so the two configurations agree within noise.
 
 | Mode | Writers | Governor | agg_ns_put | ns_put | p50 ns | p99 ns | grow_events | grow_share |
 |------|---------|----------|-----------:|-------:|-------:|-------:|------------:|-----------:|
-| unique | 1 | off | 314 | 287 | 154 | 1673 | 1409 | 31.9% |
-| unique | 1 | on | 348 | 323 | 215 | 847 | 225 | 22.6% |
-| unique | 4 | off | 786 | 2902 | 1363 | 16328 | n/a | n/a |
-| unique | 4 | on | 1083 | 4065 | 2127 | 20064 | n/a | n/a |
-| unique | 8 | off | 1019 | 7694 | 4803 | 37583 | n/a | n/a |
-| unique | 8 | on | 1460 | 11003 | 6743 | 49230 | n/a | n/a |
-| dup | 1 | off | 138 | 108 | 101 | 198 | 28 | 1.1% |
-| dup | 1 | on | 135 | 109 | 102 | 196 | 33 | 1.2% |
-| dup | 4 | off | 316 | 1175 | 352 | 10093 | n/a | n/a |
-| dup | 4 | on | 296 | 1095 | 344 | 10029 | n/a | n/a |
-| dup | 8 | off | 364 | 2802 | 398 | 20595 | n/a | n/a |
-| dup | 8 | on | 370 | 2830 | 408 | 20182 | n/a | n/a |
+| unique | 1 | off | 264 | 238 | 146 | 773 | 573 | 25.7% |
+| unique | 1 | on | 330 | 306 | 216 | 823 | 121 | 18.0% |
+| unique | 4 | off | 576 | 2142 | 985 | 13166 | n/a | n/a |
+| unique | 4 | on | 875 | 3450 | 1698 | 17205 | n/a | n/a |
+| unique | 8 | off | 748 | 5740 | 3215 | 27961 | n/a | n/a |
+| unique | 8 | on | 1082 | 8366 | 4920 | 38183 | n/a | n/a |
+| dup | 1 | off | 142 | 112 | 104 | 228 | 29 | 1.0% |
+| dup | 1 | on | 141 | 112 | 104 | 206 | 29 | 1.0% |
+| dup | 4 | off | 235 | 896 | 309 | 7438 | n/a | n/a |
+| dup | 4 | on | 240 | 885 | 314 | 7601 | n/a | n/a |
+| dup | 8 | off | 308 | 2372 | 492 | 17708 | n/a | n/a |
+| dup | 8 | on | 328 | 2534 | 447 | 18720 | n/a | n/a |
 
 Clock pair cost (median of the three runs): 25 ns per bracketed put.
 
 ## Reading the table
 
 - **Governor cost per unique put.** With one writer the enforcing governor
-  adds about 30 to 50 ns per unique put to `agg_ns_put` (300 vs 346 in the
-  first table, 314 vs 348 in the second; the range depends on scenario
-  position, see below): the size arithmetic, the reserve CAS and the commit
+  adds about 70 ns per unique put to `agg_ns_put` (266 vs 334 in the
+  first table, 264 vs 330 in the second; the range depends on host noise): the size arithmetic, the reserve CAS and the commit
   inside the lock. Under contention the gap widens to a few
   hundred nanoseconds per put because the reservation lengthens the locked
   region every waiter queues behind.
@@ -130,8 +129,8 @@ Clock pair cost (median of the three runs): 25 ns per bracketed put.
   rows agree within noise at every writer count, and `gov_reserved_delta` is
   0 on every governed `dup` run: a duplicate is recognised under the lock
   before any governor code runs and only frees its speculative copy.
-- **Contention.** `agg_ns_put` for unique puts rises from about 300 ns at one
-  writer to about 800 ns at four and about 1000 ns at eight: the locked region
+- **Contention.** `agg_ns_put` for unique puts rises from about 275 ns at one
+  writer to about 650 ns at four and about 775 ns at eight: the locked region
   serialises the puts, and the extra cost is lock hand-off. `ns_put` at eight
   writers is roughly eight times `agg_ns_put`, as expected when seven writers
   wait behind one.
@@ -140,22 +139,17 @@ Clock pair cost (median of the three runs): 25 ns per bracketed put.
   load factor) and opens 12 id segments (64 << s entries each; ids below
   200000 touch segments 0 to 11). `grow_events` is far larger than 25 because
   the 16 x p50 threshold also catches allocator and page-fault outliers on
-  ordinary puts; `grow_share` is the honest figure: about a third of the
+  ordinary puts; `grow_share` is the honest figure: about a quarter of the
   single-writer time on this host goes to those outliers, dominated by the
   last two resizes (the `max` sample, several milliseconds, is the final
   rehash). Small early resizes and segment opens stay below the threshold.
   The share is reported as a share of summed per-put latency, not of wall
   time.
-- **Scenario order.** The grid runs its scenarios in one process, and the
-  first scenario pays the first-touch page faults of the heap the table
-  grows into (the tenth-size warm-up table does not pre-fault it). The p99
-  and `grow_events` of the first row (`unique`, one writer, governor off)
-  are therefore higher than the same scenario shows when it runs later in
-  the grid, and a scenario run alone is itself in first position and pays
-  the same cost. Tail metrics are only comparable between rows measured in
-  the same position: run each side of a comparison alone (`--mode`,
-  `--writers`, `--governor`) so both sit in first position. `grow_share`
-  is stable across positions; `agg_ns_put` moves by under ten percent.
+- **Scenario order.** Every timed scenario receives a full-size untimed
+  warm-up. For tail comparisons, run each row in a fresh process with the
+  matching `--mode`, `--writers` and `--governor` arguments; this removes
+  allocator state carried between rows. The tables above are medians of three
+  isolated runs at 200000 iterations on the stated host.
 
 ## Reproducing these results
 
@@ -166,6 +160,10 @@ build/bench/bench_intern                              # full grid, defaults
 build/bench/bench_intern --mode unique --writers 8 --governor on --iters 200000
 meson test -C build bench_intern_smoke                # every scenario, 2000 puts
 ```
+
+For comparable tail metrics, invoke each scenario separately (one process per
+row) and take the median of three runs; do not compare rows captured at
+different positions in one long-lived grid process.
 
 Run each scenario three times and take the median. Record the build
 configuration, compiler, CPU governor and SHA with the numbers. The bench

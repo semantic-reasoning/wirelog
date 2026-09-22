@@ -507,7 +507,7 @@ main(int argc, char **argv)
             for (int g = 0; g < 2; g++) {
                 bool governed = g == 1;
                 uint32_t iters = (uint32_t)iters_arg;
-                uint32_t warm = iters / 10u;
+                uint32_t warm = iters;
                 if ((governed && !run_on) || (!governed && !run_off))
                     continue;
                 if (warm > 0
