@@ -1540,14 +1540,15 @@ test_session_injected_governor_admission(void)
     session = NULL;
     rc = ref ? wl_session_create_with_options(wl_backend_columnar(), plan, 1,
             &options, &session) : -1;
-    if (!ref || rc != ENOMEM || session != NULL || reserved_on(ref) != 0) {
+    if (!ref || rc != WL_INTERN_ERR_MEMORY_BUDGET || session != NULL
+        || reserved_on(ref) != 0) {
         if (session)
             wl_session_destroy(session);
         if (ref)
             wl_columnar_memory_governor_ref_release(ref);
         wl_plan_free(plan);
         wirelog_program_free(prog);
-        FAIL("intern-floor denial did not fail creation with ENOMEM");
+        FAIL("intern-floor denial did not fail creation with budget status");
         return;
     }
     wl_columnar_memory_governor_ref_release(ref);
@@ -1670,7 +1671,8 @@ test_session_injected_governor_admission(void)
     rc = ref ? wl_session_create(wl_backend_columnar(), plan, 1, &session)
         : -1;
     wl_session_testhook_set_default_options(NULL);
-    if (!ref || rc != ENOMEM || session != NULL || reserved_on(ref) != 0
+    if (!ref || rc != WL_INTERN_ERR_MEMORY_BUDGET || session != NULL
+        || reserved_on(ref) != 0
         || wl_session_testhook_default_options() != NULL) {
         if (session)
             wl_session_destroy(session);

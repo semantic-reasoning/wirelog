@@ -130,7 +130,8 @@ typedef struct {
  * Error codes (in addition to wirelog_easy_open's):
  *   WIRELOG_ERR_EXEC      - opts->size too small / opts->_reserved non-NULL
  *   WIRELOG_ERR_INVALID_IR - eager_build set and plan generation failed
- *   WIRELOG_ERR_MEMORY    - eager_build set and session allocation failed
+ *   WIRELOG_ERR_MEMORY    - eager_build set and allocation failed
+ *   WIRELOG_ERR_MEMORY_BUDGET - the configured memory budget denied admission
  *
  * Returns: WIRELOG_OK on success; *out set to NULL on any error.
  */
@@ -161,8 +162,9 @@ wirelog_easy_open_opts(const char *dl_src,
  * can read them via wirelog_program_get_facts().
  *
  * Returns: WIRELOG_OK on success, WIRELOG_ERR_PARSE on parse failure,
- * WIRELOG_ERR_MEMORY on allocation failure, or another wirelog_error_t on
- * other failure modes.  *out is set to NULL on error.
+ * WIRELOG_ERR_MEMORY on allocation failure, WIRELOG_ERR_MEMORY_BUDGET when
+ * the configured memory budget denies admission, or another wirelog_error_t
+ * on other failure modes.  *out is set to NULL on error.
  */
 WIRELOG_API wirelog_error_t
 wirelog_easy_open(const char *dl_src, wirelog_easy_session_t **out);

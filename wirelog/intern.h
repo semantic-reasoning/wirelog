@@ -37,6 +37,12 @@ typedef struct wl_intern wl_intern_t;
 typedef struct wl_columnar_memory_governor_ref
     wl_columnar_memory_governor_ref_t;
 
+/* Internal status preserving governor admission denial at facade boundaries. */
+#ifndef WL_ERR_MEMORY_BUDGET
+#define WL_ERR_MEMORY_BUDGET 0x10001
+#endif
+#define WL_INTERN_ERR_MEMORY_BUDGET WL_ERR_MEMORY_BUDGET
+
 /* Attach program-owned intern storage to a retained governor.  Existing
  * bytes are admitted transactionally.  EBUSY means a live session, worker
  * or result still holds the owning governor and the caller must continue

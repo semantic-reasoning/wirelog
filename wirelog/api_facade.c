@@ -20,6 +20,7 @@
 #include "passes/subsumption.h"
 #include "session.h"
 #include "session_facts.h"
+#include "intern.h"
 #include "wirelog-config.h"
 
 #include <errno.h>
@@ -677,11 +678,12 @@ wirelog_executor_create(wirelog_program_t *program, wirelog_error_t *error)
             1, &executor->session);
     if (session_rc != 0) {
         wirelog_executor_free(executor);
-        /* ENOMEM is an allocation failure; EOVERFLOW is the memory governor
-         * refusing to admit the program's intern table (#1431).  Both are
-         * memory verdicts under the docs/MEMORY.md contract. */
-        set_error(error, (session_rc == ENOMEM || session_rc == EOVERFLOW)
-            ? WIRELOG_ERR_MEMORY : WIRELOG_ERR_EXEC);
+        /* Session creation reports governor budget exhaustion as EOVERFLOW;
+         * keep it distinct from ordinary allocator failure. */
+        set_error(error, session_rc == WL_INTERN_ERR_MEMORY_BUDGET
+            ? WIRELOG_ERR_MEMORY_BUDGET
+            : session_rc == ENOMEM ? WIRELOG_ERR_MEMORY
+            : WIRELOG_ERR_EXEC);
         return NULL;
     }
     if (wl_session_load_facts(executor->session, program) != 0
@@ -919,6 +921,8 @@ wirelog_error_string(wirelog_error_t error)
         return "execution error";
     case WIRELOG_ERR_MEMORY:
         return "out of memory";
+    case WIRELOG_ERR_MEMORY_BUDGET:
+        return "memory budget exhausted";
     case WIRELOG_ERR_IO:
         return "I/O error";
     case WIRELOG_ERR_COMPOUND_SATURATED:

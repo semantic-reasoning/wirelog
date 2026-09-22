@@ -2504,7 +2504,7 @@ test_snapshot_rebuilds_idb_after_query_mode_input_changes(void)
 }
 
 /* ======================================================================== */
-/* Issue #1473: create-time governor denial maps to WIRELOG_ERR_MEMORY      */
+/* Issue #1473: create-time governor denial maps to WIRELOG_ERR_MEMORY_BUDGET */
 /* ======================================================================== */
 
 static wl_columnar_memory_governor_ref_t *
@@ -2600,7 +2600,7 @@ test_injected_governor_easy_eager(void)
     uint64_t intern_bytes = 0;
     uint64_t compound_bytes = 0;
 
-    TEST("#1473 easy eager: governor denial maps to WIRELOG_ERR_MEMORY");
+    TEST("#1473 easy eager: governor denial maps to WIRELOG_ERR_MEMORY_BUDGET");
     if (measure_easy_floor(RELATION_NAME_LIFETIME_SRC, &intern_bytes,
         &compound_bytes) != 0) {
         FAIL("could not measure the create-time floor");
@@ -2619,11 +2619,11 @@ test_injected_governor_easy_eager(void)
     error = wirelog_easy_open_opts(RELATION_NAME_LIFETIME_SRC, &opts,
             &session);
     wl_session_testhook_set_default_options(NULL);
-    if (error != WIRELOG_ERR_MEMORY || session != NULL
+    if (error != WIRELOG_ERR_MEMORY_BUDGET || session != NULL
         || reserved_on(ref) != 0) {
         wirelog_easy_close(session);
         wl_columnar_memory_governor_ref_release(ref);
-        FAIL("eager denial did not map to WIRELOG_ERR_MEMORY");
+        FAIL("eager denial did not map to WIRELOG_ERR_MEMORY_BUDGET");
         return;
     }
     wl_columnar_memory_governor_ref_release(ref);
@@ -2670,7 +2670,7 @@ test_injected_governor_easy_lazy(void)
     uint64_t intern_bytes = 0;
     uint64_t compound_bytes = 0;
 
-    TEST("#1473 easy lazy: governor denial maps to WIRELOG_ERR_MEMORY");
+    TEST("#1473 easy lazy: governor denial maps to WIRELOG_ERR_MEMORY_BUDGET");
     if (measure_easy_floor(RELATION_NAME_LIFETIME_SRC, &intern_bytes,
         &compound_bytes) != 0) {
         FAIL("could not measure the create-time floor");
@@ -2692,10 +2692,10 @@ test_injected_governor_easy_lazy(void)
     wl_session_testhook_set_default_options(&options);
     error = wirelog_easy_step(session);
     wl_session_testhook_set_default_options(NULL);
-    if (error != WIRELOG_ERR_MEMORY || reserved_on(ref) != 0) {
+    if (error != WIRELOG_ERR_MEMORY_BUDGET || reserved_on(ref) != 0) {
         wirelog_easy_close(session);
         wl_columnar_memory_governor_ref_release(ref);
-        FAIL("lazy denial did not map to WIRELOG_ERR_MEMORY");
+        FAIL("lazy denial did not map to WIRELOG_ERR_MEMORY_BUDGET");
         return;
     }
     wl_columnar_memory_governor_ref_release(ref);
@@ -2748,7 +2748,7 @@ test_injected_governor_executor(void)
     uint64_t intern_bytes = 0;
     uint64_t compound_bytes = 0;
 
-    TEST("#1473 executor: governor denial maps to WIRELOG_ERR_MEMORY");
+    TEST("#1473 executor: governor denial maps to WIRELOG_ERR_MEMORY_BUDGET");
     prog = wirelog_parse_string(RELATION_NAME_LIFETIME_SRC, &err);
     /* Plan generation may intern; run it once so the measurement sees the
      * table the executor's own plan generation will attach. */
@@ -2776,11 +2776,11 @@ test_injected_governor_executor(void)
     err = WIRELOG_OK;
     executor = wirelog_executor_create(prog, &err);
     wl_session_testhook_set_default_options(NULL);
-    if (executor || err != WIRELOG_ERR_MEMORY || reserved_on(ref) != 0) {
+    if (executor || err != WIRELOG_ERR_MEMORY_BUDGET || reserved_on(ref) != 0) {
         wirelog_executor_free(executor);
         wl_columnar_memory_governor_ref_release(ref);
         wirelog_program_free(prog);
-        FAIL("executor denial did not map to WIRELOG_ERR_MEMORY");
+        FAIL("executor denial did not map to WIRELOG_ERR_MEMORY_BUDGET");
         return;
     }
     wl_columnar_memory_governor_ref_release(ref);
@@ -2824,7 +2824,7 @@ test_injected_governor_executor(void)
 }
 
 /* Governor arithmetic overflow is EOVERFLOW at the session layer; every
- * facade reports it as the memory verdict. */
+ * facade preserves it as an execution error distinct from budget denial. */
 static void
 test_injected_governor_overflow_maps_to_memory(void)
 {
@@ -2837,7 +2837,8 @@ test_injected_governor_overflow_maps_to_memory(void)
     wl_columnar_memory_reservation_t token;
     wirelog_error_t err;
 
-    TEST("#1473 easy/executor: governor overflow maps to WIRELOG_ERR_MEMORY");
+    TEST(
+        "#1473 easy/executor: governor overflow remains WIRELOG_ERR_EXEC");
     /* Leave 16 bytes of headroom: the fixture's intern table holds more,
      * so attaching it overflows the governor total instead of being
      * denied within the budget. */
@@ -2858,12 +2859,12 @@ test_injected_governor_overflow_maps_to_memory(void)
     err = wirelog_easy_open_opts(RELATION_NAME_LIFETIME_SRC, &opts,
             &session);
     wl_session_testhook_set_default_options(NULL);
-    if (err != WIRELOG_ERR_MEMORY || session != NULL
+    if (err != WIRELOG_ERR_EXEC || session != NULL
         || reserved_on(ref) != UINT64_MAX - 16u) {
         wirelog_easy_close(session);
         (void)wl_columnar_memory_release(&token);
         wl_columnar_memory_governor_ref_release(ref);
-        FAIL("easy eager overflow did not map to WIRELOG_ERR_MEMORY");
+        FAIL("easy eager overflow did not remain WIRELOG_ERR_EXEC");
         return;
     }
     prog = wirelog_parse_string(RELATION_NAME_LIFETIME_SRC, &err);
@@ -2881,8 +2882,8 @@ test_injected_governor_overflow_maps_to_memory(void)
     wirelog_program_free(prog);
     (void)wl_columnar_memory_release(&token);
     wl_columnar_memory_governor_ref_release(ref);
-    if (executor || err != WIRELOG_ERR_MEMORY)
-        FAIL("executor overflow did not map to WIRELOG_ERR_MEMORY");
+    if (executor || err != WIRELOG_ERR_EXEC)
+        FAIL("executor overflow did not remain WIRELOG_ERR_EXEC");
     else
         PASS();
 }

@@ -120,10 +120,12 @@ ensure_plan_built(wirelog_easy_session_t *s, uint32_t num_workers)
             &session);
     if (rc != 0 || !session) {
         wl_plan_free(plan);
-        /* ENOMEM is an allocation failure; EOVERFLOW is the memory
-         * governor refusing to admit the program's intern table (#1431). */
-        return (rc == ENOMEM || rc == EOVERFLOW)
-            ? WIRELOG_ERR_MEMORY : WIRELOG_ERR_EXEC;
+        /* EOVERFLOW here is governor budget exhaustion, not representation
+         * overflow: session creation reports the distinction at this edge. */
+        return rc == WL_INTERN_ERR_MEMORY_BUDGET
+            ? WIRELOG_ERR_MEMORY_BUDGET
+            : rc == ENOMEM ? WIRELOG_ERR_MEMORY
+            : WIRELOG_ERR_EXEC;
     }
 
     /* Issue #718: seed inline `.dl` facts into the freshly built session
