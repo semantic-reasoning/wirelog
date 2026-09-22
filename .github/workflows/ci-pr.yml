@@ -172,12 +172,9 @@ jobs:
       # ~24 minutes after the job began.  Now a size regression fails this
       # job within minutes of configuration.
       #
-      # Nothing about the check itself changed: same step name, same script,
-      # same library artifact, same baseline (tests/baseline_size.txt) and
-      # same 5120-byte budget.  `meson compile -C builddir wirelog` builds
-      # exactly the `wirelog` target (verified on meson 1.12.0: 90 build
-      # steps, zero test artifacts), and the full Build step below reuses
-      # those objects.  Passing runs continue into every existing gate.
+      # The exact event base and tested merge are built with the same runner,
+      # Meson recipe, compiler and resolved production profile. The numeric
+      # budget remains 5120 bytes; the comparison uses the base-owned baseline.
       # =======================================================================
       - name: Build production library for early size gate
         run: |
@@ -186,7 +183,12 @@ jobs:
           echo "Early size-gate library build: $(( $(date +%s) - early_start ))s"
 
       - name: Check binary size
-        run: scripts/ci/check-text-size.sh builddir/libwirelog.so
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          TESTED_SHA: ${{ github.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/run-size-comparison.sh builddir "$BASE_SHA" "$TESTED_SHA" size-comparison.json "$PR_HEAD_SHA"
 
       - name: Build
         run: meson compile -C builddir

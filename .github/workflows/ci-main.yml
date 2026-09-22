@@ -17,6 +17,7 @@ on:
     branches: [main]
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -113,6 +114,7 @@ jobs:
         uses: ./.github/actions/setup-meson
 
       - name: Configure (Linux / macOS)
+        id: configure-native
         if: runner.os != 'Windows'
         run: meson setup builddir -Dtests=true -DmbedTLS=disabled
         env:
@@ -161,6 +163,7 @@ jobs:
           meson compile -C builddir
 
       - name: Build (Linux / macOS)
+        id: build-native
         if: runner.os != 'Windows'
         run: meson compile -C builddir
 
@@ -186,13 +189,31 @@ jobs:
           meson test -C builddir --print-errorlogs
 
       - name: Test (Linux / macOS)
+        id: test-native
         if: runner.os != 'Windows'
         run: meson test -C builddir --print-errorlogs
 
-      - name: Check binary size
-        if: runner.os == 'Linux' && matrix.compiler == 'gcc'
+      - name: Report binary size monitoring
         continue-on-error: true
-        run: scripts/ci/check-text-size.sh builddir/libwirelog.so
+        if: always() && runner.os == 'Linux' && matrix.compiler == 'gcc'
+        env:
+          MONITORED_SHA: ${{ github.sha }}
+          MONITORED_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MONITORED_RUNNER_OS: ${{ matrix.os }}
+          MONITORED_COMPILER: ${{ matrix.compiler }}
+          CONFIGURE_OUTCOME: ${{ steps.configure-native.outcome || 'unknown' }}
+          BUILD_OUTCOME: ${{ steps.build-native.outcome || 'unknown' }}
+          TEST_OUTCOME: ${{ steps.test-native.outcome || 'unknown' }}
+        run: python3 scripts/ci/report-main-size.py --library builddir/libwirelog.so --build-dir builddir --source-dir . --report size-monitor/size-report.json --sha "$MONITORED_SHA" --run-url "$MONITORED_RUN_URL" --runner-os "$MONITORED_RUNNER_OS" --compiler "$MONITORED_COMPILER" --configure-status "$CONFIGURE_OUTCOME" --build-status "$BUILD_OUTCOME" --test-status "$TEST_OUTCOME"
+
+      - name: Upload binary size monitoring evidence
+        if: always() && runner.os == 'Linux' && matrix.compiler == 'gcc'
+        uses: actions/upload-artifact@v4
+        with:
+          name: wirelog-size-monitor-${{ matrix.os }}
+          path: size-monitor/
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Path A example compile-check
         if: runner.os == 'Linux' && matrix.compiler == 'gcc'
