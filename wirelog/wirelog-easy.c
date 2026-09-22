@@ -398,8 +398,9 @@ wirelog_easy_step(wirelog_easy_session_t *s)
     if (err != WIRELOG_OK)
         return err;
     int rc = wl_session_step(s->session);
-    return (wirelog_error_t)wl_facade_session_error_code(rc,
-               COL_SESSION(s->session)->extension_expr_status);
+    return (wirelog_error_t)wl_facade_session_error_code_with_budget(rc,
+               COL_SESSION(s->session)->extension_expr_status,
+               wl_columnar_session_budget_denied(COL_SESSION(s->session)));
 }
 
 wirelog_error_t
@@ -542,6 +543,7 @@ wirelog_easy_snapshot(wirelog_easy_session_t *s, const char *relation,
     wirelog_easy_snapshot_filter_t filter
         = { .wanted = relation, .user_cb = cb, .user_data = user_data };
     int rc = wl_session_snapshot(s->session, snapshot_trampoline, &filter);
-    return (wirelog_error_t)wl_facade_session_error_code(rc,
-               COL_SESSION(s->session)->extension_expr_status);
+    return (wirelog_error_t)wl_facade_session_error_code_with_budget(rc,
+               COL_SESSION(s->session)->extension_expr_status,
+               wl_columnar_session_budget_denied(COL_SESSION(s->session)));
 }

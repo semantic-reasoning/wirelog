@@ -281,10 +281,13 @@ wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
                 wl_columnar_memory_governor_ref_get(sess->memory_governor),
                 sizeof(*frame), &reservation);
         if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
-            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                sess->memory_budget_denied = true;
             return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
                 : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
                 : EINVAL;
+        }
     }
     frame = calloc(1, sizeof(*frame));
     if (!frame) {

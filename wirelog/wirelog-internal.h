@@ -12,6 +12,7 @@
 #define WIRELOG_INTERNAL_H
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -34,6 +35,10 @@ wl_extension_error_set_expr_status(int status);
  * session entry points agree on the result of a governed evaluation. */
 int
 wl_facade_session_error_code(int rc, int expr_status);
+
+int
+wl_facade_session_error_code_with_budget(int rc, int expr_status,
+    bool budget_denied);
 
 /* Internal callback lifetime lease. The lease token is valid until released,
  * even if the originating snapshot is released or the entry is unregistered
