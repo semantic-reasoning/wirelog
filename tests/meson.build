@@ -1198,6 +1198,26 @@ if sh.found()
        timeout: 120)
 endif
 
+# Issue #1384: the ownership matrix in docs/MEMORY.md cites call sites by
+# symbol, and every symbol must resolve uniquely against a definition index.
+# Registered with an explicit timeout because the gate spawns python3 and so
+# falls under the #1464 rule; 120 matches the threading pair above and is set
+# well clear of the measured runtime as a hang detector.  The selftest drives a
+# rejection case per check and one control, and prints its own tally; a gate
+# for a table that starts out small is worthless unless it is shown to fail on
+# purpose.  The enumeration lives in the selftest rather than here because a
+# copy of it in this comment drifted behind the suite twice.
+if sh.found()
+  test('ownership_matrix', sh,
+       args: [meson.project_source_root() / 'scripts/ci/check-ownership-matrix.sh'],
+       suite: 'abi',
+       timeout: 120)
+  test('ownership_matrix_selftest', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-ownership-matrix.sh'],
+       suite: 'abi',
+       timeout: 120)
+endif
+
 # Issue #715: release dependency wraps must be reproducible.  Git wraps
 # must pin immutable 40-hex commits; wrap-file archive URLs must have
 # matching source_hash/patch_hash entries.

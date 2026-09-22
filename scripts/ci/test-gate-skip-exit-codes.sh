@@ -95,6 +95,7 @@ check-advanced-header.sh
 check-clang-tidy-backlog-monotonic.sh
 check-doop-catalogue.sh
 check-log-erasure.sh
+check-ownership-matrix.sh
 check-perf-gate-execution.sh
 check-phase-labels.sh
 check-semantics-future.sh

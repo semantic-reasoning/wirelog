@@ -664,6 +664,85 @@ the evaluation stack. Paths below are relative to `wirelog/columnar/`.
 | Continuation scratch and published batches | Producer owns scratch and input/index leases; synchronous sink owns committed output | Cursor advances at publication commit; destroy releases producer state; no asynchronous lifetime is implied for scratch-backed payloads | `continuation.c`, `join_batch.c`, `diff_join_batch.c` |
 | Delta-step rollback snapshots | Session owns admitted metadata, copied names and flat rows; stable relation identities prevent restoration into replacement registrations; a GC-only compound hold preserves handle IDs | Capture completes before detachment; checked restoration retains refused backups; successful evaluation or recovery releases them once; teardown discards pending backups after evaluator cleanup | `eval_delta.c`, `relation.c`, `session.c` |
 
+### Pin acquisition and release sites
+
+The table above names the mechanism and the file.  This one names the call
+site, because #1801 has to decide, per evaluation-stack producer, whether the
+value it pushes is owned or borrowed and who the owner is; a file name does not
+answer that.  Anchors are symbols rather than line numbers: these files churn,
+and `scripts/ci/check-ownership-matrix.sh` resolves every symbol below against
+a definition index, so a rename fails `meson test --suite abi` instead of
+rotting the doc.  It also requires every cited symbol to have a caller under
+`wirelog/`, so a row that only tests reach is refused.  That last check is a
+heuristic: a definition paired with a forward declaration, a doc-comment
+mention, a same-named static elsewhere, or an `#ifdef`-gated test wrapper as
+its only caller still passes it.  The index
+covers ordinary C definitions; it is not a substitute for the linker's symbol
+table.
+
+**This table is not complete and nothing establishes that it is.**  The gate
+proves each row's subject exists, resolves uniquely, and has a caller under
+`wirelog/`.  It does not prove that no further ownership class exists, because
+the class list is a reading result, not something derivable from a regex.  Do
+not read completeness into it.  Two of the classes #1384 enumerates are
+deliberately absent: the timestamp sub-resource, which the relation owns rather
+than being a peer class, and the rollback buffer, whose delta-step snapshot is
+already covered by the table above and whose per-relation `retract_backup_*`
+form is dormant infrastructure with no production producer.
+
+It also does not prove a row's *cells* are true, so the rows carry their own
+audit state.  At least nine cells across seven of these rows were wrong on
+first writing, and the two failure modes are worth separating because they
+need different defences.  Most were in rows nobody had read, and those errors
+named the wrong *mechanism* entirely.  But two were written while the row was
+being actively read and repaired, and those named a real function with a wrong
+claim attached -- `join.c:wl_columnar_join_dispose_left` was cited as the
+unchecked disposal when it delegates to the checked one.  Reading a row is
+necessary and not sufficient; a citation must be read for what the function
+*does*, not only for its existence.  What a function does is the one thing the
+gate cannot check.  A row added later without that reading must be marked
+`unread` in the Read column, so the distinction stays visible rather than being
+absorbed into a table that looks uniformly authoritative.  Every marker here is
+author-set: `read` records that the row's author read the code it cites, not
+that a second reader confirmed it.
+
+| Class | Owner | Acquire | Last reader | Invalidation | Destruction | Rebuildable | Read |
+|---|---|---|---|---|---|---|---|
+| Session relation storage | Session registry | `relation.c:col_rel_source_reader_acquire` | Operator holding the reader | Identity, view and storage generations invalidate dependent cached state; the held reader itself ends only at release | `relation.c:col_rel_destroy` | No | read |
+| Worker relation view | Worker, borrowing coordinator storage | `session.c:wl_columnar_session_adopt_shared_view` | Worker task before drain | Lease retirement | `session.c:wl_columnar_session_source_leases_release_all` releases the lease; `session.c:session_destroy_relation_array_pass` destroys the view | Yes, from coordinator storage | read |
+| Coordinator compound arena | Coordinator, borrowed by workers | `compound_arena.c:wl_compound_arena_borrow` | Worker holding the borrow | None; a live borrow holds the access gate against the writer, so only the holder ends it | `compound_arena.c:wl_compound_arena_borrow_release` | No | read |
+| Owned evaluation-stack result | Stack entry, until it transfers out | `eval_stack.c:eval_stack_push` with `owned` true | Consuming operator | Ownership transfers out at `eval_stack.c:eval_stack_drain_to_session`, and where a consumer clears `owned` after handing the relation on (`eval_serial.c:wl_columnar_eval_serial_framed_relation`, and after a TDD delta publish in `eval.c`); otherwise the entry is the owner | `eval_stack.c:eval_entry_dispose`, which propagates a refusal, and `eval_stack.c:eval_stack_dispose_entry`, which re-pushes the entry on one; `join.c:diff_txn_commit_after_push` open-codes a second disposal with the unchecked `relation.c:col_rel_destroy`, so a refusal is not retained there | No | read |
+| Borrowed stack value, session relation | Session registry, not the entry | `ops.c:col_op_variable` pushes `owned` false | Consuming operator | Owner outlives the entry; no pin is taken | Owner's, not the entry's | Yes, re-read from the registry | read |
+| Borrowed stack value, registered delta | Session registry delta | `ops.c:col_op_variable` pushes `owned` false with `is_delta` | Consuming operator, within the round | Not mutated while workers are dispatched; the registration is replaced per sub-pass by `eval.c:wl_columnar_eval_retire_prior_deltas`, which runs immediately before the exchange dispatch and is not the exchange, and which the converged round and the non-recursive path skip. The borrow itself is stack-scoped exactly like the session-relation borrow -- `ops.c:col_op_variable` selects the delta or the full relation and pushes both the same way | Owner's, not the entry's | Yes, until retirement | read |
+| Borrowed stack value, batch payload | Batch producer | `join_pipeline.c:pipeline_sink_append` pushes `owned` false onto a function-local scratch stack, so this borrow never reaches the evaluator's stack | Filter and map within that function | Batch publication boundary | Producer's, not the entry's | Yes, from the producer | read |
+| Primary hash arrangement | Session; see §10 above and THREADING §13-§14 | `arrangement.c:col_arrangement_probe_bundle_acquire_primary` | Probe holder | Source change, deferred while pinned | `arrangement.c:col_arrangement_probe_bundle_release`, which internally calls `arrangement.c:col_arrangement_pin_release` on the probe's arrangement pin | Yes, lazily | read |
+| Differential arrangement | Session owns the index; a transaction owns an unpublished replacement | `arrangement.c:col_session_pin_diff_arrangement`, see §11 below | Pin holder | Replacement cannot overwrite a leased index; `arrangement.c:wl_columnar_arrangement_diff_txn_abort` discards staged work | `arrangement.c:col_diff_arrangement_pin_release` | Yes, lazily | read |
+| Source-storage dependency reader | Storage owner of the probed relation | `arrangement.c:col_arrangement_probe_bundle_acquire_dependency` | Probe bundle holder | None; it is a reader on resolved storage | `arrangement.c:col_arrangement_probe_bundle_release` | No | read |
+| Sorted arrangement | Session; see §11 below | `arrangement.c:col_session_acquire_sorted_arrangement_probe_with_source_reader` | LFTJ probe holder | Source change requires rebuild, deferred while pinned | `arrangement.c:col_sorted_arrangement_probe_release` | Yes, re-sort | read |
+| Filtered-relation cache entry | Filter cache | `filter.c:filt_cache_pin_take` | Pin holder | Replacement deferred while pinned | `filter.c:col_filt_cache_pin_release`, and only when eviction was deferred; the ordinary destruction sites are stale rebuild in `filter.c`, session invalidation and teardown in `session.c`, and worker teardown in `kfusion.c` | Yes, re-filter | read |
+| Materialization cache entry | Cache, exclusively | `cache.c:col_mat_cache_lookup_pin` | Pin holder; the stack gets a copy, not the entry | `cache.c:mat_cache_evict_lru` skips pinned entries and returns false; admission in `cache.c:col_mat_cache_insert_pin` then returns `ENOSPC` | `cache.c:col_mat_cache_pin_release` on the last pin, and only when eviction was deferred | Yes, recompute the join | read |
+| Delta transport payload | Producer, then queue, then consumer | Ownership transfers at enqueue | Consumer matrix | Reconstruction deduplicates malformed aliases | `eval_tdd_queue.c:tdd_destroy_delta_payload` on reject and discard; the queue's registered destructor is a **same-named static** in `eval.c`, and matrix slots are destroyed by `eval.c:tdd_destroy_delta_slots` and by several open-coded sites in `eval.c` | No | read |
+| Continuation scratch and published batches | Producer owns scratch; sink owns committed output | `continuation.c:wl_columnar_continuation_create` for the continuation; `continuation.c:wl_columnar_continuation_publish` for each batch | The sink's append, before the cursor advances | Cursor advance at publication commit | `continuation.c:wl_columnar_continuation_destroy` | No | read |
+
+One row carries two assertions the code already makes, so it is checked at
+runtime rather than only by reading: `cache.c` asserts `pin_count == 0` before
+destroying an entry and `pin_count > 0` before decrementing.  No other row has
+a runtime check, and none was added for this table -- an assertion over a
+resource whose producer never runs would pass for the wrong reason.
+
+Two functions on #1801's consumer list are **not** borrow producers and need
+no pin: `col_op_consolidate` and `col_op_consolidate_diff` copy a borrowed
+input to owned before pushing, so `work_owned` is unconditionally true at every
+push site in `merge.c` and `diff.c`.  Recorded here so that audit is not
+repeated.
+
+`eval_entry_t` carries `bool owned` and `bool is_delta` and no other
+borrow-flavor field.  Two of the three borrowed rows share a producer, and
+`is_delta` separates them only in combination with `owned == false`: it is set
+on owned entries too.  A consumer that needs to know which owner a borrowed
+value belongs to cannot get it from the entry and must get it from this
+table.
+
 Delta-step rollback preserves the existing empty-descriptor restoration policy:
 only a relation actually detached by the step, still registered with the same
 identity, and still without columns is restored. Populated partial evaluation
