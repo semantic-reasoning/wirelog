@@ -293,10 +293,11 @@ The identity allocator uses the same default ordering because the CAS loop
 must reserve each relation identity without reuse; the test-only store is
 only used to exercise allocator exhaustion.
 
-### 5.4 `wirelog/columnar/join.c` — keyed-join cancel/budget and typed output (19 rows)
+### 5.4 `wirelog/columnar/join.c` — keyed-join cancel/budget and typed output (20 rows)
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
+| `join.c:wl_columnar_join_original_is_accounted` | `source->retained_reservation.state` | `atomic_load_explicit` | `acquire` | Observe the committed reservation before accepting the existing relation as an accounted single-owner fallback; pairs with the governor's release publication |
 | `join.c:col_join_output_limit_reached` | `sess->join_output_shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Tuple-budget accumulator across keyed-join workers; counter only |
 | `join.c:col_join_keyed_count_worker_fn` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll; eventual visibility is acceptable for cooperative cancel |
 | `join.c:col_join_keyed_count_worker_fn#2` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll |
@@ -604,7 +605,7 @@ reservation objects exclusively; their state follows the governor protocol.
 |---|---|---|---|---|
 | `eval_delta.c:wl_columnar_eval_delta_observer_release_token` | `token->state` | `atomic_load_explicit` | acquire | Observe admission or commit state before releasing the observer reservation, then reinitialize the exclusively owned token |
 
-The complete source audit now contains **155 atomic call sites**.
+The complete source audit now contains **156 atomic call sites**.
 
 ---
 
