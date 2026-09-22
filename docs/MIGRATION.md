@@ -1,9 +1,18 @@
 # Migration Guide
 
-**Last Updated:** 2026-08-11
+**Last Updated:** 2026-09-22
 
 This document describes breaking changes, opt-in features, and migration
 steps for each significant Wirelog release. Entries are ordered newest first.
+
+---
+
+## 0.62 -> 0.70
+
+No public API or ABI migration is required. Governed string evaluation now
+reports memory-budget denials as `WIRELOG_ERR_MEMORY` across the easy,
+advanced, and legacy facades; callers that previously handled those denials as
+scalar extension errors should handle the memory error status instead.
 
 ---
 
