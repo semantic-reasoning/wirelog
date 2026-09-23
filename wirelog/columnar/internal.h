@@ -1660,6 +1660,8 @@ typedef struct wl_col_session_t {
     wl_col_delta_event_t *delta_events; /* staged observer events */
     size_t delta_event_count;
     size_t delta_event_capacity;
+    wl_columnar_memory_reservation_t delta_event_reservation;
+    uint64_t delta_event_reserved_bytes;
     bool delta_event_transaction;
     wl_arena_t *eval_arena;    /* arena for per-iteration temporaries    */
     col_mat_cache_t mat_cache; /* materialization cache (US-006)        */
