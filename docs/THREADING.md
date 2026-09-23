@@ -338,11 +338,13 @@ and the wasted work is bounded.
 | `eval.c:wl_columnar_eval_nonrec_relation_parallel` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Reset before workers spawn; happens-before edge is provided by `wl_thread_create()` itself |
 | `eval.c:wl_columnar_eval_owner_publication_validate_replacement` | `replacement.reservation.state` | `atomic_load_explicit` | `acquire` | Validate the staged reservation state before the commit preflight permits any replacement publication |
 
-### 5.7 `wirelog/columnar/session.c` — worker budget snapshot (1 row)
+### 5.7 `wirelog/columnar/session.c` and `session_hash.c` — budget and registry tokens (3 rows)
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
 | `session.c:col_worker_session_create` | per-worker view of `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Worker session reads coordinator's budget snapshot; advisory, no edge required |
+| `session.c:session_rels_release` | `sess->rels_reservation.state` | `atomic_load_explicit` | `acquire` | Confirm that the session owns a live pointer-array token before rolling it back after the array is freed |
+| `session_hash.c:session_registry_image_release` | `reservation->state` | `atomic_load_explicit` | `acquire` | Confirm that a prepared registry image still owns its token before discard or publication cleanup |
 
 ### 5.8 `wirelog/columnar/memory_governor.c` — reservation state (37 rows)
 
