@@ -2478,6 +2478,30 @@ col_rel_reserve_capacity_admitted(col_rel_t *r, uint32_t new_cap,
     bool *denied);
 int
 col_rel_enable_timestamps(col_rel_t *rel);
+/* As above, but distinguish a governor refusal from an allocator failure. */
+int
+col_rel_enable_timestamps_admitted(col_rel_t *rel, bool *denied);
+/* TDD consolidation can free source timestamps. Stage their replacement,
+ * including its governor token, before consolidation changes source rows. */
+typedef struct wl_columnar_relation_timestamp_stage {
+    wl_columnar_memory_reservation_t pending;
+    wl_columnar_memory_reservation_t previous;
+    col_delta_timestamp_t *timestamps;
+    col_rel_t *owner;
+    uint32_t capacity;
+    uint64_t ledger_columns_before;
+} wl_columnar_relation_timestamp_stage_t;
+int
+wl_columnar_relation_timestamp_stage_begin(col_rel_t *rel,
+    uint32_t capacity, wl_columnar_relation_timestamp_stage_t *stage,
+    bool *denied);
+void
+wl_columnar_relation_timestamp_stage_finish(
+    wl_columnar_relation_timestamp_stage_t *stage,
+    bool preserve_existing);
+void
+wl_columnar_relation_timestamp_stage_discard(
+    wl_columnar_relation_timestamp_stage_t *stage);
 /* Enable timestamp storage while the canonical owner writer is held. */
 int
 col_rel_enable_timestamps_locked(col_rel_t *rel);

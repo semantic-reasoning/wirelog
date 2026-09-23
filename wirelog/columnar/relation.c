@@ -26,6 +26,11 @@
  * sufficient: the counter only has to hand out distinct values. */
 static wl_atomic_u64 wl_next_relation_identity = 1u;
 
+#ifdef WL_SESSION_TEST_HOOKS
+bool (*wl_columnar_relation_test_fail_timestamp_stage_alloc)(
+    const col_rel_t *);
+#endif
+
 #ifdef WL_TEST_APPEND_HOOK
 wl_columnar_append_transition_hook_t wl_columnar_append_transition_hook;
 #endif
@@ -1222,14 +1227,16 @@ col_rel_attach_memory_governor(col_rel_t *r,
     return 0;
 }
 
-int
-col_rel_enable_timestamps_locked(col_rel_t *r)
+static int
+col_rel_enable_timestamps_locked_impl(col_rel_t *r, bool *denied)
 {
     wl_columnar_memory_reservation_t pending;
     int reserve_rc;
     uint64_t new_bytes;
     col_delta_timestamp_t *timestamps;
 
+    if (denied)
+        *denied = false;
     if (!r)
         return EINVAL;
     if (r->timestamps || r->capacity == 0)
@@ -1245,8 +1252,12 @@ col_rel_enable_timestamps_locked(col_rel_t *r)
     }
     reserve_rc = col_rel_reserve_retained_shape(
         r, r->capacity, true, &pending, NULL);
-    if (reserve_rc < 0)
+        r, r->capacity, true, &pending, NULL);
+    if (reserve_rc < 0) {
+        if (denied)
+            *denied = r->memory_budget_denial_pending;
         return ENOMEM;
+    }
     if (!col_rel_retained_bytes(r->ncols, r->capacity, true, &new_bytes))
         goto fail;
     timestamps = (col_delta_timestamp_t *)calloc(
@@ -1273,12 +1284,20 @@ fail:
 }
 
 int
-col_rel_enable_timestamps(col_rel_t *r)
+col_rel_enable_timestamps_locked(col_rel_t *r)
+{
+    return col_rel_enable_timestamps_locked_impl(r, NULL);
+}
+
+int
+col_rel_enable_timestamps_admitted(col_rel_t *r, bool *denied)
 {
     wl_columnar_source_access_writer_t writer = { 0 };
     int rc;
     int release_rc;
 
+    if (denied)
+        *denied = false;
     if (!r)
         return EINVAL;
     if (r->timestamps || r->capacity == 0)
@@ -1286,11 +1305,143 @@ col_rel_enable_timestamps(col_rel_t *r)
     rc = col_rel_published_writer_acquire(r, &writer);
     if (rc != 0)
         return rc;
-    rc = col_rel_enable_timestamps_locked(r);
+    rc = col_rel_enable_timestamps_locked_impl(r, denied);
     release_rc = wl_columnar_source_access_writer_release(&writer);
     if (rc == 0 && release_rc != 0)
         rc = release_rc;
     return rc;
+}
+
+int
+col_rel_enable_timestamps(col_rel_t *r)
+{
+    return col_rel_enable_timestamps_admitted(r, NULL);
+}
+
+int
+wl_columnar_relation_timestamp_stage_begin(col_rel_t *r,
+    uint32_t capacity, wl_columnar_relation_timestamp_stage_t *stage,
+    bool *denied)
+{
+    uint64_t bytes = 0;
+    if (denied)
+        *denied = false;
+    if (!r || !stage || stage->owner || capacity == 0
+        || capacity < r->capacity || capacity < r->timestamp_capacity)
+        return EINVAL;
+    wl_columnar_memory_reservation_init(&stage->pending);
+    wl_columnar_memory_reservation_init(&stage->previous);
+    if (r->memory_governor) {
+        if (r->arena_owned || r->col_shared)
+            return EINVAL;
+        if (!col_rel_retained_bytes(r->ncols, capacity, true, &bytes))
+            return EOVERFLOW;
+        /* The old timestamp buffer remains live until consolidation. The
+         * replacement token is therefore independent of the old token even
+         * when the latter already covers the planned logical shape. */
+        wl_columnar_memory_admission_status_t status
+            = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(r->memory_governor),
+                bytes, &stage->pending);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (denied)
+                *denied = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED;
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : ENOMEM;
+        }
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    bool fail_alloc = wl_columnar_relation_test_fail_timestamp_stage_alloc
+        && wl_columnar_relation_test_fail_timestamp_stage_alloc(r);
+#else
+    bool fail_alloc = false;
+#endif
+    stage->timestamps = fail_alloc ? NULL
+        : (col_delta_timestamp_t *)calloc(capacity,
+            sizeof(*stage->timestamps));
+    if (!stage->timestamps) {
+        col_rel_reservation_rollback(&stage->pending);
+        return ENOMEM;
+    }
+    if (r->memory_governor
+        && col_rel_publish_retained_reservation(r, &stage->pending,
+        bytes, &stage->previous) != 0) {
+        free(stage->timestamps);
+        stage->timestamps = NULL;
+        col_rel_reservation_rollback(&stage->pending);
+        return ENOMEM;
+    }
+    stage->owner = r;
+    stage->capacity = capacity;
+    stage->ledger_columns_before = col_rel_owned_ledger_bytes(r);
+    return 0;
+}
+
+static void
+col_rel_timestamp_stage_reconcile_token(col_rel_t *r)
+{
+    uint64_t actual = 0;
+    uint64_t timestamps = col_rel_timestamp_ledger_bytes(r);
+    if (!r || !r->memory_governor)
+        return;
+    if (!col_rel_retained_bytes(r->ncols, r->capacity, false, &actual)
+        || !wl_columnar_memory_size_add(actual, timestamps, &actual)
+        || actual > r->retained_reserved_bytes)
+        abort();
+    if (actual == r->retained_reserved_bytes)
+        return;
+    if (actual == 0) {
+        col_rel_release_reservation_or_abort(&r->retained_reservation);
+    } else if (!wl_columnar_memory_reservation_downsize(
+            &r->retained_reservation, actual)) {
+        abort();
+    }
+    r->retained_reserved_bytes = actual;
+}
+
+void
+wl_columnar_relation_timestamp_stage_finish(
+    wl_columnar_relation_timestamp_stage_t *stage,
+    bool preserve_existing)
+{
+    if (!stage || !stage->owner || !stage->timestamps)
+        return;
+    col_rel_t *r = stage->owner;
+    if (preserve_existing && r->timestamps) {
+        free(stage->timestamps);
+        stage->timestamps = NULL;
+        col_rel_ledger_reconcile(r, stage->ledger_columns_before);
+        col_rel_timestamp_stage_reconcile_token(r);
+        col_rel_release_reservation_or_abort(&stage->previous);
+        stage->owner = NULL;
+        return;
+    }
+    free(r->timestamps);
+    r->timestamps = stage->timestamps;
+    r->timestamp_capacity = stage->capacity;
+    stage->timestamps = NULL;
+    col_rel_ledger_reconcile(r, stage->ledger_columns_before);
+    wl_columnar_relation_touch_storage(r);
+    col_rel_timestamp_stage_reconcile_token(r);
+    col_rel_release_reservation_or_abort(&stage->previous);
+    stage->owner = NULL;
+}
+
+void
+wl_columnar_relation_timestamp_stage_discard(
+    wl_columnar_relation_timestamp_stage_t *stage)
+{
+    if (!stage || !stage->owner)
+        return;
+    free(stage->timestamps);
+    stage->timestamps = NULL;
+    /* Keep coverage for the relation's current shape after a failed
+     * consolidation, releasing only credit for the unused staged buffer. */
+    col_rel_ledger_reconcile(stage->owner, stage->ledger_columns_before);
+    col_rel_timestamp_stage_reconcile_token(stage->owner);
+    col_rel_release_reservation_or_abort(&stage->previous);
+    stage->owner = NULL;
 }
 
 /*

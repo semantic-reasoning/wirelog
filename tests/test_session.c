@@ -6713,6 +6713,82 @@ static wl_columnar_eval_stack_cleanup_frame_t *ordinary_gate_frame;
 static wl_columnar_memory_governor_t *ordinary_gate_budget;
 static wl_columnar_memory_mode_t ordinary_gate_saved_mode;
 static uint64_t ordinary_gate_saved_limit;
+static col_rel_t *ordinary_gate_source;
+static uint32_t ordinary_gate_source_rows, ordinary_gate_source_sorted;
+static uint64_t ordinary_gate_source_generation;
+static uint64_t ordinary_gate_source_token_bytes;
+static col_delta_timestamp_t *ordinary_gate_source_timestamps;
+static uint32_t ordinary_gate_arr_count, ordinary_gate_diff_arr_count;
+static col_arr_entry_t *ordinary_gate_arr_entries;
+static bool ordinary_gate_payload_seen;
+extern void (*wl_columnar_eval_test_before_ordinary_payload_admission)(
+    wl_col_session_t *, col_rel_t *);
+extern void (*wl_columnar_eval_test_before_ordinary_source_timestamp_admission)(
+    wl_col_session_t *, col_rel_t *);
+extern bool (*wl_columnar_relation_test_fail_timestamp_stage_alloc)(
+    const col_rel_t *);
+extern int (*wl_columnar_eval_test_fail_ordinary_consolidation)(
+    wl_col_session_t *, col_rel_t *);
+
+static void
+ordinary_record_payload_denial_boundary(wl_col_session_t *worker,
+    col_rel_t *source)
+{
+    if (worker->worker_id != 0 || ordinary_gate_payload_seen)
+        return;
+    ordinary_gate_payload_seen = true;
+    ordinary_gate_source = source;
+    ordinary_gate_source_rows = source->nrows;
+    ordinary_gate_source_sorted = source->sorted_nrows;
+    ordinary_gate_source_generation = source->storage_generation;
+    ordinary_gate_source_token_bytes = source->retained_reserved_bytes;
+    ordinary_gate_source_timestamps = source->timestamps;
+    ordinary_gate_arr_count = worker->arr_count;
+    ordinary_gate_arr_entries = worker->arr_entries;
+    ordinary_gate_diff_arr_count = worker->diff_arr_count;
+    if (ordinary_gate_mode == 5 || ordinary_gate_mode == 6) {
+        ordinary_gate_budget = wl_columnar_memory_governor_ref_get(
+            worker->memory_governor);
+        ordinary_gate_saved_mode = ordinary_gate_budget->mode;
+        ordinary_gate_saved_limit = atomic_load_explicit(
+            &ordinary_gate_budget->usable_bytes, memory_order_relaxed);
+        ordinary_gate_budget->mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+        atomic_store_explicit(&ordinary_gate_budget->usable_bytes,
+            wl_columnar_memory_reserved(ordinary_gate_budget),
+            memory_order_relaxed);
+        ordinary_gate_budget_changed = true;
+    }
+}
+
+static void
+ordinary_payload_admission_boundary(wl_col_session_t *worker,
+    col_rel_t *source)
+{
+    if (ordinary_gate_mode == 5)
+        ordinary_record_payload_denial_boundary(worker, source);
+}
+
+static void
+ordinary_source_timestamp_admission_boundary(wl_col_session_t *worker,
+    col_rel_t *source)
+{
+    if (ordinary_gate_mode >= 6 && ordinary_gate_mode <= 8)
+        ordinary_record_payload_denial_boundary(worker, source);
+}
+
+static bool
+ordinary_fail_source_stage_alloc(const col_rel_t *source)
+{
+    return ordinary_gate_mode == 7 && source == ordinary_gate_source;
+}
+
+static int
+ordinary_fail_after_source_stage(wl_col_session_t *worker,
+    col_rel_t *source)
+{
+    return ordinary_gate_mode == 8 && worker->worker_id == 0
+           && source == ordinary_gate_source ? ENOMEM : 0;
+}
 
 static void
 count_ordinary_worker_plan(wl_col_session_t *sess, eval_stack_t *stack,
@@ -6753,6 +6829,23 @@ ordinary_worker_gate_boundary(wl_col_session_t *coord, uint32_t iteration,
         }
         return;
     }
+    if (ordinary_gate_mode >= 5 && ordinary_gate_mode <= 8)
+        ordinary_gate_verified = ordinary_gate_payload_seen
+            && ordinary_gate_source
+            && ordinary_gate_source->nrows == ordinary_gate_source_rows
+            && ordinary_gate_source->sorted_nrows
+            == ordinary_gate_source_sorted
+            && ordinary_gate_source->storage_generation
+            == ordinary_gate_source_generation
+            && ordinary_gate_source->retained_reserved_bytes
+            == ordinary_gate_source_token_bytes
+            && ordinary_gate_source->timestamps
+            == ordinary_gate_source_timestamps
+            && worker->arr_count == ordinary_gate_arr_count
+            && worker->arr_entries == ordinary_gate_arr_entries
+            && worker->diff_arr_count == ordinary_gate_diff_arr_count
+            && worker->memory_budget_denied
+            == (ordinary_gate_mode == 5 || ordinary_gate_mode == 6);
     if (ordinary_gate_budget_changed) {
         ordinary_gate_budget->mode = ordinary_gate_saved_mode;
         atomic_store_explicit(&ordinary_gate_budget->usable_bytes,
@@ -6774,7 +6867,7 @@ ordinary_worker_gate_boundary(wl_col_session_t *coord, uint32_t iteration,
             ordinary_gate_verified &= !coord->tdd_workers[w].cleanup_active
                 && !coord->tdd_workers[w].cleanup_pending
                 && coord->tdd_workers[w].cleanup_reserved_bytes == 0;
-    } else
+    } else if (ordinary_gate_mode < 5 || ordinary_gate_mode > 8)
         ordinary_gate_verified = true;
 }
 
@@ -6798,7 +6891,7 @@ test_tdd_ordinary_frame_gates(uint32_t workers, unsigned mode)
         { .op = WL_PLAN_OP_CONCAT },
         { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
     };
-    if (mode >= 2) {
+    if (mode >= 2 && (mode < 5 || mode > 8)) {
         ops[0].relation_name = "input";
         ops[1] = (wl_plan_op_t){ .op = WL_PLAN_OP_FILTER,
                                  .filter_expr = { predicate, 2 } };
@@ -6818,6 +6911,8 @@ test_tdd_ordinary_frame_gates(uint32_t workers, unsigned mode)
     ordinary_gate_mode = mode;
     ordinary_gate_calls = ordinary_gate_workers = 0;
     ordinary_gate_verified = ordinary_gate_budget_changed = false;
+    ordinary_gate_payload_seen = false;
+    ordinary_gate_source = NULL;
     ordinary_gate_rc = 0;
     ordinary_gate_frame = NULL;
 #define TDD_GATE_CHECK(condition, message) \
@@ -6830,7 +6925,7 @@ test_tdd_ordinary_frame_gates(uint32_t workers, unsigned mode)
     for (uint32_t i = 0; i < 65536; i++) values[i] = 42;
     TDD_GATE_CHECK(wl_session_insert(session, "input", values, 65536, 1) == 0,
         "input");
-    if (mode < 2) {
+    if (mode < 2 || (mode >= 5 && mode <= 8)) {
         wirelog_column_type_t type = WIRELOG_TYPE_INT64;
         unowned = col_rel_new_auto("output", 1);
         TDD_GATE_CHECK(unowned && col_rel_set_column_types(unowned, &type,
@@ -6840,14 +6935,29 @@ test_tdd_ordinary_frame_gates(uint32_t workers, unsigned mode)
     }
     wl_columnar_eval_serial_test_after_plan = count_ordinary_worker_plan;
     wl_columnar_eval_test_subpass_boundary = ordinary_worker_gate_boundary;
+    wl_columnar_eval_test_before_ordinary_payload_admission
+        = ordinary_payload_admission_boundary;
+    wl_columnar_eval_test_before_ordinary_source_timestamp_admission
+        = ordinary_source_timestamp_admission_boundary;
+    wl_columnar_relation_test_fail_timestamp_stage_alloc
+        = ordinary_fail_source_stage_alloc;
+    wl_columnar_eval_test_fail_ordinary_consolidation
+        = ordinary_fail_after_source_stage;
     int rc = wl_session_snapshot(session, collect_tuple, &tuples);
     wl_columnar_eval_test_subpass_boundary = NULL;
+    wl_columnar_eval_test_before_ordinary_payload_admission = NULL;
+    wl_columnar_eval_test_before_ordinary_source_timestamp_admission = NULL;
+    wl_columnar_relation_test_fail_timestamp_stage_alloc = NULL;
+    wl_columnar_eval_test_fail_ordinary_consolidation = NULL;
     wl_columnar_eval_serial_test_after_plan = NULL;
     TDD_GATE_CHECK(ordinary_gate_verified && ordinary_gate_workers == workers
-        && ordinary_gate_calls == 0 && sess->tdd_executed_strata == 1,
+        && (mode >= 5 && mode <= 8 ? ordinary_gate_calls > 0
+            : ordinary_gate_calls == 0)
+        && sess->tdd_executed_strata == 1,
         "actual dispatch bypassed gate or outbound exclusion");
     if (mode != 2) {
-        TDD_GATE_CHECK(rc == ((mode == 0 || mode == 3) ? EBUSY : ENOSPC) &&
+        TDD_GATE_CHECK(rc == ((mode == 0 || mode == 3) ? EBUSY
+            : mode >= 5 && mode <= 8 ? ENOMEM : ENOSPC) &&
             tuples.count == 0,
             "failure not propagated before output");
         if (ordinary_gate_frame)
@@ -6862,6 +6972,10 @@ test_tdd_ordinary_frame_gates(uint32_t workers, unsigned mode)
         "exact admitted snapshot retry");
 cleanup:
     wl_columnar_eval_test_subpass_boundary = NULL;
+    wl_columnar_eval_test_before_ordinary_payload_admission = NULL;
+    wl_columnar_eval_test_before_ordinary_source_timestamp_admission = NULL;
+    wl_columnar_relation_test_fail_timestamp_stage_alloc = NULL;
+    wl_columnar_eval_test_fail_ordinary_consolidation = NULL;
     wl_columnar_eval_serial_test_after_plan = NULL;
     if (ordinary_gate_budget_changed) {
         ordinary_gate_budget->mode = ordinary_gate_saved_mode;
@@ -6895,6 +7009,8 @@ test_outbound_publisher_ownership(unsigned mode)
     wl_columnar_memory_governor_t *budget = NULL;
     wl_columnar_memory_mode_t saved_mode = 0;
     uint64_t saved_limit = 0;
+    uint64_t reserved_before_prefix = 0;
+    uint64_t candidate_bytes_before_prefix = 0;
     const char *failure = NULL;
     int64_t value = 42;
 #define PUB_CHECK(condition, message) \
@@ -6908,8 +7024,8 @@ test_outbound_publisher_ownership(unsigned mode)
     col_eval_tdd_worker_ctx_t ctx = { .worker_sess = &worker,
                                       .delta_rels = slots, .stratum_idx = 3 };
     candidate = col_rel_new_auto("$d$output", 1);
-    PUB_CHECK(candidate && col_rel_attach_memory_governor(candidate,
-        coord->memory_governor) == 0, "candidate governor");
+    PUB_CHECK(candidate && (mode == 7 || col_rel_attach_memory_governor(
+            candidate, coord->memory_governor) == 0), "candidate governor");
     if (mode != 0)
         PUB_CHECK(col_rel_append_row(candidate, &value) == 0, "candidate row");
     if (mode == 2 || mode == 3)
@@ -6926,6 +7042,9 @@ test_outbound_publisher_ownership(unsigned mode)
             "alias");
     }
     if (mode == 4) {
+        reserved_before_prefix = wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(coord->memory_governor));
+        candidate_bytes_before_prefix = candidate->retained_reserved_bytes;
         coord->delta_queue = wl_mpsc_queue_create(1, 2);
         PUB_CHECK(coord->delta_queue, "queue");
         for (unsigned i = 0; i < 2; i++) {
@@ -6942,7 +7061,7 @@ test_outbound_publisher_ownership(unsigned mode)
     if (mode == 5)
         fail_next_alloc = true;
 #endif
-    if (mode == 6) {
+    if (mode == 6 || mode == 7) {
         budget = wl_columnar_memory_governor_ref_get(coord->memory_governor);
         saved_mode = budget->mode;
         saved_limit = atomic_load_explicit(&budget->usable_bytes,
@@ -6964,6 +7083,15 @@ test_outbound_publisher_ownership(unsigned mode)
     }
     PUB_CHECK(rc != 0 && candidate == original && !slots[0],
         "refusal lost candidate ownership");
+    if (mode == 6 || mode == 7) {
+        wl_mem_ledger_snapshot_t ledger;
+        wl_mem_ledger_snapshot(&coord->mem_ledger, &ledger);
+        PUB_CHECK(worker.memory_budget_denied
+            && ledger.subsys_bytes[WL_MEM_SUBSYS_CHANNEL] == 0
+            && candidate->memory_governor == coord->memory_governor,
+            "governor refusal did not retain an admitted owner");
+        worker.memory_budget_denied = false;
+    }
     if (mode <= 3)
         PUB_CHECK(rc == EBUSY && candidate->timestamps == timestamps
             && candidate->storage_generation == generation,
@@ -6982,6 +7110,13 @@ test_outbound_publisher_ownership(unsigned mode)
         wl_mem_ledger_snapshot(&coord->mem_ledger, &ledger);
         PUB_CHECK(ledger.subsys_bytes[WL_MEM_SUBSYS_CHANNEL] == 0,
             "prefix accounting leaked");
+        if (mode == 4)
+            PUB_CHECK(wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(coord->memory_governor))
+                == reserved_before_prefix
+                + candidate->retained_reserved_bytes
+                - candidate_bytes_before_prefix,
+                "discard did not release payload reservations");
     }
     PUB_CHECK(wl_columnar_eval_tdd_queue_publish_delta(&ctx, &worker,
         &candidate, 0, 7) == 0 && !candidate, "retry transfer");
@@ -12607,13 +12742,13 @@ main(void)
     }
     test_tdd_recursive_frame_retention(2, 0, 0, true);
     test_tdd_recursive_frame_retention(8, 3, 1, true);
-    for (unsigned mode = 0; mode < 7; mode++) {
+    for (unsigned mode = 0; mode < 8; mode++) {
 #ifndef WL_TEST_ALLOC_WRAP
         if (mode == 5) continue;
 #endif
         test_outbound_publisher_ownership(mode);
     }
-    for (unsigned mode = 0; mode < 5; mode++) {
+    for (unsigned mode = 0; mode < 9; mode++) {
         test_tdd_ordinary_frame_gates(2, mode);
         test_tdd_ordinary_frame_gates(8, mode);
     }

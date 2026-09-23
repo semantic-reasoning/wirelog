@@ -33,6 +33,12 @@ void (*wl_columnar_eval_test_after_tdd_queue_admission)(
     wl_col_session_t *coord, uint64_t bytes);
 void (*wl_columnar_eval_test_before_tdd_queue_allocation)(
     wl_col_session_t *coord, uint64_t bytes);
+void (*wl_columnar_eval_test_before_ordinary_payload_admission)(
+    wl_col_session_t *worker, col_rel_t *source);
+void (*wl_columnar_eval_test_before_ordinary_source_timestamp_admission)(
+    wl_col_session_t *worker, col_rel_t *source);
+int (*wl_columnar_eval_test_fail_ordinary_consolidation)(
+    wl_col_session_t *worker, col_rel_t *source);
 #endif
 
 /* Only the standalone decision regression targets enable this wrapper. */
@@ -1923,6 +1929,29 @@ done:;
     return cleanup_rc != 0 ? cleanup_rc : rc;
 }
 
+static int
+tdd_source_timestamp_stage_capacity(const col_rel_t *r, uint32_t *out)
+{
+    if (!r || !out)
+        return EINVAL;
+    uint64_t target = r->capacity;
+    if (target < r->timestamp_capacity)
+        target = r->timestamp_capacity;
+    if (target < r->merge_buf_cap)
+        target = r->merge_buf_cap;
+    if (r->merge_buf_cap < r->nrows) {
+        uint64_t fallback = (uint64_t)r->merge_buf_cap * 2u;
+        if (fallback < r->nrows)
+            fallback = r->nrows;
+        if (target < fallback)
+            target = fallback;
+    }
+    if (target == 0 || target > UINT32_MAX)
+        return EOVERFLOW;
+    *out = (uint32_t)target;
+    return 0;
+}
+
 static void
 tdd_worker_subpass_fn(void *arg)
 {
@@ -2068,9 +2097,70 @@ tdd_worker_subpass_fn(void *arg)
             sess->diff_operators_active = saved_diff;
             TDD_WORKER_RETURN();
         }
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_eval_test_before_ordinary_payload_admission)
+            wl_columnar_eval_test_before_ordinary_payload_admission(sess, r);
+#endif
+
+        /* Consolidation can change the source before its delta is emitted.
+         * Admit the largest possible independent payload first, including
+         * its timestamp buffer. */
+        bool denied = false;
+        int admission_rc = sess->memory_governor
+            ? col_rel_attach_memory_governor(delta, sess->memory_governor)
+            : 0;
+        if (admission_rc == ENOSPC)
+            denied = true;
+        if (admission_rc == 0)
+            admission_rc = col_rel_reserve_capacity_admitted(delta,
+                    r->nrows - snap[ri], &denied);
+        if (admission_rc == 0)
+            admission_rc = col_rel_enable_timestamps_admitted(delta,
+                    &denied);
+        if (admission_rc != 0) {
+            if (denied)
+                sess->memory_budget_denied = true;
+            col_rel_destroy(delta);
+            ctx->rc = admission_rc;
+            free(snap);
+            sess->tdd_subpass_active = saved_tdd_subpass;
+            sess->tdd_outbound_only_active = saved_outbound_only;
+            sess->diff_operators_active = saved_diff;
+            TDD_WORKER_RETURN();
+        }
+
+        wl_columnar_relation_timestamp_stage_t timestamp_stage = { 0 };
+        uint32_t timestamp_capacity = 0;
+        admission_rc = tdd_source_timestamp_stage_capacity(r,
+                &timestamp_capacity);
+#ifdef WL_SESSION_TEST_HOOKS
+        if (admission_rc == 0
+            && wl_columnar_eval_test_before_ordinary_source_timestamp_admission)
+            wl_columnar_eval_test_before_ordinary_source_timestamp_admission(
+                sess, r);
+#endif
+        if (admission_rc == 0)
+            admission_rc = wl_columnar_relation_timestamp_stage_begin(r,
+                    timestamp_capacity, &timestamp_stage, &denied);
+        if (admission_rc != 0) {
+            if (denied)
+                sess->memory_budget_denied = true;
+            col_rel_destroy(delta);
+            ctx->rc = admission_rc;
+            free(snap);
+            sess->tdd_subpass_active = saved_tdd_subpass;
+            sess->tdd_outbound_only_active = saved_outbound_only;
+            sess->diff_operators_active = saved_diff;
+            TDD_WORKER_RETURN();
+        }
 
         int rc2 = 0;
-        if (r->dedup_slots) {
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_eval_test_fail_ordinary_consolidation)
+            rc2 = wl_columnar_eval_test_fail_ordinary_consolidation(sess, r);
+#endif
+        bool consolidation_attempted = rc2 == 0;
+        if (rc2 == 0 && r->dedup_slots) {
             /* Hash-set dedup: O(D) per subpass instead of O(N) merge.
              * For each new row, check the hash set. Keep only truly
              * new rows in the relation and emit them to delta. */
@@ -2078,6 +2168,8 @@ tdd_worker_subpass_fn(void *arg)
             int64_t *rbuf = r->ncols <= 8 ? row_buf
                 : (int64_t *)malloc((size_t)r->ncols * sizeof(int64_t));
             if (!rbuf) {
+                wl_columnar_relation_timestamp_stage_discard(
+                    &timestamp_stage);
                 col_rel_destroy(delta);
                 ctx->rc = ENOMEM;
                 free(snap);
@@ -2106,7 +2198,7 @@ tdd_worker_subpass_fn(void *arg)
             wl_columnar_relation_touch_view(r);
             if (rbuf != row_buf)
                 free(rbuf);
-        } else {
+        } else if (rc2 == 0) {
             int fast_flag = 0;
             rc2 = col_op_consolidate_incremental_delta(r, snap[ri], delta,
                     &fast_flag);
@@ -2118,8 +2210,10 @@ tdd_worker_subpass_fn(void *arg)
         if (rc2 != 0) {
             /* Sorting/deduplication may have changed the source before a
              * later admission error.  Keep arrangements coherent on error. */
-            col_session_invalidate_arrangements(&sess->base,
-                sp->relations[ri].name);
+            if (consolidation_attempted)
+                col_session_invalidate_arrangements(&sess->base,
+                    sp->relations[ri].name);
+            wl_columnar_relation_timestamp_stage_discard(&timestamp_stage);
             col_rel_destroy(delta);
             ctx->rc = rc2;
             free(snap);
@@ -2134,37 +2228,14 @@ tdd_worker_subpass_fn(void *arg)
             sp->relations[ri].name);
 
         if (delta->nrows > 0) {
-            /* Stamp timestamps (eval_serial.c:653-681) */
-            delta->timestamps = (col_delta_timestamp_t *)calloc(
-                delta->nrows, sizeof(col_delta_timestamp_t));
-            if (!delta->timestamps) {
-                col_rel_destroy(delta);
-                ctx->rc = ENOMEM;
-                free(snap);
-                sess->tdd_subpass_active = saved_tdd_subpass;
-                sess->tdd_outbound_only_active = saved_outbound_only;
-                sess->diff_operators_active = saved_diff;
-                TDD_WORKER_RETURN();
-            }
-            delta->timestamp_capacity = delta->nrows;
-            wl_columnar_relation_touch_storage(delta);
+            wl_columnar_relation_timestamp_stage_finish(&timestamp_stage,
+                r->dedup_slots != NULL);
+            /* Timestamp storage was admitted before source consolidation. */
             for (uint32_t ti = 0; ti < delta->nrows; ti++) {
                 delta->timestamps[ti].iteration = eff_iter;
                 delta->timestamps[ti].stratum = ctx->stratum_idx;
                 delta->timestamps[ti].worker = (uint16_t)sess->worker_id;
                 delta->timestamps[ti].multiplicity = 1;
-            }
-
-            /* Enable target timestamps */
-            int timestamp_rc = col_rel_enable_timestamps(r);
-            if (timestamp_rc != 0) {
-                col_rel_destroy(delta);
-                ctx->rc = timestamp_rc;
-                free(snap);
-                sess->tdd_subpass_active = saved_tdd_subpass;
-                sess->tdd_outbound_only_active = saved_outbound_only;
-                sess->diff_operators_active = saved_diff;
-                TDD_WORKER_RETURN();
             }
 
             /* Issue #410, Commit 5: Queue-only transport.
@@ -2173,9 +2244,23 @@ tdd_worker_subpass_fn(void *arg)
              * after barrier.
              * The queue is admitted and allocated before worker dispatch. */
             if (sess->coordinator && sess->coordinator->delta_queue) {
+                denied = false;
+                int enq_rc = col_rel_reserve_capacity_admitted(delta,
+                        delta->capacity, &denied);
+                if (enq_rc != 0) {
+                    if (denied)
+                        sess->memory_budget_denied = true;
+                    col_rel_destroy(delta);
+                    ctx->rc = enq_rc;
+                    free(snap);
+                    sess->tdd_subpass_active = saved_tdd_subpass;
+                    sess->tdd_outbound_only_active = saved_outbound_only;
+                    sess->diff_operators_active = saved_diff;
+                    TDD_WORKER_RETURN();
+                }
                 /* Issue #1380: mirror of eval_tdd_queue.c publish. */
                 uint64_t transport_bytes = col_rel_transport_bytes(delta);
-                int enq_rc = wl_mpsc_enqueue(
+                enq_rc = wl_mpsc_enqueue(
                     sess->coordinator->delta_queue,
                     sess->worker_id, delta, ctx->stratum_idx, ri);
                 if (enq_rc == 0)
@@ -2197,6 +2282,7 @@ tdd_worker_subpass_fn(void *arg)
             }
             any_new = true;
         } else {
+            wl_columnar_relation_timestamp_stage_discard(&timestamp_stage);
             col_rel_destroy(delta);
         }
     }

@@ -151,8 +151,20 @@ wl_columnar_eval_tdd_queue_publish_delta(col_eval_tdd_worker_ctx_t *ctx,
         return rc;
     }
 
-    /* Reuse any timestamp allocation inherited from the governed copy. */
-    int rc = col_rel_enable_timestamps(delta);
+    /* The relation keeps its admission token when queue ownership changes.
+     * CHANNEL separately attributes the same bytes while it is in flight. */
+    bool denied = false;
+    int rc = sess->memory_governor
+        ? col_rel_attach_memory_governor(delta, sess->memory_governor) : 0;
+    if (rc == ENOSPC)
+        denied = true;
+    if (rc == 0)
+        rc = col_rel_reserve_capacity_admitted(delta, delta->capacity,
+                &denied);
+    if (rc == 0)
+        rc = col_rel_enable_timestamps_admitted(delta, &denied);
+    if (denied)
+        sess->memory_budget_denied = true;
     if (rc != 0)
         return rc;
     wl_columnar_source_access_writer_t writer = { 0 };
