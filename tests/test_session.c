@@ -809,11 +809,16 @@ test_retained_relation_admission(void)
         + 64u * sizeof(col_delta_timestamp_t);
     const uint64_t grown_bytes = 128u * sizeof(int64_t)
         + 128u * sizeof(col_delta_timestamp_t);
+    const uint64_t schema_bytes
+        = sizeof(wl_columnar_memory_reservation_t) + 3u
+        + sizeof(char *) + sizeof(struct ArrowSchema *)
+        + sizeof(struct ArrowSchema) + 2u + 2u * sizeof("col0");
     const uint64_t descriptor_bytes = sizeof(col_rel_t)
-        + sizeof(wl_columnar_memory_reservation_t) + sizeof("retained");
+        + sizeof(wl_columnar_memory_reservation_t) + sizeof("retained")
+        + schema_bytes;
     const uint64_t denied_descriptor_bytes = sizeof(col_rel_t)
         + sizeof(wl_columnar_memory_reservation_t)
-        + sizeof("retained-denied");
+        + sizeof("retained-denied") + schema_bytes;
     const uint64_t exact_budget = initial_bytes + grown_bytes
         + descriptor_bytes;
     wl_columnar_memory_resolution_t resolution = { 0 };
@@ -941,7 +946,11 @@ test_retained_relation_admission(void)
     TEST("batch compaction rolls back denied replacements");
     const uint64_t batch_descriptor_bytes = 2u * sizeof(col_rel_t)
         + 2u * sizeof(wl_columnar_memory_reservation_t)
-        + sizeof("batch-first") + sizeof("batch-second");
+        + sizeof("batch-first") + sizeof("batch-second")
+        + 2u * (sizeof(wl_columnar_memory_reservation_t) + 3u)
+        + 3u * (sizeof(char *) + sizeof(struct ArrowSchema *)
+        + sizeof(struct ArrowSchema) + 2u
+        + 2u * sizeof("col0"));
     resolution.usable_bytes = 4096u + batch_descriptor_bytes;
     resolution.budget_bytes = resolution.usable_bytes;
     ref = wl_columnar_memory_governor_ref_create(&resolution);
@@ -1012,7 +1021,10 @@ test_governed_compaction_transaction(void)
     const uint64_t overlap_bytes = old_bytes + new_bytes;
     const uint64_t descriptor_bytes = sizeof(col_rel_t)
         + sizeof(wl_columnar_memory_reservation_t)
-        + sizeof("compaction-transaction");
+        + sizeof("compaction-transaction")
+        + sizeof(wl_columnar_memory_reservation_t) + 3u
+        + sizeof(char *) + sizeof(struct ArrowSchema *)
+        + sizeof(struct ArrowSchema) + 2u + 2u * sizeof("col0");
     wl_columnar_memory_resolution_t resolution = { 0 };
     wl_columnar_memory_governor_ref_t *ref = NULL;
     wl_columnar_memory_governor_t *governor = NULL;

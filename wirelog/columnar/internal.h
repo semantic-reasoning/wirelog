@@ -379,6 +379,8 @@ typedef struct col_rel {
     /* Heap descriptor and name have a stable token because relation
      * replacement copies the descriptor while preserving its identity. */
     wl_columnar_memory_reservation_t *descriptor_reservation;
+    /* Heap-owned names, types, and Arrow schema; pool slab bytes are separate. */
+    wl_columnar_memory_reservation_t *metadata_reservation;
     /* Set when governed admission was denied while preparing this relation. */
     uint8_t memory_budget_denial_pending;
     wl_columnar_memory_reservation_t retained_reservation;

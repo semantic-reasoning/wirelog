@@ -332,8 +332,17 @@ and their stable reservation tokens are charged as one relation-owned class.
 Session input constructors reserve before allocation; attaching a governor to
 an already allocated heap relation admits its existing descriptor/name
 transactionally. Checked destruction returns this credit after the descriptor
-is freed. Pool slab storage belongs to `ARENA`; heap allocated names on pooled
-relations, plus schema and type metadata, remain separate admission work.
+is freed. A separate relation token covers heap column-name arrays and strings,
+column types, and the Arrow schema's owned child pointer array, child structs,
+formats, and names. Schema and type setters reserve the complete new metadata
+image while the old image is live, then release the old token after retiring
+replaced allocations; unchanged names transfer to the new token. This
+conservative overlap can reject a same-shape type update at
+a tight budget. Legacy governor attachment admits both existing metadata and
+the descriptor transactionally. Pool slab storage belongs to `ARENA`; a
+pooled relation's separately allocated name belongs to its metadata token.
+Compound-map and direct clone/share/replacement metadata paths are completed
+by the next relation metadata unit.
 
 The following matrix is the boundary for allocations created outside a
 managed columnar session. “Covered” means that the owner retains a governor
@@ -461,7 +470,8 @@ workloads:
   teardown.  Branch arenas and pools are redirected to the parent (ARENA),
   but join outputs, arrangements and caches created inside a parallel
   branch (K ≥ 4) charge the throwaway copy.  #1375 retires this path.
-- Parser and IR, the execution plan, nanoarrow schemas, the compound-term
+- Parser and IR, the execution plan, nanoarrow schemas outside governed
+  relation metadata, the compound-term
   arena, exchange buffers, thread stacks (8 MB per TDD worker by default)
   and the work queue.  The intern table is program-owned but charged to
   the first managed session's governor (#1431, see the #1418 matrix); its

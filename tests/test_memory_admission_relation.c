@@ -22,7 +22,7 @@ static int failures;
 static uint64_t overwrite_expected_peak;
 static uint64_t overwrite_expected_live;
 static unsigned overwrite_retirement_witnesses;
-static uint64_t charged_descriptor_bytes(const col_rel_t *relation);
+static uint64_t charged_fixed_bytes(const col_rel_t *relation);
 
 #define CHECK(condition, message) do { \
             if (!(condition)) { \
@@ -40,7 +40,7 @@ observe_overwrite_retirement(const col_rel_t *rel)
         && col_rel_owned_ledger_bytes(rel) == overwrite_expected_live
         && wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(rel->memory_governor))
-        == overwrite_expected_peak + charged_descriptor_bytes(rel),
+        == overwrite_expected_peak + charged_fixed_bytes(rel),
         "overwrite frees old physical storage before releasing its token");
 }
 
@@ -64,10 +64,40 @@ heap_descriptor_bytes(const char *name)
 }
 
 static uint64_t
-charged_descriptor_bytes(const col_rel_t *relation)
+charged_fixed_bytes(const col_rel_t *relation)
 {
-    return relation && relation->descriptor_reservation
-        ? relation->descriptor_reservation->bytes : 0;
+    if (!relation)
+        return 0;
+    return (relation->descriptor_reservation
+        ? relation->descriptor_reservation->bytes : 0)
+           + (relation->metadata_reservation
+        ? relation->metadata_reservation->bytes : 0);
+}
+
+static uint64_t
+auto_metadata_bytes(uint32_t ncols)
+{
+    uint64_t bytes = sizeof(wl_columnar_memory_reservation_t) + 3u;
+    for (uint32_t i = 0; i < ncols; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "col%u", i);
+        bytes += sizeof(char *) + sizeof(struct ArrowSchema *)
+            + sizeof(struct ArrowSchema) + 2u
+            + 2u * (strlen(name) + 1u);
+    }
+    return bytes;
+}
+
+static uint64_t
+heap_auto_bytes(const char *name, uint32_t ncols)
+{
+    return heap_descriptor_bytes(name) + auto_metadata_bytes(ncols);
+}
+
+static uint64_t
+pool_auto_bytes(const char *name, uint32_t ncols)
+{
+    return strlen(name) + 1u + auto_metadata_bytes(ncols);
 }
 
 static col_rel_t *
@@ -126,7 +156,7 @@ test_cow_exact_fit_and_denial(void)
     col_rel_t *source = NULL;
     col_rel_t *view;
 
-    make_resolution(&resolution, private_bytes + heap_descriptor_bytes("view"));
+    make_resolution(&resolution, private_bytes + heap_auto_bytes("view", 1));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     view = ref ? make_shared_view(ref, &source) : NULL;
     CHECK(view != NULL, "COW exact-fit setup");
@@ -143,7 +173,7 @@ test_cow_exact_fit_and_denial(void)
             "COW append/sort did not preserve copied rows");
         CHECK(wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref))
-            == private_bytes + charged_descriptor_bytes(view),
+            == private_bytes + charged_fixed_bytes(view),
             "exact-fit COW reservation");
         col_rel_destroy(view);
         CHECK(wl_columnar_memory_reserved(
@@ -155,7 +185,7 @@ test_cow_exact_fit_and_denial(void)
         wl_columnar_memory_governor_ref_release(ref);
 
     make_resolution(&resolution,
-        private_bytes - 1u + heap_descriptor_bytes("view"));
+        private_bytes - 1u + heap_auto_bytes("view", 1));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     source = NULL;
     view = ref ? make_shared_view(ref, &source) : NULL;
@@ -169,7 +199,7 @@ test_cow_exact_fit_and_denial(void)
             "denied COW changed rows");
         CHECK(wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref))
-            == charged_descriptor_bytes(view),
+            == charged_fixed_bytes(view),
             "denied COW left reservation");
         col_rel_destroy(view);
         col_rel_destroy(source);
@@ -249,7 +279,7 @@ test_governed_logical_copy(void)
             && copy->retained_reserved_bytes == expected
             && wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref))
-            == expected + charged_descriptor_bytes(copy),
+            == expected + charged_fixed_bytes(copy),
             "logical copy carries exact payload reservation");
         col_rel_destroy(copy);
         copy = NULL;
@@ -378,7 +408,7 @@ test_cow_multi_column_cleanup(void)
     int64_t appended[] = {5, 50};
 
     make_resolution(&resolution,
-        private_bytes + heap_descriptor_bytes("multi-view"));
+        private_bytes + heap_auto_bytes("multi-view", 2));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     CHECK(ref && source && view, "multi-column COW setup");
     if (ref && source && view) {
@@ -395,7 +425,7 @@ test_cow_multi_column_cleanup(void)
             "multi-column COW did not privatize every column");
         CHECK(wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref))
-            == private_bytes + charged_descriptor_bytes(view),
+            == private_bytes + charged_fixed_bytes(view),
             "multi-column COW reservation");
     }
     col_rel_destroy(view);
@@ -417,7 +447,7 @@ test_arena_promotion_with_timestamps(void)
     col_rel_t *relation;
     int64_t value = 42;
 
-    make_resolution(&resolution, bytes);
+    make_resolution(&resolution, bytes + pool_auto_bytes("arena", 1));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     pool = delta_pool_create(1, sizeof(col_rel_t), 4096);
     arena = wl_arena_create(4096);
@@ -439,7 +469,8 @@ test_arena_promotion_with_timestamps(void)
             && relation->timestamps != NULL,
             "arena promotion lost data or timestamps");
         CHECK(wl_columnar_memory_reserved(
-                wl_columnar_memory_governor_ref_get(ref)) == bytes,
+                wl_columnar_memory_governor_ref_get(ref))
+            == bytes + charged_fixed_bytes(relation),
             "arena promotion reservation");
         col_rel_free_contents(relation);
     }
@@ -467,7 +498,7 @@ test_append_transitions(void)
     int64_t value = 11;
 
     make_resolution(&resolution,
-        grown_bytes + heap_descriptor_bytes("full-view"));
+        grown_bytes + heap_auto_bytes("full-view", 1));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     view = ref ? make_full_shared_view(ref, &source, false) : NULL;
     CHECK(view != NULL, "append_row transition setup");
@@ -479,7 +510,7 @@ test_append_transitions(void)
             "append_row COW growth");
         CHECK(wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref))
-            == grown_bytes + charged_descriptor_bytes(view),
+            == grown_bytes + charged_fixed_bytes(view),
             "append_row COW reservation");
         col_rel_destroy(view);
         col_rel_destroy(source);
@@ -488,7 +519,7 @@ test_append_transitions(void)
         wl_columnar_memory_governor_ref_release(ref);
 
     make_resolution(&resolution,
-        grown_bytes + heap_descriptor_bytes("full-view"));
+        grown_bytes + heap_auto_bytes("full-view", 1));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     source = NULL;
     view = ref ? make_full_shared_view(ref, &source, false) : NULL;
@@ -511,7 +542,7 @@ test_append_transitions(void)
 
     make_resolution(&resolution, (uint64_t)(COL_REL_INIT_CAP * 2u)
         * (sizeof(int64_t) + sizeof(col_delta_timestamp_t))
-        + heap_descriptor_bytes("full-view"));
+        + heap_auto_bytes("full-view", 1));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     source = NULL;
     view = ref ? make_full_shared_view(ref, &source, true) : NULL;
@@ -539,7 +570,8 @@ test_arena_promotion_denial_preserves_state(void)
     col_rel_t *relation = NULL;
     int64_t value = 7;
 
-    make_resolution(&resolution, bytes - 1u);
+    make_resolution(&resolution,
+        bytes - 1u + pool_auto_bytes("denied", 1));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     pool = delta_pool_create(1, sizeof(col_rel_t), 4096);
     arena = wl_arena_create(4096);
@@ -557,7 +589,8 @@ test_arena_promotion_denial_preserves_state(void)
             && relation->columns[0][0] == value,
             "arena denial changed relation");
         CHECK(wl_columnar_memory_reserved(
-                wl_columnar_memory_governor_ref_get(ref)) == 0,
+                wl_columnar_memory_governor_ref_get(ref))
+            == charged_fixed_bytes(relation),
             "arena denial left reservation");
         col_rel_free_contents(relation);
     }
@@ -696,7 +729,8 @@ test_arena_append_all_admission_boundary(void)
     col_rel_t *src;
     int64_t value = 53;
 
-    make_resolution(&resolution, exact_bytes);
+    make_resolution(&resolution,
+        exact_bytes + pool_auto_bytes("arena-append-exact", 1));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     dst = ref ? make_full_arena_relation(&pool, &arena,
             "arena-append-exact", value) : NULL;
@@ -712,7 +746,8 @@ test_arena_append_all_admission_boundary(void)
             && dst->nrows == COL_REL_INIT_CAP + 1u,
             "arena append_all exact-fit state");
         CHECK(wl_columnar_memory_reserved(
-                wl_columnar_memory_governor_ref_get(ref)) == exact_bytes,
+                wl_columnar_memory_governor_ref_get(ref))
+            == exact_bytes + charged_fixed_bytes(dst),
             "arena append_all exact-fit reservation");
         col_rel_destroy(src);
         col_rel_free_contents(dst);
@@ -728,7 +763,8 @@ test_arena_append_all_admission_boundary(void)
     if (ref)
         wl_columnar_memory_governor_ref_release(ref);
 
-    make_resolution(&resolution, exact_bytes - 1u);
+    make_resolution(&resolution,
+        exact_bytes - 1u + pool_auto_bytes("arena-append-denied", 1));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     pool = NULL;
     arena = NULL;
@@ -749,7 +785,8 @@ test_arena_append_all_admission_boundary(void)
             && dst->capacity == old_capacity && dst->nrows == old_rows,
             "arena append_all denial changed state");
         CHECK(wl_columnar_memory_reserved(
-                wl_columnar_memory_governor_ref_get(ref)) == 0,
+                wl_columnar_memory_governor_ref_get(ref))
+            == charged_fixed_bytes(dst),
             "arena append_all denial left reservation");
         col_rel_destroy(src);
         col_rel_free_contents(dst);
@@ -797,7 +834,7 @@ test_heap_append_all_admission_boundary(void)
     int64_t value = 61;
 
     make_resolution(&resolution,
-        exact_bytes + heap_descriptor_bytes("heap-append-exact"));
+        exact_bytes + heap_auto_bytes("heap-append-exact", 1));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     dst = ref ? make_full_heap_relation("heap-append-exact", value, true)
               : NULL;
@@ -822,7 +859,7 @@ test_heap_append_all_admission_boundary(void)
         CHECK(dst->retained_reserved_bytes == exact_bytes
             && wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref))
-            == exact_bytes + charged_descriptor_bytes(dst),
+            == exact_bytes + charged_fixed_bytes(dst),
             "heap append_all exact-fit reservation");
     }
     col_rel_destroy(src);
@@ -831,7 +868,7 @@ test_heap_append_all_admission_boundary(void)
         wl_columnar_memory_governor_ref_release(ref);
 
     make_resolution(&resolution,
-        exact_bytes - 1u + heap_descriptor_bytes("heap-append-denied"));
+        exact_bytes - 1u + heap_auto_bytes("heap-append-denied", 1));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     dst = ref ? make_full_heap_relation("heap-append-denied", value, true)
               : NULL;
@@ -857,7 +894,7 @@ test_heap_append_all_admission_boundary(void)
             "heap append_all denial changed state");
         CHECK(wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref))
-            == charged_descriptor_bytes(dst),
+            == charged_fixed_bytes(dst),
             "heap append_all denial left reservation");
     }
     col_rel_destroy(src);
@@ -878,7 +915,7 @@ test_cow_capacity_denial_preserves_state(void)
     int64_t value = 23;
 
     make_resolution(&resolution,
-        grown_bytes - 1u + heap_descriptor_bytes("full-view"));
+        grown_bytes - 1u + heap_auto_bytes("full-view", 1));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     view = ref ? make_full_shared_view(ref, &source, false) : NULL;
     CHECK(view != NULL, "COW capacity denial setup");
@@ -897,7 +934,7 @@ test_cow_capacity_denial_preserves_state(void)
             "COW capacity denial changed relation");
         CHECK(wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref))
-            == charged_descriptor_bytes(view),
+            == charged_fixed_bytes(view),
             "COW capacity denial left reservation");
         col_rel_destroy(view);
         col_rel_destroy(source);
@@ -1040,7 +1077,7 @@ test_cow_retained_timestamp_capacity_admission(void)
     int64_t value = 9;
 
     make_resolution(&resolution,
-        bytes - 1u + heap_descriptor_bytes("skew-view"));
+        bytes - 1u + heap_auto_bytes("skew-view", 1));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     source = col_rel_new_auto("skew-source", 1);
     view = col_rel_new_auto("skew-view", 1);
@@ -1065,7 +1102,7 @@ test_cow_retained_timestamp_capacity_admission(void)
         && view->columns[0] == old_column && view->col_shared == old_shared
         && wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(ref))
-        == charged_descriptor_bytes(view),
+        == charged_fixed_bytes(view),
         "retained timestamp capacity denial preserves state");
 cleanup:
     col_rel_destroy(view);
@@ -1101,8 +1138,10 @@ test_governed_pool_clone_fallback(void)
         }
         uint64_t baseline = wl_columnar_memory_reserved(g);
         uint64_t payload = (uint64_t)COL_REL_INIT_CAP * sizeof(int64_t);
-        uint64_t descriptor = route == 1 ? 0
-            : heap_descriptor_bytes("retry");
+        uint64_t descriptor = route == 1
+            ? pool_auto_bytes("retry", 1) + sizeof("retry")
+            + sizeof(wl_columnar_memory_reservation_t)
+            : heap_auto_bytes("retry", 1);
         uint32_t used = pool ? pool->slot_used : 0;
         atomic_store_explicit(&g->usable_bytes,
             baseline + payload + descriptor - 1,
@@ -1403,7 +1442,7 @@ test_governed_delta_restore_overwrite_order(void)
         && rel->columns[0][0] == 100 && rel->columns[0][99] == 199
         && wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(ref))
-        == sizeof(restored) + charged_descriptor_bytes(rel),
+        == sizeof(restored) + charged_fixed_bytes(rel),
         "overwrite installs complete rows and releases retired charge once");
 cleanup:
     wl_columnar_relation_test_after_retired_storage_free = NULL;
@@ -1473,7 +1512,7 @@ test_cow_private_cleanup_precedes_rollback(void)
         && view->col_shared && view->col_shared[0]
         && wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(ref))
-        == charged_descriptor_bytes(view),
+        == charged_fixed_bytes(view),
         "private COW column retires before pending rollback");
 cleanup:
     col_rel_destroy(view);
@@ -1557,7 +1596,8 @@ test_heap_descriptor_admission(void)
     atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
             ref)->usable_bytes, exact, memory_order_release);
     CHECK(wl_columnar_relation_alloc_governed(&relation, name, ref) == 0
-        && relation && charged_descriptor_bytes(relation) == exact
+        && relation && relation->descriptor_reservation
+        && relation->descriptor_reservation->bytes == exact
         && wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(ref)) == exact,
         "exact descriptor constructor retains charge");
@@ -1580,7 +1620,8 @@ test_heap_descriptor_admission(void)
         atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
                 ref)->usable_bytes, exact, memory_order_release);
         CHECK(col_rel_attach_memory_governor(relation, ref) == 0
-            && charged_descriptor_bytes(relation) == exact,
+            && relation->descriptor_reservation
+            && relation->descriptor_reservation->bytes == exact,
             "descriptor adoption can retry");
         col_rel_destroy(relation);
         CHECK(wl_columnar_memory_reserved(
@@ -1598,7 +1639,8 @@ test_heap_descriptor_admission(void)
         atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
                 ref)->usable_bytes, unnamed_bytes, memory_order_release);
         CHECK(col_rel_attach_memory_governor(relation, ref) == 0
-            && charged_descriptor_bytes(relation) == unnamed_bytes,
+            && relation->descriptor_reservation
+            && relation->descriptor_reservation->bytes == unnamed_bytes,
             "unnamed descriptor adoption charges only owned bytes");
         col_rel_destroy(relation);
         CHECK(wl_columnar_memory_reserved(
@@ -1608,10 +1650,241 @@ test_heap_descriptor_admission(void)
     wl_columnar_memory_governor_ref_release(ref);
 }
 
+static void
+test_schema_metadata_adoption_and_replacement(void)
+{
+    const char *name = "metadata-adopt";
+    const uint64_t descriptor = heap_descriptor_bytes(name);
+    const uint64_t metadata = auto_metadata_bytes(2);
+    wl_columnar_memory_resolution_t resolution;
+    col_rel_t *relation = col_rel_new_auto(name, 2);
+    make_resolution(&resolution, descriptor + metadata - 1u);
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(relation && ref, "metadata adoption fixture");
+    if (!relation || !ref)
+        goto cleanup;
+    CHECK(col_rel_attach_memory_governor(relation, ref) == ENOSPC
+        && !relation->memory_governor
+        && !relation->descriptor_reservation
+        && !relation->metadata_reservation
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0,
+        "metadata denial leaves whole relation unattached");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, descriptor + metadata,
+        memory_order_release);
+    CHECK(col_rel_attach_memory_governor(relation, ref) == 0
+        && relation->metadata_reservation
+        && relation->metadata_reservation->bytes == metadata
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == descriptor + metadata,
+        "metadata adoption exact fit");
+
+    const uint64_t typed = metadata
+        + 2u * sizeof(wirelog_column_type_t);
+    wirelog_column_type_t types[] = {
+        WIRELOG_TYPE_INT64, WIRELOG_TYPE_FLOAT
+    };
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, descriptor + metadata + typed - 1u,
+        memory_order_release);
+    CHECK(col_rel_set_column_types(relation, types, 2) == ENOSPC
+        && !relation->column_types
+        && relation->metadata_reservation->bytes == metadata
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == descriptor + metadata,
+        "one-byte type replacement denial rolls back schema and token");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, descriptor + metadata + typed,
+        memory_order_release);
+    CHECK(col_rel_set_column_types(relation, types, 2) == 0
+        && relation->column_types
+        && relation->column_types[1] == WIRELOG_TYPE_FLOAT
+        && relation->metadata_reservation->bytes == typed
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == descriptor + typed,
+        "type replacement admits staged old and new metadata exactly");
+    wirelog_column_type_t next_types[] = {
+        WIRELOG_TYPE_FLOAT, WIRELOG_TYPE_INT64
+    };
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, descriptor + 2u * typed - 1u,
+        memory_order_release);
+    CHECK(col_rel_set_column_types(relation, next_types, 2) == ENOSPC
+        && relation->column_types[0] == WIRELOG_TYPE_INT64
+        && relation->column_types[1] == WIRELOG_TYPE_FLOAT
+        && relation->metadata_reservation->bytes == typed
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == descriptor + typed,
+        "same-shape type update keeps old image on overlap denial");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, descriptor + 2u * typed,
+        memory_order_release);
+    CHECK(col_rel_set_column_types(relation, next_types, 2) == 0
+        && relation->column_types[0] == WIRELOG_TYPE_FLOAT
+        && relation->metadata_reservation->bytes == typed
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == descriptor + typed,
+        "same-shape type update succeeds at staged peak and retires old");
+cleanup:
+    col_rel_destroy(relation);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "metadata adoption releases after destruction");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_schema_metadata_first_allocation(void)
+{
+    const char *name = "metadata-first";
+    const uint64_t descriptor = heap_descriptor_bytes(name);
+    const uint64_t metadata = auto_metadata_bytes(2);
+    const uint64_t columns = 2u * COL_REL_INIT_CAP * sizeof(int64_t);
+    wl_columnar_memory_resolution_t resolution;
+    col_rel_t *relation = NULL;
+    make_resolution(&resolution, descriptor + metadata - 1u);
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && wl_columnar_relation_alloc_governed(&relation,
+        name, ref) == 0, "governed schema allocation fixture");
+    if (!ref || !relation)
+        goto cleanup;
+    CHECK(col_rel_set_schema(relation, 2, NULL) == ENOSPC
+        && relation->ncols == 0 && !relation->col_names
+        && !relation->schema_ok && !relation->metadata_reservation
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == descriptor,
+        "schema name and Arrow denial precedes allocation");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, descriptor + metadata + columns,
+        memory_order_release);
+    CHECK(col_rel_set_schema(relation, 2, NULL) == 0
+        && relation->metadata_reservation
+        && relation->metadata_reservation->bytes == metadata
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == descriptor + metadata + columns,
+        "schema metadata and columns admit exact fit on retry");
+cleanup:
+    col_rel_destroy(relation);
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+}
+
+static void
+test_nested_arrow_metadata_adoption(void)
+{
+    const char *name = "nested-arrow";
+    const uint64_t arrow_bytes = 3u
+        + 2u * (sizeof(struct ArrowSchema *)
+        + sizeof(struct ArrowSchema))
+        + 3u + sizeof("nested") + 2u + sizeof("value");
+    const uint64_t metadata = arrow_bytes
+        + sizeof(wl_columnar_memory_reservation_t);
+    const uint64_t descriptor = heap_descriptor_bytes(name);
+    wl_columnar_memory_resolution_t resolution;
+    col_rel_t *relation = NULL;
+    make_resolution(&resolution, descriptor + metadata);
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && col_rel_alloc(&relation, name) == 0,
+        "nested Arrow metadata fixture");
+    if (!ref || !relation)
+        goto cleanup;
+    ArrowSchemaInit(&relation->schema);
+    CHECK(ArrowSchemaSetTypeStruct(&relation->schema, 1) == NANOARROW_OK
+        && ArrowSchemaSetTypeStruct(relation->schema.children[0], 1)
+        == NANOARROW_OK
+        && ArrowSchemaSetName(relation->schema.children[0], "nested")
+        == NANOARROW_OK
+        && ArrowSchemaInitFromType(
+            relation->schema.children[0]->children[0],
+            NANOARROW_TYPE_INT64) == NANOARROW_OK
+        && ArrowSchemaSetName(relation->schema.children[0]->children[0],
+        "value") == NANOARROW_OK,
+        "nested Arrow schema construction");
+    relation->schema_ok = true;
+    CHECK(col_rel_attach_memory_governor(relation, ref) == 0
+        && relation->metadata_reservation
+        && relation->metadata_reservation->bytes == metadata
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == descriptor + metadata,
+        "nested Arrow child arrays and names are fully adopted");
+cleanup:
+    col_rel_destroy(relation);
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+}
+
+static void
+test_pool_metadata_name_reuse(void)
+{
+    const char *name = "pool-metadata";
+    const uint64_t exact = pool_auto_bytes(name, 1);
+    wl_columnar_memory_resolution_t resolution;
+    make_resolution(&resolution, exact);
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    delta_pool_t *pool = delta_pool_create(1, sizeof(col_rel_t), 4096);
+    CHECK(ref && pool, "pool metadata fixture");
+    if (!ref || !pool)
+        goto cleanup;
+    for (unsigned attempt = 0; attempt < 2; attempt++) {
+        col_rel_t *relation = col_rel_pool_new_auto(pool, NULL, name, 1);
+        CHECK(relation && relation->pool_owned, "pool metadata slot");
+        if (!relation)
+            break;
+        CHECK(col_rel_attach_memory_governor(relation, ref) == 0
+            && !relation->descriptor_reservation
+            && relation->metadata_reservation
+            && relation->metadata_reservation->bytes == exact
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == exact,
+            "pool name and schema charged without slab double count");
+        col_rel_free_contents(relation);
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "pool metadata released before slot reuse");
+        delta_pool_reset(pool);
+    }
+    col_rel_t *source = col_rel_new_auto("pool-source", 1);
+    uint64_t name_only = strlen(name) + 1u
+        + sizeof(wl_columnar_memory_reservation_t);
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, name_only - 1u, memory_order_release);
+    col_rel_t *denied = source
+        ? wl_columnar_relation_pool_new_like_governed(pool, name,
+            source, ref) : NULL;
+    CHECK(source && !denied && pool->slot_used == 0u
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0,
+        "pool name denial restores slot and releases fallback charge");
+    col_rel_destroy(denied);
+    col_rel_destroy(source);
+cleanup:
+    delta_pool_destroy(pool);
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+}
+
 int
 main(void)
 {
     test_heap_descriptor_admission();
+    test_schema_metadata_adoption_and_replacement();
+    test_schema_metadata_first_allocation();
+    test_nested_arrow_metadata_adoption();
+    test_pool_metadata_name_reuse();
     test_governed_logical_copy();
     test_governed_empty_compound_copy();
     test_physical_timestamp_capacity();

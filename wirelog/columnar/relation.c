@@ -751,6 +751,210 @@ col_rel_reservation_rollback(wl_columnar_memory_reservation_t *reservation)
     col_rel_release_reservation_or_abort(reservation);
 }
 
+/* Measure only malloc-owned relation metadata. The Arrow schemas built here
+ * contain a struct root and primitive children, but walking the tree also
+ * makes legacy attach account a schema assembled before its governor. */
+static bool
+col_rel_arrow_metadata_bytes(const struct ArrowSchema *schema,
+    unsigned depth, uint64_t *out)
+{
+    uint64_t bytes = 0;
+    uint64_t part;
+    if (!schema || !out || depth > 64 || schema->n_children < 0
+        || (schema->n_children > 0 && !schema->children))
+        return false;
+    if (schema->format && !wl_columnar_memory_size_add(bytes,
+        strlen(schema->format) + 1u, &bytes))
+        return false;
+    if (schema->name && !wl_columnar_memory_size_add(bytes,
+        strlen(schema->name) + 1u, &bytes))
+        return false;
+    if (schema->metadata) {
+        int64_t length = ArrowMetadataSizeOf(schema->metadata);
+        if (length < 0 || !wl_columnar_memory_size_add(bytes,
+            (uint64_t)length, &bytes))
+            return false;
+    }
+    if (schema->private_data)
+        return false;
+    if (schema->children) {
+        if (!wl_columnar_memory_size_mul((uint64_t)schema->n_children,
+            sizeof(*schema->children), &part)
+            || !wl_columnar_memory_size_add(bytes, part, &bytes))
+            return false;
+        for (int64_t i = 0; i < schema->n_children; i++) {
+            if (!schema->children[i]
+                || !wl_columnar_memory_size_add(bytes,
+                sizeof(*schema->children[i]), &bytes)
+                || !col_rel_arrow_metadata_bytes(schema->children[i],
+                depth + 1u, &part)
+                || !wl_columnar_memory_size_add(bytes, part, &bytes))
+                return false;
+        }
+    }
+    if (schema->dictionary) {
+        if (!wl_columnar_memory_size_add(bytes,
+            sizeof(*schema->dictionary), &bytes)
+            || !col_rel_arrow_metadata_bytes(schema->dictionary,
+            depth + 1u, &part)
+            || !wl_columnar_memory_size_add(bytes, part, &bytes))
+            return false;
+    }
+    *out = bytes;
+    return true;
+}
+
+static bool
+col_rel_current_metadata_bytes(const col_rel_t *r, uint64_t *out)
+{
+    uint64_t bytes = 0;
+    uint64_t part;
+    if (!r || !out)
+        return false;
+    if (r->pool_owned && r->name
+        && !wl_columnar_memory_size_add(bytes,
+        strlen(r->name) + 1u, &bytes))
+        return false;
+    if (r->col_names) {
+        if (!wl_columnar_memory_size_mul(r->ncols,
+            sizeof(*r->col_names), &part)
+            || !wl_columnar_memory_size_add(bytes, part, &bytes))
+            return false;
+        for (uint32_t i = 0; i < r->ncols; i++)
+            if (r->col_names[i]
+                && !wl_columnar_memory_size_add(bytes,
+                strlen(r->col_names[i]) + 1u, &bytes))
+                return false;
+    }
+    if (r->column_types
+        && (!wl_columnar_memory_size_mul(r->ncols,
+        sizeof(*r->column_types), &part)
+        || !wl_columnar_memory_size_add(bytes, part, &bytes)))
+        return false;
+    if (r->schema_ok) {
+        if (!col_rel_arrow_metadata_bytes(&r->schema, 0, &part)
+            || !wl_columnar_memory_size_add(bytes, part, &bytes))
+            return false;
+    }
+    *out = bytes;
+    return true;
+}
+
+static bool
+col_rel_prospective_metadata_bytes(const col_rel_t *r, uint32_t ncols,
+    const char *const *names, bool names_owned, bool generated_names,
+    bool types,
+    uint64_t *out)
+{
+    uint64_t bytes = 3u; /* Arrow struct root format "+s". */
+    uint64_t part;
+    if (!r || !out)
+        return false;
+    if (r->pool_owned && r->name
+        && !wl_columnar_memory_size_add(bytes,
+        strlen(r->name) + 1u, &bytes))
+        return false;
+    if (ncols > 0) {
+        if (names_owned
+            && (!wl_columnar_memory_size_mul(ncols, sizeof(char *), &part)
+            || !wl_columnar_memory_size_add(bytes, part, &bytes)))
+            return false;
+        if (types
+            && (!wl_columnar_memory_size_mul(ncols,
+            sizeof(wirelog_column_type_t), &part)
+            || !wl_columnar_memory_size_add(bytes, part, &bytes)))
+            return false;
+        if (!wl_columnar_memory_size_mul(ncols,
+            sizeof(struct ArrowSchema *) + sizeof(struct ArrowSchema)
+            + 2u, &part)
+            || !wl_columnar_memory_size_add(bytes, part, &bytes))
+            return false;
+        for (uint32_t i = 0; i < ncols; i++) {
+            char fallback[32];
+            const char *name = names ? names[i] : NULL;
+            if (!name && generated_names) {
+                snprintf(fallback, sizeof(fallback), "col%u", i);
+                name = fallback;
+            }
+            if (names_owned && name && !wl_columnar_memory_size_add(bytes,
+                strlen(name) + 1u, &bytes))
+                return false; /* col_names[i] allocation */
+            if (!wl_columnar_memory_size_add(bytes,
+                name ? strlen(name) + 1u : 1u, &bytes))
+                return false; /* Arrow child name allocation */
+        }
+    }
+    *out = bytes;
+    return true;
+}
+
+static int
+col_rel_reserve_metadata(col_rel_t *r,
+    wl_columnar_memory_governor_ref_t *governor, uint64_t bytes,
+    wl_columnar_memory_reservation_t *pending,
+    wl_columnar_memory_reservation_t **owned)
+{
+    wl_columnar_memory_admission_status_t status;
+    wl_columnar_memory_reservation_init(pending);
+    *owned = NULL;
+    if (!governor || bytes == 0)
+        return 0;
+    if (!wl_columnar_memory_size_add(bytes, sizeof(**owned), &bytes))
+        return EOVERFLOW;
+    status = wl_columnar_memory_reserve_checked(
+        wl_columnar_memory_governor_ref_get(governor), bytes,
+        pending);
+    if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+        && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+        if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+            r->memory_budget_denial_pending = true;
+        return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+            : EOVERFLOW;
+    }
+    *owned = (wl_columnar_memory_reservation_t *)malloc(sizeof(**owned));
+    if (!*owned) {
+        col_rel_reservation_rollback(pending);
+        return ENOMEM;
+    }
+    wl_columnar_memory_reservation_init(*owned);
+    return 0;
+}
+
+static void
+col_rel_discard_metadata_reservation(
+    wl_columnar_memory_reservation_t *pending,
+    wl_columnar_memory_reservation_t *owned)
+{
+    col_rel_reservation_rollback(pending);
+    free(owned);
+}
+
+static void
+col_rel_release_metadata_reservation(
+    wl_columnar_memory_reservation_t *owned)
+{
+    if (owned) {
+        if (!wl_columnar_memory_release(owned))
+            abort();
+        free(owned);
+    }
+}
+
+static wl_columnar_memory_reservation_t *
+col_rel_publish_metadata_reservation(col_rel_t *r,
+    wl_columnar_memory_reservation_t *pending,
+    wl_columnar_memory_reservation_t *owned)
+{
+    wl_columnar_memory_reservation_t *previous = r->metadata_reservation;
+    if (owned) {
+        if (!wl_columnar_memory_reservation_move(owned, pending)
+            || !wl_columnar_memory_commit(owned, r))
+            abort();
+    }
+    r->metadata_reservation = owned;
+    return previous;
+}
+
 static int
 col_rel_reserve_retained_shape(col_rel_t *r, uint32_t capacity,
     bool timestamps, wl_columnar_memory_reservation_t *pending,
@@ -1180,30 +1384,45 @@ col_rel_attach_memory_governor(col_rel_t *r,
     wl_columnar_memory_governor_ref_t *memory_governor)
 {
     wl_columnar_memory_reservation_t pending;
+    wl_columnar_memory_reservation_t metadata_pending;
     wl_columnar_memory_reservation_t *owned = NULL;
+    wl_columnar_memory_reservation_t *metadata_owned = NULL;
     wl_columnar_memory_admission_status_t status;
     uint64_t bytes;
+    uint64_t metadata_bytes;
 
     if (!r || !memory_governor)
         return EINVAL;
     if (r->memory_governor == memory_governor)
         return 0;
-    if (r->memory_governor || r->retained_reserved_bytes != 0)
+    if (r->memory_governor || r->retained_reserved_bytes != 0
+        || r->metadata_reservation)
         return EBUSY;
+    if (!col_rel_current_metadata_bytes(r, &metadata_bytes))
+        return EOVERFLOW;
+    int metadata_rc = col_rel_reserve_metadata(r, memory_governor,
+            metadata_bytes, &metadata_pending, &metadata_owned);
+    if (metadata_rc != 0)
+        return metadata_rc;
     /* A heap relation may have been built before its session was known.
     * Adopt its already-owned descriptor and name as one transaction. */
     if (!r->pool_owned) {
         uint64_t name_bytes = r->name ? strlen(r->name) + 1u : 0u;
         if (!wl_columnar_memory_size_add(sizeof(*r),
             name_bytes, &bytes)
-            || !wl_columnar_memory_size_add(bytes, sizeof(*owned), &bytes))
+            || !wl_columnar_memory_size_add(bytes, sizeof(*owned), &bytes)) {
+            col_rel_discard_metadata_reservation(&metadata_pending,
+                metadata_owned);
             return EOVERFLOW;
+        }
         wl_columnar_memory_reservation_init(&pending);
         status = wl_columnar_memory_reserve_checked(
             wl_columnar_memory_governor_ref_get(memory_governor), bytes,
             &pending);
         if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            col_rel_discard_metadata_reservation(&metadata_pending,
+                metadata_owned);
             if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                 r->memory_budget_denial_pending = true;
             return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
@@ -1212,6 +1431,8 @@ col_rel_attach_memory_governor(col_rel_t *r,
         owned = (wl_columnar_memory_reservation_t *)malloc(sizeof(*owned));
         if (!owned) {
             col_rel_reservation_rollback(&pending);
+            col_rel_discard_metadata_reservation(&metadata_pending,
+                metadata_owned);
             return ENOMEM;
         }
         wl_columnar_memory_reservation_init(owned);
@@ -1219,9 +1440,15 @@ col_rel_attach_memory_governor(col_rel_t *r,
             || !wl_columnar_memory_commit(owned, r))
             abort();
     }
+    if (metadata_owned
+        && (!wl_columnar_memory_reservation_move(metadata_owned,
+        &metadata_pending)
+        || !wl_columnar_memory_commit(metadata_owned, r)))
+        abort();
     r->memory_governor = memory_governor;
     wl_columnar_memory_governor_ref_retain(memory_governor);
     r->descriptor_reservation = owned;
+    r->metadata_reservation = metadata_owned;
     wl_columnar_memory_reservation_init(&r->retained_reservation);
     r->memory_budget_denial_pending = false;
     return 0;
@@ -1560,6 +1787,8 @@ col_rel_free_contents_impl(col_rel_t *r, bool preserve_access_gates,
     free(r->compound_arity_map);
     if (r->schema_ok)
         ArrowSchemaRelease(&r->schema);
+    col_rel_release_metadata_reservation(r->metadata_reservation);
+    r->metadata_reservation = NULL;
     col_rel_ledger_reconcile(r, ledger_before);
     if (r->memory_governor) {
         if (r->retained_reserved_bytes > 0
@@ -2026,20 +2255,35 @@ col_rel_set_schema_impl(col_rel_t *r, uint32_t ncols,
     const char *const *col_names)
 {
     wl_columnar_memory_reservation_t pending;
+    wl_columnar_memory_reservation_t metadata_pending;
+    wl_columnar_memory_reservation_t *metadata_owned = NULL;
+    wl_columnar_memory_reservation_t *previous_metadata;
     int pending_rc;
+    int metadata_rc;
     int failure_rc = EINVAL;
     uint64_t retained_bytes = 0;
+    uint64_t metadata_bytes = 0;
 
     if (!r)
         return EINVAL;
     if (r->ncols != 0)
         return 0; /* already initialised */
 
+    if (!col_rel_prospective_metadata_bytes(r, ncols, col_names, true, true,
+        r->column_types != NULL, &metadata_bytes))
+        return EOVERFLOW;
+    metadata_rc = col_rel_reserve_metadata(r, r->memory_governor,
+            metadata_bytes, &metadata_pending, &metadata_owned);
+    if (metadata_rc != 0)
+        return metadata_rc;
+
     r->ncols = ncols;
     pending_rc = col_rel_reserve_retained(r, COL_REL_INIT_CAP, &pending,
             NULL);
     if (pending_rc < 0) {
         r->ncols = 0;
+        col_rel_discard_metadata_reservation(&metadata_pending,
+            metadata_owned);
         if (pending_rc == -ENOSPC)
             r->memory_budget_denial_pending = true;
         return ENOMEM;
@@ -2086,11 +2330,16 @@ col_rel_set_schema_impl(col_rel_t *r, uint32_t ncols,
             goto fail;
         }
     }
+    previous_metadata = col_rel_publish_metadata_reservation(r,
+            &metadata_pending, metadata_owned);
+    col_rel_release_metadata_reservation(previous_metadata);
     wl_columnar_relation_touch_view(r);
     return 0;
 
 fail:
     col_rel_reservation_rollback(&pending);
+    col_rel_discard_metadata_reservation(&metadata_pending,
+        metadata_owned);
     /* A pooled descriptor may fail before Arrow initialization, and the
      * Arrow-only initializer already releases its partial schema on error.
      * Only a live release callback denotes owned schema state here. */
@@ -2169,7 +2418,7 @@ col_rel_prepare_column_types(const col_rel_t *r,
         != NANOARROW_OK) {
         free(copy);
         ArrowSchemaRelease(out_schema);
-        return EINVAL;
+        return ENOMEM;
     }
     for (uint32_t i = 0; i < ncols; i++) {
         enum ArrowType arrow_type = copy && copy[i] == WIRELOG_TYPE_FLOAT
@@ -2178,10 +2427,15 @@ col_rel_prepare_column_types(const col_rel_t *r,
             != NANOARROW_OK) {
             free(copy);
             ArrowSchemaRelease(out_schema);
-            return EINVAL;
+            return ENOMEM;
         }
-        ArrowSchemaSetName(out_schema->children[i],
-            r->col_names && r->col_names[i] ? r->col_names[i] : "");
+        if (ArrowSchemaSetName(out_schema->children[i],
+            r->col_names && r->col_names[i] ? r->col_names[i] : "")
+            != NANOARROW_OK) {
+            free(copy);
+            ArrowSchemaRelease(out_schema);
+            return ENOMEM;
+        }
     }
     *out_types = copy;
     return 0;
@@ -2191,88 +2445,48 @@ static int
 col_rel_set_column_types_impl(col_rel_t *r,
     const wirelog_column_type_t *types, uint32_t ncols, bool publish)
 {
+    wl_columnar_memory_reservation_t metadata_pending;
+    wl_columnar_memory_reservation_t *metadata_owned = NULL;
+    wl_columnar_memory_reservation_t *previous_metadata;
+    wirelog_column_type_t *copy = NULL;
+    wirelog_column_type_t *old_types;
+    struct ArrowSchema prepared_schema;
+    struct ArrowSchema old_schema;
+    bool old_schema_ok;
+    uint64_t metadata_bytes;
+    int rc;
+
     if (!r || ncols != r->ncols)
         return EINVAL;
-    wirelog_column_type_t *copy = NULL;
-    if (ncols > 0) {
-        copy = (wirelog_column_type_t *)malloc(
-            (size_t)ncols * sizeof(*copy));
-        if (!copy)
-            return ENOMEM;
-        for (uint32_t i = 0; i < ncols; i++)
-            copy[i] = types ? types[i] : WIRELOG_TYPE_INT64;
+
+    if (!col_rel_prospective_metadata_bytes(r, ncols,
+        (const char *const *)r->col_names, r->col_names != NULL, false, true,
+        &metadata_bytes))
+        return EOVERFLOW;
+    rc = col_rel_reserve_metadata(r, r->memory_governor,
+            metadata_bytes, &metadata_pending, &metadata_owned);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_prepare_column_types(r, types, ncols, &copy,
+            &prepared_schema);
+    if (rc != 0) {
+        col_rel_discard_metadata_reservation(&metadata_pending,
+            metadata_owned);
+        return rc;
     }
-    if (r->nrows > 0 && !r->column_types) {
-        for (uint32_t i = 0; i < ncols; i++) {
-            if (copy && copy[i] == WIRELOG_TYPE_FLOAT) {
-                free(copy);
-                return EINVAL;
-            }
-        }
-    }
-    /* Validate existing rows before changing their physical interpretation.
-     * This keeps a schema update transactional when a relation was already
-     * populated through a legacy path. */
-    for (uint32_t c = 0; c < ncols; c++) {
-        if (copy && copy[c] == WIRELOG_TYPE_FLOAT) {
-            for (uint32_t row = 0; row < r->nrows; row++) {
-                if (!wl_columnar_float_bits_valid(r->columns[c][row])) {
-                    free(copy);
-                    return EINVAL;
-                }
-            }
-        }
-    }
-    if (r->schema_ok) {
-        for (uint32_t i = 0; i < ncols; i++) {
-            enum ArrowType arrow_type = copy[i]
-                == WIRELOG_TYPE_FLOAT ? NANOARROW_TYPE_DOUBLE
-                                       : NANOARROW_TYPE_INT64;
-            ArrowSchemaRelease(r->schema.children[i]);
-            if (ArrowSchemaInitFromType(r->schema.children[i], arrow_type)
-                != NANOARROW_OK) {
-                for (uint32_t j = 0; j <= i; j++) {
-                    enum ArrowType old_type = r->column_types
-                        && r->column_types[j] == WIRELOG_TYPE_FLOAT
-                        ? NANOARROW_TYPE_DOUBLE : NANOARROW_TYPE_INT64;
-                    ArrowSchemaRelease(r->schema.children[j]);
-                    (void)ArrowSchemaInitFromType(r->schema.children[j],
-                        old_type);
-                    ArrowSchemaSetName(r->schema.children[j],
-                        r->col_names && r->col_names[j]
-                            ? r->col_names[j] : "");
-                }
-                free(copy);
-                return EINVAL;
-            }
-            const char *name = r->col_names && r->col_names[i]
-                ? r->col_names[i] : "";
-            ArrowSchemaSetName(r->schema.children[i], name);
-        }
-    } else if (ncols > 0) {
-        ArrowSchemaInit(&r->schema);
-        if (ArrowSchemaSetTypeStruct(&r->schema, (int64_t)ncols)
-            != NANOARROW_OK) {
-            ArrowSchemaRelease(&r->schema);
-            free(copy);
-            return EINVAL;
-        }
-        for (uint32_t i = 0; i < ncols; i++) {
-            enum ArrowType arrow_type = copy[i] == WIRELOG_TYPE_FLOAT
-                ? NANOARROW_TYPE_DOUBLE : NANOARROW_TYPE_INT64;
-            if (ArrowSchemaInitFromType(r->schema.children[i], arrow_type)
-                != NANOARROW_OK) {
-                ArrowSchemaRelease(&r->schema);
-                free(copy);
-                return EINVAL;
-            }
-            ArrowSchemaSetName(r->schema.children[i],
-                r->col_names && r->col_names[i] ? r->col_names[i] : "");
-        }
-        r->schema_ok = true;
-    }
-    free(r->column_types);
+    old_types = r->column_types;
+    old_schema_ok = r->schema_ok;
+    if (old_schema_ok)
+        old_schema = r->schema;
     r->column_types = copy;
+    r->schema = prepared_schema;
+    r->schema_ok = true;
+    previous_metadata = col_rel_publish_metadata_reservation(r,
+            &metadata_pending, metadata_owned);
+    free(old_types);
+    if (old_schema_ok)
+        ArrowSchemaRelease(&old_schema);
+    col_rel_release_metadata_reservation(previous_metadata);
     if (r->column_types) {
         for (uint32_t c = 0; c < ncols; c++) {
             if (r->column_types[c] != WIRELOG_TYPE_FLOAT)
@@ -4657,6 +4871,29 @@ col_rel_pool_fallback_auto(delta_pool_t *pool, col_rel_t *r,
     return col_rel_new_auto(name, ncols);
 }
 
+static int
+col_rel_pool_set_name(col_rel_t *r, const char *name)
+{
+    wl_columnar_memory_reservation_t pending;
+    wl_columnar_memory_reservation_t *owned = NULL;
+    wl_columnar_memory_reservation_t *previous;
+    int rc;
+    if (!r || !r->pool_owned || !name)
+        return EINVAL;
+    rc = col_rel_reserve_metadata(r, r->memory_governor,
+            strlen(name) + 1u, &pending, &owned);
+    if (rc != 0)
+        return rc;
+    r->name = wl_strdup(name);
+    if (!r->name) {
+        col_rel_discard_metadata_reservation(&pending, owned);
+        return ENOMEM;
+    }
+    previous = col_rel_publish_metadata_reservation(r, &pending, owned);
+    col_rel_release_metadata_reservation(previous);
+    return 0;
+}
+
 col_rel_t *
 wl_columnar_relation_pool_new_like_governed(delta_pool_t *pool,
     const char *name,
@@ -4687,8 +4924,7 @@ wl_columnar_relation_pool_new_like_governed(delta_pool_t *pool,
         wl_columnar_memory_reservation_init(&r->retained_reservation);
         if (governor && col_rel_attach_memory_governor(r, governor) != 0)
             return col_rel_pool_fallback_like(pool, r, name, like, governor);
-        r->name = wl_strdup(name);
-        if (!r->name) {
+        if (col_rel_pool_set_name(r, name) != 0) {
             return col_rel_pool_fallback_like(pool, r, name, like, governor);
         }
         if (col_rel_set_schema(r, like->ncols,

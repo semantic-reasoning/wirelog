@@ -155,6 +155,31 @@ reserved_of(const wl_col_session_t *s)
            - s->rels_reservation.bytes - s->rel_hash_reservation.bytes;
 }
 
+static uint64_t
+relation_fixed_bytes(const col_rel_t *r)
+{
+    return (r->descriptor_reservation
+        ? r->descriptor_reservation->bytes : 0)
+           + (r->metadata_reservation
+        ? r->metadata_reservation->bytes : 0);
+}
+
+static uint64_t
+batch_fixed_bytes(uint32_t ncols)
+{
+    uint64_t bytes = sizeof(col_rel_t) + sizeof("$join_batch")
+        + 2u * sizeof(wl_columnar_memory_reservation_t) + 3u
+        + (uint64_t)ncols * (sizeof(char *)
+        + sizeof(struct ArrowSchema *) + sizeof(struct ArrowSchema)
+        + 2u + sizeof(wirelog_column_type_t));
+    for (uint32_t i = 0; i < ncols; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "col%u", i);
+        bytes += 2u * (strlen(name) + 1u);
+    }
+    return bytes;
+}
+
 static col_rel_t *
 make_rel(const char *name, uint32_t ncols, const char *const *col_names)
 {
@@ -1429,7 +1454,6 @@ test_lease_released_on_every_path(void)
     uint64_t reservation_base;
     uint64_t producer_live_reservation;
     uint64_t min_batch_bytes;
-    uint64_t output_descriptor_reservation;
     wl_columnar_continuation_status_t st;
     int rc;
 
@@ -1465,14 +1489,12 @@ test_lease_released_on_every_path(void)
     }
     base_pins = entry->pin_count - 1u;
     rc = col_join_batch_run_to_relation(cont, f.sess, f.out);
-    uint64_t output_reservation = f.out->retained_reserved_bytes;
-    output_descriptor_reservation = f.out->descriptor_reservation
-        ? f.out->descriptor_reservation->bytes : 0u;
+    uint64_t output_reservation = f.out->retained_reserved_bytes
+        + relation_fixed_bytes(f.out);
     wl_columnar_continuation_destroy(cont);
     cont = NULL;
     if (rc != 0 || entry->pin_count != base_pins || f.out->nrows != 40u
-        || reserved_of(f.sess) != reservation_base + output_reservation
-        + output_descriptor_reservation) {
+        || reserved_of(f.sess) != reservation_base + output_reservation) {
         FAIL("success path leaked a lease");
         goto out;
     }
@@ -1500,7 +1522,7 @@ test_lease_released_on_every_path(void)
     cont = NULL;
     if (entry->pin_count != base_pins
         || reserved_of(f.sess) != reservation_base
-        + f.out->retained_reserved_bytes + output_descriptor_reservation) {
+        + f.out->retained_reserved_bytes + relation_fixed_bytes(f.out)) {
         FAIL("destroy after cancel leaked or double-released producer state");
         goto out;
     }
@@ -1522,7 +1544,7 @@ test_lease_released_on_every_path(void)
     wl_columnar_continuation_destroy(cont);
     cont = NULL;
     if (reserved_of(f.sess) != reservation_base
-        + f.out->retained_reserved_bytes + output_descriptor_reservation) {
+        + f.out->retained_reserved_bytes + relation_fixed_bytes(f.out)) {
         FAIL("destroy after pre-batch cancel leaked producer reservation");
         goto out;
     }
@@ -1532,7 +1554,7 @@ test_lease_released_on_every_path(void)
     ((col_arr_entry_t *)entry)->pin_count = base_pins;
     if (rc != EOVERFLOW || cont != NULL
         || reserved_of(f.sess) != reservation_base
-        + f.out->retained_reserved_bytes + output_descriptor_reservation) {
+        + f.out->retained_reserved_bytes + relation_fixed_bytes(f.out)) {
         FAIL("pin overflow leaked producer descriptor admission");
         goto out;
     }
@@ -1592,7 +1614,7 @@ test_lease_released_on_every_path(void)
     cont = NULL;
     if (entry->pin_count != base_pins
         || reserved_of(f.sess) != reservation_base
-        + f.out->retained_reserved_bytes + output_descriptor_reservation) {
+        + f.out->retained_reserved_bytes + relation_fixed_bytes(f.out)) {
         FAIL("post-denial create leaked its pin or producer reservation");
         goto out;
     }
@@ -1670,7 +1692,8 @@ descriptor_footprint(uint32_t key_count, uint32_t right_ncols,
     if (create_rc != 0 || !cont
         || reserved_of(sess) <= baseline + batch_bytes)
         goto done;
-    *bytes_out = reserved_of(sess) - baseline - batch_bytes;
+    *bytes_out = reserved_of(sess) - baseline - batch_bytes
+        - batch_fixed_bytes(out->ncols);
     ok = *bytes_out >= (uint64_t)sizeof(uint32_t) * key_count * 2u
         + (uint64_t)sizeof(int64_t) * right_ncols;
 

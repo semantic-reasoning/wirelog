@@ -275,16 +275,20 @@ reserved_of(const wl_col_session_t *s)
 }
 
 static uint64_t
-descriptor_bytes(const col_rel_t *relation)
+fixed_bytes(const col_rel_t *relation)
 {
-    return relation && relation->descriptor_reservation
-        ? relation->descriptor_reservation->bytes : 0;
+    if (!relation)
+        return 0;
+    return (relation->descriptor_reservation
+        ? relation->descriptor_reservation->bytes : 0)
+           + (relation->metadata_reservation
+        ? relation->metadata_reservation->bytes : 0);
 }
 
 static uint64_t
 relation_charge(const col_rel_t *relation)
 {
-    return relation->retained_reserved_bytes + descriptor_bytes(relation);
+    return relation->retained_reserved_bytes + fixed_bytes(relation);
 }
 
 static void init_cross_op(wl_plan_op_t *op);
@@ -1704,7 +1708,7 @@ run_refused_diff_result_cleanup(uint32_t stack_depth)
         || reservation_state != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
         || reservation->bytes != charged
         || !charged || reserved_of(sess) != baseline + charged
-        + descriptor_bytes(retained->rel))
+        + fixed_bytes(retained->rel))
         goto out;
     for (uint32_t i = 0; i + 1 < stack_depth; i++) {
         if (stack.items[i].rel != left || stack.items[i].owned)
@@ -1725,7 +1729,7 @@ run_refused_diff_result_cleanup(uint32_t stack_depth)
         memory_order_acquire) != reservation_state
         || reservation->bytes != charged
         || reserved_of(sess) != baseline + charged
-        + descriptor_bytes(retained->rel))
+        + fixed_bytes(retained->rel))
         goto out;
     if (col_rel_source_reader_release(&test_diff_commit_reader) != 0)
         goto out;
