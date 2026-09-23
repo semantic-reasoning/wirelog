@@ -952,10 +952,16 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
     }
 
     /* Slow path: pre-compile expression once, then evaluate per row. */
+    int compile_rc = ENOTSUP;
     wl_columnar_expr_compiled_t *ce =
         (buf && bsz > 0)
-        ? wl_columnar_expr_compile(buf, bsz, sess ? sess->intern : NULL)
+        ? wl_columnar_expr_compile_governed(buf, bsz,
+            sess ? sess->intern : NULL, governor, sess, &compile_rc)
         : NULL;
+    if (compile_rc != ENOTSUP && compile_rc != 0) {
+        (void)col_rel_destroy_checked(out);
+        return wl_columnar_filter_dispose_input(stack, &e, compile_rc);
+    }
 
     /* Row scratch, hoisted out of the loop (#1000). */
     wl_columnar_filter_scratch_t row_scratch;
@@ -1083,7 +1089,7 @@ wl_columnar_filter_next_pow2(uint32_t n)
 static int
 fill_filtered_rel(const uint8_t *buf, uint32_t bsz, col_rel_t *rel,
     col_rel_t *out, wl_intern_t *intern,
-    wl_columnar_memory_governor_ref_t *governor)
+    wl_columnar_memory_governor_ref_t *governor, wl_col_session_t *sess)
 {
     /* Row scratch, hoisted out of both loops below (#1000). */
     wl_columnar_filter_scratch_t scratch;
@@ -1124,8 +1130,13 @@ fill_filtered_rel(const uint8_t *buf, uint32_t bsz, col_rel_t *rel,
     }
 
     /* Slow path: compile once, evaluate per row */
-    wl_columnar_expr_compiled_t *ce = wl_columnar_expr_compile(buf, bsz,
-            intern);
+    int compile_rc = ENOTSUP;
+    wl_columnar_expr_compiled_t *ce = wl_columnar_expr_compile_governed(buf,
+            bsz, intern, governor, sess, &compile_rc);
+    if (compile_rc != ENOTSUP && compile_rc != 0) {
+        col_row_buf_release(&rb);
+        return compile_rc;
+    }
     for (uint32_t r = 0; r < rel->nrows; r++) {
         col_rel_row_copy_out(rel, r, row_buf);
         int pass;
@@ -1184,7 +1195,7 @@ wl_columnar_filter_apply_right_filter_governed(
     }
 
     if (fill_filtered_rel(fexpr->data, fexpr->size, rel, out, intern,
-        governor) != 0) {
+        governor, NULL) != 0) {
         col_rel_destroy(out);
         return NULL;
     }
@@ -1364,7 +1375,7 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
                 return NULL;
             }
             if (fill_filtered_rel(fexpr->data, fexpr->size, rel, e->filtered,
-                sess->intern, governor) != 0) {
+                sess->intern, governor, sess) != 0) {
                 col_rel_destroy(e->filtered);
                 e->filtered = NULL;
                 return NULL;
@@ -1468,7 +1479,7 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
     /* Fill the new entry */
     col_rel_t *out = sess->filt_cache[idx].filtered;
     if (fill_filtered_rel(fexpr->data, fexpr->size, rel, out,
-        sess->intern, governor) != 0) {
+        sess->intern, governor, sess) != 0) {
         col_rel_destroy(out);
         sess->filt_cache[idx].filtered = NULL;
         free(sess->filt_cache[idx].filter_data);

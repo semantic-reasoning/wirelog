@@ -226,10 +226,22 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         if (ce_map) {
             ce_map_count = (op->map_expr_count < pc) ? op->map_expr_count : pc;
             for (uint32_t c = 0; c < ce_map_count; c++) {
-                if (op->map_exprs[c].data && op->map_exprs[c].size > 0)
-                    ce_map[c] = wl_columnar_expr_compile(op->map_exprs[c].data,
-                            op->map_exprs[c].size,
-                            sess ? sess->intern : NULL);
+                if (op->map_exprs[c].data && op->map_exprs[c].size > 0) {
+                    int expr_rc = ENOTSUP;
+                    ce_map[c] = wl_columnar_expr_compile_governed(
+                        op->map_exprs[c].data, op->map_exprs[c].size,
+                        sess ? sess->intern : NULL,
+                        sess ? sess->memory_governor : NULL, sess, &expr_rc);
+                    if (expr_rc != ENOTSUP && expr_rc != 0) {
+                        for (uint32_t j = 0; j < c; j++)
+                            wl_columnar_expr_compiled_free(ce_map[j]);
+                        free((void *)ce_map);
+                        free(tmp);
+                        col_rel_destroy(out);
+                        return wl_columnar_ops_dispose_entry(stack, &e,
+                                   expr_rc);
+                    }
+                }
             }
         }
     }
@@ -414,9 +426,17 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
     }
 
     wl_columnar_expr_compiled_t *agg_ce = NULL;
-    if (op->agg_expr.data && op->agg_expr.size > 0)
-        agg_ce = wl_columnar_expr_compile(op->agg_expr.data, op->agg_expr.size,
-                sess ? sess->intern : NULL);
+    if (op->agg_expr.data && op->agg_expr.size > 0) {
+        int expr_rc = ENOTSUP;
+        agg_ce = wl_columnar_expr_compile_governed(op->agg_expr.data,
+                op->agg_expr.size, sess ? sess->intern : NULL,
+                sess ? sess->memory_governor : NULL, sess, &expr_rc);
+        if (expr_rc != ENOTSUP && expr_rc != 0) {
+            free(tmp);
+            col_rel_destroy(out);
+            return wl_columnar_ops_dispose_entry(stack, &e, expr_rc);
+        }
+    }
 
     /* Row scratch, hoisted out of the loop (#1000). */
     col_row_buf_t row_rb;
