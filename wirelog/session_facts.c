@@ -19,7 +19,9 @@
 #include "io/csv_adapter_internal.h"
 #include "io/io_ctx_internal.h"
 #include "ir/program.h"
+#include "intern.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +31,7 @@
 typedef struct {
     wl_session_t *session;
     const char *relation;
+    int insert_rc;
 } wl_input_batch_sink_t;
 
 static int
@@ -38,16 +41,17 @@ wl_session_input_batch_cb(void *opaque, const int64_t *rows,
     wl_input_batch_sink_t *sink = (wl_input_batch_sink_t *)opaque;
     if (!sink || !sink->session || !sink->relation)
         return -1;
-    return wl_session_insert(sink->session, sink->relation, rows, nrows,
-               ncols);
+    sink->insert_rc = wl_session_insert(sink->session, sink->relation, rows,
+            nrows, ncols);
+    return sink->insert_rc;
 }
 
 static int
-wl_session_input_load_fail(wl_session_t *sess)
+wl_session_input_load_fail(wl_session_t *sess, int rc)
 {
     if (sess)
         sess->input_load_failed = true;
-    return -1;
+    return rc > 0 ? rc : -1;
 }
 
 int
@@ -73,7 +77,7 @@ wl_session_load_facts(wl_session_t *sess, const struct wirelog_program *prog)
         if (rc != 0) {
             fprintf(stderr, "error: failed to load facts for '%s'\n",
                 rel->name);
-            return wl_session_input_load_fail(sess);
+            return wl_session_input_load_fail(sess, rc);
         }
     }
 
@@ -104,7 +108,7 @@ wl_session_load_input_files(wl_session_t *sess,
                 "error: no I/O adapter registered for scheme '%s' "
                 "(relation '%s')\n",
                 scheme, rel->name);
-            return wl_session_input_load_fail(sess);
+            return wl_session_input_load_fail(sess, -1);
         }
 
         wirelog_io_ctx_t *ctx =
@@ -113,7 +117,7 @@ wl_session_load_input_files(wl_session_t *sess,
             fprintf(stderr,
                 "error: failed to create I/O context for '%s'\n",
                 rel->name);
-            return wl_session_input_load_fail(sess);
+            return wl_session_input_load_fail(sess, -1);
         }
         wirelog_io_ctx_set_memory_governor(ctx,
             wl_session_memory_governor(sess));
@@ -129,7 +133,7 @@ wl_session_load_input_files(wl_session_t *sess,
                     "error: validation failed for '%s': %s\n",
                     rel->name, errbuf);
                 wirelog_io_ctx_destroy(ctx);
-                return wl_session_input_load_fail(sess);
+                return wl_session_input_load_fail(sess, -1);
             }
         }
 
@@ -142,8 +146,22 @@ wl_session_load_input_files(wl_session_t *sess,
                     WL_SESSION_INPUT_BATCH_ROWS,
                     wl_session_input_batch_cb, &sink);
             wirelog_io_ctx_destroy(ctx);
-            if (src != 0)
-                return wl_session_input_load_fail(sess);
+            if (src != 0) {
+                int load_rc = sink.insert_rc;
+                if (load_rc == 0) {
+                    if (src == WL_CSV_ERR_BUDGET)
+                        load_rc = ENOSPC;
+                    else if (src == WL_CSV_ERR_MEMORY)
+                        load_rc = ENOMEM;
+                    else if (src == WL_CSV_ERR_OVERFLOW)
+                        load_rc = EOVERFLOW;
+                    else
+                        load_rc = -1;
+                } else if (load_rc == WL_INTERN_ERR_MEMORY_BUDGET) {
+                    load_rc = ENOSPC;
+                }
+                return wl_session_input_load_fail(sess, load_rc);
+            }
             continue;
         }
 
@@ -159,7 +177,8 @@ wl_session_load_input_files(wl_session_t *sess,
                 "error: adapter '%s' failed to read data for '%s'\n",
                 scheme, rel->name);
             free(data);
-            return wl_session_input_load_fail(sess);
+            return wl_session_input_load_fail(sess, rc == ENOMEM
+                ? ENOMEM : -1);
         }
 
         if (nrows > 0 && data) {
@@ -174,7 +193,7 @@ wl_session_load_input_files(wl_session_t *sess,
                 fprintf(stderr,
                     "error: failed to insert data for '%s'\n",
                     rel->name);
-                return wl_session_input_load_fail(sess);
+                return wl_session_input_load_fail(sess, rc);
             }
         } else {
             free(data);

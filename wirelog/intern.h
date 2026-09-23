@@ -95,6 +95,11 @@ wl_intern_free(wl_intern_t *intern);
 int64_t
 wl_intern_put(wl_intern_t *intern, const char *str);
 
+/* Status-preserving variant for callers that must distinguish governor
+ * denial, ordinary allocation failure, and arithmetic overflow. */
+int
+wl_intern_put_checked(wl_intern_t *intern, const char *str, int64_t *out_id);
+
 /**
  * wl_intern_get:
  * @intern: Intern table.

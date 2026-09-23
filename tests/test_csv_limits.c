@@ -1021,10 +1021,10 @@ build_wide_long_csv(size_t *out_len)
     return buf;
 }
 
-static int64_t
-wide_intern_cb(void *opaque, const char *str)
+static int
+wide_intern_cb(void *opaque, const char *str, int64_t *out_id)
 {
-    return wl_intern_put((wl_intern_t *)opaque, str);
+    return wl_intern_put_checked((wl_intern_t *)opaque, str, out_id);
 }
 
 /*

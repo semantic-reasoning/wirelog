@@ -430,7 +430,7 @@ csv_scratch_reserve(csv_scratch_t *s, size_t need)
     size_t cap = s->cap ? s->cap : 256;
     while (cap < need) {
         if (cap > (size_t)-1 / 2)
-            return WL_CSV_ERR_MEMORY;
+            return WL_CSV_ERR_OVERFLOW;
         cap *= 2;
     }
 
@@ -464,7 +464,7 @@ static int
 csv_parse_line_via_ctx(const char *line, char delimiter,
     const wirelog_column_type_t *col_types, uint32_t num_cols,
     int64_t *values, uint32_t max_cols, uint32_t *count,
-    int64_t (*intern_cb)(void *opaque, const char *str),
+    wl_csv_intern_cb intern_cb,
     void *opaque, csv_scratch_t *scratch)
 {
     if (!line || !col_types || !values || !count || num_cols == 0 || !intern_cb
@@ -486,9 +486,15 @@ csv_parse_line_via_ctx(const char *line, char delimiter,
             /* A trailing delimiter denotes an empty final string field. */
             if (col == num_cols - 1 && col > 0 && p[-1] == delimiter
                 && col_types[col] == WIRELOG_TYPE_STRING) {
-                values[col] = intern_cb(opaque, "");
-                if (values[col] < 0)
-                    return -1;
+                int64_t id = -1;
+                int irc = intern_cb(opaque, "", &id);
+                if (irc != 0)
+                    return irc == WL_INTERN_ERR_MEMORY_BUDGET
+                        ? WL_CSV_ERR_BUDGET
+                        : irc == ENOMEM ? WL_CSV_ERR_MEMORY
+                        : irc == EOVERFLOW ? WL_CSV_ERR_OVERFLOW
+                        : irc == EINVAL ? WL_CSV_ERR_ARGS : WL_CSV_ERR_PARSE;
+                values[col] = id;
                 (*count)++;
                 break;
             }
@@ -532,9 +538,15 @@ csv_parse_line_via_ctx(const char *line, char delimiter,
             memcpy(scratch->buf, start, slen);
             scratch->buf[slen] = '\0';
 
-            values[col] = intern_cb(opaque, scratch->buf);
-            if (values[col] < 0)
-                return -1;
+            int64_t id = -1;
+            int irc = intern_cb(opaque, scratch->buf, &id);
+            if (irc != 0)
+                return irc == WL_INTERN_ERR_MEMORY_BUDGET
+                    ? WL_CSV_ERR_BUDGET
+                    : irc == ENOMEM ? WL_CSV_ERR_MEMORY
+                    : irc == EOVERFLOW ? WL_CSV_ERR_OVERFLOW
+                    : irc == EINVAL ? WL_CSV_ERR_ARGS : WL_CSV_ERR_PARSE;
+            values[col] = id;
         } else {
             /* Parse a declared binary64 field without losing precision. */
             char *end;
@@ -582,10 +594,10 @@ csv_parse_line_via_ctx(const char *line, char delimiter,
 }
 
 /* Adapts the intern-table API to the callback the parser expects. */
-static int64_t
-intern_trampoline(void *opaque, const char *str)
+static int
+intern_trampoline(void *opaque, const char *str, int64_t *out_id)
 {
-    return wl_intern_put((wl_intern_t *)opaque, str);
+    return wl_intern_put_checked((wl_intern_t *)opaque, str, out_id);
 }
 
 /* ======================================================================== */
@@ -626,7 +638,7 @@ wl_csv_read_file_via_ctx(
     int64_t **out_data,
     uint32_t *out_nrows,
     uint32_t *out_ncols,
-    int64_t (*intern_cb)(void *opaque, const char *str),
+    wl_csv_intern_cb intern_cb,
     void *opaque)
 {
     if (!filepath || !col_types || !out_data || !out_nrows || !out_ncols
@@ -699,7 +711,7 @@ wl_csv_read_file_via_ctx(
                 row_values, num_cols, &col_count,
                 intern_cb, opaque, &scratch);
         if (rc != 0 || col_count != num_cols) {
-            lrc = (rc == WL_CSV_ERR_MEMORY) ? rc : WL_CSV_ERR_PARSE;
+            lrc = rc != 0 ? rc : WL_CSV_ERR_PARSE;
             break;
         }
 
@@ -745,7 +757,7 @@ wl_csv_read_file_via_ctx_stream(
     uint32_t max_batch_rows,
     wl_csv_batch_cb batch_cb,
     void *opaque,
-    int64_t (*intern_cb)(void *opaque, const char *str),
+    wl_csv_intern_cb intern_cb,
     void *intern_opaque)
 {
     return wl_csv_read_file_via_ctx_stream_admitted(filepath, delimiter,
@@ -762,7 +774,7 @@ wl_csv_read_file_via_ctx_stream_admitted(
     uint32_t max_batch_rows,
     wl_csv_batch_cb batch_cb,
     void *opaque,
-    int64_t (*intern_cb)(void *opaque, const char *str),
+    wl_csv_intern_cb intern_cb,
     void *intern_opaque,
     wl_columnar_memory_governor_t *governor)
 {
@@ -793,7 +805,11 @@ wl_csv_read_file_via_ctx_stream_admitted(
         || !wl_columnar_memory_size_add(admitted_bytes,
         WL_CSV_MAX_LINE + 1, &admitted_bytes)) {
         fclose(f);
-        return WL_CSV_ERR_MEMORY;
+        return WL_CSV_ERR_OVERFLOW;
+    }
+    if (batch_bytes > SIZE_MAX || row_bytes > SIZE_MAX) {
+        fclose(f);
+        return WL_CSV_ERR_OVERFLOW;
     }
     if (governor) {
         wl_columnar_memory_admission_status_t admission
@@ -802,7 +818,10 @@ wl_csv_read_file_via_ctx_stream_admitted(
         if (admission != WL_COLUMNAR_MEMORY_ADMISSION_OK
             && admission != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
             fclose(f);
-            return WL_CSV_ERR_MEMORY;
+            return admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                ? WL_CSV_ERR_BUDGET
+                : admission == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? WL_CSV_ERR_OVERFLOW : WL_CSV_ERR_ARGS;
         }
     }
 
@@ -811,8 +830,10 @@ wl_csv_read_file_via_ctx_stream_admitted(
     if (!batch || !row_values) {
         free(batch);
         free(row_values);
-        if (governor)
-            wl_columnar_memory_release(&reservation);
+        bool released = !governor
+            || wl_columnar_memory_release(&reservation);
+        if (!released)
+            abort();
         fclose(f);
         return WL_CSV_ERR_MEMORY;
     }
@@ -822,8 +843,10 @@ wl_csv_read_file_via_ctx_stream_admitted(
     if (rc != WL_CSV_OK) {
         free(batch);
         free(row_values);
-        if (governor)
-            wl_columnar_memory_release(&reservation);
+        bool released = !governor
+            || wl_columnar_memory_release(&reservation);
+        if (!released)
+            abort();
         fclose(f);
         return rc;
     }
@@ -842,7 +865,7 @@ wl_csv_read_file_via_ctx_stream_admitted(
                 row_values, num_cols, &col_count,
                 intern_cb, intern_opaque, &scratch);
         if (rc != 0 || col_count != num_cols) {
-            lrc = (rc == WL_CSV_ERR_MEMORY) ? rc : WL_CSV_ERR_PARSE;
+            lrc = rc != 0 ? rc : WL_CSV_ERR_PARSE;
             break;
         }
 
@@ -869,8 +892,10 @@ wl_csv_read_file_via_ctx_stream_admitted(
     csv_reader_dispose(&reader);
     free(row_values);
     free(batch);
-    if (governor)
-        wl_columnar_memory_release(&reservation);
+    bool released = !governor
+        || wl_columnar_memory_release(&reservation);
+    if (!released)
+        abort();
     fclose(f);
     return lrc < 0 ? lrc : WL_CSV_OK;
 }

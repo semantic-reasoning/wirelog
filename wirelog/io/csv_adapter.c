@@ -32,6 +32,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <errno.h>
 #if !defined(_WIN32) && !defined(_WIN64)
 #include <unistd.h>
 #else
@@ -48,13 +50,13 @@
  * to stay consistent with the legacy wl_csv_read_file_ex path.
  * External adapters should use wirelog_io_ctx_intern_string (1-based) instead.
  */
-static int64_t
-csv_intern_trampoline(void *opaque, const char *str)
+static int
+csv_intern_trampoline(void *opaque, const char *str, int64_t *out_id)
 {
     wirelog_io_ctx_t *ctx = (wirelog_io_ctx_t *)opaque;
-    if (!ctx || !ctx->intern)
-        return -1;
-    return wl_intern_put(ctx->intern, str);
+    if (!ctx || !ctx->intern || !out_id)
+        return EINVAL;
+    return wl_intern_put_checked(ctx->intern, str, out_id);
 }
 
 static const char *
@@ -92,13 +94,46 @@ csv_delimiter(wirelog_io_ctx_t *ctx)
 }
 
 static int
-csv_types(wirelog_io_ctx_t *ctx, wirelog_column_type_t **out_types)
+csv_types(wirelog_io_ctx_t *ctx, wirelog_column_type_t **out_types,
+    wl_columnar_memory_reservation_t *reservation, bool *reserved)
 {
+    if (!ctx || !out_types || !reservation || !reserved)
+        return WL_CSV_ERR_ARGS;
+
     uint32_t num_cols = wirelog_io_ctx_num_cols(ctx);
+    uint64_t types_bytes;
+    *out_types = NULL;
+    *reserved = false;
+    if (num_cols == 0
+        || !wl_columnar_memory_size_mul(num_cols,
+        sizeof(wirelog_column_type_t), &types_bytes)
+        || types_bytes > SIZE_MAX)
+        return WL_CSV_ERR_OVERFLOW;
+
+    if (ctx->memory_governor) {
+        wl_columnar_memory_admission_status_t status
+            = wl_columnar_memory_reserve_checked(ctx->memory_governor,
+                types_bytes, reservation);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                ? WL_CSV_ERR_BUDGET
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? WL_CSV_ERR_OVERFLOW : WL_CSV_ERR_ARGS;
+        *reserved = true;
+    }
+
     wirelog_column_type_t *types = (wirelog_column_type_t *)malloc(
-        (size_t)num_cols * sizeof(*types));
-    if (!types)
+        (size_t)types_bytes);
+    if (!types) {
+        if (*reserved) {
+            bool released = wl_columnar_memory_release(reservation);
+            *reserved = false;
+            if (!released)
+                abort();
+        }
         return WL_CSV_ERR_MEMORY;
+    }
     for (uint32_t i = 0; i < num_cols; i++)
         types[i] = wirelog_io_ctx_col_type(ctx, i);
     *out_types = types;
@@ -119,7 +154,10 @@ wl_csv_adapter_stream_read(wirelog_io_ctx_t *ctx, uint32_t max_batch_rows,
         return WL_CSV_ERR_ARGS;
 
     wirelog_column_type_t *types = NULL;
-    int rc = csv_types(ctx, &types);
+    wl_columnar_memory_reservation_t types_reservation;
+    bool types_reserved = false;
+    wl_columnar_memory_reservation_init(&types_reservation);
+    int rc = csv_types(ctx, &types, &types_reservation, &types_reserved);
     if (rc == WL_CSV_OK) {
         rc = wl_csv_read_file_via_ctx_stream_admitted(path, csv_delimiter(ctx),
                 types,
@@ -127,6 +165,8 @@ wl_csv_adapter_stream_read(wirelog_io_ctx_t *ctx, uint32_t max_batch_rows,
                 csv_intern_trampoline, ctx, ctx->memory_governor);
     }
     free(types);
+    if (types_reserved && !wl_columnar_memory_release(&types_reservation))
+        abort();
     return rc;
 }
 

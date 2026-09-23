@@ -689,10 +689,23 @@ wirelog_executor_create(wirelog_program_t *program, wirelog_error_t *error)
             : WIRELOG_ERR_EXEC);
         return NULL;
     }
-    if (wl_session_load_facts(executor->session, program) != 0
-        || wl_session_load_input_files(executor->session, program) != 0) {
+    int load_rc = wl_session_load_facts(executor->session, program);
+    if (load_rc != 0) {
+        wirelog_error_t result = (wirelog_error_t)
+            wl_facade_session_error_code_with_budget(load_rc, 0,
+                wl_session_budget_denied(executor->session));
         wirelog_executor_free(executor);
-        set_error(error, WIRELOG_ERR_IO);
+        set_error(error, result);
+        return NULL;
+    }
+    load_rc = wl_session_load_input_files(executor->session, program);
+    if (load_rc != 0) {
+        int mapped = wl_facade_session_error_code_with_budget(load_rc, 0,
+                wl_session_budget_denied(executor->session));
+        wirelog_error_t result = mapped == WIRELOG_ERR_EXEC
+            ? WIRELOG_ERR_IO : (wirelog_error_t)mapped;
+        wirelog_executor_free(executor);
+        set_error(error, result);
         return NULL;
     }
 

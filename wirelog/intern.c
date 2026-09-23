@@ -546,6 +546,13 @@ wl_intern_free(wl_intern_t *intern)
 int64_t
 wl_intern_put(wl_intern_t *intern, const char *str)
 {
+    int64_t id = -1;
+    return wl_intern_put_checked(intern, str, &id) == 0 ? id : -1;
+}
+
+int
+wl_intern_put_checked(wl_intern_t *intern, const char *str, int64_t *out_id)
+{
     wl_columnar_memory_reservation_t pending;
     bool pending_valid = false;
     char *copy;
@@ -561,9 +568,12 @@ wl_intern_put(wl_intern_t *intern, const char *str)
     size_t slen;
     size_t copy_bytes;
     int64_t existing;
+    int failure = ENOMEM;
 
-    if (!intern || !str)
-        return -1;
+    if (out_id)
+        *out_id = -1;
+    if (!intern || !str || !out_id)
+        return EINVAL;
 
     /* Prepare the owned copy before taking the writer lock.  strlen/malloc/
      * memcpy are independent of the table and used to make every worker wait
@@ -574,11 +584,11 @@ wl_intern_put(wl_intern_t *intern, const char *str)
      * cost is amortized over 64 * 2^k and 2x puts respectively. */
     slen = strlen(str);
     if (slen == SIZE_MAX)
-        return -1;
+        return EOVERFLOW;
     copy_bytes = slen + 1;
     copy = (char *)malloc(copy_bytes);
     if (!copy)
-        return -1;
+        return ENOMEM;
     memcpy(copy, str, copy_bytes);
 
     wl_mutex_lock(&intern->lock);
@@ -586,17 +596,22 @@ wl_intern_put(wl_intern_t *intern, const char *str)
     if (existing >= 0) {
         wl_mutex_unlock(&intern->lock);
         free(copy);
-        return existing;
+        *out_id = existing;
+        return 0;
     }
     new_id = WL_INTERN_LOAD_RELAXED(&intern->count);
-    if (new_id >= INTERN_MAX_STRINGS)
+    if (new_id >= INTERN_MAX_STRINGS) {
+        failure = EOVERFLOW;
         goto fail;
+    }
     seg = intern_seg_of(new_id);
     needs_segment = intern->segments[seg] == NULL;
     needs_resize = (uint64_t)(new_id + 1U) * INTERN_LOAD_FACTOR_DEN
         > (uint64_t)intern->slot_capacity * INTERN_LOAD_FACTOR_NUM;
-    if (needs_resize && intern->slot_capacity > UINT32_MAX / 2U)
+    if (needs_resize && intern->slot_capacity > UINT32_MAX / 2U) {
+        failure = EOVERFLOW;
         goto fail;
+    }
     new_cap = needs_resize ? intern->slot_capacity * 2U
                            : intern->slot_capacity;
 
@@ -618,29 +633,42 @@ wl_intern_put(wl_intern_t *intern, const char *str)
             && (!wl_columnar_memory_size_mul(intern->slot_capacity,
             sizeof(wl_intern_slot_t), &freed_slot_bytes)
             || !wl_columnar_memory_size_mul(new_cap,
-            sizeof(wl_intern_slot_t), &slot_bytes)))
+            sizeof(wl_intern_slot_t), &slot_bytes))) {
+            failure = EOVERFLOW;
             goto fail;
+        }
         if (needs_segment
             && !wl_columnar_memory_size_mul(intern_seg_size(seg),
-            sizeof(char *), &segment_bytes))
+            sizeof(char *), &segment_bytes)) {
+            failure = EOVERFLOW;
             goto fail;
-        if (freed_slot_bytes > old_bytes)
+        }
+        if (freed_slot_bytes > old_bytes) {
+            failure = EINVAL;
             goto fail;
+        }
         retained_after = old_bytes - freed_slot_bytes;
         if (!wl_columnar_memory_size_add(retained_after, copy_bytes,
             &retained_after)
             || !wl_columnar_memory_size_add(retained_after, segment_bytes,
             &retained_after)
             || !wl_columnar_memory_size_add(retained_after, slot_bytes,
-            &retained_after))
+            &retained_after)) {
+            failure = EOVERFLOW;
             goto fail;
+        }
         wl_columnar_memory_reservation_init(&pending);
         status = wl_columnar_memory_reserve_growth(
             wl_columnar_memory_governor_ref_get(intern->memory_governor),
             old_bytes, retained_after, &pending);
         if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
-            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            failure = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                ? WL_INTERN_ERR_MEMORY_BUDGET
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : EINVAL;
             goto fail;
+        }
         pending_valid = true;
     }
 
@@ -680,16 +708,17 @@ wl_intern_put(wl_intern_t *intern, const char *str)
      * count happens under intern->lock. */
     WL_INTERN_STORE_RELEASE(&intern->count, new_id + 1U);
     wl_mutex_unlock(&intern->lock);
-    return (int64_t)new_id;
+    *out_id = (int64_t)new_id;
+    return 0;
 
 fail:
     free(copy);
     free((void *)new_segment);
     free(new_slots);
-    if (pending_valid)
-        (void)wl_columnar_memory_rollback(&pending);
+    if (pending_valid && !wl_columnar_memory_rollback(&pending))
+        abort(); /* A live local token has no valid owner after this point. */
     wl_mutex_unlock(&intern->lock);
-    return -1;
+    return failure;
 }
 
 int64_t

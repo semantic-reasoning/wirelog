@@ -61,8 +61,10 @@ test_denied_growth_preserves_table(void)
     governor = wl_columnar_memory_governor_ref_get(ref);
     if (wl_intern_attach_memory_governor(intern, ref) != 0)
         return 1;
-    id = wl_intern_put(intern, "new-symbol");
-    if (id != -1 || wl_intern_count(intern) != 0
+    id = 123;
+    int checked_rc = wl_intern_put_checked(intern, "new-symbol", &id);
+    if (checked_rc != WL_INTERN_ERR_MEMORY_BUDGET || id != -1
+        || wl_intern_count(intern) != 0
         || wl_intern_get(intern, "new-symbol") != -1
         || wl_columnar_memory_reserved(governor) != 256) {
         wl_intern_free(intern);
@@ -91,8 +93,11 @@ test_duplicate_is_uncharged(void)
         return 1;
     first = wl_intern_put(intern, "same-symbol");
     before = wl_columnar_memory_reserved(governor);
-    duplicate = wl_intern_put(intern, "same-symbol");
+    duplicate = -1;
+    int checked_rc = wl_intern_put_checked(intern, "same-symbol",
+            &duplicate);
     if (first < 0 || duplicate != first
+        || checked_rc != 0
         || wl_columnar_memory_reserved(governor) != before) {
         wl_intern_free(intern);
         wl_columnar_memory_governor_ref_release(ref);
