@@ -889,9 +889,13 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
                 scratch_bytes, &scratch_reservation);
         if (admission != WL_COLUMNAR_MEMORY_ADMISSION_OK
             && admission != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                COL_SESSION(sess)->memory_budget_denied = true;
             free(live_indices);
             return admission == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
-                ? EOVERFLOW : ENOMEM;
+                ? EOVERFLOW
+                : admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                ? ENOSPC : ENOMEM;
         }
     }
 
@@ -915,13 +919,27 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
         return ENOMEM;
     }
 
+    wl_columnar_memory_reservation_init(&cohort->scratch_reservation);
+    uint64_t scratch_state = atomic_load_explicit(&scratch_reservation.state,
+            memory_order_acquire);
+    if ((scratch_state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        || scratch_state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED)
+        && !wl_columnar_memory_reservation_move(&cohort->scratch_reservation,
+        &scratch_reservation)) {
+        free(live_indices);
+        free(results);
+        free(workers);
+        free(worker_sess);
+        free(cohort);
+        (void)wl_columnar_memory_release(&scratch_reservation);
+        return EINVAL;
+    }
     cohort->parent = COL_SESSION(sess);
     cohort->results = results;
     cohort->workers = workers;
     cohort->worker_sess = worker_sess;
     cohort->live_indices = live_indices;
     cohort->live_count = live_count;
-    cohort->scratch_reservation = scratch_reservation;
     wl_columnar_memory_reservation_init(&scratch_reservation);
     cohort->dispatch_active = true;
     sess->kfusion_pending_cohort = cohort;

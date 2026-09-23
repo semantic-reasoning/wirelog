@@ -10636,6 +10636,7 @@ test_kfusion_parallel_cohort_refusal_retry(void)
     wl_columnar_memory_resolution_t resolution = { 0 };
     wl_columnar_memory_governor_ref_t *governor = NULL;
     uint64_t pending_charge = 0;
+    uint64_t baseline_charge = 0;
     col_rel_t *input = col_rel_new_auto("input", 1);
     KCOHORT_CHECK(input != NULL, "input allocation failed");
     KCOHORT_CHECK(col_rel_append_row(input, (int64_t[]){ 7 }) == 0,
@@ -10660,6 +10661,8 @@ test_kfusion_parallel_cohort_refusal_retry(void)
     KCOHORT_CHECK(sess.delta_pool != NULL, "delta pool allocation failed");
     KCOHORT_CHECK(session_add_rel(&sess, input) == 0,
         "input registration failed");
+    baseline_charge = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(governor));
     for (uint32_t i = 0; i < 4; i++) {
         branches[i][0].op = WL_PLAN_OP_VARIABLE;
         branches[i][0].relation_name = "input";
@@ -10773,7 +10776,7 @@ test_kfusion_parallel_cohort_refusal_retry(void)
         memory_order_acquire) == 0,
         "compound arena borrow remained after cleanup");
     KCOHORT_CHECK(wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(governor)) == 0,
+            wl_columnar_memory_governor_ref_get(governor)) == baseline_charge,
         "governed heap reservation leaked after retry");
     KCOHORT_CHECK(sess.kfusion_pending_cohort == NULL,
         "cohort remained pending after cleanup");

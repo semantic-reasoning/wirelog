@@ -6228,6 +6228,8 @@ static int
 col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord, uint32_t stratum_idx)
 {
+    if (!sp || !coord)
+        return EINVAL;
     /* A retained record is cleanup-only. Once it is cleared, this invocation
      * is a fresh evaluation with its own plan/context. */
     if (coord && coord->tdd_owner_lifetime) {
@@ -6249,6 +6251,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
     uint64_t tdd_total_t0 = now_ns();
 
     uint32_t delta_queue_capacity = 0;
+    col_eval_tdd_worker_ctx_t *ctxs = NULL;
     if (wl_columnar_eval_delta_queue_capacity(nrels,
         &delta_queue_capacity) != 0) {
         coord->tdd_total_ns += now_ns() - tdd_total_t0;
@@ -6563,14 +6566,17 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 worker_scratch_bytes, &worker_scratch);
         if (admission != WL_COLUMNAR_MEMORY_ADMISSION_OK
             && admission != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                coord->memory_budget_denied = true;
             rc = admission == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
-                ? EOVERFLOW : ENOMEM;
+                ? EOVERFLOW
+                : admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                ? ENOSPC : ENOMEM;
             goto done;
         }
     }
-    col_eval_tdd_worker_ctx_t *ctxs
-        = (col_eval_tdd_worker_ctx_t *)calloc(
-            W, sizeof(col_eval_tdd_worker_ctx_t));
+    ctxs = (col_eval_tdd_worker_ctx_t *)calloc(
+        W, sizeof(col_eval_tdd_worker_ctx_t));
     if (!ctxs) {
         rc = ENOMEM;
         goto done;
