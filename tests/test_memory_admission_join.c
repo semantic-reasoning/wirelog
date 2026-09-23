@@ -1551,7 +1551,7 @@ out:
 static void
 test_parallel_diff_denial(void)
 {
-    wl_col_session_t *sess = make_session_workers(64ull * 1024 * 1024, 2);
+    wl_col_session_t *sess = NULL;
     col_rel_t *right = make_right(1, 2);
     col_rel_t *left = make_left(65, 1);
     wl_plan_op_t op;
@@ -1591,6 +1591,8 @@ test_parallel_diff_denial(void)
 out:
     test_fail_diff_twin_alloc = false;
     unsetenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS");
+    if (denied_result.owned && denied_result.rel)
+        col_rel_destroy(denied_result.rel);
     col_rel_destroy(left);
     col_rel_destroy(right);
     destroy_session(sess);
