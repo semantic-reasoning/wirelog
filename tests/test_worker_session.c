@@ -2478,8 +2478,10 @@ test_worker_retained_pool_alias_teardown_is_retryable(void)
         goto fail;
     arena_slot = arena_relation;
     uint64_t independent_token = independent->retained_reserved_bytes;
-    uint64_t independent_fixed = independent->descriptor_reservation->bytes
-        + independent->metadata_reservation->bytes;
+    uint64_t independent_fixed = independent->descriptor_reservation
+        ? independent->descriptor_reservation->bytes : 0;
+    independent_fixed += independent->metadata_reservation
+        ? independent->metadata_reservation->bytes : 0;
     if (independent_token == 0
         || independent->retained_reservation.identity
         != &independent->retained_reservation

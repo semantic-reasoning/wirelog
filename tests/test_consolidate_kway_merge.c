@@ -1331,7 +1331,7 @@ test_consolidate_scratch_admission(void)
             FAIL("failed to append source fixture row");
         }
     }
-    ref = test_consolidate_governor_create(1);
+    ref = test_consolidate_governor_create(UINT64_C(1) << 30);
     if (!ref || col_rel_attach_memory_governor(rel, ref) != 0
         || col_rel_install_shared_view(rel, source) != 0) {
         if (ref)
@@ -1340,6 +1340,11 @@ test_consolidate_scratch_admission(void)
         test_rel_free(source);
         FAIL("failed to attach constrained governor/shared view");
     }
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(ref);
+    uint64_t fixed_reserved = wl_columnar_memory_reserved(governor);
+    atomic_store_explicit(&governor->usable_bytes, fixed_reserved,
+        memory_order_release);
     memcpy(before, rel->columns[0], sizeof(before));
     view_generation = rel->view_generation;
     storage_generation = rel->storage_generation;
@@ -1357,8 +1362,7 @@ test_consolidate_scratch_admission(void)
         || source->storage_alias_borrows != alias_borrows
         || memcmp(before, source->columns[0], sizeof(before)) != 0
         || memcmp(before, rel->columns[0], sizeof(before)) != 0
-        || wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(ref)) != 0) {
+        || wl_columnar_memory_reserved(governor) != fixed_reserved) {
         test_rel_free(rel);
         test_rel_free(source);
         wl_columnar_memory_governor_ref_release(ref);
@@ -1386,10 +1390,11 @@ test_consolidate_scratch_admission(void)
         test_rel_free(rel);
         FAIL("failed to attach sufficient memory governor");
     }
+    governor = wl_columnar_memory_governor_ref_get(ref);
+    fixed_reserved = wl_columnar_memory_reserved(governor);
     rc = col_op_consolidate_kway_merge(rel, boundaries, 2);
     if (rc != 0 || !test_rel_is_sorted_unique(rel)
-        || wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(ref)) != 0) {
+        || wl_columnar_memory_reserved(governor) != fixed_reserved) {
         test_rel_free(rel);
         wl_columnar_memory_governor_ref_release(ref);
         FAIL("admitted scratch must succeed and release reservation");
@@ -1808,16 +1813,23 @@ test_zero_arity_merge_output_is_never_zero_sized(void)
     /* (2) A budget covering only the segment scratch must be refused:
      * the merge output still asks for more than zero bytes. */
     rel = zero_arity_fixture();
-    ref = test_consolidate_governor_create(segment_scratch);
+    ref = test_consolidate_governor_create(UINT64_C(1) << 30);
     if (!rel || !ref || col_rel_attach_memory_governor(rel, ref) != 0) {
         if (ref)
             wl_columnar_memory_governor_ref_release(ref);
         test_rel_free(rel);
         FAIL("failed to attach the segment-sized governor");
     }
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(ref);
+    uint64_t fixed_reserved = wl_columnar_memory_reserved(governor);
+    atomic_store_explicit(&governor->usable_bytes,
+        fixed_reserved + segment_scratch, memory_order_release);
     rc = col_op_consolidate_kway_merge(rel, boundaries, 2);
     if (rc == ENOMEM && rel->nrows != 3)
         rc = -1; /* a denied admission must leave the rows alone */
+    if (wl_columnar_memory_reserved(governor) != fixed_reserved)
+        rc = -1;
     test_rel_free(rel);
     wl_columnar_memory_governor_ref_release(ref);
     if (rc == -1)
@@ -1828,14 +1840,18 @@ test_zero_arity_merge_output_is_never_zero_sized(void)
     /* (3) One extra int64_t of budget admits it, and the merge dedups
      * the identical empty tuples to a single row. */
     rel = zero_arity_fixture();
-    ref = test_consolidate_governor_create(segment_scratch
-            + sizeof(int64_t));
+    ref = test_consolidate_governor_create(UINT64_C(1) << 30);
     if (!rel || !ref || col_rel_attach_memory_governor(rel, ref) != 0) {
         if (ref)
             wl_columnar_memory_governor_ref_release(ref);
         test_rel_free(rel);
         FAIL("failed to attach the admitting governor");
     }
+    governor = wl_columnar_memory_governor_ref_get(ref);
+    fixed_reserved = wl_columnar_memory_reserved(governor);
+    atomic_store_explicit(&governor->usable_bytes,
+        fixed_reserved + segment_scratch + sizeof(int64_t),
+        memory_order_release);
     rc = col_op_consolidate_kway_merge(rel, boundaries, 2);
     if (rc != 0 || rel->nrows != 1) {
         test_rel_free(rel);
@@ -1844,8 +1860,7 @@ test_zero_arity_merge_output_is_never_zero_sized(void)
     }
     /* The scratch is transient: it must be given back, or a second
      * consolidation under the same exact budget could not be admitted. */
-    if (wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(ref)) != 0) {
+    if (wl_columnar_memory_reserved(governor) != fixed_reserved) {
         test_rel_free(rel);
         wl_columnar_memory_governor_ref_release(ref);
         FAIL("consolidation scratch was not released back to the governor");
@@ -2146,7 +2161,7 @@ test_timestamp_cons_governor_denial(void)
     GOV_CHECK(denied, "denied governor");
     sess.memory_governor = denied;
     eval_entry_t *entry = &stack.items[stack.top - 1];
-    GOV_CHECK(col_op_consolidate(&stack, &sess) == ENOMEM
+    GOV_CHECK(col_op_consolidate(&stack, &sess) == ENOSPC
         && stack.top == 1 && entry->rel == source && !entry->owned
         && source->nrows == 1 && source->timestamps[0].iteration == 8,
         "denial lost borrowed entry");

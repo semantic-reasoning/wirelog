@@ -983,6 +983,86 @@ col_rel_current_metadata_bytes(const col_rel_t *r, uint64_t *out)
 }
 
 static bool
+col_rel_reservation_covers(const wl_columnar_memory_reservation_t *reservation,
+    wl_columnar_memory_governor_t *governor, uint64_t bytes)
+{
+    return bytes == 0 ? reservation == NULL
+        : reservation && reservation->identity == reservation
+           && reservation->governor == governor
+           && reservation->bytes >= bytes
+           && atomic_load_explicit(&reservation->state,
+               memory_order_acquire)
+           == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED;
+}
+
+bool
+wl_columnar_relation_accounting_complete(const col_rel_t *r,
+    wl_columnar_memory_governor_ref_t *governor)
+{
+    uint64_t descriptor_bytes = 0;
+    uint64_t metadata_bytes = 0;
+    uint64_t retained_bytes = 0;
+    uint64_t named_bytes;
+    wl_columnar_memory_governor_t *raw_governor;
+
+    if (!r)
+        return false;
+    if (!governor)
+        return r->memory_governor == NULL
+               && r->descriptor_reservation == NULL
+               && r->metadata_reservation == NULL
+               && r->retained_reserved_bytes == 0
+               && r->aux_reserved_bytes == 0
+               && atomic_load_explicit(&r->aux_reservation.state,
+                   memory_order_acquire)
+               != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED;
+    if (r->memory_governor != governor
+        || !col_rel_current_metadata_bytes(r, &metadata_bytes)
+        || !col_rel_retained_bytes_for(r, r->capacity, &retained_bytes))
+        return false;
+
+    raw_governor = wl_columnar_memory_governor_ref_get(governor);
+    if (!r->pool_owned) {
+        named_bytes = r->name ? strlen(r->name) + 1u : 0u;
+        if (!wl_columnar_memory_size_add(sizeof(*r), named_bytes,
+            &descriptor_bytes)
+            || !wl_columnar_memory_size_add(descriptor_bytes,
+            sizeof(*r->descriptor_reservation), &descriptor_bytes))
+            return false;
+        if (!col_rel_reservation_covers(r->descriptor_reservation,
+            raw_governor, descriptor_bytes))
+            return false;
+    } else if (r->descriptor_reservation) {
+        return false;
+    }
+
+    if (metadata_bytes > 0
+        && !wl_columnar_memory_size_add(metadata_bytes,
+        sizeof(*r->metadata_reservation), &metadata_bytes))
+        return false;
+    if (!col_rel_reservation_covers(r->metadata_reservation, raw_governor,
+        metadata_bytes))
+        return false;
+
+    bool retained_valid = retained_bytes == 0
+        ? r->retained_reserved_bytes == 0
+        && atomic_load_explicit(&r->retained_reservation.state,
+            memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        : r->retained_reserved_bytes >= retained_bytes
+        && col_rel_reservation_covers(&r->retained_reservation,
+            raw_governor, retained_bytes);
+    bool aux_valid = r->aux_reserved_bytes == 0
+        ? atomic_load_explicit(&r->aux_reservation.state,
+            memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        : col_rel_reservation_covers(&r->aux_reservation, raw_governor,
+            r->aux_reserved_bytes);
+
+    return retained_valid && aux_valid;
+}
+
+static bool
 col_rel_prospective_metadata_bytes(const col_rel_t *r, uint32_t ncols,
     const char *const *names, bool names_owned, bool generated_names,
     bool types,
@@ -1979,17 +2059,17 @@ col_rel_ledger_release(col_rel_t *r)
 
 /* ---- lifecycle ---------------------------------------------------------- */
 
-static void
+static bool
 col_rel_free_contents_impl(col_rel_t *r, bool preserve_access_gates,
     bool preserve_descriptor_admission)
 {
     uint64_t ledger_before;
 
     if (!r)
-        return;
+        return false;
     if (r->storage_owner == r
         && col_rel_storage_alias_borrow_count(r) > 0)
-        return;
+        return false;
     /* Alias bookkeeping is released before the relation is zeroed.  The
      * owner itself is not denied destruction here; #1494 wires this status
      * into the synchronous teardown transaction. */
@@ -2067,16 +2147,41 @@ col_rel_free_contents_impl(col_rel_t *r, bool preserve_access_gates,
     } else {
         memset(r, 0, sizeof(*r));
     }
+    return true;
 }
 
 void
 col_rel_free_contents(col_rel_t *r)
 {
-    /* A governed heap descriptor must retire through checked destruction so
-     * its reservation remains live until after free(descriptor). */
-    if (r && r->descriptor_reservation)
-        abort();
-    col_rel_free_contents_impl(r, false, false);
+    wl_columnar_memory_reservation_t *descriptor_reservation;
+    wl_columnar_memory_governor_ref_t *memory_governor;
+    bool preserve_descriptor_admission;
+    uint64_t relation_identity;
+    uint64_t view_generation;
+    uint64_t storage_generation;
+
+    if (!r)
+        return;
+    /* Clearing contents leaves the descriptor itself alive for caller reuse.
+     * Keep its token and governor reference until checked destruction frees
+     * the descriptor; only the retained and metadata tokens follow contents. */
+    descriptor_reservation = r->descriptor_reservation;
+    memory_governor = r->memory_governor;
+    relation_identity = r->relation_identity;
+    view_generation = r->view_generation;
+    storage_generation = r->storage_generation;
+    preserve_descriptor_admission = descriptor_reservation != NULL;
+    if (!col_rel_free_contents_impl(r, false,
+        preserve_descriptor_admission))
+        return;
+    if (preserve_descriptor_admission) {
+        r->relation_identity = relation_identity;
+        r->view_generation = view_generation;
+        r->storage_generation = storage_generation;
+        col_rel_storage_owner_init(r);
+        r->memory_governor = memory_governor;
+        r->descriptor_reservation = descriptor_reservation;
+    }
 }
 
 /*

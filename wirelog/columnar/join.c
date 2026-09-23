@@ -74,27 +74,15 @@ wl_columnar_join_effective_governor(const wl_col_session_t *sess,
                                                    : NULL);
 }
 
-/* ENOMEM may leave the single original result publishable only when its
- * complete retained footprint was already committed to the effective
- * governor.  An unmanaged source is eligible only in an unmanaged session. */
+/* Allocation and budget denial may leave the single original result
+ * publishable only when every owner class was already committed to the
+ * effective governor.  An unmanaged source is eligible only in an unmanaged
+ * session. */
 static bool
 wl_columnar_join_original_is_accounted(const col_rel_t *source,
     wl_columnar_memory_governor_ref_t *effective)
 {
-    uint64_t needed = 0;
-    if (!source)
-        return false;
-    if (!effective)
-        return source->memory_governor == NULL
-               && source->retained_reserved_bytes == 0;
-    return source->memory_governor == effective
-           && source->retained_reservation.governor
-           == wl_columnar_memory_governor_ref_get(effective)
-           && atomic_load_explicit(&source->retained_reservation.state,
-               memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
-           && col_rel_retained_bytes_for(source, source->capacity, &needed)
-           && source->retained_reserved_bytes >= needed
-           && source->retained_reservation.bytes >= needed;
+    return wl_columnar_relation_accounting_complete(source, effective);
 }
 
 static int

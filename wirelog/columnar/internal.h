@@ -316,7 +316,9 @@ col_columns_copy_row(int64_t **dst_cols, uint32_t dst_row,
  *   When col_rel_deep_copy() creates a transient copy:
  *   - pool_owned and arena_owned are set to false on the destination
  *   - Caller owns the copy and must free it explicitly via
- *     col_rel_destroy() (or col_rel_free_contents() + free(struct))
+ *     col_rel_destroy(); governed heap descriptors must not use
+ *     col_rel_free_contents() + free(struct), because their descriptor
+ *     reservation is released only after the descriptor itself is freed
  *   - delta_pool_reset() and arena reclaim will NOT touch the copy,
  *     since both flags are false
  *   - mem_ledger is also NULL on the copy (Issue #554, R-1)
@@ -2488,6 +2490,11 @@ col_rel_attach_memory_governor(col_rel_t *rel,
 bool
 col_rel_retained_bytes_for(const col_rel_t *r, uint32_t capacity,
     uint64_t *out);
+/* True when every governed owner class on @r (descriptor, metadata and
+ * retained storage) has a committed token covering its current footprint. */
+bool
+wl_columnar_relation_accounting_complete(const col_rel_t *r,
+    wl_columnar_memory_governor_ref_t *governor);
 /* Admit and grow @r to at least @new_cap rows as one transaction; with
  * @new_cap <= capacity it admits the buffers the relation already owns.
  * ENOMEM with *@denied set is a governor verdict, clear is an allocation

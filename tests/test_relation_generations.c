@@ -54,6 +54,19 @@ static int failures;
 static col_rel_t *owned_relations[32];
 static size_t owned_relation_count;
 
+static uint64_t
+relation_fixed_admission_bytes(const col_rel_t *rel)
+{
+    uint64_t bytes = 0;
+    if (!rel)
+        return 0;
+    if (rel->descriptor_reservation)
+        bytes += rel->descriptor_reservation->bytes;
+    if (rel->metadata_reservation)
+        bytes += rel->metadata_reservation->bytes;
+    return bytes;
+}
+
 #ifdef WL_TEST_APPEND_HOOK
 static col_rel_t *append_hook_expected;
 static col_rel_t *append_hook_owner;
@@ -3758,9 +3771,8 @@ test_staged_replacement_contract(void)
         reserved_after = col_rel_transport_bytes(dst);
         CHECK(dst->retained_reserved_bytes == reserved_after
             && wl_columnar_memory_reserved(
-                wl_columnar_memory_governor_ref_get(ref)) == reserved_after
-            + dst->descriptor_reservation->bytes
-            + dst->metadata_reservation->bytes,
+                wl_columnar_memory_governor_ref_get(ref))
+            == reserved_after + relation_fixed_admission_bytes(dst),
             "replacement preserves memory admission accounting");
         cleanup_relations();
         if (ref)
@@ -3847,15 +3859,14 @@ test_staged_replacement_contract(void)
         CHECK(!replacement.writer_acquired && !replacement.reservation_active
             && dst->retained_reserved_bytes == prepared_bytes
             && wl_columnar_memory_reserved(
-                wl_columnar_memory_governor_ref_get(ref)) == prepared_bytes
-            + dst->descriptor_reservation->bytes
-            + dst->metadata_reservation->bytes,
+                wl_columnar_memory_governor_ref_get(ref))
+            == prepared_bytes + relation_fixed_admission_bytes(dst),
             "locked commit transfers reservation and releases writer");
         CHECK(atomic_load_explicit(&dst->source_access.state,
             memory_order_acquire) == 0
             && wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref))
-            == reserved_before + prepared_bytes,
+            == prepared_bytes + relation_fixed_admission_bytes(dst),
             "locked discard after commit is idempotent");
         cleanup_relations();
         CHECK(wl_columnar_memory_reserved(
@@ -4180,8 +4191,8 @@ test_staged_replacement_prepared_window(void)
             } \
         } while (0)
 
-    resolution.budget_bytes = 16384u;
-    resolution.usable_bytes = 16384u;
+    resolution.budget_bytes = UINT64_C(1) << 20;
+    resolution.usable_bytes = resolution.budget_bytes;
     resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
     resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
     resolution.status = WL_COLUMNAR_MEMORY_OK;
@@ -4403,9 +4414,8 @@ test_staged_replacement_prepared_window(void)
         && dst->view_generation == dst_view_before + 1u
         && dst->storage_generation == dst_storage_before + 1u
         && dst->retained_reserved_bytes == planned_bytes
-        && wl_columnar_memory_reserved(governor) == planned_bytes
-        + dst->descriptor_reservation->bytes
-        + dst->metadata_reservation->bytes
+        && wl_columnar_memory_reserved(governor)
+        == planned_bytes + relation_fixed_admission_bytes(dst)
         && replacement.staged == NULL && !replacement.reservation_active
         && !replacement.writer_acquired
         && atomic_load_explicit(&dst->source_access.state,

@@ -2415,6 +2415,19 @@ owner_publication_session_cleanup(wl_col_session_t *session)
     session->rels = NULL;
 }
 
+static uint64_t
+owner_publication_fixed_charge(const col_rel_t *relation)
+{
+    uint64_t bytes = 0;
+    if (!relation)
+        return 0;
+    if (relation->descriptor_reservation)
+        bytes += relation->descriptor_reservation->bytes;
+    if (relation->metadata_reservation)
+        bytes += relation->metadata_reservation->bytes;
+    return bytes;
+}
+
 typedef struct owner_publication_snapshot {
     col_rel_t *relation;
     uint64_t identity;
@@ -2887,10 +2900,8 @@ test_owner_publication_existing_targets(void)
         }
         uint64_t live_charge = low->retained_reserved_bytes
             + high->retained_reserved_bytes;
-        live_charge += low->descriptor_reservation->bytes
-            + low->metadata_reservation->bytes
-            + high->descriptor_reservation->bytes
-            + high->metadata_reservation->bytes;
+        live_charge += owner_publication_fixed_charge(low)
+            + owner_publication_fixed_charge(high);
         OWNER_CHECK(wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref)) == live_charge
             && wl_columnar_eval_owner_publication_discard(&txn) == 0

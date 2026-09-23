@@ -252,8 +252,7 @@ destroy_session(wl_col_session_t *s)
         return;
     wl_workqueue_destroy(s->wq);
     for (uint32_t i = 0; i < s->nrels; i++) {
-        col_rel_free_contents(s->rels[i]);
-        free(s->rels[i]);
+        col_rel_destroy(s->rels[i]);
     }
     free(s->rels);
     for (uint32_t i = 0; i < s->arr_count; i++) {
@@ -1552,7 +1551,7 @@ out:
 static void
 test_parallel_diff_denial(void)
 {
-    wl_col_session_t *sess = NULL;
+    wl_col_session_t *sess = make_session_workers(64ull * 1024 * 1024, 2);
     col_rel_t *right = make_right(1, 2);
     col_rel_t *left = make_left(65, 1);
     wl_plan_op_t op;

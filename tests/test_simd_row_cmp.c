@@ -89,6 +89,8 @@ typedef struct {
      * (memory_governor.h) field for field, with the two wl_atomic_u64
      * members represented as plain uint64_t of identical size/alignment. */
     void *memory_governor;
+    void *descriptor_reservation;
+    void *metadata_reservation;
     uint8_t memory_budget_denial_pending;
     struct {
         void *governor;
@@ -99,6 +101,16 @@ typedef struct {
         const void *identity;
     } retained_reservation;
     uint64_t retained_reserved_bytes;
+    /* Persistent replacement buffers have a separate admission token. */
+    struct {
+        void *governor;
+        uint64_t bytes;
+        uint64_t replacement_bytes;
+        uint64_t owner_bits;
+        uint64_t state;
+        const void *identity;
+    } aux_reservation;
+    uint64_t aux_reserved_bytes;
     /* Issue #1380: bytes charged to TIMESTAMP for timestamps[]. */
     uint64_t ledger_ts_bytes;
     int64_t *row_scratch;
@@ -123,6 +135,7 @@ typedef struct {
     wirelog_compound_kind_t compound_kind;
     uint32_t compound_count;
     uint32_t *compound_arity_map;
+    uint32_t compound_arity_len;
     uint32_t inline_physical_offset;
     uint32_t declared_ncols;
     uint64_t relation_identity;

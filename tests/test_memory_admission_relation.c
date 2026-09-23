@@ -1677,6 +1677,88 @@ test_heap_descriptor_admission(void)
 }
 
 static void
+test_governed_clear_preserves_live_descriptor_charge(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_ref_t *ref;
+    col_rel_t *relation;
+    int64_t value = 37;
+
+    make_resolution(&resolution, UINT64_C(1) << 20);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    relation = ref ? col_rel_new_auto("clear-reuse", 1) : NULL;
+    CHECK(ref && relation, "governed clear fixture");
+    if (!ref || !relation) {
+        if (relation)
+            col_rel_destroy(relation);
+        if (ref)
+            wl_columnar_memory_governor_ref_release(ref);
+        return;
+    }
+    CHECK(col_rel_attach_memory_governor(relation, ref) == 0
+        && col_rel_append_row(relation, &value) == 0
+        && col_rel_reserve_capacity_admitted(relation,
+        relation->capacity + 64, NULL) == 0,
+        "governed clear fixture admission");
+    uint64_t descriptor_bytes = relation->descriptor_reservation
+        ? relation->descriptor_reservation->bytes : 0;
+    uint64_t reserved_with_contents = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+    int64_t *contents = relation->columns[0];
+    CHECK(relation->retained_reserved_bytes > 0
+        && reserved_with_contents > descriptor_bytes,
+        "governed clear fixture has retained storage charge");
+    CHECK(col_rel_storage_alias_borrow_acquire(relation) == 0,
+        "governed clear fixture alias borrow");
+    col_rel_free_contents(relation);
+    CHECK(relation->columns[0] == contents && relation->nrows == 1
+        && col_rel_storage_alias_borrow_count(relation) == 1
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == reserved_with_contents,
+        "clear with live alias leaves contents and accounting untouched");
+    CHECK(col_rel_storage_alias_borrow_release(relation) == 0,
+        "governed clear fixture alias retirement");
+    col_rel_free_contents(relation);
+    CHECK(relation->memory_governor == ref
+        && relation->descriptor_reservation != NULL
+        && relation->metadata_reservation == NULL
+        && relation->retained_reserved_bytes == 0
+        && relation->nrows == 0 && relation->storage_owner == relation
+        && wl_columnar_relation_accounting_complete(relation, ref)
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == descriptor_bytes,
+        "clear keeps live descriptor charge and resets owned contents");
+    CHECK(col_rel_destroy_checked(relation) == 0
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0,
+        "checked destroy releases cleared descriptor after free");
+    wl_columnar_memory_governor_ref_release(ref);
+}
+
+static void
+test_relation_accounting_aux_reservation(void)
+{
+    col_rel_t *relation;
+    const uint64_t aux_bytes = 64;
+    relation = col_rel_new_auto("unaccounted-aux", 1);
+    CHECK(relation, "ungoverned aux accounting fixture");
+    if (relation) {
+        CHECK(wl_columnar_relation_accounting_complete(relation, NULL),
+            "ungoverned accounting accepts empty aux state");
+        atomic_store_explicit(&relation->aux_reservation.state,
+            WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED, memory_order_release);
+        CHECK(!wl_columnar_relation_accounting_complete(relation, NULL),
+            "ungoverned accounting rejects stale committed aux token");
+        atomic_store_explicit(&relation->aux_reservation.state,
+            WL_COLUMNAR_MEMORY_RESERVATION_EMPTY, memory_order_release);
+        relation->aux_reserved_bytes = aux_bytes;
+        CHECK(!wl_columnar_relation_accounting_complete(relation, NULL),
+            "ungoverned accounting rejects aux charge");
+    }
+    col_rel_destroy(relation);
+}
+
+static void
 test_schema_metadata_adoption_and_replacement(void)
 {
     const char *name = "metadata-adopt";
@@ -2576,6 +2658,25 @@ test_replacement_aux_admission(void)
             == dst->descriptor_reservation->bytes + metadata_bytes
             + data_bytes + aux_bytes,
             "replacement aux commit transfers exact credit and buffers");
+        CHECK(wl_columnar_relation_accounting_complete(dst, ref),
+            "owner accounting accepts committed aux token");
+        dst->aux_reserved_bytes = 0;
+        CHECK(!wl_columnar_relation_accounting_complete(dst, ref),
+            "owner accounting rejects stale committed aux token");
+        dst->aux_reserved_bytes = aux_bytes + 1;
+        CHECK(!wl_columnar_relation_accounting_complete(dst, ref),
+            "owner accounting rejects undercharged aux token");
+        dst->aux_reserved_bytes = aux_bytes;
+        wl_columnar_memory_governor_t *aux_governor
+            = dst->aux_reservation.governor;
+        dst->aux_reservation.governor = NULL;
+        CHECK(!wl_columnar_relation_accounting_complete(dst, ref),
+            "owner accounting rejects aux token bound to another governor");
+        dst->aux_reservation.governor = aux_governor;
+        dst->aux_reservation.bytes = aux_bytes - 1;
+        CHECK(!wl_columnar_relation_accounting_complete(dst, ref),
+            "owner accounting rejects undersized aux token");
+        dst->aux_reservation.bytes = aux_bytes;
         before = wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(ref));
         atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
@@ -2608,6 +2709,8 @@ int
 main(void)
 {
     test_heap_descriptor_admission();
+    test_governed_clear_preserves_live_descriptor_charge();
+    test_relation_accounting_aux_reservation();
     test_schema_metadata_adoption_and_replacement();
     test_schema_metadata_first_allocation();
     test_nested_arrow_metadata_adoption();

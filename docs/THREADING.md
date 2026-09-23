@@ -293,11 +293,10 @@ The identity allocator uses the same default ordering because the CAS loop
 must reserve each relation identity without reuse; the test-only store is
 only used to exercise allocator exhaustion.
 
-### 5.4 `wirelog/columnar/join.c` — keyed-join cancel/budget and typed output (20 rows)
+### 5.4 `wirelog/columnar/join.c` — keyed-join cancel/budget and typed output (19 rows)
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `join.c:wl_columnar_join_original_is_accounted` | `source->retained_reservation.state` | `atomic_load_explicit` | `acquire` | Observe the committed reservation before accepting the existing relation as an accounted single-owner fallback; pairs with the governor's release publication |
 | `join.c:col_join_output_limit_reached` | `sess->join_output_shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Tuple-budget accumulator across keyed-join workers; counter only |
 | `join.c:col_join_keyed_count_worker_fn` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll; eventual visibility is acceptable for cooperative cancel |
 | `join.c:col_join_keyed_count_worker_fn#2` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll |
@@ -573,7 +572,7 @@ gate -- which reports EINVAL after a commit that in fact succeeded.
 | `relation.c:col_rel_commit_replacement_locked#5` | `dst->descriptor_access.state` | `atomic_store_explicit` | release | Republish the captured peer-reader gate so a descriptor reader taken before the swap is still counted when the writer lease is released |
 
 ### 5.16 `wirelog/columnar/memory_governor.c` and `relation.c` — atomic
-replacement admission and compaction (20 rows)
+replacement admission and compaction (24 rows)
 
 Replacement admission temporarily accounts for the new footprint while the
 old reservation remains committed. The overlap CAS is the admission
@@ -599,6 +598,10 @@ the replacement transaction never releases an uncommitted token.
 | `relation.c:col_rel_compact_many` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Validate each retained reservation before compacting a relation |
 | `relation.c:col_rel_compact_many#2` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Revalidate the reservation before the second compaction path |
 | `relation.c:col_rel_prepare_replacement_impl` | `dst->aux_reservation.state` | `atomic_load_explicit` | acquire | Verify that the destination's auxiliary allocation token is committed before staging replacement and transferring its ownership |
+| `relation.c:col_rel_reservation_covers` | `reservation->state` | `atomic_load_explicit` | acquire | Verify that the owner-class reservation is committed before treating its bytes as admitted |
+| `relation.c:wl_columnar_relation_accounting_complete` | `r->aux_reservation.state` | `atomic_load_explicit` | acquire | Reject an ungoverned owner that still carries a committed auxiliary reservation |
+| `relation.c:wl_columnar_relation_accounting_complete#2` | `r->retained_reservation.state` | `atomic_load_explicit` | acquire | Accept an empty retained footprint only when no stale committed token remains |
+| `relation.c:wl_columnar_relation_accounting_complete#3` | `r->aux_reservation.state` | `atomic_load_explicit` | acquire | Accept an empty auxiliary footprint only when no stale committed token remains |
 | `relation.c:col_rel_reservation_rollback` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Read the reservation state before deciding whether rollback still owns an admitted token |
 | `relation.c:wl_columnar_relation_retirement_reservation_valid` | `retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Confirm the retained reservation is still owned by this relation before retirement |
 | `relation.c:wl_columnar_relation_retirement_reservation_valid#2` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Read the token state before validating committed or replacing reservation ownership |
