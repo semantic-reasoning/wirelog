@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <xxhash.h>
 
 #ifdef WL_TEST_ALLOC_WRAP
 void *__real_malloc(size_t size);
@@ -92,6 +93,40 @@ static int tests_failed = 0;
             tests_failed++;                   \
             printf(" ... FAIL: %s\n", (msg)); \
         } while (0)
+
+static int
+test_wide_dedup_hash_without_allocation(void)
+{
+    int64_t values[32];
+    int64_t *columns[32];
+    col_rel_t rel = { 0 };
+
+    rel.columns = columns;
+    for (uint32_t c = 0; c < 32; c++) {
+        values[c] = (int64_t)c * 127 - 9;
+        columns[c] = &values[c];
+    }
+    for (uint32_t width = 9; width <= 32; width += 23) {
+        rel.ncols = width;
+        uint64_t expected = XXH3_64bits(values,
+                (size_t)width * sizeof(values[0]));
+        if (expected == 0)
+            expected = 1;
+#ifdef WL_TEST_ALLOC_WRAP
+        allocation_calls = 0;
+        allocation_fail_at = 0;
+#endif
+        uint64_t actual = wl_columnar_eval_dedup_row_hash(&rel, 0);
+#ifdef WL_TEST_ALLOC_WRAP
+        allocation_fail_at = -1;
+        if (allocation_calls != 0)
+            return -1;
+#endif
+        if (actual != expected)
+            return -1;
+    }
+    return 0;
+}
 
 /* ======================================================================== */
 /* Helpers                                                                  */
@@ -4596,6 +4631,11 @@ main(void)
     }
     printf("TDD Recursive Distributed Evaluator Tests\n");
     printf("==========================================\n");
+    TEST("wide dedup hash matches contiguous XXH3 without allocation");
+    if (test_wide_dedup_hash_without_allocation() == 0)
+        PASS();
+    else
+        FAIL("wide dedup hash parity/allocation");
 
 #ifdef WL_TEST_BDX_SEED
 #ifdef WL_TEST_ALLOC_WRAP
