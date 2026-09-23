@@ -1099,6 +1099,207 @@ out:
     fixture_fini(&f);
 }
 
+/* (#1481) Lazy scratch sizing.  Two things need proving and they are
+ * separate: that a small join under a huge knob no longer reserves the knob,
+ * and that a join which DOES cross the 64-row floor still produces the right
+ * rows after the scratch is reallocated underneath it.
+ *
+ * The second is the one with no prior coverage.  Every other oracle
+ * comparison in this file runs at 1..16 rows per batch, all below the floor,
+ * so none of them ever grows.  A grow that forgets to publish nrows first
+ * copies zero rows into the new columns and leaves the written rows pointing
+ * at uninitialised malloc memory -- a silently wrong join that ASan and UBSan
+ * both pass.  Only comparing content across a grow catches it. */
+static void
+test_lazy_scratch_growth(void)
+{
+    static const uint32_t knobs[] = { 200u, 512u, 1000u, 4096u };
+    fixture_t f;
+    const int64_t keys[] = { 1, 2, 3 };
+    const int64_t k0[] = { 0 };
+    wl_columnar_continuation_t *cont = NULL;
+    col_rel_t *oracle;
+    uint32_t cap0;
+    uint32_t capN;
+    int rc;
+    size_t i;
+
+    for (i = 0; i < sizeof(knobs) / sizeof(knobs[0]); i++) {
+        TEST("a join crossing the 64-row floor matches the one-shot oracle");
+        /* 3 left rows x 5 keys x 47 fanout: enough matches to cross the
+         * floor several times at every knob below. */
+        if (!fixture_init(&f, 1u << 24, keys, 3, 5, 47)) {
+            FAIL("fixture");
+            fixture_fini(&f);
+            continue;
+        }
+        rc = col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+                KEY0, KEY0, 1, (uint64_t)knobs[i] * 32u, &cont);
+        if (rc != 0 || col_join_batch_rows_per_batch(cont) != knobs[i]) {
+            FAIL("producer create or rows_per_batch");
+            if (cont)
+                wl_columnar_continuation_destroy(cont);
+            fixture_fini(&f);
+            continue;
+        }
+        cap0 = col_join_batch_scratch_capacity(cont);
+        rc = col_join_batch_run_to_relation(cont, f.sess, f.out);
+        capN = col_join_batch_scratch_capacity(cont);
+        oracle = run_oracle(f.sess, f.left, &f.op);
+        if (rc != 0 || !oracle || !same_rows(oracle, f.out)) {
+            FAIL("result differs from the one-shot oracle across a grow");
+        } else if (cap0 != COL_REL_INIT_CAP || capN <= cap0) {
+            /* If the scratch never grew, the oracle comparison above proves
+             * nothing about growth and this case is worthless. */
+            FAIL("the scratch did not start at the floor and grow past it");
+        } else {
+            PASS();
+        }
+        if (oracle)
+            col_rel_destroy(oracle);
+        wl_columnar_continuation_destroy(cont);
+        fixture_fini(&f);
+    }
+
+    /* A grow that FAILS must still produce every row.  Without this the
+     * park choice is dead code: growth succeeds in every case above, so
+     * nothing exercises the short-batch path at all -- a mutant that parks
+     * on the NEXT candidate instead of the unwritten one survives the whole
+     * file.  The one-shot resize hook fails exactly one grow, so the
+     * producer emits one short batch, parks, and resumes; if it parked past
+     * the candidate it was about to write, that row is silently lost and
+     * the oracle comparison is what notices.
+     *
+     * This is also the case the resize hook's other user (see the comment at
+     * test_sink_prepare_resize_failure) must not be confused with: there the
+     * hook is meant for the SINK, and it only reaches the sink because that
+     * batch is 16 rows and the scratch never resizes. */
+    TEST("a denied scratch grow emits a short batch without losing a row");
+    if (!fixture_init(&f, 1u << 24, keys, 3, 5, 47)) {
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    rc = col_join_batch_producer_create(f.sess, &f.op, f.left, false, KEY0,
+            KEY0, 1, 512u * 32u, &cont);
+    if (rc != 0) {
+        FAIL("producer create");
+        fixture_fini(&f);
+        return;
+    }
+    wl_columnar_relation_test_fail_next_prepare_resize();
+    rc = col_join_batch_run_to_relation(cont, f.sess, f.out);
+    /* The hook is one-shot and global.  This run consumes it -- the capN
+     * assertion below proves the producer's grow took it -- but clear it
+     * unconditionally so an edit that stops consuming it cannot leak a
+     * refusal into the exact-fit case that follows. */
+    wl_columnar_relation_test_clear_prepare_resize();
+    capN = col_join_batch_scratch_capacity(cont);
+    oracle = run_oracle(f.sess, f.left, &f.op);
+    if (rc != 0 || !oracle || !same_rows(oracle, f.out)) {
+        FAIL("a failed grow lost or duplicated a row");
+    } else if (f.out->nrows != 3u * 47u) {
+        FAIL("wrong row count after a failed grow");
+    } else if (capN != COL_REL_INIT_CAP * 2u) {
+        /* The first grow was refused, so the scratch stayed at the floor
+         * for that batch; the next batch retried and succeeded once. */
+        FAIL("the scratch did not retry the grow on the following batch");
+    } else {
+        PASS();
+    }
+    if (oracle)
+        col_rel_destroy(oracle);
+    wl_columnar_continuation_destroy(cont);
+    fixture_fini(&f);
+
+    /* The issue's own acceptance criterion, in its own numbers.  k0 rather
+     * than keys: make_right generates keys 0..right_keys-1, so a left key of
+     * 1 against one right key joins nothing -- and same_rows(empty, empty) is
+     * true, so without the nrows check below this case would pass while
+     * testing nothing at all.
+     *
+     * The criterion is measured DIFFERENTIALLY: the same fixture is created
+     * twice, once under a knob that fits in the 64-row floor and once under
+     * the issue's 1 GiB knob, and the two governor deltas must be equal.
+     * Everything else create reserves -- the arrangement lease, the producer
+     * descriptor -- is identical across the pair, so it cancels without the
+     * test having to know what those things are or what they cost.  An
+     * earlier form subtracted the arrangement's bytes by name and broke the
+     * first time create grew a third reservation; this cannot.
+     *
+     * Restoring the eager reservation is caught here, but by the create
+     * guard rather than by the delta: 1 GiB exceeds the fixture's budget, so
+     * create is denied and returns non-zero first.  The delta comparison is
+     * what catches a knob-dependent reservation small enough to be admitted,
+     * which is the class it exists for. */
+    TEST("a 10-row join under a 1 GiB knob reserves the floor, not the knob");
+    {
+        uint64_t small_delta = 0;
+        uint64_t huge_delta = 0;
+        int k;
+
+        for (k = 0; k < 2; k++) {
+            uint64_t knob = k ? 1073741824ull : 32ull * 8ull;
+            uint64_t before;
+            uint64_t after;
+
+            if (!fixture_init(&f, 1u << 24, k0, 1, 1, 10)) {
+                FAIL("fixture");
+                fixture_fini(&f);
+                return;
+            }
+            before = reserved_of(f.sess);
+            rc = col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+                    KEY0, KEY0, 1, knob, &cont);
+            after = reserved_of(f.sess);
+            if (rc != 0) {
+                FAIL("producer create");
+                fixture_fini(&f);
+                return;
+            }
+            if (k && col_join_batch_rows_per_batch(cont) != 1073741824u / 32u) {
+                /* Without this the pair would agree just as well under two
+                 * small knobs, and would not be testing the criterion. */
+                FAIL("create did not settle on the knob's rows_per_batch");
+                wl_columnar_continuation_destroy(cont);
+                fixture_fini(&f);
+                return;
+            }
+            if (k)
+                huge_delta = after - before;
+            else
+                small_delta = after - before;
+            if (k) {
+                rc = col_join_batch_run_to_relation(cont, f.sess, f.out);
+                capN = col_join_batch_scratch_capacity(cont);
+                oracle = run_oracle(f.sess, f.left, &f.op);
+            }
+            wl_columnar_continuation_destroy(cont);
+            cont = NULL;
+            if (!k)
+                fixture_fini(&f);
+        }
+        if (rc != 0 || !oracle || !same_rows(oracle, f.out)
+            || f.out->nrows != 10u) {
+            FAIL("result differs from the one-shot oracle");
+        } else if (huge_delta != small_delta) {
+            FAIL("the 1 GiB knob reserved more at create than a tiny knob");
+        } else if (capN > 2u * f.out->nrows + COL_REL_INIT_CAP) {
+            /* One reading after the run is the PEAK, not just the final
+             * value: col_rel_reserve_capacity_admitted never shrinks
+             * capacity.  Sampling mid-run would be no stronger and would
+             * couple the case to the batch schedule. */
+            FAIL("scratch exceeded twice the output plus the floor");
+        } else {
+            PASS();
+        }
+        if (oracle)
+            col_rel_destroy(oracle);
+        fixture_fini(&f);
+    }
+
+}
+
 /* (6) Exact-fit admission: the budget that exactly covers the first batch
  * growth admits it; one byte less is denied by the governor with every
  * observable value unchanged. */
@@ -1151,7 +1352,15 @@ test_exact_fit_and_one_byte_over(void)
          * budget must hold r0 plus the whole new footprint.  A governor's
          * budget is fixed at creation, so rebuild the fixture under the
          * computed budget; every value above is deterministic. */
-        budget = r0 + after - (uint64_t)deny;
+        /* TWO admissions since #1481, not one, and they serialise.  The
+         * producer's scratch is no longer sized at create: it starts at the
+         * 64-row floor and must itself grow 64 -> 100 inside this publish,
+         * before the sink reserves.  The scratch peaks at r0 + after and
+         * settles at r0 + after - before; the sink then peaks on top of
+         * that.  So the exact fit is one `after` higher than it was, and one
+         * byte below it denies the SINK -- the scratch grow has already been
+         * admitted by then. */
+        budget = r0 + 2u * after - before - (uint64_t)deny;
         wl_columnar_continuation_destroy(cont);
         fixture_fini(&f);
         if (!fixture_init(&f, budget, keys, 1, 1, 300)
@@ -1174,7 +1383,12 @@ test_exact_fit_and_one_byte_over(void)
             ok = ok && st == WL_COLUMNAR_CONTINUATION_RESERVATION_DENIED
                 && f.out->nrows == 0u && cur.sequence == 0u
                 && cur.next.lr == 0u && cur.next.rr == UINT32_MAX
-                && reserved_of(f.sess) == r0
+                /* The scratch grow landed before the sink was refused, so
+                 * a denied publish no longer leaves the session counter
+                 * exactly as it found it.  Everything the CALLER can see --
+                 * rows, cursor, output reservation, pin -- is unchanged; the
+                 * narrowing is to the governor total alone. */
+                && reserved_of(f.sess) == r0 + after - before
                 && f.out->retained_reserved_bytes == before
                 && entry && entry->pin_count == pins_before;
         } else {
@@ -1183,7 +1397,8 @@ test_exact_fit_and_one_byte_over(void)
                 && f.out->nrows == 100u && cur.sequence == 1u
                 && col_rel_retained_bytes_for(f.out, f.out->capacity, &now)
                 && now == f.out->retained_reserved_bytes
-                && reserved_of(f.sess) == r0 + after - before;
+                /* Both grows settled: the scratch's and the sink's. */
+                && reserved_of(f.sess) == r0 + 2u * (after - before);
         }
         if (!ok)
             FAIL(deny ?
@@ -2618,6 +2833,7 @@ main(void)
     test_stale_inputs_are_rejected();
     test_true_cross_key_collision_resumes();
     test_suspended_producer_survives_eviction();
+    test_lazy_scratch_growth();
     test_exact_fit_and_one_byte_over();
     test_lease_released_on_every_path();
     test_descriptor_reservation_shape();

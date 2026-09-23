@@ -1139,10 +1139,17 @@ of batches on the eval stack (JOIN -> FILTER* -> MAP) remains #1475.
 
 Ownership and admission:
 
-- The producer holds one arrangement lease for its whole lifetime and
-  one governed scratch relation of `rows_per_batch = N / row_bytes` rows
-  (at least the 64 rows a fresh relation pre-allocates), admitted once at
-  create; `N` smaller than one output row, or a zero-width output, is a
+- The producer holds one arrangement lease for its whole lifetime, one
+  governed descriptor allocation (the producer struct itself plus the key
+  row and the key-index arrays, admitted at create), and one governed
+  scratch relation.  Since #1481 that relation is sized
+  LAZILY: create admits only the 64 rows a fresh relation pre-allocates,
+  and the fill loop doubles it on demand under admission, clamped to
+  `rows_per_batch = N / row_bytes`.  A small join under a large `N`
+  therefore reserves what it uses rather than what the knob allows, and
+  an `N` below 64 output rows still gets the 64-row floor -- the floor
+  wins, as it did before, and the clamp never sizes below it.  `N`
+  smaller than one output row, or a zero-width output, is a
   recorded fallback (`row-too-large`).
 - The output relation is heap allocated (never from the delta pool, whose
   reset frees nothing) and attached to the session governor.  Its retained
@@ -1158,12 +1165,42 @@ Ownership and admission:
   capacity admitted for it is retained, as after a failed bulk append.
   Any mutation of either input or a rebuild of the arrangement between
   batches is reported as stale rather than resumed.
-- Per-producer bound: scratch (`rows_per_batch * row_bytes` plus the key
-  row) plus the sink's growth increment for the next batch, transiently
-  up to twice `rows_per_batch * row_bytes` during the exact-fit resize.
+- Per-producer bound, unchanged as the WORST case: the descriptor
+  allocation (`sizeof(col_join_batch_producer_t)` plus the key row and the
+  key-index arrays -- note that this makes the struct's size a governed
+  quantity, so a field added to it is not free) plus scratch
+  (`rows_per_batch * row_bytes`) plus the sink's growth
+  increment for the next batch, transiently up to twice
+  `rows_per_batch * row_bytes` during the exact-fit resize.  Since #1481
+  the scratch reaches that bound only if the join's fanout demands it, but
+  it carries the same 2x transient when it does: every step holds the old
+  buffers while reserving the new, so the peak is
+  `(old + new) * row_bytes`.  BUDGET AGAINST 2x.  A clean doubling is
+  1.5x, but the final clamped step can approach 2x -- measured 1.8x at
+  `rows_per_batch = 80`, 1.64x at 100, 1.985x at 65 -- and which step
+  lands last depends on where `rows_per_batch` falls relative to the
+  doubling sequence, so the ratio is not predictable from the knob alone.
   The full join result is still materialized into the output relation:
   this unit bounds producer memory and admits output growth, it does not
   bound the output itself.
+- A grow the governor refuses is answered with a SHORT BATCH, not a failed
+  produce: the producer parks on the candidate it was about to write and
+  emits what it has, so a tight budget costs batch boundaries rather than
+  progress.  A short batch always carries at least the 64-row floor, so it
+  can never be mistaken for the `rows == 0 && complete` terminal shape.
+  Lazy sizing is therefore more tolerant in COMPLETION than the eager
+  reservation it replaced -- a budget that made create fail outright can
+  now finish in short batches -- but not in PEAK reservation, which the
+  2x transient above can push higher than eager's single create charge.
+  The binding constraint remains the output relation's growth.
+- One narrowing came with it: a publish that returns
+  `RESERVATION_DENIED` may now leave the session's reserved total higher
+  than it found it, because the producer's scratch transaction is separate
+  from and earlier than the sink's.  Everything the caller can observe --
+  rows, cursor, output reservation, arrangement pin -- is still unchanged.
+  It follows this file's existing rule that a failed operation keeps the
+  capacity it was admitted (see `sink_abort` in `join_batch.c`), so the
+  retry costs no new reservation.
 - The legacy row cap `WIRELOG_JOIN_OUTPUT_LIMIT` stays distinct and is
   checked once per committed batch, so it may be overshot by at most
   `rows_per_batch - 1` rows in bounded mode.  The ledger backpressure
@@ -1171,15 +1208,18 @@ Ownership and admission:
   admission is the bound.
 
 Differential keyed joins use `wirelog/columnar/diff_join_batch.c` when bounded
-mode is enabled for a normal keyed join.  The right relation is incrementally
-indexed in a differential transaction before the continuation starts; that
-cache transaction is committed before a differential generation/source pin is
-held for the continuation.  Each batch preserves the signed timestamp
-multiplicity product (`left * right`).  Stale input, generation changes,
-overflow, cancellation, or failed admission discard the output relation and
-release the differential pin exactly once.  Materialized/cache joins and
-delta-right, filtered, cross, worker, and other unsupported shapes remain on
-their existing one-shot paths until their publication contracts are bounded.
+mode is enabled for a normal keyed join.  Its scratch is still sized EAGERLY
+at `rows_per_batch`; #1481's lazy growth covers the non-differential producer
+only, so a small differential join under a large `N` still reserves the knob.
+The right relation is incrementally indexed in a differential transaction
+before the continuation starts; that cache transaction is committed before a
+differential generation/source pin is held for the continuation.  Each batch
+preserves the signed timestamp multiplicity product (`left * right`).  Stale
+input, generation changes, overflow, cancellation, or failed admission discard
+the output relation and release the differential pin exactly once.
+Materialized/cache joins and delta-right, filtered, cross, worker, and other
+unsupported shapes remain on their existing one-shot paths until their
+publication contracts are bounded.
 
 ## 10b. Plain STEP completion recovery (#1713)
 
