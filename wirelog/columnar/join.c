@@ -1409,6 +1409,9 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         uint32_t nbuckets_ep = 0;
         uint32_t *ht_head_ep = NULL;
         uint32_t *ht_next_ep = NULL;
+        wl_columnar_memory_reservation_t hash_reservation;
+        bool hash_admitted = false;
+        wl_columnar_memory_reservation_init(&hash_reservation);
 
         col_arrangement_probe_bundle_init(&arr_bundle);
 
@@ -1502,6 +1505,54 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     col_rel_destroy(right_filtered);
                 return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
             }
+            if (sess->memory_governor && kc > 0) {
+                uint64_t head_bytes = 0;
+                uint64_t next_bytes = 0;
+                uint64_t hash_bytes = 0;
+                wl_columnar_memory_admission_status_t status;
+                bool sized = wl_columnar_memory_size_mul(nbuckets_ep,
+                        sizeof(uint32_t), &head_bytes)
+                    && wl_columnar_memory_size_mul(
+                    right->nrows > 0 ? right->nrows : 1,
+                    sizeof(uint32_t), &next_bytes)
+                    && wl_columnar_memory_size_add(head_bytes, next_bytes,
+                        &hash_bytes);
+                if (!sized) {
+                    (void)col_arrangement_probe_bundle_release(&arr_bundle);
+                    free(tmp);
+                    col_rel_destroy(out);
+                    free(lk);
+                    free(rk);
+                    if (right_filtered)
+                        col_rel_destroy(right_filtered);
+                    return wl_columnar_join_dispose_left(stack, &left_e,
+                               EOVERFLOW);
+                }
+                status = wl_columnar_memory_reserve_checked(
+                    wl_columnar_memory_governor_ref_get(
+                        sess->memory_governor),
+                    hash_bytes, &hash_reservation);
+                if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+                    && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+                    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                        sess->memory_budget_denied = true;
+                    (void)col_arrangement_probe_bundle_release(&arr_bundle);
+                    free(tmp);
+                    col_rel_destroy(out);
+                    free(lk);
+                    free(rk);
+                    if (right_filtered)
+                        col_rel_destroy(right_filtered);
+                    return wl_columnar_join_dispose_left(stack, &left_e,
+                               status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                                   ? ENOSPC
+                                   : status
+                               == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                                   ? EOVERFLOW
+                                   : ENOMEM);
+                }
+                hash_admitted = true;
+            }
             ht_head_ep = (uint32_t *)calloc(nbuckets_ep, sizeof(uint32_t));
             ht_next_ep = (uint32_t *)malloc(
                 (right->nrows > 0 ? right->nrows : 1) * sizeof(uint32_t));
@@ -1512,6 +1563,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     nbuckets_ep);
                 free(ht_head_ep);
                 free(ht_next_ep);
+                if (hash_admitted)
+                    (void)wl_columnar_memory_rollback(&hash_reservation);
                 (void)col_arrangement_probe_bundle_release(&arr_bundle);
                 free(tmp);
                 col_rel_destroy(out);
@@ -1548,6 +1601,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 col_arrangement_pin_release(&arr_pin);
                 free(ht_head_ep);
                 free(ht_next_ep);
+                if (hash_admitted)
+                    (void)wl_columnar_memory_rollback(&hash_reservation);
                 free(tmp);
                 col_rel_destroy(out);
                 free(lk);
@@ -1679,6 +1734,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         free(key_row);
         free(ht_head_ep);
         free(ht_next_ep);
+        if (hash_admitted)
+            (void)wl_columnar_memory_rollback(&hash_reservation);
         if (join_rc != 0) {
             int release_rc = 0;
             WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
