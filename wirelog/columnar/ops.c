@@ -67,6 +67,18 @@
 
 /* Cross-module function declarations are in columnar/internal.h */
 
+typedef struct {
+    wl_columnar_memory_reservation_t reservation;
+    bool active;
+} wl_ops_scratch_t;
+
+static int
+wl_ops_scratch_reserve(wl_ops_scratch_t *scratch,
+    wl_columnar_memory_governor_ref_t *governor, uint64_t bytes,
+    wl_col_session_t *sess);
+static void
+wl_ops_scratch_release(wl_ops_scratch_t *scratch);
+
 /* --- VARIABLE ------------------------------------------------------------ */
 
 int
@@ -202,6 +214,32 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
 #endif
 
     uint32_t pc = op->project_count;
+    uint64_t map_scratch_bytes = 0;
+    uint64_t map_bytes = 0;
+    bool map_sized = wl_columnar_memory_size_mul(pc, sizeof(int64_t),
+            &map_bytes)
+        && wl_columnar_memory_size_add(map_scratch_bytes, map_bytes,
+            &map_scratch_bytes);
+    if (op->map_exprs && op->map_expr_count > 0)
+        map_sized = map_sized
+            && wl_columnar_memory_size_mul(pc,
+                sizeof(wl_columnar_expr_compiled_t *), &map_bytes)
+            && wl_columnar_memory_size_add(map_scratch_bytes, map_bytes,
+                &map_scratch_bytes);
+    if (e.rel->ncols > COL_STACK_MAX)
+        map_sized = map_sized
+            && wl_columnar_memory_size_mul(e.rel->ncols, sizeof(int64_t),
+                &map_bytes)
+            && wl_columnar_memory_size_add(map_scratch_bytes, map_bytes,
+                &map_scratch_bytes);
+    if (!map_sized)
+        return wl_columnar_ops_dispose_entry(stack, &e, EOVERFLOW);
+    wl_ops_scratch_t map_scratch;
+    int map_scratch_rc = wl_ops_scratch_reserve(&map_scratch,
+            sess ? sess->memory_governor : NULL, map_scratch_bytes, sess);
+    if (map_scratch_rc != 0)
+        return wl_columnar_ops_dispose_entry(stack, &e, map_scratch_rc);
+#define WL_MAP_RELEASE_SCRATCH() wl_ops_scratch_release(&map_scratch)
     col_rel_t *out = NULL;
 #ifdef WL_SESSION_TEST_HOOKS
     if (!wl_columnar_ops_test_map_fail_output_alloc)
@@ -209,10 +247,13 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     out = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
             "$map", pc);
     if (!out)
+        WL_MAP_RELEASE_SCRATCH();
+    if (!out)
         return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
 
     int64_t *tmp = (int64_t *)malloc(sizeof(int64_t) * pc);
     if (!tmp) {
+        WL_MAP_RELEASE_SCRATCH();
         col_rel_destroy(out);
         return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
     }
@@ -223,24 +264,29 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     if (op->map_exprs && op->map_expr_count > 0) {
         ce_map = (wl_columnar_expr_compiled_t **)calloc(pc,
                 sizeof(wl_columnar_expr_compiled_t *));
-        if (ce_map) {
-            ce_map_count = (op->map_expr_count < pc) ? op->map_expr_count : pc;
-            for (uint32_t c = 0; c < ce_map_count; c++) {
-                if (op->map_exprs[c].data && op->map_exprs[c].size > 0) {
-                    int expr_rc = ENOTSUP;
-                    ce_map[c] = wl_columnar_expr_compile_governed(
-                        op->map_exprs[c].data, op->map_exprs[c].size,
-                        sess ? sess->intern : NULL,
-                        sess ? sess->memory_governor : NULL, sess, &expr_rc);
-                    if (expr_rc != ENOTSUP && expr_rc != 0) {
-                        for (uint32_t j = 0; j < c; j++)
-                            wl_columnar_expr_compiled_free(ce_map[j]);
-                        free((void *)ce_map);
-                        free(tmp);
-                        col_rel_destroy(out);
-                        return wl_columnar_ops_dispose_entry(stack, &e,
-                                   expr_rc);
-                    }
+        if (!ce_map && pc > 0) {
+            free(tmp);
+            col_rel_destroy(out);
+            WL_MAP_RELEASE_SCRATCH();
+            return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
+        }
+        ce_map_count = (op->map_expr_count < pc) ? op->map_expr_count : pc;
+        for (uint32_t c = 0; c < ce_map_count; c++) {
+            if (op->map_exprs[c].data && op->map_exprs[c].size > 0) {
+                int expr_rc = ENOTSUP;
+                ce_map[c] = wl_columnar_expr_compile_governed(
+                    op->map_exprs[c].data, op->map_exprs[c].size,
+                    sess ? sess->intern : NULL,
+                    sess ? sess->memory_governor : NULL, sess, &expr_rc);
+                if (expr_rc != ENOTSUP && expr_rc != 0) {
+                    for (uint32_t j = 0; j < c; j++)
+                        wl_columnar_expr_compiled_free(ce_map[j]);
+                    free((void *)ce_map);
+                    free(tmp);
+                    col_rel_destroy(out);
+                    WL_MAP_RELEASE_SCRATCH();
+                    return wl_columnar_ops_dispose_entry(stack, &e,
+                               expr_rc);
                 }
             }
         }
@@ -257,6 +303,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         }
         free(tmp);
         col_rel_destroy(out);
+        WL_MAP_RELEASE_SCRATCH();
         return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
     }
 
@@ -288,6 +335,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                         col_row_buf_release(&row_rb);
                         free(tmp);
                         col_rel_destroy(out);
+                        WL_MAP_RELEASE_SCRATCH();
                         return wl_columnar_ops_dispose_entry(stack, &e,
                                    ERANGE);
                     }
@@ -316,9 +364,12 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                          * memory error (Issue #1470); the partial output
                          * was destroyed above. */
                         if (expr_status
-                            == WL_COLUMNAR_EXPR_ALLOCATION_FAILURE)
+                            == WL_COLUMNAR_EXPR_ALLOCATION_FAILURE) {
+                            WL_MAP_RELEASE_SCRATCH();
                             return wl_columnar_ops_dispose_entry(stack, &e,
                                        ENOMEM);
+                        }
+                        WL_MAP_RELEASE_SCRATCH();
                         return wl_columnar_ops_dispose_entry(stack, &e,
                                    expr_status >=
                                    WL_COLUMNAR_EXPR_EXTENSION_MALFORMED
@@ -341,6 +392,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             col_row_buf_release(&row_rb);
             free(tmp);
             col_rel_destroy(out);
+            WL_MAP_RELEASE_SCRATCH();
             return wl_columnar_ops_dispose_entry(stack, &e, rc);
         }
     }
@@ -352,13 +404,16 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     }
     col_row_buf_release(&row_rb);
     free(tmp);
+    WL_MAP_RELEASE_SCRATCH();
 
     int input_rc = wl_columnar_ops_dispose_entry(stack, &e, 0);
     if (input_rc != 0) {
         col_rel_destroy(out);
         return input_rc;
     }
-    return eval_stack_push(stack, out, true);
+    int push_rc = eval_stack_push(stack, out, true);
+#undef WL_MAP_RELEASE_SCRATCH
+    return push_rc;
 }
 
 /* --- CONCAT and CONSOLIDATE are implemented in columnar/merge.c. */
@@ -369,11 +424,6 @@ typedef struct {
     uint64_t hash;
     uint32_t row;
 } reduce_group_slot_t;
-
-typedef struct {
-    wl_columnar_memory_reservation_t reservation;
-    bool active;
-} wl_ops_scratch_t;
 
 static int
 wl_ops_scratch_reserve(wl_ops_scratch_t *scratch,
