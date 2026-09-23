@@ -2231,6 +2231,47 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     if (!sess->coordinator && W > 1 && right->nrows > 0) {
         int ensure_rc = wl_columnar_session_ensure_workqueue(sess, W);
         if (ensure_rc == 0) {
+            wl_columnar_memory_reservation_t parallel_reservation;
+            bool parallel_admitted = false;
+            wl_columnar_memory_reservation_init(&parallel_reservation);
+            if (sess->memory_governor) {
+                uint64_t ctx_bytes = 0;
+                uint64_t offset_bytes = 0;
+                uint64_t hash_bytes = 0;
+                uint64_t total_bytes = 0;
+                wl_columnar_memory_admission_status_t status;
+                bool sized = wl_columnar_memory_size_mul(W,
+                        sizeof(col_semijoin_ctx_t), &ctx_bytes)
+                    && wl_columnar_memory_size_mul((uint64_t)W + 1u,
+                        sizeof(uint64_t), &offset_bytes)
+                    && wl_columnar_memory_size_mul(
+                    left->nrows > 0 ? left->nrows : 1,
+                    sizeof(uint32_t), &hash_bytes)
+                    && wl_columnar_memory_size_add(ctx_bytes, offset_bytes,
+                        &total_bytes)
+                    && wl_columnar_memory_size_add(total_bytes, hash_bytes,
+                        &total_bytes);
+                if (!sized) {
+                    sj_rc = EOVERFLOW;
+                    goto semijoin_parallel_done;
+                }
+                status = wl_columnar_memory_reserve_checked(
+                    wl_columnar_memory_governor_ref_get(
+                        sess->memory_governor),
+                    total_bytes, &parallel_reservation);
+                if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+                    && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+                    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                        sess->memory_budget_denied = true;
+                    sj_rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                        ? ENOSPC
+                        : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                        ? EOVERFLOW
+                        : ENOMEM;
+                    goto semijoin_parallel_done;
+                }
+                parallel_admitted = true;
+            }
             col_semijoin_ctx_t *ctxs = (col_semijoin_ctx_t *)calloc(
                 W, sizeof(col_semijoin_ctx_t));
             uint64_t *offsets = (uint64_t *)calloc(W + 1,
@@ -2304,13 +2345,27 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 free(left_hashes);
                 free(offsets);
                 free(ctxs);
+                if (parallel_admitted)
+                    (void)wl_columnar_memory_rollback(
+                        &parallel_reservation);
+                parallel_admitted = false;
                 if (prc == 0)
                     goto semijoin_done;
             } else {
                 free(left_hashes);
                 free(offsets);
                 free(ctxs);
+                if (parallel_admitted)
+                    (void)wl_columnar_memory_rollback(
+                        &parallel_reservation);
+                parallel_admitted = false;
             }
+semijoin_parallel_done:
+            if (parallel_admitted)
+                (void)wl_columnar_memory_rollback(&parallel_reservation);
+            parallel_admitted = false;
+            if (sj_rc != 0)
+                goto semijoin_done;
         }
     }
 
