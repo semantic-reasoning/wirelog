@@ -128,10 +128,19 @@ destroy_session(wl_col_session_t *s)
     for (uint32_t i = 0; i < s->filt_cache_count; i++) {
         free(s->filt_cache[i].rel_name);
         free(s->filt_cache[i].filter_data);
+        if (s->filt_cache[i].metadata_reservation) {
+            (void)wl_columnar_memory_rollback(
+                s->filt_cache[i].metadata_reservation);
+            free(s->filt_cache[i].metadata_reservation);
+        }
         if (s->filt_cache[i].filtered)
             col_rel_destroy(s->filt_cache[i].filtered);
     }
     free(s->filt_cache);
+    if (s->filt_cache_array_reservation) {
+        (void)wl_columnar_memory_rollback(s->filt_cache_array_reservation);
+        free(s->filt_cache_array_reservation);
+    }
     delta_pool_destroy(s->delta_pool);
     wl_columnar_memory_governor_ref_release(s->memory_governor);
     free(s);
