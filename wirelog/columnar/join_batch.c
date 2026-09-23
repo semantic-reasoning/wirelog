@@ -93,7 +93,6 @@ typedef struct {
     col_rel_t *batch;        /* governed heap scratch, rows_per_batch rows */
     wl_columnar_memory_reservation_t descriptor_reservation;
     bool descriptor_admitted;
-    bool descriptor_committed;
     uint32_t rows_per_batch;
     col_join_batch_cursor_t cursor;
 } col_join_batch_producer_t;
@@ -272,9 +271,6 @@ static void
 producer_destroy(void *context)
 {
     col_join_batch_producer_t *p = (col_join_batch_producer_t *)context;
-    wl_columnar_memory_reservation_t descriptor_reservation;
-    bool descriptor_admitted;
-    bool descriptor_committed;
 
     if (!p)
         return;
@@ -284,19 +280,8 @@ producer_destroy(void *context)
     free(p->key_row);
     free(p->lk);
     free(p->rk);
-    wl_columnar_memory_reservation_init(&descriptor_reservation);
-    descriptor_admitted = p->descriptor_admitted;
-    descriptor_committed = p->descriptor_committed;
-    if (descriptor_admitted
-        && !wl_columnar_memory_reservation_move(&descriptor_reservation,
-        &p->descriptor_reservation))
-        abort();
-    if (descriptor_admitted) {
-        if (descriptor_committed)
-            (void)wl_columnar_memory_release(&descriptor_reservation);
-        else
-            (void)wl_columnar_memory_rollback(&descriptor_reservation);
-    }
+    if (p->descriptor_admitted)
+        (void)wl_columnar_memory_release(&p->descriptor_reservation);
     free(p);
 }
 
@@ -311,8 +296,6 @@ col_join_batch_producer_create(wl_col_session_t *sess,
     wl_columnar_continuation_producer_t producer;
     wl_columnar_continuation_cursor_t initial;
     uint64_t row_bytes = 0;
-    uint64_t key_bytes = 0;
-    uint64_t probe_bytes = 0;
     uint64_t descriptor_bytes = 0;
     uint64_t rows;
     uint32_t ocols;
@@ -331,17 +314,13 @@ col_join_batch_producer_create(wl_col_session_t *sess,
     for (uint32_t k = 0; k < kc; k++)
         if (lk[k] >= left->ncols || rk[k] >= right->ncols)
             return EINVAL;
-    if (!wl_columnar_memory_size_mul(kc, sizeof(uint32_t), &key_bytes)
-        || !wl_columnar_memory_size_add(key_bytes, key_bytes,
-        &descriptor_bytes)
-        || !wl_columnar_memory_size_mul(right->ncols > 0 ? right->ncols : 1u,
-        sizeof(int64_t), &probe_bytes)
-        || !wl_columnar_memory_size_add(descriptor_bytes, probe_bytes,
-        &descriptor_bytes)
-        || !wl_columnar_memory_size_add(descriptor_bytes, sizeof(*p),
-        &descriptor_bytes)
-        || key_bytes > SIZE_MAX || probe_bytes > SIZE_MAX
-        || descriptor_bytes > SIZE_MAX)
+    /* kc and ncols are uint32_t, so their products and sum fit uint64_t;
+     * reject totals that cannot be represented by this process's size_t. */
+    descriptor_bytes = sizeof(*p)
+        + (uint64_t)kc * 2u * sizeof(uint32_t)
+        + (uint64_t)(right->ncols > 0 ? right->ncols : 1u)
+        * sizeof(int64_t);
+    if (descriptor_bytes > SIZE_MAX)
         return EOVERFLOW;
     wl_columnar_memory_reservation_init(&descriptor_reservation);
     if (sess->memory_governor) {
@@ -395,7 +374,6 @@ col_join_batch_producer_create(wl_col_session_t *sess,
             rc = EINVAL;
             goto fail;
         }
-        p->descriptor_committed = true;
     }
 
     /* One lease for the whole continuation.  The registry refuses to
