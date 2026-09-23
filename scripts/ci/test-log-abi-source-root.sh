@@ -86,6 +86,9 @@ setup)
 compile)
     if [ "${STUB_MODE:-ok}" = leak ]; then
         printf '%s\n' 'wl_log_erasure_sentinel_trace injected fixture' >"$3/libwirelog.so"
+    elif [ ! -e "$3/compile-count" ]; then
+        : >"$3/compile-count"
+        printf '%s\n' 'wl_log_erasure_sentinel_trace positive control' >"$3/libwirelog.so"
     else
         printf '%s\n' 'ordinary nonempty object evidence' >"$3/libwirelog.so"
     fi
