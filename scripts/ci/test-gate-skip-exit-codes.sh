@@ -105,6 +105,7 @@ check-wrap-revisions.sh
 check_log_header_not_public.sh
 check-manifest-collation.sh
 check-sbom-snapshot-locale.sh
+check-subprojects-ignored.sh
 "
 
 # Gates deliberately outside the contract, each with the reason. A gate belongs
