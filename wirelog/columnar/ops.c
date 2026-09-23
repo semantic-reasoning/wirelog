@@ -1024,6 +1024,39 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     if (k < 2u || !meta->rel_names || !meta->key_cols)
         return EINVAL;
 
+    uint64_t lftj_scratch_bytes = 0;
+    uint64_t bytes = 0;
+    if (!wl_columnar_memory_size_mul(k,
+        sizeof(wl_lftj_input_t) + sizeof(col_sorted_arrangement_probe_t)
+        + sizeof(col_rel_t *)
+        + sizeof(wl_columnar_source_access_reader_t)
+        + sizeof(bool) + 3u * sizeof(uint32_t), &bytes)
+        || !wl_columnar_memory_size_add(lftj_scratch_bytes, bytes,
+        &lftj_scratch_bytes))
+        return EOVERFLOW;
+    for (uint32_t i = 0; i < k; i++) {
+        col_rel_t *rel = session_find_rel(sess, meta->rel_names[i]);
+        if (!rel || meta->key_cols[i] >= rel->ncols)
+            return rel ? EINVAL : ENOENT;
+        if (!wl_columnar_memory_size_mul(rel->nrows, rel->ncols,
+            &bytes)
+            || !wl_columnar_memory_size_mul(bytes, sizeof(int64_t), &bytes)
+            || !wl_columnar_memory_size_add(lftj_scratch_bytes, bytes,
+            &lftj_scratch_bytes))
+            return EOVERFLOW;
+        if (!wl_columnar_memory_size_mul(rel->ncols, sizeof(int64_t),
+            &bytes)
+            || !wl_columnar_memory_size_add(lftj_scratch_bytes, bytes,
+            &lftj_scratch_bytes))
+            return EOVERFLOW;
+    }
+    wl_ops_scratch_t lftj_scratch;
+    int lftj_scratch_rc = wl_ops_scratch_reserve(&lftj_scratch,
+            sess ? sess->memory_governor : NULL, lftj_scratch_bytes, sess);
+    if (lftj_scratch_rc != 0)
+        return lftj_scratch_rc;
+#define WL_LFTJ_RELEASE_SCRATCH() wl_ops_scratch_release(&lftj_scratch)
+
     /* Allocate per-relation working arrays. */
     wl_lftj_input_t *inputs
         = (wl_lftj_input_t *)calloc(k, sizeof(wl_lftj_input_t));
@@ -1049,6 +1082,7 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         free(ncols);
         free(lftj_offsets);
         free(binary_offsets);
+        WL_LFTJ_RELEASE_SCRATCH();
         return ENOMEM;
     }
 
@@ -1156,8 +1190,9 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                                   out,
                                   0 };
 
-        rc = wl_columnar_lftj_join_typed(inputs, key_type, k, lftj_binary_cb,
-                &ctx);
+        rc = wl_columnar_lftj_join_typed_governed(inputs, key_type, k,
+                lftj_binary_cb, &ctx,
+                sess ? sess->memory_governor : NULL);
         if (rc == 0)
             rc = ctx.rc;
 
@@ -1227,6 +1262,8 @@ cleanup_arrays:
     free(ncols);
     free(lftj_offsets);
     free(binary_offsets);
+    WL_LFTJ_RELEASE_SCRATCH();
+#undef WL_LFTJ_RELEASE_SCRATCH
     return rc;
 }
 
