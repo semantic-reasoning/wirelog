@@ -97,6 +97,9 @@ typedef struct {
     col_join_batch_cursor_t cursor;
 } col_join_batch_producer_t;
 
+_Static_assert(sizeof(col_join_batch_producer_t) % _Alignof(int64_t) == 0,
+    "JOIN producer tail must support int64_t alignment");
+
 static uint64_t
 pos_pack(uint32_t lr, uint32_t rr)
 {
@@ -277,9 +280,6 @@ producer_destroy(void *context)
     producer_release_lease(p);
     if (p->batch)
         col_rel_destroy(p->batch); /* releases the scratch token and ref */
-    free(p->key_row);
-    free(p->lk);
-    free(p->rk);
     if (p->descriptor_admitted)
         (void)wl_columnar_memory_release(&p->descriptor_reservation);
     free(p);
@@ -328,8 +328,7 @@ col_join_batch_producer_create(wl_col_session_t *sess,
             = wl_columnar_memory_reserve_checked(
                 wl_columnar_memory_governor_ref_get(sess->memory_governor),
                 descriptor_bytes, &descriptor_reservation);
-        if (admission != WL_COLUMNAR_MEMORY_ADMISSION_OK
-            && admission != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+        if (admission > WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
             if (admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                 sess->memory_budget_denied = true;
             return admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
@@ -339,7 +338,7 @@ col_join_batch_producer_create(wl_col_session_t *sess,
         }
         descriptor_admitted = true;
     }
-    p = (col_join_batch_producer_t *)calloc(1, sizeof(*p));
+    p = (col_join_batch_producer_t *)calloc(1, (size_t)descriptor_bytes);
     if (!p) {
         if (descriptor_admitted)
             (void)wl_columnar_memory_rollback(&descriptor_reservation);
@@ -359,14 +358,14 @@ col_join_batch_producer_create(wl_col_session_t *sess,
     p->left = left;
     p->right = right;
     p->kc = kc;
-    p->lk = (uint32_t *)malloc((size_t)kc * sizeof(uint32_t));
-    p->rk = (uint32_t *)malloc((size_t)kc * sizeof(uint32_t));
-    p->key_row = (int64_t *)calloc(right->ncols > 0 ? right->ncols : 1u,
-            sizeof(int64_t));
-    if (!p->lk || !p->rk || !p->key_row) {
-        rc = ENOMEM;
-        goto fail;
-    }
+    /* The allocation tail is raw storage.  Its first two regions hold the
+     * uint32_t key-column arrays; the final int64_t region is naturally
+     * aligned because its offset is 2 * kc * sizeof(uint32_t). */
+    unsigned char *scratch = (unsigned char *)(p + 1);
+    p->lk = (uint32_t *)scratch;
+    p->rk = p->lk + kc;
+    p->key_row = (int64_t *)(scratch
+        + 2u * (size_t)kc * sizeof(uint32_t));
     memcpy(p->lk, lk, (size_t)kc * sizeof(uint32_t));
     memcpy(p->rk, rk, (size_t)kc * sizeof(uint32_t));
     if (p->descriptor_admitted) {
