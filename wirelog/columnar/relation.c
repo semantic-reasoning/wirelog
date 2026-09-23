@@ -928,6 +928,63 @@ col_rel_prospective_metadata_bytes(const col_rel_t *r, uint32_t ncols,
     return true;
 }
 
+/* Flat schema copies own fresh names, type lanes, and Arrow children.  The
+ * source's nested Arrow tree is not copied by these publication paths. */
+static bool
+col_rel_flat_copy_metadata_bytes(const col_rel_t *owner,
+    const col_rel_t *source, bool force_names, bool force_schema,
+    uint64_t *out)
+{
+    uint64_t bytes = 0;
+    uint64_t part;
+    bool names;
+    bool schema;
+
+    if (!owner || !source || !out)
+        return false;
+    names = force_names || source->col_names != NULL;
+    schema = force_schema || source->schema_ok;
+    if (owner->pool_owned && owner->name
+        && !wl_columnar_memory_size_add(bytes,
+        strlen(owner->name) + 1u, &bytes))
+        return false;
+    if (names && source->ncols > 0
+        && (!wl_columnar_memory_size_mul(source->ncols,
+        sizeof(*source->col_names), &part)
+        || !wl_columnar_memory_size_add(bytes, part, &bytes)))
+        return false;
+    if (source->column_types && source->ncols > 0
+        && (!wl_columnar_memory_size_mul(source->ncols,
+        sizeof(*source->column_types), &part)
+        || !wl_columnar_memory_size_add(bytes, part, &bytes)))
+        return false;
+    if (schema) {
+        if (!wl_columnar_memory_size_add(bytes, 3u, &bytes)
+            || !wl_columnar_memory_size_mul(source->ncols,
+            sizeof(struct ArrowSchema *) + sizeof(struct ArrowSchema)
+            + 2u, &part)
+            || !wl_columnar_memory_size_add(bytes, part, &bytes))
+            return false;
+    }
+    for (uint32_t c = 0; c < source->ncols; c++) {
+        const char *name = source->col_names ? source->col_names[c] : NULL;
+        if (names && (name || force_names)
+            && !wl_columnar_memory_size_add(bytes,
+            name ? strlen(name) + 1u : 1u, &bytes))
+            return false;
+        if (schema && !wl_columnar_memory_size_add(bytes,
+            name ? strlen(name) + 1u : 1u, &bytes))
+            return false;
+    }
+    if (source->compound_kind != WIRELOG_COMPOUND_KIND_NONE) {
+        if (!col_rel_compound_map_bytes(source, &part)
+            || !wl_columnar_memory_size_add(bytes, part, &bytes))
+            return false;
+    }
+    *out = bytes;
+    return true;
+}
+
 static int
 col_rel_reserve_metadata(col_rel_t *r,
     wl_columnar_memory_governor_ref_t *governor, uint64_t bytes,
@@ -3536,6 +3593,9 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
     wirelog_column_type_t *prepared_types = NULL;
     struct ArrowSchema prepared_schema;
     bool prepared_schema_ok = false;
+    wl_columnar_memory_reservation_t metadata_pending;
+    wl_columnar_memory_reservation_t *metadata_owned = NULL;
+    uint64_t metadata_bytes;
     int rc;
     (void)arena;
     if (!dst || !src || dst->ncols != src->ncols)
@@ -3663,6 +3723,16 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
     /* Type metadata is part of the append transaction.  Prepare its owned
      * copy and complete Arrow schema before resizing or changing dst. */
     if (!dst->column_types && src->column_types) {
+        if (!col_rel_prospective_metadata_bytes(dst, dst->ncols,
+            (const char *const *)dst->col_names, dst->col_names != NULL,
+            false, true, &metadata_bytes)) {
+            rc = EOVERFLOW;
+            goto cleanup;
+        }
+        rc = col_rel_reserve_metadata(dst, dst->memory_governor,
+                metadata_bytes, &metadata_pending, &metadata_owned);
+        if (rc != 0)
+            goto cleanup;
         int type_rc = col_rel_prepare_column_types(dst, src->column_types,
                 dst->ncols, &prepared_types, &prepared_schema);
         if (type_rc != 0) {
@@ -3771,12 +3841,17 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
      * destination growth has completed.  A rejected append therefore cannot
      * change an untyped destination's schema. */
     if (prepared_schema_ok) {
+        wl_columnar_memory_reservation_t *previous_metadata;
         if (dst->schema_ok)
             ArrowSchemaRelease(&dst->schema);
         free(dst->column_types);
         dst->column_types = prepared_types;
         dst->schema = prepared_schema;
         dst->schema_ok = true;
+        previous_metadata = col_rel_publish_metadata_reservation(dst,
+                &metadata_pending, metadata_owned);
+        metadata_owned = NULL;
+        col_rel_release_metadata_reservation(previous_metadata);
         prepared_types = NULL;
         prepared_schema_ok = false;
     }
@@ -3817,6 +3892,9 @@ cleanup:
     free(prepared_types);
     if (prepared_schema_ok)
         ArrowSchemaRelease(&prepared_schema);
+    if (metadata_owned)
+        col_rel_discard_metadata_reservation(&metadata_pending,
+            metadata_owned);
     if (alias_release_pending) {
         int alias_rc = col_rel_storage_alias_release(dst);
         if (alias_rc != 0 && rc == 0)
@@ -4306,6 +4384,10 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
     struct ArrowSchema prepared_schema;
     bool prepared_schema_ok = false;
     int prepare_rc = ENOMEM;
+    wl_columnar_memory_reservation_t metadata_pending;
+    wl_columnar_memory_reservation_t *metadata_owned = NULL;
+    uint64_t metadata_bytes;
+    uint64_t map_bytes = 0;
     if (!dst || !src || dst == src || dst->ncols != src->ncols)
         return EINVAL;
     if (!dst->storage_owner)
@@ -4341,7 +4423,6 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
         && src->compound_kind != WIRELOG_COMPOUND_KIND_SIDE)
         return EINVAL;
     if (src->compound_kind != WIRELOG_COMPOUND_KIND_NONE) {
-        uint64_t map_bytes;
         if (!col_rel_compound_map_bytes(src, &map_bytes)
             || map_bytes == 0)
             return EINVAL;
@@ -4355,14 +4436,24 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
             || src->inline_physical_offset != 0u) {
             return EINVAL;
         }
+        shared_compound_kind = src->compound_kind;
+        shared_compound_count = src->compound_count;
+        shared_inline_physical_offset = src->inline_physical_offset;
+    }
+    if (!col_rel_flat_copy_metadata_bytes(dst, src, true, true,
+        &metadata_bytes))
+        return EOVERFLOW;
+    prepare_rc = col_rel_reserve_metadata(dst, dst->memory_governor,
+            metadata_bytes, &metadata_pending, &metadata_owned);
+    if (prepare_rc != 0)
+        return prepare_rc;
+    prepare_rc = ENOMEM;
+    if (shared_arity_len > 0) {
         shared_arity_map = (uint32_t *)malloc((size_t)map_bytes);
         if (!shared_arity_map)
             goto prepare_fail;
         memcpy(shared_arity_map, src->compound_arity_map,
             (size_t)map_bytes);
-        shared_compound_kind = src->compound_kind;
-        shared_compound_count = src->compound_count;
-        shared_inline_physical_offset = src->inline_physical_offset;
     }
     shared_has_graph_column = src->has_graph_column;
     shared_graph_col_idx = src->graph_col_idx;
@@ -4433,8 +4524,11 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
             prepare_rc = EINVAL;
             goto prepare_fail;
         }
-        ArrowSchemaSetName(prepared_schema.children[c],
-            shared_names ? shared_names[c] : "");
+        if (ArrowSchemaSetName(prepared_schema.children[c],
+            shared_names ? shared_names[c] : "") != NANOARROW_OK) {
+            prepare_rc = ENOMEM;
+            goto prepare_fail;
+        }
     }
     {
         int64_t **old_columns = dst->columns;
@@ -4520,6 +4614,13 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
         if (old_owner != dst)
             (void)col_rel_storage_alias_borrow_release(old_owner);
     }
+    {
+        wl_columnar_memory_reservation_t *previous_metadata
+            = col_rel_publish_metadata_reservation(dst, &metadata_pending,
+                metadata_owned);
+        col_rel_release_metadata_reservation(previous_metadata);
+        metadata_owned = NULL;
+    }
     shared_columns = NULL;
     shared_flags = NULL;
     shared_types = NULL;
@@ -4541,6 +4642,9 @@ prepare_fail:
             free(shared_names[c]);
         free((void *)shared_names);
     }
+    if (metadata_owned)
+        col_rel_discard_metadata_reservation(&metadata_pending,
+            metadata_owned);
     return prepare_rc;
 }
 
@@ -7651,19 +7755,80 @@ col_rel_radix_sort_int64(col_rel_t *r)
 int
 wl_columnar_relation_rename_checked(col_rel_t *rel, const char *name)
 {
+    wl_columnar_source_access_writer_t descriptor = { 0 };
+    wl_columnar_source_access_writer_t source_writer = { 0 };
+    wl_columnar_memory_reservation_t pending;
+    wl_columnar_memory_reservation_t *owned = NULL;
+    wl_columnar_memory_reservation_t *previous;
+    uint64_t bytes;
+    uint64_t name_bytes;
+    uint64_t old_name_bytes;
+    char *replacement;
+    char *old_name;
+    col_rel_t *owner = NULL;
+    int rc;
+
     if (!rel || !name)
         return EINVAL;
-    char *replacement = wl_strdup(name);
-    if (!replacement)
-        return ENOMEM;
-    wl_columnar_source_access_writer_t writer = { 0 };
-    int rc = wl_columnar_source_access_writer_acquire(&rel->descriptor_access,
-            &writer);
-    if (rc != 0) {
-        free(replacement);
+    rc = wl_columnar_source_access_writer_acquire(&rel->descriptor_access,
+            &descriptor);
+    if (rc != 0)
         return rc;
+    if (rel->pool_owned) {
+        rc = col_rel_storage_owner_resolve(rel, &owner);
+        if (rc == 0)
+            rc = wl_columnar_source_access_writer_acquire(
+                &owner->source_access, &source_writer);
+        if (rc != 0)
+            goto done;
     }
-    free(rel->name);
+    name_bytes = strlen(name) + 1u;
+    old_name_bytes = rel->name ? strlen(rel->name) + 1u : 0u;
+    if (rel->pool_owned) {
+        if (!col_rel_current_metadata_bytes(rel, &bytes)
+            || bytes < old_name_bytes
+            || !wl_columnar_memory_size_add(bytes - old_name_bytes,
+            name_bytes, &bytes)) {
+            rc = EOVERFLOW;
+            goto done;
+        }
+    } else if (!wl_columnar_memory_size_add(sizeof(*rel), name_bytes,
+        &bytes)) {
+        rc = EOVERFLOW;
+        goto done;
+    }
+    rc = col_rel_reserve_metadata(rel, rel->memory_governor, bytes,
+            &pending, &owned);
+    if (rc != 0)
+        goto done;
+    replacement = wl_strdup(name);
+    if (!replacement) {
+        col_rel_discard_metadata_reservation(&pending, owned);
+        rc = ENOMEM;
+        goto done;
+    }
+    old_name = rel->name;
     rel->name = replacement;
-    return wl_columnar_source_access_writer_release(&writer);
+    if (rel->pool_owned) {
+        previous = col_rel_publish_metadata_reservation(rel, &pending,
+                owned);
+    } else {
+        previous = rel->descriptor_reservation;
+        if (owned && (!wl_columnar_memory_reservation_move(owned, &pending)
+            || !wl_columnar_memory_commit(owned, rel)))
+            abort();
+        rel->descriptor_reservation = owned;
+    }
+    free(old_name);
+    col_rel_release_metadata_reservation(previous);
+    rc = 0;
+done:
+    if (source_writer.owner
+        && wl_columnar_source_access_writer_release(&source_writer) != 0
+        && rc == 0)
+        rc = EINVAL;
+    if (wl_columnar_source_access_writer_release(&descriptor) != 0
+        && rc == 0)
+        rc = EINVAL;
+    return rc;
 }

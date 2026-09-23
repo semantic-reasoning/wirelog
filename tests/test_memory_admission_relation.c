@@ -1991,6 +1991,226 @@ test_compound_map_admission_and_bounds(void)
     wl_columnar_memory_governor_ref_release(ref);
 }
 
+static void
+test_shared_view_metadata_admission(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_ref_t *ref;
+    col_rel_t *source = col_rel_new_auto("shared-meta-source", 2);
+    col_rel_t *view = col_rel_new_auto("shared-meta-view", 2);
+    const col_rel_logical_col_t wide = {
+        WIRELOG_COMPOUND_KIND_INLINE, 2u, 0u
+    };
+    uint64_t before;
+    uint64_t old_metadata;
+    uint64_t next_metadata = auto_metadata_bytes(2) + sizeof(uint32_t);
+    uint64_t view_generation;
+    int64_t **old_columns;
+    wl_columnar_memory_reservation_t *old_token;
+
+    CHECK(source && view, "shared metadata fixtures");
+    if (!source || !view)
+        goto cleanup;
+    CHECK(col_rel_apply_compound_schema(source, &wide, 1u) == 0,
+        "shared source compound schema");
+    make_resolution(&resolution, UINT64_MAX);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && col_rel_attach_memory_governor(view, ref) == 0,
+        "shared destination governor");
+    if (!ref || !view->memory_governor)
+        goto cleanup_ref;
+    before = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+    view_generation = view->view_generation;
+    old_columns = view->columns;
+    old_token = view->metadata_reservation;
+    old_metadata = old_token->bytes;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, before + next_metadata - 1u,
+        memory_order_release);
+    CHECK(col_rel_install_shared_view(view, source) == ENOSPC
+        && view->columns == old_columns
+        && view->metadata_reservation == old_token
+        && view->view_generation == view_generation
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == before,
+        "shared view one-byte denial preserves destination");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, before + next_metadata,
+        memory_order_release);
+    CHECK(col_rel_install_shared_view(view, source) == 0
+        && view->compound_arity_len == 1u
+        && view->compound_arity_map[0] == 2u
+        && view->metadata_reservation->bytes == next_metadata
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == before
+        - old_metadata + next_metadata,
+        "shared view exact-fit retry publishes copied map metadata");
+cleanup_ref:
+    col_rel_destroy(view);
+    view = NULL;
+    col_rel_destroy(source);
+    source = NULL;
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "shared metadata token cleanup");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+cleanup:
+    col_rel_destroy(view);
+    col_rel_destroy(source);
+}
+
+static void
+test_append_type_metadata_admission(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    col_rel_t *source = col_rel_new_auto("typed-source", 1);
+    col_rel_t *dst = col_rel_new_auto("typed-destination", 1);
+    wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    int64_t value = 17;
+    uint64_t before;
+    uint64_t new_metadata;
+    wl_columnar_memory_reservation_t *old_token;
+    struct ArrowSchema *old_child;
+
+    CHECK(source && dst && col_rel_set_column_types(source, &type, 1u) == 0
+        && col_rel_append_row(source, &value) == 0,
+        "typed append metadata fixture");
+    if (!source || !dst)
+        goto cleanup;
+    make_resolution(&resolution, UINT64_MAX);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && col_rel_attach_memory_governor(dst, ref) == 0,
+        "typed append governor");
+    if (!ref || !dst->memory_governor)
+        goto cleanup;
+    before = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+    old_token = dst->metadata_reservation;
+    old_child = dst->schema.children[0];
+    new_metadata = old_token->bytes + sizeof(type);
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, before + new_metadata - 1u,
+        memory_order_release);
+    CHECK(col_rel_append_all(dst, source, NULL) == ENOSPC
+        && !dst->column_types && dst->nrows == 0
+        && dst->schema.children[0] == old_child
+        && dst->metadata_reservation == old_token
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == before,
+        "typed append denial preserves schema and token");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, before + new_metadata,
+        memory_order_release);
+    CHECK(col_rel_append_all(dst, source, NULL) == 0
+        && dst->column_types && dst->nrows == 1
+        && dst->columns[0][0] == value
+        && dst->metadata_reservation->bytes == new_metadata,
+        "typed append exact-fit retry publishes metadata");
+cleanup:
+    col_rel_destroy(dst);
+    col_rel_destroy(source);
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+}
+
+static void
+test_rename_metadata_admission(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    col_rel_t *heap = col_rel_new_auto("rename-old", 1);
+    delta_pool_t *pool = NULL;
+    col_rel_t *pooled = NULL;
+    uint64_t before;
+    uint64_t old_charge;
+    uint64_t new_charge;
+    char *old_name;
+
+    CHECK(heap != NULL, "heap rename fixture");
+    if (!heap)
+        return;
+    make_resolution(&resolution, UINT64_MAX);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && col_rel_attach_memory_governor(heap, ref) == 0,
+        "heap rename governor");
+    if (!ref || !heap->memory_governor)
+        goto cleanup;
+    before = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+    old_charge = heap->descriptor_reservation->bytes;
+    new_charge = heap_descriptor_bytes("rename-longer");
+    old_name = heap->name;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, before + new_charge - 1u,
+        memory_order_release);
+    CHECK(wl_columnar_relation_rename_checked(heap, "rename-longer")
+        == ENOSPC && heap->name == old_name
+        && heap->descriptor_reservation->bytes == old_charge
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == before,
+        "heap rename denial retains descriptor name and token");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, before + new_charge,
+        memory_order_release);
+    CHECK(wl_columnar_relation_rename_checked(heap, "rename-longer") == 0
+        && strcmp(heap->name, "rename-longer") == 0
+        && heap->descriptor_reservation->bytes == new_charge
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == before - old_charge + new_charge,
+        "heap rename exact-fit retry transfers descriptor token");
+    col_rel_destroy(heap);
+    heap = NULL;
+    pool = delta_pool_create(1, sizeof(col_rel_t), 4096);
+    pooled = pool ? col_rel_pool_new_auto(pool, NULL, "pool-old", 1) : NULL;
+    CHECK(pooled && pooled->pool_owned, "pooled rename fixture");
+    if (!pooled)
+        goto cleanup;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, UINT64_MAX, memory_order_release);
+    CHECK(col_rel_attach_memory_governor(pooled, ref) == 0,
+        "pooled rename governor");
+    if (!pooled->memory_governor)
+        goto cleanup;
+    before = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+    old_charge = pooled->metadata_reservation->bytes;
+    new_charge = old_charge - strlen("pool-old") - 1u
+        + strlen("pool-longer") + 1u;
+    old_name = pooled->name;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, before + new_charge - 1u,
+        memory_order_release);
+    CHECK(wl_columnar_relation_rename_checked(pooled, "pool-longer")
+        == ENOSPC && pooled->name == old_name
+        && pooled->metadata_reservation->bytes == old_charge,
+        "pooled rename denial retains name and metadata token");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, before + new_charge,
+        memory_order_release);
+    CHECK(wl_columnar_relation_rename_checked(pooled, "pool-longer") == 0
+        && strcmp(pooled->name, "pool-longer") == 0
+        && pooled->metadata_reservation->bytes == new_charge
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == new_charge,
+        "pooled rename exact-fit retry transfers metadata token");
+cleanup:
+    col_rel_destroy(heap);
+    if (pooled)
+        col_rel_free_contents(pooled);
+    delta_pool_destroy(pool);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "rename tokens released");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
 int
 main(void)
 {
@@ -2000,6 +2220,9 @@ main(void)
     test_nested_arrow_metadata_adoption();
     test_pool_metadata_name_reuse();
     test_compound_map_admission_and_bounds();
+    test_shared_view_metadata_admission();
+    test_append_type_metadata_admission();
+    test_rename_metadata_admission();
     test_governed_logical_copy();
     test_governed_empty_compound_copy();
     test_physical_timestamp_capacity();
