@@ -35,13 +35,15 @@ def _write_tmp(value):
     json.dump(value,temp); temp.close(); return temp.name
 
 profile={"schema_version":1,"source_sha":"source123","platform":{"system":"Linux"},
-         "options":{"buildtype":"release"},"tools":{"c":{"id":"gcc"}},
+         "options":{"buildtype":"release"},"tools":{"build":{"c":{"id":"gcc","exelist":["gcc"]},
+                                                                         "cpp":{"id":"gcc","exelist":["c++"]}}},
          "effective_build_commands":["cc -O3"]}
 library=b"fixture library bytes"
 library_digest=hashlib.sha256(library).hexdigest()
 report={"schema_version":1,"status":"within-budget","commit_sha":"source123",
         "measured_bytes":200,"runner_os":"ubuntu-latest","compiler":"gcc",
-        "profile":profile,"library_sha256":library_digest}
+        "profile":profile,"profile_sha256":digest_profile(profile),
+        "library_sha256":library_digest}
 buf=io.BytesIO()
 with zipfile.ZipFile(buf,"w") as z:
     z.writestr("size-monitor/size-report.json",json.dumps(report))
@@ -66,12 +68,24 @@ def exercise(provenance, corrupt=None):
         if corrupt=="expired": artifact["expired"]=True
         if corrupt=="digest": artifact["digest"]="sha256:"+"0"*64
         response_report=dict(report)
+        if corrupt == "build-failed":
+            response_report.update({"status":"monitoring-error", "phase":"build",
+                                    "error":"production build step failed: build",
+                                    "workflow_steps":{"configure":"success","build":"failure","test":"skipped"}})
+        if corrupt == "bad-build-failure":
+            response_report.update({"status":"monitoring-error", "phase":"build",
+                                    "error":"production build step failed: configure",
+                                    "workflow_steps":{"configure":"failure","build":"failure","test":"skipped"}})
+        if corrupt == "missing-library-size":
+            response_report.update({"status":"monitoring-error", "phase":"build",
+                                    "error":"production build step failed: build", "measured_bytes":None,
+                                    "workflow_steps":{"configure":"success","build":"failure","test":"skipped"}})
         if corrupt=="source": response_report["commit_sha"]="other123"
         if corrupt=="bytes": response_report["measured_bytes"]=201
         if corrupt=="profile": response_report["profile"]={"schema_version":1,"changed":True}
         if corrupt=="library": response_report["library_sha256"]="0"*64
         body=artifact_zip
-        if corrupt in ("source","bytes","profile","library"):
+        if corrupt in ("source","bytes","profile","library","build-failed","bad-build-failure","missing-library-size"):
             out=io.BytesIO()
             with zipfile.ZipFile(out,"w") as z: z.writestr("size-report.json",json.dumps(response_report))
             body=out.getvalue()
@@ -88,7 +102,8 @@ def exercise(provenance, corrupt=None):
                 return SimpleNamespace(returncode=1 if corrupt=="unrelated" else 0)
             if isinstance(cmd,list) and cmd[:2]==["meson","compile"]:
                 build=Path(cmd[cmd.index("-C")+1]); build.mkdir(parents=True,exist_ok=True)
-                (build/"libwirelog.so").write_bytes(library)
+                rebuilt=b"same .text, different non-text build bytes" if corrupt=="rebuild-library-hash" else library
+                (build/"libwirelog.so").write_bytes(rebuilt)
             if isinstance(cmd,list) and "size-profile.py" in " ".join(map(str,cmd)):
                 output=Path(cmd[cmd.index("--output")+1]); output.write_text(json.dumps(profile), encoding="utf-8")
             return SimpleNamespace(returncode=0)
@@ -109,7 +124,8 @@ check("unchanged legacy baseline remains allowed",
       lambda: mod.authorize("owner/repo","base456","candidate789",354887,354887,"missing",""))
 check("legacy provenance cannot authorize numeric inflation",
       lambda: mod.authorize("owner/repo","base456","candidate789",354887,500000,
-                            Path(__file__).parents[2]/"tests/baseline_size.provenance.json","token"),
+                            _write_tmp({"schema_version":1,"status":"legacy-unverified",
+                                        "baseline_bytes":354887}),"token"),
       "trusted-ci-artifact")
 check("candidate-authored URL without token is not trust evidence",
       lambda: mod.authorize("owner/repo","base456","candidate789",100,200,
@@ -117,11 +133,17 @@ check("candidate-authored URL without token is not trust evidence",
       "read-only Actions API")
 check("valid main artifact and reproducible source authorize the measurement",
       lambda: exercise(fixture_provenance()))
+check("failed full build authorizes only its fully measured reproducible library",
+      lambda: exercise(fixture_provenance(), "build-failed"))
+check("rebuild may differ outside .text while reproducing the authorized size",
+      lambda: exercise(fixture_provenance(), "rebuild-library-hash"))
 for case, message in [("wrong-workflow","designated main workflow"),
                       ("arm-artifact","canonical x86 production artifact"),("expired","missing, expired"),
                       ("missing","missing, expired"),("digest","artifact digest"),
                       ("source","source or byte count"),("bytes","source or byte count"),
                       ("profile","profile digest"),("library","library digest"),
+                      ("bad-build-failure","eligible, reproducible size measurement"),
+                      ("missing-library-size","eligible, reproducible size measurement"),
                       ("unrelated","not an ancestor")]:
     check(f"{case} artifact/source/provenance mismatch rejected",
           lambda c=case: exercise(fixture_provenance(),c),message)
