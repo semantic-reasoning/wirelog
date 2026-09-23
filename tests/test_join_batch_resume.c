@@ -1209,6 +1209,9 @@ test_lease_released_on_every_path(void)
     col_join_batch_relation_sink_t sctx;
     const col_arr_entry_t *entry;
     uint32_t base_pins;
+    uint64_t reservation_base;
+    uint64_t producer_live_reservation;
+    uint64_t min_batch_bytes;
     wl_columnar_continuation_status_t st;
     int rc;
 
@@ -1218,6 +1221,12 @@ test_lease_released_on_every_path(void)
         fixture_fini(&f);
         return;
     }
+    if (!col_session_get_arrangement(&f.sess->base, "right", KEY0, 1u)) {
+        FAIL("arrangement warmup");
+        fixture_fini(&f);
+        return;
+    }
+    reservation_base = reserved_of(f.sess);
     /* Success path. */
     rc = col_join_batch_producer_create(f.sess, &f.op, f.left, false, KEY0,
             KEY0, 1, 8u * 32u, &cont);
@@ -1226,11 +1235,23 @@ test_lease_released_on_every_path(void)
         FAIL("create did not take exactly one lease");
         goto out;
     }
+    if (reserved_of(f.sess) <= reservation_base) {
+        FAIL("producer descriptor and batch were not admitted");
+        goto out;
+    }
+    producer_live_reservation = reserved_of(f.sess);
+    if (!col_rel_retained_bytes_for(f.out, 64u, &min_batch_bytes)
+        || producer_live_reservation - reservation_base <= min_batch_bytes) {
+        FAIL("producer descriptor admission was missing beside batch storage");
+        goto out;
+    }
     base_pins = entry->pin_count - 1u;
     rc = col_join_batch_run_to_relation(cont, f.sess, f.out);
+    uint64_t output_reservation = f.out->retained_reserved_bytes;
     wl_columnar_continuation_destroy(cont);
     cont = NULL;
-    if (rc != 0 || entry->pin_count != base_pins || f.out->nrows != 40u) {
+    if (rc != 0 || entry->pin_count != base_pins || f.out->nrows != 40u
+        || reserved_of(f.sess) != reservation_base + output_reservation) {
         FAIL("success path leaked a lease");
         goto out;
     }
@@ -1244,9 +1265,11 @@ test_lease_released_on_every_path(void)
         goto out;
     }
     st = wl_columnar_continuation_publish(cont, &sink);
+    uint64_t cancel_live_reservation = reserved_of(f.sess);
     wl_columnar_continuation_cancel(cont);
     if (st != WL_COLUMNAR_CONTINUATION_OK || f.out->nrows != 8u
         || entry->pin_count != base_pins
+        || reserved_of(f.sess) != cancel_live_reservation
         || wl_columnar_continuation_publish(cont, &sink)
         != WL_COLUMNAR_CONTINUATION_INVALID || f.out->nrows != 8u) {
         FAIL("cancel after a committed batch");
@@ -1254,19 +1277,52 @@ test_lease_released_on_every_path(void)
     }
     wl_columnar_continuation_destroy(cont);
     cont = NULL;
-    if (entry->pin_count != base_pins) {
-        FAIL("destroy after cancel released the lease twice");
+    if (entry->pin_count != base_pins
+        || reserved_of(f.sess) != reservation_base
+        + f.out->retained_reserved_bytes) {
+        FAIL("destroy after cancel leaked or double-released producer state");
+        goto out;
+    }
+    /* Cancellation before the first batch also releases the pin immediately,
+    * while the producer-owned descriptor reservation lives until destroy. */
+    rc = col_join_batch_producer_create(f.sess, &f.op, f.left, false, KEY0,
+            KEY0, 1, 8u * 32u, &cont);
+    if (rc != 0 || entry->pin_count != base_pins + 1u) {
+        FAIL("create before cancel");
+        goto out;
+    }
+    cancel_live_reservation = reserved_of(f.sess);
+    wl_columnar_continuation_cancel(cont);
+    if (entry->pin_count != base_pins
+        || reserved_of(f.sess) != cancel_live_reservation) {
+        FAIL("cancel before first batch changed producer reservation lifetime");
+        goto out;
+    }
+    wl_columnar_continuation_destroy(cont);
+    cont = NULL;
+    if (reserved_of(f.sess) != reservation_base
+        + f.out->retained_reserved_bytes) {
+        FAIL("destroy after pre-batch cancel leaked producer reservation");
+        goto out;
+    }
+    ((col_arr_entry_t *)entry)->pin_count = UINT32_MAX;
+    rc = col_join_batch_producer_create(f.sess, &f.op, f.left, false, KEY0,
+            KEY0, 1, 8u * 32u, &cont);
+    ((col_arr_entry_t *)entry)->pin_count = base_pins;
+    if (rc != EOVERFLOW || cont != NULL
+        || reserved_of(f.sess) != reservation_base
+        + f.out->retained_reserved_bytes) {
+        FAIL("pin overflow leaked producer descriptor admission");
         goto out;
     }
     /* Error path: a budget that admits the arrangement but not the scratch
-     * relation denies create; the lease and the scratch reservation must
+     * relation denies create; the lease and the descriptor reservation must
      * be gone, leaving only the arrangement's own reservation. */
     {
-        /* The arrangement's own reservation is known from the generous
-         * session above; a budget just above it admits the arrangement and
-         * denies the 64-row scratch relation (2 KiB). */
-        uint64_t arr_bytes = entry->arr.reserved_bytes;
-        wl_col_session_t *tight = make_session(arr_bytes + 256u);
+        /* Leave one byte beyond the already-admitted arrangement so the
+         * producer descriptor reservation is denied before its allocations. */
+        uint64_t arr_bytes = reservation_base;
+        wl_col_session_t *tight = make_session(arr_bytes + 1u);
         col_rel_t *right2 = make_right(2, 20);
         const col_arr_entry_t *e2;
         if (!tight || !right2) {
@@ -1277,22 +1333,147 @@ test_lease_released_on_every_path(void)
             goto out;
         }
         session_add_rel(tight, right2);
+        if (!col_session_get_arrangement(&tight->base, "right", KEY0, 1u)) {
+            FAIL("tight arrangement warmup");
+            destroy_session(tight);
+            goto out;
+        }
         rc = col_join_batch_producer_create(tight, &f.op, f.left, false,
                 KEY0, KEY0, 1, 8u * 32u, &cont);
         e2 = find_entry(tight, "right");
-        if (rc != ENOMEM || cont != NULL || (e2 && e2->pin_count != 0u)
+        if (rc != ENOSPC || !tight->memory_budget_denied || cont != NULL
+            || (e2 && e2->pin_count != 0u)
             || reserved_of(tight) != (e2 ? e2->arr.reserved_bytes : 0u)) {
-            FAIL("denied create left a lease or a reservation behind");
+            FAIL(
+                "descriptor denial lacked a typed result or left state behind");
             destroy_session(tight);
             goto out;
         }
         destroy_session(tight);
+    }
+    /* A denied create in the tight session above did not poison an equivalent
+     * arrangement: a later adequately budgeted create succeeds and cleans up. */
+    rc = col_join_batch_producer_create(f.sess, &f.op, f.left, false, KEY0,
+            KEY0, 1, 8u * 32u, &cont);
+    if (rc != 0 || !cont || entry->pin_count != base_pins + 1u) {
+        FAIL("create after denial against an unchanged arrangement");
+        goto out;
+    }
+    wl_columnar_continuation_destroy(cont);
+    cont = NULL;
+    if (entry->pin_count != base_pins
+        || reserved_of(f.sess) != reservation_base
+        + f.out->retained_reserved_bytes) {
+        FAIL("post-denial create leaked its pin or producer reservation");
+        goto out;
     }
     PASS();
 out:
     if (cont)
         wl_columnar_continuation_destroy(cont);
     fixture_fini(&f);
+}
+
+/* The producer's descriptor reservation grows by exactly the additional
+ * key-index bytes and right-side probe-row bytes.  Subtract the independently
+ * computed 64-row batch relation reservation so this check isolates the
+ * producer descriptor for narrow and wide schemas. */
+static bool
+descriptor_footprint(uint32_t key_count, uint32_t right_ncols,
+    uint64_t *bytes_out)
+{
+    wl_col_session_t *sess = NULL;
+    col_rel_t *right = NULL;
+    col_rel_t *left = NULL;
+    col_rel_t *out = NULL;
+    wl_plan_op_t op;
+    const char *left_names[3] = { "k0", "k1", "lv" };
+    const char *right_names[8];
+    char right_name_storage[8][16];
+    const char *left_keys[2] = { "k0", "k1" };
+    const char *right_keys[2] = { "k0", "k1" };
+    uint32_t lk[2] = { 0u, 1u };
+    uint32_t rk[2] = { 0u, 1u };
+    int64_t left_row[3] = { 1, 2, 3 };
+    int64_t right_row[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    uint64_t batch_bytes;
+    uint64_t baseline;
+    uint64_t batch_budget;
+    wl_columnar_continuation_t *cont = NULL;
+    bool ok = false;
+
+    if (key_count == 0 || key_count > 2 || right_ncols < key_count
+        || right_ncols > 8 || !bytes_out)
+        return false;
+    for (uint32_t i = 0; i < right_ncols; i++) {
+        const char *prefix = i < key_count ? "k" : "r";
+        (void)snprintf(right_name_storage[i], sizeof(right_name_storage[i]),
+            "%s%u", prefix, i);
+        right_names[i] = right_name_storage[i];
+    }
+    sess = make_session(1u << 24);
+    right = make_rel("right", right_ncols, right_names);
+    left = make_rel("left", 3, left_names);
+    if (!sess || !right || !left
+        || col_rel_append_row(right, right_row) != 0
+        || col_rel_append_row(left, left_row) != 0
+        || session_add_rel(sess, right) != 0)
+        goto done;
+    right = NULL;
+    memset(&op, 0, sizeof(op));
+    op.op = WL_PLAN_OP_JOIN;
+    op.right_relation = "right";
+    op.key_count = key_count;
+    op.left_keys = left_keys;
+    op.right_keys = right_keys;
+    op.delta_mode = WL_DELTA_FORCE_FULL;
+    if (!col_session_get_arrangement(&sess->base, "right", rk, key_count))
+        goto done;
+    out = col_rel_new_auto("$shape", col_join_output_width(left,
+            sess->rels[0], &op));
+    if (!out || col_join_set_output_types(out, left, sess->rels[0], &op) != 0
+        || !col_rel_retained_bytes_for(out, 64u, &batch_bytes))
+        goto done;
+    batch_budget = batch_bytes;
+    baseline = reserved_of(sess);
+    int create_rc = col_join_batch_producer_create(sess, &op, left, false,
+            lk, rk, key_count, batch_budget, &cont);
+    if (create_rc != 0 || !cont
+        || reserved_of(sess) <= baseline + batch_bytes)
+        goto done;
+    *bytes_out = reserved_of(sess) - baseline - batch_bytes;
+    ok = *bytes_out >= (uint64_t)sizeof(uint32_t) * key_count * 2u
+        + (uint64_t)sizeof(int64_t) * right_ncols;
+
+done:
+    if (cont)
+        wl_columnar_continuation_destroy(cont);
+    if (out)
+        col_rel_destroy(out);
+    if (left)
+        col_rel_destroy(left);
+    if (right)
+        col_rel_destroy(right);
+    if (sess)
+        destroy_session(sess);
+    return ok;
+}
+
+static void
+test_descriptor_reservation_shape(void)
+{
+    uint64_t narrow_bytes;
+    uint64_t wide_bytes;
+
+    TEST("producer admission includes multi-key and wide probe scratch");
+    if (!descriptor_footprint(1u, 2u, &narrow_bytes)
+        || !descriptor_footprint(2u, 8u, &wide_bytes)
+        || wide_bytes - narrow_bytes != 6u * sizeof(int64_t)
+        + 2u * sizeof(uint32_t)) {
+        FAIL("producer reservation did not scale with key and probe arrays");
+        return;
+    }
+    PASS();
 }
 
 /* (8) Projection: a projected output width matches the oracle. */
@@ -1438,6 +1619,8 @@ test_unsupported_budget_and_pooled_output(void)
     wl_columnar_continuation_sink_t sink;
     col_join_batch_relation_sink_t sctx;
     col_rel_t *pooled;
+    const col_arr_entry_t *entry;
+    uint64_t reservation_base;
     int rc;
 
     TEST("sub-row budget is ENOTSUP; pool-owned output is refused");
@@ -1446,10 +1629,19 @@ test_unsupported_budget_and_pooled_output(void)
         fixture_fini(&f);
         return;
     }
+    if (!col_session_get_arrangement(&f.sess->base, "right", KEY0, 1u)) {
+        FAIL("arrangement warmup");
+        fixture_fini(&f);
+        return;
+    }
+    reservation_base = reserved_of(f.sess);
+    entry = find_entry(f.sess, "right");
     rc = col_join_batch_producer_create(f.sess, &f.op, f.left, false, KEY0,
             KEY0, 1, 31u, &cont);
     pooled = col_rel_pool_new_auto(f.sess->delta_pool, NULL, "$pooled", 4);
     if (rc != ENOTSUP || cont != NULL || !pooled
+        || !entry || entry->pin_count != 0u
+        || reserved_of(f.sess) != reservation_base
         || col_join_batch_relation_sink_init(&sctx, &sink, f.sess, pooled)
         != EINVAL)
         FAIL("unsupported budget or pooled output was accepted");
@@ -2428,6 +2620,7 @@ main(void)
     test_suspended_producer_survives_eviction();
     test_exact_fit_and_one_byte_over();
     test_lease_released_on_every_path();
+    test_descriptor_reservation_shape();
     test_projected_output();
     test_float_key();
     test_unsupported_budget_and_pooled_output();
