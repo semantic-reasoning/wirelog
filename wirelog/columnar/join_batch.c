@@ -91,6 +91,9 @@ typedef struct {
     const col_arrangement_t *arr;
     int64_t *key_row;
     col_rel_t *batch;        /* governed heap scratch, rows_per_batch rows */
+    wl_columnar_memory_reservation_t descriptor_reservation;
+    bool descriptor_admitted;
+    bool descriptor_committed;
     uint32_t rows_per_batch;
     col_join_batch_cursor_t cursor;
 } col_join_batch_producer_t;
@@ -269,6 +272,9 @@ static void
 producer_destroy(void *context)
 {
     col_join_batch_producer_t *p = (col_join_batch_producer_t *)context;
+    wl_columnar_memory_reservation_t descriptor_reservation;
+    bool descriptor_admitted;
+    bool descriptor_committed;
 
     if (!p)
         return;
@@ -278,6 +284,19 @@ producer_destroy(void *context)
     free(p->key_row);
     free(p->lk);
     free(p->rk);
+    wl_columnar_memory_reservation_init(&descriptor_reservation);
+    descriptor_admitted = p->descriptor_admitted;
+    descriptor_committed = p->descriptor_committed;
+    if (descriptor_admitted
+        && !wl_columnar_memory_reservation_move(&descriptor_reservation,
+        &p->descriptor_reservation))
+        abort();
+    if (descriptor_admitted) {
+        if (descriptor_committed)
+            (void)wl_columnar_memory_release(&descriptor_reservation);
+        else
+            (void)wl_columnar_memory_rollback(&descriptor_reservation);
+    }
     free(p);
 }
 
@@ -292,8 +311,13 @@ col_join_batch_producer_create(wl_col_session_t *sess,
     wl_columnar_continuation_producer_t producer;
     wl_columnar_continuation_cursor_t initial;
     uint64_t row_bytes = 0;
+    uint64_t key_bytes = 0;
+    uint64_t probe_bytes = 0;
+    uint64_t descriptor_bytes = 0;
     uint64_t rows;
     uint32_t ocols;
+    wl_columnar_memory_reservation_t descriptor_reservation;
+    bool descriptor_admitted = false;
     int rc;
 
     if (out)
@@ -307,9 +331,50 @@ col_join_batch_producer_create(wl_col_session_t *sess,
     for (uint32_t k = 0; k < kc; k++)
         if (lk[k] >= left->ncols || rk[k] >= right->ncols)
             return EINVAL;
+    if (!wl_columnar_memory_size_mul(kc, sizeof(uint32_t), &key_bytes)
+        || !wl_columnar_memory_size_add(key_bytes, key_bytes,
+        &descriptor_bytes)
+        || !wl_columnar_memory_size_mul(right->ncols > 0 ? right->ncols : 1u,
+        sizeof(int64_t), &probe_bytes)
+        || !wl_columnar_memory_size_add(descriptor_bytes, probe_bytes,
+        &descriptor_bytes)
+        || !wl_columnar_memory_size_add(descriptor_bytes, sizeof(*p),
+        &descriptor_bytes)
+        || key_bytes > SIZE_MAX || probe_bytes > SIZE_MAX
+        || descriptor_bytes > SIZE_MAX)
+        return EOVERFLOW;
+    wl_columnar_memory_reservation_init(&descriptor_reservation);
+    if (sess->memory_governor) {
+        wl_columnar_memory_admission_status_t admission
+            = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(sess->memory_governor),
+                descriptor_bytes, &descriptor_reservation);
+        if (admission != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && admission != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                sess->memory_budget_denied = true;
+            return admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                ? ENOSPC
+                : admission == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : ENOMEM;
+        }
+        descriptor_admitted = true;
+    }
     p = (col_join_batch_producer_t *)calloc(1, sizeof(*p));
-    if (!p)
+    if (!p) {
+        if (descriptor_admitted)
+            (void)wl_columnar_memory_rollback(&descriptor_reservation);
         return ENOMEM;
+    }
+    wl_columnar_memory_reservation_init(&p->descriptor_reservation);
+    if (descriptor_admitted
+        && !wl_columnar_memory_reservation_move(&p->descriptor_reservation,
+        &descriptor_reservation)) {
+        (void)wl_columnar_memory_rollback(&descriptor_reservation);
+        free(p);
+        return EINVAL;
+    }
+    p->descriptor_admitted = descriptor_admitted;
     p->sess = sess;
     p->op = op;
     p->left = left;
@@ -325,13 +390,22 @@ col_join_batch_producer_create(wl_col_session_t *sess,
     }
     memcpy(p->lk, lk, (size_t)kc * sizeof(uint32_t));
     memcpy(p->rk, rk, (size_t)kc * sizeof(uint32_t));
+    if (p->descriptor_admitted) {
+        if (!wl_columnar_memory_commit(&p->descriptor_reservation, p)) {
+            rc = EINVAL;
+            goto fail;
+        }
+        p->descriptor_committed = true;
+    }
 
     /* One lease for the whole continuation.  The registry refuses to
      * relocate entries while any lease is active, so the arrangement
      * pointer stays valid until destroy or cancel. */
-    if (col_session_pin_arrangement(&sess->base, op->right_relation, rk, kc,
-        &p->pin) != 0 || !p->pin.arr) {
-        rc = ENOENT;
+    rc = col_session_pin_arrangement(&sess->base, op->right_relation, rk, kc,
+            &p->pin);
+    if (rc != 0 || !p->pin.arr) {
+        if (rc == 0)
+            rc = ENOENT;
         goto fail;
     }
     p->arr = p->pin.arr;

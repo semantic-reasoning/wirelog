@@ -86,8 +86,9 @@ typedef struct {
  *
  * Returns 0 and a continuation in *@out; EINVAL on bad arguments, ENOENT
  * when no persistent arrangement can be pinned, ENOTSUP when @batch_bytes
- * cannot hold a single output row, ENOMEM on admission or allocation
- * failure.  Nothing is left pinned or reserved on failure. */
+ * cannot hold a single output row, ENOSPC when governed admission is denied,
+ * EOVERFLOW on checked size overflow, or ENOMEM on allocation failure.
+ * Nothing is left pinned or reserved on failure. */
 int
 col_join_batch_producer_create(wl_col_session_t *sess,
     const wl_plan_op_t *op, const col_rel_t *left, bool left_is_delta,
