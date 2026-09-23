@@ -549,11 +549,30 @@ col_op_k_fusion_serial(const wl_plan_op_t *op, eval_stack_t *stack,
     if (retained_rc != 0)
         return retained_rc;
 
+    uint64_t results_bytes = 0;
+    if (!wl_columnar_memory_size_mul(k, sizeof(col_rel_t *),
+        &results_bytes))
+        return EOVERFLOW;
+    wl_columnar_memory_reservation_t results_reservation;
+    wl_columnar_memory_reservation_init(&results_reservation);
+    if (sess->memory_governor) {
+        wl_columnar_memory_admission_status_t admission
+            = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(sess->memory_governor),
+                results_bytes, &results_reservation);
+        if (admission != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && admission != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            return admission == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : ENOMEM;
+    }
+
     uint64_t _phase_t0 = now_ns();
     col_rel_t **results = (col_rel_t **)calloc(k, sizeof(col_rel_t *));
     COL_SESSION(sess)->kfusion_alloc_ns += now_ns() - _phase_t0;
-    if (!results)
+    if (!results) {
+        wl_columnar_memory_reservation_release(&results_reservation);
         return ENOMEM;
+    }
 
     /* Snapshot mat_cache so branch-added entries don't leak past K-Fusion
      * (parity with parallel path which discards all worker additions). */
@@ -728,6 +747,7 @@ cleanup:
             rc = cleanup_rc;
     }
     free((void *)results);
+    wl_columnar_memory_reservation_release(&results_reservation);
     COL_SESSION(sess)->kfusion_cleanup_ns += now_ns() - _phase_t0;
     return rc;
 }
