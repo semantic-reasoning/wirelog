@@ -2071,22 +2071,23 @@ test_session_injected_governor_admission(void)
     wl_columnar_memory_governor_ref_release(ref);
     PASS();
 
-    /* The intern table fits but the compound arena does not: creation fails
-     * and the oom path detaches the table it attached. */
+    /* The intern table fits but the compound arena does not: creation reports
+     * the budget denial and cleanup detaches the table it attached. */
     TEST("session(#1473): injected governor denies below the compound floor");
     ref = enforcing_governor(intern_bytes + compound_bytes - 1u);
     options.memory_governor = ref;
     session = NULL;
     rc = ref ? wl_session_create_with_options(wl_backend_columnar(), plan, 1,
             &options, &session) : -1;
-    if (!ref || rc != ENOMEM || session != NULL || reserved_on(ref) != 0) {
+    if (!ref || rc != WL_ERR_MEMORY_BUDGET || session != NULL
+        || reserved_on(ref) != 0) {
         if (session)
             wl_session_destroy(session);
         if (ref)
             wl_columnar_memory_governor_ref_release(ref);
         wl_plan_free(plan);
         wirelog_program_free(prog);
-        FAIL("compound-floor denial did not fail creation with ENOMEM");
+        FAIL("compound-floor denial did not report a budget result");
         return;
     }
     wl_columnar_memory_governor_ref_release(ref);

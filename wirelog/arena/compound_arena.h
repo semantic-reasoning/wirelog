@@ -241,6 +241,12 @@ wl_compound_arena_create_managed(uint32_t session_seed,
     uint32_t default_gen_cap, uint32_t max_epochs,
     wl_columnar_memory_governor_t *governor);
 
+/* Preserve a managed constructor's admission result for session creation. */
+int
+wl_compound_arena_create_managed_checked(uint32_t session_seed,
+    uint32_t default_gen_cap, uint32_t max_epochs,
+    wl_columnar_memory_governor_t *governor, wl_compound_arena_t **out);
+
 /* Internal callback form used by the governor glue translation unit. */
 wl_compound_arena_t *
 wl_compound_arena_create_with_admission(uint32_t session_seed,

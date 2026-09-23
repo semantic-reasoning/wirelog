@@ -4,6 +4,7 @@
 
 #include "columnar/memory_governor.h"
 
+#include <errno.h>
 #include <stdlib.h>
 
 typedef struct {
@@ -82,10 +83,10 @@ normalize_max_epochs(uint32_t max_epochs)
     return max_epochs;
 }
 
-wl_compound_arena_t *
-wl_compound_arena_create_managed(uint32_t session_seed,
+int
+wl_compound_arena_create_managed_checked(uint32_t session_seed,
     uint32_t default_gen_cap, uint32_t max_epochs,
-    wl_columnar_memory_governor_t *governor)
+    wl_columnar_memory_governor_t *governor, wl_compound_arena_t **out)
 {
     wl_compound_arena_admission_t *admission;
     wl_columnar_memory_admission_status_t status;
@@ -93,21 +94,26 @@ wl_compound_arena_create_managed(uint32_t session_seed,
     uint64_t gens_bytes;
     uint64_t fixed_bytes;
 
-    if (!governor)
-        return wl_compound_arena_create(session_seed, default_gen_cap,
-                   max_epochs);
+    if (!out)
+        return EINVAL;
+    *out = NULL;
     if (default_gen_cap == 0)
-        return NULL;
+        return EINVAL;
+    if (!governor) {
+        *out = wl_compound_arena_create(session_seed, default_gen_cap,
+                max_epochs);
+        return *out ? 0 : ENOMEM;
+    }
     max_epochs = normalize_max_epochs(max_epochs);
     if (!wl_columnar_memory_size_mul(max_epochs,
         sizeof(wl_compound_gen_t), &gens_bytes)
         || !wl_columnar_memory_size_add(sizeof(wl_compound_arena_t),
         gens_bytes, &fixed_bytes))
-        return NULL;
+        return EOVERFLOW;
 
     admission = (wl_compound_arena_admission_t *)malloc(sizeof(*admission));
     if (!admission)
-        return NULL;
+        return ENOMEM;
     admission->governor = governor;
     wl_columnar_memory_reservation_init(&admission->reservation);
     status = wl_columnar_memory_reserve_checked(governor, fixed_bytes,
@@ -115,7 +121,9 @@ wl_compound_arena_create_managed(uint32_t session_seed,
     if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
         && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
         free(admission);
-        return NULL;
+        return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+            : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
+            : EINVAL;
     }
 
     arena = wl_compound_arena_create_with_admission(session_seed,
@@ -126,11 +134,23 @@ wl_compound_arena_create_managed(uint32_t session_seed,
     if (!arena) {
         (void)wl_columnar_memory_rollback(&admission->reservation);
         free(admission);
-        return NULL;
+        return ENOMEM;
     }
     if (!wl_columnar_memory_commit(&admission->reservation, arena)) {
         wl_compound_arena_free(arena);
-        return NULL;
+        return EINVAL;
     }
+    *out = arena;
+    return 0;
+}
+
+wl_compound_arena_t *
+wl_compound_arena_create_managed(uint32_t session_seed,
+    uint32_t default_gen_cap, uint32_t max_epochs,
+    wl_columnar_memory_governor_t *governor)
+{
+    wl_compound_arena_t *arena = NULL;
+    (void)wl_compound_arena_create_managed_checked(session_seed,
+        default_gen_cap, max_epochs, governor, &arena);
     return arena;
 }

@@ -139,9 +139,13 @@ ensure_plan_built(wirelog_easy_session_t *s, uint32_t num_workers)
      * advance. */
     rc = wl_session_load_facts(session, s->prog);
     if (rc != 0) {
+        wirelog_error_t error = rc == ENOSPC
+            || wl_session_budget_denied(session)
+            ? WIRELOG_ERR_MEMORY_BUDGET
+            : rc == ENOMEM ? WIRELOG_ERR_MEMORY : WIRELOG_ERR_EXEC;
         wl_session_destroy(session);
         wl_plan_free(plan);
-        return WIRELOG_ERR_EXEC;
+        return error;
     }
 
     s->plan = plan;

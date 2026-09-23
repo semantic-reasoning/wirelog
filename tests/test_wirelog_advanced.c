@@ -2470,6 +2470,71 @@ out:
     return ok ? 0 : -1;
 }
 
+static int
+test_inline_fact_create_budget(void)
+{
+    static const char *SRC =
+        ".decl src(x: int64)\n"
+        ".decl out(x: int64)\n"
+        "src(17).\n"
+        "out(X) :- src(X).\n";
+    wirelog_program_t *prog = parse_or_die(SRC, "inline-fact-budget");
+    wirelog_session_t *session = NULL;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    wl_session_options_t options;
+    uint64_t intern_bytes = 0, other_bytes = 0;
+    struct count_state rows = { 0 };
+    int failed = 1;
+    if (!prog || measure_create_floor(prog, &intern_bytes,
+        &other_bytes) != 0)
+        goto done;
+    ref = enforcing_governor(intern_bytes + other_bytes);
+    if (!ref)
+        goto done;
+    wl_session_options_init(&options);
+    options.memory_governor = ref;
+    wl_session_testhook_set_default_options(&options);
+    wirelog_error_t error = wirelog_session_create(prog,
+            WIRELOG_BACKEND_COLUMNAR, 1, &session);
+    wl_session_testhook_set_default_options(NULL);
+    if (error != WIRELOG_ERR_MEMORY_BUDGET || session != NULL
+        || reserved_on(ref) != intern_bytes) {
+        fprintf(stderr,
+            "inline advanced denial err=%d session=%p reserved=%llu intern=%llu\n",
+            error, (void *)session, (unsigned long long)reserved_on(ref),
+            (unsigned long long)intern_bytes);
+        goto done;
+    }
+    atomic_store_explicit(
+        &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
+        UINT64_MAX / 4u, memory_order_release);
+    wl_session_testhook_set_default_options(&options);
+    error = wirelog_session_create(prog, WIRELOG_BACKEND_COLUMNAR, 1,
+            &session);
+    wl_session_testhook_set_default_options(NULL);
+    if (error != WIRELOG_OK || !session
+        || wirelog_session_snapshot(session, count_rows, &rows)
+        != WIRELOG_OK || rows.rows != 1) {
+        fprintf(stderr, "inline advanced retry err=%d session=%p rows=%u\n",
+            error, (void *)session, rows.rows);
+        goto done;
+    }
+    failed = 0;
+done:
+    wl_session_testhook_set_default_options(NULL);
+    wirelog_session_destroy(session);
+    if (prog)
+        wirelog_program_free(prog);
+    if (ref) {
+        if (reserved_on(ref) != 0)
+            failed = 1;
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (failed)
+        fprintf(stderr, "inline-fact-budget: typed denial/retry failed\n");
+    return failed;
+}
+
 /* ======================================================================== */
 /* Issue #1521: an evaluation-time interning denial is a memory verdict     */
 /* ======================================================================== */
@@ -2884,6 +2949,7 @@ main(void)
     failures += test_issue_665_partial_conjunction_multi_worker();
     failures += test_invalid_memory_budget();
     failures += test_fact_mutation_budget();
+    failures += test_inline_fact_create_budget();
     failures += test_injected_governor_denial_maps_to_memory();
     failures += test_injected_governor_overflow_maps_to_memory();
     failures += test_denied_eval_interning_maps_to_memory();

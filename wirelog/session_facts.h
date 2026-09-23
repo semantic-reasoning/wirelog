@@ -29,7 +29,9 @@ struct wirelog_program;
  *
  * Returns:
  *    0 on success.
- *   -1 on error (NULL args or insert failure).
+ *   -1 on invalid input or an untyped failure.
+ *   A positive wl_session_insert() error is preserved, so callers can
+ *   distinguish budget denial from allocator and execution failures.
  */
 int
 wl_session_load_facts(wl_session_t *sess, const struct wirelog_program *prog);
@@ -39,15 +41,16 @@ wl_session_load_facts(wl_session_t *sess, const struct wirelog_program *prog);
  * @sess: Active execution session.
  * @prog: Parsed program with .input directives.
  *
- * Load CSV files for all relations with .input directives.
- * Reads CSV via wl_csv_read_file() and inserts via wl_session_insert().
+ * Load external inputs for all relations with .input directives through
+ * their registered adapters, then insert via wl_session_insert().
  *
  * Returns:
  *    0 on success.
- *   -1 on error (NULL args, missing file, parse error, or insert failure).
+ *   -1 on invalid input, I/O, parse, or untyped adapter failure.
+ *   A positive row-insertion error or ENOMEM from an adapter is preserved.
  */
 int
 wl_session_load_input_files(wl_session_t *sess,
-                            const struct wirelog_program *prog);
+    const struct wirelog_program *prog);
 
 #endif /* WL_SESSION_FACTS_H */

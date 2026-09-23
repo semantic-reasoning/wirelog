@@ -2,6 +2,7 @@
 
 #include "../wirelog/arena/compound_arena.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -368,6 +369,10 @@ test_denial_and_legacy_contract(void)
     make_resolution(&resolution, expected - 1);
     CHECK(wl_columnar_memory_governor_init(&governor, &resolution)
         == WL_COLUMNAR_MEMORY_OK, "denial governor initialization");
+    arena = (wl_compound_arena_t *)1;
+    CHECK(wl_compound_arena_create_managed_checked(1, 64, 2, &governor,
+        &arena) == ENOSPC && arena == NULL,
+        "checked constructor reports exact budget denial");
     arena = wl_compound_arena_create_managed(1, 64, 2, &governor);
     CHECK(arena == NULL, "denied compound metadata returns NULL");
     CHECK(wl_columnar_memory_reserved(&governor) == 0,
@@ -377,6 +382,16 @@ test_denial_and_legacy_contract(void)
     CHECK(arena == NULL, "default epoch table is also denied honestly");
     CHECK(wl_columnar_memory_reserved(&governor) == 0,
         "default denial leaves no reservation behind");
+
+    make_resolution(&resolution, expected);
+    CHECK(wl_columnar_memory_governor_init(&governor, &resolution)
+        == WL_COLUMNAR_MEMORY_OK, "exact-fit governor initialization");
+    CHECK(wl_compound_arena_create_managed_checked(1, 64, 2, &governor,
+        &arena) == 0 && arena != NULL,
+        "checked constructor admits exact fixed footprint");
+    wl_compound_arena_free(arena);
+    CHECK(wl_columnar_memory_reserved(&governor) == 0,
+        "checked constructor releases exact reservation");
 
     arena = wl_compound_arena_create_managed(1, 64, 2, NULL);
     CHECK(arena != NULL, "NULL governor preserves unmanaged mode");

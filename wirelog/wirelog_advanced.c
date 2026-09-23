@@ -478,9 +478,13 @@ wirelog_session_create_impl(wirelog_program_t *program,
      * deltas appear on the first step()). */
     rc = wl_session_load_facts(inner, program);
     if (rc != 0) {
+        wirelog_error_t error = rc == ENOSPC
+            || wl_session_budget_denied(inner)
+            ? WIRELOG_ERR_MEMORY_BUDGET
+            : rc == ENOMEM ? WIRELOG_ERR_MEMORY : WIRELOG_ERR_EXEC;
         wl_session_destroy(inner);
         wl_plan_free(plan);
-        return WIRELOG_ERR_EXEC;
+        return error;
     }
 
     wirelog_session_t *s

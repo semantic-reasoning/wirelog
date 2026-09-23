@@ -17,9 +17,11 @@
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/io/csv_reader.h"
 #include "../wirelog/intern.h"
+#include "../wirelog/io/csv_reader.h"
 #include "../wirelog/session.h"
 #include "test_tmpdir.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -2624,6 +2626,379 @@ measure_easy_floor(const char *src, uint64_t *intern_bytes,
     return rc;
 }
 
+static const char *INLINE_FACT_BUDGET_SRC =
+    ".decl src(x: int64)\n"
+    ".decl out(x: int64)\n"
+    "src(17).\n"
+    "out(X) :- src(X).\n";
+
+/* PARITY: test_inline_fact_create_budget in the advanced facade covers the
+ * same seeded-create error; the lazy retry and executor are easy-only. */
+static void
+test_inline_fact_create_budget(void)
+{
+    uint64_t intern_bytes = 0, other_bytes = 0;
+    wl_session_options_t options;
+    wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
+    wirelog_easy_session_t *session = NULL;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    wirelog_error_t error = WIRELOG_OK;
+    tuple_collector_t rows = { 0 };
+
+    TEST("#1369 eager inline-fact denial reports the budget result");
+    if (measure_easy_floor(INLINE_FACT_BUDGET_SRC, &intern_bytes,
+        &other_bytes) != 0) {
+        FAIL("could not measure seeded program's empty-session floor");
+        return;
+    }
+    ref = enforcing_governor(intern_bytes + other_bytes);
+    if (!ref) {
+        FAIL("governor allocation");
+        return;
+    }
+    wl_session_options_init(&options);
+    options.memory_governor = ref;
+    opts.eager_build = true;
+    wl_session_testhook_set_default_options(&options);
+    error = wirelog_easy_open_opts(INLINE_FACT_BUDGET_SRC, &opts, &session);
+    wl_session_testhook_set_default_options(NULL);
+    if (error != WIRELOG_ERR_MEMORY_BUDGET || session != NULL
+        || reserved_on(ref) != 0) {
+        FAIL("eager inline-fact denial was not typed or cleaned up");
+        goto done;
+    }
+    PASS();
+
+    TEST("#1369 lazy inline-fact denial retries without stale state");
+    error = wirelog_easy_open(INLINE_FACT_BUDGET_SRC, &session);
+    if (error != WIRELOG_OK || !session) {
+        FAIL("lazy open");
+        goto done;
+    }
+    wl_session_testhook_set_default_options(&options);
+    error = wirelog_easy_snapshot(session, "out", collect_tuple, &rows);
+    wl_session_testhook_set_default_options(NULL);
+    if (error != WIRELOG_ERR_MEMORY_BUDGET || rows.count != 0
+        || reserved_on(ref) != intern_bytes) {
+        FAIL("lazy inline-fact denial changed result or leaked");
+        goto done;
+    }
+    atomic_store_explicit(
+        &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
+        UINT64_MAX / 4u, memory_order_release);
+    wl_session_testhook_set_default_options(&options);
+    error = wirelog_easy_snapshot(session, "out", collect_tuple, &rows);
+    wl_session_testhook_set_default_options(NULL);
+    if (error != WIRELOG_OK || rows.count != 1
+        || rows.rows[0][0] != 17) {
+        FAIL("lazy retry did not derive the exact seeded result");
+        goto done;
+    }
+    PASS();
+done:
+    wirelog_easy_close(session);
+    if (reserved_on(ref) != 0)
+        FAIL("inline-fact retry leaked governor reservation");
+    wl_columnar_memory_governor_ref_release(ref);
+}
+
+/* PARITY: the advanced session API has no executor constructor. */
+static void
+test_executor_inline_fact_budget(void)
+{
+    wirelog_error_t error = WIRELOG_OK;
+    wirelog_program_t *prog = wirelog_parse_string(INLINE_FACT_BUDGET_SRC,
+            &error);
+    wirelog_executor_t *executor = NULL;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    wl_session_options_t options;
+    uint64_t intern_bytes = 0, other_bytes = 0;
+    TEST("#1369 executor inline-fact denial reports budget, not I/O");
+    if (!prog || measure_create_floor(prog, &intern_bytes,
+        &other_bytes) != 0) {
+        FAIL("could not measure executor's empty-session floor");
+        goto done;
+    }
+    ref = enforcing_governor(intern_bytes + other_bytes);
+    if (!ref) {
+        FAIL("governor allocation");
+        goto done;
+    }
+    wl_session_options_init(&options);
+    options.memory_governor = ref;
+    wl_session_testhook_set_default_options(&options);
+    executor = wirelog_executor_create(prog, &error);
+    wl_session_testhook_set_default_options(NULL);
+    if (error != WIRELOG_ERR_MEMORY_BUDGET || executor != NULL
+        || reserved_on(ref) != intern_bytes) {
+        FAIL("executor fact denial was misclassified or leaked");
+        goto done;
+    }
+    atomic_store_explicit(
+        &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
+        UINT64_MAX / 4u, memory_order_release);
+    wl_session_testhook_set_default_options(&options);
+    executor = wirelog_executor_create(prog, &error);
+    wl_session_testhook_set_default_options(NULL);
+    if (error != WIRELOG_OK || !executor) {
+        FAIL("executor create did not recover after denial");
+        goto done;
+    }
+    PASS();
+done:
+    wl_session_testhook_set_default_options(NULL);
+    wirelog_executor_free(executor);
+    wirelog_program_free(prog);
+    if (ref) {
+        if (reserved_on(ref) != 0)
+            FAIL("executor fact denial leaked governor reservation");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static bool budget_input_fail_read;
+
+static int
+budget_input_read(wirelog_io_ctx_t *ctx, int64_t **data,
+    uint32_t *nrows, void *user_data)
+{
+    (void)ctx;
+    (void)user_data;
+    if (budget_input_fail_read)
+        return -1;
+    *data = malloc(sizeof(**data));
+    if (!*data)
+        return ENOMEM;
+    (*data)[0] = 17;
+    *nrows = 1;
+    return 0;
+}
+
+/* PARITY: the advanced session API does not load .input files on create. */
+static void
+test_executor_input_budget_and_io(void)
+{
+    static const char *SRC =
+        ".decl src(x: int64)\n"
+        ".input src(io=\"budget_input_probe\", filename=\"unused\")\n";
+    static const wirelog_io_adapter_t adapter = {
+        .abi_version = WIRELOG_IO_ABI_VERSION,
+        .scheme = "budget_input_probe",
+        .read = budget_input_read,
+    };
+    wirelog_error_t error = WIRELOG_OK;
+    wirelog_program_t *prog = NULL;
+    wirelog_executor_t *executor = NULL;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    wl_session_options_t options;
+    uint64_t intern_bytes = 0, other_bytes = 0;
+    bool registered = false;
+    TEST("#1369 executor input-row budget denial stays distinct from I/O");
+    if (wirelog_io_register_adapter(&adapter) != 0) {
+        FAIL("input probe registration");
+        return;
+    }
+    registered = true;
+    prog = wirelog_parse_string(SRC, &error);
+    if (!prog || measure_create_floor(prog, &intern_bytes,
+        &other_bytes) != 0) {
+        FAIL("could not measure input program's empty-session floor");
+        goto done;
+    }
+    ref = enforcing_governor(intern_bytes + other_bytes);
+    if (!ref) {
+        FAIL("governor allocation");
+        goto done;
+    }
+    wl_session_options_init(&options);
+    options.memory_governor = ref;
+    budget_input_fail_read = false;
+    wl_session_testhook_set_default_options(&options);
+    executor = wirelog_executor_create(prog, &error);
+    wl_session_testhook_set_default_options(NULL);
+    if (executor || error != WIRELOG_ERR_MEMORY_BUDGET
+        || reserved_on(ref) != intern_bytes) {
+        FAIL("input insertion denial was misclassified or leaked");
+        goto done;
+    }
+    atomic_store_explicit(
+        &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
+        UINT64_MAX / 4u, memory_order_release);
+    budget_input_fail_read = true;
+    wl_session_testhook_set_default_options(&options);
+    executor = wirelog_executor_create(prog, &error);
+    wl_session_testhook_set_default_options(NULL);
+    if (executor || error != WIRELOG_ERR_IO) {
+        FAIL("ordinary adapter failure lost I/O classification");
+        goto done;
+    }
+    budget_input_fail_read = false;
+    wl_session_testhook_set_default_options(&options);
+    executor = wirelog_executor_create(prog, &error);
+    wl_session_testhook_set_default_options(NULL);
+    if (!executor || error != WIRELOG_OK) {
+        FAIL("input executor create did not recover");
+        goto done;
+    }
+    PASS();
+done:
+    wl_session_testhook_set_default_options(NULL);
+    budget_input_fail_read = false;
+    wirelog_executor_free(executor);
+    wirelog_program_free(prog);
+    if (ref) {
+        if (reserved_on(ref) != 0)
+            FAIL("input executor leaked governor reservation");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (registered)
+        (void)wirelog_io_unregister_adapter("budget_input_probe");
+}
+
+/* PARITY: built-in CSV input is loaded by the executor, not by the
+ * advanced session constructor. */
+static void
+test_executor_csv_scratch_budget(void)
+{
+    char path[512];
+    char source[768];
+    wirelog_error_t error = WIRELOG_OK;
+    wirelog_program_t *prog = NULL;
+    wirelog_executor_t *executor = NULL;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    wl_session_options_t options;
+    uint64_t intern_bytes = 0, other_bytes = 0;
+    FILE *file;
+
+    TEST("#1369 executor CSV scratch denial reports the budget result");
+    test_tmppath(path, sizeof(path), "wirelog_1369_csv_scratch.csv");
+    file = fopen(path, "w");
+    if (!file) {
+        FAIL("CSV fixture open");
+        return;
+    }
+    fputs("17\n", file);
+    fclose(file);
+    snprintf(source, sizeof(source),
+        ".decl src(x: int64)\n.input src(io=\"csv\", filename=\"%s\")\n",
+        path);
+    prog = wirelog_parse_string(source, &error);
+    if (!prog || measure_create_floor(prog, &intern_bytes,
+        &other_bytes) != 0) {
+        FAIL("could not measure CSV program's empty-session floor");
+        goto done;
+    }
+    ref = enforcing_governor(intern_bytes + other_bytes);
+    if (!ref) {
+        FAIL("governor allocation");
+        goto done;
+    }
+    wl_session_options_init(&options);
+    options.memory_governor = ref;
+    wl_session_testhook_set_default_options(&options);
+    executor = wirelog_executor_create(prog, &error);
+    wl_session_testhook_set_default_options(NULL);
+    if (executor || error != WIRELOG_ERR_MEMORY_BUDGET
+        || reserved_on(ref) != intern_bytes) {
+        FAIL("CSV scratch denial was misclassified or leaked");
+        goto done;
+    }
+    atomic_store_explicit(
+        &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
+        UINT64_MAX / 4u, memory_order_release);
+    wl_session_testhook_set_default_options(&options);
+    executor = wirelog_executor_create(prog, &error);
+    wl_session_testhook_set_default_options(NULL);
+    if (!executor || error != WIRELOG_OK) {
+        FAIL("CSV scratch denial did not recover");
+        goto done;
+    }
+    PASS();
+done:
+    wl_session_testhook_set_default_options(NULL);
+    wirelog_executor_free(executor);
+    wirelog_program_free(prog);
+    if (ref) {
+        if (reserved_on(ref) != 0)
+            FAIL("CSV scratch admission leaked governor reservation");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    remove(path);
+}
+
+/* PARITY: facade-only -- the advanced session constructor does not load
+ * CSV .input files. */
+static void
+test_executor_csv_intern_budget(void)
+{
+    char path[512];
+    char source[768];
+    wirelog_error_t error = WIRELOG_OK;
+    wirelog_program_t *prog = NULL;
+    wirelog_executor_t *executor = NULL;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    wl_session_options_t options;
+    uint64_t intern_bytes = 0, other_bytes = 0;
+    FILE *file;
+
+    TEST("#1369 executor CSV intern denial reports the budget result");
+    test_tmppath(path, sizeof(path), "wirelog_1369_csv_intern.csv");
+    file = fopen(path, "w");
+    if (!file) {
+        FAIL("CSV fixture open");
+        return;
+    }
+    fputs("alpha\n", file);
+    fclose(file);
+    snprintf(source, sizeof(source),
+        ".decl src(s: string)\n.input src(io=\"csv\", filename=\"%s\")\n",
+        path);
+    prog = wirelog_parse_string(source, &error);
+    if (!prog || measure_create_floor(prog, &intern_bytes,
+        &other_bytes) != 0) {
+        FAIL("could not measure CSV program's empty-session floor");
+        goto done;
+    }
+    uint64_t scratch_bytes = 1024u * sizeof(int64_t) + sizeof(int64_t)
+        + WL_CSV_READ_CHUNK + 2u * (WL_CSV_MAX_LINE + 1u);
+    ref = enforcing_governor(intern_bytes + other_bytes + scratch_bytes);
+    if (!ref) {
+        FAIL("governor allocation");
+        goto done;
+    }
+    wl_session_options_init(&options);
+    options.memory_governor = ref;
+    wl_session_testhook_set_default_options(&options);
+    executor = wirelog_executor_create(prog, &error);
+    wl_session_testhook_set_default_options(NULL);
+    if (executor || error != WIRELOG_ERR_MEMORY_BUDGET
+        || reserved_on(ref) != intern_bytes) {
+        FAIL("CSV intern denial was misclassified or leaked");
+        goto done;
+    }
+    atomic_store_explicit(
+        &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
+        UINT64_MAX / 4u, memory_order_release);
+    wl_session_testhook_set_default_options(&options);
+    executor = wirelog_executor_create(prog, &error);
+    wl_session_testhook_set_default_options(NULL);
+    if (!executor || error != WIRELOG_OK) {
+        FAIL("CSV intern denial did not recover");
+        goto done;
+    }
+    PASS();
+done:
+    wl_session_testhook_set_default_options(NULL);
+    wirelog_executor_free(executor);
+    wirelog_program_free(prog);
+    if (ref) {
+        if (reserved_on(ref) != 0)
+            FAIL("CSV intern admission leaked governor reservation");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    remove(path);
+}
+
 /* PARITY: the advanced facade has no eager/lazy split; both easy paths and
  * the executor pair with test_injected_governor_denial_maps_to_memory. */
 static void
@@ -3213,6 +3588,11 @@ main(void)
 
     test_invalid_memory_budget();
     test_fact_mutation_budget();
+    test_inline_fact_create_budget();
+    test_executor_inline_fact_budget();
+    test_executor_input_budget_and_io();
+    test_executor_csv_scratch_budget();
+    test_executor_csv_intern_budget();
     test_injected_governor_easy_eager();
     test_injected_governor_easy_lazy();
     test_injected_governor_executor();

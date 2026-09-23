@@ -1983,9 +1983,9 @@ col_compute_worker_cap(uint64_t ram_bytes)
  *   4. Pre-register EDB relations from plan->edb_relations (ncols lazy-inited)
  *   5. Set *out = &sess->base  (session.c:38 then sets base.backend)
  *
- * @return 0 on success, EINVAL if plan/out is NULL, ENOMEM on alloc failure
- *         or governor denial, EOVERFLOW when admitting the intern table would
- *         overflow the governor total (#1431)
+ * @return 0 on success, EINVAL if plan/out is NULL, ENOMEM on allocation
+ *         failure, WL_ERR_MEMORY_BUDGET on governor denial, EOVERFLOW on
+ *         representational overflow
  *
  * @see wl_session_create in session.c for vtable dispatch context
  * @see wl_col_session_t memory layout documentation above
@@ -2378,11 +2378,15 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
      * tests/test_compound_arena.c; max_epochs=0 selects the library
      * default (WL_COMPOUND_EPOCH_MAX + 1). */
     uint32_t compound_max_epochs = session_compound_max_epochs_from_env();
-    sess->compound_arena = wl_compound_arena_create_managed(0x53455353u,
+    int compound_rc = wl_compound_arena_create_managed_checked(0x53455353u,
             4096u, compound_max_epochs,
-            wl_columnar_memory_governor_ref_get(sess->memory_governor));
-    if (!sess->compound_arena)
+            wl_columnar_memory_governor_ref_get(sess->memory_governor),
+            &sess->compound_arena);
+    if (compound_rc != 0) {
+        creation_failure_rc = compound_rc == ENOSPC ? WL_ERR_MEMORY_BUDGET
+            : compound_rc;
         goto oom;
+    }
     WL_LOG(WL_LOG_SEC_SESSION, WL_LOG_INFO,
         "event=compound_arena_init seed=0x%08x default_gen_cap=%u "
         "max_epochs=%u",
@@ -2441,12 +2445,18 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
                 rc = col_rel_set_column_types(r,
                         plan->edb_column_types[i], type_count);
             if (rc != 0) {
+                creation_failure_rc = rc == ENOSPC
+                    || r->memory_budget_denial_pending
+                    ? WL_ERR_MEMORY_BUDGET : rc > 0 ? rc : ENOMEM;
                 col_rel_destroy(r);
                 goto oom;
             }
         }
         rc = session_add_rel(sess, r);
         if (rc != 0) {
+            creation_failure_rc = rc == ENOSPC
+                || r->memory_budget_denial_pending
+                ? WL_ERR_MEMORY_BUDGET : rc > 0 ? rc : ENOMEM;
             col_rel_destroy(r);
             goto oom;
         }
@@ -2481,11 +2491,17 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
             };
             rc = col_rel_set_schema(meta, 6, meta_cols);
             if (rc != 0) {
+                creation_failure_rc = rc == ENOSPC
+                    || meta->memory_budget_denial_pending
+                    ? WL_ERR_MEMORY_BUDGET : rc > 0 ? rc : ENOMEM;
                 col_rel_destroy(meta);
                 goto oom;
             }
             rc = session_add_rel(sess, meta);
             if (rc != 0) {
+                creation_failure_rc = rc == ENOSPC
+                    || meta->memory_budget_denial_pending
+                    ? WL_ERR_MEMORY_BUDGET : rc > 0 ? rc : ENOMEM;
                 col_rel_destroy(meta);
                 goto oom;
             }
