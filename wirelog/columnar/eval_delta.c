@@ -23,20 +23,73 @@ wl_delta_event_append(wl_col_session_t *sess, const char *relation,
 {
     wl_col_delta_event_t *grown;
     int64_t *copy;
+    size_t next = sess->delta_event_capacity;
+    uint64_t row_bytes = 0;
+    uint64_t array_bytes = 0;
+    uint64_t new_reserved = sess->delta_event_reserved_bytes;
+    wl_columnar_memory_reservation_t replacement;
+    bool replacement_active = false;
+
+    if (!wl_columnar_memory_size_mul(ncols, sizeof(*copy), &row_bytes))
+        return EOVERFLOW;
     if (sess->delta_event_count == sess->delta_event_capacity) {
-        size_t next = sess->delta_event_capacity
-            ? sess->delta_event_capacity * 2 : 16;
+        next = next ? next * 2 : 16;
+        if (next < sess->delta_event_capacity
+            || !wl_columnar_memory_size_mul(next, sizeof(*grown),
+            &array_bytes))
+            return EOVERFLOW;
+    }
+    if (sess->delta_event_count == sess->delta_event_capacity)
+        new_reserved = sess->delta_event_reserved_bytes
+            + (array_bytes - sess->delta_event_capacity * sizeof(*grown));
+    if (!wl_columnar_memory_size_add(new_reserved, row_bytes,
+        &new_reserved))
+        return EOVERFLOW;
+    if (sess->memory_governor && new_reserved > 0) {
+        wl_columnar_memory_reservation_init(&replacement);
+        wl_columnar_memory_admission_status_t status
+            = wl_columnar_memory_reserve_growth(
+                wl_columnar_memory_governor_ref_get(sess->memory_governor),
+                sess->delta_event_reserved_bytes, new_reserved,
+                &replacement);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : ENOMEM;
+        replacement_active = true;
+    }
+    if (sess->delta_event_count == sess->delta_event_capacity) {
         grown = (wl_col_delta_event_t *)realloc(sess->delta_events,
                 next * sizeof(*grown));
-        if (!grown)
+        if (!grown) {
+            if (replacement_active)
+                wl_columnar_memory_rollback(&replacement);
             return ENOMEM;
+        }
         sess->delta_events = grown;
         sess->delta_event_capacity = next;
     }
-    copy = (int64_t *)malloc((size_t)ncols * sizeof(*copy));
-    if (!copy)
+    copy = (int64_t *)malloc((size_t)row_bytes);
+    if (!copy) {
+        if (replacement_active)
+            wl_columnar_memory_rollback(&replacement);
         return ENOMEM;
-    memcpy(copy, row, (size_t)ncols * sizeof(*copy));
+    }
+    memcpy(copy, row, (size_t)row_bytes);
+    if (replacement_active) {
+        if (!wl_columnar_memory_commit(&replacement, sess)) {
+            free(copy);
+            wl_columnar_memory_rollback(&replacement);
+            return EBUSY;
+        }
+        if (sess->delta_event_reserved_bytes == 0)
+            wl_columnar_memory_reservation_init(
+                &sess->delta_event_reservation);
+        wl_columnar_memory_release(&sess->delta_event_reservation);
+        wl_columnar_memory_reservation_move(&sess->delta_event_reservation,
+            &replacement);
+    }
+    sess->delta_event_reserved_bytes = new_reserved;
     sess->delta_events[sess->delta_event_count++]
         = (wl_col_delta_event_t){ relation, copy, ncols, diff };
     return 0;
@@ -53,6 +106,8 @@ wl_columnar_delta_events_clear(wl_col_session_t *sess)
     sess->delta_events = NULL;
     sess->delta_event_count = 0;
     sess->delta_event_capacity = 0;
+    wl_columnar_memory_release(&sess->delta_event_reservation);
+    sess->delta_event_reserved_bytes = 0;
 }
 
 void
