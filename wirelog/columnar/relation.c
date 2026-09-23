@@ -106,14 +106,14 @@ wl_columnar_relation_test_fail_next_commit_publication(void)
 }
 #endif
 
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
 static void
 wl_columnar_relation_test_note_resize_columns_retired(void)
 {
-#ifdef WL_TEST_RELATION_RESIZE_HOOK
     if (wl_columnar_relation_test_watch_rollback_cleanup)
         wl_columnar_relation_test_resize_columns_retired = true;
-#endif
 }
+#endif
 
 static void *
 wl_columnar_relation_radix_malloc(size_t size, const char *site)
@@ -998,7 +998,9 @@ col_rel_grow_owned_transition_impl(col_rel_t *r, uint32_t new_cap,
 fail:
     col_columns_free(new_columns, r->ncols);
     free(new_timestamps);
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
     wl_columnar_relation_test_note_resize_columns_retired();
+#endif
     col_rel_reservation_rollback(&pending);
     return ENOMEM;
 }
@@ -1101,7 +1103,9 @@ fail:
             free(*cursor); /* NOLINT(clang-analyzer-security.ArrayBound) */
         free((void *)private_cols);
     }
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
     wl_columnar_relation_test_note_resize_columns_retired();
+#endif
     col_rel_reservation_rollback(&pending);
     return ENOMEM;
 }
@@ -2320,7 +2324,9 @@ col_rel_reserve_capacity_admitted(col_rel_t *r, uint32_t new_cap,
             &previous) != 0) {
             col_columns_free(new_cols, r->ncols);
             free(new_ts);
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
             wl_columnar_relation_test_note_resize_columns_retired();
+#endif
             col_rel_reservation_rollback(&pending);
             return ENOMEM;
         }
@@ -2491,7 +2497,9 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
                 new_bytes, &previous) != 0) {
                 col_columns_free(new_cols, r->ncols);
                 free(new_ts);
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
                 wl_columnar_relation_test_note_resize_columns_retired();
+#endif
                 col_rel_reservation_rollback(&pending);
                 goto enomem;
             }
@@ -2641,7 +2649,9 @@ col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
         &previous) != 0) {
         col_columns_free(new_cols, r->ncols);
         free(new_ts);
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
         wl_columnar_relation_test_note_resize_columns_retired();
+#endif
         col_rel_reservation_rollback(&pending);
         return ENOMEM;
     }
