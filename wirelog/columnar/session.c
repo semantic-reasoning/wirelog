@@ -3838,7 +3838,7 @@ wl_columnar_session_budget_denial_clear(wl_col_session_t *sess)
 }
 
 static int
-col_session_step(wl_session_t *session)
+col_session_step_impl(wl_session_t *session)
 {
     wl_col_session_t *sess = COL_SESSION(session);
     wl_columnar_session_budget_denial_clear(sess);
@@ -4158,6 +4158,26 @@ col_session_reset_snapshot_profile(wl_col_session_t *sess)
 }
 
 static int
+col_session_step(wl_session_t *session)
+{
+    wl_col_session_t *sess = COL_SESSION(session);
+    int rc;
+    bool active = sess->base.evaluation_control != NULL;
+    if (active) {
+        rc = wl_evaluation_control_begin(sess->base.evaluation_control,
+                &sess->base);
+        if (rc != 0)
+            return rc;
+    }
+    rc = col_session_step_impl(session);
+    if (active)
+        rc = wl_evaluation_control_finish(sess->base.evaluation_control,
+                &sess->base,
+                rc, 0);
+    return rc;
+}
+
+static int
 col_session_emit_snapshot(const wl_plan_t *plan, wl_col_session_t *sess,
     wirelog_on_tuple_fn callback, void *user_data)
 {
@@ -4379,7 +4399,7 @@ wl_columnar_session_profile_begin(const wl_plan_t *plan, uint64_t affected_mask,
  * @return 0 on success, EINVAL if session/callback NULL, non-zero on eval error
  */
 static int
-col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
+col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
     void *user_data)
 {
     if (!session || !callback)
@@ -4402,7 +4422,7 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
         return deferred_rc;
     if (sess->plain_step_completion_pending) {
         /* Drain a refused plain STEP before snapshot callbacks are emitted. */
-        int resume_rc = col_session_step(session);
+        int resume_rc = col_session_step_impl(session);
         if (resume_rc != 0)
             return resume_rc;
     }
@@ -4885,6 +4905,27 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
         fprintf(stderr, "TDD snapshot complete evaluated_count=%u rc=0\n",
             tdd_profile_evaluated);
     return snapshot_rc;
+}
+
+static int
+col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
+    void *user_data)
+{
+    wl_col_session_t *sess = COL_SESSION(session);
+    int rc;
+    bool active = sess->base.evaluation_control != NULL;
+    if (active) {
+        rc = wl_evaluation_control_begin(sess->base.evaluation_control,
+                &sess->base);
+        if (rc != 0)
+            return rc;
+    }
+    rc = col_session_snapshot_impl(session, callback, user_data);
+    if (active)
+        rc = wl_evaluation_control_finish(sess->base.evaluation_control,
+                &sess->base,
+                rc, 0);
+    return rc;
 }
 
 /* Affected strata/rules detection moved to columnar/frontier.c;
