@@ -5084,6 +5084,7 @@ inject_serial_metadata(wl_col_session_t *sess, eval_stack_t *stack,
         .iteration = 8, .stratum = 4, .worker = 1, .multiplicity = 6
     };
     source->compound_arity_map = malloc(sizeof(uint32_t));
+    source->compound_arity_len = 1;
     if (!source->compound_arity_map)
         return;
     source->compound_arity_map[0] = 1;
@@ -7578,6 +7579,7 @@ idb_after_eval(wl_col_session_t *sess)
             target->timestamps[row] = idb_timestamp(row);
         if (!target->compound_arity_map) {
             target->compound_arity_map = malloc(sizeof(uint32_t));
+            target->compound_arity_len = 1;
             if (!target->compound_arity_map)
                 return;
         }

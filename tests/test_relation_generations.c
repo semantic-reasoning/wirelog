@@ -2716,6 +2716,7 @@ test_constructor_schema_parity(void)
                         : WIRELOG_COMPOUND_KIND_SIDE;
                     src->compound_count = kind == 1 ? 1 : 0;
                     src->compound_arity_map = malloc(2 * sizeof(uint32_t));
+                    src->compound_arity_len = 2;
                     SCHEMA_CHECK(src->compound_arity_map, "source map");
                     src->compound_arity_map[0] = 1;
                     src->compound_arity_map[1] = 1;
@@ -2789,6 +2790,7 @@ test_constructor_schema_parity(void)
     src->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
     src->compound_count = 1;
     src->compound_arity_map = malloc(2 * sizeof(uint32_t));
+    src->compound_arity_len = 2;
     SCHEMA_CHECK(src->compound_arity_map, "fault map");
     src->compound_arity_map[0] = 1;
     src->compound_arity_map[1] = 1;
@@ -2858,6 +2860,7 @@ test_constructor_schema_parity(void)
         if (malformed == 2) {
             free(src->compound_arity_map);
             src->compound_arity_map = NULL;
+            src->compound_arity_len = 0;
             src->compound_kind = WIRELOG_COMPOUND_KIND_SIDE;
         }
         uint32_t used = pool->slot_used;
@@ -3479,6 +3482,7 @@ test_shared_view_relation_metadata(void)
     src->compound_count = 1u;
     src->inline_physical_offset = 0u;
     src->compound_arity_map = (uint32_t *)malloc(sizeof(uint32_t));
+    src->compound_arity_len = 1;
     CHECK(src->compound_arity_map != NULL, "source compound map");
     src->compound_arity_map[0] = 1u;
 
@@ -3489,6 +3493,7 @@ test_shared_view_relation_metadata(void)
     dst->compound_count = 0u;
     dst->inline_physical_offset = 0u;
     dst->compound_arity_map = (uint32_t *)malloc(sizeof(uint32_t));
+    dst->compound_arity_len = 1;
     CHECK(dst->compound_arity_map != NULL, "destination compound map");
     dst->compound_arity_map[0] = 1u;
 
@@ -3510,6 +3515,7 @@ test_shared_view_relation_metadata(void)
 
     free(src->compound_arity_map);
     src->compound_arity_map = (uint32_t *)malloc(sizeof(uint32_t));
+    src->compound_arity_len = 1;
     CHECK(src->compound_arity_map != NULL, "side compound map");
     src->compound_arity_map[0] = 1u;
     src->has_graph_column = false;
@@ -3528,6 +3534,7 @@ test_shared_view_relation_metadata(void)
 
     free(src->compound_arity_map);
     src->compound_arity_map = NULL;
+    src->compound_arity_len = 0;
     src->compound_kind = WIRELOG_COMPOUND_KIND_NONE;
     src->compound_count = 0u;
     src->inline_physical_offset = 0u;
@@ -3542,6 +3549,7 @@ test_shared_view_relation_metadata(void)
     src->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
     src->compound_count = 1u;
     src->compound_arity_map = (uint32_t *)calloc(1u, sizeof(uint32_t));
+    src->compound_arity_len = 1;
     CHECK(src->compound_arity_map != NULL, "malformed source map");
     uint32_t *saved_map = dst->compound_arity_map;
     uint64_t saved_view = dst->view_generation;
@@ -3556,6 +3564,7 @@ test_shared_view_relation_metadata(void)
 #ifdef WL_TEST_ALLOC_WRAP
     free(src->compound_arity_map);
     src->compound_arity_map = (uint32_t *)malloc(sizeof(uint32_t));
+    src->compound_arity_len = 1;
     CHECK(src->compound_arity_map != NULL, "failure-sweep source map");
     src->compound_arity_map[0] = 1u;
     src->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
@@ -3567,6 +3576,7 @@ test_shared_view_relation_metadata(void)
         CHECK(candidate != NULL, "metadata failure destination");
         candidate->compound_kind = WIRELOG_COMPOUND_KIND_SIDE;
         candidate->compound_arity_map = (uint32_t *)malloc(sizeof(uint32_t));
+        candidate->compound_arity_len = 1;
         CHECK(candidate->compound_arity_map != NULL,
             "metadata failure old map");
         candidate->compound_arity_map[0] = 1u;
@@ -4071,6 +4081,7 @@ test_staged_replacement_contract(void)
     candidate->compound_kind = WIRELOG_COMPOUND_KIND_SIDE;
     candidate->compound_count = 1u;
     candidate->compound_arity_map = (uint32_t *)calloc(1u, sizeof(uint32_t));
+    candidate->compound_arity_len = 1;
     CHECK(candidate->compound_arity_map != NULL,
         "replacement malformed schema map allocation");
     CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == EINVAL,
@@ -4081,6 +4092,7 @@ test_staged_replacement_contract(void)
         "replacement schema failure preserves state");
     free(candidate->compound_arity_map);
     candidate->compound_arity_map = NULL;
+    candidate->compound_arity_len = 0;
     candidate->compound_kind = WIRELOG_COMPOUND_KIND_NONE;
     candidate->compound_count = 0;
 #ifdef WL_TEST_ALLOC_WRAP

@@ -246,7 +246,7 @@ test_governed_logical_copy(void)
     expected = (uint64_t)source->ncols * source->capacity * sizeof(int64_t)
         + (uint64_t)timestamp_capacity * sizeof(col_delta_timestamp_t);
     make_resolution(&resolution,
-        expected + heap_descriptor_bytes("logical-copy"));
+        expected + heap_auto_bytes("logical-copy", 1));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     CHECK(ref != NULL, "logical-copy governor");
     if (!ref)
@@ -301,7 +301,7 @@ test_governed_logical_copy(void)
 
     atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
             ref)->usable_bytes,
-        expected - 1u + heap_descriptor_bytes("logical-copy"),
+        expected - 1u + heap_auto_bytes("logical-copy", 1),
         memory_order_release);
     CHECK(wl_columnar_relation_deep_copy_governed(source, &copy,
         ref) == ENOMEM && !copy
@@ -311,7 +311,7 @@ test_governed_logical_copy(void)
         "denied logical copy leaves source and governor unchanged");
     atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
             ref)->usable_bytes,
-        expected + heap_descriptor_bytes("logical-copy"),
+        expected + heap_auto_bytes("logical-copy", 1),
         memory_order_release);
     wl_columnar_relation_test_fail_next_governed_copy_payload_alloc();
     CHECK(wl_columnar_relation_deep_copy_governed(source, &copy, ref) == ENOMEM
@@ -346,6 +346,7 @@ test_governed_empty_compound_copy(void)
     if (!source)
         return;
     source->compound_arity_map = malloc(sizeof(arity));
+    source->compound_arity_len = 1;
     CHECK(source->compound_arity_map != NULL,
         "empty compound-copy arity allocation");
     if (!source->compound_arity_map)
@@ -365,7 +366,8 @@ test_governed_empty_compound_copy(void)
     uint64_t expected = (uint64_t)source->ncols * source->capacity
         * sizeof(int64_t);
     make_resolution(&resolution,
-        expected + heap_descriptor_bytes("empty-compound-copy"));
+        expected + heap_auto_bytes("empty-compound-copy", 2)
+        + 2u * sizeof(wirelog_column_type_t) + sizeof(uint32_t));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     CHECK(ref != NULL, "empty compound-copy governor");
     if (!ref)
@@ -1877,6 +1879,118 @@ cleanup:
         wl_columnar_memory_governor_ref_release(ref);
 }
 
+static void
+test_compound_map_admission_and_bounds(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_ref_t *ref;
+    col_rel_t *relation = col_rel_new_auto("map-admission", 2);
+    col_rel_t *copy = NULL;
+    const col_rel_logical_col_t wide = {
+        WIRELOG_COMPOUND_KIND_INLINE, 2u, 0u
+    };
+    uint64_t before;
+    uint64_t new_metadata;
+    uint64_t clone_peak;
+    uint32_t *old_map;
+    uint64_t old_view;
+
+    CHECK(relation != NULL, "compound map fixture");
+    if (!relation)
+        return;
+    make_resolution(&resolution, UINT64_MAX);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref != NULL, "compound map governor");
+    if (!ref) {
+        col_rel_destroy(relation);
+        return;
+    }
+    CHECK(col_rel_attach_memory_governor(relation, ref) == 0,
+        "compound map attach");
+    before = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+    new_metadata = relation->metadata_reservation->bytes
+        + sizeof(uint32_t);
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, before + new_metadata - 1u,
+        memory_order_release);
+    old_view = relation->view_generation;
+    CHECK(col_rel_apply_compound_schema(relation, &wide, 1u) == ENOSPC
+        && !relation->compound_arity_map
+        && relation->view_generation == old_view
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == before,
+        "one-byte-short map admission leaves relation unchanged");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, before + new_metadata,
+        memory_order_release);
+    CHECK(col_rel_apply_compound_schema(relation, &wide, 1u) == 0
+        && relation->compound_arity_len == 1u
+        && relation->metadata_reservation->bytes == new_metadata,
+        "exact-fit map admission charges logical allocation");
+    old_map = relation->compound_arity_map;
+    before = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+    old_view = relation->view_generation;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, before + new_metadata - 1u,
+        memory_order_release);
+    CHECK(col_rel_apply_compound_schema(relation, &wide, 1u) == ENOSPC
+        && relation->compound_arity_map == old_map
+        && relation->view_generation == old_view
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == before,
+        "map replacement denial retains old token and buffer");
+
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, UINT64_MAX, memory_order_release);
+    relation->compound_arity_len = 0;
+    CHECK(wl_columnar_relation_new_like_governed_checked("bad-map",
+        relation, ref, &copy) == EINVAL && !copy,
+        "zero map length is rejected before clone read");
+    relation->compound_arity_len = 1;
+    relation->compound_arity_map[0] = 0;
+    CHECK(wl_columnar_relation_new_like_governed_checked("bad-map",
+        relation, ref, &copy) == EINVAL && !copy,
+        "zero arity is rejected before clone read");
+    relation->compound_arity_map[0] = 3;
+    CHECK(wl_columnar_relation_new_like_governed_checked("bad-map",
+        relation, ref, &copy) == EINVAL && !copy,
+        "oversized arity is rejected before clone read");
+    relation->compound_arity_map[0] = 1;
+    CHECK(wl_columnar_relation_new_like_governed_checked("bad-map",
+        relation, ref, &copy) == EINVAL && !copy,
+        "arity sum mismatch is rejected before clone read");
+    relation->compound_arity_map[0] = 2;
+    clone_peak = before + heap_descriptor_bytes("clone-map")
+        + (uint64_t)relation->ncols * relation->capacity * sizeof(int64_t)
+        + auto_metadata_bytes(2) + new_metadata;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, clone_peak - 1u, memory_order_release);
+    CHECK(wl_columnar_relation_new_like_governed_checked("clone-map",
+        relation, ref, &copy) == ENOSPC && !copy,
+        "checked heap clone preserves one-byte map admission denial");
+    CHECK(wl_columnar_relation_pool_new_like_governed_checked(NULL,
+        "clone-map", relation, ref, &copy) == ENOSPC && !copy,
+        "checked pool fallback preserves one-byte map admission denial");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, clone_peak, memory_order_release);
+    CHECK(wl_columnar_relation_new_like_governed_checked("clone-map",
+        relation, ref, &copy) == 0 && copy
+        && copy->compound_arity_len == 1u
+        && copy->compound_arity_map[0] == 2u
+        && copy->metadata_reservation
+        && copy->metadata_reservation->bytes == new_metadata,
+        "checked heap clone charges exact compound map metadata");
+    col_rel_destroy(copy);
+    copy = NULL;
+    col_rel_destroy(relation);
+    CHECK(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0,
+        "compound map tokens released");
+    wl_columnar_memory_governor_ref_release(ref);
+}
+
 int
 main(void)
 {
@@ -1885,6 +1999,7 @@ main(void)
     test_schema_metadata_first_allocation();
     test_nested_arrow_metadata_adoption();
     test_pool_metadata_name_reuse();
+    test_compound_map_admission_and_bounds();
     test_governed_logical_copy();
     test_governed_empty_compound_copy();
     test_physical_timestamp_capacity();

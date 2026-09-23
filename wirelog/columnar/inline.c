@@ -64,13 +64,9 @@ wl_col_rel_inline_locate(const col_rel_t *rel, uint32_t logical_col,
     }
 
     uint32_t offset = 0u;
-    for (uint32_t i = 0; ; i++) {
-        /* Guard: all logical columns have been consumed without finding
-         * logical_col.  Checking offset >= ncols BEFORE indexing
-         * compound_arity_map prevents an out-of-bounds read when
-         * logical_col is >= logical_ncols (e.g. the caller passes 99
-         * for a 4-column schema).  The array has exactly logical_ncols
-         * entries, and after the last entry offset == ncols. */
+    for (uint32_t i = 0; i < rel->compound_arity_len; i++) {
+        /* The loop is bounded by the allocated logical map length.  Also
+         * reject an inconsistent physical prefix before using its width. */
         if (offset >= rel->ncols) {
             WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
                 "event=locate error=logical_col_oor rel=%s "
@@ -86,7 +82,7 @@ wl_col_rel_inline_locate(const col_rel_t *rel, uint32_t logical_col,
                 rel->name ? rel->name : "(anon)", logical_col, i);
             return EINVAL; /* Task #2 never emits zero-width entries */
         }
-        if (offset + width > rel->ncols) {
+        if (width > rel->ncols - offset) {
             WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
                 "event=locate error=logical_col_oor rel=%s "
                 "logical_col=%u physical_ncols=%u",
@@ -100,6 +96,7 @@ wl_col_rel_inline_locate(const col_rel_t *rel, uint32_t logical_col,
         }
         offset += width;
     }
+    return EINVAL;
 }
 
 int

@@ -652,6 +652,7 @@ test_compound_arity_map_round_trip_inline(void)
     /* logical layout: scalar, INLINE/2 (covers physical 1..2), <fill>.
      * Walk-by-physical sums: 1 + 2 = 3, matching ncols. */
     src->compound_arity_map = (uint32_t *)calloc(2u, sizeof(uint32_t));
+    src->compound_arity_len = 2u;
     ASSERT(src->compound_arity_map != NULL, "calloc arity_map failed");
     src->compound_arity_map[0] = 1u;
     src->compound_arity_map[1] = 2u;
@@ -696,6 +697,7 @@ test_compound_arity_map_corrupt_input_degrades(void)
     src->compound_count = 1u;
     src->inline_physical_offset = 0u;
     src->compound_arity_map = (uint32_t *)calloc(3u, sizeof(uint32_t));
+    src->compound_arity_len = 3u;
     ASSERT(src->compound_arity_map != NULL, "calloc arity_map failed");
     src->compound_arity_map[0] = 1u;
     src->compound_arity_map[1] = 0u; /* corrupt: width-zero entry */
@@ -754,6 +756,7 @@ test_deep_copy_remap_metadata_preserved(void)
     src->compound_count = 1u;
     src->inline_physical_offset = 1u;
     src->compound_arity_map = (uint32_t *)calloc(2u, sizeof(uint32_t));
+    src->compound_arity_len = 2u;
     ASSERT(src->compound_arity_map != NULL, "calloc arity_map failed");
     src->compound_arity_map[0] = 1u; /* scalar logical column */
     src->compound_arity_map[1] = 2u; /* INLINE compound, arity 2  */

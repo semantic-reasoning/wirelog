@@ -459,6 +459,8 @@ typedef struct col_rel {
      *   column, N (>=1) for an inline compound of arity N.  NULL when
      *   compound_kind != INLINE; Phase 2B populates this during schema
      *   inference.  Freed on relation destruction.
+     * compound_arity_len records that allocated logical count so validation
+     *   and cloning never infer a bound from the wider physical schema.
      *
      * inline_physical_offset
      *   Physical column index at which the first inline compound slot
@@ -474,6 +476,7 @@ typedef struct col_rel {
     wirelog_compound_kind_t compound_kind;
     uint32_t compound_count;
     uint32_t *compound_arity_map;
+    uint32_t compound_arity_len;
     uint32_t inline_physical_offset;
 
     /* Issue #1038: the relation's declared *physical* width, propagated from
@@ -2729,6 +2732,10 @@ col_rel_new_like(const char *name, const col_rel_t *src);
 col_rel_t *
 wl_columnar_relation_new_like_governed(const char *name, const col_rel_t *src,
     wl_columnar_memory_governor_ref_t *governor);
+/* The checked constructor retains ENOSPC for governor denial. */
+int wl_columnar_relation_new_like_governed_checked(const char *name,
+    const col_rel_t *src, wl_columnar_memory_governor_ref_t *governor,
+    col_rel_t **out);
 #ifdef WL_TEST_BDX_SEED
 int
 wl_columnar_eval_test_bdx_seed(col_rel_t *cidb,
@@ -2772,6 +2779,9 @@ col_rel_pool_new_like(delta_pool_t *pool, const char *name,
 col_rel_t *wl_columnar_relation_pool_new_like_governed(delta_pool_t *pool,
     const char *name, const col_rel_t *like,
     wl_columnar_memory_governor_ref_t *governor);
+int wl_columnar_relation_pool_new_like_governed_checked(delta_pool_t *pool,
+    const char *name, const col_rel_t *like,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out);
 
 /*
  * col_rel_deep_copy (Issue #553):

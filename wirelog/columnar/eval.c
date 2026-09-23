@@ -3190,17 +3190,16 @@ tdd_compound_map_entries(const col_rel_t *rel, uint32_t *entries_out)
     if (!rel->compound_arity_map || rel->ncols == 0
         || rel->compound_count == 0)
         return false;
-    while (physical < rel->ncols) {
-        uint32_t arity;
-
-        if (entries >= rel->ncols)
-            return false;
-        arity = rel->compound_arity_map[entries];
+    if (rel->compound_arity_len == 0)
+        return false;
+    for (entries = 0; entries < rel->compound_arity_len; entries++) {
+        uint32_t arity = rel->compound_arity_map[entries];
         if (arity == 0 || arity > rel->ncols - physical)
             return false;
         physical += arity;
-        entries++;
     }
+    if (physical != rel->ncols)
+        return false;
     *entries_out = entries;
     return true;
 }
