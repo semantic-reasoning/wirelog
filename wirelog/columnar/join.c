@@ -1537,8 +1537,52 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             out->nrows);
     } else {
         /* Standard merge-join for non-unary relations. */
+        wl_columnar_memory_reservation_t tmp_reservation;
+        bool tmp_admitted = false;
+        wl_columnar_memory_reservation_init(&tmp_reservation);
+        if (sess->memory_governor && kc > 0) {
+            uint64_t tmp_bytes = 0;
+            wl_columnar_memory_admission_status_t status;
+            if (!wl_columnar_memory_size_mul(ocols ? ocols : 1,
+                sizeof(int64_t), &tmp_bytes)) {
+                col_rel_destroy(out);
+                free(lk);
+                free(rk);
+                if (right_filtered)
+                    col_rel_destroy(right_filtered);
+                return wl_columnar_join_dispose_left(stack, &left_e,
+                           EOVERFLOW);
+            }
+            status = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(sess->memory_governor),
+                tmp_bytes, &tmp_reservation);
+            if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+                && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+                if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                    sess->memory_budget_denied = true;
+                col_rel_destroy(out);
+                free(lk);
+                free(rk);
+                if (right_filtered)
+                    col_rel_destroy(right_filtered);
+                return wl_columnar_join_dispose_left(stack, &left_e,
+                           status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                               ? ENOSPC
+                               : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                               ? EOVERFLOW : ENOMEM);
+            }
+            tmp_admitted = true;
+        }
+#define WL_JOIN_RELEASE_TMP() \
+        do { \
+            if (tmp_admitted) { \
+                (void)wl_columnar_memory_rollback(&tmp_reservation); \
+                tmp_admitted = false; \
+            } \
+        } while (0)
         tmp = (int64_t *)malloc(sizeof(int64_t) * (ocols ? ocols : 1));
         if (!tmp) {
+            WL_JOIN_RELEASE_TMP();
             col_rel_destroy(out);
             free(lk);
             free(rk);
@@ -1576,6 +1620,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     right = (col_rel_t *)arr_probe->source;
                     arr = arr_probe->arr;
                 } else if (probe_rc != ENOENT) {
+                    WL_JOIN_RELEASE_TMP();
                     free(tmp);
                     col_rel_destroy(out);
                     free(lk);
@@ -1597,6 +1642,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                         = col_arrangement_probe_bundle_acquire_dependency(
                             &arr_bundle, right);
                     if (dependency_rc != 0) {
+                        WL_JOIN_RELEASE_TMP();
                         free(tmp);
                         col_rel_destroy(out);
                         free(lk);
@@ -1621,6 +1667,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 = col_arrangement_probe_bundle_acquire_dependency(
                     &arr_bundle, right);
             if (dependency_rc != 0) {
+                WL_JOIN_RELEASE_TMP();
                 free(tmp);
                 col_rel_destroy(out);
                 free(lk);
@@ -1646,6 +1693,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             /* Ephemeral hash table (delta path or arrangement unavailable). */
             if (col_join_bucket_count(right->nrows, &nbuckets_ep) != 0) {
                 (void)col_arrangement_probe_bundle_release(&arr_bundle);
+                WL_JOIN_RELEASE_TMP();
                 free(tmp);
                 col_rel_destroy(out);
                 free(lk);
@@ -1668,6 +1716,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                         &hash_bytes);
                 if (!sized) {
                     (void)col_arrangement_probe_bundle_release(&arr_bundle);
+                    WL_JOIN_RELEASE_TMP();
                     free(tmp);
                     col_rel_destroy(out);
                     free(lk);
@@ -1686,6 +1735,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                         sess->memory_budget_denied = true;
                     (void)col_arrangement_probe_bundle_release(&arr_bundle);
+                    WL_JOIN_RELEASE_TMP();
                     free(tmp);
                     col_rel_destroy(out);
                     free(lk);
@@ -1715,6 +1765,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 if (hash_admitted)
                     (void)wl_columnar_memory_rollback(&hash_reservation);
                 (void)col_arrangement_probe_bundle_release(&arr_bundle);
+                WL_JOIN_RELEASE_TMP();
                 free(tmp);
                 col_rel_destroy(out);
                 free(lk);
@@ -1752,6 +1803,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 free(ht_next_ep);
                 if (hash_admitted)
                     (void)wl_columnar_memory_rollback(&hash_reservation);
+                WL_JOIN_RELEASE_TMP();
                 free(tmp);
                 col_rel_destroy(out);
                 free(lk);
@@ -1890,6 +1942,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
                 "Merge-join failed with rc=%d, out->nrows=%u",
                 join_rc, out->nrows);
+            WL_JOIN_RELEASE_TMP();
             free(tmp);
             col_rel_destroy(out);
             free(lk);
@@ -1910,6 +1963,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             release_rc = col_arrangement_probe_bundle_release(&arr_bundle);
         col_arrangement_pin_release(&arr_pin);
         if (release_rc != 0) {
+            WL_JOIN_RELEASE_TMP();
             free(tmp);
             col_rel_destroy(out);
             free(lk);
@@ -1918,9 +1972,11 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 col_rel_destroy(right_filtered);
             return wl_columnar_join_dispose_left(stack, &left_e, release_rc);
         }
+        WL_JOIN_RELEASE_TMP();
     }
 
     free(tmp);
+#undef WL_JOIN_RELEASE_TMP
     free(lk);
     free(rk);
     /* Propagate delta flag: result is a delta if left was delta OR we used
