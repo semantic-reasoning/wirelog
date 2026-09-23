@@ -365,6 +365,52 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
 /* --- K-FUSION is implemented in columnar/kfusion.c. */
 /* --- REDUCE (aggregate) -------------------------------------------------- */
 
+typedef struct {
+    uint64_t hash;
+    uint32_t row;
+} reduce_group_slot_t;
+
+typedef struct {
+    wl_columnar_memory_reservation_t reservation;
+    bool active;
+} wl_ops_scratch_t;
+
+static int
+wl_ops_scratch_reserve(wl_ops_scratch_t *scratch,
+    wl_columnar_memory_governor_ref_t *governor, uint64_t bytes,
+    wl_col_session_t *sess)
+{
+    wl_columnar_memory_admission_status_t status;
+    if (!scratch)
+        return EINVAL;
+    memset(scratch, 0, sizeof(*scratch));
+    wl_columnar_memory_reservation_init(&scratch->reservation);
+    if (!governor || bytes == 0)
+        return 0;
+    status = wl_columnar_memory_reserve_checked(
+        wl_columnar_memory_governor_ref_get(governor), bytes,
+        &scratch->reservation);
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+        || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+        scratch->active = true;
+        return 0;
+    }
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED && sess)
+        sess->memory_budget_denied = true;
+    return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+        : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
+        : ENOMEM;
+}
+
+static void
+wl_ops_scratch_release(wl_ops_scratch_t *scratch)
+{
+    if (scratch && scratch->active) {
+        (void)wl_columnar_memory_rollback(&scratch->reservation);
+        scratch->active = false;
+    }
+}
+
 int
 col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
@@ -381,8 +427,49 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
     col_rel_t *in = e.rel;
     uint32_t gc = op->group_by_count;
 
-    /* Output: the group columns and aggregate retain the rule-head order. */
+    uint32_t map_cap = 1;
+    uint64_t desired = (uint64_t)(in->nrows ? in->nrows : 1) * 2U;
+    while ((uint64_t)map_cap < desired && map_cap <= UINT32_MAX / 2U)
+        map_cap <<= 1;
+    if ((uint64_t)map_cap < desired)
+        return wl_columnar_ops_dispose_entry(stack, &e, EOVERFLOW);
+    uint64_t scratch_bytes = 0;
+    uint64_t bytes = 0;
     uint32_t ocols = gc + 1;
+    bool sized = wl_columnar_memory_size_mul(ocols,
+            sizeof(wirelog_column_type_t), &bytes)
+        && wl_columnar_memory_size_add(scratch_bytes, bytes,
+            &scratch_bytes)
+        && wl_columnar_memory_size_mul(ocols ? ocols : 1,
+            sizeof(int64_t), &bytes)
+        && wl_columnar_memory_size_add(scratch_bytes, bytes,
+            &scratch_bytes)
+        && wl_columnar_memory_size_mul(map_cap,
+            sizeof(reduce_group_slot_t), &bytes)
+        && wl_columnar_memory_size_add(scratch_bytes, bytes,
+            &scratch_bytes)
+        && wl_columnar_memory_size_mul(map_cap, sizeof(double), &bytes)
+        && wl_columnar_memory_size_add(scratch_bytes, bytes,
+            &scratch_bytes)
+        && wl_columnar_memory_size_mul(map_cap, sizeof(uint64_t), &bytes)
+        && wl_columnar_memory_size_add(scratch_bytes, bytes,
+            &scratch_bytes);
+    if (in->ncols > COL_STACK_MAX)
+        sized = sized
+            && wl_columnar_memory_size_mul(in->ncols, sizeof(int64_t),
+                &bytes)
+            && wl_columnar_memory_size_add(scratch_bytes, bytes,
+                &scratch_bytes);
+    if (!sized)
+        return wl_columnar_ops_dispose_entry(stack, &e, EOVERFLOW);
+    wl_ops_scratch_t scratch;
+    int scratch_rc = wl_ops_scratch_reserve(&scratch,
+            sess ? sess->memory_governor : NULL, scratch_bytes, sess);
+    if (scratch_rc != 0)
+        return wl_columnar_ops_dispose_entry(stack, &e, scratch_rc);
+#define WL_REDUCE_RELEASE_SCRATCH() wl_ops_scratch_release(&scratch)
+
+    /* Output: the group columns and aggregate retain the rule-head order. */
     uint32_t agg_index = op->aggregate_index < ocols
         ? op->aggregate_index : gc;
     col_rel_t *out = NULL;
@@ -392,6 +479,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
     out = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
             "$reduce", ocols);
     if (!out) {
+        WL_REDUCE_RELEASE_SCRATCH();
         return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
     }
 
@@ -401,6 +489,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
             (size_t)ocols * sizeof(*types));
         if (!types) {
             col_rel_destroy(out);
+            WL_REDUCE_RELEASE_SCRATCH();
             return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
         }
         for (uint32_t c = 0; c < gc; c++) {
@@ -415,6 +504,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         free(types);
         if (type_rc != 0) {
             col_rel_destroy(out);
+            WL_REDUCE_RELEASE_SCRATCH();
             return wl_columnar_ops_dispose_entry(stack, &e, type_rc);
         }
     }
@@ -422,6 +512,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
     int64_t *tmp = (int64_t *)malloc(sizeof(int64_t) * (ocols ? ocols : 1));
     if (!tmp) {
         col_rel_destroy(out);
+        WL_REDUCE_RELEASE_SCRATCH();
         return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
     }
 
@@ -434,6 +525,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         if (expr_rc != ENOTSUP && expr_rc != 0) {
             free(tmp);
             col_rel_destroy(out);
+            WL_REDUCE_RELEASE_SCRATCH();
             return wl_columnar_ops_dispose_entry(stack, &e, expr_rc);
         }
     }
@@ -444,24 +536,10 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         wl_columnar_expr_compiled_free(agg_ce);
         free(tmp);
         col_rel_destroy(out);
+        WL_REDUCE_RELEASE_SCRATCH();
         return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
     }
 
-    typedef struct {
-        uint64_t hash;
-        uint32_t row;
-    } reduce_group_slot_t;
-    uint32_t map_cap = 1;
-    uint64_t desired = (uint64_t)(in->nrows ? in->nrows : 1) * 2U;
-    while ((uint64_t)map_cap < desired && map_cap <= UINT32_MAX / 2U)
-        map_cap <<= 1;
-    if ((uint64_t)map_cap < desired) {
-        col_row_buf_release(&row_rb);
-        wl_columnar_expr_compiled_free(agg_ce);
-        free(tmp);
-        col_rel_destroy(out);
-        return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
-    }
     reduce_group_slot_t *groups = (reduce_group_slot_t *)calloc(map_cap,
             sizeof(*groups));
     if (!groups) {
@@ -469,6 +547,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         wl_columnar_expr_compiled_free(agg_ce);
         free(tmp);
         col_rel_destroy(out);
+        WL_REDUCE_RELEASE_SCRATCH();
         return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
     }
     double *sums = (double *)calloc(map_cap, sizeof(*sums));
@@ -481,6 +560,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         wl_columnar_expr_compiled_free(agg_ce);
         free(tmp);
         col_rel_destroy(out);
+        WL_REDUCE_RELEASE_SCRATCH();
         return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
     }
     uint32_t map_mask = map_cap - 1;
@@ -507,6 +587,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                     free(groups);
                     free(tmp);
                     col_rel_destroy(out);
+                    WL_REDUCE_RELEASE_SCRATCH();
                     return wl_columnar_ops_dispose_entry(stack, &e, ERANGE);
                 }
             } else {
@@ -523,6 +604,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                     free(groups);
                     free(tmp);
                     col_rel_destroy(out);
+                    WL_REDUCE_RELEASE_SCRATCH();
                     return wl_columnar_ops_dispose_entry(stack, &e, ERANGE);
                 }
             }
@@ -532,6 +614,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
             col_row_buf_release(&row_rb);
             wl_columnar_expr_compiled_free(agg_ce); free(tmp);
             col_rel_destroy(out);
+            WL_REDUCE_RELEASE_SCRATCH();
             return wl_columnar_ops_dispose_entry(stack, &e, EINVAL);
         }
 
@@ -591,6 +674,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                         col_row_buf_release(&row_rb);
                         wl_columnar_expr_compiled_free(agg_ce); free(tmp);
                         col_rel_destroy(out);
+                        WL_REDUCE_RELEASE_SCRATCH();
                         return wl_columnar_ops_dispose_entry(stack, &e, ERANGE);
                     }
                     sums[slot] = next_value;
@@ -611,6 +695,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                     free(groups);
                     free(tmp);
                     col_rel_destroy(out);
+                    WL_REDUCE_RELEASE_SCRATCH();
                     return wl_columnar_ops_dispose_entry(stack, &e, ERANGE);
                 }
                 set_rc = col_rel_set(out, group_row, agg_index, next);
@@ -649,6 +734,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                     col_row_buf_release(&row_rb);
                     wl_columnar_expr_compiled_free(agg_ce); free(tmp);
                     col_rel_destroy(out);
+                    WL_REDUCE_RELEASE_SCRATCH();
                     return wl_columnar_ops_dispose_entry(stack, &e, ERANGE);
                 }
                 set_rc = col_rel_set(out, group_row, agg_index,
@@ -689,6 +775,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                 free(groups);
                 free(tmp);
                 col_rel_destroy(out);
+                WL_REDUCE_RELEASE_SCRATCH();
                 return wl_columnar_ops_dispose_entry(stack, &e, rc);
             }
             groups[slot].hash = hash;
@@ -702,12 +789,14 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
     free(sums);
     free(counts);
     free(tmp);
+    WL_REDUCE_RELEASE_SCRATCH();
     int input_rc = wl_columnar_ops_dispose_entry(stack, &e, 0);
     if (input_rc != 0) {
         col_rel_destroy(out);
         return input_rc;
     }
-    return eval_stack_push(stack, out, true);
+    int push_rc = eval_stack_push(stack, out, true);
+    return push_rc;
 
 set_failure:
     col_row_buf_release(&row_rb);
@@ -717,8 +806,10 @@ set_failure:
     free(counts);
     free(tmp);
     col_rel_destroy(out);
+    WL_REDUCE_RELEASE_SCRATCH();
     return wl_columnar_ops_dispose_entry(stack, &e, set_rc);
 }
+#undef WL_REDUCE_RELEASE_SCRATCH
 
 /* --- REDUCE WEIGHTED (Z-set / Mobius COUNT) ------------------------------ */
 
