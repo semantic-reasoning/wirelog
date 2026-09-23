@@ -26,6 +26,7 @@
 
 #include <stdint.h>
 #include "wirelog/wirelog-types.h"
+#include "columnar/memory_governor.h"
 
 /* Maximum number of input relations supported by wl_lftj_join. */
 #define WL_LFTJ_MAX_K 64
@@ -103,5 +104,11 @@ int
 wl_columnar_lftj_join_typed(const wl_lftj_input_t *inputs,
     wirelog_column_type_t key_type, uint32_t k,
     wl_lftj_result_fn cb, void *user);
+
+int
+wl_columnar_lftj_join_typed_governed(const wl_lftj_input_t *inputs,
+    wirelog_column_type_t key_type, uint32_t k,
+    wl_lftj_result_fn cb, void *user,
+    wl_columnar_memory_governor_ref_t *governor);
 
 #endif /* WL_COLUMNAR_LFTJ_H */
