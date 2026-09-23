@@ -14,6 +14,18 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Every configure left the worktree dirty** (#1814): `.gitignore`
+  ignored `subprojects/xxHash-0.8.3/` while `subprojects/xxhash.wrap`
+  pins `directory = xxHash-0.8.4`, so the rule named a directory meson
+  no longer creates and did not name the one it does.  Since `8ab99d14`
+  bumped the wrap and left the rule behind, every `meson setup` added
+  104 untracked files to `git status`, on every machine.  Naming the
+  extraction directories cannot be made safe -- meson also creates
+  `subprojects/packagecache`, which is neither a wrap name nor any
+  `directory =` value -- so the rule is now deny-by-default:
+  `subprojects/*` with the tracked inputs re-included by name.  A wrap
+  bump can no longer desynchronise it.
+
 - **`log_abi_compile_erasure` asserted nothing** (#1808): the gate
   compiled libwirelog at `-Dwirelog_log_max_level=error` and checked
   that the TRACE sentinel string was absent from the artifact.  But

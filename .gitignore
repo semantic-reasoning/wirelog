@@ -63,10 +63,35 @@ bench/data/doop/*.facts
 .DS_Store
 Thumbs.db
 
-# Subproject dependencies (managed by wrap mechanism, not committed)
-subprojects/nanoarrow/
-subprojects/xxHash-0.8.3/
-subprojects/packagecache/
+# Subproject dependencies (managed by the wrap mechanism, not committed).
+#
+# Deny-by-default (#1814).  Meson extracts each wrap into
+# subprojects/<directory>, where <directory> is the wrap's `directory =`
+# value or, absent that key, the wrap's own name -- so the name changes on
+# every version bump.  Naming the extracted directories one by one
+# desynchronised at 8ab99d14, which bumped xxhash.wrap to 0.8.4 and left the
+# rule at 0.8.3, and every worktree stayed permanently dirty for several
+# releases.  Nothing objected because nothing compared the rule against the
+# wrap.
+#
+# Enumerating names cannot be made safe: meson also creates
+# subprojects/packagecache, which is neither a wrap name nor any `directory =`
+# value (mesonbuild/wrap/wrap.py:377).  So ignore everything directly under
+# subprojects/ and re-include the tracked inputs by name.
+#
+# `subprojects/*` carries an internal slash, so git anchors it here and `*`
+# does not cross `/`: it matches the direct children only, not any depth.
+# `*` does match a leading dot, so .wraplock needs its own re-inclusion.
+# scripts/ci/check-subprojects-ignored.sh asserts both halves.
+#
+# To track a NEW file directly under subprojects/, add a "!" line below.
+# Without one, `git add <path>` refuses it by name and `git add -A` drops it
+# with no message at all.
+subprojects/*
+!subprojects/*.wrap
+!subprojects/.wraplock
+!subprojects/packagefiles/
+
 *.uncrustify
 
 # SBOM generation artifacts (timestamped, regenerated per release; only snapshot.txt committed)
