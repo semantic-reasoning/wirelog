@@ -481,12 +481,18 @@ col_join_batch_producer_create(wl_col_session_t *sess,
     if (sess->memory_governor) {
         bool denied = false;
         rc = col_rel_attach_memory_governor(p->batch, sess->memory_governor);
-        if (rc != 0)
+        if (rc != 0) {
+            if (rc == ENOSPC || p->batch->memory_budget_denial_pending)
+                sess->memory_budget_denied = true;
             goto fail;
+        }
         rc = col_rel_reserve_capacity_admitted(p->batch, p->batch->capacity,
                 &denied);
-        if (rc != 0)
+        if (rc != 0) {
+            if (denied || p->batch->memory_budget_denial_pending)
+                sess->memory_budget_denied = true;
             goto fail;
+        }
     }
     /* #1481: the scratch is NOT admitted at rows_per_batch here.  It starts
      * at the COL_REL_INIT_CAP rows a fresh relation pre-allocates and doubles
@@ -703,11 +709,17 @@ col_join_batch_relation_sink_init(col_join_batch_relation_sink_t *ctx,
     if (sess->memory_governor) {
         bool denied = false;
         rc = col_rel_attach_memory_governor(out, sess->memory_governor);
-        if (rc != 0)
+        if (rc != 0) {
+            if (rc == ENOSPC || out->memory_budget_denial_pending)
+                sess->memory_budget_denied = true;
             return rc;
+        }
         rc = col_rel_reserve_capacity_admitted(out, out->capacity, &denied);
-        if (rc != 0)
+        if (rc != 0) {
+            if (denied || out->memory_budget_denial_pending)
+                sess->memory_budget_denied = true;
             return rc;
+        }
     }
     sink->context = ctx;
     sink->begin = sink_begin;

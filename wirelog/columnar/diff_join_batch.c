@@ -375,13 +375,19 @@ col_diff_join_batch_producer_create(wl_col_session_t *sess,
     p->rows_per_batch = rows > UINT32_MAX ? UINT32_MAX : (uint32_t)rows;
     if (sess->memory_governor) {
         rc = col_rel_attach_memory_governor(p->batch, sess->memory_governor);
-        if (rc != 0)
+        if (rc != 0) {
+            if (rc == ENOSPC || p->batch->memory_budget_denial_pending)
+                sess->memory_budget_denied = true;
             goto fail;
+        }
     }
     rc = col_rel_reserve_capacity_admitted(p->batch, p->rows_per_batch,
             NULL);
-    if (rc != 0)
+    if (rc != 0) {
+        if (p->batch->memory_budget_denial_pending)
+            sess->memory_budget_denied = true;
         goto fail;
+    }
     p->cursor.left_identity = left->relation_identity;
     p->cursor.left_view_gen = left->view_generation;
     p->cursor.left_storage_gen = left->storage_generation;

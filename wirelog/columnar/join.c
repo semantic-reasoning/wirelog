@@ -250,11 +250,17 @@ col_join_admit_output(wl_col_session_t *sess, col_rel_t *out,
     if (!sess || !out || !sess->memory_governor || out->pool_owned)
         return 0;
     rc = col_rel_attach_memory_governor(out, sess->memory_governor);
-    if (rc != 0)
+    if (rc != 0) {
+        if (rc == ENOSPC || out->memory_budget_denial_pending)
+            sess->memory_budget_denied = true;
         return rc;
+    }
     if (!admit_capacity)
         return 0;
-    return col_rel_reserve_capacity_admitted(out, out->capacity, NULL);
+    rc = col_rel_reserve_capacity_admitted(out, out->capacity, NULL);
+    if (rc != 0 && out->memory_budget_denial_pending)
+        sess->memory_budget_denied = true;
+    return rc;
 }
 
 bool

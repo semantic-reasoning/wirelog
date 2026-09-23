@@ -1007,6 +1007,9 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
             if (rc == 0)
                 rc = col_rel_attach_memory_governor(final->rel,
                         coord->memory_governor);
+            if (rc == ENOSPC || (final->rel
+                && final->rel->memory_budget_denial_pending))
+                coord->memory_budget_denied = true;
         }
         for (uint32_t w = 0; rc == 0 && w < W; w++) {
             col_rel_t *part = stages->items[w].rel;
@@ -5592,10 +5595,12 @@ tdd_owner_build_candidate(col_rel_t *target, const char *name,
         candidate = col_rel_new_auto(name, 0);
         if (!candidate)
             return ENOMEM;
-        if (!target && governor
-            && col_rel_attach_memory_governor(candidate, governor) != 0) {
-            col_rel_destroy(candidate);
-            return ENOMEM;
+        if (!target && governor) {
+            rc = col_rel_attach_memory_governor(candidate, governor);
+            if (rc != 0) {
+                col_rel_destroy(candidate);
+                return rc;
+            }
         }
     }
     for (uint32_t i = 0; i < input_count; i++) {
@@ -5795,11 +5800,14 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
             rc = ENOMEM;
             goto fail;
         }
-        if (!schema_source && coord->memory_governor
-            && col_rel_attach_memory_governor(combined,
-            coord->memory_governor) != 0) {
-            rc = ENOMEM;
-            goto fail;
+        if (!schema_source && coord->memory_governor) {
+            rc = col_rel_attach_memory_governor(combined,
+                    coord->memory_governor);
+            if (rc != 0) {
+                if (rc == ENOSPC || combined->memory_budget_denial_pending)
+                    coord->memory_budget_denied = true;
+                goto fail;
+            }
         }
         for (uint32_t w = 0; w < W; w++) {
             col_rel_t *d = ctxs[w].delta_rels[ri];
@@ -5982,6 +5990,8 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
     return 0;
 
 fail:
+    if (rc == ENOSPC)
+        coord->memory_budget_denied = true;
     if (parts) {
         for (uint32_t w = 0; w < W; w++)
             col_rel_destroy(parts[w]);

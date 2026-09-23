@@ -327,8 +327,13 @@ tokens: coordinator creation, worker creation, and registry growth admit the
 full pointer capacity before allocation, while a prepared image admits both
 its future registry array and validation copy until publication or discard.
 The image transfers its future array reservation to the session and releases
-the validation copy on publication. Relation descriptors and their name and
-schema metadata remain a separate allocation class.
+the validation copy on publication. Heap relation descriptors, copied names,
+and their stable reservation tokens are charged as one relation-owned class.
+Session input constructors reserve before allocation; attaching a governor to
+an already allocated heap relation admits its existing descriptor/name
+transactionally. Checked destruction returns this credit after the descriptor
+is freed. Pool slab storage belongs to `ARENA`; heap allocated names on pooled
+relations, plus schema and type metadata, remain separate admission work.
 
 The following matrix is the boundary for allocations created outside a
 managed columnar session. “Covered” means that the owner retains a governor

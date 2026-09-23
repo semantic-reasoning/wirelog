@@ -354,6 +354,8 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
         if (rc == 0)
             rc = col_rel_reserve_capacity_admitted(out, out->capacity, NULL);
         if (rc != 0) {
+            if (rc == ENOSPC || out->memory_budget_denial_pending)
+                sess->memory_budget_denied = true;
             col_rel_destroy(out);
             wl_columnar_continuation_cancel(continuation);
             wl_columnar_continuation_destroy(continuation);

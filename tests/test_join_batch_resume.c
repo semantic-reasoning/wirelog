@@ -89,7 +89,8 @@ make_session(uint64_t budget)
     s->frontier_ops = &col_frontier_epoch_ops;
     s->delta_pool = delta_pool_create(256, sizeof(col_rel_t), 1024 * 1024);
     wl_mem_ledger_init(&s->mem_ledger, 0);
-    s->memory_governor = make_governor(budget);
+    s->memory_governor = make_governor(budget
+            + 16u * sizeof(col_rel_t *) + 17u * sizeof(uint32_t));
     if (!s->delta_pool || !s->memory_governor) {
         if (s->delta_pool)
             delta_pool_destroy(s->delta_pool);
@@ -150,7 +151,8 @@ static uint64_t
 reserved_of(const wl_col_session_t *s)
 {
     return wl_columnar_memory_reserved(
-        wl_columnar_memory_governor_ref_get(s->memory_governor));
+        wl_columnar_memory_governor_ref_get(s->memory_governor))
+           - s->rels_reservation.bytes - s->rel_hash_reservation.bytes;
 }
 
 static col_rel_t *

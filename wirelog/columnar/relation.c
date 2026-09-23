@@ -1174,15 +1174,51 @@ int
 col_rel_attach_memory_governor(col_rel_t *r,
     wl_columnar_memory_governor_ref_t *memory_governor)
 {
+    wl_columnar_memory_reservation_t pending;
+    wl_columnar_memory_reservation_t *owned = NULL;
+    wl_columnar_memory_admission_status_t status;
+    uint64_t bytes;
+
     if (!r || !memory_governor)
         return EINVAL;
     if (r->memory_governor == memory_governor)
         return 0;
     if (r->memory_governor || r->retained_reserved_bytes != 0)
         return EBUSY;
+    /* A heap relation may have been built before its session was known.
+    * Adopt its already-owned descriptor and name as one transaction. */
+    if (!r->pool_owned) {
+        uint64_t name_bytes = r->name ? strlen(r->name) + 1u : 0u;
+        if (!wl_columnar_memory_size_add(sizeof(*r),
+            name_bytes, &bytes)
+            || !wl_columnar_memory_size_add(bytes, sizeof(*owned), &bytes))
+            return EOVERFLOW;
+        wl_columnar_memory_reservation_init(&pending);
+        status = wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(memory_governor), bytes,
+            &pending);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                r->memory_budget_denial_pending = true;
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : EOVERFLOW;
+        }
+        owned = (wl_columnar_memory_reservation_t *)malloc(sizeof(*owned));
+        if (!owned) {
+            col_rel_reservation_rollback(&pending);
+            return ENOMEM;
+        }
+        wl_columnar_memory_reservation_init(owned);
+        if (!wl_columnar_memory_reservation_move(owned, &pending)
+            || !wl_columnar_memory_commit(owned, r))
+            abort();
+    }
     r->memory_governor = memory_governor;
     wl_columnar_memory_governor_ref_retain(memory_governor);
+    r->descriptor_reservation = owned;
     wl_columnar_memory_reservation_init(&r->retained_reservation);
+    r->memory_budget_denial_pending = false;
     return 0;
 }
 
@@ -1313,7 +1349,8 @@ col_rel_ledger_release(col_rel_t *r)
 /* ---- lifecycle ---------------------------------------------------------- */
 
 static void
-col_rel_free_contents_impl(col_rel_t *r, bool preserve_access_gates)
+col_rel_free_contents_impl(col_rel_t *r, bool preserve_access_gates,
+    bool preserve_descriptor_admission)
 {
     uint64_t ledger_before;
 
@@ -1332,6 +1369,12 @@ col_rel_free_contents_impl(col_rel_t *r, bool preserve_access_gates)
      * concurrent admission cannot reuse credit while these buffers remain
      * resident. */
     free(r->name);
+    if (r->descriptor_reservation && !preserve_descriptor_admission) {
+        if (!wl_columnar_memory_release(r->descriptor_reservation))
+            abort();
+        free(r->descriptor_reservation);
+        r->descriptor_reservation = NULL;
+    }
     if (!r->arena_owned) {
         if (r->col_shared && r->columns) {
             /* Free only non-shared columns (6B zero-copy sharing) */
@@ -1372,7 +1415,8 @@ col_rel_free_contents_impl(col_rel_t *r, bool preserve_access_gates)
             && !wl_columnar_memory_release(&r->retained_reservation))
             abort();
         r->retained_reserved_bytes = 0;
-        wl_columnar_memory_governor_ref_release(r->memory_governor);
+        if (!preserve_descriptor_admission)
+            wl_columnar_memory_governor_ref_release(r->memory_governor);
         r->memory_governor = NULL;
     }
     if (preserve_access_gates) {
@@ -1390,7 +1434,11 @@ col_rel_free_contents_impl(col_rel_t *r, bool preserve_access_gates)
 void
 col_rel_free_contents(col_rel_t *r)
 {
-    col_rel_free_contents_impl(r, false);
+    /* A governed heap descriptor must retire through checked destruction so
+     * its reservation remains live until after free(descriptor). */
+    if (r && r->descriptor_reservation)
+        abort();
+    col_rel_free_contents_impl(r, false, false);
 }
 
 /*
@@ -1408,6 +1456,8 @@ col_rel_destroy_checked(col_rel_t *r)
     wl_columnar_source_access_reader_t owner_reader = { 0 };
     bool owner_writer_held = false;
     bool from_pool;
+    wl_columnar_memory_reservation_t *descriptor_reservation;
+    wl_columnar_memory_governor_ref_t *descriptor_governor;
     int rc;
 
     if (!r)
@@ -1449,7 +1499,9 @@ col_rel_destroy_checked(col_rel_t *r)
     }
 
     from_pool = r->pool_owned;
-    col_rel_free_contents_impl(r, true); /* memset zeroes pool_owned */
+    descriptor_reservation = r->descriptor_reservation;
+    descriptor_governor = descriptor_reservation ? r->memory_governor : NULL;
+    col_rel_free_contents_impl(r, true, descriptor_reservation != NULL);
     if (owner_reader.owner) {
         rc = wl_columnar_source_access_reader_release(&owner_reader);
         if (rc != 0)
@@ -1473,6 +1525,12 @@ col_rel_destroy_checked(col_rel_t *r)
         atomic_store_explicit(&r->storage_alias_borrows, 0,
             memory_order_relaxed);
         wl_columnar_memory_reservation_init(&r->retained_reservation);
+    }
+    if (descriptor_reservation) {
+        if (!wl_columnar_memory_release(descriptor_reservation))
+            abort();
+        free(descriptor_reservation);
+        wl_columnar_memory_governor_ref_release(descriptor_governor);
     }
     /* If pool_owned: struct memory freed on pool_reset(), skip free(). */
     return 0;
@@ -1660,6 +1718,8 @@ wl_columnar_relation_retirement_commit(
 {
     col_rel_t *relation;
     bool from_pool;
+    wl_columnar_memory_reservation_t *descriptor_reservation;
+    wl_columnar_memory_governor_ref_t *descriptor_governor;
 
     if (!token || !token->relation
         || !token->descriptor_writer.owner || !token->source_writer.owner
@@ -1674,11 +1734,15 @@ wl_columnar_relation_retirement_commit(
         abort();
     relation = token->relation;
     from_pool = relation->pool_owned;
+    descriptor_reservation = relation->descriptor_reservation;
+    descriptor_governor = descriptor_reservation
+        ? relation->memory_governor : NULL;
     /* Do not release terminal writers: their gate storage is part of the
      * descriptor about to be freed. Physical contents retire before the
      * retained governor credit is returned by free_contents_impl(). */
     memset(token, 0, sizeof(*token));
-    col_rel_free_contents_impl(relation, true);
+    col_rel_free_contents_impl(relation, true,
+        descriptor_reservation != NULL);
     if (!from_pool) {
         free(relation);
     } else {
@@ -1692,6 +1756,12 @@ wl_columnar_relation_retirement_commit(
         atomic_store_explicit(&relation->storage_alias_borrows, 0,
             memory_order_relaxed);
         wl_columnar_memory_reservation_init(&relation->retained_reservation);
+    }
+    if (descriptor_reservation) {
+        if (!wl_columnar_memory_release(descriptor_reservation))
+            abort();
+        free(descriptor_reservation);
+        wl_columnar_memory_governor_ref_release(descriptor_governor);
     }
 }
 
@@ -2088,20 +2158,63 @@ col_rel_set_column_types(col_rel_t *r, const wirelog_column_type_t *types,
 }
 
 int
-col_rel_alloc(col_rel_t **out, const char *name)
+wl_columnar_relation_alloc_governed(col_rel_t **out, const char *name,
+    wl_columnar_memory_governor_ref_t *memory_governor)
 {
+    wl_columnar_memory_reservation_t pending;
+    wl_columnar_memory_reservation_t *owned = NULL;
+    wl_columnar_memory_admission_status_t status;
+    uint64_t bytes;
+    if (!out || !name)
+        return EINVAL;
+    *out = NULL;
+    wl_columnar_memory_reservation_init(&pending);
+    if (memory_governor) {
+        if (!wl_columnar_memory_size_add(sizeof(col_rel_t),
+            strlen(name) + 1u, &bytes)
+            || !wl_columnar_memory_size_add(bytes, sizeof(*owned), &bytes))
+            return EOVERFLOW;
+        status = wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(memory_governor), bytes,
+            &pending);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : EOVERFLOW;
+    }
     col_rel_t *r = (col_rel_t *)calloc(1, sizeof(col_rel_t));
-    if (!r)
+    if (!r) {
+        col_rel_reservation_rollback(&pending);
         return ENOMEM;
+    }
     r->name = wl_strdup(name);
     if (!r->name) {
         free(r);
+        col_rel_reservation_rollback(&pending);
         return ENOMEM;
     }
     if (col_rel_new_identity(&r->relation_identity) != 0) {
         free(r->name);
         free(r);
+        col_rel_reservation_rollback(&pending);
         return EOVERFLOW;
+    }
+    if (memory_governor) {
+        owned = (wl_columnar_memory_reservation_t *)malloc(sizeof(*owned));
+        if (!owned) {
+            free(r->name);
+            free(r);
+            col_rel_reservation_rollback(&pending);
+            return ENOMEM;
+        }
+        wl_columnar_memory_reservation_init(owned);
+        if (!wl_columnar_memory_reservation_move(owned, &pending)
+            || !wl_columnar_memory_commit(owned, r))
+            abort();
+        r->descriptor_reservation = owned;
+        r->memory_governor = memory_governor;
+        wl_columnar_memory_governor_ref_retain(memory_governor);
+        wl_columnar_memory_reservation_init(&r->retained_reservation);
     }
     r->view_generation = 1u;
     r->storage_generation = 1u;
@@ -2109,6 +2222,12 @@ col_rel_alloc(col_rel_t **out, const char *name)
     col_rel_storage_owner_init(r);
     *out = r;
     return 0;
+}
+
+int
+col_rel_alloc(col_rel_t **out, const char *name)
+{
+    return wl_columnar_relation_alloc_governed(out, name, NULL);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -5363,6 +5482,10 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     old = *dst;
     name = old.name;
     staged_name = staged->name;
+    wl_columnar_memory_reservation_t *staged_descriptor_reservation
+        = staged->descriptor_reservation;
+    wl_columnar_memory_governor_ref_t *staged_governor
+        = staged->memory_governor;
     ledger = old.mem_ledger;
     governor = old.memory_governor;
     identity = old.relation_identity;
@@ -5382,6 +5505,13 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     staged->name = NULL;
     free(staged_name);
     free(staged);
+    if (staged_descriptor_reservation) {
+        if (!wl_columnar_memory_release(staged_descriptor_reservation))
+            abort();
+        free(staged_descriptor_reservation);
+    }
+    if (staged_governor)
+        wl_columnar_memory_governor_ref_release(staged_governor);
     replacement->staged = NULL;
 
     dst->relation_identity = identity;
@@ -5390,6 +5520,7 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     dst->pool_owned = old.pool_owned;
     dst->mem_ledger = ledger;
     dst->memory_governor = governor;
+    dst->descriptor_reservation = old.descriptor_reservation;
     dst->retained_reserved_bytes = 0;
     wl_columnar_memory_reservation_init(&dst->retained_reservation);
     if (has_new_reservation) {
@@ -5413,6 +5544,7 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
 
     replacement->reservation_active = false;
     old.name = NULL;
+    old.descriptor_reservation = NULL;
     old.mem_ledger = NULL;
     old.memory_governor = NULL;
     old.ledger_ts_bytes = 0;

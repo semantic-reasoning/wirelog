@@ -376,6 +376,9 @@ typedef struct col_rel {
      * accounting ledger: the token represents the relation's live heap
      * footprint and is only attached to session-owned input relations. */
     wl_columnar_memory_governor_ref_t *memory_governor;
+    /* Heap descriptor and name have a stable token because relation
+     * replacement copies the descriptor while preserving its identity. */
+    wl_columnar_memory_reservation_t *descriptor_reservation;
     /* Set when governed admission was denied while preparing this relation. */
     uint8_t memory_budget_denial_pending;
     wl_columnar_memory_reservation_t retained_reservation;
@@ -2455,6 +2458,9 @@ wl_columnar_arrangement_test_force_stale(wl_col_session_t *sess,
 #endif
 int
 col_rel_alloc(col_rel_t **out, const char *name);
+int
+wl_columnar_relation_alloc_governed(col_rel_t **out, const char *name,
+    wl_columnar_memory_governor_ref_t *memory_governor);
 int
 col_rel_attach_memory_governor(col_rel_t *rel,
     wl_columnar_memory_governor_ref_t *memory_governor);

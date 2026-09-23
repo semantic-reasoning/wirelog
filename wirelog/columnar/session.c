@@ -1997,6 +1997,7 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
     wl_columnar_memory_governor_ref_t *memory_governor;
     const wl_columnar_memory_governor_t *governor;
     bool intern_attached_here = false;
+    int creation_failure_rc = ENOMEM;
 
     if (!plan || !out)
         return EINVAL;
@@ -2398,12 +2399,10 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
     /* Pre-register EDB relations (ncols determined at first insert) */
     for (uint32_t i = 0; i < plan->edb_count; i++) {
         col_rel_t *r = NULL;
-        int rc = col_rel_alloc(&r, plan->edb_relations[i]);
-        if (rc != 0)
-            goto oom;
-        rc = col_rel_attach_memory_governor(r, sess->memory_governor);
+        int rc = wl_columnar_relation_alloc_governed(&r,
+                plan->edb_relations[i], sess->memory_governor);
         if (rc != 0) {
-            col_rel_destroy(r);
+            creation_failure_rc = rc == ENOSPC ? WL_ERR_MEMORY_BUDGET : rc;
             goto oom;
         }
         /* Issue #535: propagate graph-column metadata from plan to col_rel_t.
@@ -2469,13 +2468,11 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
         if (any_graph_enabled
             && session_find_rel(sess, "__graph_metadata") == NULL) {
             col_rel_t *meta = NULL;
-            int rc = col_rel_alloc(&meta, "__graph_metadata");
-            if (rc != 0)
-                goto oom;
-            rc = col_rel_attach_memory_governor(meta,
-                    sess->memory_governor);
+            int rc = wl_columnar_relation_alloc_governed(&meta,
+                    "__graph_metadata", sess->memory_governor);
             if (rc != 0) {
-                col_rel_destroy(meta);
+                creation_failure_rc = rc == ENOSPC ? WL_ERR_MEMORY_BUDGET
+                    : rc;
                 goto oom;
             }
             static const char *const meta_cols[6] = {
@@ -2536,7 +2533,7 @@ oom:
             sess->intern, sess->memory_governor);
     wl_columnar_memory_governor_ref_release(sess->memory_governor);
     free(sess);
-    return ENOMEM;
+    return creation_failure_rc;
 }
 
 /*
