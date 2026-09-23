@@ -98,6 +98,7 @@ static int
 test_wide_dedup_hash_without_allocation(void)
 {
     int64_t values[32];
+    _Alignas(64) int64_t expected_values[32];
     int64_t *columns[32];
     col_rel_t rel = { 0 };
 
@@ -108,7 +109,10 @@ test_wide_dedup_hash_without_allocation(void)
     }
     for (uint32_t width = 9; width <= 32; width += 23) {
         rel.ncols = width;
-        uint64_t expected = XXH3_64bits(values,
+        /* XXH3's one-shot ARM64 NEON path reads 16-byte vectors. */
+        memcpy(expected_values, values,
+            (size_t)width * sizeof(values[0]));
+        uint64_t expected = XXH3_64bits(expected_values,
                 (size_t)width * sizeof(values[0]));
         if (expected == 0)
             expected = 1;
