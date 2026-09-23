@@ -217,7 +217,7 @@ wl_columnar_relation_radix_bench_enabled(void)
 static int col_rel_grow_owned_transition_impl(col_rel_t *r,
     uint32_t new_cap, bool defer_alias_release);
 static int col_rel_cow_unshare_impl(col_rel_t *r, uint32_t new_cap,
-    bool defer_alias_release);
+    bool defer_alias_release, bool preserve_table_charge);
 
 static int
 col_rel_grow_owned_transition(col_rel_t *r, uint32_t new_cap)
@@ -558,7 +558,7 @@ col_rel_set(col_rel_t *r, uint32_t row, uint32_t col, int64_t val)
      * release prevents a new reader from entering through the detached view
      * before this mutation is complete. */
     if (r->col_shared) {
-        rc = col_rel_cow_unshare_impl(r, 0, true);
+        rc = col_rel_cow_unshare_impl(r, 0, true, false);
         if (rc != 0)
             goto release_writer;
         alias_release_pending = true;
@@ -586,8 +586,66 @@ release_writer:
  * deliberately independent of the current ownership mode: a shared or arena
  * relation is copied into heap storage and is not changed until the caller
  * reaches its publication point. */
+static bool
+col_rel_shared_table_bytes(uint32_t ncols, bool flags, uint64_t *out)
+{
+    uint64_t lane = sizeof(int64_t *) + (flags ? sizeof(bool) : 0u);
+    return wl_columnar_memory_size_mul(ncols, lane, out)
+           && *out <= SIZE_MAX;
+}
+
+/* A replacement table overlaps the old table during preparation.  Keep the
+ * old token committed and reserve the complete new shape until the old
+ * storage has physically been retired. */
 static int
-col_rel_prepare_resize(const col_rel_t *r, uint32_t new_cap,
+col_rel_begin_shared_table_replacement(col_rel_t *r)
+{
+    uint64_t bytes;
+    wl_columnar_memory_admission_status_t status;
+    if (!r->shared_table_reservation)
+        return 0;
+    if (!col_rel_shared_table_bytes(r->ncols, false, &bytes)
+        || !wl_columnar_memory_size_add(bytes,
+        sizeof(*r->shared_table_reservation), &bytes))
+        return EOVERFLOW;
+    status = wl_columnar_memory_begin_replacement(
+        r->shared_table_reservation, bytes);
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+        r->memory_budget_denial_pending = true;
+    return status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+           || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY ? 0
+        : status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+        : EOVERFLOW;
+}
+
+static void
+col_rel_finish_shared_table_replacement(col_rel_t *r, bool publish)
+{
+    if (!r->shared_table_reservation)
+        return;
+    if (publish) {
+        if (!wl_columnar_memory_commit_replacement(
+                r->shared_table_reservation))
+            abort();
+    } else if (!wl_columnar_memory_rollback_replacement(
+            r->shared_table_reservation)) {
+        abort();
+    }
+}
+
+static void
+col_rel_release_shared_table(col_rel_t *r)
+{
+    if (!r->shared_table_reservation)
+        return;
+    if (!wl_columnar_memory_release(r->shared_table_reservation))
+        abort();
+    free(r->shared_table_reservation);
+    r->shared_table_reservation = NULL;
+}
+
+static int
+col_rel_prepare_resize(col_rel_t *r, uint32_t new_cap,
     int64_t ***out_columns, col_delta_timestamp_t **out_timestamps)
 {
     int64_t **columns = NULL;
@@ -602,10 +660,15 @@ col_rel_prepare_resize(const col_rel_t *r, uint32_t new_cap,
 
     if (!r || !out_columns || !out_timestamps)
         return EINVAL;
+    int table_rc = col_rel_begin_shared_table_replacement(r);
+    if (table_rc != 0)
+        return table_rc;
     if (r->ncols > 0) {
         columns = col_columns_alloc(r->ncols, new_cap);
-        if (!columns)
+        if (!columns) {
+            col_rel_finish_shared_table_replacement(r, false);
             return ENOMEM;
+        }
         for (uint32_t c = 0; c < r->ncols; c++) {
             if (r->columns && r->columns[c] && r->nrows > 0)
                 memcpy(columns[c], r->columns[c],
@@ -617,6 +680,7 @@ col_rel_prepare_resize(const col_rel_t *r, uint32_t new_cap,
             (size_t)new_cap * sizeof(*timestamps));
         if (!timestamps) {
             col_columns_free(columns, r->ncols);
+            col_rel_finish_shared_table_replacement(r, false);
             return ENOMEM;
         }
         if (r->nrows > 0)
@@ -649,6 +713,8 @@ col_rel_release_column_storage(col_rel_t *r)
     }
     r->columns = NULL;
     r->col_shared = NULL;
+    /* Callers that replace the table settle its replacement token after
+     * publishing the new pointer. */
 }
 
 static void
@@ -662,6 +728,7 @@ col_rel_publish_resize(col_rel_t *r, int64_t **columns,
     r->timestamp_capacity = timestamps ? new_cap : 0;
     r->capacity = new_cap;
     r->arena_owned = false;
+    col_rel_finish_shared_table_replacement(r, true);
 }
 
 uint64_t
@@ -1333,6 +1400,11 @@ col_rel_grow_owned_transition_impl(col_rel_t *r, uint32_t new_cap,
             &new_bytes, NULL);
     if (pending_rc < 0)
         return ENOMEM;
+    int table_rc = col_rel_begin_shared_table_replacement(r);
+    if (table_rc != 0) {
+        col_rel_reservation_rollback(&pending);
+        return table_rc;
+    }
     new_columns = col_columns_alloc(r->ncols, new_cap);
     if (!new_columns)
         goto fail;
@@ -1372,6 +1444,7 @@ col_rel_grow_owned_transition_impl(col_rel_t *r, uint32_t new_cap,
         free((void *)old_columns);
     }
     free(old_shared_flags);
+    col_rel_finish_shared_table_replacement(r, true);
     free(old_timestamps);
     col_rel_release_retired_reservation(&previous);
     col_rel_ledger_reconcile(r, ledger_before);
@@ -1387,6 +1460,7 @@ fail:
     wl_columnar_relation_test_note_resize_columns_retired();
 #endif
     col_rel_reservation_rollback(&pending);
+    col_rel_finish_shared_table_replacement(r, false);
     return ENOMEM;
 }
 
@@ -1404,12 +1478,12 @@ col_rel_promote_arena_admitted(col_rel_t *r)
 int
 col_rel_cow_unshare(col_rel_t *r, uint32_t new_cap)
 {
-    return col_rel_cow_unshare_impl(r, new_cap, false);
+    return col_rel_cow_unshare_impl(r, new_cap, false, false);
 }
 
 static int
 col_rel_cow_unshare_impl(col_rel_t *r, uint32_t new_cap,
-    bool defer_alias_release)
+    bool defer_alias_release, bool preserve_table_charge)
 {
     wl_columnar_memory_reservation_t pending;
     wl_columnar_memory_reservation_t previous;
@@ -1471,6 +1545,15 @@ col_rel_cow_unshare_impl(col_rel_t *r, uint32_t new_cap,
         if (!any_shared) {
             free(r->col_shared);
             r->col_shared = NULL;
+            if (r->shared_table_reservation && !preserve_table_charge) {
+                uint64_t bytes;
+                if (!col_rel_shared_table_bytes(r->ncols, false, &bytes)
+                    || !wl_columnar_memory_size_add(bytes,
+                    sizeof(*r->shared_table_reservation), &bytes)
+                    || !wl_columnar_memory_reservation_downsize(
+                        r->shared_table_reservation, bytes))
+                    abort();
+            }
         }
     }
     col_rel_release_retired_reservation(&previous);
@@ -1511,7 +1594,7 @@ col_rel_cow_unshare_with_source_writer(col_rel_t *r,
         || writer->identity != (uintptr_t)writer
         || !wl_columnar_source_access_writer_thread_equal(writer))
         return EINVAL;
-    return col_rel_cow_unshare_impl(r, 0, true);
+    return col_rel_cow_unshare_impl(r, 0, true, false);
 }
 
 int
@@ -1520,8 +1603,10 @@ col_rel_attach_memory_governor(col_rel_t *r,
 {
     wl_columnar_memory_reservation_t pending;
     wl_columnar_memory_reservation_t metadata_pending;
+    wl_columnar_memory_reservation_t table_pending;
     wl_columnar_memory_reservation_t *owned = NULL;
     wl_columnar_memory_reservation_t *metadata_owned = NULL;
+    wl_columnar_memory_reservation_t *table_owned = NULL;
     wl_columnar_memory_admission_status_t status;
     uint64_t bytes;
     uint64_t metadata_bytes;
@@ -1541,6 +1626,22 @@ col_rel_attach_memory_governor(col_rel_t *r,
             metadata_bytes, &metadata_pending, &metadata_owned);
     if (metadata_rc != 0)
         return metadata_rc;
+    if (r->col_shared) {
+        uint64_t table_bytes;
+        if (!col_rel_shared_table_bytes(r->ncols, true,
+            &table_bytes)) {
+            col_rel_discard_metadata_reservation(&metadata_pending,
+                metadata_owned);
+            return EOVERFLOW;
+        }
+        int table_rc = col_rel_reserve_metadata(r, memory_governor,
+                table_bytes, &table_pending, &table_owned);
+        if (table_rc != 0) {
+            col_rel_discard_metadata_reservation(&metadata_pending,
+                metadata_owned);
+            return table_rc;
+        }
+    }
     /* A heap relation may have been built before its session was known.
     * Adopt its already-owned descriptor and name as one transaction. */
     if (!r->pool_owned) {
@@ -1550,6 +1651,9 @@ col_rel_attach_memory_governor(col_rel_t *r,
             || !wl_columnar_memory_size_add(bytes, sizeof(*owned), &bytes)) {
             col_rel_discard_metadata_reservation(&metadata_pending,
                 metadata_owned);
+            if (table_owned)
+                col_rel_discard_metadata_reservation(&table_pending,
+                    table_owned);
             return EOVERFLOW;
         }
         wl_columnar_memory_reservation_init(&pending);
@@ -1560,6 +1664,9 @@ col_rel_attach_memory_governor(col_rel_t *r,
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
             col_rel_discard_metadata_reservation(&metadata_pending,
                 metadata_owned);
+            if (table_owned)
+                col_rel_discard_metadata_reservation(&table_pending,
+                    table_owned);
             if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                 r->memory_budget_denial_pending = true;
             return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
@@ -1570,6 +1677,9 @@ col_rel_attach_memory_governor(col_rel_t *r,
             col_rel_reservation_rollback(&pending);
             col_rel_discard_metadata_reservation(&metadata_pending,
                 metadata_owned);
+            if (table_owned)
+                col_rel_discard_metadata_reservation(&table_pending,
+                    table_owned);
             return ENOMEM;
         }
         wl_columnar_memory_reservation_init(owned);
@@ -1582,10 +1692,16 @@ col_rel_attach_memory_governor(col_rel_t *r,
         &metadata_pending)
         || !wl_columnar_memory_commit(metadata_owned, r)))
         abort();
+    if (table_owned
+        && (!wl_columnar_memory_reservation_move(table_owned,
+        &table_pending)
+        || !wl_columnar_memory_commit(table_owned, r)))
+        abort();
     r->memory_governor = memory_governor;
     wl_columnar_memory_governor_ref_retain(memory_governor);
     r->descriptor_reservation = owned;
     r->metadata_reservation = metadata_owned;
+    r->shared_table_reservation = table_owned;
     wl_columnar_memory_reservation_init(&r->retained_reservation);
     r->memory_budget_denial_pending = false;
     return 0;
@@ -1908,6 +2024,7 @@ col_rel_free_contents_impl(col_rel_t *r, bool preserve_access_gates,
     free(r->col_shared);
     r->columns = NULL;
     r->col_shared = NULL;
+    col_rel_release_shared_table(r);
     col_columns_free(r->retract_backup_columns, r->ncols);
     col_columns_free(r->merge_columns, r->ncols);
     free(r->row_scratch);
@@ -3025,6 +3142,7 @@ col_rel_reserve_capacity_admitted(col_rel_t *r, uint32_t new_cap,
             wl_columnar_relation_test_note_resize_columns_retired();
 #endif
             col_rel_reservation_rollback(&pending);
+            col_rel_finish_shared_table_replacement(r, false);
             return ENOMEM;
         }
         col_rel_publish_resize(r, new_cols, new_ts, target);
@@ -3205,6 +3323,7 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
                 wl_columnar_relation_test_note_resize_columns_retired();
 #endif
                 col_rel_reservation_rollback(&pending);
+                col_rel_finish_shared_table_replacement(r, false);
                 goto enomem;
             }
             col_rel_publish_resize(r, new_cols, new_ts, new_cap);
@@ -3216,7 +3335,7 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
     /* A shared view can still have spare capacity.  Privatize it before the
      * in-place row write even when no capacity growth is needed. */
     if (r->col_shared) {
-        if (col_rel_cow_unshare_impl(r, 0, true) != 0)
+        if (col_rel_cow_unshare_impl(r, 0, true, false) != 0)
             goto enomem;
         alias_release_pending = true;
     }
@@ -3299,7 +3418,7 @@ col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
     /* A shared view can have spare capacity but still needs COW before the
      * first locked append.  Perform that fallible transition up front. */
     if (r->col_shared && required <= r->capacity) {
-        int rc = col_rel_cow_unshare_impl(r, 0, true);
+        int rc = col_rel_cow_unshare_impl(r, 0, true, false);
         if (rc == 0)
             *out_alias_release_pending = alias_release_pending;
         return rc;
@@ -3357,6 +3476,7 @@ col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
         wl_columnar_relation_test_note_resize_columns_retired();
 #endif
         col_rel_reservation_rollback(&pending);
+        col_rel_finish_shared_table_replacement(r, false);
         return ENOMEM;
     }
     col_rel_publish_resize(r, new_cols, new_ts, new_cap);
@@ -3466,6 +3586,7 @@ wl_columnar_relation_delta_detach(col_rel_t *rel, uint64_t expected_identity)
         free((void *)rel->columns);
     }
     free(rel->col_shared);
+    col_rel_release_shared_table(rel);
     rel->columns = NULL;
     rel->col_shared = NULL;
     rel->arena_owned = false;
@@ -3544,9 +3665,13 @@ wl_columnar_relation_delta_restore_flat_impl(col_rel_t *rel,
         rc = ENOMEM;
         goto done;
     }
+    rc = col_rel_begin_shared_table_replacement(rel);
+    if (rc != 0)
+        goto done;
     columns = col_columns_alloc(ncols, nrows);
     if (!columns) {
         rc = ENOMEM;
+        col_rel_finish_shared_table_replacement(rel, false);
         goto done;
     }
     for (uint32_t row = 0; row < nrows; row++)
@@ -3556,6 +3681,7 @@ wl_columnar_relation_delta_restore_flat_impl(col_rel_t *rel,
         && col_rel_publish_retained_reservation(rel, &pending, bytes,
         &previous) != 0) {
         rc = ENOMEM;
+        col_rel_finish_shared_table_replacement(rel, false);
         goto done;
     }
     uint64_t before = col_rel_owned_ledger_bytes(rel);
@@ -3583,6 +3709,7 @@ wl_columnar_relation_delta_restore_flat_impl(col_rel_t *rel,
         free((void *)old_columns);
         free(old_col_shared);
     }
+    col_rel_finish_shared_table_replacement(rel, true);
 #ifdef WL_TEST_RELATION_RESIZE_HOOK
     if (old_columns && wl_columnar_relation_test_after_retired_storage_free)
         wl_columnar_relation_test_after_retired_storage_free(rel);
@@ -3868,7 +3995,7 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
     /* Bulk append also mutates spare capacity, so a shared view must be
      * privatized even when the destination does not grow. */
     if (dst->col_shared) {
-        rc = col_rel_cow_unshare_impl(dst, 0, true);
+        rc = col_rel_cow_unshare_impl(dst, 0, true, false);
         if (rc != 0)
             goto cleanup;
         alias_release_pending = true;
@@ -4025,6 +4152,7 @@ col_rel_compact_impl(col_rel_t *r,
             free((void *)r->columns);
         }
         r->columns = NULL;
+        col_rel_release_shared_table(r);
         r->capacity = 0;
         r->arena_owned = false;
         col_columns_free(r->merge_columns, r->ncols);
@@ -4154,6 +4282,7 @@ col_rel_compact_impl(col_rel_t *r,
             col_rel_release_column_storage(&old_storage);
             free(old_ts);
         }
+        col_rel_finish_shared_table_replacement(r, true);
         /* Do not return the old footprint to the ledger until its buffers
          * have actually been freed.  The replacement remains governed by
          * the peak reservation until the commit below. */
@@ -4428,7 +4557,10 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
     int prepare_rc = ENOMEM;
     wl_columnar_memory_reservation_t metadata_pending;
     wl_columnar_memory_reservation_t *metadata_owned = NULL;
+    wl_columnar_memory_reservation_t shared_table_pending;
+    wl_columnar_memory_reservation_t *shared_table_owned = NULL;
     uint64_t metadata_bytes;
+    uint64_t shared_table_bytes = 0;
     uint64_t map_bytes = 0;
     if (!dst || !src || dst == src || dst->ncols != src->ncols)
         return EINVAL;
@@ -4489,6 +4621,16 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
             metadata_bytes, &metadata_pending, &metadata_owned);
     if (prepare_rc != 0)
         return prepare_rc;
+    if (!col_rel_shared_table_bytes(dst->ncols, true,
+        &shared_table_bytes)) {
+        prepare_rc = EOVERFLOW;
+        goto prepare_fail;
+    }
+    prepare_rc = col_rel_reserve_metadata(dst, dst->memory_governor,
+            shared_table_bytes, &shared_table_pending,
+            &shared_table_owned);
+    if (prepare_rc != 0)
+        goto prepare_fail;
     prepare_rc = ENOMEM;
     if (shared_arity_len > 0) {
         shared_arity_map = (uint32_t *)malloc((size_t)map_bytes);
@@ -4592,6 +4734,7 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
         }
         free((void *)old_columns);
         free(old_shared);
+        col_rel_release_shared_table(dst);
         free(dst->column_types);
         free(dst->timestamps);
         free(dst->compound_arity_map);
@@ -4621,6 +4764,13 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
             ArrowSchemaRelease(&dst->schema);
         dst->columns = shared_columns;
         dst->col_shared = shared_flags;
+        if (shared_table_owned) {
+            if (!wl_columnar_memory_reservation_move(shared_table_owned,
+                &shared_table_pending)
+                || !wl_columnar_memory_commit(shared_table_owned, dst))
+                abort();
+        }
+        dst->shared_table_reservation = shared_table_owned;
         dst->column_types = shared_types;
         dst->timestamps = shared_timestamps;
         dst->timestamp_capacity = shared_timestamp_capacity;
@@ -4665,6 +4815,7 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
     }
     shared_columns = NULL;
     shared_flags = NULL;
+    shared_table_owned = NULL;
     shared_types = NULL;
     shared_timestamps = NULL;
     shared_names = NULL;
@@ -4687,6 +4838,9 @@ prepare_fail:
     if (metadata_owned)
         col_rel_discard_metadata_reservation(&metadata_pending,
             metadata_owned);
+    if (shared_table_owned)
+        col_rel_discard_metadata_reservation(&shared_table_pending,
+            shared_table_owned);
     return prepare_rc;
 }
 
@@ -7776,7 +7930,7 @@ col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
          * and releases it afterwards (or hands it back).  Releasing inside
          * the COW and then rolling back would restore a borrowed view whose
          * borrow the owner no longer counts. */
-        if (col_rel_cow_unshare_impl(r, 0, true) != 0) {
+        if (col_rel_cow_unshare_impl(r, 0, true, true) != 0) {
             free((void *)old_columns);
             free(old_shared);
             return ENOMEM;
@@ -7813,6 +7967,16 @@ col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
         r->storage_generation = old_storage;
     } else if (borrowed && out_alias_release_pending) {
         *out_alias_release_pending = true;
+    }
+    if (rc == 0 && borrowed && !r->col_shared
+        && r->shared_table_reservation) {
+        uint64_t bytes;
+        if (!col_rel_shared_table_bytes(r->ncols, false, &bytes)
+            || !wl_columnar_memory_size_add(bytes,
+            sizeof(*r->shared_table_reservation), &bytes)
+            || !wl_columnar_memory_reservation_downsize(
+                r->shared_table_reservation, bytes))
+            abort();
     }
     free((void *)old_columns);
     free(old_shared);

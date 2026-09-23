@@ -381,6 +381,9 @@ typedef struct col_rel {
     wl_columnar_memory_reservation_t *descriptor_reservation;
     /* Heap-owned names, types, and Arrow schema; pool slab bytes are separate. */
     wl_columnar_memory_reservation_t *metadata_reservation;
+    /* Owns the pointer table installed by a shared view, plus its borrow
+     * flags while they exist.  The token follows the table through COW. */
+    wl_columnar_memory_reservation_t *shared_table_reservation;
     /* Set when governed admission was denied while preparing this relation. */
     uint8_t memory_budget_denial_pending;
     wl_columnar_memory_reservation_t retained_reservation;

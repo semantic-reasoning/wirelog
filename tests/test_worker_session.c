@@ -2478,14 +2478,18 @@ test_worker_retained_pool_alias_teardown_is_retryable(void)
         goto fail;
     arena_slot = arena_relation;
     uint64_t independent_token = independent->retained_reserved_bytes;
+    uint64_t independent_fixed = independent->descriptor_reservation->bytes
+        + independent->metadata_reservation->bytes;
     if (independent_token == 0
         || independent->retained_reservation.identity
         != &independent->retained_reservation
         || atomic_load_explicit(&independent->retained_reservation.state,
         memory_order_relaxed) != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
         || independent_token > UINT64_MAX - worker_baseline
+        || independent_fixed > UINT64_MAX - worker_baseline
+        - independent_token
         || wl_columnar_memory_reserved(governor)
-        != worker_baseline + independent_token)
+        != worker_baseline + independent_token + independent_fixed)
         goto fail;
 
     boundaries = (uint32_t *)malloc(2u * sizeof(*boundaries));
