@@ -228,9 +228,9 @@ lftj_emit_product(const lftj_iter_t *iters, uint32_t k, int64_t key,
 /* ======================================================================== */
 
 WL_COLUMNAR_LFTJ_NOINLINE int
-wl_columnar_lftj_join_typed(const wl_lftj_input_t *inputs,
+wl_columnar_lftj_join_typed_governed(const wl_lftj_input_t *inputs,
     wirelog_column_type_t key_type, uint32_t k, wl_lftj_result_fn cb,
-    void *user)
+    void *user, wl_columnar_memory_governor_ref_t *governor)
 {
     if (!inputs || k < 2u || k > WL_LFTJ_MAX_K || !cb)
         return EINVAL;
@@ -251,6 +251,40 @@ wl_columnar_lftj_join_typed(const wl_lftj_input_t *inputs,
         if (total_cols > UINT32_MAX - add)
             return EINVAL;
         total_cols += add;
+    }
+
+    uint64_t scratch_bytes = 0;
+    uint64_t bytes = 0;
+    if (!wl_columnar_memory_size_mul(k, sizeof(lftj_iter_t), &bytes)
+        || !wl_columnar_memory_size_add(scratch_bytes, bytes,
+        &scratch_bytes)
+        || !wl_columnar_memory_size_mul(total_cols, sizeof(int64_t), &bytes)
+        || !wl_columnar_memory_size_add(scratch_bytes, bytes,
+        &scratch_bytes)
+        || !wl_columnar_memory_size_mul(k, 2u * sizeof(uint32_t), &bytes)
+        || !wl_columnar_memory_size_add(scratch_bytes, bytes,
+        &scratch_bytes))
+        return EOVERFLOW;
+    for (uint32_t i = 0; i < k; i++) {
+        if (!wl_columnar_memory_size_mul(inputs[i].nrows, inputs[i].ncols,
+            &bytes)
+            || !wl_columnar_memory_size_mul(bytes, sizeof(int64_t), &bytes)
+            || !wl_columnar_memory_size_mul(bytes, 2u, &bytes)
+            || !wl_columnar_memory_size_add(scratch_bytes, bytes,
+            &scratch_bytes))
+            return EOVERFLOW;
+    }
+    wl_columnar_memory_reservation_t reservation;
+    wl_columnar_memory_reservation_init(&reservation);
+    if (governor && scratch_bytes > 0) {
+        wl_columnar_memory_admission_status_t status
+            = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(governor), scratch_bytes,
+                &reservation);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : ENOMEM;
     }
 
     /* Allocate and sort per-relation iterators. */
@@ -379,7 +413,17 @@ cleanup:
     for (uint32_t i = 0; i < k; i++)
         lftj_iter_free(&iters[i]);
     free(iters);
+    wl_columnar_memory_release(&reservation);
     return rc;
+}
+
+int
+wl_columnar_lftj_join_typed(const wl_lftj_input_t *inputs,
+    wirelog_column_type_t key_type, uint32_t k, wl_lftj_result_fn cb,
+    void *user)
+{
+    return wl_columnar_lftj_join_typed_governed(inputs, key_type, k, cb,
+               user, NULL);
 }
 
 int
