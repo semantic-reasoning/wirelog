@@ -201,22 +201,6 @@ run_direct_join(wl_col_session_t *col_session, col_rel_t *left,
     return 0;
 }
 
-/* An enforcing governor that admits the 32-byte join-key scratch but not the
-* 192-byte minimum arrangement table (16 buckets plus 16 chain slots) for the
-* two-row test relation. Existing relations stay on their original governor;
-* swapping this into a session only affects subsequently attached entries. */
-static wl_columnar_memory_governor_ref_t *
-tight_arrangement_governor(void)
-{
-    wl_columnar_memory_resolution_t resolution = { 0 };
-    resolution.budget_bytes = 32u;
-    resolution.usable_bytes = 32u;
-    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
-    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
-    resolution.status = WL_COLUMNAR_MEMORY_OK;
-    return wl_columnar_memory_governor_ref_create(&resolution);
-}
-
 /* ================================================================
  * Test 1: TC 3-edge correctness — arrangement probe path
  *
@@ -592,7 +576,7 @@ test_join_arr_primary_probe_writer_retry(void)
 }
 
 /* ================================================================
- * Test 11: Primary full-right JOIN propagates arrangement build ENOMEM
+ * Test 11: Primary full-right JOIN propagates arrangement admission denial
  *
  * ENOENT is the only primary probe miss that may use the old ephemeral
  * fallback.  Once the probe has admitted the exact source, allocation failure
@@ -601,7 +585,7 @@ test_join_arr_primary_probe_writer_retry(void)
 static void
 test_join_arr_primary_probe_enomem_propagates(void)
 {
-    TEST("Primary arrangement JOIN propagates build ENOMEM");
+    TEST("Primary arrangement JOIN propagates probe ENOMEM");
 
     const char *src = ".decl edge(x: int32, y: int32)\n"
         "edge(1, 100). edge(2, 200).\n";
@@ -614,22 +598,14 @@ test_join_arr_primary_probe_enomem_propagates(void)
     wl_col_session_t *col_session = COL_SESSION(sess);
     ASSERT(col_session->arr_count == 0, "right arrangement starts cold");
 
-    wl_columnar_memory_governor_ref_t *tight
-        = tight_arrangement_governor();
-    ASSERT(tight != NULL, "tight arrangement governor allocation failed");
-    wl_columnar_memory_governor_ref_t *orig_governor
-        = col_session->memory_governor;
-    col_session->memory_governor = tight;
-
     col_rel_t *left = make_join_left();
     ASSERT(left != NULL, "ENOMEM left fixture");
+    wl_columnar_arrangement_probe_test_fail_next_acquire(ENOMEM);
     rc = run_direct_join(col_session, left, NULL);
+    wl_columnar_arrangement_probe_test_clear();
     col_rel_destroy(left);
 
-    col_session->memory_governor = orig_governor;
-    wl_columnar_memory_governor_ref_release(tight);
-
-    ASSERT(rc == ENOMEM, "primary build ENOMEM must not fall back");
+    ASSERT(rc == ENOMEM, "primary probe failure must not fall back");
     ASSERT(col_session->arr_count == 0,
         "failed primary build must not publish an arrangement");
 

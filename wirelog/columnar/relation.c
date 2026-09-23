@@ -1002,23 +1002,33 @@ wl_columnar_relation_accounting_complete(const col_rel_t *r,
     uint64_t descriptor_bytes = 0;
     uint64_t metadata_bytes = 0;
     uint64_t retained_bytes = 0;
+    uint64_t shared_table_bytes = 0;
     uint64_t named_bytes;
+    uint32_t owned_columns;
     wl_columnar_memory_governor_t *raw_governor;
 
     if (!r)
         return false;
+    owned_columns = r->ncols;
+    if (r->col_shared) {
+        for (uint32_t i = 0; i < r->ncols; i++)
+            if (r->col_shared[i])
+                owned_columns--;
+    }
     if (!governor)
         return r->memory_governor == NULL
                && r->descriptor_reservation == NULL
                && r->metadata_reservation == NULL
                && r->retained_reserved_bytes == 0
                && r->aux_reserved_bytes == 0
+               && r->shared_table_reservation == NULL
                && atomic_load_explicit(&r->aux_reservation.state,
                    memory_order_acquire)
                != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED;
     if (r->memory_governor != governor
         || !col_rel_current_metadata_bytes(r, &metadata_bytes)
-        || !col_rel_retained_bytes_for(r, r->capacity, &retained_bytes))
+        || !col_rel_retained_bytes(owned_columns, r->capacity,
+        r->timestamps != NULL, &retained_bytes))
         return false;
 
     raw_governor = wl_columnar_memory_governor_ref_get(governor);
@@ -1034,6 +1044,18 @@ wl_columnar_relation_accounting_complete(const col_rel_t *r,
             return false;
     } else if (r->descriptor_reservation) {
         return false;
+    }
+
+    if (r->col_shared && !r->shared_table_reservation)
+        return false;
+    if (r->shared_table_reservation) {
+        if (!col_rel_shared_table_bytes(r->ncols, r->col_shared != NULL,
+            &shared_table_bytes)
+            || !wl_columnar_memory_size_add(shared_table_bytes,
+            sizeof(*r->shared_table_reservation), &shared_table_bytes)
+            || !col_rel_reservation_covers(r->shared_table_reservation,
+            raw_governor, shared_table_bytes))
+            return false;
     }
 
     if (metadata_bytes > 0

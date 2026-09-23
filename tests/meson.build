@@ -2773,12 +2773,23 @@ test('delta_arrangement', test_delta_arrangement_exe)
 # Join Arrangement Integration Tests (Phase 3C - 3C-002)
 # ============================================================================
 
+# Issue #1369: inject an arrangement probe allocation failure to prove JOIN
+# does not treat errors other than ENOENT as a cache miss.
+test_join_arrangement_arrangement = static_library(
+  'test_join_arrangement_arrangement',
+  files('../wirelog/columnar/arrangement.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_COLUMNAR_ARRANGEMENT_PROBE_TEST_HOOKS=1'],
+)
+
 test_join_arrangement_exe = executable(
   'test_join_arrangement',
   files('test_join_arrangement.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
-  link_with: [testlib_prod],
+  c_args: ['-DWL_COLUMNAR_ARRANGEMENT_PROBE_TEST_HOOKS=1'],
+  link_with: [test_join_arrangement_arrangement, testlib_prod],
 )
 
 test('join_arrangement', test_join_arrangement_exe)

@@ -91,6 +91,7 @@ typedef struct {
     void *memory_governor;
     void *descriptor_reservation;
     void *metadata_reservation;
+    void *shared_table_reservation;
     uint8_t memory_budget_denial_pending;
     struct {
         void *governor;

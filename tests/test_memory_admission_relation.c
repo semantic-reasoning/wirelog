@@ -2211,6 +2211,30 @@ test_shared_view_table_lifetime(void)
         "shared pointer table exact-fit retry");
     if (!view->shared_table_reservation)
         goto cleanup;
+    CHECK(wl_columnar_relation_accounting_complete(view, ref),
+        "complete accounting accepts governed shared pointer table");
+    wl_columnar_memory_reservation_t *table_token
+        = view->shared_table_reservation;
+    view->shared_table_reservation = NULL;
+    CHECK(!wl_columnar_relation_accounting_complete(view, ref),
+        "complete accounting rejects missing shared-table token");
+    view->shared_table_reservation = table_token;
+    table_token->governor = NULL;
+    CHECK(!wl_columnar_relation_accounting_complete(view, ref),
+        "complete accounting rejects wrong shared-table governor");
+    table_token->governor = wl_columnar_memory_governor_ref_get(ref);
+    table_token->bytes--;
+    CHECK(!wl_columnar_relation_accounting_complete(view, ref),
+        "complete accounting rejects undersized shared-table token");
+    table_token->bytes++;
+    uint64_t table_state = atomic_load_explicit(&table_token->state,
+            memory_order_relaxed);
+    atomic_store_explicit(&table_token->state,
+        WL_COLUMNAR_MEMORY_RESERVATION_EMPTY, memory_order_release);
+    CHECK(!wl_columnar_relation_accounting_complete(view, ref),
+        "complete accounting rejects uncommitted shared-table token");
+    atomic_store_explicit(&table_token->state, table_state,
+        memory_order_release);
     before = wl_columnar_memory_reserved(
         wl_columnar_memory_governor_ref_get(ref));
     wl_columnar_memory_reservation_t *first_token
@@ -2248,6 +2272,12 @@ test_shared_view_table_lifetime(void)
         == before + COL_REL_INIT_CAP * sizeof(int64_t)
         - sizeof(bool),
         "COW retains pointer table and credits freed flags");
+    CHECK(wl_columnar_relation_accounting_complete(view, ref),
+        "complete accounting accepts compact shared-table token after COW");
+    view->shared_table_reservation->bytes--;
+    CHECK(!wl_columnar_relation_accounting_complete(view, ref),
+        "complete accounting checks reduced shared-table token size");
+    view->shared_table_reservation->bytes++;
     CHECK(col_rel_compact(view) == 0
         && view->columns == NULL
         && view->shared_table_reservation == NULL
@@ -2281,6 +2311,8 @@ test_attach_existing_shared_table(void)
         "ungoverned shared table fixture");
     if (!source || !view || !view->col_shared)
         goto cleanup;
+    CHECK(wl_columnar_relation_accounting_complete(view, NULL),
+        "unmanaged shared table needs no governed token");
     make_resolution(&resolution, exact - 1u);
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     CHECK(ref && col_rel_attach_memory_governor(view, ref) == ENOSPC
@@ -2300,6 +2332,8 @@ test_attach_existing_shared_table(void)
         && wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(ref)) == exact,
         "preexisting shared table attach exact fit");
+    CHECK(wl_columnar_relation_accounting_complete(view, ref),
+        "attached shared table has complete governed accounting");
 cleanup:
     col_rel_destroy(view);
     col_rel_destroy(source);
