@@ -887,9 +887,37 @@ col_join_parallel_cross(wl_col_session_t *sess, const col_rel_t *left,
     if (nrows > 0)
         wl_columnar_relation_touch_view(out);
 
+    wl_columnar_memory_reservation_t ctx_reservation;
+    bool ctx_admitted = false;
+    wl_columnar_memory_reservation_init(&ctx_reservation);
+    if (sess->memory_governor) {
+        uint64_t ctx_bytes = 0;
+        wl_columnar_memory_admission_status_t status;
+        if (!wl_columnar_memory_size_mul(W, sizeof(col_join_cross_ctx_t),
+            &ctx_bytes)) {
+            col_rel_destroy(out);
+            return EOVERFLOW;
+        }
+        status = wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(sess->memory_governor),
+            ctx_bytes, &ctx_reservation);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                sess->memory_budget_denied = true;
+            col_rel_destroy(out);
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : ENOMEM;
+        }
+        ctx_admitted = true;
+    }
     col_join_cross_ctx_t *ctxs = (col_join_cross_ctx_t *)calloc(
         W, sizeof(col_join_cross_ctx_t));
     if (!ctxs) {
+        if (ctx_admitted)
+            (void)wl_columnar_memory_rollback(&ctx_reservation);
         col_rel_destroy(out);
         return ENOMEM;
     }
@@ -921,6 +949,8 @@ col_join_parallel_cross(wl_col_session_t *sess, const col_rel_t *left,
     wl_workqueue_wait_all(sess->wq);
     if (rc == 0)
         rc = atomic_load_explicit(&write_error, memory_order_relaxed);
+    if (ctx_admitted)
+        (void)wl_columnar_memory_rollback(&ctx_reservation);
     free(ctxs);
     if (rc != 0) {
         col_rel_destroy(out);
