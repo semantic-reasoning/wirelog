@@ -1277,6 +1277,35 @@ if sh.found()
        timeout: 120)
 endif
 
+# Issue #1814: .gitignore and the wrap files must agree about subprojects/.
+# The rule named subprojects/xxHash-0.8.3/ while xxhash.wrap pinned
+# directory = xxHash-0.8.4, so every configure left 104 untracked files behind,
+# on every machine, for several releases; nothing compared the two.  The gate
+# asserts that no tracked path under subprojects/ is ignored, that every
+# directory meson creates there IS ignored, and -- the assertion that rejects
+# the rule this issue removed -- that a name meson has never created is ignored
+# too, i.e. the rule covers any extraction directory rather than today's.
+if sh.found()
+  test('subprojects_ignored', sh,
+       args: [meson.project_source_root() / 'scripts/ci/check-subprojects-ignored.sh',
+              meson.project_source_root()],
+       suite: 'abi',
+       timeout: 120)
+
+  # Its self-test, which drives each assertion against a throwaway repository.
+  # 120 rather than Meson's 30s default per the #1464 rule.  It makes at
+  # least 25 assertions -- the floor the script itself enforces, so that
+  # number cannot drift out of this comment silently -- against a throwaway
+  # git repository per case, in under a second.  The budget is for a loaded
+  # CI runner, not for this workload; the #1487 walltime alarm at 50% of the
+  # timeout is nowhere near.  A fixture count is deliberately not quoted
+  # here: nothing pins it, and it went stale three times in review.
+  test('subprojects_ignored_selftest', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-check-subprojects-ignored.sh'],
+       suite: 'abi',
+       timeout: 120)
+endif
+
 # Issue #1343: the two wrap-reading gates must agree on what a section header
 # is. They did not -- `[wrap-git]  # the pin` is legal (configparser matches
 # headers by prefix, so meson builds it), and check-wrap-revisions.sh reported

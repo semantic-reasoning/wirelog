@@ -6,6 +6,17 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **`subprojects_ignored` gate** (#1814):
+  `scripts/ci/check-subprojects-ignored.sh`, registered as `meson test
+  --suite abi:subprojects_ignored`, asserts that `.gitignore` and the
+  wrap files agree.  No tracked path under `subprojects/` may be
+  ignored, every directory meson creates there must be ignored, and --
+  the assertion that rejects the rule this issue removed -- a name meson
+  has never created must be ignored too, so the rule covers any
+  extraction directory rather than today's.  Nothing compared the two
+  before, which is why the desynchronisation survived several releases.
+  Its self-test is `abi:subprojects_ignored_selftest`.
+
 ### Changed
 
 ### Deprecated
