@@ -1429,6 +1429,7 @@ test_lease_released_on_every_path(void)
     uint64_t reservation_base;
     uint64_t producer_live_reservation;
     uint64_t min_batch_bytes;
+    uint64_t output_descriptor_reservation;
     wl_columnar_continuation_status_t st;
     int rc;
 
@@ -1465,10 +1466,13 @@ test_lease_released_on_every_path(void)
     base_pins = entry->pin_count - 1u;
     rc = col_join_batch_run_to_relation(cont, f.sess, f.out);
     uint64_t output_reservation = f.out->retained_reserved_bytes;
+    output_descriptor_reservation = f.out->descriptor_reservation
+        ? f.out->descriptor_reservation->bytes : 0u;
     wl_columnar_continuation_destroy(cont);
     cont = NULL;
     if (rc != 0 || entry->pin_count != base_pins || f.out->nrows != 40u
-        || reserved_of(f.sess) != reservation_base + output_reservation) {
+        || reserved_of(f.sess) != reservation_base + output_reservation
+        + output_descriptor_reservation) {
         FAIL("success path leaked a lease");
         goto out;
     }
@@ -1496,7 +1500,7 @@ test_lease_released_on_every_path(void)
     cont = NULL;
     if (entry->pin_count != base_pins
         || reserved_of(f.sess) != reservation_base
-        + f.out->retained_reserved_bytes) {
+        + f.out->retained_reserved_bytes + output_descriptor_reservation) {
         FAIL("destroy after cancel leaked or double-released producer state");
         goto out;
     }
@@ -1518,7 +1522,7 @@ test_lease_released_on_every_path(void)
     wl_columnar_continuation_destroy(cont);
     cont = NULL;
     if (reserved_of(f.sess) != reservation_base
-        + f.out->retained_reserved_bytes) {
+        + f.out->retained_reserved_bytes + output_descriptor_reservation) {
         FAIL("destroy after pre-batch cancel leaked producer reservation");
         goto out;
     }
@@ -1528,7 +1532,7 @@ test_lease_released_on_every_path(void)
     ((col_arr_entry_t *)entry)->pin_count = base_pins;
     if (rc != EOVERFLOW || cont != NULL
         || reserved_of(f.sess) != reservation_base
-        + f.out->retained_reserved_bytes) {
+        + f.out->retained_reserved_bytes + output_descriptor_reservation) {
         FAIL("pin overflow leaked producer descriptor admission");
         goto out;
     }
@@ -1588,7 +1592,7 @@ test_lease_released_on_every_path(void)
     cont = NULL;
     if (entry->pin_count != base_pins
         || reserved_of(f.sess) != reservation_base
-        + f.out->retained_reserved_bytes) {
+        + f.out->retained_reserved_bytes + output_descriptor_reservation) {
         FAIL("post-denial create leaked its pin or producer reservation");
         goto out;
     }

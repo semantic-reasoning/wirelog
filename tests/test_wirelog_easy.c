@@ -13,6 +13,7 @@
 #include "../wirelog/util/log.h"
 #include "../wirelog/arena/compound_arena.h"
 #include "../wirelog/columnar/memory_governor.h"
+#include "../wirelog/backend.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/io/csv_reader.h"
 #include "../wirelog/intern.h"
@@ -2528,12 +2529,9 @@ reserved_on(wl_columnar_memory_governor_ref_t *ref)
         wl_columnar_memory_governor_ref_get(ref));
 }
 
-/* The create-time floor of a fact-free program: the bytes its intern table
- * admits when a session attaches it (#1431) plus the session's fixed
- * compound arena (probed with the library-default epoch count, so like the
- * budget tests this assumes WIRELOG_COMPOUND_MAX_EPOCHS is unset).  The
- * delta pool and eval arena degrade to malloc when denied, so an exact-fit
- * budget admits precisely these two. */
+/* Measure the complete create-time retained footprint, including session
+ * registry and relation metadata. Keep the probe budget below the optional
+ * pool/arena slab sizes so they use their fallback paths. */
 static int
 measure_create_floor(wirelog_program_t *prog, uint64_t *intern_bytes,
     uint64_t *compound_bytes)
@@ -2541,6 +2539,10 @@ measure_create_floor(wirelog_program_t *prog, uint64_t *intern_bytes,
     wl_columnar_memory_governor_ref_t *probe
         = enforcing_governor(UINT64_MAX / 4u);
     wl_compound_arena_t *arena = NULL;
+    wl_columnar_memory_governor_ref_t *floor_probe = NULL;
+    wl_plan_t *plan = NULL;
+    wl_session_t *session = NULL;
+    wl_session_options_t options;
     /* The public accessor is read-only; the probe attaches and detaches
      * the program-owned table exactly as session creation does. */
     wl_intern_t *intern = (wl_intern_t *)wirelog_program_get_intern(prog);
@@ -2560,9 +2562,42 @@ measure_create_floor(wirelog_program_t *prog, uint64_t *intern_bytes,
         goto out;
     *compound_bytes = reserved_on(probe);
     wl_compound_arena_free(arena);
+    arena = NULL;
     ok = reserved_on(probe) == 0 && *intern_bytes > 0
         && *compound_bytes > 0;
+    if (!ok)
+        goto out;
+    ok = 0;
+    if (wl_plan_from_program(prog, &plan) != 0 || !plan)
+        goto out;
+    floor_probe = enforcing_governor(*intern_bytes + *compound_bytes + 65536u);
+    if (!floor_probe)
+        goto out;
+    wl_session_options_init(&options);
+    options.memory_governor = floor_probe;
+    wl_session_testhook_set_default_options(&options);
+    int create_rc = wl_session_create(wl_backend_columnar(), plan, 1,
+            &session);
+    wl_session_testhook_set_default_options(NULL);
+    if (create_rc != 0 || !session)
+        goto out;
+    uint64_t full_bytes = reserved_on(floor_probe);
+    wl_session_destroy(session);
+    session = NULL;
+    if (full_bytes < *intern_bytes
+        || reserved_on(floor_probe) != *intern_bytes)
+        goto out;
+    *compound_bytes = full_bytes - *intern_bytes;
+    ok = 1;
 out:
+    if (session)
+        wl_session_destroy(session);
+    if (plan)
+        wl_plan_free(plan);
+    if (floor_probe)
+        wl_columnar_memory_governor_ref_release(floor_probe);
+    if (arena)
+        wl_compound_arena_free(arena);
     if (probe)
         wl_columnar_memory_governor_ref_release(probe);
     return ok ? 0 : -1;
