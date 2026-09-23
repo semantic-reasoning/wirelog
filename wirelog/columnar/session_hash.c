@@ -233,10 +233,10 @@ wl_columnar_session_hash_registry_image_discard(
 {
     if (!image)
         return;
-    free(image->rels);
+    free((void *)image->rels);
     free(image->hash_head);
     free(image->hash_next);
-    free(image->expected_rel_contents);
+    free((void *)image->expected_rel_contents);
     memset(image, 0, sizeof(*image));
 }
 
@@ -267,19 +267,20 @@ wl_columnar_session_hash_registry_image_prepare(wl_col_session_t *session,
     bytes = (size_t)cap * sizeof(*image->rels);
     if (cap != 0 && bytes / cap != sizeof(*image->rels))
         return EOVERFLOW;
-    image->rels = malloc(bytes);
+    image->rels = (col_rel_t **)malloc(bytes);
     if (!image->rels)
         return ENOMEM;
     if (session->nrels > 0) {
-        image->expected_rel_contents = malloc(
+        image->expected_rel_contents = (col_rel_t **)malloc(
             (size_t)session->nrels * sizeof(*image->expected_rel_contents));
         if (!image->expected_rel_contents) {
             wl_columnar_session_hash_registry_image_discard(image);
             return ENOMEM;
         }
-        memcpy(image->expected_rel_contents, session->rels,
+        memcpy((void *)image->expected_rel_contents,
+            (const void *)session->rels,
             (size_t)session->nrels * sizeof(*image->expected_rel_contents));
-        memcpy(image->rels, session->rels,
+        memcpy((void *)image->rels, (const void *)session->rels,
             (size_t)session->nrels * sizeof(*image->rels));
     }
 #ifdef WL_TEST_OWNER_PUBLICATION
@@ -314,6 +315,10 @@ wl_columnar_session_hash_registry_image_prepare(wl_col_session_t *session,
         uint32_t slot = 0;
         while (slot < image->nrels && image->rels[slot])
             slot++;
+        if (slot >= needed || slot >= cap) {
+            wl_columnar_session_hash_registry_image_discard(image);
+            return EOVERFLOW;
+        }
         if (slot == image->nrels)
             image->nrels++;
         image->rels[slot] = candidate;
@@ -415,9 +420,9 @@ wl_columnar_session_hash_registry_image_publish(
     image->rels = NULL;
     image->hash_head = NULL;
     image->hash_next = NULL;
-    free(old_rels);
+    free((void *)old_rels);
     free(old_head);
     free(old_next);
-    free(image->expected_rel_contents);
+    free((void *)image->expected_rel_contents);
     memset(image, 0, sizeof(*image));
 }
