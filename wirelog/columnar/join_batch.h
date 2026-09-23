@@ -95,9 +95,17 @@ col_join_batch_producer_create(wl_col_session_t *sess,
     const uint32_t *lk, const uint32_t *rk, uint32_t kc,
     uint64_t batch_bytes, wl_columnar_continuation_t **out);
 
-/* Rows per batch the producer settled on; 0 for a NULL continuation. */
+/* The MAXIMUM rows per batch the producer settled on; 0 for a NULL
+ * continuation.  An emitted batch can be shorter: since #1481 the scratch
+ * grows on demand, and a grow the governor refuses is answered with a short
+ * batch rather than a failed produce. */
 uint32_t
 col_join_batch_rows_per_batch(const wl_columnar_continuation_t *cont);
+
+/* Physical rows the scratch batch currently holds; 0 for a NULL
+ * continuation.  Test and diagnostic surface for #1481's lazy growth. */
+uint32_t
+col_join_batch_scratch_capacity(const wl_columnar_continuation_t *cont);
 
 /* Copy of the producer's full cursor for tests and diagnostics. */
 bool

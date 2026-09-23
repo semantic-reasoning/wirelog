@@ -95,9 +95,10 @@ typedef struct {
         int64_t *key_row;
         int64_t alignment;
     } key_row_storage;
-    col_rel_t *batch;        /* governed heap scratch, rows_per_batch rows */
+    col_rel_t *batch;        /* governed heap scratch, grown on demand */
     wl_columnar_memory_reservation_t descriptor_reservation;
     uint32_t rows_per_batch;
+    bool grow_denied_logged;  /* one WARN per producer, not per batch */
     col_join_batch_cursor_t cursor;
 } col_join_batch_producer_t;
 
@@ -166,6 +167,49 @@ producer_validate(void *context,
     return true;
 }
 
+/* Grow the scratch batch to hold row @n, doubling from whatever a fresh
+ * relation pre-allocated and clamping to rows_per_batch.  Returns false when
+ * the row cannot be written, which the caller turns into a short batch.
+ *
+ * p->batch->nrows MUST be set to n before the reserve.  producer_produce
+ * zeroes nrows while filling and only restores it at emit, and
+ * col_rel_prepare_resize copies exactly nrows rows -- so growing with nrows
+ * still 0 copies nothing, frees the old columns, and leaves every row written
+ * so far pointing at uninitialised malloc memory.  That is a silently wrong
+ * join, and neither ASan nor UBSan reports it; only an oracle comparison
+ * across a grow does.  #1481.
+ */
+static bool
+grow_scratch(col_join_batch_producer_t *p, uint32_t n)
+{
+    uint32_t cap = p->batch->capacity;
+    uint32_t want;
+    bool denied = false;
+    int rc;
+
+    /* The caller only grows at n == capacity, and the n == rows_per_batch
+     * park in the fill loop fires first otherwise, so cap < rows_per_batch
+     * on entry and both arms exceed cap.  The postcondition below does not
+     * rely on that, though: col_rel_reserve_capacity_admitted returns 0
+     * without growing whenever want <= capacity, so reporting its status
+     * would be reporting the call rather than the outcome. */
+    want = cap < p->rows_per_batch / 2u ? cap * 2u : p->rows_per_batch;
+    p->batch->nrows = n;
+    rc = col_rel_reserve_capacity_admitted(p->batch, want, &denied);
+    if (rc == 0 && p->batch->capacity > n)
+        return true;
+    if (!p->grow_denied_logged) {
+        p->grow_denied_logged = true;
+        WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_WARN,
+            "join batch scratch stuck at %u rows (wanted %u, ceiling %u): "
+            "%s; emitting short batches", cap, want, p->rows_per_batch,
+            denied ? "admission denied"
+                   : rc != 0 ? "allocation failed"
+                             : "the reserve did not grow it");
+    }
+    return false;
+}
+
 static wl_columnar_continuation_status_t
 producer_produce(void *context, const wl_columnar_continuation_cursor_t *cursor,
     wl_columnar_continuation_batch_t *batch)
@@ -199,6 +243,16 @@ producer_produce(void *context, const wl_columnar_continuation_cursor_t *cursor,
             /* Chains may hold collision rows; every candidate is checked. */
             if (col_join_keys_match_rel(p->left, lr, p->lk, p->right, rr,
                 p->rk, p->kc)) {
+                if (n == p->batch->capacity && !grow_scratch(p, n)) {
+                    /* Park on THIS candidate, not the next one: it was
+                    * never written, and the rr != UINT32_MAX resume path
+                    * re-tests it.  Emitting what we have keeps the scan
+                    * moving; refusing the batch would leave the cursor
+                    * unchanged and livelock under a tight governor. */
+                    next.lr = lr;
+                    next.rr = rr;
+                    goto emit;
+                }
                 if (col_join_write_pair_at(p->batch, n, p->left, lr,
                     p->right, rr, p->op->project_indices,
                     p->op->project_count) != 0)
@@ -434,13 +488,14 @@ col_join_batch_producer_create(wl_col_session_t *sess,
         if (rc != 0)
             goto fail;
     }
-    {
-        bool denied = false;
-        rc = col_rel_reserve_capacity_admitted(p->batch, p->rows_per_batch,
-                &denied);
-        if (rc != 0)
-            goto fail;
-    }
+    /* #1481: the scratch is NOT admitted at rows_per_batch here.  It starts
+     * at the COL_REL_INIT_CAP rows a fresh relation pre-allocates and doubles
+     * on demand in producer_produce, so a small join under a large
+     * WIRELOG_JOIN_BATCH_BYTES reserves what it uses rather than what the
+     * knob allows.  The governor-branch reservation above stays: it admits
+     * that initial capacity, and a session too tight for even 64 rows must
+     * still fail create rather than discover it mid-batch.
+     */
 
     p->cursor.next.lr = 0;
     p->cursor.next.rr = UINT32_MAX;
@@ -494,6 +549,13 @@ col_join_batch_rows_per_batch(const wl_columnar_continuation_t *cont)
 {
     const col_join_batch_producer_t *p = producer_of(cont);
     return p ? p->rows_per_batch : 0;
+}
+
+uint32_t
+col_join_batch_scratch_capacity(const wl_columnar_continuation_t *cont)
+{
+    const col_join_batch_producer_t *p = producer_of(cont);
+    return p ? p->batch->capacity : 0;
 }
 
 bool

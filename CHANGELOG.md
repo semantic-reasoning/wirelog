@@ -19,6 +19,21 @@ All notable changes to wirelog are documented in this file.
 
 ### Changed
 
+- **Bounded join scratch is sized lazily** (#1481):
+  `col_join_batch_producer_create` reserved `WIRELOG_JOIN_BATCH_BYTES /
+  row_bytes` rows of governed scratch at create, whatever the join's
+  actual fanout, so a small join under a large knob reserved far more
+  than its output -- a 10-row join under a 1 GiB knob reserved 32M rows.
+  The scratch now starts at the 64 rows a fresh relation pre-allocates
+  and doubles on demand under admission, clamped to the same
+  `rows_per_batch`, which stays both the batch boundary and the worst
+  case.  A grow the governor refuses is answered with a short batch
+  parked on the unwritten candidate rather than a failed produce, so a
+  budget too tight for the knob now completes in short batches where it
+  previously failed at create.  `docs/MEMORY.md` section 10a carries the
+  revised per-producer bound, including the 2x transient to budget
+  against.
+
 ### Deprecated
 
 ### Removed
