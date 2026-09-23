@@ -3794,8 +3794,10 @@ incremental_release_no_buf:
 static void col_session_reclaim_quiescent(wl_col_session_t *sess);
 
 bool
-wl_columnar_session_budget_denied(const wl_col_session_t *sess)
+wl_columnar_session_budget_denied(const void *session)
 {
+    const wl_col_session_t *sess = session;
+
     if (!sess || sess->memory_budget_denied)
         return sess != NULL && sess->memory_budget_denied;
     for (uint32_t i = 0; i < sess->tdd_workers_count; i++) {
@@ -4935,12 +4937,6 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
 /* Vtable Singleton                                                          */
 /* ======================================================================== */
 
-static bool
-col_session_budget_denied_query(wl_session_t *session)
-{
-    return wl_columnar_session_budget_denied(COL_SESSION(session));
-}
-
 static const wl_compute_backend_t col_backend = {
     .name = "columnar",
     .session_create = col_session_create,
@@ -4953,7 +4949,7 @@ static const wl_compute_backend_t col_backend = {
     .session_snapshot = col_session_snapshot,
     .session_memory_governor = col_session_memory_governor,
     .session_create_with_options = col_session_create_with_options,
-    .session_budget_denied = col_session_budget_denied_query,
+    .session_budget_denied = wl_columnar_session_budget_denied,
 };
 
 const wl_compute_backend_t *

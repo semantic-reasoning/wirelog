@@ -2096,7 +2096,7 @@ typedef struct wl_col_session_t {
 } wl_col_session_t;
 
 bool
-wl_columnar_session_budget_denied(const wl_col_session_t *sess);
+wl_columnar_session_budget_denied(const void *session);
 void
 wl_columnar_session_budget_denial_clear(wl_col_session_t *sess);
 

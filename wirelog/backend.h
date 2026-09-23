@@ -102,9 +102,9 @@ typedef struct {
         wl_session_t **out);
 
     /* Optional query for a backend-specific memory-budget denial from the
-     * most recent operation. Backends without governed admission leave this
-     * NULL. */
-    bool (*session_budget_denied)(wl_session_t *session);
+     * most recent operation. The opaque pointer is the backend's session
+     * representation. Backends without governed admission leave this NULL. */
+    bool (*session_budget_denied)(const void *session);
 } wl_compute_backend_t;
 
 /**
