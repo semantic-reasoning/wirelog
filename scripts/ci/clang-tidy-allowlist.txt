@@ -1,8 +1,11 @@
 # scripts/ci/clang-tidy-allowlist.txt - Issue #1100.
 #
 # The libwirelog.so sources that are clang-tidy clean under the repository
-# .clang-tidy.  scripts/ci/check-clang-tidy-ratchet.py analyses every file
-# listed here on every run; one diagnostic fails the build.
+# .clang-tidy. scripts/ci/check-clang-tidy-ratchet.py analyses every active
+# file listed here on every run; one diagnostic fails the build. The two
+# threading backend alternatives are both registered, and the configured
+# compilation database selects exactly one for each run. The inactive backend
+# is excluded from that run's scans and counts.
 #
 # This is a ratchet register, in the shape of
 # scripts/ci/phase-label-allowlist.txt:
@@ -108,6 +111,7 @@ wirelog/session.c
 wirelog/session_facts.c
 wirelog/string_ops.c
 wirelog/thread_c11.c
+wirelog/thread_posix.c
 wirelog/util/lockfree_queue.c
 wirelog/util/log.c
 wirelog/util/log_emit.c
