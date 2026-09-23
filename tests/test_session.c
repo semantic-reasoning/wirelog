@@ -6957,7 +6957,8 @@ test_tdd_ordinary_frame_gates(uint32_t workers, unsigned mode)
         "actual dispatch bypassed gate or outbound exclusion");
     if (mode != 2) {
         TDD_GATE_CHECK(rc == ((mode == 0 || mode == 3) ? EBUSY
-            : mode >= 5 && mode <= 8 ? ENOMEM : ENOSPC) &&
+            : mode == 5 ? ENOSPC
+            : mode >= 6 && mode <= 8 ? ENOMEM : ENOSPC) &&
             tuples.count == 0,
             "failure not propagated before output");
         if (ordinary_gate_frame)
@@ -7088,7 +7089,8 @@ test_outbound_publisher_ownership(unsigned mode)
         wl_mem_ledger_snapshot(&coord->mem_ledger, &ledger);
         PUB_CHECK(worker.memory_budget_denied
             && ledger.subsys_bytes[WL_MEM_SUBSYS_CHANNEL] == 0
-            && candidate->memory_governor == coord->memory_governor,
+            && candidate->memory_governor
+            == (mode == 6 ? coord->memory_governor : NULL),
             "governor refusal did not retain an admitted owner");
         worker.memory_budget_denied = false;
     }
