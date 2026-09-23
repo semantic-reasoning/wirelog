@@ -3320,17 +3320,27 @@ col_session_insert(wl_session_t *session, const char *relation,
     if (r->ncols == 0) {
         if (r->declared_ncols != 0 && num_cols != r->declared_ncols)
             return EINVAL;
+        bool denied_before = r->memory_budget_denial_pending;
         int rc = col_rel_set_schema(r, num_cols, NULL);
-        if (rc != 0)
+        if (rc != 0) {
+            if (rc == ENOMEM && !denied_before
+                && r->memory_budget_denial_pending)
+                return ENOSPC;
             return rc;
+        }
     } else if (r->ncols != num_cols) {
         return EINVAL; /* column count mismatch */
     }
 
     for (uint32_t i = 0; i < num_rows; i++) {
+        bool denied_before = r->memory_budget_denial_pending;
         int rc = col_rel_append_row(r, data + (size_t)i * num_cols);
-        if (rc != 0)
+        if (rc != 0) {
+            if (rc == ENOMEM && !denied_before
+                && r->memory_budget_denial_pending)
+                return ENOSPC;
             return rc;
+        }
     }
 
     session_note_inserted_input(sess, r, false);

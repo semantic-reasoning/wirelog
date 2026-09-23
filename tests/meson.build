@@ -611,7 +611,7 @@ test('csv', test_csv_exe)
 test_csv_streaming_exe = executable(
   'test_csv_streaming',
   files('test_csv_streaming.c'),
-  csv_src,
+  io_src,
   intern_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [threads_dep],

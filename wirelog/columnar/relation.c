@@ -747,24 +747,36 @@ col_rel_reservation_rollback(wl_columnar_memory_reservation_t *reservation)
 }
 
 static int
-col_rel_reserve_retained_shape(const col_rel_t *r, uint32_t capacity,
-    bool timestamps, wl_columnar_memory_reservation_t *pending)
+col_rel_reserve_retained_shape(col_rel_t *r, uint32_t capacity,
+    bool timestamps, wl_columnar_memory_reservation_t *pending,
+    int *failure_rc)
 {
     uint64_t bytes;
     wl_columnar_memory_admission_status_t status;
 
-    if (!r || !pending)
+    if (failure_rc)
+        *failure_rc = ENOMEM;
+    if (!r || !pending) {
+        if (failure_rc)
+            *failure_rc = EINVAL;
         return -1;
+    }
     wl_columnar_memory_reservation_init(pending);
     if (!r->memory_governor)
         return 0;
     /* Shared and arena-backed relations are deliberately not attached by
      * the retained-EDB path yet; their ownership transitions are separate
      * admission units. */
-    if (r->arena_owned || r->col_shared)
+    if (r->arena_owned || r->col_shared) {
+        if (failure_rc)
+            *failure_rc = EINVAL;
         return -1;
-    if (!col_rel_retained_bytes(r->ncols, capacity, timestamps, &bytes))
+    }
+    if (!col_rel_retained_bytes(r->ncols, capacity, timestamps, &bytes)) {
+        if (failure_rc)
+            *failure_rc = EOVERFLOW;
         return -1;
+    }
     /* A consolidation or bulk append may have reduced the physical
      * capacity while the committed token still covers the larger shape.
      * Keep that conservative token: no new admission is needed until the
@@ -777,17 +789,26 @@ col_rel_reserve_retained_shape(const col_rel_t *r, uint32_t capacity,
         wl_columnar_memory_governor_ref_get(r->memory_governor),
         r->retained_reserved_bytes, bytes, pending);
     if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
-        && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+        && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+        if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED) {
+            r->memory_budget_denial_pending = true;
+            if (failure_rc)
+                *failure_rc = ENOMEM;
+        } else if (failure_rc) {
+            *failure_rc = status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : EINVAL;
+        }
         return -1;
+    }
     return 1;
 }
 
 static int
-col_rel_reserve_retained(const col_rel_t *r, uint32_t capacity,
-    wl_columnar_memory_reservation_t *pending)
+col_rel_reserve_retained(col_rel_t *r, uint32_t capacity,
+    wl_columnar_memory_reservation_t *pending, int *failure_rc)
 {
     return col_rel_reserve_retained_shape(r, capacity,
-               r->timestamps != NULL, pending);
+               r->timestamps != NULL, pending, failure_rc);
 }
 
 static int
@@ -889,22 +910,33 @@ wl_columnar_relation_compaction_commit_replacement(
  * COW retains physical timestamp capacity; growth supplies its new allocation
  * capacity. These shapes must not be inferred from the same column bound. */
 static int
-col_rel_reserve_transition(const col_rel_t *r, uint32_t capacity,
+col_rel_reserve_transition(col_rel_t *r, uint32_t capacity,
     uint32_t timestamp_capacity, wl_columnar_memory_reservation_t *pending,
-    uint64_t *bytes_out)
+    uint64_t *bytes_out, int *failure_rc)
 {
     uint64_t bytes;
     wl_columnar_memory_admission_status_t status;
 
-    if (!r || !pending || !bytes_out)
+    if (failure_rc)
+        *failure_rc = ENOMEM;
+    if (!r || !pending || !bytes_out) {
+        if (failure_rc)
+            *failure_rc = EINVAL;
         return -1;
+    }
     wl_columnar_memory_reservation_init(pending);
-    if (!col_rel_retained_bytes(r->ncols, capacity, false, &bytes))
+    if (!col_rel_retained_bytes(r->ncols, capacity, false, &bytes)) {
+        if (failure_rc)
+            *failure_rc = EOVERFLOW;
         return -1;
+    }
     uint64_t timestamp_bytes = (uint64_t)timestamp_capacity
         * sizeof(col_delta_timestamp_t);
-    if (bytes > UINT64_MAX - timestamp_bytes)
+    if (bytes > UINT64_MAX - timestamp_bytes) {
+        if (failure_rc)
+            *failure_rc = EOVERFLOW;
         return -1;
+    }
     bytes += timestamp_bytes;
     *bytes_out = bytes;
     if (!r->memory_governor || bytes == 0 ||
@@ -914,8 +946,17 @@ col_rel_reserve_transition(const col_rel_t *r, uint32_t capacity,
         wl_columnar_memory_governor_ref_get(r->memory_governor),
         r->retained_reserved_bytes, bytes, pending);
     if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
-        && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+        && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+        if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED) {
+            r->memory_budget_denial_pending = true;
+            if (failure_rc)
+                *failure_rc = ENOMEM;
+        } else if (failure_rc) {
+            *failure_rc = status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : EINVAL;
+        }
         return -1;
+    }
     return 1;
 }
 
@@ -945,7 +986,7 @@ col_rel_grow_owned_transition_impl(col_rel_t *r, uint32_t new_cap,
         return EINVAL;
     pending_rc = col_rel_reserve_transition(r, new_cap,
             r->timestamps ? new_cap : 0, &pending,
-            &new_bytes);
+            &new_bytes, NULL);
     if (pending_rc < 0)
         return ENOMEM;
     new_columns = col_columns_alloc(r->ncols, new_cap);
@@ -1045,7 +1086,7 @@ col_rel_cow_unshare_impl(col_rel_t *r, uint32_t new_cap,
                    defer_alias_release);
     pending_rc = col_rel_reserve_transition(r, capacity,
             r->timestamps ? r->timestamp_capacity : 0, &pending,
-            &new_bytes);
+            &new_bytes, NULL);
     if (pending_rc < 0)
         return ENOMEM;
     private_cols = (int64_t **)calloc(r->ncols, sizeof(*private_cols));
@@ -1167,7 +1208,7 @@ col_rel_enable_timestamps_locked(col_rel_t *r)
         return 0;
     }
     reserve_rc = col_rel_reserve_retained_shape(
-        r, r->capacity, true, &pending);
+        r, r->capacity, true, &pending, NULL);
     if (reserve_rc < 0)
         return ENOMEM;
     if (!col_rel_retained_bytes(r->ncols, r->capacity, true, &new_bytes))
@@ -1774,7 +1815,8 @@ col_rel_set_schema_impl(col_rel_t *r, uint32_t ncols,
         return 0; /* already initialised */
 
     r->ncols = ncols;
-    pending_rc = col_rel_reserve_retained(r, COL_REL_INIT_CAP, &pending);
+    pending_rc = col_rel_reserve_retained(r, COL_REL_INIT_CAP, &pending,
+            NULL);
     if (pending_rc < 0) {
         r->ncols = 0;
         return ENOMEM;
@@ -2299,7 +2341,7 @@ col_rel_reserve_capacity_admitted(col_rel_t *r, uint32_t new_cap,
 
         pending_rc = 0;
         if (admitted) {
-            pending_rc = col_rel_reserve_retained(r, target, &pending);
+            pending_rc = col_rel_reserve_retained(r, target, &pending, NULL);
             if (pending_rc < 0) {
                 if (denied)
                     *denied = true;
@@ -2459,8 +2501,12 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
             /* Ownership transitions stage columns and timestamps together;
              * admission happens before any source buffer is copied and the
              * helper publishes the storage generation on success. */
-            if (col_rel_grow_owned_transition_impl(r, new_cap, true) != 0)
-                goto enomem;
+            int transition_rc = col_rel_grow_owned_transition_impl(r,
+                    new_cap, true);
+            if (transition_rc != 0) {
+                rc = ENOMEM;
+                goto release_writer;
+            }
             alias_release_pending = true;
         } else {
             /* Heap-owned growth is one transaction: admit the new footprint
@@ -2473,9 +2519,12 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
             wl_columnar_memory_reservation_t previous;
             wl_columnar_memory_reservation_init(&previous);
             if (admitted) {
-                pending_rc = col_rel_reserve_retained(r, new_cap, &pending);
-                if (pending_rc < 0)
-                    goto enomem;
+                pending_rc = col_rel_reserve_retained(r, new_cap, &pending,
+                        NULL);
+                if (pending_rc < 0) {
+                    rc = ENOMEM;
+                    goto release_writer;
+                }
                 if (!col_rel_retained_bytes(r->ncols, new_cap,
                     r->timestamps != NULL, &new_bytes)) {
                     col_rel_reservation_rollback(&pending);
@@ -2627,7 +2676,7 @@ col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
     wl_columnar_memory_reservation_t previous;
     wl_columnar_memory_reservation_init(&previous);
     if (admitted) {
-        pending_rc = col_rel_reserve_retained(r, new_cap, &pending);
+        pending_rc = col_rel_reserve_retained(r, new_cap, &pending, NULL);
         if (pending_rc < 0
             || !col_rel_retained_bytes(r->ncols, new_cap,
             r->timestamps != NULL, &new_bytes)) {
@@ -2835,7 +2884,7 @@ wl_columnar_relation_delta_restore_flat_impl(col_rel_t *rel,
         goto done;
     }
     pending_rc = col_rel_reserve_retained_shape(rel, nrows,
-            rel->timestamps != NULL, &pending);
+            rel->timestamps != NULL, &pending, NULL);
     if (pending_rc < 0) {
         rc = ENOMEM;
         goto done;
@@ -4904,7 +4953,7 @@ wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
         goto done;
     }
     reserve_rc = col_rel_reserve_transition(dst, dst->capacity,
-            timestamp_capacity, &pending, &reserved_bytes);
+            timestamp_capacity, &pending, &reserved_bytes, NULL);
     if (reserve_rc < 0) {
         rc = ENOMEM;
         goto done;

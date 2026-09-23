@@ -21,6 +21,8 @@
 
 typedef int (*wl_csv_batch_cb)(void *opaque, const int64_t *rows,
     uint32_t nrows, uint32_t ncols);
+typedef int (*wl_csv_intern_cb)(void *opaque, const char *str,
+    int64_t *out_id);
 
 /**
  * WL_CSV_MAX_LINE:
@@ -61,6 +63,8 @@ typedef int (*wl_csv_batch_cb)(void *opaque, const int64_t *rows,
 #define WL_CSV_ERR_MEMORY (-3)        /* allocation failure */
 #define WL_CSV_ERR_LINE_TOO_LONG (-4) /* line exceeds WL_CSV_MAX_LINE */
 #define WL_CSV_ERR_EMBEDDED_NUL (-5)  /* NUL byte inside a line */
+#define WL_CSV_ERR_BUDGET (-6)        /* governed reservation denied */
+#define WL_CSV_ERR_OVERFLOW (-7)      /* checked size/admission overflow */
 
 /**
  * wl_csv_parse_line:
@@ -197,7 +201,7 @@ wl_csv_read_file_via_ctx(
     int64_t **out_data,
     uint32_t *out_nrows,
     uint32_t *out_ncols,
-    int64_t (*intern_cb)(void *opaque, const char *str),
+    wl_csv_intern_cb intern_cb,
     void *opaque);
 
 /*
@@ -215,7 +219,7 @@ wl_csv_read_file_via_ctx_stream(
     uint32_t max_batch_rows,
     wl_csv_batch_cb batch_cb,
     void *opaque,
-    int64_t (*intern_cb)(void *opaque, const char *str),
+    wl_csv_intern_cb intern_cb,
     void *intern_opaque);
 
 int
@@ -227,7 +231,7 @@ wl_csv_read_file_via_ctx_stream_admitted(
     uint32_t max_batch_rows,
     wl_csv_batch_cb batch_cb,
     void *opaque,
-    int64_t (*intern_cb)(void *opaque, const char *str),
+    wl_csv_intern_cb intern_cb,
     void *intern_opaque,
     wl_columnar_memory_governor_t *governor);
 

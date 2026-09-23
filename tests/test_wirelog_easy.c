@@ -14,8 +14,10 @@
 #include "../wirelog/arena/compound_arena.h"
 #include "../wirelog/columnar/memory_governor.h"
 #include "../wirelog/exec_plan_gen.h"
+#include "../wirelog/io/csv_reader.h"
 #include "../wirelog/intern.h"
 #include "../wirelog/session.h"
+#include "test_tmpdir.h"
 
 #include <fcntl.h>
 #include <stddef.h>
@@ -2823,6 +2825,202 @@ test_injected_governor_executor(void)
     PASS();
 }
 
+static wirelog_program_t *
+program_with_csv_input(const char *path, wirelog_error_t *error)
+{
+    char source[1024];
+    char portable_path[512];
+    snprintf(portable_path, sizeof(portable_path), "%s", path);
+    for (char *p = portable_path; *p; p++) {
+        if (*p == '\\')
+            *p = '/';
+    }
+    snprintf(source, sizeof(source),
+        ".decl src(x: int64, y: int64)\n"
+        ".input src(io=\"csv\", filename=\"%s\", delimiter=\",\")\n",
+        portable_path);
+    return wirelog_parse_string(source, error);
+}
+
+static int
+write_csv_fixture(char *path, size_t path_size, const char *name,
+    const char *contents)
+{
+    test_tmppath(path, path_size, name);
+    FILE *file = fopen(path, "w");
+    if (!file)
+        return -1;
+    int write_ok = fputs(contents, file) >= 0;
+    int close_ok = fclose(file) == 0;
+    return write_ok && close_ok ? 0 : -1;
+}
+
+/* PARITY: facade-only -- exercises CSV error mapping through wirelog_easy. */
+static void
+test_executor_csv_budget_and_retry(void)
+{
+    const char *filename = "wirelog_csv_budget_executor.csv";
+    char path[512];
+    wirelog_error_t error = WIRELOG_ERR_EXEC;
+    wirelog_program_t *program = NULL;
+    wirelog_executor_t *executor = NULL;
+    wl_session_options_t options;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    uint64_t intern_bytes = 0;
+    uint64_t compound_bytes = 0;
+    wl_plan_t *warm = NULL;
+
+    TEST("#1908 CSV budget denial stays distinct, releases and retries");
+    if (write_csv_fixture(path, sizeof(path), filename, "1,2\n") != 0) {
+        FAIL("CSV budget fixture creation failed");
+        return;
+    }
+    program = program_with_csv_input(path, &error);
+    if (!program || wl_plan_from_program(program, &warm) != 0 || !warm) {
+        if (warm)
+            wl_plan_free(warm);
+        if (program)
+            wirelog_program_free(program);
+        remove(path);
+        FAIL("CSV budget fixture parse failed");
+        return;
+    }
+    wl_plan_free(warm);
+    if (measure_create_floor(program, &intern_bytes, &compound_bytes) != 0) {
+        wirelog_program_free(program);
+        remove(path);
+        FAIL("CSV budget session floor could not be measured");
+        return;
+    }
+    wl_session_options_init(&options);
+    ref = enforcing_governor(intern_bytes + compound_bytes);
+    if (!ref) {
+        wirelog_program_free(program);
+        remove(path);
+        FAIL("CSV budget governor creation failed");
+        return;
+    }
+    options.memory_governor = ref;
+    wl_session_testhook_set_default_options(&options);
+    executor = wirelog_executor_create(program, &error);
+    wl_session_testhook_set_default_options(NULL);
+    if (executor || error != WIRELOG_ERR_MEMORY_BUDGET
+        || reserved_on(ref) != intern_bytes) {
+        wirelog_executor_free(executor);
+        wl_columnar_memory_governor_ref_release(ref);
+        wirelog_program_free(program);
+        remove(path);
+        FAIL("pre-callback CSV budget denial was misclassified or leaked");
+        return;
+    }
+    wl_columnar_memory_governor_ref_release(ref);
+
+    /* Reader admission succeeds exactly at its conservative peak, so the
+     * first relation insertion is the budget denial inside the callback. */
+    uint64_t schema_bytes = 2u * sizeof(wirelog_column_type_t);
+    uint64_t reader_bytes
+        = 1024u * 2u * sizeof(int64_t) + 2u * sizeof(int64_t)
+        + WL_CSV_READ_CHUNK + 2u * (WL_CSV_MAX_LINE + 1u);
+    ref = enforcing_governor(intern_bytes + compound_bytes + schema_bytes
+            + reader_bytes);
+    if (!ref) {
+        wirelog_program_free(program);
+        remove(path);
+        FAIL("callback budget governor creation failed");
+        return;
+    }
+    options.memory_governor = ref;
+    wl_session_testhook_set_default_options(&options);
+    executor = wirelog_executor_create(program, &error);
+    wl_session_testhook_set_default_options(NULL);
+    if (executor || error != WIRELOG_ERR_MEMORY_BUDGET
+        || reserved_on(ref) != intern_bytes) {
+        wirelog_executor_free(executor);
+        wl_columnar_memory_governor_ref_release(ref);
+        wirelog_program_free(program);
+        remove(path);
+        FAIL("callback insert budget denial was misclassified or leaked");
+        return;
+    }
+    wl_columnar_memory_governor_ref_release(ref);
+
+    ref = enforcing_governor(UINT64_C(64) * 1024u * 1024u);
+    if (!ref) {
+        wirelog_program_free(program);
+        remove(path);
+        FAIL("CSV retry governor creation failed");
+        return;
+    }
+    options.memory_governor = ref;
+    wl_session_testhook_set_default_options(&options);
+    executor = wirelog_executor_create(program, &error);
+    wl_session_testhook_set_default_options(NULL);
+    if (!executor || error != WIRELOG_OK) {
+        wirelog_executor_free(executor);
+        wl_columnar_memory_governor_ref_release(ref);
+        wirelog_program_free(program);
+        remove(path);
+        FAIL("CSV input did not succeed in a fresh admitted session");
+        return;
+    }
+    wirelog_executor_free(executor);
+    executor = NULL;
+    if (reserved_on(ref) != intern_bytes) {
+        wl_columnar_memory_governor_ref_release(ref);
+        wirelog_program_free(program);
+        remove(path);
+        FAIL("successful CSV load left session reservations behind");
+        return;
+    }
+
+    remove(path);
+    executor = wirelog_executor_create(program, &error);
+    if (executor || error != WIRELOG_ERR_IO
+        || reserved_on(ref) != intern_bytes) {
+        wirelog_executor_free(executor);
+        wl_columnar_memory_governor_ref_release(ref);
+        wirelog_program_free(program);
+        FAIL("missing CSV input did not remain an I/O error");
+        return;
+    }
+    if (write_csv_fixture(path, sizeof(path), filename,
+        "not-an-int,2\n") != 0) {
+        wl_columnar_memory_governor_ref_release(ref);
+        wirelog_program_free(program);
+        FAIL("malformed CSV fixture creation failed");
+        return;
+    }
+    executor = wirelog_executor_create(program, &error);
+    if (executor || error != WIRELOG_ERR_IO
+        || reserved_on(ref) != intern_bytes) {
+        wirelog_executor_free(executor);
+        wl_columnar_memory_governor_ref_release(ref);
+        wirelog_program_free(program);
+        remove(path);
+        FAIL("malformed CSV input did not remain an I/O error");
+        return;
+    }
+    if (write_csv_fixture(path, sizeof(path), filename, "1\n") != 0) {
+        wl_columnar_memory_governor_ref_release(ref);
+        wirelog_program_free(program);
+        FAIL("arity-invalid CSV fixture creation failed");
+        return;
+    }
+    executor = wirelog_executor_create(program, &error);
+    if (executor || error != WIRELOG_ERR_IO
+        || reserved_on(ref) != intern_bytes) {
+        wirelog_executor_free(executor);
+        wl_columnar_memory_governor_ref_release(ref);
+        wirelog_program_free(program);
+        remove(path);
+        FAIL("arity-invalid CSV input did not remain an I/O error");
+        return;
+    }
+    wl_columnar_memory_governor_ref_release(ref);
+    wirelog_program_free(program);
+    PASS();
+}
+
 /* Governor arithmetic overflow is EOVERFLOW at the session layer; every
  * facade preserves it as an execution error distinct from budget denial. */
 static void
@@ -2931,6 +3129,7 @@ main(void)
     test_injected_governor_easy_eager();
     test_injected_governor_easy_lazy();
     test_injected_governor_executor();
+    test_executor_csv_budget_and_retry();
     test_injected_governor_overflow_maps_to_memory();
 
     test_open_close_null_safe();

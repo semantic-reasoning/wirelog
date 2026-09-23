@@ -204,10 +204,10 @@ build_wide_csv(char *buf, size_t bufsz, int ncols, int mixed, int nrows)
 
 /* Interns through a real table so the loaded ids can be resolved back to
  * the exact source text, rather than only counted. */
-static int64_t
-intern_cb(void *opaque, const char *str)
+static int
+intern_cb(void *opaque, const char *str, int64_t *out_id)
 {
-    return wl_intern_put((wl_intern_t *)opaque, str);
+    return wl_intern_put_checked((wl_intern_t *)opaque, str, out_id);
 }
 
 static void

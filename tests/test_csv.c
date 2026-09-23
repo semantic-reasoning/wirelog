@@ -14,6 +14,7 @@
 #include "test_tmpdir.h"
 
 #include <stdio.h>
+#include <errno.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -623,12 +624,15 @@ test_parse_line_ex_rejects_malformed_fields(void)
 
 static int64_t fake_intern_counter;
 
-static int64_t
-fake_intern_cb(void *opaque, const char *str)
+static int
+fake_intern_cb(void *opaque, const char *str, int64_t *out_id)
 {
     (void)opaque;
     (void)str;
-    return fake_intern_counter++;
+    if (!out_id)
+        return EINVAL;
+    *out_id = fake_intern_counter++;
+    return 0;
 }
 
 static void
