@@ -1,6 +1,12 @@
 {
   "schema_version": 1,
-  "status": "legacy-unverified",
-  "baseline_bytes": 354887,
-  "reason": "The original measurement's source revision, compiler profile, and CI artifact could not be recovered."
+  "status": "trusted-ci-artifact",
+  "baseline_bytes": 377286,
+  "repository": "semantic-reasoning/wirelog",
+  "source_sha": "03a97843a8ca3c740d7ab1df05097aa512f7fbcf",
+  "run_id": 35806912665,
+  "artifact_id": 10729000688,
+  "artifact_sha256": "9f8a0b91f89c61bef0125d5e9ba7e04caba071b12245c0a8c3e9b76f33b79470",
+  "profile_sha256": "e998de7827ab8b2c665e9f895e4e2e6e0f17b29450ae468c39efe41464aa97a7",
+  "library_sha256": "01658451c09b747b73aa6db6f000d0ac740d7f447ca1c43b34bb69dca54ba9c3"
 }

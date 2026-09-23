@@ -1,10 +1,13 @@
 # Binary size monitoring and admission
 
-`tests/baseline_size.txt` remains the historical numeric reference (354887
-bytes). Its provenance is explicitly `legacy-unverified` in
-`tests/baseline_size.provenance.json`; the original source revision, compiler
-profile, and run artifact were not recoverable. That label is not measurement
-evidence and does not authorize a numeric edit.
+`tests/baseline_size.txt` records the current canonical Ubuntu x86_64 GCC
+measurement (377286 bytes), from source revision
+`03a97843a8ca3c740d7ab1df05097aa512f7fbcf`. The earlier 354887-byte value was
+legacy and unverified. The refreshed value is tied to the main CI artifact in
+`tests/baseline_size.provenance.json` and is accepted only after the verifier
+reproduces the profile and `.text` size from that source. The artifact digest
+and reported library digest remain cross-checked against the sidecar; a rebuilt
+library may have different non-`.text` bytes due to LTO metadata.
 
 The production limit remains 5120 bytes. PR CI compares the production shared
 library from the exact `pull_request.base.sha` tree with the library from the
@@ -28,8 +31,12 @@ only `wirelog-size-monitor-ubuntu-latest`; ARM measurements cannot authorize
 the canonical x86 baseline.
 If setup, profile capture, library lookup, or measurement fails, the report is
 `monitoring-error`; missing data is never replaced with zero or described as a
-pass. Main reports are useful evidence but do not claim that the old baseline
-is comparable with the current toolchain.
+pass. A monitor report can still carry a complete production-library
+measurement when the later full build fails. Such an artifact is eligible for
+baseline provenance only when the main workflow run succeeded, configuration
+succeeded, the report contains the exact measured library/profile evidence,
+and the verifier independently reproduces all of it. This does not declare
+the failed full build successful.
 
 ## Baseline updates
 
@@ -37,8 +44,11 @@ Do not replace the baseline with a local build measurement. A numeric update is
 accepted only when its sidecar identifies a report artifact from a successful
 `ci-main.yml` push run in this repository, the source commit is an ancestor of
 the PR base, the Actions artifact digest and report agree with the sidecar, and
-the current runner can reproduce both the profile, section size, and library
-digest from that eligible source. PR admission still uses the event base's
+the current runner can reproduce the profile and section size from that
+eligible source. The artifact and report library digests must match the
+sidecar, but rebuilds need not be byte-identical outside the measured section.
+A `monitoring-error` artifact qualifies only for the
+narrow later-full-build failure case described above. PR admission still uses the event base's
 baseline, so changing source and baseline in one PR cannot grant additional
 budget. If artifact access, toolchain reproduction, or provenance validation
 fails, the update is rejected. No workflow writes or commits baseline changes.
