@@ -351,6 +351,10 @@ typedef struct {
     uint32_t pair_cap;
     uint32_t pair_cap_limit;
     bool pairs_complete;
+    wl_columnar_memory_governor_ref_t *memory_governor;
+    wl_columnar_memory_reservation_t pair_reservation;
+    uint64_t pair_reserved_bytes;
+    int pair_error;
     atomic_bool *stop;
     atomic_uint_fast64_t *shared_count;
     int rc;
@@ -518,15 +522,70 @@ col_join_pair_cache_append(col_join_keyed_ctx_t *ctx, uint32_t lr,
             ctx->pairs_complete = false;
             return false;
         }
+        wl_columnar_memory_reservation_t pending;
+        bool pending_valid = false;
+        uint64_t new_bytes = 0;
+        if (ctx->memory_governor) {
+            if (!wl_columnar_memory_size_mul(new_cap,
+                sizeof(col_join_pair_ref_t), &new_bytes)) {
+                ctx->pair_error = EOVERFLOW;
+                ctx->pairs_complete = false;
+                return false;
+            }
+            wl_columnar_memory_reservation_init(&pending);
+            wl_columnar_memory_admission_status_t status =
+                wl_columnar_memory_reserve_growth(
+                wl_columnar_memory_governor_ref_get(
+                    ctx->memory_governor),
+                ctx->pair_reserved_bytes, new_bytes, &pending);
+            if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+                && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+                ctx->pair_error =
+                    status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                    ? ENOSPC
+                    : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                    ? EOVERFLOW : ENOMEM;
+                ctx->pairs_complete = false;
+                return false;
+            }
+            pending_valid = true;
+        }
         col_join_pair_ref_t *new_pairs = (col_join_pair_ref_t *)realloc(
             ctx->pairs, (size_t)new_cap * sizeof(col_join_pair_ref_t));
         if (!new_pairs) {
+            if (pending_valid)
+                (void)wl_columnar_memory_rollback(&pending);
             free(ctx->pairs);
             ctx->pairs = NULL;
             ctx->pair_count = 0;
             ctx->pair_cap = 0;
             ctx->pairs_complete = false;
             return false;
+        }
+        if (pending_valid) {
+            wl_columnar_memory_reservation_t previous;
+            if (!wl_columnar_memory_commit(&pending, ctx)) {
+                (void)wl_columnar_memory_rollback(&pending);
+                free(new_pairs);
+                ctx->pairs = NULL;
+                ctx->pair_count = 0;
+                ctx->pair_cap = 0;
+                ctx->pair_error = ENOMEM;
+                ctx->pairs_complete = false;
+                return false;
+            }
+            wl_columnar_memory_reservation_init(&previous);
+            if (ctx->pair_reserved_bytes > 0
+                && !wl_columnar_memory_reservation_move(
+                    &previous, &ctx->pair_reservation))
+                abort();
+            if (!wl_columnar_memory_reservation_move(
+                    &ctx->pair_reservation, &pending))
+                abort();
+            if (ctx->pair_reserved_bytes > 0
+                && !wl_columnar_memory_release(&previous))
+                abort();
+            ctx->pair_reserved_bytes = new_bytes;
         }
         ctx->pairs = new_pairs;
         ctx->pair_cap = new_cap;
@@ -587,6 +646,8 @@ col_join_keyed_count_worker_fn(void *arg)
             atomic_store_explicit(ctx->stop, true, memory_order_relaxed);
     }
     ctx->count = count;
+    if (ctx->pair_error != 0)
+        ctx->rc = ctx->pair_error;
 }
 
 static void
@@ -2908,6 +2969,11 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 ctxs[w].left_hashes = left_hashes;
                 ctxs[w].pair_cap_limit = pair_cap_limit;
                 ctxs[w].pairs_complete = true;
+                ctxs[w].memory_governor = sess->memory_governor;
+                wl_columnar_memory_reservation_init(
+                    &ctxs[w].pair_reservation);
+                ctxs[w].pair_reserved_bytes = 0;
+                ctxs[w].pair_error = 0;
                 ctxs[w].stop = &stop;
                 ctxs[w].shared_count = &shared_count;
                 if (wl_workqueue_submit(sess->wq,
@@ -2970,8 +3036,13 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                             prc = ctxs[w].rc;
                 }
             }
-            for (uint32_t w = 0; w < W; w++)
+            for (uint32_t w = 0; w < W; w++) {
+                if (ctxs[w].pair_reserved_bytes > 0
+                    && !wl_columnar_memory_release(
+                        &ctxs[w].pair_reservation))
+                    abort();
                 free(ctxs[w].pairs);
+            }
             free(offsets);
             free(ctxs);
             free(left_hashes);
