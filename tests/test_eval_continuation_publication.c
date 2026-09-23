@@ -373,6 +373,18 @@ test_reservation_and_stack_ownership(void)
     memset(&producer, 0, sizeof(producer));
     continuation = make_continuation(&producer);
     CHECK(eval_stack_push_continuation(&stack, continuation) == 0,
+        "continuation can reach a REDUCE boundary");
+    {
+        wl_plan_op_t op = { 0 };
+        CHECK(col_op_reduce(&op, &stack, NULL) == ENOTSUP,
+            "materializing REDUCE boundary rejects continuation");
+    }
+    CHECK(producer.destroy_calls == 1,
+        "REDUCE boundary destroys continuation exactly once");
+
+    memset(&producer, 0, sizeof(producer));
+    continuation = make_continuation(&producer);
+    CHECK(eval_stack_push_continuation(&stack, continuation) == 0,
         "mixed stack accepts a continuation for drain");
     eval_stack_drain(&stack);
     CHECK(producer.destroy_calls == 1,

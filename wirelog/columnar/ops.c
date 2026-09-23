@@ -201,11 +201,25 @@ wl_columnar_ops_dispose_entry(eval_stack_t *stack, eval_entry_t *entry,
     return rc != 0 ? rc : result;
 }
 
+/* Relation-only operators must reject and destroy a pending continuation. */
+static int
+wl_columnar_ops_reject_null_session(eval_stack_t *stack)
+{
+    if (stack->top == 0 || stack->top > COL_STACK_MAX
+        || stack->items[stack->top - 1].kind
+        != WL_COLUMNAR_EVAL_ENTRY_CONTINUATION)
+        return EINVAL;
+    eval_entry_t discarded;
+    return eval_stack_pop_relation(stack, &discarded);
+}
+
 int
 col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
 {
-    if (!op || !stack || !sess)
+    if (!op || !stack)
         return EINVAL;
+    if (!sess)
+        return wl_columnar_ops_reject_null_session(stack);
     eval_entry_t e;
     int pop_rc = eval_stack_pop_relation(stack, &e);
     if (pop_rc != 0)
@@ -467,8 +481,10 @@ int
 col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
 {
-    if (!op || !stack || !sess)
+    if (!op || !stack)
         return EINVAL;
+    if (!sess)
+        return wl_columnar_ops_reject_null_session(stack);
     eval_entry_t e;
     int pop_rc = eval_stack_pop_relation(stack, &e);
     if (pop_rc != 0)
