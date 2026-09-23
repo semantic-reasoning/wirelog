@@ -388,6 +388,9 @@ col_join_set_output_types(col_rel_t *out, const col_rel_t *left,
     return rc;
 }
 
+static int col_join_set_left_output_types(col_rel_t *out,
+    const col_rel_t *left, const wl_plan_op_t *op);
+
 /* Build a heap result under its governor from the first allocation.  Schema
  * creation admits metadata and initial columns; type installation admits the
  * resulting schema before any row writer can observe the relation. */
@@ -406,11 +409,14 @@ col_join_new_heap_output(wl_col_session_t *sess, const char *name,
             sess->memory_governor);
     if (rc != 0)
         goto fail;
-    rc = col_rel_set_schema(out, col_join_output_width(left, right, op),
-            NULL);
+    uint32_t width = right ? col_join_output_width(left, right, op)
+        : (op && op->project_count > 0 && op->project_indices
+            ? op->project_count : left->ncols);
+    rc = col_rel_set_schema(out, width, NULL);
     if (rc != 0)
         goto fail;
-    rc = col_join_set_output_types(out, left, right, op);
+    rc = right ? col_join_set_output_types(out, left, right, op)
+        : col_join_set_left_output_types(out, left, op);
     if (rc != 0)
         goto fail;
     col_join_attach_ledger(sess, out);
@@ -1048,14 +1054,23 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
          * This can occur in generated plans where optional relations may not exist. */
         uint32_t empty_cols = (op->project_count > 0 && op->project_indices)
             ? op->project_count : left_e.rel->ncols;
-        col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool,
-                sess->eval_arena, "$join_empty", empty_cols);
-        if (!out) {
-            return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
+        col_rel_t *out = NULL;
+        int output_rc;
+        if (sess->memory_governor) {
+            output_rc = col_join_new_heap_output(sess, "$join_empty",
+                    left_e.rel, NULL, op, &out);
+        } else {
+            out = col_rel_pool_new_auto(sess->delta_pool,
+                    sess->eval_arena, "$join_empty", empty_cols);
+            output_rc = out
+                ? col_join_set_left_output_types(out, left_e.rel, op)
+                : ENOMEM;
         }
-        if (col_join_set_left_output_types(out, left_e.rel, op) != 0) {
-            col_rel_destroy(out);
-            return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
+        if (output_rc != 0) {
+            if (out)
+                col_rel_destroy(out);
+            return wl_columnar_join_dispose_left(stack, &left_e,
+                       output_rc);
         }
         return wl_columnar_join_publish_after_left(stack, &left_e, out, false);
     }
@@ -1096,13 +1111,22 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
              * empty result — this rule copy produces no tuples from this
              * permutation (correct semi-naive, issue #85). */
             uint32_t ocols = col_join_output_width(left_e.rel, right, op);
-            col_rel_t *empty = col_rel_new_auto("$join_empty", ocols);
-            if (!empty) {
-                return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
+            col_rel_t *empty = NULL;
+            int output_rc;
+            if (sess->memory_governor) {
+                output_rc = col_join_new_heap_output(sess, "$join_empty",
+                        left_e.rel, right, op, &empty);
+            } else {
+                empty = col_rel_new_auto("$join_empty", ocols);
+                output_rc = empty
+                    ? col_join_set_output_types(empty, left_e.rel, right,
+                        op) : ENOMEM;
             }
-            if (col_join_set_output_types(empty, left_e.rel, right, op) != 0) {
-                col_rel_destroy(empty);
-                return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
+            if (output_rc != 0) {
+                if (empty)
+                    col_rel_destroy(empty);
+                return wl_columnar_join_dispose_left(stack, &left_e,
+                           output_rc);
             }
             return wl_columnar_join_publish_after_left(stack, &left_e, empty,
                        false);
@@ -1282,14 +1306,13 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
      * failure, and the eligibility verdict stands. */
     if (bounded && right->nrows == 0)
         bounded = false;
-    /* Materialized results outlive the current delta-pool reset while they
-    * remain in mat_cache, so cache-owned joins must be heap allocated.  A
-    * bounded-mode output is governed by the session's memory governor and
-    * must be heap allocated too: delta_pool_reset() never frees slot
-    * contents, so a governor reference on a pooled relation would leak. */
+    /* Managed outputs own their buffers and governor tokens until the stack
+     * or cache releases them.  The pool path is retained for unmanaged
+     * sessions, where its slot lifetime is tied to the delta-pool epoch. */
     col_rel_t *out = NULL;
     int output_rc;
-    if (bounded || (op->materialized && !projected_join)) {
+    if (sess->memory_governor || bounded
+        || (op->materialized && !projected_join)) {
         output_rc = col_join_new_heap_output(sess, "$join", left, right,
                 op, &out);
     } else {
@@ -2741,14 +2764,23 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
     if (!right) {
         uint32_t empty_cols = (op->project_count > 0 && op->project_indices)
             ? op->project_count : left_e.rel->ncols;
-        col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool,
-                sess->eval_arena, "$join_diff_empty", empty_cols);
-        if (!out) {
-            return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
+        col_rel_t *out = NULL;
+        int output_rc;
+        if (sess->memory_governor) {
+            output_rc = col_join_new_heap_output(sess, "$join_diff_empty",
+                    left_e.rel, NULL, op, &out);
+        } else {
+            out = col_rel_pool_new_auto(sess->delta_pool,
+                    sess->eval_arena, "$join_diff_empty", empty_cols);
+            output_rc = out
+                ? col_join_set_left_output_types(out, left_e.rel, op)
+                : ENOMEM;
         }
-        if (col_join_set_left_output_types(out, left_e.rel, op) != 0) {
-            col_rel_destroy(out);
-            return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
+        if (output_rc != 0) {
+            if (out)
+                col_rel_destroy(out);
+            return wl_columnar_join_dispose_left(stack, &left_e,
+                       output_rc);
         }
         return wl_columnar_join_publish_after_left(stack, &left_e, out, false);
     }
@@ -2773,14 +2805,23 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
         } else if (sess->current_iteration > 0 || sess->delta_seeded
             || sess->retraction_seeded) {
             uint32_t ocols = col_join_output_width(left_e.rel, right, op);
-            col_rel_t *empty = col_rel_new_auto("$join_diff_empty", ocols);
-            if (!empty) {
-                return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
-            }
+            col_rel_t *empty = NULL;
+            int output_rc;
             /* The schema copy still reads the left input (#1376). */
-            if (col_join_set_output_types(empty, left_e.rel, right, op) != 0) {
-                col_rel_destroy(empty);
-                return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
+            if (sess->memory_governor) {
+                output_rc = col_join_new_heap_output(sess,
+                        "$join_diff_empty", left_e.rel, right, op, &empty);
+            } else {
+                empty = col_rel_new_auto("$join_diff_empty", ocols);
+                output_rc = empty
+                    ? col_join_set_output_types(empty, left_e.rel, right,
+                        op) : ENOMEM;
+            }
+            if (output_rc != 0) {
+                if (empty)
+                    col_rel_destroy(empty);
+                return wl_columnar_join_dispose_left(stack, &left_e,
+                           output_rc);
             }
             return wl_columnar_join_publish_after_left(stack, &left_e, empty,
                        false);
@@ -2970,11 +3011,11 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
     }
 
     uint32_t ocols = col_join_output_width(left, right, op);
-    /* Materialized results outlive the current delta-pool reset while they
-     * remain in mat_cache, so cache-owned joins must be heap allocated. */
+    /* Managed outputs retain a governor token until their stack or cache
+     * owner releases them; unmanaged outputs keep the pool fast path. */
     col_rel_t *out = NULL;
     int output_rc;
-    if (op->materialized && !projected_join) {
+    if (sess->memory_governor || (op->materialized && !projected_join)) {
         output_rc = col_join_new_heap_output(sess, "$join_diff", left,
                 right, op, &out);
     } else {

@@ -924,17 +924,12 @@ out:
     destroy_session(sess);
 }
 
-/* ---- case 6: a pool-owned output stays ungoverned ----------------------- */
+/* ---- case 6: projected output has a retained owner ---------------------- */
 
-/*
- * The discriminator is pool_owned, not materialized.  join.c allocates the
- * output with (bounded || (materialized && !projected_join)), and
- * projected_join is (project_count > 0 && project_indices), so a
- * MATERIALIZED join with a projection is pool allocated.  Testing
- * materialized == false here would exercise the wrong branch.
- */
+/* A MATERIALIZED projection bypasses the materialization cache, but its
+ * stack result still owns columns and must be charged under a governor. */
 static void
-test_projected_output_stays_pooled(void)
+test_projected_output_is_governed(void)
 {
     const char *lk[] = { "k" };
     const char *rk[] = { "k" };
@@ -945,7 +940,7 @@ test_projected_output_stays_pooled(void)
     wl_plan_op_t op;
     eval_entry_t result = { 0 };
 
-    TEST("materialized+projected output stays pooled and ungoverned");
+    TEST("materialized+projected output owns a governed footprint");
     if (!sess || !right || !left) {
         FAIL("fixture");
         goto out;
@@ -959,18 +954,19 @@ test_projected_output_stays_pooled(void)
         FAIL("projected join failed");
         goto out;
     }
-    if (!result.rel || !result.rel->pool_owned) {
-        FAIL("projected materialized output was not pool allocated");
+    if (!result.rel || result.rel->pool_owned || !admission_invariant(
+            result.rel)) {
+        FAIL("projected materialized output was not governed");
         goto out_entry;
     }
     /* Assert on the relation, not on the session total: the keyed
      * arrangement built during the join is legitimately charged. */
-    if (result.rel->memory_governor != NULL) {
-        FAIL("a pooled output must not carry a governor reference");
+    if (result.rel->memory_governor != sess->memory_governor) {
+        FAIL("projected output has the wrong governor");
         goto out_entry;
     }
-    if (result.rel->retained_reserved_bytes != 0u) {
-        FAIL("a pooled output holds a committed reservation");
+    if (relation_charge(result.rel) == 0u) {
+        FAIL("projected output has no committed reservation");
         goto out_entry;
     }
     PASS();
@@ -978,6 +974,169 @@ out_entry:
     if (result.owned && result.rel)
         col_rel_destroy(result.rel);
 out:
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+}
+
+static void
+test_managed_empty_join_outputs(void)
+{
+    TEST("missing-right and absent-delta JOIN outputs retain their charges");
+    for (uint32_t variant = 0; variant < 4; variant++) {
+        bool differential = (variant & 1u) != 0;
+        bool missing_right = (variant & 2u) != 0;
+        wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+        col_rel_t *right = make_right(1, 1);
+        col_rel_t *left = make_left(2, 2);
+        wl_plan_op_t op;
+        eval_entry_t result = { 0 };
+        bool ok = false;
+        uint32_t expected_cols;
+
+        if (!sess || !right || !left)
+            goto next;
+        if (differential)
+            init_diff_keyed_op(&op);
+        else
+            init_cross_op(&op);
+        expected_cols = missing_right ? left->ncols
+            : left->ncols + right->ncols;
+        if (missing_right) {
+            op.right_relation = "absent";
+        } else {
+            if (session_add_rel(sess, right) != 0)
+                goto next;
+            right = NULL;
+            op.delta_mode = WL_DELTA_FORCE_DELTA;
+            sess->current_iteration = 1;
+        }
+        int rc = differential ? run_diff_join(sess, left, &op, &result)
+            : run_join(sess, left, &op, &result);
+        ok = rc == 0 && result.rel && result.owned
+            && result.rel->nrows == 0
+            && result.rel->ncols == expected_cols
+            && !result.rel->pool_owned
+            && result.rel->memory_governor == sess->memory_governor
+            && admission_invariant(result.rel)
+            && relation_charge(result.rel) > 0
+            && reserved_of(sess) == relation_charge(result.rel);
+next:
+        if (result.owned && result.rel)
+            col_rel_destroy(result.rel);
+        if (sess && reserved_of(sess) != 0u)
+            ok = false;
+        col_rel_destroy(left);
+        col_rel_destroy(right);
+        destroy_session(sess);
+        if (!ok) {
+            FAIL("an empty JOIN output escaped without its full charge");
+            return;
+        }
+    }
+    PASS();
+}
+
+static void
+test_empty_join_output_denial(void)
+{
+    TEST("missing-right JOIN rejects an unaffordable empty descriptor");
+    for (uint32_t variant = 0; variant < 2; variant++) {
+        wl_col_session_t *sess = make_session(1u);
+        col_rel_t *left = make_left(2, 2);
+        wl_plan_op_t op;
+        eval_entry_t result = { 0 };
+        bool ok = false;
+        if (sess && left) {
+            if (variant)
+                init_diff_keyed_op(&op);
+            else
+                init_cross_op(&op);
+            op.right_relation = "absent";
+            int rc = variant ? run_diff_join(sess, left, &op, &result)
+                : run_join(sess, left, &op, &result);
+            ok = rc == ENOSPC && !result.rel
+                && sess->memory_budget_denied
+                && reserved_of(sess) == 0u;
+        }
+        col_rel_destroy(left);
+        destroy_session(sess);
+        if (!ok) {
+            FAIL("empty output denial lost its status or reservation");
+            return;
+        }
+    }
+    PASS();
+}
+
+static void
+test_unmaterialized_diff_output_is_governed(void)
+{
+    wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+    col_rel_t *right = make_right(4, 2);
+    col_rel_t *left = make_left(8, 4);
+    wl_plan_op_t op;
+    eval_entry_t result = { 0 };
+
+    TEST("unmaterialized differential JOIN output is governed");
+    if (!sess || !right || !left || session_add_rel(sess, right) != 0) {
+        FAIL("fixture");
+        goto out;
+    }
+    right = NULL;
+    init_diff_keyed_op(&op);
+    op.materialized = false;
+    if (run_diff_join(sess, left, &op, &result) != 0 || !result.rel
+        || !result.owned || result.rel->pool_owned
+        || result.rel->memory_governor != sess->memory_governor
+        || !admission_invariant(result.rel)
+        || relation_charge(result.rel) == 0) {
+        FAIL("differential output bypassed the governor");
+        goto out;
+    }
+    PASS();
+out:
+    if (result.owned && result.rel)
+        col_rel_destroy(result.rel);
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+}
+
+static void
+test_unmanaged_projected_output_stays_pooled(void)
+{
+    const uint32_t proj[] = { 0u };
+    wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+    col_rel_t *right = make_right(2, 1);
+    col_rel_t *left = make_left(4, 2);
+    wl_plan_op_t op;
+    eval_entry_t result = { 0 };
+
+    TEST("unmanaged projected JOIN keeps its pool path");
+    if (!sess || !right || !left) {
+        FAIL("fixture");
+        goto out;
+    }
+    wl_columnar_memory_governor_ref_release(sess->memory_governor);
+    sess->memory_governor = NULL;
+    if (session_add_rel(sess, right) != 0) {
+        FAIL("right relation registration failed");
+        goto out;
+    }
+    right = NULL;
+    init_cross_op(&op);
+    op.project_count = 1u;
+    op.project_indices = proj;
+    if (run_join(sess, left, &op, &result) != 0 || !result.rel
+        || !result.rel->pool_owned || result.rel->memory_governor) {
+        FAIL("unmanaged projection lost its pool allocation");
+        goto out;
+    }
+    PASS();
+out:
+    if (result.owned && result.rel)
+        col_rel_destroy(result.rel);
     col_rel_destroy(left);
     col_rel_destroy(right);
     destroy_session(sess);
@@ -2291,7 +2450,11 @@ main(void)
     }
     test_growth_rollback();
     test_reuse_after_denial();
-    test_projected_output_stays_pooled();
+    test_projected_output_is_governed();
+    test_managed_empty_join_outputs();
+    test_empty_join_output_denial();
+    test_unmaterialized_diff_output_is_governed();
+    test_unmanaged_projected_output_stays_pooled();
     test_cache_adoption_charges_once();
     test_parallel_cross_output_is_governed();
     test_parallel_cross_denial();
