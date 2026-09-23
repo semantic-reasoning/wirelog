@@ -4363,6 +4363,31 @@ wl_columnar_session_has_retained_cleanup(const wl_col_session_t *sess)
     return false;
 }
 
+wl_columnar_memory_admission_status_t
+wl_columnar_session_reserve_reclaim_quiescent(wl_col_session_t *sess,
+    uint64_t bytes, wl_columnar_memory_reservation_t *reservation)
+{
+    if (!sess || !sess->memory_governor)
+        return WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(sess->memory_governor);
+    wl_columnar_memory_admission_status_t status
+        = wl_columnar_memory_reserve_checked(governor, bytes, reservation);
+    if (status != WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+        return status;
+    /* This helper is only called before coordinator dispatch. Never reclaim
+     * while a previous owner, publication, or cache pin is still live. */
+    if (sess->coordinator || sess->tdd_owner_lifetime
+        || sess->delta_publish_active || sess->mat_cache.active_pins != 0
+        || wl_columnar_session_has_retained_cleanup(sess))
+        return status;
+    uint64_t before = wl_columnar_memory_reserved(governor);
+    (void)wl_mem_ledger_reclaim(&sess->mem_ledger);
+    if (wl_columnar_memory_reserved(governor) >= before)
+        return status;
+    return wl_columnar_memory_reserve_checked(governor, bytes, reservation);
+}
+
 /* Snapshot/step completion is the coordinator's quiescent boundary.  Explicit
  * pins must already have been released by join.c; only then may the ledger
  * callback reclaim owned cache entries under memory pressure. */

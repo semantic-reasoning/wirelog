@@ -29,6 +29,10 @@
 #ifdef WL_SESSION_TEST_HOOKS
 void (*wl_columnar_eval_test_before_tdd_queue_admission)(
     wl_col_session_t *coord, uint64_t bytes);
+void (*wl_columnar_eval_test_after_tdd_queue_admission)(
+    wl_col_session_t *coord, uint64_t bytes);
+void (*wl_columnar_eval_test_before_tdd_queue_allocation)(
+    wl_col_session_t *coord, uint64_t bytes);
 #endif
 
 /* Only the standalone decision regression targets enable this wrapper. */
@@ -218,9 +222,12 @@ wl_columnar_eval_tdd_owner_lifetime_create(wl_col_session_t *coord,
                 wl_columnar_memory_governor_ref_get(coord->memory_governor),
                 allocation_bytes, &reservation);
         if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
-            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                coord->memory_budget_denied = true;
             return status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
                 ? EOVERFLOW : ENOMEM;
+        }
     }
     wl_columnar_eval_tdd_owner_lifetime_t *lifetime = calloc(1,
             allocation_bytes);
@@ -6605,6 +6612,37 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             goto done;
         }
     }
+    /* Reserve while the coordinator is quiescent, before the new owner
+     * lifetime is installed. A denied admission may reclaim an unpinned
+     * cache entry once and retry before any worker is dispatched. */
+    rc = wl_mpsc_queue_footprint_for(W, delta_queue_capacity,
+            &queue_ring_bytes);
+    if (rc != 0)
+        goto done;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_test_before_tdd_queue_admission)
+        wl_columnar_eval_test_before_tdd_queue_admission(coord,
+            queue_ring_bytes);
+#endif
+    if (coord->memory_governor) {
+        wl_columnar_memory_admission_status_t status
+            = wl_columnar_session_reserve_reclaim_quiescent(coord,
+                queue_ring_bytes, &queue_reservation);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                coord->memory_budget_denied = true;
+            rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
+                : ENOMEM;
+            goto done;
+        }
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_test_after_tdd_queue_admission)
+        wl_columnar_eval_test_after_tdd_queue_admission(coord,
+            queue_ring_bytes);
+#endif
     ctxs = (col_eval_tdd_worker_ctx_t *)calloc(
         W, sizeof(col_eval_tdd_worker_ctx_t));
     if (!ctxs) {
@@ -6632,33 +6670,13 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         }
     }
 
-    /* Issue #410: Create MPSC delta queue for dual-write transport.
-     * Capacity = W × nrels × 2 (2x headroom; at most W×nrels per sub-pass).
-     * Admit its complete fixed ring before any queue allocation. */
-    rc = wl_mpsc_queue_footprint_for(W, delta_queue_capacity,
-            &queue_ring_bytes);
-    if (rc != 0)
-        goto done;
+    /* Issue #410: MPSC queue for W workers, with 2x headroom per relation.
+     * Its full fixed footprint is already reserved above. */
 #ifdef WL_SESSION_TEST_HOOKS
-    if (wl_columnar_eval_test_before_tdd_queue_admission)
-        wl_columnar_eval_test_before_tdd_queue_admission(coord,
+    if (wl_columnar_eval_test_before_tdd_queue_allocation)
+        wl_columnar_eval_test_before_tdd_queue_allocation(coord,
             queue_ring_bytes);
 #endif
-    if (coord->memory_governor) {
-        wl_columnar_memory_admission_status_t status
-            = wl_columnar_memory_reserve_checked(
-                wl_columnar_memory_governor_ref_get(coord->memory_governor),
-                queue_ring_bytes, &queue_reservation);
-        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
-            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
-            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
-                coord->memory_budget_denied = true;
-            rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
-                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
-                : ENOMEM;
-            goto done;
-        }
-    }
     coord->delta_queue = wl_mpsc_queue_create_with_destructor(
         W, delta_queue_capacity, tdd_destroy_delta_payload);
     if (!coord->delta_queue) {

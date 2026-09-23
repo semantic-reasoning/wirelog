@@ -1530,6 +1530,9 @@ enforcing_governor(uint64_t usable)
 
 static uint64_t tdd_ring_test_bytes;
 static uint64_t tdd_ring_test_reserved;
+static bool tdd_ring_reclaim_attempted;
+static bool tdd_ring_reclaim_succeeded;
+static bool tdd_ring_owner_mode;
 
 static void
 deny_tdd_ring_admission(wl_col_session_t *coord, uint64_t bytes)
@@ -1540,6 +1543,48 @@ deny_tdd_ring_admission(wl_col_session_t *coord, uint64_t bytes)
     tdd_ring_test_reserved = wl_columnar_memory_reserved(governor);
     atomic_store_explicit(&governor->usable_bytes, tdd_ring_test_reserved,
         memory_order_release);
+}
+
+static void
+retry_tdd_ring_after_reclaim(wl_col_session_t *coord, uint64_t bytes)
+{
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(coord->memory_governor);
+    tdd_ring_test_bytes = bytes;
+    tdd_ring_test_reserved = wl_columnar_memory_reserved(governor);
+    tdd_ring_reclaim_attempted = coord->mat_cache.count == 1;
+    atomic_store_explicit(&governor->usable_bytes,
+        tdd_ring_test_reserved + bytes - 1u, memory_order_release);
+}
+
+static void
+finish_tdd_ring_after_reclaim(wl_col_session_t *coord, uint64_t bytes)
+{
+    (void)bytes;
+    tdd_ring_reclaim_succeeded = tdd_ring_reclaim_attempted
+        && coord->mat_cache.count == 0;
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(coord->memory_governor);
+    atomic_store_explicit(&governor->usable_bytes, UINT64_MAX / 4u,
+        memory_order_release);
+}
+
+static void
+deny_tdd_owner_after_ring(wl_col_session_t *coord, uint64_t bytes)
+{
+    (void)bytes;
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(coord->memory_governor);
+    tdd_ring_test_reserved = wl_columnar_memory_reserved(governor);
+    atomic_store_explicit(&governor->usable_bytes, tdd_ring_test_reserved,
+        memory_order_release);
+}
+
+static void
+observe_tdd_ring_owner_allocation(wl_col_session_t *coord, uint64_t bytes)
+{
+    (void)bytes;
+    tdd_ring_owner_mode = coord->tdd_owner_lifetime != NULL;
 }
 
 #ifdef WL_TEST_ALLOC_WRAP
@@ -1565,7 +1610,7 @@ test_tdd_ring_budget_admission(void)
                                        .key_col_count = 1 };
     wl_plan_op_t ops[] = {
         { .op = WL_PLAN_OP_VARIABLE, .relation_name = "output" },
-        { .op = WL_PLAN_OP_JOIN, .right_relation = "output", .left_keys = keys,
+        { .op = WL_PLAN_OP_JOIN, .right_relation = "input", .left_keys = keys,
           .right_keys = keys, .key_count = 1, .project_indices = projection,
           .project_count = 1 },
         { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
@@ -1586,6 +1631,8 @@ test_tdd_ring_budget_admission(void)
         = enforcing_governor(UINT64_MAX / 4u);
     wl_session_t *session = NULL;
     int64_t *values = NULL;
+    col_rel_t *cache_left = NULL, *cache_right = NULL;
+    col_rel_t *cache_result = NULL;
     const char *failure = NULL;
     tuple_collector_t tuples = { 0 };
     tdd_ring_test_bytes = tdd_ring_test_reserved = 0;
@@ -1621,22 +1668,93 @@ test_tdd_ring_budget_admission(void)
         "denied ring cleanup");
     atomic_store_explicit(&governor->usable_bytes, UINT64_MAX / 4u,
         memory_order_release);
+    wl_columnar_eval_test_after_tdd_queue_admission = deny_tdd_owner_after_ring;
+    int owner_denied_rc = wl_session_snapshot(session, collect_tuple, &tuples);
+    wl_columnar_eval_test_after_tdd_queue_admission = NULL;
+    RING_CHECK(owner_denied_rc == ENOMEM
+        && wl_columnar_session_budget_denied(coord)
+        && !coord->delta_queue && !coord->tdd_owner_lifetime
+        && coord->mem_channel_ring_bytes == 0 && tuples.count == 0
+        && wl_columnar_memory_reserved(governor) <= tdd_ring_test_reserved,
+        "owner lifetime denial must preserve budget status and ring cleanup");
+    atomic_store_explicit(&governor->usable_bytes, UINT64_MAX / 4u,
+        memory_order_release);
 #ifdef WL_TEST_ALLOC_WRAP
-    wl_columnar_eval_test_before_tdd_queue_admission
+    wl_columnar_eval_test_before_tdd_queue_allocation
         = fail_tdd_ring_allocation;
     int allocator_rc = wl_session_snapshot(session, collect_tuple, &tuples);
-    wl_columnar_eval_test_before_tdd_queue_admission = NULL;
+    wl_columnar_eval_test_before_tdd_queue_allocation = NULL;
     RING_CHECK(allocator_rc == ENOMEM && !coord->delta_queue
         && !coord->tdd_owner_lifetime && coord->mem_channel_ring_bytes == 0
         && wl_columnar_memory_reserved(governor) <= tdd_ring_test_reserved,
         "queue allocator failure cleanup");
 #endif
+    cache_left = col_rel_new_auto("ring_cache_left", 1);
+    cache_right = col_rel_new_auto("ring_cache_right", 1);
+    RING_CHECK(col_rel_alloc(&cache_result, "ring_cache_result") == 0,
+        "cache result descriptor");
+    int64_t cached_row = 42;
+    RING_CHECK(cache_left && cache_right && cache_result
+        && col_rel_append_row(cache_left, &cached_row) == 0
+        && col_rel_append_row(cache_right, &cached_row) == 0
+        && col_rel_attach_memory_governor(cache_result, ref) == 0
+        && col_rel_set_schema(cache_result, 1, NULL) == 0
+        && col_rel_append_row(cache_result, &cached_row) == 0
+        && col_mat_cache_insert(&coord->mat_cache, cache_left, cache_right,
+        cache_result) == 0, "reclaimable cache fixture");
+    cache_result = NULL; /* Cache owns the result. */
+    uint64_t cached_bytes = wl_columnar_memory_reserved(governor);
+    wl_columnar_memory_reservation_t admitted;
+    wl_columnar_memory_reservation_init(&admitted);
+    RING_CHECK(col_mat_cache_lookup(&coord->mat_cache, cache_left, cache_right)
+        != NULL && coord->mat_cache.active_pins > 0, "cache pin");
+    atomic_store_explicit(&governor->usable_bytes,
+        cached_bytes + tdd_ring_test_bytes - 1u, memory_order_release);
+    RING_CHECK(wl_columnar_session_reserve_reclaim_quiescent(coord,
+        tdd_ring_test_bytes, &admitted)
+        == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+        && coord->mat_cache.count == 1
+        && wl_columnar_memory_reserved(governor) == cached_bytes,
+        "pinned cache must not be reclaimed");
+    col_mat_cache_release_pins(&coord->mat_cache);
+    wl_columnar_memory_admission_status_t retry_status
+        = wl_columnar_session_reserve_reclaim_quiescent(coord,
+            tdd_ring_test_bytes, &admitted);
+    RING_CHECK(retry_status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+        && coord->mat_cache.count == 0
+        && wl_columnar_memory_reserved(governor) < cached_bytes
+        + tdd_ring_test_bytes,
+        "one reclaim did not enable retry");
+    RING_CHECK(wl_columnar_memory_release(&admitted),
+        "reclaimed retry reservation release");
+    atomic_store_explicit(&governor->usable_bytes, UINT64_MAX / 4u,
+        memory_order_release);
+    RING_CHECK(col_rel_alloc(&cache_result, "ring_cache_result_2") == 0
+        && col_rel_attach_memory_governor(cache_result, ref) == 0
+        && col_rel_set_schema(cache_result, 1, NULL) == 0
+        && col_rel_append_row(cache_result, &cached_row) == 0
+        && col_mat_cache_insert(&coord->mat_cache, cache_left, cache_right,
+        cache_result) == 0, "second cache fixture");
+    cache_result = NULL;
+    tdd_ring_reclaim_attempted = tdd_ring_reclaim_succeeded
+            = tdd_ring_owner_mode = false;
+    wl_columnar_eval_test_before_tdd_queue_admission
+        = retry_tdd_ring_after_reclaim;
+    wl_columnar_eval_test_after_tdd_queue_admission
+        = finish_tdd_ring_after_reclaim;
+    wl_columnar_eval_test_before_tdd_queue_allocation
+        = observe_tdd_ring_owner_allocation;
     RING_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0
         && tuples.count == 1 && tuples.rows[0][0] == 42
+        && tdd_ring_reclaim_succeeded
+        && tdd_ring_owner_mode
+        && coord->tdd_executed_strata > 0
         && !wl_columnar_session_budget_denied(coord),
-        "same-session retry");
+        "owner-mode ring reclaim and retry");
 ring_done:
     wl_columnar_eval_test_before_tdd_queue_admission = NULL;
+    wl_columnar_eval_test_after_tdd_queue_admission = NULL;
+    wl_columnar_eval_test_before_tdd_queue_allocation = NULL;
 #ifdef WL_TEST_ALLOC_WRAP
     fail_next_alloc = false;
 #endif
@@ -1648,6 +1766,9 @@ ring_done:
     }
     free(values);
     wl_session_destroy(session);
+    col_rel_destroy(cache_result);
+    col_rel_destroy(cache_left);
+    col_rel_destroy(cache_right);
     wl_columnar_memory_governor_ref_release(ref);
     if (failure)
         FAIL(failure);

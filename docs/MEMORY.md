@@ -670,6 +670,12 @@ the evaluation stack. Paths below are relative to `wirelog/columnar/`.
 | Materialization cache | Cache exclusively owns accepted heap results; lookup pin protects copying | JOIN exposes an independent copy to the stack; eviction/clear waits for pins and destroys the cached result once | `cache.c`, `join.c` |
 | Delta transport payload | Producer transfers owned relation to queue, then coordinator matrix/consumer | Reconstruction deduplicates malformed aliases; discard destroys each owned queued payload; current matrix retains one payload per worker/relation, not an arbitrary batch stream | `eval_tdd_queue.c`, `eval.c` |
 | TDD transport ring | Coordinator admits the checked rounded queue footprint before allocation; the owner lifetime retains its reservation while cleanup is refused | Queue destruction precedes governor release; CHANNEL ledger separately attributes the same fixed ring bytes | `../util/lockfree_queue.c`, `eval.c` |
+
+The coordinator may retry TDD ring admission once after an initial budget
+denial. It invokes registered cache reclaimers only before worker dispatch,
+with no retained cleanup or cache pins, and retries only if the governor's
+reserved-byte total decreases. A pinned entry or no progress leaves the
+original denial in place.
 | Continuation scratch and published batches | Producer owns scratch and input/index leases; synchronous sink owns committed output | Cursor advances at publication commit; destroy releases producer state; no asynchronous lifetime is implied for scratch-backed payloads | `continuation.c`, `join_batch.c`, `diff_join_batch.c` |
 | Delta-step rollback snapshots | Session owns admitted metadata, copied names and flat rows; stable relation identities prevent restoration into replacement registrations; a GC-only compound hold preserves handle IDs | Capture completes before detachment; checked restoration retains refused backups; successful evaluation or recovery releases them once; teardown discards pending backups after evaluator cleanup | `eval_delta.c`, `relation.c`, `session.c` |
 

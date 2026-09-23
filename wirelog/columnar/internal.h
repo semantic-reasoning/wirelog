@@ -3580,8 +3580,17 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
     wl_col_session_t *coord);
 int
 wl_columnar_eval_delta_queue_capacity(uint32_t nrels, uint32_t *out);
+/* Coordinator-only, before worker dispatch. Reclaim once on a denied
+ * reservation and retry only after governor-reserved bytes decrease. */
+wl_columnar_memory_admission_status_t
+wl_columnar_session_reserve_reclaim_quiescent(wl_col_session_t *sess,
+    uint64_t bytes, wl_columnar_memory_reservation_t *reservation);
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_eval_test_before_tdd_queue_admission)(
+    wl_col_session_t *coord, uint64_t bytes);
+extern void (*wl_columnar_eval_test_after_tdd_queue_admission)(
+    wl_col_session_t *coord, uint64_t bytes);
+extern void (*wl_columnar_eval_test_before_tdd_queue_allocation)(
     wl_col_session_t *coord, uint64_t bytes);
 #endif
 int
