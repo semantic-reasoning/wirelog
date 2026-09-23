@@ -2696,7 +2696,8 @@ wl_columnar_eval_owner_publication_register(
         txn->registry_images_prepared = true;
         return 0;
     }
-    txn->registry_images = calloc(additions, sizeof(*txn->registry_images));
+    txn->registry_images = (wl_columnar_session_hash_registry_image_t *)calloc(
+        additions, sizeof(*txn->registry_images));
     if (!txn->registry_images)
         return ENOMEM;
     for (uint32_t i = 0; i < txn->count; i++) {
@@ -2708,27 +2709,46 @@ wl_columnar_eval_owner_publication_register(
 
         if (entry->target)
             continue;
-        for (uint32_t p = 0; p < txn->registry_image_count; p++)
+        if (txn->registry_image_count > additions) {
+            /* The count is invalid; cleanup must not index past allocation. */
+            txn->registry_image_count = additions;
+            wl_columnar_eval_owner_publication_discard_registry_images(txn);
+            return EOVERFLOW;
+        }
+        for (uint32_t p = 0;
+            p < txn->registry_image_count && p < additions; p++)
             if (txn->registry_images[p].session == entry->session) {
                 prior_image = true;
                 break;
             }
         if (prior_image)
             continue;
+        if (txn->registry_image_count == additions) {
+            wl_columnar_eval_owner_publication_discard_registry_images(txn);
+            return EOVERFLOW;
+        }
         for (uint32_t j = i; j < txn->count; j++)
             if (!txn->entries[j].target
                 && txn->entries[j].session == entry->session)
                 nadd++;
-        candidates = malloc((size_t)nadd * sizeof(*candidates));
+        candidates = (col_rel_t **)malloc((size_t)nadd * sizeof(*candidates));
         if (!candidates) {
             wl_columnar_eval_owner_publication_discard_registry_images(txn);
             return ENOMEM;
         }
         uint32_t at = 0;
-        for (uint32_t j = i; j < txn->count; j++)
+        for (uint32_t j = i; j < txn->count; j++) {
             if (!txn->entries[j].target
-                && txn->entries[j].session == entry->session)
+                && txn->entries[j].session == entry->session) {
+                if (at >= nadd) {
+                    free((void *)candidates);
+                    wl_columnar_eval_owner_publication_discard_registry_images(
+                        txn);
+                    return EOVERFLOW;
+                }
                 candidates[at++] = txn->entries[j].candidate;
+            }
+        }
 #ifdef WL_TEST_OWNER_PUBLICATION
         if (wl_columnar_eval_owner_publication_fail_session == entry->session
             && wl_columnar_eval_owner_publication_fail_name) {
@@ -2748,7 +2768,7 @@ wl_columnar_eval_owner_publication_register(
         rc = wl_columnar_session_hash_registry_image_prepare(entry->session,
                 candidates, nadd,
                 &txn->registry_images[txn->registry_image_count]);
-        free(candidates);
+        free((void *)candidates);
         if (rc != 0) {
 #ifdef WL_TEST_OWNER_PUBLICATION
             if (wl_columnar_session_hash_test_registry_image_prepare_failure_hit())
@@ -5841,8 +5861,8 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
                 break;
             }
         }
-        parts = calloc(W, sizeof(*parts));
-        empty_inputs = calloc(1, sizeof(*empty_inputs));
+        parts = (col_rel_t **)calloc(W, sizeof(*parts));
+        empty_inputs = (col_rel_t **)calloc(1, sizeof(*empty_inputs));
         if (!parts || !empty_inputs) {
             rc = ENOMEM;
             goto fail;
@@ -5898,13 +5918,13 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
                 }
             }
         }
-        free(empty_inputs);
+        free((void *)empty_inputs);
         empty_inputs = NULL;
         for (uint32_t w = 0; w < W; w++) {
             col_rel_destroy(parts[w]);
             parts[w] = NULL;
         }
-        free(parts);
+        free((void *)parts);
         parts = NULL;
         col_rel_destroy(combined);
         combined = NULL;
@@ -5952,8 +5972,8 @@ fail:
         for (uint32_t w = 0; w < W; w++)
             col_rel_destroy(parts[w]);
     }
-    free(parts);
-    free(empty_inputs);
+    free((void *)parts);
+    free((void *)empty_inputs);
     col_rel_destroy(combined);
     {
         int cancel_rc = tdd_owner_cancel_input_retirements(retirements,
