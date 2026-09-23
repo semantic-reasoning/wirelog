@@ -80,6 +80,7 @@ typedef struct {
     uint32_t merge_buf_cap;
     uint32_t base_nrows;
     col_delta_timestamp_t *timestamps;
+    uint32_t timestamp_capacity;
     bool pool_owned;
     bool arena_owned;
     void *mem_ledger;
@@ -88,6 +89,7 @@ typedef struct {
      * (memory_governor.h) field for field, with the two wl_atomic_u64
      * members represented as plain uint64_t of identical size/alignment. */
     void *memory_governor;
+    uint8_t memory_budget_denial_pending;
     struct {
         void *governor;
         uint64_t bytes;
