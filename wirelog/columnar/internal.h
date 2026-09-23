@@ -1630,6 +1630,7 @@ typedef struct wl_columnar_tdd_owner_lifetime {
     bool evaluation_active;
     bool dispatch_active;
     void *worker_ctxs;
+    wl_columnar_memory_reservation_t reservation;
     wl_mpsc_queue_t *queue;
     uint64_t queue_ring_bytes;
     /* First matrix_slots entries are the worker/relation matrix. The tail
