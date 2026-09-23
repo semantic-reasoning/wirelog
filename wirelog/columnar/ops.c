@@ -204,6 +204,8 @@ wl_columnar_ops_dispose_entry(eval_stack_t *stack, eval_entry_t *entry,
 int
 col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
 {
+    if (!op || !stack || !sess)
+        return EINVAL;
     eval_entry_t e;
     int pop_rc = eval_stack_pop_relation(stack, &e);
     if (pop_rc != 0)
@@ -465,6 +467,8 @@ int
 col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
 {
+    if (!op || !stack || !sess)
+        return EINVAL;
     eval_entry_t e;
     int pop_rc = eval_stack_pop_relation(stack, &e);
     if (pop_rc != 0)
@@ -1017,6 +1021,8 @@ lftj_binary_cb(const int64_t *row, uint32_t lftj_ncols, void *user)
 int
 col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
 {
+    if (!op || !stack || !sess)
+        return EINVAL;
     if (!op->opaque_data)
         return EINVAL;
     const wl_plan_op_lftj_t *meta = (const wl_plan_op_lftj_t *)op->opaque_data;
