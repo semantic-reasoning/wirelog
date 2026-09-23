@@ -5296,17 +5296,12 @@ wl_columnar_relation_new_like_impl(const char *name, const col_rel_t *src,
     if (!src)
         return NULL;
     col_rel_t *r = NULL;
-    rc = col_rel_alloc(&r, name);
+    rc = governor
+        ? wl_columnar_relation_alloc_governed(&r, name, governor)
+        : col_rel_alloc(&r, name);
     if (rc != 0) {
         if (failure)
             *failure = rc;
-        return NULL;
-    }
-    rc = governor ? col_rel_attach_memory_governor(r, governor) : 0;
-    if (rc != 0) {
-        if (failure)
-            *failure = rc;
-        col_rel_destroy(r);
         return NULL;
     }
     rc = col_rel_set_schema(r, src->ncols,

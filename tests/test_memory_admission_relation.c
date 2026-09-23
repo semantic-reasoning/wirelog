@@ -1684,6 +1684,51 @@ test_heap_descriptor_admission(void)
 }
 
 static void
+test_governed_new_like_descriptor_admission(void)
+{
+    const char *name = "new-like-descriptor";
+    const uint64_t descriptor = heap_descriptor_bytes(name);
+    const uint64_t metadata = auto_metadata_bytes(0);
+    wl_columnar_memory_resolution_t resolution;
+    col_rel_t *source = col_rel_new_auto("new-like-source", 0);
+    col_rel_t *copy = NULL;
+    make_resolution(&resolution, descriptor - 1u);
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+
+    CHECK(source && ref, "governed new-like fixtures");
+    if (!source || !ref)
+        goto cleanup;
+    CHECK(wl_columnar_relation_new_like_governed_checked(name, source,
+        ref, &copy) == ENOSPC && !copy
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0,
+        "new-like descriptor denial precedes allocation and rolls back");
+
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, descriptor + metadata,
+        memory_order_release);
+    CHECK(wl_columnar_relation_new_like_governed_checked(name, source,
+        ref, &copy) == 0 && copy && copy->descriptor_reservation
+        && copy->descriptor_reservation->bytes == descriptor
+        && copy->metadata_reservation
+        && copy->metadata_reservation->bytes == metadata
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == descriptor + metadata,
+        "new-like exact descriptor and schema admission");
+    col_rel_destroy(copy);
+    copy = NULL;
+    CHECK(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0,
+        "new-like destruction releases descriptor and schema charges");
+cleanup:
+    col_rel_destroy(copy);
+    col_rel_destroy(source);
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+}
+
+static void
 test_governed_clear_preserves_live_descriptor_charge(void)
 {
     wl_columnar_memory_resolution_t resolution;
@@ -2750,6 +2795,7 @@ int
 main(void)
 {
     test_heap_descriptor_admission();
+    test_governed_new_like_descriptor_admission();
     test_governed_clear_preserves_live_descriptor_charge();
     test_relation_accounting_aux_reservation();
     test_schema_metadata_adoption_and_replacement();
