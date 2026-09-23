@@ -2003,16 +2003,6 @@ tdd_worker_subpass_fn(void *arg)
     if (ctx->force_diff && ctx->outbound_only && eff_iter > 0)
         sess->delta_seeded = true;
     sess->current_iteration = eff_iter;
-#define TDD_WORKER_RETURN() \
-        do { \
-            sess->tdd_subpass_active = saved_tdd_subpass; \
-            sess->tdd_outbound_only_active = saved_outbound_only; \
-            sess->delta_seeded = saved_delta_seeded; \
-            sess->diff_operators_active = saved_diff; \
-            ctx->runtime_ns = now_ns() - worker_t0; \
-            return; \
-        } while (0)
-
     /* Free per-sub-pass delta arrangements (eval_serial.c:414) */
     col_session_free_delta_arrangements(sess);
 
@@ -2029,10 +2019,7 @@ tdd_worker_subpass_fn(void *arg)
         }
         if (all_empty) {
             ctx->all_empty_delta = true;
-            sess->tdd_subpass_active = saved_tdd_subpass;
-            sess->tdd_outbound_only_active = saved_outbound_only;
-            sess->diff_operators_active = saved_diff;
-            TDD_WORKER_RETURN();
+            goto worker_done;
         }
     }
 
@@ -2041,15 +2028,12 @@ tdd_worker_subpass_fn(void *arg)
     if (wl_columnar_eval_checked_size_mul(nrels, sizeof(uint32_t),
         &snap_bytes) != 0) {
         ctx->rc = EOVERFLOW;
-        TDD_WORKER_RETURN();
+        goto worker_done;
     }
     uint32_t *snap = (uint32_t *)calloc(nrels, sizeof(uint32_t));
     if (!snap) {
         ctx->rc = ENOMEM;
-        sess->tdd_subpass_active = saved_tdd_subpass;
-        sess->tdd_outbound_only_active = saved_outbound_only;
-        sess->diff_operators_active = saved_diff;
-        TDD_WORKER_RETURN();
+        goto worker_done;
     }
     for (uint32_t ri = 0; ri < nrels; ri++) {
         col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
@@ -2075,7 +2059,7 @@ tdd_worker_subpass_fn(void *arg)
             if (rc != 0) {
                 ctx->rc = rc;
                 free(snap);
-                TDD_WORKER_RETURN();
+                goto worker_done;
             }
             continue;
         }
@@ -2084,7 +2068,7 @@ tdd_worker_subpass_fn(void *arg)
         if (rc != 0) {
             ctx->rc = rc;
             free(snap);
-            TDD_WORKER_RETURN();
+            goto worker_done;
         }
     }
 
@@ -2102,10 +2086,7 @@ tdd_worker_subpass_fn(void *arg)
         if (!delta) {
             ctx->rc = ENOMEM;
             free(snap);
-            sess->tdd_subpass_active = saved_tdd_subpass;
-            sess->tdd_outbound_only_active = saved_outbound_only;
-            sess->diff_operators_active = saved_diff;
-            TDD_WORKER_RETURN();
+            goto worker_done;
         }
 #ifdef WL_SESSION_TEST_HOOKS
         if (wl_columnar_eval_test_before_ordinary_payload_admission)
@@ -2133,10 +2114,7 @@ tdd_worker_subpass_fn(void *arg)
             col_rel_destroy(delta);
             ctx->rc = admission_rc;
             free(snap);
-            sess->tdd_subpass_active = saved_tdd_subpass;
-            sess->tdd_outbound_only_active = saved_outbound_only;
-            sess->diff_operators_active = saved_diff;
-            TDD_WORKER_RETURN();
+            goto worker_done;
         }
 
         wl_columnar_relation_timestamp_stage_t timestamp_stage = { 0 };
@@ -2158,10 +2136,7 @@ tdd_worker_subpass_fn(void *arg)
             col_rel_destroy(delta);
             ctx->rc = admission_rc;
             free(snap);
-            sess->tdd_subpass_active = saved_tdd_subpass;
-            sess->tdd_outbound_only_active = saved_outbound_only;
-            sess->diff_operators_active = saved_diff;
-            TDD_WORKER_RETURN();
+            goto worker_done;
         }
 
         int rc2 = 0;
@@ -2183,10 +2158,7 @@ tdd_worker_subpass_fn(void *arg)
                 col_rel_destroy(delta);
                 ctx->rc = ENOMEM;
                 free(snap);
-                sess->tdd_subpass_active = saved_tdd_subpass;
-                sess->tdd_outbound_only_active = saved_outbound_only;
-                sess->diff_operators_active = saved_diff;
-                TDD_WORKER_RETURN();
+                goto worker_done;
             }
             uint32_t keep = snap[ri];
             for (uint32_t i = snap[ri]; i < r->nrows; i++) {
@@ -2227,10 +2199,7 @@ tdd_worker_subpass_fn(void *arg)
             col_rel_destroy(delta);
             ctx->rc = rc2;
             free(snap);
-            sess->tdd_subpass_active = saved_tdd_subpass;
-            sess->tdd_outbound_only_active = saved_outbound_only;
-            sess->diff_operators_active = saved_diff;
-            TDD_WORKER_RETURN();
+            goto worker_done;
         }
 
         /* Consolidation changed the relation only after rc2 succeeded. */
@@ -2263,10 +2232,7 @@ tdd_worker_subpass_fn(void *arg)
                     col_rel_destroy(delta);
                     ctx->rc = enq_rc;
                     free(snap);
-                    sess->tdd_subpass_active = saved_tdd_subpass;
-                    sess->tdd_outbound_only_active = saved_outbound_only;
-                    sess->diff_operators_active = saved_diff;
-                    TDD_WORKER_RETURN();
+                    goto worker_done;
                 }
                 /* Issue #1380: mirror of eval_tdd_queue.c publish. */
                 uint64_t transport_bytes = col_rel_transport_bytes(delta);
@@ -2281,10 +2247,7 @@ tdd_worker_subpass_fn(void *arg)
                     col_rel_destroy(delta);
                     ctx->rc = ENOMEM;
                     free(snap);
-                    sess->tdd_subpass_active = saved_tdd_subpass;
-                    sess->tdd_outbound_only_active = saved_outbound_only;
-                    sess->diff_operators_active = saved_diff;
-                    TDD_WORKER_RETURN();
+                    goto worker_done;
                 }
             } else {
                 /* A caller without a queue retains the legacy direct path. */
@@ -2317,11 +2280,14 @@ tdd_worker_subpass_fn(void *arg)
     }
 
     ctx->any_new = any_new;
+    goto worker_done_common;
+worker_done:
+    sess->delta_seeded = saved_delta_seeded;
+worker_done_common:
     sess->tdd_subpass_active = saved_tdd_subpass;
     sess->tdd_outbound_only_active = saved_outbound_only;
     sess->diff_operators_active = saved_diff;
     ctx->runtime_ns = now_ns() - worker_t0;
-#undef TDD_WORKER_RETURN
 }
 
 /*
