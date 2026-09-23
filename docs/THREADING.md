@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **165**).
+match the script's count (currently **170**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -570,7 +570,7 @@ gate -- which reports EINVAL after a commit that in fact succeeded.
 | `relation.c:col_rel_commit_replacement_locked#5` | `dst->descriptor_access.state` | `atomic_store_explicit` | release | Republish the captured peer-reader gate so a descriptor reader taken before the swap is still counted when the writer lease is released |
 
 ### 5.16 `wirelog/columnar/memory_governor.c` and `relation.c` — atomic
-replacement admission and compaction (14 rows)
+replacement admission and compaction (19 rows)
 
 Replacement admission temporarily accounts for the new footprint while the
 old reservation remains committed. The overlap CAS is the admission
@@ -595,6 +595,11 @@ the replacement transaction never releases an uncommitted token.
 | `relation.c:col_rel_compact_impl#2` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Recheck a previously admitted replacement token before retrying its publication after an earlier physical-growth failure |
 | `relation.c:col_rel_compact_many` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Validate each retained reservation before compacting a relation |
 | `relation.c:col_rel_compact_many#2` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Revalidate the reservation before the second compaction path |
+| `relation.c:col_rel_reservation_rollback` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Read the reservation state before deciding whether rollback still owns an admitted token |
+| `relation.c:wl_columnar_relation_retirement_reservation_valid` | `retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Confirm the retained reservation is still owned by this relation before retirement |
+| `relation.c:wl_columnar_relation_retirement_reservation_valid#2` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Read the token state before validating committed or replacing reservation ownership |
+| `relation.c:wl_columnar_relation_retirement_writer_valid` | `source_access.state` | `atomic_load_explicit` | acquire | Confirm the retirement writer still owns the source-access gate |
+| `relation.c:wl_columnar_relation_retirement_commit` | `storage_alias_borrows` | `atomic_store_explicit` | relaxed | Clear the alias count when a pooled relation descriptor is reset for reuse |
 
 ### 5.17 `wirelog/columnar/eval_delta.c` — observer reservations (1 row)
 
@@ -605,7 +610,7 @@ reservation objects exclusively; their state follows the governor protocol.
 |---|---|---|---|---|
 | `eval_delta.c:wl_columnar_eval_delta_observer_release_token` | `token->state` | `atomic_load_explicit` | acquire | Observe admission or commit state before releasing the observer reservation, then reinitialize the exclusively owned token |
 
-The complete source audit now contains **165 atomic call sites**.
+The complete source audit now contains **170 atomic call sites**.
 
 ---
 
