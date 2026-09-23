@@ -1201,6 +1201,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             col_rel_t *copy = NULL;
             int copy_rc = wl_columnar_relation_deep_copy_governed(cached,
                     &copy, wl_columnar_join_effective_governor(sess, cached));
+            if (copy_rc == ENOSPC)
+                sess->memory_budget_denied = true;
             col_mat_cache_pin_release(&cache_pin);
 #ifdef WL_PROFILE
             sess->profile.join_cache_hit_ns += now_ns() - _t0_join;
@@ -2017,7 +2019,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         int copy_rc = wl_columnar_relation_deep_copy_governed(out, &copy,
                 effective);
         if (copy_rc != 0) {
-            if (copy_rc == ENOMEM
+            if ((copy_rc == ENOMEM || copy_rc == ENOSPC)
                 && wl_columnar_join_original_is_accounted(out, effective))
                 return wl_columnar_join_publish_after_left(stack, &left_e,
                            out, result_is_delta);
@@ -2865,6 +2867,8 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
             col_rel_t *copy = NULL;
             int copy_rc = wl_columnar_relation_deep_copy_governed(cached,
                     &copy, wl_columnar_join_effective_governor(sess, cached));
+            if (copy_rc == ENOSPC)
+                sess->memory_budget_denied = true;
             col_mat_cache_pin_release(&cache_pin);
             if (right_filtered)
                 col_rel_destroy(right_filtered);
@@ -3502,7 +3506,7 @@ join_success:
                 publish = NULL;
                 primary_rc = cache_rc;
             }
-        } else if (copy_rc == ENOMEM
+        } else if ((copy_rc == ENOMEM || copy_rc == ENOSPC)
             && wl_columnar_join_original_is_accounted(out, effective)) {
             /* The existing committed token covers the one published owner. */
         } else {

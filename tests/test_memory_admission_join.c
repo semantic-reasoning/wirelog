@@ -59,6 +59,7 @@ static int tests_run;
 static int tests_passed;
 static int tests_failed;
 static bool test_cache_reclaim_attempt;
+static bool test_fail_diff_twin_alloc;
 static bool test_cache_pin_protected;
 static wl_col_session_t *test_reclaim_sess;
 static const col_rel_t *test_reclaim_source;
@@ -77,6 +78,11 @@ void wl_columnar_relation_test_fail_next_governed_copy_payload_alloc(void);
 static void
 try_reclaim_during_governed_copy(const col_rel_t *source)
 {
+    if (test_fail_diff_twin_alloc && source && source->name
+        && strcmp(source->name, "$join_diff") == 0) {
+        test_fail_diff_twin_alloc = false;
+        wl_columnar_relation_test_fail_next_governed_copy_payload_alloc();
+    }
     if (!test_cache_reclaim_attempt)
         return;
     test_cache_reclaim_attempt = false;
@@ -1270,63 +1276,6 @@ out:
 
 /* ---- cases 11 and 12: parallel keyed differential join ---------------- */
 
-static bool
-measure_parallel_diff_peak(uint64_t *peak_out)
-{
-    const uint32_t expected_rows = 130u;
-    wl_col_session_t *sess = make_session_workers(64ull * 1024 * 1024, 2);
-    col_rel_t *right = make_right(1, 2);
-    col_rel_t *left = make_left(65, 1);
-    wl_plan_op_t op;
-    eval_entry_t result = { 0 };
-    const col_rel_t *governed;
-    uint64_t final_bytes;
-    uint64_t initial_bytes;
-    uint64_t other_bytes;
-    bool ok = false;
-
-    setenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS", "2", 1);
-    if (!sess || !right || !left)
-        goto out;
-    if (session_add_rel(sess, right) != 0)
-        goto out;
-    right = NULL;
-    init_diff_keyed_op(&op);
-    if (run_diff_join(sess, left, &op, &result) != 0)
-        goto out;
-    governed = cached_output(sess, left);
-    if (!governed || governed->nrows != expected_rows
-        || governed->capacity != expected_rows
-        || governed->pool_owned || governed->memory_governor == NULL
-        || sess->wq == NULL || sess->diff_arr_count != 1
-        || !admission_invariant(governed))
-        goto out_entry;
-    if (!col_rel_retained_bytes_for(governed, governed->capacity,
-        &final_bytes)
-        || !col_rel_retained_bytes_for(governed, COL_REL_INIT_CAP,
-        &initial_bytes)
-        || governed->retained_reserved_bytes != final_bytes)
-        goto out_entry;
-    other_bytes = reserved_of(sess) - governed->retained_reserved_bytes;
-    /* A diff transaction deep-copies the persistent arrangement while the
-     * output grows, so include that second arrangement footprint and the
-     * output's initial token in the one-byte-short budget. */
-    if (other_bytes > UINT64_MAX - initial_bytes
-        || reserved_of(sess) > UINT64_MAX - other_bytes - initial_bytes)
-        goto out_entry;
-    *peak_out = reserved_of(sess) + other_bytes + initial_bytes;
-    ok = *peak_out > 0;
-out_entry:
-    if (result.owned && result.rel)
-        col_rel_destroy(result.rel);
-out:
-    unsetenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS");
-    col_rel_destroy(left);
-    col_rel_destroy(right);
-    destroy_session(sess);
-    return ok;
-}
-
 static void
 test_parallel_diff_output_is_governed(void)
 {
@@ -1437,16 +1386,11 @@ test_parallel_diff_denial(void)
     col_rel_t *right = make_right(1, 2);
     col_rel_t *left = make_left(65, 1);
     wl_plan_op_t op;
-    uint64_t peak = 0;
     eval_entry_t denied_result = { 0 };
 
     TEST("parallel keyed diff copy OOM publishes one accounted result");
     setenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS", "2", 1);
-    if (!measure_parallel_diff_peak(&peak) || peak <= 1u) {
-        FAIL("could not measure the parallel diff overlap peak");
-        goto out;
-    }
-    sess = make_session_workers(peak - 1u, 2);
+    sess = make_session_workers(64ull * 1024 * 1024, 2);
     if (!sess || !right || !left) {
         FAIL("fixture");
         goto out;
@@ -1457,8 +1401,10 @@ test_parallel_diff_denial(void)
     }
     right = NULL;
     init_diff_keyed_op(&op);
+    test_fail_diff_twin_alloc = true;
     int rc = run_diff_join(sess, left, &op, &denied_result);
-    if (rc != 0 || !denied_result.rel || !denied_result.owned
+    if (rc != 0 || test_fail_diff_twin_alloc || !denied_result.rel
+        || !denied_result.owned
         || denied_result.rel->memory_governor != sess->memory_governor
         || !admission_invariant(denied_result.rel)
         || cached_output(sess, left) != NULL || sess->diff_arr_count != 1) {
@@ -1474,6 +1420,7 @@ test_parallel_diff_denial(void)
     denied_result.rel = NULL;
     PASS();
 out:
+    test_fail_diff_twin_alloc = false;
     unsetenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS");
     col_rel_destroy(left);
     col_rel_destroy(right);
@@ -1874,7 +1821,8 @@ test_materialized_stack_copy_contract(void)
     atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
             sess->memory_governor)->usable_bytes, cache_bytes - 1u,
         memory_order_release);
-    if (run_join(sess, left, &op, &result) != ENOMEM || result.rel
+    if (run_join(sess, left, &op, &result) != ENOSPC || result.rel
+        || !sess->memory_budget_denied
         || cached_output(sess, left) != cached
         || reserved_of(sess) != cache_bytes) {
         FAIL(
