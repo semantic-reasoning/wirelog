@@ -89,15 +89,17 @@ typedef struct {
     uint32_t kc;
     col_arrangement_pin_t pin;
     const col_arrangement_t *arr;
-    int64_t *key_row;
+    /* The union keeps the raw allocation tail aligned for key_row on
+     * compilers without C11 _Alignof support. */
+    union {
+        int64_t *key_row;
+        int64_t alignment;
+    } key_row_storage;
     col_rel_t *batch;        /* governed heap scratch, rows_per_batch rows */
     wl_columnar_memory_reservation_t descriptor_reservation;
     uint32_t rows_per_batch;
     col_join_batch_cursor_t cursor;
 } col_join_batch_producer_t;
-
-_Static_assert(sizeof(col_join_batch_producer_t) % _Alignof(int64_t) == 0,
-    "JOIN producer tail must support int64_t alignment");
 
 static uint64_t
 pos_pack(uint32_t lr, uint32_t rr)
@@ -188,9 +190,10 @@ producer_produce(void *context, const wl_columnar_continuation_cursor_t *cursor,
         uint32_t rr = next.rr;
         if (rr == UINT32_MAX) {
             for (uint32_t k = 0; k < p->kc; k++)
-                p->key_row[p->rk[k]] = p->left->columns[p->lk[k]][lr];
+                p->key_row_storage.key_row[p->rk[k]]
+                    = p->left->columns[p->lk[k]][lr];
             rr = col_arrangement_find_first_typed(p->arr, p->right,
-                    p->key_row);
+                    p->key_row_storage.key_row);
         }
         while (rr != UINT32_MAX) {
             /* Chains may hold collision rows; every candidate is checked. */
@@ -360,7 +363,7 @@ col_join_batch_producer_create(wl_col_session_t *sess,
     unsigned char *scratch = (unsigned char *)(p + 1);
     p->lk = (uint32_t *)scratch;
     p->rk = p->lk + kc;
-    p->key_row = (int64_t *)(scratch
+    p->key_row_storage.key_row = (int64_t *)(scratch
         + 2u * (size_t)kc * sizeof(uint32_t));
     memcpy(p->lk, lk, (size_t)kc * sizeof(uint32_t));
     memcpy(p->rk, rk, (size_t)kc * sizeof(uint32_t));
