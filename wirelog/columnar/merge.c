@@ -107,7 +107,7 @@ col_op_consolidate_size_add(size_t left, size_t right, size_t *out)
 }
 
 static int
-col_rel_compact_scratch_reserve(const col_rel_t *rel, uint64_t bytes,
+col_rel_merge_scratch_reserve(const col_rel_t *rel, uint64_t bytes,
     wl_columnar_memory_reservation_t *reservation)
 {
     wl_columnar_memory_admission_status_t status;
@@ -126,7 +126,7 @@ col_rel_compact_scratch_reserve(const col_rel_t *rel, uint64_t bytes,
 }
 
 static void
-col_rel_compact_scratch_release(wl_columnar_memory_reservation_t *reservation)
+col_rel_merge_scratch_release(wl_columnar_memory_reservation_t *reservation)
 {
     if (reservation)
         wl_columnar_memory_release(reservation);
@@ -614,6 +614,36 @@ col_op_consolidate_hash_dedup(col_rel_t *rel,
     uint32_t nc = rel->ncols;
     uint32_t nr = rel->nrows;
     size_t row_bytes = (size_t)nc * sizeof(int64_t);
+    uint64_t scratch_bytes = 0;
+    uint64_t bytes = 0;
+    uint64_t max_ht_cap = 8192;
+    uint64_t max_uniq_cap = 4096;
+    wl_columnar_memory_reservation_t reservation;
+
+    while (max_ht_cap <= (uint64_t)nr * 2u
+        && max_ht_cap <= UINT32_MAX / 2u)
+        max_ht_cap *= 2u;
+    while (max_uniq_cap < nr && max_uniq_cap <= UINT32_MAX / 2u)
+        max_uniq_cap *= 2u;
+    if (max_uniq_cap < nr
+        || !wl_columnar_memory_size_mul(max_ht_cap, row_bytes, &bytes)
+        || !wl_columnar_memory_size_add(scratch_bytes, bytes,
+        &scratch_bytes)
+        || !wl_columnar_memory_size_add(scratch_bytes, max_ht_cap,
+        &scratch_bytes)
+        || !wl_columnar_memory_size_mul(max_uniq_cap, row_bytes, &bytes)
+        || !wl_columnar_memory_size_add(scratch_bytes, bytes,
+        &scratch_bytes)
+        || (nc > COL_STACK_MAX
+        && (!wl_columnar_memory_size_mul(nc, sizeof(int64_t), &bytes)
+        || !wl_columnar_memory_size_add(scratch_bytes, bytes,
+        &scratch_bytes))))
+        return EOVERFLOW;
+    int admission_rc = col_rel_merge_scratch_reserve(rel, scratch_bytes,
+            &reservation);
+    if (admission_rc != 0)
+        return admission_rc;
+#define HASH_RELEASE_SCRATCH() col_rel_merge_scratch_release(&reservation)
 
     /* Hash table: open addressing, power-of-2 capacity */
     uint32_t ht_cap = 8192;
@@ -625,6 +655,7 @@ col_op_consolidate_hash_dedup(col_rel_t *rel,
     if (!ht_vals || !ht_used) {
         free(ht_vals);
         free(ht_used);
+        HASH_RELEASE_SCRATCH();
         return ENOMEM;
     }
 
@@ -636,6 +667,7 @@ col_op_consolidate_hash_dedup(col_rel_t *rel,
     if (!uniq_buf) {
         free(ht_vals);
         free(ht_used);
+        HASH_RELEASE_SCRATCH();
         return ENOMEM;
     }
 
@@ -647,6 +679,7 @@ col_op_consolidate_hash_dedup(col_rel_t *rel,
         free(ht_vals);
         free(ht_used);
         free(uniq_buf);
+        HASH_RELEASE_SCRATCH();
         return ENOMEM;
     }
 
@@ -677,6 +710,7 @@ col_op_consolidate_hash_dedup(col_rel_t *rel,
                     free(ht_vals);
                     free(ht_used);
                     free(uniq_buf);
+                    HASH_RELEASE_SCRATCH();
                     return -1;
                 }
 
@@ -694,6 +728,7 @@ col_op_consolidate_hash_dedup(col_rel_t *rel,
                     free(ht_vals);
                     free(ht_used);
                     free(uniq_buf);
+                    HASH_RELEASE_SCRATCH();
                     return ENOMEM;
                 }
 
@@ -737,6 +772,7 @@ col_op_consolidate_hash_dedup(col_rel_t *rel,
                     free(ht_vals);
                     free(ht_used);
                     free(uniq_buf);
+                    HASH_RELEASE_SCRATCH();
                     return ENOMEM;
                 }
                 uniq_buf = nb;
@@ -762,6 +798,7 @@ col_op_consolidate_hash_dedup(col_rel_t *rel,
         int cow_rc = col_rel_cow_unshare_with_source_writer(rel, writer);
         if (cow_rc != 0) {
             free(uniq_buf);
+            HASH_RELEASE_SCRATCH();
             return cow_rc;
         }
         *alias_release_pending = true;
@@ -773,7 +810,9 @@ col_op_consolidate_hash_dedup(col_rel_t *rel,
     rel->nrows = uniq_count;
     wl_columnar_relation_touch_view(rel);
     free(uniq_buf);
+    HASH_RELEASE_SCRATCH();
 
+#undef HASH_RELEASE_SCRATCH
     return 0;
 }
 
@@ -1607,7 +1646,7 @@ col_rel_compact_runs(col_rel_t *rel)
         return EOVERFLOW;
     if (merged_bytes > SIZE_MAX)
         return EOVERFLOW;
-    int admission_rc = col_rel_compact_scratch_reserve(rel, merged_bytes,
+    int admission_rc = col_rel_merge_scratch_reserve(rel, merged_bytes,
             &reservation);
     if (admission_rc != 0)
         return admission_rc;
@@ -1621,7 +1660,7 @@ col_rel_compact_runs(col_rel_t *rel)
     /* Allocate merge output buffer (flat row-major) */
     int64_t *merged = (int64_t *)malloc((size_t)merged_bytes);
     if (!merged) {
-        col_rel_compact_scratch_release(&reservation);
+        col_rel_merge_scratch_release(&reservation);
         return ENOMEM;
     }
 
@@ -1724,7 +1763,7 @@ col_rel_compact_runs(col_rel_t *rel)
     for (uint32_t r = 0; r < out; r++)
         col_rel_row_copy_in_raw(rel, r, merged + (size_t)r * nc);
     free(merged);
-    col_rel_compact_scratch_release(&reservation);
+    col_rel_merge_scratch_release(&reservation);
 
     rel->nrows = out;
     wl_columnar_relation_touch_view(rel);
