@@ -299,7 +299,6 @@ col_join_batch_producer_create(wl_col_session_t *sess,
     uint64_t rows;
     uint32_t ocols;
     wl_columnar_memory_reservation_t descriptor_reservation;
-    bool descriptor_admitted = false;
     int rc;
 
     if (out)
@@ -335,16 +334,15 @@ col_join_batch_producer_create(wl_col_session_t *sess,
                 : admission == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
                 ? EOVERFLOW : ENOMEM;
         }
-        descriptor_admitted = true;
     }
     p = (col_join_batch_producer_t *)calloc(1, (size_t)descriptor_bytes);
     if (!p) {
-        if (descriptor_admitted)
+        if (descriptor_reservation.governor)
             (void)wl_columnar_memory_rollback(&descriptor_reservation);
         return ENOMEM;
     }
     wl_columnar_memory_reservation_init(&p->descriptor_reservation);
-    if (descriptor_admitted
+    if (descriptor_reservation.governor
         && !wl_columnar_memory_reservation_move(&p->descriptor_reservation,
         &descriptor_reservation)) {
         (void)wl_columnar_memory_rollback(&descriptor_reservation);
@@ -366,7 +364,7 @@ col_join_batch_producer_create(wl_col_session_t *sess,
         + 2u * (size_t)kc * sizeof(uint32_t));
     memcpy(p->lk, lk, (size_t)kc * sizeof(uint32_t));
     memcpy(p->rk, rk, (size_t)kc * sizeof(uint32_t));
-    if (descriptor_admitted) {
+    if (p->descriptor_reservation.governor) {
         if (!wl_columnar_memory_commit(&p->descriptor_reservation, p)) {
             rc = EINVAL;
             goto fail;
