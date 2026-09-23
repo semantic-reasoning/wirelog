@@ -92,7 +92,6 @@ typedef struct {
     int64_t *key_row;
     col_rel_t *batch;        /* governed heap scratch, rows_per_batch rows */
     wl_columnar_memory_reservation_t descriptor_reservation;
-    bool descriptor_admitted;
     uint32_t rows_per_batch;
     col_join_batch_cursor_t cursor;
 } col_join_batch_producer_t;
@@ -280,7 +279,7 @@ producer_destroy(void *context)
     producer_release_lease(p);
     if (p->batch)
         col_rel_destroy(p->batch); /* releases the scratch token and ref */
-    if (p->descriptor_admitted)
+    if (p->descriptor_reservation.governor)
         (void)wl_columnar_memory_release(&p->descriptor_reservation);
     free(p);
 }
@@ -352,7 +351,6 @@ col_join_batch_producer_create(wl_col_session_t *sess,
         free(p);
         return EINVAL;
     }
-    p->descriptor_admitted = descriptor_admitted;
     p->sess = sess;
     p->op = op;
     p->left = left;
@@ -368,7 +366,7 @@ col_join_batch_producer_create(wl_col_session_t *sess,
         + 2u * (size_t)kc * sizeof(uint32_t));
     memcpy(p->lk, lk, (size_t)kc * sizeof(uint32_t));
     memcpy(p->rk, rk, (size_t)kc * sizeof(uint32_t));
-    if (p->descriptor_admitted) {
+    if (descriptor_admitted) {
         if (!wl_columnar_memory_commit(&p->descriptor_reservation, p)) {
             rc = EINVAL;
             goto fail;
