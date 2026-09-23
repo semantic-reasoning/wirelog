@@ -11814,9 +11814,33 @@ cleanup:
 #undef CLONE_CHECK
 }
 
+static void
+test_operator_null_session_guards(void)
+{
+    wl_plan_op_t op = { 0 };
+    eval_stack_t stack;
+    col_rel_t marker = { 0 };
+
+    TEST("operators reject null session without consuming stack input");
+    eval_stack_init(&stack);
+    if (eval_stack_push(&stack, &marker, false) != 0) {
+        FAIL("stack setup");
+        return;
+    }
+    if (col_op_map(&op, &stack, NULL) != EINVAL
+        || col_op_reduce(&op, &stack, NULL) != EINVAL
+        || col_op_lftj(&op, &stack, NULL) != EINVAL
+        || stack.top != 1 || stack.items[0].rel != &marker) {
+        FAIL("null session changed the input stack");
+        return;
+    }
+    PASS();
+}
+
 int
 main(void)
 {
+    test_operator_null_session_guards();
     for (unsigned route = 0; route < 3; route++)
         for (unsigned fallback = 0; fallback < 2; fallback++)
             test_serial_borrowed_clone_admission(1, 0, route, fallback != 0);
