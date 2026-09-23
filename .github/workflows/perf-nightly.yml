@@ -1,492 +1,126 @@
-name: Perf Nightly
-
-# Nightly WL_LOG disabled-path perf gate (issue #508 Phase 3).
-#
-# Why separate from ci-main.yml / ci-pr.yml:
-#   The perf gate is intentionally opt-in (WIRELOG_PERF_GATE=1) because
-#   shared CI runners exhibit several-percent wall-clock noise above the
-#   1% wall budget. Running it per-PR would be flaky; running it never
-#   means regressions can slip to main. Nightly is the compromise.
-#
-# Runners:
-#   ubuntu-latest   - GCC; sets cpufreq governor to performance via
-#                     cpupower if available, pins to CPU 0 via taskset.
-#   windows-latest  - MSVC; bench_stability_prep() in the test handles
-#                     thread affinity + HIGH_PRIORITY_CLASS internally.
-#
-# Both runners are shared GitHub-hosted boxes. The coefficient-of-
-# variation self-check inside test_log_perf_gate converts noisy runs
-# to SKIP (exit 77) instead of FAIL, so background load never produces
-# a false regression signal. When the gate actually FAILs, it means
-# both wall-delta > 1% AND per-iter > 1 ns tripped on a measurement
-# stable enough to pass the CoV ceiling - a real regression.
-#
-# fail-fast: false  - both matrix entries run to completion even if
-# one fails, so we get a complete picture per night.
+name: Issue 1913 paired performance diagnosis (temporary)
 
 on:
-  schedule:
-    # Daily at 04:00 UTC (overnight US Pacific / EU early morning).
-    - cron: '0 4 * * *'
   workflow_dispatch:
-    inputs:
-      portfolio_tier:
-        description: 'bench_flowlog portfolio tier'
-        type: choice
-        options:
-          - smoke
-          - light
-          - readme-full
-        default: readme-full
-      portfolio_workers:
-        description: 'Comma-separated portfolio worker counts'
-        default: '1'
-      portfolio_repeat:
-        description: 'Portfolio repeat count'
-        default: '1'
 
 permissions:
   contents: read
-  actions: read
 
 jobs:
-  perf:
-    name: Perf / ${{ matrix.os }} / ${{ matrix.compiler }}
-    runs-on: ${{ matrix.os }}
-    continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            compiler: gcc
-            cc: gcc
-          - os: windows-latest
-            compiler: msvc
-            cc: cl
-
+  paired-perf:
+    name: Paired gates / Ubuntu 24.04 / GCC
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
-      - name: Install dependencies (Linux)
-        if: runner.os == 'Linux'
+      - name: Verify diagnostic ref
+        env:
+          EXPECTED_BASE_SHA: 8d91c2da2b188b94af5b9f1da21c569d80ccb387
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/diagnostic/issue-1913-ab
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$EXPECTED_BASE_SHA"
+          test "$(git diff --name-only "$EXPECTED_BASE_SHA" HEAD | sort | tr '\n' ' ')" \
+            = ".github/workflows/perf-nightly.yml scripts/ci/run-issue-1913-paired-perf.sh "
+
+      - name: Install Linux build and affinity tools
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build linux-tools-common linux-tools-generic
 
-      - name: Install dependencies (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          choco install pkgconfiglite -y
-
       - name: Set up Meson 1.12.0
         uses: ./.github/actions/setup-meson
 
-      # Best-effort: request the 'performance' cpufreq governor. On
-      # GitHub's ubuntu-latest the governor is usually already
-      # 'performance' or 'schedutil'; if it is not and cpupower cannot
-      # set it (no permission / no governor driver), the test will SKIP
-      # with a diagnostic rather than FAIL.
-      - name: Set cpufreq governor (Linux, best-effort)
-        if: runner.os == 'Linux'
-        continue-on-error: true
+      - name: Fetch and verify measured source trees
+        env:
+          BASE_SHA: 8d91c2da2b188b94af5b9f1da21c569d80ccb387
+          CANDIDATE_SHA: b712e443457bca0a9d573b29af5885453728f504
         run: |
+          set -euo pipefail
+          git fetch --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main \
+            +refs/heads/feat/issue-1369-memory-admission:refs/remotes/origin/feat/issue-1369-memory-admission
+          test "$(git rev-parse origin/main)" = "$BASE_SHA"
+          test "$(git rev-parse origin/feat/issue-1369-memory-admission)" = "$CANDIDATE_SHA"
+          git worktree add --detach "$RUNNER_TEMP/wirelog-base" "$BASE_SHA"
+          git worktree add --detach "$RUNNER_TEMP/wirelog-candidate" "$CANDIDATE_SHA"
+          mkdir -p "$RUNNER_TEMP/issue-1913-artifacts"
+          gcc_version=$(gcc -dumpfullversion)
+          meson_version=$(meson --version)
+          case "$gcc_version" in
+            13.3.*) ;;
+            *) echo "expected CI GCC 13.3.x, found $gcc_version" >&2; exit 1 ;;
+          esac
+          test "$meson_version" = 1.12.0
+          {
+            printf 'diagnostic_workflow_sha=%s\n' "$GITHUB_SHA"
+            printf 'base_tree_sha=%s\n' "$BASE_SHA"
+            printf 'candidate_tree_sha=%s\n' "$CANDIDATE_SHA"
+            printf 'gcc_version=%s\n' "$gcc_version"
+            printf 'meson_version=%s\n' "$meson_version"
+            date -u +'%Y-%m-%dT%H:%M:%SZ'
+            uname -a
+            lscpu
+            gcc --version
+            meson --version
+            git -C "$RUNNER_TEMP/wirelog-base" status --porcelain
+            git -C "$RUNNER_TEMP/wirelog-candidate" status --porcelain
+            cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor || true
+          } > "$RUNNER_TEMP/issue-1913-artifacts/runner.txt"
+
+      - name: Require stable measurement host
+        run: |
+          set -euo pipefail
           sudo cpupower frequency-set -g performance || true
-          for cpu in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do
-            echo "governor($cpu) = $(cat "$cpu" 2>/dev/null || echo 'unreadable')"
+          governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
+          echo "cpu0 governor=$governor"
+          test "$governor" = performance
+          taskset -c 0 true
+          printf 'cpu0 governor=%s\n' "$governor" \
+            >> "$RUNNER_TEMP/issue-1913-artifacts/runner.txt"
+
+      - name: Configure and build both gate binaries
+        run: |
+          set -euo pipefail
+          for variant in base candidate; do
+            if [ "$variant" = base ]; then
+              source_tree="$RUNNER_TEMP/wirelog-base"
+            else
+              source_tree="$RUNNER_TEMP/wirelog-candidate"
+            fi
+            (
+              cd "$source_tree"
+              CC=gcc meson setup build-perf \
+                --buildtype=release \
+                -Doptimization=s \
+                -Db_lto=true \
+                -Dwirelog_log_max_level=trace \
+                -Dtests=true \
+                -DmbedTLS=disabled
+              meson introspect build-perf --buildoptions \
+                > "$RUNNER_TEMP/issue-1913-artifacts/$variant-meson-options.json"
+              meson compile -C build-perf \
+                tests/test_crdt_perf_gate tests/test_cspa_perf_gate
+            )
           done
 
-      - name: Configure release + trace ceiling (Linux)
-        if: runner.os == 'Linux'
-        run: >
-          meson setup build-perf
-          --buildtype=release
-          -Dwirelog_log_max_level=trace
-          -Dtests=true
-          -DmbedTLS=disabled
-        env:
-          CC: ${{ matrix.cc }}
-
-      - name: Configure release + trace ceiling (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        env:
-          CC: ${{ matrix.cc }}
-          CXX: ${{ matrix.cc }}
-        # Force MSVC even when the image also exposes MinGW. Meson discovers
-        # Visual Studio and restores its environment in compile/test steps.
-        run: |
-          meson setup build-perf --vsenv --buildtype=release -Dwirelog_log_max_level=trace -Dtests=true -DmbedTLS=disabled
-
-      - name: Build (Linux)
-        if: runner.os == 'Linux'
-        run: meson compile -C build-perf
-
-      - name: Build (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: |
-          meson compile -C build-perf
-
-      # Linux: taskset pins the meson test harness to CPU 0. The test
-      # still benefits from the operator-imposed cpufreq=performance
-      # check pre-gate; if that check fails, the test SKIPs cleanly.
-      - name: Run perf suite (Linux)
-        if: runner.os == 'Linux'
-        env:
-          WIRELOG_PERF_GATE: '1'
-        run: |
-          taskset -c 0 meson test -C build-perf --suite perf --print-errorlogs --num-processes 1
-
-      # Windows: bench_stability_prep() sets thread affinity and raises
-      # priority class from inside the test process. No external wrapper
-      # needed; meson test invokes the binary directly.
-      - name: Run perf suite (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        env:
-          WIRELOG_PERF_GATE: '1'
-        run: |
-          meson test -C build-perf --suite perf --print-errorlogs --num-processes 1
-
-      - name: Collect flowlog portfolio (Linux)
-        if: ${{ always() && runner.os == 'Linux' }}
+      - name: Run paired CRDT and CSPA gates
         shell: bash
-        env:
-          PORTFOLIO_TIER: ${{ github.event.inputs.portfolio_tier || 'readme-full' }}
-          PORTFOLIO_WORKERS: ${{ github.event.inputs.portfolio_workers || '1' }}
-          PORTFOLIO_REPEAT: ${{ github.event.inputs.portfolio_repeat || '1' }}
         run: |
-          set +e
-          python scripts/perf/run-flowlog-portfolio.py \
-            --bench build-perf/bench/bench_flowlog \
-            --tier "$PORTFOLIO_TIER" \
-            --workers "$PORTFOLIO_WORKERS" \
-            --repeat "$PORTFOLIO_REPEAT" \
-            --out-dir perf-artifacts/portfolio
-          rc=$?
-          echo "portfolio_exit=$rc" >> "$GITHUB_OUTPUT"
-          echo "PORTFOLIO_EXIT=$rc" >> "$GITHUB_ENV"
-          echo "portfolio_exit=$rc" >> "$GITHUB_STEP_SUMMARY"
-          exit 0
+          bash scripts/ci/run-issue-1913-paired-perf.sh \
+            "$RUNNER_TEMP/wirelog-base" \
+            "$RUNNER_TEMP/wirelog-candidate" \
+            "$RUNNER_TEMP/issue-1913-artifacts"
 
-      - name: Collect flowlog portfolio (Windows)
-        if: ${{ always() && runner.os == 'Windows' }}
-        shell: bash
-        env:
-          PORTFOLIO_TIER: ${{ github.event.inputs.portfolio_tier || 'readme-full' }}
-          PORTFOLIO_WORKERS: ${{ github.event.inputs.portfolio_workers || '1' }}
-          PORTFOLIO_REPEAT: ${{ github.event.inputs.portfolio_repeat || '1' }}
-        run: |
-          set +e
-          python scripts/perf/run-flowlog-portfolio.py \
-            --bench build-perf/bench/bench_flowlog.exe \
-            --tier "$PORTFOLIO_TIER" \
-            --workers "$PORTFOLIO_WORKERS" \
-            --repeat "$PORTFOLIO_REPEAT" \
-            --out-dir perf-artifacts/portfolio
-          rc=$?
-          echo "portfolio_exit=$rc" >> "$GITHUB_OUTPUT"
-          echo "PORTFOLIO_EXIT=$rc" >> "$GITHUB_ENV"
-          echo "portfolio_exit=$rc" >> "$GITHUB_STEP_SUMMARY"
-          exit 0
-
-      - name: Upload flowlog portfolio artifacts
+      - name: Upload paired measurements
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: perf-portfolio-${{ matrix.os }}-${{ matrix.compiler }}
-          path: perf-artifacts/portfolio
-          if-no-files-found: warn
-          retention-days: 35
-
-      - name: Summarize flowlog portfolio
-        if: always()
-        shell: bash
-        run: |
-          python scripts/perf/summarize-flowlog-portfolio.py \
-            --artifact-dir perf-artifacts/portfolio \
-            --artifact-name "perf-portfolio-${{ matrix.os }}-${{ matrix.compiler }}" \
-            >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Publish results
-        if: always()
-        shell: bash
-        run: |
-          STATUS="${{ job.status }}"
-          echo "## Perf Nightly: ${{ matrix.os }} / ${{ matrix.compiler }}" >> "$GITHUB_STEP_SUMMARY"
-          echo '' >> "$GITHUB_STEP_SUMMARY"
-          echo "Status: **${STATUS}**" >> "$GITHUB_STEP_SUMMARY"
-          echo '' >> "$GITHUB_STEP_SUMMARY"
-          if [ -f build-perf/meson-logs/testlog.txt ]; then
-            echo '<details><summary>Perf suite testlog</summary>' >> "$GITHUB_STEP_SUMMARY"
-            echo '' >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            grep -A 30 'test_log_perf_gate' build-perf/meson-logs/testlog.txt 2>/dev/null \
-              | head -200 >> "$GITHUB_STEP_SUMMARY" || true
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            echo '</details>' >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-  portfolio-skip-rate:
-    name: Perf portfolio SKIP-rate history
-    needs: perf
-    if: always()
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Download recent portfolio artifacts
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p perf-artifacts/history perf-artifacts/skip-rate
-          warnings=perf-artifacts/skip-rate/warnings.log
-          : > "$warnings"
-          cutoff="$(date -u -d '30 days ago' '+%Y-%m-%dT%H:%M:%SZ')"
-          if ! gh run list \
-              --workflow perf-nightly.yml \
-              --created ">=$cutoff" \
-              --limit 100 \
-              --json databaseId \
-              --jq '.[].databaseId' > perf-artifacts/skip-rate/runs.txt; then
-            echo "gh run list failed; no history downloaded" >> "$warnings"
-          fi
-          while IFS= read -r run_id; do
-            [ -n "$run_id" ] || continue
-            dest="perf-artifacts/history/run-$run_id"
-            mkdir -p "$dest"
-            if ! gh run download "$run_id" \
-                --pattern 'perf-portfolio-*' \
-                --dir "$dest"; then
-              echo "failed to download perf portfolio artifacts for run $run_id" >> "$warnings"
-            fi
-          done < perf-artifacts/skip-rate/runs.txt
-
-      - name: Summarize portfolio SKIP-rate history
-        if: always()
-        shell: bash
-        run: |
-          mkdir -p perf-artifacts/skip-rate
-          python scripts/perf/summarize-flowlog-portfolio-history.py \
-            --root perf-artifacts/history \
-            --window-days 30 \
-            --json-out perf-artifacts/skip-rate/skip-rate.json \
-            > perf-artifacts/skip-rate/skip-rate.md
-          if [ -s perf-artifacts/skip-rate/warnings.log ]; then
-            {
-              echo ''
-              echo '<details><summary>Artifact download warnings</summary>'
-              echo ''
-              sed 's/^/- /' perf-artifacts/skip-rate/warnings.log
-              echo ''
-              echo '</details>'
-            } >> perf-artifacts/skip-rate/skip-rate.md
-          fi
-          cat perf-artifacts/skip-rate/skip-rate.md >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload portfolio SKIP-rate summary
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: perf-portfolio-skip-rate
-          path: perf-artifacts/skip-rate
-          if-no-files-found: warn
-          retention-days: 35
-
-  # Authoritative DOOP execution for issue #1351.  The execution and
-  # correctness contract must run even when no dedicated runner is available.
-  # Hosted-runner timing is explicitly advisory; strict governor/threshold
-  # enforcement remains available through run-doop-perf-gate.sh's
-  # `strict-stable` mode for a future provisioned runner.
-  perf-stable:
-    name: Perf hosted runner / correctness + DOOP
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build curl unzip linux-tools-common linux-tools-generic
-
-      - name: Set up Meson 1.12.0
-        uses: ./.github/actions/setup-meson
-
-      - name: Verify hosted DOOP capacity
-        shell: bash
-        run: |
-          set -euo pipefail
-          taskset -pc $$
-          nproc --all
-          taskset -pc $$ | grep -Eq ':[[:space:]]*[0-9]'
-
-      - name: Configure stripped build
-        run: >
-          meson setup build-perf-error
-          --buildtype=release
-          -Dwirelog_log_max_level=error
-          -Dtests=true
-          -DmbedTLS=disabled
-        env:
-          CC: gcc
-
-      - name: Download pinned DOOP dataset
-        run: bench/data/doop/download.sh
-
-      - name: Build stripped build
-        run: meson compile -C build-perf-error
-
-      - name: Run evaluator correctness gates
-        env:
-          WIRELOG_PERF_GATE: '1'
-        run: >
-          meson test -C build-perf-error
-          crdt_correctness_full cspa_correctness
-          --print-errorlogs --num-processes 1
-
-      # DOOP is W=8 and must not inherit the single-CPU affinity used by the
-      # W=1 evaluator gates above.  Keep a separate Meson log, then append it
-      # to the authoritative error log so the common execution checker still
-      # verifies one complete evidence stream.
-      - name: Run DOOP W=8 timing gate
-        if: always()
-        env:
-          WIRELOG_PERF_GATE: '1'
-          WIRELOG_PERF_REQUIRE: '1'
-          WIRELOG_DOOP_PERF_MODE: required-hosted
-          WL_DOOP_PERF_GATE_TARGET_MS: ${{ vars.WL_DOOP_PERF_GATE_TARGET_MS }}
-        run: |
-          doop_affinity=$(taskset -pc $$ | sed 's/.*: //')
-          test -n "$doop_affinity"
-          set +e
-          taskset -c "$doop_affinity" meson test -C build-perf-error doop_w8_gate \
-            --logbase doop-testlog --print-errorlogs --num-processes 1
-          rc=$?
-          cat build-perf-error/meson-logs/doop-testlog.txt >> \
-            build-perf-error/meson-logs/testlog.txt
-          exit "$rc"
-
-      - name: Verify DOOP gate executed
-        run: >
-          scripts/ci/check-doop-perf-gate-execution.sh
-          build-perf-error/meson-logs/doop-testlog.txt
-
-      - name: Upload authoritative perf logs
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: perf-stable-test-logs
-          path: |
-            build-perf-error/meson-logs/testlog.txt
-            build-perf-error/meson-logs/doop-testlog.txt
+          name: issue-1913-paired-perf-ubuntu-24.04
+          path: ${{ runner.temp }}/issue-1913-artifacts
           if-no-files-found: error
-          retention-days: 35
-
-      - name: Capture DOOP execution evidence
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p perf-artifacts/doop
-          if [[ -f build-perf-error/meson-logs/doop-testlog.txt ]]; then
-            cp build-perf-error/meson-logs/doop-testlog.txt perf-artifacts/doop/
-          else
-            echo 'MISSING: build-perf-error/meson-logs/doop-testlog.txt' \
-              > perf-artifacts/doop/doop-testlog.txt
-          fi
-          if [[ -f scripts/release/downstream-matrix-oracles.tsv ]]; then
-            cp scripts/release/downstream-matrix-oracles.tsv perf-artifacts/doop/
-          else
-            echo 'MISSING: downstream-matrix-oracles.tsv' \
-              > perf-artifacts/doop/downstream-matrix-oracles.tsv
-          fi
-          if compgen -G 'bench/data/doop/*.facts' > /dev/null; then
-            ( cd bench/data/doop && sha256sum -- *.facts | LC_ALL=C sort -k2 \
-                | sha256sum | awk '{print $1}' ) > perf-artifacts/doop/facts-manifest.sha256
-          else
-            echo 'MISSING: bench/data/doop/*.facts' \
-              > perf-artifacts/doop/facts-manifest.sha256
-          fi
-          commit=$(git rev-parse HEAD)
-          affinity=$(taskset -pc $$ | sed 's/.*: //')
-          governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor \
-            2>/dev/null || echo unavailable)
-          printf '{\n  "commit": "%s",\n  "workflow": "%s",\n  "run_id": "%s",\n  "runner_os": "%s",\n  "runner_arch": "%s",\n  "runner_image": "%s",\n  "cpu_count": %s,\n  "affinity": "%s",\n  "governor": "%s",\n  "workers": 8,\n  "repeat": 5,\n  "mode": "required-hosted",\n  "timing": "advisory"\n}\n' \
-            "$commit" "$GITHUB_WORKFLOW" "$GITHUB_RUN_ID" "$RUNNER_OS" \
-            "$RUNNER_ARCH" "${ImageOS:-unknown}" "$(nproc --all)" \
-            "$affinity" "$governor" > perf-artifacts/doop/host.json
-          printf 'capture_completed=true\n' > perf-artifacts/doop/evidence-status.txt
-
-      - name: Upload DOOP execution evidence
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: perf-doop-evidence
-          path: perf-artifacts/doop
-          if-no-files-found: error
-          retention-days: 35
-
-  # ==========================================================================
-  # Stress nightly (Issue #594): runs the W=4 / R=500 freeze-cycle and
-  # W=4 / R=5000 apply-roundtrip workloads under TSan instrumentation on
-  # Linux GCC.  Independent of the perf gate above (different build flags
-  # and different test suite) so a stress regression doesn't mask a perf
-  # regression and vice-versa.  See docs/STRESS_BASELINE.md for the
-  # release-tier (W=8) invocation and the flake-baseline protocol.
-  # ==========================================================================
-  stress:
-    name: Stress / ubuntu-latest / gcc / TSan
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Ninja
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build
-
-      - name: Set up Meson 1.12.0
-        uses: ./.github/actions/setup-meson
-
-      - name: Configure debug + TSan
-        run: >
-          meson setup build-stress-tsan
-          -Db_sanitize=thread
-          -Db_lundef=false
-          -Dthreads=posix
-          -Dtests=true
-          --buildtype=debug
-        env:
-          CC: gcc
-
-      - name: Build
-        run: meson compile -C build-stress-tsan
-
-      - name: Run stress-nightly suite under TSan
-        env:
-          TSAN_OPTIONS: 'halt_on_error=1:second_deadlock_stack=1'
-        run: |
-          meson test -C build-stress-tsan --suite stress-nightly \
-            --print-errorlogs --num-processes 1
-
-      - name: Publish results
-        if: always()
-        shell: bash
-        run: |
-          STATUS="${{ job.status }}"
-          echo "## Stress Nightly: ubuntu-latest / gcc / TSan" >> "$GITHUB_STEP_SUMMARY"
-          echo '' >> "$GITHUB_STEP_SUMMARY"
-          echo "Status: **${STATUS}**" >> "$GITHUB_STEP_SUMMARY"
-          if [ -f build-stress-tsan/meson-logs/testlog.txt ]; then
-            echo '<details><summary>Stress-nightly testlog</summary>' >> "$GITHUB_STEP_SUMMARY"
-            echo '' >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            grep -A 30 'stress_harness' build-stress-tsan/meson-logs/testlog.txt 2>/dev/null \
-              | head -200 >> "$GITHUB_STEP_SUMMARY" || true
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            echo '</details>' >> "$GITHUB_STEP_SUMMARY"
-          fi
+          retention-days: 30
