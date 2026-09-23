@@ -1322,15 +1322,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         return wl_columnar_join_publish_after_left(stack, &left_e, out, false);
     }
 
-    int64_t *tmp = (int64_t *)malloc(sizeof(int64_t) * (ocols ? ocols : 1));
-    if (!tmp) {
-        col_rel_destroy(out);
-        free(lk);
-        free(rk);
-        if (right_filtered)
-            col_rel_destroy(right_filtered);
-        return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
-    }
+    int64_t *tmp = NULL;
 
     /* BOOLEAN SPECIALIZATION (Issue #62): Fast-path for unary relations.
      * When right relation is unary (ncols == 1) and single join key,
@@ -1350,10 +1342,59 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         col_rel_t *probe = right_is_unary ? left : right;
         uint32_t build_kcol = right_is_unary ? rk[0] : lk[0];
         uint32_t probe_kcol = right_is_unary ? lk[0] : rk[0];
+        wl_columnar_memory_reservation_t row_reservation;
+        bool row_admitted = false;
+        wl_columnar_memory_reservation_init(&row_reservation);
+        if (sess->memory_governor) {
+            uint64_t row_bytes = 0;
+            wl_columnar_memory_admission_status_t status;
+            if (!wl_columnar_memory_size_mul(ocols ? ocols : 1,
+                sizeof(int64_t), &row_bytes)) {
+                col_rel_destroy(out);
+                free(lk);
+                free(rk);
+                if (right_filtered)
+                    col_rel_destroy(right_filtered);
+                return wl_columnar_join_dispose_left(stack, &left_e,
+                           EOVERFLOW);
+            }
+            status = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(sess->memory_governor),
+                row_bytes, &row_reservation);
+            if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+                && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+                if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                    sess->memory_budget_denied = true;
+                col_rel_destroy(out);
+                free(lk);
+                free(rk);
+                if (right_filtered)
+                    col_rel_destroy(right_filtered);
+                return wl_columnar_join_dispose_left(stack, &left_e,
+                           status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                               ? ENOSPC
+                               : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                               ? EOVERFLOW : ENOMEM);
+            }
+            row_admitted = true;
+        }
+        tmp = (int64_t *)malloc(sizeof(int64_t) * (ocols ? ocols : 1));
+        if (!tmp) {
+            if (row_admitted)
+                (void)wl_columnar_memory_rollback(&row_reservation);
+            col_rel_destroy(out);
+            free(lk);
+            free(rk);
+            if (right_filtered)
+                col_rel_destroy(right_filtered);
+            return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
+        }
 
         /* Build hash set from the unary relation's single column. */
         uint32_t nbuckets;
         if (col_join_bucket_count(build->nrows, &nbuckets) != 0) {
+            if (row_admitted)
+                (void)wl_columnar_memory_rollback(&row_reservation);
             free(tmp);
             col_rel_destroy(out);
             free(lk);
@@ -1378,6 +1419,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 && wl_columnar_memory_size_add(head_bytes, next_bytes,
                     &hash_bytes);
             if (!sized) {
+                if (row_admitted)
+                    (void)wl_columnar_memory_rollback(&row_reservation);
                 free(tmp);
                 col_rel_destroy(out);
                 free(lk);
@@ -1394,6 +1437,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
                 if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                     sess->memory_budget_denied = true;
+                if (row_admitted)
+                    (void)wl_columnar_memory_rollback(&row_reservation);
                 free(tmp);
                 col_rel_destroy(out);
                 free(lk);
@@ -1415,6 +1460,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         if (!ht_head || !ht_next) {
             if (hash_admitted)
                 (void)wl_columnar_memory_rollback(&hash_reservation);
+            if (row_admitted)
+                (void)wl_columnar_memory_rollback(&row_reservation);
             free(ht_head);
             free(ht_next);
             free(tmp);
@@ -1474,6 +1521,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         free(ht_next);
         if (hash_admitted)
             (void)wl_columnar_memory_rollback(&hash_reservation);
+        if (row_admitted)
+            (void)wl_columnar_memory_rollback(&row_reservation);
         if (join_rc != 0) {
             free(tmp);
             col_rel_destroy(out);
@@ -1488,6 +1537,15 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             out->nrows);
     } else {
         /* Standard merge-join for non-unary relations. */
+        tmp = (int64_t *)malloc(sizeof(int64_t) * (ocols ? ocols : 1));
+        if (!tmp) {
+            col_rel_destroy(out);
+            free(lk);
+            free(rk);
+            if (right_filtered)
+                col_rel_destroy(right_filtered);
+            return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
+        }
         /* Hash join: use persistent arrangement for the full right relation.
          * Delta substitution and true "no arrangement" misses retain the
          * existing ephemeral hash table path.  Once the protected primary
