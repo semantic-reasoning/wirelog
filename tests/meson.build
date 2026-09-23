@@ -2522,7 +2522,7 @@ test('sub_ms_graph_correctness', test_sub_ms_graph_perf_gate_exe,
 
 test_consolidate_incremental_delta_exe = executable(
   'test_consolidate_incremental_delta',
-  files('test_consolidate_incremental_delta.c'),
+  files('test_consolidate_incremental_delta.c', '../wirelog/evaluation_control.c'),
   backend_src,
   intern_src,
   arena_src,
@@ -2567,7 +2567,7 @@ test('mat_cache_lifetime', test_mat_cache_lifetime_exe)
 
 test_consolidate_kway_merge_exe = executable(
   'test_consolidate_kway_merge',
-  files('test_consolidate_kway_merge.c'),
+  files('test_consolidate_kway_merge.c', '../wirelog/evaluation_control.c'),
   backend_src,
   intern_src,
   arena_src,

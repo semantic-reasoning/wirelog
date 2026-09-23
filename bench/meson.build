@@ -99,6 +99,10 @@ bench_workqueue_src = files(
   subdir_wirelog / 'workqueue.c',
 )
 
+bench_evaluation_control_src = files(
+  subdir_wirelog / 'evaluation_control.c',
+)
+
 # Reuse the same threading backend selected by wirelog/meson.build
 # (C11 threads.h > POSIX pthreads > Windows MSVC).
 bench_thread_src = wirelog_thread_src
@@ -144,6 +148,7 @@ bench_col_layout = executable(
   'bench_col_layout',
   files('bench_col_layout.c'),
   bench_backend_src,
+  bench_evaluation_control_src,
   files(subdir_wirelog / 'intern.c'),
   bench_arena_src,
   bench_thread_src,
@@ -161,6 +166,7 @@ bench_compound_exe = executable(
   files('bench_compound.c'),
   bench_parser_src,
   bench_backend_src,
+  bench_evaluation_control_src,
   files(subdir_wirelog / 'intern.c'),
   bench_arena_src,
   bench_thread_src,
@@ -178,6 +184,7 @@ bench_intern_exe = executable(
   'bench_intern',
   files('bench_intern.c'),
   bench_backend_src,
+  bench_evaluation_control_src,
   files(subdir_wirelog / 'intern.c'),
   bench_arena_src,
   bench_thread_src,
@@ -196,6 +203,7 @@ bench_intern_exe = executable(
 bench_filter_scan_srcs = [
   files('bench_filter_scan.c'),
   bench_backend_src,
+  bench_evaluation_control_src,
   files(subdir_wirelog / 'intern.c'),
   bench_arena_src,
   bench_thread_src,
