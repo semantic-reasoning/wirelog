@@ -94,7 +94,9 @@ wl_columnar_eval_serial_canonicalize_aggregate_locked(col_rel_t *rel,
         if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
             return status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
-                ? EOVERFLOW : ENOMEM;
+                ? EOVERFLOW
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                ? ENOSPC : ENOMEM;
     }
     col_group_slot_t *groups = (col_group_slot_t *)calloc(map_cap,
             sizeof(*groups));
@@ -165,7 +167,8 @@ wl_columnar_eval_serial_canonicalize_aggregate_locked(col_rel_t *rel,
 
 static int
 wl_columnar_eval_serial_canonicalize_aggregate(col_rel_t *rel,
-    const wl_plan_agg_spec_t *spec, const wl_intern_t *intern)
+    const wl_plan_agg_spec_t *spec, const wl_intern_t *intern,
+    wl_col_session_t *sess)
 {
     if (!rel || !spec || !spec->has_spec || rel->nrows < 2)
         return 0;
@@ -182,6 +185,8 @@ wl_columnar_eval_serial_canonicalize_aggregate(col_rel_t *rel,
         rc = wl_columnar_eval_serial_canonicalize_aggregate_locked(rel,
                 spec, intern);
     int release_rc = wl_columnar_source_access_writer_release(&writer);
+    if (rc == ENOSPC)
+        sess->memory_budget_denied = true;
     return rc != 0 ? rc : release_rc;
 }
 
@@ -229,7 +234,7 @@ wl_columnar_eval_serial_canonicalize_aggregates(const wl_plan_stratum_t *sp,
             wl_columnar_eval_serial_test_before_aggregate(sess, rel);
 #endif
         int rc = wl_columnar_eval_serial_canonicalize_aggregate(rel,
-                &rp->recursive_agg, sess->intern);
+                &rp->recursive_agg, sess->intern, sess);
         if (rc != 0)
             return rc;
         col_session_invalidate_arrangements(&sess->base, rp->name);
@@ -493,9 +498,14 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 wl_columnar_memory_governor_ref_get(sess->memory_governor),
                 delta_scratch_bytes, &delta_reservation);
         if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
-            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                sess->memory_budget_denied = true;
             return status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
-                ? EOVERFLOW : ENOMEM;
+                ? EOVERFLOW
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                ? ENOSPC : ENOMEM;
+        }
     }
     col_rel_t **delta_rels = (col_rel_t **)calloc(nrels, sizeof(col_rel_t *));
     if (!delta_rels) {
