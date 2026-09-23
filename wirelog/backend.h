@@ -100,6 +100,11 @@ typedef struct {
     int (*session_create_with_options)(const wl_plan_t *plan,
         uint32_t num_workers, const wl_session_options_t *options,
         wl_session_t **out);
+
+    /* Optional query for a backend-specific memory-budget denial from the
+     * most recent operation. Backends without governed admission leave this
+     * NULL. */
+    bool (*session_budget_denied)(wl_session_t *session);
 } wl_compute_backend_t;
 
 /**

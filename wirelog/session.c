@@ -22,7 +22,6 @@
 
 #include "session.h"
 #include "backend.h"
-#include "columnar/internal.h"
 #include "thread.h"
 #include <errno.h>
 #include <string.h>
@@ -470,8 +469,12 @@ wl_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
 bool
 wl_session_budget_denied(wl_session_t *session)
 {
-    if (!session || !session->backend
-        || session->backend != wl_backend_columnar())
+    bool denied;
+
+    if (!session || wl_session_operation_begin(session) != 0)
         return false;
-    return wl_columnar_session_budget_denied(COL_SESSION(session));
+    denied = session->backend && session->backend->session_budget_denied
+        && session->backend->session_budget_denied(session);
+    wl_session_operation_end(session);
+    return denied;
 }
