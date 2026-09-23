@@ -2083,6 +2083,33 @@ wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
         aj_head[h] = rr + 1;
     }
     int aj_rc = 0;
+    wl_columnar_memory_reservation_t aj_row_reservation;
+    bool aj_row_admitted = false;
+    wl_columnar_memory_reservation_init(&aj_row_reservation);
+    if (sess->memory_governor) {
+        uint64_t row_bytes = 0;
+        wl_columnar_memory_admission_status_t status;
+        if (!wl_columnar_memory_size_mul(
+                left->ncols ? left->ncols : 1, sizeof(int64_t),
+                &row_bytes)) {
+            aj_rc = EOVERFLOW;
+            goto antijoin_done;
+        }
+        status = wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(sess->memory_governor),
+            row_bytes, &aj_row_reservation);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                sess->memory_budget_denied = true;
+            aj_rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : ENOMEM;
+            goto antijoin_done;
+        }
+        aj_row_admitted = true;
+    }
     int64_t *lrow_buf = (int64_t *)malloc(
         sizeof(int64_t) * (left->ncols ? left->ncols : 1));
     if (!lrow_buf) {
@@ -2106,6 +2133,8 @@ wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     }
     free(lrow_buf);
 antijoin_done:
+    if (aj_row_admitted)
+        (void)wl_columnar_memory_rollback(&aj_row_reservation);
     free(aj_head);
     free(aj_next);
     if (aj_hash_admitted)
@@ -2222,8 +2251,46 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     }
 #endif
 
+    wl_columnar_memory_reservation_t sj_row_reservation;
+    bool sj_row_admitted = false;
+    wl_columnar_memory_reservation_init(&sj_row_reservation);
+    if (sess->memory_governor) {
+        uint64_t row_bytes = 0;
+        wl_columnar_memory_admission_status_t status;
+        if (!wl_columnar_memory_size_mul(ocols ? ocols : 1,
+            sizeof(int64_t), &row_bytes)) {
+            col_rel_destroy(out);
+            free(lk);
+            free(rk);
+            if (right_filtered)
+                col_rel_destroy(right_filtered);
+            return wl_columnar_join_dispose_left(stack, &left_e,
+                       EOVERFLOW);
+        }
+        status = wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(sess->memory_governor),
+            row_bytes, &sj_row_reservation);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                sess->memory_budget_denied = true;
+            col_rel_destroy(out);
+            free(lk);
+            free(rk);
+            if (right_filtered)
+                col_rel_destroy(right_filtered);
+            return wl_columnar_join_dispose_left(stack, &left_e,
+                       status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                           ? ENOSPC
+                           : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                           ? EOVERFLOW : ENOMEM);
+        }
+        sj_row_admitted = true;
+    }
     int64_t *tmp = (int64_t *)malloc(sizeof(int64_t) * (ocols ? ocols : 1));
     if (!tmp) {
+        if (sj_row_admitted)
+            (void)wl_columnar_memory_rollback(&sj_row_reservation);
         col_rel_destroy(out);
         free(lk);
         free(rk);
@@ -2235,6 +2302,8 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     /* Build hash set from right relation join keys: O(|R|) */
     uint32_t nbuckets;
     if (col_join_bucket_count(right->nrows, &nbuckets) != 0) {
+        if (sj_row_admitted)
+            (void)wl_columnar_memory_rollback(&sj_row_reservation);
         free(tmp);
         col_rel_destroy(out);
         free(lk);
@@ -2293,6 +2362,8 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     uint32_t *ht_next = (uint32_t *)malloc((right->nrows > 0 ? right->nrows : 1)
             * sizeof(uint32_t));
     if (!ht_head || !ht_next) {
+        if (sj_row_admitted)
+            (void)wl_columnar_memory_rollback(&sj_row_reservation);
         if (sj_hash_admitted)
             (void)wl_columnar_memory_rollback(&sj_hash_reservation);
         free(ht_head);
@@ -2485,6 +2556,8 @@ semijoin_parallel_done:
     }
 
 semijoin_done:
+    if (sj_row_admitted)
+        (void)wl_columnar_memory_rollback(&sj_row_reservation);
     free(ht_head);
     free(ht_next);
     if (sj_hash_admitted)
