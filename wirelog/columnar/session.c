@@ -125,9 +125,7 @@ session_rels_admit(wl_col_session_t *sess, uint64_t bytes,
         return 0;
     if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
         sess->memory_budget_denied = true;
-    return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
-        : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
-        : EINVAL;
+    return wl_columnar_memory_governor_admission_errno(status, EINVAL);
 }
 
 static void

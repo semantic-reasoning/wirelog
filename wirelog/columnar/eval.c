@@ -1743,9 +1743,7 @@ wl_columnar_eval_retire_worker_relations(const wl_plan_stratum_t *sp,
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
             if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                 coord->memory_budget_denied = true;
-            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
-                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
-                : EINVAL;
+            return wl_columnar_memory_governor_admission_errno(status, EINVAL);
         }
     }
     wl_columnar_eval_delta_retirement_t *entries = calloc(count,
@@ -6696,9 +6694,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
             if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                 coord->memory_budget_denied = true;
-            rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
-                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
-                : ENOMEM;
+            rc = wl_columnar_memory_governor_admission_errno(status, ENOMEM);
             goto done;
         }
     }
