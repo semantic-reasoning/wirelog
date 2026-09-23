@@ -289,6 +289,7 @@ struct wl_columnar_kfusion_cohort {
     bool dispatch_active;
     bool barrier_complete;
     bool resources_cleaned;
+    wl_columnar_memory_reservation_t scratch_reservation;
     col_rel_t *merged;
     int operation_rc;
     atomic_uint_fast64_t shared_join_count;
@@ -485,6 +486,7 @@ col_kfusion_free_cohort(struct wl_columnar_kfusion_cohort *cohort)
     free(cohort->workers);
     free(cohort->results);
     free(cohort->live_indices);
+    wl_columnar_memory_reservation_release(&cohort->scratch_reservation);
     free(cohort);
 }
 
@@ -852,6 +854,47 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
     if (parallel_executed)
         *parallel_executed = true;
 
+    uint64_t scratch_bytes = 0;
+    uint64_t bytes = 0;
+    if (!wl_columnar_memory_size_mul(k, sizeof(uint32_t), &scratch_bytes)
+        || !wl_columnar_memory_size_mul(live_count, sizeof(col_rel_t *),
+        &bytes)
+        || !wl_columnar_memory_size_add(scratch_bytes, bytes,
+        &scratch_bytes)
+        || !wl_columnar_memory_size_mul(live_count,
+        sizeof(col_op_k_fusion_worker_t), &bytes)
+        || !wl_columnar_memory_size_add(scratch_bytes, bytes,
+        &scratch_bytes)
+        || !wl_columnar_memory_size_mul(live_count,
+        sizeof(wl_col_session_t), &bytes)
+        || !wl_columnar_memory_size_add(scratch_bytes, bytes,
+        &scratch_bytes)
+        || !wl_columnar_memory_size_mul(1,
+        sizeof(struct wl_columnar_kfusion_cohort), &bytes)
+        || !wl_columnar_memory_size_add(scratch_bytes, bytes,
+        &scratch_bytes)
+        || !wl_columnar_memory_size_mul(live_count, sizeof(col_rel_t *),
+        &bytes)
+        || !wl_columnar_memory_size_add(scratch_bytes, bytes,
+        &scratch_bytes)) {
+        free(live_indices);
+        return EOVERFLOW;
+    }
+    wl_columnar_memory_reservation_t scratch_reservation;
+    wl_columnar_memory_reservation_init(&scratch_reservation);
+    if (sess->memory_governor) {
+        wl_columnar_memory_admission_status_t admission
+            = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(sess->memory_governor),
+                scratch_bytes, &scratch_reservation);
+        if (admission != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && admission != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            free(live_indices);
+            return admission == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : ENOMEM;
+        }
+    }
+
     col_rel_t **results = (col_rel_t **)calloc(live_count, sizeof(col_rel_t *));
     col_op_k_fusion_worker_t *workers = (col_op_k_fusion_worker_t *)calloc(
         live_count, sizeof(col_op_k_fusion_worker_t));
@@ -868,6 +911,7 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
         free(workers);
         free(worker_sess);
         free(cohort);
+        wl_columnar_memory_reservation_release(&scratch_reservation);
         return ENOMEM;
     }
 
@@ -877,6 +921,8 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
     cohort->worker_sess = worker_sess;
     cohort->live_indices = live_indices;
     cohort->live_count = live_count;
+    cohort->scratch_reservation = scratch_reservation;
+    wl_columnar_memory_reservation_init(&scratch_reservation);
     cohort->dispatch_active = true;
     sess->kfusion_pending_cohort = cohort;
 
