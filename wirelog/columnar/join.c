@@ -1210,6 +1210,15 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
 
     uint32_t kc = op->key_count;
     col_rel_t *left = left_e.rel;
+    /* A relation cannot represent more than UINT32_MAX rows. Check a full
+     * cross product before either the serial or parallel path allocates an
+     * output; an explicit row limit retains its existing overflow behavior. */
+    if (kc == 0 && sess->join_output_limit == 0
+        && (uint64_t)left->nrows * right->nrows > UINT32_MAX) {
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
+        return wl_columnar_join_dispose_left(stack, &left_e, EOVERFLOW);
+    }
 
     /* Resolve key column positions */
     uint32_t *lk = (uint32_t *)malloc(sizeof(uint32_t) * (kc ? kc : 1));

@@ -195,13 +195,9 @@ now_ns(void)
 #define COL_ARR_CACHE_MAX 128u
 #define COL_ARR_CACHE_LIMIT_BYTES (256ULL * 1024ULL * 1024ULL) /* 256 MB default */
 
-/* Default maximum output rows per single join operation (issue #218, #221).
- * Prevents unbounded memory growth from cardinality explosion in
- * cross-product-heavy joins (e.g., DOOP VarPointsTo). When exceeded,
- * the join returns EOVERFLOW. Set to 0 to disable the limit.
- * At runtime, the session uses a dynamically computed limit based on
- * available physical memory (see wl_col_session_t.join_output_limit). */
-#define COL_JOIN_OUTPUT_LIMIT_DEFAULT (50u * 1000u * 1000u) /* 50M rows */
+/* The join row limit defaults to zero (disabled). A positive
+ * WIRELOG_JOIN_OUTPUT_LIMIT enables the optional EOVERFLOW cap; governed
+ * byte admission remains active in either mode. */
 
 typedef enum wl_columnar_internal_tdd_fallback_reason {
     WL_COLUMNAR_INTERNAL_TDD_FALLBACK_NONE = 0,

@@ -551,8 +551,10 @@ are now admitted. Joins and other allocation classes remain follow-up work.
 The only consumer is the join operator: when RELATION reaches 80% of its
 share (`wl_mem_ledger_should_backpressure(RELATION, 80)`), a worker session
 stops generating rows for the current join and reports the condition
-upstream.  The join row cap (`WIRELOG_JOIN_OUTPUT_LIMIT`, Issue #221) is a
-separate mechanism.  Replacing both with admission control is #1367
+upstream. `WIRELOG_JOIN_OUTPUT_LIMIT` is an optional explicit row cap: unset
+or invalid values leave it disabled, while a valid positive decimal enables
+it. Governed byte admission remains active with the row cap disabled.
+Replacing the legacy ledger heuristic with admission control is #1367
 (foundation in #1368).
 
 ## 7. Baselines
@@ -1221,7 +1223,7 @@ Ownership and admission:
   It follows this file's existing rule that a failed operation keeps the
   capacity it was admitted (see `sink_abort` in `join_batch.c`), so the
   retry costs no new reservation.
-- The legacy row cap `WIRELOG_JOIN_OUTPUT_LIMIT` stays distinct and is
+- The optional explicit row cap `WIRELOG_JOIN_OUTPUT_LIMIT` stays distinct and is
   checked once per committed batch, so it may be overshot by at most
   `rows_per_batch - 1` rows in bounded mode.  The ledger backpressure
   heuristic of the one-shot loop is not consulted per row in bounded mode;

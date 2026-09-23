@@ -1540,6 +1540,7 @@ test_lease_released_on_every_path(void)
         wl_col_session_t *tight = make_session(arr_bytes + 1u);
         col_rel_t *right2 = make_right(2, 20);
         const col_arr_entry_t *e2;
+        uint64_t registry_bytes = 0;
         if (!tight || !right2) {
             FAIL("tight session");
             if (right2)
@@ -1547,7 +1548,13 @@ test_lease_released_on_every_path(void)
             destroy_session(tight);
             goto out;
         }
-        session_add_rel(tight, right2);
+        if (session_add_rel(tight, right2) != 0) {
+            FAIL("tight relation registration");
+            col_rel_destroy(right2);
+            destroy_session(tight);
+            goto out;
+        }
+        registry_bytes = reserved_of(tight);
         if (!col_session_get_arrangement(&tight->base, "right", KEY0, 1u)) {
             FAIL("tight arrangement warmup");
             destroy_session(tight);
@@ -1558,7 +1565,8 @@ test_lease_released_on_every_path(void)
         e2 = find_entry(tight, "right");
         if (rc != ENOSPC || !tight->memory_budget_denied || cont != NULL
             || (e2 && e2->pin_count != 0u)
-            || reserved_of(tight) != (e2 ? e2->arr.reserved_bytes : 0u)) {
+            || reserved_of(tight)
+            != registry_bytes + (e2 ? e2->arr.reserved_bytes : 0u)) {
             FAIL(
                 "descriptor denial lacked a typed result or left state behind");
             destroy_session(tight);
@@ -1980,6 +1988,47 @@ out:
     if (oracle)
         col_rel_destroy(oracle);
     fixture_fini(&f);
+}
+
+static void
+test_unlimited_cross_representation_overflow(void)
+{
+    const int64_t key[] = { 1 };
+    TEST("unlimited cross join rejects unrepresentable output before writes");
+    for (uint32_t workers = 1; workers <= 2; workers++) {
+        fixture_t f;
+        eval_stack_t stack;
+        wl_plan_op_t cross;
+        if (!fixture_init(&f, 1u << 24, key, 1, 1, 1)) {
+            FAIL("fixture");
+            fixture_fini(&f);
+            return;
+        }
+        f.sess->num_workers = workers;
+        f.sess->join_output_limit = 0;
+        cross = f.op;
+        cross.key_count = 0;
+        uint32_t left_rows = f.left->nrows;
+        uint32_t right_rows = f.right->nrows;
+        uint64_t before = reserved_of(f.sess);
+        f.left->nrows = 65536;
+        f.right->nrows = 65536;
+        eval_stack_init(&stack);
+        int rc = eval_stack_push(&stack, f.left, false);
+        if (rc == 0)
+            rc = col_op_join(&cross, &stack, f.sess);
+        f.left->nrows = left_rows;
+        f.right->nrows = right_rows;
+        bool ok = rc == EOVERFLOW && stack.top == 0
+            && f.out->nrows == 0 && reserved_of(f.sess) == before;
+        eval_stack_drain(&stack);
+        fixture_fini(&f);
+        if (!ok) {
+            FAIL("cross join wrote output or leaked reservation");
+            return;
+        }
+    }
+    PASS();
 }
 
 /* Run one excluded operator shape in both modes.  The non-strict invocation
@@ -2842,6 +2891,7 @@ main(void)
     test_unsupported_budget_and_pooled_output();
     test_row_cap_trips_after_a_committed_batch();
     test_operator_dispatch_and_eligibility();
+    test_unlimited_cross_representation_overflow();
     test_operator_no_arrangement_probe_failure();
     test_operator_delta_and_filtered_fallbacks();
     test_eligibility_ordering();
