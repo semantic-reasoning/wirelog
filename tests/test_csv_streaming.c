@@ -31,15 +31,6 @@ intern_cb(void *opaque, const char *value, int64_t *out_id)
     return wl_intern_put_checked((wl_intern_t *)opaque, value, out_id);
 }
 
-static int64_t
-intern_checked_cb(void *opaque, const char *value)
-{
-    int64_t id = -1;
-    int rc = wl_intern_put_checked((wl_intern_t *)opaque, value, &id);
-    return rc == WL_INTERN_ERR_MEMORY_BUDGET
-        ? WL_CSV_INTERN_BUDGET_DENIED : rc == 0 ? id : -1;
-}
-
 static int
 observe_rows(void *opaque, const int64_t *rows, uint32_t nrows,
     uint32_t ncols)
@@ -414,7 +405,7 @@ test_intern_denial_keeps_prior_ids(void)
         goto out;
 
     rc = wl_csv_read_file_via_ctx_stream_admitted(path, ',', types, 2, 2,
-            observe_rows, &obs, intern_checked_cb, intern,
+            observe_rows, &obs, intern_cb, intern,
             wl_columnar_memory_governor_ref_get(csv_ref));
     clean = rc == WL_CSV_ERR_BUDGET
         && wl_intern_count(intern) == 1u

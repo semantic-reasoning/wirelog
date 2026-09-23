@@ -1845,7 +1845,6 @@ col_rel_enable_timestamps_locked_impl(col_rel_t *r, bool *denied)
     }
     reserve_rc = col_rel_reserve_retained_shape(
         r, r->capacity, true, &pending, NULL);
-        r, r->capacity, true, &pending, NULL);
     if (reserve_rc < 0) {
         if (denied)
             *denied = r->memory_budget_denial_pending;
