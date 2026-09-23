@@ -110,6 +110,37 @@ session_hash_result_or_fallback(wl_col_session_t *sess, int rc)
     return rc;
 }
 
+static int
+session_rels_admit(wl_col_session_t *sess, uint64_t bytes,
+    wl_columnar_memory_reservation_t *reservation)
+{
+    if (!sess->memory_governor)
+        return 0;
+    wl_columnar_memory_admission_status_t status
+        = wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(sess->memory_governor),
+            bytes, reservation);
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+        || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+        return 0;
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+        sess->memory_budget_denied = true;
+    return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+        : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
+        : EINVAL;
+}
+
+static void
+session_rels_release(wl_col_session_t *sess)
+{
+    if (sess->memory_governor
+        && atomic_load_explicit(&sess->rels_reservation.state,
+        memory_order_acquire)
+        == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        && !wl_columnar_memory_rollback(&sess->rels_reservation))
+        abort();
+}
+
 static void
 session_invalidate_relation_caches(wl_col_session_t *sess, const char *name)
 {
@@ -1035,6 +1066,7 @@ session_pool_rel_rollback(col_rel_t *src, col_rel_t *heap)
 int
 session_add_rel(wl_col_session_t *sess, col_rel_t *r)
 {
+    int failure_rc = ENOMEM;
     if (!r)
         return EINVAL;
     /* Promotion copies the descriptor and clears the source slot.  Do not
@@ -1097,11 +1129,43 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
     }
 
     if (sess->nrels >= sess->rel_cap) {
-        uint32_t nc = sess->rel_cap ? sess->rel_cap * 2 : 16;
-        col_rel_t **nr = (col_rel_t **)realloc(
-            (void *)sess->rels, sizeof(col_rel_t *) * nc);
-        if (!nr)
+        if (sess->rel_cap > UINT32_MAX / 2u) {
+            failure_rc = EOVERFLOW;
             goto oom;
+        }
+        uint32_t nc = sess->rel_cap ? sess->rel_cap * 2u : 16u;
+        uint64_t bytes;
+        if (!wl_columnar_memory_size_mul(nc, sizeof(col_rel_t *),
+            &bytes) || bytes > SIZE_MAX) {
+            failure_rc = EOVERFLOW;
+            goto oom;
+        }
+        wl_columnar_memory_reservation_t pending;
+        wl_columnar_memory_reservation_init(&pending);
+        failure_rc = session_rels_admit(sess, bytes, &pending);
+        if (failure_rc != 0)
+            goto oom;
+        failure_rc = ENOMEM;
+        col_rel_t **nr = (col_rel_t **)malloc((size_t)bytes);
+        if (!nr){
+            if (sess->memory_governor
+                && !wl_columnar_memory_rollback(&pending))
+                abort();
+            goto oom;
+        }
+        if (sess->nrels > 0)
+            memcpy((void *)nr, (const void *)sess->rels,
+                (size_t)sess->nrels * sizeof(*nr));
+        free((void *)sess->rels);
+        session_rels_release(sess);
+        if (sess->memory_governor
+            && sess->rels_reservation.identity
+            != &sess->rels_reservation)
+            wl_columnar_memory_reservation_init(&sess->rels_reservation);
+        if (sess->memory_governor
+            && !wl_columnar_memory_reservation_move(
+                &sess->rels_reservation, &pending))
+            abort();
         sess->rels = nr;
         sess->rel_cap = nc;
     }
@@ -1138,7 +1202,7 @@ oom:
     if (pool_src) {
         session_pool_rel_rollback(pool_src, r);
     }
-    return ENOMEM;
+    return failure_rc;
 }
 
 int
@@ -1971,6 +2035,7 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
     }
     sess->memory_governor = memory_governor;
     wl_columnar_memory_reservation_init(&sess->rel_hash_reservation);
+    wl_columnar_memory_reservation_init(&sess->rels_reservation);
 
     sess->frontier_ops = &col_frontier_epoch_ops;
 
@@ -2199,8 +2264,21 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
 
     sess->rel_cap = 16;
     sess->pending_input_change = true;
+    int rels_admit_rc = session_rels_admit(sess,
+            (uint64_t)sess->rel_cap * sizeof(col_rel_t *),
+            &sess->rels_reservation);
+    if (rels_admit_rc != 0) {
+        if (intern_attached_here)
+            (void)wl_intern_detach_memory_governor(
+                sess->intern, sess->memory_governor);
+        wl_columnar_memory_governor_ref_release(sess->memory_governor);
+        free(sess);
+        return rels_admit_rc == ENOSPC ? WL_ERR_MEMORY_BUDGET
+            : rels_admit_rc;
+    }
     sess->rels = (col_rel_t **)calloc(sess->rel_cap, sizeof(col_rel_t *));
     if (!sess->rels) {
+        session_rels_release(sess);
         if (intern_attached_here)
             (void)wl_intern_detach_memory_governor(
                 sess->intern, sess->memory_governor);
@@ -2470,6 +2548,7 @@ oom:
     (void)session_destroy_relation_array_pass(sess->rels, sess->nrels, true);
     (void)session_destroy_relation_array_pass(sess->rels, sess->nrels, false);
     free((void *)sess->rels);
+    session_rels_release(sess);
     session_rel_free_hash(sess);
     wl_workqueue_destroy(sess->wq);       /* NULL-safe */
     delta_pool_destroy(sess->delta_pool); /* NULL-safe */
@@ -2668,6 +2747,7 @@ col_session_destroy(wl_session_t *session)
         abort();
     }
     free((void *)sess->rels);
+    session_rels_release(sess);
     /* Free relation name hash table (Issue #281) */
     session_rel_free_hash(sess);
     col_mat_cache_detach_reclaimer(&sess->mat_cache);
@@ -2779,6 +2859,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
     uint32_t worker_id, col_rel_t **partitions,
     uint32_t num_partitions, wl_col_session_t *out_worker)
 {
+    int failure_rc = ENOMEM;
     if (!coordinator || !out_worker || (!partitions && num_partitions > 0))
         return EINVAL;
     /* Worker storage is reusable only after a complete destroy. A refused
@@ -2858,6 +2939,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->rels = NULL;
     out_worker->nrels = 0;
     out_worker->rel_cap = 0;
+    wl_columnar_memory_reservation_init(&out_worker->rels_reservation);
     out_worker->rel_hash_head = NULL;
     out_worker->rel_hash_next = NULL;
     out_worker->rel_hash_nbuckets = 0;
@@ -2975,6 +3057,20 @@ col_worker_session_create(wl_col_session_t *coordinator,
 
     /* Step 6: Populate rels[] with partition relations (ownership transfer) */
     if (num_partitions > 0) {
+        uint64_t bytes;
+        if (!wl_columnar_memory_size_mul(num_partitions,
+            sizeof(col_rel_t *), &bytes) || bytes > SIZE_MAX) {
+            failure_rc = EOVERFLOW;
+            goto cleanup;
+        }
+        failure_rc = session_rels_admit(out_worker, bytes,
+                &out_worker->rels_reservation);
+        if (failure_rc != 0) {
+            if (failure_rc == ENOSPC)
+                coordinator->memory_budget_denied = true;
+            goto cleanup;
+        }
+        failure_rc = ENOMEM;
         out_worker->rels
             = (col_rel_t **)calloc(num_partitions, sizeof(col_rel_t *));
         if (!out_worker->rels)
@@ -3067,7 +3163,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
 cleanup:
     {
         int destroy_rc = col_worker_session_destroy(out_worker);
-        return destroy_rc != 0 ? destroy_rc : ENOMEM;
+        return destroy_rc != 0 ? destroy_rc : failure_rc;
     }
 }
 
@@ -3194,6 +3290,7 @@ col_worker_session_destroy(wl_col_session_t *worker)
     }
 
     free((void *)worker->rels);
+    session_rels_release(worker);
     worker->rels = NULL;
     worker->nrels = 0;
     worker->rel_cap = 0;

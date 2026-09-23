@@ -322,8 +322,13 @@ chain arrays. Rebuilds admit both replacement arrays while the old image is
 still live; denied optional rebuilds leave relation lookup on its linear
 fallback. Transactional registry images hold their own hash reservation until
 discard or publication, when ownership moves to the session. Relation pointer
-arrays and temporary image validation copies remain separate allocation
-classes from these hash arrays.
+arrays and temporary image validation copies have their own admission
+tokens: coordinator creation, worker creation, and registry growth admit the
+full pointer capacity before allocation, while a prepared image admits both
+its future registry array and validation copy until publication or discard.
+The image transfers its future array reservation to the session and releases
+the validation copy on publication. Relation descriptors and their name and
+schema metadata remain a separate allocation class.
 
 The following matrix is the boundary for allocations created outside a
 managed columnar session. “Covered” means that the owner retains a governor
