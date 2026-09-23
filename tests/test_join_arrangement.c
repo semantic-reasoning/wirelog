@@ -39,29 +39,29 @@ static int pass_count = 0;
 static int fail_count = 0;
 
 #define TEST(name)                                      \
-    do {                                                \
-        test_count++;                                   \
-        printf("TEST %d: %s ... ", test_count, (name)); \
-    } while (0)
+        do {                                                \
+            test_count++;                                   \
+            printf("TEST %d: %s ... ", test_count, (name)); \
+        } while (0)
 
 #define PASS()            \
-    do {                  \
-        pass_count++;     \
-        printf("PASS\n"); \
-    } while (0)
+        do {                  \
+            pass_count++;     \
+            printf("PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                    \
-    do {                             \
-        fail_count++;                \
-        printf("FAIL: %s\n", (msg)); \
-        return;                      \
-    } while (0)
+        do {                             \
+            fail_count++;                \
+            printf("FAIL: %s\n", (msg)); \
+            return;                      \
+        } while (0)
 
 #define ASSERT(cond, msg) \
-    do {                  \
-        if (!(cond))      \
+        do {                  \
+            if (!(cond))      \
             FAIL(msg);    \
-    } while (0)
+        } while (0)
 
 /* ----------------------------------------------------------------
  * Helper: tuple counting callback
@@ -88,7 +88,7 @@ count_cb(const char *rel, const int64_t *row, uint32_t nc, void *u)
 
 static int
 run_program(const char *src, const char *rel, int64_t *out_count,
-            uint32_t *out_iters, wl_session_t **out_sess_keep)
+    uint32_t *out_iters, wl_session_t **out_sess_keep)
 {
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(src, &err);
@@ -201,15 +201,16 @@ run_direct_join(wl_col_session_t *col_session, col_rel_t *left,
     return 0;
 }
 
-/* An enforcing governor that admits no arrangement hash table.  Existing
- * relations stay on their original governor; swapping this into a session
- * only affects subsequently attached arrangement entries. */
+/* An enforcing governor that admits the 32-byte join-key scratch but not the
+* 192-byte minimum arrangement table (16 buckets plus 16 chain slots) for the
+* two-row test relation. Existing relations stay on their original governor;
+* swapping this into a session only affects subsequently attached entries. */
 static wl_columnar_memory_governor_ref_t *
 tight_arrangement_governor(void)
 {
     wl_columnar_memory_resolution_t resolution = { 0 };
-    resolution.budget_bytes = 1u;
-    resolution.usable_bytes = 1u;
+    resolution.budget_bytes = 32u;
+    resolution.usable_bytes = 32u;
     resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
     resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
     resolution.status = WL_COLUMNAR_MEMORY_OK;
@@ -228,8 +229,8 @@ test_join_arr_tc_3edge(void)
     TEST("TC 3-edge: arrangement probe produces 6 tuples");
 
     const char *src = ".decl r(x: int32, y: int32)\n"
-                      "r(1, 2). r(2, 3). r(3, 4).\n"
-                      "r(x, z) :- r(x, y), r(y, z).\n";
+        "r(1, 2). r(2, 3). r(3, 4).\n"
+        "r(x, z) :- r(x, y), r(y, z).\n";
 
     int64_t count = 0;
     int rc = run_program(src, "r", &count, NULL, NULL);
@@ -250,8 +251,8 @@ test_join_arr_tc_2cycle(void)
     TEST("TC 2-cycle: arrangement probe produces 4 tuples");
 
     const char *src = ".decl r(x: int32, y: int32)\n"
-                      "r(1, 2). r(2, 1).\n"
-                      "r(x, z) :- r(x, y), r(y, z).\n";
+        "r(1, 2). r(2, 1).\n"
+        "r(x, z) :- r(x, y), r(y, z).\n";
 
     int64_t count = 0;
     int rc = run_program(src, "r", &count, NULL, NULL);
@@ -273,10 +274,10 @@ test_join_arr_5node_chain(void)
     TEST("5-node chain: arrangement incremental update, 10 tuples");
 
     const char *src = ".decl e(x: int32, y: int32)\n"
-                      "e(1, 2). e(2, 3). e(3, 4). e(4, 5).\n"
-                      ".decl reach(x: int32, y: int32)\n"
-                      "reach(x, y) :- e(x, y).\n"
-                      "reach(x, z) :- reach(x, y), reach(y, z).\n";
+        "e(1, 2). e(2, 3). e(3, 4). e(4, 5).\n"
+        ".decl reach(x: int32, y: int32)\n"
+        "reach(x, y) :- e(x, y).\n"
+        "reach(x, z) :- reach(x, y), reach(y, z).\n";
 
     int64_t count = 0;
     uint32_t iters = 0;
@@ -300,8 +301,8 @@ test_join_arr_complete_graph_dedup(void)
     TEST("Complete 3-node graph: arrangement dedup = 9 tuples (KI-1)");
 
     const char *src = ".decl r(x: int32, y: int32)\n"
-                      "r(1, 2). r(2, 1). r(1, 3). r(3, 1). r(2, 3). r(3, 2).\n"
-                      "r(x, z) :- r(x, y), r(y, z).\n";
+        "r(1, 2). r(2, 1). r(1, 3). r(3, 1). r(2, 3). r(3, 2).\n"
+        "r(x, z) :- r(x, y), r(y, z).\n";
 
     int64_t count = 0;
     int rc = run_program(src, "r", &count, NULL, NULL);
@@ -323,16 +324,16 @@ test_join_arr_k1_k2_parity(void)
     TEST("K=1 vs K=2 parity: arrangement read-only across workers");
 
     const char *src_k1 = ".decl edge(x: int32, y: int32)\n"
-                         "edge(1, 2). edge(2, 3). edge(3, 4).\n"
-                         ".decl tc(x: int32, y: int32)\n"
-                         "tc(x, y) :- edge(x, y).\n"
-                         "tc(x, z) :- tc(x, y), edge(y, z).\n";
+        "edge(1, 2). edge(2, 3). edge(3, 4).\n"
+        ".decl tc(x: int32, y: int32)\n"
+        "tc(x, y) :- edge(x, y).\n"
+        "tc(x, z) :- tc(x, y), edge(y, z).\n";
 
     const char *src_k2 = ".decl e(x: int32, y: int32)\n"
-                         "e(1, 2). e(2, 3). e(3, 4).\n"
-                         ".decl tc(x: int32, y: int32)\n"
-                         "tc(x, y) :- e(x, y).\n"
-                         "tc(x, z) :- tc(x, y), tc(y, z).\n";
+        "e(1, 2). e(2, 3). e(3, 4).\n"
+        ".decl tc(x: int32, y: int32)\n"
+        "tc(x, y) :- e(x, y).\n"
+        "tc(x, z) :- tc(x, y), tc(y, z).\n";
 
     int64_t count_k1 = 0, count_k2 = 0;
     int rc1 = run_program(src_k1, "tc", &count_k1, NULL, NULL);
@@ -361,10 +362,10 @@ test_join_arr_multi_stratum_edb_cached(void)
     TEST("Multi-stratum: EDB arrangement cached across iterations, 6 tuples");
 
     const char *src = ".decl edge(x: int32, y: int32)\n"
-                      "edge(1, 2). edge(2, 3). edge(3, 4).\n"
-                      ".decl reach(x: int32, y: int32)\n"
-                      "reach(x, y) :- edge(x, y).\n"
-                      "reach(x, z) :- reach(x, y), edge(y, z).\n";
+        "edge(1, 2). edge(2, 3). edge(3, 4).\n"
+        ".decl reach(x: int32, y: int32)\n"
+        "reach(x, y) :- edge(x, y).\n"
+        "reach(x, z) :- reach(x, y), edge(y, z).\n";
 
     int64_t count = 0;
     uint32_t iters = 0;
@@ -395,10 +396,10 @@ test_join_arr_populated_after_join(void)
     /* K=1 program: reach JOIN edge ON reach.y = edge.x.
      * Right relation = edge; right key column = x = col 0. */
     const char *src = ".decl edge(x: int32, y: int32)\n"
-                      "edge(1, 2). edge(2, 3). edge(3, 4).\n"
-                      ".decl reach(x: int32, y: int32)\n"
-                      "reach(x, y) :- edge(x, y).\n"
-                      "reach(x, z) :- reach(x, y), edge(y, z).\n";
+        "edge(1, 2). edge(2, 3). edge(3, 4).\n"
+        ".decl reach(x: int32, y: int32)\n"
+        "reach(x, y) :- edge(x, y).\n"
+        "reach(x, z) :- reach(x, y), edge(y, z).\n";
 
     wl_session_t *sess = NULL;
     int64_t count = 0;
@@ -413,7 +414,7 @@ test_join_arr_populated_after_join(void)
         = col_session_get_arrangement(sess, "edge", key_cols, 1);
     ASSERT(arr != NULL, "arrangement must be populated after join");
     ASSERT(arr->indexed_rows > 0,
-           "arrangement must have indexed rows after join");
+        "arrangement must have indexed rows after join");
 
     wl_session_destroy(sess);
 
@@ -434,8 +435,8 @@ test_join_arr_darr_cleared_after_kfusion(void)
     TEST("Delta arr cache empty on main session after K=2 snapshot");
 
     const char *src = ".decl r(x: int32, y: int32)\n"
-                      "r(1, 2). r(2, 3). r(3, 4).\n"
-                      "r(x, z) :- r(x, y), r(y, z).\n";
+        "r(1, 2). r(2, 3). r(3, 4).\n"
+        "r(x, z) :- r(x, y), r(y, z).\n";
 
     wl_session_t *sess = NULL;
     int64_t count = 0;
@@ -447,7 +448,7 @@ test_join_arr_darr_cleared_after_kfusion(void)
      * K-fusion dispatch: worker caches are per-worker and freed on join. */
     uint32_t darr_count = col_session_get_darr_count(sess);
     ASSERT(darr_count == 0,
-           "main session must have 0 delta arr entries after K-fusion");
+        "main session must have 0 delta arr entries after K-fusion");
 
     wl_session_destroy(sess);
 
@@ -469,9 +470,9 @@ test_join_arr_large_chain_delta(void)
     TEST("Large K=2 10-node chain with delta arrangement: 45 tuples");
 
     const char *src = ".decl r(x: int32, y: int32)\n"
-                      "r(1,2). r(2,3). r(3,4). r(4,5). r(5,6).\n"
-                      "r(6,7). r(7,8). r(8,9). r(9,10).\n"
-                      "r(x, z) :- r(x, y), r(y, z).\n";
+        "r(1,2). r(2,3). r(3,4). r(4,5). r(5,6).\n"
+        "r(6,7). r(7,8). r(8,9). r(9,10).\n"
+        "r(x, z) :- r(x, y), r(y, z).\n";
 
     int64_t count = 0;
     uint32_t iters = 0;
@@ -496,7 +497,7 @@ test_join_arr_primary_probe_writer_retry(void)
     TEST("Primary arrangement JOIN admits source before build/rebuild");
 
     const char *src = ".decl edge(x: int32, y: int32)\n"
-                      "edge(1, 100). edge(2, 200).\n";
+        "edge(1, 100). edge(2, 200).\n";
     wl_session_t *sess = NULL;
     int64_t count = 0;
     int rc = run_program(src, "edge", &count, NULL, &sess);
@@ -536,7 +537,7 @@ test_join_arr_primary_probe_writer_retry(void)
     col_arrangement_t *arr = col_session_get_arrangement(sess, "edge",
             key_cols, 1);
     ASSERT(arr != NULL && arr->indexed_rows == right->nrows,
-           "right arrangement built after admitted retry");
+        "right arrangement built after admitted retry");
 
     ASSERT(wl_columnar_source_access_writer_acquire(&right->source_access,
         &writer) == 0, "prebuilt right writer acquire");
@@ -603,7 +604,7 @@ test_join_arr_primary_probe_enomem_propagates(void)
     TEST("Primary arrangement JOIN propagates build ENOMEM");
 
     const char *src = ".decl edge(x: int32, y: int32)\n"
-                      "edge(1, 100). edge(2, 200).\n";
+        "edge(1, 100). edge(2, 200).\n";
     wl_session_t *sess = NULL;
     int64_t count = 0;
     int rc = run_program(src, "edge", &count, NULL, &sess);
@@ -644,7 +645,7 @@ int
 main(void)
 {
     printf("\n=== Join Arrangement Integration Tests (3C-002 / 3C-002-Ext) "
-           "===\n\n");
+        "===\n\n");
 
     test_join_arr_tc_3edge();
     test_join_arr_tc_2cycle();
