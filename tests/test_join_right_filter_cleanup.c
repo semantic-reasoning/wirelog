@@ -137,10 +137,19 @@ destroy_mock_session(wl_col_session_t *s)
     for (uint32_t i = 0; i < s->filt_cache_count; i++) {
         free(s->filt_cache[i].rel_name);
         free(s->filt_cache[i].filter_data);
+        if (s->filt_cache[i].metadata_reservation) {
+            (void)wl_columnar_memory_rollback(
+                s->filt_cache[i].metadata_reservation);
+            free(s->filt_cache[i].metadata_reservation);
+        }
         if (s->filt_cache[i].filtered)
             col_rel_destroy(s->filt_cache[i].filtered);
     }
     free(s->filt_cache);
+    if (s->filt_cache_array_reservation) {
+        (void)wl_columnar_memory_rollback(s->filt_cache_array_reservation);
+        free(s->filt_cache_array_reservation);
+    }
     session_rel_free_hash(s);
     delta_pool_destroy(s->delta_pool);
     free(s);
@@ -1086,8 +1095,19 @@ cleanup:
             col_rel_destroy(sess->filt_cache[i].filtered);
             free(sess->filt_cache[i].rel_name);
             free(sess->filt_cache[i].filter_data);
+            if (sess->filt_cache[i].metadata_reservation) {
+                (void)wl_columnar_memory_rollback(
+                    sess->filt_cache[i].metadata_reservation);
+                free(sess->filt_cache[i].metadata_reservation);
+            }
         }
         free(sess->filt_cache);
+        if (sess->filt_cache_array_reservation) {
+            (void)wl_columnar_memory_rollback(
+                sess->filt_cache_array_reservation);
+            free(sess->filt_cache_array_reservation);
+            sess->filt_cache_array_reservation = NULL;
+        }
         sess->filt_cache = NULL; sess->filt_cache_count = 0;
         sess->memory_governor = NULL;
         destroy_mock_session(sess);
