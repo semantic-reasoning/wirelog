@@ -8,6 +8,7 @@
  * Part of #244 Timely-Differential Dataflow Migration, Stage 2.
  */
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1451,6 +1452,193 @@ test_small_cons_metadata_guard(void)
     PASS;
 }
 
+static void
+test_borrowed_copy_budget_retry(void)
+{
+    TEST("borrowed differential CONS copy admits exact budget and retries");
+    wl_col_session_t *sess = make_mock_session();
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    col_rel_t *borrowed = col_rel_new_auto("budget-borrowed", 1);
+    col_rel_t *probe = NULL;
+    eval_stack_t stack;
+    uint64_t constructor_bytes, constructor_limit, denied_limit;
+    uint64_t output_bytes;
+    uint32_t *boundaries;
+    int64_t values[] = { 7, 8 };
+
+    resolution.budget_bytes = UINT64_MAX / 2;
+    resolution.usable_bytes = resolution.budget_bytes;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    ASSERT_TRUE(sess != NULL && borrowed != NULL
+        && col_rel_append_row(borrowed, &values[0]) == 0
+        && col_rel_append_row(borrowed, &values[1]) == 0,
+        "borrowed budget fixture");
+    sess->memory_governor
+        = wl_columnar_memory_governor_ref_create(&resolution);
+    ASSERT_TRUE(sess->memory_governor != NULL, "budget governor");
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(sess->memory_governor);
+
+    ASSERT_TRUE(wl_columnar_relation_pool_new_like_governed_checked(
+            sess->delta_pool, "$consol_diff", borrowed, sess->memory_governor,
+            &probe) == 0 && probe != NULL, "constructor charge probe");
+    constructor_bytes = wl_columnar_memory_reserved(governor);
+    ASSERT_TRUE(constructor_bytes > 1 && col_rel_destroy_checked(probe) == 0
+        && wl_columnar_memory_reserved(governor) == 0,
+        "constructor reservation releases");
+    /* Schema staging briefly reserves both old and replacement metadata.
+     * Find the exact admission threshold, which can exceed the final token. */
+    denied_limit = constructor_bytes - 1;
+    constructor_limit = resolution.usable_bytes;
+    while (constructor_limit - denied_limit > 1) {
+        uint64_t midpoint = denied_limit
+            + (constructor_limit - denied_limit) / 2;
+        atomic_store_explicit(&governor->usable_bytes, midpoint,
+            memory_order_release);
+        int probe_rc = wl_columnar_relation_pool_new_like_governed_checked(
+            sess->delta_pool, "$consol_diff", borrowed,
+            sess->memory_governor, &probe);
+        if (probe_rc == 0) {
+            ASSERT_TRUE(probe != NULL
+                && wl_columnar_memory_reserved(governor) == constructor_bytes
+                && col_rel_destroy_checked(probe) == 0
+                && wl_columnar_memory_reserved(governor) == 0,
+                "constructor threshold probe releases");
+            constructor_limit = midpoint;
+        } else {
+            ASSERT_TRUE(probe_rc == ENOSPC && probe == NULL
+                && wl_columnar_memory_reserved(governor) == 0,
+                "constructor threshold probe denies cleanly");
+            denied_limit = midpoint;
+        }
+    }
+    atomic_store_explicit(&governor->usable_bytes, constructor_limit,
+        memory_order_release);
+    ASSERT_TRUE(wl_columnar_relation_pool_new_like_governed_checked(
+            sess->delta_pool, "$consol_diff", borrowed, sess->memory_governor,
+            &probe) == 0 && probe != NULL
+        && wl_columnar_memory_reserved(governor) == constructor_bytes
+        && col_rel_destroy_checked(probe) == 0
+        && wl_columnar_memory_reserved(governor) == 0,
+        "constructor exact budget fits and releases");
+
+    eval_stack_init(&stack);
+    ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
+        "denial stack");
+    boundaries = malloc(3 * sizeof(*boundaries));
+    ASSERT_TRUE(boundaries != NULL, "denial boundaries");
+    boundaries[0] = 0;
+    boundaries[1] = 1;
+    boundaries[2] = 2;
+    stack.items[0].seg_boundaries = boundaries;
+    stack.items[0].seg_count = 2;
+    atomic_store_explicit(&governor->usable_bytes, denied_limit,
+        memory_order_release);
+    ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == ENOSPC
+        && sess->memory_budget_denied
+        && stack.top == 1 && stack.items[0].rel == borrowed
+        && !stack.items[0].owned
+        && stack.items[0].seg_boundaries == boundaries
+        && stack.items[0].seg_count == 2
+        && wl_columnar_memory_reserved(governor) == 0,
+        "constructor denial retains borrowed relation and metadata");
+
+    sess->memory_budget_denied = false;
+    atomic_store_explicit(&governor->usable_bytes, resolution.usable_bytes,
+        memory_order_release);
+    ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == 0
+        && stack.top == 1 && stack.items[0].rel != borrowed
+        && stack.items[0].owned && stack.items[0].seg_boundaries == NULL
+        && stack.items[0].seg_count == 0
+        && !sess->memory_budget_denied,
+        "budget retry creates the governed copy");
+    output_bytes = wl_columnar_memory_reserved(governor);
+    ASSERT_TRUE(output_bytes >= constructor_bytes,
+        "copy retains the constructor reservation");
+    ASSERT_TRUE(eval_stack_drain(&stack) == 0
+        && wl_columnar_memory_reserved(governor) == 0,
+        "copy teardown releases exact reservation");
+    col_rel_destroy(borrowed);
+    wl_columnar_memory_governor_ref_release(sess->memory_governor);
+    sess->memory_governor = NULL;
+    destroy_mock_session(sess);
+    PASS;
+}
+
+static void
+test_borrowed_copy_source_governor_fallback(void)
+{
+    TEST("borrowed differential CONS copy inherits source governor");
+    wl_col_session_t *sess = make_mock_session();
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    col_rel_t *borrowed = col_rel_new_auto("fallback-borrowed", 1);
+    eval_stack_t stack;
+    uint32_t *boundaries;
+    int64_t values[] = { 7, 8 };
+    uint64_t source_bytes;
+
+    resolution.budget_bytes = UINT64_MAX / 2;
+    resolution.usable_bytes = resolution.budget_bytes;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    wl_columnar_memory_governor_ref_t *ref
+        = wl_columnar_memory_governor_ref_create(&resolution);
+    ASSERT_TRUE(sess != NULL && borrowed != NULL && ref != NULL
+        && col_rel_append_row(borrowed, &values[0]) == 0
+        && col_rel_append_row(borrowed, &values[1]) == 0
+        && col_rel_attach_memory_governor(borrowed, ref) == 0,
+        "governed source fixture");
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(ref);
+    source_bytes = wl_columnar_memory_reserved(governor);
+    ASSERT_TRUE(sess->memory_governor == NULL && source_bytes > 0,
+        "source is the only governor owner");
+
+    eval_stack_init(&stack);
+    ASSERT_TRUE(eval_stack_push(&stack, borrowed, false) == 0,
+        "fallback denial stack");
+    boundaries = malloc(3 * sizeof(*boundaries));
+    ASSERT_TRUE(boundaries != NULL, "fallback boundaries");
+    boundaries[0] = 0;
+    boundaries[1] = 1;
+    boundaries[2] = 2;
+    stack.items[0].seg_boundaries = boundaries;
+    stack.items[0].seg_count = 2;
+    atomic_store_explicit(&governor->usable_bytes, source_bytes,
+        memory_order_release);
+    ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == ENOSPC
+        && sess->memory_budget_denied
+        && stack.top == 1 && stack.items[0].rel == borrowed
+        && !stack.items[0].owned
+        && stack.items[0].seg_boundaries == boundaries
+        && stack.items[0].seg_count == 2
+        && wl_columnar_memory_reserved(governor) == source_bytes,
+        "source governor denial retains borrowed input");
+
+    sess->memory_budget_denied = false;
+    atomic_store_explicit(&governor->usable_bytes, resolution.usable_bytes,
+        memory_order_release);
+    ASSERT_TRUE(col_op_consolidate_diff(&stack, sess) == 0
+        && stack.top == 1 && stack.items[0].rel != borrowed
+        && stack.items[0].rel->memory_governor == ref
+        && stack.items[0].owned && stack.items[0].seg_boundaries == NULL
+        && !sess->memory_budget_denied
+        && wl_columnar_memory_reserved(governor) > source_bytes,
+        "retry charges the source governor");
+    ASSERT_TRUE(eval_stack_drain(&stack) == 0
+        && wl_columnar_memory_reserved(governor) == source_bytes,
+        "fallback copy releases its reservation");
+    col_rel_destroy(borrowed);
+    ASSERT_TRUE(wl_columnar_memory_reserved(governor) == 0,
+        "source teardown releases its reservation");
+    wl_columnar_memory_governor_ref_release(ref);
+    destroy_mock_session(sess);
+    PASS;
+}
+
 int
 main(void)
 {
@@ -1476,6 +1664,8 @@ main(void)
     test_merge_buffer_reuse();
     test_sorted_nrows_set_correctly();
     test_small_cons_metadata_guard();
+    test_borrowed_copy_budget_retry();
+    test_borrowed_copy_source_governor_fallback();
 
     printf("\n=== Results: %d/%d passed ===\n",
         tests_passed, tests_passed + tests_failed);

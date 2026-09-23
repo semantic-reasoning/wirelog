@@ -122,18 +122,26 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
     col_rel_t *work = in;
     bool work_owned = e.owned;
     if (!work_owned) {
+        int create_rc;
+        wl_columnar_memory_governor_ref_t *governor
+            = sess->memory_governor ? sess->memory_governor
+              : in->memory_governor;
 #ifdef WL_SESSION_TEST_HOOKS
         if (wl_columnar_diff_test_fail_copy_alloc)
-            work = NULL;
+            create_rc = ENOMEM;
         else
 #endif
-        work = col_rel_pool_new_like(sess->delta_pool, "$consol_diff", in);
-        if (!work) {
+        create_rc = wl_columnar_relation_pool_new_like_governed_checked(
+            sess->delta_pool, "$consol_diff", in, governor,
+            &work);
+        if (create_rc != 0) {
+            if (create_rc == ENOSPC)
+                sess->memory_budget_denied = true;
             /* Preserve the borrowed input and its segment metadata so a
              * caller can retry after transient allocation pressure. */
             if (eval_stack_repush_entry(stack, &e) != 0)
                 return ENOBUFS;
-            return ENOMEM;
+            return create_rc;
         }
         int append_rc;
 #ifdef WL_SESSION_TEST_HOOKS
