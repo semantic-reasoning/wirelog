@@ -1250,6 +1250,62 @@ filt_cache_pin_take(wl_col_session_t *sess, col_filt_cache_entry_t *e,
     pin->active = true;
 }
 
+static int
+filt_cache_reserve(wl_col_session_t *sess, uint64_t bytes,
+    wl_columnar_memory_reservation_t **out)
+{
+    wl_columnar_memory_reservation_t *reservation;
+    wl_columnar_memory_admission_status_t status;
+    if (!out)
+        return EINVAL;
+    *out = NULL;
+    if (!sess || !sess->memory_governor || bytes == 0)
+        return 0;
+    reservation = (wl_columnar_memory_reservation_t *)malloc(
+        sizeof(*reservation));
+    if (!reservation)
+        return ENOMEM;
+    wl_columnar_memory_reservation_init(reservation);
+    status = wl_columnar_memory_reserve_checked(
+        wl_columnar_memory_governor_ref_get(sess->memory_governor), bytes,
+        reservation);
+    if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+        && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+        if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+            sess->memory_budget_denied = true;
+        free(reservation);
+        return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+            : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
+            : ENOMEM;
+    }
+    *out = reservation;
+    return 0;
+}
+
+static void
+filt_cache_release_reservation(wl_columnar_memory_reservation_t **slot)
+{
+    if (!slot || !*slot)
+        return;
+    (void)wl_columnar_memory_rollback(*slot);
+    free(*slot);
+    *slot = NULL;
+}
+
+static int
+filt_cache_metadata_bytes(const char *rel_name, uint32_t filter_size,
+    uint64_t *bytes)
+{
+    uint64_t name_bytes;
+    if (!rel_name || !bytes)
+        return EINVAL;
+    if (!wl_columnar_memory_size_add((uint64_t)strlen(rel_name), 1,
+        &name_bytes)
+        || !wl_columnar_memory_size_add(name_bytes, filter_size, bytes))
+        return EOVERFLOW;
+    return 0;
+}
+
 col_rel_t *
 wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
     const wl_plan_expr_buffer_t *fexpr, const char *rel_name, col_rel_t *rel,
@@ -1327,25 +1383,57 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
          * filtered relation for this op. */
         if (sess->filt_cache_active_pins > 0)
             return NULL;
-        uint32_t new_cap = sess->filt_cache_cap == 0 ? 4
-                                                      : sess->filt_cache_cap *
-            2;
+        uint32_t new_cap;
+        if (sess->filt_cache_cap == 0)
+            new_cap = 4;
+        else {
+            if (sess->filt_cache_cap > UINT32_MAX / 2u)
+                return NULL;
+            new_cap = sess->filt_cache_cap * 2;
+        }
+        uint64_t array_bytes = 0;
+        wl_columnar_memory_reservation_t *array_reservation = NULL;
+        if (!wl_columnar_memory_size_mul(new_cap,
+            sizeof(*sess->filt_cache), &array_bytes))
+            return NULL;
+        int array_rc = filt_cache_reserve(sess, array_bytes,
+                &array_reservation);
+        if (array_rc != 0)
+            return NULL;
         void *tmp = realloc(sess->filt_cache,
                 new_cap * sizeof(*sess->filt_cache));
-        if (!tmp)
+        if (!tmp) {
+            filt_cache_release_reservation(&array_reservation);
             return NULL;
+        }
+        filt_cache_release_reservation(&sess->filt_cache_array_reservation);
         sess->filt_cache = tmp;
         sess->filt_cache_cap = new_cap;
+        sess->filt_cache_array_reservation = array_reservation;
     }
     uint32_t idx = sess->filt_cache_count;
     memset(&sess->filt_cache[idx], 0, sizeof(sess->filt_cache[idx]));
-    sess->filt_cache[idx].rel_name = strdup(rel_name);
-    if (!sess->filt_cache[idx].rel_name)
+    uint64_t metadata_bytes = 0;
+    int metadata_rc = filt_cache_metadata_bytes(rel_name, fexpr->size,
+            &metadata_bytes);
+    if (metadata_rc != 0)
         return NULL;
+    metadata_rc = filt_cache_reserve(sess, metadata_bytes,
+            &sess->filt_cache[idx].metadata_reservation);
+    if (metadata_rc != 0)
+        return NULL;
+    sess->filt_cache[idx].rel_name = strdup(rel_name);
+    if (!sess->filt_cache[idx].rel_name) {
+        filt_cache_release_reservation(
+            &sess->filt_cache[idx].metadata_reservation);
+        return NULL;
+    }
     /* Store an owned copy of the filter expression bytes for full key compare */
     sess->filt_cache[idx].filter_data = (uint8_t *)malloc(fexpr->size);
     if (!sess->filt_cache[idx].filter_data) {
         free(sess->filt_cache[idx].rel_name);
+        filt_cache_release_reservation(
+            &sess->filt_cache[idx].metadata_reservation);
         return NULL;
     }
     memcpy(sess->filt_cache[idx].filter_data, fexpr->data, fexpr->size);
@@ -1360,6 +1448,8 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
     if (!sess->filt_cache[idx].filtered) {
         free(sess->filt_cache[idx].filter_data);
         free(sess->filt_cache[idx].rel_name);
+        filt_cache_release_reservation(
+            &sess->filt_cache[idx].metadata_reservation);
         return NULL;
     }
     if (rel->timestamps
@@ -1369,6 +1459,8 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
         sess->filt_cache[idx].filtered = NULL;
         free(sess->filt_cache[idx].filter_data);
         free(sess->filt_cache[idx].rel_name);
+        filt_cache_release_reservation(
+            &sess->filt_cache[idx].metadata_reservation);
         return NULL;
     }
     sess->filt_cache_count++;
@@ -1381,6 +1473,8 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
         sess->filt_cache[idx].filtered = NULL;
         free(sess->filt_cache[idx].filter_data);
         free(sess->filt_cache[idx].rel_name);
+        filt_cache_release_reservation(
+            &sess->filt_cache[idx].metadata_reservation);
         memset(&sess->filt_cache[idx], 0, sizeof(sess->filt_cache[idx]));
         /* The entry was never published: roll the count back so a failed
          * build cannot strand a cache slot or make later growth skip it. */

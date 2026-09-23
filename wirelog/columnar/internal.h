@@ -1535,6 +1535,9 @@ typedef struct col_filt_cache_entry {
     col_rel_t *filtered;     /* owned: the filtered relation */
     uint32_t pin_count;      /* active reader leases (Issue #1435) */
     bool evict_deferred;     /* replacement or destruction waits for readers */
+    /* Stable heap token for owned key metadata; entries move during cache
+     * growth, so the reservation itself must not be embedded here. */
+    wl_columnar_memory_reservation_t *metadata_reservation;
 } col_filt_cache_entry_t;
 
 /* Non-public lease for a filtered relation borrowed from filt_cache
@@ -2077,6 +2080,8 @@ typedef struct wl_col_session_t {
     col_filt_cache_entry_t *filt_cache;
     uint32_t filt_cache_count;
     uint32_t filt_cache_cap;
+    /* Stable token for the cache entry-array allocation. */
+    wl_columnar_memory_reservation_t *filt_cache_array_reservation;
     /* Issue #1435: active filtered-cache leases.  While non-zero the entry
      * array is neither grown nor compacted, so lease pointers stay valid;
      * asserted zero at session and worker teardown in debug builds. */

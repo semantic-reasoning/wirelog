@@ -148,6 +148,10 @@ session_invalidate_relation_caches(wl_col_session_t *sess, const char *name)
             free(e->filter_data);
             if (e->filtered)
                 col_rel_destroy(e->filtered);
+            if (e->metadata_reservation) {
+                (void)wl_columnar_memory_rollback(e->metadata_reservation);
+                free(e->metadata_reservation);
+            }
             memset(e, 0, sizeof(*e));
             continue;
         }
@@ -2706,10 +2710,21 @@ col_session_destroy(wl_session_t *session)
     for (uint32_t i = 0; i < sess->filt_cache_count; i++) {
         free(sess->filt_cache[i].rel_name);
         free(sess->filt_cache[i].filter_data);
+        if (sess->filt_cache[i].metadata_reservation) {
+            (void)wl_columnar_memory_rollback(
+                sess->filt_cache[i].metadata_reservation);
+            free(sess->filt_cache[i].metadata_reservation);
+        }
         if (sess->filt_cache[i].filtered)
             col_rel_destroy(sess->filt_cache[i].filtered);
     }
     free(sess->filt_cache);
+    if (sess->filt_cache_array_reservation) {
+        (void)wl_columnar_memory_rollback(
+            sess->filt_cache_array_reservation);
+        free(sess->filt_cache_array_reservation);
+        sess->filt_cache_array_reservation = NULL;
+    }
     /* Issue #559: free side-relation compound arena (NULL-safe). */
     WL_LOG(WL_LOG_SEC_SESSION, WL_LOG_INFO,
         "event=compound_arena_destroy live_handles=%llu",
@@ -2888,6 +2903,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->filt_cache = NULL;
     out_worker->filt_cache_count = 0;
     out_worker->filt_cache_cap = 0;
+    out_worker->filt_cache_array_reservation = NULL;
     out_worker->filt_cache_active_pins = 0;
     /* Issue #579 / R-5: workers BORROW the coordinator's frozen arena.
      * Worker destroy must NOT free this pointer (see
@@ -3195,11 +3211,23 @@ col_worker_session_destroy(wl_col_session_t *worker)
         worker->filt_cache[i].rel_name = NULL;
         free(worker->filt_cache[i].filter_data);
         worker->filt_cache[i].filter_data = NULL;
+        if (worker->filt_cache[i].metadata_reservation) {
+            (void)wl_columnar_memory_rollback(
+                worker->filt_cache[i].metadata_reservation);
+            free(worker->filt_cache[i].metadata_reservation);
+            worker->filt_cache[i].metadata_reservation = NULL;
+        }
     }
     free(worker->filt_cache);
     worker->filt_cache = NULL;
     worker->filt_cache_count = 0;
     worker->filt_cache_cap = 0;
+    if (worker->filt_cache_array_reservation) {
+        (void)wl_columnar_memory_rollback(
+            worker->filt_cache_array_reservation);
+        free(worker->filt_cache_array_reservation);
+        worker->filt_cache_array_reservation = NULL;
+    }
 
     /* Free mat_cache entries (all worker-owned since zeroed at create) */
     col_mat_cache_release_pins(&worker->mat_cache);
