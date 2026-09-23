@@ -385,6 +385,10 @@ typedef struct col_rel {
     uint8_t memory_budget_denial_pending;
     wl_columnar_memory_reservation_t retained_reservation;
     uint64_t retained_reserved_bytes;
+    /* Persistent merge, retraction backup, and dedup buffers copied during
+     * canonical replacement have their own physical lifetime. */
+    wl_columnar_memory_reservation_t aux_reservation;
+    uint64_t aux_reserved_bytes;
     /* Bytes currently charged to WL_MEM_SUBSYS_TIMESTAMP for this relation's
      * timestamps[] array (Issue #1380).  Maintained by
      * col_rel_ledger_reconcile()/col_rel_ledger_release(); always 0 when
@@ -553,9 +557,16 @@ typedef struct wl_columnar_relation_retirement_token {
 typedef struct col_rel_replacement {
     col_rel_t *staged;
     wl_columnar_memory_reservation_t reservation;
+    wl_columnar_memory_reservation_t metadata_pending;
+    wl_columnar_memory_reservation_t *metadata_owned;
+    wl_columnar_memory_reservation_t aux_pending;
+    uint64_t aux_reserved_bytes;
+    bool aux_reserved;
+    wl_columnar_memory_reservation_t staged_descriptor_reservation;
     wl_columnar_source_access_writer_t writer;
     uint64_t reserved_bytes;
     bool reservation_active;
+    bool staged_descriptor_reserved;
     bool writer_acquired;
 } col_rel_replacement_t;
 

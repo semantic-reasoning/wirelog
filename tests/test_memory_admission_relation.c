@@ -2211,6 +2211,232 @@ cleanup:
     }
 }
 
+static void
+test_replacement_metadata_admission(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    col_rel_t *dst = col_rel_new_auto("replacement-target", 2);
+    col_rel_t *candidate = col_rel_new_auto("replacement-source", 2);
+    col_rel_replacement_t replacement = { 0 };
+    wirelog_column_type_t types[] = {
+        WIRELOG_TYPE_INT64, WIRELOG_TYPE_INT64
+    };
+    const col_rel_logical_col_t wide = {
+        WIRELOG_COMPOUND_KIND_INLINE, 2u, 0u
+    };
+    int64_t row[] = { 41, 42 };
+    uint64_t before;
+    uint64_t data_bytes;
+    uint64_t metadata_bytes;
+    uint64_t scratch_bytes;
+    uint64_t view_before;
+    int64_t **old_columns;
+    wl_columnar_memory_reservation_t *old_token;
+
+    CHECK(dst && candidate && col_rel_set_column_types(candidate, types,
+        2u) == 0 && col_rel_apply_compound_schema(candidate, &wide, 1u)
+        == 0 && col_rel_append_row(candidate, row) == 0,
+        "replacement metadata fixture");
+    if (!dst || !candidate || !candidate->compound_arity_map)
+        goto cleanup;
+    make_resolution(&resolution, UINT64_MAX);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && col_rel_attach_memory_governor(dst, ref) == 0,
+        "replacement metadata governor");
+    if (!ref || !dst->memory_governor)
+        goto cleanup;
+    before = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+    data_bytes = (uint64_t)candidate->ncols * candidate->capacity
+        * sizeof(int64_t);
+    metadata_bytes = auto_metadata_bytes(2) + sizeof(types)
+        + sizeof(uint32_t);
+    scratch_bytes = sizeof(col_rel_t) + strlen(candidate->name) + 1u;
+    view_before = dst->view_generation;
+    old_columns = dst->columns;
+    old_token = dst->metadata_reservation;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, before + data_bytes + metadata_bytes - 1u,
+        memory_order_release);
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement)
+        == ENOSPC && !replacement.staged && !replacement.writer_acquired
+        && dst->columns == old_columns
+        && dst->metadata_reservation == old_token
+        && dst->view_generation == view_before
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == before,
+        "replacement metadata denial rolls back all reservations");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, before + data_bytes + metadata_bytes
+        + scratch_bytes - 1u, memory_order_release);
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement)
+        == ENOSPC && !replacement.staged
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == before,
+        "replacement scratch descriptor denial rolls back metadata");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, before + data_bytes + metadata_bytes
+        + scratch_bytes, memory_order_release);
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0
+        && replacement.staged && replacement.metadata_owned
+        && replacement.metadata_pending.bytes == metadata_bytes
+        && replacement.staged_descriptor_reserved
+        && replacement.staged_descriptor_reservation.bytes == scratch_bytes
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == before + data_bytes + metadata_bytes + scratch_bytes,
+        "replacement exact-fit preparation retains all staged credits");
+    col_rel_discard_replacement(&replacement);
+    CHECK(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == before
+        && dst->columns == old_columns && dst->view_generation == view_before,
+        "replacement discard releases staged metadata and scratch");
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0,
+        "replacement exact-fit retry");
+    if (replacement.staged) {
+        col_rel_commit_replacement_locked(dst, &replacement);
+        CHECK(dst->columns != old_columns && dst->columns[0][0] == row[0]
+            && dst->compound_arity_len == 1u
+            && dst->compound_arity_map[0] == 2u
+            && dst->column_types[0] == WIRELOG_TYPE_INT64
+            && dst->metadata_reservation
+            && dst->metadata_reservation->bytes == metadata_bytes
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref))
+            == dst->descriptor_reservation->bytes + metadata_bytes
+            + data_bytes,
+            "replacement commit transfers exact metadata token");
+    }
+cleanup:
+    col_rel_discard_replacement(&replacement);
+    col_rel_destroy(dst);
+    col_rel_destroy(candidate);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "replacement metadata cleanup releases all credits");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_replacement_aux_admission(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    col_rel_t *dst = col_rel_new_auto("aux-target", 2);
+    col_rel_t *candidate = col_rel_new_auto("aux-source", 2);
+    col_rel_replacement_t replacement = { 0 };
+    uint64_t before;
+    uint64_t data_bytes;
+    uint64_t metadata_bytes;
+    uint64_t aux_bytes;
+    uint64_t scratch_bytes;
+    int64_t **old_columns;
+
+    CHECK(dst && candidate, "replacement aux fixture");
+    if (!dst || !candidate)
+        goto cleanup;
+    candidate->merge_buf_cap = 5;
+    candidate->merge_columns = col_columns_alloc(2, 5);
+    candidate->retract_backup_capacity = 3;
+    candidate->retract_backup_nrows = 1;
+    candidate->retract_backup_columns = col_columns_alloc(2, 3);
+    candidate->dedup_cap = 8;
+    candidate->dedup_slots = calloc(8, sizeof(uint64_t));
+    CHECK(candidate->merge_columns && candidate->retract_backup_columns
+        && candidate->dedup_slots, "replacement aux buffers");
+    if (!candidate->merge_columns || !candidate->retract_backup_columns
+        || !candidate->dedup_slots)
+        goto cleanup;
+    candidate->merge_columns[0][0] = 31;
+    candidate->retract_backup_columns[1][0] = 32;
+    candidate->dedup_slots[0] = 33;
+    candidate->dedup_count = 1;
+    make_resolution(&resolution, UINT64_MAX);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && col_rel_attach_memory_governor(dst, ref) == 0,
+        "replacement aux governor");
+    if (!ref || !dst->memory_governor)
+        goto cleanup;
+    before = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+    old_columns = dst->columns;
+    data_bytes = (uint64_t)candidate->ncols * candidate->capacity
+        * sizeof(int64_t);
+    metadata_bytes = auto_metadata_bytes(2);
+    aux_bytes = 2u * (sizeof(int64_t *) + 5u * sizeof(int64_t))
+        + 2u * (sizeof(int64_t *) + 3u * sizeof(int64_t))
+        + 8u * sizeof(uint64_t);
+    scratch_bytes = sizeof(col_rel_t) + strlen(candidate->name) + 1u;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes,
+        before + data_bytes + metadata_bytes + aux_bytes - 1u,
+        memory_order_release);
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement)
+        == ENOSPC && !replacement.staged && !replacement.writer_acquired
+        && dst->columns == old_columns
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == before,
+        "replacement aux one-byte denial preserves old relation");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes,
+        before + data_bytes + metadata_bytes + aux_bytes + scratch_bytes,
+        memory_order_release);
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0
+        && replacement.aux_reserved
+        && replacement.aux_pending.bytes == aux_bytes
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == before + data_bytes + metadata_bytes + aux_bytes + scratch_bytes,
+        "replacement aux exact-fit preparation");
+    col_rel_discard_replacement(&replacement);
+    CHECK(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == before,
+        "replacement aux discard releases credit");
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0,
+        "replacement aux retry");
+    if (replacement.staged) {
+        col_rel_commit_replacement_locked(dst, &replacement);
+        CHECK(dst->aux_reserved_bytes == aux_bytes
+            && dst->aux_reservation.bytes == aux_bytes
+            && dst->merge_columns[0][0] == 31
+            && dst->retract_backup_columns[1][0] == 32
+            && dst->dedup_slots[0] == 33
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref))
+            == dst->descriptor_reservation->bytes + metadata_bytes
+            + data_bytes + aux_bytes,
+            "replacement aux commit transfers exact credit and buffers");
+        before = wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref));
+        atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+                ref)->usable_bytes,
+            before + data_bytes + metadata_bytes + aux_bytes
+            + scratch_bytes, memory_order_release);
+        CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0,
+            "replacement with existing aux token prepares");
+        if (replacement.staged) {
+            col_rel_commit_replacement_locked(dst, &replacement);
+            CHECK(dst->aux_reservation.bytes == aux_bytes
+                && wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(ref)) == before,
+                "replacement frees old aux before releasing its credit");
+        }
+    }
+cleanup:
+    col_rel_discard_replacement(&replacement);
+    col_rel_destroy(dst);
+    col_rel_destroy(candidate);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "replacement aux cleanup releases credit");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
 int
 main(void)
 {
@@ -2223,6 +2449,8 @@ main(void)
     test_shared_view_metadata_admission();
     test_append_type_metadata_admission();
     test_rename_metadata_admission();
+    test_replacement_metadata_admission();
+    test_replacement_aux_admission();
     test_governed_logical_copy();
     test_governed_empty_compound_copy();
     test_physical_timestamp_capacity();

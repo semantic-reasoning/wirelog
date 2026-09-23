@@ -723,6 +723,44 @@ col_rel_retained_bytes(uint32_t ncols, uint32_t capacity, bool timestamps,
     return true;
 }
 
+/* A replacement deep-copies these buffers and keeps them after publication.
+ * Count only allocations that deep_copy and replacement actually reproduce. */
+static bool
+col_rel_replacement_aux_bytes(const col_rel_t *candidate, uint64_t *out)
+{
+    uint64_t bytes = 0;
+    uint64_t part;
+    uint64_t grid;
+
+    if (!candidate || !out)
+        return false;
+    if (candidate->merge_columns && candidate->ncols > 0u
+        && candidate->merge_buf_cap > 0u) {
+        if (!wl_columnar_memory_size_mul(candidate->ncols,
+            sizeof(int64_t *) + (uint64_t)candidate->merge_buf_cap
+            * sizeof(int64_t), &grid)
+            || !wl_columnar_memory_size_add(bytes, grid, &bytes))
+            return false;
+    }
+    if (candidate->retract_backup_columns && candidate->ncols > 0u
+        && candidate->retract_backup_capacity > 0u) {
+        if (!wl_columnar_memory_size_mul(candidate->ncols,
+            sizeof(int64_t *) + (uint64_t)candidate->retract_backup_capacity
+            * sizeof(int64_t), &grid)
+            || !wl_columnar_memory_size_add(bytes, grid, &bytes))
+            return false;
+    }
+    if (candidate->dedup_cap > 0u) {
+        if (!candidate->dedup_slots
+            || !wl_columnar_memory_size_mul(candidate->dedup_cap,
+            sizeof(*candidate->dedup_slots), &part)
+            || !wl_columnar_memory_size_add(bytes, part, &bytes))
+            return false;
+    }
+    *out = bytes;
+    return bytes <= SIZE_MAX;
+}
+
 static void
 col_rel_release_reservation_or_abort(
     wl_columnar_memory_reservation_t *reservation)
@@ -1883,6 +1921,10 @@ col_rel_free_contents_impl(col_rel_t *r, bool preserve_access_gates,
     }
     free(r->column_types);
     free(r->dedup_slots);
+    if (r->aux_reserved_bytes > 0) {
+        col_rel_release_reservation_or_abort(&r->aux_reservation);
+        r->aux_reserved_bytes = 0;
+    }
     free(r->compound_arity_map);
     if (r->schema_ok)
         ArrowSchemaRelease(&r->schema);
@@ -5598,7 +5640,13 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
             }
             const char *cname = (dst->col_names && dst->col_names[i])
                 ? dst->col_names[i] : "";
-            ArrowSchemaSetName(dst->schema.children[i], cname);
+            if (ArrowSchemaSetName(dst->schema.children[i], cname)
+                != NANOARROW_OK) {
+                ArrowSchemaRelease(&dst->schema);
+                col_rel_free_contents(dst);
+                free(dst);
+                return ENOMEM;
+            }
         }
         dst->schema_ok = true;
     }
@@ -5916,6 +5964,9 @@ col_rel_prepare_replacement_impl(col_rel_t *dst, const col_rel_t *candidate,
 {
     uint64_t planned_bytes;
     uint64_t staged_bytes;
+    uint64_t metadata_bytes;
+    uint64_t aux_bytes;
+    uint64_t staged_descriptor_bytes;
     uint32_t compound_entries;
     int rc;
 
@@ -5930,8 +5981,21 @@ col_rel_prepare_replacement_impl(col_rel_t *dst, const col_rel_t *candidate,
         return EOVERFLOW;
     if (!col_rel_replacement_old_reservation_valid(dst))
         return EINVAL;
+    if (dst->aux_reserved_bytes > 0
+        && (dst->aux_reservation.identity != &dst->aux_reservation
+        || atomic_load_explicit(&dst->aux_reservation.state,
+        memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED))
+        return EINVAL;
     if (!col_rel_retained_bytes(candidate->ncols, candidate->capacity,
         candidate->timestamps != NULL, &planned_bytes))
+        return EOVERFLOW;
+    if (!col_rel_flat_copy_metadata_bytes(dst, candidate, false, false,
+        &metadata_bytes)
+        || !col_rel_replacement_aux_bytes(candidate, &aux_bytes)
+        || !wl_columnar_memory_size_add(sizeof(col_rel_t),
+        candidate->name ? strlen(candidate->name) + 1u : 0u,
+        &staged_descriptor_bytes))
         return EOVERFLOW;
     if (candidate->timestamps
         && candidate->timestamp_capacity > candidate->capacity) {
@@ -5980,11 +6044,66 @@ col_rel_prepare_replacement_impl(col_rel_t *dst, const col_rel_t *candidate,
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
             if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                 dst->memory_budget_denial_pending = true;
-            goto allocation_failure;
+            rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : EOVERFLOW;
+            goto fail;
         }
         if (!wl_columnar_memory_commit(&replacement->reservation, dst))
             goto allocation_failure;
         replacement->reservation_active = true;
+    }
+
+    rc = col_rel_reserve_metadata(dst, dst->memory_governor,
+            metadata_bytes, &replacement->metadata_pending,
+            &replacement->metadata_owned);
+    if (rc != 0)
+        goto fail;
+    replacement->aux_reserved_bytes = aux_bytes;
+    wl_columnar_memory_reservation_init(&replacement->aux_pending);
+    if (dst->memory_governor && aux_bytes > 0) {
+        wl_columnar_memory_admission_status_t status
+            = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(dst->memory_governor),
+                aux_bytes, &replacement->aux_pending);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                dst->memory_budget_denial_pending = true;
+            rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : EOVERFLOW;
+            goto fail;
+        }
+        if (!wl_columnar_memory_commit(&replacement->aux_pending, dst)) {
+            col_rel_reservation_rollback(&replacement->aux_pending);
+            rc = ENOMEM;
+            goto fail;
+        }
+        replacement->aux_reserved = true;
+    }
+    wl_columnar_memory_reservation_init(
+        &replacement->staged_descriptor_reservation);
+    if (dst->memory_governor) {
+        wl_columnar_memory_admission_status_t status
+            = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(dst->memory_governor),
+                staged_descriptor_bytes,
+                &replacement->staged_descriptor_reservation);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                dst->memory_budget_denial_pending = true;
+            rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : EOVERFLOW;
+            goto fail;
+        }
+        if (!wl_columnar_memory_commit(
+                &replacement->staged_descriptor_reservation, dst)) {
+            col_rel_reservation_rollback(
+                &replacement->staged_descriptor_reservation);
+            rc = ENOMEM;
+            goto fail;
+        }
+        replacement->staged_descriptor_reserved = true;
     }
 
     rc = col_rel_deep_copy(candidate, &replacement->staged, NULL);
@@ -6074,6 +6193,8 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     col_rel_t *owner = NULL;
     col_rel_t *staged;
     wl_columnar_memory_reservation_t new_reservation;
+    wl_columnar_memory_reservation_t old_aux_reservation;
+    wl_columnar_memory_reservation_t new_aux_reservation;
     char *name;
     char *staged_name;
     wl_mem_ledger_t *ledger;
@@ -6089,6 +6210,8 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     struct wl_col_session_t *deferred_relation_session;
     bool has_new_reservation;
     bool has_old_reservation;
+    bool has_old_aux_reservation;
+    bool has_new_aux_reservation;
     uint64_t old_retained_bytes;
     wl_columnar_memory_reservation_t old_reservation;
     int release_rc;
@@ -6117,6 +6240,8 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     has_new_reservation = replacement->reservation_active;
     wl_columnar_memory_reservation_init(&old_reservation);
     wl_columnar_memory_reservation_init(&new_reservation);
+    wl_columnar_memory_reservation_init(&old_aux_reservation);
+    wl_columnar_memory_reservation_init(&new_aux_reservation);
     old_retained_bytes = dst->retained_reserved_bytes;
     has_old_reservation = old_retained_bytes > 0;
     if (has_old_reservation
@@ -6131,6 +6256,16 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
         assert(false && "prepared replacement reservation must be movable");
         abort();
     }
+    has_old_aux_reservation = dst->aux_reserved_bytes > 0;
+    has_new_aux_reservation = replacement->aux_reserved;
+    if (has_old_aux_reservation
+        && !wl_columnar_memory_reservation_move(&old_aux_reservation,
+        &dst->aux_reservation))
+        abort();
+    if (has_new_aux_reservation
+        && !wl_columnar_memory_reservation_move(&new_aux_reservation,
+        &replacement->aux_pending))
+        abort();
 
     old = *dst;
     name = old.name;
@@ -6166,6 +6301,12 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     if (staged_governor)
         wl_columnar_memory_governor_ref_release(staged_governor);
     replacement->staged = NULL;
+    if (replacement->staged_descriptor_reserved) {
+        if (!wl_columnar_memory_release(
+                &replacement->staged_descriptor_reservation))
+            abort();
+        replacement->staged_descriptor_reserved = false;
+    }
 
     dst->relation_identity = identity;
     dst->view_generation = view_generation;
@@ -6174,8 +6315,20 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     dst->mem_ledger = ledger;
     dst->memory_governor = governor;
     dst->descriptor_reservation = old.descriptor_reservation;
+    if (col_rel_publish_metadata_reservation(dst,
+        &replacement->metadata_pending, replacement->metadata_owned))
+        abort(); /* staged copies never carry a metadata token */
+    replacement->metadata_owned = NULL;
     dst->retained_reserved_bytes = 0;
     wl_columnar_memory_reservation_init(&dst->retained_reservation);
+    dst->aux_reserved_bytes = 0;
+    wl_columnar_memory_reservation_init(&dst->aux_reservation);
+    if (has_new_aux_reservation) {
+        if (!wl_columnar_memory_reservation_move(&dst->aux_reservation,
+            &new_aux_reservation))
+            abort();
+        dst->aux_reserved_bytes = replacement->aux_reserved_bytes;
+    }
     if (has_new_reservation) {
         (void)wl_columnar_memory_reservation_move(
             &dst->retained_reservation, &new_reservation);
@@ -6196,16 +6349,21 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     wl_columnar_relation_touch_replacement(dst);
 
     replacement->reservation_active = false;
+    replacement->aux_reserved = false;
     old.name = NULL;
     old.descriptor_reservation = NULL;
     old.mem_ledger = NULL;
     old.memory_governor = NULL;
     old.ledger_ts_bytes = 0;
+    old.aux_reserved_bytes = 0;
     old.storage_owner = &old;
     old.storage_owner_identity = old.relation_identity;
     old.storage_alias_borrows = 0;
     col_rel_storage_owner_init(&old);
     col_rel_free_contents(&old);
+
+    if (has_old_aux_reservation)
+        col_rel_release_reservation_or_abort(&old_aux_reservation);
 
     if (has_old_reservation
         && !wl_columnar_memory_release(&old_reservation)) {
@@ -6250,6 +6408,21 @@ col_rel_discard_replacement(col_rel_replacement_t *replacement)
     if (replacement->staged) {
         col_rel_destroy(replacement->staged);
         replacement->staged = NULL;
+    }
+    if (replacement->staged_descriptor_reserved) {
+        if (!wl_columnar_memory_release(
+                &replacement->staged_descriptor_reservation))
+            abort();
+        replacement->staged_descriptor_reserved = false;
+    }
+    if (replacement->metadata_owned) {
+        col_rel_discard_metadata_reservation(
+            &replacement->metadata_pending, replacement->metadata_owned);
+        replacement->metadata_owned = NULL;
+    }
+    if (replacement->aux_reserved) {
+        col_rel_release_reservation_or_abort(&replacement->aux_pending);
+        replacement->aux_reserved = false;
     }
     if (replacement->reservation_active) {
         (void)wl_columnar_memory_release(&replacement->reservation);

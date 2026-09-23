@@ -2852,6 +2852,10 @@ test_owner_publication_existing_targets(void)
         }
         uint64_t live_charge = low->retained_reserved_bytes
             + high->retained_reserved_bytes;
+        live_charge += low->descriptor_reservation->bytes
+            + low->metadata_reservation->bytes
+            + high->descriptor_reservation->bytes
+            + high->metadata_reservation->bytes;
         OWNER_CHECK(wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref)) == live_charge
             && wl_columnar_eval_owner_publication_discard(&txn) == 0
