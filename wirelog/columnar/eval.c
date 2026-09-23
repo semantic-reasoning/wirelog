@@ -139,6 +139,7 @@ wl_columnar_eval_tdd_owner_lifetime_retry(wl_col_session_t *coord)
         lifetime->queue = NULL;
     }
     coord->tdd_owner_lifetime = NULL;
+    wl_columnar_memory_release(&lifetime->reservation);
     free(lifetime);
     return 0;
 }
@@ -203,10 +204,32 @@ wl_columnar_eval_tdd_owner_lifetime_create(wl_col_session_t *coord,
         return EOVERFLOW;
     allocation_bytes = sizeof(wl_columnar_eval_tdd_owner_lifetime_t) +
         slot_bytes;
+    wl_columnar_memory_reservation_t reservation;
+    wl_columnar_memory_reservation_init(&reservation);
+    if (coord->memory_governor) {
+        wl_columnar_memory_admission_status_t status
+            = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(coord->memory_governor),
+                allocation_bytes, &reservation);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : ENOMEM;
+    }
     wl_columnar_eval_tdd_owner_lifetime_t *lifetime = calloc(1,
             allocation_bytes);
-    if (!lifetime)
+    if (!lifetime) {
+        wl_columnar_memory_release(&reservation);
         return ENOMEM;
+    }
+    wl_columnar_memory_reservation_init(&lifetime->reservation);
+    if (coord->memory_governor
+        && !wl_columnar_memory_reservation_move(&lifetime->reservation,
+        &reservation)) {
+        wl_columnar_memory_release(&reservation);
+        free(lifetime);
+        return EBUSY;
+    }
     lifetime->worker_count = workers;
     lifetime->relation_count = nrels;
     lifetime->matrix_slots = matrix_slots;
