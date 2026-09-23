@@ -10,8 +10,9 @@ This gate is a ratchet over the `libwirelog.so` translation units in the
 build's `compile_commands.json`:
 
   - `scripts/ci/clang-tidy-allowlist.txt` lists the files that are clean
-    today.  Every one of them is analysed on every run; a single diagnostic
-    fails the build.
+    today. Every active entry is analysed on every run; a single diagnostic
+    fails the build. Thread backend entries are selected from the configured
+    compilation database, so only the active backend is analysed.
   - `scripts/ci/clang-tidy-backlog.txt` lists the files that are not clean
     yet.  They are not analysed.  The backlog carries no diagnostic counts:
     counts are toolchain-version-dependent, so a count would turn a
@@ -64,7 +65,7 @@ continues to describe one source-level verdict.  A diagnostic in either
 configuration fails that source and is reported with its configuration label.
 
 Exit codes:
-   0 - every allowlisted file is clean
+   0 - every active allowlisted file is clean
    1 - a diagnostic was reported, a list is out of sync, or a harness error
   77 - skipped (meson SKIP), with the reason on stdout
 """
@@ -101,6 +102,10 @@ BASELINE_DIR = REPO_ROOT / "scripts/ci/clang-tidy-baselines"
 # Demand a plausible floor rather than merely non-empty, in the spirit of
 # scripts/ci/check-doop-catalogue.sh.
 MIN_ENTRIES = 50
+THREAD_BACKEND_SOURCES = (
+    "wirelog/thread_c11.c",
+    "wirelog/thread_posix.c",
+)
 
 # clang-tidy writes these to stdout.  Anchored at the start of the line so
 # that a diagnostic quoted inside a note's source snippet cannot match.
@@ -760,6 +765,59 @@ def report_failures(results: list[Result]) -> int:
 # Modes
 # ---------------------------------------------------------------------------
 
+def resolve_source_partition(selected_sources: set[str], allow: list[str],
+                             backlog: list[str],
+                             repo_root: pathlib.Path = REPO_ROOT
+                             ) -> tuple[list[str], list[str], str]:
+    """Validate both backend registrations, then activate the built backend."""
+    for label, paths in (("allowlist", allow), ("backlog", backlog)):
+        duplicates = sorted({path for path in paths if paths.count(path) > 1})
+        if duplicates:
+            raise GateError(f"{label} has duplicate entries: "
+                            f"{', '.join(duplicates)}")
+
+    overlap = sorted(set(allow) & set(backlog))
+    if overlap:
+        raise GateError("sources listed in both allowlist and backlog: "
+                        f"{', '.join(overlap)}")
+
+    registered = set(allow) | set(backlog)
+    missing_backend_files = [
+        path for path in THREAD_BACKEND_SOURCES
+        if not (repo_root / path).is_file()
+    ]
+    if missing_backend_files:
+        raise GateError("thread backend source missing: "
+                        f"{', '.join(missing_backend_files)}")
+    unregistered_backends = sorted(set(THREAD_BACKEND_SOURCES) - registered)
+    if unregistered_backends:
+        raise GateError("thread backend source must appear exactly once in "
+                        "allowlist or backlog: "
+                        f"{', '.join(unregistered_backends)}")
+
+    selected_backends = sorted(set(THREAD_BACKEND_SOURCES) & selected_sources)
+    if len(selected_backends) != 1:
+        raise GateError("expected exactly one selected thread backend in "
+                        f"compile database, found: {selected_backends}")
+    active_backend = selected_backends[0]
+    inactive_backend = next(path for path in THREAD_BACKEND_SOURCES
+                            if path != active_backend)
+    active_allow = [path for path in allow if path != inactive_backend]
+    active_backlog = [path for path in backlog if path != inactive_backend]
+    active_registered = set(active_allow) | set(active_backlog)
+    missing = sorted(selected_sources - active_registered)
+    unknown = sorted(active_registered - selected_sources)
+    if missing or unknown:
+        details = []
+        if missing:
+            details.append("built but unregistered: " + ", ".join(missing))
+        if unknown:
+            details.append("registered but not built: " + ", ".join(unknown))
+        raise GateError("allowlist and backlog do not partition the selected "
+                        "translation units (" + "; ".join(details) + ")")
+    return active_allow, active_backlog, active_backend
+
+
 def mode_ratchet(exe: str, entries: list[dict], version: str) -> int:
     selected = {rel_to_repo(entry_source(e)): e for e in entries}
     allow = read_list(ALLOWLIST)
@@ -771,28 +829,14 @@ def mode_ratchet(exe: str, entries: list[dict], version: str) -> int:
             f"{fixture_rel} is a sensitivity fixture and must not appear in "
             "either list; it is deliberately not part of any build target")
 
-    overlap = sorted(set(allow) & set(backlog))
-    missing = sorted(set(selected) - set(allow) - set(backlog))
-    unknown = sorted((set(allow) | set(backlog)) - set(selected))
-
-    if overlap or missing or unknown:
+    try:
+        allow, backlog, active_backend = resolve_source_partition(
+            set(selected), allow, backlog)
+    except GateError as error:
         print("check-clang-tidy-ratchet: FAIL: the allowlist and the backlog "
-              "no longer partition the libwirelog.so sources.", file=sys.stderr)
-        if overlap:
-            print("  listed in BOTH files:", file=sys.stderr)
-            for path in overlap:
-                print(f"    {path}", file=sys.stderr)
-        if missing:
-            print("  built but listed in NEITHER file (fix the source, then "
-                  "add it to the allowlist):", file=sys.stderr)
-            for path in missing:
-                print(f"    {path}", file=sys.stderr)
-        if unknown:
-            print("  listed but no longer built (a deleted or renamed "
-                  "source, or an allowlist line dropped to hide a "
-                  "regression):", file=sys.stderr)
-            for path in unknown:
-                print(f"    {path}", file=sys.stderr)
+              "do not partition the configured libwirelog.so sources.",
+              file=sys.stderr)
+        print(f"  {error}", file=sys.stderr)
         return 1
 
     targets = [selected[path] for path in allow]
@@ -805,8 +849,9 @@ def mode_ratchet(exe: str, entries: list[dict], version: str) -> int:
     rc = report_failures(results)
     rc = max(rc, check_nolint_baseline(results, version))
     if rc == 0:
-        print(f"check-clang-tidy-ratchet: OK; {len(allow)} file(s) clean, "
-              f"{len(backlog)} in backlog, "
+        print(f"check-clang-tidy-ratchet: OK; backend {active_backend}; "
+              f"{len(allow)} active file(s) clean, "
+              f"{len(backlog)} active file(s) in backlog, "
               f"{len(ALTERNATE_CONFIGS)} alternate configuration(s) checked")
     return rc
 

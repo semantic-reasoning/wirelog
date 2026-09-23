@@ -19,6 +19,92 @@ SPEC.loader.exec_module(RATCHET)
 
 
 class RatchetGuardTests(unittest.TestCase):
+    def partition_lists(self):
+        allow = RATCHET.read_list(ROOT / "scripts/ci/clang-tidy-allowlist.txt")
+        backlog = RATCHET.read_list(ROOT / "scripts/ci/clang-tidy-backlog.txt")
+        return allow, backlog
+
+    def selected_sources(self, backend="wirelog/thread_c11.c"):
+        allow, backlog = self.partition_lists()
+        return ((set(allow) | set(backlog))
+                - set(RATCHET.THREAD_BACKEND_SOURCES)) | {backend}
+
+    def test_partition_activates_only_configured_thread_backend(self):
+        allow, backlog = self.partition_lists()
+        for backend in RATCHET.THREAD_BACKEND_SOURCES:
+            with self.subTest(backend=backend):
+                active_allow, active_backlog, selected = (
+                    RATCHET.resolve_source_partition(
+                        self.selected_sources(backend), allow, backlog))
+                self.assertEqual(selected, backend)
+                inactive = next(path for path in RATCHET.THREAD_BACKEND_SOURCES
+                                if path != backend)
+                self.assertNotIn(inactive, active_allow)
+                self.assertNotIn(inactive, active_backlog)
+
+    def test_partition_rejects_both_or_neither_backend_selected(self):
+        allow, backlog = self.partition_lists()
+        ordinary = ((set(allow) | set(backlog))
+                    - set(RATCHET.THREAD_BACKEND_SOURCES))
+        for backends in (set(RATCHET.THREAD_BACKEND_SOURCES), set()):
+            with self.subTest(backends=backends), self.assertRaises(
+                    RATCHET.GateError):
+                RATCHET.resolve_source_partition(
+                    ordinary | backends, allow, backlog)
+
+    def test_partition_requires_both_backend_registrations(self):
+        allow, backlog = self.partition_lists()
+        for missing in RATCHET.THREAD_BACKEND_SOURCES:
+            with self.subTest(missing=missing), self.assertRaises(
+                    RATCHET.GateError):
+                RATCHET.resolve_source_partition(
+                    self.selected_sources(),
+                    [path for path in allow if path != missing],
+                    [path for path in backlog if path != missing])
+
+    def test_partition_allows_backend_registered_in_backlog(self):
+        allow, backlog = self.partition_lists()
+        backend = "wirelog/thread_c11.c"
+        allow = [path for path in allow if path != backend]
+        backlog.append(backend)
+        active_allow, active_backlog, selected = (
+            RATCHET.resolve_source_partition(
+                self.selected_sources(backend), allow, backlog))
+        self.assertEqual(selected, backend)
+        self.assertNotIn(backend, active_allow)
+        self.assertIn(backend, active_backlog)
+
+    def test_partition_rejects_missing_backend_source_file(self):
+        allow, backlog = self.partition_lists()
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            for backend in RATCHET.THREAD_BACKEND_SOURCES:
+                (root / backend).parent.mkdir(parents=True, exist_ok=True)
+                (root / backend).touch()
+            (root / RATCHET.THREAD_BACKEND_SOURCES[1]).unlink()
+            with self.assertRaises(RATCHET.GateError):
+                RATCHET.resolve_source_partition(
+                    self.selected_sources(), allow, backlog, root)
+
+    def test_partition_rejects_overlap_duplicates_stale_and_missing_entries(self):
+        allow, backlog = self.partition_lists()
+        selected = self.selected_sources()
+        with self.assertRaises(RATCHET.GateError):
+            RATCHET.resolve_source_partition(selected, allow,
+                                             backlog + [allow[0]])
+        with self.assertRaises(RATCHET.GateError):
+            RATCHET.resolve_source_partition(selected, allow + [allow[0]],
+                                             backlog)
+        with self.assertRaises(RATCHET.GateError):
+            RATCHET.resolve_source_partition(selected, allow,
+                                             backlog + ["wirelog/stale.c"])
+        with self.assertRaises(RATCHET.GateError):
+            RATCHET.resolve_source_partition(selected - {allow[0]}, allow,
+                                             backlog)
+        with self.assertRaises(RATCHET.GateError):
+            RATCHET.resolve_source_partition(
+                selected | {"wirelog/new_selected.c"}, allow, backlog)
+
     def test_effective_checks_are_canonical_and_sorted(self):
         self.assertEqual(
             RATCHET.effective_checks_from_output(
