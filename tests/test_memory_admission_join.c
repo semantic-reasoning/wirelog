@@ -557,7 +557,7 @@ test_descriptor_denial_survives_private_join_output(void)
     }
     right = NULL;
     init_cross_op(&op);
-    if (run_join(sess, left, &op, &result) != ENOMEM
+    if (run_join(sess, left, &op, &result) != ENOSPC
         || result.rel != NULL || !wl_columnar_session_budget_denied(sess)
         || reserved_of(sess) != 0) {
         FAIL("descriptor denial lost its session status or credit");
@@ -592,9 +592,9 @@ cleanup:
  * arrangement while the output was admitted successfully -- a boundary
  * about the wrong allocation.
  *
- * The fixture is sized so the result fits inside COL_REL_INIT_CAP: with no
- * doubling, the output's committed token IS its peak, so "exact fit" is
- * exact and "one byte over" is a real one-byte boundary.
+ * The fixture is sized so the result fits inside COL_REL_INIT_CAP.  The
+ * governed constructor holds the initial schema reservation while it stages
+ * the typed schema, so the boundary is that constructor's transient peak.
  */
 static void
 init_cross_op(wl_plan_op_t *op)
@@ -624,7 +624,7 @@ init_diff_keyed_op(wl_plan_op_t *op)
 }
 
 static bool
-measure_output_bytes(uint64_t *out_bytes)
+measure_output_bytes(uint64_t *out_bytes, uint64_t *peak_bytes)
 {
     wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
     col_rel_t *right = make_right(2, 1);
@@ -632,6 +632,7 @@ measure_output_bytes(uint64_t *out_bytes)
     wl_plan_op_t op;
     eval_entry_t result = { 0 };
     bool ok = false;
+    col_rel_t *staged = NULL;
 
     if (!sess || !right || !left)
         goto out;
@@ -648,12 +649,20 @@ measure_output_bytes(uint64_t *out_bytes)
         /* A governed stack twin now lives alongside the cached output; this
          * boundary measures the output owner itself. */
         *out_bytes = relation_charge(governed);
+        if (wl_columnar_relation_alloc_governed(&staged, "$join",
+            sess->memory_governor) != 0
+            || col_rel_set_schema(staged, governed->ncols, NULL) != 0
+            || !governed->metadata_reservation)
+            goto out_entry;
+        *peak_bytes = relation_charge(staged)
+            + governed->metadata_reservation->bytes;
     }
     ok = true;
 out_entry:
     if (result.owned && result.rel)
         col_rel_destroy(result.rel);
 out:
+    col_rel_destroy(staged);
     col_rel_destroy(left);
     col_rel_destroy(right);
     destroy_session(sess);
@@ -661,7 +670,8 @@ out:
 }
 
 static void
-run_at_budget(const char *name, uint64_t budget, bool expect_ok)
+run_at_budget(const char *name, uint64_t budget, uint64_t output_bytes,
+    bool expect_ok)
 {
     wl_col_session_t *sess = make_session(budget);
     col_rel_t *right = make_right(2, 1);
@@ -690,19 +700,19 @@ run_at_budget(const char *name, uint64_t budget, bool expect_ok)
             FAIL("committed token does not cover the output capacity");
             goto out_entry;
         }
-        if (reserved_of(sess) != budget) {
-            FAIL("exact-fit single-owner fallback did not consume the budget");
+        if (reserved_of(sess) != output_bytes) {
+            FAIL("exact-fit single-owner fallback retained the wrong charge");
             goto out_entry;
         }
         PASS();
         goto out_entry;
     }
     if (rc == 0) {
-        FAIL("join succeeded one byte below the output footprint");
+        FAIL("join succeeded one byte below the constructor peak");
         goto out_entry;
     }
-    if (rc != ENOMEM) {
-        FAIL("denial did not surface as ENOMEM");
+    if (rc != ENOSPC || !sess->memory_budget_denied) {
+        FAIL("denial did not surface as ENOSPC");
         goto out;
     }
     /* No arrangement is built on this path, so a denied cross join must
@@ -1198,8 +1208,9 @@ test_parallel_cross_denial(void)
     session_add_rel(sess, right);
     right = NULL;
     init_cross_op(&op);
-    if (run_join(sess, left, &op, NULL) != ENOMEM) {
-        FAIL("an unaffordable cross join was not denied with ENOMEM");
+    if (run_join(sess, left, &op, NULL) != ENOSPC
+        || !sess->memory_budget_denied) {
+        FAIL("an unaffordable cross join was not denied with ENOSPC");
         goto out;
     }
     PASS();
@@ -1509,7 +1520,8 @@ test_parallel_diff_true_admission_denial_rolls_back(void)
     }
     right = NULL;
     init_diff_keyed_op(&op);
-    if (run_diff_join(sess, left, &op, &result) != ENOMEM || result.rel
+    if (run_diff_join(sess, left, &op, &result) != ENOSPC || result.rel
+        || !sess->memory_budget_denied
         || reserved_of(sess) != 0u || sess->mat_cache.count != 0
         || sess->diff_arr_count != 0) {
         FAIL("true admission denial published output or committed diff state");
@@ -2265,15 +2277,16 @@ main(void)
 
     test_attach_baseline();
     test_descriptor_denial_survives_private_join_output();
-    if (measure_output_bytes(&out_bytes)) {
-        run_at_budget("cross join succeeds at exactly its output footprint",
-            out_bytes, true);
-        run_at_budget("cross join is denied one byte below that footprint",
-            out_bytes - 1u, false);
+    uint64_t peak_bytes = 0;
+    if (measure_output_bytes(&out_bytes, &peak_bytes)) {
+        run_at_budget("cross join succeeds at its constructor peak",
+            peak_bytes, out_bytes, true);
+        run_at_budget("cross join is denied one byte below that peak",
+            peak_bytes - 1u, out_bytes, false);
     } else {
-        TEST("cross join succeeds at exactly its output footprint");
+        TEST("cross join succeeds at its constructor peak");
         FAIL("could not measure the output footprint");
-        TEST("cross join is denied one byte below that footprint");
+        TEST("cross join is denied one byte below that peak");
         FAIL("could not measure the output footprint");
     }
     test_growth_rollback();
