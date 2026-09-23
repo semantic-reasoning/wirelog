@@ -612,6 +612,56 @@ wl_columnar_filter_dispose_input(eval_stack_t *stack, eval_entry_t *entry,
     return cleanup_rc != 0 ? cleanup_rc : primary_rc;
 }
 
+typedef struct {
+    wl_columnar_memory_reservation_t reservation;
+    bool active;
+} wl_columnar_filter_scratch_t;
+
+static int
+wl_columnar_filter_scratch_reserve(wl_columnar_filter_scratch_t *scratch,
+    wl_columnar_memory_governor_ref_t *governor, uint64_t bytes,
+    wl_col_session_t *sess)
+{
+    wl_columnar_memory_admission_status_t status;
+    if (!scratch)
+        return EINVAL;
+    memset(scratch, 0, sizeof(*scratch));
+    wl_columnar_memory_reservation_init(&scratch->reservation);
+    if (!governor || bytes == 0)
+        return 0;
+    status = wl_columnar_memory_reserve_checked(
+        wl_columnar_memory_governor_ref_get(governor), bytes,
+        &scratch->reservation);
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+        || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+        scratch->active = true;
+        return 0;
+    }
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED && sess)
+        sess->memory_budget_denied = true;
+    return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+        : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
+        : ENOMEM;
+}
+
+static void
+wl_columnar_filter_scratch_release(wl_columnar_filter_scratch_t *scratch)
+{
+    if (scratch && scratch->active) {
+        (void)wl_columnar_memory_rollback(&scratch->reservation);
+        scratch->active = false;
+    }
+}
+
+static bool
+wl_columnar_filter_scratch_add(uint64_t count, uint64_t size,
+    uint64_t *total)
+{
+    uint64_t bytes;
+    return total && wl_columnar_memory_size_mul(count, size, &bytes)
+           && wl_columnar_memory_size_add(*total, bytes, total);
+}
+
 int
 wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
@@ -655,8 +705,33 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
             ? columns[cmp.col_b] : NULL;
 
         if (timestamped) {
+            uint64_t scratch_bytes = 0;
+            wl_columnar_filter_scratch_t scratch;
+            if (!wl_columnar_filter_scratch_add(ncols, sizeof(int64_t),
+                &scratch_bytes)) {
+                (void)col_rel_destroy_checked(out);
+                return wl_columnar_filter_dispose_input(stack, &e,
+                           EOVERFLOW);
+            }
+#ifdef __AVX2__
+            if (!wl_columnar_filter_scratch_add(
+                    (uint64_t)COL_FILTER_TILE + COL_FILTER_SEL_SLACK,
+                    sizeof(uint32_t), &scratch_bytes)) {
+                (void)col_rel_destroy_checked(out);
+                return wl_columnar_filter_dispose_input(stack, &e,
+                           EOVERFLOW);
+            }
+#endif
+            int scratch_rc = wl_columnar_filter_scratch_reserve(&scratch,
+                    governor, scratch_bytes, sess);
+            if (scratch_rc != 0) {
+                (void)col_rel_destroy_checked(out);
+                return wl_columnar_filter_dispose_input(stack, &e,
+                           scratch_rc);
+            }
             int64_t *row = (int64_t *)malloc((size_t)ncols * sizeof(*row));
             if (!row) {
+                wl_columnar_filter_scratch_release(&scratch);
                 (void)col_rel_destroy_checked(out);
                 return wl_columnar_filter_dispose_input(stack, &e, ENOMEM);
             }
@@ -670,6 +745,7 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     * sizeof(*sel));
                 if (!sel) {
                     free(row);
+                    wl_columnar_filter_scratch_release(&scratch);
                     (void)col_rel_destroy_checked(out);
                     return wl_columnar_filter_dispose_input(stack, &e,
                                ENOMEM);
@@ -694,6 +770,7 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
                         if (rc != 0) {
                             free(sel);
                             free(row);
+                            wl_columnar_filter_scratch_release(&scratch);
                             (void)col_rel_destroy_checked(out);
                             return wl_columnar_filter_dispose_input(stack,
                                        &e, rc);
@@ -715,12 +792,14 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
                             row);
                     if (rc != 0) {
                         free(row);
+                        wl_columnar_filter_scratch_release(&scratch);
                         (void)col_rel_destroy_checked(out);
                         return wl_columnar_filter_dispose_input(stack, &e, rc);
                     }
                 }
             }
             free(row);
+            wl_columnar_filter_scratch_release(&scratch);
             int cleanup_rc = wl_columnar_filter_dispose_input(stack, &e, 0);
             if (cleanup_rc != 0) {
                 (void)col_rel_destroy_checked(out);
@@ -729,10 +808,33 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
             return eval_stack_push(stack, out, true);
         }
 
-        /* Pre-allocate output buffer sized for worst-case (all rows pass) */
-        size_t cap = (size_t)nrows * ncols;
-        int64_t *tmp = (int64_t *)malloc(cap * sizeof(int64_t));
+        /* Pre-allocate output buffer sized for worst-case (all rows pass). */
+        uint64_t scratch_bytes = 0;
+        uint64_t cells = 0;
+        wl_columnar_filter_scratch_t scratch;
+        if (!wl_columnar_memory_size_mul(nrows, ncols, &cells)
+            || !wl_columnar_filter_scratch_add(cells, sizeof(int64_t),
+            &scratch_bytes)) {
+            col_rel_destroy(out);
+            return wl_columnar_filter_dispose_input(stack, &e, EOVERFLOW);
+        }
+#ifdef __AVX2__
+        if (!wl_columnar_filter_scratch_add(
+                (uint64_t)COL_FILTER_TILE + COL_FILTER_SEL_SLACK,
+                sizeof(uint32_t), &scratch_bytes)) {
+            col_rel_destroy(out);
+            return wl_columnar_filter_dispose_input(stack, &e, EOVERFLOW);
+        }
+#endif
+        int scratch_rc = wl_columnar_filter_scratch_reserve(&scratch,
+                governor, scratch_bytes, sess);
+        if (scratch_rc != 0) {
+            col_rel_destroy(out);
+            return wl_columnar_filter_dispose_input(stack, &e, scratch_rc);
+        }
+        int64_t *tmp = (int64_t *)malloc((size_t)cells * sizeof(int64_t));
         if (!tmp) {
+            wl_columnar_filter_scratch_release(&scratch);
             col_rel_destroy(out);
             return wl_columnar_filter_dispose_input(stack, &e, ENOMEM);
         }
@@ -758,6 +860,7 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 * sizeof(uint32_t));
             if (!sel) {
                 free(tmp);
+                wl_columnar_filter_scratch_release(&scratch);
                 col_rel_destroy(out);
                 return wl_columnar_filter_dispose_input(stack, &e, ENOMEM);
             }
@@ -833,11 +936,13 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
             int rc = col_rel_append_row(out, tmp + (size_t)r * ncols);
             if (rc != 0) {
                 free(tmp);
+                wl_columnar_filter_scratch_release(&scratch);
                 col_rel_destroy(out);
                 return wl_columnar_filter_dispose_input(stack, &e, rc);
             }
         }
         free(tmp);
+        wl_columnar_filter_scratch_release(&scratch);
         int cleanup_rc = wl_columnar_filter_dispose_input(stack, &e, 0);
         if (cleanup_rc != 0) {
             (void)col_rel_destroy_checked(out);
@@ -853,8 +958,25 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
         : NULL;
 
     /* Row scratch, hoisted out of the loop (#1000). */
+    wl_columnar_filter_scratch_t row_scratch;
+    uint64_t row_scratch_bytes = 0;
+    if (e.rel->ncols > COL_STACK_MAX
+        && !wl_columnar_filter_scratch_add(e.rel->ncols, sizeof(int64_t),
+        &row_scratch_bytes)) {
+        wl_columnar_expr_compiled_free(ce);
+        (void)col_rel_destroy_checked(out);
+        return wl_columnar_filter_dispose_input(stack, &e, EOVERFLOW);
+    }
+    int row_scratch_rc = wl_columnar_filter_scratch_reserve(&row_scratch,
+            governor, row_scratch_bytes, sess);
+    if (row_scratch_rc != 0) {
+        wl_columnar_expr_compiled_free(ce);
+        (void)col_rel_destroy_checked(out);
+        return wl_columnar_filter_dispose_input(stack, &e, row_scratch_rc);
+    }
     col_row_buf_t row_rb;
     if (!col_row_buf_init(&row_rb, e.rel->ncols)) {
+        wl_columnar_filter_scratch_release(&row_scratch);
         wl_columnar_expr_compiled_free(ce);
         (void)col_rel_destroy_checked(out);
         return wl_columnar_filter_dispose_input(stack, &e, ENOMEM);
@@ -890,6 +1012,7 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 if (sess && status != WL_COLUMNAR_EXPR_ALLOCATION_FAILURE)
                     sess->extension_expr_status = status;
                 col_row_buf_release(&row_rb);
+                wl_columnar_filter_scratch_release(&row_scratch);
                 wl_columnar_expr_compiled_free(ce);
                 (void)col_rel_destroy_checked(out);
                 /* A refused string allocation fails the step as a memory
@@ -904,6 +1027,7 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
             int rc = wl_columnar_filter_append_selected(out, e.rel, r, row);
             if (rc != 0) {
                 col_row_buf_release(&row_rb);
+                wl_columnar_filter_scratch_release(&row_scratch);
                 wl_columnar_expr_compiled_free(ce);
                 (void)col_rel_destroy_checked(out);
                 return wl_columnar_filter_dispose_input(stack, &e, rc);
@@ -911,6 +1035,7 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
         }
     }
     col_row_buf_release(&row_rb);
+    wl_columnar_filter_scratch_release(&row_scratch);
     wl_columnar_expr_compiled_free(ce);
 
     int cleanup_rc = wl_columnar_filter_dispose_input(stack, &e, 0);
@@ -957,12 +1082,25 @@ wl_columnar_filter_next_pow2(uint32_t n)
  */
 static int
 fill_filtered_rel(const uint8_t *buf, uint32_t bsz, col_rel_t *rel,
-    col_rel_t *out, wl_intern_t *intern)
+    col_rel_t *out, wl_intern_t *intern,
+    wl_columnar_memory_governor_ref_t *governor)
 {
     /* Row scratch, hoisted out of both loops below (#1000). */
+    wl_columnar_filter_scratch_t scratch;
+    uint64_t scratch_bytes = 0;
+    if (rel->ncols > COL_STACK_MAX
+        && !wl_columnar_filter_scratch_add(rel->ncols, sizeof(int64_t),
+        &scratch_bytes))
+        return EOVERFLOW;
+    int scratch_rc = wl_columnar_filter_scratch_reserve(&scratch, governor,
+            scratch_bytes, NULL);
+    if (scratch_rc != 0)
+        return scratch_rc;
     col_row_buf_t rb;
-    if (!col_row_buf_init(&rb, rel->ncols))
+    if (!col_row_buf_init(&rb, rel->ncols)) {
+        wl_columnar_filter_scratch_release(&scratch);
         return ENOMEM;
+    }
     int64_t *row_buf = rb.ptr;
 
     /* Fast path: simple colA CMP CONST or colA CMP colB predicate */
@@ -971,14 +1109,17 @@ fill_filtered_rel(const uint8_t *buf, uint32_t bsz, col_rel_t *rel,
         for (uint32_t r = 0; r < rel->nrows; r++) {
             col_rel_row_copy_out(rel, r, row_buf);
             if (col_filter_cmp_row(row_buf, rel->ncols, &cmp)) {
-                if (wl_columnar_filter_append_selected(out, rel, r,
-                    row_buf) != 0) {
+                int rc = wl_columnar_filter_append_selected(out, rel, r,
+                        row_buf);
+                if (rc != 0) {
                     col_row_buf_release(&rb);
-                    return ENOMEM;
+                    wl_columnar_filter_scratch_release(&scratch);
+                    return rc;
                 }
             }
         }
         col_row_buf_release(&rb);
+        wl_columnar_filter_scratch_release(&scratch);
         return 0;
     }
 
@@ -1001,14 +1142,19 @@ fill_filtered_rel(const uint8_t *buf, uint32_t bsz, col_rel_t *rel,
                     intern);
             pass = (err == 0) ? (val != 0 ? 1 : 0) : 0; /* fail-closed */
         }
-        if (pass && wl_columnar_filter_append_selected(out, rel, r,
-            row_buf) != 0) {
-            col_row_buf_release(&rb);
-            wl_columnar_expr_compiled_free(ce);
-            return ENOMEM;
+        if (pass) {
+            int rc = wl_columnar_filter_append_selected(out, rel, r,
+                    row_buf);
+            if (rc != 0) {
+                col_row_buf_release(&rb);
+                wl_columnar_filter_scratch_release(&scratch);
+                wl_columnar_expr_compiled_free(ce);
+                return rc;
+            }
         }
     }
     col_row_buf_release(&rb);
+    wl_columnar_filter_scratch_release(&scratch);
     wl_columnar_expr_compiled_free(ce);
     return 0;
 }
@@ -1037,7 +1183,8 @@ wl_columnar_filter_apply_right_filter_governed(
         return NULL;
     }
 
-    if (fill_filtered_rel(fexpr->data, fexpr->size, rel, out, intern) != 0) {
+    if (fill_filtered_rel(fexpr->data, fexpr->size, rel, out, intern,
+        governor) != 0) {
         col_rel_destroy(out);
         return NULL;
     }
@@ -1161,7 +1308,7 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
                 return NULL;
             }
             if (fill_filtered_rel(fexpr->data, fexpr->size, rel, e->filtered,
-                sess->intern) != 0) {
+                sess->intern, governor) != 0) {
                 col_rel_destroy(e->filtered);
                 e->filtered = NULL;
                 return NULL;
@@ -1229,7 +1376,7 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
     /* Fill the new entry */
     col_rel_t *out = sess->filt_cache[idx].filtered;
     if (fill_filtered_rel(fexpr->data, fexpr->size, rel, out,
-        sess->intern) != 0) {
+        sess->intern, governor) != 0) {
         col_rel_destroy(out);
         sess->filt_cache[idx].filtered = NULL;
         free(sess->filt_cache[idx].filter_data);
