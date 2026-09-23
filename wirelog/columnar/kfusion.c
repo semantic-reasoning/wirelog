@@ -486,7 +486,7 @@ col_kfusion_free_cohort(struct wl_columnar_kfusion_cohort *cohort)
     free(cohort->workers);
     free(cohort->results);
     free(cohort->live_indices);
-    wl_columnar_memory_reservation_release(&cohort->scratch_reservation);
+    wl_columnar_memory_release(&cohort->scratch_reservation);
     free(cohort);
 }
 
@@ -572,7 +572,7 @@ col_op_k_fusion_serial(const wl_plan_op_t *op, eval_stack_t *stack,
     col_rel_t **results = (col_rel_t **)calloc(k, sizeof(col_rel_t *));
     COL_SESSION(sess)->kfusion_alloc_ns += now_ns() - _phase_t0;
     if (!results) {
-        wl_columnar_memory_reservation_release(&results_reservation);
+        wl_columnar_memory_release(&results_reservation);
         return ENOMEM;
     }
 
@@ -749,7 +749,7 @@ cleanup:
             rc = cleanup_rc;
     }
     free((void *)results);
-    wl_columnar_memory_reservation_release(&results_reservation);
+    wl_columnar_memory_release(&results_reservation);
     COL_SESSION(sess)->kfusion_cleanup_ns += now_ns() - _phase_t0;
     return rc;
 }
@@ -911,7 +911,7 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
         free(workers);
         free(worker_sess);
         free(cohort);
-        wl_columnar_memory_reservation_release(&scratch_reservation);
+        wl_columnar_memory_release(&scratch_reservation);
         return ENOMEM;
     }
 
