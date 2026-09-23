@@ -6505,6 +6505,36 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
     uint32_t *bdx_snap = NULL;
     bool owner_slots_embedded = false;
     bool owner_dispatch_quiesced = true;
+    wl_columnar_memory_reservation_t worker_scratch;
+    wl_columnar_memory_reservation_init(&worker_scratch);
+    uint64_t worker_scratch_bytes = 0;
+    uint64_t worker_bytes = 0;
+    if (!wl_columnar_memory_size_mul(W,
+        sizeof(col_eval_tdd_worker_ctx_t), &worker_bytes)
+        || !wl_columnar_memory_size_add(worker_scratch_bytes, worker_bytes,
+        &worker_scratch_bytes)
+        || (!owner_exchange_mode
+        && (!wl_columnar_memory_size_mul(W, nrels,
+        &worker_bytes)
+        || !wl_columnar_memory_size_mul(worker_bytes,
+        sizeof(col_rel_t *), &worker_bytes)
+        || !wl_columnar_memory_size_add(worker_scratch_bytes,
+        worker_bytes, &worker_scratch_bytes)))) {
+        rc = EOVERFLOW;
+        goto done;
+    }
+    if (coord->memory_governor && worker_scratch_bytes > 0) {
+        wl_columnar_memory_admission_status_t admission
+            = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(coord->memory_governor),
+                worker_scratch_bytes, &worker_scratch);
+        if (admission != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && admission != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            rc = admission == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : ENOMEM;
+            goto done;
+        }
+    }
     col_eval_tdd_worker_ctx_t *ctxs
         = (col_eval_tdd_worker_ctx_t *)calloc(
             W, sizeof(col_eval_tdd_worker_ctx_t));
@@ -7094,6 +7124,7 @@ done:
         free(ctxs);
     }
     free(bdx_snap);
+    wl_columnar_memory_release(&worker_scratch);
     coord->diff_operators_active = saved_diff;
 
     if (owner_adaptive_fallback && rc == 0) {
