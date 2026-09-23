@@ -1632,6 +1632,7 @@ typedef struct wl_columnar_tdd_owner_lifetime {
     void *worker_ctxs;
     wl_columnar_memory_reservation_t reservation;
     wl_mpsc_queue_t *queue;
+    wl_columnar_memory_reservation_t queue_reservation;
     uint64_t queue_ring_bytes;
     /* First matrix_slots entries are the worker/relation matrix. The tail
      * owns overflow queue payloads, with capacity reserved before dispatch. */
@@ -3577,6 +3578,10 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
     wl_col_session_t *coord);
 int
 wl_columnar_eval_delta_queue_capacity(uint32_t nrels, uint32_t *out);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_eval_test_before_tdd_queue_admission)(
+    wl_col_session_t *coord, uint64_t bytes);
+#endif
 int
 wl_columnar_eval_tdd_matrix_size(uint32_t W, uint32_t nrels,
     size_t element_size, size_t *out);

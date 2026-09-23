@@ -116,6 +116,27 @@ test_capacity_overflow_rejected(void)
     PASS();
 }
 
+static void
+test_checked_footprint(void)
+{
+    TEST("checked footprint matches rounded queue allocation");
+    uint64_t planned = 0;
+    ASSERT(wl_mpsc_queue_footprint_for(3, 5, &planned) == 0,
+        "rounded footprint rejected");
+    wl_mpsc_queue_t *queue = wl_mpsc_queue_create(3, 5);
+    ASSERT(queue != NULL, "rounded queue allocation failed");
+    ASSERT(wl_mpsc_queue_footprint_bytes(queue) == planned,
+        "planned footprint differs from allocated footprint");
+    wl_mpsc_queue_destroy(queue);
+    ASSERT(wl_mpsc_queue_footprint_for(0, 5, &planned) != 0,
+        "zero workers accepted");
+    ASSERT(wl_mpsc_queue_footprint_for(1, 1, &planned) != 0,
+        "capacity below two accepted");
+    ASSERT(wl_mpsc_queue_footprint_for(1, UINT32_MAX, &planned) != 0,
+        "overflowing capacity accepted");
+    PASS();
+}
+
 /* ----------------------------------------------------------------
  * Test 2: single producer enqueue/dequeue correctness
  * ---------------------------------------------------------------- */
@@ -531,6 +552,7 @@ main(void)
 
     test_create_destroy();
     test_capacity_overflow_rejected();
+    test_checked_footprint();
     test_single_producer();
     test_rel_idx_field();
     test_new_fields();

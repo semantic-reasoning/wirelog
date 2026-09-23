@@ -37,6 +37,7 @@ typedef volatile uint32_t wl_atomic_u32;
 #endif
 
 #include <stdbool.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -201,6 +202,28 @@ struct wl_mpsc_queue {
     wl_mpsc_payload_destroy_fn destroy_payload;
 };
 
+int
+wl_mpsc_queue_footprint_for(uint32_t num_workers, uint32_t capacity,
+    uint64_t *out_bytes)
+{
+    if (!out_bytes || num_workers == 0 || capacity < 2)
+        return EINVAL;
+    uint32_t rounded = next_pow2(capacity);
+    if (rounded == 0)
+        return EOVERFLOW;
+    if ((uint64_t)num_workers * sizeof(wl_spsc_queue_t) > SIZE_MAX
+        || (uint64_t)rounded * sizeof(wl_delta_msg_t) > SIZE_MAX)
+        return EOVERFLOW;
+    uint64_t workers_bytes = (uint64_t)num_workers * sizeof(wl_spsc_queue_t);
+    uint64_t ring_bytes = (uint64_t)rounded * sizeof(wl_delta_msg_t);
+    if (ring_bytes > (UINT64_MAX - sizeof(wl_mpsc_queue_t)
+        - workers_bytes) / num_workers)
+        return EOVERFLOW;
+    *out_bytes = sizeof(wl_mpsc_queue_t) + workers_bytes
+        + ring_bytes * num_workers;
+    return 0;
+}
+
 wl_mpsc_queue_t *
 wl_mpsc_queue_create(uint32_t num_workers, uint32_t capacity)
 {
@@ -211,8 +234,10 @@ wl_mpsc_queue_t *
 wl_mpsc_queue_create_with_destructor(uint32_t num_workers, uint32_t capacity,
     wl_mpsc_payload_destroy_fn destroy_payload)
 {
-    if (num_workers == 0 || capacity < 2)
+    uint64_t footprint;
+    if (wl_mpsc_queue_footprint_for(num_workers, capacity, &footprint) != 0)
         return NULL;
+    (void)footprint;
 
     wl_mpsc_queue_t *q = (wl_mpsc_queue_t *)calloc(1, sizeof(wl_mpsc_queue_t));
     if (!q)

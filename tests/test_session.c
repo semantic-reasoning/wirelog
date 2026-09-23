@@ -1433,6 +1433,134 @@ enforcing_governor(uint64_t usable)
     return wl_columnar_memory_governor_ref_create(&resolution);
 }
 
+static uint64_t tdd_ring_test_bytes;
+static uint64_t tdd_ring_test_reserved;
+
+static void
+deny_tdd_ring_admission(wl_col_session_t *coord, uint64_t bytes)
+{
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(coord->memory_governor);
+    tdd_ring_test_bytes = bytes;
+    tdd_ring_test_reserved = wl_columnar_memory_reserved(governor);
+    atomic_store_explicit(&governor->usable_bytes, tdd_ring_test_reserved,
+        memory_order_release);
+}
+
+#ifdef WL_TEST_ALLOC_WRAP
+static void
+fail_tdd_ring_allocation(wl_col_session_t *coord, uint64_t bytes)
+{
+    tdd_ring_test_bytes = bytes;
+    tdd_ring_test_reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(coord->memory_governor));
+    fail_next_alloc = true;
+}
+#endif
+
+static void
+test_tdd_ring_budget_admission(void)
+{
+    TEST("TDD ring admission denial leaves no queue and permits retry");
+    uint32_t key = 0, projection[] = { 0 };
+    const char *keys[] = { "col0" };
+    uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
+    wl_plan_op_exchange_t exchange = { .num_workers = 1,
+                                       .key_col_idxs = &key,
+                                       .key_col_count = 1 };
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "output" },
+        { .op = WL_PLAN_OP_JOIN, .right_relation = "output", .left_keys = keys,
+          .right_keys = keys, .key_count = 1, .project_indices = projection,
+          .project_count = 1 },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } },
+        { .op = WL_PLAN_OP_CONCAT },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    wl_plan_relation_t relation = { .name = "output", .delta_name = "$d$output",
+                                    .ops = ops, .op_count = 6 };
+    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1,
+                                  .is_recursive = true };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    wl_columnar_memory_governor_ref_t *ref
+        = enforcing_governor(UINT64_MAX / 4u);
+    wl_session_t *session = NULL;
+    int64_t *values = NULL;
+    const char *failure = NULL;
+    tuple_collector_t tuples = { 0 };
+    tdd_ring_test_bytes = tdd_ring_test_reserved = 0;
+#define RING_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto ring_done; \
+             } } while (0)
+    RING_CHECK(ref, "governor creation");
+    options.memory_governor = ref;
+    RING_CHECK(wl_session_create_with_options(wl_backend_columnar(), &plan,
+        2, &options, &session) == 0, "session creation");
+    values = malloc(65536u * sizeof(*values));
+    RING_CHECK(values, "input allocation");
+    for (uint32_t i = 0; i < 65536u; i++)
+        values[i] = 42;
+    RING_CHECK(wl_session_insert(session, "input", values, 65536u, 1) == 0,
+        "input insertion");
+    wl_columnar_eval_test_before_tdd_queue_admission
+        = deny_tdd_ring_admission;
+    int denied_rc = wl_session_snapshot(session, collect_tuple, &tuples);
+    wl_columnar_eval_test_before_tdd_queue_admission = NULL;
+    wl_col_session_t *coord = COL_SESSION(session);
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(ref);
+    uint64_t planned = 0;
+    RING_CHECK(wl_mpsc_queue_footprint_for(2, 2, &planned) == 0
+        && tdd_ring_test_bytes == planned, "ring footprint hook");
+    RING_CHECK(denied_rc == ENOSPC
+        && wl_columnar_session_budget_denied(coord) && tuples.count == 0,
+        "typed denial before output");
+    RING_CHECK(!coord->delta_queue && !coord->tdd_owner_lifetime
+        && coord->mem_channel_ring_bytes == 0
+        && wl_columnar_memory_reserved(governor) <= tdd_ring_test_reserved,
+        "denied ring cleanup");
+    atomic_store_explicit(&governor->usable_bytes, UINT64_MAX / 4u,
+        memory_order_release);
+#ifdef WL_TEST_ALLOC_WRAP
+    wl_columnar_eval_test_before_tdd_queue_admission
+        = fail_tdd_ring_allocation;
+    int allocator_rc = wl_session_snapshot(session, collect_tuple, &tuples);
+    wl_columnar_eval_test_before_tdd_queue_admission = NULL;
+    RING_CHECK(allocator_rc == ENOMEM && !coord->delta_queue
+        && !coord->tdd_owner_lifetime && coord->mem_channel_ring_bytes == 0
+        && wl_columnar_memory_reserved(governor) <= tdd_ring_test_reserved,
+        "queue allocator failure cleanup");
+#endif
+    RING_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0
+        && tuples.count == 1 && tuples.rows[0][0] == 42
+        && !wl_columnar_session_budget_denied(coord),
+        "same-session retry");
+ring_done:
+    wl_columnar_eval_test_before_tdd_queue_admission = NULL;
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = false;
+#endif
+    if (ref) {
+        wl_columnar_memory_governor_t *governor
+            = wl_columnar_memory_governor_ref_get(ref);
+        atomic_store_explicit(&governor->usable_bytes, UINT64_MAX / 4u,
+            memory_order_release);
+    }
+    free(values);
+    wl_session_destroy(session);
+    wl_columnar_memory_governor_ref_release(ref);
+    if (failure)
+        FAIL(failure);
+    else
+        PASS();
+#undef RING_CHECK
+}
+
 static uint64_t
 reserved_on(wl_columnar_memory_governor_ref_t *ref)
 {
@@ -11883,6 +12011,7 @@ main(void)
     test_session_create_destroy_columnar();
     test_session_create_with_options();
     test_session_injected_governor_admission();
+    test_tdd_ring_budget_admission();
 #ifdef _WIN32
     test_session_windows_job_options();
 #endif

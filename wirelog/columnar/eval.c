@@ -26,6 +26,11 @@
 #define TDD_OWNER_FALLBACK_MIN_ITER 31u
 #define TDD_OWNER_FALLBACK_DELTA_ROWS 512u
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_eval_test_before_tdd_queue_admission)(
+    wl_col_session_t *coord, uint64_t bytes);
+#endif
+
 /* Only the standalone decision regression targets enable this wrapper. */
 #ifdef WL_COLUMNAR_EVAL_TEST_SUBMISSION
 extern int
@@ -138,6 +143,7 @@ wl_columnar_eval_tdd_owner_lifetime_retry(wl_col_session_t *coord)
         wl_mpsc_queue_destroy(lifetime->queue);
         lifetime->queue = NULL;
     }
+    wl_columnar_memory_release(&lifetime->queue_reservation);
     coord->tdd_owner_lifetime = NULL;
     wl_columnar_memory_release(&lifetime->reservation);
     free(lifetime);
@@ -223,6 +229,7 @@ wl_columnar_eval_tdd_owner_lifetime_create(wl_col_session_t *coord,
         return ENOMEM;
     }
     wl_columnar_memory_reservation_init(&lifetime->reservation);
+    wl_columnar_memory_reservation_init(&lifetime->queue_reservation);
     if (coord->memory_governor
         && !wl_columnar_memory_reservation_move(&lifetime->reservation,
         &reservation)) {
@@ -2154,7 +2161,7 @@ tdd_worker_subpass_fn(void *arg)
              * delta ownership transfers to queue; coordinator reconstructs
              * ctxs via wl_columnar_eval_tdd_queue_reconstruct_delta_matrix
              * after barrier.
-             * Fallback to ctx write when queue unavailable (alloc failure). */
+             * The queue is admitted and allocated before worker dispatch. */
             if (sess->coordinator && sess->coordinator->delta_queue) {
                 /* Issue #1380: mirror of eval_tdd_queue.c publish. */
                 uint64_t transport_bytes = col_rel_transport_bytes(delta);
@@ -2175,7 +2182,7 @@ tdd_worker_subpass_fn(void *arg)
                     TDD_WORKER_RETURN();
                 }
             } else {
-                /* No queue (creation failed): fall back to direct ctx write. */
+                /* A caller without a queue retains the legacy direct path. */
                 ctx->delta_rels[ri] = delta;
             }
             any_new = true;
@@ -6271,6 +6278,9 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
     uint64_t tdd_total_t0 = now_ns();
 
     uint32_t delta_queue_capacity = 0;
+    uint64_t queue_ring_bytes = 0;
+    wl_columnar_memory_reservation_t queue_reservation;
+    wl_columnar_memory_reservation_init(&queue_reservation);
     col_eval_tdd_worker_ctx_t *ctxs = NULL;
     if (wl_columnar_eval_delta_queue_capacity(nrels,
         &delta_queue_capacity) != 0) {
@@ -6624,16 +6634,50 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
 
     /* Issue #410: Create MPSC delta queue for dual-write transport.
      * Capacity = W × nrels × 2 (2x headroom; at most W×nrels per sub-pass).
-     * Failure is non-fatal: enqueue is skipped when delta_queue is NULL.
-     * An unrepresentable nrels*2 request is rejected before any stratum
-     * state allocation, using the evaluator's ENOMEM failure signal. */
+     * Admit its complete fixed ring before any queue allocation. */
+    rc = wl_mpsc_queue_footprint_for(W, delta_queue_capacity,
+            &queue_ring_bytes);
+    if (rc != 0)
+        goto done;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_test_before_tdd_queue_admission)
+        wl_columnar_eval_test_before_tdd_queue_admission(coord,
+            queue_ring_bytes);
+#endif
+    if (coord->memory_governor) {
+        wl_columnar_memory_admission_status_t status
+            = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(coord->memory_governor),
+                queue_ring_bytes, &queue_reservation);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                coord->memory_budget_denied = true;
+            rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
+                : ENOMEM;
+            goto done;
+        }
+    }
     coord->delta_queue = wl_mpsc_queue_create_with_destructor(
         W, delta_queue_capacity, tdd_destroy_delta_payload);
+    if (!coord->delta_queue) {
+        rc = ENOMEM;
+        goto done;
+    }
+    if (coord->memory_governor && coord->tdd_owner_lifetime
+        && !wl_columnar_memory_reservation_move(
+            &coord->tdd_owner_lifetime->queue_reservation,
+            &queue_reservation)) {
+        wl_mpsc_queue_destroy(coord->delta_queue);
+        coord->delta_queue = NULL;
+        rc = EINVAL;
+        goto done;
+    }
     if (coord->tdd_owner_lifetime)
         coord->tdd_owner_lifetime->queue = coord->delta_queue;
     /* Issue #1380: ring storage is fixed for the stratum; charge once. */
-    coord->mem_channel_ring_bytes
-        = wl_mpsc_queue_footprint_bytes(coord->delta_queue);
+    coord->mem_channel_ring_bytes = queue_ring_bytes;
     if (coord->tdd_owner_lifetime)
         coord->tdd_owner_lifetime->queue_ring_bytes
             = coord->mem_channel_ring_bytes;
@@ -7173,6 +7217,7 @@ done:
         wl_mpsc_queue_destroy(coord->delta_queue);
         coord->delta_queue = NULL;
     }
+    wl_columnar_memory_release(&queue_reservation);
 
     /* Free pre-allocated worker contexts */
     if (ctxs && (!coord->tdd_owner_lifetime
