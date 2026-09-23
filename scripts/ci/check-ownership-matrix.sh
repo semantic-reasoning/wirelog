@@ -51,10 +51,21 @@ expected_rows="${WIRELOG_OWNERSHIP_EXPECTED_ROWS:-16}"
     exit 1
 }
 
-read_rows=$(grep -cE '\| read \|$' "$rows" || true)
-expected_read="${WIRELOG_OWNERSHIP_EXPECTED_READ:-16}"
-[ "$read_rows" -eq "$expected_read" ] || {
-    echo "check-ownership-matrix: FAIL: expected exactly $expected_read rows marked read, found $read_rows" >&2
+author_read_rows=$(grep -cE '\| author-read \|$' "$rows" || true)
+expected_author_read="${WIRELOG_OWNERSHIP_EXPECTED_AUTHOR_READ:-1}"
+[ "$author_read_rows" -eq "$expected_author_read" ] || {
+    echo "check-ownership-matrix: FAIL: expected exactly $expected_author_read rows marked author-read, found $author_read_rows" >&2
+    exit 1
+}
+reviewer_read_rows=$(grep -cE '\| reviewer-read \|$' "$rows" || true)
+expected_reviewer_read="${WIRELOG_OWNERSHIP_EXPECTED_REVIEWER_READ:-15}"
+[ "$reviewer_read_rows" -eq "$expected_reviewer_read" ] || {
+    echo "check-ownership-matrix: FAIL: expected exactly $expected_reviewer_read rows marked reviewer-read, found $reviewer_read_rows" >&2
+    exit 1
+}
+expected_marked_rows=$((expected_author_read + expected_reviewer_read))
+[ "$expected_marked_rows" -eq "$expected_rows" ] || {
+    echo "check-ownership-matrix: FAIL: author-read and reviewer-read pins sum to $expected_marked_rows, expected $expected_rows rows" >&2
     exit 1
 }
 

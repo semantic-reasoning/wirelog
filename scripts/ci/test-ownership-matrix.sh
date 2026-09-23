@@ -29,12 +29,15 @@ make_sandbox() {
 }
 
 run_gate() {
-    WIRELOG_OWNERSHIP_DOC_ROOT="$1" bash "$1/scripts/ci/check-ownership-matrix.sh" >"$work/out" 2>"$work/err"
+    WIRELOG_OWNERSHIP_DOC_ROOT="$1" \
+        WIRELOG_OWNERSHIP_EXPECTED_AUTHOR_READ="${2:-1}" \
+        WIRELOG_OWNERSHIP_EXPECTED_REVIEWER_READ="${3:-15}" \
+        bash "$1/scripts/ci/check-ownership-matrix.sh" >"$work/out" 2>"$work/err"
 }
 
 expect_failure() {
     local name="$1" dir="$2" needle="$3"
-    if run_gate "$dir"; then
+    if run_gate "$dir" "${4:-1}" "${5:-15}"; then
         echo "FAIL: $name: gate accepted a tree it should have rejected" >&2
         failures=$((failures + 1))
         return
@@ -118,16 +121,24 @@ dir=$(make_sandbox test_only_symbol)
 rewrite_file "$dir/docs/MEMORY.md" 's/`arrangement.c:col_session_pin_diff_arrangement`/`arrangement.c:col_arrangement_probe_bundle_acquire`/'
 expect_failure "symbol with no production caller" "$dir" "have no caller under wirelog/"
 
-# 9. A row downgraded from read to unread.  The audited count is pinned for the
-#    same reason the row count is: without it a row could drift into the table
-#    unread and be indistinguishable from one that was checked.
-dir=$(make_sandbox unread_row)
-awk '!done && sub(/\| read \|$/, "| unread |") { done = 1 } { print }' \
+# 9. A newly author-read row cannot silently become reviewer-read. The
+#    reviewer pin is set to the resulting count so this case reaches the
+#    independent author-state pin.
+dir=$(make_sandbox author_state_pin)
+awk '!done && /^\| Timestamp sub-resource / && sub(/\| author-read \|$/, "| reviewer-read |") { done = 1 } { print }' \
     "$dir/docs/MEMORY.md" >"$dir/docs/MEMORY.md.tmp"
 mv "$dir/docs/MEMORY.md.tmp" "$dir/docs/MEMORY.md"
-expect_failure "audited count off its pin" "$dir" "rows marked read, found"
+expect_failure "author-read count off its pin" "$dir" "rows marked author-read, found 0" 1 16
 
-# 10. Control: the unmutated tree must pass, or every case above proves nothing.
+# 10. A reviewer-read row cannot silently become author-read. The author pin
+#    is set to the resulting count so this case reaches the reviewer-state pin.
+dir=$(make_sandbox reviewer_state_pin)
+awk '!done && sub(/\| reviewer-read \|$/, "| author-read |") { done = 1 } { print }' \
+    "$dir/docs/MEMORY.md" >"$dir/docs/MEMORY.md.tmp"
+mv "$dir/docs/MEMORY.md.tmp" "$dir/docs/MEMORY.md"
+expect_failure "reviewer-read count off its pin" "$dir" "rows marked reviewer-read, found 14" 2 15
+
+# 11. Control: the unmutated tree must pass, or every case above proves nothing.
 dir=$(make_sandbox control)
 expect_success "control, unmutated tree" "$dir"
 
@@ -135,4 +146,4 @@ if [ "$failures" -ne 0 ]; then
     echo "test-ownership-matrix: $failures case(s) failed" >&2
     exit 1
 fi
-echo "test-ownership-matrix: OK; 9 rejection cases and 1 control"
+echo "test-ownership-matrix: OK; 10 rejection cases and 1 control"
