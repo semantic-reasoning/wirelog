@@ -3355,11 +3355,21 @@ wl_columnar_filter_apply_right_filter_governed(
     const wl_plan_expr_buffer_t *fexpr,
     col_rel_t *rel, delta_pool_t *pool, wl_intern_t *intern,
     wl_columnar_memory_governor_ref_t *governor);
+int wl_columnar_filter_apply_right_filter_governed_checked(
+    const wl_plan_expr_buffer_t *fexpr, col_rel_t *rel, delta_pool_t *pool,
+    wl_intern_t *intern, wl_columnar_memory_governor_ref_t *governor,
+    col_rel_t **out);
 uint64_t
 wl_columnar_filter_fnv1a_hash(const uint8_t *buf, uint32_t len);
 col_rel_t *
 wl_columnar_filter_apply_right_filter_cached(wl_col_session_t *sess,
     const wl_plan_expr_buffer_t *fexpr, const char *rel_name, col_rel_t *rel);
+int wl_columnar_filter_apply_right_filter_cached_checked(
+    wl_col_session_t *sess, const wl_plan_expr_buffer_t *fexpr,
+    const char *rel_name, col_rel_t *rel, col_rel_t **out);
+/* Checked cache calls return 0 with *out == NULL only when a lease or
+ * deferred invalidation makes the cache unavailable. Allocation/admission
+ * failures return their errno status; JOIN must not fall back on denial. */
 /* Lease-taking variant (Issue #1435): on success *pin is active and the
  * returned relation stays valid until col_filt_cache_pin_release(); NULL
  * when the entry is leased and stale (replacement deferred), hidden by a
@@ -3370,6 +3380,10 @@ col_rel_t *
 wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
     const wl_plan_expr_buffer_t *fexpr, const char *rel_name, col_rel_t *rel,
     col_filt_cache_pin_t *pin);
+int wl_columnar_filter_apply_right_filter_cached_pin_checked(
+    wl_col_session_t *sess, const wl_plan_expr_buffer_t *fexpr,
+    const char *rel_name, col_rel_t *rel, col_filt_cache_pin_t *pin,
+    col_rel_t **out);
 void
 col_filt_cache_pin_release(col_filt_cache_pin_t *pin);
 

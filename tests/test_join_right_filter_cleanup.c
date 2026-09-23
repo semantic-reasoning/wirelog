@@ -110,10 +110,8 @@ static void
 destroy_mock_session(wl_col_session_t *s)
 {
     wl_workqueue_destroy(s->wq);
-    for (uint32_t i = 0; i < s->nrels; i++) {
-        col_rel_free_contents(s->rels[i]);
-        free(s->rels[i]);
-    }
+    for (uint32_t i = 0; i < s->nrels; i++)
+        col_rel_destroy(s->rels[i]);
     free((void *)s->rels);
     for (uint32_t i = 0; i < s->arr_count; i++) {
         free(s->arr_entries[i].rel_name);
@@ -537,9 +535,11 @@ test_right_filter_preserves_timestamps(void)
         size_t ts_bytes = (size_t)rel->capacity * sizeof(*rel->timestamps);
         fail_calloc_bytes = ts_bytes;
         fail_calloc_hits = 0;
-        col_rel_t *failed = wl_columnar_filter_apply_right_filter_cached_pin(
-            fault_sess, &expr, "fault-right", rel, &fault_pin);
-        ok = failed == NULL && !fault_pin.active && fail_calloc_hits == 1;
+        col_rel_t *failed = NULL;
+        int fault_rc = wl_columnar_filter_apply_right_filter_cached_pin_checked(
+            fault_sess, &expr, "fault-right", rel, &fault_pin, &failed);
+        ok = fault_rc == ENOMEM && failed == NULL && !fault_pin.active
+            && fail_calloc_hits == 1 && fault_sess->filt_cache_count == 0;
         if (ok) {
             col_rel_t *retried = wl_columnar_filter_apply_right_filter_cached(
                 fault_sess, &expr, "fault-right", rel);
@@ -979,7 +979,8 @@ test_managed_right_filter(op_fn_t fn, wl_plan_op_type_t type, bool grow,
     init_op(&op, type);
     ok = eval_stack_push(&stack, left, false) == 0;
     if (!ok) goto cleanup;
-    ok = fn(&op, &stack, sess) == ENOMEM && stack.top == 0;
+    ok = fn(&op, &stack, sess) == ENOSPC && sess->memory_budget_denied
+        && stack.top == 0;
     if (!ok) goto cleanup;
     ok = col_rel_source_reader_acquire(left, &reader) == 0;
     if (!ok) goto cleanup;
@@ -1079,8 +1080,11 @@ test_managed_filter_cache(void)
     col_filt_cache_pin_release(&pin);
     atomic_store_explicit(&wl_columnar_memory_governor_ref_get(b)->usable_bytes,
         0, memory_order_release);
-    ok = ok && !wl_columnar_filter_apply_right_filter_cached_pin(sess, &expr,
-            "right", right, &second) && !second.active;
+    col_rel_t *denied = NULL;
+    int refresh_rc = wl_columnar_filter_apply_right_filter_cached_pin_checked(
+        sess, &expr, "right", right, &second, &denied);
+    ok = ok && refresh_rc == ENOSPC && !denied && !second.active
+        && sess->memory_budget_denied;
     atomic_store_explicit(&wl_columnar_memory_governor_ref_get(b)->usable_bytes,
         1u << 20, memory_order_release);
     cached = wl_columnar_filter_apply_right_filter_cached_pin(sess, &expr,
@@ -1142,16 +1146,42 @@ test_filter_cache_admission_and_growth(void)
         goto cleanup;
     sess->memory_governor = ref;
     right = session_find_rel(sess, "right");
-    out = wl_columnar_filter_apply_right_filter_cached_pin(sess, &expr,
-            "admission", right, &pin);
-    ok = !out && !pin.active && sess->filt_cache_count == 0
+    int cache_rc = wl_columnar_filter_apply_right_filter_cached_pin_checked(
+        sess, &expr, "admission", right, &pin, &out);
+    ok = cache_rc == ENOSPC && !out && !pin.active
+        && sess->memory_budget_denied && sess->filt_cache_count == 0
         && sess->filt_cache_active_pins == 0
         && wl_columnar_memory_reserved(
         wl_columnar_memory_governor_ref_get(ref)) == 0;
     col_filt_cache_pin_release(&pin);
+    col_rel_t *owned = NULL;
+    int owned_rc = wl_columnar_filter_apply_right_filter_governed_checked(
+        &expr, right, sess->delta_pool, sess->intern, ref, &owned);
+    ok = ok && owned_rc == ENOSPC && !owned
+        && wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref)) == 0;
+    uint64_t array_bytes = 4u * sizeof(*sess->filt_cache);
+    uint64_t key_bytes = strlen("admission") + 1u + expr.size;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, array_bytes + key_bytes,
+        memory_order_release);
+    cache_rc = wl_columnar_filter_apply_right_filter_cached_pin_checked(
+        sess, &expr, "admission", right, &pin, &out);
+    ok = ok && cache_rc == ENOSPC && !out && !pin.active
+        && sess->filt_cache_count == 0 && sess->filt_cache_cap == 4
+        && !sess->filt_cache[0].filtered
+        && !sess->filt_cache[0].rel_name
+        && !sess->filt_cache[0].metadata_reservation
+        && wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref)) == array_bytes;
+    col_filt_cache_pin_release(&pin);
     atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
             ref)->usable_bytes,
         1u << 20, memory_order_release);
+    owned_rc = wl_columnar_filter_apply_right_filter_governed_checked(
+        &expr, right, sess->delta_pool, sess->intern, ref, &owned);
+    ok = ok && owned_rc == 0 && owned && owned->nrows == 4;
+    col_rel_destroy(owned);
     out = wl_columnar_filter_apply_right_filter_cached_pin(sess, &expr,
             "admission", right, &pin);
     ok = ok && out && out->nrows == 4 && pin.active;
@@ -1204,6 +1234,49 @@ cleanup:
     if (ok) PASS(); else FAIL("admission or pinned cache growth contract");
 }
 
+static void
+test_join_filter_budget_denial(void)
+{
+    TEST("right-filter budget denial stops JOIN before owned fallback");
+    wl_col_session_t *sess = make_mock_session();
+    wl_columnar_memory_governor_ref_t *ref = right_filter_governor(1u);
+    bool ok = sess && ref && register_right(sess) == 0;
+    if (!ok)
+        goto cleanup;
+    sess->memory_governor = ref;
+    for (unsigned cached = 0; cached < 2 && ok; cached++) {
+        col_rel_t *left = make_left(false);
+        eval_stack_t stack;
+        wl_plan_op_t op;
+        eval_stack_init(&stack);
+        init_op(&op, WL_PLAN_OP_JOIN);
+        if (cached)
+            op.delta_mode = WL_DELTA_FORCE_FULL;
+        ok = left && eval_stack_push(&stack, left, false) == 0;
+        uint32_t slots_before = sess->delta_pool->slot_used;
+        int rc = ok ? wl_columnar_join_op(&op, &stack, sess) : ENOMEM;
+        ok = ok && rc == ENOSPC && sess->memory_budget_denied
+            && stack.top == 0 && sess->filt_cache_count == 0
+            && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0;
+        if (cached)
+            ok = ok && sess->delta_pool->slot_used == slots_before;
+        (void)eval_stack_drain(&stack);
+        col_rel_destroy(left);
+    }
+cleanup:
+    if (sess) {
+        sess->memory_governor = NULL;
+        destroy_mock_session(sess);
+    }
+    if (ref) {
+        ok = ok && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0;
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (ok) PASS(); else FAIL("JOIN retried or hid right-filter denial");
+}
+
 int
 main(void)
 {
@@ -1220,6 +1293,7 @@ main(void)
     }
     test_managed_filter_cache();
     test_filter_cache_admission_and_growth();
+    test_join_filter_budget_denial();
     for (unsigned grow = 0; grow < 2; grow++)
         for (unsigned exhaust = 0; exhaust < 2; exhaust++)
             test_managed_right_filter(wl_columnar_join_op, WL_PLAN_OP_JOIN,
