@@ -3238,6 +3238,10 @@ typedef enum {
 wl_columnar_expr_compiled_t *
 wl_columnar_expr_compile(const uint8_t *buf, uint32_t size,
     const wl_intern_t *intern);
+wl_columnar_expr_compiled_t *
+wl_columnar_expr_compile_governed(const uint8_t *buf, uint32_t size,
+    const wl_intern_t *intern, wl_columnar_memory_governor_ref_t *governor,
+    wl_col_session_t *sess, int *error_out);
 void
 wl_columnar_expr_compiled_free(wl_columnar_expr_compiled_t *c);
 int

@@ -1416,12 +1416,17 @@ struct wl_columnar_expr_compiled {
      * expression.  NULL is legal and matches the interpreter's own NULL-intern
      * fallbacks. */
     const wl_intern_t *intern;
+    wl_columnar_memory_reservation_t *reservation;
 };
 
 void
 wl_columnar_expr_compiled_free(wl_columnar_expr_compiled_t *c)
 {
     if (c) {
+        if (c->reservation) {
+            (void)wl_columnar_memory_rollback(c->reservation);
+            free(c->reservation);
+        }
         free(c->instrs);
         free(c);
     }
@@ -1438,9 +1443,12 @@ wl_columnar_expr_compiled_free(wl_columnar_expr_compiled_t *c)
  * col_eval_expr_run in that case.
  */
 wl_columnar_expr_compiled_t *
-wl_columnar_expr_compile(const uint8_t *buf, uint32_t size,
-    const wl_intern_t *intern)
+wl_columnar_expr_compile_governed(const uint8_t *buf, uint32_t size,
+    const wl_intern_t *intern, wl_columnar_memory_governor_ref_t *governor,
+    wl_col_session_t *sess, int *error_out)
 {
+    if (error_out)
+        *error_out = ENOTSUP;
     if (!buf || size == 0)
         return NULL;
 
@@ -1543,19 +1551,72 @@ wl_columnar_expr_compile(const uint8_t *buf, uint32_t size,
     if (ninstr == 0)
         return NULL;
 
+    uint64_t instr_bytes = 0;
+    uint64_t compiled_bytes = 0;
+    if (!wl_columnar_memory_size_mul(ninstr, sizeof(expr_instr_t),
+        &instr_bytes)
+        || !wl_columnar_memory_size_add(sizeof(wl_columnar_expr_compiled_t),
+        instr_bytes, &compiled_bytes)) {
+        if (error_out)
+            *error_out = EOVERFLOW;
+        return NULL;
+    }
+    wl_columnar_memory_reservation_t *reservation = NULL;
+    if (governor && compiled_bytes > 0) {
+        wl_columnar_memory_admission_status_t status;
+        reservation = (wl_columnar_memory_reservation_t *)malloc(
+            sizeof(*reservation));
+        if (!reservation) {
+            if (error_out)
+                *error_out = ENOMEM;
+            return NULL;
+        }
+        wl_columnar_memory_reservation_init(reservation);
+        status = wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(governor), compiled_bytes,
+            reservation);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED && sess)
+                sess->memory_budget_denied = true;
+            free(reservation);
+            if (error_out)
+                *error_out = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                    ? ENOSPC
+                    : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                    ? EOVERFLOW : ENOMEM;
+            return NULL;
+        }
+    }
     wl_columnar_expr_compiled_t *c =
         (wl_columnar_expr_compiled_t *)malloc(
         sizeof(wl_columnar_expr_compiled_t));
-    if (!c)
+    if (!c) {
+        if (reservation) {
+            (void)wl_columnar_memory_rollback(reservation);
+            free(reservation);
+        }
+        if (error_out)
+            *error_out = ENOMEM;
         return NULL;
+    }
     c->instrs =
-        (expr_instr_t *)malloc(ninstr * sizeof(expr_instr_t));
+        (expr_instr_t *)malloc((size_t)instr_bytes);
     if (!c->instrs) {
         free(c);
+        if (reservation) {
+            (void)wl_columnar_memory_rollback(reservation);
+            free(reservation);
+        }
+        if (error_out)
+            *error_out = ENOMEM;
         return NULL;
     }
     c->ninstr = ninstr;
     c->intern = intern;
+    c->reservation = reservation;
+    if (error_out)
+        *error_out = 0;
 
     /* Pass 2: fill instruction array. */
     uint32_t j = 0;
@@ -1598,6 +1659,14 @@ wl_columnar_expr_compile(const uint8_t *buf, uint32_t size,
         }
     }
     return c;
+}
+
+wl_columnar_expr_compiled_t *
+wl_columnar_expr_compile(const uint8_t *buf, uint32_t size,
+    const wl_intern_t *intern)
+{
+    return wl_columnar_expr_compile_governed(buf, size, intern, NULL, NULL,
+               NULL);
 }
 
 /*
