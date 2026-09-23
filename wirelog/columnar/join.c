@@ -2791,6 +2791,64 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 (void)col_arrangement_probe_bundle_release(&diff_bundle);
                 return wl_columnar_join_dispose_left(stack, &left_e, ensure_rc);
             }
+            wl_columnar_memory_reservation_t parallel_reservation;
+            bool parallel_admitted = false;
+            wl_columnar_memory_reservation_init(&parallel_reservation);
+            if (sess->memory_governor) {
+                uint64_t ctx_bytes = 0;
+                uint64_t offset_bytes = 0;
+                uint64_t hash_bytes = 0;
+                uint64_t total_bytes = 0;
+                wl_columnar_memory_admission_status_t status;
+                bool sized = wl_columnar_memory_size_mul(W,
+                        sizeof(col_join_keyed_ctx_t), &ctx_bytes)
+                    && wl_columnar_memory_size_mul((uint64_t)W + 1u,
+                        sizeof(uint64_t), &offset_bytes)
+                    && wl_columnar_memory_size_mul(
+                    left->nrows > 0 ? left->nrows : 1,
+                    sizeof(uint32_t), &hash_bytes)
+                    && wl_columnar_memory_size_add(ctx_bytes, offset_bytes,
+                        &total_bytes)
+                    && wl_columnar_memory_size_add(total_bytes, hash_bytes,
+                        &total_bytes);
+                if (!sized) {
+                    free(tmp);
+                    col_rel_destroy(out);
+                    free(lk);
+                    free(rk);
+                    if (right_filtered)
+                        col_rel_destroy(right_filtered);
+                    wl_columnar_arrangement_diff_txn_abort(&diff_txn);
+                    (void)col_arrangement_probe_bundle_release(&diff_bundle);
+                    return wl_columnar_join_dispose_left(stack, &left_e,
+                               EOVERFLOW);
+                }
+                status = wl_columnar_memory_reserve_checked(
+                    wl_columnar_memory_governor_ref_get(
+                        sess->memory_governor),
+                    total_bytes, &parallel_reservation);
+                if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+                    && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+                    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                        sess->memory_budget_denied = true;
+                    free(tmp);
+                    col_rel_destroy(out);
+                    free(lk);
+                    free(rk);
+                    if (right_filtered)
+                        col_rel_destroy(right_filtered);
+                    wl_columnar_arrangement_diff_txn_abort(&diff_txn);
+                    (void)col_arrangement_probe_bundle_release(&diff_bundle);
+                    return wl_columnar_join_dispose_left(stack, &left_e,
+                               status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                                   ? ENOSPC
+                                   : status
+                               == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                                   ? EOVERFLOW
+                                   : ENOMEM);
+                }
+                parallel_admitted = true;
+            }
             col_join_keyed_ctx_t *ctxs = (col_join_keyed_ctx_t *)calloc(
                 W, sizeof(col_join_keyed_ctx_t));
             uint64_t *offsets = (uint64_t *)calloc(W + 1, sizeof(uint64_t));
@@ -2798,6 +2856,9 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 sizeof(uint32_t)
                 * (size_t)(left->nrows ? left->nrows : 1));
             if (!ctxs || !offsets) {
+                if (parallel_admitted)
+                    (void)wl_columnar_memory_rollback(
+                        &parallel_reservation);
                 free(ctxs);
                 free(offsets);
                 free(left_hashes);
@@ -2914,6 +2975,8 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
             free(offsets);
             free(ctxs);
             free(left_hashes);
+            if (parallel_admitted)
+                (void)wl_columnar_memory_rollback(&parallel_reservation);
             if (prc != 0) {
                 free(tmp);
                 col_rel_destroy(out);
