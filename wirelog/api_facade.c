@@ -780,7 +780,9 @@ wirelog_load_facts_from_csv(wirelog_executor_t *executor,
             ncols);
     free(data);
     if (rc != 0) {
-        set_error(error, WIRELOG_ERR_EXEC);
+        set_error(error, (wirelog_error_t)
+            wl_facade_session_error_code_with_budget(rc, 0,
+            wl_session_budget_denied(executor->session)));
         return false;
     }
     set_error(error, WIRELOG_OK);

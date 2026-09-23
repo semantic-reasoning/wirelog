@@ -1819,6 +1819,8 @@ col_rel_set_schema_impl(col_rel_t *r, uint32_t ncols,
             NULL);
     if (pending_rc < 0) {
         r->ncols = 0;
+        if (pending_rc == -ENOSPC)
+            r->memory_budget_denial_pending = true;
         return ENOMEM;
     }
 

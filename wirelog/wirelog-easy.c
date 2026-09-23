@@ -308,7 +308,8 @@ wirelog_easy_insert(wirelog_easy_session_t *s, const char *relation,
     if (err != WIRELOG_OK)
         return err;
     int rc = wl_session_insert(s->session, relation, row, 1, ncols);
-    return (rc == 0) ? WIRELOG_OK : WIRELOG_ERR_EXEC;
+    return (wirelog_error_t)wl_facade_session_error_code_with_budget(rc, 0,
+               wl_session_budget_denied(s->session));
 }
 
 wirelog_error_t
@@ -324,7 +325,8 @@ wirelog_easy_remove(wirelog_easy_session_t *s, const char *relation,
     if (err != WIRELOG_OK)
         return err;
     int rc = wl_session_remove(s->session, relation, row, 1, ncols);
-    return (rc == 0) ? WIRELOG_OK : WIRELOG_ERR_EXEC;
+    return (wirelog_error_t)wl_facade_session_error_code_with_budget(rc, 0,
+               wl_session_budget_denied(s->session));
 }
 
 /* ======================================================================== */

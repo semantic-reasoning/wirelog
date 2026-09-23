@@ -97,7 +97,7 @@ int
 wl_facade_session_error_code_with_budget(int rc, int expr_status,
     bool budget_denied)
 {
-    if (budget_denied && rc == ENOSPC)
+    if (budget_denied && (rc == ENOSPC || rc == ENOMEM))
         return WIRELOG_ERR_MEMORY_BUDGET;
     return wl_facade_session_error_code(rc, expr_status);
 }

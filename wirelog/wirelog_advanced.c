@@ -388,6 +388,8 @@ session_typed_rows(wirelog_session_t *session, const char *relation,
         }
     }
     int rc = 0;
+    bool budget_denied = false;
+    bool rollback_failed = false;
     for (uint32_t r = 0; r < num_rows && rc == 0; r++) {
         int64_t *row = &converted[(size_t)r * physical_nlanes];
         rc = remove ? wl_session_remove(session->inner, relation, row, 1,
@@ -395,6 +397,7 @@ session_typed_rows(wirelog_session_t *session, const char *relation,
             : wl_session_insert(session->inner, relation, row, 1,
                 physical_nlanes);
         if (rc != 0) {
+            budget_denied = wl_session_budget_denied(session->inner);
             for (uint32_t rollback = 0; rollback < r; rollback++) {
                 int inverse = remove
                     ? wl_session_insert(session->inner, relation,
@@ -403,8 +406,10 @@ session_typed_rows(wirelog_session_t *session, const char *relation,
                     : wl_session_remove(session->inner, relation,
                         &converted[(size_t)rollback * physical_nlanes], 1,
                         physical_nlanes);
-                if (inverse != 0)
+                if (inverse != 0) {
+                    rollback_failed = true;
                     break;
+                }
             }
         }
     }
@@ -412,7 +417,10 @@ session_typed_rows(wirelog_session_t *session, const char *relation,
     typed_layout_free(&layout);
     if (rc == 0)
         return WIRELOG_OK;
-    return rc == ENOMEM ? WIRELOG_ERR_MEMORY : WIRELOG_ERR_EXEC;
+    if (rollback_failed)
+        return WIRELOG_ERR_EXEC;
+    return (wirelog_error_t)wl_facade_session_error_code_with_budget(rc, 0,
+               budget_denied);
 }
 
 static const wl_compute_backend_t *
@@ -530,7 +538,8 @@ wirelog_session_insert(wirelog_session_t *session, const char *relation,
         return WIRELOG_ERR_EXEC;
     int rc = wl_session_insert(session->inner, relation, data, num_rows,
             num_cols);
-    return (rc == 0) ? WIRELOG_OK : WIRELOG_ERR_EXEC;
+    return (wirelog_error_t)wl_facade_session_error_code_with_budget(rc, 0,
+               wl_session_budget_denied(session->inner));
 }
 
 wirelog_error_t
@@ -543,7 +552,8 @@ wirelog_session_remove(wirelog_session_t *session, const char *relation,
         return WIRELOG_ERR_EXEC;
     int rc = wl_session_remove(session->inner, relation, data, num_rows,
             num_cols);
-    return (rc == 0) ? WIRELOG_OK : WIRELOG_ERR_EXEC;
+    return (wirelog_error_t)wl_facade_session_error_code_with_budget(rc, 0,
+               wl_session_budget_denied(session->inner));
 }
 
 wirelog_error_t

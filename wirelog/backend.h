@@ -105,6 +105,9 @@ typedef struct {
      * most recent operation. The opaque pointer is the backend's session
      * representation. Backends without governed admission leave this NULL. */
     bool (*session_budget_denied)(const void *session);
+    /* Optional reset before a new fact mutation. Sessions are externally
+     * serialized; the result query then describes that operation alone. */
+    void (*session_budget_denial_clear)(void *session);
 } wl_compute_backend_t;
 
 /**
