@@ -77,7 +77,13 @@ wl_columnar_eval_test_submit(wl_work_queue_t *wq, void (*fn)(void *),
  * register nothing after a sweep. */
 static bool teardown_hold_armed;
 static bool teardown_hold_fired;
+static bool teardown_reader_release_safe;
 static wl_columnar_source_access_reader_t teardown_reader;
+static bool teardown_caller_attempted;
+static bool teardown_caller_alias_selected;
+static bool teardown_caller_state_ok;
+static int teardown_caller_rc;
+static uint32_t teardown_caller_cohort_count;
 static bool owner_queue_hold_armed;
 static bool owner_queue_hold_fired;
 static col_rel_t *owner_queue_relation;
@@ -94,15 +100,63 @@ wl_columnar_eval_test_before_worker_cleanup(wl_col_session_t *coord)
      * test would pass without ever holding anything. */
     if (coord->tdd_workers_count == 0)
         return;
+    teardown_caller_cohort_count = coord->tdd_workers_count;
+    if (teardown_caller_cohort_count != 8)
+        return;
+    wl_col_session_t *cohort_workers = coord->tdd_workers;
     wl_col_session_t *worker = &coord->tdd_workers[0];
     for (uint32_t i = 0; i < worker->nrels; i++) {
         col_rel_t *rel = worker->rels[i];
-        if (!rel)
+        if (!rel || !rel->storage_owner || rel->storage_owner == rel)
             continue;
         if (col_rel_source_reader_acquire_transferable(rel,
             &teardown_reader) != 0)
             continue;
         teardown_hold_fired = true;
+        teardown_reader_release_safe = true;
+        teardown_caller_alias_selected = true;
+
+        uint32_t worker_id = worker->worker_id;
+        uint32_t nrels = worker->nrels;
+        col_rel_t **rels = worker->rels;
+        uintptr_t held_alias_address = (uintptr_t)rel;
+        uintptr_t *slot_addresses = NULL;
+        if (nrels == 0 || sizeof(*slot_addresses) > SIZE_MAX / nrels)
+            return;
+        slot_addresses = malloc((size_t)nrels * sizeof(*slot_addresses));
+        if (!slot_addresses)
+            return;
+        for (uint32_t slot = 0; slot < nrels; slot++)
+            slot_addresses[slot] = (uintptr_t)rels[slot];
+
+        teardown_caller_rc = col_worker_session_destroy(worker);
+        teardown_caller_attempted = true;
+
+        bool held_alias_still_registered = false;
+        bool slots_stable = worker->rels == rels && worker->nrels == nrels;
+        if (slots_stable) {
+            for (uint32_t slot = 0; slot < nrels; slot++) {
+                uintptr_t after = (uintptr_t)worker->rels[slot];
+                uintptr_t before = slot_addresses[slot];
+                if ((before == 0 && after != 0)
+                    || (before != 0 && after != 0 && after != before))
+                    slots_stable = false;
+                if (slot == i && after == held_alias_address)
+                    held_alias_still_registered = true;
+            }
+        }
+        teardown_reader_release_safe = teardown_caller_rc != 0
+            && worker->rels == rels && worker->nrels == nrels
+            && worker->rels[i] == rel;
+        teardown_caller_state_ok = teardown_caller_rc == EBUSY
+            && coord->tdd_workers == cohort_workers
+            && coord->tdd_workers_count == 8
+            && worker == &cohort_workers[0]
+            && worker->worker_id == worker_id
+            && worker->coordinator == coord
+            && worker->teardown_started
+            && slots_stable && held_alias_still_registered;
+        free(slot_addresses);
         return;
     }
 }
@@ -436,6 +490,12 @@ run_teardown_refusal_gate(void)
     memset(&teardown_reader, 0, sizeof(teardown_reader));
     teardown_hold_armed = true;
     teardown_hold_fired = false;
+    teardown_reader_release_safe = false;
+    teardown_caller_attempted = false;
+    teardown_caller_alias_selected = false;
+    teardown_caller_state_ok = false;
+    teardown_caller_rc = 0;
+    teardown_caller_cohort_count = 0;
     rc = snapshot_oracle(session, 5050, true);
     /* The hook must have run on a populated cohort, or the assertions below
      * would hold for want of anything to refuse. */
@@ -465,12 +525,34 @@ run_teardown_refusal_gate(void)
          * been freed with it, so drop the reader without touching it rather
          * than turning a clean failure into a use-after-free. */
         memset(&teardown_reader, 0, sizeof(teardown_reader));
+        teardown_reader_release_safe = false;
+        rc = EIO;
+        goto cleanup;
+    }
+    if (!teardown_caller_attempted || !teardown_caller_alias_selected
+        || !teardown_caller_state_ok || teardown_caller_rc != EBUSY
+        || teardown_caller_cohort_count != 8
+        || columnar->tdd_workers_count != 8) {
         rc = EIO;
         goto cleanup;
     }
 
     teardown_hold_armed = false;
-    if (col_rel_source_reader_release(&teardown_reader) != 0) {
+    if (!teardown_reader_release_safe) {
+        rc = EIO;
+        goto cleanup;
+    }
+    int reader_release_rc = col_rel_source_reader_release(&teardown_reader);
+    teardown_reader_release_safe = false;
+    if (reader_release_rc != 0) {
+        rc = EIO;
+        goto cleanup;
+    }
+    wl_col_session_t *caller_retry_worker = &columnar->tdd_workers[0];
+    int caller_retry_rc = col_worker_session_destroy(caller_retry_worker);
+    if (caller_retry_rc != 0 || caller_retry_worker->coordinator != NULL
+        || caller_retry_worker->rels != NULL
+        || caller_retry_worker->nrels != 0) {
         rc = EIO;
         goto cleanup;
     }
@@ -481,8 +563,12 @@ cleanup:
     teardown_hold_armed = false;
     /* Release before destroy: col_session_destroy aborts when a worker
      * teardown refuses. */
-    if (teardown_reader.owner)
-        (void)col_rel_source_reader_release(&teardown_reader);
+    if (teardown_reader.owner) {
+        if (teardown_reader_release_safe)
+            (void)col_rel_source_reader_release(&teardown_reader);
+        else
+            memset(&teardown_reader, 0, sizeof(teardown_reader));
+    }
     if (session)
         wl_session_destroy(session);
     if (plan)
