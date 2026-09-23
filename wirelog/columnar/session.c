@@ -4935,6 +4935,12 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
 /* Vtable Singleton                                                          */
 /* ======================================================================== */
 
+static bool
+col_session_budget_denied_query(wl_session_t *session)
+{
+    return wl_columnar_session_budget_denied(COL_SESSION(session));
+}
+
 static const wl_compute_backend_t col_backend = {
     .name = "columnar",
     .session_create = col_session_create,
@@ -4947,6 +4953,7 @@ static const wl_compute_backend_t col_backend = {
     .session_snapshot = col_session_snapshot,
     .session_memory_governor = col_session_memory_governor,
     .session_create_with_options = col_session_create_with_options,
+    .session_budget_denied = col_session_budget_denied_query,
 };
 
 const wl_compute_backend_t *
