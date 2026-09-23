@@ -80,10 +80,28 @@ wl_columnar_eval_serial_canonicalize_aggregate_locked(col_rel_t *rel,
         map_cap <<= 1;
     if ((uint64_t)map_cap < desired)
         return ENOMEM;
+    uint64_t group_bytes = 0;
+    if (!wl_columnar_memory_size_mul(map_cap, sizeof(col_group_slot_t),
+        &group_bytes))
+        return EOVERFLOW;
+    wl_columnar_memory_reservation_t group_reservation;
+    wl_columnar_memory_reservation_init(&group_reservation);
+    if (rel->memory_governor) {
+        wl_columnar_memory_admission_status_t status
+            = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(rel->memory_governor),
+                group_bytes, &group_reservation);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : ENOMEM;
+    }
     col_group_slot_t *groups = (col_group_slot_t *)calloc(map_cap,
             sizeof(*groups));
-    if (!groups)
+    if (!groups) {
+        wl_columnar_memory_release(&group_reservation);
         return ENOMEM;
+    }
     uint32_t map_mask = map_cap - 1;
     for (uint32_t row = 0; row < rel->nrows; row++) {
         uint32_t found = UINT32_MAX;
@@ -140,6 +158,7 @@ wl_columnar_eval_serial_canonicalize_aggregate_locked(col_rel_t *rel,
     }
 
     free(groups);
+    wl_columnar_memory_release(&group_reservation);
 
     return 0;
 }
@@ -457,9 +476,32 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
      * relation by name, giving delta (left) x full (right) join semantics.
      */
     uint32_t nrels = sp->relation_count;
+    uint64_t delta_scratch_bytes = 0;
+    uint64_t bytes = 0;
+    if (!wl_columnar_memory_size_mul(nrels, sizeof(col_rel_t *), &bytes)
+        || !wl_columnar_memory_size_add(delta_scratch_bytes, bytes,
+        &delta_scratch_bytes)
+        || !wl_columnar_memory_size_mul(nrels, sizeof(uint32_t), &bytes)
+        || !wl_columnar_memory_size_add(delta_scratch_bytes, bytes,
+        &delta_scratch_bytes))
+        return EOVERFLOW;
+    wl_columnar_memory_reservation_t delta_reservation;
+    wl_columnar_memory_reservation_init(&delta_reservation);
+    if (sess->memory_governor) {
+        wl_columnar_memory_admission_status_t status
+            = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(sess->memory_governor),
+                delta_scratch_bytes, &delta_reservation);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : ENOMEM;
+    }
     col_rel_t **delta_rels = (col_rel_t **)calloc(nrels, sizeof(col_rel_t *));
-    if (!delta_rels)
+    if (!delta_rels) {
+        wl_columnar_memory_release(&delta_reservation);
         return ENOMEM;
+    }
 
     /* Allocate snap once before the iteration loop (Issue #367): hoisting
      * the allocation out of the outer loop eliminates 2 malloc/free calls
@@ -467,6 +509,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t *snap = (uint32_t *)malloc(nrels * sizeof(uint32_t));
     if (!snap) {
         free((void *)delta_rels);
+        wl_columnar_memory_release(&delta_reservation);
         return ENOMEM;
     }
 
@@ -487,6 +530,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             if (sort_rc != 0) {
                 free((void *)delta_rels);
                 free(snap);
+                wl_columnar_memory_release(&delta_reservation);
                 return sort_rc;
             }
         }
@@ -967,6 +1011,7 @@ stride_error:
                     assert(delta_rels[ri] == NULL);
                 free(snap);
                 free((void *)delta_rels);
+                wl_columnar_memory_release(&delta_reservation);
                 return outer_rc;
             }
             for (uint32_t ri = 0; ri < nrels; ri++) {
@@ -982,6 +1027,7 @@ stride_error:
             }
             free(snap);
             free((void *)delta_rels);
+            wl_columnar_memory_release(&delta_reservation);
             return outer_rc;
         }
 
@@ -1048,6 +1094,7 @@ stride_error:
         }
         free(snap);
         free((void *)delta_rels);
+        wl_columnar_memory_release(&delta_reservation);
         return agg_rc;
     }
 
@@ -1109,6 +1156,7 @@ stride_error:
     }
     free(snap);
     free((void *)delta_rels);
+    wl_columnar_memory_release(&delta_reservation);
     col_session_mem_sample(sess); /* Issue #1380 */
     delta_pool_reset(sess->delta_pool);
     sess->rotation_ops->rotate_eval_arena(sess);
