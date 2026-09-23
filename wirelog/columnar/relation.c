@@ -1002,6 +1002,8 @@ wl_columnar_relation_accounting_complete(const col_rel_t *r,
     uint64_t descriptor_bytes = 0;
     uint64_t metadata_bytes = 0;
     uint64_t retained_bytes = 0;
+    uint64_t timestamp_bytes = 0;
+    uint64_t retained_columns;
     uint64_t shared_table_bytes = 0;
     uint64_t named_bytes;
     uint32_t owned_columns;
@@ -1027,8 +1029,17 @@ wl_columnar_relation_accounting_complete(const col_rel_t *r,
                != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED;
     if (r->memory_governor != governor
         || !col_rel_current_metadata_bytes(r, &metadata_bytes)
-        || !col_rel_retained_bytes(owned_columns, r->capacity,
-        r->timestamps != NULL, &retained_bytes))
+        || (!r->timestamps && r->timestamp_capacity != 0)
+        || (r->timestamps && r->timestamp_capacity == 0)
+        || !wl_columnar_memory_size_mul(owned_columns, r->capacity,
+        &retained_columns)
+        || !wl_columnar_memory_size_mul(retained_columns,
+        sizeof(int64_t), &retained_bytes)
+        || (r->timestamps
+        && (!wl_columnar_memory_size_mul(r->timestamp_capacity,
+        sizeof(col_delta_timestamp_t), &timestamp_bytes)
+        || !wl_columnar_memory_size_add(retained_bytes,
+        timestamp_bytes, &retained_bytes))))
         return false;
 
     raw_governor = wl_columnar_memory_governor_ref_get(governor);

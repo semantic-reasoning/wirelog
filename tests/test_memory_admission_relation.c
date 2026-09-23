@@ -299,6 +299,13 @@ test_governed_logical_copy(void)
                 wl_columnar_memory_governor_ref_get(ref))
             == expected + charged_fixed_bytes(copy),
             "logical copy carries exact payload reservation");
+        CHECK(wl_columnar_relation_accounting_complete(copy, ref),
+            "complete accounting uses physical timestamp capacity");
+        uint64_t retained_token_bytes = copy->retained_reservation.bytes;
+        copy->retained_reservation.bytes--;
+        CHECK(!wl_columnar_relation_accounting_complete(copy, ref),
+            "complete accounting rejects a short timestamp reservation");
+        copy->retained_reservation.bytes = retained_token_bytes;
         col_rel_destroy(copy);
         copy = NULL;
     }

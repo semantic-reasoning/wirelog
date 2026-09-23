@@ -576,11 +576,11 @@ test_join_arr_primary_probe_writer_retry(void)
 }
 
 /* ================================================================
- * Test 11: Primary full-right JOIN propagates arrangement admission denial
+ * Test 11: Primary full-right JOIN propagates arrangement probe errors
  *
  * ENOENT is the only primary probe miss that may use the old ephemeral
- * fallback.  Once the probe has admitted the exact source, allocation failure
- * during cold build or stale rebuild must remain visible to the caller.
+ * fallback. A synthetic non-ENOENT probe error must remain visible to the
+ * caller instead of being treated as a cache miss.
  * ================================================================ */
 static void
 test_join_arr_primary_probe_enomem_propagates(void)
