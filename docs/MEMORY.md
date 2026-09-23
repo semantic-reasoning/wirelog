@@ -317,6 +317,14 @@ allocation classes.
 
 ## #1418 Allocation Coverage Matrix
 
+The session relation-name hash owns a governor reservation for its bucket and
+chain arrays. Rebuilds admit both replacement arrays while the old image is
+still live; denied optional rebuilds leave relation lookup on its linear
+fallback. Transactional registry images hold their own hash reservation until
+discard or publication, when ownership moves to the session. Relation pointer
+arrays and temporary image validation copies remain separate allocation
+classes from these hash arrays.
+
 The following matrix is the boundary for allocations created outside a
 managed columnar session. “Covered” means that the owner retains a governor
 reservation and publishes growth only after both admission and allocation

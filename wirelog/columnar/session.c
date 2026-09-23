@@ -103,7 +103,7 @@ session_compound_max_epochs_from_env(void)
 static int
 session_hash_result_or_fallback(wl_col_session_t *sess, int rc)
 {
-    if (rc == ENOMEM) {
+    if (rc == ENOMEM || rc == ENOSPC) {
         session_rel_free_hash(sess);
         return 0;
     }
@@ -1970,6 +1970,7 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
         return ENOMEM;
     }
     sess->memory_governor = memory_governor;
+    wl_columnar_memory_reservation_init(&sess->rel_hash_reservation);
 
     sess->frontier_ops = &col_frontier_epoch_ops;
 
@@ -2469,6 +2470,7 @@ oom:
     (void)session_destroy_relation_array_pass(sess->rels, sess->nrels, true);
     (void)session_destroy_relation_array_pass(sess->rels, sess->nrels, false);
     free((void *)sess->rels);
+    session_rel_free_hash(sess);
     wl_workqueue_destroy(sess->wq);       /* NULL-safe */
     delta_pool_destroy(sess->delta_pool); /* NULL-safe */
     wl_arena_free(sess->eval_arena);      /* NULL-safe; releases admission */
@@ -2860,6 +2862,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->rel_hash_next = NULL;
     out_worker->rel_hash_nbuckets = 0;
     out_worker->rel_hash_chain_cap = 0;
+    wl_columnar_memory_reservation_init(&out_worker->rel_hash_reservation);
     out_worker->source_leases = NULL;
     out_worker->deferred_relations = NULL;
     out_worker->deferred_relation_count = 0;
