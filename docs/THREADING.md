@@ -318,11 +318,12 @@ only used to exercise allocator exhaustion.
 | `join.c:col_join_parallel_cross` | `write_error` | `atomic_load_explicit` | `relaxed` | Coordinator observes worker write status after the workqueue barrier |
 | `join.c:wl_columnar_semijoin_op` | `write_error` | `atomic_load_explicit` | `relaxed` | Coordinator observes typed semijoin fill status after the workqueue barrier |
 
-### 5.5 `wirelog/columnar/kfusion.c` — K-fusion shared counter (1 row)
+### 5.5 `wirelog/columnar/kfusion.c` — K-fusion shared counter and reservation (2 rows)
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `kfusion.c:col_op_k_fusion_dispatch` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Issue #959: zeroed before branch tasks are submitted, so the happens-before edge comes from task submission itself -- same argument as `eval.c:399`, which resets the TDD counter before `wl_thread_create()` |
+| `kfusion.c:col_op_k_fusion_dispatch` | `scratch_reservation.state` | `atomic_load_explicit` | `acquire` | Inspect reservation ownership state before moving the address-bound token into the cohort; acquire pairs with reservation-state publication |
+| `kfusion.c:col_op_k_fusion_dispatch#2` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Issue #959: zeroed before branch tasks are submitted, so the happens-before edge comes from task submission itself -- same argument as `eval.c:399`, which resets the TDD counter before `wl_thread_create()` |
 
 The `stop` flag's `memory_order_relaxed` store is deliberate:
 cancellation is **cooperative**, not preemptive. A worker may observe
