@@ -107,6 +107,32 @@ col_op_consolidate_size_add(size_t left, size_t right, size_t *out)
 }
 
 static int
+col_rel_compact_scratch_reserve(const col_rel_t *rel, uint64_t bytes,
+    wl_columnar_memory_reservation_t *reservation)
+{
+    wl_columnar_memory_admission_status_t status;
+    if (!reservation)
+        return EINVAL;
+    wl_columnar_memory_reservation_init(reservation);
+    if (!rel || !rel->memory_governor || bytes == 0)
+        return 0;
+    status = wl_columnar_memory_reserve_checked(
+        wl_columnar_memory_governor_ref_get(rel->memory_governor), bytes,
+        reservation);
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+        || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+        return 0;
+    return status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : ENOMEM;
+}
+
+static void
+col_rel_compact_scratch_release(wl_columnar_memory_reservation_t *reservation)
+{
+    if (reservation)
+        wl_columnar_memory_release(reservation);
+}
+
+static int
 col_op_concat_cleanup(eval_stack_t *stack, eval_entry_t *a,
     eval_entry_t *b, int primary_rc)
 {
@@ -1572,6 +1598,19 @@ col_rel_compact_runs(col_rel_t *rel)
     uint32_t nc = rel->ncols;
     uint32_t nr = rel->nrows;
     uint32_t K = rel->run_count;
+    uint64_t merged_bytes = 0;
+    wl_columnar_memory_reservation_t reservation;
+
+    if (!wl_columnar_memory_size_mul(nr,
+        (uint64_t)nc * sizeof(int64_t),
+        &merged_bytes))
+        return EOVERFLOW;
+    if (merged_bytes > SIZE_MAX)
+        return EOVERFLOW;
+    int admission_rc = col_rel_compact_scratch_reserve(rel, merged_bytes,
+            &reservation);
+    if (admission_rc != 0)
+        return admission_rc;
 
     /* Build segment boundaries from run_ends */
     uint32_t seg_bounds[COL_MAX_RUNS + 1];
@@ -1580,9 +1619,11 @@ col_rel_compact_runs(col_rel_t *rel)
         seg_bounds[i + 1] = rel->run_ends[i];
 
     /* Allocate merge output buffer (flat row-major) */
-    int64_t *merged = (int64_t *)malloc((size_t)nr * nc * sizeof(int64_t));
-    if (!merged)
+    int64_t *merged = (int64_t *)malloc((size_t)merged_bytes);
+    if (!merged) {
+        col_rel_compact_scratch_release(&reservation);
         return ENOMEM;
+    }
 
     /* Min-heap entries (stack-allocated, K <= COL_MAX_RUNS = 8).
      *
@@ -1683,6 +1724,7 @@ col_rel_compact_runs(col_rel_t *rel)
     for (uint32_t r = 0; r < out; r++)
         col_rel_row_copy_in_raw(rel, r, merged + (size_t)r * nc);
     free(merged);
+    col_rel_compact_scratch_release(&reservation);
 
     rel->nrows = out;
     wl_columnar_relation_touch_view(rel);
