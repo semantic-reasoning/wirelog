@@ -6542,6 +6542,16 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         || !wl_columnar_memory_size_mul(worker_bytes,
         sizeof(col_rel_t *), &worker_bytes)
         || !wl_columnar_memory_size_add(worker_scratch_bytes,
+        worker_bytes, &worker_scratch_bytes)))
+        || (bdx_mode
+        && (!wl_columnar_memory_size_mul(W, nrels, &worker_bytes)
+        || !wl_columnar_memory_size_mul(worker_bytes,
+        sizeof(uint32_t) + sizeof(wl_delta_msg_t), &worker_bytes)
+        || !wl_columnar_memory_size_add(worker_scratch_bytes,
+        worker_bytes, &worker_scratch_bytes)
+        || !wl_columnar_memory_size_mul(W, sizeof(col_rel_t *),
+        &worker_bytes)
+        || !wl_columnar_memory_size_add(worker_scratch_bytes,
         worker_bytes, &worker_scratch_bytes)))) {
         rc = EOVERFLOW;
         goto done;
