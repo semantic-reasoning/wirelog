@@ -5035,7 +5035,7 @@ test_serial_cleanup_admission_and_failures(bool recursive, uint32_t workers)
         atomic_store_explicit(&budget->usable_bytes, saved_limit,
             memory_order_relaxed);
         serial_deny_copy = false;
-        SERIAL_FAIL_CHECK(rc == ENOMEM
+        SERIAL_FAIL_CHECK(rc == (mode == 0 ? ENOMEM : ENOSPC)
             && !fail_next_alloc && target->nrows == 0
             && target->view_generation == target_generation
             && wl_columnar_memory_reserved(budget) == reserved_before
@@ -12286,6 +12286,9 @@ test_filter_governed_admission(unsigned route, bool timestamped,
     for (unsigned attempt = 0; attempt < 2; attempt++) {
         FILTER_CHECK(wl_columnar_filter_op(&op, &stack, &sess) == EBUSY,
             "held input cleanup must refuse");
+        if (phase == 0)
+            FILTER_CHECK(sess.memory_budget_denied,
+                "FILTER constructor denial remains observable");
         FILTER_CHECK(stack.top == 1 && stack.items[0].rel == input
             && stack.items[0].owned && stack.items[0].seg_boundaries == segments
             && input->view_generation == generation,
@@ -12439,7 +12442,8 @@ test_serial_borrowed_clone_admission(uint32_t workers, unsigned denial,
             int rc = wl_columnar_eval_serial_framed_relation(&output, sess,
                     false);
             idb_restore_budget(sess);
-            CLONE_CHECK(rc == ENOMEM && !session_find_rel(sess, "output")
+            CLONE_CHECK(rc == ENOSPC && sess->memory_budget_denied
+                && !session_find_rel(sess, "output")
                 && input->columns == columns &&
                 input->view_generation == generation
                 && input->nrows == count && !sess->cleanup_active

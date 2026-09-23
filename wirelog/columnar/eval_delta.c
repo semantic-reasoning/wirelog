@@ -1456,10 +1456,12 @@ wl_columnar_eval_delta_consolidate(col_rel_t *target, wl_col_session_t *sess)
     }
     if (target->nrows <= 1)
         goto done;
-    col_rel_t *candidate = wl_columnar_relation_new_like_governed(
-        "$consol", target, sess->memory_governor);
-    if (!candidate) {
-        rc = ENOMEM;
+    col_rel_t *candidate = NULL;
+    rc = wl_columnar_relation_new_like_governed_checked("$consol", target,
+            sess->memory_governor, &candidate);
+    if (rc != 0) {
+        if (rc == ENOSPC)
+            sess->memory_budget_denied = true;
         goto done;
     }
     result->rel = candidate;
