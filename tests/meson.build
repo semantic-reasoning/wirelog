@@ -4184,7 +4184,7 @@ test('col_rel_deep_copy', test_col_rel_deep_copy_exe, timeout: 120)
 # Relation identity/generation contract and mutation instrumentation (Issue #1441)
 test_relation_generations_exe = executable(
   'test_relation_generations',
-  files('test_relation_generations.c'),
+  files('test_relation_generations.c', '../wirelog/evaluation_control.c'),
   backend_src,
   intern_src,
   arena_src,
@@ -4201,7 +4201,7 @@ test('relation_generations', test_relation_generations_exe)
 if host_machine.system() == 'linux'
   test_relation_generations_oom_exe = executable(
     'test_relation_generations_oom',
-    files('test_relation_generations.c'),
+    files('test_relation_generations.c', '../wirelog/evaluation_control.c'),
     backend_src,
     intern_src,
     arena_src,
