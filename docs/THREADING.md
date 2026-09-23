@@ -573,7 +573,7 @@ gate -- which reports EINVAL after a commit that in fact succeeded.
 | `relation.c:col_rel_commit_replacement_locked#5` | `dst->descriptor_access.state` | `atomic_store_explicit` | release | Republish the captured peer-reader gate so a descriptor reader taken before the swap is still counted when the writer lease is released |
 
 ### 5.16 `wirelog/columnar/memory_governor.c` and `relation.c` — atomic
-replacement admission and compaction (19 rows)
+replacement admission and compaction (20 rows)
 
 Replacement admission temporarily accounts for the new footprint while the
 old reservation remains committed. The overlap CAS is the admission
@@ -598,6 +598,7 @@ the replacement transaction never releases an uncommitted token.
 | `relation.c:col_rel_compact_impl#2` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Recheck a previously admitted replacement token before retrying its publication after an earlier physical-growth failure |
 | `relation.c:col_rel_compact_many` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Validate each retained reservation before compacting a relation |
 | `relation.c:col_rel_compact_many#2` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Revalidate the reservation before the second compaction path |
+| `relation.c:col_rel_prepare_replacement_impl` | `dst->aux_reservation.state` | `atomic_load_explicit` | acquire | Verify that the destination's auxiliary allocation token is committed before staging replacement and transferring its ownership |
 | `relation.c:col_rel_reservation_rollback` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Read the reservation state before deciding whether rollback still owns an admitted token |
 | `relation.c:wl_columnar_relation_retirement_reservation_valid` | `retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Confirm the retained reservation is still owned by this relation before retirement |
 | `relation.c:wl_columnar_relation_retirement_reservation_valid#2` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Read the token state before validating committed or replacing reservation ownership |
