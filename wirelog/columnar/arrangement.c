@@ -2748,7 +2748,6 @@ col_session_pin_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
     const col_rel_t *source_rel, const uint32_t *key_cols, uint32_t key_count,
     col_diff_arrangement_pin_t *pin)
 {
-    wl_columnar_source_access_reader_t reader = { 0 };
     col_diff_arr_entry_t *entry = NULL;
     col_diff_arrangement_t *arr;
     col_relation_snapshot_t snapshot;
@@ -2759,12 +2758,12 @@ col_session_pin_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
     if (!col_session_has_exact_relation(cs, source_rel, rel_name))
         return EINVAL;
     memset(pin, 0, sizeof(*pin));
-    if (col_rel_source_reader_acquire(source_rel, &reader) != 0)
+    if (col_rel_source_reader_acquire(source_rel, &pin->source_reader) != 0)
         return EBUSY;
     arr = col_session_get_diff_arrangement(cs, rel_name, source_rel,
             key_cols, key_count);
     if (!arr) {
-        (void)col_rel_source_reader_release(&reader);
+        (void)col_rel_source_reader_release(&pin->source_reader);
         return EBUSY;
     }
     for (uint32_t i = 0; i < cs->diff_arr_count; i++) {
@@ -2775,7 +2774,7 @@ col_session_pin_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
         }
     }
     if (!entry || entry->pin_count == UINT32_MAX) {
-        (void)col_rel_source_reader_release(&reader);
+        (void)col_rel_source_reader_release(&pin->source_reader);
         return entry ? EOVERFLOW : EINVAL;
     }
     snapshot = wl_columnar_relation_snapshot(source_rel);
@@ -2783,7 +2782,7 @@ col_session_pin_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
         arr->source_snapshot = snapshot;
     if (!wl_columnar_relation_snapshot_equal(arr->source_snapshot, snapshot)
         || entry->generation == UINT64_MAX) {
-        (void)col_rel_source_reader_release(&reader);
+        (void)col_rel_source_reader_release(&pin->source_reader);
         return EBUSY;
     }
     entry->pin_count++;
@@ -2792,7 +2791,6 @@ col_session_pin_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
     pin->session = cs;
     pin->source = source_rel;
     pin->source_snapshot = snapshot;
-    pin->source_reader = reader;
     pin->generation = entry->generation;
     pin->active = true;
     return 0;

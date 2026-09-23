@@ -1650,6 +1650,13 @@ test_diff_arrangement_pin_lifetime(void)
     col_diff_arrangement_pin_release(&pin);
     ASSERT_TRUE(!pin.active && pin.entry == NULL,
         "pin release clears the handle");
+    ASSERT_TRUE(atomic_load_explicit(&source->source_access.state,
+        memory_order_relaxed) == 0
+        && atomic_load_explicit(&source->descriptor_access.state,
+        memory_order_relaxed) == 0,
+        "pin release clears both source and descriptor readers");
+    ASSERT_TRUE(col_rel_append_row(source, (int64_t[]){ 2 }) == 0,
+        "source can be appended after pin release");
     ASSERT_TRUE(col_session_free_diff_arrangements(s) == 0,
         "teardown succeeds after release");
 
@@ -1743,6 +1750,13 @@ test_diff_join_batch_signed_timestamps(void)
     }
 
     wl_columnar_continuation_destroy(cont);
+    ASSERT_TRUE(atomic_load_explicit(&right->source_access.state,
+        memory_order_relaxed) == 0
+        && atomic_load_explicit(&right->descriptor_access.state,
+        memory_order_relaxed) == 0,
+        "producer destruction releases both right-side readers");
+    ASSERT_TRUE(col_rel_append_row(right, (int64_t[]){ 2, 200 }) == 0,
+        "right relation can be appended after producer destruction");
     col_rel_destroy(out);
     col_rel_destroy(left);
     destroy_mock_session(s);
