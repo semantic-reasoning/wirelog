@@ -3040,6 +3040,9 @@ static int bdx_seed_test_fail_worker = -1;
 static bool bdx_seed_test_fail_sort;
 #endif
 
+static void wl_columnar_eval_tdd_compact_sorted_candidate(
+    col_rel_t *candidate);
+
 static int
 tdd_seed_bdx_coordinator_idb(col_rel_t *cidb, col_rel_t *const *worker_idbs,
     uint32_t worker_count)
@@ -3103,29 +3106,7 @@ tdd_seed_bdx_coordinator_idb(col_rel_t *cidb, col_rel_t *const *worker_idbs,
             if (rc != 0)
                 goto cleanup;
         }
-        uint32_t out = 1;
-        for (uint32_t row = 1; row < candidate->nrows; row++) {
-            bool duplicate = true;
-            for (uint32_t col = 0; col < candidate->ncols; col++) {
-                if (candidate->columns[col][row - 1]
-                    != candidate->columns[col][row]) {
-                    duplicate = false;
-                    break;
-                }
-            }
-            if (!duplicate) {
-                if (out != row)
-                    col_columns_copy_row(candidate->columns, out,
-                        (int64_t *const *)candidate->columns, row,
-                        candidate->ncols);
-                if (candidate->timestamps)
-                    candidate->timestamps[out] = candidate->timestamps[row];
-                out++;
-            }
-        }
-        candidate->nrows = out;
-        candidate->sorted_nrows = out;
-        wl_columnar_relation_touch_view(candidate);
+        wl_columnar_eval_tdd_compact_sorted_candidate(candidate);
     }
 
     memset(&replacement, 0, sizeof(replacement));
@@ -3147,6 +3128,38 @@ static int tdd_merge_test_fail_worker = -1;
 static bool tdd_merge_test_fail_sort;
 static bool tdd_merge_test_fail_overflow;
 #endif
+
+/* Compact adjacent duplicate rows in a sorted private candidate. Keep this
+ * shared by BDX seeding and worker-result merge so both paths preserve the
+ * same timestamp survivor and sorted-prefix bookkeeping. */
+static void
+wl_columnar_eval_tdd_compact_sorted_candidate(col_rel_t *candidate)
+{
+    uint32_t out = 1;
+
+    for (uint32_t row = 1; row < candidate->nrows; row++) {
+        bool duplicate = true;
+        for (uint32_t col = 0; col < candidate->ncols; col++) {
+            if (candidate->columns[col][row - 1]
+                != candidate->columns[col][row]) {
+                duplicate = false;
+                break;
+            }
+        }
+        if (!duplicate) {
+            if (out != row)
+                col_columns_copy_row(candidate->columns, out,
+                    (int64_t *const *)candidate->columns, row,
+                    candidate->ncols);
+            if (candidate->timestamps)
+                candidate->timestamps[out] = candidate->timestamps[row];
+            out++;
+        }
+    }
+    candidate->nrows = out;
+    candidate->sorted_nrows = out;
+    wl_columnar_relation_touch_view(candidate);
+}
 
 /* Return the number of logical entries in an inline compound arity map.
  * The map is valid only when its widths cover exactly the physical schema. */
@@ -3339,29 +3352,7 @@ tdd_merge_relation_results(col_rel_t **target_io, const char *rel_name,
                 goto cleanup;
         }
 
-        uint32_t out = 1;
-        for (uint32_t row = 1; row < candidate->nrows; row++) {
-            bool duplicate = true;
-            for (uint32_t col = 0; col < candidate->ncols; col++) {
-                if (candidate->columns[col][row - 1]
-                    != candidate->columns[col][row]) {
-                    duplicate = false;
-                    break;
-                }
-            }
-            if (!duplicate) {
-                if (out != row)
-                    col_columns_copy_row(candidate->columns, out,
-                        (int64_t *const *)candidate->columns, row,
-                        candidate->ncols);
-                if (candidate->timestamps)
-                    candidate->timestamps[out] = candidate->timestamps[row];
-                out++;
-            }
-        }
-        candidate->nrows = out;
-        candidate->sorted_nrows = out;
-        wl_columnar_relation_touch_view(candidate);
+        wl_columnar_eval_tdd_compact_sorted_candidate(candidate);
     }
 
     if (!target) {
