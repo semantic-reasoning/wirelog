@@ -26,6 +26,18 @@
 #define TDD_OWNER_FALLBACK_MIN_ITER 31u
 #define TDD_OWNER_FALLBACK_DELTA_ROWS 512u
 
+static int
+wl_columnar_eval_new_like_checked(wl_col_session_t *session,
+    const char *name, const col_rel_t *source,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out)
+{
+    int rc = wl_columnar_relation_new_like_governed_checked(name, source,
+            governor, out);
+    if (rc == ENOSPC && session)
+        session->memory_budget_denied = true;
+    return rc;
+}
+
 #ifdef WL_SESSION_TEST_HOOKS
 void (*wl_columnar_eval_test_before_tdd_queue_admission)(
     wl_col_session_t *coord, uint64_t bytes);
@@ -590,11 +602,10 @@ nonrec_rule_worker_fn(void *arg)
         wl_columnar_eval_test_nonrec_worker(worker, stack, result, &ctx->rc);
 #endif
     if (ctx->rc == 0 && result->rel) {
-        col_rel_t *copy = wl_columnar_relation_new_like_governed(ctx->rp->name,
-                result->rel, worker->memory_governor);
-        if (!copy) {
-            ctx->rc = ENOMEM;
-        } else {
+        col_rel_t *copy = NULL;
+        ctx->rc = wl_columnar_eval_new_like_checked(worker, ctx->rp->name,
+                result->rel, worker->memory_governor, &copy);
+        if (ctx->rc == 0) {
             /* The coordinator admitted and initialized this disjoint slot
              * before dispatch. It observes it only after the worker barrier. */
             ctx->stage->rel = copy;
@@ -670,7 +681,8 @@ nonrec_parallel_min_rows_per_worker(void)
 }
 
 static int
-nonrec_copy_relation_slice(const col_rel_t *src, const char *name,
+nonrec_copy_relation_slice(wl_col_session_t *coord, const col_rel_t *src,
+    const char *name,
     uint32_t begin, uint32_t end, wl_columnar_memory_governor_ref_t *governor,
     col_rel_t **out)
 {
@@ -680,11 +692,10 @@ nonrec_copy_relation_slice(const col_rel_t *src, const char *name,
     int rc = col_rel_source_reader_acquire(src, &reader);
     if (rc != 0)
         return rc;
-    col_rel_t *dst = wl_columnar_relation_new_like_governed(name, src,
-            governor);
+    col_rel_t *dst = NULL;
+    rc = wl_columnar_eval_new_like_checked(coord, name, src, governor, &dst);
     int64_t *row = NULL;
-    if (!dst) {
-        rc = ENOMEM;
+    if (rc != 0) {
         goto done;
     }
     row = malloc(sizeof(int64_t) * (src->ncols ? src->ncols : 1));
@@ -933,7 +944,8 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
             if (end > driver->nrows)
                 end = driver->nrows;
             col_rel_t *slice = NULL;
-            rc = nonrec_copy_relation_slice(driver, slice_name, begin, end,
+            rc = nonrec_copy_relation_slice(coord, driver, slice_name,
+                    begin, end,
                     coord->memory_governor, &slice);
             if (rc == 0)
                 worker_rels[w][rels_built++] = slice; /* NOLINT(clang-analyzer-security.ArrayBound) */
@@ -974,6 +986,8 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
         for (uint32_t w = 0; w < W; w++) {
             record_worker_expr_status(coord, ctxs[w].worker_sess,
                 ctxs[w].rc);
+            if (ctxs[w].rc == ENOSPC)
+                coord->memory_budget_denied = true;
             if (ctxs[w].rc != 0 && rc == 0)
                 rc = ctxs[w].rc;
         }
@@ -1002,11 +1016,9 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
                 prototype = stages->items[w].rel;
         rc = WL_COLUMNAR_EVAL_NONREC_BOUNDARY(coord, 3, 0, NULL);
         if (rc == 0 && prototype) {
-            final->rel = wl_columnar_relation_new_like_governed(rp->name,
-                    prototype, coord->memory_governor);
+            rc = wl_columnar_eval_new_like_checked(coord, rp->name,
+                    prototype, coord->memory_governor, &final->rel);
             final->owned = final->rel != NULL;
-            if (!final->rel)
-                rc = ENOMEM;
         } else if (rc == 0) {
             rc = col_rel_alloc(&final->rel, rp->name);
             final->owned = final->rel != NULL;
@@ -1191,11 +1203,9 @@ tdd_init_workers(wl_col_session_t *coord, uint32_t W)
             /* Empty: give each worker an empty relation */
             for (uint32_t w = 0; w < W && rc == 0; w++) {
                 WL_COLUMNAR_EVAL_INIT_BOUNDARY(0, 0, w, coord);
-                worker_parts[w][parts_built]
-                    = wl_columnar_relation_new_like_governed(name, rel,
-                        coord->memory_governor);
-                if (!worker_parts[w][parts_built])
-                    rc = ENOMEM;
+                rc = wl_columnar_eval_new_like_checked(coord, name, rel,
+                        coord->memory_governor,
+                        &worker_parts[w][parts_built]);
             }
         } else {
             col_rel_t **parts = (col_rel_t **)calloc(W, sizeof(col_rel_t *));
@@ -1341,10 +1351,10 @@ tdd_replicate_workers(wl_col_session_t *coord, uint32_t W)
 
         for (uint32_t w = 0; w < W && rc == 0; w++) {
             WL_COLUMNAR_EVAL_INIT_BOUNDARY(1, 0, w, coord);
-            col_rel_t *copy = wl_columnar_relation_new_like_governed(name,
-                    rel, coord->memory_governor);
-            if (!copy) {
-                rc = ENOMEM;
+            col_rel_t *copy = NULL;
+            rc = wl_columnar_eval_new_like_checked(coord, name, rel,
+                    coord->memory_governor, &copy);
+            if (rc != 0) {
                 break;
             }
             if (rel->nrows > 0) {
@@ -1511,11 +1521,12 @@ tdd_refresh_global_read_relation(const wl_plan_stratum_t *sp,
             continue;
         if (src->ncols > 0) {
             if (dst->ncols != src->ncols) {
-                col_rel_t *view = wl_columnar_relation_new_like_governed(
-                    src->name, src, coord->memory_governor);
-                if (!view)
-                    return ENOMEM;
-                int rc = col_rel_install_shared_view(view, src);
+                col_rel_t *view = NULL;
+                int rc = wl_columnar_eval_new_like_checked(coord,
+                        src->name, src, coord->memory_governor, &view);
+                if (rc != 0)
+                    return rc;
+                rc = col_rel_install_shared_view(view, src);
                 bool shared = rc == 0;
                 if (!shared) {
                     rc = tdd_shared_view_deep_copy_fallback(NULL, view,
@@ -1774,10 +1785,9 @@ wl_columnar_eval_retire_worker_relations(const wl_plan_stratum_t *sp,
             if (rc != 0)
                 goto cleanup;
             entry->alias = owner != prior;
-            entry->empty = wl_columnar_relation_new_like_governed(name, prior,
-                    coord->memory_governor);
-            if (!entry->empty) {
-                rc = ENOMEM;
+            rc = wl_columnar_eval_new_like_checked(coord, name, prior,
+                    coord->memory_governor, &entry->empty);
+            if (rc != 0) {
                 goto cleanup;
             }
             entry->empty->declared_ncols = prior->declared_ncols;
@@ -1876,10 +1886,10 @@ wl_columnar_eval_outbound_framed_relation(col_eval_tdd_worker_ctx_t *ctx,
     if (rc != 0 || !result->rel || result->rel->nrows == 0)
         goto done;
 
-    col_rel_t *delta = wl_columnar_relation_new_like_governed(
-        rp->delta_name, result->rel, sess->memory_governor);
-    if (!delta) {
-        rc = ENOMEM;
+    col_rel_t *delta = NULL;
+    rc = wl_columnar_eval_new_like_checked(sess, rp->delta_name,
+            result->rel, sess->memory_governor, &delta);
+    if (rc != 0) {
         goto done;
     }
     /* Lower entries have drained, so this push has a vacant slot. */
@@ -4308,10 +4318,10 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
                 if (wl_columnar_eval_test_hybrid_boundary)
                     wl_columnar_eval_test_hybrid_boundary(0, w);
 #endif
-                col_rel_t *empty = wl_columnar_relation_new_like_governed(
-                    name, rel, coord->memory_governor);
-                if (!empty) {
-                    rc = ENOMEM;
+                col_rel_t *empty = NULL;
+                rc = wl_columnar_eval_new_like_checked(coord, name, rel,
+                        coord->memory_governor, &empty);
+                if (rc != 0) {
                     break;
                 }
                 empty->declared_ncols = rel->declared_ncols;
@@ -5647,10 +5657,10 @@ tdd_owner_build_candidate(col_rel_t *target, const char *name,
          * schema-less IDB: the first accepted delta supplies its schema.
          * The target has no rows to carry over, so building from the input
          * also preserves its complete logical metadata. */
-        candidate = wl_columnar_relation_new_like_governed(name, source,
-                governor ? governor : source->memory_governor);
-        if (!candidate)
-            return ENOMEM;
+        rc = wl_columnar_eval_new_like_checked(NULL, name, source,
+                governor ? governor : source->memory_governor, &candidate);
+        if (rc != 0)
+            return rc;
         if (target->timestamps && col_rel_enable_timestamps(candidate) != 0) {
             col_rel_destroy(candidate);
             return ENOMEM;
@@ -5667,10 +5677,10 @@ tdd_owner_build_candidate(col_rel_t *target, const char *name,
             return ENOMEM;
         }
     } else if (source) {
-        candidate = wl_columnar_relation_new_like_governed(name, source,
-                governor ? governor : source->memory_governor);
-        if (!candidate)
-            return ENOMEM;
+        rc = wl_columnar_eval_new_like_checked(NULL, name, source,
+                governor ? governor : source->memory_governor, &candidate);
+        if (rc != 0)
+            return rc;
         if (target && target->timestamps
             && col_rel_enable_timestamps(candidate) != 0) {
             col_rel_destroy(candidate);
@@ -5877,14 +5887,15 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
                 }
             }
         }
-        combined = schema_source
-            ? wl_columnar_relation_new_like_governed(dname, schema_source,
-                coord->memory_governor)
-            : col_rel_new_auto(dname, ncols);
-        if (!combined) {
-            rc = ENOMEM;
-            goto fail;
+        if (schema_source)
+            rc = wl_columnar_eval_new_like_checked(coord, dname,
+                    schema_source, coord->memory_governor, &combined);
+        else {
+            combined = col_rel_new_auto(dname, ncols);
+            rc = combined ? 0 : ENOMEM;
         }
+        if (rc != 0)
+            goto fail;
         if (!schema_source && coord->memory_governor) {
             rc = col_rel_attach_memory_governor(combined,
                     coord->memory_governor);
@@ -6138,10 +6149,11 @@ tdd_global_read_exchange_deltas(const wl_plan_stratum_t *sp,
         rc = WL_COLUMNAR_EVAL_GLOBAL_BOUNDARY(coord, ri, 0);
         if (rc != 0)
             return rc;
-        col_rel_t *combined = wl_columnar_relation_new_like_governed(dname,
-                prototype, coord->memory_governor);
-        if (!combined)
-            return ENOMEM;
+        col_rel_t *combined = NULL;
+        rc = wl_columnar_eval_new_like_checked(coord, dname, prototype,
+                coord->memory_governor, &combined);
+        if (rc != 0)
+            return rc;
 
         for (uint32_t w = 0; w < W; w++) {
             col_rel_t *d = ctxs[w].delta_rels[ri];

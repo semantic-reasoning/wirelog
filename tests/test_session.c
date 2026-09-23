@@ -8103,7 +8103,8 @@ specialized_worker_boundary(wl_col_session_t *worker, eval_stack_t *stack,
 
     if (worker->worker_id != specialized_worker || specialized_injected
         || specialized_mode < 3 ||
-        (specialized_mode > 8 && specialized_mode < 21))
+        (specialized_mode > 8 && specialized_mode < 21)
+        || specialized_mode == 23)
         return;
     specialized_injected = true;
     specialized_hook_rc = 0;
@@ -8177,7 +8178,7 @@ specialized_publication_boundary(wl_col_session_t *coord, unsigned phase,
 {
     if (specialized_injected) return 0;
     unsigned wanted = specialized_mode == 9 || specialized_mode == 13 ? 0
-        : specialized_mode == 10 ? 3
+        : specialized_mode == 10 || specialized_mode == 23 ? 3
         : specialized_mode == 11 || specialized_mode == 15 ? 4
         : specialized_mode == 14 || specialized_mode == 19 ? 1 : 5;
     if (phase != wanted) return 0;
@@ -8194,7 +8195,8 @@ specialized_publication_boundary(wl_col_session_t *coord, unsigned phase,
     if (specialized_mode == 19)
         return wl_columnar_eval_stack_cleanup_begin(&coord->tdd_workers[worker],
                    &specialized_active);
-    if (specialized_mode == 13 || specialized_mode == 15) {
+    if (specialized_mode == 13 || specialized_mode == 15
+        || specialized_mode == 23) {
         idb_set_budget(coord); return 0;
     }
 #ifdef WL_TEST_ALLOC_WRAP
@@ -8502,21 +8504,25 @@ test_specialized_publication(uint32_t workers, unsigned initial, unsigned mode,
     SPECIAL_CHECK(specialized_hook_rc == 0, "specialized test seam");
     if (!healthy) {
         int expected = (mode <= 7 || mode == 19 || mode == 20 ||
-            mode >= 21) ? EBUSY
-            : mode == 13 || mode == 15 ? ENOSPC : ENOMEM;
+            (mode >= 21 && mode <= 22)) ? EBUSY
+            : mode == 13 || mode == 15 || mode == 23 ? ENOSPC : ENOMEM;
         bool expected_status = mode == 18
             ? coord->extension_expr_status
             == WL_COLUMNAR_EXPR_EXTENSION_MALFORMED
             : rc == expected;
         SPECIAL_CHECK(rc != 0 && expected_status && tuples.count == 0,
             "specialized refusal code or callbacks");
+        if (mode == 23)
+            SPECIAL_CHECK(coord->memory_budget_denied,
+                "constructor denial retained at coordinator");
         if (target)
             SPECIAL_CHECK(target == session_find_rel(coord, "output")
                 && target->nrows == (initial == 2 ? 1u : 0u)
                 && target->columns == columns && target->view_generation == view
                 && target->storage_generation == storage,
                 "specialized refused target changed");
-        if (mode <= 7 || mode == 19 || mode == 20 || mode >= 21) {
+        if (mode <= 7 || mode == 19 || mode == 20
+            || (mode >= 21 && mode <= 22)) {
             for (unsigned retry = 0; retry < 2; retry++) {
                 SPECIAL_CHECK(wl_session_snapshot(session, collect_tuple,
                     &tuples) == EBUSY
@@ -8526,7 +8532,8 @@ test_specialized_publication(uint32_t workers, unsigned initial, unsigned mode,
                         &coord->arr_entries[0],
                         sizeof(specialized_arrangement)) == 0,
                         "specialized refused arrangement changed");
-                if ((mode >= 3 && mode <= 6) || mode >= 21)
+                if ((mode >= 3 && mode <= 6)
+                    || (mode >= 21 && mode <= 22))
                     SPECIAL_CHECK(specialized_entry->rel == specialized_held
                         && specialized_entry->seg_count == 2
                         && specialized_entry->seg_boundaries
@@ -12748,7 +12755,7 @@ main(void)
     for (uint32_t workers = 2; workers <= 8; workers *= 4) {
         for (unsigned initial = 0; initial < 3; initial++)
             test_specialized_publication(workers, initial, 0, initial == 2);
-        for (unsigned mode = 1; mode <= 22; mode++) {
+        for (unsigned mode = 1; mode <= 23; mode++) {
 #ifndef WL_TEST_ALLOC_WRAP
             if (mode >= 9 && mode <= 12)
                 continue;
