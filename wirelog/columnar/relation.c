@@ -614,7 +614,8 @@ col_rel_begin_shared_table_replacement(col_rel_t *r)
         r->memory_budget_denial_pending = true;
     return status == WL_COLUMNAR_MEMORY_ADMISSION_OK
            || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY ? 0
-        : wl_columnar_memory_governor_admission_errno(status, EOVERFLOW);
+        : status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+        : EOVERFLOW;
 }
 
 static void
@@ -1222,7 +1223,8 @@ col_rel_reserve_metadata(col_rel_t *r,
         && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
         if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
             r->memory_budget_denial_pending = true;
-        return wl_columnar_memory_governor_admission_errno(status, EOVERFLOW);
+        return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+            : EOVERFLOW;
     }
     *owned = (wl_columnar_memory_reservation_t *)malloc(sizeof(**owned));
     if (!*owned) {
@@ -1780,8 +1782,8 @@ col_rel_attach_memory_governor(col_rel_t *r,
                     table_owned);
             if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                 r->memory_budget_denial_pending = true;
-            return wl_columnar_memory_governor_admission_errno(status,
-                       EOVERFLOW);
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : EOVERFLOW;
         }
         owned = (wl_columnar_memory_reservation_t *)malloc(sizeof(*owned));
         if (!owned) {
@@ -2941,8 +2943,8 @@ wl_columnar_relation_alloc_governed(col_rel_t **out, const char *name,
             &pending);
         if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
-            return wl_columnar_memory_governor_admission_errno(status,
-                       EOVERFLOW);
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : EOVERFLOW;
     }
     col_rel_t *r = (col_rel_t *)calloc(1, sizeof(col_rel_t));
     if (!r) {
@@ -6328,7 +6330,8 @@ col_rel_prepare_replacement_impl(col_rel_t *dst, const col_rel_t *candidate,
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
             if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                 dst->memory_budget_denial_pending = true;
-            rc = wl_columnar_memory_governor_admission_errno(status, EOVERFLOW);
+            rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : EOVERFLOW;
             goto fail;
         }
         if (!wl_columnar_memory_commit(&replacement->reservation, dst))
@@ -6352,7 +6355,8 @@ col_rel_prepare_replacement_impl(col_rel_t *dst, const col_rel_t *candidate,
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
             if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                 dst->memory_budget_denial_pending = true;
-            rc = wl_columnar_memory_governor_admission_errno(status, EOVERFLOW);
+            rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : EOVERFLOW;
             goto fail;
         }
         if (!wl_columnar_memory_commit(&replacement->aux_pending, dst)) {
@@ -6374,7 +6378,8 @@ col_rel_prepare_replacement_impl(col_rel_t *dst, const col_rel_t *candidate,
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
             if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                 dst->memory_budget_denial_pending = true;
-            rc = wl_columnar_memory_governor_admission_errno(status, EOVERFLOW);
+            rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : EOVERFLOW;
             goto fail;
         }
         if (!wl_columnar_memory_commit(

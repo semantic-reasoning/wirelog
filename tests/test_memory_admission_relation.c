@@ -32,33 +32,6 @@ static uint64_t charged_fixed_bytes(const col_rel_t *relation);
 } while (0)
 
 static void
-test_admission_errno_mapping(void)
-{
-    const int fallbacks[] = { EINVAL, ENOMEM, EOVERFLOW };
-
-    for (size_t i = 0; i < sizeof(fallbacks) / sizeof(fallbacks[0]); i++) {
-        int fallback = fallbacks[i];
-        const wl_columnar_memory_admission_status_t other_statuses[] = {
-            WL_COLUMNAR_MEMORY_ADMISSION_OK,
-            WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY,
-            WL_COLUMNAR_MEMORY_ADMISSION_INVALID,
-        };
-        CHECK(wl_columnar_memory_governor_admission_errno(
-                WL_COLUMNAR_MEMORY_ADMISSION_DENIED, fallback) == ENOSPC,
-            "denied admission maps to ENOSPC");
-        CHECK(wl_columnar_memory_governor_admission_errno(
-                WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW, fallback) == EOVERFLOW,
-            "overflow admission maps to EOVERFLOW");
-        for (size_t j = 0; j < sizeof(other_statuses)
-            / sizeof(other_statuses[0]); j++) {
-            CHECK(wl_columnar_memory_governor_admission_errno(
-                    other_statuses[j], fallback) == fallback,
-                "other admission status preserves caller fallback");
-        }
-    }
-}
-
-static void
 observe_overwrite_retirement(const col_rel_t *rel)
 {
     overwrite_retirement_witnesses++;
@@ -2821,7 +2794,6 @@ cleanup:
 int
 main(void)
 {
-    test_admission_errno_mapping();
     test_heap_descriptor_admission();
     test_governed_new_like_descriptor_admission();
     test_governed_clear_preserves_live_descriptor_charge();

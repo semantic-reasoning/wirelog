@@ -124,11 +124,6 @@ typedef enum {
     WL_COLUMNAR_MEMORY_ADMISSION_DENIED = 4,
 } wl_columnar_memory_admission_status_t;
 
-/* Translate a rejected admission result to the existing public/internal
- * errno contract for a caller. */
-int wl_columnar_memory_governor_admission_errno(
-    wl_columnar_memory_admission_status_t status, int fallback_errno);
-
 typedef struct {
     wl_columnar_memory_governor_t *governor;
     uint64_t bytes;

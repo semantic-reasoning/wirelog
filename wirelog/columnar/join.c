@@ -537,7 +537,10 @@ col_join_pair_cache_append(col_join_keyed_ctx_t *ctx, uint32_t lr,
             if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
                 && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
                 ctx->pair_error =
-                    wl_columnar_memory_governor_admission_errno(status, ENOMEM);
+                    status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                    ? ENOSPC
+                    : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                    ? EOVERFLOW : ENOMEM;
                 ctx->pairs_complete = false;
                 return false;
             }
@@ -895,7 +898,10 @@ col_join_parallel_cross(wl_col_session_t *sess, const col_rel_t *left,
             if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                 sess->memory_budget_denied = true;
             col_rel_destroy(out);
-            return wl_columnar_memory_governor_admission_errno(status, ENOMEM);
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : ENOMEM;
         }
         ctx_admitted = true;
     }
@@ -1384,8 +1390,10 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 if (right_filtered)
                     col_rel_destroy(right_filtered);
                 return wl_columnar_join_dispose_left(stack, &left_e,
-                           wl_columnar_memory_governor_admission_errno(status,
-                           ENOMEM));
+                           status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                               ? ENOSPC
+                               : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                               ? EOVERFLOW : ENOMEM);
             }
             row_admitted = true;
         }
@@ -1457,8 +1465,11 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 if (right_filtered)
                     col_rel_destroy(right_filtered);
                 return wl_columnar_join_dispose_left(stack, &left_e,
-                           wl_columnar_memory_governor_admission_errno(status,
-                           ENOMEM));
+                           status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                               ? ENOSPC
+                               : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                               ? EOVERFLOW
+                               : ENOMEM);
             }
             hash_admitted = true;
         }
@@ -1574,8 +1585,10 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 if (right_filtered)
                     col_rel_destroy(right_filtered);
                 return wl_columnar_join_dispose_left(stack, &left_e,
-                           wl_columnar_memory_governor_admission_errno(status,
-                           ENOMEM));
+                           status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                               ? ENOSPC
+                               : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                               ? EOVERFLOW : ENOMEM);
             }
             tmp_admitted = true;
         }
@@ -1749,8 +1762,12 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     if (right_filtered)
                         col_rel_destroy(right_filtered);
                     return wl_columnar_join_dispose_left(stack, &left_e,
-                               wl_columnar_memory_governor_admission_errno(
-                                   status, ENOMEM));
+                               status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                                   ? ENOSPC
+                                   : status
+                               == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                                   ? EOVERFLOW
+                                   : ENOMEM);
                 }
                 hash_admitted = true;
             }
@@ -2171,8 +2188,11 @@ wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
             if (right_filtered)
                 col_rel_destroy(right_filtered);
             return wl_columnar_join_dispose_left(stack, &left_e,
-                       wl_columnar_memory_governor_admission_errno(status,
-                       ENOMEM));
+                       status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                           ? ENOSPC
+                           : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                           ? EOVERFLOW
+                           : ENOMEM);
         }
         aj_hash_admitted = true;
     }
@@ -2217,7 +2237,10 @@ wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
             if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                 sess->memory_budget_denied = true;
-            aj_rc = wl_columnar_memory_governor_admission_errno(status, ENOMEM);
+            aj_rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : ENOMEM;
             goto antijoin_done;
         }
         aj_row_admitted = true;
@@ -2394,8 +2417,10 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
             if (right_filtered)
                 col_rel_destroy(right_filtered);
             return wl_columnar_join_dispose_left(stack, &left_e,
-                       wl_columnar_memory_governor_admission_errno(status,
-                       ENOMEM));
+                       status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                           ? ENOSPC
+                           : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                           ? EOVERFLOW : ENOMEM);
         }
         sj_row_admitted = true;
     }
@@ -2462,8 +2487,11 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
             if (right_filtered)
                 col_rel_destroy(right_filtered);
             return wl_columnar_join_dispose_left(stack, &left_e,
-                       wl_columnar_memory_governor_admission_errno(status,
-                       ENOMEM));
+                       status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                           ? ENOSPC
+                           : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                           ? EOVERFLOW
+                           : ENOMEM);
         }
         sj_hash_admitted = true;
     }
@@ -2534,8 +2562,11 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
                     if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                         sess->memory_budget_denied = true;
-                    sj_rc = wl_columnar_memory_governor_admission_errno(status,
-                            ENOMEM);
+                    sj_rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                        ? ENOSPC
+                        : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                        ? EOVERFLOW
+                        : ENOMEM;
                     goto semijoin_parallel_done;
                 }
                 parallel_admitted = true;
@@ -3032,8 +3063,10 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
             if (right_filtered)
                 col_rel_destroy(right_filtered);
             return wl_columnar_join_dispose_left(stack, &left_e,
-                       wl_columnar_memory_governor_admission_errno(status,
-                       ENOMEM));
+                       status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                           ? ENOSPC
+                           : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                           ? EOVERFLOW : ENOMEM);
         }
         tmp_admitted = true;
     }
@@ -3183,8 +3216,12 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     wl_columnar_arrangement_diff_txn_abort(&diff_txn);
                     (void)col_arrangement_probe_bundle_release(&diff_bundle);
                     return wl_columnar_join_dispose_left(stack, &left_e,
-                               wl_columnar_memory_governor_admission_errno(
-                                   status, ENOMEM));
+                               status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                                   ? ENOSPC
+                                   : status
+                               == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                                   ? EOVERFLOW
+                                   : ENOMEM);
                 }
                 parallel_admitted = true;
             }

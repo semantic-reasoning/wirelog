@@ -7,11 +7,11 @@
 
 #include "columnar/memory_governor.h"
 
-#include <errno.h>
 #include <string.h>
 #include <stdlib.h>
 
 #ifndef _WIN32
+#include <errno.h>
 #include <stdio.h>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -20,25 +20,6 @@
 #endif
 
 #include <limits.h>
-
-#if defined(_MSC_VER)
-#define WL_COLUMNAR_MEMORY_GOVERNOR_NOINLINE __declspec(noinline)
-#elif defined(__GNUC__) || defined(__clang__)
-#define WL_COLUMNAR_MEMORY_GOVERNOR_NOINLINE __attribute__((noinline))
-#else
-#define WL_COLUMNAR_MEMORY_GOVERNOR_NOINLINE
-#endif
-
-WL_COLUMNAR_MEMORY_GOVERNOR_NOINLINE int
-wl_columnar_memory_governor_admission_errno(
-    wl_columnar_memory_admission_status_t status, int fallback_errno)
-{
-    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
-        return ENOSPC;
-    if (status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW)
-        return EOVERFLOW;
-    return fallback_errno;
-}
 
 #ifdef WL_TEST_RELATION_RESIZE_HOOK
 static bool wl_columnar_memory_governor_test_refuse_release;
