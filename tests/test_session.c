@@ -11834,6 +11834,14 @@ test_operator_null_session_guards(void)
         FAIL("null session changed the input stack");
         return;
     }
+    eval_stack_drain(&stack);
+    if (col_op_map(&op, &stack, NULL) != EINVAL
+        || col_op_reduce(&op, &stack, NULL) != EINVAL
+        || col_op_lftj(&op, &stack, NULL) != EINVAL
+        || stack.top != 0) {
+        FAIL("null session changed an empty stack");
+        return;
+    }
     PASS();
 }
 
