@@ -2915,8 +2915,8 @@ test_executor_csv_budget_and_retry(void)
     }
     wl_columnar_memory_governor_ref_release(ref);
 
-    /* Reader admission succeeds exactly at its conservative peak, so the
-     * first relation insertion is the budget denial inside the callback. */
+    /* Reader admission succeeds exactly at its conservative peak, but the
+     * whole-file staging reservation is denied before relation insertion. */
     uint64_t schema_bytes = 2u * sizeof(wirelog_column_type_t);
     uint64_t reader_bytes
         = 1024u * 2u * sizeof(int64_t) + 2u * sizeof(int64_t)
