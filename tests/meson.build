@@ -5818,6 +5818,19 @@ test_compound_gc_hold_exe = executable(
 )
 test('compound_gc_hold', test_compound_gc_hold_exe, timeout: 60)
 
+# Reaches the columnar attempt wrappers through the backend vtable, which the
+# ENOTSUP gate keeps unreachable from the public API.  evaluation_control.c
+# comes from testlib_prod; listing it again would duplicate the symbols.
+test_evaluation_attempt_owner_exe = executable(
+  'test_evaluation_attempt_owner',
+  files('test_evaluation_attempt_owner.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+
+test('evaluation_attempt_owner', test_evaluation_attempt_owner_exe)
+
 # Internal foundation; cancellation and shared admission use real threads.
 test_evaluation_control_exe = executable(
   'test_evaluation_control',
