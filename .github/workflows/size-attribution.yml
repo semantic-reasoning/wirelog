@@ -1,0 +1,107 @@
+name: PR 1903 binary size attribution
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request to inspect (must be 1903)
+        required: true
+        type: string
+        default: "1903"
+      base_sha:
+        description: Full base commit SHA (must match the recorded CI base)
+        required: true
+        type: string
+        default: "8d91c2da2b188b94af5b9f1da21c569d80ccb387"
+      candidate_sha:
+        description: Full current PR head SHA
+        required: true
+        type: string
+        default: "a4c7c622daa3b7247378acf71a74b7f40f4ff556"
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    name: Exact-profile size attribution
+    if: ${{ github.repository == 'semantic-reasoning/wirelog' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require default branch and record runner identity
+        env:
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REF" = "refs/heads/main"
+          mkdir -p size-attribution
+          cat /etc/os-release > size-attribution/os-release.txt
+          printf 'ImageOS=%s\nImageVersion=%s\n' "${ImageOS:-unavailable}" "${ImageVersion:-unavailable}" \
+            > size-attribution/runner-image.txt
+          grep -q '^ID="ubuntu"$' /etc/os-release
+          grep -q '^VERSION_ID="24.04"$' /etc/os-release
+
+      - name: Install CI build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils ninja-build libmbedtls-dev
+
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+
+      - name: Create diagnostic Python environment
+        run: uv venv .venv-size-attribution
+
+      - name: Record tool versions
+        run: |
+          set -euo pipefail
+          mkdir -p size-attribution
+          {
+            gcc --version
+            gcc -dumpfullversion -dumpversion
+            ld --version
+            readelf --version
+            addr2line --version
+            meson --version
+            ninja --version
+            python --version
+            .venv-size-attribution/bin/python --version
+          } > size-attribution/tool-versions.txt 2>&1
+
+      - name: Run contract tests
+        run: .venv-size-attribution/bin/python scripts/ci/test-size-attribution.py -v
+
+      - name: Build and attribute pinned PR size
+        env:
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_PR_NUMBER: ${{ inputs.pr_number }}
+          GH_BASE_SHA: ${{ inputs.base_sha }}
+          GH_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/.venv-size-attribution/bin:$PATH"
+          .venv-size-attribution/bin/python scripts/ci/collect-size-attribution.py \
+            --repository "$GH_REPOSITORY" \
+            --pr-number "$GH_PR_NUMBER" \
+            --base-sha "$GH_BASE_SHA" \
+            --candidate-sha "$GH_CANDIDATE_SHA" \
+            --workflow-ref "$WORKFLOW_REF" \
+            --repository-root "$PWD" \
+            --output "$PWD/size-attribution"
+
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr-1903-size-attribution-${{ github.run_id }}-${{ github.run_attempt }}
+          path: size-attribution/
+          if-no-files-found: warn
+          retention-days: 14
