@@ -254,7 +254,8 @@ class TransactionalHookCase(unittest.TestCase):
 
         def fail_second_apply(source, destination):
             nonlocal failed
-            if Path(destination) == self.root / "b.c" and not failed:
+            if Path(destination).resolve(strict=False) == (self.root / "b.c").resolve(strict=False) \
+                    and not failed:
                 failed = True
                 raise OSError("injected replacement failure")
             return real_replace(source, destination)
