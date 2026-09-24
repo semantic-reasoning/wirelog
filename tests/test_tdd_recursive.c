@@ -23,7 +23,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <xxhash.h>
 
 #ifdef WL_TEST_ALLOC_WRAP
 void *__real_malloc(size_t size);
@@ -98,24 +97,25 @@ static int
 test_wide_dedup_hash_without_allocation(void)
 {
     int64_t values[32];
-    _Alignas(64) int64_t expected_values[32];
     int64_t *columns[32];
     col_rel_t rel = { 0 };
+    static const uint32_t widths[] = { 9, 32 };
+    /* XXH3 0.8.4 scalar-backend golden hashes for values[c] = c * 127 - 9.
+     * A one-shot 72-byte hash enters xxHash 0.8.4's ARM NEON long-input
+     * loop, whose final stripe performs a sanitizer-visible misaligned load.
+     * Keep these independent of the backend used by the library under test. */
+    static const uint64_t expected_hashes[] = {
+        UINT64_C(0x1dc82039ce41eee6), UINT64_C(0xf9330b424b6ea360)
+    };
 
     rel.columns = columns;
     for (uint32_t c = 0; c < 32; c++) {
         values[c] = (int64_t)c * 127 - 9;
         columns[c] = &values[c];
     }
-    for (uint32_t width = 9; width <= 32; width += 23) {
+    for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); i++) {
+        uint32_t width = widths[i];
         rel.ncols = width;
-        /* XXH3's one-shot ARM64 NEON path reads 16-byte vectors. */
-        memcpy(expected_values, values,
-            (size_t)width * sizeof(values[0]));
-        uint64_t expected = XXH3_64bits(expected_values,
-                (size_t)width * sizeof(values[0]));
-        if (expected == 0)
-            expected = 1;
 #ifdef WL_TEST_ALLOC_WRAP
         allocation_calls = 0;
         allocation_fail_at = 0;
@@ -126,7 +126,7 @@ test_wide_dedup_hash_without_allocation(void)
         if (allocation_calls != 0)
             return -1;
 #endif
-        if (actual != expected)
+        if (actual != expected_hashes[i])
             return -1;
     }
     return 0;
