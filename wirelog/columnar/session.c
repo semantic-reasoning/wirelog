@@ -4471,18 +4471,44 @@ col_session_step(wl_session_t *session)
 {
     wl_col_session_t *sess = COL_SESSION(session);
     int rc;
+    /*
+     * The owner key is the session's operation admission, not the session.
+     * wirelog/session.c attaches the control to that admission and
+     * wirelog/session.h documents it; passing &sess->base made every begin
+     * return EINVAL.
+     *
+     * Safety here does not rest on how worker copies are built.
+     * col_worker_session_create nulls operation_admission, but the K-fusion
+     * branch wrapper does not -- it shallow-copies the session and clears
+     * owns_evaluation_control without clearing operation_admission.  What
+     * bounds this is the call site: in production these vtable slots are
+     * dispatched only from wirelog/session.c, and the one test that reaches
+     * them directly also passes the session it owns.  A branch copy that did
+     * reach begin would be refused without mutating anything -- EBUSY when it
+     * descends from the coordinator, since it exists only inside an already
+     * active attempt, and EINVAL when it descends from a worker, whose
+     * operation_admission is NULL.
+     *
+     * begin returns 0 even when cancellation is already pending; charge(0) is
+     * the only reader of that flag, and finish never reads it.  Without the
+     * poll below a pre-cancelled attempt would run the whole operation, mutate
+     * the session and then be reported as a clean success.
+     */
+    const void *owner = sess->base.operation_admission;
     bool active = sess->base.evaluation_control != NULL;
     if (active) {
-        rc = wl_evaluation_control_begin(sess->base.evaluation_control,
-                &sess->base);
+        rc = wl_evaluation_control_begin(sess->base.evaluation_control, owner);
         if (rc != 0)
             return rc;
+        rc = wl_evaluation_control_charge(sess->base.evaluation_control, 0);
+    } else {
+        rc = 0;
     }
-    rc = col_session_step_impl(session);
+    if (rc == 0)
+        rc = col_session_step_impl(session);
     if (active)
         rc = wl_evaluation_control_finish(sess->base.evaluation_control,
-                &sess->base,
-                rc, 0);
+                owner, rc, 0);
     return rc;
 }
 
@@ -5222,18 +5248,44 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
 {
     wl_col_session_t *sess = COL_SESSION(session);
     int rc;
+    /*
+     * The owner key is the session's operation admission, not the session.
+     * wirelog/session.c attaches the control to that admission and
+     * wirelog/session.h documents it; passing &sess->base made every begin
+     * return EINVAL.
+     *
+     * Safety here does not rest on how worker copies are built.
+     * col_worker_session_create nulls operation_admission, but the K-fusion
+     * branch wrapper does not -- it shallow-copies the session and clears
+     * owns_evaluation_control without clearing operation_admission.  What
+     * bounds this is the call site: in production these vtable slots are
+     * dispatched only from wirelog/session.c, and the one test that reaches
+     * them directly also passes the session it owns.  A branch copy that did
+     * reach begin would be refused without mutating anything -- EBUSY when it
+     * descends from the coordinator, since it exists only inside an already
+     * active attempt, and EINVAL when it descends from a worker, whose
+     * operation_admission is NULL.
+     *
+     * begin returns 0 even when cancellation is already pending; charge(0) is
+     * the only reader of that flag, and finish never reads it.  Without the
+     * poll below a pre-cancelled attempt would run the whole operation, mutate
+     * the session and then be reported as a clean success.
+     */
+    const void *owner = sess->base.operation_admission;
     bool active = sess->base.evaluation_control != NULL;
     if (active) {
-        rc = wl_evaluation_control_begin(sess->base.evaluation_control,
-                &sess->base);
+        rc = wl_evaluation_control_begin(sess->base.evaluation_control, owner);
         if (rc != 0)
             return rc;
+        rc = wl_evaluation_control_charge(sess->base.evaluation_control, 0);
+    } else {
+        rc = 0;
     }
-    rc = col_session_snapshot_impl(session, callback, user_data);
+    if (rc == 0)
+        rc = col_session_snapshot_impl(session, callback, user_data);
     if (active)
         rc = wl_evaluation_control_finish(sess->base.evaluation_control,
-                &sess->base,
-                rc, 0);
+                owner, rc, 0);
     return rc;
 }
 
