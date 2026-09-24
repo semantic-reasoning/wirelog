@@ -176,7 +176,11 @@ wirelog_session_destroy(wirelog_session_t *session);
  * from inline `.dl` seeding will observe multiplicity +2 (see
  * docs/SEMANTICS.md).
  *
- * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure.
+ * Returns: WIRELOG_OK on success.  A single-row call returns
+ * WIRELOG_ERR_MEMORY for allocation failure or WIRELOG_ERR_MEMORY_BUDGET
+ * when the configured budget denies admission.  Other failures return
+ * WIRELOG_ERR_EXEC.  Multi-row calls apply atomically: a failed call leaves
+ * the relation unchanged.
  */
 WIRELOG_API wirelog_error_t
 wirelog_session_insert(wirelog_session_t *session, const char *relation,
@@ -193,8 +197,11 @@ wirelog_session_insert(wirelog_session_t *session, const char *relation,
  * Retract rows from @relation.  Each remove decrements z-set
  * multiplicity by -1.
  *
- * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure or if
- * the backend does not support retraction.
+ * Returns: WIRELOG_OK on success.  A single-row call returns
+ * WIRELOG_ERR_MEMORY for allocation failure or WIRELOG_ERR_MEMORY_BUDGET
+ * when the configured budget denies admission.  Other failures, including
+ * unsupported retraction, return WIRELOG_ERR_EXEC.  Multi-row calls apply
+ * atomically: a failed call leaves the relation unchanged.
  */
 WIRELOG_API wirelog_error_t
 wirelog_session_remove(wirelog_session_t *session, const char *relation,
@@ -204,7 +211,9 @@ wirelog_session_remove(wirelog_session_t *session, const char *relation,
  * FLOAT lanes are host-order IEEE-754 binary64 bits.  The descriptor's
  * logical/physical schema must match the relation; callbacks and input
  * buffers are used synchronously and never retained.  On failure, @error
- * receives the first invalid row/column and a bounded diagnostic message. */
+ * receives the first invalid row/column and a bounded diagnostic message.
+ * Budget denial returns WIRELOG_ERR_MEMORY_BUDGET after earlier typed rows
+ * have been rolled back. */
 WIRELOG_API wirelog_error_t
 wirelog_session_insert_typed(wirelog_session_t *session,
     const char *relation, const wirelog_typed_row_v1_t *rows,
