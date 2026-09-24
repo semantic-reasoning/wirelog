@@ -69,12 +69,7 @@ wirelog uses automated formatting and linting. The `uncrustify.cfg` file is the 
 
 **Format check (dry-run):**
 ```sh
-find wirelog/ tests/ -name '*.c' -o -name '*.h' | xargs uncrustify -c uncrustify.cfg --check
-```
-
-**Auto-format:**
-```sh
-find wirelog/ tests/ -name '*.c' -o -name '*.h' | xargs uncrustify -c uncrustify.cfg --replace --no-backup
+find wirelog/ tests/ \( -name '*.c' -o -name '*.h' \) -print0 | xargs -0 uncrustify -c uncrustify.cfg --check
 ```
 
 **clang-tidy:**
@@ -91,13 +86,13 @@ run-clang-tidy-18 -p builddir-tidy wirelog/ tests/
 
 ### Pre-commit Hook (Optional)
 
-You can optionally set up a pre-commit hook for auto-formatting:
-```sh
-echo '#!/bin/sh
-find wirelog/ tests/ -name "*.c" -o -name "*.h" | xargs uncrustify -c uncrustify.cfg --replace --no-backup
-git add -u' > .git/hooks/pre-commit
-chmod +x .git/hooks/pre-commit
-```
+The generated pre-commit hook formats staged C and header files as one batch.
+It rejects partially staged source files, so stage the complete file before
+committing. Meson setup installs or updates the generated hook when Uncrustify
+is available and no custom pre-commit hook is installed. Existing custom hooks
+are preserved. Do not replace the generated hook with an ad hoc formatter
+hook; formatting must complete successfully for the entire staged batch before
+any file or index entry changes.
 
 See the [clang-tidy Ratchet](CLAUDE.md#clang-tidy-ratchet-issue-1100) section
 and the ratchet registers under `scripts/ci/` for linting policy and checks.
