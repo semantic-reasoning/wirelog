@@ -185,14 +185,40 @@ mkdir -p "$repo/sbom"
 cp "$out/snapshot.txt" "$repo/sbom/snapshot.txt"
 check_excludes="$tmp/check-excludes.txt"
 check_snapshot() {
+    : > "$check_excludes"
     SYFT_EXCLUDES="$check_excludes" PATH="$repo/bin:$PATH" \
-        "$repo/scripts/ci/check-sbom-snapshot.sh"
+        "$repo/scripts/ci/check-sbom-snapshot.sh" "$@"
 }
 expect_status 'the snapshot gate accepts its generated baseline' 0 check_snapshot
 assert 'the snapshot gate passes the exact workflow-tools exclusion' \
     test "$(wc -l < "$check_excludes")" -eq 1
 assert 'the snapshot gate passes the exact workflow-tools exclusion' \
     grep -Fxq '**/workflow-tools/**' "$check_excludes"
+
+# --- the build tree the gate must not read (#1917) -------------------------
+# A configured meson build dir sits inside repo_root in CI, and syft reads
+# every byte of it to catalog nothing. These assert the exclusion is passed,
+# spelled the one way syft honours, and ONLY for a build root that is actually
+# inside the scanned tree.
+#
+# The spelling is load-bearing, not cosmetic: syft resolves --exclude for a
+# `dir:` scan against the scan root, so an absolute path matches everything and
+# the scan yields zero artifacts. A gate that excluded its whole tree would
+# still exit 0 here against a stub, which is why the pattern itself is pinned.
+mkdir -p "$repo/builddir-san"
+check_snapshot "$repo/builddir-san"
+assert 'the gate excludes a build root inside the repo' \
+    grep -Fxq './builddir-san/**' "$check_excludes"
+assert 'the gate still excludes the helper checkout alongside it' \
+    grep -Fxq '**/workflow-tools/**' "$check_excludes"
+assert 'the gate passes exactly those two exclusions' \
+    test "$(wc -l < "$check_excludes")" -eq 2
+
+# Outside repo_root there is nothing to exclude: syft never walks it, and a
+# `./`-relative pattern could not name it anyway.
+check_snapshot "$tmp/fake-build"
+assert 'a build root outside the repo adds no exclusion' \
+    test "$(wc -l < "$check_excludes")" -eq 1
 check_snapshot_with_unexcluded_checkout() {
     SYFT_IGNORE_EXCLUDE=1 SYFT_EXCLUDES="$tmp/ignored-excludes.txt" \
         PATH="$repo/bin:$PATH" "$repo/scripts/ci/check-sbom-snapshot.sh"
@@ -219,6 +245,28 @@ all_scans_are_repo_root() {
     ! grep -qvxF "$repo" "$scanned"
 }
 assert 'every syft scan targets repo_root, never the build root' all_scans_are_repo_root
+
+# The gate and the generator must use the SAME scan boundary, or the baseline
+# one writes is not the list the other diffs. #1917 gave the gate a build-tree
+# exclusion; this pins the generator to the identical spelling, so the pair
+# cannot drift into comparing two different trees.
+#
+# This does NOT make $build_root a scan target -- the assertion above still
+# holds, and #1308's inversion is still ahead. It makes it load-bearing only as
+# something to leave OUT of the scan.
+gen_excludes="$tmp/gen-excludes.txt"
+inside_build="$repo/builddir-gen"
+mkdir -p "$inside_build"
+: > "$gen_excludes"
+SYFT_SCANNED="$scanned" SYFT_EXCLUDES="$gen_excludes" PATH="$repo/bin:$PATH" \
+    "$repo/scripts/release/generate-sbom.sh" "$inside_build" "$out" >/dev/null
+assert 'the generator excludes a build root inside the repo' \
+    grep -Fxq './builddir-gen/**' "$gen_excludes"
+# Three scans, two exclusions each: the exclusion must reach every document,
+# not just the snapshot. A generator that excluded it from one output and not
+# the others would ship an SPDX file describing a different tree.
+assert 'every generator scan carries both exclusions' \
+    test "$(wc -l < "$gen_excludes")" -eq 6
 
 # --- the default, which every existing caller relies on --------------------
 expect_status 'the output directory is optional' 0 gen "$tmp/fake-build"
