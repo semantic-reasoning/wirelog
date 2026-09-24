@@ -4146,6 +4146,12 @@ wl_columnar_session_budget_denial_clear(wl_col_session_t *sess)
                 ->memory_budget_denial_pending = false;
 }
 
+static void
+col_session_budget_denial_clear(void *session)
+{
+    wl_columnar_session_budget_denial_clear(COL_SESSION(session));
+}
+
 static int
 col_session_step_impl(wl_session_t *session)
 {
@@ -5257,6 +5263,7 @@ static const wl_compute_backend_t col_backend = {
     .session_memory_governor = col_session_memory_governor,
     .session_create_with_options = col_session_create_with_options,
     .session_budget_denied = wl_columnar_session_budget_denied,
+    .session_budget_denial_clear = col_session_budget_denial_clear,
 };
 
 const wl_compute_backend_t *

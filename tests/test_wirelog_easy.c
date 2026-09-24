@@ -3119,6 +3119,59 @@ test_invalid_memory_budget(void)
     wirelog_easy_close(session);
 }
 
+static void
+test_fact_mutation_budget(void)
+{
+    const char *src = ".decl src(x: int64)\n";
+    wl_columnar_memory_governor_ref_t *ref
+        = enforcing_governor(UINT64_MAX / 4u);
+    wl_session_options_t options;
+    wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
+    wirelog_easy_session_t *session = NULL;
+    int64_t row = 17;
+    TEST("#1369 easy fact mutation budget denial and retry");
+    if (!ref) {
+        FAIL("governor allocation failed");
+        return;
+    }
+    wl_session_options_init(&options);
+    options.memory_governor = ref;
+    opts.eager_build = true;
+    wl_session_testhook_set_default_options(&options);
+    wirelog_error_t create_rc = wirelog_easy_open_opts(src, &opts, &session);
+    wl_session_testhook_set_default_options(NULL);
+    if (create_rc != WIRELOG_OK || !session) {
+        FAIL("session creation failed");
+        goto done;
+    }
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(ref);
+    atomic_store_explicit(&governor->usable_bytes, reserved_on(ref),
+        memory_order_release);
+    wirelog_error_t denied_rc = wirelog_easy_insert(session, "src", &row, 1);
+    wirelog_error_t stale_rc = wirelog_easy_insert(session, "missing", &row, 1);
+    if (denied_rc != WIRELOG_ERR_MEMORY_BUDGET
+        || strcmp(wirelog_error_string(denied_rc),
+        "memory budget exhausted") != 0
+        || stale_rc != WIRELOG_ERR_EXEC) {
+        fprintf(stderr, "fact budget: denied=%d stale=%d baseline=%llu\n",
+            denied_rc, stale_rc, (unsigned long long)reserved_on(ref));
+        FAIL("denial or stale status mapping failed");
+        goto done;
+    }
+    atomic_store_explicit(&governor->usable_bytes, UINT64_MAX / 4u,
+        memory_order_release);
+    if (wirelog_easy_insert(session, "src", &row, 1) != WIRELOG_OK
+        || wirelog_easy_remove(session, "src", &row, 1) != WIRELOG_OK) {
+        FAIL("retry failed");
+        goto done;
+    }
+    PASS();
+done:
+    wirelog_easy_close(session);
+    wl_columnar_memory_governor_ref_release(ref);
+}
+
 int
 main(void)
 {
@@ -3126,6 +3179,7 @@ main(void)
     printf("==========================\n\n");
 
     test_invalid_memory_budget();
+    test_fact_mutation_budget();
     test_injected_governor_easy_eager();
     test_injected_governor_easy_lazy();
     test_injected_governor_executor();

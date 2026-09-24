@@ -1,4 +1,7 @@
 #include "wirelog/wirelog-extension.h"
+#include "wirelog/wirelog-internal.h"
+#include "wirelog/wirelog.h"
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +38,12 @@ int main(void)
                                             invoke, NULL, NULL };
     wirelog_extension_descriptor_t bad = desc;
     int failures = 0;
+    failures += check(wl_facade_session_error_code_with_budget(ENOMEM, 0,
+            true) == WIRELOG_ERR_MEMORY,
+            "stale budget flag does not relabel snapshot allocation failure");
+    failures += check(wl_facade_fact_mutation_error_code(ENOMEM, true)
+            == WIRELOG_ERR_MEMORY_BUDGET,
+            "fact mutation denied reservation is budget error");
     failures += check(r != NULL, "create");
     desc.addon_abi_identity = UINT64_C(0x0123456789abcdef);
     desc.addon_abi_version = 7;

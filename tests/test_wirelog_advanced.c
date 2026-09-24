@@ -407,6 +407,12 @@ struct count_state {
     uint32_t rows;
 };
 
+struct fact_budget_snapshot_state {
+    uint32_t rows;
+    uint32_t first;
+    uint32_t second;
+};
+
 struct delta_state {
     uint32_t inserts;
     uint32_t removes;
@@ -432,6 +438,20 @@ count_rows(const char *relation, const int64_t *row, uint32_t ncols,
     (void)ncols;
     struct count_state *st = (struct count_state *)user_data;
     st->rows++;
+}
+
+static void
+count_fact_budget_rows(const char *relation, const int64_t *row,
+    uint32_t ncols, void *user_data)
+{
+    if (strcmp(relation, "out") != 0)
+        return;
+    struct fact_budget_snapshot_state *st = user_data;
+    st->rows++;
+    if (ncols == 1 && row[0] == 1000)
+        st->first++;
+    if (ncols == 1 && row[0] == 1001)
+        st->second++;
 }
 
 static wirelog_program_t *parse_or_die(const char *src, const char *what);
@@ -2477,7 +2497,7 @@ test_bulk_insert_error_mapping(void)
     wirelog_error_t single_error = wirelog_session_insert(session, "src", one,
             1, 1);
     if (bulk_error != WIRELOG_ERR_MEMORY_BUDGET
-        || single_error != WIRELOG_ERR_EXEC
+        || single_error != WIRELOG_ERR_MEMORY_BUDGET
         || wl_facade_session_error_code(ENOMEM, 0) != WIRELOG_ERR_MEMORY
         || wl_facade_session_error_code(WL_ERR_MEMORY_BUDGET, 0)
         != WIRELOG_ERR_MEMORY_BUDGET) {
@@ -2540,7 +2560,7 @@ test_bulk_incremental_remove_budget_mapping(void)
     wirelog_error_t single_error = wirelog_session_remove(session, "src", one,
             1, 1);
     if (bulk_error != WIRELOG_ERR_MEMORY_BUDGET
-        || single_error != WIRELOG_ERR_EXEC) {
+        || single_error != WIRELOG_ERR_MEMORY_BUDGET) {
         fprintf(stderr, "T-1938: remove bulk=%d single=%d\n", bulk_error,
             single_error);
         goto out;
@@ -2846,6 +2866,109 @@ test_invalid_memory_budget(void)
     return 0;
 }
 
+static int
+test_fact_mutation_budget(void)
+{
+    const char *src = ".decl src(x: int64)\n"
+        ".decl out(x: int64)\n"
+        "out(X) :- src(X).\n";
+    wirelog_program_t *prog = parse_or_die(src, "fact-budget");
+    wirelog_session_t *session = NULL;
+    wl_session_options_t options;
+    wl_columnar_memory_governor_ref_t *ref = enforcing_governor(UINT64_MAX /
+            4u);
+    wl_columnar_memory_governor_t *governor = ref
+        ? wl_columnar_memory_governor_ref_get(ref) : NULL;
+    int64_t row = 17;
+    int failed = 1;
+    if (!prog || !ref)
+        goto done;
+    wl_session_options_init(&options);
+    options.memory_governor = ref;
+    wl_session_testhook_set_default_options(&options);
+    wirelog_error_t create_rc = wirelog_session_create(prog,
+            WIRELOG_BACKEND_COLUMNAR, 1, &session);
+    wl_session_testhook_set_default_options(NULL);
+    if (create_rc != WIRELOG_OK || !session)
+        goto done;
+    uint64_t baseline = reserved_on(ref);
+    atomic_store_explicit(&governor->usable_bytes, baseline,
+        memory_order_release);
+    wirelog_error_t denied_rc = wirelog_session_insert(session, "src", &row, 1,
+            1);
+    wirelog_error_t stale_rc = wirelog_session_insert(session, "missing", &row,
+            1, 1);
+    if (denied_rc != WIRELOG_ERR_MEMORY_BUDGET
+        || strcmp(wirelog_error_string(denied_rc),
+        "memory budget exhausted") != 0
+        || stale_rc != WIRELOG_ERR_EXEC) {
+        fprintf(stderr, "fact budget: denied=%d stale=%d baseline=%llu\n",
+            denied_rc, stale_rc, (unsigned long long)reserved_on(ref));
+        goto done;
+    }
+    atomic_store_explicit(&governor->usable_bytes, UINT64_MAX / 4u,
+        memory_order_release);
+    if (wirelog_session_insert(session, "src", &row, 1, 1) != WIRELOG_OK
+        || wirelog_session_remove(session, "src", &row, 1, 1) != WIRELOG_OK)
+        goto done;
+    int64_t seed[63];
+    for (uint32_t i = 0; i < 63; i++)
+        seed[i] = (int64_t)i;
+    if (wirelog_session_insert(session, "src", seed, 63, 1) != WIRELOG_OK)
+        goto done;
+    uint32_t types[] = { WIRELOG_TYPE_INT64 };
+    uint32_t offsets[] = { 0 };
+    uint64_t first_lane[] = { 1000 };
+    uint64_t second_lane[] = { 1001 };
+    wirelog_typed_row_v1_t rows[2] = {
+        { sizeof(rows[0]), 1, 0, 1, 1, 1, types, offsets, types, first_lane },
+        { sizeof(rows[1]), 1, 0, 1, 1, 1, types, offsets, types, second_lane }
+    };
+    uint64_t before_typed = reserved_on(ref);
+    atomic_store_explicit(&governor->usable_bytes, before_typed,
+        memory_order_release);
+    wirelog_error_t typed_rc = wirelog_session_insert_typed(session, "src",
+            rows, 2, NULL);
+    uint64_t after_typed = reserved_on(ref);
+    atomic_store_explicit(&governor->usable_bytes, UINT64_MAX / 4u,
+        memory_order_release);
+    struct fact_budget_snapshot_state snapshot = { 0 };
+    if (typed_rc != WIRELOG_ERR_MEMORY_BUDGET
+        || after_typed != before_typed
+        || wirelog_session_step(session) != WIRELOG_OK
+        || wirelog_session_snapshot(session, count_fact_budget_rows,
+        &snapshot) != WIRELOG_OK || snapshot.rows != 63
+        || snapshot.first != 0 || snapshot.second != 0) {
+        fprintf(stderr,
+            "fact budget: typed=%d rows=%u before=%llu after=%llu\n",
+            typed_rc, snapshot.rows, (unsigned long long)before_typed,
+            (unsigned long long)after_typed);
+        goto done;
+    }
+    snapshot = (struct fact_budget_snapshot_state){ 0 };
+    if (wirelog_session_insert_typed(session, "src", rows, 2, NULL)
+        != WIRELOG_OK
+        || wirelog_session_snapshot(session, count_fact_budget_rows,
+        &snapshot) != WIRELOG_OK || snapshot.rows != 65
+        || snapshot.first != 1 || snapshot.second != 1) {
+        fprintf(stderr, "fact budget retry: rows=%u first=%u second=%u\n",
+            snapshot.rows, snapshot.first, snapshot.second);
+        goto done;
+    }
+    failed = 0;
+done:
+    wl_session_testhook_set_default_options(NULL);
+    wirelog_session_destroy(session);
+    wirelog_program_free(prog);
+    if (ref && reserved_on(ref) != 0) {
+        fprintf(stderr, "fact budget teardown retained %llu bytes\n",
+            (unsigned long long)reserved_on(ref));
+        failed = 1;
+    }
+    wl_columnar_memory_governor_ref_release(ref);
+    return failed;
+}
+
 int
 main(void)
 {
@@ -2890,6 +3013,7 @@ main(void)
     failures += test_issue_665_partial_conjunction_default_workers();
     failures += test_issue_665_partial_conjunction_multi_worker();
     failures += test_invalid_memory_budget();
+    failures += test_fact_mutation_budget();
     failures += test_injected_governor_denial_maps_to_memory();
     failures += test_injected_governor_overflow_maps_to_memory();
     failures += test_denied_eval_interning_maps_to_memory();

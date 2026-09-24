@@ -352,9 +352,12 @@ wl_session_insert(wl_session_t *session, const char *relation,
     if (!session->backend || !session->backend->session_insert
         || session->input_load_failed)
         rc = -1;
-    else
+    else {
+        if (session->backend->session_budget_denial_clear)
+            session->backend->session_budget_denial_clear(session);
         rc = session->backend->session_insert(session, relation, data,
                 num_rows, num_cols);
+    }
     wl_session_operation_end(session);
     return rc;
 }
@@ -405,9 +408,12 @@ wl_session_remove(wl_session_t *session, const char *relation,
         return rc;
     if (!session->backend || !session->backend->session_remove)
         rc = -1;
-    else
+    else {
+        if (session->backend->session_budget_denial_clear)
+            session->backend->session_budget_denial_clear(session);
         rc = session->backend->session_remove(session, relation, data,
                 num_rows, num_cols);
+    }
     wl_session_operation_end(session);
     return rc;
 }

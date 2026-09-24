@@ -102,6 +102,14 @@ wl_facade_session_error_code_with_budget(int rc, int expr_status,
     return wl_facade_session_error_code(rc, expr_status);
 }
 
+int
+wl_facade_fact_mutation_error_code(int rc, bool budget_denied)
+{
+    if (budget_denied && rc == ENOMEM)
+        rc = WL_ERR_MEMORY_BUDGET;
+    return wl_facade_session_error_code_with_budget(rc, 0, budget_denied);
+}
+
 static char *
 wl_extension_name_copy(const char *name)
 {
