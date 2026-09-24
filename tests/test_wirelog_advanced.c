@@ -29,7 +29,6 @@
 
 #include <stdbool.h>
 #include <errno.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <math.h>
 #include <stdio.h>
