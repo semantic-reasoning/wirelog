@@ -35,6 +35,11 @@ class SizeAttributionContractTests(unittest.TestCase):
         self.assertIn("GH_REFERENCE_SHA", workflow)
         self.assertIn("timeout-minutes: 60", workflow)
         self.assertIn("ImageVersion", workflow)
+        self.assertIn("scripts/ci/require-ubuntu-2404.sh", workflow)
+        self.assertNotIn("grep -q '^ID=", workflow)
+        self.assertNotIn("grep -q '^VERSION_ID=", workflow)
+        self.assertIn('cat /etc/os-release > size-attribution/os-release.txt', workflow)
+        self.assertIn("        if: always()\n        uses: actions/upload-artifact@v7", workflow)
         self.assertIn("collect-size-attribution.py", workflow)
         self.assertIn("test-size-attribution.py", workflow)
         self.assertNotIn("pull-requests: write", workflow)
@@ -503,6 +508,64 @@ class SizeAttributionContractTests(unittest.TestCase):
         with mock.patch.object(collector.Path, "read_text", return_value='ID="ubuntu"\nVERSION_ID="22.04"\n'), \
              self.assertRaises(collector.DiagnosticError):
             collector.require_os_ubuntu_2404()
+
+    def test_workflow_os_guard_accepts_quoted_and_unquoted_ubuntu_2404(self):
+        helper = ROOT / "scripts/ci/require-ubuntu-2404.sh"
+        valid_files = (
+            'ID=ubuntu\nVERSION_ID=24.04\n',
+            'ID="ubuntu"\nVERSION_ID="24.04"\n',
+            'ID=ubuntu\nVERSION_ID="24.04"\n',
+            'ID="ubuntu"\nVERSION_ID=24.04\n',
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            os_release = Path(temp) / "os-release"
+            for contents in valid_files:
+                with self.subTest(contents=contents):
+                    os_release.write_text(contents, encoding="utf-8")
+                    result = subprocess.run(
+                        [str(helper), str(os_release)], text=True, capture_output=True, check=False)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_workflow_os_guard_rejects_invalid_or_missing_identity_fields(self):
+        helper = ROOT / "scripts/ci/require-ubuntu-2404.sh"
+        invalid_files = (
+            'ID=debian\nVERSION_ID=24.04\n',
+            'ID=ubuntu\nVERSION_ID=22.04\n',
+            'ID=ubuntu\nVERSION_ID=24.10\n',
+            'VERSION_ID=24.04\n',
+            'ID=ubuntu\n',
+            'ID="ubuntu\nVERSION_ID=24.04\n',
+            'ID=ubuntu; :\nVERSION_ID=24.04\n',
+            'ID\nID=ubuntu\nVERSION_ID=24.04\n',
+            'ID =ubuntu\nID=ubuntu\nVERSION_ID=24.04\n',
+            'ID=ubuntu\nID=ubuntu\nVERSION_ID=24.04\n',
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            os_release = Path(temp) / "os-release"
+            inherited_env = os.environ.copy()
+            inherited_env.update(ID="ubuntu", VERSION_ID="24.04")
+            for contents in invalid_files:
+                with self.subTest(contents=contents):
+                    os_release.write_text(contents, encoding="utf-8")
+                    result = subprocess.run(
+                        [str(helper), str(os_release)], env=inherited_env,
+                        text=True, capture_output=True, check=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("error:", result.stderr)
+
+            missing_file = subprocess.run(
+                [str(helper), str(os_release / "missing")], text=True, capture_output=True, check=False)
+            self.assertNotEqual(missing_file.returncode, 0)
+            self.assertIn("cannot read OS release file", missing_file.stderr)
+
+            marker = Path(temp) / "should-not-exist"
+            os_release.write_text(
+                f'ID=ubuntu\nVERSION_ID=24.04\nID_LIKE=debian\n: > {marker}\n',
+                encoding="utf-8")
+            result = subprocess.run(
+                [str(helper), str(os_release)], text=True, capture_output=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(marker.exists())
 
     def test_failure_report_survives_build_failure(self):
         args = collector.parse_args([
