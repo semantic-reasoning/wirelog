@@ -1214,7 +1214,7 @@ session_rel_registration_prepare(wl_col_session_t *sess,
     if (!replacement)
         return ENOMEM;
     if (sess->nrels != 0)
-        memcpy(replacement, sess->rels,
+        memcpy((void *)replacement, (const void *)sess->rels,
             (size_t)sess->nrels * sizeof(*replacement));
     registration->replacement_array = replacement;
     registration->replacement_capacity = capacity;
@@ -1231,7 +1231,7 @@ session_rel_registration_discard(session_rel_registration_t *registration)
     if (registration->retirement.relation)
         (void)wl_columnar_relation_retirement_cancel(
             &registration->retirement);
-    free(registration->replacement_array);
+    free((void *)registration->replacement_array);
     session_rel_registration_init(registration);
 }
 
@@ -1259,7 +1259,7 @@ session_rel_registration_commit(wl_col_session_t *sess, col_rel_t *relation,
     session_rel_free_hash(sess);
     if (registration->old_relation)
         wl_columnar_relation_retirement_commit(&registration->retirement);
-    free(old_array);
+    free((void *)old_array);
     if (old_lease) {
         int release_rc = wl_columnar_session_source_lease_release(old_lease);
         assert(release_rc == 0);
@@ -3861,27 +3861,26 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
     uint32_t match_count = 0;
     uint64_t input_cells;
     uint64_t input_bytes;
-    uint64_t match_plan_bytes;
+    size_t match_plan_count;
+    uint32_t match_capacity;
     bool denied = false;
     bool budget_denied = false;
     char rname[256];
     int rc = 0;
 
+    match_capacity = num_rows < r->nrows ? num_rows : r->nrows;
+    match_plan_count = match_capacity ? (size_t)match_capacity : 1u;
     if (!wl_columnar_memory_size_mul(num_rows, num_cols, &input_cells)
         || !wl_columnar_memory_size_mul(input_cells, sizeof(int64_t),
         &input_bytes)
         || input_bytes > SIZE_MAX
-        || !wl_columnar_memory_size_mul(
-            num_rows < r->nrows ? num_rows : r->nrows,
-            sizeof(*match_plan), &match_plan_bytes)
-        || match_plan_bytes > SIZE_MAX) {
+        || match_plan_count > SIZE_MAX / sizeof(*match_plan)) {
         writer_rc = EOVERFLOW;
         goto incremental_release;
     }
-    if (match_plan_bytes != 0)
-        match_plan = malloc((size_t)match_plan_bytes);
+    match_plan = calloc(match_plan_count, sizeof(*match_plan));
     matched = r->nrows ? (uint8_t *)calloc(r->nrows, sizeof(*matched)) : NULL;
-    if ((match_plan_bytes != 0 && !match_plan)
+    if (!match_plan
         || (r->nrows != 0 && !matched)) {
         writer_rc = ENOMEM;
         goto incremental_release;
@@ -3902,6 +3901,10 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
                 continue;
             col_rel_row_copy_out(r, ri, row_buf);
             if (memcmp(row_buf, del, row_bytes) == 0) {
+                if (match_count >= match_capacity) {
+                    writer_rc = EOVERFLOW;
+                    goto incremental_release;
+                }
                 matched[ri] = 1;
                 match_plan[match_count].request_row = di;
                 match_plan[match_count].source_row = ri;
