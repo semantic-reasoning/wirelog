@@ -329,7 +329,7 @@ test_dispatch_unknown_scheme_error(void)
 static void
 test_dispatch_stream_failure_poison(void)
 {
-    TEST("stream failure poisons session");
+    TEST("CSV commit failure poisons session");
 #ifdef TEST_DISPATCH_PRESENT
     const char *pnames[] = { "filename" };
     const char *tmpdir = getenv("TMPDIR");
@@ -357,7 +357,7 @@ test_dispatch_stream_failure_poison(void)
     }
 
     s_insert_calls = 0;
-    s_fail_insert_at = 2;
+    s_fail_insert_at = 1;
     s_snapshot_called = 0;
     wl_session_t sess = {0};
     sess.backend = &s_mock_backend;
@@ -368,11 +368,62 @@ test_dispatch_stream_failure_poison(void)
     free_program(prog);
     remove(csv_path);
 
-    if (load_rc != 0 && snapshot_rc != 0 && s_insert_calls == 2
+    if (load_rc != 0 && snapshot_rc != 0 && s_insert_calls == 1
         && s_snapshot_called == 0)
         PASS();
     else
-        FAIL("partial stream failure remained evaluable");
+        FAIL("failed atomic CSV commit remained evaluable");
+#else
+    SKIP("dispatch rewrite not yet implemented (#458)");
+#endif
+}
+
+static void
+test_dispatch_late_parse_failure_is_atomic(void)
+{
+    TEST("late CSV parse failure does not commit staged batches");
+#ifdef TEST_DISPATCH_PRESENT
+    const char *pnames[] = { "filename" };
+    const char *tmpdir = getenv("TMPDIR");
+    if (!tmpdir) tmpdir = getenv("TMP");
+    if (!tmpdir) tmpdir = getenv("TEMP");
+    if (!tmpdir) tmpdir = "/tmp";
+    char csv_path[512];
+    snprintf(csv_path, sizeof(csv_path),
+        "%s/wirelog_test_dispatch_late_parse_failure.csv", tmpdir);
+    FILE *f = fopen(csv_path, "w");
+    if (!f) {
+        FAIL("could not create temp CSV file");
+        return;
+    }
+    for (int i = 0; i < 1024; i++)
+        fprintf(f, "%d\n", i);
+    fputs("not-an-integer\n", f);
+    fclose(f);
+
+    const char *pvalues[] = { csv_path };
+    struct wirelog_program *prog = make_program(NULL, pnames, pvalues, 1);
+    if (!prog) {
+        FAIL("failed to create program");
+        remove(csv_path);
+        return;
+    }
+
+    s_insert_calls = 0;
+    s_fail_insert_at = 0;
+    s_snapshot_called = 0;
+    wl_session_t sess = {0};
+    sess.backend = &s_mock_backend;
+    int load_rc = wl_session_load_input_files(&sess, prog);
+    int snapshot_rc = wl_session_snapshot(&sess, NULL, NULL);
+
+    free_program(prog);
+    remove(csv_path);
+    if (load_rc != 0 && snapshot_rc != 0 && s_insert_calls == 0
+        && s_snapshot_called == 0)
+        PASS();
+    else
+        FAIL("late parse failure committed rows or left the session evaluable");
 #else
     SKIP("dispatch rewrite not yet implemented (#458)");
 #endif
@@ -388,6 +439,7 @@ int main(void) {
     test_dispatch_csv_default();
     test_dispatch_unknown_scheme_error();
     test_dispatch_stream_failure_poison();
+    test_dispatch_late_parse_failure_is_atomic();
     printf("=== Results: %d passed, %d failed, %d skipped ===\n",
         passed, failed, skipped);
     return failed > 0 ? 1 : 0;
