@@ -761,6 +761,163 @@ test_retained_relation_admission(void)
 }
 
 static void
+test_bulk_relation_append_transaction(void)
+{
+    const uint64_t one_column_capacity_64 = 64u * sizeof(int64_t);
+    const uint64_t one_column_capacity_128 = 128u * sizeof(int64_t);
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    col_rel_t *rel = NULL;
+    bool denied = false;
+    int64_t initial[64];
+    int64_t batch[65];
+    int rc;
+
+    TEST("bulk append denial leaves unset schema unchanged, exact fit commits");
+    for (uint32_t i = 0; i < 65u; i++)
+        batch[i] = (int64_t)i + 1000;
+    resolution.budget_bytes = one_column_capacity_128 - 1u;
+    resolution.usable_bytes = one_column_capacity_128 - 1u;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    if (!ref || col_rel_alloc(&rel, "bulk-fresh") != 0
+        || col_rel_attach_memory_governor(rel, ref) != 0) {
+        col_rel_destroy(rel);
+        if (ref)
+            wl_columnar_memory_governor_ref_release(ref);
+        FAIL("fresh relation setup failed");
+        return;
+    }
+    rc = col_rel_append_rows_atomic(rel, batch, 65u, 1u, &denied);
+    if (rc != ENOMEM || !denied || rel->ncols != 0 || rel->nrows != 0
+        || rel->capacity != 0 || rel->columns != NULL
+        || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != 0) {
+        col_rel_destroy(rel);
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("denied lazy schema changed relation state");
+        return;
+    }
+    atomic_store_explicit(
+        &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
+        one_column_capacity_128, memory_order_release);
+    rc = col_rel_append_rows_atomic(rel, batch, 65u, 1u, &denied);
+    if (rc != 0 || denied || rel->ncols != 1 || rel->nrows != 65u
+        || rel->capacity != 128u || rel->columns[0][64] != batch[64]
+        || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        != one_column_capacity_128) {
+        col_rel_destroy(rel);
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("exact-fit lazy schema batch did not commit completely");
+        return;
+    }
+    col_rel_destroy(rel);
+    rel = NULL;
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != 0) {
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("fresh relation admission leaked after destroy");
+        return;
+    }
+    wl_columnar_memory_governor_ref_release(ref);
+    PASS();
+
+    TEST("bulk append denial preserves rows, timestamps, and generation");
+    for (uint32_t i = 0; i < 64u; i++)
+        initial[i] = (int64_t)i;
+    const uint64_t old_bytes = one_column_capacity_64
+        + 64u * sizeof(col_delta_timestamp_t);
+    const uint64_t new_bytes = one_column_capacity_128
+        + 128u * sizeof(col_delta_timestamp_t);
+    resolution.budget_bytes = old_bytes + new_bytes;
+    resolution.usable_bytes = old_bytes + new_bytes;
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    rel = NULL;
+    if (!ref || col_rel_alloc(&rel, "bulk-populated") != 0
+        || col_rel_attach_memory_governor(rel, ref) != 0
+        || col_rel_set_schema(rel, 1u, NULL) != 0
+        || col_rel_set_column_types(rel,
+        &(wirelog_column_type_t){ WIRELOG_TYPE_FLOAT }, 1u) != 0
+        || col_rel_enable_timestamps(rel) != 0
+        || col_rel_append_rows_atomic(rel, initial, 64u, 1u,
+        &denied) != 0) {
+        col_rel_destroy(rel);
+        if (ref)
+            wl_columnar_memory_governor_ref_release(ref);
+        FAIL("populated relation setup failed");
+        return;
+    }
+    int64_t **old_columns = rel->columns;
+    col_delta_timestamp_t *old_timestamps = rel->timestamps;
+    uint64_t old_view_generation = rel->view_generation;
+    uint64_t old_storage_generation = rel->storage_generation;
+    int64_t invalid_batch[2] = { batch[0],
+                                 (int64_t)UINT64_C(0x7ff0000000000000) };
+    rc = col_rel_append_rows_atomic(rel, invalid_batch, 2u, 1u, &denied);
+    if (rc != EINVAL || denied || rel->columns != old_columns
+        || rel->timestamps != old_timestamps || rel->capacity != 64u
+        || rel->nrows != 64u || rel->columns[0][63] != 63
+        || rel->timestamps[0].iteration != 0
+        || rel->view_generation != old_view_generation
+        || rel->storage_generation != old_storage_generation
+        || rel->retained_reserved_bytes != old_bytes
+        || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != old_bytes) {
+        col_rel_destroy(rel);
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("invalid final row changed typed relation or admission");
+        return;
+    }
+    atomic_store_explicit(
+        &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
+        old_bytes + new_bytes - 1u, memory_order_release);
+    denied = false;
+    rc = col_rel_append_rows_atomic(rel, batch, 2u, 1u, &denied);
+    if (rc != ENOMEM || !denied || rel->columns != old_columns
+        || rel->timestamps != old_timestamps || rel->capacity != 64u
+        || rel->nrows != 64u || rel->columns[0][63] != 63
+        || rel->timestamps[0].iteration != 0
+        || rel->view_generation != old_view_generation
+        || rel->storage_generation != old_storage_generation
+        || rel->retained_reserved_bytes != old_bytes
+        || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != old_bytes) {
+        col_rel_destroy(rel);
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("denied bulk growth changed populated relation");
+        return;
+    }
+    atomic_store_explicit(
+        &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
+        old_bytes + new_bytes, memory_order_release);
+    denied = true;
+    rc = col_rel_append_rows_atomic(rel, batch, 2u, 1u, &denied);
+    if (rc != 0 || denied || rel->capacity != 128u || rel->nrows != 66u
+        || rel->columns[0][64] != batch[0]
+        || rel->columns[0][65] != batch[1]
+        || rel->timestamps[64].iteration != 0
+        || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != new_bytes) {
+        col_rel_destroy(rel);
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("exact-fit populated batch did not commit completely");
+        return;
+    }
+    col_rel_destroy(rel);
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != 0) {
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("populated relation admission leaked after destroy");
+        return;
+    }
+    wl_columnar_memory_governor_ref_release(ref);
+    PASS();
+}
+
+static void
 test_governed_compaction_transaction(void)
 {
     const uint64_t old_bytes = 128u * sizeof(int64_t)
@@ -11875,6 +12032,7 @@ main(void)
 
     test_session_hash_overflow_rejected();
     test_retained_relation_admission();
+    test_bulk_relation_append_transaction();
     test_governed_compaction_transaction();
     test_intern_reservation_program_lifetime();
     test_intern_rebinds_to_next_session();

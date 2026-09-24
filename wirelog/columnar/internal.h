@@ -2657,6 +2657,12 @@ col_rel_append_row(col_rel_t *r, const int64_t *row);
 int
 col_rel_append_row_locked(col_rel_t *r, const int64_t *row,
     wl_columnar_source_access_writer_t *writer);
+/* Append a complete input batch under one relation writer.  All row/type
+ * validation and governor admission complete before the first row publishes.
+ * On ENOMEM, *@denied distinguishes governor refusal from allocator failure. */
+int
+col_rel_append_rows_atomic(col_rel_t *r, const int64_t *rows,
+    uint32_t num_rows, uint32_t num_cols, bool *denied);
 int
 col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
     wl_columnar_source_access_writer_t *writer,
