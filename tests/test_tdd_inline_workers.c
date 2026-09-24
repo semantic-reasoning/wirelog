@@ -84,10 +84,58 @@ static bool teardown_caller_alias_selected;
 static bool teardown_caller_state_ok;
 static int teardown_caller_rc;
 static uint32_t teardown_caller_cohort_count;
+static bool teardown_dispatch_verified;
+static uint32_t teardown_dispatch_selected_workers;
+static uint32_t teardown_dispatch_completed_rounds;
+static uint64_t teardown_dispatch_submitted_tasks;
+static uint64_t teardown_dispatch_worker_delta_rows;
+static uint32_t teardown_dispatch_reach_rows;
 static bool owner_queue_hold_armed;
 static bool owner_queue_hold_fired;
 static col_rel_t *owner_queue_relation;
 static wl_columnar_source_access_reader_t owner_queue_reader;
+
+static bool
+teardown_reach_matches_oracle(const wl_col_session_t *coord,
+    uint32_t *row_count)
+{
+    const col_rel_t *reach = NULL;
+    bool seen[101][101] = {{ false }};
+    uint32_t rows = 0;
+
+    for (uint32_t i = 0; i < coord->nrels; i++) {
+        const col_rel_t *rel = coord->rels[i];
+        if (rel && rel->name && strcmp(rel->name, "reach") == 0) {
+            reach = rel;
+            break;
+        }
+    }
+    if (!reach || reach->ncols != 4 || !reach->columns
+        || !reach->columns[0] || !reach->columns[1]
+        || !reach->columns[2] || !reach->columns[3])
+        return false;
+
+    for (uint32_t i = 0; i < reach->nrows; i++) {
+        int64_t x = reach->columns[0][i];
+        int64_t y = reach->columns[1][i];
+        if (x < 0 || x > 100 || y > 100 || x >= y
+            || reach->columns[2][i] != 7 || reach->columns[3][i] != 8
+            || seen[x][y])
+            return false;
+        seen[x][y] = true;
+        rows++;
+    }
+    if (rows != 5050)
+        return false;
+    for (int x = 0; x <= 100; x++) {
+        for (int y = x + 1; y <= 100; y++) {
+            if (!seen[x][y])
+                return false;
+        }
+    }
+    *row_count = rows;
+    return true;
+}
 
 void
 wl_columnar_eval_test_before_worker_cleanup(wl_col_session_t *coord)
@@ -103,6 +151,23 @@ wl_columnar_eval_test_before_worker_cleanup(wl_col_session_t *coord)
     teardown_caller_cohort_count = coord->tdd_workers_count;
     if (teardown_caller_cohort_count != 8)
         return;
+    if (coord->tdd_audit.selected_workers != 8
+        || coord->tdd_audit.submitted_tasks == 0
+        || coord->tdd_audit.completed_rounds == 0
+        || coord->tdd_audit.worker_delta_rows == 0
+        || coord->tdd_audit.submitted_tasks
+        != (uint64_t)coord->tdd_audit.selected_workers
+        * coord->tdd_audit.completed_rounds)
+        return;
+    uint32_t reach_rows = 0;
+    if (!teardown_reach_matches_oracle(coord, &reach_rows))
+        return;
+    teardown_dispatch_verified = true;
+    teardown_dispatch_selected_workers = coord->tdd_audit.selected_workers;
+    teardown_dispatch_submitted_tasks = coord->tdd_audit.submitted_tasks;
+    teardown_dispatch_completed_rounds = coord->tdd_audit.completed_rounds;
+    teardown_dispatch_worker_delta_rows = coord->tdd_audit.worker_delta_rows;
+    teardown_dispatch_reach_rows = reach_rows;
     wl_col_session_t *cohort_workers = coord->tdd_workers;
     wl_col_session_t *worker = &coord->tdd_workers[0];
     for (uint32_t i = 0; i < worker->nrels; i++) {
@@ -463,6 +528,7 @@ run_teardown_refusal_gate(void)
     wl_plan_t *plan = NULL;
     wl_session_t *session = NULL;
     wl_col_session_t *columnar = NULL;
+    bool session_cleanup_safe = true;
     int rc;
 
     if (!program)
@@ -478,12 +544,19 @@ run_teardown_refusal_gate(void)
     if (rc != 0)
         goto fail;
     columnar = COL_SESSION(session);
-    int64_t facts[200];
+    int64_t facts[382];
+    uint32_t fact_rows = 0;
     for (int i = 0; i < 100; i++) {
-        facts[i * 2] = (int64_t)i;
-        facts[i * 2 + 1] = (int64_t)i + 1;
+        facts[fact_rows * 2] = (int64_t)i;
+        facts[fact_rows * 2 + 1] = (int64_t)i + 1;
+        fact_rows++;
+        if (i + 10 <= 100) {
+            facts[fact_rows * 2] = (int64_t)i;
+            facts[fact_rows * 2 + 1] = (int64_t)i + 10;
+            fact_rows++;
+        }
     }
-    rc = wl_session_insert(session, "edge", facts, 100, 2);
+    rc = wl_session_insert(session, "edge", facts, fact_rows, 2);
     if (rc != 0)
         goto cleanup;
 
@@ -496,6 +569,12 @@ run_teardown_refusal_gate(void)
     teardown_caller_state_ok = false;
     teardown_caller_rc = 0;
     teardown_caller_cohort_count = 0;
+    teardown_dispatch_verified = false;
+    teardown_dispatch_selected_workers = 0;
+    teardown_dispatch_completed_rounds = 0;
+    teardown_dispatch_submitted_tasks = 0;
+    teardown_dispatch_worker_delta_rows = 0;
+    teardown_dispatch_reach_rows = 0;
     rc = snapshot_oracle(session, 5050, true);
     /* The hook must have run on a populated cohort, or the assertions below
      * would hold for want of anything to refuse. */
@@ -503,12 +582,29 @@ run_teardown_refusal_gate(void)
         rc = EIO;
         goto cleanup;
     }
-    /* A sanity guard, not the discriminating assertion.  The snapshot
-     * reports a generic 1 here both with and without the propagation
-     * under test, so this never fires on the mutation below.  It is kept
-     * because a snapshot reporting success outright would invalidate
-     * everything after it. */
+    /* EBUSY makes the outer snapshot fail during cleanup. Completion proof
+     * was captured in the hook before refusal; this error is only expected
+     * evidence that the refusal propagated to the caller. */
     if (rc == 0) {
+        rc = EIO;
+        goto cleanup;
+    }
+    if (!teardown_dispatch_verified || teardown_dispatch_selected_workers != 8
+        || teardown_dispatch_submitted_tasks == 0
+        || teardown_dispatch_completed_rounds == 0
+        || teardown_dispatch_worker_delta_rows == 0
+        || teardown_dispatch_reach_rows != 5050) {
+        rc = EIO;
+        goto cleanup;
+    }
+    uint32_t recursive = 0, executed = 0, fallback = 0;
+    uint32_t ineligible = 0, no_exchange = 0, unsafe = 0, adaptive = 0;
+    const char *reason = NULL;
+    wl_columnar_session_get_tdd_decision_stats(session, &recursive, &executed,
+        &fallback, &ineligible, &no_exchange, &unsafe, &adaptive, &reason);
+    if (recursive == 0 || executed == 0 || adaptive != 0
+        || fallback != 0 || ineligible != 0 || no_exchange != 0 || unsafe != 0
+        || (reason && reason[0] != '\0' && strcmp(reason, "none") != 0)) {
         rc = EIO;
         goto cleanup;
     }
@@ -526,6 +622,7 @@ run_teardown_refusal_gate(void)
          * than turning a clean failure into a use-after-free. */
         memset(&teardown_reader, 0, sizeof(teardown_reader));
         teardown_reader_release_safe = false;
+        session_cleanup_safe = false;
         rc = EIO;
         goto cleanup;
     }
@@ -533,18 +630,21 @@ run_teardown_refusal_gate(void)
         || !teardown_caller_state_ok || teardown_caller_rc != EBUSY
         || teardown_caller_cohort_count != 8
         || columnar->tdd_workers_count != 8) {
+        session_cleanup_safe = false;
         rc = EIO;
         goto cleanup;
     }
 
     teardown_hold_armed = false;
     if (!teardown_reader_release_safe) {
+        session_cleanup_safe = false;
         rc = EIO;
         goto cleanup;
     }
     int reader_release_rc = col_rel_source_reader_release(&teardown_reader);
     teardown_reader_release_safe = false;
     if (reader_release_rc != 0) {
+        session_cleanup_safe = false;
         rc = EIO;
         goto cleanup;
     }
@@ -553,6 +653,7 @@ run_teardown_refusal_gate(void)
     if (caller_retry_rc != 0 || caller_retry_worker->coordinator != NULL
         || caller_retry_worker->rels != NULL
         || caller_retry_worker->nrels != 0) {
+        session_cleanup_safe = false;
         rc = EIO;
         goto cleanup;
     }
@@ -564,14 +665,20 @@ cleanup:
     /* Release before destroy: col_session_destroy aborts when a worker
      * teardown refuses. */
     if (teardown_reader.owner) {
-        if (teardown_reader_release_safe)
-            (void)col_rel_source_reader_release(&teardown_reader);
-        else
+        if (teardown_reader_release_safe) {
+            if (col_rel_source_reader_release(&teardown_reader) != 0)
+                session_cleanup_safe = false;
+        } else {
             memset(&teardown_reader, 0, sizeof(teardown_reader));
+            session_cleanup_safe = false;
+        }
     }
-    if (session)
+    if (session && session_cleanup_safe)
         wl_session_destroy(session);
-    if (plan)
+    else if (session)
+        fprintf(stderr,
+            "skipping session destruction because the held reader target is unsafe\n");
+    if (plan && session_cleanup_safe)
         wl_plan_free(plan);
     return rc == 0 ? 0 : 1;
 fail:
