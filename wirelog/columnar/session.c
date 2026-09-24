@@ -3317,31 +3317,18 @@ col_session_insert(wl_session_t *session, const char *relation,
      * insert used to *define* the width; it is now checked against the
      * declared physical width when the program declared one, so a host
      * cannot establish a relation at a shape its own `.decl` contradicts. */
-    if (r->ncols == 0) {
-        if (r->declared_ncols != 0 && num_cols != r->declared_ncols)
-            return EINVAL;
-        bool denied_before = r->memory_budget_denial_pending;
-        int rc = col_rel_set_schema(r, num_cols, NULL);
-        if (rc != 0) {
-            if (rc == ENOMEM && !denied_before
-                && r->memory_budget_denial_pending)
-                return ENOSPC;
-            return rc;
-        }
-    } else if (r->ncols != num_cols) {
+    if (r->ncols == 0 && r->declared_ncols != 0
+        && num_cols != r->declared_ncols)
+        return EINVAL;
+    if (r->ncols != 0 && r->ncols != num_cols) {
         return EINVAL; /* column count mismatch */
     }
 
-    for (uint32_t i = 0; i < num_rows; i++) {
-        bool denied_before = r->memory_budget_denial_pending;
-        int rc = col_rel_append_row(r, data + (size_t)i * num_cols);
-        if (rc != 0) {
-            if (rc == ENOMEM && !denied_before
-                && r->memory_budget_denial_pending)
-                return ENOSPC;
-            return rc;
-        }
-    }
+    bool denied = false;
+    int rc = col_rel_append_rows_atomic(r, data, num_rows, num_cols,
+            &denied);
+    if (rc != 0)
+        return rc == ENOMEM && denied ? ENOSPC : rc;
 
     session_note_inserted_input(sess, r, false);
     /* The non-incremental API must force a full epoch evaluation even when
@@ -3508,22 +3495,20 @@ col_session_insert_incremental(wl_session_t *session, const char *relation,
      * insert used to *define* the width; it is now checked against the
      * declared physical width when the program declared one, so a host
      * cannot establish a relation at a shape its own `.decl` contradicts. */
-    if (r->ncols == 0) {
-        if (r->declared_ncols != 0 && num_cols != r->declared_ncols)
-            return EINVAL;
-        int rc = col_rel_set_schema(r, num_cols, NULL);
-        if (rc != 0)
-            return rc;
-    } else if (r->ncols != num_cols) {
+    if (r->ncols == 0 && r->declared_ncols != 0
+        && num_cols != r->declared_ncols)
+        return EINVAL;
+    if (r->ncols != 0 && r->ncols != num_cols) {
         return EINVAL; /* column count mismatch */
     }
 
-    /* Append rows; frontier[] is intentionally NOT modified */
-    for (uint32_t i = 0; i < num_rows; i++) {
-        int rc = col_rel_append_row(r, data + (size_t)i * num_cols);
-        if (rc != 0)
-            return rc;
-    }
+    /* Append the complete batch atomically; frontier[] is intentionally NOT
+     * modified by the incremental path. */
+    bool denied = false;
+    int rc = col_rel_append_rows_atomic(r, data, num_rows, num_cols,
+            &denied);
+    if (rc != 0)
+        return rc == ENOMEM && denied ? ENOSPC : rc;
 
     wl_col_session_t *sess = COL_SESSION(session);
     session_note_inserted_input(sess, r, true);

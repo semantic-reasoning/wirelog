@@ -1801,13 +1801,18 @@ fail:
  * Returns 0 on success, ENOMEM/EINVAL on failure.
  */
 static int
-col_rel_set_schema_impl(col_rel_t *r, uint32_t ncols,
-    const char *const *col_names)
+col_rel_set_schema_impl_capacity(col_rel_t *r, uint32_t ncols,
+    const char *const *col_names, uint32_t initial_capacity,
+    bool *out_denied)
 {
     wl_columnar_memory_reservation_t pending;
     int pending_rc;
     int failure_rc = EINVAL;
+    int reserve_failure_rc = ENOMEM;
     uint64_t retained_bytes = 0;
+
+    if (out_denied)
+        *out_denied = false;
 
     if (!r)
         return EINVAL;
@@ -1815,15 +1820,17 @@ col_rel_set_schema_impl(col_rel_t *r, uint32_t ncols,
         return 0; /* already initialised */
 
     r->ncols = ncols;
-    pending_rc = col_rel_reserve_retained(r, COL_REL_INIT_CAP, &pending,
-            NULL);
+    pending_rc = col_rel_reserve_retained_shape(r, initial_capacity,
+            false, &pending, &reserve_failure_rc);
     if (pending_rc < 0) {
         r->ncols = 0;
-        return ENOMEM;
+        if (out_denied && r->memory_budget_denial_pending)
+            *out_denied = true;
+        return reserve_failure_rc;
     }
 
     if (ncols > 0) {
-        r->capacity = COL_REL_INIT_CAP;
+        r->capacity = initial_capacity;
         r->columns = col_columns_alloc(ncols, r->capacity);
         if (!r->columns) {
             failure_rc = ENOMEM;
@@ -1884,7 +1891,17 @@ fail:
     }
     r->capacity = 0;
     r->ncols = 0;
+    if (out_denied && r->memory_budget_denial_pending)
+        *out_denied = true;
     return failure_rc;
+}
+
+static int
+col_rel_set_schema_impl(col_rel_t *r, uint32_t ncols,
+    const char *const *col_names)
+{
+    return col_rel_set_schema_impl_capacity(r, ncols, col_names,
+               COL_REL_INIT_CAP, NULL);
 }
 
 int
@@ -2616,6 +2633,152 @@ col_rel_append_row_locked(col_rel_t *r, const int64_t *row,
     wl_columnar_source_access_writer_t *writer)
 {
     return col_rel_append_row_impl(r, row, writer, true);
+}
+
+static int
+col_rel_capacity_for_rows(uint32_t current, uint32_t required,
+    uint32_t *out_capacity)
+{
+    uint32_t capacity = current ? current : COL_REL_INIT_CAP;
+
+    if (!out_capacity)
+        return EINVAL;
+    while (capacity < required) {
+        if (capacity > UINT32_MAX / 2u)
+            return EOVERFLOW;
+        capacity *= 2u;
+    }
+    *out_capacity = capacity;
+    return 0;
+}
+
+int
+col_rel_append_rows_atomic(col_rel_t *r, const int64_t *rows,
+    uint32_t num_rows, uint32_t num_cols, bool *denied)
+{
+    wl_columnar_source_access_writer_t writer = { 0 };
+    bool alias_release_pending = false;
+    bool schema_was_unset;
+    uint32_t required_rows;
+    uint32_t capacity;
+    uint64_t cells;
+    uint64_t input_bytes;
+    int rc;
+
+    if (denied)
+        *denied = false;
+    if (!r || (!rows && num_rows != 0))
+        return EINVAL;
+    if (num_rows == 0)
+        return 0;
+    if (!wl_columnar_memory_size_mul(num_rows, num_cols, &cells)
+        || !wl_columnar_memory_size_mul(cells, sizeof(int64_t),
+        &input_bytes)
+        || input_bytes > SIZE_MAX)
+        return EOVERFLOW;
+    rc = col_rel_source_writer_acquire(r, &writer);
+    if (rc != 0)
+        return rc;
+
+    /* Consume stale denial evidence at this operation boundary.  A later
+     * ENOMEM is called a budget denial only if this operation sets the bit. */
+    r->memory_budget_denial_pending = false;
+
+    if (num_rows > UINT32_MAX - r->nrows) {
+        rc = EOVERFLOW;
+        goto finish;
+    }
+    required_rows = r->nrows + num_rows;
+    schema_was_unset = r->ncols == 0;
+    if (r->ncols != 0 && num_cols != r->ncols) {
+        rc = EINVAL;
+        goto finish;
+    }
+    if (r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID
+        - (schema_was_unset ? 2u : 1u)
+        || ((required_rows > r->capacity || r->col_shared || r->arena_owned)
+        && r->storage_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)) {
+        rc = EOVERFLOW;
+        goto finish;
+    }
+
+    /* Validate the entire batch before COW, capacity, timestamps, rows, or
+     * generations can change. */
+    if (r->ncols > 0) {
+        bool empty_unallocated = r->nrows == 0 && r->capacity == 0;
+        if ((!r->columns && !empty_unallocated)
+            || r->capacity < r->nrows) {
+            rc = EINVAL;
+            goto finish;
+        }
+        for (uint32_t c = 0; r->columns && c < r->ncols; c++) {
+            if (!r->columns[c]) {
+                rc = EINVAL;
+                goto finish;
+            }
+        }
+        if (r->column_types) {
+            for (uint32_t row = 0; row < num_rows; row++) {
+                const int64_t *values = rows + (size_t)row * num_cols;
+                for (uint32_t col = 0; col < r->ncols; col++) {
+                    if (r->column_types[col] == WIRELOG_TYPE_FLOAT
+                        && !wl_columnar_float_bits_valid(values[col])) {
+                        rc = EINVAL;
+                        goto finish;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Publish a lazy schema only after every validation that can reject the
+     * batch has completed.  Schema construction itself performs admission
+     * and rolls back on allocation failure; its capacity covers the batch,
+     * so the reserve below cannot expose a partially appended relation. */
+    if (schema_was_unset) {
+        rc = col_rel_capacity_for_rows(r->capacity, required_rows,
+                &capacity);
+        if (rc != 0)
+            goto finish;
+        rc = col_rel_set_schema_impl_capacity(r, num_cols, NULL, capacity,
+                denied);
+        if (rc != 0)
+            goto finish;
+    }
+
+    rc = col_rel_reserve_rows_locked(r, num_rows, &writer,
+            &alias_release_pending);
+    if (rc != 0) {
+        if (denied && r->memory_budget_denial_pending)
+            *denied = true;
+        goto finish;
+    }
+
+    /* Capacity/admission and COW are now complete.  The prevalidated raw
+     * copies below do not allocate and cannot fail while this writer is held. */
+    for (uint32_t row = 0; row < num_rows; row++) {
+        uint32_t dst = r->nrows + row;
+        if (r->timestamps)
+            memset(&r->timestamps[dst], 0, sizeof(r->timestamps[dst]));
+        if (col_rel_row_copy_in_raw(r, dst,
+            rows + (size_t)row * num_cols) != 0)
+            abort();
+    }
+    r->nrows = required_rows;
+    wl_columnar_relation_touch_view(r);
+    rc = 0;
+    if (denied)
+        *denied = false;
+
+finish:
+    if (alias_release_pending
+        && col_rel_storage_alias_release(r) != 0)
+        abort();
+    if (wl_columnar_source_access_writer_release(&writer) != 0)
+        abort();
+    if (rc != 0 && denied && r->memory_budget_denial_pending)
+        *denied = true;
+    return rc;
 }
 
 /* Reserve the complete destination shape before a multi-row operation starts.
