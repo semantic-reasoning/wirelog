@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       pr_number:
-        description: Pull request to inspect (1903 historical or 1945 admission candidate only)
+        description: Open admission pull request to inspect (only allowlisted PRs are accepted)
         required: true
         type: choice
         options:
@@ -12,17 +12,17 @@ on:
           - "1945"
         default: "1903"
       base_sha:
-        description: Full base commit SHA (pinned for 1903; current main for 1945)
+        description: Fresh origin/main SHA used as the pull request base
         required: true
         type: string
-        default: "8d91c2da2b188b94af5b9f1da21c569d80ccb387"
+        default: "65cd273685086a4b7410976be159d44d1615c48e"
       candidate_sha:
         description: Full current PR head SHA from the selected pull request
         required: true
         type: string
         default: "a4c7c622daa3b7247378acf71a74b7f40f4ff556"
       reference_sha:
-        description: For PR 1945 enter the original post-rebase pre-reduction head SHA on every run; record it in the PR review and require reviewers to match every report to it. Leave empty for PR 1903.
+        description: Leave empty for the initial base/head report; for later reductions, use the initial candidate SHA and keep it fixed across runs and matched to each report
         required: false
         type: string
         default: ""
