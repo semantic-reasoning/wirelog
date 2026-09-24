@@ -22,11 +22,14 @@
 #include "wirelog/columnar/memory_governor.h"
 #include "wirelog/exec_plan_gen.h"
 #include "wirelog/session.h"
+#include "wirelog/wirelog-internal.h"
 #include "wirelog/passes/fusion.h"
 #include "wirelog/passes/jpp.h"
 #include "wirelog/passes/sip.h"
 
 #include <stdbool.h>
+#include <errno.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <math.h>
 #include <stdio.h>
@@ -2436,6 +2439,125 @@ out:
     return ok ? 0 : -1;
 }
 
+/* Issue #1938: untyped bulk calls expose budget and allocation failures,
+ * while one-row calls retain their legacy EXEC mapping. */
+static int
+test_bulk_insert_error_mapping(void)
+{
+    static const char *SRC = ".decl src(x: int32)\n";
+    wirelog_program_t *prog = parse_or_die(SRC, "T-1938-bulk-map");
+    wirelog_session_t *session = NULL;
+    wl_session_options_t options;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    uint64_t intern_bytes = 0;
+    uint64_t compound_bytes = 0;
+    const int64_t one[] = { 1 };
+    const int64_t two[] = { 1, 2 };
+    int rc = 1;
+
+    if (!prog || measure_create_floor(prog, &intern_bytes,
+        &compound_bytes) != 0) {
+        fprintf(stderr, "T-1938: could not measure session floor\n");
+        goto out;
+    }
+    wl_session_options_init(&options);
+    ref = enforcing_governor(intern_bytes + compound_bytes);
+    if (!ref)
+        goto out;
+    options.memory_governor = ref;
+    wl_session_testhook_set_default_options(&options);
+    wirelog_error_t create_error = wirelog_session_create(prog,
+            WIRELOG_BACKEND_COLUMNAR, 1, &session);
+    wl_session_testhook_set_default_options(NULL);
+    if (create_error != WIRELOG_OK || !session) {
+        fprintf(stderr, "T-1938: session create err=%d\n", create_error);
+        goto out;
+    }
+    wirelog_error_t bulk_error = wirelog_session_insert(session, "src", two,
+            2, 1);
+    wirelog_error_t single_error = wirelog_session_insert(session, "src", one,
+            1, 1);
+    if (bulk_error != WIRELOG_ERR_MEMORY_BUDGET
+        || single_error != WIRELOG_ERR_EXEC
+        || wl_facade_session_error_code(ENOMEM, 0) != WIRELOG_ERR_MEMORY
+        || wl_facade_session_error_code(WL_ERR_MEMORY_BUDGET, 0)
+        != WIRELOG_ERR_MEMORY_BUDGET) {
+        fprintf(stderr, "T-1938: bulk=%d single=%d ordinary=%d sentinel=%d\n",
+            bulk_error, single_error,
+            wl_facade_session_error_code(ENOMEM, 0),
+            wl_facade_session_error_code(WL_ERR_MEMORY_BUDGET, 0));
+        goto out;
+    }
+    rc = 0;
+out:
+    wl_session_testhook_set_default_options(NULL);
+    if (session)
+        wirelog_session_destroy(session);
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+    if (prog)
+        wirelog_program_free(prog);
+    return rc;
+}
+
+static int
+test_bulk_incremental_remove_budget_mapping(void)
+{
+    static const char *SRC = ".decl src(x: int32)\n";
+    wirelog_program_t *prog = parse_or_die(SRC, "T-1938-remove-budget");
+    wirelog_session_t *session = NULL;
+    wl_session_options_t options;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    struct delta_state deltas = { 0 };
+    const int64_t one[] = { 1 };
+    const int64_t two[] = { 1, 1 };
+    int rc = 1;
+
+    if (!prog)
+        goto out;
+    ref = enforcing_governor(UINT64_C(64) * 1024u * 1024u);
+    if (!ref)
+        goto out;
+    wl_session_options_init(&options);
+    options.memory_governor = ref;
+    wl_session_testhook_set_default_options(&options);
+    wirelog_error_t create_error = wirelog_session_create(prog,
+            WIRELOG_BACKEND_COLUMNAR, 1, &session);
+    wl_session_testhook_set_default_options(NULL);
+    if (create_error != WIRELOG_OK || !session
+        || wirelog_session_insert(session, "src", one, 1, 1) != WIRELOG_OK
+        || wirelog_session_set_delta_cb(session, count_deltas, &deltas)
+        != WIRELOG_OK
+        || wirelog_session_step(session) != WIRELOG_OK) {
+        fprintf(stderr, "T-1938: incremental-remove setup failed\n");
+        goto out;
+    }
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(ref);
+    atomic_store_explicit(&governor->usable_bytes, reserved_on(ref),
+        memory_order_relaxed);
+    wirelog_error_t bulk_error = wirelog_session_remove(session, "src", two,
+            2, 1);
+    wirelog_error_t single_error = wirelog_session_remove(session, "src", one,
+            1, 1);
+    if (bulk_error != WIRELOG_ERR_MEMORY_BUDGET
+        || single_error != WIRELOG_ERR_EXEC) {
+        fprintf(stderr, "T-1938: remove bulk=%d single=%d\n", bulk_error,
+            single_error);
+        goto out;
+    }
+    rc = 0;
+out:
+    wl_session_testhook_set_default_options(NULL);
+    if (session)
+        wirelog_session_destroy(session);
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+    if (prog)
+        wirelog_program_free(prog);
+    return rc;
+}
+
 /* ======================================================================== */
 /* Issue #1521: an evaluation-time interning denial is a memory verdict     */
 /* ======================================================================== */
@@ -2772,6 +2894,8 @@ main(void)
     failures += test_injected_governor_denial_maps_to_memory();
     failures += test_injected_governor_overflow_maps_to_memory();
     failures += test_denied_eval_interning_maps_to_memory();
+    failures += test_bulk_insert_error_mapping();
+    failures += test_bulk_incremental_remove_budget_mapping();
     failures += test_typed_float_ingress();
     if (failures == 0)
         printf("test_wirelog_advanced: OK\n");

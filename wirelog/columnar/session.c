@@ -3863,6 +3863,7 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
     uint64_t input_bytes;
     uint64_t match_plan_bytes;
     bool denied = false;
+    bool budget_denied = false;
     char rname[256];
     int rc = 0;
 
@@ -3956,7 +3957,8 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
     }
     rc = col_rel_attach_memory_governor(rdelta, sess->memory_governor);
     if (rc != 0) {
-        writer_rc = rdelta->memory_budget_denial_pending ? ENOSPC : rc;
+        budget_denied = rdelta->memory_budget_denial_pending;
+        writer_rc = budget_denied ? ENOSPC : rc;
         goto incremental_release;
     }
     /* Build the complete private replacement, carrying earlier same-relation
@@ -3969,7 +3971,8 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
             rc = col_rel_append_rows_atomic(rdelta, row_buf, 1u, num_cols,
                     &denied);
             if (rc != 0) {
-                writer_rc = rc == ENOMEM && denied ? ENOSPC : rc;
+                budget_denied = rc == ENOMEM && denied;
+                writer_rc = budget_denied ? ENOSPC : rc;
                 goto incremental_release;
             }
         }
@@ -3980,14 +3983,16 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
         rc = col_rel_append_rows_atomic(rdelta,
                 data + (size_t)di * num_cols, 1u, num_cols, &denied);
         if (rc != 0) {
-            writer_rc = rc == ENOMEM && denied ? ENOSPC : rc;
+            budget_denied = rc == ENOMEM && denied;
+            writer_rc = budget_denied ? ENOSPC : rc;
             goto incremental_release;
         }
     }
     if (r->timestamps || (previous_delta && previous_delta->timestamps)) {
         rc = col_rel_enable_timestamps(rdelta);
         if (rc != 0) {
-            writer_rc = rdelta->memory_budget_denial_pending ? ENOSPC : rc;
+            budget_denied = rdelta->memory_budget_denial_pending;
+            writer_rc = budget_denied ? ENOSPC : rc;
             goto incremental_release;
         }
         if (previous_delta && previous_delta->timestamps) {
@@ -4054,6 +4059,8 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
     writer_rc = 0;
 
 incremental_release:
+    if (budget_denied)
+        sess->remove_staging_budget_denied = true;
     if (previous_reader.owner)
         (void)col_rel_source_reader_release(&previous_reader);
     if (registration.retirement.relation

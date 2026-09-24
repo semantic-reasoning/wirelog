@@ -528,9 +528,15 @@ wirelog_session_insert(wirelog_session_t *session, const char *relation,
         return WIRELOG_ERR_EXEC;
     if (session_relation_has_float(session, relation))
         return WIRELOG_ERR_EXEC;
+    wl_columnar_session_budget_denial_clear(COL_SESSION(session->inner));
     int rc = wl_session_insert(session->inner, relation, data, num_rows,
             num_cols);
-    return (rc == 0) ? WIRELOG_OK : WIRELOG_ERR_EXEC;
+    if (rc == 0)
+        return WIRELOG_OK;
+    if (num_rows <= 1)
+        return WIRELOG_ERR_EXEC;
+    return (wirelog_error_t)wl_facade_session_error_code_with_budget(rc, 0,
+               wl_session_budget_denied(session->inner));
 }
 
 wirelog_error_t
@@ -541,9 +547,18 @@ wirelog_session_remove(wirelog_session_t *session, const char *relation,
         return WIRELOG_ERR_EXEC;
     if (session_relation_has_float(session, relation))
         return WIRELOG_ERR_EXEC;
+    wl_col_session_t *col_session = COL_SESSION(session->inner);
+    col_session->remove_staging_budget_denied = false;
+    wl_columnar_session_budget_denial_clear(COL_SESSION(session->inner));
     int rc = wl_session_remove(session->inner, relation, data, num_rows,
             num_cols);
-    return (rc == 0) ? WIRELOG_OK : WIRELOG_ERR_EXEC;
+    if (rc == 0)
+        return WIRELOG_OK;
+    if (num_rows <= 1)
+        return WIRELOG_ERR_EXEC;
+    return (wirelog_error_t)wl_facade_session_error_code_with_budget(rc, 0,
+               wl_session_budget_denied(session->inner)
+               || col_session->remove_staging_budget_denied);
 }
 
 wirelog_error_t
