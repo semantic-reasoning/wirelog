@@ -3562,48 +3562,105 @@ col_session_remove(wl_session_t *session, const char *relation,
     if (writer_rc != 0)
         return writer_rc;
 
+    uint8_t *matched = NULL;
     int64_t row_stack[COL_STACK_MAX];
     int64_t *row_buf = row_stack;
-    if (num_cols > COL_STACK_MAX) {
-        row_buf = (int64_t *)malloc(num_cols * sizeof(int64_t));
-        if (!row_buf)
-            writer_rc = ENOMEM;
-    }
-    if (writer_rc != 0)
+    uint32_t remove_count = 0;
+    uint64_t input_cells;
+    uint64_t input_bytes;
+    if (!wl_columnar_memory_size_mul(num_rows, num_cols, &input_cells)
+        || !wl_columnar_memory_size_mul(input_cells, sizeof(int64_t),
+        &input_bytes)
+        || input_bytes > SIZE_MAX) {
+        writer_rc = EOVERFLOW;
         goto remove_release;
+    }
 
-    /* Compact: remove matching rows */
+    /* Prepare the entire match plan before changing the EDB.  A request can
+     * consume only one still-unmatched source row, so duplicate requests
+     * remove duplicate tuples only when those tuples actually exist. */
+    matched = r->nrows
+        ? (uint8_t *)calloc(r->nrows, sizeof(*matched)) : NULL;
+    if (r->nrows != 0 && !matched) {
+        writer_rc = ENOMEM;
+        goto remove_release;
+    }
+    size_t row_bytes = (size_t)(input_bytes / num_rows);
+    if (num_cols > COL_STACK_MAX) {
+        row_buf = (int64_t *)malloc((size_t)num_cols * sizeof(*row_buf));
+        if (!row_buf) {
+            writer_rc = ENOMEM;
+            goto remove_release;
+        }
+    }
     for (uint32_t di = 0; di < num_rows; di++) {
         const int64_t *del = data + (size_t)di * num_cols;
-        uint32_t old_nrows = r->nrows;
-        uint32_t out_r = 0;
         for (uint32_t ri = 0; ri < r->nrows; ri++) {
+            if (matched[ri])
+                continue;
             col_rel_row_copy_out(r, ri, row_buf);
-            if (memcmp(row_buf, del, sizeof(int64_t) * num_cols) != 0) {
-                if (out_r != ri)
-                    col_rel_row_copy_in_raw(r, out_r, row_buf);
+            if (memcmp(row_buf, del, row_bytes) == 0) {
+                matched[ri] = 1;
+                remove_count++;
+                break;
+            }
+        }
+    }
+
+    if (remove_count != 0
+        && r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u) {
+        writer_rc = EOVERFLOW;
+        goto remove_release;
+    }
+    /* session_relation_writer_acquire() rejects active leases.  A residual
+     * shared-column view without a lease cannot be compacted in place. */
+    if (remove_count != 0 && r->col_shared) {
+        writer_rc = EBUSY;
+        goto remove_release;
+    }
+
+    /* No allocation or fallible operation follows the first row write. */
+    if (remove_count != 0) {
+        uint32_t out_r = 0;
+        uint32_t old_nrows = r->nrows;
+        uint32_t old_base_nrows = r->base_nrows < old_nrows
+            ? r->base_nrows : old_nrows;
+        uint32_t new_base_nrows = 0;
+        for (uint32_t ri = 0; ri < old_nrows; ri++) {
+            if (!matched[ri]) {
+                if (ri < old_base_nrows)
+                    new_base_nrows++;
+                if (out_r != ri) {
+                    col_rel_row_move_raw(r, out_r, ri);
+                    if (r->timestamps)
+                        r->timestamps[out_r] = r->timestamps[ri];
+                }
                 out_r++;
-            } else {
-                /* Remove first matching row only */
-                di = num_rows; /* break outer loop after this one */
-                for (uint32_t rest = ri + 1; rest < r->nrows; rest++, out_r++)
-                    col_rel_row_move_raw(r, out_r, rest);
-                r->nrows = out_r;
-                goto next_del;
             }
         }
         r->nrows = out_r;
-next_del:;
-        if (r->nrows != old_nrows)
-            wl_columnar_relation_touch_view(r);
+        r->base_nrows = new_base_nrows;
+        /* Compaction preserves the row sequence, but these optional indexes
+         * describe old row offsets.  Let their owning paths rebuild lazily. */
+        r->sorted_nrows = 0;
+        r->run_count = 0;
+        memset(r->run_ends, 0, sizeof(r->run_ends));
+        free(r->dedup_slots);
+        r->dedup_slots = NULL;
+        r->dedup_cap = 0;
+        r->dedup_count = 0;
+        wl_columnar_relation_touch_view(r);
     }
-    session_invalidate_relation_caches(sess, r->name);
-    sess->pending_input_change = true;
-    sess->snapshot_stable_valid = false;
+    if (remove_count != 0) {
+        session_invalidate_relation_caches(sess, r->name);
+        sess->pending_input_change = true;
+        sess->snapshot_stable_valid = false;
+    }
 
 remove_release:
     if (row_buf != row_stack)
         free(row_buf);
+    free(matched);
     if (writer.owner) {
         int release_rc = wl_columnar_source_access_writer_release(&writer);
         if (writer_rc == 0 && release_rc != 0)

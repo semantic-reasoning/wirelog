@@ -2529,6 +2529,86 @@ test_session_relation(wl_session_t *session, const char *name)
     return NULL;
 }
 
+static void
+test_session_remove_bulk_transaction(void)
+{
+    TEST("session: bulk direct remove stages distinct matches atomically");
+    const int64_t initial[] = { 1, 1, 2, 1 };
+    const int64_t requests[] = { 1, 1 };
+    const int64_t missing[] = { 99 };
+    wl_plan_t *plan = build_plan(".decl a(x: int32)\n");
+    wl_session_t *session = NULL;
+    if (!plan || wl_session_create(wl_backend_columnar(), plan, 1,
+        &session) != 0 || wl_session_insert(session, "a", initial, 4, 1) != 0) {
+        if (session)
+            wl_session_destroy(session);
+        wl_plan_free(plan);
+        FAIL("session setup failed");
+        return;
+    }
+    col_rel_t *rel = test_session_relation(session, "a");
+    wl_col_session_t *sess = COL_SESSION(session);
+    if (!rel || col_rel_enable_timestamps(rel) != 0) {
+        wl_session_destroy(session);
+        wl_plan_free(plan);
+        FAIL("timestamp relation setup failed");
+        return;
+    }
+    for (uint32_t i = 0; i < 4; i++) {
+        rel->timestamps[i].iteration = 10u + i;
+        rel->timestamps[i].multiplicity = (int64_t)i + 1;
+    }
+    rel->base_nrows = 3;
+    rel->sorted_nrows = 4;
+    rel->run_count = 2;
+    rel->run_ends[0] = 2;
+    rel->run_ends[1] = 4;
+    rel->dedup_slots = (uint64_t *)calloc(8, sizeof(*rel->dedup_slots));
+    if (!rel->dedup_slots) {
+        wl_session_destroy(session);
+        wl_plan_free(plan);
+        FAIL("dedup metadata setup failed");
+        return;
+    }
+    rel->dedup_cap = 8;
+    rel->dedup_count = 1;
+    rel->dedup_slots[0] = 123;
+
+    if (wl_session_remove(session, "a", requests, 2, 1) != 0
+        || rel->nrows != 2 || rel->columns[0][0] != 2
+        || rel->columns[0][1] != 1 || rel->timestamps[0].iteration != 12
+        || rel->timestamps[0].multiplicity != 3
+        || rel->timestamps[1].iteration != 13
+        || rel->timestamps[1].multiplicity != 4
+        || rel->base_nrows != 1 || rel->sorted_nrows != 0
+        || rel->run_count != 0 || rel->run_ends[0] != 0
+        || rel->dedup_slots != NULL || rel->dedup_cap != 0
+        || rel->dedup_count != 0 || !sess->pending_input_change) {
+        wl_session_destroy(session);
+        wl_plan_free(plan);
+        FAIL("duplicate requests did not consume distinct rows atomically");
+        return;
+    }
+
+    uint64_t view_generation = rel->view_generation;
+    sess->pending_input_change = false;
+    sess->snapshot_stable_valid = true;
+    if (wl_session_remove(session, "a", missing, 1, 1) != 0
+        || rel->nrows != 2 || rel->columns[0][0] != 2
+        || rel->columns[0][1] != 1
+        || rel->timestamps[0].iteration != 12
+        || rel->view_generation != view_generation
+        || sess->pending_input_change || !sess->snapshot_stable_valid) {
+        wl_session_destroy(session);
+        wl_plan_free(plan);
+        FAIL("missing remove request changed published state");
+        return;
+    }
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    PASS();
+}
+
 static bool
 test_session_remove_alias_borrow_case(bool incremental)
 {
@@ -12055,6 +12135,7 @@ main(void)
     /* GREEN: diff=-1 retraction deltas now implemented */
     test_session_remove_single_delta();
     test_session_remove_nonexistent();
+    test_session_remove_bulk_transaction();
     test_session_remove_live_alias();
     test_session_remove_wide_alias_before_allocation();
     test_session_remove_reader_exclusion();
