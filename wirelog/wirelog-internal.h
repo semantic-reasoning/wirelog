@@ -40,6 +40,12 @@ int
 wl_facade_session_error_code_with_budget(int rc, int expr_status,
     bool budget_denied);
 
+/* A fact mutation begins by clearing the transient denial flag.  Some
+ * relation growth paths still return ENOMEM for a denied reservation; scope
+ * that translation to this operation so later snapshot errors stay distinct. */
+int
+wl_facade_fact_mutation_error_code(int rc, bool budget_denied);
+
 /* Internal callback lifetime lease. The lease token is valid until released,
  * even if the originating snapshot is released or the entry is unregistered
  * while the callback is running. */

@@ -230,7 +230,10 @@ wirelog_easy_make_compound(wirelog_easy_session_t *s, const char *functor,
  * Insert a single row into @relation, lazily building the plan and session
  * on first call.
  *
- * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure.
+ * Returns: WIRELOG_OK on success; a plan/session build error if lazy
+ * initialization fails; WIRELOG_ERR_MEMORY on allocation failure;
+ * WIRELOG_ERR_MEMORY_BUDGET on a governed admission denial; or
+ * WIRELOG_ERR_EXEC on another mutation failure.
  */
 WIRELOG_API wirelog_error_t
 wirelog_easy_insert(wirelog_easy_session_t *s, const char *relation,
@@ -246,7 +249,10 @@ wirelog_easy_insert(wirelog_easy_session_t *s, const char *relation,
  *
  * Remove a single row from @relation.
  *
- * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure.
+ * Returns: WIRELOG_OK on success; a plan/session build error if lazy
+ * initialization fails; WIRELOG_ERR_MEMORY on allocation failure;
+ * WIRELOG_ERR_MEMORY_BUDGET on a governed admission denial; or
+ * WIRELOG_ERR_EXEC on another mutation failure.
  */
 WIRELOG_API wirelog_error_t
 wirelog_easy_remove(wirelog_easy_session_t *s, const char *relation,
@@ -261,7 +267,8 @@ wirelog_easy_remove(wirelog_easy_session_t *s, const char *relation,
  *
  * Variadic helper that interns each symbol then inserts the resulting row.
  *
- * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure.
+ * Returns the same result as wirelog_easy_insert(), or WIRELOG_ERR_EXEC
+ * if symbol interning fails.
  */
 WIRELOG_API wirelog_error_t
 wirelog_easy_insert_sym(wirelog_easy_session_t *s, const char *relation, ...);
@@ -271,7 +278,8 @@ wirelog_easy_insert_sym(wirelog_easy_session_t *s, const char *relation, ...);
  *
  * Variadic counterpart of wirelog_easy_insert_sym for retraction.
  *
- * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure.
+ * Returns the same result as wirelog_easy_remove(), or WIRELOG_ERR_EXEC
+ * if symbol interning fails.
  */
 WIRELOG_API wirelog_error_t
 wirelog_easy_remove_sym(wirelog_easy_session_t *s, const char *relation, ...);
