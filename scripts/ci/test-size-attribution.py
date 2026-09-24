@@ -1,6 +1,7 @@
 """Contract tests for the PR #1903 exact-profile diagnostic collector."""
 
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -26,6 +27,13 @@ class SizeAttributionContractTests(unittest.TestCase):
         self.assertIn("contents: read", workflow)
         self.assertIn("persist-credentials: false", workflow)
         self.assertIn("retention-days: 14", workflow)
+        self.assertIn("type: choice", workflow)
+        self.assertIn("- \"1945\"", workflow)
+        self.assertIn("reference_sha", workflow)
+        self.assertIn("record it in the PR review", workflow)
+        self.assertIn("match every report", workflow)
+        self.assertIn("GH_REFERENCE_SHA", workflow)
+        self.assertIn("timeout-minutes: 60", workflow)
         self.assertIn("ImageVersion", workflow)
         self.assertIn("collect-size-attribution.py", workflow)
         self.assertIn("test-size-attribution.py", workflow)
@@ -49,6 +57,203 @@ class SizeAttributionContractTests(unittest.TestCase):
             collector.verify_repository(Path("."), collector.REPOSITORY, 1903,
                                         collector.BASE_SHA, "a4c7c622daa3b7247378acf71a74b7f40f4ff556",
                                         "refs/heads/main")
+
+    def test_pr1945_mode_accepts_only_fresh_main_head_and_exact_merge_parents(self):
+        base, head, reference = "1" * 40, "3" * 40, "2" * 40
+        metadata = {"state": "open", "base_ref": "main", "base_sha": base,
+                    "head_sha": head, "head_repository": collector.REPOSITORY}
+        collector.validate_pr1945_request(
+            collector.REPOSITORY, 1945, base, head, reference,
+            "refs/heads/main", base, head, [base, head], metadata)
+        rejected = (
+            {"repository": "other/repo"},
+            {"pr_number": 1903},
+            {"base_sha": "4" * 40},
+            {"reference_sha": base},
+            {"candidate_sha": "4" * 40},
+            {"workflow_ref": "refs/heads/feature"},
+            {"remote_main_sha": "5" * 40},
+            {"remote_head_sha": "6" * 40},
+            {"merge_parents": [base, "4" * 40]},
+            {"pull_request": {**metadata, "state": "closed"}},
+            {"pull_request": {**metadata, "base_ref": "release"}},
+            {"pull_request": {**metadata, "base_sha": "7" * 40}},
+            {"pull_request": {**metadata, "head_sha": "8" * 40}},
+            {"pull_request": {**metadata, "head_repository": "fork/wirelog"}},
+        )
+        values = {"repository": collector.REPOSITORY, "pr_number": 1945,
+                  "base_sha": base, "candidate_sha": head,
+                  "reference_sha": reference, "workflow_ref": "refs/heads/main",
+                  "remote_main_sha": base, "remote_head_sha": head,
+                  "merge_parents": [base, head], "pull_request": metadata}
+        for overrides in rejected:
+            with self.subTest(overrides=overrides), self.assertRaises(collector.DiagnosticError):
+                collector.validate_pr1945_request(**(values | overrides))
+
+    def test_pr1945_verify_requires_reference_ancestor_and_fresh_refs(self):
+        base, reference, candidate, merge = "1" * 40, "2" * 40, "3" * 40, "4" * 40
+        outputs = [
+            "https://github.com/semantic-reasoning/wirelog.git\n", "", base + "\n",
+            candidate + "\trefs/pull/1945/head\n", "", "", candidate + "\n",
+            f"{merge} {base} {candidate}\n", base + "\n", reference + "\n",
+            candidate + "\n", "", "",
+        ]
+        metadata = {"state": "open", "base_ref": "main", "base_sha": base,
+                    "head_sha": candidate, "head_repository": collector.REPOSITORY}
+        with mock.patch.object(collector, "fetch_pull_request_metadata", return_value=metadata), \
+             mock.patch.object(collector, "run", side_effect=outputs):
+            identity = collector.verify_repository(
+                Path("."), collector.REPOSITORY, 1945, base, candidate,
+                "refs/heads/main", reference)
+        self.assertEqual(identity["remote_main"], base)
+        self.assertEqual(identity["remote_pr_head"], candidate)
+        self.assertEqual(identity["reference_sha"], reference)
+
+        stale_outputs = list(outputs)
+        stale_outputs[2] = "5" * 40 + "\n"
+        with mock.patch.object(collector, "fetch_pull_request_metadata", return_value=metadata), \
+             mock.patch.object(collector, "run", side_effect=stale_outputs), \
+             self.assertRaises(collector.DiagnosticError):
+            collector.verify_repository(
+                Path("."), collector.REPOSITORY, 1945, base, candidate,
+                "refs/heads/main", reference)
+
+        remaining_outputs = iter(outputs)
+        def reject_candidate_ancestry(command, **kwargs):
+            if command[:3] == ["git", "merge-base", "--is-ancestor"] and command[3] == reference:
+                raise collector.DiagnosticError("reference is not an ancestor")
+            return next(remaining_outputs)
+
+        with mock.patch.object(collector, "fetch_pull_request_metadata", return_value=metadata), \
+             mock.patch.object(collector, "run", side_effect=reject_candidate_ancestry), \
+             self.assertRaises(collector.DiagnosticError):
+            collector.verify_repository(
+                Path("."), collector.REPOSITORY, 1945, base, candidate,
+                "refs/heads/main", reference)
+
+    def test_pr1945_rejects_missing_or_non_ancestor_reference(self):
+        with self.assertRaises(collector.DiagnosticError):
+            collector.verify_repository(Path("."), collector.REPOSITORY, 1945,
+                                        "1" * 40, "3" * 40, "refs/heads/main")
+        base, reference, candidate, merge = "1" * 40, "2" * 40, "3" * 40, "4" * 40
+        outputs = iter([
+            "https://github.com/semantic-reasoning/wirelog.git\n", "", base + "\n",
+            candidate + "\trefs/pull/1945/head\n", "", "", candidate + "\n",
+            f"{merge} {base} {candidate}\n", base + "\n", reference + "\n",
+            candidate + "\n", "",
+        ])
+        def reject_candidate_ancestry(command, **kwargs):
+            if command[:3] == ["git", "merge-base", "--is-ancestor"] and command[3] == reference:
+                raise collector.DiagnosticError("reference is not an ancestor")
+            return next(outputs)
+
+        metadata = {"state": "open", "base_ref": "main", "base_sha": base,
+                    "head_sha": candidate, "head_repository": collector.REPOSITORY}
+        with mock.patch.object(collector, "fetch_pull_request_metadata", return_value=metadata), \
+             mock.patch.object(collector, "run", side_effect=reject_candidate_ancestry), \
+             self.assertRaises(collector.DiagnosticError):
+            collector.verify_repository(
+                Path("."), collector.REPOSITORY, 1945, base, candidate,
+                "refs/heads/main", reference)
+
+    def test_pr1945_metadata_rejects_invalid_json_and_malformed_shapes(self):
+        for payload in (b"not-json", b"[]", b'{"base": [], "head": {}}',
+                        b'{"base": {}, "head": []}',
+                        b'{"base": {}, "head": {"repo": "wrong-shape"}}'):
+            with self.subTest(payload=payload), \
+                 mock.patch.object(collector.urllib.request, "urlopen",
+                                   return_value=io.BytesIO(payload)), \
+                 self.assertRaises(collector.DiagnosticError):
+                collector.fetch_pull_request_metadata(collector.REPOSITORY, 1945)
+
+    def test_pr1945_collection_reports_three_tree_totals_and_checksums(self):
+        base, reference, candidate = "1" * 40, "2" * 40, "3" * 40
+        args = collector.parse_args([
+            "--repository", collector.REPOSITORY, "--pr-number", "1945",
+            "--base-sha", base, "--reference-sha", reference,
+            "--candidate-sha", candidate, "--workflow-ref", "refs/heads/main",
+        ])
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args.repository_root = str(ROOT)
+            args.output = str(root / "artifacts")
+
+            def fake_build(repo, source, sha, target, env, map_path=None, build_root=None):
+                target.mkdir(parents=True, exist_ok=True)
+                profile = target / "profile.json"
+                profile.write_text(json.dumps({
+                    "schema_version": 1, "source_sha": sha,
+                    "options": {"optimization": "s", "b_lto": True},
+                    "effective_link_arguments": [{"parameters": ["-shared", "-flto"]}],
+                }), encoding="utf-8")
+                library = target / "libwirelog.so"
+                library.write_bytes(sha.encode())
+                if map_path is not None:
+                    map_path.write_text(" .text 0x1000 0x20 build/lib.p/a.o\n", encoding="utf-8")
+                digest = collector.sha256_file(library)
+                return {"build": build_root, "profile": profile, "library": library,
+                        "map": map_path, "setup_command": ["meson", "setup"],
+                        "compile_command": ["meson", "compile"], "binary_sha256": digest}
+
+            def fake_run(command, **kwargs):
+                if command[0] == "git" and command[1:3] == ["rev-parse", "HEAD"]:
+                    return "9" * 40 + "\n"
+                if command[0] == "gcc":
+                    return "13.3.0\n"
+                if command[0] == "ld":
+                    return "GNU ld 2.42\n"
+                if command[0] == "meson":
+                    return "1.12.0\n"
+                if command[0] == "ninja":
+                    return "1.11.1\n"
+                if command[0] == "readelf":
+                    return "[ 1] .debug_info [ 2] .debug_line"
+                return ""
+
+            def fake_measure(repo, library, sha, profile, output, env):
+                value = int(sha[0], 16) * 100 + 360000
+                return {"measured_bytes": value, "source_sha": sha}
+
+            with mock.patch.object(collector, "require_os_ubuntu_2404", return_value={"version_id": "24.04"}), \
+                 mock.patch.object(collector, "verify_repository", return_value={"remote_main": base}), \
+                 mock.patch.object(collector, "read_workflow_code_identity", return_value={"tool": "hash"}), \
+                 mock.patch.object(collector, "read_policy_identity", return_value={"policy": "hash"}), \
+                 mock.patch.object(collector, "run", side_effect=fake_run), \
+                 mock.patch.object(collector, "extract_tree"), \
+                 mock.patch.object(collector, "build_one", side_effect=fake_build), \
+                 mock.patch.object(collector, "measure_library", side_effect=fake_measure), \
+                 mock.patch.object(collector, "forensic_profile_matches", return_value=(True, [])), \
+                 mock.patch.object(collector, "text_size", return_value=360000), \
+                 mock.patch.object(collector, "map_text_objects", return_value=[
+                     {"object": "lib.p/a.o", "text_bytes": 32}]), \
+                 mock.patch.object(collector, "symbol_artifacts", side_effect=lambda *args, **kwargs: {"text_symbols": []}), \
+                 mock.patch.object(collector, "map_text_sections", return_value=[]), \
+                 mock.patch.object(collector, "lto_evidence", return_value={"enabled": True}), \
+                 mock.patch.object(collector, "join_symbols_to_objects", return_value=[]), \
+                 mock.patch.object(collector, "attach_source_locations"):
+                self.assertEqual(collector.collect(args), 0)
+
+            report = json.loads((Path(args.output) / "report.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "complete")
+            self.assertEqual(report["authoritative"]["base"]["source_sha"], base)
+            self.assertEqual(report["authoritative"]["reference"]["source_sha"], reference)
+            self.assertEqual(report["authoritative"]["candidate"]["source_sha"], candidate)
+            self.assertEqual(set(report["total_text_comparisons"]),
+                             {"base_to_reference", "reference_to_candidate", "base_to_candidate"})
+            self.assertTrue((Path(args.output) / "SHA256SUMS").is_file())
+
+    def test_artifact_checksums_cover_report_and_map_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "report.json").write_text("report\n", encoding="utf-8")
+            (root / "attribution-base.map").write_text("map\n", encoding="utf-8")
+            collector.write_artifact_checksums(root)
+            lines = (root / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
+            self.assertEqual([line.split("  ", 1)[1] for line in lines],
+                             ["attribution-base.map", "report.json"])
+            for line in lines:
+                digest, relative = line.split("  ", 1)
+                self.assertEqual(digest, collector.sha256_file(root / relative))
 
     def test_build_environment_drops_credentials_and_inherited_flags(self):
         with mock.patch.dict(os.environ, {"GH_TOKEN": "secret", "GITHUB_TOKEN": "secret",
