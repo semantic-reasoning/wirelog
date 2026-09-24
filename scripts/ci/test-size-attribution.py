@@ -104,6 +104,115 @@ class SizeAttributionContractTests(unittest.TestCase):
                 {"object": "build/b.o", "text_bytes": 8},
             ])
 
+    def test_map_parser_retains_half_open_ranges_and_ltrans_objects(self):
+        with tempfile.TemporaryDirectory() as temp:
+            map_file = Path(temp) / "sample.map"
+            map_file.write_text(
+                " .text.alpha 0x0000000000001000 0x10 build/lib.p/a.o\n"
+                " .text.beta 0x0000000000002000 0x08 build/lib.p/ltrans0.ltrans.o\n",
+                encoding="utf-8")
+            self.assertEqual(collector.map_text_sections(map_file), [
+                {"section": ".text.alpha", "start": 0x1000, "end": 0x1010,
+                 "text_bytes": 0x10, "object": "build/lib.p/a.o"},
+                {"section": ".text.beta", "start": 0x2000, "end": 0x2008,
+                 "text_bytes": 0x08, "object": "build/lib.p/ltrans0.ltrans.o"},
+            ])
+
+    def test_symbols_join_only_to_unique_half_open_object_ranges(self):
+        deltas = [{"object": "a.o", "delta_bytes": 12},
+                  {"object": "b.o", "delta_bytes": -4}]
+        sections = [
+            {"start": 0x1000, "end": 0x1010, "text_bytes": 16, "object": "base/lib.p/a.o"},
+            {"start": 0x1010, "end": 0x1020, "text_bytes": 16, "object": "base/lib.p/b.o"},
+        ]
+        symbols = [
+            {"address": "4096", "size": 5, "kind": "T", "symbol": "first"},
+            {"address": "4111", "size": 1, "kind": "T", "symbol": "last_in_a"},
+            {"address": "4111", "size": 2, "kind": "T", "symbol": "crosses_a_boundary"},
+            {"address": "4112", "size": 2, "kind": "T", "symbol": "first_in_b"},
+            {"address": "8192", "size": 2, "kind": "T", "symbol": "unmapped"},
+        ]
+        result = collector.join_symbols_to_objects(deltas, sections, symbols)
+        self.assertEqual(result[0]["status"], "available")
+        self.assertEqual([row["symbol"] for row in result[0]["symbols"]], ["first", "last_in_a"])
+        self.assertEqual(result[0]["boundary_symbol_count"], 1)
+        self.assertEqual([row["symbol"] for row in result[1]["symbols"]], ["first_in_b"])
+        self.assertEqual(result[1]["symbols"][0]["address_hex"], "0x1010")
+
+    def test_zero_sized_symbol_at_section_end_is_not_attributed(self):
+        result = collector.join_symbols_to_objects(
+            [{"object": "a.o", "delta_bytes": 1}],
+            [{"start": 0x1000, "end": 0x1010, "text_bytes": 16, "object": "lib.p/a.o"}],
+            [{"address": str(0x1010), "size": 0, "kind": "T", "symbol": "at_end"}])
+        self.assertEqual(result[0]["status"], "unavailable")
+        self.assertEqual(result[0]["symbols"], [])
+
+    def test_only_largest_changed_objects_receive_symbol_rows(self):
+        deltas = [{"object": f"obj{index}.o", "delta_bytes": 20 - index}
+                  for index in range(12)]
+        sections = [{"start": 0x1000 + index * 0x10, "end": 0x1010 + index * 0x10,
+                     "text_bytes": 16, "object": f"build/lib.p/obj{index}.o"}
+                    for index in range(12)]
+        symbols = [{"address": str(0x1000 + index * 0x10), "size": 4,
+                    "kind": "T", "symbol": f"symbol{index}"} for index in range(12)]
+        result = collector.join_symbols_to_objects(deltas, sections, symbols)
+        self.assertEqual(len(result), 10)
+        self.assertEqual(result[-1]["object"], "obj9.o")
+
+    def test_symbol_join_marks_overlapping_object_ranges_ambiguous(self):
+        result = collector.join_symbols_to_objects(
+            [{"object": "a.o", "delta_bytes": 1}],
+            [{"start": 0x1000, "end": 0x1020, "text_bytes": 32, "object": "x.p/a.o"},
+             {"start": 0x1000, "end": 0x1020, "text_bytes": 32, "object": "y.p/b.o"}],
+            [{"address": "4096", "size": 4, "kind": "T", "symbol": "shared"}])
+        self.assertEqual(result[0]["status"], "ambiguous")
+        self.assertEqual(result[0]["ambiguous_symbol_count"], 1)
+        self.assertEqual(result[0]["symbols"], [])
+
+    def test_object_source_rows_are_nested_and_explicitly_unavailable(self):
+        item = {"object": "a.o", "status": "available", "reason": None,
+                "symbols": [{"address_hex": "0x1000", "address": "4096", "size": 4,
+                             "kind": "T", "symbol": "foo"}]}
+        with mock.patch.object(collector, "run", return_value="foo()\nsrc/foo.c:12") as run_mock:
+            collector.attach_source_locations(Path("libwirelog.so"), [item], {}, dwarf_available=True)
+            self.assertEqual(item["source_mapping"]["status"], "available")
+            self.assertEqual(item["source_mapping"]["records"][0]["source"], "src/foo.c:12")
+            run_mock.assert_called_once()
+        unavailable = {"object": "new.o", "reason": "no linker-map range", "symbols": []}
+        collector.attach_source_locations(Path("libwirelog.so"), [unavailable], {}, dwarf_available=False)
+        self.assertEqual(unavailable["source_mapping"]["status"], "unavailable")
+        self.assertEqual(unavailable["source_mapping"]["reason"], "no linker-map range")
+
+    def test_lto_and_inlining_evidence_are_explicit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp) / "profile.json"
+            profile.write_text(json.dumps({
+                "options": {"b_lto": True},
+                "effective_link_arguments": [{"parameters": ["-shared", "-flto=auto"]}],
+            }), encoding="utf-8")
+            sections = [{"object": "build/lib.p/ltrans0.ltrans.o", "text_bytes": 20}]
+            evidence = collector.lto_evidence(profile, sections)
+            self.assertTrue(evidence["enabled"])
+            self.assertEqual(evidence["ltrans_objects"]["status"], "available")
+            self.assertEqual(evidence["ltrans_objects"]["count"], 1)
+            self.assertEqual(evidence["ltrans_objects"]["text_bytes"], 20)
+            self.assertEqual(evidence["inlining_evidence"]["status"], "unavailable")
+            self.assertTrue(evidence["inlining_evidence"]["reason"])
+
+            profile.write_text(json.dumps({"options": {"b_lto": False},
+                                           "effective_link_arguments": [{"parameters": []}]}),
+                               encoding="utf-8")
+            disabled = collector.lto_evidence(profile, [])
+            self.assertFalse(disabled["enabled"])
+            self.assertEqual(disabled["ltrans_objects"]["status"], "not-applicable")
+
+            profile.write_text(json.dumps({"options": {"b_lto": True},
+                                           "effective_link_arguments": [{"parameters": ["-flto"]}]}),
+                               encoding="utf-8")
+            unavailable = collector.lto_evidence(profile, [])
+            self.assertEqual(unavailable["ltrans_objects"]["status"], "unavailable")
+            self.assertTrue(unavailable["ltrans_objects"]["reason"])
+
     def test_per_object_delta_is_ranked_by_absolute_change(self):
         deltas = collector.object_text_deltas(
             [{"object": "/base/build/libwirelog.so.p/a.o", "text_bytes": 20},
@@ -114,6 +223,16 @@ class SizeAttributionContractTests(unittest.TestCase):
         self.assertEqual(deltas[0]["delta_bytes"], 30)
         self.assertEqual({item["object"]: item["delta_bytes"] for item in deltas},
                          {"a.o": 30, "b.o": -20})
+
+    def test_ltrans_partition_names_are_not_paired_as_object_deltas(self):
+        deltas = collector.object_text_deltas(
+            [{"object": "/base/lib.p/a.o", "text_bytes": 12},
+             {"object": "/base/lib.p/ltrans0.ltrans.o", "text_bytes": 100}],
+            [{"object": "/candidate/lib.p/a.o", "text_bytes": 15},
+             {"object": "/candidate/lib.p/ltrans1.ltrans.o", "text_bytes": 120},
+             {"object": "/candidate/lib.p/ltrans2.ltrans.o", "text_bytes": 40}])
+        self.assertEqual(deltas, [{"object": "a.o", "base_text_bytes": 12,
+                                   "candidate_text_bytes": 15, "delta_bytes": 3}])
 
     def test_size_profile_comparison_rejects_profile_mismatch(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -186,6 +305,7 @@ class SizeAttributionContractTests(unittest.TestCase):
             "--base-sha", collector.BASE_SHA, "--candidate-sha", "a4c7c622daa3b7247378acf71a74b7f40f4ff556",
             "--workflow-ref", "refs/heads/main",
         ])
+        args.repository_root = str(ROOT)
         with tempfile.TemporaryDirectory() as temp:
             args.output = str(Path(temp) / "artifacts")
             tool_versions = {
