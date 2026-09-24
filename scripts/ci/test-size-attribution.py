@@ -523,7 +523,8 @@ class SizeAttributionContractTests(unittest.TestCase):
                 with self.subTest(contents=contents):
                     os_release.write_text(contents, encoding="utf-8")
                     result = subprocess.run(
-                        [str(helper), str(os_release)], text=True, capture_output=True, check=False)
+                        [str(helper), str(os_release)], text=True, encoding="utf-8",
+                        capture_output=True, check=False)
                     self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_workflow_os_guard_rejects_invalid_or_missing_identity_fields(self):
@@ -549,12 +550,13 @@ class SizeAttributionContractTests(unittest.TestCase):
                     os_release.write_text(contents, encoding="utf-8")
                     result = subprocess.run(
                         [str(helper), str(os_release)], env=inherited_env,
-                        text=True, capture_output=True, check=False)
+                        text=True, encoding="utf-8", capture_output=True, check=False)
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("error:", result.stderr)
 
             missing_file = subprocess.run(
-                [str(helper), str(os_release / "missing")], text=True, capture_output=True, check=False)
+                [str(helper), str(os_release / "missing")], text=True,
+                encoding="utf-8", capture_output=True, check=False)
             self.assertNotEqual(missing_file.returncode, 0)
             self.assertIn("cannot read OS release file", missing_file.stderr)
 
@@ -563,7 +565,8 @@ class SizeAttributionContractTests(unittest.TestCase):
                 f'ID=ubuntu\nVERSION_ID=24.04\nID_LIKE=debian\n: > {marker}\n',
                 encoding="utf-8")
             result = subprocess.run(
-                [str(helper), str(os_release)], text=True, capture_output=True, check=False)
+                [str(helper), str(os_release)], text=True, encoding="utf-8",
+                capture_output=True, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(marker.exists())
 
