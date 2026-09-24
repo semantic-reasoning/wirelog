@@ -289,36 +289,58 @@ def symbol_artifacts(library: Path, output: Path, env: dict[str, str]) -> dict[s
     mapping_path.write_text(json.dumps(mapping, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     return {"nm_file": nm_path.name, "objdump_file": objdump_path.name,
             "source_map_file": mapping_path.name, "source_mapping": mapping,
-            "largest_symbols": largest}
+            "largest_symbols": largest, "text_symbols": text_symbols}
 
 
-def map_text_objects(map_path: Path) -> list[dict[str, Any]]:
+def map_text_sections(map_path: Path) -> list[dict[str, Any]]:
     if not map_path.is_file():
         return []
-    pattern = re.compile(r"^\s+\.text(?:\.[^\s]+)?\s+0x[0-9a-fA-F]+\s+0x([0-9a-fA-F]+)\s+(\S+\.o)\s*$")
-    totals: dict[str, int] = {}
+    pattern = re.compile(
+        r"^\s+(\.text(?:\.[^\s]+)?)\s+(0x[0-9a-fA-F]+)\s+"
+        r"(0x[0-9a-fA-F]+)\s+(\S+\.o)\s*$")
+    sections: list[dict[str, Any]] = []
     for line in map_path.read_text(encoding="utf-8", errors="replace").splitlines():
         match = pattern.match(line)
         if match:
-            size, name = match.groups()
-            totals[name] = totals.get(name, 0) + int(size, 16)
+            section, address, size, name = match.groups()
+            start, length = int(address, 16), int(size, 16)
+            if length:
+                sections.append({"section": section, "start": start, "end": start + length,
+                                 "text_bytes": length, "object": name})
+    return sections
+
+
+def object_key(name: str) -> str:
+    normalized = name.replace("\\", "/")
+    parts = normalized.split("/")
+    for index, part in enumerate(parts):
+        if part.endswith(".p"):
+            return "/".join(parts[index + 1:])
+    return "/".join(parts[-3:])
+
+
+def map_text_objects(map_path: Path) -> list[dict[str, Any]]:
+    totals: dict[str, int] = {}
+    for section in map_text_sections(map_path):
+        name = section["object"]
+        totals[name] = totals.get(name, 0) + section["text_bytes"]
     return [{"object": name, "text_bytes": amount}
             for name, amount in sorted(totals.items(), key=lambda pair: pair[1], reverse=True)]
 
 
-def object_text_deltas(base: list[dict[str, Any]], candidate: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    def key(name: str) -> str:
-        normalized = name.replace("\\", "/")
-        parts = normalized.split("/")
-        for index, part in enumerate(parts):
-            if part.endswith(".p"):
-                return "/".join(parts[index + 1:])
-        return "/".join(parts[-3:])
+def is_ltrans_object(name: str) -> bool:
+    return bool(re.search(r"(?:^|/)ltrans[^/]*\.ltrans\.o$", name.replace("\\", "/")))
 
+
+def object_text_deltas(base: list[dict[str, Any]], candidate: list[dict[str, Any]]) -> list[dict[str, Any]]:
     def aggregate(rows: list[dict[str, Any]]) -> dict[str, int]:
         result: dict[str, int] = {}
         for row in rows:
-            normalized = key(row["object"])
+            # LTO partition names describe compiler-generated chunks, not stable
+            # source objects. Compare them per build only through lto_evidence().
+            if is_ltrans_object(row["object"]):
+                continue
+            normalized = object_key(row["object"])
             result[normalized] = result.get(normalized, 0) + row["text_bytes"]
         return result
 
@@ -329,6 +351,141 @@ def object_text_deltas(base: list[dict[str, Any]], candidate: list[dict[str, Any
                "delta_bytes": after.get(name, 0) - before.get(name, 0)}
               for name in names]
     return sorted(deltas, key=lambda item: abs(item["delta_bytes"]), reverse=True)
+
+
+def join_symbols_to_objects(object_deltas: list[dict[str, Any]],
+                            sections: list[dict[str, Any]],
+                            symbols: list[dict[str, Any]], *,
+                            object_limit: int = 10,
+                            symbol_limit: int = 20) -> list[dict[str, Any]]:
+    """Join final-binary symbols to changed input objects using linker-map ranges.
+
+    A symbol is attributed only when its full address range falls in sections
+    belonging to exactly one normalized input object. Ranges are half-open to
+    avoid assigning a symbol at one object's end to that object.
+    """
+    by_key: dict[str, list[dict[str, Any]]] = {}
+    for section in sections:
+        by_key.setdefault(object_key(section["object"]), []).append(section)
+
+    result: list[dict[str, Any]] = []
+    for delta in object_deltas[:object_limit]:
+        key = delta["object"]
+        matched: list[dict[str, Any]] = []
+        ambiguous = 0
+        boundary = 0
+        for symbol in symbols:
+            address = int(symbol["address"], 10)
+            start_owners = {object_key(section["object"]) for section in sections
+                            if section["start"] <= address < section["end"]}
+            symbol_end = address + symbol["size"]
+            owners = {object_key(section["object"]) for section in sections
+                      if section["start"] <= address < section["end"]
+                      and symbol_end <= section["end"]}
+            if len(owners) > 1 and key in owners:
+                ambiguous += 1
+            elif not owners and key in start_owners:
+                boundary += 1
+            elif owners == {key}:
+                matched.append({**symbol, "address_hex": f"0x{address:x}"})
+        matched.sort(key=lambda item: item["size"], reverse=True)
+        selected = matched[:symbol_limit]
+        own_sections = by_key.get(key, [])
+        if selected:
+            status, reason = "available", None
+        elif not own_sections:
+            status, reason = "unavailable", "no linker-map .text range for this object in this build"
+        elif ambiguous:
+            status, reason = "ambiguous", "symbol addresses overlap multiple normalized input objects"
+        elif boundary:
+            status, reason = "ambiguous", "symbol ranges cross their linker-map input-section boundary"
+        else:
+            status, reason = "unavailable", "no final-binary text symbols uniquely joined to this object"
+        result.append({
+            "object": key,
+            "delta_bytes": delta["delta_bytes"],
+            "status": status,
+            "reason": reason,
+            "map_sections": len(own_sections),
+            "matched_symbol_count": len(matched),
+            "ambiguous_symbol_count": ambiguous,
+            "boundary_symbol_count": boundary,
+            "omitted_symbol_count": max(0, len(matched) - len(selected)),
+            "symbols": selected,
+        })
+    return result
+
+
+def attach_source_locations(library: Path, object_attribution: list[dict[str, Any]],
+                            env: dict[str, str], *, dwarf_available: bool) -> None:
+    for item in object_attribution:
+        symbols = item["symbols"]
+        if not symbols:
+            item["source_mapping"] = {"status": "unavailable", "reason": item["reason"],
+                                      "records": []}
+            continue
+        if not dwarf_available:
+            item["source_mapping"] = {
+                "status": "unavailable", "reason": "final binary has no DWARF info/line sections",
+                "records": [],
+            }
+            continue
+        mapped = run(["addr2line", "-e", str(library), "-f", "-C",
+                      *(symbol["address_hex"] for symbol in symbols)], env=env).splitlines()
+        records = []
+        mapped_count = 0
+        for index, symbol in enumerate(symbols):
+            function = mapped[index * 2] if index * 2 < len(mapped) else "??"
+            source = mapped[index * 2 + 1] if index * 2 + 1 < len(mapped) else "??:?"
+            mapped_count += source not in ("??:?", "??:0")
+            records.append({"symbol": symbol["symbol"], "address": symbol["address_hex"],
+                            "function": function, "source": source})
+        item["source_mapping"] = {
+            "status": "available" if mapped_count else "unavailable",
+            "reason": None if mapped_count else "addr2line found no source locations for joined symbols",
+            "mapped_symbols": mapped_count,
+            "records": records,
+        }
+
+
+def lto_evidence(profile_path: Path, sections: list[dict[str, Any]]) -> dict[str, Any]:
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    options = profile.get("options", {})
+    lto_option = options.get("b_lto")
+    link_flags = [parameter for entry in profile.get("effective_link_arguments", [])
+                  for parameter in entry.get("parameters", [])]
+    lto_flags = [flag for flag in link_flags if flag == "-flto" or flag.startswith("-flto=")]
+    enabled = bool(lto_option) or bool(lto_flags)
+    ltrans = sorted({section["object"] for section in sections
+                     if re.search(r"(?:^|/)ltrans[^/]*\.ltrans\.o$", section["object"])})
+    ltrans_sections = [section for section in sections if section["object"] in ltrans]
+    if not enabled:
+        ltrans_status, ltrans_reason = "not-applicable", "LTO is disabled in the effective profile"
+    elif ltrans:
+        ltrans_status, ltrans_reason = "available", None
+    else:
+        ltrans_status, ltrans_reason = "unavailable", "linker map contains no recognizable LTRANS input objects"
+    return {
+        "enabled": enabled,
+        "profile_b_lto": lto_option,
+        "effective_flto_flags": lto_flags,
+        "ltrans_objects": {
+            "status": ltrans_status,
+            "reason": ltrans_reason,
+            "count": len(ltrans),
+            "text_bytes": sum(section["text_bytes"] for section in ltrans_sections),
+            "objects": ltrans,
+            "cross_build_delta_status": "unavailable",
+            "cross_build_delta_reason": (
+                "LTRANS partition names and membership are build-specific and are excluded from "
+                "like-for-like object delta ranking"
+            ),
+        },
+        "inlining_evidence": {
+            "status": "unavailable",
+            "reason": "the authoritative CI profile does not emit an optimizer inline-decision report",
+        },
+    }
 
 
 def attribution_matches(forensic_hash: str, authoritative_hash: str,
@@ -462,6 +619,10 @@ def collect(args: argparse.Namespace) -> int:
             write_json(report_path, report)
 
             attribution: dict[str, Any] = {}
+            attribution_sections: dict[str, list[dict[str, Any]]] = {}
+            attribution_text_symbols: dict[str, list[dict[str, Any]]] = {}
+            attribution_libraries: dict[str, Path] = {}
+            attribution_dwarf: dict[str, bool] = {}
             for label, source, sha, auth in (
                 ("base", source_base, args.base_sha, auth_base),
                 ("candidate", source_candidate, args.candidate_sha, auth_candidate),
@@ -477,6 +638,9 @@ def collect(args: argparse.Namespace) -> int:
                 same_text = forensic_text == authoritative_text
                 map_digest = sha256_file(map_path) if map_path.is_file() else None
                 symbols = symbol_artifacts(forensic["library"], output / f"attribution-{label}", env)
+                sections = map_text_sections(map_path)
+                text_symbols = symbols.pop("text_symbols")
+                section_listing = run(["readelf", "--sections", "--wide", str(forensic["library"])], env=env)
                 attribution[label] = {
                     "binary_sha256": forensic["binary_sha256"],
                     "text_bytes": forensic_text,
@@ -492,10 +656,26 @@ def collect(args: argparse.Namespace) -> int:
                     "objects": map_text_objects(map_path),
                     "symbols": symbols,
                     "extra_linker_flag": f"-Wl,-Map={map_path}",
+                    "lto_evidence": lto_evidence(forensic["profile"], sections),
                 }
+                attribution_sections[label] = sections
+                attribution_text_symbols[label] = text_symbols
+                attribution_libraries[label] = forensic["library"]
+                attribution_dwarf[label] = dwarf_mapping_available(section_listing)
             report["attribution"] = attribution
             report["per_object_text_deltas"] = object_text_deltas(
                 attribution["base"]["objects"], attribution["candidate"]["objects"])
+            report["per_object_text_delta_note"] = (
+                "LTRANS objects are excluded from cross-build object deltas because partition "
+                "names and membership are not stable; inspect per-build lto_evidence instead."
+            )
+            for label in ("base", "candidate"):
+                object_evidence = join_symbols_to_objects(
+                    report["per_object_text_deltas"], attribution_sections[label],
+                    attribution_text_symbols[label])
+                attach_source_locations(attribution_libraries[label], object_evidence, env,
+                                        dwarf_available=attribution_dwarf[label])
+                attribution[label]["largest_changed_object_attribution"] = object_evidence
             usable = all(item["profile_matches_except_map_flag"] and
                          attribution_matches(item["binary_sha256"],
                                              item["authoritative_binary_sha256"],
