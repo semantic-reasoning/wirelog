@@ -990,6 +990,9 @@ test('shell_gate_walltime_selftest', py3,
 test('uncrustify_hook_selftest', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-setup-uncrustify-hook.py'],
      suite: 'abi', timeout: 120)
+test('uncrustify_hook_transaction_selftest', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-run-uncrustify-pre-commit.py'],
+     suite: 'abi', timeout: 120)
 
 test('version_sync', py3,
      args: [meson.project_source_root() / 'scripts/ci/check-version-sync.py',
