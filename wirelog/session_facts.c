@@ -20,6 +20,8 @@
 #include "io/io_ctx_internal.h"
 #include "ir/program.h"
 #include "intern.h"
+#include "columnar/memory_governor.h"
+#include "wirelog-internal.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -30,8 +32,14 @@
 
 typedef struct {
     wl_session_t *session;
-    const char *relation;
-    int insert_rc;
+    int64_t *rows;
+    uint32_t nrows;
+    uint32_t capacity;
+    uint32_t ncols;
+    wl_columnar_memory_reservation_t reservations[2];
+    unsigned active_reservation;
+    bool reserved;
+    int error;
 } wl_input_batch_sink_t;
 
 static int
@@ -39,11 +47,72 @@ wl_session_input_batch_cb(void *opaque, const int64_t *rows,
     uint32_t nrows, uint32_t ncols)
 {
     wl_input_batch_sink_t *sink = (wl_input_batch_sink_t *)opaque;
-    if (!sink || !sink->session || !sink->relation)
-        return -1;
-    sink->insert_rc = wl_session_insert(sink->session, sink->relation, rows,
-            nrows, ncols);
-    return sink->insert_rc;
+    if (!sink || !sink->session || !rows || !nrows || !ncols
+        || (sink->ncols && sink->ncols != ncols))
+        return sink ? (sink->error = WL_CSV_ERR_ARGS) : WL_CSV_ERR_ARGS;
+    if (nrows > UINT32_MAX - sink->nrows) {
+        sink->error = WL_CSV_ERR_OVERFLOW;
+        return sink->error;
+    }
+    uint32_t needed = sink->nrows + nrows;
+    if (needed > sink->capacity) {
+        uint32_t capacity = sink->capacity ? sink->capacity
+            : WL_SESSION_INPUT_BATCH_ROWS;
+        while (capacity < needed) {
+            if (capacity > UINT32_MAX / 2u) {
+                capacity = needed;
+                break;
+            }
+            capacity *= 2u;
+        }
+        uint64_t cells, bytes;
+        if (!wl_columnar_memory_size_mul(capacity, ncols, &cells)
+            || !wl_columnar_memory_size_mul(cells, sizeof(int64_t), &bytes)
+            || bytes > SIZE_MAX) {
+            sink->error = WL_CSV_ERR_OVERFLOW;
+            return sink->error;
+        }
+        unsigned replacement_slot = sink->active_reservation ^ 1u;
+        wl_columnar_memory_reservation_t *replacement
+            = &sink->reservations[replacement_slot];
+        wl_columnar_memory_reservation_init(replacement);
+        wl_columnar_memory_governor_t *governor
+            = wl_session_memory_governor(sink->session);
+        if (governor) {
+            wl_columnar_memory_admission_status_t status
+                = wl_columnar_memory_reserve_checked(governor, bytes,
+                    replacement);
+            if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+                && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+                sink->error = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                    ? WL_CSV_ERR_BUDGET : status ==
+                    WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                    ? WL_CSV_ERR_OVERFLOW
+                    : WL_CSV_ERR_ARGS;
+                return sink->error;
+            }
+        }
+        int64_t *grown = realloc(sink->rows, (size_t)bytes);
+        if (!grown) {
+            if (governor && !wl_columnar_memory_release(replacement))
+                abort();
+            sink->error = WL_CSV_ERR_MEMORY;
+            return sink->error;
+        }
+        if (sink->reserved
+            && !wl_columnar_memory_release(
+                &sink->reservations[sink->active_reservation]))
+            abort();
+        sink->rows = grown;
+        sink->capacity = capacity;
+        sink->ncols = ncols;
+        sink->active_reservation = replacement_slot;
+        sink->reserved = governor != NULL;
+    }
+    memcpy(sink->rows + (size_t)sink->nrows * ncols, rows,
+        (size_t)nrows * ncols * sizeof(*rows));
+    sink->nrows = needed;
+    return 0;
 }
 
 static int
@@ -51,6 +120,8 @@ wl_session_input_load_fail(wl_session_t *sess, int rc)
 {
     if (sess)
         sess->input_load_failed = true;
+    if (rc == WL_ERR_MEMORY_BUDGET)
+        return rc;
     return rc > 0 ? rc : -1;
 }
 
@@ -140,28 +211,43 @@ wl_session_load_input_files(wl_session_t *sess,
         if (adapter == &wl_csv_adapter) {
             wl_input_batch_sink_t sink = {
                 .session = sess,
-                .relation = rel->name,
             };
+            wl_columnar_memory_reservation_init(&sink.reservations[0]);
+            wl_columnar_memory_reservation_init(&sink.reservations[1]);
             int src = wl_csv_adapter_stream_read(ctx,
                     WL_SESSION_INPUT_BATCH_ROWS,
                     wl_session_input_batch_cb, &sink);
+            int load_rc = 0;
+            if (src == 0 && sink.nrows != 0)
+                load_rc = wl_session_insert(sess, rel->name, sink.rows,
+                        sink.nrows, sink.ncols);
             wirelog_io_ctx_destroy(ctx);
-            if (src != 0) {
-                int load_rc = sink.insert_rc;
-                if (load_rc == 0) {
-                    if (src == WL_CSV_ERR_BUDGET)
-                        load_rc = ENOSPC;
-                    else if (src == WL_CSV_ERR_MEMORY)
+            if (src != 0 || load_rc != 0) {
+                if (src != 0) {
+                    int csv_rc = sink.error ? sink.error : src;
+                    if (csv_rc == WL_CSV_ERR_BUDGET)
+                        load_rc = WL_ERR_MEMORY_BUDGET;
+                    else if (csv_rc == WL_CSV_ERR_MEMORY)
                         load_rc = ENOMEM;
-                    else if (src == WL_CSV_ERR_OVERFLOW)
+                    else if (csv_rc == WL_CSV_ERR_OVERFLOW)
                         load_rc = EOVERFLOW;
                     else
                         load_rc = -1;
                 } else if (load_rc == WL_INTERN_ERR_MEMORY_BUDGET) {
-                    load_rc = ENOSPC;
+                    load_rc = WL_ERR_MEMORY_BUDGET;
                 }
+                free(sink.rows);
+                if (sink.reserved
+                    && !wl_columnar_memory_release(
+                        &sink.reservations[sink.active_reservation]))
+                    abort();
                 return wl_session_input_load_fail(sess, load_rc);
             }
+            free(sink.rows);
+            if (sink.reserved
+                && !wl_columnar_memory_release(
+                    &sink.reservations[sink.active_reservation]))
+                abort();
             continue;
         }
 
