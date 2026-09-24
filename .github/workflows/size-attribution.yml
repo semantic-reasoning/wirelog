@@ -52,8 +52,7 @@ jobs:
           cat /etc/os-release > size-attribution/os-release.txt
           printf 'ImageOS=%s\nImageVersion=%s\n' "${ImageOS:-unavailable}" "${ImageVersion:-unavailable}" \
             > size-attribution/runner-image.txt
-          grep -q '^ID="ubuntu"$' /etc/os-release
-          grep -q '^VERSION_ID="24.04"$' /etc/os-release
+          scripts/ci/require-ubuntu-2404.sh
 
       - name: Install CI build dependencies
         run: |
