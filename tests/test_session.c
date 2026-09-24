@@ -2609,6 +2609,109 @@ test_session_remove_bulk_transaction(void)
     PASS();
 }
 
+static void
+test_session_remove_incremental_batch_transaction(void)
+{
+    TEST(
+        "session: incremental remove preserves and accumulates pending retractions");
+    const int64_t a_initial[] = { 1, 1 };
+    const int64_t b_initial[] = { 9 };
+    const int64_t one[] = { 1 };
+    const int64_t nine[] = { 9 };
+    const int64_t missing[] = { 99 };
+    wl_plan_t *plan = build_plan(".decl a(x: int32)\n"
+            ".decl b(x: int32)\n"
+            ".decl ra(x: int32)\n"
+            ".decl rb(x: int32)\n"
+            "ra(x) :- a(x).\n"
+            "rb(x) :- b(x).\n");
+    wl_session_t *session = NULL;
+    delta_collector_t deltas = { 0 };
+    if (!plan || wl_session_create(wl_backend_columnar(), plan, 1,
+        &session) != 0 || wl_session_insert(session, "a", a_initial, 2, 1) != 0
+        || wl_session_insert(session, "b", b_initial, 1, 1) != 0
+        || wl_session_step(session) != 0) {
+        if (session)
+            wl_session_destroy(session);
+        wl_plan_free(plan);
+        FAIL("incremental removal setup failed");
+        return;
+    }
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    if (wl_session_step(session) != 0) {
+        wl_session_destroy(session);
+        wl_plan_free(plan);
+        FAIL("initial incremental epoch failed");
+        return;
+    }
+    memset(&deltas, 0, sizeof(deltas));
+    col_rel_t *a = test_session_relation(session, "a");
+    col_rel_t *b = test_session_relation(session, "b");
+    if (!a || !b || col_rel_enable_timestamps(a) != 0) {
+        wl_session_destroy(session);
+        wl_plan_free(plan);
+        FAIL("timestamp relation setup failed");
+        return;
+    }
+    a->timestamps[0].iteration = 21;
+    a->timestamps[1].iteration = 22;
+    if (wl_session_remove(session, "a", one, 1, 1) != 0
+        || a->nrows != 1 || a->columns[0][0] != 1
+        || wl_session_remove(session, "a", one, 1, 1) != 0
+        || a->nrows != 0) {
+        wl_session_destroy(session);
+        wl_plan_free(plan);
+        FAIL("same-relation removals did not commit");
+        return;
+    }
+    col_rel_t *pending = test_session_relation(session, "$r$a");
+    uint32_t pending_rows = pending ? pending->nrows : 0;
+    uint32_t pending_epoch = COL_SESSION(session)->outer_epoch;
+    if (!pending || pending_rows != 2
+        || !pending->timestamps || pending->timestamps[0].iteration != 21
+        || pending->timestamps[1].iteration != 22
+        || wl_session_remove(session, "b", missing, 1, 1) != 0
+        || test_session_relation(session, "$r$a") != pending
+        || pending->nrows != pending_rows
+        || COL_SESSION(session)->outer_epoch != pending_epoch
+        || wl_session_remove(session, "b", nine, 1, 1) != EBUSY
+        || b->nrows != 1 || b->columns[0][0] != 9
+        || test_session_relation(session, "$r$a") != pending
+        || pending->nrows != pending_rows
+        || COL_SESSION(session)->last_removed_relation == NULL
+        || strcmp(COL_SESSION(session)->last_removed_relation, "a") != 0) {
+        wl_session_destroy(session);
+        wl_plan_free(plan);
+        FAIL(
+            "pending retraction was lost or cross-relation removal mutated state");
+        return;
+    }
+    if (wl_session_step(session) != 0
+        || !has_delta(&deltas, "ra", one, 1, -1)
+        || count_deltas(&deltas, "ra", -1) != 1
+        || count_deltas(&deltas, "rb", -1) != 0
+        || COL_SESSION(session)->last_removed_relation != NULL
+        || test_session_relation(session, "$r$a") != NULL) {
+        wl_session_destroy(session);
+        wl_plan_free(plan);
+        FAIL("accumulated same-relation retraction did not publish once");
+        return;
+    }
+    memset(&deltas, 0, sizeof(deltas));
+    if (wl_session_remove(session, "b", nine, 1, 1) != 0
+        || b->nrows != 0 || wl_session_step(session) != 0
+        || !has_delta(&deltas, "rb", nine, 1, -1)
+        || count_deltas(&deltas, "rb", -1) != 1) {
+        wl_session_destroy(session);
+        wl_plan_free(plan);
+        FAIL("cross-relation removal did not succeed after pending step");
+        return;
+    }
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    PASS();
+}
+
 static bool
 test_session_remove_alias_borrow_case(bool incremental)
 {
@@ -12136,6 +12239,7 @@ main(void)
     test_session_remove_single_delta();
     test_session_remove_nonexistent();
     test_session_remove_bulk_transaction();
+    test_session_remove_incremental_batch_transaction();
     test_session_remove_live_alias();
     test_session_remove_wide_alias_before_allocation();
     test_session_remove_reader_exclusion();

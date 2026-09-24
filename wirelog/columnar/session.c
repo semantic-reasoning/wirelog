@@ -1141,6 +1141,132 @@ oom:
     return ENOMEM;
 }
 
+/* Registration for a newly staged retraction relation is prepared without
+ * changing the session.  The commit path can then swap the relation pointer
+ * and its row source after EDB compaction has become non-failing. */
+typedef struct {
+    uint32_t index;
+    bool append;
+    col_rel_t *old_relation;
+    col_rel_t **replacement_array;
+    uint32_t replacement_capacity;
+    wl_columnar_relation_retirement_token_t retirement;
+} session_rel_registration_t;
+
+static void
+session_rel_registration_init(session_rel_registration_t *registration)
+{
+    memset(registration, 0, sizeof(*registration));
+    wl_columnar_relation_retirement_init(&registration->retirement);
+}
+
+static int
+session_rel_registration_prepare(wl_col_session_t *sess,
+    col_rel_t *relation, session_rel_registration_t *registration)
+{
+    uint32_t hole = UINT32_MAX;
+
+    if (!sess || !relation || !relation->name || !registration
+        || relation->pool_owned || relation->arena_owned)
+        return EINVAL;
+    for (uint32_t i = 0; i < sess->nrels; i++) {
+        col_rel_t *current = sess->rels[i];
+        if (!current) {
+            if (hole == UINT32_MAX)
+                hole = i;
+            continue;
+        }
+        if (strcmp(current->name, relation->name) == 0) {
+            registration->old_relation = current;
+            registration->index = i;
+            int rc = wl_columnar_relation_retirement_prepare(current,
+                    &registration->retirement);
+            if (rc != 0)
+                return rc;
+            return 0;
+        }
+    }
+
+    if (hole != UINT32_MAX) {
+        registration->index = hole;
+        return 0;
+    }
+    if (sess->nrels < sess->rel_cap) {
+        registration->index = sess->nrels;
+        registration->append = true;
+        return 0;
+    }
+
+    uint32_t capacity = sess->rel_cap ? sess->rel_cap : 16u;
+    if (capacity <= sess->nrels) {
+        if (capacity > UINT32_MAX / 2u)
+            return EOVERFLOW;
+        capacity *= 2u;
+    }
+    uint64_t array_bytes;
+    if (capacity <= sess->nrels
+        || !wl_columnar_memory_size_mul(capacity, sizeof(*sess->rels),
+        &array_bytes)
+        || array_bytes > SIZE_MAX)
+        return EOVERFLOW;
+    col_rel_t **replacement = (col_rel_t **)calloc(capacity,
+            sizeof(*replacement));
+    if (!replacement)
+        return ENOMEM;
+    if (sess->nrels != 0)
+        memcpy(replacement, sess->rels,
+            (size_t)sess->nrels * sizeof(*replacement));
+    registration->replacement_array = replacement;
+    registration->replacement_capacity = capacity;
+    registration->index = sess->nrels;
+    registration->append = true;
+    return 0;
+}
+
+static void
+session_rel_registration_discard(session_rel_registration_t *registration)
+{
+    if (!registration)
+        return;
+    if (registration->retirement.relation)
+        (void)wl_columnar_relation_retirement_cancel(
+            &registration->retirement);
+    free(registration->replacement_array);
+    session_rel_registration_init(registration);
+}
+
+static void
+session_rel_registration_commit(wl_col_session_t *sess, col_rel_t *relation,
+    session_rel_registration_t *registration)
+{
+    col_rel_t **old_array = NULL;
+    wl_columnar_session_source_lease_t *old_lease = NULL;
+
+    if (registration->old_relation) {
+        session_invalidate_relation_caches(sess, relation->name);
+        old_lease = wl_columnar_session_source_lease_take(sess,
+                registration->old_relation);
+    }
+    if (registration->replacement_array) {
+        old_array = sess->rels;
+        sess->rels = registration->replacement_array;
+        sess->rel_cap = registration->replacement_capacity;
+        registration->replacement_array = NULL;
+    }
+    sess->rels[registration->index] = relation;
+    if (registration->append && registration->index == sess->nrels)
+        sess->nrels++;
+    session_rel_free_hash(sess);
+    if (registration->old_relation)
+        wl_columnar_relation_retirement_commit(&registration->retirement);
+    free(old_array);
+    if (old_lease) {
+        int release_rc = wl_columnar_session_source_lease_release(old_lease);
+        assert(release_rc == 0);
+    }
+    session_rel_registration_init(registration);
+}
+
 int
 session_remove_rel(wl_col_session_t *sess, const char *name)
 {
@@ -3720,106 +3846,225 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
     if (writer_rc != 0)
         return writer_rc;
 
-    /* Allocate $r$<name> delta relation to collect removed rows */
-    char rname[256];
-    snprintf(rname, sizeof(rname), "$r$%s", r->name);
-
-    col_rel_t *rdelta = col_rel_new_auto(rname, num_cols);
-    if (!rdelta) {
-        writer_rc = ENOMEM;
-        goto incremental_release_no_buf;
-    }
-
-    /* Append each removed row to the delta relation.
-     * We need to track which rows are actually being removed from the EDB,
-     * then add them to rdelta. */
-    int rc = 0;
-    for (uint32_t di = 0; di < num_rows; di++) {
-        const int64_t *del = data + (size_t)di * num_cols;
-        /* Check if this row exists in EDB; if so, append to rdelta */
-        for (uint32_t ri = 0; ri < r->nrows; ri++) {
-            const int64_t *row = col_rel_row(r, ri);
-            if (memcmp(row, del, sizeof(int64_t) * num_cols) == 0) {
-                /* Found matching row; add to retraction delta */
-                rc = col_rel_append_row(rdelta, del);
-                if (rc != 0) {
-                    col_rel_destroy(rdelta);
-                    writer_rc = rc;
-                    goto incremental_release_no_buf;
-                }
-                break; /* Only one copy per removal request */
-            }
-        }
-    }
-
+    struct {
+        uint32_t request_row;
+        uint32_t source_row;
+    } *match_plan = NULL;
+    uint8_t *matched = NULL;
+    col_rel_t *rdelta = NULL;
+    col_rel_t *previous_delta = NULL;
+    wl_columnar_source_access_reader_t previous_reader = { 0 };
+    session_rel_registration_t registration;
+    session_rel_registration_init(&registration);
     int64_t row_stack[COL_STACK_MAX];
     int64_t *row_buf = row_stack;
+    uint32_t match_count = 0;
+    uint64_t input_cells;
+    uint64_t input_bytes;
+    uint64_t match_plan_bytes;
+    bool denied = false;
+    char rname[256];
+    int rc = 0;
+
+    if (!wl_columnar_memory_size_mul(num_rows, num_cols, &input_cells)
+        || !wl_columnar_memory_size_mul(input_cells, sizeof(int64_t),
+        &input_bytes)
+        || input_bytes > SIZE_MAX
+        || !wl_columnar_memory_size_mul(
+            num_rows < r->nrows ? num_rows : r->nrows,
+            sizeof(*match_plan), &match_plan_bytes)
+        || match_plan_bytes > SIZE_MAX) {
+        writer_rc = EOVERFLOW;
+        goto incremental_release;
+    }
+    if (match_plan_bytes != 0)
+        match_plan = malloc((size_t)match_plan_bytes);
+    matched = r->nrows ? (uint8_t *)calloc(r->nrows, sizeof(*matched)) : NULL;
+    if ((match_plan_bytes != 0 && !match_plan)
+        || (r->nrows != 0 && !matched)) {
+        writer_rc = ENOMEM;
+        goto incremental_release;
+    }
     if (num_cols > COL_STACK_MAX) {
-        row_buf = (int64_t *)malloc(num_cols * sizeof(int64_t));
+        row_buf = (int64_t *)malloc((size_t)num_cols * sizeof(*row_buf));
         if (!row_buf) {
-            col_rel_destroy(rdelta);
             writer_rc = ENOMEM;
             goto incremental_release;
         }
     }
 
-    /* Register $r$<name> in session.  session_add_rel performs replacement
-     * transactionally: it prepares/promotes the new relation before
-     * destroying an existing delta, so an allocation or lease failure does
-     * not discard the previous bookkeeping. */
-    rc = session_add_rel(sess, rdelta);
+    size_t row_bytes = (size_t)(input_bytes / num_rows);
+    for (uint32_t di = 0; di < num_rows; di++) {
+        const int64_t *del = data + (size_t)di * num_cols;
+        for (uint32_t ri = 0; ri < r->nrows; ri++) {
+            if (matched[ri])
+                continue;
+            col_rel_row_copy_out(r, ri, row_buf);
+            if (memcmp(row_buf, del, row_bytes) == 0) {
+                matched[ri] = 1;
+                match_plan[match_count].request_row = di;
+                match_plan[match_count].source_row = ri;
+                match_count++;
+                break;
+            }
+        }
+    }
+
+    /* A miss is a true no-op: it must not replace an earlier staged retraction
+     * or disturb any input/session publication state. */
+    if (match_count == 0) {
+        writer_rc = 0;
+        goto incremental_release;
+    }
+    if (sess->outer_epoch == UINT32_MAX
+        || r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u) {
+        writer_rc = EOVERFLOW;
+        goto incremental_release;
+    }
+    if (r->col_shared) {
+        writer_rc = EBUSY;
+        goto incremental_release;
+    }
+    if (sess->last_removed_relation
+        && strcmp(sess->last_removed_relation, r->name) != 0) {
+        writer_rc = EBUSY;
+        goto incremental_release;
+    }
+    int rname_len = snprintf(rname, sizeof(rname), "$r$%s", r->name);
+    if (rname_len < 0 || (size_t)rname_len >= sizeof(rname)) {
+        writer_rc = EOVERFLOW;
+        goto incremental_release;
+    }
+
+    if (sess->last_removed_relation) {
+        previous_delta = session_find_rel(sess, rname);
+        if (!previous_delta || previous_delta->ncols != num_cols) {
+            writer_rc = EINVAL;
+            goto incremental_release;
+        }
+        rc = col_rel_source_reader_acquire(previous_delta, &previous_reader);
+        if (rc != 0) {
+            writer_rc = rc;
+            goto incremental_release;
+        }
+    }
+
+    rc = col_rel_alloc(&rdelta, rname);
+    if (rc != 0 || !rdelta) {
+        writer_rc = rc != 0 ? rc : ENOMEM;
+        goto incremental_release;
+    }
+    rc = col_rel_attach_memory_governor(rdelta, sess->memory_governor);
     if (rc != 0) {
-        col_rel_destroy(rdelta);
+        writer_rc = rdelta->memory_budget_denial_pending ? ENOSPC : rc;
+        goto incremental_release;
+    }
+    /* Build the complete private replacement, carrying earlier same-relation
+     * retractions forward before adding rows selected by this request. */
+    uint32_t previous_rows = previous_delta ? previous_delta->nrows : 0;
+    if (previous_delta) {
+        for (uint32_t i = 0; i < previous_delta->nrows; i++) {
+            col_rel_row_copy_out(previous_delta, i, row_buf);
+            denied = false;
+            rc = col_rel_append_rows_atomic(rdelta, row_buf, 1u, num_cols,
+                    &denied);
+            if (rc != 0) {
+                writer_rc = rc == ENOMEM && denied ? ENOSPC : rc;
+                goto incremental_release;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < match_count; i++) {
+        uint32_t di = match_plan[i].request_row;
+        denied = false;
+        rc = col_rel_append_rows_atomic(rdelta,
+                data + (size_t)di * num_cols, 1u, num_cols, &denied);
+        if (rc != 0) {
+            writer_rc = rc == ENOMEM && denied ? ENOSPC : rc;
+            goto incremental_release;
+        }
+    }
+    if (r->timestamps || (previous_delta && previous_delta->timestamps)) {
+        rc = col_rel_enable_timestamps(rdelta);
+        if (rc != 0) {
+            writer_rc = rdelta->memory_budget_denial_pending ? ENOSPC : rc;
+            goto incremental_release;
+        }
+        if (previous_delta && previous_delta->timestamps) {
+            for (uint32_t i = 0; i < previous_rows; i++)
+                rdelta->timestamps[i] = previous_delta->timestamps[i];
+        }
+        for (uint32_t i = 0; i < match_count; i++) {
+            uint32_t source_row = match_plan[i].source_row;
+            if (r->timestamps)
+                rdelta->timestamps[previous_rows + i]
+                    = r->timestamps[source_row];
+        }
+    }
+
+    if (previous_reader.owner) {
+        rc = col_rel_source_reader_release(&previous_reader);
+        if (rc != 0) {
+            writer_rc = rc;
+            goto incremental_release;
+        }
+    }
+    previous_delta = NULL;
+    rc = session_rel_registration_prepare(sess, rdelta, &registration);
+    if (rc != 0) {
         writer_rc = rc;
         goto incremental_release;
     }
 
-    /* Remove rows from the EDB using existing compact logic */
-    for (uint32_t di = 0; di < num_rows; di++) {
-        const int64_t *del = data + (size_t)di * num_cols;
-        uint32_t old_nrows = r->nrows;
-        uint32_t out_r = 0;
-        for (uint32_t ri = 0; ri < r->nrows; ri++) {
-            col_rel_row_copy_out(r, ri, row_buf);
-            if (memcmp(row_buf, del, sizeof(int64_t) * num_cols) != 0) {
-                if (out_r != ri)
-                    col_rel_row_copy_in_raw(r, out_r, row_buf);
-                out_r++;
-            } else {
-                /* Remove first matching row only */
-                di = num_rows; /* break outer loop after this one */
-                for (uint32_t rest = ri + 1; rest < r->nrows; rest++, out_r++)
-                    col_rel_row_move_raw(r, out_r, rest);
-                r->nrows = out_r;
-                goto next_del_incr;
+    /* From this point onward, EDB compaction and publication cannot fail. */
+    uint32_t old_nrows = r->nrows;
+    uint32_t old_base_nrows = r->base_nrows < old_nrows
+        ? r->base_nrows : old_nrows;
+    uint32_t out_r = 0;
+    uint32_t new_base_nrows = 0;
+    for (uint32_t ri = 0; ri < old_nrows; ri++) {
+        if (!matched[ri]) {
+            if (ri < old_base_nrows)
+                new_base_nrows++;
+            if (out_r != ri) {
+                col_rel_row_move_raw(r, out_r, ri);
+                if (r->timestamps)
+                    r->timestamps[out_r] = r->timestamps[ri];
             }
+            out_r++;
         }
-        r->nrows = out_r;
-next_del_incr:;
-        if (r->nrows != old_nrows)
-            wl_columnar_relation_touch_view(r);
     }
-    /* Clamp base_nrows to current row count */
-    if (r->base_nrows > r->nrows)
-        r->base_nrows = r->nrows;
-
-    /* Issue #472: Invalidate arrangement caches for the modified relation
-     * so subsequent re-evaluation rebuilds hash indices without the removed
-     * rows.  Without this, cached arrangements contain stale entries that
-     * produce phantom join matches during full re-eval retraction. */
+    r->nrows = out_r;
+    r->base_nrows = new_base_nrows;
+    r->sorted_nrows = 0;
+    r->run_count = 0;
+    memset(r->run_ends, 0, sizeof(r->run_ends));
+    free(r->dedup_slots);
+    r->dedup_slots = NULL;
+    r->dedup_cap = 0;
+    r->dedup_count = 0;
+    wl_columnar_relation_touch_view(r);
+    session_rel_registration_commit(sess, rdelta, &registration);
+    rdelta = NULL;
     session_invalidate_relation_caches(sess, r->name);
-
-    /* Mark removal for affected-stratum calculation */
     sess->last_removed_relation = r->name;
     sess->outer_epoch++;
     sess->pending_input_change = true;
-
+    sess->snapshot_stable_valid = false;
     writer_rc = 0;
 
 incremental_release:
+    if (previous_reader.owner)
+        (void)col_rel_source_reader_release(&previous_reader);
+    if (registration.retirement.relation
+        || registration.replacement_array)
+        session_rel_registration_discard(&registration);
+    if (rdelta)
+        col_rel_destroy(rdelta);
     if (row_buf != row_stack)
         free(row_buf);
-incremental_release_no_buf:
+    free(match_plan);
+    free(matched);
     if (writer.owner) {
         int release_rc = wl_columnar_source_access_writer_release(&writer);
         if (writer_rc == 0 && release_rc != 0)
