@@ -300,18 +300,18 @@ test_build_full_rejects_zero_nbuckets(void)
 }
 
 /* ================================================================
- * Test 2: arr_update_incremental must reject a row count whose chain
- * array size wraps, instead of writing past a 16-entry allocation.
+ * Test 2: a full rebuild must reject a row count whose load-factor
+ * multiplication wraps, instead of sizing a tiny hash table and walking
+ * an unrepresentable relation.
  *
- * The arrangement is first built at the relation's real size, so
- * arr->nbuckets is the 16-entry floor.  arr_next_pow2(nrows * 2) is
- * also 16 once nrows * 2 wraps to 0, so the load-factor check does
- * not divert to arr_build_full and this path must guard itself.
+ * The arrangement is first built at the relation's real size, then the
+ * synthetic row count is changed without advancing the relation token.
+ * The cache detects the row-count mismatch and routes through arr_build_full.
  * ================================================================ */
 static void
-test_update_incremental_rejects_wrapped_cap(void)
+test_full_rebuild_rejects_wrapped_count(void)
 {
-    TEST("arr_update_incremental: nrows with wrapped chain cap is rejected");
+    TEST("arr_build_full: nrows with wrapped load factor is rejected");
 
     wl_session_t *sess = NULL;
     wl_plan_t *plan = NULL;
@@ -364,7 +364,7 @@ main(void)
     printf("\n=== Arrangement next-pow2 Overflow Tests (Issue #1074) ===\n\n");
 
     test_build_full_rejects_zero_nbuckets();
-    test_update_incremental_rejects_wrapped_cap();
+    test_full_rebuild_rejects_wrapped_count();
 
     printf("\nResults: %d/%d passed", pass_count, test_count);
     if (fail_count > 0)
