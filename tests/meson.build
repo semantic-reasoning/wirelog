@@ -1590,7 +1590,8 @@ endif
 # change without a baseline update (enforces explicit review of dependency drift).
 if sh.found()
   test('sbom_snapshot', sh,
-       args: [meson.project_source_root() / 'scripts/ci/check-sbom-snapshot.sh'],
+       args: [meson.project_source_root() / 'scripts/ci/check-sbom-snapshot.sh',
+              meson.project_build_root()],
        suite: 'sbom',
        timeout: 120)
 endif

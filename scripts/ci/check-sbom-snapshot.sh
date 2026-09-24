@@ -42,6 +42,43 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
 baseline="$repo_root/sbom/snapshot.txt"
 
+# Issue #1917: do not read the build tree. In CI the configured meson build dir
+# sits INSIDE repo_root (`builddir-san`), so `syft dir:"$repo_root"` reads every
+# byte of it -- and catalogs nothing from it, because a meson build tree carries
+# no manifests syft recognises. #1308 measured that as zero artifacts, and
+# generate-sbom.sh's own "Do not fix this by pointing syft AT $build_root"
+# comment records the same thing.
+#
+# Under -Db_sanitize=address,undefined that tree is the largest thing in the
+# checkout, and reading it spent the gate's whole 120 s budget: it timed out on
+# the self-hosted runners, which are the only ones that ship syft, so the gate
+# passed or failed according to which pool answered `ubuntu-latest` (#1581).
+#
+# Excluding it is output-NEUTRAL, not merely cheaper: the artifact list is
+# byte-identical with and without the exclusion.
+#
+# $1 is optional so the documented bare invocation keeps working;
+# tests/meson.build supplies meson.project_build_root(). A build root outside
+# repo_root gets no exclusion: syft never walks it, and a relative pattern
+# could not name it anyway.
+#
+# An array, not a string: a repo path may contain spaces. Plain `+=` and no
+# `readarray` -- macOS ships bash 3.2, where readarray/mapfile do not exist.
+syft_exclude_args=(--exclude '**/workflow-tools/**')
+sbom_build_root="${1:-}"
+if [ -n "$sbom_build_root" ] && [ -d "$sbom_build_root" ]; then
+    sbom_build_abs="$(cd "$sbom_build_root" && pwd)"
+    case "$sbom_build_abs" in
+        "$repo_root"/*)
+            # MUST be `./`-relative. syft resolves --exclude for a `dir:` scan
+            # against the scan root; an ABSOLUTE path matches everything, and
+            # the scan then returns zero artifacts -- a gate that silently
+            # excluded its own tree. Verified both ways.
+            syft_exclude_args+=(--exclude "./${sbom_build_abs#"$repo_root"/}/**")
+            ;;
+    esac
+fi
+
 # SKIP if syft not available
 if ! command -v syft >/dev/null 2>&1; then
     skip "syft not on PATH"
@@ -63,7 +100,7 @@ trap 'rm -rf "$tmpdir"' EXIT
 # Extract current dependency list as "name@version:license"
 # Release verification checks out workflow helpers under this nested directory;
 # exclude those files while retaining local-action declarations in workflows.
-syft dir:"$repo_root" --exclude '**/workflow-tools/**' -o syft-json 2>/dev/null \
+syft dir:"$repo_root" "${syft_exclude_args[@]}" -o syft-json 2>/dev/null \
   | jq -r '.artifacts[] | "\(.name)@\(.version // "unknown"):\((.licenses // [{}])[0].value // "NOASSERTION")"' \
   | LC_ALL=C sort > "$tmpdir/current.txt"
 

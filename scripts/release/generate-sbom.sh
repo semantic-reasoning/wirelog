@@ -16,22 +16,22 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
-# $1 is never read: all three syft calls scan $repo_root, not the build tree.
-# There are no programmatic callers -- only the recipe in
-# docs/SECURITY_MODEL.md 3.1 and the hints in check-sbom-snapshot.sh -- so what
-# this preserves is compatibility with humans following docs, not with code.
+# $1 is read for exactly one thing: it names a tree to leave OUT of the scan.
+# All three syft calls still scan $repo_root, never the build tree.
 #
-# It stays because REMOVING it would shift $2 into $1, and the documented
+# Removing the parameter would shift $2 into $1, and the documented
 # `generate-sbom.sh build` would then set out_dir=build and write the snapshot
 # into ./build, silently leaving the committed baseline stale. That is a
 # transition hazard rather than an intrinsic one: make-tarball.sh takes its out
 # dir at $1, so the two would be consistent afterwards.
 #
-# Do not "fix" this by pointing syft at $build_root -- a meson build tree
+# Do not "fix" this by pointing syft AT $build_root -- a meson build tree
 # carries no manifests syft catalogs, and scanning one yields zero artifacts.
-# What the SBOM actually describes is the real problem; see #1308.
+# What the SBOM actually describes is the real problem; see #1308. That zero is
+# also why excluding it changes no output: it only stops syft reading gigabytes
+# of instrumented binaries to catalog nothing, which is what timed the CI gate
+# out in #1917.
 build_root="${1:?Usage: generate-sbom.sh <build_root> [out_dir]}"
-: "$build_root"
 
 # The output directory, defaulting to today's behaviour so no caller changes.
 # It exists so the script can be run in a test at all: writing to $repo_root/sbom
@@ -68,8 +68,25 @@ output_prefix="$out_dir/wirelog-${version}"
 # workflow-tools/ directory. Exclude that checkout's files from the tagged
 # source inventory. The workflow cataloger still reports the local-action
 # declaration in release-tag.yml, which remains a legitimate snapshot entry.
+# The gate diffs what this writes, so check-sbom-snapshot.sh must use the SAME
+# scan boundary; test-generate-sbom.sh asserts both spellings together.
+# An array, not a string: a repo path may contain spaces. Plain `+=` and no
+# `readarray` -- macOS ships bash 3.2, where readarray/mapfile do not exist.
+syft_exclude_args=(--exclude '**/workflow-tools/**')
+if [ -d "$build_root" ]; then
+    build_abs="$(cd "$build_root" && pwd)"
+    case "$build_abs" in
+        "$repo_root"/*)
+            # MUST be `./`-relative: syft resolves --exclude for a `dir:` scan
+            # against the scan root, and an ABSOLUTE path matches everything --
+            # which would empty the snapshot instead of trimming it.
+            syft_exclude_args+=(--exclude "./${build_abs#"$repo_root"/}/**")
+            ;;
+    esac
+fi
+
 syft_scan() {
-    syft dir:"$repo_root" --exclude '**/workflow-tools/**' "$@"
+    syft dir:"$repo_root" "${syft_exclude_args[@]}" "$@"
 }
 
 echo "generate-sbom: Generating SPDX 2.3..."
