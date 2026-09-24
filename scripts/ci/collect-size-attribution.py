@@ -49,8 +49,8 @@ def sha256_file(path: Path) -> str:
 
 def run(command: list[str], *, cwd: Path | None = None,
         env: dict[str, str] | None = None, stdout: Any = subprocess.PIPE) -> str:
-    result = subprocess.run(command, cwd=cwd, env=env, text=True, stdout=stdout,
-                            stderr=subprocess.PIPE, check=False)
+    result = subprocess.run(command, cwd=cwd, env=env, text=True, encoding="utf-8",
+                            stdout=stdout, stderr=subprocess.PIPE, check=False)
     if result.returncode:
         rendered = " ".join(command)
         raise DiagnosticError(
