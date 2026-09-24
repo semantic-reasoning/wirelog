@@ -82,7 +82,8 @@ class TransactionalHookCase(unittest.TestCase):
         self.assertTrue(ok, detail)
         hook = self.root / ".git" / "hooks" / "pre-commit"
         self.assertEqual(hook.read_text(encoding="utf-8"), setup.get_uncrustify_check_script())
-        self.assertTrue(hook.stat().st_mode & stat.S_IXUSR)
+        if os.name != "nt":
+            self.assertTrue(hook.stat().st_mode & stat.S_IXUSR)
         self.hook_body = hook.read_text(encoding="utf-8")
 
     def _git(self, *args: str, env: dict[str, str] | None = None,
