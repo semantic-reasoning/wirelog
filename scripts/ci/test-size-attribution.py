@@ -28,10 +28,11 @@ class SizeAttributionContractTests(unittest.TestCase):
         self.assertIn("persist-credentials: false", workflow)
         self.assertIn("retention-days: 14", workflow)
         self.assertIn("type: choice", workflow)
+        self.assertIn("Open admission pull request", workflow)
+        self.assertIn("Fresh origin/main SHA", workflow)
         self.assertIn("- \"1945\"", workflow)
         self.assertIn("reference_sha", workflow)
-        self.assertIn("record it in the PR review", workflow)
-        self.assertIn("match every report", workflow)
+        self.assertIn("keep it fixed across runs", workflow)
         self.assertIn("GH_REFERENCE_SHA", workflow)
         self.assertIn("timeout-minutes: 60", workflow)
         self.assertIn("ImageVersion", workflow)
@@ -75,6 +76,7 @@ class SizeAttributionContractTests(unittest.TestCase):
             {"pr_number": 1903},
             {"base_sha": "4" * 40},
             {"reference_sha": base},
+            {"reference_sha": head},
             {"candidate_sha": "4" * 40},
             {"workflow_ref": "refs/heads/feature"},
             {"remote_main_sha": "5" * 40},
@@ -94,6 +96,108 @@ class SizeAttributionContractTests(unittest.TestCase):
         for overrides in rejected:
             with self.subTest(overrides=overrides), self.assertRaises(collector.DiagnosticError):
                 collector.validate_pr1945_request(**(values | overrides))
+
+    def test_current_pr1903_mode_accepts_only_fresh_main_head_and_exact_merge_parents(self):
+        base, head, reference = "1" * 40, "3" * 40, "2" * 40
+        metadata = {"state": "open", "base_ref": "main", "base_sha": base,
+                    "head_sha": head, "head_repository": collector.REPOSITORY}
+        collector.validate_current_candidate_request(
+            collector.REPOSITORY, 1903, base, head, reference,
+            "refs/heads/main", base, head, [base, head], metadata)
+        rejected = (
+            {"repository": "other/repo"},
+            {"pr_number": 1945},
+            {"base_sha": "4" * 40},
+            {"reference_sha": base},
+            {"candidate_sha": "4" * 40},
+            {"workflow_ref": "refs/heads/feature"},
+            {"remote_main_sha": "5" * 40},
+            {"remote_head_sha": "6" * 40},
+            {"merge_parents": [base, "4" * 40]},
+            {"pull_request": {**metadata, "state": "closed"}},
+            {"pull_request": {**metadata, "base_ref": "release"}},
+            {"pull_request": {**metadata, "base_sha": "7" * 40}},
+            {"pull_request": {**metadata, "head_sha": "8" * 40}},
+            {"pull_request": {**metadata, "head_repository": "fork/wirelog"}},
+        )
+        values = {"repository": collector.REPOSITORY, "pr_number": 1903,
+                  "base_sha": base, "candidate_sha": head,
+                  "reference_sha": reference, "workflow_ref": "refs/heads/main",
+                  "remote_main_sha": base, "remote_head_sha": head,
+                  "merge_parents": [base, head], "pull_request": metadata}
+        for overrides in rejected:
+            with self.subTest(overrides=overrides), self.assertRaises(collector.DiagnosticError):
+                collector.validate_current_candidate_request(**(values | overrides))
+
+    def test_current_pr1903_verify_requires_fixed_reference_and_fresh_refs(self):
+        base, reference, candidate, merge = "1" * 40, "2" * 40, "3" * 40, "4" * 40
+        outputs = [
+            "https://github.com/semantic-reasoning/wirelog.git\n", "", base + "\n",
+            candidate + "\trefs/pull/1903/head\n", "", "", candidate + "\n",
+            f"{merge} {base} {candidate}\n", base + "\n", reference + "\n",
+            candidate + "\n", "", "",
+        ]
+        metadata = {"state": "open", "base_ref": "main", "base_sha": base,
+                    "head_sha": candidate, "head_repository": collector.REPOSITORY}
+        with mock.patch.object(collector, "fetch_pull_request_metadata", return_value=metadata), \
+             mock.patch.object(collector, "run", side_effect=outputs):
+            identity = collector.verify_repository(
+                Path("."), collector.REPOSITORY, 1903, base, candidate,
+                "refs/heads/main", reference)
+        self.assertEqual(identity["remote_main"], base)
+        self.assertEqual(identity["remote_pr_head"], candidate)
+        self.assertEqual(identity["reference_sha"], reference)
+
+        with self.assertRaises(collector.DiagnosticError):
+            collector.verify_repository(
+                Path("."), collector.REPOSITORY, 1903, base, candidate,
+                "refs/heads/main")
+
+    def test_current_pr1903_baseline_requires_fresh_two_tree_identity(self):
+        base, candidate, merge = "1" * 40, "3" * 40, "4" * 40
+        metadata = {"state": "open", "base_ref": "main", "base_sha": base,
+                    "head_sha": candidate, "head_repository": collector.REPOSITORY}
+        collector.validate_current_baseline_request(
+            collector.REPOSITORY, 1903, base, candidate,
+            "refs/heads/main", base, candidate, [base, candidate], metadata)
+        with self.assertRaises(collector.DiagnosticError):
+            collector.validate_current_baseline_request(
+                collector.REPOSITORY, 1937, base, candidate,
+                "refs/heads/main", base, candidate, [base, candidate], metadata)
+
+        outputs = [
+            "https://github.com/semantic-reasoning/wirelog.git\n", "", base + "\n",
+            candidate + "\trefs/pull/1903/head\n", "", "", candidate + "\n",
+            f"{merge} {base} {candidate}\n", base + "\n", candidate + "\n", "",
+        ]
+        with mock.patch.object(collector, "fetch_pull_request_metadata", return_value=metadata), \
+             mock.patch.object(collector, "run", side_effect=outputs):
+            identity = collector.verify_repository(
+                Path("."), collector.REPOSITORY, 1903, base, candidate,
+                "refs/heads/main")
+        self.assertEqual(identity["remote_main"], base)
+        self.assertEqual(identity["remote_pr_head"], candidate)
+        self.assertEqual(identity["remote_pr_merge"], merge)
+
+    def test_current_pr1903_baseline_routes_to_two_tree_collection(self):
+        args = collector.parse_args([
+            "--repository", collector.REPOSITORY, "--pr-number", "1903",
+            "--base-sha", "1" * 40, "--candidate-sha", "3" * 40,
+            "--workflow-ref", "refs/heads/main",
+        ])
+        with mock.patch.object(collector, "collect_pr1903", return_value=0) as collect:
+            self.assertEqual(collector.collect(args), 0)
+        collect.assert_called_once_with(args)
+
+    def test_current_pr1903_collection_uses_three_tree_attribution(self):
+        args = collector.parse_args([
+            "--repository", collector.REPOSITORY, "--pr-number", "1903",
+            "--base-sha", "1" * 40, "--reference-sha", "2" * 40,
+            "--candidate-sha", "3" * 40, "--workflow-ref", "refs/heads/main",
+        ])
+        with mock.patch.object(collector, "collect_current_candidate", return_value=0) as collect:
+            self.assertEqual(collector.collect(args), 0)
+        collect.assert_called_once_with(args)
 
     def test_pr1945_verify_requires_reference_ancestor_and_fresh_refs(self):
         base, reference, candidate, merge = "1" * 40, "2" * 40, "3" * 40, "4" * 40
