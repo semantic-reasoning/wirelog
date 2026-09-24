@@ -1,23 +1,31 @@
-name: PR 1903 binary size attribution
+name: Admission PR exact-profile size attribution
 
 on:
   workflow_dispatch:
     inputs:
       pr_number:
-        description: Pull request to inspect (must be 1903)
+        description: Pull request to inspect (1903 historical or 1945 admission candidate only)
         required: true
-        type: string
+        type: choice
+        options:
+          - "1903"
+          - "1945"
         default: "1903"
       base_sha:
-        description: Full base commit SHA (must match the recorded CI base)
+        description: Full base commit SHA (pinned for 1903; current main for 1945)
         required: true
         type: string
         default: "8d91c2da2b188b94af5b9f1da21c569d80ccb387"
       candidate_sha:
-        description: Full current PR head SHA
+        description: Full current PR head SHA from the selected pull request
         required: true
         type: string
         default: "a4c7c622daa3b7247378acf71a74b7f40f4ff556"
+      reference_sha:
+        description: For PR 1945 enter the original post-rebase pre-reduction head SHA on every run; record it in the PR review and require reviewers to match every report to it. Leave empty for PR 1903.
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -27,7 +35,7 @@ jobs:
     name: Exact-profile size attribution
     if: ${{ github.repository == 'semantic-reasoning/wirelog' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
         with:
@@ -78,30 +86,36 @@ jobs:
       - name: Run contract tests
         run: .venv-size-attribution/bin/python scripts/ci/test-size-attribution.py -v
 
-      - name: Build and attribute pinned PR size
+      - name: Build and attribute allowlisted PR size
         env:
           GH_REPOSITORY: ${{ github.repository }}
           GH_PR_NUMBER: ${{ inputs.pr_number }}
           GH_BASE_SHA: ${{ inputs.base_sha }}
           GH_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          GH_REFERENCE_SHA: ${{ inputs.reference_sha }}
           WORKFLOW_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
           export PATH="$PWD/.venv-size-attribution/bin:$PATH"
-          .venv-size-attribution/bin/python scripts/ci/collect-size-attribution.py \
-            --repository "$GH_REPOSITORY" \
-            --pr-number "$GH_PR_NUMBER" \
-            --base-sha "$GH_BASE_SHA" \
-            --candidate-sha "$GH_CANDIDATE_SHA" \
-            --workflow-ref "$WORKFLOW_REF" \
-            --repository-root "$PWD" \
+          args=(
+            --repository "$GH_REPOSITORY"
+            --pr-number "$GH_PR_NUMBER"
+            --base-sha "$GH_BASE_SHA"
+            --candidate-sha "$GH_CANDIDATE_SHA"
+            --workflow-ref "$WORKFLOW_REF"
+            --repository-root "$PWD"
             --output "$PWD/size-attribution"
+          )
+          if [ -n "$GH_REFERENCE_SHA" ]; then
+            args+=(--reference-sha "$GH_REFERENCE_SHA")
+          fi
+          .venv-size-attribution/bin/python scripts/ci/collect-size-attribution.py "${args[@]}"
 
       - name: Upload diagnostic evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: pr-1903-size-attribution-${{ github.run_id }}-${{ github.run_attempt }}
+          name: pr-${{ inputs.pr_number }}-size-attribution-${{ github.run_id }}-${{ github.run_attempt }}
           path: size-attribution/
           if-no-files-found: warn
           retention-days: 14
