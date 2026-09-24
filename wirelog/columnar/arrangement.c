@@ -588,13 +588,18 @@ static int
 arr_build_full_impl(col_arrangement_t *arr, const col_rel_t *rel)
 {
     uint32_t nrows = rel->nrows;
-    uint32_t nbuckets = arr_next_pow2(nrows > 0 ? nrows * 2u : 16u);
+    uint32_t nbuckets;
+
+    /* Keep the load-factor multiplication representable before sizing either
+     * the bucket table or its row chains. */
+    if (nrows > UINT32_MAX / 2u)
+        return ENOMEM;
+    nbuckets = arr_next_pow2(nrows > 0 ? nrows * 2u : 16u);
 
     /*
      * arr_next_pow2 returns 0 above 0x80000000, so nbuckets is 0 for nrows
-     * in [0x40000001, 0x7FFFFFFF] and again in [0xC0000001, 0xFFFFFFFF] --
-     * 2147483646 row counts, about half the 32-bit space.  Zero would then
-     * pass the "size changed" test below against a zeroed arrangement, skip
+     * in [0x40000001, 0x7FFFFFFF] -- 1,073,741,823 row counts. A zero value
+     * would pass the "size changed" test below against a zeroed arrangement, skip
      * the allocation, and leave arr_index_rows to load ht_head[hash & ~0u]
      * through a NULL pointer.
      *
@@ -611,12 +616,10 @@ arr_build_full_impl(col_arrangement_t *arr, const col_rel_t *rel)
      * A primitive-only fix was available; this one is preferred because it
      * rejects the relation rather than silently resizing it.
      *
-     * The domain left open is deliberate.  Row counts in
-     * [0x80000000, 0xC0000000] still build here, degenerately -- nbuckets
-     * floors at 16 for two billion rows -- and that is memory-safe: the
-     * chain sizing below takes max(nrows, ht_cap * 2), which never lands
-     * under nrows. This full-build path is used whenever a cache index is
-     * stale or incomplete; there is no separate partial-index sizing path.
+     * Counts above UINT32_MAX / 2 are refused before the load-factor
+     * multiplication can wrap and undersize the bucket or row-chain arrays.
+     * This full-build path is used whenever a cache index is stale or
+     * incomplete; there is no separate partial-index sizing path.
      *
      * ENOMEM is reused deliberately: the relation is unrepresentable rather
      * than out of memory, and EOVERFLOW would say so.  It is not that
