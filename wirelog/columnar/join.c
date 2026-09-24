@@ -3075,23 +3075,29 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
             (void)col_arrangement_probe_bundle_release(&diff_bundle);
     }
 
-    if (darr
-        && col_diff_arrangement_ensure_ht_capacity(darr, right->nrows) != 0) {
-        wl_columnar_arrangement_diff_txn_abort(&diff_txn);
-        darr = NULL; /* capacity grow failed; fall through to ephemeral */
-        (void)col_arrangement_probe_bundle_release(&diff_bundle);
+    if (darr && darr->indexed_rows != right->nrows) {
+        /* Relation snapshots change on mutation, so a partial same-token
+         * index is never a supported state. Rebuild the private transaction
+         * copy from row zero after token invalidation or unexpected drift. */
+        wl_columnar_arrangement_diff_reset_state(darr);
+        if (col_diff_arrangement_ensure_ht_capacity(darr, right->nrows) != 0) {
+            wl_columnar_arrangement_diff_txn_abort(&diff_txn);
+            darr = NULL; /* fall through to the ephemeral arrangement */
+            (void)col_arrangement_probe_bundle_release(&diff_bundle);
+        }
     }
 
-    if (darr) {
-        /* Incrementally add new rows [indexed_rows, right->nrows) to hash */
-        uint32_t indexed = darr->indexed_rows;
-        uint32_t nbk = darr->nbuckets;
-        for (uint32_t rr = indexed; rr < right->nrows; rr++) {
+    uint32_t nbk = darr ? darr->nbuckets : 0;
+    if (darr && darr->indexed_rows != right->nrows) {
+        for (uint32_t rr = 0; rr < right->nrows; rr++) {
             uint32_t h = col_join_hash_rel_keys(right, rr, rk, kc) & (nbk - 1);
             darr->ht_next[rr] = darr->ht_head[h];
             darr->ht_head[h] = rr + 1; /* 1-based; 0 = end of chain */
         }
         darr->indexed_rows = right->nrows;
+    }
+
+    if (darr) {
         darr->current_nrows = right->nrows;
         darr->source_snapshot = wl_columnar_relation_snapshot(right);
 

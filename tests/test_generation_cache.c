@@ -214,6 +214,7 @@ test_generation_consumers(void)
     wl_mem_ledger_t worker_ledger;
     wl_mem_ledger_init(&worker_ledger, 0);
     wl_columnar_arrangement_diff_txn_t worker_txn = { 0 };
+    wl_columnar_arrangement_diff_txn_t reset_txn = { 0 };
     int result = 0;
     CHECK(make_session(&session, &plan, &program) == 0,
         "session creation failed");
@@ -356,6 +357,44 @@ test_generation_consumers(void)
             &key_col, 1);
     CHECK(primary != NULL && primary->indexed_rows == rel->nrows,
         "primary arrangement creation failed");
+    int64_t appended_row[2] = { 404, 404 };
+    col_relation_snapshot_t primary_before_append =
+        wl_columnar_relation_snapshot(rel);
+    CHECK(col_rel_append_row(rel, appended_row) == 0,
+        "append after primary/differential indexing failed");
+    CHECK(!wl_columnar_relation_snapshot_equal(primary_before_append,
+        wl_columnar_relation_snapshot(rel)),
+        "append did not advance relation freshness token");
+    primary = col_session_get_arrangement(session, "edge", &key_col, 1);
+    CHECK(primary != NULL && primary->indexed_rows == rel->nrows
+        && col_arrangement_find_first_typed(primary, rel, &appended_row[0])
+        != UINT32_MAX
+        && col_arrangement_find_first_typed(primary, rel, &((int64_t){ 100 }))
+        == UINT32_MAX,
+        "primary arrangement did not rebuild for appended source row");
+
+    CHECK(diff->indexed_rows == 101,
+        "persistent differential index changed before transaction reset");
+    CHECK(wl_columnar_arrangement_diff_txn_begin(cs, "edge", rel,
+        &key_col, 1, &reset_txn) == 0,
+        "stale differential transaction begin failed");
+    CHECK(reset_txn.working->indexed_rows == 0
+        && reset_txn.working->base_nrows == 0
+        && reset_txn.working->current_nrows == 0
+        && !wl_columnar_relation_snapshot_valid(
+            reset_txn.working->source_snapshot)
+        && diff->indexed_rows == 101,
+        "transaction stale-token reset was incomplete or mutated persistent index");
+    CHECK(index_diff_arrangement(reset_txn.working, rel, &key_col, 1) == 0,
+        "differential full rebuild after append failed");
+    reset_txn.working->source_snapshot = wl_columnar_relation_snapshot(rel);
+    CHECK(wl_columnar_arrangement_diff_txn_commit(&reset_txn) == 0,
+        "differential rebuild commit failed");
+    diff = cs->diff_arr_entries[0].diff_arr;
+    CHECK(diff->indexed_rows == rel->nrows
+        && diff_contains_key(diff, rel, key_col, 404)
+        && !diff_contains_key(diff, rel, key_col, 100),
+        "differential full rebuild kept stale keys or missed appended key");
     CHECK(col_arr_entries_clone(cs->arr_entries, cs->arr_count,
         &arr_clone, &arr_clone_cap, NULL) == 0 && arr_clone_cap > 0,
         "primary arrangement worker clone failed");
@@ -436,6 +475,7 @@ cleanup:
     if (sorted_probe.active)
         (void)col_sorted_arrangement_probe_release(&sorted_probe);
     wl_columnar_arrangement_diff_txn_abort(&worker_txn);
+    wl_columnar_arrangement_diff_txn_abort(&reset_txn);
     if (worker_rel)
         col_rel_destroy(worker_rel);
     free(worker.rels);

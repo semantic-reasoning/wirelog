@@ -777,9 +777,9 @@ test_arrangement_reuse(void)
 }
 
 static void
-test_arrangement_incremental(void)
+test_arrangement_generation_rebuild(void)
 {
-    TEST("arrangement incremental: add rows between joins");
+    TEST("arrangement generation change: rebuild before next join");
     wl_col_session_t *sess = make_mock_session();
 
     const char *cn[] = {"x", "y"};
@@ -818,7 +818,13 @@ test_arrangement_incremental(void)
     int64_t rr2[] = {2, 200};
     col_rel_append_row(right_ref, rr2);
 
-    /* Second join: right now has 2 rows, arrangement incrementally updated */
+    uint32_t right_key = 0;
+    col_diff_arrangement_t *arr = col_session_get_diff_arrangement(sess,
+            "right", right_ref, &right_key, 1);
+    ASSERT_TRUE(arr != NULL && arr->indexed_rows == 0,
+        "generation change must reset differential index before rebuild");
+
+    /* Second join: right now has 2 rows, arrangement rebuilt from row zero. */
     col_rel_t *left2 = make_rel("left2", 2, cn);
     col_rel_append_row(left2, lr1);
     col_rel_append_row(left2, lr2);
@@ -1913,7 +1919,7 @@ main(void)
     test_duplicate_keys_in_right();
     test_single_key_column();
     test_arrangement_reuse();
-    test_arrangement_incremental();
+    test_arrangement_generation_rebuild();
     test_diff_arrangement_txn_ledger_accounting();
     test_diff_arrangement_pin_lifetime();
     test_diff_join_batch_signed_timestamps();
