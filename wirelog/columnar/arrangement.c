@@ -615,17 +615,15 @@ arr_build_full_impl(col_arrangement_t *arr, const col_rel_t *rel)
      * [0x80000000, 0xC0000000] still build here, degenerately -- nbuckets
      * floors at 16 for two billion rows -- and that is memory-safe: the
      * chain sizing below takes max(nrows, ht_cap * 2), which never lands
-     * under nrows, unlike the bare nrows * 2u in arr_update_incremental.
-     * Unifying the two guards on row count measures one diagnostic, so the
-     * asymmetry with that function is required rather than an oversight.
+     * under nrows. This full-build path is used whenever a cache index is
+     * stale or incomplete; there is no separate partial-index sizing path.
      *
      * ENOMEM is reused deliberately: the relation is unrepresentable rather
      * than out of memory, and EOVERFLOW would say so.  It is not that
      * EOVERFLOW is unavailable -- join.c, which consumes these
-     * arrangements, returns it as rc=84 in nine places.  It is that all
-     * seven call sites of this function and arr_update_incremental discard
-     * the value and collapse to NULL, so the distinction could never reach
-     * a caller.
+     * arrangements, returns it as rc=84 in nine places. It is that all
+     * call sites of this function discard the value and collapse to NULL,
+     * so the distinction could never reach a caller.
      */
     if (nbuckets == 0)
         return ENOMEM;
@@ -744,99 +742,9 @@ arr_build_full(col_arrangement_t *arr, const col_rel_t *rel)
     return rc;
 }
 
-/* Incremental update: index only rows [old_nrows..rel->nrows). */
-static int
-arr_update_incremental_impl(col_arrangement_t *arr, const col_rel_t *rel,
-    uint32_t old_nrows)
-{
-    uint32_t nrows = rel->nrows;
-    if (old_nrows >= nrows)
-        return 0;
-
-    /*
-     * Both sizes below are nrows * 2, which wraps for nrows >= 0x80000000 --
-     * every row count in the top half of the range.  The chain array is the
-     * dangerous one: the wrapped product is 0, the 16-entry floor rounds it
-     * up, and arr_index_rows writes past a 64-byte allocation.  The
-     * arr_build_full guard does not cover it, because arr_next_pow2(0) is 16
-     * and matches the arrangement's existing bucket count, so the load-factor
-     * test below never diverts to the rebuild.
-     *
-     * This refuses more than the unsafe range, deliberately.  Where nrows is
-     * in [0x80000000, 0xC0000000] and `needed` differs from arr->nbuckets,
-     * the call used to divert to arr_build_full and complete safely, and is
-     * now rejected.  What that costs is a relation of at least 2^31 rows --
-     * some 34 GB of backing store across two columns -- whose success was a
-     * 16-bucket table with 134-million-entry chains.  One test on the row
-     * count, ahead of both products, is worth more than preserving it.
-     *
-     * ENOMEM is reused for the reason given in arr_build_full.
-     */
-    if (nrows > UINT32_MAX / 2u)
-        return ENOMEM;
-
-    /* If load factor would exceed 50%, full rebuild needed. */
-    uint32_t needed = arr_next_pow2(nrows * 2u);
-    if (needed != arr->nbuckets)
-        return arr_build_full(arr, rel);
-
-    /* Grow chain array if needed. */
-    if (nrows > arr->ht_cap) {
-        uint32_t new_cap = nrows * 2u < 16u ? 16u : nrows * 2u;
-        size_t next_bytes = (size_t)new_cap * sizeof(uint32_t);
-        size_t head_bytes = (size_t)arr->nbuckets * sizeof(uint64_t);
-        uint64_t target_bytes;
-        wl_columnar_memory_reservation_t pending;
-        bool pending_valid;
-        if (new_cap != 0 && next_bytes / sizeof(uint32_t) != new_cap)
-            return ENOMEM;
-        if (head_bytes > SIZE_MAX - next_bytes)
-            return ENOMEM;
-        target_bytes = (uint64_t)(head_bytes + next_bytes);
-        if (!arr_reserve_bytes(arr, target_bytes, &pending))
-            return ENOMEM;
-        pending_valid = arr->memory_governor != NULL;
-        uint32_t *nxt = (uint32_t *)malloc(next_bytes);
-        if (!nxt){
-            if (pending_valid)
-                (void)wl_columnar_memory_release(&pending);
-            return ENOMEM;
-        }
-        if (arr->ht_next && arr->ht_cap > 0)
-            memcpy(nxt, arr->ht_next,
-                (size_t)arr->ht_cap * sizeof(uint32_t));
-        free(arr->ht_next);
-        arr->ht_next = nxt;
-        arr->ht_cap = new_cap;
-        if (pending_valid
-            && !arr_publish_reservation(arr, &pending, target_bytes)) {
-            arr_free_contents(arr);
-            return ENOMEM;
-        }
-    }
-
-    uint32_t nb = arr->nbuckets;
-    /* Extends a cached arrangement in place: rows indexed here are probed
-     * against rows indexed by earlier calls, so these buckets must match what
-     * arr_hash_key() computes on the probe side.  See arr_hash_rows_batch. */
-    arr_index_rows(arr, rel, old_nrows, nrows, nb);
-    arr->indexed_rows = nrows;
-    return 0;
-}
-
 /* ======================================================================== */
 /* Arrangement Cache LRU Eviction (Issue #216)                              */
 /* ======================================================================== */
-
-static int
-arr_update_incremental(col_arrangement_t *arr, const col_rel_t *rel,
-    uint32_t old_nrows)
-{
-    uint64_t before = arr->ledger ? arr_ledger_bytes(arr) : 0;
-    int rc = arr_update_incremental_impl(arr, rel, old_nrows);
-    arr_ledger_sync(arr, before);
-    return rc;
-}
 
 /*
  * col_arr_cache_evict_lru: evict arrangement cache entries until arr_total_bytes
@@ -954,30 +862,17 @@ col_session_get_arrangement_for_source(wl_col_session_t *cs, col_rel_t *rel,
          * no path frees a leased entry's buffers. */
         if (e->pin_count > 0
             && (!snapshot_match || arr_entry_unbuilt(e)
-            || e->arr.indexed_rows < rel->nrows || e->rebuild_deferred)) {
+            || e->arr.indexed_rows != rel->nrows
+            || e->rebuild_deferred)) {
             e->rebuild_deferred = true;
             return EBUSY;
         }
-        if (!snapshot_match || arr_entry_unbuilt(e)) {
+        if (!snapshot_match || arr_entry_unbuilt(e)
+            || e->arr.indexed_rows != rel->nrows) {
             /* Deduct stale bytes before rebuild; restore on failure. */
             cs->arr_total_bytes -= e->mem_bytes;
             if (arr_build_full(&e->arr, rel) != 0) {
                 cs->arr_total_bytes += e->mem_bytes;
-                return ENOMEM;
-            }
-            if (!arr_memory_bytes(&e->arr, &e->mem_bytes)) {
-                arr_free_contents(&e->arr);
-                arr_entry_mark_unbuilt(e);
-                e->mem_bytes = 0;
-                return ENOMEM;
-            }
-            cs->arr_total_bytes += e->mem_bytes;
-            e->source_snapshot = wl_columnar_relation_snapshot(rel);
-        } else if (e->arr.indexed_rows < rel->nrows) {
-            uint32_t old = e->arr.indexed_rows;
-            cs->arr_total_bytes -= e->mem_bytes;
-            if (arr_update_incremental(&e->arr, rel, old) != 0) {
-                cs->arr_total_bytes += e->mem_bytes; /* restore on failure */
                 return ENOMEM;
             }
             if (!arr_memory_bytes(&e->arr, &e->mem_bytes)) {
@@ -2616,14 +2511,11 @@ diff_entry_next_generation(uint64_t generation)
     return generation == UINT64_MAX ? UINT64_MAX : generation + 1u;
 }
 
-static void
-diff_entry_reset(col_diff_arr_entry_t *entry)
+void
+wl_columnar_arrangement_diff_reset_state(col_diff_arrangement_t *arr)
 {
-    col_diff_arrangement_t *arr;
-
-    if (!entry || !entry->diff_arr)
+    if (!arr)
         return;
-    arr = entry->diff_arr;
     if (arr->ht_head)
         memset(arr->ht_head, 0,
             (size_t)arr->nbuckets * sizeof(*arr->ht_head));
@@ -2634,6 +2526,14 @@ diff_entry_reset(col_diff_arr_entry_t *entry)
     arr->current_nrows = 0;
     arr->indexed_rows = 0;
     arr->source_snapshot = (col_relation_snapshot_t){ 0, 0, 0 };
+}
+
+static void
+diff_entry_reset(col_diff_arr_entry_t *entry)
+{
+    if (!entry || !entry->diff_arr)
+        return;
+    wl_columnar_arrangement_diff_reset_state(entry->diff_arr);
     entry->generation = diff_entry_next_generation(entry->generation);
 }
 
@@ -2942,17 +2842,7 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
 
     if (!wl_columnar_relation_snapshot_equal(txn->working->source_snapshot,
         wl_columnar_relation_snapshot(source_rel))) {
-        if (txn->working->ht_head)
-            memset(txn->working->ht_head, 0,
-                (size_t)txn->working->nbuckets *
-                sizeof(*txn->working->ht_head));
-        if (txn->working->ht_next)
-            memset(txn->working->ht_next, 0,
-                (size_t)txn->working->ht_cap * sizeof(*txn->working->ht_next));
-        txn->working->base_nrows = 0;
-        txn->working->current_nrows = 0;
-        txn->working->indexed_rows = 0;
-        txn->working->source_snapshot = (col_relation_snapshot_t){ 0, 0, 0 };
+        wl_columnar_arrangement_diff_reset_state(txn->working);
     }
     return 0;
 }

@@ -3151,6 +3151,8 @@ col_diff_arrangement_t *
 col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
     const col_rel_t *source_rel,
     const uint32_t *key_cols, uint32_t key_count);
+void
+wl_columnar_arrangement_diff_reset_state(col_diff_arrangement_t *arr);
 int
 col_session_pin_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
     const col_rel_t *source_rel, const uint32_t *key_cols, uint32_t key_count,
