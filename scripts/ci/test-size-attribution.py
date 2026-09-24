@@ -118,11 +118,11 @@ class SizeAttributionContractTests(unittest.TestCase):
     def test_size_profile_comparison_rejects_profile_mismatch(self):
         with tempfile.TemporaryDirectory() as temp:
             base, candidate = Path(temp) / "base.json", Path(temp) / "candidate.json"
-            base.write_text(json.dumps({"schema_version": 1, "options": {"optimization": "s"}}))
-            candidate.write_text(json.dumps({"schema_version": 1, "options": {"optimization": "0"}}))
+            base.write_text(json.dumps({"schema_version": 1, "options": {"optimization": "s"}}), encoding="utf-8")
+            candidate.write_text(json.dumps({"schema_version": 1, "options": {"optimization": "0"}}), encoding="utf-8")
             result = subprocess.run(
                 [sys.executable, str(ROOT / "scripts/ci/size-profile.py"), "compare", str(base), str(candidate)],
-                text=True, capture_output=True, check=False)
+                text=True, encoding="utf-8", capture_output=True, check=False)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("production profile mismatch", result.stderr)
 
@@ -208,7 +208,7 @@ class SizeAttributionContractTests(unittest.TestCase):
                  mock.patch.object(collector, "extract_tree"), \
                  mock.patch.object(collector, "build_one", side_effect=collector.DiagnosticError("mock build failure")):
                 self.assertEqual(collector.collect(args), 1)
-            report = __import__("json").loads((Path(args.output) / "report.json").read_text())
+            report = __import__("json").loads((Path(args.output) / "report.json").read_text(encoding="utf-8"))
             self.assertEqual(report["status"], "failed")
             self.assertIn("mock build failure", report["error"])
 
