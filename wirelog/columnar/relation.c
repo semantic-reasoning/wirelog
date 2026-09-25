@@ -6198,9 +6198,9 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
  * clones execution scratch and intentionally carries no governor.  Admit the
  * destination's physical columns and timestamp allocation before allocating
  * either buffer, while a source-reader lease keeps the observed shape stable. */
-int
-wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
-    wl_columnar_memory_governor_ref_t *governor)
+static int
+col_rel_deep_copy_governed_impl(const col_rel_t *src, col_rel_t **out,
+    wl_columnar_memory_governor_ref_t *governor, bool mutable_image)
 {
     wl_columnar_source_access_reader_t reader = { 0 };
     col_rel_payload_txn_t pending;
@@ -6210,15 +6210,18 @@ wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
     uint64_t reserved_bytes = 0;
     uint64_t metadata_bytes = 0;
     int reserve_rc = 0;
+    int reserve_failure_rc = ENOMEM;
     int rc;
 
     if (!src || !out)
         return EINVAL;
     *out = NULL;
     wl_columnar_memory_reservation_init(&metadata_pending);
-    rc = col_rel_source_reader_acquire(src, &reader);
-    if (rc != 0)
-        return rc;
+    if (!mutable_image) {
+        rc = col_rel_source_reader_acquire(src, &reader);
+        if (rc != 0)
+            return rc;
+    }
     if (src->nrows > src->capacity || (src->ncols > 0
         && src->capacity > 0 && !src->columns)
         || (src->timestamps != NULL) != (src->timestamp_capacity != 0)
@@ -6229,7 +6232,8 @@ wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
     if (!governor)
         governor = src->memory_governor;
     rc = governor
-        ? wl_columnar_relation_alloc_governed(&dst, src->name, governor)
+        ? wl_columnar_relation_alloc_governed(&dst,
+            mutable_image ? NULL : src->name, governor)
         : col_rel_alloc(&dst, src->name ? src->name : "");
     if (rc != 0)
         goto done;
@@ -6238,8 +6242,9 @@ wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
         dst->name = NULL;
     }
     if (!col_rel_prospective_metadata_bytes(src->ncols,
-        (const char *const *)src->col_names, src->ncols > 0,
-        true, src->column_types != NULL, src->schema_ok,
+        (const char *const *)src->col_names,
+        mutable_image ? src->col_names != NULL : src->ncols > 0,
+        !mutable_image, src->column_types != NULL, src->schema_ok,
         src->compound_arity_len, false, &metadata_bytes)) {
         rc = EOVERFLOW;
         goto done;
@@ -6261,7 +6266,7 @@ wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
         memcpy(dst->column_types, src->column_types,
             (size_t)src->ncols * sizeof(*dst->column_types));
     }
-    if (src->ncols > 0) {
+    if (src->ncols > 0 && (!mutable_image || src->col_names)) {
         dst->col_names = (char **)calloc(src->ncols,
                 sizeof(*dst->col_names));
         if (!dst->col_names) {
@@ -6272,12 +6277,12 @@ wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
             char fallback[32];
             const char *name = src->col_names && src->col_names[c]
                 ? src->col_names[c] : NULL;
-            if (!name) {
+            if (!name && !mutable_image) {
                 snprintf(fallback, sizeof(fallback), "col%u", c);
                 name = fallback;
             }
-            dst->col_names[c] = wl_strdup(name);
-            if (!dst->col_names[c]) {
+            dst->col_names[c] = name ? wl_strdup(name) : NULL;
+            if (name && !dst->col_names[c]) {
                 rc = ENOMEM;
                 goto done;
             }
@@ -6301,17 +6306,21 @@ wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
     }
     dst->capacity = src->capacity;
     timestamp_capacity = src->timestamps
-        ? (src->timestamp_capacity > src->capacity
-            ? src->timestamp_capacity : src->capacity) : 0;
+        ? (mutable_image ? src->timestamp_capacity
+            : (src->timestamp_capacity > src->capacity
+            ? src->timestamp_capacity : src->capacity)) : 0;
     if (src->timestamps && src->timestamp_capacity < src->nrows) {
         rc = EINVAL;
         goto done;
     }
     reserve_rc = col_rel_reserve_transition(dst, dst->capacity,
             timestamp_capacity, timestamp_capacity != 0, &pending,
-            &reserved_bytes, NULL);
+            &reserved_bytes, &reserve_failure_rc);
     if (reserve_rc < 0) {
-        rc = ENOMEM;
+        rc = mutable_image ? reserve_failure_rc : ENOMEM;
+        if (mutable_image && rc == ENOMEM
+            && dst->memory_budget_denial_pending)
+            rc = ENOSPC;
         goto done;
     }
 #ifdef WL_TEST_RELATION_RESIZE_HOOK
@@ -6397,6 +6406,24 @@ wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
         if (rc != 0)
             goto rollback;
     }
+    if (mutable_image) {
+        if (src->merge_columns) {
+            rc = col_rel_reserve_merge_grid(dst, src->merge_buf_cap);
+            if (rc != 0) {
+                if (rc == ENOMEM && dst->memory_budget_denial_pending)
+                    rc = ENOSPC;
+                goto done;
+            }
+            for (uint32_t c = 0; c < src->ncols; c++)
+                memcpy(dst->merge_columns[c], src->merge_columns[c],
+                    (size_t)src->merge_buf_cap * sizeof(int64_t));
+        } else {
+            dst->merge_buf_cap = src->merge_buf_cap;
+        }
+        rc = wl_columnar_eval_dedup_set_clone_exact(dst, src);
+        if (rc != 0)
+            goto done;
+    }
     *out = dst;
     dst = NULL;
     rc = 0;
@@ -6410,7 +6437,7 @@ done:
         col_rel_reservation_rollback(&metadata_pending);
     if (dst)
         col_rel_destroy(dst);
-    {
+    if (!mutable_image) {
         int release_rc = col_rel_source_reader_release(&reader);
         if (rc == 0 && release_rc != 0) {
             col_rel_destroy(*out);
@@ -6419,6 +6446,311 @@ done:
         }
     }
     return rc;
+}
+
+int
+wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
+    wl_columnar_memory_governor_ref_t *governor)
+{
+    return col_rel_deep_copy_governed_impl(src, out, governor, false);
+}
+
+static bool
+col_rel_image_token_valid(const wl_columnar_memory_reservation_t *token,
+    const col_rel_t *owner, uint64_t bytes)
+{
+    uint64_t state = atomic_load_explicit(&token->state,
+            memory_order_acquire);
+    if (!bytes)
+        return state == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+               || state == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED;
+    return token->identity == token && token->bytes == bytes
+           && token->governor
+           == wl_columnar_memory_governor_ref_get(owner->memory_governor)
+           && state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+           && atomic_load_explicit(&token->owner_bits,
+               memory_order_acquire) == (uintptr_t)owner;
+}
+
+static int
+col_rel_mutable_image_validate(const col_rel_t *r)
+{
+    uint64_t payload, metadata, dedup, descriptor, named_descriptor;
+    if (!r || !r->memory_governor || r->pool_owned || r->arena_owned
+        || r->col_shared || r->retract_backup_columns
+        || r->retract_backup_timestamps
+        || r->retract_backup_nrows || r->retract_backup_base_nrows
+        || r->retract_backup_capacity
+        || r->retract_backup_timestamp_capacity
+        || r->retract_backup_sorted_nrows || r->retract_backup_run_count
+        || r->storage_owner != r || r->nrows > r->capacity
+        || col_rel_storage_alias_borrow_count(r) != 0
+        || r->base_nrows > r->nrows || r->sorted_nrows > r->nrows
+        || (r->ncols && !r->row_scratch)
+        || (r->ncols && (r->merge_columns != NULL)
+        != (r->merge_buf_cap != 0))
+        || r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+        || r->storage_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
+        return EBUSY;
+    if (!col_rel_retained_live_bytes(r, &payload)
+        || !col_rel_current_metadata_bytes(r, &metadata))
+        return EINVAL;
+    int rc = wl_columnar_eval_dedup_set_bytes(r, &dedup);
+    if (rc != 0)
+        return rc;
+    if (!wl_columnar_memory_size_add(sizeof(col_rel_t),
+        sizeof(wl_columnar_memory_reservation_t), &descriptor)
+        || !wl_columnar_memory_size_add(descriptor,
+        r->name ? strlen(r->name) + 1u : 0u, &named_descriptor))
+        return EOVERFLOW;
+    if (r->descriptor_reserved_bytes != (r->pool_name_reserved_bytes
+        ? descriptor : named_descriptor))
+        return EBUSY;
+    if (!col_rel_image_token_valid(&r->descriptor_reservation, r,
+        r->descriptor_reserved_bytes)
+        || (r->pool_name_reserved_bytes
+        && (!r->name || r->pool_name_reserved_bytes
+        != strlen(r->name) + 1u))
+        || !col_rel_image_token_valid(&r->pool_name_reservation, r,
+        r->pool_name_reserved_bytes)
+        || !col_rel_image_token_valid(&r->retained_reservation, r, payload)
+        || r->retained_reserved_bytes != payload
+        || !col_rel_image_token_valid(&r->metadata_reservation, r, metadata)
+        || r->metadata_reserved_bytes != metadata
+        || !col_rel_image_token_valid(&r->dedup_reservation, r, dedup)
+        || r->dedup_reserved_bytes != dedup)
+        return EBUSY;
+    for (uint32_t c = 0; c < r->ncols; c++) {
+        if (r->capacity && (!r->columns || !r->columns[c]))
+            return EINVAL;
+        if (r->merge_columns && !r->merge_columns[c])
+            return EINVAL;
+    }
+    if (r->run_count > COL_MAX_RUNS)
+        return EINVAL;
+    uint32_t end = 0;
+    for (uint32_t i = 0; i < r->run_count; i++) {
+        if (r->run_ends[i] <= end || r->run_ends[i] > r->nrows)
+            return EINVAL;
+        end = r->run_ends[i];
+    }
+    return r->run_count && end != r->nrows ? EINVAL : 0;
+}
+
+int
+col_rel_mutable_image_prepare(col_rel_t *source,
+    col_rel_mutable_image_t *transaction)
+{
+    int rc;
+    if (!source || !transaction)
+        return EINVAL;
+    if (transaction->source || transaction->image)
+        return EBUSY;
+    memset(transaction, 0, sizeof(*transaction));
+    rc = col_rel_published_writer_acquire(source, &transaction->writer);
+    if (rc != 0)
+        return rc;
+    transaction->source = source;
+    rc = col_rel_mutable_image_validate(source);
+    if (rc == 0)
+        rc = col_rel_deep_copy_governed_impl(source, &transaction->image,
+                source->memory_governor, true);
+    if (rc != 0) {
+        if (transaction->image)
+            col_rel_destroy(transaction->image);
+        (void)wl_columnar_source_access_writer_release(&transaction->writer);
+        memset(transaction, 0, sizeof(*transaction));
+    }
+    return rc;
+}
+
+col_rel_t *
+col_rel_mutable_image_get(col_rel_mutable_image_t *transaction)
+{
+    return transaction && transaction->source
+           && transaction->writer.identity == (uintptr_t)&transaction->writer
+        ? transaction->image : NULL;
+}
+
+void
+col_rel_mutable_image_discard(col_rel_mutable_image_t *transaction)
+{
+    if (!transaction || !transaction->source)
+        return;
+    if (transaction->writer.owner != &transaction->source->source_access
+        || transaction->writer.identity
+        != (uintptr_t)&transaction->writer
+        || !wl_columnar_source_access_writer_thread_equal(
+            &transaction->writer))
+        abort();
+    if (transaction->image)
+        col_rel_destroy(transaction->image);
+    if (wl_columnar_source_access_writer_release(&transaction->writer) != 0)
+        abort();
+    memset(transaction, 0, sizeof(*transaction));
+}
+
+/* The image's current tokens (including growth after prepare) are moved,
+* never copied. All fallible checks precede the first source mutation. */
+int
+col_rel_mutable_image_commit(col_rel_mutable_image_t *transaction)
+{
+    wl_columnar_memory_reservation_t descriptor, image_descriptor, pool_name;
+    wl_columnar_memory_reservation_t old_payload, old_metadata, old_dedup;
+    wl_columnar_memory_reservation_t new_payload, new_metadata, new_dedup;
+    col_rel_t old, *source, *image;
+    wl_columnar_memory_governor_ref_t *image_governor;
+    wl_mem_ledger_t *ledger;
+    char *name;
+    uint64_t identity, view_generation, storage_generation;
+    uint64_t gate_state, descriptor_state, ledger_before;
+    uint64_t descriptor_bytes, pool_name_bytes, payload_bytes;
+    uint64_t metadata_bytes, dedup_bytes;
+    col_rel_t *deferred_next;
+    struct wl_col_session_t *deferred_session;
+
+    if (!transaction)
+        return EINVAL;
+    source = transaction->source;
+    image = transaction->image;
+    if (!source || !image
+        || transaction->writer.owner != &source->source_access
+        || transaction->writer.identity
+        != (uintptr_t)&transaction->writer
+        || !wl_columnar_source_access_writer_thread_equal(
+            &transaction->writer))
+        return EINVAL;
+    if (col_rel_mutable_image_validate(source) != 0
+        || col_rel_mutable_image_validate(image) != 0
+        || image->name || image->pool_owned || image->memory_governor
+        != source->memory_governor)
+        return EBUSY;
+
+    wl_columnar_memory_reservation_init(&descriptor);
+    wl_columnar_memory_reservation_init(&image_descriptor);
+    wl_columnar_memory_reservation_init(&pool_name);
+    wl_columnar_memory_reservation_init(&old_payload);
+    wl_columnar_memory_reservation_init(&old_metadata);
+    wl_columnar_memory_reservation_init(&old_dedup);
+    wl_columnar_memory_reservation_init(&new_payload);
+    wl_columnar_memory_reservation_init(&new_metadata);
+    wl_columnar_memory_reservation_init(&new_dedup);
+    descriptor_bytes = source->descriptor_reserved_bytes;
+    pool_name_bytes = source->pool_name_reserved_bytes;
+    payload_bytes = image->retained_reserved_bytes;
+    metadata_bytes = image->metadata_reserved_bytes;
+    dedup_bytes = image->dedup_reserved_bytes;
+    image_governor = image->memory_governor;
+    if (!wl_columnar_memory_reservation_move(&descriptor,
+        &source->descriptor_reservation)
+        || !wl_columnar_memory_reservation_move(&image_descriptor,
+        &image->descriptor_reservation)
+        || (pool_name_bytes && !wl_columnar_memory_reservation_move(
+            &pool_name, &source->pool_name_reservation))
+        || (source->retained_reserved_bytes
+        && !wl_columnar_memory_reservation_move(&old_payload,
+        &source->retained_reservation))
+        || (source->metadata_reserved_bytes
+        && !wl_columnar_memory_reservation_move(&old_metadata,
+        &source->metadata_reservation))
+        || (source->dedup_reserved_bytes
+        && !wl_columnar_memory_reservation_move(&old_dedup,
+        &source->dedup_reservation))
+        || (payload_bytes && (!wl_columnar_memory_transfer(
+            &image->retained_reservation, source)
+        || !wl_columnar_memory_reservation_move(&new_payload,
+        &image->retained_reservation)))
+        || (metadata_bytes && (!wl_columnar_memory_transfer(
+            &image->metadata_reservation, source)
+        || !wl_columnar_memory_reservation_move(&new_metadata,
+        &image->metadata_reservation)))
+        || (dedup_bytes && (!wl_columnar_memory_transfer(
+            &image->dedup_reservation, source)
+        || !wl_columnar_memory_reservation_move(&new_dedup,
+        &image->dedup_reservation))))
+        abort(); /* Validated writer-exclusive tokens cannot race here. */
+
+    old = *source;
+    name = old.name;
+    ledger = old.mem_ledger;
+    identity = old.relation_identity;
+    view_generation = old.view_generation;
+    storage_generation = old.storage_generation;
+    ledger_before = col_rel_owned_ledger_bytes(&old);
+    deferred_next = old.deferred_relation_next;
+    deferred_session = old.deferred_relation_session;
+    gate_state = atomic_load_explicit(&old.source_access.state,
+            memory_order_acquire);
+    descriptor_state = atomic_load_explicit(&old.descriptor_access.state,
+            memory_order_acquire);
+    *source = *image;
+    free(image); /* Its descriptor credit remains live until this free. */
+    transaction->image = NULL;
+    source->name = name;
+    source->memory_governor = old.memory_governor;
+    source->mem_ledger = ledger;
+    source->relation_identity = identity;
+    source->memory_budget_denial_pending = old.memory_budget_denial_pending;
+    source->view_generation = view_generation;
+    source->storage_generation = storage_generation;
+    source->deferred_relation_next = deferred_next;
+    source->deferred_relation_session = deferred_session;
+    source->storage_owner = source;
+    source->storage_owner_identity = identity;
+    source->ledger_ts_bytes = old.ledger_ts_bytes;
+    source->descriptor_reserved_bytes = descriptor_bytes;
+    wl_columnar_memory_reservation_init(&source->descriptor_reservation);
+    if (!wl_columnar_memory_reservation_move(&source->descriptor_reservation,
+        &descriptor))
+        abort();
+    source->pool_name_reserved_bytes = pool_name_bytes;
+    wl_columnar_memory_reservation_init(&source->pool_name_reservation);
+    if (pool_name_bytes && !wl_columnar_memory_reservation_move(
+            &source->pool_name_reservation, &pool_name))
+        abort();
+    source->retained_reserved_bytes = payload_bytes;
+    source->metadata_reserved_bytes = metadata_bytes;
+    source->dedup_reserved_bytes = dedup_bytes;
+    wl_columnar_memory_reservation_init(&source->retained_reservation);
+    wl_columnar_memory_reservation_init(&source->metadata_reservation);
+    wl_columnar_memory_reservation_init(&source->dedup_reservation);
+    if ((payload_bytes && !wl_columnar_memory_reservation_move(
+            &source->retained_reservation, &new_payload))
+        || (metadata_bytes && !wl_columnar_memory_reservation_move(
+            &source->metadata_reservation, &new_metadata))
+        || (dedup_bytes && !wl_columnar_memory_reservation_move(
+            &source->dedup_reservation, &new_dedup)))
+        abort();
+    atomic_store_explicit(&source->source_access.state, gate_state,
+        memory_order_release);
+    atomic_store_explicit(&source->descriptor_access.state, descriptor_state,
+        memory_order_release);
+    col_rel_ledger_reconcile(source, ledger_before);
+    wl_columnar_relation_touch_replacement(source);
+
+    old.name = NULL;
+    old.mem_ledger = NULL;
+    old.memory_governor = NULL;
+    old.descriptor_reserved_bytes = 0;
+    old.pool_name_reserved_bytes = 0;
+    old.retained_reserved_bytes = 0;
+    old.metadata_reserved_bytes = 0;
+    old.dedup_reserved_bytes = 0;
+    old.storage_owner = &old;
+    old.storage_owner_identity = old.relation_identity;
+    atomic_store_explicit(&old.storage_alias_borrows, 0,
+        memory_order_relaxed);
+    col_rel_storage_owner_init(&old);
+    col_rel_free_contents(&old); /* Physical old image retires first. */
+    col_rel_release_reservation_or_abort(&old_payload);
+    col_rel_release_reservation_or_abort(&old_metadata);
+    col_rel_release_reservation_or_abort(&old_dedup);
+    col_rel_release_reservation_or_abort(&image_descriptor);
+    wl_columnar_memory_governor_ref_release(image_governor);
+    if (wl_columnar_source_access_writer_release(&transaction->writer) != 0)
+        abort();
+    memset(transaction, 0, sizeof(*transaction));
+    return 0;
 }
 
 static int
