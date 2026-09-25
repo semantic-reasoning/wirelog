@@ -249,31 +249,22 @@ deep_copy_fixture_assert_relations_equal(const col_rel_t *a,
             "FIXTURE: compound_arity_map NULL-ness mismatch\n");
         return 0;
     }
+    if (a->compound_arity_len != b->compound_arity_len) {
+        fprintf(stderr, "FIXTURE: compound_arity_len mismatch\n");
+        return 0;
+    }
     if (a->compound_arity_map && b->compound_arity_map) {
         if (a->compound_arity_map == b->compound_arity_map) {
             fprintf(stderr,
                 "FIXTURE: compound_arity_map aliased\n");
             return 0;
         }
-        /* arity_map length matches the LOGICAL column count.  In the
-         * INLINE-kind path the logical layout is implicit; we compare
-         * up to compound_count + scalar tail using the same convention
-         * the existing tests rely on (entry-by-entry while non-zero,
-         * matching what the round-trip test asserts).  Since both
-         * relations are paired (deep-copy a -> b), walking the LOGICAL
-         * column count derived from the arity_map's stored values is
-         * sufficient -- we walk until the prefix-sum reaches ncols. */
-        uint32_t walked = 0u;
-        for (uint32_t i = 0; walked < a->ncols && i < a->ncols; i++) {
+        for (uint32_t i = 0; i < a->compound_arity_len; i++) {
             if (a->compound_arity_map[i] != b->compound_arity_map[i]) {
                 fprintf(stderr,
                     "FIXTURE: compound_arity_map[%u] mismatch\n", i);
                 return 0;
             }
-            uint32_t w = a->compound_arity_map[i];
-            if (w == 0u)
-                break; /* defensive: avoid infinite loop on bad input */
-            walked += w;
         }
     }
 
