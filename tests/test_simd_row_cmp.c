@@ -141,6 +141,7 @@ typedef struct {
     wirelog_compound_kind_t compound_kind;
     uint32_t compound_count;
     uint32_t *compound_arity_map;
+    uint32_t compound_arity_len;
     uint32_t inline_physical_offset;
     uint32_t declared_ncols;
     uint64_t relation_identity;

@@ -67,6 +67,7 @@ static uint64_t
 metadata_bytes(const col_rel_t *rel)
 {
     uint64_t bytes = rel->schema_ok ? 3u : 0u;
+    bytes += (uint64_t)rel->compound_arity_len * sizeof(uint32_t);
     if (rel->col_names)
         bytes += (uint64_t)rel->ncols * sizeof(*rel->col_names);
     if (rel->column_types)
@@ -796,6 +797,7 @@ test_governed_empty_compound_copy(void)
     if (!source)
         return;
     source->compound_arity_map = malloc(sizeof(arity));
+    source->compound_arity_len = 1;
     CHECK(source->compound_arity_map != NULL,
         "empty compound-copy arity allocation");
     if (!source->compound_arity_map)
@@ -1588,6 +1590,11 @@ test_governed_pool_clone_fallback(void)
         int64_t value = 42;
         CHECK(col_rel_append_row(src, &value) == 0, "source seed");
         CHECK(col_rel_enable_timestamps(src) == 0, "source timestamp mode");
+        const col_rel_logical_col_t logical = {
+            WIRELOG_COMPOUND_KIND_SIDE, 2u, 1u
+        };
+        CHECK(col_rel_apply_compound_schema(src, &logical, 1u) == 0,
+            "source compound-map setup");
         if (route == 2) {
             occupied = col_rel_pool_new_like(pool, "occupied", src);
             CHECK(occupied && occupied->pool_owned, "actual pool exhaustion");
@@ -1596,7 +1603,10 @@ test_governed_pool_clone_fallback(void)
         uint64_t baseline = wl_columnar_memory_reserved(g);
         uint64_t payload = (uint64_t)COL_REL_INIT_CAP * sizeof(int64_t);
         uint64_t heap_floor = route == 1 ? 0 : descriptor_bytes("retry");
-        uint64_t metadata_floor = auto_metadata_bytes(1);
+        uint64_t metadata_final = auto_metadata_bytes(1)
+            + sizeof(uint32_t);
+        uint64_t metadata_floor = auto_metadata_bytes(1)
+            + metadata_final;
         uint32_t used = pool ? pool->slot_used : 0;
         atomic_store_explicit(&g->usable_bytes,
             baseline + payload + heap_floor + metadata_floor - 1,
@@ -1616,6 +1626,12 @@ test_governed_pool_clone_fallback(void)
         CHECK(clone && clone->memory_governor == ref,
             "effective governor retained");
         if (!clone) goto cleanup;
+        CHECK(clone->compound_arity_len == 1
+            && clone->compound_arity_map
+            && clone->compound_arity_map != src->compound_arity_map
+            && clone->compound_arity_map[0] == 1
+            && clone->metadata_reserved_bytes == metadata_final,
+            "heap or pool clone admits its private compound map");
         CHECK(clone->pool_owned == (route == 1), "expected pool or heap route");
         CHECK(!clone->timestamps, "legacy timestamp mode unchanged");
         CHECK(col_rel_enable_timestamps(clone) != 0 && !clone->timestamps,
@@ -2030,9 +2046,287 @@ test_terminal_release_policy(void)
 }
 #endif
 
+static void
+test_compound_map_admission(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    const col_rel_logical_col_t logical = {
+        WIRELOG_COMPOUND_KIND_INLINE, 2u, 1u
+    };
+    col_rel_t *rel = col_rel_new_auto("compound-map", 2);
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    uint64_t base, old_meta, new_meta, old_view, old_storage;
+    uint32_t *old_map;
+    if (!rel) {
+        CHECK(false, "compound-map fixture allocation");
+        return;
+    }
+    old_meta = metadata_bytes(rel);
+    new_meta = old_meta + sizeof(uint32_t);
+    base = descriptor_bytes("compound-map") + old_meta;
+    make_resolution(&resolution, base + new_meta - 1u);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && col_rel_attach_memory_governor(rel, ref) == 0,
+        "compound-map base attach");
+    if (!ref || rel->memory_governor != ref)
+        goto cleanup;
+    old_view = rel->view_generation;
+    old_storage = rel->storage_generation;
+    CHECK(col_rel_apply_compound_schema(rel, &logical, 1u) == ENOMEM
+        && rel->compound_arity_map == NULL
+        && rel->compound_arity_len == 0
+        && rel->view_generation == old_view
+        && rel->storage_generation == old_storage
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == base,
+        "compound-map one-byte denial preserves old image");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, base + new_meta,
+        memory_order_release);
+    CHECK(col_rel_apply_compound_schema(rel, &logical, 1u) == 0
+        && rel->compound_arity_len == 1
+        && rel->metadata_reserved_bytes == metadata_bytes(rel)
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == base + sizeof(uint32_t),
+        "compound-map exact-fit installation");
+    old_map = rel->compound_arity_map;
+    old_view = rel->view_generation;
+    old_storage = rel->storage_generation;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes,
+        descriptor_bytes("compound-map") + 2u * new_meta - 1u,
+        memory_order_release);
+    CHECK(col_rel_apply_compound_schema(rel, &logical, 1u) == ENOMEM
+        && rel->compound_arity_map == old_map
+        && rel->view_generation == old_view
+        && rel->storage_generation == old_storage,
+        "compound-map replacement one-byte overlap denial");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes,
+        descriptor_bytes("compound-map") + 2u * new_meta,
+        memory_order_release);
+    wl_columnar_relation_test_fail_next_metadata_alloc();
+    CHECK(col_rel_apply_compound_schema(rel, &logical, 1u) == ENOMEM
+        && rel->compound_arity_map == old_map
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == base + sizeof(uint32_t),
+        "compound-map post-admission allocator failure rolls back");
+    CHECK(col_rel_apply_compound_schema(rel, &logical, 1u) == 0
+        && rel->compound_arity_map != old_map
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == base + sizeof(uint32_t),
+        "compound-map overlap retry releases old credit");
+cleanup:
+    col_rel_destroy(rel);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "compound-map teardown releases metadata token");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_compound_map_attach_and_shared_view(void)
+{
+    const col_rel_logical_col_t logical = {
+        WIRELOG_COMPOUND_KIND_INLINE, 2u, 1u
+    };
+    wl_columnar_memory_resolution_t resolution;
+    col_rel_t *rel = col_rel_new_auto("attached-map", 2);
+    col_rel_t *plain = col_rel_new_auto("plain", 2);
+    col_rel_t *add = col_rel_new_auto("map-add", 2);
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    wl_columnar_memory_governor_ref_t *add_ref = NULL;
+    uint64_t exact, view;
+    CHECK(rel && plain && add && col_rel_apply_compound_schema(rel,
+        &logical, 1u) == 0, "compound-map attach setup");
+    if (!rel || !plain || !add || rel->compound_arity_len != 1)
+        goto cleanup;
+    exact = descriptor_bytes("attached-map") + metadata_bytes(rel);
+    make_resolution(&resolution, exact - 1u);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && col_rel_attach_memory_governor(rel, ref) == ENOSPC
+        && rel->memory_governor == NULL
+        && rel->metadata_reserved_bytes == 0
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0,
+        "compound-map legacy attach one-byte denial");
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+    make_resolution(&resolution, exact);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && col_rel_attach_memory_governor(rel, ref) == 0
+        && rel->metadata_reserved_bytes == metadata_bytes(rel)
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == exact,
+        "compound-map legacy attach exact fit");
+    if (!ref || rel->memory_governor != ref)
+        goto cleanup;
+    make_resolution(&resolution,
+        descriptor_bytes("map-add") + metadata_bytes(add));
+    add_ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(add_ref && col_rel_attach_memory_governor(add, add_ref) == 0,
+        "governed shared-view addition setup");
+    if (add_ref && add->memory_governor == add_ref) {
+        uint64_t add_view = add->view_generation;
+        CHECK(col_rel_install_shared_view(add, rel) == ENOTSUP
+            && add->compound_arity_len == 0
+            && add->view_generation == add_view,
+            "governed shared view refuses compound addition");
+    }
+    view = rel->view_generation;
+    CHECK(col_rel_install_shared_view(rel, plain) == ENOTSUP
+        && rel->compound_arity_len == 1
+        && rel->view_generation == view
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == exact,
+        "governed shared view refuses compound removal");
+    CHECK(col_rel_install_shared_view(plain, rel) == 0
+        && plain->compound_arity_len == 1,
+        "ungoverned shared view copies bounded compound map");
+cleanup:
+    col_rel_destroy(add);
+    col_rel_destroy(plain);
+    col_rel_destroy(rel);
+    if (add_ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(add_ref)) == 0,
+            "governed shared-view addition teardown");
+        wl_columnar_memory_governor_ref_release(add_ref);
+    }
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "compound-map attach teardown releases token");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_compound_map_replacement(void)
+{
+    const col_rel_logical_col_t logical[2] = {
+        { WIRELOG_COMPOUND_KIND_SIDE, 2u, 1u },
+        { WIRELOG_COMPOUND_KIND_NONE, 0u, 0u },
+    };
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    col_rel_t *target = col_rel_new_auto("map-target", 2);
+    col_rel_t *candidate = col_rel_new_auto("map-candidate", 2);
+    col_rel_replacement_t replacement = { 0 };
+    uint64_t base, planned, exact, view;
+    if (!target || !candidate
+        || col_rel_apply_compound_schema(candidate, logical, 2u) != 0) {
+        CHECK(false, "compound replacement fixture");
+        goto cleanup;
+    }
+    planned = (uint64_t)candidate->ncols * candidate->capacity
+        * sizeof(int64_t);
+    base = descriptor_bytes("map-target") + metadata_bytes(target);
+    exact = base + planned + metadata_bytes(candidate);
+    make_resolution(&resolution, exact - 1u);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    if (!ref || col_rel_attach_memory_governor(target, ref) != 0) {
+        CHECK(false, "compound replacement governor attach");
+        goto cleanup;
+    }
+    view = target->view_generation;
+    CHECK(col_rel_prepare_replacement(target, candidate, &replacement)
+        == ENOMEM && target->view_generation == view
+        && target->compound_arity_len == 0
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == base,
+        "compound replacement one-byte denial preserves old image");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, exact, memory_order_release);
+    CHECK(col_rel_prepare_replacement(target, candidate, &replacement) == 0
+        && replacement.metadata_reserved_bytes == metadata_bytes(candidate)
+        && replacement.staged->compound_arity_len == 2
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == exact,
+        "compound replacement exact-fit prepared window");
+    col_rel_discard_replacement(&replacement);
+    CHECK(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == base
+        && target->compound_arity_len == 0,
+        "compound replacement discard releases pending map credit");
+    CHECK(col_rel_prepare_replacement(target, candidate, &replacement) == 0,
+        "compound replacement prepare after discard");
+    if (replacement.staged)
+        col_rel_commit_replacement_locked(target, &replacement);
+    col_rel_discard_replacement(&replacement);
+    CHECK(target->compound_arity_len == 2
+        && target->compound_arity_map
+        && target->compound_arity_map[0] == 1
+        && target->compound_arity_map[1] == 1
+        && target->metadata_reserved_bytes == metadata_bytes(candidate)
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == descriptor_bytes("map-target") + planned
+        + metadata_bytes(candidate),
+        "compound replacement commits exact private map charge");
+cleanup:
+    col_rel_discard_replacement(&replacement);
+    col_rel_destroy(candidate);
+    col_rel_destroy(target);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "compound replacement teardown releases token");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_compound_map_malformed_length(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    col_rel_t *rel = col_rel_new_auto("bad-map", 1);
+    wl_columnar_memory_governor_ref_t *ref;
+    CHECK(rel != NULL, "malformed compound-map setup");
+    if (!rel)
+        return;
+    rel->compound_arity_map = malloc(sizeof(uint32_t));
+    CHECK(rel->compound_arity_map != NULL, "malformed compound-map storage");
+    if (!rel->compound_arity_map) {
+        col_rel_destroy(rel);
+        return;
+    }
+    rel->compound_arity_map[0] = 1;
+    make_resolution(&resolution, 1u << 20);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && col_rel_attach_memory_governor(rel, ref) == EOVERFLOW
+        && rel->memory_governor == NULL,
+        "map pointer without length rejected before read");
+    rel->compound_arity_len = 2;
+    CHECK(ref && col_rel_attach_memory_governor(rel, ref) == EOVERFLOW
+        && rel->memory_governor == NULL,
+        "map length exceeding physical width rejected before read");
+    rel->compound_arity_len = 1;
+    rel->compound_arity_map[0] = 0;
+    CHECK(ref && col_rel_attach_memory_governor(rel, ref) == EOVERFLOW
+        && rel->memory_governor == NULL,
+        "zero map entry rejected before admission");
+    col_rel_destroy(rel);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "malformed map leaves no reservation");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
 int
 main(void)
 {
+    test_compound_map_admission();
+    test_compound_map_attach_and_shared_view();
+    test_compound_map_replacement();
+    test_compound_map_malformed_length();
     test_heap_descriptor_admission();
     test_heap_descriptor_attach_and_replacement();
     test_pool_descriptor_excluded();

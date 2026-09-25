@@ -1498,6 +1498,7 @@ test_tdd_reset_restore_transaction(void)
     rel->compound_count = 1;
     rel->compound_arity_map = (uint32_t *)calloc(2,
             sizeof(*rel->compound_arity_map));
+    rel->compound_arity_len = 2;
     if (!rel->compound_arity_map) {
         col_rel_destroy(rel);
         FAIL("compound metadata setup");
@@ -1650,6 +1651,7 @@ test_tdd_reset_restore_transaction(void)
         bad->compound_count = 1;
         bad->compound_arity_map = (uint32_t *)calloc(2,
                 sizeof(*bad->compound_arity_map));
+        bad->compound_arity_len = 2;
         if (!bad->compound_arity_map) {
             col_rel_destroy(bad);
             session_remove_rel(&coord, "r");
@@ -1791,6 +1793,7 @@ test_tdd_reset_restore_transaction(void)
         bad->compound_count = 1;
         bad->compound_arity_map = (uint32_t *)calloc(2,
                 sizeof(*bad->compound_arity_map));
+        bad->compound_arity_len = 2;
         if (!bad->compound_arity_map) {
             col_rel_destroy(bad);
             FAIL("new-relation cleanup setup");
@@ -2098,6 +2101,7 @@ test_tdd_merge_schema_mismatch_rollback(void)
     worker->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
     worker->compound_count = 1;
     worker->compound_arity_map = (uint32_t *)malloc(2 * sizeof(uint32_t));
+    worker->compound_arity_len = 2;
     if (!worker->compound_arity_map) {
         col_rel_destroy(target);
         col_rel_destroy(worker);
@@ -3584,6 +3588,7 @@ test_initializer_schema_parity(uint32_t workers, unsigned mode, bool typed)
         unowned->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
         unowned->compound_count = 1;
         unowned->compound_arity_map = malloc(sizeof(uint32_t));
+        unowned->compound_arity_len = 1;
         META_CHECK(unowned->compound_arity_map, "metadata map");
         unowned->compound_arity_map[0] = 2;
         META_CHECK(col_rel_enable_timestamps(unowned) == 0,
@@ -3799,6 +3804,7 @@ test_hybrid_empty_idb_ownership(unsigned fault)
     HYBRID_CHECK(output_rel, "output allocation");
     output_rel->column_types = malloc(2 * sizeof(*output_rel->column_types));
     output_rel->compound_arity_map = malloc(sizeof(uint32_t));
+    output_rel->compound_arity_len = 1;
     HYBRID_CHECK(output_rel->column_types && output_rel->compound_arity_map,
         "metadata allocation");
     output_rel->column_types[0] = WIRELOG_TYPE_INT64;
@@ -4107,17 +4113,16 @@ test_global_exchange_metadata(uint32_t workers, bool schema_less)
     wl_columnar_memory_governor_ref_retain(governor);
     prototype = col_rel_new_auto("prototype", 2);
     GLOBAL_META_CHECK(prototype, "prototype");
-    GLOBAL_META_CHECK(col_rel_attach_memory_governor(prototype, governor) == 0,
-        "attach governor");
     wirelog_column_type_t types[] = { WIRELOG_TYPE_INT64, WIRELOG_TYPE_INT64 };
     GLOBAL_META_CHECK(col_rel_set_column_types(prototype, types, 2) == 0,
         "types");
-    prototype->compound_arity_map = malloc(sizeof(uint32_t));
-    GLOBAL_META_CHECK(prototype->compound_arity_map, "compound map");
-    prototype->compound_arity_map[0] = 2;
-    prototype->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
-    prototype->compound_count = 1;
-    prototype->inline_physical_offset = 0;
+    const col_rel_logical_col_t logical = {
+        WIRELOG_COMPOUND_KIND_INLINE, 2u, 1u
+    };
+    GLOBAL_META_CHECK(col_rel_apply_compound_schema(prototype, &logical,
+        1u) == 0, "compound map");
+    GLOBAL_META_CHECK(col_rel_attach_memory_governor(prototype, governor) == 0,
+        "attach governor");
     prototype->declared_ncols = 1;
     prototype->has_graph_column = true;
     prototype->graph_col_idx = 1;

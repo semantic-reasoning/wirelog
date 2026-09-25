@@ -5391,12 +5391,11 @@ inject_serial_metadata(wl_col_session_t *sess, eval_stack_t *stack,
     source->timestamps[1] = (col_delta_timestamp_t){
         .iteration = 8, .stratum = 4, .worker = 1, .multiplicity = 6
     };
-    source->compound_arity_map = malloc(sizeof(uint32_t));
-    if (!source->compound_arity_map)
+    const col_rel_logical_col_t logical = {
+        WIRELOG_COMPOUND_KIND_INLINE, 1u, 1u
+    };
+    if (col_rel_apply_compound_schema(source, &logical, 1u) != 0)
         return;
-    source->compound_arity_map[0] = 1;
-    source->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
-    source->compound_count = 1;
     col_rel_t *copy = wl_columnar_relation_new_like_governed("metadata", source,
             sess->memory_governor);
     if (!copy)
@@ -7747,14 +7746,11 @@ idb_after_eval(wl_col_session_t *sess)
             return;
         for (uint32_t row = 0; row < target->nrows; row++)
             target->timestamps[row] = idb_timestamp(row);
-        if (!target->compound_arity_map) {
-            target->compound_arity_map = malloc(sizeof(uint32_t));
-            if (!target->compound_arity_map)
-                return;
-        }
-        target->compound_arity_map[0] = 1;
-        target->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
-        target->compound_count = 1;
+        const col_rel_logical_col_t logical = {
+            WIRELOG_COMPOUND_KIND_INLINE, 1u, 1u
+        };
+        if (col_rel_apply_compound_schema(target, &logical, 1u) != 0)
+            return;
     }
     idb_target_columns = target->columns;
     idb_target_view = target->view_generation;
@@ -12266,6 +12262,11 @@ test_governed_pool_publication(unsigned mode)
 #define PROMOTE_CHECK(c, m) do { if (!(c)) { failure = m; goto cleanup; \
                                  } } while (0)
     PROMOTE_CHECK(ref && source, "setup");
+    const col_rel_logical_col_t logical = {
+        WIRELOG_COMPOUND_KIND_SIDE, 2u, 1u
+    };
+    PROMOTE_CHECK(col_rel_apply_compound_schema(source, &logical, 1u) == 0,
+        "compound source setup");
     pool = delta_pool_create_managed(2, sizeof(col_rel_t), 64,
             wl_columnar_memory_governor_ref_get(ref));
     PROMOTE_CHECK(pool, "managed pool");
@@ -12279,6 +12280,8 @@ test_governed_pool_publication(unsigned mode)
         .iteration = 11, .stratum = 12, .worker = 13, .multiplicity = -3
     };
     uint64_t bytes = candidate->retained_reserved_bytes;
+    uint64_t metadata_bytes = candidate->metadata_reserved_bytes;
+    uint32_t *map = candidate->compound_arity_map;
     uint64_t reserved = reserved_on(ref);
     uint64_t identity = candidate->relation_identity;
     int64_t **columns = candidate->columns;
@@ -12311,6 +12314,11 @@ test_governed_pool_publication(unsigned mode)
 #endif
         PROMOTE_CHECK(candidate->pool_owned && candidate->columns == columns
             && candidate->timestamps == timestamps
+            && candidate->compound_arity_map == map
+            && candidate->compound_arity_len == 1
+            && candidate->metadata_reserved_bytes == metadata_bytes
+            && atomic_load_explicit(&candidate->metadata_reservation.owner_bits,
+            memory_order_acquire) == (uintptr_t)candidate
             && candidate->relation_identity == identity
             && candidate->retained_reserved_bytes == bytes
             && candidate->retained_reservation.identity ==
@@ -12335,7 +12343,12 @@ test_governed_pool_publication(unsigned mode)
     PROMOTE_CHECK(result && result != candidate && !result->pool_owned
         && result->memory_governor == ref && result->columns == columns
         && result->timestamps == timestamps &&
-        result->relation_identity == identity
+        result->compound_arity_map == map
+        && result->compound_arity_len == 1
+        && result->metadata_reserved_bytes == metadata_bytes
+        && atomic_load_explicit(&result->metadata_reservation.owner_bits,
+        memory_order_acquire) == (uintptr_t)result
+        && result->relation_identity == identity
         && result->retained_reservation.identity ==
         &result->retained_reservation
         && atomic_load_explicit(&result->retained_reservation.owner_bits,
