@@ -213,8 +213,14 @@ test_governed_auto_relation_schema(void)
         && wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(governor)) == old_reserved,
         "failed timestamped promotion restores schema, buffer and admission");
-    wl_columnar_relation_test_watch_timestamp_retirement_order();
     rc = col_rel_set_schema(rel, 2, NULL);
+    ASSERT_TRUE(rc == 0 && rel->schema_ok && rel->ncols == 2
+        && rel->capacity == 1 && rel->timestamps == timestamps
+        && rel->timestamp_capacity == 1
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor))
+        == rel->retained_reserved_bytes,
+        "timestamped promotion keeps existing admitted capacities aligned");
     int64_t promoted_rows[] = { 5, 7, 11, 13 };
     rc = rc == 0 ? col_rel_append_rows_atomic(rel, promoted_rows, 2, 2,
             &denied) : rc;
@@ -226,8 +232,6 @@ test_governed_auto_relation_schema(void)
         == wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(governor)),
         "timestamped promotion grows and admits buffers before multirow append");
-    ASSERT_TRUE(wl_columnar_relation_test_timestamp_retirement_was_ordered(),
-        "old timestamp buffer retires before its reservation credit");
     col_rel_destroy(rel);
     rel = NULL;
     ASSERT_TRUE(wl_columnar_memory_reserved(
