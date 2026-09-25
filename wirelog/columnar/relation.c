@@ -736,6 +736,7 @@ typedef struct {
     uint32_t timestamp_capacity;
     uint32_t merge_capacity;
     uint32_t backup_capacity;
+    uint32_t backup_timestamp_capacity;
     bool active_table;
     bool merge_table;
     bool backup_table;
@@ -762,7 +763,8 @@ static bool
 col_rel_payload_shape_bytes(const col_rel_payload_shape_t *shape,
     uint64_t *out)
 {
-    uint64_t active, merge, backup, timestamps, scratch = 0, sum;
+    uint64_t active, merge, backup, timestamps, backup_timestamps;
+    uint64_t scratch = 0, sum;
     if (!shape || !out
         || !col_rel_payload_grid_bytes(shape->ncols,
         shape->owned_columns, shape->column_capacity,
@@ -775,11 +777,14 @@ col_rel_payload_shape_bytes(const col_rel_payload_shape_t *shape,
         shape->backup_capacity, shape->backup_table, &backup)
         || !wl_columnar_memory_size_mul(shape->timestamp_capacity,
         sizeof(col_delta_timestamp_t), &timestamps)
+        || !wl_columnar_memory_size_mul(shape->backup_timestamp_capacity,
+        sizeof(col_delta_timestamp_t), &backup_timestamps)
         || (shape->scratch && !wl_columnar_memory_size_mul(shape->ncols,
         sizeof(int64_t), &scratch))
         || !wl_columnar_memory_size_add(active, merge, &sum)
         || !wl_columnar_memory_size_add(sum, backup, &sum)
         || !wl_columnar_memory_size_add(sum, timestamps, &sum)
+        || !wl_columnar_memory_size_add(sum, backup_timestamps, &sum)
         || !wl_columnar_memory_size_add(sum, scratch, out))
         return false;
     return true;
@@ -801,6 +806,7 @@ col_rel_payload_live_shape(const col_rel_t *r, col_rel_payload_shape_t *shape)
         .timestamp_capacity = r->timestamp_capacity,
         .merge_capacity = r->merge_buf_cap,
         .backup_capacity = r->retract_backup_capacity,
+        .backup_timestamp_capacity = r->retract_backup_timestamp_capacity,
         .active_table = r->columns && !r->col_shared,
         .merge_table = r->merge_columns != NULL,
         .backup_table = r->retract_backup_columns != NULL,
@@ -841,7 +847,12 @@ static bool
 col_rel_timestamp_shape_valid(const col_rel_t *r)
 {
     return r && (r->timestamps != NULL) == (r->timestamp_capacity != 0)
-           && (!r->timestamps || r->timestamp_capacity >= r->nrows);
+           && (!r->timestamps || r->timestamp_capacity >= r->nrows)
+           && (r->retract_backup_timestamps != NULL)
+           == (r->retract_backup_timestamp_capacity != 0)
+           && (!r->retract_backup_timestamps
+           || r->retract_backup_timestamp_capacity
+           >= r->retract_backup_nrows);
 }
 
 bool
@@ -2067,6 +2078,7 @@ col_rel_free_contents_impl(col_rel_t *r, bool preserve_access_gates)
     r->columns = NULL;
     r->col_shared = NULL;
     col_columns_free(r->retract_backup_columns, r->ncols);
+    free(r->retract_backup_timestamps);
     col_columns_free(r->merge_columns, r->ncols);
     free(r->row_scratch);
     free(r->timestamps);
@@ -4856,6 +4868,9 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
         || !col_rel_timestamp_shape_valid(dst)
         || src->nrows > src->capacity)
         return EINVAL;
+    if (dst->memory_governor && (dst->retract_backup_columns
+        || dst->retract_backup_timestamps))
+        return EBUSY;
     if (!dst->storage_owner)
         col_rel_storage_owner_init(dst);
     if (col_rel_storage_owner_resolve(src, &source_owner) != 0
@@ -5018,6 +5033,8 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
         char **old_names = dst->col_names;
         int64_t **old_merge = dst->merge_columns;
         int64_t **old_retract = dst->retract_backup_columns;
+        col_delta_timestamp_t *old_retract_timestamps
+            = dst->retract_backup_timestamps;
         uint64_t *old_dedup = dst->dedup_slots;
         int64_t *old_scratch = dst->row_scratch;
         struct ArrowSchema old_schema = dst->schema;
@@ -5035,7 +5052,10 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
         dst->merge_columns = NULL;
         dst->merge_buf_cap = 0;
         dst->retract_backup_columns = NULL;
+        dst->retract_backup_timestamps = NULL;
+        dst->retract_backup_timestamp_capacity = 0;
         dst->retract_backup_nrows = 0;
+        dst->retract_backup_base_nrows = 0;
         dst->retract_backup_capacity = 0;
         dst->retract_backup_sorted_nrows = 0;
         dst->retract_backup_run_count = 0;
@@ -5109,6 +5129,7 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
         }
         col_columns_free(old_merge, dst->ncols);
         col_columns_free(old_retract, dst->ncols);
+        free(old_retract_timestamps);
         free(old_dedup);
         free(old_scratch);
         if (old_schema_ok)
@@ -6037,7 +6058,10 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
      * tracking scalars + fixed array.
      */
     dst->retract_backup_nrows = src->retract_backup_nrows;
+    dst->retract_backup_base_nrows = src->retract_backup_base_nrows;
     dst->retract_backup_capacity = src->retract_backup_capacity;
+    dst->retract_backup_timestamp_capacity
+        = src->retract_backup_timestamp_capacity;
     dst->retract_backup_sorted_nrows = src->retract_backup_sorted_nrows;
     dst->retract_backup_run_count = src->retract_backup_run_count;
     memcpy(dst->retract_backup_run_ends, src->retract_backup_run_ends,
@@ -6059,6 +6083,20 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
                     (size_t)src->retract_backup_nrows * sizeof(int64_t));
             }
         }
+    }
+    if (src->retract_backup_timestamps) {
+        dst->retract_backup_timestamps = calloc(
+            src->retract_backup_timestamp_capacity,
+            sizeof(*dst->retract_backup_timestamps));
+        if (!dst->retract_backup_timestamps) {
+            col_rel_free_contents(dst);
+            col_rel_free_heap_after_contents(dst);
+            return ENOMEM;
+        }
+        memcpy(dst->retract_backup_timestamps,
+            src->retract_backup_timestamps,
+            (size_t)src->retract_backup_timestamp_capacity
+            * sizeof(*dst->retract_backup_timestamps));
     }
 
     /*
@@ -6419,6 +6457,9 @@ col_rel_prepare_replacement_impl(col_rel_t *dst, const col_rel_t *candidate,
 
     if (!dst || !candidate || !replacement || dst == candidate)
         return EINVAL;
+    if (dst->memory_governor && (dst->retract_backup_columns
+        || dst->retract_backup_timestamps))
+        return EBUSY;
 
     rc = col_rel_replacement_validate_candidate(candidate);
     if (rc != 0)

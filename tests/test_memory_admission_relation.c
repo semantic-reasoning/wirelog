@@ -3509,9 +3509,84 @@ test_compound_map_malformed_length(void)
     }
 }
 
+static void
+test_retraction_backup_timestamp_admission(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    col_rel_t *owner = col_rel_new_auto("backup-owner", 1);
+    col_rel_t *source = col_rel_new_auto("backup-source", 1);
+    col_rel_t *copy = NULL;
+    col_rel_replacement_t replacement = { 0 };
+    int64_t row = 17;
+    CHECK(owner && source, "backup timestamp fixture");
+    if (!owner || !source)
+        goto cleanup;
+    CHECK(col_rel_append_row(owner, &row) == 0
+        && col_rel_append_row(source, &row) == 0
+        && col_rel_enable_timestamps(owner) == 0,
+        "backup timestamp active image");
+    owner->retract_backup_columns = col_columns_alloc(1, 8);
+    owner->retract_backup_timestamps = calloc(8,
+            sizeof(*owner->retract_backup_timestamps));
+    CHECK(owner->retract_backup_columns
+        && owner->retract_backup_timestamps,
+        "backup timestamp physical image");
+    if (!owner->retract_backup_columns
+        || !owner->retract_backup_timestamps)
+        goto cleanup;
+    owner->retract_backup_capacity = 8;
+    owner->retract_backup_timestamp_capacity = 8;
+    owner->retract_backup_nrows = 1;
+    owner->retract_backup_columns[0][0] = 29;
+    owner->retract_backup_timestamps[0].iteration = 91;
+    uint64_t footprint = descriptor_bytes("backup-owner")
+        + metadata_bytes(owner) + attach_payload_bytes(owner);
+    make_resolution(&resolution, footprint - 1u);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && col_rel_attach_memory_governor(owner, ref) == ENOSPC
+        && !owner->memory_governor
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0,
+        "backup timestamp one-byte attach refusal is transactional");
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+    make_resolution(&resolution, footprint);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && col_rel_attach_memory_governor(owner, ref) == 0
+        && owner->retained_reserved_bytes == attach_payload_bytes(owner)
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == footprint,
+        "backup timestamp exact attach includes both timestamp buffers");
+    CHECK(col_rel_deep_copy(owner, &copy, NULL) == 0 && copy
+        && copy->retract_backup_timestamps
+        && copy->retract_backup_timestamps
+        != owner->retract_backup_timestamps
+        && copy->retract_backup_timestamps[0].iteration == 91,
+        "backup timestamp deep copy owns private storage");
+    CHECK(col_rel_install_shared_view(owner, source) == EBUSY
+        && owner->retract_backup_timestamps[0].iteration == 91,
+        "governed shared install refuses live backup before mutation");
+    CHECK(col_rel_prepare_replacement(owner, source, &replacement) == EBUSY
+        && owner->retract_backup_timestamps[0].iteration == 91,
+        "governed replacement refuses live backup before mutation");
+cleanup:
+    col_rel_discard_replacement(&replacement);
+    col_rel_destroy(copy);
+    col_rel_destroy(owner);
+    col_rel_destroy(source);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "backup timestamp teardown releases exact credit");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
 int
 main(void)
 {
+    test_retraction_backup_timestamp_admission();
     test_compound_map_admission();
     test_compound_map_attach_and_shared_view();
     test_compound_map_replacement();

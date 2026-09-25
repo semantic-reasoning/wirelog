@@ -12825,9 +12825,333 @@ test_operator_null_session_guards(void)
     PASS();
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+static int retraction_eval_mode;
+
+static int
+test_retraction_eval(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
+    uint32_t stratum_idx)
+{
+    (void)stratum_idx;
+    if (retraction_eval_mode == 5) {
+        col_rel_t *first = session_find_rel(sess, sp->relations[0].name);
+        col_rel_t *wide = session_find_rel(sess, sp->relations[1].name);
+        int64_t first_row = 2;
+        int64_t wide_row[COL_STACK_MAX + 1u] = { 7 };
+        return first && wide && first->base_nrows == 0
+               && wide->base_nrows == 0
+               && col_rel_append_row(first, &first_row) == 0
+               && col_rel_append_row(wide, wide_row) == 0
+            ? 0 : ENOMEM;
+    }
+    if (retraction_eval_mode == 4) {
+        col_rel_t *untimestamped = session_find_rel(sess,
+                sp->relations[1].name);
+        int64_t candidate = 7;
+        return untimestamped
+               && col_rel_append_row(untimestamped, &candidate) == 0
+               && col_rel_append_row(untimestamped, &candidate) == 0
+            ? 0 : ENOMEM;
+    }
+    col_rel_t *r = session_find_rel(sess, sp->relations[0].name);
+    int64_t candidate = 2;
+    if (r && r->base_nrows != 0)
+        return EINVAL;
+    if (retraction_eval_mode == 2)
+        return 0;
+    if (!r || col_rel_append_row(r, &candidate) != 0)
+        return ENOMEM;
+    if (r->timestamps)
+        r->timestamps[r->nrows - 1u].iteration = 99;
+    if (retraction_eval_mode == 3) {
+        candidate = 1;
+        if (col_rel_append_row(r, &candidate) != 0)
+            return ENOMEM;
+        if (r->timestamps)
+            r->timestamps[r->nrows - 1u].iteration = 88;
+    }
+    if (retraction_eval_mode == 1) {
+        if (col_rel_reserve_merge_grid(r, COL_REL_INIT_CAP) != 0)
+            return ENOMEM;
+        return ENOMEM;
+    }
+    return 0;
+}
+
+static void
+test_governed_retraction_transaction(void)
+{
+    wl_plan_relation_t relations[] = {
+        { .name = "retract-first" }, { .name = "retract-second" }
+    };
+    wl_plan_stratum_t stratum = {
+        .relations = relations, .relation_count = 2
+    };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess = NULL;
+    col_rel_t *first = NULL, *second = NULL;
+    wl_columnar_memory_governor_t *governor = NULL;
+    wl_columnar_source_access_reader_t held = { 0 };
+    bool first_registered = false, second_registered = false;
+    const char *failure = NULL;
+    uint64_t baseline = 0;
+    const uint64_t grid = sizeof(int64_t *)
+        + (uint64_t)COL_REL_INIT_CAP * sizeof(int64_t);
+    const uint64_t timestamp = (uint64_t)COL_REL_INIT_CAP
+        * sizeof(col_delta_timestamp_t);
+    const uint64_t incoming = 2u * grid + timestamp;
+    int64_t row;
+#define RETRACT_CHECK(c, m) do { if (!(c)) { failure = (m); goto cleanup; \
+                                 } } while (0)
+    TEST("governed retraction stages both images and restores timestamps");
+    RETRACT_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "session create");
+    sess = COL_SESSION(session);
+    governor = wl_columnar_memory_governor_ref_get(sess->memory_governor);
+    first = col_rel_new_auto(relations[0].name, 1);
+    second = col_rel_new_auto(relations[1].name, 1);
+    RETRACT_CHECK(first && second, "relation create");
+    for (int64_t value = 1; value <= 3; value++)
+        RETRACT_CHECK(col_rel_append_row(first, &value) == 0,
+            "first rows");
+    row = 7;
+    RETRACT_CHECK(col_rel_append_row(second, &row) == 0
+        && col_rel_enable_timestamps(first) == 0,
+        "second row and timestamps");
+    first->timestamps[0].iteration = 11;
+    first->timestamps[1].iteration = 22;
+    first->timestamps[2].iteration = 33;
+    first->base_nrows = 2;
+    second->base_nrows = 1;
+    RETRACT_CHECK(col_rel_attach_memory_governor(first,
+        sess->memory_governor) == 0
+        && col_rel_attach_memory_governor(second,
+        sess->memory_governor) == 0,
+        "governed attach");
+    RETRACT_CHECK(session_add_rel(sess, first) == 0,
+        "first relation registration");
+    first_registered = true;
+    RETRACT_CHECK(session_add_rel(sess, second) == 0,
+        "second relation registration");
+    second_registered = true;
+    baseline = wl_columnar_memory_reserved(governor);
+    int64_t **first_columns = first->columns;
+    int64_t **second_columns = second->columns;
+    col_delta_timestamp_t *first_timestamps = first->timestamps;
+    uint64_t first_generation = first->view_generation;
+    uint64_t second_generation = second->view_generation;
+    wl_columnar_eval_delta_test_retraction_eval = test_retraction_eval;
+    atomic_store_explicit(&governor->usable_bytes,
+        baseline + incoming - 1u, memory_order_release);
+    RETRACT_CHECK(wl_columnar_eval_delta_test_retraction_step(&stratum,
+        sess, 0) == ENOSPC
+        && wl_columnar_memory_reserved(governor) == baseline
+        && first->columns == first_columns
+        && second->columns == second_columns
+        && first->timestamps == first_timestamps
+        && first->view_generation == first_generation
+        && second->view_generation == second_generation
+        && !first->retract_backup_columns
+        && !second->retract_backup_columns,
+        "one-byte prepare denial preserves both relations");
+    atomic_store_explicit(&governor->usable_bytes, baseline + incoming,
+        memory_order_release);
+    RETRACT_CHECK(col_rel_source_reader_acquire(second, &held) == 0,
+        "hold second reader");
+    RETRACT_CHECK(wl_columnar_eval_delta_test_retraction_step(&stratum,
+        sess, 0) == EBUSY
+        && wl_columnar_memory_reserved(governor) == baseline
+        && first->columns == first_columns,
+        "busy second preflight rolls back first stage");
+    RETRACT_CHECK(col_rel_source_reader_release(&held) == 0,
+        "release second reader");
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_malloc_size = (size_t)COL_REL_INIT_CAP * sizeof(int64_t);
+    fail_malloc_matches_to_skip = 1;
+    atomic_store_explicit(&governor->usable_bytes, baseline + incoming,
+        memory_order_release);
+    RETRACT_CHECK(wl_columnar_eval_delta_test_retraction_step(&stratum,
+        sess, 0) == ENOMEM
+        && wl_columnar_memory_reserved(governor) == baseline
+        && first->columns == first_columns
+        && second->columns == second_columns
+        && first->timestamps == first_timestamps
+        && first->view_generation == first_generation
+        && second->view_generation == second_generation,
+        "second staged allocation failure rolls back both tokens");
+    fail_malloc_size = 0;
+    fail_malloc_matches_to_skip = 0;
+#endif
+    retraction_eval_mode = 2;
+    int exact_rc = wl_columnar_eval_delta_test_retraction_step(&stratum,
+            sess, 0);
+    RETRACT_CHECK(exact_rc == 0
+        && first->nrows == 3 && first->columns[0][0] == 1
+        && first->columns[0][1] == 2
+        && first->timestamps == first_timestamps
+        && first->timestamps[0].iteration == 11
+        && first->timestamps[1].iteration == 22
+        && first->base_nrows == 2
+        && second->base_nrows == 1
+        && !first->retract_backup_columns
+        && !first->retract_backup_timestamps
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "exact prepare and empty evaluation restore");
+    atomic_store_explicit(&governor->usable_bytes, 1024u * 1024u * 1024u,
+        memory_order_release);
+    retraction_eval_mode = 0;
+    RETRACT_CHECK(wl_columnar_eval_delta_test_retraction_step(&stratum,
+        sess, 0) == 0
+        && first->nrows == 2 && first->columns[0][0] == 1
+        && first->columns[0][1] == 3
+        && first->timestamps == first_timestamps
+        && first->timestamps[0].iteration == 11
+        && first->timestamps[1].iteration == 33
+        && first->base_nrows == 1
+        && second->base_nrows == 1
+        && !first->retract_backup_columns
+        && !first->retract_backup_timestamps
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "timestamp-aligned removal releases staged image");
+    retraction_eval_mode = 1;
+    RETRACT_CHECK(wl_columnar_eval_delta_test_retraction_step(&stratum,
+        sess, 0) == ENOMEM
+        && first->nrows == 2 && first->columns[0][1] == 3
+        && first->timestamps == first_timestamps
+        && !first->merge_columns && !first->retract_backup_columns
+        && !first->retract_backup_timestamps
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "evaluation failure frees active and merge payload before credit");
+    retraction_eval_mode = 3;
+    RETRACT_CHECK(wl_columnar_eval_delta_test_retraction_step(&stratum,
+        sess, 0) == 0
+        && first->nrows == 1 && first->columns[0][0] == 3
+        && first->timestamps[0].iteration == 33
+        && first->base_nrows == 0
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "timestamped candidate sort and repeated removal keep alignment");
+    retraction_eval_mode = 4;
+    RETRACT_CHECK(wl_columnar_eval_delta_test_retraction_step(&stratum,
+        sess, 0) == 0 && second->nrows == 0
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "untimestamped candidates consolidate before removal");
+cleanup:
+    wl_columnar_eval_delta_test_retraction_eval = NULL;
+    retraction_eval_mode = 0;
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_malloc_size = 0;
+    fail_malloc_matches_to_skip = 0;
+#endif
+    if (held.owner)
+        (void)col_rel_source_reader_release(&held);
+    if (session) {
+        if (!first_registered)
+            col_rel_destroy(first);
+        if (!second_registered)
+            col_rel_destroy(second);
+        wl_session_destroy(session);
+    } else {
+        col_rel_destroy(first);
+        col_rel_destroy(second);
+    }
+    if (failure) FAIL(failure);
+    else PASS();
+#undef RETRACT_CHECK
+}
+
+static void
+test_retraction_row_buffer_failure_before_removal(void)
+{
+    wl_plan_relation_t relations[] = {
+        { .name = "retract-narrow" }, { .name = "retract-wide" }
+    };
+    wl_plan_stratum_t stratum = {
+        .relations = relations, .relation_count = 2
+    };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1 };
+    wl_session_t *session = NULL;
+    col_rel_t *narrow = NULL, *wide = NULL;
+    bool narrow_registered = false, wide_registered = false;
+    const char *failure = NULL;
+    int64_t wide_row[COL_STACK_MAX + 1u] = { 7 };
+    int64_t row = 1;
+#define ROW_FAIL_CHECK(c, m) do { if (!(c)) { failure = (m); goto cleanup; \
+                                  } } while (0)
+    TEST("retraction row buffer failure precedes every removal");
+    ROW_FAIL_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "session create");
+    wl_col_session_t *sess = COL_SESSION(session);
+    narrow = col_rel_new_auto(relations[0].name, 1);
+    wide = col_rel_new_auto(relations[1].name, COL_STACK_MAX + 1u);
+    ROW_FAIL_CHECK(narrow && wide, "relation create");
+    ROW_FAIL_CHECK(col_rel_append_row(narrow, &row) == 0,
+        "narrow first row");
+    row = 2;
+    ROW_FAIL_CHECK(col_rel_append_row(narrow, &row) == 0
+        && col_rel_append_row(wide, wide_row) == 0,
+        "rows before retraction");
+    narrow->base_nrows = 2;
+    wide->base_nrows = 1;
+    ROW_FAIL_CHECK(col_rel_attach_memory_governor(narrow,
+        sess->memory_governor) == 0
+        && col_rel_attach_memory_governor(wide,
+        sess->memory_governor) == 0,
+        "governor attach");
+    ROW_FAIL_CHECK(session_add_rel(sess, narrow) == 0,
+        "narrow registration");
+    narrow_registered = true;
+    ROW_FAIL_CHECK(session_add_rel(sess, wide) == 0,
+        "wide registration");
+    wide_registered = true;
+    uint64_t baseline = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(sess->memory_governor));
+    wl_columnar_eval_delta_test_retraction_eval = test_retraction_eval;
+    retraction_eval_mode = 5;
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_malloc_size = sizeof(wide_row);
+    fail_malloc_matches_to_skip = 1;
+    ROW_FAIL_CHECK(wl_columnar_eval_delta_test_retraction_step(&stratum,
+        sess, 0) == ENOMEM && fail_malloc_size == 0
+        && narrow->nrows == 2 && narrow->columns[0][0] == 1
+        && narrow->columns[0][1] == 2 && narrow->base_nrows == 2
+        && wide->nrows == 1 && wide->columns[0][0] == 7
+        && wide->base_nrows == 1
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(sess->memory_governor))
+        == baseline,
+        "row buffer ENOMEM leaves both relations unchanged");
+    fail_malloc_size = 0;
+    fail_malloc_matches_to_skip = 0;
+#endif
+cleanup:
+    wl_columnar_eval_delta_test_retraction_eval = NULL;
+    retraction_eval_mode = 0;
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_malloc_size = 0;
+    fail_malloc_matches_to_skip = 0;
+#endif
+    if (session) {
+        if (!narrow_registered) col_rel_destroy(narrow);
+        if (!wide_registered) col_rel_destroy(wide);
+        wl_session_destroy(session);
+    } else {
+        col_rel_destroy(narrow);
+        col_rel_destroy(wide);
+    }
+    if (failure) FAIL(failure);
+    else PASS();
+#undef ROW_FAIL_CHECK
+}
+#endif
+
 int
 main(void)
 {
+#ifdef WL_SESSION_TEST_HOOKS
+    test_governed_retraction_transaction();
+    test_retraction_row_buffer_failure_before_removal();
+#endif
     test_operator_null_session_guards();
     for (unsigned route = 0; route < 3; route++)
         for (unsigned fallback = 0; fallback < 2; fallback++)
