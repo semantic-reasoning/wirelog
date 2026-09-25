@@ -4255,9 +4255,12 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
                             rc = ENOMEM;
                         } else {
                             /* Init hash-set dedup for O(1) consolidation. */
-                            WL_COLUMNAR_EVAL_DEDUP_SET_INIT_FROM_REL(parts[w]);
-                            worker_rels[w][rels_built] = parts[w];
-                            parts[w] = NULL;
+                            rc = WL_COLUMNAR_EVAL_DEDUP_SET_INIT_FROM_REL(
+                                parts[w]);
+                            if (rc == 0) {
+                                worker_rels[w][rels_built] = parts[w];
+                                parts[w] = NULL;
+                            }
                         }
                     }
                 }
@@ -4888,10 +4891,7 @@ tdd_clear_relation_dedup_set(col_rel_t *r)
 {
     if (!r)
         return;
-    free(r->dedup_slots);
-    r->dedup_slots = NULL;
-    r->dedup_cap = 0;
-    r->dedup_count = 0;
+    wl_columnar_eval_dedup_set_clear(r);
 }
 
 /* Snapshot a published relation without carrying over its session-owned
@@ -4912,6 +4912,12 @@ tdd_snapshot_relation(const col_rel_t *source, col_rel_t **out)
     rc = col_rel_deep_copy(source, &snapshot, NULL);
     if (rc != 0)
         return rc;
+    uint64_t dedup_bytes;
+    if (snapshot->memory_governor
+        || wl_columnar_eval_dedup_set_bytes(source, &dedup_bytes) != 0) {
+        col_rel_destroy(snapshot);
+        return EINVAL;
+    }
     if (snapshot->compound_kind != source->compound_kind
         || snapshot->compound_count != source->compound_count
         || snapshot->inline_physical_offset

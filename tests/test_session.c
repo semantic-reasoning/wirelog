@@ -12415,6 +12415,12 @@ test_ungoverned_pool_payload_promotion(void)
     POOL_PAYLOAD_CHECK(source->capacity == 1024 && !source->row_scratch,
         "physical source shape");
     source->nrows = 1;
+    source->dedup_slots = calloc(4u, sizeof(uint64_t));
+    POOL_PAYLOAD_CHECK(source->dedup_slots, "pool dedup setup");
+    source->dedup_slots[1] = 1u;
+    source->dedup_cap = 4;
+    source->dedup_count = 1;
+    uint64_t *source_dedup = source->dedup_slots;
     uint64_t physical = 0;
     POOL_PAYLOAD_CHECK(col_rel_retained_live_bytes(source, &physical),
         "source payload shape");
@@ -12422,7 +12428,8 @@ test_ungoverned_pool_payload_promotion(void)
     uint64_t baseline = reserved_on(ref);
     uint64_t exact = baseline + sizeof(col_rel_t) + strlen(name) + 1u
         + sizeof(wl_columnar_memory_reservation_t)
-        + test_auto_metadata_bytes(1) + expected_payload;
+        + test_auto_metadata_bytes(1) + expected_payload
+        + 4u * sizeof(uint64_t);
     wl_columnar_memory_governor_t *governor
         = wl_columnar_memory_governor_ref_get(ref);
     int64_t **columns = source->columns;
@@ -12432,6 +12439,8 @@ test_ungoverned_pool_payload_promotion(void)
         && source->columns == columns && source->row_scratch == NULL
         && source->memory_governor == NULL
         && source->retained_reserved_bytes == 0
+        && source->dedup_slots == source_dedup
+        && source->dedup_reserved_bytes == 0
         && !source->memory_budget_denial_pending
         && reserved_on(ref) == baseline,
         "one-byte payload denial restores pool source");
@@ -12446,6 +12455,9 @@ test_ungoverned_pool_payload_promotion(void)
         == expected_payload && heap->retained_reservation.bytes
         == expected_payload && reserved_on(ref) == exact,
         "published heap owns exact payload");
+    POOL_PAYLOAD_CHECK(heap->dedup_slots == source_dedup
+        && heap->dedup_reserved_bytes == 4u * sizeof(uint64_t),
+        "promoted heap owns transferred dedup token");
     atomic_store_explicit(&governor->usable_bytes, 1u << 20,
         memory_order_release);
     POOL_PAYLOAD_CHECK(col_rel_compact(heap) == 0 && heap->capacity < 1024
@@ -12458,6 +12470,12 @@ test_ungoverned_pool_payload_promotion(void)
     POOL_PAYLOAD_CHECK(col_rel_append_row(candidate, &value) == 0,
         "duplicate payload");
     int64_t **candidate_columns = candidate->columns;
+    candidate->dedup_slots = calloc(4u, sizeof(uint64_t));
+    POOL_PAYLOAD_CHECK(candidate->dedup_slots, "duplicate dedup setup");
+    candidate->dedup_slots[1] = 1u;
+    candidate->dedup_cap = 4;
+    candidate->dedup_count = 1;
+    uint64_t *candidate_dedup = candidate->dedup_slots;
     uint64_t before = reserved_on(ref);
     POOL_PAYLOAD_CHECK(col_rel_source_reader_acquire(heap, &reader) == 0,
         "hold incumbent reader");
@@ -12466,6 +12484,8 @@ test_ungoverned_pool_payload_promotion(void)
         && candidate->columns == candidate_columns
         && candidate->memory_governor == NULL
         && candidate->retained_reserved_bytes == 0
+        && candidate->dedup_slots == candidate_dedup
+        && candidate->dedup_reserved_bytes == 0
         && candidate->row_scratch == NULL
         && reserved_on(ref) == before,
         "duplicate refusal restores ungoverned pool payload");

@@ -662,6 +662,7 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
             continue;
 
         uint32_t ncols = r->ncols;
+        bool removed_any = false;
 
         for (uint32_t del_idx = 0; del_idx < retract_nrows[ri]; del_idx++) {
             const int64_t *to_remove
@@ -676,6 +677,7 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
                     == 0) {
                     /* Found matching row; skip it (removal) */
                     found = true;
+                    removed_any = true;
                     /* Copy remaining rows forward */
                     for (uint32_t rest = src_idx + 1; rest < r->nrows;
                         rest++) {
@@ -706,6 +708,8 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
                     sess->delta_data);
             }
         }
+        if (removed_any)
+            wl_columnar_eval_dedup_set_clear(r);
     }
 
     /* Cleanup: free stolen retraction buffers */

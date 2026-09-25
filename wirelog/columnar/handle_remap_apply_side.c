@@ -277,10 +277,7 @@ wl_handle_remap_invalidate_side_relation_caches(struct wl_col_session_t *sess,
          * sizeof(*dedup_slots) bytes per remapped relation per
          * rotation.  The next consolidation rebuilds the table from
          * the (rewritten) row data. */
-        free(rel->dedup_slots);
-        rel->dedup_slots = NULL;
-        rel->dedup_cap = 0;
-        rel->dedup_count = 0;
+        wl_columnar_eval_dedup_set_clear(rel);
 
         touched++;
     }
