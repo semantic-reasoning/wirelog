@@ -1334,7 +1334,10 @@ test_consolidate_scratch_admission(void)
     uint64_t descriptor_bytes = sizeof(col_rel_t)
         + sizeof("consolidate_test")
         + sizeof(wl_columnar_memory_reservation_t);
-    ref = test_consolidate_governor_create(descriptor_bytes);
+    uint64_t metadata_bytes = sizeof(*rel->col_names)
+        + strlen(rel->col_names[0]) + 1u;
+    ref = test_consolidate_governor_create(descriptor_bytes
+            + metadata_bytes);
     if (!ref || col_rel_attach_memory_governor(rel, ref) != 0
         || col_rel_install_shared_view(rel, source) != 0) {
         if (ref)
@@ -1362,7 +1365,7 @@ test_consolidate_scratch_admission(void)
         || memcmp(before, rel->columns[0], sizeof(before)) != 0
         || wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(ref))
-        != rel->descriptor_reserved_bytes) {
+        != rel->descriptor_reserved_bytes + rel->metadata_reserved_bytes) {
         test_rel_free(rel);
         test_rel_free(source);
         wl_columnar_memory_governor_ref_release(ref);
@@ -1394,7 +1397,7 @@ test_consolidate_scratch_admission(void)
     if (rc != 0 || !test_rel_is_sorted_unique(rel)
         || wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(ref))
-        != rel->descriptor_reserved_bytes) {
+        != rel->descriptor_reserved_bytes + rel->metadata_reserved_bytes) {
         test_rel_free(rel);
         wl_columnar_memory_governor_ref_release(ref);
         FAIL("admitted scratch must succeed and release reservation");
