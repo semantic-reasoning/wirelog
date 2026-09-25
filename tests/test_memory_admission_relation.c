@@ -254,6 +254,48 @@ cleanup:
     }
 }
 
+static void
+test_governed_null_name_copy(void)
+{
+    const uint64_t bytes = sizeof(col_rel_t);
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_ref_t *ref;
+    col_rel_t *source = col_rel_new_auto("unnamed-source", 0);
+    col_rel_t *copy = (col_rel_t *)(uintptr_t)1;
+
+    CHECK(source != NULL, "null-name copy source");
+    if (!source)
+        return;
+    free(source->name);
+    source->name = NULL;
+    make_resolution(&resolution, bytes - 1u);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && wl_columnar_relation_deep_copy_governed(source,
+        &copy, ref) == ENOSPC && copy == NULL,
+        "null-name copy preserves typed one-byte denial");
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "denied null-name copy rolls back charge");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    make_resolution(&resolution, bytes);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    copy = NULL;
+    CHECK(ref && wl_columnar_relation_deep_copy_governed(source,
+        &copy, ref) == 0 && copy && copy->name == NULL
+        && copy->descriptor_reserved_bytes == bytes,
+        "null-name copy admits zero name bytes exactly");
+    col_rel_destroy(copy);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "null-name copy teardown releases descriptor");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    col_rel_destroy(source);
+}
+
 static col_rel_t *
 make_shared_view(wl_columnar_memory_governor_ref_t *ref,
     col_rel_t **source_out)
@@ -1724,6 +1766,7 @@ main(void)
     test_heap_descriptor_attach_and_replacement();
     test_pool_descriptor_excluded();
     test_heap_descriptor_rename();
+    test_governed_null_name_copy();
     test_governed_logical_copy();
     test_governed_empty_compound_copy();
     test_physical_timestamp_capacity();

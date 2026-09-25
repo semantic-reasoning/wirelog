@@ -2478,14 +2478,18 @@ test_worker_retained_pool_alias_teardown_is_retryable(void)
         goto fail;
     arena_slot = arena_relation;
     uint64_t independent_token = independent->retained_reserved_bytes;
+    uint64_t independent_descriptor = independent->descriptor_reserved_bytes;
     if (independent_token == 0
+        || independent_descriptor == 0
         || independent->retained_reservation.identity
         != &independent->retained_reservation
         || atomic_load_explicit(&independent->retained_reservation.state,
         memory_order_relaxed) != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        || independent_descriptor > UINT64_MAX - worker_baseline
         || independent_token > UINT64_MAX - worker_baseline
+        - independent_descriptor
         || wl_columnar_memory_reserved(governor)
-        != worker_baseline + independent_token)
+        != worker_baseline + independent_descriptor + independent_token)
         goto fail;
 
     boundaries = (uint32_t *)malloc(2u * sizeof(*boundaries));
@@ -2917,6 +2921,73 @@ test_pool_relation_promotion_rollback_restores_token_identity(void)
     cleanup_coordinator(coord, plan, prog);
     if (!ok) {
         FAIL("pool relation rollback lost payload or token identity");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+static int
+test_pool_relation_descriptor_boundary(void)
+{
+    const char *name = "pool-descriptor-boundary";
+    const uint64_t descriptor_bytes = sizeof(col_rel_t) + strlen(name) + 1u;
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *coord = make_coordinator(&plan, &prog);
+    wl_columnar_source_access_reader_t reader = { 0 };
+    col_rel_t *old = NULL;
+    col_rel_t *pool_rel = NULL;
+    wl_columnar_memory_governor_t *governor = NULL;
+    uint64_t baseline = 0;
+    int ok = coord != NULL;
+
+    TEST("pool promotion admits descriptor exactly and rolls back denial");
+    if (ok) {
+        old = col_rel_new_auto(name, 1);
+        pool_rel = col_rel_pool_new_auto(coord->delta_pool, NULL, name, 1);
+        ok = old && pool_rel && session_add_rel(coord, old) == 0;
+        if (ok) {
+            old = session_find_rel(coord, name);
+            governor = wl_columnar_memory_governor_ref_get(
+                coord->memory_governor);
+            baseline = wl_columnar_memory_reserved(governor);
+            atomic_store_explicit(&governor->usable_bytes,
+                baseline + descriptor_bytes - 1u, memory_order_release);
+            ok = session_add_rel(coord, pool_rel) == ENOSPC
+                && pool_rel->pool_owned && pool_rel->storage_owner == pool_rel
+                && pool_rel->memory_governor == NULL
+                && wl_columnar_memory_reserved(governor) == baseline;
+        }
+        if (ok) {
+            atomic_store_explicit(&governor->usable_bytes,
+                baseline + descriptor_bytes, memory_order_release);
+            ok = col_rel_source_reader_acquire(old, &reader) == 0
+                && session_add_rel(coord, pool_rel) == EBUSY
+                && pool_rel->pool_owned && pool_rel->storage_owner == pool_rel
+                && pool_rel->memory_governor == NULL
+                && wl_columnar_memory_reserved(governor) == baseline;
+        }
+        if (reader.owner && col_rel_source_reader_release(&reader) != 0)
+            ok = 0;
+        if (ok) {
+            ok = session_add_rel(coord, pool_rel) == 0;
+            col_rel_t *promoted = session_find_rel(coord, name);
+            ok = ok && promoted && promoted != pool_rel
+                && !promoted->pool_owned
+                && promoted->descriptor_reserved_bytes == descriptor_bytes
+                && wl_columnar_memory_reserved(governor)
+                == baseline + descriptor_bytes;
+        }
+    }
+    if (coord)
+        cleanup_coordinator(coord, plan, prog);
+    else {
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+    }
+    if (!ok) {
+        FAIL("promotion descriptor admission or rollback");
         return 1;
     }
     PASS();
@@ -3500,6 +3571,7 @@ main(int argc, char **argv)
     test_pool_relation_promotion_tombstones_source();
     test_pool_relation_promotion_rejects_live_children();
     test_pool_relation_promotion_rollback_restores_token_identity();
+    test_pool_relation_descriptor_boundary();
     test_storage_alias_borrow_accounting();
     test_shared_view_publication_respects_destination_owner_writer();
     test_alias_descriptor_reader_blocks_publication();

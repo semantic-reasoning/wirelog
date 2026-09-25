@@ -2362,6 +2362,63 @@ cleanup:
 #undef CANDIDATE_CHECK
 }
 
+static int
+test_owner_candidate_governed_rename(void)
+{
+    const char *old_name = "$d$rename";
+    const char *new_name = "$d$rename-expanded";
+    const uint64_t old_descriptor = sizeof(col_rel_t) + strlen(old_name)
+        + 1u;
+    const uint64_t new_descriptor = sizeof(col_rel_t) + strlen(new_name)
+        + 1u;
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    wl_columnar_memory_governor_t *governor = NULL;
+    col_rel_t *target = owner_publication_candidate(old_name, 17);
+    col_rel_t *candidate = NULL;
+    uint64_t payload = target
+        ? (uint64_t)target->capacity * sizeof(int64_t) : 0;
+    int ok = target != NULL;
+
+    resolution.budget_bytes = 1024 * 1024;
+    resolution.usable_bytes = resolution.budget_bytes;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    if (ok)
+        ok = ref && col_rel_attach_memory_governor(target, ref) == 0;
+    if (ok) {
+        governor = wl_columnar_memory_governor_ref_get(ref);
+        uint64_t exact = old_descriptor * 2u + new_descriptor + payload;
+        atomic_store_explicit(&governor->usable_bytes, exact - 1u,
+            memory_order_release);
+        ok = wl_columnar_eval_test_owner_build_candidate(target, new_name,
+                NULL, 0, true, &candidate) == ENOSPC && candidate == NULL
+            && strcmp(target->name, old_name) == 0
+            && wl_columnar_memory_reserved(governor) == old_descriptor;
+        atomic_store_explicit(&governor->usable_bytes, exact,
+            memory_order_release);
+        ok = ok && wl_columnar_eval_test_owner_build_candidate(target,
+                new_name, NULL, 0, true, &candidate) == 0 && candidate
+            && strcmp(candidate->name, new_name) == 0
+            && wl_columnar_memory_reserved(governor)
+            == old_descriptor + new_descriptor + payload;
+    }
+    col_rel_destroy(candidate);
+    col_rel_destroy(target);
+    if (ref) {
+        ok = ok && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0;
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (!ok) {
+        fprintf(stderr, "owner governed rename boundary failed\n");
+        return 1;
+    }
+    return 0;
+}
+
 static void
 owner_publication_session_cleanup(wl_col_session_t *session)
 {
@@ -2846,7 +2903,9 @@ test_owner_publication_existing_targets(void)
                 goto cleanup;
             }
         }
-        uint64_t live_charge = low->retained_reserved_bytes
+        uint64_t live_charge = low->descriptor_reserved_bytes
+            + high->descriptor_reserved_bytes
+            + low->retained_reserved_bytes
             + high->retained_reserved_bytes;
         OWNER_CHECK(wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref)) == live_charge
@@ -4668,6 +4727,11 @@ main(void)
         PASS();
     else
         FAIL("owner exchange candidate contract");
+    TEST("owner candidate rename admits governed name bytes exactly");
+    if (test_owner_candidate_governed_rename() == 0)
+        PASS();
+    else
+        FAIL("owner candidate governed rename");
     TEST("owner publication preserves populated hashless registries");
     if (test_owner_publication_hashless_registry() == 0)
         PASS();
