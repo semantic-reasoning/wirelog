@@ -129,6 +129,13 @@ test_governed_auto_relation_schema(void)
             wl_columnar_memory_governor_ref_get(governor)) == timestamp_bytes,
         "nullary timestamp capacity and reservation stay consistent");
     timestamps = rel->timestamps;
+    rc = col_rel_set_schema(rel, 2, NULL);
+    ASSERT_TRUE(rc == ENOSPC && rel->schema_ok && rel->ncols == 0
+        && rel->capacity == COL_REL_INIT_CAP && rel->timestamps == timestamps
+        && rel->timestamp_capacity == COL_REL_INIT_CAP
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)) == timestamp_bytes,
+        "denied timestamped promotion preserves schema, payload and charge");
     rc = col_rel_append_rows_atomic(rel, &empty_row, 1, 0, &denied);
     ASSERT_TRUE(rc == 0 && !denied && rel->nrows == 1
         && rel->timestamps == timestamps
@@ -141,6 +148,91 @@ test_governed_auto_relation_schema(void)
     ASSERT_TRUE(wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(governor)) == 0,
         "nullary timestamp reservation releases on destroy");
+    wl_columnar_memory_governor_ref_release(governor);
+
+    governor = make_test_governor(1);
+    ASSERT_TRUE(governor != NULL, "nullary promotion denial governor created");
+    rc = wl_columnar_relation_new_auto_governed("promote_denied", 0,
+            COL_REL_INIT_CAP, false, governor, &rel);
+    ASSERT_TRUE(rc == 0 && rel && rel->schema_ok && rel->ncols == 0,
+        "empty governed relation starts with a valid nullary schema");
+    rc = col_rel_set_schema(rel, 2, NULL);
+    ASSERT_TRUE(rc == ENOSPC && rel->schema_ok && rel->ncols == 0
+        && rel->capacity == COL_REL_INIT_CAP
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)) == 0,
+        "denied nullary promotion preserves the original schema and charge");
+    int64_t nullary_row = 0;
+    rc = col_rel_append_rows_atomic(rel, &nullary_row, 1, 0, &denied);
+    ASSERT_TRUE(rc == 0 && rel->nrows == 1,
+        "nullary relation remains usable after denied promotion");
+    col_rel_destroy(rel);
+    rel = NULL;
+    wl_columnar_memory_governor_ref_release(governor);
+
+    governor = make_test_governor(4096);
+    ASSERT_TRUE(governor != NULL, "nullary promotion governor created");
+    rc = wl_columnar_relation_new_auto_governed("promote_allowed", 0,
+            COL_REL_INIT_CAP, false, governor, &rel);
+    ASSERT_TRUE(rc == 0 && rel != NULL, "promotable nullary relation created");
+    rc = col_rel_set_schema(rel, 2, NULL);
+    int64_t promoted_row[] = { 5, 7 };
+    rc = rc == 0 ? col_rel_append_rows_atomic(rel, promoted_row, 1, 2,
+            &denied) : rc;
+    ASSERT_TRUE(rc == 0 && rel->schema_ok && rel->ncols == 2
+        && rel->nrows == 1 && rel->columns[0][0] == 5
+        && rel->columns[1][0] == 7
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor))
+        == rel->retained_reserved_bytes,
+        "allowed nullary promotion admits and appends the new schema");
+    col_rel_destroy(rel);
+    rel = NULL;
+    ASSERT_TRUE(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)) == 0,
+        "promoted schema reservation releases on destroy");
+    wl_columnar_memory_governor_ref_release(governor);
+
+    governor = make_test_governor(4096);
+    ASSERT_TRUE(governor != NULL, "small timestamp promotion governor created");
+    rc = wl_columnar_relation_new_auto_governed("promote_timestamped", 0,
+            1, true, governor, &rel);
+    ASSERT_TRUE(rc == 0 && rel && rel->capacity == 1
+        && rel->timestamp_capacity == 1,
+        "timestamped nullary relation starts with one admitted slot");
+    timestamps = rel->timestamps;
+    uint64_t old_reserved = rel->retained_reserved_bytes;
+    uint64_t old_generation = rel->view_generation;
+    wl_columnar_relation_test_fail_next_reservation_commit();
+    rc = col_rel_set_schema(rel, 2, NULL);
+    ASSERT_TRUE(rc == ENOMEM && rel->schema_ok && rel->ncols == 0
+        && rel->capacity == 1 && rel->timestamps == timestamps
+        && rel->timestamp_capacity == 1
+        && rel->view_generation == old_generation
+        && rel->retained_reserved_bytes == old_reserved
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)) == old_reserved,
+        "failed timestamped promotion restores schema, buffer and admission");
+    wl_columnar_relation_test_watch_timestamp_retirement_order();
+    rc = col_rel_set_schema(rel, 2, NULL);
+    int64_t promoted_rows[] = { 5, 7, 11, 13 };
+    rc = rc == 0 ? col_rel_append_rows_atomic(rel, promoted_rows, 2, 2,
+            &denied) : rc;
+    ASSERT_TRUE(rc == 0 && !denied && rel->ncols == 2 && rel->nrows == 2
+        && rel->capacity >= 2 && rel->timestamp_capacity >= rel->capacity
+        && rel->timestamps != timestamps
+        && rel->columns[0][1] == 11 && rel->columns[1][1] == 13
+        && rel->retained_reserved_bytes
+        == wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)),
+        "timestamped promotion grows and admits buffers before multirow append");
+    ASSERT_TRUE(wl_columnar_relation_test_timestamp_retirement_was_ordered(),
+        "old timestamp buffer retires before its reservation credit");
+    col_rel_destroy(rel);
+    rel = NULL;
+    ASSERT_TRUE(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)) == 0,
+        "grown timestamp promotion releases reservation on destroy");
     wl_columnar_memory_governor_ref_release(governor);
 
     governor = make_test_governor(1024u * 1024u);

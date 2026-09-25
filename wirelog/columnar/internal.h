@@ -578,6 +578,8 @@ void wl_columnar_relation_test_fail_next_prepare_resize(void);
 void wl_columnar_relation_test_fail_next_reservation_commit(void);
 void wl_columnar_relation_test_watch_next_rollback_cleanup(void);
 bool wl_columnar_relation_test_rollback_cleanup_was_ordered(void);
+void wl_columnar_relation_test_watch_timestamp_retirement_order(void);
+bool wl_columnar_relation_test_timestamp_retirement_was_ordered(void);
 void wl_columnar_relation_test_fail_next_compact_rollback(void);
 void wl_columnar_relation_test_fail_next_compact_commit(void);
 void wl_columnar_relation_test_fail_next_governed_copy_payload_alloc(void);

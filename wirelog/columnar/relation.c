@@ -42,6 +42,9 @@ static bool wl_columnar_relation_test_fail_reservation_commit;
 static bool wl_columnar_relation_test_watch_rollback_cleanup;
 static bool wl_columnar_relation_test_resize_columns_retired;
 static bool wl_columnar_relation_test_rollback_cleanup_observed;
+static bool wl_columnar_relation_test_watch_timestamp_retirement;
+static bool wl_columnar_relation_test_timestamp_retired;
+static bool wl_columnar_relation_test_timestamp_retirement_ordered;
 
 void
 wl_columnar_relation_test_fail_next_prepare_resize(void)
@@ -85,6 +88,20 @@ bool
 wl_columnar_relation_test_rollback_cleanup_was_ordered(void)
 {
     return wl_columnar_relation_test_rollback_cleanup_observed;
+}
+
+void
+wl_columnar_relation_test_watch_timestamp_retirement_order(void)
+{
+    wl_columnar_relation_test_watch_timestamp_retirement = true;
+    wl_columnar_relation_test_timestamp_retired = false;
+    wl_columnar_relation_test_timestamp_retirement_ordered = false;
+}
+
+bool
+wl_columnar_relation_test_timestamp_retirement_was_ordered(void)
+{
+    return wl_columnar_relation_test_timestamp_retirement_ordered;
 }
 
 static bool wl_columnar_relation_fail_governed_copy_payload_alloc;
@@ -874,6 +891,14 @@ static void
 col_rel_release_retired_reservation(
     wl_columnar_memory_reservation_t *previous)
 {
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    if (wl_columnar_relation_test_watch_timestamp_retirement) {
+        wl_columnar_relation_test_timestamp_retirement_ordered
+            = wl_columnar_relation_test_timestamp_retired
+            && previous && previous->bytes != 0;
+        wl_columnar_relation_test_watch_timestamp_retirement = false;
+    }
+#endif
     col_rel_release_reservation_or_abort(previous);
 }
 
@@ -1810,22 +1835,50 @@ col_rel_set_schema_impl_capacity(col_rel_t *r, uint32_t ncols,
     int failure_rc = EINVAL;
     int reserve_failure_rc = ENOMEM;
     uint64_t retained_bytes = 0;
+    wl_columnar_memory_reservation_t previous;
+    bool promote_nullary_schema = false;
+    bool retained_timestamps;
+    uint32_t old_capacity = 0;
+    col_delta_timestamp_t *old_timestamps = NULL;
+    col_delta_timestamp_t *replacement_timestamps = NULL;
+    uint32_t old_timestamp_capacity = 0;
+    struct ArrowSchema old_schema = { 0 };
 
     if (out_denied)
         *out_denied = false;
+    wl_columnar_memory_reservation_init(&previous);
 
     if (!r)
         return EINVAL;
-    if (r->schema_ok)
+    promote_nullary_schema = r->schema_ok && r->ncols == 0 && ncols > 0;
+    if (r->schema_ok && !promote_nullary_schema)
         return 0; /* already initialised */
 
+    if (promote_nullary_schema) {
+        if (r->nrows != 0 || r->columns || r->col_names)
+            return EINVAL;
+        old_capacity = r->capacity;
+        old_timestamps = r->timestamps;
+        old_timestamp_capacity = r->timestamp_capacity;
+        old_schema = r->schema;
+        memset(&r->schema, 0, sizeof(r->schema));
+        r->schema_ok = false;
+        if (old_timestamp_capacity > initial_capacity)
+            initial_capacity = old_timestamp_capacity;
+    }
+
+    retained_timestamps = with_timestamps || r->timestamps != NULL;
     r->ncols = ncols;
     r->capacity = initial_capacity;
     pending_rc = col_rel_reserve_retained_shape(r, initial_capacity,
-            with_timestamps, &pending, &reserve_failure_rc);
+            retained_timestamps, &pending, &reserve_failure_rc);
     if (pending_rc < 0) {
         r->ncols = 0;
-        r->capacity = 0;
+        r->capacity = promote_nullary_schema ? old_capacity : 0;
+        if (promote_nullary_schema) {
+            r->schema = old_schema;
+            r->schema_ok = true;
+        }
         if (out_denied && r->memory_budget_denial_pending)
             *out_denied = true;
         return reserve_failure_rc;
@@ -1858,7 +1911,19 @@ col_rel_set_schema_impl_capacity(col_rel_t *r, uint32_t ncols,
         }
     }
 
-    if (with_timestamps && initial_capacity > 0) {
+    if (promote_nullary_schema && old_timestamps
+        && old_timestamp_capacity < initial_capacity) {
+        replacement_timestamps = (col_delta_timestamp_t *)calloc(
+            initial_capacity, sizeof(*replacement_timestamps));
+        if (!replacement_timestamps) {
+            failure_rc = ENOMEM;
+            goto fail;
+        }
+        r->timestamps = replacement_timestamps;
+        r->timestamp_capacity = initial_capacity;
+    }
+
+    if (with_timestamps && !r->timestamps && initial_capacity > 0) {
         r->timestamps = (col_delta_timestamp_t *)calloc(initial_capacity,
                 sizeof(*r->timestamps));
         if (!r->timestamps) {
@@ -1874,17 +1939,54 @@ col_rel_set_schema_impl_capacity(col_rel_t *r, uint32_t ncols,
     }
     if (pending_rc > 0) {
         if (!col_rel_retained_bytes(r->ncols, r->capacity,
-            with_timestamps, &retained_bytes)
+            retained_timestamps, &retained_bytes)
             || col_rel_publish_retained_reservation(r, &pending,
-            retained_bytes, NULL) != 0) {
+            retained_bytes, promote_nullary_schema ? &previous : NULL) != 0) {
             failure_rc = ENOMEM;
             goto fail;
         }
+    }
+    if (promote_nullary_schema) {
+        if (r->timestamps != old_timestamps) {
+            free(old_timestamps);
+            old_timestamps = NULL;
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+            if (wl_columnar_relation_test_watch_timestamp_retirement)
+                wl_columnar_relation_test_timestamp_retired = true;
+#endif
+        }
+        ArrowSchemaRelease(&old_schema);
+        col_rel_release_retired_reservation(&previous);
     }
     wl_columnar_relation_touch_view(r);
     return 0;
 
 fail:
+    if (promote_nullary_schema) {
+        if (r->schema.release)
+            ArrowSchemaRelease(&r->schema);
+        col_columns_free(r->columns, ncols);
+        r->columns = NULL;
+        if (r->col_names) {
+            for (uint32_t i = 0; i < ncols; i++)
+                free(r->col_names[i]);
+            free((void *)r->col_names);
+            r->col_names = NULL;
+        }
+        if (r->timestamps != old_timestamps) {
+            free(r->timestamps);
+            r->timestamps = old_timestamps;
+            r->timestamp_capacity = old_timestamp_capacity;
+        }
+        r->schema = old_schema;
+        r->schema_ok = true;
+        r->capacity = old_capacity;
+        r->ncols = 0;
+        col_rel_reservation_rollback(&pending);
+        if (out_denied && r->memory_budget_denial_pending)
+            *out_denied = true;
+        return failure_rc;
+    }
     /* A pooled descriptor may fail before Arrow initialization, and the
      * Arrow-only initializer already releases its partial schema on error.
      * Only a live release callback denotes owned schema state here. */
@@ -1933,7 +2035,12 @@ col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names)
     rc = col_rel_published_writer_acquire(r, &writer);
     if (rc != 0)
         return rc;
+    r->memory_budget_denial_pending = false;
     rc = col_rel_set_schema_impl(r, ncols, col_names);
+    if (rc == ENOMEM && r->memory_budget_denial_pending) {
+        rc = ENOSPC;
+        r->memory_budget_denial_pending = false;
+    }
     release_rc = wl_columnar_source_access_writer_release(&writer);
     if (rc == 0 && release_rc != 0)
         rc = release_rc;
