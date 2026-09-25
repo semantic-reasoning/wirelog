@@ -1,34 +1,46 @@
 # Issue #1937 size experiment plan
 
-This document reserves a reviewable candidate for investigating the cumulative
-`.text` size cost tracked by [issue #1937](https://github.com/semantic-reasoning/wirelog/issues/1937).
-It makes no production change and claims no size reduction. The existing
-baseline and historical measurements are context only; the experiment must
-collect fresh, exact-profile evidence before selecting or accepting a code
-change.
+This document records the exact-profile experiment for the cumulative `.text`
+size cost tracked by [issue #1937](https://github.com/semantic-reasoning/wirelog/issues/1937).
+It makes no size-reduction claim until a production candidate is measured
+against the fixed reference below.
 
-## Measurement sequence
+## Reviewed reference
 
-1. Rebase this candidate onto current `main` after the trusted attribution
-   tooling change is merged. Record the exact base commit, candidate head,
-   workflow run, and report artifact for every measurement.
-2. Run the initial base/head attribution using the supported Ubuntu 24.04
-   release profile. Use its object/source attribution to identify a bounded
-   production-size opportunity. A failed preflight, profile mismatch, missing
-   evidence, or incomplete report is not a measurement pass.
-3. Before testing reductions, record the independently reviewed reference
-   candidate and its exact head as the anchor for that measurement series.
-   Compare each subsequent reduction against that fixed reference and the
-   current exact base/head. If the experiment's scope changes, declare a new
-   reviewed series and establish a new reference; do not silently move the
-   anchor.
-4. For any production change, preserve admission accounting, typed denial,
-   rollback behavior, and existing tests. Run the focused behavior and
-   failure-path tests plus the applicable sanitizer, ABI, and performance
-   validation. Accept a change only with reproducible reports and passing
-   required size and behavior gates.
+- Main/base SHA: `9887ace362dfd77c5dc9e7e370498569f84c6b3d`
+- Reviewed reference candidate SHA: `e031010f27b01bbb54fe02988c0e03ca6e4e88ef`
+- Initial trusted report: [workflow run 36123181728](https://github.com/semantic-reasoning/wirelog/actions/runs/36123181728)
+- Exact-profile `.text`: base and reference both measured **382,829 bytes**;
+  base/head delta **0 bytes**.
+- The report confirms matching profile, policy-file hashes, binary hashes,
+  repository identity, current `main`, PR base/head, and successful Ubuntu
+  24.04 preflight.
+- LTO's temporary partition names and missing final-binary DWARF make
+  per-source byte attribution unavailable. Retained symbols identify
+  `wl_columnar_join_op` and `wl_columnar_join_diff_op` as useful code-inspection
+  starting points, not as evidence of additive source-byte savings.
+
+## Bounded production experiment
+
+Factor only the duplicated cached/governed right-filter setup shared by
+ordinary and differential JOIN in `wirelog/columnar/join.c`. Preserve cache
+eligibility and ownership, session-governor precedence, fallback behavior,
+and caller-owned checked cleanup on denial. Leave delta/retraction selection,
+materialization caching, cache publication, leases, and differential
+transactions unchanged.
+
+Keep `e031010f27b01bbb54fe02988c0e03ca6e4e88ef` as the fixed
+`reference_sha` for every reduction measurement in this series. Record the
+exact current base/head, workflow run, and report artifact each time. Do not
+accept the refactor unless the trusted exact-profile comparison demonstrates
+a useful `.text` reduction and the applicable size gate passes. If it does
+not reduce size, discard the production experiment rather than changing the
+budget or baseline.
+
+For any accepted production change, preserve admission accounting, typed
+denial, rollback behavior, and existing tests. Run focused behavior and
+failure-path tests plus applicable sanitizer, ABI, and performance validation.
 
 The separately reviewed, main-owned allowlist authorizes measurement of this
 candidate PR only. It does not authorize a baseline increase, policy change,
-weakened governor preflight, or a claim that this documentation-only draft
-reduces binary size.
+or weakened governor preflight.
