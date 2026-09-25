@@ -5096,7 +5096,10 @@ tdd_restore_entries_discard(wl_col_session_t *coord,
         }
     }
     coord->nrels = initial_nrels;
-    (void)session_rel_build_hash(coord);
+    /* The old index may still contain entries above initial_nrels after the
+     * rollback.  A denied rebuild must leave lookup on the linear path. */
+    if (session_rel_build_hash(coord) != 0)
+        session_rel_free_hash(coord);
     for (uint32_t i = 0; i < count; i++) {
         if (entries[i].replacement_prepared
             || entries[i].replacement.writer_acquired)

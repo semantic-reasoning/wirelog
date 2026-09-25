@@ -578,6 +578,134 @@ test_session_hash_overflow_rejected(void)
 }
 
 static void
+test_session_hash_admission_and_image_lifetime(void)
+{
+    TEST("session hash reserves peak rebuild and registry image bytes");
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    resolution.budget_bytes = 1024;
+    resolution.usable_bytes = 1024;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    wl_columnar_memory_governor_ref_t *ref
+        = wl_columnar_memory_governor_ref_create(&resolution);
+    if (!ref) {
+        FAIL("governor setup failed");
+        return;
+    }
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(ref);
+    col_rel_t first = { .name = "first" };
+    col_rel_t second = { .name = "second" };
+    col_rel_t third = { .name = "third" };
+    col_rel_t fourth = { .name = "fourth" };
+    wl_col_session_t sess = { 0 };
+    sess.memory_governor = ref;
+    wl_columnar_memory_reservation_init(&sess.rel_hash_reservation);
+    sess.rel_cap = 3;
+    sess.rels = calloc(sess.rel_cap, sizeof(*sess.rels));
+    if (!sess.rels) {
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("registry setup failed");
+        return;
+    }
+    sess.rels[0] = &first;
+    sess.nrels = 1;
+    const uint64_t first_bytes = 16u * sizeof(uint32_t)
+        + sizeof(uint32_t);
+    const uint64_t second_bytes = first_bytes + sizeof(uint32_t);
+    const uint64_t image_bytes = second_bytes + sizeof(uint32_t);
+    const char *failure = NULL;
+    wl_columnar_session_hash_registry_image_t image = { 0 };
+#define HASH_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    atomic_store_explicit(&governor->usable_bytes, first_bytes - 1u,
+        memory_order_release);
+    HASH_CHECK(session_rel_build_hash(&sess) == ENOSPC
+        && wl_columnar_memory_reserved(governor) == 0
+        && !sess.rel_hash_head && session_find_rel(&sess, "first") == &first
+        && !wl_columnar_session_budget_denied(&sess),
+        "one-byte-under initial hash denial changed lookup");
+    atomic_store_explicit(&governor->usable_bytes, first_bytes,
+        memory_order_release);
+    HASH_CHECK(session_rel_build_hash(&sess) == 0
+        && wl_columnar_memory_reserved(governor) == first_bytes,
+        "exact-fit first hash was not charged");
+    uint32_t *old_head = sess.rel_hash_head;
+    uint32_t *old_next = sess.rel_hash_next;
+    sess.rels[1] = &second;
+    sess.nrels = 2;
+    atomic_store_explicit(&governor->usable_bytes,
+        first_bytes + second_bytes - 1u, memory_order_release);
+    HASH_CHECK(session_rel_hash_insert(&sess, 1) == ENOSPC
+        && sess.rel_hash_head == old_head && sess.rel_hash_next == old_next
+        && wl_columnar_memory_reserved(governor) == first_bytes
+        && session_find_rel(&sess, "second") == &second
+        && !wl_columnar_session_budget_denied(&sess),
+        "one-byte-under rebuild changed old hash or linear lookup");
+    sess.memory_budget_denied = true;
+    HASH_CHECK(session_rel_build_hash(&sess) == ENOSPC
+        && wl_columnar_session_budget_denied(&sess)
+        && sess.rel_hash_head == old_head
+        && wl_columnar_memory_reserved(governor) == first_bytes,
+        "optional fallback cleared an earlier budget denial");
+    sess.memory_budget_denied = false;
+    atomic_store_explicit(&governor->usable_bytes,
+        first_bytes + second_bytes, memory_order_release);
+    HASH_CHECK(session_rel_build_hash(&sess) == 0
+        && wl_columnar_memory_reserved(governor) == second_bytes,
+        "exact-fit rebuild did not transfer reservation");
+    col_rel_t *additions[] = { &third };
+    atomic_store_explicit(&governor->usable_bytes,
+        second_bytes + image_bytes - 1u, memory_order_release);
+    HASH_CHECK(wl_columnar_session_hash_registry_image_prepare(&sess,
+        additions, 1, &image) == ENOSPC
+        && wl_columnar_session_budget_denied(&sess)
+        && wl_columnar_memory_reserved(governor) == second_bytes,
+        "one-byte-under image denial changed reservation");
+    atomic_store_explicit(&governor->usable_bytes,
+        second_bytes + image_bytes, memory_order_release);
+    HASH_CHECK(wl_columnar_session_hash_registry_image_prepare(&sess,
+        additions, 1, &image) == 0
+        && wl_columnar_memory_reserved(governor)
+        == second_bytes + image_bytes,
+        "exact-fit prepared image was not charged");
+    wl_columnar_session_hash_registry_image_discard(&image);
+    HASH_CHECK(wl_columnar_memory_reserved(governor) == second_bytes,
+        "discard did not release image reservation");
+    HASH_CHECK(wl_columnar_session_hash_registry_image_prepare(&sess,
+        additions, 1, &image) == 0,
+        "image retry failed after discard");
+    wl_columnar_session_hash_registry_image_publish(&image);
+    HASH_CHECK(session_find_rel(&sess, "third") == &third
+        && wl_columnar_memory_reserved(governor) == image_bytes,
+        "publication did not replace old reservation");
+    uint32_t *published_head = sess.rel_hash_head;
+    atomic_store_explicit(&governor->usable_bytes,
+        image_bytes + 16u * sizeof(uint32_t)
+        + 4u * sizeof(uint32_t) - 1u, memory_order_release);
+    HASH_CHECK(session_add_rel(&sess, &fourth) == 0
+        && session_find_rel(&sess, "fourth") == &fourth
+        && sess.rel_hash_head == published_head
+        && wl_columnar_memory_reserved(governor) == image_bytes
+        && wl_columnar_session_budget_denied(&sess),
+        "optional insertion fallback lost lookup or earlier budget denial");
+cleanup:
+    wl_columnar_session_hash_registry_image_discard(&image);
+    session_rel_free_hash(&sess);
+    if (!failure && wl_columnar_memory_reserved(governor) != 0)
+        failure = "hash teardown leaked reservation";
+    free(sess.rels);
+    wl_columnar_memory_governor_ref_release(ref);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef HASH_CHECK
+}
+
+static void
 test_retained_relation_admission(void)
 {
     const uint64_t initial_bytes = 64u * sizeof(int64_t)
@@ -12214,6 +12342,7 @@ main(void)
     printf("test_session: persistent columnar session delta tests\n");
 
     test_session_hash_overflow_rejected();
+    test_session_hash_admission_and_image_lifetime();
     test_retained_relation_admission();
     test_bulk_relation_append_transaction();
     test_governed_compaction_transaction();
