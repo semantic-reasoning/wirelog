@@ -13,6 +13,7 @@
 #include "../wirelog/util/log.h"
 #include "../wirelog/arena/compound_arena.h"
 #include "../wirelog/columnar/memory_governor.h"
+#include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/io/csv_reader.h"
 #include "../wirelog/intern.h"
@@ -2532,18 +2533,20 @@ reserved_on(wl_columnar_memory_governor_ref_t *ref)
 }
 
 /* The create-time floor of a fact-free program: the bytes its intern table
- * admits when a session attaches it (#1431) plus the session's fixed
+ * admits when a session attaches it (#1431), planned EDB descriptors, and
+ * the session's fixed
  * compound arena (probed with the library-default epoch count, so like the
  * budget tests this assumes WIRELOG_COMPOUND_MAX_EPOCHS is unset).  The
- * delta pool and eval arena degrade to malloc when denied.  Callers add the
- * initial relation registry to these two measured owners. */
+ * delta pool and eval arena degrade to malloc when denied. Callers add the
+ * initial relation registry to the measured owners. */
 static int
 measure_create_floor(wirelog_program_t *prog, uint64_t *intern_bytes,
-    uint64_t *compound_bytes)
+    uint64_t *compound_bytes, uint64_t *descriptor_bytes)
 {
     wl_columnar_memory_governor_ref_t *probe
         = enforcing_governor(UINT64_MAX / 4u);
     wl_compound_arena_t *arena = NULL;
+    wl_plan_t *plan = NULL;
     /* The public accessor is read-only; the probe attaches and detaches
      * the program-owned table exactly as session creation does. */
     wl_intern_t *intern = (wl_intern_t *)wirelog_program_get_intern(prog);
@@ -2551,6 +2554,25 @@ measure_create_floor(wirelog_program_t *prog, uint64_t *intern_bytes,
 
     if (!probe || !intern)
         goto out;
+    if (wl_plan_from_program(prog, &plan) != 0 || !plan)
+        goto out;
+    *descriptor_bytes = 0;
+    for (uint32_t i = 0; i < plan->edb_count; i++) {
+        size_t name_len = strlen(plan->edb_relations[i]);
+        uint64_t name_bytes, relation_bytes;
+        if (name_len == SIZE_MAX
+            || !wl_columnar_memory_size_add((uint64_t)name_len, 1u,
+            &name_bytes)
+            || !wl_columnar_memory_size_add(sizeof(col_rel_t), name_bytes,
+            &relation_bytes)
+            || !wl_columnar_memory_size_add(relation_bytes,
+            sizeof(wl_columnar_memory_reservation_t), &relation_bytes)
+            || !wl_columnar_memory_size_add(*descriptor_bytes,
+            relation_bytes, descriptor_bytes))
+            goto out;
+    }
+    wl_plan_free(plan);
+    plan = NULL;
     if (wl_intern_attach_memory_governor(intern, probe) != 0)
         goto out;
     *intern_bytes = reserved_on(probe);
@@ -2566,6 +2588,8 @@ measure_create_floor(wirelog_program_t *prog, uint64_t *intern_bytes,
     ok = reserved_on(probe) == 0 && *intern_bytes > 0
         && *compound_bytes > 0;
 out:
+    if (plan)
+        wl_plan_free(plan);
     if (probe)
         wl_columnar_memory_governor_ref_release(probe);
     return ok ? 0 : -1;
@@ -2575,19 +2599,16 @@ out:
  * table measured here matches the one the facade's session will attach. */
 static int
 measure_easy_floor(const char *src, uint64_t *intern_bytes,
-    uint64_t *compound_bytes)
+    uint64_t *compound_bytes, uint64_t *descriptor_bytes)
 {
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(src, &err);
-    wl_plan_t *plan = NULL;
     int rc = -1;
     if (!prog)
         return -1;
-    if (wirelog_optimize(prog, &err)
-        && wl_plan_from_program(prog, &plan) == 0 && plan)
-        rc = measure_create_floor(prog, intern_bytes, compound_bytes);
-    if (plan)
-        wl_plan_free(plan);
+    if (wirelog_optimize(prog, &err))
+        rc = measure_create_floor(prog, intern_bytes, compound_bytes,
+                descriptor_bytes);
     wirelog_program_free(prog);
     return rc;
 }
@@ -2604,10 +2625,11 @@ test_injected_governor_easy_eager(void)
     wirelog_error_t error;
     uint64_t intern_bytes = 0;
     uint64_t compound_bytes = 0;
+    uint64_t descriptor_bytes = 0;
 
     TEST("#1473 easy eager: governor denial maps to WIRELOG_ERR_MEMORY_BUDGET");
     if (measure_easy_floor(RELATION_NAME_LIFETIME_SRC, &intern_bytes,
-        &compound_bytes) != 0) {
+        &compound_bytes, &descriptor_bytes) != 0) {
         FAIL("could not measure the create-time floor");
         return;
     }
@@ -2636,7 +2658,7 @@ test_injected_governor_easy_eager(void)
 
     TEST("#1473 easy eager: exact floor budget opens and is released");
     ref = enforcing_governor(intern_bytes + compound_bytes
-            + SESSION_REGISTRY_BYTES);
+            + SESSION_REGISTRY_BYTES + descriptor_bytes);
     if (!ref) {
         FAIL("governor allocation failed");
         return;
@@ -2648,7 +2670,7 @@ test_injected_governor_easy_eager(void)
     wl_session_testhook_set_default_options(NULL);
     if (error != WIRELOG_OK || !session
         || reserved_on(ref) != intern_bytes + compound_bytes
-        + SESSION_REGISTRY_BYTES) {
+        + SESSION_REGISTRY_BYTES + descriptor_bytes) {
         wirelog_easy_close(session);
         wl_columnar_memory_governor_ref_release(ref);
         FAIL("exact-fit eager open did not admit the floor");
@@ -2676,10 +2698,11 @@ test_injected_governor_easy_lazy(void)
     wirelog_error_t error;
     uint64_t intern_bytes = 0;
     uint64_t compound_bytes = 0;
+    uint64_t descriptor_bytes = 0;
 
     TEST("#1473 easy lazy: governor denial maps to WIRELOG_ERR_MEMORY_BUDGET");
     if (measure_easy_floor(RELATION_NAME_LIFETIME_SRC, &intern_bytes,
-        &compound_bytes) != 0) {
+        &compound_bytes, &descriptor_bytes) != 0) {
         FAIL("could not measure the create-time floor");
         return;
     }
@@ -2713,7 +2736,7 @@ test_injected_governor_easy_lazy(void)
      * only creation is measured. */
     TEST("#1473 easy lazy: exact floor budget builds on retry");
     ref = enforcing_governor(intern_bytes + compound_bytes
-            + SESSION_REGISTRY_BYTES);
+            + SESSION_REGISTRY_BYTES + descriptor_bytes);
     if (!ref) {
         wirelog_easy_close(session);
         FAIL("governor allocation failed");
@@ -2725,7 +2748,7 @@ test_injected_governor_easy_lazy(void)
     wl_session_testhook_set_default_options(NULL);
     if (error != WIRELOG_OK
         || reserved_on(ref) != intern_bytes + compound_bytes
-        + SESSION_REGISTRY_BYTES) {
+        + SESSION_REGISTRY_BYTES + descriptor_bytes) {
         wirelog_easy_close(session);
         wl_columnar_memory_governor_ref_release(ref);
         FAIL("exact-fit lazy build did not admit the floor");
@@ -2756,6 +2779,7 @@ test_injected_governor_executor(void)
     wl_plan_t *warm = NULL;
     uint64_t intern_bytes = 0;
     uint64_t compound_bytes = 0;
+    uint64_t descriptor_bytes = 0;
 
     TEST("#1473 executor: governor denial maps to WIRELOG_ERR_MEMORY_BUDGET");
     prog = wirelog_parse_string(RELATION_NAME_LIFETIME_SRC, &err);
@@ -2768,7 +2792,8 @@ test_injected_governor_executor(void)
         return;
     }
     wl_plan_free(warm);
-    if (measure_create_floor(prog, &intern_bytes, &compound_bytes) != 0) {
+    if (measure_create_floor(prog, &intern_bytes, &compound_bytes,
+        &descriptor_bytes) != 0) {
         wirelog_program_free(prog);
         FAIL("could not measure the create-time floor");
         return;
@@ -2797,7 +2822,7 @@ test_injected_governor_executor(void)
 
     TEST("#1473 executor: exact floor budget creates and is released");
     ref = enforcing_governor(intern_bytes + compound_bytes
-            + SESSION_REGISTRY_BYTES);
+            + SESSION_REGISTRY_BYTES + descriptor_bytes);
     if (!ref) {
         wirelog_program_free(prog);
         FAIL("governor allocation failed");
@@ -2810,7 +2835,7 @@ test_injected_governor_executor(void)
     wl_session_testhook_set_default_options(NULL);
     if (!executor || err != WIRELOG_OK
         || reserved_on(ref) != intern_bytes + compound_bytes
-        + SESSION_REGISTRY_BYTES) {
+        + SESSION_REGISTRY_BYTES + descriptor_bytes) {
         wirelog_executor_free(executor);
         wl_columnar_memory_governor_ref_release(ref);
         wirelog_program_free(prog);
@@ -2877,6 +2902,7 @@ test_executor_csv_budget_and_retry(void)
     wl_columnar_memory_governor_ref_t *ref = NULL;
     uint64_t intern_bytes = 0;
     uint64_t compound_bytes = 0;
+    uint64_t descriptor_bytes = 0;
     wl_plan_t *warm = NULL;
 
     TEST("#1908 CSV budget denial stays distinct, releases and retries");
@@ -2895,7 +2921,8 @@ test_executor_csv_budget_and_retry(void)
         return;
     }
     wl_plan_free(warm);
-    if (measure_create_floor(program, &intern_bytes, &compound_bytes) != 0) {
+    if (measure_create_floor(program, &intern_bytes, &compound_bytes,
+        &descriptor_bytes) != 0) {
         wirelog_program_free(program);
         remove(path);
         FAIL("CSV budget session floor could not be measured");
@@ -2903,7 +2930,7 @@ test_executor_csv_budget_and_retry(void)
     }
     wl_session_options_init(&options);
     ref = enforcing_governor(intern_bytes + compound_bytes
-            + SESSION_REGISTRY_BYTES);
+            + SESSION_REGISTRY_BYTES + descriptor_bytes);
     if (!ref) {
         wirelog_program_free(program);
         remove(path);
@@ -2932,7 +2959,8 @@ test_executor_csv_budget_and_retry(void)
         = 1024u * 2u * sizeof(int64_t) + 2u * sizeof(int64_t)
         + WL_CSV_READ_CHUNK + 2u * (WL_CSV_MAX_LINE + 1u);
     ref = enforcing_governor(intern_bytes + compound_bytes
-            + SESSION_REGISTRY_BYTES + schema_bytes + reader_bytes);
+            + SESSION_REGISTRY_BYTES + descriptor_bytes
+            + schema_bytes + reader_bytes);
     if (!ref) {
         wirelog_program_free(program);
         remove(path);

@@ -117,7 +117,8 @@ test_heap_descriptor_attach_and_replacement(void)
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     CHECK(target && ref && col_rel_attach_memory_governor(target, ref)
         == ENOSPC && target->memory_governor == NULL
-        && target->descriptor_reserved_bytes == 0,
+        && target->descriptor_reserved_bytes == 0
+        && target->memory_budget_denial_pending,
         "legacy attach denial is transactional");
     if (ref) {
         CHECK(wl_columnar_memory_reserved(
@@ -130,7 +131,8 @@ test_heap_descriptor_attach_and_replacement(void)
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     if (target && candidate && ref) {
         CHECK(col_rel_attach_memory_governor(target, ref) == 0
-            && target->descriptor_reserved_bytes == bytes,
+            && target->descriptor_reserved_bytes == bytes
+            && !target->memory_budget_denial_pending,
             "legacy attach exact descriptor charge");
         CHECK(col_rel_append_row(candidate, &value) == 0,
             "replacement candidate setup");

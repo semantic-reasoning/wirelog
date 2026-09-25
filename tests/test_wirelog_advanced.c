@@ -20,6 +20,7 @@
 #include "wirelog/intern.h"
 #include "wirelog/arena/compound_arena.h"
 #include "wirelog/columnar/memory_governor.h"
+#include "wirelog/columnar/internal.h"
 #include "wirelog/exec_plan_gen.h"
 #include "wirelog/session.h"
 #include "wirelog/wirelog-internal.h"
@@ -2415,9 +2416,10 @@ reserved_on(wl_columnar_memory_governor_ref_t *ref)
         wl_columnar_memory_governor_ref_get(ref));
 }
 
-/* Measure the intern table admitted when a session attaches it (#1431) and
- * the fixed compound arena.  Callers add the initial 16-pointer session
- * registry to obtain the create-time floor.  The arena is probed with the
+/* Measure the intern table admitted when a session attaches it (#1431),
+ * the fixed compound arena, and planned EDB descriptor/name charges.
+ * Callers add the initial 16-pointer session registry to obtain the floor.
+ * The arena is probed with the
  * library-default epoch count, so the budget tests assume
  * WIRELOG_COMPOUND_MAX_EPOCHS is unset.  The delta
  * pool and eval arena degrade to malloc when denied.  Plan generation is run
@@ -2425,7 +2427,7 @@ reserved_on(wl_columnar_memory_governor_ref_t *ref)
  * generation will attach. */
 static int
 measure_create_floor(wirelog_program_t *prog, uint64_t *intern_bytes,
-    uint64_t *compound_bytes)
+    uint64_t *compound_bytes, uint64_t *descriptor_bytes)
 {
     wl_columnar_memory_governor_ref_t *probe
         = enforcing_governor(UINT64_MAX / 4u);
@@ -2440,7 +2442,23 @@ measure_create_floor(wirelog_program_t *prog, uint64_t *intern_bytes,
         goto out;
     if (wl_plan_from_program(prog, &warm) != 0 || !warm)
         goto out;
+    *descriptor_bytes = 0;
+    for (uint32_t i = 0; i < warm->edb_count; i++) {
+        size_t name_len = strlen(warm->edb_relations[i]);
+        uint64_t name_bytes, relation_bytes;
+        if (name_len == SIZE_MAX
+            || !wl_columnar_memory_size_add((uint64_t)name_len, 1u,
+            &name_bytes)
+            || !wl_columnar_memory_size_add(sizeof(col_rel_t), name_bytes,
+            &relation_bytes)
+            || !wl_columnar_memory_size_add(relation_bytes,
+            sizeof(wl_columnar_memory_reservation_t), &relation_bytes)
+            || !wl_columnar_memory_size_add(*descriptor_bytes,
+            relation_bytes, descriptor_bytes))
+            goto out;
+    }
     wl_plan_free(warm);
+    warm = NULL;
     if (wl_intern_attach_memory_governor(intern, probe) != 0)
         goto out;
     *intern_bytes = reserved_on(probe);
@@ -2456,6 +2474,8 @@ measure_create_floor(wirelog_program_t *prog, uint64_t *intern_bytes,
     ok = reserved_on(probe) == 0 && *intern_bytes > 0
         && *compound_bytes > 0;
 out:
+    if (warm)
+        wl_plan_free(warm);
     if (probe)
         wl_columnar_memory_governor_ref_release(probe);
     return ok ? 0 : -1;
@@ -2473,18 +2493,19 @@ test_bulk_insert_error_mapping(void)
     wl_columnar_memory_governor_ref_t *ref = NULL;
     uint64_t intern_bytes = 0;
     uint64_t compound_bytes = 0;
+    uint64_t descriptor_bytes = 0;
     const int64_t one[] = { 1 };
     const int64_t two[] = { 1, 2 };
     int rc = 1;
 
     if (!prog || measure_create_floor(prog, &intern_bytes,
-        &compound_bytes) != 0) {
+        &compound_bytes, &descriptor_bytes) != 0) {
         fprintf(stderr, "T-1938: could not measure session floor\n");
         goto out;
     }
     wl_session_options_init(&options);
     ref = enforcing_governor(intern_bytes + compound_bytes
-            + SESSION_REGISTRY_BYTES);
+            + SESSION_REGISTRY_BYTES + descriptor_bytes);
     if (!ref)
         goto out;
     options.memory_governor = ref;
@@ -2634,18 +2655,20 @@ test_denied_eval_interning_maps_to_memory(void)
         const char *ext;
         uint64_t intern_bytes = 0;
         uint64_t compound_bytes = 0;
+        uint64_t descriptor_bytes = 0;
         bool denying = slacks[i] == DENY_SLACK;
 
         if (!prog)
             return 1;
-        if (measure_create_floor(prog, &intern_bytes, &compound_bytes) != 0) {
+        if (measure_create_floor(prog, &intern_bytes, &compound_bytes,
+            &descriptor_bytes) != 0) {
             fprintf(stderr, "T-1521: could not measure the create floor\n");
             wirelog_program_free(prog);
             return 1;
         }
         wl_session_options_init(&options);
         ref = enforcing_governor(intern_bytes + compound_bytes
-                + SESSION_REGISTRY_BYTES + slacks[i]);
+                + SESSION_REGISTRY_BYTES + descriptor_bytes + slacks[i]);
         if (!ref) {
             wirelog_program_free(prog);
             return 1;
@@ -2706,11 +2729,13 @@ test_injected_governor_denial_maps_to_memory(void)
     wirelog_error_t error;
     uint64_t intern_bytes = 0;
     uint64_t compound_bytes = 0;
+    uint64_t descriptor_bytes = 0;
     int rc = 1;
 
     if (!prog)
         return 1;
-    if (measure_create_floor(prog, &intern_bytes, &compound_bytes) != 0) {
+    if (measure_create_floor(prog, &intern_bytes, &compound_bytes,
+        &descriptor_bytes) != 0) {
         fprintf(stderr, "T-1473: could not measure the create-time floor\n");
         goto out;
     }
@@ -2747,7 +2772,7 @@ test_injected_governor_denial_maps_to_memory(void)
     /* Exact floor: creation succeeds, destroy leaves the program-owned
      * intern reservation, and freeing the program releases it. */
     ref = enforcing_governor(intern_bytes + compound_bytes
-            + SESSION_REGISTRY_BYTES);
+            + SESSION_REGISTRY_BYTES + descriptor_bytes);
     if (!ref)
         goto out;
     options.memory_governor = ref;
@@ -2757,7 +2782,7 @@ test_injected_governor_denial_maps_to_memory(void)
     wl_session_testhook_set_default_options(NULL);
     if (error != WIRELOG_OK || !session
         || reserved_on(ref) != intern_bytes + compound_bytes
-        + SESSION_REGISTRY_BYTES) {
+        + SESSION_REGISTRY_BYTES + descriptor_bytes) {
         fprintf(stderr, "T-1473: exact-fit create err=%d reserved=%llu\n",
             error, (unsigned long long)reserved_on(ref));
         goto out;
