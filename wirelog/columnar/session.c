@@ -998,6 +998,48 @@ session_pool_rel_move_metadata(col_rel_t *dst, col_rel_t *src)
     return true;
 }
 
+static bool
+session_pool_rel_move_name(col_rel_t *dst, col_rel_t *src,
+    wl_columnar_memory_governor_ref_t *governor)
+{
+    if (src->pool_name_reserved_bytes == 0)
+        return true;
+    if (!governor || !src->name
+        || strlen(src->name) + 1u != src->pool_name_reserved_bytes
+        || dst->pool_name_reserved_bytes != 0
+        || dst->pool_name_reservation.identity != &dst->pool_name_reservation
+        || src->pool_name_reservation.identity != &src->pool_name_reservation
+        || src->pool_name_reservation.bytes != src->pool_name_reserved_bytes
+        || src->pool_name_reservation.governor
+        != wl_columnar_memory_governor_ref_get(governor)
+        || atomic_load_explicit(&src->pool_name_reservation.state,
+        memory_order_acquire) != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        || atomic_load_explicit(&src->pool_name_reservation.owner_bits,
+        memory_order_acquire) != (uintptr_t)src)
+        return false;
+    if (!wl_columnar_memory_transfer(&src->pool_name_reservation, dst))
+        return false;
+    if (!wl_columnar_memory_reservation_move(&dst->pool_name_reservation,
+        &src->pool_name_reservation)) {
+        if (!wl_columnar_memory_transfer(&src->pool_name_reservation, src))
+            abort();
+        return false;
+    }
+    dst->pool_name_reserved_bytes = src->pool_name_reserved_bytes;
+    src->pool_name_reserved_bytes = 0;
+    return true;
+}
+
+static void
+session_pool_rel_finish_promotion(col_rel_t *heap)
+{
+    /* The published heap descriptor now covers the transferred name. */
+    if (heap->pool_name_reserved_bytes
+        && !wl_columnar_memory_release(&heap->pool_name_reservation))
+        abort();
+    heap->pool_name_reserved_bytes = 0;
+}
+
 static int
 session_pool_rel_promote(col_rel_t *src,
     wl_columnar_memory_governor_ref_t *session_governor,
@@ -1072,6 +1114,16 @@ session_pool_rel_promote(col_rel_t *src,
         rc = EBUSY;
         goto fail;
     }
+    if (!session_pool_rel_move_name(heap, src, governor)) {
+        if (!wl_columnar_session_pool_rel_move_reservation(src, heap))
+            abort();
+        if (source_had_governor
+            && !session_pool_rel_move_metadata(src, heap))
+            abort();
+        col_rel_destroy(heap);
+        rc = EBUSY;
+        goto fail;
+    }
     session_pool_rel_transfer_payload(heap, src);
     heap->memory_governor = governor;
     if (source_had_governor)
@@ -1098,6 +1150,7 @@ session_pool_rel_promote(col_rel_t *src,
     atomic_store_explicit(&src->storage_alias_borrows, 0,
         memory_order_relaxed);
     wl_columnar_memory_reservation_init(&src->metadata_reservation);
+    wl_columnar_memory_reservation_init(&src->pool_name_reservation);
     wl_columnar_memory_reservation_init(&src->retained_reservation);
     /* The pool slot remains permanently closed until pool reset/reuse. */
     descriptor_writer.owner = NULL;
@@ -1120,6 +1173,8 @@ session_pool_rel_rollback(col_rel_t *src, col_rel_t *heap,
     wl_columnar_memory_governor_ref_t *governor = heap->memory_governor;
 
     if (!wl_columnar_session_pool_rel_move_reservation(src, heap))
+        abort();
+    if (!session_pool_rel_move_name(src, heap, governor))
         abort();
     session_pool_rel_transfer_payload(src, heap);
     wl_columnar_memory_reservation_init(&metadata);
@@ -1195,8 +1250,11 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
 
     for (uint32_t i = 0; i < sess->nrels; i++) {
         if (sess->rels[i] && strcmp(sess->rels[i]->name, r->name) == 0) {
-            if (sess->rels[i] == r)
+            if (sess->rels[i] == r) {
+                if (pool_src)
+                    session_pool_rel_finish_promotion(r);
                 return 0;
+            }
             session_invalidate_relation_caches(sess, r->name);
             col_rel_t *old_relation = sess->rels[i];
             wl_columnar_session_source_lease_t *old_lease
@@ -1211,6 +1269,8 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
                 = wl_columnar_session_source_lease_release(old_lease);
             assert(release_rc == 0);
             sess->rels[i] = r;
+            if (pool_src)
+                session_pool_rel_finish_promotion(r);
             return 0;
         }
     }
@@ -1225,6 +1285,8 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
                 failure_rc = hash_ret;
                 goto oom;
             }
+            if (pool_src)
+                session_pool_rel_finish_promotion(r);
             return 0;
         }
     }
@@ -1284,6 +1346,8 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
     /* Optional hash allocation or admission failure leaves linear lookup
      * available in session_find_rel. */
 
+    if (pool_src)
+        session_pool_rel_finish_promotion(r);
     return 0;
 
 busy:

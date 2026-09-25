@@ -1336,21 +1336,24 @@ int
 col_rel_attach_memory_governor(col_rel_t *r,
     wl_columnar_memory_governor_ref_t *memory_governor)
 {
-    uint64_t bytes = 0, metadata_bytes = 0;
+    uint64_t bytes = 0, metadata_bytes = 0, pool_name_bytes = 0;
     wl_columnar_memory_admission_status_t status;
     wl_columnar_memory_reservation_t descriptor_pending, metadata_pending;
+    wl_columnar_memory_reservation_t pool_name_pending;
 
     if (!r || !memory_governor)
         return EINVAL;
     if (r->memory_governor == memory_governor)
         return 0;
     if (r->memory_governor || r->retained_reserved_bytes != 0
-        || r->metadata_reserved_bytes != 0)
+        || r->metadata_reserved_bytes != 0
+        || r->pool_name_reserved_bytes != 0)
         return EBUSY;
     if (!col_rel_current_metadata_bytes(r, &metadata_bytes))
         return EOVERFLOW;
     wl_columnar_memory_reservation_init(&descriptor_pending);
     wl_columnar_memory_reservation_init(&metadata_pending);
+    wl_columnar_memory_reservation_init(&pool_name_pending);
     if (!r->pool_owned) {
         if (r->name && strlen(r->name) == SIZE_MAX)
             return EOVERFLOW;
@@ -1368,6 +1371,21 @@ col_rel_attach_memory_governor(col_rel_t *r,
                 : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
                 : EINVAL;
         }
+    } else if (r->name) {
+        if (strlen(r->name) == SIZE_MAX)
+            return EOVERFLOW;
+        pool_name_bytes = (uint64_t)strlen(r->name) + 1u;
+        status = wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(memory_governor),
+            pool_name_bytes, &pool_name_pending);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                r->memory_budget_denial_pending = true;
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
+                : EINVAL;
+        }
     }
     if (metadata_bytes) {
         status = wl_columnar_memory_reserve_checked(
@@ -1376,6 +1394,7 @@ col_rel_attach_memory_governor(col_rel_t *r,
         if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
             col_rel_reservation_rollback(&descriptor_pending);
+            col_rel_reservation_rollback(&pool_name_pending);
             if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                 r->memory_budget_denial_pending = true;
             return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
@@ -1385,6 +1404,7 @@ col_rel_attach_memory_governor(col_rel_t *r,
     }
     wl_columnar_memory_reservation_init(&r->descriptor_reservation);
     wl_columnar_memory_reservation_init(&r->metadata_reservation);
+    wl_columnar_memory_reservation_init(&r->pool_name_reservation);
     if (bytes && (!wl_columnar_memory_reservation_move(
             &r->descriptor_reservation, &descriptor_pending)
         || !wl_columnar_memory_commit(&r->descriptor_reservation, r)))
@@ -1393,8 +1413,13 @@ col_rel_attach_memory_governor(col_rel_t *r,
             &r->metadata_reservation, &metadata_pending)
         || !wl_columnar_memory_commit(&r->metadata_reservation, r)))
         abort();
+    if (pool_name_bytes && (!wl_columnar_memory_reservation_move(
+            &r->pool_name_reservation, &pool_name_pending)
+        || !wl_columnar_memory_commit(&r->pool_name_reservation, r)))
+        abort();
     r->descriptor_reserved_bytes = bytes;
     r->metadata_reserved_bytes = metadata_bytes;
+    r->pool_name_reserved_bytes = pool_name_bytes;
     r->memory_governor = memory_governor;
     r->memory_budget_denial_pending = false;
     wl_columnar_memory_governor_ref_retain(memory_governor);
@@ -1582,6 +1607,10 @@ col_rel_free_contents_impl(col_rel_t *r, bool preserve_access_gates)
      * concurrent admission cannot reuse credit while these buffers remain
      * resident. */
     free(r->name);
+    if (r->pool_name_reserved_bytes
+        && !wl_columnar_memory_release(&r->pool_name_reservation))
+        abort();
+    r->pool_name_reserved_bytes = 0;
     if (!r->arena_owned) {
         if (r->col_shared && r->columns) {
             /* Free only non-shared columns (6B zero-copy sharing) */
@@ -2458,6 +2487,7 @@ wl_columnar_relation_alloc_governed(col_rel_t **out, const char *name,
     r->memory_governor = governor;
     wl_columnar_memory_governor_ref_retain(governor);
     wl_columnar_memory_reservation_init(&r->metadata_reservation);
+    wl_columnar_memory_reservation_init(&r->pool_name_reservation);
     wl_columnar_memory_reservation_init(&r->retained_reservation);
     r->view_generation = 1u;
     r->storage_generation = 1u;
@@ -4797,9 +4827,8 @@ col_rel_col_idx(const col_rel_t *r, const char *name)
  * Src must carry a valid nonempty map. A governed destination reserves its
  * complete prospective metadata image unless the caller already did so.
  *
- * Returns 0 on success (compound metadata installed on dst), -1 on
- * width-inconsistency, -2 on allocation failure (dst's compound metadata is
- * left untouched, matching the existing graceful-degrade behaviour).
+ * Returns 0 on success, -1 on invalid shape, -2 on allocation/admission
+ * failure, and -3 on overflow. The destination is unchanged on failure.
  */
 static int
 col_rel_clone_compound_meta(col_rel_t *dst, const col_rel_t *src,
@@ -4813,15 +4842,18 @@ col_rel_clone_compound_meta(col_rel_t *dst, const col_rel_t *src,
     uint64_t map_bytes = 0;
     if (!wl_columnar_memory_size_mul(src->compound_arity_len,
         sizeof(uint32_t), &map_bytes) || map_bytes > SIZE_MAX)
-        return -1;
+        return -3;
     if (!metadata_prepaid) {
         if (!col_rel_prospective_metadata_bytes(dst->ncols,
             (const char *const *)dst->col_names,
             dst->col_names != NULL, false, dst->column_types != NULL,
             dst->schema_ok, src->compound_arity_len, &metadata_bytes))
-            return -1;
-        if (col_rel_reserve_metadata(dst, metadata_bytes, &pending) != 0)
-            return -2;
+            return -3;
+        int reserve_rc = col_rel_reserve_metadata(dst, metadata_bytes,
+                &pending);
+        if (reserve_rc != 0)
+            return reserve_rc == EOVERFLOW ? -3
+                : reserve_rc == EINVAL ? -1 : -2;
     }
     uint32_t *copy = (uint32_t *)malloc((size_t)map_bytes);
     if (!copy) {
@@ -4889,33 +4921,46 @@ wl_columnar_relation_new_auto_governed(const char *name, uint32_t ncols,
  * callers obtain their template from a lookup that can miss and check only
  * the returned relation, so failing here is what makes that check
  * sufficient. */
-static col_rel_t *
-wl_columnar_relation_new_like_impl(const char *name, const col_rel_t *src,
+static int
+wl_columnar_relation_new_like_checked_impl(col_rel_t **out,
+    const char *name, const col_rel_t *src,
     wl_columnar_memory_governor_ref_t *governor, bool preserve_metadata)
 {
-    if (!src)
-        return NULL;
+    wl_columnar_source_access_reader_t reader = { 0 };
     col_rel_t *r = NULL;
-    if (col_rel_alloc(&r, name) != 0)
-        return NULL;
-    if (governor && col_rel_attach_memory_governor(r, governor) != 0) {
-        col_rel_destroy(r);
-        return NULL;
+    int rc;
+
+    if (!out)
+        return EINVAL;
+    *out = NULL;
+    if (!name || !src)
+        return EINVAL;
+    rc = col_rel_source_reader_acquire(src, &reader);
+    if (rc != 0)
+        return rc;
+    if (!wl_columnar_relation_compound_map_valid(src)
+        || (src->has_graph_column && src->graph_col_idx >= src->ncols)) {
+        rc = EINVAL;
+        goto done;
     }
-    if (src->column_types && src->ncols > 0) {
-        r->column_types = (wirelog_column_type_t *)malloc(
-            (size_t)src->ncols * sizeof(*r->column_types));
-        if (!r->column_types) {
-            col_rel_destroy(r);
-            return NULL;
+    rc = governor ? wl_columnar_relation_alloc_governed(&r, name, governor)
+        : col_rel_alloc(&r, name);
+    if (rc != 0)
+        goto done;
+    rc = col_rel_set_schema(r, src->ncols,
+            (const char *const *)src->col_names);
+    if (rc != 0) {
+        if (rc == ENOMEM && r->memory_budget_denial_pending)
+            rc = ENOSPC;
+        goto done;
+    }
+    if (src->column_types) {
+        rc = col_rel_set_column_types(r, src->column_types, src->ncols);
+        if (rc != 0) {
+            if (rc == ENOMEM && r->memory_budget_denial_pending)
+                rc = ENOSPC;
+            goto done;
         }
-        memcpy(r->column_types, src->column_types,
-            (size_t)src->ncols * sizeof(*r->column_types));
-    }
-    if (col_rel_set_schema(r, src->ncols, (const char *const *)src->col_names)
-        != 0) {
-        col_rel_destroy(r);
-        return NULL;
     }
     /* Issue #535: inherit graph-column metadata so deltas/clones route by
      * __graph_id consistently with their source relation. */
@@ -4925,46 +4970,60 @@ wl_columnar_relation_new_like_impl(const char *name, const col_rel_t *src,
     /* Required metadata cannot be silently dropped: that would change
      * interpretation of the same physical columns. Deep-copy retains its
      * separate historical contract. */
-    if ((!wl_columnar_relation_compound_map_valid(src))
-        || (src->compound_arity_len > 0
-        && col_rel_clone_compound_meta(r, src, false) != 0)) {
-        col_rel_destroy(r);
-        return NULL;
+    if (src->compound_arity_len > 0) {
+        int clone_rc = col_rel_clone_compound_meta(r, src, false);
+        if (clone_rc != 0) {
+            rc = clone_rc == -1 ? EINVAL
+                : clone_rc == -3 ? EOVERFLOW
+                : r->memory_budget_denial_pending ? ENOSPC : ENOMEM;
+            goto done;
+        }
     }
-    if (preserve_metadata && src->timestamps
-        && col_rel_enable_timestamps(r) != 0) {
-        col_rel_destroy(r);
-        return NULL;
+    if (preserve_metadata && src->timestamps) {
+        rc = col_rel_enable_timestamps(r);
+        if (rc != 0) {
+            if (rc == ENOMEM && r->memory_budget_denial_pending)
+                rc = ENOSPC;
+            goto done;
+        }
     }
-    return r;
+    rc = 0;
+done:
+    if (col_rel_source_reader_release(&reader) != 0 && rc == 0)
+        rc = EBUSY;
+    if (rc == 0)
+        *out = r;
+    else
+        col_rel_destroy(r);
+    return rc;
 }
 
 col_rel_t *
 col_rel_new_like(const char *name, const col_rel_t *src)
 {
-    return wl_columnar_relation_new_like_impl(name, src, NULL, false);
+    col_rel_t *r = NULL;
+    (void)wl_columnar_relation_new_like_checked_impl(&r, name, src, NULL,
+        false);
+    return r;
 }
 
 col_rel_t *
 wl_columnar_relation_new_like_governed(const char *name, const col_rel_t *src,
     wl_columnar_memory_governor_ref_t *governor)
 {
-    col_rel_t *out = NULL;
-    if (!governor)
-        return wl_columnar_relation_new_like_impl(name, src, NULL, true);
-    if (wl_columnar_relation_new_like_governed_checked(name, src, governor,
-        &out) != 0)
-        return NULL;
-    return out;
+    col_rel_t *r = NULL;
+    (void)wl_columnar_relation_new_like_governed_checked(&r, name, src,
+        governor);
+    return r;
 }
 
 int
-wl_columnar_relation_new_like_governed_checked(const char *name,
-    const col_rel_t *src, wl_columnar_memory_governor_ref_t *governor,
-    col_rel_t **out)
+wl_columnar_relation_new_like_governed_checked(col_rel_t **out,
+    const char *name, const col_rel_t *src,
+    wl_columnar_memory_governor_ref_t *governor)
 {
-    return wl_columnar_relation_new_like_governed_checked_mode(name, src,
-               governor, true, out);
+    return wl_columnar_relation_new_like_checked_impl(out, name, src,
+               governor, true);
 }
 
 int
@@ -4972,56 +5031,8 @@ wl_columnar_relation_new_like_governed_checked_mode(const char *name,
     const col_rel_t *src, wl_columnar_memory_governor_ref_t *governor,
     bool preserve_timestamps, col_rel_t **out)
 {
-    col_rel_t *r = NULL;
-    int rc;
-
-    if (out)
-        *out = NULL;
-    if (!src || !governor || !out)
-        return EINVAL;
-    rc = col_rel_alloc(&r, name);
-    if (rc != 0)
-        return rc;
-    rc = col_rel_attach_memory_governor(r, governor);
-    if (rc == 0 && src->column_types && src->ncols > 0) {
-        r->column_types = (wirelog_column_type_t *)malloc(
-            (size_t)src->ncols * sizeof(*r->column_types));
-        if (!r->column_types)
-            rc = ENOMEM;
-        else
-            memcpy(r->column_types, src->column_types,
-                (size_t)src->ncols * sizeof(*r->column_types));
-    }
-    if (rc == 0)
-        rc = col_rel_set_schema_impl_capacity(r, src->ncols,
-                (const char *const *)src->col_names, COL_REL_INIT_CAP,
-                false, NULL);
-    if (rc == ENOMEM && r->memory_budget_denial_pending)
-        rc = ENOSPC;
-    if (rc == 0) {
-        r->has_graph_column = src->has_graph_column;
-        r->graph_col_idx = src->graph_col_idx;
-        r->declared_ncols = src->declared_ncols;
-        if (!wl_columnar_relation_compound_map_valid(src)) {
-            rc = EINVAL;
-        } else if (src->compound_arity_len > 0) {
-            int compound_rc = col_rel_clone_compound_meta(r, src, false);
-            if (compound_rc != 0)
-                rc = compound_rc == -1 ? EINVAL
-                    : r->memory_budget_denial_pending ? ENOSPC : ENOMEM;
-        }
-    }
-    if (rc == 0 && preserve_timestamps && src->timestamps) {
-        rc = col_rel_enable_timestamps(r);
-        if (rc == ENOMEM && r->memory_budget_denial_pending)
-            rc = ENOSPC;
-    }
-    if (rc != 0) {
-        col_rel_destroy(r);
-        return rc;
-    }
-    *out = r;
-    return 0;
+    return wl_columnar_relation_new_like_checked_impl(out, name, src,
+               governor, preserve_timestamps);
 }
 
 /* Pool-aware col_rel constructor wrappers.
@@ -5033,17 +5044,6 @@ wl_columnar_relation_new_like_governed_checked_mode(const char *name,
  * skip free() on the struct itself while still freeing heap-allocated
  * internals. */
 static col_rel_t *
-col_rel_pool_fallback_like(delta_pool_t *pool, col_rel_t *r,
-    const char *name, const col_rel_t *like,
-    wl_columnar_memory_governor_ref_t *governor)
-{
-    col_rel_free_contents(r);
-    if (pool->slot_used > 0)
-        pool->slot_used--;
-    return wl_columnar_relation_new_like_impl(name, like, governor, false);
-}
-
-static col_rel_t *
 col_rel_pool_fallback_auto(delta_pool_t *pool, col_rel_t *r,
     const char *name, uint32_t ncols)
 {
@@ -5053,60 +5053,160 @@ col_rel_pool_fallback_auto(delta_pool_t *pool, col_rel_t *r,
     return col_rel_new_auto(name, ncols);
 }
 
-col_rel_t *
-wl_columnar_relation_pool_new_like_governed(delta_pool_t *pool,
-    const char *name,
-    const col_rel_t *like, wl_columnar_memory_governor_ref_t *governor)
+int
+wl_columnar_relation_pool_new_like_governed_checked(col_rel_t **out,
+    delta_pool_t *pool, const char *name, const col_rel_t *like,
+    wl_columnar_memory_governor_ref_t *governor)
 {
-    /* Issue #1140: reject before delta_pool_alloc_slot() so a rejected call
-     * does not burn a pool slot. */
-    if (!like)
-        return NULL;
-    if (!pool)
-        return wl_columnar_relation_new_like_impl(name, like, governor, false); /* Fallback to malloc */
+    wl_columnar_source_access_reader_t reader = { 0 };
+    wl_columnar_memory_reservation_t name_pending;
+    col_rel_t *r = NULL;
+    col_rel_t *fallback = NULL;
+    int rc;
+
+    if (!out)
+        return EINVAL;
+    *out = NULL;
+    if (!name || !like)
+        return EINVAL;
+    if (!pool || pool->slot_used >= pool->slot_cap)
+        return wl_columnar_relation_new_like_checked_impl(out, name, like,
+                   governor, false);
+    rc = col_rel_source_reader_acquire(like, &reader);
+    if (rc != 0)
+        return rc;
+    if (!wl_columnar_relation_compound_map_valid(like)
+        || (like->has_graph_column && like->graph_col_idx >= like->ncols)) {
+        rc = EINVAL;
+        goto done;
+    }
     /* Reserve the identity before consuming a slab slot.  The allocator is
      * deliberately non-wrapping; exhaustion is a hard rejection and must
      * not make a subsequent valid pool allocation appear exhausted. */
-    if (pool->slot_used < pool->slot_cap) {
-        uint64_t identity = 0;
-        if (col_rel_new_identity(&identity) != 0)
-            return NULL;
-        col_rel_t *r = (col_rel_t *)delta_pool_alloc_slot(pool);
-        if (!r)
-            return wl_columnar_relation_new_like_impl(name, like, governor,
-                       false);
-        r->pool_owned = true;
-        r->relation_identity = identity;
-        r->view_generation = 1u;
-        r->storage_generation = 1u;
-        col_rel_storage_owner_init(r);
-        wl_columnar_memory_reservation_init(&r->retained_reservation);
-        if (governor && col_rel_attach_memory_governor(r, governor) != 0)
-            return col_rel_pool_fallback_like(pool, r, name, like, governor);
-        r->name = wl_strdup(name);
-        if (!r->name) {
-            return col_rel_pool_fallback_like(pool, r, name, like, governor);
-        }
-        if (col_rel_set_schema(r, like->ncols,
-            (const char *const *)like->col_names) != 0)
-            return col_rel_pool_fallback_like(pool, r, name, like, governor);
-        r->declared_ncols = like->declared_ncols;
-        r->has_graph_column = like->has_graph_column;
-        r->graph_col_idx = like->graph_col_idx;
-        if (like->column_types
-            && col_rel_set_column_types(r, like->column_types,
-            like->ncols) != 0) {
-            return col_rel_pool_fallback_like(pool, r, name, like, governor);
-        }
-        if (!wl_columnar_relation_compound_map_valid(like)
-            || (like->compound_arity_len > 0
-            && col_rel_clone_compound_meta(r, like, false) != 0))
-            return col_rel_pool_fallback_like(pool, r, name, like, governor);
-        r->nrows = 0;
-        return r;
+    uint64_t identity = 0;
+    if (col_rel_new_identity(&identity) != 0) {
+        rc = EOVERFLOW;
+        goto done;
     }
-    /* Pool exhausted: retain the historical heap fallback. */
-    return wl_columnar_relation_new_like_impl(name, like, governor, false);
+    r = (col_rel_t *)delta_pool_alloc_slot(pool);
+    if (!r) {
+        rc = wl_columnar_relation_new_like_checked_impl(&fallback, name, like,
+                governor, false);
+        goto done;
+    }
+    r->pool_owned = true;
+    r->relation_identity = identity;
+    r->view_generation = 1u;
+    r->storage_generation = 1u;
+    col_rel_storage_owner_init(r);
+    wl_columnar_memory_reservation_init(&r->descriptor_reservation);
+    wl_columnar_memory_reservation_init(&r->metadata_reservation);
+    wl_columnar_memory_reservation_init(&r->pool_name_reservation);
+    wl_columnar_memory_reservation_init(&r->retained_reservation);
+    if (governor) {
+        rc = col_rel_attach_memory_governor(r, governor);
+        if (rc != 0)
+            goto fail_slot;
+    }
+    wl_columnar_memory_reservation_init(&name_pending);
+    if (governor) {
+        size_t name_len = strlen(name);
+        if (name_len == SIZE_MAX) {
+            rc = EOVERFLOW;
+            goto fail_slot;
+        }
+        uint64_t name_bytes = (uint64_t)name_len + 1u;
+        wl_columnar_memory_admission_status_t status
+            = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(governor),
+                name_bytes, &name_pending);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : EINVAL;
+            if (rc == ENOSPC)
+                r->memory_budget_denial_pending = true;
+            goto fail_slot;
+        }
+    }
+    r->name = wl_strdup(name);
+    if (!r->name) {
+        rc = ENOMEM;
+        goto fail_name;
+    }
+    if (governor) {
+        if (!wl_columnar_memory_reservation_move(
+                &r->pool_name_reservation, &name_pending)
+            || !wl_columnar_memory_commit(&r->pool_name_reservation,
+            r)) {
+            rc = EINVAL;
+            goto fail_name;
+        }
+        r->pool_name_reserved_bytes = (uint64_t)strlen(name) + 1u;
+    }
+    rc = col_rel_set_schema(r, like->ncols,
+            (const char *const *)like->col_names);
+    if (rc != 0) {
+        if (rc == ENOMEM && r->memory_budget_denial_pending)
+            rc = ENOSPC;
+        goto fail_slot;
+    }
+    r->declared_ncols = like->declared_ncols;
+    r->has_graph_column = like->has_graph_column;
+    r->graph_col_idx = like->graph_col_idx;
+    if (like->column_types) {
+        rc = col_rel_set_column_types(r, like->column_types,
+                like->ncols);
+        if (rc != 0) {
+            if (rc == ENOMEM && r->memory_budget_denial_pending)
+                rc = ENOSPC;
+            goto fail_slot;
+        }
+    }
+    if (like->compound_arity_len > 0) {
+        int clone_rc = col_rel_clone_compound_meta(r, like, false);
+        if (clone_rc != 0) {
+            rc = clone_rc == -1 ? EINVAL
+                : clone_rc == -3 ? EOVERFLOW
+                    : r->memory_budget_denial_pending ? ENOSPC : ENOMEM;
+            goto fail_slot;
+        }
+    }
+    r->nrows = 0;
+    rc = 0;
+    goto done;
+fail_name:
+    col_rel_reservation_rollback(&name_pending);
+    col_rel_reservation_rollback(&r->pool_name_reservation);
+fail_slot:
+    col_rel_free_contents(r);
+    pool->slot_used--;
+    r = NULL;
+done:
+    if (col_rel_source_reader_release(&reader) != 0 && rc == 0)
+        rc = EBUSY;
+    if (rc == 0) {
+        *out = r ? r : fallback;
+    } else {
+        if (r) {
+            col_rel_free_contents(r);
+            pool->slot_used--;
+        }
+        col_rel_destroy(fallback);
+    }
+    return rc;
+}
+
+col_rel_t *
+wl_columnar_relation_pool_new_like_governed(delta_pool_t *pool,
+    const char *name, const col_rel_t *like,
+    wl_columnar_memory_governor_ref_t *governor)
+{
+    col_rel_t *r = NULL;
+    (void)wl_columnar_relation_pool_new_like_governed_checked(&r, pool,
+        name, like, governor);
+    return r;
 }
 
 col_rel_t *
@@ -5134,6 +5234,7 @@ col_rel_pool_new_auto(delta_pool_t *pool, wl_arena_t *arena,
         r->view_generation = 1u;
         r->storage_generation = 1u;
         col_rel_storage_owner_init(r);
+        wl_columnar_memory_reservation_init(&r->pool_name_reservation);
         wl_columnar_memory_reservation_init(&r->retained_reservation);
         r->name = wl_strdup(name);
         if (!r->name) {
@@ -5600,7 +5701,8 @@ wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
         int compound_rc = !wl_columnar_relation_compound_map_valid(src)
             ? -1 : col_rel_clone_compound_meta(dst, src, true);
         if (compound_rc != 0) {
-            rc = compound_rc == -2 ? ENOMEM : EINVAL;
+            rc = compound_rc == -2 ? ENOMEM
+                : compound_rc == -3 ? EOVERFLOW : EINVAL;
             goto done;
         }
     }
@@ -5960,6 +6062,7 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     col_rel_t *staged;
     wl_columnar_memory_reservation_t new_reservation;
     wl_columnar_memory_reservation_t descriptor_reservation;
+    wl_columnar_memory_reservation_t pool_name_reservation;
     wl_columnar_memory_reservation_t old_metadata;
     char *name;
     char *staged_name;
@@ -5978,6 +6081,7 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     bool has_old_reservation;
     uint64_t old_retained_bytes;
     uint64_t descriptor_reserved_bytes;
+    uint64_t pool_name_reserved_bytes;
     uint64_t metadata_reserved_bytes;
     wl_columnar_memory_reservation_t old_reservation;
     int release_rc;
@@ -6007,11 +6111,17 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     wl_columnar_memory_reservation_init(&old_reservation);
     wl_columnar_memory_reservation_init(&new_reservation);
     wl_columnar_memory_reservation_init(&descriptor_reservation);
+    wl_columnar_memory_reservation_init(&pool_name_reservation);
     wl_columnar_memory_reservation_init(&old_metadata);
     descriptor_reserved_bytes = dst->descriptor_reserved_bytes;
     if (descriptor_reserved_bytes > 0
         && !wl_columnar_memory_reservation_move(&descriptor_reservation,
         &dst->descriptor_reservation))
+        abort();
+    pool_name_reserved_bytes = dst->pool_name_reserved_bytes;
+    if (pool_name_reserved_bytes > 0
+        && !wl_columnar_memory_reservation_move(&pool_name_reservation,
+        &dst->pool_name_reservation))
         abort();
     metadata_reserved_bytes = dst->metadata_reserved_bytes;
     if (metadata_reserved_bytes
@@ -6055,6 +6165,8 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
         abort(); /* Staged copies must not own a descriptor reservation. */
     if (staged->metadata_reserved_bytes != 0)
         abort(); /* Staged metadata is covered by the prepared token. */
+    if (staged->pool_name_reserved_bytes != 0)
+        abort(); /* Staged copies do not own a pool name. */
     dst->name = name;
     staged->name = NULL;
     free(staged_name);
@@ -6072,6 +6184,12 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     if (descriptor_reserved_bytes > 0
         && !wl_columnar_memory_reservation_move(
             &dst->descriptor_reservation, &descriptor_reservation))
+        abort();
+    dst->pool_name_reserved_bytes = pool_name_reserved_bytes;
+    wl_columnar_memory_reservation_init(&dst->pool_name_reservation);
+    if (pool_name_reserved_bytes > 0
+        && !wl_columnar_memory_reservation_move(&dst->pool_name_reservation,
+        &pool_name_reservation))
         abort();
     wl_columnar_memory_reservation_init(&dst->metadata_reservation);
     dst->metadata_reserved_bytes = 0;
@@ -6112,6 +6230,7 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     old.mem_ledger = NULL;
     old.memory_governor = NULL;
     old.descriptor_reserved_bytes = 0;
+    old.pool_name_reserved_bytes = 0;
     old.metadata_reserved_bytes = 0;
     old.ledger_ts_bytes = 0;
     old.storage_owner = &old;
@@ -7690,11 +7809,15 @@ wl_columnar_relation_rename_checked(col_rel_t *rel, const char *name)
             &writer);
     if (rc != 0)
         return rc;
-    governed = !rel->pool_owned && rel->memory_governor != NULL;
+    governed = rel->memory_governor != NULL;
     if (governed) {
-        if (strlen(name) == SIZE_MAX
-            || !wl_columnar_memory_size_add(sizeof(*rel),
-            (uint64_t)strlen(name) + 1u, &bytes)) {
+        if (strlen(name) == SIZE_MAX) {
+            rc = EOVERFLOW;
+            goto fail;
+        }
+        bytes = (uint64_t)strlen(name) + 1u;
+        if (!rel->pool_owned
+            && !wl_columnar_memory_size_add(sizeof(*rel), bytes, &bytes)) {
             rc = EOVERFLOW;
             goto fail;
         }
@@ -7707,6 +7830,8 @@ wl_columnar_relation_rename_checked(col_rel_t *rel, const char *name)
             rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
                 : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
                 : EINVAL;
+            if (rc == ENOSPC)
+                rel->memory_budget_denial_pending = true;
             goto fail;
         }
     }
@@ -7718,19 +7843,27 @@ wl_columnar_relation_rename_checked(col_rel_t *rel, const char *name)
         goto fail;
     }
     if (governed) {
+        wl_columnar_memory_reservation_t *current = rel->pool_owned
+            ? &rel->pool_name_reservation : &rel->descriptor_reservation;
+        bool had_old = rel->pool_owned
+            ? rel->pool_name_reserved_bytes != 0
+            : rel->descriptor_reserved_bytes != 0;
         wl_columnar_memory_reservation_init(&old_reservation);
         if (!wl_columnar_memory_commit(&pending, rel)
-            || !wl_columnar_memory_reservation_move(&old_reservation,
-            &rel->descriptor_reservation)
-            || !wl_columnar_memory_reservation_move(
-                &rel->descriptor_reservation, &pending))
+            || (had_old && !wl_columnar_memory_reservation_move(
+                &old_reservation, current))
+            || !wl_columnar_memory_reservation_move(current, &pending))
             abort();
     }
     free(rel->name);
     rel->name = replacement;
     if (governed) {
-        rel->descriptor_reserved_bytes = bytes;
-        if (!wl_columnar_memory_release(&old_reservation))
+        if (rel->pool_owned)
+            rel->pool_name_reserved_bytes = bytes;
+        else
+            rel->descriptor_reserved_bytes = bytes;
+        if (old_reservation.bytes
+            && !wl_columnar_memory_release(&old_reservation))
             abort();
     }
     return wl_columnar_source_access_writer_release(&writer);

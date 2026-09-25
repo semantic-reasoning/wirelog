@@ -388,6 +388,9 @@ typedef struct col_rel {
     /* Heap-owned schema names, types, and nested ArrowSchema allocations. */
     wl_columnar_memory_reservation_t metadata_reservation;
     uint64_t metadata_reserved_bytes;
+    /* A pool descriptor owns its heap name until publication promotes it. */
+    wl_columnar_memory_reservation_t pool_name_reservation;
+    uint64_t pool_name_reserved_bytes;
     /* Set when governed admission was denied while preparing this relation. */
     uint8_t memory_budget_denial_pending;
     wl_columnar_memory_reservation_t retained_reservation;
@@ -2728,17 +2731,16 @@ bool
 wl_columnar_relation_compound_map_valid(const col_rel_t *r);
 col_rel_t *
 col_rel_new_like(const char *name, const col_rel_t *src);
-/* Admit column/timestamp buffers before allocation; preserve required
- * compound and timestamp metadata or fail. Heap descriptor/name overhead is
- * admitted when the constructed relation attaches its governor. NULL includes
- * admission denial. */
+/* Checked construction admits the heap descriptor/name first, then each
+ * schema, type, map, and retained image before allocation. Pointer wrappers
+ * preserve their historical NULL-on-error behavior. */
 col_rel_t *
 wl_columnar_relation_new_like_governed(const char *name, const col_rel_t *src,
     wl_columnar_memory_governor_ref_t *governor);
 int
-wl_columnar_relation_new_like_governed_checked(const char *name,
-    const col_rel_t *src, wl_columnar_memory_governor_ref_t *governor,
-    col_rel_t **out);
+wl_columnar_relation_new_like_governed_checked(col_rel_t **out,
+    const char *name, const col_rel_t *src,
+    wl_columnar_memory_governor_ref_t *governor);
 int
 wl_columnar_relation_new_like_governed_checked_mode(const char *name,
     const col_rel_t *src, wl_columnar_memory_governor_ref_t *governor,
@@ -2780,11 +2782,14 @@ col_rel_t *
 col_rel_pool_new_like(delta_pool_t *pool, const char *name,
     const col_rel_t *like);
 
-/* Explicit admission for heap payloads, including every pool fallback.
- * Like the legacy constructor, does not enable timestamp mode. Pool slab
- * accounting remains separate; NULL governor retains unmanaged semantics. */
+/* A pool slot admits its own heap name separately from metadata. Setup
+ * failures restore the slot; only absent, exhausted, or missed slots fall
+ * back to governed heap construction. Pool clones do not enable timestamps. */
 col_rel_t *wl_columnar_relation_pool_new_like_governed(delta_pool_t *pool,
     const char *name, const col_rel_t *like,
+    wl_columnar_memory_governor_ref_t *governor);
+int wl_columnar_relation_pool_new_like_governed_checked(col_rel_t **out,
+    delta_pool_t *pool, const char *name, const col_rel_t *like,
     wl_columnar_memory_governor_ref_t *governor);
 
 /*
