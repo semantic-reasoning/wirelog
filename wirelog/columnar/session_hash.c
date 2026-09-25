@@ -63,8 +63,8 @@ session_rel_next_pow2(uint32_t n)
 
 /*
  * session_rel_build_hash: Full rebuild of hash table from rels[] array.
- * Returns 0 on success, ENOMEM on allocation failure.
- * May reallocate bucket heads if size changed, or chain array if needed.
+ * Replaces both arrays together. Admission or allocation failure preserves
+ * the previous hash until the caller chooses linear lookup.
  */
 int
 session_rel_build_hash(wl_col_session_t *sess)
@@ -76,30 +76,39 @@ session_rel_build_hash(wl_col_session_t *sess)
     if (nbuckets == 0)
         return ENOMEM;
 
-    /* Reallocate bucket heads if size changed. */
-    if (nbuckets != sess->rel_hash_nbuckets) {
-        uint32_t *head
-            = (uint32_t *)malloc(nbuckets * sizeof(uint32_t));
-        if (!head)
-            return ENOMEM;
-        free(sess->rel_hash_head);
-        sess->rel_hash_head = head;
-        sess->rel_hash_nbuckets = nbuckets;
+    uint64_t head_bytes, next_bytes, total_bytes;
+    if (!wl_columnar_memory_size_mul(nbuckets, sizeof(uint32_t),
+        &head_bytes)
+        || !wl_columnar_memory_size_mul(nrels, sizeof(uint32_t),
+        &next_bytes)
+        || !wl_columnar_memory_size_add(head_bytes, next_bytes,
+        &total_bytes)
+        || head_bytes > SIZE_MAX || next_bytes > SIZE_MAX)
+        return EOVERFLOW;
+    wl_columnar_memory_reservation_t pending;
+    wl_columnar_memory_reservation_init(&pending);
+    if (sess->memory_governor) {
+        wl_columnar_memory_admission_status_t status
+            = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(sess->memory_governor),
+                total_bytes, &pending);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : EINVAL;
+        }
     }
-    memset(sess->rel_hash_head, 0xFF, nbuckets * sizeof(uint32_t));
-
-    /* Allocate chain array with explicit capacity tracking.
-     * Allocate nrels capacity (all relation indices from 0..nrels-1).
-     * This tracks actual capacity separately from bucket count. */
-    if (nrels > sess->rel_hash_chain_cap) {
-        uint32_t new_cap = nrels;
-        uint32_t *nxt = (uint32_t *)malloc(new_cap * sizeof(uint32_t));
-        if (!nxt)
-            return ENOMEM;
-        free(sess->rel_hash_next);
-        sess->rel_hash_next = nxt;
-        sess->rel_hash_chain_cap = new_cap;
+    uint32_t *head = (uint32_t *)malloc((size_t)head_bytes);
+    uint32_t *next = nrels ? (uint32_t *)malloc((size_t)next_bytes) : NULL;
+    if (!head || (nrels && !next)) {
+        free(head);
+        free(next);
+        if (sess->memory_governor)
+            (void)wl_columnar_memory_rollback(&pending);
+        return ENOMEM;
     }
+    memset(head, 0xFF, (size_t)head_bytes);
 
     /* Index all non-NULL relations. */
     for (uint32_t i = 0; i < nrels; i++) {
@@ -107,9 +116,26 @@ session_rel_build_hash(wl_col_session_t *sess)
             continue; /* Skip holes from session_remove_rel */
         uint32_t bucket
             = session_rel_hash_string(sess->rels[i]->name, nbuckets);
-        sess->rel_hash_next[i] = sess->rel_hash_head[bucket];
-        sess->rel_hash_head[bucket] = i;
+        next[i] = head[bucket];
+        head[bucket] = i;
     }
+    free(sess->rel_hash_head);
+    free(sess->rel_hash_next);
+    if (sess->memory_governor) {
+        if (sess->rel_hash_reservation.identity
+            != &sess->rel_hash_reservation)
+            wl_columnar_memory_reservation_init(&sess->rel_hash_reservation);
+        if (sess->rel_hash_nbuckets > 0
+            && !wl_columnar_memory_rollback(&sess->rel_hash_reservation))
+            abort();
+        if (!wl_columnar_memory_reservation_move(
+                &sess->rel_hash_reservation, &pending))
+            abort();
+    }
+    sess->rel_hash_head = head;
+    sess->rel_hash_next = next;
+    sess->rel_hash_nbuckets = nbuckets;
+    sess->rel_hash_chain_cap = nrels;
     return 0;
 }
 
@@ -202,6 +228,9 @@ session_rel_free_hash(wl_col_session_t *sess)
         return;
     free(sess->rel_hash_head);
     free(sess->rel_hash_next);
+    if (sess->memory_governor && sess->rel_hash_nbuckets > 0
+        && !wl_columnar_memory_rollback(&sess->rel_hash_reservation))
+        abort();
     sess->rel_hash_head = NULL;
     sess->rel_hash_next = NULL;
     sess->rel_hash_nbuckets = 0;
@@ -236,6 +265,12 @@ wl_columnar_session_hash_registry_image_discard(
     free((void *)image->rels);
     free(image->hash_head);
     free(image->hash_next);
+    if (image->hash_reservation.identity == &image->hash_reservation
+        && atomic_load_explicit(&image->hash_reservation.state,
+        memory_order_acquire)
+        == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        && !wl_columnar_memory_rollback(&image->hash_reservation))
+        abort();
     free((void *)image->expected_rel_contents);
     memset(image, 0, sizeof(*image));
 }
@@ -251,6 +286,7 @@ wl_columnar_session_hash_registry_image_prepare(wl_col_session_t *session,
     if (!session || !additions || addition_count == 0 || !image)
         return EINVAL;
     memset(image, 0, sizeof(*image));
+    wl_columnar_memory_reservation_init(&image->hash_reservation);
     if (session->nrels > 0) {
         if (!session->rels) {
             return EINVAL;
@@ -340,6 +376,28 @@ wl_columnar_session_hash_registry_image_prepare(wl_col_session_t *session,
         wl_columnar_session_hash_registry_image_discard(image);
         return EOVERFLOW;
     }
+    uint64_t hash_bytes;
+    if (!wl_columnar_memory_size_add(head_bytes, next_bytes,
+        &hash_bytes)) {
+        wl_columnar_session_hash_registry_image_discard(image);
+        return EOVERFLOW;
+    }
+    if (session->memory_governor) {
+        wl_columnar_memory_admission_status_t status
+            = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(
+                    session->memory_governor), hash_bytes,
+                &image->hash_reservation);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                session->memory_budget_denied = true;
+            wl_columnar_session_hash_registry_image_discard(image);
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : EINVAL;
+        }
+    }
     image->hash_head = malloc(head_bytes);
     image->hash_next = malloc(next_bytes);
     if (!image->hash_head || !image->hash_next) {
@@ -423,6 +481,19 @@ wl_columnar_session_hash_registry_image_publish(
     free((void *)old_rels);
     free(old_head);
     free(old_next);
+    if (session->memory_governor) {
+        if (session->rel_hash_reservation.identity
+            != &session->rel_hash_reservation)
+            wl_columnar_memory_reservation_init(
+                &session->rel_hash_reservation);
+        if (old_head
+            && !wl_columnar_memory_rollback(
+                &session->rel_hash_reservation))
+            abort();
+        if (!wl_columnar_memory_reservation_move(
+                &session->rel_hash_reservation, &image->hash_reservation))
+            abort();
+    }
     free((void *)image->expected_rel_contents);
     memset(image, 0, sizeof(*image));
 }

@@ -1656,6 +1656,7 @@ typedef struct wl_col_session_t {
     uint32_t *rel_hash_next;      /* owned collision chain pointers           */
     uint32_t rel_hash_nbuckets;   /* current bucket count (power of 2)       */
     uint32_t rel_hash_chain_cap;  /* allocated capacity of rel_hash_next[]  */
+    wl_columnar_memory_reservation_t rel_hash_reservation;
     wirelog_on_delta_fn delta_cb;   /* delta callback (NULL = disabled)       */
     void *delta_data;          /* opaque user context for delta_cb       */
     wl_col_delta_event_t *delta_events; /* staged observer events */
@@ -3086,6 +3087,7 @@ struct wl_columnar_session_hash_registry_image {
     uint32_t *hash_next;
     uint32_t hash_nbuckets;
     uint32_t hash_chain_cap;
+    wl_columnar_memory_reservation_t hash_reservation;
 };
 
 int
