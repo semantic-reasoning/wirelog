@@ -2621,8 +2621,7 @@ test_owner_candidate_governed_rename(void)
     wl_columnar_memory_governor_t *governor = NULL;
     col_rel_t *target = owner_publication_candidate(old_name, 17);
     col_rel_t *candidate = NULL;
-    uint64_t payload = target
-        ? (uint64_t)target->capacity * sizeof(int64_t) : 0;
+    uint64_t payload = 0;
     int ok = target != NULL;
 
     resolution.budget_bytes = 1024 * 1024;
@@ -2635,8 +2634,10 @@ test_owner_candidate_governed_rename(void)
         ok = ref && col_rel_attach_memory_governor(target, ref) == 0;
     if (ok) {
         governor = wl_columnar_memory_governor_ref_get(ref);
+        payload = target->retained_reserved_bytes;
         uint64_t metadata = target->metadata_reserved_bytes;
-        uint64_t exact = old_descriptor * 2u + new_descriptor + payload
+        uint64_t exact = old_descriptor * 2u + new_descriptor
+            + 2u * payload
             + 2u * metadata;
         atomic_store_explicit(&governor->usable_bytes, exact - 1u,
             memory_order_release);
@@ -2644,14 +2645,14 @@ test_owner_candidate_governed_rename(void)
                 NULL, 0, true, &candidate) == ENOSPC && candidate == NULL
             && strcmp(target->name, old_name) == 0
             && wl_columnar_memory_reserved(governor)
-            == old_descriptor + metadata;
+            == old_descriptor + metadata + payload;
         atomic_store_explicit(&governor->usable_bytes, exact,
             memory_order_release);
         ok = ok && wl_columnar_eval_test_owner_build_candidate(target,
                 new_name, NULL, 0, true, &candidate) == 0 && candidate
             && strcmp(candidate->name, new_name) == 0
             && wl_columnar_memory_reserved(governor)
-            == old_descriptor + new_descriptor + payload
+            == old_descriptor + new_descriptor + 2u * payload
             + metadata + candidate->metadata_reserved_bytes;
     }
     col_rel_destroy(candidate);

@@ -841,8 +841,16 @@ col_rel_set_raw(col_rel_t *r, uint32_t row, uint32_t col, int64_t val)
 static inline const int64_t *
 col_rel_row(const col_rel_t *r, uint32_t row)
 {
+    static const int64_t empty_row = 0;
+    if (!r)
+        return NULL;
+    if (r->ncols == 0)
+        return &empty_row;
     col_rel_t *mr = (col_rel_t *)(uintptr_t)r; /* cast away const for scratch */
     if (!mr->row_scratch) {
+        /* Governed scratch is admitted and allocated before publication. */
+        if (mr->memory_governor)
+            return NULL;
         mr->row_scratch = (int64_t *)malloc(r->ncols * sizeof(int64_t));
         if (!mr->row_scratch)
             return NULL;
@@ -2488,6 +2496,11 @@ col_rel_retained_bytes_for(const col_rel_t *r, uint32_t capacity,
  * false for inconsistent timestamp pointer/capacity or size overflow. */
 bool
 col_rel_retained_live_bytes(const col_rel_t *r, uint64_t *out);
+/* Replace a persistent merge grid under the aggregate payload reservation.
+ * On admission/allocation failure the relation and old grid are unchanged. */
+int col_rel_reserve_merge_grid(col_rel_t *r, uint32_t capacity);
+/* Retire aggregate credit after a payload allocation has been freed. */
+void col_rel_retire_payload_credit(col_rel_t *r);
 /* Admit and grow @r to at least @new_cap rows as one transaction; with
  * @new_cap <= capacity it admits the buffers the relation already owns.
  * ENOMEM with *@denied set is a governor verdict, clear is an allocation
@@ -2732,6 +2745,7 @@ wl_columnar_relation_alloc_governed(col_rel_t **out, const char *name,
 int
 wl_columnar_relation_admit_existing_metadata(col_rel_t *dst,
     const col_rel_t *src);
+int wl_columnar_relation_admit_existing_payload(col_rel_t *r);
 bool
 wl_columnar_relation_compound_map_valid(const col_rel_t *r);
 col_rel_t *

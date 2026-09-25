@@ -1345,7 +1345,8 @@ test_consolidate_scratch_admission(void)
     uint64_t scratch_bytes = 2u * 2u * sizeof(uint32_t)
         + (4u + 1u + 3u) * sizeof(int64_t);
     ref = test_consolidate_governor_create(descriptor_bytes
-            + metadata_bytes + view_metadata_bytes);
+            + metadata_bytes + view_metadata_bytes
+            + 2u * sizeof(int64_t));
     if (!ref || col_rel_attach_memory_governor(rel, ref) != 0
         || col_rel_install_shared_view(rel, source) != 0) {
         if (ref)
@@ -1361,7 +1362,7 @@ test_consolidate_scratch_admission(void)
         FAIL("shared-view metadata footprint differs from exact fixture");
     }
     uint64_t live_bytes = rel->descriptor_reserved_bytes
-        + rel->metadata_reserved_bytes;
+        + rel->metadata_reserved_bytes + rel->retained_reserved_bytes;
     atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
             ref)->usable_bytes, live_bytes + scratch_bytes - 1u,
         memory_order_release);
@@ -1384,7 +1385,8 @@ test_consolidate_scratch_admission(void)
         || memcmp(before, rel->columns[0], sizeof(before)) != 0
         || wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(ref))
-        != rel->descriptor_reserved_bytes + rel->metadata_reserved_bytes) {
+        != rel->descriptor_reserved_bytes + rel->metadata_reserved_bytes
+        + rel->retained_reserved_bytes) {
         test_rel_free(rel);
         test_rel_free(source);
         wl_columnar_memory_governor_ref_release(ref);
@@ -1416,7 +1418,8 @@ test_consolidate_scratch_admission(void)
     if (rc != 0 || !test_rel_is_sorted_unique(rel)
         || wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(ref))
-        != rel->descriptor_reserved_bytes + rel->metadata_reserved_bytes) {
+        != rel->descriptor_reserved_bytes + rel->metadata_reserved_bytes
+        + rel->retained_reserved_bytes) {
         test_rel_free(rel);
         wl_columnar_memory_governor_ref_release(ref);
         FAIL("admitted scratch must succeed and release reservation");

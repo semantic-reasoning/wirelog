@@ -610,6 +610,8 @@ commit keeps their sum without crediting either image.
 | `relation.c:col_rel_compact_many` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Validate each retained reservation before compacting a relation |
 | `relation.c:col_rel_compact_many#2` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Revalidate the reservation before the second compaction path |
 | `relation.c:col_rel_reservation_rollback` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Read the reservation state before deciding whether rollback still owns an admitted token |
+| `relation.c:col_rel_retire_payload_credit` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Check whether a growth transaction still owns both images before reducing the payload token after physical retirement |
+| `relation.c:col_rel_payload_txn_rollback` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Test-only rollback witness checks the growth state after private storage is freed and before its credit returns |
 | `relation.c:wl_columnar_relation_retirement_reservation_valid` | `retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Confirm the retained reservation is still owned by this relation before retirement |
 | `relation.c:wl_columnar_relation_retirement_reservation_valid#2` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Read the token state before validating committed or replacing reservation ownership |
 | `relation.c:wl_columnar_relation_retirement_writer_valid` | `source_access.state` | `atomic_load_explicit` | acquire | Confirm the retirement writer still owns the source-access gate |
@@ -624,7 +626,7 @@ reservation objects exclusively; their state follows the governor protocol.
 |---|---|---|---|---|
 | `eval_delta.c:wl_columnar_eval_delta_observer_release_token` | `token->state` | `atomic_load_explicit` | acquire | Observe admission or commit state before releasing the observer reservation, then reinitialize the exclusively owned token |
 
-The complete source audit now contains **176 atomic call sites**.
+The complete source audit now contains **183 atomic call sites**.
 
 ---
 
