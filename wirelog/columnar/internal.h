@@ -391,6 +391,9 @@ typedef struct col_rel {
     /* A pool descriptor owns its heap name until publication promotes it. */
     wl_columnar_memory_reservation_t pool_name_reservation;
     uint64_t pool_name_reserved_bytes;
+    /* The persistent TDD hash table is independent of relation payload. */
+    wl_columnar_memory_reservation_t dedup_reservation;
+    uint64_t dedup_reserved_bytes;
     /* Set when governed admission was denied while preparing this relation. */
     uint8_t memory_budget_denial_pending;
     wl_columnar_memory_reservation_t retained_reservation;
@@ -564,11 +567,14 @@ typedef struct col_rel_replacement {
     col_rel_t *staged;
     wl_columnar_memory_reservation_t reservation;
     wl_columnar_memory_reservation_t metadata_reservation;
+    wl_columnar_memory_reservation_t dedup_reservation;
     wl_columnar_source_access_writer_t writer;
     uint64_t reserved_bytes;
     uint64_t metadata_reserved_bytes;
+    uint64_t dedup_reserved_bytes;
     bool reservation_active;
     bool metadata_reservation_active;
+    bool dedup_reservation_active;
     bool writer_acquired;
 } col_rel_replacement_t;
 
@@ -3546,6 +3552,9 @@ bool
 wl_columnar_eval_dedup_set_contains(const col_rel_t *r, uint64_t h);
 int
 wl_columnar_eval_dedup_set_init_from_rel(col_rel_t *r);
+/* Validate a persistent hash table and clear it after physical free. */
+int wl_columnar_eval_dedup_set_bytes(const col_rel_t *r, uint64_t *bytes);
+void wl_columnar_eval_dedup_set_clear(col_rel_t *r);
 
 /* ======================================================================== */
 /* Evaluator (columnar/eval.c)                                              */

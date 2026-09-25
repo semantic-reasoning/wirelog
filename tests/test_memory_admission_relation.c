@@ -130,6 +130,233 @@ attach_payload_bytes(const col_rel_t *rel)
 }
 
 static void
+test_dedup_attach_init_growth_and_clear(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    col_rel_t *rel = col_rel_new_auto("dedup-attach", 1);
+    uint64_t *slots = NULL;
+    CHECK(rel != NULL, "dedup attach relation created");
+    if (!rel)
+        return;
+    slots = calloc(4u, sizeof(*slots));
+    CHECK(slots != NULL, "dedup attach slots allocated");
+    if (!slots) {
+        col_rel_destroy(rel);
+        return;
+    }
+    slots[1] = 1;
+    rel->dedup_slots = slots;
+    rel->dedup_cap = 4;
+    rel->dedup_count = 1;
+    const uint64_t floor = descriptor_bytes(rel->name)
+        + metadata_bytes(rel) + attach_payload_bytes(rel)
+        + 4u * sizeof(uint64_t);
+    make_resolution(&resolution, floor - 1u);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && col_rel_attach_memory_governor(rel, ref) == ENOSPC
+        && rel->memory_governor == NULL
+        && rel->dedup_slots == slots && rel->dedup_reserved_bytes == 0
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0,
+        "dedup legacy attach one-byte denial preserves table");
+    wl_columnar_memory_governor_ref_release(ref);
+    make_resolution(&resolution, floor);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && col_rel_attach_memory_governor(rel, ref) == 0
+        && rel->dedup_reserved_bytes == 4u * sizeof(uint64_t)
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == floor,
+        "dedup legacy attach exact token");
+    CHECK(wl_columnar_eval_dedup_set_contains(rel, 1)
+        && !wl_columnar_eval_dedup_set_contains(rel, 2),
+        "bounded dedup lookup keeps existing hash");
+    wl_columnar_eval_dedup_set_clear(rel);
+    uint64_t base = floor - 4u * sizeof(uint64_t);
+    CHECK(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == base,
+        "dedup clear physically frees before credit return");
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(ref);
+    atomic_store_explicit(&governor->usable_bytes, base + 8192u - 1u,
+        memory_order_release);
+    CHECK(wl_columnar_eval_dedup_set_init_from_rel(rel) == ENOSPC
+        && rel->dedup_slots == NULL && rel->dedup_reserved_bytes == 0
+        && wl_columnar_memory_reserved(governor) == base,
+        "dedup init one-byte denial leaves no image");
+    atomic_store_explicit(&governor->usable_bytes, base + 8192u,
+        memory_order_release);
+    CHECK(wl_columnar_eval_dedup_set_init_from_rel(rel) == 0
+        && rel->dedup_cap == 1024 && rel->dedup_reserved_bytes == 8192u
+        && rel->memory_budget_denial_pending,
+        "dedup init exact admission preserves earlier denial evidence");
+    for (uint64_t hash = 1; hash <= 717u; hash++)
+        CHECK(wl_columnar_eval_dedup_set_insert(rel, hash),
+            "dedup insert below load threshold");
+    CHECK(!wl_columnar_eval_dedup_set_insert(rel, 717u)
+        && rel->dedup_cap == 1024,
+        "duplicate probe does not trigger growth at threshold");
+    bool pending_before_growth = rel->memory_budget_denial_pending;
+    atomic_store_explicit(&governor->usable_bytes,
+        base + 8192u + 16384u - 1u, memory_order_release);
+    CHECK(wl_columnar_eval_dedup_set_insert(rel, 718u)
+        && rel->dedup_cap == 1024 && rel->dedup_count == 717u
+        && rel->memory_budget_denial_pending == pending_before_growth
+        && wl_columnar_memory_reserved(governor) == base + 8192u,
+        "dedup growth denial preserves unique fallback and old table");
+    atomic_store_explicit(&governor->usable_bytes,
+        base + 8192u + 16384u, memory_order_release);
+    CHECK(wl_columnar_eval_dedup_set_insert(rel, 718u)
+        && rel->dedup_cap == 2048 && rel->dedup_count == 718u
+        && rel->dedup_reserved_bytes == 16384u
+        && wl_columnar_memory_reserved(governor) == base + 16384u,
+        "dedup growth admits old-new overlap then releases old credit");
+    wl_columnar_eval_dedup_set_clear(rel);
+    CHECK(wl_columnar_memory_reserved(governor) == base,
+        "dedup grown table teardown releases exact credit");
+    col_rel_destroy(rel);
+    CHECK(wl_columnar_memory_reserved(governor) == 0,
+        "dedup relation teardown releases remaining tokens");
+    wl_columnar_memory_governor_ref_release(ref);
+}
+
+static void
+test_dedup_full_probe_and_malformed_shape(void)
+{
+    col_rel_t *rel = col_rel_new_auto("dedup-full", 1);
+    CHECK(rel != NULL, "dedup full relation created");
+    if (!rel)
+        return;
+    rel->dedup_slots = calloc(4u, sizeof(uint64_t));
+    CHECK(rel->dedup_slots != NULL, "dedup full slots allocated");
+    if (!rel->dedup_slots) {
+        col_rel_destroy(rel);
+        return;
+    }
+    rel->dedup_cap = 4;
+    rel->dedup_count = 4;
+    for (uint32_t i = 0; i < 4; i++)
+        rel->dedup_slots[i] = i + 1u;
+    CHECK(!wl_columnar_eval_dedup_set_contains(rel, 9)
+        && !wl_columnar_eval_dedup_set_insert(rel, 1)
+        && wl_columnar_eval_dedup_set_insert(rel, 9)
+        && rel->dedup_cap == 8 && rel->dedup_count == 5,
+        "full table probes terminate and unique insert grows");
+    rel->dedup_count = 8;
+    uint64_t bytes = 0;
+    CHECK(wl_columnar_eval_dedup_set_bytes(rel, &bytes) == EINVAL,
+        "dedup slot count mismatch rejected");
+    rel->dedup_count = 5;
+    wl_columnar_eval_dedup_set_clear(rel);
+    rel->nrows = UINT32_MAX;
+    CHECK(wl_columnar_eval_dedup_set_init_from_rel(rel) == EOVERFLOW
+        && rel->dedup_slots == NULL,
+        "dedup init rejects row-count arithmetic overflow");
+    rel->nrows = 0;
+    col_rel_destroy(rel);
+}
+
+static void
+test_dedup_replacement_overlap(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    make_resolution(&resolution, UINT64_C(1024) * 1024u);
+    wl_columnar_memory_governor_ref_t *ref
+        = wl_columnar_memory_governor_ref_create(&resolution);
+    col_rel_t *target = col_rel_new_auto("dedup-target", 1);
+    col_rel_t *candidate = col_rel_new_auto("dedup-candidate", 1);
+    col_rel_replacement_t replacement = { 0 };
+    CHECK(ref && target && candidate,
+        "dedup replacement objects created");
+    if (!ref || !target || !candidate)
+        goto cleanup;
+    CHECK(col_rel_attach_memory_governor(target, ref) == 0
+        && wl_columnar_eval_dedup_set_init_from_rel(target) == 0
+        && wl_columnar_eval_dedup_set_init_from_rel(candidate) == 0,
+        "dedup replacement old and candidate tables ready");
+    uint64_t baseline = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+    uint64_t incoming = private_payload_bytes(1u, candidate->capacity, 0)
+        + metadata_bytes(candidate) + 8192u;
+    uint64_t *old_slots = target->dedup_slots;
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(ref);
+    atomic_store_explicit(&governor->usable_bytes,
+        baseline + incoming - 1u, memory_order_release);
+    CHECK(col_rel_prepare_replacement(target, candidate, &replacement)
+        == ENOSPC && target->dedup_slots == old_slots
+        && target->dedup_reserved_bytes == 8192u
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "dedup replacement one-byte denial preserves old token");
+    col_rel_discard_replacement(&replacement);
+    atomic_store_explicit(&governor->usable_bytes,
+        baseline + incoming, memory_order_release);
+    CHECK(col_rel_prepare_replacement(target, candidate, &replacement) == 0
+        && replacement.staged && replacement.staged->dedup_slots
+        && replacement.dedup_reserved_bytes == 8192u
+        && wl_columnar_memory_reserved(governor) == baseline + incoming,
+        "dedup replacement stages exact old-new overlap");
+    col_rel_discard_replacement(&replacement);
+    CHECK(target->dedup_slots == old_slots
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "dedup replacement discard returns only staged credit");
+    CHECK(col_rel_prepare_replacement(target, candidate, &replacement) == 0,
+        "dedup replacement retry prepares");
+    if (replacement.staged) {
+        col_rel_commit_replacement_locked(target, &replacement);
+        CHECK(target->dedup_slots && target->dedup_slots != old_slots
+            && target->dedup_reserved_bytes == 8192u
+            && wl_columnar_eval_dedup_set_bytes(target, &incoming) == 0,
+            "dedup replacement commit transfers new token");
+    }
+cleanup:
+    col_rel_discard_replacement(&replacement);
+    col_rel_destroy(target);
+    col_rel_destroy(candidate);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "dedup replacement teardown releases both tables");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_dedup_shared_retirement_and_clear(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    make_resolution(&resolution, UINT64_C(1024) * 1024u);
+    wl_columnar_memory_governor_ref_t *ref
+        = wl_columnar_memory_governor_ref_create(&resolution);
+    col_rel_t *source = col_rel_new_auto("dedup-source", 1);
+    col_rel_t *target = col_rel_new_auto("dedup-view", 1);
+    CHECK(ref && source && target, "dedup shared objects created");
+    if (!ref || !source || !target)
+        goto cleanup;
+    CHECK(col_rel_attach_memory_governor(target, ref) == 0
+        && wl_columnar_eval_dedup_set_init_from_rel(target) == 0,
+        "dedup shared target has admitted table");
+    CHECK(col_rel_install_shared_view(target, source) == 0
+        && target->dedup_slots == NULL
+        && target->dedup_reserved_bytes == 0
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == target->descriptor_reserved_bytes
+        + target->metadata_reserved_bytes
+        + target->retained_reserved_bytes,
+        "shared install retires old dedup image and token together");
+cleanup:
+    col_rel_destroy(target);
+    col_rel_destroy(source);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "dedup shared teardown releases all credit");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
 test_heap_descriptor_admission(void)
 {
     const char *name = "descriptor";
@@ -3587,6 +3814,10 @@ cleanup:
 int
 main(void)
 {
+    test_dedup_attach_init_growth_and_clear();
+    test_dedup_full_probe_and_malformed_shape();
+    test_dedup_replacement_overlap();
+    test_dedup_shared_retirement_and_clear();
     test_retraction_backup_timestamp_admission();
     test_compound_map_admission();
     test_compound_map_attach_and_shared_view();

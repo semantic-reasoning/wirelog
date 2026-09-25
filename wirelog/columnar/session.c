@@ -999,6 +999,49 @@ session_pool_rel_move_metadata(col_rel_t *dst, col_rel_t *src)
 }
 
 static bool
+session_pool_rel_move_dedup(col_rel_t *dst, col_rel_t *src)
+{
+    if (!src->dedup_reserved_bytes)
+        return true;
+    if (dst->dedup_reserved_bytes
+        || !wl_columnar_memory_transfer(&src->dedup_reservation, dst))
+        return false;
+    if (!wl_columnar_memory_reservation_move(&dst->dedup_reservation,
+        &src->dedup_reservation)) {
+        if (!wl_columnar_memory_transfer(&src->dedup_reservation, src))
+            abort();
+        return false;
+    }
+    dst->dedup_reserved_bytes = src->dedup_reserved_bytes;
+    src->dedup_reserved_bytes = 0;
+    return true;
+}
+
+static int
+session_pool_rel_admit_dedup(col_rel_t *heap, uint64_t bytes)
+{
+    wl_columnar_memory_reservation_t pending;
+    wl_columnar_memory_admission_status_t status;
+    if (!bytes || !heap->memory_governor)
+        return 0;
+    wl_columnar_memory_reservation_init(&pending);
+    status = wl_columnar_memory_reserve_checked(
+        wl_columnar_memory_governor_ref_get(heap->memory_governor),
+        bytes, &pending);
+    if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+        && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+        return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+            : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+            ? EOVERFLOW : EBUSY;
+    if (!wl_columnar_memory_commit(&pending, heap)
+        || !wl_columnar_memory_reservation_move(
+            &heap->dedup_reservation, &pending))
+        abort();
+    heap->dedup_reserved_bytes = bytes;
+    return 0;
+}
+
+static bool
 session_pool_rel_move_name(col_rel_t *dst, col_rel_t *src,
     wl_columnar_memory_governor_ref_t *governor)
 {
@@ -1067,7 +1110,9 @@ session_pool_rel_promote(col_rel_t *src,
     uint64_t state = atomic_load_explicit(&src->retained_reservation.state,
             memory_order_acquire);
     uint64_t payload_bytes = 0;
+    uint64_t dedup_bytes = 0;
     if (!col_rel_retained_live_bytes(src, &payload_bytes)
+        || wl_columnar_eval_dedup_set_bytes(src, &dedup_bytes) != 0
         || (source_had_governor && src->ncols && !src->row_scratch)) {
         rc = EINVAL;
         goto fail;
@@ -1132,6 +1177,23 @@ session_pool_rel_promote(col_rel_t *src,
         rc = EBUSY;
         goto fail;
     }
+    if (source_had_governor) {
+        if (!session_pool_rel_move_dedup(heap, src))
+            rc = EBUSY;
+        else
+            rc = 0;
+    } else {
+        rc = session_pool_rel_admit_dedup(heap, dedup_bytes);
+    }
+    if (rc != 0) {
+        if (!session_pool_rel_move_name(src, heap, governor)
+            || !wl_columnar_session_pool_rel_move_reservation(src, heap)
+            || (source_had_governor
+            && !session_pool_rel_move_metadata(src, heap)))
+            abort();
+        col_rel_destroy(heap);
+        goto fail;
+    }
     session_pool_rel_transfer_payload(heap, src);
     heap->memory_governor = governor;
     if (source_had_governor)
@@ -1159,6 +1221,7 @@ session_pool_rel_promote(col_rel_t *src,
         memory_order_relaxed);
     wl_columnar_memory_reservation_init(&src->metadata_reservation);
     wl_columnar_memory_reservation_init(&src->pool_name_reservation);
+    wl_columnar_memory_reservation_init(&src->dedup_reservation);
     wl_columnar_memory_reservation_init(&src->retained_reservation);
     /* The pool slot remains permanently closed until pool reset/reuse. */
     descriptor_writer.owner = NULL;
@@ -1183,9 +1246,16 @@ session_pool_rel_rollback(col_rel_t *src, col_rel_t *heap,
     if (source_had_governor
         && !wl_columnar_session_pool_rel_move_reservation(src, heap))
         abort();
+    if (source_had_governor && !session_pool_rel_move_dedup(src, heap))
+        abort();
     if (!session_pool_rel_move_name(src, heap, governor))
         abort();
     session_pool_rel_transfer_payload(src, heap);
+    if (!source_had_governor && heap->dedup_reserved_bytes) {
+        if (!wl_columnar_memory_release(&heap->dedup_reservation))
+            abort();
+        heap->dedup_reserved_bytes = 0;
+    }
     if (!source_had_governor) {
         if (!source_had_scratch) {
             free(src->row_scratch);
@@ -4117,10 +4187,7 @@ col_session_remove(wl_session_t *session, const char *relation,
         r->sorted_nrows = 0;
         r->run_count = 0;
         memset(r->run_ends, 0, sizeof(r->run_ends));
-        free(r->dedup_slots);
-        r->dedup_slots = NULL;
-        r->dedup_cap = 0;
-        r->dedup_count = 0;
+        wl_columnar_eval_dedup_set_clear(r);
         wl_columnar_relation_touch_view(r);
     }
     if (remove_count != 0) {
@@ -4393,10 +4460,7 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
     r->sorted_nrows = 0;
     r->run_count = 0;
     memset(r->run_ends, 0, sizeof(r->run_ends));
-    free(r->dedup_slots);
-    r->dedup_slots = NULL;
-    r->dedup_cap = 0;
-    r->dedup_count = 0;
+    wl_columnar_eval_dedup_set_clear(r);
     wl_columnar_relation_touch_view(r);
     session_rel_registration_commit(sess, rdelta, &registration);
     rdelta = NULL;

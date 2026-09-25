@@ -154,7 +154,7 @@ wl_columnar_eval_serial_canonicalize_aggregate_locked(col_rel_t *rel,
         rel->sorted_nrows = out;
         rel->base_nrows = out;
         rel->run_count = 0;
-        rel->dedup_count = 0;
+        wl_columnar_eval_dedup_set_clear(rel);
         memset(rel->run_ends, 0, sizeof(rel->run_ends));
         wl_columnar_relation_touch_view(rel);
     }

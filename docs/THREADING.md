@@ -628,7 +628,18 @@ reservation objects exclusively; their state follows the governor protocol.
 | `eval_delta.c:wl_retraction_stage_prepare` | `r->retained_reservation.state` | `atomic_load_explicit` | acquire | Validate the committed payload token under the relation writer before staging a second physical image |
 | `eval_delta.c:wl_retraction_stage_prepare#2` | `r->retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Confirm the token is still bound to the canonical relation before growing its charge |
 
-The complete source audit now contains **185 atomic call sites**.
+### 5.18 `wirelog/columnar/eval_dedup.c` — governed hash token (3 rows)
+
+The relation's writer owns the dedup table and its token. Validation reads
+the committed token after publication and before a growth transaction.
+
+| Anchor (file:function[#N]) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `eval_dedup.c:wl_columnar_eval_dedup_set_bytes` | `r->dedup_reservation.state` | `atomic_load_explicit` | acquire | Confirm an empty table has no active reservation before attach or reuse |
+| `eval_dedup.c:wl_dedup_token_valid` | `r->dedup_reservation.state` | `atomic_load_explicit` | acquire | Confirm a populated table is covered by a committed token before mutation or lookup |
+| `eval_dedup.c:wl_dedup_token_valid#2` | `r->dedup_reservation.owner_bits` | `atomic_load_explicit` | acquire | Confirm the committed token belongs to this relation before growth or transfer |
+
+The complete source audit now contains **189 atomic call sites**.
 
 ---
 
