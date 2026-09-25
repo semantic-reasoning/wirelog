@@ -2707,7 +2707,7 @@ int
 col_rel_col_idx(const col_rel_t *r, const char *name);
 col_rel_t *
 col_rel_new_auto(const char *name, uint32_t ncols);
-/* Allocate a heap descriptor and name under a known governor. */
+/* Allocate a heap descriptor and optional name under a known governor. */
 int
 wl_columnar_relation_alloc_governed(col_rel_t **out, const char *name,
     wl_columnar_memory_governor_ref_t *governor);
