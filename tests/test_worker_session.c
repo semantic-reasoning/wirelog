@@ -2120,7 +2120,10 @@ test_pool_relation_promotion_tombstones_source(void)
     col_rel_t *pool_slot = pool_rel;
     int rc = session_add_rel(coord, pool_rel);
     col_rel_t *promoted = session_find_rel(coord, "pool-move-tombstone");
+    uint64_t payload_bytes = 0;
     int ok = rc == 0 && promoted && promoted != pool_slot
+        && col_rel_retained_live_bytes(promoted, &payload_bytes)
+        && promoted->retained_reserved_bytes == payload_bytes
         && !promoted->pool_owned && promoted->nrows == 1
         && promoted->columns[0][0] == 42
         && promoted->storage_owner == promoted
@@ -2128,7 +2131,7 @@ test_pool_relation_promotion_tombstones_source(void)
         && promoted->retained_reservation.identity
         == &promoted->retained_reservation
         && atomic_load_explicit(&promoted->retained_reservation.state,
-            memory_order_relaxed) == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+            memory_order_relaxed) == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
         && pool_slot->relation_identity == 0
         && pool_slot->storage_owner == NULL
         && atomic_load_explicit(&pool_slot->source_access.state,
@@ -2947,6 +2950,7 @@ test_pool_relation_descriptor_boundary(void)
     wl_columnar_memory_governor_t *governor = NULL;
     uint64_t baseline = 0;
     uint64_t metadata_bytes = 0;
+    uint64_t payload_bytes = 0;
     int ok = coord != NULL;
 
     TEST("pool promotion admits descriptor exactly and rolls back denial");
@@ -2960,11 +2964,14 @@ test_pool_relation_descriptor_boundary(void)
                 + sizeof(*pool_rel->schema.children[0]) + 2u
                 + 2u * (strlen(pool_rel->col_names[0]) + 1u);
             old = session_find_rel(coord, name);
+            ok = col_rel_retained_live_bytes(pool_rel, &payload_bytes);
+            payload_bytes += pool_rel->ncols * sizeof(int64_t);
             governor = wl_columnar_memory_governor_ref_get(
                 coord->memory_governor);
             baseline = wl_columnar_memory_reserved(governor);
             atomic_store_explicit(&governor->usable_bytes,
-                baseline + descriptor_bytes + metadata_bytes - 1u,
+                baseline + descriptor_bytes + metadata_bytes
+                + payload_bytes - 1u,
                 memory_order_release);
             ok = session_add_rel(coord, pool_rel) == ENOSPC
                 && pool_rel->pool_owned && pool_rel->storage_owner == pool_rel
@@ -2973,7 +2980,8 @@ test_pool_relation_descriptor_boundary(void)
         }
         if (ok) {
             atomic_store_explicit(&governor->usable_bytes,
-                baseline + descriptor_bytes + metadata_bytes,
+                baseline + descriptor_bytes + metadata_bytes
+                + payload_bytes,
                 memory_order_release);
             ok = col_rel_source_reader_acquire(old, &reader) == 0
                 && session_add_rel(coord, pool_rel) == EBUSY
@@ -2990,8 +2998,10 @@ test_pool_relation_descriptor_boundary(void)
                 && !promoted->pool_owned
                 && promoted->descriptor_reserved_bytes == descriptor_bytes
                 && promoted->metadata_reserved_bytes == metadata_bytes
+                && promoted->retained_reserved_bytes == payload_bytes
                 && wl_columnar_memory_reserved(governor)
-                == baseline + descriptor_bytes + metadata_bytes;
+                == baseline + descriptor_bytes + metadata_bytes
+                + payload_bytes;
         }
     }
     if (coord)

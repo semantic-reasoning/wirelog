@@ -1066,11 +1066,19 @@ session_pool_rel_promote(col_rel_t *src,
     }
     uint64_t state = atomic_load_explicit(&src->retained_reservation.state,
             memory_order_acquire);
+    uint64_t payload_bytes = 0;
+    if (!col_rel_retained_live_bytes(src, &payload_bytes)
+        || (source_had_governor && src->ncols && !src->row_scratch)) {
+        rc = EINVAL;
+        goto fail;
+    }
     bool empty = state == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
         && src->retained_reservation.bytes == 0
-        && src->retained_reserved_bytes == 0;
+        && src->retained_reserved_bytes == 0
+        && (!source_had_governor || payload_bytes == 0);
     bool committed = state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
         && src->retained_reserved_bytes > 0
+        && src->retained_reserved_bytes == payload_bytes
         && src->retained_reservation.bytes == src->retained_reserved_bytes
         && src->retained_reservation.replacement_bytes == 0
         && src->memory_governor
@@ -1166,17 +1174,30 @@ fail:
 
 static void
 session_pool_rel_rollback(col_rel_t *src, col_rel_t *heap,
-    bool source_had_governor)
+    bool source_had_governor, bool source_had_scratch)
 {
     wl_columnar_memory_reservation_t descriptor;
     wl_columnar_memory_reservation_t metadata;
     wl_columnar_memory_governor_ref_t *governor = heap->memory_governor;
 
-    if (!wl_columnar_session_pool_rel_move_reservation(src, heap))
+    if (source_had_governor
+        && !wl_columnar_session_pool_rel_move_reservation(src, heap))
         abort();
     if (!session_pool_rel_move_name(src, heap, governor))
         abort();
     session_pool_rel_transfer_payload(src, heap);
+    if (!source_had_governor) {
+        if (!source_had_scratch) {
+            free(src->row_scratch);
+            src->row_scratch = NULL;
+        }
+        src->retained_reserved_bytes = 0;
+        if (heap->retained_reserved_bytes
+            && !wl_columnar_memory_release(&heap->retained_reservation))
+            abort();
+        heap->retained_reserved_bytes = 0;
+        src->memory_budget_denial_pending = false;
+    }
     wl_columnar_memory_reservation_init(&metadata);
     if (source_had_governor) {
         if (!session_pool_rel_move_metadata(src, heap))
@@ -1228,15 +1249,25 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
      * session, because col_session_destroy calls free() on each entry. */
     col_rel_t *pool_src = NULL;
     bool pool_src_had_governor = false;
+    bool pool_src_had_scratch = false;
     if (r->pool_owned) {
         col_rel_t *heap = NULL;
         pool_src_had_governor = r->memory_governor != NULL;
+        pool_src_had_scratch = r->row_scratch != NULL;
         int promote_rc = session_pool_rel_promote(r, sess->memory_governor,
                 &heap);
         if (promote_rc != 0)
             return promote_rc;
         pool_src = r;
         r = heap;
+        if (!pool_src_had_governor && r->memory_governor) {
+            int admit_rc = wl_columnar_relation_admit_existing_payload(r);
+            if (admit_rc != 0) {
+                session_pool_rel_rollback(pool_src, r, false,
+                    pool_src_had_scratch);
+                return admit_rc;
+            }
+        }
     }
     /* Arena-owned data must be promoted to heap before storing in the
      * session, because arena_reset invalidates all arena pointers. */
@@ -1352,7 +1383,8 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
 
 busy:
     if (pool_src)
-        session_pool_rel_rollback(pool_src, r, pool_src_had_governor);
+        session_pool_rel_rollback(pool_src, r, pool_src_had_governor,
+            pool_src_had_scratch);
     return EBUSY;
 
 oom:
@@ -1367,7 +1399,8 @@ oom:
      * col_rel_pool_new_auto(), which sets pool_owned and arena_owned
      * together. */
     if (pool_src) {
-        session_pool_rel_rollback(pool_src, r, pool_src_had_governor);
+        session_pool_rel_rollback(pool_src, r, pool_src_had_governor,
+            pool_src_had_scratch);
     }
     return failure_rc;
 }

@@ -2308,6 +2308,7 @@ test_timestamp_batch_projection_and_live_charge(void)
         || batch->capacity <= 1u
         || row_bytes != sizeof(int64_t) + sizeof(col_delta_timestamp_t)
         || live_bytes != (uint64_t)batch->capacity * row_bytes
+        + sizeof(int64_t *) + sizeof(int64_t)
         || batch->retained_reserved_bytes != live_bytes) {
         FAIL("projected row or live retained footprint changed");
     } else {
