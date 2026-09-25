@@ -93,6 +93,7 @@ typedef struct {
         void *governor;
         uint64_t bytes;
         uint64_t replacement_bytes;
+        uint8_t transition_kind;
         uint64_t owner_bits;
         uint64_t state;
         const void *identity;
@@ -102,6 +103,7 @@ typedef struct {
         void *governor;
         uint64_t bytes;
         uint64_t replacement_bytes;
+        uint8_t transition_kind;
         uint64_t owner_bits;
         uint64_t state;
         const void *identity;
@@ -111,6 +113,7 @@ typedef struct {
         void *governor;
         uint64_t bytes;
         uint64_t replacement_bytes;
+        uint8_t transition_kind;
         uint64_t owner_bits;
         uint64_t state;
         const void *identity;
@@ -121,6 +124,7 @@ typedef struct {
         void *governor;
         uint64_t bytes;
         uint64_t replacement_bytes;
+        uint8_t transition_kind;
         uint64_t owner_bits;
         uint64_t state;
         const void *identity;

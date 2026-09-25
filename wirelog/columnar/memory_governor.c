@@ -532,6 +532,7 @@ wl_columnar_memory_reservation_move(
         return false;
     destination->governor = source->governor;
     destination->bytes = source->bytes;
+    destination->transition_kind = source->transition_kind;
     atomic_store_explicit(&destination->owner_bits,
         atomic_load_explicit(&source->owner_bits, memory_order_relaxed),
         memory_order_relaxed);
@@ -539,6 +540,7 @@ wl_columnar_memory_reservation_move(
     destination->identity = destination;
     source->governor = NULL;
     source->bytes = 0;
+    source->transition_kind = WL_COLUMNAR_MEMORY_TRANSITION_NONE;
     atomic_store_explicit(&source->owner_bits, 0, memory_order_relaxed);
     atomic_store_explicit(&source->state,
         WL_COLUMNAR_MEMORY_RESERVATION_EMPTY, memory_order_release);
@@ -583,6 +585,7 @@ reserve_internal(wl_columnar_memory_governor_t *governor,
     }
     reservation->governor = governor;
     reservation->bytes = bytes;
+    reservation->transition_kind = WL_COLUMNAR_MEMORY_TRANSITION_NONE;
     atomic_store_explicit(&reservation->owner_bits, 0, memory_order_relaxed);
     old = atomic_load_explicit(&governor->reserved_bytes, memory_order_relaxed);
     for (;;) {
@@ -799,24 +802,35 @@ reserve_replacement_overlap(wl_columnar_memory_governor_t *governor,
     }
 }
 
-wl_columnar_memory_admission_status_t
-wl_columnar_memory_begin_replacement(
-    wl_columnar_memory_reservation_t *reservation, uint64_t new_bytes)
+static wl_columnar_memory_admission_status_t
+begin_overlap(wl_columnar_memory_reservation_t *reservation,
+    uint64_t additional_bytes, wl_columnar_memory_transition_kind_t kind)
 {
     wl_columnar_memory_admission_status_t status;
 
-    if (!reservation_identity_valid(reservation) || new_bytes == 0
+    if (!reservation_identity_valid(reservation) || additional_bytes == 0
         || !claim_reservation_state(reservation,
         WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED,
         WL_COLUMNAR_MEMORY_RESERVATION_REPLACEMENT_ADMITTING))
         return WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
-    if (new_bytes > reservation->bytes || !reservation->governor) {
+    if (!reservation->governor
+        || reservation->transition_kind != WL_COLUMNAR_MEMORY_TRANSITION_NONE
+        || (kind == WL_COLUMNAR_MEMORY_TRANSITION_REPLACEMENT
+        && additional_bytes > reservation->bytes)) {
         atomic_store_explicit(&reservation->state,
             WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED,
             memory_order_release);
         return WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
     }
-    status = reserve_replacement_overlap(reservation->governor, new_bytes);
+    if (kind == WL_COLUMNAR_MEMORY_TRANSITION_GROWTH
+        && additional_bytes > UINT64_MAX - reservation->bytes) {
+        atomic_store_explicit(&reservation->state,
+            WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED,
+            memory_order_release);
+        return WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW;
+    }
+    status = reserve_replacement_overlap(reservation->governor,
+            additional_bytes);
     if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
         && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
         atomic_store_explicit(&reservation->state,
@@ -824,10 +838,27 @@ wl_columnar_memory_begin_replacement(
             memory_order_release);
         return status;
     }
-    reservation->replacement_bytes = new_bytes;
+    reservation->replacement_bytes = additional_bytes;
+    reservation->transition_kind = (uint8_t)kind;
     atomic_store_explicit(&reservation->state,
         WL_COLUMNAR_MEMORY_RESERVATION_REPLACING, memory_order_release);
     return status;
+}
+
+wl_columnar_memory_admission_status_t
+wl_columnar_memory_begin_replacement(
+    wl_columnar_memory_reservation_t *reservation, uint64_t new_bytes)
+{
+    return begin_overlap(reservation, new_bytes,
+               WL_COLUMNAR_MEMORY_TRANSITION_REPLACEMENT);
+}
+
+wl_columnar_memory_admission_status_t
+wl_columnar_memory_begin_growth(
+    wl_columnar_memory_reservation_t *reservation, uint64_t additional_bytes)
+{
+    return begin_overlap(reservation, additional_bytes,
+               WL_COLUMNAR_MEMORY_TRANSITION_GROWTH);
 }
 
 bool
@@ -842,6 +873,13 @@ wl_columnar_memory_commit_replacement(
         WL_COLUMNAR_MEMORY_RESERVATION_REPLACING,
         WL_COLUMNAR_MEMORY_RESERVATION_COMMITTING))
         return false;
+    if (reservation->transition_kind
+        != WL_COLUMNAR_MEMORY_TRANSITION_REPLACEMENT) {
+        atomic_store_explicit(&reservation->state,
+            WL_COLUMNAR_MEMORY_RESERVATION_REPLACING,
+            memory_order_release);
+        return false;
+    }
     old_bytes = reservation->bytes;
     new_bytes = reservation->replacement_bytes;
     if (new_bytes == 0 || new_bytes > old_bytes
@@ -853,14 +891,41 @@ wl_columnar_memory_commit_replacement(
     }
     reservation->bytes = new_bytes;
     reservation->replacement_bytes = 0;
+    reservation->transition_kind = WL_COLUMNAR_MEMORY_TRANSITION_NONE;
     atomic_store_explicit(&reservation->state,
         WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED, memory_order_release);
     return true;
 }
 
 bool
-wl_columnar_memory_rollback_replacement(
+wl_columnar_memory_commit_growth(
     wl_columnar_memory_reservation_t *reservation)
+{
+    if (!reservation_identity_valid(reservation)
+        || !claim_reservation_state(reservation,
+        WL_COLUMNAR_MEMORY_RESERVATION_REPLACING,
+        WL_COLUMNAR_MEMORY_RESERVATION_COMMITTING))
+        return false;
+    if (reservation->transition_kind
+        != WL_COLUMNAR_MEMORY_TRANSITION_GROWTH
+        || reservation->replacement_bytes == 0
+        || reservation->replacement_bytes > UINT64_MAX - reservation->bytes) {
+        atomic_store_explicit(&reservation->state,
+            WL_COLUMNAR_MEMORY_RESERVATION_REPLACING,
+            memory_order_release);
+        return false;
+    }
+    reservation->bytes += reservation->replacement_bytes;
+    reservation->replacement_bytes = 0;
+    reservation->transition_kind = WL_COLUMNAR_MEMORY_TRANSITION_NONE;
+    atomic_store_explicit(&reservation->state,
+        WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED, memory_order_release);
+    return true;
+}
+
+static bool
+rollback_overlap(wl_columnar_memory_reservation_t *reservation,
+    wl_columnar_memory_transition_kind_t kind)
 {
     uint64_t replacement_bytes;
 
@@ -869,6 +934,12 @@ wl_columnar_memory_rollback_replacement(
         WL_COLUMNAR_MEMORY_RESERVATION_REPLACING,
         WL_COLUMNAR_MEMORY_RESERVATION_COMMITTING))
         return false;
+    if (reservation->transition_kind != kind) {
+        atomic_store_explicit(&reservation->state,
+            WL_COLUMNAR_MEMORY_RESERVATION_REPLACING,
+            memory_order_release);
+        return false;
+    }
     replacement_bytes = reservation->replacement_bytes;
     if (replacement_bytes == 0
         || !credit_reservation(reservation->governor, replacement_bytes)) {
@@ -878,9 +949,26 @@ wl_columnar_memory_rollback_replacement(
         return false;
     }
     reservation->replacement_bytes = 0;
+    reservation->transition_kind = WL_COLUMNAR_MEMORY_TRANSITION_NONE;
     atomic_store_explicit(&reservation->state,
         WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED, memory_order_release);
     return true;
+}
+
+bool
+wl_columnar_memory_rollback_replacement(
+    wl_columnar_memory_reservation_t *reservation)
+{
+    return rollback_overlap(reservation,
+               WL_COLUMNAR_MEMORY_TRANSITION_REPLACEMENT);
+}
+
+bool
+wl_columnar_memory_rollback_growth(
+    wl_columnar_memory_reservation_t *reservation)
+{
+    return rollback_overlap(reservation,
+               WL_COLUMNAR_MEMORY_TRANSITION_GROWTH);
 }
 
 bool
@@ -946,11 +1034,14 @@ finish_reservation(wl_columnar_memory_reservation_t *reservation,
             && credit_reservation(reservation->governor, bytes);
     }
     WL_MEMORY_TEST_POINT(reservation, WL_COLUMNAR_MEMORY_TEST_RELEASE_CREDITED);
+    if (ok) {
+        if (state == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING)
+            reservation->replacement_bytes = 0;
+        reservation->transition_kind = WL_COLUMNAR_MEMORY_TRANSITION_NONE;
+    }
     atomic_store_explicit(&reservation->state,
         ok ? WL_COLUMNAR_MEMORY_RESERVATION_RELEASED : state,
         memory_order_release);
-    if (ok && state == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING)
-        reservation->replacement_bytes = 0;
     return ok;
 }
 
