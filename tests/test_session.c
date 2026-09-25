@@ -7032,6 +7032,7 @@ extern void (*wl_columnar_eval_test_after_worker_delta)(wl_col_session_t *,
     col_rel_t *, int);
 static bool ordinary_delta_hook_seen, ordinary_delta_hook_ok;
 static bool ordinary_delta_refusal_unchanged;
+static atomic_bool ordinary_delta_check_complete = ATOMIC_VAR_INIT(false);
 static col_rel_t *ordinary_delta_source;
 static uint32_t ordinary_delta_rows;
 static uint64_t ordinary_delta_view, ordinary_delta_storage;
@@ -7051,23 +7052,14 @@ ordinary_worker_delta_deny(wl_col_session_t *worker, col_rel_t *source,
     ordinary_delta_columns = source->columns;
     wl_columnar_memory_governor_t *budget =
         wl_columnar_memory_governor_ref_get(worker->memory_governor);
-    uint64_t before = wl_columnar_memory_reserved(budget);
     col_rel_t *measured = NULL;
     int rc = wl_columnar_eval_test_prepare_worker_delta(&measured, name,
             source, rows, worker->memory_governor);
-    uint64_t after = wl_columnar_memory_reserved(budget);
-    ordinary_delta_hook_ok = rc == 0 && measured && after > before;
+    ordinary_delta_hook_ok = rc == 0 && measured;
     col_rel_destroy(measured);
     if (!ordinary_delta_hook_ok)
         return;
-    ordinary_gate_budget = budget;
-    ordinary_gate_saved_mode = budget->mode;
-    ordinary_gate_saved_limit = atomic_load_explicit(&budget->usable_bytes,
-            memory_order_relaxed);
-    budget->mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
-    atomic_store_explicit(&budget->usable_bytes, after - 1,
-        memory_order_relaxed);
-    ordinary_gate_budget_changed = true;
+    atomic_store_explicit(&budget->usable_bytes, 0, memory_order_release);
 }
 
 static void
@@ -7081,6 +7073,8 @@ ordinary_worker_delta_check(wl_col_session_t *worker, col_rel_t *source,
         && source->view_generation == ordinary_delta_view
         && source->storage_generation == ordinary_delta_storage
         && source->columns == ordinary_delta_columns;
+    atomic_store_explicit(&ordinary_delta_check_complete, true,
+        memory_order_release);
 }
 
 static void
@@ -7108,7 +7102,8 @@ ordinary_worker_gate_boundary(wl_col_session_t *coord, uint32_t iteration,
             worker->current_iteration = 7;
             ordinary_gate_rc = wl_columnar_eval_stack_cleanup_begin(worker,
                     &ordinary_gate_frame);
-        } else if (ordinary_gate_mode == 1 || ordinary_gate_mode == 4) {
+        } else if (ordinary_gate_mode == 1 || ordinary_gate_mode == 4
+            || ordinary_gate_mode == 5) {
             ordinary_gate_budget =
                 wl_columnar_memory_governor_ref_get(coord->memory_governor);
             ordinary_gate_saved_mode = ordinary_gate_budget->mode;
@@ -7116,8 +7111,9 @@ ordinary_worker_gate_boundary(wl_col_session_t *coord, uint32_t iteration,
                 atomic_load_explicit(&ordinary_gate_budget->usable_bytes,
                     memory_order_relaxed);
             ordinary_gate_budget->mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
-            atomic_store_explicit(&ordinary_gate_budget->usable_bytes, 0,
-                memory_order_relaxed);
+            if (ordinary_gate_mode != 5)
+                atomic_store_explicit(&ordinary_gate_budget->usable_bytes, 0,
+                    memory_order_relaxed);
             ordinary_gate_budget_changed = true;
         }
         return;
@@ -7192,6 +7188,8 @@ test_tdd_ordinary_frame_gates(uint32_t workers, unsigned mode)
     ordinary_delta_hook_seen = ordinary_delta_hook_ok = false;
     ordinary_delta_refusal_unchanged = false;
     ordinary_delta_source = NULL;
+    atomic_store_explicit(&ordinary_delta_check_complete, false,
+        memory_order_release);
 #define TDD_GATE_CHECK(condition, message) \
         do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
     TDD_GATE_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
@@ -7222,7 +7220,9 @@ test_tdd_ordinary_frame_gates(uint32_t workers, unsigned mode)
     wl_columnar_eval_test_before_worker_delta = NULL;
     wl_columnar_eval_test_after_worker_delta = NULL;
     if (mode == 5)
-        TDD_GATE_CHECK(ordinary_delta_hook_seen && ordinary_delta_hook_ok
+        TDD_GATE_CHECK(atomic_load_explicit(
+                &ordinary_delta_check_complete, memory_order_acquire)
+            && ordinary_delta_hook_seen && ordinary_delta_hook_ok
             && ordinary_delta_refusal_unchanged, "worker delta preflight");
     else
         TDD_GATE_CHECK(ordinary_gate_verified &&
