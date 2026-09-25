@@ -138,7 +138,10 @@ typedef struct {
      * implementation now publishes generations at the end of the relation.
      * Do not move anything in the legacy prefix to make this mirror fit. */
     int64_t **retract_backup_columns;
+    col_delta_timestamp_t *retract_backup_timestamps;
+    uint32_t retract_backup_timestamp_capacity;
     uint32_t retract_backup_nrows;
+    uint32_t retract_backup_base_nrows;
     uint32_t retract_backup_capacity;
     uint32_t retract_backup_sorted_nrows;
     bool *col_shared;
