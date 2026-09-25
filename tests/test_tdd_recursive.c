@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <xxhash.h>
 
 #ifdef WL_TEST_ALLOC_WRAP
 void *__real_malloc(size_t size);
@@ -4914,9 +4915,45 @@ test_dedup_init_allocation_rollback(void)
 #endif
 }
 
+static int
+test_wide_dedup_hash_parity(uint32_t width)
+{
+    col_rel_t *rel = col_rel_new_auto("wide-dedup", width);
+    int64_t values[2][32] = { { 0 } };
+    int ok = rel != NULL;
+    for (uint32_t row = 0; row < 2 && ok; row++) {
+        for (uint32_t col = 0; col < width; col++)
+            values[row][col] = (int64_t)(row ? 37u * col + 11u
+                : 101u - 13u * col);
+        ok = col_rel_append_row(rel, values[row]) == 0;
+    }
+    for (uint32_t row = 0; row < 2 && ok; row++) {
+        uint64_t expected = XXH3_64bits(values[row],
+                (size_t)width * sizeof(int64_t));
+#ifdef WL_TEST_ALLOC_WRAP
+        allocation_calls = 0;
+        allocation_fail_at = 0;
+#endif
+        uint64_t actual = wl_columnar_eval_dedup_row_hash(rel, row);
+#ifdef WL_TEST_ALLOC_WRAP
+        ok = allocation_calls == 0;
+        allocation_fail_at = -1;
+#endif
+        ok = ok && actual == (expected ? expected : 1u);
+    }
+    col_rel_destroy(rel);
+    return ok ? 0 : -1;
+}
+
 int
 main(void)
 {
+    TEST("wide dedup hash: 9 columns match one-shot without allocation");
+    if (test_wide_dedup_hash_parity(9) == 0) PASS();
+    else FAIL("9-column streaming parity or allocation");
+    TEST("wide dedup hash: 32 columns match one-shot without allocation");
+    if (test_wide_dedup_hash_parity(32) == 0) PASS();
+    else FAIL("32-column streaming parity or allocation");
 #ifdef WL_TEST_ALLOC_WRAP
     test_tdd_queue_ring_admission();
     test_tdd_queue_create_failure();
