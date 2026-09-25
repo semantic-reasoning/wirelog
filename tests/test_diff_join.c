@@ -90,6 +90,70 @@ destroy_mock_session(wl_col_session_t *s)
     free(s);
 }
 
+static wl_columnar_memory_governor_ref_t *
+make_test_governor(uint64_t budget)
+{
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    resolution.budget_bytes = budget;
+    resolution.usable_bytes = budget;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    return wl_columnar_memory_governor_ref_create(&resolution);
+}
+
+static void
+test_governed_auto_relation_schema(void)
+{
+    uint64_t timestamp_bytes = (uint64_t)COL_REL_INIT_CAP
+        * sizeof(col_delta_timestamp_t);
+    wl_columnar_memory_governor_ref_t *governor
+        = make_test_governor(timestamp_bytes);
+    col_rel_t *rel = NULL;
+    col_delta_timestamp_t *timestamps;
+    int64_t empty_row = 0;
+    bool denied = false;
+    int rc;
+
+    TEST("governed auto schema handles nullary timestamps and rollback");
+    ASSERT_TRUE(governor != NULL, "schema governor created");
+    rc = wl_columnar_relation_new_auto_governed("nullary_ts", 0,
+            COL_REL_INIT_CAP, true, governor, &rel);
+    ASSERT_TRUE(rc == 0 && rel && rel->capacity == COL_REL_INIT_CAP
+        && rel->timestamp_capacity == COL_REL_INIT_CAP
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)) == timestamp_bytes,
+        "nullary timestamp capacity and reservation stay consistent");
+    timestamps = rel->timestamps;
+    rc = col_rel_append_rows_atomic(rel, &empty_row, 1, 0, &denied);
+    ASSERT_TRUE(rc == 0 && !denied && rel->nrows == 1
+        && rel->timestamps == timestamps
+        && rel->timestamp_capacity == COL_REL_INIT_CAP
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)) == timestamp_bytes,
+        "nullary append preserves its admitted timestamp buffer");
+    col_rel_destroy(rel);
+    rel = NULL;
+    ASSERT_TRUE(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)) == 0,
+        "nullary timestamp reservation releases on destroy");
+    wl_columnar_memory_governor_ref_release(governor);
+
+    governor = make_test_governor(1024u * 1024u);
+    ASSERT_TRUE(governor != NULL, "rollback governor created");
+    wl_columnar_relation_test_watch_next_rollback_cleanup();
+    wl_columnar_relation_test_fail_next_reservation_commit();
+    rc = wl_columnar_relation_new_auto_governed("failed_schema", 2,
+            COL_REL_INIT_CAP, true, governor, &rel);
+    ASSERT_TRUE(rc == ENOMEM && rel == NULL
+        && wl_columnar_relation_test_rollback_cleanup_was_ordered()
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)) == 0,
+        "schema payload retires before its denied reservation is rolled back");
+    wl_columnar_memory_governor_ref_release(governor);
+    PASS;
+}
+
 static col_rel_t *
 make_large_left_rel(void)
 {
@@ -1883,19 +1947,26 @@ test_diff_join_batch_signed_timestamps(void)
     const uint32_t key = 0;
     char *left_keys[] = { "k" };
     char *right_keys[] = { "k" };
+    uint32_t project_indices[] = { 1u, 3u };
     wl_plan_op_t op = { 0 };
     wl_col_session_t *s = make_mock_session();
     col_rel_t *left = make_rel("left_batch", 2, names);
     col_rel_t *right = make_rel("right_batch", 2, names);
     col_rel_t *out = NULL;
+    wl_columnar_memory_governor_ref_t *source_governor = NULL;
+    wl_columnar_memory_governor_ref_t *session_governor = NULL;
+    wl_columnar_memory_governor_ref_t *right_governor = NULL;
+    col_rel_t *left_unmanaged = NULL;
     wl_columnar_continuation_t *cont = NULL;
     int64_t row[] = { 1, 10 };
+    uint64_t scratch_bytes;
+    uint64_t admission_budget;
     int rc;
 
-    TEST("differential bounded join preserves signed timestamps");
+    TEST("differential bounded join grows timestamped scratch safely");
     ASSERT_TRUE(s && left && right, "differential batch fixture allocation");
     ASSERT_TRUE(col_rel_append_row(left, row) == 0, "left batch row");
-    for (int64_t i = 0; i < 3; i++) {
+    for (int64_t i = 0; i < 130; i++) {
         int64_t right_row[] = { 1, 100 + i };
         ASSERT_TRUE(col_rel_append_row(right, right_row) == 0,
             "right batch row");
@@ -1908,34 +1979,84 @@ test_diff_join_batch_signed_timestamps(void)
     left->timestamps[0].stratum = 3;
     left->timestamps[0].worker = 2;
     left->timestamps[0]._reserved = 0;
-    right->timestamps[0].multiplicity = 1;
-    right->timestamps[0].iteration = 99;
-    right->timestamps[0].stratum = 98;
-    right->timestamps[0].worker = 97;
-    right->timestamps[1].multiplicity = -1;
-    right->timestamps[2].multiplicity = 2;
-    ASSERT_TRUE(session_add_rel(s, right) == 0, "right relation registered");
+    for (uint32_t i = 0; i < right->nrows; i++) {
+        right->timestamps[i].multiplicity = (int64_t[]){ 1, -1, 2 }[i % 3u];
+        right->timestamps[i].iteration = 99;
+        right->timestamps[i].stratum = 98;
+        right->timestamps[i].worker = 97;
+    }
     op.op = WL_PLAN_OP_JOIN;
     op.right_relation = "right_batch";
     op.left_keys = (const char *const *)left_keys;
     op.right_keys = (const char *const *)right_keys;
     op.key_count = 1;
-    s->join_batch_bytes = 64;
+    op.project_indices = project_indices;
+    op.project_count = 2;
+    out = col_rel_new_auto("diff_batch_out", 2);
+    ASSERT_TRUE(out && col_join_set_output_types(out, left, right, &op) == 0
+        && col_rel_enable_timestamps(out) == 0
+        && col_rel_retained_bytes_for(out, 64u, &scratch_bytes),
+        "source and scratch footprints measured");
+    admission_budget = scratch_bytes;
+    source_governor = make_test_governor(admission_budget);
+    ASSERT_TRUE(source_governor
+        && col_rel_attach_memory_governor(left, source_governor) == 0,
+        "source-only governor attached with exact initial capacity budget");
+    ASSERT_TRUE(session_add_rel(s, right) == 0, "right relation registered");
+    /* The initial 64-row scratch exactly fits.  Its first 64->128 growth is
+     * denied, after which raising the source governor permits retry. */
+    s->join_batch_bytes = 8192;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            source_governor)->usable_bytes, scratch_bytes - 1u,
+        memory_order_release);
+    int create_denied_rc = col_diff_join_batch_producer_create(s, &op, left,
+            false, &key, &key, 1, s->join_batch_bytes, &cont);
+    ASSERT_TRUE(create_denied_rc == ENOSPC && cont == NULL
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(source_governor)) == 0,
+        "initial scratch denial is ENOSPC and leaves no reservation");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            source_governor)->usable_bytes, scratch_bytes,
+        memory_order_release);
     ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, left, false,
         &key, &key, 1, s->join_batch_bytes, &cont) == 0,
         "differential batch producer created");
+    ASSERT_TRUE(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(source_governor))
+        == admission_budget,
+        "initial scratch capacity is admitted against the source governor");
     ASSERT_TRUE(col_rel_destroy_checked(left) == EBUSY,
         "left relation remains protected while continuation is live");
-    out = col_rel_new_auto("diff_batch_out", 4);
-    ASSERT_TRUE(out && col_join_set_output_types(out, left, right, &op) == 0
-        && col_rel_enable_timestamps(out) == 0,
-        "differential batch output created");
-    rc = col_join_batch_run_to_relation(cont, s, out);
-    ASSERT_TRUE(rc == 0 && out->nrows == 3 && out->timestamps,
+    col_join_batch_relation_sink_t sink_context;
+    wl_columnar_continuation_sink_t sink;
+    ASSERT_TRUE(col_join_batch_relation_sink_init(&sink_context, &sink, s,
+        out) == 0, "differential batch output sink created");
+    const wl_columnar_continuation_cursor_t *cursor
+        = wl_columnar_continuation_cursor(cont);
+    wl_columnar_continuation_cursor_t cursor_before = *cursor;
+    wl_columnar_continuation_status_t status
+        = wl_columnar_continuation_publish(cont, &sink);
+    ASSERT_TRUE(status == WL_COLUMNAR_CONTINUATION_RESERVATION_DENIED
+        && out->nrows == 0
+        && wl_columnar_continuation_cursor(cont)->sequence
+        == cursor_before.sequence
+        && wl_columnar_continuation_cursor(cont)->position
+        == cursor_before.position,
+        "growth denial leaves output and committed cursor unchanged");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            source_governor)->usable_bytes, admission_budget + 1024u * 1024u,
+        memory_order_release);
+    status = wl_columnar_continuation_publish(cont, &sink);
+    rc = status == WL_COLUMNAR_CONTINUATION_OK ? 0 : EIO;
+    if (rc == 0 && wl_columnar_continuation_publish(cont, &sink)
+        != WL_COLUMNAR_CONTINUATION_DONE)
+        rc = EIO;
+    ASSERT_TRUE(rc == 0 && out->nrows == 130 && out->timestamps,
         "differential batch completes across multiple batches");
     bool seen_neg4 = false;
     bool seen_pos2 = false;
     bool seen_neg2 = false;
+    bool seen_rows[130] = { false };
     for (uint32_t i = 0; i < out->nrows; i++) {
         switch (out->timestamps[i].multiplicity) {
         case -4:
@@ -1954,14 +2075,106 @@ test_diff_join_batch_signed_timestamps(void)
     ASSERT_TRUE(seen_neg4 && seen_pos2 && seen_neg2,
         "each signed multiplicity product is preserved");
     for (uint32_t i = 0; i < out->nrows; i++) {
-        ASSERT_TRUE(out->timestamps[i].iteration == 7
+        int64_t right_value = col_rel_get(out, i, 1);
+        ASSERT_TRUE(right_value >= 100 && right_value < 230,
+            "output match is within the exact oracle domain");
+        uint32_t source_row = (uint32_t)(right_value - 100);
+        int64_t expected_mult = (int64_t[]){ -2, 2, -4 }[source_row % 3u];
+        ASSERT_TRUE(col_rel_get(out, i, 0) == 10
+            && col_rel_get(out, i, 1) == right_value
+            && !seen_rows[source_row]
+            && out->timestamps[i].multiplicity == expected_mult
+            && out->timestamps[i].iteration == 7
             && out->timestamps[i].stratum == 3
             && out->timestamps[i].worker == 2
             && out->timestamps[i]._reserved == 0,
             "delta-driving provenance is preserved across differential join");
+        seen_rows[source_row] = true;
     }
+    for (uint32_t i = 0; i < 130; i++)
+        ASSERT_TRUE(seen_rows[i], "every input match appears exactly once");
 
     wl_columnar_continuation_destroy(cont);
+    ASSERT_TRUE(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(source_governor)) == 0,
+        "producer destruction releases scratch reservation exactly once");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            source_governor)->usable_bytes, scratch_bytes * 4u,
+        memory_order_release);
+    ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, left, false,
+        &key, &key, 1, s->join_batch_bytes, &cont) == 0,
+        "producer created for allocation-failure mapping");
+    wl_columnar_relation_test_fail_next_prepare_resize();
+    rc = col_join_batch_run_to_relation(cont, s, out);
+    ASSERT_TRUE(rc == ENOMEM && out->nrows == 130,
+        "producer allocation failure remains ENOMEM through the runner");
+    wl_columnar_continuation_destroy(cont);
+    cont = NULL;
+    ASSERT_TRUE(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(source_governor)) == 0,
+        "allocation failure releases scratch reservation");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            source_governor)->usable_bytes, scratch_bytes,
+        memory_order_release);
+    ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, left, false,
+        &key, &key, 1, s->join_batch_bytes, &cont) == 0,
+        "producer created for runner denial mapping");
+    rc = col_join_batch_run_to_relation(cont, s, out);
+    ASSERT_TRUE(rc == ENOSPC && out->nrows == 130,
+        "runner maps scratch admission denial to ENOSPC");
+    wl_columnar_continuation_destroy(cont);
+    cont = NULL;
+    ASSERT_TRUE(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(source_governor)) == 0,
+        "runner denial releases scratch reservation after destruction");
+    session_governor = make_test_governor(1024u * 1024u);
+    ASSERT_TRUE(session_governor != NULL, "session governor created");
+    s->memory_governor = session_governor;
+    col_diff_arrangement_pin_t governor_pin = { 0 };
+    ASSERT_TRUE(col_session_pin_diff_arrangement(s, "right_batch", right,
+        &key, 1, &governor_pin) == 0,
+        "arrangement is pinned under the session governor");
+    col_diff_arrangement_pin_release(&governor_pin);
+    uint64_t session_baseline = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(session_governor));
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            source_governor)->usable_bytes, 0, memory_order_release);
+    int session_create_rc = col_diff_join_batch_producer_create(s, &op, left,
+            false, &key, &key, 1, s->join_batch_bytes, &cont);
+    uint64_t session_after_create = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(session_governor));
+    ASSERT_TRUE(session_create_rc == 0
+        && session_after_create >= session_baseline + scratch_bytes
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(source_governor)) == 0,
+        "session governor takes precedence over both source governors");
+    wl_columnar_continuation_destroy(cont);
+    cont = NULL;
+    s->memory_governor = NULL;
+    uint64_t session_after_destroy = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(session_governor));
+    ASSERT_TRUE(session_after_create >= session_after_destroy + scratch_bytes,
+        "session-governed scratch reservation is released");
+    right_governor = make_test_governor(1024u * 1024u);
+    left_unmanaged = make_rel("left_unmanaged", 2, names);
+    ASSERT_TRUE(right_governor && left_unmanaged
+        && col_rel_attach_memory_governor(right, right_governor) == 0
+        && col_rel_append_row(left_unmanaged, (int64_t[]){ 1, 42 }) == 0,
+        "right-only governor fallback fixture created");
+    uint64_t right_baseline = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(right_governor));
+    ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, left_unmanaged,
+        false, &key, &key, 1, s->join_batch_bytes, &cont) == 0
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(right_governor))
+        >= right_baseline + scratch_bytes,
+        "right source governor admits scratch when left is unmanaged");
+    wl_columnar_continuation_destroy(cont);
+    cont = NULL;
+    ASSERT_TRUE(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(right_governor)) ==
+        right_baseline,
+        "right-governed scratch reservation is released");
     ASSERT_TRUE(atomic_load_explicit(&right->source_access.state,
         memory_order_relaxed) == 0
         && atomic_load_explicit(&right->descriptor_access.state,
@@ -1969,9 +2182,13 @@ test_diff_join_batch_signed_timestamps(void)
         "producer destruction releases both right-side readers");
     ASSERT_TRUE(col_rel_append_row(right, (int64_t[]){ 2, 200 }) == 0,
         "right relation can be appended after producer destruction");
+    col_rel_destroy(left_unmanaged);
     col_rel_destroy(out);
     col_rel_destroy(left);
     destroy_mock_session(s);
+    wl_columnar_memory_governor_ref_release(source_governor);
+    wl_columnar_memory_governor_ref_release(session_governor);
+    wl_columnar_memory_governor_ref_release(right_governor);
     PASS;
 }
 
@@ -2129,6 +2346,7 @@ main(void)
     test_diff_arrangement_txn_ledger_accounting();
     test_diff_arrangement_pin_lifetime();
     test_diff_join_batch_signed_timestamps();
+    test_governed_auto_relation_schema();
     test_diff_join_batch_rejects_invalid_resume_cursor();
     test_diff_join_batch_last_row_multimatch_continuation();
     test_late_abort_does_not_advance_arrangement();

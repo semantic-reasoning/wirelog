@@ -3971,6 +3971,7 @@ test_diff_join_exe = executable(
   'test_diff_join',
   files('test_diff_join.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWL_TEST_RELATION_RESIZE_HOOK=1'],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],
 )

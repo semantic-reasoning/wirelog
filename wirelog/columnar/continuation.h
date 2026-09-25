@@ -22,6 +22,8 @@ typedef enum {
     WL_COLUMNAR_CONTINUATION_RESERVATION_DENIED,
     WL_COLUMNAR_CONTINUATION_SINK_FAILURE,
     WL_COLUMNAR_CONTINUATION_COMMIT_FAILURE,
+    /* Producer could not allocate its private scratch payload. */
+    WL_COLUMNAR_CONTINUATION_ALLOCATION_FAILURE,
     /* The sink reports that its side effect is durable, but cannot report an
      * unambiguous successful return to its caller.  The cursor has already
      * advanced; retrying the batch would duplicate the side effect. */
