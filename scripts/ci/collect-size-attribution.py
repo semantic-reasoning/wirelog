@@ -703,25 +703,67 @@ def forensic_profile_matches(authoritative_path: Path, forensic_path: Path,
                              map_path: Path) -> tuple[bool, list[str]]:
     authoritative = json.loads(authoritative_path.read_text(encoding="utf-8"))
     forensic = json.loads(forensic_path.read_text(encoding="utf-8"))
+    if not isinstance(authoritative, dict) or not isinstance(forensic, dict):
+        return False, ["malformed profile root"]
     authoritative.pop("source_sha", None)
     forensic.pop("source_sha", None)
     expected_map_flag = f"-Wl,-Map={map_path}"
     found_map_flags = 0
-    for entry in forensic.get("effective_link_arguments", []):
-        parameters = entry.get("parameters", [])
+    differences: list[str] = []
+
+    def strip_map_flags(parameters: Any, field: str, *, required: bool) -> tuple[list[str] | None, int]:
+        if not isinstance(parameters, list) or any(not isinstance(item, str) for item in parameters):
+            differences.append(f"malformed linker argument list: {field}")
+            return None, 0
         kept = []
+        found = 0
         for parameter in parameters:
             if parameter == expected_map_flag:
-                found_map_flags += 1
-            elif "-Wl,-Map=" in parameter or parameter == "-Map" or parameter.startswith("-Map="):
-                return False, ["unexpected or split linker map argument"]
+                found += 1
+            elif (parameter == "-Map" or
+                  parameter.startswith(("-Wl,-Map", "-Map="))):
+                differences.append("unexpected or split linker map argument")
+                return None, found
             else:
                 kept.append(parameter)
-        entry["parameters"] = kept
+        if found > 1:
+            differences.append(f"duplicate linker map flag in {field}")
+        if required and found != 1:
+            differences.append(f"expected exactly one linker map flag, found {found}")
+        return kept, found
+
+    effective = forensic.get("effective_link_arguments")
+    if not isinstance(effective, list):
+        differences.append("malformed effective_link_arguments")
+    else:
+        for index, entry in enumerate(effective):
+            if not isinstance(entry, dict):
+                differences.append(f"malformed effective linker argument entry: {index}")
+                continue
+            kept, found = strip_map_flags(entry.get("parameters"),
+                                          f"effective_link_arguments[{index}]", required=False)
+            found_map_flags += found
+            if kept is not None:
+                entry["parameters"] = kept
+
+    options = forensic.get("options")
+    if "options" not in forensic:
+        options = None
+    elif not isinstance(options, dict):
+        differences.append("malformed options")
+    else:
+        for key in ("c_link_args", "cpp_link_args"):
+            if key not in options:
+                continue
+            kept, _ = strip_map_flags(options[key], f"options.{key}", required=False)
+            if kept is not None:
+                options[key] = kept
+
     if found_map_flags != 1:
-        return False, [f"expected exactly one linker map flag, found {found_map_flags}"]
-    differences = sorted(key for key in set(authoritative) | set(forensic)
-                         if authoritative.get(key) != forensic.get(key))
+        differences.append(f"expected exactly one linker map flag, found {found_map_flags}")
+    differences.extend(sorted(key for key in set(authoritative) | set(forensic)
+                              if authoritative.get(key) != forensic.get(key)))
+    differences = sorted(set(differences))
     return not differences, differences
 
 
