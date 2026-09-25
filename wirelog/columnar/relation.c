@@ -698,31 +698,52 @@ col_rel_timestamp_ledger_bytes(const col_rel_t *r)
 uint64_t
 col_rel_transport_bytes(const col_rel_t *r)
 {
-    uint64_t cols = col_rel_owned_ledger_bytes(r);
-    uint64_t ts = col_rel_timestamp_ledger_bytes(r);
-    if (cols > UINT64_MAX - ts)
-        return UINT64_MAX;
-    return cols + ts;
+    uint64_t bytes;
+    return col_rel_retained_live_bytes(r, &bytes) ? bytes : UINT64_MAX;
+}
+
+/* Count prospective or live heap buffers with independent physical widths.
+* A nonzero timestamp width represents an allocated timestamps[] buffer. */
+static bool
+col_rel_retained_shape_bytes(uint32_t owned_columns,
+    uint32_t column_capacity, uint32_t timestamp_capacity, uint64_t *out)
+{
+    uint64_t columns;
+    uint64_t timestamps;
+
+    if (!out || !wl_columnar_memory_size_mul(owned_columns,
+        column_capacity, &columns)
+        || !wl_columnar_memory_size_mul(columns, sizeof(int64_t), &columns)
+        || !wl_columnar_memory_size_mul(timestamp_capacity,
+        sizeof(col_delta_timestamp_t), &timestamps)
+        || !wl_columnar_memory_size_add(columns, timestamps, out))
+        return false;
+    return true;
 }
 
 static bool
-col_rel_retained_bytes(uint32_t ncols, uint32_t capacity, bool timestamps,
-    uint64_t *out)
+col_rel_timestamp_shape_valid(const col_rel_t *r)
 {
-    uint64_t columns;
-    uint64_t timestamp_bytes = 0;
+    return r && (r->timestamps != NULL) == (r->timestamp_capacity != 0)
+           && (!r->timestamps || r->timestamp_capacity >= r->nrows);
+}
 
-    if (!out || !wl_columnar_memory_size_mul(ncols, capacity, &columns)
-        || !wl_columnar_memory_size_mul(columns, sizeof(int64_t), &columns))
+bool
+col_rel_retained_live_bytes(const col_rel_t *r, uint64_t *out)
+{
+    uint32_t owned = 0;
+    if (!r || !out || !col_rel_timestamp_shape_valid(r)
+        || (r->ncols && r->capacity && !r->columns))
         return false;
-    if (timestamps
-        && (!wl_columnar_memory_size_mul(capacity,
-        sizeof(col_delta_timestamp_t), &timestamp_bytes)
-        || !wl_columnar_memory_size_add(columns, timestamp_bytes, out)))
-        return false;
-    if (!timestamps)
-        *out = columns;
-    return true;
+    if (!r->arena_owned && r->columns)
+        for (uint32_t c = 0; c < r->ncols; c++) {
+            if (r->capacity && !r->columns[c])
+                return false;
+            if (!r->col_shared || !r->col_shared[c])
+                owned++;
+        }
+    return col_rel_retained_shape_bytes(owned, r->capacity,
+               r->timestamp_capacity, out);
 }
 
 static void
@@ -910,7 +931,7 @@ col_rel_publish_metadata(col_rel_t *r,
 
 static int
 col_rel_reserve_retained_shape(col_rel_t *r, uint32_t capacity,
-    bool timestamps, wl_columnar_memory_reservation_t *pending,
+    uint32_t timestamp_capacity, wl_columnar_memory_reservation_t *pending,
     int *failure_rc)
 {
     uint64_t bytes;
@@ -934,7 +955,8 @@ col_rel_reserve_retained_shape(col_rel_t *r, uint32_t capacity,
             *failure_rc = EINVAL;
         return -1;
     }
-    if (!col_rel_retained_bytes(r->ncols, capacity, timestamps, &bytes)) {
+    if (!col_rel_retained_shape_bytes(r->ncols, capacity,
+        timestamp_capacity, &bytes)) {
         if (failure_rc)
             *failure_rc = EOVERFLOW;
         return -1;
@@ -970,7 +992,8 @@ col_rel_reserve_retained(col_rel_t *r, uint32_t capacity,
     wl_columnar_memory_reservation_t *pending, int *failure_rc)
 {
     return col_rel_reserve_retained_shape(r, capacity,
-               r->timestamps != NULL, pending, failure_rc);
+               r->timestamps ? (capacity > r->capacity ? capacity
+                   : r->timestamp_capacity) : 0, pending, failure_rc);
 }
 
 static int
@@ -1081,25 +1104,18 @@ col_rel_reserve_transition(col_rel_t *r, uint32_t capacity,
 
     if (failure_rc)
         *failure_rc = ENOMEM;
-    if (!r || !pending || !bytes_out) {
+    if (!r || !pending || !bytes_out || !col_rel_timestamp_shape_valid(r)) {
         if (failure_rc)
             *failure_rc = EINVAL;
         return -1;
     }
     wl_columnar_memory_reservation_init(pending);
-    if (!col_rel_retained_bytes(r->ncols, capacity, false, &bytes)) {
+    if (!col_rel_retained_shape_bytes(r->ncols, capacity,
+        timestamp_capacity, &bytes)) {
         if (failure_rc)
             *failure_rc = EOVERFLOW;
         return -1;
     }
-    uint64_t timestamp_bytes = (uint64_t)timestamp_capacity
-        * sizeof(col_delta_timestamp_t);
-    if (bytes > UINT64_MAX - timestamp_bytes) {
-        if (failure_rc)
-            *failure_rc = EOVERFLOW;
-        return -1;
-    }
-    bytes += timestamp_bytes;
     *bytes_out = bytes;
     if (!r->memory_governor || bytes == 0 ||
         bytes <= r->retained_reserved_bytes)
@@ -1343,6 +1359,8 @@ col_rel_attach_memory_governor(col_rel_t *r,
 
     if (!r || !memory_governor)
         return EINVAL;
+    if (!col_rel_timestamp_shape_valid(r))
+        return EINVAL;
     if (r->memory_governor == memory_governor)
         return 0;
     if (r->memory_governor || r->retained_reserved_bytes != 0
@@ -1459,7 +1477,7 @@ col_rel_enable_timestamps_locked(col_rel_t *r)
     uint64_t new_bytes;
     col_delta_timestamp_t *timestamps;
 
-    if (!r)
+    if (!r || !col_rel_timestamp_shape_valid(r))
         return EINVAL;
     if (r->timestamps || r->capacity == 0)
         return 0;
@@ -1473,10 +1491,11 @@ col_rel_enable_timestamps_locked(col_rel_t *r)
         return 0;
     }
     reserve_rc = col_rel_reserve_retained_shape(
-        r, r->capacity, true, &pending, NULL);
+        r, r->capacity, r->capacity, &pending, NULL);
     if (reserve_rc < 0)
         return ENOMEM;
-    if (!col_rel_retained_bytes(r->ncols, r->capacity, true, &new_bytes))
+    if (!col_rel_retained_shape_bytes(r->ncols, r->capacity,
+        r->capacity, &new_bytes))
         goto fail;
     timestamps = (col_delta_timestamp_t *)calloc(
         r->capacity, sizeof(*timestamps));
@@ -2133,14 +2152,13 @@ col_rel_set_schema_impl_capacity(col_rel_t *r, uint32_t ncols,
     int reserve_failure_rc = ENOMEM;
     uint64_t retained_bytes = 0, metadata_bytes = 0;
     bool promote_nullary_schema;
-    bool retained_timestamps;
     bool image_owns_timestamps = false;
     struct ArrowSchema old_schema;
     bool old_schema_ok;
 
     if (out_denied)
         *out_denied = false;
-    if (!r)
+    if (!r || !col_rel_timestamp_shape_valid(r))
         return EINVAL;
     promote_nullary_schema = r->schema_ok && r->ncols == 0 && ncols > 0;
     if (r->schema_ok && !promote_nullary_schema)
@@ -2156,7 +2174,6 @@ col_rel_set_schema_impl_capacity(col_rel_t *r, uint32_t ncols,
     }
     if (!col_rel_compound_map_valid_for(r, ncols))
         return EINVAL;
-    retained_timestamps = with_timestamps || r->timestamps != NULL;
     if (!col_rel_prospective_metadata_bytes(ncols, col_names, ncols > 0,
         true, r->column_types != NULL, true, r->compound_arity_len,
         &metadata_bytes))
@@ -2179,8 +2196,10 @@ col_rel_set_schema_impl_capacity(col_rel_t *r, uint32_t ncols,
     /* Existing timestamps remain owned by the source until publication. */
     image.timestamps = r->timestamps;
     image.timestamp_capacity = r->timestamp_capacity;
+    if (with_timestamps && image.timestamp_capacity < image.capacity)
+        image.timestamp_capacity = image.capacity;
     pending_rc = col_rel_reserve_retained_shape(&image, image.capacity,
-            retained_timestamps, &pending, &reserve_failure_rc);
+            image.timestamp_capacity, &pending, &reserve_failure_rc);
     if (pending_rc < 0) {
         col_rel_reservation_rollback(&metadata_pending);
         if (image.memory_budget_denial_pending)
@@ -2226,8 +2245,8 @@ col_rel_set_schema_impl_capacity(col_rel_t *r, uint32_t ncols,
     if (wl_columnar_relation_init_arrow_schema(&image) != 0)
         goto fail;
     if (pending_rc > 0
-        && (!col_rel_retained_bytes(ncols, image.capacity,
-        retained_timestamps, &retained_bytes)
+        && (!col_rel_retained_shape_bytes(ncols, image.capacity,
+        image.timestamp_capacity, &retained_bytes)
         || col_rel_publish_retained_reservation(r, &pending,
         retained_bytes, NULL) != 0))
         goto fail;
@@ -2749,8 +2768,10 @@ col_rel_retained_bytes_for(const col_rel_t *r, uint32_t capacity,
 {
     if (!r || !out)
         return false;
-    return col_rel_retained_bytes(r->ncols, capacity, r->timestamps != NULL,
-               out);
+    if (!col_rel_timestamp_shape_valid(r))
+        return false;
+    return col_rel_retained_shape_bytes(r->ncols, capacity,
+               r->timestamps ? capacity : 0, out);
 }
 
 /* Admit and grow the physical capacity of @r to at least @new_cap as one
@@ -2776,11 +2797,9 @@ col_rel_reserve_capacity_admitted(col_rel_t *r, uint32_t new_cap,
 
     if (denied)
         *denied = false;
-    if (!r)
+    if (!r || !col_rel_timestamp_shape_valid(r))
         return EINVAL;
     target = new_cap > r->capacity ? new_cap : r->capacity;
-    if (target == 0)
-        return 0;
     if (target > r->capacity) {
         if (r->col_shared || r->arena_owned) {
             /* Ownership transitions stage columns and timestamps together;
@@ -2805,8 +2824,8 @@ col_rel_reserve_capacity_admitted(col_rel_t *r, uint32_t new_cap,
                     *denied = true;
                 return ENOMEM;
             }
-            if (!col_rel_retained_bytes(r->ncols, target,
-                r->timestamps != NULL, &bytes)) {
+            if (!col_rel_retained_shape_bytes(r->ncols, target,
+                r->timestamps ? target : 0, &bytes)) {
                 col_rel_reservation_rollback(&pending);
                 if (denied)
                     *denied = true;
@@ -2839,23 +2858,12 @@ col_rel_reserve_capacity_admitted(col_rel_t *r, uint32_t new_cap,
     /* No reallocation: admit the heap buffers the relation already owns when
      * the retained token does not cover them yet.  A nullary relation owns
      * no column buffers. */
-    if (!r->memory_governor || r->col_shared || r->arena_owned
-        || r->ncols == 0)
+    if (!r->memory_governor || r->col_shared || r->arena_owned)
         return 0;
-    if (!col_rel_retained_bytes(r->ncols, target, false, &bytes)) {
+    if (!col_rel_retained_live_bytes(r, &bytes)) {
         if (denied)
             *denied = true;
         return ENOMEM;
-    }
-    if (r->timestamps) {
-        uint64_t timestamp_bytes = (uint64_t)r->timestamp_capacity
-            * sizeof(col_delta_timestamp_t);
-        if (bytes > UINT64_MAX - timestamp_bytes) {
-            if (denied)
-                *denied = true;
-            return ENOMEM;
-        }
-        bytes += timestamp_bytes;
     }
     if (bytes <= r->retained_reserved_bytes)
         return 0;
@@ -2983,8 +2991,8 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
                     rc = ENOMEM;
                     goto release_writer;
                 }
-                if (!col_rel_retained_bytes(r->ncols, new_cap,
-                    r->timestamps != NULL, &new_bytes)) {
+                if (!col_rel_retained_shape_bytes(r->ncols, new_cap,
+                    r->timestamps ? new_cap : 0, &new_bytes)) {
                     col_rel_reservation_rollback(&pending);
                     goto enomem;
                 }
@@ -3282,8 +3290,8 @@ col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
     if (admitted) {
         pending_rc = col_rel_reserve_retained(r, new_cap, &pending, NULL);
         if (pending_rc < 0
-            || !col_rel_retained_bytes(r->ncols, new_cap,
-            r->timestamps != NULL, &new_bytes)) {
+            || !col_rel_retained_shape_bytes(r->ncols, new_cap,
+            r->timestamps ? new_cap : 0, &new_bytes)) {
             if (pending_rc > 0)
                 col_rel_reservation_rollback(&pending);
             return ENOMEM;
@@ -3469,6 +3477,8 @@ wl_columnar_relation_delta_restore_flat_impl(col_rel_t *rel,
         goto done;
     }
     if (rel->ncols != ncols
+        || !col_rel_timestamp_shape_valid(rel)
+        || (rel->timestamps && rel->timestamp_capacity < nrows)
         || col_rel_storage_owner_resolve(rel, &owner) != 0 || owner != rel) {
         rc = EINVAL;
         goto done;
@@ -3482,13 +3492,13 @@ wl_columnar_relation_delta_restore_flat_impl(col_rel_t *rel,
     }
     if (rel->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
         || rel->storage_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
-        || !col_rel_retained_bytes(ncols, nrows,
-        rel->timestamps != NULL, &bytes)) {
+        || !col_rel_retained_shape_bytes(ncols, nrows,
+        rel->timestamp_capacity, &bytes)) {
         rc = EOVERFLOW;
         goto done;
     }
     pending_rc = col_rel_reserve_retained_shape(rel, nrows,
-            rel->timestamps != NULL, &pending, NULL);
+            rel->timestamp_capacity, &pending, NULL);
     if (pending_rc < 0) {
         rc = ENOMEM;
         goto done;
@@ -3910,7 +3920,7 @@ col_rel_compaction_shape(const col_rel_t *r, uint32_t *out_capacity,
 {
     uint32_t tight;
 
-    if (!r || r->nrows == 0
+    if (!r || !col_rel_timestamp_shape_valid(r) || r->nrows == 0
         || r->capacity <= (uint64_t)r->nrows * 4)
         return false;
     tight = r->nrows * 2;
@@ -3920,8 +3930,8 @@ col_rel_compaction_shape(const col_rel_t *r, uint32_t *out_capacity,
         tight = COL_REL_INIT_CAP;
     if (out_capacity)
         *out_capacity = tight;
-    if (out_bytes && !col_rel_retained_bytes(r->ncols, tight,
-        r->timestamps != NULL, out_bytes))
+    if (out_bytes && !col_rel_retained_shape_bytes(r->ncols, tight,
+        r->timestamps ? tight : 0, out_bytes))
         return false;
     return true;
 }
@@ -5631,7 +5641,7 @@ wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
         return rc;
     if (src->nrows > src->capacity || (src->ncols > 0
         && src->capacity > 0 && !src->columns)
-        || (src->timestamp_capacity > 0 && !src->timestamps)
+        || (src->timestamps != NULL) != (src->timestamp_capacity != 0)
         || !wl_columnar_relation_compound_map_valid(src)) {
         rc = EINVAL;
         goto done;
@@ -5840,6 +5850,10 @@ col_rel_replacement_validate_candidate(const col_rel_t *candidate)
     uint32_t compound_entries;
 
     if (!candidate || candidate->nrows > candidate->capacity
+        || (candidate->timestamps != NULL)
+        != (candidate->timestamp_capacity != 0)
+        || (candidate->timestamps
+        && candidate->timestamp_capacity < candidate->nrows)
         || !wl_columnar_relation_generation_valid(
             candidate->view_generation)
         || !wl_columnar_relation_generation_valid(
@@ -5850,8 +5864,9 @@ col_rel_replacement_validate_candidate(const col_rel_t *candidate)
         || candidate->storage_generation
         >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
         return EOVERFLOW;
-    if (!col_rel_retained_bytes(candidate->ncols, candidate->capacity,
-        candidate->timestamps != NULL, &ignored_bytes))
+    if (!col_rel_retained_shape_bytes(candidate->ncols,
+        candidate->capacity, candidate->timestamp_capacity,
+        &ignored_bytes))
         return EOVERFLOW;
     if (candidate->ncols > 0 && candidate->capacity > 0) {
         if (!candidate->columns)
@@ -5901,8 +5916,14 @@ col_rel_prepare_replacement_impl(col_rel_t *dst, const col_rel_t *candidate,
         return EOVERFLOW;
     if (!col_rel_replacement_old_reservation_valid(dst))
         return EINVAL;
-    if (!col_rel_retained_bytes(candidate->ncols, candidate->capacity,
-        candidate->timestamps != NULL, &planned_bytes))
+    /* The private legacy copy keeps at least column capacity for enabled
+     * timestamps, even when the source's physical timestamp buffer is
+     * narrower. Admit the staged allocation, not the source shape. */
+    uint32_t staged_timestamp_capacity = candidate->timestamps
+        ? (candidate->timestamp_capacity > candidate->capacity
+            ? candidate->timestamp_capacity : candidate->capacity) : 0;
+    if (!col_rel_retained_shape_bytes(candidate->ncols,
+        candidate->capacity, staged_timestamp_capacity, &planned_bytes))
         return EOVERFLOW;
     if (!col_rel_prospective_metadata_bytes(candidate->ncols,
         (const char *const *)candidate->col_names,
@@ -5911,14 +5932,6 @@ col_rel_prepare_replacement_impl(col_rel_t *dst, const col_rel_t *candidate,
         candidate->compound_arity_len,
         &metadata_bytes))
         return EOVERFLOW;
-    if (candidate->timestamps
-        && candidate->timestamp_capacity > candidate->capacity) {
-        uint64_t extra = (uint64_t)(candidate->timestamp_capacity
-            - candidate->capacity) * sizeof(col_delta_timestamp_t);
-        if (planned_bytes > UINT64_MAX - extra)
-            return EOVERFLOW;
-        planned_bytes += extra;
-    }
 
     if (writer_held) {
         col_rel_t *owner = NULL;

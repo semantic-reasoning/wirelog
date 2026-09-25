@@ -1875,10 +1875,173 @@ test_cow_retained_timestamp_capacity_admission(void)
         == descriptor_bytes("skew-view")
         + view->metadata_reserved_bytes,
         "retained timestamp capacity denial preserves state");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes,
+        bytes + descriptor_bytes("skew-view")
+        + view->metadata_reserved_bytes, memory_order_release);
+    CHECK(col_rel_cow_unshare(view, 0) == 0
+        && view->retained_reserved_bytes == bytes
+        && view->timestamp_capacity == physical
+        && view->columns[0] != old_column
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == bytes + descriptor_bytes("skew-view")
+        + view->metadata_reserved_bytes,
+        "exact physical timestamp capacity admits COW retry");
 cleanup:
     col_rel_destroy(view);
     col_rel_destroy(source);
-    if (ref) wl_columnar_memory_governor_ref_release(ref);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "physical timestamp COW teardown releases exact credit");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_replacement_expands_narrow_timestamps(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    col_rel_t *target = col_rel_new_auto("narrow-target", 1);
+    col_rel_t *candidate = col_rel_new_auto("narrow-candidate", 1);
+    col_rel_replacement_t replacement = { 0 };
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    int64_t value = 17;
+
+    CHECK(target && candidate && col_rel_append_row(candidate, &value) == 0
+        && col_rel_enable_timestamps(candidate) == 0,
+        "narrow replacement fixture");
+    if (!target || !candidate || !candidate->timestamps)
+        goto cleanup;
+    col_delta_timestamp_t *narrow = realloc(candidate->timestamps,
+            sizeof(*narrow));
+    CHECK(narrow != NULL, "narrow timestamp allocation");
+    if (!narrow)
+        goto cleanup;
+    candidate->timestamps = narrow;
+    candidate->timestamp_capacity = 1u;
+    uint64_t staged_bytes = (uint64_t)candidate->capacity
+        * (sizeof(int64_t) + sizeof(col_delta_timestamp_t));
+    uint64_t exact = descriptor_bytes("narrow-target")
+        + metadata_bytes(target) + metadata_bytes(candidate) + staged_bytes;
+    make_resolution(&resolution, exact - 1u);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && col_rel_attach_memory_governor(target, ref) == 0,
+        "narrow replacement governor");
+    if (!ref || !target->memory_governor)
+        goto cleanup;
+    CHECK(col_rel_prepare_replacement(target, candidate, &replacement)
+        == ENOMEM && !replacement.staged
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == descriptor_bytes("narrow-target")
+        + target->metadata_reserved_bytes,
+        "narrow source admits expanded staged timestamps one byte short");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, exact, memory_order_release);
+    CHECK(col_rel_prepare_replacement(target, candidate, &replacement) == 0
+        && replacement.staged
+        && replacement.reserved_bytes == staged_bytes
+        && replacement.staged->timestamp_capacity == candidate->capacity,
+        "narrow source replacement exact staged physical width");
+    col_rel_discard_replacement(&replacement);
+    CHECK(col_rel_prepare_replacement(target, candidate, &replacement) == 0,
+        "narrow replacement retries after discard");
+    if (replacement.staged)
+        col_rel_commit_replacement_locked(target, &replacement);
+    col_rel_discard_replacement(&replacement);
+    CHECK(target->retained_reserved_bytes == staged_bytes
+        && target->timestamp_capacity == candidate->capacity,
+        "narrow replacement commits physical width");
+cleanup:
+    col_rel_discard_replacement(&replacement);
+    col_rel_destroy(candidate);
+    col_rel_destroy(target);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "narrow replacement teardown releases exact credit");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_timestamp_shape_attach_invariant(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    col_rel_t *rel = col_rel_new_auto("bad-timestamp", 1);
+    make_resolution(&resolution, 1u << 20);
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(rel && ref && col_rel_enable_timestamps(rel) == 0,
+        "timestamp invariant fixture");
+    if (!rel || !ref || !rel->timestamps)
+        goto cleanup;
+    uint32_t physical = rel->timestamp_capacity;
+    rel->timestamp_capacity = 0;
+    CHECK(col_rel_attach_memory_governor(rel, ref) == EINVAL
+        && rel->memory_governor == NULL
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0,
+        "timestamp pointer without physical capacity rejects attach");
+    rel->timestamp_capacity = physical;
+    CHECK(col_rel_attach_memory_governor(rel, ref) == 0,
+        "valid physical capacity attaches after rejection");
+cleanup:
+    col_rel_destroy(rel);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "timestamp invariant teardown releases credit");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_timestamp_only_retained_admission(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    col_rel_t *rel = col_rel_new_auto("timestamp-only", 0);
+    make_resolution(&resolution, 1u << 20);
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(rel && ref, "timestamp-only admission fixture");
+    if (!rel || !ref)
+        goto cleanup;
+    rel->timestamps = calloc(3u, sizeof(*rel->timestamps));
+    rel->timestamp_capacity = rel->timestamps ? 3u : 0u;
+    CHECK(rel->timestamps && col_rel_attach_memory_governor(rel, ref) == 0,
+        "timestamp-only relation attaches");
+    if (!rel->memory_governor)
+        goto cleanup;
+    uint64_t baseline = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+    uint64_t bytes = 3u * sizeof(col_delta_timestamp_t);
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, baseline + bytes - 1u,
+        memory_order_release);
+    bool denied = false;
+    CHECK(col_rel_reserve_capacity_admitted(rel, 0, &denied) == ENOMEM
+        && denied && rel->retained_reserved_bytes == 0
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == baseline,
+        "timestamp-only physical bytes denied one byte short");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, baseline + bytes, memory_order_release);
+    CHECK(col_rel_reserve_capacity_admitted(rel, 0, &denied) == 0
+        && rel->retained_reserved_bytes == bytes
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == baseline + bytes,
+        "timestamp-only physical bytes admitted at exact fit");
+cleanup:
+    col_rel_destroy(rel);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "timestamp-only teardown releases exact credit");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
 }
 
 static void
@@ -2658,6 +2821,9 @@ main(void)
     test_governed_empty_compound_copy();
     test_physical_timestamp_capacity();
     test_cow_retained_timestamp_capacity_admission();
+    test_replacement_expands_narrow_timestamps();
+    test_timestamp_shape_attach_invariant();
+    test_timestamp_only_retained_admission();
     test_governed_pool_clone_fallback();
     test_governed_delta_restore_overwrite_order();
     test_resize_allocation_cleanup_precedes_rollback();
