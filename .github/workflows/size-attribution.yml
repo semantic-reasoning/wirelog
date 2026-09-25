@@ -10,6 +10,7 @@ on:
         options:
           - "1903"
           - "1945"
+          - "1956"
         default: "1903"
       base_sha:
         description: Fresh origin/main SHA used as the pull request base

@@ -1,4 +1,4 @@
-"""Collect reproducible, read-only size and linker-map evidence for PR #1903."""
+"""Collect reproducible, read-only size and linker-map evidence for reviewed PRs."""
 
 from __future__ import annotations
 
@@ -20,6 +20,10 @@ from typing import Any
 REPOSITORY = "semantic-reasoning/wirelog"
 PR_NUMBER = 1903
 ADMISSION_PR_NUMBER = 1945
+# Main-owned eligibility record for the documentation-only #1937 experiment PR.
+SIZE_REDUCTION_PR_NUMBER = 1956
+CURRENT_CANDIDATE_PR_NUMBERS = {PR_NUMBER, ADMISSION_PR_NUMBER, SIZE_REDUCTION_PR_NUMBER}
+CURRENT_TWO_TREE_PR_NUMBERS = {PR_NUMBER, SIZE_REDUCTION_PR_NUMBER}
 BASE_SHA = "8d91c2da2b188b94af5b9f1da21c569d80ccb387"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 POLICY_FILES = (
@@ -164,6 +168,10 @@ def validate_current_candidate_request(repository: str, pr_number: int,
         raise DiagnosticError(f"unexpected repository {repository!r}")
     if pr_number not in allowed_pr_numbers:
         raise DiagnosticError("the current-candidate attribution mode does not allow this PR")
+    if pull_request.get("number") != pr_number:
+        raise DiagnosticError(f"GitHub PR metadata number does not match PR #{pr_number}")
+    if pull_request.get("base_repository") != REPOSITORY:
+        raise DiagnosticError(f"PR #{pr_number} must target this repository")
     if workflow_ref != "refs/heads/main":
         raise DiagnosticError("diagnostics must be dispatched from refs/heads/main")
     for name, value in (("base SHA", base_sha), ("candidate SHA", candidate_sha),
@@ -194,7 +202,7 @@ def validate_current_candidate_request(repository: str, pr_number: int,
 
 
 def fetch_pull_request_metadata(repository: str, pr_number: int) -> dict[str, Any]:
-    if repository != REPOSITORY or pr_number not in {PR_NUMBER, ADMISSION_PR_NUMBER}:
+    if repository != REPOSITORY or pr_number not in CURRENT_CANDIDATE_PR_NUMBERS:
         raise DiagnosticError("pull request metadata is restricted to allowlisted same-repository PRs")
     url = f"https://api.github.com/repos/{REPOSITORY}/pulls/{pr_number}"
     request = urllib.request.Request(
@@ -207,16 +215,25 @@ def fetch_pull_request_metadata(repository: str, pr_number: int) -> dict[str, An
         raise DiagnosticError(f"could not verify public PR #{pr_number} metadata: {exc}") from exc
     if not isinstance(payload, dict):
         raise DiagnosticError(f"GitHub returned malformed PR #{pr_number} metadata")
+    if payload.get("number") != pr_number:
+        raise DiagnosticError(f"GitHub returned metadata for a different PR than #{pr_number}")
     base = payload.get("base")
     head = payload.get("head")
     if not isinstance(base, dict) or not isinstance(head, dict):
         raise DiagnosticError(f"GitHub returned malformed PR #{pr_number} base/head metadata")
+    base_repo = base.get("repo")
+    if not isinstance(base_repo, dict):
+        raise DiagnosticError(f"GitHub returned malformed PR #{pr_number} base repository metadata")
+    if base_repo.get("full_name") != REPOSITORY:
+        raise DiagnosticError(f"PR #{pr_number} must target this repository")
     head_repo = head.get("repo")
     if head_repo is not None and not isinstance(head_repo, dict):
         raise DiagnosticError(f"GitHub returned malformed PR #{pr_number} head repository metadata")
     head_repo = head_repo or {}
-    return {"state": payload.get("state"), "base_ref": base.get("ref"),
+    return {"number": payload.get("number"),
+            "state": payload.get("state"), "base_ref": base.get("ref"),
             "base_sha": base.get("sha"), "head_sha": head.get("sha"),
+            "base_repository": base_repo.get("full_name"),
             "head_repository": head_repo.get("full_name")}
 
 
@@ -224,9 +241,16 @@ def validate_current_baseline_request(repository: str, pr_number: int,
                                       base_sha: str, candidate_sha: str,
                                       workflow_ref: str, remote_main_sha: str,
                                       remote_head_sha: str, merge_parents: list[str],
-                                      pull_request: dict[str, Any]) -> None:
-    if repository != REPOSITORY or pr_number != PR_NUMBER:
-        raise DiagnosticError("current two-tree baseline attribution accepts only PR #1903")
+                                      pull_request: dict[str, Any],
+                                      allowed_pr_numbers: set[int] | None = None) -> None:
+    if allowed_pr_numbers is None:
+        allowed_pr_numbers = {PR_NUMBER}
+    if repository != REPOSITORY or pr_number not in allowed_pr_numbers:
+        raise DiagnosticError("current two-tree baseline attribution does not allow this PR")
+    if pull_request.get("number") != pr_number:
+        raise DiagnosticError(f"GitHub PR metadata number does not match PR #{pr_number}")
+    if pull_request.get("base_repository") != REPOSITORY:
+        raise DiagnosticError(f"PR #{pr_number} must target this repository")
     if workflow_ref != "refs/heads/main":
         raise DiagnosticError("diagnostics must be dispatched from refs/heads/main")
     for name, value in (("base SHA", base_sha), ("candidate SHA", candidate_sha),
@@ -238,22 +262,22 @@ def validate_current_baseline_request(repository: str, pr_number: int,
     if candidate_sha != remote_head_sha:
         raise DiagnosticError("candidate SHA does not match the current remote PR head")
     if merge_parents != [base_sha, candidate_sha]:
-        raise DiagnosticError("PR #1903 merge ref does not match the requested main base and head")
+        raise DiagnosticError(f"PR #{pr_number} merge ref does not match the requested main base and head")
     if pull_request.get("state") != "open":
-        raise DiagnosticError("PR #1903 must remain open during attribution")
+        raise DiagnosticError(f"PR #{pr_number} must remain open during attribution")
     if pull_request.get("base_ref") != "main" or pull_request.get("base_sha") != base_sha:
-        raise DiagnosticError("PR #1903 must target the requested current main SHA")
+        raise DiagnosticError(f"PR #{pr_number} must target the requested current main SHA")
     if pull_request.get("head_sha") != candidate_sha:
-        raise DiagnosticError("PR #1903 API head SHA differs from the current remote head")
+        raise DiagnosticError(f"PR #{pr_number} API head SHA differs from the current remote head")
     if pull_request.get("head_repository") != REPOSITORY:
-        raise DiagnosticError("PR #1903 must originate from this repository")
+        raise DiagnosticError(f"PR #{pr_number} must originate from this repository")
 
 
 def verify_repository(repo: Path, repository: str, pr_number: int,
                       base_sha: str, candidate_sha: str, workflow_ref: str,
                       reference_sha: str | None = None) -> dict[str, str]:
-    if pr_number == PR_NUMBER and not reference_sha:
-        if base_sha != BASE_SHA:
+    if pr_number in CURRENT_TWO_TREE_PR_NUMBERS and not reference_sha:
+        if pr_number != PR_NUMBER or base_sha != BASE_SHA:
             return verify_current_baseline_repository(
                 repo, repository, pr_number, base_sha, candidate_sha, workflow_ref)
         if repository != REPOSITORY:
@@ -284,7 +308,7 @@ def verify_repository(repo: Path, repository: str, pr_number: int,
         run(["git", "merge-base", "--is-ancestor", base_sha, "refs/remotes/origin/main"], cwd=repo)
         return {"origin": origin, "remote_pr_head": remote_head[0]}
 
-    if pr_number not in {PR_NUMBER, ADMISSION_PR_NUMBER}:
+    if pr_number not in CURRENT_CANDIDATE_PR_NUMBERS:
         raise DiagnosticError("only allowlisted same-repository admission PRs are accepted")
     if not reference_sha:
         raise DiagnosticError(f"PR #{pr_number} current-candidate attribution requires an immutable reference SHA")
@@ -314,8 +338,7 @@ def verify_repository(repo: Path, repository: str, pr_number: int,
     merge_fields = run(["git", "rev-list", "--parents", "-n", "1",
                         f"refs/diagnostic/pr-{pr_number}-merge"], cwd=repo).split()
     merge_parents = merge_fields[1:]
-    allowed_pr_numbers = ({PR_NUMBER} if pr_number == PR_NUMBER
-                          else {ADMISSION_PR_NUMBER})
+    allowed_pr_numbers = {pr_number}
     validate_current_candidate_request(repository, pr_number, base_sha,
                                        candidate_sha, reference_sha,
                                        workflow_ref, remote_main,
@@ -338,8 +361,8 @@ def verify_repository(repo: Path, repository: str, pr_number: int,
 def verify_current_baseline_repository(repo: Path, repository: str, pr_number: int,
                                        base_sha: str, candidate_sha: str,
                                        workflow_ref: str) -> dict[str, Any]:
-    if repository != REPOSITORY or pr_number != PR_NUMBER:
-        raise DiagnosticError("current two-tree baseline attribution accepts only PR #1903")
+    if repository != REPOSITORY or pr_number not in CURRENT_TWO_TREE_PR_NUMBERS:
+        raise DiagnosticError("current two-tree baseline attribution does not allow this PR")
     validate_sha(base_sha, "base SHA")
     validate_sha(candidate_sha, "candidate SHA")
     origin = run(["git", "remote", "get-url", "origin"], cwd=repo).strip()
@@ -350,19 +373,20 @@ def verify_current_baseline_repository(repo: Path, repository: str, pr_number: i
     pull_request = fetch_pull_request_metadata(repository, pr_number)
     remote_head = run(["git", "ls-remote", "origin", f"refs/pull/{pr_number}/head"], cwd=repo).split()
     if len(remote_head) != 2:
-        raise DiagnosticError("could not resolve the current remote PR #1903 head")
+        raise DiagnosticError(f"could not resolve the current remote PR #{pr_number} head")
     run(["git", "fetch", "--no-tags", "origin",
          f"refs/pull/{pr_number}/head:refs/diagnostic/pr-{pr_number}-head"], cwd=repo)
     run(["git", "fetch", "--no-tags", "origin",
          f"refs/pull/{pr_number}/merge:refs/diagnostic/pr-{pr_number}-merge"], cwd=repo)
     fetched_head = run(["git", "rev-parse", f"refs/diagnostic/pr-{pr_number}-head"], cwd=repo).strip()
     if fetched_head != remote_head[0]:
-        raise DiagnosticError("fetched PR #1903 head differs from ls-remote")
+        raise DiagnosticError(f"fetched PR #{pr_number} head differs from ls-remote")
     merge_fields = run(["git", "rev-list", "--parents", "-n", "1",
                         f"refs/diagnostic/pr-{pr_number}-merge"], cwd=repo).split()
     validate_current_baseline_request(
         repository, pr_number, base_sha, candidate_sha, workflow_ref,
-        remote_main, remote_head[0], merge_fields[1:], pull_request)
+        remote_main, remote_head[0], merge_fields[1:], pull_request,
+        allowed_pr_numbers={pr_number})
     for name, sha in (("base", base_sha), ("candidate", candidate_sha)):
         resolved = run(["git", "rev-parse", "--verify", f"{sha}^{{commit}}"], cwd=repo).strip()
         if resolved != sha:
@@ -767,7 +791,7 @@ def forensic_profile_matches(authoritative_path: Path, forensic_path: Path,
     return not differences, differences
 
 
-def collect_pr1903(args: argparse.Namespace) -> int:
+def collect_two_tree_candidate(args: argparse.Namespace) -> int:
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     report: dict[str, Any] = {
@@ -1251,7 +1275,7 @@ def collect_current_candidate(args: argparse.Namespace) -> int:
 
 def collect(args: argparse.Namespace) -> int:
     if args.reference_sha:
-        if args.pr_number in {PR_NUMBER, ADMISSION_PR_NUMBER}:
+        if args.pr_number in CURRENT_CANDIDATE_PR_NUMBERS:
             return collect_current_candidate(args)
         output = Path(args.output).resolve()
         output.mkdir(parents=True, exist_ok=True)
@@ -1260,14 +1284,14 @@ def collect(args: argparse.Namespace) -> int:
                   "candidate_sha": args.candidate_sha,
                   "reference_sha": args.reference_sha,
                   "workflow_ref": args.workflow_ref, "status": "failed",
-                  "error": "reference SHA is restricted to allowlisted admission PRs"}
+                  "error": "reference SHA is restricted to allowlisted current candidates"}
         write_json(output / "report.json", report)
         write_artifact_checksums(output)
         print(report["error"], file=sys.stderr)
         return 1
-    if args.pr_number != PR_NUMBER:
-        raise DiagnosticError("only historical PR #1903 or allowlisted current admission PRs are accepted")
-    return collect_pr1903(args)
+    if args.pr_number not in CURRENT_TWO_TREE_PR_NUMBERS:
+        raise DiagnosticError("two-tree attribution is restricted to allowlisted current candidates")
+    return collect_two_tree_candidate(args)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
