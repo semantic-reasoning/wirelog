@@ -11,6 +11,7 @@ import sys
 import tarfile
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -41,19 +42,37 @@ def measurement_is_reproducible(report):
             isinstance(report.get("library_sha256"), str) and
             len(report["library_sha256"]) == 64)
 
+def checked_https_url(url, api=False):
+    parts = urllib.parse.urlsplit(url)
+    if (parts.scheme != "https" or not parts.hostname or parts.username is not None or
+            parts.password is not None or (api and parts.netloc != "api.github.com")):
+        fail("artifact request requires an absolute HTTPS URL without userinfo")
+
+
+class SafeArtifactRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        checked_https_url(headers.get("location") or headers.get("uri") or newurl)
+        checked_https_url(newurl)
+        # A fresh request prevents the GitHub API token and headers from
+        # reaching the short-lived artifact storage URL.
+        return urllib.request.Request(newurl)
+
+
+class RejectRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def request(url, token, binary=False):
-    if binary:
-        # GitHub Actions artifact ZIP endpoints redirect to short-lived blob
-        # URLs. The GitHub CLI handles that redirect and strips API credentials
-        # before following it; urllib forwards them incorrectly in this flow.
-        env = os.environ.copy()
-        env["GH_TOKEN"] = token
-        return subprocess.check_output(["gh", "api", url], env=env)
+    checked_https_url(url, api=True)
     req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json",
                                                "Authorization": f"Bearer {token}",
                                                "X-GitHub-Api-Version": "2022-11-28"})
-    with urllib.request.urlopen(req, timeout=30) as response:
-        return json.loads(response.read())
+    opener = urllib.request.build_opener(SafeArtifactRedirect() if binary else RejectRedirect())
+    with opener.open(req, timeout=30) as response:
+        checked_https_url(response.geturl())
+        body = response.read()
+    return body if binary else json.loads(body)
 
 def fail(message):
     raise ValueError(message)

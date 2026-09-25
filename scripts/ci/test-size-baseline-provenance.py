@@ -120,6 +120,56 @@ def exercise(provenance, corrupt=None):
              mock.patch.object(mod.subprocess,"check_output",subprocess_output):
             return mod.authorize("owner/repo","base456","candidate789",100,200,p,"fixture-token")
 
+def exercise_binary_download(location="https://storage.example/artifact.zip", final_url=None):
+    api_url = "https://api.github.com/repos/owner/repo/actions/artifacts/22/zip"
+    final_url = final_url or location
+
+    class Response(io.BytesIO):
+        def geturl(self):
+            return final_url
+
+    class Opener:
+        def __init__(self, handler):
+            self.handler = handler
+
+        def open(self, req, timeout):
+            assert timeout == 30
+            assert req.full_url == api_url
+            assert req.get_header("Authorization") == "Bearer fixture-token"
+            assert req.get_header("X-github-api-version") == "2022-11-28"
+            resolved = ("https://storage.example/artifact.zip" if location.startswith("/")
+                        else location)
+            redirected = self.handler.redirect_request(
+                req, None, 302, "Found", {"location": location}, resolved)
+            assert redirected.headers == {}
+            return Response(b"fixture artifact bytes")
+
+    with mock.patch.object(mod.urllib.request, "build_opener",
+                           side_effect=lambda handler: Opener(handler)), \
+         mock.patch.object(mod.subprocess, "check_output",
+                           side_effect=AssertionError("gh must not run")):
+        assert mod.request(api_url, "fixture-token", binary=True) == b"fixture artifact bytes"
+
+check("artifact download authenticates API and strips credentials on redirect",
+      exercise_binary_download)
+for bad_url in ("http://storage.example/artifact.zip", "/relative.zip", "https:///artifact.zip",
+                "https://user@storage.example/artifact.zip"):
+    check(f"artifact redirect rejects {bad_url}",
+          lambda url=bad_url: exercise_binary_download(url), "absolute HTTPS URL")
+for bad_url in ("http://api.github.com/artifact.zip", "/relative.zip", "https:///artifact.zip",
+                "https://user@api.github.com/artifact.zip", "https://example.com/artifact.zip"):
+    check(f"artifact API URL rejects {bad_url}",
+          lambda url=bad_url: mod.request(url, "fixture-token", binary=True), "absolute HTTPS URL")
+check("artifact response rejects a downgraded final URL",
+      lambda: exercise_binary_download(final_url="http://storage.example/artifact.zip"),
+      "absolute HTTPS URL")
+
+def assert_json_redirect_rejected():
+    assert mod.RejectRedirect().redirect_request(
+        None, None, 302, "Found", {}, "https://storage.example/data") is None
+
+check("JSON API rejects redirects", assert_json_redirect_rejected)
+
 check("unchanged legacy baseline remains allowed",
       lambda: mod.authorize("owner/repo","base456","candidate789",354887,354887,"missing",""))
 check("legacy provenance cannot authorize numeric inflation",
