@@ -97,6 +97,8 @@ typedef struct {
     } key_row_storage;
     col_rel_t *batch;        /* governed heap scratch, grown on demand */
     wl_columnar_memory_reservation_t descriptor_reservation;
+    wl_columnar_memory_governor_ref_t *descriptor_governor;
+    bool descriptor_committed;
     uint32_t rows_per_batch;
     bool grow_denied_logged;  /* one WARN per producer, not per batch */
     col_join_batch_cursor_t cursor;
@@ -330,15 +332,31 @@ static void
 producer_destroy(void *context)
 {
     col_join_batch_producer_t *p = (col_join_batch_producer_t *)context;
+    wl_columnar_memory_reservation_t reservation;
+    wl_columnar_memory_governor_ref_t *governor;
+    bool committed;
 
     if (!p)
         return;
+    wl_columnar_memory_reservation_init(&reservation);
+    if (p->descriptor_reservation.governor
+        && !wl_columnar_memory_reservation_move(&reservation,
+        &p->descriptor_reservation))
+        abort();
+    governor = p->descriptor_governor;
+    committed = p->descriptor_committed;
     producer_release_lease(p);
     if (p->batch)
         col_rel_destroy(p->batch); /* releases the scratch token and ref */
-    if (p->descriptor_reservation.governor)
-        (void)wl_columnar_memory_release(&p->descriptor_reservation);
     free(p);
+    if (reservation.governor) {
+        if (committed){
+            if (!wl_columnar_memory_release(&reservation)) abort();
+        }else{
+            if (!wl_columnar_memory_rollback(&reservation)) abort();
+        }
+    }
+    wl_columnar_memory_governor_ref_release(governor);
 }
 
 int
@@ -353,8 +371,10 @@ col_join_batch_producer_create(wl_col_session_t *sess,
     wl_columnar_continuation_cursor_t initial;
     uint64_t row_bytes = 0;
     uint64_t descriptor_bytes = 0;
+    uint64_t key_bytes, row_storage_bytes;
     uint64_t rows;
     uint32_t ocols;
+    wl_columnar_memory_governor_ref_t *descriptor_governor = NULL;
     wl_columnar_memory_reservation_t descriptor_reservation;
     int rc;
 
@@ -369,23 +389,32 @@ col_join_batch_producer_create(wl_col_session_t *sess,
     for (uint32_t k = 0; k < kc; k++)
         if (lk[k] >= left->ncols || rk[k] >= right->ncols)
             return EINVAL;
-    /* kc and ncols are uint32_t, so their products and sum fit uint64_t;
-     * reject totals that cannot be represented by this process's size_t. */
-    descriptor_bytes = sizeof(*p)
-        + (uint64_t)kc * 2u * sizeof(uint32_t)
-        + (uint64_t)(right->ncols > 0 ? right->ncols : 1u)
-        * sizeof(int64_t);
-    if (descriptor_bytes > SIZE_MAX)
+    if (!wl_columnar_memory_size_mul(kc, 2u * sizeof(uint32_t),
+        &key_bytes)
+        || !wl_columnar_memory_size_mul(
+            right->ncols > 0 ? right->ncols : 1u, sizeof(int64_t),
+            &row_storage_bytes)
+        || !wl_columnar_memory_size_add(sizeof(*p), key_bytes,
+        &descriptor_bytes)
+        || !wl_columnar_memory_size_add(descriptor_bytes,
+        row_storage_bytes, &descriptor_bytes)
+        || descriptor_bytes > SIZE_MAX)
         return EOVERFLOW;
+    descriptor_governor = sess->memory_governor
+        ? sess->memory_governor
+        : left->memory_governor ? left->memory_governor
+                                : right->memory_governor;
+    wl_columnar_memory_governor_ref_retain(descriptor_governor);
     wl_columnar_memory_reservation_init(&descriptor_reservation);
-    if (sess->memory_governor) {
+    if (descriptor_governor) {
         wl_columnar_memory_admission_status_t admission
             = wl_columnar_memory_reserve_checked(
-                wl_columnar_memory_governor_ref_get(sess->memory_governor),
+                wl_columnar_memory_governor_ref_get(descriptor_governor),
                 descriptor_bytes, &descriptor_reservation);
         if (admission > WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
             if (admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                 sess->memory_budget_denied = true;
+            wl_columnar_memory_governor_ref_release(descriptor_governor);
             return admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
                 ? ENOSPC
                 : admission == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
@@ -394,16 +423,21 @@ col_join_batch_producer_create(wl_col_session_t *sess,
     }
     p = (col_join_batch_producer_t *)calloc(1, (size_t)descriptor_bytes);
     if (!p) {
-        if (descriptor_reservation.governor)
-            (void)wl_columnar_memory_rollback(&descriptor_reservation);
+        if (descriptor_reservation.governor){
+            if (!wl_columnar_memory_rollback(&descriptor_reservation)) abort();
+        }
+        wl_columnar_memory_governor_ref_release(descriptor_governor);
         return ENOMEM;
     }
     wl_columnar_memory_reservation_init(&p->descriptor_reservation);
+    p->descriptor_governor = descriptor_governor;
     if (descriptor_reservation.governor
         && !wl_columnar_memory_reservation_move(&p->descriptor_reservation,
         &descriptor_reservation)) {
-        (void)wl_columnar_memory_rollback(&descriptor_reservation);
         free(p);
+        if (!wl_columnar_memory_rollback(&descriptor_reservation))
+            abort();
+        wl_columnar_memory_governor_ref_release(descriptor_governor);
         return EINVAL;
     }
     p->sess = sess;
@@ -426,6 +460,7 @@ col_join_batch_producer_create(wl_col_session_t *sess,
             rc = EINVAL;
             goto fail;
         }
+        p->descriptor_committed = true;
     }
 
     /* One lease for the whole continuation.  The registry refuses to

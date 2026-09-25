@@ -9,10 +9,14 @@
  */
 
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+
+extern void wl_columnar_diff_join_batch_test_fail_allocation_at(uint32_t n);
+extern void wl_columnar_diff_join_batch_test_fail_next_commit(void);
 
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/columnar/diff_join_batch.h"
@@ -1961,6 +1965,8 @@ test_diff_join_batch_signed_timestamps(void)
     int64_t row[] = { 1, 10 };
     uint64_t scratch_bytes;
     uint64_t admission_budget;
+    uint64_t descriptor_bytes;
+    uint64_t source_baseline;
     int rc;
 
     TEST("differential bounded join grows timestamped scratch safely");
@@ -1998,33 +2004,90 @@ test_diff_join_batch_signed_timestamps(void)
         && col_rel_retained_bytes_for(out, 64u, &scratch_bytes),
         "source and scratch footprints measured");
     admission_budget = scratch_bytes;
-    source_governor = make_test_governor(admission_budget);
+    source_governor = make_test_governor(4u * 1024u * 1024u);
     ASSERT_TRUE(source_governor
         && col_rel_attach_memory_governor(left, source_governor) == 0,
         "source-only governor attached with exact initial capacity budget");
     ASSERT_TRUE(session_add_rel(s, right) == 0, "right relation registered");
+    source_baseline = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(source_governor));
+    ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, left, false,
+        &key, &key, 1, 8192u, &cont) == 0 && cont != NULL,
+        "producer scratch preflight succeeds");
+    uint64_t admitted_after_create = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(source_governor));
+    ASSERT_TRUE(admitted_after_create > source_baseline + scratch_bytes,
+        "producer descriptor is admitted beside its batch relation");
+    descriptor_bytes = admitted_after_create - source_baseline - scratch_bytes;
+    wl_columnar_continuation_cancel(cont);
+    ASSERT_TRUE(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(source_governor))
+        == admitted_after_create,
+        "cancellation releases leases but retains admitted producer storage");
+    wl_columnar_continuation_destroy(cont);
+    cont = NULL;
+    ASSERT_TRUE(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(source_governor))
+        == source_baseline,
+        "preflight destruction restores source governor baseline");
+    wl_columnar_diff_join_batch_test_fail_allocation_at(4u);
+    rc = col_diff_join_batch_producer_create(s, &op, left, false, &key, &key,
+            1, 8192u, &cont);
+    ASSERT_TRUE(rc == ENOMEM && cont == NULL
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(source_governor))
+        == source_baseline,
+        "partial descriptor allocation failure rolls back admission");
+    wl_columnar_diff_join_batch_test_fail_next_commit();
+    rc = col_diff_join_batch_producer_create(s, &op, left, false, &key, &key,
+            1, 8192u, &cont);
+    ASSERT_TRUE(rc == EINVAL && cont == NULL
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(source_governor))
+        == source_baseline,
+        "descriptor commit failure frees storage before rollback");
+    uint32_t diff_arrangements_before_denial = s->diff_arr_count;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            source_governor)->usable_bytes,
+        source_baseline + descriptor_bytes - 1u, memory_order_release);
+    rc = col_diff_join_batch_producer_create(s, &op, left, false, &key, &key,
+            1, 8192u, &cont);
+    ASSERT_TRUE(rc == ENOSPC && cont == NULL
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(source_governor))
+        == source_baseline && s->diff_arr_count
+        == diff_arrangements_before_denial
+        && atomic_load_explicit(&left->source_access.state,
+        memory_order_relaxed) == 0
+        && atomic_load_explicit(&right->source_access.state,
+        memory_order_relaxed) == 0,
+        "descriptor-only denial precedes allocations, leases and indexing");
     /* The initial 64-row scratch exactly fits.  Its first 64->128 growth is
      * denied, after which raising the source governor permits retry. */
     s->join_batch_bytes = 8192;
     atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
-            source_governor)->usable_bytes, scratch_bytes - 1u,
+            source_governor)->usable_bytes,
+        source_baseline + descriptor_bytes + scratch_bytes - 1u,
         memory_order_release);
     int create_denied_rc = col_diff_join_batch_producer_create(s, &op, left,
             false, &key, &key, 1, s->join_batch_bytes, &cont);
     ASSERT_TRUE(create_denied_rc == ENOSPC && cont == NULL
         && wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(source_governor)) == 0,
-        "initial scratch denial is ENOSPC and leaves no reservation");
+            wl_columnar_memory_governor_ref_get(source_governor))
+        == source_baseline,
+        "producer scratch denial is ENOSPC and leaves no reservation");
     atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
-            source_governor)->usable_bytes, scratch_bytes,
+            source_governor)->usable_bytes,
+        source_baseline + descriptor_bytes + scratch_bytes,
         memory_order_release);
     ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, left, false,
         &key, &key, 1, s->join_batch_bytes, &cont) == 0,
         "differential batch producer created");
+    admission_budget = descriptor_bytes + scratch_bytes;
     ASSERT_TRUE(wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(source_governor))
-        == admission_budget,
-        "initial scratch capacity is admitted against the source governor");
+        == source_baseline + admission_budget,
+        "descriptor and initial scratch capacity are admitted together");
     ASSERT_TRUE(col_rel_destroy_checked(left) == EBUSY,
         "left relation remains protected while continuation is live");
     col_join_batch_relation_sink_t sink_context;
@@ -2096,7 +2159,8 @@ test_diff_join_batch_signed_timestamps(void)
 
     wl_columnar_continuation_destroy(cont);
     ASSERT_TRUE(wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(source_governor)) == 0,
+            wl_columnar_memory_governor_ref_get(source_governor))
+        == source_baseline,
         "producer destruction releases scratch reservation exactly once");
     atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
             source_governor)->usable_bytes, scratch_bytes * 4u,
@@ -2111,10 +2175,12 @@ test_diff_join_batch_signed_timestamps(void)
     wl_columnar_continuation_destroy(cont);
     cont = NULL;
     ASSERT_TRUE(wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(source_governor)) == 0,
+            wl_columnar_memory_governor_ref_get(source_governor))
+        == source_baseline,
         "allocation failure releases scratch reservation");
     atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
-            source_governor)->usable_bytes, scratch_bytes,
+            source_governor)->usable_bytes,
+        source_baseline + descriptor_bytes + scratch_bytes,
         memory_order_release);
     ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, left, false,
         &key, &key, 1, s->join_batch_bytes, &cont) == 0,
@@ -2125,7 +2191,8 @@ test_diff_join_batch_signed_timestamps(void)
     wl_columnar_continuation_destroy(cont);
     cont = NULL;
     ASSERT_TRUE(wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(source_governor)) == 0,
+            wl_columnar_memory_governor_ref_get(source_governor))
+        == source_baseline,
         "runner denial releases scratch reservation after destruction");
     session_governor = make_test_governor(1024u * 1024u);
     ASSERT_TRUE(session_governor != NULL, "session governor created");

@@ -184,7 +184,8 @@ testlib_prod = static_library(
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_TEST_RELATION_RESIZE_HOOK=1',
-           '-DWL_TEST_JOIN_CACHE_HOOK=1'],
+           '-DWL_TEST_JOIN_CACHE_HOOK=1',
+           '-DWL_TEST_JOIN_BATCH_DESCRIPTOR_HOOKS=1'],
 )
 
 source_access_exe = executable(
