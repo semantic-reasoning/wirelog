@@ -2170,6 +2170,7 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
     wl_columnar_memory_governor_ref_t *memory_governor;
     const wl_columnar_memory_governor_t *governor;
     bool intern_attached_here = false;
+    int relation_create_rc = ENOMEM;
 
     if (!plan || !out)
         return EINVAL;
@@ -2594,12 +2595,10 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
     /* Pre-register EDB relations (ncols determined at first insert) */
     for (uint32_t i = 0; i < plan->edb_count; i++) {
         col_rel_t *r = NULL;
-        int rc = col_rel_alloc(&r, plan->edb_relations[i]);
-        if (rc != 0)
-            goto oom;
-        rc = col_rel_attach_memory_governor(r, sess->memory_governor);
+        int rc = wl_columnar_relation_alloc_governed(&r,
+                plan->edb_relations[i], sess->memory_governor);
         if (rc != 0) {
-            col_rel_destroy(r);
+            relation_create_rc = rc;
             goto oom;
         }
         /* Issue #535: propagate graph-column metadata from plan to col_rel_t.
@@ -2638,12 +2637,16 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
                 rc = col_rel_set_column_types(r,
                         plan->edb_column_types[i], type_count);
             if (rc != 0) {
+                relation_create_rc = rc == ENOMEM
+                    && r->memory_budget_denial_pending ? ENOSPC : rc;
                 col_rel_destroy(r);
                 goto oom;
             }
         }
         rc = session_add_rel(sess, r);
         if (rc != 0) {
+            relation_create_rc = rc == ENOMEM
+                && r->memory_budget_denial_pending ? ENOSPC : rc;
             col_rel_destroy(r);
             goto oom;
         }
@@ -2665,13 +2668,10 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
         if (any_graph_enabled
             && session_find_rel(sess, "__graph_metadata") == NULL) {
             col_rel_t *meta = NULL;
-            int rc = col_rel_alloc(&meta, "__graph_metadata");
-            if (rc != 0)
-                goto oom;
-            rc = col_rel_attach_memory_governor(meta,
-                    sess->memory_governor);
+            int rc = wl_columnar_relation_alloc_governed(&meta,
+                    "__graph_metadata", sess->memory_governor);
             if (rc != 0) {
-                col_rel_destroy(meta);
+                relation_create_rc = rc;
                 goto oom;
             }
             static const char *const meta_cols[6] = {
@@ -2680,11 +2680,15 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
             };
             rc = col_rel_set_schema(meta, 6, meta_cols);
             if (rc != 0) {
+                relation_create_rc = rc == ENOMEM
+                    && meta->memory_budget_denial_pending ? ENOSPC : rc;
                 col_rel_destroy(meta);
                 goto oom;
             }
             rc = session_add_rel(sess, meta);
             if (rc != 0) {
+                relation_create_rc = rc == ENOMEM
+                    && meta->memory_budget_denial_pending ? ENOSPC : rc;
                 col_rel_destroy(meta);
                 goto oom;
             }
@@ -2732,7 +2736,8 @@ oom:
             sess->intern, sess->memory_governor);
     wl_columnar_memory_governor_ref_release(sess->memory_governor);
     free(sess);
-    return ENOMEM;
+    return relation_create_rc == ENOSPC ? WL_ERR_MEMORY_BUDGET
+        : relation_create_rc;
 }
 
 /*

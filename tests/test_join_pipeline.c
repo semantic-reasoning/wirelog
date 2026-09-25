@@ -41,8 +41,7 @@ pipeline_session_destroy(wl_col_session_t *sess)
         return;
     wl_workqueue_destroy(sess->wq);
     for (uint32_t i = 0; i < sess->nrels; i++) {
-        col_rel_free_contents(sess->rels[i]);
-        free(sess->rels[i]);
+        col_rel_destroy(sess->rels[i]);
     }
     free(sess->rels);
     for (uint32_t i = 0; i < sess->arr_count; i++) {

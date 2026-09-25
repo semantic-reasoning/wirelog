@@ -1096,11 +1096,16 @@ test_worker_registry_pointer_admission(void)
 static void
 test_retained_relation_admission(void)
 {
+    const uint64_t descriptor_bytes = sizeof(col_rel_t)
+        + sizeof("retained");
+    const uint64_t denied_descriptor_bytes = sizeof(col_rel_t)
+        + sizeof("retained-denied");
     const uint64_t initial_bytes = 64u * sizeof(int64_t)
         + 64u * sizeof(col_delta_timestamp_t);
     const uint64_t grown_bytes = 128u * sizeof(int64_t)
         + 128u * sizeof(col_delta_timestamp_t);
-    const uint64_t exact_budget = initial_bytes + grown_bytes;
+    const uint64_t exact_budget = initial_bytes + grown_bytes
+        + descriptor_bytes;
     wl_columnar_memory_resolution_t resolution = { 0 };
     wl_columnar_memory_governor_ref_t *ref = NULL;
     col_rel_t *rel = NULL;
@@ -1133,7 +1138,8 @@ test_retained_relation_admission(void)
     if (rc != 0 || rel->capacity != 128u || rel->nrows != 65u
         || rel->timestamps[0].iteration != 0
         || wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(ref)) != grown_bytes) {
+            wl_columnar_memory_governor_ref_get(ref))
+        != grown_bytes + descriptor_bytes) {
         col_rel_destroy(rel);
         wl_columnar_memory_governor_ref_release(ref);
         FAIL("exact-fit retained growth was not committed");
@@ -1149,7 +1155,8 @@ test_retained_relation_admission(void)
         memory_order_acquire)
         != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
         || wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(ref)) != initial_bytes) {
+            wl_columnar_memory_governor_ref_get(ref))
+        != initial_bytes + descriptor_bytes) {
         col_rel_destroy(rel);
         wl_columnar_memory_governor_ref_release(ref);
         FAIL("governed non-empty compaction did not commit replacement");
@@ -1159,12 +1166,12 @@ test_retained_relation_admission(void)
     col_rel_compact(rel);
     if (rel->capacity != 0u
         || wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(ref)) != 0u
+            wl_columnar_memory_governor_ref_get(ref)) != descriptor_bytes
         || col_rel_append_row(rel, &row) != 0
         || rel->capacity != 64u
         || wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(ref))
-        != 64u * sizeof(int64_t)) {
+        != 64u * sizeof(int64_t) + descriptor_bytes) {
         col_rel_destroy(rel);
         wl_columnar_memory_governor_ref_release(ref);
         FAIL("empty compaction left a stale retained admission");
@@ -1181,8 +1188,9 @@ test_retained_relation_admission(void)
     PASS();
 
     TEST("retained relation denial preserves old rows and capacity");
-    resolution.usable_bytes = exact_budget - 1u;
-    resolution.budget_bytes = exact_budget - 1u;
+    resolution.usable_bytes = initial_bytes + grown_bytes
+        + denied_descriptor_bytes - 1u;
+    resolution.budget_bytes = resolution.usable_bytes;
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     rel = NULL;
     if (!ref || col_rel_alloc(&rel, "retained-denied") != 0
@@ -1202,7 +1210,8 @@ test_retained_relation_admission(void)
     rc = rc == 0 ? col_rel_append_row(rel, &row) : rc;
     if (rc != ENOMEM || rel->capacity != 64u || rel->nrows != 64u
         || wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(ref)) != initial_bytes) {
+            wl_columnar_memory_governor_ref_get(ref))
+        != initial_bytes + denied_descriptor_bytes) {
         col_rel_destroy(rel);
         wl_columnar_memory_governor_ref_release(ref);
         FAIL("denied retained growth changed relation state");
@@ -1219,8 +1228,10 @@ test_retained_relation_admission(void)
     PASS();
 
     TEST("batch compaction rolls back denied replacements");
-    resolution.usable_bytes = 4096u;
-    resolution.budget_bytes = 4096u;
+    const uint64_t batch_descriptor_bytes = 2u * sizeof(col_rel_t)
+        + sizeof("batch-first") + sizeof("batch-second");
+    resolution.usable_bytes = 4096u + batch_descriptor_bytes;
+    resolution.budget_bytes = resolution.usable_bytes;
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     col_rel_t *first = NULL;
     col_rel_t *second = NULL;
@@ -1246,18 +1257,21 @@ test_retained_relation_admission(void)
             rc = col_rel_append_row(second, second_row);
     }
     atomic_store_explicit(
-        &wl_columnar_memory_governor_ref_get(ref)->usable_bytes, 3584u,
+        &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
+        3584u + batch_descriptor_bytes,
         memory_order_release);
     first->nrows = 1;
     second->nrows = 1;
     int batch_rc = col_rel_compact_many((col_rel_t *[]) { first, second }, 2);
     if (rc != 0 || first->capacity != 128u || second->capacity != 128u
         || wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(ref)) != 3072u
+            wl_columnar_memory_governor_ref_get(ref))
+        != 3072u + batch_descriptor_bytes
         || batch_rc != 0
         || first->capacity != 128u || second->capacity != 128u
         || wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(ref)) != 3072u) {
+            wl_columnar_memory_governor_ref_get(ref))
+        != 3072u + batch_descriptor_bytes) {
         col_rel_destroy(first);
         col_rel_destroy(second);
         wl_columnar_memory_governor_ref_release(ref);
@@ -1279,6 +1293,8 @@ test_retained_relation_admission(void)
 static void
 test_bulk_relation_append_transaction(void)
 {
+    const uint64_t descriptor_bytes = sizeof(col_rel_t)
+        + sizeof("bulk-fresh");
     const uint64_t one_column_capacity_64 = 64u * sizeof(int64_t);
     const uint64_t one_column_capacity_128 = 128u * sizeof(int64_t);
     wl_columnar_memory_resolution_t resolution = { 0 };
@@ -1292,8 +1308,8 @@ test_bulk_relation_append_transaction(void)
     TEST("bulk append denial leaves unset schema unchanged, exact fit commits");
     for (uint32_t i = 0; i < 65u; i++)
         batch[i] = (int64_t)i + 1000;
-    resolution.budget_bytes = one_column_capacity_128 - 1u;
-    resolution.usable_bytes = one_column_capacity_128 - 1u;
+    resolution.budget_bytes = one_column_capacity_128 + descriptor_bytes - 1u;
+    resolution.usable_bytes = resolution.budget_bytes;
     resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
     resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
     resolution.status = WL_COLUMNAR_MEMORY_OK;
@@ -1310,7 +1326,7 @@ test_bulk_relation_append_transaction(void)
     if (rc != ENOMEM || !denied || rel->ncols != 0 || rel->nrows != 0
         || rel->capacity != 0 || rel->columns != NULL
         || wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(ref)) != 0) {
+            wl_columnar_memory_governor_ref_get(ref)) != descriptor_bytes) {
         col_rel_destroy(rel);
         wl_columnar_memory_governor_ref_release(ref);
         FAIL("denied lazy schema changed relation state");
@@ -1318,13 +1334,13 @@ test_bulk_relation_append_transaction(void)
     }
     atomic_store_explicit(
         &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
-        one_column_capacity_128, memory_order_release);
+        one_column_capacity_128 + descriptor_bytes, memory_order_release);
     rc = col_rel_append_rows_atomic(rel, batch, 65u, 1u, &denied);
     if (rc != 0 || denied || rel->ncols != 1 || rel->nrows != 65u
         || rel->capacity != 128u || rel->columns[0][64] != batch[64]
         || wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(ref))
-        != one_column_capacity_128) {
+        != one_column_capacity_128 + descriptor_bytes) {
         col_rel_destroy(rel);
         wl_columnar_memory_governor_ref_release(ref);
         FAIL("exact-fit lazy schema batch did not commit completely");
@@ -1348,8 +1364,11 @@ test_bulk_relation_append_transaction(void)
         + 64u * sizeof(col_delta_timestamp_t);
     const uint64_t new_bytes = one_column_capacity_128
         + 128u * sizeof(col_delta_timestamp_t);
-    resolution.budget_bytes = old_bytes + new_bytes;
-    resolution.usable_bytes = old_bytes + new_bytes;
+    const uint64_t populated_descriptor_bytes = sizeof(col_rel_t)
+        + sizeof("bulk-populated");
+    resolution.budget_bytes = old_bytes + new_bytes
+        + populated_descriptor_bytes;
+    resolution.usable_bytes = resolution.budget_bytes;
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     rel = NULL;
     if (!ref || col_rel_alloc(&rel, "bulk-populated") != 0
@@ -1381,7 +1400,8 @@ test_bulk_relation_append_transaction(void)
         || rel->storage_generation != old_storage_generation
         || rel->retained_reserved_bytes != old_bytes
         || wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(ref)) != old_bytes) {
+            wl_columnar_memory_governor_ref_get(ref))
+        != old_bytes + populated_descriptor_bytes) {
         col_rel_destroy(rel);
         wl_columnar_memory_governor_ref_release(ref);
         FAIL("invalid final row changed typed relation or admission");
@@ -1389,7 +1409,8 @@ test_bulk_relation_append_transaction(void)
     }
     atomic_store_explicit(
         &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
-        old_bytes + new_bytes - 1u, memory_order_release);
+        old_bytes + new_bytes + populated_descriptor_bytes - 1u,
+        memory_order_release);
     denied = false;
     rc = col_rel_append_rows_atomic(rel, batch, 2u, 1u, &denied);
     if (rc != ENOMEM || !denied || rel->columns != old_columns
@@ -1400,7 +1421,8 @@ test_bulk_relation_append_transaction(void)
         || rel->storage_generation != old_storage_generation
         || rel->retained_reserved_bytes != old_bytes
         || wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(ref)) != old_bytes) {
+            wl_columnar_memory_governor_ref_get(ref))
+        != old_bytes + populated_descriptor_bytes) {
         col_rel_destroy(rel);
         wl_columnar_memory_governor_ref_release(ref);
         FAIL("denied bulk growth changed populated relation");
@@ -1408,7 +1430,8 @@ test_bulk_relation_append_transaction(void)
     }
     atomic_store_explicit(
         &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
-        old_bytes + new_bytes, memory_order_release);
+        old_bytes + new_bytes + populated_descriptor_bytes,
+        memory_order_release);
     denied = true;
     rc = col_rel_append_rows_atomic(rel, batch, 2u, 1u, &denied);
     if (rc != 0 || denied || rel->capacity != 128u || rel->nrows != 66u
@@ -1416,7 +1439,8 @@ test_bulk_relation_append_transaction(void)
         || rel->columns[0][65] != batch[1]
         || rel->timestamps[64].iteration != 0
         || wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(ref)) != new_bytes) {
+            wl_columnar_memory_governor_ref_get(ref))
+        != new_bytes + populated_descriptor_bytes) {
         col_rel_destroy(rel);
         wl_columnar_memory_governor_ref_release(ref);
         FAIL("exact-fit populated batch did not commit completely");
@@ -1436,6 +1460,8 @@ test_bulk_relation_append_transaction(void)
 static void
 test_governed_compaction_transaction(void)
 {
+    const uint64_t descriptor_bytes = sizeof(col_rel_t)
+        + sizeof("compaction-transaction");
     const uint64_t old_bytes = 128u * sizeof(int64_t)
         + 128u * sizeof(col_delta_timestamp_t);
     const uint64_t new_bytes = 64u * sizeof(int64_t)
@@ -1462,8 +1488,8 @@ test_governed_compaction_transaction(void)
         } while (0)
 
     TEST("governed compaction admits overlap and retries conservatively");
-    resolution.budget_bytes = overlap_bytes;
-    resolution.usable_bytes = overlap_bytes;
+    resolution.budget_bytes = overlap_bytes + descriptor_bytes;
+    resolution.usable_bytes = resolution.budget_bytes;
     resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
     resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
     resolution.status = WL_COLUMNAR_MEMORY_OK;
@@ -1487,12 +1513,14 @@ test_governed_compaction_transaction(void)
     COMPACTION_CHECK(rel->capacity == 128u
         && rel->nrows == 65u
         && rel->retained_reserved_bytes == old_bytes
-        && wl_columnar_memory_reserved(governor) == old_bytes,
+        && wl_columnar_memory_reserved(governor)
+        == old_bytes + descriptor_bytes,
         "governed compaction old admission");
 
     old_columns = rel->columns;
     rel->nrows = 1;
-    atomic_store_explicit(&governor->usable_bytes, overlap_bytes - 1u,
+    atomic_store_explicit(&governor->usable_bytes,
+        overlap_bytes + descriptor_bytes - 1u,
         memory_order_release);
     rc = col_rel_compact(rel);
     wl_mem_ledger_snapshot(&ledger, &snapshot);
@@ -1500,11 +1528,13 @@ test_governed_compaction_transaction(void)
         && rel->capacity == 128u
         && atomic_load_explicit(&rel->retained_reservation.state,
         memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
-        && wl_columnar_memory_reserved(governor) == old_bytes
+        && wl_columnar_memory_reserved(governor)
+        == old_bytes + descriptor_bytes
         && snapshot.current_bytes == old_bytes,
         "governed compaction denied overlap changed state");
 
-    atomic_store_explicit(&governor->usable_bytes, overlap_bytes,
+    atomic_store_explicit(&governor->usable_bytes,
+        overlap_bytes + descriptor_bytes,
         memory_order_release);
     rc = col_rel_compact(rel);
     wl_mem_ledger_snapshot(&ledger, &snapshot);
@@ -1513,7 +1543,8 @@ test_governed_compaction_transaction(void)
         && rel->retained_reserved_bytes == new_bytes
         && atomic_load_explicit(&rel->retained_reservation.state,
         memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
-        && wl_columnar_memory_reserved(governor) == new_bytes
+        && wl_columnar_memory_reserved(governor)
+        == new_bytes + descriptor_bytes
         && snapshot.current_bytes == new_bytes
         && snapshot.subsys_bytes[WL_MEM_SUBSYS_RELATION]
         == 64u * sizeof(int64_t)
@@ -1526,16 +1557,19 @@ test_governed_compaction_transaction(void)
             "governed compaction retry growth");
     COMPACTION_CHECK(rel->capacity == 128u && rel->nrows == 65u
         && rel->retained_reserved_bytes == old_bytes
-        && wl_columnar_memory_reserved(governor) == old_bytes,
+        && wl_columnar_memory_reserved(governor)
+        == old_bytes + descriptor_bytes,
         "governed compaction retry old admission");
     rel->nrows = 16;
     old_columns = rel->columns;
-    atomic_store_explicit(&governor->usable_bytes, overlap_bytes,
+    atomic_store_explicit(&governor->usable_bytes,
+        overlap_bytes + descriptor_bytes,
         memory_order_release);
     COMPACTION_CHECK(
         wl_columnar_memory_begin_replacement(&rel->retained_reservation,
         new_bytes) == WL_COLUMNAR_MEMORY_ADMISSION_OK
-        && wl_columnar_memory_reserved(governor) == overlap_bytes,
+        && wl_columnar_memory_reserved(governor)
+        == overlap_bytes + descriptor_bytes,
         "governed compaction failure admission");
 
     /* The direct counter change simulates a governor accounting failure
@@ -1555,7 +1589,8 @@ test_governed_compaction_transaction(void)
         && snapshot.current_bytes == new_bytes,
         "governed compaction failure did not preserve retry state");
 
-    atomic_store_explicit(&governor->reserved_bytes, overlap_bytes,
+    atomic_store_explicit(&governor->reserved_bytes,
+        overlap_bytes + descriptor_bytes,
         memory_order_release);
     rc = col_rel_compact(rel);
     wl_mem_ledger_snapshot(&ledger, &snapshot);
@@ -1563,7 +1598,8 @@ test_governed_compaction_transaction(void)
         && rel->retained_reserved_bytes == new_bytes
         && atomic_load_explicit(&rel->retained_reservation.state,
         memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
-        && wl_columnar_memory_reserved(governor) == new_bytes
+        && wl_columnar_memory_reserved(governor)
+        == new_bytes + descriptor_bytes
         && snapshot.current_bytes == new_bytes,
         "governed compaction retry did not settle token");
 
@@ -1585,7 +1621,8 @@ cleanup:
         uint64_t replacement_bytes
             = rel->retained_reservation.replacement_bytes;
         atomic_store_explicit(&governor->reserved_bytes,
-            rel->retained_reserved_bytes + replacement_bytes,
+            rel->retained_reserved_bytes + replacement_bytes
+            + descriptor_bytes,
             memory_order_release);
         if (col_rel_transport_bytes(rel) == replacement_bytes)
             (void)col_rel_compact(rel);
@@ -2183,6 +2220,7 @@ test_session_injected_governor_admission(void)
     wl_mem_ledger_snapshot_t ledger;
     uint64_t intern_bytes = 0;
     uint64_t compound_bytes = 0;
+    uint64_t descriptor_bytes = 0;
     int rc;
 
     TEST("session(#1473): injected governor denies below the intern floor");
@@ -2203,6 +2241,9 @@ test_session_injected_governor_admission(void)
         FAIL("could not measure the create-time floor");
         return;
     }
+    for (uint32_t i = 0; i < plan->edb_count; i++)
+        descriptor_bytes += sizeof(col_rel_t)
+            + strlen(plan->edb_relations[i]) + 1u;
 
     /* The whole intern table is admitted transactionally; one byte short
      * fails creation before anything else is charged and leaves the
@@ -2269,12 +2310,12 @@ test_session_injected_governor_admission(void)
     wl_columnar_memory_governor_ref_release(ref);
     PASS();
 
-    /* Exact fit: creation succeeds on the injected governor itself, charges
-     * exactly the floor, and destroy releases everything but the
+    /* Exact fit includes the EDB descriptor/name alongside the existing
+     * intern, compound and registry floor. Destroy releases everything but the
      * program-owned intern reservation. */
     TEST("session(#1473): injected governor admits the exact floor");
     ref = enforcing_governor(intern_bytes + compound_bytes
-            + registry_bytes);
+            + registry_bytes + descriptor_bytes);
     options.memory_governor = ref;
     session = NULL;
     rc = ref ? wl_session_create_with_options(wl_backend_columnar(), plan, 1,
@@ -2286,9 +2327,9 @@ test_session_injected_governor_admission(void)
         || wl_session_memory_governor(session)
         != wl_columnar_memory_governor_ref_get(ref)
         || reserved_on(ref) != intern_bytes + compound_bytes
-        + registry_bytes
+        + registry_bytes + descriptor_bytes
         || ledger.total_budget != intern_bytes + compound_bytes
-        + registry_bytes) {
+        + registry_bytes + descriptor_bytes) {
         if (session)
             wl_session_destroy(session);
         if (ref)
