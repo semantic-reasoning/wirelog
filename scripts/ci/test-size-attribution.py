@@ -33,6 +33,11 @@ class SizeAttributionContractTests(unittest.TestCase):
         self.assertIn("- \"1945\"", workflow)
         self.assertIn("- \"1956\"", workflow)
         self.assertIn("SIZE_REDUCTION_PR_NUMBER = 1956", (ROOT / "scripts/ci/collect-size-attribution.py").read_text(encoding="utf-8"))
+        self.assertIn(
+            "description: 'Leave empty only for the initial PR #1903 or #1956 base/head report; "
+            "PR #1945 and later reductions require the reviewed fixed reference SHA and keep it fixed across runs'",
+            workflow,
+        )
         self.assertIn("reference_sha", workflow)
         self.assertIn("keep it fixed across runs", workflow)
         self.assertIn("GH_REFERENCE_SHA", workflow)

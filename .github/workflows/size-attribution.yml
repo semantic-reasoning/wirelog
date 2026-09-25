@@ -23,7 +23,7 @@ on:
         type: string
         default: "a4c7c622daa3b7247378acf71a74b7f40f4ff556"
       reference_sha:
-        description: Leave empty for the initial base/head report; for later reductions, use the initial candidate SHA and keep it fixed across runs and matched to each report
+        description: 'Leave empty only for the initial PR #1903 or #1956 base/head report; PR #1945 and later reductions require the reviewed fixed reference SHA and keep it fixed across runs'
         required: false
         type: string
         default: ""
