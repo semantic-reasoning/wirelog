@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
+#define XXH_STATIC_LINKING_ONLY
 #include <xxhash.h>
 
 static bool
@@ -113,16 +114,22 @@ wl_dedup_probe(const uint64_t *slots, uint32_t cap, uint64_t h,
 uint64_t
 wl_columnar_eval_dedup_row_hash(const col_rel_t *r, uint32_t row)
 {
-    int64_t buf[8];
-    int64_t *p = r->ncols <= 8 ? buf
-        : (int64_t *)malloc((size_t)r->ncols * sizeof(int64_t));
-    if (!p)
-        return 1; /* fallback: treat as unique */
-    for (uint32_t c = 0; c < r->ncols; c++)
-        p[c] = r->columns[c][row];
-    uint64_t h = XXH3_64bits(p, (size_t)r->ncols * sizeof(int64_t));
-    if (p != buf)
-        free(p);
+    uint64_t h;
+    if (r->ncols <= 8) {
+        int64_t buf[8];
+        for (uint32_t c = 0; c < r->ncols; c++)
+            buf[c] = r->columns[c][row];
+        h = XXH3_64bits(buf, (size_t)r->ncols * sizeof(int64_t));
+    } else {
+        XXH3_state_t state;
+        XXH3_INITSTATE(&state);
+        (void)XXH3_64bits_reset(&state);
+        for (uint32_t c = 0; c < r->ncols; c++) {
+            int64_t value = r->columns[c][row];
+            (void)XXH3_64bits_update(&state, &value, sizeof(value));
+        }
+        h = XXH3_64bits_digest(&state);
+    }
     return h ? h : 1; /* avoid 0 sentinel */
 }
 
