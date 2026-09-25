@@ -968,6 +968,36 @@ wl_columnar_session_pool_rel_move_reservation(col_rel_t *dst, col_rel_t *src)
     return true;
 }
 
+static bool
+session_pool_rel_move_metadata(col_rel_t *dst, col_rel_t *src)
+{
+    if (src->metadata_reserved_bytes == 0)
+        return true;
+    if (!src->memory_governor || dst->memory_governor != src->memory_governor
+        || dst->metadata_reserved_bytes != 0
+        || dst->metadata_reservation.identity != &dst->metadata_reservation
+        || src->metadata_reservation.identity != &src->metadata_reservation
+        || src->metadata_reservation.bytes != src->metadata_reserved_bytes
+        || src->metadata_reservation.governor
+        != wl_columnar_memory_governor_ref_get(src->memory_governor)
+        || atomic_load_explicit(&src->metadata_reservation.state,
+        memory_order_acquire) != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        || atomic_load_explicit(&src->metadata_reservation.owner_bits,
+        memory_order_acquire) != (uintptr_t)src)
+        return false;
+    if (!wl_columnar_memory_transfer(&src->metadata_reservation, dst))
+        return false;
+    if (!wl_columnar_memory_reservation_move(&dst->metadata_reservation,
+        &src->metadata_reservation)) {
+        if (!wl_columnar_memory_transfer(&src->metadata_reservation, src))
+            abort();
+        return false;
+    }
+    dst->metadata_reserved_bytes = src->metadata_reserved_bytes;
+    src->metadata_reserved_bytes = 0;
+    return true;
+}
+
 static int
 session_pool_rel_promote(col_rel_t *src,
     wl_columnar_memory_governor_ref_t *session_governor,
@@ -1021,7 +1051,23 @@ session_pool_rel_promote(col_rel_t *src,
     /* The pool name moves with its payload; discard the allocator's copy. */
     free(heap->name);
     heap->name = NULL;
+    if (src->metadata_reserved_bytes) {
+        if (!session_pool_rel_move_metadata(heap, src)) {
+            col_rel_destroy(heap);
+            rc = EBUSY;
+            goto fail;
+        }
+    } else if (governor) {
+        rc = wl_columnar_relation_admit_existing_metadata(heap, src);
+        if (rc != 0) {
+            col_rel_destroy(heap);
+            goto fail;
+        }
+    }
     if (!wl_columnar_session_pool_rel_move_reservation(heap, src)) {
+        if (src->memory_governor
+            && !session_pool_rel_move_metadata(src, heap))
+            abort();
         col_rel_destroy(heap);
         rc = EBUSY;
         goto fail;
@@ -1051,6 +1097,7 @@ session_pool_rel_promote(col_rel_t *src,
     src->deferred_relation_session = NULL;
     atomic_store_explicit(&src->storage_alias_borrows, 0,
         memory_order_relaxed);
+    wl_columnar_memory_reservation_init(&src->metadata_reservation);
     wl_columnar_memory_reservation_init(&src->retained_reservation);
     /* The pool slot remains permanently closed until pool reset/reuse. */
     descriptor_writer.owner = NULL;
@@ -1069,11 +1116,21 @@ session_pool_rel_rollback(col_rel_t *src, col_rel_t *heap,
     bool source_had_governor)
 {
     wl_columnar_memory_reservation_t descriptor;
+    wl_columnar_memory_reservation_t metadata;
     wl_columnar_memory_governor_ref_t *governor = heap->memory_governor;
 
     if (!wl_columnar_session_pool_rel_move_reservation(src, heap))
         abort();
     session_pool_rel_transfer_payload(src, heap);
+    wl_columnar_memory_reservation_init(&metadata);
+    if (source_had_governor) {
+        if (!session_pool_rel_move_metadata(src, heap))
+            abort();
+    } else if (heap->metadata_reserved_bytes
+        && !wl_columnar_memory_reservation_move(&metadata,
+        &heap->metadata_reservation)) {
+        abort();
+    }
     if (source_had_governor)
         wl_columnar_memory_governor_ref_retain(governor);
     else
@@ -1093,6 +1150,8 @@ session_pool_rel_rollback(col_rel_t *src, col_rel_t *heap,
         abort();
     free(heap);
     if (governor) {
+        if (metadata.bytes && !wl_columnar_memory_release(&metadata))
+            abort();
         if (!wl_columnar_memory_release(&descriptor))
             abort();
         wl_columnar_memory_governor_ref_release(governor);

@@ -3749,7 +3749,8 @@ test_staged_replacement_contract(void)
         CHECK(dst->retained_reserved_bytes == reserved_after
             && wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref))
-            == reserved_after + dst->descriptor_reserved_bytes,
+            == reserved_after + dst->descriptor_reserved_bytes
+            + dst->metadata_reserved_bytes,
             "replacement preserves memory admission accounting");
         cleanup_relations();
         if (ref)
@@ -3796,7 +3797,8 @@ test_staged_replacement_contract(void)
         CHECK(replacement.reservation_active && prepared_bytes > 0
             && wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref))
-            == reserved_before + prepared_bytes,
+            == reserved_before + prepared_bytes
+            + replacement.metadata_reserved_bytes,
             "locked prepare holds governed reservation");
         CHECK(replacement.writer.identity == (uintptr_t)&replacement.writer
             && replacement.writer.owner == &dst->source_access
@@ -3835,13 +3837,15 @@ test_staged_replacement_contract(void)
             && dst->retained_reserved_bytes == prepared_bytes
             && wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref))
-            == prepared_bytes + dst->descriptor_reserved_bytes,
+            == prepared_bytes + dst->descriptor_reserved_bytes
+            + dst->metadata_reserved_bytes,
             "locked commit transfers reservation and releases writer");
         CHECK(atomic_load_explicit(&dst->source_access.state,
             memory_order_acquire) == 0
             && wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref))
-            == reserved_before + prepared_bytes,
+            == prepared_bytes + dst->descriptor_reserved_bytes
+            + dst->metadata_reserved_bytes,
             "locked discard after commit is idempotent");
         cleanup_relations();
         CHECK(wl_columnar_memory_reserved(
@@ -4109,6 +4113,9 @@ test_staged_replacement_prepared_window(void)
     const uint64_t descriptor_bytes = sizeof(col_rel_t)
         + sizeof("generation_test")
         + sizeof(wl_columnar_memory_reservation_t);
+    const uint64_t one_column_metadata_bytes = 3u + sizeof(char *)
+        + sizeof(struct ArrowSchema *) + sizeof(struct ArrowSchema)
+        + 2u + 2u * sizeof("col0");
     wl_columnar_memory_resolution_t resolution = { 0 };
     wl_columnar_memory_governor_ref_t *ref = NULL;
     wl_columnar_memory_governor_t *governor = NULL;
@@ -4167,7 +4174,9 @@ test_staged_replacement_prepared_window(void)
             } \
         } while (0)
 
-    resolution.budget_bytes = 4096u + descriptor_bytes;
+    resolution.budget_bytes = 4096u + descriptor_bytes
+        + 2u * one_column_metadata_bytes
+        + 2u * sizeof(wirelog_column_type_t);
     resolution.usable_bytes = resolution.budget_bytes;
     resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
     resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
@@ -4392,6 +4401,7 @@ test_staged_replacement_prepared_window(void)
         && dst->retained_reserved_bytes == planned_bytes
         && wl_columnar_memory_reserved(governor)
         == planned_bytes + dst->descriptor_reserved_bytes
+        + dst->metadata_reserved_bytes
         && replacement.staged == NULL && !replacement.reservation_active
         && !replacement.writer_acquired
         && atomic_load_explicit(&dst->source_access.state,

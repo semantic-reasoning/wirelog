@@ -385,6 +385,9 @@ typedef struct col_rel {
      * descriptor lifetime. Pool descriptors are charged by their pool. */
     wl_columnar_memory_reservation_t descriptor_reservation;
     uint64_t descriptor_reserved_bytes;
+    /* Heap-owned schema names, types, and nested ArrowSchema allocations. */
+    wl_columnar_memory_reservation_t metadata_reservation;
+    uint64_t metadata_reserved_bytes;
     /* Set when governed admission was denied while preparing this relation. */
     uint8_t memory_budget_denial_pending;
     wl_columnar_memory_reservation_t retained_reservation;
@@ -554,9 +557,12 @@ typedef struct wl_columnar_relation_retirement_token {
 typedef struct col_rel_replacement {
     col_rel_t *staged;
     wl_columnar_memory_reservation_t reservation;
+    wl_columnar_memory_reservation_t metadata_reservation;
     wl_columnar_source_access_writer_t writer;
     uint64_t reserved_bytes;
+    uint64_t metadata_reserved_bytes;
     bool reservation_active;
+    bool metadata_reservation_active;
     bool writer_acquired;
 } col_rel_replacement_t;
 
@@ -581,6 +587,7 @@ extern void (*wl_columnar_relation_test_after_retired_storage_free)(
     const col_rel_t *);
 void wl_columnar_relation_test_fail_next_prepare_resize(void);
 void wl_columnar_relation_test_fail_next_reservation_commit(void);
+void wl_columnar_relation_test_fail_next_metadata_alloc(void);
 void wl_columnar_relation_test_watch_next_rollback_cleanup(void);
 bool wl_columnar_relation_test_rollback_cleanup_was_ordered(void);
 void wl_columnar_relation_test_fail_next_compact_rollback(void);
@@ -2711,6 +2718,10 @@ col_rel_new_auto(const char *name, uint32_t ncols);
 int
 wl_columnar_relation_alloc_governed(col_rel_t **out, const char *name,
     wl_columnar_memory_governor_ref_t *governor);
+/* Admit metadata moved from an ungoverned pool descriptor to a heap owner. */
+int
+wl_columnar_relation_admit_existing_metadata(col_rel_t *dst,
+    const col_rel_t *src);
 col_rel_t *
 col_rel_new_like(const char *name, const col_rel_t *src);
 /* Admit column/timestamp buffers before allocation; preserve required

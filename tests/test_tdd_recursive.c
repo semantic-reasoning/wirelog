@@ -2390,20 +2390,24 @@ test_owner_candidate_governed_rename(void)
         ok = ref && col_rel_attach_memory_governor(target, ref) == 0;
     if (ok) {
         governor = wl_columnar_memory_governor_ref_get(ref);
-        uint64_t exact = old_descriptor * 2u + new_descriptor + payload;
+        uint64_t metadata = target->metadata_reserved_bytes;
+        uint64_t exact = old_descriptor * 2u + new_descriptor + payload
+            + 2u * metadata;
         atomic_store_explicit(&governor->usable_bytes, exact - 1u,
             memory_order_release);
         ok = wl_columnar_eval_test_owner_build_candidate(target, new_name,
                 NULL, 0, true, &candidate) == ENOSPC && candidate == NULL
             && strcmp(target->name, old_name) == 0
-            && wl_columnar_memory_reserved(governor) == old_descriptor;
+            && wl_columnar_memory_reserved(governor)
+            == old_descriptor + metadata;
         atomic_store_explicit(&governor->usable_bytes, exact,
             memory_order_release);
         ok = ok && wl_columnar_eval_test_owner_build_candidate(target,
                 new_name, NULL, 0, true, &candidate) == 0 && candidate
             && strcmp(candidate->name, new_name) == 0
             && wl_columnar_memory_reserved(governor)
-            == old_descriptor + new_descriptor + payload;
+            == old_descriptor + new_descriptor + payload
+            + metadata + candidate->metadata_reserved_bytes;
     }
     col_rel_destroy(candidate);
     col_rel_destroy(target);
@@ -2905,6 +2909,8 @@ test_owner_publication_existing_targets(void)
         }
         uint64_t live_charge = low->descriptor_reserved_bytes
             + high->descriptor_reserved_bytes
+            + low->metadata_reserved_bytes
+            + high->metadata_reserved_bytes
             + low->retained_reserved_bytes
             + high->retained_reserved_bytes;
         OWNER_CHECK(wl_columnar_memory_reserved(
