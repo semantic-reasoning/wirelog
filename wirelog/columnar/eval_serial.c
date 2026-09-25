@@ -287,10 +287,12 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
             /* Dispose the externally observable result before publication.
             * Otherwise a refused destroy after append duplicates rows on
             * an initial snapshot retry. The private copy never escapes. */
-            col_rel_t *copy = wl_columnar_relation_new_like_governed(
-                "$publish", result->rel, sess->memory_governor);
-            if (!copy) {
-                rc = ENOMEM;
+            col_rel_t *copy = NULL;
+            rc = wl_columnar_relation_new_like_governed_checked(&copy,
+                    "$publish", result->rel, sess->memory_governor);
+            if (rc != 0) {
+                if (rc == ENOSPC)
+                    sess->memory_budget_denied = true;
                 goto done;
             }
             rc = eval_stack_push(stack, copy, true);
@@ -326,10 +328,12 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
             goto done;
         wl_columnar_memory_governor_ref_t *governor = sess->memory_governor
             ? sess->memory_governor : source->memory_governor;
-        col_rel_t *copy = wl_columnar_relation_pool_new_like_governed(
-            sess->delta_pool, rp->name, source, governor);
-        if (!copy) {
-            rc = ENOMEM;
+        col_rel_t *copy = NULL;
+        rc = wl_columnar_relation_pool_new_like_governed_checked(&copy,
+                sess->delta_pool, rp->name, source, governor);
+        if (rc != 0) {
+            if (rc == ENOSPC)
+                sess->memory_budget_denied = true;
         } else {
             result->rel = copy;
             result->owned = true;
@@ -820,17 +824,21 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 if (wl_columnar_eval_serial_test_before_delta_clone)
                     wl_columnar_eval_serial_test_before_delta_clone(sess, r);
 #endif
-                col_rel_t *delta = wl_columnar_relation_pool_new_like_governed(
-                    sess->delta_pool, dname, r, governor);
+                col_rel_t *delta = NULL;
+                int clone_rc =
+                    wl_columnar_relation_pool_new_like_governed_checked(
+                    &delta, sess->delta_pool, dname, r, governor);
                 int reader_release_rc =
                     col_rel_source_reader_release(&reader);
                 if (reader_release_rc != 0 && delta) {
                     col_rel_destroy(delta);
                     delta = NULL;
                 }
-                if (!delta) {
+                if (clone_rc != 0 || !delta) {
                     outer_rc = reader_release_rc != 0 ? reader_release_rc
-                                                      : ENOMEM;
+                                                      : clone_rc;
+                    if (outer_rc == ENOSPC)
+                        sess->memory_budget_denied = true;
                     goto stride_error;
                 }
 

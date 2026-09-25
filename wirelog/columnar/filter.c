@@ -673,10 +673,14 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
 
     wl_columnar_memory_governor_ref_t *governor = sess->memory_governor
         ? sess->memory_governor : e.rel->memory_governor;
-    col_rel_t *out = wl_columnar_relation_pool_new_like_governed(
-        sess->delta_pool, "$filter", e.rel, governor);
-    if (!out) {
-        return wl_columnar_filter_dispose_input(stack, &e, ENOMEM);
+    col_rel_t *out = NULL;
+    int constructor_rc =
+        wl_columnar_relation_pool_new_like_governed_checked(&out,
+            sess->delta_pool, "$filter", e.rel, governor);
+    if (constructor_rc != 0) {
+        if (constructor_rc == ENOSPC)
+            sess->memory_budget_denied = true;
+        return wl_columnar_filter_dispose_input(stack, &e, constructor_rc);
     }
 
     bool timestamped = e.rel->timestamps != NULL;

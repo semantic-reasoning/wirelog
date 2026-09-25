@@ -291,7 +291,8 @@ relation_charge(const col_rel_t *relation)
 {
     return relation->retained_reserved_bytes
            + relation->descriptor_reserved_bytes
-           + relation->metadata_reserved_bytes;
+           + relation->metadata_reserved_bytes
+           + relation->pool_name_reserved_bytes;
 }
 
 /*

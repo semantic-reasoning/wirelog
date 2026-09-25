@@ -1209,10 +1209,11 @@ wl_columnar_merge_consolidate_timestamped(eval_stack_t *stack,
             ? sess->memory_governor : entry.rel->memory_governor;
         /* Use a governed heap clone so constructor, timestamp, growth, and
          * merge scratch allocations are admitted before any mutation. */
-        copy = wl_columnar_relation_new_like_governed("$consol", entry.rel,
-                governor);
-        if (!copy) {
-            rc = ENOMEM;
+        rc = wl_columnar_relation_new_like_governed_checked(&copy,
+                "$consol", entry.rel, governor);
+        if (rc != 0) {
+            if (rc == ENOSPC && sess)
+                sess->memory_budget_denied = true;
             goto failed;
         }
         rc = col_rel_enable_timestamps(copy);

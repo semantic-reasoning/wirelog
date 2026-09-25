@@ -237,11 +237,13 @@ test_pool_descriptor_excluded(void)
     wl_arena_t *arena = wl_arena_create(4096);
     col_rel_t *relation = pool && arena
         ? col_rel_pool_new_auto(pool, arena, "pool", 1) : NULL;
-    make_resolution(&resolution, relation ? metadata_bytes(relation) : 0);
+    make_resolution(&resolution, relation ? metadata_bytes(relation)
+        + strlen(relation->name) + 1u : 0);
     wl_columnar_memory_governor_ref_t *ref
         = wl_columnar_memory_governor_ref_create(&resolution);
     CHECK(ref && relation && col_rel_attach_memory_governor(relation, ref)
         == 0 && relation->descriptor_reserved_bytes == 0
+        && relation->pool_name_reserved_bytes == strlen(relation->name) + 1u
         && relation->metadata_reserved_bytes == metadata_bytes(relation),
         "pool descriptor excluded from heap charge");
     if (relation)
@@ -256,6 +258,307 @@ test_pool_descriptor_excluded(void)
             "pool teardown leaves no descriptor charge");
         wl_columnar_memory_governor_ref_release(ref);
     }
+}
+
+static void
+test_checked_new_like_boundaries(void)
+{
+    col_rel_t *source = col_rel_new_auto("like-source", 1);
+    const wirelog_column_type_t type = WIRELOG_TYPE_FLOAT;
+    const col_rel_logical_col_t logical = {
+        WIRELOG_COMPOUND_KIND_SIDE, 2u, 1u
+    };
+    CHECK(source && col_rel_set_column_types(source, &type, 1) == 0
+        && col_rel_apply_compound_schema(source, &logical, 1) == 0,
+        "checked new-like source");
+    if (!source) return;
+    const uint64_t payload = (uint64_t)COL_REL_INIT_CAP * sizeof(int64_t);
+    const uint64_t typed = auto_metadata_bytes(1) + sizeof(type);
+    const uint64_t mapped = typed + sizeof(uint32_t);
+    for (unsigned route = 0; route < 2; route++) {
+        for (unsigned short_budget = 0; short_budget < 2; short_budget++) {
+            const char *name = route ? "pool-like" : "heap-like";
+            uint64_t identity = route ? strlen(name) + 1u
+                : descriptor_bytes(name);
+            uint64_t exact = identity + payload + typed + mapped;
+            wl_columnar_memory_resolution_t resolution;
+            make_resolution(&resolution, exact - short_budget);
+            wl_columnar_memory_governor_ref_t *ref
+                = wl_columnar_memory_governor_ref_create(&resolution);
+            delta_pool_t *pool = route
+                ? delta_pool_create(1, sizeof(col_rel_t), 4096) : NULL;
+            col_rel_t *copy = (col_rel_t *)(uintptr_t)1;
+            CHECK(ref && (!route || pool), "checked new-like governor/pool");
+            if (!ref || (route && !pool)) {
+                delta_pool_destroy(pool);
+                if (ref) wl_columnar_memory_governor_ref_release(ref);
+                continue;
+            }
+            int rc = route
+                ? wl_columnar_relation_pool_new_like_governed_checked(
+                &copy, pool, name, source, ref)
+                : wl_columnar_relation_new_like_governed_checked(
+                &copy, name, source, ref);
+            CHECK(short_budget ? rc == ENOSPC && copy == NULL
+                : rc == 0 && copy != NULL,
+                "checked new-like exact/one-byte boundary");
+            if (short_budget) {
+                CHECK(wl_columnar_memory_reserved(
+                        wl_columnar_memory_governor_ref_get(ref)) == 0
+                    && (!pool || pool->slot_used == 0),
+                    "checked denial restores token and slot");
+            } else if (copy) {
+                CHECK(copy->column_types
+                    && copy->column_types[0] == WIRELOG_TYPE_FLOAT
+                    && copy->compound_arity_len == 1
+                    && copy->metadata_reserved_bytes == mapped
+                    && copy->pool_name_reserved_bytes
+                    == (route ? strlen(name) + 1u : 0u)
+                    && copy->descriptor_reserved_bytes
+                    == (route ? 0u : descriptor_bytes(name))
+                    && wl_columnar_memory_reserved(
+                        wl_columnar_memory_governor_ref_get(ref))
+                    == identity + payload + mapped,
+                    "checked clone owns exact final shape");
+                if (copy != (col_rel_t *)(uintptr_t)1)
+                    col_rel_destroy(copy);
+            }
+            CHECK(wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(ref)) == 0,
+                "checked clone teardown releases all credits");
+            delta_pool_destroy(pool);
+            wl_columnar_memory_governor_ref_release(ref);
+        }
+    }
+    CHECK(col_rel_enable_timestamps(source) == 0,
+        "timestamped new-like source");
+    uint64_t timestamp_bytes = (uint64_t)COL_REL_INIT_CAP
+        * sizeof(col_delta_timestamp_t);
+    uint64_t timestamp_peak = descriptor_bytes("timed-like") + payload
+        + mapped + payload + timestamp_bytes;
+    for (unsigned short_budget = 0; short_budget < 2; short_budget++) {
+        wl_columnar_memory_resolution_t timed_resolution;
+        make_resolution(&timed_resolution, timestamp_peak - short_budget);
+        wl_columnar_memory_governor_ref_t *timed_ref
+            = wl_columnar_memory_governor_ref_create(&timed_resolution);
+        col_rel_t *timed = (col_rel_t *)(uintptr_t)1;
+        CHECK(timed_ref != NULL, "timestamp new-like governor");
+        if (!timed_ref) continue;
+        int timed_rc = wl_columnar_relation_new_like_governed_checked(
+            &timed, "timed-like", source, timed_ref);
+        CHECK(short_budget ? timed_rc == ENOSPC && timed == NULL
+            : timed_rc == 0 && timed && timed->timestamps
+            && timed->retained_reserved_bytes
+            == payload + timestamp_bytes,
+            "timestamp new-like exact/one-byte boundary");
+        col_rel_destroy(timed);
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(timed_ref)) == 0,
+            "timestamp new-like teardown");
+        wl_columnar_memory_governor_ref_release(timed_ref);
+    }
+    wl_columnar_memory_resolution_t resolution;
+    make_resolution(&resolution, 1u << 20);
+    wl_columnar_memory_governor_ref_t *ref
+        = wl_columnar_memory_governor_ref_create(&resolution);
+    delta_pool_t *pool = delta_pool_create(1, sizeof(col_rel_t), 4096);
+    if (ref && pool) {
+        col_rel_t *copy = (col_rel_t *)(uintptr_t)1;
+        wl_columnar_source_access_writer_t writer = { 0 };
+        CHECK(wl_columnar_source_access_writer_acquire(
+                &source->descriptor_access, &writer) == 0,
+            "checked source writer gate");
+        CHECK(wl_columnar_relation_new_like_governed_checked(&copy,
+            "busy", source, ref) == EBUSY && copy == NULL,
+            "checked clone refuses busy source before publication");
+        CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+            "checked source writer release");
+        wl_columnar_relation_test_fail_next_metadata_alloc();
+        CHECK(wl_columnar_relation_pool_new_like_governed_checked(&copy,
+            pool, "fault", source, ref) == ENOMEM && copy == NULL
+            && pool->slot_used == 0
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "pool allocation failure restores slot and credit");
+        col_rel_t *occupied = col_rel_pool_new_auto(pool, NULL, "used", 0);
+        CHECK(occupied && occupied->pool_owned, "fallback occupied slot");
+        CHECK(wl_columnar_relation_pool_new_like_governed_checked(&copy,
+            pool, "fallback", source, ref) == 0 && copy
+            && !copy->pool_owned && copy->descriptor_reserved_bytes > 0,
+            "exhausted pool falls back to admitted heap");
+        col_rel_destroy(copy);
+        col_rel_destroy(occupied);
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "heap fallback teardown");
+        source->compound_arity_len = 2;
+        copy = (col_rel_t *)(uintptr_t)1;
+        CHECK(wl_columnar_relation_pool_new_like_governed_checked(&copy,
+            pool, "invalid", source, ref) == EINVAL && copy == NULL,
+            "checked pool constructor rejects malformed source");
+        source->compound_arity_len = 1;
+    }
+    delta_pool_destroy(pool);
+    if (ref) wl_columnar_memory_governor_ref_release(ref);
+    col_rel_destroy(source);
+}
+
+static void
+test_pool_name_lifecycle(void)
+{
+    delta_pool_t *pool = delta_pool_create(1, sizeof(col_rel_t), 4096);
+    col_rel_t *rel = pool
+        ? col_rel_pool_new_auto(pool, NULL, "pool-old", 1) : NULL;
+    wl_columnar_memory_resolution_t resolution;
+    uint64_t name_bytes = strlen("pool-old") + 1u;
+    uint64_t metadata = rel ? metadata_bytes(rel) : 0;
+    make_resolution(&resolution, name_bytes + metadata - 1u);
+    wl_columnar_memory_governor_ref_t *ref
+        = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(rel && ref, "legacy pool-name fixture");
+    if (!rel || !ref) goto cleanup;
+    CHECK(col_rel_attach_memory_governor(rel, ref) == ENOSPC
+        && rel->memory_governor == NULL
+        && rel->pool_name_reserved_bytes == 0
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0,
+        "legacy pool attach one-byte denial is atomic");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes,
+        name_bytes + metadata, memory_order_release);
+    CHECK(col_rel_attach_memory_governor(rel, ref) == 0
+        && rel->descriptor_reserved_bytes == 0
+        && rel->pool_name_reserved_bytes == name_bytes,
+        "legacy pool attach admits exact name and metadata");
+    uint64_t live = name_bytes + metadata;
+    CHECK(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == live,
+        "legacy pool exact credit");
+    CHECK(wl_columnar_relation_rename_checked(rel, "pool-longer") == ENOSPC
+        && strcmp(rel->name, "pool-old") == 0
+        && rel->pool_name_reserved_bytes == name_bytes,
+        "governed pool rename denial keeps old name/token");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes,
+        1u << 20, memory_order_release);
+    CHECK(wl_columnar_relation_rename_checked(rel, "pool-longer") == 0
+        && rel->pool_name_reserved_bytes == strlen("pool-longer") + 1u,
+        "governed pool rename grows exact token");
+    CHECK(wl_columnar_relation_rename_checked(rel, "p") == 0
+        && rel->pool_name_reserved_bytes == 2u,
+        "governed pool rename shrinks exact token");
+    col_rel_t *candidate = col_rel_new_auto("candidate", 1);
+    col_rel_replacement_t replacement = { 0 };
+    CHECK(candidate && col_rel_prepare_replacement(rel, candidate,
+        &replacement) == 0, "pool replacement prepares");
+    if (replacement.staged)
+        col_rel_commit_replacement_locked(rel, &replacement);
+    col_rel_discard_replacement(&replacement);
+    CHECK(rel->pool_name_reserved_bytes == 2u
+        && rel->pool_name_reservation.bytes == 2u
+        && atomic_load_explicit(&rel->pool_name_reservation.owner_bits,
+        memory_order_acquire) == (uintptr_t)rel
+        && strcmp(rel->name, "p") == 0,
+        "pool replacement preserves name token");
+    col_rel_destroy(candidate);
+cleanup:
+    if (rel) col_rel_free_contents(rel);
+    delta_pool_destroy(pool);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "pool-name teardown releases credit");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_checked_new_like_schema_type_denial(void)
+{
+    col_rel_t *schema_source = col_rel_new_auto("schema-src", 1);
+    col_rel_t *typed_source = col_rel_new_auto("typed-src", 1);
+    const wirelog_column_type_t type = WIRELOG_TYPE_FLOAT;
+    CHECK(schema_source && typed_source
+        && col_rel_set_column_types(typed_source, &type, 1) == 0,
+        "schema/type denial sources");
+    if (!schema_source || !typed_source) goto cleanup;
+    uint64_t payload = (uint64_t)COL_REL_INIT_CAP * sizeof(int64_t);
+    uint64_t schema = auto_metadata_bytes(1);
+    uint64_t typed = schema + sizeof(type);
+    for (unsigned route = 0; route < 2; route++) {
+        for (unsigned stage = 0; stage < 2; stage++) {
+            const char *name = route ? "pool-stage" : "heap-stage";
+            const col_rel_t *source = stage ? typed_source : schema_source;
+            uint64_t identity = route ? strlen(name) + 1u
+                : descriptor_bytes(name);
+            uint64_t peak = identity + payload
+                + (stage ? schema + typed : schema);
+            for (unsigned short_budget = 0; short_budget < 2;
+                short_budget++) {
+                wl_columnar_memory_resolution_t resolution;
+                make_resolution(&resolution, peak - short_budget);
+                wl_columnar_memory_governor_ref_t *ref
+                    = wl_columnar_memory_governor_ref_create(&resolution);
+                delta_pool_t *pool = route
+                    ? delta_pool_create(1, sizeof(col_rel_t), 4096) : NULL;
+                col_rel_t *copy = (col_rel_t *)(uintptr_t)1;
+                CHECK(ref && (!route || pool), "schema/type stage fixture");
+                if (!ref || (route && !pool)) {
+                    delta_pool_destroy(pool);
+                    if (ref) wl_columnar_memory_governor_ref_release(ref);
+                    continue;
+                }
+                int rc = route
+                    ? wl_columnar_relation_pool_new_like_governed_checked(
+                    &copy, pool, name, source, ref)
+                    : wl_columnar_relation_new_like_governed_checked(&copy,
+                        name, source, ref);
+                CHECK(short_budget ? rc == ENOSPC && copy == NULL
+                    : rc == 0 && copy != NULL,
+                    "schema/type stage exact/one-byte typed result");
+                if (copy != (col_rel_t *)(uintptr_t)1)
+                    col_rel_destroy(copy);
+                CHECK(wl_columnar_memory_reserved(
+                        wl_columnar_memory_governor_ref_get(ref)) == 0
+                    && (!pool || !short_budget || pool->slot_used == 0),
+                    "schema/type stage rollback/teardown");
+                delta_pool_destroy(pool);
+                wl_columnar_memory_governor_ref_release(ref);
+            }
+        }
+    }
+cleanup:
+    col_rel_destroy(typed_source);
+    col_rel_destroy(schema_source);
+}
+
+static void
+test_checked_new_like_identity_overflow(void)
+{
+    col_rel_t *source = col_rel_new_auto("overflow-source", 1);
+    delta_pool_t *pool = delta_pool_create(1, sizeof(col_rel_t), 4096);
+    wl_columnar_memory_resolution_t resolution;
+    make_resolution(&resolution, 1u << 20);
+    wl_columnar_memory_governor_ref_t *ref
+        = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(source && pool && ref, "identity-overflow fixture");
+    if (source && pool && ref) {
+        col_rel_t *out = (col_rel_t *)(uintptr_t)1;
+        CHECK(col_rel_test_set_next_identity(UINT64_MAX) == 0
+            && wl_columnar_relation_new_like_governed_checked(&out,
+            "overflow", source, ref) == EOVERFLOW && out == NULL,
+            "checked heap reports identity overflow");
+        out = (col_rel_t *)(uintptr_t)1;
+        CHECK(wl_columnar_relation_pool_new_like_governed_checked(&out,
+            pool, "overflow", source, ref) == EOVERFLOW && out == NULL
+            && pool->slot_used == 0
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "checked pool reports identity overflow without slot use");
+    }
+    col_rel_destroy(source);
+    delta_pool_destroy(pool);
+    if (ref) wl_columnar_memory_governor_ref_release(ref);
 }
 
 static void
@@ -901,7 +1204,8 @@ test_arena_promotion_with_timestamps(void)
     col_rel_t *relation;
     int64_t value = 42;
 
-    make_resolution(&resolution, bytes + auto_metadata_bytes(1));
+    make_resolution(&resolution, bytes + auto_metadata_bytes(1)
+        + strlen("arena") + 1u);
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     pool = delta_pool_create(1, sizeof(col_rel_t), 4096);
     arena = wl_arena_create(4096);
@@ -924,7 +1228,8 @@ test_arena_promotion_with_timestamps(void)
             "arena promotion lost data or timestamps");
         CHECK(wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref))
-            == bytes + relation->metadata_reserved_bytes,
+            == bytes + relation->metadata_reserved_bytes
+            + relation->pool_name_reserved_bytes,
             "arena promotion reservation");
         col_rel_free_contents(relation);
     }
@@ -1025,7 +1330,8 @@ test_arena_promotion_denial_preserves_state(void)
     col_rel_t *relation = NULL;
     int64_t value = 7;
 
-    make_resolution(&resolution, bytes + auto_metadata_bytes(1) - 1u);
+    make_resolution(&resolution, bytes + auto_metadata_bytes(1)
+        + strlen("denied") + 1u - 1u);
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     pool = delta_pool_create(1, sizeof(col_rel_t), 4096);
     arena = wl_arena_create(4096);
@@ -1044,7 +1350,8 @@ test_arena_promotion_denial_preserves_state(void)
             "arena denial changed relation");
         CHECK(wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref))
-            == relation->metadata_reserved_bytes,
+            == relation->metadata_reserved_bytes
+            + relation->pool_name_reserved_bytes,
             "arena denial left reservation");
         col_rel_free_contents(relation);
     }
@@ -1183,7 +1490,8 @@ test_arena_append_all_admission_boundary(void)
     col_rel_t *src;
     int64_t value = 53;
 
-    make_resolution(&resolution, exact_bytes + auto_metadata_bytes(1));
+    make_resolution(&resolution, exact_bytes + auto_metadata_bytes(1)
+        + strlen("arena-append-exact") + 1u);
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     dst = ref ? make_full_arena_relation(&pool, &arena,
             "arena-append-exact", value) : NULL;
@@ -1200,7 +1508,8 @@ test_arena_append_all_admission_boundary(void)
             "arena append_all exact-fit state");
         CHECK(wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref))
-            == exact_bytes + dst->metadata_reserved_bytes,
+            == exact_bytes + dst->metadata_reserved_bytes
+            + dst->pool_name_reserved_bytes,
             "arena append_all exact-fit reservation");
         col_rel_destroy(src);
         col_rel_free_contents(dst);
@@ -1217,7 +1526,8 @@ test_arena_append_all_admission_boundary(void)
         wl_columnar_memory_governor_ref_release(ref);
 
     make_resolution(&resolution,
-        exact_bytes + auto_metadata_bytes(1) - 1u);
+        exact_bytes + auto_metadata_bytes(1)
+        + strlen("arena-append-denied") + 1u - 1u);
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     pool = NULL;
     arena = NULL;
@@ -1239,7 +1549,8 @@ test_arena_append_all_admission_boundary(void)
             "arena append_all denial changed state");
         CHECK(wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref))
-            == dst->metadata_reserved_bytes,
+            == dst->metadata_reserved_bytes
+            + dst->pool_name_reserved_bytes,
             "arena append_all denial left reservation");
         col_rel_destroy(src);
         col_rel_free_contents(dst);
@@ -1602,14 +1913,15 @@ test_governed_pool_clone_fallback(void)
         }
         uint64_t baseline = wl_columnar_memory_reserved(g);
         uint64_t payload = (uint64_t)COL_REL_INIT_CAP * sizeof(int64_t);
-        uint64_t heap_floor = route == 1 ? 0 : descriptor_bytes("retry");
+        uint64_t identity_floor = route == 1 ? strlen("retry") + 1u
+            : descriptor_bytes("retry");
         uint64_t metadata_final = auto_metadata_bytes(1)
             + sizeof(uint32_t);
         uint64_t metadata_floor = auto_metadata_bytes(1)
             + metadata_final;
         uint32_t used = pool ? pool->slot_used : 0;
         atomic_store_explicit(&g->usable_bytes,
-            baseline + payload + heap_floor + metadata_floor - 1,
+            baseline + payload + identity_floor + metadata_floor - 1,
             memory_order_release);
         clone = wl_columnar_relation_pool_new_like_governed(pool, "denied", src,
                 ref);
@@ -1619,7 +1931,7 @@ test_governed_pool_clone_fallback(void)
             "failed reservation restored");
         if (clone) goto cleanup;
         atomic_store_explicit(&g->usable_bytes,
-            baseline + payload + heap_floor + metadata_floor,
+            baseline + payload + identity_floor + metadata_floor,
             memory_order_release);
         clone = wl_columnar_relation_pool_new_like_governed(pool, "retry", src,
                 ref);
@@ -1633,6 +1945,9 @@ test_governed_pool_clone_fallback(void)
             && clone->metadata_reserved_bytes == metadata_final,
             "heap or pool clone admits its private compound map");
         CHECK(clone->pool_owned == (route == 1), "expected pool or heap route");
+        CHECK(clone->pool_name_reserved_bytes
+            == (route == 1 ? strlen("retry") + 1u : 0u),
+            "pool clone name admitted separately");
         CHECK(!clone->timestamps, "legacy timestamp mode unchanged");
         CHECK(col_rel_enable_timestamps(clone) != 0 && !clone->timestamps,
             "timestamp admission refusal");
@@ -2330,6 +2645,9 @@ main(void)
     test_heap_descriptor_admission();
     test_heap_descriptor_attach_and_replacement();
     test_pool_descriptor_excluded();
+    test_checked_new_like_boundaries();
+    test_checked_new_like_schema_type_denial();
+    test_pool_name_lifecycle();
     test_schema_metadata_admission();
     test_legacy_metadata_attach();
     test_zero_width_schema_metadata();
@@ -2359,6 +2677,7 @@ main(void)
     test_heap_append_all_admission_boundary();
     test_cow_capacity_denial_preserves_state();
     test_cow_ledger_reconcile_is_exact_once();
+    test_checked_new_like_identity_overflow();
     if (failures != 0)
         return 1;
     puts("memory admission relation: PASS");

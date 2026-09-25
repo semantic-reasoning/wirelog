@@ -5343,7 +5343,7 @@ test_serial_cleanup_admission_and_failures(bool recursive, uint32_t workers)
         atomic_store_explicit(&budget->usable_bytes, saved_limit,
             memory_order_relaxed);
         serial_deny_copy = false;
-        SERIAL_FAIL_CHECK(rc == ENOMEM
+        SERIAL_FAIL_CHECK(rc == (mode ? ENOSPC : ENOMEM)
             && !fail_next_alloc && target->nrows == 0
             && target->view_generation == target_generation
             && wl_columnar_memory_reserved(budget) == reserved_before
@@ -12281,6 +12281,7 @@ test_governed_pool_publication(unsigned mode)
     };
     uint64_t bytes = candidate->retained_reserved_bytes;
     uint64_t metadata_bytes = candidate->metadata_reserved_bytes;
+    uint64_t pool_name_bytes = candidate->pool_name_reserved_bytes;
     uint32_t *map = candidate->compound_arity_map;
     uint64_t reserved = reserved_on(ref);
     uint64_t identity = candidate->relation_identity;
@@ -12317,6 +12318,11 @@ test_governed_pool_publication(unsigned mode)
             && candidate->compound_arity_map == map
             && candidate->compound_arity_len == 1
             && candidate->metadata_reserved_bytes == metadata_bytes
+            && candidate->pool_name_reserved_bytes == pool_name_bytes
+            && candidate->pool_name_reservation.bytes == pool_name_bytes
+            && atomic_load_explicit(
+                &candidate->pool_name_reservation.owner_bits,
+                memory_order_acquire) == (uintptr_t)candidate
             && atomic_load_explicit(&candidate->metadata_reservation.owner_bits,
             memory_order_acquire) == (uintptr_t)candidate
             && candidate->relation_identity == identity
@@ -12355,7 +12361,9 @@ test_governed_pool_publication(unsigned mode)
         memory_order_acquire) == (uintptr_t)result
         && result->retained_reserved_bytes == bytes
         && result->descriptor_reserved_bytes > 0
+        && result->pool_name_reserved_bytes == 0
         && reserved_on(ref) == reserved + result->descriptor_reserved_bytes
+        - pool_name_bytes
         && candidate->memory_governor == NULL
         && candidate->retained_reserved_bytes == 0
         && result->timestamps[0].multiplicity == -3,
@@ -12534,6 +12542,7 @@ observe_serial_borrowed_clone(wl_col_session_t *sess, eval_stack_t *stack,
                 wl_columnar_memory_governor_ref_get(sess->memory_governor);
             atomic_store_explicit(&g->usable_bytes,
                 reserved_on(sess->memory_governor)
+                + strlen("output") + 1u + test_auto_metadata_bytes(1)
                 + (uint64_t)COL_REL_INIT_CAP * sizeof(int64_t),
                 memory_order_release);
         }
@@ -12615,7 +12624,8 @@ test_serial_borrowed_clone_admission(uint32_t workers, unsigned denial,
             int rc = wl_columnar_eval_serial_framed_relation(&output, sess,
                     false);
             idb_restore_budget(sess);
-            CLONE_CHECK(rc == ENOMEM && !session_find_rel(sess, "output")
+            CLONE_CHECK(rc == (denial == 1 ? ENOSPC : ENOMEM)
+                && !session_find_rel(sess, "output")
                 && input->columns == columns &&
                 input->view_generation == generation
                 && input->nrows == count && !sess->cleanup_active
