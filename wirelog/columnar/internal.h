@@ -460,12 +460,11 @@ typedef struct col_rel {
      *   Number of inline-kind logical columns in this relation.  Zero
      *   when compound_kind != INLINE.
      *
-     * compound_arity_map
-     *   Owned array of length equal to the LOGICAL column count.  Entry
+     * compound_arity_map / compound_arity_len
+     *   Owned array of compound_arity_len logical entries. Entry
      *   i is the expansion arity of logical column i: 1 for a scalar
-     *   column, N (>=1) for an inline compound of arity N.  NULL when
-     *   compound_kind != INLINE; Phase 2B populates this during schema
-     *   inference.  Freed on relation destruction.
+     *   column, N (>=1) for an inline compound of arity N. NULL exactly
+     *   when compound_arity_len is zero. Freed on relation destruction.
      *
      * inline_physical_offset
      *   Physical column index at which the first inline compound slot
@@ -473,14 +472,13 @@ typedef struct col_rel {
      *   matches the prefix-sum of compound_arity_map entries that
      *   precede the first inline compound.
      *
-     * Phase 1 (this commit) introduces the fields only.  Logic that
-     * populates and consumes them lands in Phase 2 (Issue #532, Tasks
-     * #2-#4).  All allocation paths zero-initialise these slots via
-     * calloc(), and col_rel_free_contents() frees compound_arity_map.
+     * Every map read is bounded by compound_arity_len and validates that
+     * positive entries sum to physical ncols.
      */
     wirelog_compound_kind_t compound_kind;
     uint32_t compound_count;
     uint32_t *compound_arity_map;
+    uint32_t compound_arity_len;
     uint32_t inline_physical_offset;
 
     /* Issue #1038: the relation's declared *physical* width, propagated from
@@ -2726,6 +2724,8 @@ wl_columnar_relation_alloc_governed(col_rel_t **out, const char *name,
 int
 wl_columnar_relation_admit_existing_metadata(col_rel_t *dst,
     const col_rel_t *src);
+bool
+wl_columnar_relation_compound_map_valid(const col_rel_t *r);
 col_rel_t *
 col_rel_new_like(const char *name, const col_rel_t *src);
 /* Admit column/timestamp buffers before allocation; preserve required

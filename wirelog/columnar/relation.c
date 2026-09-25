@@ -756,7 +756,7 @@ col_rel_reservation_rollback(wl_columnar_memory_reservation_t *reservation)
 static bool
 col_rel_prospective_metadata_bytes(uint32_t ncols,
     const char *const *names, bool names_owned, bool generated_names,
-    bool types, bool schema, uint64_t *out)
+    bool types, bool schema, uint32_t compound_len, uint64_t *out)
 {
     uint64_t bytes = schema ? 3u : 0u;
     if (!out)
@@ -788,14 +788,53 @@ col_rel_prospective_metadata_bytes(uint32_t ncols,
                 return false;
         }
     }
+    if (!wl_columnar_memory_size_add(bytes,
+        (uint64_t)compound_len * sizeof(uint32_t), &bytes))
+        return false;
     *out = bytes;
     return true;
 }
 
 static bool
+col_rel_compound_map_valid_for(const col_rel_t *r, uint32_t ncols)
+{
+    uint32_t width = 0;
+    if (!r || (r->compound_arity_map == NULL)
+        != (r->compound_arity_len == 0)
+        || r->compound_arity_len > ncols)
+        return false;
+    if (r->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        && r->compound_kind != WIRELOG_COMPOUND_KIND_INLINE
+        && r->compound_kind != WIRELOG_COMPOUND_KIND_SIDE)
+        return false;
+    if (r->compound_kind == WIRELOG_COMPOUND_KIND_INLINE) {
+        if (r->compound_arity_len == 0 || r->compound_count == 0
+            || r->compound_count > r->compound_arity_len
+            || r->inline_physical_offset >= ncols)
+            return false;
+    } else if (r->compound_count != 0 || r->inline_physical_offset != 0)
+        return false;
+    for (uint32_t i = 0; i < r->compound_arity_len; i++) {
+        uint32_t arity = r->compound_arity_map[i];
+        if (arity == 0 || arity > ncols - width)
+            return false;
+        width += arity;
+    }
+    return r->compound_arity_len == 0
+        ? r->compound_kind == WIRELOG_COMPOUND_KIND_NONE
+        : width == ncols;
+}
+
+bool
+wl_columnar_relation_compound_map_valid(const col_rel_t *r)
+{
+    return r && col_rel_compound_map_valid_for(r, r->ncols);
+}
+
+static bool
 col_rel_current_metadata_bytes(const col_rel_t *r, uint64_t *out)
 {
-    if (!r || !out)
+    if (!r || !out || !wl_columnar_relation_compound_map_valid(r))
         return false;
     /* Wirelog builds flat struct schemas. Reject an externally changed tree
     * rather than admitting bytes the flat-shape formula cannot describe. */
@@ -823,7 +862,8 @@ col_rel_current_metadata_bytes(const col_rel_t *r, uint64_t *out)
     }
     return col_rel_prospective_metadata_bytes(r->ncols,
                (const char *const *)r->col_names, r->col_names != NULL, false,
-               r->column_types != NULL, r->schema_ok, out);
+               r->column_types != NULL, r->schema_ok, r->compound_arity_len,
+               out);
 }
 
 static int
@@ -2082,9 +2122,12 @@ col_rel_set_schema_impl_capacity(col_rel_t *r, uint32_t ncols,
         if (r->timestamp_capacity > initial_capacity)
             initial_capacity = r->timestamp_capacity;
     }
+    if (!col_rel_compound_map_valid_for(r, ncols))
+        return EINVAL;
     retained_timestamps = with_timestamps || r->timestamps != NULL;
     if (!col_rel_prospective_metadata_bytes(ncols, col_names, ncols > 0,
-        true, r->column_types != NULL, true, &metadata_bytes))
+        true, r->column_types != NULL, true, r->compound_arity_len,
+        &metadata_bytes))
         return EOVERFLOW;
     failure_rc = col_rel_reserve_metadata(r, metadata_bytes,
             &metadata_pending);
@@ -2288,9 +2331,11 @@ col_rel_set_column_types_impl(col_rel_t *r,
 
     if (!r || ncols != r->ncols)
         return EINVAL;
+    if (!wl_columnar_relation_compound_map_valid(r))
+        return EINVAL;
     if (!col_rel_prospective_metadata_bytes(ncols,
         (const char *const *)r->col_names, r->col_names != NULL, false,
-        true, true, &metadata_bytes))
+        true, true, r->compound_arity_len, &metadata_bytes))
         return EOVERFLOW;
     rc = col_rel_reserve_metadata(r, metadata_bytes, &pending);
     if (rc != 0)
@@ -2581,22 +2626,48 @@ col_rel_apply_compound_schema_impl(col_rel_t *r,
     uint32_t compound_count = 0u;
     uint32_t inline_offset = 0u;
     uint32_t physical_ncols = 0u;
+    uint64_t map_bytes = 0;
+    if (!wl_columnar_memory_size_mul(logical_ncols, sizeof(uint32_t),
+        &map_bytes) || map_bytes > SIZE_MAX)
+        return EOVERFLOW;
     int rc = col_rel_compute_physical_layout(logical_cols, logical_ncols,
             &physical_ncols, NULL, &inline_offset, &compound_count);
     if (rc != 0)
         return rc;
     if (r->ncols != 0 && physical_ncols != r->ncols)
         return EINVAL;
+    if (r->ncols != 0 && !wl_columnar_relation_compound_map_valid(r))
+        return EINVAL;
     if (!wl_columnar_relation_generation_valid(r->view_generation)
         || r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
         return EOVERFLOW;
 
-    uint32_t *arity_map
-        = (uint32_t *)malloc((size_t)logical_ncols * sizeof(uint32_t));
-    if (!arity_map) {
+    uint64_t metadata_bytes = 0;
+    wl_columnar_memory_reservation_t pending, old_metadata;
+    if (!col_rel_prospective_metadata_bytes(r->ncols,
+        (const char *const *)r->col_names, r->col_names != NULL, false,
+        r->column_types != NULL, r->schema_ok, logical_ncols,
+        &metadata_bytes))
+        return EOVERFLOW;
+    rc = col_rel_reserve_metadata(r, metadata_bytes, &pending);
+    if (rc != 0)
+        return rc == ENOSPC ? ENOMEM : rc;
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    if (wl_columnar_relation_test_fail_metadata_alloc) {
+        wl_columnar_relation_test_fail_metadata_alloc = false;
+        col_rel_reservation_rollback(&pending);
+        return ENOMEM;
+    }
+#endif
+
+    uint32_t *arity_map = logical_ncols
+        ? (uint32_t *)malloc((size_t)map_bytes)
+        : NULL;
+    if (logical_ncols && !arity_map) {
+        col_rel_reservation_rollback(&pending);
         WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_ERROR,
             "event=apply_schema error=oom bytes=%zu",
-            (size_t)logical_ncols * sizeof(uint32_t));
+            (size_t)map_bytes);
         return ENOMEM;
     }
 
@@ -2610,9 +2681,10 @@ col_rel_apply_compound_schema_impl(col_rel_t *r,
             has_side = true;
     }
 
-    /* Commit: free any prior map before taking ownership of the new one. */
-    free(r->compound_arity_map);
+    /* The pending token covers the new map while the old map is still live. */
+    uint32_t *old_map = r->compound_arity_map;
     r->compound_arity_map = arity_map;
+    r->compound_arity_len = logical_ncols;
     r->compound_count = compound_count;
     r->inline_physical_offset = inline_offset;
     const char *path_tag;
@@ -2626,6 +2698,9 @@ col_rel_apply_compound_schema_impl(col_rel_t *r,
         r->compound_kind = WIRELOG_COMPOUND_KIND_NONE;
         path_tag = "none";
     }
+    col_rel_publish_metadata(r, &pending, metadata_bytes, &old_metadata);
+    free(old_map);
+    col_rel_release_reservation_or_abort(&old_metadata);
     WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_DEBUG,
         "event=apply_schema path=%s rel=%s logical=%u compound_count=%u "
         "inline_offset=%u",
@@ -3482,6 +3557,9 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
     (void)arena;
     if (!dst || !src || dst->ncols != src->ncols)
         return EINVAL;
+    if (!wl_columnar_relation_compound_map_valid(dst)
+        || !wl_columnar_relation_compound_map_valid(src))
+        return EINVAL;
     wl_columnar_memory_reservation_init(&metadata_pending);
     if (src->nrows == 0) {
         /* An empty source still completes a destination ownership
@@ -3608,7 +3686,7 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
     if (!dst->column_types && src->column_types) {
         if (!col_rel_prospective_metadata_bytes(dst->ncols,
             (const char *const *)dst->col_names, dst->col_names != NULL,
-            false, true, true, &metadata_bytes))
+            false, true, true, dst->compound_arity_len, &metadata_bytes))
             goto overflow;
         rc = col_rel_reserve_metadata(dst, metadata_bytes,
                 &metadata_pending);
@@ -4265,6 +4343,14 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
     int prepare_rc = ENOMEM;
     if (!dst || !src || dst == src || dst->ncols != src->ncols)
         return EINVAL;
+    if (dst->memory_governor
+        && (dst->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        || dst->compound_arity_map || dst->compound_arity_len
+        || dst->compound_count || dst->inline_physical_offset
+        || src->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        || src->compound_arity_map || src->compound_arity_len
+        || src->compound_count || src->inline_physical_offset))
+        return ENOTSUP;
     if (!dst->storage_owner)
         col_rel_storage_owner_init(dst);
     if (col_rel_storage_owner_resolve(src, &source_owner) != 0
@@ -4293,43 +4379,18 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
         return EOVERFLOW;
     if (src->has_graph_column && src->graph_col_idx >= src->ncols)
         return EINVAL;
-    if (src->compound_kind != WIRELOG_COMPOUND_KIND_NONE
-        && src->compound_kind != WIRELOG_COMPOUND_KIND_INLINE
-        && src->compound_kind != WIRELOG_COMPOUND_KIND_SIDE)
+    if (!wl_columnar_relation_compound_map_valid(src))
         return EINVAL;
-    /* The map has no separate length field.  Bound the inferred logical
-     * length by the physical width because every valid entry contributes at
-     * least one physical slot. */
-    if (src->compound_kind != WIRELOG_COMPOUND_KIND_NONE) {
-        if (!src->compound_arity_map || src->ncols == 0u)
-            return EINVAL;
-        uint64_t physical_width = 0;
-        while (shared_arity_len < src->ncols
-            && physical_width < src->ncols) {
-            uint32_t arity = src->compound_arity_map[shared_arity_len];
-            if (arity == 0u
-                || physical_width + (uint64_t)arity > src->ncols)
-                return EINVAL;
-            physical_width += arity;
-            shared_arity_len++;
-        }
-        if (physical_width != src->ncols || shared_arity_len == 0u)
-            return EINVAL;
-        if (src->compound_kind == WIRELOG_COMPOUND_KIND_INLINE) {
-            if (src->compound_count == 0u
-                || src->compound_count > shared_arity_len
-                || src->inline_physical_offset >= src->ncols)
-                return EINVAL;
-        } else if (src->compound_count != 0u
-            || src->inline_physical_offset != 0u) {
-            return EINVAL;
-        }
-        shared_arity_map = (uint32_t *)malloc(
-            (size_t)shared_arity_len * sizeof(*shared_arity_map));
+    shared_arity_len = src->compound_arity_len;
+    if (shared_arity_len) {
+        uint64_t map_bytes = 0;
+        if (!wl_columnar_memory_size_mul(shared_arity_len,
+            sizeof(*shared_arity_map), &map_bytes) || map_bytes > SIZE_MAX)
+            return EOVERFLOW;
+        shared_arity_map = (uint32_t *)malloc((size_t)map_bytes);
         if (!shared_arity_map)
             goto prepare_fail;
-        memcpy(shared_arity_map, src->compound_arity_map,
-            (size_t)shared_arity_len * sizeof(*shared_arity_map));
+        memcpy(shared_arity_map, src->compound_arity_map, (size_t)map_bytes);
         shared_compound_kind = src->compound_kind;
         shared_compound_count = src->compound_count;
         shared_inline_physical_offset = src->inline_physical_offset;
@@ -4457,6 +4518,7 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
         dst->compound_kind = shared_compound_kind;
         dst->compound_count = shared_compound_count;
         dst->compound_arity_map = shared_arity_map;
+        dst->compound_arity_len = shared_arity_len;
         dst->inline_physical_offset = shared_inline_physical_offset;
         dst->col_names = shared_names;
         dst->arena_owned = false;
@@ -4729,53 +4791,55 @@ col_rel_col_idx(const col_rel_t *r, const char *name)
 
 /*
  * col_rel_clone_compound_meta:
- * Replicate src's compound metadata onto dst. Mirrors the logical-column
- * walk used by col_rel_new_like / col_rel_pool_new_like (Issue #534): walk
- * src->compound_arity_map summing widths until physical ncols are covered,
- * then deep-copy that many entries so dst and src destroy paths stay
- * independent (K-Fusion isolation, Issue #553).
+ * Replicate src's validated, explicitly sized compound map onto dst so
+ * source and destination destroy paths stay independent.
  *
- * Src must satisfy: src->compound_kind != WIRELOG_COMPOUND_KIND_NONE,
- * src->compound_arity_map != NULL, src->ncols > 0. Callers gate on these.
+ * Src must carry a valid nonempty map. A governed destination reserves its
+ * complete prospective metadata image unless the caller already did so.
  *
  * Returns 0 on success (compound metadata installed on dst), -1 on
  * width-inconsistency, -2 on allocation failure (dst's compound metadata is
  * left untouched, matching the existing graceful-degrade behaviour).
  */
 static int
-col_rel_clone_compound_meta(col_rel_t *dst, const col_rel_t *src)
+col_rel_clone_compound_meta(col_rel_t *dst, const col_rel_t *src,
+    bool metadata_prepaid)
 {
-    /* compound_arity_map is keyed by LOGICAL column index, but we record
-     * at least as many entries as the physical ncols to match the
-     * source's allocation footprint. Walk the source map summing widths
-     * until we cover ncols physical slots, then copy that many entries.
-     * Bail gracefully on any inconsistency. */
-    uint32_t logical_count = 0u;
-    uint32_t acc = 0u;
-    while (acc < src->ncols) {
-        if (logical_count >= src->ncols
-            || src->compound_arity_map[logical_count] == 0u
-            || src->compound_arity_map[logical_count] > src->ncols - acc) {
-            /* Corrupt width -- leave compound metadata cleared rather
-             * than propagating the inconsistency. */
-            return -1;
-        }
-        acc += src->compound_arity_map[logical_count];
-        logical_count++;
-    }
-    if (logical_count == 0u || acc != src->ncols)
+    wl_columnar_memory_reservation_t pending, old_metadata;
+    uint64_t metadata_bytes = 0;
+    if (!dst || !src || !wl_columnar_relation_compound_map_valid(src)
+        || src->compound_arity_len == 0 || dst->compound_arity_map)
         return -1;
-
-    uint32_t *copy = (uint32_t *)malloc(
-        (size_t)logical_count * sizeof(uint32_t));
-    if (!copy)
+    uint64_t map_bytes = 0;
+    if (!wl_columnar_memory_size_mul(src->compound_arity_len,
+        sizeof(uint32_t), &map_bytes) || map_bytes > SIZE_MAX)
+        return -1;
+    if (!metadata_prepaid) {
+        if (!col_rel_prospective_metadata_bytes(dst->ncols,
+            (const char *const *)dst->col_names,
+            dst->col_names != NULL, false, dst->column_types != NULL,
+            dst->schema_ok, src->compound_arity_len, &metadata_bytes))
+            return -1;
+        if (col_rel_reserve_metadata(dst, metadata_bytes, &pending) != 0)
+            return -2;
+    }
+    uint32_t *copy = (uint32_t *)malloc((size_t)map_bytes);
+    if (!copy) {
+        if (!metadata_prepaid)
+            col_rel_reservation_rollback(&pending);
         return -2;
-    memcpy(copy, src->compound_arity_map,
-        (size_t)logical_count * sizeof(uint32_t));
+    }
+    memcpy(copy, src->compound_arity_map, (size_t)map_bytes);
     dst->compound_arity_map = copy;
+    dst->compound_arity_len = src->compound_arity_len;
     dst->compound_kind = src->compound_kind;
     dst->compound_count = src->compound_count;
     dst->inline_physical_offset = src->inline_physical_offset;
+    if (!metadata_prepaid) {
+        col_rel_publish_metadata(dst, &pending, metadata_bytes,
+            &old_metadata);
+        col_rel_release_reservation_or_abort(&old_metadata);
+    }
     return 0;
 }
 
@@ -4861,9 +4925,9 @@ wl_columnar_relation_new_like_impl(const char *name, const col_rel_t *src,
     /* Required metadata cannot be silently dropped: that would change
      * interpretation of the same physical columns. Deep-copy retains its
      * separate historical contract. */
-    if (src->compound_kind != WIRELOG_COMPOUND_KIND_NONE
-        && (!src->compound_arity_map || src->ncols == 0u
-        || col_rel_clone_compound_meta(r, src) != 0)) {
+    if ((!wl_columnar_relation_compound_map_valid(src))
+        || (src->compound_arity_len > 0
+        && col_rel_clone_compound_meta(r, src, false) != 0)) {
         col_rel_destroy(r);
         return NULL;
     }
@@ -4938,10 +5002,14 @@ wl_columnar_relation_new_like_governed_checked_mode(const char *name,
         r->has_graph_column = src->has_graph_column;
         r->graph_col_idx = src->graph_col_idx;
         r->declared_ncols = src->declared_ncols;
-        if (src->compound_kind != WIRELOG_COMPOUND_KIND_NONE
-            && (!src->compound_arity_map || src->ncols == 0u
-            || col_rel_clone_compound_meta(r, src) != 0))
-            rc = ENOMEM;
+        if (!wl_columnar_relation_compound_map_valid(src)) {
+            rc = EINVAL;
+        } else if (src->compound_arity_len > 0) {
+            int compound_rc = col_rel_clone_compound_meta(r, src, false);
+            if (compound_rc != 0)
+                rc = compound_rc == -1 ? EINVAL
+                    : r->memory_budget_denial_pending ? ENOSPC : ENOMEM;
+        }
     }
     if (rc == 0 && preserve_timestamps && src->timestamps) {
         rc = col_rel_enable_timestamps(r);
@@ -5030,9 +5098,9 @@ wl_columnar_relation_pool_new_like_governed(delta_pool_t *pool,
             like->ncols) != 0) {
             return col_rel_pool_fallback_like(pool, r, name, like, governor);
         }
-        if (like->compound_kind != WIRELOG_COMPOUND_KIND_NONE
-            && (!like->compound_arity_map || like->ncols == 0u
-            || col_rel_clone_compound_meta(r, like) != 0))
+        if (!wl_columnar_relation_compound_map_valid(like)
+            || (like->compound_arity_len > 0
+            && col_rel_clone_compound_meta(r, like, false) != 0))
             return col_rel_pool_fallback_like(pool, r, name, like, governor);
         r->nrows = 0;
         return r;
@@ -5414,9 +5482,9 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
      * WIRELOG_COMPOUND_KIND_NONE leave dst at the zero default established
      * by calloc.
      */
-    if (src->compound_kind != WIRELOG_COMPOUND_KIND_NONE
-        && src->compound_arity_map && src->ncols > 0u) {
-        (void)col_rel_clone_compound_meta(dst, src);
+    if (src->compound_arity_len > 0
+        && wl_columnar_relation_compound_map_valid(src)) {
+        (void)col_rel_clone_compound_meta(dst, src, false);
     }
 
     if (src->schema_ok) {
@@ -5459,7 +5527,8 @@ wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
         return rc;
     if (src->nrows > src->capacity || (src->ncols > 0
         && src->capacity > 0 && !src->columns)
-        || (src->timestamp_capacity > 0 && !src->timestamps)) {
+        || (src->timestamp_capacity > 0 && !src->timestamps)
+        || !wl_columnar_relation_compound_map_valid(src)) {
         rc = EINVAL;
         goto done;
     }
@@ -5476,7 +5545,8 @@ wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
     }
     if (!col_rel_prospective_metadata_bytes(src->ncols,
         (const char *const *)src->col_names, src->ncols > 0,
-        true, src->column_types != NULL, src->schema_ok, &metadata_bytes)) {
+        true, src->column_types != NULL, src->schema_ok,
+        src->compound_arity_len, &metadata_bytes)) {
         rc = EOVERFLOW;
         goto done;
     }
@@ -5526,9 +5596,9 @@ wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
     col_rel_publish_metadata(dst, &metadata_pending, metadata_bytes,
         &old_metadata);
     col_rel_release_reservation_or_abort(&old_metadata);
-    if (src->compound_kind != WIRELOG_COMPOUND_KIND_NONE) {
-        int compound_rc = (!src->compound_arity_map || src->ncols == 0)
-            ? -1 : col_rel_clone_compound_meta(dst, src);
+    if (src->compound_arity_len > 0) {
+        int compound_rc = !wl_columnar_relation_compound_map_valid(src)
+            ? -1 : col_rel_clone_compound_meta(dst, src, true);
         if (compound_rc != 0) {
             rc = compound_rc == -2 ? ENOMEM : EINVAL;
             goto done;
@@ -5651,25 +5721,10 @@ static int
 col_rel_replacement_compound_entries(const col_rel_t *candidate,
     uint32_t *out_entries)
 {
-    uint32_t entries = 0;
-    uint32_t physical_count = 0;
-
-    if (!candidate || !out_entries)
+    if (!candidate || !out_entries
+        || !wl_columnar_relation_compound_map_valid(candidate))
         return EINVAL;
-    if (candidate->compound_kind == WIRELOG_COMPOUND_KIND_NONE) {
-        *out_entries = 0;
-        return 0;
-    }
-    if (!candidate->compound_arity_map || candidate->ncols == 0)
-        return EINVAL;
-    while (physical_count < candidate->ncols) {
-        uint32_t arity = candidate->compound_arity_map[entries];
-        if (arity == 0 || arity > candidate->ncols - physical_count)
-            return EINVAL;
-        physical_count += arity;
-        entries++;
-    }
-    *out_entries = entries;
+    *out_entries = candidate->compound_arity_len;
     return 0;
 }
 
@@ -5700,16 +5755,8 @@ col_rel_replacement_validate_candidate(const col_rel_t *candidate)
             if (!candidate->columns[c])
                 return EINVAL;
     }
-    if (candidate->compound_kind == WIRELOG_COMPOUND_KIND_NONE) {
-        if (candidate->compound_arity_map || candidate->compound_count != 0
-            || candidate->inline_physical_offset != 0)
-            return EINVAL;
-    }
     if (col_rel_replacement_compound_entries(candidate, &compound_entries)
         != 0)
-        return EINVAL;
-    if (candidate->compound_kind == WIRELOG_COMPOUND_KIND_INLINE
-        && candidate->compound_count > compound_entries)
         return EINVAL;
     return 0;
 }
@@ -5756,6 +5803,7 @@ col_rel_prepare_replacement_impl(col_rel_t *dst, const col_rel_t *candidate,
         (const char *const *)candidate->col_names,
         candidate->col_names != NULL, false,
         candidate->column_types != NULL, candidate->schema_ok,
+        candidate->compound_arity_len,
         &metadata_bytes))
         return EOVERFLOW;
     if (candidate->timestamps
@@ -5828,6 +5876,8 @@ col_rel_prepare_replacement_impl(col_rel_t *dst, const col_rel_t *candidate,
      * silently publishing a different schema. */
     if (replacement->staged->compound_kind != candidate->compound_kind
         || replacement->staged->compound_count != candidate->compound_count
+        || replacement->staged->compound_arity_len
+        != candidate->compound_arity_len
         || replacement->staged->inline_physical_offset
         != candidate->inline_physical_offset)
         goto invalid;

@@ -140,6 +140,7 @@ test_col_rel_inline_schema(void)
     r->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
     r->compound_count = 2u;
     r->compound_arity_map = arity_map;
+    r->compound_arity_len = logical_ncols;
     /* col 0 takes one physical slot; the first inline compound starts at
      * physical offset 1. */
     r->inline_physical_offset = 1u;

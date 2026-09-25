@@ -727,7 +727,7 @@ tdd_shared_view_deep_copy_fallback(wl_col_session_t *sess, col_rel_t *dst,
     /* EBUSY can mean terminal source destruction already claimed the gate.
      * Never turn that exclusion result into an unprotected source read. */
     if (shared_view_rc != ENOMEM && shared_view_rc != EINVAL
-        && shared_view_rc != EOVERFLOW)
+        && shared_view_rc != EOVERFLOW && shared_view_rc != ENOTSUP)
         return shared_view_rc;
     rc = col_rel_storage_owner_resolve(src, &source_owner);
     if (rc != 0)
@@ -3079,10 +3079,11 @@ tdd_compound_map_entries(const col_rel_t *rel, uint32_t *entries_out)
 
     if (!rel || !entries_out)
         return false;
+    if (!wl_columnar_relation_compound_map_valid(rel))
+        return false;
     if (rel->compound_kind != WIRELOG_COMPOUND_KIND_INLINE) {
         *entries_out = 0;
-        return rel->compound_arity_map == NULL
-               && rel->compound_count == 0;
+        return true;
     }
     if (!rel->compound_arity_map || rel->ncols == 0
         || rel->compound_count == 0)
@@ -3090,7 +3091,7 @@ tdd_compound_map_entries(const col_rel_t *rel, uint32_t *entries_out)
     while (physical < rel->ncols) {
         uint32_t arity;
 
-        if (entries >= rel->ncols)
+        if (entries >= rel->compound_arity_len)
             return false;
         arity = rel->compound_arity_map[entries];
         if (arity == 0 || arity > rel->ncols - physical)
@@ -3099,7 +3100,7 @@ tdd_compound_map_entries(const col_rel_t *rel, uint32_t *entries_out)
         entries++;
     }
     *entries_out = entries;
-    return true;
+    return entries == rel->compound_arity_len;
 }
 
 /* Worker results must have compatible physical and logical schema metadata

@@ -56,7 +56,7 @@ wl_col_rel_inline_locate(const col_rel_t *rel, uint32_t logical_col,
             logical_col);
         return EINVAL;
     }
-    if (!rel->compound_arity_map) {
+    if (!wl_columnar_relation_compound_map_valid(rel)) {
         WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_ERROR,
             "event=locate error=missing_arity_map rel=%s",
             rel->name ? rel->name : "(anon)");
@@ -71,7 +71,7 @@ wl_col_rel_inline_locate(const col_rel_t *rel, uint32_t logical_col,
          * logical_col is >= logical_ncols (e.g. the caller passes 99
          * for a 4-column schema).  The array has exactly logical_ncols
          * entries, and after the last entry offset == ncols. */
-        if (offset >= rel->ncols) {
+        if (offset >= rel->ncols || i >= rel->compound_arity_len) {
             WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
                 "event=locate error=logical_col_oor rel=%s "
                 "logical_col=%u physical_ncols=%u",
