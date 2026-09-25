@@ -1026,6 +1026,39 @@ diff_arrangement_links_in_bounds(const col_diff_arrangement_t *arr)
     return true;
 }
 
+static bool
+diff_arrangement_indexes_rows(const col_diff_arrangement_t *arr,
+    const col_rel_t *rel, const uint32_t *key_cols, uint32_t key_count)
+{
+    if (!diff_arrangement_links_in_bounds(arr) ||
+        arr->indexed_rows != rel->nrows)
+        return false;
+    for (uint32_t bucket = 0; bucket < arr->nbuckets; bucket++) {
+        for (uint32_t entry = arr->ht_head[bucket]; entry != 0;
+            entry = arr->ht_next[entry - 1]) {
+            uint32_t row = entry - 1u;
+            uint32_t hash = 2166136261u;
+            if (row >= rel->nrows)
+                return false;
+            for (uint32_t key = 0; key < key_count; key++)
+                hash = wl_columnar_hash_value(hash, rel, key_cols[key],
+                        rel->columns[key_cols[key]][row]);
+            if ((hash & (arr->nbuckets - 1u)) != bucket)
+                return false;
+        }
+    }
+    for (uint32_t row = 0; row < rel->nrows; row++) {
+        uint32_t occurrences = 0;
+        for (uint32_t bucket = 0; bucket < arr->nbuckets; bucket++)
+            for (uint32_t entry = arr->ht_head[bucket]; entry != 0;
+                entry = arr->ht_next[entry - 1])
+                occurrences += entry == row + 1u;
+        if (occurrences != 1)
+            return false;
+    }
+    return true;
+}
+
 static uint64_t
 diff_arrangement_ledger_bytes(const wl_col_session_t *sess)
 {
@@ -2356,6 +2389,272 @@ test_diff_join_batch_signed_timestamps(void)
 }
 
 static void
+test_diff_join_batch_snapshot_reset_and_tail(void)
+{
+    const char *names[] = { "k", "v" };
+    const uint32_t key = 0;
+    char *left_keys[] = { "k" };
+    char *right_keys[] = { "k" };
+    wl_plan_op_t op = { 0 };
+    wl_col_session_t *s = make_mock_session();
+    col_rel_t *left = make_rel("snapshot_left", 2, names);
+    col_rel_t *right = make_rel("snapshot_right", 2, names);
+    col_rel_t *out = NULL;
+    wl_columnar_continuation_t *cont = NULL;
+    col_diff_arr_entry_t *entry;
+    col_diff_arrangement_t *persistent;
+    col_relation_snapshot_t old_snapshot;
+    uint64_t entry_generation;
+    uint64_t ledger_bytes;
+    uint32_t old_indexed, old_current, old_base, old_buckets, old_ht_cap;
+    uint32_t *old_heads, *old_next;
+    int64_t left_row[] = { 768, 10 };
+
+    TEST("differential batch resets on append and retains same-snapshot tail");
+    ASSERT_TRUE(s && left && right, "snapshot fixture allocation");
+    ASSERT_TRUE(col_rel_append_row(left, left_row) == 0,
+        "left lookup row appended");
+    for (int64_t i = 0; i < 768; i++) {
+        int64_t row[] = { i, i * 10 };
+        ASSERT_TRUE(col_rel_append_row(right, row) == 0,
+            "initial right relation filled to bucket threshold");
+    }
+    ASSERT_TRUE(session_add_rel(s, right) == 0, "right relation registered");
+    op.op = WL_PLAN_OP_JOIN;
+    op.right_relation = "snapshot_right";
+    op.left_keys = (const char *const *)left_keys;
+    op.right_keys = (const char *const *)right_keys;
+    op.key_count = 1;
+
+    ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, left, false,
+        &key, &key, 1, 128, &cont) == 0,
+        "initial differential batch producer created");
+    out = col_rel_new_auto("snapshot_out_initial", 4);
+    ASSERT_TRUE(out && col_join_set_output_types(out, left, right, &op) == 0,
+        "initial output relation created");
+    ASSERT_TRUE(col_join_batch_run_to_relation(cont, s, out) == 0
+        && out->nrows == 0, "initial index has no future-key match");
+    wl_columnar_continuation_destroy(cont);
+    cont = NULL;
+    col_rel_destroy(out);
+    out = NULL;
+
+    ASSERT_TRUE(s->diff_arr_count == 1, "initial arrangement published");
+    entry = &s->diff_arr_entries[0];
+    persistent = entry->diff_arr;
+    ASSERT_TRUE(persistent && persistent->indexed_rows == 768
+        && persistent->nbuckets == 1024
+        && diff_arrangement_links_in_bounds(persistent),
+        "initial bucket threshold indexed and bounded");
+    col_diff_arrangement_reset_delta(persistent);
+    ASSERT_TRUE(persistent->base_nrows == persistent->current_nrows,
+        "initial arrangement reset establishes a nonzero delta base");
+    entry_generation = entry->generation;
+    old_snapshot = persistent->source_snapshot;
+    old_indexed = persistent->indexed_rows;
+    old_current = persistent->current_nrows;
+    old_base = persistent->base_nrows;
+    old_buckets = persistent->nbuckets;
+    old_ht_cap = persistent->ht_cap;
+    old_heads = malloc((size_t)old_buckets * sizeof(*old_heads));
+    old_next = malloc((size_t)old_ht_cap * sizeof(*old_next));
+    ASSERT_TRUE(old_heads && old_next, "persistent chain snapshot allocated");
+    memcpy(old_heads, persistent->ht_head,
+        (size_t)old_buckets * sizeof(*old_heads));
+    memcpy(old_next, persistent->ht_next,
+        (size_t)old_ht_cap * sizeof(*old_next));
+    ledger_bytes = diff_arrangement_ledger_bytes(s);
+
+    /* A real append advances the source view generation.  Force commit to
+     * fail after private reset/indexing so abort can prove the persistent
+     * arrangement, including its generation and ledger charge, stayed intact. */
+    ASSERT_TRUE(col_rel_append_row(right, (int64_t[]){ 768, 7680 }) == 0,
+        "public append crosses the arrangement bucket threshold");
+    entry->generation = UINT64_MAX;
+    ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, left, false,
+        &key, &key, 1, 128, &cont) == EOVERFLOW && cont == NULL,
+        "private rebuild is aborted when publication generation overflows");
+    entry = &s->diff_arr_entries[0];
+    ASSERT_TRUE(entry->diff_arr == persistent && entry->generation == UINT64_MAX
+        && !entry->transaction_pending && s->diff_txn_count == 0,
+        "aborted rebuild preserves persistent identity and injected generation");
+    ASSERT_TRUE(entry->diff_arr->indexed_rows == old_indexed
+        && entry->diff_arr->current_nrows == old_current
+        && entry->diff_arr->base_nrows == old_base
+        && entry->diff_arr->nbuckets == old_buckets
+        && entry->diff_arr->ht_cap == old_ht_cap
+        && wl_columnar_relation_snapshot_equal(
+            entry->diff_arr->source_snapshot, old_snapshot),
+        "aborted rebuild preserves persistent index metadata and snapshot");
+    ASSERT_TRUE(memcmp(entry->diff_arr->ht_head, old_heads,
+        (size_t)old_buckets * sizeof(*old_heads)) == 0
+        && memcmp(entry->diff_arr->ht_next, old_next,
+        (size_t)old_ht_cap * sizeof(*old_next)) == 0
+        && diff_arrangement_links_in_bounds(entry->diff_arr),
+        "aborted rebuild preserves bounded persistent hash chains");
+    ASSERT_TRUE(diff_arrangement_ledger_bytes(s) == ledger_bytes,
+        "aborted private rebuild restores arrangement ledger bytes");
+
+    entry->generation = entry_generation;
+    ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, left, false,
+        &key, &key, 1, 128, &cont) == 0,
+        "retry after private rebuild abort succeeds");
+    entry = &s->diff_arr_entries[0];
+    ASSERT_TRUE(entry->generation == entry_generation + 1u
+        && entry->diff_arr->base_nrows == 0
+        && entry->diff_arr->indexed_rows == right->nrows
+        && entry->diff_arr->current_nrows == right->nrows
+        && entry->diff_arr->nbuckets == 2048
+        && diff_arrangement_indexes_rows(entry->diff_arr, right, &key, 1),
+        "generation-changing append resets and rebuilds across bucket growth");
+    out = col_rel_new_auto("snapshot_out_append", 4);
+    ASSERT_TRUE(out && col_join_set_output_types(out, left, right, &op) == 0,
+        "append output relation created");
+    ASSERT_TRUE(col_join_batch_run_to_relation(cont, s, out) == 0
+        && out->nrows == 1
+        && output_contains_row(out, (int64_t[]){ 768, 10, 768, 7680 }),
+        "rebuilt index returns exactly the newly appended matching row");
+    wl_columnar_continuation_destroy(cont);
+    cont = NULL;
+    col_rel_destroy(out);
+    out = NULL;
+
+    /* A public cell replacement also advances the view token.  Rebuilding
+     * must remove the old key and index the replacement exactly once. */
+    ASSERT_TRUE(col_rel_set(right, 0, 0, -1) == 0,
+        "public row replacement changes the indexed key");
+    col_rel_t *replace_left = make_rel("snapshot_replace_left", 2, names);
+    ASSERT_TRUE(replace_left != NULL
+        && col_rel_append_row(replace_left, (int64_t[]){ 0, 30 }) == 0
+        && col_rel_append_row(replace_left, (int64_t[]){ -1, 40 }) == 0,
+        "old and replacement keys prepared for lookup");
+    ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, replace_left,
+        false, &key, &key, 1, 128, &cont) == 0,
+        "replacement snapshot rebuild succeeds");
+    entry = &s->diff_arr_entries[0];
+    ASSERT_TRUE(diff_arrangement_indexes_rows(entry->diff_arr, right, &key, 1),
+        "replacement rebuild contains each current row in its correct bucket");
+    out = col_rel_new_auto("snapshot_out_replace", 4);
+    ASSERT_TRUE(out && col_join_set_output_types(out, replace_left, right,
+        &op) == 0,
+        "replacement output relation created");
+    ASSERT_TRUE(col_join_batch_run_to_relation(cont, s, out) == 0
+        && out->nrows == 1
+        && output_contains_row(out, (int64_t[]){ -1, 40, -1, 0 }),
+        "replacement rebuild drops stale key and returns current key once");
+    wl_columnar_continuation_destroy(cont);
+    cont = NULL;
+    col_rel_destroy(out);
+    out = NULL;
+    col_rel_destroy(replace_left);
+
+    /* Synthetic defensive case only: public mutators always bump the view
+     * generation.  Append within reserved relation storage, then restore that
+     * token to exercise same-snapshot row-count growth in index_right(). */
+    uint64_t same_view_generation = right->view_generation;
+    uint64_t same_storage_generation = right->storage_generation;
+    ASSERT_TRUE(col_rel_append_row(right, (int64_t[]){ 769, 7690 }) == 0
+        && right->storage_generation == same_storage_generation,
+        "synthetic tail row fits existing relation storage");
+    right->view_generation = same_view_generation;
+    ASSERT_TRUE(wl_columnar_relation_snapshot_equal(
+            entry->diff_arr->source_snapshot,
+            wl_columnar_relation_snapshot(right)),
+        "synthetic tail retains the committed source snapshot");
+    col_rel_t *tail_left = make_rel("snapshot_tail_left", 2, names);
+    int64_t tail_left_row[] = { 769, 20 };
+    ASSERT_TRUE(tail_left && col_rel_append_row(tail_left, tail_left_row) == 0,
+        "tail lookup row created");
+    ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, tail_left, false,
+        &key, &key, 1, 128, &cont) == 0,
+        "same-snapshot defensive tail producer created");
+    entry = &s->diff_arr_entries[0];
+    ASSERT_TRUE(entry->diff_arr->nbuckets == 2048
+        && entry->diff_arr->indexed_rows == right->nrows
+        && diff_arrangement_indexes_rows(entry->diff_arr, right, &key, 1),
+        "same-snapshot tail preserves bucket allocation and bounded chains");
+    out = col_rel_new_auto("snapshot_out_tail", 4);
+    ASSERT_TRUE(out && col_join_set_output_types(out, tail_left, right,
+        &op) == 0,
+        "same-snapshot tail output relation created");
+    ASSERT_TRUE(col_join_batch_run_to_relation(cont, s, out) == 0
+        && out->nrows == 1
+        && output_contains_row(out, (int64_t[]){ 769, 20, 769, 7690 }),
+        "defensive tail index returns exactly its synthetic row");
+
+    free(old_heads);
+    free(old_next);
+    wl_columnar_continuation_destroy(cont);
+    col_rel_destroy(out);
+    col_rel_destroy(tail_left);
+    col_rel_destroy(left);
+    destroy_mock_session(s);
+    PASS;
+}
+
+static void
+test_diff_join_batch_snapshot_reset_without_growth(void)
+{
+    const char *names[] = { "k", "v" };
+    const uint32_t key = 0;
+    char *left_keys[] = { "k" };
+    char *right_keys[] = { "k" };
+    wl_plan_op_t op = { 0 };
+    wl_col_session_t *s = make_mock_session();
+    col_rel_t *left = make_rel("snapshot_small_left", 2, names);
+    col_rel_t *right = make_rel("snapshot_small_right", 2, names);
+    col_rel_t *out;
+    wl_columnar_continuation_t *cont = NULL;
+    uint32_t initial_buckets;
+    int64_t left_row[] = { 2, 10 };
+
+    TEST("differential batch snapshot reset without bucket growth");
+    ASSERT_TRUE(s && left && right, "small snapshot fixture allocated");
+    ASSERT_TRUE(col_rel_append_row(left, left_row) == 0
+        && col_rel_append_row(right, (int64_t[]){ 1, 100 }) == 0
+        && session_add_rel(s, right) == 0,
+        "small initial relations prepared");
+    op.op = WL_PLAN_OP_JOIN;
+    op.right_relation = "snapshot_small_right";
+    op.left_keys = (const char *const *)left_keys;
+    op.right_keys = (const char *const *)right_keys;
+    op.key_count = 1;
+    ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, left, false,
+        &key, &key, 1, 128, &cont) == 0,
+        "small initial producer created");
+    out = col_rel_new_auto("snapshot_small_initial_out", 4);
+    ASSERT_TRUE(out && col_join_set_output_types(out, left, right, &op) == 0
+        && col_join_batch_run_to_relation(cont, s, out) == 0 && out->nrows == 0,
+        "small initial relation indexed");
+    wl_columnar_continuation_destroy(cont);
+    cont = NULL;
+    col_rel_destroy(out);
+
+    initial_buckets = s->diff_arr_entries[0].diff_arr->nbuckets;
+    ASSERT_TRUE(col_rel_append_row(right, (int64_t[]){ 2, 200 }) == 0,
+        "public append changes snapshot below growth threshold");
+    ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, left, false,
+        &key, &key, 1, 128, &cont) == 0,
+        "generation-changing append producer created");
+    col_diff_arrangement_t *arr = s->diff_arr_entries[0].diff_arr;
+    ASSERT_TRUE(arr->nbuckets == initial_buckets
+        && diff_arrangement_indexes_rows(arr, right, &key, 1),
+        "snapshot change rebuilds every row without bucket growth");
+    out = col_rel_new_auto("snapshot_small_append_out", 4);
+    ASSERT_TRUE(out && col_join_set_output_types(out, left, right, &op) == 0
+        && col_join_batch_run_to_relation(cont, s, out) == 0
+        && out->nrows == 1
+        && output_contains_row(out, (int64_t[]){ 2, 10, 2, 200 }),
+        "same-capacity rebuild returns appended match exactly once");
+
+    wl_columnar_continuation_destroy(cont);
+    col_rel_destroy(out);
+    col_rel_destroy(left);
+    destroy_mock_session(s);
+    PASS;
+}
+
+static void
 test_diff_join_batch_rejects_invalid_resume_cursor(void)
 {
     const char *names[] = { "k", "v" };
@@ -2510,6 +2809,8 @@ main(void)
     test_diff_arrangement_pin_lifetime();
     test_diff_join_batch_signed_timestamps();
     test_governed_auto_relation_schema();
+    test_diff_join_batch_snapshot_reset_and_tail();
+    test_diff_join_batch_snapshot_reset_without_growth();
     test_diff_join_batch_rejects_invalid_resume_cursor();
     test_diff_join_batch_last_row_multimatch_continuation();
     test_late_abort_does_not_advance_arrangement();
