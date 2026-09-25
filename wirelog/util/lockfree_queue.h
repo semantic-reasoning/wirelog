@@ -79,6 +79,11 @@ typedef void (*wl_mpsc_payload_destroy_fn)(void *payload);
  */
 typedef struct wl_mpsc_queue wl_mpsc_queue_t;
 
+/* Exact allocation footprint after the per-worker capacity is rounded to
+ * the same power of two used by queue creation. */
+int wl_mpsc_queue_footprint_checked(uint32_t num_workers, uint32_t capacity,
+    uint64_t *out);
+
 /**
  * wl_mpsc_queue_create:
  * @num_workers: Number of producer threads.  Must be >= 1.

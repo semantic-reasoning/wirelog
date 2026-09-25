@@ -37,6 +37,8 @@ typedef volatile uint32_t wl_atomic_u32;
 #endif
 
 #include <stdbool.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -201,6 +203,29 @@ struct wl_mpsc_queue {
     wl_mpsc_payload_destroy_fn destroy_payload;
 };
 
+int
+wl_mpsc_queue_footprint_checked(uint32_t num_workers, uint32_t capacity,
+    uint64_t *out)
+{
+    if (!out || !num_workers || capacity < 2)
+        return EINVAL;
+    uint32_t rounded = next_pow2(capacity);
+    if (!rounded)
+        return EOVERFLOW;
+    uint64_t worker_bytes = (uint64_t)num_workers * sizeof(wl_spsc_queue_t);
+    uint64_t ring_bytes = (uint64_t)rounded * sizeof(wl_delta_msg_t);
+    if (worker_bytes > SIZE_MAX || ring_bytes > SIZE_MAX
+        || num_workers > (UINT64_MAX - worker_bytes
+        - sizeof(wl_mpsc_queue_t)) / ring_bytes)
+        return EOVERFLOW;
+    uint64_t total = sizeof(wl_mpsc_queue_t) + worker_bytes
+        + (uint64_t)num_workers * ring_bytes;
+    if (total > SIZE_MAX)
+        return EOVERFLOW;
+    *out = total;
+    return 0;
+}
+
 wl_mpsc_queue_t *
 wl_mpsc_queue_create(uint32_t num_workers, uint32_t capacity)
 {
@@ -211,7 +236,9 @@ wl_mpsc_queue_t *
 wl_mpsc_queue_create_with_destructor(uint32_t num_workers, uint32_t capacity,
     wl_mpsc_payload_destroy_fn destroy_payload)
 {
-    if (num_workers == 0 || capacity < 2)
+    uint64_t footprint;
+    if (wl_mpsc_queue_footprint_checked(num_workers, capacity,
+        &footprint) != 0)
         return NULL;
 
     wl_mpsc_queue_t *q = (wl_mpsc_queue_t *)calloc(1, sizeof(wl_mpsc_queue_t));
@@ -237,6 +264,12 @@ wl_mpsc_queue_create_with_destructor(uint32_t num_workers, uint32_t capacity,
             free(q);
             return NULL;
         }
+    }
+
+    /* Keep the admission formula tied to the allocator's physical shape. */
+    if (wl_mpsc_queue_footprint_bytes(q) != footprint) {
+        wl_mpsc_queue_destroy(q);
+        return NULL;
     }
 
     return q;
