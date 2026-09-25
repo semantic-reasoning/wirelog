@@ -615,6 +615,8 @@ test_session_hash_admission_and_image_lifetime(void)
         + sizeof(uint32_t);
     const uint64_t second_bytes = first_bytes + sizeof(uint32_t);
     const uint64_t image_bytes = second_bytes + sizeof(uint32_t);
+    const uint64_t image_rels_bytes = 3u * sizeof(col_rel_t *);
+    const uint64_t expected_bytes = 2u * sizeof(col_rel_t *);
     const char *failure = NULL;
     wl_columnar_session_hash_registry_image_t image = { 0 };
 #define HASH_CHECK(condition, message) \
@@ -656,19 +658,54 @@ test_session_hash_admission_and_image_lifetime(void)
         && wl_columnar_memory_reserved(governor) == second_bytes,
         "exact-fit rebuild did not transfer reservation");
     col_rel_t *additions[] = { &third };
+    col_rel_t **old_registry = sess.rels;
     atomic_store_explicit(&governor->usable_bytes,
-        second_bytes + image_bytes - 1u, memory_order_release);
+        second_bytes + image_rels_bytes - 1u, memory_order_release);
     HASH_CHECK(wl_columnar_session_hash_registry_image_prepare(&sess,
         additions, 1, &image) == ENOSPC
         && wl_columnar_session_budget_denied(&sess)
-        && wl_columnar_memory_reserved(governor) == second_bytes,
-        "one-byte-under image denial changed reservation");
+        && wl_columnar_memory_reserved(governor) == second_bytes
+        && sess.rels == old_registry,
+        "one-byte-under image registry denial changed reservation");
     atomic_store_explicit(&governor->usable_bytes,
-        second_bytes + image_bytes, memory_order_release);
+        second_bytes + image_rels_bytes + expected_bytes - 1u,
+        memory_order_release);
+    HASH_CHECK(wl_columnar_session_hash_registry_image_prepare(&sess,
+        additions, 1, &image) == ENOSPC
+        && wl_columnar_memory_reserved(governor) == second_bytes
+        && sess.rels == old_registry,
+        "one-byte-under validation copy denial leaked reservation");
+    atomic_store_explicit(&governor->usable_bytes,
+        second_bytes + image_rels_bytes + expected_bytes + image_bytes - 1u,
+        memory_order_release);
+    HASH_CHECK(wl_columnar_session_hash_registry_image_prepare(&sess,
+        additions, 1, &image) == ENOSPC
+        && wl_columnar_memory_reserved(governor) == second_bytes
+        && sess.rels == old_registry,
+        "one-byte-under hash denial leaked image reservations");
+    atomic_store_explicit(&governor->usable_bytes,
+        second_bytes + image_rels_bytes + expected_bytes + image_bytes,
+        memory_order_release);
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_malloc_size = (size_t)image_rels_bytes;
+    HASH_CHECK(wl_columnar_session_hash_registry_image_prepare(&sess,
+        additions, 1, &image) == ENOMEM
+        && fail_malloc_size == 0 && sess.rels == old_registry
+        && wl_columnar_memory_reserved(governor) == second_bytes,
+        "image registry allocator failure leaked reservation");
+    fail_malloc_size = (size_t)expected_bytes;
+    HASH_CHECK(wl_columnar_session_hash_registry_image_prepare(&sess,
+        additions, 1, &image) == ENOMEM
+        && fail_malloc_size == 0 && sess.rels == old_registry
+        && wl_columnar_memory_reserved(governor) == second_bytes,
+        "image validation allocator failure leaked reservation");
+#endif
     HASH_CHECK(wl_columnar_session_hash_registry_image_prepare(&sess,
         additions, 1, &image) == 0
+        && image.rels_reservation.bytes == image_rels_bytes
+        && image.expected_rels_reservation.bytes == expected_bytes
         && wl_columnar_memory_reserved(governor)
-        == second_bytes + image_bytes,
+        == second_bytes + image_rels_bytes + expected_bytes + image_bytes,
         "exact-fit prepared image was not charged");
     wl_columnar_session_hash_registry_image_discard(&image);
     HASH_CHECK(wl_columnar_memory_reserved(governor) == second_bytes,
@@ -678,21 +715,29 @@ test_session_hash_admission_and_image_lifetime(void)
         "image retry failed after discard");
     wl_columnar_session_hash_registry_image_publish(&image);
     HASH_CHECK(session_find_rel(&sess, "third") == &third
-        && wl_columnar_memory_reserved(governor) == image_bytes,
+        && wl_columnar_memory_reserved(governor)
+        == image_bytes + image_rels_bytes,
         "publication did not replace old reservation");
     uint32_t *published_head = sess.rel_hash_head;
     atomic_store_explicit(&governor->usable_bytes,
-        image_bytes + 16u * sizeof(uint32_t)
+        image_bytes + 6u * sizeof(col_rel_t *) + 16u * sizeof(uint32_t)
         + 4u * sizeof(uint32_t) - 1u, memory_order_release);
     HASH_CHECK(session_add_rel(&sess, &fourth) == 0
         && session_find_rel(&sess, "fourth") == &fourth
         && sess.rel_hash_head == published_head
-        && wl_columnar_memory_reserved(governor) == image_bytes
+        && wl_columnar_memory_reserved(governor)
+        == image_bytes + 6u * sizeof(col_rel_t *)
         && wl_columnar_session_budget_denied(&sess),
         "optional insertion fallback lost lookup or earlier budget denial");
 cleanup:
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_malloc_size = 0;
+#endif
     wl_columnar_session_hash_registry_image_discard(&image);
     session_rel_free_hash(&sess);
+    if (atomic_load_explicit(&sess.rels_reservation.state,
+        memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED)
+        (void)wl_columnar_memory_rollback(&sess.rels_reservation);
     if (!failure && wl_columnar_memory_reserved(governor) != 0)
         failure = "hash teardown leaked reservation";
     free(sess.rels);
@@ -703,6 +748,245 @@ cleanup:
     }
     PASS();
 #undef HASH_CHECK
+}
+
+static void
+test_session_registry_pointer_admission(void)
+{
+    TEST("session relation pointer growth admits overlap and retries");
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    resolution.budget_bytes = 512;
+    resolution.usable_bytes = 512;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    wl_columnar_memory_governor_ref_t *ref
+        = wl_columnar_memory_governor_ref_create(&resolution);
+    if (!ref) {
+        FAIL("governor setup failed");
+        return;
+    }
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(ref);
+    wl_col_session_t sess = { 0 };
+    col_rel_t first = { .name = "first" };
+    col_rel_t second = { .name = "second" };
+    sess.memory_governor = ref;
+    sess.rel_cap = 1;
+    wl_columnar_memory_reservation_init(&sess.rels_reservation);
+    const uint64_t one = sizeof(col_rel_t *), two = 2u * one;
+    const char *failure = NULL;
+#define POINTER_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    POINTER_CHECK(wl_columnar_memory_reserve_checked(governor, one,
+        &sess.rels_reservation) == WL_COLUMNAR_MEMORY_ADMISSION_OK,
+        "initial admission failed");
+    sess.rels = calloc(1, sizeof(*sess.rels));
+    POINTER_CHECK(sess.rels != NULL, "initial allocation failed");
+    sess.rels[0] = &first;
+    sess.nrels = 1;
+    col_rel_t **old_rels = sess.rels;
+    atomic_store_explicit(&governor->usable_bytes, one + two - 1u,
+        memory_order_release);
+    POINTER_CHECK(session_add_rel(&sess, &second) == ENOSPC
+        && wl_columnar_session_budget_denied(&sess)
+        && sess.rels == old_rels && sess.nrels == 1 && sess.rel_cap == 1
+        && sess.rels[0] == &first
+        && wl_columnar_memory_reserved(governor) == one,
+        "one-byte-under growth changed registry");
+    sess.memory_budget_denied = false;
+    atomic_store_explicit(&governor->usable_bytes, one + two,
+        memory_order_release);
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_malloc_size = (size_t)two;
+    POINTER_CHECK(session_add_rel(&sess, &second) == ENOMEM
+        && fail_malloc_size == 0 && sess.rels == old_rels
+        && sess.nrels == 1 && sess.rel_cap == 1
+        && wl_columnar_memory_reserved(governor) == one,
+        "allocator failure changed registry or reservation");
+#endif
+    POINTER_CHECK(session_add_rel(&sess, &second) == 0
+        && sess.rels != old_rels && sess.nrels == 2 && sess.rel_cap == 2
+        && session_find_rel(&sess, "second") == &second
+        && wl_columnar_memory_reserved(governor) == two
+        && !wl_columnar_session_budget_denied(&sess),
+        "exact-fit retry failed to transfer registry token");
+cleanup:
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_malloc_size = 0;
+#endif
+    session_rel_free_hash(&sess);
+    if (atomic_load_explicit(&sess.rels_reservation.state,
+        memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED)
+        (void)wl_columnar_memory_rollback(&sess.rels_reservation);
+    if (!failure && wl_columnar_memory_reserved(governor) != 0)
+        failure = "registry teardown leaked reservation";
+    free(sess.rels);
+    wl_columnar_memory_governor_ref_release(ref);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef POINTER_CHECK
+}
+
+static void
+test_retraction_registry_pointer_admission(void)
+{
+    TEST("retraction registry replacement reserves, discards and publishes");
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    resolution.budget_bytes = 512;
+    resolution.usable_bytes = 512;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    wl_columnar_memory_governor_ref_t *ref
+        = wl_columnar_memory_governor_ref_create(&resolution);
+    col_rel_t *edb = col_rel_new_auto("edb", 1);
+    col_rel_t *retraction = col_rel_new_auto("$r$edb", 1);
+    if (!ref || !edb || !retraction
+        || col_rel_append_row(edb, (int64_t[]){ 42 }) != 0) {
+        if (edb) col_rel_destroy(edb);
+        if (retraction) col_rel_destroy(retraction);
+        if (ref) wl_columnar_memory_governor_ref_release(ref);
+        FAIL("retraction fixture setup failed");
+        return;
+    }
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(ref);
+    wl_col_session_t sess = { 0 };
+    sess.memory_governor = ref;
+    sess.rel_cap = 1;
+    wl_columnar_memory_reservation_init(&sess.rels_reservation);
+    const uint64_t one = sizeof(col_rel_t *), two = 2u * one;
+    const char *failure = NULL;
+#define RETRACTION_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    RETRACTION_CHECK(wl_columnar_memory_reserve_checked(governor, one,
+        &sess.rels_reservation) == WL_COLUMNAR_MEMORY_ADMISSION_OK,
+        "initial array admission failed");
+    sess.rels = calloc(1, sizeof(*sess.rels));
+    RETRACTION_CHECK(sess.rels != NULL, "initial array allocation failed");
+    sess.rels[0] = edb;
+    edb = NULL;
+    sess.nrels = 1;
+    col_rel_t **original = sess.rels;
+    atomic_store_explicit(&governor->usable_bytes, one + two - 1u,
+        memory_order_release);
+    RETRACTION_CHECK(wl_columnar_session_test_register_retraction(&sess,
+        retraction, true) == ENOSPC
+        && sess.rels == original && sess.nrels == 1 && sess.rel_cap == 1
+        && sess.rels[0]->columns[0][0] == 42
+        && wl_columnar_memory_reserved(governor) == one,
+        "denied retraction changed EDB or registry");
+    atomic_store_explicit(&governor->usable_bytes, one + two,
+        memory_order_release);
+    RETRACTION_CHECK(wl_columnar_session_test_register_retraction(&sess,
+        retraction, false) == 0
+        && sess.rels == original && sess.nrels == 1 && sess.rel_cap == 1
+        && sess.rels[0]->columns[0][0] == 42
+        && wl_columnar_memory_reserved(governor) == one,
+        "discard did not roll back replacement reservation");
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_calloc_size = (size_t)two;
+    RETRACTION_CHECK(wl_columnar_session_test_register_retraction(&sess,
+        retraction, true) == ENOMEM
+        && fail_calloc_size == 0 && sess.rels == original
+        && sess.nrels == 1 && wl_columnar_memory_reserved(governor) == one,
+        "replacement allocator failure changed registry");
+#endif
+    int rc = wl_columnar_session_test_register_retraction(&sess,
+            retraction, true);
+    if (rc == 0)
+        retraction = NULL;
+    RETRACTION_CHECK(rc == 0 && sess.rels != original
+        && sess.nrels == 2 && sess.rel_cap == 2
+        && sess.rels[0]->columns[0][0] == 42
+        && sess.rels[1] && strcmp(sess.rels[1]->name, "$r$edb") == 0
+        && wl_columnar_memory_reserved(governor) == two
+        && sess.rels_reservation.bytes == two,
+        "commit did not transfer replacement reservation");
+cleanup:
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_calloc_size = 0;
+#endif
+    for (uint32_t i = 0; i < sess.nrels; i++)
+        if (sess.rels && sess.rels[i])
+            col_rel_destroy(sess.rels[i]);
+    col_rel_destroy(edb);
+    col_rel_destroy(retraction);
+    free(sess.rels);
+    if (atomic_load_explicit(&sess.rels_reservation.state,
+        memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED)
+        (void)wl_columnar_memory_rollback(&sess.rels_reservation);
+    if (!failure && wl_columnar_memory_reserved(governor) != 0)
+        failure = "retraction registry teardown leaked reservation";
+    wl_columnar_memory_governor_ref_release(ref);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef RETRACTION_CHECK
+}
+
+static void
+test_worker_registry_pointer_admission(void)
+{
+    TEST("worker relation array denial preserves partitions and retries");
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    resolution.budget_bytes = 32u * 1024u * 1024u;
+    resolution.usable_bytes = resolution.budget_bytes;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    wl_columnar_memory_governor_ref_t *ref
+        = wl_columnar_memory_governor_ref_create(&resolution);
+    col_rel_t *partition = col_rel_new_auto("partition", 1);
+    if (!ref || !partition) {
+        if (partition) col_rel_destroy(partition);
+        if (ref) wl_columnar_memory_governor_ref_release(ref);
+        FAIL("worker fixture setup failed");
+        return;
+    }
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(ref);
+    wl_col_session_t coordinator = { 0 }, worker = { 0 };
+    col_rel_t *parts[] = { partition };
+    coordinator.memory_governor = ref;
+    coordinator.num_workers = 1;
+    const char *failure = NULL;
+    atomic_store_explicit(&governor->usable_bytes,
+        sizeof(col_rel_t *) - 1u, memory_order_release);
+    int rc = col_worker_session_create(&coordinator, 0, parts, 1, &worker);
+    if (rc != ENOSPC || parts[0] != partition
+        || !wl_columnar_session_budget_denied(&coordinator)
+        || wl_columnar_memory_reserved(governor) != 0)
+        failure = "one-byte-under worker admission changed ownership";
+    if (!failure) {
+        coordinator.memory_budget_denied = false;
+        atomic_store_explicit(&governor->usable_bytes,
+            sizeof(col_rel_t *), memory_order_release);
+        rc = col_worker_session_create(&coordinator, 0, parts, 1, &worker);
+        if (rc != 0 || parts[0] != NULL
+            || worker.rels[0] != partition
+            || wl_columnar_memory_reserved(governor)
+            != sizeof(col_rel_t *))
+            failure = "exact-fit worker retry lost relation array token";
+    }
+    if (parts[0])
+        col_rel_destroy(parts[0]);
+    if (worker.memory_governor && col_worker_session_destroy(&worker) != 0)
+        failure = "worker teardown failed";
+    if (!failure && wl_columnar_memory_reserved(governor) != 0)
+        failure = "worker teardown leaked relation array token";
+    wl_columnar_memory_governor_ref_release(ref);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
 }
 
 static void
@@ -1860,11 +2144,33 @@ test_session_injected_governor_admission(void)
     wl_columnar_memory_governor_ref_release(ref);
     PASS();
 
+    const uint64_t registry_bytes = 16u * sizeof(col_rel_t *);
+    TEST("session(#1929): relation registry denies one byte below exact fit");
+    ref = enforcing_governor(intern_bytes + registry_bytes - 1u);
+    options.memory_governor = ref;
+    session = NULL;
+    rc = ref ? wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &session) : -1;
+    if (!ref || rc != WL_ERR_MEMORY_BUDGET || session != NULL
+        || reserved_on(ref) != 0) {
+        if (session)
+            wl_session_destroy(session);
+        if (ref)
+            wl_columnar_memory_governor_ref_release(ref);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("registry denial did not roll back session creation");
+        return;
+    }
+    wl_columnar_memory_governor_ref_release(ref);
+    PASS();
+
     /* Exact fit: creation succeeds on the injected governor itself, charges
      * exactly the floor, and destroy releases everything but the
      * program-owned intern reservation. */
     TEST("session(#1473): injected governor admits the exact floor");
-    ref = enforcing_governor(intern_bytes + compound_bytes);
+    ref = enforcing_governor(intern_bytes + compound_bytes
+            + registry_bytes);
     options.memory_governor = ref;
     session = NULL;
     rc = ref ? wl_session_create_with_options(wl_backend_columnar(), plan, 1,
@@ -1876,7 +2182,9 @@ test_session_injected_governor_admission(void)
         || wl_session_memory_governor(session)
         != wl_columnar_memory_governor_ref_get(ref)
         || reserved_on(ref) != intern_bytes + compound_bytes
-        || ledger.total_budget != intern_bytes + compound_bytes) {
+        + registry_bytes
+        || ledger.total_budget != intern_bytes + compound_bytes
+        + registry_bytes) {
         if (session)
             wl_session_destroy(session);
         if (ref)
@@ -11294,6 +11602,9 @@ kfusion_cohort_cleanup:
     }
     session_rel_free_hash(&sess);
     free(sess.rels);
+    if (atomic_load_explicit(&sess.rels_reservation.state,
+        memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED)
+        (void)wl_columnar_memory_rollback(&sess.rels_reservation);
     if (input)
         col_rel_destroy(input);
     if (governor)
@@ -11902,7 +12213,7 @@ test_governed_pool_publication(unsigned mode)
     }
 #ifdef WL_TEST_ALLOC_WRAP
     if (mode == 2) fail_calloc_size = sizeof(col_rel_t);
-    if (mode == 3) fail_realloc_size = 16 * sizeof(col_rel_t *);
+    if (mode == 3) fail_malloc_size = 16 * sizeof(col_rel_t *);
 #endif
     if (mode == 4)
         atomic_store_explicit(&candidate->retained_reservation.state,
@@ -11915,7 +12226,7 @@ test_governed_pool_publication(unsigned mode)
         PROMOTE_CHECK(rc == ((mode == 1 || mode == 4) ? EBUSY : ENOMEM),
             "publication failure");
 #ifdef WL_TEST_ALLOC_WRAP
-        PROMOTE_CHECK(fail_calloc_size == 0 && fail_realloc_size == 0,
+        PROMOTE_CHECK(fail_calloc_size == 0 && fail_malloc_size == 0,
             "fault hit");
 #endif
         PROMOTE_CHECK(candidate->pool_owned && candidate->columns == columns
@@ -11957,14 +12268,16 @@ test_governed_pool_publication(unsigned mode)
         "heap owns unchanged payload and token");
 cleanup:
 #ifdef WL_TEST_ALLOC_WRAP
-    fail_calloc_size = fail_realloc_size = 0;
+    fail_calloc_size = fail_malloc_size = 0;
 #endif
     if (held) (void)col_rel_source_reader_release(&reader);
     if (!published) col_rel_destroy(candidate);
     for (uint32_t i = 0; i < sess.nrels; i++) col_rel_destroy(sess.rels[i]);
     free(sess.rels);
-    free(sess.rel_hash_head);
-    free(sess.rel_hash_next);
+    if (atomic_load_explicit(&sess.rels_reservation.state,
+        memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED)
+        (void)wl_columnar_memory_rollback(&sess.rels_reservation);
+    session_rel_free_hash(&sess);
     col_rel_destroy(source);
     delta_pool_destroy(pool);
     if (ref) {
@@ -12343,6 +12656,9 @@ main(void)
 
     test_session_hash_overflow_rejected();
     test_session_hash_admission_and_image_lifetime();
+    test_session_registry_pointer_admission();
+    test_retraction_registry_pointer_admission();
+    test_worker_registry_pointer_admission();
     test_retained_relation_admission();
     test_bulk_relation_append_transaction();
     test_governed_compaction_transaction();
