@@ -89,6 +89,15 @@ typedef struct {
      * (memory_governor.h) field for field, with the two wl_atomic_u64
      * members represented as plain uint64_t of identical size/alignment. */
     void *memory_governor;
+    struct {
+        void *governor;
+        uint64_t bytes;
+        uint64_t replacement_bytes;
+        uint64_t owner_bits;
+        uint64_t state;
+        const void *identity;
+    } descriptor_reservation;
+    uint64_t descriptor_reserved_bytes;
     uint8_t memory_budget_denial_pending;
     struct {
         void *governor;
