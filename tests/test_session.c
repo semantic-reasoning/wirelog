@@ -29,6 +29,7 @@
 #include "../wirelog/intern.h"
 #include "../wirelog/wirelog-parser.h"
 #include "../wirelog/wirelog.h"
+#include "../wirelog/wirelog-internal.h"
 #include "plan_fixture.h"
 
 #include <stdio.h>
@@ -6945,7 +6946,7 @@ test_tdd_outbound_frame_retention(uint32_t workers, unsigned storage,
             TDD_FRAME_CHECK(held->timestamps == outbound_frame_timestamps
                 && held->storage_generation == outbound_frame_storage_generation
                 && held->nrows == outbound_frame_rows
-                && ((held->timestamps != NULL) == (storage == 5)),
+                && held->timestamps != NULL,
                 "late candidate mutated before reader release");
         wl_mem_ledger_snapshot_t queue_ledger;
         wl_mem_ledger_snapshot(&sess->mem_ledger, &queue_ledger);
@@ -7022,6 +7023,65 @@ static wl_columnar_eval_stack_cleanup_frame_t *ordinary_gate_frame;
 static wl_columnar_memory_governor_t *ordinary_gate_budget;
 static wl_columnar_memory_mode_t ordinary_gate_saved_mode;
 static uint64_t ordinary_gate_saved_limit;
+extern int wl_columnar_eval_test_prepare_worker_delta(col_rel_t **out,
+    const char *name, const col_rel_t *source, uint32_t rows,
+    wl_columnar_memory_governor_ref_t *governor);
+extern void (*wl_columnar_eval_test_before_worker_delta)(wl_col_session_t *,
+    col_rel_t *, const char *, uint32_t);
+extern void (*wl_columnar_eval_test_after_worker_delta)(wl_col_session_t *,
+    col_rel_t *, int);
+static bool ordinary_delta_hook_seen, ordinary_delta_hook_ok;
+static bool ordinary_delta_refusal_unchanged;
+static col_rel_t *ordinary_delta_source;
+static uint32_t ordinary_delta_rows;
+static uint64_t ordinary_delta_view, ordinary_delta_storage;
+static int64_t **ordinary_delta_columns;
+
+static void
+ordinary_worker_delta_deny(wl_col_session_t *worker, col_rel_t *source,
+    const char *name, uint32_t rows)
+{
+    if (worker->worker_id != 0 || ordinary_delta_hook_seen)
+        return;
+    ordinary_delta_hook_seen = true;
+    ordinary_delta_source = source;
+    ordinary_delta_rows = source->nrows;
+    ordinary_delta_view = source->view_generation;
+    ordinary_delta_storage = source->storage_generation;
+    ordinary_delta_columns = source->columns;
+    wl_columnar_memory_governor_t *budget =
+        wl_columnar_memory_governor_ref_get(worker->memory_governor);
+    uint64_t before = wl_columnar_memory_reserved(budget);
+    col_rel_t *measured = NULL;
+    int rc = wl_columnar_eval_test_prepare_worker_delta(&measured, name,
+            source, rows, worker->memory_governor);
+    uint64_t after = wl_columnar_memory_reserved(budget);
+    ordinary_delta_hook_ok = rc == 0 && measured && after > before;
+    col_rel_destroy(measured);
+    if (!ordinary_delta_hook_ok)
+        return;
+    ordinary_gate_budget = budget;
+    ordinary_gate_saved_mode = budget->mode;
+    ordinary_gate_saved_limit = atomic_load_explicit(&budget->usable_bytes,
+            memory_order_relaxed);
+    budget->mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    atomic_store_explicit(&budget->usable_bytes, after - 1,
+        memory_order_relaxed);
+    ordinary_gate_budget_changed = true;
+}
+
+static void
+ordinary_worker_delta_check(wl_col_session_t *worker, col_rel_t *source,
+    int rc)
+{
+    if (worker->worker_id != 0 || source != ordinary_delta_source)
+        return;
+    ordinary_delta_refusal_unchanged = rc == ENOSPC
+        && source->nrows == ordinary_delta_rows
+        && source->view_generation == ordinary_delta_view
+        && source->storage_generation == ordinary_delta_storage
+        && source->columns == ordinary_delta_columns;
+}
 
 static void
 count_ordinary_worker_plan(wl_col_session_t *sess, eval_stack_t *stack,
@@ -7107,7 +7167,7 @@ test_tdd_ordinary_frame_gates(uint32_t workers, unsigned mode)
         { .op = WL_PLAN_OP_CONCAT },
         { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
     };
-    if (mode >= 2) {
+    if (mode >= 2 && mode != 5) {
         ops[0].relation_name = "input";
         ops[1] = (wl_plan_op_t){ .op = WL_PLAN_OP_FILTER,
                                  .filter_expr = { predicate, 2 } };
@@ -7129,6 +7189,9 @@ test_tdd_ordinary_frame_gates(uint32_t workers, unsigned mode)
     ordinary_gate_verified = ordinary_gate_budget_changed = false;
     ordinary_gate_rc = 0;
     ordinary_gate_frame = NULL;
+    ordinary_delta_hook_seen = ordinary_delta_hook_ok = false;
+    ordinary_delta_refusal_unchanged = false;
+    ordinary_delta_source = NULL;
 #define TDD_GATE_CHECK(condition, message) \
         do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
     TDD_GATE_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
@@ -7149,13 +7212,33 @@ test_tdd_ordinary_frame_gates(uint32_t workers, unsigned mode)
     }
     wl_columnar_eval_serial_test_after_plan = count_ordinary_worker_plan;
     wl_columnar_eval_test_subpass_boundary = ordinary_worker_gate_boundary;
+    if (mode == 5) {
+        wl_columnar_eval_test_before_worker_delta = ordinary_worker_delta_deny;
+        wl_columnar_eval_test_after_worker_delta = ordinary_worker_delta_check;
+    }
     int rc = wl_session_snapshot(session, collect_tuple, &tuples);
     wl_columnar_eval_test_subpass_boundary = NULL;
     wl_columnar_eval_serial_test_after_plan = NULL;
-    TDD_GATE_CHECK(ordinary_gate_verified && ordinary_gate_workers == workers
-        && ordinary_gate_calls == 0 && sess->tdd_executed_strata == 1,
-        "actual dispatch bypassed gate or outbound exclusion");
+    wl_columnar_eval_test_before_worker_delta = NULL;
+    wl_columnar_eval_test_after_worker_delta = NULL;
+    if (mode == 5)
+        TDD_GATE_CHECK(ordinary_delta_hook_seen && ordinary_delta_hook_ok
+            && ordinary_delta_refusal_unchanged, "worker delta preflight");
+    else
+        TDD_GATE_CHECK(ordinary_gate_verified &&
+            ordinary_gate_workers == workers
+            && ordinary_gate_calls == 0 && sess->tdd_executed_strata == 1,
+            "actual dispatch bypassed gate or outbound exclusion");
     if (mode != 2) {
+        if (mode == 5) {
+            TDD_GATE_CHECK(sess->memory_budget_denied
+                && wl_columnar_session_budget_denied(sess)
+                && wl_facade_session_error_code_with_budget(rc, 0,
+                wl_columnar_session_budget_denied(sess))
+                == WIRELOG_ERR_MEMORY_BUDGET,
+                "worker budget denial lost public error type");
+            wl_columnar_session_budget_denial_clear(sess);
+        }
         TDD_GATE_CHECK(rc == ((mode == 0 || mode == 3) ? EBUSY : ENOSPC) &&
             tuples.count == 0,
             "failure not propagated before output");
@@ -7172,6 +7255,8 @@ test_tdd_ordinary_frame_gates(uint32_t workers, unsigned mode)
 cleanup:
     wl_columnar_eval_test_subpass_boundary = NULL;
     wl_columnar_eval_serial_test_after_plan = NULL;
+    wl_columnar_eval_test_before_worker_delta = NULL;
+    wl_columnar_eval_test_after_worker_delta = NULL;
     if (ordinary_gate_budget_changed) {
         ordinary_gate_budget->mode = ordinary_gate_saved_mode;
         atomic_store_explicit(&ordinary_gate_budget->usable_bytes,
@@ -7221,7 +7306,7 @@ test_outbound_publisher_ownership(unsigned mode)
         coord->memory_governor) == 0, "candidate governor");
     if (mode != 0)
         PUB_CHECK(col_rel_append_row(candidate, &value) == 0, "candidate row");
-    if (mode == 2 || mode == 3)
+    if (mode != 0 && mode <= 4)
         PUB_CHECK(col_rel_enable_timestamps(candidate) == 0, "timestamps");
     col_rel_t *original = candidate;
     col_delta_timestamp_t *timestamps = candidate->timestamps;
@@ -7241,6 +7326,8 @@ test_outbound_publisher_ownership(unsigned mode)
             col_rel_t *prefix = col_rel_new_auto("prefix", 1);
             PUB_CHECK(prefix && col_rel_append_row(prefix, &value) == 0,
                 "prefix");
+            PUB_CHECK(col_rel_enable_timestamps(prefix) == 0,
+                "prefix timestamps");
             int rc = wl_columnar_eval_tdd_queue_publish_delta(&ctx, &worker,
                     &prefix, 0, 4);
             if (rc != 0) col_rel_destroy(prefix);
@@ -7260,7 +7347,8 @@ test_outbound_publisher_ownership(unsigned mode)
         atomic_store_explicit(&budget->usable_bytes, 0, memory_order_relaxed);
         budget_changed = true;
     }
-    int rc = wl_columnar_eval_tdd_queue_publish_delta(&ctx, &worker,
+    int rc = mode >= 5 ? col_rel_enable_timestamps(candidate)
+        : wl_columnar_eval_tdd_queue_publish_delta(&ctx, &worker,
             &candidate, 0, 7);
 #ifdef WL_TEST_ALLOC_WRAP
     fail_next_alloc = false;
@@ -7292,6 +7380,9 @@ test_outbound_publisher_ownership(unsigned mode)
         PUB_CHECK(ledger.subsys_bytes[WL_MEM_SUBSYS_CHANNEL] == 0,
             "prefix accounting leaked");
     }
+    if (mode >= 5)
+        PUB_CHECK(col_rel_enable_timestamps(candidate) == 0,
+            "retry timestamp admission");
     PUB_CHECK(wl_columnar_eval_tdd_queue_publish_delta(&ctx, &worker,
         &candidate, 0, 7) == 0 && !candidate, "retry transfer");
     PUB_CHECK(mode == 0 ? slots[0] == NULL : slots[0] == original,
@@ -7330,6 +7421,133 @@ cleanup:
     }
     PASS();
 #undef PUB_CHECK
+}
+
+static void
+test_worker_delta_preflight(uint32_t ncols, uint32_t rows)
+{
+    TEST("TDD worker delta: physical image exact admission and rollback");
+    wl_plan_t plan = { 0 };
+    wl_session_t *session = NULL;
+    col_rel_t *source = NULL, *delta = NULL;
+    const char *failure = NULL;
+    int64_t value = 7;
+    wl_columnar_memory_governor_t *budget = NULL;
+    wl_columnar_memory_mode_t saved_mode = 0;
+    uint64_t saved_limit = 0;
+#define DELTA_CHECK(c, m) do { if (!(c)) { failure = m; goto cleanup; \
+                               } } while (0)
+    DELTA_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "session");
+    wl_col_session_t *sess = COL_SESSION(session);
+    budget = wl_columnar_memory_governor_ref_get(sess->memory_governor);
+    saved_mode = budget->mode;
+    saved_limit = atomic_load_explicit(&budget->usable_bytes,
+            memory_order_relaxed);
+    source = col_rel_new_auto("source", ncols);
+    DELTA_CHECK(source, "source");
+    for (uint32_t i = 0; i < rows; i++)
+        DELTA_CHECK(col_rel_append_row(source, &value) == 0, "source rows");
+    uint64_t source_view = source->view_generation;
+    uint64_t source_storage = source->storage_generation;
+    int64_t **source_columns = source->columns;
+    uint64_t baseline = wl_columnar_memory_reserved(budget);
+    DELTA_CHECK(wl_columnar_eval_test_prepare_worker_delta(&delta,
+        "$d$source", source, UINT32_MAX, sess->memory_governor)
+        == EOVERFLOW && !delta
+        && wl_columnar_memory_reserved(budget) == baseline,
+        "unrepresentable delta capacity leaves no reservation");
+    DELTA_CHECK(wl_columnar_eval_test_prepare_worker_delta(&delta,
+        "$d$source", source, rows, sess->memory_governor) == 0,
+        "measure exact delta");
+    uint64_t peak = wl_columnar_memory_reserved(budget);
+    DELTA_CHECK(peak > baseline && delta->capacity >= rows
+        && delta->timestamps && delta->timestamp_capacity == delta->capacity
+        && delta->retained_reserved_bytes > 0,
+        "complete physical delta image");
+    DELTA_CHECK(col_rel_destroy_checked(delta) == 0, "measured teardown");
+    delta = NULL;
+    DELTA_CHECK(wl_columnar_memory_reserved(budget) == baseline,
+        "measured credit returned");
+    uint64_t constructor_peak = baseline, grid_peak = baseline;
+    DELTA_CHECK(wl_columnar_relation_new_like_governed_checked(&delta,
+        "$d$source", source, sess->memory_governor) == 0,
+        "measure descriptor stage");
+    constructor_peak = wl_columnar_memory_reserved(budget);
+    wl_columnar_source_access_writer_t writer = { 0 };
+    DELTA_CHECK(col_rel_source_writer_acquire(delta, &writer) == 0,
+        "measure writer");
+    bool alias_release_pending = false;
+    int stage_rc = col_rel_reserve_rows_locked(delta, rows, &writer,
+            &alias_release_pending);
+    int release_rc = wl_columnar_source_access_writer_release(&writer);
+    DELTA_CHECK(stage_rc == 0 && release_rc == 0
+        && !alias_release_pending, "measure grid stage");
+    grid_peak = wl_columnar_memory_reserved(budget);
+    DELTA_CHECK(constructor_peak > baseline && grid_peak >= constructor_peak
+        && peak > grid_peak, "strict timestamp stage");
+    DELTA_CHECK(col_rel_destroy_checked(delta) == 0, "stage teardown");
+    delta = NULL;
+    DELTA_CHECK(wl_columnar_memory_reserved(budget) == baseline,
+        "stage credit returned");
+    budget->mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    uint64_t denial_limits[3] = { constructor_peak - 1,
+                                  grid_peak >
+                                  constructor_peak ? grid_peak - 1 : 0,
+                                  peak - 1 };
+    for (unsigned stage = 0; stage < 3; stage++) {
+        if (denial_limits[stage] == 0)
+            continue;
+        atomic_store_explicit(&budget->usable_bytes, denial_limits[stage],
+            memory_order_relaxed);
+        DELTA_CHECK(wl_columnar_eval_test_prepare_worker_delta(&delta,
+            "$d$source", source, rows, sess->memory_governor) == ENOSPC
+            && !delta && wl_columnar_memory_reserved(budget) == baseline,
+            "stage one-byte denial");
+    }
+#ifdef WL_TEST_ALLOC_WRAP
+    budget->mode = saved_mode;
+    atomic_store_explicit(&budget->usable_bytes, saved_limit,
+        memory_order_relaxed);
+    fail_next_alloc = true;
+    int alloc_rc = wl_columnar_eval_test_prepare_worker_delta(&delta,
+            "$d$source", source, rows, sess->memory_governor);
+    bool alloc_fired = !fail_next_alloc;
+    fail_next_alloc = false;
+    DELTA_CHECK(alloc_rc == ENOMEM && alloc_fired && !delta
+        && wl_columnar_memory_reserved(budget) == baseline,
+        "allocation failure returned credit");
+    budget->mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+#endif
+    atomic_store_explicit(&budget->usable_bytes, peak - 1,
+        memory_order_relaxed);
+    DELTA_CHECK(wl_columnar_eval_test_prepare_worker_delta(&delta,
+        "$d$source", source, rows, sess->memory_governor) == ENOSPC
+        && !delta && wl_columnar_memory_reserved(budget) == baseline
+        && source->nrows == rows && source->columns == source_columns
+        && source->view_generation == source_view
+        && source->storage_generation == source_storage,
+        "one-byte denial left source and credit unchanged");
+    atomic_store_explicit(&budget->usable_bytes, peak,
+        memory_order_relaxed);
+    DELTA_CHECK(wl_columnar_eval_test_prepare_worker_delta(&delta,
+        "$d$source", source, rows, sess->memory_governor) == 0
+        && delta && wl_columnar_memory_reserved(budget) == peak,
+        "exact-fit retry");
+cleanup:
+    if (budget) {
+        budget->mode = saved_mode;
+        atomic_store_explicit(&budget->usable_bytes, saved_limit,
+            memory_order_relaxed);
+    }
+    col_rel_destroy(delta);
+    col_rel_destroy(source);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef DELTA_CHECK
 }
 
 static void
@@ -13405,6 +13623,7 @@ main(void)
         test_tdd_ordinary_frame_gates(2, mode);
         test_tdd_ordinary_frame_gates(8, mode);
     }
+    test_tdd_ordinary_frame_gates(2, 5);
     test_worker_frame_admission(false);
     test_worker_frame_admission(true);
     test_worker_frame_retention(8, 0, true, false, 0);
@@ -13487,6 +13706,9 @@ main(void)
     test_recursive_delta_admission_retry(1);
     test_recursive_delta_admission_retry(2);
     test_recursive_delta_admission_retry(3);
+    test_worker_delta_preflight(1, 1);
+    test_worker_delta_preflight(1, 17);
+    test_worker_delta_preflight(0, 17);
 #ifdef WL_TEST_ALLOC_WRAP
     test_recursive_delta_publication_failure(true);
 #endif
