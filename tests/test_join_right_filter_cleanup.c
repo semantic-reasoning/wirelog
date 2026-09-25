@@ -13,11 +13,10 @@
  * were never freed is a heap leak.
  *
  * The tests drive the operators directly on a mock session and force the
- * owned path with WL_DELTA_FORCE_DELTA plus a populated $d$right.  Two
- * early exits are deterministic without allocation injection:
- *   - the ledger backpressure return (a non-error exit that pushes the
- *     empty output and returns 0), reached by pre-setting the RELATION
- *     gauge above the 80% threshold;
+ * owned path with WL_DELTA_FORCE_DELTA plus a populated $d$right.  These
+ * deterministic paths need no allocation injection:
+ *   - ledger pressure no longer changes JOIN results; the same pressure
+ *     used to push a successful but empty output before probing;
  *   - the key-type EINVAL return, reached with a FLOAT left key against an
  *     INT64 right key.
  * The leak check is independent of the sanitizer: the filtered relation
@@ -311,12 +310,13 @@ run_op(wl_col_session_t *sess, op_fn_t fn, wl_plan_op_type_t type,
  * Cases
  * ------------------------------------------------------------------------ */
 
-/* Ledger backpressure: the operator pushes its (empty) output and returns 0
- * before joining; the owned filtered relation must not survive.  Budget 1000
- * gives the RELATION subsystem a 500-byte cap; a 400-byte gauge is at the 80%
- * threshold before the output's own bytes are attached. */
+/* Observational ledger pressure must not replace the exact JOIN result with
+ * an empty success.  Budget 1000 gives the RELATION subsystem a 500-byte cap;
+ * the pre-set 400-byte gauge crosses the former 80% threshold.  The owned
+ * filtered relation must still be destroyed on the successful path. */
 static int
-test_backpressure_exit(const char *name, op_fn_t fn, wl_plan_op_type_t type)
+test_ledger_pressure_full_result(const char *name, op_fn_t fn,
+    wl_plan_op_type_t type)
 {
     TEST(name);
     wl_col_session_t *sess = make_mock_session();
@@ -332,7 +332,7 @@ test_backpressure_exit(const char *name, op_fn_t fn, wl_plan_op_type_t type)
 
     col_rel_t *out = NULL;
     int rc = run_op(sess, fn, type, false, &out);
-    int ok = rc == 0 && out != NULL && out->nrows == 0;
+    int ok = rc == 0 && out != NULL && out->nrows == 4;
     if (!ok)
         printf("(rc=%d out=%p) ", rc, (void *)out);
     if (out)
@@ -343,7 +343,7 @@ test_backpressure_exit(const char *name, op_fn_t fn, wl_plan_op_type_t type)
 
     destroy_mock_session(sess);
     if (!ok) {
-        FAIL("owned right filter leaked on the backpressure exit");
+        FAIL("ledger pressure changed the result or leaked the owned filter");
         return 1;
     }
     PASS();
@@ -1244,10 +1244,15 @@ main(void)
 #ifdef WL_TEST_JOIN_TIMESTAMP_HOOK
     test_semijoin_timestamp_exact_resize();
 #endif
-    test_backpressure_exit("join: backpressure exit releases the filter",
+    test_ledger_pressure_full_result(
+        "join: ledger pressure preserves rows and filter cleanup",
         wl_columnar_join_op, WL_PLAN_OP_JOIN);
-    test_backpressure_exit("join(diff): backpressure exit releases the filter",
+    test_ledger_pressure_full_result(
+        "join(diff): ledger pressure preserves rows and filter cleanup",
         wl_columnar_join_diff_op, WL_PLAN_OP_JOIN);
+    test_ledger_pressure_full_result(
+        "semijoin: ledger pressure preserves rows and filter cleanup",
+        wl_columnar_semijoin_op, WL_PLAN_OP_SEMIJOIN);
     test_key_type_exit("join: key-type exit releases the filter (control)",
         wl_columnar_join_op, WL_PLAN_OP_JOIN);
     test_key_type_exit("join(diff): key-type exit releases the filter",

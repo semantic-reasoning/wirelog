@@ -425,31 +425,6 @@ col_join_output_limit_reached(wl_col_session_t *sess, const col_rel_t *out)
     return out && out->nrows >= limit;
 }
 
-/*
- * col_join_inloop_backpressure: in-loop soft backpressure check.
- *
- * The RELATION-subsystem 80% threshold is a SOFT signal intended for the
- * multi-worker TDD path, where col_eval_stratum_tdd recovers via EAGAIN
- * (retry with fewer workers).  Coordinator and single-session evaluators
- * have no fallback — propagating EOVERFLOW from this signal turns a soft
- * advisory into an unrecoverable, silent abort (Issue #791: DOOP fails at
- * stratum 54 SubtypeOf eff_iter=1 when RELATION usage crosses 4.7 GB on a
- * 16 GB host even though absolute memory is fine and the cardinality cap
- * is far away).  Restrict this check to worker sessions; the hard
- * cardinality cap (col_join_output_limit_reached) remains the universal
- * safety net.  The pre-join coordinator-side BP check still applies and
- * degrades gracefully to an empty result (Issue #404 design).
- */
-static inline bool
-col_join_inloop_backpressure(wl_col_session_t *sess, const col_rel_t *out)
-{
-    if (!sess || !sess->coordinator)
-        return false;
-    return out && out->nrows > 0 && out->nrows % 10000 == 0
-           && wl_mem_ledger_should_backpressure(
-        &sess->mem_ledger, WL_MEM_SUBSYS_RELATION, 80);
-}
-
 static int
 col_join_reserve_exact(col_rel_t *rel, uint32_t nrows)
 {
@@ -1464,26 +1439,6 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             col_rel_destroy(right_filtered);
         return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
     }
-    /* Backpressure check (Issue #224): when RELATION subsystem reaches >= 80%
-     * of its budget, skip row generation and push an empty result instead of
-     * risking EOVERFLOW (rc=84).  Evaluation continues with gracefully
-     * degraded (incomplete) results rather than failing entirely.
-     *
-     * TDD workers (coordinator != NULL) skip this pre-join check (Issue #404):
-     * returning empty results before row generation causes silent correctness
-     * bugs — zero join output leads to premature fixed-point convergence.
-     * Workers still have in-loop backpressure + join_output_limit as hard
-     * safety nets.  Coordinator sessions retain full pre-join protection. */
-    if (wl_mem_ledger_should_backpressure(&sess->mem_ledger,
-        WL_MEM_SUBSYS_RELATION, 80)
-        && !sess->coordinator) {
-        wl_columnar_join_key_scratch_free(&key_scratch, &lk);
-        wl_columnar_join_key_scratch_free(&key_scratch, &rk);
-        if (right_filtered)
-            col_rel_destroy(right_filtered);
-        return wl_columnar_join_publish_after_left(stack, &left_e, out, false);
-    }
-
     int64_t *tmp = NULL;
 
     /* BOOLEAN SPECIALIZATION (Issue #62): Fast-path for unary relations.
@@ -1671,8 +1626,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                         join_rc);
                     break;
                 }
-                if (col_join_output_limit_reached(sess, out)
-                    || col_join_inloop_backpressure(sess, out)) {
+                if (col_join_output_limit_reached(sess, out)) {
                     fprintf(stderr,
                         "join output limit reached: %u rows "
                         "(limit=%llu)\n",
@@ -2099,8 +2053,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                                     join_rc);
                                 break;
                             }
-                            if (col_join_output_limit_reached(sess, out)
-                                || col_join_inloop_backpressure(sess, out)) {
+                            if (col_join_output_limit_reached(sess, out)) {
                                 fprintf(
                                     stderr,
                                     "join output limit reached: %u rows "
@@ -2132,8 +2085,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                                 join_rc);
                             break;
                         }
-                        if (col_join_output_limit_reached(sess, out)
-                            || col_join_inloop_backpressure(sess, out)) {
+                        if (col_join_output_limit_reached(sess, out)) {
                             fprintf(stderr,
                                 "join output limit reached: %u rows "
                                 "(limit=%llu)\n",
@@ -3192,16 +3144,6 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
             col_rel_destroy(right_filtered);
         return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
     }
-    /* Backpressure check (Issue #224) */
-    if (wl_mem_ledger_should_backpressure(&sess->mem_ledger,
-        WL_MEM_SUBSYS_RELATION, 80)) {
-        wl_columnar_join_key_scratch_free(&key_scratch, &lk);
-        wl_columnar_join_key_scratch_free(&key_scratch, &rk);
-        if (right_filtered)
-            col_rel_destroy(right_filtered);
-        return wl_columnar_join_publish_after_left(stack, &left_e, out, false);
-    }
-
     wl_columnar_memory_reservation_t tmp_reservation;
     bool tmp_admitted = false;
     wl_columnar_memory_reservation_init(&tmp_reservation);
@@ -3499,24 +3441,6 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 prc = EOVERFLOW;
             if (prc == 0 && total > UINT32_MAX)
                 prc = EOVERFLOW;
-            if (prc == 0 && total > out->capacity && ocols > 0) {
-                uint64_t add_rows = total - out->capacity;
-                uint64_t row_bytes = (uint64_t)ocols * sizeof(int64_t);
-                uint64_t add_bytes = add_rows > UINT64_MAX / row_bytes
-                    ? UINT64_MAX : add_rows * row_bytes;
-                uint64_t budget = atomic_load_explicit(
-                    &sess->mem_ledger.total_budget, memory_order_relaxed);
-                uint64_t current = atomic_load_explicit(
-                    &sess->mem_ledger.subsys_bytes[WL_MEM_SUBSYS_RELATION],
-                    memory_order_relaxed);
-                uint64_t cap = (budget
-                    * wl_mem_subsys_pct[WL_MEM_SUBSYS_RELATION]) / 100u;
-                uint64_t threshold = (cap * 80u) / 100u;
-                if (budget > 0 && cap > 0
-                    && (add_bytes > UINT64_MAX - current
-                    || current + add_bytes >= threshold))
-                    prc = EOVERFLOW;
-            }
             if (prc == 0) {
                 if (col_join_reserve_exact(out, (uint32_t)total) != 0) {
                     prc = ENOMEM;
@@ -3577,8 +3501,7 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                         op->project_indices, op->project_count, tmp);
                 if (join_rc != 0)
                     break;
-                if (col_join_output_limit_reached(sess, out)
-                    || col_join_inloop_backpressure(sess, out)) {
+                if (col_join_output_limit_reached(sess, out)) {
                     fprintf(stderr,
                         "join output limit reached (diff): %u rows "
                         "(limit=%llu)\n",
@@ -3699,8 +3622,7 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                         op->project_indices, op->project_count, tmp);
                 if (join_rc != 0)
                     break;
-                if (col_join_output_limit_reached(sess, out)
-                    || col_join_inloop_backpressure(sess, out)) {
+                if (col_join_output_limit_reached(sess, out)) {
                     fprintf(stderr,
                         "join output limit reached (diff): %u rows "
                         "(limit=%llu)\n",

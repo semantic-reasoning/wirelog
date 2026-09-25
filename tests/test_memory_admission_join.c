@@ -238,10 +238,8 @@ make_governor(uint64_t budget)
 }
 
 /*
- * A bare managed session.  mem_ledger budget stays 0 so
- * wl_mem_ledger_should_backpressure() is false: the Issue #224 early return
- * in col_op_join pushes an EMPTY output with rc 0, which would let several
- * cases below pass without ever generating a row.
+ * A bare managed session.  The ledger is observational; result allocation
+ * admission is enforced independently by the governor.
  *
  * @workers > 1 (with coordinator NULL) is what lets
  * col_join_should_parallelize_rows() admit the parallel paths.
@@ -824,6 +822,58 @@ test_growth_rollback(void)
     PASS();
 out:
     col_rel_destroy(r);
+    destroy_session(sess);
+}
+
+static void
+test_worker_join_above_ledger_threshold_keeps_all_rows(void)
+{
+    wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+    col_rel_t *right = make_right(1, 1);
+    col_rel_t *left = make_left(10002u, 1u);
+    wl_plan_op_t op;
+    eval_entry_t result = { 0 };
+
+    TEST("worker JOIN above ledger threshold keeps all governed rows");
+    if (!sess || !right || !left) {
+        FAIL("fixture");
+        goto out;
+    }
+    if (session_add_rel(sess, right) != 0) {
+        FAIL("right relation registration failed");
+        goto out;
+    }
+    right = NULL;
+    /* The legacy in-loop signal fired at exactly 10,000 rows on worker
+     * sessions and converted the otherwise complete output into EOVERFLOW. */
+    sess->coordinator = sess;
+    wl_mem_ledger_init(&sess->mem_ledger, 1000u);
+    wl_mem_ledger_set_gauge(&sess->mem_ledger, WL_MEM_SUBSYS_RELATION, 400u);
+    init_join_op(&op, (const char *const[]){ "k" },
+        (const char *const[]){ "k" });
+    op.materialized = false;
+    if (run_join(sess, left, &op, &result) != 0 || !result.rel
+        || result.rel->nrows != 10002u
+        || col_rel_get(result.rel, 0, 1) != 0
+        || col_rel_get(result.rel, 10001u, 1) != 10001) {
+        FAIL("ledger pressure truncated or failed the exact JOIN result");
+        goto out;
+    }
+    for (uint32_t row = 0; row < result.rel->nrows; row++) {
+        if (col_rel_get(result.rel, row, 0) != 0
+            || col_rel_get(result.rel, row, 1) != row
+            || col_rel_get(result.rel, row, 2) != 0
+            || col_rel_get(result.rel, row, 3) != 0) {
+            FAIL("ledger pressure changed a JOIN result row");
+            goto out;
+        }
+    }
+    PASS();
+out:
+    if (result.owned && result.rel)
+        col_rel_destroy(result.rel);
+    col_rel_destroy(left);
+    col_rel_destroy(right);
     destroy_session(sess);
 }
 
@@ -1864,6 +1914,8 @@ test_parallel_diff_output_is_governed(void)
         FAIL("diff fixture does not select the governed keyed path");
         goto out;
     }
+    wl_mem_ledger_init(&sess->mem_ledger, 1000u);
+    wl_mem_ledger_set_gauge(&sess->mem_ledger, WL_MEM_SUBSYS_RELATION, 400u);
     if (run_diff_join(sess, left, &op, &result) != 0) {
         FAIL("parallel keyed diff join failed under a generous budget");
         goto out;
@@ -3172,6 +3224,7 @@ main(void)
         FAIL("could not measure the output footprint");
     }
     test_growth_rollback();
+    test_worker_join_above_ledger_threshold_keeps_all_rows();
     test_reuse_after_denial();
     test_projected_output_is_governed();
     test_join_output_growth_denial_is_typed();
