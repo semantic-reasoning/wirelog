@@ -101,10 +101,11 @@ session_compound_max_epochs_from_env(void)
 }
 
 static int
-session_hash_result_or_fallback(wl_col_session_t *sess, int rc)
+session_hash_result_or_fallback(int rc)
 {
-    if (rc == ENOMEM) {
-        session_rel_free_hash(sess);
+    if (rc == ENOMEM || rc == ENOSPC) {
+        /* A failed rebuild leaves the previous index valid for its entries;
+         * misses still take session_find_rel's linear path. */
         return 0;
     }
     return rc;
@@ -1088,8 +1089,8 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
     for (uint32_t i = 0; i < sess->nrels; i++) {
         if (!sess->rels[i]) {
             sess->rels[i] = r;
-            int hash_ret = session_hash_result_or_fallback(sess,
-                    session_rel_build_hash(sess));
+            int hash_ret = session_hash_result_or_fallback(
+                session_rel_build_hash(sess));
             if (hash_ret != 0)
                 return hash_ret;
             return 0;
@@ -1111,7 +1112,7 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
     /* Update hash table for O(1) lookup (Issue #281).
      * May rebuild if load factor exceeded or rebuild on first insert. */
     int hash_ret = session_rel_hash_insert(sess, idx);
-    hash_ret = session_hash_result_or_fallback(sess, hash_ret);
+    hash_ret = session_hash_result_or_fallback(hash_ret);
     if (hash_ret != 0)
         return hash_ret;
     /* ENOMEM in hash insert is non-fatal; fallback to linear search in
@@ -2096,6 +2097,7 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
         return ENOMEM;
     }
     sess->memory_governor = memory_governor;
+    wl_columnar_memory_reservation_init(&sess->rel_hash_reservation);
 
     sess->frontier_ops = &col_frontier_epoch_ops;
 
@@ -2595,6 +2597,7 @@ oom:
     (void)session_destroy_relation_array_pass(sess->rels, sess->nrels, true);
     (void)session_destroy_relation_array_pass(sess->rels, sess->nrels, false);
     free((void *)sess->rels);
+    session_rel_free_hash(sess);
     wl_workqueue_destroy(sess->wq);       /* NULL-safe */
     delta_pool_destroy(sess->delta_pool); /* NULL-safe */
     wl_arena_free(sess->eval_arena);      /* NULL-safe; releases admission */
@@ -2986,6 +2989,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->rel_hash_next = NULL;
     out_worker->rel_hash_nbuckets = 0;
     out_worker->rel_hash_chain_cap = 0;
+    wl_columnar_memory_reservation_init(&out_worker->rel_hash_reservation);
     out_worker->source_leases = NULL;
     out_worker->deferred_relations = NULL;
     out_worker->deferred_relation_count = 0;
