@@ -90,6 +90,30 @@ def good(path):
             path.write_text(source, encoding="utf-8")
             self.assertEqual([], self.gate.scan_file(path))
 
+    def test_url_opener_is_allowed_but_path_open_is_still_reported(self):
+        source = """
+import urllib.request
+
+def download(path):
+    opener = urllib.request.build_opener()
+    opener.open('https://example.invalid/artifact', timeout=30)
+    path.open('w')
+    opener = path
+    opener.open('w')
+    fake = path.build_opener()
+    fake.open('w')
+
+def unrelated(path):
+    opener = path
+    opener.open('w')
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "url_opener.py"
+            path.write_text(source, encoding="utf-8")
+            violations = self.gate.scan_file(path)
+        self.assertEqual([7, 9, 11, 15], [item.line for item in violations])
+        self.assertTrue(all("Path.open" in item.message for item in violations))
+
     def test_audit_uses_strict_utf8_for_committed_logs(self):
         audit = (ROOT / "scripts/perf/audit-tdd-execution.py").read_text(encoding="utf-8")
         self.assertIn('read_text(encoding="utf-8", errors="strict")', audit)
