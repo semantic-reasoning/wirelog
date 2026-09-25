@@ -73,6 +73,7 @@ static uint32_t *test_diff_commit_segments;
 static bool test_diff_commit_refusal_witnessed;
 
 void wl_columnar_relation_test_fail_next_governed_copy_payload_alloc(void);
+extern bool wl_columnar_join_test_fail_next_key_scratch_alloc;
 
 static void
 try_reclaim_during_governed_copy(const col_rel_t *source)
@@ -580,6 +581,10 @@ measure_output_bytes(uint64_t *out_bytes)
     wl_plan_op_t op;
     eval_entry_t result = { 0 };
     bool ok = false;
+    uint64_t scratch_bytes = 0;
+    uint64_t row_bytes = 0;
+    uint64_t hash_bytes = 0;
+    uint32_t buckets = 0;
 
     if (!sess || !right || !left)
         goto out;
@@ -593,9 +598,19 @@ measure_output_bytes(uint64_t *out_bytes)
         if (!governed || governed->nrows > COL_REL_INIT_CAP
             || governed->retained_reserved_bytes == 0u)
             goto out_entry;
-        /* A governed stack twin now lives alongside the cached output; this
-         * boundary measures the output owner itself. */
-        *out_bytes = governed->retained_reserved_bytes;
+        /* Include the standard cross-join fallback row in the exact-fit
+         * boundary; it remains live throughout row generation. */
+        buckets = wl_columnar_filter_next_pow2(4u);
+        if (buckets == 0
+            || !wl_columnar_memory_size_mul(governed->ncols,
+            sizeof(int64_t), &row_bytes)
+            || !wl_columnar_memory_size_mul((uint64_t)buckets + 2u,
+            sizeof(uint32_t), &hash_bytes)
+            || !wl_columnar_memory_size_add(row_bytes, hash_bytes,
+            &scratch_bytes)
+            || !wl_columnar_memory_size_add(
+                governed->retained_reserved_bytes, scratch_bytes, out_bytes))
+            goto out_entry;
     }
     ok = true;
 out_entry:
@@ -638,8 +653,10 @@ run_at_budget(const char *name, uint64_t budget, bool expect_ok)
             FAIL("committed token does not cover the output capacity");
             goto out_entry;
         }
-        if (reserved_of(sess) != budget) {
-            FAIL("exact-fit single-owner fallback did not consume the budget");
+        const col_rel_t *retained_output = governed ? governed : result.rel;
+        if (!retained_output || !admission_invariant(retained_output)
+            || reserved_of(sess) >= budget) {
+            FAIL("scratch credit was retained after the join completed");
             goto out_entry;
         }
         PASS();
@@ -961,6 +978,100 @@ out:
 }
 
 static void
+test_source_governed_join_key_scratch_denial(void)
+{
+    static const char *const left_keys[] = { "k" };
+    static const char *const right_keys[] = { "k" };
+    wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+    col_rel_t *right = make_right(2, 1);
+    col_rel_t *left = make_left(4, 2);
+    wl_columnar_memory_governor_ref_t *source_ref = NULL;
+    wl_columnar_memory_governor_ref_t *session_ref = NULL;
+    wl_plan_op_t op;
+
+    TEST("source-only JOIN key scratch denial is typed and balanced");
+    if (!sess || !right || !left
+        || !(source_ref = make_governor(
+            2u * sizeof(uint32_t) - 1u))
+        || col_rel_attach_memory_governor(left, source_ref) != 0) {
+        FAIL("fixture");
+        goto out;
+    }
+    session_ref = sess->memory_governor;
+    sess->memory_governor = NULL;
+    if (session_add_rel(sess, right) != 0) {
+        sess->memory_governor = session_ref;
+        session_ref = NULL;
+        FAIL("right relation setup");
+        goto out;
+    }
+    right = NULL;
+    init_join_op(&op, left_keys, right_keys);
+    if (run_join(sess, left, &op, NULL) != ENOSPC
+        || !sess->memory_budget_denied
+        || reserved_for(source_ref) != 0) {
+        FAIL("key scratch denial was not typed or leaked its reservation");
+    } else {
+        PASS();
+    }
+out:
+    if (sess && session_ref)
+        sess->memory_governor = session_ref;
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+    wl_columnar_memory_governor_ref_release(source_ref);
+}
+
+static void
+test_source_governed_join_key_scratch_alloc_failure(void)
+{
+    static const char *const left_keys[] = { "k" };
+    static const char *const right_keys[] = { "k" };
+    wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+    col_rel_t *right = make_right(2, 1);
+    col_rel_t *left = make_left(4, 2);
+    wl_columnar_memory_governor_ref_t *source_ref = NULL;
+    wl_columnar_memory_governor_ref_t *session_ref = NULL;
+    wl_plan_op_t op;
+
+    TEST("key scratch allocation failure releases its admitted source bytes");
+    if (!sess || !right || !left
+        || !(source_ref = make_governor(2u * sizeof(uint32_t)))
+        || col_rel_attach_memory_governor(left, source_ref) != 0) {
+        FAIL("fixture");
+        goto out;
+    }
+    session_ref = sess->memory_governor;
+    sess->memory_governor = NULL;
+    if (session_add_rel(sess, right) != 0) {
+        sess->memory_governor = session_ref;
+        session_ref = NULL;
+        FAIL("right relation setup");
+        goto out;
+    }
+    right = NULL;
+    init_join_op(&op, left_keys, right_keys);
+    wl_columnar_join_test_fail_next_key_scratch_alloc = true;
+    int rc = run_join(sess, left, &op, NULL);
+    bool injected = !wl_columnar_join_test_fail_next_key_scratch_alloc;
+    if (rc != ENOMEM || !injected || sess->memory_budget_denied
+        || reserved_for(source_ref) != 0) {
+        FAIL("allocator failure was confused with denial or leaked bytes");
+    } else {
+        PASS();
+    }
+out:
+    wl_columnar_join_test_fail_next_key_scratch_alloc = false;
+    if (sess && session_ref)
+        sess->memory_governor = session_ref;
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+    wl_columnar_memory_governor_ref_release(source_ref);
+}
+
+static void
 test_source_governor_output_precedence(void)
 {
     const char *unused_keys[] = { "k" };
@@ -1029,6 +1140,76 @@ test_source_governor_output_precedence(void)
         destroy_session(sess);
         wl_columnar_memory_governor_ref_release(left_ref);
         wl_columnar_memory_governor_ref_release(right_ref);
+    }
+}
+
+static void
+test_filter_join_hash_denial_unwinds_scratch(void)
+{
+    const char *left_keys[] = { "k" };
+    const char *right_keys[] = { "k" };
+    col_rel_t *shape = col_rel_new_auto("$filter_join_budget", 2);
+    uint64_t output_bytes = 0;
+    if (!shape || !col_rel_retained_bytes_for(shape, COL_REL_INIT_CAP,
+        &output_bytes)) {
+        col_rel_destroy(shape);
+        TEST("SEMI/ANTI hash denial restores admitted scratch");
+        FAIL("could not measure filter-join output footprint");
+        return;
+    }
+    col_rel_destroy(shape);
+
+    for (uint32_t which = 0; which < 2; which++) {
+        /* Admit the output, both key-index slots, and the one-row probe
+         * buffer, leaving the four-bucket/two-chain hash table one byte
+         * beyond the budget. */
+        uint64_t budget = output_bytes + 2u * sizeof(uint32_t)
+            + 2u * sizeof(int64_t);
+        wl_col_session_t *sess = make_session(budget);
+        col_rel_t *right = make_right(2, 1);
+        col_rel_t *left = make_left(4, 2);
+        wl_plan_op_t op = { 0 };
+        eval_entry_t result = { 0 };
+        int (*fn)(const wl_plan_op_t *, eval_stack_t *, wl_col_session_t *)
+            = which == 0 ? wl_columnar_semijoin_op : wl_columnar_antijoin_op;
+
+        TEST(which == 0
+            ? "SEMI hash denial restores admitted scratch"
+            : "ANTI hash denial destroys output and restores scratch");
+        if (!sess || !right || !left) {
+            tests_failed++;
+            printf("FAIL: fixture\n");
+            col_rel_destroy(left);
+            col_rel_destroy(right);
+            destroy_session(sess);
+            continue;
+        }
+        if (session_add_rel(sess, right) != 0) {
+            tests_failed++;
+            printf("FAIL: right relation setup\n");
+            col_rel_destroy(left);
+            col_rel_destroy(right);
+            destroy_session(sess);
+            continue;
+        }
+        right = NULL;
+        memset(&op, 0, sizeof(op));
+        op.right_relation = "right";
+        op.key_count = 1;
+        op.left_keys = left_keys;
+        op.right_keys = right_keys;
+        int rc = run_filter_join(fn, sess, left, &op, &result);
+        if (rc != ENOSPC || result.rel || !sess->memory_budget_denied
+            || reserved_of(sess) != 0u || left->nrows != 4
+            || col_rel_get(left, 0, 0) != 0) {
+            tests_failed++;
+            printf(
+                "FAIL: hash refusal leaked bytes or changed the held input\n");
+        } else {
+            PASS();
+        }
+        col_rel_destroy(left);
+        destroy_session(sess);
     }
 }
 
@@ -2447,20 +2628,23 @@ main(void)
 
     test_attach_baseline();
     if (measure_output_bytes(&out_bytes)) {
-        run_at_budget("cross join succeeds at exactly its output footprint",
+        run_at_budget("cross join succeeds at the exact output+scratch peak",
             out_bytes, true);
-        run_at_budget("cross join is denied one byte below that footprint",
+        run_at_budget("cross join denied one byte below output+scratch peak",
             out_bytes - 1u, false);
     } else {
-        TEST("cross join succeeds at exactly its output footprint");
+        TEST("cross join succeeds at the exact output+scratch peak");
         FAIL("could not measure the output footprint");
-        TEST("cross join is denied one byte below that footprint");
+        TEST("cross join is denied one byte below its output+scratch peak");
         FAIL("could not measure the output footprint");
     }
     test_growth_rollback();
     test_reuse_after_denial();
     test_projected_output_is_governed();
     test_join_output_growth_denial_is_typed();
+    test_filter_join_hash_denial_unwinds_scratch();
+    test_source_governed_join_key_scratch_denial();
+    test_source_governed_join_key_scratch_alloc_failure();
     test_source_governor_output_precedence();
     test_source_governed_anti_semi_outputs();
     test_cache_adoption_charges_once();
