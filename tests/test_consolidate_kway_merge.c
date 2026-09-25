@@ -1331,7 +1331,10 @@ test_consolidate_scratch_admission(void)
             FAIL("failed to append source fixture row");
         }
     }
-    ref = test_consolidate_governor_create(1);
+    uint64_t descriptor_bytes = sizeof(col_rel_t)
+        + sizeof("consolidate_test")
+        + sizeof(wl_columnar_memory_reservation_t);
+    ref = test_consolidate_governor_create(descriptor_bytes);
     if (!ref || col_rel_attach_memory_governor(rel, ref) != 0
         || col_rel_install_shared_view(rel, source) != 0) {
         if (ref)
@@ -1358,7 +1361,8 @@ test_consolidate_scratch_admission(void)
         || memcmp(before, source->columns[0], sizeof(before)) != 0
         || memcmp(before, rel->columns[0], sizeof(before)) != 0
         || wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(ref)) != 0) {
+            wl_columnar_memory_governor_ref_get(ref))
+        != rel->descriptor_reserved_bytes) {
         test_rel_free(rel);
         test_rel_free(source);
         wl_columnar_memory_governor_ref_release(ref);
@@ -1389,7 +1393,8 @@ test_consolidate_scratch_admission(void)
     rc = col_op_consolidate_kway_merge(rel, boundaries, 2);
     if (rc != 0 || !test_rel_is_sorted_unique(rel)
         || wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(ref)) != 0) {
+            wl_columnar_memory_governor_ref_get(ref))
+        != rel->descriptor_reserved_bytes) {
         test_rel_free(rel);
         wl_columnar_memory_governor_ref_release(ref);
         FAIL("admitted scratch must succeed and release reservation");
@@ -1808,7 +1813,11 @@ test_zero_arity_merge_output_is_never_zero_sized(void)
     /* (2) A budget covering only the segment scratch must be refused:
      * the merge output still asks for more than zero bytes. */
     rel = zero_arity_fixture();
-    ref = test_consolidate_governor_create(segment_scratch);
+    const uint64_t descriptor_bytes = sizeof(col_rel_t)
+        + sizeof("consolidate_test")
+        + sizeof(wl_columnar_memory_reservation_t);
+    ref = test_consolidate_governor_create(descriptor_bytes
+            + segment_scratch);
     if (!rel || !ref || col_rel_attach_memory_governor(rel, ref) != 0) {
         if (ref)
             wl_columnar_memory_governor_ref_release(ref);
@@ -1828,8 +1837,8 @@ test_zero_arity_merge_output_is_never_zero_sized(void)
     /* (3) One extra int64_t of budget admits it, and the merge dedups
      * the identical empty tuples to a single row. */
     rel = zero_arity_fixture();
-    ref = test_consolidate_governor_create(segment_scratch
-            + sizeof(int64_t));
+    ref = test_consolidate_governor_create(descriptor_bytes
+            + segment_scratch + sizeof(int64_t));
     if (!rel || !ref || col_rel_attach_memory_governor(rel, ref) != 0) {
         if (ref)
             wl_columnar_memory_governor_ref_release(ref);
@@ -1845,7 +1854,8 @@ test_zero_arity_merge_output_is_never_zero_sized(void)
     /* The scratch is transient: it must be given back, or a second
      * consolidation under the same exact budget could not be admitted. */
     if (wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(ref)) != 0) {
+            wl_columnar_memory_governor_ref_get(ref))
+        != rel->descriptor_reserved_bytes) {
         test_rel_free(rel);
         wl_columnar_memory_governor_ref_release(ref);
         FAIL("consolidation scratch was not released back to the governor");
