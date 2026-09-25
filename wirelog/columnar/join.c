@@ -74,6 +74,18 @@ wl_columnar_join_effective_governor(const wl_col_session_t *sess,
                                                    : NULL);
 }
 
+static wl_columnar_memory_governor_ref_t *
+wl_columnar_join_output_governor(const wl_col_session_t *sess,
+    const col_rel_t *left,
+    const col_rel_t *right)
+{
+    if (sess && sess->memory_governor)
+        return sess->memory_governor;
+    if (left && left->memory_governor)
+        return left->memory_governor;
+    return right ? right->memory_governor : NULL;
+}
+
 /* ENOMEM may leave the single original result publishable only when its
  * complete retained footprint was already committed to the effective
  * governor.  An unmanaged source is eligible only in an unmanaged session. */
@@ -220,41 +232,64 @@ col_join_attach_ledger(wl_col_session_t *sess, col_rel_t *rel)
     col_rel_ledger_reconcile(rel, 0);
 }
 
-/*
- * Issue #1477: bind a heap-owned join output to the session governor.
- *
- * A heap output outlives the current delta-pool epoch -- the
- * materialization cache owns it after a successful insert, and the
- * evaluation stack owns it when that insert fails -- so it is admitted
- * exactly like the bounded producer's output does in
- * col_join_batch_relation_sink_init().  Pooled outputs stay ledger-sampled:
- * delta_pool_reset() never frees slot contents, so a governor reference on
- * a pooled relation would leak (see the allocation comment in col_op_join).
- *
- * Attaching is idempotent for the bounded path, which attaches the same
- * reference again later: col_rel_attach_memory_governor() short-circuits on
- * an identical reference before its EBUSY test.
- *
- * @admit_capacity reserves the capacity the relation already owns, so a
- * bulk writer cannot publish rows into unadmitted buffers.  Callers that
- * immediately size the output with col_join_reserve_exact() pass false:
- * that helper admits the real target, and an intermediate reservation
- * would only raise the transient peak by one initial footprint.
- */
+/* Construct join payload only after reserving its initial retained shape.
+ * Unmanaged transient outputs may use the evaluation pool; governed and
+ * retained outputs are always heap-owned so their reservation outlives the
+ * pool epoch. */
 static int
-col_join_admit_output(wl_col_session_t *sess, col_rel_t *out,
-    bool admit_capacity)
+wl_columnar_join_new_output(wl_col_session_t *sess, const col_rel_t *left,
+    const col_rel_t *right, const char *name, uint32_t ncols,
+    uint32_t capacity, bool timestamps, bool retained, col_rel_t **out)
 {
-    int rc;
+    wl_columnar_memory_governor_ref_t *governor;
+    int rc = 0;
 
-    if (!sess || !out || !sess->memory_governor || out->pool_owned)
-        return 0;
-    rc = col_rel_attach_memory_governor(out, sess->memory_governor);
-    if (rc != 0)
+    if (!out)
+        return EINVAL;
+    *out = NULL;
+    governor = wl_columnar_join_output_governor(sess, left, right);
+    if (governor) {
+        rc = wl_columnar_relation_new_auto_governed(name, ncols, capacity,
+                timestamps, governor, out);
+    } else if (retained) {
+        *out = col_rel_new_auto(name, ncols);
+        rc = *out ? 0 : ENOMEM;
+        if (rc == 0 && capacity > (*out)->capacity)
+            rc = col_rel_reserve_capacity_admitted(*out, capacity, NULL);
+        if (rc == 0 && timestamps)
+            rc = col_rel_enable_timestamps(*out);
+    } else {
+        *out = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
+                name, ncols);
+        rc = *out ? 0 : ENOMEM;
+        if (rc == 0 && timestamps)
+            rc = col_rel_enable_timestamps(*out);
+    }
+    if (rc != 0) {
+        if (*out) {
+            if (rc == ENOMEM && (*out)->memory_budget_denial_pending)
+                rc = ENOSPC;
+            col_rel_destroy(*out);
+            *out = NULL;
+        }
+        if (rc == ENOSPC && sess)
+            sess->memory_budget_denied = true;
         return rc;
-    if (!admit_capacity)
-        return 0;
-    return col_rel_reserve_capacity_admitted(out, out->capacity, NULL);
+    }
+    col_join_attach_ledger(sess, *out);
+    return 0;
+}
+
+static int
+wl_columnar_join_output_error(wl_col_session_t *sess, const col_rel_t *out,
+    int rc)
+{
+    if (rc == ENOMEM && out && out->memory_budget_denial_pending) {
+        if (sess)
+            sess->memory_budget_denied = true;
+        return ENOSPC;
+    }
+    return rc;
 }
 
 bool
@@ -851,7 +886,7 @@ col_join_parallel_cross(wl_col_session_t *sess, const col_rel_t *left,
         *out_overflow = 1;
     }
     if (emit_total > UINT32_MAX)
-        return ENOMEM;
+        return EOVERFLOW;
 
     uint32_t nrows = (uint32_t)emit_total;
     uint32_t active_workers = sess->num_workers > emit_total
@@ -864,25 +899,10 @@ col_join_parallel_cross(wl_col_session_t *sess, const col_rel_t *left,
         return ensure_rc;
 
     uint32_t W = active_workers;
-    col_rel_t *out = col_rel_new_auto("$join",
-            col_join_output_width(left, right, op));
-    if (!out)
-        return ENOMEM;
-    if (col_join_set_output_types(out, left, right, op) != 0) {
-        col_rel_destroy(out);
-        return ENOMEM;
-    }
-    col_join_attach_ledger(sess, out);
-    /* Attach only: the reserve below admits the real target, so admitting
-     * the initial capacity first would just raise the transient peak. */
-    if (col_join_admit_output(sess, out, false) != 0) {
-        col_rel_destroy(out);
-        return ENOMEM;
-    }
-    if (col_join_reserve_exact(out, nrows) != 0) {
-        col_rel_destroy(out);
-        return ENOMEM;
-    }
+    col_rel_t *out = *outp;
+    int reserve_rc = col_join_reserve_exact(out, nrows);
+    if (reserve_rc != 0)
+        return wl_columnar_join_output_error(sess, out, reserve_rc);
     out->nrows = nrows;
     if (nrows > 0)
         wl_columnar_relation_touch_view(out);
@@ -895,7 +915,6 @@ col_join_parallel_cross(wl_col_session_t *sess, const col_rel_t *left,
         wl_columnar_memory_admission_status_t status;
         if (!wl_columnar_memory_size_mul(W, sizeof(col_join_cross_ctx_t),
             &ctx_bytes)) {
-            col_rel_destroy(out);
             return EOVERFLOW;
         }
         status = wl_columnar_memory_reserve_checked(
@@ -905,7 +924,6 @@ col_join_parallel_cross(wl_col_session_t *sess, const col_rel_t *left,
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
             if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                 sess->memory_budget_denied = true;
-            col_rel_destroy(out);
             return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
                 ? ENOSPC
                 : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
@@ -918,7 +936,6 @@ col_join_parallel_cross(wl_col_session_t *sess, const col_rel_t *left,
     if (!ctxs) {
         if (ctx_admitted)
             (void)wl_columnar_memory_rollback(&ctx_reservation);
-        col_rel_destroy(out);
         return ENOMEM;
     }
 
@@ -953,15 +970,8 @@ col_join_parallel_cross(wl_col_session_t *sess, const col_rel_t *left,
         (void)wl_columnar_memory_rollback(&ctx_reservation);
     free(ctxs);
     if (rc != 0) {
-        col_rel_destroy(out);
-        return rc;
+        return wl_columnar_join_output_error(sess, out, rc);
     }
-
-    /* The placeholder was ledger-accounted before selecting this fast path;
-     * retain its ledger while destroying it so the initial allocation is
-     * released. */
-    col_rel_destroy(*outp);
-    *outp = out;
     return 0;
 }
 
@@ -1118,11 +1128,12 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
          * This can occur in generated plans where optional relations may not exist. */
         uint32_t empty_cols = (op->project_count > 0 && op->project_indices)
             ? op->project_count : left_e.rel->ncols;
-        col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool,
-                sess->eval_arena, "$join_empty", empty_cols);
-        if (!out) {
-            return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
-        }
+        col_rel_t *out = NULL;
+        int create_rc = wl_columnar_join_new_output(sess, left_e.rel, NULL,
+                "$join_empty", empty_cols, COL_REL_INIT_CAP, false, false,
+                &out);
+        if (create_rc != 0)
+            return wl_columnar_join_dispose_left(stack, &left_e, create_rc);
         if (col_join_set_left_output_types(out, left_e.rel, op) != 0) {
             col_rel_destroy(out);
             return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
@@ -1142,10 +1153,12 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     if (selection.force_empty) {
         /* FORCE_DELTA had no usable $d$/$r$ on a seeded round. */
         uint32_t ocols = col_join_output_width(left_e.rel, right, op);
-        col_rel_t *empty = col_rel_new_auto("$join_empty", ocols);
-        if (!empty) {
-            return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
-        }
+        col_rel_t *empty = NULL;
+        int create_rc = wl_columnar_join_new_output(sess, left_e.rel, right,
+                "$join_empty", ocols, COL_REL_INIT_CAP, false, true,
+                &empty);
+        if (create_rc != 0)
+            return wl_columnar_join_dispose_left(stack, &left_e, create_rc);
         if (col_join_set_output_types(empty, left_e.rel, right, op) != 0) {
             col_rel_destroy(empty);
             return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
@@ -1277,21 +1290,19 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
      * failure, and the eligibility verdict stands. */
     if (bounded && right->nrows == 0)
         bounded = false;
-    /* Materialized results outlive the current delta-pool reset while they
-    * remain in mat_cache, so cache-owned joins must be heap allocated.  A
-    * bounded-mode output is governed by the session's memory governor and
-    * must be heap allocated too: delta_pool_reset() never frees slot
-    * contents, so a governor reference on a pooled relation would leak. */
-    col_rel_t *out = (bounded || (op->materialized && !projected_join))
-        ? col_rel_new_auto("$join", ocols)
-        : col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
-            "$join", ocols);
-    if (!out) {
+    /* Governed outputs and materialized results outlive the current
+     * delta-pool reset, so both require heap-owned relation descriptors. */
+    col_rel_t *out = NULL;
+    int output_rc = wl_columnar_join_new_output(sess, left, right, "$join",
+            ocols,
+            COL_REL_INIT_CAP, false,
+            bounded || (op->materialized && !projected_join), &out);
+    if (output_rc != 0) {
         free(lk);
         free(rk);
         if (right_filtered)
             col_rel_destroy(right_filtered);
-        return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
+        return wl_columnar_join_dispose_left(stack, &left_e, output_rc);
     }
     if (col_join_set_output_types(out, left, right, op) != 0) {
         free(lk);
@@ -1301,19 +1312,6 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             col_rel_destroy(right_filtered);
         return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
     }
-    /* Attach ledger so row growth is tracked under RELATION subsystem */
-    col_join_attach_ledger(sess, out);
-    /* Issue #1477: a heap output is retained past this delta-pool epoch, so
-     * admit it under the session governor before any row is written. */
-    if (col_join_admit_output(sess, out, true) != 0) {
-        col_rel_destroy(out);
-        free(lk);
-        free(rk);
-        if (right_filtered)
-            col_rel_destroy(right_filtered);
-        return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
-    }
-
     /* Backpressure check (Issue #224): when RELATION subsystem reaches >= 80%
      * of its budget, skip row generation and push an empty result instead of
      * risking EOVERFLOW (rc=84).  Evaluation continues with gracefully
@@ -1537,6 +1535,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             (void)wl_columnar_memory_rollback(&row_reservation);
         if (join_rc != 0) {
             free(tmp);
+            join_rc = wl_columnar_join_output_error(sess, out, join_rc);
             col_rel_destroy(out);
             free(lk);
             free(rk);
@@ -1956,6 +1955,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 join_rc, out->nrows);
             WL_JOIN_RELEASE_TMP();
             free(tmp);
+            join_rc = wl_columnar_join_output_error(sess, out, join_rc);
             col_rel_destroy(out);
             free(lk);
             free(rk);
@@ -2127,14 +2127,24 @@ wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
         return wl_columnar_join_dispose_left(stack, &left_e, EINVAL);
     }
 
-    col_rel_t *out = col_rel_pool_new_like(sess->delta_pool, "$antijoin", left);
-    if (!out) {
+    col_rel_t *out = NULL;
+    wl_columnar_memory_governor_ref_t *output_governor
+        = wl_columnar_join_output_governor(sess, left, right);
+    int output_rc = output_governor
+        ? wl_columnar_relation_new_like_governed_checked_mode("$antijoin",
+            left, output_governor, false, &out)
+        : ((out = col_rel_pool_new_like(sess->delta_pool, "$antijoin", left))
+            ? 0 : ENOMEM);
+    if (output_rc != 0) {
         free(lk);
         free(rk);
         if (right_filtered)
             col_rel_destroy(right_filtered);
-        return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
+        if (output_rc == ENOSPC)
+            sess->memory_budget_denied = true;
+        return wl_columnar_join_dispose_left(stack, &left_e, output_rc);
     }
+    col_join_attach_ledger(sess, out);
 
     /* Hash antijoin: build hash set from right, iterate left. */
     uint32_t aj_nbuckets;
@@ -2266,6 +2276,7 @@ antijoin_done:
     if (aj_hash_admitted)
         (void)wl_columnar_memory_rollback(&aj_hash_reservation);
     if (aj_rc != 0) {
+        aj_rc = wl_columnar_join_output_error(sess, out, aj_rc);
         col_rel_destroy(out);
         free(lk);
         free(rk);
@@ -2347,15 +2358,21 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
 
     /* Output: project_indices selects output columns from left */
     uint32_t ocols = op->project_count ? op->project_count : left->ncols;
-    col_rel_t *out
-        = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena, "$semijoin",
-            ocols);
-    if (!out) {
+    col_rel_t *out = NULL;
+    int output_rc = wl_columnar_join_new_output(sess, left, right, "$semijoin",
+            ocols, COL_REL_INIT_CAP,
+#ifdef WL_TEST_JOIN_TIMESTAMP_HOOK
+            wl_columnar_join_test_enable_semijoin_timestamps,
+#else
+            false,
+#endif
+            false, &out);
+    if (output_rc != 0) {
         free(lk);
         free(rk);
         if (right_filtered)
             col_rel_destroy(right_filtered);
-        return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
+        return wl_columnar_join_dispose_left(stack, &left_e, output_rc);
     }
     if (col_join_set_left_output_types(out, left, op) != 0) {
         col_rel_destroy(out);
@@ -2365,18 +2382,6 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
             col_rel_destroy(right_filtered);
         return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
     }
-#ifdef WL_TEST_JOIN_TIMESTAMP_HOOK
-    if (wl_columnar_join_test_enable_semijoin_timestamps
-        && col_rel_enable_timestamps(out) != 0) {
-        col_rel_destroy(out);
-        free(lk);
-        free(rk);
-        if (right_filtered)
-            col_rel_destroy(right_filtered);
-        return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
-    }
-#endif
-
     wl_columnar_memory_reservation_t sj_row_reservation;
     bool sj_row_admitted = false;
     wl_columnar_memory_reservation_init(&sj_row_reservation);
@@ -2602,7 +2607,7 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 }
                 offsets[W] = total;
                 if (prc == 0 && total > UINT32_MAX)
-                    prc = ENOMEM;
+                    prc = EOVERFLOW;
                 if (prc == 0 && col_join_reserve_exact(out,
                     (uint32_t)total) != 0)
                     prc = ENOMEM;
@@ -2689,6 +2694,7 @@ semijoin_done:
     if (sj_hash_admitted)
         (void)wl_columnar_memory_rollback(&sj_hash_reservation);
     if (sj_rc != 0) {
+        sj_rc = wl_columnar_join_output_error(sess, out, sj_rc);
         free(tmp);
         col_rel_destroy(out);
         free(lk);
@@ -2741,11 +2747,12 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
     if (!right) {
         uint32_t empty_cols = (op->project_count > 0 && op->project_indices)
             ? op->project_count : left_e.rel->ncols;
-        col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool,
-                sess->eval_arena, "$join_diff_empty", empty_cols);
-        if (!out) {
-            return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
-        }
+        col_rel_t *out = NULL;
+        int create_rc = wl_columnar_join_new_output(sess, left_e.rel, NULL,
+                "$join_diff_empty", empty_cols, COL_REL_INIT_CAP, false,
+                false, &out);
+        if (create_rc != 0)
+            return wl_columnar_join_dispose_left(stack, &left_e, create_rc);
         if (col_join_set_left_output_types(out, left_e.rel, op) != 0) {
             col_rel_destroy(out);
             return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
@@ -2759,10 +2766,12 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
     bool used_right_delta = selection.used_right_delta;
     if (selection.force_empty) {
         uint32_t ocols = col_join_output_width(left_e.rel, right, op);
-        col_rel_t *empty = col_rel_new_auto("$join_diff_empty", ocols);
-        if (!empty) {
-            return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
-        }
+        col_rel_t *empty = NULL;
+        int create_rc = wl_columnar_join_new_output(sess, left_e.rel, right,
+                "$join_diff_empty", ocols, COL_REL_INIT_CAP, false, true,
+                &empty);
+        if (create_rc != 0)
+            return wl_columnar_join_dispose_left(stack, &left_e, create_rc);
         /* The schema copy still reads the left input (#1376). */
         if (col_join_set_output_types(empty, left_e.rel, right, op) != 0) {
             col_rel_destroy(empty);
@@ -2879,13 +2888,14 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
         && !used_right_delta
         && op->right_filter_expr.size == 0 && !op->materialized) {
         wl_columnar_continuation_t *cont = NULL;
-        col_rel_t *bounded_out = col_rel_new_auto("$join_diff_batch",
-                col_join_output_width(left, right, op));
-        int bounded_rc = bounded_out
-            ? col_join_set_output_types(bounded_out, left, right, op)
-            : ENOMEM;
-        if (bounded_rc == 0 && (left->timestamps || right->timestamps))
-            bounded_rc = col_rel_enable_timestamps(bounded_out);
+        col_rel_t *bounded_out = NULL;
+        int bounded_rc = wl_columnar_join_new_output(sess, left, right,
+                "$join_diff_batch", col_join_output_width(left, right, op),
+                COL_REL_INIT_CAP, left->timestamps || right->timestamps,
+                true, &bounded_out);
+        if (bounded_rc == 0)
+            bounded_rc = col_join_set_output_types(bounded_out, left, right,
+                    op);
         if (bounded_rc == 0)
             bounded_rc = col_diff_join_batch_producer_create(sess, op, left,
                     left_e.is_delta, lk, rk, kc, sess->join_batch_bytes, &cont);
@@ -2920,16 +2930,16 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
     uint32_t ocols = col_join_output_width(left, right, op);
     /* Materialized results outlive the current delta-pool reset while they
      * remain in mat_cache, so cache-owned joins must be heap allocated. */
-    col_rel_t *out = (op->materialized && !projected_join)
-        ? col_rel_new_auto("$join_diff", ocols)
-        : col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
-            "$join_diff", ocols);
-    if (!out) {
+    col_rel_t *out = NULL;
+    int output_rc = wl_columnar_join_new_output(sess, left, right, "$join_diff",
+            ocols, COL_REL_INIT_CAP, false,
+            (op->materialized && !projected_join), &out);
+    if (output_rc != 0) {
         free(lk);
         free(rk);
         if (right_filtered)
             col_rel_destroy(right_filtered);
-        return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
+        return wl_columnar_join_dispose_left(stack, &left_e, output_rc);
     }
     if (col_join_set_output_types(out, left, right, op) != 0) {
         free(lk);
@@ -2939,17 +2949,6 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
             col_rel_destroy(right_filtered);
         return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
     }
-    col_join_attach_ledger(sess, out);
-    /* Issue #1477: same contract as the ordinary join output above. */
-    if (col_join_admit_output(sess, out, true) != 0) {
-        col_rel_destroy(out);
-        free(lk);
-        free(rk);
-        if (right_filtered)
-            col_rel_destroy(right_filtered);
-        return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
-    }
-
     /* Backpressure check (Issue #224) */
     if (wl_mem_ledger_should_backpressure(&sess->mem_ledger,
         WL_MEM_SUBSYS_RELATION, 80)) {
@@ -3238,7 +3237,7 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 && total >= sess->join_output_limit)
                 prc = EOVERFLOW;
             if (prc == 0 && total > UINT32_MAX)
-                prc = ENOMEM;
+                prc = EOVERFLOW;
             if (prc == 0 && total > out->capacity && ocols > 0) {
                 uint64_t add_rows = total - out->capacity;
                 uint64_t row_bytes = (uint64_t)ocols * sizeof(int64_t);
@@ -3293,6 +3292,7 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
             if (prc != 0) {
                 WL_DIFF_RELEASE_TMP();
                 free(tmp);
+                prc = wl_columnar_join_output_error(sess, out, prc);
                 col_rel_destroy(out);
                 free(lk);
                 free(rk);
@@ -3333,6 +3333,7 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
         if (join_rc != 0) {
             WL_DIFF_RELEASE_TMP();
             free(tmp);
+            join_rc = wl_columnar_join_output_error(sess, out, join_rc);
             col_rel_destroy(out);
             free(lk);
             free(rk);
@@ -3409,6 +3410,7 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
         if (join_rc != 0) {
             WL_DIFF_RELEASE_TMP();
             free(tmp);
+            join_rc = wl_columnar_join_output_error(sess, out, join_rc);
             col_rel_destroy(out);
             free(lk);
             free(rk);

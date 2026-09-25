@@ -453,6 +453,27 @@ run_diff_join(wl_col_session_t *sess, col_rel_t *left,
     return 0;
 }
 
+static int
+run_filter_join(int (*op_fn)(const wl_plan_op_t *, eval_stack_t *,
+    wl_col_session_t *), wl_col_session_t *sess, col_rel_t *left,
+    const wl_plan_op_t *op, eval_entry_t *out)
+{
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    eval_stack_push(&stack, left, false);
+    int rc = op_fn(op, &stack, sess);
+    if (rc != 0) {
+        while (stack.top > 0) {
+            eval_entry_t entry = eval_stack_pop(&stack);
+            if (entry.owned)
+                col_rel_destroy(entry.rel);
+        }
+        return rc;
+    }
+    *out = eval_stack_pop(&stack);
+    return 0;
+}
+
 /* ---- case 1: attach + baseline ----------------------------------------- */
 
 static void
@@ -628,8 +649,8 @@ run_at_budget(const char *name, uint64_t budget, bool expect_ok)
         FAIL("join succeeded one byte below the output footprint");
         goto out_entry;
     }
-    if (rc != ENOMEM) {
-        FAIL("denial did not surface as ENOMEM");
+    if (rc != ENOSPC) {
+        FAIL("denial did not surface as ENOSPC");
         goto out;
     }
     /* No arrangement is built on this path, so a denied cross join must
@@ -841,17 +862,12 @@ out:
     destroy_session(sess);
 }
 
-/* ---- case 6: a pool-owned output stays ungoverned ----------------------- */
+/* ---- case 6: projected materialized outputs are governed ---------------- */
 
-/*
- * The discriminator is pool_owned, not materialized.  join.c allocates the
- * output with (bounded || (materialized && !projected_join)), and
- * projected_join is (project_count > 0 && project_indices), so a
- * MATERIALIZED join with a projection is pool allocated.  Testing
- * materialized == false here would exercise the wrong branch.
- */
+/* A projected materialized result is still an output payload and must carry
+ * the effective governor even though it bypasses the materialization cache. */
 static void
-test_projected_output_stays_pooled(void)
+test_projected_output_is_governed(void)
 {
     const char *lk[] = { "k" };
     const char *rk[] = { "k" };
@@ -862,7 +878,7 @@ test_projected_output_stays_pooled(void)
     wl_plan_op_t op;
     eval_entry_t result = { 0 };
 
-    TEST("materialized+projected output stays pooled and ungoverned");
+    TEST("materialized+projected output follows output admission");
     if (!sess || !right || !left) {
         FAIL("fixture");
         goto out;
@@ -876,18 +892,13 @@ test_projected_output_stays_pooled(void)
         FAIL("projected join failed");
         goto out;
     }
-    if (!result.rel || !result.rel->pool_owned) {
-        FAIL("projected materialized output was not pool allocated");
+    if (!result.rel || result.rel->pool_owned
+        || result.rel->memory_governor != sess->memory_governor) {
+        FAIL("projected materialized output is not governor-owned");
         goto out_entry;
     }
-    /* Assert on the relation, not on the session total: the keyed
-     * arrangement built during the join is legitimately charged. */
-    if (result.rel->memory_governor != NULL) {
-        FAIL("a pooled output must not carry a governor reference");
-        goto out_entry;
-    }
-    if (result.rel->retained_reserved_bytes != 0u) {
-        FAIL("a pooled output holds a committed reservation");
+    if (!admission_invariant(result.rel)) {
+        FAIL("projected output token does not cover its capacity");
         goto out_entry;
     }
     PASS();
@@ -898,6 +909,195 @@ out:
     col_rel_destroy(left);
     col_rel_destroy(right);
     destroy_session(sess);
+}
+
+static void
+test_join_output_growth_denial_is_typed(void)
+{
+    wl_col_session_t *measure = make_session(64ull * 1024 * 1024);
+    col_rel_t *probe = make_rel("$join", 4, NULL);
+    uint64_t initial_bytes = 0;
+    uint64_t grown_bytes = 0;
+    wl_col_session_t *sess = NULL;
+    col_rel_t *right = make_right(13, 1);
+    col_rel_t *left = make_left(7, 2);
+    wl_plan_op_t op;
+
+    TEST("JOIN output growth denial is ENOSPC and releases its output");
+    if (!measure || !probe || !right || !left
+        || !col_rel_retained_bytes_for(probe, COL_REL_INIT_CAP,
+        &initial_bytes)
+        || !col_rel_retained_bytes_for(probe, COL_REL_INIT_CAP * 2u,
+        &grown_bytes)) {
+        FAIL("could not derive output growth footprints");
+        goto out;
+    }
+    destroy_session(measure);
+    measure = NULL;
+    col_rel_destroy(probe);
+    probe = NULL;
+    sess = make_session(initial_bytes + grown_bytes - 1u);
+    if (!sess) {
+        FAIL("could not create constrained governor");
+        goto out;
+    }
+    session_add_rel(sess, right);
+    right = NULL;
+    init_cross_op(&op);
+    op.materialized = false;
+    if (run_join(sess, left, &op, NULL) != ENOSPC
+        || !sess->memory_budget_denied || reserved_of(sess) != 0u) {
+        FAIL("growth denial was not typed or left output bytes reserved");
+        goto out;
+    }
+    PASS();
+out:
+    if (measure)
+        destroy_session(measure);
+    col_rel_destroy(probe);
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+}
+
+static void
+test_source_governor_output_precedence(void)
+{
+    const char *unused_keys[] = { "k" };
+
+    for (uint32_t mode = 0; mode < 3; mode++) {
+        wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+        wl_columnar_memory_governor_ref_t *session_ref;
+        wl_columnar_memory_governor_ref_t *left_ref = make_governor(
+            64ull * 1024 * 1024);
+        wl_columnar_memory_governor_ref_t *right_ref = make_governor(
+            64ull * 1024 * 1024);
+        col_rel_t *right = make_right(2, 1);
+        col_rel_t *left = make_left(4, 2);
+        wl_plan_op_t op;
+        eval_entry_t result = { 0 };
+        wl_columnar_memory_governor_ref_t *expected = mode == 0
+            ? (sess ? sess->memory_governor : NULL)
+            : mode == 1 ? left_ref : right_ref;
+
+        TEST(mode == 0
+            ? "output admission prefers session over source governors"
+            : mode == 1
+            ? "source output admission prefers left over right governor"
+            : "source output admission falls back to right governor");
+        if (!sess || !left_ref || !right_ref || !right || !left) {
+            FAIL("fixture");
+            col_rel_destroy(left);
+            col_rel_destroy(right);
+            destroy_session(sess);
+            wl_columnar_memory_governor_ref_release(left_ref);
+            wl_columnar_memory_governor_ref_release(right_ref);
+            break;
+        }
+        session_ref = sess->memory_governor;
+        if (mode != 0)
+            sess->memory_governor = NULL;
+        if ((mode != 2 && col_rel_attach_memory_governor(left,
+            left_ref) != 0)
+            || col_rel_attach_memory_governor(right, right_ref) != 0
+            || session_add_rel(sess, right) != 0) {
+            FAIL("source governor setup failed");
+            sess->memory_governor = session_ref;
+            col_rel_destroy(left);
+            col_rel_destroy(right);
+            destroy_session(sess);
+            wl_columnar_memory_governor_ref_release(left_ref);
+            wl_columnar_memory_governor_ref_release(right_ref);
+            break;
+        }
+        right = NULL;
+        init_cross_op(&op);
+        op.materialized = false;
+        op.left_keys = unused_keys;
+        op.right_keys = unused_keys;
+        if (run_join(sess, left, &op, &result) != 0 || !result.rel
+            || result.rel->memory_governor != expected
+            || !admission_invariant(result.rel)) {
+            FAIL("output did not follow the effective source governor");
+        } else {
+            PASS();
+        }
+        if (result.owned && result.rel)
+            col_rel_destroy(result.rel);
+        col_rel_destroy(left);
+        sess->memory_governor = session_ref;
+        destroy_session(sess);
+        wl_columnar_memory_governor_ref_release(left_ref);
+        wl_columnar_memory_governor_ref_release(right_ref);
+    }
+}
+
+static void
+test_source_governed_anti_semi_outputs(void)
+{
+    const char *left_keys[] = { "k" };
+    const char *right_keys[] = { "k" };
+    wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+    wl_columnar_memory_governor_ref_t *session_ref;
+    wl_columnar_memory_governor_ref_t *source_ref = make_governor(
+        64ull * 1024 * 1024);
+    col_rel_t *right = make_right(2, 1);
+    col_rel_t *left = make_left(4, 2);
+    wl_plan_op_t op;
+    eval_entry_t result = { 0 };
+
+    TEST("source-only governor admits ANTI and SEMI JOIN outputs");
+    if (!sess || !source_ref || !right || !left) {
+        FAIL("fixture");
+        goto out;
+    }
+    if (col_rel_enable_timestamps(left) != 0) {
+        FAIL("timestamped ANTI fixture");
+        goto out;
+    }
+    session_ref = sess->memory_governor;
+    sess->memory_governor = NULL;
+    if (col_rel_attach_memory_governor(left, source_ref) != 0
+        || session_add_rel(sess, right) != 0) {
+        sess->memory_governor = session_ref;
+        FAIL("source governor setup failed");
+        goto out;
+    }
+    right = NULL;
+    memset(&op, 0, sizeof(op));
+    op.right_relation = "right";
+    op.key_count = 1;
+    op.left_keys = left_keys;
+    op.right_keys = right_keys;
+    if (run_filter_join(wl_columnar_antijoin_op, sess, left, &op, &result)
+        != 0 || !result.rel || result.rel->memory_governor != source_ref
+        || !admission_invariant(result.rel) || result.rel->timestamps) {
+        FAIL("ANTI output admission or timestamp policy changed");
+        goto out_result;
+    }
+    if (result.owned)
+        col_rel_destroy(result.rel);
+    memset(&result, 0, sizeof(result));
+    if (run_filter_join(wl_columnar_semijoin_op, sess, left, &op, &result)
+        != 0 || !result.rel || result.rel->memory_governor != source_ref
+        || !admission_invariant(result.rel)) {
+        FAIL("SEMI output was not charged to its source governor");
+        goto out_result;
+    }
+    PASS();
+out_result:
+    if (result.owned && result.rel)
+        col_rel_destroy(result.rel);
+    result.rel = NULL;
+    result.owned = false;
+    col_rel_destroy(left);
+    left = NULL;
+    sess->memory_governor = session_ref;
+out:
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+    wl_columnar_memory_governor_ref_release(source_ref);
 }
 
 /* ---- case 7: cache adoption charges once -------------------------------- */
@@ -1125,8 +1325,8 @@ test_parallel_cross_denial(void)
     session_add_rel(sess, right);
     right = NULL;
     init_cross_op(&op);
-    if (run_join(sess, left, &op, NULL) != ENOMEM) {
-        FAIL("an unaffordable cross join was not denied with ENOMEM");
+    if (run_join(sess, left, &op, NULL) != ENOSPC) {
+        FAIL("an unaffordable cross join was not denied with ENOSPC");
         goto out;
     }
     PASS();
@@ -1495,7 +1695,7 @@ test_parallel_diff_true_admission_denial_rolls_back(void)
     }
     right = NULL;
     init_diff_keyed_op(&op);
-    if (run_diff_join(sess, left, &op, &result) != ENOMEM || result.rel
+    if (run_diff_join(sess, left, &op, &result) != ENOSPC || result.rel
         || reserved_of(sess) != 0u || sess->mat_cache.count != 0
         || sess->diff_arr_count != 0) {
         FAIL("true admission denial published output or committed diff state");
@@ -2259,7 +2459,10 @@ main(void)
     }
     test_growth_rollback();
     test_reuse_after_denial();
-    test_projected_output_stays_pooled();
+    test_projected_output_is_governed();
+    test_join_output_growth_denial_is_typed();
+    test_source_governor_output_precedence();
+    test_source_governed_anti_semi_outputs();
     test_cache_adoption_charges_once();
     test_parallel_cross_output_is_governed();
     test_parallel_cross_denial();

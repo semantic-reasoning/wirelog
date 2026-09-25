@@ -328,7 +328,7 @@ col_columns_copy_row(int64_t **dst_cols, uint32_t dst_row,
  */
 typedef struct col_rel {
     char *name;                /* owned, null-terminated                */
-    uint32_t ncols;            /* columns per tuple (0 = unset)         */
+    uint32_t ncols;            /* columns per tuple (0 = nullary)       */
     int64_t **columns;         /* owned, column-major: columns[col][row] */
     wirelog_column_type_t *column_types; /* physical type per lane       */
     uint32_t nrows;            /* current row count                     */
@@ -2712,6 +2712,14 @@ col_rel_new_like(const char *name, const col_rel_t *src);
 col_rel_t *
 wl_columnar_relation_new_like_governed(const char *name, const col_rel_t *src,
     wl_columnar_memory_governor_ref_t *governor);
+int
+wl_columnar_relation_new_like_governed_checked(const char *name,
+    const col_rel_t *src, wl_columnar_memory_governor_ref_t *governor,
+    col_rel_t **out);
+int
+wl_columnar_relation_new_like_governed_checked_mode(const char *name,
+    const col_rel_t *src, wl_columnar_memory_governor_ref_t *governor,
+    bool preserve_timestamps, col_rel_t **out);
 #ifdef WL_TEST_BDX_SEED
 int
 wl_columnar_eval_test_bdx_seed(col_rel_t *cidb,
