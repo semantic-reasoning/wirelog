@@ -128,8 +128,8 @@ try_reclaim_during_governed_copy(const col_rel_t *source)
         ? source->retained_reserved_bytes : 0;
     uint64_t governor_reserved = wl_columnar_memory_reserved(
         wl_columnar_memory_governor_ref_get(sess->memory_governor));
-    bool admission_committed = col_rel_retained_bytes_for(source,
-            source->capacity, &copy_bytes)
+    bool admission_committed = col_rel_retained_live_bytes(source,
+            &copy_bytes)
         && already_charged <= UINT64_MAX - copy_bytes
         && governor_reserved >= already_charged + copy_bytes;
     bool source_reader_held = wl_columnar_source_access_gate_busy(
@@ -346,7 +346,7 @@ admission_invariant(const col_rel_t *r)
 
     if (!r || !r->memory_governor)
         return true;
-    if (!col_rel_retained_bytes_for(r, r->capacity, &want))
+    if (!col_rel_retained_live_bytes(r, &want))
         return false;
     return want == r->retained_reserved_bytes;
 }
@@ -2017,8 +2017,7 @@ measure_parallel_diff_peak(uint64_t *peak_out)
         || sess->wq == NULL || sess->diff_arr_count != 1
         || !admission_invariant(governed))
         goto out_entry;
-    if (!col_rel_retained_bytes_for(governed, governed->capacity,
-        &final_bytes)
+    if (!col_rel_retained_live_bytes(governed, &final_bytes)
         || !col_rel_retained_bytes_for(governed, COL_REL_INIT_CAP,
         &initial_bytes)
         || governed->retained_reserved_bytes != final_bytes)
@@ -3371,6 +3370,32 @@ out:
 
 /* ---- main --------------------------------------------------------------- */
 
+static void
+test_timestamp_batch_projection_and_live_charge(void)
+{
+    col_rel_t *batch = col_rel_new_auto("$join_batch", 1);
+    wl_col_session_t *sess = make_session(1u << 20);
+    uint64_t row_bytes = 0, live_bytes = 0;
+
+    TEST("timestamp JOIN batch projects one row but admits physical capacity");
+    if (!batch || !sess || col_rel_enable_timestamps(batch) != 0
+        || col_rel_attach_memory_governor(batch, sess->memory_governor) != 0
+        || col_rel_reserve_capacity_admitted(batch, batch->capacity,
+        NULL) != 0
+        || !col_rel_retained_bytes_for(batch, 1u, &row_bytes)
+        || !col_rel_retained_live_bytes(batch, &live_bytes)
+        || batch->capacity <= 1u
+        || row_bytes != sizeof(int64_t) + sizeof(col_delta_timestamp_t)
+        || live_bytes != (uint64_t)batch->capacity * row_bytes
+        || batch->retained_reserved_bytes != live_bytes) {
+        FAIL("projected row or live retained footprint changed");
+    } else {
+        PASS();
+    }
+    col_rel_destroy(batch);
+    destroy_session(sess);
+}
+
 int
 main(void)
 {
@@ -3384,6 +3409,7 @@ main(void)
     printf("Memory admission: JOIN output capacity (Issue #1477)\n");
 
     test_attach_baseline();
+    test_timestamp_batch_projection_and_live_charge();
     if (measure_output_bytes(&out_bytes)) {
         run_at_budget("cross join succeeds at the exact output+scratch peak",
             out_bytes, true);

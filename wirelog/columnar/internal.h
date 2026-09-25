@@ -2478,11 +2478,16 @@ col_rel_alloc(col_rel_t **out, const char *name);
 int
 col_rel_attach_memory_governor(col_rel_t *rel,
     wl_columnar_memory_governor_ref_t *memory_governor);
-/* Retained-admission footprint of @r at @capacity rows (columns plus
- * timestamps when enabled).  False on size-arithmetic overflow. */
+/* Projected footprint at @capacity rows: columns and enabled timestamps
+ * both use that requested width. Batch planners use this for one-row costs
+ * and prospective payloads, not live reservation checks. */
 bool
 col_rel_retained_bytes_for(const col_rel_t *r, uint32_t capacity,
     uint64_t *out);
+/* Exact currently owned heap footprint, including physical timestamp width;
+ * false for inconsistent timestamp pointer/capacity or size overflow. */
+bool
+col_rel_retained_live_bytes(const col_rel_t *r, uint64_t *out);
 /* Admit and grow @r to at least @new_cap rows as one transaction; with
  * @new_cap <= capacity it admits the buffers the relation already owns.
  * ENOMEM with *@denied set is a governor verdict, clear is an allocation
