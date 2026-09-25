@@ -320,7 +320,8 @@ col_columns_copy_row(int64_t **dst_cols, uint32_t dst_row,
  *   When col_rel_deep_copy() creates a transient copy:
  *   - pool_owned and arena_owned are set to false on the destination
  *   - Caller owns the copy and must free it explicitly via
- *     col_rel_destroy() (or col_rel_free_contents() + free(struct))
+ *     col_rel_destroy(); a governed heap descriptor cannot use
+ *     col_rel_free_contents() + free(struct)
  *   - delta_pool_reset() and arena reclaim will NOT touch the copy,
  *     since both flags are false
  *   - mem_ledger is also NULL on the copy (Issue #554, R-1)
@@ -380,6 +381,10 @@ typedef struct col_rel {
      * accounting ledger: the token represents the relation's live heap
      * footprint and is only attached to session-owned input relations. */
     wl_columnar_memory_governor_ref_t *memory_governor;
+    /* Heap descriptor, name, and this token remain charged for the entire
+     * descriptor lifetime. Pool descriptors are charged by their pool. */
+    wl_columnar_memory_reservation_t descriptor_reservation;
+    uint64_t descriptor_reserved_bytes;
     /* Set when governed admission was denied while preparing this relation. */
     uint8_t memory_budget_denial_pending;
     wl_columnar_memory_reservation_t retained_reservation;
@@ -2702,11 +2707,16 @@ int
 col_rel_col_idx(const col_rel_t *r, const char *name);
 col_rel_t *
 col_rel_new_auto(const char *name, uint32_t ncols);
+/* Allocate a heap descriptor and name under a known governor. */
+int
+wl_columnar_relation_alloc_governed(col_rel_t **out, const char *name,
+    wl_columnar_memory_governor_ref_t *governor);
 col_rel_t *
 col_rel_new_like(const char *name, const col_rel_t *src);
 /* Admit column/timestamp buffers before allocation; preserve required
- * compound and timestamp metadata or fail. Descriptor/name overhead follows
- * the existing constructor contract. NULL includes admission denial. */
+ * compound and timestamp metadata or fail. Heap descriptor/name overhead is
+ * admitted when the constructed relation attaches its governor. NULL includes
+ * admission denial. */
 col_rel_t *
 wl_columnar_relation_new_like_governed(const char *name, const col_rel_t *src,
     wl_columnar_memory_governor_ref_t *governor);

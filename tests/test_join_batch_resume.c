@@ -108,8 +108,7 @@ destroy_session(wl_col_session_t *s)
         return;
     wl_workqueue_destroy(s->wq);
     for (uint32_t i = 0; i < s->nrels; i++) {
-        col_rel_free_contents(s->rels[i]);
-        free(s->rels[i]);
+        col_rel_destroy(s->rels[i]);
     }
     free(s->rels);
     if (s->rels_reservation.identity == &s->rels_reservation
@@ -1466,7 +1465,8 @@ test_lease_released_on_every_path(void)
     }
     base_pins = entry->pin_count - 1u;
     rc = col_join_batch_run_to_relation(cont, f.sess, f.out);
-    uint64_t output_reservation = f.out->retained_reserved_bytes;
+    uint64_t output_reservation = f.out->retained_reserved_bytes
+        + f.out->descriptor_reserved_bytes;
     wl_columnar_continuation_destroy(cont);
     cont = NULL;
     if (rc != 0 || entry->pin_count != base_pins || f.out->nrows != 40u
@@ -1498,7 +1498,7 @@ test_lease_released_on_every_path(void)
     cont = NULL;
     if (entry->pin_count != base_pins
         || reserved_of(f.sess) != reservation_base
-        + f.out->retained_reserved_bytes) {
+        + f.out->retained_reserved_bytes + f.out->descriptor_reserved_bytes) {
         FAIL("destroy after cancel leaked or double-released producer state");
         goto out;
     }
@@ -1520,7 +1520,7 @@ test_lease_released_on_every_path(void)
     wl_columnar_continuation_destroy(cont);
     cont = NULL;
     if (reserved_of(f.sess) != reservation_base
-        + f.out->retained_reserved_bytes) {
+        + f.out->retained_reserved_bytes + f.out->descriptor_reserved_bytes) {
         FAIL("destroy after pre-batch cancel leaked producer reservation");
         goto out;
     }
@@ -1530,7 +1530,7 @@ test_lease_released_on_every_path(void)
     ((col_arr_entry_t *)entry)->pin_count = base_pins;
     if (rc != EOVERFLOW || cont != NULL
         || reserved_of(f.sess) != reservation_base
-        + f.out->retained_reserved_bytes) {
+        + f.out->retained_reserved_bytes + f.out->descriptor_reserved_bytes) {
         FAIL("pin overflow leaked producer descriptor admission");
         goto out;
     }
@@ -1590,7 +1590,7 @@ test_lease_released_on_every_path(void)
     cont = NULL;
     if (entry->pin_count != base_pins
         || reserved_of(f.sess) != reservation_base
-        + f.out->retained_reserved_bytes) {
+        + f.out->retained_reserved_bytes + f.out->descriptor_reserved_bytes) {
         FAIL("post-denial create leaked its pin or producer reservation");
         goto out;
     }
