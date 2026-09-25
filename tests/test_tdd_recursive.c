@@ -153,6 +153,219 @@ cleanup_session(wl_col_session_t *sess, wl_plan_t *plan,
     wirelog_program_free(prog);
 }
 
+static int insert_edges(wl_col_session_t *sess, const int64_t *rows,
+    uint32_t nrows);
+static uint32_t count_rows(wl_col_session_t *sess, const char *name);
+
+#ifdef WL_TEST_ALLOC_WRAP
+typedef struct {
+    wl_columnar_memory_reservation_t *reservation;
+    uint64_t bytes;
+    unsigned calls;
+    bool release;
+} queue_reclaim_fixture_t;
+
+static wl_mem_reclaim_result_t
+queue_reclaim_fixture(void *owner)
+{
+    queue_reclaim_fixture_t *fixture = owner;
+    fixture->calls++;
+    if (fixture->release
+        && wl_columnar_memory_release(fixture->reservation))
+        return (wl_mem_reclaim_result_t){ fixture->bytes, 1 };
+    return (wl_mem_reclaim_result_t){ fixture->bytes, 1 };
+}
+
+static void
+test_tdd_queue_ring_admission(void)
+{
+    TEST("coordinator ring exact admission and one reclaim retry");
+    const char *failure = NULL;
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    resolution.budget_bytes = 1u << 20;
+    resolution.usable_bytes = resolution.budget_bytes;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    wl_columnar_memory_governor_ref_t *ref
+        = wl_columnar_memory_governor_ref_create(&resolution);
+    wl_col_session_t *coord = calloc(1, sizeof(*coord));
+    wl_columnar_memory_reservation_t reclaim_token;
+    wl_columnar_memory_reservation_init(&reclaim_token);
+    wl_mem_reclaimer_handle_t handle = 0;
+    uint64_t bytes = 0;
+#define QUEUE_CHECK(c, m) do { if (!(c)) { failure = (m); goto cleanup; \
+                               } } while (0)
+    QUEUE_CHECK(ref && coord, "fixture allocation");
+    coord->memory_governor = ref;
+    wl_columnar_memory_reservation_init(&coord->delta_queue_ring_reservation);
+    wl_mem_ledger_init(&coord->mem_ledger, 0);
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(ref);
+    QUEUE_CHECK(wl_mpsc_queue_footprint_checked(2, 3, &bytes) == 0,
+        "ring shape");
+    atomic_store_explicit(&governor->usable_bytes, bytes - 1,
+        memory_order_relaxed);
+    QUEUE_CHECK(wl_columnar_eval_test_reserve_queue_ring(coord, 2, 3,
+        &bytes) == ENOSPC && wl_columnar_memory_reserved(governor) == 0,
+        "one-byte denial must preserve credit");
+    atomic_store_explicit(&governor->usable_bytes, bytes,
+        memory_order_relaxed);
+    QUEUE_CHECK(wl_columnar_eval_test_reserve_queue_ring(coord, 2, 3,
+        &bytes) == 0 && wl_columnar_memory_reserved(governor) == bytes,
+        "exact admission");
+    QUEUE_CHECK(wl_columnar_memory_release(
+            &coord->delta_queue_ring_reservation), "exact release");
+    wl_columnar_memory_reservation_init(&coord->delta_queue_ring_reservation);
+    QUEUE_CHECK(wl_columnar_memory_reserved(governor) == 0,
+        "exact teardown");
+
+    const uint64_t reclaim_bytes = 128;
+    atomic_store_explicit(&governor->usable_bytes, bytes + reclaim_bytes,
+        memory_order_relaxed);
+    QUEUE_CHECK(wl_columnar_memory_reserve_checked(governor, reclaim_bytes,
+        &reclaim_token) == WL_COLUMNAR_MEMORY_ADMISSION_OK
+        && wl_columnar_memory_commit(&reclaim_token, coord),
+        "reclaim fixture reserve");
+    queue_reclaim_fixture_t fixture = { &reclaim_token, reclaim_bytes, 0,
+                                        true };
+    QUEUE_CHECK(wl_mem_ledger_register_reclaimer(&coord->mem_ledger,
+        queue_reclaim_fixture, &fixture, &handle) == 0,
+        "register reclaimer");
+    atomic_store_explicit(&governor->usable_bytes,
+        bytes + reclaim_bytes - 1, memory_order_relaxed);
+    QUEUE_CHECK(wl_columnar_eval_test_reserve_queue_ring(coord, 2, 3,
+        &bytes) == 0 && fixture.calls == 1
+        && wl_columnar_memory_reserved(governor) == bytes,
+        "one retry only after actual credit returned");
+    QUEUE_CHECK(wl_columnar_memory_release(
+            &coord->delta_queue_ring_reservation), "reclaimed ring release");
+    wl_columnar_memory_reservation_init(&coord->delta_queue_ring_reservation);
+    wl_mem_ledger_unregister_reclaimer(&coord->mem_ledger, handle);
+    handle = 0;
+    fixture.calls = 0;
+    fixture.release = false;
+    QUEUE_CHECK(wl_mem_ledger_register_reclaimer(&coord->mem_ledger,
+        queue_reclaim_fixture, &fixture, &handle) == 0,
+        "register no-progress reclaimer");
+    atomic_store_explicit(&governor->usable_bytes, bytes - 1,
+        memory_order_relaxed);
+    QUEUE_CHECK(wl_columnar_eval_test_reserve_queue_ring(coord, 2, 3,
+        &bytes) == ENOSPC && fixture.calls == 1
+        && wl_columnar_memory_reserved(governor) == 0,
+        "no-progress reclaim must not retry admission");
+    coord->mat_cache.active_pins = 1;
+    fixture.calls = 0;
+    QUEUE_CHECK(wl_columnar_eval_test_reserve_queue_ring(coord, 2, 3,
+        &bytes) == ENOSPC && fixture.calls == 0,
+        "pinned state forbids reclaim");
+cleanup:
+    if (handle)
+        wl_mem_ledger_unregister_reclaimer(&coord->mem_ledger, handle);
+    if (coord && coord->delta_queue_ring_reservation.bytes)
+        (void)wl_columnar_memory_release(
+            &coord->delta_queue_ring_reservation);
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+    free(coord);
+    if (failure)
+        FAIL(failure);
+    else
+        PASS();
+#undef QUEUE_CHECK
+}
+
+static void
+test_tdd_queue_create_failure(void)
+{
+    TEST("queue allocation failure stops before worker dispatch and retries");
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    resolution.budget_bytes = 1u << 20;
+    resolution.usable_bytes = resolution.budget_bytes;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    wl_columnar_memory_governor_ref_t *ref
+        = wl_columnar_memory_governor_ref_create(&resolution);
+    wl_col_session_t *coord = calloc(1, sizeof(*coord));
+    bool ok = ref && coord;
+    if (ok) {
+        coord->memory_governor = ref;
+        wl_columnar_memory_reservation_init(
+            &coord->delta_queue_ring_reservation);
+        wl_mem_ledger_init(&coord->mem_ledger, 0);
+        /* Four physical calloc sites: queue header, worker table, two rings. */
+        for (long fault = 0; fault < 4 && ok; fault++) {
+            allocation_calls = 0;
+            allocation_fail_at = fault;
+            int rc = wl_columnar_eval_test_create_queue_ring(coord, 2, 3);
+            allocation_fail_at = -1;
+            ok = rc == ENOMEM && coord->delta_queue == NULL
+                && coord->delta_queue_ring_reservation.bytes == 0
+                && coord->mem_channel_ring_bytes == 0
+                && atomic_load_explicit(&coord->mem_ledger.subsys_bytes[
+                        WL_MEM_SUBSYS_CHANNEL], memory_order_acquire) == 0
+                && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0;
+            if (ok)
+                ok = wl_columnar_eval_test_create_queue_ring(coord, 2, 3)
+                    == 0
+                    && coord->delta_queue != NULL
+                    && coord->mem_channel_ring_bytes
+                    == wl_mpsc_queue_footprint_bytes(coord->delta_queue)
+                    && wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(ref))
+                    == coord->mem_channel_ring_bytes
+                    && atomic_load_explicit(
+                    &coord->delta_queue_ring_reservation.state,
+                    memory_order_acquire)
+                    == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+                    && atomic_load_explicit(
+                    &coord->delta_queue_ring_reservation.owner_bits,
+                    memory_order_acquire) == (uintptr_t)coord;
+            wl_columnar_eval_tdd_dispose_queue_ring(coord);
+            ok = coord->delta_queue == NULL
+                && coord->delta_queue_ring_reservation.bytes == 0
+                && atomic_load_explicit(&coord->mem_ledger.subsys_bytes[
+                        WL_MEM_SUBSYS_CHANNEL], memory_order_acquire) == 0
+                && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0 && ok;
+        }
+        if (ok)
+            ok = wl_columnar_eval_test_create_queue_ring(coord, 2, 3) == 0;
+        if (ok) {
+            size_t lifetime_bytes =
+                sizeof(wl_columnar_eval_tdd_owner_lifetime_t)
+                + sizeof(col_rel_t *);
+            wl_columnar_eval_tdd_owner_lifetime_t *lifetime
+                = calloc(1, lifetime_bytes);
+            ok = lifetime != NULL;
+            if (ok) {
+                wl_columnar_memory_reservation_init(&lifetime->reservation);
+                lifetime->matrix_slots = 1;
+                lifetime->queue = coord->delta_queue;
+                lifetime->queue_ring_bytes = coord->mem_channel_ring_bytes;
+                coord->tdd_owner_lifetime = lifetime;
+                ok = wl_columnar_eval_tdd_owner_lifetime_retry(coord) == 0
+                    && coord->tdd_owner_lifetime == NULL
+                    && coord->delta_queue == NULL
+                    && coord->delta_queue_ring_reservation.bytes == 0;
+            }
+        }
+        wl_columnar_eval_tdd_dispose_queue_ring(coord);
+        ok = wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0 && ok;
+    }
+    free(coord);
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+    if (ok)
+        PASS();
+    else
+        FAIL("create failure mutated dispatch or retry state");
+}
+#endif
+
 static int
 test_tdd_owner_lifetime_retry_gate(void)
 {
@@ -170,6 +383,20 @@ test_tdd_owner_lifetime_retry_gate(void)
     wl_columnar_source_access_reader_t reader = { 0 };
     int rc = relation && lifetime ? 0 : ENOMEM;
     bool attached = false;
+#ifdef WL_TEST_ALLOC_WRAP
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(sess->memory_governor);
+    uint64_t ring_baseline = wl_columnar_memory_reserved(governor);
+    if (rc == 0)
+        rc = wl_columnar_eval_test_create_queue_ring(sess, 2, 3);
+    if (rc == 0) {
+        lifetime->queue = sess->delta_queue;
+        lifetime->queue_ring_bytes = sess->mem_channel_ring_bytes;
+        if (wl_columnar_memory_reserved(governor)
+            != ring_baseline + lifetime->queue_ring_bytes)
+            rc = EPROTO;
+    }
+#endif
     if (rc == 0)
         rc = col_rel_source_reader_acquire_transferable(relation, &reader);
     if (rc == 0) {
@@ -192,6 +419,13 @@ test_tdd_owner_lifetime_retry_gate(void)
                 rc = EPROTO;
                 break;
             }
+#ifdef WL_TEST_ALLOC_WRAP
+            if (wl_columnar_memory_reserved(governor)
+                != ring_baseline + lifetime->queue_ring_bytes) {
+                rc = EPROTO;
+                break;
+            }
+#endif
         }
     }
     if (reader.owner) {
@@ -204,6 +438,10 @@ test_tdd_owner_lifetime_retry_gate(void)
     if (rc == 0 && (sess->tdd_owner_lifetime != NULL
         || wl_columnar_session_ensure_tdd_worker_slots(sess, 2) != 0))
         rc = EPROTO;
+#ifdef WL_TEST_ALLOC_WRAP
+    if (rc == 0 && wl_columnar_memory_reserved(governor) != ring_baseline)
+        rc = EPROTO;
+#endif
     if (attached && sess->tdd_owner_lifetime) {
         sess->tdd_owner_lifetime->evaluation_active = false;
         int cleanup_rc = wl_columnar_eval_tdd_owner_lifetime_retry(sess);
@@ -4679,6 +4917,10 @@ test_dedup_init_allocation_rollback(void)
 int
 main(void)
 {
+#ifdef WL_TEST_ALLOC_WRAP
+    test_tdd_queue_ring_admission();
+    test_tdd_queue_create_failure();
+#endif
     TEST("dedup init allocation failure rolls back its token");
     if (test_dedup_init_allocation_rollback() == 0)
         PASS();

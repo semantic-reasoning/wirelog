@@ -2474,6 +2474,7 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
     sess->memory_governor = memory_governor;
     wl_columnar_memory_reservation_init(&sess->rel_hash_reservation);
     wl_columnar_memory_reservation_init(&sess->rels_reservation);
+    wl_columnar_memory_reservation_init(&sess->delta_queue_ring_reservation);
 
     sess->frontier_ops = &col_frontier_epoch_ops;
 
@@ -3111,6 +3112,7 @@ col_session_destroy(wl_session_t *session)
             abort();
         }
     }
+    wl_columnar_eval_tdd_dispose_queue_ring(sess);
     /* Worker views may borrow coordinator relation storage.  Drain workers
      * before coordinator relations so their owner borrows are released before
      * the coordinator root is destroyed. */
@@ -3474,6 +3476,8 @@ col_worker_session_create(wl_col_session_t *coordinator,
      * ledger and never aggregate. */
     out_worker->mat_cache.ledger = &out_worker->mem_ledger;
     out_worker->mem_channel_ring_bytes = 0;
+    wl_columnar_memory_reservation_init(
+        &out_worker->delta_queue_ring_reservation);
     out_worker->mem_worker_reports = 0;
     out_worker->mem_worker_peak_max = 0;
     out_worker->mem_worker_peak_sum = 0;
