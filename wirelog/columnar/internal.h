@@ -1978,6 +1978,8 @@ typedef struct wl_col_session_t {
      *   mem_report_level: cached WL_MEM_REPORT level (0 = off, 1 =
      *       coordinator summary, 2 = also every worker teardown). */
     uint64_t mem_channel_ring_bytes;
+    /* Coordinator-owned MPSC ring storage; workers never inherit this token. */
+    wl_columnar_memory_reservation_t delta_queue_ring_reservation;
     uint64_t mem_worker_reports;
     uint64_t mem_worker_peak_max;
     uint64_t mem_worker_peak_sum;
@@ -3663,6 +3665,12 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
     wl_col_session_t *coord);
 int
 wl_columnar_eval_delta_queue_capacity(uint32_t nrels, uint32_t *out);
+#ifdef WL_TEST_ALLOC_WRAP
+int wl_columnar_eval_test_reserve_queue_ring(wl_col_session_t *coord,
+    uint32_t workers, uint32_t capacity, uint64_t *bytes);
+int wl_columnar_eval_test_create_queue_ring(wl_col_session_t *coord,
+    uint32_t workers, uint32_t capacity);
+#endif
 int
 wl_columnar_eval_tdd_matrix_size(uint32_t W, uint32_t nrels,
     size_t element_size, size_t *out);
@@ -3903,6 +3911,7 @@ wl_columnar_eval_tdd_queue_discard_delta_queue(wl_mpsc_queue_t *queue,
 void
 wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(wl_mpsc_queue_t *queue,
     wl_mem_ledger_t *ledger);
+void wl_columnar_eval_tdd_dispose_queue_ring(wl_col_session_t *coord);
 
 /* Allocation-free ownership-test seam; drains every live message. */
 void

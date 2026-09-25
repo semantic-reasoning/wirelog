@@ -49,6 +49,125 @@ tdd_destroy_delta_payload(void *payload)
     col_rel_destroy((col_rel_t *)payload);
 }
 
+static void
+tdd_release_queue_ring(wl_col_session_t *coord)
+{
+    if (coord->delta_queue_ring_reservation.bytes
+        && !wl_columnar_memory_release(
+            &coord->delta_queue_ring_reservation))
+        abort();
+    wl_columnar_memory_reservation_init(
+        &coord->delta_queue_ring_reservation);
+}
+
+/* This retry is confined to the coordinator before its first dispatch. */
+static bool
+tdd_queue_reclaim_safe(const wl_col_session_t *coord)
+{
+    if (coord->tdd_owner_lifetime || coord->retained_eval_entry_count
+        || coord->kfusion_pending_cohort || coord->cleanup_active
+        || coord->cleanup_pending || coord->delta_rollback
+        || coord->mat_cache.active_pins)
+        return false;
+    for (uint32_t w = 0; w < coord->tdd_workers_count; w++) {
+        const wl_col_session_t *worker = &coord->tdd_workers[w];
+        if (worker->cleanup_active || worker->cleanup_pending
+            || worker->delta_rollback || worker->mat_cache.active_pins)
+            return false;
+    }
+    return true;
+}
+
+static int
+tdd_reserve_queue_ring(wl_col_session_t *coord, uint32_t workers,
+    uint32_t capacity, uint64_t *bytes)
+{
+    int rc = wl_mpsc_queue_footprint_checked(workers, capacity, bytes);
+    if (rc || !coord->memory_governor)
+        return rc;
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(coord->memory_governor);
+    wl_columnar_memory_admission_status_t status
+        = wl_columnar_memory_reserve_checked(governor, *bytes,
+            &coord->delta_queue_ring_reservation);
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+        && tdd_queue_reclaim_safe(coord)) {
+        uint64_t before = wl_columnar_memory_reserved(governor);
+        wl_mem_reclaim_result_t reclaimed
+            = wl_mem_ledger_reclaim(&coord->mem_ledger);
+        uint64_t after = wl_columnar_memory_reserved(governor);
+        if (reclaimed.bytes_released && after < before)
+            status = wl_columnar_memory_reserve_checked(governor, *bytes,
+                    &coord->delta_queue_ring_reservation);
+    }
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+        || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+        return 0;
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED) {
+        coord->memory_budget_denied = true;
+        return ENOSPC;
+    }
+    return status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+        ? EOVERFLOW : EBUSY;
+}
+
+static int
+tdd_create_queue_ring(wl_col_session_t *coord, uint32_t workers,
+    uint32_t capacity)
+{
+    uint64_t bytes = 0;
+    int rc = tdd_reserve_queue_ring(coord, workers, capacity, &bytes);
+    if (rc != 0)
+        return rc;
+    wl_mpsc_queue_t *queue = wl_mpsc_queue_create_with_destructor(
+        workers, capacity, tdd_destroy_delta_payload);
+    if (!queue) {
+        tdd_release_queue_ring(coord);
+        return ENOMEM;
+    }
+    if (coord->memory_governor
+        && !wl_columnar_memory_commit(
+            &coord->delta_queue_ring_reservation, coord))
+        abort();
+    coord->delta_queue = queue;
+    coord->mem_channel_ring_bytes = bytes;
+    wl_mem_ledger_alloc(&coord->mem_ledger, WL_MEM_SUBSYS_CHANNEL, bytes);
+    return 0;
+}
+
+void
+wl_columnar_eval_tdd_dispose_queue_ring(wl_col_session_t *coord)
+{
+    if (!coord || coord->tdd_owner_lifetime)
+        return;
+    if (coord->delta_queue) {
+        wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(
+            coord->delta_queue, &coord->mem_ledger);
+        wl_mpsc_queue_destroy(coord->delta_queue);
+        coord->delta_queue = NULL;
+        wl_mem_ledger_free(&coord->mem_ledger, WL_MEM_SUBSYS_CHANNEL,
+            coord->mem_channel_ring_bytes);
+        coord->mem_channel_ring_bytes = 0;
+    }
+    tdd_release_queue_ring(coord);
+}
+
+#ifdef WL_TEST_ALLOC_WRAP
+int
+wl_columnar_eval_test_reserve_queue_ring(wl_col_session_t *coord,
+    uint32_t workers, uint32_t capacity, uint64_t *bytes)
+{
+    return tdd_reserve_queue_ring(coord, workers, capacity, bytes);
+}
+
+int
+wl_columnar_eval_test_create_queue_ring(wl_col_session_t *coord,
+    uint32_t workers, uint32_t capacity)
+{
+    return tdd_create_queue_ring(coord, workers, capacity);
+}
+#endif
+
 static bool
 wl_columnar_eval_tdd_owner_lifetime_contains(
     const wl_columnar_eval_tdd_owner_lifetime_t *lifetime,
@@ -129,14 +248,15 @@ wl_columnar_eval_tdd_owner_lifetime_retry(wl_col_session_t *coord)
         return rc;
 
     if (lifetime->queue) {
-        wl_mem_ledger_free(&coord->mem_ledger, WL_MEM_SUBSYS_CHANNEL,
-            lifetime->queue_ring_bytes);
         if (coord->delta_queue == lifetime->queue) {
             coord->delta_queue = NULL;
             coord->mem_channel_ring_bytes = 0;
         }
         wl_mpsc_queue_destroy(lifetime->queue);
         lifetime->queue = NULL;
+        wl_mem_ledger_free(&coord->mem_ledger, WL_MEM_SUBSYS_CHANNEL,
+            lifetime->queue_ring_bytes);
+        tdd_release_queue_ring(coord);
     }
     coord->tdd_owner_lifetime = NULL;
     wl_columnar_memory_release(&lifetime->reservation);
@@ -316,6 +436,9 @@ wl_columnar_eval_delta_queue_capacity(uint32_t nrels, uint32_t *out)
      * 2^31 is its largest non-wrapping request on the current base. */
     if (nrels > (UINT32_C(1) << 30))
         return EOVERFLOW;
+    /* Each worker emits at most one delta for each relation in a subpass.
+     * Its private SPSC ring leaves one slot vacant, so a power-of-two ring
+     * of at least 2*nrels has room for all nrels messages without draining. */
     *out = nrels > 0 ? nrels * 2u : 2u;
     return 0;
 }
@@ -1824,6 +1947,81 @@ void (*wl_columnar_eval_test_outbound_before_publish)(wl_col_session_t *,
     eval_entry_t *);
 #endif
 
+/* Construct the worst-case outgoing image before a worker changes its source.
+ * Every subsequent delta append fits this physical grid and timestamp array. */
+static int
+wl_columnar_eval_prepare_worker_delta(col_rel_t **out, const char *name,
+    const col_rel_t *source, uint32_t rows,
+    wl_columnar_memory_governor_ref_t *governor)
+{
+    if (!out)
+        return EINVAL;
+    *out = NULL;
+    col_rel_t *delta = NULL;
+    int rc = wl_columnar_relation_new_like_governed_checked(&delta,
+            name, source, governor);
+    if (rc != 0)
+        return rc;
+    uint32_t target_capacity = delta->capacity
+        ? delta->capacity : COL_REL_INIT_CAP;
+    while (target_capacity < rows) {
+        if (target_capacity > UINT32_MAX / 2u) {
+            col_rel_destroy(delta);
+            return EOVERFLOW;
+        }
+        target_capacity *= 2u;
+    }
+    uint64_t projected = 0, timestamp_bytes = 0;
+    if (!col_rel_retained_bytes_for(delta, target_capacity, &projected)
+        || !wl_columnar_memory_size_mul(target_capacity,
+        sizeof(col_delta_timestamp_t), &timestamp_bytes)
+        || timestamp_bytes > SIZE_MAX
+        || !wl_columnar_memory_size_add(projected,
+        delta->timestamps ? 0 : timestamp_bytes, &projected)
+        || projected > SIZE_MAX) {
+        col_rel_destroy(delta);
+        return EOVERFLOW;
+    }
+    wl_columnar_source_access_writer_t writer = { 0 };
+    rc = col_rel_source_writer_acquire(delta, &writer);
+    if (rc == 0) {
+        bool alias_release_pending = false;
+        rc = col_rel_reserve_rows_locked(delta, rows, &writer,
+                &alias_release_pending);
+        /* A newly created heap delta cannot borrow another relation. */
+        if (rc == 0 && alias_release_pending)
+            rc = EBUSY;
+        if (rc == 0)
+            rc = col_rel_enable_timestamps_locked(delta);
+        int release_rc = wl_columnar_source_access_writer_release(&writer);
+        if (rc == 0)
+            rc = release_rc;
+    }
+    if (rc != 0) {
+        if (rc == ENOMEM && delta->memory_budget_denial_pending)
+            rc = ENOSPC;
+        col_rel_destroy(delta);
+        return rc;
+    }
+    *out = delta;
+    return 0;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+int
+wl_columnar_eval_test_prepare_worker_delta(col_rel_t **out,
+    const char *name, const col_rel_t *source, uint32_t rows,
+    wl_columnar_memory_governor_ref_t *governor)
+{
+    return wl_columnar_eval_prepare_worker_delta(out, name, source, rows,
+               governor);
+}
+void (*wl_columnar_eval_test_before_worker_delta)(wl_col_session_t *,
+    col_rel_t *, const char *, uint32_t);
+void (*wl_columnar_eval_test_after_worker_delta)(wl_col_session_t *,
+    col_rel_t *, int);
+#endif
+
 static int
 wl_columnar_eval_outbound_framed_relation(col_eval_tdd_worker_ctx_t *ctx,
     uint32_t ri, bool *produced)
@@ -1853,10 +2051,12 @@ wl_columnar_eval_outbound_framed_relation(col_eval_tdd_worker_ctx_t *ctx,
     if (rc != 0 || !result->rel || result->rel->nrows == 0)
         goto done;
 
-    col_rel_t *delta = wl_columnar_relation_new_like_governed(
-        rp->delta_name, result->rel, sess->memory_governor);
-    if (!delta) {
-        rc = ENOMEM;
+    col_rel_t *delta = NULL;
+    rc = wl_columnar_relation_new_like_governed_checked(&delta,
+            rp->delta_name, result->rel, sess->memory_governor);
+    if (rc != 0) {
+        if (rc == ENOSPC)
+            sess->memory_budget_denied = true;
         goto done;
     }
     /* Lower entries have drained, so this push has a vacant slot. */
@@ -1866,6 +2066,13 @@ wl_columnar_eval_outbound_framed_relation(col_eval_tdd_worker_ctx_t *ctx,
         goto done;
     }
     rc = col_rel_append_all(delta, result->rel, NULL);
+    if (rc == 0) {
+        rc = col_rel_enable_timestamps(delta);
+        if (rc == ENOMEM && delta->memory_budget_denial_pending)
+            rc = ENOSPC;
+        if (rc == ENOSPC)
+            sess->memory_budget_denied = true;
+    }
     if (rc == 0)
         rc = eval_entry_dispose(result);
     if (rc != 0)
@@ -2040,11 +2247,24 @@ tdd_worker_subpass_fn(void *arg)
             continue;
 
         const char *dname = sp->relations[ri].delta_name;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_eval_test_before_worker_delta)
+            wl_columnar_eval_test_before_worker_delta(sess, r, dname,
+                r->nrows - snap[ri]);
+#endif
 
         /* Heap-allocate delta so it survives delta_pool_reset below. */
-        col_rel_t *delta = col_rel_new_like(dname, r);
-        if (!delta) {
-            ctx->rc = ENOMEM;
+        col_rel_t *delta = NULL;
+        int prep_rc = wl_columnar_eval_prepare_worker_delta(&delta,
+                dname, r, r->nrows - snap[ri], sess->memory_governor);
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_eval_test_after_worker_delta)
+            wl_columnar_eval_test_after_worker_delta(sess, r, prep_rc);
+#endif
+        if (prep_rc != 0) {
+            if (prep_rc == ENOSPC)
+                sess->memory_budget_denied = true;
+            ctx->rc = prep_rc;
             free(snap);
             sess->tdd_subpass_active = saved_tdd_subpass;
             sess->tdd_outbound_only_active = saved_outbound_only;
@@ -2117,20 +2337,7 @@ tdd_worker_subpass_fn(void *arg)
             sp->relations[ri].name);
 
         if (delta->nrows > 0) {
-            /* Stamp timestamps (eval_serial.c:653-681) */
-            delta->timestamps = (col_delta_timestamp_t *)calloc(
-                delta->nrows, sizeof(col_delta_timestamp_t));
-            if (!delta->timestamps) {
-                col_rel_destroy(delta);
-                ctx->rc = ENOMEM;
-                free(snap);
-                sess->tdd_subpass_active = saved_tdd_subpass;
-                sess->tdd_outbound_only_active = saved_outbound_only;
-                sess->diff_operators_active = saved_diff;
-                TDD_WORKER_RETURN();
-            }
-            delta->timestamp_capacity = delta->nrows;
-            wl_columnar_relation_touch_storage(delta);
+            /* The timestamp image was admitted before source mutation. */
             for (uint32_t ti = 0; ti < delta->nrows; ti++) {
                 delta->timestamps[ti].iteration = eff_iter;
                 delta->timestamps[ti].stratum = ctx->stratum_idx;
@@ -6285,10 +6492,11 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
 
     uint32_t delta_queue_capacity = 0;
     col_eval_tdd_worker_ctx_t *ctxs = NULL;
-    if (wl_columnar_eval_delta_queue_capacity(nrels,
-        &delta_queue_capacity) != 0) {
+    int capacity_rc = wl_columnar_eval_delta_queue_capacity(nrels,
+            &delta_queue_capacity);
+    if (capacity_rc != 0) {
         coord->tdd_total_ns += now_ns() - tdd_total_t0;
-        return ENOMEM;
+        return capacity_rc;
     }
 
     /* Pre-register empty IDB relations on coordinator
@@ -6614,6 +6822,9 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         rc = ENOMEM;
         goto done;
     }
+    rc = tdd_create_queue_ring(coord, W, delta_queue_capacity);
+    if (rc != 0)
+        goto done;
     if (owner_exchange_mode) {
         rc = wl_columnar_eval_tdd_owner_lifetime_create(coord, ctxs, W, nrels,
                 delta_queue_capacity);
@@ -6635,23 +6846,13 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         }
     }
 
-    /* Issue #410: Create MPSC delta queue for dual-write transport.
-     * Capacity = W × nrels × 2 (2x headroom; at most W×nrels per sub-pass).
-     * Failure is non-fatal: enqueue is skipped when delta_queue is NULL.
-     * An unrepresentable nrels*2 request is rejected before any stratum
-     * state allocation, using the evaluator's ENOMEM failure signal. */
-    coord->delta_queue = wl_mpsc_queue_create_with_destructor(
-        W, delta_queue_capacity, tdd_destroy_delta_payload);
+    /* The queue was admitted and created before the owner lifetime record;
+     * this binding is nonfallible and precedes any worker dispatch. */
     if (coord->tdd_owner_lifetime)
         coord->tdd_owner_lifetime->queue = coord->delta_queue;
-    /* Issue #1380: ring storage is fixed for the stratum; charge once. */
-    coord->mem_channel_ring_bytes
-        = wl_mpsc_queue_footprint_bytes(coord->delta_queue);
     if (coord->tdd_owner_lifetime)
         coord->tdd_owner_lifetime->queue_ring_bytes
             = coord->mem_channel_ring_bytes;
-    wl_mem_ledger_alloc(&coord->mem_ledger, WL_MEM_SUBSYS_CHANNEL,
-        coord->mem_channel_ring_bytes);
 
     /* Issue #390: BDX snap array — pre-subpass IDB sizes per worker/relation.
      * Used to truncate worker IDB back to clean partition state after each
@@ -6920,6 +7121,8 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 if (ctxs[w].rc != 0 && rc == 0)
                     rc = ctxs[w].rc;
                 wl_col_session_t *worker = ctxs[w].worker_sess;
+                if (ctxs[w].rc != 0 && worker->memory_budget_denied)
+                    coord->memory_budget_denied = true;
                 if (rc == 0 &&
                     (worker->cleanup_active || worker->cleanup_pending
                     || worker->delta_rollback))
@@ -7174,22 +7377,22 @@ done:
             = wl_columnar_eval_tdd_owner_lifetime_retry(coord);
         if (lifetime_rc != 0 && rc == 0)
             rc = lifetime_rc;
+        if (!coord->tdd_owner_lifetime
+            && coord->delta_queue_ring_reservation.bytes)
+            tdd_release_queue_ring(coord);
     } else {
         /* Issue #410: Destroy MPSC delta queue created for this stratum. */
         /* Issue #1380: drain with accounting first so the destructor path has
          * nothing left to reclaim, then release the ring charge. */
-        wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(
-            coord->delta_queue, &coord->mem_ledger);
-        wl_mem_ledger_free(&coord->mem_ledger, WL_MEM_SUBSYS_CHANNEL,
-            coord->mem_channel_ring_bytes);
-        coord->mem_channel_ring_bytes = 0;
-        wl_mpsc_queue_destroy(coord->delta_queue);
-        coord->delta_queue = NULL;
+        wl_columnar_eval_tdd_dispose_queue_ring(coord);
     }
-
-    /* Free pre-allocated worker contexts */
-    if (ctxs && (!coord->tdd_owner_lifetime
-        || !coord->tdd_owner_lifetime->dispatch_active)) {
+    /* A refused dispatch cleanup retains the contexts with its owner record. */
+    if (ctxs && coord->tdd_owner_lifetime
+        && coord->tdd_owner_lifetime->dispatch_active) {
+        assert(coord->tdd_owner_lifetime->worker_ctxs == ctxs);
+        ctxs = NULL;
+    }
+    if (ctxs) {
         if (!owner_slots_embedded)
             for (uint32_t w = 0; w < W; w++)
                 free((void *)ctxs[w].delta_rels);

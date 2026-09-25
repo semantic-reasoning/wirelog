@@ -809,6 +809,68 @@ test_delta_queue_capacity_boundaries(void)
     return;
 }
 
+static void
+test_delta_queue_footprint_boundaries(void)
+{
+    TEST("delta queue footprint follows physical ring rounding");
+    uint64_t three = 0, four = 0, five = 0;
+    wl_mpsc_queue_t *queue = wl_mpsc_queue_create(2, 3);
+    bool ok = queue
+        && wl_mpsc_queue_footprint_checked(2, 3, &three) == 0
+        && wl_mpsc_queue_footprint_checked(2, 4, &four) == 0
+        && wl_mpsc_queue_footprint_checked(2, 5, &five) == 0
+        && three == four && three == wl_mpsc_queue_footprint_bytes(queue)
+        && five - four == 2u * 4u * sizeof(wl_delta_msg_t)
+        && wl_mpsc_queue_footprint_checked(0, 2, &three) == EINVAL
+        && wl_mpsc_queue_footprint_checked(2, 1, &three) == EINVAL
+        && wl_mpsc_queue_footprint_checked(2, UINT32_MAX,
+            &three) == EOVERFLOW
+        && wl_mpsc_queue_footprint_checked(UINT32_MAX,
+            UINT32_C(1) << 31, &three) == EOVERFLOW;
+    wl_mpsc_queue_destroy(queue);
+    if (ok)
+        PASS();
+    else
+        FAIL("incorrect rounded footprint or overflow result");
+}
+
+static void
+test_delta_queue_four_workers_no_loss(void)
+{
+    TEST("four worker rings deliver every message exactly once");
+    wl_mpsc_queue_t *queue = wl_mpsc_queue_create(4, 5);
+    bool seen[20] = { false };
+    bool ok = queue != NULL;
+    if (ok)
+        for (uint32_t worker = 0; worker < 4; worker++)
+            for (uint32_t item = 0; item < 5; item++) {
+                uintptr_t id = (uintptr_t)worker * 5u + item + 1u;
+                if (wl_mpsc_enqueue(queue, worker, (void *)id, 0,
+                    item) != 0)
+                    ok = false;
+            }
+    wl_delta_msg_t message;
+    unsigned delivered = 0;
+    while (queue && wl_mpsc_dequeue(queue, &message)) {
+        uintptr_t id = (uintptr_t)message.delta;
+        if (!id || id > 20 || seen[id - 1u])
+            ok = false;
+        else
+            seen[id - 1u] = true;
+        delivered++;
+    }
+    if (delivered != 20)
+        ok = false;
+    for (unsigned i = 0; i < 20; i++)
+        if (!seen[i])
+            ok = false;
+    wl_mpsc_queue_destroy(queue);
+    if (ok)
+        PASS();
+    else
+        FAIL("lost or duplicate message");
+}
+
 static int
 test_discard_drains_all_messages(void)
 {
@@ -934,6 +996,8 @@ main(void)
     test_reconstruct_sparse();
     test_reconstruct_duplicate();
     test_delta_queue_capacity_boundaries();
+    test_delta_queue_footprint_boundaries();
+    test_delta_queue_four_workers_no_loss();
     test_tdd_matrix_size_boundaries();
     test_tdd_queue_discard_large_dimensions();
     test_discard_drains_all_messages();
