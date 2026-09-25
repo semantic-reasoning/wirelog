@@ -1254,6 +1254,209 @@ test_delta_substitution(void)
     PASS;
 }
 
+typedef int (*join_selection_fn)(const wl_plan_op_t *, eval_stack_t *,
+    wl_col_session_t *);
+
+typedef struct {
+    const char *name;
+    wl_delta_mode_t mode;
+    uint32_t iteration;
+    bool delta_seeded;
+    bool retraction_seeded;
+    bool retraction_right_pass;
+    bool subpass;
+    bool outbound_only;
+    bool left_is_delta;
+    bool add_delta;
+    bool add_retraction;
+    const int64_t *full_keys;
+    uint32_t full_count;
+    const int64_t *delta_keys;
+    uint32_t delta_count;
+    const int64_t *retraction_keys;
+    uint32_t retraction_count;
+    uint32_t expected_mask;
+    bool expected_is_delta;
+} join_selection_case_t;
+
+static col_rel_t *
+make_key_relation(const char *name, const int64_t *keys, uint32_t count)
+{
+    const char *columns[] = { "k" };
+    col_rel_t *rel = make_rel(name, 1, columns);
+    if (!rel)
+        return NULL;
+    for (uint32_t i = 0; i < count; i++) {
+        if (col_rel_append_row(rel, &keys[i]) != 0) {
+            col_rel_destroy(rel);
+            return NULL;
+        }
+    }
+    return rel;
+}
+
+static bool
+run_join_selection_case(const join_selection_case_t *test_case,
+    join_selection_fn fn)
+{
+    static const int64_t left_keys[] = { 1, 2, 3 };
+    wl_col_session_t *sess = make_mock_session();
+    col_rel_t *left = NULL;
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    bool ok = false;
+    if (!sess)
+        return false;
+
+    col_rel_t *right = make_key_relation("right", test_case->full_keys,
+            test_case->full_count);
+    if (!right)
+        goto cleanup;
+    if (session_add_rel(sess, right) != 0) {
+        col_rel_destroy(right);
+        goto cleanup;
+    }
+    if (test_case->add_delta) {
+        col_rel_t *delta = make_key_relation("$d$right",
+                test_case->delta_keys, test_case->delta_count);
+        if (!delta)
+            goto cleanup;
+        if (session_add_rel(sess, delta) != 0) {
+            col_rel_destroy(delta);
+            goto cleanup;
+        }
+    }
+    if (test_case->add_retraction) {
+        col_rel_t *retraction = make_key_relation("$r$right",
+                test_case->retraction_keys, test_case->retraction_count);
+        if (!retraction)
+            goto cleanup;
+        if (session_add_rel(sess, retraction) != 0) {
+            col_rel_destroy(retraction);
+            goto cleanup;
+        }
+    }
+    sess->current_iteration = test_case->iteration;
+    sess->delta_seeded = test_case->delta_seeded;
+    sess->retraction_seeded = test_case->retraction_seeded;
+    sess->retraction_right_pass = test_case->retraction_right_pass;
+    sess->tdd_subpass_active = test_case->subpass;
+    sess->tdd_outbound_only_active = test_case->outbound_only;
+
+    left = make_key_relation("left", left_keys, 3);
+    if (!left)
+        goto cleanup;
+    wl_plan_op_t op = { 0 };
+    const char *keys[] = { "k" };
+    op.op = WL_PLAN_OP_JOIN;
+    op.right_relation = "right";
+    op.key_count = 1;
+    op.left_keys = keys;
+    op.right_keys = keys;
+    op.delta_mode = test_case->mode;
+    if (eval_stack_push_delta(&stack, left, false,
+        test_case->left_is_delta) != 0)
+        goto cleanup;
+
+    int rc = fn(&op, &stack, sess);
+    if (rc != 0 || stack.top != 1)
+        goto cleanup;
+    eval_entry_t result = eval_stack_pop(&stack);
+    uint32_t mask = 0;
+    for (uint32_t i = 0; i < result.rel->nrows; i++) {
+        int64_t key = col_rel_get(result.rel, i, 0);
+        if (key < 1 || key > 3) {
+            ok = false;
+            goto result_cleanup;
+        }
+        uint32_t bit = 1u << (uint32_t)key;
+        if (mask & bit) {
+            ok = false;
+            goto result_cleanup;
+        }
+        mask |= bit;
+    }
+    ok = mask == test_case->expected_mask
+        && result.is_delta == test_case->expected_is_delta;
+result_cleanup:
+    free(result.seg_boundaries);
+    if (result.owned)
+        col_rel_destroy(result.rel);
+cleanup:
+    (void)eval_stack_drain(&stack);
+    if (left)
+        col_rel_destroy(left);
+    destroy_mock_session(sess);
+    if (!ok)
+        fprintf(stderr, "right selection case failed: %s\n", test_case->name);
+    return ok;
+}
+
+static void
+test_shared_right_selection_cases(void)
+{
+    static const int64_t full_all[] = { 1, 2, 3 };
+    static const int64_t full_one[] = { 1 };
+    static const int64_t delta_two[] = { 2 };
+    static const int64_t delta_two_three[] = { 2, 3 };
+    static const int64_t retraction_three[] = { 3 };
+    static const join_selection_case_t cases[] = {
+        { "FORCE_DELTA absent at unseeded iteration zero uses full",
+          WL_DELTA_FORCE_DELTA, 0, false, false, false, false, false, false,
+          false, false, full_all, 3, NULL, 0, NULL, 0, 0x0e, false },
+        { "FORCE_DELTA empty at unseeded iteration zero uses full",
+          WL_DELTA_FORCE_DELTA, 0, false, false, false, false, false, false,
+          true, false, full_all, 3, NULL, 0, NULL, 0, 0x0e, false },
+        { "FORCE_DELTA absent on a later round is empty",
+          WL_DELTA_FORCE_DELTA, 1, false, false, false, false, false, false,
+          false, false, full_all, 3, NULL, 0, NULL, 0, 0, false },
+        { "delta-seeded iteration-zero FORCE_DELTA absent is empty",
+          WL_DELTA_FORCE_DELTA, 0, true, false, false, false, false, false,
+          false, false, full_all, 3, NULL, 0, NULL, 0, 0, false },
+        { "FORCE_DELTA uses a populated delta on a later round",
+          WL_DELTA_FORCE_DELTA, 1, false, false, false, false, false, false,
+          true, false, full_all, 3, delta_two, 1, NULL, 0, 0x04, true },
+        { "seeded iteration-zero FORCE_DELTA falls back to absent-delta $r$",
+          WL_DELTA_FORCE_DELTA, 0, false, true, false, false, false, false,
+          false, true, full_all, 3, NULL, 0, retraction_three, 1, 0x08, true },
+        { "seeded FORCE_DELTA does not fall back when empty $d$ exists",
+          WL_DELTA_FORCE_DELTA, 0, false, true, false, false, false, false,
+          true, true, full_all, 3, NULL, 0, retraction_three, 1, 0, false },
+        { "AUTO chooses a smaller right delta",
+          WL_DELTA_AUTO, 0, false, false, false, false, false, false,
+          true, false, full_all, 3, delta_two, 1, NULL, 0, 0x04, true },
+        { "AUTO subpass uses a nonempty delta larger than full",
+          WL_DELTA_AUTO, 0, false, false, false, true, false, false,
+          true, false, full_one, 1, delta_two_three, 2, NULL, 0, 0x0c,
+          true },
+        { "AUTO leaves an already-delta left side on full right",
+          WL_DELTA_AUTO, 0, false, false, false, false, false, true,
+          true, false, full_all, 3, delta_two, 1, NULL, 0, 0x0e, true },
+        { "outbound-only selects even an empty right delta",
+          WL_DELTA_AUTO, 1, false, false, false, false, true, true,
+          true, false, full_all, 3, NULL, 0, NULL, 0, 0, true },
+        { "retraction right-pass overrides FORCE_FULL",
+          WL_DELTA_FORCE_FULL, 0, false, false, true, false, false, false,
+          false, true, full_one, 1, NULL, 0, retraction_three, 1, 0x08,
+          true }
+    };
+    const join_selection_fn operators[] = {
+        wl_columnar_join_op, wl_columnar_join_diff_op
+    };
+
+    TEST(
+        "shared ordinary/differential right-delta selection preserves edge cases");
+    for (size_t op_index = 0; op_index < sizeof(operators)
+        / sizeof(operators[0]); op_index++) {
+        for (size_t case_index = 0; case_index < sizeof(cases)
+            / sizeof(cases[0]); case_index++) {
+            ASSERT_TRUE(run_join_selection_case(&cases[case_index],
+                operators[op_index]), "right selection behavior differs");
+        }
+    }
+    PASS;
+}
+
 static void
 test_single_key_column(void)
 {
@@ -1931,6 +2134,7 @@ main(void)
     test_diff_operators_active_flag();
     test_force_full_mode();
     test_delta_substitution();
+    test_shared_right_selection_cases();
     test_diff_arr_entry_cleanup();
     test_projected_join_emits_projected_columns();
     test_projected_diff_join_emits_projected_columns();

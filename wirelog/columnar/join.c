@@ -74,41 +74,6 @@ wl_columnar_join_effective_governor(const wl_col_session_t *sess,
                                                    : NULL);
 }
 
-/* Use the retained filter cache when eligible; otherwise return an owned,
- * governor-accounted fallback through @owned_fallback. Cache hits remain
- * cache-owned, and failure leaves all input ownership with the caller. */
-static col_rel_t *
-wl_columnar_join_filter_right(const wl_plan_op_t *op,
-    wl_col_session_t *sess, col_rel_t *right, bool used_right_delta,
-    col_rel_t **owned_fallback)
-{
-    *owned_fallback = NULL;
-    if (op->right_filter_expr.size == 0)
-        return right;
-
-    col_rel_t *filtered = NULL;
-    if (op->right_relation && !used_right_delta) {
-        filtered = wl_columnar_filter_apply_right_filter_cached(sess,
-                &op->right_filter_expr, op->right_relation, right);
-        if (!filtered)
-            WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
-                "filtered cache unavailable for %s, using owned filter",
-                op->right_relation);
-    }
-    if (filtered)
-        return filtered;
-
-    filtered = wl_columnar_filter_apply_right_filter_governed(
-        &op->right_filter_expr, right, sess->delta_pool, sess->intern,
-        sess->memory_governor ? sess->memory_governor :
-        right->memory_governor);
-    if (!filtered)
-        return NULL;
-
-    *owned_fallback = filtered;
-    return filtered;
-}
-
 /* ENOMEM may leave the single original result publishable only when its
  * complete retained footprint was already committed to the effective
  * governor.  An unmanaged source is eligible only in an unmanaged session. */
@@ -1059,6 +1024,74 @@ col_join_append_pair(col_rel_t *out, const col_rel_t *left, uint32_t lr,
     return col_rel_append_row(out, fallback_row);
 }
 
+typedef struct {
+    col_rel_t *right;
+    bool used_right_delta;
+    bool force_empty;
+} wl_columnar_join_selection_t;
+
+static wl_columnar_join_selection_t
+wl_columnar_join_select_right(const wl_plan_op_t *op,
+    wl_col_session_t *sess, col_rel_t *right, bool left_is_delta)
+{
+    wl_columnar_join_selection_t selection = {
+        .right = right,
+        .used_right_delta = false,
+        .force_empty = false
+    };
+
+    if (op->delta_mode == WL_DELTA_FORCE_DELTA && op->right_relation) {
+        char rdname[256];
+        snprintf(rdname, sizeof(rdname), "$d$%s", op->right_relation);
+        col_rel_t *rdelta = session_find_rel(sess, rdname);
+        /* At iteration zero, seeded retractions use $r$ when $d$ is absent. */
+        if (!rdelta && sess->retraction_seeded
+            && sess->current_iteration == 0) {
+            if (retraction_rel_name(op->right_relation, rdname,
+                sizeof(rdname)) == 0)
+                rdelta = session_find_rel(sess, rdname);
+        }
+        if (rdelta && rdelta->nrows > 0) {
+            selection.right = rdelta;
+            selection.used_right_delta = true;
+        } else if (sess->current_iteration > 0 || sess->delta_seeded
+            || sess->retraction_seeded) {
+            selection.force_empty = true;
+        }
+    } else if (op->delta_mode != WL_DELTA_FORCE_FULL && op->right_relation
+        && (!left_is_delta || (sess->tdd_outbound_only_active
+        && sess->current_iteration > 0))) {
+        char rdname[256];
+        snprintf(rdname, sizeof(rdname), "$d$%s", op->right_relation);
+        col_rel_t *rdelta = session_find_rel(sess, rdname);
+        if (rdelta && (((rdelta->nrows > 0
+            && rdelta->nrows < right->nrows) || (rdelta->nrows > 0
+            && sess->tdd_subpass_active))
+            || (sess->tdd_outbound_only_active
+            && sess->current_iteration > 0))) {
+            selection.right = rdelta;
+            selection.used_right_delta = true;
+        }
+    }
+
+    /* Retraction right-pass deliberately also overrides FORCE_FULL. */
+    if (!selection.force_empty && !selection.used_right_delta
+        && sess->retraction_right_pass && sess->current_iteration == 0
+        && op->right_relation) {
+        char rdname[256];
+        if (retraction_rel_name(op->right_relation, rdname,
+            sizeof(rdname)) == 0) {
+            col_rel_t *rdelta = session_find_rel(sess, rdname);
+            if (rdelta && rdelta->nrows > 0) {
+                selection.right = rdelta;
+                selection.used_right_delta = true;
+            }
+        }
+    }
+
+    return selection;
+}
+
 int
 wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
@@ -1102,86 +1135,59 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     sess->profile.join_calls++;
 #endif
 
-    /* Right-side delta substitution controlled by delta_mode:
-     * FORCE_DELTA: always substitute delta of right if available; if no
-     *              delta exists, short-circuit with an empty result (this
-     *              rule copy produces no tuples from this permutation).
-     * FORCE_FULL:  never substitute delta; always use full right.
-     * AUTO:        heuristic -- substitute delta when left is not already
-     *              a delta and right-delta is strictly smaller than full. */
-    bool used_right_delta = false;
-    if (op->delta_mode == WL_DELTA_FORCE_DELTA && op->right_relation) {
-        char rdname[256];
-        snprintf(rdname, sizeof(rdname), "$d$%s", op->right_relation);
-        col_rel_t *rdelta = session_find_rel(sess, rdname);
-        /* Issue #472: mirror VARIABLE op retraction-aware pattern —
-         * fall back to $r$<name> when retraction_seeded at iteration 0. */
-        if (!rdelta && sess->retraction_seeded
-            && sess->current_iteration == 0) {
-            if (retraction_rel_name(op->right_relation, rdname,
-                sizeof(rdname)) == 0)
-                rdelta = session_find_rel(sess, rdname);
+    wl_columnar_join_selection_t selection = wl_columnar_join_select_right(
+        op, sess, right, left_e.is_delta);
+    right = selection.right;
+    bool used_right_delta = selection.used_right_delta;
+    if (selection.force_empty) {
+        /* FORCE_DELTA had no usable $d$/$r$ on a seeded round. */
+        uint32_t ocols = col_join_output_width(left_e.rel, right, op);
+        col_rel_t *empty = col_rel_new_auto("$join_empty", ocols);
+        if (!empty) {
+            return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
         }
-        if (rdelta && rdelta->nrows > 0) {
-            right = rdelta;
-            used_right_delta = true;
-        } else if (sess->current_iteration > 0 || sess->delta_seeded
-            || sess->retraction_seeded) {
-            /* Iteration > 0, delta-seeded iter 0 (issue #83), or
-             * retraction-seeded iter 0 (issue #472):
-             * FORCE_DELTA required but delta absent/empty. Short-circuit to
-             * empty result — this rule copy produces no tuples from this
-             * permutation (correct semi-naive, issue #85). */
-            uint32_t ocols = col_join_output_width(left_e.rel, right, op);
-            col_rel_t *empty = col_rel_new_auto("$join_empty", ocols);
-            if (!empty) {
-                return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
-            }
-            if (col_join_set_output_types(empty, left_e.rel, right, op) != 0) {
-                col_rel_destroy(empty);
-                return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
-            }
-            return wl_columnar_join_publish_after_left(stack, &left_e, empty,
-                       false);
+        if (col_join_set_output_types(empty, left_e.rel, right, op) != 0) {
+            col_rel_destroy(empty);
+            return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
         }
-        /* else: iteration 0 — no deltas yet, fall through to full right */
-    } else if (op->delta_mode != WL_DELTA_FORCE_FULL && op->right_relation
-        && (!left_e.is_delta || (sess->tdd_outbound_only_active
-        && sess->current_iteration > 0))) {
-        /* AUTO: original heuristic */
-        char rdname[256];
-        snprintf(rdname, sizeof(rdname), "$d$%s", op->right_relation);
-        col_rel_t *rdelta = session_find_rel(sess, rdname);
-        if (rdelta && (((rdelta->nrows > 0
-            && rdelta->nrows < right->nrows) || (rdelta->nrows > 0
-            && sess->tdd_subpass_active))
-            || (sess->tdd_outbound_only_active
-            && sess->current_iteration > 0))) {
-            right = rdelta;
-            used_right_delta = true;
-        }
-    }
-    /* Issue #472: Retraction right-pass — when retraction_right_pass is set,
-     * use the $r$ retraction delta on the right side so that self-join rules
-     * derive retractions from full(left) x $r$(right). */
-    if (!used_right_delta && sess->retraction_right_pass
-        && sess->current_iteration == 0 && op->right_relation) {
-        char rdname[256];
-        if (retraction_rel_name(op->right_relation, rdname,
-            sizeof(rdname)) == 0) {
-            col_rel_t *rdelta = session_find_rel(sess, rdname);
-            if (rdelta && rdelta->nrows > 0) {
-                right = rdelta;
-                used_right_delta = true;
-            }
-        }
+        return wl_columnar_join_publish_after_left(stack, &left_e, empty,
+                   false);
     }
 
-    right = wl_columnar_join_filter_right(op, sess, right, used_right_delta,
-            &right_filtered);
-    if (!right) {
-        int cleanup_rc = eval_stack_dispose_entry(stack, &left_e);
-        return cleanup_rc != 0 ? cleanup_rc : ENOMEM;
+    /* Apply constant filter on right child (from FILTER wrappers collected
+     * during plan generation).  Use session-level cache (Issue #386): the
+     * filtered relation is owned by sess->filt_cache and must NOT be
+     * destroyed here.  right_filtered remains NULL for the cached path.
+     * The cache reports itself unavailable while a lease defers a rebuild
+     * or blocks growth (Issue #1435), and on allocation failure; either
+     * way this op continues on an owned filtered relation. */
+    if (op->right_filter_expr.size > 0) {
+        col_rel_t *filtered = NULL;
+        if (op->right_relation && !used_right_delta) {
+            filtered = wl_columnar_filter_apply_right_filter_cached(sess,
+                    &op->right_filter_expr, op->right_relation, right);
+            if (!filtered)
+                WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
+                    "filtered cache unavailable for %s, using owned filter",
+                    op->right_relation);
+        }
+        if (filtered) {
+            right = filtered;
+            /* right_filtered stays NULL: cache owns the relation */
+        } else {
+            /* Delta path, no relation name, or cache unavailable:
+             * pool-allocated filter owned by this op */
+            filtered = wl_columnar_filter_apply_right_filter_governed(
+                &op->right_filter_expr, right, sess->delta_pool, sess->intern,
+                sess->memory_governor ? sess->memory_governor :
+                right->memory_governor);
+            if (!filtered) {
+                int cleanup_rc = eval_stack_dispose_entry(stack, &left_e);
+                return cleanup_rc != 0 ? cleanup_rc : ENOMEM;
+            }
+            right = filtered;
+            right_filtered = filtered;
+        }
     }
 
     /* Materialization cache: reuse previous join result when available.
@@ -2747,72 +2753,59 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
         return wl_columnar_join_publish_after_left(stack, &left_e, out, false);
     }
 
-    /* Right-side delta substitution (same logic as col_op_join) */
-    bool used_right_delta = false;
-    if (op->delta_mode == WL_DELTA_FORCE_DELTA && op->right_relation) {
-        char rdname[256];
-        snprintf(rdname, sizeof(rdname), "$d$%s", op->right_relation);
-        col_rel_t *rdelta = session_find_rel(sess, rdname);
-        /* Issue #472: mirror VARIABLE op retraction-aware pattern —
-         * fall back to $r$<name> when retraction_seeded at iteration 0. */
-        if (!rdelta && sess->retraction_seeded
-            && sess->current_iteration == 0) {
-            if (retraction_rel_name(op->right_relation, rdname,
-                sizeof(rdname)) == 0)
-                rdelta = session_find_rel(sess, rdname);
+    wl_columnar_join_selection_t selection = wl_columnar_join_select_right(
+        op, sess, right, left_e.is_delta);
+    right = selection.right;
+    bool used_right_delta = selection.used_right_delta;
+    if (selection.force_empty) {
+        uint32_t ocols = col_join_output_width(left_e.rel, right, op);
+        col_rel_t *empty = col_rel_new_auto("$join_diff_empty", ocols);
+        if (!empty) {
+            return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
         }
-        if (rdelta && rdelta->nrows > 0) {
-            right = rdelta;
-            used_right_delta = true;
-        } else if (sess->current_iteration > 0 || sess->delta_seeded
-            || sess->retraction_seeded) {
-            uint32_t ocols = col_join_output_width(left_e.rel, right, op);
-            col_rel_t *empty = col_rel_new_auto("$join_diff_empty", ocols);
-            if (!empty) {
-                return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
-            }
-            /* The schema copy still reads the left input (#1376). */
-            if (col_join_set_output_types(empty, left_e.rel, right, op) != 0) {
-                col_rel_destroy(empty);
-                return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
-            }
-            return wl_columnar_join_publish_after_left(stack, &left_e, empty,
-                       false);
+        /* The schema copy still reads the left input (#1376). */
+        if (col_join_set_output_types(empty, left_e.rel, right, op) != 0) {
+            col_rel_destroy(empty);
+            return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
         }
-    } else if (op->delta_mode != WL_DELTA_FORCE_FULL && op->right_relation
-        && (!left_e.is_delta || (sess->tdd_outbound_only_active
-        && sess->current_iteration > 0))) {
-        char rdname[256];
-        snprintf(rdname, sizeof(rdname), "$d$%s", op->right_relation);
-        col_rel_t *rdelta = session_find_rel(sess, rdname);
-        if (rdelta && (((rdelta->nrows > 0
-            && rdelta->nrows < right->nrows) || (rdelta->nrows > 0
-            && sess->tdd_subpass_active))
-            || (sess->tdd_outbound_only_active
-            && sess->current_iteration > 0))) {
-            right = rdelta;
-            used_right_delta = true;
-        }
-    }
-    /* Issue #472: Retraction right-pass (same as col_op_join). */
-    if (!used_right_delta && sess->retraction_right_pass
-        && sess->current_iteration == 0 && op->right_relation) {
-        char rdname[256];
-        if (retraction_rel_name(op->right_relation, rdname,
-            sizeof(rdname)) == 0) {
-            col_rel_t *rdelta = session_find_rel(sess, rdname);
-            if (rdelta && rdelta->nrows > 0) {
-                right = rdelta;
-                used_right_delta = true;
-            }
-        }
+        return wl_columnar_join_publish_after_left(stack, &left_e, empty,
+                   false);
     }
 
-    right = wl_columnar_join_filter_right(op, sess, right, used_right_delta,
-            &right_filtered);
-    if (!right) {
-        int cleanup_rc = eval_stack_dispose_entry(stack, &left_e);
-        return cleanup_rc != 0 ? cleanup_rc : ENOMEM;
+    /* Apply constant filter on right child (from FILTER wrappers collected
+     * during plan generation).  Use session-level cache (Issue #386): the
+     * filtered relation is owned by sess->filt_cache and must NOT be
+     * destroyed here.  right_filtered remains NULL for the cached path.
+     * The cache reports itself unavailable while a lease defers a rebuild
+     * or blocks growth (Issue #1435), and on allocation failure; either
+     * way this op continues on an owned filtered relation. */
+    if (op->right_filter_expr.size > 0) {
+        col_rel_t *filtered = NULL;
+        if (op->right_relation && !used_right_delta) {
+            filtered = wl_columnar_filter_apply_right_filter_cached(sess,
+                    &op->right_filter_expr, op->right_relation, right);
+            if (!filtered)
+                WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
+                    "filtered cache unavailable for %s, using owned filter",
+                    op->right_relation);
+        }
+        if (filtered) {
+            right = filtered;
+            /* right_filtered stays NULL: cache owns the relation */
+        } else {
+            /* Delta path, no relation name, or cache unavailable:
+             * pool-allocated filter owned by this op */
+            filtered = wl_columnar_filter_apply_right_filter_governed(
+                &op->right_filter_expr, right, sess->delta_pool, sess->intern,
+                sess->memory_governor ? sess->memory_governor :
+                right->memory_governor);
+            if (!filtered) {
+                int cleanup_rc = eval_stack_dispose_entry(stack, &left_e);
+                return cleanup_rc != 0 ? cleanup_rc : ENOMEM;
+            }
+            right = filtered;
+            right_filtered = filtered;
+        }
     }
 
     /* Materialization cache check */
