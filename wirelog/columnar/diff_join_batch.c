@@ -16,9 +16,19 @@
 #include <string.h>
 
 #ifdef WL_TEST_JOIN_BATCH_DESCRIPTOR_HOOKS
+#if defined(_MSC_VER)
+static __declspec(thread) uint32_t test_fail_alloc_at;
+static __declspec(thread) uint32_t test_alloc_count;
+static __declspec(thread) bool test_fail_commit;
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 static _Thread_local uint32_t test_fail_alloc_at;
 static _Thread_local uint32_t test_alloc_count;
 static _Thread_local bool test_fail_commit;
+#else
+static __thread uint32_t test_fail_alloc_at;
+static __thread uint32_t test_alloc_count;
+static __thread bool test_fail_commit;
+#endif
 
 void
 wl_columnar_diff_join_batch_test_fail_allocation_at(uint32_t n)
