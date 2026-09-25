@@ -2159,7 +2159,7 @@ test_timestamp_cons_governor_denial(void)
     GOV_CHECK(denied, "denied governor");
     sess.memory_governor = denied;
     eval_entry_t *entry = &stack.items[stack.top - 1];
-    GOV_CHECK(col_op_consolidate(&stack, &sess) == ENOMEM
+    GOV_CHECK(col_op_consolidate(&stack, &sess) == ENOSPC
         && stack.top == 1 && entry->rel == source && !entry->owned
         && source->nrows == 1 && source->timestamps[0].iteration == 8,
         "denial lost borrowed entry");
