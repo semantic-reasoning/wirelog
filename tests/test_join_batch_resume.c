@@ -1466,7 +1466,8 @@ test_lease_released_on_every_path(void)
     base_pins = entry->pin_count - 1u;
     rc = col_join_batch_run_to_relation(cont, f.sess, f.out);
     uint64_t output_reservation = f.out->retained_reserved_bytes
-        + f.out->descriptor_reserved_bytes;
+        + f.out->descriptor_reserved_bytes
+        + f.out->metadata_reserved_bytes;
     wl_columnar_continuation_destroy(cont);
     cont = NULL;
     if (rc != 0 || entry->pin_count != base_pins || f.out->nrows != 40u
@@ -1498,7 +1499,8 @@ test_lease_released_on_every_path(void)
     cont = NULL;
     if (entry->pin_count != base_pins
         || reserved_of(f.sess) != reservation_base
-        + f.out->retained_reserved_bytes + f.out->descriptor_reserved_bytes) {
+        + f.out->retained_reserved_bytes + f.out->descriptor_reserved_bytes
+        + f.out->metadata_reserved_bytes) {
         FAIL("destroy after cancel leaked or double-released producer state");
         goto out;
     }
@@ -1520,7 +1522,8 @@ test_lease_released_on_every_path(void)
     wl_columnar_continuation_destroy(cont);
     cont = NULL;
     if (reserved_of(f.sess) != reservation_base
-        + f.out->retained_reserved_bytes + f.out->descriptor_reserved_bytes) {
+        + f.out->retained_reserved_bytes + f.out->descriptor_reserved_bytes
+        + f.out->metadata_reserved_bytes) {
         FAIL("destroy after pre-batch cancel leaked producer reservation");
         goto out;
     }
@@ -1530,7 +1533,8 @@ test_lease_released_on_every_path(void)
     ((col_arr_entry_t *)entry)->pin_count = base_pins;
     if (rc != EOVERFLOW || cont != NULL
         || reserved_of(f.sess) != reservation_base
-        + f.out->retained_reserved_bytes + f.out->descriptor_reserved_bytes) {
+        + f.out->retained_reserved_bytes + f.out->descriptor_reserved_bytes
+        + f.out->metadata_reserved_bytes) {
         FAIL("pin overflow leaked producer descriptor admission");
         goto out;
     }
@@ -1590,7 +1594,8 @@ test_lease_released_on_every_path(void)
     cont = NULL;
     if (entry->pin_count != base_pins
         || reserved_of(f.sess) != reservation_base
-        + f.out->retained_reserved_bytes + f.out->descriptor_reserved_bytes) {
+        + f.out->retained_reserved_bytes + f.out->descriptor_reserved_bytes
+        + f.out->metadata_reserved_bytes) {
         FAIL("post-denial create leaked its pin or producer reservation");
         goto out;
     }
@@ -1603,8 +1608,8 @@ out:
 
 /* The producer's descriptor reservation grows by exactly the additional
  * key-index bytes and right-side probe-row bytes.  Subtract the independently
- * computed 64-row batch relation reservation so this check isolates the
- * producer descriptor for narrow and wide schemas. */
+ * computed batch relation storage, descriptor, and metadata reservations so
+ * this check isolates the producer descriptor for narrow and wide schemas. */
 static bool
 descriptor_footprint(uint32_t key_count, uint32_t right_ncols,
     uint64_t *bytes_out)
@@ -1624,6 +1629,8 @@ descriptor_footprint(uint32_t key_count, uint32_t right_ncols,
     int64_t left_row[3] = { 1, 2, 3 };
     int64_t right_row[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
     uint64_t batch_bytes;
+    uint64_t batch_descriptor;
+    uint64_t batch_metadata;
     uint64_t baseline;
     uint64_t batch_budget;
     wl_columnar_continuation_t *cont = NULL;
@@ -1661,14 +1668,23 @@ descriptor_footprint(uint32_t key_count, uint32_t right_ncols,
     if (!out || col_join_set_output_types(out, left, sess->rels[0], &op) != 0
         || !col_rel_retained_bytes_for(out, 64u, &batch_bytes))
         goto done;
+    batch_descriptor = sizeof(col_rel_t) + sizeof("$join_batch")
+        + sizeof(wl_columnar_memory_reservation_t);
+    batch_metadata = 3u + (uint64_t)out->ncols
+        * (sizeof(char *) + sizeof(wirelog_column_type_t)
+        + sizeof(struct ArrowSchema *) + sizeof(struct ArrowSchema)
+        + 2u);
+    for (uint32_t i = 0; i < out->ncols; i++)
+        batch_metadata += 2u * (strlen(out->col_names[i]) + 1u);
     batch_budget = batch_bytes;
     baseline = reserved_of(sess);
     int create_rc = col_join_batch_producer_create(sess, &op, left, false,
             lk, rk, key_count, batch_budget, &cont);
-    if (create_rc != 0 || !cont
-        || reserved_of(sess) <= baseline + batch_bytes)
+    if (create_rc != 0 || !cont || reserved_of(sess) <= baseline
+        + batch_bytes + batch_descriptor + batch_metadata)
         goto done;
-    *bytes_out = reserved_of(sess) - baseline - batch_bytes;
+    *bytes_out = reserved_of(sess) - baseline - batch_bytes
+        - batch_descriptor - batch_metadata;
     ok = *bytes_out >= (uint64_t)sizeof(uint32_t) * key_count * 2u
         + (uint64_t)sizeof(int64_t) * right_ncols;
 

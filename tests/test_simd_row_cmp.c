@@ -98,6 +98,15 @@ typedef struct {
         const void *identity;
     } descriptor_reservation;
     uint64_t descriptor_reserved_bytes;
+    struct {
+        void *governor;
+        uint64_t bytes;
+        uint64_t replacement_bytes;
+        uint64_t owner_bits;
+        uint64_t state;
+        const void *identity;
+    } metadata_reservation;
+    uint64_t metadata_reserved_bytes;
     uint8_t memory_budget_denial_pending;
     struct {
         void *governor;
