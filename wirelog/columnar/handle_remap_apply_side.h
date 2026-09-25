@@ -143,9 +143,8 @@ wl_handle_remap_apply_session_side_relations(struct wl_col_session_t *sess,
  *      include the (now stale) handle column values.
  *
  *   2. Frees and zeroes the per-relation row-dedup hash:
- *           free(rel->dedup_slots);
- *           rel->dedup_slots = NULL;
- *           rel->dedup_cap = 0; rel->dedup_count = 0;
+ *           wl_columnar_eval_dedup_set_clear(rel);
+ *      The helper frees physical slots before releasing their token.
  *      The next consolidation rebuilds the dedup table from the
  *      rewritten row data (eval.c).  Setting only the pointer to
  *      NULL would leak the prior allocation.

@@ -2905,10 +2905,26 @@ test_pool_relation_promotion_rollback_restores_token_identity(void)
             "pool-move-rollback", 1);
     int64_t row[] = { 7 };
     int ok = old != NULL && pool_rel != NULL;
+    if (ok) {
+        pool_rel->dedup_slots = calloc(4u, sizeof(uint64_t));
+        ok = pool_rel->dedup_slots != NULL;
+        if (ok) {
+            pool_rel->dedup_slots[1] = 1u;
+            pool_rel->dedup_cap = 4u;
+            pool_rel->dedup_count = 1u;
+            ok = col_rel_attach_memory_governor(pool_rel,
+                    coord->memory_governor) == 0;
+        }
+    }
+    uint64_t *dedup_slots = pool_rel ? pool_rel->dedup_slots : NULL;
+    uint64_t baseline = 0;
     if (ok)
         ok = col_rel_append_row(pool_rel, row) == 0
             && session_add_rel(coord, old) == 0
             && col_rel_source_reader_acquire(old, &reader) == 0;
+    if (ok)
+        baseline = wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(coord->memory_governor));
     int rc = ok ? session_add_rel(coord, pool_rel) : EINVAL;
     ok = ok && rc == EBUSY && pool_rel->pool_owned
         && pool_rel->relation_identity != 0
@@ -2917,8 +2933,16 @@ test_pool_relation_promotion_rollback_restores_token_identity(void)
         && col_rel_storage_alias_borrow_count(pool_rel) == 0
         && pool_rel->retained_reservation.identity
         == &pool_rel->retained_reservation
+        && pool_rel->retained_reserved_bytes > 0
+        && pool_rel->dedup_slots == dedup_slots
+        && pool_rel->dedup_reserved_bytes == 4u * sizeof(uint64_t)
+        && pool_rel->dedup_reservation.identity
+        == &pool_rel->dedup_reservation
+        && wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(coord->memory_governor))
+        == baseline
         && atomic_load_explicit(&pool_rel->retained_reservation.state,
-            memory_order_relaxed) == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+            memory_order_relaxed) == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
         && atomic_load_explicit(&pool_rel->source_access.state,
             memory_order_acquire) == 0
         && atomic_load_explicit(&pool_rel->descriptor_access.state,
