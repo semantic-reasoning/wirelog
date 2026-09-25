@@ -31,6 +31,9 @@ wl_dedup_token_valid(const col_rel_t *r)
            memory_order_acquire) == (uintptr_t)r);
 }
 
+static int wl_dedup_admission_rc(col_rel_t *r,
+    wl_columnar_memory_admission_status_t status);
+
 int
 wl_columnar_eval_dedup_set_bytes(const col_rel_t *r, uint64_t *bytes)
 {
@@ -60,6 +63,49 @@ wl_columnar_eval_dedup_set_bytes(const col_rel_t *r, uint64_t *bytes)
         return !r->dedup_reserved_bytes ? 0 : EINVAL;
     if (!wl_dedup_token_valid(r))
         return EBUSY;
+    return 0;
+}
+
+/* Clone the current table without changing its load factor or probe layout.
+* The image is private, but its slots must be admitted before allocation. */
+int
+wl_columnar_eval_dedup_set_clone_exact(col_rel_t *dst, const col_rel_t *src)
+{
+    wl_columnar_memory_reservation_t pending;
+    wl_columnar_memory_admission_status_t status;
+    uint64_t bytes;
+    int rc = wl_columnar_eval_dedup_set_bytes(src, &bytes);
+
+    if (rc != 0 || !dst || dst->dedup_slots || dst->dedup_reserved_bytes)
+        return rc != 0 ? rc : EINVAL;
+    if (bytes == 0)
+        return 0;
+    if (bytes > SIZE_MAX)
+        return EOVERFLOW;
+    wl_columnar_memory_reservation_init(&pending);
+    if (dst->memory_governor) {
+        status = wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(dst->memory_governor),
+            bytes, &pending);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            return wl_dedup_admission_rc(dst, status);
+    }
+    uint64_t *slots = malloc((size_t)bytes);
+    if (!slots) {
+        if (pending.bytes && !wl_columnar_memory_rollback(&pending))
+            abort();
+        return ENOMEM;
+    }
+    memcpy(slots, src->dedup_slots, (size_t)bytes);
+    if (pending.bytes && (!wl_columnar_memory_commit(&pending, dst)
+        || !wl_columnar_memory_reservation_move(&dst->dedup_reservation,
+        &pending)))
+        abort();
+    dst->dedup_slots = slots;
+    dst->dedup_cap = src->dedup_cap;
+    dst->dedup_count = src->dedup_count;
+    dst->dedup_reserved_bytes = dst->memory_governor ? bytes : 0;
     return 0;
 }
 

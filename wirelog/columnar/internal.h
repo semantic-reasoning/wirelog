@@ -578,6 +578,20 @@ typedef struct col_rel_replacement {
     bool writer_acquired;
 } col_rel_replacement_t;
 
+/* Private governed source image. The source writer remains held until commit
+ * or discard; callers may mutate only the image returned by get(). */
+typedef struct col_rel_mutable_image {
+    col_rel_t *source;
+    col_rel_t *image;
+    wl_columnar_source_access_writer_t writer;
+} col_rel_mutable_image_t;
+
+int col_rel_mutable_image_prepare(col_rel_t *source,
+    col_rel_mutable_image_t *transaction);
+col_rel_t *col_rel_mutable_image_get(col_rel_mutable_image_t *transaction);
+int col_rel_mutable_image_commit(col_rel_mutable_image_t *transaction);
+void col_rel_mutable_image_discard(col_rel_mutable_image_t *transaction);
+
 #ifdef WL_TEST_APPEND_HOOK
 /* Test-only seam for the append ownership-transition window.  This is not
  * part of the installed/public header surface. */
@@ -3540,6 +3554,8 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess);
 
 uint64_t
 wl_columnar_eval_dedup_row_hash(const col_rel_t *r, uint32_t row);
+int wl_columnar_eval_dedup_set_clone_exact(col_rel_t *dst,
+    const col_rel_t *src);
 bool
 wl_columnar_eval_dedup_set_insert(col_rel_t *r, uint64_t h);
 bool

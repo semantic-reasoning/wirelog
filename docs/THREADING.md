@@ -576,6 +576,22 @@ gate -- which reports EINVAL after a commit that in fact succeeded.
 | `relation.c:col_rel_commit_replacement_locked#4` | `dst->source_access.state` | `atomic_store_explicit` | release | Republish the captured admission state onto the committed descriptor; the release orders every field written above it before another thread can observe the gate |
 | `relation.c:col_rel_commit_replacement_locked#5` | `dst->descriptor_access.state` | `atomic_store_explicit` | release | Republish the captured peer-reader gate so a descriptor reader taken before the swap is still counted when the writer lease is released |
 
+### 5.15a `wirelog/columnar/relation.c` — mutable governed image (7 rows)
+
+The source writer stays held while a private image is prepared and mutated.
+Commit captures both gate states before replacing the descriptor, then
+restores them after moving the image's current reservations to the source.
+
+| Anchor (file:function[#N]) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `relation.c:col_rel_image_token_valid` | `token->state` | `atomic_load_explicit` | acquire | Validate a committed reservation before the image stages or transfers ownership |
+| `relation.c:col_rel_image_token_valid#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Confirm the reservation belongs to the exact source or image descriptor |
+| `relation.c:col_rel_mutable_image_commit` | `old.source_access.state` | `atomic_load_explicit` | acquire | Preserve the source writer admission state across whole-descriptor publication |
+| `relation.c:col_rel_mutable_image_commit#2` | `old.descriptor_access.state` | `atomic_load_explicit` | acquire | Preserve the descriptor gate state across the same publication |
+| `relation.c:col_rel_mutable_image_commit#3` | `source->source_access.state` | `atomic_store_explicit` | release | Republish the held source writer state after all image fields and tokens are installed |
+| `relation.c:col_rel_mutable_image_commit#4` | `source->descriptor_access.state` | `atomic_store_explicit` | release | Republish the captured descriptor gate before the writer is released |
+| `relation.c:col_rel_mutable_image_commit#5` | `old.storage_alias_borrows` | `atomic_store_explicit` | relaxed | Clear the stack retirement copy's alias count before physical cleanup; the copy is private |
+
 ### 5.16 `wirelog/columnar/memory_governor.c` and `relation.c` — atomic
 replacement admission and compaction (19 rows)
 

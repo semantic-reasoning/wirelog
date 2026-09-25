@@ -131,6 +131,234 @@ attach_payload_bytes(const col_rel_t *rel)
 }
 
 static void
+test_mutable_image_transaction(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    wl_mem_ledger_t ledger;
+    wl_mem_ledger_snapshot_t snapshot;
+    wl_mem_ledger_init(&ledger, 0);
+    make_resolution(&resolution, UINT64_C(1) << 22);
+    wl_columnar_memory_governor_ref_t *ref
+        = wl_columnar_memory_governor_ref_create(&resolution);
+    col_rel_t *source = col_rel_new_auto("mutable-source", 1);
+    col_rel_mutable_image_t txn = { 0 };
+    if (!ref || !source) {
+        CHECK(false, "mutable image fixture");
+        goto done;
+    }
+    int64_t first = 23, second = 29;
+    const col_rel_logical_col_t logical = {
+        WIRELOG_COMPOUND_KIND_SIDE, 2u, 1u
+    };
+    CHECK(col_rel_append_row(source, &first) == 0
+        && col_rel_enable_timestamps(source) == 0
+        && col_rel_apply_compound_schema(source, &logical, 1) == 0
+        && col_rel_attach_memory_governor(source, ref) == 0
+        && col_rel_reserve_merge_grid(source, 4) == 0
+        && wl_columnar_eval_dedup_set_init_from_rel(source) == 0,
+        "mutable image source has admitted payload, metadata, merge and dedup");
+    source->mem_ledger = &ledger;
+    col_rel_ledger_reconcile(source, 0);
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(ref);
+    uint64_t baseline = wl_columnar_memory_reserved(governor);
+    uint64_t image_descriptor = sizeof(col_rel_t)
+        + sizeof(wl_columnar_memory_reservation_t);
+    uint64_t image_primary = private_payload_bytes(source->ncols,
+            source->capacity, source->timestamp_capacity);
+    uint64_t incoming = image_descriptor + source->metadata_reserved_bytes
+        + source->retained_reserved_bytes + source->dedup_reserved_bytes;
+    int64_t **old_columns = source->columns;
+    uint64_t *old_dedup = source->dedup_slots;
+    uint64_t old_generation = source->view_generation;
+    source->arena_owned = true;
+    CHECK(col_rel_mutable_image_prepare(source, &txn) == EBUSY,
+        "mutable image rejects arena source");
+    source->arena_owned = false;
+    bool shared_lane = true;
+    source->col_shared = &shared_lane;
+    CHECK(col_rel_mutable_image_prepare(source, &txn) == EBUSY,
+        "mutable image rejects borrowed source");
+    source->col_shared = NULL;
+    source->retract_backup_columns = source->columns;
+    CHECK(col_rel_mutable_image_prepare(source, &txn) == EBUSY,
+        "mutable image rejects active retraction backup");
+    source->retract_backup_columns = NULL;
+    atomic_store_explicit(&source->storage_alias_borrows, 1,
+        memory_order_relaxed);
+    CHECK(col_rel_mutable_image_prepare(source, &txn) == EBUSY,
+        "mutable image rejects source with a live alias");
+    atomic_store_explicit(&source->storage_alias_borrows, 0,
+        memory_order_relaxed);
+    source->base_nrows = source->nrows + 1u;
+    CHECK(col_rel_mutable_image_prepare(source, &txn) == EBUSY
+        && col_rel_mutable_image_get(&txn) == NULL
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "mutable image rejects malformed source before admission");
+    source->base_nrows = 0;
+    uint64_t stage_floors[] = {
+        image_descriptor, image_descriptor + source->metadata_reserved_bytes,
+        image_descriptor + source->metadata_reserved_bytes + image_primary,
+        incoming - source->dedup_reserved_bytes, incoming,
+    };
+    for (size_t i = 0; i < sizeof(stage_floors) / sizeof(stage_floors[0]);
+        i++) {
+        atomic_store_explicit(&governor->usable_bytes,
+            baseline + stage_floors[i] - 1u, memory_order_release);
+        CHECK(col_rel_mutable_image_prepare(source, &txn) == ENOSPC
+            && col_rel_mutable_image_get(&txn) == NULL
+            && source->columns == old_columns
+            && source->dedup_slots == old_dedup
+            && source->view_generation == old_generation
+            && wl_columnar_memory_reserved(governor) == baseline,
+            "mutable image one-byte stage denial preserves source and credit");
+    }
+    atomic_store_explicit(&governor->usable_bytes, baseline + incoming,
+        memory_order_release);
+    wl_columnar_relation_test_fail_next_governed_copy_payload_alloc();
+    CHECK(col_rel_mutable_image_prepare(source, &txn) == ENOMEM
+        && col_rel_mutable_image_get(&txn) == NULL
+        && source->columns == old_columns
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "mutable image payload allocation failure rolls back admissions");
+    CHECK(col_rel_mutable_image_prepare(source, &txn) == 0
+        && txn.image && txn.image->name == NULL
+        && txn.image->timestamp_capacity == source->timestamp_capacity
+        && txn.image->compound_arity_len == source->compound_arity_len
+        && txn.image->compound_arity_map != source->compound_arity_map
+        && txn.image->merge_columns && txn.image->dedup_slots
+        && wl_columnar_memory_reserved(governor) == baseline + incoming,
+        "mutable image exact overlap stages all independent storage");
+    col_rel_mutable_image_t second_txn = { 0 };
+    CHECK(col_rel_mutable_image_prepare(source, &second_txn) == EBUSY
+        && col_rel_mutable_image_get(&second_txn) == NULL,
+        "mutable image holds source writer until completion");
+    col_rel_mutable_image_discard(&txn);
+    CHECK(source->columns == old_columns && source->dedup_slots == old_dedup
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "mutable image discard frees image before returning credit");
+    CHECK(col_rel_mutable_image_prepare(source, &txn) == 0,
+        "mutable image can retry after discard");
+    col_rel_t *image = col_rel_mutable_image_get(&txn);
+    if (image) {
+        atomic_store_explicit(&governor->usable_bytes,
+            baseline + incoming + 65536u, memory_order_release);
+        uint32_t old_cap = image->capacity;
+        for (uint32_t i = 0; i <= old_cap; i++)
+            CHECK(col_rel_append_row(image, &second) == 0,
+                "mutable image can grow independently");
+        const wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+        CHECK(col_rel_set_column_types(image, &type, 1) == 0,
+            "mutable image can grow metadata independently");
+        for (uint64_t h = 1; h <= 720u; h++)
+            CHECK(wl_columnar_eval_dedup_set_insert(image, h),
+                "mutable image can grow dedup independently");
+        uint64_t image_payload = image->retained_reserved_bytes;
+        uint64_t image_metadata = image->metadata_reserved_bytes;
+        uint64_t image_dedup = image->dedup_reserved_bytes;
+        CHECK(source->nrows == 1 && source->columns[0][0] == first,
+            "mutable image mutation does not change source");
+        CHECK(col_rel_mutable_image_commit(&txn) == 0
+            && source->nrows == old_cap + 2u
+            && source->columns[0][1] == second
+            && source->columns != old_columns
+            && source->dedup_slots != old_dedup
+            && source->retained_reserved_bytes == image_payload
+            && source->metadata_reserved_bytes == image_metadata
+            && source->dedup_reserved_bytes == image_dedup
+            && source->column_types[0] == WIRELOG_TYPE_INT64
+            && source->retained_reservation.owner_bits == (uintptr_t)source
+            && source->dedup_reservation.owner_bits == (uintptr_t)source,
+            "mutable image commit transfers live image tokens and contents");
+        wl_mem_ledger_snapshot(&ledger, &snapshot);
+        CHECK(snapshot.subsys_bytes[WL_MEM_SUBSYS_TIMESTAMP]
+            == col_rel_timestamp_ledger_bytes(source)
+            && source->ledger_ts_bytes
+            == col_rel_timestamp_ledger_bytes(source),
+            "mutable image timestamp growth reconciles source ledger");
+    }
+    col_rel_mutable_image_discard(&txn);
+done:
+    col_rel_destroy(source);
+    wl_mem_ledger_snapshot(&ledger, &snapshot);
+    CHECK(snapshot.current_bytes == 0,
+        "mutable image teardown clears source ledger");
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "mutable image teardown releases every token");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_mutable_image_pool_name_handoff(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    make_resolution(&resolution, 1u << 20);
+    wl_columnar_memory_governor_ref_t *ref
+        = wl_columnar_memory_governor_ref_create(&resolution);
+    col_rel_t *source = NULL;
+    col_rel_mutable_image_t txn = { 0 };
+    if (!ref || wl_columnar_relation_alloc_governed(&source, NULL, ref)
+        != 0) {
+        CHECK(false, "mutable pool-name handoff fixture");
+        goto done;
+    }
+    /* This is the transient heap shape after pool-name promotion: the heap
+     * descriptor has no name bytes, while the separate name token is live. */
+    const char *name = "promoted-name";
+    uint64_t name_bytes = strlen(name) + 1u;
+    source->name = malloc((size_t)name_bytes);
+    if (!source->name) {
+        CHECK(false, "mutable promoted source name allocation");
+        goto done;
+    }
+    memcpy(source->name, name, (size_t)name_bytes);
+    wl_columnar_memory_reservation_t pending;
+    wl_columnar_memory_reservation_init(&pending);
+    wl_columnar_memory_admission_status_t status
+        = wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(ref), name_bytes, &pending);
+    CHECK(source->name && (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+        || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+        && wl_columnar_memory_commit(&pending, source)
+        && wl_columnar_memory_reservation_move(
+            &source->pool_name_reservation, &pending),
+        "mutable promoted source owns separate name token");
+    source->pool_name_reserved_bytes = name_bytes;
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(ref);
+    uint64_t baseline = wl_columnar_memory_reserved(governor);
+    source->descriptor_reserved_bytes += name_bytes;
+    CHECK(col_rel_mutable_image_prepare(source, &txn) == EBUSY
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "mutable image rejects duplicate descriptor and pool name coverage");
+    source->descriptor_reserved_bytes -= name_bytes;
+    CHECK(col_rel_mutable_image_prepare(source, &txn) == 0,
+        "mutable promoted source prepares with pool-name credit");
+    col_rel_mutable_image_discard(&txn);
+    CHECK(source->pool_name_reserved_bytes == name_bytes
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "mutable promoted discard preserves pool-name token");
+    CHECK(col_rel_mutable_image_prepare(source, &txn) == 0
+        && col_rel_mutable_image_commit(&txn) == 0
+        && source->pool_name_reserved_bytes == name_bytes
+        && source->pool_name_reservation.owner_bits == (uintptr_t)source
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "mutable promoted commit preserves source name and pool-name token");
+done:
+    col_rel_mutable_image_discard(&txn);
+    col_rel_destroy(source);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "mutable promoted teardown releases name and descriptor");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
 test_dedup_attach_init_growth_and_clear(void)
 {
     wl_columnar_memory_resolution_t resolution;
@@ -3813,6 +4041,8 @@ cleanup:
 int
 main(void)
 {
+    test_mutable_image_transaction();
+    test_mutable_image_pool_name_handoff();
     test_dedup_attach_init_growth_and_clear();
     test_dedup_full_probe_and_malformed_shape();
     test_dedup_replacement_overlap();
