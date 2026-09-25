@@ -53,6 +53,16 @@ wl_columnar_join_dispose_left(eval_stack_t *stack, eval_entry_t *left,
 }
 
 static int
+wl_columnar_join_memory_error(wl_col_session_t *sess, int rc)
+{
+    if (rc == ENOSPC) {
+        sess->memory_budget_denied = true;
+        return ENOMEM;
+    }
+    return rc;
+}
+
+static int
 wl_columnar_join_publish_after_left(eval_stack_t *stack, eval_entry_t *left,
     col_rel_t *out, bool is_delta)
 {
@@ -1202,7 +1212,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             if (right_filtered)
                 col_rel_destroy(right_filtered);
             if (copy_rc != 0)
-                return wl_columnar_join_dispose_left(stack, &left_e, copy_rc);
+                return wl_columnar_join_dispose_left(stack, &left_e,
+                           wl_columnar_join_memory_error(sess, copy_rc));
             return wl_columnar_join_publish_after_left(stack, &left_e, copy,
                        left_e.is_delta || used_right_delta);
         }
@@ -2002,12 +2013,13 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         int copy_rc = wl_columnar_relation_deep_copy_governed(out, &copy,
                 effective);
         if (copy_rc != 0) {
-            if (copy_rc == ENOMEM
+            if ((copy_rc == ENOMEM || copy_rc == ENOSPC)
                 && wl_columnar_join_original_is_accounted(out, effective))
                 return wl_columnar_join_publish_after_left(stack, &left_e,
                            out, result_is_delta);
             col_rel_destroy(out);
-            return wl_columnar_join_dispose_left(stack, &left_e, copy_rc);
+            return wl_columnar_join_dispose_left(stack, &left_e,
+                       wl_columnar_join_memory_error(sess, copy_rc));
         }
         int cache_rc = col_mat_cache_insert(&sess->mat_cache, left, right, out);
         bool publish_original = (cache_rc == ENOMEM || cache_rc == ENOSPC)
@@ -2015,7 +2027,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         if (cache_rc != 0 && !publish_original) {
             col_rel_destroy(copy);
             col_rel_destroy(out);
-            return wl_columnar_join_dispose_left(stack, &left_e, cache_rc);
+            return wl_columnar_join_dispose_left(stack, &left_e,
+                       wl_columnar_join_memory_error(sess, cache_rc));
         }
         int cleanup_rc = wl_columnar_join_dispose_left(stack, &left_e, 0);
         if (cleanup_rc != 0) {
@@ -2854,7 +2867,8 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
             if (right_filtered)
                 col_rel_destroy(right_filtered);
             if (copy_rc != 0)
-                return wl_columnar_join_dispose_left(stack, &left_e, copy_rc);
+                return wl_columnar_join_dispose_left(stack, &left_e,
+                           wl_columnar_join_memory_error(sess, copy_rc));
             return wl_columnar_join_publish_after_left(stack, &left_e, copy,
                        left_e.is_delta || used_right_delta);
         }
@@ -3485,16 +3499,16 @@ join_success:
                 col_rel_destroy(out);
                 out = NULL;
                 publish = NULL;
-                primary_rc = cache_rc;
+                primary_rc = wl_columnar_join_memory_error(sess, cache_rc);
             }
-        } else if (copy_rc == ENOMEM
+        } else if ((copy_rc == ENOMEM || copy_rc == ENOSPC)
             && wl_columnar_join_original_is_accounted(out, effective)) {
             /* The existing committed token covers the one published owner. */
         } else {
             col_rel_destroy(out);
             out = NULL;
             publish = NULL;
-            primary_rc = copy_rc;
+            primary_rc = wl_columnar_join_memory_error(sess, copy_rc);
         }
     }
     /* End internal source readers before testing externally held input

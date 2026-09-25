@@ -1196,10 +1196,13 @@ col_rel_attach_memory_governor(col_rel_t *r,
             wl_columnar_memory_governor_ref_get(memory_governor), bytes,
             &r->descriptor_reservation);
         if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
-            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                r->memory_budget_denial_pending = true;
             return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
                 : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
                 : EINVAL;
+        }
         if (!wl_columnar_memory_commit(&r->descriptor_reservation, r)) {
             (void)wl_columnar_memory_rollback(&r->descriptor_reservation);
             return EINVAL;
@@ -1207,6 +1210,7 @@ col_rel_attach_memory_governor(col_rel_t *r,
         r->descriptor_reserved_bytes = bytes;
     }
     r->memory_governor = memory_governor;
+    r->memory_budget_denial_pending = false;
     wl_columnar_memory_governor_ref_retain(memory_governor);
     wl_columnar_memory_reservation_init(&r->retained_reservation);
     return 0;

@@ -12309,7 +12309,8 @@ test_governed_pool_publication(unsigned mode)
         && atomic_load_explicit(&result->retained_reservation.owner_bits,
         memory_order_acquire) == (uintptr_t)result
         && result->retained_reserved_bytes == bytes
-        && reserved_on(ref) == reserved
+        && result->descriptor_reserved_bytes > 0
+        && reserved_on(ref) == reserved + result->descriptor_reserved_bytes
         && candidate->memory_governor == NULL
         && candidate->retained_reserved_bytes == 0
         && result->timestamps[0].multiplicity == -3,
