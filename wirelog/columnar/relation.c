@@ -1834,9 +1834,7 @@ col_rel_set_schema_impl_capacity(col_rel_t *r, uint32_t ncols,
         old_schema = r->schema;
         memset(&r->schema, 0, sizeof(r->schema));
         r->schema_ok = false;
-        if (old_timestamp_capacity > initial_capacity)
-            initial_capacity = old_timestamp_capacity;
-        else if (old_timestamps)
+        if (old_timestamp_capacity > initial_capacity || old_timestamps)
             initial_capacity = old_timestamp_capacity;
     }
 
