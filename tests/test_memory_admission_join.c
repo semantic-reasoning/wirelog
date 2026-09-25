@@ -74,6 +74,44 @@ static bool test_diff_commit_refusal_witnessed;
 
 void wl_columnar_relation_test_fail_next_governed_copy_payload_alloc(void);
 extern bool wl_columnar_join_test_fail_next_key_scratch_alloc;
+extern int (*wl_columnar_join_test_submit_override)(wl_work_queue_t *,
+    void (*)(void *), void *);
+extern uint32_t wl_columnar_join_test_last_keyed_workers;
+extern void (*wl_columnar_join_test_before_pair_growth)(
+    wl_columnar_memory_governor_t *, uint64_t, uint64_t);
+extern bool wl_columnar_join_test_fail_pair_realloc;
+extern atomic_bool wl_columnar_join_test_fail_pair_commit;
+extern uint32_t wl_columnar_join_test_pair_cap_limit_override;
+extern bool wl_columnar_join_test_last_cross_ctx_admitted;
+extern bool wl_columnar_join_test_last_keyed_parallel_admitted;
+extern bool wl_columnar_join_test_last_semijoin_parallel_admitted;
+
+static uint32_t test_join_submit_calls;
+static uint32_t test_join_submit_fail_at;
+static bool test_pair_growth_denial_injected;
+
+static void
+deny_pair_growth_with_governor_limit(wl_columnar_memory_governor_t *governor,
+    uint64_t old_bytes, uint64_t new_bytes)
+{
+    if (!governor || old_bytes == 0 || new_bytes == 0)
+        return;
+    uint64_t reserved = wl_columnar_memory_reserved(governor);
+    if (reserved > UINT64_MAX - new_bytes)
+        return;
+    atomic_store_explicit(&governor->usable_bytes,
+        reserved + new_bytes - 1u, memory_order_release);
+    test_pair_growth_denial_injected = true;
+}
+
+static int
+fail_join_submit_at(wl_work_queue_t *wq, void (*work_fn)(void *), void *ctx)
+{
+    test_join_submit_calls++;
+    if (test_join_submit_calls == test_join_submit_fail_at)
+        return ENOMEM;
+    return wl_workqueue_submit(wq, work_fn, ctx);
+}
 
 static void
 try_reclaim_during_governed_copy(const col_rel_t *source)
@@ -363,6 +401,23 @@ make_left(uint32_t n, uint32_t keys)
         return NULL;
     for (uint32_t i = 0; i < n; i++) {
         int64_t row[] = { (int64_t)(keys ? i % keys : 0), (int64_t)i };
+        if (col_rel_append_row(left, row) != 0) {
+            col_rel_destroy(left);
+            return NULL;
+        }
+    }
+    return left;
+}
+
+static col_rel_t *
+make_split_left(uint32_t n, uint32_t first_key_rows)
+{
+    const char *cn[] = { "k", "v" };
+    col_rel_t *left = make_rel("left", 2, cn);
+    if (!left)
+        return NULL;
+    for (uint32_t i = 0; i < n; i++) {
+        int64_t row[] = { i < first_key_rows ? 0 : 1, (int64_t)i };
         if (col_rel_append_row(left, row) != 0) {
             col_rel_destroy(left);
             return NULL;
@@ -1430,6 +1485,146 @@ out:
     destroy_session(sess);
 }
 
+static void
+test_parallel_cross_source_governor_accounts_contexts(void)
+{
+    wl_col_session_t *sess = make_session_workers(64ull * 1024 * 1024, 2);
+    wl_columnar_memory_governor_ref_t *source_ref
+        = make_governor(64ull * 1024 * 1024);
+    wl_columnar_memory_governor_ref_t *session_ref
+        = sess ? sess->memory_governor : NULL;
+    col_rel_t *right = make_right(13, 1);
+    col_rel_t *left = make_left(7, 2);
+    wl_plan_op_t op;
+    eval_entry_t result = { 0 };
+    uint64_t left_bytes = 0;
+
+    TEST("parallel cross JOIN admits source-governed worker contexts");
+    setenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS", "2", 1);
+    if (!sess || !source_ref || !right || !left) {
+        FAIL("fixture");
+        goto out;
+    }
+    if (col_rel_attach_memory_governor(left, source_ref) != 0) {
+        FAIL("left source governor setup");
+        goto out;
+    }
+    left_bytes = left->retained_reserved_bytes;
+    sess->memory_governor = NULL;
+    if (session_add_rel(sess, right) != 0) {
+        sess->memory_governor = session_ref;
+        FAIL("right relation setup");
+        goto out;
+    }
+    right = NULL;
+    init_cross_op(&op);
+    wl_columnar_join_test_last_cross_ctx_admitted = false;
+    if (run_join(sess, left, &op, &result) != 0 || !result.rel
+        || result.rel->nrows != 91u
+        || result.rel->memory_governor != source_ref
+        || !admission_invariant(result.rel)
+        || !wl_columnar_join_test_last_cross_ctx_admitted
+        || sess->wq == NULL) {
+        FAIL("parallel cross scratch did not use the source governor");
+        goto out_entry;
+    }
+    col_rel_destroy(result.rel);
+    result.rel = NULL;
+    col_mat_cache_clear(&sess->mat_cache);
+    if (reserved_for(source_ref) != left_bytes) {
+        FAIL("parallel cross cleanup retained context or output credit");
+        goto out;
+    }
+    PASS();
+    goto out_entry;
+out_entry:
+    if (result.owned && result.rel)
+        col_rel_destroy(result.rel);
+out:
+    if (sess)
+        sess->memory_governor = session_ref;
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+    wl_columnar_memory_governor_ref_release(source_ref);
+}
+
+static void
+test_parallel_semijoin_source_governor_accounts_scratch(void)
+{
+    wl_col_session_t *sess = make_session_workers(64ull * 1024 * 1024, 2);
+    wl_columnar_memory_governor_ref_t *source_ref
+        = make_governor(64ull * 1024 * 1024);
+    wl_columnar_memory_governor_ref_t *session_ref
+        = sess ? sess->memory_governor : NULL;
+    col_rel_t *right = make_right(1, 2);
+    col_rel_t *left = make_left(65, 1);
+    const char *left_keys[] = { "k" };
+    const char *right_keys[] = { "k" };
+    wl_plan_op_t op = { 0 };
+    eval_entry_t result = { 0 };
+    uint64_t left_bytes = 0;
+
+    TEST("parallel SEMI JOIN admits source-governed worker scratch");
+    setenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS", "2", 1);
+    if (!sess || !source_ref || !right || !left) {
+        FAIL("fixture");
+        goto out;
+    }
+    if (col_rel_attach_memory_governor(left, source_ref) != 0) {
+        FAIL("left source governor setup");
+        goto out;
+    }
+    left_bytes = left->retained_reserved_bytes;
+    sess->memory_governor = NULL;
+    if (session_add_rel(sess, right) != 0) {
+        sess->memory_governor = session_ref;
+        FAIL("right relation setup");
+        goto out;
+    }
+    right = NULL;
+    op.right_relation = "right";
+    op.key_count = 1;
+    op.left_keys = left_keys;
+    op.right_keys = right_keys;
+    wl_columnar_join_test_last_semijoin_parallel_admitted = false;
+    if (run_filter_join(wl_columnar_semijoin_op, sess, left, &op, &result)
+        != 0 || !result.rel || result.rel->nrows != 65u
+        || result.rel->memory_governor != source_ref
+        || !admission_invariant(result.rel)
+        || !wl_columnar_join_test_last_semijoin_parallel_admitted
+        || sess->wq == NULL) {
+        FAIL("parallel SEMI scratch did not use the source governor");
+        goto out_entry;
+    }
+    for (uint32_t row = 0; row < result.rel->nrows; row++) {
+        if (col_rel_get(result.rel, row, 0) != 0
+            || col_rel_get(result.rel, row, 1) != row) {
+            FAIL("parallel SEMI output differs from matching input rows");
+            goto out_entry;
+        }
+    }
+    col_rel_destroy(result.rel);
+    result.rel = NULL;
+    if (reserved_for(source_ref) != left_bytes) {
+        FAIL("parallel SEMI cleanup retained scratch or output credit");
+        goto out;
+    }
+    PASS();
+    goto out_entry;
+out_entry:
+    if (result.owned && result.rel)
+        col_rel_destroy(result.rel);
+out:
+    if (sess)
+        sess->memory_governor = session_ref;
+    unsetenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS");
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+    wl_columnar_memory_governor_ref_release(source_ref);
+}
+
 /* ---- case 9: bulk reserve on a governed keyed output -------------------- */
 
 /*
@@ -1884,6 +2079,344 @@ test_parallel_diff_true_admission_denial_rolls_back(void)
     }
     PASS();
 out:
+    unsetenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS");
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+}
+
+static void
+run_parallel_diff_partial_submit_failure(uint32_t fail_at,
+    const char *test_name)
+{
+    wl_col_session_t *sess = make_session_workers(64ull * 1024 * 1024, 2);
+    col_rel_t *right = make_right(1, 2);
+    col_rel_t *left = make_left(65, 1);
+    wl_plan_op_t op;
+    eval_entry_t result = { 0 };
+
+    TEST(test_name);
+    setenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS", "2", 1);
+    if (!sess || !right || !left) {
+        FAIL("fixture");
+        goto out;
+    }
+    if (session_add_rel(sess, right) != 0) {
+        FAIL("right relation setup");
+        goto out;
+    }
+    right = NULL;
+    init_diff_keyed_op(&op);
+    test_join_submit_calls = 0;
+    test_join_submit_fail_at = fail_at;
+    wl_columnar_join_test_submit_override = fail_join_submit_at;
+    int rc = run_diff_join(sess, left, &op, &result);
+    wl_columnar_join_test_submit_override = NULL;
+    if (rc != ENOMEM || test_join_submit_calls != fail_at || result.rel
+        || left->nrows != 65 || reserved_of(sess) != 0u
+        || sess->mat_cache.count != 0 || sess->diff_arr_count != 0
+        || sess->diff_txn_count != 0) {
+        FAIL("partial worker submission published or retained worker state");
+        goto out_entry;
+    }
+    if (run_diff_join(sess, left, &op, &result) != 0 || !result.rel
+        || result.rel->nrows != 130 || sess->wq == NULL
+        || sess->diff_arr_count != 1) {
+        FAIL("parallel retry did not reproduce the full differential output");
+        goto out_entry;
+    }
+    for (uint32_t row = 0; row < result.rel->nrows; row++) {
+        if (col_rel_get(result.rel, row, 0) != 0
+            || col_rel_get(result.rel, row, 1) != row / 2u
+            || col_rel_get(result.rel, row, 2) != 0
+            || col_rel_get(result.rel, row, 3) != 1u - (row % 2u)) {
+            FAIL(
+                "parallel retry rows differ from expected differential output");
+            goto out_entry;
+        }
+    }
+    PASS();
+    goto out_entry;
+out_entry:
+    if (result.owned && result.rel)
+        col_rel_destroy(result.rel);
+out:
+    wl_columnar_join_test_submit_override = NULL;
+    unsetenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS");
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+}
+
+static void
+test_parallel_diff_partial_count_submit_drains_and_retries(void)
+{
+    run_parallel_diff_partial_submit_failure(2u,
+        "parallel diff partial count submission drains and retries");
+}
+
+static void
+test_parallel_diff_partial_fill_submit_drains_and_retries(void)
+{
+    run_parallel_diff_partial_submit_failure(4u,
+        "parallel diff partial fill submission drains and retries");
+}
+
+static void
+test_parallel_diff_w8_dispatch_and_output(void)
+{
+    wl_col_session_t *sess = make_session_workers(64ull * 1024 * 1024, 8);
+    col_rel_t *right = make_right(1, 2);
+    col_rel_t *left = make_left(65, 1);
+    wl_plan_op_t op;
+    eval_entry_t result = { 0 };
+
+    TEST("parallel keyed diff dispatches W8 and preserves exact output");
+    setenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS", "2", 1);
+    if (!sess || !right || !left) {
+        FAIL("fixture");
+        goto out;
+    }
+    if (session_add_rel(sess, right) != 0) {
+        FAIL("right relation setup");
+        goto out;
+    }
+    right = NULL;
+    init_diff_keyed_op(&op);
+    if (run_diff_join(sess, left, &op, &result) != 0 || !result.rel
+        || result.rel->nrows != 130u || sess->wq == NULL
+        || wl_columnar_join_test_last_keyed_workers != 8u
+        || sess->diff_arr_count != 1) {
+        FAIL("eight-worker differential join did not reach expected output");
+        goto out_entry;
+    }
+    for (uint32_t row = 0; row < result.rel->nrows; row++) {
+        if (col_rel_get(result.rel, row, 0) != 0
+            || col_rel_get(result.rel, row, 1) != row / 2u
+            || col_rel_get(result.rel, row, 2) != 0
+            || col_rel_get(result.rel, row, 3) != 1u - (row % 2u)) {
+            FAIL("W8 output differs from the exact keyed-join rows");
+            goto out_entry;
+        }
+    }
+    PASS();
+    goto out_entry;
+out_entry:
+    if (result.owned && result.rel)
+        col_rel_destroy(result.rel);
+out:
+    unsetenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS");
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+}
+
+static void
+test_parallel_diff_source_governor_accounting(void)
+{
+    wl_col_session_t *sess = make_session_workers(64ull * 1024 * 1024, 2);
+    wl_columnar_memory_governor_ref_t *source_ref
+        = make_governor(64ull * 1024 * 1024);
+    wl_columnar_memory_governor_ref_t *session_ref
+        = sess ? sess->memory_governor : NULL;
+    col_rel_t *right = make_right(1, 2);
+    col_rel_t *left = make_left(65, 1);
+    wl_plan_op_t op;
+    eval_entry_t result = { 0 };
+
+    TEST("parallel keyed diff uses and releases the source-only governor");
+    setenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS", "2", 1);
+    if (!sess || !source_ref || !right || !left) {
+        FAIL("fixture");
+        goto out;
+    }
+    if (col_rel_attach_memory_governor(left, source_ref) != 0) {
+        FAIL("could not govern the borrowed left input");
+        goto out;
+    }
+    sess->memory_governor = NULL;
+    if (session_add_rel(sess, right) != 0) {
+        sess->memory_governor = session_ref;
+        FAIL("right relation setup");
+        goto out;
+    }
+    right = NULL;
+    init_diff_keyed_op(&op);
+    if (run_diff_join(sess, left, &op, &result) != 0 || !result.rel
+        || result.rel->nrows != 130u || result.rel->memory_governor
+        != source_ref || !admission_invariant(result.rel)
+        || sess->wq == NULL
+        || wl_columnar_join_test_last_keyed_workers != 2u
+        || !wl_columnar_join_test_last_keyed_parallel_admitted) {
+        FAIL("parallel diff scratch ignored the source governor");
+        goto out_entry;
+    }
+    col_rel_destroy(result.rel);
+    result.rel = NULL;
+    col_mat_cache_clear(&sess->mat_cache);
+    if (reserved_for(source_ref) != left->retained_reserved_bytes) {
+        FAIL("parallel diff cleanup retained scratch or output charges");
+        goto out;
+    }
+    PASS();
+    goto out;
+out_entry:
+    if (result.owned && result.rel)
+        col_rel_destroy(result.rel);
+out:
+    if (sess)
+        sess->memory_governor = session_ref;
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+    wl_columnar_memory_governor_ref_release(source_ref);
+}
+
+static void
+run_parallel_pair_growth_failure(bool deny_growth, bool fail_commit)
+{
+    wl_col_session_t *sess = make_session_workers(64ull * 1024 * 1024, 2);
+    col_rel_t *right = make_right(1, 1);
+    col_rel_t *left = make_split_left(100001u, 50001u);
+    wl_plan_op_t op;
+    eval_entry_t result = { 0 };
+    bool injected;
+
+    TEST(deny_growth
+        ? "parallel pair-vector growth denial restores old reservation"
+        : fail_commit
+        ? "parallel pair-vector commit failure restores reservation"
+        : "parallel pair-vector realloc failure restores old reservation");
+    setenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS", "2", 1);
+    if (!sess || !right || !left) {
+        FAIL("fixture");
+        goto out;
+    }
+    atomic_store_explicit(&sess->mem_ledger.total_budget,
+        64ull * 1024 * 1024, memory_order_release);
+    if (session_add_rel(sess, right) != 0) {
+        FAIL("right relation setup");
+        goto out;
+    }
+    right = NULL;
+    init_diff_keyed_op(&op);
+    test_pair_growth_denial_injected = false;
+    if (deny_growth)
+        wl_columnar_join_test_before_pair_growth
+            = deny_pair_growth_with_governor_limit;
+    else if (fail_commit)
+        atomic_store_explicit(&wl_columnar_join_test_fail_pair_commit, true,
+            memory_order_release);
+    else
+        wl_columnar_join_test_fail_pair_realloc = true;
+    int rc = run_diff_join(sess, left, &op, &result);
+    wl_columnar_join_test_before_pair_growth = NULL;
+    injected = deny_growth ? test_pair_growth_denial_injected
+        : fail_commit ? !atomic_load_explicit(
+        &wl_columnar_join_test_fail_pair_commit, memory_order_acquire)
+        : !wl_columnar_join_test_fail_pair_realloc;
+    if (rc != (deny_growth ? ENOSPC : ENOMEM) || !injected || result.rel
+        || (deny_growth && !sess->memory_budget_denied)
+        || reserved_of(sess) != 0u || sess->mat_cache.count != 0
+        || sess->diff_arr_count != 0 || sess->diff_txn_count != 0) {
+        FAIL("pair-vector failure published output or retained scratch");
+        goto out_entry;
+    }
+
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            sess->memory_governor)->usable_bytes, 64ull * 1024 * 1024,
+        memory_order_release);
+    sess->memory_budget_denied = false;
+    if (run_diff_join(sess, left, &op, &result) != 0 || !result.rel
+        || result.rel->nrows != 50001u || sess->diff_arr_count != 1) {
+        FAIL("pair-vector failure retry did not produce all matches");
+        goto out_entry;
+    }
+    for (uint32_t row = 0; row < result.rel->nrows; row++) {
+        if (col_rel_get(result.rel, row, 0) != 0
+            || col_rel_get(result.rel, row, 1) != row
+            || col_rel_get(result.rel, row, 2) != 0
+            || col_rel_get(result.rel, row, 3) != 0) {
+            FAIL("pair-vector failure retry changed output rows");
+            goto out_entry;
+        }
+    }
+    PASS();
+    goto out_entry;
+out_entry:
+    if (result.owned && result.rel)
+        col_rel_destroy(result.rel);
+out:
+    wl_columnar_join_test_before_pair_growth = NULL;
+    wl_columnar_join_test_fail_pair_realloc = false;
+    atomic_store_explicit(&wl_columnar_join_test_fail_pair_commit, false,
+        memory_order_release);
+    unsetenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS");
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+}
+
+static void
+test_parallel_pair_growth_denial_unwinds_and_retries(void)
+{
+    run_parallel_pair_growth_failure(true, false);
+}
+
+static void
+test_parallel_pair_growth_alloc_failure_unwinds_and_retries(void)
+{
+    run_parallel_pair_growth_failure(false, false);
+}
+
+static void
+test_parallel_pair_growth_commit_failure_unwinds_and_retries(void)
+{
+    run_parallel_pair_growth_failure(false, true);
+}
+
+static void
+test_parallel_pair_cache_limit_falls_back_to_reprobe(void)
+{
+    wl_col_session_t *sess = make_session_workers(64ull * 1024 * 1024, 2);
+    col_rel_t *right = make_right(1, 2);
+    col_rel_t *left = make_left(3000, 1);
+    wl_plan_op_t op;
+    eval_entry_t result = { 0 };
+
+    TEST("parallel pair-cache cap falls back without losing JOIN rows");
+    setenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS", "2", 1);
+    wl_columnar_join_test_pair_cap_limit_override = 1024u;
+    if (!sess || !right || !left) {
+        FAIL("fixture");
+        goto out;
+    }
+    if (session_add_rel(sess, right) != 0) {
+        FAIL("right relation setup");
+        goto out;
+    }
+    right = NULL;
+    init_diff_keyed_op(&op);
+    if (run_diff_join(sess, left, &op, &result) != 0 || !result.rel
+        || result.rel->nrows != 6000u) {
+        FAIL("pair-cache cap failed instead of reprobeing all matches");
+        goto out_entry;
+    }
+    for (uint32_t row = 0; row < result.rel->nrows; row++) {
+        if (col_rel_get(result.rel, row, 0) != 0
+            || col_rel_get(result.rel, row, 1) != row / 2u
+            || col_rel_get(result.rel, row, 2) != 0
+            || col_rel_get(result.rel, row, 3) != 1u - (row % 2u)) {
+            FAIL("pair-cache cap fallback changed output rows");
+            goto out_entry;
+        }
+    }
+    PASS();
+out_entry:
+    if (result.owned && result.rel)
+        col_rel_destroy(result.rel);
+out:
+    wl_columnar_join_test_pair_cap_limit_override = 0;
     unsetenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS");
     col_rel_destroy(left);
     col_rel_destroy(right);
@@ -2649,11 +3182,21 @@ main(void)
     test_source_governed_anti_semi_outputs();
     test_cache_adoption_charges_once();
     test_parallel_cross_output_is_governed();
+    test_parallel_cross_source_governor_accounts_contexts();
+    test_parallel_semijoin_source_governor_accounts_scratch();
     test_parallel_cross_denial();
     test_small_parallel_cross_is_admitted();
     test_parallel_diff_output_is_governed();
     test_parallel_diff_denial();
     test_parallel_diff_true_admission_denial_rolls_back();
+    test_parallel_diff_partial_count_submit_drains_and_retries();
+    test_parallel_diff_partial_fill_submit_drains_and_retries();
+    test_parallel_diff_w8_dispatch_and_output();
+    test_parallel_diff_source_governor_accounting();
+    test_parallel_pair_growth_denial_unwinds_and_retries();
+    test_parallel_pair_growth_alloc_failure_unwinds_and_retries();
+    test_parallel_pair_growth_commit_failure_unwinds_and_retries();
+    test_parallel_pair_cache_limit_falls_back_to_reprobe();
     test_diff_commit_failure_unwinds_pushed_materialization();
     test_diff_commit_refusal_retains_complete_stack_entry();
     test_differential_cache_hit_reclaim_pin();

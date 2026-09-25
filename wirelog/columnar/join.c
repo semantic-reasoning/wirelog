@@ -41,7 +41,29 @@ bool wl_columnar_join_test_enable_semijoin_timestamps;
 void (*wl_columnar_join_test_before_diff_commit)(
     wl_columnar_arrangement_diff_txn_t *);
 bool wl_columnar_join_test_fail_next_key_scratch_alloc;
+int (*wl_columnar_join_test_submit_override)(wl_work_queue_t *,
+    void (*)(void *), void *);
+uint32_t wl_columnar_join_test_last_keyed_workers;
+void (*wl_columnar_join_test_before_pair_growth)(
+    wl_columnar_memory_governor_t *, uint64_t, uint64_t);
+bool wl_columnar_join_test_fail_pair_realloc;
+atomic_bool wl_columnar_join_test_fail_pair_commit = ATOMIC_VAR_INIT(false);
+uint32_t wl_columnar_join_test_pair_cap_limit_override;
+bool wl_columnar_join_test_last_cross_ctx_admitted;
+bool wl_columnar_join_test_last_semijoin_parallel_admitted;
+bool wl_columnar_join_test_last_keyed_parallel_admitted;
 #endif
+
+static int
+wl_columnar_join_submit(wl_work_queue_t *wq, void (*work_fn)(void *),
+    void *ctx)
+{
+#ifdef WL_TEST_JOIN_CACHE_HOOK
+    if (wl_columnar_join_test_submit_override)
+        return wl_columnar_join_test_submit_override(wq, work_fn, ctx);
+#endif
+    return wl_workqueue_submit(wq, work_fn, ctx);
+}
 
 /* Retire the whole evaluator entry; refusal keeps its relation and segment
  * metadata together in the caller's vacated stack slot. */
@@ -631,13 +653,19 @@ col_join_pair_cache_append(col_join_keyed_ctx_t *ctx, uint32_t lr,
     if (ctx->pair_count == ctx->pair_cap) {
         uint32_t new_cap = ctx->pair_cap ? ctx->pair_cap * 2u : 1024u;
         if (new_cap <= ctx->pair_cap) {
+            ctx->pair_error = EOVERFLOW;
             ctx->pairs_complete = false;
             return false;
         }
         if (ctx->pair_cap_limit > 0 && new_cap > ctx->pair_cap_limit)
             new_cap = ctx->pair_cap_limit;
         size_t max_pairs = SIZE_MAX / sizeof(col_join_pair_ref_t);
-        if (new_cap <= ctx->pair_cap || (size_t)new_cap > max_pairs) {
+        if (new_cap <= ctx->pair_cap) {
+            ctx->pairs_complete = false;
+            return false;
+        }
+        if ((size_t)new_cap > max_pairs) {
+            ctx->pair_error = EOVERFLOW;
             free(ctx->pairs);
             ctx->pairs = NULL;
             ctx->pair_count = 0;
@@ -656,6 +684,14 @@ col_join_pair_cache_append(col_join_keyed_ctx_t *ctx, uint32_t lr,
                 return false;
             }
             wl_columnar_memory_reservation_init(&pending);
+#ifdef WL_TEST_JOIN_CACHE_HOOK
+            if (ctx->pair_reserved_bytes > 0
+                && wl_columnar_join_test_before_pair_growth)
+                wl_columnar_join_test_before_pair_growth(
+                    wl_columnar_memory_governor_ref_get(
+                        ctx->memory_governor),
+                    ctx->pair_reserved_bytes, new_bytes);
+#endif
             wl_columnar_memory_admission_status_t status =
                 wl_columnar_memory_reserve_growth(
                 wl_columnar_memory_governor_ref_get(
@@ -673,8 +709,15 @@ col_join_pair_cache_append(col_join_keyed_ctx_t *ctx, uint32_t lr,
             }
             pending_valid = true;
         }
-        col_join_pair_ref_t *new_pairs = (col_join_pair_ref_t *)realloc(
-            ctx->pairs, (size_t)new_cap * sizeof(col_join_pair_ref_t));
+        col_join_pair_ref_t *new_pairs = NULL;
+#ifdef WL_TEST_JOIN_CACHE_HOOK
+        if (ctx->pair_reserved_bytes > 0
+            && wl_columnar_join_test_fail_pair_realloc) {
+            wl_columnar_join_test_fail_pair_realloc = false;
+        } else
+#endif
+        new_pairs = (col_join_pair_ref_t *)realloc(ctx->pairs,
+                (size_t)new_cap * sizeof(col_join_pair_ref_t));
         if (!new_pairs) {
             if (pending_valid)
                 (void)wl_columnar_memory_rollback(&pending);
@@ -683,13 +726,23 @@ col_join_pair_cache_append(col_join_keyed_ctx_t *ctx, uint32_t lr,
             ctx->pair_count = 0;
             ctx->pair_cap = 0;
             ctx->pairs_complete = false;
+            ctx->pair_error = ENOMEM;
             return false;
         }
         if (pending_valid) {
             wl_columnar_memory_reservation_t previous;
-            if (!wl_columnar_memory_commit(&pending, ctx)) {
-                (void)wl_columnar_memory_rollback(&pending);
+#ifdef WL_TEST_JOIN_CACHE_HOOK
+            bool fail_commit = ctx->pair_reserved_bytes > 0
+                && atomic_exchange_explicit(
+                &wl_columnar_join_test_fail_pair_commit, false,
+                memory_order_acq_rel);
+            bool commit_ok = !fail_commit;
+#else
+            bool commit_ok = true;
+#endif
+            if (!commit_ok || !wl_columnar_memory_commit(&pending, ctx)) {
                 free(new_pairs);
+                (void)wl_columnar_memory_rollback(&pending);
                 ctx->pairs = NULL;
                 ctx->pair_count = 0;
                 ctx->pair_cap = 0;
@@ -987,6 +1040,9 @@ col_join_parallel_cross(wl_col_session_t *sess, const col_rel_t *left,
         return ensure_rc;
 
     uint32_t W = active_workers;
+#ifdef WL_TEST_JOIN_CACHE_HOOK
+    wl_columnar_join_test_last_cross_ctx_admitted = false;
+#endif
     col_rel_t *out = *outp;
     int reserve_rc = col_join_reserve_exact(out, nrows);
     if (reserve_rc != 0)
@@ -998,15 +1054,17 @@ col_join_parallel_cross(wl_col_session_t *sess, const col_rel_t *left,
     wl_columnar_memory_reservation_t ctx_reservation;
     bool ctx_admitted = false;
     wl_columnar_memory_reservation_init(&ctx_reservation);
-    if (sess->memory_governor) {
-        uint64_t ctx_bytes = 0;
+    wl_columnar_memory_governor_ref_t *ctx_governor
+        = wl_columnar_join_output_governor(sess, left, right);
+    uint64_t ctx_bytes = 0;
+    if (!wl_columnar_memory_size_mul(W, sizeof(col_join_cross_ctx_t),
+        &ctx_bytes) || ctx_bytes > SIZE_MAX) {
+        return EOVERFLOW;
+    }
+    if (ctx_governor) {
         wl_columnar_memory_admission_status_t status;
-        if (!wl_columnar_memory_size_mul(W, sizeof(col_join_cross_ctx_t),
-            &ctx_bytes)) {
-            return EOVERFLOW;
-        }
         status = wl_columnar_memory_reserve_checked(
-            wl_columnar_memory_governor_ref_get(sess->memory_governor),
+            wl_columnar_memory_governor_ref_get(ctx_governor),
             ctx_bytes, &ctx_reservation);
         if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
@@ -1019,8 +1077,11 @@ col_join_parallel_cross(wl_col_session_t *sess, const col_rel_t *left,
         }
         ctx_admitted = true;
     }
-    col_join_cross_ctx_t *ctxs = (col_join_cross_ctx_t *)calloc(
-        W, sizeof(col_join_cross_ctx_t));
+#ifdef WL_TEST_JOIN_CACHE_HOOK
+    wl_columnar_join_test_last_cross_ctx_admitted = ctx_admitted;
+#endif
+    col_join_cross_ctx_t *ctxs = (col_join_cross_ctx_t *)calloc(1,
+            (size_t)ctx_bytes);
     if (!ctxs) {
         if (ctx_admitted)
             (void)wl_columnar_memory_rollback(&ctx_reservation);
@@ -1045,7 +1106,7 @@ col_join_parallel_cross(wl_col_session_t *sess, const col_rel_t *left,
         ctxs[w].begin = begin;
         ctxs[w].end = end;
         ctxs[w].write_error = &write_error;
-        if (wl_workqueue_submit(sess->wq, col_join_cross_fill_worker_fn,
+        if (wl_columnar_join_submit(sess->wq, col_join_cross_fill_worker_fn,
             &ctxs[w]) != 0) {
             rc = ENOMEM;
             break;
@@ -1054,9 +1115,9 @@ col_join_parallel_cross(wl_col_session_t *sess, const col_rel_t *left,
     wl_workqueue_wait_all(sess->wq);
     if (rc == 0)
         rc = atomic_load_explicit(&write_error, memory_order_relaxed);
+    free(ctxs);
     if (ctx_admitted)
         (void)wl_columnar_memory_rollback(&ctx_reservation);
-    free(ctxs);
     if (rc != 0) {
         return wl_columnar_join_output_error(sess, out, rc);
     }
@@ -2694,30 +2755,33 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
             wl_columnar_memory_reservation_t parallel_reservation;
             bool parallel_admitted = false;
             wl_columnar_memory_reservation_init(&parallel_reservation);
-            if (sess->memory_governor) {
-                uint64_t ctx_bytes = 0;
-                uint64_t offset_bytes = 0;
-                uint64_t hash_bytes = 0;
-                uint64_t total_bytes = 0;
+            uint64_t ctx_bytes = 0;
+            uint64_t offset_count = (uint64_t)W + 1u;
+            uint64_t offset_bytes = 0;
+            uint64_t hash_bytes = 0;
+            uint64_t total_bytes = 0;
+            bool sized = wl_columnar_memory_size_mul(W,
+                    sizeof(col_semijoin_ctx_t), &ctx_bytes)
+                && wl_columnar_memory_size_mul(offset_count,
+                    sizeof(uint64_t), &offset_bytes)
+                && wl_columnar_memory_size_mul(
+                left->nrows > 0 ? left->nrows : 1,
+                sizeof(uint32_t), &hash_bytes)
+                && wl_columnar_memory_size_add(ctx_bytes, offset_bytes,
+                    &total_bytes)
+                && wl_columnar_memory_size_add(total_bytes, hash_bytes,
+                    &total_bytes)
+                && ctx_bytes <= SIZE_MAX && offset_bytes <= SIZE_MAX
+                && hash_bytes <= SIZE_MAX;
+            if (!sized) {
+                sj_rc = EOVERFLOW;
+                goto semijoin_parallel_done;
+            }
+            if (scratch_governor) {
                 wl_columnar_memory_admission_status_t status;
-                bool sized = wl_columnar_memory_size_mul(W,
-                        sizeof(col_semijoin_ctx_t), &ctx_bytes)
-                    && wl_columnar_memory_size_mul((uint64_t)W + 1u,
-                        sizeof(uint64_t), &offset_bytes)
-                    && wl_columnar_memory_size_mul(
-                    left->nrows > 0 ? left->nrows : 1,
-                    sizeof(uint32_t), &hash_bytes)
-                    && wl_columnar_memory_size_add(ctx_bytes, offset_bytes,
-                        &total_bytes)
-                    && wl_columnar_memory_size_add(total_bytes, hash_bytes,
-                        &total_bytes);
-                if (!sized) {
-                    sj_rc = EOVERFLOW;
-                    goto semijoin_parallel_done;
-                }
                 status = wl_columnar_memory_reserve_checked(
                     wl_columnar_memory_governor_ref_get(
-                        sess->memory_governor),
+                        scratch_governor),
                     total_bytes, &parallel_reservation);
                 if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
                     && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
@@ -2732,23 +2796,27 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 }
                 parallel_admitted = true;
             }
-            col_semijoin_ctx_t *ctxs = (col_semijoin_ctx_t *)calloc(
-                W, sizeof(col_semijoin_ctx_t));
-            uint64_t *offsets = (uint64_t *)calloc(W + 1,
-                    sizeof(uint64_t));
-            uint32_t *left_hashes = (uint32_t *)malloc(
-                sizeof(uint32_t) * (size_t)(left->nrows ? left->nrows : 1));
-            if (ctxs && offsets) {
+#ifdef WL_TEST_JOIN_CACHE_HOOK
+            wl_columnar_join_test_last_semijoin_parallel_admitted
+                = parallel_admitted;
+#endif
+            col_semijoin_ctx_t *ctxs = (col_semijoin_ctx_t *)calloc(1,
+                    (size_t)ctx_bytes);
+            uint64_t *offsets = (uint64_t *)calloc(1,
+                    (size_t)offset_bytes);
+            uint32_t *left_hashes = (uint32_t *)malloc((size_t)hash_bytes);
+            if (ctxs && offsets && left_hashes) {
                 atomic_int write_error = ATOMIC_VAR_INIT(0);
-                uint32_t chunk = (left->nrows + W - 1u) / W;
+                uint32_t chunk = (uint32_t)(((uint64_t)left->nrows
+                    + (uint64_t)W - 1u) / W);
                 int prc = 0;
                 for (uint32_t w = 0; w < W; w++) {
-                    uint32_t begin = w * chunk;
-                    uint32_t end = begin + chunk;
-                    if (begin > left->nrows)
-                        begin = left->nrows;
-                    if (end > left->nrows)
-                        end = left->nrows;
+                    uint64_t begin_wide = (uint64_t)w * chunk;
+                    uint64_t end_wide = begin_wide + chunk;
+                    uint32_t begin = begin_wide > left->nrows
+                        ? left->nrows : (uint32_t)begin_wide;
+                    uint32_t end = end_wide > left->nrows
+                        ? left->nrows : (uint32_t)end_wide;
                     ctxs[w].left = left;
                     ctxs[w].right = right;
                     ctxs[w].lk = lk;
@@ -2762,7 +2830,7 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     ctxs[w].end = end;
                     ctxs[w].left_hashes = left_hashes;
                     ctxs[w].write_error = &write_error;
-                    if (wl_workqueue_submit(sess->wq,
+                    if (wl_columnar_join_submit(sess->wq,
                         col_semijoin_count_worker_fn, &ctxs[w]) != 0)
                         prc = ENOMEM;
                 }
@@ -2770,7 +2838,12 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 uint64_t total = 0;
                 for (uint32_t w = 0; w < W; w++) {
                     offsets[w] = total;
-                    total += ctxs[w].count;
+                    if (!wl_columnar_memory_size_add(total, ctxs[w].count,
+                        &total)) {
+                        prc = EOVERFLOW;
+                        total = 0;
+                        break;
+                    }
                 }
                 offsets[W] = total;
                 if (prc == 0 && total > UINT32_MAX)
@@ -2788,7 +2861,7 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     for (uint32_t w = 0; w < W; w++) {
                         ctxs[w].out = out;
                         ctxs[w].out_begin = offsets[w];
-                        if (wl_workqueue_submit(sess->wq,
+                        if (wl_columnar_join_submit(sess->wq,
                             col_semijoin_fill_worker_fn, &ctxs[w]) != 0)
                             prc = ENOMEM;
                     }
@@ -3260,41 +3333,47 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 (void)col_arrangement_probe_bundle_release(&diff_bundle);
                 return wl_columnar_join_dispose_left(stack, &left_e, ensure_rc);
             }
+#ifdef WL_TEST_JOIN_CACHE_HOOK
+            wl_columnar_join_test_last_keyed_workers = W;
+#endif
             wl_columnar_memory_reservation_t parallel_reservation;
             bool parallel_admitted = false;
             wl_columnar_memory_reservation_init(&parallel_reservation);
-            if (sess->memory_governor) {
-                uint64_t ctx_bytes = 0;
-                uint64_t offset_bytes = 0;
-                uint64_t hash_bytes = 0;
-                uint64_t total_bytes = 0;
+            uint64_t ctx_bytes = 0;
+            uint64_t offset_count = (uint64_t)W + 1u;
+            uint64_t offset_bytes = 0;
+            uint64_t hash_bytes = 0;
+            uint64_t total_bytes = 0;
+            bool sized = wl_columnar_memory_size_mul(W,
+                    sizeof(col_join_keyed_ctx_t), &ctx_bytes)
+                && wl_columnar_memory_size_mul(offset_count,
+                    sizeof(uint64_t), &offset_bytes)
+                && wl_columnar_memory_size_mul(
+                left->nrows > 0 ? left->nrows : 1,
+                sizeof(uint32_t), &hash_bytes)
+                && wl_columnar_memory_size_add(ctx_bytes, offset_bytes,
+                    &total_bytes)
+                && wl_columnar_memory_size_add(total_bytes, hash_bytes,
+                    &total_bytes)
+                && ctx_bytes <= SIZE_MAX && offset_bytes <= SIZE_MAX
+                && hash_bytes <= SIZE_MAX;
+            if (!sized) {
+                WL_DIFF_RELEASE_TMP();
+                col_rel_destroy(out);
+                wl_columnar_join_key_scratch_free(&key_scratch, &lk);
+                wl_columnar_join_key_scratch_free(&key_scratch, &rk);
+                if (right_filtered)
+                    col_rel_destroy(right_filtered);
+                wl_columnar_arrangement_diff_txn_abort(&diff_txn);
+                (void)col_arrangement_probe_bundle_release(&diff_bundle);
+                return wl_columnar_join_dispose_left(stack, &left_e,
+                           EOVERFLOW);
+            }
+            if (scratch_governor) {
                 wl_columnar_memory_admission_status_t status;
-                bool sized = wl_columnar_memory_size_mul(W,
-                        sizeof(col_join_keyed_ctx_t), &ctx_bytes)
-                    && wl_columnar_memory_size_mul((uint64_t)W + 1u,
-                        sizeof(uint64_t), &offset_bytes)
-                    && wl_columnar_memory_size_mul(
-                    left->nrows > 0 ? left->nrows : 1,
-                    sizeof(uint32_t), &hash_bytes)
-                    && wl_columnar_memory_size_add(ctx_bytes, offset_bytes,
-                        &total_bytes)
-                    && wl_columnar_memory_size_add(total_bytes, hash_bytes,
-                        &total_bytes);
-                if (!sized) {
-                    WL_DIFF_RELEASE_TMP();
-                    col_rel_destroy(out);
-                    wl_columnar_join_key_scratch_free(&key_scratch, &lk);
-                    wl_columnar_join_key_scratch_free(&key_scratch, &rk);
-                    if (right_filtered)
-                        col_rel_destroy(right_filtered);
-                    wl_columnar_arrangement_diff_txn_abort(&diff_txn);
-                    (void)col_arrangement_probe_bundle_release(&diff_bundle);
-                    return wl_columnar_join_dispose_left(stack, &left_e,
-                               EOVERFLOW);
-                }
                 status = wl_columnar_memory_reserve_checked(
                     wl_columnar_memory_governor_ref_get(
-                        sess->memory_governor),
+                        scratch_governor),
                     total_bytes, &parallel_reservation);
                 if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
                     && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
@@ -3318,19 +3397,22 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 }
                 parallel_admitted = true;
             }
-            col_join_keyed_ctx_t *ctxs = (col_join_keyed_ctx_t *)calloc(
-                W, sizeof(col_join_keyed_ctx_t));
-            uint64_t *offsets = (uint64_t *)calloc(W + 1, sizeof(uint64_t));
-            uint32_t *left_hashes = (uint32_t *)malloc(
-                sizeof(uint32_t)
-                * (size_t)(left->nrows ? left->nrows : 1));
+#ifdef WL_TEST_JOIN_CACHE_HOOK
+            wl_columnar_join_test_last_keyed_parallel_admitted
+                = parallel_admitted;
+#endif
+            col_join_keyed_ctx_t *ctxs = (col_join_keyed_ctx_t *)calloc(1,
+                    (size_t)ctx_bytes);
+            uint64_t *offsets = (uint64_t *)calloc(1,
+                    (size_t)offset_bytes);
+            uint32_t *left_hashes = (uint32_t *)malloc((size_t)hash_bytes);
             if (!ctxs || !offsets) {
-                if (parallel_admitted)
-                    (void)wl_columnar_memory_rollback(
-                        &parallel_reservation);
                 free(ctxs);
                 free(offsets);
                 free(left_hashes);
+                if (parallel_admitted)
+                    (void)wl_columnar_memory_rollback(
+                        &parallel_reservation);
                 WL_DIFF_RELEASE_TMP();
                 col_rel_destroy(out);
                 wl_columnar_join_key_scratch_free(&key_scratch, &lk);
@@ -3341,7 +3423,8 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 (void)col_arrangement_probe_bundle_release(&diff_bundle);
                 return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
             }
-            uint32_t chunk = (left->nrows + W - 1u) / W;
+            uint32_t chunk = (uint32_t)(((uint64_t)left->nrows
+                + (uint64_t)W - 1u) / W);
             uint64_t pair_budget = wl_mem_ledger_bytes_remaining(
                 &sess->mem_ledger) / 8u;
             if (left->nrows < WL_JOIN_PAIR_CACHE_MIN_LEFT_ROWS)
@@ -3354,16 +3437,20 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 ? UINT32_MAX
                 : (uint32_t)(pair_budget_per_worker
                 / sizeof(col_join_pair_ref_t));
+#ifdef WL_TEST_JOIN_CACHE_HOOK
+            if (wl_columnar_join_test_pair_cap_limit_override > 0)
+                pair_cap_limit = wl_columnar_join_test_pair_cap_limit_override;
+#endif
             atomic_bool stop = ATOMIC_VAR_INIT(false);
             atomic_uint_fast64_t shared_count = ATOMIC_VAR_INIT(0);
             int prc = 0;
             for (uint32_t w = 0; w < W; w++) {
-                uint32_t begin = w * chunk;
-                uint32_t end = begin + chunk;
-                if (begin > left->nrows)
-                    begin = left->nrows;
-                if (end > left->nrows)
-                    end = left->nrows;
+                uint64_t begin_wide = (uint64_t)w * chunk;
+                uint64_t end_wide = begin_wide + chunk;
+                uint32_t begin = begin_wide > left->nrows
+                    ? left->nrows : (uint32_t)begin_wide;
+                uint32_t end = end_wide > left->nrows
+                    ? left->nrows : (uint32_t)end_wide;
                 ctxs[w].left = left;
                 ctxs[w].right = right;
                 ctxs[w].darr = darr;
@@ -3377,14 +3464,14 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 ctxs[w].left_hashes = left_hashes;
                 ctxs[w].pair_cap_limit = pair_cap_limit;
                 ctxs[w].pairs_complete = true;
-                ctxs[w].memory_governor = sess->memory_governor;
+                ctxs[w].memory_governor = scratch_governor;
                 wl_columnar_memory_reservation_init(
                     &ctxs[w].pair_reservation);
                 ctxs[w].pair_reserved_bytes = 0;
                 ctxs[w].pair_error = 0;
                 ctxs[w].stop = &stop;
                 ctxs[w].shared_count = &shared_count;
-                if (wl_workqueue_submit(sess->wq,
+                if (wl_columnar_join_submit(sess->wq,
                     col_join_keyed_count_worker_fn, &ctxs[w]) != 0)
                     prc = ENOMEM;
             }
@@ -3397,8 +3484,15 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 if (ctxs[w].rc != 0 && prc == 0)
                     prc = ctxs[w].rc;
                 offsets[w] = total;
-                total += ctxs[w].count;
+                if (!wl_columnar_memory_size_add(total, ctxs[w].count,
+                    &total)) {
+                    prc = EOVERFLOW;
+                    total = 0;
+                    break;
+                }
             }
+            if (prc == ENOSPC)
+                sess->memory_budget_denied = true;
             offsets[W] = total;
             if (prc == 0 && sess->join_output_limit > 0
                 && total >= sess->join_output_limit)
@@ -3434,7 +3528,7 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                         ctxs[w].out = out;
                         ctxs[w].out_begin = offsets[w];
                         ctxs[w].rc = 0;
-                        if (wl_workqueue_submit(sess->wq,
+                        if (wl_columnar_join_submit(sess->wq,
                             col_join_keyed_fill_worker_fn, &ctxs[w]) != 0)
                             prc = ENOMEM;
                     }
@@ -3445,11 +3539,11 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 }
             }
             for (uint32_t w = 0; w < W; w++) {
+                free(ctxs[w].pairs);
                 if (ctxs[w].pair_reserved_bytes > 0
                     && !wl_columnar_memory_release(
                         &ctxs[w].pair_reservation))
                     abort();
-                free(ctxs[w].pairs);
             }
             free(offsets);
             free(ctxs);
