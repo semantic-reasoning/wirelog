@@ -2700,6 +2700,10 @@ int
 col_rel_col_idx(const col_rel_t *r, const char *name);
 col_rel_t *
 col_rel_new_auto(const char *name, uint32_t ncols);
+int
+wl_columnar_relation_new_auto_governed(const char *name, uint32_t ncols,
+    uint32_t initial_capacity, bool timestamps,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out);
 col_rel_t *
 col_rel_new_like(const char *name, const col_rel_t *src);
 /* Admit column/timestamp buffers before allocation; preserve required

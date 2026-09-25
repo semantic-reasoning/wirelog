@@ -748,8 +748,11 @@ col_join_batch_run_to_relation(wl_columnar_continuation_t *cont,
         case WL_COLUMNAR_CONTINUATION_DONE:
             return 0;
         case WL_COLUMNAR_CONTINUATION_RESERVATION_DENIED:
+            rc = ENOSPC;
+            break;
         case WL_COLUMNAR_CONTINUATION_SINK_FAILURE:
         case WL_COLUMNAR_CONTINUATION_COMMIT_FAILURE:
+        case WL_COLUMNAR_CONTINUATION_ALLOCATION_FAILURE:
             rc = ENOMEM;
             break;
         case WL_COLUMNAR_CONTINUATION_STALE:

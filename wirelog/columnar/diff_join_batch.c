@@ -35,6 +35,32 @@ typedef struct {
     col_join_batch_cursor_t cursor;
 } col_diff_join_batch_producer_t;
 
+/* Preserve the rows already written while the relation grows.  The relation
+ * resize path copies exactly nrows (including timestamps), so publishing the
+ * live prefix before reserve is required for correctness. */
+static wl_columnar_continuation_status_t
+grow_scratch(col_diff_join_batch_producer_t *p, uint32_t n)
+{
+    uint32_t cap = p->batch->capacity;
+    uint32_t want;
+    bool denied = false;
+    int rc;
+
+    if (cap >= p->rows_per_batch)
+        return WL_COLUMNAR_CONTINUATION_INVALID;
+    want = cap < p->rows_per_batch / 2u ? cap * 2u : p->rows_per_batch;
+    if (want <= cap)
+        want = p->rows_per_batch;
+    p->batch->nrows = n;
+    rc = col_rel_reserve_capacity_admitted(p->batch, want, &denied);
+    if (rc == 0 && p->batch->capacity > n)
+        return WL_COLUMNAR_CONTINUATION_OK;
+    if (rc == ENOMEM)
+        return denied ? WL_COLUMNAR_CONTINUATION_RESERVATION_DENIED
+                      : WL_COLUMNAR_CONTINUATION_ALLOCATION_FAILURE;
+    return WL_COLUMNAR_CONTINUATION_INVALID;
+}
+
 static uint64_t
 pos_pack(uint32_t lr, uint32_t rr)
 {
@@ -150,6 +176,12 @@ producer_produce(void *context,
                 return WL_COLUMNAR_CONTINUATION_STALE;
             if (col_join_keys_match_rel(p->left, lr, p->lk, p->right, rr,
                 p->rk, p->kc)) {
+                if (n == p->batch->capacity) {
+                    wl_columnar_continuation_status_t grow_status
+                        = grow_scratch(p, n);
+                    if (grow_status != WL_COLUMNAR_CONTINUATION_OK)
+                        return grow_status;
+                }
                 if (col_join_write_pair_at(p->batch, n, p->left, lr,
                     p->right, rr, p->project_indices,
                     p->project_count) != 0)
@@ -173,6 +205,9 @@ producer_produce(void *context,
                         return WL_COLUMNAR_CONTINUATION_INVALID;
                 }
                 n++;
+                /* Keep the live prefix structurally current, so every future
+                 * relocation preserves the row just written. */
+                p->batch->nrows = n;
                 if (n == p->rows_per_batch) {
                     uint32_t nrr = diff_next(p->arr, rr);
                     next.lr = nrr == UINT32_MAX ? lr + 1u : lr;
@@ -351,16 +386,35 @@ col_diff_join_batch_producer_create(wl_col_session_t *sess,
         goto fail;
     p->arr = p->pin.arr;
     ocols = col_join_output_width(left, right, op);
-    p->batch = col_rel_new_auto("$diff_join_batch", ocols);
+    /* Session ownership is authoritative.  Without a session governor, the
+     * delta-driving left source owns this transient scratch; the right source
+     * is the fallback for legacy inputs that carry governance only there. */
+    wl_columnar_memory_governor_ref_t *governor = sess->memory_governor
+        ? sess->memory_governor
+        : (left->memory_governor ? left->memory_governor
+                                 : right->memory_governor);
+    bool timestamped = left->timestamps || right->timestamps;
+    if (governor)
+        rc = wl_columnar_relation_new_auto_governed("$diff_join_batch",
+                ocols, COL_REL_INIT_CAP, timestamped, governor, &p->batch);
+    else {
+        p->batch = col_rel_new_auto("$diff_join_batch", ocols);
+        rc = p->batch ? 0 : ENOMEM;
+    }
+    if (rc != 0)
+        goto fail;
     if (!p->batch || col_join_set_output_types(p->batch, left, right, op)
         != 0) {
         rc = ENOMEM;
         goto fail;
     }
-    if ((left->timestamps || right->timestamps)
-        && col_rel_enable_timestamps(p->batch) != 0) {
-        rc = ENOMEM;
-        goto fail;
+    if (timestamped && !p->batch->timestamps) {
+        rc = col_rel_enable_timestamps(p->batch);
+        if (rc != 0) {
+            if (rc == ENOMEM && p->batch->memory_budget_denial_pending)
+                rc = ENOSPC;
+            goto fail;
+        }
     }
     if (!col_rel_retained_bytes_for(p->batch, 1u, &row_bytes)
         || row_bytes == 0) {
@@ -373,15 +427,6 @@ col_diff_join_batch_producer_create(wl_col_session_t *sess,
         goto fail;
     }
     p->rows_per_batch = rows > UINT32_MAX ? UINT32_MAX : (uint32_t)rows;
-    if (sess->memory_governor) {
-        rc = col_rel_attach_memory_governor(p->batch, sess->memory_governor);
-        if (rc != 0)
-            goto fail;
-    }
-    rc = col_rel_reserve_capacity_admitted(p->batch, p->rows_per_batch,
-            NULL);
-    if (rc != 0)
-        goto fail;
     p->cursor.left_identity = left->relation_identity;
     p->cursor.left_view_gen = left->view_generation;
     p->cursor.left_storage_gen = left->storage_generation;

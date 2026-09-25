@@ -1803,7 +1803,7 @@ fail:
 static int
 col_rel_set_schema_impl_capacity(col_rel_t *r, uint32_t ncols,
     const char *const *col_names, uint32_t initial_capacity,
-    bool *out_denied)
+    bool with_timestamps, bool *out_denied)
 {
     wl_columnar_memory_reservation_t pending;
     int pending_rc;
@@ -1816,21 +1816,22 @@ col_rel_set_schema_impl_capacity(col_rel_t *r, uint32_t ncols,
 
     if (!r)
         return EINVAL;
-    if (r->ncols != 0)
+    if (r->schema_ok)
         return 0; /* already initialised */
 
     r->ncols = ncols;
+    r->capacity = initial_capacity;
     pending_rc = col_rel_reserve_retained_shape(r, initial_capacity,
-            false, &pending, &reserve_failure_rc);
+            with_timestamps, &pending, &reserve_failure_rc);
     if (pending_rc < 0) {
         r->ncols = 0;
+        r->capacity = 0;
         if (out_denied && r->memory_budget_denial_pending)
             *out_denied = true;
         return reserve_failure_rc;
     }
 
     if (ncols > 0) {
-        r->capacity = initial_capacity;
         r->columns = col_columns_alloc(ncols, r->capacity);
         if (!r->columns) {
             failure_rc = ENOMEM;
@@ -1857,13 +1858,23 @@ col_rel_set_schema_impl_capacity(col_rel_t *r, uint32_t ncols,
         }
     }
 
+    if (with_timestamps && initial_capacity > 0) {
+        r->timestamps = (col_delta_timestamp_t *)calloc(initial_capacity,
+                sizeof(*r->timestamps));
+        if (!r->timestamps) {
+            failure_rc = ENOMEM;
+            goto fail;
+        }
+        r->timestamp_capacity = initial_capacity;
+    }
+
     if (wl_columnar_relation_init_arrow_schema(r) != 0) {
         failure_rc = ENOMEM;
         goto fail;
     }
     if (pending_rc > 0) {
         if (!col_rel_retained_bytes(r->ncols, r->capacity,
-            r->timestamps != NULL, &retained_bytes)
+            with_timestamps, &retained_bytes)
             || col_rel_publish_retained_reservation(r, &pending,
             retained_bytes, NULL) != 0) {
             failure_rc = ENOMEM;
@@ -1874,7 +1885,6 @@ col_rel_set_schema_impl_capacity(col_rel_t *r, uint32_t ncols,
     return 0;
 
 fail:
-    col_rel_reservation_rollback(&pending);
     /* A pooled descriptor may fail before Arrow initialization, and the
      * Arrow-only initializer already releases its partial schema on error.
      * Only a live release callback denotes owned schema state here. */
@@ -1883,6 +1893,9 @@ fail:
     r->schema_ok = false;
     col_columns_free(r->columns, ncols);
     r->columns = NULL;
+    free(r->timestamps);
+    r->timestamps = NULL;
+    r->timestamp_capacity = 0;
     if (r->col_names) {
         for (uint32_t i = 0; i < ncols; i++)
             free(r->col_names[i]);
@@ -1891,6 +1904,10 @@ fail:
     }
     r->capacity = 0;
     r->ncols = 0;
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    wl_columnar_relation_test_note_resize_columns_retired();
+#endif
+    col_rel_reservation_rollback(&pending);
     if (out_denied && r->memory_budget_denial_pending)
         *out_denied = true;
     return failure_rc;
@@ -1901,7 +1918,7 @@ col_rel_set_schema_impl(col_rel_t *r, uint32_t ncols,
     const char *const *col_names)
 {
     return col_rel_set_schema_impl_capacity(r, ncols, col_names,
-               COL_REL_INIT_CAP, NULL);
+               COL_REL_INIT_CAP, false, NULL);
 }
 
 int
@@ -2689,8 +2706,8 @@ col_rel_append_rows_atomic(col_rel_t *r, const int64_t *rows,
         goto finish;
     }
     required_rows = r->nrows + num_rows;
-    schema_was_unset = r->ncols == 0;
-    if (r->ncols != 0 && num_cols != r->ncols) {
+    schema_was_unset = !r->schema_ok;
+    if (!schema_was_unset && num_cols != r->ncols) {
         rc = EINVAL;
         goto finish;
     }
@@ -2741,7 +2758,7 @@ col_rel_append_rows_atomic(col_rel_t *r, const int64_t *rows,
         if (rc != 0)
             goto finish;
         rc = col_rel_set_schema_impl_capacity(r, num_cols, NULL, capacity,
-                denied);
+                false, denied);
         if (rc != 0)
             goto finish;
     }
@@ -4448,6 +4465,34 @@ col_rel_new_auto(const char *name, uint32_t ncols)
         return NULL;
     }
     return r;
+}
+
+int
+wl_columnar_relation_new_auto_governed(const char *name, uint32_t ncols,
+    uint32_t initial_capacity, bool timestamps,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out)
+{
+    col_rel_t *r = NULL;
+    bool denied = false;
+    int rc;
+
+    if (out)
+        *out = NULL;
+    if (!name || !governor || !out)
+        return EINVAL;
+    rc = col_rel_alloc(&r, name);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_attach_memory_governor(r, governor);
+    if (rc == 0)
+        rc = col_rel_set_schema_impl_capacity(r, ncols, NULL,
+                initial_capacity, timestamps, &denied);
+    if (rc != 0) {
+        col_rel_destroy(r);
+        return rc == ENOMEM && denied ? ENOSPC : rc;
+    }
+    *out = r;
+    return 0;
 }
 
 /* Helper: create owned relation copying col_names from src.
