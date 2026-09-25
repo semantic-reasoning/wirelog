@@ -1499,14 +1499,32 @@ test_workspace_sort_rejects_undersized_workspace_and_rolls_back(void)
     int64_t low = 1;
     int64_t high = 2;
     int64_t *source_column;
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    uint64_t old_reserved = 0, old_retained = 0;
 
     CHECK(source && view && sorted, "undersized workspace relations");
     for (int64_t value = 40; value > 0; value--)
         CHECK(col_rel_append_row(source, &value) == 0,
             "undersized workspace seed");
+    CHECK(col_rel_enable_timestamps(source) == 0,
+        "undersized workspace source timestamps");
+    resolution.budget_bytes = 1u << 20;
+    resolution.usable_bytes = resolution.budget_bytes;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    governor = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(governor && col_rel_attach_memory_governor(view, governor) == 0,
+        "undersized workspace governed view setup");
     CHECK(col_rel_install_shared_view(view, source) == 0,
         "undersized workspace shared view");
     source_column = source->columns[0];
+    if (governor) {
+        old_reserved = wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor));
+        old_retained = view->retained_reserved_bytes;
+    }
 
     /* Preparing over an already-sorted two-row segment leaves every
      * capacity at zero, so the same workspace cannot serve a 40-row sort. */
@@ -1533,10 +1551,23 @@ test_workspace_sort_rejects_undersized_workspace_and_rolls_back(void)
     CHECK(source->columns[0] == source_column
         && col_rel_get(source, 0, 0) == 40 && col_rel_get(view, 0, 0) == 40,
         "refused workspace sort leaves both relations unsorted");
+    if (governor)
+        CHECK(view->retained_reserved_bytes == old_retained
+            && view->retained_reservation.bytes == old_retained
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(governor))
+            == old_reserved,
+            "refused workspace sort restores exact retained token and credit");
     CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
         "undersized workspace writer release");
     wl_columnar_radix_workspace_destroy(&undersized);
     cleanup_relations();
+    if (governor) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(governor)) == 0,
+            "workspace rollback teardown releases governor credit");
+        wl_columnar_memory_governor_ref_release(governor);
+    }
 }
 
 static void
