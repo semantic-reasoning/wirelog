@@ -4561,7 +4561,75 @@ col_rel_t *
 wl_columnar_relation_new_like_governed(const char *name, const col_rel_t *src,
     wl_columnar_memory_governor_ref_t *governor)
 {
-    return wl_columnar_relation_new_like_impl(name, src, governor, true);
+    col_rel_t *out = NULL;
+    if (!governor)
+        return wl_columnar_relation_new_like_impl(name, src, NULL, true);
+    if (wl_columnar_relation_new_like_governed_checked(name, src, governor,
+        &out) != 0)
+        return NULL;
+    return out;
+}
+
+int
+wl_columnar_relation_new_like_governed_checked(const char *name,
+    const col_rel_t *src, wl_columnar_memory_governor_ref_t *governor,
+    col_rel_t **out)
+{
+    return wl_columnar_relation_new_like_governed_checked_mode(name, src,
+               governor, true, out);
+}
+
+int
+wl_columnar_relation_new_like_governed_checked_mode(const char *name,
+    const col_rel_t *src, wl_columnar_memory_governor_ref_t *governor,
+    bool preserve_timestamps, col_rel_t **out)
+{
+    col_rel_t *r = NULL;
+    int rc;
+
+    if (out)
+        *out = NULL;
+    if (!src || !governor || !out)
+        return EINVAL;
+    rc = col_rel_alloc(&r, name);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_attach_memory_governor(r, governor);
+    if (rc == 0 && src->column_types && src->ncols > 0) {
+        r->column_types = (wirelog_column_type_t *)malloc(
+            (size_t)src->ncols * sizeof(*r->column_types));
+        if (!r->column_types)
+            rc = ENOMEM;
+        else
+            memcpy(r->column_types, src->column_types,
+                (size_t)src->ncols * sizeof(*r->column_types));
+    }
+    if (rc == 0)
+        rc = col_rel_set_schema_impl_capacity(r, src->ncols,
+                (const char *const *)src->col_names, COL_REL_INIT_CAP,
+                false, NULL);
+    if (rc == ENOMEM && r->memory_budget_denial_pending)
+        rc = ENOSPC;
+    if (rc == 0) {
+        r->has_graph_column = src->has_graph_column;
+        r->graph_col_idx = src->graph_col_idx;
+        r->declared_ncols = src->declared_ncols;
+        if (src->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+            && (!src->compound_arity_map || src->ncols == 0u
+            || col_rel_clone_compound_meta(r, src) != 0))
+            rc = ENOMEM;
+    }
+    if (rc == 0 && preserve_timestamps && src->timestamps) {
+        rc = col_rel_enable_timestamps(r);
+        if (rc == ENOMEM && r->memory_budget_denial_pending)
+            rc = ENOSPC;
+    }
+    if (rc != 0) {
+        col_rel_destroy(r);
+        return rc;
+    }
+    *out = r;
+    return 0;
 }
 
 /* Pool-aware col_rel constructor wrappers.

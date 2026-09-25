@@ -201,16 +201,24 @@ run_direct_join(wl_col_session_t *col_session, col_rel_t *left,
     return 0;
 }
 
-/* An enforcing governor that admits the 32-byte join-key scratch but not the
-* 192-byte minimum arrangement table (16 buckets plus 16 chain slots) for the
-* two-row test relation. Existing relations stay on their original governor;
-* swapping this into a session only affects subsequently attached entries. */
+/* Admit the four-column output's initial payload and the 32-byte probe row,
+ * but not the 192-byte minimum arrangement table (16 buckets plus 16 chain
+ * slots) for the two-row test relation. Existing relations stay on their
+ * original governor; swapping this into a session only affects later owners. */
 static wl_columnar_memory_governor_ref_t *
 tight_arrangement_governor(void)
 {
     wl_columnar_memory_resolution_t resolution = { 0 };
-    resolution.budget_bytes = 32u;
-    resolution.usable_bytes = 32u;
+    col_rel_t *shape = col_rel_new_auto("$arrangement_test_output", 4);
+    uint64_t output_bytes = 0;
+    if (!shape || !col_rel_retained_bytes_for(shape, COL_REL_INIT_CAP,
+        &output_bytes)) {
+        col_rel_destroy(shape);
+        return NULL;
+    }
+    col_rel_destroy(shape);
+    resolution.budget_bytes = output_bytes + 32u;
+    resolution.usable_bytes = resolution.budget_bytes;
     resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
     resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
     resolution.status = WL_COLUMNAR_MEMORY_OK;
