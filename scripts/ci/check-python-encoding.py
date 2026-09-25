@@ -57,12 +57,52 @@ def _text_mode(node: ast.Call, mode_index: int) -> bool:
     return mode is None or "b" not in mode
 
 
+def _is_urllib_opener_call(node: ast.AST | None) -> bool:
+    return (isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "build_opener"
+            and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "request"
+            and isinstance(node.func.value.value, ast.Name)
+            and node.func.value.value.id == "urllib")
+
+
 class EncodingVisitor(ast.NodeVisitor):
     def __init__(self, path: Path) -> None:
         self.path = path
         self.violations: list[Violation] = []
         self.subprocess_names = {"subprocess"}
         self.subprocess_calls: set[str] = set()
+        self.url_opener_names: list[set[str]] = [set()]
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.url_opener_names.append(set())
+        self.generic_visit(node)
+        self.url_opener_names.pop()
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.visit_FunctionDef(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.url_opener_names.append(set())
+        self.generic_visit(node)
+        self.url_opener_names.pop()
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.generic_visit(node)
+        is_opener = _is_urllib_opener_call(node.value)
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                self.url_opener_names[-1].discard(target.id)
+                if is_opener:
+                    self.url_opener_names[-1].add(target.id)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self.generic_visit(node)
+        if isinstance(node.target, ast.Name) and node.value is not None:
+            self.url_opener_names[-1].discard(node.target.id)
+            if _is_urllib_opener_call(node.value):
+                self.url_opener_names[-1].add(node.target.id)
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
@@ -88,6 +128,8 @@ class EncodingVisitor(ast.NodeVisitor):
         if attr in {"read_text", "write_text"} and not _has_explicit_encoding(node):
             self.add(node, f"Path.{attr}() must specify encoding=\"utf-8\"")
         elif (attr == "open" and not _has_explicit_encoding(node)
+              and not (isinstance(function.value, ast.Name)
+                       and function.value.id in self.url_opener_names[-1])
               and not (isinstance(function.value, ast.Call)
                        and isinstance(function.value.func, ast.Name)
                        and function.value.func.id == "__import__"
