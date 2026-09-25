@@ -5561,11 +5561,10 @@ tdd_owner_build_candidate(col_rel_t *target, const char *name,
                 governor ? governor : target->memory_governor);
         if (rc != 0)
             return rc;
-        free(candidate->name);
-        candidate->name = wl_strdup(name);
-        if (!candidate->name) {
+        rc = wl_columnar_relation_rename_checked(candidate, name);
+        if (rc != 0) {
             col_rel_destroy(candidate);
-            return ENOMEM;
+            return rc;
         }
     } else if (source) {
         candidate = wl_columnar_relation_new_like_governed(name, source,

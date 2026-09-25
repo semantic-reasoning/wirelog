@@ -1184,9 +1184,10 @@ col_rel_attach_memory_governor(col_rel_t *r,
     if (r->memory_governor || r->retained_reserved_bytes != 0)
         return EBUSY;
     if (!r->pool_owned) {
-        if (!r->name || strlen(r->name) == SIZE_MAX
-            || !wl_columnar_memory_size_add(sizeof(*r),
-            (uint64_t)strlen(r->name) + 1u, &bytes))
+        if (r->name && strlen(r->name) == SIZE_MAX)
+            return EOVERFLOW;
+        if (!wl_columnar_memory_size_add(sizeof(*r),
+            r->name ? (uint64_t)strlen(r->name) + 1u : 0u, &bytes))
             return EOVERFLOW;
         wl_columnar_memory_reservation_init(&r->descriptor_reservation);
         status = wl_columnar_memory_reserve_checked(
@@ -2256,12 +2257,13 @@ wl_columnar_relation_alloc_governed(col_rel_t **out, const char *name,
     bool admitted = false;
     int rc;
 
-    if (!out || !name || !governor)
+    if (!out || !governor)
         return EINVAL;
     *out = NULL;
-    if (strlen(name) == SIZE_MAX
-        || !wl_columnar_memory_size_add(sizeof(col_rel_t),
-        (uint64_t)strlen(name) + 1u, &bytes))
+    if (name && strlen(name) == SIZE_MAX)
+        return EOVERFLOW;
+    if (!wl_columnar_memory_size_add(sizeof(col_rel_t),
+        name ? (uint64_t)strlen(name) + 1u : 0u, &bytes))
         return EOVERFLOW;
     wl_columnar_memory_reservation_init(&pending);
     wl_columnar_memory_admission_status_t status
@@ -2278,8 +2280,8 @@ wl_columnar_relation_alloc_governed(col_rel_t **out, const char *name,
         rc = ENOMEM;
         goto fail;
     }
-    r->name = wl_strdup(name);
-    if (!r->name) {
+    r->name = name ? wl_strdup(name) : NULL;
+    if (name && !r->name) {
         rc = ENOMEM;
         goto fail;
     }
@@ -2295,7 +2297,6 @@ wl_columnar_relation_alloc_governed(col_rel_t **out, const char *name,
         rc = EINVAL;
         goto fail;
     }
-    admitted = false;
     r->descriptor_reserved_bytes = bytes;
     r->memory_governor = governor;
     wl_columnar_memory_governor_ref_retain(governor);
@@ -5361,16 +5362,14 @@ wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
     }
     if (!governor)
         governor = src->memory_governor;
-    rc = col_rel_alloc(&dst, src->name ? src->name : "");
+    rc = governor
+        ? wl_columnar_relation_alloc_governed(&dst, src->name, governor)
+        : col_rel_alloc(&dst, src->name ? src->name : "");
     if (rc != 0)
         goto done;
     if (!src->name) {
         free(dst->name);
         dst->name = NULL;
-    }
-    if (governor && col_rel_attach_memory_governor(dst, governor) != 0) {
-        rc = ENOMEM;
-        goto done;
     }
     dst->ncols = src->ncols;
     dst->declared_ncols = src->declared_ncols;

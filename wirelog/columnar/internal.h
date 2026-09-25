@@ -2711,7 +2711,7 @@ int
 wl_columnar_relation_new_auto_governed(const char *name, uint32_t ncols,
     uint32_t initial_capacity, bool timestamps,
     wl_columnar_memory_governor_ref_t *governor, col_rel_t **out);
-/* Allocate a heap descriptor and name under a known governor. */
+/* Allocate a heap descriptor and optional name under a known governor. */
 int
 wl_columnar_relation_alloc_governed(col_rel_t **out, const char *name,
     wl_columnar_memory_governor_ref_t *governor);
