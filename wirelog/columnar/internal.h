@@ -1649,6 +1649,7 @@ typedef struct wl_col_session_t {
     col_rel_t **rels;          /* owned array of owned col_rel_t*        */
     uint32_t nrels;            /* current number of registered relations */
     uint32_t rel_cap;          /* allocated capacity of rels[]           */
+    wl_columnar_memory_reservation_t rels_reservation;
     /* Relation name hash table (Issue #281): O(1) lookup for session_find_rel.
      * Uses FNV-1a hash (arrangement.c pattern) with chaining. Built lazily on
      * first lookup, rebuilt when load factor exceeds 50%.  */
@@ -3062,6 +3063,10 @@ int
 session_add_rel(wl_col_session_t *sess, col_rel_t *r);
 int
 session_remove_rel(wl_col_session_t *sess, const char *name);
+#ifdef WL_SESSION_TEST_HOOKS
+int wl_columnar_session_test_register_retraction(wl_col_session_t *sess,
+    col_rel_t *relation, bool publish);
+#endif
 
 /* ======================================================================== */
 /* Session Hash Table Helpers (columnar/session_hash.c - Issue #281)       */
@@ -3100,6 +3105,8 @@ struct wl_columnar_session_hash_registry_image {
     uint32_t hash_nbuckets;
     uint32_t hash_chain_cap;
     wl_columnar_memory_reservation_t hash_reservation;
+    wl_columnar_memory_reservation_t rels_reservation;
+    wl_columnar_memory_reservation_t expected_rels_reservation;
 };
 
 int
