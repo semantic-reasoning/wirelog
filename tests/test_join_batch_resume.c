@@ -112,6 +112,10 @@ destroy_session(wl_col_session_t *s)
         free(s->rels[i]);
     }
     free(s->rels);
+    if (s->rels_reservation.identity == &s->rels_reservation
+        && atomic_load_explicit(&s->rels_reservation.state,
+        memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED)
+        (void)wl_columnar_memory_rollback(&s->rels_reservation);
     for (uint32_t i = 0; i < s->arr_count; i++) {
         free(s->arr_entries[i].rel_name);
         free(s->arr_entries[i].key_cols);
@@ -1536,8 +1540,7 @@ test_lease_released_on_every_path(void)
     {
         /* Leave one byte beyond the already-admitted arrangement so the
          * producer descriptor reservation is denied before its allocations. */
-        uint64_t arr_bytes = reservation_base;
-        wl_col_session_t *tight = make_session(arr_bytes + 1u);
+        wl_col_session_t *tight = make_session(64ull * 1024 * 1024);
         col_rel_t *right2 = make_right(2, 20);
         const col_arr_entry_t *e2;
         if (!tight || !right2) {
@@ -1547,18 +1550,27 @@ test_lease_released_on_every_path(void)
             destroy_session(tight);
             goto out;
         }
-        session_add_rel(tight, right2);
+        if (session_add_rel(tight, right2) != 0) {
+            FAIL("tight relation registration");
+            col_rel_destroy(right2);
+            destroy_session(tight);
+            goto out;
+        }
         if (!col_session_get_arrangement(&tight->base, "right", KEY0, 1u)) {
             FAIL("tight arrangement warmup");
             destroy_session(tight);
             goto out;
         }
+        uint64_t tight_base = reserved_of(tight);
+        atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+                tight->memory_governor)->usable_bytes, tight_base + 1u,
+            memory_order_release);
         rc = col_join_batch_producer_create(tight, &f.op, f.left, false,
                 KEY0, KEY0, 1, 8u * 32u, &cont);
         e2 = find_entry(tight, "right");
         if (rc != ENOSPC || !tight->memory_budget_denied || cont != NULL
             || (e2 && e2->pin_count != 0u)
-            || reserved_of(tight) != (e2 ? e2->arr.reserved_bytes : 0u)) {
+            || reserved_of(tight) != tight_base) {
             FAIL(
                 "descriptor denial lacked a typed result or left state behind");
             destroy_session(tight);

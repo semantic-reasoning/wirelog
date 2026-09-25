@@ -2509,6 +2509,9 @@ test_snapshot_rebuilds_idb_after_query_mode_input_changes(void)
 /* Issue #1473: create-time governor denial maps to WIRELOG_ERR_MEMORY_BUDGET */
 /* ======================================================================== */
 
+/* The columnar session reserves its initial sixteen relation pointers. */
+#define SESSION_REGISTRY_BYTES (16u * sizeof(void *))
+
 static wl_columnar_memory_governor_ref_t *
 enforcing_governor(uint64_t usable)
 {
@@ -2532,8 +2535,8 @@ reserved_on(wl_columnar_memory_governor_ref_t *ref)
  * admits when a session attaches it (#1431) plus the session's fixed
  * compound arena (probed with the library-default epoch count, so like the
  * budget tests this assumes WIRELOG_COMPOUND_MAX_EPOCHS is unset).  The
- * delta pool and eval arena degrade to malloc when denied, so an exact-fit
- * budget admits precisely these two. */
+ * delta pool and eval arena degrade to malloc when denied.  Callers add the
+ * initial relation registry to these two measured owners. */
 static int
 measure_create_floor(wirelog_program_t *prog, uint64_t *intern_bytes,
     uint64_t *compound_bytes)
@@ -2632,7 +2635,8 @@ test_injected_governor_easy_eager(void)
     PASS();
 
     TEST("#1473 easy eager: exact floor budget opens and is released");
-    ref = enforcing_governor(intern_bytes + compound_bytes);
+    ref = enforcing_governor(intern_bytes + compound_bytes
+            + SESSION_REGISTRY_BYTES);
     if (!ref) {
         FAIL("governor allocation failed");
         return;
@@ -2643,7 +2647,8 @@ test_injected_governor_easy_eager(void)
             &session);
     wl_session_testhook_set_default_options(NULL);
     if (error != WIRELOG_OK || !session
-        || reserved_on(ref) != intern_bytes + compound_bytes) {
+        || reserved_on(ref) != intern_bytes + compound_bytes
+        + SESSION_REGISTRY_BYTES) {
         wirelog_easy_close(session);
         wl_columnar_memory_governor_ref_release(ref);
         FAIL("exact-fit eager open did not admit the floor");
@@ -2707,7 +2712,8 @@ test_injected_governor_easy_lazy(void)
      * delta-callback registration builds the session without stepping, so
      * only creation is measured. */
     TEST("#1473 easy lazy: exact floor budget builds on retry");
-    ref = enforcing_governor(intern_bytes + compound_bytes);
+    ref = enforcing_governor(intern_bytes + compound_bytes
+            + SESSION_REGISTRY_BYTES);
     if (!ref) {
         wirelog_easy_close(session);
         FAIL("governor allocation failed");
@@ -2718,7 +2724,8 @@ test_injected_governor_easy_lazy(void)
     error = wirelog_easy_set_delta_cb(session, NULL, NULL);
     wl_session_testhook_set_default_options(NULL);
     if (error != WIRELOG_OK
-        || reserved_on(ref) != intern_bytes + compound_bytes) {
+        || reserved_on(ref) != intern_bytes + compound_bytes
+        + SESSION_REGISTRY_BYTES) {
         wirelog_easy_close(session);
         wl_columnar_memory_governor_ref_release(ref);
         FAIL("exact-fit lazy build did not admit the floor");
@@ -2789,7 +2796,8 @@ test_injected_governor_executor(void)
     PASS();
 
     TEST("#1473 executor: exact floor budget creates and is released");
-    ref = enforcing_governor(intern_bytes + compound_bytes);
+    ref = enforcing_governor(intern_bytes + compound_bytes
+            + SESSION_REGISTRY_BYTES);
     if (!ref) {
         wirelog_program_free(prog);
         FAIL("governor allocation failed");
@@ -2801,7 +2809,8 @@ test_injected_governor_executor(void)
     executor = wirelog_executor_create(prog, &err);
     wl_session_testhook_set_default_options(NULL);
     if (!executor || err != WIRELOG_OK
-        || reserved_on(ref) != intern_bytes + compound_bytes) {
+        || reserved_on(ref) != intern_bytes + compound_bytes
+        + SESSION_REGISTRY_BYTES) {
         wirelog_executor_free(executor);
         wl_columnar_memory_governor_ref_release(ref);
         wirelog_program_free(prog);
@@ -2893,7 +2902,8 @@ test_executor_csv_budget_and_retry(void)
         return;
     }
     wl_session_options_init(&options);
-    ref = enforcing_governor(intern_bytes + compound_bytes);
+    ref = enforcing_governor(intern_bytes + compound_bytes
+            + SESSION_REGISTRY_BYTES);
     if (!ref) {
         wirelog_program_free(program);
         remove(path);
@@ -2921,8 +2931,8 @@ test_executor_csv_budget_and_retry(void)
     uint64_t reader_bytes
         = 1024u * 2u * sizeof(int64_t) + 2u * sizeof(int64_t)
         + WL_CSV_READ_CHUNK + 2u * (WL_CSV_MAX_LINE + 1u);
-    ref = enforcing_governor(intern_bytes + compound_bytes + schema_bytes
-            + reader_bytes);
+    ref = enforcing_governor(intern_bytes + compound_bytes
+            + SESSION_REGISTRY_BYTES + schema_bytes + reader_bytes);
     if (!ref) {
         wirelog_program_free(program);
         remove(path);
