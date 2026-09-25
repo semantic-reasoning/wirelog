@@ -571,14 +571,24 @@ class SizeAttributionContractTests(unittest.TestCase):
             auth, forensic = root / "auth.json", root / "forensic.json"
             map_path = root / "candidate.map"
             base = {"schema_version": 1, "source_sha": "a" * 40,
-                    "options": {"optimization": "s"},
+                    "options": {"optimization": "s", "c_link_args": [], "cpp_link_args": []},
                     "effective_link_arguments": [{"parameters": ["-shared", "-flto"]}]}
             changed = json.loads(json.dumps(base))
             changed["source_sha"] = "b" * 40
             changed["effective_link_arguments"][0]["parameters"].append(f"-Wl,-Map={map_path}")
+            # Meson records the same map option in per-language option metadata.
+            changed["options"]["c_link_args"] = [f"-Wl,-Map={map_path}"]
+            changed["options"]["cpp_link_args"] = [f"-Wl,-Map={map_path}"]
             auth.write_text(json.dumps(base), encoding="utf-8")
             forensic.write_text(json.dumps(changed), encoding="utf-8")
             self.assertEqual(collector.forensic_profile_matches(auth, forensic, map_path), (True, []))
+
+            changed["effective_link_arguments"][0]["parameters"].append(f"-Wl,-Map={map_path}")
+            forensic.write_text(json.dumps(changed), encoding="utf-8")
+            matches, differences = collector.forensic_profile_matches(auth, forensic, map_path)
+            self.assertFalse(matches)
+            self.assertIn("expected exactly one linker map flag, found 2", differences)
+            changed["effective_link_arguments"][0]["parameters"].pop()
 
             changed["options"]["optimization"] = "0"
             forensic.write_text(json.dumps(changed), encoding="utf-8")
@@ -587,11 +597,81 @@ class SizeAttributionContractTests(unittest.TestCase):
             self.assertEqual(differences, ["options"])
 
             changed["options"]["optimization"] = "s"
-            changed["effective_link_arguments"][0]["parameters"].append(f"-Wl,-Map={map_path}")
+            changed["options"]["c_link_args"].append(f"-Wl,-Map={map_path}")
             forensic.write_text(json.dumps(changed), encoding="utf-8")
             matches, differences = collector.forensic_profile_matches(auth, forensic, map_path)
             self.assertFalse(matches)
-            self.assertEqual(differences, ["expected exactly one linker map flag, found 2"])
+            self.assertIn("duplicate linker map flag in options.c_link_args", differences)
+
+            # The legacy representation with only effective linker arguments remains valid.
+            del changed["options"]["c_link_args"]
+            del changed["options"]["cpp_link_args"]
+            legacy = json.loads(json.dumps(base))
+            del legacy["options"]["c_link_args"]
+            del legacy["options"]["cpp_link_args"]
+            auth.write_text(json.dumps(legacy), encoding="utf-8")
+            forensic.write_text(json.dumps(changed), encoding="utf-8")
+            self.assertEqual(collector.forensic_profile_matches(auth, forensic, map_path), (True, []))
+
+    def test_forensic_profile_rejects_malformed_and_asymmetric_map_flags(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            auth, forensic = root / "auth.json", root / "forensic.json"
+            map_path = root / "expected.map"
+            flag = f"-Wl,-Map={map_path}"
+            base = {"schema_version": 1,
+                    "options": {"optimization": "s", "c_link_args": [], "cpp_link_args": []},
+                    "effective_link_arguments": [{"parameters": ["-shared"]}]}
+            auth.write_text(json.dumps(base), encoding="utf-8")
+
+            def check(candidate, expected_difference):
+                forensic.write_text(json.dumps(candidate), encoding="utf-8")
+                matches, differences = collector.forensic_profile_matches(auth, forensic, map_path)
+                self.assertFalse(matches)
+                self.assertTrue(any(expected_difference in item for item in differences), differences)
+
+            candidate = json.loads(json.dumps(base))
+            candidate["effective_link_arguments"][0]["parameters"].append(flag)
+            candidate["options"]["c_link_args"] = [flag, flag]
+            check(candidate, "duplicate linker map flag in options.c_link_args")
+
+            candidate["options"]["c_link_args"] = []
+            candidate["options"]["cpp_link_args"] = [flag, flag]
+            check(candidate, "duplicate linker map flag in options.cpp_link_args")
+
+            candidate["options"]["cpp_link_args"] = []
+            # Present option arrays may omit the metadata copy; complete comparison still applies.
+            forensic.write_text(json.dumps(candidate), encoding="utf-8")
+            self.assertEqual(collector.forensic_profile_matches(auth, forensic, map_path), (True, []))
+
+            for split_flags in (("-Wl,-Map", str(map_path)),
+                                ("-Wl,-Map,/wrong/path",),
+                                ("-Wl,-Map=/wrong/path",),
+                                ("-Map", str(map_path))):
+                candidate["options"]["c_link_args"] = list(split_flags)
+                check(candidate, "unexpected or split linker map argument")
+
+            authoritative_map = json.loads(json.dumps(base))
+            authoritative_map["options"]["c_link_args"] = [flag]
+            auth.write_text(json.dumps(authoritative_map), encoding="utf-8")
+            # Do not normalize the authoritative profile, even when only it has the map option.
+            candidate["options"]["c_link_args"] = []
+            candidate["options"]["cpp_link_args"] = []
+            candidate["effective_link_arguments"] = [{"parameters": ["-shared", flag]}]
+            check(candidate, "options")
+
+            candidate = json.loads(json.dumps(base))
+            candidate["effective_link_arguments"] = {"parameters": [flag]}
+            check(candidate, "malformed effective_link_arguments")
+
+            candidate = json.loads(json.dumps(base))
+            candidate["effective_link_arguments"][0]["parameters"] = [flag, 7]
+            check(candidate, "malformed linker argument list")
+
+            forensic.write_text(json.dumps([]), encoding="utf-8")
+            matches, differences = collector.forensic_profile_matches(auth, forensic, map_path)
+            self.assertFalse(matches)
+            self.assertEqual(differences, ["malformed profile root"])
 
     def test_forensic_profile_rejects_missing_or_unexpected_map_argument(self):
         with tempfile.TemporaryDirectory() as temp:
