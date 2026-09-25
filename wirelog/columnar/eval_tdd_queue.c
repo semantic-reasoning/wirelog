@@ -151,10 +151,11 @@ wl_columnar_eval_tdd_queue_publish_delta(col_eval_tdd_worker_ctx_t *ctx,
         return rc;
     }
 
-    /* Reuse any timestamp allocation inherited from the governed copy. */
-    int rc = col_rel_enable_timestamps(delta);
-    if (rc != 0)
-        return rc;
+    /* Producers admit the complete timestamp image before changing their
+     * source. Publication only stamps and transfers that owned image. */
+    if (!delta->timestamps || delta->timestamp_capacity < delta->nrows)
+        return EINVAL;
+    int rc;
     wl_columnar_source_access_writer_t writer = { 0 };
     rc = col_rel_source_writer_acquire(delta, &writer);
     if (rc != 0)
