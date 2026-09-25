@@ -1691,6 +1691,76 @@ test_descriptor_reservation_shape(void)
     PASS();
 }
 
+static void
+test_descriptor_uses_source_governor(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1 };
+    wl_columnar_memory_governor_ref_t *source_governor = NULL;
+    wl_columnar_memory_governor_ref_t *governor_ref;
+    wl_columnar_memory_governor_ref_t *session_governor;
+    wl_columnar_continuation_t *cont = NULL;
+    uint64_t baseline;
+    uint64_t admitted;
+
+    TEST(
+        "producer descriptor uses left-source governor without session governor");
+    if (!fixture_init(&f, 1u << 24, keys, 2, 2, 20)) {
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    source_governor = make_governor(1u << 20);
+    session_governor = f.sess->memory_governor;
+    if (!source_governor
+        || col_rel_attach_memory_governor(f.left, source_governor) != 0) {
+        FAIL("source governor setup");
+        goto out;
+    }
+    baseline = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(source_governor));
+    f.sess->memory_governor = NULL;
+    if (col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1u, 8u * 32u, &cont) != 0 || !cont) {
+        FAIL("producer creation with source-only governor");
+        goto out;
+    }
+    admitted = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(source_governor));
+    if (admitted <= baseline) {
+        FAIL("producer descriptor was not charged to its source governor");
+        goto out;
+    }
+    wl_columnar_continuation_cancel(cont);
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(source_governor)) != admitted) {
+        FAIL("cancellation released producer storage credit early");
+        goto out;
+    }
+    uint64_t producer_credit = admitted - baseline;
+    governor_ref = source_governor;
+    col_rel_destroy(f.left);
+    f.left = NULL;
+    wl_columnar_memory_governor_ref_release(source_governor);
+    source_governor = NULL;
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor_ref))
+        != producer_credit) {
+        FAIL("producer did not retain the governor after source detach");
+        goto out;
+    }
+    wl_columnar_continuation_destroy(cont);
+    cont = NULL;
+    PASS();
+out:
+    if (cont)
+        wl_columnar_continuation_destroy(cont);
+    f.sess->memory_governor = session_governor;
+    if (source_governor)
+        wl_columnar_memory_governor_ref_release(source_governor);
+    fixture_fini(&f);
+}
+
 /* (8) Projection: a projected output width matches the oracle. */
 static void
 test_projected_output(void)
@@ -2837,6 +2907,7 @@ main(void)
     test_exact_fit_and_one_byte_over();
     test_lease_released_on_every_path();
     test_descriptor_reservation_shape();
+    test_descriptor_uses_source_governor();
     test_projected_output();
     test_float_key();
     test_unsupported_budget_and_pooled_output();

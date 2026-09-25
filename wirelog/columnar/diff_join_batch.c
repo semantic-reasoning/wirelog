@@ -15,6 +15,37 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef WL_TEST_JOIN_BATCH_DESCRIPTOR_HOOKS
+static _Thread_local uint32_t test_fail_alloc_at;
+static _Thread_local uint32_t test_alloc_count;
+static _Thread_local bool test_fail_commit;
+
+void
+wl_columnar_diff_join_batch_test_fail_allocation_at(uint32_t n)
+{
+    test_fail_alloc_at = n;
+    test_alloc_count = 0;
+}
+
+void
+wl_columnar_diff_join_batch_test_fail_next_commit(void)
+{
+    test_fail_commit = true;
+}
+
+static bool
+test_fail_descriptor_alloc(void)
+{
+    if (test_fail_alloc_at == 0)
+        return false;
+    uint32_t n = ++test_alloc_count;
+    if (n != test_fail_alloc_at)
+        return false;
+    test_fail_alloc_at = 0;
+    return true;
+}
+#endif
+
 typedef struct {
     const col_rel_t *left;
     const col_rel_t *right;
@@ -31,6 +62,9 @@ typedef struct {
     col_diff_arrangement_t *arr;
     col_rel_t *batch;
     int64_t *key_row;
+    wl_columnar_memory_reservation_t descriptor_reservation;
+    wl_columnar_memory_governor_ref_t *descriptor_governor;
+    bool descriptor_committed;
     uint32_t rows_per_batch;
     col_join_batch_cursor_t cursor;
 } col_diff_join_batch_producer_t;
@@ -273,9 +307,19 @@ static void
 producer_destroy(void *context)
 {
     col_diff_join_batch_producer_t *p = context;
+    wl_columnar_memory_reservation_t reservation;
+    wl_columnar_memory_governor_ref_t *governor;
+    bool committed;
 
     if (!p)
         return;
+    wl_columnar_memory_reservation_init(&reservation);
+    if (p->descriptor_reservation.governor
+        && !wl_columnar_memory_reservation_move(&reservation,
+        &p->descriptor_reservation))
+        abort();
+    governor = p->descriptor_governor;
+    committed = p->descriptor_committed;
     producer_release(p);
     col_rel_destroy(p->batch);
     free(p->key_row);
@@ -283,6 +327,14 @@ producer_destroy(void *context)
     free(p->rk);
     free(p->project_indices);
     free(p);
+    if (reservation.governor) {
+        if (committed){
+            if (!wl_columnar_memory_release(&reservation)) abort();
+        }else{
+            if (!wl_columnar_memory_rollback(&reservation)) abort();
+        }
+    }
+    wl_columnar_memory_governor_ref_release(governor);
 }
 
 static int
@@ -330,7 +382,10 @@ col_diff_join_batch_producer_create(wl_col_session_t *sess,
     wl_columnar_continuation_producer_t producer = { 0 };
     wl_columnar_continuation_cursor_t initial = { 0 };
     uint64_t row_bytes, rows;
+    uint64_t project_bytes, key_bytes, key_row_bytes, descriptor_bytes;
     uint32_t ocols;
+    wl_columnar_memory_governor_ref_t *descriptor_governor = NULL;
+    wl_columnar_memory_reservation_t descriptor_reservation;
     int rc;
 
     if (out)
@@ -342,16 +397,78 @@ col_diff_join_batch_producer_create(wl_col_session_t *sess,
     right = session_find_rel(sess, op->right_relation);
     if (!right)
         return ENOENT;
+    if (!wl_columnar_memory_size_mul(op->project_count,
+        sizeof(uint32_t), &project_bytes)
+        || !wl_columnar_memory_size_mul(kc,
+        2u * sizeof(uint32_t), &key_bytes)
+        || !wl_columnar_memory_size_mul(
+            right->ncols > 0 ? right->ncols : 1u, sizeof(int64_t),
+            &key_row_bytes)
+        || !wl_columnar_memory_size_add(sizeof(*p), project_bytes,
+        &descriptor_bytes)
+        || !wl_columnar_memory_size_add(descriptor_bytes, key_bytes,
+        &descriptor_bytes)
+        || !wl_columnar_memory_size_add(descriptor_bytes, key_row_bytes,
+        &descriptor_bytes)
+        || descriptor_bytes > SIZE_MAX)
+        return EOVERFLOW;
+    descriptor_governor = sess->memory_governor
+        ? sess->memory_governor
+        : left->memory_governor ? left->memory_governor
+                                : right->memory_governor;
+    wl_columnar_memory_governor_ref_retain(descriptor_governor);
+    wl_columnar_memory_reservation_init(&descriptor_reservation);
+    if (descriptor_governor) {
+        wl_columnar_memory_admission_status_t admission
+            = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(descriptor_governor),
+                descriptor_bytes, &descriptor_reservation);
+        if (admission > WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                sess->memory_budget_denied = true;
+            wl_columnar_memory_governor_ref_release(descriptor_governor);
+            return admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                ? ENOSPC
+                : admission == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : ENOMEM;
+        }
+    }
+#ifdef WL_TEST_JOIN_BATCH_DESCRIPTOR_HOOKS
+    p = test_fail_descriptor_alloc() ? NULL : calloc(1, sizeof(*p));
+#else
     p = calloc(1, sizeof(*p));
-    if (!p)
+#endif
+    if (!p) {
+        if (descriptor_reservation.governor){
+            if (!wl_columnar_memory_rollback(&descriptor_reservation)) abort();
+        }
+        wl_columnar_memory_governor_ref_release(descriptor_governor);
         return ENOMEM;
+    }
+    wl_columnar_memory_reservation_init(&p->descriptor_reservation);
+    p->descriptor_governor = descriptor_governor;
+    if (descriptor_reservation.governor
+        && !wl_columnar_memory_reservation_move(&p->descriptor_reservation,
+        &descriptor_reservation)) {
+        free(p);
+        if (!wl_columnar_memory_rollback(&descriptor_reservation))
+            abort();
+        wl_columnar_memory_governor_ref_release(descriptor_governor);
+        return EINVAL;
+    }
     p->left = left;
     p->right = right;
     p->kc = kc;
     p->project_count = op->project_count;
     if (p->project_count > 0) {
+#ifdef WL_TEST_JOIN_BATCH_DESCRIPTOR_HOOKS
+        p->project_indices = test_fail_descriptor_alloc() ? NULL
+            : malloc((size_t)p->project_count
+                * sizeof(*p->project_indices));
+#else
         p->project_indices = malloc((size_t)p->project_count
                 * sizeof(*p->project_indices));
+#endif
         if (!p->project_indices) {
             rc = ENOMEM;
             goto fail;
@@ -367,16 +484,40 @@ col_diff_join_batch_producer_create(wl_col_session_t *sess,
     if (rc != 0)
         goto fail;
     p->left_source_reader_active = true;
+#ifdef WL_TEST_JOIN_BATCH_DESCRIPTOR_HOOKS
+    p->lk = test_fail_descriptor_alloc() ? NULL
+        : malloc((size_t)kc * sizeof(*p->lk));
+    p->rk = test_fail_descriptor_alloc() ? NULL
+        : malloc((size_t)kc * sizeof(*p->rk));
+    p->key_row = test_fail_descriptor_alloc() ? NULL
+        : calloc(right->ncols ? right->ncols : 1u, sizeof(*p->key_row));
+#else
     p->lk = malloc((size_t)kc * sizeof(*p->lk));
     p->rk = malloc((size_t)kc * sizeof(*p->rk));
     p->key_row = calloc(right->ncols ? right->ncols : 1u,
             sizeof(*p->key_row));
+#endif
     if (!p->lk || !p->rk || !p->key_row) {
         rc = ENOMEM;
         goto fail;
     }
     memcpy(p->lk, lk, (size_t)kc * sizeof(*p->lk));
     memcpy(p->rk, rk, (size_t)kc * sizeof(*p->rk));
+    if (p->descriptor_reservation.governor) {
+        bool commit_ok = true;
+#ifdef WL_TEST_JOIN_BATCH_DESCRIPTOR_HOOKS
+        if (test_fail_commit) {
+            test_fail_commit = false;
+            commit_ok = false;
+        }
+#endif
+        if (!commit_ok
+            || !wl_columnar_memory_commit(&p->descriptor_reservation, p)) {
+            rc = EINVAL;
+            goto fail;
+        }
+        p->descriptor_committed = true;
+    }
     rc = index_right(sess, op->right_relation, right, rk, kc);
     if (rc != 0)
         goto fail;
@@ -389,14 +530,11 @@ col_diff_join_batch_producer_create(wl_col_session_t *sess,
     /* Session ownership is authoritative.  Without a session governor, the
      * delta-driving left source owns this transient scratch; the right source
      * is the fallback for legacy inputs that carry governance only there. */
-    wl_columnar_memory_governor_ref_t *governor = sess->memory_governor
-        ? sess->memory_governor
-        : (left->memory_governor ? left->memory_governor
-                                 : right->memory_governor);
     bool timestamped = left->timestamps || right->timestamps;
-    if (governor)
+    if (descriptor_governor)
         rc = wl_columnar_relation_new_auto_governed("$diff_join_batch",
-                ocols, COL_REL_INIT_CAP, timestamped, governor, &p->batch);
+                ocols, COL_REL_INIT_CAP, timestamped, descriptor_governor,
+                &p->batch);
     else {
         p->batch = col_rel_new_auto("$diff_join_batch", ocols);
         rc = p->batch ? 0 : ENOMEM;
