@@ -298,6 +298,7 @@ only used to exercise allocator exhaustion.
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
 | `join.c:wl_columnar_join_original_is_accounted` | `source->retained_reservation.state` | `atomic_load_explicit` | `acquire` | Observe the committed reservation before accepting the existing relation as an accounted single-owner fallback; pairs with the governor's release publication |
+| `join.c:col_join_pair_cache_append` | `wl_columnar_join_test_fail_pair_commit` | `atomic_exchange_explicit` | `acq_rel` | Consume the one-shot test-only pair-commit failure flag without racing its setter |
 | `join.c:col_join_output_limit_reached` | `sess->join_output_shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Tuple-budget accumulator across keyed-join workers; counter only |
 | `join.c:col_join_keyed_count_worker_fn` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll; eventual visibility is acceptable for cooperative cancel |
 | `join.c:col_join_keyed_count_worker_fn#2` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll |
@@ -306,8 +307,6 @@ only used to exercise allocator exhaustion.
 | `join.c:col_join_keyed_count_worker_fn#5` | `*ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Cross-worker counter increment |
 | `join.c:col_join_keyed_count_worker_fn#6` | `*ctx->stop` | `atomic_store_explicit` | `relaxed` | Cooperative cancel flag (see the preceding cancellation note) |
 | `join.c:wl_columnar_join_diff_op` | `stop` (local) | `atomic_load_explicit` | `relaxed` | Compaction-loop cancel poll |
-| `join.c:wl_columnar_join_diff_op#2` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Backpressure poll; advisory, no edge required |
-| `join.c:wl_columnar_join_diff_op#3` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Backpressure poll; advisory, no edge required |
 | `join.c:col_semijoin_fill_worker_fn` | `*ctx->write_error` | `atomic_load_explicit` | `relaxed` | Cooperative fill cancellation after another worker reports a typed write failure |
 | `join.c:col_semijoin_fill_worker_fn#2` | `*ctx->write_error` | `atomic_store_explicit` | `relaxed` | Publish the first typed output-write failure to sibling workers and the coordinator |
 | `join.c:col_semijoin_fill_worker_fn#3` | `*ctx->write_error` | `atomic_store_explicit` | `relaxed` | Publish a failure from a later projected column in the same output row |
