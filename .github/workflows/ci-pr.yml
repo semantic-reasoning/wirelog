@@ -174,7 +174,9 @@ jobs:
       #
       # The exact event base and tested merge are built with the same runner,
       # Meson recipe, compiler and resolved production profile. The numeric
-      # budget remains 5120 bytes; the comparison uses the base-owned baseline.
+      # budget remains 5120 bytes. The comparison starts with the base-owned
+      # baseline and uses a candidate numeric baseline only after trusted
+      # provenance verification succeeds.
       # =======================================================================
       - name: Build production library for early size gate
         run: |
