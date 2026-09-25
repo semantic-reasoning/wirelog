@@ -617,7 +617,7 @@ commit keeps their sum without crediting either image.
 | `relation.c:wl_columnar_relation_retirement_writer_valid` | `source_access.state` | `atomic_load_explicit` | acquire | Confirm the retirement writer still owns the source-access gate |
 | `relation.c:wl_columnar_relation_retirement_commit` | `storage_alias_borrows` | `atomic_store_explicit` | relaxed | Clear the alias count when a pooled relation descriptor is reset for reuse |
 
-### 5.17 `wirelog/columnar/eval_delta.c` — observer reservations (1 row)
+### 5.17 `wirelog/columnar/eval_delta.c` — observer and retraction reservations (3 rows)
 
 Observer cleanup releases only admitted tokens. The session owns these stable
 reservation objects exclusively; their state follows the governor protocol.
@@ -625,8 +625,10 @@ reservation objects exclusively; their state follows the governor protocol.
 | Anchor (file:function[#N]) | Field | Op | Order | Justification |
 |---|---|---|---|---|
 | `eval_delta.c:wl_columnar_eval_delta_observer_release_token` | `token->state` | `atomic_load_explicit` | acquire | Observe admission or commit state before releasing the observer reservation, then reinitialize the exclusively owned token |
+| `eval_delta.c:wl_retraction_stage_prepare` | `r->retained_reservation.state` | `atomic_load_explicit` | acquire | Validate the committed payload token under the relation writer before staging a second physical image |
+| `eval_delta.c:wl_retraction_stage_prepare#2` | `r->retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Confirm the token is still bound to the canonical relation before growing its charge |
 
-The complete source audit now contains **183 atomic call sites**.
+The complete source audit now contains **185 atomic call sites**.
 
 ---
 

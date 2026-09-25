@@ -401,15 +401,20 @@ typedef struct col_rel {
      * mem_ledger is NULL. */
     uint64_t ledger_ts_bytes;
     /* Scratch buffer for col_rel_row() gather (Phase C, Issue #332).
-     * Lazily allocated on first col_rel_row() call. Freed in free_contents. */
+     * Preallocated before governed publication; ungoverned relations may
+     * allocate it lazily. Freed in free_contents. */
     int64_t *row_scratch;
     /* Zero-copy retraction backup (issue #300).
      * col_stratum_step_retraction_nonrecursive saves the live columns pointer
      * here before clearing the relation for retraction evaluation, then
-     * restores it afterwards without any memcpy.  All four fields are
-     * NULL/0 at all times outside retraction evaluation. */
+     * restores it afterwards without any memcpy. The timestamp pointer and
+     * its physical capacity move with the rows. All backup fields are
+     * NULL/0 outside retraction evaluation. */
     int64_t **retract_backup_columns;
+    col_delta_timestamp_t *retract_backup_timestamps;
+    uint32_t retract_backup_timestamp_capacity;
     uint32_t retract_backup_nrows;
+    uint32_t retract_backup_base_nrows;
     uint32_t retract_backup_capacity;
     uint32_t retract_backup_sorted_nrows;
     /* Zero-copy column sharing for worker sessions (Issue #334, 6B).
@@ -3622,6 +3627,10 @@ bool wl_columnar_eval_delta_rollback_active(const wl_col_session_t *sess);
 bool wl_columnar_eval_delta_defer_gc(wl_col_session_t *sess);
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_eval_delta_test_after_eval)(wl_col_session_t *sess);
+extern int (*wl_columnar_eval_delta_test_retraction_eval)(
+    const wl_plan_stratum_t *, wl_col_session_t *, uint32_t);
+int wl_columnar_eval_delta_test_retraction_step(const wl_plan_stratum_t *,
+    wl_col_session_t *, uint32_t);
 extern void (*wl_columnar_kfusion_test_before_cleanup)(
     wl_col_session_t *sess, eval_stack_t *stack, col_rel_t **results,
     uint32_t result_count);
