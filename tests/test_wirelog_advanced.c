@@ -2394,6 +2394,8 @@ test_issue_665_partial_conjunction_multi_worker(void)
 /* Issue #1473: create-time governor denial maps to WIRELOG_ERR_MEMORY_BUDGET */
 /* ======================================================================== */
 
+#define SESSION_REGISTRY_BYTES (16u * sizeof(void *))
+
 static wl_columnar_memory_governor_ref_t *
 enforcing_governor(uint64_t usable)
 {
@@ -2413,10 +2415,11 @@ reserved_on(wl_columnar_memory_governor_ref_t *ref)
         wl_columnar_memory_governor_ref_get(ref));
 }
 
-/* The create-time floor of a fact-free program: the bytes its intern table
- * admits when a session attaches it (#1431) plus the session's fixed
- * compound arena (probed with the library-default epoch count, so like the
- * budget tests this assumes WIRELOG_COMPOUND_MAX_EPOCHS is unset); the delta
+/* Measure the intern table admitted when a session attaches it (#1431) and
+ * the fixed compound arena.  Callers add the initial 16-pointer session
+ * registry to obtain the create-time floor.  The arena is probed with the
+ * library-default epoch count, so the budget tests assume
+ * WIRELOG_COMPOUND_MAX_EPOCHS is unset.  The delta
  * pool and eval arena degrade to malloc when denied.  Plan generation is run
  * once first so the table measured is the one the facade's own plan
  * generation will attach. */
@@ -2480,7 +2483,8 @@ test_bulk_insert_error_mapping(void)
         goto out;
     }
     wl_session_options_init(&options);
-    ref = enforcing_governor(intern_bytes + compound_bytes);
+    ref = enforcing_governor(intern_bytes + compound_bytes
+            + SESSION_REGISTRY_BYTES);
     if (!ref)
         goto out;
     options.memory_governor = ref;
@@ -2640,7 +2644,8 @@ test_denied_eval_interning_maps_to_memory(void)
             return 1;
         }
         wl_session_options_init(&options);
-        ref = enforcing_governor(intern_bytes + compound_bytes + slacks[i]);
+        ref = enforcing_governor(intern_bytes + compound_bytes
+                + SESSION_REGISTRY_BYTES + slacks[i]);
         if (!ref) {
             wirelog_program_free(prog);
             return 1;
@@ -2741,7 +2746,8 @@ test_injected_governor_denial_maps_to_memory(void)
 
     /* Exact floor: creation succeeds, destroy leaves the program-owned
      * intern reservation, and freeing the program releases it. */
-    ref = enforcing_governor(intern_bytes + compound_bytes);
+    ref = enforcing_governor(intern_bytes + compound_bytes
+            + SESSION_REGISTRY_BYTES);
     if (!ref)
         goto out;
     options.memory_governor = ref;
@@ -2750,7 +2756,8 @@ test_injected_governor_denial_maps_to_memory(void)
             &session);
     wl_session_testhook_set_default_options(NULL);
     if (error != WIRELOG_OK || !session
-        || reserved_on(ref) != intern_bytes + compound_bytes) {
+        || reserved_on(ref) != intern_bytes + compound_bytes
+        + SESSION_REGISTRY_BYTES) {
         fprintf(stderr, "T-1473: exact-fit create err=%d reserved=%llu\n",
             error, (unsigned long long)reserved_on(ref));
         goto out;
