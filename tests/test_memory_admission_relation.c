@@ -72,6 +72,9 @@ metadata_bytes(const col_rel_t *rel)
         bytes += (uint64_t)rel->ncols * sizeof(*rel->col_names);
     if (rel->column_types)
         bytes += (uint64_t)rel->ncols * sizeof(*rel->column_types);
+    if (rel->col_shared)
+        bytes += (uint64_t)rel->ncols
+            * (sizeof(*rel->columns) + sizeof(*rel->col_shared));
     if (rel->schema_ok)
         bytes += (uint64_t)rel->ncols
             * (sizeof(struct ArrowSchema *) + sizeof(struct ArrowSchema)
@@ -98,6 +101,12 @@ auto_metadata_bytes(uint32_t ncols)
         bytes += 2u * (strlen(name) + 1u);
     }
     return bytes;
+}
+
+static uint64_t
+shared_table_bytes(uint32_t ncols)
+{
+    return (uint64_t)ncols * (sizeof(int64_t *) + sizeof(bool));
 }
 
 static void
@@ -906,7 +915,7 @@ test_cow_exact_fit_and_denial(void)
     col_rel_t *view;
 
     make_resolution(&resolution, private_bytes + descriptor_bytes("view")
-        + auto_metadata_bytes(1));
+        + auto_metadata_bytes(1) + shared_table_bytes(1));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     view = ref ? make_shared_view(ref, &source) : NULL;
     CHECK(view != NULL, "COW exact-fit setup");
@@ -936,7 +945,8 @@ test_cow_exact_fit_and_denial(void)
         wl_columnar_memory_governor_ref_release(ref);
 
     make_resolution(&resolution, private_bytes - 1u
-        + descriptor_bytes("view") + auto_metadata_bytes(1));
+        + descriptor_bytes("view") + auto_metadata_bytes(1)
+        + shared_table_bytes(1));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     source = NULL;
     view = ref ? make_shared_view(ref, &source) : NULL;
@@ -1164,7 +1174,8 @@ test_cow_multi_column_cleanup(void)
     int64_t appended[] = {5, 50};
 
     make_resolution(&resolution, private_bytes
-        + descriptor_bytes("multi-view") + metadata_bytes(view));
+        + descriptor_bytes("multi-view") + metadata_bytes(view)
+        + shared_table_bytes(2));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     CHECK(ref && source && view, "multi-column COW setup");
     if (ref && source && view) {
@@ -1257,7 +1268,8 @@ test_append_transitions(void)
     int64_t value = 11;
 
     make_resolution(&resolution, grown_bytes
-        + descriptor_bytes("full-view") + auto_metadata_bytes(1));
+        + descriptor_bytes("full-view") + auto_metadata_bytes(1)
+        + shared_table_bytes(1));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     view = ref ? make_full_shared_view(ref, &source, false) : NULL;
     CHECK(view != NULL, "append_row transition setup");
@@ -1279,7 +1291,8 @@ test_append_transitions(void)
         wl_columnar_memory_governor_ref_release(ref);
 
     make_resolution(&resolution, grown_bytes
-        + descriptor_bytes("full-view") + auto_metadata_bytes(1));
+        + descriptor_bytes("full-view") + auto_metadata_bytes(1)
+        + shared_table_bytes(1));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     source = NULL;
     view = ref ? make_full_shared_view(ref, &source, false) : NULL;
@@ -1302,7 +1315,9 @@ test_append_transitions(void)
 
     make_resolution(&resolution, (uint64_t)(COL_REL_INIT_CAP * 2u)
         * (sizeof(int64_t) + sizeof(col_delta_timestamp_t))
-        + descriptor_bytes("full-view") + auto_metadata_bytes(1));
+        + descriptor_bytes("full-view") + auto_metadata_bytes(1)
+        + shared_table_bytes(1)
+        + (uint64_t)COL_REL_INIT_CAP * sizeof(col_delta_timestamp_t));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     source = NULL;
     view = ref ? make_full_shared_view(ref, &source, true) : NULL;
@@ -1845,8 +1860,11 @@ test_cow_retained_timestamp_capacity_admission(void)
     col_rel_t *view = NULL;
     int64_t value = 9;
 
-    make_resolution(&resolution, bytes - 1u
-        + descriptor_bytes("skew-view") + auto_metadata_bytes(1));
+    const uint64_t old_timestamp_bytes = (uint64_t)physical
+        * sizeof(col_delta_timestamp_t);
+    make_resolution(&resolution, bytes - 1u + old_timestamp_bytes
+        + descriptor_bytes("skew-view") + auto_metadata_bytes(1)
+        + shared_table_bytes(1));
     ref = wl_columnar_memory_governor_ref_create(&resolution);
     source = col_rel_new_auto("skew-source", 1);
     view = col_rel_new_auto("skew-view", 1);
@@ -1872,11 +1890,11 @@ test_cow_retained_timestamp_capacity_admission(void)
         && wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(ref))
         == descriptor_bytes("skew-view")
-        + view->metadata_reserved_bytes,
+        + view->metadata_reserved_bytes + old_timestamp_bytes,
         "retained timestamp capacity denial preserves state");
     atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
             ref)->usable_bytes,
-        bytes + descriptor_bytes("skew-view")
+        bytes + old_timestamp_bytes + descriptor_bytes("skew-view")
         + view->metadata_reserved_bytes, memory_order_release);
     CHECK(col_rel_cow_unshare(view, 0) == 0
         && view->retained_reserved_bytes == bytes
@@ -1894,6 +1912,446 @@ cleanup:
         CHECK(wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref)) == 0,
             "physical timestamp COW teardown releases exact credit");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_governed_shared_view_timestamp_transaction(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    col_rel_t *source = col_rel_new_auto("shared-ts-source", 1);
+    col_rel_t *dst = col_rel_new_auto("shared-ts-dst", 1);
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    int64_t value = 23;
+    make_resolution(&resolution, 1u << 20);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && source && dst && col_rel_append_row(source, &value) == 0
+        && col_rel_enable_timestamps(source) == 0,
+        "governed shared timestamp fixture");
+    if (!ref || !source || !dst || !source->timestamps)
+        goto cleanup;
+    uint32_t physical = source->capacity + 7u;
+    col_delta_timestamp_t *expanded = realloc(source->timestamps,
+            (size_t)physical * sizeof(*expanded));
+    CHECK(expanded != NULL, "shared source physical timestamp expansion");
+    if (!expanded)
+        goto cleanup;
+    source->timestamps = expanded;
+    source->timestamp_capacity = physical;
+    CHECK(col_rel_attach_memory_governor(dst, ref) == 0,
+        "governed shared timestamp destination attach");
+    if (!dst->memory_governor)
+        goto cleanup;
+    uint64_t base = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+    uint64_t new_metadata = auto_metadata_bytes(1)
+        + shared_table_bytes(1);
+    uint64_t new_retained = (uint64_t)physical
+        * sizeof(col_delta_timestamp_t);
+    int64_t **old_columns = dst->columns;
+    uint64_t old_view = dst->view_generation;
+    uint64_t old_storage = dst->storage_generation;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, base + new_metadata - 1u,
+        memory_order_release);
+    CHECK(col_rel_install_shared_view(dst, source) == ENOSPC
+        && dst->columns == old_columns && dst->col_shared == NULL
+        && dst->view_generation == old_view
+        && dst->storage_generation == old_storage
+        && source->storage_alias_borrows == 0u
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == base,
+        "shared metadata one-byte denial preserves old image");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, base + new_metadata + new_retained - 1u,
+        memory_order_release);
+    CHECK(col_rel_install_shared_view(dst, source) == ENOSPC
+        && dst->columns == old_columns && dst->col_shared == NULL
+        && dst->retained_reserved_bytes == 0
+        && source->storage_alias_borrows == 0u
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == base,
+        "shared physical timestamp one-byte denial rolls metadata back");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, base + new_metadata + new_retained,
+        memory_order_release);
+    wl_columnar_relation_test_fail_next_metadata_alloc();
+    CHECK(col_rel_install_shared_view(dst, source) == ENOMEM
+        && dst->columns == old_columns && dst->col_shared == NULL
+        && dst->view_generation == old_view
+        && source->storage_alias_borrows == 0u
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == base,
+        "shared post-admission allocator failure preserves old image");
+    CHECK(col_rel_install_shared_view(dst, source) == 0
+        && dst->timestamp_capacity == physical
+        && dst->retained_reserved_bytes == new_retained
+        && dst->metadata_reserved_bytes == new_metadata
+        && source->storage_alias_borrows == 1u
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == dst->descriptor_reserved_bytes + new_metadata + new_retained,
+        "shared exact physical timestamp image publishes once");
+cleanup:
+    col_rel_destroy(dst);
+    col_rel_destroy(source);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "shared timestamp transaction teardown releases credits");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_governed_shared_view_dst_only_timestamps(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    col_rel_t *source = col_rel_new_auto("dst-ts-source", 1);
+    col_rel_t *dst = col_rel_new_auto("dst-ts-view", 1);
+    int64_t value = 5;
+    make_resolution(&resolution, 1u << 20);
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && source && dst && col_rel_append_row(source, &value) == 0
+        && col_rel_enable_timestamps(dst) == 0,
+        "destination-only timestamp fixture");
+    if (!ref || !source || !dst || !dst->timestamps)
+        goto cleanup;
+    CHECK(col_rel_attach_memory_governor(dst, ref) == 0
+        && col_rel_reserve_capacity_admitted(dst, dst->capacity, NULL) == 0,
+        "destination-only old retained image admission");
+    if (!dst->retained_reserved_bytes)
+        goto cleanup;
+    uint64_t base = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+    uint64_t new_metadata = auto_metadata_bytes(1)
+        + shared_table_bytes(1);
+    uint64_t new_retained = (uint64_t)source->capacity
+        * sizeof(col_delta_timestamp_t);
+    int64_t **old_columns = dst->columns;
+    col_delta_timestamp_t *old_timestamps = dst->timestamps;
+    uint64_t old_retained = dst->retained_reserved_bytes;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, base + new_metadata + new_retained - 1u,
+        memory_order_release);
+    CHECK(col_rel_install_shared_view(dst, source) == ENOSPC
+        && dst->columns == old_columns && dst->timestamps == old_timestamps
+        && dst->retained_reserved_bytes == old_retained
+        && source->storage_alias_borrows == 0u
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == base,
+        "destination-only timestamp one-byte overlap denial");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, base + new_metadata + new_retained,
+        memory_order_release);
+    CHECK(col_rel_install_shared_view(dst, source) == 0
+        && dst->timestamps != old_timestamps
+        && dst->timestamp_capacity == source->capacity
+        && dst->retained_reserved_bytes == new_retained
+        && source->storage_alias_borrows == 1u
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == dst->descriptor_reserved_bytes + new_metadata + new_retained,
+        "destination-only timestamp exact overlap publishes once");
+cleanup:
+    col_rel_destroy(dst);
+    col_rel_destroy(source);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "destination-only timestamp teardown releases credit");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_shared_view_narrow_timestamp_appends(void)
+{
+    for (int mode = 0; mode < 4; mode++) {
+        wl_columnar_memory_resolution_t resolution;
+        col_rel_t *source = col_rel_new_auto("narrow-source", 1);
+        col_rel_t *view = col_rel_new_auto("narrow-view", 1);
+        col_rel_t *suffix = col_rel_new_auto("narrow-suffix", 1);
+        wl_columnar_memory_governor_ref_t *ref;
+        int64_t value = 7;
+        int64_t batch[] = { 8, 9 };
+        bool denied = false;
+        make_resolution(&resolution, 1u << 20);
+        ref = wl_columnar_memory_governor_ref_create(&resolution);
+        CHECK(ref && source && view && suffix
+            && col_rel_append_row(source, &value) == 0
+            && col_rel_enable_timestamps(source) == 0
+            && col_rel_append_row(suffix, &batch[0]) == 0
+            && col_rel_append_row(suffix, &batch[1]) == 0,
+            "narrow timestamp append fixture");
+        if (!ref || !source || !view || !suffix || !source->timestamps)
+            goto cleanup;
+        if (mode == 3)
+            CHECK(col_rel_enable_timestamps(suffix) == 0,
+                "timestamped bulk source fixture");
+        CHECK(source->capacity > source->nrows,
+            "source has spare column capacity for timestamp skew");
+        col_delta_timestamp_t *narrow = realloc(source->timestamps,
+                sizeof(*narrow));
+        CHECK(narrow != NULL, "shrink source physical timestamp buffer");
+        if (!narrow)
+            goto cleanup;
+        source->timestamps = narrow;
+        source->timestamp_capacity = source->nrows;
+        CHECK(col_rel_attach_memory_governor(view, ref) == 0
+            && col_rel_install_shared_view(view, source) == 0,
+            "install governed narrow timestamp view");
+        if (!view->col_shared)
+            goto cleanup;
+        uint64_t baseline = wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref));
+        uint64_t replacement = (uint64_t)view->capacity
+            * (sizeof(int64_t) + sizeof(col_delta_timestamp_t));
+        int64_t *old_column = view->columns[0];
+        col_delta_timestamp_t *old_timestamps = view->timestamps;
+        uint64_t old_storage = view->storage_generation;
+        uint64_t old_view = view->view_generation;
+        uint64_t old_retained = view->retained_reserved_bytes;
+        uint64_t old_metadata = view->metadata_reserved_bytes;
+        atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+                ref)->usable_bytes, baseline + replacement - 1u,
+            memory_order_release);
+        int rc = mode == 0 ? col_rel_append_row(view, &batch[0])
+            : mode == 1 ? col_rel_append_rows_atomic(view, batch, 2u, 1u,
+                &denied)
+            : col_rel_append_all(view, suffix, NULL);
+        CHECK(rc == ENOMEM && view->nrows == 1u
+            && view->columns[0] == old_column
+            && view->timestamps == old_timestamps
+            && view->timestamp_capacity == 1u
+            && view->col_shared != NULL
+            && view->storage_generation == old_storage
+            && view->view_generation == old_view
+            && view->retained_reserved_bytes == old_retained
+            && view->metadata_reserved_bytes == old_metadata
+            && source->storage_alias_borrows == 1u
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == baseline,
+            "narrow timestamp append one-byte denial is transactional");
+        if (mode == 1)
+            CHECK(denied, "atomic narrow timestamp batch reports denial");
+        atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+                ref)->usable_bytes, baseline + replacement,
+            memory_order_release);
+        rc = mode == 0 ? col_rel_append_row(view, &batch[0])
+            : mode == 1 ? col_rel_append_rows_atomic(view, batch, 2u, 1u,
+                &denied)
+            : col_rel_append_all(view, suffix, NULL);
+        CHECK(rc == 0 && view->nrows == (mode == 0 ? 2u : 3u)
+            && view->timestamp_capacity == view->capacity
+            && view->col_shared == NULL
+            && view->columns[0] != old_column
+            && view->timestamps != old_timestamps
+            && view->retained_reserved_bytes == replacement
+            && source->storage_alias_borrows == 0u
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref))
+            == view->descriptor_reserved_bytes
+            + view->metadata_reserved_bytes + replacement,
+            "narrow timestamp append exact fit grows physical buffer");
+cleanup:
+        col_rel_destroy(view);
+        col_rel_destroy(suffix);
+        col_rel_destroy(source);
+        if (ref) {
+            CHECK(wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(ref)) == 0,
+                "narrow timestamp append teardown releases credit");
+            wl_columnar_memory_governor_ref_release(ref);
+        }
+    }
+}
+
+static void
+test_owned_narrow_timestamp_append(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    col_rel_t *rel = col_rel_new_auto("owned-narrow", 1);
+    int64_t value = 11;
+    make_resolution(&resolution, 1u << 20);
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && rel && col_rel_append_row(rel, &value) == 0
+        && col_rel_enable_timestamps(rel) == 0,
+        "owned narrow timestamp fixture");
+    if (!ref || !rel || !rel->timestamps)
+        goto cleanup;
+    col_delta_timestamp_t *narrow = realloc(rel->timestamps,
+            sizeof(*narrow));
+    CHECK(narrow != NULL, "owned physical timestamp shrink");
+    if (!narrow)
+        goto cleanup;
+    rel->timestamps = narrow;
+    rel->timestamp_capacity = 1u;
+    CHECK(col_rel_attach_memory_governor(rel, ref) == 0,
+        "attach owned narrow timestamp relation");
+    if (!rel->memory_governor)
+        goto cleanup;
+    uint64_t baseline = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+    uint64_t replacement = (uint64_t)rel->capacity
+        * (sizeof(int64_t) + sizeof(col_delta_timestamp_t));
+    int64_t *old_column = rel->columns[0];
+    col_delta_timestamp_t *old_timestamps = rel->timestamps;
+    uint64_t old_storage = rel->storage_generation;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, baseline + replacement - 1u,
+        memory_order_release);
+    CHECK(col_rel_append_row(rel, &value) == ENOMEM
+        && rel->nrows == 1u && rel->columns[0] == old_column
+        && rel->timestamps == old_timestamps
+        && rel->timestamp_capacity == 1u
+        && rel->storage_generation == old_storage
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == baseline,
+        "owned narrow timestamp one-byte denial preserves image");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, baseline + replacement,
+        memory_order_release);
+    CHECK(col_rel_append_row(rel, &value) == 0
+        && rel->nrows == 2u
+        && rel->timestamp_capacity == rel->capacity
+        && rel->retained_reserved_bytes == replacement
+        && rel->columns[0] != old_column
+        && rel->timestamps != old_timestamps,
+        "owned narrow timestamp exact-fit transition");
+cleanup:
+    col_rel_destroy(rel);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "owned narrow timestamp teardown releases credit");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_legacy_shared_view_attach(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    col_rel_t *source = col_rel_new_auto("legacy-shared-source", 1);
+    col_rel_t *dst = col_rel_new_auto("legacy-shared-dst", 1);
+    int64_t value = 3;
+    CHECK(source && dst && col_rel_append_row(source, &value) == 0
+        && col_rel_enable_timestamps(source) == 0
+        && col_rel_install_shared_view(dst, source) == 0,
+        "legacy shared-view attach fixture");
+    if (!source || !dst || !dst->col_shared)
+        goto cleanup;
+    uint64_t exact = descriptor_bytes("legacy-shared-dst")
+        + metadata_bytes(dst)
+        + (uint64_t)dst->timestamp_capacity
+        * sizeof(col_delta_timestamp_t);
+    make_resolution(&resolution, exact - 1u);
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && col_rel_attach_memory_governor(dst, ref) == ENOSPC
+        && dst->memory_governor == NULL
+        && dst->metadata_reserved_bytes == 0
+        && dst->retained_reserved_bytes == 0
+        && source->storage_alias_borrows == 1u
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0,
+        "legacy shared-view attach one-byte denial rolls all tokens back");
+    if (ref) wl_columnar_memory_governor_ref_release(ref);
+    make_resolution(&resolution, exact);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && col_rel_attach_memory_governor(dst, ref) == 0
+        && dst->metadata_reserved_bytes == metadata_bytes(dst)
+        && dst->retained_reserved_bytes == (uint64_t)dst->timestamp_capacity
+        * sizeof(col_delta_timestamp_t)
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == exact,
+        "legacy shared-view attach exact physical image");
+    col_rel_destroy(dst);
+    dst = NULL;
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "legacy shared-view attach teardown releases credit");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+cleanup:
+    col_rel_destroy(dst);
+    col_rel_destroy(source);
+}
+
+static void
+test_shared_table_retirement_paths(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    make_resolution(&resolution, 1u << 20);
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    col_rel_t *source = col_rel_new_auto("table-owner", 1);
+    col_rel_t *view = col_rel_new_auto("table-view", 1);
+    col_rel_t *typed = col_rel_new_auto("table-typed", 1);
+    int64_t value = 11;
+    wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    CHECK(ref && source && view && typed
+        && col_rel_append_row(source, &value) == 0
+        && col_rel_append_row(typed, &value) == 0
+        && col_rel_set_column_types(typed, &type, 1) == 0
+        && col_rel_attach_memory_governor(view, ref) == 0
+        && col_rel_install_shared_view(view, source) == 0,
+        "shared-table retirement fixture");
+    if (!ref || !source || !view || !typed || !view->col_shared)
+        goto cleanup;
+    uint64_t table = shared_table_bytes(1);
+    CHECK(view->metadata_reserved_bytes == metadata_bytes(view)
+        && view->metadata_reserved_bytes >= table,
+        "shared pointer and flag tables belong to metadata token");
+    CHECK(col_rel_append_all(view, typed, NULL) == 0
+        && view->col_shared == NULL
+        && view->column_types != NULL
+        && view->metadata_reserved_bytes == metadata_bytes(view)
+        && source->storage_alias_borrows == 0u,
+        "typed append retires shared table credit before metadata publish");
+    col_rel_destroy(view);
+    view = col_rel_new_auto("table-detach", 1);
+    CHECK(view && col_rel_attach_memory_governor(view, ref) == 0
+        && col_rel_install_shared_view(view, source) == 0,
+        "shared-table delta-detach setup");
+    if (view && view->col_shared) {
+        uint64_t shared_metadata = view->metadata_reserved_bytes;
+        CHECK(wl_columnar_relation_delta_detach(view,
+            view->relation_identity) == 0
+            && view->col_shared == NULL && view->columns == NULL
+            && view->metadata_reserved_bytes == shared_metadata - table
+            && source->storage_alias_borrows == 0u,
+            "delta detach frees tables before metadata downsize");
+    }
+    col_rel_destroy(view);
+    view = NULL;
+    col_rel_t *empty_source = col_rel_new_auto("table-empty-owner", 1);
+    view = col_rel_new_auto("table-compact", 1);
+    CHECK(empty_source && view
+        && col_rel_attach_memory_governor(view, ref) == 0
+        && col_rel_install_shared_view(view, empty_source) == 0,
+        "shared-table empty compaction setup");
+    if (view && view->col_shared) {
+        uint64_t shared_metadata = view->metadata_reserved_bytes;
+        CHECK(col_rel_compact(view) == 0 && view->col_shared == NULL
+            && view->metadata_reserved_bytes == shared_metadata - table
+            && empty_source->storage_alias_borrows == 0u,
+            "empty compaction retires shared table credit once");
+    }
+    col_rel_destroy(empty_source);
+cleanup:
+    col_rel_destroy(view);
+    col_rel_destroy(typed);
+    col_rel_destroy(source);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "shared-table retirement teardown releases all credit");
         wl_columnar_memory_governor_ref_release(ref);
     }
 }
@@ -2644,32 +3102,85 @@ test_compound_map_attach_and_shared_view(void)
         "compound-map legacy attach exact fit");
     if (!ref || rel->memory_governor != ref)
         goto cleanup;
-    make_resolution(&resolution,
-        descriptor_bytes("map-add") + metadata_bytes(add));
+    uint64_t add_base = descriptor_bytes("map-add") + metadata_bytes(add);
+    uint64_t add_new = metadata_bytes(rel) + shared_table_bytes(rel->ncols);
+    make_resolution(&resolution, add_base + add_new - 1u);
     add_ref = wl_columnar_memory_governor_ref_create(&resolution);
     CHECK(add_ref && col_rel_attach_memory_governor(add, add_ref) == 0,
         "governed shared-view addition setup");
     if (add_ref && add->memory_governor == add_ref) {
         uint64_t add_view = add->view_generation;
-        CHECK(col_rel_install_shared_view(add, rel) == ENOTSUP
-            && add->compound_arity_len == 0
-            && add->view_generation == add_view,
-            "governed shared view refuses compound addition");
+        int64_t **old_columns = add->columns;
+        CHECK(col_rel_install_shared_view(add, rel) == ENOSPC
+            && add->compound_arity_len == 0 && add->columns == old_columns
+            && add->view_generation == add_view
+            && add->metadata_reserved_bytes == metadata_bytes(add)
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(add_ref)) == add_base,
+            "governed shared-view map addition denial preserves old image");
+        atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+                add_ref)->usable_bytes, add_base + add_new,
+            memory_order_release);
+        CHECK(col_rel_install_shared_view(add, rel) == 0
+            && add->compound_arity_len == 1
+            && add->compound_arity_map[0] == 2
+            && add->metadata_reserved_bytes == add_new
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(add_ref))
+            == descriptor_bytes("map-add") + add_new,
+            "governed shared-view map addition exact fit");
     }
+    col_rel_destroy(add);
+    add = NULL;
+    uint64_t removal_new = metadata_bytes(plain)
+        + shared_table_bytes(plain->ncols);
     view = rel->view_generation;
-    CHECK(col_rel_install_shared_view(rel, plain) == ENOTSUP
-        && rel->compound_arity_len == 1
+    uint32_t *old_map = rel->compound_arity_map;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, exact + removal_new - 1u,
+        memory_order_release);
+    CHECK(col_rel_install_shared_view(rel, plain) == ENOSPC
+        && rel->compound_arity_len == 1 && rel->compound_arity_map == old_map
         && rel->view_generation == view
         && wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(ref)) == exact,
-        "governed shared view refuses compound removal");
-    CHECK(col_rel_install_shared_view(plain, rel) == 0
-        && plain->compound_arity_len == 1,
-        "ungoverned shared view copies bounded compound map");
+        "governed shared-view map removal denial preserves old image");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, exact + removal_new, memory_order_release);
+    CHECK(col_rel_install_shared_view(rel, plain) == 0
+        && rel->compound_arity_len == 0 && rel->compound_arity_map == NULL
+        && rel->metadata_reserved_bytes == removal_new
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == descriptor_bytes("attached-map") + removal_new,
+        "governed shared-view map removal exact fit");
+    int64_t **old_shared_columns = rel->columns;
+    view = rel->view_generation;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes,
+        descriptor_bytes("attached-map") + 2u * removal_new - 1u,
+        memory_order_release);
+    CHECK(col_rel_install_shared_view(rel, plain) == ENOSPC
+        && rel->columns == old_shared_columns
+        && rel->view_generation == view
+        && plain->storage_alias_borrows == 1u,
+        "governed shared-view replacement denies one-byte overlap");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes,
+        descriptor_bytes("attached-map") + 2u * removal_new,
+        memory_order_release);
+    CHECK(col_rel_install_shared_view(rel, plain) == 0
+        && rel->columns != old_shared_columns
+        && rel->metadata_reserved_bytes == removal_new
+        && plain->storage_alias_borrows == 1u
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == descriptor_bytes("attached-map") + removal_new,
+        "governed shared-view replacement releases retired image once");
 cleanup:
     col_rel_destroy(add);
-    col_rel_destroy(plain);
     col_rel_destroy(rel);
+    col_rel_destroy(plain);
     if (add_ref) {
         CHECK(wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(add_ref)) == 0,
@@ -2820,6 +3331,12 @@ main(void)
     test_governed_empty_compound_copy();
     test_physical_timestamp_capacity();
     test_cow_retained_timestamp_capacity_admission();
+    test_governed_shared_view_timestamp_transaction();
+    test_governed_shared_view_dst_only_timestamps();
+    test_shared_view_narrow_timestamp_appends();
+    test_owned_narrow_timestamp_append();
+    test_legacy_shared_view_attach();
+    test_shared_table_retirement_paths();
     test_replacement_expands_narrow_timestamps();
     test_timestamp_shape_attach_invariant();
     test_timestamp_only_retained_admission();

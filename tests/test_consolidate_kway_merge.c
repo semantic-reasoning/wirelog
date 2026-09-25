@@ -1336,8 +1336,17 @@ test_consolidate_scratch_admission(void)
         + sizeof(wl_columnar_memory_reservation_t);
     uint64_t metadata_bytes = sizeof(*rel->col_names)
         + strlen(rel->col_names[0]) + 1u;
+    uint64_t view_metadata_bytes = 3u + sizeof(*rel->col_names)
+        + strlen(source->col_names[0]) + 1u
+        + sizeof(struct ArrowSchema *) + sizeof(struct ArrowSchema)
+        + 2u + strlen(source->col_names[0]) + 1u
+        + sizeof(int64_t *) + sizeof(bool);
+    /* Two segment bounds, one four-row merge buffer plus its sentinel,
+     * and a three-slot insertion workspace for the unsorted pairs. */
+    uint64_t scratch_bytes = 2u * 2u * sizeof(uint32_t)
+        + (4u + 1u + 3u) * sizeof(int64_t);
     ref = test_consolidate_governor_create(descriptor_bytes
-            + metadata_bytes);
+            + metadata_bytes + view_metadata_bytes);
     if (!ref || col_rel_attach_memory_governor(rel, ref) != 0
         || col_rel_install_shared_view(rel, source) != 0) {
         if (ref)
@@ -1346,6 +1355,17 @@ test_consolidate_scratch_admission(void)
         test_rel_free(source);
         FAIL("failed to attach constrained governor/shared view");
     }
+    if (rel->metadata_reserved_bytes != view_metadata_bytes) {
+        test_rel_free(rel);
+        test_rel_free(source);
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("shared-view metadata footprint differs from exact fixture");
+    }
+    uint64_t live_bytes = rel->descriptor_reserved_bytes
+        + rel->metadata_reserved_bytes;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, live_bytes + scratch_bytes - 1u,
+        memory_order_release);
     memcpy(before, rel->columns[0], sizeof(before));
     view_generation = rel->view_generation;
     storage_generation = rel->storage_generation;
