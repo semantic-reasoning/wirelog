@@ -205,6 +205,14 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
 
     uint32_t rc_cnt = sp->relation_count;
 
+    /* A2 will account the timestamped pointer-steal and backup lifecycle.
+    * Refuse a governed stratum before changing any relation in Step 0. */
+    for (uint32_t ri = 0; ri < rc_cnt; ri++) {
+        col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
+        if (r && r->ncols && r->memory_governor)
+            return ENOTSUP;
+    }
+
     /* retract_data[ri] will hold the stolen post-consolidation pointer;
      * no malloc/memcpy needed — ownership is transferred from r->data. */
     int64_t **retract_data = (int64_t **)calloc(rc_cnt, sizeof(int64_t *));

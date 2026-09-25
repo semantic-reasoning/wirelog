@@ -3327,8 +3327,8 @@ test_sort_failure_atomicity(void)
         "shared sort failure restores borrowed column");
     CHECK(view->col_shared != NULL && view->col_shared[0],
         "shared sort failure restores borrowed flag");
-    CHECK(view->col_shared != old_flags,
-        "shared sort failure recreates ownership flags");
+    CHECK(view->col_shared == old_flags,
+        "shared sort failure preserves ownership flags");
     CHECK(view->view_generation == old_view
         && view->storage_generation == old_storage,
         "shared sort failure restores generations");
@@ -4220,7 +4220,8 @@ test_staged_replacement_prepared_window(void)
     resolution.budget_bytes = 4096u + descriptor_bytes
         + 2u * one_column_metadata_bytes
         + 2u * sizeof(wirelog_column_type_t)
-        + 2u * sizeof(uint32_t);
+        + 2u * sizeof(uint32_t)
+        + (uint64_t)COL_REL_INIT_CAP * sizeof(col_delta_timestamp_t);
     resolution.usable_bytes = resolution.budget_bytes;
     resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
     resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;

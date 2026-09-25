@@ -226,20 +226,10 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
                                    : work->merge_buf_cap * 2;
             if (new_cap < max_rows)
                 new_cap = max_rows;
-            if (work->merge_columns) {
-                if (col_columns_realloc(work->merge_columns, nc,
-                    new_cap) != 0) {
-                    return col_op_diff_cleanup_owned_relation(stack, &e, work,
-                               work_owned, ENOMEM);
-                }
-            } else {
-                work->merge_columns = col_columns_alloc(nc, new_cap);
-                if (!work->merge_columns) {
-                    return col_op_diff_cleanup_owned_relation(stack, &e, work,
-                               work_owned, ENOMEM);
-                }
-            }
-            work->merge_buf_cap = new_cap;
+            int grid_rc = col_rel_reserve_merge_grid(work, new_cap);
+            if (grid_rc != 0)
+                return col_op_diff_cleanup_owned_relation(stack, &e, work,
+                           work_owned, grid_rc);
             merged_cols = work->merge_columns;
             used_merge_buf = true;
         }
@@ -296,7 +286,8 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
             uint32_t tight = out_idx + out_idx / 4;
             if (tight < COL_REL_INIT_CAP)
                 tight = COL_REL_INIT_CAP;
-            if (col_columns_realloc(work->columns, nc, tight) == 0)
+            if (!work->memory_governor
+                && col_columns_realloc(work->columns, nc, tight) == 0)
                 work->capacity = tight;
             if (work->capacity == tight)
                 wl_columnar_relation_touch_storage(work);
