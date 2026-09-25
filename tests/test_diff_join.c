@@ -76,8 +76,7 @@ destroy_mock_session(wl_col_session_t *s)
 {
     wl_workqueue_destroy(s->wq);
     for (uint32_t i = 0; i < s->nrels; i++) {
-        col_rel_free_contents(s->rels[i]);
-        free(s->rels[i]);
+        col_rel_destroy(s->rels[i]);
     }
     free(s->rels);
     /* Free arrangement registry (matches real session destroy) */

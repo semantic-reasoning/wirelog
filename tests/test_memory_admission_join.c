@@ -279,8 +279,7 @@ destroy_session(wl_col_session_t *s)
         return;
     wl_workqueue_destroy(s->wq);
     for (uint32_t i = 0; i < s->nrels; i++) {
-        col_rel_free_contents(s->rels[i]);
-        free(s->rels[i]);
+        col_rel_destroy(s->rels[i]);
     }
     free(s->rels);
     if (s->rels_reservation.identity == &s->rels_reservation
@@ -322,6 +321,13 @@ reserved_for(wl_columnar_memory_governor_ref_t *ref)
 {
     return wl_columnar_memory_reserved(
         wl_columnar_memory_governor_ref_get(ref));
+}
+
+static uint64_t
+relation_charge(const col_rel_t *relation)
+{
+    return relation->retained_reserved_bytes
+           + relation->descriptor_reserved_bytes;
 }
 
 /*
@@ -676,7 +682,7 @@ measure_output_bytes(uint64_t *out_bytes)
             || !wl_columnar_memory_size_add(row_bytes, hash_bytes,
             &scratch_bytes)
             || !wl_columnar_memory_size_add(
-                governed->retained_reserved_bytes, scratch_bytes, out_bytes))
+                relation_charge(governed), scratch_bytes, out_bytes))
             goto out_entry;
     }
     ok = true;
@@ -1478,7 +1484,7 @@ test_cache_adoption_charges_once(void)
         FAIL("the materialized output did not reach the cache");
         goto out_entry;
     }
-    out_bytes = governed->retained_reserved_bytes;
+    out_bytes = relation_charge(governed);
     if (out_bytes == 0u) {
         FAIL("the cached join output holds no reservation to account");
         goto out_entry;
@@ -1934,7 +1940,7 @@ measure_parallel_diff_peak(uint64_t *peak_out)
         &initial_bytes)
         || governed->retained_reserved_bytes != final_bytes)
         goto out_entry;
-    other_bytes = reserved_of(sess) - governed->retained_reserved_bytes;
+    other_bytes = reserved_of(sess) - relation_charge(governed);
     /* A diff transaction deep-copies the persistent arrangement while the
      * output grows, so include that second arrangement footprint and the
      * output's initial token in the one-byte-short budget. */
@@ -2016,7 +2022,7 @@ test_parallel_diff_output_is_governed(void)
             FAIL("diff miss did not charge its governed stack twin");
             goto out_entry;
         }
-        uint64_t result_bytes = result.rel->retained_reserved_bytes;
+        uint64_t result_bytes = relation_charge(result.rel);
         eval_stack_t cons_stack;
         eval_stack_init(&cons_stack);
         if (eval_stack_push(&cons_stack, result.rel, true) != 0) {
@@ -2031,7 +2037,7 @@ test_parallel_diff_output_is_governed(void)
             != expected_rows
             || cons_stack.items[0].rel->memory_governor
             != sess->memory_governor
-            || cons_stack.items[0].rel->retained_reserved_bytes != result_bytes
+            || relation_charge(cons_stack.items[0].rel) != result_bytes
             || reserved_of(sess) != before) {
             (void)eval_stack_drain(&cons_stack);
             FAIL("differential CONS changed governed output accounting");
@@ -2148,7 +2154,7 @@ test_differential_cache_hit_reclaim_pin(void)
         || result.rel->memory_governor != sess->memory_governor
         || !admission_invariant(result.rel)
         || reserved_of(sess) != registry_charge(sess)
-        + result.rel->retained_reserved_bytes) {
+        + relation_charge(result.rel)) {
         FAIL("differential cache hit did not retain pin and charge its copy");
         goto out_result;
     }
@@ -2660,7 +2666,7 @@ run_refused_diff_result_cleanup(uint32_t stack_depth)
         goto out;
     eval_entry_t *retained = &stack.items[stack.top - 1];
     segments = retained->seg_boundaries;
-    charged = retained->rel->retained_reserved_bytes;
+    charged = relation_charge(retained->rel);
     reservation = &retained->rel->retained_reservation;
     reservation_governor = reservation->governor;
     reservation_identity = reservation->identity;
@@ -2679,7 +2685,7 @@ run_refused_diff_result_cleanup(uint32_t stack_depth)
         != wl_columnar_memory_governor_ref_get(sess->memory_governor)
         || !reservation_identity || owner_bits == 0
         || reservation_state != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
-        || reservation->bytes != charged
+        || reservation->bytes != retained->rel->retained_reserved_bytes
         || !charged || reserved_of(sess) != baseline + charged)
         goto out;
     for (uint32_t i = 0; i + 1 < stack_depth; i++) {
@@ -2690,7 +2696,7 @@ run_refused_diff_result_cleanup(uint32_t stack_depth)
         || stack.items[stack.top - 1].rel != test_diff_commit_retained_rel
         || stack.items[stack.top - 1].seg_boundaries != segments
         || stack.items[stack.top - 1].seg_count != 2
-        || stack.items[stack.top - 1].rel->retained_reserved_bytes != charged
+        || relation_charge(stack.items[stack.top - 1].rel) != charged
         || &stack.items[stack.top - 1].rel->retained_reservation
         != reservation
         || reservation->identity != reservation_identity
@@ -2699,7 +2705,7 @@ run_refused_diff_result_cleanup(uint32_t stack_depth)
         memory_order_acquire) != owner_bits
         || atomic_load_explicit(&reservation->state,
         memory_order_acquire) != reservation_state
-        || reservation->bytes != charged
+        || reservation->bytes != retained->rel->retained_reserved_bytes
         || reserved_of(sess) != baseline + charged)
         goto out;
     if (col_rel_source_reader_release(&test_diff_commit_reader) != 0)
@@ -2809,8 +2815,8 @@ test_materialized_stack_copy_contract(void)
         goto out_entry;
     }
     reserved = reserved_of(sess);
-    cache_bytes = cached->retained_reserved_bytes;
-    copy_bytes = result.rel->retained_reserved_bytes;
+    cache_bytes = relation_charge(cached);
+    copy_bytes = relation_charge(result.rel);
     if (cache_bytes == 0 || copy_bytes == 0
         || reserved != registry_charge(sess) + cache_bytes + copy_bytes) {
         FAIL("cache and stack twin reservations are not both charged");
@@ -2830,7 +2836,7 @@ test_materialized_stack_copy_contract(void)
         || !test_cache_pin_protected
         || result.rel == cached || result.rel->memory_governor
         != sess->memory_governor
-        || result.rel->retained_reserved_bytes != copy_bytes
+        || relation_charge(result.rel) != copy_bytes
         || col_rel_get(result.rel, 0, 0) != col_rel_get(cached, 0, 0)
         || reserved_of(sess) != registry_charge(sess)
         + cache_bytes + copy_bytes) {
@@ -2908,7 +2914,7 @@ test_cache_copy_governor_precedence(void)
         goto out;
     }
     right = NULL;
-    source_bytes = cached->retained_reserved_bytes;
+    source_bytes = relation_charge(cached);
     if (col_mat_cache_insert(&sess->mat_cache, left,
         session_find_rel(sess, "right"), cached) != 0) {
         FAIL("could not seed governed cache result");
@@ -2925,7 +2931,7 @@ test_cache_copy_governor_precedence(void)
         FAIL("cache hit did not select the session governor");
         goto out_result;
     }
-    copy_bytes = result.rel->retained_reserved_bytes;
+    copy_bytes = relation_charge(result.rel);
     if (reserved_for(source_governor)
         != registry_charge(sess) + source_bytes
         || reserved_for(other) != copy_bytes || copy_bytes == 0) {
@@ -2945,7 +2951,7 @@ test_cache_copy_governor_precedence(void)
         || !admission_invariant(result.rel)
         || reserved_for(source_governor)
         != registry_charge(sess) + source_bytes
-        + result.rel->retained_reserved_bytes
+        + relation_charge(result.rel)
         || reserved_for(other) != 0u) {
         FAIL("cache hit did not fall back to the source governor");
         goto out_result;
@@ -3015,7 +3021,7 @@ test_governed_copy_payload_failure_falls_back_to_accounted_original(void)
         || !admission_invariant(result.rel)
         || cached_output(sess, left) != NULL
         || reserved_of(sess) != registry_charge(sess)
-        + result.rel->retained_reserved_bytes) {
+        + relation_charge(result.rel)) {
         FAIL(
             "failed twin admission leaked a token or published an unaccounted result");
         goto out_entry;
@@ -3092,7 +3098,7 @@ test_materialized_cache_insert_failure_unwinds_both_results(void)
         || !admission_invariant(ordinary.rel)
         || sess->mat_cache.count != COL_MAT_CACHE_MAX
         || reserved_of(sess) != registry_charge(sess)
-        + ordinary.rel->retained_reserved_bytes) {
+        + relation_charge(ordinary.rel)) {
         FAIL("ENOSPC did not publish one already-accounted JOIN result");
         goto out;
     }
@@ -3115,7 +3121,7 @@ test_materialized_cache_insert_failure_unwinds_both_results(void)
         goto out;
     }
     uint64_t diff_reserved = reserved_of(sess);
-    uint64_t differential_bytes = differential.rel->retained_reserved_bytes;
+    uint64_t differential_bytes = relation_charge(differential.rel);
     if (diff_reserved < differential_bytes || differential_bytes == 0) {
         FAIL("differential fallback has no retained reservation");
         col_rel_destroy(differential.rel);
@@ -3197,17 +3203,17 @@ test_governed_join_consumers_release_exactly_once(void)
     if (!cache_entry || !admission_invariant(cache_entry)
         || stack.items[0].rel->retained_reserved_bytes == 0
         || reserved_of(sess) != registry_charge(sess)
-        + cache_entry->retained_reserved_bytes
-        + stack.items[0].rel->retained_reserved_bytes) {
+        + relation_charge(cache_entry)
+        + relation_charge(stack.items[0].rel)) {
         FAIL("JOIN did not charge cache and stack outputs exactly");
         goto out;
     }
-    cache_bytes = cache_entry->retained_reserved_bytes;
+    cache_bytes = relation_charge(cache_entry);
     int filter_rc = wl_columnar_filter_op(&filter_op, &stack, sess);
     if (filter_rc != 0 || stack.top != 1 || stack.items[0].rel->nrows != 4
         || stack.items[0].rel->memory_governor != sess->memory_governor
         || reserved_of(sess) != registry_charge(sess) + cache_bytes
-        + stack.items[0].rel->retained_reserved_bytes) {
+        + relation_charge(stack.items[0].rel)) {
         FAIL(
             "FILTER did not consume the governed copy and preserve cache charge");
         goto out;
