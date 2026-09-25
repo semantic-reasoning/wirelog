@@ -185,6 +185,7 @@ run_direct_join(wl_col_session_t *col_session, col_rel_t *left,
     op.left_keys = left_keys;
     op.right_keys = right_keys;
     op.delta_mode = WL_DELTA_FORCE_FULL;
+    op.materialized = true;
 
     eval_stack_init(&stack);
     if (eval_stack_push(&stack, left, false) != 0)
@@ -201,10 +202,11 @@ run_direct_join(wl_col_session_t *col_session, col_rel_t *left,
     return 0;
 }
 
-/* Admit the four-column output's initial payload and the 32-byte probe row,
- * but not the 192-byte minimum arrangement table (16 buckets plus 16 chain
- * slots) for the two-row test relation. Existing relations stay on their
- * original governor; swapping this into a session only affects later owners. */
+/* Admit the four-column output, key-index slots, probe row and arrangement
+ * key row, but not the 192-byte minimum arrangement table (16 buckets plus
+ * 16 chain slots) for the two-row test relation. Existing relations stay on
+ * their original governor; swapping this into a session only affects later
+ * owners. */
 static wl_columnar_memory_governor_ref_t *
 tight_arrangement_governor(void)
 {
@@ -217,7 +219,8 @@ tight_arrangement_governor(void)
         return NULL;
     }
     col_rel_destroy(shape);
-    resolution.budget_bytes = output_bytes + 32u;
+    resolution.budget_bytes = output_bytes + 32u + 2u * sizeof(uint32_t)
+        + 2u * sizeof(int64_t);
     resolution.usable_bytes = resolution.budget_bytes;
     resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
     resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
@@ -645,6 +648,130 @@ test_join_arr_primary_probe_enomem_propagates(void)
     PASS();
 }
 
+static void
+test_join_arr_probe_row_denial_retries(void)
+{
+    TEST("arrangement probe-row denial releases leases and permits retry");
+    const char *src = ".decl edge(x: int32, y: int32)\n"
+        "edge(1, 100). edge(2, 200).\n";
+    wl_session_t *sess = NULL;
+    int64_t count = 0;
+    if (run_program(src, "edge", &count, NULL, &sess) != 0 || !sess)
+        FAIL("edge fixture setup failed");
+    wl_col_session_t *cs = COL_SESSION(sess);
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    resolution.budget_bytes = 1024u * 1024u;
+    resolution.usable_bytes = resolution.budget_bytes;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    wl_columnar_memory_governor_ref_t *governor
+        = wl_columnar_memory_governor_ref_create(&resolution);
+    if (!governor) {
+        wl_session_destroy(sess);
+        FAIL("governor fixture failed");
+    }
+    wl_columnar_memory_governor_ref_t *original = cs->memory_governor;
+    cs->memory_governor = governor;
+
+    col_rel_t *warm_left = make_join_left();
+    col_rel_t *left = make_join_left();
+    col_rel_t *shape = col_rel_new_auto("$probe_row_output", 4);
+    wirelog_column_type_t types[] = {
+        WIRELOG_TYPE_INT32, WIRELOG_TYPE_INT32,
+        WIRELOG_TYPE_INT32, WIRELOG_TYPE_INT32,
+    };
+    uint64_t output_bytes = 0;
+    int64_t expected_rows[16] = { 0 };
+    uint32_t expected_nrows = 0;
+    if (!warm_left || !left || !shape
+        || col_rel_set_column_types(shape, types, 4) != 0
+        || !col_rel_retained_bytes_for(shape, COL_REL_INIT_CAP,
+        &output_bytes)) {
+        col_rel_destroy(warm_left);
+        col_rel_destroy(left);
+        col_rel_destroy(shape);
+        cs->memory_governor = original;
+        wl_columnar_memory_governor_ref_release(governor);
+        wl_session_destroy(sess);
+        FAIL("probe-row fixture setup failed");
+    }
+    col_rel_destroy(shape);
+    eval_entry_t warm_result = { 0 };
+    if (run_direct_join(cs, warm_left, &warm_result) != 0 || cs->arr_count == 0
+        || !warm_result.rel || warm_result.rel->nrows > 4) {
+        if (warm_result.owned && warm_result.rel)
+            col_rel_destroy(warm_result.rel);
+        col_rel_destroy(warm_left);
+        col_rel_destroy(left);
+        cs->memory_governor = original;
+        wl_columnar_memory_governor_ref_release(governor);
+        wl_session_destroy(sess);
+        FAIL("could not warm the persistent right arrangement");
+    }
+    expected_nrows = warm_result.rel->nrows;
+    for (uint32_t row = 0; row < expected_nrows; row++) {
+        for (uint32_t col = 0; col < 4; col++) {
+            expected_rows[row * 4u + col] = col_rel_get(warm_result.rel,
+                    row, col);
+        }
+    }
+    if (warm_result.owned && warm_result.rel)
+        col_rel_destroy(warm_result.rel);
+    col_rel_destroy(warm_left);
+    uint64_t baseline = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(governor));
+    /* Output + key-index + temporary output row fit; the 16-byte probe row
+     * does not. The arrangement itself is already retained in baseline. */
+    uint64_t limit = baseline + output_bytes + 2u * sizeof(uint32_t)
+        + 4u * sizeof(int64_t);
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(governor)
+        ->usable_bytes, limit, memory_order_release);
+    int rc = run_direct_join(cs, left, NULL);
+    if (rc != ENOSPC || !cs->memory_budget_denied || left->nrows != 2
+        || col_rel_get(left, 0, 0) != 1
+        || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)) != baseline) {
+        col_rel_destroy(left);
+        cs->memory_governor = original;
+        wl_columnar_memory_governor_ref_release(governor);
+        wl_session_destroy(sess);
+        FAIL("probe-row denial leaked a lease or changed the left input");
+    }
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(governor)
+        ->usable_bytes, resolution.budget_bytes, memory_order_release);
+    eval_entry_t result = { 0 };
+    rc = run_direct_join(cs, left, &result);
+    if (rc != 0 || !result.rel || result.rel->nrows != expected_nrows) {
+        if (result.owned && result.rel)
+            col_rel_destroy(result.rel);
+        col_rel_destroy(left);
+        cs->memory_governor = original;
+        wl_columnar_memory_governor_ref_release(governor);
+        wl_session_destroy(sess);
+        FAIL("successful retry did not reproduce exact join output");
+    }
+    for (uint32_t row = 0; row < expected_nrows; row++) {
+        for (uint32_t col = 0; col < 4; col++) {
+            if (col_rel_get(result.rel, row, col)
+                != expected_rows[row * 4u + col]) {
+                col_rel_destroy(result.rel);
+                col_rel_destroy(left);
+                cs->memory_governor = original;
+                wl_columnar_memory_governor_ref_release(governor);
+                wl_session_destroy(sess);
+                FAIL("retry rows differ from the successful control output");
+            }
+        }
+    }
+    col_rel_destroy(result.rel);
+    col_rel_destroy(left);
+    cs->memory_governor = original;
+    wl_columnar_memory_governor_ref_release(governor);
+    wl_session_destroy(sess);
+    PASS();
+}
+
 /* ================================================================
  * main
  * ================================================================ */
@@ -666,6 +793,7 @@ main(void)
     test_join_arr_large_chain_delta();
     test_join_arr_primary_probe_writer_retry();
     test_join_arr_primary_probe_enomem_propagates();
+    test_join_arr_probe_row_denial_retries();
 
     printf("\nResults: %d/%d passed", pass_count, test_count);
     if (fail_count > 0)
