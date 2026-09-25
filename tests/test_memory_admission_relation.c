@@ -2067,6 +2067,88 @@ cleanup:
 }
 
 static void
+test_shared_view_dst_only_timestamp_extent(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    col_rel_t *source = col_rel_new_auto("long-source", 1);
+    col_rel_t *dst = col_rel_new_auto("short-ts-view", 1);
+    int64_t value = 5;
+    make_resolution(&resolution, 1u << 20);
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && source && dst && col_rel_enable_timestamps(dst) == 0,
+        "destination-only timestamp extent fixture");
+    if (!ref || !source || !dst || !dst->timestamps)
+        goto cleanup;
+    uint32_t old_timestamp_capacity = dst->timestamp_capacity;
+    for (uint32_t row = 0; row <= old_timestamp_capacity; row++) {
+        value = (int64_t)row;
+        if (col_rel_append_row(source, &value) != 0) {
+            CHECK(false, "long un-timestamped source fixture");
+            goto cleanup;
+        }
+    }
+    CHECK(source->nrows > old_timestamp_capacity
+        && source->capacity >= source->nrows
+        && col_rel_attach_memory_governor(dst, ref) == 0
+        && col_rel_reserve_capacity_admitted(dst, dst->capacity, NULL) == 0,
+        "attach short destination timestamp buffer");
+    if (!dst->memory_governor || !dst->retained_reserved_bytes)
+        goto cleanup;
+    uint64_t baseline = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+    uint64_t new_metadata = auto_metadata_bytes(1)
+        + shared_table_bytes(1);
+    uint64_t new_retained = (uint64_t)source->nrows
+        * sizeof(col_delta_timestamp_t);
+    int64_t **old_columns = dst->columns;
+    col_delta_timestamp_t *old_timestamps = dst->timestamps;
+    uint64_t old_retained = dst->retained_reserved_bytes;
+    uint64_t old_view = dst->view_generation;
+    uint64_t old_storage = dst->storage_generation;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, baseline + new_metadata + new_retained - 1u,
+        memory_order_release);
+    CHECK(col_rel_install_shared_view(dst, source) == ENOSPC
+        && dst->columns == old_columns
+        && dst->timestamps == old_timestamps
+        && dst->timestamp_capacity == old_timestamp_capacity
+        && dst->retained_reserved_bytes == old_retained
+        && dst->view_generation == old_view
+        && dst->storage_generation == old_storage
+        && source->storage_alias_borrows == 0u
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == baseline,
+        "destination-only extent one-byte denial preserves image");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, baseline + new_metadata + new_retained,
+        memory_order_release);
+    uint64_t live_bytes = 0;
+    CHECK(col_rel_install_shared_view(dst, source) == 0
+        && dst->nrows == source->nrows
+        && dst->timestamp_capacity == source->nrows
+        && dst->timestamp_capacity >= dst->nrows
+        && dst->timestamps != old_timestamps
+        && dst->retained_reserved_bytes == new_retained
+        && col_rel_retained_live_bytes(dst, &live_bytes)
+        && live_bytes == new_retained
+        && source->storage_alias_borrows == 1u
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref))
+        == dst->descriptor_reserved_bytes + new_metadata + new_retained,
+        "destination-only exact extent fits and publishes valid shape");
+cleanup:
+    col_rel_destroy(dst);
+    col_rel_destroy(source);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "destination-only extent teardown releases credit");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
 test_shared_view_narrow_timestamp_appends(void)
 {
     for (int mode = 0; mode < 4; mode++) {
@@ -3333,6 +3415,7 @@ main(void)
     test_cow_retained_timestamp_capacity_admission();
     test_governed_shared_view_timestamp_transaction();
     test_governed_shared_view_dst_only_timestamps();
+    test_shared_view_dst_only_timestamp_extent();
     test_shared_view_narrow_timestamp_appends();
     test_owned_narrow_timestamp_append();
     test_legacy_shared_view_attach();
