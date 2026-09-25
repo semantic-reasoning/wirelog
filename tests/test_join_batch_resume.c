@@ -1702,6 +1702,9 @@ test_descriptor_uses_source_governor(void)
     wl_columnar_continuation_t *cont = NULL;
     uint64_t baseline;
     uint64_t admitted;
+    uint64_t descriptor_bytes;
+    uint64_t payload_bytes;
+    uint64_t session_baseline;
 
     TEST(
         "producer descriptor uses left-source governor without session governor");
@@ -1712,13 +1715,29 @@ test_descriptor_uses_source_governor(void)
     }
     source_governor = make_governor(1u << 20);
     session_governor = f.sess->memory_governor;
-    if (!source_governor
+    if (!descriptor_footprint(1u, 2u, &descriptor_bytes)
+        || col_rel_enable_timestamps(f.left) != 0
+        || col_rel_enable_timestamps(f.out) != 0
+        || !col_rel_retained_bytes_for(f.out, COL_REL_INIT_CAP,
+        &payload_bytes)
+        || !source_governor
         || col_rel_attach_memory_governor(f.left, source_governor) != 0) {
         FAIL("source governor setup");
         goto out;
     }
     baseline = wl_columnar_memory_reserved(
         wl_columnar_memory_governor_ref_get(source_governor));
+    session_baseline = reserved_of(f.sess);
+    if (col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1u, 8u * 32u, &cont) != 0 || !cont
+        || reserved_of(f.sess) <= session_baseline
+        || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(source_governor)) != baseline) {
+        FAIL("session governor did not take precedence over left source");
+        goto out;
+    }
+    wl_columnar_continuation_destroy(cont);
+    cont = NULL;
     f.sess->memory_governor = NULL;
     if (col_join_batch_producer_create(f.sess, &f.op, f.left, false,
         KEY0, KEY0, 1u, 8u * 32u, &cont) != 0 || !cont) {
@@ -1727,8 +1746,8 @@ test_descriptor_uses_source_governor(void)
     }
     admitted = wl_columnar_memory_reserved(
         wl_columnar_memory_governor_ref_get(source_governor));
-    if (admitted <= baseline) {
-        FAIL("producer descriptor was not charged to its source governor");
+    if (admitted - baseline != descriptor_bytes + payload_bytes) {
+        FAIL("source governor did not charge the exact initial payload");
         goto out;
     }
     wl_columnar_continuation_cancel(cont);
@@ -1747,6 +1766,146 @@ test_descriptor_uses_source_governor(void)
             wl_columnar_memory_governor_ref_get(governor_ref))
         != producer_credit) {
         FAIL("producer did not retain the governor after source detach");
+        goto out;
+    }
+    wl_columnar_continuation_destroy(cont);
+    cont = NULL;
+    PASS();
+out:
+    if (cont)
+        wl_columnar_continuation_destroy(cont);
+    f.sess->memory_governor = session_governor;
+    if (source_governor)
+        wl_columnar_memory_governor_ref_release(source_governor);
+    fixture_fini(&f);
+}
+
+static void
+test_batch_payload_uses_right_governor_fallback(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1 };
+    wl_columnar_memory_governor_ref_t *source_governor = NULL;
+    wl_columnar_memory_governor_ref_t *session_governor;
+    wl_columnar_continuation_t *cont = NULL;
+    col_rel_t *oracle = NULL;
+    uint64_t baseline;
+    uint64_t admitted;
+    uint64_t descriptor_bytes;
+    uint64_t payload_bytes;
+
+    TEST("batch payload uses right-source governor fallback");
+    if (!fixture_init(&f, 1u << 24, keys, 2, 2, 20)) {
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    source_governor = make_governor(1u << 20);
+    session_governor = f.sess->memory_governor;
+    if (!descriptor_footprint(1u, 2u, &descriptor_bytes)
+        || !col_rel_retained_bytes_for(f.out, COL_REL_INIT_CAP,
+        &payload_bytes)
+        || !source_governor
+        || col_rel_attach_memory_governor(f.right, source_governor) != 0) {
+        FAIL("right source governor setup");
+        goto out;
+    }
+    oracle = run_oracle(f.sess, f.left, &f.op);
+    if (!oracle) {
+        FAIL("oracle");
+        goto out;
+    }
+    baseline = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(source_governor));
+    f.sess->memory_governor = NULL;
+    if (col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1u, 8u * 32u, &cont) != 0 || !cont) {
+        FAIL("producer creation with right-only governor");
+        goto out;
+    }
+    admitted = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(source_governor));
+    if (admitted - baseline != descriptor_bytes + payload_bytes) {
+        FAIL("right governor did not charge the exact initial payload");
+        goto out;
+    }
+    if (col_join_batch_run_to_relation(cont, f.sess, f.out) != 0
+        || !same_rows(oracle, f.out)) {
+        FAIL("right-governed producer output differed from the oracle");
+        goto out;
+    }
+    wl_columnar_continuation_destroy(cont);
+    cont = NULL;
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(source_governor)) != baseline) {
+        FAIL("right-source producer destruction leaked admission");
+        goto out;
+    }
+    PASS();
+out:
+    if (cont)
+        wl_columnar_continuation_destroy(cont);
+    if (oracle)
+        col_rel_destroy(oracle);
+    f.sess->memory_governor = session_governor;
+    if (source_governor)
+        wl_columnar_memory_governor_ref_release(source_governor);
+    fixture_fini(&f);
+}
+
+static void
+test_batch_payload_denial_rolls_back_and_retries(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1 };
+    wl_columnar_memory_governor_ref_t *source_governor = NULL;
+    wl_columnar_memory_governor_ref_t *session_governor;
+    wl_columnar_continuation_t *cont = NULL;
+    const col_arr_entry_t *entry;
+    uint64_t descriptor_bytes;
+    uint64_t payload_bytes;
+    uint64_t budget;
+    uint64_t baseline;
+    int rc;
+
+    TEST("initial batch payload denial rolls back and permits retry");
+    if (!fixture_init(&f, 1u << 24, keys, 2, 2, 20)) {
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    session_governor = f.sess->memory_governor;
+    if (!descriptor_footprint(1u, 2u, &descriptor_bytes)
+        || !col_rel_retained_bytes_for(f.out, COL_REL_INIT_CAP,
+        &payload_bytes)
+        || !col_session_get_arrangement(&f.sess->base, "right", KEY0, 1u)) {
+        FAIL("admission footprint setup");
+        goto out;
+    }
+    budget = f.left->retained_reserved_bytes + descriptor_bytes
+        + payload_bytes - 1u;
+    source_governor = make_governor(budget);
+    if (!source_governor
+        || col_rel_attach_memory_governor(f.left, source_governor) != 0) {
+        FAIL("tight source governor setup");
+        goto out;
+    }
+    baseline = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(source_governor));
+    entry = find_entry(f.sess, "right");
+    f.sess->memory_governor = NULL;
+    rc = col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+            KEY0, KEY0, 1u, 8u * 32u, &cont);
+    if (rc != ENOSPC || cont != NULL || !entry || entry->pin_count != 0u
+        || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(source_governor)) != baseline) {
+        FAIL("initial payload denial was not typed or leaked a reservation");
+        goto out;
+    }
+    f.sess->memory_governor = session_governor;
+    if (col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1u, 8u * 32u, &cont) != 0 || !cont) {
+        FAIL("producer retry after denied source admission");
         goto out;
     }
     wl_columnar_continuation_destroy(cont);
@@ -2908,6 +3067,8 @@ main(void)
     test_lease_released_on_every_path();
     test_descriptor_reservation_shape();
     test_descriptor_uses_source_governor();
+    test_batch_payload_uses_right_governor_fallback();
+    test_batch_payload_denial_rolls_back_and_retries();
     test_projected_output();
     test_float_key();
     test_unsupported_budget_and_pooled_output();

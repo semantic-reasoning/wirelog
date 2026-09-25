@@ -479,19 +479,26 @@ col_join_batch_producer_create(wl_col_session_t *sess,
         goto fail;
     }
 
-    /* Scratch batch relation: same shape as the output, admitted once
-     * under the session governor, sized so one batch fits batch_bytes. */
+    /* Scratch batch relation: same shape as the output, admitted before
+     * allocation under the producer's effective governor. */
     ocols = col_join_output_width(left, right, op);
-    p->batch = col_rel_new_auto("$join_batch", ocols);
-    if (!p->batch) {
-        rc = ENOMEM;
-        goto fail;
+    bool timestamped = left->timestamps != NULL;
+    if (p->descriptor_governor)
+        rc = wl_columnar_relation_new_auto_governed("$join_batch", ocols,
+                COL_REL_INIT_CAP, timestamped, p->descriptor_governor,
+                &p->batch);
+    else {
+        p->batch = col_rel_new_auto("$join_batch", ocols);
+        rc = p->batch ? 0 : ENOMEM;
     }
+    if (rc != 0)
+        goto fail;
     if (col_join_set_output_types(p->batch, left, right, op) != 0) {
         rc = ENOMEM;
         goto fail;
     }
-    if (left->timestamps && col_rel_enable_timestamps(p->batch) != 0) {
+    if (timestamped && !p->batch->timestamps
+        && col_rel_enable_timestamps(p->batch) != 0) {
         rc = ENOMEM;
         goto fail;
     }
@@ -513,24 +520,9 @@ col_join_batch_producer_create(wl_col_session_t *sess,
     if (rows > UINT32_MAX)
         rows = UINT32_MAX;
     p->rows_per_batch = (uint32_t)rows;
-    if (sess->memory_governor) {
-        bool denied = false;
-        rc = col_rel_attach_memory_governor(p->batch, sess->memory_governor);
-        if (rc != 0)
-            goto fail;
-        rc = col_rel_reserve_capacity_admitted(p->batch, p->batch->capacity,
-                &denied);
-        if (rc != 0)
-            goto fail;
-    }
-    /* #1481: the scratch is NOT admitted at rows_per_batch here.  It starts
-     * at the COL_REL_INIT_CAP rows a fresh relation pre-allocates and doubles
-     * on demand in producer_produce, so a small join under a large
-     * WIRELOG_JOIN_BATCH_BYTES reserves what it uses rather than what the
-     * knob allows.  The governor-branch reservation above stays: it admits
-     * that initial capacity, and a session too tight for even 64 rows must
-     * still fail create rather than discover it mid-batch.
-     */
+    /* #1481: the scratch starts at COL_REL_INIT_CAP rows and doubles on
+     * demand in producer_produce, so a small join reserves what it uses
+     * rather than the full WIRELOG_JOIN_BATCH_BYTES allowance. */
 
     p->cursor.next.lr = 0;
     p->cursor.next.rr = UINT32_MAX;
