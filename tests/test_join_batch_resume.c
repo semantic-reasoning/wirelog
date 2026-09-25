@@ -1319,6 +1319,7 @@ test_exact_fit_and_one_byte_over(void)
         uint64_t r0;
         uint64_t before;
         uint64_t after;
+        uint64_t live_before;
         uint64_t budget;
         uint32_t pins_before;
         const col_arr_entry_t *entry;
@@ -1344,7 +1345,8 @@ test_exact_fit_and_one_byte_over(void)
         }
         r0 = reserved_of(f.sess);
         if (!col_rel_retained_bytes_for(f.out, f.out->capacity, &before)
-            || before != f.out->retained_reserved_bytes
+            || !col_rel_retained_live_bytes(f.out, &live_before)
+            || live_before != f.out->retained_reserved_bytes
             || !col_rel_retained_bytes_for(f.out, 100u, &after)) {
             FAIL("sink init did not admit the existing capacity");
             wl_columnar_continuation_destroy(cont);
@@ -1363,7 +1365,9 @@ test_exact_fit_and_one_byte_over(void)
          * that.  So the exact fit is one `after` higher than it was, and one
          * byte below it denies the SINK -- the scratch grow has already been
          * admitted by then. */
-        budget = r0 + 2u * after - before - (uint64_t)deny;
+        budget = r0 + 2u * after - before
+            + (uint64_t)f.out->ncols * sizeof(int64_t *)
+            - (uint64_t)deny;
         wl_columnar_continuation_destroy(cont);
         fixture_fini(&f);
         if (!fixture_init(&f, budget, keys, 1, 1, 300)
@@ -1392,13 +1396,13 @@ test_exact_fit_and_one_byte_over(void)
                  * rows, cursor, output reservation, pin -- is unchanged; the
                  * narrowing is to the governor total alone. */
                 && reserved_of(f.sess) == r0 + after - before
-                && f.out->retained_reserved_bytes == before
+                && f.out->retained_reserved_bytes == live_before
                 && entry && entry->pin_count == pins_before;
         } else {
             uint64_t now;
             ok = ok && st == WL_COLUMNAR_CONTINUATION_OK
                 && f.out->nrows == 100u && cur.sequence == 1u
-                && col_rel_retained_bytes_for(f.out, f.out->capacity, &now)
+                && col_rel_retained_live_bytes(f.out, &now)
                 && now == f.out->retained_reserved_bytes
                 /* Both grows settled: the scratch's and the sink's. */
                 && reserved_of(f.sess) == r0 + 2u * (after - before);
@@ -1643,6 +1647,7 @@ descriptor_footprint(uint32_t key_count, uint32_t right_ncols,
     int64_t left_row[3] = { 1, 2, 3 };
     int64_t right_row[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
     uint64_t batch_bytes;
+    uint64_t batch_payload;
     uint64_t batch_descriptor;
     uint64_t batch_metadata;
     uint64_t baseline;
@@ -1682,6 +1687,8 @@ descriptor_footprint(uint32_t key_count, uint32_t right_ncols,
     if (!out || col_join_set_output_types(out, left, sess->rels[0], &op) != 0
         || !col_rel_retained_bytes_for(out, 64u, &batch_bytes))
         goto done;
+    batch_payload = batch_bytes + (uint64_t)out->ncols
+        * (sizeof(int64_t *) + sizeof(int64_t));
     batch_descriptor = sizeof(col_rel_t) + sizeof("$join_batch");
     batch_metadata = 3u + (uint64_t)out->ncols
         * (sizeof(char *) + sizeof(wirelog_column_type_t)
@@ -1694,9 +1701,9 @@ descriptor_footprint(uint32_t key_count, uint32_t right_ncols,
     int create_rc = col_join_batch_producer_create(sess, &op, left, false,
             lk, rk, key_count, batch_budget, &cont);
     if (create_rc != 0 || !cont || reserved_of(sess) <= baseline
-        + batch_bytes + batch_descriptor + batch_metadata)
+        + batch_payload + batch_descriptor + batch_metadata)
         goto done;
-    *bytes_out = reserved_of(sess) - baseline - batch_bytes
+    *bytes_out = reserved_of(sess) - baseline - batch_payload
         - batch_descriptor - batch_metadata;
     ok = *bytes_out >= (uint64_t)sizeof(uint32_t) * key_count * 2u
         + (uint64_t)sizeof(int64_t) * right_ncols;

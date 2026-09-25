@@ -1421,20 +1421,10 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
                                    : work->merge_buf_cap * 2;
             if (new_cap < max_rows)
                 new_cap = max_rows;
-            if (work->merge_columns) {
-                if (col_columns_realloc(work->merge_columns, nc,
-                    new_cap) != 0) {
-                    return col_op_cleanup_owned_relation(stack, &e, work,
-                               work_owned, ENOMEM);
-                }
-            } else {
-                work->merge_columns = col_columns_alloc(nc, new_cap);
-                if (!work->merge_columns) {
-                    return col_op_cleanup_owned_relation(stack, &e, work,
-                               work_owned, ENOMEM);
-                }
-            }
-            work->merge_buf_cap = new_cap;
+            int grid_rc = col_rel_reserve_merge_grid(work, new_cap);
+            if (grid_rc != 0)
+                return col_op_cleanup_owned_relation(stack, &e, work,
+                           work_owned, grid_rc);
             merged_cols = work->merge_columns;
             used_merge_buf = true;
         }
@@ -1489,7 +1479,8 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
             uint32_t tight = out + out / 4;
             if (tight < COL_REL_INIT_CAP)
                 tight = COL_REL_INIT_CAP;
-            if (col_columns_realloc(work->columns, nc, tight) == 0) {
+            if (!work->memory_governor
+                && col_columns_realloc(work->columns, nc, tight) == 0) {
                 work->capacity = tight;
                 wl_columnar_relation_touch_storage(work);
             }
@@ -1954,6 +1945,7 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
             free(rel->timestamps);
             rel->timestamps = NULL;
             rel->timestamp_capacity = 0;
+            col_rel_retire_payload_credit(rel);
             wl_columnar_relation_touch_storage(rel);
         }
         if (out_fast_path)
@@ -2054,6 +2046,7 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
             free(rel->timestamps);
             rel->timestamps = NULL;
             rel->timestamp_capacity = 0;
+            col_rel_retire_payload_credit(rel);
         }
         if (out_fast_path)
             *out_fast_path = 0;
@@ -2070,19 +2063,10 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
                                : rel->merge_buf_cap * 2;
         if (new_cap < max_rows)
             new_cap = max_rows;
-        if (nc == 0) {
-            rel->merge_buf_cap = new_cap;
-        } else if (rel->merge_columns) {
-            if (col_columns_realloc(rel->merge_columns, nc, new_cap) != 0)
-                return col_op_consolidate_incremental_delta_fail(delta_out,
-                           delta_initial_nrows, ENOMEM);
-        } else {
-            rel->merge_columns = col_columns_alloc(nc, new_cap);
-            if (!rel->merge_columns)
-                return col_op_consolidate_incremental_delta_fail(delta_out,
-                           delta_initial_nrows, ENOMEM);
-        }
-        rel->merge_buf_cap = new_cap;
+        int grid_rc = col_rel_reserve_merge_grid(rel, new_cap);
+        if (grid_rc != 0)
+            return col_op_consolidate_incremental_delta_fail(delta_out,
+                       delta_initial_nrows, grid_rc);
     }
     int64_t **merged_cols = rel->merge_columns;
 
@@ -2191,15 +2175,18 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
         uint32_t tight = out + out / 4;
         if (tight < COL_REL_INIT_CAP)
             tight = COL_REL_INIT_CAP;
-        if (col_columns_realloc(rel->columns, nc, tight) == 0)
+        if (!rel->memory_governor
+            && col_columns_realloc(rel->columns, nc, tight) == 0)
             wl_columnar_relation_touch_storage(rel);
-        rel->capacity = tight;
+        if (!rel->memory_governor)
+            rel->capacity = tight;
     }
 
     if (rel->timestamps) {
         free(rel->timestamps);
         rel->timestamps = NULL;
         rel->timestamp_capacity = 0;
+        col_rel_retire_payload_credit(rel);
         wl_columnar_relation_touch_storage(rel);
     }
     if (out_fast_path)
