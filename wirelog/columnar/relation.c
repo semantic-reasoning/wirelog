@@ -4549,7 +4549,9 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
     if (!wl_columnar_relation_compound_map_valid(src))
         return EINVAL;
     shared_timestamp_capacity = src->timestamps ? src->timestamp_capacity
-        : dst->timestamps ? src->capacity : 0;
+        : dst->timestamps
+            ? (dst->timestamp_capacity > src->nrows
+                ? dst->timestamp_capacity : src->nrows) : 0;
     if (!col_rel_shared_view_metadata_bytes(src, &metadata_bytes)
         || !col_rel_retained_shape_bytes(0, 0,
         shared_timestamp_capacity, &retained_bytes))
