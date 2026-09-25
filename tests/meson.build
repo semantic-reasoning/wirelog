@@ -5122,6 +5122,11 @@ test('tdd_execution_audit', bench_flowlog_json_py3,
      suite: 'bench',
      timeout: 90)
 
+test('flowlog_portfolio_result_validation', bench_flowlog_json_py3,
+     args: [files('test_flowlog_portfolio.py')[0]],
+     suite: 'bench',
+     timeout: 30)
+
 test_tdd_single_key_owner_exe = executable(
   'test_tdd_single_key_owner',
   files('test_tdd_single_key_owner.c'),
