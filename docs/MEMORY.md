@@ -321,8 +321,12 @@ The session relation-name hash owns a governor reservation for its bucket and
 chain arrays. Rebuilds reserve both replacement arrays while the old index is
 live; denied optional rebuilds leave lookup on its linear fallback.
 Transactional registry images hold their hash reservation until discard or
-publication, when it moves to the session. Relation pointer arrays and
-temporary image validation copies are separate allocation classes.
+publication, when it moves to the session. Coordinator and worker relation
+pointer arrays reserve their full capacity before allocation or replacement.
+A prepared image separately reserves its future relation array and validation
+copy; publication moves the future array token to the session and releases
+the validation copy. Relation descriptors, names and schema metadata remain
+a separate allocation class.
 
 The following matrix is the boundary for allocations created outside a
 managed columnar session. “Covered” means that the owner retains a governor
