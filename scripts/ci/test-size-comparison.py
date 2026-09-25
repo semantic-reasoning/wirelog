@@ -62,10 +62,23 @@ with tempfile.TemporaryDirectory(prefix="wirelog-size-merge-fixture-") as temp_n
     head_build=temp/"head build"; report=temp/"size report.json"
     run(["meson","setup",str(head_build),str(repo),"-Dtests=true","-DmbedTLS=disabled"])
 
-    def compare(base_sha, pr_sha, merge_sha, expected=0):
+    verifier_stub=temp/"verifier stub"; verifier_stub.mkdir()
+    python_stub=verifier_stub/"python3"
+    python_stub.write_text(
+        '#!/bin/sh\ncase "$1" in\n'
+        '  */verify-size-baseline.py) exit "$FIXTURE_VERIFY_EXIT" ;;\n'
+        'esac\nexec "$FIXTURE_REAL_PYTHON" "$@"\n', encoding="utf-8")
+    python_stub.chmod(0o755)
+
+    def compare(base_sha, pr_sha, merge_sha, expected=0, verifier_result=None):
         if report.exists(): report.unlink()
+        env={**fixture_env,"GITHUB_REPOSITORY":"fixture/wirelog"}
+        if verifier_result is not None:
+            env.update({"PATH":str(verifier_stub)+os.pathsep+env.get("PATH", ""),
+                        "FIXTURE_VERIFY_EXIT":str(verifier_result),
+                        "FIXTURE_REAL_PYTHON":sys.executable})
         result=run([str(orchestrator),str(head_build),base_sha,merge_sha,str(report),pr_sha],
-                   cwd=repo,check=False,env={**fixture_env,"GITHUB_REPOSITORY":"fixture/wirelog"})
+                   cwd=repo,check=False,env=env)
         if result.returncode!=expected:
             raise AssertionError(f"comparison returned {result.returncode}, expected {expected}:\n{result.stdout}\n{result.stderr}")
         return result
@@ -91,6 +104,13 @@ with tempfile.TemporaryDirectory(prefix="wirelog-size-merge-fixture-") as temp_n
     inflated=compare(base,pr_inflate,merge_inflate,2)
     assert "numeric baseline update" in inflated.stderr
     assert not report.exists(), "candidate baseline inflation must fail before policy output"
+    rejected=compare(base,pr_inflate,merge_inflate,2,verifier_result=1)
+    assert "numeric baseline update" in rejected.stderr
+    assert not report.exists(), "rejected verification must fail before policy output"
+    compare(base,pr_inflate,merge_inflate,0,verifier_result=0)
+    authorized_report=json.loads(report.read_text(encoding="utf-8"))
+    assert authorized_report["baseline_bytes"]==999999999
+    assert authorized_report["status"]=="pass" and authorized_report["inherited_overage"] is False
 
     # Only a true two-parent merge with exact event base + PR head is accepted.
     run(["git","checkout","-q","pr-doc"],cwd=repo)
@@ -102,4 +122,4 @@ with tempfile.TemporaryDirectory(prefix="wirelog-size-merge-fixture-") as temp_n
     result=compare(pr_doc,pr_inflate,merge_inflate,2)
     assert "first parent differs" in result.stderr
 
-print("test-size-comparison: exact merge, inherited debt, growth, and baseline ownership passed")
+print("test-size-comparison: exact merge, inherited debt, growth, and baseline authorization passed")

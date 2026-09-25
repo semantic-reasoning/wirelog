@@ -34,6 +34,7 @@ git archive --format=tar "$base_sha" | tar -xf - -C "$tmp/base-source" || die "c
 baseline=$(git show "$base_sha:tests/baseline_size.txt") || die "base-owned baseline is missing"
 printf '%s\n' "$baseline" >"$tmp/base-baseline.txt"
 case "$baseline" in ''|*[!0-9]*) die "base-owned baseline is invalid" ;; esac
+policy_baseline=$baseline
 
 git show "$head_sha:tests/baseline_size.provenance.json" >"$tmp/head-baseline.provenance.json" 2>/dev/null \
     || die "candidate baseline provenance sidecar is missing"
@@ -45,6 +46,7 @@ if [ "$head_baseline" != "$baseline" ]; then
         --candidate-sha "$head_sha" --base-value "$baseline" --candidate-value "$head_baseline" \
         --provenance-file "$tmp/head-baseline.provenance.json" \
         || die "numeric baseline update is not backed by trusted reproducible CI evidence"
+    policy_baseline=$head_baseline
 fi
 
 meson setup "$tmp/base-build" "$tmp/base-source" -Dtests=true -DmbedTLS=disabled || die "event-base Meson configure failed"
@@ -64,5 +66,5 @@ head_bytes=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["me
 base_profile=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d.pop("source_sha",None); import hashlib; print(hashlib.sha256(json.dumps(d,sort_keys=True,separators=(",",":")).encode()).hexdigest())' "$tmp/base-profile.json")
 head_profile=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d.pop("source_sha",None); import hashlib; print(hashlib.sha256(json.dumps(d,sort_keys=True,separators=(",",":")).encode()).hexdigest())' "$tmp/head-profile.json")
 python3 "$script_dir/text-size-policy.py" --base-size "$base_bytes" --head-size "$head_bytes" \
-    --baseline "$baseline" --base-profile "$base_profile" --head-profile "$head_profile" \
+    --baseline "$policy_baseline" --base-profile "$base_profile" --head-profile "$head_profile" \
     --base-sha "$base_sha" --head-sha "$head_sha" --output "$report"
