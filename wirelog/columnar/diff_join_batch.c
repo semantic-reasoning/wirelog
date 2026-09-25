@@ -361,6 +361,9 @@ index_right(wl_col_session_t *sess, const char *name, const col_rel_t *right,
     arr = txn.working;
     rc = col_diff_arrangement_ensure_ht_capacity(arr, right->nrows);
     if (rc == 0) {
+        /* A source snapshot change resets this private copy in txn_begin,
+         * so public appends rebuild from row zero.  Retain the tail walk for
+         * defensive same-snapshot row-count changes from internal callers. */
         for (uint32_t row = arr->indexed_rows; row < right->nrows; row++) {
             uint32_t hash = 2166136261u;
             for (uint32_t k = 0; k < kc; k++)
