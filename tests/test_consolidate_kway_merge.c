@@ -1332,8 +1332,7 @@ test_consolidate_scratch_admission(void)
         }
     }
     uint64_t descriptor_bytes = sizeof(col_rel_t)
-        + sizeof("consolidate_test")
-        + sizeof(wl_columnar_memory_reservation_t);
+        + sizeof("consolidate_test");
     uint64_t metadata_bytes = sizeof(*rel->col_names)
         + strlen(rel->col_names[0]) + 1u;
     ref = test_consolidate_governor_create(descriptor_bytes
@@ -1817,8 +1816,7 @@ test_zero_arity_merge_output_is_never_zero_sized(void)
      * the merge output still asks for more than zero bytes. */
     rel = zero_arity_fixture();
     const uint64_t descriptor_bytes = sizeof(col_rel_t)
-        + sizeof("consolidate_test")
-        + sizeof(wl_columnar_memory_reservation_t);
+        + sizeof("consolidate_test");
     ref = test_consolidate_governor_create(descriptor_bytes
             + segment_scratch);
     if (!rel || !ref || col_rel_attach_memory_governor(rel, ref) != 0) {
