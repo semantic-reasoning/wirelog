@@ -56,7 +56,7 @@ def fixture_provenance(**changes):
        "library_sha256":library_digest}
     p.update(changes); return p
 
-def exercise(provenance, corrupt=None):
+def exercise(provenance, corrupt=None, base_sha="base456", candidate_sha="candidate789"):
     with tempfile.TemporaryDirectory() as temp:
         p=Path(temp)/"provenance.json"; p.write_text(json.dumps(provenance), encoding="utf-8")
         run={"path":".github/workflows/ci-main.yml","event":"push","head_branch":"main",
@@ -118,7 +118,7 @@ def exercise(provenance, corrupt=None):
         with mock.patch.object(mod,"request",request), \
              mock.patch.object(mod.subprocess,"run",subprocess_run), \
              mock.patch.object(mod.subprocess,"check_output",subprocess_output):
-            return mod.authorize("owner/repo","base456","candidate789",100,200,p,"fixture-token")
+            return mod.authorize("owner/repo",base_sha,candidate_sha,100,200,p,"fixture-token")
 
 def exercise_binary_download(location="https://storage.example/artifact.zip", final_url=None):
     api_url = "https://api.github.com/repos/owner/repo/actions/artifacts/22/zip"
@@ -183,6 +183,11 @@ check("candidate-authored URL without token is not trust evidence",
       "read-only Actions API")
 check("valid main artifact and reproducible source authorize the measurement",
       lambda: exercise(fixture_provenance()))
+check("exact event-base main artifact authorizes the measurement",
+      lambda: exercise(fixture_provenance(), base_sha="source123"))
+check("candidate source cannot authorize its own baseline",
+      lambda: exercise(fixture_provenance(), candidate_sha="source123"),
+      "distinct from the candidate")
 check("failed full build authorizes only its fully measured reproducible library",
       lambda: exercise(fixture_provenance(), "build-failed"))
 check("rebuild may differ outside .text while reproducing the authorized size",

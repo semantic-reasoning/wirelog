@@ -89,8 +89,8 @@ def authorize(repo, base_sha, candidate_sha, base_value, candidate_value, proven
     if p.get("baseline_bytes") != candidate_value:
         fail("provenance baseline value does not match candidate baseline")
     source_sha = p.get("source_sha", "")
-    if not source_sha or source_sha in (base_sha, candidate_sha):
-        fail("measurement source must be an earlier eligible main revision")
+    if not source_sha or source_sha == candidate_sha:
+        fail("measurement source must be an eligible main revision distinct from the candidate")
     ancestor = subprocess.run(["git", "merge-base", "--is-ancestor", source_sha, base_sha],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if ancestor.returncode != 0:
