@@ -5833,6 +5833,20 @@ test_evaluation_attempt_owner_exe = executable(
 
 test('evaluation_attempt_owner', test_evaluation_attempt_owner_exe)
 
+# Issue #1953: the publication cutoff and what a stop there must leave behind.
+# Drives the columnar impls through the backend vtable and injects cancellation
+# with the WL_SESSION_TEST_HOOKS levers, which testlib_prod defines; the
+# installed library carries no hook symbol.
+test_evaluation_retry_exe = executable(
+  'test_evaluation_retry',
+  files('test_evaluation_retry.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+
+test('evaluation_retry', test_evaluation_retry_exe, timeout: 60)
+
 # Internal foundation; cancellation and shared admission use real threads.
 test_evaluation_control_exe = executable(
   'test_evaluation_control',
