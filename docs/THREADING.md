@@ -343,7 +343,7 @@ and the wasted work is bounded.
 |---|---|---|---|---|
 | `session.c:col_worker_session_create` | per-worker view of `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Worker session reads coordinator's budget snapshot; advisory, no edge required |
 | `session.c:session_rels_release` | `reservation->state` | `atomic_load_explicit` | `acquire` | Check whether an exclusively owned relation-array token is still reserved before rolling it back after its array is freed or a replacement is discarded |
-| `session_hash.c:session_registry_image_release` | `reservation->state` | `atomic_load_explicit` | `acquire` | Check whether an exclusively owned registry-image or session array token is still reserved before discard or publication cleanup |
+| `session_hash.c:session_reservation_reserved` | `reservation->state` | `atomic_load_explicit` | `acquire` | Check whether an exclusively owned registry-image or session array token is still reserved before discard or publication cleanup |
 
 ### 5.8 `wirelog/columnar/memory_governor.c` — reservation state (37 rows)
 
