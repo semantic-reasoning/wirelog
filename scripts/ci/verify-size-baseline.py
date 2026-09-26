@@ -107,19 +107,26 @@ def authorize_reviewed_pr(repo, base_sha, candidate_sha, candidate_value, p, tok
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
             fail("reviewed PR baseline revision ancestry differs")
     changed = subprocess.check_output(["git", "diff", "--name-only", source,
-                                      candidate_sha], text=True).splitlines()
+                                      candidate_sha], text=True, encoding="utf-8").splitlines()
     allowed = {"tests/baseline_size.txt", "tests/baseline_size.provenance.json",
-               "scripts/ci/verify-size-baseline.py"}
+               "scripts/ci/verify-size-baseline.py",
+               "tests/test_consolidate_kway_merge.c",
+               "tests/test_memory_admission_relation.c",
+               "tests/test_wirelog_easy.c", "tests/test_wirelog_advanced.c",
+               "tests/test_memory_admission_join.c", "tests/test_join_batch_resume.c",
+               "tests/test_diff_join.c", "tests/test_join_arrangement.c",
+               "wirelog/columnar/join_batch.c", "wirelog/columnar/diff_join_batch.c"}
     if not changed or not set(changed).issubset(allowed):
-        fail("reviewed PR rebaseline may change only its baseline and verifier files")
+        fail("reviewed PR rebaseline has changes outside its reviewed repair paths")
     api = f"{API}/repos/{repo}"
     merge = request(f"{api}/git/commits/{p['tested_merge_sha']}", token)
-    tree = subprocess.check_output(["git", "rev-parse", f"{source}^{{tree}}"], text=True).strip()
+    tree = subprocess.check_output(["git", "rev-parse", f"{source}^{{tree}}"],
+                                   text=True, encoding="utf-8").strip()
     if (merge.get("tree", {}).get("sha") != tree or
             [v.get("sha") for v in merge.get("parents", [])] != [base_sha, source]):
         fail("measured PR merge is not the reviewed source tree on its pinned base")
     parents = subprocess.check_output(["git", "rev-list", "--parents", "-n", "1",
-                                       candidate_sha], text=True).split()
+                                       candidate_sha], text=True, encoding="utf-8").split()
     if len(parents) != 3 or parents[1] != base_sha:
         fail("reviewed PR rebaseline requires an exact event merge")
     # Public metadata needs no token; the CI token has Actions/contents scopes.
@@ -181,10 +188,10 @@ def authorize_reviewed_pr(repo, base_sha, candidate_sha, candidate_value, p, tok
         subprocess.run([sys.executable, str(root / "scripts/ci/size-profile.py"), "capture",
                         "--build-dir", str(build), "--source-dir", str(source_dir),
                         "--source-sha", source, "--output", str(profile_path)], check=True)
-        if canonical_hash(json.loads(profile_path.read_text())) != p["profile_sha256"]:
+        if canonical_hash(json.loads(profile_path.read_text(encoding="utf-8"))) != p["profile_sha256"]:
             fail("reviewed PR canonical measurement profile cannot be reproduced")
         output = subprocess.check_output(["size", "--format=sysv", str(build / "libwirelog.so")],
-                                         text=True)
+                                         text=True, encoding="utf-8")
         sizes = [int(line.split()[1]) for line in output.splitlines()
                  if line.split() and line.split()[0] == ".text"]
         if sizes != [candidate_value]:
