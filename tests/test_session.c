@@ -751,6 +751,110 @@ cleanup:
 }
 
 static void
+test_session_hash_governor_transition(void)
+{
+    TEST("session hash token follows allocation across governor changes");
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    resolution.budget_bytes = 1024;
+    resolution.usable_bytes = 1024;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    wl_columnar_memory_governor_ref_t *ref
+        = wl_columnar_memory_governor_ref_create(&resolution);
+    wl_col_session_t sess = { 0 };
+    col_rel_t first = { .name = "first" };
+    col_rel_t second = { .name = "second" };
+    col_rel_t third = { .name = "third" };
+    col_rel_t *additions[] = { &second };
+    wl_columnar_session_hash_registry_image_t image = { 0 };
+    const char *failure = NULL;
+    const uint64_t hash_bytes = 16u * sizeof(uint32_t)
+        + sizeof(uint32_t);
+    if (!ref) {
+        FAIL("governor setup failed");
+        return;
+    }
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(ref);
+    sess.rel_cap = 2;
+    sess.rels = calloc(sess.rel_cap, sizeof(*sess.rels));
+    if (!sess.rels) {
+        failure = "registry setup failed";
+        goto cleanup;
+    }
+    sess.rels[0] = &first;
+    sess.nrels = 1;
+#define TRANSITION_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    TRANSITION_CHECK(session_rel_build_hash(&sess) == 0,
+        "ungoverned initial hash failed");
+    sess.memory_governor = ref;
+    session_rel_free_hash(&sess);
+    TRANSITION_CHECK(wl_columnar_memory_reserved(governor) == 0,
+        "ungoverned hash teardown tried to release a token");
+    TRANSITION_CHECK(session_rel_build_hash(&sess) == 0
+        && wl_columnar_memory_reserved(governor) == hash_bytes,
+        "governed hash was not admitted");
+    sess.memory_governor = NULL;
+    TRANSITION_CHECK(session_rel_build_hash(&sess) == 0
+        && wl_columnar_memory_reserved(governor) == 0,
+        "ungoverned rebuild retained old governed credit");
+    sess.memory_governor = ref;
+    TRANSITION_CHECK(session_rel_build_hash(&sess) == 0
+        && wl_columnar_memory_reserved(governor) == hash_bytes,
+        "governed rebuild did not admit a new token");
+    const uint64_t old_rels_bytes = sess.rel_cap * sizeof(*sess.rels);
+    wl_columnar_memory_reservation_init(&sess.rels_reservation);
+    TRANSITION_CHECK(wl_columnar_memory_reserve_checked(governor,
+        old_rels_bytes, &sess.rels_reservation)
+        == WL_COLUMNAR_MEMORY_ADMISSION_OK
+        && wl_columnar_memory_reserved(governor)
+        == hash_bytes + old_rels_bytes,
+        "old registry token setup failed");
+    sess.memory_governor = NULL;
+    TRANSITION_CHECK(wl_columnar_session_hash_registry_image_prepare(&sess,
+        additions, 1, &image) == 0,
+        "ungoverned registry image preparation failed");
+    sess.memory_governor = ref;
+    wl_columnar_session_hash_registry_image_publish(&image);
+    TRANSITION_CHECK(session_find_rel(&sess, "second") == &second
+        && wl_columnar_memory_reserved(governor) == 0,
+        "ungoverned image did not retire governed registry and hash tokens");
+    additions[0] = &third;
+    TRANSITION_CHECK(wl_columnar_session_hash_registry_image_prepare(&sess,
+        additions, 1, &image) == 0
+        && image.rels_reservation.bytes > 0
+        && image.hash_reservation.bytes > 0,
+        "governed image preparation did not stage registry and hash tokens");
+    const uint64_t staged_live_bytes = image.rels_reservation.bytes
+        + image.hash_reservation.bytes;
+    sess.memory_governor = NULL;
+    wl_columnar_session_hash_registry_image_publish(&image);
+    sess.memory_governor = ref;
+    TRANSITION_CHECK(session_find_rel(&sess, "third") == &third
+        && wl_columnar_memory_reserved(governor) == staged_live_bytes,
+        "governed staged tokens were lost during ungoverned publication");
+cleanup:
+    wl_columnar_session_hash_registry_image_discard(&image);
+    session_rel_free_hash(&sess);
+    free(sess.rels);
+    if (sess.rels_reservation.identity == &sess.rels_reservation
+        && atomic_load_explicit(&sess.rels_reservation.state,
+        memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        && !wl_columnar_memory_rollback(&sess.rels_reservation))
+        failure = "registry teardown could not release staged token";
+    if (!failure && wl_columnar_memory_reserved(governor) != 0)
+        failure = "hash transition teardown leaked credit";
+    wl_columnar_memory_governor_ref_release(ref);
+    if (failure)
+        FAIL(failure);
+    else
+        PASS();
+#undef TRANSITION_CHECK
+}
+
+static void
 test_session_registry_pointer_admission(void)
 {
     TEST("session relation pointer growth admits overlap and retries");
@@ -12656,6 +12760,7 @@ main(void)
 
     test_session_hash_overflow_rejected();
     test_session_hash_admission_and_image_lifetime();
+    test_session_hash_governor_transition();
     test_session_registry_pointer_admission();
     test_retraction_registry_pointer_admission();
     test_worker_registry_pointer_admission();

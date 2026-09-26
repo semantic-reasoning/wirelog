@@ -57,6 +57,37 @@ session_rel_next_pow2(uint32_t n)
     return n + 1u;
 }
 
+static bool
+session_reservation_reserved(
+    const wl_columnar_memory_reservation_t *reservation)
+{
+    return reservation->identity == reservation
+           && atomic_load_explicit(&reservation->state,
+               memory_order_acquire)
+           == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED;
+}
+
+static void
+session_reservation_release(wl_columnar_memory_reservation_t *reservation)
+{
+    if (session_reservation_reserved(reservation)
+        && !wl_columnar_memory_rollback(reservation))
+        abort();
+}
+
+static void
+session_reservation_move_if_reserved(
+    wl_columnar_memory_reservation_t *destination,
+    wl_columnar_memory_reservation_t *source)
+{
+    if (!session_reservation_reserved(source))
+        return;
+    if (destination->identity != destination)
+        wl_columnar_memory_reservation_init(destination);
+    if (!wl_columnar_memory_reservation_move(destination, source))
+        abort();
+}
+
 /* ======================================================================== */
 /* Hash Table Build and Maintenance                                        */
 /* ======================================================================== */
@@ -104,8 +135,7 @@ session_rel_build_hash(wl_col_session_t *sess)
     if (!head || (nrels && !next)) {
         free(head);
         free(next);
-        if (sess->memory_governor)
-            (void)wl_columnar_memory_rollback(&pending);
+        session_reservation_release(&pending);
         return ENOMEM;
     }
     memset(head, 0xFF, (size_t)head_bytes);
@@ -121,17 +151,9 @@ session_rel_build_hash(wl_col_session_t *sess)
     }
     free(sess->rel_hash_head);
     free(sess->rel_hash_next);
-    if (sess->memory_governor) {
-        if (sess->rel_hash_reservation.identity
-            != &sess->rel_hash_reservation)
-            wl_columnar_memory_reservation_init(&sess->rel_hash_reservation);
-        if (sess->rel_hash_nbuckets > 0
-            && !wl_columnar_memory_rollback(&sess->rel_hash_reservation))
-            abort();
-        if (!wl_columnar_memory_reservation_move(
-                &sess->rel_hash_reservation, &pending))
-            abort();
-    }
+    session_reservation_release(&sess->rel_hash_reservation);
+    session_reservation_move_if_reserved(&sess->rel_hash_reservation,
+        &pending);
     sess->rel_hash_head = head;
     sess->rel_hash_next = next;
     sess->rel_hash_nbuckets = nbuckets;
@@ -228,9 +250,7 @@ session_rel_free_hash(wl_col_session_t *sess)
         return;
     free(sess->rel_hash_head);
     free(sess->rel_hash_next);
-    if (sess->memory_governor && sess->rel_hash_nbuckets > 0
-        && !wl_columnar_memory_rollback(&sess->rel_hash_reservation))
-        abort();
+    session_reservation_release(&sess->rel_hash_reservation);
     sess->rel_hash_head = NULL;
     sess->rel_hash_next = NULL;
     sess->rel_hash_nbuckets = 0;
@@ -276,17 +296,6 @@ session_registry_image_admit(wl_col_session_t *session, uint64_t bytes,
         : EINVAL;
 }
 
-static void
-session_registry_image_release(wl_columnar_memory_reservation_t *reservation)
-{
-    if (reservation->identity == reservation
-        && atomic_load_explicit(&reservation->state,
-        memory_order_acquire)
-        == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
-        && !wl_columnar_memory_rollback(reservation))
-        abort();
-}
-
 void
 wl_columnar_session_hash_registry_image_discard(
     wl_columnar_session_hash_registry_image_t *image)
@@ -294,12 +303,12 @@ wl_columnar_session_hash_registry_image_discard(
     if (!image)
         return;
     free((void *)image->rels);
-    session_registry_image_release(&image->rels_reservation);
+    session_reservation_release(&image->rels_reservation);
     free(image->hash_head);
     free(image->hash_next);
-    session_registry_image_release(&image->hash_reservation);
+    session_reservation_release(&image->hash_reservation);
     free((void *)image->expected_rel_contents);
-    session_registry_image_release(&image->expected_rels_reservation);
+    session_reservation_release(&image->expected_rels_reservation);
     memset(image, 0, sizeof(*image));
 }
 
@@ -531,31 +540,15 @@ wl_columnar_session_hash_registry_image_publish(
     image->hash_head = NULL;
     image->hash_next = NULL;
     free((void *)old_rels);
-    if (session->memory_governor) {
-        if (session->rels_reservation.identity
-            != &session->rels_reservation)
-            wl_columnar_memory_reservation_init(&session->rels_reservation);
-        session_registry_image_release(&session->rels_reservation);
-        if (!wl_columnar_memory_reservation_move(
-                &session->rels_reservation, &image->rels_reservation))
-            abort();
-    }
+    session_reservation_release(&session->rels_reservation);
+    session_reservation_move_if_reserved(&session->rels_reservation,
+        &image->rels_reservation);
     free(old_head);
     free(old_next);
-    if (session->memory_governor) {
-        if (session->rel_hash_reservation.identity
-            != &session->rel_hash_reservation)
-            wl_columnar_memory_reservation_init(
-                &session->rel_hash_reservation);
-        if (old_head
-            && !wl_columnar_memory_rollback(
-                &session->rel_hash_reservation))
-            abort();
-        if (!wl_columnar_memory_reservation_move(
-                &session->rel_hash_reservation, &image->hash_reservation))
-            abort();
-    }
+    session_reservation_release(&session->rel_hash_reservation);
+    session_reservation_move_if_reserved(
+        &session->rel_hash_reservation, &image->hash_reservation);
     free((void *)image->expected_rel_contents);
-    session_registry_image_release(&image->expected_rels_reservation);
+    session_reservation_release(&image->expected_rels_reservation);
     memset(image, 0, sizeof(*image));
 }
