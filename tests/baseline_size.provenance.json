@@ -1,12 +1,15 @@
 {
   "schema_version": 1,
-  "status": "trusted-ci-artifact",
-  "baseline_bytes": 387391,
+  "status": "trusted-reviewed-pr-size-job",
+  "authorization_id": "pr-1959-reviewed-head-34eeb23c",
+  "baseline_bytes": 395540,
   "repository": "semantic-reasoning/wirelog",
-  "source_sha": "4643796d77aa145e31919352b77e1099e1427e51",
-  "run_id": 36191780015,
-  "artifact_id": 10889101782,
-  "artifact_sha256": "185228d4cb8079bab2986e4e67f9e703c9c0fb31de35e8a19289e8f88b15ea37",
-  "profile_sha256": "e998de7827ab8b2c665e9f895e4e2e6e0f17b29450ae468c39efe41464aa97a7",
-  "library_sha256": "3774f6a549f4763f3355a9ec4a938e30a1dad230f5799203bb72201f9093b12f"
+  "pr_number": 1959,
+  "source_sha": "34eeb23c201ba443a3fca5a6d38aee6365d7a25b",
+  "base_sha": "8e01e3cf7f406caa6e09ef100b480adbec8d35e9",
+  "tested_merge_sha": "0b3866eef0cb8eb577041eafa6bddef3278f36ba",
+  "run_id": 36214645977,
+  "job_id": 108328340847,
+  "profile_sha256": "cd6cc2f2c54520ba56c8efc0241b17d722d00c8b569cb6c6bb38f5e10d5e1508",
+  "job_log_sha256": "92a8693156963c73b8ddc1e296527c0e12ec1a7cf2973247a1e9189d521759c4"
 }
