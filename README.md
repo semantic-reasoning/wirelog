@@ -65,7 +65,7 @@ It is a design proposal, not a currently available API.
 
 ## Performance
 
-The complete benchmark evidence is recorded in [docs/benchmarks/2026-09-26-flowlog](docs/benchmarks/2026-09-26-flowlog/). It contains two immutable 48-record matrices: the historical revision `7e498e782a4cca96175d34f86bf5b958d042552d` and the current benchmark head `afcdd8a3f05f67daaeb003c7acd25e96e2433419`, whose product base is main merge commit `30b19ba3` from #1975. Both use release `-Os`, LTO, GCC 16.2.1, `wirelog_log_max_level=error`, CPUs 0-15, and the same 82-file data inventory. Non-DOOP workloads use five-trial medians; DOOP uses one authoritative trial per width because each run is very long.
+The complete benchmark evidence is recorded in [the campaign index](docs/benchmarks/2026-09-26-flowlog/campaign-index.json). It contains two immutable 48-record matrices: the historical revision `7e498e782a4cca96175d34f86bf5b958d042552d` and the current benchmark head `afcdd8a3f05f67daaeb003c7acd25e96e2433419`, whose product base is main merge commit `30b19ba3` from #1975. Both use release `-Os`, LTO, GCC 16.2.1, `wirelog_log_max_level=error`, CPUs 0-15, and the same 82-file data inventory. Non-DOOP workloads use five-trial medians; DOOP uses one authoritative trial per width because each run is very long.
 
 **Test environment:** Intel Xeon E5-2696 v4 (2 sockets, 44 physical cores total, 88 logical CPUs), Linux 7.2.6, 125 GiB RAM. Wall-clock values are descriptive and affected by governor, thermal state, memory pressure, and the campaigns' separate execution times. Peak RSS is shown in MiB.
 
