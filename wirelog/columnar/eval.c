@@ -2901,59 +2901,15 @@ wl_columnar_eval_owner_publication_discard(
 static int
 tdd_bdx_sort_candidate(col_rel_t *candidate)
 {
-    int64_t **original_columns = NULL;
-    col_delta_timestamp_t *original_timestamps = NULL;
-    bool *used = NULL;
-    int rc;
-
     if (!candidate || candidate->nrows <= 1)
         return 0;
-    if (!candidate->timestamps)
-        return col_rel_radix_sort(candidate, 0, candidate->nrows);
-
-    original_columns = col_columns_alloc(candidate->ncols,
-            candidate->nrows);
-    original_timestamps = (col_delta_timestamp_t *)malloc(
-        (size_t)candidate->nrows * sizeof(*original_timestamps));
-    used = (bool *)calloc(candidate->nrows, sizeof(*used));
-    if (!original_columns || !original_timestamps || !used) {
-        col_columns_free(original_columns, candidate->ncols);
-        free(original_timestamps);
-        free(used);
+    /* The former zero-column copy allocation refused timestamped nullary
+     * exchanges before publication. Keep that contract; their owner/alias
+     * publication support is outside this sort optimization. */
+    if (candidate->timestamps && candidate->ncols == 0)
         return ENOMEM;
-    }
-    for (uint32_t col = 0; col < candidate->ncols; col++)
-        memcpy(original_columns[col], candidate->columns[col],
-            (size_t)candidate->nrows * sizeof(**original_columns));
-    memcpy(original_timestamps, candidate->timestamps,
-        (size_t)candidate->nrows * sizeof(*original_timestamps));
-
-    rc = col_rel_radix_sort(candidate, 0, candidate->nrows);
-    if (rc != 0)
-        goto cleanup;
-    for (uint32_t row = 0; row < candidate->nrows; row++) {
-        uint32_t source = 0;
-        for (; source < candidate->nrows; source++) {
-            bool match = !used[source];
-            for (uint32_t col = 0; match && col < candidate->ncols; col++)
-                match = candidate->columns[col][row]
-                    == original_columns[col][source];
-            if (match)
-                break;
-        }
-        if (source == candidate->nrows) {
-            rc = EINVAL;
-            goto cleanup;
-        }
-        used[source] = true;
-        candidate->timestamps[row] = original_timestamps[source];
-    }
-
-cleanup:
-    col_columns_free(original_columns, candidate->ncols);
-    free(original_timestamps);
-    free(used);
-    return rc;
+    /* Radix sorting already carries timestamps with its stable permutation. */
+    return col_rel_radix_sort(candidate, 0, candidate->nrows);
 }
 
 #ifdef WL_TEST_BDX_SEED
