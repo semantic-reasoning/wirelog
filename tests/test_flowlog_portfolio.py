@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest import mock
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "perf" / "run-flowlog-portfolio.py"
 SPEC = importlib.util.spec_from_file_location("flowlog_portfolio", MODULE_PATH)
@@ -68,6 +71,103 @@ class PortfolioResultTests(unittest.TestCase):
         parsed, error = portfolio.parse_cspa_incremental_tsv(valid + "\n" + valid)
         self.assertIsNone(parsed)
         self.assertIn("one cspa_incr", error or "")
+
+    def test_parses_standard_tsv_emitted_despite_json_request(self) -> None:
+        header = "workload\tnodes\tedges\tworkers\trepeat\tmin_ms\tmedian_ms\tmax_ms\tpeak_rss_kb\ttuples\titerations\tstatus"
+        row = "dyck\t-\t100\t8\t5\t10.0\t11.0\t12.0\t3000\t2100\t8\tOK"
+        parsed, error, _ = portfolio.parse_bench_output("json", row)
+        self.assertIsNone(error)
+        self.assertEqual(parsed["workload"], "dyck")
+        self.assertEqual(parsed["workers"], 8)
+        self.assertEqual(parsed["tuples"], 2100)
+        parsed, error = portfolio.parse_bench_tsv(header + "\n" + row + "\n")
+        self.assertIsNone(error)
+        self.assertEqual(parsed["wall_time_ms"]["median"], 11.0)
+        self.assertIsNone(portfolio.validate_bench_json(parsed, "dyck", 8, 5))
+        self.assertIn(
+            "identity",
+            portfolio.validate_bench_json(parsed, "dyck", 1, 5) or "",
+        )
+
+    def test_rejects_invalid_standard_tsv_rows(self) -> None:
+        header = "workload\tnodes\tedges\tworkers\trepeat\tmin_ms\tmedian_ms\tmax_ms\tpeak_rss_kb\ttuples\titerations\tstatus"
+        row = "dyck\t-\t100\t8\t5\t10.0\t11.0\t12.0\t3000\t2100\t8\tOK"
+        cases = (
+            (row.replace("\tOK", "\tFAIL"), "status"),
+            (row.replace("\t100\t", "\tbad\t"), "invalid benchmark TSV metric"),
+            (row.replace("\t10.0\t11.0", "\tnan\t11.0"), "finite"),
+            (row.replace("\t10.0\t11.0\t12.0", "\t12.0\t11.0\t13.0"), "min <= median"),
+        )
+        for invalid, expected in cases:
+            parsed, error = portfolio.parse_bench_tsv(header + "\n" + invalid)
+            self.assertIsNone(parsed)
+            self.assertIn(expected, error or "")
+        parsed, error = portfolio.parse_bench_tsv(header + "\n" + row + "\n" + row)
+        self.assertIsNone(parsed)
+        self.assertIn("one benchmark TSV row", error or "")
+
+    def test_interruption_keeps_completed_record_and_incomplete_manifest(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            out_dir = root / "out"
+            record = {
+                "status": "ok", "workload": "reach", "workers": 1, "repeat": 1,
+                "return_code": 0, "duration_sec": 0.1, "summary": {},
+                "command": [], "raw_stdout": "completed evidence",
+            }
+            args = [
+                "--repo-root", str(root), "--data-root", str(root),
+                "--out-dir", str(out_dir), "--bench", str(root / "bench"),
+                "--workers", "1,8", "--repeat", "1", "--workload", "reach",
+            ]
+            with mock.patch.object(
+                portfolio, "run_one", side_effect=[record, KeyboardInterrupt]
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    portfolio.main(args)
+            manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+            progress = [
+                json.loads(line)
+                for line in (out_dir / "progress.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertFalse(manifest["run_complete"])
+            self.assertEqual(len(progress), 1)
+            self.assertEqual(progress[0]["raw_stdout"], "completed evidence")
+
+    def test_final_artifact_failure_does_not_publish_completion(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            out_dir = root / "out"
+            record = {
+                "status": "ok", "workload": "reach", "workers": 1, "repeat": 1,
+                "return_code": 0, "duration_sec": 0.1, "summary": {}, "command": [],
+            }
+            args = [
+                "--repo-root", str(root), "--data-root", str(root),
+                "--out-dir", str(out_dir), "--bench", str(root / "bench"),
+                "--workers", "1", "--repeat", "1", "--workload", "reach",
+            ]
+            with mock.patch.object(portfolio, "run_one", return_value=record):
+                with mock.patch.object(portfolio, "write_tsv", side_effect=OSError("disk full")):
+                    with self.assertRaisesRegex(OSError, "disk full"):
+                        portfolio.main(args)
+            manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertFalse(manifest["run_complete"])
+
+    def test_existing_artifacts_are_preserved_when_reuse_is_rejected(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            out_dir = root / "out"
+            out_dir.mkdir()
+            progress = out_dir / "progress.jsonl"
+            progress.write_text("previous evidence\n", encoding="utf-8")
+            args = [
+                "--repo-root", str(root), "--data-root", str(root),
+                "--out-dir", str(out_dir), "--bench", str(root / "bench"),
+                "--workers", "1", "--repeat", "1", "--workload", "reach",
+            ]
+            self.assertEqual(portfolio.main(args), 2)
+            self.assertEqual(progress.read_text(encoding="utf-8"), "previous evidence\n")
 
     def test_flags_cross_worker_result_mismatch(self) -> None:
         records = [
