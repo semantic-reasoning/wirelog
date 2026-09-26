@@ -4299,6 +4299,24 @@ col_session_budget_denial_clear(void *session)
     wl_columnar_session_budget_denial_clear(COL_SESSION(session));
 }
 
+/*
+ * The publication cutoff (#1953).  wl_evaluation_control_finish does not poll,
+ * so the integration owes a final charge(0) before it commits publication --
+ * without one, a cancellation arriving after the wrapper's entry poll is seen
+ * only by the NEXT attempt, and this one publishes and reports success.
+ *
+ * charge() returns EINVAL when no attempt is active.  That is deliberately NOT
+ * softened into a no-op here: the impls run only inside their wrapper's begin,
+ * so an EINVAL would mean an impl was reached outside its attempt, which is the
+ * defect class #1820 shipped.  Let it surface.
+ */
+static int
+col_session_publication_cutoff(wl_col_session_t *sess)
+{
+    return sess->base.evaluation_control
+        ? wl_evaluation_control_charge(sess->base.evaluation_control, 0) : 0;
+}
+
 static int
 col_session_step_impl(wl_session_t *session)
 {
@@ -4494,6 +4512,52 @@ compact_staged_deltas:
         wl_columnar_eval_delta_observer_set_active(sess, false);
         col_session_reclaim_quiescent(sess);
         return compact_rc;
+    }
+
+    /*
+     * Cut here: after compaction, before the observer is prepared.
+     *
+     * After compaction, because both shapes take their resume token across it.
+     * The observer records `evaluated` above the label; the plain step sets
+     * plain_step_completion_pending with phase COMPACT just before compacting,
+     * and has no observer to carry that state instead.  Cutting earlier would
+     * leave a stopped plain step with no token and force a full re-evaluation.
+     * Compacting twice is harmless: the batch releases every writer it took,
+     * and a second pass over compacted data is idempotent.
+     *
+     * Before prepare, because prepare reserves for the whole staged diff and
+     * allocates the event array.  Prepare publishes nothing to the host, so
+     * cutting ahead of it gives up no coverage and keeps a stopped attempt from
+     * holding a reservation it never uses.
+     *
+     * Outside the observer branch, so the callback-free shape is covered too:
+     * with no observer, control falls straight from here into the commit below,
+     * which is where a later snapshot starts treating this model as stable.
+     *
+     * The unwind clears one committed field.  plain_step_completion_active is a
+     * re-entrancy latch, not progress: while it and _pending are both set, this
+     * function's entry guard and the snapshot's refuse with EBUSY.  Each unwind
+     * that can run with it set clears it, this one included; leaving it set is
+     * what would strand the session.  set_active(false) reverts what an attempt
+     * that reached here set, and is what lets the observer be discarded at
+     * destroy.
+     *
+     * What routes the retry back to this label is the observer's `evaluated`
+     * flag, or, with no observer, plain_step_completion_pending with phase
+     * COMPACT, and the observer's staged baseline is what makes the retry
+     * deliver the same events.  pending_input_change and has_evaluated are not
+     * routers: this function writes them only in the commit block below, so
+     * skipping it leaves them describing what this attempt published.  Say
+     * nothing here about base_nrows -- evaluation rewrites it above this point
+     * for recursive aggregates, so it is neither ours to describe nor safe to
+     * reason about from this vantage.
+     */
+    int cutoff_rc = col_session_publication_cutoff(sess);
+    if (cutoff_rc != 0) {
+        sess->plain_step_completion_active = false;
+        wl_columnar_eval_delta_observer_set_active(sess, false);
+        col_session_reclaim_quiescent(sess);
+        return cutoff_rc;
     }
 
     if (!completing_plain_step && sess->delta_observer) {
