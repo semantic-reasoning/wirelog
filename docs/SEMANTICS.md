@@ -646,3 +646,163 @@ Host callback side effects cannot be rolled back. Notification-only cancellation
 remains distinct from evaluation cancellation. The future public surface must
 provide retained opaque handles, request/configure/reset, completed reports and
 distinct stop errors through both facades, without exposing these internal types.
+
+### Publication-cutoff state map (#1953; step implemented, snapshot pending)
+
+Rows name fields and functions, never line numbers, for the reason
+`scripts/ci/ownership_doc_anchors.py` records: a line citation rots within
+days. `scripts/ci/check-state-map-anchors.py` checks both columns of every row
+in both directions -- each function named must really touch the field, and
+every function the gate can attribute the field to must be named. That bound is
+real and worth reading: the gate sees functions under `wirelog/`, nothing in
+`tests/`, and only those with a single indexed definition. It credits a field
+only where a body names it before an assignment or reads it by name, so a bulk
+write is invisible -- `col_session_create_internal` zeroes the twelve session
+fields through one `calloc`, `base_nrows` belonging to the relation rather than
+the session, and it is named in the one row where it also assigns by name. Text
+inside a preprocessor directive is invisible too, because the index blanks it
+and this gate blanks it with the index. For a qualified subject the gate
+requires the field to be reached through `->` from a name the body declares as
+a pointer to that struct, so `entry->rel->base_nrows` counts when `rel` is such
+a pointer and `entry->owner->base_nrows` does not; a body that declares the
+struct and still reaches the field some other way stops the gate rather than
+being guessed at. Within that bound the columns are complete, so this section
+states no convention about what they leave out. An earlier revision stated one
+instead, and it was false on both of its halves: prose the gate cannot read,
+excusing omissions the gate cannot see.
+
+What the gate does not check is the verdict, because `PRESERVE` and `COMMIT`
+are not facts about the present code. `PRESERVE` means a stopping return must
+skip the write; `COMMIT` means it must perform it anyway. Those are judgements
+about what a stopped attempt should leave behind, and they are reviewed by
+people. The columns exist so that the evidence under them is not also a matter
+of opinion.
+
+Scope: the fields the two evaluating paths commit in their bookkeeping block,
+the one each runs once its strata are done. Where that block sits relative to
+publication is the difference between the paths, and the two bullets below set
+it out. The stable-snapshot fast path is out of scope on purpose: it emits to
+the host callback and returns above that block entirely, so a cutoff placed for
+the evaluating path is not on its route at all, and it needs its own reasoning.
+
+The columns credit `col_worker_session_create` only where it overwrites a field
+by name. Its `*out_worker = *coordinator;` mentions no field and is invisible
+to the gate, so the six rows that name it are six explicit resets, and they
+come in two groups with different reasons. Four of them are the mapped members
+of the `plain_step_completion_*` group, cleared along with that group's other
+members because recovery continuations belong to the coordinator and a
+disposable worker clone must never inherit one. `last_inserted_relation` and
+`last_removed_relation` are nulled much later, as borrowed coordinator pointers
+a worker must not use. Both groups refuse to inherit something; neither is
+inheritance, which is what the struct copy above them does and what no column
+shows.
+
+The two evaluating paths are not mirror images, and the difference decides
+where a cutoff belongs.
+
+- `col_session_step_impl` publishes, when it has an observer, before it
+  commits: the observer publish invokes the host callback, and the bookkeeping
+  follows. The callback-free shape publishes nothing and falls straight into
+  the same bookkeeping.
+- `col_session_snapshot_impl` commits before it delivers: the bookkeeping, then
+  a gauge sample, then the emit.
+
+So the snapshot cutoff must sit above the bookkeeping, not merely above the
+emit. By the emit that follows the bookkeeping, `has_evaluated`,
+`snapshot_stable_valid` and every `base_nrows` are committed, and no later line
+in `col_session_snapshot_impl` rolls them back. How far above the bookkeeping
+the cutoff may sit is not settled here. The step cutoff sits after compaction
+for a reason its own comment gives -- both shapes carry a resume token across
+it, and cutting earlier would leave a stopped plain step with no token -- and
+that reason does not transfer: the snapshot path sets no such token, so no
+token is lost by stopping earlier, and compacting twice is harmless by that
+same comment. So nothing there makes an earlier stop a correctness error.
+
+Cost varies across that range, but not in a way that picks a placement, and the
+reason is worth stating because two earlier drafts of this paragraph got it
+wrong. The delta pre-seed runs before compaction, under three conditions at
+once: a relation was inserted, nothing forces a full re-evaluation, and an
+evaluation has run before. It sets `delta_seeded` after its loop whether or not
+the loop registered anything, and the loop skips a relation whose `base_nrows`
+is zero or whose `nrows` has not passed it -- so the flag can stand for no
+`$d$` relations at all.
+
+What keeps that from deciding the cutoff is the carry-over. No write outside
+the bookkeeping clears a flag the pre-seed set, because those two are the only
+writes that reach the coordinator session `col_session_snapshot_impl` was
+called on. Every other write to the field under `wirelog/` lands on a worker
+clone, or on a session being created or torn down. Every stopping return
+between the pre-seed and the bookkeeping -- the retained-cleanup unwind, the
+evaluation-failure unwind, and the compaction check, whose own comment calls
+its `EBUSY` a state-preserving outcome -- leaves the guard's three conditions
+intact, so the next attempt runs the pre-seed again with the flag already set.
+A cutoff above the pre-seed therefore does not leave the flag clear on its own
+account; it only forgoes this attempt's pre-seed. What the snapshot unit has to
+settle is what it owes the entry state, not which placement escapes it.
+
+A field's row does not mean both paths write it. Six do not: the step path
+never touches `delta_seeded`, and the snapshot path never writes
+`last_removed_relation`, `retraction_seeded`, `plain_step_completion_pending`,
+`plain_step_completion_phase` or `plain_step_completion_active`. Which of those
+five the snapshot path still reads is in the read column, one field at a time;
+an earlier revision summarised it here and got it wrong within one round.
+
+| field | written by | read by | verdict |
+|---|---|---|---|
+| `last_inserted_relation` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create`, `session_note_inserted_input` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | PRESERVE |
+| `pending_input_change` | `col_session_create_internal`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
+| `pending_full_input_eval` | `col_session_insert`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
+| `has_evaluated` | `col_session_snapshot_impl`, `col_session_step_impl` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl` | PRESERVE |
+| `snapshot_stable_valid` | `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl` | PRESERVE |
+| `delta_seeded` | `col_session_snapshot_impl`, `tdd_worker_subpass_fn` | `col_op_variable`, `col_session_snapshot_impl`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right` | PRESERVE |
+| `last_removed_relation` | `col_session_remove_incremental`, `col_session_step_impl`, `col_worker_session_create` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
+| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta` | `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right` | PRESERVE |
+| `plain_step_completion_pending` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create` | `col_session_insert`, `col_session_insert_incremental`, `col_session_make_compound`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE -- with `plain_step_completion_phase` this is the resume token |
+| `plain_step_completion_phase` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE |
+| `plain_step_completion_step_context` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl` | PRESERVE |
+| `plain_step_completion_active` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_snapshot_impl`, `col_session_step_impl` | **COMMIT** on the step path -- a re-entrancy latch, not progress. While it stays set beside `plain_step_completion_pending`, the entry guard of both `col_session_step_impl` and `col_session_snapshot_impl` returns `EBUSY` above every line that would clear it. The snapshot path never writes it, so the snapshot cutoff has nothing to perform here. |
+| `col_rel_t::base_nrows` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_install_shared_view_unprotected`, `col_rel_reset_rows_locked`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `tdd_empty_relation_candidate`, `tdd_seed_bdx_coordinator_idb`, `wl_columnar_eval_serial_canonicalize_aggregate_locked`, `wl_columnar_relation_deep_copy_governed` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_install_shared_view_unprotected`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `wl_columnar_relation_deep_copy_governed` | PRESERVE -- the snapshot delta pre-seed skips a relation whose `base_nrows` is zero or whose `nrows <= base_nrows`, so committing the bookkeeping's `base_nrows = nrows` changes what the next attempt pre-seeds, including whether it pre-seeds at all. That is the whole verified consequence; see the note below before adding another |
+
+Two non-field actions sit in the same region and need their own verdicts.
+`col_session_reclaim_quiescent` is **COMMIT**: the step cutoff's unwind calls
+it, as the stratum- and compaction-failure unwinds beside it do, and it
+releases mat-cache pins before any ledger test -- though it returns earlier
+still when the session has retained cleanup outstanding, so it is not
+unconditional, and several other unwinds in both paths do skip it.
+`col_session_mem_sample`, which the snapshot path runs between its bookkeeping
+and its emit, has no verdict yet: it sets a gauge that
+`col_session_reclaim_quiescent` later tests, so a snapshot cutoff that skips
+the sample and commits the reclaim would test a gauge that predates this
+evaluation's growth. Settle it in the snapshot unit.
+
+What the snapshot cutoff adds to the contract above: that clause defers a stop
+arriving *after publication starts*. A snapshot stop between the bookkeeping
+and the emit arrives before publication, and is deferred because the
+bookkeeping cannot be rolled back. So the snapshot path's point of no return is
+earlier than publication, and the clause's "before observable tuple/delta
+publication" wording under-specifies it -- it must name the bookkeeping commit
+when the snapshot unit lands.
+
+`delta_seeded` and `retraction_seeded` are both left set by a stop above their
+commit, but their consequences differ. A stale `delta_seeded` may or may not
+come with `$d$<name>` relations still registered -- the pre-seed sets the flag
+even when its loop registered none, and the evaluation-failure unwind, which
+removes every `$d$`-prefixed relation by name rather than only the pre-seed's,
+leaves the flag set and keeps any whose checked removal refuses. That refusal
+is deliberate, and the loop's own comment says why: a reader may still depend
+on a delta after evaluation fails. When they are registered, the snapshot
+pre-seed re-registers those names through `session_add_rel`, whose same-name
+branch destroys the previously registered owner -- or, when that destroy is
+refused, restores its source lease and returns `EBUSY`. A stale
+`retraction_seeded` registers nothing -- the step path's retraction pre-seed
+only looks relations up -- but it keeps the snapshot fast path closed and
+changes forced-delta selection.
+
+Successive drafts of the step-path comment each asserted a further purpose for
+`base_nrows` and each was falsified: that the retry route reads it, that
+advancing it would describe unpublished rows, that it routes the retry, that
+advancing it would silently drop rows. Some were wrong about direction or role;
+the last was wrong about consequence, because `col_session_emit_snapshot`
+iterates `row < r->nrows` and never mentions the field. The row above therefore
+names the one consequence that was read out of the pre-seed's own condition,
+and a new claim about this field belongs in a test before it belongs here.

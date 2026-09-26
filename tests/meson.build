@@ -964,6 +964,26 @@ test('shell_gate_timeouts_selftest', py3,
      env: ['WIRELOG_SHELL_GATE_BUILD=' + meson.project_build_root()],
      suite: 'abi')
 
+# Issue #1953: the publication-cutoff state map in docs/SEMANTICS.md names
+# fields and functions rather than line numbers, because a line citation rots
+# within days.  The gate checks both columns of every row in both directions:
+# a cell may not credit a function that never touches the field, and may not
+# omit one the gate can attribute it to -- functions under wirelog/ with a
+# single definition, reaching a qualified field through a declared pointer to
+# that struct.  Both defects were in earlier drafts, and the second is why
+# emptying a cell fails here instead of passing with less to check.  The
+# verdict column is deliberately not checked -- PRESERVE and COMMIT are
+# judgements, not facts about the present code.  The self-test's budget is
+# generous because it forces several full symbol-index rebuilds to reach guards
+# no document fixture can; measured at ~18 s here, ~40-60 s projected on a
+# 2-vCPU runner under a parallel suite.
+test('state_map_anchors', py3,
+     args: [meson.project_source_root() / 'scripts/ci/check-state-map-anchors.py'],
+     suite: 'abi', timeout: 60)
+test('state_map_anchors_selftest', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-check-state-map-anchors.py'],
+     suite: 'abi', timeout: 300)
+
 # Issue #1570: self-test for scripts/ci/ci-run-telemetry.py, the offline
 # analyzer that separates CI queue delay from execution time.  Only the
 # self-test is registered: the analyzer itself is a measurement instrument, not
