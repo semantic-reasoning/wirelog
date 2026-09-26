@@ -32,6 +32,7 @@ void *__real_realloc(void *ptr, size_t size);
 static long allocation_fail_at = -1;
 static long allocation_calls;
 static size_t allocation_fail_calloc_size;
+static size_t allocation_fail_malloc_size;
 static wl_col_session_t *allocation_failure_worker;
 static bool allocation_failed_after_transfer;
 
@@ -45,6 +46,10 @@ fail_this_allocation(void)
 void *
 __wrap_malloc(size_t size)
 {
+    if (allocation_fail_malloc_size && size == allocation_fail_malloc_size) {
+        allocation_fail_malloc_size = 0;
+        return NULL;
+    }
     return fail_this_allocation() ? NULL : __real_malloc(size);
 }
 
@@ -1415,6 +1420,242 @@ test_bdx_seed_allocation_failure_is_atomic(void)
     fputs("BDX seed allocation failure coverage skipped\n", stderr);
     return 0;
 #endif
+}
+
+static col_delta_timestamp_t
+candidate_timestamp(uint32_t row, uint32_t worker)
+{
+    return (col_delta_timestamp_t){.iteration = row + 100,
+                                   .stratum = worker + 3,
+                                   .worker = worker,
+                                   .multiplicity = (int64_t)(row % 7) - 3};
+}
+
+static bool
+candidate_timestamp_equal(col_delta_timestamp_t a, col_delta_timestamp_t b)
+{
+    return a.iteration == b.iteration && a.stratum == b.stratum &&
+           a.worker == b.worker && a.multiplicity == b.multiplicity;
+}
+
+static void
+test_candidate_timestamp_order(bool merge)
+{
+    TEST("large multiworker seed/merge retains stable duplicate timestamps");
+    enum { ROWS = 8192, KEYS = 1024, WORKERS = 2 };
+    col_rel_t *target = col_rel_new_auto("r", 2);
+    col_rel_t *workers[WORKERS] = {NULL, NULL};
+    wl_mem_ledger_t ledger;
+    bool ledger_active = false;
+    const char *failure = NULL;
+#define ORDER_CHECK(condition, message)                                        \
+        do {                                                                       \
+            if (!(condition)) {                                                    \
+                failure = message;                                                 \
+                goto cleanup;                                                      \
+            }                                                                      \
+        } while (0)
+    ORDER_CHECK(target && col_rel_enable_timestamps(target) == 0, "target");
+    wl_mem_ledger_init(&ledger, 0);
+    ledger_active = true;
+    target->mem_ledger = &ledger;
+    col_rel_ledger_reconcile(target, 0);
+    for (uint32_t w = 0; w < WORKERS; w++) {
+        workers[w] = col_rel_new_auto("r", 2);
+        ORDER_CHECK(workers[w] && col_rel_enable_timestamps(workers[w]) == 0,
+            "worker");
+        for (uint32_t i = 0; i < ROWS; i++) {
+            int64_t key = (ROWS - 1 - i) % KEYS;
+            int64_t row[] = {key, key % 17};
+            ORDER_CHECK(col_rel_append_row(workers[w], row) == 0, "append");
+            workers[w]->timestamps[i] = candidate_timestamp(i, w);
+        }
+    }
+    int rc;
+#ifdef WL_TEST_TDD_MERGE
+    if (merge)
+        rc = wl_columnar_eval_test_tdd_merge(&target, workers, WORKERS);
+    else
+#else
+    (void)merge;
+#endif
+        rc = wl_columnar_eval_test_bdx_seed(target, workers, WORKERS);
+    ORDER_CHECK(rc == 0 && target->nrows == KEYS && target->timestamps,
+        "publication");
+    for (uint32_t key = 0; key < KEYS; key++) {
+        ORDER_CHECK(col_rel_get(target, key, 0) == key &&
+            col_rel_get(target, key, 1) == key % 17 &&
+            candidate_timestamp_equal(
+                target->timestamps[key],
+                candidate_timestamp(KEYS - 1 - key, 0)),
+            "first stable duplicate timestamp");
+    }
+    ORDER_CHECK(target->ledger_ts_bytes ==
+        col_rel_timestamp_ledger_bytes(target) &&
+        target->ledger_ts_bytes > 0,
+        "timestamp accounting");
+    for (uint32_t w = 0; w < WORKERS; w++) {
+        ORDER_CHECK(workers[w]->nrows == ROWS, "source row count");
+        for (uint32_t i = 0; i < ROWS; i++) {
+            uint32_t key = (ROWS - 1 - i) % KEYS;
+            ORDER_CHECK(
+                col_rel_get(workers[w], i, 0) == key &&
+                col_rel_get(workers[w], i, 1) == key % 17 &&
+                candidate_timestamp_equal(workers[w]->timestamps[i],
+                candidate_timestamp(i, w)),
+                "source changed");
+        }
+    }
+cleanup:
+    col_rel_destroy(target);
+    for (uint32_t w = 0; w < WORKERS; w++)
+        col_rel_destroy(workers[w]);
+    if (ledger_active) {
+        wl_mem_ledger_snapshot_t snapshot;
+        wl_mem_ledger_snapshot(&ledger, &snapshot);
+        if (snapshot.current_bytes != 0 && !failure)
+            failure = "timestamp ledger leak";
+    }
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef ORDER_CHECK
+}
+
+static void
+test_bdx_radix_scratch_failure(void)
+{
+#ifdef WL_TEST_ALLOC_WRAP
+    TEST(
+        "BDX radix timestamp allocation failure preserves staging and retries");
+    enum { ROWS = 37 };
+    col_rel_t *target = col_rel_new_auto("r", 2);
+    col_rel_t *worker = col_rel_new_auto("r", 2);
+    wl_columnar_memory_resolution_t resolution = {0};
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    bdx_seed_snapshot_t snapshot;
+    const char *failure = NULL;
+    uint64_t reserved = 0;
+#define SCRATCH_CHECK(condition, message)                                      \
+        do {                                                                       \
+            if (!(condition)) {                                                    \
+                failure = message;                                                 \
+                goto cleanup;                                                      \
+            }                                                                      \
+        } while (0)
+    resolution.budget_bytes = UINT64_C(1) << 24;
+    resolution.usable_bytes = resolution.budget_bytes;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    SCRATCH_CHECK(ref && target && worker, "fixture");
+    SCRATCH_CHECK(col_rel_attach_memory_governor(target, ref) == 0 &&
+        col_rel_attach_memory_governor(worker, ref) == 0 &&
+        col_rel_enable_timestamps(target) == 0 &&
+        col_rel_enable_timestamps(worker) == 0,
+        "governed timestamps");
+    for (uint32_t i = 0; i < ROWS; i++) {
+        int64_t row[] = {ROWS - i, i};
+        SCRATCH_CHECK(col_rel_append_row(worker, row) == 0, "append");
+        worker->timestamps[i] = candidate_timestamp(i, 1);
+    }
+    capture_bdx_seed_snapshot(target, &snapshot);
+    reserved =
+        wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(ref));
+    /* Staged payload uses relation capacity; only radix scratch requests
+     * exactly ROWS timestamp records. This exercises the real allocator. */
+    allocation_fail_malloc_size = ROWS * sizeof(col_delta_timestamp_t);
+    int rc = wl_columnar_eval_test_bdx_seed(target, (col_rel_t *[]){worker}, 1);
+    SCRATCH_CHECK(allocation_fail_malloc_size == 0 && rc == ENOMEM &&
+        bdx_seed_snapshot_unchanged(target, &snapshot) &&
+        wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == reserved,
+        "radix refusal changed published state or reservation");
+    for (uint32_t i = 0; i < ROWS; i++)
+        SCRATCH_CHECK(col_rel_get(worker, i, 0) == ROWS - i &&
+            col_rel_get(worker, i, 1) == i &&
+            candidate_timestamp_equal(worker->timestamps[i],
+            candidate_timestamp(i, 1)),
+            "source changed after refusal");
+    SCRATCH_CHECK(wl_columnar_eval_test_bdx_seed(
+            target, (col_rel_t *[]){worker}, 1) == 0 &&
+        target->nrows == ROWS,
+        "retry");
+    for (uint32_t i = 0; i < ROWS; i++)
+        SCRATCH_CHECK(
+            col_rel_get(target, i, 0) == i + 1 &&
+            col_rel_get(target, i, 1) == ROWS - 1 - i &&
+            candidate_timestamp_equal(target->timestamps[i],
+            candidate_timestamp(ROWS - 1 - i, 1)),
+            "retry timestamp order");
+cleanup:
+    allocation_fail_malloc_size = 0;
+    col_rel_destroy(target);
+    col_rel_destroy(worker);
+    if (ref) {
+        if (wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) != 0 &&
+            !failure)
+            failure = "reservation leak";
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef SCRATCH_CHECK
+#endif
+}
+
+static void
+test_nullary_candidate_timestamp_order(void)
+{
+    TEST("nullary seed preserves raw row counts and timestamps");
+    col_rel_t *target = col_rel_new_auto("r", 0);
+    col_rel_t *workers[] = {col_rel_new_auto("r", 0), col_rel_new_auto("r", 0)};
+    const char *failure = NULL;
+#define EMPTY_CHECK(condition, message)                                        \
+        do {                                                                       \
+            if (!(condition)) {                                                    \
+                failure = message;                                                 \
+                goto cleanup;                                                      \
+            }                                                                      \
+        } while (0)
+    EMPTY_CHECK(target && col_rel_enable_timestamps(target) == 0, "target");
+    for (uint32_t w = 0; w < 2; w++) {
+        int64_t empty_tuple = 0;
+        EMPTY_CHECK(workers[w] && col_rel_enable_timestamps(workers[w]) == 0 &&
+            col_rel_append_row(workers[w], &empty_tuple) == 0,
+            "worker");
+        workers[w]->timestamps[0] = candidate_timestamp(0, w);
+    }
+    int rc = wl_columnar_eval_test_bdx_seed(target, workers, 2);
+    EMPTY_CHECK(rc == 0 && target->nrows == 2 && target->ncols == 0 &&
+        target->timestamps &&
+        candidate_timestamp_equal(target->timestamps[0],
+        candidate_timestamp(0, 0)) &&
+        candidate_timestamp_equal(target->timestamps[1],
+        candidate_timestamp(0, 1)),
+        "raw tuple timestamps");
+    for (uint32_t w = 0; w < 2; w++)
+        EMPTY_CHECK(workers[w]->nrows == 1 && workers[w]->ncols == 0 &&
+            candidate_timestamp_equal(workers[w]->timestamps[0],
+            candidate_timestamp(0, w)),
+            "source changed");
+cleanup:
+    col_rel_destroy(target);
+    for (uint32_t w = 0; w < 2; w++)
+        col_rel_destroy(workers[w]);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef EMPTY_CHECK
 }
 
 static int
@@ -4020,7 +4261,7 @@ extern int wl_columnar_eval_test_global_exchange(const wl_plan_stratum_t *,
     wl_col_session_t *, col_eval_tdd_worker_ctx_t *, uint32_t);
 
 static void
-test_global_exchange_metadata(uint32_t workers, bool schema_less)
+test_global_exchange_metadata(uint32_t workers, bool schema_less, bool owner)
 {
     TEST(
         "global exchange: full metadata adoption and timestamp correspondence");
@@ -4066,7 +4307,8 @@ test_global_exchange_metadata(uint32_t workers, bool schema_less)
         "target");
     col_rel_t *target = unowned;
     unowned = NULL;
-    GLOBAL_META_CHECK(wl_columnar_eval_test_initializer(2, coord, workers) == 0,
+    GLOBAL_META_CHECK(
+        wl_columnar_eval_test_initializer(owner ? 0 : 2, coord, workers) == 0,
         "global workers");
     ctxs = calloc(workers, sizeof(*ctxs));
     GLOBAL_META_CHECK(ctxs, "contexts");
@@ -4088,21 +4330,66 @@ test_global_exchange_metadata(uint32_t workers, bool schema_less)
                                                                   row + 1 };
         }
     }
+    if (owner) {
+        GLOBAL_META_CHECK(wl_columnar_eval_test_owner_exchange(
+                &stratum, coord, ctxs, workers) == 0 &&
+            target->nrows == 2,
+            "owner exchange");
+        uint32_t rows_seen = 0;
+        unsigned keys_seen = 0;
+        for (uint32_t w = 0; w < workers; w++) {
+            GLOBAL_META_CHECK(ctxs[w].delta_rels[0] == NULL,
+                "input retirement");
+            col_rel_t *delta =
+                session_find_rel(&coord->tdd_workers[w], "$d$output");
+            if (!delta)
+                continue;
+            GLOBAL_META_CHECK(delta->ncols == 2 && delta->timestamps,
+                "owner timestamps");
+            for (uint32_t row = 0; row < delta->nrows; row++) {
+                int64_t key = col_rel_get(delta, row, 0);
+                GLOBAL_META_CHECK((key == 7 || key == 42) &&
+                    col_rel_get(delta, row, 1) == key,
+                    "owner row");
+                unsigned bit = key == 7 ? 1 : 2;
+                GLOBAL_META_CHECK(!(keys_seen & bit), "duplicate owner row");
+                keys_seen |= bit;
+                rows_seen++;
+                col_delta_timestamp_t timestamp = {
+                    .iteration = key == 7 ? 11 : 10,
+                    .stratum = 3,
+                    .worker = 0,
+                    .multiplicity = key == 7 ? 2 : 1
+                };
+                GLOBAL_META_CHECK(candidate_timestamp_equal(
+                        delta->timestamps[row], timestamp),
+                    "stable owner duplicate timestamp");
+            }
+        }
+        GLOBAL_META_CHECK(rows_seen == 2 && keys_seen == 3,
+            "owner row aggregate");
+        goto cleanup;
+    }
     GLOBAL_META_CHECK(wl_columnar_eval_test_global_exchange(&stratum, coord,
         ctxs, workers) == 0, "metadata exchange");
-    GLOBAL_META_CHECK(target == session_find_rel(coord, "output")
-        && target->nrows == 2 && target->ncols == 2 &&
-        target->declared_ncols == 1
-        && target->column_types && target->column_types[0] == WIRELOG_TYPE_INT64
-        && target->has_graph_column && target->graph_col_idx == 1
-        && target->compound_kind == WIRELOG_COMPOUND_KIND_INLINE
-        && target->compound_count == 1 && target->compound_arity_map
-        && target->compound_arity_map[0] == 2 && target->timestamps
-        && col_rel_get(target, 0, 0) == 7 && col_rel_get(target, 1, 0) == 42
-        && target->timestamps[0].iteration == 11
-        && target->timestamps[0].multiplicity == 2
-        && target->timestamps[1].iteration == 10
-        && target->timestamps[1].multiplicity == 1,
+    GLOBAL_META_CHECK(
+        target == session_find_rel(coord, "output") && target->nrows == 2 &&
+        target->ncols == 2 && target->declared_ncols == 1 &&
+        target->column_types &&
+        target->column_types[0] == WIRELOG_TYPE_INT64 &&
+        target->has_graph_column && target->graph_col_idx == 1 &&
+        target->compound_kind == WIRELOG_COMPOUND_KIND_INLINE &&
+        target->compound_count == 1 && target->compound_arity_map &&
+        target->compound_arity_map[0] == 2 && target->timestamps &&
+        col_rel_get(target, 0, 0) == 7 && col_rel_get(target, 1, 0) == 42 &&
+        target->timestamps[0].iteration == 11 &&
+        target->timestamps[0].worker == 0 &&
+        target->timestamps[0].stratum == 3 &&
+        target->timestamps[0].multiplicity == 2 &&
+        target->timestamps[1].iteration == 10 &&
+        target->timestamps[1].worker == 0 &&
+        target->timestamps[1].stratum == 3 &&
+        target->timestamps[1].multiplicity == 1,
         "metadata adoption or timestamp correspondence");
     for (uint32_t w = 0; w < workers; w++) {
         col_rel_t *view = session_find_rel(&coord->tdd_workers[w], "output");
@@ -4136,6 +4423,105 @@ cleanup:
     }
     PASS();
 #undef GLOBAL_META_CHECK
+}
+
+static void
+test_owner_exchange_nullary_timestamps(void)
+{
+    TEST("owner timestamped nullary exchange refuses before publication");
+    enum { WORKERS = 2, ROWS = 3 };
+    wl_plan_relation_t relation = {.name = "output", .delta_name = "$d$output"};
+    wl_plan_stratum_t stratum = {.relations = &relation, .relation_count = 1};
+    wl_plan_t plan = {.strata = &stratum, .stratum_count = 1};
+    wl_session_t *session = NULL;
+    col_rel_t *prototype = NULL, *unowned = NULL;
+    col_eval_tdd_worker_ctx_t ctxs[WORKERS] = {0};
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    const char *failure = NULL;
+#define NULLARY_CHECK(condition, message)                                      \
+        do {                                                                       \
+            if (!(condition)) {                                                    \
+                failure = message;                                                 \
+                goto cleanup;                                                      \
+            }                                                                      \
+        } while (0)
+    NULLARY_CHECK(
+        wl_session_create(wl_backend_columnar(), &plan, WORKERS, &session) == 0,
+        "session");
+    wl_col_session_t *coord = (wl_col_session_t *)session;
+    governor = coord->memory_governor;
+    wl_columnar_memory_governor_ref_retain(governor);
+    prototype = col_rel_new_auto("prototype", 0);
+    NULLARY_CHECK(prototype && col_rel_enable_timestamps(prototype) == 0,
+        "timestamp prototype");
+    unowned =
+        wl_columnar_relation_new_like_governed("output", prototype, governor);
+    NULLARY_CHECK(unowned && session_add_rel(coord, unowned) == 0, "target");
+    col_rel_t *target = unowned;
+    unowned = NULL;
+    NULLARY_CHECK(wl_columnar_eval_test_initializer(2, coord, WORKERS) == 0,
+        "workers");
+    /* Warm lazy registry indexes before comparing reservation totals. */
+    (void)session_find_rel(coord, "output");
+    for (uint32_t w = 0; w < WORKERS; w++)
+        (void)session_find_rel(&coord->tdd_workers[w], "output");
+    uint64_t reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(governor));
+    for (uint32_t w = 0; w < WORKERS; w++) {
+        ctxs[w].delta_rels = calloc(1, sizeof(*ctxs[w].delta_rels));
+        NULLARY_CHECK(ctxs[w].delta_rels, "delta matrix");
+        col_rel_t *delta = wl_columnar_relation_new_like_governed(
+            "$d$output", prototype, governor);
+        ctxs[w].delta_rels[0] = delta;
+        NULLARY_CHECK(delta, "delta");
+        for (uint32_t i = 0; i < ROWS; i++) {
+            int64_t empty_tuple = 0;
+            NULLARY_CHECK(col_rel_append_row(delta, &empty_tuple) == 0,
+                "append");
+            delta->timestamps[i] = candidate_timestamp(i, w);
+        }
+    }
+    bdx_seed_snapshot_t target_snapshot;
+    capture_bdx_seed_snapshot(target, &target_snapshot);
+    col_rel_t *views[WORKERS];
+    for (uint32_t w = 0; w < WORKERS; w++)
+        views[w] = session_find_rel(&coord->tdd_workers[w], "output");
+    int exchange_rc =
+        wl_columnar_eval_test_owner_exchange(&stratum, coord, ctxs, WORKERS);
+    NULLARY_CHECK(
+        exchange_rc == ENOMEM && target == session_find_rel(coord, "output") &&
+        bdx_seed_snapshot_unchanged(target, &target_snapshot) &&
+        wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)) == reserved,
+        "nullary refusal changed target or reservation");
+    /* The test boundary owns its inputs and destroys them on refusal. */
+    for (uint32_t w = 0; w < WORKERS; w++)
+        NULLARY_CHECK(ctxs[w].delta_rels[0] == NULL &&
+            session_find_rel(&coord->tdd_workers[w], "output") ==
+            views[w],
+            "input cleanup or worker publication");
+cleanup:
+    for (uint32_t w = 0; w < WORKERS; w++) {
+        if (ctxs[w].delta_rels)
+            col_rel_destroy(ctxs[w].delta_rels[0]);
+        free(ctxs[w].delta_rels);
+    }
+    col_rel_destroy(unowned);
+    col_rel_destroy(prototype);
+    wl_session_destroy(session);
+    if (governor) {
+        if (wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(governor)) != 0 &&
+            !failure)
+            failure = "reservation leak";
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef NULLARY_CHECK
 }
 
 static void
@@ -4568,8 +4954,9 @@ int
 main(void)
 {
     for (uint32_t workers = 2; workers <= 8; workers *= 4) {
-        test_global_exchange_metadata(workers, false);
-        test_global_exchange_metadata(workers, true);
+        test_global_exchange_metadata(workers, false, false);
+        test_global_exchange_metadata(workers, false, true);
+        test_global_exchange_metadata(workers, true, false);
     }
     for (unsigned mode = 0; mode < 10; mode++) {
 #ifndef WL_TEST_ALLOC_WRAP
@@ -4639,6 +5026,9 @@ main(void)
     test_bdx_seed_sort_failure_is_atomic();
     test_bdx_seed_allocation_failure_is_atomic();
     test_bdx_seed_success_preserves_timestamps();
+    test_candidate_timestamp_order(false);
+    test_nullary_candidate_timestamp_order();
+    test_bdx_radix_scratch_failure();
     TEST("owner lifetime refusal is retained and cleanup readiness retries");
     if (test_tdd_owner_lifetime_retry_gate() == 0)
         PASS();
@@ -4661,8 +5051,10 @@ main(void)
 #ifdef WL_TEST_TDD_MERGE
     test_tdd_merge_transactional_publication();
     test_tdd_merge_schema_mismatch_rollback();
+    test_candidate_timestamp_order(true);
 #endif
 #ifdef WL_TEST_OWNER_PUBLICATION
+    test_owner_exchange_nullary_timestamps();
     TEST("owner exchange candidate replacement and rollback contract");
     if (test_owner_exchange_candidate_contract() == 0)
         PASS();
