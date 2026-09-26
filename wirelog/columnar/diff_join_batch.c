@@ -554,12 +554,15 @@ col_diff_join_batch_producer_create(wl_col_session_t *sess,
     }
     if (rc != 0)
         goto fail;
-    if (!p->batch || col_join_set_output_types(p->batch, left, right, op)
-        != 0) {
+    if (!p->batch) {
         rc = ENOMEM;
         goto fail;
     }
+    rc = col_join_set_output_types(p->batch, left, right, op);
+    if (rc != 0)
+        goto fail;
     if (timestamped && !p->batch->timestamps) {
+        p->batch->memory_budget_denial_pending = false;
         rc = col_rel_enable_timestamps(p->batch);
         if (rc != 0) {
             if (rc == ENOMEM && p->batch->memory_budget_denial_pending)

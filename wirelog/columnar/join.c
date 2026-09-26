@@ -1268,9 +1268,10 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 &out);
         if (create_rc != 0)
             return wl_columnar_join_dispose_left(stack, &left_e, create_rc);
-        if (col_join_set_left_output_types(out, left_e.rel, op) != 0) {
+        create_rc = col_join_set_left_output_types(out, left_e.rel, op);
+        if (create_rc != 0) {
             col_rel_destroy(out);
-            return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
+            return wl_columnar_join_dispose_left(stack, &left_e, create_rc);
         }
         return wl_columnar_join_publish_after_left(stack, &left_e, out, false);
     }
@@ -1293,9 +1294,10 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 &empty);
         if (create_rc != 0)
             return wl_columnar_join_dispose_left(stack, &left_e, create_rc);
-        if (col_join_set_output_types(empty, left_e.rel, right, op) != 0) {
+        create_rc = col_join_set_output_types(empty, left_e.rel, right, op);
+        if (create_rc != 0) {
             col_rel_destroy(empty);
-            return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
+            return wl_columnar_join_dispose_left(stack, &left_e, create_rc);
         }
         return wl_columnar_join_publish_after_left(stack, &left_e, empty,
                    false);
@@ -1442,13 +1444,14 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             col_rel_destroy(right_filtered);
         return wl_columnar_join_dispose_left(stack, &left_e, output_rc);
     }
-    if (col_join_set_output_types(out, left, right, op) != 0) {
+    output_rc = col_join_set_output_types(out, left, right, op);
+    if (output_rc != 0) {
         wl_columnar_join_key_scratch_free(&key_scratch, &lk);
         wl_columnar_join_key_scratch_free(&key_scratch, &rk);
         col_rel_destroy(out);
         if (right_filtered)
             col_rel_destroy(right_filtered);
-        return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
+        return wl_columnar_join_dispose_left(stack, &left_e, output_rc);
     }
     int64_t *tmp = NULL;
 
@@ -2556,13 +2559,14 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
             col_rel_destroy(right_filtered);
         return wl_columnar_join_dispose_left(stack, &left_e, output_rc);
     }
-    if (col_join_set_left_output_types(out, left, op) != 0) {
+    output_rc = col_join_set_left_output_types(out, left, op);
+    if (output_rc != 0) {
         col_rel_destroy(out);
         wl_columnar_join_key_scratch_free(&key_scratch, &lk);
         wl_columnar_join_key_scratch_free(&key_scratch, &rk);
         if (right_filtered)
             col_rel_destroy(right_filtered);
-        return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
+        return wl_columnar_join_dispose_left(stack, &left_e, output_rc);
     }
     wl_columnar_memory_reservation_t sj_row_reservation;
     bool sj_row_admitted = false;
@@ -2958,9 +2962,10 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 false, &out);
         if (create_rc != 0)
             return wl_columnar_join_dispose_left(stack, &left_e, create_rc);
-        if (col_join_set_left_output_types(out, left_e.rel, op) != 0) {
+        create_rc = col_join_set_left_output_types(out, left_e.rel, op);
+        if (create_rc != 0) {
             col_rel_destroy(out);
-            return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
+            return wl_columnar_join_dispose_left(stack, &left_e, create_rc);
         }
         return wl_columnar_join_publish_after_left(stack, &left_e, out, false);
     }
@@ -2978,9 +2983,10 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
         if (create_rc != 0)
             return wl_columnar_join_dispose_left(stack, &left_e, create_rc);
         /* The schema copy still reads the left input (#1376). */
-        if (col_join_set_output_types(empty, left_e.rel, right, op) != 0) {
+        create_rc = col_join_set_output_types(empty, left_e.rel, right, op);
+        if (create_rc != 0) {
             col_rel_destroy(empty);
-            return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
+            return wl_columnar_join_dispose_left(stack, &left_e, create_rc);
         }
         return wl_columnar_join_publish_after_left(stack, &left_e, empty,
                    false);
@@ -3150,13 +3156,14 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
             col_rel_destroy(right_filtered);
         return wl_columnar_join_dispose_left(stack, &left_e, output_rc);
     }
-    if (col_join_set_output_types(out, left, right, op) != 0) {
+    output_rc = col_join_set_output_types(out, left, right, op);
+    if (output_rc != 0) {
         wl_columnar_join_key_scratch_free(&key_scratch, &lk);
         wl_columnar_join_key_scratch_free(&key_scratch, &rk);
         col_rel_destroy(out);
         if (right_filtered)
             col_rel_destroy(right_filtered);
-        return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
+        return wl_columnar_join_dispose_left(stack, &left_e, output_rc);
     }
     wl_columnar_memory_reservation_t tmp_reservation;
     bool tmp_admitted = false;

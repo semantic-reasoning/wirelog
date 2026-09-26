@@ -665,6 +665,7 @@ measure_output_bytes(uint64_t *out_bytes)
     if (session_add_rel(sess, right) != 0)
         goto out;
     right = NULL;
+    uint64_t source_baseline = reserved_of(sess);
     init_cross_op(&op);
     if (run_join(sess, left, &op, &result) != 0)
         goto out;
@@ -687,6 +688,16 @@ measure_output_bytes(uint64_t *out_bytes)
                 relation_charge(governed), scratch_bytes, out_bytes))
             goto out_entry;
     }
+    /* Type replacement holds the old Arrow metadata until commit. */
+    uint64_t metadata_peak = relation_charge(cached_output(sess, left))
+        - cached_output(sess, left)->descriptor_reserved_bytes
+        + sizeof(col_rel_t) + sizeof("$join")
+        + cached_output(sess, left)->metadata_reserved_bytes
+        - (uint64_t)cached_output(sess, left)->ncols
+        * sizeof(wirelog_column_type_t);
+    if (metadata_peak > *out_bytes)
+        *out_bytes = metadata_peak;
+    *out_bytes += source_baseline;
     ok = true;
 out_entry:
     if (result.owned && result.rel)
@@ -699,9 +710,67 @@ out:
 }
 
 static void
+test_missing_right_metadata_boundary(void)
+{
+    TEST("missing-right JOIN preserves metadata denial and exact overlap");
+    wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+    col_rel_t *left = make_left(1, 2);
+    wl_plan_op_t op;
+    eval_entry_t result = { 0 };
+    col_rel_t *shape = col_rel_new_auto("$join_empty", 2);
+    uint64_t payload = 0;
+    uint64_t metadata = 3u + 2u * (sizeof(char *)
+        + sizeof(struct ArrowSchema *) + sizeof(struct ArrowSchema) + 2u)
+        + 4u * sizeof("col0");
+    if (!sess || !left || !shape
+        || !col_rel_retained_bytes_for(shape, COL_REL_INIT_CAP, &payload)) {
+        FAIL("missing-right boundary fixture");
+        goto out;
+    }
+    init_cross_op(&op);
+    op.right_relation = "missing";
+    uint64_t peak = sizeof(col_rel_t) + sizeof("$join_empty")
+        + payload + 2u * metadata + 2u * sizeof(wirelog_column_type_t);
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(sess->memory_governor);
+    atomic_store_explicit(&governor->usable_bytes, peak - 1u,
+        memory_order_release);
+    if (run_join(sess, left, &op, &result) != ENOSPC
+        || result.rel || reserved_of(sess) != 0) {
+        FAIL("missing-right metadata denial was not typed or balanced");
+        goto out;
+    }
+    atomic_store_explicit(&governor->usable_bytes, peak, memory_order_release);
+    wl_columnar_relation_test_fail_next_metadata_alloc();
+    if (run_join(sess, left, &op, &result) != ENOMEM
+        || result.rel || reserved_of(sess) != 0) {
+        FAIL("missing-right metadata allocator failure lost its type");
+        goto out;
+    }
+    if (run_join(sess, left, &op, &result) != 0 || !result.rel
+        || result.rel->nrows != 0 || reserved_of(sess) != peak - metadata) {
+        FAIL("missing-right exact metadata overlap did not settle");
+        goto out;
+    }
+    col_rel_destroy(result.rel);
+    result.rel = NULL;
+    if (reserved_of(sess) != 0) {
+        FAIL("missing-right result destruction leaked credit");
+        goto out;
+    }
+    PASS();
+out:
+    if (result.owned && result.rel)
+        col_rel_destroy(result.rel);
+    col_rel_destroy(shape);
+    col_rel_destroy(left);
+    destroy_session(sess);
+}
+
+static void
 run_at_budget(const char *name, uint64_t budget, bool expect_ok)
 {
-    wl_col_session_t *sess = make_session(budget);
+    wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
     col_rel_t *right = make_right(2, 1);
     col_rel_t *left = make_left(4, 2);
     wl_plan_op_t op;
@@ -718,6 +787,10 @@ run_at_budget(const char *name, uint64_t budget, bool expect_ok)
         goto out;
     }
     right = NULL;
+    uint64_t source_baseline = reserved_of(sess);
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            sess->memory_governor)->usable_bytes, budget,
+        memory_order_release);
     init_cross_op(&op);
     rc = run_join(sess, left, &op, &result);
     if (expect_ok) {
@@ -750,7 +823,7 @@ run_at_budget(const char *name, uint64_t budget, bool expect_ok)
     }
     /* No arrangement is built on this path, so a denied cross join must
      * leave the governor exactly where it started. */
-    if (reserved_of(sess) != registry_charge(sess)) {
+    if (reserved_of(sess) != source_baseline) {
         FAIL("denied join left reserved bytes behind");
         goto out;
     }
@@ -1136,12 +1209,16 @@ test_source_governed_join_key_scratch_denial(void)
 
     TEST("source-only JOIN key scratch denial is typed and balanced");
     if (!sess || !right || !left
-        || !(source_ref = make_governor(
-            2u * sizeof(uint32_t) - 1u))
+        || !(source_ref = make_governor(64ull * 1024 * 1024))
         || col_rel_attach_memory_governor(left, source_ref) != 0) {
         FAIL("fixture");
         goto out;
     }
+    uint64_t source_baseline = reserved_for(source_ref);
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            source_ref)->usable_bytes,
+        source_baseline + 2u * sizeof(uint32_t) - 1u,
+        memory_order_release);
     session_ref = sess->memory_governor;
     sess->memory_governor = NULL;
     if (session_add_rel(sess, right) != 0) {
@@ -1154,7 +1231,7 @@ test_source_governed_join_key_scratch_denial(void)
     init_join_op(&op, left_keys, right_keys);
     if (run_join(sess, left, &op, NULL) != ENOSPC
         || !sess->memory_budget_denied
-        || reserved_for(source_ref) != 0) {
+        || reserved_for(source_ref) != source_baseline) {
         FAIL("key scratch denial was not typed or leaked its reservation");
     } else {
         PASS();
@@ -1182,11 +1259,15 @@ test_source_governed_join_key_scratch_alloc_failure(void)
 
     TEST("key scratch allocation failure releases its admitted source bytes");
     if (!sess || !right || !left
-        || !(source_ref = make_governor(2u * sizeof(uint32_t)))
+        || !(source_ref = make_governor(64ull * 1024 * 1024))
         || col_rel_attach_memory_governor(left, source_ref) != 0) {
         FAIL("fixture");
         goto out;
     }
+    uint64_t source_baseline = reserved_for(source_ref);
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            source_ref)->usable_bytes, source_baseline + 2u * sizeof(uint32_t),
+        memory_order_release);
     session_ref = sess->memory_governor;
     sess->memory_governor = NULL;
     if (session_add_rel(sess, right) != 0) {
@@ -1201,7 +1282,7 @@ test_source_governed_join_key_scratch_alloc_failure(void)
     int rc = run_join(sess, left, &op, NULL);
     bool injected = !wl_columnar_join_test_fail_next_key_scratch_alloc;
     if (rc != ENOMEM || !injected || sess->memory_budget_denied
-        || reserved_for(source_ref) != 0) {
+        || reserved_for(source_ref) != source_baseline) {
         FAIL("allocator failure was confused with denial or leaked bytes");
     } else {
         PASS();
@@ -1627,7 +1708,7 @@ test_parallel_cross_source_governor_accounts_contexts(void)
         FAIL("left source governor setup");
         goto out;
     }
-    left_bytes = left->retained_reserved_bytes;
+    left_bytes = relation_charge(left);
     sess->memory_governor = NULL;
     if (session_add_rel(sess, right) != 0) {
         sess->memory_governor = session_ref;
@@ -1693,7 +1774,7 @@ test_parallel_semijoin_source_governor_accounts_scratch(void)
         FAIL("left source governor setup");
         goto out;
     }
-    left_bytes = left->retained_reserved_bytes;
+    left_bytes = relation_charge(left);
     sess->memory_governor = NULL;
     if (session_add_rel(sess, right) != 0) {
         sess->memory_governor = session_ref;
@@ -2386,7 +2467,7 @@ test_parallel_diff_source_governor_accounting(void)
     col_rel_destroy(result.rel);
     result.rel = NULL;
     col_mat_cache_clear(&sess->mat_cache);
-    if (reserved_for(source_ref) != left->retained_reserved_bytes) {
+    if (reserved_for(source_ref) != relation_charge(left)) {
         FAIL("parallel diff cleanup retained scratch or output charges");
         goto out;
     }
@@ -3304,18 +3385,17 @@ main(void)
 
     test_attach_baseline();
     if (measure_output_bytes(&out_bytes)) {
-        const uint64_t registry_floor = 16u * sizeof(col_rel_t *)
-            + 16u * sizeof(uint32_t) + sizeof(uint32_t);
         run_at_budget("cross join succeeds at the exact output+scratch peak",
-            out_bytes + registry_floor, true);
+            out_bytes, true);
         run_at_budget("cross join denied one byte below output+scratch peak",
-            out_bytes + registry_floor - 1u, false);
+            out_bytes - 1u, false);
     } else {
         TEST("cross join succeeds at the exact output+scratch peak");
         FAIL("could not measure the output footprint");
         TEST("cross join is denied one byte below its output+scratch peak");
         FAIL("could not measure the output footprint");
     }
+    test_missing_right_metadata_boundary();
     test_growth_rollback();
     test_worker_join_above_ledger_threshold_keeps_all_rows();
     test_reuse_after_denial();

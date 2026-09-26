@@ -493,14 +493,17 @@ col_join_batch_producer_create(wl_col_session_t *sess,
     }
     if (rc != 0)
         goto fail;
-    if (col_join_set_output_types(p->batch, left, right, op) != 0) {
-        rc = ENOMEM;
+    rc = col_join_set_output_types(p->batch, left, right, op);
+    if (rc != 0)
         goto fail;
-    }
-    if (timestamped && !p->batch->timestamps
-        && col_rel_enable_timestamps(p->batch) != 0) {
-        rc = ENOMEM;
-        goto fail;
+    if (timestamped && !p->batch->timestamps) {
+        p->batch->memory_budget_denial_pending = false;
+        rc = col_rel_enable_timestamps(p->batch);
+        if (rc != 0) {
+            if (rc == ENOMEM && p->batch->memory_budget_denial_pending)
+                rc = ENOSPC;
+            goto fail;
+        }
     }
     if (!col_rel_retained_bytes_for(p->batch, 1u, &row_bytes)) {
         rc = EINVAL;

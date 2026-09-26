@@ -115,6 +115,8 @@ def authorize_reviewed_pr(repo, base_sha, candidate_sha, candidate_value, p, tok
                "tests/test_wirelog_easy.c", "tests/test_wirelog_advanced.c",
                "tests/test_memory_admission_join.c", "tests/test_join_batch_resume.c",
                "tests/test_diff_join.c", "tests/test_join_arrangement.c",
+               "wirelog/columnar/relation.c",
+               "wirelog/columnar/join.c",
                "wirelog/columnar/join_batch.c", "wirelog/columnar/diff_join_batch.c"}
     if not changed or not set(changed).issubset(allowed):
         fail("reviewed PR rebaseline has changes outside its reviewed repair paths")

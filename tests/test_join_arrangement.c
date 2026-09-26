@@ -202,6 +202,20 @@ run_direct_join(wl_col_session_t *col_session, col_rel_t *left,
     return 0;
 }
 
+static uint64_t
+auto_metadata_bytes(uint32_t ncols)
+{
+    uint64_t bytes = 3u + (uint64_t)ncols
+        * (sizeof(char *) + sizeof(struct ArrowSchema *)
+        + sizeof(struct ArrowSchema) + 2u);
+    for (uint32_t i = 0; i < ncols; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "col%u", i);
+        bytes += 2u * (strlen(name) + 1u);
+    }
+    return bytes;
+}
+
 /* Admit the four-column output, key-index slots, probe row and arrangement
  * key row, but not the 192-byte minimum arrangement table (16 buckets plus
  * 16 chain slots) for the two-row test relation. Existing relations stay on
@@ -219,7 +233,10 @@ tight_arrangement_governor(void)
         return NULL;
     }
     col_rel_destroy(shape);
-    resolution.budget_bytes = output_bytes + 32u + 2u * sizeof(uint32_t)
+    resolution.budget_bytes = output_bytes + sizeof(col_rel_t)
+        + sizeof("$join") + auto_metadata_bytes(4)
+        + 4u * sizeof(wirelog_column_type_t)
+        + 32u + 2u * sizeof(uint32_t)
         + 2u * sizeof(int64_t);
     resolution.usable_bytes = resolution.budget_bytes;
     resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
@@ -612,7 +629,7 @@ test_join_arr_primary_probe_writer_retry(void)
 static void
 test_join_arr_primary_probe_enomem_propagates(void)
 {
-    TEST("Primary arrangement JOIN propagates build ENOMEM");
+    TEST("Primary arrangement JOIN propagates admission failures");
 
     const char *src = ".decl edge(x: int32, y: int32)\n"
         "edge(1, 100). edge(2, 200).\n";
@@ -637,10 +654,25 @@ test_join_arr_primary_probe_enomem_propagates(void)
     rc = run_direct_join(col_session, left, NULL);
     col_rel_destroy(left);
 
+    ASSERT(rc == ENOSPC, "metadata overlap denial precedes cold indexing");
+    /* Isolate the cold arrangement allocation from output metadata. */
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(tight);
+    atomic_store_explicit(&governor->usable_bytes,
+        16u * sizeof(uint32_t) + 16u * sizeof(uint32_t) - 1u,
+        memory_order_release);
+    col_arrangement_probe_t probe = { 0 };
+    const uint32_t key = 0;
+    int probe_rc = col_session_acquire_primary_arrangement_probe(sess,
+            col_session->rels[0], &key, 1u, &probe);
+    ASSERT(probe_rc == ENOMEM,
+        "cold arrangement allocation denial stays visible");
+    ASSERT(wl_columnar_memory_reserved(governor) == 0,
+        "cold arrangement denial releases scratch admission");
     col_session->memory_governor = orig_governor;
     wl_columnar_memory_governor_ref_release(tight);
 
-    ASSERT(rc == ENOMEM, "primary build ENOMEM must not fall back");
+    ASSERT(rc == ENOSPC, "output metadata denial must remain ENOSPC");
     ASSERT(col_session->arr_count == 0,
         "failed primary build must not publish an arrangement");
 
