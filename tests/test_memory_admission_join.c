@@ -727,6 +727,8 @@ test_missing_right_metadata_boundary(void)
         FAIL("missing-right boundary fixture");
         goto out;
     }
+    payload += (uint64_t)shape->ncols
+        * (sizeof(int64_t *) + sizeof(int64_t));
     init_cross_op(&op);
     op.right_relation = "missing";
     uint64_t peak = sizeof(col_rel_t) + sizeof("$join_empty")
@@ -3387,6 +3389,7 @@ test_timestamp_batch_projection_and_live_charge(void)
         || batch->capacity <= 1u
         || row_bytes != sizeof(int64_t) + sizeof(col_delta_timestamp_t)
         || live_bytes != (uint64_t)batch->capacity * row_bytes
+        + sizeof(int64_t *) + sizeof(int64_t)
         || batch->retained_reserved_bytes != live_bytes) {
         FAIL("projected row or live retained footprint changed");
     } else {

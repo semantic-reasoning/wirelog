@@ -193,6 +193,284 @@ col_row_in_sorted(const int64_t *sorted_data, uint32_t nrows, uint32_t ncols,
  * specification for the pointer-swap contract, so it is kept rather than
  * deleted; UNUSED suppresses the warning until it is wired up.
  */
+typedef struct {
+    col_rel_t *rel;
+    wl_columnar_source_access_writer_t writer;
+    int64_t **empty_columns;
+    col_delta_timestamp_t *empty_timestamps;
+    uint64_t old_bytes;
+    uint64_t incoming_bytes;
+    bool growth_pending;
+    bool growth_committed;
+} wl_retraction_stage_t;
+
+#ifdef WL_SESSION_TEST_HOOKS
+int (*wl_columnar_eval_delta_test_retraction_eval)(
+    const wl_plan_stratum_t *, wl_col_session_t *, uint32_t);
+#endif
+
+static int
+wl_retraction_evaluate(const wl_plan_stratum_t *sp,
+    wl_col_session_t *sess, uint32_t stratum_idx)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_delta_test_retraction_eval)
+        return wl_columnar_eval_delta_test_retraction_eval(sp, sess,
+                   stratum_idx);
+#endif
+    return col_eval_stratum(sp, sess, stratum_idx);
+}
+
+static void
+wl_retraction_stage_discard(wl_retraction_stage_t *stages, uint32_t count)
+{
+    if (!stages)
+        return;
+    /* Free the staged physical image before returning any reserved credit. */
+    for (uint32_t i = 0; i < count; i++) {
+        wl_retraction_stage_t *s = &stages[i];
+        if (s->empty_columns)
+            col_columns_free(s->empty_columns, s->rel->ncols);
+        free(s->empty_timestamps);
+        s->empty_columns = NULL;
+        s->empty_timestamps = NULL;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        wl_retraction_stage_t *s = &stages[i];
+        if (s->growth_committed) {
+            if (!wl_columnar_memory_reservation_downsize(
+                    &s->rel->retained_reservation, s->old_bytes))
+                abort();
+            s->rel->retained_reserved_bytes = s->old_bytes;
+        } else if (s->growth_pending
+            && !wl_columnar_memory_rollback_growth(
+                &s->rel->retained_reservation))
+            abort();
+        if (s->writer.owner)
+            (void)wl_columnar_source_access_writer_release(&s->writer);
+    }
+    free(stages);
+}
+
+static int
+wl_retraction_stage_prepare(const wl_plan_stratum_t *sp,
+    wl_col_session_t *sess, wl_retraction_stage_t **out)
+{
+    const uint32_t count = sp->relation_count;
+    wl_retraction_stage_t *stages = calloc(count ? count : 1u,
+            sizeof(*stages));
+    int rc = ENOMEM;
+    if (!stages)
+        return ENOMEM;
+    *out = NULL;
+    for (uint32_t i = 0; i < count; i++) {
+        wl_retraction_stage_t *s = &stages[i];
+        col_rel_t *r = session_find_rel(sess, sp->relations[i].name);
+        if (!r || r->ncols == 0)
+            continue;
+        for (uint32_t j = 0; j < i; j++)
+            if (stages[j].rel == r) {
+                rc = EBUSY;
+                goto fail;
+            }
+        s->rel = r;
+        rc = col_rel_source_writer_acquire(r, &s->writer);
+        if (rc != 0)
+            goto fail;
+        if (r->pool_owned || r->arena_owned || r->col_shared
+            || r->storage_owner != r
+            || r->storage_owner_identity != r->relation_identity
+            || r->storage_owner_generation != r->storage_generation
+            || col_rel_storage_alias_borrow_count(r) != 0
+            || r->retract_backup_columns || r->retract_backup_timestamps
+            || r->retract_backup_capacity
+            || r->retract_backup_timestamp_capacity
+            || r->retract_backup_nrows || r->retract_backup_base_nrows
+            || r->base_nrows > r->nrows || r->merge_columns
+            || r->merge_buf_cap || !r->columns
+            || r->nrows > r->capacity
+            || (r->timestamps != NULL) != (r->timestamp_capacity != 0)
+            || (r->timestamps && r->timestamp_capacity < r->nrows)
+            || (r->memory_governor && !r->row_scratch)) {
+            rc = EBUSY;
+            goto fail;
+        }
+        for (uint32_t c = 0; c < r->ncols; c++)
+            if (!r->columns[c]) {
+                rc = EBUSY;
+                goto fail;
+            }
+        if (!col_rel_retained_live_bytes(r, &s->old_bytes)) {
+            rc = EBUSY;
+            goto fail;
+        }
+        if (r->memory_governor
+            && (s->old_bytes != r->retained_reserved_bytes
+            || r->retained_reservation.bytes != s->old_bytes
+            || r->retained_reservation.identity
+            != &r->retained_reservation
+            || r->retained_reservation.governor
+            != wl_columnar_memory_governor_ref_get(
+                r->memory_governor)
+            || atomic_load_explicit(&r->retained_reservation.state,
+            memory_order_acquire)
+            != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+            || atomic_load_explicit(&r->retained_reservation.owner_bits,
+            memory_order_acquire) != (uintptr_t)r)) {
+            rc = EBUSY;
+            goto fail;
+        }
+    }
+    /* Every participant is canonical and token-complete before the first
+     * growth reservation. Keep their writer leases only through publish. */
+    for (uint32_t i = 0; i < count; i++) {
+        wl_retraction_stage_t *s = &stages[i];
+        col_rel_t *r = s->rel;
+        if (!r)
+            continue;
+        uint64_t lanes, table, timestamps = 0;
+        if (!wl_columnar_memory_size_mul(r->ncols, COL_REL_INIT_CAP,
+            &lanes)
+            || !wl_columnar_memory_size_mul(lanes, sizeof(int64_t),
+            &lanes)
+            || !wl_columnar_memory_size_mul(r->ncols,
+            sizeof(int64_t *), &table)
+            || !wl_columnar_memory_size_add(lanes, table,
+            &s->incoming_bytes)
+            || (r->timestamps && (!wl_columnar_memory_size_mul(
+                COL_REL_INIT_CAP, sizeof(col_delta_timestamp_t),
+                &timestamps)
+            || !wl_columnar_memory_size_add(s->incoming_bytes,
+            timestamps, &s->incoming_bytes)))) {
+            rc = EOVERFLOW;
+            goto fail;
+        }
+        if (r->memory_governor) {
+            wl_columnar_memory_admission_status_t status
+                = wl_columnar_memory_begin_growth(
+                    &r->retained_reservation, s->incoming_bytes);
+            if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+                && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+                rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                    : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                    ? EOVERFLOW : EBUSY;
+                if (rc == ENOSPC) {
+                    r->memory_budget_denial_pending = true;
+                    sess->memory_budget_denied = true;
+                }
+                goto fail;
+            }
+            s->growth_pending = true;
+        }
+        s->empty_columns = col_columns_alloc(r->ncols, COL_REL_INIT_CAP);
+        if (!s->empty_columns) {
+            rc = ENOMEM;
+            goto fail;
+        }
+        if (r->timestamps) {
+            s->empty_timestamps = calloc(COL_REL_INIT_CAP,
+                    sizeof(*s->empty_timestamps));
+            if (!s->empty_timestamps) {
+                rc = ENOMEM;
+                goto fail;
+            }
+        }
+    }
+    /* All fallible preparation completed. Commit credits while every old
+     * image and every staged allocation is still resident. */
+    for (uint32_t i = 0; i < count; i++) {
+        wl_retraction_stage_t *s = &stages[i];
+        if (!s->rel || !s->growth_pending)
+            continue;
+        if (!wl_columnar_memory_commit_growth(
+                &s->rel->retained_reservation)) {
+            rc = EBUSY;
+            goto fail;
+        }
+        s->growth_pending = false;
+        s->growth_committed = true;
+        s->rel->retained_reserved_bytes += s->incoming_bytes;
+    }
+    *out = stages;
+    return 0;
+fail:
+    wl_retraction_stage_discard(stages, count);
+    return rc;
+}
+
+static void
+wl_retraction_restore(col_rel_t *r)
+{
+    if (!r || !r->retract_backup_columns)
+        return;
+    col_columns_free(r->columns, r->ncols);
+    free(r->timestamps);
+    col_columns_free(r->merge_columns, r->ncols);
+    r->columns = NULL;
+    r->timestamps = NULL;
+    r->timestamp_capacity = 0;
+    r->merge_columns = NULL;
+    r->merge_buf_cap = 0;
+    r->capacity = 0;
+    r->nrows = 0;
+    col_rel_retire_payload_credit(r);
+    r->columns = r->retract_backup_columns;
+    r->timestamps = r->retract_backup_timestamps;
+    r->timestamp_capacity = r->retract_backup_timestamp_capacity;
+    r->nrows = r->retract_backup_nrows;
+    r->base_nrows = r->retract_backup_base_nrows;
+    r->capacity = r->retract_backup_capacity;
+    r->sorted_nrows = r->retract_backup_sorted_nrows;
+    r->run_count = r->retract_backup_run_count;
+    memcpy(r->run_ends, r->retract_backup_run_ends,
+        sizeof(r->run_ends));
+    r->retract_backup_columns = NULL;
+    r->retract_backup_timestamps = NULL;
+    r->retract_backup_timestamp_capacity = 0;
+    r->retract_backup_nrows = 0;
+    r->retract_backup_base_nrows = 0;
+    r->retract_backup_capacity = 0;
+    r->retract_backup_sorted_nrows = 0;
+    r->retract_backup_run_count = 0;
+    wl_columnar_relation_touch_replacement(r);
+}
+
+static void
+wl_retraction_restore_all(const wl_plan_stratum_t *sp,
+    wl_col_session_t *sess)
+{
+    for (uint32_t i = 0; i < sp->relation_count; i++)
+        wl_retraction_restore(session_find_rel(sess,
+            sp->relations[i].name));
+}
+
+static int wl_columnar_eval_delta_timestamp_normalize(
+    wl_col_session_t *sess, col_rel_t *rel);
+
+static int
+wl_retraction_consolidate_candidates(col_rel_t *r, wl_col_session_t *sess)
+{
+    if (r->nrows <= 1)
+        return 0;
+    if (r->timestamps)
+        return wl_columnar_eval_delta_timestamp_normalize(sess, r);
+    int rc = col_rel_radix_sort(r, 0, r->nrows);
+    if (rc != 0)
+        return rc;
+    uint32_t out = 1;
+    for (uint32_t row = 1; row < r->nrows; row++) {
+        if (col_rel_row_cmp(r, out - 1u, row) == 0)
+            continue;
+        col_rel_row_move_raw(r, out, row);
+        out++;
+    }
+    r->nrows = out;
+    r->sorted_nrows = out;
+    r->run_count = 1;
+    r->run_ends[0] = out;
+    return 0;
+}
+
 static int UNUSED
 col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
     wl_col_session_t *sess,
@@ -215,28 +493,51 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
         return ENOMEM;
     }
 
+    wl_retraction_stage_t *stages = NULL;
+    int rc = wl_retraction_stage_prepare(sp, sess, &stages);
+    if (rc != 0) {
+        free((void *)retract_data);
+        free(retract_nrows);
+        return rc;
+    }
+
     /* Step 0: Pointer-swap original data into retract_backup fields (O(1))
      * and clear relation for retraction evaluation. */
     for (uint32_t ri = 0; ri < rc_cnt; ri++) {
-        col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
-        if (!r || r->ncols == 0)
+        wl_retraction_stage_t *s = &stages[ri];
+        col_rel_t *r = s->rel;
+        if (!r)
             continue;
         r->retract_backup_columns = r->columns;
+        r->retract_backup_timestamps = r->timestamps;
+        r->retract_backup_timestamp_capacity = r->timestamp_capacity;
         r->retract_backup_nrows = r->nrows;
+        r->retract_backup_base_nrows = r->base_nrows;
         r->retract_backup_capacity = r->capacity;
         r->retract_backup_sorted_nrows = r->sorted_nrows;
         r->retract_backup_run_count = r->run_count;
         memcpy(r->retract_backup_run_ends, r->run_ends,
             sizeof(r->run_ends));
-        r->columns = NULL;
-        r->capacity = 0;
+        r->columns = s->empty_columns;
+        r->timestamps = s->empty_timestamps;
+        r->timestamp_capacity = s->empty_timestamps
+            ? COL_REL_INIT_CAP : 0;
+        s->empty_columns = NULL;
+        s->empty_timestamps = NULL;
+        r->capacity = COL_REL_INIT_CAP;
         r->nrows = 0;
+        r->base_nrows = 0;
         r->sorted_nrows = 0;
         r->run_count = 0;
         /* Retraction publishes a temporary empty view.  Restoration below
          * must receive a fresh generation, never the saved one. */
         wl_columnar_relation_touch_replacement(r);
     }
+    for (uint32_t ri = 0; ri < rc_cnt; ri++)
+        if (stages[ri].writer.owner)
+            (void)wl_columnar_source_access_writer_release(
+                &stages[ri].writer);
+    free(stages);
 
     /* Step 1: Enable retraction-seeded mode and evaluate stratum.
      * First pass (left): VARIABLE loads $r$, JOIN uses full right.
@@ -245,7 +546,7 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
      * retracted EDB appears on both sides of a JOIN. */
     sess->retraction_seeded = true;
     sess->retraction_right_pass = false;
-    int rc = col_eval_stratum(sp, sess, stratum_idx);
+    rc = wl_retraction_evaluate(sp, sess, stratum_idx);
 
     /* Issue #472: Check if a second (right) pass is needed.
      * Scan relation plans for JOIN/SEMIJOIN ops whose right_relation has
@@ -275,32 +576,13 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
         }
         if (need_right_pass) {
             sess->retraction_right_pass = true;
-            rc = col_eval_stratum(sp, sess, stratum_idx);
+            rc = wl_retraction_evaluate(sp, sess, stratum_idx);
             sess->retraction_right_pass = false;
         }
     }
     sess->retraction_seeded = false;
     if (rc != 0) {
-        /* Restore all backup pointers; free any eval-allocated buffers */
-        for (uint32_t i = 0; i < rc_cnt; i++) {
-            col_rel_t *r = session_find_rel(sess, sp->relations[i].name);
-            if (!r || r->ncols == 0)
-                continue;
-            col_columns_free(r->columns, r->ncols);
-            r->columns = r->retract_backup_columns;
-            r->nrows = r->retract_backup_nrows;
-            r->capacity = r->retract_backup_capacity;
-            r->sorted_nrows = r->retract_backup_sorted_nrows;
-            r->run_count = r->retract_backup_run_count;
-            memcpy(r->run_ends, r->retract_backup_run_ends,
-                sizeof(r->run_ends));
-            r->retract_backup_columns = NULL;
-            r->retract_backup_nrows = 0;
-            r->retract_backup_capacity = 0;
-            r->retract_backup_sorted_nrows = 0;
-            r->retract_backup_run_count = 0;
-            wl_columnar_relation_touch_replacement(r);
-        }
+        wl_retraction_restore_all(sp, sess);
         free((void *)retract_data);
         free(retract_nrows);
         return rc;
@@ -314,32 +596,11 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
             continue;
 
         if (r->nrows > 0) {
-            rc = wl_columnar_eval_delta_consolidate(r, sess);
+            rc = wl_retraction_consolidate_candidates(r, sess);
             if (rc != 0) {
-                /* Restore any relations still holding backup state */
-                for (uint32_t i = 0; i < rc_cnt; i++) {
-                    col_rel_t *r2
-                        = session_find_rel(sess, sp->relations[i].name);
-                    if (!r2 || r2->ncols == 0)
-                        continue;
-                    if (r2->retract_backup_columns != NULL) {
-                        col_columns_free(r2->columns, r2->ncols);
-                        r2->columns = r2->retract_backup_columns;
-                        r2->nrows = r2->retract_backup_nrows;
-                        r2->capacity = r2->retract_backup_capacity;
-                        r2->sorted_nrows = r2->retract_backup_sorted_nrows;
-                        r2->run_count = r2->retract_backup_run_count;
-                        memcpy(r2->run_ends, r2->retract_backup_run_ends,
-                            sizeof(r2->run_ends));
-                        r2->retract_backup_columns = NULL;
-                        r2->retract_backup_nrows = 0;
-                        r2->retract_backup_capacity = 0;
-                        r2->retract_backup_sorted_nrows = 0;
-                        r2->retract_backup_run_count = 0;
-                        wl_columnar_relation_touch_replacement(r2);
-                    }
+                wl_retraction_restore_all(sp, sess);
+                for (uint32_t i = 0; i < rc_cnt; i++)
                     free(retract_data[i]);
-                }
                 free((void *)retract_data);
                 free(retract_nrows);
                 return rc;
@@ -348,36 +609,50 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
             uint32_t nc = r->ncols;
             int64_t *flat = (int64_t *)malloc(
                 (size_t)r->nrows * nc * sizeof(int64_t));
-            if (flat) {
-                for (uint32_t row = 0; row < r->nrows; row++)
-                    col_rel_row_copy_out(r, row, flat + (size_t)row * nc);
+            if (!flat) {
+                wl_retraction_restore_all(sp, sess);
+                for (uint32_t i = 0; i < rc_cnt; i++)
+                    free(retract_data[i]);
+                free((void *)retract_data);
+                free(retract_nrows);
+                return ENOMEM;
             }
+            for (uint32_t row = 0; row < r->nrows; row++)
+                col_rel_row_copy_out(r, row, flat + (size_t)row * nc);
             retract_data[ri] = flat;
-            retract_nrows[ri] = flat ? r->nrows : 0;
-            col_columns_free(r->columns, r->ncols);
-            r->columns = NULL;
-            r->capacity = 0;
-            r->nrows = 0;
+            retract_nrows[ri] = r->nrows;
         }
+        wl_retraction_restore(r);
+    }
 
-        /* Free any eval-allocated buffer not stolen above (nrows==0 case) */
-        col_columns_free(r->columns, r->ncols);
-        r->columns = NULL;
-
-        /* Swap back original data (O(1)) */
-        r->columns = r->retract_backup_columns;
-        r->nrows = r->retract_backup_nrows;
-        r->capacity = r->retract_backup_capacity;
-        r->sorted_nrows = r->retract_backup_sorted_nrows;
-        r->run_count = r->retract_backup_run_count;
-        memcpy(r->run_ends, r->retract_backup_run_ends,
-            sizeof(r->run_ends));
-        r->retract_backup_columns = NULL;
-        r->retract_backup_nrows = 0;
-        r->retract_backup_capacity = 0;
-        r->retract_backup_sorted_nrows = 0;
-        r->retract_backup_run_count = 0;
-        wl_columnar_relation_touch_replacement(r);
+    /* Prepare the only row buffer before any relation can lose a row. */
+    uint32_t widest = 0;
+    for (uint32_t ri = 0; ri < rc_cnt; ri++) {
+        col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
+        if (r && retract_nrows[ri] && r->ncols > widest)
+            widest = r->ncols;
+    }
+    int64_t row_stack[COL_STACK_MAX];
+    int64_t *src_buf = row_stack;
+    if (widest > COL_STACK_MAX) {
+#if SIZE_MAX < UINT64_MAX
+        if ((uint64_t)widest > SIZE_MAX / sizeof(int64_t)) {
+            rc = EOVERFLOW;
+        } else {
+#endif
+        src_buf = malloc((size_t)widest * sizeof(int64_t));
+        if (!src_buf)
+            rc = ENOMEM;
+#if SIZE_MAX < UINT64_MAX
+    }
+#endif
+        if (rc != 0) {
+            for (uint32_t i = 0; i < rc_cnt; i++)
+                free(retract_data[i]);
+            free((void *)retract_data);
+            free(retract_nrows);
+            return rc;
+        }
     }
 
     /* Step 4: Remove retracted rows and fire delta callbacks */
@@ -387,18 +662,7 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
             continue;
 
         uint32_t ncols = r->ncols;
-        int64_t row_stack[COL_STACK_MAX];
-        int64_t *src_buf = row_stack;
-        if (ncols > COL_STACK_MAX) {
-            src_buf = (int64_t *)malloc(ncols * sizeof(int64_t));
-            if (!src_buf) {
-                for (uint32_t i = 0; i < rc_cnt; i++)
-                    free(retract_data[i]);
-                free((void *)retract_data);
-                free(retract_nrows);
-                return ENOMEM;
-            }
-        }
+        bool removed_any = false;
 
         for (uint32_t del_idx = 0; del_idx < retract_nrows[ri]; del_idx++) {
             const int64_t *to_remove
@@ -413,19 +677,27 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
                     == 0) {
                     /* Found matching row; skip it (removal) */
                     found = true;
+                    removed_any = true;
                     /* Copy remaining rows forward */
                     for (uint32_t rest = src_idx + 1; rest < r->nrows;
                         rest++) {
                         col_rel_row_move_raw(r, out_r, rest);
+                        if (r->timestamps)
+                            r->timestamps[out_r] = r->timestamps[rest];
                         out_r++;
                     }
                     r->nrows = out_r;
+                    if (src_idx < r->base_nrows)
+                        r->base_nrows--;
                     wl_columnar_relation_touch_view(r);
                     break;
                 } else {
                     /* Keep this row */
-                    if (out_r != src_idx)
+                    if (out_r != src_idx) {
                         col_rel_row_copy_in_raw(r, out_r, src_buf);
+                        if (r->timestamps)
+                            r->timestamps[out_r] = r->timestamps[src_idx];
+                    }
                     out_r++;
                 }
             }
@@ -436,17 +708,28 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
                     sess->delta_data);
             }
         }
-        if (src_buf != row_stack)
-            free(src_buf);
+        if (removed_any)
+            wl_columnar_eval_dedup_set_clear(r);
     }
 
     /* Cleanup: free stolen retraction buffers */
+    if (src_buf != row_stack)
+        free(src_buf);
     for (uint32_t i = 0; i < rc_cnt; i++)
         free(retract_data[i]);
     free((void *)retract_data);
     free(retract_nrows);
     return 0;
 }
+
+#ifdef WL_SESSION_TEST_HOOKS
+int
+wl_columnar_eval_delta_test_retraction_step(const wl_plan_stratum_t *sp,
+    wl_col_session_t *sess, uint32_t stratum_idx)
+{
+    return col_stratum_step_retraction_nonrecursive(sp, sess, stratum_idx);
+}
+#endif
 
 typedef struct {
     char *name;

@@ -391,6 +391,9 @@ typedef struct col_rel {
     /* A pool descriptor owns its heap name until publication promotes it. */
     wl_columnar_memory_reservation_t pool_name_reservation;
     uint64_t pool_name_reserved_bytes;
+    /* The persistent TDD hash table is independent of relation payload. */
+    wl_columnar_memory_reservation_t dedup_reservation;
+    uint64_t dedup_reserved_bytes;
     /* Set when governed admission was denied while preparing this relation. */
     uint8_t memory_budget_denial_pending;
     wl_columnar_memory_reservation_t retained_reservation;
@@ -401,15 +404,20 @@ typedef struct col_rel {
      * mem_ledger is NULL. */
     uint64_t ledger_ts_bytes;
     /* Scratch buffer for col_rel_row() gather (Phase C, Issue #332).
-     * Lazily allocated on first col_rel_row() call. Freed in free_contents. */
+     * Preallocated before governed publication; ungoverned relations may
+     * allocate it lazily. Freed in free_contents. */
     int64_t *row_scratch;
     /* Zero-copy retraction backup (issue #300).
      * col_stratum_step_retraction_nonrecursive saves the live columns pointer
      * here before clearing the relation for retraction evaluation, then
-     * restores it afterwards without any memcpy.  All four fields are
-     * NULL/0 at all times outside retraction evaluation. */
+     * restores it afterwards without any memcpy. The timestamp pointer and
+     * its physical capacity move with the rows. All backup fields are
+     * NULL/0 outside retraction evaluation. */
     int64_t **retract_backup_columns;
+    col_delta_timestamp_t *retract_backup_timestamps;
+    uint32_t retract_backup_timestamp_capacity;
     uint32_t retract_backup_nrows;
+    uint32_t retract_backup_base_nrows;
     uint32_t retract_backup_capacity;
     uint32_t retract_backup_sorted_nrows;
     /* Zero-copy column sharing for worker sessions (Issue #334, 6B).
@@ -559,11 +567,14 @@ typedef struct col_rel_replacement {
     col_rel_t *staged;
     wl_columnar_memory_reservation_t reservation;
     wl_columnar_memory_reservation_t metadata_reservation;
+    wl_columnar_memory_reservation_t dedup_reservation;
     wl_columnar_source_access_writer_t writer;
     uint64_t reserved_bytes;
     uint64_t metadata_reserved_bytes;
+    uint64_t dedup_reserved_bytes;
     bool reservation_active;
     bool metadata_reservation_active;
+    bool dedup_reservation_active;
     bool writer_acquired;
 } col_rel_replacement_t;
 
@@ -841,8 +852,16 @@ col_rel_set_raw(col_rel_t *r, uint32_t row, uint32_t col, int64_t val)
 static inline const int64_t *
 col_rel_row(const col_rel_t *r, uint32_t row)
 {
+    static const int64_t empty_row = 0;
+    if (!r)
+        return NULL;
+    if (r->ncols == 0)
+        return &empty_row;
     col_rel_t *mr = (col_rel_t *)(uintptr_t)r; /* cast away const for scratch */
     if (!mr->row_scratch) {
+        /* Governed scratch is admitted and allocated before publication. */
+        if (mr->memory_governor)
+            return NULL;
         mr->row_scratch = (int64_t *)malloc(r->ncols * sizeof(int64_t));
         if (!mr->row_scratch)
             return NULL;
@@ -2488,6 +2507,11 @@ col_rel_retained_bytes_for(const col_rel_t *r, uint32_t capacity,
  * false for inconsistent timestamp pointer/capacity or size overflow. */
 bool
 col_rel_retained_live_bytes(const col_rel_t *r, uint64_t *out);
+/* Replace a persistent merge grid under the aggregate payload reservation.
+ * On admission/allocation failure the relation and old grid are unchanged. */
+int col_rel_reserve_merge_grid(col_rel_t *r, uint32_t capacity);
+/* Retire aggregate credit after a payload allocation has been freed. */
+void col_rel_retire_payload_credit(col_rel_t *r);
 /* Admit and grow @r to at least @new_cap rows as one transaction; with
  * @new_cap <= capacity it admits the buffers the relation already owns.
  * ENOMEM with *@denied set is a governor verdict, clear is an allocation
@@ -2732,6 +2756,7 @@ wl_columnar_relation_alloc_governed(col_rel_t **out, const char *name,
 int
 wl_columnar_relation_admit_existing_metadata(col_rel_t *dst,
     const col_rel_t *src);
+int wl_columnar_relation_admit_existing_payload(col_rel_t *r);
 bool
 wl_columnar_relation_compound_map_valid(const col_rel_t *r);
 col_rel_t *
@@ -3527,6 +3552,9 @@ bool
 wl_columnar_eval_dedup_set_contains(const col_rel_t *r, uint64_t h);
 int
 wl_columnar_eval_dedup_set_init_from_rel(col_rel_t *r);
+/* Validate a persistent hash table and clear it after physical free. */
+int wl_columnar_eval_dedup_set_bytes(const col_rel_t *r, uint64_t *bytes);
+void wl_columnar_eval_dedup_set_clear(col_rel_t *r);
 
 /* ======================================================================== */
 /* Evaluator (columnar/eval.c)                                              */
@@ -3608,6 +3636,10 @@ bool wl_columnar_eval_delta_rollback_active(const wl_col_session_t *sess);
 bool wl_columnar_eval_delta_defer_gc(wl_col_session_t *sess);
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_eval_delta_test_after_eval)(wl_col_session_t *sess);
+extern int (*wl_columnar_eval_delta_test_retraction_eval)(
+    const wl_plan_stratum_t *, wl_col_session_t *, uint32_t);
+int wl_columnar_eval_delta_test_retraction_step(const wl_plan_stratum_t *,
+    wl_col_session_t *, uint32_t);
 extern void (*wl_columnar_kfusion_test_before_cleanup)(
     wl_col_session_t *sess, eval_stack_t *stack, col_rel_t **results,
     uint32_t result_count);

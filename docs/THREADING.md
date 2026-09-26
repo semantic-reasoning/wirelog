@@ -582,7 +582,10 @@ Replacement admission temporarily accounts for the new footprint while the
 old reservation remains committed. The overlap CAS is the admission
 linearization point; token state stores publish rollback and commit results.
 Compaction validates the retained reservation before replacing storage, so
-the replacement transaction never releases an uncommitted token.
+the replacement transaction never releases an uncommitted token. Committed
+growth uses the same overlap state with a private transition kind: the old
+bytes and added bytes remain charged until commit or rollback, and a growth
+commit keeps their sum without crediting either image.
 
 | Anchor (file:function[#N]) | Field | Op | Order | Justification |
 |---|---|---|---|---|
@@ -590,24 +593,31 @@ the replacement transaction never releases an uncommitted token.
 | `memory_governor.c:reserve_replacement_overlap#2` | `usable_bytes` | `atomic_load_explicit` | relaxed | Read the immutable replacement admission limit |
 | `memory_governor.c:reserve_replacement_overlap#3` | `reserved_bytes` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Linearize overflow detection without wrapping the shared total |
 | `memory_governor.c:reserve_replacement_overlap#4` | `reserved_bytes` | `atomic_compare_exchange_weak_explicit` | relaxed/relaxed | Admit the replacement overlap without exceeding the usable limit |
-| `memory_governor.c:wl_columnar_memory_begin_replacement` | `reservation->state` | `atomic_store_explicit` | release | Restore the committed state after invalid replacement input |
-| `memory_governor.c:wl_columnar_memory_begin_replacement#2` | `reservation->state` | `atomic_store_explicit` | release | Restore the committed state after overlap denial |
-| `memory_governor.c:wl_columnar_memory_begin_replacement#3` | `reservation->state` | `atomic_store_explicit` | release | Publish the replacing state after overlap admission |
-| `memory_governor.c:wl_columnar_memory_commit_replacement` | `reservation->state` | `atomic_store_explicit` | release | Restore replacing state when commit accounting cannot complete |
-| `memory_governor.c:wl_columnar_memory_commit_replacement#2` | `reservation->state` | `atomic_store_explicit` | release | Publish the committed state after the retained bytes are reduced |
-| `memory_governor.c:wl_columnar_memory_rollback_replacement` | `reservation->state` | `atomic_store_explicit` | release | Restore replacing state when rollback accounting cannot complete |
-| `memory_governor.c:wl_columnar_memory_rollback_replacement#2` | `reservation->state` | `atomic_store_explicit` | release | Publish the committed state after returning the overlap credit |
+| `memory_governor.c:begin_overlap` | `reservation->state` | `atomic_store_explicit` | release | Restore committed state after invalid overlap input |
+| `memory_governor.c:begin_overlap#2` | `reservation->state` | `atomic_store_explicit` | release | Restore committed state after growth arithmetic overflow |
+| `memory_governor.c:begin_overlap#3` | `reservation->state` | `atomic_store_explicit` | release | Restore committed state after overlap admission denial |
+| `memory_governor.c:begin_overlap#4` | `reservation->state` | `atomic_store_explicit` | release | Publish the overlap kind and bytes before the replacing state |
+| `memory_governor.c:wl_columnar_memory_commit_replacement` | `reservation->state` | `atomic_store_explicit` | release | Restore replacing state when a growth token reaches replacement commit |
+| `memory_governor.c:wl_columnar_memory_commit_replacement#2` | `reservation->state` | `atomic_store_explicit` | release | Restore replacing state when replacement accounting cannot complete |
+| `memory_governor.c:wl_columnar_memory_commit_replacement#3` | `reservation->state` | `atomic_store_explicit` | release | Publish committed replacement bytes after returning old credit |
+| `memory_governor.c:wl_columnar_memory_commit_growth` | `reservation->state` | `atomic_store_explicit` | release | Restore replacing state on wrong kind or invalid growth sum |
+| `memory_governor.c:wl_columnar_memory_commit_growth#2` | `reservation->state` | `atomic_store_explicit` | release | Publish the committed sum after keeping both charged images |
+| `memory_governor.c:rollback_overlap` | `reservation->state` | `atomic_store_explicit` | release | Restore replacing state when the rollback kind does not match |
+| `memory_governor.c:rollback_overlap#2` | `reservation->state` | `atomic_store_explicit` | release | Restore replacing state when overlap credit cannot be returned |
+| `memory_governor.c:rollback_overlap#3` | `reservation->state` | `atomic_store_explicit` | release | Publish committed old bytes after returning overlap credit |
 | `relation.c:col_rel_compact_impl` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Validate the retained reservation before preparing a replacement footprint |
 | `relation.c:col_rel_compact_impl#2` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Recheck a previously admitted replacement token before retrying its publication after an earlier physical-growth failure |
 | `relation.c:col_rel_compact_many` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Validate each retained reservation before compacting a relation |
 | `relation.c:col_rel_compact_many#2` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Revalidate the reservation before the second compaction path |
 | `relation.c:col_rel_reservation_rollback` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Read the reservation state before deciding whether rollback still owns an admitted token |
+| `relation.c:col_rel_retire_payload_credit` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Check whether a growth transaction still owns both images before reducing the payload token after physical retirement |
+| `relation.c:col_rel_payload_txn_rollback` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Test-only rollback witness checks the growth state after private storage is freed and before its credit returns |
 | `relation.c:wl_columnar_relation_retirement_reservation_valid` | `retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Confirm the retained reservation is still owned by this relation before retirement |
 | `relation.c:wl_columnar_relation_retirement_reservation_valid#2` | `retained_reservation.state` | `atomic_load_explicit` | acquire | Read the token state before validating committed or replacing reservation ownership |
 | `relation.c:wl_columnar_relation_retirement_writer_valid` | `source_access.state` | `atomic_load_explicit` | acquire | Confirm the retirement writer still owns the source-access gate |
 | `relation.c:wl_columnar_relation_retirement_commit` | `storage_alias_borrows` | `atomic_store_explicit` | relaxed | Clear the alias count when a pooled relation descriptor is reset for reuse |
 
-### 5.17 `wirelog/columnar/eval_delta.c` — observer reservations (1 row)
+### 5.17 `wirelog/columnar/eval_delta.c` — observer and retraction reservations (3 rows)
 
 Observer cleanup releases only admitted tokens. The session owns these stable
 reservation objects exclusively; their state follows the governor protocol.
@@ -615,8 +625,21 @@ reservation objects exclusively; their state follows the governor protocol.
 | Anchor (file:function[#N]) | Field | Op | Order | Justification |
 |---|---|---|---|---|
 | `eval_delta.c:wl_columnar_eval_delta_observer_release_token` | `token->state` | `atomic_load_explicit` | acquire | Observe admission or commit state before releasing the observer reservation, then reinitialize the exclusively owned token |
+| `eval_delta.c:wl_retraction_stage_prepare` | `r->retained_reservation.state` | `atomic_load_explicit` | acquire | Validate the committed payload token under the relation writer before staging a second physical image |
+| `eval_delta.c:wl_retraction_stage_prepare#2` | `r->retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Confirm the token is still bound to the canonical relation before growing its charge |
 
-The complete source audit now contains **176 atomic call sites**.
+### 5.18 `wirelog/columnar/eval_dedup.c` — governed hash token (3 rows)
+
+The relation's writer owns the dedup table and its token. Validation reads
+the committed token after publication and before a growth transaction.
+
+| Anchor (file:function[#N]) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `eval_dedup.c:wl_columnar_eval_dedup_set_bytes` | `r->dedup_reservation.state` | `atomic_load_explicit` | acquire | Confirm an empty table has no active reservation before attach or reuse |
+| `eval_dedup.c:wl_dedup_token_valid` | `r->dedup_reservation.state` | `atomic_load_explicit` | acquire | Confirm a populated table is covered by a committed token before mutation or lookup |
+| `eval_dedup.c:wl_dedup_token_valid#2` | `r->dedup_reservation.owner_bits` | `atomic_load_explicit` | acquire | Confirm the committed token belongs to this relation before growth or transfer |
+
+The complete source audit now contains **188 atomic call sites**.
 
 ---
 

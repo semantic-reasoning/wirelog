@@ -3382,22 +3382,25 @@ tdd_sorted_merge_append(col_rel_t *dst, col_rel_t *src)
 
     /* Copy current dst rows into the persistent merge buffer */
     if (dst->merge_buf_cap < N) {
-        int64_t **mc = col_columns_alloc(ncols, N);
-        if (!mc)
-            return ENOMEM;
-        col_columns_free(dst->merge_columns, ncols);
-        dst->merge_columns = mc;
-        dst->merge_buf_cap = N;
+        int grid_rc = col_rel_reserve_merge_grid(dst, N);
+        if (grid_rc != 0)
+            return grid_rc;
     }
     for (uint32_t c = 0; c < ncols; c++)
         memcpy(dst->merge_columns[c], dst->columns[c], N * sizeof(int64_t));
 
     /* Grow dst columns to hold the merged result */
     if (dst->capacity < total) {
-        if (col_columns_realloc(dst->columns, ncols, total) != 0)
-            return ENOMEM;
-        dst->capacity = total;
-        wl_columnar_relation_touch_storage(dst);
+        if (dst->memory_governor) {
+            int grow_rc = col_rel_reserve_capacity_admitted(dst, total, NULL);
+            if (grow_rc != 0)
+                return grow_rc;
+        } else {
+            if (col_columns_realloc(dst->columns, ncols, total) != 0)
+                return ENOMEM;
+            dst->capacity = total;
+            wl_columnar_relation_touch_storage(dst);
+        }
     }
 
     /* Two-pointer merge: both sequences are sorted, no overlap */
@@ -4208,9 +4211,12 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
                             rc = ENOMEM;
                         } else {
                             /* Init hash-set dedup for O(1) consolidation. */
-                            WL_COLUMNAR_EVAL_DEDUP_SET_INIT_FROM_REL(parts[w]);
-                            worker_rels[w][rels_built] = parts[w];
-                            parts[w] = NULL;
+                            rc = WL_COLUMNAR_EVAL_DEDUP_SET_INIT_FROM_REL(
+                                parts[w]);
+                            if (rc == 0) {
+                                worker_rels[w][rels_built] = parts[w];
+                                parts[w] = NULL;
+                            }
                         }
                     }
                 }
@@ -4841,10 +4847,7 @@ tdd_clear_relation_dedup_set(col_rel_t *r)
 {
     if (!r)
         return;
-    free(r->dedup_slots);
-    r->dedup_slots = NULL;
-    r->dedup_cap = 0;
-    r->dedup_count = 0;
+    wl_columnar_eval_dedup_set_clear(r);
 }
 
 /* Snapshot a published relation without carrying over its session-owned
@@ -4865,6 +4868,12 @@ tdd_snapshot_relation(const col_rel_t *source, col_rel_t **out)
     rc = col_rel_deep_copy(source, &snapshot, NULL);
     if (rc != 0)
         return rc;
+    uint64_t dedup_bytes;
+    if (snapshot->memory_governor
+        || wl_columnar_eval_dedup_set_bytes(source, &dedup_bytes) != 0) {
+        col_rel_destroy(snapshot);
+        return EINVAL;
+    }
     if (snapshot->compound_kind != source->compound_kind
         || snapshot->compound_count != source->compound_count
         || snapshot->inline_physical_offset
@@ -4924,6 +4933,7 @@ tdd_empty_relation_candidate(const col_rel_t *source, col_rel_t **out)
     free(candidate->timestamps);
     candidate->timestamps = NULL;
     candidate->timestamp_capacity = 0;
+    col_rel_retire_payload_credit(candidate);
     candidate->ledger_ts_bytes = 0;
     tdd_clear_relation_dedup_set(candidate);
     return 0;

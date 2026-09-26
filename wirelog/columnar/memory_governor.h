@@ -117,6 +117,12 @@ typedef enum {
 } wl_columnar_memory_reservation_state_t;
 
 typedef enum {
+    WL_COLUMNAR_MEMORY_TRANSITION_NONE = 0,
+    WL_COLUMNAR_MEMORY_TRANSITION_REPLACEMENT = 1,
+    WL_COLUMNAR_MEMORY_TRANSITION_GROWTH = 2,
+} wl_columnar_memory_transition_kind_t;
+
+typedef enum {
     WL_COLUMNAR_MEMORY_ADMISSION_OK = 0,
     WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY = 1,
     WL_COLUMNAR_MEMORY_ADMISSION_INVALID = 2,
@@ -128,6 +134,8 @@ typedef struct {
     wl_columnar_memory_governor_t *governor;
     uint64_t bytes;
     uint64_t replacement_bytes;
+    /* Private overlap discriminator; read only after claiming REPLACING. */
+    uint8_t transition_kind;
     wl_atomic_u64 owner_bits;
     wl_atomic_u64 state;
     /* Tokens are caller-owned and intentionally non-copyable.  A copied
@@ -236,6 +244,20 @@ wl_columnar_memory_commit_replacement(
 
 bool
 wl_columnar_memory_rollback_replacement(
+    wl_columnar_memory_reservation_t *reservation);
+
+/* Temporarily charge additional bytes on a committed token while its old
+ * physical image remains live. Commit keeps O+N, rollback restores O. */
+wl_columnar_memory_admission_status_t
+wl_columnar_memory_begin_growth(
+    wl_columnar_memory_reservation_t *reservation, uint64_t additional_bytes);
+
+bool
+wl_columnar_memory_commit_growth(
+    wl_columnar_memory_reservation_t *reservation);
+
+bool
+wl_columnar_memory_rollback_growth(
     wl_columnar_memory_reservation_t *reservation);
 
 bool

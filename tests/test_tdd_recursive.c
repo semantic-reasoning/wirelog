@@ -2621,8 +2621,7 @@ test_owner_candidate_governed_rename(void)
     wl_columnar_memory_governor_t *governor = NULL;
     col_rel_t *target = owner_publication_candidate(old_name, 17);
     col_rel_t *candidate = NULL;
-    uint64_t payload = target
-        ? (uint64_t)target->capacity * sizeof(int64_t) : 0;
+    uint64_t payload = 0;
     int ok = target != NULL;
 
     resolution.budget_bytes = 1024 * 1024;
@@ -2635,8 +2634,10 @@ test_owner_candidate_governed_rename(void)
         ok = ref && col_rel_attach_memory_governor(target, ref) == 0;
     if (ok) {
         governor = wl_columnar_memory_governor_ref_get(ref);
+        payload = target->retained_reserved_bytes;
         uint64_t metadata = target->metadata_reserved_bytes;
-        uint64_t exact = old_descriptor * 2u + new_descriptor + payload
+        uint64_t exact = old_descriptor * 2u + new_descriptor
+            + 2u * payload
             + 2u * metadata;
         atomic_store_explicit(&governor->usable_bytes, exact - 1u,
             memory_order_release);
@@ -2644,14 +2645,14 @@ test_owner_candidate_governed_rename(void)
                 NULL, 0, true, &candidate) == ENOSPC && candidate == NULL
             && strcmp(target->name, old_name) == 0
             && wl_columnar_memory_reserved(governor)
-            == old_descriptor + metadata;
+            == old_descriptor + metadata + payload;
         atomic_store_explicit(&governor->usable_bytes, exact,
             memory_order_release);
         ok = ok && wl_columnar_eval_test_owner_build_candidate(target,
                 new_name, NULL, 0, true, &candidate) == 0 && candidate
             && strcmp(candidate->name, new_name) == 0
             && wl_columnar_memory_reserved(governor)
-            == old_descriptor + new_descriptor + payload
+            == old_descriptor + new_descriptor + 2u * payload
             + metadata + candidate->metadata_reserved_bytes;
     }
     col_rel_destroy(candidate);
@@ -5020,9 +5021,55 @@ cleanup:
 /* Main                                                                     */
 /* ======================================================================== */
 
+static int
+test_dedup_init_allocation_rollback(void)
+{
+#ifdef WL_TEST_ALLOC_WRAP
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    resolution.budget_bytes = 1024u * 1024u;
+    resolution.usable_bytes = resolution.budget_bytes;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    wl_columnar_memory_governor_ref_t *ref
+        = wl_columnar_memory_governor_ref_create(&resolution);
+    col_rel_t *rel = col_rel_new_auto("dedup-alloc", 1);
+    int ok = ref && rel && col_rel_attach_memory_governor(rel, ref) == 0;
+    if (ok) {
+        uint64_t before = wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref));
+        allocation_calls = 0;
+        allocation_fail_at = 0;
+        int rc = wl_columnar_eval_dedup_set_init_from_rel(rel);
+        allocation_fail_at = -1;
+        ok = rc == ENOMEM && !rel->dedup_slots
+            && rel->dedup_reserved_bytes == 0
+            && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == before
+            && wl_columnar_eval_dedup_set_init_from_rel(rel) == 0
+            && rel->dedup_reserved_bytes == 8192u;
+    }
+    allocation_fail_at = -1;
+    col_rel_destroy(rel);
+    if (ref) {
+        ok = ok && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0;
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    return ok ? 0 : -1;
+#else
+    return 0;
+#endif
+}
+
 int
 main(void)
 {
+    TEST("dedup init allocation failure rolls back its token");
+    if (test_dedup_init_allocation_rollback() == 0)
+        PASS();
+    else
+        FAIL("dedup init token rollback/retry");
     for (uint32_t workers = 2; workers <= 8; workers *= 4) {
         test_global_exchange_metadata(workers, false, false);
         test_global_exchange_metadata(workers, false, true);

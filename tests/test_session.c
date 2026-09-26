@@ -1114,12 +1114,14 @@ test_retained_relation_admission(void)
         + sizeof("retained");
     const uint64_t denied_descriptor_bytes = sizeof(col_rel_t)
         + sizeof("retained-denied");
+    const uint64_t table_and_scratch = sizeof(int64_t *) + sizeof(int64_t);
     const uint64_t initial_bytes = 64u * sizeof(int64_t)
-        + 64u * sizeof(col_delta_timestamp_t);
+        + 64u * sizeof(col_delta_timestamp_t) + table_and_scratch;
     const uint64_t grown_bytes = 128u * sizeof(int64_t)
-        + 128u * sizeof(col_delta_timestamp_t);
+        + 128u * sizeof(col_delta_timestamp_t) + table_and_scratch;
     const uint64_t metadata_bytes = test_auto_metadata_bytes(1);
-    const uint64_t exact_budget = initial_bytes + grown_bytes
+    const uint64_t exact_budget = initial_bytes
+        + grown_bytes - sizeof(int64_t)
         + descriptor_bytes + metadata_bytes;
     wl_columnar_memory_resolution_t resolution = { 0 };
     wl_columnar_memory_governor_ref_t *ref = NULL;
@@ -1182,12 +1184,12 @@ test_retained_relation_admission(void)
     if (rel->capacity != 0u
         || wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(ref))
-        != descriptor_bytes + metadata_bytes
+        != descriptor_bytes + metadata_bytes + sizeof(int64_t)
         || col_rel_append_row(rel, &row) != 0
         || rel->capacity != 64u
         || wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(ref))
-        != 64u * sizeof(int64_t) + descriptor_bytes
+        != 64u * sizeof(int64_t) + table_and_scratch + descriptor_bytes
         + metadata_bytes) {
         col_rel_destroy(rel);
         wl_columnar_memory_governor_ref_release(ref);
@@ -1205,7 +1207,8 @@ test_retained_relation_admission(void)
     PASS();
 
     TEST("retained relation denial preserves old rows and capacity");
-    resolution.usable_bytes = initial_bytes + grown_bytes
+    resolution.usable_bytes = initial_bytes
+        + grown_bytes - sizeof(int64_t)
         + denied_descriptor_bytes + metadata_bytes - 1u;
     resolution.budget_bytes = resolution.usable_bytes;
     ref = wl_columnar_memory_governor_ref_create(&resolution);
@@ -1249,7 +1252,7 @@ test_retained_relation_admission(void)
         + sizeof("batch-first") + sizeof("batch-second");
     const uint64_t batch_metadata_bytes = metadata_bytes
         + test_auto_metadata_bytes(2);
-    resolution.usable_bytes = 4096u + batch_descriptor_bytes
+    resolution.usable_bytes = 8192u + batch_descriptor_bytes
         + batch_metadata_bytes;
     resolution.budget_bytes = resolution.usable_bytes;
     ref = wl_columnar_memory_governor_ref_create(&resolution);
@@ -1276,9 +1279,15 @@ test_retained_relation_admission(void)
         if (rc == 0)
             rc = col_rel_append_row(second, second_row);
     }
+    uint64_t batch_live = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+    const uint64_t first_incoming = sizeof(int64_t *)
+        + 64u * sizeof(int64_t);
+    const uint64_t second_incoming = 2u * sizeof(int64_t *)
+        + 2u * 64u * sizeof(int64_t);
     atomic_store_explicit(
         &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
-        3584u + batch_descriptor_bytes + batch_metadata_bytes,
+        batch_live + first_incoming + second_incoming - 1u,
         memory_order_release);
     first->nrows = 1;
     second->nrows = 1;
@@ -1286,12 +1295,12 @@ test_retained_relation_admission(void)
     if (rc != 0 || first->capacity != 128u || second->capacity != 128u
         || wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(ref))
-        != 3072u + batch_descriptor_bytes + batch_metadata_bytes
+        != batch_live
         || batch_rc != 0
         || first->capacity != 128u || second->capacity != 128u
         || wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(ref))
-        != 3072u + batch_descriptor_bytes + batch_metadata_bytes) {
+        != batch_live) {
         col_rel_destroy(first);
         col_rel_destroy(second);
         wl_columnar_memory_governor_ref_release(ref);
@@ -1315,8 +1324,10 @@ test_bulk_relation_append_transaction(void)
 {
     const uint64_t descriptor_bytes = sizeof(col_rel_t)
         + sizeof("bulk-fresh");
-    const uint64_t one_column_capacity_64 = 64u * sizeof(int64_t);
-    const uint64_t one_column_capacity_128 = 128u * sizeof(int64_t);
+    const uint64_t one_column_capacity_64 = 64u * sizeof(int64_t)
+        + sizeof(int64_t *) + sizeof(int64_t);
+    const uint64_t one_column_capacity_128 = 128u * sizeof(int64_t)
+        + sizeof(int64_t *) + sizeof(int64_t);
     const uint64_t metadata_bytes = test_auto_metadata_bytes(1);
     wl_columnar_memory_resolution_t resolution = { 0 };
     wl_columnar_memory_governor_ref_t *ref = NULL;
@@ -1391,7 +1402,7 @@ test_bulk_relation_append_transaction(void)
         + sizeof("bulk-populated");
     const uint64_t populated_metadata_bytes = metadata_bytes
         + sizeof(wirelog_column_type_t);
-    resolution.budget_bytes = old_bytes + new_bytes
+    resolution.budget_bytes = old_bytes + new_bytes - sizeof(int64_t)
         + populated_descriptor_bytes + populated_metadata_bytes;
     resolution.usable_bytes = resolution.budget_bytes;
     ref = wl_columnar_memory_governor_ref_create(&resolution);
@@ -1435,7 +1446,7 @@ test_bulk_relation_append_transaction(void)
     }
     atomic_store_explicit(
         &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
-        old_bytes + new_bytes + populated_descriptor_bytes
+        old_bytes + new_bytes - sizeof(int64_t) + populated_descriptor_bytes
         + populated_metadata_bytes - 1u,
         memory_order_release);
     denied = false;
@@ -1458,7 +1469,7 @@ test_bulk_relation_append_transaction(void)
     }
     atomic_store_explicit(
         &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
-        old_bytes + new_bytes + populated_descriptor_bytes
+        old_bytes + new_bytes - sizeof(int64_t) + populated_descriptor_bytes
         + populated_metadata_bytes,
         memory_order_release);
     denied = true;
@@ -1493,10 +1504,13 @@ test_governed_compaction_transaction(void)
     const uint64_t descriptor_bytes = sizeof(col_rel_t)
         + sizeof("compaction-transaction");
     const uint64_t old_bytes = 128u * sizeof(int64_t)
-        + 128u * sizeof(col_delta_timestamp_t);
+        + 128u * sizeof(col_delta_timestamp_t)
+        + sizeof(int64_t *) + sizeof(int64_t);
     const uint64_t new_bytes = 64u * sizeof(int64_t)
-        + 64u * sizeof(col_delta_timestamp_t);
-    const uint64_t overlap_bytes = old_bytes + new_bytes;
+        + 64u * sizeof(col_delta_timestamp_t)
+        + sizeof(int64_t *) + sizeof(int64_t);
+    const uint64_t overlap_bytes = old_bytes + new_bytes
+        - sizeof(int64_t);
     const uint64_t metadata_bytes = test_auto_metadata_bytes(1);
     wl_columnar_memory_resolution_t resolution = { 0 };
     wl_columnar_memory_governor_ref_t *ref = NULL;
@@ -1506,7 +1520,6 @@ test_governed_compaction_transaction(void)
     col_rel_t *rel = NULL;
     int64_t row = 7;
     int64_t **old_columns = NULL;
-    int64_t **failed_columns = NULL;
     const char *failure = NULL;
     int rc;
 
@@ -1562,7 +1575,8 @@ test_governed_compaction_transaction(void)
         memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
         && wl_columnar_memory_reserved(governor)
         == old_bytes + descriptor_bytes + metadata_bytes
-        && snapshot.current_bytes == old_bytes,
+        && snapshot.current_bytes == old_bytes
+        - sizeof(int64_t *) - sizeof(int64_t),
         "governed compaction denied overlap changed state");
 
     atomic_store_explicit(&governor->usable_bytes,
@@ -1578,6 +1592,7 @@ test_governed_compaction_transaction(void)
         && wl_columnar_memory_reserved(governor)
         == new_bytes + descriptor_bytes + metadata_bytes
         && snapshot.current_bytes == new_bytes
+        - sizeof(int64_t *) - sizeof(int64_t)
         && snapshot.subsys_bytes[WL_MEM_SUBSYS_RELATION]
         == 64u * sizeof(int64_t)
         && snapshot.subsys_bytes[WL_MEM_SUBSYS_TIMESTAMP]
@@ -1597,42 +1612,16 @@ test_governed_compaction_transaction(void)
     atomic_store_explicit(&governor->usable_bytes,
         overlap_bytes + descriptor_bytes + metadata_bytes,
         memory_order_release);
-    COMPACTION_CHECK(
-        wl_columnar_memory_begin_replacement(&rel->retained_reservation,
-        new_bytes) == WL_COLUMNAR_MEMORY_ADMISSION_OK
-        && wl_columnar_memory_reserved(governor)
-        == overlap_bytes + descriptor_bytes + metadata_bytes,
-        "governed compaction failure admission");
-
-    /* The direct counter change simulates a governor accounting failure
-     * after overlap admission.  No production hook is needed: the token
-     * state and relation storage are the contract under test. */
-    atomic_store_explicit(&governor->reserved_bytes, 0u,
-        memory_order_release);
     rc = col_rel_compact(rel);
     wl_mem_ledger_snapshot(&ledger, &snapshot);
-    failed_columns = rel->columns;
-    COMPACTION_CHECK(rc == EAGAIN && failed_columns != old_columns
-        && rel->capacity == 64u
-        && rel->retained_reserved_bytes == old_bytes
-        && atomic_load_explicit(&rel->retained_reservation.state,
-        memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING
-        && rel->retained_reservation.replacement_bytes == new_bytes
-        && snapshot.current_bytes == new_bytes,
-        "governed compaction failure did not preserve retry state");
-
-    atomic_store_explicit(&governor->reserved_bytes,
-        overlap_bytes + descriptor_bytes + metadata_bytes,
-        memory_order_release);
-    rc = col_rel_compact(rel);
-    wl_mem_ledger_snapshot(&ledger, &snapshot);
-    COMPACTION_CHECK(rc == 0 && rel->columns == failed_columns
+    COMPACTION_CHECK(rc == 0 && rel->columns != old_columns
         && rel->retained_reserved_bytes == new_bytes
         && atomic_load_explicit(&rel->retained_reservation.state,
         memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
         && wl_columnar_memory_reserved(governor)
         == new_bytes + descriptor_bytes + metadata_bytes
-        && snapshot.current_bytes == new_bytes,
+        && snapshot.current_bytes == new_bytes
+        - sizeof(int64_t *) - sizeof(int64_t),
         "governed compaction retry did not settle token");
 
     col_rel_destroy(rel);
@@ -12491,6 +12480,130 @@ cleanup:
 }
 
 static void
+test_ungoverned_pool_payload_promotion(void)
+{
+    TEST("ungoverned pool payload promotion admits exact image and rolls back");
+    const char *failure = NULL;
+    const char *name = "pool-payload";
+    wl_columnar_memory_governor_ref_t *ref = enforcing_governor(1u << 20);
+    delta_pool_t *pool = delta_pool_create(2, sizeof(col_rel_t), 4096);
+    wl_col_session_t sess = { 0 };
+    col_rel_t *source = pool ? col_rel_pool_new_auto(pool, NULL, name,
+            1) : NULL;
+    col_rel_t *candidate = NULL;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    bool reader_held = false, published = false;
+#define POOL_PAYLOAD_CHECK(c, m) do { if (!(c)) { failure = m; goto cleanup; } \
+} while (0)
+    POOL_PAYLOAD_CHECK(ref && source && source->pool_owned, "setup");
+    sess.memory_governor = ref;
+    sess.rel_cap = 1;
+    sess.rels = calloc(1, sizeof(*sess.rels));
+    POOL_PAYLOAD_CHECK(sess.rels, "registry allocation");
+    wl_columnar_memory_reservation_init(&sess.rels_reservation);
+    POOL_PAYLOAD_CHECK(wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(ref), sizeof(*sess.rels),
+            &sess.rels_reservation) == WL_COLUMNAR_MEMORY_ADMISSION_OK
+        && wl_columnar_memory_commit(&sess.rels_reservation, &sess),
+        "registry admission");
+    for (int64_t i = 0; i < 513; i++)
+        POOL_PAYLOAD_CHECK(col_rel_append_row(source, &i) == 0,
+            "populate pool payload");
+    POOL_PAYLOAD_CHECK(source->capacity == 1024 && !source->row_scratch,
+        "physical source shape");
+    source->nrows = 1;
+    source->dedup_slots = calloc(4u, sizeof(uint64_t));
+    POOL_PAYLOAD_CHECK(source->dedup_slots, "pool dedup setup");
+    source->dedup_slots[1] = 1u;
+    source->dedup_cap = 4;
+    source->dedup_count = 1;
+    uint64_t *source_dedup = source->dedup_slots;
+    uint64_t physical = 0;
+    POOL_PAYLOAD_CHECK(col_rel_retained_live_bytes(source, &physical),
+        "source payload shape");
+    uint64_t expected_payload = physical + sizeof(int64_t);
+    uint64_t baseline = reserved_on(ref);
+    uint64_t exact = baseline + sizeof(col_rel_t) + strlen(name) + 1u
+        + test_auto_metadata_bytes(1) + expected_payload
+        + 4u * sizeof(uint64_t);
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(ref);
+    int64_t **columns = source->columns;
+    atomic_store_explicit(&governor->usable_bytes, exact - 1u,
+        memory_order_release);
+    POOL_PAYLOAD_CHECK(session_add_rel(&sess, source) == ENOSPC
+        && source->columns == columns && source->row_scratch == NULL
+        && source->memory_governor == NULL
+        && source->retained_reserved_bytes == 0
+        && source->dedup_slots == source_dedup
+        && source->dedup_reserved_bytes == 0
+        && !source->memory_budget_denial_pending
+        && reserved_on(ref) == baseline,
+        "one-byte payload denial restores pool source");
+    atomic_store_explicit(&governor->usable_bytes, exact,
+        memory_order_release);
+    POOL_PAYLOAD_CHECK(session_add_rel(&sess, source) == 0,
+        "exact payload retry");
+    published = true;
+    col_rel_t *heap = session_find_rel(&sess, name);
+    POOL_PAYLOAD_CHECK(heap && heap != source && heap->columns == columns
+        && heap->row_scratch && heap->retained_reserved_bytes
+        == expected_payload && heap->retained_reservation.bytes
+        == expected_payload && reserved_on(ref) == exact,
+        "published heap owns exact payload");
+    POOL_PAYLOAD_CHECK(heap->dedup_slots == source_dedup
+        && heap->dedup_reserved_bytes == 4u * sizeof(uint64_t),
+        "promoted heap owns transferred dedup token");
+    atomic_store_explicit(&governor->usable_bytes, 1u << 20,
+        memory_order_release);
+    POOL_PAYLOAD_CHECK(col_rel_compact(heap) == 0 && heap->capacity < 1024
+        && heap->retained_reserved_bytes < expected_payload,
+        "promoted heap compacts with admitted payload");
+    candidate = col_rel_pool_new_auto(pool, NULL, name, 1);
+    POOL_PAYLOAD_CHECK(candidate && candidate->pool_owned,
+        "duplicate pool candidate");
+    int64_t value = 7;
+    POOL_PAYLOAD_CHECK(col_rel_append_row(candidate, &value) == 0,
+        "duplicate payload");
+    int64_t **candidate_columns = candidate->columns;
+    candidate->dedup_slots = calloc(4u, sizeof(uint64_t));
+    POOL_PAYLOAD_CHECK(candidate->dedup_slots, "duplicate dedup setup");
+    candidate->dedup_slots[1] = 1u;
+    candidate->dedup_cap = 4;
+    candidate->dedup_count = 1;
+    uint64_t *candidate_dedup = candidate->dedup_slots;
+    uint64_t before = reserved_on(ref);
+    POOL_PAYLOAD_CHECK(col_rel_source_reader_acquire(heap, &reader) == 0,
+        "hold incumbent reader");
+    reader_held = true;
+    POOL_PAYLOAD_CHECK(session_add_rel(&sess, candidate) == EBUSY
+        && candidate->columns == candidate_columns
+        && candidate->memory_governor == NULL
+        && candidate->retained_reserved_bytes == 0
+        && candidate->dedup_slots == candidate_dedup
+        && candidate->dedup_reserved_bytes == 0
+        && candidate->row_scratch == NULL
+        && reserved_on(ref) == before,
+        "duplicate refusal restores ungoverned pool payload");
+cleanup:
+    if (reader_held) (void)col_rel_source_reader_release(&reader);
+    if (!published) col_rel_destroy(source);
+    col_rel_destroy(candidate);
+    for (uint32_t i = 0; i < sess.nrels; i++) col_rel_destroy(sess.rels[i]);
+    session_rel_free_hash(&sess);
+    free(sess.rels);
+    if (sess.rels_reservation.bytes)
+        (void)wl_columnar_memory_release(&sess.rels_reservation);
+    delta_pool_destroy(pool);
+    if (ref) {
+        if (!failure && reserved_on(ref) != 0) failure = "payload leak";
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (failure) FAIL(failure); else PASS();
+#undef POOL_PAYLOAD_CHECK
+}
+
+static void
 test_filter_governed_admission(unsigned route, bool timestamped,
     unsigned phase, bool session_governor)
 {
@@ -12640,7 +12753,8 @@ observe_serial_borrowed_clone(wl_col_session_t *sess, eval_stack_t *stack,
             atomic_store_explicit(&g->usable_bytes,
                 reserved_on(sess->memory_governor)
                 + strlen("output") + 1u + test_auto_metadata_bytes(1)
-                + (uint64_t)COL_REL_INIT_CAP * sizeof(int64_t),
+                + (uint64_t)COL_REL_INIT_CAP * sizeof(int64_t)
+                + sizeof(int64_t *) + sizeof(int64_t),
                 memory_order_release);
         }
     }
@@ -12827,9 +12941,333 @@ test_operator_null_session_guards(void)
     PASS();
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+static int retraction_eval_mode;
+
+static int
+test_retraction_eval(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
+    uint32_t stratum_idx)
+{
+    (void)stratum_idx;
+    if (retraction_eval_mode == 5) {
+        col_rel_t *first = session_find_rel(sess, sp->relations[0].name);
+        col_rel_t *wide = session_find_rel(sess, sp->relations[1].name);
+        int64_t first_row = 2;
+        int64_t wide_row[COL_STACK_MAX + 1u] = { 7 };
+        return first && wide && first->base_nrows == 0
+               && wide->base_nrows == 0
+               && col_rel_append_row(first, &first_row) == 0
+               && col_rel_append_row(wide, wide_row) == 0
+            ? 0 : ENOMEM;
+    }
+    if (retraction_eval_mode == 4) {
+        col_rel_t *untimestamped = session_find_rel(sess,
+                sp->relations[1].name);
+        int64_t candidate = 7;
+        return untimestamped
+               && col_rel_append_row(untimestamped, &candidate) == 0
+               && col_rel_append_row(untimestamped, &candidate) == 0
+            ? 0 : ENOMEM;
+    }
+    col_rel_t *r = session_find_rel(sess, sp->relations[0].name);
+    int64_t candidate = 2;
+    if (r && r->base_nrows != 0)
+        return EINVAL;
+    if (retraction_eval_mode == 2)
+        return 0;
+    if (!r || col_rel_append_row(r, &candidate) != 0)
+        return ENOMEM;
+    if (r->timestamps)
+        r->timestamps[r->nrows - 1u].iteration = 99;
+    if (retraction_eval_mode == 3) {
+        candidate = 1;
+        if (col_rel_append_row(r, &candidate) != 0)
+            return ENOMEM;
+        if (r->timestamps)
+            r->timestamps[r->nrows - 1u].iteration = 88;
+    }
+    if (retraction_eval_mode == 1) {
+        if (col_rel_reserve_merge_grid(r, COL_REL_INIT_CAP) != 0)
+            return ENOMEM;
+        return ENOMEM;
+    }
+    return 0;
+}
+
+static void
+test_governed_retraction_transaction(void)
+{
+    wl_plan_relation_t relations[] = {
+        { .name = "retract-first" }, { .name = "retract-second" }
+    };
+    wl_plan_stratum_t stratum = {
+        .relations = relations, .relation_count = 2
+    };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess = NULL;
+    col_rel_t *first = NULL, *second = NULL;
+    wl_columnar_memory_governor_t *governor = NULL;
+    wl_columnar_source_access_reader_t held = { 0 };
+    bool first_registered = false, second_registered = false;
+    const char *failure = NULL;
+    uint64_t baseline = 0;
+    const uint64_t grid = sizeof(int64_t *)
+        + (uint64_t)COL_REL_INIT_CAP * sizeof(int64_t);
+    const uint64_t timestamp = (uint64_t)COL_REL_INIT_CAP
+        * sizeof(col_delta_timestamp_t);
+    const uint64_t incoming = 2u * grid + timestamp;
+    int64_t row;
+#define RETRACT_CHECK(c, m) do { if (!(c)) { failure = (m); goto cleanup; \
+                                 } } while (0)
+    TEST("governed retraction stages both images and restores timestamps");
+    RETRACT_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "session create");
+    sess = COL_SESSION(session);
+    governor = wl_columnar_memory_governor_ref_get(sess->memory_governor);
+    first = col_rel_new_auto(relations[0].name, 1);
+    second = col_rel_new_auto(relations[1].name, 1);
+    RETRACT_CHECK(first && second, "relation create");
+    for (int64_t value = 1; value <= 3; value++)
+        RETRACT_CHECK(col_rel_append_row(first, &value) == 0,
+            "first rows");
+    row = 7;
+    RETRACT_CHECK(col_rel_append_row(second, &row) == 0
+        && col_rel_enable_timestamps(first) == 0,
+        "second row and timestamps");
+    first->timestamps[0].iteration = 11;
+    first->timestamps[1].iteration = 22;
+    first->timestamps[2].iteration = 33;
+    first->base_nrows = 2;
+    second->base_nrows = 1;
+    RETRACT_CHECK(col_rel_attach_memory_governor(first,
+        sess->memory_governor) == 0
+        && col_rel_attach_memory_governor(second,
+        sess->memory_governor) == 0,
+        "governed attach");
+    RETRACT_CHECK(session_add_rel(sess, first) == 0,
+        "first relation registration");
+    first_registered = true;
+    RETRACT_CHECK(session_add_rel(sess, second) == 0,
+        "second relation registration");
+    second_registered = true;
+    baseline = wl_columnar_memory_reserved(governor);
+    int64_t **first_columns = first->columns;
+    int64_t **second_columns = second->columns;
+    col_delta_timestamp_t *first_timestamps = first->timestamps;
+    uint64_t first_generation = first->view_generation;
+    uint64_t second_generation = second->view_generation;
+    wl_columnar_eval_delta_test_retraction_eval = test_retraction_eval;
+    atomic_store_explicit(&governor->usable_bytes,
+        baseline + incoming - 1u, memory_order_release);
+    RETRACT_CHECK(wl_columnar_eval_delta_test_retraction_step(&stratum,
+        sess, 0) == ENOSPC
+        && wl_columnar_memory_reserved(governor) == baseline
+        && first->columns == first_columns
+        && second->columns == second_columns
+        && first->timestamps == first_timestamps
+        && first->view_generation == first_generation
+        && second->view_generation == second_generation
+        && !first->retract_backup_columns
+        && !second->retract_backup_columns,
+        "one-byte prepare denial preserves both relations");
+    atomic_store_explicit(&governor->usable_bytes, baseline + incoming,
+        memory_order_release);
+    RETRACT_CHECK(col_rel_source_reader_acquire(second, &held) == 0,
+        "hold second reader");
+    RETRACT_CHECK(wl_columnar_eval_delta_test_retraction_step(&stratum,
+        sess, 0) == EBUSY
+        && wl_columnar_memory_reserved(governor) == baseline
+        && first->columns == first_columns,
+        "busy second preflight rolls back first stage");
+    RETRACT_CHECK(col_rel_source_reader_release(&held) == 0,
+        "release second reader");
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_malloc_size = (size_t)COL_REL_INIT_CAP * sizeof(int64_t);
+    fail_malloc_matches_to_skip = 1;
+    atomic_store_explicit(&governor->usable_bytes, baseline + incoming,
+        memory_order_release);
+    RETRACT_CHECK(wl_columnar_eval_delta_test_retraction_step(&stratum,
+        sess, 0) == ENOMEM
+        && wl_columnar_memory_reserved(governor) == baseline
+        && first->columns == first_columns
+        && second->columns == second_columns
+        && first->timestamps == first_timestamps
+        && first->view_generation == first_generation
+        && second->view_generation == second_generation,
+        "second staged allocation failure rolls back both tokens");
+    fail_malloc_size = 0;
+    fail_malloc_matches_to_skip = 0;
+#endif
+    retraction_eval_mode = 2;
+    int exact_rc = wl_columnar_eval_delta_test_retraction_step(&stratum,
+            sess, 0);
+    RETRACT_CHECK(exact_rc == 0
+        && first->nrows == 3 && first->columns[0][0] == 1
+        && first->columns[0][1] == 2
+        && first->timestamps == first_timestamps
+        && first->timestamps[0].iteration == 11
+        && first->timestamps[1].iteration == 22
+        && first->base_nrows == 2
+        && second->base_nrows == 1
+        && !first->retract_backup_columns
+        && !first->retract_backup_timestamps
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "exact prepare and empty evaluation restore");
+    atomic_store_explicit(&governor->usable_bytes, 1024u * 1024u * 1024u,
+        memory_order_release);
+    retraction_eval_mode = 0;
+    RETRACT_CHECK(wl_columnar_eval_delta_test_retraction_step(&stratum,
+        sess, 0) == 0
+        && first->nrows == 2 && first->columns[0][0] == 1
+        && first->columns[0][1] == 3
+        && first->timestamps == first_timestamps
+        && first->timestamps[0].iteration == 11
+        && first->timestamps[1].iteration == 33
+        && first->base_nrows == 1
+        && second->base_nrows == 1
+        && !first->retract_backup_columns
+        && !first->retract_backup_timestamps
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "timestamp-aligned removal releases staged image");
+    retraction_eval_mode = 1;
+    RETRACT_CHECK(wl_columnar_eval_delta_test_retraction_step(&stratum,
+        sess, 0) == ENOMEM
+        && first->nrows == 2 && first->columns[0][1] == 3
+        && first->timestamps == first_timestamps
+        && !first->merge_columns && !first->retract_backup_columns
+        && !first->retract_backup_timestamps
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "evaluation failure frees active and merge payload before credit");
+    retraction_eval_mode = 3;
+    RETRACT_CHECK(wl_columnar_eval_delta_test_retraction_step(&stratum,
+        sess, 0) == 0
+        && first->nrows == 1 && first->columns[0][0] == 3
+        && first->timestamps[0].iteration == 33
+        && first->base_nrows == 0
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "timestamped candidate sort and repeated removal keep alignment");
+    retraction_eval_mode = 4;
+    RETRACT_CHECK(wl_columnar_eval_delta_test_retraction_step(&stratum,
+        sess, 0) == 0 && second->nrows == 0
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "untimestamped candidates consolidate before removal");
+cleanup:
+    wl_columnar_eval_delta_test_retraction_eval = NULL;
+    retraction_eval_mode = 0;
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_malloc_size = 0;
+    fail_malloc_matches_to_skip = 0;
+#endif
+    if (held.owner)
+        (void)col_rel_source_reader_release(&held);
+    if (session) {
+        if (!first_registered)
+            col_rel_destroy(first);
+        if (!second_registered)
+            col_rel_destroy(second);
+        wl_session_destroy(session);
+    } else {
+        col_rel_destroy(first);
+        col_rel_destroy(second);
+    }
+    if (failure) FAIL(failure);
+    else PASS();
+#undef RETRACT_CHECK
+}
+
+static void
+test_retraction_row_buffer_failure_before_removal(void)
+{
+    wl_plan_relation_t relations[] = {
+        { .name = "retract-narrow" }, { .name = "retract-wide" }
+    };
+    wl_plan_stratum_t stratum = {
+        .relations = relations, .relation_count = 2
+    };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1 };
+    wl_session_t *session = NULL;
+    col_rel_t *narrow = NULL, *wide = NULL;
+    bool narrow_registered = false, wide_registered = false;
+    const char *failure = NULL;
+    int64_t wide_row[COL_STACK_MAX + 1u] = { 7 };
+    int64_t row = 1;
+#define ROW_FAIL_CHECK(c, m) do { if (!(c)) { failure = (m); goto cleanup; \
+                                  } } while (0)
+    TEST("retraction row buffer failure precedes every removal");
+    ROW_FAIL_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "session create");
+    wl_col_session_t *sess = COL_SESSION(session);
+    narrow = col_rel_new_auto(relations[0].name, 1);
+    wide = col_rel_new_auto(relations[1].name, COL_STACK_MAX + 1u);
+    ROW_FAIL_CHECK(narrow && wide, "relation create");
+    ROW_FAIL_CHECK(col_rel_append_row(narrow, &row) == 0,
+        "narrow first row");
+    row = 2;
+    ROW_FAIL_CHECK(col_rel_append_row(narrow, &row) == 0
+        && col_rel_append_row(wide, wide_row) == 0,
+        "rows before retraction");
+    narrow->base_nrows = 2;
+    wide->base_nrows = 1;
+    ROW_FAIL_CHECK(col_rel_attach_memory_governor(narrow,
+        sess->memory_governor) == 0
+        && col_rel_attach_memory_governor(wide,
+        sess->memory_governor) == 0,
+        "governor attach");
+    ROW_FAIL_CHECK(session_add_rel(sess, narrow) == 0,
+        "narrow registration");
+    narrow_registered = true;
+    ROW_FAIL_CHECK(session_add_rel(sess, wide) == 0,
+        "wide registration");
+    wide_registered = true;
+    uint64_t baseline = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(sess->memory_governor));
+    wl_columnar_eval_delta_test_retraction_eval = test_retraction_eval;
+    retraction_eval_mode = 5;
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_malloc_size = sizeof(wide_row);
+    fail_malloc_matches_to_skip = 1;
+    ROW_FAIL_CHECK(wl_columnar_eval_delta_test_retraction_step(&stratum,
+        sess, 0) == ENOMEM && fail_malloc_size == 0
+        && narrow->nrows == 2 && narrow->columns[0][0] == 1
+        && narrow->columns[0][1] == 2 && narrow->base_nrows == 2
+        && wide->nrows == 1 && wide->columns[0][0] == 7
+        && wide->base_nrows == 1
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(sess->memory_governor))
+        == baseline,
+        "row buffer ENOMEM leaves both relations unchanged");
+    fail_malloc_size = 0;
+    fail_malloc_matches_to_skip = 0;
+#endif
+cleanup:
+    wl_columnar_eval_delta_test_retraction_eval = NULL;
+    retraction_eval_mode = 0;
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_malloc_size = 0;
+    fail_malloc_matches_to_skip = 0;
+#endif
+    if (session) {
+        if (!narrow_registered) col_rel_destroy(narrow);
+        if (!wide_registered) col_rel_destroy(wide);
+        wl_session_destroy(session);
+    } else {
+        col_rel_destroy(narrow);
+        col_rel_destroy(wide);
+    }
+    if (failure) FAIL(failure);
+    else PASS();
+#undef ROW_FAIL_CHECK
+}
+#endif
+
 int
 main(void)
 {
+#ifdef WL_SESSION_TEST_HOOKS
+    test_governed_retraction_transaction();
+    test_retraction_row_buffer_failure_before_removal();
+#endif
     test_operator_null_session_guards();
     for (unsigned route = 0; route < 3; route++)
         for (unsigned fallback = 0; fallback < 2; fallback++)
@@ -12847,6 +13285,7 @@ main(void)
     test_governed_worker_filter_publication(2);
     test_governed_worker_filter_publication(8);
     test_governed_pool_publication(0);
+    test_ungoverned_pool_payload_promotion();
     test_governed_pool_publication(1);
     test_governed_pool_publication(4);
 #ifdef WL_TEST_ALLOC_WRAP

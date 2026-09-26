@@ -1014,7 +1014,7 @@ test_governed_compaction_retry_policy(void)
     }
 
     /* Restore an oversized shape by growing and retracting again, then force
-     * both post-publication accounting decisions to refuse once. */
+     * the growth commit and rollback to refuse before publication. */
     for (int64_t i = 1; i < 65; i++)
         if (col_rel_append_row(rel, &i) != 0) {
             FAIL("post-publication fixture regrowth failed");
@@ -1023,12 +1023,12 @@ test_governed_compaction_retry_policy(void)
     rel->nrows = 1;
     wl_columnar_relation_test_fail_next_compact_commit();
     wl_columnar_relation_test_fail_next_compact_rollback();
-    if (col_rel_compact(rel) != EAGAIN || rel->capacity >= 128
+    if (col_rel_compact(rel) != EAGAIN || rel->capacity != 128
         || atomic_load_explicit(&rel->retained_reservation.state,
         memory_order_acquire)
         != WL_COLUMNAR_MEMORY_RESERVATION_REPLACING
         || rel->columns[0][0] != 0) {
-        FAIL("post-publication refusal did not retain valid replacement");
+        FAIL("growth commit refusal changed the original image");
         goto done;
     }
     if (col_rel_compact(rel) != 0
@@ -1036,7 +1036,7 @@ test_governed_compaction_retry_policy(void)
         memory_order_acquire)
         != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
         || rel->columns[0][0] != 0) {
-        FAIL("post-publication token retry failed");
+        FAIL("growth token retry failed");
         goto done;
     }
     PASS();
