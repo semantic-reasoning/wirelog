@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -202,5 +203,112 @@ for case, message in [("wrong-workflow","designated main workflow"),
                       ("unrelated","not an ancestor")]:
     check(f"{case} artifact/source/provenance mismatch rejected",
           lambda c=case: exercise(fixture_provenance(),c),message)
+
+# Real Git histories exercise the pinned-source reference after rebase.
+with tempfile.TemporaryDirectory(prefix="reviewed-rebase-") as history:
+    previous = os.getcwd()
+    try:
+        os.chdir(history)
+        def git(*args):
+            return subprocess.check_output(["git", *args], text=True,
+                                           encoding="utf-8", stderr=subprocess.DEVNULL).strip()
+        git("init", "-q")
+        git("config", "user.name", "Baseline fixture")
+        git("config", "user.email", "baseline@example.invalid")
+        Path("reviewed.c").write_text("base\n", encoding="utf-8")
+        git("add", "."); git("commit", "-qm", "base")
+        pinned_base = git("rev-parse", "HEAD")
+        Path("reviewed.c").write_text("reviewed\n", encoding="utf-8")
+        git("commit", "-qam", "reviewed source")
+        source = git("rev-parse", "HEAD")
+        git("checkout", "-q", "--detach", pinned_base)
+        Path("main.c").write_text("advanced main\n", encoding="utf-8")
+        git("add", "."); git("commit", "-qm", "advance main")
+        current_base = git("rev-parse", "HEAD")
+        git("cherry-pick", source)
+        rebased_source = git("rev-parse", "HEAD")
+        reference = mod.reviewed_pr_reference_tree(current_base, pinned_base, source)
+        check("clean rebase preserves immutable reviewed reference",
+              lambda: (_ for _ in ()).throw(AssertionError("tree mismatch"))
+              if reference != git("rev-parse", "HEAD^{tree}") else None)
+        record = dict(mod.REVIEWED_PR_BASELINE, source_sha=source,
+                      base_sha=pinned_base, tested_merge_sha="0" * 40)
+        Path("scripts/ci").mkdir(parents=True)
+        Path("scripts/ci/verify-size-baseline.py").write_text("repair\n", encoding="utf-8")
+        git("add", "."); git("commit", "-qm", "authorized repair")
+        repair = git("rev-parse", "HEAD")
+        tree = git("rev-parse", "HEAD^{tree}")
+        event_merge = git("commit-tree", tree, "-p", current_base, "-p", repair,
+                          "-m", "event merge")
+        historical_report = {
+            "allowed_head_bytes": 392511,
+            "base_sha": pinned_base, "head_sha": record["tested_merge_sha"],
+            "base_bytes": 389203, "head_bytes": 395540, "baseline_bytes": 387391,
+            "budget_bytes": 5120, "status": "over-budget",
+            "base_profile": record["profile_sha256"], "head_profile": record["profile_sha256"],
+        }
+        historical_log = (f"  BASE_SHA: {pinned_base}\n"
+            f"  TESTED_SHA: {record['tested_merge_sha']}\n"
+            f"  PR_HEAD_SHA: {source}\n"
+            + json.dumps(historical_report, indent=2) + "\n").encode("utf-8")
+        record["job_log_sha256"] = hashlib.sha256(historical_log).hexdigest()
+        def reviewed_request(url, token, binary=False, authenticated=True):
+            if binary:
+                return historical_log
+            if "/git/commits/" in url:
+                return {"tree": {"sha": git("rev-parse", f"{source}^{{tree}}")},
+                        "parents": [{"sha": pinned_base}, {"sha": source}]}
+            if "/pulls/" in url:
+                return {"state": "open", "number": record["pr_number"],
+                        "base": {"ref": "main", "sha": current_base,
+                                 "repo": {"full_name": record["repository"]}},
+                        "head": {"sha": repair, "repo": {"full_name": record["repository"]}}}
+            if "/actions/runs/" in url:
+                return {"path": ".github/workflows/ci-pr.yml", "event": "pull_request",
+                        "head_sha": source, "pull_requests": [{"number": record["pr_number"],
+                            "base": {"sha": pinned_base}, "head": {"sha": repair}}]}
+            return {"run_id": record["run_id"], "head_sha": source,
+                    "name": "Build / ubuntu-latest / gcc", "conclusion": "failure",
+                    "steps": [{"name": name, "conclusion": result} for name, result in
+                              (("Configure", "success"),
+                               ("Build production library for early size gate", "success"),
+                               ("Check binary size", "failure"))]}
+        with mock.patch.object(mod, "REVIEWED_PR_BASELINE", record), \
+             mock.patch.object(mod, "request", side_effect=reviewed_request), \
+             mock.patch.object(mod.tempfile, "TemporaryDirectory",
+                               side_effect=ValueError("canonical rebuild reached")):
+            check("advanced event base retains historical measurement pins",
+                  lambda: mod.authorize_reviewed_pr(record["repository"], current_base,
+                      event_merge, record["baseline_bytes"], record, "token"),
+                  "canonical rebuild reached")
+        with mock.patch.object(mod, "REVIEWED_PR_BASELINE", record), \
+             mock.patch.object(mod, "request", side_effect=ValueError("trusted proof reached")):
+            check("rebased event reaches historical evidence verification",
+                  lambda: mod.authorize_reviewed_pr(record["repository"], current_base,
+                      event_merge, record["baseline_bytes"], record, "token"),
+                  "trusted proof reached")
+            Path("unauthorized.c").write_text("unexpected\n", encoding="utf-8")
+            git("add", "."); git("commit", "-qm", "unauthorized change")
+            check("rebased unauthorized candidate path rejected",
+                  lambda: mod.authorize_reviewed_pr(record["repository"], current_base,
+                      git("rev-parse", "HEAD"), record["baseline_bytes"], record, "token"),
+                  "outside its reviewed repair paths")
+        git("checkout", "-q", "--orphan", "unrelated")
+        git("rm", "-qrf", ".")
+        Path("other.c").write_text("other\n", encoding="utf-8")
+        git("add", "."); git("commit", "-qm", "unrelated base")
+        unrelated = git("rev-parse", "HEAD")
+        check("unrelated current base rejected",
+              lambda: mod.reviewed_pr_reference_tree(unrelated, pinned_base, source),
+              "ancestry differs")
+        git("checkout", "-q", "--detach", pinned_base)
+        Path("reviewed.c").write_text("conflicting main\n", encoding="utf-8")
+        git("commit", "-qam", "conflicting main")
+        conflict = git("rev-parse", "HEAD")
+        check("conflicting reviewed-source rebase rejected",
+              lambda: mod.reviewed_pr_reference_tree(conflict, pinned_base, source),
+              "cannot be cleanly applied")
+    finally:
+        os.chdir(previous)
 
 print("test-size-baseline-provenance: all cases passed")

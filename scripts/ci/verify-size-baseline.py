@@ -95,21 +95,44 @@ def request(url, token, binary=False, authenticated=True):
 def fail(message):
     raise ValueError(message)
 
+def reviewed_pr_reference_tree(base_sha, pinned_base, source):
+    """Apply the immutable reviewed source to the current, descendant base."""
+    for sha in (pinned_base, source):
+        if subprocess.run(["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+            subprocess.run(["git", "fetch", "--no-tags", "origin", sha], check=True,
+                           stdout=subprocess.DEVNULL)
+        resolved = subprocess.check_output(["git", "rev-parse", f"{sha}^{{commit}}"],
+                                           text=True, encoding="utf-8").strip()
+        if resolved != sha:
+            fail("reviewed PR pinned revision is not an exact commit")
+    for older, newer in ((pinned_base, base_sha), (pinned_base, source)):
+        if subprocess.run(["git", "merge-base", "--is-ancestor", older, newer],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+            fail("reviewed PR baseline revision ancestry differs")
+    merged = subprocess.run(["git", "merge-tree", "--write-tree", base_sha, source],
+                            capture_output=True, text=True, encoding="utf-8")
+    tree = merged.stdout.strip()
+    if merged.returncode or not re.fullmatch(r"[0-9a-f]{40}", tree):
+        fail("reviewed PR source cannot be cleanly applied to the current base")
+    if subprocess.check_output(["git", "cat-file", "-t", tree],
+                               text=True, encoding="utf-8").strip() != "tree":
+        fail("reviewed PR rebased reference is not a tree")
+    return tree
+
 def authorize_reviewed_pr(repo, base_sha, candidate_sha, candidate_value, p, token):
     if p != REVIEWED_PR_BASELINE or repo != p["repository"] or not token:
         fail("reviewed PR baseline requires the exact approved record and Actions API access")
     source = p["source_sha"]
-    if (base_sha != p["base_sha"] or candidate_value != p["baseline_bytes"] or
+    if (candidate_value != p["baseline_bytes"] or
             candidate_sha in (source, p["tested_merge_sha"])):
         fail("reviewed PR baseline source, event base, or byte count differs")
-    for older, newer in ((base_sha, source), (source, candidate_sha)):
-        if subprocess.run(["git", "merge-base", "--is-ancestor", older, newer],
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
-            fail("reviewed PR baseline revision ancestry differs")
-    changed = subprocess.check_output(["git", "diff", "--name-only", source,
+    reference = reviewed_pr_reference_tree(base_sha, p["base_sha"], source)
+    changed = subprocess.check_output(["git", "diff", "--name-only", reference,
                                       candidate_sha], text=True, encoding="utf-8").splitlines()
     allowed = {"tests/baseline_size.txt", "tests/baseline_size.provenance.json",
                "scripts/ci/verify-size-baseline.py",
+               "scripts/ci/test-size-baseline-provenance.py",
                "tests/test_consolidate_kway_merge.c",
                "tests/test_memory_admission_relation.c",
                "tests/test_wirelog_easy.c", "tests/test_wirelog_advanced.c",
@@ -125,7 +148,7 @@ def authorize_reviewed_pr(repo, base_sha, candidate_sha, candidate_value, p, tok
     tree = subprocess.check_output(["git", "rev-parse", f"{source}^{{tree}}"],
                                    text=True, encoding="utf-8").strip()
     if (merge.get("tree", {}).get("sha") != tree or
-            [v.get("sha") for v in merge.get("parents", [])] != [base_sha, source]):
+            [v.get("sha") for v in merge.get("parents", [])] != [p["base_sha"], source]):
         fail("measured PR merge is not the reviewed source tree on its pinned base")
     parents = subprocess.check_output(["git", "rev-list", "--parents", "-n", "1",
                                        candidate_sha], text=True, encoding="utf-8").split()
@@ -144,7 +167,7 @@ def authorize_reviewed_pr(repo, base_sha, candidate_sha, candidate_value, p, tok
     if (run.get("path") != ".github/workflows/ci-pr.yml" or
             run.get("event") != "pull_request" or run.get("head_sha") != source or
             not any(pr.get("number") == p["pr_number"] and
-                    pr.get("base", {}).get("sha") == base_sha and
+                    pr.get("base", {}).get("sha") in (p["base_sha"], base_sha) and
                     pr.get("head", {}).get("sha") == parents[2]
                     for pr in run.get("pull_requests", []))):
         fail("reviewed PR measurement run identity differs")
@@ -161,7 +184,7 @@ def authorize_reviewed_pr(repo, base_sha, candidate_sha, candidate_value, p, tok
     if hashlib.sha256(log).hexdigest() != p["job_log_sha256"]:
         fail("reviewed PR measurement log digest differs")
     clean = re.sub(r"(?m)^\d{4}-\d{2}-\d{2}T[^ ]+Z ", "", log.decode("utf-8"))
-    for key, value in (("BASE_SHA", base_sha), ("TESTED_SHA", p["tested_merge_sha"]),
+    for key, value in (("BASE_SHA", p["base_sha"]), ("TESTED_SHA", p["tested_merge_sha"]),
                        ("PR_HEAD_SHA", source)):
         if f"  {key}: {value}\n" not in clean:
             fail("reviewed PR measurement environment differs")
@@ -169,7 +192,7 @@ def authorize_reviewed_pr(repo, base_sha, candidate_sha, candidate_value, p, tok
     if not match:
         fail("reviewed PR measurement policy report is missing")
     report = json.loads(match.group())
-    expected = {"base_sha": base_sha, "head_sha": p["tested_merge_sha"],
+    expected = {"base_sha": p["base_sha"], "head_sha": p["tested_merge_sha"],
                 "base_bytes": 389203, "head_bytes": 395540, "baseline_bytes": 387391,
                 "budget_bytes": 5120, "status": "over-budget",
                 "base_profile": p["profile_sha256"], "head_profile": p["profile_sha256"]}
