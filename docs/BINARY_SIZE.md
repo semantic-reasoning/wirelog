@@ -1,9 +1,9 @@
 # Binary size monitoring and admission
 
 `tests/baseline_size.txt` records the current canonical Ubuntu x86_64 GCC
-measurement (377286 bytes), from source revision
-`03a97843a8ca3c740d7ab1df05097aa512f7fbcf`. The earlier 354887-byte value was
-legacy and unverified. The refreshed value is tied to the main CI artifact in
+measurement (387391 bytes), from source revision
+`4643796d77aa145e31919352b77e1099e1427e51`. The value is tied to the main
+CI artifact in
 `tests/baseline_size.provenance.json` and is accepted only after the verifier
 reproduces the profile and `.text` size from that source. The artifact digest
 and reported library digest remain cross-checked against the sidecar; a rebuilt
@@ -16,7 +16,7 @@ its first parent is the event base. Both libraries are configured and built on
 the same runner with `-Dtests=true -DmbedTLS=disabled`, and the resolved Meson
 options, compiler/linker identity and version, target, platform, and effective
 wirelog build commands must match. A profile mismatch is an error. The
-candidate's baseline file is never used for its own admission decision.
+candidate's baseline file is used only after its main CI provenance is verified.
 
 Normally the head may be at most baseline + 5120 bytes. If the measured base
 already exceeds that ceiling, the head may not exceed the measured base. A
@@ -42,16 +42,17 @@ the failed full build successful.
 
 Do not replace the baseline with a local build measurement. A numeric update is
 accepted only when its sidecar identifies a report artifact from a successful
-`ci-main.yml` push run in this repository, the source commit is an ancestor of
-the PR base, the Actions artifact digest and report agree with the sidecar, and
+`ci-main.yml` push run in this repository, the source commit is the PR base or
+an earlier ancestor, the Actions artifact digest and report agree with the sidecar, and
 the current runner can reproduce the profile and section size from that
 eligible source. The artifact and report library digests must match the
 sidecar, but rebuilds need not be byte-identical outside the measured section.
 A `monitoring-error` artifact qualifies only for the
-narrow later-full-build failure case described above. PR admission still uses the event base's
-baseline, so changing source and baseline in one PR cannot grant additional
-budget. If artifact access, toolchain reproduction, or provenance validation
-fails, the update is rejected. No workflow writes or commits baseline changes.
+narrow later-full-build failure case described above. A candidate baseline can
+grant additional budget only when the verified measurement comes from an eligible
+main revision distinct from the candidate. If artifact access, toolchain
+reproduction, or provenance validation fails, the update is rejected. No
+workflow writes or commits baseline changes.
 
 Required PR check/job names are unchanged. The main monitoring step remains
 non-blocking and the repository grants no write permission for this process.
