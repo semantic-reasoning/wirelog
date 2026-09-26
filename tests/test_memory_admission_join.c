@@ -1082,17 +1082,25 @@ test_join_output_growth_denial_is_typed(void)
     measure = NULL;
     col_rel_destroy(probe);
     probe = NULL;
-    sess = make_session(initial_bytes + grown_bytes - 1u);
+    sess = make_session(64ull * 1024 * 1024);
     if (!sess) {
-        FAIL("could not create constrained governor");
+        FAIL("could not create governor");
         goto out;
     }
-    session_add_rel(sess, right);
+    if (session_add_rel(sess, right) != 0) {
+        FAIL("right relation registration failed");
+        goto out;
+    }
     right = NULL;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            sess->memory_governor)->usable_bytes,
+        registry_charge(sess) + initial_bytes + grown_bytes - 1u,
+        memory_order_release);
     init_cross_op(&op);
     op.materialized = false;
     if (run_join(sess, left, &op, NULL) != ENOSPC
-        || !sess->memory_budget_denied || reserved_of(sess) != 0u) {
+        || !sess->memory_budget_denied
+        || reserved_of(sess) != registry_charge(sess)) {
         FAIL("growth denial was not typed or left output bytes reserved");
         goto out;
     }
@@ -1289,12 +1297,11 @@ test_filter_join_hash_denial_unwinds_scratch(void)
     col_rel_destroy(shape);
 
     for (uint32_t which = 0; which < 2; which++) {
-        /* Admit the output, both key-index slots, and the one-row probe
-         * buffer, leaving the four-bucket/two-chain hash table one byte
-         * beyond the budget. */
-        uint64_t budget = output_bytes + 2u * sizeof(uint32_t)
+        /* Admit output, key-index slots, probe row, and all but one byte
+         * of the 16-bucket hash: two chains for SEMI, three for ANTI. */
+        uint64_t operation_budget = output_bytes + 2u * sizeof(uint32_t)
             + 2u * sizeof(int64_t);
-        wl_col_session_t *sess = make_session(budget);
+        wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
         col_rel_t *right = make_right(2, 1);
         col_rel_t *left = make_left(4, 2);
         wl_plan_op_t op = { 0 };
@@ -1313,6 +1320,26 @@ test_filter_join_hash_denial_unwinds_scratch(void)
             destroy_session(sess);
             continue;
         }
+        uint32_t buckets = wl_columnar_filter_next_pow2(
+            2u * right->nrows);
+        uint64_t head_bytes = 0, next_bytes = 0, hash_bytes = 0;
+        if (right->nrows != 2u || buckets != 16u
+            || !wl_columnar_memory_size_mul(buckets, sizeof(uint32_t),
+            &head_bytes)
+            || !wl_columnar_memory_size_mul(
+                (uint64_t)right->nrows + (which == 1u),
+                sizeof(uint32_t), &next_bytes)
+            || !wl_columnar_memory_size_add(head_bytes, next_bytes,
+            &hash_bytes)
+            || !wl_columnar_memory_size_add(operation_budget,
+            hash_bytes - 1u, &operation_budget)) {
+            tests_failed++;
+            printf("FAIL: hash footprint fixture\n");
+            col_rel_destroy(left);
+            col_rel_destroy(right);
+            destroy_session(sess);
+            continue;
+        }
         if (session_add_rel(sess, right) != 0) {
             tests_failed++;
             printf("FAIL: right relation setup\n");
@@ -1322,6 +1349,9 @@ test_filter_join_hash_denial_unwinds_scratch(void)
             continue;
         }
         right = NULL;
+        atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+                sess->memory_governor)->usable_bytes,
+            registry_charge(sess) + operation_budget, memory_order_release);
         memset(&op, 0, sizeof(op));
         op.right_relation = "right";
         op.key_count = 1;
@@ -1329,7 +1359,7 @@ test_filter_join_hash_denial_unwinds_scratch(void)
         op.right_keys = right_keys;
         int rc = run_filter_join(fn, sess, left, &op, &result);
         if (rc != ENOSPC || result.rel || !sess->memory_budget_denied
-            || reserved_of(sess) != 0u || left->nrows != 4
+            || reserved_of(sess) != registry_charge(sess) || left->nrows != 4
             || col_rel_get(left, 0, 0) != 0) {
             tests_failed++;
             printf(
@@ -2206,7 +2236,8 @@ run_parallel_diff_partial_submit_failure(uint32_t fail_at,
     int rc = run_diff_join(sess, left, &op, &result);
     wl_columnar_join_test_submit_override = NULL;
     if (rc != ENOMEM || test_join_submit_calls != fail_at || result.rel
-        || left->nrows != 65 || reserved_of(sess) != 0u
+        || left->nrows != 65
+        || reserved_of(sess) != registry_charge(sess)
         || sess->mat_cache.count != 0 || sess->diff_arr_count != 0
         || sess->diff_txn_count != 0) {
         FAIL("partial worker submission published or retained worker state");
@@ -2410,7 +2441,8 @@ run_parallel_pair_growth_failure(bool deny_growth, bool fail_commit)
         : !wl_columnar_join_test_fail_pair_realloc;
     if (rc != (deny_growth ? ENOSPC : ENOMEM) || !injected || result.rel
         || (deny_growth && !sess->memory_budget_denied)
-        || reserved_of(sess) != 0u || sess->mat_cache.count != 0
+        || reserved_of(sess) != registry_charge(sess)
+        || sess->mat_cache.count != 0
         || sess->diff_arr_count != 0 || sess->diff_txn_count != 0) {
         FAIL("pair-vector failure published output or retained scratch");
         goto out_entry;
