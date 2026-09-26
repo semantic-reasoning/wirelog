@@ -727,6 +727,8 @@ test_missing_right_metadata_boundary(void)
         FAIL("missing-right boundary fixture");
         goto out;
     }
+    payload += (uint64_t)shape->ncols
+        * (sizeof(int64_t *) + sizeof(int64_t));
     init_cross_op(&op);
     op.right_relation = "missing";
     uint64_t peak = sizeof(col_rel_t) + sizeof("$join_empty")

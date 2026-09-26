@@ -1773,6 +1773,8 @@ test_descriptor_uses_source_governor(void)
         FAIL("source governor setup");
         goto out;
     }
+    payload_bytes += (uint64_t)f.out->ncols
+        * (sizeof(int64_t *) + sizeof(int64_t));
     baseline = wl_columnar_memory_reserved(
         wl_columnar_memory_governor_ref_get(source_governor));
     session_baseline = reserved_of(f.sess);
@@ -1861,6 +1863,8 @@ test_batch_payload_uses_right_governor_fallback(void)
         FAIL("right source governor setup");
         goto out;
     }
+    payload_bytes += (uint64_t)f.out->ncols
+        * (sizeof(int64_t *) + sizeof(int64_t));
     oracle = run_oracle(f.sess, f.left, &f.op);
     if (!oracle) {
         FAIL("oracle");
@@ -1936,6 +1940,8 @@ test_batch_payload_denial_rolls_back_and_retries(void)
         FAIL("admission footprint setup");
         goto out;
     }
+    payload_bytes += (uint64_t)f.out->ncols
+        * (sizeof(int64_t *) + sizeof(int64_t));
     budget = descriptor_bytes + payload_bytes
         + sizeof(col_rel_t) + sizeof("$join_batch")
         + 2u * auto_metadata_bytes(f.out->ncols)
