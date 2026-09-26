@@ -1,0 +1,17 @@
+{
+  "load": [
+    3.11279296875,
+    2.1689453125,
+    3.14453125
+  ],
+  "memory_kb": {
+    "MemAvailable": 63588188,
+    "MemTotal": 131859056,
+    "SwapFree": 44640640,
+    "SwapTotal": 67108860
+  },
+  "memory_psi": "some avg10=0.01 avg60=0.41 avg300=0.34 total=261573320\nfull avg10=0.01 avg60=0.41 avg300=0.34 total=158593789\n",
+  "pswpin": 2232805,
+  "pswpout": 5748655,
+  "utc": "2026-09-26T08:14:13.581899+00:00"
+}

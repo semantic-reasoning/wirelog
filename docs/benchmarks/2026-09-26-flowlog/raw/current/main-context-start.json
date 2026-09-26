@@ -1,0 +1,1545 @@
+{
+  "affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "binary_bytes": 577112,
+  "binary_sha256": "216e6ce0e7b97718d68df1f6c95aed1684f16ab87974d1046960ea1970eda2c8",
+  "captured_at": "2026-09-26T10:47:01.645630+00:00",
+  "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/tmux-spawn-0ecd1792-4988-48ad-b5d1-f22a9349f593.scope\n",
+  "compiler": "cc (GCC) 16.2.1 20260810\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.",
+  "cpu_topology": "CPU NODE SOCKET CORE L1d:L1i:L2:L3 ONLINE    MAXMHZ    MINMHZ       MHZ\n  0    0      0    0 0:0:0:0          yes 3700.0000 1200.0000 1197.3311\n  1    0      0    1 1:1:1:0          yes 3700.0000 1200.0000 1200.0000\n  2    0      0    2 2:2:2:0          yes 3700.0000 1200.0000 1197.2760\n  3    0      0    3 3:3:3:0          yes 3700.0000 1200.0000 2593.7981\n  4    0      0    4 4:4:4:0          yes 3700.0000 1200.0000 1197.2430\n  5    0      0    5 5:5:5:0          yes 3700.0000 1200.0000 1197.2040\n  6    0      0    6 8:8:8:0          yes 3700.0000 1200.0000 1200.0000\n  7    0      0    7 9:9:9:0          yes 3700.0000 1200.0000 1196.7080\n  8    0      0    8 10:10:10:0       yes 3700.0000 1200.0000 1197.2460\n  9    0      0    9 11:11:11:0       yes 3700.0000 1200.0000 1200.0000\n 10    0      0   10 12:12:12:0       yes 3700.0000 1200.0000 1197.5020\n 11    0      0   11 16:16:16:0       yes 3700.0000 1200.0000 1697.3330\n 12    0      0   12 17:17:17:0       yes 3700.0000 1200.0000 2943.4341\n 13    0      0   13 18:18:18:0       yes 3700.0000 1200.0000 2197.2271\n 14    0      0   14 19:19:19:0       yes 3700.0000 1200.0000 1200.0000\n 15    0      0   15 20:20:20:0       yes 3700.0000 1200.0000 1197.4990\n 16    0      0   16 21:21:21:0       yes 3700.0000 1200.0000 1197.1660\n 17    0      0   17 24:24:24:0       yes 3700.0000 1200.0000 1197.7800\n 18    0      0   18 25:25:25:0       yes 3700.0000 1200.0000 1161.7629\n 19    0      0   19 26:26:26:0       yes 3700.0000 1200.0000 1197.2600\n 20    0      0   20 27:27:27:0       yes 3700.0000 1200.0000 1194.4370\n 21    0      0   21 28:28:28:0       yes 3700.0000 1200.0000 1204.5959\n 22    1      1   22 32:32:32:1       yes 3700.0000 1200.0000 1200.0000\n 23    1      1   23 33:33:33:1       yes 3700.0000 1200.0000 1200.0000\n 24    1      1   24 34:34:34:1       yes 3700.0000 1200.0000 1200.0000\n 25    1      1   25 35:35:35:1       yes 3700.0000 1200.0000 1200.0000\n 26    1      1   26 36:36:36:1       yes 3700.0000 1200.0000 1200.0000\n 27    1      1   27 37:37:37:1       yes 3700.0000 1200.0000 1200.0000\n 28    1      1   28 40:40:40:1       yes 3700.0000 1200.0000 1190.4480\n 29    1      1   29 41:41:41:1       yes 3700.0000 1200.0000 1200.0000\n 30    1      1   30 42:42:42:1       yes 3700.0000 1200.0000 1200.0000\n 31    1      1   31 43:43:43:1       yes 3700.0000 1200.0000 1200.0000\n 32    1      1   32 44:44:44:1       yes 3700.0000 1200.0000 1200.0000\n 33    1      1   33 48:48:48:1       yes 3700.0000 1200.0000 1200.0000\n 34    1      1   34 49:49:49:1       yes 3700.0000 1200.0000 1200.0000\n 35    1      1   35 50:50:50:1       yes 3700.0000 1200.0000 1200.0000\n 36    1      1   36 51:51:51:1       yes 3700.0000 1200.0000 1200.0000\n 37    1      1   37 52:52:52:1       yes 3700.0000 1200.0000 1200.0000\n 38    1      1   38 53:53:53:1       yes 3700.0000 1200.0000 1200.0000\n 39    1      1   39 56:56:56:1       yes 3700.0000 1200.0000 1200.0000\n 40    1      1   40 57:57:57:1       yes 3700.0000 1200.0000 1186.0129\n 41    1      1   41 58:58:58:1       yes 3700.0000 1200.0000 1200.0000\n 42    1      1   42 59:59:59:1       yes 3700.0000 1200.0000 1200.0000\n 43    1      1   43 60:60:60:1       yes 3700.0000 1200.0000 1193.0490\n 44    0      0    0 0:0:0:0          yes 3700.0000 1200.0000 1199.8051\n 45    0      0    1 1:1:1:0          yes 3700.0000 1200.0000 1199.8361\n 46    0      0    2 2:2:2:0          yes 3700.0000 1200.0000 1200.0000\n 47    0      0    3 3:3:3:0          yes 3700.0000 1200.0000 1455.8831\n 48    0      0    4 4:4:4:0          yes 3700.0000 1200.0000 1200.0000\n 49    0      0    5 5:5:5:0          yes 3700.0000 1200.0000 1197.2170\n 50    0      0    6 8:8:8:0          yes 3700.0000 1200.0000 1197.2240\n 51    0      0    7 9:9:9:0          yes 3700.0000 1200.0000 1197.4771\n 52    0      0    8 10:10:10:0       yes 3700.0000 1200.0000 1197.8010\n 53    0      0    9 11:11:11:0       yes 3700.0000 1200.0000 3424.5959\n 54    0      0   10 12:12:12:0       yes 3700.0000 1200.0000 1197.1429\n 55    0      0   11 16:16:16:0       yes 3700.0000 1200.0000 1200.0000\n 56    0      0   12 17:17:17:0       yes 3700.0000 1200.0000 1200.0000\n 57    0      0   13 18:18:18:0       yes 3700.0000 1200.0000 1200.0000\n 58    0      0   14 19:19:19:0       yes 3700.0000 1200.0000 1200.0000\n 59    0      0   15 20:20:20:0       yes 3700.0000 1200.0000 1197.1570\n 60    0      0   16 21:21:21:0       yes 3700.0000 1200.0000 1200.0000\n 61    0      0   17 24:24:24:0       yes 3700.0000 1200.0000 1200.0000\n 62    0      0   18 25:25:25:0       yes 3700.0000 1200.0000 1200.0000\n 63    0      0   19 26:26:26:0       yes 3700.0000 1200.0000 1197.7159\n 64    0      0   20 27:27:27:0       yes 3700.0000 1200.0000 1198.9700\n 65    0      0   21 28:28:28:0       yes 3700.0000 1200.0000 1200.0000\n 66    1      1   22 32:32:32:1       yes 3700.0000 1200.0000 1200.0000\n 67    1      1   23 33:33:33:1       yes 3700.0000 1200.0000 1200.0000\n 68    1      1   24 34:34:34:1       yes 3700.0000 1200.0000 1200.0000\n 69    1      1   25 35:35:35:1       yes 3700.0000 1200.0000 1200.0000\n 70    1      1   26 36:36:36:1       yes 3700.0000 1200.0000 1200.0000\n 71    1      1   27 37:37:37:1       yes 3700.0000 1200.0000 1200.0000\n 72    1      1   28 40:40:40:1       yes 3700.0000 1200.0000 1200.0000\n 73    1      1   29 41:41:41:1       yes 3700.0000 1200.0000 1200.0000\n 74    1      1   30 42:42:42:1       yes 3700.0000 1200.0000 1200.0000\n 75    1      1   31 43:43:43:1       yes 3700.0000 1200.0000 1200.0000\n 76    1      1   32 44:44:44:1       yes 3700.0000 1200.0000 1191.1650\n 77    1      1   33 48:48:48:1       yes 3700.0000 1200.0000 1200.0000\n 78    1      1   34 49:49:49:1       yes 3700.0000 1200.0000 1200.0000\n 79    1      1   35 50:50:50:1       yes 3700.0000 1200.0000 1197.1670\n 80    1      1   36 51:51:51:1       yes 3700.0000 1200.0000 1200.0000\n 81    1      1   37 52:52:52:1       yes 3700.0000 1200.0000 1200.0000\n 82    1      1   38 53:53:53:1       yes 3700.0000 1200.0000 1200.0000\n 83    1      1   39 56:56:56:1       yes 3700.0000 1200.0000 1200.0000\n 84    1      1   40 57:57:57:1       yes 3700.0000 1200.0000 1200.0000\n 85    1      1   41 58:58:58:1       yes 3700.0000 1200.0000 3700.0000\n 86    1      1   42 59:59:59:1       yes 3700.0000 1200.0000 1900.0000\n 87    1      1   43 60:60:60:1       yes 3700.0000 1200.0000 1200.0000",
+  "data_files": {
+    "andersen/addressOf.csv": {
+      "bytes": 346,
+      "sha256": "06dd1eba85020a9824db9c2d40e26777982bc8b9a8512acc81737598e73644ba"
+    },
+    "andersen/assign.csv": {
+      "bytes": 235,
+      "sha256": "4757f1daa384ba703475c527c0f16826e82d8a052f2334a26b384f42d931343e"
+    },
+    "andersen/load.csv": {
+      "bytes": 118,
+      "sha256": "0e52b4b5387bacb29d5dccc27c0288345f4374e484d2d875bed3eba08e4d24e9"
+    },
+    "andersen/store.csv": {
+      "bytes": 114,
+      "sha256": "42c4d7b13b56fbac8b9feb2cf21cb17c372417bffc80cdcef418fa9cb7f9a374"
+    },
+    "crdt/Insert_input.csv": {
+      "bytes": 3143972,
+      "sha256": "9147f2b44d4cb291336da9aa6c39c27feac8630361f2b36875474e5c30602b05"
+    },
+    "crdt/Remove_input.csv": {
+      "bytes": 650096,
+      "sha256": "b83fba0709b37259cd6ad00bfe3434abc3df3fec3dbccd3f5eedf273e9c921dc"
+    },
+    "csda/edge.csv": {
+      "bytes": 1985,
+      "sha256": "00ba6479c1f56763a2e513483eaf7bfd170d4d66a26af80619904301b2f8cecd"
+    },
+    "csda/nullEdge.csv": {
+      "bytes": 128,
+      "sha256": "07bf611deaea007e8626ce330002820dc6eb9c7506c52e8f1066181a20fbb193"
+    },
+    "cspa/assign.csv": {
+      "bytes": 1048,
+      "sha256": "10ee3e1a6388d6596cf4d437336c6215062554761156b9be22767dba86bb2032"
+    },
+    "cspa/dereference.csv": {
+      "bytes": 116,
+      "sha256": "c37127cbcf42cebb04296869cf16b029d60992706c98377e4536d3c9e5b06185"
+    },
+    "ddisasm/cond_jump.csv": {
+      "bytes": 100,
+      "sha256": "d7a51f5ab665d9128164911c7b9236d3eaa940acefeff07e829bc719b8898a29"
+    },
+    "ddisasm/direct_call.csv": {
+      "bytes": 160,
+      "sha256": "75f958229ee94a51fc8657a05c2bddea3c276103e9fb59d7573a92875676e0d1"
+    },
+    "ddisasm/direct_jump.csv": {
+      "bytes": 30,
+      "sha256": "87c7da67f8f78f7804e512f0be49669a28e2cab773f25841012333d562a7bf9f"
+    },
+    "ddisasm/entry_point.csv": {
+      "bytes": 5,
+      "sha256": "83c02ac2d48c863dab2ccf6870455aadfc2cec073b8db269b517c879d76aa6d9"
+    },
+    "ddisasm/instruction.csv": {
+      "bytes": 1246,
+      "sha256": "e2bddb845c9c8cc75f60fd787146bb2a35535a299e38dbdafb88c57ef5b9b52e"
+    },
+    "ddisasm/next.csv": {
+      "bytes": 1490,
+      "sha256": "4d51bbd03e07d440d203dc0a8be84a941f316c3a251f46265d657dd4c0077785"
+    },
+    "ddisasm/nop.csv": {
+      "bytes": 200,
+      "sha256": "6a0303936d22af2125b1c98f13fff1f6308114d58499cc21960c3fd01a77bcdb"
+    },
+    "ddisasm/return_inst.csv": {
+      "bytes": 75,
+      "sha256": "18b7f907d78d71796064db83b5c7ba375cc54e45d13d14866802b92276dbb13b"
+    },
+    "doop/ActualParam.facts": {
+      "bytes": 62717292,
+      "sha256": "8e19db08b648f7bad561e701a4bda035f6da0ebdda4902cd9910af6e1f60302f"
+    },
+    "doop/ApplicationClass.facts": {
+      "bytes": 38169,
+      "sha256": "69024c6daf8510c8bf6d35c11aa6aafdd2304733fabf3e8d9bd6c97212f1cd19"
+    },
+    "doop/ArrayType.facts": {
+      "bytes": 1312141,
+      "sha256": "f05836678f259c9cbfcbe3e61b3a87ab4f1faa0371e9f2f34d8ea22dd712017f"
+    },
+    "doop/AssignCast.facts": {
+      "bytes": 14221978,
+      "sha256": "7300d1b09ff47f10886fd6cc2f6a9df8c5c68d697373461a374aa30157f67203"
+    },
+    "doop/AssignHeapAllocation.facts": {
+      "bytes": 36303074,
+      "sha256": "ea485ce215ed34b59893eee50e364de1aaae37f244ab11ffdb0547c17f2bdf4f"
+    },
+    "doop/AssignLocal.facts": {
+      "bytes": 58071602,
+      "sha256": "d0af89c230718ac473aa6e442d8837dff81c9043f039b1683c9f395b99861ad5"
+    },
+    "doop/AssignReturnValue.facts": {
+      "bytes": 34906148,
+      "sha256": "981115a75813c1305b290534aaa8e4f596f9e4a1a8dbfcca100d17ee601b8234"
+    },
+    "doop/ClassHeap.facts": {
+      "bytes": 863176,
+      "sha256": "abcb0a17ec9cb80463b7b21da860663c64a88d479419a15e7f889e345d45a02e"
+    },
+    "doop/ClassType.facts": {
+      "bytes": 296389,
+      "sha256": "6e312943fc1fd5db68296eb8b66659e510de021671e4dc49543189abaa6fa665"
+    },
+    "doop/ComponentType.facts": {
+      "bytes": 2449526,
+      "sha256": "8dfc3fd6226d6ca44e457bb3fa631e2c46f875522afb8ef82b9a1fa2285e6196"
+    },
+    "doop/DirectSuperclass.facts": {
+      "bytes": 481183,
+      "sha256": "9780486901277b3277bf4f2dd97cc050334aca98288fa435391f924f623cb312"
+    },
+    "doop/DirectSuperinterface.facts": {
+      "bytes": 260973,
+      "sha256": "a7141429e03634c569242e0e7cb37e83f27610961c593403a2dd0df729d64949"
+    },
+    "doop/Field.facts": {
+      "bytes": 27195678,
+      "sha256": "8ee7c662609772e9ec72777bb0dbeb79690b666cb8c60decf1de20f93c4ad7ec"
+    },
+    "doop/FormalParam.facts": {
+      "bytes": 18043016,
+      "sha256": "bd3ecd5a3d8cfe16fd22a7ec2f81d987256afd2ff6d54ca4014e94c6a0238451"
+    },
+    "doop/InterfaceType.facts": {
+      "bytes": 28712,
+      "sha256": "6f716ca2e2e06f3a22093125fe9f5de5af23b821be76affa81b8b52940af0606"
+    },
+    "doop/LoadArrayIndex.facts": {
+      "bytes": 6508747,
+      "sha256": "866ff290e11de22ed08b09e2ba69a40c5178c7b952ff50d4ced2a057e41a13b3"
+    },
+    "doop/LoadInstanceField.facts": {
+      "bytes": 45898799,
+      "sha256": "f143bec1d5e2ff9b7f8a21c2dc0e088b88468731f84448877998ce21d418b744"
+    },
+    "doop/LoadStaticField.facts": {
+      "bytes": 10987635,
+      "sha256": "5e689283b232b6bfd49142902c7926cf3693791cf99aa240bb1ea7d20811029a"
+    },
+    "doop/MainClass.facts": {
+      "bytes": 47,
+      "sha256": "70b471d14e37ac8e8b6f1b9315beecef9f9cfe0dbfbb5a1da4b1f6c0a887b86e"
+    },
+    "doop/Method-Modifier.facts": {
+      "bytes": 8600087,
+      "sha256": "855cbc72eea7dc6f3b1945ac42478750d7f2b6fef6fdf0af0efd7aa16b8df8bc"
+    },
+    "doop/Method.facts": {
+      "bytes": 13906405,
+      "sha256": "57f6fa5b8357906bce9a050dbec60073dabca58e1626cdcd89f38d8b02f1420d"
+    },
+    "doop/MethodHandleConstant.facts": {
+      "bytes": 100442,
+      "sha256": "07a08a14fc13bff011af8c94cf3530097c5aa1d9eac4d2a1748f050714624289"
+    },
+    "doop/MethodTypeConstant.facts": {
+      "bytes": 55638,
+      "sha256": "a68d73682229072437cbdde31f72552a471a011dce4a280ea426b0d905bafc41"
+    },
+    "doop/NormalHeap.facts": {
+      "bytes": 7278210,
+      "sha256": "981ee6ffab5a9defa6f89aa07dc804a858e1f46fe224b05463f5598bea2db07a"
+    },
+    "doop/Return.facts": {
+      "bytes": 14695970,
+      "sha256": "0becce5ce7ec425ad8eaa3470dedb1689d9c8fb37126611a54f59815a90c49da"
+    },
+    "doop/SpecialMethodInvocation.facts": {
+      "bytes": 24745076,
+      "sha256": "17b6001e8172194641632d94abe888708075d6abf87907475a512b4d304c48e4"
+    },
+    "doop/StaticMethodInvocation.facts": {
+      "bytes": 11884298,
+      "sha256": "8751af7fabd3fbd6a6e29ec1988b915429ef4a4b43dcc86ce372223a134a5740"
+    },
+    "doop/StoreArrayIndex.facts": {
+      "bytes": 18214021,
+      "sha256": "1d160a0744231584755f4fd402188735b85bbe05a0fd093c9df43071a12040d4"
+    },
+    "doop/StoreInstanceField.facts": {
+      "bytes": 17001572,
+      "sha256": "e4b7f8dffae81eb162b472a73a8aa306609f4718178591b29243f5d0d50e105a"
+    },
+    "doop/StoreStaticField.facts": {
+      "bytes": 2509824,
+      "sha256": "2654f877fbf5c1e6107f934c0b2331f1fbacc2a06224d93310458c751822ee2b"
+    },
+    "doop/StringConstant.facts": {
+      "bytes": 959093,
+      "sha256": "ad2d059f5e3811fbcaf00afc1d4f112501e098bc6af275282ae336d18369d9f6"
+    },
+    "doop/ThisVar.facts": {
+      "bytes": 10070504,
+      "sha256": "ee8baa8f47c26cb134a4171926f0bf9a46f30c9a031a8363e80bb50f21a3f5ea"
+    },
+    "doop/Var-DeclaringMethod.facts": {
+      "bytes": 164306690,
+      "sha256": "5dd712e3d5e549c221adea600bdaa27d90bef429898d87f44d5c12931d2644c4"
+    },
+    "doop/Var-Type.facts": {
+      "bytes": 102039806,
+      "sha256": "0edbbc2aa8a3c443ea3d8b21cb8e6e321444287211863a54bfc2dbb798540242"
+    },
+    "doop/VirtualMethodInvocation.facts": {
+      "bytes": 59101443,
+      "sha256": "eeaf04a61eac466d472161fb31ebeaac668845b355a8e1d965208d3b4beefd2c"
+    },
+    "dyck/close1.csv": {
+      "bytes": 186,
+      "sha256": "20d1236f2c865e7e2ff98f764941d61467b7b0fd85a38855913fb75fd6acc393"
+    },
+    "dyck/close2.csv": {
+      "bytes": 207,
+      "sha256": "d9e3a1f908714bbfeaa0806979cd79f27a7657e6200387d15f5e33c75045ee27"
+    },
+    "dyck/open1.csv": {
+      "bytes": 185,
+      "sha256": "df7548c9aaedcc6d4caf824c45be5a79af4fd27a740847628cad24b599b3728b"
+    },
+    "dyck/open2.csv": {
+      "bytes": 207,
+      "sha256": "09ffed4954f3334aedbac14a66da2d5f5cf7f39e0f3cb7a333d89e58a45430da"
+    },
+    "galen/c.csv": {
+      "bytes": 186,
+      "sha256": "3e2dd4b6395a898dd9d9ae4ebc226dbda19899a8f8c39b695f2b29c8b9c954b8"
+    },
+    "galen/inputP.csv": {
+      "bytes": 640,
+      "sha256": "5d51310f0d13d0cf580a8604be15750326e5aa4b9426e347c7c97e345aa6a76b"
+    },
+    "galen/inputQ.csv": {
+      "bytes": 592,
+      "sha256": "cd7008e5f02076e85d94574fd3bea39cca5b657c4d727f9fe72a0b0d5d069d49"
+    },
+    "galen/rc.csv": {
+      "bytes": 180,
+      "sha256": "b13de0cb2dbd3a41e90ade0f09145b60e7c6bf32123ea0c5d044c0fab3580a56"
+    },
+    "galen/s.csv": {
+      "bytes": 136,
+      "sha256": "50c49f23011d3390f9ca07c7b09107f3f3d42effe735f75ee1ee50c082b6fcdb"
+    },
+    "galen/u.csv": {
+      "bytes": 194,
+      "sha256": "28484677ff003f50c1990ad8b76e2982bcbfb82cf9c827e1a47e1f80aaf36d90"
+    },
+    "graph_100.csv": {
+      "bytes": 578,
+      "sha256": "68266816b76acb69af9d6479585dd6fe9ce97af6df83b4371a1986f2582f66d0"
+    },
+    "graph_100_weighted.csv": {
+      "bytes": 784,
+      "sha256": "0a42e980267ef55995076e1e4550e33de4e24127bc0eec2798ab032c87e446b5"
+    },
+    "polonius/cfg_edge.csv": {
+      "bytes": 298,
+      "sha256": "281232c2c96deba8d4ed8af8c93523f39b6b44e1c06273ce39ed7362dfc5557e"
+    },
+    "polonius/child_path.csv": {
+      "bytes": 80,
+      "sha256": "e000ec24be2aa14152241caf213821657584cdf8b31e6de6a07a20f95813c7a1"
+    },
+    "polonius/drop_of_var_derefs_origin.csv": {
+      "bytes": 16,
+      "sha256": "3f6f41d682c1e3a887ba88629225b44a74af3157ad5f7d0f22eb95f4cbc42ee7"
+    },
+    "polonius/known_placeholder_subset.csv": {
+      "bytes": 8,
+      "sha256": "a3e96cb0b253c36da295635594e9c7684378d01025769a437498518e08b4440a"
+    },
+    "polonius/loan_invalidated_at.csv": {
+      "bytes": 54,
+      "sha256": "ce858b75b340ef725055a7d6765222b2af553caa05d6ef6e0d2b9e34db60afbf"
+    },
+    "polonius/loan_issued_at.csv": {
+      "bytes": 107,
+      "sha256": "68c4bba39cde31c0af6ede373d57a5ad6acce6c50efe84a7c6b613be071c4cde"
+    },
+    "polonius/loan_killed_at.csv": {
+      "bytes": 35,
+      "sha256": "f7aa3a851d3628f25d5c22fbb511096891f3bae76d25aca9f5a7736d7ce96fe8"
+    },
+    "polonius/path_accessed_at_base.csv": {
+      "bytes": 41,
+      "sha256": "b0e8f7158f3d3472d0c3995b303a855b288d14bf258fd7425874ceb6142a9c1e"
+    },
+    "polonius/path_assigned_at_base.csv": {
+      "bytes": 69,
+      "sha256": "c74228042b9d404e03f61794ed3b294c89aff5c9ff6c28d6878dfe9d9fa20a0a"
+    },
+    "polonius/path_is_var.csv": {
+      "bytes": 40,
+      "sha256": "89ad3179f79c0129b9c51b725dc9d06d44d42bebd6a0a51a0702ba6ba716f46e"
+    },
+    "polonius/path_moved_at_base.csv": {
+      "bytes": 54,
+      "sha256": "f152df19756750044a69fc183958b1ad6280dc355d129fc1c3ec710963cb2401"
+    },
+    "polonius/subset_base.csv": {
+      "bytes": 162,
+      "sha256": "73b66c57c772a030bac4f7e4289b6c750f0c40b203646d2753ae60bf684c3555"
+    },
+    "polonius/universal_region.csv": {
+      "bytes": 8,
+      "sha256": "2927992b6c9220cf759e9afea9278712f61e53eeab3f71d2d82fbb941ebf8810"
+    },
+    "polonius/use_of_var_derefs_origin.csv": {
+      "bytes": 80,
+      "sha256": "5a307c102d395b9dbb460057bfee47ca6890d75b866bdd7fd09c63975eccd45c"
+    },
+    "polonius/var_defined_at.csv": {
+      "bytes": 138,
+      "sha256": "7cef68bbacee6ae7c875feba58e454a3083b71c245c95a4bbdb59182099ad2e5"
+    },
+    "polonius/var_dropped_at.csv": {
+      "bytes": 21,
+      "sha256": "0e1cb56cc75f9ee45c62c5e726496f785bb265ec5ce7d9166d4479306dc781c9"
+    },
+    "polonius/var_used_at.csv": {
+      "bytes": 199,
+      "sha256": "75e5abee8d05a24811720b6eae6bb6754d8991d35b57234aa21b13f10d468a0d"
+    }
+  },
+  "effective_cpuset": "0-87\n",
+  "git_status": "",
+  "governors": [
+    "schedutil"
+  ],
+  "host_start": {
+    "load": [
+      1.6650390625,
+      1.68115234375,
+      2.07568359375
+    ],
+    "memory_kb": {
+      "MemAvailable": 63825736,
+      "MemTotal": 131859056,
+      "SwapFree": 44644960,
+      "SwapTotal": 67108860
+    },
+    "memory_psi": "some avg10=0.00 avg60=0.00 avg300=0.00 total=261574238\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=158594674\n",
+    "pswpin": 2232833,
+    "pswpout": 5748655,
+    "utc": "2026-09-26T10:47:02.119743+00:00"
+  },
+  "kernel_cmdline": "initrd=\\initramfs-linux.img initrd=\\intel-ucode.img root=UUID=c8e9b142-905d-47bf-ad5f-2628efe27543 rw intel_iommu=on iommu=pt\n",
+  "linker": "GNU ld (GNU Binutils) 2.47\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis program is free software; you may redistribute it under the terms of\nthe GNU General Public License version 3 or (at your option) a later version.\nThis program has absolutely no warranty.",
+  "meson_options": [
+    {
+      "choices": [
+        "enabled",
+        "disabled",
+        "auto"
+      ],
+      "description": "Override value of all 'auto' features",
+      "machine": "any",
+      "name": "auto_features",
+      "section": "core",
+      "type": "combo",
+      "value": "auto"
+    },
+    {
+      "choices": [
+        "ninja",
+        "vs",
+        "vs2010",
+        "vs2012",
+        "vs2013",
+        "vs2015",
+        "vs2017",
+        "vs2019",
+        "vs2022",
+        "vs2026",
+        "xcode",
+        "none"
+      ],
+      "description": "Backend to use",
+      "machine": "any",
+      "name": "backend",
+      "section": "core",
+      "type": "combo",
+      "value": "ninja"
+    },
+    {
+      "choices": [
+        "vs2022",
+        "vs2026"
+      ],
+      "description": "Setup multiple buildtype-suffixed ninja-backend build directories, and a [builddir]_vs containing a Visual Studio meta-backend with multiple configurations that calls into them",
+      "machine": "any",
+      "name": "genvslite",
+      "section": "core",
+      "type": "combo",
+      "value": "vs2022"
+    },
+    {
+      "choices": [
+        "plain",
+        "debug",
+        "debugoptimized",
+        "release",
+        "minsize",
+        "custom"
+      ],
+      "description": "Build type to use",
+      "machine": "any",
+      "name": "buildtype",
+      "section": "core",
+      "type": "combo",
+      "value": "release"
+    },
+    {
+      "description": "Enable debug symbols and other information",
+      "machine": "any",
+      "name": "debug",
+      "section": "core",
+      "type": "boolean",
+      "value": false
+    },
+    {
+      "choices": [
+        "shared",
+        "static",
+        "both"
+      ],
+      "description": "Default library type",
+      "machine": "any",
+      "name": "default_library",
+      "section": "core",
+      "type": "combo",
+      "value": "shared"
+    },
+    {
+      "choices": [
+        "shared",
+        "static",
+        "auto"
+      ],
+      "description": "Default library type for both_libraries",
+      "machine": "any",
+      "name": "default_both_libraries",
+      "section": "core",
+      "type": "combo",
+      "value": "shared"
+    },
+    {
+      "description": "Default umask to apply on permissions of installed files",
+      "machine": "any",
+      "name": "install_umask",
+      "section": "core",
+      "type": "integer",
+      "value": 18
+    },
+    {
+      "choices": [
+        "mirror",
+        "flat"
+      ],
+      "description": "Build directory layout",
+      "machine": "any",
+      "name": "layout",
+      "section": "core",
+      "type": "combo",
+      "value": "mirror"
+    },
+    {
+      "choices": [
+        "plain",
+        "0",
+        "g",
+        "1",
+        "2",
+        "3",
+        "s"
+      ],
+      "description": "Optimization level",
+      "machine": "any",
+      "name": "optimization",
+      "section": "core",
+      "type": "combo",
+      "value": "s"
+    },
+    {
+      "description": "Whether to try static linking before shared linking",
+      "machine": "any",
+      "name": "prefer_static",
+      "section": "core",
+      "type": "boolean",
+      "value": false
+    },
+    {
+      "description": "Strip targets on install",
+      "machine": "any",
+      "name": "strip",
+      "section": "core",
+      "type": "boolean",
+      "value": false
+    },
+    {
+      "choices": [
+        "on",
+        "off",
+        "subprojects"
+      ],
+      "description": "Unity build",
+      "machine": "any",
+      "name": "unity",
+      "section": "core",
+      "type": "combo",
+      "value": "off"
+    },
+    {
+      "description": "Unity block size",
+      "machine": "any",
+      "name": "unity_size",
+      "section": "core",
+      "type": "integer",
+      "value": 4
+    },
+    {
+      "choices": [
+        "0",
+        "1",
+        "2",
+        "3",
+        "everything"
+      ],
+      "description": "Compiler warning level to use",
+      "machine": "any",
+      "name": "warning_level",
+      "section": "core",
+      "type": "combo",
+      "value": "1"
+    },
+    {
+      "description": "Treat warnings as errors",
+      "machine": "any",
+      "name": "werror",
+      "section": "core",
+      "type": "boolean",
+      "value": false
+    },
+    {
+      "choices": [
+        "default",
+        "nofallback",
+        "nodownload",
+        "forcefallback",
+        "nopromote"
+      ],
+      "description": "Wrap mode",
+      "machine": "any",
+      "name": "wrap_mode",
+      "section": "core",
+      "type": "combo",
+      "value": "default"
+    },
+    {
+      "description": "Force fallback for those subprojects",
+      "machine": "any",
+      "name": "force_fallback_for",
+      "section": "core",
+      "type": "array",
+      "value": []
+    },
+    {
+      "description": "Activate Visual Studio environment",
+      "machine": "any",
+      "name": "vsenv",
+      "section": "core",
+      "type": "boolean",
+      "value": false
+    },
+    {
+      "description": "Use OMF format on OS/2",
+      "machine": "any",
+      "name": "os2_emxomf",
+      "section": "core",
+      "type": "boolean",
+      "value": false
+    },
+    {
+      "description": "Generate pkgconfig files as relocatable",
+      "machine": "any",
+      "name": "pkgconfig.relocatable",
+      "section": "core",
+      "type": "boolean",
+      "value": false
+    },
+    {
+      "description": "Whether to compile bytecode",
+      "machine": "any",
+      "name": "python.bytecompile",
+      "section": "core",
+      "type": "integer",
+      "value": 0
+    },
+    {
+      "choices": [
+        "auto",
+        "prefix",
+        "system",
+        "venv"
+      ],
+      "description": "Which python environment to install to",
+      "machine": "any",
+      "name": "python.install_env",
+      "section": "core",
+      "type": "combo",
+      "value": "prefix"
+    },
+    {
+      "description": "Directory for site-specific, platform-specific files.",
+      "machine": "any",
+      "name": "python.platlibdir",
+      "section": "core",
+      "type": "string",
+      "value": ""
+    },
+    {
+      "description": "Directory for site-specific, non-platform-specific files.",
+      "machine": "any",
+      "name": "python.purelibdir",
+      "section": "core",
+      "type": "string",
+      "value": ""
+    },
+    {
+      "description": "Whether to allow use of the Python Limited API",
+      "machine": "any",
+      "name": "python.allow_limited_api",
+      "section": "core",
+      "type": "boolean",
+      "value": true
+    },
+    {
+      "description": "Config file containing the build details for the target Python installation.",
+      "machine": "any",
+      "name": "python.build_config",
+      "section": "core",
+      "type": "string",
+      "value": ""
+    },
+    {
+      "description": "List of additional paths for pkg-config to search",
+      "machine": "host",
+      "name": "pkg_config_path",
+      "section": "core",
+      "type": "array",
+      "value": []
+    },
+    {
+      "description": "List of additional prefixes for cmake to search",
+      "machine": "host",
+      "name": "cmake_prefix_path",
+      "section": "core",
+      "type": "array",
+      "value": []
+    },
+    {
+      "description": "Maximum number of linker processes to run or 0 for no limit",
+      "machine": "any",
+      "name": "backend_max_links",
+      "section": "backend",
+      "type": "integer",
+      "value": 0
+    },
+    {
+      "description": "Use -Wl,--as-needed when linking",
+      "machine": "any",
+      "name": "b_asneeded",
+      "section": "base",
+      "type": "boolean",
+      "value": true
+    },
+    {
+      "choices": [
+        "true",
+        "false",
+        "if-release"
+      ],
+      "description": "Disable asserts",
+      "machine": "any",
+      "name": "b_ndebug",
+      "section": "base",
+      "type": "combo",
+      "value": "false"
+    },
+    {
+      "description": "Code sanitizer to use",
+      "machine": "any",
+      "name": "b_sanitize",
+      "section": "base",
+      "type": "array",
+      "value": [
+        "none"
+      ]
+    },
+    {
+      "description": "Directory to store ThinLTO cache objects",
+      "machine": "any",
+      "name": "b_thinlto_cache_dir",
+      "section": "base",
+      "type": "string",
+      "value": ""
+    },
+    {
+      "description": "Build executables as position independent",
+      "machine": "any",
+      "name": "b_pie",
+      "section": "base",
+      "type": "boolean",
+      "value": false
+    },
+    {
+      "description": "Use precompiled headers",
+      "machine": "any",
+      "name": "b_pch",
+      "section": "base",
+      "type": "boolean",
+      "value": true
+    },
+    {
+      "description": "Use multiple threads for Link Time Optimization",
+      "machine": "any",
+      "name": "b_lto_threads",
+      "section": "base",
+      "type": "integer",
+      "value": 0
+    },
+    {
+      "description": "Enable coverage tracking.",
+      "machine": "any",
+      "name": "b_coverage",
+      "section": "base",
+      "type": "boolean",
+      "value": false
+    },
+    {
+      "description": "Use LLVM ThinLTO caching for faster incremental builds",
+      "machine": "any",
+      "name": "b_thinlto_cache",
+      "section": "base",
+      "type": "boolean",
+      "value": false
+    },
+    {
+      "description": "Build static libraries as position independent",
+      "machine": "any",
+      "name": "b_staticpic",
+      "section": "base",
+      "type": "boolean",
+      "value": true
+    },
+    {
+      "choices": [
+        "auto",
+        "always",
+        "never"
+      ],
+      "description": "Use colored output",
+      "machine": "any",
+      "name": "b_colorout",
+      "section": "base",
+      "type": "combo",
+      "value": "always"
+    },
+    {
+      "description": "Use -Wl,--no-undefined when linking",
+      "machine": "any",
+      "name": "b_lundef",
+      "section": "base",
+      "type": "boolean",
+      "value": true
+    },
+    {
+      "description": "Use link time optimization",
+      "machine": "any",
+      "name": "b_lto",
+      "section": "base",
+      "type": "boolean",
+      "value": true
+    },
+    {
+      "choices": [
+        "off",
+        "generate",
+        "use"
+      ],
+      "description": "Use profile guided optimization",
+      "machine": "any",
+      "name": "b_pgo",
+      "section": "base",
+      "type": "combo",
+      "value": "off"
+    },
+    {
+      "description": "Extra arguments passed to the c compiler",
+      "machine": "host",
+      "name": "c_args",
+      "section": "compiler",
+      "type": "array",
+      "value": []
+    },
+    {
+      "description": "Extra arguments passed to the c linker",
+      "machine": "host",
+      "name": "c_link_args",
+      "section": "compiler",
+      "type": "array",
+      "value": []
+    },
+    {
+      "choices": [
+        "none",
+        "c89",
+        "c99",
+        "c11",
+        "c17",
+        "c18",
+        "c2x",
+        "c23",
+        "c2y",
+        "gnu89",
+        "gnu99",
+        "gnu11",
+        "gnu17",
+        "gnu18",
+        "gnu2x",
+        "gnu23",
+        "gnu2y"
+      ],
+      "description": "c language standard to use",
+      "machine": "host",
+      "name": "c_std",
+      "section": "compiler",
+      "type": "combo",
+      "value": "none"
+    },
+    {
+      "description": "Extra arguments passed to the cpp compiler",
+      "machine": "host",
+      "name": "cpp_args",
+      "section": "compiler",
+      "type": "array",
+      "value": []
+    },
+    {
+      "description": "Extra arguments passed to the cpp linker",
+      "machine": "host",
+      "name": "cpp_link_args",
+      "section": "compiler",
+      "type": "array",
+      "value": []
+    },
+    {
+      "choices": [
+        "none",
+        "c++98",
+        "c++03",
+        "c++11",
+        "c++14",
+        "c++17",
+        "c++1z",
+        "c++2a",
+        "c++20",
+        "c++23",
+        "c++26",
+        "gnu++98",
+        "gnu++03",
+        "gnu++11",
+        "gnu++14",
+        "gnu++17",
+        "gnu++1z",
+        "gnu++2a",
+        "gnu++20",
+        "gnu++23",
+        "gnu++26"
+      ],
+      "description": "cpp language standard to use",
+      "machine": "host",
+      "name": "cpp_std",
+      "section": "compiler",
+      "type": "combo",
+      "value": "none"
+    },
+    {
+      "choices": [
+        "none",
+        "default",
+        "a",
+        "s",
+        "sc"
+      ],
+      "description": "C++ exception handling type.",
+      "machine": "host",
+      "name": "cpp_eh",
+      "section": "compiler",
+      "type": "combo",
+      "value": "default"
+    },
+    {
+      "description": "Enable RTTI",
+      "machine": "host",
+      "name": "cpp_rtti",
+      "section": "compiler",
+      "type": "boolean",
+      "value": true
+    },
+    {
+      "description": "STL debug mode",
+      "machine": "host",
+      "name": "cpp_debugstl",
+      "section": "compiler",
+      "type": "boolean",
+      "value": false
+    },
+    {
+      "choices": [
+        "false",
+        "true"
+      ],
+      "description": "Use #import std.",
+      "machine": "host",
+      "name": "cpp_importstd",
+      "section": "compiler",
+      "type": "combo",
+      "value": "false"
+    },
+    {
+      "description": "Installation prefix",
+      "machine": "any",
+      "name": "prefix",
+      "section": "directory",
+      "type": "string",
+      "value": "/usr/local"
+    },
+    {
+      "description": "Executable directory",
+      "machine": "any",
+      "name": "bindir",
+      "section": "directory",
+      "type": "string",
+      "value": "bin"
+    },
+    {
+      "description": "Data file directory",
+      "machine": "any",
+      "name": "datadir",
+      "section": "directory",
+      "type": "string",
+      "value": "share"
+    },
+    {
+      "description": "Header file directory",
+      "machine": "any",
+      "name": "includedir",
+      "section": "directory",
+      "type": "string",
+      "value": "include"
+    },
+    {
+      "description": "Info page directory",
+      "machine": "any",
+      "name": "infodir",
+      "section": "directory",
+      "type": "string",
+      "value": "share/info"
+    },
+    {
+      "description": "Library directory",
+      "machine": "any",
+      "name": "libdir",
+      "section": "directory",
+      "type": "string",
+      "value": "lib"
+    },
+    {
+      "description": "Licenses directory",
+      "machine": "any",
+      "name": "licensedir",
+      "section": "directory",
+      "type": "string",
+      "value": ""
+    },
+    {
+      "description": "Library executable directory",
+      "machine": "any",
+      "name": "libexecdir",
+      "section": "directory",
+      "type": "string",
+      "value": "libexec"
+    },
+    {
+      "description": "Locale data directory",
+      "machine": "any",
+      "name": "localedir",
+      "section": "directory",
+      "type": "string",
+      "value": "share/locale"
+    },
+    {
+      "description": "Localstate data directory",
+      "machine": "any",
+      "name": "localstatedir",
+      "section": "directory",
+      "type": "string",
+      "value": "/var/local"
+    },
+    {
+      "description": "Manual page directory",
+      "machine": "any",
+      "name": "mandir",
+      "section": "directory",
+      "type": "string",
+      "value": "share/man"
+    },
+    {
+      "description": "System executable directory",
+      "machine": "any",
+      "name": "sbindir",
+      "section": "directory",
+      "type": "string",
+      "value": "sbin"
+    },
+    {
+      "description": "Architecture-independent data directory",
+      "machine": "any",
+      "name": "sharedstatedir",
+      "section": "directory",
+      "type": "string",
+      "value": "/var/local/lib"
+    },
+    {
+      "description": "Sysconf data directory",
+      "machine": "any",
+      "name": "sysconfdir",
+      "section": "directory",
+      "type": "string",
+      "value": "etc"
+    },
+    {
+      "description": "Enable embedded mode (minimal dependencies, smaller binary)",
+      "machine": "any",
+      "name": "embedded",
+      "section": "user",
+      "type": "boolean",
+      "value": false
+    },
+    {
+      "choices": [
+        "disabled",
+        "enabled"
+      ],
+      "description": "Enable Arrow IPC support (for data serialization and network transport)",
+      "machine": "any",
+      "name": "ipc",
+      "section": "user",
+      "type": "combo",
+      "value": "disabled"
+    },
+    {
+      "choices": [
+        "native",
+        "posix"
+      ],
+      "description": "Threading backend: native (auto-detect C11/POSIX) or posix (force pthreads, required for TSan)",
+      "machine": "any",
+      "name": "threads",
+      "section": "user",
+      "type": "combo",
+      "value": "native"
+    },
+    {
+      "description": "Build and run tests",
+      "machine": "any",
+      "name": "tests",
+      "section": "user",
+      "type": "boolean",
+      "value": true
+    },
+    {
+      "description": "Build parser fuzz target and corpus smoke test when using Clang/libFuzzer (Issue #743)",
+      "machine": "any",
+      "name": "enable_fuzz",
+      "section": "user",
+      "type": "boolean",
+      "value": false
+    },
+    {
+      "description": "Build documentation (not yet implemented)",
+      "machine": "any",
+      "name": "documentation",
+      "section": "user",
+      "type": "boolean",
+      "value": false
+    },
+    {
+      "choices": [
+        "ethernet",
+        "castagnoli"
+      ],
+      "description": "Default CRC-32 variant: ethernet (standard) or castagnoli (iSCSI)",
+      "machine": "any",
+      "name": "crc32_variant",
+      "section": "user",
+      "type": "combo",
+      "value": "ethernet"
+    },
+    {
+      "choices": [
+        "disabled",
+        "enabled"
+      ],
+      "description": "Enable optional CLI plugin loader via dlopen (Issue #461). Excluded from Android/iOS.",
+      "machine": "any",
+      "name": "io_plugin_dlopen",
+      "section": "user",
+      "type": "combo",
+      "value": "disabled"
+    },
+    {
+      "description": "Build for Android (NDK cross-compile, Issue #464). When true: excludes wirelog_cli, adds -Wl,-z,max-page-size=16384 on aarch64 for 16 KB page compatibility (Android 14+). Symbol visibility remains hidden -- WIRELOG_API on public headers already covers Android exports. Use with meson --cross-file cross/android-arm64.ini (or android-x86_64.ini).",
+      "machine": "any",
+      "name": "android",
+      "section": "user",
+      "type": "boolean",
+      "value": false
+    },
+    {
+      "description": "Build for iOS. Disables executable targets and plugin loading, and applies Apple iOS target flags.",
+      "machine": "any",
+      "name": "ios",
+      "section": "user",
+      "type": "boolean",
+      "value": false
+    },
+    {
+      "choices": [
+        "disabled",
+        "enabled",
+        "auto"
+      ],
+      "description": "Use system-installed mbedTLS for cryptographic functions. auto=enabled if found, else disabled. Enabling links Apache-2.0 mbedTLS and brings cryptography into the build (see docs/SECURITY_MODEL.md): the artifact then carries ECCN 5D002.c.1 under U.S. EAR; downstream redistributors are responsible for any export filings under their own jurisdiction. Default-disabled builds carry no cryptographic code (EAR99).",
+      "machine": "any",
+      "name": "mbedTLS",
+      "section": "user",
+      "type": "combo",
+      "value": "disabled"
+    },
+    {
+      "description": "Explicit single-prefix metadata-free mbedTLS installation to use after pkg-config/CMake discovery fails (native builds only).",
+      "machine": "any",
+      "name": "mbedTLS_prefix",
+      "section": "user",
+      "type": "string",
+      "value": ""
+    },
+    {
+      "choices": [
+        "error",
+        "warn",
+        "info",
+        "debug",
+        "trace"
+      ],
+      "description": "Compile-time ceiling for WL_LOG() (Issue #287). Set to \"error\" in release for zero-cost disabled TRACE/DEBUG/INFO/WARN sites.",
+      "machine": "any",
+      "name": "wirelog_log_max_level",
+      "section": "user",
+      "type": "combo",
+      "value": "error"
+    },
+    {
+      "choices": [
+        "enabled",
+        "disabled",
+        "auto"
+      ],
+      "description": "Build utility applications",
+      "machine": "any",
+      "name": "nanoarrow:apps",
+      "section": "user",
+      "type": "combo",
+      "value": "disabled"
+    },
+    {
+      "choices": [
+        "enabled",
+        "disabled",
+        "auto"
+      ],
+      "description": "Build benchmarks",
+      "machine": "any",
+      "name": "nanoarrow:benchmarks",
+      "section": "user",
+      "type": "combo",
+      "value": "auto"
+    },
+    {
+      "choices": [
+        "enabled",
+        "disabled",
+        "auto"
+      ],
+      "description": "Build CUDA libraries",
+      "machine": "any",
+      "name": "nanoarrow:cuda",
+      "section": "user",
+      "type": "combo",
+      "value": "auto"
+    },
+    {
+      "choices": [
+        "enabled",
+        "disabled",
+        "auto"
+      ],
+      "description": "Build device libraries",
+      "machine": "any",
+      "name": "nanoarrow:device",
+      "section": "user",
+      "type": "combo",
+      "value": "disabled"
+    },
+    {
+      "choices": [
+        "enabled",
+        "disabled",
+        "auto"
+      ],
+      "description": "Build cross-implementation Arrow integration tests",
+      "machine": "any",
+      "name": "nanoarrow:integration_tests",
+      "section": "user",
+      "type": "combo",
+      "value": "auto"
+    },
+    {
+      "choices": [
+        "enabled",
+        "disabled",
+        "auto"
+      ],
+      "description": "Build IPC libraries",
+      "machine": "any",
+      "name": "nanoarrow:ipc",
+      "section": "user",
+      "type": "combo",
+      "value": "disabled"
+    },
+    {
+      "choices": [
+        "enabled",
+        "disabled",
+        "auto"
+      ],
+      "description": "Build IPC libraries with LZ4 compression support",
+      "machine": "any",
+      "name": "nanoarrow:ipc_with_lz4",
+      "section": "user",
+      "type": "combo",
+      "value": "auto"
+    },
+    {
+      "choices": [
+        "enabled",
+        "disabled",
+        "auto"
+      ],
+      "description": "Build IPC libraries with ZSTD compression support",
+      "machine": "any",
+      "name": "nanoarrow:ipc_with_zstd",
+      "section": "user",
+      "type": "combo",
+      "value": "auto"
+    },
+    {
+      "choices": [
+        "enabled",
+        "disabled",
+        "auto"
+      ],
+      "description": "Build Apple metal libraries",
+      "machine": "any",
+      "name": "nanoarrow:metal",
+      "section": "user",
+      "type": "combo",
+      "value": "auto"
+    },
+    {
+      "description": "A prefix for exported symbols",
+      "machine": "any",
+      "name": "nanoarrow:namespace",
+      "section": "user",
+      "type": "string",
+      "value": ""
+    },
+    {
+      "choices": [
+        "enabled",
+        "disabled",
+        "auto"
+      ],
+      "description": "Build testing libraries",
+      "machine": "any",
+      "name": "nanoarrow:testing",
+      "section": "user",
+      "type": "combo",
+      "value": "disabled"
+    },
+    {
+      "choices": [
+        "enabled",
+        "disabled",
+        "auto"
+      ],
+      "description": "Build tests",
+      "machine": "any",
+      "name": "nanoarrow:tests",
+      "section": "user",
+      "type": "combo",
+      "value": "disabled"
+    },
+    {
+      "choices": [
+        "enabled",
+        "disabled",
+        "auto"
+      ],
+      "description": "Build tests with Arrow",
+      "machine": "any",
+      "name": "nanoarrow:tests_with_arrow",
+      "section": "user",
+      "type": "combo",
+      "value": "auto"
+    },
+    {
+      "description": "Switch multi-branch finalization stage of XXH32 by a single jump",
+      "machine": "any",
+      "name": "xxhash:32-endjmp",
+      "section": "user",
+      "type": "boolean",
+      "value": false
+    },
+    {
+      "description": "Build the CLI",
+      "machine": "any",
+      "name": "xxhash:cli",
+      "section": "user",
+      "type": "boolean",
+      "value": true
+    },
+    {
+      "choices": [
+        "enabled",
+        "disabled",
+        "auto"
+      ],
+      "description": "Force endianness",
+      "machine": "any",
+      "name": "xxhash:cpu-little-endian",
+      "section": "user",
+      "type": "combo",
+      "value": "auto"
+    },
+    {
+      "description": "See DISPATCH=1 for information about xxh_x86dispatch.c",
+      "machine": "any",
+      "name": "xxhash:dispatch",
+      "section": "user",
+      "type": "boolean",
+      "value": false
+    },
+    {
+      "choices": [
+        "enabled",
+        "disabled",
+        "auto"
+      ],
+      "description": "Use a faster direct read path when input is aligned",
+      "machine": "any",
+      "name": "xxhash:force-align-check",
+      "section": "user",
+      "type": "combo",
+      "value": "auto"
+    },
+    {
+      "choices": [
+        "default",
+        "attribute",
+        "unaligned-reads",
+        "byteshift"
+      ],
+      "description": "See XXH_FORCE_MEMORY_ACCESS",
+      "machine": "any",
+      "name": "xxhash:force-memory-access",
+      "section": "user",
+      "type": "combo",
+      "value": "default"
+    },
+    {
+      "description": "Make all functions inline",
+      "machine": "any",
+      "name": "xxhash:inline-all",
+      "section": "user",
+      "type": "boolean",
+      "value": false
+    },
+    {
+      "choices": [
+        "enabled",
+        "disabled",
+        "auto"
+      ],
+      "description": "See XXH_NO_INLINE_HINTS",
+      "machine": "any",
+      "name": "xxhash:inline-hints",
+      "section": "user",
+      "type": "combo",
+      "value": "auto"
+    },
+    {
+      "description": "Include compilation of algorithms relying on 64-bit types",
+      "machine": "any",
+      "name": "xxhash:long-long",
+      "section": "user",
+      "type": "boolean",
+      "value": true
+    },
+    {
+      "description": "Prefixes all symbols with the value of XXH_NAMESPACE",
+      "machine": "any",
+      "name": "xxhash:namespace",
+      "section": "user",
+      "type": "string",
+      "value": ""
+    },
+    {
+      "description": "Disable prefetching. XXH3 only",
+      "machine": "any",
+      "name": "xxhash:prefetch",
+      "section": "user",
+      "type": "boolean",
+      "value": true
+    },
+    {
+      "description": "Select prefetching distance. XXH3 only",
+      "machine": "any",
+      "name": "xxhash:prefetch-dist",
+      "section": "user",
+      "type": "integer",
+      "value": 0
+    },
+    {
+      "choices": [
+        "default",
+        "scalar",
+        "sse2",
+        "avx2",
+        "avx512",
+        "neon",
+        "vsx"
+      ],
+      "description": "Manually select a vector instruction set",
+      "machine": "any",
+      "name": "xxhash:vector",
+      "section": "user",
+      "type": "combo",
+      "value": "default"
+    },
+    {
+      "description": "Removes symbols related to XXH3 (both 64 & 128 bits) from generated binary",
+      "machine": "any",
+      "name": "xxhash:xxh3",
+      "section": "user",
+      "type": "boolean",
+      "value": true
+    },
+    {
+      "description": "Whether to print the logs from failing tests",
+      "machine": "any",
+      "name": "errorlogs",
+      "section": "test",
+      "type": "boolean",
+      "value": true
+    },
+    {
+      "description": "Split stdout and stderr in test logs",
+      "machine": "any",
+      "name": "stdsplit",
+      "section": "test",
+      "type": "boolean",
+      "value": true
+    }
+  ],
+  "microcode": [
+    "0xb000014"
+  ],
+  "runner_sha256": "9e0d2493f9b9bfa47d88eddc3cae5f2e258e2361718ea702ba0ad3b0cf1ab1a4",
+  "smt_active": "1\n",
+  "source_sha": "afcdd8a3f05f67daaeb003c7acd25e96e2433419",
+  "source_tree": "c32d74dc431012ffe039b8c6379ed8e9dae891a2",
+  "turbo_disabled": "0\n",
+  "uname": [
+    "Linux",
+    "u6332-v2",
+    "7.2.6-arch2-1",
+    "#1 SMP PREEMPT_DYNAMIC Mon, 14 Sep 2026 22:41:30 +0000",
+    "x86_64",
+    ""
+  ]
+}

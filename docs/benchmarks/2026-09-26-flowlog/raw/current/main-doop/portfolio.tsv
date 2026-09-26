@@ -1,0 +1,4 @@
+status	reason	workload	workers	repeat	return_code	duration_sec	median_ms	tuples	iterations	peak_rss_kb	ledger_peak_bytes	ledger_worker_peak_max_bytes	command
+ok		doop	1	1	0	4678.91	4.67787e+06	13828835	153	54650456	69636305476	0	/home/joykim/tmp/wirelog-1972-current-afcdd8a3/build-portfolio/bench/bench_flowlog --workload doop --data-doop /home/joykim/tmp/wirelog-1361-data/doop --workers 1 --repeat 1 --format json
+ok		doop	8	1	0	2872.52	2.87156e+06	13828835	153	56482112	32995332400	65841644	/home/joykim/tmp/wirelog-1972-current-afcdd8a3/build-portfolio/bench/bench_flowlog --workload doop --data-doop /home/joykim/tmp/wirelog-1361-data/doop --workers 8 --repeat 1 --format json
+ok		doop	16	1	0	2848.91	2.84792e+06	13828835	153	56556656	32995332400	65841644	/home/joykim/tmp/wirelog-1972-current-afcdd8a3/build-portfolio/bench/bench_flowlog --workload doop --data-doop /home/joykim/tmp/wirelog-1361-data/doop --workers 16 --repeat 1 --format json
