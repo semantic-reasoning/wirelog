@@ -1,0 +1,79 @@
+{
+  "args": {
+    "repeat": 1,
+    "tier": "smoke",
+    "workers": [
+      1,
+      8,
+      16
+    ],
+    "workloads": [
+      "doop"
+    ]
+  },
+  "artifacts": {
+    "failures_jsonl": "failures.jsonl",
+    "manifest": "manifest.json",
+    "portfolio_jsonl": "portfolio.jsonl",
+    "portfolio_tsv": "portfolio.tsv",
+    "progress_jsonl": "progress.jsonl"
+  },
+  "bench_executable": true,
+  "bench_exists": true,
+  "bench_path": "/home/joykim/tmp/wirelog-1972-current-afcdd8a3/build-portfolio/bench/bench_flowlog",
+  "data_root": "/home/joykim/tmp/wirelog-1361-data",
+  "duration_sec": 10400.382277,
+  "ended_at": "2026-09-26T13:54:59+00:00",
+  "kind": "wirelog-flowlog-portfolio",
+  "output_dir": "/home/joykim/tmp/wirelog-1972-current-campaign/main-doop",
+  "platform": {
+    "machine": "x86_64",
+    "processor": "",
+    "release": "7.2.6-arch2-1",
+    "system": "Linux"
+  },
+  "python": {
+    "executable": "/dev/shm/wirelog-1361/.venv/bin/python",
+    "version": "3.14.7"
+  },
+  "record_count": 3,
+  "repo": {
+    "dirty": false,
+    "sha": "afcdd8a3f05f67daaeb003c7acd25e96e2433419"
+  },
+  "repo_root": "/home/joykim/tmp/wirelog-1972-current-afcdd8a3",
+  "run_complete": true,
+  "run_status": "complete",
+  "schema_version": 1,
+  "started_at": "2026-09-26T11:01:38+00:00",
+  "status_counts": {
+    "ok": 3
+  },
+  "tier_definition": {
+    "description": "cheap local validation tier",
+    "excluded_reason": "smoke tier keeps local validation fast",
+    "excluded_workloads": [
+      "tc",
+      "reach",
+      "cc",
+      "sssp",
+      "sg",
+      "bipartite",
+      "andersen",
+      "dyck",
+      "cspa-fast",
+      "cspa",
+      "csda",
+      "galen",
+      "polonius",
+      "ddisasm",
+      "crdt"
+    ],
+    "readme_command_count": 16,
+    "tier": "smoke",
+    "workload_count": 1,
+    "workloads": [
+      "doop"
+    ]
+  }
+}

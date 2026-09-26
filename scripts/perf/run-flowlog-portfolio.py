@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import math
+import os
 import platform
 import subprocess
 import sys
@@ -266,6 +269,62 @@ def parse_bench_json(stdout: str) -> tuple[dict[str, Any] | None, str | None]:
     return parsed, None
 
 
+def parse_bench_tsv(stdout: str) -> tuple[dict[str, Any] | None, str | None]:
+    columns = [
+        "workload",
+        "nodes",
+        "edges",
+        "workers",
+        "repeat",
+        "min_ms",
+        "median_ms",
+        "max_ms",
+        "peak_rss_kb",
+        "tuples",
+        "iterations",
+        "status",
+    ]
+    lines = [line for line in stdout.splitlines() if line.strip()]
+    if lines and lines[0].split("\t") == columns:
+        lines.pop(0)
+    if len(lines) != 1:
+        return None, f"expected one benchmark TSV row, found {len(lines)}"
+    fields = lines[0].split("\t")
+    if len(fields) != len(columns):
+        return None, f"benchmark TSV row has {len(fields)} fields, expected {len(columns)}"
+    row = dict(zip(columns, fields, strict=True))
+    if row["status"] != "OK":
+        return None, f"benchmark TSV status is {row['status']!r}"
+    try:
+        for name in ("nodes", "edges"):
+            if row[name] != "-" and parse_int(row[name]) < 0:
+                raise ValueError(f"{name} must be nonnegative or '-'")
+        workers = parse_int(row["workers"])
+        repeat = parse_int(row["repeat"])
+        peak_rss_kb = parse_int(row["peak_rss_kb"])
+        tuples = parse_int(row["tuples"])
+        iterations = parse_int(row["iterations"])
+        timings = [parse_float(row[name]) for name in ("min_ms", "median_ms", "max_ms")]
+    except ValueError as exc:
+        return None, f"invalid benchmark TSV metric: {exc}"
+    if workers <= 0 or repeat <= 0 or peak_rss_kb < 0 or tuples < 0 or iterations < 0:
+        return None, "benchmark TSV counts must be positive or nonnegative"
+    if any(not math.isfinite(value) or value < 0 for value in timings):
+        return None, "benchmark TSV timings must be finite nonnegative numbers"
+    if timings != sorted(timings):
+        return None, "benchmark TSV must satisfy min <= median <= max"
+    return {
+        "workload": row["workload"],
+        "workers": workers,
+        "repeat": repeat,
+        "tuples": tuples,
+        "iterations": iterations,
+        "peak_rss_kb": peak_rss_kb,
+        "wall_time_ms": dict(zip(("min", "median", "max"), timings, strict=True)),
+        "bench_status": row["status"],
+    }, None
+
+
 def parse_int(value: str) -> int:
     return int(value, 10)
 
@@ -291,9 +350,10 @@ def parse_cspa_incremental_tsv(stdout: str) -> tuple[dict[str, Any] | None, str 
         ("bench_status", str),
     ]
 
-    for line in reversed(stdout.splitlines()):
-        if not line.startswith("cspa_incr\t"):
-            continue
+    rows = [line for line in stdout.splitlines() if line.startswith("cspa_incr\t")]
+    if len(rows) > 1:
+        return None, f"expected one cspa_incr TSV row, found {len(rows)}"
+    for line in rows:
         fields = line.split("\t")
         if len(fields) != len(columns):
             return None, f"cspa_incr row has {len(fields)} fields, expected {len(columns)}"
@@ -304,6 +364,27 @@ def parse_cspa_incremental_tsv(stdout: str) -> tuple[dict[str, Any] | None, str 
                 parsed[name] = converter(value)
         except ValueError as exc:
             return None, f"invalid cspa_incr field: {exc}"
+        if parsed["workload"] != "cspa_incr" or parsed["bench_status"] != "OK":
+            return None, "cspa_incr row has unexpected workload or status"
+        for name in (
+            "facts",
+            "tuples_before",
+            "tuples_after",
+            "iters_before",
+            "iters_after",
+            "peak_rss_kb",
+        ):
+            if parsed[name] < 0:
+                return None, f"cspa_incr field {name} is negative"
+        for name in (
+            "baseline_ms",
+            "initial_ms",
+            "insert_ms",
+            "reeval_ms",
+            "speedup",
+        ):
+            if not math.isfinite(parsed[name]) or parsed[name] < 0:
+                return None, f"cspa_incr field {name} is not a finite nonnegative number"
         return parsed, None
 
     return None, "missing cspa_incr TSV row"
@@ -315,11 +396,60 @@ def parse_bench_output(
 ) -> tuple[dict[str, Any] | None, str | None, str]:
     if parser == "json":
         parsed, error = parse_bench_json(stdout)
-        return parsed, error, "json_parse_failed"
+        if error is None:
+            return parsed, None, "json_parse_failed"
+        tsv, tsv_error = parse_bench_tsv(stdout)
+        if tsv_error is None:
+            return tsv, None, "json_parse_failed"
+        return None, f"JSON: {error}; TSV: {tsv_error}", "bench_output_parse_failed"
     if parser == "cspa_incremental_tsv":
         parsed, error = parse_cspa_incremental_tsv(stdout)
         return parsed, error, "tsv_parse_failed"
     return None, f"unknown parser: {parser}", "parse_failed"
+
+
+def expected_bench_workload(workload: str) -> str:
+    # The CLI exposes the static benchmark as cspa-fast, while its stable
+    # machine-readable identity is cspa (also documented in README.md).
+    return "cspa" if workload == "cspa-fast" else workload
+
+
+def validate_bench_json(
+    parsed: dict[str, Any], workload: str, workers: int, repeat: int
+) -> str | None:
+    expected_workload = expected_bench_workload(workload)
+    if parsed.get("workload") != expected_workload:
+        return f"bench workload identity mismatch: expected {expected_workload!r}"
+    actual_workers = parsed.get("workers")
+    actual_repeat = parsed.get("repeat")
+    if (
+        isinstance(actual_workers, bool)
+        or not isinstance(actual_workers, int)
+        or actual_workers != workers
+        or isinstance(actual_repeat, bool)
+        or not isinstance(actual_repeat, int)
+        or actual_repeat != repeat
+    ):
+        return "bench worker/repeat identity mismatch"
+    for name in ("tuples", "iterations", "peak_rss_kb"):
+        value = parsed.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return f"bench field {name} must be a nonnegative integer"
+    wall = parsed.get("wall_time_ms")
+    if not isinstance(wall, dict):
+        return "bench wall_time_ms must be an object"
+    samples = [wall.get(name) for name in ("min", "median", "max")]
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+        for value in samples
+    ):
+        return "bench wall_time_ms min/median/max must be finite nonnegative numbers"
+    if samples != sorted(samples):
+        return "bench wall_time_ms must satisfy min <= median <= max"
+    return None
 
 
 def summarize_bench(parsed: dict[str, Any] | None) -> dict[str, Any]:
@@ -428,10 +558,9 @@ def run_one(
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
         )
+        stdout = proc.stdout.decode("utf-8", errors="replace")
+        stderr = proc.stderr.decode("utf-8", errors="replace")
         duration = time.monotonic() - t0
         ended = utc_now()
     except OSError as exc:
@@ -454,7 +583,14 @@ def run_one(
         }
 
     parser = spec.get("parser", "json") if spec else "json"
-    parsed, parse_error, parse_reason = parse_bench_output(parser, proc.stdout)
+    parsed, parse_error, parse_reason = parse_bench_output(parser, stdout)
+    if parse_error is None and isinstance(parsed, dict):
+        if parser == "json":
+            parse_error = validate_bench_json(parsed, workload, workers, repeat)
+        elif parsed.get("workload") != "cspa_incr":
+            parse_error = "bench workload identity mismatch: expected 'cspa_incr'"
+        if parse_error is not None:
+            parse_reason = "invalid_bench_record"
     bench_status = parsed.get("bench_status") if isinstance(parsed, dict) else None
     parser_ok = parse_error is None and (bench_status in (None, "OK"))
     status = "ok" if proc.returncode == 0 and parser_ok else "fail"
@@ -481,8 +617,12 @@ def run_one(
         "return_code": proc.returncode,
         "bench": parsed,
         "summary": summarize_bench(parsed),
-        "stderr_tail": proc.stderr[-4000:] if proc.stderr else "",
-        "stdout_tail": proc.stdout[-4000:] if status != "ok" else "",
+        "stderr_tail": stderr[-4000:] if stderr else "",
+        "stdout_tail": stdout[-4000:] if status != "ok" else "",
+        "raw_stdout": stdout,
+        "raw_stderr": stderr,
+        "raw_stdout_base64": base64.b64encode(proc.stdout).decode("ascii"),
+        "raw_stderr_base64": base64.b64encode(proc.stderr).decode("ascii"),
     }
 
 
@@ -491,6 +631,24 @@ def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
         for record in records:
             f.write(json.dumps(record, sort_keys=True, separators=(",", ":")))
             f.write("\n")
+
+
+def append_jsonl_durable(path: Path, record: dict[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, sort_keys=True, separators=(",", ":")))
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as f:
+        json.dump(value, f, indent=2, sort_keys=True)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    temporary.replace(path)
 
 
 def tsv_value(value: Any) -> str:
@@ -545,6 +703,21 @@ def write_tsv(path: Path, records: list[dict[str, Any]]) -> None:
             f.write("\n")
 
 
+def flag_worker_result_mismatches(records: list[dict[str, Any]]) -> None:
+    grouped: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for record in records:
+        if record.get("status") == "ok":
+            grouped.setdefault((record["workload"], record["repeat"]), []).append(record)
+    for (workload, repeat), group in grouped.items():
+        tuple_counts = {record["summary"].get("tuples") for record in group}
+        if len(group) > 1 and (None in tuple_counts or len(tuple_counts) != 1):
+            detail = "tuple counts differ across worker counts"
+            for record in group:
+                record["status"] = "fail"
+                record["reason"] = "worker_result_mismatch"
+                record["detail"] = detail
+
+
 def build_manifest(
     args: argparse.Namespace,
     repo_root: Path,
@@ -555,6 +728,7 @@ def build_manifest(
     ended_at: str,
     duration_sec: float,
     records: list[dict[str, Any]],
+    run_status: str,
 ) -> dict[str, Any]:
     status_counts = Counter(record["status"] for record in records)
     return {
@@ -563,6 +737,8 @@ def build_manifest(
         "started_at": started_at,
         "ended_at": ended_at,
         "duration_sec": round(duration_sec, 6),
+        "run_status": run_status,
+        "run_complete": run_status == "complete",
         "repo": git_metadata(repo_root),
         "repo_root": str(repo_root),
         "data_root": str(data_root),
@@ -596,6 +772,7 @@ def build_manifest(
             "portfolio_jsonl": "portfolio.jsonl",
             "portfolio_tsv": "portfolio.tsv",
             "failures_jsonl": "failures.jsonl",
+            "progress_jsonl": "progress.jsonl",
         },
     }
 
@@ -685,19 +862,47 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     workloads = selected_workloads(args)
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    artifact_names = (
+        "manifest.json",
+        "manifest.json.tmp",
+        "portfolio.jsonl",
+        "portfolio.tsv",
+        "failures.jsonl",
+        "progress.jsonl",
+    )
+    existing = [name for name in artifact_names if (args.out_dir / name).exists()]
+    if existing:
+        print(
+            f"refusing to overwrite existing portfolio artifacts in {args.out_dir}: "
+            + ", ".join(existing),
+            file=sys.stderr,
+        )
+        return 2
 
     started_at = utc_now()
     t0 = time.monotonic()
     records: list[dict[str, Any]] = []
+    progress_path = args.out_dir / "progress.jsonl"
+    progress_path.write_text("", encoding="utf-8")
+    write_json_atomic(
+        args.out_dir / "manifest.json",
+        build_manifest(
+            args, args.repo_root, args.data_root, args.out_dir, workloads,
+            started_at, started_at, 0.0, records, "running",
+        ),
+    )
     for workload in workloads:
         for workers in args.workers:
             record = run_one(args.bench, args.data_root, workload, workers, args.repeat)
             records.append(record)
+            append_jsonl_durable(progress_path, record)
             print(
                 f"{record['status']}: workload={workload} workers={workers} "
                 f"reason={record.get('reason') or '-'}",
                 file=sys.stderr,
             )
+
+    flag_worker_result_mismatches(records)
 
     ended_at = utc_now()
     duration_sec = time.monotonic() - t0
@@ -712,15 +917,13 @@ def main(argv: list[str]) -> int:
         ended_at,
         duration_sec,
         records,
+        "complete",
     )
 
-    (args.out_dir / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
     write_jsonl(args.out_dir / "portfolio.jsonl", records)
     write_tsv(args.out_dir / "portfolio.tsv", records)
     write_jsonl(args.out_dir / "failures.jsonl", failures)
+    write_json_atomic(args.out_dir / "manifest.json", manifest)
 
     if any(record["status"] == "fail" for record in records):
         return 1

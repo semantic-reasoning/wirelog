@@ -1,0 +1,330 @@
+{
+  "andersen/addressOf.csv": {
+    "bytes": 346,
+    "sha256": "06dd1eba85020a9824db9c2d40e26777982bc8b9a8512acc81737598e73644ba"
+  },
+  "andersen/assign.csv": {
+    "bytes": 235,
+    "sha256": "4757f1daa384ba703475c527c0f16826e82d8a052f2334a26b384f42d931343e"
+  },
+  "andersen/load.csv": {
+    "bytes": 118,
+    "sha256": "0e52b4b5387bacb29d5dccc27c0288345f4374e484d2d875bed3eba08e4d24e9"
+  },
+  "andersen/store.csv": {
+    "bytes": 114,
+    "sha256": "42c4d7b13b56fbac8b9feb2cf21cb17c372417bffc80cdcef418fa9cb7f9a374"
+  },
+  "crdt/Insert_input.csv": {
+    "bytes": 3143972,
+    "sha256": "9147f2b44d4cb291336da9aa6c39c27feac8630361f2b36875474e5c30602b05"
+  },
+  "crdt/Remove_input.csv": {
+    "bytes": 650096,
+    "sha256": "b83fba0709b37259cd6ad00bfe3434abc3df3fec3dbccd3f5eedf273e9c921dc"
+  },
+  "csda/edge.csv": {
+    "bytes": 1985,
+    "sha256": "00ba6479c1f56763a2e513483eaf7bfd170d4d66a26af80619904301b2f8cecd"
+  },
+  "csda/nullEdge.csv": {
+    "bytes": 128,
+    "sha256": "07bf611deaea007e8626ce330002820dc6eb9c7506c52e8f1066181a20fbb193"
+  },
+  "cspa/assign.csv": {
+    "bytes": 1048,
+    "sha256": "10ee3e1a6388d6596cf4d437336c6215062554761156b9be22767dba86bb2032"
+  },
+  "cspa/dereference.csv": {
+    "bytes": 116,
+    "sha256": "c37127cbcf42cebb04296869cf16b029d60992706c98377e4536d3c9e5b06185"
+  },
+  "ddisasm/cond_jump.csv": {
+    "bytes": 100,
+    "sha256": "d7a51f5ab665d9128164911c7b9236d3eaa940acefeff07e829bc719b8898a29"
+  },
+  "ddisasm/direct_call.csv": {
+    "bytes": 160,
+    "sha256": "75f958229ee94a51fc8657a05c2bddea3c276103e9fb59d7573a92875676e0d1"
+  },
+  "ddisasm/direct_jump.csv": {
+    "bytes": 30,
+    "sha256": "87c7da67f8f78f7804e512f0be49669a28e2cab773f25841012333d562a7bf9f"
+  },
+  "ddisasm/entry_point.csv": {
+    "bytes": 5,
+    "sha256": "83c02ac2d48c863dab2ccf6870455aadfc2cec073b8db269b517c879d76aa6d9"
+  },
+  "ddisasm/instruction.csv": {
+    "bytes": 1246,
+    "sha256": "e2bddb845c9c8cc75f60fd787146bb2a35535a299e38dbdafb88c57ef5b9b52e"
+  },
+  "ddisasm/next.csv": {
+    "bytes": 1490,
+    "sha256": "4d51bbd03e07d440d203dc0a8be84a941f316c3a251f46265d657dd4c0077785"
+  },
+  "ddisasm/nop.csv": {
+    "bytes": 200,
+    "sha256": "6a0303936d22af2125b1c98f13fff1f6308114d58499cc21960c3fd01a77bcdb"
+  },
+  "ddisasm/return_inst.csv": {
+    "bytes": 75,
+    "sha256": "18b7f907d78d71796064db83b5c7ba375cc54e45d13d14866802b92276dbb13b"
+  },
+  "doop/ActualParam.facts": {
+    "bytes": 62717292,
+    "sha256": "8e19db08b648f7bad561e701a4bda035f6da0ebdda4902cd9910af6e1f60302f"
+  },
+  "doop/ApplicationClass.facts": {
+    "bytes": 38169,
+    "sha256": "69024c6daf8510c8bf6d35c11aa6aafdd2304733fabf3e8d9bd6c97212f1cd19"
+  },
+  "doop/ArrayType.facts": {
+    "bytes": 1312141,
+    "sha256": "f05836678f259c9cbfcbe3e61b3a87ab4f1faa0371e9f2f34d8ea22dd712017f"
+  },
+  "doop/AssignCast.facts": {
+    "bytes": 14221978,
+    "sha256": "7300d1b09ff47f10886fd6cc2f6a9df8c5c68d697373461a374aa30157f67203"
+  },
+  "doop/AssignHeapAllocation.facts": {
+    "bytes": 36303074,
+    "sha256": "ea485ce215ed34b59893eee50e364de1aaae37f244ab11ffdb0547c17f2bdf4f"
+  },
+  "doop/AssignLocal.facts": {
+    "bytes": 58071602,
+    "sha256": "d0af89c230718ac473aa6e442d8837dff81c9043f039b1683c9f395b99861ad5"
+  },
+  "doop/AssignReturnValue.facts": {
+    "bytes": 34906148,
+    "sha256": "981115a75813c1305b290534aaa8e4f596f9e4a1a8dbfcca100d17ee601b8234"
+  },
+  "doop/ClassHeap.facts": {
+    "bytes": 863176,
+    "sha256": "abcb0a17ec9cb80463b7b21da860663c64a88d479419a15e7f889e345d45a02e"
+  },
+  "doop/ClassType.facts": {
+    "bytes": 296389,
+    "sha256": "6e312943fc1fd5db68296eb8b66659e510de021671e4dc49543189abaa6fa665"
+  },
+  "doop/ComponentType.facts": {
+    "bytes": 2449526,
+    "sha256": "8dfc3fd6226d6ca44e457bb3fa631e2c46f875522afb8ef82b9a1fa2285e6196"
+  },
+  "doop/DirectSuperclass.facts": {
+    "bytes": 481183,
+    "sha256": "9780486901277b3277bf4f2dd97cc050334aca98288fa435391f924f623cb312"
+  },
+  "doop/DirectSuperinterface.facts": {
+    "bytes": 260973,
+    "sha256": "a7141429e03634c569242e0e7cb37e83f27610961c593403a2dd0df729d64949"
+  },
+  "doop/Field.facts": {
+    "bytes": 27195678,
+    "sha256": "8ee7c662609772e9ec72777bb0dbeb79690b666cb8c60decf1de20f93c4ad7ec"
+  },
+  "doop/FormalParam.facts": {
+    "bytes": 18043016,
+    "sha256": "bd3ecd5a3d8cfe16fd22a7ec2f81d987256afd2ff6d54ca4014e94c6a0238451"
+  },
+  "doop/InterfaceType.facts": {
+    "bytes": 28712,
+    "sha256": "6f716ca2e2e06f3a22093125fe9f5de5af23b821be76affa81b8b52940af0606"
+  },
+  "doop/LoadArrayIndex.facts": {
+    "bytes": 6508747,
+    "sha256": "866ff290e11de22ed08b09e2ba69a40c5178c7b952ff50d4ced2a057e41a13b3"
+  },
+  "doop/LoadInstanceField.facts": {
+    "bytes": 45898799,
+    "sha256": "f143bec1d5e2ff9b7f8a21c2dc0e088b88468731f84448877998ce21d418b744"
+  },
+  "doop/LoadStaticField.facts": {
+    "bytes": 10987635,
+    "sha256": "5e689283b232b6bfd49142902c7926cf3693791cf99aa240bb1ea7d20811029a"
+  },
+  "doop/MainClass.facts": {
+    "bytes": 47,
+    "sha256": "70b471d14e37ac8e8b6f1b9315beecef9f9cfe0dbfbb5a1da4b1f6c0a887b86e"
+  },
+  "doop/Method-Modifier.facts": {
+    "bytes": 8600087,
+    "sha256": "855cbc72eea7dc6f3b1945ac42478750d7f2b6fef6fdf0af0efd7aa16b8df8bc"
+  },
+  "doop/Method.facts": {
+    "bytes": 13906405,
+    "sha256": "57f6fa5b8357906bce9a050dbec60073dabca58e1626cdcd89f38d8b02f1420d"
+  },
+  "doop/MethodHandleConstant.facts": {
+    "bytes": 100442,
+    "sha256": "07a08a14fc13bff011af8c94cf3530097c5aa1d9eac4d2a1748f050714624289"
+  },
+  "doop/MethodTypeConstant.facts": {
+    "bytes": 55638,
+    "sha256": "a68d73682229072437cbdde31f72552a471a011dce4a280ea426b0d905bafc41"
+  },
+  "doop/NormalHeap.facts": {
+    "bytes": 7278210,
+    "sha256": "981ee6ffab5a9defa6f89aa07dc804a858e1f46fe224b05463f5598bea2db07a"
+  },
+  "doop/Return.facts": {
+    "bytes": 14695970,
+    "sha256": "0becce5ce7ec425ad8eaa3470dedb1689d9c8fb37126611a54f59815a90c49da"
+  },
+  "doop/SpecialMethodInvocation.facts": {
+    "bytes": 24745076,
+    "sha256": "17b6001e8172194641632d94abe888708075d6abf87907475a512b4d304c48e4"
+  },
+  "doop/StaticMethodInvocation.facts": {
+    "bytes": 11884298,
+    "sha256": "8751af7fabd3fbd6a6e29ec1988b915429ef4a4b43dcc86ce372223a134a5740"
+  },
+  "doop/StoreArrayIndex.facts": {
+    "bytes": 18214021,
+    "sha256": "1d160a0744231584755f4fd402188735b85bbe05a0fd093c9df43071a12040d4"
+  },
+  "doop/StoreInstanceField.facts": {
+    "bytes": 17001572,
+    "sha256": "e4b7f8dffae81eb162b472a73a8aa306609f4718178591b29243f5d0d50e105a"
+  },
+  "doop/StoreStaticField.facts": {
+    "bytes": 2509824,
+    "sha256": "2654f877fbf5c1e6107f934c0b2331f1fbacc2a06224d93310458c751822ee2b"
+  },
+  "doop/StringConstant.facts": {
+    "bytes": 959093,
+    "sha256": "ad2d059f5e3811fbcaf00afc1d4f112501e098bc6af275282ae336d18369d9f6"
+  },
+  "doop/ThisVar.facts": {
+    "bytes": 10070504,
+    "sha256": "ee8baa8f47c26cb134a4171926f0bf9a46f30c9a031a8363e80bb50f21a3f5ea"
+  },
+  "doop/Var-DeclaringMethod.facts": {
+    "bytes": 164306690,
+    "sha256": "5dd712e3d5e549c221adea600bdaa27d90bef429898d87f44d5c12931d2644c4"
+  },
+  "doop/Var-Type.facts": {
+    "bytes": 102039806,
+    "sha256": "0edbbc2aa8a3c443ea3d8b21cb8e6e321444287211863a54bfc2dbb798540242"
+  },
+  "doop/VirtualMethodInvocation.facts": {
+    "bytes": 59101443,
+    "sha256": "eeaf04a61eac466d472161fb31ebeaac668845b355a8e1d965208d3b4beefd2c"
+  },
+  "dyck/close1.csv": {
+    "bytes": 186,
+    "sha256": "20d1236f2c865e7e2ff98f764941d61467b7b0fd85a38855913fb75fd6acc393"
+  },
+  "dyck/close2.csv": {
+    "bytes": 207,
+    "sha256": "d9e3a1f908714bbfeaa0806979cd79f27a7657e6200387d15f5e33c75045ee27"
+  },
+  "dyck/open1.csv": {
+    "bytes": 185,
+    "sha256": "df7548c9aaedcc6d4caf824c45be5a79af4fd27a740847628cad24b599b3728b"
+  },
+  "dyck/open2.csv": {
+    "bytes": 207,
+    "sha256": "09ffed4954f3334aedbac14a66da2d5f5cf7f39e0f3cb7a333d89e58a45430da"
+  },
+  "galen/c.csv": {
+    "bytes": 186,
+    "sha256": "3e2dd4b6395a898dd9d9ae4ebc226dbda19899a8f8c39b695f2b29c8b9c954b8"
+  },
+  "galen/inputP.csv": {
+    "bytes": 640,
+    "sha256": "5d51310f0d13d0cf580a8604be15750326e5aa4b9426e347c7c97e345aa6a76b"
+  },
+  "galen/inputQ.csv": {
+    "bytes": 592,
+    "sha256": "cd7008e5f02076e85d94574fd3bea39cca5b657c4d727f9fe72a0b0d5d069d49"
+  },
+  "galen/rc.csv": {
+    "bytes": 180,
+    "sha256": "b13de0cb2dbd3a41e90ade0f09145b60e7c6bf32123ea0c5d044c0fab3580a56"
+  },
+  "galen/s.csv": {
+    "bytes": 136,
+    "sha256": "50c49f23011d3390f9ca07c7b09107f3f3d42effe735f75ee1ee50c082b6fcdb"
+  },
+  "galen/u.csv": {
+    "bytes": 194,
+    "sha256": "28484677ff003f50c1990ad8b76e2982bcbfb82cf9c827e1a47e1f80aaf36d90"
+  },
+  "graph_100.csv": {
+    "bytes": 578,
+    "sha256": "68266816b76acb69af9d6479585dd6fe9ce97af6df83b4371a1986f2582f66d0"
+  },
+  "graph_100_weighted.csv": {
+    "bytes": 784,
+    "sha256": "0a42e980267ef55995076e1e4550e33de4e24127bc0eec2798ab032c87e446b5"
+  },
+  "polonius/cfg_edge.csv": {
+    "bytes": 298,
+    "sha256": "281232c2c96deba8d4ed8af8c93523f39b6b44e1c06273ce39ed7362dfc5557e"
+  },
+  "polonius/child_path.csv": {
+    "bytes": 80,
+    "sha256": "e000ec24be2aa14152241caf213821657584cdf8b31e6de6a07a20f95813c7a1"
+  },
+  "polonius/drop_of_var_derefs_origin.csv": {
+    "bytes": 16,
+    "sha256": "3f6f41d682c1e3a887ba88629225b44a74af3157ad5f7d0f22eb95f4cbc42ee7"
+  },
+  "polonius/known_placeholder_subset.csv": {
+    "bytes": 8,
+    "sha256": "a3e96cb0b253c36da295635594e9c7684378d01025769a437498518e08b4440a"
+  },
+  "polonius/loan_invalidated_at.csv": {
+    "bytes": 54,
+    "sha256": "ce858b75b340ef725055a7d6765222b2af553caa05d6ef6e0d2b9e34db60afbf"
+  },
+  "polonius/loan_issued_at.csv": {
+    "bytes": 107,
+    "sha256": "68c4bba39cde31c0af6ede373d57a5ad6acce6c50efe84a7c6b613be071c4cde"
+  },
+  "polonius/loan_killed_at.csv": {
+    "bytes": 35,
+    "sha256": "f7aa3a851d3628f25d5c22fbb511096891f3bae76d25aca9f5a7736d7ce96fe8"
+  },
+  "polonius/path_accessed_at_base.csv": {
+    "bytes": 41,
+    "sha256": "b0e8f7158f3d3472d0c3995b303a855b288d14bf258fd7425874ceb6142a9c1e"
+  },
+  "polonius/path_assigned_at_base.csv": {
+    "bytes": 69,
+    "sha256": "c74228042b9d404e03f61794ed3b294c89aff5c9ff6c28d6878dfe9d9fa20a0a"
+  },
+  "polonius/path_is_var.csv": {
+    "bytes": 40,
+    "sha256": "89ad3179f79c0129b9c51b725dc9d06d44d42bebd6a0a51a0702ba6ba716f46e"
+  },
+  "polonius/path_moved_at_base.csv": {
+    "bytes": 54,
+    "sha256": "f152df19756750044a69fc183958b1ad6280dc355d129fc1c3ec710963cb2401"
+  },
+  "polonius/subset_base.csv": {
+    "bytes": 162,
+    "sha256": "73b66c57c772a030bac4f7e4289b6c750f0c40b203646d2753ae60bf684c3555"
+  },
+  "polonius/universal_region.csv": {
+    "bytes": 8,
+    "sha256": "2927992b6c9220cf759e9afea9278712f61e53eeab3f71d2d82fbb941ebf8810"
+  },
+  "polonius/use_of_var_derefs_origin.csv": {
+    "bytes": 80,
+    "sha256": "5a307c102d395b9dbb460057bfee47ca6890d75b866bdd7fd09c63975eccd45c"
+  },
+  "polonius/var_defined_at.csv": {
+    "bytes": 138,
+    "sha256": "7cef68bbacee6ae7c875feba58e454a3083b71c245c95a4bbdb59182099ad2e5"
+  },
+  "polonius/var_dropped_at.csv": {
+    "bytes": 21,
+    "sha256": "0e1cb56cc75f9ee45c62c5e726496f785bb265ec5ce7d9166d4479306dc781c9"
+  },
+  "polonius/var_used_at.csv": {
+    "bytes": 199,
+    "sha256": "75e5abee8d05a24811720b6eae6bb6754d8991d35b57234aa21b13f10d468a0d"
+  }
+}
