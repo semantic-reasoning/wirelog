@@ -2117,6 +2117,8 @@ test_diff_join_batch_signed_timestamps(void)
     wl_columnar_continuation_t *cont = NULL;
     int64_t row[] = { 1, 10 };
     uint64_t scratch_bytes;
+    uint64_t initial_payload_bytes;
+    uint64_t growth_incoming_bytes;
     uint64_t admission_budget;
     uint64_t descriptor_bytes;
     uint64_t source_baseline;
@@ -2156,7 +2158,12 @@ test_diff_join_batch_signed_timestamps(void)
         && col_rel_enable_timestamps(out) == 0
         && col_rel_retained_bytes_for(out, 64u, &scratch_bytes),
         "source and scratch footprints measured");
-    admission_budget = scratch_bytes;
+    initial_payload_bytes = scratch_bytes + out->ncols
+        * (sizeof(int64_t *) + sizeof(int64_t));
+    growth_incoming_bytes = 2u * 128u * sizeof(int64_t)
+        + out->ncols * sizeof(int64_t *)
+        + 128u * sizeof(*out->timestamps);
+    admission_budget = initial_payload_bytes;
     source_governor = make_test_governor(4u * 1024u * 1024u);
     ASSERT_TRUE(source_governor
         && col_rel_attach_memory_governor(left, source_governor) == 0,
@@ -2169,9 +2176,11 @@ test_diff_join_batch_signed_timestamps(void)
         "producer scratch preflight succeeds");
     uint64_t admitted_after_create = wl_columnar_memory_reserved(
         wl_columnar_memory_governor_ref_get(source_governor));
-    ASSERT_TRUE(admitted_after_create > source_baseline + scratch_bytes,
+    ASSERT_TRUE(admitted_after_create > source_baseline
+        + initial_payload_bytes,
         "producer descriptor is admitted beside its batch relation");
-    descriptor_bytes = admitted_after_create - source_baseline - scratch_bytes;
+    descriptor_bytes = admitted_after_create - source_baseline
+        - initial_payload_bytes;
     wl_columnar_continuation_cancel(cont);
     ASSERT_TRUE(wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(source_governor))
@@ -2232,7 +2241,7 @@ test_diff_join_batch_signed_timestamps(void)
     s->join_batch_bytes = 8192;
     atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
             source_governor)->usable_bytes,
-        source_baseline + descriptor_bytes + scratch_bytes
+        source_baseline + descriptor_bytes + initial_payload_bytes
         + auto_metadata_bytes(out->ncols) - 1u,
         memory_order_release);
     int create_denied_rc = col_diff_join_batch_producer_create(s, &op, left,
@@ -2244,13 +2253,13 @@ test_diff_join_batch_signed_timestamps(void)
         "producer scratch denial is ENOSPC and leaves no reservation");
     atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
             source_governor)->usable_bytes,
-        source_baseline + descriptor_bytes + scratch_bytes
+        source_baseline + descriptor_bytes + initial_payload_bytes
         + auto_metadata_bytes(out->ncols),
         memory_order_release);
     ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, left, false,
         &key, &key, 1, s->join_batch_bytes, &cont) == 0,
         "differential batch producer created");
-    admission_budget = descriptor_bytes + scratch_bytes;
+    admission_budget = descriptor_bytes + initial_payload_bytes;
     ASSERT_TRUE(wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(source_governor))
         == source_baseline + admission_budget,
@@ -2330,13 +2339,20 @@ test_diff_join_batch_signed_timestamps(void)
         == source_baseline,
         "producer destruction releases scratch reservation exactly once");
     atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
-            source_governor)->usable_bytes, scratch_bytes * 4u,
+            source_governor)->usable_bytes,
+        source_baseline + descriptor_bytes + initial_payload_bytes
+        + growth_incoming_bytes,
         memory_order_release);
     ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, left, false,
         &key, &key, 1, s->join_batch_bytes, &cont) == 0,
         "producer created for allocation-failure mapping");
     wl_columnar_relation_test_fail_next_prepare_resize();
     rc = col_join_batch_run_to_relation(cont, s, out);
+    bool resize_failure_hook_consumed
+        = !wl_columnar_relation_test_fail_prepare_resize;
+    wl_columnar_relation_test_clear_prepare_resize();
+    ASSERT_TRUE(resize_failure_hook_consumed,
+        "runner reaches the injected relation resize allocation failure");
     ASSERT_TRUE(rc == ENOMEM && out->nrows == 130,
         "producer allocation failure remains ENOMEM through the runner");
     wl_columnar_continuation_destroy(cont);
@@ -2347,7 +2363,7 @@ test_diff_join_batch_signed_timestamps(void)
         "allocation failure releases scratch reservation");
     atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
             source_governor)->usable_bytes,
-        source_baseline + descriptor_bytes + scratch_bytes
+        source_baseline + descriptor_bytes + initial_payload_bytes
         + auto_metadata_bytes(out->ncols),
         memory_order_release);
     ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, left, false,

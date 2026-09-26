@@ -639,7 +639,7 @@ the committed token after publication and before a growth transaction.
 | `eval_dedup.c:wl_dedup_token_valid` | `r->dedup_reservation.state` | `atomic_load_explicit` | acquire | Confirm a populated table is covered by a committed token before mutation or lookup |
 | `eval_dedup.c:wl_dedup_token_valid#2` | `r->dedup_reservation.owner_bits` | `atomic_load_explicit` | acquire | Confirm the committed token belongs to this relation before growth or transfer |
 
-The complete source audit now contains **189 atomic call sites**.
+The complete source audit now contains **188 atomic call sites**.
 
 ---
 

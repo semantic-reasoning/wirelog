@@ -12524,7 +12524,6 @@ test_ungoverned_pool_payload_promotion(void)
     uint64_t expected_payload = physical + sizeof(int64_t);
     uint64_t baseline = reserved_on(ref);
     uint64_t exact = baseline + sizeof(col_rel_t) + strlen(name) + 1u
-        + sizeof(wl_columnar_memory_reservation_t)
         + test_auto_metadata_bytes(1) + expected_payload
         + 4u * sizeof(uint64_t);
     wl_columnar_memory_governor_t *governor
