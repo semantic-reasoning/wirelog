@@ -2565,8 +2565,6 @@ measure_create_floor(wirelog_program_t *prog, uint64_t *intern_bytes,
             &name_bytes)
             || !wl_columnar_memory_size_add(sizeof(col_rel_t), name_bytes,
             &relation_bytes)
-            || !wl_columnar_memory_size_add(relation_bytes,
-            sizeof(wl_columnar_memory_reservation_t), &relation_bytes)
             || !wl_columnar_memory_size_add(*descriptor_bytes,
             relation_bytes, descriptor_bytes))
             goto out;

@@ -726,7 +726,8 @@ test_zero_width_schema_metadata(void)
     atomic_store_explicit(&governor->usable_bytes, descriptor + 3u,
         memory_order_release);
     CHECK(col_rel_set_schema(rel, 0, NULL) == 0
-        && rel->schema_ok && rel->capacity == 0
+        && rel->schema_ok && rel->capacity == COL_REL_INIT_CAP
+        && !rel->columns && !rel->timestamps
         && rel->metadata_reserved_bytes == 3u
         && wl_columnar_memory_reserved(governor) == descriptor + 3u,
         "zero-width Arrow root exact fit");
