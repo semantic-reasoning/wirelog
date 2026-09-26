@@ -408,11 +408,18 @@ def parse_bench_output(
     return None, f"unknown parser: {parser}", "parse_failed"
 
 
+def expected_bench_workload(workload: str) -> str:
+    # The CLI exposes the static benchmark as cspa-fast, while its stable
+    # machine-readable identity is cspa (also documented in README.md).
+    return "cspa" if workload == "cspa-fast" else workload
+
+
 def validate_bench_json(
     parsed: dict[str, Any], workload: str, workers: int, repeat: int
 ) -> str | None:
-    if parsed.get("workload") != workload:
-        return f"bench workload identity mismatch: expected {workload!r}"
+    expected_workload = expected_bench_workload(workload)
+    if parsed.get("workload") != expected_workload:
+        return f"bench workload identity mismatch: expected {expected_workload!r}"
     actual_workers = parsed.get("workers")
     actual_repeat = parsed.get("repeat")
     if (
@@ -702,13 +709,9 @@ def flag_worker_result_mismatches(records: list[dict[str, Any]]) -> None:
         if record.get("status") == "ok":
             grouped.setdefault((record["workload"], record["repeat"]), []).append(record)
     for (workload, repeat), group in grouped.items():
-        signatures = {
-            (record["summary"].get("tuples"), record["summary"].get("iterations"))
-            for record in group
-        }
-        missing_counts = any(None in signature for signature in signatures)
-        if len(group) > 1 and (missing_counts or len(signatures) != 1):
-            detail = "tuple/iteration counts differ across worker counts"
+        tuple_counts = {record["summary"].get("tuples") for record in group}
+        if len(group) > 1 and (None in tuple_counts or len(tuple_counts) != 1):
+            detail = "tuple counts differ across worker counts"
             for record in group:
                 record["status"] = "fail"
                 record["reason"] = "worker_result_mismatch"

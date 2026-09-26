@@ -59,6 +59,17 @@ class PortfolioResultTests(unittest.TestCase):
         record["tuples"] = -1
         self.assertIn("nonnegative integer", portfolio.validate_bench_json(record, "reach", 8, 5) or "")
 
+    def test_cspa_fast_accepts_documented_output_identity_only(self) -> None:
+        record = self.valid_json()
+        record["workload"] = "cspa"
+        parsed, error, _ = portfolio.parse_bench_output("json", json.dumps(record))
+        self.assertIsNone(error)
+        self.assertIsNone(portfolio.validate_bench_json(parsed, "cspa-fast", 8, 5))
+        record["workload"] = "reach"
+        parsed, error, _ = portfolio.parse_bench_output("json", json.dumps(record))
+        self.assertIsNone(error)
+        self.assertIn("identity", portfolio.validate_bench_json(parsed, "cspa-fast", 8, 5) or "")
+
     def test_rejects_cspa_nonfinite_tsv_fields(self) -> None:
         valid = "cspa_incr\t1\t10\t9\t0.1\t2\t5\t100\t110\t4\t5\t3000\tOK"
         parsed, error = portfolio.parse_cspa_incremental_tsv(valid)
@@ -179,6 +190,17 @@ class PortfolioResultTests(unittest.TestCase):
         portfolio.flag_worker_result_mismatches(records)
         self.assertTrue(all(record["status"] == "fail" for record in records))
         self.assertTrue(all(record["reason"] == "worker_result_mismatch" for record in records))
+        self.assertTrue(all("tuple counts" in record["detail"] for record in records))
+
+    def test_iteration_variation_is_diagnostic_not_a_cross_worker_failure(self) -> None:
+        records = [
+            {"status": "ok", "workload": "polonius", "repeat": 5,
+             "workers": 1, "summary": {"tuples": 1983, "iterations": 23}},
+            {"status": "ok", "workload": "polonius", "repeat": 5,
+             "workers": 8, "summary": {"tuples": 1983, "iterations": 25}},
+        ]
+        portfolio.flag_worker_result_mismatches(records)
+        self.assertTrue(all(record["status"] == "ok" for record in records))
 
 
 if __name__ == "__main__":
