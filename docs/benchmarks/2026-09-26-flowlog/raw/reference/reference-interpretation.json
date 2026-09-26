@@ -1,0 +1,19 @@
+{
+  "distinct_outputs": {
+    "crdt": 2156530,
+    "ddisasm": 900,
+    "doop": {
+      "iterations": 28,
+      "tuples": 6069774
+    },
+    "polonius": 1999
+  },
+  "documented_corrections": [
+    "b79a40ef7eaa74b6c0ddc0c20f5c43a21db306d1: descriptor and matching benchmark rule constants, closes956",
+    "059e410: single-rule dedup, issue957",
+    "issue955: join-key plan-generation correctness"
+  ],
+  "resource_caveat": "DOOP phase samples record pswpout changes and transient memory PSI; historical DOOP timings are descriptive and workload-non-equivalent, not isolated causal speed comparisons.",
+  "role": "historical revision fingerprint, not current golden output or equivalent-workload speedup",
+  "source_sha": "7e498e782a4cca96175d34f86bf5b958d042552d"
+}
