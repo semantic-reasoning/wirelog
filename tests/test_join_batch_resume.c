@@ -1610,6 +1610,20 @@ out:
  * key-index bytes and right-side probe-row bytes.  Subtract the independently
  * computed batch relation storage, descriptor, and metadata reservations so
  * this check isolates the producer descriptor for narrow and wide schemas. */
+static uint64_t
+auto_metadata_bytes(uint32_t ncols)
+{
+    uint64_t bytes = 3u + (uint64_t)ncols
+        * (sizeof(char *) + sizeof(struct ArrowSchema *)
+        + sizeof(struct ArrowSchema) + 2u);
+    for (uint32_t i = 0; i < ncols; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "col%u", i);
+        bytes += 2u * (strlen(name) + 1u);
+    }
+    return bytes;
+}
+
 static bool
 descriptor_footprint(uint32_t key_count, uint32_t right_ncols,
     uint64_t *bytes_out)
@@ -1668,8 +1682,7 @@ descriptor_footprint(uint32_t key_count, uint32_t right_ncols,
     if (!out || col_join_set_output_types(out, left, sess->rels[0], &op) != 0
         || !col_rel_retained_bytes_for(out, 64u, &batch_bytes))
         goto done;
-    batch_descriptor = sizeof(col_rel_t) + sizeof("$join_batch")
-        + sizeof(wl_columnar_memory_reservation_t);
+    batch_descriptor = sizeof(col_rel_t) + sizeof("$join_batch");
     batch_metadata = 3u + (uint64_t)out->ncols
         * (sizeof(char *) + sizeof(wirelog_column_type_t)
         + sizeof(struct ArrowSchema *) + sizeof(struct ArrowSchema)
@@ -1774,7 +1787,10 @@ test_descriptor_uses_source_governor(void)
     }
     admitted = wl_columnar_memory_reserved(
         wl_columnar_memory_governor_ref_get(source_governor));
-    if (admitted - baseline != descriptor_bytes + payload_bytes) {
+    if (admitted - baseline != descriptor_bytes + payload_bytes
+        + sizeof(col_rel_t) + sizeof("$join_batch")
+        + auto_metadata_bytes(f.out->ncols)
+        + (uint64_t)f.out->ncols * sizeof(wirelog_column_type_t)) {
         FAIL("source governor did not charge the exact initial payload");
         goto out;
     }
@@ -1853,7 +1869,10 @@ test_batch_payload_uses_right_governor_fallback(void)
     }
     admitted = wl_columnar_memory_reserved(
         wl_columnar_memory_governor_ref_get(source_governor));
-    if (admitted - baseline != descriptor_bytes + payload_bytes) {
+    if (admitted - baseline != descriptor_bytes + payload_bytes
+        + sizeof(col_rel_t) + sizeof("$join_batch")
+        + auto_metadata_bytes(f.out->ncols)
+        + (uint64_t)f.out->ncols * sizeof(wirelog_column_type_t)) {
         FAIL("right governor did not charge the exact initial payload");
         goto out;
     }
@@ -1910,9 +1929,11 @@ test_batch_payload_denial_rolls_back_and_retries(void)
         FAIL("admission footprint setup");
         goto out;
     }
-    budget = f.left->retained_reserved_bytes + descriptor_bytes
-        + payload_bytes - 1u;
-    source_governor = make_governor(budget);
+    budget = descriptor_bytes + payload_bytes
+        + sizeof(col_rel_t) + sizeof("$join_batch")
+        + 2u * auto_metadata_bytes(f.out->ncols)
+        + (uint64_t)f.out->ncols * sizeof(wirelog_column_type_t);
+    source_governor = make_governor(1u << 20);
     if (!source_governor
         || col_rel_attach_memory_governor(f.left, source_governor) != 0) {
         FAIL("tight source governor setup");
@@ -1922,6 +1943,9 @@ test_batch_payload_denial_rolls_back_and_retries(void)
         wl_columnar_memory_governor_ref_get(source_governor));
     entry = find_entry(f.sess, "right");
     f.sess->memory_governor = NULL;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            source_governor)->usable_bytes, baseline + budget - 1u,
+        memory_order_release);
     rc = col_join_batch_producer_create(f.sess, &f.op, f.left, false,
             KEY0, KEY0, 1u, 8u * 32u, &cont);
     if (rc != ENOSPC || cont != NULL || !entry || entry->pin_count != 0u
@@ -1930,14 +1954,36 @@ test_batch_payload_denial_rolls_back_and_retries(void)
         FAIL("initial payload denial was not typed or leaked a reservation");
         goto out;
     }
-    f.sess->memory_governor = session_governor;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            source_governor)->usable_bytes, baseline + budget,
+        memory_order_release);
+    wl_columnar_relation_test_fail_next_metadata_alloc();
+    rc = col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+            KEY0, KEY0, 1u, 8u * 32u, &cont);
+    if (rc != ENOMEM || cont != NULL || entry->pin_count != 0u
+        || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(source_governor)) != baseline) {
+        FAIL("metadata allocation failure was not typed or balanced");
+        goto out;
+    }
     if (col_join_batch_producer_create(f.sess, &f.op, f.left, false,
         KEY0, KEY0, 1u, 8u * 32u, &cont) != 0 || !cont) {
         FAIL("producer retry after denied source admission");
         goto out;
     }
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(source_governor))
+        != baseline + budget - auto_metadata_bytes(f.out->ncols)) {
+        FAIL("metadata overlap credit did not settle after creation");
+        goto out;
+    }
     wl_columnar_continuation_destroy(cont);
     cont = NULL;
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(source_governor)) != baseline) {
+        FAIL("exact-fit producer destruction leaked admission");
+        goto out;
+    }
     PASS();
 out:
     if (cont)

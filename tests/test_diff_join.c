@@ -105,13 +105,28 @@ make_test_governor(uint64_t budget)
     return wl_columnar_memory_governor_ref_create(&resolution);
 }
 
+static uint64_t
+auto_metadata_bytes(uint32_t ncols)
+{
+    uint64_t bytes = 3u + (uint64_t)ncols
+        * (sizeof(char *) + sizeof(struct ArrowSchema *)
+        + sizeof(struct ArrowSchema) + 2u);
+    for (uint32_t i = 0; i < ncols; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "col%u", i);
+        bytes += 2u * (strlen(name) + 1u);
+    }
+    return bytes;
+}
+
 static void
 test_governed_auto_relation_schema(void)
 {
     uint64_t timestamp_bytes = (uint64_t)COL_REL_INIT_CAP
         * sizeof(col_delta_timestamp_t);
     wl_columnar_memory_governor_ref_t *governor
-        = make_test_governor(timestamp_bytes);
+        = make_test_governor(timestamp_bytes + sizeof(col_rel_t)
+            + sizeof("nullary_ts") + 3u);
     col_rel_t *rel = NULL;
     col_delta_timestamp_t *timestamps;
     int64_t empty_row = 0;
@@ -125,7 +140,8 @@ test_governed_auto_relation_schema(void)
     ASSERT_TRUE(rc == 0 && rel && rel->capacity == COL_REL_INIT_CAP
         && rel->timestamp_capacity == COL_REL_INIT_CAP
         && wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(governor)) == timestamp_bytes,
+            wl_columnar_memory_governor_ref_get(governor)) ==
+        timestamp_bytes + sizeof(col_rel_t) + sizeof("nullary_ts") + 3u,
         "nullary timestamp capacity and reservation stay consistent");
     timestamps = rel->timestamps;
     rc = col_rel_set_schema(rel, 2, NULL);
@@ -133,14 +149,16 @@ test_governed_auto_relation_schema(void)
         && rel->capacity == COL_REL_INIT_CAP && rel->timestamps == timestamps
         && rel->timestamp_capacity == COL_REL_INIT_CAP
         && wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(governor)) == timestamp_bytes,
+            wl_columnar_memory_governor_ref_get(governor)) ==
+        timestamp_bytes + sizeof(col_rel_t) + sizeof("nullary_ts") + 3u,
         "denied timestamped promotion preserves schema, payload and charge");
     rc = col_rel_append_rows_atomic(rel, &empty_row, 1, 0, &denied);
     ASSERT_TRUE(rc == 0 && !denied && rel->nrows == 1
         && rel->timestamps == timestamps
         && rel->timestamp_capacity == COL_REL_INIT_CAP
         && wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(governor)) == timestamp_bytes,
+            wl_columnar_memory_governor_ref_get(governor)) ==
+        timestamp_bytes + sizeof(col_rel_t) + sizeof("nullary_ts") + 3u,
         "nullary append preserves its admitted timestamp buffer");
     col_rel_destroy(rel);
     rel = NULL;
@@ -149,7 +167,8 @@ test_governed_auto_relation_schema(void)
         "nullary timestamp reservation releases on destroy");
     wl_columnar_memory_governor_ref_release(governor);
 
-    governor = make_test_governor(1);
+    governor = make_test_governor(sizeof(col_rel_t) + sizeof("promote_denied") +
+            3u);
     ASSERT_TRUE(governor != NULL, "nullary promotion denial governor created");
     rc = wl_columnar_relation_new_auto_governed("promote_denied", 0,
             COL_REL_INIT_CAP, false, governor, &rel);
@@ -159,7 +178,8 @@ test_governed_auto_relation_schema(void)
     ASSERT_TRUE(rc == ENOSPC && rel->schema_ok && rel->ncols == 0
         && rel->capacity == COL_REL_INIT_CAP
         && wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(governor)) == 0,
+            wl_columnar_memory_governor_ref_get(governor)) ==
+        sizeof(col_rel_t) + sizeof("promote_denied") + 3u,
         "denied nullary promotion preserves the original schema and charge");
     int64_t nullary_row = 0;
     rc = col_rel_append_rows_atomic(rel, &nullary_row, 1, 0, &denied);
@@ -183,7 +203,8 @@ test_governed_auto_relation_schema(void)
         && rel->columns[1][0] == 7
         && wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(governor))
-        == rel->retained_reserved_bytes,
+        == rel->retained_reserved_bytes + rel->descriptor_reserved_bytes
+        + rel->metadata_reserved_bytes,
         "allowed nullary promotion admits and appends the new schema");
     col_rel_destroy(rel);
     rel = NULL;
@@ -210,7 +231,9 @@ test_governed_auto_relation_schema(void)
         && rel->view_generation == old_generation
         && rel->retained_reserved_bytes == old_reserved
         && wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(governor)) == old_reserved,
+            wl_columnar_memory_governor_ref_get(governor)) ==
+        old_reserved + rel->descriptor_reserved_bytes
+        + rel->metadata_reserved_bytes,
         "failed timestamped promotion restores schema, buffer and admission");
     rc = col_rel_set_schema(rel, 2, NULL);
     ASSERT_TRUE(rc == 0 && rel->schema_ok && rel->ncols == 2
@@ -218,7 +241,8 @@ test_governed_auto_relation_schema(void)
         && rel->timestamp_capacity == 1
         && wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(governor))
-        == rel->retained_reserved_bytes,
+        == rel->retained_reserved_bytes + rel->descriptor_reserved_bytes
+        + rel->metadata_reserved_bytes,
         "timestamped promotion keeps existing admitted capacities aligned");
     int64_t promoted_rows[] = { 5, 7, 11, 13 };
     rc = rc == 0 ? col_rel_append_rows_atomic(rel, promoted_rows, 2, 2,
@@ -227,7 +251,8 @@ test_governed_auto_relation_schema(void)
         && rel->capacity >= 2 && rel->timestamp_capacity >= rel->capacity
         && rel->timestamps != timestamps
         && rel->columns[0][1] == 11 && rel->columns[1][1] == 13
-        && rel->retained_reserved_bytes
+        && rel->retained_reserved_bytes + rel->descriptor_reserved_bytes
+        + rel->metadata_reserved_bytes
         == wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(governor)),
         "timestamped promotion grows and admits buffers before multirow append");
@@ -2190,12 +2215,25 @@ test_diff_join_batch_signed_timestamps(void)
         && atomic_load_explicit(&right->source_access.state,
         memory_order_relaxed) == 0,
         "descriptor-only denial precedes allocations, leases and indexing");
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            source_governor)->usable_bytes, 4u * 1024u * 1024u,
+        memory_order_release);
+    s->join_batch_bytes = 8192;
+    wl_columnar_relation_test_fail_next_metadata_alloc();
+    rc = col_diff_join_batch_producer_create(s, &op, left, false,
+            &key, &key, 1, s->join_batch_bytes, &cont);
+    ASSERT_TRUE(rc == ENOMEM && cont == NULL
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(source_governor))
+        == source_baseline,
+        "metadata allocation failure remains ENOMEM and rolls back");
     /* The initial 64-row scratch exactly fits.  Its first 64->128 growth is
      * denied, after which raising the source governor permits retry. */
     s->join_batch_bytes = 8192;
     atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
             source_governor)->usable_bytes,
-        source_baseline + descriptor_bytes + scratch_bytes - 1u,
+        source_baseline + descriptor_bytes + scratch_bytes
+        + auto_metadata_bytes(out->ncols) - 1u,
         memory_order_release);
     int create_denied_rc = col_diff_join_batch_producer_create(s, &op, left,
             false, &key, &key, 1, s->join_batch_bytes, &cont);
@@ -2206,7 +2244,8 @@ test_diff_join_batch_signed_timestamps(void)
         "producer scratch denial is ENOSPC and leaves no reservation");
     atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
             source_governor)->usable_bytes,
-        source_baseline + descriptor_bytes + scratch_bytes,
+        source_baseline + descriptor_bytes + scratch_bytes
+        + auto_metadata_bytes(out->ncols),
         memory_order_release);
     ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, left, false,
         &key, &key, 1, s->join_batch_bytes, &cont) == 0,
@@ -2308,7 +2347,8 @@ test_diff_join_batch_signed_timestamps(void)
         "allocation failure releases scratch reservation");
     atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
             source_governor)->usable_bytes,
-        source_baseline + descriptor_bytes + scratch_bytes,
+        source_baseline + descriptor_bytes + scratch_bytes
+        + auto_metadata_bytes(out->ncols),
         memory_order_release);
     ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, left, false,
         &key, &key, 1, s->join_batch_bytes, &cont) == 0,
@@ -2341,7 +2381,8 @@ test_diff_join_batch_signed_timestamps(void)
     ASSERT_TRUE(session_create_rc == 0
         && session_after_create >= session_baseline + scratch_bytes
         && wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(source_governor)) == 0,
+            wl_columnar_memory_governor_ref_get(source_governor)) ==
+        source_baseline,
         "session governor takes precedence over both source governors");
     wl_columnar_continuation_destroy(cont);
     cont = NULL;

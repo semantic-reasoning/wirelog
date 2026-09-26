@@ -2148,6 +2148,9 @@ col_rel_set_schema_impl_capacity(col_rel_t *r, uint32_t ncols,
     if (promote_nullary_schema) {
         if (r->nrows != 0 || r->columns || r->col_names)
             return EINVAL;
+        if (r->timestamps && r->timestamp_capacity < r->capacity)
+            return EINVAL;
+        initial_capacity = r->capacity;
         if (r->timestamp_capacity > initial_capacity)
             initial_capacity = r->timestamp_capacity;
     }
