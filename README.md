@@ -65,197 +65,57 @@ It is a design proposal, not a currently available API.
 
 ## Performance
 
-15-workload static benchmark portfolio plus CSPA incremental check
-(2026-08-04, `main` at `7e498e7`, release/LTO build, GCC 16.1.1,
-`--repeat 5` medians):
+The complete benchmark evidence is recorded in [docs/benchmarks/2026-09-26-flowlog](docs/benchmarks/2026-09-26-flowlog/). It contains two immutable 48-record matrices: the historical revision `7e498e782a4cca96175d34f86bf5b958d042552d` and the current benchmark head `afcdd8a3f05f67daaeb003c7acd25e96e2433419`, whose product base is main merge commit `30b19ba3` from #1975. Both use release `-Os`, LTO, GCC 16.2.1, `wirelog_log_max_level=error`, CPUs 0-15, and the same 82-file data inventory. Non-DOOP workloads use five-trial medians; DOOP uses one authoritative trial per width because each run is very long.
 
-**Test environment**: Intel Xeon E5-2696 v4 (2 sockets, 44C/88T), Linux 7.1.5
-(Arch), 88 logical CPUs across two NUMA nodes, 125 GB RAM. Measurements were
-collected from `./build-readme-bench/bench/bench_flowlog`; wall-clock results
-vary with CPU governor, thermal state, and memory pressure.
+**Test environment:** Intel Xeon E5-2696 v4 (2 sockets, 44 physical cores total, 88 logical CPUs), Linux 7.2.6, 125 GiB RAM. Wall-clock values are descriptive and affected by governor, thermal state, memory pressure, and the campaigns' separate execution times. Peak RSS is shown in MiB.
 
-Each workload was run in its own process. Peak RSS is a process-wide
-high-water mark, so a single `--workload all` invocation reports the largest
-workload's footprint for every workload that follows it -- the reproduction
-block below runs them separately for the same reason.
+| Category | Workload | W=1 median | W=8 median | W=16 median | Tuples | Iterations | Peak RSS (W=1 / W=8 / W=16 MiB) |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Graph | TC | 10.4ms | 10.1ms | 14.0ms | 4,950 | 98 | 3.9 / 3.3 / 3.8 |
+| Graph | Reach | 1.9ms | 1.9ms | 1.9ms | 100 | 98 | 3.1 / 3.4 / 3.4 |
+| Graph | CC | 13.8ms | 13.6ms | 14.0ms | 100 | 99 | 4.1 / 3.8 / 4.1 |
+| Graph | SSSP | 2.3ms | 2.0ms | 2.6ms | 100 | 98 | 3.4 / 3.4 / 3.4 |
+| Graph | SG | 0.8ms | 0.8ms | 0.8ms | 0 | 0 | 3.4 / 3.4 / 3.4 |
+| Graph | Bipartite | 3.0ms | 2.5ms | 2.5ms | 100 | 73 | 3.4 / 3.2 / 3.3 |
+| Pointer Analysis | Andersen | 4.5ms | 4.8ms | 5.2ms | 155 | 8 | 3.5 / 4.1 / 4.1 |
+| Pointer Analysis | Dyck-2 | 29.1ms | 29.6ms | 27.6ms | 2,120 | 8 | 5.8 / 21.8 / 7.2 |
+| Pointer Analysis | CSPA (static) | 4.80s | 2.43s | 2.41s | 20,381 | 6 | 320.3 / 408.8 / 406.0 |
+| Data Flow | CSDA | 4.9ms | 4.9ms | 4.9ms | 2,986 | 29 | 3.5 / 3.9 / 3.5 |
+| Ontology | Galen | 74.1ms | 115.7ms | 105.1ms | 5,568 | 23 | 6.5 / 15.9 / 13.0 |
+| Borrow Check | Polonius | 8.3ms | 9.4ms | 12.4ms | 1,983 | 23 / 25 / 25 | 4.0 / 4.4 / 4.4 |
+| Disassembly | DDISASM | 7.5ms | 10.6ms | 11.0ms | 704 | 0 / 19 / 19 | 3.9 / 4.5 / 16.8 |
+| CRDT | CRDT | 44.87s | 45.54s | 46.81s | 2,152,328 | 14,148 | 123.4 / 488.1 / 770.7 |
+| Program Analysis | DOOP (zxing) | 4,677.9s | 2,871.6s | 2,847.9s | 13,828,835 | 153 | 53,369.6 / 55,158.3 / 55,231.1 |
 
-| Category | Workload | W=1 median | W=8 median | W=16 median | Tuples | Iterations | Peak RSS (W=1 / W=8 / W=16) |
-|----------|----------|------------|------------|-------------|--------|------------|-------------------------------|
-| Graph | TC (Transitive Closure) | 6.3ms | 8.0ms | 8.0ms | 4,950 | 98 | 3.0MB / 3.3MB / 3.3MB |
-| Graph | Reach | 0.6ms | 0.6ms | 0.4ms | 100 | 98 | 2.8MB / 2.9MB / 2.9MB |
-| Graph | CC (Connected Components) | 7.7ms | 7.4ms | 9.9ms | 100 | 99 | 3.0MB / 3.2MB / 3.4MB |
-| Graph | SSSP (Shortest Path) | 0.8ms | 0.8ms | 0.8ms | 100 | 98 | 2.9MB / 2.9MB / 2.9MB |
-| Graph | SG (Subgraph) | 0.4ms | 0.5ms | 0.5ms | 0 | 0 | 2.9MB / 2.9MB / 2.9MB |
-| Graph | Bipartite | 1.0ms | 1.0ms | 1.0ms | 100 | 73 | 3.0MB / 3.0MB / 2.9MB |
-| Pointer Analysis | Andersen | 2.2ms | 3.8ms | 3.3ms | 155 | 8 | 3.1MB / 3.5MB / 3.6MB |
-| Pointer Analysis | Dyck-2 | 11.9ms | 13.7ms | 13.4ms | 2,120 | 8 | 3.5MB / 7.2MB / 7.0MB |
-| Pointer Analysis | CSPA | 1.59s | 1.41s | 1.43s | 20,381 | 6 | 330.4MB / 442.4MB / 419.1MB |
-| Data Flow | CSDA | 2.8ms | 2.8ms | 2.4ms | 2,986 | 29 | 3.2MB / 3.2MB / 3.1MB |
-| Ontology | Galen | 23.1ms | 29.2ms | 32.1ms | 5,568 | 23 | 4.2MB / 8.6MB / 8.1MB |
-| Borrow Check | Polonius | 4.7ms | 3.4ms | 4.6ms | 1,983 | 23 / 25 / 25 | 3.5MB / 3.5MB / 3.5MB |
-| Disassembly | DDISASM | 2.9ms | 3.4ms | 3.4ms | 704 | 0 / 19 / 19 | 3.5MB / 3.6MB / 3.7MB |
-| CRDT | CRDT | 24.95s | 24.90s | 24.06s | 2,152,328 | 14,148 | 113.6MB / 377.7MB / 451.1MB |
-| Program Analysis | DOOP (zxing) | 1399.2s | 1169.2s | 1134.7s | 13,828,835 [^doop] | 153 | 39.1GB / 40.9GB / 41.0GB |
+The CSPA static row is `cspa-fast`. The separate incremental CSPA check (`cspa`) inserted 35 synthetic `Assign` facts (20% of the 179 input rows) and produced 21,063 tuples: baseline/re-evaluation medians were 4,733.6/101.4ms (W=1), 2,530.5/168.7ms (W=8), and 2,425.9/161.6ms (W=16). These are five-trial medians from the machine-verifiable current matrix.
 
-[^doop]: DOOP is the one row measured with `--repeat 1`, not a 5-trial
-    median: at 23 minutes a run, three widths at `--repeat 5` is six hours.
-    All three widths complete and agree: 13,828,835 tuples and 153
-    iterations at W=1, W=8 and W=16 alike. Until #959 they did not -- W=8
-    and W=16 died on a join-output cap of 74,026,332. The earlier revision
-    of this footnote attributed that to the session cap being divided by the
-    worker count; that was wrong. The divisor was the K-fusion *branch*
-    count (19 for this workload), applied to the whole session budget, so
-    the cap shrank as the fan grew rather than as the width grew. W>1
-    depends on the branch dispatch having a work queue, which is why W=1 was
-    never affected.
+DOOP uses the pinned 35-file extracted manifest (SHA-256 `215ddcc50bca70c0089e0ced9298274aec4edb6741736d03cc3c4386b96f831c`; declared archive SHA-256 `154593343fefd18306d4098ba9f6286947b134b56ebcf83d8e8eae368d5867e7`). It consumed up to about 54 GiB RSS in this campaign and caused substantial swap pressure; the DOOP rows are authoritative completed runs but should be treated as descriptive. The historical campaign produced different outputs (CRDT 2,156,530 and DOOP 6,069,774 tuples) because commits #955/#956/#957 changed benchmark semantics and duplicate handling. Those historical values are preserved for attribution and are not claimed as equivalent-workload timing baselines.
 
-    Parallel scaling is weak -- 1.20x at W=8 and 1.23x at W=16 -- and
-    nothing here claims otherwise; #959 removed a hard failure, not a
-    bottleneck. The W>1 tuple counts recorded two revisions ago came from
-    runs that varied between invocations (#958); the agreement across widths
-    above is the check that this is no longer true.
+Pre-fix CRDT diagnostics are excluded from this table; the complete current-main matrix above is the README calibration.
 
-Numbers are 5-trial medians (`--repeat 5`) on a single dev host with
-cpufreq governor `schedutil`; treat them as descriptive, not gated.
-The `meson test --suite perf` regression gate is separate and runs
-under `-Dwirelog_log_max_level=error` plus a `performance` governor
-(see `tests/test_crdt_perf_gate.c`).
-
-The CSPA table row is the static `cspa-fast` workload. The separate
-incremental CSPA check exercises `--workload cspa`, which runs *only* the
-incremental variant -- the two are different entry points, not two
-reports from one run.
-
-Historic single-trial numbers from pre-2026-05-09 README revisions
-(before commit `1e6af00`) used `--repeat 1` and are not directly
-comparable to the current 5-trial medians. Wall-clock deltas between
-successive refreshes on this host are descriptive and should not be read
-as isolated algorithmic speedups or regressions.
-
-**Tuple counts fell for four workloads in 0.54.0, and the new numbers are
-the correct ones.** DDISASM 900 -> 704, Polonius 1,999 -> 1,983, CRDT
-2,156,530 -> 2,152,328, DOOP 14,096,448 -> 13,828,835. Iteration counts are
-unchanged in every case.
-
-The cause is `059e410` (#957): a relation defined by a single rule was not
-deduplicated, so a head that projected away a body variable derived one row
-per derivation rather than one per distinct tuple. Datalog is set-valued,
-so the earlier totals were counting duplicates. Confirmed by building both
-sides of that commit on this host: `059e410^` reproduces the previous
-table's DDISASM 900, Polonius 1,999 and CRDT 2,156,530 exactly, and
-`059e410` reproduces the three values above exactly.
-
-DOOP was not bisected the same way -- 23 minutes a run makes a two-sided
-build expensive -- so its attribution to #957 is by consistency with the
-other three rather than by direct measurement. Note that the previous
-footnote claimed 14,096,448 was already a post-#957 figure; that claim does
-not survive re-measurement and was wrong.
-
-**Output changed for four workloads since the 2026-05-24 revision.** These
-are result-set changes, not timing noise, and they have separate causes:
-
-- **CRDT** (1,301,914 -> 2,156,530 tuples), **DDISASM** (531 -> 900), and
-  **Polonius** (1,807 -> 1,999) changed under `61e2530` (#914), which reset
-  the iteration context for non-recursive strata; the previous table was
-  never re-measured afterwards. Confirmed by building both sides of that
-  commit: at W=1, `61e2530^` reproduces the previous table's three values
-  exactly and `61e2530` reproduces the current ones exactly. CRDT's
-  iteration count moves with it, 0 -> 14,148.
-- **DOOP** changed under #950/#951 (reading the archive's string-valued
-  `.facts` as shipped, and deriving two relations it does not ship), #956
-  (`Method_Descriptor` was projecting the parameter list instead of
-  `returnType(params)`), and above all **#955**, a plan-generation defect
-  that made the evaluator drop most of its own derivations. The total is
-  not comparable to the previous row in any tuple-level sense; see below.
-
-**The DOOP row describes a specific artifact**: the FlowLog zxing archive
-with sha256
-`154593343fefd18306d4098ba9f6286947b134b56ebcf83d8e8eae368d5867e7`
-(35 `.facts` files, ~740 MB unpacked), fetched by
-`bench/data/doop/download.sh`. **It needs roughly 40 GB of RAM and takes
-about 23 minutes** at W=1 -- the 2026-05-24 row's 12 GB and 33 s do not
-describe what running this costs. That row was measured before #955, when
-the evaluator was dropping most of its own derivations: `VarPointsTo`
-measured 5,266 against a true value near 4.1 million. The old speed was
-under-derivation, not performance.
-
-**The difference from the 2026-05-24 row is accounted for.** Upstream
-replaced the archive at that URL on 2026-05-24, 51 minutes after the old
-row was measured, with a regenerated Soot fact dump rather than a
-re-encoding. The HuggingFace mirror is git-backed, so the original is still
-served at revision `e9d2e0e` (117,156,975 bytes, sha256 `dcd842b8...`) --
-which is what the "~112 MB" in `download.sh` had been describing all along.
-Building the benchmark at `70f4d84` and running it against that recovered
-archive reproduces the old row exactly: **6,276,657 tuples, 28 iterations,
-11.8 GB**.
-
-Running today's engine against both archives separates the two causes:
-
-| | tuples | iterations |
-|---|---|---|
-| `70f4d84` engine, old archive (the old row) | 6,276,657 | 28 |
-| today's engine, old archive | 14,470,301 | 160 |
-| today's engine, current archive | 13,828,835 | 153 |
-
-**The engine change dominates.** #955 -- a plan-generation defect that
-shifted join keys past a semijoin and silently resolved them to column 0 --
-had the evaluator dropping most of its own derivations, so the old row was
-not a smaller-but-correct answer, it was a different and wrong one. No
-tuple-level decomposition against it is meaningful.
-
-The archive change is the smaller term and still real: upstream replaced
-the artifact 51 minutes after the old row was measured, with a regenerated
-Soot fact dump rather than a re-encoding. The dominant single input change
-is `AssignLocal`, 306,227 -> 144,124 rows: it is the main source of
-`Assign`, and `VarPointsTo` closure over `Assign` dominates the total. 32
-of the 34 shared relations changed; only `MainClass` and `ApplicationClass`
-did not. See #952.
-
-The recovered archive also ships full-DOOP reference outputs, which is the
-first external check this benchmark has had. Post-#955, on the current
-archive, against the reference (a different dataset, so exact agreement is
-not expected): `Reachable` 6,127 vs 6,167, `ArrayIndexPointsTo` 32,859 vs
-33,018, `InstanceFieldPointsTo` 3,792,166 vs 3,837,529, `VarPointsTo`
-4,121,488 vs 4,455,314. Before #955 those measured 498, 0, and 5,266.
-
-**Incremental evaluation** (CSPA, delta-seeded): W=1 baseline 1.31s
--> incremental re-eval 15.3ms (**86.0x faster**); W=8 baseline 691.3ms
--> incremental re-eval 27.5ms (**25.1x faster**); W=16 baseline 673.9ms
--> incremental re-eval 27.1ms (**24.9x faster**). Each run inserted one
-fact and changed the result from 20,381 to 21,063 tuples.
-
-`--workers N` means "use up to N workers", not "force exactly N workers for
-every stratum". The evaluator selects an active width per eligible TDD or
-K-Fusion path, falls back to narrower execution when a plan is not safely
-partitionable, and caps some paths to avoid spending memory on idle worker
-state. This keeps `W=N` adaptive: increasing N gives the runtime permission to
-use more parallelism where it is semantically safe and profitable, while
-single-threaded or narrow strata remain valid.
-
-Re-run the large-workload snapshot with:
+Reproduce the matrix with the reviewed runner and pinned data manifest:
 
 ```bash
-meson setup build --buildtype=release
-meson compile -C build bench/bench_flowlog
-for w in 1 8 16; do
-  ./build/bench/bench_flowlog --workload tc --data bench/data/graph_100.csv --workers "$w" --repeat 5
-  ./build/bench/bench_flowlog --workload reach --data bench/data/graph_100.csv --workers "$w" --repeat 5
-  ./build/bench/bench_flowlog --workload cc --data bench/data/graph_100.csv --workers "$w" --repeat 5
-  ./build/bench/bench_flowlog --workload sssp --data bench/data/graph_100.csv --data-weighted bench/data/graph_100_weighted.csv --workers "$w" --repeat 5
-  ./build/bench/bench_flowlog --workload sg --data bench/data/graph_100.csv --workers "$w" --repeat 5
-  ./build/bench/bench_flowlog --workload bipartite --data bench/data/graph_100.csv --workers "$w" --repeat 5
-  ./build/bench/bench_flowlog --workload andersen --data-andersen bench/data/andersen --workers "$w" --repeat 5
-  ./build/bench/bench_flowlog --workload dyck --data-dyck bench/data/dyck --workers "$w" --repeat 5
-  ./build/bench/bench_flowlog --workload cspa-fast --data-cspa bench/data/cspa --workers "$w" --repeat 5
-  ./build/bench/bench_flowlog --workload cspa --data-cspa bench/data/cspa --workers "$w" --repeat 5
-  ./build/bench/bench_flowlog --workload csda --data-csda bench/data/csda --workers "$w" --repeat 5
-  ./build/bench/bench_flowlog --workload galen --data-galen bench/data/galen --workers "$w" --repeat 5
-  ./build/bench/bench_flowlog --workload polonius --data-polonius bench/data/polonius --workers "$w" --repeat 5
-  ./build/bench/bench_flowlog --workload ddisasm --data-ddisasm bench/data/ddisasm --workers "$w" --repeat 5
-  ./build/bench/bench_flowlog --workload crdt --data-crdt bench/data/crdt --workers "$w" --repeat 5
-  ./build/bench/bench_flowlog --workload doop --data-doop bench/data/doop --workers "$w" --repeat 5
-done
+meson setup build-portfolio --buildtype=release -Doptimization=s -Db_lto=true -Dwirelog_log_max_level=error
+meson compile -C build-portfolio -j4 bench/bench_flowlog
+python scripts/perf/run-flowlog-portfolio.py --repo-root "$PWD" \
+  --bench build-portfolio/bench/bench_flowlog \
+  --out-dir benchmark-output --workers 1,8,16 --repeat 5 \
+  --workload tc --workload reach --workload cc --workload sssp \
+  --workload sg --workload bipartite --workload andersen --workload dyck \
+  --workload cspa-fast --workload cspa --workload csda --workload galen \
+  --workload polonius --workload ddisasm --workload crdt
 ```
+
+Run the DOOP rows separately with the same setup after verifying the pinned data manifest:
+
+```bash
+python scripts/perf/run-flowlog-portfolio.py --repo-root "$PWD" \
+  --bench build-portfolio/bench/bench_flowlog \
+  --out-dir benchmark-doop --workers 1,8,16 --workload doop --repeat 1
+```
+
+The runner records source/tree cleanliness, binary and data hashes, commands, JSON/TSV output, host samples, and a durable manifest. The perf suite remains separately gated; no performance threshold or baseline was raised.
 
 ## Examples
 
