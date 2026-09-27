@@ -18,8 +18,8 @@ import zipfile
 
 API = "https://api.github.com"
 
-# One maintainer-authorized reset to the reviewed PR #1959 measurement.
-# This record deliberately provides no general PR-baseline eligibility.
+# One-time, maintainer-authorized PR measurements. These exact records do not
+# provide general PR-baseline eligibility.
 REVIEWED_PR_BASELINE = {
     "schema_version": 1, "status": "trusted-reviewed-pr-size-job",
     "authorization_id": "pr-1959-reviewed-head-34eeb23c",
@@ -32,6 +32,40 @@ REVIEWED_PR_BASELINE = {
     "profile_sha256": "cd6cc2f2c54520ba56c8efc0241b17d722d00c8b569cb6c6bb38f5e10d5e1508",
     "job_log_sha256": "92a8693156963c73b8ddc1e296527c0e12ec1a7cf2973247a1e9189d521759c4",
 }
+
+REVIEWED_PR1959_MEASUREMENT = {
+    "base_repository_baseline_bytes": 387391, "source_baseline_bytes": 387391,
+    "measured_base_bytes": 389203, "reported_baseline_bytes": 387391,
+    "budget_bytes": 5120, "measurement_status": "over-budget",
+}
+
+REVIEWED_PR1961_BASELINE = {
+    "schema_version": 1, "status": "trusted-reviewed-pr-size-job",
+    "authorization_id": "pr-1961-maintainer-approved-head-418116cf",
+    "repository": "semantic-reasoning/wirelog", "pr_number": 1961,
+    "baseline_bytes": 404282,
+    "source_sha": "418116cf14e915f6391082ea37b2884b67edd960",
+    "base_sha": "4ef15bbcb33151d00ddb93ebbdeefa042b32fb43",
+    "tested_merge_sha": "37b4738629224f1f588af23bd75aa2feca17e911",
+    "run_id": 36283418997, "job_id": 108519917114,
+    "profile_sha256": "cd6cc2f2c54520ba56c8efc0241b17d722d00c8b569cb6c6bb38f5e10d5e1508",
+    "job_log_sha256": "972f894abf88853a218c25ca15bc7897eb829785f812b63e3eeff3e0b8ea0e72",
+    "base_repository_baseline_bytes": 395540,
+    "source_baseline_bytes": 397579, "measured_base_bytes": 397579,
+    "reported_baseline_bytes": 397579,
+    "budget_bytes": 5120, "measurement_status": "over-budget",
+}
+
+
+def reviewed_pr_baselines():
+    # A function keeps the legacy #1959 fixture patchable without weakening
+    # exact-record equality for production authorization.
+    return (REVIEWED_PR_BASELINE, REVIEWED_PR1961_BASELINE)
+
+def reviewed_pr_measurement(p):
+    if p == REVIEWED_PR_BASELINE:
+        return REVIEWED_PR1959_MEASUREMENT
+    return p
 
 def canonical_hash(value):
     profile = dict(value); profile.pop("source_sha", None)
@@ -120,28 +154,53 @@ def reviewed_pr_reference_tree(base_sha, pinned_base, source):
         fail("reviewed PR rebased reference is not a tree")
     return tree
 
-def authorize_reviewed_pr(repo, base_sha, candidate_sha, candidate_value, p, token):
-    if p != REVIEWED_PR_BASELINE or repo != p["repository"] or not token:
+def reviewed_pr_repair_paths(p):
+    if p == REVIEWED_PR_BASELINE or p.get("pr_number") == 1959:
+        return {
+            "tests/baseline_size.txt", "tests/baseline_size.provenance.json",
+            "scripts/ci/verify-size-baseline.py",
+            "scripts/ci/test-size-baseline-provenance.py",
+            "tests/test_consolidate_kway_merge.c",
+            "tests/test_memory_admission_relation.c",
+            "tests/test_wirelog_easy.c", "tests/test_wirelog_advanced.c",
+            "tests/test_memory_admission_join.c", "tests/test_join_batch_resume.c",
+            "tests/test_diff_join.c", "tests/test_join_arrangement.c",
+            "wirelog/columnar/relation.c", "wirelog/columnar/join.c",
+            "wirelog/columnar/join_batch.c", "wirelog/columnar/diff_join_batch.c",
+        }
+    if p == REVIEWED_PR1961_BASELINE:
+        return {
+            "docs/BINARY_SIZE.md", "scripts/ci/verify-size-baseline.py",
+            "scripts/ci/test-size-baseline-provenance.py",
+            "tests/baseline_size.txt", "tests/baseline_size.provenance.json",
+        }
+    fail("reviewed PR baseline record is not recognized")
+
+def authorize_reviewed_pr(repo, base_sha, candidate_sha, base_value,
+                          candidate_value, p, token):
+    if p not in reviewed_pr_baselines() or repo != p["repository"] or not token:
         fail("reviewed PR baseline requires the exact approved record and Actions API access")
+    repair_paths = reviewed_pr_repair_paths(p)
+    measurement = reviewed_pr_measurement(p)
+    if base_value != measurement["base_repository_baseline_bytes"]:
+        fail("current event base baseline differs from the reviewed record")
     source = p["source_sha"]
     if (candidate_value != p["baseline_bytes"] or
             candidate_sha in (source, p["tested_merge_sha"])):
         fail("reviewed PR baseline source, event base, or byte count differs")
+    root = Path(__file__).resolve().parents[2]
+    for sha, expected in ((base_sha, measurement["base_repository_baseline_bytes"]),
+                          (p["base_sha"], measurement["base_repository_baseline_bytes"]),
+                          (source, measurement["source_baseline_bytes"])):
+        recorded = subprocess.check_output(
+            ["git", "show", f"{sha}:tests/baseline_size.txt"], cwd=root,
+            text=True, encoding="ascii").strip()
+        if recorded != str(expected):
+            fail("base or measured-source baseline file differs from the reviewed record")
     reference = reviewed_pr_reference_tree(base_sha, p["base_sha"], source)
     changed = subprocess.check_output(["git", "diff", "--name-only", reference,
                                       candidate_sha], text=True, encoding="utf-8").splitlines()
-    allowed = {"tests/baseline_size.txt", "tests/baseline_size.provenance.json",
-               "scripts/ci/verify-size-baseline.py",
-               "scripts/ci/test-size-baseline-provenance.py",
-               "tests/test_consolidate_kway_merge.c",
-               "tests/test_memory_admission_relation.c",
-               "tests/test_wirelog_easy.c", "tests/test_wirelog_advanced.c",
-               "tests/test_memory_admission_join.c", "tests/test_join_batch_resume.c",
-               "tests/test_diff_join.c", "tests/test_join_arrangement.c",
-               "wirelog/columnar/relation.c",
-               "wirelog/columnar/join.c",
-               "wirelog/columnar/join_batch.c", "wirelog/columnar/diff_join_batch.c"}
-    if not changed or not set(changed).issubset(allowed):
+    if not changed or not set(changed).issubset(repair_paths):
         fail("reviewed PR rebaseline has changes outside its reviewed repair paths")
     api = f"{API}/repos/{repo}"
     merge = request(f"{api}/git/commits/{p['tested_merge_sha']}", token)
@@ -166,9 +225,12 @@ def authorize_reviewed_pr(repo, base_sha, candidate_sha, candidate_value, p, tok
     run = request(f"{api}/actions/runs/{p['run_id']}", token)
     if (run.get("path") != ".github/workflows/ci-pr.yml" or
             run.get("event") != "pull_request" or run.get("head_sha") != source or
+            run.get("repository", {}).get("full_name") != repo or
             not any(pr.get("number") == p["pr_number"] and
-                    pr.get("base", {}).get("sha") in (p["base_sha"], base_sha) and
-                    pr.get("head", {}).get("sha") == parents[2]
+                    pr.get("base", {}).get("sha") == p["base_sha"] and
+                    pr.get("head", {}).get("sha") == source and
+                    pr.get("base", {}).get("repo", {}).get("url") == f"{API}/repos/{repo}" and
+                    pr.get("head", {}).get("repo", {}).get("url") == f"{API}/repos/{repo}"
                     for pr in run.get("pull_requests", []))):
         fail("reviewed PR measurement run identity differs")
     job = request(f"{api}/actions/jobs/{p['job_id']}", token)
@@ -193,12 +255,16 @@ def authorize_reviewed_pr(repo, base_sha, candidate_sha, candidate_value, p, tok
         fail("reviewed PR measurement policy report is missing")
     report = json.loads(match.group())
     expected = {"base_sha": p["base_sha"], "head_sha": p["tested_merge_sha"],
-                "base_bytes": 389203, "head_bytes": 395540, "baseline_bytes": 387391,
-                "budget_bytes": 5120, "status": "over-budget",
+                "base_bytes": measurement["measured_base_bytes"],
+                "head_bytes": p["baseline_bytes"],
+                "baseline_bytes": measurement["reported_baseline_bytes"],
+                "allowed_head_bytes": measurement["reported_baseline_bytes"] + measurement["budget_bytes"],
+                "delta_from_baseline_bytes": p["baseline_bytes"] - measurement["reported_baseline_bytes"],
+                "budget_bytes": measurement["budget_bytes"],
+                "status": measurement["measurement_status"],
                 "base_profile": p["profile_sha256"], "head_profile": p["profile_sha256"]}
     if any(report.get(k) != v for k, v in expected.items()):
         fail("reviewed PR measurement profile or policy values differ")
-    root = Path(__file__).resolve().parents[2]
     with tempfile.TemporaryDirectory(prefix="wirelog-reviewed-baseline-") as temp:
         source_dir = Path(temp) / "source"; build = Path(temp) / "build"
         source_dir.mkdir()
@@ -221,7 +287,7 @@ def authorize_reviewed_pr(repo, base_sha, candidate_sha, candidate_value, p, tok
                  if line.split() and line.split()[0] == ".text"]
         if sizes != [candidate_value]:
             fail("reviewed PR baseline bytes cannot be reproduced")
-    return "one-time reviewed PR #1959 measurement reproduced"
+    return f"one-time reviewed PR #{p['pr_number']} measurement reproduced"
 
 def authorize(repo, base_sha, candidate_sha, base_value, candidate_value, provenance_path, token):
     base_value = int(base_value); candidate_value = int(candidate_value)
@@ -229,7 +295,8 @@ def authorize(repo, base_sha, candidate_sha, base_value, candidate_value, proven
         return "unchanged"
     p = json.loads(Path(provenance_path).read_text(encoding="utf-8"))
     if p.get("status") == "trusted-reviewed-pr-size-job":
-        return authorize_reviewed_pr(repo, base_sha, candidate_sha, candidate_value, p, token)
+        return authorize_reviewed_pr(repo, base_sha, candidate_sha, base_value,
+                                     candidate_value, p, token)
     if p.get("schema_version") != 1 or p.get("status") != "trusted-ci-artifact":
         fail("numeric baseline update requires a trusted-ci-artifact provenance record")
     if not token:
