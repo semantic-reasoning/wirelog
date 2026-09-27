@@ -41,7 +41,20 @@
 #ifdef WL_SESSION_TEST_HOOKS
 bool wl_columnar_merge_test_fail_copy_alloc;
 bool wl_columnar_merge_test_fail_copy_append;
+bool wl_columnar_merge_test_fail_concat_boundaries_alloc;
 #endif
+
+static void *
+wl_columnar_merge_concat_boundaries_alloc(size_t bytes)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_merge_test_fail_concat_boundaries_alloc) {
+        wl_columnar_merge_test_fail_concat_boundaries_alloc = false;
+        return NULL;
+    }
+#endif
+    return malloc(bytes);
+}
 
 static void *
 col_op_consolidate_malloc(size_t size, const char *site)
@@ -155,6 +168,24 @@ col_op_dispose_entry_primary(eval_stack_t *stack, eval_entry_t *entry,
     return primary_rc != 0 ? primary_rc : cleanup_rc;
 }
 
+/* Before input consumption starts, both popped slots remain available and
+ * the candidate has never been published or borrowed. Preserve complete
+ * entries, including segment ownership, for a retry of the same operator. */
+static int
+wl_columnar_merge_concat_abort(eval_stack_t *stack, wl_col_session_t *sess,
+    eval_entry_t *a, eval_entry_t *b, col_rel_t *candidate, int rc)
+{
+    if (rc == ENOMEM && candidate && candidate->memory_budget_denial_pending)
+        rc = ENOSPC;
+    if (rc == ENOSPC && sess)
+        sess->memory_budget_denied = true;
+    col_rel_destroy(candidate);
+    int restore_rc = eval_stack_repush_entry(stack, a);
+    if (restore_rc == 0)
+        restore_rc = eval_stack_repush_entry(stack, b);
+    return restore_rc != 0 ? restore_rc : rc;
+}
+
 static int
 col_op_cleanup_owned_relation(eval_stack_t *stack, eval_entry_t *entry,
     col_rel_t *rel, bool owned, int primary_rc)
@@ -214,20 +245,23 @@ col_op_concat(eval_stack_t *stack, wl_col_session_t *sess)
     sess->profile.concat_calls++;
 #endif
 
-    col_rel_t *out = col_rel_pool_new_like(sess->delta_pool, "$concat", a);
-    if (!out) {
-        return col_op_concat_cleanup(stack, &a_e, &b_e, ENOMEM);
-    }
+    wl_columnar_memory_governor_ref_t *governor = sess->memory_governor
+        ? sess->memory_governor : a->memory_governor
+        ? a->memory_governor : b->memory_governor;
+    col_rel_t *out = NULL;
+    int rc = wl_columnar_relation_pool_new_like_governed_checked(&out,
+            sess->delta_pool, "$concat", a, governor);
+    if (rc != 0)
+        return wl_columnar_merge_concat_abort(stack, sess, &a_e, &b_e,
+                   out, rc);
 
-    int rc = col_rel_append_all(out, a, NULL);
+    rc = col_rel_append_all(out, a, NULL);
     if (rc == 0)
         rc = col_rel_append_all(out, b, NULL);
 
-    if (rc != 0) {
-        int cleanup_rc = col_op_concat_cleanup(stack, &a_e, &b_e, rc);
-        col_rel_destroy(out);
-        return cleanup_rc;
-    }
+    if (rc != 0)
+        return wl_columnar_merge_concat_abort(stack, sess, &a_e, &b_e,
+                   out, rc);
 
     /* Track segment boundaries for K-way merge optimization. */
     uint32_t left_segs = a_e.seg_count > 0 ? a_e.seg_count : 1;
@@ -235,12 +269,11 @@ col_op_concat(eval_stack_t *stack, wl_col_session_t *sess)
     uint32_t total_segs = left_segs + right_segs;
 
     uint32_t *out_boundaries
-        = (uint32_t *)malloc((total_segs + 1) * sizeof(uint32_t));
-    if (!out_boundaries) {
-        int cleanup_rc = col_op_concat_cleanup(stack, &a_e, &b_e, ENOMEM);
-        col_rel_destroy(out);
-        return cleanup_rc;
-    }
+        = (uint32_t *)wl_columnar_merge_concat_boundaries_alloc(
+            (total_segs + 1) * sizeof(uint32_t));
+    if (!out_boundaries)
+        return wl_columnar_merge_concat_abort(stack, sess, &a_e, &b_e,
+                   out, ENOMEM);
 
     /* Copy left boundaries */
     if (a_e.seg_boundaries != NULL) {
