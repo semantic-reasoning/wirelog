@@ -2209,6 +2209,83 @@ cleanup:
 #undef GOV_CHECK
 }
 
+static void
+test_governed_borrowed_cons_late_allocator(unsigned route)
+{
+    TEST("governed borrowed CONS restores entry after late allocator failure");
+    wl_col_session_t sess = { 0 };
+    col_rel_t *source = col_rel_new_auto("late-cons", 1);
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    const char *failure = NULL;
+    uint32_t nrows = route == 2 ? 10001u : 42u;
+#define LATE_CHECK(c, m) do { if (!(c)) { failure = m; goto cleanup; \
+                              } } while (0)
+    sess.memory_governor = test_consolidate_governor_create(UINT64_C(1) << 26);
+    LATE_CHECK(source && sess.memory_governor, "late CONS fixture");
+    if (route == 4) {
+        wirelog_column_type_t type = WIRELOG_TYPE_FLOAT;
+        LATE_CHECK(col_rel_set_column_types(source, &type, 1) == 0,
+            "late float metadata");
+    }
+    for (uint32_t i = 0; i < nrows; i++) {
+        int64_t value = (nrows - i) % 7u;
+        if (route == 4)
+            value = wl_columnar_float_to_bits((double)value - 3.0);
+        LATE_CHECK(col_rel_append_row(source, &value) == 0, "late source row");
+    }
+    if (route == 3)
+        LATE_CHECK(col_rel_enable_timestamps(source) == 0, "late timestamps");
+    LATE_CHECK(eval_stack_push(&stack, source, false) == 0, "late input push");
+    uint32_t *bounds = malloc(3u * sizeof(*bounds));
+    LATE_CHECK(bounds, "late input metadata");
+    bounds[0] = 0; bounds[1] = nrows / 2u; bounds[2] = nrows;
+    stack.items[0].seg_boundaries = bounds;
+    stack.items[0].seg_count = route == 0 || route == 2 || route == 4 ? 1u : 2u;
+    stack.items[0].is_delta = true;
+    if (stack.items[0].seg_count == 1) bounds[1] = nrows;
+    uint64_t generation = source->view_generation;
+    const char *site = route == 0 ? "radix_workspace_perm_a"
+        : route == 4 ? "radix_workspace_insertion_rows"
+        : route == 2 ? "hash_table"
+        : route == 3 ? "merge_timestamps" : "merge_output";
+    fail_consolidate_allocation_at(site);
+    LATE_CHECK(col_op_consolidate(&stack, &sess) == ENOMEM
+        && consolidate_fail_used && !sess.memory_budget_denied
+        && stack.top == 1 && stack.items[0].rel == source
+        && !stack.items[0].owned && stack.items[0].is_delta
+        && stack.items[0].seg_boundaries == bounds
+        && source->nrows == nrows && source->view_generation == generation
+        && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            sess.memory_governor)) == 0,
+        "late allocator refusal must restore complete input and credit");
+    for (uint32_t i = 0; i < nrows; i++)
+        LATE_CHECK(source->columns[0][i] == (route == 4
+            ? wl_columnar_float_to_bits((double)((nrows - i) % 7u) - 3.0)
+            : (int64_t)((nrows - i) % 7u)),
+            "late allocator refusal changed source rows");
+    clear_consolidate_allocation_failure();
+    LATE_CHECK(col_op_consolidate(&stack, &sess) == 0 && stack.top == 1
+        && stack.items[0].owned && stack.items[0].rel->nrows == 7,
+        "late allocator refusal successful retry");
+    for (uint32_t i = 0; i < 7; i++)
+        LATE_CHECK(stack.items[0].rel->columns[0][i] == (route == 4
+            ? wl_columnar_float_to_bits((double)i - 3.0) : (int64_t)i),
+            "late allocator retry exact result");
+cleanup:
+    clear_consolidate_allocation_failure();
+    (void)eval_stack_drain(&stack);
+    col_rel_destroy(source);
+    if (sess.memory_governor) {
+        if (wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                sess.memory_governor)) != 0 && !failure)
+            failure = "late CONS leaked credit";
+        wl_columnar_memory_governor_ref_release(sess.memory_governor);
+    }
+    if (failure) FAIL(failure); else PASS();
+#undef LATE_CHECK
+}
+
 int
 main(void)
 {
@@ -2250,6 +2327,8 @@ main(void)
         test_timestamp_cons_entry(ownership, 2, 2);
         test_timestamp_cons_entry(ownership, 0, 2);
     }
+    for (unsigned route = 0; route < 5; route++)
+        test_governed_borrowed_cons_late_allocator(route);
     test_timestamp_cons_governor_denial();
     test_timestamp_set_merge(1, 34, 0, false, false);
     test_timestamp_set_merge(2, 34, 0, false, false);
