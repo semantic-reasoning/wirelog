@@ -1744,6 +1744,21 @@ wl_columnar_session_tdd_debug_decision(const wl_plan_stratum_t *sp,
     if (!env || env[0] == '\0' || env[0] == '0')
         return;
 
+    /* Diagnostic capability only; never participates in admission. K=1 and
+     * unsupported relations are reported explicitly, not silently omitted. */
+    if (sp) {
+        for (uint32_t r = 0; r < sp->relation_count; r++) {
+            wl_columnar_eval_tdd_plan_manifest_t bindings;
+            int rc = wl_columnar_eval_tdd_plan_bindings(sp, r, &bindings);
+            fprintf(stderr,
+                "TDD bindings rel=%s status=%d alternatives=%u slices=%u reads=%u\n",
+                sp->relations[r].name ? sp->relations[r].name : "(null)", rc,
+                bindings.alternative_count, bindings.slice_count,
+                bindings.read_count);
+            wl_columnar_eval_tdd_plan_bindings_free(&bindings);
+        }
+    }
+
     const char *first_rel = (sp && sp->relation_count > 0)
         ? sp->relations[0].name : "(none)";
     wl_tdd_segment_stats_t segment_stats;
