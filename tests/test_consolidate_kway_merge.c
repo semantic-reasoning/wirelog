@@ -2328,18 +2328,20 @@ test_radix_workspace_preflight(uint32_t count, bool timestamped)
     if (timestamped)
         scratch += (uint64_t)count * sizeof(col_delta_timestamp_t);
     const uint64_t extra = 19;
-    atomic_store(&g->usable_bytes, baseline + scratch + extra - 1);
+    atomic_store_explicit(&g->usable_bytes, baseline + scratch + extra - 1,
+        memory_order_seq_cst);
     WP_CHECK(wl_columnar_radix_workspace_prepare(rel, bounds, 1, extra,
         &workspace) == ENOMEM && rel->memory_budget_denial_pending
         && wl_columnar_memory_reserved(g) == baseline, "real budget denial");
-    atomic_store(&g->usable_bytes, UINT64_C(1) << 30);
+    atomic_store_explicit(&g->usable_bytes, UINT64_C(1) << 30,
+        memory_order_seq_cst);
     rel->memory_budget_denial_pending = false; /* New owning operation. */
     WP_CHECK(wl_columnar_radix_workspace_prepare(rel, bounds, 1, UINT64_MAX,
         &workspace) == EOVERFLOW && !rel->memory_budget_denial_pending
         && wl_columnar_memory_reserved(g) == baseline, "arithmetic overflow");
     wl_columnar_memory_reservation_t padding;
     wl_columnar_memory_reservation_init(&padding);
-    atomic_store(&g->usable_bytes, UINT64_MAX);
+    atomic_store_explicit(&g->usable_bytes, UINT64_MAX, memory_order_seq_cst);
     WP_CHECK(wl_columnar_memory_reserve_checked(g, UINT64_MAX - baseline - 1,
         &padding) == WL_COLUMNAR_MEMORY_ADMISSION_OK,
         "reserve overflow padding");
@@ -2347,7 +2349,8 @@ test_radix_workspace_preflight(uint32_t count, bool timestamped)
             &workspace);
     uint64_t after = wl_columnar_memory_reserved(g);
     bool released = wl_columnar_memory_release(&padding);
-    atomic_store(&g->usable_bytes, UINT64_C(1) << 30);
+    atomic_store_explicit(&g->usable_bytes, UINT64_C(1) << 30,
+        memory_order_seq_cst);
     WP_CHECK(rc == EOVERFLOW && after == UINT64_MAX - 1 && released
         && wl_columnar_memory_reserved(g) == baseline
         && !rel->memory_budget_denial_pending, "accounting overflow");
@@ -2385,7 +2388,8 @@ test_radix_workspace_preflight(uint32_t count, bool timestamped)
     WP_CHECK(wl_columnar_radix_workspace_prepare(rel, bounds, 1, UINT64_MAX,
         &workspace) == EOVERFLOW && rel->memory_budget_denial_pending,
         "nested failure must preserve earlier denial");
-    atomic_store(&g->usable_bytes, baseline + scratch + extra);
+    atomic_store_explicit(&g->usable_bytes, baseline + scratch + extra,
+        memory_order_seq_cst);
     WP_CHECK(wl_columnar_radix_workspace_prepare(rel, bounds, 1, extra,
         &workspace) == 0 && rel->memory_budget_denial_pending
         && wl_columnar_memory_reserved(g) == baseline + scratch + extra,
@@ -2529,9 +2533,11 @@ test_radix_direct_admission(uint32_t count, unsigned route, unsigned ownership,
         + (count >= 50000 ? 65536u * sizeof(uint32_t) : 0);
     if (timestamped)
         scratch += (uint64_t)count * sizeof(col_delta_timestamp_t);
-    atomic_store(&g->usable_bytes, baseline + scratch - 1);
+    atomic_store_explicit(&g->usable_bytes, baseline + scratch - 1,
+        memory_order_seq_cst);
     int rc = test_radix_admitted_call(rel, route);
-    atomic_store(&g->usable_bytes, UINT64_C(1) << 30);
+    atomic_store_explicit(&g->usable_bytes, UINT64_C(1) << 30,
+        memory_order_seq_cst);
     DA_CHECK(rc == ENOMEM && rel->memory_budget_denial_pending,
         "scratch one-byte-short must deny");
     const char *sites[] = {
@@ -2563,13 +2569,14 @@ test_radix_direct_admission(uint32_t count, unsigned route, unsigned ownership,
     }
     wl_columnar_memory_reservation_t padding;
     wl_columnar_memory_reservation_init(&padding);
-    atomic_store(&g->usable_bytes, UINT64_MAX);
+    atomic_store_explicit(&g->usable_bytes, UINT64_MAX, memory_order_seq_cst);
     DA_CHECK(wl_columnar_memory_reserve_checked(g, UINT64_MAX - baseline,
         &padding) == WL_COLUMNAR_MEMORY_ADMISSION_OK, "scratch padding");
     rel->memory_budget_denial_pending = false;
     rc = test_radix_admitted_call(rel, route);
     bool released = wl_columnar_memory_release(&padding);
-    atomic_store(&g->usable_bytes, UINT64_C(1) << 30);
+    atomic_store_explicit(&g->usable_bytes, UINT64_C(1) << 30,
+        memory_order_seq_cst);
     DA_CHECK(rc == EOVERFLOW && released && !rel->memory_budget_denial_pending,
         "direct scratch overflow keeps typed cause");
     wl_columnar_source_access_reader_t reader = { 0 };
@@ -2593,7 +2600,8 @@ test_radix_direct_admission(uint32_t count, unsigned route, unsigned ownership,
     /* Exact scratch budget proves no duplicate admission for owned storage.
      * Shared storage additionally requires the independently admitted COW. */
     if (ownership != 1)
-        atomic_store(&g->usable_bytes, baseline + scratch);
+        atomic_store_explicit(&g->usable_bytes, baseline + scratch,
+            memory_order_seq_cst);
     rel->memory_budget_denial_pending = true;
     DA_CHECK(test_radix_admitted_call(rel, route) == 0
         && rel->memory_budget_denial_pending == (route == 1),
@@ -2678,7 +2686,7 @@ test_radix_workspace_width(uint32_t count, bool floating)
     int64_t *old_column = view->columns[0];
     WW_CHECK(col_rel_source_writer_acquire(view, &writer) == 0, "view writer");
     /* If COW is tried first, this limit yields ENOMEM, not required EINVAL. */
-    atomic_store(&g->usable_bytes, admitted);
+    atomic_store_explicit(&g->usable_bytes, admitted, memory_order_seq_cst);
     WW_CHECK(wl_columnar_relation_radix_sort_with_workspace(view, 0, count,
         &writer, &workspace) == EINVAL && view->col_shared
         && view->columns[0] == old_column && view->view_generation == generation
@@ -2705,11 +2713,12 @@ test_radix_workspace_width(uint32_t count, bool floating)
     WW_CHECK(workspace.insertion_bytes == 0
         && wl_columnar_memory_reserved(g) == baseline,
         "destroy clears capacity");
-    atomic_store(&g->usable_bytes, UINT64_C(1) << 30);
+    atomic_store_explicit(&g->usable_bytes, UINT64_C(1) << 30,
+        memory_order_seq_cst);
     WW_CHECK(wl_columnar_radix_workspace_prepare(wide, bounds, 1, 0,
         &workspace) == 0, "wide reprepare");
     admitted = wl_columnar_memory_reserved(g);
-    atomic_store(&g->usable_bytes, admitted);
+    atomic_store_explicit(&g->usable_bytes, admitted, memory_order_seq_cst);
     WW_CHECK(col_rel_source_writer_acquire(narrow, &writer) == 0,
         "narrow writer");
     WW_CHECK(wl_columnar_relation_radix_sort_with_workspace(narrow, 0, count,
@@ -2725,7 +2734,7 @@ test_radix_workspace_width(uint32_t count, bool floating)
      * to overflow with a real padding token, and preserve its typed cause. */
     wl_columnar_memory_reservation_t padding;
     wl_columnar_memory_reservation_init(&padding);
-    atomic_store(&g->usable_bytes, UINT64_MAX);
+    atomic_store_explicit(&g->usable_bytes, UINT64_MAX, memory_order_seq_cst);
     WW_CHECK(wl_columnar_memory_reserve_checked(g, UINT64_MAX - admitted,
         &padding) == WL_COLUMNAR_MEMORY_ADMISSION_OK, "COW overflow padding");
     int rc = col_rel_source_writer_acquire(view, &writer);
@@ -2733,7 +2742,8 @@ test_radix_workspace_width(uint32_t count, bool floating)
         rc = wl_columnar_relation_radix_sort_with_workspace(view, 0, count,
                 &writer, &workspace);
     bool released = wl_columnar_memory_release(&padding);
-    atomic_store(&g->usable_bytes, UINT64_C(1) << 30);
+    atomic_store_explicit(&g->usable_bytes, UINT64_C(1) << 30,
+        memory_order_seq_cst);
     WW_CHECK(rc == EOVERFLOW && released && !view->memory_budget_denial_pending
         && wl_columnar_memory_reserved(g) == admitted && view->col_shared
         && view->view_generation == generation &&
@@ -2877,9 +2887,11 @@ test_governed_owned_cons(uint32_t count, uint32_t unique, unsigned route,
         wl_columnar_memory_reservation_init(&padding);
         uint32_t saved_boundary = 0;
         if (fault == 0)
-            atomic_store(&g->usable_bytes, baseline);
+            atomic_store_explicit(&g->usable_bytes, baseline,
+                memory_order_seq_cst);
         else if (fault == 1) {
-            atomic_store(&g->usable_bytes, UINT64_MAX);
+            atomic_store_explicit(&g->usable_bytes, UINT64_MAX,
+                memory_order_seq_cst);
             OC_CHECK(wl_columnar_memory_reserve_checked(g,
                 UINT64_MAX - baseline,
                 &padding) == WL_COLUMNAR_MEMORY_ADMISSION_OK,
@@ -2897,7 +2909,8 @@ test_governed_owned_cons(uint32_t count, uint32_t unique, unsigned route,
         clear_consolidate_allocation_failure();
         if (fault == 1)
             OC_CHECK(wl_columnar_memory_release(&padding), "padding release");
-        atomic_store(&g->usable_bytes, UINT64_C(1) << 30);
+        atomic_store_explicit(&g->usable_bytes, UINT64_C(1) << 30,
+            memory_order_seq_cst);
         if (reader.owner)
             OC_CHECK(col_rel_source_reader_release(&reader) == 0,
                 "reader release");
