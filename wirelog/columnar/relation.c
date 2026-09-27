@@ -8155,9 +8155,26 @@ wl_columnar_radix_workspace_prepare(const col_rel_t *rel,
     size_t timestamp_bytes = 0;
     size_t workspace_bytes = 0;
     uint64_t total_scratch_bytes;
+    int failure_rc = ENOMEM;
 
     if (!rel || !seg_boundaries || seg_count == 0 || !workspace)
         return EINVAL;
+    /* A live workspace owns its buffers and reservation until destroy. */
+    if (workspace->admission_active || workspace->perm_a || workspace->perm_b
+        || workspace->bucket_values || workspace->byte_values
+        || workspace->short_values || workspace->count16
+        || workspace->temp_column || workspace->insertion_rows
+        || workspace->timestamps || workspace->timestamp_capacity
+        || workspace->k8_capacity || workspace->k16_capacity
+        || workspace->insertion_capacity)
+        return EINVAL;
+    /* Check the entire boundary sequence before comparing any row. Partial
+     * relation ranges and empty segments are valid preparation inputs. */
+    for (uint32_t s = 0; s < seg_count; s++) {
+        if (seg_boundaries[s] > seg_boundaries[s + 1]
+            || seg_boundaries[s + 1] > rel->nrows)
+            return EINVAL;
+    }
     memset(workspace, 0, sizeof(*workspace));
     for (uint32_t c = 0; rel->column_types && c < rel->ncols; c++)
         has_float |= rel->column_types[c] == WIRELOG_TYPE_FLOAT;
@@ -8166,6 +8183,8 @@ wl_columnar_radix_workspace_prepare(const col_rel_t *rel,
         uint32_t start = seg_boundaries[s];
         uint32_t end = seg_boundaries[s + 1];
         uint32_t count = end - start;
+        if (count <= 1)
+            continue;
         bool sorted = true;
         for (uint32_t row = start + 1; row < end; row++) {
             if (col_rel_row_cmp(rel, row - 1, row) > 0) {
@@ -8173,7 +8192,7 @@ wl_columnar_radix_workspace_prepare(const col_rel_t *rel,
                 break;
             }
         }
-        if (sorted || count <= 1)
+        if (sorted)
             continue;
         if (has_float || count <= 32) {
             if (count > insertion_rows)
@@ -8251,6 +8270,10 @@ wl_columnar_radix_workspace_prepare(const col_rel_t *rel,
             && admission_status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
             if (admission_status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                 ((col_rel_t *)rel)->memory_budget_denial_pending = true;
+            failure_rc = admission_status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                ? ENOMEM : admission_status ==
+                WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : EINVAL;
             goto no_memory;
         }
         workspace->admission_active = true;
@@ -8302,11 +8325,10 @@ wl_columnar_radix_workspace_prepare(const col_rel_t *rel,
     return 0;
 
 overflow:
-    wl_columnar_radix_workspace_destroy(workspace);
-    return ENOMEM;
+    failure_rc = EOVERFLOW;
 no_memory:
     wl_columnar_radix_workspace_destroy(workspace);
-    return ENOMEM;
+    return failure_rc;
 }
 
 static int

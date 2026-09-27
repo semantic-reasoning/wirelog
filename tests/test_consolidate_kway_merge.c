@@ -2286,6 +2286,167 @@ cleanup:
 #undef LATE_CHECK
 }
 
+/* Exercise the public preparation primitive with real governor outcomes and
+ * intercepted allocations, without mutating or forging a relation shape. */
+static void
+test_radix_workspace_preflight(uint32_t count, bool timestamped)
+{
+    TEST("prepared radix workspace retains ownership and typed failures");
+    col_rel_t *rel = col_rel_new_auto("workspace", 1);
+    wl_columnar_memory_governor_ref_t *ref =
+        test_consolidate_governor_create(UINT64_C(1) << 30);
+    wl_columnar_radix_workspace_t workspace = { 0 };
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int64_t *before = malloc((size_t)count * sizeof(*before));
+    col_delta_timestamp_t *before_ts = timestamped
+        ? calloc(count, sizeof(*before_ts)) : NULL;
+    const char *failure = NULL;
+#define WP_CHECK(c, m) do { if (!(c)) { failure = m; goto cleanup; } } while (0)
+    WP_CHECK(rel && ref && before && (!timestamped || before_ts), "fixture");
+    if (timestamped)
+        WP_CHECK(col_rel_enable_timestamps(rel) == 0, "enable timestamps");
+    for (uint32_t i = 0; i < count; i++) {
+        before[i] = count - i;
+        WP_CHECK(col_rel_append_row(rel, &before[i]) == 0, "append");
+        if (timestamped) {
+            rel->timestamps[i] = (col_delta_timestamp_t){
+                .iteration = i, .stratum = 7, .worker = 3, .multiplicity = -2,
+            };
+        }
+    }
+    if (timestamped)
+        memcpy(before_ts, rel->timestamps, (size_t)count * sizeof(*before_ts));
+    WP_CHECK(col_rel_attach_memory_governor(rel, ref) == 0, "attach governor");
+    wl_columnar_memory_governor_t *g = wl_columnar_memory_governor_ref_get(ref);
+    uint64_t baseline = wl_columnar_memory_reserved(g);
+    uint64_t view = rel->view_generation, storage = rel->storage_generation;
+    uint32_t bounds[] = { 0, count };
+    uint64_t scratch = count <= 32 ? ((uint64_t)count + 1) * sizeof(int64_t)
+        : (uint64_t)count * (2 * sizeof(uint32_t) + sizeof(int64_t)
+        + (count >= 50000 ? sizeof(uint16_t) : sizeof(uint8_t)))
+        + (count >= 50000 ? 65536u * sizeof(uint32_t) : 0);
+    if (timestamped)
+        scratch += (uint64_t)count * sizeof(col_delta_timestamp_t);
+    const uint64_t extra = 19;
+    atomic_store(&g->usable_bytes, baseline + scratch + extra - 1);
+    WP_CHECK(wl_columnar_radix_workspace_prepare(rel, bounds, 1, extra,
+        &workspace) == ENOMEM && rel->memory_budget_denial_pending
+        && wl_columnar_memory_reserved(g) == baseline, "real budget denial");
+    atomic_store(&g->usable_bytes, UINT64_C(1) << 30);
+    rel->memory_budget_denial_pending = false; /* New owning operation. */
+    WP_CHECK(wl_columnar_radix_workspace_prepare(rel, bounds, 1, UINT64_MAX,
+        &workspace) == EOVERFLOW && !rel->memory_budget_denial_pending
+        && wl_columnar_memory_reserved(g) == baseline, "arithmetic overflow");
+    wl_columnar_memory_reservation_t padding;
+    wl_columnar_memory_reservation_init(&padding);
+    atomic_store(&g->usable_bytes, UINT64_MAX);
+    WP_CHECK(wl_columnar_memory_reserve_checked(g, UINT64_MAX - baseline - 1,
+        &padding) == WL_COLUMNAR_MEMORY_ADMISSION_OK,
+        "reserve overflow padding");
+    int rc = wl_columnar_radix_workspace_prepare(rel, bounds, 1, 0,
+            &workspace);
+    uint64_t after = wl_columnar_memory_reserved(g);
+    bool released = wl_columnar_memory_release(&padding);
+    atomic_store(&g->usable_bytes, UINT64_C(1) << 30);
+    WP_CHECK(rc == EOVERFLOW && after == UINT64_MAX - 1 && released
+        && wl_columnar_memory_reserved(g) == baseline
+        && !rel->memory_budget_denial_pending, "accounting overflow");
+
+    const uint32_t invalid[][3] = {
+        { 0, count + 1, count }, { 1, 0, count }, { 0, count, count + 1 },
+    };
+    for (uint32_t i = 0; i < 3; i++)
+        WP_CHECK(wl_columnar_radix_workspace_prepare(rel, invalid[i], 2, 0,
+            &workspace) == EINVAL && !rel->memory_budget_denial_pending
+            && wl_columnar_memory_reserved(g) == baseline, "invalid range");
+
+    const char *sites[] = {
+        "radix_workspace_timestamps", "radix_workspace_insertion_rows",
+        "radix_workspace_perm_a", "radix_workspace_perm_b",
+        "radix_workspace_temp_column", "radix_workspace_bucket_values",
+        "radix_workspace_count16",
+    };
+    for (uint32_t i = 0; i < 7; i++) {
+        if ((i == 0 && !timestamped) || (i == 1 && count > 32)
+            || (i >= 2 && count <= 32) || (i == 6 && count < 50000))
+            continue;
+        fail_consolidate_allocation_at(sites[i]);
+        rc = wl_columnar_radix_workspace_prepare(rel, bounds, 1, extra,
+                &workspace);
+        clear_consolidate_allocation_failure();
+        WP_CHECK(consolidate_fail_used && rc == ENOMEM
+            && !rel->memory_budget_denial_pending
+            && wl_columnar_memory_reserved(g) == baseline
+            && !workspace.admission_active && !workspace.perm_a
+            && !workspace.timestamps && !workspace.insertion_rows,
+            "allocator failure must release prior allocations and credit");
+    }
+    rel->memory_budget_denial_pending = true; /* Evidence from an outer scope. */
+    WP_CHECK(wl_columnar_radix_workspace_prepare(rel, bounds, 1, UINT64_MAX,
+        &workspace) == EOVERFLOW && rel->memory_budget_denial_pending,
+        "nested failure must preserve earlier denial");
+    atomic_store(&g->usable_bytes, baseline + scratch + extra);
+    WP_CHECK(wl_columnar_radix_workspace_prepare(rel, bounds, 1, extra,
+        &workspace) == 0 && rel->memory_budget_denial_pending
+        && wl_columnar_memory_reserved(g) == baseline + scratch + extra,
+        "exact admission and nested success");
+    void *allocation = count <= 32 ? (void *)workspace.insertion_rows
+        : (void *)workspace.perm_a;
+    WP_CHECK(wl_columnar_radix_workspace_prepare(rel, bounds, 1, 0,
+        &workspace) == EINVAL
+        && allocation == (count <= 32 ? (void *)workspace.insertion_rows
+            : (void *)workspace.perm_a)
+        && wl_columnar_memory_reserved(g) == baseline + scratch + extra,
+        "live workspace must remain owned after refusal");
+    WP_CHECK(memcmp(before, rel->columns[0],
+        (size_t)count * sizeof(*before)) == 0
+        && (!timestamped || memcmp(before_ts, rel->timestamps,
+        (size_t)count * sizeof(*before_ts)) == 0)
+        && rel->view_generation == view && rel->storage_generation == storage,
+        "preparation must preserve source bytes and generations");
+    WP_CHECK(col_rel_source_writer_acquire(rel, &writer) == 0, "writer");
+    rc = wl_columnar_relation_radix_sort_with_workspace(rel, 0, count,
+            &writer, &workspace);
+    WP_CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "release writer");
+    WP_CHECK(rc == 0 &&
+        wl_columnar_memory_reserved(g) == baseline + scratch + extra,
+        "prepared sort must not charge twice");
+    for (uint32_t i = 0; i < count; i++)
+        WP_CHECK(rel->columns[0][i] == (int64_t)i + 1
+            && (!timestamped || memcmp(&rel->timestamps[i],
+            &before_ts[count - i - 1],
+            sizeof(*before_ts)) == 0), "retry rows and timestamp permutation");
+    wl_columnar_radix_workspace_destroy(&workspace);
+    WP_CHECK(wl_columnar_memory_reserved(g) == baseline, "scratch retired");
+    uint32_t partial[] = { 1, 1, count - 1 }; /* empty then sorted partial range */
+    WP_CHECK(wl_columnar_radix_workspace_prepare(rel, partial, 2, 0,
+        &workspace) == 0 && !workspace.admission_active && !workspace.perm_a
+        && !workspace.insertion_rows && !workspace.timestamps
+        && wl_columnar_memory_reserved(g) == baseline,
+        "sorted and empty ranges");
+cleanup:
+    clear_consolidate_allocation_failure();
+    if (writer.owner)
+        (void)wl_columnar_source_access_writer_release(&writer);
+    wl_columnar_radix_workspace_destroy(&workspace);
+    col_rel_destroy(rel);
+    free(before);
+    free(before_ts);
+    if (ref) {
+        if (wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                ref)) != 0)
+            failure = "reservation leak after teardown";
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef WP_CHECK
+}
+
 int
 main(void)
 {
@@ -2293,6 +2454,9 @@ main(void)
     printf("NOTE: Expected to FAIL at link time until US-002 GREEN phase\n");
     printf("      implements col_op_consolidate_kway_merge.\n\n");
 
+    test_radix_workspace_preflight(3, false);
+    test_radix_workspace_preflight(64, true);
+    test_radix_workspace_preflight(50000, true);
     test_single_copy_passthrough();
     test_two_copies_direct_merge();
     test_two_copies_compare_full_raw_row_width();

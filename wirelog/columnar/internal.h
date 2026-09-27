@@ -2939,6 +2939,13 @@ typedef struct {
     bool admission_active;
 } wl_columnar_radix_workspace_t;
 
+/* Prepare a zero-initialized or fully destroyed workspace. Live workspaces
+ * are refused unchanged; destroy releases their buffers and admission once.
+ * Partial, empty and sorted ranges are supported. All boundaries are checked
+ * before row reads. ENOMEM denotes allocator failure or real budget denial;
+ * only the latter adds memory_budget_denial_pending. This nested helper never
+ * clears earlier denial evidence: the owning operation controls that boundary.
+ * Arithmetic/accounting overflow returns EOVERFLOW; invalid input/state EINVAL. */
 int
 wl_columnar_radix_workspace_prepare(const col_rel_t *rel,
     const uint32_t *seg_boundaries, uint32_t seg_count,
