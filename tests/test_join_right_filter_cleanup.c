@@ -978,7 +978,8 @@ test_managed_right_filter(op_fn_t fn, wl_plan_op_type_t type, bool grow,
     init_op(&op, type);
     ok = eval_stack_push(&stack, left, false) == 0;
     if (!ok) goto cleanup;
-    ok = fn(&op, &stack, sess) == ENOMEM && stack.top == 0;
+    ok = fn(&op, &stack, sess) == ENOSPC && stack.top == 0
+        && sess->memory_budget_denied;
     if (!ok) goto cleanup;
     ok = col_rel_source_reader_acquire(left, &reader) == 0;
     if (!ok) goto cleanup;
@@ -1141,9 +1142,28 @@ test_filter_cache_admission_and_growth(void)
         goto cleanup;
     sess->memory_governor = ref;
     right = session_find_rel(sess, "right");
-    out = wl_columnar_filter_apply_right_filter_cached_pin(sess, &expr,
-            "admission", right, &pin);
-    ok = !out && !pin.active && sess->filt_cache_count == 0
+    int uncached_rc = wl_columnar_filter_apply_right_filter_governed_checked(
+        &expr, right, sess->delta_pool, sess->intern, ref, sess, &out);
+    ok = uncached_rc == ENOSPC && !out && sess->memory_budget_denied
+        && wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref)) == 0;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(ref)
+        ->usable_bytes, 1u << 20, memory_order_release);
+    uncached_rc = wl_columnar_filter_apply_right_filter_governed_checked(
+        &expr, right, sess->delta_pool, sess->intern, ref, sess, &out);
+    ok = ok && uncached_rc == 0 && out && out->nrows == 4;
+    col_rel_destroy(out);
+    out = NULL;
+    if (!ok)
+        goto cleanup;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(ref)
+        ->usable_bytes, 1u, memory_order_release);
+    bool cache_unavailable = false;
+    int cache_rc = wl_columnar_filter_apply_right_filter_cached_pin_checked(
+        sess, &expr, "admission", right, &pin, &out,
+        &cache_unavailable);
+    ok = cache_rc == ENOSPC && !cache_unavailable && !out && !pin.active
+        && sess->memory_budget_denied && sess->filt_cache_count == 0
         && sess->filt_cache_active_pins == 0
         && wl_columnar_memory_reserved(
         wl_columnar_memory_governor_ref_get(ref)) == 0;
@@ -1174,9 +1194,11 @@ test_filter_cache_admission_and_growth(void)
     uint32_t cap_before = sess->filt_cache_cap;
     ok = ok && out && held.active && sess->filt_cache_active_pins == 1;
     col_filt_cache_pin_t blocked = { 0 };
-    out = wl_columnar_filter_apply_right_filter_cached_pin(sess, &expr,
-            "growth-new", right, &blocked);
-    ok = ok && !out && !blocked.active
+    cache_unavailable = false;
+    cache_rc = wl_columnar_filter_apply_right_filter_cached_pin_checked(sess,
+            &expr, "growth-new", right, &blocked, &out,
+            &cache_unavailable);
+    ok = ok && cache_rc == 0 && cache_unavailable && !out && !blocked.active
         && sess->filt_cache_count == count_before
         && sess->filt_cache_cap == cap_before
         && sess->filt_cache_active_pins == 1;
@@ -1203,6 +1225,117 @@ cleanup:
     if (ok) PASS(); else FAIL("admission or pinned cache growth contract");
 }
 
+static void
+test_join_cached_filter_admission(void)
+{
+    TEST("JOIN propagates cached filter denial and retries session");
+    wl_col_session_t *sess = make_mock_session();
+    wl_columnar_memory_governor_ref_t *ref = right_filter_governor(1u);
+    col_rel_t *left = make_left(false);
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    bool local = true;
+    int ok = sess && ref && left && register_right(sess) == 0;
+    if (!ok)
+        goto cleanup;
+    sess->memory_governor = ref;
+    wl_plan_op_t op;
+    init_op(&op, WL_PLAN_OP_JOIN);
+    op.delta_mode = WL_DELTA_FORCE_FULL;
+    op.materialized = false;
+    ok = eval_stack_push(&stack, left, true) == 0;
+    if (!ok)
+        goto cleanup;
+    local = false;
+    int rc = wl_columnar_join_op(&op, &stack, sess);
+    ok = rc == ENOSPC && stack.top == 0 && sess->memory_budget_denied
+        && sess->filt_cache_count == 0
+        && wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref)) == 0;
+    if (!ok)
+        goto cleanup;
+
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(ref)
+        ->usable_bytes, 1u << 20, memory_order_release);
+    left = make_left(false);
+    ok = left && eval_stack_push(&stack, left, true) == 0;
+    if (!ok)
+        goto cleanup;
+    local = false;
+    ok = wl_columnar_join_op(&op, &stack, sess) == 0 && stack.top == 1
+        && exact_join_rows(stack.items[0].rel, true, false)
+        && sess->filt_cache_count == 1;
+cleanup:
+    (void)eval_stack_drain(&stack);
+    if (local)
+        col_rel_destroy(left);
+    if (sess) {
+        sess->memory_governor = NULL;
+        destroy_mock_session(sess);
+    }
+    if (ref) {
+        ok = ok && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0;
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (ok) PASS(); else FAIL("cached filter denial/retry contract");
+}
+
+static void
+test_join_filter_cache_unavailable_fallback(void)
+{
+    TEST("JOIN falls back only for leased stale filter cache");
+    wl_col_session_t *sess = make_mock_session();
+    wl_columnar_memory_governor_ref_t *ref = right_filter_governor(1u << 20);
+    col_rel_t *left = make_left(false);
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    col_filt_cache_pin_t held = { 0 };
+    bool local = true;
+    int ok = sess && ref && left && register_right(sess) == 0;
+    if (!ok)
+        goto cleanup;
+    sess->memory_governor = ref;
+    col_rel_t *right = session_find_rel(sess, "right");
+    wl_plan_expr_buffer_t expr = { filter_bytes, sizeof(filter_bytes) };
+    col_rel_t *cached = wl_columnar_filter_apply_right_filter_cached_pin(
+        sess, &expr, "right", right, &held);
+    ok = cached && held.active && !sess->memory_budget_denied;
+    if (!ok)
+        goto cleanup;
+    int64_t extra[] = { 4, 204 };
+    ok = col_rel_append_row(right, extra) == 0;
+    if (!ok)
+        goto cleanup;
+    wl_plan_op_t op;
+    init_op(&op, WL_PLAN_OP_JOIN);
+    op.delta_mode = WL_DELTA_FORCE_FULL;
+    op.materialized = false;
+    ok = eval_stack_push(&stack, left, true) == 0;
+    if (!ok)
+        goto cleanup;
+    local = false;
+    ok = wl_columnar_join_op(&op, &stack, sess) == 0 && stack.top == 1
+        && exact_join_rows(stack.items[0].rel, true, false)
+        && !sess->memory_budget_denied && sess->filt_cache_count == 1
+        && sess->filt_cache[0].evict_deferred;
+cleanup:
+    col_filt_cache_pin_release(&held);
+    (void)eval_stack_drain(&stack);
+    if (local)
+        col_rel_destroy(left);
+    if (sess) {
+        sess->memory_governor = NULL;
+        destroy_mock_session(sess);
+    }
+    if (ref) {
+        ok = ok && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) == 0;
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (ok) PASS(); else FAIL("filter cache fallback contract");
+}
+
 int
 main(void)
 {
@@ -1219,6 +1352,8 @@ main(void)
     }
     test_managed_filter_cache();
     test_filter_cache_admission_and_growth();
+    test_join_cached_filter_admission();
+    test_join_filter_cache_unavailable_fallback();
     for (unsigned grow = 0; grow < 2; grow++)
         for (unsigned exhaust = 0; exhaust < 2; exhaust++)
             test_managed_right_filter(wl_columnar_join_op, WL_PLAN_OP_JOIN,

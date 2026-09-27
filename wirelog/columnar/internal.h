@@ -3386,6 +3386,11 @@ wl_columnar_filter_apply_right_filter_governed(
     const wl_plan_expr_buffer_t *fexpr,
     col_rel_t *rel, delta_pool_t *pool, wl_intern_t *intern,
     wl_columnar_memory_governor_ref_t *governor);
+int
+wl_columnar_filter_apply_right_filter_governed_checked(
+    const wl_plan_expr_buffer_t *fexpr, col_rel_t *rel, delta_pool_t *pool,
+    wl_intern_t *intern, wl_columnar_memory_governor_ref_t *governor,
+    wl_col_session_t *sess, col_rel_t **out);
 uint64_t
 wl_columnar_filter_fnv1a_hash(const uint8_t *buf, uint32_t len);
 col_rel_t *
@@ -3401,6 +3406,14 @@ col_rel_t *
 wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
     const wl_plan_expr_buffer_t *fexpr, const char *rel_name, col_rel_t *rel,
     col_filt_cache_pin_t *pin);
+/* Checked cache lookup returns zero with *cache_unavailable=true when a
+ * lease/deferred invalidation prevents cache use; allocation and admission
+ * failures are returned as errors so callers do not hide them as fallback. */
+int
+wl_columnar_filter_apply_right_filter_cached_pin_checked(
+    wl_col_session_t *sess, const wl_plan_expr_buffer_t *fexpr,
+    const char *rel_name, col_rel_t *rel, col_filt_cache_pin_t *pin,
+    col_rel_t **out, bool *cache_unavailable);
 void
 col_filt_cache_pin_release(col_filt_cache_pin_t *pin);
 

@@ -2937,7 +2937,7 @@ test_materialized_stack_copy_contract(void)
             sess->memory_governor)->usable_bytes,
         registry_charge(sess) + cache_bytes - 1u,
         memory_order_release);
-    if (run_join(sess, left, &op, &result) != ENOMEM || result.rel
+    if (run_join(sess, left, &op, &result) != ENOSPC || result.rel
         || cached_output(sess, left) != cached
         || reserved_of(sess) != registry_charge(sess) + cache_bytes) {
         FAIL(
@@ -3181,6 +3181,7 @@ test_materialized_cache_insert_failure_unwinds_both_results(void)
         || ordinary.rel->memory_governor != sess->memory_governor
         || !admission_invariant(ordinary.rel)
         || sess->mat_cache.count != COL_MAT_CACHE_MAX
+        || sess->memory_budget_denied
         || reserved_of(sess) != registry_charge(sess)
         + relation_charge(ordinary.rel)) {
         FAIL("ENOSPC did not publish one already-accounted JOIN result");
@@ -3199,6 +3200,7 @@ test_materialized_cache_insert_failure_unwinds_both_results(void)
         || differential.rel->memory_governor != sess->memory_governor
         || !admission_invariant(differential.rel)
         || sess->mat_cache.count != COL_MAT_CACHE_MAX
+        || sess->memory_budget_denied
         || sess->diff_arr_count != 1) {
         FAIL(
             "ENOSPC did not commit differential fallback as one accounted owner");

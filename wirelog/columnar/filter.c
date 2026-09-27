@@ -591,14 +591,27 @@ wl_columnar_filter_prepare_timestamps(col_rel_t *out, const col_rel_t *src)
 }
 
 static int
+wl_columnar_filter_status(wl_col_session_t *sess, col_rel_t *relation,
+    int rc)
+{
+    if (rc == ENOMEM && relation
+        && relation->memory_budget_denial_pending)
+        rc = ENOSPC;
+    if (rc == ENOSPC && sess)
+        sess->memory_budget_denied = true;
+    return rc;
+}
+
+static int
 wl_columnar_filter_append_selected(col_rel_t *out, const col_rel_t *src,
-    uint32_t src_row, const int64_t *row)
+    uint32_t src_row, const int64_t *row, wl_col_session_t *sess)
 {
     if (!out || !src || !row || src_row >= src->nrows
         || (src->timestamps && !out->timestamps))
         return EINVAL;
     uint32_t dst_row = out->nrows;
-    int rc = col_rel_append_row(out, row);
+    int rc = wl_columnar_filter_status(sess, out,
+            col_rel_append_row(out, row));
     if (rc == 0 && src->timestamps)
         out->timestamps[dst_row] = src->timestamps[src_row];
     return rc;
@@ -684,10 +697,12 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
     }
 
     bool timestamped = e.rel->timestamps != NULL;
-    if (timestamped && wl_columnar_filter_prepare_timestamps(out, e.rel)
-        != 0) {
+    int timestamp_rc = timestamped
+        ? wl_columnar_filter_prepare_timestamps(out, e.rel) : 0;
+    if (timestamp_rc != 0) {
+        timestamp_rc = wl_columnar_filter_status(sess, out, timestamp_rc);
         (void)col_rel_destroy_checked(out);
-        return wl_columnar_filter_dispose_input(stack, &e, ENOMEM);
+        return wl_columnar_filter_dispose_input(stack, &e, timestamp_rc);
     }
 
     const uint8_t *buf = op->filter_expr.data;
@@ -770,7 +785,7 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
                         for (uint32_t c = 0; c < ncols; c++)
                             row[c] = columns[c][src_row];
                         int rc = wl_columnar_filter_append_selected(out,
-                                e.rel, src_row, row);
+                                e.rel, src_row, row, sess);
                         if (rc != 0) {
                             free(sel);
                             free(row);
@@ -793,7 +808,7 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     for (uint32_t c = 0; c < ncols; c++)
                         row[c] = columns[c][r];
                     int rc = wl_columnar_filter_append_selected(out, e.rel, r,
-                            row);
+                            row, sess);
                     if (rc != 0) {
                         free(row);
                         wl_columnar_filter_scratch_release(&scratch);
@@ -1034,7 +1049,8 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
             pass = err == WL_COLUMNAR_EXPR_OK && val != 0;
         }
         if (pass) {
-            int rc = wl_columnar_filter_append_selected(out, e.rel, r, row);
+            int rc = wl_columnar_filter_append_selected(out, e.rel, r, row,
+                    sess);
             if (rc != 0) {
                 col_row_buf_release(&row_rb);
                 wl_columnar_filter_scratch_release(&row_scratch);
@@ -1120,7 +1136,7 @@ fill_filtered_rel(const uint8_t *buf, uint32_t bsz, col_rel_t *rel,
             col_rel_row_copy_out(rel, r, row_buf);
             if (col_filter_cmp_row(row_buf, rel->ncols, &cmp)) {
                 int rc = wl_columnar_filter_append_selected(out, rel, r,
-                        row_buf);
+                        row_buf, sess);
                 if (rc != 0) {
                     col_row_buf_release(&rb);
                     wl_columnar_filter_scratch_release(&scratch);
@@ -1159,7 +1175,7 @@ fill_filtered_rel(const uint8_t *buf, uint32_t bsz, col_rel_t *rel,
         }
         if (pass) {
             int rc = wl_columnar_filter_append_selected(out, rel, r,
-                    row_buf);
+                    row_buf, sess);
             if (rc != 0) {
                 col_row_buf_release(&rb);
                 wl_columnar_filter_scratch_release(&scratch);
@@ -1188,22 +1204,43 @@ wl_columnar_filter_apply_right_filter_governed(
     col_rel_t *rel, delta_pool_t *pool, wl_intern_t *intern,
     wl_columnar_memory_governor_ref_t *governor)
 {
-    col_rel_t *out = wl_columnar_relation_pool_new_like_governed(
-        pool, "$rfilter", rel, governor);
-    if (!out)
-        return NULL;
-    if (rel->timestamps && wl_columnar_filter_prepare_timestamps(out, rel)
-        != 0) {
-        col_rel_destroy(out);
-        return NULL;
-    }
+    col_rel_t *out = NULL;
+    return wl_columnar_filter_apply_right_filter_governed_checked(fexpr,
+               rel, pool, intern, governor, NULL, &out) == 0 ? out : NULL;
+}
 
-    if (fill_filtered_rel(fexpr->data, fexpr->size, rel, out, intern,
-        governor, NULL) != 0) {
-        col_rel_destroy(out);
-        return NULL;
+int
+wl_columnar_filter_apply_right_filter_governed_checked(
+    const wl_plan_expr_buffer_t *fexpr, col_rel_t *rel, delta_pool_t *pool,
+    wl_intern_t *intern, wl_columnar_memory_governor_ref_t *governor,
+    wl_col_session_t *sess, col_rel_t **out)
+{
+    int rc;
+    if (!fexpr || !rel || (fexpr->size != 0 && !fexpr->data) || !out)
+        return EINVAL;
+    *out = NULL;
+    rc = wl_columnar_relation_pool_new_like_governed_checked(out, pool,
+            "$rfilter", rel, governor);
+    if (rc != 0) {
+        if (rc == ENOSPC && sess)
+            sess->memory_budget_denied = true;
+        return rc;
     }
-    return out;
+    if (rel->timestamps) {
+        rc = wl_columnar_filter_prepare_timestamps(*out, rel);
+        if (rc != 0)
+            goto failed;
+    }
+    rc = fill_filtered_rel(fexpr->data, fexpr->size, rel, *out, intern,
+            governor, sess);
+    if (rc != 0)
+        goto failed;
+    return 0;
+failed:
+    rc = wl_columnar_filter_status(sess, *out, rc);
+    (void)col_rel_destroy_checked(*out);
+    *out = NULL;
+    return rc;
 }
 
 col_rel_t *
@@ -1321,16 +1358,22 @@ filt_cache_metadata_bytes(const char *rel_name, uint32_t filter_size,
     return 0;
 }
 
-col_rel_t *
-wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
+static col_rel_t *
+wl_columnar_filter_apply_right_filter_cached_pin_impl(wl_col_session_t *sess,
     const wl_plan_expr_buffer_t *fexpr, const char *rel_name, col_rel_t *rel,
-    col_filt_cache_pin_t *pin)
+    col_filt_cache_pin_t *pin, int *status_out, bool *cache_unavailable)
 {
-    if (!pin)
+    if (status_out)
+        *status_out = 0;
+    if (cache_unavailable)
+        *cache_unavailable = false;
+    if (!pin || !status_out || !cache_unavailable || !sess || !fexpr
+        || !rel_name || !rel || (fexpr->size && !fexpr->data)) {
+        if (status_out)
+            *status_out = EINVAL;
         return NULL;
+    }
     memset(pin, 0, sizeof(*pin));
-    if (!sess || !fexpr || !rel_name || !rel)
-        return NULL;
     wl_columnar_memory_governor_ref_t *governor = sess->memory_governor
         ? sess->memory_governor : rel->memory_governor;
     uint64_t fhash = wl_columnar_filter_fnv1a_hash(fexpr->data, fexpr->size);
@@ -1348,8 +1391,10 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
             continue;
         /* A deferred entry is hidden until its last reader releases it;
          * the caller uses an owned filtered relation meanwhile (#1435). */
-        if (e->evict_deferred)
+        if (e->evict_deferred) {
+            *cache_unavailable = true;
             return NULL;
+        }
         /* Cache hit: the freshness token is the contract (Issue #1438);
          * the row count is kept as a cheap second guard. */
         bool fresh = e->filtered
@@ -1362,26 +1407,37 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
              * until the last release and report it unavailable. */
             if (e->pin_count > 0) {
                 e->evict_deferred = true;
+                *cache_unavailable = true;
                 return NULL;
             }
             /* Source changed and nobody reads the old copy: rebuild in place */
             if (e->filtered)
                 col_rel_destroy(e->filtered);
-            e->filtered = wl_columnar_relation_pool_new_like_governed(NULL,
-                    "$rfilter_cache", rel, governor);
-            if (!e->filtered)
-                return NULL;
-            if (rel->timestamps &&
-                wl_columnar_filter_prepare_timestamps(e->filtered, rel)
-                != 0) {
-                col_rel_destroy(e->filtered);
-                e->filtered = NULL;
+            int rebuild_rc =
+                wl_columnar_relation_pool_new_like_governed_checked(
+                &e->filtered, NULL, "$rfilter_cache", rel, governor);
+            if (rebuild_rc != 0) {
+                *status_out = rebuild_rc;
                 return NULL;
             }
-            if (fill_filtered_rel(fexpr->data, fexpr->size, rel, e->filtered,
-                sess->intern, governor, sess) != 0) {
+            int timestamp_rc = rel->timestamps
+                ? wl_columnar_filter_prepare_timestamps(e->filtered, rel) : 0;
+            if (timestamp_rc != 0) {
+                timestamp_rc = wl_columnar_filter_status(sess, e->filtered,
+                        timestamp_rc);
                 col_rel_destroy(e->filtered);
                 e->filtered = NULL;
+                *status_out = timestamp_rc;
+                return NULL;
+            }
+            int fill_rc = fill_filtered_rel(fexpr->data, fexpr->size, rel,
+                    e->filtered, sess->intern, governor, sess);
+            if (fill_rc != 0) {
+                fill_rc = wl_columnar_filter_status(sess, e->filtered,
+                        fill_rc);
+                col_rel_destroy(e->filtered);
+                e->filtered = NULL;
+                *status_out = fill_rc;
                 return NULL;
             }
             e->source_nrows = rel->nrows;
@@ -1396,29 +1452,38 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
         /* Growth moves every entry; refuse it while a lease points into
          * the array (Issue #1435).  The caller falls back to an owned
          * filtered relation for this op. */
-        if (sess->filt_cache_active_pins > 0)
+        if (sess->filt_cache_active_pins > 0) {
+            *cache_unavailable = true;
             return NULL;
+        }
         uint32_t new_cap;
         if (sess->filt_cache_cap == 0)
             new_cap = 4;
         else {
-            if (sess->filt_cache_cap > UINT32_MAX / 2u)
+            if (sess->filt_cache_cap > UINT32_MAX / 2u) {
+                *status_out = EOVERFLOW;
                 return NULL;
+            }
             new_cap = sess->filt_cache_cap * 2;
         }
         uint64_t array_bytes = 0;
         wl_columnar_memory_reservation_t *array_reservation = NULL;
         if (!wl_columnar_memory_size_mul(new_cap,
-            sizeof(*sess->filt_cache), &array_bytes))
+            sizeof(*sess->filt_cache), &array_bytes)) {
+            *status_out = EOVERFLOW;
             return NULL;
+        }
         int array_rc = filt_cache_reserve(sess, array_bytes,
                 &array_reservation);
-        if (array_rc != 0)
+        if (array_rc != 0) {
+            *status_out = array_rc;
             return NULL;
+        }
         void *tmp = realloc(sess->filt_cache,
                 new_cap * sizeof(*sess->filt_cache));
         if (!tmp) {
             filt_cache_release_reservation(&array_reservation);
+            *status_out = ENOMEM;
             return NULL;
         }
         filt_cache_release_reservation(&sess->filt_cache_array_reservation);
@@ -1431,16 +1496,21 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
     uint64_t metadata_bytes = 0;
     int metadata_rc = filt_cache_metadata_bytes(rel_name, fexpr->size,
             &metadata_bytes);
-    if (metadata_rc != 0)
+    if (metadata_rc != 0) {
+        *status_out = metadata_rc;
         return NULL;
+    }
     metadata_rc = filt_cache_reserve(sess, metadata_bytes,
             &sess->filt_cache[idx].metadata_reservation);
-    if (metadata_rc != 0)
+    if (metadata_rc != 0) {
+        *status_out = metadata_rc;
         return NULL;
+    }
     sess->filt_cache[idx].rel_name = strdup(rel_name);
     if (!sess->filt_cache[idx].rel_name) {
         filt_cache_release_reservation(
             &sess->filt_cache[idx].metadata_reservation);
+        *status_out = ENOMEM;
         return NULL;
     }
     /* Store an owned copy of the filter expression bytes for full key compare */
@@ -1449,6 +1519,7 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
         free(sess->filt_cache[idx].rel_name);
         filt_cache_release_reservation(
             &sess->filt_cache[idx].metadata_reservation);
+        *status_out = ENOMEM;
         return NULL;
     }
     memcpy(sess->filt_cache[idx].filter_data, fexpr->data, fexpr->size);
@@ -1457,33 +1528,40 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
     sess->filt_cache[idx].source_nrows = 0; /* will be set after fill */
     sess->filt_cache[idx].source_snapshot = (col_relation_snapshot_t){ 0, 0,
                                                                        0 };
-    sess->filt_cache[idx].filtered =
-        wl_columnar_relation_pool_new_like_governed(NULL,
-            "$rfilter_cache", rel, governor);
-    if (!sess->filt_cache[idx].filtered) {
+    int constructor_rc = wl_columnar_relation_pool_new_like_governed_checked(
+        &sess->filt_cache[idx].filtered, NULL, "$rfilter_cache", rel,
+        governor);
+    if (constructor_rc != 0) {
         free(sess->filt_cache[idx].filter_data);
         free(sess->filt_cache[idx].rel_name);
         filt_cache_release_reservation(
             &sess->filt_cache[idx].metadata_reservation);
+        *status_out = constructor_rc;
         return NULL;
     }
-    if (rel->timestamps
-        && wl_columnar_filter_prepare_timestamps(
-            sess->filt_cache[idx].filtered, rel) != 0) {
+    int timestamp_rc = rel->timestamps
+        ? wl_columnar_filter_prepare_timestamps(
+        sess->filt_cache[idx].filtered, rel) : 0;
+    if (timestamp_rc != 0) {
+        timestamp_rc = wl_columnar_filter_status(sess,
+                sess->filt_cache[idx].filtered, timestamp_rc);
         col_rel_destroy(sess->filt_cache[idx].filtered);
         sess->filt_cache[idx].filtered = NULL;
         free(sess->filt_cache[idx].filter_data);
         free(sess->filt_cache[idx].rel_name);
         filt_cache_release_reservation(
             &sess->filt_cache[idx].metadata_reservation);
+        *status_out = timestamp_rc;
         return NULL;
     }
     sess->filt_cache_count++;
 
     /* Fill the new entry */
     col_rel_t *out = sess->filt_cache[idx].filtered;
-    if (fill_filtered_rel(fexpr->data, fexpr->size, rel, out,
-        sess->intern, governor, sess) != 0) {
+    int fill_rc = fill_filtered_rel(fexpr->data, fexpr->size, rel, out,
+            sess->intern, governor, sess);
+    if (fill_rc != 0) {
+        fill_rc = wl_columnar_filter_status(sess, out, fill_rc);
         col_rel_destroy(out);
         sess->filt_cache[idx].filtered = NULL;
         free(sess->filt_cache[idx].filter_data);
@@ -1494,12 +1572,43 @@ wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
         /* The entry was never published: roll the count back so a failed
          * build cannot strand a cache slot or make later growth skip it. */
         sess->filt_cache_count--;
+        *status_out = fill_rc;
         return NULL;
     }
     sess->filt_cache[idx].source_nrows = rel->nrows;
     sess->filt_cache[idx].source_snapshot
         = wl_columnar_relation_snapshot(rel);
     filt_cache_pin_take(sess, &sess->filt_cache[idx], pin);
+    return out;
+}
+
+int
+wl_columnar_filter_apply_right_filter_cached_pin_checked(
+    wl_col_session_t *sess, const wl_plan_expr_buffer_t *fexpr,
+    const char *rel_name, col_rel_t *rel, col_filt_cache_pin_t *pin,
+    col_rel_t **out, bool *cache_unavailable)
+{
+    int status = 0;
+    if (!out || !cache_unavailable)
+        return EINVAL;
+    *out = NULL;
+    *cache_unavailable = false;
+    *out = wl_columnar_filter_apply_right_filter_cached_pin_impl(sess,
+            fexpr, rel_name, rel, pin, &status, cache_unavailable);
+    if (status == ENOSPC && sess)
+        sess->memory_budget_denied = true;
+    return *out ? 0 : status;
+}
+
+col_rel_t *
+wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
+    const wl_plan_expr_buffer_t *fexpr, const char *rel_name, col_rel_t *rel,
+    col_filt_cache_pin_t *pin)
+{
+    col_rel_t *out = NULL;
+    bool cache_unavailable = false;
+    (void)wl_columnar_filter_apply_right_filter_cached_pin_checked(sess,
+        fexpr, rel_name, rel, pin, &out, &cache_unavailable);
     return out;
 }
 
