@@ -305,7 +305,9 @@ with tempfile.TemporaryDirectory(prefix="reviewed-rebase-") as history:
                         "head_sha": source, "pull_requests": [{"number": record["pr_number"],
                             "base": {"sha": pinned_base,
                                      "repo": {"url": f"{mod.API}/repos/{record['repository']}"}},
-                            "head": {"sha": source,
+                            # GitHub returns the PR's live head here even for an
+                            # older run; run.head_sha remains the immutable source.
+                            "head": {"sha": repair,
                                      "repo": {"url": f"{mod.API}/repos/{record['repository']}"}}}]}
                 run_response.update(run_overrides)
                 return run_response
@@ -403,6 +405,16 @@ with tempfile.TemporaryDirectory(prefix="reviewed-rebase-") as history:
             run_overrides.clear()
             run_overrides["pull_requests"] = []
             check("missing historical PR association is rejected",
+                  lambda: mod.authorize_reviewed_pr(record["repository"], current_base,
+                      event_merge, 395540, record["baseline_bytes"], record, "token"),
+                  "measurement run identity differs")
+            run_overrides.clear()
+            run_overrides["pull_requests"] = [{"number": record["pr_number"],
+                "base": {"sha": pinned_base,
+                         "repo": {"url": f"{mod.API}/repos/{record['repository']}"}},
+                "head": {"sha": "unrelated-head",
+                         "repo": {"url": f"{mod.API}/repos/{record['repository']}"}}}]
+            check("unrelated historical PR association head is rejected",
                   lambda: mod.authorize_reviewed_pr(record["repository"], current_base,
                       event_merge, 395540, record["baseline_bytes"], record, "token"),
                   "measurement run identity differs")
