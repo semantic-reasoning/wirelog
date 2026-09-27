@@ -27,22 +27,105 @@ row-local addons proposed by issue #912 cannot change this evaluation model.
 ## Scalar addon boundary (Status: Current)
 
 Built-in expression functions retain their current parser, plan, evaluator,
-and optimization semantics. Issue #912 proposes a future row-local scalar
-function addon, but provides no runtime or public API; its registry, callback,
-error, and lifetime constraints are documented in
-[`docs/design/scalar-function-addon.md`](design/scalar-function-addon.md).
+and optimization semantics. The scalar addon ABI is shipped and public:
+`wirelog/wirelog-extension.h` declares the descriptor, the registry, and the
+reference-counted snapshot handles, and the columnar evaluator resolves a
+`@call` against a snapshot supplied at plan or session creation. The design
+rationale, together with the registry, callback, error, and lifetime
+constraints, is in
+[`docs/design/scalar-function-addon.md`](design/scalar-function-addon.md),
+which was written as an issue #912 proposal and still reads as one, ahead of
+the surface that shipped.
 
 An addon callback cannot change the engine's relational, differential, or
 aggregate semantics. In particular, callback errors are not silently converted
 to false predicates.
 
 The `DETERMINISTIC` and `PURE` capability bits are addon attestations; Wirelog
-does not independently prove them. Until an optimizer pass has access to the
-extension snapshot that carries those declarations, optimizer passes preserve
-the source order and expression structure of rules containing scalar addon
-calls. This conservative boundary prevents callback duplication, elimination,
-or movement based on an unverified capability declaration. A future optimizer
-contract may enable specific transformations for callbacks with both bits.
+does not independently prove them, and no engine path reads either bit today.
+Registration accepts any combination of the known bits and rejects only an
+unknown one, and the evaluator consults `THREAD_SAFE` and `REENTRANT` alone.
+Join-order planning is the pass that holds the line: `wl_jpp_apply` declines
+to reorder or re-project any rule whose IR contains an extension call, so it
+cannot duplicate, drop, or relocate a call site on the strength of an
+unverified declaration. That is a statement about one pass and not about the
+optimizer as a whole -- fusion, for instance, folds a PROJECT over a FILTER
+into a single FLATMAP and carries the filter expression onto the fused node,
+and it is not extension-aware. None of this bounds how often the evaluator
+invokes a call site that survives optimization; for that, see "Scalar addon
+invocation count" below. A future optimizer contract may enable specific
+transformations for callbacks with both bits.
+
+### Scalar addon invocation count
+
+This section is about a `@call` in a value position -- the one that produces a
+column value, as in `started(id, @call("act.start", id)) :- ready(id).` Such a
+call is a replayable expression, not an action hook. How many times a step
+invokes it is not part of the contract, and an invocation is not evidence that
+anything changed.
+
+With a delta callback installed through `wirelog_easy_set_delta_cb` and the
+session driven by `wirelog_easy_step`, a step that re-derives the rule
+re-derives it in full: the callback runs once for every row the rule then
+derives, including rows whose derivation did not change, and once more for
+each repeated derivation of the same row. What the count follows is that
+derivation -- not the size of the change, and not the row count of any
+relation the rule reads.
+
+A selective body narrows it. For
+`started(id, @call("act.start", id)) :- ready(id), enabled(id).` with two of
+five `ready` rows enabled, a step invokes the callback twice, whatever
+`ready` holds. Where the rule has a single body atom, as in the example this
+section opened with, the derivation is that relation's rows, and there
+retracting one row of five invokes the callback four further times while
+inserting one row into a four-row relation invokes it five times. A rule
+that derives nothing does not invoke it at all.
+
+A step whose mutation does not reach the rule leaves the callback alone. The
+engine decides that at stratum granularity rather than per rule --
+`col_compute_affected_strata` masks strata -- so whether a particular mutation
+reaches a particular rule is a property of how the program stratifies, and
+mutating a relation the rule does not read is not on its own a guarantee.
+
+How many invocations a session performs under other configurations differs and
+is not specified here; issue #1994 tracks the one difference that is known.
+Choosing a configuration for its invocation count would rest on something a
+release may change, so a host should not do it -- and a delta callback is
+installed because the host wants deltas, not as a tuning knob.
+
+The delta stream carries the set difference, so a re-derivation that
+reproduces a row publishes nothing. Inserting a sixth row into a five-row
+source can invoke the callback six times and publish one `+1` event; in the
+selective-body case above, retracting a `ready` row that was not enabled
+invokes the callback twice and publishes no event at all. A host watching
+deltas can therefore neither count the invocations nor see the work.
+
+Two obligations follow for a host. The first is value stability: a callback
+must be safe to run again for an argument tuple it has already answered, and
+should answer the same value when it does. One that returns a fresh value per
+invocation -- a ticket, a timestamp, a counter -- makes the derived row change
+on re-derivation, so the row is retracted at its old value and republished at
+the new one, and the host sees a `-1`/`+1` pair for a row whose input never
+moved.
+
+The second is that exactly-once external effects are the host's. Wirelog
+attaches no execution identity to an invocation, does not de-duplicate
+invocations, and does not roll back an effect a callback already performed; a
+step that fails afterwards does not undo it. The discipline that survives the
+invocation count is to keep the effect out of the callback: derive the request
+as data, make the callback a lookup keyed by an identity the host chose, and
+perform the effect from the host's delta handling, where each request arrives
+as one `+1`. That last step depends on the first obligation, because an
+unstable callback republishes the same logical request under a new value and a
+host keyed on the delta row would act on it twice. In-callback memoization on
+the host's key, returning the original value on a repeat, is the same
+discipline inside the callback; it is process-local and does not by itself
+survive a crash. Wirelog does not offer crash-safe exactly-once effects.
+
+`THREAD_SAFE` and `REENTRANT` are the policy bits the evaluator acts on.
+Declaring `PURE` or `DETERMINISTIC` does not reduce the count, and omitting
+them does not cause registration or evaluation to reject the addon, which is
+why their absence is not what admitted the addon in issue #1986.
 
 ---
 

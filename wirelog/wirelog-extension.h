@@ -51,7 +51,12 @@ typedef struct wirelog_extension_value {
  * copies accepted BOOL and INT64 results after invoke() returns; callbacks
  * must therefore not expect the engine to retain pointers or release memory.
  * STRING results are reserved for a future ownership-aware ABI and are
- * rejected by the current evaluator. */
+ * rejected by the current evaluator.
+ *
+ * invoke() may run more than once for the same argument tuple within one
+ * host operation, because a step can re-derive a rule the call appears in.
+ * A callback must tolerate that and should answer the same value when it
+ * happens.  See "Scalar addon invocation count" in docs/SEMANTICS.md. */
 
 typedef int (*wirelog_extension_scalar_fn)(
     const wirelog_extension_value_t *args, uint32_t nargs,
@@ -60,7 +65,13 @@ typedef void (*wirelog_extension_destroy_fn)(void *user_data);
 
 /* Callback capabilities. A zero policy is the legacy/unspecified contract.
  * Unless REENTRANT is declared, a callback must not recursively evaluate the
- * same logical session.  The evaluator enforces this synchronously. */
+ * same logical session.  The evaluator enforces this synchronously.
+ *
+ * THREAD_SAFE and REENTRANT are the bits the evaluator acts on.
+ * DETERMINISTIC and PURE are recorded attestations that no engine path reads
+ * today: declaring them does not change how often a callback runs, and
+ * omitting them does not cause registration or evaluation to reject it.
+ * See "Scalar addon invocation count" in docs/SEMANTICS.md. */
 #define WIRELOG_EXTENSION_CALLBACK_THREAD_SAFE  (1u << 0)
 #define WIRELOG_EXTENSION_CALLBACK_DETERMINISTIC (1u << 1)
 #define WIRELOG_EXTENSION_CALLBACK_PURE        (1u << 2)

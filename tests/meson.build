@@ -5580,6 +5580,18 @@ test_extension_filter_exe = executable(
 
 test('extension_filter', test_extension_filter_exe)
 
+# Issue #1986: pin how often a value-position scalar @call runs, so a change
+# to the invocation contract in docs/SEMANTICS.md is deliberate, not silent.
+test_extension_replay_exe = executable(
+  'test_extension_replay',
+  files('test_extension_replay.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+
+test('extension_replay', test_extension_replay_exe)
+
 # ============================================================================
 # I/O Context Accessor Tests (#452)
 # ============================================================================

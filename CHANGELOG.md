@@ -92,6 +92,19 @@ All notable changes to wirelog are documented in this file.
 
 ### Documentation
 
+- **Scalar addon invocation count** (#1986): `docs/SEMANTICS.md` now
+  states how often a value-position `@call` is invoked -- once per row
+  the rule derives, which a selective body narrows below the row count
+  of the relations it reads -- and what a host must do for value
+  stability and for exactly-once external effects.  The claim that the
+  conservative optimizer boundary "prevents callback duplication,
+  elimination, or movement" is narrowed to the one pass that
+  implements it, `wl_jpp_apply`, and the description of the addon ABI
+  as a future proposal with no runtime or public API is replaced.
+  `wirelog/wirelog-extension.h` gains matching pointers on `invoke()`
+  and on the capability bits.  `tests/extension_replay` pins today's
+  counts.  No behavior change.
+
 ## [0.70.0] - 2026-09-22
 
 ### Added
