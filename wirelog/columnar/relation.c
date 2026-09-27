@@ -8137,11 +8137,11 @@ wl_columnar_radix_workspace_destroy(wl_columnar_radix_workspace_t *workspace)
     memset(workspace, 0, sizeof(*workspace));
 }
 
-int
-wl_columnar_radix_workspace_prepare(const col_rel_t *rel,
+static int
+wl_columnar_relation_radix_workspace_prepare(const col_rel_t *rel,
     const uint32_t *seg_boundaries, uint32_t seg_count,
     uint64_t additional_scratch_bytes,
-    wl_columnar_radix_workspace_t *workspace)
+    wl_columnar_radix_workspace_t *workspace, bool skip_sorted)
 {
     uint32_t k8_rows = 0;
     uint32_t k16_rows = 0;
@@ -8166,7 +8166,7 @@ wl_columnar_radix_workspace_prepare(const col_rel_t *rel,
         || workspace->temp_column || workspace->insertion_rows
         || workspace->timestamps || workspace->timestamp_capacity
         || workspace->k8_capacity || workspace->k16_capacity
-        || workspace->insertion_capacity)
+        || workspace->insertion_capacity || workspace->insertion_bytes)
         return EINVAL;
     /* Check the entire boundary sequence before comparing any row. Partial
      * relation ranges and empty segments are valid preparation inputs. */
@@ -8185,8 +8185,8 @@ wl_columnar_radix_workspace_prepare(const col_rel_t *rel,
         uint32_t count = end - start;
         if (count <= 1)
             continue;
-        bool sorted = true;
-        for (uint32_t row = start + 1; row < end; row++) {
+        bool sorted = skip_sorted;
+        for (uint32_t row = start + 1; sorted && row < end; row++) {
             if (col_rel_row_cmp(rel, row - 1, row) > 0) {
                 sorted = false;
                 break;
@@ -8321,6 +8321,7 @@ wl_columnar_radix_workspace_prepare(const col_rel_t *rel,
         if (!workspace->insertion_rows)
             goto no_memory;
         workspace->insertion_capacity = insertion_rows;
+        workspace->insertion_bytes = insertion_bytes;
     }
     return 0;
 
@@ -8329,6 +8330,46 @@ overflow:
 no_memory:
     wl_columnar_radix_workspace_destroy(workspace);
     return failure_rc;
+}
+
+int
+wl_columnar_radix_workspace_prepare(const col_rel_t *rel,
+    const uint32_t *seg_boundaries, uint32_t seg_count,
+    uint64_t additional_scratch_bytes, wl_columnar_radix_workspace_t *workspace)
+{
+    return wl_columnar_relation_radix_workspace_prepare(rel, seg_boundaries,
+               seg_count, additional_scratch_bytes, workspace, true);
+}
+
+/* Check the physical scratch selected by the raw sorter before detaching a
+ * shared relation. Insertion buffers depend on both row and column counts. */
+static int
+wl_columnar_relation_radix_workspace_validate(const col_rel_t *rel,
+    uint32_t nrows, const wl_columnar_radix_workspace_t *workspace)
+{
+    bool insertion = nrows <= 32;
+    if (rel->timestamps && (!workspace->timestamps
+        || workspace->timestamp_capacity < nrows))
+        return EINVAL;
+    for (uint32_t c = 0; rel->column_types && c < rel->ncols; c++)
+        insertion |= rel->column_types[c] == WIRELOG_TYPE_FLOAT;
+    if (insertion) {
+        size_t rows, bytes;
+        if (!col_rel_size_add(nrows, 1, &rows)
+            || !col_rel_size_multiply(rows, rel->ncols, &bytes)
+            || !col_rel_size_multiply(bytes, sizeof(int64_t), &bytes))
+            return EOVERFLOW;
+        return workspace->insertion_rows &&
+               workspace->insertion_capacity >= nrows
+               && workspace->insertion_bytes >= bytes ? 0 : EINVAL;
+    }
+    if (!workspace->perm_a || !workspace->perm_b || !workspace->temp_column)
+        return EINVAL;
+    if (nrows >= 50000)
+        return workspace->short_values && workspace->count16
+               && workspace->k16_capacity >= nrows ? 0 : EINVAL;
+    return workspace->byte_values &&
+           workspace->k8_capacity >= nrows ? 0 : EINVAL;
 }
 
 static int
@@ -8438,6 +8479,22 @@ col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
     if (nrows <= 1)
         return 0;
 
+    wl_columnar_radix_workspace_t local_workspace = { 0 };
+    bool owns_workspace = !workspace && r->memory_governor;
+    int rc;
+    if (owns_workspace) {
+        uint32_t bounds[] = { start_row, start_row + nrows };
+        rc = wl_columnar_relation_radix_workspace_prepare(r, bounds, 1, 0,
+                &local_workspace, false);
+        if (rc != 0)
+            return rc;
+        workspace = &local_workspace;
+    }
+    if (workspace) {
+        rc = wl_columnar_relation_radix_workspace_validate(r, nrows, workspace);
+        if (rc != 0)
+            goto cleanup_workspace;
+    }
     col_rel_cow_deferred_t deferred = { 0 };
     uint64_t ledger_before = 0;
     uint64_t old_view = 0;
@@ -8451,10 +8508,9 @@ col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
          * and releases it afterwards (or hands it back).  Releasing inside
          * the COW and then rolling back would restore a borrowed view whose
          * borrow the owner no longer counts. */
-        if (col_rel_cow_unshare_impl(r, 0, true, true,
-            &deferred) != 0) {
-            return ENOMEM;
-        }
+        rc = col_rel_cow_unshare_impl(r, 0, true, true, &deferred);
+        if (rc != 0)
+            goto cleanup_workspace;
 #ifdef WL_TEST_CONSOLIDATE_HOOK
         if (defer_alias_release
             && wl_columnar_consolidation_transition_hook)
@@ -8463,7 +8519,7 @@ col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
 #endif
     }
 
-    int rc = col_rel_radix_sort_raw(r, start_row, nrows, workspace);
+    rc = col_rel_radix_sort_raw(r, start_row, nrows, workspace);
     if (rc != 0 && borrowed) {
         col_columns_free(r->columns, r->ncols);
         r->columns = deferred.columns;
@@ -8490,6 +8546,9 @@ col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
         if (out_alias_release_pending)
             *out_alias_release_pending = true;
     }
+cleanup_workspace:
+    if (owns_workspace)
+        wl_columnar_radix_workspace_destroy(&local_workspace);
     return rc;
 }
 
@@ -8558,6 +8617,7 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
     rc = col_rel_source_writer_acquire(r, &writer);
     if (rc != 0)
         return rc;
+    r->memory_budget_denial_pending = false;
     rc = col_rel_radix_sort_locked(r, start_row, nrows, &writer, false,
             &alias_release_pending);
     if (wl_columnar_source_access_writer_release(&writer) != 0 && rc == 0)
