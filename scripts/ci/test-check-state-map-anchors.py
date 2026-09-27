@@ -414,16 +414,16 @@ def main() -> int:
         # `col_diff_arrangement_reset_delta` is, in full,
         # `arr->base_nrows = arr->current_nrows;` and touches no col_rel_t.  A
         # gate that dropped the qualifier credited it as a writer.
-        # The write column is the one that ends at `..._deep_copy_governed` and
+        # The write column is the one that ends at `wl_retraction_restore` and
         # is followed by the read column; the read column ends at the verdict.
         row_edit("an arrangement function is not a col_rel_t writer",
                  "| `col_rel_t::base_nrows` | `col_rel_compact_impl`,",
                  "| `col_rel_t::base_nrows` | `col_diff_arrangement_reset_delta`,"
                  " `col_rel_compact_impl`,")
         row_edit("an arrangement function is not a col_rel_t reader",
-                 "`wl_columnar_relation_deep_copy_governed` |"
+                 "`wl_retraction_restore` |"
                  " `col_rel_compact_impl`,",
-                 "`wl_columnar_relation_deep_copy_governed` |"
+                 "`wl_retraction_restore` |"
                  " `col_diff_arrangement_has_delta`, `col_rel_compact_impl`,")
 
         # Completeness: dropping a real writer must fail.  Soundness alone would
