@@ -2611,6 +2611,7 @@ measure_easy_floor(const char *src, uint64_t *intern_bytes,
     return rc;
 }
 
+/* PARITY: facade-only -- exercises lazy retry after inline fact admission. */
 static void
 test_inline_fact_budget_denial_maps_and_retries(void)
 {
