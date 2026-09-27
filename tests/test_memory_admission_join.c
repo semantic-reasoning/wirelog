@@ -85,6 +85,7 @@ extern uint32_t wl_columnar_join_test_pair_cap_limit_override;
 extern bool wl_columnar_join_test_last_cross_ctx_admitted;
 extern bool wl_columnar_join_test_last_keyed_parallel_admitted;
 extern bool wl_columnar_join_test_last_semijoin_parallel_admitted;
+extern bool wl_columnar_merge_test_fail_concat_boundaries_alloc;
 
 static uint32_t test_join_submit_calls;
 static uint32_t test_join_submit_fail_at;
@@ -330,6 +331,171 @@ relation_charge(const col_rel_t *relation)
            + relation->descriptor_reserved_bytes
            + relation->metadata_reserved_bytes
            + relation->pool_name_reserved_bytes;
+}
+
+static bool
+concat_entry_unchanged(const eval_entry_t *entry, const eval_entry_t *before)
+{
+    return entry->rel == before->rel && entry->owned == before->owned
+           && entry->is_delta == before->is_delta
+           && entry->seg_boundaries == before->seg_boundaries
+           && entry->seg_count == before->seg_count
+           && entry->kind == before->kind
+           && entry->continuation == before->continuation;
+}
+
+static void
+test_concat_admission_rollback(bool pooled, bool second_append)
+{
+    TEST(pooled ? "pooled CONCAT admission preserves staged inputs"
+         : "heap CONCAT admission preserves staged inputs");
+    wl_col_session_t *sess = make_session(UINT64_C(1) << 24);
+    col_rel_t *a = col_rel_new_auto("a", 1);
+    col_rel_t *b = col_rel_new_auto("b", 1);
+    col_rel_t *lower = col_rel_new_auto("lower", 1);
+    col_rel_t *probe = NULL;
+    eval_stack_t stack;
+    eval_entry_t original_a, original_b, original_lower;
+    const char *failure = NULL;
+    uint32_t a_rows = COL_REL_INIT_CAP + (second_append ? 0u : 1u);
+    uint64_t baseline = 0, clone_limit = 0, a_charge = 0;
+    wl_columnar_memory_governor_t *governor = NULL;
+    eval_stack_init(&stack);
+#define CONCAT_CHECK(condition, message) \
+        do { \
+            if (!(condition)) { \
+                failure = message; \
+                goto cleanup; \
+            } \
+        } while (0)
+    CONCAT_CHECK(sess && a && b && lower, "fixture");
+    if (!pooled) {
+        delta_pool_destroy(sess->delta_pool);
+        sess->delta_pool = NULL;
+    }
+    governor = wl_columnar_memory_governor_ref_get(sess->memory_governor);
+    CONCAT_CHECK(col_rel_attach_memory_governor(a, sess->memory_governor) == 0
+        && col_rel_attach_memory_governor(b, sess->memory_governor) == 0,
+        "source admission");
+    for (uint32_t row = 0; row < a_rows; row++) {
+        int64_t value = row;
+        CONCAT_CHECK(col_rel_append_row(a, &value) == 0, "source rows");
+    }
+    int64_t last = a_rows, sentinel = 777;
+    CONCAT_CHECK(col_rel_append_row(b, &last) == 0
+        && col_rel_append_row(lower, &sentinel) == 0, "other rows");
+    a_charge = relation_charge(a);
+    CONCAT_CHECK(eval_stack_push(&stack, lower, false) == 0, "lower entry");
+    original_lower = stack.items[0];
+    CONCAT_CHECK(eval_stack_push(&stack, a, pooled) == 0, "left entry");
+    if (pooled)
+        a = NULL; /* stack owns the left input in this variant */
+    stack.items[1].is_delta = true;
+    stack.items[1].seg_boundaries = malloc(2 * sizeof(uint32_t));
+    CONCAT_CHECK(stack.items[1].seg_boundaries != NULL, "left segments");
+    stack.items[1].seg_boundaries[0] = 0;
+    stack.items[1].seg_boundaries[1] = a_rows;
+    stack.items[1].seg_count = 1;
+    original_a = stack.items[1];
+    CONCAT_CHECK(eval_stack_push(&stack, b, false) == 0, "right entry");
+    stack.items[2].seg_boundaries = malloc(2 * sizeof(uint32_t));
+    CONCAT_CHECK(stack.items[2].seg_boundaries != NULL, "right segments");
+    stack.items[2].seg_boundaries[0] = 0;
+    stack.items[2].seg_boundaries[1] = 1;
+    stack.items[2].seg_count = 1;
+    original_b = stack.items[2];
+    baseline = reserved_of(sess);
+
+    /* Measure the same pool/heap constructor route used by CONCAT. Probes
+     * consume pool slots; ensure they cannot accidentally force fallback. */
+    CONCAT_CHECK(!pooled || sess->delta_pool->slot_cap >= 16,
+        "pool capacity");
+    CONCAT_CHECK(wl_columnar_relation_pool_new_like_governed_checked(&probe,
+        sess->delta_pool, "$concat", original_a.rel,
+        sess->memory_governor) == 0, "measure constructor");
+    clone_limit = reserved_of(sess);
+    col_rel_destroy(probe);
+    probe = NULL;
+    CONCAT_CHECK(reserved_of(sess) == baseline, "probe release");
+
+    for (unsigned phase = 0; phase < 3; phase++) {
+        sess->memory_budget_denied = false;
+        uint64_t limit = phase == 0 ? baseline
+            : phase == 1 ? clone_limit : UINT64_C(1) << 24;
+        atomic_store_explicit(&governor->usable_bytes, limit,
+            memory_order_release);
+        if (phase == 1) {
+            CONCAT_CHECK(wl_columnar_relation_pool_new_like_governed_checked(
+                    &probe, sess->delta_pool, "$concat", original_a.rel,
+                    sess->memory_governor) == 0
+                && probe->capacity == COL_REL_INIT_CAP,
+                "constructor must fit constrained budget");
+            int probe_rc = col_rel_append_all(probe, original_a.rel, NULL);
+            if (second_append) {
+                CONCAT_CHECK(probe_rc == 0, "first append must fit");
+                probe_rc = col_rel_append_all(probe, b, NULL);
+            }
+            CONCAT_CHECK(probe_rc == ENOMEM
+                && probe->memory_budget_denial_pending,
+                "append must reach budget refusal");
+            col_rel_destroy(probe);
+            probe = NULL;
+            CONCAT_CHECK(reserved_of(sess) == baseline, "growth probe release");
+        }
+        if (phase == 2)
+            wl_columnar_merge_test_fail_concat_boundaries_alloc = true;
+        int rc = col_op_concat(&stack, sess);
+        CONCAT_CHECK(rc == (phase == 2 ? ENOMEM : ENOSPC)
+            && sess->memory_budget_denied == (phase != 2),
+            "CONCAT failure status");
+        CONCAT_CHECK(!wl_columnar_merge_test_fail_concat_boundaries_alloc,
+            "ordinary allocation failure hook not consumed");
+        CONCAT_CHECK(stack.top == 3
+            && concat_entry_unchanged(&stack.items[0], &original_lower)
+            && concat_entry_unchanged(&stack.items[1], &original_a)
+            && concat_entry_unchanged(&stack.items[2], &original_b)
+            && reserved_of(sess) == baseline,
+            "CONCAT failure lost inputs or reservations");
+        CONCAT_CHECK(original_a.rel->nrows == a_rows && b->nrows == 1
+            && b->columns[0][0] == last && lower->columns[0][0] == sentinel
+            && original_a.seg_boundaries[0] == 0
+            && original_a.seg_boundaries[1] == a_rows
+            && original_b.seg_boundaries[0] == 0
+            && original_b.seg_boundaries[1] == 1, "source metadata changed");
+        for (uint32_t row = 0; row < a_rows; row++)
+            CONCAT_CHECK(original_a.rel->columns[0][row] == row,
+                "source contents changed");
+    }
+    CONCAT_CHECK(col_op_concat(&stack, sess) == 0 && stack.top == 2,
+        "retry same inputs");
+    col_rel_t *out = stack.items[1].rel;
+    CONCAT_CHECK(out->memory_governor == sess->memory_governor
+        && out->nrows == a_rows + 1 && stack.items[1].owned
+        && stack.items[1].seg_count == 2
+        && stack.items[1].seg_boundaries[0] == 0
+        && stack.items[1].seg_boundaries[1] == a_rows
+        && stack.items[1].seg_boundaries[2] == a_rows + 1
+        && !sess->memory_budget_denied
+        && reserved_of(sess) == baseline - (pooled ? a_charge : 0)
+        + relation_charge(out), "retry output accounting/segments");
+    for (uint32_t row = 0; row <= a_rows; row++)
+        CONCAT_CHECK(out->columns[0][row] == row, "retry output rows");
+cleanup:
+    wl_columnar_merge_test_fail_concat_boundaries_alloc = false;
+    col_rel_destroy(probe);
+    (void)eval_stack_drain(&stack);
+    col_rel_destroy(a);
+    col_rel_destroy(b);
+    col_rel_destroy(lower);
+    if (sess && reserved_of(sess) != 0 && !failure)
+        failure = "reservation leak";
+    destroy_session(sess);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef CONCAT_CHECK
 }
 
 /*
@@ -3397,13 +3563,17 @@ test_governed_join_consumers_release_exactly_once(void)
     }
     duplicate = NULL;
     if (col_op_concat(&stack, sess) != 0 || stack.top != 1
-        || reserved_of(sess) != registry_charge(sess) + cache_bytes) {
-        FAIL("CONCAT did not release the governed input twin once");
+        || stack.items[0].rel->memory_governor != sess->memory_governor
+        || reserved_of(sess) != registry_charge(sess) + cache_bytes
+        + relation_charge(stack.items[0].rel)) {
+        FAIL(
+            "CONCAT did not replace the governed input charge with its output");
         goto out;
     }
     if (col_op_consolidate(&stack, sess) != 0 || stack.top != 1
         || stack.items[0].rel->nrows != 8u
-        || reserved_of(sess) != registry_charge(sess) + cache_bytes) {
+        || reserved_of(sess) != registry_charge(sess) + cache_bytes
+        + relation_charge(stack.items[0].rel)) {
         FAIL("CONSOLIDATE changed result or retained-cache accounting");
         goto out;
     }
@@ -3468,6 +3638,10 @@ main(void)
     printf("Memory admission: JOIN output capacity (Issue #1477)\n");
 
     test_attach_baseline();
+    test_concat_admission_rollback(false, false);
+    test_concat_admission_rollback(false, true);
+    test_concat_admission_rollback(true, false);
+    test_concat_admission_rollback(true, true);
     test_timestamp_batch_projection_and_live_charge();
     if (measure_output_bytes(&out_bytes)) {
         run_at_budget("cross join succeeds at the exact output+scratch peak",

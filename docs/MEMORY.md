@@ -863,6 +863,24 @@ holds or a frozen arena can still defer that explicit collection attempt.
 The resident-floor contract below applies across the managed session, including
 coordinator and worker dependencies; it is not limited to arrangement leases.
 
+Variable-size operator result storage is part of the session memory budget,
+including temporary relations consumed by another operator. Pool descriptor
+slabs and arena backing already admitted at creation are charged once; separate
+heap names, schemas and column payloads require their own reservations. CONCAT
+uses the checked governed pool/heap constructor for its result and admits growth
+before appending either input. Constructor or staging failure preserves both
+input stack entries and their segment metadata for retry, returning `ENOSPC`
+for budget denial and `ENOMEM` for allocator failure. Once input consumption
+starts, the existing checked-disposal/retained-owner contract still applies;
+this is not a transaction over a refused input destruction.
+
+This is CONCAT relation-output coverage, not completion of all temporary
+admission (#1978/#1369). EMPTY/BASE_SKIP, MAP/REDUCE/LFTJ and borrowed CONS output
+paths still need audit and integration. Eval-entry segment boundaries and other
+auxiliary metadata/scratch need lifetime accounting through their actual free
+sites; they are not covered by CONCAT's relation reservation or excluded from
+the intended budget contract.
+
 An iteration or frontier boundary alone does not authorize reclamation. All
 queued tasks, consumer-held values, active probes and rollback obligations
 must be accounted for first. The resident floor includes pinned inputs,
