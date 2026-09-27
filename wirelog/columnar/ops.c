@@ -81,6 +81,28 @@ wl_ops_scratch_release(wl_ops_scratch_t *scratch);
 
 /* --- VARIABLE ------------------------------------------------------------ */
 
+/* Empty rule results still own names, schema and initial column storage.
+ * The pool/heap checked constructor retains the existing timestamp policy. */
+static int
+wl_columnar_ops_push_empty(eval_stack_t *stack, wl_col_session_t *sess,
+    const col_rel_t *like, const char *name, bool is_delta)
+{
+    col_rel_t *empty = NULL;
+    wl_columnar_memory_governor_ref_t *governor = sess->memory_governor
+        ? sess->memory_governor : like->memory_governor;
+    int rc = wl_columnar_relation_pool_new_like_governed_checked(&empty,
+            sess->delta_pool, name, like, governor);
+    if (rc != 0) {
+        if (rc == ENOSPC)
+            sess->memory_budget_denied = true;
+        return rc;
+    }
+    rc = eval_stack_push_delta(stack, empty, true, is_delta);
+    if (rc != 0)
+        col_rel_destroy(empty);
+    return rc;
+}
+
 int
 col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
@@ -122,14 +144,8 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
         && sess->tdd_outbound_only_active
         && sess->current_iteration > 0)) {
         /* Issue #370: segment has no FORCE_DELTA — push empty to skip. */
-        col_rel_t *empty = col_rel_pool_new_like(
-            sess->delta_pool, "$empty_skip", full_rel);
-        if (!empty)
-            return ENOMEM;
-        int push_rc = eval_stack_push_delta(stack, empty, true, false);
-        if (push_rc != 0)
-            col_rel_destroy(empty);
-        return push_rc;
+        return wl_columnar_ops_push_empty(stack, sess, full_rel,
+                   "$empty_skip", false);
     }
     if (op->delta_mode == WL_DELTA_FORCE_FULL) {
         return eval_stack_push_delta(stack, full_rel, false, false);
@@ -143,14 +159,8 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
                 /* Issue #83 (delta-seeded) or #158 (retraction-seeded):
                  * No pre-seeded delta means this relation has no new/removed facts.
                  * Push empty so only rules with actual deltas produce output. */
-                col_rel_t *empty = col_rel_pool_new_like(
-                    sess->delta_pool, "$empty_delta", full_rel);
-                if (!empty)
-                    return ENOMEM;
-                int push_rc = eval_stack_push_delta(stack, empty, true, true);
-                if (push_rc != 0)
-                    col_rel_destroy(empty);
-                return push_rc;
+                return wl_columnar_ops_push_empty(stack, sess, full_rel,
+                           "$empty_delta", true);
             }
             /* Base-case iteration: no deltas exist yet, fall back to full
              * relation so EDB-grounded rules can still fire on iter 0. */
@@ -159,14 +169,8 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
         /* Iteration > 0: delta absent or empty means the relation has
          * converged.  Push an empty relation so this rule copy produces
          * no output (correct semi-naive semantics, issue #85). */
-        col_rel_t *empty
-            = col_rel_pool_new_like(sess->delta_pool, "$empty_delta", full_rel);
-        if (!empty)
-            return ENOMEM;
-        int push_rc = eval_stack_push_delta(stack, empty, true, true);
-        if (push_rc != 0)
-            col_rel_destroy(empty);
-        return push_rc;
+        return wl_columnar_ops_push_empty(stack, sess, full_rel,
+                   "$empty_delta", true);
     }
 
     /* WL_DELTA_AUTO: use delta if strictly smaller than full relation.

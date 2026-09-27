@@ -874,8 +874,17 @@ for budget denial and `ENOMEM` for allocator failure. Once input consumption
 starts, the existing checked-disposal/retained-owner contract still applies;
 this is not a transaction over a refused input destruction.
 
-This is CONCAT relation-output coverage, not completion of all temporary
-admission (#1978/#1369). EMPTY/BASE_SKIP, MAP/REDUCE/LFTJ and borrowed CONS output
+VARIABLE's empty skip and missing-delta results also use the checked governed
+pool/heap constructor, selecting the session governor or, when absent, the
+source governor. Budget denial returns `ENOSPC` without changing the stack or
+source. Allocator and representation errors remain distinct. Failed stack
+publication destroys the private output and releases its reservations; a pool
+slot consumed by successful construction remains inert until the pool resets.
+Seed conditions, delta tags and borrowed-full iteration-zero behavior are
+unchanged.
+
+This is CONCAT and VARIABLE empty-output coverage, not completion of all
+temporary admission (#1978/#1369). MAP/REDUCE/LFTJ and borrowed CONS output
 paths still need audit and integration. Eval-entry segment boundaries and other
 auxiliary metadata/scratch need lifetime accounting through their actual free
 sites; they are not covered by CONCAT's relation reservation or excluded from

@@ -345,6 +345,235 @@ concat_entry_unchanged(const eval_entry_t *entry, const eval_entry_t *before)
 }
 
 static void
+test_variable_empty_admission(bool pooled, unsigned governor_mode,
+    unsigned condition)
+{
+    char label[112];
+    snprintf(label, sizeof(label),
+        "VARIABLE empty admission pool=%d governor=%u condition=%u",
+        pooled, governor_mode, condition);
+    TEST(label);
+    wl_col_session_t *sess = make_session(UINT64_C(1) << 24);
+    wl_columnar_memory_governor_ref_t *source_ref = NULL, *saved_ref = NULL;
+    wl_columnar_memory_governor_ref_t *expected = NULL;
+    col_rel_t *source = col_rel_new_auto("input", 2), *probe = NULL;
+    eval_stack_t stack;
+    eval_entry_t lower = {0};
+    const char *failure = NULL;
+    eval_stack_init(&stack);
+#define EMPTY_CHECK(c, message) do { if (!(c)) { failure = message; \
+                                                 goto cleanup; } } while (0)
+    EMPTY_CHECK(sess && source, "fixture allocation");
+    saved_ref = sess->memory_governor;
+    if (governor_mode) {
+        source_ref = make_governor(UINT64_C(1) << 24);
+        EMPTY_CHECK(source_ref, "source governor");
+    }
+    expected = governor_mode == 1 ? source_ref : saved_ref;
+    wl_columnar_memory_governor_ref_retain(expected);
+    EMPTY_CHECK(col_rel_attach_memory_governor(source,
+        source_ref ? source_ref : saved_ref) == 0,
+        "source admission");
+    const wirelog_column_type_t types[2] = {WIRELOG_TYPE_INT64,
+                                            WIRELOG_TYPE_INT64};
+    const col_rel_logical_col_t logical[2] = {
+        {WIRELOG_COMPOUND_KIND_SIDE, 2, 1}, {WIRELOG_COMPOUND_KIND_NONE, 0, 0}
+    };
+    const int64_t row[2] = {13, 29};
+    EMPTY_CHECK(col_rel_set_column_types(source, types, 2) == 0
+        && col_rel_apply_compound_schema(source, logical, 2) == 0
+        && col_rel_append_row(source, row) == 0
+        && col_rel_enable_timestamps(source) == 0, "source schema and row");
+    source->has_graph_column = true;
+    source->graph_col_idx = 1;
+    source->declared_ncols = 1;
+    uint64_t source_view = source->view_generation;
+    uint64_t source_storage = source->storage_generation;
+    col_delta_timestamp_t *source_timestamps = source->timestamps;
+    if (governor_mode == 1)
+        sess->memory_governor = NULL;
+    /* A unit fixture registry isolates output admission from registry growth. */
+    sess->rels = calloc(2, sizeof(*sess->rels));
+    EMPTY_CHECK(sess->rels, "fixture registry");
+    sess->rels[0] = source;
+    sess->nrels = 1;
+    source = NULL; /* session now owns it */
+    col_rel_t *full = sess->rels[0];
+    if (condition == 5) {
+        sess->rels[1] = col_rel_new_auto("$d$input", 2);
+        EMPTY_CHECK(sess->rels[1], "empty registered delta");
+        sess->nrels = 2;
+    }
+    delta_pool_destroy(sess->delta_pool);
+    sess->delta_pool = pooled ? delta_pool_create_managed(128,
+            sizeof(col_rel_t), 4096,
+            wl_columnar_memory_governor_ref_get(expected)) : NULL;
+    EMPTY_CHECK(!pooled || sess->delta_pool, "pre-admitted pool");
+    if (governor_mode == 2) {
+        /* Exhaust only the source governor: session precedence must win. */
+        atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+                source_ref)->usable_bytes,
+            reserved_for(source_ref), memory_order_release);
+    }
+    EMPTY_CHECK(eval_stack_push(&stack, full, false) == 0, "lower stack input");
+    stack.items[0].seg_boundaries = malloc(2 * sizeof(uint32_t));
+    EMPTY_CHECK(stack.items[0].seg_boundaries, "lower segments");
+    stack.items[0].seg_boundaries[0] = 0;
+    stack.items[0].seg_boundaries[1] = 1;
+    stack.items[0].seg_count = 1;
+    lower = stack.items[0];
+    /* Lookup may build the session's governed name index. Include that
+     * independent registry charge before measuring operator-only admission. */
+    EMPTY_CHECK(session_find_rel(sess, "input") == full,
+        "warm registry lookup");
+    const uint64_t baseline = reserved_for(expected);
+    const uint64_t other_baseline = source_ref ? reserved_for(source_ref) : 0;
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(expected);
+    const char *name = condition < 2 ? "$empty_skip" : "$empty_delta";
+    wl_plan_op_t op = {.op = WL_PLAN_OP_VARIABLE, .relation_name = "input",
+                       .delta_mode = condition == 0 ? WL_DELTA_FORCE_EMPTY
+            : condition ==
+                           1 ? WL_DELTA_FORCE_EMPTY_AFTER_SEED :
+                           WL_DELTA_FORCE_DELTA};
+    sess->current_iteration = condition == 1 || condition >= 4 ? 1 : 0;
+    sess->tdd_outbound_only_active = condition == 1;
+    sess->delta_seeded = condition == 2;
+    sess->retraction_seeded = condition == 3;
+
+    /* Locate the exact constructor peak, including metadata replacement
+     * overlap. Every successful probe releases its live charge; pool slots
+     * are deliberately plentiful because they are reclaimed at pool reset. */
+    uint64_t low = baseline, high = baseline + (UINT64_C(1) << 20);
+    while (low + 1 < high) {
+        uint64_t mid = low + (high - low) / 2;
+        atomic_store_explicit(&governor->usable_bytes, mid,
+            memory_order_release);
+        int rc = wl_columnar_relation_pool_new_like_governed_checked(&probe,
+                sess->delta_pool, name, full, expected);
+        EMPTY_CHECK(rc == 0 || rc == ENOSPC, "constructor peak calibration");
+        if (rc == 0) high = mid;
+        else low = mid;
+        col_rel_destroy(probe);
+        probe = NULL;
+        EMPTY_CHECK(reserved_for(expected) == baseline,
+            "calibration charge release");
+    }
+    atomic_store_explicit(&governor->usable_bytes, high, memory_order_release);
+    EMPTY_CHECK(wl_columnar_relation_pool_new_like_governed_checked(&probe,
+        sess->delta_pool, name, full, expected) == 0,
+        "measured constructor limit fits");
+    col_rel_destroy(probe);
+    probe = NULL;
+
+    for (unsigned phase = 0; phase < 3; phase++) {
+        uint32_t slots = pooled ? sess->delta_pool->slot_used : 0;
+        atomic_store_explicit(&governor->usable_bytes, phase == 0 ? high - 1
+            : baseline + (UINT64_C(1) << 20), memory_order_release);
+        sess->memory_budget_denied = false;
+        if (phase == 1)
+            wl_columnar_relation_test_fail_next_metadata_alloc();
+        if (phase == 2)
+            full->graph_col_idx = full->ncols;
+        int rc = col_op_variable(&op, &stack, sess);
+        full->graph_col_idx = 1;
+        EMPTY_CHECK(rc == (phase == 0 ? ENOSPC : phase == 1 ? ENOMEM : EINVAL),
+            "empty constructor typed failure");
+        EMPTY_CHECK(sess->memory_budget_denied == (phase == 0),
+            "denial provenance");
+        EMPTY_CHECK(stack.top == 1 && concat_entry_unchanged(&stack.items[0],
+            &lower)
+            && lower.seg_boundaries[0] == 0 && lower.seg_boundaries[1] == 1,
+            "refusal preserves complete lower entry");
+        EMPTY_CHECK(reserved_for(expected) == baseline
+            && (!pooled || sess->delta_pool->slot_used == slots),
+            "failure reservation/slot rollback");
+    }
+    atomic_store_explicit(&governor->usable_bytes, high, memory_order_release);
+    sess->memory_budget_denied = false;
+    EMPTY_CHECK(col_op_variable(&op, &stack, sess) == 0 && stack.top == 2,
+        "retry at exact constructor limit");
+    const eval_entry_t *result = &stack.items[1];
+    const col_rel_t *out = result->rel;
+    EMPTY_CHECK(out && out->memory_governor == expected &&
+        out->pool_owned == pooled
+        && strcmp(out->name, name) == 0 && out->nrows == 0
+        && result->owned && result->is_delta == (condition >= 2)
+        && !sess->memory_budget_denied, "empty result ownership/governor/tag");
+    EMPTY_CHECK(out->ncols == full->ncols &&
+        out->declared_ncols == full->declared_ncols
+        && out->has_graph_column && out->graph_col_idx == 1
+        && out->compound_arity_len == full->compound_arity_len
+        && out->compound_arity_map != full->compound_arity_map
+        && out->compound_kind == full->compound_kind && out->timestamps == NULL,
+        "empty result metadata and legacy timestamp policy");
+    for (uint32_t c = 0; c < full->ncols; c++) {
+        EMPTY_CHECK(strcmp(out->col_names[c], full->col_names[c]) == 0
+            && out->column_types[c] == full->column_types[c]
+            && out->compound_arity_map[c] == full->compound_arity_map[c],
+            "private schema metadata");
+    }
+    EMPTY_CHECK(reserved_for(expected) == baseline + relation_charge(out),
+        "output charged once");
+    eval_entry_t entry = eval_stack_pop(&stack);
+    EMPTY_CHECK(eval_entry_dispose(&entry) == 0 &&
+        reserved_for(expected) == baseline,
+        "output disposal restores baseline");
+    /* Success after ENOMEM also proves the one-shot fault was consumed. */
+    while (stack.top < COL_STACK_MAX)
+        EMPTY_CHECK(eval_stack_push(&stack, full, false) == 0, "fill stack");
+    EMPTY_CHECK(col_op_variable(&op, &stack, sess) == ENOBUFS
+        && stack.top == COL_STACK_MAX && !sess->memory_budget_denied
+        && reserved_for(expected) == baseline,
+        "push failure discards private result");
+    for (uint32_t i = 1; i < stack.top; i++)
+        EMPTY_CHECK(stack.items[i].rel == full && !stack.items[i].owned,
+            "full stack unchanged");
+    stack.top = 1; /* discard borrowed, metadata-free fixture entries */
+
+    /* Unseeded iteration zero and FORCE_FULL remain borrowed reads even at
+     * an exhausted budget. No empty output may be allocated here. */
+    sess->current_iteration = 0;
+    sess->delta_seeded = sess->retraction_seeded = false;
+    atomic_store_explicit(&governor->usable_bytes, baseline,
+        memory_order_release);
+    op.delta_mode = WL_DELTA_FORCE_DELTA;
+    for (unsigned control = 0; control < 2; control++) {
+        if (control) op.delta_mode = WL_DELTA_FORCE_FULL;
+        EMPTY_CHECK(col_op_variable(&op, &stack, sess) == 0 && stack.top == 2
+            && stack.items[1].rel == full && !stack.items[1].owned
+            && !stack.items[1].is_delta && reserved_for(expected) == baseline,
+            "borrowed full-relation control");
+        entry = eval_stack_pop(&stack);
+        EMPTY_CHECK(eval_entry_dispose(&entry) == 0,
+            "borrowed control release");
+    }
+    EMPTY_CHECK(full->nrows == 1 && full->columns[0][0] == row[0]
+        && full->columns[1][0] == row[1] &&
+        full->timestamps == source_timestamps
+        && full->view_generation == source_view &&
+        full->storage_generation == source_storage,
+        "source contents and generations unchanged");
+    EMPTY_CHECK(governor_mode != 2 ||
+        reserved_for(source_ref) == other_baseline,
+        "session precedence leaves source charge alone");
+cleanup:
+    col_rel_destroy(probe);
+    (void)eval_stack_drain(&stack);
+    col_rel_destroy(source);
+    if (sess && saved_ref)
+        sess->memory_governor = saved_ref;
+    destroy_session(sess);
+    if (expected && reserved_for(expected) != 0 && !failure)
+        failure = "teardown leaked governor bytes";
+    wl_columnar_memory_governor_ref_release(expected);
+    wl_columnar_memory_governor_ref_release(source_ref);
+    if (failure) FAIL(failure);
+    else PASS();
+#undef EMPTY_CHECK
+}
+
+static void
 test_concat_admission_rollback(bool pooled, bool second_append)
 {
     TEST(pooled ? "pooled CONCAT admission preserves staged inputs"
@@ -3638,6 +3867,12 @@ main(void)
     printf("Memory admission: JOIN output capacity (Issue #1477)\n");
 
     test_attach_baseline();
+    for (unsigned pooled = 0; pooled < 2; pooled++) {
+        for (unsigned governor = 0; governor < 3; governor++) {
+            for (unsigned condition = 0; condition < 6; condition++)
+                test_variable_empty_admission(pooled != 0, governor, condition);
+        }
+    }
     test_concat_admission_rollback(false, false);
     test_concat_admission_rollback(false, true);
     test_concat_admission_rollback(true, false);
