@@ -1333,7 +1333,7 @@ test_governed_logical_copy(void)
         + metadata_bytes(source) - 1u,
         memory_order_release);
     CHECK(wl_columnar_relation_deep_copy_governed(source, &copy,
-        ref) == ENOMEM && !copy
+        ref) == ENOSPC && !copy
         && wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(ref)) == 0
         && source->nrows == 1 && source->columns[0][0] == value,
