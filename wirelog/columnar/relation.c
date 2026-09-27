@@ -6295,6 +6295,7 @@ wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
     uint64_t reserved_bytes = 0;
     uint64_t metadata_bytes = 0;
     int reserve_rc = 0;
+    int reserve_failure_rc = ENOMEM;
     int rc;
 
     if (!src || !out)
@@ -6394,9 +6395,11 @@ wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
     }
     reserve_rc = col_rel_reserve_transition(dst, dst->capacity,
             timestamp_capacity, timestamp_capacity != 0, &pending,
-            &reserved_bytes, NULL);
+            &reserved_bytes, &reserve_failure_rc);
     if (reserve_rc < 0) {
-        rc = ENOMEM;
+        rc = reserve_failure_rc == ENOMEM
+            && dst->memory_budget_denial_pending
+            ? ENOSPC : reserve_failure_rc;
         goto done;
     }
 #ifdef WL_TEST_RELATION_RESIZE_HOOK
