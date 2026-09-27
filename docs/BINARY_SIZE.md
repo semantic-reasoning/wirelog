@@ -1,16 +1,21 @@
 # Binary size monitoring and admission
 
-`tests/baseline_size.txt` records 404282 bytes, the canonical Ubuntu x86_64
-GCC `.text` measurement from PR #1961's reviewed production size job at source
-revision `418116cf14e915f6391082ea37b2884b67edd960`. This is a one-time,
-maintainer-approved baseline reset based on that reproducible measurement; it
-does not reduce the binary's size. Its exact PR, base, merge, run, job, log,
-profile, prior baseline, and measurement values are pinned in
-`tests/baseline_size.provenance.json`. The verifier accepts the record only
-after checking those identities and reproducing the canonical profile and
-`.text` size. The fixed 5120-byte allowance is unchanged, so the resulting
-maximum is 409402 bytes. A rebuilt library may have different non-`.text`
-bytes due to LTO metadata.
+`tests/baseline_size.txt` records 408989 bytes, the canonical Ubuntu x86_64
+GCC `.text` measurement from main revision
+`13d9244a13503cd178c40bb0179daf7c818ee314`. The completed
+[main workflow run 36335594347](https://github.com/semantic-reasoning/wirelog/actions/runs/36335594347)
+produced `wirelog-size-monitor-ubuntu-latest` artifact `10936589708`.
+Its source, run, artifact, profile, library digests and measurement are pinned
+in `tests/baseline_size.provenance.json`. The unchanged verifier checks those
+identities and independently rebuilds that source to reproduce its profile and
+`.text` size through the normal `trusted-ci-artifact` policy.
+
+The workflow concluded successfully, and the report records successful
+configuration and build, but its test step failed. This artifact establishes
+the production-library measurement, not a passing test suite. The refresh
+does not reduce the binary's size or change TDD eligibility. The fixed
+5120-byte allowance is unchanged, so the resulting maximum is 414109 bytes.
+A rebuilt library may have different non-`.text` bytes due to LTO metadata.
 
 The production limit remains 5120 bytes. PR CI compares the production shared
 library from the exact `pull_request.base.sha` tree with the library from the
