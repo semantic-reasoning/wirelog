@@ -139,9 +139,12 @@ ensure_plan_built(wirelog_easy_session_t *s, uint32_t num_workers)
      * advance. */
     rc = wl_session_load_facts(session, s->prog);
     if (rc != 0) {
+        wirelog_error_t load_error
+            = (wirelog_error_t)wl_facade_session_error_code_with_budget(
+                rc, 0, wl_session_budget_denied(session));
         wl_session_destroy(session);
         wl_plan_free(plan);
-        return WIRELOG_ERR_EXEC;
+        return load_error;
     }
 
     s->plan = plan;

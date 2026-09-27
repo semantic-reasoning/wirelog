@@ -478,9 +478,12 @@ wirelog_session_create_impl(wirelog_program_t *program,
      * deltas appear on the first step()). */
     rc = wl_session_load_facts(inner, program);
     if (rc != 0) {
+        wirelog_error_t load_error
+            = (wirelog_error_t)wl_facade_session_error_code_with_budget(
+                rc, 0, wl_session_budget_denied(inner));
         wl_session_destroy(inner);
         wl_plan_free(plan);
-        return WIRELOG_ERR_EXEC;
+        return load_error;
     }
 
     wirelog_session_t *s
