@@ -83,6 +83,348 @@ wl_columnar_eval_tdd_plan_next(const wl_plan_stratum_t *sp,
     return false;
 }
 
+/* Compare semantic payloads, not cloned pointers or structure padding. */
+static bool
+wl_columnar_eval_tdd_plan_string_equal(const char *a, const char *b)
+{
+    return a && b ? strcmp(a, b) == 0 : a == b;
+}
+
+static bool
+wl_columnar_eval_tdd_plan_bytes_equal(const void *a, const void *b,
+    size_t size)
+{
+    return size == 0 || (a && b && memcmp(a, b, size) == 0);
+}
+
+static bool
+wl_columnar_eval_tdd_plan_expr_equal(wl_plan_expr_buffer_t a,
+    wl_plan_expr_buffer_t b)
+{
+    return a.size == b.size
+           && wl_columnar_eval_tdd_plan_bytes_equal(a.data, b.data, a.size);
+}
+
+static bool
+wl_columnar_eval_tdd_plan_keys_equal(const wl_plan_op_t *a,
+    const wl_plan_op_t *b)
+{
+    if (a->key_count != b->key_count)
+        return false;
+    for (uint32_t i = 0; i < a->key_count; i++) {
+        if (!a->left_keys || !a->right_keys || !b->left_keys || !b->right_keys
+            || !a->left_keys[i] || !a->right_keys[i]
+            || !wl_columnar_eval_tdd_plan_string_equal(a->left_keys[i],
+            b->left_keys[i])
+            || !wl_columnar_eval_tdd_plan_string_equal(a->right_keys[i],
+            b->right_keys[i]))
+            return false;
+    }
+    return true;
+}
+
+static bool
+wl_columnar_eval_tdd_plan_op_equal(const wl_plan_op_t *a,
+    const wl_plan_op_t *b)
+{
+    if (a->op != b->op || a->opaque_data || b->opaque_data
+        || !wl_columnar_eval_tdd_plan_string_equal(a->relation_name,
+        b->relation_name)
+        || !wl_columnar_eval_tdd_plan_string_equal(a->right_relation,
+        b->right_relation)
+        || !wl_columnar_eval_tdd_plan_keys_equal(a, b)
+        || a->project_count != b->project_count
+        || !wl_columnar_eval_tdd_plan_bytes_equal(a->project_indices,
+        b->project_indices, (size_t)a->project_count * sizeof(uint32_t))
+        || !wl_columnar_eval_tdd_plan_expr_equal(a->filter_expr, b->filter_expr)
+        || !wl_columnar_eval_tdd_plan_expr_equal(a->right_filter_expr,
+        b->right_filter_expr)
+        || a->agg_fn != b->agg_fn || a->aggregate_index != b->aggregate_index
+        || a->agg_operand_type != b->agg_operand_type ||
+        a->agg_result_type != b->agg_result_type
+        || !wl_columnar_eval_tdd_plan_expr_equal(a->agg_expr, b->agg_expr)
+        || a->group_by_count != b->group_by_count
+        || !wl_columnar_eval_tdd_plan_bytes_equal(a->group_by_indices,
+        b->group_by_indices, (size_t)a->group_by_count * sizeof(uint32_t))
+        || a->map_expr_count != b->map_expr_count)
+        return false;
+    for (uint32_t i = 0; i < a->map_expr_count; i++) {
+        if (!a->map_exprs || !b->map_exprs
+            || !wl_columnar_eval_tdd_plan_expr_equal(a->map_exprs[i],
+            b->map_exprs[i]))
+            return false;
+    }
+    return true;
+}
+
+static const char *
+wl_columnar_eval_tdd_plan_operand(const wl_plan_op_t *op)
+{
+    if (op->op == WL_PLAN_OP_VARIABLE)
+        return op->relation_name;
+    if (op->op == WL_PLAN_OP_JOIN || op->op == WL_PLAN_OP_SEMIJOIN)
+        return op->right_relation;
+    return NULL;
+}
+
+static bool
+wl_columnar_eval_tdd_plan_source(const wl_plan_op_t *op,
+    const wl_plan_stratum_t *sp)
+{
+    return (op->op == WL_PLAN_OP_VARIABLE || op->op == WL_PLAN_OP_JOIN)
+           && is_stratum_idb(sp, wl_columnar_eval_tdd_plan_operand(op));
+}
+
+/* Only the redundant, non-projecting prefilter immediately before the same
+ * keyed JOIN is recognized. Other recursive SEMIJOIN shapes stay unsupported.
+ * Its registry lookup reads FULL even when the following JOIN drives DELTA. */
+static bool
+wl_columnar_eval_tdd_plan_prefilter(const wl_plan_op_t *ops,
+    uint32_t i, uint32_t end)
+{
+    const wl_plan_op_t *op = &ops[i];
+    return i + 1 < end && ops[i + 1].op == WL_PLAN_OP_JOIN
+           && op->key_count == 1 && op->project_count == 0
+           && op->right_filter_expr.size == 0
+           && ops[i + 1].right_filter_expr.size == 0
+           && wl_columnar_eval_tdd_plan_string_equal(op->right_relation,
+               ops[i + 1].right_relation)
+           && wl_columnar_eval_tdd_plan_keys_equal(op, &ops[i + 1]);
+}
+
+static int
+wl_columnar_eval_tdd_plan_slice(const wl_plan_stratum_t *sp,
+    const wl_plan_op_t *ops, uint32_t base, uint32_t start, uint32_t end,
+    uint32_t alternative, uint32_t ordinal,
+    wl_columnar_eval_tdd_plan_manifest_t *manifest)
+{
+    uint32_t sources = 0, drivers = 0, driver = UINT32_MAX;
+    for (uint32_t i = start; i < end; i++) {
+        const wl_plan_op_t *op = &ops[base + i];
+        if (wl_columnar_eval_tdd_plan_source(op, sp)) {
+            sources++;
+            if (op->delta_mode == WL_DELTA_FORCE_DELTA) {
+                drivers++;
+                driver = base + i;
+            }
+        }
+        if (op->op == WL_PLAN_OP_SEMIJOIN
+            && is_stratum_idb(sp, op->right_relation)
+            && !wl_columnar_eval_tdd_plan_prefilter(ops, base + i, base + end))
+            return ENOTSUP;
+    }
+    if (drivers > 1)
+        return EINVAL;
+    bool inactive = sources != 0 && drivers == 0;
+    bool seed = sources == 0;
+    uint32_t read_start = manifest->read_count;
+    for (uint32_t i = start; i < end; i++) {
+        const wl_plan_op_t *op = &ops[base + i];
+        wl_delta_mode_t expected = WL_DELTA_AUTO;
+        if (wl_columnar_eval_tdd_plan_source(op, sp))
+            expected = base + i ==
+                driver ? WL_DELTA_FORCE_DELTA : WL_DELTA_FORCE_FULL;
+        if (i == start && inactive)
+            expected = WL_DELTA_FORCE_EMPTY;
+        if (i == start && seed)
+            expected = WL_DELTA_FORCE_EMPTY_AFTER_SEED;
+        if (op->delta_mode != expected)
+            return EINVAL;
+        const char *name = wl_columnar_eval_tdd_plan_operand(op);
+        if (!name || inactive)
+            continue;
+        if (manifest->reads) {
+            wl_columnar_eval_tdd_plan_read_t *read =
+                &manifest->reads[manifest->read_count];
+            *read = (wl_columnar_eval_tdd_plan_read_t){
+                .op_index = base + i, .source_index = i,
+                .relation_name = name,
+                .right_operand = op->op != WL_PLAN_OP_VARIABLE,
+                .kind = base + i == driver ? WL_COLUMNAR_EVAL_TDD_PLAN_DELTA
+                    : op->op ==
+                    WL_PLAN_OP_SEMIJOIN ? WL_COLUMNAR_EVAL_TDD_PLAN_PREFILTER
+                    : WL_COLUMNAR_EVAL_TDD_PLAN_FULL,
+            };
+        }
+        manifest->read_count++;
+    }
+    if (seed) {
+        for (uint32_t i = start; i < end; i++) {
+            if (is_stratum_idb(sp,
+                wl_columnar_eval_tdd_plan_operand(&ops[base + i])))
+                return ENOTSUP; /* A recursive prefilter alone is not a seed. */
+        }
+    }
+    if (manifest->slices) {
+        manifest->slices[manifest->slice_count] =
+            (wl_columnar_eval_tdd_plan_slice_t){
+            .alternative = alternative, .ordinal = ordinal,
+            .start = base + start, .count = end - start, .driver = driver,
+            .read_start = read_start,
+            .read_count = manifest->read_count - read_start,
+            .seed = seed, .inactive = inactive,
+        };
+    }
+    manifest->slice_count++;
+    return 0;
+}
+
+static int
+wl_columnar_eval_tdd_plan_walk(const wl_plan_stratum_t *sp,
+    const wl_plan_relation_t *rel,
+    wl_columnar_eval_tdd_plan_manifest_t *manifest)
+{
+    uint32_t width = manifest->block_size;
+    for (uint32_t b = 0; b < manifest->alternative_count; b++) {
+        uint32_t base = b * width, depth = 0, ordinal = 0, start = UINT32_MAX;
+        uint32_t drivers = 0;
+        for (uint32_t i = 0; i < width; i++) {
+            const wl_plan_op_t *op = &rel->ops[base + i];
+            if (!wl_columnar_eval_tdd_plan_op_equal(&rel->ops[i], op))
+                return EINVAL;
+            if (op->delta_mode == WL_DELTA_FORCE_DELTA)
+                drivers++;
+            bool boundary = op->op == WL_PLAN_OP_VARIABLE
+                || op->op == WL_PLAN_OP_CONCAT ||
+                op->op == WL_PLAN_OP_CONSOLIDATE;
+            if (boundary && start != UINT32_MAX) {
+                int rc = wl_columnar_eval_tdd_plan_slice(sp, rel->ops, base,
+                        start, i, b, ordinal++, manifest);
+                if (rc != 0)
+                    return rc;
+                start = UINT32_MAX;
+            }
+            switch (op->op) {
+            case WL_PLAN_OP_VARIABLE:
+                if (!op->relation_name || i == width - 1)
+                    return EINVAL;
+                depth++;
+                start = i;
+                break;
+            case WL_PLAN_OP_CONCAT:
+                if (op->delta_mode != WL_DELTA_AUTO
+                    || (i == width - 1 ? depth != 1 : depth < 2))
+                    return EINVAL;
+                depth--;
+                break;
+            case WL_PLAN_OP_CONSOLIDATE:
+                if (depth != 1 || op->delta_mode != WL_DELTA_AUTO)
+                    return EINVAL;
+                break;
+            case WL_PLAN_OP_JOIN:
+            case WL_PLAN_OP_SEMIJOIN:
+                if (!op->right_relation)
+                    return EINVAL;
+            /* fall through */
+            case WL_PLAN_OP_MAP:
+            case WL_PLAN_OP_FILTER:
+                if (start == UINT32_MAX || depth == 0)
+                    return EINVAL;
+                break;
+            default:
+                return ENOTSUP;
+            }
+        }
+        if (depth != 0 || start != UINT32_MAX || drivers != 1)
+            return EINVAL;
+    }
+    /* Independently enumerate source slots. Counting deltas alone could
+     * incorrectly accept a truncated or duplicated set of alternatives. */
+    uint32_t sources = 0;
+    for (uint32_t i = 0; i < width; i++) {
+        uint32_t drives = 0;
+        for (uint32_t b = 0; b < manifest->alternative_count; b++)
+            drives += rel->ops[b * width + i].delta_mode ==
+                WL_DELTA_FORCE_DELTA;
+        bool source = wl_columnar_eval_tdd_plan_source(&rel->ops[i], sp);
+        if (drives != (source ? 1u : 0u))
+            return EINVAL;
+        sources += source;
+    }
+    return sources == manifest->alternative_count ? 0 : EINVAL;
+}
+
+void
+wl_columnar_eval_tdd_plan_bindings_free(
+    wl_columnar_eval_tdd_plan_manifest_t *manifest)
+{
+    if (!manifest)
+        return;
+    free(manifest->reads);
+    free(manifest->slices);
+    memset(manifest, 0, sizeof(*manifest));
+}
+
+int
+wl_columnar_eval_tdd_plan_bindings(const wl_plan_stratum_t *sp,
+    uint32_t relation_index, wl_columnar_eval_tdd_plan_manifest_t *out)
+{
+    if (!out)
+        return EINVAL;
+    memset(out, 0, sizeof(*out));
+    if (!sp || !sp->relations || relation_index >= sp->relation_count)
+        return EINVAL;
+    for (uint32_t r = 0; r < sp->relation_count; r++) {
+        if (!sp->relations[r].name)
+            return EINVAL;
+        for (uint32_t j = 0; j < r; j++) {
+            if (strcmp(sp->relations[r].name, sp->relations[j].name) == 0)
+                return EINVAL;
+        }
+    }
+    const wl_plan_relation_t *rel = &sp->relations[relation_index];
+    if (!sp->is_recursive || !rel->ops || rel->op_count < 4)
+        return ENOTSUP;
+    uint32_t count = rel->op_count;
+    const wl_plan_op_t *exchange = &rel->ops[count - 1];
+    const wl_plan_op_exchange_t *meta = exchange->opaque_data;
+    if (exchange->op != WL_PLAN_OP_EXCHANGE || !meta
+        || !meta->key_col_idxs || !meta->key_col_count)
+        return ENOTSUP;
+    if (rel->ops[count - 2].op != WL_PLAN_OP_CONSOLIDATE
+        || rel->ops[count - 2].delta_mode != WL_DELTA_AUTO
+        || exchange->delta_mode != WL_DELTA_AUTO)
+        return EINVAL;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < count - 2; i++)
+        k += rel->ops[i].delta_mode == WL_DELTA_FORCE_DELTA;
+    if (k < 2)
+        return ENOTSUP;
+    if ((count - 2) % k != 0)
+        return EINVAL;
+    uint32_t width = (count - 2) / k;
+    if (width < 2 || rel->ops[width - 1].op != WL_PLAN_OP_CONCAT)
+        return EINVAL;
+    wl_columnar_eval_tdd_plan_manifest_t result = {
+        .relation_index = relation_index, .alternative_count = k,
+        .block_size = width,
+    };
+    int rc = wl_columnar_eval_tdd_plan_walk(sp, rel, &result);
+    if (rc != 0)
+        return rc;
+    size_t slice_bytes, read_bytes;
+    if (wl_columnar_eval_checked_size_mul(result.slice_count,
+        sizeof(*result.slices), &slice_bytes) != 0
+        || wl_columnar_eval_checked_size_mul(result.read_count,
+        sizeof(*result.reads), &read_bytes) != 0)
+        return EOVERFLOW;
+    result.slices = calloc(1, slice_bytes);
+    result.reads = calloc(1, read_bytes);
+    if (!result.slices || !result.reads) {
+        wl_columnar_eval_tdd_plan_bindings_free(&result);
+        return ENOMEM;
+    }
+    result.slice_count = 0;
+    result.read_count = 0;
+    rc = wl_columnar_eval_tdd_plan_walk(sp, rel, &result);
+    if (rc != 0) {
+        wl_columnar_eval_tdd_plan_bindings_free(&result);
+        return rc;
+    }
+    *out = result;
+    return 0;
+}
+
 /*
  * LFTJ plans currently contain only EDB operands.  Keep that invariant
  * explicit at the TDD boundary: a hand-built or future plan with an IDB

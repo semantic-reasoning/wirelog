@@ -3639,6 +3639,56 @@ tdd_stratum_single_idb_join_keys_exchange_aligned(
     const wl_plan_stratum_t *sp);
 bool
 tdd_stratum_global_read_candidate(const wl_plan_stratum_t *sp);
+/* Occurrence bindings for explicit unfused multiway alternatives (#1984).
+ * This describes input requirements only, NEVER execution eligibility.
+ * Names and ops are borrowed: the unchanged plan must outlive the manifest.
+ * Every read in an active slice requires one immutable epoch; only DELTA
+ * reads may be partitioned. Unexpanded/K=1 relations return ENOTSUP.
+ */
+typedef enum {
+    WL_COLUMNAR_EVAL_TDD_PLAN_FULL,
+    WL_COLUMNAR_EVAL_TDD_PLAN_DELTA,
+    WL_COLUMNAR_EVAL_TDD_PLAN_PREFILTER
+} wl_columnar_eval_tdd_plan_read_kind_t;
+
+typedef struct {
+    uint32_t op_index; /* absolute index in the owning relation */
+    uint32_t source_index; /* same slot across expansion alternatives */
+    const char *relation_name;
+    bool right_operand;
+    wl_columnar_eval_tdd_plan_read_kind_t kind;
+} wl_columnar_eval_tdd_plan_read_t;
+
+typedef struct {
+    uint32_t alternative;
+    uint32_t ordinal; /* rule slice within this alternative */
+    uint32_t start;
+    uint32_t count;
+    uint32_t driver; /* absolute op index; UINT32_MAX for seed/inactive */
+    uint32_t read_start;
+    uint32_t read_count;
+    bool seed;
+    bool inactive;
+} wl_columnar_eval_tdd_plan_slice_t;
+
+typedef struct {
+    uint32_t relation_index;
+    uint32_t alternative_count;
+    uint32_t block_size;
+    uint32_t slice_count;
+    uint32_t read_count;
+    wl_columnar_eval_tdd_plan_slice_t *slices;
+    wl_columnar_eval_tdd_plan_read_t *reads;
+} wl_columnar_eval_tdd_plan_manifest_t;
+
+/* out must not own a previous manifest. Every failure leaves it empty.
+ * EINVAL: malformed/inconsistent expansion; ENOTSUP: unsupported plan form;
+ * ENOMEM/EOVERFLOW: storage failure. No plan or session mutation. */
+int wl_columnar_eval_tdd_plan_bindings(const wl_plan_stratum_t *sp,
+    uint32_t relation_index, wl_columnar_eval_tdd_plan_manifest_t *out);
+void wl_columnar_eval_tdd_plan_bindings_free(
+    wl_columnar_eval_tdd_plan_manifest_t *manifest);
+
 typedef struct {
     uint32_t total_segments;
     uint32_t seed_only_segments;

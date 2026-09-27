@@ -5897,3 +5897,20 @@ test_evaluation_control_exe = executable(
 )
 test('evaluation_control', test_evaluation_control_exe,
      suite: ['unit', 'tsan'], timeout: 60)
+
+# #1984: recognize explicit multiway input occurrences without changing TDD
+# admission. The actual benchmark source prevents a toy-plan-only proof.
+tdd_driver_wrap = host_machine.system() == 'linux'
+test_tdd_delta_driver_plan_exe = executable(
+  'test_tdd_delta_driver_plan',
+  files('test_tdd_delta_driver_plan.c'),
+  backend_src, parser_src, ir_src, optimizer_src, arena_src,
+  io_src, thread_src, workqueue_src,
+  c_args: ['-DENABLE_K_FUSION=0'] + (tdd_driver_wrap ? ['-DWL_TEST_ALLOC_WRAP=1'] : []),
+  link_args: tdd_driver_wrap ? ['-Wl,--wrap=calloc'] : [],
+  override_options: tdd_driver_wrap ? ['b_lto=false'] : [],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+test('tdd_delta_driver_plan', test_tdd_delta_driver_plan_exe,
+     env: ['WIRELOG_TEST_CSPA_PLAN=' + meson.project_source_root() / 'bench/workloads/cspa.dl'])

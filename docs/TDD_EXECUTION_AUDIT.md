@@ -225,3 +225,38 @@ of barriers or safety guards:
 
 These are explicitly bounded follow-up needs, not optimizations implemented or
 performance improvements claimed by #1378.
+
+## Occurrence binding diagnostics (#1984)
+
+`WIRELOG_TDD_DECISION_DEBUG=1` also emits a `TDD bindings` record per
+relation. `status=0` means that its explicit unfused multiway alternatives
+have a validated input-binding manifest. `status=ENOTSUP` (printed as the
+platform errno number) includes unexpanded/K=1 relations and unsupported
+forms; other nonzero statuses report malformed plans or allocation failure.
+These records do **not** establish execution eligibility. The existing
+`TDD decision` and completed-work records remain the evidence for dispatch.
+The manifest is built only when this diagnostic is enabled or when explicitly
+requested internally; normal admission allocates no new manifest.
+
+For the current lowered CSPA plan, `valueFlow` has three alternatives and
+`valueAlias` five. `memoryAlias` is unexpanded and has no manifest. This is
+not whole-SCC support. Bindings retain the exact operator occurrence and
+operand side, so repeated uses of `valueFlow` remain distinct. The inserted,
+non-projecting SEMIJOIN prefilter reads the full epoch even when the following
+JOIN reads a partitioned delta. Ambiguous forms, missing or duplicated driver
+alternatives, changed sibling semantics, and invalid UNION/seed masks fail
+recognition. Names are borrowed from the unchanged plan; the manifest owns
+only its descriptor arrays and must be freed before that plan is released.
+
+`meson test -C builddir tdd_delta_driver_plan` generates the real benchmark
+plan and checks these bindings, malformed plans, and allocation-failure retry
+(on Linux). A small independent fixture checks exact input multiplicities and
+cross-owner full-read witnesses at simulated widths 1, 2 and 8, including fixed
+expected tuples for individual three-input alternatives. This is a binding
+proof, not a test of the engine's distributed or differential runtime.
+
+Actual CSPA execution still requires #1984's runtime integration with #1965's
+atomic round publication: immutable same-epoch full reads, governed lifetimes,
+worker drain/rollback, partition/epoch-aware cache reuse, and exact derived
+results across simultaneous deltas, retractions and retries. #1982 retains
+actual W=2/8 dispatch and qualified paired performance acceptance.
