@@ -575,6 +575,137 @@ expect(const char *name, int ok)
     return 1;
 }
 
+/* Borrowed metadata is sufficient for this read-only planner query.  The
+ * session lookup still owns a lazily allocated hash, released on every exit. */
+static int
+run_self_join_alignment(bool nested)
+{
+    char *names[] = { "alpha", "beta", "other" };
+    col_rel_t relation = { .name = "r", .ncols = 3, .col_names = names };
+    col_rel_t *relations[] = { &relation };
+    wl_col_session_t coord = { .rels = relations, .nrels = 1 };
+    const char *left[] = { "alpha", "beta" };
+    const char *right[] = { "alpha", "beta" };
+    uint32_t keys[] = { 0, 1 };
+    wl_plan_op_exchange_t exchange = { .key_col_idxs = keys,
+                                       .key_col_count = 1 };
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "r" },
+        { .op = WL_PLAN_OP_JOIN, .right_relation = "r", .left_keys = left,
+          .right_keys = right, .key_count = 1 },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange },
+    };
+    wl_plan_op_t *children[] = { ops, ops };
+    uint32_t counts[] = { 2, 2 };
+    wl_plan_op_k_fusion_t fusion = { .k = 2, .k_ops = children,
+                                     .k_op_counts = counts };
+    wl_plan_op_t outer[] = {
+        { .op = WL_PLAN_OP_K_FUSION, .opaque_data = &fusion },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange },
+    };
+    wl_plan_relation_t plan_rel = { .name = "r", .ops = nested ? outer : ops,
+                                    .op_count = nested ? 2 : 3 };
+    wl_plan_stratum_t stratum = { .relations = &plan_rel, .relation_count = 1 };
+    wl_plan_op_t *exchange_op = nested ? &outer[1] : &ops[2];
+    int failed = 1;
+
+#define ALIGNMENT_CHECK(expected) do { \
+            if (tdd_stratum_idb_self_join_exchange_aligned(&stratum, &coord) \
+                != (expected)) { \
+                fprintf(stderr, "alignment nested=%d line=%d expected=%d\n", \
+                    nested, __LINE__, (expected)); \
+                goto done; \
+            } \
+} while (0)
+
+    if (!tdd_stratum_has_idb_self_join(&stratum))
+        goto done;
+    /* Positive controls prevent missing schema/metadata from masking a NULL
+     * dereference. Composite index 1 retains valid keys at index 0. */
+    for (uint32_t width = 1; width <= 2; width++) {
+        ops[1].key_count = exchange.key_col_count = width;
+        ALIGNMENT_CHECK(true);
+        for (uint32_t k = 0; k < width; k++) {
+            const char *saved = left[k];
+            left[k] = NULL;
+            ALIGNMENT_CHECK(false);
+            left[k] = saved;
+            saved = right[k];
+            right[k] = NULL;
+            ALIGNMENT_CHECK(false);
+            right[k] = saved;
+        }
+        ALIGNMENT_CHECK(true);
+    }
+
+    left[1] = "other";
+    ALIGNMENT_CHECK(false);
+    left[1] = "beta";
+    right[1] = "other";
+    ALIGNMENT_CHECK(false);
+    right[1] = "missing";
+    ALIGNMENT_CHECK(false);
+    right[1] = "beta";
+    ops[1].left_keys = NULL;
+    ALIGNMENT_CHECK(false);
+    ops[1].left_keys = left;
+    ops[1].right_keys = NULL;
+    ALIGNMENT_CHECK(false);
+    ops[1].right_keys = right;
+    ops[1].key_count = 0;
+    ALIGNMENT_CHECK(false);
+    ops[1].key_count = 1;
+    ALIGNMENT_CHECK(false);
+    ops[1].key_count = 2;
+
+    session_rel_free_hash(&coord);
+    coord.nrels = 0;
+    ALIGNMENT_CHECK(false);
+    coord.nrels = 1;
+    relation.col_names = NULL;
+    ALIGNMENT_CHECK(false);
+    relation.col_names = names;
+    relation.ncols = 0;
+    ALIGNMENT_CHECK(false);
+    relation.ncols = 3;
+    exchange_op->opaque_data = NULL;
+    ALIGNMENT_CHECK(false);
+    exchange_op->opaque_data = &exchange;
+    exchange.key_col_idxs = NULL;
+    ALIGNMENT_CHECK(false);
+    exchange.key_col_idxs = keys;
+    exchange.key_col_count = 0;
+    ALIGNMENT_CHECK(false);
+    exchange.key_col_count = 2;
+    ALIGNMENT_CHECK(true);
+
+    /* A duplicate name resolves its first literal match, even when only
+     * the later duplicate belongs to the exchange key. */
+    ops[1].key_count = exchange.key_col_count = 1;
+    names[0] = names[1] = "dup";
+    left[0] = right[0] = "dup";
+    ALIGNMENT_CHECK(true);
+    keys[0] = 1;
+    ALIGNMENT_CHECK(false);
+    names[0] = NULL;
+    ALIGNMENT_CHECK(true);
+
+    /* Numeric-looking keys do not synthesize positional schema names. */
+    names[0] = "alpha";
+    names[1] = "beta";
+    left[0] = right[0] = "col0";
+    ALIGNMENT_CHECK(false);
+    names[1] = "col0";
+    ALIGNMENT_CHECK(true);
+    keys[0] = 0;
+    ALIGNMENT_CHECK(false);
+    failed = 0;
+done:
+    session_rel_free_hash(&coord);
+#undef ALIGNMENT_CHECK
+    return failed;
+}
+
 /* Check the public internal queries, rather than duplicating their traversal. */
 static int
 run_plan_traversal(void)
@@ -777,6 +908,10 @@ main(int argc, char **argv)
             unsetenv("WIRELOG_TDD_STRATUM_PROFILE");
         return run_snapshot_frames();
     }
+    failed += expect("top-level self-join alignment rejects malformed keys",
+            run_self_join_alignment(false) == 0);
+    failed += expect("nested self-join alignment rejects malformed keys",
+            run_self_join_alignment(true) == 0);
     failed += expect("TDD plan traversal preserves query policies",
             run_plan_traversal() == 0);
     failed += expect("post-dispatch serial replay retains history",

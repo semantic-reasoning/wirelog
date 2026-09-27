@@ -972,6 +972,8 @@ idb_idb_join_right_keys_match_exchange(const wl_plan_op_t *ops,
                     return false; /* No schema: cannot verify */
 
                 for (uint32_t k = 0; k < op->key_count; k++) {
+                    if (!op->right_keys[k] || !op->left_keys[k])
+                        return false;
                     /* Check right_key against EXCHANGE key */
                     const char *rkname = op->right_keys[k];
                     uint32_t rcidx = UINT32_MAX;
