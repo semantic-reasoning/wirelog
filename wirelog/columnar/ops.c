@@ -205,10 +205,10 @@ wl_columnar_ops_dispose_entry(eval_stack_t *stack, eval_entry_t *entry,
     return rc != 0 ? rc : result;
 }
 
-/* Only admission before row evaluation can safely retry without replaying
- * extension callbacks. Ordinary failures retain checked-disposal precedence. */
+/* Callers may restore only before effectful evaluation, or after proving
+ * evaluation was pure. Ordinary failures retain checked-disposal precedence. */
 static int
-wl_columnar_ops_map_admission_failure(eval_stack_t *stack, eval_entry_t *entry,
+wl_columnar_ops_admission_failure(eval_stack_t *stack, eval_entry_t *entry,
     wl_col_session_t *sess, int rc)
 {
     if (rc == ENOSPC) {
@@ -274,7 +274,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     int map_scratch_rc = wl_ops_scratch_reserve(&map_scratch,
             governor, map_scratch_bytes, sess);
     if (map_scratch_rc != 0)
-        return wl_columnar_ops_map_admission_failure(stack, &e, sess,
+        return wl_columnar_ops_admission_failure(stack, &e, sess,
                    map_scratch_rc);
 #define WL_MAP_RELEASE_SCRATCH() wl_ops_scratch_release(&map_scratch)
     col_rel_t *out = NULL;
@@ -297,7 +297,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     }
     if (output_rc != 0) {
         WL_MAP_RELEASE_SCRATCH();
-        return wl_columnar_ops_map_admission_failure(stack, &e, sess,
+        return wl_columnar_ops_admission_failure(stack, &e, sess,
                    output_rc);
     }
 
@@ -335,7 +335,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                     free(tmp);
                     col_rel_destroy(out);
                     WL_MAP_RELEASE_SCRATCH();
-                    return wl_columnar_ops_map_admission_failure(stack, &e,
+                    return wl_columnar_ops_admission_failure(stack, &e,
                                sess,
                                expr_rc);
                 }
@@ -532,7 +532,11 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
 #endif
 
     col_rel_t *in = e.rel;
+    wl_columnar_memory_governor_ref_t *governor = sess->memory_governor
+        ? sess->memory_governor : in->memory_governor;
     uint32_t gc = op->group_by_count;
+    if (gc == UINT32_MAX)
+        return wl_columnar_ops_dispose_entry(stack, &e, EOVERFLOW);
 
     uint32_t map_cap = 1;
     uint64_t desired = (uint64_t)(in->nrows ? in->nrows : 1) * 2U;
@@ -571,23 +575,34 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         return wl_columnar_ops_dispose_entry(stack, &e, EOVERFLOW);
     wl_ops_scratch_t scratch;
     int scratch_rc = wl_ops_scratch_reserve(&scratch,
-            sess ? sess->memory_governor : NULL, scratch_bytes, sess);
+            governor, scratch_bytes, sess);
     if (scratch_rc != 0)
-        return wl_columnar_ops_dispose_entry(stack, &e, scratch_rc);
+        return wl_columnar_ops_admission_failure(stack, &e, sess, scratch_rc);
 #define WL_REDUCE_RELEASE_SCRATCH() wl_ops_scratch_release(&scratch)
 
     /* Output: the group columns and aggregate retain the rule-head order. */
     uint32_t agg_index = op->aggregate_index < ocols
         ? op->aggregate_index : gc;
     col_rel_t *out = NULL;
+    int output_rc = ENOMEM;
 #ifdef WL_SESSION_TEST_HOOKS
     if (!wl_columnar_ops_test_reduce_fail_output_alloc)
 #endif
-    out = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
-            "$reduce", ocols);
-    if (!out) {
+    {
+        if (governor) {
+            uint32_t capacity = in->nrows < COL_REL_INIT_CAP
+                ? in->nrows : COL_REL_INIT_CAP;
+            output_rc = wl_columnar_relation_new_auto_governed("$reduce",
+                    ocols, capacity, false, governor, &out);
+        } else {
+            out = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
+                    "$reduce", ocols);
+            output_rc = out ? 0 : ENOMEM;
+        }
+    }
+    if (output_rc != 0) {
         WL_REDUCE_RELEASE_SCRATCH();
-        return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
+        return wl_columnar_ops_admission_failure(stack, &e, sess, output_rc);
     }
 
     bool float_agg = op->agg_operand_type == WL_PLAN_AGG_OPERAND_FLOAT;
@@ -612,7 +627,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         if (type_rc != 0) {
             col_rel_destroy(out);
             WL_REDUCE_RELEASE_SCRATCH();
-            return wl_columnar_ops_dispose_entry(stack, &e, type_rc);
+            return wl_columnar_ops_admission_failure(stack, &e, sess, type_rc);
         }
     }
 
@@ -628,12 +643,12 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         int expr_rc = ENOTSUP;
         agg_ce = wl_columnar_expr_compile_governed(op->agg_expr.data,
                 op->agg_expr.size, sess ? sess->intern : NULL,
-                sess ? sess->memory_governor : NULL, sess, &expr_rc);
+                governor, sess, &expr_rc);
         if (expr_rc != ENOTSUP && expr_rc != 0) {
             free(tmp);
             col_rel_destroy(out);
             WL_REDUCE_RELEASE_SCRATCH();
-            return wl_columnar_ops_dispose_entry(stack, &e, expr_rc);
+            return wl_columnar_ops_admission_failure(stack, &e, sess, expr_rc);
         }
     }
 
@@ -670,6 +685,10 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         WL_REDUCE_RELEASE_SCRATCH();
         return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
     }
+    /* Interpreted aggregates can intern strings. Do not replay those effects
+     * after a late refusal; COUNT never evaluates its aggregate expression. */
+    bool retry_safe = op->agg_fn == WIRELOG_AGG_COUNT
+        || !op->agg_expr.data || op->agg_expr.size == 0 || agg_ce != NULL;
     uint32_t map_mask = map_cap - 1;
     int set_rc = 0;
 
@@ -875,6 +894,10 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
             }
             int rc = col_rel_append_row(out, tmp);
             if (rc != 0) {
+                if (rc == ENOMEM && out->memory_budget_denial_pending)
+                    rc = ENOSPC;
+                if (rc == ENOSPC)
+                    sess->memory_budget_denied = true;
                 col_row_buf_release(&row_rb);
                 wl_columnar_expr_compiled_free(agg_ce);
                 free(sums);
@@ -883,6 +906,9 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                 free(tmp);
                 col_rel_destroy(out);
                 WL_REDUCE_RELEASE_SCRATCH();
+                if (retry_safe)
+                    return wl_columnar_ops_admission_failure(stack, &e,
+                               sess, rc);
                 return wl_columnar_ops_dispose_entry(stack, &e, rc);
             }
             groups[slot].hash = hash;
@@ -903,6 +929,8 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         return input_rc;
     }
     int push_rc = eval_stack_push(stack, out, true);
+    if (push_rc != 0)
+        col_rel_destroy(out);
     return push_rc;
 
 set_failure:

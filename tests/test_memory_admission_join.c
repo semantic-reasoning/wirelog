@@ -569,9 +569,9 @@ cleanup:
 }
 
 static void
-test_map_unmanaged_storage(unsigned mode)
+test_operator_unmanaged_storage(unsigned mode, bool reduce)
 {
-    TEST("unmanaged MAP retains heap/pool/arena allocation policy");
+    TEST("unmanaged MAP/REDUCE retains heap/pool/arena allocation policy");
     wl_col_session_t sess = {0};
     col_rel_t *input = col_rel_new_auto("input", 1);
     eval_stack_t stack;
@@ -581,17 +581,19 @@ test_map_unmanaged_storage(unsigned mode)
     if (mode == 2)
         sess.eval_arena = wl_arena_create(4096);
     const int64_t row = 7;
-    wl_plan_op_t op = {.op = WL_PLAN_OP_MAP, .project_count = 1};
+    wl_plan_op_t op = {.op = reduce ? WL_PLAN_OP_REDUCE : WL_PLAN_OP_MAP,
+                       .project_count = 1, .agg_fn = WIRELOG_AGG_COUNT};
     bool ok = input && (!mode || sess.delta_pool)
         && (mode != 2 || sess.eval_arena)
         && col_rel_append_row(input, &row) == 0
         && eval_stack_push(&stack, input, false) == 0
-        && col_op_map(&op, &stack, &sess) == 0 && stack.top == 1;
+        && (reduce ? col_op_reduce(&op, &stack, &sess)
+                   : col_op_map(&op, &stack, &sess)) == 0 && stack.top == 1;
     if (ok) {
         const col_rel_t *out = stack.items[0].rel;
         ok = out && !out->memory_governor && out->pool_owned == (mode != 0)
             && out->arena_owned == (mode == 2) && out->nrows == 1
-            && col_rel_get(out, 0, 0) == 7;
+            && col_rel_get(out, 0, 0) == (reduce ? 1 : 7);
     }
     (void)eval_stack_drain(&stack);
     col_rel_destroy(input);
@@ -601,6 +603,266 @@ test_map_unmanaged_storage(unsigned mode)
         FAIL("legacy storage route"); return;
     }
     PASS();
+}
+
+static int
+reduce_probe(wl_col_session_t *sess, col_rel_t *input, wl_plan_op_t *op,
+    uint32_t *capacity)
+{
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    int rc = eval_stack_push(&stack, input, false);
+    if (rc == 0)
+        rc = col_op_reduce(op, &stack, sess);
+    if (rc == 0 && capacity)
+        *capacity = stack.items[stack.top - 1].rel->capacity;
+    (void)eval_stack_drain(&stack);
+    return rc;
+}
+
+static bool
+reduce_measure_limit(wl_col_session_t *sess, col_rel_t *input,
+    wl_plan_op_t *op, wl_columnar_memory_governor_ref_t *ref,
+    uint64_t baseline, uint64_t *limit)
+{
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(ref);
+    uint64_t low = baseline, high = baseline + (UINT64_C(1) << 24);
+    while (low < high) {
+        uint64_t mid = low + (high - low) / 2;
+        atomic_store_explicit(&governor->usable_bytes, mid,
+            memory_order_release);
+        int rc = reduce_probe(sess, input, op, NULL);
+        if ((rc != 0 && rc != ENOSPC) || reserved_for(ref) != baseline)
+            return false;
+        if (rc == 0)
+            high = mid;
+        else
+            low = mid + 1;
+    }
+    *limit = high;
+    return true;
+}
+
+/* kind: COUNT, direct SUM, compiled SUM, interpreted SUM. */
+static void
+test_reduce_admission(unsigned governor_mode, bool owned, unsigned kind,
+    uint32_t nrows)
+{
+    TEST(
+        "REDUCE governs groups and preserves the defined denial retry boundary");
+    wl_col_session_t *sess = make_session(UINT64_C(1) << 26);
+    wl_columnar_memory_governor_ref_t *saved = NULL, *source_ref = NULL;
+    wl_columnar_memory_governor_ref_t *expected = NULL;
+    col_rel_t *input = col_rel_new_auto("reduce_input", 2);
+    col_rel_t *lower = col_rel_new_auto("lower", 1);
+    bool stacked_owned = false;
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    const char *failure = NULL;
+#define REDUCE_CHECK(c, message) do { if (!(c)) { failure = message; \
+                                                  goto cleanup; } } while (0)
+    REDUCE_CHECK(sess && input && lower, "fixture");
+    saved = sess->memory_governor;
+    if (governor_mode)
+        source_ref = make_governor(UINT64_C(1) << 26);
+    REDUCE_CHECK(!governor_mode || source_ref, "source governor");
+    expected = governor_mode == 1 ? source_ref : saved;
+    wl_columnar_memory_governor_ref_retain(expected);
+    REDUCE_CHECK(col_rel_attach_memory_governor(input,
+        source_ref ? source_ref : saved) == 0, "source admission");
+    for (uint32_t r = 0; r < nrows; r++) {
+        const int64_t row[] = {0, 3};
+        REDUCE_CHECK(col_rel_append_row(input, row) == 0, "source rows");
+    }
+    REDUCE_CHECK(col_rel_enable_timestamps(input) == 0, "source timestamps");
+    if (governor_mode == 1)
+        sess->memory_governor = NULL;
+    delta_pool_destroy(sess->delta_pool);
+    sess->delta_pool = delta_pool_create_managed(8, sizeof(col_rel_t), 4096,
+            wl_columnar_memory_governor_ref_get(expected));
+    sess->eval_arena = wl_arena_create_managed(4096,
+            wl_columnar_memory_governor_ref_get(expected));
+    REDUCE_CHECK(sess->delta_pool && sess->eval_arena, "prepaid allocators");
+    if (governor_mode == 2)
+        atomic_store_explicit(&wl_columnar_memory_governor_ref_get(source_ref)
+            ->usable_bytes, reserved_for(source_ref), memory_order_release);
+    uint8_t compiled[] = {WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1'};
+    /* String length is an interpreter-only expression returning an integer.
+     * This exercises the conservative interpreter policy without a registry. */
+    uint8_t interpreted[] = {WL_PLAN_EXPR_CONST_STR, 3, 0, 'a', 'b', 'c',
+                             WL_PLAN_EXPR_STR_FN_STRLEN};
+    wl_plan_op_t op = {.op = WL_PLAN_OP_REDUCE, .group_by_count = 1,
+                       .aggregate_index = 1,
+                       .agg_fn = kind == 0 ? WIRELOG_AGG_COUNT
+                                                  : WIRELOG_AGG_SUM};
+    if (kind == 2)
+        op.agg_expr = (wl_plan_expr_buffer_t){compiled, sizeof(compiled)};
+    if (kind == 3) {
+        sess->intern = wl_intern_create();
+        REDUCE_CHECK(sess->intern, "interpreter intern table");
+        op.agg_expr = (wl_plan_expr_buffer_t){interpreted, sizeof(interpreted)};
+    }
+    uint64_t baseline = reserved_for(expected);
+    uint64_t few_limit = 0, full_limit = 0;
+    REDUCE_CHECK(reduce_measure_limit(sess, input, &op, expected, baseline,
+        &few_limit), "few-group threshold");
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(expected);
+    atomic_store_explicit(&governor->usable_bytes, few_limit,
+        memory_order_release);
+    uint32_t capacity = UINT32_MAX;
+    REDUCE_CHECK(reduce_probe(sess, input, &op, &capacity) == 0
+        && capacity == (nrows < COL_REL_INIT_CAP ? nrows : COL_REL_INIT_CAP),
+        "few groups do not preallocate worst-case input cardinality");
+    for (uint32_t r = 0; r < nrows; r++)
+        REDUCE_CHECK(col_rel_set(input, r, 0, r) == 0,
+            "distinct group fixture");
+    REDUCE_CHECK(reduce_measure_limit(sess, input, &op, expected, baseline,
+        &full_limit), "distinct-group threshold");
+    REDUCE_CHECK(nrows <= COL_REL_INIT_CAP || full_limit > few_limit,
+        "growth requires additional overlap credit");
+    atomic_store_explicit(&governor->usable_bytes,
+        baseline + (UINT64_C(1) << 24),
+        memory_order_release);
+    sess->memory_budget_denied = false;
+    wl_columnar_relation_test_fail_next_metadata_alloc();
+    REDUCE_CHECK(reduce_probe(sess, input, &op, NULL) == ENOMEM
+        && !sess->memory_budget_denied && reserved_for(expected) == baseline,
+        "allocator failure remains ENOMEM");
+    if (nrows > COL_REL_INIT_CAP) {
+        wl_columnar_relation_test_fail_next_prepare_resize();
+        REDUCE_CHECK(reduce_probe(sess, input, &op, NULL) == ENOMEM
+            && !wl_columnar_relation_test_fail_prepare_resize
+            && !sess->memory_budget_denied &&
+            reserved_for(expected) == baseline,
+            "late resize allocator failure is not budget denial");
+    }
+    wl_plan_op_t invalid = op;
+    invalid.group_by_count = UINT32_MAX;
+    REDUCE_CHECK(reduce_probe(sess, input, &invalid, NULL) == EOVERFLOW
+        && !sess->memory_budget_denied && reserved_for(expected) == baseline,
+        "output width overflow remains distinct");
+    uint64_t view = input->view_generation, storage = input->storage_generation;
+    col_delta_timestamp_t *timestamps = input->timestamps;
+    uint64_t input_charge = input->memory_governor == expected
+        ? relation_charge(input) : 0;
+    REDUCE_CHECK(eval_stack_push(&stack, lower, false) == 0
+        && eval_stack_push_delta(&stack, input, owned, true) == 0,
+        "input stack");
+    stacked_owned = owned;
+    stack.items[1].seg_boundaries = malloc(2 * sizeof(uint32_t));
+    REDUCE_CHECK(stack.items[1].seg_boundaries, "segments");
+    stack.items[1].seg_count = 1;
+    stack.items[1].seg_boundaries[0] = 0;
+    stack.items[1].seg_boundaries[1] = nrows;
+    eval_entry_t before = stack.items[1];
+    for (unsigned phase = 0; phase < (kind == 3 ? 1u : 3u); phase++) {
+        uint64_t limit = phase == 0 ? baseline : phase == 1 ? few_limit - 1
+                                                                           :
+            full_limit - 1;
+        atomic_store_explicit(&governor->usable_bytes, limit,
+            memory_order_release);
+        sess->memory_budget_denied = false;
+        REDUCE_CHECK(col_op_reduce(&op, &stack, sess) == ENOSPC
+            && sess->memory_budget_denied, "typed admission denial");
+        REDUCE_CHECK(stack.top == 2
+            && concat_entry_unchanged(&stack.items[1], &before)
+            && stack.items[0].rel == lower
+            && before.seg_boundaries[0] == 0 &&
+            before.seg_boundaries[1] == nrows,
+            "denial retains exact input entry");
+        REDUCE_CHECK(reserved_for(expected) == baseline
+            && input->view_generation == view &&
+            input->storage_generation == storage
+            && input->timestamps == timestamps && input->nrows == nrows
+            && sess->delta_pool->slot_used == 0 && sess->eval_arena->used == 0,
+            "private work unwinds without source or allocator-floor mutation");
+    }
+    if (kind == 2) {
+        uint8_t arithmetic[647] = {WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1'};
+        for (unsigned i = 0; i < 64; i++) {
+            arithmetic[7 + i * 10] = WL_PLAN_EXPR_CONST_INT;
+            arithmetic[16 + i * 10] = WL_PLAN_EXPR_ARITH_ADD;
+        }
+        op.agg_expr = (wl_plan_expr_buffer_t){arithmetic, sizeof(arithmetic)};
+        atomic_store_explicit(&governor->usable_bytes, few_limit,
+            memory_order_release);
+        sess->memory_budget_denied = false;
+        REDUCE_CHECK(col_op_reduce(&op, &stack, sess) == ENOSPC
+            && sess->memory_budget_denied && stack.top == 2
+            && concat_entry_unchanged(&stack.items[1], &before)
+            && reserved_for(expected) == baseline,
+            "compiled expression denial restores input");
+        op.agg_expr = (wl_plan_expr_buffer_t){compiled, sizeof(compiled)};
+    }
+    if (kind == 3 && nrows > COL_REL_INIT_CAP) {
+        REDUCE_CHECK(!owned, "interpreter fixture retains borrowed source");
+        atomic_store_explicit(&governor->usable_bytes, full_limit - 1,
+            memory_order_release);
+        sess->memory_budget_denied = false;
+        REDUCE_CHECK(col_op_reduce(&op, &stack, sess) == ENOSPC
+            && sess->memory_budget_denied && stack.top == 1
+            && reserved_for(expected) == baseline && input->nrows == nrows
+            && input->view_generation == view,
+            "interpreter late refusal consumes entry");
+        REDUCE_CHECK(eval_stack_push(&stack, input, false) == 0,
+            "explicit new interpreter invocation");
+    }
+    atomic_store_explicit(&governor->usable_bytes, full_limit,
+        memory_order_release);
+    sess->memory_budget_denied = false;
+    int rc = col_op_reduce(&op, &stack, sess);
+    if (owned && rc == 0) {
+        input = NULL; stacked_owned = false;
+    }
+    REDUCE_CHECK(rc == 0 && stack.top == 2 && !sess->memory_budget_denied,
+        "exact-limit successful reduction");
+    const col_rel_t *out = stack.items[1].rel;
+    REDUCE_CHECK(out && out->memory_governor == expected && !out->pool_owned
+        && !out->arena_owned && out->nrows == nrows && out->ncols == 2
+        && out->column_types && out->column_types[1] == WIRELOG_TYPE_INT64,
+        "governed grouped output schema");
+    for (uint32_t r = 0; r < nrows; r++)
+        REDUCE_CHECK(col_rel_get(out, r, 0) == r
+            && col_rel_get(out, r, 1) == (kind == 0 ? 1 : 3),
+            "exact groups and aggregates");
+    REDUCE_CHECK(reserved_for(expected) == baseline - (owned ? input_charge : 0)
+        + relation_charge(out), "complete output accounting");
+    REDUCE_CHECK(eval_stack_drain(&stack) == 0
+        && reserved_for(expected) == baseline - (owned ? input_charge : 0),
+        "output reservation release");
+cleanup:
+    wl_columnar_relation_test_clear_prepare_resize();
+    if (stacked_owned)
+        input = NULL;
+    (void)eval_stack_drain(&stack);
+    col_rel_destroy(input);
+    col_rel_destroy(lower);
+    if (sess) {
+        wl_arena_free(sess->eval_arena);
+        sess->eval_arena = NULL;
+        wl_intern_free(sess->intern);
+        sess->intern = NULL;
+        if (saved)
+            sess->memory_governor = saved;
+    }
+    destroy_session(sess);
+    if (source_ref) {
+        if (reserved_for(source_ref) != 0 && !failure)
+            failure = "source credit leaked";
+        wl_columnar_memory_governor_ref_release(source_ref);
+    }
+    if (expected) {
+        if (reserved_for(expected) != 0 && !failure)
+            failure = "resolved credit leaked";
+        wl_columnar_memory_governor_ref_release(expected);
+    }
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef REDUCE_CHECK
 }
 
 static void
@@ -4128,13 +4390,23 @@ main(void)
     printf("Memory admission: JOIN output capacity (Issue #1477)\n");
 
     test_attach_baseline();
+    for (unsigned governor = 0; governor < 3; governor++)
+        for (unsigned owned = 0; owned < 2; owned++)
+            test_reduce_admission(governor, owned != 0, 0,
+                COL_REL_INIT_CAP * 3 + 1);
+    test_reduce_admission(0, false, 1, COL_REL_INIT_CAP * 3 + 1);
+    test_reduce_admission(1, true, 2, COL_REL_INIT_CAP * 3 + 1);
+    test_reduce_admission(1, false, 3, COL_REL_INIT_CAP * 3 + 1);
+    test_reduce_admission(0, true, 0, 0);
+    for (unsigned mode = 0; mode < 3; mode++)
+        test_operator_unmanaged_storage(mode, true);
     for (unsigned governor = 0; governor < 3; governor++) {
         for (unsigned owned = 0; owned < 2; owned++)
             test_map_admission(governor, owned != 0, COL_REL_INIT_CAP + 1,
                 false, false);
     }
     for (unsigned mode = 0; mode < 3; mode++)
-        test_map_unmanaged_storage(mode);
+        test_operator_unmanaged_storage(mode, false);
     test_map_admission(0, false, 0, false, false);
     test_map_admission(1, true, 3, true, false);
     test_map_admission(0, false, 3, false, true);
