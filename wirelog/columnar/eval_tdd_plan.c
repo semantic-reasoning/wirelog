@@ -38,6 +38,51 @@ is_stratum_idb(const wl_plan_stratum_t *sp, const char *name)
     return false;
 }
 
+/* Enumerate each relation's top-level sequence followed by its direct fusion
+ * children. Predicates retain their own state and can stop before later
+ * metadata is inspected. Other traversal policies deliberately stay separate. */
+typedef struct {
+    uint32_t relation;
+    uint32_t op;
+    uint32_t child;
+    bool top_yielded;
+    const wl_plan_op_t *ops;
+    uint32_t count;
+} wl_columnar_eval_tdd_plan_cursor_t;
+
+static bool
+wl_columnar_eval_tdd_plan_next(const wl_plan_stratum_t *sp,
+    wl_columnar_eval_tdd_plan_cursor_t *cursor)
+{
+    while (cursor->relation < sp->relation_count) {
+        const wl_plan_relation_t *rel = &sp->relations[cursor->relation];
+        if (!cursor->top_yielded) {
+            cursor->top_yielded = true;
+            cursor->ops = rel->ops;
+            cursor->count = rel->op_count;
+            return true;
+        }
+        while (cursor->op < rel->op_count) {
+            const wl_plan_op_t *op = &rel->ops[cursor->op];
+            if (op->op == WL_PLAN_OP_K_FUSION && op->opaque_data) {
+                const wl_plan_op_k_fusion_t *kf = op->opaque_data;
+                if (cursor->child < kf->k) {
+                    cursor->ops = kf->k_ops[cursor->child];
+                    cursor->count = kf->k_op_counts[cursor->child];
+                    cursor->child++;
+                    return true;
+                }
+            }
+            cursor->op++;
+            cursor->child = 0;
+        }
+        cursor->relation++;
+        cursor->op = 0;
+        cursor->top_yielded = false;
+    }
+    return false;
+}
+
 /*
  * LFTJ plans currently contain only EDB operands.  Keep that invariant
  * explicit at the TDD boundary: a hand-built or future plan with an IDB
@@ -208,29 +253,12 @@ uint32_t
 stratum_max_idb_body_atoms(const wl_plan_stratum_t *sp)
 {
     uint32_t max_count = 0;
-    for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
-        const wl_plan_relation_t *rel = &sp->relations[ri];
-
-        /* Check top-level ops */
-        uint32_t c = ops_max_idb_segment_body_atoms(rel->ops,
-                rel->op_count, sp);
+    wl_columnar_eval_tdd_plan_cursor_t cursor = { 0 };
+    while (wl_columnar_eval_tdd_plan_next(sp, &cursor)) {
+        uint32_t c = ops_max_idb_segment_body_atoms(cursor.ops, cursor.count,
+                sp);
         if (c > max_count)
             max_count = c;
-
-        /* Check ops inside K_FUSION */
-        for (uint32_t oi = 0; oi < rel->op_count; oi++) {
-            if (rel->ops[oi].op == WL_PLAN_OP_K_FUSION
-                && rel->ops[oi].opaque_data) {
-                const wl_plan_op_k_fusion_t *kf =
-                    (const wl_plan_op_k_fusion_t *)rel->ops[oi].opaque_data;
-                for (uint32_t ki = 0; ki < kf->k; ki++) {
-                    c = ops_max_idb_segment_body_atoms(kf->k_ops[ki],
-                            kf->k_op_counts[ki], sp);
-                    if (c > max_count)
-                        max_count = c;
-                }
-            }
-        }
     }
     return max_count;
 }
@@ -838,25 +866,11 @@ tdd_stratum_single_idb_join_keys_exchange_aligned(
     if (tdd_stratum_has_idb_self_join(sp))
         return false;
 
-    for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
-        const wl_plan_relation_t *rel = &sp->relations[ri];
-
+    wl_columnar_eval_tdd_plan_cursor_t cursor = { 0 };
+    while (wl_columnar_eval_tdd_plan_next(sp, &cursor)) {
         if (!tdd_ops_single_idb_keys_exchange_aligned(
-                rel->ops, rel->op_count, sp))
+                cursor.ops, cursor.count, sp))
             return false;
-
-        for (uint32_t oi = 0; oi < rel->op_count; oi++) {
-            if (rel->ops[oi].op == WL_PLAN_OP_K_FUSION
-                && rel->ops[oi].opaque_data) {
-                const wl_plan_op_k_fusion_t *kf =
-                    (const wl_plan_op_k_fusion_t *)rel->ops[oi].opaque_data;
-                for (uint32_t ki = 0; ki < kf->k; ki++) {
-                    if (!tdd_ops_single_idb_keys_exchange_aligned(
-                            kf->k_ops[ki], kf->k_op_counts[ki], sp))
-                        return false;
-                }
-            }
-        }
     }
     return true;
 }
@@ -873,26 +887,10 @@ tdd_stratum_single_idb_join_keys_exchange_aligned(
 bool
 tdd_stratum_has_idb_self_join(const wl_plan_stratum_t *sp)
 {
-    for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
-        const wl_plan_relation_t *rel = &sp->relations[ri];
-
-        /* Check top-level ops */
-        if (ops_have_idb_idb_join(rel->ops, rel->op_count, sp))
+    wl_columnar_eval_tdd_plan_cursor_t cursor = { 0 };
+    while (wl_columnar_eval_tdd_plan_next(sp, &cursor)) {
+        if (ops_have_idb_idb_join(cursor.ops, cursor.count, sp))
             return true;
-
-        /* Check ops inside K_FUSION */
-        for (uint32_t oi = 0; oi < rel->op_count; oi++) {
-            if (rel->ops[oi].op == WL_PLAN_OP_K_FUSION
-                && rel->ops[oi].opaque_data) {
-                const wl_plan_op_k_fusion_t *kf =
-                    (const wl_plan_op_k_fusion_t *)rel->ops[oi].opaque_data;
-                for (uint32_t ki = 0; ki < kf->k; ki++) {
-                    if (ops_have_idb_idb_join(kf->k_ops[ki],
-                        kf->k_op_counts[ki], sp))
-                        return true;
-                }
-            }
-        }
     }
     return false;
 }
@@ -1048,26 +1046,11 @@ tdd_stratum_idb_self_join_exchange_aligned(const wl_plan_stratum_t *sp,
     if (!tdd_stratum_has_idb_self_join(sp))
         return false;
 
-    for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
-        const wl_plan_relation_t *rel = &sp->relations[ri];
-
+    wl_columnar_eval_tdd_plan_cursor_t cursor = { 0 };
+    while (wl_columnar_eval_tdd_plan_next(sp, &cursor)) {
         if (!idb_idb_join_right_keys_match_exchange(
-                rel->ops, rel->op_count, sp, coord))
+                cursor.ops, cursor.count, sp, coord))
             return false;
-
-        /* Check inside K_FUSION */
-        for (uint32_t oi = 0; oi < rel->op_count; oi++) {
-            if (rel->ops[oi].op == WL_PLAN_OP_K_FUSION
-                && rel->ops[oi].opaque_data) {
-                const wl_plan_op_k_fusion_t *kf =
-                    (const wl_plan_op_k_fusion_t *)rel->ops[oi].opaque_data;
-                for (uint32_t ki = 0; ki < kf->k; ki++) {
-                    if (!idb_idb_join_right_keys_match_exchange(
-                            kf->k_ops[ki], kf->k_op_counts[ki], sp, coord))
-                        return false;
-                }
-            }
-        }
     }
     return true;
 }
