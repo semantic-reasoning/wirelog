@@ -3497,6 +3497,9 @@ tdd_merge_relation_results(wl_col_session_t *coord, col_rel_t **target_io,
         col_rel_discard_replacement(&replacement);
 
 cleanup:
+    rc = eval_relation_status(candidate, rc);
+    if (rc == ENOSPC && coord)
+        coord->memory_budget_denied = true;
     col_rel_destroy(candidate);
     return rc;
 }
@@ -3547,6 +3550,14 @@ wl_columnar_eval_test_tdd_merge(col_rel_t **target,
     col_rel_t *const *worker_rels, uint32_t worker_count)
 {
     return tdd_merge_relation_results(NULL, target, "test", worker_rels,
+               worker_count);
+}
+
+int
+wl_columnar_eval_test_tdd_merge_with_coord(wl_col_session_t *coord,
+    col_rel_t **target, col_rel_t *const *worker_rels, uint32_t worker_count)
+{
+    return tdd_merge_relation_results(coord, target, "test", worker_rels,
                worker_count);
 }
 

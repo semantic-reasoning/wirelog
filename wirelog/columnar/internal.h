@@ -2790,6 +2790,9 @@ wl_columnar_eval_test_bdx_seed_fail_sort_once(void);
 int
 wl_columnar_eval_test_tdd_merge(col_rel_t **target,
     col_rel_t *const *worker_rels, uint32_t worker_count);
+int
+wl_columnar_eval_test_tdd_merge_with_coord(wl_col_session_t *coord,
+    col_rel_t **target, col_rel_t *const *worker_rels, uint32_t worker_count);
 void
 wl_columnar_eval_test_tdd_merge_fail_worker(uint32_t worker_index);
 void
