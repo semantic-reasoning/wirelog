@@ -4514,6 +4514,18 @@ incremental_release:
  */
 static void col_session_reclaim_quiescent(wl_col_session_t *sess);
 
+#ifdef WL_SESSION_TEST_HOOKS
+/*
+ * Fired on the stable fast path, just above its cutoff.  The hole that cutoff
+ * closes there is a cancellation that lands after the wrapper's entry poll, and
+ * no single-threaded test can place one between that poll and the emit without
+ * a lever.  Under the same WL_SESSION_TEST_HOOKS boundary as every other lever
+ * here: an unguarded definition survives in libwirelog_static.a as a writable
+ * global, and the iOS leg builds the shared library with default visibility.
+ */
+void (*wl_columnar_session_test_before_stable_emit)(wl_col_session_t *sess);
+#endif
+
 bool
 wl_columnar_session_budget_denied(const void *session)
 {
@@ -5274,6 +5286,45 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
         && !sess->retraction_seeded) {
         if (tdd_profile_active)
             wl_columnar_session_profile_begin(plan, 0, sess->num_workers, true);
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_session_test_before_stable_emit)
+            wl_columnar_session_test_before_stable_emit(sess);
+#endif
+        /*
+         * The fast path has its own cutoff because it has its own emit.  A
+         * cutoff placed for the evaluating path below is not on this route: this
+         * branch publishes the whole model without evaluating, so a
+         * cancellation arriving after the wrapper's entry poll would be seen by
+         * nothing -- finish() reads control->stop, and only charge() converts
+         * the sticky cancelled word into one.
+         *
+         * "It does no work, so the entry poll is adjacent enough" does not hold.
+         * A refused plain step is drained above by calling col_session_step_impl
+         * inside this attempt, and that drain compacts every relation before
+         * writing six of the seven fields this branch tests -- four in its
+         * commit block, and last_removed_relation and retraction_seeded in the
+         * retraction cleanup just above it.  The seventh, delta_seeded, the step
+         * path never writes at all; only this function's own pre-seed sets it
+         * and its own bookkeeping clears it.  So a drain can leave control here
+         * with the whole model just compacted.  What routes a retry away from
+         * this branch is a delta_seeded left set by a snapshot that stopped
+         * between its own pre-seed and its own bookkeeping -- the only two
+         * writes that reach the coordinator's copy of the field; the write in
+         * tdd_worker_subpass_fn lands on a worker clone and is save-restored
+         * around it.  That is what makes such a retry a full re-evaluation.
+         *
+         * The unwind performs the quiescent boundary and nothing else.  It does
+         * not sample the memory ledger because this branch's success route does
+         * not either -- it emits and reclaims -- so the unwind is symmetric with
+         * the path it guards.  And it must not clear snapshot_stable_valid:
+         * refusing to publish does not invalidate a stable model, and clearing
+         * it would push the retry into a full re-evaluation.
+         */
+        int stable_cutoff_rc = col_session_publication_cutoff(sess);
+        if (stable_cutoff_rc != 0) {
+            col_session_reclaim_quiescent(sess);
+            return stable_cutoff_rc;
+        }
         int rc = col_session_emit_snapshot(plan, sess, callback, user_data);
         col_session_reclaim_quiescent(sess);
         if (tdd_profile_active && rc == 0)
@@ -5689,8 +5740,68 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
     }
     sess->tdd_decision_tracking_active = false;
 
-    /* Compaction is a source mutation.  Do it before publishing the stable
-     * snapshot bookkeeping so EBUSY leaves all retry state intact. */
+    /*
+     * Cut here: after evaluation, before compaction, above the bookkeeping.
+     *
+     * Above the bookkeeping because this path commits before it delivers.
+     * Nothing below rolls has_evaluated, snapshot_stable_valid or the base_nrows
+     * loop back, so a cutoff under them would report cancellation while leaving
+     * the session claiming this pass succeeded.
+     *
+     * What makes a stop here safe for the retry is narrower than "nothing is
+     * committed".  Plenty is: a drained step's whole commit block, the $d$
+     * pre-seed, and col_session_clear_idb_rows, which wipes the IDB rows.  The
+     * wipe is the sharp edge -- a retry that took the stable fast path would
+     * publish an empty model as a complete success.  It cannot, because
+     * clear_idb_rows is only reached when pending_full_input_eval or
+     * pending_input_change is set, nothing between that guard and this cutoff
+     * writes either one, and both disqualify the fast path.
+     *
+     * Before compaction, which is where this differs from the step path.  That
+     * one cuts after compaction because both its shapes carry a resume token
+     * across it and cutting earlier would strand a stopped step with no token;
+     * this path sets no token and re-evaluates from the top, so the reason does
+     * not transfer.  What does apply is the converse: col_rel_compact_many can
+     * return EBUSY, and finish() prefers a non-zero execution_status over
+     * control->stop, so compacting first would report EBUSY for an attempt the
+     * caller asked to cancel.  Polling first makes cancellation win.
+     *
+     * This covers publication at the snapshot boundary.  It is not a claim
+     * about streaming, but the shape of that gap is narrower than it looks:
+     * nothing in eval*.c charges, yet this path's own strata cannot stream
+     * either -- wl_columnar_delta_events_publish has one caller, inside
+     * col_stratum_step_with_delta, whose only production caller is
+     * col_session_step_impl.  Its other caller is a retraction helper that
+     * file still marks UNUSED and that only a WL_SESSION_TEST_HOOKS wrapper
+     * reaches.  So the one route by which a snapshot streams is the plain-step
+     * drain above, and that returns through the step path's own cutoff, whose
+     * rc this function propagates.  The unpolled fixpoint itself is the
+     * operator-checkpoint item of #1953, not this one.
+     *
+     * The unwind performs the quiescent boundary, as the compaction failure
+     * below does, and is deliberately not preceded by col_session_mem_sample.
+     * Not because the sample would publish something a stopped pass should not:
+     * on any route where a stratum evaluated, eval_serial.c and eval.c have
+     * sampled the coordinator already and the STORED/TEMPORARY high-water marks
+     * are raised above this point.  (The exceptions are an affected_mask that
+     * excludes every stratum, and a plan with no strata at all: the loop body
+     * never runs and the sample below would have been this pass's first.)
+     * Omitting it is inert either way -- the gauges are absolute, so the next
+     * sample recomputes them, and a gauge one pass old costs
+     * col_session_reclaim_quiescent at most a missed eviction of recomputable
+     * cache entries, or one it did not need.
+     */
+    int cutoff_rc = col_session_publication_cutoff(sess);
+    if (cutoff_rc != 0) {
+        col_session_reclaim_quiescent(sess);
+        return cutoff_rc;
+    }
+
+    /*
+     * Compaction is a source mutation.  Do it before publishing the stable
+     * snapshot bookkeeping so EBUSY leaves the session's retry state intact;
+     * the compaction pass itself is index-ordered and not transactional.
+     */
     int compact_rc = col_rel_compact_many(sess->rels, sess->nrels);
     if (compact_rc != 0) {
         col_session_reclaim_quiescent(sess);

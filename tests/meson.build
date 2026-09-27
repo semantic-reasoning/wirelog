@@ -5872,6 +5872,20 @@ test_evaluation_retry_exe = executable(
 
 test('evaluation_retry', test_evaluation_retry_exe, timeout: 60)
 
+# Issue #1953: the snapshot path's two emits and what a stop above each must
+# leave behind.  The stable fast path needs its own case because a cutoff placed
+# for the evaluating path is not on its route.
+test_evaluation_snapshot_cutoff_exe = executable(
+  'test_evaluation_snapshot_cutoff',
+  files('test_evaluation_snapshot_cutoff.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+
+test('evaluation_snapshot_cutoff', test_evaluation_snapshot_cutoff_exe,
+     timeout: 60)
+
 # Internal foundation; cancellation and shared admission use real threads.
 test_evaluation_control_exe = executable(
   'test_evaluation_control',
