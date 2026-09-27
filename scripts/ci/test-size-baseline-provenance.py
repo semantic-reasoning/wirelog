@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline fixtures for trusted main-artifact baseline authorization."""
 import hashlib
+from contextlib import contextmanager
 import importlib.util
 import io
 import json
@@ -231,8 +232,80 @@ for case, message in [("wrong-workflow","designated main workflow"),
     check(f"{case} artifact/source/provenance mismatch rejected",
           lambda c=case: exercise(fixture_provenance(),c),message)
 
+def trace_events(path):
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def auto_maintenance_children(events):
+    return [event for event in events
+            if event.get("event") == "child_start"
+            and event.get("argv", [])[1:3] == ["maintenance", "run"]
+            and "--auto" in event["argv"]]
+
+
+@contextmanager
+def isolated_history():
+    # Git may detach maintenance after a synchronous commit returns. Keep the
+    # regression itself synchronous, including its expected pre-fix failure.
+    # The positive control proves that the real fixture's opt-out suppresses
+    # actual Git work, rather than merely checking a configuration value.
+    with tempfile.TemporaryDirectory(prefix="provenance-git-") as temp:
+        root = Path(temp)
+        config = root / "gitconfig"
+        config.write_text(
+            "[maintenance]\n\tauto = true\n\tautoDetach = false\n"
+            "[maintenance \"gc\"]\n\tenabled = false\n"
+            "[maintenance \"loose-objects\"]\n\tenabled = true\n\tauto = 1\n"
+            "[gc]\n\tauto = 0\n", encoding="utf-8")
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith("GIT_")}
+        env.update(GIT_CONFIG_GLOBAL=str(config), GIT_CONFIG_NOSYSTEM="1",
+                   GIT_TRACE2_EVENT=str(root / "control.trace"))
+        with mock.patch.dict(os.environ, env, clear=True):
+            control = root / "control"
+            control.mkdir()
+            def control_git(*args):
+                return subprocess.check_output(
+                    ["git", *args], cwd=control, text=True, encoding="utf-8",
+                    stderr=subprocess.PIPE)
+            control_git("init", "-q")
+            control_git("config", "user.name", "Maintenance control")
+            control_git("config", "user.email", "control@example.invalid")
+            (control / "data").write_text("maintenance control\n", encoding="utf-8")
+            control_git("add", ".")
+            control_git("commit", "-qm", "control")
+            events = trace_events(root / "control.trace")
+            children = auto_maintenance_children(events)
+            assert children, "positive control did not launch automatic maintenance"
+            for child in children:
+                assert any(event.get("event") == "child_exit"
+                           and event.get("sid") == child["sid"]
+                           and event.get("child_id") == child["child_id"]
+                           and event.get("code") == 0 for event in events), \
+                    "positive control maintenance did not complete successfully"
+            tasks = [event for event in events
+                     if event.get("event") == "region_enter"
+                     and event.get("category") == "maintenance"
+                     and event.get("label") == "loose-objects"]
+            assert tasks, "positive control did not execute loose-object maintenance"
+            for task in tasks:
+                assert any(event.get("event") == "region_leave"
+                           and event.get("sid") == task["sid"]
+                           and event.get("category") == task["category"]
+                           and event.get("label") == task["label"] for event in events), \
+                    "positive control maintenance task did not finish"
+            print("ok: real automatic maintenance control completed")
+            # Keep configuration and traces outside the history's `git add .`.
+            os.environ["GIT_TRACE2_EVENT"] = str(root / "history.trace")
+            with tempfile.TemporaryDirectory(prefix="reviewed-rebase-", dir=root) as history:
+                yield history
+                assert not auto_maintenance_children(trace_events(root / "history.trace")), \
+                    "history fixture launched automatic maintenance"
+            print("ok: history fixture has no automatic maintenance and cleans up")
+
+
 # Real Git histories exercise the pinned-source reference after rebase.
-with tempfile.TemporaryDirectory(prefix="reviewed-rebase-") as history:
+with isolated_history() as history:
     previous = os.getcwd()
     try:
         os.chdir(history)
@@ -240,6 +313,7 @@ with tempfile.TemporaryDirectory(prefix="reviewed-rebase-") as history:
             return subprocess.check_output(["git", *args], text=True,
                                            encoding="utf-8", stderr=subprocess.DEVNULL).strip()
         git("init", "-q")
+        git("config", "maintenance.auto", "false")
         git("config", "user.name", "Baseline fixture")
         git("config", "user.email", "baseline@example.invalid")
         Path("tests").mkdir()
