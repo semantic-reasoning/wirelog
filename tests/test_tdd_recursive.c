@@ -5430,7 +5430,13 @@ static int
 test_wide_dedup_hash_parity(uint32_t width)
 {
     col_rel_t *rel = col_rel_new_auto("wide-dedup", width);
-    int64_t values[2][32] = { { 0 } };
+#if defined(_MSC_VER)
+    __declspec(align(16)) int64_t values[2][32] = { { 0 } };
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+    _Alignas(16) int64_t values[2][32] = { { 0 } };
+#else
+    __attribute__((aligned(16))) int64_t values[2][32] = { { 0 } };
+#endif
     int ok = rel != NULL;
     for (uint32_t row = 0; row < 2 && ok; row++) {
         for (uint32_t col = 0; col < width; col++)
