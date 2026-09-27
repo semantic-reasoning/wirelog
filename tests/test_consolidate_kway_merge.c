@@ -2773,9 +2773,236 @@ cleanup:
 #undef WW_CHECK
 }
 
+/* Exercise the operator's ownership boundary, not just the merge kernel. */
+static void
+test_governed_owned_cons(uint32_t count, uint32_t unique, unsigned route,
+    unsigned storage, bool timestamped)
+{
+    TEST("governed owned CONS retains its complete entry on scratch refusal");
+    col_rel_t *source = col_rel_new_auto("owned-cons", 1), *rel = source;
+    col_rel_t *view = NULL;
+    wl_arena_t *arena = NULL;
+    wl_columnar_memory_governor_ref_t *ref =
+        test_consolidate_governor_create(UINT64_C(1) << 30);
+    int64_t *before = malloc((size_t)count * sizeof(*before));
+    col_delta_timestamp_t *before_ts = timestamped
+        ? malloc((size_t)count * sizeof(*before_ts)) : NULL;
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    wl_col_session_t sess = { 0 };
+    wl_columnar_source_access_reader_t reader = { 0 };
+    bool source_owned = true;
+    const char *failure = NULL;
+#define OC_CHECK(c, m) do { if (!(c)) { failure = m; goto cleanup; } } while (0)
+    OC_CHECK(source && ref && before && (!timestamped || before_ts), "fixture");
+    if (timestamped)
+        OC_CHECK(col_rel_enable_timestamps(source) == 0, "timestamps");
+    for (uint32_t i = 0; i < count; i++) {
+        before[i] = route == 1 && i < 2 ? (int64_t)i + 1
+            : (int64_t)((count - i - 1) % unique) + 1;
+        OC_CHECK(col_rel_append_row(source, &before[i]) == 0, "append");
+        if (timestamped) source->timestamps[i] = kway_timestamp(i);
+    }
+    if (timestamped)
+        memcpy(before_ts, source->timestamps,
+            (size_t)count * sizeof(*before_ts));
+    if (route == 1) source->sorted_nrows = 2;
+    if (storage == 1) {
+        view = col_rel_new_like("owned-cons-view", source);
+        OC_CHECK(view && col_rel_install_shared_view(view, source) == 0,
+            "shared view");
+        rel = view;
+    } else if (storage == 2) {
+        arena = wl_arena_create(4096);
+        int64_t *column = arena ? wl_arena_alloc(arena,
+                (size_t)source->capacity * sizeof(*column)) : NULL;
+        OC_CHECK(column, "arena payload");
+        memcpy(column, before, (size_t)count * sizeof(*column));
+        free(source->columns[0]);
+        source->columns[0] = column;
+        source->arena_owned = true;
+    }
+    OC_CHECK(col_rel_attach_memory_governor(rel, ref) == 0, "governor");
+    for (uint32_t i = 0; i < COL_STACK_MAX - 1; i++)
+        OC_CHECK(eval_stack_push(&stack, source, false) == 0, "lower stack");
+    OC_CHECK(eval_stack_push_delta(&stack, rel, true, true) == 0,
+        "owned entry");
+    if (storage == 1) view = NULL; else source_owned = false;
+    eval_entry_t *entry = &stack.items[stack.top - 1];
+    if (route >= 2) {
+        entry->seg_count = route;
+        entry->seg_boundaries = malloc((route + 1) * sizeof(uint32_t));
+        OC_CHECK(entry->seg_boundaries, "boundaries");
+        for (unsigned i = 0; i <= route; i++)
+            entry->seg_boundaries[i] = (uint32_t)((uint64_t)count * i / route);
+    }
+    eval_entry_t original = *entry;
+    uint64_t generation = rel->view_generation, epoch = rel->storage_generation;
+    uint32_t capacity = rel->capacity, sorted = rel->sorted_nrows;
+    uint32_t runs = rel->run_count, run_ends[COL_MAX_RUNS];
+    memcpy(run_ends, rel->run_ends, sizeof(run_ends));
+    int64_t **columns = rel->columns;
+    int64_t *column = rel->columns[0];
+    bool *shared = rel->col_shared;
+    wl_columnar_memory_governor_t *g = wl_columnar_memory_governor_ref_get(ref);
+    uint64_t baseline = wl_columnar_memory_reserved(g);
+    bool hash = count > 10000 && !timestamped;
+    uint32_t max_segment = route >= 2 ? (count + route - 1) / route
+        : route == 1 ? count - 2 : count;
+    /* First deny real admission; then exercise allocation and accounting
+     * failures with deliberately stale denial evidence at each new call. */
+    const char *sites[] = {
+        "radix_workspace_insertion_rows", "radix_workspace_perm_a",
+        "radix_workspace_timestamps", "segment_starts", "segment_ends",
+        "merge_output", "merge_heap", "merge_timestamps",
+        "hash_table", "hash_table_used", "hash_unique_rows",
+        "hash_rehash_rows", "hash_rehash_used", "hash_unique_grow",
+    };
+    for (unsigned fault = 0; fault < 18; fault++) {
+        const char *site = fault >= 4 ? sites[fault - 4] : NULL;
+        if (site) {
+            unsigned i = fault - 4;
+            if ((hash && i < 8) || (!hash && i >= 8)
+                || (i == 0 && max_segment > 32) || (i == 1 && max_segment <= 32)
+                || (i == 2 && !timestamped)
+                || (i == 5 && route < 1) || (i == 6 && route < 3)
+                || (i == 7 && (!timestamped || route < 1))
+                || (i >= 11 && (count < 20000 || unique <= 4096)))
+                continue;
+        }
+        if (fault == 3 && route < 2) continue;
+        rel->memory_budget_denial_pending = true;
+        sess.memory_budget_denied = false;
+        wl_columnar_memory_reservation_t padding;
+        wl_columnar_memory_reservation_init(&padding);
+        uint32_t saved_boundary = 0;
+        if (fault == 0)
+            atomic_store(&g->usable_bytes, baseline);
+        else if (fault == 1) {
+            atomic_store(&g->usable_bytes, UINT64_MAX);
+            OC_CHECK(wl_columnar_memory_reserve_checked(g,
+                UINT64_MAX - baseline,
+                &padding) == WL_COLUMNAR_MEMORY_ADMISSION_OK,
+                "overflow padding");
+        } else if (fault == 2)
+            OC_CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
+                "held reader");
+        else if (fault == 3) {
+            saved_boundary = entry->seg_boundaries[1];
+            entry->seg_boundaries[1] = count + 1;
+        } else
+            fail_consolidate_allocation_at(site);
+        int rc = col_op_consolidate(&stack, &sess);
+        bool hook_used = consolidate_fail_used;
+        clear_consolidate_allocation_failure();
+        if (fault == 1)
+            OC_CHECK(wl_columnar_memory_release(&padding), "padding release");
+        atomic_store(&g->usable_bytes, UINT64_C(1) << 30);
+        if (reader.owner)
+            OC_CHECK(col_rel_source_reader_release(&reader) == 0,
+                "reader release");
+        /* Test entry reachability before dereferencing an owned relation:
+         * the legacy implementation may destroy it when scratch fails. */
+        OC_CHECK(stack.top == COL_STACK_MAX && entry->rel == original.rel
+            && entry->owned == original.owned &&
+            entry->is_delta == original.is_delta
+            && entry->seg_boundaries == original.seg_boundaries
+            && entry->seg_count == original.seg_count &&
+            entry->kind == original.kind
+            && entry->continuation == original.continuation,
+            "exact retry entry");
+        if (fault == 3) entry->seg_boundaries[1] = saved_boundary;
+        int expected = fault == 0 ? ENOSPC : fault == 1 ? EOVERFLOW
+            : fault == 2 ? EBUSY : fault == 3 ? EINVAL : ENOMEM;
+        OC_CHECK(rc == expected && (!site || hook_used),
+            "typed failure/hook witness");
+        OC_CHECK(rel->memory_budget_denial_pending == (fault == 0 || fault == 2)
+            && sess.memory_budget_denied == (fault == 0),
+            "fresh denial provenance");
+        OC_CHECK(rel->nrows == count && rel->capacity == capacity
+            && rel->sorted_nrows == sorted && rel->run_count == runs
+            && memcmp(rel->run_ends, run_ends, sizeof(run_ends)) == 0
+            && rel->columns == columns && rel->columns[0] == column
+            && rel->col_shared == shared && rel->view_generation == generation
+            && rel->storage_generation == epoch
+            && memcmp(rel->columns[0], before,
+            (size_t)count * sizeof(*before)) == 0
+            && (!timestamped || memcmp(rel->timestamps, before_ts,
+            (size_t)count * sizeof(*before_ts)) == 0)
+            && wl_columnar_memory_reserved(g) == baseline,
+            "refusal changed source/credit");
+        if (storage == 1)
+            OC_CHECK(col_rel_storage_alias_borrow_count(source) == 1,
+                "refusal detached view");
+    }
+    rel->memory_budget_denial_pending = true;
+    sess.memory_budget_denied = false;
+    OC_CHECK(col_op_consolidate(&stack, &sess) == 0
+        && stack.top == COL_STACK_MAX && entry->rel == rel && entry->owned
+        && entry->is_delta == timestamped && !entry->seg_boundaries
+        && entry->seg_count == 0 && rel->nrows == unique
+        && rel->sorted_nrows == unique && rel->run_count == 1
+        && rel->run_ends[0] == unique && !rel->memory_budget_denial_pending
+        && !sess.memory_budget_denied, "exact retry metadata");
+    for (uint32_t r = 0; r < unique; r++) {
+        OC_CHECK(col_rel_get(rel, r, 0) == (int64_t)r + 1,
+            "retry exact values");
+        if (timestamped) {
+            uint32_t first = 0;
+            while (before[first] != (int64_t)r + 1) first++;
+            OC_CHECK(kway_timestamp_equal(rel->timestamps[r], before_ts[first]),
+                "first timestamp representative");
+        }
+    }
+    if (storage == 1)
+        OC_CHECK(source->nrows == count
+            && memcmp(source->columns[0], before,
+            (size_t)count * sizeof(*before)) == 0
+            && col_rel_storage_alias_borrow_count(source) == 0,
+            "source survived COW");
+    else
+        OC_CHECK(wl_columnar_memory_reserved(g) == baseline,
+            "scratch credit retired");
+cleanup:
+    clear_consolidate_allocation_failure();
+    if (reader.owner) (void)col_rel_source_reader_release(&reader);
+    while (stack.top) {
+        eval_entry_t e = eval_stack_pop(&stack);
+        free(e.seg_boundaries);
+        if (e.owned) col_rel_destroy(e.rel);
+    }
+    col_rel_destroy(view);
+    if (source_owned) col_rel_destroy(source);
+    wl_arena_free(arena);
+    free(before);
+    free(before_ts);
+    if (ref) {
+        if (wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                ref)))
+            failure = "teardown credit leak";
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (failure) {
+        printf("[rows=%u unique=%u route=%u storage=%u ts=%d] ", count, unique,
+            route, storage, timestamped);
+        FAIL(failure);
+    }
+    PASS();
+#undef OC_CHECK
+}
+
 int
 main(void)
 {
+    for (unsigned route = 0; route < 4; route++) {
+        test_governed_owned_cons(6, 3, route, 0, false);
+        test_governed_owned_cons(64, 8, route, 0, true);
+    }
+    test_governed_owned_cons(64, 8, 3, 1, false);
+    test_governed_owned_cons(64, 8, 2, 2, false);
+    test_governed_owned_cons(20000, 5000, 3, 0, false);
+    test_governed_owned_cons(12000, 12000, 2, 0, false);
+
     printf("=== test_consolidate_kway_merge (TDD RED PHASE) ===\n\n");
     printf("NOTE: Expected to FAIL at link time until US-002 GREEN phase\n");
     printf("      implements col_op_consolidate_kway_merge.\n\n");

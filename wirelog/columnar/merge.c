@@ -930,10 +930,10 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
         &segment_bytes)
         || !col_op_consolidate_size_multiply(seg_count, sizeof(heap_entry_t),
         &heap_bytes))
-        return ENOMEM;
+        return EOVERFLOW;
     if (!col_op_consolidate_size_multiply(segment_bytes, 2u,
         &segment_total_bytes))
-        return ENOMEM;
+        return EOVERFLOW;
     additional_scratch_bytes = segment_total_bytes;
     if (seg_count >= 2) {
         /* Keep one element of storage for zero-arity relations: malloc(0)
@@ -945,22 +945,22 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
             &merged_bytes)
             || !col_op_consolidate_size_add(merged_bytes, sizeof(int64_t),
             &merged_alloc_bytes))
-            return ENOMEM;
+            return EOVERFLOW;
         if (!col_op_consolidate_size_add(additional_scratch_bytes,
             merged_alloc_bytes, &additional_scratch_bytes))
-            return ENOMEM;
+            return EOVERFLOW;
     }
     if (rel->timestamps && seg_count >= 2) {
         if (!col_op_consolidate_size_multiply(nr,
             sizeof(*merged_timestamps), &timestamp_bytes)
             || !col_op_consolidate_size_add(additional_scratch_bytes,
             timestamp_bytes, &additional_scratch_bytes))
-            return ENOMEM;
+            return EOVERFLOW;
     }
     if (seg_count >= 3
         && !col_op_consolidate_size_add(additional_scratch_bytes, heap_bytes,
         &additional_scratch_bytes))
-        return ENOMEM;
+        return EOVERFLOW;
 
     /* Hash-based dedup for large datasets (#369): O(N) scan + O(U log U) sort
      * where U is the unique count.  When U << N (common in recursive Datalog
@@ -1172,18 +1172,22 @@ cleanup:
 
 static int
 wl_columnar_merge_consolidate_checked(col_rel_t *rel,
-    const uint32_t *seg_boundaries, uint32_t seg_count, bool finalize)
+    const uint32_t *seg_boundaries, uint32_t seg_count, bool finalize,
+    bool *out_published)
 {
     wl_columnar_source_access_writer_t writer = { 0 };
     col_rel_t *owner = NULL;
     bool alias_release_pending = false;
     int rc;
 
+    if (out_published)
+        *out_published = false;
     if (!rel)
         return EINVAL;
     rc = col_rel_source_writer_acquire(rel, &writer);
     if (rc != 0)
         return rc;
+    rel->memory_budget_denial_pending = false;
     if (!wl_columnar_relation_float_values_valid(rel)) {
         rc = EINVAL;
         goto release_writer;
@@ -1208,6 +1212,8 @@ wl_columnar_merge_consolidate_checked(col_rel_t *rel,
         rel->run_count = 1;
         rel->run_ends[0] = rel->nrows;
     }
+    if (rc == 0 && out_published)
+        *out_published = true;
 release_writer:
     if (alias_release_pending) {
         int alias_rc = col_rel_storage_alias_release(rel);
@@ -1224,7 +1230,7 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
     uint32_t seg_count)
 {
     return wl_columnar_merge_consolidate_checked(rel, seg_boundaries,
-               seg_count, false);
+               seg_count, false, NULL);
 }
 
 /* A borrowed input stays untouched until its private candidate has completed
@@ -1286,8 +1292,7 @@ wl_columnar_merge_consolidate_borrowed(eval_stack_t *stack,
     }
 #endif
 
-    /* The checked engine admits its complete sort workspace. The legacy
-     * unprepared radix path does not yet admit every scratch class (#1993). */
+    /* Admit the complete sort workspace before mutating the private copy. */
     uint32_t whole[] = { 0, copy->nrows };
     const uint32_t *boundaries = whole;
     uint32_t segments = 1;
@@ -1296,7 +1301,7 @@ wl_columnar_merge_consolidate_borrowed(eval_stack_t *stack,
         segments = entry.seg_count;
     }
     rc = wl_columnar_merge_consolidate_checked(copy, boundaries, segments,
-            true);
+            true, NULL);
     if (rc != 0)
         goto failed;
     free(entry.seg_boundaries);
@@ -1317,11 +1322,11 @@ failed:
                copy, rc);
 }
 
-/* Timestamped SET consolidation shares the checked stable k-way engine.
+/* Timestamped SET and governed owned consolidation share the checked engine.
  * Keep the popped entry intact until success: its original stack slot remains
  * available even when the caller entered with a completely full stack. */
 static int
-wl_columnar_merge_consolidate_timestamped(eval_stack_t *stack,
+wl_columnar_merge_consolidate_entry(eval_stack_t *stack,
     wl_col_session_t *sess, eval_entry_t entry)
 {
     col_rel_t *work = entry.rel;
@@ -1329,6 +1334,7 @@ wl_columnar_merge_consolidate_timestamped(eval_stack_t *stack,
     wl_columnar_source_access_reader_t reader = { 0 };
     wl_columnar_memory_governor_ref_t *governor = NULL;
     int rc = 0;
+    bool published = false;
     if (!entry.owned) {
         rc = col_rel_source_reader_acquire(entry.rel, &reader);
         if (rc != 0)
@@ -1373,17 +1379,26 @@ wl_columnar_merge_consolidate_timestamped(eval_stack_t *stack,
         segments = 2;
     }
     rc = wl_columnar_merge_consolidate_checked(work, boundaries, segments,
-            true);
-    if (rc != 0)
+            true, &published);
+    if (rc != 0 && !published)
         goto failed;
     free(entry.seg_boundaries);
     entry.seg_boundaries = NULL;
     entry.seg_count = 0;
     entry.rel = work;
     entry.owned = true;
+    if (!work->timestamps)
+        entry.is_delta = false;
+    /* Publication is complete even if releasing a lease reports an
+     * invariant error. Retain that result, not obsolete segment boundaries. */
     stack->items[stack->top++] = entry;
-    return 0;
+    return rc;
 failed:
+    if (entry.owned && rc == ENOMEM && work->memory_budget_denial_pending) {
+        rc = ENOSPC;
+        if (sess)
+            sess->memory_budget_denied = true;
+    }
     if (reader.owner) {
         int release_rc = col_rel_source_reader_release(&reader);
         if (release_rc != 0)
@@ -1406,7 +1421,7 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
 
     col_rel_t *in = e.rel;
     if (in->timestamps)
-        return wl_columnar_merge_consolidate_timestamped(stack, sess, e);
+        return wl_columnar_merge_consolidate_entry(stack, sess, e);
     if (!wl_columnar_relation_float_values_valid(in)) {
         return col_op_dispose_entry_primary(stack, &e, EINVAL);
     }
@@ -1444,6 +1459,8 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
     if (!e.owned && governor)
         return wl_columnar_merge_consolidate_borrowed(stack, sess, e,
                    governor);
+    if (e.owned && in->memory_governor)
+        return wl_columnar_merge_consolidate_entry(stack, sess, e);
 
     /* Sort in-place if we own the relation, otherwise copy first */
     col_rel_t *work = in;
