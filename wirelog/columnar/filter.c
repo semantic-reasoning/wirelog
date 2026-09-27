@@ -1620,7 +1620,7 @@ wl_columnar_filter_apply_right_filter_cached(wl_col_session_t *sess,
     const wl_plan_expr_buffer_t *fexpr, const char *rel_name,
     col_rel_t *rel)
 {
-    col_filt_cache_pin_t pin;
+    col_filt_cache_pin_t pin = { 0 };
     col_rel_t *out = wl_columnar_filter_apply_right_filter_cached_pin(sess,
             fexpr, rel_name, rel, &pin);
     col_filt_cache_pin_release(&pin);
