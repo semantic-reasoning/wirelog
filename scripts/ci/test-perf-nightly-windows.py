@@ -6,6 +6,7 @@ general YAML. No YAML package is needed on the platforms running the ABI suite.
 """
 
 from pathlib import Path
+import json
 import re
 import unittest
 
@@ -14,6 +15,35 @@ WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/perf-nightly
 CONFIGURE = "Configure release + trace ceiling (Windows)"
 BUILD = "Build (Windows)"
 TEST = "Run perf suite (Windows)"
+RUNNER_LABELS = {"self-hosted", "Windows", "X64", "windows-latest", "wirelog-perf"}
+
+
+def windows_matrix(text: str) -> None:
+    text = "\n".join(line for line in text.splitlines()
+                     if line.strip() and not line.lstrip().startswith("#")) + "\n"
+    entries = re.findall(
+        r"^          - os: windows\n((?:            [^\n]*\n)*)",
+        text, re.MULTILINE)
+    assert len(entries) == 1, "expected exactly one Windows matrix entry"
+    fields = {"os": "windows"}
+    for line in entries[0].splitlines():
+        match = re.fullmatch(r"            ([a-z]+): (.+)", line)
+        assert match, "unsupported Windows matrix field layout"
+        key, value = match.groups()
+        assert key not in fields, f"duplicate Windows matrix field: {key}"
+        fields[key] = value
+    assert fields.get("compiler") == "msvc", "Windows matrix must select MSVC"
+    assert fields.get("cc") == "cl", "Windows matrix must select cl"
+    runner = fields.get("runner", "")
+    assert runner.startswith("'") and runner.endswith("'"), \
+        "Windows matrix runner must be quoted JSON"
+    try:
+        labels = json.loads(runner[1:-1])
+    except json.JSONDecodeError as error:
+        raise AssertionError("Windows matrix runner must be valid JSON") from error
+    assert isinstance(labels, list) and all(isinstance(label, str) for label in labels), \
+        "Windows matrix runner must be a list of labels"
+    assert RUNNER_LABELS <= set(labels), "Windows matrix runner is missing required labels"
 
 
 def step(text: str, name: str) -> str:
@@ -35,8 +65,7 @@ def field(body: str, key: str) -> str:
 
 
 def validate(text: str) -> None:
-    assert re.search(r"- os: windows-latest\n\s+compiler: msvc\n\s+cc: cl\n", text), \
-        "Windows matrix must select cl"
+    windows_matrix(text)
     bodies = {name: step(text, name) for name in (CONFIGURE, BUILD, TEST)}
     for name, body in bodies.items():
         assert "        if: runner.os == 'Windows'\n" in body, name
@@ -112,6 +141,60 @@ class WindowsWorkflowTests(unittest.TestCase):
     def test_gcc_matrix_fails(self):
         with self.assertRaisesRegex(AssertionError, "matrix must select cl"):
             validate(self.text.replace("            cc: cl", "            cc: gcc"))
+
+    def test_wrong_matrix_compiler_fails(self):
+        with self.assertRaisesRegex(AssertionError, "matrix must select MSVC"):
+            validate(self.text.replace("compiler: msvc", "compiler: gcc"))
+
+    def test_missing_runner_labels_fail(self):
+        for label in RUNNER_LABELS:
+            with self.subTest(label=label):
+                mutated = self.text.replace(f'"{label}"', '"wrong-label"')
+                with self.assertRaisesRegex(AssertionError, "missing required labels"):
+                    validate(mutated)
+
+    def test_invalid_runner_json_fails(self):
+        mutated = self.text.replace('["self-hosted", "Windows"', '[invalid, "Windows"')
+        with self.assertRaisesRegex(AssertionError, "must be valid JSON"):
+            validate(mutated)
+
+    def test_runner_must_be_label_list(self):
+        mutated = re.sub(r"(            runner: )'[^\n]*Windows[^\n]*'",
+                         r"\1'42'", self.text)
+        with self.assertRaisesRegex(AssertionError, "must be a list of labels"):
+            validate(mutated)
+
+    def test_comment_cannot_supply_matrix_fields(self):
+        for key, message in (("cc", "must select cl"),
+                             ("compiler", "must select MSVC"),
+                             ("runner", "must be quoted JSON")):
+            with self.subTest(key=key):
+                mutated = self.text.replace(f"            {key}:", f"            # {key}:")
+                with self.assertRaisesRegex(AssertionError, message):
+                    validate(mutated)
+
+    def test_duplicate_matrix_entry_fails(self):
+        mutated = self.text.replace("          - os: linux", "          - os: windows")
+        with self.assertRaisesRegex(AssertionError, "exactly one Windows matrix entry"):
+            validate(mutated)
+
+    def test_duplicate_matrix_field_fails(self):
+        for key, value in (("cc", "cl"), ("compiler", "msvc")):
+            with self.subTest(key=key):
+                line = f"            {key}: {value}"
+                mutated = self.text.replace(line, line + "\n" + line)
+                with self.assertRaisesRegex(AssertionError, f"duplicate Windows matrix field: {key}"):
+                    validate(mutated)
+        mutated = self.text.replace("          - os: windows\n",
+                                    "          - os: windows\n            os: linux\n")
+        with self.assertRaisesRegex(AssertionError, "duplicate Windows matrix field: os"):
+            validate(mutated)
+
+    def test_compiler_in_other_matrix_entry_fails(self):
+        mutated = self.text.replace("            cc: cl\n", "")
+        mutated = mutated.replace("            cc: gcc\n", "            cc: cl\n")
+        with self.assertRaisesRegex(AssertionError, "must select cl"):
+            validate(mutated)
 
     def test_bypassing_meson_build_fails(self):
         with self.assertRaisesRegex(AssertionError, "build must use Meson"):
