@@ -45,19 +45,19 @@ def field(body: str, key: str) -> str:
 
 def validate(text: str) -> None:
     stable = job(text, "perf-stable")
-    assert re.search(r"^    runs-on: ubuntu-latest$", stable, re.MULTILINE), \
-        "authoritative DOOP path must run on a hosted Ubuntu runner"
-    assert "self-hosted" not in stable, \
-        "authoritative DOOP path must not require a self-hosted runner"
+    assert re.search(
+        r"^    runs-on: \[self-hosted, Linux, X64, wirelog-perf\]$",
+        stable, re.MULTILINE), \
+        "authoritative DOOP path must run on the wirelog-perf runner"
     assert "continue-on-error" not in stable, \
         "authoritative DOOP path must not hide failures"
     install = field(step(stable, "Install dependencies"), "run")
     assert "curl" in install and "unzip" in install, \
         "stable runner must install DOOP download tools"
 
-    host = field(step(stable, "Verify hosted DOOP capacity"), "run")
+    host = field(step(stable, "Verify perf runner capacity"), "run")
     assert "taskset -pc $$" in host, \
-        "hosted path must verify an actual permitted CPU affinity"
+        "perf path must verify an actual permitted CPU affinity"
 
     download = field(step(stable, "Download pinned DOOP dataset"), "run")
     assert download.strip() == "bench/data/doop/download.sh", \
@@ -76,7 +76,7 @@ def validate(text: str) -> None:
     for variable in (
         "WIRELOG_PERF_GATE: '1'",
         "WIRELOG_PERF_REQUIRE: '1'",
-        "WIRELOG_DOOP_PERF_MODE: required-hosted",
+        "WIRELOG_DOOP_PERF_MODE: strict-stable",
         "WL_DOOP_PERF_GATE_TARGET_MS: ${{ vars.WL_DOOP_PERF_GATE_TARGET_MS }}",
     ):
         assert variable in doop_env, f"DOOP step must set {variable}"
