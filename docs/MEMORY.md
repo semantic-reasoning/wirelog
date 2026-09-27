@@ -883,8 +883,20 @@ slot consumed by successful construction remains inert until the pool resets.
 Seed conditions, delta tags and borrowed-full iteration-zero behavior are
 unchanged.
 
-This is CONCAT and VARIABLE empty-output coverage, not completion of all
-temporary admission (#1978/#1369). MAP/REDUCE/LFTJ and borrowed CONS output
+MAP resolves the session governor first, then the source governor, for scratch,
+compiled expressions and result storage. Governed MAP results use independently
+owned heap storage with capacity for every input row, admitted before row
+expressions or extension callbacks execute. Existing pool/arena backing stays
+reserved; this route bypasses those allocators without charging their storage a
+second time. With no governor, MAP retains its pool/arena allocation path.
+Scratch, result-construction and expression-compilation budget refusals restore
+the complete input entry for retry. Ordinary allocation/expression failures keep
+the existing checked-disposal error precedence. This is not rollback of callbacks
+that have already executed. A zero-column projection admits its non-null row
+scratch buffer as well.
+
+This is CONCAT, VARIABLE empty-output and MAP coverage, not completion of all
+temporary admission (#1978/#1369). REDUCE/LFTJ and borrowed CONS output
 paths still need audit and integration. Eval-entry segment boundaries and other
 auxiliary metadata/scratch need lifetime accounting through their actual free
 sites; they are not covered by CONCAT's relation reservation or excluded from

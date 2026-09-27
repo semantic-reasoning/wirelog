@@ -30,6 +30,7 @@
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
 #include "../wirelog/wirelog.h"
+#include "../wirelog/wirelog-extension.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -342,6 +343,264 @@ concat_entry_unchanged(const eval_entry_t *entry, const eval_entry_t *before)
            && entry->seg_count == before->seg_count
            && entry->kind == before->kind
            && entry->continuation == before->continuation;
+}
+
+static unsigned map_admission_callback_calls;
+
+static int
+map_admission_callback(const wirelog_extension_value_t *args, uint32_t nargs,
+    wirelog_extension_value_t *result, void *user_data)
+{
+    (void)args;
+    (void)nargs;
+    (void)user_data;
+    map_admission_callback_calls++;
+    result->type = WIRELOG_EXTENSION_VALUE_INT64;
+    result->size = sizeof(int64_t);
+    result->as.int64_value = 42;
+    return 0;
+}
+
+static void
+test_map_admission(unsigned governor_mode, bool owned, uint32_t nrows,
+    bool nullary, bool callback)
+{
+    TEST("MAP preadmits full output before callbacks and retries exact input");
+    wl_col_session_t *sess = make_session(UINT64_C(1) << 24);
+    wl_columnar_memory_governor_ref_t *saved_ref = NULL, *source_ref = NULL;
+    wl_columnar_memory_governor_ref_t *expected = NULL;
+    col_rel_t *input = col_rel_new_auto("map_input", 1), *probe = NULL;
+    col_rel_t *lower = col_rel_new_auto("lower", 1);
+    wirelog_extension_registry_t *registry = NULL;
+    wirelog_extension_snapshot_t *snapshot = NULL;
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    const char *failure = NULL;
+    bool input_stacked_owned = false;
+#define MAP_CHECK(c, message) do { if (!(c)) { failure = message; \
+                                               goto cleanup; } } while (0)
+    MAP_CHECK(sess && input && lower, "fixture allocation");
+    saved_ref = sess->memory_governor;
+    if (governor_mode)
+        source_ref = make_governor(UINT64_C(1) << 24);
+    MAP_CHECK(!governor_mode || source_ref, "source governor");
+    expected = governor_mode == 1 ? source_ref : saved_ref;
+    wl_columnar_memory_governor_ref_retain(expected);
+    MAP_CHECK(col_rel_attach_memory_governor(input,
+        source_ref ? source_ref : saved_ref) == 0, "input admission");
+    for (uint32_t r = 0; r < nrows; r++) {
+        int64_t value = (int64_t)r + 7;
+        MAP_CHECK(col_rel_append_row(input, &value) == 0, "input rows");
+    }
+    MAP_CHECK(col_rel_enable_timestamps(input) == 0, "input timestamps");
+    if (governor_mode == 1)
+        sess->memory_governor = NULL;
+    delta_pool_destroy(sess->delta_pool);
+    sess->delta_pool = delta_pool_create_managed(8, sizeof(col_rel_t), 4096,
+            wl_columnar_memory_governor_ref_get(expected));
+    sess->eval_arena = wl_arena_create_managed(4096,
+            wl_columnar_memory_governor_ref_get(expected));
+    MAP_CHECK(sess->delta_pool && sess->eval_arena, "admitted pool and arena");
+    if (governor_mode == 2)
+        atomic_store_explicit(&wl_columnar_memory_governor_ref_get(source_ref)
+            ->usable_bytes, reserved_for(source_ref), memory_order_release);
+    uint32_t pc = nullary ? 0 : 1;
+    uint8_t call[] = {WL_PLAN_EXPR_EXTENSION_CALL, 8, 0,
+                      't', 'e', 's', 't', '.', 'm', 'a', 'p', 0, 0, 0, 0};
+    wl_plan_expr_buffer_t expression = {call, sizeof(call)};
+    wl_plan_op_t op = {.op = WL_PLAN_OP_MAP, .project_count = pc};
+    if (callback) {
+        wirelog_extension_descriptor_t descriptor = {
+            .abi_version = WIRELOG_EXTENSION_ABI_VERSION,
+            .size = sizeof(descriptor), .name = "test.map",
+            .result_type = WIRELOG_EXTENSION_VALUE_INT64,
+            .invoke = map_admission_callback
+        };
+        registry = wirelog_extension_registry_create();
+        MAP_CHECK(registry && wirelog_extension_register(registry,
+            &descriptor) == 0, "callback registration");
+        snapshot = wirelog_extension_snapshot_acquire(registry);
+        MAP_CHECK(snapshot, "callback snapshot");
+        sess->base.extension_snapshot = snapshot;
+        op.map_exprs = &expression;
+        op.map_expr_count = 1;
+    }
+    MAP_CHECK(eval_stack_push(&stack, lower, false) == 0
+        && eval_stack_push_delta(&stack, input, owned, true) == 0,
+        "input stack");
+    input_stacked_owned = owned;
+    stack.items[1].seg_boundaries = malloc(2 * sizeof(uint32_t));
+    MAP_CHECK(stack.items[1].seg_boundaries, "input segment metadata");
+    stack.items[1].seg_count = 1;
+    stack.items[1].seg_boundaries[0] = 0;
+    stack.items[1].seg_boundaries[1] = nrows;
+    eval_entry_t before = stack.items[1];
+    uint64_t view = input->view_generation, storage = input->storage_generation;
+    col_delta_timestamp_t *timestamps = input->timestamps;
+    uint64_t baseline = reserved_for(expected);
+    uint64_t input_charge = input->memory_governor == expected
+        ? relation_charge(input) : 0;
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(expected);
+    /* Measure the checked constructor independently of MAP, including its
+     * transient metadata peak; MAP scratch overlaps that whole operation. */
+    uint64_t low = baseline, high = baseline + (UINT64_C(1) << 20);
+    while (low < high) {
+        uint64_t mid = low + (high - low) / 2;
+        atomic_store_explicit(&governor->usable_bytes, mid,
+            memory_order_release);
+        int rc = wl_columnar_relation_new_auto_governed("$map", pc, nrows,
+                false, expected, &probe);
+        MAP_CHECK(rc == 0 || rc == ENOSPC, "constructor peak calibration");
+        col_rel_destroy(probe);
+        probe = NULL;
+        MAP_CHECK(reserved_for(expected) == baseline, "probe charge released");
+        if (rc == 0)
+            high = mid;
+        else
+            low = mid + 1;
+    }
+    uint64_t scratch = sizeof(int64_t)
+        + (callback ? pc * sizeof(wl_columnar_expr_compiled_t *) : 0);
+    uint64_t limit = high + scratch;
+    map_admission_callback_calls = 0;
+    for (unsigned phase = 0; phase < 2; phase++) {
+        atomic_store_explicit(&governor->usable_bytes,
+            phase == 0 ? baseline : limit - 1, memory_order_release);
+        sess->memory_budget_denied = false;
+        MAP_CHECK(col_op_map(&op, &stack, sess) == ENOSPC
+            && sess->memory_budget_denied, "typed scratch/output denial");
+        MAP_CHECK(stack.top == 2 && stack.items[0].rel == lower
+            && concat_entry_unchanged(&stack.items[1], &before)
+            && before.seg_boundaries[0] == 0
+            && before.seg_boundaries[1] == nrows,
+            "denial retains complete input entry");
+        MAP_CHECK(reserved_for(expected) == baseline
+            && sess->delta_pool->slot_used == 0 && sess->eval_arena->used == 0,
+            "denial preserves pool/arena credit and usage");
+        MAP_CHECK(input->view_generation == view
+            && input->storage_generation == storage
+            && input->timestamps == timestamps && input->nrows == nrows
+            && map_admission_callback_calls == 0,
+            "denial leaves source and callback effects unchanged");
+    }
+    if (callback) {
+        /* The output fits, but a large compiled expression does not. This
+         * refusal is still before row evaluation and must retain the entry. */
+        uint8_t arithmetic[647] = {WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '0'};
+        for (unsigned i = 0; i < 64; i++) {
+            arithmetic[7 + i * 10] = WL_PLAN_EXPR_CONST_INT;
+            arithmetic[16 + i * 10] = WL_PLAN_EXPR_ARITH_ADD;
+        }
+        wl_plan_expr_buffer_t compiled = {arithmetic, sizeof(arithmetic)};
+        op.map_exprs = &compiled;
+        atomic_store_explicit(&governor->usable_bytes, limit,
+            memory_order_release);
+        sess->memory_budget_denied = false;
+        MAP_CHECK(col_op_map(&op, &stack, sess) == ENOSPC
+            && sess->memory_budget_denied && stack.top == 2
+            && concat_entry_unchanged(&stack.items[1], &before)
+            && reserved_for(expected) == baseline
+            && map_admission_callback_calls == 0,
+            "compiled-expression admission retains original input");
+        op.map_exprs = &expression;
+    }
+    atomic_store_explicit(&governor->usable_bytes, limit, memory_order_release);
+    sess->memory_budget_denied = false;
+    int rc = col_op_map(&op, &stack, sess);
+    if (owned && rc == 0) {
+        input = NULL;
+        input_stacked_owned = false;
+    }
+    MAP_CHECK(rc == 0 && stack.top == 2, "exact-budget retry");
+    const col_rel_t *out = stack.items[1].rel;
+    MAP_CHECK(out && out->memory_governor == expected && !out->pool_owned
+        && !out->arena_owned && out->capacity == nrows && out->nrows == nrows
+        && out->ncols == pc && !out->timestamps && stack.items[1].owned,
+        "governed complete output shape");
+    MAP_CHECK(reserved_for(expected) == baseline - (owned ? input_charge : 0)
+        + relation_charge(out) && sess->delta_pool->slot_used == 0
+        && sess->eval_arena->used == 0,
+        "output exact charge, prepaid floors intact");
+    for (uint32_t r = 0; r < nrows && pc > 0; r++)
+        MAP_CHECK(col_rel_get(out, r, 0) == (callback ? 42 : (int64_t)r + 7),
+            "all projected values preserved");
+    MAP_CHECK(map_admission_callback_calls == (callback ? nrows : 0),
+        "callbacks executed exactly once after admission");
+    MAP_CHECK(eval_stack_drain(&stack) == 0
+        && reserved_for(expected) == baseline - (owned ? input_charge : 0),
+        "output drain releases only output charge");
+cleanup:
+    col_rel_destroy(probe);
+    if (input_stacked_owned)
+        input = NULL; /* stack owns it until checked drain */
+    (void)eval_stack_drain(&stack);
+    col_rel_destroy(input);
+    col_rel_destroy(lower);
+    if (sess) {
+        sess->base.extension_snapshot = NULL;
+        wl_arena_free(sess->eval_arena);
+        sess->eval_arena = NULL;
+        if (saved_ref)
+            sess->memory_governor = saved_ref;
+    }
+    wirelog_extension_snapshot_release(snapshot);
+    if (registry) {
+        (void)wirelog_extension_unregister(registry, "test.map");
+        if (wirelog_extension_registry_destroy(registry) != 0 && !failure)
+            failure = "callback registry cleanup refused";
+    }
+    destroy_session(sess);
+    if (source_ref) {
+        if (reserved_for(source_ref) != 0 && !failure)
+            failure = "source governor leaked credit";
+        wl_columnar_memory_governor_ref_release(source_ref);
+    }
+    if (expected) {
+        if (reserved_for(expected) != 0 && !failure)
+            failure = "resolved governor leaked credit";
+        wl_columnar_memory_governor_ref_release(expected);
+    }
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef MAP_CHECK
+}
+
+static void
+test_map_unmanaged_storage(unsigned mode)
+{
+    TEST("unmanaged MAP retains heap/pool/arena allocation policy");
+    wl_col_session_t sess = {0};
+    col_rel_t *input = col_rel_new_auto("input", 1);
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    if (mode)
+        sess.delta_pool = delta_pool_create(8, sizeof(col_rel_t), 4096);
+    if (mode == 2)
+        sess.eval_arena = wl_arena_create(4096);
+    const int64_t row = 7;
+    wl_plan_op_t op = {.op = WL_PLAN_OP_MAP, .project_count = 1};
+    bool ok = input && (!mode || sess.delta_pool)
+        && (mode != 2 || sess.eval_arena)
+        && col_rel_append_row(input, &row) == 0
+        && eval_stack_push(&stack, input, false) == 0
+        && col_op_map(&op, &stack, &sess) == 0 && stack.top == 1;
+    if (ok) {
+        const col_rel_t *out = stack.items[0].rel;
+        ok = out && !out->memory_governor && out->pool_owned == (mode != 0)
+            && out->arena_owned == (mode == 2) && out->nrows == 1
+            && col_rel_get(out, 0, 0) == 7;
+    }
+    (void)eval_stack_drain(&stack);
+    col_rel_destroy(input);
+    delta_pool_destroy(sess.delta_pool);
+    wl_arena_free(sess.eval_arena);
+    if (!ok) {
+        FAIL("legacy storage route"); return;
+    }
+    PASS();
 }
 
 static void
@@ -3756,7 +4015,9 @@ test_governed_join_consumers_release_exactly_once(void)
     if (col_op_map(&map_op, &stack, sess) != 0
         || stack.top != 1 || stack.items[0].rel->ncols != 1
         || stack.items[0].rel->nrows != 4
-        || reserved_of(sess) != registry_charge(sess) + cache_bytes) {
+        || stack.items[0].rel->memory_governor != sess->memory_governor
+        || reserved_of(sess) != registry_charge(sess) + cache_bytes
+        + relation_charge(stack.items[0].rel)) {
         FAIL("MAP changed retained JOIN cache accounting");
         goto out;
     }
@@ -3867,6 +4128,17 @@ main(void)
     printf("Memory admission: JOIN output capacity (Issue #1477)\n");
 
     test_attach_baseline();
+    for (unsigned governor = 0; governor < 3; governor++) {
+        for (unsigned owned = 0; owned < 2; owned++)
+            test_map_admission(governor, owned != 0, COL_REL_INIT_CAP + 1,
+                false, false);
+    }
+    for (unsigned mode = 0; mode < 3; mode++)
+        test_map_unmanaged_storage(mode);
+    test_map_admission(0, false, 0, false, false);
+    test_map_admission(1, true, 3, true, false);
+    test_map_admission(0, false, 3, false, true);
+    test_map_admission(1, true, 3, false, true);
     for (unsigned pooled = 0; pooled < 2; pooled++) {
         for (unsigned governor = 0; governor < 3; governor++) {
             for (unsigned condition = 0; condition < 6; condition++)
