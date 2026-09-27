@@ -2935,6 +2935,7 @@ typedef struct {
     uint32_t k8_capacity;
     uint32_t k16_capacity;
     uint32_t insertion_capacity;
+    size_t insertion_bytes; /* Actual capacity, including the saved row. */
     wl_columnar_memory_reservation_t admission;
     bool admission_active;
 } wl_columnar_radix_workspace_t;

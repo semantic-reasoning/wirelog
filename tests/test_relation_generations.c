@@ -1483,9 +1483,8 @@ test_source_writer_cow_shared_view(void)
 
 /* The workspace entry point must thread the caller's scratch buffers into
  * the sort rather than quietly allocating its own: a workspace prepared for
- * a smaller range is refused.  That refusal is also the only reachable way
- * to exercise the shared-view rollback, so this pins both -- the detach is
- * undone and the alias borrow survives, leaving the view readable through
+ * a smaller range is refused. The workspace is rejected before
+ * detach and the alias borrow survives, leaving the view readable through
  * the source exactly as before the attempt. */
 static void
 test_workspace_sort_rejects_undersized_workspace_and_rolls_back(void)

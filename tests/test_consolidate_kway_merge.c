@@ -2447,6 +2447,332 @@ cleanup:
 #undef WP_CHECK
 }
 
+static int
+test_radix_admitted_call(col_rel_t *rel, unsigned route)
+{
+    if (route == 2)
+        return col_rel_radix_sort_int64(rel);
+    if (route == 0)
+        return col_rel_radix_sort(rel, 0, rel->nrows);
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int rc = col_rel_source_writer_acquire(rel, &writer);
+    if (rc != 0)
+        return rc;
+    bool pending = false;
+    rc = col_rel_radix_sort_locked(rel, 0, rel->nrows, &writer, false,
+            &pending);
+    int release_rc = wl_columnar_source_access_writer_release(&writer);
+    return rc != 0 ? rc : release_rc;
+}
+
+static void
+test_radix_direct_admission(uint32_t count, unsigned route, unsigned ownership,
+    bool timestamped, bool sorted, bool floating)
+{
+    TEST("direct radix scratch admission precedes mutation and COW");
+    col_rel_t *source = col_rel_new_auto("direct-radix", 1), *view = NULL;
+    col_rel_t *rel = source;
+    wl_arena_t *arena = NULL;
+    wl_columnar_memory_governor_ref_t *ref =
+        test_consolidate_governor_create(UINT64_C(1) << 30);
+    int64_t *before = malloc((size_t)count * sizeof(*before));
+    col_delta_timestamp_t *before_ts = timestamped
+        ? calloc(count, sizeof(*before_ts)) : NULL;
+    const char *failure = NULL;
+#define DA_CHECK(c, m) do { if (!(c)) { failure = m; goto cleanup; } } while (0)
+    DA_CHECK(source && ref && before && (!timestamped || before_ts), "fixture");
+    if (floating) {
+        wirelog_column_type_t type = WIRELOG_TYPE_FLOAT;
+        DA_CHECK(col_rel_set_column_types(source, &type, 1) == 0,
+            "float schema");
+    }
+    if (timestamped)
+        DA_CHECK(col_rel_enable_timestamps(source) == 0, "timestamps");
+    for (uint32_t i = 0; i < count; i++) {
+        int64_t value = sorted ? i + 1 : count - i;
+        before[i] = floating ? wl_columnar_float_to_bits((double)value) : value;
+        DA_CHECK(col_rel_append_row(source, &before[i]) == 0, "append");
+        if (timestamped)
+            source->timestamps[i] = (col_delta_timestamp_t){
+                .iteration = i, .stratum = 4, .worker = 2, .multiplicity = -3,
+            };
+    }
+    if (timestamped)
+        memcpy(before_ts, source->timestamps,
+            (size_t)count * sizeof(*before_ts));
+    if (ownership == 1) {
+        view = col_rel_new_like("radix-view", source);
+        DA_CHECK(view && col_rel_install_shared_view(view, source) == 0,
+            "alias");
+        rel = view;
+    } else if (ownership == 2) {
+        arena = wl_arena_create(4096);
+        int64_t *column = arena ? wl_arena_alloc(arena,
+                (size_t)source->capacity * sizeof(*column)) : NULL;
+        DA_CHECK(column, "arena payload");
+        memcpy(column, source->columns[0], (size_t)count * sizeof(*column));
+        free(source->columns[0]);
+        source->columns[0] = column;
+        source->arena_owned = true;
+    }
+    DA_CHECK(col_rel_attach_memory_governor(rel, ref) == 0, "governor");
+    wl_columnar_memory_governor_t *g = wl_columnar_memory_governor_ref_get(ref);
+    uint64_t baseline = wl_columnar_memory_reserved(g);
+    uint64_t generation = rel->view_generation,
+        storage = rel->storage_generation;
+    int64_t *column_before = rel->columns[0];
+    bool *shared_before = rel->col_shared;
+    uint64_t scratch = count <= 32 || floating
+        ? ((uint64_t)count + 1) * sizeof(int64_t)
+        : (uint64_t)count * (2 * sizeof(uint32_t) + sizeof(int64_t)
+        + (count >= 50000 ? sizeof(uint16_t) : sizeof(uint8_t)))
+        + (count >= 50000 ? 65536u * sizeof(uint32_t) : 0);
+    if (timestamped)
+        scratch += (uint64_t)count * sizeof(col_delta_timestamp_t);
+    atomic_store(&g->usable_bytes, baseline + scratch - 1);
+    int rc = test_radix_admitted_call(rel, route);
+    atomic_store(&g->usable_bytes, UINT64_C(1) << 30);
+    DA_CHECK(rc == ENOMEM && rel->memory_budget_denial_pending,
+        "scratch one-byte-short must deny");
+    const char *sites[] = {
+        "radix_workspace_timestamps", "radix_workspace_insertion_rows",
+        "radix_workspace_perm_a", "radix_workspace_perm_b",
+        "radix_workspace_temp_column", "radix_workspace_bucket_values",
+        "radix_workspace_count16",
+    };
+    for (uint32_t i = 0; i < 7; i++) {
+        bool insertion = count <= 32 || floating;
+        if ((i == 0 && !timestamped) || (i == 1 && !insertion)
+            || (i >= 2 && insertion) || (i == 6 && count < 50000))
+            continue;
+        rel->memory_budget_denial_pending = route != 1; /* Stale outer cause. */
+        fail_consolidate_allocation_at(sites[i]);
+        rc = test_radix_admitted_call(rel, route);
+        clear_consolidate_allocation_failure();
+        DA_CHECK(consolidate_fail_used && rc == ENOMEM
+            && !rel->memory_budget_denial_pending, "actual allocator failure");
+        if (route == 1) {
+            rel->memory_budget_denial_pending = true;
+            fail_consolidate_allocation_at(sites[i]);
+            rc = test_radix_admitted_call(rel, route);
+            clear_consolidate_allocation_failure();
+            DA_CHECK(consolidate_fail_used && rc == ENOMEM
+                && rel->memory_budget_denial_pending,
+                "nested allocator failure preserves earlier denial");
+        }
+    }
+    wl_columnar_memory_reservation_t padding;
+    wl_columnar_memory_reservation_init(&padding);
+    atomic_store(&g->usable_bytes, UINT64_MAX);
+    DA_CHECK(wl_columnar_memory_reserve_checked(g, UINT64_MAX - baseline,
+        &padding) == WL_COLUMNAR_MEMORY_ADMISSION_OK, "scratch padding");
+    rel->memory_budget_denial_pending = false;
+    rc = test_radix_admitted_call(rel, route);
+    bool released = wl_columnar_memory_release(&padding);
+    atomic_store(&g->usable_bytes, UINT64_C(1) << 30);
+    DA_CHECK(rc == EOVERFLOW && released && !rel->memory_budget_denial_pending,
+        "direct scratch overflow keeps typed cause");
+    wl_columnar_source_access_reader_t reader = { 0 };
+    DA_CHECK(col_rel_source_reader_acquire(rel, &reader) == 0, "held reader");
+    rel->memory_budget_denial_pending = true;
+    rc = test_radix_admitted_call(rel, route);
+    int release_rc = col_rel_source_reader_release(&reader);
+    DA_CHECK(rc == EBUSY && release_rc == 0 &&
+        rel->memory_budget_denial_pending,
+        "writer refusal preserves earlier denial");
+    DA_CHECK(wl_columnar_memory_reserved(g) == baseline
+        && rel->columns[0] == column_before && rel->col_shared == shared_before
+        && rel->view_generation == generation &&
+        rel->storage_generation == storage
+        && memcmp(before, rel->columns[0], (size_t)count * sizeof(*before)) == 0
+        && (!timestamped || memcmp(before_ts, rel->timestamps,
+        (size_t)count * sizeof(*before_ts)) == 0), "refusal changed source");
+    if (ownership == 1)
+        DA_CHECK(col_rel_storage_alias_borrow_count(source) == 1,
+            "refusal detached alias");
+    /* Exact scratch budget proves no duplicate admission for owned storage.
+     * Shared storage additionally requires the independently admitted COW. */
+    if (ownership != 1)
+        atomic_store(&g->usable_bytes, baseline + scratch);
+    rel->memory_budget_denial_pending = true;
+    DA_CHECK(test_radix_admitted_call(rel, route) == 0
+        && rel->memory_budget_denial_pending == (route == 1),
+        "retry/provenance");
+    for (uint32_t i = 0; i < count; i++) {
+        int64_t expected = floating ? wl_columnar_float_to_bits((double)i + 1)
+            : (int64_t)i + 1;
+        DA_CHECK(rel->columns[0][i] == expected
+            && (!timestamped || memcmp(&rel->timestamps[i],
+            &before_ts[sorted ? i : count - i - 1], sizeof(*before_ts)) == 0),
+            "exact sorted output");
+    }
+    if (ownership == 1)
+        DA_CHECK(col_rel_storage_alias_borrow_count(source) == 0
+            && memcmp(before, source->columns[0],
+            (size_t)count * sizeof(*before)) == 0,
+            "COW source or alias ownership");
+    else
+        DA_CHECK(wl_columnar_memory_reserved(g) == baseline, "scratch leak");
+cleanup:
+    clear_consolidate_allocation_failure();
+    col_rel_destroy(view);
+    col_rel_destroy(source);
+    wl_arena_free(arena);
+    free(before);
+    free(before_ts);
+    if (ref) {
+        if (wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                ref)) != 0)
+            failure = "credit leak after direct sort teardown";
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef DA_CHECK
+}
+
+static void
+test_radix_workspace_width(uint32_t count, bool floating)
+{
+    TEST("insertion workspace checks byte capacity before COW");
+    col_rel_t *narrow = col_rel_new_auto("narrow", 1);
+    col_rel_t *wide = col_rel_new_auto("wide", 2), *view = NULL;
+    wl_columnar_memory_governor_ref_t *ref =
+        test_consolidate_governor_create(UINT64_C(1) << 30);
+    wl_columnar_radix_workspace_t workspace = { 0 };
+    wl_columnar_source_access_writer_t writer = { 0 };
+    const char *failure = NULL;
+#define WW_CHECK(c, m) do { if (!(c)) { failure = m; goto cleanup; } } while (0)
+    WW_CHECK(narrow && wide && ref, "fixture");
+    if (floating) {
+        wirelog_column_type_t types[] = { WIRELOG_TYPE_FLOAT,
+                                          WIRELOG_TYPE_FLOAT };
+        WW_CHECK(col_rel_set_column_types(narrow, types, 1) == 0
+            && col_rel_set_column_types(wide, types, 2) == 0, "float schemas");
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        int64_t row[] = { count - i, (count - i) * 10 };
+        if (floating) {
+            row[0] = wl_columnar_float_to_bits((double)row[0]);
+            row[1] = wl_columnar_float_to_bits((double)row[1]);
+        }
+        WW_CHECK(col_rel_append_row(narrow, row) == 0
+            && col_rel_append_row(wide, row) == 0, "append");
+    }
+    view = col_rel_new_like("width-view", wide);
+    WW_CHECK(view && col_rel_install_shared_view(view, wide) == 0
+        && col_rel_attach_memory_governor(narrow, ref) == 0
+        && col_rel_attach_memory_governor(wide, ref) == 0
+        && col_rel_attach_memory_governor(view, ref) == 0, "governed fixtures");
+    wl_columnar_memory_governor_t *g = wl_columnar_memory_governor_ref_get(ref);
+    uint32_t bounds[] = { 0, count };
+    uint64_t baseline = wl_columnar_memory_reserved(g);
+    WW_CHECK(wl_columnar_radix_workspace_prepare(narrow, bounds, 1, 0,
+        &workspace) == 0, "narrow preparation");
+    uint64_t admitted = wl_columnar_memory_reserved(g);
+    uint64_t generation = view->view_generation,
+        storage = view->storage_generation;
+    int64_t *old_column = view->columns[0];
+    WW_CHECK(col_rel_source_writer_acquire(view, &writer) == 0, "view writer");
+    /* If COW is tried first, this limit yields ENOMEM, not required EINVAL. */
+    atomic_store(&g->usable_bytes, admitted);
+    WW_CHECK(wl_columnar_relation_radix_sort_with_workspace(view, 0, count,
+        &writer, &workspace) == EINVAL && view->col_shared
+        && view->columns[0] == old_column && view->view_generation == generation
+        && view->storage_generation == storage
+        && col_rel_storage_alias_borrow_count(wide) == 1
+        && wl_columnar_memory_reserved(g) == admitted,
+        "width refusal before COW");
+    WW_CHECK(wl_columnar_source_access_writer_release(&writer) == 0, "release");
+    for (uint32_t i = 0; i < count; i++) {
+        int64_t a = count - i, b = (count - i) * 10;
+        if (floating) {
+            a = wl_columnar_float_to_bits((double)a);
+            b = wl_columnar_float_to_bits((double)b);
+        }
+        WW_CHECK(view->columns[0][i] == a && view->columns[1][i] == b,
+            "wide bytes preserved");
+    }
+    WW_CHECK(col_rel_source_writer_acquire(narrow, &writer) == 0,
+        "narrow writer");
+    WW_CHECK(wl_columnar_relation_radix_sort_with_workspace(narrow, 0, count,
+        &writer, &workspace) == 0, "original workspace still usable");
+    WW_CHECK(wl_columnar_source_access_writer_release(&writer) == 0, "release");
+    wl_columnar_radix_workspace_destroy(&workspace);
+    WW_CHECK(workspace.insertion_bytes == 0
+        && wl_columnar_memory_reserved(g) == baseline,
+        "destroy clears capacity");
+    atomic_store(&g->usable_bytes, UINT64_C(1) << 30);
+    WW_CHECK(wl_columnar_radix_workspace_prepare(wide, bounds, 1, 0,
+        &workspace) == 0, "wide reprepare");
+    admitted = wl_columnar_memory_reserved(g);
+    atomic_store(&g->usable_bytes, admitted);
+    WW_CHECK(col_rel_source_writer_acquire(narrow, &writer) == 0,
+        "narrow writer");
+    WW_CHECK(wl_columnar_relation_radix_sort_with_workspace(narrow, 0, count,
+        &writer, &workspace) == 0 && wl_columnar_memory_reserved(g) == admitted,
+        "wider capacity may serve narrower input without another charge");
+    WW_CHECK(wl_columnar_source_access_writer_release(&writer) == 0, "release");
+    for (uint32_t i = 0; i < count; i++)
+        WW_CHECK(narrow->columns[0][i] == (floating
+            ? wl_columnar_float_to_bits((double)i + 1) : (int64_t)i + 1),
+            "narrow sorted output");
+
+    /* The supplied workspace is admitted; force the later COW reservation
+     * to overflow with a real padding token, and preserve its typed cause. */
+    wl_columnar_memory_reservation_t padding;
+    wl_columnar_memory_reservation_init(&padding);
+    atomic_store(&g->usable_bytes, UINT64_MAX);
+    WW_CHECK(wl_columnar_memory_reserve_checked(g, UINT64_MAX - admitted,
+        &padding) == WL_COLUMNAR_MEMORY_ADMISSION_OK, "COW overflow padding");
+    int rc = col_rel_source_writer_acquire(view, &writer);
+    if (rc == 0)
+        rc = wl_columnar_relation_radix_sort_with_workspace(view, 0, count,
+                &writer, &workspace);
+    bool released = wl_columnar_memory_release(&padding);
+    atomic_store(&g->usable_bytes, UINT64_C(1) << 30);
+    WW_CHECK(rc == EOVERFLOW && released && !view->memory_budget_denial_pending
+        && wl_columnar_memory_reserved(g) == admitted && view->col_shared
+        && view->view_generation == generation &&
+        view->storage_generation == storage,
+        "COW overflow must keep local cause and ownership");
+    WW_CHECK(wl_columnar_relation_radix_sort_with_workspace(view, 0, count,
+        &writer, &workspace) == 0 && !view->col_shared
+        && col_rel_storage_alias_borrow_count(wide) == 0, "COW exact retry");
+    WW_CHECK(wl_columnar_source_access_writer_release(&writer) == 0, "release");
+    for (uint32_t i = 0; i < count; i++) {
+        int64_t a = i + 1, b = (i + 1) * 10;
+        if (floating) {
+            a = wl_columnar_float_to_bits((double)a);
+            b = wl_columnar_float_to_bits((double)b);
+        }
+        WW_CHECK(view->columns[0][i] == a && view->columns[1][i] == b,
+            "COW sorted result");
+    }
+cleanup:
+    if (writer.owner)
+        (void)wl_columnar_source_access_writer_release(&writer);
+    wl_columnar_radix_workspace_destroy(&workspace);
+    col_rel_destroy(view);
+    col_rel_destroy(narrow);
+    col_rel_destroy(wide);
+    if (ref) {
+        if (wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                ref)) != 0)
+            failure = "capacity test credit leak";
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef WW_CHECK
+}
+
 int
 main(void)
 {
@@ -2454,6 +2780,19 @@ main(void)
     printf("NOTE: Expected to FAIL at link time until US-002 GREEN phase\n");
     printf("      implements col_op_consolidate_kway_merge.\n\n");
 
+    for (unsigned route = 0; route < 3; route++) {
+        const uint32_t counts[] = { 3, 64, 50000 };
+        for (unsigned i = 0; i < 3; i++) {
+            test_radix_direct_admission(counts[i], route, 0, false, false,
+                false);
+            test_radix_direct_admission(counts[i], route, 0, true, true, false);
+        }
+        test_radix_direct_admission(64, route, 1, true, false, false);
+        test_radix_direct_admission(64, route, 2, false, false, false);
+        test_radix_direct_admission(64, route, 0, true, false, true);
+    }
+    test_radix_workspace_width(3, false);
+    test_radix_workspace_width(64, true);
     test_radix_workspace_preflight(3, false);
     test_radix_workspace_preflight(64, true);
     test_radix_workspace_preflight(50000, true);
