@@ -895,8 +895,21 @@ the existing checked-disposal error precedence. This is not rollback of callback
 that have already executed. A zero-column projection admits its non-null row
 scratch buffer as well.
 
-This is CONCAT, VARIABLE empty-output and MAP coverage, not completion of all
-temporary admission (#1978/#1369). REDUCE/LFTJ and borrowed CONS output
+REDUCE uses the same session-first/source-fallback policy for scratch, output
+and compiled aggregate expressions. Its governed heap output starts at the
+smaller of the input row count and the initial relation capacity, then admits
+growth as new groups appear. It does not reserve one output row per input for
+low-cardinality reductions. Pre-aggregation budget refusal restores the complete
+input entry. Late growth denial also restores it for COUNT, absent expressions,
+and successfully compiled expressions. Interpreter fallback may modify intern
+state, so late refusal retains the existing checked-disposal behavior; universal
+late-refusal input retention remains outstanding. Ordinary allocator, arithmetic
+and disposal errors keep their existing precedence. Only a private output's
+confirmed denial flag converts a collapsed growth `ENOMEM` into `ENOSPC`;
+shared growth overflow/invalid-state propagation is tracked separately in #1991.
+
+This is CONCAT, VARIABLE empty-output, MAP and REDUCE result coverage, not
+completion of all temporary admission (#1978/#1369). LFTJ and borrowed CONS output
 paths still need audit and integration. Eval-entry segment boundaries and other
 auxiliary metadata/scratch need lifetime accounting through their actual free
 sites; they are not covered by CONCAT's relation reservation or excluded from
