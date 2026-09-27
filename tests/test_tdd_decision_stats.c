@@ -575,6 +575,188 @@ expect(const char *name, int ok)
     return 1;
 }
 
+/* Check the public internal queries, rather than duplicating their traversal. */
+static int
+run_plan_traversal(void)
+{
+    char *names[] = { "col0", "col1" };
+    col_rel_t r = { .name = "r", .ncols = 2, .col_names = names };
+    col_rel_t s = { .name = "s", .ncols = 2, .col_names = names };
+    col_rel_t *registered[] = { &r, &s };
+    wl_col_session_t coord = { .rels = registered, .nrels = 2 };
+    const char *key0[] = { "col0" }, *key1[] = { "col1" };
+    uint32_t column = 0;
+    wl_plan_op_exchange_t exchange = { .key_col_idxs = &column,
+                                       .key_col_count = 1 };
+    wl_plan_op_t seed[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "edb" },
+    };
+    wl_plan_op_t one[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "r" },
+        { .op = WL_PLAN_OP_JOIN, .right_relation = "edb", .left_keys = key0,
+          .right_keys = key0, .key_count = 1 },
+    };
+    wl_plan_op_t two[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "r" },
+        { .op = WL_PLAN_OP_JOIN, .right_relation = "r", .left_keys = key0,
+          .right_keys = key0, .key_count = 1 },
+    };
+    wl_plan_op_t three[] = { two[0], two[1], two[1] };
+    wl_plan_op_t *children[] = { seed, one, two };
+    uint32_t counts[] = { 1, 2, 2 };
+    wl_plan_op_k_fusion_t fusion = { .k = 3, .k_ops = children,
+                                     .k_op_counts = counts };
+    wl_plan_op_t *later_children[] = { seed, three };
+    uint32_t later_counts[] = { 1, 3 };
+    wl_plan_op_k_fusion_t later = { .k = 2, .k_ops = later_children,
+                                    .k_op_counts = later_counts };
+    wl_plan_op_t root[7] = {
+        seed[0],
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange },
+    };
+    wl_plan_op_t other[] = {
+        { .op = WL_PLAN_OP_K_FUSION, .opaque_data = &later },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange },
+    };
+    wl_plan_relation_t rels[] = {
+        { .name = "r", .ops = root, .op_count = 0 },
+        { .name = "s", .ops = other, .op_count = 0 },
+    };
+    wl_plan_stratum_t sp = { .relations = rels, .relation_count = 0 };
+    wl_tdd_segment_stats_t stats;
+    int failed = 1;
+
+#define TRAVERSAL_CHECK(maximum, self, single, aligned) do { \
+            if (stratum_max_idb_body_atoms(&sp) != (maximum) \
+                || tdd_stratum_has_idb_self_join(&sp) != (self) \
+                || tdd_stratum_single_idb_join_keys_exchange_aligned(&sp) \
+                != (single) \
+                || tdd_stratum_idb_self_join_exchange_aligned(&sp, &coord) \
+                != (aligned)) { \
+                fprintf(stderr, "traversal classification line=%d\n", __LINE__); \
+                goto done; \
+            } \
+} while (0)
+#define TRAVERSAL_REQUIRE(condition) do { \
+            if (!(condition)) { \
+                fprintf(stderr, "traversal control line=%d\n", __LINE__); \
+                goto done; \
+            } \
+} while (0)
+
+    TRAVERSAL_CHECK(0, false, true, false);
+    sp.relation_count = 1;
+    TRAVERSAL_CHECK(0, false, true, false); /* Empty sequence. */
+    rels[0].op_count = 2;
+    TRAVERSAL_CHECK(0, false, true, false);
+
+    root[0] = one[0];
+    root[1] = one[1];
+    root[2] = (wl_plan_op_t){ .op = WL_PLAN_OP_EXCHANGE,
+                              .opaque_data = &exchange };
+    rels[0].op_count = 3;
+    TRAVERSAL_CHECK(1, false, true, false);
+    root[1].left_keys = key1;
+    TRAVERSAL_CHECK(1, false, false, false);
+    root[1] = two[1];
+    TRAVERSAL_CHECK(2, true, false, true);
+    root[1].left_keys = key1;
+    TRAVERSAL_CHECK(2, true, false, false);
+
+    /* A later child decides; a second fusion and later relation must also
+     * be visited. Child sequences each start with fresh predicate state. */
+    root[0] = seed[0];
+    root[1] = (wl_plan_op_t){ .op = WL_PLAN_OP_K_FUSION,
+                              .opaque_data = &fusion };
+    TRAVERSAL_CHECK(2, true, false, true);
+    two[1].left_keys = key1;
+    TRAVERSAL_CHECK(2, true, false, false);
+    two[1].left_keys = key0;
+    root[2] = other[0];
+    root[3] = other[1];
+    rels[0].op_count = 4;
+    TRAVERSAL_CHECK(3, true, false, true);
+    root[2] = other[1];
+    rels[0].op_count = 3;
+    sp.relation_count = 2;
+    rels[1].op_count = 2;
+    TRAVERSAL_CHECK(3, true, false, true);
+    three[2].left_keys = key1;
+    TRAVERSAL_CHECK(3, true, false, false);
+    three[2].left_keys = key0;
+    sp.relation_count = 1;
+
+    fusion.k = 1;
+    children[0] = one;
+    counts[0] = 2;
+    TRAVERSAL_CHECK(1, false, true, false);
+    one[1].left_keys = key1;
+    TRAVERSAL_CHECK(1, false, false, false);
+    one[1].left_keys = key0;
+    TRAVERSAL_REQUIRE(tdd_stratum_global_read_candidate(&sp));
+    tdd_stratum_segment_stats(&sp, &stats);
+    TRAVERSAL_REQUIRE(stats.total_segments == 1
+        && stats.global_read_segments == 1 && stats.seed_only_segments == 0);
+
+    /* These four queries include top-level evidence even when fusion exists;
+    * segment statistics intentionally use only the children in that case. */
+    root[0] = three[0];
+    root[1] = three[1];
+    root[2] = three[2];
+    root[3] = (wl_plan_op_t){ .op = WL_PLAN_OP_K_FUSION,
+                              .opaque_data = &fusion };
+    root[4] = other[1];
+    rels[0].op_count = 5;
+    children[0] = seed;
+    counts[0] = 1;
+    TRAVERSAL_CHECK(3, true, false, true);
+    tdd_stratum_segment_stats(&sp, &stats);
+    TRAVERSAL_REQUIRE(stats.total_segments == 1
+        && stats.seed_only_segments == 1 && stats.max_segment_idb_atoms == 0);
+    TRAVERSAL_REQUIRE(!tdd_stratum_global_read_candidate(&sp));
+    fusion.k = 0;
+    TRAVERSAL_CHECK(3, true, false, true);
+    root[3].opaque_data = NULL;
+    TRAVERSAL_CHECK(3, true, false, true);
+
+    /* Empty children and NULL payloads do not hide a later usable child. */
+    root[0] = seed[0];
+    root[1] = (wl_plan_op_t){ .op = WL_PLAN_OP_K_FUSION };
+    root[2] = (wl_plan_op_t){ .op = WL_PLAN_OP_K_FUSION,
+                              .opaque_data = &fusion };
+    root[3] = other[1];
+    rels[0].op_count = 4;
+    fusion.k = 2;
+    children[0] = NULL;
+    counts[0] = 0;
+    children[1] = one;
+    counts[1] = 2;
+    /* The separate LFTJ precheck rejects the NULL fusion payload. */
+    TRAVERSAL_CHECK(1, false, false, false);
+    root[1] = seed[0];
+    TRAVERSAL_CHECK(1, false, true, false);
+
+    /* Direct children are not recursively expanded by these four queries.
+    * The distinct unsupported-LFTJ checker still descends recursively. */
+    wl_plan_op_t nested[] = {
+        { .op = WL_PLAN_OP_K_FUSION, .opaque_data = &later },
+    };
+    children[1] = nested;
+    counts[1] = 1;
+    TRAVERSAL_CHECK(0, false, true, false);
+    wl_plan_op_t invalid_lftj[] = { { .op = WL_PLAN_OP_LFTJ } };
+    later_children[1] = invalid_lftj;
+    later_counts[1] = 1;
+    TRAVERSAL_REQUIRE(tdd_stratum_has_unsupported_lftj(&sp));
+    TRAVERSAL_CHECK(0, false, false, false);
+    failed = 0;
+done:
+    session_rel_free_hash(&coord);
+#undef TRAVERSAL_REQUIRE
+#undef TRAVERSAL_CHECK
+    return failed;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -595,6 +777,8 @@ main(int argc, char **argv)
             unsetenv("WIRELOG_TDD_STRATUM_PROFILE");
         return run_snapshot_frames();
     }
+    failed += expect("TDD plan traversal preserves query policies",
+            run_plan_traversal() == 0);
     failed += expect("post-dispatch serial replay retains history",
             run_audit_boundary(0) == 0);
     failed += expect("worker cleanup refusal blocks serial replay and retries",
