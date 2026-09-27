@@ -2273,11 +2273,16 @@ tdd_worker_subpass_fn(void *arg)
 
         /* Heap-allocate delta so it survives delta_pool_reset below. */
         col_rel_t *delta = NULL;
-        /* Preserve the legacy ungoverned delta allocation policy while
-         * returning allocation and representation failures to the caller. */
-        ctx->rc = eval_relation_new_like_checked(sess, dname, r, NULL,
-                &delta);
-        if (ctx->rc != 0) {
+        int prep_rc = wl_columnar_eval_prepare_worker_delta(&delta,
+                dname, r, r->nrows - snap[ri], sess->memory_governor);
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_eval_test_after_worker_delta)
+            wl_columnar_eval_test_after_worker_delta(sess, r, prep_rc);
+#endif
+        if (prep_rc != 0) {
+            if (prep_rc == ENOSPC)
+                sess->memory_budget_denied = true;
+            ctx->rc = prep_rc;
             free(snap);
             sess->tdd_subpass_active = saved_tdd_subpass;
             sess->tdd_outbound_only_active = saved_outbound_only;
