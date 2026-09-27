@@ -597,6 +597,8 @@ extern wl_columnar_set_transition_hook_t wl_columnar_set_transition_hook;
 extern bool wl_columnar_relation_test_fail_prepare_resize;
 extern void (*wl_columnar_relation_test_after_retired_storage_free)(
     const col_rel_t *);
+wl_columnar_continuation_status_t
+wl_columnar_join_pipeline_test_reserve(col_rel_t *out, uint32_t rows);
 void wl_columnar_relation_test_fail_next_prepare_resize(void);
 void wl_columnar_relation_test_fail_next_reservation_commit(void);
 void wl_columnar_relation_test_fail_next_metadata_alloc(void);
@@ -2517,17 +2519,23 @@ void col_rel_retire_payload_credit(col_rel_t *r);
 /* Admit and grow @r to at least @new_cap rows as one transaction; with
  * @new_cap <= capacity it admits the buffers the relation already owns.
  * ENOMEM with *@denied set is a governor verdict, clear is an allocation
- * failure (Issue #1446). */
+ * failure (Issue #1446). EOVERFLOW reports size/accounting overflow; EINVAL
+ * reports invalid shape/state. Caller owns an unpublished relation or holds
+ * its writer. This operation resets transient denial evidence. */
 int
 col_rel_reserve_capacity_admitted(col_rel_t *r, uint32_t new_cap,
     bool *denied);
 int
 col_rel_enable_timestamps(col_rel_t *rel);
-/* Enable timestamp storage while the canonical owner writer is held. */
+/* Enable timestamp storage while the canonical owner writer is held.
+* Nested preparation preserves earlier denial evidence. Admission errors
+* retain ENOMEM+pending (budget), EOVERFLOW, or EINVAL provenance. */
 int
 col_rel_enable_timestamps_locked(col_rel_t *rel);
 /* Promote arena-backed relation columns to private heap storage.  Admission
- * and copying are transactional; ENOMEM leaves the relation unchanged. */
+ * and copying are transactional; failure leaves the relation unchanged.
+ * Caller owns the relation exclusively. ENOMEM+pending denotes budget
+ * refusal; ENOMEM alone is allocation failure, EOVERFLOW/EINVAL stay typed. */
 int
 col_rel_promote_arena_admitted(col_rel_t *rel);
 
@@ -2702,6 +2710,10 @@ int
 wl_col_rel_inline_project_column(col_rel_t *dst, uint32_t dst_row,
     const col_rel_t *src, uint32_t src_row, uint32_t logical_col);
 
+/* Row append and locked row reservation reset transient denial evidence
+ * under the source writer. Actual budget refusal retains legacy ENOMEM plus
+ * memory_budget_denial_pending; allocation ENOMEM, EOVERFLOW and EINVAL are
+ * distinct. Lower nested admission helpers do not reset outer evidence. */
 int
 col_rel_append_row(col_rel_t *r, const int64_t *row);
 int

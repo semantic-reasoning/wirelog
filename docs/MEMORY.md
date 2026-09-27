@@ -1486,3 +1486,21 @@ If commit and rollback both refuse, compaction returns `EAGAIN` and retains
 the valid relation storage plus its `REPLACING` token. A later compaction call
 resolves that token before reporting success; callers must preserve the
 relation and its governor until that retry or checked teardown completes.
+
+### Relation growth error provenance
+
+Capacity reservation, row append, locked batch reservation, COW/arena
+transitions and timestamp preparation retain checked admission errors.
+For compatibility, an actual budget denial returns `ENOMEM` with the relation's
+`memory_budget_denial_pending` flag (and the optional `denied` output) set.
+Allocator failure returns `ENOMEM` without new denial evidence; accounting or
+size overflow returns `EOVERFLOW`, and invalid shape or reservation state returns
+`EINVAL`. JOIN and session adapters convert only confirmed budget denial to
+`ENOSPC` or the continuation reservation-denied status.
+
+Outer row/capacity operations clear stale denial evidence under their existing
+ownership or writer contract. Nested preparation, including locked timestamp
+allocation, preserves earlier evidence belonging to its enclosing operation.
+Rejected growth preserves storage, row/timestamp contents, generations and
+reservation credit; a retry starts a new operation. This status contract does
+not change worker publication or coordinator rollback transactions (#1964/#1965).

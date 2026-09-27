@@ -3811,9 +3811,380 @@ cleanup:
     }
 }
 
+/* Issue #1991: exercise the real governor verdicts with small valid storage.
+ * A separate accounting-only token fills the counter; no huge allocation or
+ * forged column dimensions are needed to force arithmetic overflow. */
+static int
+exercise_growth_boundary(col_rel_t *rel, unsigned boundary, bool *denied)
+{
+    int64_t row = 91;
+    if (boundary == 4)
+        return wl_columnar_join_pipeline_test_reserve(rel, rel->capacity + 1u);
+    if (boundary == 0)
+        return col_rel_reserve_capacity_admitted(rel, rel->capacity + 1u,
+                   denied);
+    if (boundary == 1)
+        return col_rel_append_row(rel, &row);
+    if (boundary == 3)
+        return col_rel_append_rows_atomic(rel, &row, 1u, 1u, denied);
+    wl_columnar_source_access_writer_t writer = { 0 };
+    bool alias_pending = false;
+    int rc = col_rel_source_writer_acquire(rel, &writer);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_reserve_rows_locked(rel, 1u, &writer, &alias_pending);
+    if (alias_pending)
+        CHECK(col_rel_storage_alias_release(rel) == 0,
+            "growth boundary releases deferred alias");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "growth boundary releases its writer");
+    return rc;
+}
+
+static void
+test_growth_error_provenance(void)
+{
+    for (unsigned boundary = 0; boundary < 5; boundary++) {
+        for (unsigned storage = 0; storage < 5; storage++) {
+            /* Capacity reservation alone does not privatize spare COW. */
+            if (boundary == 0 && storage == 3)
+                continue;
+            wl_columnar_memory_resolution_t resolution;
+            make_resolution(&resolution, UINT64_MAX);
+            wl_columnar_memory_governor_ref_t *ref =
+                wl_columnar_memory_governor_ref_create(&resolution);
+            wl_columnar_memory_governor_t *governor =
+                wl_columnar_memory_governor_ref_get(ref);
+            col_rel_t *source = NULL;
+            delta_pool_t *pool = NULL;
+            wl_arena_t *arena = NULL;
+            col_rel_t *rel = NULL;
+            if (storage == 2) {
+                pool = delta_pool_create(1, sizeof(col_rel_t), 4096);
+                arena = wl_arena_create(4096);
+                if (pool && arena)
+                    rel = col_rel_pool_new_auto(pool, arena, "growth", 1);
+            } else
+                rel = col_rel_new_auto("growth", 1);
+            CHECK(ref && rel, "growth status fixture");
+            if (!ref || !rel)
+                goto cleanup;
+            uint32_t rows = storage >= 3 ? 1u : rel->capacity;
+            for (uint32_t i = 0; i < rows; i++) {
+                int64_t value = i + 1u;
+                CHECK(col_rel_append_row(rel, &value) == 0,
+                    "growth status initial row");
+            }
+            CHECK(col_rel_enable_timestamps(rel) == 0,
+                "growth status timestamp fixture");
+            if (!rel->timestamps)
+                goto cleanup;
+            rel->timestamps[0].multiplicity = -7;
+            if (storage == 4) {
+                col_delta_timestamp_t *narrow_timestamps =
+                    realloc(rel->timestamps,
+                        sizeof(*narrow_timestamps));
+                CHECK(narrow_timestamps != NULL,
+                    "growth status narrow timestamp");
+                if (!narrow_timestamps)
+                    goto cleanup;
+                rel->timestamps = narrow_timestamps;
+                rel->timestamp_capacity = 1u;
+            }
+            if (storage == 1 || storage == 3) {
+                source = rel;
+                rel = col_rel_new_auto("growth-view", 1);
+                CHECK(rel && col_rel_attach_memory_governor(rel, ref) == 0
+                    && col_rel_install_shared_view(rel, source) == 0,
+                    "growth status shared view fixture");
+                if (!rel || !rel->col_shared)
+                    goto cleanup;
+            } else
+                CHECK(col_rel_attach_memory_governor(rel, ref) == 0,
+                    "growth status attach fixture");
+            uint64_t baseline = wl_columnar_memory_reserved(governor);
+            uint64_t retained = rel->retained_reserved_bytes;
+            uint64_t metadata = rel->metadata_reserved_bytes;
+            uint64_t storage_generation = rel->storage_generation;
+            uint64_t view_generation = rel->view_generation;
+            uint32_t capacity = rel->capacity;
+            uint32_t timestamp_capacity = rel->timestamp_capacity;
+            col_rel_t *owner = rel->storage_owner;
+            uint64_t aliases = col_rel_storage_alias_borrow_count(owner);
+            int64_t **columns = rel->columns;
+            bool *shared = rel->col_shared;
+            bool arena_owned = rel->arena_owned;
+            col_delta_timestamp_t *timestamps = rel->timestamps;
+            int64_t *row_copy = malloc((size_t)rows * sizeof(*row_copy));
+            size_t timestamp_bytes = (size_t)rows * sizeof(*timestamps);
+            col_delta_timestamp_t *timestamp_copy = malloc(timestamp_bytes);
+            CHECK(row_copy && timestamp_copy, "growth status snapshot");
+            if (!row_copy || !timestamp_copy) {
+                free(row_copy);
+                free(timestamp_copy);
+                goto cleanup;
+            }
+            memcpy(row_copy, columns[0], (size_t)rows * sizeof(*row_copy));
+            memcpy(timestamp_copy, timestamps, timestamp_bytes);
+            for (unsigned cause = 0; cause < 4; cause++) {
+                wl_columnar_memory_reservation_t padding;
+                wl_columnar_memory_reservation_init(&padding);
+                bool denied = false;
+                uint64_t expected_reserved = baseline;
+                if (cause == 0)
+                    atomic_store_explicit(&governor->usable_bytes,
+                        baseline, memory_order_release);
+                else {
+                    atomic_store_explicit(&governor->usable_bytes,
+                        UINT64_MAX, memory_order_release);
+                    if (cause == 1)
+                        wl_columnar_relation_test_fail_next_prepare_resize();
+                    else if (cause == 2) {
+                        CHECK(wl_columnar_memory_reserve_checked(governor,
+                            UINT64_MAX - baseline, &padding)
+                            == WL_COLUMNAR_MEMORY_ADMISSION_OK
+                            && wl_columnar_memory_commit(&padding, &padding),
+                            "growth overflow padding reservation");
+                        expected_reserved = UINT64_MAX;
+                    } else {
+                        CHECK(wl_columnar_memory_begin_growth(
+                                &rel->retained_reservation, 1u)
+                            == WL_COLUMNAR_MEMORY_ADMISSION_OK,
+                            "growth invalid-state preexisting transition");
+                        expected_reserved = baseline + 1u;
+                    }
+                }
+                int rc = exercise_growth_boundary(rel, boundary, &denied);
+                int expected = cause < 2 ? ENOMEM
+                    : cause == 2 ? EOVERFLOW : EINVAL;
+                if (boundary == 4)
+                    expected = cause == 0
+                        ? WL_COLUMNAR_CONTINUATION_RESERVATION_DENIED
+                        : WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
+                if (rc != expected)
+                    fprintf(stderr,
+                        "growth boundary=%u storage=%u cause=%u rc=%d expected=%d\n",
+                        boundary, storage, cause, rc, expected);
+                CHECK(rc == expected, "growth preserves exact failure cause");
+                CHECK(rel->memory_budget_denial_pending == (cause == 0)
+                    && ((boundary != 0 && boundary != 3)
+                    || denied == (cause == 0)),
+                    "growth reports only current actual budget denial");
+                CHECK(rel->nrows == rows && rel->capacity == capacity
+                    && rel->timestamp_capacity == timestamp_capacity
+                    && rel->columns == columns && rel->timestamps == timestamps
+                    && rel->col_shared == shared &&
+                    rel->arena_owned == arena_owned
+                    && rel->storage_owner == owner
+                    && col_rel_storage_alias_borrow_count(owner) == aliases
+                    && rel->storage_generation == storage_generation
+                    && rel->view_generation == view_generation
+                    && rel->retained_reserved_bytes == retained
+                    && rel->metadata_reserved_bytes == metadata
+                    && memcmp(rel->columns[0], row_copy,
+                    (size_t)rows * sizeof(*row_copy)) == 0
+                    && memcmp(rel->timestamps, timestamp_copy,
+                    timestamp_bytes) == 0
+                    && wl_columnar_memory_reserved(governor) ==
+                    expected_reserved,
+                    "growth refusal preserves complete live image and credit");
+                if (cause == 2)
+                    CHECK(wl_columnar_memory_release(&padding),
+                        "growth overflow padding teardown");
+                if (cause == 3) {
+                    CHECK(atomic_load_explicit(&rel->retained_reservation.state,
+                        memory_order_acquire) ==
+                        WL_COLUMNAR_MEMORY_RESERVATION_REPLACING
+                        && rel->retained_reservation.replacement_bytes == 1u,
+                        "growth failure preserves preexisting reservation transition");
+                    CHECK(wl_columnar_memory_rollback_growth(
+                            &rel->retained_reservation),
+                        "growth invalid-state fixture rollback");
+                }
+                wl_columnar_source_access_reader_t reader = { 0 };
+                CHECK(col_rel_source_reader_acquire(rel, &reader) == 0
+                    && col_rel_source_reader_release(&reader) == 0,
+                    "growth refusal leaves source access reusable");
+            }
+            bool denied = true;
+            CHECK(exercise_growth_boundary(rel, boundary, &denied) == 0
+                && !rel->memory_budget_denial_pending
+                && ((boundary != 0 && boundary != 3) || !denied)
+                && rel->nrows == rows + ((boundary == 1 ||
+                boundary == 3) ? 1u : 0u)
+                && memcmp(rel->columns[0], row_copy,
+                (size_t)rows * sizeof(*row_copy)) == 0
+                && memcmp(rel->timestamps, timestamp_copy,
+                timestamp_bytes) == 0,
+                "growth retry succeeds once and preserves old rows/timestamps");
+            if (boundary == 1 || boundary == 3)
+                CHECK(rel->columns[0][rows] == 91,
+                    "growth retry publishes exactly the requested row");
+            free(row_copy);
+            free(timestamp_copy);
+cleanup:
+            wl_columnar_relation_test_clear_prepare_resize();
+            if (pool) {
+                col_rel_free_contents(rel);
+                delta_pool_destroy(pool);
+            } else
+                col_rel_destroy(rel);
+            col_rel_destroy(source);
+            wl_arena_free(arena);
+            if (ref) {
+                CHECK(wl_columnar_memory_reserved(governor) == 0,
+                    "growth status teardown returns all credit");
+                wl_columnar_memory_governor_ref_release(ref);
+            }
+        }
+    }
+}
+
+static void
+test_timestamp_growth_provenance(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    make_resolution(&resolution, UINT64_MAX);
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    col_rel_t *rel = col_rel_new_auto("timestamp-status", 1);
+    CHECK(ref && rel && col_rel_attach_memory_governor(rel, ref) == 0,
+        "timestamp status fixture");
+    if (!ref || !rel)
+        goto cleanup;
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(ref);
+    uint64_t baseline = wl_columnar_memory_reserved(governor);
+    uint64_t generation = rel->storage_generation;
+    wl_columnar_source_access_writer_t writer = { 0 };
+    CHECK(col_rel_source_writer_acquire(rel, &writer) == 0,
+        "timestamp status writer");
+    atomic_store_explicit(&governor->usable_bytes, baseline,
+        memory_order_release);
+    CHECK(col_rel_enable_timestamps_locked(rel) == ENOMEM
+        && rel->memory_budget_denial_pending,
+        "nested timestamp actual denial");
+    atomic_store_explicit(&governor->usable_bytes, UINT64_MAX,
+        memory_order_release);
+    wl_columnar_memory_reservation_t padding;
+    wl_columnar_memory_reservation_init(&padding);
+    CHECK(wl_columnar_memory_reserve_checked(governor,
+        UINT64_MAX - baseline, &padding) == WL_COLUMNAR_MEMORY_ADMISSION_OK,
+        "timestamp accounting overflow padding");
+    CHECK(col_rel_enable_timestamps_locked(rel) == EOVERFLOW
+        && rel->memory_budget_denial_pending,
+        "nested timestamp keeps local overflow and earlier denial evidence");
+    CHECK(wl_columnar_memory_release(&padding), "timestamp padding release");
+    CHECK(wl_columnar_memory_begin_growth(&rel->retained_reservation, 1)
+        == WL_COLUMNAR_MEMORY_ADMISSION_OK,
+        "timestamp invalid-state setup");
+    CHECK(col_rel_enable_timestamps_locked(rel) == EINVAL
+        && rel->memory_budget_denial_pending,
+        "nested timestamp keeps invalid status and earlier denial evidence");
+    CHECK(wl_columnar_memory_rollback_growth(&rel->retained_reservation),
+        "timestamp invalid-state teardown");
+    wl_columnar_relation_test_fail_next_prepare_resize();
+    CHECK(col_rel_enable_timestamps_locked(rel) == ENOMEM
+        && rel->memory_budget_denial_pending && !rel->timestamps
+        && rel->timestamp_capacity == 0
+        && rel->storage_generation == generation
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "nested allocator failure keeps earlier operation evidence and image");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "timestamp status writer release");
+    CHECK(col_rel_enable_timestamps(rel) == 0
+        && !rel->memory_budget_denial_pending && rel->timestamps
+        && rel->timestamp_capacity == rel->capacity,
+        "outer timestamp retry clears earlier operation denial");
+cleanup:
+    col_rel_destroy(rel);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "timestamp status teardown");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_no_growth_admission_provenance(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    make_resolution(&resolution, UINT64_MAX);
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    col_rel_t *rel = col_rel_new_auto("existing-grid", 1);
+    CHECK(ref && rel && col_rel_attach_memory_governor(rel, ref) == 0,
+        "no-growth status fixture");
+    if (!ref || !rel)
+        goto cleanup;
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(ref);
+    /* Model the supported legacy unadmitted-payload state without changing
+     * physical buffers, metadata or governor ownership. */
+    CHECK(wl_columnar_memory_release(&rel->retained_reservation),
+        "no-growth fixture unadmits only the payload token");
+    rel->retained_reserved_bytes = 0;
+    uint64_t baseline = wl_columnar_memory_reserved(governor);
+    uint64_t generation = rel->storage_generation;
+    int64_t **columns = rel->columns;
+    bool denied = false;
+    atomic_store_explicit(&governor->usable_bytes, baseline,
+        memory_order_release);
+    CHECK(col_rel_reserve_capacity_admitted(rel, rel->capacity, &denied)
+        == ENOMEM && denied && rel->memory_budget_denial_pending,
+        "no-growth sets accurate denial output and relation evidence");
+    atomic_store_explicit(&governor->usable_bytes, UINT64_MAX,
+        memory_order_release);
+    wl_columnar_memory_reservation_t padding;
+    wl_columnar_memory_reservation_init(&padding);
+    CHECK(wl_columnar_memory_reserve_checked(governor,
+        UINT64_MAX - baseline, &padding) == WL_COLUMNAR_MEMORY_ADMISSION_OK,
+        "no-growth overflow padding");
+    CHECK(col_rel_reserve_capacity_admitted(rel, rel->capacity, &denied)
+        == EOVERFLOW && !denied && !rel->memory_budget_denial_pending,
+        "no-growth accounting overflow is not budget denial");
+    CHECK(wl_columnar_memory_release(&padding), "no-growth padding release");
+    rel->timestamp_capacity = 1;
+    CHECK(col_rel_reserve_capacity_admitted(rel, rel->capacity, &denied)
+        == EINVAL && !denied && !rel->memory_budget_denial_pending,
+        "no-growth malformed timestamp rejected without allocation");
+    rel->timestamp_capacity = 0;
+    wl_columnar_relation_test_fail_next_reservation_commit();
+    CHECK(col_rel_reserve_capacity_admitted(rel, rel->capacity, &denied)
+        == ENOMEM && !denied && !rel->memory_budget_denial_pending
+        && rel->columns == columns && rel->storage_generation == generation
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "no-growth publication failure preserves unadmitted image");
+    CHECK(col_rel_reserve_capacity_admitted(rel, rel->capacity, &denied)
+        == 0 && !denied && !rel->memory_budget_denial_pending
+        && rel->columns == columns && rel->storage_generation == generation,
+        "no-growth retry admits same physical image");
+    wl_columnar_source_access_writer_t writer = { 0 };
+    bool alias_pending = false;
+    CHECK(col_rel_source_writer_acquire(rel, &writer) == 0,
+        "row-count overflow writer");
+    CHECK(col_rel_reserve_rows_locked(rel, UINT32_MAX, &writer,
+        &alias_pending) == EOVERFLOW && !alias_pending,
+        "locked reserve reports capacity arithmetic overflow before allocation");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "row-count overflow writer release");
+cleanup:
+    col_rel_destroy(rel);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "no-growth status teardown");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
 int
 main(void)
 {
+    test_timestamp_growth_provenance();
+    test_no_growth_admission_provenance();
+    test_growth_error_provenance();
     test_dedup_attach_init_growth_and_clear();
     test_dedup_full_probe_and_malformed_shape();
     test_dedup_replacement_overlap();
