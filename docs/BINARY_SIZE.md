@@ -1,13 +1,16 @@
 # Binary size monitoring and admission
 
-`tests/baseline_size.txt` records the current canonical Ubuntu x86_64 GCC
-measurement (387391 bytes), from source revision
-`4643796d77aa145e31919352b77e1099e1427e51`. The value is tied to the main
-CI artifact in
-`tests/baseline_size.provenance.json` and is accepted only after the verifier
-reproduces the profile and `.text` size from that source. The artifact digest
-and reported library digest remain cross-checked against the sidecar; a rebuilt
-library may have different non-`.text` bytes due to LTO metadata.
+`tests/baseline_size.txt` records 404282 bytes, the canonical Ubuntu x86_64
+GCC `.text` measurement from PR #1961's reviewed production size job at source
+revision `418116cf14e915f6391082ea37b2884b67edd960`. This is a one-time,
+maintainer-approved baseline reset based on that reproducible measurement; it
+does not reduce the binary's size. Its exact PR, base, merge, run, job, log,
+profile, prior baseline, and measurement values are pinned in
+`tests/baseline_size.provenance.json`. The verifier accepts the record only
+after checking those identities and reproducing the canonical profile and
+`.text` size. The fixed 5120-byte allowance is unchanged, so the resulting
+maximum is 409402 bytes. A rebuilt library may have different non-`.text`
+bytes due to LTO metadata.
 
 The production limit remains 5120 bytes. PR CI compares the production shared
 library from the exact `pull_request.base.sha` tree with the library from the
@@ -40,8 +43,8 @@ the failed full build successful.
 
 ## Baseline updates
 
-Do not replace the baseline with a local build measurement. A numeric update is
-accepted only when its sidecar identifies a report artifact from a successful
+Do not replace the baseline with a local build measurement. Normally, a numeric
+update is accepted only when its sidecar identifies a report artifact from a successful
 `ci-main.yml` push run in this repository, the source commit is the PR base or
 an earlier ancestor, the Actions artifact digest and report agree with the sidecar, and
 the current runner can reproduce the profile and section size from that
@@ -52,7 +55,10 @@ narrow later-full-build failure case described above. A candidate baseline can
 grant additional budget only when the verified measurement comes from an eligible
 main revision distinct from the candidate. If artifact access, toolchain
 reproduction, or provenance validation fails, the update is rejected. No
-workflow writes or commits baseline changes.
+workflow writes or commits baseline changes. The only reviewed-PR exceptions
+are the exact, one-time records for PRs #1959 and #1961 embedded in the verifier;
+each is restricted to its recorded measurement and repair paths. They grant no
+general PR-based baseline eligibility and retain the same 5120-byte allowance.
 
 Required PR check/job names are unchanged. The main monitoring step remains
 non-blocking and the repository grants no write permission for this process.
