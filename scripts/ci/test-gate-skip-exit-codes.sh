@@ -138,30 +138,76 @@ check-release-template.sh
 # --- coverage: a gate added later cannot slip through -----------------------
 # Every check-*.sh that tests/meson.build runs must be listed above. Without
 # this the file silently stops covering the tree it claims to.
-uncovered=""
-found=0
-while IFS= read -r script; do
-    found=$((found + 1))
-    # The one pipeline left in this file, and safe in the direction that
-    # matters: the list is ~20 short lines, printf is a builtin, and a spurious
-    # non-zero adds to $uncovered and FAILS. Fail-closed, unlike skip_then_zero,
-    # which was fail-open and is why that one has no pipeline at all.
-    printf '%s\n' "$COVERED$EXEMPT" | grep -qxF "$script" || uncovered="$uncovered $script"
-done < <(grep -oE "scripts/[A-Za-z0-9_/-]+\.sh" "$root/tests/meson.build" \
-             | sed 's|.*/||' | grep -Ei '^check[_-]' | sort -u)
-# A floor, because "nothing uncovered" and "scanned nothing" are otherwise the
-# same result: replacing every path in tests/meson.build with a spelling the
-# scan cannot match made this report ok with rc 0. A restructure of how those
-# paths are written would have retired the guard silently.
-if (( found < 15 )); then
-    printf 'test-gate-skip-exit-codes: FAIL coverage scan found only %d check scripts in tests/meson.build (expected at least 15); the scan or the file has changed shape\n' "$found" >&2
-    failures=$((failures + 1))
-elif [[ -n "$uncovered" ]]; then
-    printf 'test-gate-skip-exit-codes: FAIL meson runs check scripts absent from COVERED/EXEMPT:%s\n' "$uncovered" >&2
-    failures=$((failures + 1))
-else
+check_coverage() {
+    local meson_file=$1 registry=$2 uncovered="" found=0 script
+    while IFS= read -r script; do
+        found=$((found + 1))
+        # A matching grep -q can close its input early. A here-string avoids
+        # an upstream printf whose SIGPIPE would look like missing coverage.
+        grep -qxF -- "$script" <<<"$registry" || uncovered="$uncovered $script"
+    done < <(grep -oE "scripts/[A-Za-z0-9_/-]+\.sh" "$meson_file" \
+                 | sed 's|.*/||' | grep -Ei '^check[_-]' | sort -u)
+    # Distinguish a complete registry from a scan that no longer finds paths.
+    if (( found < 15 )); then
+        printf 'test-gate-skip-exit-codes: FAIL coverage scan found only %d check scripts in tests/meson.build (expected at least 15); the scan or the file has changed shape\n' "$found" >&2
+        return 1
+    elif [[ -n "$uncovered" ]]; then
+        printf 'test-gate-skip-exit-codes: FAIL meson runs check scripts absent from COVERED/EXEMPT:%s\n' "$uncovered" >&2
+        return 1
+    fi
     printf 'test-gate-skip-exit-codes: ok every meson-registered check script is covered or exempted (%d scanned)\n' "$found"
-fi
+}
+check_coverage "$root/tests/meson.build" "$COVERED$EXEMPT" || failures=$((failures + 1))
+
+# Exercise the same scanner and membership path using owned registration files.
+# The large registry controls the writer/reader failure mechanism; it does not
+# reproduce the original hosted failure with the small real registry.
+coverage_fixture="$tmp/coverage-meson.build"
+: >"$coverage_fixture"
+coverage_count=0
+for name in $COVERED; do
+    printf "find_program('scripts/ci/%s')\n" "$name" >>"$coverage_fixture"
+    coverage_count=$((coverage_count + 1))
+    (( coverage_count < 14 )) || break
+done
+printf "find_program('scripts/ci/check-changelog-rc.sh')\n" >>"$coverage_fixture"
+expect_status 'coverage accepts covered and exempt registrations' 0 \
+    check_coverage "$coverage_fixture" "$COVERED$EXEMPT"
+
+printf -v coverage_padding '%*s' 1048576 ''
+coverage_large="$COVERED$EXEMPT$coverage_padding"
+expect_status 'coverage accepts early entries with a large trailing registry' 0 \
+    check_coverage "$coverage_fixture" "$coverage_large"
+
+coverage_unknown="$tmp/coverage-unknown.build"
+cp "$coverage_fixture" "$coverage_unknown"
+printf "find_program('scripts/ci/check-unlisted-fixture.sh')\n" >>"$coverage_unknown"
+expect_status 'coverage rejects an unlisted registration' 1 \
+    check_coverage "$coverage_unknown" "$COVERED$EXEMPT"
+expect_says 'coverage names the unlisted registration' \
+    'absent from COVERED/EXEMPT: check-unlisted-fixture.sh'
+expect_status 'large coverage registry still rejects an unlisted registration' 1 \
+    check_coverage "$coverage_unknown" "$coverage_large"
+expect_says 'large coverage names the unlisted registration' \
+    'absent from COVERED/EXEMPT: check-unlisted-fixture.sh'
+
+coverage_near="$COVERED$EXEMPT"$'prefix-check-unlisted-fixture.sh-suffix\n'
+expect_status 'coverage requires a whole registry line' 1 \
+    check_coverage "$coverage_unknown" "$coverage_near"
+expect_says 'coverage rejects an embedded-only name' \
+    'absent from COVERED/EXEMPT: check-unlisted-fixture.sh'
+expect_status 'large coverage requires a whole registry line' 1 \
+    check_coverage "$coverage_unknown" "$coverage_near$coverage_padding"
+expect_says 'large coverage rejects an embedded-only name' \
+    'absent from COVERED/EXEMPT: check-unlisted-fixture.sh'
+
+coverage_short="$tmp/coverage-short.build"
+printf "find_program('scripts/ci/check-abi-symbols.sh')\n" >"$coverage_short"
+expect_status 'coverage rejects a scan below its floor' 1 \
+    check_coverage "$coverage_short" "$COVERED$EXEMPT"
+expect_says 'coverage reports the scan floor' \
+    'coverage scan found only 1 check scripts in tests/meson.build (expected at least 15)'
+unset coverage_padding coverage_large coverage_near
 
 # --- source-level backstop --------------------------------------------------
 # A branch that prints SKIP and then exits 0 within the next SIX lines. Matches
