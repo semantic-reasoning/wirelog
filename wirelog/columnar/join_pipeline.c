@@ -165,6 +165,7 @@ pipeline_sink_reserve(void *context, uint64_t bytes, uint32_t rows)
     wl_join_pipeline_sink_t *sink = (wl_join_pipeline_sink_t *)context;
     uint64_t need;
     int rc;
+    bool denied = false;
 
     (void)bytes;
     if (!sink || !sink->begun || !sink->out)
@@ -173,12 +174,21 @@ pipeline_sink_reserve(void *context, uint64_t bytes, uint32_t rows)
     if (need > UINT32_MAX)
         return WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
     rc = col_rel_reserve_capacity_admitted(sink->out, (uint32_t)need,
-            NULL);
+            &denied);
     if (rc == 0)
         return WL_COLUMNAR_CONTINUATION_OK;
-    return rc == ENOMEM ? WL_COLUMNAR_CONTINUATION_RESERVATION_DENIED
+    return rc == ENOMEM && denied ? WL_COLUMNAR_CONTINUATION_RESERVATION_DENIED
                         : WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
 }
+
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+wl_columnar_continuation_status_t
+wl_columnar_join_pipeline_test_reserve(col_rel_t *out, uint32_t rows)
+{
+    wl_join_pipeline_sink_t sink = { .out = out, .begun = true };
+    return pipeline_sink_reserve(&sink, 0, rows);
+}
+#endif
 
 static wl_columnar_continuation_status_t
 pipeline_sink_append(void *context,
