@@ -2300,6 +2300,131 @@ test_tdd_reset_restore_transaction(void)
 #endif
 
 #ifdef WL_TEST_TDD_MERGE
+static void
+test_tdd_merge_growth_admission(void)
+{
+    TEST("TDD merge preserves post-clone growth admission errors");
+    col_rel_t *target = col_rel_new_auto("r", 2);
+    col_rel_t *worker = col_rel_new_auto("r", 2);
+    col_rel_t *probe = NULL;
+    col_rel_t *workers[] = { worker };
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    wl_columnar_memory_governor_t *governor = NULL;
+    wl_col_session_t coord = { 0 };
+    bdx_seed_snapshot_t snapshot;
+    const char *failure = NULL;
+    uint64_t baseline = 0, clone_limit = 0;
+    uint32_t rows = 0;
+    int rc;
+#define MERGE_CHECK(condition, message) \
+        do { \
+            if (!(condition)) { \
+                failure = message; \
+                goto cleanup; \
+            } \
+        } while (0)
+    resolution.budget_bytes = UINT64_C(1) << 24;
+    resolution.usable_bytes = resolution.budget_bytes;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    MERGE_CHECK(ref && target && worker, "fixture");
+    governor = wl_columnar_memory_governor_ref_get(ref);
+    coord.memory_governor = ref;
+    MERGE_CHECK(col_rel_attach_memory_governor(target, ref) == 0,
+        "attach governor");
+    int64_t first[] = { 0, 0 };
+    MERGE_CHECK(col_rel_append_row(target, first) == 0, "first row");
+    rows = target->capacity;
+    for (uint32_t i = 1; i < rows; i++) {
+        int64_t row[] = { i, i };
+        MERGE_CHECK(col_rel_append_row(target, row) == 0, "fill capacity");
+    }
+    int64_t extra[] = { rows, rows };
+    MERGE_CHECK(col_rel_append_row(worker, extra) == 0
+        && target->nrows == target->capacity && !target->timestamps,
+        "growth boundary");
+    capture_bdx_seed_snapshot(target, &snapshot);
+    baseline = wl_columnar_memory_reserved(governor);
+
+    /* Derive the cap from real charges, then prove that cloning still
+     * succeeds at that exact cap. Only the subsequent append is denied. */
+    MERGE_CHECK(wl_columnar_relation_deep_copy_governed(target, &probe,
+        ref) == 0, "measure clone");
+    clone_limit = wl_columnar_memory_reserved(governor);
+    col_rel_destroy(probe);
+    probe = NULL;
+    MERGE_CHECK(wl_columnar_memory_reserved(governor) == baseline,
+        "probe release");
+    atomic_store_explicit(&governor->usable_bytes, clone_limit,
+        memory_order_release);
+    MERGE_CHECK(wl_columnar_relation_deep_copy_governed(target, &probe,
+        ref) == 0 && probe->nrows == rows && probe->capacity == rows,
+        "clone must fit constrained budget");
+    rc = col_rel_append_all(probe, worker, NULL);
+    MERGE_CHECK(rc == ENOMEM && probe->memory_budget_denial_pending,
+        "append must hit admission boundary");
+    col_rel_destroy(probe);
+    probe = NULL;
+    MERGE_CHECK(wl_columnar_memory_reserved(governor) == baseline,
+        "failed probe release");
+
+    /* Both coordinator and relation-only callers must retain provenance. */
+    for (unsigned with_coord = 0; with_coord < 2; with_coord++) {
+        coord.memory_budget_denied = false;
+        rc = with_coord
+            ? wl_columnar_eval_test_tdd_merge_with_coord(&coord, &target,
+                workers, 1)
+            : wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+        MERGE_CHECK(rc == ENOSPC
+            && coord.memory_budget_denied == (with_coord != 0),
+            "growth refusal lost budget provenance");
+        MERGE_CHECK(bdx_seed_snapshot_unchanged(target, &snapshot)
+            && wl_columnar_memory_reserved(governor) == baseline,
+            "growth refusal changed target or leaked reservation");
+        for (uint32_t i = 0; i < rows; i++)
+            MERGE_CHECK(target->columns[0][i] == i
+                && target->columns[1][i] == i, "rollback rows");
+    }
+
+    atomic_store_explicit(&governor->usable_bytes, resolution.usable_bytes,
+        memory_order_release);
+    coord.memory_budget_denied = false;
+    wl_columnar_eval_test_tdd_merge_fail_worker(0);
+    rc = wl_columnar_eval_test_tdd_merge_with_coord(&coord, &target,
+            workers, 1);
+    MERGE_CHECK(rc == ENOMEM && !coord.memory_budget_denied
+        && bdx_seed_snapshot_unchanged(target, &snapshot)
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "ordinary allocation failure misclassified");
+    MERGE_CHECK(wl_columnar_eval_test_tdd_merge_with_coord(&coord, &target,
+        workers, 1) == 0 && !coord.memory_budget_denied
+        && target->nrows == rows + 1, "retry with sufficient budget");
+    for (uint32_t i = 0; i <= rows; i++)
+        MERGE_CHECK(target->columns[0][i] == i
+            && target->columns[1][i] == i, "retry rows");
+    MERGE_CHECK(worker->nrows == 1 && worker->columns[0][0] == rows
+        && worker->columns[1][0] == rows, "worker changed");
+cleanup:
+    col_rel_destroy(probe);
+    col_rel_destroy(target);
+    col_rel_destroy(worker);
+    if (ref) {
+        if (wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) != 0 && !failure)
+            failure = "reservation leak";
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef MERGE_CHECK
+}
+
 static int
 test_tdd_merge_transactional_publication(void)
 {
@@ -5408,6 +5533,7 @@ main(void)
     test_tdd_reset_restore_transaction();
 #endif
 #ifdef WL_TEST_TDD_MERGE
+    test_tdd_merge_growth_admission();
     test_tdd_merge_transactional_publication();
     test_tdd_merge_schema_mismatch_rollback();
     test_candidate_timestamp_order(true);
