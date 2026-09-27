@@ -3,20 +3,17 @@
 The scheduled `perf-nightly` workflow has two different responsibilities:
 
 * `perf-stable` is the required execution and correctness lane. It runs on
-  `ubuntu-latest`, executes the pinned DOOP workload with `W=8` and
+  `[self-hosted, Linux, X64, wirelog-perf]`, executes the pinned DOOP workload with `W=8` and
   `repeat=5`, and fails for missing data, an oracle or manifest mismatch,
   incorrect tuple/iteration sentinels, an incomplete result, or a non-zero
   benchmark exit.
-* A provisioned runner may additionally use
-  `WIRELOG_DOOP_PERF_MODE=strict-stable` to enforce cpufreq and a calibrated
-  five-repetition median target. That mode is not used by the hosted lane,
-  because a GitHub-hosted runner does not provide stable CPU-frequency or
-  affinity guarantees.
+* The dedicated runner uses `WIRELOG_DOOP_PERF_MODE=strict-stable` to enforce
+  cpufreq and a calibrated five-repetition median target.
 
-Hosted timing is therefore recorded as `timing=advisory` in the DOOP result
+Dedicated-runner timing is recorded as `timing=enforced` in the DOOP result
 and in the retained `perf-doop-evidence` artifact. A configured
-`WL_DOOP_PERF_GATE_TARGET_MS` is recorded for comparison but is not treated as
-a stable-runner regression threshold in hosted mode. The artifact retains the
+`WL_DOOP_PERF_GATE_TARGET_MS` is enforced as the stable-runner regression
+threshold. The artifact retains the
 candidate commit, workflow run, runner image, permitted CPU affinity, governor
 observation, oracle row, facts manifest, raw Meson log, and the requested
 `workers=8` / `repeat=5` contract.

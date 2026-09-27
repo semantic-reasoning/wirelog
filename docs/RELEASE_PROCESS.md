@@ -358,10 +358,11 @@ documented stable-runner contract and use `WIRELOG_PERF_REQUIRE=1` with
 `scripts/ci/check-perf-gate-execution.sh`.
 
 DOOP is a separate mandatory execution contract for issue #1351:
-`perf-nightly` runs the pinned dataset at W=8/repeat=5 on `ubuntu-latest`,
-rejects missing or skipped correctness evidence, and retains the raw log and
-host/oracle evidence. Its hosted timing is explicitly advisory until a
-strict-stable calibration exists; see `docs/DOOP_PERF_BASELINE.md`.
+`perf-nightly` runs the pinned dataset at W=8/repeat=5 on the
+`[self-hosted, Linux, X64, wirelog-perf]` runner, rejects missing or skipped
+correctness evidence, and retains the raw log and host/oracle evidence. Its
+timing uses the strict-stable calibrated target; see
+`docs/DOOP_PERF_BASELINE.md`.
 
 Current enforcement is correctness sentinels plus median/mean/stdev/CoV
 reporting with a CoV <= 5% noise ceiling.  There is no absolute

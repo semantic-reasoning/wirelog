@@ -9,12 +9,12 @@ name: Perf Nightly
 #   means regressions can slip to main. Nightly is the compromise.
 #
 # Runners:
-#   ubuntu-latest   - GCC; sets cpufreq governor to performance via
-#                     cpupower if available, pins to CPU 0 via taskset.
+#   wirelog-perf    - self-hosted Linux x64 GCC runner; sets cpufreq governor
+#                     to performance when available and pins to CPU 0.
 #   windows-latest  - MSVC; bench_stability_prep() in the test handles
 #                     thread affinity + HIGH_PRIORITY_CLASS internally.
 #
-# Both runners are shared GitHub-hosted boxes. The coefficient-of-
+# The Windows runner is shared GitHub-hosted. The coefficient-of-
 # variation self-check inside test_log_perf_gate converts noisy runs
 # to SKIP (exit 77) instead of FAIL, so background load never produces
 # a false regression signal. When the gate actually FAILs, it means
@@ -52,16 +52,18 @@ permissions:
 jobs:
   perf:
     name: Perf / ${{ matrix.os }} / ${{ matrix.compiler }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ fromJSON(matrix.runner) }}
     continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: linux
+            runner: '["self-hosted", "Linux", "X64", "wirelog-perf"]'
             compiler: gcc
             cc: gcc
-          - os: windows-latest
+          - os: windows
+            runner: '["self-hosted", "Windows", "X64", "windows-latest", "wirelog-perf"]'
             compiler: msvc
             cc: cl
 
@@ -82,11 +84,8 @@ jobs:
       - name: Set up Meson 1.12.0
         uses: ./.github/actions/setup-meson
 
-      # Best-effort: request the 'performance' cpufreq governor. On
-      # GitHub's ubuntu-latest the governor is usually already
-      # 'performance' or 'schedutil'; if it is not and cpupower cannot
-      # set it (no permission / no governor driver), the test will SKIP
-      # with a diagnostic rather than FAIL.
+      # Request the performance governor on the provisioned runner. The
+      # required gate below fails if the runner cannot provide it.
       - name: Set cpufreq governor (Linux, best-effort)
         if: runner.os == 'Linux'
         continue-on-error: true
@@ -297,13 +296,11 @@ jobs:
           retention-days: 35
 
   # Authoritative DOOP execution for issue #1351.  The execution and
-  # correctness contract must run even when no dedicated runner is available.
-  # Hosted-runner timing is explicitly advisory; strict governor/threshold
-  # enforcement remains available through run-doop-perf-gate.sh's
-  # `strict-stable` mode for a future provisioned runner.
+  # Correctness and DOOP timing run on the provisioned perf runner so the
+  # strict governor/threshold contract has stable CPU and affinity semantics.
   perf-stable:
-    name: Perf hosted runner / correctness + DOOP
-    runs-on: ubuntu-latest
+    name: Perf wirelog-perf / correctness + DOOP
+    runs-on: [self-hosted, Linux, X64, wirelog-perf]
     steps:
       - uses: actions/checkout@v5
 
@@ -315,7 +312,7 @@ jobs:
       - name: Set up Meson 1.12.0
         uses: ./.github/actions/setup-meson
 
-      - name: Verify hosted DOOP capacity
+      - name: Verify perf runner capacity
         shell: bash
         run: |
           set -euo pipefail
@@ -356,7 +353,7 @@ jobs:
         env:
           WIRELOG_PERF_GATE: '1'
           WIRELOG_PERF_REQUIRE: '1'
-          WIRELOG_DOOP_PERF_MODE: required-hosted
+          WIRELOG_DOOP_PERF_MODE: strict-stable
           WL_DOOP_PERF_GATE_TARGET_MS: ${{ vars.WL_DOOP_PERF_GATE_TARGET_MS }}
         run: |
           doop_affinity=$(taskset -pc $$ | sed 's/.*: //')
@@ -414,7 +411,7 @@ jobs:
           affinity=$(taskset -pc $$ | sed 's/.*: //')
           governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor \
             2>/dev/null || echo unavailable)
-          printf '{\n  "commit": "%s",\n  "workflow": "%s",\n  "run_id": "%s",\n  "runner_os": "%s",\n  "runner_arch": "%s",\n  "runner_image": "%s",\n  "cpu_count": %s,\n  "affinity": "%s",\n  "governor": "%s",\n  "workers": 8,\n  "repeat": 5,\n  "mode": "required-hosted",\n  "timing": "advisory"\n}\n' \
+          printf '{\n  "commit": "%s",\n  "workflow": "%s",\n  "run_id": "%s",\n  "runner_os": "%s",\n  "runner_arch": "%s",\n  "runner_image": "%s",\n  "cpu_count": %s,\n  "affinity": "%s",\n  "governor": "%s",\n  "workers": 8,\n  "repeat": 5,\n  "mode": "strict-stable",\n  "timing": "enforced"\n}\n' \
             "$commit" "$GITHUB_WORKFLOW" "$GITHUB_RUN_ID" "$RUNNER_OS" \
             "$RUNNER_ARCH" "${ImageOS:-unknown}" "$(nproc --all)" \
             "$affinity" "$governor" > perf-artifacts/doop/host.json
