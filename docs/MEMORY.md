@@ -908,9 +908,23 @@ and disposal errors keep their existing precedence. Only a private output's
 confirmed denial flag converts a collapsed growth `ENOMEM` into `ENOSPC`;
 shared growth overflow/invalid-state propagation is tracked separately in #1991.
 
-This is CONCAT, VARIABLE empty-output, MAP and REDUCE result coverage, not
-completion of all temporary admission (#1978/#1369). LFTJ and borrowed CONS output
-paths still need audit and integration. Eval-entry segment boundaries and other
+Borrowed CONS copies also select the session governor before the source
+fallback and hold a source reader through schema/row capture. Governed copies
+use the checked consolidation workspace for segmented and unsegmented input,
+including hash scratch for large inputs. Copy or consolidation refusal captures
+actual budget evidence before cleanup, returns `ENOSPC`, and restores the full
+borrowed entry and segment metadata. Allocator failure stays `ENOMEM`. If
+checked destruction refuses, the private copy remains the owned retry entry;
+the original source stays unchanged. Timestamped borrowed copies follow the
+same failure contract and retain signed timestamp representatives. Successful
+publication preserves entry metadata and releases the consumed segment array.
+Unmanaged routing and owned-input cleanup retain their existing behavior.
+
+This is CONCAT, VARIABLE empty-output, MAP, REDUCE and borrowed CONS result
+coverage, not completion of all temporary admission (#1978/#1369). LFTJ still
+needs audit and integration. Raw radix scratch for owned/general callers and
+shared workspace error typing remain tracked separately in #1993. Eval-entry
+segment boundaries and other
 auxiliary metadata/scratch need lifetime accounting through their actual free
 sites; they are not covered by CONCAT's relation reservation or excluded from
 the intended budget contract.

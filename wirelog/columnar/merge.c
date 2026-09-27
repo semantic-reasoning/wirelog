@@ -41,6 +41,7 @@
 #ifdef WL_SESSION_TEST_HOOKS
 bool wl_columnar_merge_test_fail_copy_alloc;
 bool wl_columnar_merge_test_fail_copy_append;
+int (*wl_columnar_merge_test_after_cons_copy)(col_rel_t *);
 bool wl_columnar_merge_test_fail_concat_boundaries_alloc;
 #endif
 
@@ -120,7 +121,7 @@ col_op_consolidate_size_add(size_t left, size_t right, size_t *out)
 }
 
 static int
-col_rel_merge_scratch_reserve(const col_rel_t *rel, uint64_t bytes,
+col_rel_merge_scratch_reserve(col_rel_t *rel, uint64_t bytes,
     wl_columnar_memory_reservation_t *reservation)
 {
     wl_columnar_memory_admission_status_t status;
@@ -135,7 +136,11 @@ col_rel_merge_scratch_reserve(const col_rel_t *rel, uint64_t bytes,
     if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
         || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
         return 0;
-    return status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : ENOMEM;
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED) {
+        rel->memory_budget_denial_pending = true;
+        return ENOMEM;
+    }
+    return status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : EINVAL;
 }
 
 static void
@@ -1222,6 +1227,96 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
                seg_count, false);
 }
 
+/* A borrowed input stays untouched until its private candidate has completed
+ * consolidation. Capture denial evidence before checked destruction can erase
+ * it; a refused destruction must retain the candidate as a reachable owner. */
+static int
+wl_columnar_merge_consolidate_borrowed_abort(eval_stack_t *stack,
+    wl_col_session_t *sess, eval_entry_t entry, col_rel_t *copy, int rc)
+{
+    if (rc == ENOMEM && copy && copy->memory_budget_denial_pending)
+        rc = ENOSPC;
+    if (rc == ENOSPC && sess)
+        sess->memory_budget_denied = true;
+    int cleanup_rc = col_rel_destroy_checked(copy);
+    if (cleanup_rc != 0) {
+        entry.rel = copy;
+        entry.owned = true;
+    }
+    stack->items[stack->top++] = entry;
+    return rc != 0 ? rc : cleanup_rc;
+}
+
+static int
+wl_columnar_merge_consolidate_borrowed(eval_stack_t *stack,
+    wl_col_session_t *sess, eval_entry_t entry,
+    wl_columnar_memory_governor_ref_t *governor)
+{
+    col_rel_t *copy = NULL;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    int rc = col_rel_source_reader_acquire(entry.rel, &reader);
+    if (rc != 0)
+        goto failed;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_merge_test_fail_copy_alloc)
+        rc = ENOMEM;
+    else
+#endif
+    rc = wl_columnar_relation_pool_new_like_governed_checked(&copy,
+            sess ? sess->delta_pool : NULL, "$consol", entry.rel, governor);
+    if (rc != 0)
+        goto failed;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_merge_test_fail_copy_append)
+        rc = ENOMEM;
+    else
+#endif
+    rc = col_rel_append_all(copy, entry.rel, NULL);
+    if (rc != 0)
+        goto failed;
+    rc = col_rel_source_reader_release(&reader);
+    if (rc != 0)
+        goto failed;
+
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_merge_test_after_cons_copy) {
+        rc = wl_columnar_merge_test_after_cons_copy(copy);
+        if (rc != 0)
+            goto failed;
+    }
+#endif
+
+    /* The checked engine admits its complete sort workspace. The legacy
+     * unprepared radix path does not yet admit every scratch class (#1993). */
+    uint32_t whole[] = { 0, copy->nrows };
+    const uint32_t *boundaries = whole;
+    uint32_t segments = 1;
+    if (entry.seg_boundaries && entry.seg_count >= 2) {
+        boundaries = entry.seg_boundaries;
+        segments = entry.seg_count;
+    }
+    rc = wl_columnar_merge_consolidate_checked(copy, boundaries, segments,
+            true);
+    if (rc != 0)
+        goto failed;
+    free(entry.seg_boundaries);
+    entry.seg_boundaries = NULL;
+    entry.seg_count = 0;
+    entry.rel = copy;
+    entry.owned = true;
+    stack->items[stack->top++] = entry;
+    return 0;
+
+failed:
+    if (reader.owner) {
+        int release_rc = col_rel_source_reader_release(&reader);
+        if (release_rc != 0)
+            rc = release_rc;
+    }
+    return wl_columnar_merge_consolidate_borrowed_abort(stack, sess, entry,
+               copy, rc);
+}
+
 /* Timestamped SET consolidation shares the checked stable k-way engine.
  * Keep the popped entry intact until success: its original stack slot remains
  * available even when the caller entered with a completely full stack. */
@@ -1258,6 +1353,13 @@ wl_columnar_merge_consolidate_timestamped(eval_stack_t *stack,
         if (rc != 0)
             goto failed;
         work = copy;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_merge_test_after_cons_copy) {
+            rc = wl_columnar_merge_test_after_cons_copy(copy);
+            if (rc != 0)
+                goto failed;
+        }
+#endif
     }
     uint32_t local_boundaries[3] = { 0, work->nrows, work->nrows };
     const uint32_t *boundaries = local_boundaries;
@@ -1287,8 +1389,9 @@ failed:
         if (release_rc != 0)
             rc = release_rc;
     }
-    /* The private copy is never exposed to a reader or another owner. */
-    col_rel_destroy(copy);
+    if (!entry.owned)
+        return wl_columnar_merge_consolidate_borrowed_abort(stack, sess,
+                   entry, copy, rc);
     stack->items[stack->top++] = entry;
     return rc;
 }
@@ -1336,6 +1439,12 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
         return eval_stack_repush_entry(stack, &e);
     }
 
+    wl_columnar_memory_governor_ref_t *governor = sess && sess->memory_governor
+        ? sess->memory_governor : in->memory_governor;
+    if (!e.owned && governor)
+        return wl_columnar_merge_consolidate_borrowed(stack, sess, e,
+                   governor);
+
     /* Sort in-place if we own the relation, otherwise copy first */
     col_rel_t *work = in;
     bool work_owned = e.owned;
@@ -1345,7 +1454,8 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
             wl_columnar_merge_test_fail_copy_alloc
                 ? NULL :
 #endif
-            col_rel_pool_new_like(sess->delta_pool, "$consol", in);
+            col_rel_pool_new_like(sess ? sess->delta_pool : NULL, "$consol",
+                in);
         if (!work) {
             /* Keep the borrowed input and its segment metadata available for
              * a retry after transient allocation pressure. */

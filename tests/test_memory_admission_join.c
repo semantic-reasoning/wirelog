@@ -75,6 +75,7 @@ static bool test_diff_commit_refusal_witnessed;
 
 void wl_columnar_relation_test_fail_next_governed_copy_payload_alloc(void);
 extern bool wl_columnar_join_test_fail_next_key_scratch_alloc;
+extern bool wl_columnar_merge_test_fail_copy_alloc;
 extern int (*wl_columnar_join_test_submit_override)(wl_work_queue_t *,
     void (*)(void *), void *);
 extern uint32_t wl_columnar_join_test_last_keyed_workers;
@@ -3065,6 +3066,333 @@ out:
     destroy_session(sess);
 }
 
+extern int (*wl_columnar_merge_test_after_cons_copy)(col_rel_t *);
+static wl_columnar_source_access_reader_t cons_copy_reader;
+static col_rel_t *cons_refused_copy;
+
+static int
+refuse_cons_copy_cleanup(col_rel_t *copy)
+{
+    wl_columnar_merge_test_after_cons_copy = NULL;
+    cons_refused_copy = copy;
+    int rc = col_rel_source_reader_acquire(copy, &cons_copy_reader);
+    return rc != 0 ? rc : ENOMEM;
+}
+
+static void
+test_borrowed_cons_cleanup_refusal(bool timestamps)
+{
+    TEST("governed CONS retains a cleanup-refused copy as the retry owner");
+    wl_col_session_t *sess = make_session(UINT64_C(1) << 24);
+    col_rel_t *input = col_rel_new_auto("cons-refused", 1);
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    const char *failure = NULL;
+#define OWNER_CHECK(c, m) do { if (!(c)) { failure = m; goto cleanup; \
+                               } } while (0)
+    OWNER_CHECK(sess && input, "cleanup-refusal fixture");
+    int64_t rows[] = { 2, 1, 2 };
+    for (unsigned i = 0; i < 3; i++)
+        OWNER_CHECK(col_rel_append_row(input, &rows[i]) == 0, "source append");
+    if (timestamps)
+        OWNER_CHECK(col_rel_enable_timestamps(input) == 0, "source timestamps");
+    OWNER_CHECK(eval_stack_push(&stack, input, false) == 0, "source push");
+    uint32_t *bounds = malloc(3 * sizeof(*bounds));
+    OWNER_CHECK(bounds, "refusal boundaries");
+    bounds[0] = 0; bounds[1] = 1; bounds[2] = 3;
+    stack.items[0].seg_boundaries = bounds;
+    stack.items[0].seg_count = 2;
+    stack.items[0].is_delta = true;
+    uint64_t baseline = reserved_of(sess), view = input->view_generation;
+    wl_columnar_merge_test_after_cons_copy = refuse_cons_copy_cleanup;
+    OWNER_CHECK(col_op_consolidate(&stack, sess) == ENOMEM
+        && !sess->memory_budget_denied && cons_refused_copy
+        && stack.top == 1 && stack.items[0].rel == cons_refused_copy
+        && stack.items[0].owned && stack.items[0].is_delta
+        && stack.items[0].seg_boundaries == bounds
+        && stack.items[0].seg_count == 2
+        && cons_refused_copy != input && cons_refused_copy->nrows == 3
+        && input->nrows == 3 && input->view_generation == view
+        && input->columns[0][0] == 2 && input->columns[0][1] == 1
+        && input->columns[0][2] == 2
+        && reserved_of(sess) == baseline + relation_charge(cons_refused_copy),
+        "failed cleanup lost owner, original source, primary error or credit");
+    OWNER_CHECK(col_rel_source_reader_release(&cons_copy_reader) == 0,
+        "release refused-copy reader");
+    cons_refused_copy = NULL;
+    OWNER_CHECK(col_op_consolidate(&stack, sess) == 0 && stack.top == 1
+        && stack.items[0].owned && stack.items[0].rel->nrows == 2
+        && stack.items[0].rel->columns[0][0] == 1
+        && stack.items[0].rel->columns[0][1] == 2,
+        "cleanup-refused owner can retry after exclusion clears");
+    OWNER_CHECK(eval_stack_drain(&stack) == 0 && reserved_of(sess) == baseline,
+        "retained-copy final teardown returns credit");
+cleanup:
+    wl_columnar_merge_test_after_cons_copy = NULL;
+    if (cons_copy_reader.owner)
+        (void)col_rel_source_reader_release(&cons_copy_reader);
+    cons_refused_copy = NULL;
+    (void)eval_stack_drain(&stack);
+    col_rel_destroy(input);
+    destroy_session(sess);
+    if (failure) FAIL(failure); else PASS();
+#undef OWNER_CHECK
+}
+
+static int
+cons_probe(wl_col_session_t *sess, col_rel_t *input,
+    wl_columnar_memory_governor_ref_t *governor, unsigned pool_mode,
+    bool segmented, bool copy_only)
+{
+    int rc;
+    col_rel_t *copy = NULL;
+    if (copy_only) {
+        rc = input->timestamps
+            ? wl_columnar_relation_new_like_governed_checked(&copy,
+                "$consol", input, governor)
+            : wl_columnar_relation_pool_new_like_governed_checked(&copy,
+                sess->delta_pool, "$consol", input, governor);
+        if (rc == 0)
+            rc = col_rel_append_all(copy, input, NULL);
+        if (rc == ENOMEM && copy && copy->memory_budget_denial_pending)
+            rc = ENOSPC;
+        col_rel_destroy(copy);
+    } else {
+        eval_stack_t stack;
+        eval_stack_init(&stack);
+        rc = eval_stack_push(&stack, input, false);
+        if (rc == 0 && segmented) {
+            uint32_t *bounds = malloc(3u * sizeof(*bounds));
+            if (!bounds)
+                rc = ENOMEM;
+            else {
+                bounds[0] = 0; bounds[1] = input->nrows / 2u;
+                bounds[2] = input->nrows;
+                stack.items[0].seg_boundaries = bounds;
+                stack.items[0].seg_count = 2;
+            }
+        }
+        if (rc == 0)
+            rc = col_op_consolidate(&stack, sess);
+        int cleanup_rc = eval_stack_drain(&stack);
+        if (cleanup_rc != 0)
+            rc = cleanup_rc;
+    }
+    if (sess->delta_pool) {
+        delta_pool_reset(sess->delta_pool);
+        if (pool_mode == 2)
+            sess->delta_pool->slot_used = sess->delta_pool->slot_cap;
+    }
+    return rc;
+}
+
+static bool
+cons_exact_limit(wl_col_session_t *sess, col_rel_t *input,
+    wl_columnar_memory_governor_ref_t *ref, unsigned pool_mode,
+    bool segmented, bool copy_only, uint64_t baseline, uint64_t *out)
+{
+    uint64_t low = baseline, high = baseline + (UINT64_C(1) << 26);
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(ref);
+    while (low < high) {
+        uint64_t mid = low + (high - low) / 2;
+        atomic_store_explicit(&governor->usable_bytes, mid,
+            memory_order_release);
+        int rc = cons_probe(sess, input, ref, pool_mode, segmented, copy_only);
+        if ((rc != 0 && rc != ENOSPC) || reserved_for(ref) != baseline)
+            return false;
+        if (rc == 0) high = mid; else low = mid + 1u;
+    }
+    *out = high;
+    return true;
+}
+
+static void
+test_borrowed_cons_admission(unsigned governor_mode, unsigned pool_mode,
+    uint32_t nrows, bool segmented, bool timestamps)
+{
+    TEST(
+        "borrowed CONS admits copy and workspace, preserves input and retries");
+    wl_col_session_t *sess = make_session(UINT64_C(1) << 27);
+    wl_columnar_memory_governor_ref_t *saved_ref = NULL, *source_ref = NULL;
+    wl_columnar_memory_governor_ref_t *expected = NULL;
+    col_rel_t *input = col_rel_new_auto("borrowed-cons", 2);
+    col_rel_t *lower = col_rel_new_auto("cons-lower", 1);
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    const char *failure = NULL;
+#define CONS_CHECK(c, m) do { if (!(c)) { failure = m; goto cleanup; \
+                              } } while (0)
+    CONS_CHECK(sess && input && lower, "CONS fixture");
+    saved_ref = sess->memory_governor;
+    if (governor_mode)
+        source_ref = make_governor(UINT64_C(1) << 27);
+    CONS_CHECK(!governor_mode || source_ref, "CONS source governor");
+    expected = governor_mode == 1 ? source_ref : saved_ref;
+    wl_columnar_memory_governor_ref_retain(expected);
+    for (uint32_t i = 0; i < nrows; i++) {
+        int64_t value = (nrows - i) % 7u;
+        int64_t row[] = { value, value + 10 };
+        CONS_CHECK(col_rel_append_row(input, row) == 0, "CONS source rows");
+    }
+    const wirelog_column_type_t types[] = { WIRELOG_TYPE_INT64,
+                                            WIRELOG_TYPE_INT64 };
+    CONS_CHECK(col_rel_set_column_types(input, types, 2) == 0,
+        "CONS schema types");
+    const col_rel_logical_col_t logical[] = {
+        { WIRELOG_COMPOUND_KIND_SIDE, 2, 1 },
+        { WIRELOG_COMPOUND_KIND_NONE, 0, 0 }
+    };
+    CONS_CHECK(col_rel_apply_compound_schema(input, logical, 2) == 0,
+        "CONS compound metadata");
+    input->has_graph_column = true;
+    input->graph_col_idx = 1;
+    if (timestamps) {
+        CONS_CHECK(col_rel_enable_timestamps(input) == 0, "CONS timestamps");
+        for (uint32_t i = 0; i < nrows; i++) {
+            input->timestamps[i].iteration = i + 1u;
+            input->timestamps[i].multiplicity = (int32_t)(i % 3u) - 1;
+        }
+    }
+    CONS_CHECK(col_rel_attach_memory_governor(input,
+        source_ref ? source_ref : saved_ref) == 0, "CONS source admission");
+    if (governor_mode == 1)
+        sess->memory_governor = NULL;
+    delta_pool_destroy(sess->delta_pool);
+    sess->delta_pool = pool_mode
+        ? delta_pool_create_managed(4, sizeof(col_rel_t), 4096,
+            wl_columnar_memory_governor_ref_get(expected)) : NULL;
+    CONS_CHECK(!pool_mode || sess->delta_pool, "CONS admitted pool");
+    if (pool_mode == 2)
+        sess->delta_pool->slot_used = sess->delta_pool->slot_cap;
+    if (governor_mode == 2)
+        atomic_store_explicit(&wl_columnar_memory_governor_ref_get(source_ref)
+            ->usable_bytes, reserved_for(source_ref), memory_order_release);
+    uint64_t baseline = reserved_for(expected);
+    uint64_t source_baseline = reserved_for(source_ref);
+    uint64_t view = input->view_generation, storage = input->storage_generation;
+    int64_t **columns = input->columns;
+    col_delta_timestamp_t *old_timestamps = input->timestamps;
+    uint64_t copy_limit = 0, full_limit = 0;
+    CONS_CHECK(cons_exact_limit(sess, input, expected, pool_mode, segmented,
+        true, baseline, &copy_limit) && copy_limit > baseline,
+        "CONS exact copy admission threshold");
+    CONS_CHECK(cons_exact_limit(sess, input, expected, pool_mode, segmented,
+        false, baseline, &full_limit) && full_limit > copy_limit,
+        "CONS exact additional workspace admission threshold");
+    for (uint32_t i = 0; i < COL_STACK_MAX - 1u; i++)
+        CONS_CHECK(eval_stack_push(&stack, lower, false) == 0,
+            "CONS lower stack control");
+    CONS_CHECK(eval_stack_push(&stack, input, false) == 0, "CONS input push");
+    eval_entry_t *entry = &stack.items[COL_STACK_MAX - 1u];
+    entry->is_delta = true;
+    entry->seg_boundaries = malloc((segmented ? 3u : 2u) * sizeof(uint32_t));
+    CONS_CHECK(entry->seg_boundaries, "CONS entry metadata");
+    entry->seg_boundaries[0] = 0;
+    entry->seg_boundaries[1] = segmented ? nrows / 2u : nrows;
+    if (segmented) entry->seg_boundaries[2] = nrows;
+    entry->seg_count = segmented ? 2u : 1u;
+    eval_entry_t original = *entry;
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(expected);
+    const uint64_t limits[] = { baseline, copy_limit - 1u, full_limit - 1u };
+    for (unsigned phase = 0; phase < 3; phase++) {
+        atomic_store_explicit(&governor->usable_bytes, limits[phase],
+            memory_order_release);
+        sess->memory_budget_denied = false;
+        CONS_CHECK(col_op_consolidate(&stack, sess) == ENOSPC
+            && sess->memory_budget_denied, "CONS budget cause is typed");
+        CONS_CHECK(stack.top == COL_STACK_MAX
+            && stack.items[0].rel == lower
+            && concat_entry_unchanged(entry, &original)
+            && original.seg_boundaries[0] == 0
+            && original.seg_boundaries[segmented ? 2 : 1] == nrows,
+            "CONS failure retains complete full-stack borrowed entry");
+        CONS_CHECK(input->nrows == nrows && input->columns == columns
+            && input->timestamps == old_timestamps
+            && input->view_generation == view &&
+            input->storage_generation == storage
+            && reserved_for(expected) == baseline
+            && (!source_ref || source_ref == expected
+            || reserved_for(source_ref) == source_baseline),
+            "CONS failure preserves source image and both governors");
+        for (uint32_t i = 0; i < nrows; i++) {
+            int64_t value = (nrows - i) % 7u;
+            CONS_CHECK(input->columns[0][i] == value
+                && input->columns[1][i] == value + 10
+                && (!timestamps || (input->timestamps[i].iteration == i + 1u
+                && input->timestamps[i].multiplicity == (int32_t)(i % 3u) - 1)),
+                "CONS unchanged exact source rows and signed timestamps");
+        }
+    }
+    atomic_store_explicit(&governor->usable_bytes, full_limit,
+        memory_order_release);
+    sess->memory_budget_denied = false;
+    wl_columnar_merge_test_fail_copy_alloc = true;
+    int rc = col_op_consolidate(&stack, sess);
+    wl_columnar_merge_test_fail_copy_alloc = false;
+    if (!timestamps)
+        CONS_CHECK(rc == ENOMEM && !sess->memory_budget_denied
+            && concat_entry_unchanged(entry, &original)
+            && reserved_for(expected) == baseline,
+            "CONS copy allocator failure remains distinct");
+    else {
+        /* Timestamped copy uses the checked heap constructor independently
+        * of the legacy plain-copy hook; its success is the retry below. */
+        CONS_CHECK(rc == 0, "timestamp CONS exact-fit retry");
+    }
+    if (!timestamps)
+        CONS_CHECK(col_op_consolidate(&stack, sess) == 0,
+            "CONS exact-fit retry");
+    col_rel_t *out = entry->rel;
+    CONS_CHECK(stack.top == COL_STACK_MAX && entry->owned && entry->is_delta
+        && !entry->seg_boundaries && entry->seg_count == 0
+        && out != input && out->memory_governor == expected && out->nrows == 7u
+        && out->pool_owned == (!timestamps && pool_mode == 1)
+        && out->compound_arity_len == input->compound_arity_len
+        && out->compound_arity_len > 0
+        && memcmp(out->compound_arity_map, input->compound_arity_map,
+        input->compound_arity_len * sizeof(uint32_t)) == 0
+        && out->ncols == 2 && out->has_graph_column && out->graph_col_idx == 1
+        && out->column_types && out->column_types[0] == WIRELOG_TYPE_INT64
+        && out->column_types[1] == WIRELOG_TYPE_INT64
+        && reserved_for(expected) == baseline + relation_charge(out),
+        "CONS publishes one complete admitted result with entry/schema metadata");
+    for (uint32_t i = 0; i < 7u; i++) {
+        CONS_CHECK(out->columns[0][i] == i && out->columns[1][i] == i + 10,
+            "CONS exact canonical tuples");
+        if (timestamps) {
+            uint32_t first = (nrows - i) % 7u;
+            CONS_CHECK(out->timestamps[i].iteration == first + 1u
+                && out->timestamps[i].multiplicity == (int32_t)(first % 3u) - 1,
+                "CONS preserves earliest signed representative");
+        }
+    }
+    CONS_CHECK(eval_stack_drain(&stack) == 0 &&
+        reserved_for(expected) == baseline,
+        "CONS result teardown returns credit");
+cleanup:
+    wl_columnar_merge_test_fail_copy_alloc = false;
+    (void)eval_stack_drain(&stack);
+    col_rel_destroy(input);
+    col_rel_destroy(lower);
+    if (sess && saved_ref)
+        sess->memory_governor = saved_ref;
+    destroy_session(sess);
+    if (source_ref) {
+        if (reserved_for(source_ref) != 0 &&
+            !failure) failure = "source credit leak";
+        wl_columnar_memory_governor_ref_release(source_ref);
+    }
+    if (expected) {
+        if (reserved_for(expected) != 0 &&
+            !failure) failure = "CONS credit leak";
+        wl_columnar_memory_governor_ref_release(expected);
+    }
+    if (failure) FAIL(failure); else PASS();
+#undef CONS_CHECK
+}
+
 static void
 test_diff_consolidate_copy_admission(void)
 {
@@ -4451,6 +4779,18 @@ main(void)
     test_parallel_cross_denial();
     test_small_parallel_cross_is_admitted();
     test_parallel_diff_output_is_governed();
+    for (unsigned mode = 0; mode < 3; mode++) {
+        test_borrowed_cons_admission(mode, mode, 42u, false, false);
+        test_borrowed_cons_admission(mode, mode, 42u, true, false);
+        test_borrowed_cons_admission(mode, mode, COL_REL_INIT_CAP * 2u + 1u,
+            true, false);
+        test_borrowed_cons_admission(mode, mode, 10001u, false, false);
+        test_borrowed_cons_admission(mode, mode, 42u, true, true);
+    }
+    test_borrowed_cons_admission(0, 1, 42u, true, false);
+    test_borrowed_cons_admission(2, 1, 42u, true, false);
+    test_borrowed_cons_cleanup_refusal(false);
+    test_borrowed_cons_cleanup_refusal(true);
     test_diff_consolidate_copy_admission();
     test_parallel_diff_denial();
     test_parallel_diff_true_admission_denial_rolls_back();
