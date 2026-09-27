@@ -205,6 +205,20 @@ wl_columnar_ops_dispose_entry(eval_stack_t *stack, eval_entry_t *entry,
     return rc != 0 ? rc : result;
 }
 
+/* Only admission before row evaluation can safely retry without replaying
+ * extension callbacks. Ordinary failures retain checked-disposal precedence. */
+static int
+wl_columnar_ops_map_admission_failure(eval_stack_t *stack, eval_entry_t *entry,
+    wl_col_session_t *sess, int rc)
+{
+    if (rc == ENOSPC) {
+        sess->memory_budget_denied = true;
+        int restore_rc = eval_stack_repush_entry(stack, entry);
+        return restore_rc != 0 ? restore_rc : rc;
+    }
+    return wl_columnar_ops_dispose_entry(stack, entry, rc);
+}
+
 /* Relation-only operators must reject and destroy a pending continuation. */
 static int
 wl_columnar_ops_reject_null_session(eval_stack_t *stack)
@@ -233,10 +247,12 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         wl_columnar_ops_test_before_map_dispose(stack, &e);
 #endif
 
+    wl_columnar_memory_governor_ref_t *governor = sess->memory_governor
+        ? sess->memory_governor : e.rel->memory_governor;
     uint32_t pc = op->project_count;
     uint64_t map_scratch_bytes = 0;
     uint64_t map_bytes = 0;
-    bool map_sized = wl_columnar_memory_size_mul(pc, sizeof(int64_t),
+    bool map_sized = wl_columnar_memory_size_mul(pc ? pc : 1, sizeof(int64_t),
             &map_bytes)
         && wl_columnar_memory_size_add(map_scratch_bytes, map_bytes,
             &map_scratch_bytes);
@@ -256,22 +272,36 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         return wl_columnar_ops_dispose_entry(stack, &e, EOVERFLOW);
     wl_ops_scratch_t map_scratch;
     int map_scratch_rc = wl_ops_scratch_reserve(&map_scratch,
-            sess ? sess->memory_governor : NULL, map_scratch_bytes, sess);
+            governor, map_scratch_bytes, sess);
     if (map_scratch_rc != 0)
-        return wl_columnar_ops_dispose_entry(stack, &e, map_scratch_rc);
+        return wl_columnar_ops_map_admission_failure(stack, &e, sess,
+                   map_scratch_rc);
 #define WL_MAP_RELEASE_SCRATCH() wl_ops_scratch_release(&map_scratch)
     col_rel_t *out = NULL;
+    int output_rc = ENOMEM;
 #ifdef WL_SESSION_TEST_HOOKS
     if (!wl_columnar_ops_test_map_fail_output_alloc)
 #endif
-    out = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
-            "$map", pc);
-    if (!out)
+    {
+        /* MAP emits exactly one row per input. Admit the complete payload
+         * before invoking any extension callback; no later growth is needed.
+         * Governed outputs own their heap storage independently of pool epochs. */
+        if (governor) {
+            output_rc = wl_columnar_relation_new_auto_governed("$map", pc,
+                    e.rel->nrows, false, governor, &out);
+        } else {
+            out = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
+                    "$map", pc);
+            output_rc = out ? 0 : ENOMEM;
+        }
+    }
+    if (output_rc != 0) {
         WL_MAP_RELEASE_SCRATCH();
-    if (!out)
-        return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
+        return wl_columnar_ops_map_admission_failure(stack, &e, sess,
+                   output_rc);
+    }
 
-    int64_t *tmp = (int64_t *)malloc(sizeof(int64_t) * pc);
+    int64_t *tmp = (int64_t *)malloc(sizeof(int64_t) * (pc ? pc : 1));
     if (!tmp) {
         WL_MAP_RELEASE_SCRATCH();
         col_rel_destroy(out);
@@ -297,7 +327,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                 ce_map[c] = wl_columnar_expr_compile_governed(
                     op->map_exprs[c].data, op->map_exprs[c].size,
                     sess ? sess->intern : NULL,
-                    sess ? sess->memory_governor : NULL, sess, &expr_rc);
+                    governor, sess, &expr_rc);
                 if (expr_rc != ENOTSUP && expr_rc != 0) {
                     for (uint32_t j = 0; j < c; j++)
                         wl_columnar_expr_compiled_free(ce_map[j]);
@@ -305,7 +335,8 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                     free(tmp);
                     col_rel_destroy(out);
                     WL_MAP_RELEASE_SCRATCH();
-                    return wl_columnar_ops_dispose_entry(stack, &e,
+                    return wl_columnar_ops_map_admission_failure(stack, &e,
+                               sess,
                                expr_rc);
                 }
             }
@@ -432,6 +463,8 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         return input_rc;
     }
     int push_rc = eval_stack_push(stack, out, true);
+    if (push_rc != 0)
+        col_rel_destroy(out);
 #undef WL_MAP_RELEASE_SCRATCH
     return push_rc;
 }
