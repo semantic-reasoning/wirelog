@@ -647,7 +647,7 @@ remains distinct from evaluation cancellation. The future public surface must
 provide retained opaque handles, request/configure/reset, completed reports and
 distinct stop errors through both facades, without exposing these internal types.
 
-### Publication-cutoff state map (#1953; step implemented, snapshot pending)
+### Publication-cutoff state map (#1953; both paths implemented)
 
 Rows name fields and functions, never line numbers, for the reason
 `scripts/ci/ownership_doc_anchors.py` records: a line citation rots within
@@ -681,9 +681,12 @@ of opinion.
 Scope: the fields the two evaluating paths commit in their bookkeeping block,
 the one each runs once its strata are done. Where that block sits relative to
 publication is the difference between the paths, and the two bullets below set
-it out. The stable-snapshot fast path is out of scope on purpose: it emits to
-the host callback and returns above that block entirely, so a cutoff placed for
-the evaluating path is not on its route at all, and it needs its own reasoning.
+it out. The stable-snapshot fast path commits none of them. The columns name
+functions, so they cannot separate it from the evaluating path inside
+`col_session_snapshot_impl`; what they do show is why that function appears in
+the read column of `last_removed_relation` and `retraction_seeded` -- its only
+reads of either are the fast path's own guard. It carries a cutoff of its own
+for its own emit rather than relying on one placed for the evaluating path.
 
 The columns credit `col_worker_session_create` only where it overwrites a field
 by name. Its `*out_worker = *coordinator;` mentions no field and is invisible
@@ -711,12 +714,14 @@ So the snapshot cutoff must sit above the bookkeeping, not merely above the
 emit. By the emit that follows the bookkeeping, `has_evaluated`,
 `snapshot_stable_valid` and every `base_nrows` are committed, and no later line
 in `col_session_snapshot_impl` rolls them back. How far above the bookkeeping
-the cutoff may sit is not settled here. The step cutoff sits after compaction
-for a reason its own comment gives -- both shapes carry a resume token across
-it, and cutting earlier would leave a stopped plain step with no token -- and
-that reason does not transfer: the snapshot path sets no such token, so no
-token is lost by stopping earlier, and compacting twice is harmless by that
-same comment. So nothing there makes an earlier stop a correctness error.
+it sits is settled now that the cutoff exists: above `col_rel_compact_many` as
+well. The step cutoff sits after compaction for a reason its own comment gives
+-- both shapes carry a resume token across it, and cutting earlier would leave
+a stopped plain step with no token -- and that reason does not transfer,
+because the snapshot path sets no such token. What settles it instead is the
+converse: compaction can return `EBUSY`, and `wl_evaluation_control_finish`
+prefers a non-zero execution status over `control->stop`, so compacting first
+would report that failure for an attempt the caller asked to cancel.
 
 Cost varies across that range, but not in a way that picks a placement, and the
 reason is worth stating because two earlier drafts of this paragraph got it
@@ -765,23 +770,33 @@ an earlier revision summarised it here and got it wrong within one round.
 
 Two non-field actions sit in the same region and need their own verdicts.
 `col_session_reclaim_quiescent` is **COMMIT**: the step cutoff's unwind calls
-it, as the stratum- and compaction-failure unwinds beside it do, and it
-releases mat-cache pins before any ledger test -- though it returns earlier
-still when the session has retained cleanup outstanding, so it is not
-unconditional, and several other unwinds in both paths do skip it.
-`col_session_mem_sample`, which the snapshot path runs between its bookkeeping
-and its emit, has no verdict yet: it sets a gauge that
-`col_session_reclaim_quiescent` later tests, so a snapshot cutoff that skips
-the sample and commits the reclaim would test a gauge that predates this
-evaluation's growth. Settle it in the snapshot unit.
+it, as the stratum- and compaction-failure unwinds beside it do, and both
+snapshot cutoffs do the same. It releases mat-cache pins before any ledger test
+-- though it returns earlier still when the session has retained cleanup
+outstanding, so it is not unconditional, and several other unwinds in both
+paths do skip it. `col_session_mem_sample` is **PRESERVE**: no cutoff performs
+it, and none should. The worry that deferred that verdict -- that reclaiming on
+a gauge the sample would have refreshed tests a stale one -- does not survive
+the mechanics. The gauges are absolute rather than accumulated, so the next
+sample recomputes them; evaluation calls the sample already, from
+`eval_serial.c`, `eval.c` and `eval_delta.c`, on any route where a stratum ran;
+and the reclaim risks at most a missed eviction of recomputable cache entries,
+or one it did not need.
 
-What the snapshot cutoff adds to the contract above: that clause defers a stop
-arriving *after publication starts*. A snapshot stop between the bookkeeping
-and the emit arrives before publication, and is deferred because the
-bookkeeping cannot be rolled back. So the snapshot path's point of no return is
-earlier than publication, and the clause's "before observable tuple/delta
-publication" wording under-specifies it -- it must name the bookkeeping commit
-when the snapshot unit lands.
+What the snapshot cutoffs add to the contract above: that clause defers a stop
+arriving *after publication starts*, and on the evaluating path the point of no
+return is earlier than publication, because the bookkeeping commits before the
+emit and cannot be rolled back. So read the clause as naming the bookkeeping
+commit rather than the emit on that path; the stable fast path commits nothing,
+so for it the clause means what it says. Neither cutoff is a claim about
+streaming, and the gap there is narrower than "a `delta_cb` fires during the
+strata" suggests: `wl_columnar_delta_events_publish` has one caller, inside
+`col_stratum_step_with_delta`, whose only production caller is
+`col_session_step_impl` -- its other caller is a retraction helper still marked
+`UNUSED`, reached only by a test hook. So the one route by which a snapshot
+streams is the plain-step drain, and that returns through the step path's own
+cutoff. What is genuinely unpolled is the fixpoint itself -- nothing in
+`eval*.c` charges -- and that is the operator-checkpoint item, not this one.
 
 `delta_seeded` and `retraction_seeded` are both left set by a stop above their
 commit, but their consequences differ. A stale `delta_seeded` may or may not
