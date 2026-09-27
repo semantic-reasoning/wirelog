@@ -78,10 +78,8 @@ wl_columnar_join_dispose_left(eval_stack_t *stack, eval_entry_t *left,
 static int
 wl_columnar_join_memory_error(wl_col_session_t *sess, int rc)
 {
-    if (rc == ENOSPC) {
+    if (rc == ENOSPC)
         sess->memory_budget_denied = true;
-        return ENOMEM;
-    }
     return rc;
 }
 
@@ -1308,14 +1306,24 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
      * filtered relation is owned by sess->filt_cache and must NOT be
      * destroyed here.  right_filtered remains NULL for the cached path.
      * The cache reports itself unavailable while a lease defers a rebuild
-     * or blocks growth (Issue #1435), and on allocation failure; either
-     * way this op continues on an owned filtered relation. */
+     * or blocks growth (Issue #1435); allocation and admission failures are
+     * returned to the caller instead of being hidden by an owned fallback. */
     if (op->right_filter_expr.size > 0) {
         col_rel_t *filtered = NULL;
+        bool cache_unavailable = false;
+        int filter_rc = 0;
         if (op->right_relation && !used_right_delta) {
-            filtered = wl_columnar_filter_apply_right_filter_cached(sess,
-                    &op->right_filter_expr, op->right_relation, right);
-            if (!filtered)
+            col_filt_cache_pin_t filter_pin = { 0 };
+            filter_rc =
+                wl_columnar_filter_apply_right_filter_cached_pin_checked(
+                sess, &op->right_filter_expr, op->right_relation, right,
+                &filter_pin, &filtered, &cache_unavailable);
+            col_filt_cache_pin_release(&filter_pin);
+            if (filter_rc != 0) {
+                int cleanup_rc = eval_stack_dispose_entry(stack, &left_e);
+                return cleanup_rc != 0 ? cleanup_rc : filter_rc;
+            }
+            if (cache_unavailable)
                 WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
                     "filtered cache unavailable for %s, using owned filter",
                     op->right_relation);
@@ -1323,19 +1331,23 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         if (filtered) {
             right = filtered;
             /* right_filtered stays NULL: cache owns the relation */
-        } else {
+        } else if (cache_unavailable || !op->right_relation ||
+            used_right_delta) {
             /* Delta path, no relation name, or cache unavailable:
              * pool-allocated filter owned by this op */
-            filtered = wl_columnar_filter_apply_right_filter_governed(
+            filter_rc = wl_columnar_filter_apply_right_filter_governed_checked(
                 &op->right_filter_expr, right, sess->delta_pool, sess->intern,
                 sess->memory_governor ? sess->memory_governor :
-                right->memory_governor);
-            if (!filtered) {
+                right->memory_governor, sess, &filtered);
+            if (filter_rc != 0) {
                 int cleanup_rc = eval_stack_dispose_entry(stack, &left_e);
-                return cleanup_rc != 0 ? cleanup_rc : ENOMEM;
+                return cleanup_rc != 0 ? cleanup_rc : filter_rc;
             }
             right = filtered;
             right_filtered = filtered;
+        } else if (!filtered) {
+            int cleanup_rc = eval_stack_dispose_entry(stack, &left_e);
+            return cleanup_rc != 0 ? cleanup_rc : EINVAL;
         }
     }
 
@@ -2261,14 +2273,14 @@ wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
      * the per-iteration filter cost is O(N) — acceptable for current workloads
      * but a candidate for follow-up optimization. */
     if (op->right_filter_expr.size > 0) {
-        col_rel_t *filtered
-            = wl_columnar_filter_apply_right_filter_governed(
-                &op->right_filter_expr, right, sess->delta_pool, sess->intern,
-                sess->memory_governor ? sess->memory_governor :
-                right->memory_governor);
-        if (!filtered) {
+        col_rel_t *filtered = NULL;
+        int filter_rc = wl_columnar_filter_apply_right_filter_governed_checked(
+            &op->right_filter_expr, right, sess->delta_pool, sess->intern,
+            sess->memory_governor ? sess->memory_governor :
+            right->memory_governor, sess, &filtered);
+        if (filter_rc != 0) {
             int cleanup_rc = eval_stack_dispose_entry(stack, &left_e);
-            return cleanup_rc != 0 ? cleanup_rc : ENOMEM;
+            return cleanup_rc != 0 ? cleanup_rc : filter_rc;
         }
         right = filtered;
         right_filtered = filtered;
@@ -2497,14 +2509,14 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
      * the per-iteration filter cost is O(N) — acceptable for current workloads
      * but a candidate for follow-up optimization. */
     if (op->right_filter_expr.size > 0) {
-        col_rel_t *filtered
-            = wl_columnar_filter_apply_right_filter_governed(
-                &op->right_filter_expr, right, sess->delta_pool, sess->intern,
-                sess->memory_governor ? sess->memory_governor :
-                right->memory_governor);
-        if (!filtered) {
+        col_rel_t *filtered = NULL;
+        int filter_rc = wl_columnar_filter_apply_right_filter_governed_checked(
+            &op->right_filter_expr, right, sess->delta_pool, sess->intern,
+            sess->memory_governor ? sess->memory_governor :
+            right->memory_governor, sess, &filtered);
+        if (filter_rc != 0) {
             int cleanup_rc = eval_stack_dispose_entry(stack, &left_e);
-            return cleanup_rc != 0 ? cleanup_rc : ENOMEM;
+            return cleanup_rc != 0 ? cleanup_rc : filter_rc;
         }
         right = filtered;
         right_filtered = filtered;
@@ -2997,14 +3009,24 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
      * filtered relation is owned by sess->filt_cache and must NOT be
      * destroyed here.  right_filtered remains NULL for the cached path.
      * The cache reports itself unavailable while a lease defers a rebuild
-     * or blocks growth (Issue #1435), and on allocation failure; either
-     * way this op continues on an owned filtered relation. */
+     * or blocks growth (Issue #1435); allocation and admission failures are
+     * returned instead of being hidden by an owned fallback. */
     if (op->right_filter_expr.size > 0) {
         col_rel_t *filtered = NULL;
+        bool cache_unavailable = false;
+        int filter_rc = 0;
         if (op->right_relation && !used_right_delta) {
-            filtered = wl_columnar_filter_apply_right_filter_cached(sess,
-                    &op->right_filter_expr, op->right_relation, right);
-            if (!filtered)
+            col_filt_cache_pin_t filter_pin = { 0 };
+            filter_rc =
+                wl_columnar_filter_apply_right_filter_cached_pin_checked(
+                sess, &op->right_filter_expr, op->right_relation, right,
+                &filter_pin, &filtered, &cache_unavailable);
+            col_filt_cache_pin_release(&filter_pin);
+            if (filter_rc != 0) {
+                int cleanup_rc = eval_stack_dispose_entry(stack, &left_e);
+                return cleanup_rc != 0 ? cleanup_rc : filter_rc;
+            }
+            if (cache_unavailable)
                 WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
                     "filtered cache unavailable for %s, using owned filter",
                     op->right_relation);
@@ -3012,19 +3034,23 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
         if (filtered) {
             right = filtered;
             /* right_filtered stays NULL: cache owns the relation */
-        } else {
+        } else if (cache_unavailable || !op->right_relation ||
+            used_right_delta) {
             /* Delta path, no relation name, or cache unavailable:
              * pool-allocated filter owned by this op */
-            filtered = wl_columnar_filter_apply_right_filter_governed(
+            filter_rc = wl_columnar_filter_apply_right_filter_governed_checked(
                 &op->right_filter_expr, right, sess->delta_pool, sess->intern,
                 sess->memory_governor ? sess->memory_governor :
-                right->memory_governor);
-            if (!filtered) {
+                right->memory_governor, sess, &filtered);
+            if (filter_rc != 0) {
                 int cleanup_rc = eval_stack_dispose_entry(stack, &left_e);
-                return cleanup_rc != 0 ? cleanup_rc : ENOMEM;
+                return cleanup_rc != 0 ? cleanup_rc : filter_rc;
             }
             right = filtered;
             right_filtered = filtered;
+        } else if (!filtered) {
+            int cleanup_rc = eval_stack_dispose_entry(stack, &left_e);
+            return cleanup_rc != 0 ? cleanup_rc : EINVAL;
         }
     }
 
