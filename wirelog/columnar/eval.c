@@ -843,8 +843,10 @@ nonrec_make_shared_relation_view(wl_col_session_t *coord,
     if (!src || !out)
         return EINVAL;
     col_rel_t *view = NULL;
-    int rc = eval_relation_new_like_checked(coord, src->name, src,
-            coord ? coord->memory_governor : src->memory_governor, &view);
+    /* This view was historically a plain, ungoverned schema clone. Keep the
+     * checked error result without adding new governor charges to this path. */
+    int rc = eval_relation_new_like_checked(coord, src->name, src, NULL,
+            &view);
     if (rc != 0)
         return rc;
     rc = col_rel_install_shared_view(view, src);
@@ -2271,8 +2273,10 @@ tdd_worker_subpass_fn(void *arg)
 
         /* Heap-allocate delta so it survives delta_pool_reset below. */
         col_rel_t *delta = NULL;
-        ctx->rc = eval_relation_new_like_checked(sess, dname, r,
-                sess->memory_governor, &delta);
+        /* Preserve the legacy ungoverned delta allocation policy while
+         * returning allocation and representation failures to the caller. */
+        ctx->rc = eval_relation_new_like_checked(sess, dname, r, NULL,
+                &delta);
         if (ctx->rc != 0) {
             free(snap);
             sess->tdd_subpass_active = saved_tdd_subpass;
@@ -3154,10 +3158,9 @@ tdd_seed_bdx_coordinator_idb(wl_col_session_t *coord, col_rel_t *cidb,
             return EINVAL;
     }
 
-    wl_columnar_memory_governor_ref_t *governor = coord
-        ? coord->memory_governor : cidb->memory_governor;
+    /* Preserve col_rel_new_like's historical ungoverned accounting policy. */
     rc = eval_relation_new_like_checked(coord, cidb->name, schema_source,
-            governor, &candidate);
+            NULL, &candidate);
     if (rc != 0)
         return rc;
     candidate->nrows = 0;
@@ -3389,9 +3392,10 @@ tdd_merge_relation_results(wl_col_session_t *coord, col_rel_t **target_io,
         if (rc != 0)
             return rc;
     } else {
+        /* This branch replaces legacy col_rel_new_like, so keep it
+         * ungoverned while preserving its detailed failure status. */
         rc = eval_relation_new_like_checked(coord, rel_name, schema_source,
-                coord ? coord->memory_governor
-                      : schema_source->memory_governor, &candidate);
+                NULL, &candidate);
         if (rc != 0)
             return rc;
         if (target && target->nrows != 0) {
