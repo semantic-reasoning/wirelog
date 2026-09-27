@@ -228,7 +228,7 @@ def authorize_reviewed_pr(repo, base_sha, candidate_sha, base_value,
             run.get("repository", {}).get("full_name") != repo or
             not any(pr.get("number") == p["pr_number"] and
                     pr.get("base", {}).get("sha") == p["base_sha"] and
-                    pr.get("head", {}).get("sha") == source and
+                    pr.get("head", {}).get("sha") in (source, parents[2]) and
                     pr.get("base", {}).get("repo", {}).get("url") == f"{API}/repos/{repo}" and
                     pr.get("head", {}).get("repo", {}).get("url") == f"{API}/repos/{repo}"
                     for pr in run.get("pull_requests", []))):
