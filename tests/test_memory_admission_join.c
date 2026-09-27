@@ -2150,6 +2150,60 @@ out:
 }
 
 static void
+test_diff_consolidate_copy_admission(void)
+{
+    wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+    col_rel_t *borrowed = make_left(4, 2);
+    eval_stack_t stack;
+    uint64_t reserved;
+    int rc;
+
+    TEST("differential CONS copy obeys admission and can retry");
+    if (!sess || !borrowed
+        || col_rel_attach_memory_governor(borrowed,
+        sess->memory_governor) != 0) {
+        FAIL("fixture");
+        goto out;
+    }
+    eval_stack_init(&stack);
+    if (eval_stack_push(&stack, borrowed, false) != 0) {
+        FAIL("could not push borrowed CONS input");
+        goto out;
+    }
+    reserved = reserved_of(sess);
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            sess->memory_governor)->usable_bytes, reserved,
+        memory_order_release);
+    rc = col_op_consolidate_diff(&stack, sess);
+    if (rc != ENOSPC || stack.top != 1 || stack.items[0].rel != borrowed
+        || stack.items[0].owned || !sess->memory_budget_denied
+        || reserved_of(sess) != reserved) {
+        (void)eval_stack_drain(&stack);
+        FAIL("denied CONS copy did not preserve borrowed retry input");
+        goto out;
+    }
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            sess->memory_governor)->usable_bytes, 64ull * 1024 * 1024,
+        memory_order_release);
+    sess->memory_budget_denied = false;
+    rc = col_op_consolidate_diff(&stack, sess);
+    if (rc != 0 || stack.top != 1 || stack.items[0].rel == borrowed
+        || !stack.items[0].owned || stack.items[0].rel->nrows != 4) {
+        (void)eval_stack_drain(&stack);
+        FAIL("CONS copy did not retry after admission was restored");
+        goto out;
+    }
+    if (eval_stack_drain(&stack) != 0) {
+        FAIL("CONS retry cleanup");
+        goto out;
+    }
+    PASS();
+out:
+    col_rel_destroy(borrowed);
+    destroy_session(sess);
+}
+
+static void
 test_parallel_diff_denial(void)
 {
     wl_col_session_t *sess = NULL;
@@ -3444,6 +3498,7 @@ main(void)
     test_parallel_cross_denial();
     test_small_parallel_cross_is_admitted();
     test_parallel_diff_output_is_governed();
+    test_diff_consolidate_copy_admission();
     test_parallel_diff_denial();
     test_parallel_diff_true_admission_denial_rolls_back();
     test_parallel_diff_partial_count_submit_drains_and_retries();
