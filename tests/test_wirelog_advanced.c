@@ -2416,6 +2416,77 @@ reserved_on(wl_columnar_memory_governor_ref_t *ref)
         wl_columnar_memory_governor_ref_get(ref));
 }
 
+static int measure_create_floor(wirelog_program_t *prog,
+    uint64_t *intern_bytes, uint64_t *compound_bytes,
+    uint64_t *descriptor_bytes);
+
+static int
+test_inline_fact_budget_denial_maps(void)
+{
+    wirelog_program_t *prog = parse_or_die(
+        ".decl src(x: int64)\nsrc(17).\n", "T-1936-inline-fact");
+    wirelog_session_t *session = NULL;
+    wl_session_options_t options;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    uint64_t intern_bytes = 0;
+    uint64_t compound_bytes = 0;
+    uint64_t descriptor_bytes = 0;
+    uint64_t floor;
+    int rc = 1;
+
+    if (!prog || measure_create_floor(prog, &intern_bytes, &compound_bytes,
+        &descriptor_bytes) != 0)
+        goto out;
+    if (!wl_columnar_memory_size_add(intern_bytes, compound_bytes, &floor)
+        || !wl_columnar_memory_size_add(floor, SESSION_REGISTRY_BYTES,
+        &floor)
+        || !wl_columnar_memory_size_add(floor, descriptor_bytes, &floor))
+        goto out;
+    ref = enforcing_governor(floor);
+    if (!ref)
+        goto out;
+    wl_session_options_init(&options);
+    options.memory_governor = ref;
+    wl_session_testhook_set_default_options(&options);
+    wirelog_error_t error = wirelog_session_create(prog,
+            WIRELOG_BACKEND_COLUMNAR, 1, &session);
+    wl_session_testhook_set_default_options(NULL);
+    if (error != WIRELOG_ERR_MEMORY_BUDGET || session != NULL
+        || reserved_on(ref) != intern_bytes) {
+        fprintf(stderr, "T-1936: inline-fact create err=%d reserve=%llu\n",
+            error, (unsigned long long)reserved_on(ref));
+        goto out;
+    }
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(ref)
+        ->usable_bytes, UINT64_MAX / 4u, memory_order_release);
+    wl_session_testhook_set_default_options(&options);
+    error = wirelog_session_create(prog, WIRELOG_BACKEND_COLUMNAR, 1,
+            &session);
+    wl_session_testhook_set_default_options(NULL);
+    if (error != WIRELOG_OK || !session) {
+        fprintf(stderr, "T-1936: inline-fact create retry err=%d\n", error);
+        goto out;
+    }
+    wirelog_session_destroy(session);
+    session = NULL;
+    if (reserved_on(ref) != intern_bytes)
+        goto out;
+    rc = 0;
+out:
+    wl_session_testhook_set_default_options(NULL);
+    wirelog_session_destroy(session);
+    wirelog_program_free(prog);
+    if (ref) {
+        if (reserved_on(ref) != 0) {
+            fprintf(stderr, "T-1936: inline-fact teardown leaked %llu bytes\n",
+                (unsigned long long)reserved_on(ref));
+            rc = 1;
+        }
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    return rc;
+}
+
 /* Measure the intern table admitted when a session attaches it (#1431),
  * the fixed compound arena, and planned EDB descriptor/name charges.
  * Callers add the initial 16-pointer session registry to obtain the floor.
@@ -3044,6 +3115,7 @@ main(void)
     failures += test_issue_665_partial_conjunction_multi_worker();
     failures += test_invalid_memory_budget();
     failures += test_fact_mutation_budget();
+    failures += test_inline_fact_budget_denial_maps();
     failures += test_injected_governor_denial_maps_to_memory();
     failures += test_injected_governor_overflow_maps_to_memory();
     failures += test_denied_eval_interning_maps_to_memory();

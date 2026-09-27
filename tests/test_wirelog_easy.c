@@ -2611,6 +2611,74 @@ measure_easy_floor(const char *src, uint64_t *intern_bytes,
     return rc;
 }
 
+static void
+test_inline_fact_budget_denial_maps_and_retries(void)
+{
+    const char *src = ".decl src(x: int64)\nsrc(17).\n";
+    wirelog_easy_session_t *session = NULL;
+    wl_session_options_t options;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    uint64_t intern_bytes = 0;
+    uint64_t compound_bytes = 0;
+    uint64_t descriptor_bytes = 0;
+    uint64_t floor;
+
+    TEST("#1936 easy inline fact denial reports budget and retries");
+    if (measure_easy_floor(src, &intern_bytes, &compound_bytes,
+        &descriptor_bytes) != 0
+        || !wl_columnar_memory_size_add(intern_bytes, compound_bytes,
+        &floor)
+        || !wl_columnar_memory_size_add(floor, SESSION_REGISTRY_BYTES,
+        &floor)
+        || !wl_columnar_memory_size_add(floor, descriptor_bytes, &floor)) {
+        FAIL("could not measure inline fact session floor");
+        return;
+    }
+    ref = enforcing_governor(floor);
+    if (!ref) {
+        FAIL("governor allocation failed");
+        return;
+    }
+    wl_session_options_init(&options);
+    options.memory_governor = ref;
+    wirelog_error_t rc = wirelog_easy_open(src, &session);
+    if (rc != WIRELOG_OK || !session) {
+        FAIL("lazy open failed");
+        goto done;
+    }
+    wl_session_testhook_set_default_options(&options);
+    rc = wirelog_easy_step(session);
+    wl_session_testhook_set_default_options(NULL);
+    if (rc != WIRELOG_ERR_MEMORY_BUDGET
+        || reserved_on(ref) != intern_bytes) {
+        fprintf(stderr, "inline fact budget: rc=%d reserved=%llu intern=%llu\n",
+            rc, (unsigned long long)reserved_on(ref),
+            (unsigned long long)intern_bytes);
+        FAIL("inline fact admission denial was not preserved");
+        goto done;
+    }
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(ref)
+        ->usable_bytes, UINT64_MAX / 4u, memory_order_release);
+    wl_session_testhook_set_default_options(&options);
+    rc = wirelog_easy_step(session);
+    wl_session_testhook_set_default_options(NULL);
+    if (rc != WIRELOG_OK) {
+        FAIL("inline fact lazy build did not retry after budget restoration");
+        goto done;
+    }
+    wirelog_easy_close(session);
+    session = NULL;
+    if (reserved_on(ref) != 0) {
+        FAIL("closing the retried lazy session leaked its reservation");
+        goto done;
+    }
+    PASS();
+done:
+    wl_session_testhook_set_default_options(NULL);
+    wirelog_easy_close(session);
+    wl_columnar_memory_governor_ref_release(ref);
+}
+
 /* PARITY: the advanced facade has no eager/lazy split; both easy paths and
  * the executor pair with test_injected_governor_denial_maps_to_memory. */
 static void
@@ -3218,6 +3286,7 @@ main(void)
     test_fact_mutation_budget();
     test_injected_governor_easy_eager();
     test_injected_governor_easy_lazy();
+    test_inline_fact_budget_denial_maps_and_retries();
     test_injected_governor_executor();
     test_executor_csv_budget_and_retry();
     test_injected_governor_overflow_maps_to_memory();
