@@ -264,9 +264,10 @@ actual W=2/8 dispatch and qualified paired performance acceptance.
 ## Occurrence-bound worker execution (#1984)
 
 The internal `wl_columnar_eval_tdd_run_bound_slice_begin()` helper executes one
-active manifest slice through the real VARIABLE, JOIN and lowered SEMIJOIN
+supported manifest slice through the real VARIABLE, MAP, JOIN and lowered SEMIJOIN
 operators. The caller supplies every input occurrence from one immutable epoch:
-only the designated DELTA occurrence is partitioned; FULL and PREFILTER inputs
+for recursive slices, only the designated DELTA occurrence is partitioned;
+FULL and PREFILTER inputs
 retain their full view. Captured names, schema, generations, owner-plan identity
 and partition metadata are checked before execution. Snapshot and partition
 tokens attest caller setup; they cannot establish coherent provenance or global
@@ -286,17 +287,34 @@ its source is pinned.
 Bound execution bypasses name-based delta selection, materialization-cache
 lookup/insertion and full/delta arrangement reuse. This avoids cache identities
 that do not include the supplied epoch/partition. Original plan flags and
-ordinary unbound cache behavior are unchanged. Seed/inactive slices, K=1,
-retractions/diff operators, batch pipelines, right filters and unsupported
-operators refuse before evaluation. Existing conservative TDD admission and
-SCC dispatch remain unchanged.
+ordinary unbound cache behavior are unchanged.
+
+The helper also accepts exactly the three generated `valueFlow` unary `assign`
+seed bodies in alternative zero: projections `01`, `00`, and `11`, at ordinals
+0/1/2 and slice starts 0/2/5. Each uses one FULL two-column `assign` input in
+the initial positive phase, iteration zero, with worker 0 of 1 and a NULL
+partition. Complete operator and expression payloads must match the generated
+forms. The bound VARIABLE path bypasses ordinary later-iteration empty-seed
+selection, so other seed phases, alternatives and forms remain explicitly
+refused. Inactive slices, K=1, retractions/diff operators, batch pipelines,
+right filters and unsupported operators also refuse before evaluation.
+The caller must schedule each seed once; the helper does not enforce once-only
+execution across calls. Its outputs are raw tuple bags preserving duplicates,
+without UNION consolidation. Existing conservative TDD admission and SCC
+dispatch remain unchanged.
 
 `meson test -C builddir tdd_occurrence_execution` runs all five active alternatives
 of the unmodified generated CSPA `valueAlias` plan with independently partitioned
 small inputs at W=1/2/8 and checks exact output tuples. It also exercises a
 separate materialized JOIN with a conflicting cached result, borrowed 0/1-row
 outputs, stale/mismatched metadata, partial acquisition, governed denial,
-allocation failures (Linux), refused cleanup and cleanup-only retry. This proves
-positive single-slice execution, not signed multiplicities, convergence or
-whole-CSPA support. Epoch/read-set production, seed/K=1 policy and #1965 atomic
+allocation failures (Linux), refused cleanup and cleanup-only retry. Separate
+seed cases use the three actual generated `valueFlow` bodies and independent
+raw-bag oracles for empty and duplicated/overlapping inputs, retaining duplicate
+multiplicity in each result and their concatenation. They check altered-plan
+and later-alternative refusals before execution, source/output lifetime,
+governed denial versus allocator failure, and cleanup-only retry without
+reevaluation. These tests establish bounded positive body execution, not signed
+multiplicities, convergence or whole-CSPA support. Epoch/read-set production,
+once-only seed scheduling, UNION consolidation, K=1 support and #1965 atomic
 SCC publication remain prerequisites for enabling that dispatch and for #1982.

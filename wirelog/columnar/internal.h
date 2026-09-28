@@ -3747,6 +3747,13 @@ struct wl_columnar_eval_tdd_run {
     int primary_rc;
 };
 
+/* Also accepts only the generated valueFlow unary assign seed bodies in
+ * alternative zero, with one full two-column input, iteration zero, positive
+ * state, worker 0/1 and NULL partition. Other seed shapes/topologies/phases
+ * are refused before acquiring resources. The caller enumerates each seed
+ * once; this handle does not provide scheduler-wide exactly-once execution.
+ * Outputs remain independent raw bags with the existing operator metadata;
+ * no UNION consolidation, coordinator publication or signed mode is added. */
 int wl_columnar_eval_tdd_run_bound_slice_begin(wl_col_session_t *worker,
     const wl_plan_stratum_t *stratum,
     const wl_columnar_eval_tdd_plan_manifest_t *manifest, uint32_t slice_index,

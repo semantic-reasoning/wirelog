@@ -461,6 +461,62 @@ wl_columnar_eval_tdd_plan_input_matches(const wl_columnar_eval_tdd_input_t *in)
            rel->graph_col_idx == in->graph_col_idx);
 }
 
+/* These are the three unary EDB seed bodies in the unfused CSPA plan.
+ * Compare complete payloads, including expression bytes, before allowing the
+ * bound VARIABLE path to bypass ordinary seed/delta selection. */
+static bool
+wl_columnar_eval_tdd_plan_seed_supported(const wl_plan_stratum_t *sp,
+    const wl_columnar_eval_tdd_plan_manifest_t *manifest,
+    const wl_columnar_eval_tdd_plan_slice_t *slice)
+{
+    static const uint32_t starts[] = {0, 2, 5};
+    static const uint32_t projections[][2] = {{0, 1}, {0, 0}, {1, 1}};
+    const wl_plan_relation_t *rel = manifest->owner_relation;
+    if (!rel->name || strcmp(rel->name, "valueFlow") != 0
+        || slice->ordinal >= 3 || slice->start != starts[slice->ordinal]
+        || slice->count != 2 || slice->read_count != 1
+        || slice->start + slice->count >= manifest->block_size)
+        return false;
+    for (uint32_t r = 0; r < sp->relation_count; r++) {
+        if (!sp->relations[r].name
+            || strcmp(sp->relations[r].name, "assign") == 0)
+            return false;
+    }
+    uint8_t variables[2][7] = {
+        {WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '0'},
+        {WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1'},
+    };
+    const uint32_t *projection = projections[slice->ordinal];
+    wl_plan_expr_buffer_t expressions[2] = {
+        {.data = variables[projection[0]], .size = 7},
+        {.data = variables[projection[1]], .size = 7},
+    };
+    const wl_plan_op_t expected_variable = {
+        .op = WL_PLAN_OP_VARIABLE, .relation_name = "assign",
+    };
+    const wl_plan_op_t expected_map = {
+        .op = WL_PLAN_OP_MAP, .project_count = 2,
+        .project_indices = projection,
+        .map_expr_count = 2, .map_exprs = expressions,
+    };
+    const wl_plan_op_t *ops = rel->ops + slice->start;
+    /* op_equal compares semantic payload bytes, but intentionally ignores
+     * pointers whose count/size is zero. Keep this seed allowlist exact. */
+    if (ops[0].left_keys || ops[0].right_keys || ops[0].project_indices
+        || ops[0].group_by_indices || ops[0].map_exprs
+        || ops[1].left_keys || ops[1].right_keys
+        || ops[1].group_by_indices
+        || ops[0].filter_expr.data || ops[0].right_filter_expr.data
+        || ops[0].agg_expr.data || ops[1].filter_expr.data
+        || ops[1].right_filter_expr.data || ops[1].agg_expr.data)
+        return false;
+    return ops[0].delta_mode == WL_DELTA_FORCE_EMPTY_AFTER_SEED
+           && ops[1].delta_mode == WL_DELTA_AUTO
+           && !ops[0].materialized && !ops[1].materialized
+           && wl_columnar_eval_tdd_plan_op_equal(&ops[0], &expected_variable)
+           && wl_columnar_eval_tdd_plan_op_equal(&ops[1], &expected_map);
+}
+
 int
 wl_columnar_eval_tdd_plan_prepare_inputs(wl_col_session_t *worker,
     const wl_plan_stratum_t *sp,
@@ -471,7 +527,7 @@ wl_columnar_eval_tdd_plan_prepare_inputs(wl_col_session_t *worker,
     wl_columnar_eval_tdd_run_t *run)
 {
     if (!worker || !sp || !manifest || !run || !inputs || !snapshot
-        || !partition || !worker_count || worker_index >= worker_count)
+        || !worker_count || worker_index >= worker_count)
         return EINVAL;
     if (run->worker || run->slots || run->cleanup || run->output
         || worker->teardown_started || worker->tdd_input_run ||
@@ -489,7 +545,7 @@ wl_columnar_eval_tdd_plan_prepare_inputs(wl_col_session_t *worker,
         return EINVAL;
     const wl_columnar_eval_tdd_plan_slice_t *slice =
         &manifest->slices[slice_index];
-    if (manifest->alternative_count < 2 || slice->seed || slice->inactive
+    if (manifest->alternative_count < 2 || slice->inactive
         || worker->diff_operators_active || worker->retraction_seeded
         || worker->retraction_right_pass || worker->delta_seeded
         || worker->join_batch_bytes > 0 || worker->join_batch_strict)
@@ -500,12 +556,27 @@ wl_columnar_eval_tdd_plan_prepare_inputs(wl_col_session_t *worker,
         || slice->read_count > manifest->read_count - slice->read_start
         || input_count != slice->read_count || !input_count)
         return EINVAL;
+    bool seed = slice->seed;
+    if (seed) {
+        if (slice->alternative != 0 || worker->current_iteration != 0
+            || worker_count != 1 || worker_index != 0 || partition)
+            return ENOTSUP;
+        if (slice->driver != UINT32_MAX || input_count != 1
+            || inputs[0].partition || inputs[0].worker_index != 0
+            || inputs[0].worker_count != 1 || inputs[0].ncols != 2
+            || !inputs[0].name || strcmp(inputs[0].name, "assign") != 0)
+            return EINVAL;
+        if (!wl_columnar_eval_tdd_plan_seed_supported(sp, manifest, slice))
+            return ENOTSUP;
+    } else if (!partition) {
+        return EINVAL;
+    }
     uint32_t reads = 0, drivers = 0;
     for (uint32_t i = slice->start; i < slice->start + slice->count; i++) {
         const wl_plan_op_t *op = &rel->ops[i];
         if (op->opaque_data || op->right_filter_expr.size ||
             op->filter_expr.size || op->agg_expr.size
-            || op->map_expr_count)
+            || (!seed && op->map_expr_count))
             return ENOTSUP;
         if (op->op == WL_PLAN_OP_MAP)
             continue;
@@ -539,7 +610,7 @@ wl_columnar_eval_tdd_plan_prepare_inputs(wl_col_session_t *worker,
                 || in->worker_count != worker_count)
                 return EINVAL;
             drivers++;
-        } else if ((op->delta_mode != WL_DELTA_FORCE_FULL
+        } else if ((!seed && op->delta_mode != WL_DELTA_FORCE_FULL
             && op->delta_mode != WL_DELTA_AUTO)
             || in->partition)
             return EINVAL;
@@ -548,7 +619,7 @@ wl_columnar_eval_tdd_plan_prepare_inputs(wl_col_session_t *worker,
             slice->start + slice->count))
             return ENOTSUP;
     }
-    if (reads != input_count || drivers != 1)
+    if (reads != input_count || drivers != (seed ? 0u : 1u))
         return EINVAL;
     size_t bytes;
     if (wl_columnar_eval_checked_size_mul(input_count,
