@@ -672,16 +672,19 @@ seed_refusals(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
     wl_columnar_eval_test_bound_slice_after_eval = NULL;
     wl_columnar_memory_governor_t *governor =
         wl_columnar_memory_governor_ref_get(worker.memory_governor);
-    uint64_t limit = atomic_load(&governor->usable_bytes);
+    uint64_t limit = atomic_load_explicit(&governor->usable_bytes,
+            memory_order_seq_cst);
     wl_columnar_memory_mode_t mode = governor->mode;
     governor->mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
-    atomic_store(&governor->usable_bytes, before);
+    atomic_store_explicit(&governor->usable_bytes, before,
+        memory_order_seq_cst);
     worker.memory_budget_denied = false;
     CHECK(wl_columnar_eval_tdd_run_bound_slice_begin(&worker, sp, manifest,
         si, &snapshot_token, NULL, 0, 1, &good, 1, &run) == ENOSPC);
     CHECK(worker.memory_budget_denied && !run.worker &&
         reserved(&worker) == before);
-    atomic_store(&governor->usable_bytes, limit);
+    atomic_store_explicit(&governor->usable_bytes, limit,
+        memory_order_seq_cst);
     governor->mode = mode;
     worker.memory_budget_denied = false;
 #ifdef WL_TEST_ALLOC_WRAP
