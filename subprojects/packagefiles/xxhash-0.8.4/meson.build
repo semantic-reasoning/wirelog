@@ -94,6 +94,25 @@ if host_machine.system() == 'windows'
   endif
 endif
 
+# On AArch64 with GCC, xxHash reads NEON stripes through a direct
+# dereference of a 16-byte-aligned vector type (xxhash.h, XXH_vld1q_u64),
+# whose own comment records that unaligned access is always safe there and
+# that the cast exists so GCC does not pessimise the load.  The secret
+# advances eight bytes per stripe, so the pointer is only 8-byte aligned and
+# -fsanitize=alignment reports every such load.  Every XXH3 input longer than
+# XXH3_MIDSIZE_MAX takes that path, one-shot or streaming alike.
+#
+# Exclude this dependency from that one check instead of forcing the scalar
+# backend, which would leave the sanitizer builds exercising a different
+# implementation from the one that ships.  The flag applies to the library
+# target only: putting it in c_args would export it through xxhash_dep and
+# silence the check across every consumer that includes xxhash.h.
+if get_option('b_sanitize') != 'none' and cc.has_argument(
+  '-fno-sanitize=alignment',
+)
+  c_build_args += '-fno-sanitize=alignment'
+endif
+
 inc = include_directories('.')
 
 xxhash = library(
