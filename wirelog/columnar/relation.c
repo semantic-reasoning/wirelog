@@ -95,6 +95,7 @@ wl_columnar_relation_test_rollback_cleanup_was_ordered(void)
 }
 
 static bool wl_columnar_relation_fail_governed_copy_payload_alloc;
+static bool wl_columnar_relation_fail_mutable_image_overflow;
 void (*wl_columnar_relation_test_after_governed_copy_admission)(
     const col_rel_t *);
 void (*wl_columnar_relation_test_after_retired_storage_free)(const col_rel_t *);
@@ -103,6 +104,18 @@ void
 wl_columnar_relation_test_fail_next_governed_copy_payload_alloc(void)
 {
     wl_columnar_relation_fail_governed_copy_payload_alloc = true;
+}
+
+void
+wl_columnar_relation_test_clear_governed_copy_payload_alloc(void)
+{
+    wl_columnar_relation_fail_governed_copy_payload_alloc = false;
+}
+
+void
+wl_columnar_relation_test_fail_next_mutable_image_overflow(void)
+{
+    wl_columnar_relation_fail_mutable_image_overflow = true;
 }
 static bool wl_columnar_relation_fail_commit_publication;
 
@@ -6313,6 +6326,15 @@ col_rel_deep_copy_governed_impl(const col_rel_t *src, col_rel_t **out,
         rc = EINVAL;
         goto done;
     }
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    /* Exercise rollback after the private descriptor and metadata image have
+     * already been admitted, on the real checked-size cleanup path. */
+    if (mutable_image && wl_columnar_relation_fail_mutable_image_overflow) {
+        wl_columnar_relation_fail_mutable_image_overflow = false;
+        rc = EOVERFLOW;
+        goto done;
+    }
+#endif
     reserve_rc = col_rel_reserve_transition(dst, dst->capacity,
             timestamp_capacity, timestamp_capacity != 0, &pending,
             &reserved_bytes, &reserve_failure_rc);

@@ -169,7 +169,22 @@ test_mutable_image_transaction(void)
     uint64_t incoming = image_descriptor + source->metadata_reserved_bytes
         + source->retained_reserved_bytes + source->dedup_reserved_bytes;
     int64_t **old_columns = source->columns;
+    col_delta_timestamp_t *old_timestamps = source->timestamps;
+    int64_t **old_merge_columns = source->merge_columns;
     uint64_t *old_dedup = source->dedup_slots;
+    uint32_t old_nrows = source->nrows;
+    uint32_t old_capacity = source->capacity;
+    uint32_t old_timestamp_capacity = source->timestamp_capacity;
+    uint32_t old_sorted_nrows = source->sorted_nrows;
+    uint32_t old_run_count = source->run_count;
+    uint32_t old_storage_generation = source->storage_generation;
+    uint32_t old_run_ends[COL_MAX_RUNS];
+    memcpy(old_run_ends, source->run_ends, sizeof(old_run_ends));
+    uint32_t old_dedup_count = source->dedup_count;
+    uint32_t old_dedup_cap = source->dedup_cap;
+    uint64_t old_retained_bytes = source->retained_reserved_bytes;
+    uint64_t old_metadata_bytes = source->metadata_reserved_bytes;
+    uint64_t old_dedup_bytes = source->dedup_reserved_bytes;
     uint64_t old_generation = source->view_generation;
     source->arena_owned = true;
     CHECK(col_rel_mutable_image_prepare(source, &txn) == EBUSY,
@@ -196,6 +211,27 @@ test_mutable_image_transaction(void)
         && wl_columnar_memory_reserved(governor) == baseline,
         "mutable image rejects malformed source before admission");
     source->base_nrows = 0;
+    wl_columnar_relation_test_fail_next_mutable_image_overflow();
+    CHECK(col_rel_mutable_image_prepare(source, &txn) == EOVERFLOW
+        && col_rel_mutable_image_get(&txn) == NULL
+        && source->columns == old_columns
+        && source->timestamps == old_timestamps
+        && source->merge_columns == old_merge_columns
+        && source->dedup_slots == old_dedup
+        && source->nrows == old_nrows && source->capacity == old_capacity
+        && source->timestamp_capacity == old_timestamp_capacity
+        && source->sorted_nrows == old_sorted_nrows
+        && source->run_count == old_run_count
+        && source->storage_generation == old_storage_generation
+        && source->view_generation == old_generation
+        && memcmp(source->run_ends, old_run_ends, sizeof(old_run_ends)) == 0
+        && source->dedup_count == old_dedup_count
+        && source->dedup_cap == old_dedup_cap
+        && source->retained_reserved_bytes == old_retained_bytes
+        && source->metadata_reserved_bytes == old_metadata_bytes
+        && source->dedup_reserved_bytes == old_dedup_bytes
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "mutable image overflow preserves source and every reservation");
     uint64_t stage_floors[] = {
         image_descriptor, image_descriptor + source->metadata_reserved_bytes,
         image_descriptor + source->metadata_reserved_bytes + image_primary,
@@ -209,6 +245,13 @@ test_mutable_image_transaction(void)
             && col_rel_mutable_image_get(&txn) == NULL
             && source->columns == old_columns
             && source->dedup_slots == old_dedup
+            && source->timestamps == old_timestamps
+            && source->merge_columns == old_merge_columns
+            && source->nrows == old_nrows
+            && source->capacity == old_capacity
+            && source->storage_generation == old_storage_generation
+            && source->dedup_count == old_dedup_count
+            && source->dedup_cap == old_dedup_cap
             && source->view_generation == old_generation
             && wl_columnar_memory_reserved(governor) == baseline,
             "mutable image one-byte stage denial preserves source and credit");
@@ -219,6 +262,13 @@ test_mutable_image_transaction(void)
     CHECK(col_rel_mutable_image_prepare(source, &txn) == ENOMEM
         && col_rel_mutable_image_get(&txn) == NULL
         && source->columns == old_columns
+        && source->timestamps == old_timestamps
+        && source->merge_columns == old_merge_columns
+        && source->nrows == old_nrows
+        && source->capacity == old_capacity
+        && source->storage_generation == old_storage_generation
+        && source->dedup_count == old_dedup_count
+        && source->dedup_cap == old_dedup_cap
         && wl_columnar_memory_reserved(governor) == baseline,
         "mutable image payload allocation failure rolls back admissions");
     CHECK(col_rel_mutable_image_prepare(source, &txn) == 0
@@ -258,6 +308,7 @@ test_mutable_image_transaction(void)
         uint64_t image_dedup = image->dedup_reserved_bytes;
         CHECK(source->nrows == 1 && source->columns[0][0] == first,
             "mutable image mutation does not change source");
+        wl_columnar_relation_test_fail_next_governed_copy_payload_alloc();
         CHECK(col_rel_mutable_image_commit(&txn) == 0
             && source->nrows == old_cap + 2u
             && source->columns[0][1] == second
@@ -270,6 +321,7 @@ test_mutable_image_transaction(void)
             && source->retained_reservation.owner_bits == (uintptr_t)source
             && source->dedup_reservation.owner_bits == (uintptr_t)source,
             "mutable image commit transfers live image tokens and contents");
+        wl_columnar_relation_test_clear_governed_copy_payload_alloc();
         wl_mem_ledger_snapshot(&ledger, &snapshot);
         CHECK(snapshot.subsys_bytes[WL_MEM_SUBSYS_TIMESTAMP]
             == col_rel_timestamp_ledger_bytes(source)

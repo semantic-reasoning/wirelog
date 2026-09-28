@@ -619,6 +619,8 @@ bool wl_columnar_relation_test_rollback_cleanup_was_ordered(void);
 void wl_columnar_relation_test_fail_next_compact_rollback(void);
 void wl_columnar_relation_test_fail_next_compact_commit(void);
 void wl_columnar_relation_test_fail_next_governed_copy_payload_alloc(void);
+void wl_columnar_relation_test_clear_governed_copy_payload_alloc(void);
+void wl_columnar_relation_test_fail_next_mutable_image_overflow(void);
 void wl_columnar_relation_test_clear_prepare_resize(void);
 void wl_columnar_relation_test_fail_next_commit_publication(void);
 void wl_columnar_memory_governor_test_refuse_next_release(void);
