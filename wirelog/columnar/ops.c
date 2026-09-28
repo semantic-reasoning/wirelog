@@ -107,6 +107,13 @@ int
 col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
 {
+    if (sess->tdd_input_run) {
+        col_rel_t *bound = NULL;
+        bool delta = false;
+        int rc = wl_columnar_eval_tdd_plan_resolve_input(sess, op, false,
+                &bound, &delta);
+        return rc ? rc : eval_stack_push_delta(stack, bound, false, delta);
+    }
     if (!op->relation_name)
         return ENOENT;
     col_rel_t *full_rel = session_find_rel(sess, op->relation_name);

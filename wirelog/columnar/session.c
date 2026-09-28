@@ -645,7 +645,7 @@ wl_columnar_session_cleanup_ready(wl_col_session_t *sess)
 {
     if (!sess)
         return EINVAL;
-    if (sess->delta_publish_active)
+    if (sess->delta_publish_active || sess->tdd_input_run)
         return EBUSY;
     if (sess->tdd_owner_lifetime) {
         if (sess->tdd_owner_lifetime->evaluation_active
@@ -3157,7 +3157,7 @@ col_session_destroy(wl_session_t *session)
     /* Public destruction has already closed admission and drained workers.
      * Refused internal readers violate the same synchronous teardown invariant
      * as refused relation destruction below; never free their allocators. */
-    int cleanup_rc = (sess->cleanup_active
+    int cleanup_rc = (sess->tdd_input_run || sess->cleanup_active
         || wl_columnar_eval_delta_rollback_active(sess)) ? EBUSY
         : wl_columnar_eval_stack_cleanup_retry(sess);
     if (cleanup_rc == 0)
@@ -3323,7 +3323,8 @@ col_worker_session_create(wl_col_session_t *coordinator,
         return EINVAL;
     /* Worker storage is reusable only after a complete destroy. A refused
      * teardown leaves ownership in place and permanently closes this worker. */
-    if (out_worker->teardown_started)
+    if (out_worker->teardown_started || out_worker->tdd_input_run
+        || coordinator->tdd_input_run)
         return EBUSY;
 
     /* #1661: the worker registry is heap-only, and this is the one registry
@@ -3408,6 +3409,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->deferred_relations = NULL;
     out_worker->deferred_relation_count = 0;
     out_worker->cleanup_active = NULL;
+    out_worker->tdd_input_run = NULL;
     out_worker->cleanup_pending = NULL;
     out_worker->cleanup_active_count = 0;
     out_worker->cleanup_pending_count = 0;
@@ -3639,7 +3641,7 @@ col_worker_session_destroy(wl_col_session_t *worker)
     if (!worker)
         return 0;
     /* Nesting is allowed during evaluation, never during destruction. */
-    if (worker->cleanup_active
+    if (worker->tdd_input_run || worker->cleanup_active
         || wl_columnar_eval_delta_rollback_active(worker))
         return EBUSY;
     int cleanup_rc = wl_columnar_eval_stack_cleanup_retry(worker);

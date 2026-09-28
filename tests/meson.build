@@ -5926,3 +5926,18 @@ test_tdd_delta_driver_plan_exe = executable(
 )
 test('tdd_delta_driver_plan', test_tdd_delta_driver_plan_exe,
      env: ['WIRELOG_TEST_CSPA_PLAN=' + meson.project_source_root() / 'bench/workloads/cspa.dl'])
+
+# #1984: actual operator consumption of occurrence-bound worker inputs.
+test_tdd_occurrence_execution_exe = executable(
+  'test_tdd_occurrence_execution',
+  files('test_tdd_occurrence_execution.c'),
+  backend_src, parser_src, ir_src, optimizer_src, arena_src,
+  io_src, thread_src, workqueue_src,
+  c_args: ['-DENABLE_K_FUSION=0', '-DWL_SESSION_TEST_HOOKS=1'] + (tdd_driver_wrap ? ['-DWL_TEST_ALLOC_WRAP=1'] : []),
+  link_args: tdd_driver_wrap ? ['-Wl,--wrap=calloc'] : [],
+  override_options: tdd_driver_wrap ? ['b_lto=false'] : [],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+test('tdd_occurrence_execution', test_tdd_occurrence_execution_exe,
+     env: ['WIRELOG_TEST_CSPA_PLAN=' + meson.project_source_root() / 'bench/workloads/cspa.dl'])
