@@ -530,6 +530,275 @@ synthetic_cases(wl_col_session_t *coord)
     return 0;
 }
 
+static const int64_t seed_assign[][2] = {
+    {1, 4}, {1, 4}, {4, 1}, {1, 1}, {9, 4},
+};
+static const int64_t seed_expected[3][5][2] = {
+    {{1, 4}, {1, 4}, {4, 1}, {1, 1}, {9, 4}},
+    {{1, 1}, {1, 1}, {4, 4}, {1, 1}, {9, 9}},
+    {{4, 4}, {4, 4}, {1, 1}, {1, 1}, {4, 4}},
+};
+
+/* Compare occurrences, including duplicate rows; no consolidation oracle. */
+static int
+seed_bag(const int64_t actual[][2], const int64_t expected[][2], uint32_t n)
+{
+    bool used[15] = {0};
+    CHECK(n <= 15);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t j = 0;
+        while (j < n && (used[j] || actual[i][0] != expected[j][0]
+            || actual[i][1] != expected[j][1])) j++;
+        CHECK(j < n);
+        used[j] = true;
+    }
+    return 0;
+}
+
+static int
+seed_refusals(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
+    wl_columnar_eval_tdd_plan_manifest_t *manifest, uint32_t si)
+{
+    wl_col_session_t worker = {0};
+    CHECK(col_worker_session_create(coord, 0, NULL, 0, &worker) == 0);
+    col_rel_t *assign = relation("assign", seed_assign, 5, 0, 0);
+    CHECK(assign);
+    wl_columnar_eval_tdd_plan_slice_t *slice = &manifest->slices[si];
+    wl_columnar_eval_tdd_plan_read_t *read =
+        &manifest->reads[slice->read_start];
+    wl_columnar_eval_tdd_input_t good = capture(read, assign, 0, 1);
+    wl_plan_op_t *var = (wl_plan_op_t *)&manifest->owner_ops[slice->start];
+    wl_plan_op_t *map = var + 1;
+    wl_columnar_eval_tdd_run_t run = {0};
+    uint64_t before = reserved(&worker);
+    evaluations = 0;
+    wl_columnar_eval_test_bound_slice_after_eval = count_evaluation;
+    for (uint32_t c = 0; c < 42; c++) {
+        wl_columnar_eval_tdd_input_t input = good;
+        wl_columnar_eval_tdd_plan_manifest_t changed = *manifest;
+        const wl_columnar_eval_tdd_plan_manifest_t *m = manifest;
+        wl_columnar_eval_tdd_plan_slice_t saved_slice = *slice;
+        wl_columnar_eval_tdd_plan_read_t saved_read = *read;
+        wl_plan_op_t saved_var = *var, saved_map = *map;
+        wl_plan_expr_buffer_t saved_expr = map->map_exprs[0];
+        uint8_t saved_byte = map->map_exprs[0].data[6];
+        uint32_t width = 1, index = 0;
+        const void *partition = NULL;
+        int expected = EINVAL;
+        switch (c) {
+        case 0: worker.current_iteration = 1; expected = ENOTSUP; break;
+        case 1: worker.diff_operators_active = true; expected = ENOTSUP; break;
+        case 2: worker.delta_seeded = true; expected = ENOTSUP; break;
+        case 3: worker.retraction_seeded = true; expected = ENOTSUP; break;
+        case 4: worker.retraction_right_pass = true; expected = ENOTSUP; break;
+        case 5: width = 2; expected = ENOTSUP; break;
+        case 6: width = 2; index = 1; expected = ENOTSUP; break;
+        case 7: partition = &partition_token; expected = ENOTSUP; break;
+        case 8: input.partition = &partition_token; break;
+        case 9: input.worker_count = 2; break;
+        case 10: input.snapshot = &partition_token; break;
+        case 11: input.view_generation++; break;
+        case 12: input.storage_generation++; break;
+        case 13: input.ncols++; break;
+        case 14: changed.owner_ops++; m = &changed; break;
+        case 15: slice->driver = slice->start; break;
+        case 16: slice->inactive = true; expected = ENOTSUP; break;
+        case 17: slice->seed = false; break;
+        case 18: slice->ordinal++; expected = ENOTSUP; break;
+        case 19: slice->start++; expected = ENOTSUP; break;
+        case 20: read->kind = WL_COLUMNAR_EVAL_TDD_PLAN_DELTA; break;
+        case 21: read->right_operand = true; break;
+        case 22: read->op_index++; break;
+        case 23: var->delta_mode = WL_DELTA_AUTO; expected = ENOTSUP; break;
+        case 24: var->relation_name = "valueFlow"; expected = ENOTSUP; break;
+        case 25: map->project_count = 1; expected = ENOTSUP; break;
+        case 26: map->map_exprs[0].size--; expected = ENOTSUP; break;
+        case 27: map->map_exprs[0].data[6] = '2'; expected = ENOTSUP; break;
+        case 28: map->filter_expr.size = 1; expected = ENOTSUP; break;
+        case 29: map->opaque_data = &partition_token; expected = ENOTSUP; break;
+        case 30: input.schema_ok = !input.schema_ok; break;
+        case 31: input.declared_ncols++; break;
+        case 32: input.name = "wrong"; break;
+        case 33: worker.join_batch_bytes = 1; expected = ENOTSUP; break;
+        case 34: map->delta_mode = WL_DELTA_FORCE_FULL; expected = ENOTSUP;
+            break;
+        case 35: input.read = read + 1; break;
+        case 36: input.worker_index = 1; break;
+        case 37: var->materialized = true; expected = ENOTSUP; break;
+        case 38: map->materialized = true; expected = ENOTSUP; break;
+        case 39: var->map_exprs = map->map_exprs; expected = ENOTSUP; break;
+        case 40: map->filter_expr.data = &saved_byte; expected = ENOTSUP;
+            break;
+        case 41: var->project_indices = map->project_indices;
+            expected = ENOTSUP; break;
+        }
+        /* A held writer proves each refusal precedes reader acquisition. */
+        wl_columnar_source_access_writer_t writer = {0};
+        CHECK(col_rel_source_writer_acquire(assign, &writer) == 0);
+        int rc = wl_columnar_eval_tdd_run_bound_slice_begin(&worker, sp, m,
+                si, &snapshot_token, partition, index, width, &input, 1, &run);
+        CHECK(wl_columnar_source_access_writer_release(&writer) == 0);
+        *slice = saved_slice; *read = saved_read;
+        *var = saved_var; *map = saved_map;
+        map->map_exprs[0] = saved_expr;
+        map->map_exprs[0].data[6] = saved_byte;
+        if (rc != expected) fprintf(stderr, "seed refusal %u: %d != %d\n",
+                c, rc, expected);
+        CHECK(rc == expected && !run.worker && !worker.tdd_input_run &&
+            !worker.cleanup_active && !worker.cleanup_pending &&
+            reserved(&worker) == before && evaluations == 0);
+        worker.current_iteration = 0;
+        worker.diff_operators_active = worker.delta_seeded = false;
+        worker.retraction_seeded = worker.retraction_right_pass = false;
+        worker.join_batch_bytes = 0;
+    }
+    uint32_t copies = 0;
+    for (uint32_t s = 0; s < manifest->slice_count; s++) {
+        const wl_columnar_eval_tdd_plan_slice_t *other = &manifest->slices[s];
+        if (!other->seed || !other->alternative) continue;
+        wl_columnar_eval_tdd_input_t input = capture(
+            &manifest->reads[other->read_start], assign, 0, 1);
+        wl_columnar_source_access_writer_t writer = {0};
+        CHECK(col_rel_source_writer_acquire(assign, &writer) == 0);
+        CHECK(wl_columnar_eval_tdd_run_bound_slice_begin(&worker, sp,
+            manifest, s, &snapshot_token, NULL, 0, 1, &input, 1,
+            &run) == ENOTSUP);
+        CHECK(wl_columnar_source_access_writer_release(&writer) == 0);
+        CHECK(!run.worker && !worker.cleanup_active && !worker.cleanup_pending
+            && reserved(&worker) == before && evaluations == 0);
+        copies++;
+    }
+    CHECK(copies == 3 * (manifest->alternative_count - 1));
+    wl_columnar_eval_test_bound_slice_after_eval = NULL;
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(worker.memory_governor);
+    uint64_t limit = atomic_load(&governor->usable_bytes);
+    wl_columnar_memory_mode_t mode = governor->mode;
+    governor->mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    atomic_store(&governor->usable_bytes, before);
+    worker.memory_budget_denied = false;
+    CHECK(wl_columnar_eval_tdd_run_bound_slice_begin(&worker, sp, manifest,
+        si, &snapshot_token, NULL, 0, 1, &good, 1, &run) == ENOSPC);
+    CHECK(worker.memory_budget_denied && !run.worker &&
+        reserved(&worker) == before);
+    atomic_store(&governor->usable_bytes, limit);
+    governor->mode = mode;
+    worker.memory_budget_denied = false;
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_calloc_after = 0;
+    int rc = wl_columnar_eval_tdd_run_bound_slice_begin(&worker, sp, manifest,
+            si, &snapshot_token, NULL, 0, 1, &good, 1, &run);
+    fail_calloc_after = -1;
+    CHECK(rc == ENOMEM && !run.worker && !worker.memory_budget_denied &&
+        reserved(&worker) == before);
+#endif
+    /* A retained intermediate keeps the seed input pinned; retry only cleans. */
+    evaluations = 0;
+    wl_columnar_eval_test_bound_slice_after_eval = pin_result_and_fail;
+    CHECK(wl_columnar_eval_tdd_run_bound_slice_begin(&worker, sp, manifest,
+        si, &snapshot_token, NULL, 0, 1, &good, 1, &run) == ENOMEM);
+    CHECK(run.worker && worker.cleanup_pending && evaluations == 1);
+    wl_columnar_source_access_writer_t writer = {0};
+    CHECK(col_rel_source_writer_acquire(assign, &writer) == EBUSY);
+    CHECK(wl_columnar_eval_tdd_run_bound_slice_finish(&run, NULL) == ENOMEM &&
+        run.worker && evaluations == 1);
+    CHECK(col_rel_source_reader_release(&held_result) == 0);
+    wl_columnar_eval_test_bound_slice_after_eval = NULL;
+    CHECK(wl_columnar_eval_tdd_run_bound_slice_finish(&run, NULL) == ENOMEM &&
+        !run.worker && reserved(&worker) == before);
+    evaluations = release_calls = 0;
+    wl_columnar_eval_test_bound_slice_after_eval = count_evaluation;
+    wl_columnar_eval_test_bound_slice_before_release = refuse_release_once;
+    CHECK(wl_columnar_eval_tdd_run_bound_slice_begin(&worker, sp, manifest,
+        si, &snapshot_token, NULL, 0, 1, &good, 1, &run) == 0);
+    col_rel_t *saved = run.output, *out = NULL;
+    CHECK(saved && saved->nrows == 5);
+    CHECK(wl_columnar_eval_tdd_run_bound_slice_finish(&run, &out) == EBUSY &&
+        !out && run.output == saved && evaluations == 1);
+    CHECK(wl_columnar_eval_tdd_run_bound_slice_finish(&run, &out) == 0 &&
+        out == saved && evaluations == 1);
+    wl_columnar_eval_test_bound_slice_after_eval = NULL;
+    wl_columnar_eval_test_bound_slice_before_release = NULL;
+    CHECK(col_rel_destroy_checked(out) == 0 && reserved(&worker) == before);
+    CHECK(assign->nrows == 5);
+    for (uint32_t i = 0; i < 5; i++)
+        CHECK(assign->columns[0][i] == seed_assign[i][0] &&
+            assign->columns[1][i] == seed_assign[i][1]);
+    CHECK(col_rel_destroy_checked(assign) == 0);
+    CHECK(col_worker_session_destroy(&worker) == 0);
+    return 0;
+}
+
+static int
+seed_cases(wl_col_session_t *coord, const wl_plan_stratum_t *sp)
+{
+    uint32_t ri = 0;
+    while (ri < sp->relation_count && strcmp(sp->relations[ri].name,
+        "valueFlow") != 0) ri++;
+    CHECK(ri < sp->relation_count);
+    wl_columnar_eval_tdd_plan_manifest_t manifest = {0};
+    CHECK(wl_columnar_eval_tdd_plan_bindings(sp, ri, &manifest) == 0);
+    uint32_t first = UINT32_MAX;
+    for (uint32_t rows = 0; rows <= 5; rows += 5) {
+        int64_t total[15][2], expected[15][2];
+        uint32_t count = 0, shapes = 0;
+        for (uint32_t si = 0; si < manifest.slice_count; si++) {
+            const wl_columnar_eval_tdd_plan_slice_t *slice =
+                &manifest.slices[si];
+            if (!slice->seed || slice->alternative != 0) continue;
+            if (first == UINT32_MAX) first = si;
+            CHECK(slice->count == 2 && slice->read_count == 1);
+            const wl_plan_op_t *map = &manifest.owner_ops[slice->start + 1];
+            CHECK(map->op == WL_PLAN_OP_MAP && map->project_count == 2 &&
+                map->project_indices && map->map_expr_count == 2);
+            uint32_t a = map->project_indices[0], b = map->project_indices[1];
+            CHECK((a == 0 && b <= 1) || (a == 1 && b == 1));
+            uint32_t shape = a == b ? a + 1 : 0;
+            CHECK(!(shapes & (1u << shape)));
+            shapes |= 1u << shape;
+            wl_col_session_t worker = {0};
+            CHECK(col_worker_session_create(coord, 0, NULL, 0, &worker) == 0);
+            col_rel_t *assign = relation("assign", seed_assign, rows, 0, 0);
+            CHECK(assign);
+            const wl_columnar_eval_tdd_plan_read_t *read =
+                &manifest.reads[slice->read_start];
+            CHECK(read->kind == WL_COLUMNAR_EVAL_TDD_PLAN_FULL);
+            wl_columnar_eval_tdd_input_t input = capture(read, assign, 0, 1);
+            uint64_t before = reserved(&worker);
+            wl_columnar_eval_tdd_run_t run = {0};
+            CHECK(wl_columnar_eval_tdd_run_bound_slice_begin(&worker, sp,
+                &manifest, si, &snapshot_token, NULL, 0, 1, &input, 1,
+                &run) == 0);
+            wl_columnar_source_access_writer_t writer = {0};
+            CHECK(col_rel_source_writer_acquire(assign, &writer) == EBUSY);
+            CHECK(col_worker_session_destroy(&worker) == EBUSY);
+            col_rel_t *out = NULL;
+            CHECK(wl_columnar_eval_tdd_run_bound_slice_finish(&run, &out) == 0);
+            CHECK(out && out->nrows == rows && out->ncols == 2 &&
+                !out->pool_owned && !out->arena_owned);
+            CHECK(col_rel_destroy_checked(assign) == 0);
+            int64_t actual[5][2];
+            for (uint32_t i = 0; i < rows; i++) {
+                actual[i][0] = out->columns[0][i];
+                actual[i][1] = out->columns[1][i];
+                memcpy(total[count], actual[i], sizeof(actual[i]));
+                memcpy(expected[count++], seed_expected[shape][i],
+                    sizeof(actual[i]));
+            }
+            CHECK(seed_bag(actual, seed_expected[shape], rows) == 0);
+            CHECK(col_rel_destroy_checked(out) == 0 &&
+                reserved(&worker) == before);
+            CHECK(col_worker_session_destroy(&worker) == 0);
+        }
+        CHECK(shapes == 7 && count == 3 * rows);
+        CHECK(seed_bag(total, expected, count) == 0);
+    }
+    CHECK(first != UINT32_MAX && seed_refusals(coord, sp, &manifest,
+        first) == 0);
+    wl_columnar_eval_tdd_plan_bindings_free(&manifest);
+    return 0;
+}
+
 int main(void)
 {
     const char *path = getenv("WIRELOG_TEST_CSPA_PLAN");
@@ -572,6 +841,7 @@ int main(void)
     CHECK(exercised == 5);
     CHECK(negative_cases(coord, sp, &manifest) == 0);
     CHECK(synthetic_cases(coord) == 0);
+    CHECK(seed_cases(coord, sp) == 0);
     wl_session_destroy(session);
     wl_columnar_eval_tdd_plan_bindings_free(&manifest);
     wl_plan_free(plan); wirelog_program_free(program);
