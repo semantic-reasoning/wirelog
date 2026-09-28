@@ -100,6 +100,20 @@ expect_gate 'schema 2 tuple, iteration, and files manifest pass' 0 \
     'doop_w8_gate OK: tuples=13828835 iterations=153' \
     WIRELOG_PERF_REQUIRE=1 WL_DOOP_PERF_GATE_TARGET_MS=10 \
     FAKE_TUPLES=13828835 FAKE_ITERS=153
+printf 'schedutil\n' > "$governor"
+expect_gate 'tagged runner enforces timing without requiring performance governor' 0 \
+    'timing=enforced mode=strict-tagged' \
+    WIRELOG_PERF_REQUIRE=1 WIRELOG_DOOP_PERF_MODE=strict-tagged \
+    WL_DOOP_PERF_GATE_TARGET_MS=10 FAKE_TUPLES=13828835 FAKE_ITERS=153
+expect_gate 'tagged runner still rejects median above target' 1 \
+    'median 1 ms exceeds target 0 ms' \
+    WIRELOG_PERF_REQUIRE=1 WIRELOG_DOOP_PERF_MODE=strict-tagged \
+    WL_DOOP_PERF_GATE_TARGET_MS=0 FAKE_TUPLES=13828835 FAKE_ITERS=153
+expect_gate 'strict stable mode still requires performance governor' 1 \
+    "cpufreq governor is 'schedutil'" \
+    WIRELOG_PERF_REQUIRE=1 WIRELOG_DOOP_PERF_MODE=strict-stable \
+    WL_DOOP_PERF_GATE_TARGET_MS=10 FAKE_TUPLES=13828835 FAKE_ITERS=153
+printf 'performance\n' > "$governor"
 expect_gate 'hosted required mode accepts correctness without a stable target' 0 \
     'timing=advisory mode=required-hosted' \
     WIRELOG_PERF_REQUIRE=1 WIRELOG_DOOP_PERF_MODE=required-hosted \

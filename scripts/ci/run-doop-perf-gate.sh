@@ -29,7 +29,7 @@ required_or_skip() {
     skip "set WIRELOG_PERF_GATE=1 to run on dedicated performance hardware"
 
 case "$WIRELOG_DOOP_PERF_MODE" in
-    required-hosted|strict-stable) ;;
+    required-hosted|strict-stable|strict-tagged) ;;
     *) fail "unknown DOOP performance mode: $WIRELOG_DOOP_PERF_MODE" ;;
 esac
 
@@ -72,7 +72,7 @@ bench_bin="${WIRELOG_DOOP_BENCH_BIN:-bench/bench_flowlog}"
     required_or_skip "DOOP data directory not found: $data_dir"
 [[ -x "$bench_bin" ]] || fail "bench_flowlog not found or not executable: $bench_bin"
 
-if [[ "$WIRELOG_DOOP_PERF_MODE" == strict-stable ]]; then
+if [[ "$WIRELOG_DOOP_PERF_MODE" != required-hosted ]]; then
     [[ -n "$WL_DOOP_PERF_GATE_TARGET_MS" ]] || \
         required_or_skip "no calibrated 5-repetition W=8 target; set WL_DOOP_PERF_GATE_TARGET_MS"
 fi
@@ -237,7 +237,7 @@ IFS=$'\t' read -r workload _ facts workers repeat min_ms median_ms max_ms rss tu
 
 [[ "$result" == OK ]] || fail "DOOP result status is '$result'"
 timing_status=enforced
-if [[ "$WIRELOG_DOOP_PERF_MODE" == strict-stable ]]; then
+if [[ "$WIRELOG_DOOP_PERF_MODE" != required-hosted ]]; then
     if ! awk -v value="$median_ms" -v target="$WL_DOOP_PERF_GATE_TARGET_MS" \
         'BEGIN { exit !(value + 0 <= target + 0) }'; then
         fail "median ${median_ms} ms exceeds target ${WL_DOOP_PERF_GATE_TARGET_MS} ms"

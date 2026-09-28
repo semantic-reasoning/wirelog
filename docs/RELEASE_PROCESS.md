@@ -361,7 +361,8 @@ DOOP is a separate mandatory execution contract for issue #1351:
 `perf-nightly` runs the pinned dataset at W=8/repeat=5 on the
 `[self-hosted, Linux, X64, wirelog-perf]` runner, rejects missing or skipped
 correctness evidence, and retains the raw log and host/oracle evidence. Its
-timing uses the strict-stable calibrated target; see
+timing uses the strict-tagged calibrated target; the cpufreq governor is
+recorded as provenance but is not required; see
 `docs/DOOP_PERF_BASELINE.md`.
 
 Current enforcement is correctness sentinels plus median/mean/stdev/CoV
