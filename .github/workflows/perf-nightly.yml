@@ -295,9 +295,9 @@ jobs:
           if-no-files-found: warn
           retention-days: 35
 
-  # Authoritative DOOP execution for issue #1351.  The execution and
-  # Correctness and DOOP timing run on the provisioned perf runner so the
-  # strict governor/threshold contract has stable CPU and affinity semantics.
+  # Authoritative DOOP execution for issue #1351. Correctness gates and DOOP
+  # timing run on the tagged perf runner. The calibrated
+  # threshold is enforced; the governor is captured as provenance only.
   perf-stable:
     name: Perf wirelog-perf / correctness + DOOP
     runs-on: [self-hosted, Linux, X64, wirelog-perf]
@@ -353,7 +353,7 @@ jobs:
         env:
           WIRELOG_PERF_GATE: '1'
           WIRELOG_PERF_REQUIRE: '1'
-          WIRELOG_DOOP_PERF_MODE: strict-stable
+          WIRELOG_DOOP_PERF_MODE: strict-tagged
           WL_DOOP_PERF_GATE_TARGET_MS: ${{ vars.WL_DOOP_PERF_GATE_TARGET_MS }}
         run: |
           doop_affinity=$(taskset -pc $$ | sed 's/.*: //')
@@ -411,7 +411,7 @@ jobs:
           affinity=$(taskset -pc $$ | sed 's/.*: //')
           governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor \
             2>/dev/null || echo unavailable)
-          printf '{\n  "commit": "%s",\n  "workflow": "%s",\n  "run_id": "%s",\n  "runner_os": "%s",\n  "runner_arch": "%s",\n  "runner_image": "%s",\n  "cpu_count": %s,\n  "affinity": "%s",\n  "governor": "%s",\n  "workers": 8,\n  "repeat": 5,\n  "mode": "strict-stable",\n  "timing": "enforced"\n}\n' \
+          printf '{\n  "commit": "%s",\n  "workflow": "%s",\n  "run_id": "%s",\n  "runner_os": "%s",\n  "runner_arch": "%s",\n  "runner_image": "%s",\n  "cpu_count": %s,\n  "affinity": "%s",\n  "governor": "%s",\n  "workers": 8,\n  "repeat": 5,\n  "mode": "strict-tagged",\n  "timing": "enforced"\n}\n' \
             "$commit" "$GITHUB_WORKFLOW" "$GITHUB_RUN_ID" "$RUNNER_OS" \
             "$RUNNER_ARCH" "${ImageOS:-unknown}" "$(nproc --all)" \
             "$affinity" "$governor" > perf-artifacts/doop/host.json

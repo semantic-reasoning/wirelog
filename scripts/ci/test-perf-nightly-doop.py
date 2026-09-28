@@ -76,7 +76,7 @@ def validate(text: str) -> None:
     for variable in (
         "WIRELOG_PERF_GATE: '1'",
         "WIRELOG_PERF_REQUIRE: '1'",
-        "WIRELOG_DOOP_PERF_MODE: strict-stable",
+        "WIRELOG_DOOP_PERF_MODE: strict-tagged",
         "WL_DOOP_PERF_GATE_TARGET_MS: ${{ vars.WL_DOOP_PERF_GATE_TARGET_MS }}",
     ):
         assert variable in doop_env, f"DOOP step must set {variable}"
@@ -91,6 +91,12 @@ def validate(text: str) -> None:
     assert "check-doop-perf-gate-execution.sh" in verify
     evidence = field(step(stable, "Capture DOOP execution evidence"), "run")
     assert '"workers": 8' in evidence and '"repeat": 5' in evidence
+    assert '"governor": "%s"' in evidence, \
+        "host evidence must retain the observed governor"
+    assert '"mode": "strict-tagged"' in evidence, \
+        "host evidence must report the governor-independent tagged mode"
+    assert '"timing": "enforced"' in evidence, \
+        "tagged mode must retain enforced timing evidence"
     upload = field(step(stable, "Upload DOOP execution evidence"), "with")
     assert "perf-artifacts/doop" in upload
 
