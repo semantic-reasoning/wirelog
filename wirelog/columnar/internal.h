@@ -578,6 +578,46 @@ typedef struct col_rel_replacement {
     bool writer_acquired;
 } col_rel_replacement_t;
 
+/* Private governed source image. The source writer remains held until commit
+ * or discard; callers may mutate only the image returned by get(). */
+typedef struct col_rel_mutable_image {
+    col_rel_t *source;
+    col_rel_t *image;
+    wl_columnar_source_access_writer_t writer;
+} col_rel_mutable_image_t;
+
+/* The boundary that matters is thread affinity, not the return code.
+ *
+ * discard() is a no-op when the transaction records no source.  Otherwise it
+ * aborts on the same three conditions that make commit() return EINVAL for a
+ * live transaction: a writer token whose owner is not this source, whose
+ * identity is not the token's own address, or whose thread is not this one.
+ * So: discard unconditionally, on the thread that ran prepare() and through
+ * the same object.  The token is bound to its own address, so discarding a
+ * by-value copy of the transaction aborts; from another thread neither
+ * commit() nor discard() is usable.
+ *
+ * commit() also returns EINVAL for a null, zeroed or image-cleared
+ * transaction.  discard() stays correct in each of those, and for the
+ * image-cleared one it is required: it releases the writer that would
+ * otherwise keep col_rel_destroy_checked returning EBUSY, which
+ * col_rel_destroy discards, leaking the relation and its credit.  commit()
+ * returns EBUSY when the source or image no longer validates or the image has
+ * acquired a name, a pool or another governor; it publishes nothing and the
+ * transaction stays live.
+ *
+ * prepare() returns EINVAL on a null argument and EBUSY on an already-live
+ * transaction, touching neither, so a second call cannot orphan the first
+ * one's writer.  It also returns EBUSY from the writer acquisition itself, so
+ * EBUSY does not mean the transaction was already live.  Every failure after
+ * the acquisition leaves it inert: no source or image recorded and no writer
+ * held.  On 0 it is live and owns the source writer. */
+int col_rel_mutable_image_prepare(col_rel_t *source,
+    col_rel_mutable_image_t *transaction);
+col_rel_t *col_rel_mutable_image_get(col_rel_mutable_image_t *transaction);
+int col_rel_mutable_image_commit(col_rel_mutable_image_t *transaction);
+void col_rel_mutable_image_discard(col_rel_mutable_image_t *transaction);
+
 #ifdef WL_TEST_APPEND_HOOK
 /* Test-only seam for the append ownership-transition window.  This is not
  * part of the installed/public header surface. */
@@ -607,6 +647,9 @@ bool wl_columnar_relation_test_rollback_cleanup_was_ordered(void);
 void wl_columnar_relation_test_fail_next_compact_rollback(void);
 void wl_columnar_relation_test_fail_next_compact_commit(void);
 void wl_columnar_relation_test_fail_next_governed_copy_payload_alloc(void);
+void wl_columnar_relation_test_clear_governed_copy_payload_alloc(void);
+void wl_columnar_relation_test_fail_next_mutable_image_overflow(void);
+void wl_columnar_relation_test_clear_mutable_image_overflow(void);
 void wl_columnar_relation_test_clear_prepare_resize(void);
 void wl_columnar_relation_test_fail_next_commit_publication(void);
 void wl_columnar_memory_governor_test_refuse_next_release(void);
@@ -3587,6 +3630,8 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess);
 
 uint64_t
 wl_columnar_eval_dedup_row_hash(const col_rel_t *r, uint32_t row);
+int wl_columnar_eval_dedup_set_clone_exact(col_rel_t *dst,
+    const col_rel_t *src);
 bool
 wl_columnar_eval_dedup_set_insert(col_rel_t *r, uint64_t h);
 bool
