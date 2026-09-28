@@ -1656,6 +1656,7 @@ typedef struct wl_columnar_eval_stack_cleanup_frame
     wl_columnar_eval_stack_cleanup_frame_t;
 struct wl_columnar_retained_eval_entry;
 struct wl_columnar_kfusion_cohort;
+typedef struct wl_columnar_eval_tdd_run wl_columnar_eval_tdd_run_t;
 typedef struct wl_columnar_tdd_owner_lifetime {
     uint32_t worker_count;
     uint32_t relation_count;
@@ -2032,6 +2033,8 @@ typedef struct wl_col_session_t {
      * the specialized nonrecursive parallel rule evaluators. K-Fusion is the
      * one evaluator that still drains an unframed stack; see #1648. */
     wl_columnar_eval_stack_cleanup_frame_t *cleanup_active;
+    /* Caller-owned bound-slice handle; blocks reuse until finish succeeds. */
+    wl_columnar_eval_tdd_run_t *tdd_input_run;
     wl_columnar_eval_stack_cleanup_frame_t *cleanup_pending;
     uint32_t cleanup_active_count;
     uint32_t cleanup_pending_count;
@@ -3687,7 +3690,81 @@ typedef struct {
     uint32_t read_count;
     wl_columnar_eval_tdd_plan_slice_t *slices;
     wl_columnar_eval_tdd_plan_read_t *reads;
+    const wl_plan_stratum_t *owner_stratum;
+    const wl_plan_relation_t *owner_relation;
+    const wl_plan_op_t *owner_ops;
+    uint32_t owner_op_count;
 } wl_columnar_eval_tdd_plan_manifest_t;
+
+/* Explicit caller snapshot, schema and partition attestations. The caller
+ * holds an epoch barrier or pinned views before capture; matching tokens alone
+ * do not establish a coherent epoch or global partition coverage. Borrowed
+ * names/arrays, plan, manifest and source contents remain immutable. Keep all
+ * borrowed data, sources and worker alive through successful finish.
+ * Inputs are ordered exactly as the selected manifest slice's reads. */
+typedef struct {
+    const wl_columnar_eval_tdd_plan_read_t *read;
+    col_rel_t *relation;
+    const char *name;
+    const void *snapshot;
+    const void *partition;
+    uint64_t view_generation, storage_generation;
+    uint32_t worker_index, worker_count;
+    uint32_t ncols, declared_ncols;
+    bool schema_ok;
+    const char *const *column_names;
+    const wirelog_column_type_t *column_types;
+    wirelog_compound_kind_t compound_kind;
+    uint32_t compound_count, compound_arity_len, inline_physical_offset;
+    const uint32_t *compound_arity_map;
+    bool has_graph_column;
+    uint32_t graph_col_idx;
+} wl_columnar_eval_tdd_input_t;
+
+typedef struct {
+    wl_columnar_eval_tdd_input_t input;
+    wl_columnar_source_access_reader_t reader;
+} wl_columnar_eval_tdd_input_slot_t;
+
+/* Zero-initialize and keep at a stable address. Never move/copy a live handle.
+ * begin evaluates once; finish only cleans up and transfers independent output.
+ * Passing NULL for owned_result discards the output during finish.
+ * A non-NULL worker after any error means ownership remains here: retain all
+ * dependencies and retry finish. A primary evaluation error wins over cleanup
+ * refusal. Successful cleanup clears worker even when returning that error. */
+struct wl_columnar_eval_tdd_run {
+    wl_col_session_t *worker;
+    const wl_columnar_eval_tdd_plan_manifest_t *manifest;
+    const wl_columnar_eval_tdd_plan_slice_t *slice;
+    wl_columnar_eval_tdd_input_slot_t *slots;
+    uint32_t input_count;
+    wl_columnar_memory_reservation_t reservation;
+    wl_columnar_memory_governor_ref_t *governor;
+    wl_columnar_eval_stack_cleanup_frame_t *cleanup;
+    col_rel_t *output;
+    const wl_plan_op_t *current_op;
+    bool evaluating;
+    int primary_rc;
+};
+
+int wl_columnar_eval_tdd_run_bound_slice_begin(wl_col_session_t *worker,
+    const wl_plan_stratum_t *stratum,
+    const wl_columnar_eval_tdd_plan_manifest_t *manifest, uint32_t slice_index,
+    const void *snapshot, const void *partition,
+    uint32_t worker_index, uint32_t worker_count,
+    const wl_columnar_eval_tdd_input_t *inputs, uint32_t input_count,
+    wl_columnar_eval_tdd_run_t *run);
+int wl_columnar_eval_tdd_run_bound_slice_finish(wl_columnar_eval_tdd_run_t *run,
+    col_rel_t **owned_result);
+int wl_columnar_eval_tdd_plan_prepare_inputs(wl_col_session_t *worker,
+    const wl_plan_stratum_t *stratum,
+    const wl_columnar_eval_tdd_plan_manifest_t *manifest, uint32_t slice_index,
+    const void *snapshot, const void *partition,
+    uint32_t worker_index, uint32_t worker_count,
+    const wl_columnar_eval_tdd_input_t *inputs, uint32_t input_count,
+    wl_columnar_eval_tdd_run_t *run);
+int wl_columnar_eval_tdd_plan_resolve_input(wl_col_session_t *worker,
+    const wl_plan_op_t *op, bool right, col_rel_t **relation, bool *delta);
 
 /* out must not own a previous manifest. Every failure leaves it empty.
  * EINVAL: malformed/inconsistent expansion; ENOTSUP: unsupported plan form;

@@ -260,3 +260,43 @@ atomic round publication: immutable same-epoch full reads, governed lifetimes,
 worker drain/rollback, partition/epoch-aware cache reuse, and exact derived
 results across simultaneous deltas, retractions and retries. #1982 retains
 actual W=2/8 dispatch and qualified paired performance acceptance.
+
+## Occurrence-bound worker execution (#1984)
+
+The internal `wl_columnar_eval_tdd_run_bound_slice_begin()` helper executes one
+active manifest slice through the real VARIABLE, JOIN and lowered SEMIJOIN
+operators. The caller supplies every input occurrence from one immutable epoch:
+only the designated DELTA occurrence is partitioned; FULL and PREFILTER inputs
+retain their full view. Captured names, schema, generations, owner-plan identity
+and partition metadata are checked before execution. Snapshot and partition
+tokens attest caller setup; they cannot establish coherent provenance or global
+partition coverage without the caller's snapshot barrier or pinned views.
+
+The caller keeps a zero-initialized run handle at a stable address. It owns
+reserved input bookkeeping, descriptor reader leases, cleanup state and an
+independent governed output. The worker, sources, manifest, plan and borrowed
+metadata must remain alive and immutable until finish clears the handle.
+`wl_columnar_eval_tdd_run_bound_slice_finish()` transfers the output only after
+cleanup succeeds; passing NULL discards it. If cleanup refuses, the handle
+retains ownership and blocks worker reuse/destruction. Retry only finishes
+cleanup and preserves the primary evaluation error; it never re-executes the
+slice. Even an empty or single-row borrowed VARIABLE result is detached while
+its source is pinned.
+
+Bound execution bypasses name-based delta selection, materialization-cache
+lookup/insertion and full/delta arrangement reuse. This avoids cache identities
+that do not include the supplied epoch/partition. Original plan flags and
+ordinary unbound cache behavior are unchanged. Seed/inactive slices, K=1,
+retractions/diff operators, batch pipelines, right filters and unsupported
+operators refuse before evaluation. Existing conservative TDD admission and
+SCC dispatch remain unchanged.
+
+`meson test -C builddir tdd_occurrence_execution` runs all five active alternatives
+of the unmodified generated CSPA `valueAlias` plan with independently partitioned
+small inputs at W=1/2/8 and checks exact output tuples. It also exercises a
+separate materialized JOIN with a conflicting cached result, borrowed 0/1-row
+outputs, stale/mismatched metadata, partial acquisition, governed denial,
+allocation failures (Linux), refused cleanup and cleanup-only retry. This proves
+positive single-slice execution, not signed multiplicities, convergence or
+whole-CSPA support. Epoch/read-set production, seed/K=1 policy and #1965 atomic
+SCC publication remain prerequisites for enabling that dispatch and for #1982.

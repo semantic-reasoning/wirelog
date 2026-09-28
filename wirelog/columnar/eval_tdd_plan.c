@@ -398,6 +398,8 @@ wl_columnar_eval_tdd_plan_bindings(const wl_plan_stratum_t *sp,
     wl_columnar_eval_tdd_plan_manifest_t result = {
         .relation_index = relation_index, .alternative_count = k,
         .block_size = width,
+        .owner_stratum = sp, .owner_relation = rel,
+        .owner_ops = rel->ops, .owner_op_count = rel->op_count,
     };
     int rc = wl_columnar_eval_tdd_plan_walk(sp, rel, &result);
     if (rc != 0)
@@ -423,6 +425,204 @@ wl_columnar_eval_tdd_plan_bindings(const wl_plan_stratum_t *sp,
     }
     *out = result;
     return 0;
+}
+
+/* Validate the captured schema without consulting mutable registry aliases. */
+static bool
+wl_columnar_eval_tdd_plan_input_matches(const wl_columnar_eval_tdd_input_t *in)
+{
+    const col_rel_t *rel = in->relation;
+    if (!rel || rel->ncols != in->ncols
+        || (rel->col_names == NULL) != (in->column_names == NULL))
+        return false;
+    for (uint32_t c = 0; rel->col_names && c < rel->ncols; c++) {
+        if (!wl_columnar_eval_tdd_plan_string_equal(rel->col_names[c],
+            in->column_names[c]))
+            return false;
+    }
+    return rel->name && in->name && strcmp(rel->name, in->name) == 0
+           && rel->view_generation == in->view_generation
+           && rel->storage_generation == in->storage_generation
+           && rel->declared_ncols == in->declared_ncols
+           && rel->schema_ok == in->schema_ok && !rel->timestamps
+           && (rel->column_types == NULL) == (in->column_types == NULL)
+           && (!rel->column_types || memcmp(rel->column_types, in->column_types,
+           rel->ncols * sizeof(*rel->column_types)) == 0)
+           && rel->compound_kind == in->compound_kind
+           && rel->compound_count == in->compound_count
+           && rel->compound_arity_len == in->compound_arity_len
+           && rel->inline_physical_offset == in->inline_physical_offset
+           && (rel->compound_arity_len == 0 || (rel->compound_arity_map
+           && in->compound_arity_map && memcmp(rel->compound_arity_map,
+           in->compound_arity_map,
+           rel->compound_arity_len * sizeof(uint32_t)) == 0))
+           && rel->has_graph_column == in->has_graph_column
+           && (!rel->has_graph_column ||
+           rel->graph_col_idx == in->graph_col_idx);
+}
+
+int
+wl_columnar_eval_tdd_plan_prepare_inputs(wl_col_session_t *worker,
+    const wl_plan_stratum_t *sp,
+    const wl_columnar_eval_tdd_plan_manifest_t *manifest, uint32_t slice_index,
+    const void *snapshot, const void *partition,
+    uint32_t worker_index, uint32_t worker_count,
+    const wl_columnar_eval_tdd_input_t *inputs, uint32_t input_count,
+    wl_columnar_eval_tdd_run_t *run)
+{
+    if (!worker || !sp || !manifest || !run || !inputs || !snapshot
+        || !partition || !worker_count || worker_index >= worker_count)
+        return EINVAL;
+    if (run->worker || run->slots || run->cleanup || run->output
+        || worker->teardown_started || worker->tdd_input_run ||
+        worker->cleanup_active
+        || worker->cleanup_pending)
+        return EBUSY;
+    if (manifest->owner_stratum != sp || !sp->relations
+        || manifest->relation_index >= sp->relation_count)
+        return EINVAL;
+    const wl_plan_relation_t *rel = &sp->relations[manifest->relation_index];
+    if (manifest->owner_relation != rel || manifest->owner_ops != rel->ops
+        || manifest->owner_op_count != rel->op_count || !rel->ops
+        || !manifest->slices || !manifest->reads
+        || slice_index >= manifest->slice_count)
+        return EINVAL;
+    const wl_columnar_eval_tdd_plan_slice_t *slice =
+        &manifest->slices[slice_index];
+    if (manifest->alternative_count < 2 || slice->seed || slice->inactive
+        || worker->diff_operators_active || worker->retraction_seeded
+        || worker->retraction_right_pass || worker->delta_seeded
+        || worker->join_batch_bytes > 0 || worker->join_batch_strict)
+        return ENOTSUP;
+    if (!slice->count || slice->start >= rel->op_count
+        || slice->count > rel->op_count - slice->start
+        || slice->read_start > manifest->read_count
+        || slice->read_count > manifest->read_count - slice->read_start
+        || input_count != slice->read_count || !input_count)
+        return EINVAL;
+    uint32_t reads = 0, drivers = 0;
+    for (uint32_t i = slice->start; i < slice->start + slice->count; i++) {
+        const wl_plan_op_t *op = &rel->ops[i];
+        if (op->opaque_data || op->right_filter_expr.size ||
+            op->filter_expr.size || op->agg_expr.size
+            || op->map_expr_count)
+            return ENOTSUP;
+        if (op->op == WL_PLAN_OP_MAP)
+            continue;
+        if (op->op != WL_PLAN_OP_VARIABLE && op->op != WL_PLAN_OP_JOIN
+            && op->op != WL_PLAN_OP_SEMIJOIN)
+            return ENOTSUP;
+        if ((i == slice->start) != (op->op == WL_PLAN_OP_VARIABLE)
+            || reads >= input_count)
+            return EINVAL;
+        const wl_columnar_eval_tdd_plan_read_t *read =
+            &manifest->reads[slice->read_start + reads];
+        const wl_columnar_eval_tdd_input_t *in = &inputs[reads++];
+        const char *name = wl_columnar_eval_tdd_plan_operand(op);
+        bool delta = i == slice->driver;
+        wl_columnar_eval_tdd_plan_read_kind_t kind = delta
+            ? WL_COLUMNAR_EVAL_TDD_PLAN_DELTA
+            : op->op ==
+            WL_PLAN_OP_SEMIJOIN ? WL_COLUMNAR_EVAL_TDD_PLAN_PREFILTER
+            : WL_COLUMNAR_EVAL_TDD_PLAN_FULL;
+        if (read->op_index != i || in->read != read || !name
+            || !read->relation_name || strcmp(name, read->relation_name) != 0
+            || read->right_operand != (op->op != WL_PLAN_OP_VARIABLE)
+            || read->kind != kind || in->snapshot != snapshot
+            || !wl_columnar_eval_tdd_plan_input_matches(in))
+            return EINVAL;
+        if (delta) {
+            if (op->delta_mode != WL_DELTA_FORCE_DELTA
+                || op->op == WL_PLAN_OP_SEMIJOIN
+                || in->partition != partition ||
+                in->worker_index != worker_index
+                || in->worker_count != worker_count)
+                return EINVAL;
+            drivers++;
+        } else if ((op->delta_mode != WL_DELTA_FORCE_FULL
+            && op->delta_mode != WL_DELTA_AUTO)
+            || in->partition)
+            return EINVAL;
+        if (op->op == WL_PLAN_OP_SEMIJOIN
+            && !wl_columnar_eval_tdd_plan_prefilter(rel->ops, i,
+            slice->start + slice->count))
+            return ENOTSUP;
+    }
+    if (reads != input_count || drivers != 1)
+        return EINVAL;
+    size_t bytes;
+    if (wl_columnar_eval_checked_size_mul(input_count,
+        sizeof(*run->slots), &bytes) != 0)
+        return EOVERFLOW;
+    /* Reserve in the stable caller handle: even failed setup has a durable
+     * token if releasing credit refuses. No live token is abandoned locally. */
+    wl_columnar_memory_reservation_init(&run->reservation);
+    if (worker->memory_governor) {
+        wl_columnar_memory_admission_status_t status =
+            wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(worker->memory_governor),
+            bytes, &run->reservation);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                worker->memory_budget_denied = true;
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
+                : EINVAL;
+        }
+        run->governor = worker->memory_governor;
+        wl_columnar_memory_governor_ref_retain(run->governor);
+    }
+    run->worker = worker;
+    run->manifest = manifest;
+    run->slice = slice;
+    worker->tdd_input_run = run;
+    run->slots = calloc(input_count, sizeof(*run->slots));
+    if (!run->slots)
+        return ENOMEM;
+    run->input_count = input_count;
+    if (run->governor && !wl_columnar_memory_commit(&run->reservation,
+        run->slots))
+        return EINVAL;
+    wl_columnar_eval_tdd_input_slot_t *slots = run->slots;
+    for (uint32_t i = 0; i < input_count; i++) {
+        slots[i].input = inputs[i];
+        bool duplicate = false;
+        for (uint32_t j = 0; j < i; j++)
+            duplicate |= slots[j].input.relation == inputs[i].relation;
+        if (!duplicate) {
+            int rc = col_rel_source_reader_acquire(inputs[i].relation,
+                    &slots[i].reader);
+            if (rc != 0)
+                return rc;
+        }
+        if (!wl_columnar_eval_tdd_plan_input_matches(&inputs[i]))
+            return EINVAL;
+    }
+    return 0;
+}
+
+int
+wl_columnar_eval_tdd_plan_resolve_input(wl_col_session_t *worker,
+    const wl_plan_op_t *op, bool right, col_rel_t **relation, bool *delta)
+{
+    if (!worker || !op || !relation || !delta)
+        return EINVAL;
+    wl_columnar_eval_tdd_run_t *run = worker->tdd_input_run;
+    if (!run || !run->evaluating || run->current_op != op)
+        return EBUSY;
+    for (uint32_t i = 0; i < run->input_count; i++) {
+        const wl_columnar_eval_tdd_input_t *in = &run->slots[i].input;
+        const wl_columnar_eval_tdd_plan_read_t *read = in->read;
+        if (read->op_index >= run->manifest->owner_op_count
+            || op != &run->manifest->owner_ops[read->op_index]
+            || read->right_operand != right)
+            continue;
+        *relation = in->relation;
+        *delta = read->kind == WL_COLUMNAR_EVAL_TDD_PLAN_DELTA;
+        return 0;
+    }
+    return EINVAL;
 }
 
 /*

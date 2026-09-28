@@ -40,12 +40,14 @@ _Static_assert(WL_PLAN_OP_K_FUSION == WL_PLAN_OP__BACKEND_START,
  * Evaluate all operators for one relation plan using the eval stack.
  * On success, the top of stack holds the result relation (owned).
  */
-int
-col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
+static int
+wl_columnar_eval_plan_body(const wl_plan_relation_t *rplan, eval_stack_t *stack,
     wl_col_session_t *sess)
 {
     for (uint32_t i = 0; i < rplan->op_count; i++) {
         const wl_plan_op_t *op = &rplan->ops[i];
+        if (sess->tdd_input_run)
+            sess->tdd_input_run->current_op = op;
         int rc = 0;
 
         /* NOTE: Weighted operation cases (WL_PLAN_OP_JOIN_WEIGHTED,
@@ -63,7 +65,7 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
          * Applies to both W=1 sequential evaluation and W>1 TDD workers.
          * For CRDT (k=1, no FORCE_DELTA expansion), this eliminates redundant
          * 104K-row consolidation sorting on every sub-pass (Issue #367). */
-        if (op->op == WL_PLAN_OP_VARIABLE
+        if (!sess->tdd_input_run && op->op == WL_PLAN_OP_VARIABLE
             && sess->current_iteration > 0
             && op->delta_mode == WL_DELTA_AUTO && op->relation_name) {
             /* Look ahead: base-case VARIABLE is followed by MAP (not JOIN). */
@@ -209,6 +211,22 @@ ordinary_join:
             return rc;
     }
     return 0;
+}
+
+int
+col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
+    wl_col_session_t *sess)
+{
+    if (!sess->tdd_input_run)
+        return wl_columnar_eval_plan_body(rplan, stack, sess);
+    wl_columnar_eval_tdd_run_t *run = sess->tdd_input_run;
+    if (!run->evaluating || run->current_op
+        || rplan->ops != run->manifest->owner_ops + run->slice->start
+        || rplan->op_count != run->slice->count)
+        return EBUSY;
+    int rc = wl_columnar_eval_plan_body(rplan, stack, sess);
+    run->current_op = NULL;
+    return rc;
 }
 
 /*

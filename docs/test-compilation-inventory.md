@@ -199,6 +199,7 @@ testlib_prod = static_library(
 | test_stratify_scc_bounds | dep subset `threads_dep` |
 | test_string_ops | dep subset `threads_dep` |
 | test_string_parser | dep subset `threads_dep` |
+| test_tdd_occurrence_execution | defines `ENABLE_K_FUSION=0` and `WL_SESSION_TEST_HOOKS=1`; Linux wraps `calloc` with LTO disabled |
 | test_tdd_delta_driver_plan | defines `ENABLE_K_FUSION=0`; Linux wraps `calloc` with LTO disabled |
 | test_tdd_decision_stats | defines `WL_COLUMNAR_EVAL_TEST_SUBMISSION` |
 | test_tdd_decision_stats_nofusion | defines `ENABLE_K_FUSION=0, ` WL_COLUMNAR_EVAL_TEST_SUBMISSION` |

@@ -2131,6 +2131,129 @@ done:;
     return cleanup_rc != 0 ? cleanup_rc : rc;
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+int (*wl_columnar_eval_test_bound_slice_after_eval)(
+    wl_columnar_eval_tdd_run_t *);
+int (*wl_columnar_eval_test_bound_slice_before_release)(
+    wl_columnar_eval_tdd_run_t *);
+#endif
+
+int
+wl_columnar_eval_tdd_run_bound_slice_finish(wl_columnar_eval_tdd_run_t *run,
+    col_rel_t **owned_result)
+{
+    if (!run || !run->worker || run->worker->tdd_input_run != run
+        || run->evaluating || (owned_result && *owned_result))
+        return EINVAL;
+    int rc = 0;
+    if (run->cleanup)
+        rc = wl_columnar_eval_stack_cleanup_finish(&run->cleanup);
+    else if (run->worker->cleanup_pending)
+        rc = wl_columnar_eval_stack_cleanup_retry(run->worker);
+    if (rc != 0)
+        return run->primary_rc ? run->primary_rc : rc;
+    if ((run->primary_rc || !owned_result) && run->output) {
+        rc = col_rel_destroy_checked(run->output);
+        if (rc != 0)
+            return run->primary_rc ? run->primary_rc : rc;
+        run->output = NULL;
+    }
+    for (uint32_t i = run->input_count; i > 0; i--) {
+        wl_columnar_source_access_reader_t *reader = &run->slots[i - 1].reader;
+        if (!reader->owner)
+            continue;
+        rc = col_rel_source_reader_release(reader);
+        if (rc != 0)
+            return run->primary_rc ? run->primary_rc : rc;
+    }
+    /* Retire physical storage before returning credit. The token stays in
+     * the caller handle so a refused credit release can be retried safely. */
+    free(run->slots);
+    run->slots = NULL;
+    run->input_count = 0;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_test_bound_slice_before_release) {
+        rc = wl_columnar_eval_test_bound_slice_before_release(run);
+        if (rc != 0)
+            return run->primary_rc ? run->primary_rc : rc;
+    }
+#endif
+    if (run->governor && !wl_columnar_memory_release(&run->reservation))
+        return run->primary_rc ? run->primary_rc : EINVAL;
+    if (run->governor)
+        wl_columnar_memory_governor_ref_release(run->governor);
+    if (owned_result)
+        *owned_result = run->output;
+    rc = run->primary_rc;
+    run->worker->tdd_input_run = NULL;
+    memset(run, 0, sizeof(*run));
+    return rc;
+}
+
+int
+wl_columnar_eval_tdd_run_bound_slice_begin(wl_col_session_t *worker,
+    const wl_plan_stratum_t *stratum,
+    const wl_columnar_eval_tdd_plan_manifest_t *manifest, uint32_t slice_index,
+    const void *snapshot, const void *partition,
+    uint32_t worker_index, uint32_t worker_count,
+    const wl_columnar_eval_tdd_input_t *inputs, uint32_t input_count,
+    wl_columnar_eval_tdd_run_t *run)
+{
+    if (!worker || !manifest || !run)
+        return EINVAL;
+    if (run->worker || run->slots || run->cleanup || run->output)
+        return EBUSY;
+    int rc = wl_columnar_eval_tdd_plan_prepare_inputs(worker, stratum, manifest,
+            slice_index, snapshot, partition, worker_index, worker_count,
+            inputs, input_count, run);
+    if (rc != 0)
+        goto failed;
+    rc = wl_columnar_eval_stack_cleanup_begin(worker, &run->cleanup);
+    if (rc != 0)
+        goto failed;
+    wl_plan_relation_t body = *manifest->owner_relation;
+    body.ops = manifest->owner_ops + run->slice->start;
+    body.op_count = run->slice->count;
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(run->cleanup);
+    eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(run->cleanup);
+    run->evaluating = true;
+    rc = col_eval_relation_plan(&body, stack, worker);
+    run->evaluating = false;
+    run->current_op = NULL;
+    if (rc != 0)
+        goto failed;
+    if (stack->top != 1) {
+        rc = EINVAL;
+        goto failed;
+    }
+    rc = eval_stack_pop_relation(stack, result);
+    if (rc != 0)
+        goto failed;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_test_bound_slice_after_eval) {
+        rc = wl_columnar_eval_test_bound_slice_after_eval(run);
+        if (rc != 0)
+            goto failed;
+    }
+#endif
+    /* Detach even a borrowed empty/single-row passthrough before unpinning.
+     * The returned heap owner cannot depend on a worker pool or arena reset. */
+    rc = wl_columnar_relation_deep_copy_governed(result->rel, &run->output,
+            worker->memory_governor);
+    if (rc != 0)
+        goto failed;
+    return 0;
+failed:
+    if (run && run->worker == worker && worker &&
+        worker->tdd_input_run == run) {
+        run->primary_rc = rc;
+        if (rc == ENOSPC)
+            worker->memory_budget_denied = true;
+        (void)wl_columnar_eval_tdd_run_bound_slice_finish(run, NULL);
+    }
+    return rc;
+}
+
 static void
 tdd_worker_subpass_fn(void *arg)
 {

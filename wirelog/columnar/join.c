@@ -1243,6 +1243,16 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
      * is undone with col_mat_cache_remove_result. right_filtered is the owned,
      * uncached fallback; this operator is synchronous and retires its probe
      * and worker users before each cleanup edge. */
+    col_rel_t *right = NULL;
+    bool bound_delta = false;
+    if (sess->tdd_input_run) {
+        int bound_rc = wl_columnar_eval_tdd_plan_resolve_input(sess, op, true,
+                &right, &bound_delta);
+        if (bound_rc != 0)
+            return bound_rc;
+    } else {
+        right = session_find_rel(sess, op->right_relation);
+    }
     eval_entry_t left_e;
     int pop_rc = eval_stack_pop_relation(stack, &left_e);
     if (pop_rc != 0)
@@ -1253,7 +1263,6 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
      * For col_op_join we use wl_columnar_filter_apply_right_filter_cached; the cache owns
      * the filtered relation and we must NOT destroy it here. */
     col_rel_t *right_filtered = NULL;
-    col_rel_t *right = session_find_rel(sess, op->right_relation);
     if (!right) {
         /* If right relation doesn't exist, join produces empty result (cross-product with nothing).
          * Similar to ANTIJOIN logic (which keeps all left rows on missing right).
@@ -1279,8 +1288,10 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     sess->profile.join_calls++;
 #endif
 
-    wl_columnar_join_selection_t selection = wl_columnar_join_select_right(
-        op, sess, right, left_e.is_delta);
+    wl_columnar_join_selection_t selection = sess->tdd_input_run
+        ? (wl_columnar_join_selection_t){right, bound_delta,
+                                         bound_delta && right->nrows == 0}
+        : wl_columnar_join_select_right(op, sess, right, left_e.is_delta);
     right = selection.right;
     bool used_right_delta = selection.used_right_delta;
     if (selection.force_empty) {
@@ -1359,7 +1370,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     /* An owned filtered fallback has a fresh identity for every operation.
     * It cannot hit again during the lease window, so bypass the
     * materialization cache rather than occupying a slot until eviction. */
-    if (op->materialized && !projected_join && !right_filtered) {
+    if (op->materialized && !sess->tdd_input_run && !projected_join &&
+        !right_filtered) {
         col_mat_cache_pin_t cache_pin = { 0 };
         col_rel_t *cached
             = col_mat_cache_lookup_pin(&sess->mat_cache, left_e.rel, right,
@@ -1448,7 +1460,9 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     int output_rc = wl_columnar_join_new_output(sess, left, right, "$join",
             ocols,
             COL_REL_INIT_CAP, false,
-            bounded || (op->materialized && !projected_join), &out);
+            bounded ||
+            (op->materialized && !sess->tdd_input_run && !projected_join),
+            &out);
     if (output_rc != 0) {
         wl_columnar_join_key_scratch_free(&key_scratch, &lk);
         wl_columnar_join_key_scratch_free(&key_scratch, &rk);
@@ -1767,7 +1781,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             "Standard merge-join starting - left=%u rows, right=%u rows, kc=%u",
             left->nrows, right->nrows, kc);
 
-        if (!used_right_delta && op->right_relation && kc > 0) {
+        if (!sess->tdd_input_run && !used_right_delta && op->right_relation &&
+            kc > 0) {
             if (op->right_filter_expr.size == 0) {
                 int probe_rc = col_arrangement_probe_bundle_acquire_primary(
                     &arr_bundle, &sess->base, right, rk, kc, &arr_probe);
@@ -1815,7 +1830,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                             op->right_relation, fhash, right, rk, kc);
                 }
             }
-        } else if (used_right_delta && op->right_relation && kc > 0) {
+        } else if (!sess->tdd_input_run && used_right_delta &&
+            op->right_relation && kc > 0) {
             int dependency_rc
                 = col_arrangement_probe_bundle_acquire_dependency(
                     &arr_bundle, right);
@@ -2187,7 +2203,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
      * copy for the evaluation stack.  This keeps cache lifetime entirely
      * inside this operation and avoids borrowed stack entries. */
     /* Owned filtered fallbacks are operation-local; see the ordinary path. */
-    if (op->materialized && !projected_join && !right_filtered) {
+    if (op->materialized && !sess->tdd_input_run && !projected_join &&
+        !right_filtered) {
 #ifdef WL_PROFILE
         if (out->nrows == 0)
             sess->profile.join_empty_out++;
@@ -2494,13 +2511,22 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     /* out and its copies remain private until push; right_filtered is the
      * uncached operation-owned fallback. Semijoin completes its synchronous
      * probes before cleanup, and no filtered relation is transferred to cache. */
+    col_rel_t *right = NULL;
+    bool bound_delta = false;
+    if (sess->tdd_input_run) {
+        int bound_rc = wl_columnar_eval_tdd_plan_resolve_input(sess, op, true,
+                &right, &bound_delta);
+        if (bound_rc != 0)
+            return bound_rc;
+    } else {
+        right = session_find_rel(sess, op->right_relation);
+    }
     col_rel_t *right_filtered = NULL;
     eval_entry_t left_e;
     int pop_rc = eval_stack_pop_relation(stack, &left_e);
     if (pop_rc != 0)
         return pop_rc;
 
-    col_rel_t *right = session_find_rel(sess, op->right_relation);
     if (!right)
         return eval_stack_repush_entry(stack, &left_e);
 
