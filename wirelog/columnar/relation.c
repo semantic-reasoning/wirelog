@@ -6319,8 +6319,8 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
  * clones execution scratch and intentionally carries no governor.  Admit the
  * destination's physical columns and timestamp allocation before allocating
  * either buffer, while a source-reader lease keeps the observed shape stable. */
-int
-wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
+static int
+col_rel_deep_copy_governed_impl(const col_rel_t *src, col_rel_t **out,
     wl_columnar_memory_governor_ref_t *governor)
 {
     wl_columnar_source_access_reader_t reader = { 0 };
@@ -6542,6 +6542,15 @@ done:
         }
     }
     return rc;
+}
+
+/* Public entry point.  The body lives in a file-private impl so that in-tree
+ * callers can be given variants of it without widening this header's surface. */
+int
+wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
+    wl_columnar_memory_governor_ref_t *governor)
+{
+    return col_rel_deep_copy_governed_impl(src, out, governor);
 }
 
 static int
