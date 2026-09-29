@@ -6622,7 +6622,7 @@ col_rel_image_token_valid(const wl_columnar_memory_reservation_t *token,
 }
 
 static int
-col_rel_mutable_image_validate(const col_rel_t *r)
+col_rel_mutable_image_validate(const col_rel_t *r, bool source)
 {
     uint64_t payload, metadata, dedup, descriptor, named_descriptor;
     if (!r || !r->memory_governor || r->pool_owned || r->arena_owned
@@ -6634,7 +6634,11 @@ col_rel_mutable_image_validate(const col_rel_t *r)
         || r->retract_backup_sorted_nrows || r->retract_backup_run_count
         || r->storage_owner != r || r->nrows > r->capacity
         || col_rel_storage_alias_borrow_count(r) != 0
-        || r->base_nrows > r->nrows || r->sorted_nrows > r->nrows
+        || r->base_nrows > r->nrows
+        /* BDX may clear rows while retaining the previous sorted cursor.
+         * The governed copy clamps it; the original remains untouched on
+         * discard and is replaced only after the private work succeeds. */
+        || (!source && r->sorted_nrows > r->nrows)
         || (r->ncols && !r->row_scratch)
         || (r->ncols && (r->merge_columns != NULL)
         != (r->merge_buf_cap != 0))
@@ -6712,7 +6716,7 @@ col_rel_mutable_image_prepare(col_rel_t *source,
     if (rc != 0)
         return rc;
     transaction->source = source;
-    rc = col_rel_mutable_image_validate(source);
+    rc = col_rel_mutable_image_validate(source, true);
     if (rc == 0)
         rc = col_rel_deep_copy_governed_impl(source, &transaction->image,
                 source->memory_governor, true);
@@ -6781,8 +6785,8 @@ col_rel_mutable_image_commit(col_rel_mutable_image_t *transaction)
         || !wl_columnar_source_access_writer_thread_equal(
             &transaction->writer))
         return EINVAL;
-    if (col_rel_mutable_image_validate(source) != 0
-        || col_rel_mutable_image_validate(image) != 0
+    if (col_rel_mutable_image_validate(source, true) != 0
+        || col_rel_mutable_image_validate(image, false) != 0
         || image->name || image->pool_owned || image->memory_governor
         != source->memory_governor)
         return EBUSY;
