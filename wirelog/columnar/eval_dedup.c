@@ -15,6 +15,17 @@
 #define XXH_STATIC_LINKING_ONLY
 #include <xxhash.h>
 
+#ifdef WL_SESSION_TEST_HOOKS
+static atomic_bool wl_dedup_fail_next_growth_alloc;
+
+void
+wl_columnar_eval_dedup_test_fail_next_growth_alloc(void)
+{
+    atomic_store_explicit(&wl_dedup_fail_next_growth_alloc, true,
+        memory_order_release);
+}
+#endif
+
 static bool
 wl_dedup_token_valid(const col_rel_t *r)
 {
@@ -221,7 +232,14 @@ wl_columnar_eval_dedup_set_grow(col_rel_t *r)
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
             return wl_dedup_admission_rc(r, status);
     }
+#ifdef WL_SESSION_TEST_HOOKS
+    bool fail_alloc = atomic_exchange_explicit(
+        &wl_dedup_fail_next_growth_alloc, false, memory_order_acq_rel);
+    new_slots = fail_alloc ? NULL
+        : (uint64_t *)calloc(new_cap, sizeof(uint64_t));
+#else
     new_slots = (uint64_t *)calloc(new_cap, sizeof(uint64_t));
+#endif
     if (!new_slots) {
         if (growth && !wl_columnar_memory_rollback_growth(
                 &r->dedup_reservation))
@@ -276,35 +294,51 @@ wl_columnar_eval_dedup_set_grow(col_rel_t *r)
 bool
 wl_columnar_eval_dedup_set_insert(col_rel_t *r, uint64_t h)
 {
+    bool inserted = false;
+    bool pending_before = r && r->memory_budget_denial_pending;
+    if (wl_columnar_eval_dedup_set_insert_checked(r, h, &inserted) == 0)
+        return inserted;
+    if (r)
+        r->memory_budget_denial_pending = pending_before;
+    return true; /* Historical unique fallback on denial or malformed set. */
+}
+
+int
+wl_columnar_eval_dedup_set_insert_checked(col_rel_t *r, uint64_t h,
+    bool *inserted)
+{
     uint32_t empty = UINT32_MAX;
-    if (!r || !h)
-        return true;
+    if (!r || !h || !inserted)
+        return EINVAL;
     if (r->dedup_slots && !wl_dedup_token_valid(r))
-        return true;
+        return EBUSY;
     /* A duplicate never needs growth, even at the load threshold. */
     if (r->dedup_slots && r->dedup_cap
         && !(r->dedup_cap & (r->dedup_cap - 1u))
-        && wl_dedup_probe(r->dedup_slots, r->dedup_cap, h, &empty))
-        return false;
+        && wl_dedup_probe(r->dedup_slots, r->dedup_cap, h, &empty)) {
+        *inserted = false;
+        return 0;
+    }
     if (!r->dedup_slots || !r->dedup_cap
         || (r->dedup_cap & (r->dedup_cap - 1u))
         || r->dedup_count >= r->dedup_cap
         || (uint64_t)r->dedup_count * 10u
         >= (uint64_t)r->dedup_cap * 7u) {
-        bool pending_before = r->memory_budget_denial_pending;
-        if (wl_columnar_eval_dedup_set_grow(r) != 0) {
-            r->memory_budget_denial_pending = pending_before;
-            return true; /* Preserve the unique fallback on denial/OOM. */
-        }
+        int rc = wl_columnar_eval_dedup_set_grow(r);
+        if (rc != 0)
+            return rc;
         empty = UINT32_MAX;
-        if (wl_dedup_probe(r->dedup_slots, r->dedup_cap, h, &empty))
-            return false;
+        if (wl_dedup_probe(r->dedup_slots, r->dedup_cap, h, &empty)) {
+            *inserted = false;
+            return 0;
+        }
     }
     if (empty == UINT32_MAX)
-        return true;
+        return EBUSY;
     r->dedup_slots[empty] = h;
     r->dedup_count++;
-    return true;
+    *inserted = true;
+    return 0;
 }
 
 bool
