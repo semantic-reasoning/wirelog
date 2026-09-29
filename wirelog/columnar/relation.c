@@ -31,6 +31,8 @@ wl_columnar_append_transition_hook_t wl_columnar_append_transition_hook;
 #endif
 
 #ifdef WL_SESSION_TEST_HOOKS
+wl_columnar_radix_admission_test_hook_t
+    wl_columnar_radix_admission_test_hook;
 #ifdef _MSC_VER
 #define WL_RELATION_TIMESTAMP_TEST_THREAD_LOCAL __declspec(thread)
 #else
@@ -8679,10 +8681,23 @@ wl_columnar_relation_radix_workspace_prepare(const col_rel_t *rel,
         + additional_scratch_bytes;
     if (rel->memory_governor && total_scratch_bytes > 0) {
         wl_columnar_memory_reservation_init(&workspace->admission);
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_radix_admission_test_hook)
+            wl_columnar_radix_admission_test_hook(rel, workspace_bytes,
+                additional_scratch_bytes, total_scratch_bytes,
+                WL_COLUMNAR_RADIX_ADMISSION_BEFORE,
+                WL_COLUMNAR_MEMORY_ADMISSION_INVALID);
+#endif
         wl_columnar_memory_admission_status_t admission_status
             = wl_columnar_memory_reserve_checked(
                 wl_columnar_memory_governor_ref_get(rel->memory_governor),
                 total_scratch_bytes, &workspace->admission);
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_radix_admission_test_hook)
+            wl_columnar_radix_admission_test_hook(rel, workspace_bytes,
+                additional_scratch_bytes, total_scratch_bytes,
+                WL_COLUMNAR_RADIX_ADMISSION_AFTER, admission_status);
+#endif
         if (admission_status != WL_COLUMNAR_MEMORY_ADMISSION_OK
             && admission_status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
             if (admission_status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)

@@ -661,6 +661,15 @@ int wl_columnar_relation_test_commit_replacement_locked(col_rel_t *dst,
 #ifdef WL_SESSION_TEST_HOOKS
 void wl_columnar_relation_test_fail_next_governed_timestamp_alloc(void);
 bool wl_columnar_relation_test_governed_timestamp_alloc_pending(void);
+typedef enum {
+    WL_COLUMNAR_RADIX_ADMISSION_BEFORE = 1,
+    WL_COLUMNAR_RADIX_ADMISSION_AFTER = 2
+} wl_columnar_radix_admission_phase_t;
+typedef void (*wl_columnar_radix_admission_test_hook_t)(const col_rel_t *,
+    uint64_t, uint64_t, uint64_t, wl_columnar_radix_admission_phase_t,
+    wl_columnar_memory_admission_status_t);
+extern wl_columnar_radix_admission_test_hook_t
+    wl_columnar_radix_admission_test_hook;
 #endif
 
 #ifdef WL_TEST_CONSOLIDATE_HOOK
