@@ -2046,6 +2046,10 @@ void (*wl_columnar_eval_test_after_worker_image)(wl_col_session_t *,
     col_rel_t *, int);
 int (*wl_columnar_eval_test_after_worker_private)(wl_col_session_t *,
     col_rel_t *, col_rel_t *, col_rel_t *);
+int (*wl_columnar_eval_test_before_worker_dedup)(wl_col_session_t *,
+    col_rel_t *, col_rel_t *, col_rel_t *);
+void (*wl_columnar_eval_test_after_worker_dedup)(wl_col_session_t *,
+    col_rel_t *, int);
 #endif
 
 static int
@@ -2446,6 +2450,11 @@ tdd_worker_subpass_fn(void *arg)
             && image->memory_budget_denial_pending;
         if (image)
             image->memory_budget_denial_pending = false;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (rc2 == 0 && wl_columnar_eval_test_before_worker_dedup)
+            rc2 = wl_columnar_eval_test_before_worker_dedup(sess, r,
+                    image, delta);
+#endif
         if (rc2 == 0 && image->dedup_slots) {
             /* Hash-set dedup mutates only the private image. Its eager
              * row_scratch handles wide relations without another allocation. */
@@ -2481,6 +2490,10 @@ tdd_worker_subpass_fn(void *arg)
             rc2 = col_op_consolidate_incremental_delta(image, snap[ri],
                     delta, &fast_flag);
         }
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_eval_test_after_worker_dedup)
+            wl_columnar_eval_test_after_worker_dedup(sess, r, rc2);
+#endif
         if (rc2 == 0 && delta->nrows > 0) {
             for (uint32_t ti = 0; ti < delta->nrows; ti++) {
                 delta->timestamps[ti].iteration = eff_iter;

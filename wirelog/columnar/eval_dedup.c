@@ -17,12 +17,31 @@
 
 #ifdef WL_SESSION_TEST_HOOKS
 static atomic_bool wl_dedup_fail_next_growth_alloc;
+#ifdef _MSC_VER
+#define WL_DEDUP_TEST_THREAD_LOCAL __declspec(thread)
+#else
+#define WL_DEDUP_TEST_THREAD_LOCAL _Thread_local
+#endif
+static WL_DEDUP_TEST_THREAD_LOCAL bool wl_dedup_fail_next_worker_growth_alloc;
+#undef WL_DEDUP_TEST_THREAD_LOCAL
 
 void
 wl_columnar_eval_dedup_test_fail_next_growth_alloc(void)
 {
     atomic_store_explicit(&wl_dedup_fail_next_growth_alloc, true,
         memory_order_release);
+}
+
+void
+wl_columnar_eval_dedup_test_fail_next_worker_growth_alloc(void)
+{
+    wl_dedup_fail_next_worker_growth_alloc = true;
+}
+
+bool
+wl_columnar_eval_dedup_test_worker_growth_alloc_pending(void)
+{
+    return wl_dedup_fail_next_worker_growth_alloc;
 }
 #endif
 
@@ -230,8 +249,11 @@ wl_columnar_eval_dedup_set_grow(col_rel_t *r, uint64_t incoming_hash,
             return wl_dedup_admission_rc(r, status);
     }
 #ifdef WL_SESSION_TEST_HOOKS
-    bool fail_alloc = atomic_exchange_explicit(
+    bool tls_fail = wl_dedup_fail_next_worker_growth_alloc;
+    wl_dedup_fail_next_worker_growth_alloc = false;
+    bool global_fail = atomic_exchange_explicit(
         &wl_dedup_fail_next_growth_alloc, false, memory_order_acq_rel);
+    bool fail_alloc = tls_fail || global_fail;
     new_slots = fail_alloc ? NULL
         : (uint64_t *)calloc(new_cap, sizeof(uint64_t));
 #else
