@@ -13,6 +13,216 @@ static int failures;
                                 return; } \
 } while (0)
 
+static int
+paired_reader_acquire(wl_columnar_source_access_gate_t *source,
+    wl_columnar_source_access_gate_t *descriptor,
+    wl_columnar_source_access_reader_t *reader)
+{
+    int rc = wl_columnar_source_access_gate_reader_acquire(descriptor);
+    if (rc != 0)
+        return rc;
+    rc = wl_columnar_source_access_reader_acquire_transferable(source, reader);
+    if (rc != 0) {
+        (void)wl_columnar_source_access_gate_reader_release(descriptor);
+        return rc;
+    }
+    reader->secondary_owner = descriptor;
+    return 0;
+}
+
+struct cohort_thread_arg {
+    wl_columnar_source_access_cohort_t *cohort;
+    int result;
+};
+
+static void *
+cohort_restore_on_thread(void *opaque)
+{
+    struct cohort_thread_arg *arg = opaque;
+    arg->result = wl_columnar_source_access_cohort_restore(arg->cohort);
+    return NULL;
+}
+
+static void
+test_paired_cohort(bool shared_descriptor)
+{
+    wl_columnar_source_access_gate_t source = { 0 }, first = { 0 };
+    wl_columnar_source_access_gate_t second = { 0 };
+    wl_columnar_source_access_gate_t *other
+        = shared_descriptor ? &first : &second;
+    wl_columnar_source_access_reader_t a = { 0 }, b = { 0 };
+    wl_columnar_source_access_reader_t *readers[] = { &a, &b };
+    wl_columnar_source_access_cohort_entry_t entries[2] = { 0 };
+    wl_columnar_source_access_cohort_t cohort = { 0 }, copy;
+    wl_columnar_source_access_reader_t blocked = { 0 };
+    wl_thread_t thread;
+    struct cohort_thread_arg arg = { &cohort, EINVAL };
+
+    wl_columnar_source_access_gate_init(&source);
+    wl_columnar_source_access_gate_init(&first);
+    wl_columnar_source_access_gate_init(&second);
+    CHECK(paired_reader_acquire(&source, &first, &a) == 0,
+        "first paired reader");
+    CHECK(paired_reader_acquire(&source, other, &b) == 0,
+        "second paired reader");
+    CHECK(wl_columnar_source_access_cohort_exchange(&source, readers, 2,
+        entries, shared_descriptor ? 1 : 2, &cohort) == 0,
+        "exact paired cohort exchange");
+    CHECK(cohort.entry_count == (shared_descriptor ? 1u : 2u)
+        && entries[0].readers == (shared_descriptor ? 2u : 1u),
+        "descriptor multiplicity recorded");
+    copy = cohort;
+    CHECK(wl_columnar_source_access_cohort_restore(&copy) == EINVAL,
+        "copied cohort rejected");
+    CHECK(wl_columnar_source_access_reader_release(&a) == EINVAL
+        && a.owner == &source && a.secondary_owner == &first,
+        "suspended release leaves both references live");
+    CHECK(atomic_load_explicit(&source.state, memory_order_acquire)
+        == WL_COLUMNAR_SOURCE_ACCESS_WRITER
+        && atomic_load_explicit(&first.state, memory_order_acquire)
+        == WL_COLUMNAR_SOURCE_ACCESS_WRITER,
+        "suspended release changed neither gate");
+    CHECK(wl_columnar_source_access_reader_acquire(&source, &blocked)
+        == EBUSY
+        && wl_columnar_source_access_gate_reader_acquire(&first) == EBUSY,
+        "suspended gates deny new readers");
+    entries[0].readers++;
+    CHECK(wl_columnar_source_access_cohort_restore(&cohort) == EINVAL,
+        "malformed cohort snapshot rejected");
+    entries[0].readers--;
+    wl_columnar_source_access_gate_t *saved_descriptor
+        = a.secondary_owner;
+    a.secondary_owner = &source;
+    CHECK(wl_columnar_source_access_cohort_restore(&cohort) == EINVAL
+        && atomic_load_explicit(&source.state, memory_order_acquire)
+        == WL_COLUMNAR_SOURCE_ACCESS_WRITER,
+        "source gate in reader descriptor rejected before mutation");
+    a.secondary_owner = saved_descriptor;
+    entries[0].gate = &source;
+    CHECK(wl_columnar_source_access_cohort_restore(&cohort) == EINVAL
+        && atomic_load_explicit(&source.state, memory_order_acquire)
+        == WL_COLUMNAR_SOURCE_ACCESS_WRITER
+        && atomic_load_explicit(&first.state, memory_order_acquire)
+        == WL_COLUMNAR_SOURCE_ACCESS_WRITER,
+        "source gate in snapshot entry rejected before mutation");
+    a.secondary_owner = &source;
+    CHECK(wl_columnar_source_access_cohort_restore(&cohort) == EINVAL
+        && atomic_load_explicit(&source.state, memory_order_acquire)
+        == WL_COLUMNAR_SOURCE_ACCESS_WRITER,
+        "matching forged source descriptor does not publish source");
+    a.secondary_owner = saved_descriptor;
+    entries[0].gate = saved_descriptor;
+    CHECK(wl_thread_create(&thread, cohort_restore_on_thread, &arg) == 0,
+        "cross-thread cohort restore setup");
+    CHECK(wl_thread_join(&thread) == 0 && arg.result == 0,
+        "cross-thread paired cohort restore");
+    CHECK(wl_columnar_source_access_cohort_restore(&cohort) == EINVAL,
+        "reused cohort rejected");
+    CHECK(atomic_load_explicit(&source.state, memory_order_acquire) == 2
+        && atomic_load_explicit(&first.state, memory_order_acquire)
+        == (shared_descriptor ? 2u : 1u),
+        "paired gates restored to exact reader counts");
+    CHECK(wl_columnar_source_access_reader_release(&b) == 0
+        && wl_columnar_source_access_reader_release(&a) == 0,
+        "restored readers release once");
+    CHECK(atomic_load_explicit(&source.state, memory_order_acquire) == 0
+        && atomic_load_explicit(&first.state, memory_order_acquire) == 0
+        && atomic_load_explicit(&second.state, memory_order_acquire) == 0,
+        "all paired gates drained");
+}
+
+static void
+test_paired_cohort_rejections(void)
+{
+    wl_columnar_source_access_gate_t source = { 0 }, descriptor = { 0 };
+    wl_columnar_source_access_gate_t wrong = { 0 };
+    wl_columnar_source_access_reader_t reader = { 0 }, external = { 0 };
+    wl_columnar_source_access_reader_t copy, *readers[] = { &reader };
+    wl_columnar_source_access_reader_t *duplicates[] = { &reader, &reader };
+    wl_columnar_source_access_cohort_entry_t entries[2] = { 0 };
+    wl_columnar_source_access_cohort_t cohort = { 0 };
+    wl_columnar_source_access_gate_init(&source);
+    wl_columnar_source_access_gate_init(&descriptor);
+    wl_columnar_source_access_gate_init(&wrong);
+    CHECK(paired_reader_acquire(&source, &descriptor, &reader) == 0,
+        "paired rejection setup");
+    copy = reader;
+    readers[0] = &copy;
+    CHECK(wl_columnar_source_access_cohort_exchange(&source, readers, 1,
+        entries, 1, &cohort) == EINVAL, "copied reader rejected");
+    readers[0] = &reader;
+    CHECK(wl_columnar_source_access_cohort_exchange(&wrong, readers, 1,
+        entries, 1, &cohort) == EINVAL, "wrong source gate rejected");
+    CHECK(wl_columnar_source_access_cohort_exchange(&source, duplicates, 2,
+        entries, 2, &cohort) == EINVAL, "duplicate reader rejected");
+    reader.thread_valid = true;
+    CHECK(wl_columnar_source_access_cohort_exchange(&source, readers, 1,
+        entries, 1, &cohort) == EINVAL, "thread-valid lease rejected");
+    reader.thread_valid = false;
+    reader.secondary_owner = &source;
+    CHECK(wl_columnar_source_access_cohort_exchange(&source, readers, 1,
+        entries, 1, &cohort) == EINVAL, "source as descriptor rejected");
+    reader.secondary_owner = &descriptor;
+    atomic_store_explicit(&source.state, WL_COLUMNAR_SOURCE_ACCESS_WRITER,
+        memory_order_release);
+    CHECK(wl_columnar_source_access_reader_release(&reader) == EINVAL
+        && reader.owner == &source
+        && atomic_load_explicit(&descriptor.state, memory_order_acquire) == 1,
+        "release during source-first exchange changes neither gate");
+    atomic_store_explicit(&source.state, 1, memory_order_release);
+    CHECK(wl_columnar_source_access_reader_acquire(&source, &external) == 0,
+        "external source reader setup");
+    CHECK(wl_columnar_source_access_cohort_exchange(&source, readers, 1,
+        entries, 1, &cohort) == EBUSY,
+        "extra source reader denies exchange");
+    CHECK(wl_columnar_source_access_reader_release(&external) == 0,
+        "external source reader release");
+    CHECK(wl_columnar_source_access_gate_reader_acquire(&descriptor) == 0,
+        "external descriptor reader setup");
+    CHECK(wl_columnar_source_access_cohort_exchange(&source, readers, 1,
+        entries, 1, &cohort) == EBUSY,
+        "extra descriptor reader denies exchange");
+    CHECK(cohort.identity == 0
+        && atomic_load_explicit(&source.state, memory_order_acquire) == 1
+        && atomic_load_explicit(&descriptor.state, memory_order_acquire) == 2,
+        "failed descriptor exchange restored source and token");
+    CHECK(wl_columnar_source_access_gate_reader_release(&descriptor) == 0,
+        "external descriptor reader release");
+    CHECK(wl_columnar_source_access_reader_release(&reader) == 0,
+        "original reader release after denials");
+}
+
+static void
+test_paired_cohort_partial_unwind(void)
+{
+    wl_columnar_source_access_gate_t source = { 0 }, first = { 0 };
+    wl_columnar_source_access_gate_t second = { 0 };
+    wl_columnar_source_access_reader_t a = { 0 }, b = { 0 };
+    wl_columnar_source_access_reader_t *readers[] = { &a, &b };
+    wl_columnar_source_access_cohort_entry_t entries[2] = { 0 };
+    wl_columnar_source_access_cohort_t cohort = { 0 };
+    wl_columnar_source_access_gate_init(&source);
+    wl_columnar_source_access_gate_init(&first);
+    wl_columnar_source_access_gate_init(&second);
+    CHECK(paired_reader_acquire(&source, &first, &a) == 0
+        && paired_reader_acquire(&source, &second, &b) == 0,
+        "partial unwind setup");
+    CHECK(wl_columnar_source_access_gate_reader_acquire(&second) == 0,
+        "extra second descriptor reader");
+    CHECK(wl_columnar_source_access_cohort_exchange(&source, readers, 2,
+        entries, 2, &cohort) == EBUSY,
+        "second descriptor denial unwinds first");
+    CHECK(atomic_load_explicit(&source.state, memory_order_acquire) == 2
+        && atomic_load_explicit(&first.state, memory_order_acquire) == 1
+        && atomic_load_explicit(&second.state, memory_order_acquire) == 2
+        && cohort.identity == 0 && a.owner == &source && b.owner == &source,
+        "partial unwind restored exact counts and tokens");
+    CHECK(wl_columnar_source_access_gate_reader_release(&second) == 0
+        && wl_columnar_source_access_reader_release(&b) == 0
+        && wl_columnar_source_access_reader_release(&a) == 0,
+        "partial unwind teardown");
+}
+
 static void
 test_lifecycle(void)
 {
@@ -422,6 +632,10 @@ main(void)
     test_reader_overflow();
     test_concurrent_readers();
     test_writer_publication();
+    test_paired_cohort(false);
+    test_paired_cohort(true);
+    test_paired_cohort_rejections();
+    test_paired_cohort_partial_unwind();
     printf("%s\n", failures == 0 ? "PASS" : "FAIL");
     return failures == 0 ? 0 : 1;
 }
