@@ -7405,6 +7405,22 @@ static bool wide_timestamp_prepared, wide_timestamp_armed;
 static bool wide_timestamp_error_seen, wide_timestamp_fault_consumed;
 static bool wide_timestamp_source_unchanged, wide_timestamp_image_unpublished;
 static int wide_timestamp_error_rc;
+static col_arr_entry_t *wide_timestamp_arr_entry;
+static uint64_t *wide_timestamp_ht_head;
+static uint32_t *wide_timestamp_ht_next;
+static uint32_t wide_timestamp_nbuckets, wide_timestamp_ht_cap;
+static uint32_t wide_timestamp_indexed_rows, wide_timestamp_generation;
+static uint64_t wide_timestamp_reserved_bytes;
+static wl_columnar_memory_governor_t *wide_timestamp_reservation_governor;
+static uint64_t wide_timestamp_reservation_bytes;
+static uint64_t wide_timestamp_replacement_bytes;
+static uint8_t wide_timestamp_transition_kind;
+static uint64_t wide_timestamp_owner_bits, wide_timestamp_reservation_state;
+static const void *wide_timestamp_reservation_identity;
+static bool wide_timestamp_arr_built, wide_timestamp_boundary_seen;
+static bool wide_timestamp_arr_unchanged;
+static bool wide_timestamp_boundary_source_unchanged;
+static bool wide_timestamp_capture_arr;
 #ifdef _MSC_VER
 #define WL_WIDE_MERGE_THREAD_LOCAL __declspec(thread)
 #else
@@ -7471,8 +7487,92 @@ wide_rollback_before_image(wl_col_session_t *worker, col_rel_t *source,
         return;
     wide_rollback_source = source;
     wide_rollback_before = wide_rollback_fingerprint(source);
+    if (wide_timestamp_capture_arr) {
+        for (uint32_t i = 0; i < worker->arr_count; i++) {
+            col_arr_entry_t *entry = &worker->arr_entries[i];
+            if (!entry->rel_name || strcmp(entry->rel_name, "output") != 0
+                || entry->key_count != 1 || !entry->key_cols
+                || entry->key_cols[0] != 0)
+                continue;
+            col_arrangement_t *arr = &entry->arr;
+            /* An empty source has no ht_next allocation or indexed rows. */
+            wide_timestamp_arr_built = arr->nbuckets > 0 && arr->ht_head
+                && arr->generation != 0
+                && arr->reserved_bytes > 0
+                && arr->reservation.bytes > 0;
+            wide_timestamp_arr_entry = entry;
+            wide_timestamp_ht_head = arr->ht_head;
+            wide_timestamp_ht_next = arr->ht_next;
+            wide_timestamp_nbuckets = arr->nbuckets;
+            wide_timestamp_ht_cap = arr->ht_cap;
+            wide_timestamp_indexed_rows = arr->indexed_rows;
+            wide_timestamp_generation = arr->generation;
+            wide_timestamp_reserved_bytes = arr->reserved_bytes;
+            wide_timestamp_reservation_governor = arr->reservation.governor;
+            wide_timestamp_reservation_bytes = arr->reservation.bytes;
+            wide_timestamp_replacement_bytes =
+                arr->reservation.replacement_bytes;
+            wide_timestamp_transition_kind = arr->reservation.transition_kind;
+            wide_timestamp_owner_bits = atomic_load_explicit(
+                &arr->reservation.owner_bits, memory_order_acquire);
+            wide_timestamp_reservation_state = atomic_load_explicit(
+                &arr->reservation.state, memory_order_acquire);
+            wide_timestamp_reservation_identity = arr->reservation.identity;
+            break;
+        }
+    }
     if (wide_rollback_prep_fault)
         wl_columnar_relation_test_fail_next_governed_copy_payload_alloc();
+}
+
+static void
+wide_timestamp_after_subpass(wl_col_session_t *coord, uint32_t iteration,
+    bool before)
+{
+    (void)iteration;
+    if (before || wide_timestamp_boundary_seen)
+        return;
+    wide_timestamp_boundary_seen = true;
+    if (!wide_timestamp_arr_entry)
+        return;
+    int worker_id = atomic_load_explicit(&wide_rollback_worker,
+            memory_order_acquire);
+    if (worker_id < 0 || (uint32_t)worker_id >= coord->tdd_workers_count)
+        return;
+    wl_col_session_t *worker = &coord->tdd_workers[worker_id];
+    wide_timestamp_boundary_source_unchanged = wide_rollback_source
+        && wide_rollback_fingerprint(wide_rollback_source)
+        == wide_rollback_before;
+    for (uint32_t i = 0; i < worker->arr_count; i++) {
+        col_arr_entry_t *entry = &worker->arr_entries[i];
+        if (!entry->rel_name || strcmp(entry->rel_name, "output") != 0
+            || entry->key_count != 1 || !entry->key_cols
+            || entry->key_cols[0] != 0)
+            continue;
+        col_arrangement_t *arr = &entry->arr;
+        wide_timestamp_arr_unchanged = entry == wide_timestamp_arr_entry
+            && arr->ht_head == wide_timestamp_ht_head
+            && arr->ht_next == wide_timestamp_ht_next
+            && arr->nbuckets == wide_timestamp_nbuckets
+            && arr->ht_cap == wide_timestamp_ht_cap
+            && arr->indexed_rows == wide_timestamp_indexed_rows
+            && arr->generation == wide_timestamp_generation
+            && arr->reserved_bytes == wide_timestamp_reserved_bytes
+            && arr->reservation.governor
+            == wide_timestamp_reservation_governor
+            && arr->reservation.bytes == wide_timestamp_reservation_bytes
+            && arr->reservation.replacement_bytes
+            == wide_timestamp_replacement_bytes
+            && arr->reservation.transition_kind
+            == wide_timestamp_transition_kind
+            && atomic_load_explicit(&arr->reservation.owner_bits,
+                memory_order_acquire) == wide_timestamp_owner_bits
+            && atomic_load_explicit(&arr->reservation.state,
+                memory_order_acquire) == wide_timestamp_reservation_state
+            && arr->reservation.identity
+            == wide_timestamp_reservation_identity;
+        break;
+    }
 }
 
 static void
@@ -7755,12 +7855,18 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
                 ? (int64_t)((r % 4u) * 100u + c) : (int64_t)(r % 4u);
     wl_session_t *session = NULL;
     col_rel_t *unowned = NULL;
+    wl_columnar_memory_governor_ref_t *governor_ref = NULL;
     const char *failure = NULL;
     wide_rollback_rows_t rows = { .width = width };
 #define WIDE_CHECK(condition, message) \
         do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
     WIDE_CHECK(wl_session_create(wl_backend_columnar(), &plan, 2,
         &session) == 0, "create");
+    if (fault_mode == 4) {
+        governor_ref = COL_SESSION(session)->memory_governor;
+        WIDE_CHECK(governor_ref, "timestamp governor");
+        wl_columnar_memory_governor_ref_retain(governor_ref);
+    }
     unowned = col_rel_new_auto("output", width);
     WIDE_CHECK(unowned && col_rel_set_column_types(unowned, types,
         width) == 0 && session_add_rel(COL_SESSION(session), unowned) == 0,
@@ -7787,9 +7893,16 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
     wide_timestamp_error_seen = wide_timestamp_fault_consumed = false;
     wide_timestamp_source_unchanged = wide_timestamp_image_unpublished = false;
     wide_timestamp_error_rc = 0;
+    wide_timestamp_arr_entry = NULL;
+    wide_timestamp_arr_built = wide_timestamp_boundary_seen = false;
+    wide_timestamp_arr_unchanged = false;
+    wide_timestamp_boundary_source_unchanged = false;
+    wide_timestamp_capture_arr = fault_mode == 4;
     wl_columnar_eval_test_before_worker_delta = fault_mode == 3
         ? wide_merge_before_delta : NULL;
     wl_columnar_eval_test_before_worker_image = wide_rollback_before_image;
+    wl_columnar_eval_test_subpass_boundary = fault_mode == 4
+        ? wide_timestamp_after_subpass : NULL;
     wl_columnar_eval_test_after_worker_image = fault_mode == 1
         ? wide_rollback_after_image : NULL;
     wl_columnar_eval_test_after_worker_private = fault_mode == 0
@@ -7804,6 +7917,7 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
         ? wide_timestamp_after_error : NULL;
     int rc = wl_session_snapshot(session, wide_rollback_collect, &rows);
     wl_columnar_eval_test_before_worker_image = NULL;
+    wl_columnar_eval_test_subpass_boundary = NULL;
     wl_columnar_eval_test_after_worker_image = NULL;
     wl_columnar_eval_test_after_worker_private = NULL;
     wl_columnar_eval_test_before_worker_delta = NULL;
@@ -7817,7 +7931,10 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
         && wide_timestamp_error_rc == rc
         && wide_timestamp_fault_consumed
         && wide_timestamp_image_unpublished
-        && wide_timestamp_source_unchanged)
+        && wide_timestamp_source_unchanged
+        && wide_timestamp_arr_built && wide_timestamp_boundary_seen
+        && wide_timestamp_arr_unchanged
+        && wide_timestamp_boundary_source_unchanged)
         : fault_mode == 3 ? (wide_merge_private_seen
         && wide_merge_after_seen && wide_merge_after_rc == rc
         && wide_merge_fault_consumed && wide_merge_source_unchanged)
@@ -7837,6 +7954,7 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
         && !rows.invalid,
         "retry lost or duplicated wide worker rows");
 cleanup:
+    wl_columnar_eval_test_subpass_boundary = NULL;
     wl_columnar_eval_test_before_worker_delta = NULL;
     wl_columnar_eval_test_before_worker_image = NULL;
     wl_columnar_eval_test_after_worker_image = NULL;
@@ -7844,10 +7962,17 @@ cleanup:
     wl_columnar_eval_test_before_worker_dedup = NULL;
     wl_columnar_eval_test_after_worker_dedup = NULL;
     wl_columnar_eval_test_after_worker_private_error = NULL;
+    wide_timestamp_capture_arr = false;
     wide_rollback_prep_fault = 0;
     col_rel_destroy(unowned);
     free(values);
     wl_session_destroy(session);
+    if (governor_ref) {
+        if (!failure && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(governor_ref)) != 0)
+            failure = "timestamp retry leaked governor reservations";
+        wl_columnar_memory_governor_ref_release(governor_ref);
+    }
     if (failure) {
         FAIL(failure); return;
     }
