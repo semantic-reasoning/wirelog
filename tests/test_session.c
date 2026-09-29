@@ -38,6 +38,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
+
 #if defined(WL_HAVE_C11_THREADS) || !defined(_WIN32)
 #include <time.h>
 #endif
@@ -7385,7 +7389,41 @@ extern void (*wl_columnar_eval_test_after_worker_dedup)(wl_col_session_t *,
 extern void (*wl_columnar_eval_test_after_worker_private_error)(
     wl_col_session_t *, col_rel_t *, col_rel_t *, col_rel_t *, int);
 
-static atomic_int wide_rollback_worker = ATOMIC_VAR_INIT(-1);
+enum {
+    WL_WIDE_ROLLBACK_UNCLAIMED = -1,
+    WL_WIDE_ROLLBACK_CLAIMED = -2
+};
+
+static atomic_int wide_rollback_worker =
+    ATOMIC_VAR_INIT(WL_WIDE_ROLLBACK_UNCLAIMED);
+
+static bool
+wide_rollback_try_claim(void)
+{
+#ifdef _MSC_VER
+    return _InterlockedCompareExchange((volatile LONG *)&wide_rollback_worker,
+               WL_WIDE_ROLLBACK_CLAIMED,
+               WL_WIDE_ROLLBACK_UNCLAIMED) == WL_WIDE_ROLLBACK_UNCLAIMED;
+#else
+    int unclaimed = WL_WIDE_ROLLBACK_UNCLAIMED;
+    return atomic_compare_exchange_strong_explicit(&wide_rollback_worker,
+               &unclaimed, WL_WIDE_ROLLBACK_CLAIMED, memory_order_acq_rel,
+               memory_order_acquire);
+#endif
+}
+
+static void
+wide_rollback_publish(uint32_t worker_id)
+{
+#ifdef _MSC_VER
+    (void)_InterlockedExchange((volatile LONG *)&wide_rollback_worker,
+        (LONG)worker_id);
+#else
+    atomic_store_explicit(&wide_rollback_worker, (int)worker_id,
+        memory_order_release);
+#endif
+}
+
 static col_rel_t *wide_rollback_source;
 static uint64_t wide_rollback_before;
 static bool wide_rollback_private_seen, wide_rollback_source_unchanged;
@@ -7627,10 +7665,7 @@ wide_rollback_before_image(wl_col_session_t *worker, col_rel_t *source,
             }
         }
     }
-    int unclaimed = -1;
-    if (!atomic_compare_exchange_strong_explicit(&wide_rollback_worker,
-        &unclaimed, (int)worker->worker_id, memory_order_acq_rel,
-        memory_order_acquire))
+    if (!wide_rollback_try_claim())
         return;
     wide_rollback_source = source;
     wide_rollback_before = wide_rollback_fingerprint(source);
@@ -7672,6 +7707,7 @@ wide_rollback_before_image(wl_col_session_t *worker, col_rel_t *source,
     }
     if (wide_rollback_prep_fault)
         wl_columnar_relation_test_fail_next_governed_copy_payload_alloc();
+    wide_rollback_publish(worker->worker_id);
 }
 
 static void
