@@ -27,7 +27,7 @@
  *       * WIRELOG_PERF_GATE=1 not set (per-PR CI opt-out).
  *       * Build not reaching TRACE in the compile-time ceiling (without
  *         that, the site is compiled out and the test is vacuous).
- *       * Linux: cpufreq governor not 'performance'.
+ *       * Linux: cpufreq governor not 'performance' outside perf-nightly.
  *       * Windows: bench_stability_prep() failed (affinity/priority
  *         could not be set).
  *       * Other hosts (macOS, BSD): no Windows-equivalent stability
@@ -106,27 +106,6 @@ run_wllog(uint64_t iters, int a, int b, int c)
  * sample, not an estimator. */
 
 /*
- * Reads /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor (Linux only).
- * Returns true iff the governor is "performance". On non-Linux the Linux
- * governor does not apply; the caller dispatches separately.
- */
-#if defined(__linux__)
-static bool
-cpufreq_is_performance_(void)
-{
-    FILE *f = fopen("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
-            "r");
-    if (!f) return false;
-    char buf[64] = {0};
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    fclose(f);
-    if (n == 0) return false;
-    if (buf[n - 1] == '\n') buf[n - 1] = '\0';
-    return strcmp(buf, "performance") == 0;
-}
-#endif
-
-/*
  * Platform-dispatched stability pre-check. Returns true iff the host
  * is configured well enough to trust the subsequent measurement. On
  * false the caller prints a platform-specific SKIP diagnostic.
@@ -135,7 +114,7 @@ static bool
 stability_env_ok_(void)
 {
 #if defined(__linux__)
-    return cpufreq_is_performance_();
+    return wl_perf_stability_env_ok() == 1;
 #elif defined(_WIN32)
     /* Active stability on Windows: pin + priority. If the kernel
      * refuses any of these (unusual outside sandboxes), SKIP. */

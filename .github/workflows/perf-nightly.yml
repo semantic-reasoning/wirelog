@@ -9,8 +9,8 @@ name: Perf Nightly
 #   means regressions can slip to main. Nightly is the compromise.
 #
 # Runners:
-#   wirelog-perf    - self-hosted Linux x64 GCC runner; sets cpufreq governor
-#                     to performance when available and pins to CPU 0.
+#   wirelog-perf    - self-hosted Linux x64 GCC runner; requests the
+#                     performance governor when available and pins to CPU 0.
 #   windows-latest  - MSVC; bench_stability_prep() in the test handles
 #                     thread affinity + HIGH_PRIORITY_CLASS internally.
 #
@@ -84,8 +84,8 @@ jobs:
       - name: Set up Meson 1.12.0
         uses: ./.github/actions/setup-meson
 
-      # Request the performance governor on the provisioned runner. The
-      # required gate below fails if the runner cannot provide it.
+      # Request the performance governor as a best-effort noise reduction.
+      # The Linux nightly suite records the observed value as provenance.
       - name: Set cpufreq governor (Linux, best-effort)
         if: runner.os == 'Linux'
         continue-on-error: true
@@ -127,15 +127,51 @@ jobs:
         run: |
           meson compile -C build-perf
 
-      # Linux: taskset pins the meson test harness to CPU 0. The test
-      # still benefits from the operator-imposed cpufreq=performance
-      # check pre-gate; if that check fails, the test SKIPs cleanly.
+      # Linux: taskset pins the meson test harness to CPU 0. Nightly
+      # records the governor but does not use it as a gate precondition.
       - name: Run perf suite (Linux)
         if: runner.os == 'Linux'
         env:
           WIRELOG_PERF_GATE: '1'
+          WIRELOG_PERF_NIGHTLY: '1'
         run: |
           taskset -c 0 meson test -C build-perf --suite perf --print-errorlogs --num-processes 1
+
+      - name: Capture Linux perf suite evidence
+        if: ${{ always() && runner.os == 'Linux' }}
+        shell: bash
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          mkdir -p perf-artifacts/linux-suite
+          {
+            echo "commit=$COMMIT_SHA"
+            echo "run=$RUN_ID attempt=$RUN_ATTEMPT"
+            echo "runner=$RUNNER_NAME os=$RUNNER_OS arch=$RUNNER_ARCH"
+            echo 'runner_labels=self-hosted,Linux,X64,wirelog-perf'
+            echo 'mode=nightly governor_eligibility=bypassed'
+            echo 'WIRELOG_PERF_GATE=1 WIRELOG_PERF_NIGHTLY=1'
+            taskset -pc $$
+            if [ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
+              echo "governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
+            else
+              echo 'governor=unavailable'
+            fi
+          } > perf-artifacts/linux-suite/host.txt
+          if [ -f build-perf/meson-logs/testlog.txt ]; then
+            cp build-perf/meson-logs/testlog.txt perf-artifacts/linux-suite/testlog.txt
+          fi
+
+      - name: Upload Linux perf suite evidence
+        if: ${{ always() && runner.os == 'Linux' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: perf-suite-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: perf-artifacts/linux-suite
+          if-no-files-found: error
+          retention-days: 35
 
       # Windows: bench_stability_prep() sets thread affinity and raises
       # priority class from inside the test process. No external wrapper

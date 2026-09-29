@@ -27,8 +27,8 @@
  *
  * wl_perf_stability_env_ok prints a SKIP-suitable diagnostic to stderr
  * on failure (sysfs missing, governor wrong, or unsupported platform)
- * and returns 0; returns 1 only when the host is configured for stable
- * timing.  Callers that just need to early-return on env failure can
+ * and returns 0. Linux perf-nightly accepts any governor and records it;
+ * all other Linux timing runs still require "performance". Callers can
  * print their own context-specific prefix and forward the return code.
  */
 
@@ -246,8 +246,8 @@ wl_perf_cov_ms(const double *samples, size_t n)
     return stdev / mean;
 }
 
-/* Stability env pre-check.  Linux: cpufreq governor on cpu0 must be
- * "performance" -- mirrors tests/test_log_perf_gate.c:142-156.  Prints
+/* Stability env pre-check. Linux: cpufreq governor on cpu0 must be
+ * "performance" unless perf-nightly explicitly opts out. Prints
  * a SKIP-suitable diagnostic to stderr on failure (distinguishing
  * "sysfs missing" from "governor wrong") and returns 0; returns 1 on
  * success.  Non-Linux platforms print a "no shipped stability design"
@@ -256,6 +256,24 @@ static inline int
 wl_perf_stability_env_ok(void)
 {
 #if defined(__linux__)
+    const char *nightly = getenv("WIRELOG_PERF_NIGHTLY");
+    if (nightly && strcmp(nightly, "1") == 0) {
+        char observed[64] = "unavailable";
+        FILE *nightly_file = fopen(
+            "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor", "r");
+        if (nightly_file) {
+            if (fgets(observed, sizeof(observed), nightly_file)) {
+                observed[strcspn(observed, "\n")] = '\0';
+            } else {
+                strcpy(observed, "unavailable");
+            }
+            fclose(nightly_file);
+        }
+        fprintf(stderr,
+            "  NOTE: mode=nightly governor=%s eligibility=bypassed\n",
+            observed);
+        return 1;
+    }
     FILE *f = fopen("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
             "r");
     if (!f) {
