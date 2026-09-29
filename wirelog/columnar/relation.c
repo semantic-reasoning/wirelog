@@ -7286,8 +7286,9 @@ col_rel_prepare_replacement_locked(col_rel_t *dst,
 }
 
 void
-col_rel_commit_replacement_locked(col_rel_t *dst,
-    col_rel_replacement_t *replacement)
+col_rel_commit_replacement_retain_writer_locked(col_rel_t *dst,
+    col_rel_replacement_t *replacement,
+    wl_columnar_source_access_writer_t *retained_writer)
 {
     col_rel_t old;
     col_rel_t *owner = NULL;
@@ -7318,7 +7319,6 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     uint64_t metadata_reserved_bytes;
     uint64_t old_dedup_reserved_bytes;
     wl_columnar_memory_reservation_t old_reservation;
-    int release_rc;
 
     /* Preparation establishes all fallible invariants.  Publication is a
      * no-fail operation: callers must not attempt to roll it back after the
@@ -7327,7 +7327,9 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
      * caller that reaches here with a mismatched gate has already violated
      * the prepare/commit contract, and this function has no error channel
      * left to report it through. */
-    if (!dst || !replacement || !replacement->staged
+    if (!dst || !replacement || !replacement->staged || !retained_writer
+        || retained_writer->owner || retained_writer->secondary_owner
+        || retained_writer->identity || retained_writer->thread_valid
         || col_rel_storage_owner_resolve(dst, &owner) != 0
         || owner != dst)
         abort();
@@ -7508,14 +7510,23 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
             replacement->reservation_active = true;
     }
 
-    release_rc = wl_columnar_source_access_writer_release(
-        &replacement->writer);
-    /* The token is valid for the whole publication.  A release error can
-     * only indicate an internal contract violation after state was already
-     * published; it is therefore diagnostic, never a commit failure. */
+    if (wl_columnar_source_access_writer_move(retained_writer,
+        &replacement->writer) != 0)
+        abort(); /* Validated writer survives the descriptor publication. */
+    replacement->writer_acquired = false;
+}
+
+void
+col_rel_commit_replacement_locked(col_rel_t *dst,
+    col_rel_replacement_t *replacement)
+{
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int release_rc;
+    col_rel_commit_replacement_retain_writer_locked(dst, replacement,
+        &writer);
+    release_rc = wl_columnar_source_access_writer_release(&writer);
     assert(release_rc == 0);
     (void)release_rc;
-    replacement->writer_acquired = false;
 }
 
 #ifdef WL_TEST_RELATION_RESIZE_HOOK

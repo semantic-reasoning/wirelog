@@ -4150,6 +4150,69 @@ test_staged_replacement_contract(void)
 }
 
 static void
+test_staged_replacement_retains_writer(void)
+{
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    wl_columnar_memory_governor_ref_t *ref;
+    col_rel_t *dst = new_relation(), *candidate = new_relation();
+    col_rel_replacement_t replacement = { 0 };
+    wl_columnar_source_access_writer_t retained = { 0 }, copied;
+    wl_columnar_source_access_writer_t blocked = { 0 };
+    wl_columnar_source_access_reader_t reader = { 0 };
+    uint64_t identity, view_before, storage_before;
+    int64_t old_value = 11, new_value = 29;
+
+    resolution.budget_bytes = 1u << 20;
+    resolution.usable_bytes = resolution.budget_bytes;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref && dst && candidate, "retained replacement setup");
+    CHECK(col_rel_attach_memory_governor(dst, ref) == 0
+        && col_rel_append_row(dst, &old_value) == 0
+        && col_rel_append_row(candidate, &new_value) == 0,
+        "retained replacement data");
+    identity = dst->relation_identity;
+    view_before = dst->view_generation;
+    storage_before = dst->storage_generation;
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0,
+        "retained replacement prepare");
+    col_rel_commit_replacement_retain_writer_locked(dst, &replacement,
+        &retained);
+    CHECK(dst->relation_identity == identity && dst->nrows == 1
+        && dst->columns[0][0] == new_value
+        && dst->view_generation == view_before + 1u
+        && dst->storage_generation == storage_before + 1u
+        && dst->retained_reserved_bytes > 0
+        && dst->retained_reservation.identity == &dst->retained_reservation
+        && atomic_load_explicit(&dst->retained_reservation.state,
+        memory_order_acquire)
+        == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED,
+        "retained commit publishes rows, generations and reservation");
+    CHECK(retained.owner == &dst->source_access
+        && retained.identity == (uintptr_t)&retained
+        && !replacement.writer_acquired && replacement.writer.owner == NULL,
+        "retained writer moved out of replacement");
+    CHECK(wl_columnar_source_access_reader_acquire(&dst->source_access,
+        &reader) == EBUSY
+        && wl_columnar_source_access_writer_acquire(&dst->source_access,
+        &blocked) == EBUSY, "retained writer blocks new admission");
+    copied = retained;
+    CHECK(wl_columnar_source_access_writer_release(&copied) == EINVAL,
+        "copied retained writer cannot release");
+    col_rel_discard_replacement(&replacement);
+    col_rel_discard_replacement(&replacement);
+    CHECK(wl_columnar_source_access_writer_release(&retained) == 0
+        && wl_columnar_source_access_writer_release(&retained) == EINVAL
+        && atomic_load_explicit(&dst->source_access.state,
+        memory_order_acquire) == 0,
+        "retained writer releases once after idempotent discard");
+    cleanup_relations();
+    wl_columnar_memory_governor_ref_release(ref);
+}
+
+static void
 test_staged_replacement_prepared_window(void)
 {
     const uint64_t descriptor_bytes = sizeof(col_rel_t)
@@ -4543,6 +4606,7 @@ main(void)
     test_empty_append_detaches_shared_destination();
     test_checked_reset_rows_locked();
     test_staged_replacement_contract();
+    test_staged_replacement_retains_writer();
     test_staged_replacement_prepared_window();
     test_identity_exhaustion();
     if (failures != 0)
