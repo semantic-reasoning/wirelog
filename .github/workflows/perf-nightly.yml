@@ -127,6 +127,33 @@ jobs:
         run: |
           meson compile -C build-perf
 
+      - name: Capture Linux perf host before suite
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p perf-artifacts/linux-suite
+          {
+            echo "runner=$RUNNER_NAME os=$RUNNER_OS arch=$RUNNER_ARCH"
+            echo 'requested_affinity=0'
+            taskset -pc $$
+            echo "kernel=$(uname -srmo)"
+            echo "cpu_model=$(awk -F: '/^model name[[:space:]]*:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }' /proc/cpuinfo)"
+            echo "boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unavailable)"
+            echo "loadavg=$(cat /proc/loadavg 2>/dev/null || echo unavailable)"
+            for file in /sys/fs/cgroup/cpuset.cpus.effective /sys/fs/cgroup/cpu.stat /proc/pressure/cpu; do
+              echo "[$file]"
+              cat "$file" 2>/dev/null || echo unavailable
+            done
+            for name in scaling_governor scaling_cur_freq scaling_min_freq scaling_max_freq cpuinfo_cur_freq; do
+              file="/sys/devices/system/cpu/cpu0/cpufreq/$name"
+              if [ -r "$file" ]; then
+                echo "$name=$(cat "$file")"
+              else
+                echo "$name=unavailable"
+              fi
+            done
+          } > perf-artifacts/linux-suite/host-before.txt
+
       # Linux: taskset pins the meson test harness to CPU 0. Nightly
       # records the governor but does not use it as a gate precondition.
       - name: Run perf suite (Linux)
@@ -148,18 +175,57 @@ jobs:
           mkdir -p perf-artifacts/linux-suite
           {
             echo "commit=$COMMIT_SHA"
+            echo "checkout_commit=$(git rev-parse HEAD)"
+            echo "source_tree=$(git rev-parse HEAD^{tree})"
             echo "run=$RUN_ID attempt=$RUN_ATTEMPT"
             echo "runner=$RUNNER_NAME os=$RUNNER_OS arch=$RUNNER_ARCH"
             echo 'runner_labels=self-hosted,Linux,X64,wirelog-perf'
             echo 'mode=nightly governor_eligibility=bypassed'
             echo 'WIRELOG_PERF_GATE=1 WIRELOG_PERF_NIGHTLY=1'
+            echo 'requested_affinity=0'
             taskset -pc $$
+            echo "kernel=$(uname -srmo)"
+            echo "cpu_model=$(awk -F: '/^model name[[:space:]]*:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }' /proc/cpuinfo)"
+            echo "compiler=$(gcc --version | head -n 1)"
+            echo "meson=$(meson --version)"
+            echo "boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unavailable)"
+            echo "loadavg=$(cat /proc/loadavg 2>/dev/null || echo unavailable)"
+            for file in /sys/fs/cgroup/cpuset.cpus.effective /sys/fs/cgroup/cpu.stat /proc/pressure/cpu; do
+              echo "[$file]"
+              cat "$file" 2>/dev/null || echo unavailable
+            done
             if [ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
               echo "governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
             else
               echo 'governor=unavailable'
             fi
+            for name in scaling_cur_freq scaling_min_freq scaling_max_freq cpuinfo_cur_freq; do
+              file="/sys/devices/system/cpu/cpu0/cpufreq/$name"
+              if [ -r "$file" ]; then
+                echo "$name=$(cat "$file")"
+              else
+                echo "$name=unavailable"
+              fi
+            done
           } > perf-artifacts/linux-suite/host.txt
+          { meson configure build-perf || echo unavailable; } > perf-artifacts/linux-suite/meson-config.txt
+          { meson introspect build-perf --compilers || echo unavailable; } > perf-artifacts/linux-suite/compilers.json
+          {
+            for file in \
+              build-perf/tests/test_crdt_perf_gate \
+              build-perf/tests/test_cspa_perf_gate \
+              build-perf/meson-info/intro-buildoptions.json \
+              bench/data/crdt/Insert_input.csv \
+              bench/data/crdt/Remove_input.csv \
+              bench/data/cspa/assign.csv \
+              bench/data/cspa/dereference.csv; do
+              if [ -f "$file" ]; then
+                sha256sum "$file"
+              else
+                echo "missing $file"
+              fi
+            done
+          } > perf-artifacts/linux-suite/sha256.txt
           if [ -f build-perf/meson-logs/testlog.txt ]; then
             cp build-perf/meson-logs/testlog.txt perf-artifacts/linux-suite/testlog.txt
           fi
