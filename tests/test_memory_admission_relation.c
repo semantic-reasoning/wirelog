@@ -687,6 +687,67 @@ test_dedup_full_probe_and_malformed_shape(void)
 }
 
 static void
+test_dedup_growth_rehash_collision_and_duplicate(void)
+{
+    col_rel_t *rel = col_rel_new_auto("dedup-collision", 1);
+    CHECK(rel != NULL, "dedup collision relation created");
+    if (!rel)
+        return;
+    rel->dedup_slots = calloc(4u, sizeof(uint64_t));
+    CHECK(rel->dedup_slots != NULL, "dedup collision slots allocated");
+    if (!rel->dedup_slots) {
+        col_rel_destroy(rel);
+        return;
+    }
+    rel->dedup_cap = 4;
+    rel->dedup_count = 4;
+    for (uint32_t i = 0; i < 4; i++)
+        rel->dedup_slots[i] = 1u + 4u * i;
+
+    bool inserted = false;
+    uint64_t bytes = 0;
+    CHECK(wl_columnar_eval_dedup_set_insert_checked(rel, 17u,
+        &inserted) == 0 && inserted && rel->dedup_cap == 8
+        && rel->dedup_count == 5 && rel->dedup_slots[1] == 17u
+        && wl_columnar_eval_dedup_set_bytes(rel, &bytes) == 0
+        && bytes == 8u * sizeof(uint64_t),
+        "dedup growth seeds incoming hash before colliding old hashes");
+    for (uint64_t h = 1; h <= 17u; h += 4u)
+        CHECK(wl_columnar_eval_dedup_set_contains(rel, h),
+            "dedup growth retains colliding old and new hashes");
+    inserted = true;
+    CHECK(wl_columnar_eval_dedup_set_insert_checked(rel, 17u,
+        &inserted) == 0 && !inserted && rel->dedup_count == 5,
+        "dedup growth followed by duplicate reinsertion is idempotent");
+    wl_columnar_eval_dedup_set_clear(rel);
+
+    /* A valid shape may contain a hash beyond an empty probe slot. The
+     * existing grow path treated it as a duplicate after rehashing. */
+    rel->dedup_slots = calloc(4u, sizeof(uint64_t));
+    CHECK(rel->dedup_slots != NULL, "dedup displaced slots allocated");
+    if (!rel->dedup_slots) {
+        col_rel_destroy(rel);
+        return;
+    }
+    rel->dedup_cap = 4;
+    rel->dedup_count = 3;
+    rel->dedup_slots[0] = 4u;
+    rel->dedup_slots[2] = 6u;
+    rel->dedup_slots[3] = 9u;
+    inserted = true;
+    CHECK(wl_columnar_eval_dedup_set_insert_checked(rel, 9u,
+        &inserted) == 0 && !inserted && rel->dedup_cap == 8
+        && rel->dedup_count == 3
+        && wl_columnar_eval_dedup_set_bytes(rel, &bytes) == 0,
+        "dedup growth preserves unreachable existing hash count");
+    CHECK(wl_columnar_eval_dedup_set_contains(rel, 4u)
+        && wl_columnar_eval_dedup_set_contains(rel, 6u)
+        && wl_columnar_eval_dedup_set_contains(rel, 9u),
+        "dedup growth rehashes displaced entries");
+    col_rel_destroy(rel);
+}
+
+static void
 test_dedup_replacement_overlap(void)
 {
     wl_columnar_memory_resolution_t resolution;
@@ -4619,6 +4680,7 @@ main(void)
     test_mutable_image_pool_name_handoff();
     test_dedup_attach_init_growth_and_clear();
     test_dedup_full_probe_and_malformed_shape();
+    test_dedup_growth_rehash_collision_and_duplicate();
     test_dedup_replacement_overlap();
     test_dedup_shared_retirement_and_clear();
     test_retraction_backup_timestamp_admission();
