@@ -355,13 +355,17 @@ wl_columnar_eval_tdd_plan_bindings_free(
     memset(manifest, 0, sizeof(*manifest));
 }
 
-int
-wl_columnar_eval_tdd_plan_bindings(const wl_plan_stratum_t *sp,
-    uint32_t relation_index, wl_columnar_eval_tdd_plan_manifest_t *out)
+static int
+wl_columnar_eval_tdd_plan_collect(const wl_plan_stratum_t *sp,
+    uint32_t relation_index, wl_columnar_eval_tdd_plan_manifest_t *out,
+    uint32_t counts[3])
 {
-    if (!out)
+    if (!out && !counts)
         return EINVAL;
-    memset(out, 0, sizeof(*out));
+    if (out)
+        memset(out, 0, sizeof(*out));
+    if (counts)
+        memset(counts, 0, 3 * sizeof(*counts));
     if (!sp || !sp->relations || relation_index >= sp->relation_count)
         return EINVAL;
     for (uint32_t r = 0; r < sp->relation_count; r++) {
@@ -398,8 +402,6 @@ wl_columnar_eval_tdd_plan_bindings(const wl_plan_stratum_t *sp,
     wl_columnar_eval_tdd_plan_manifest_t result = {
         .relation_index = relation_index, .alternative_count = k,
         .block_size = width,
-        .owner_stratum = sp, .owner_relation = rel,
-        .owner_ops = rel->ops, .owner_op_count = rel->op_count,
     };
     int rc = wl_columnar_eval_tdd_plan_walk(sp, rel, &result);
     if (rc != 0)
@@ -410,6 +412,12 @@ wl_columnar_eval_tdd_plan_bindings(const wl_plan_stratum_t *sp,
         || wl_columnar_eval_checked_size_mul(result.read_count,
         sizeof(*result.reads), &read_bytes) != 0)
         return EOVERFLOW;
+    if (counts) {
+        counts[0] = result.alternative_count;
+        counts[1] = result.slice_count;
+        counts[2] = result.read_count;
+        return 0;
+    }
     result.slices = calloc(1, slice_bytes);
     result.reads = calloc(1, read_bytes);
     if (!result.slices || !result.reads) {
@@ -423,8 +431,28 @@ wl_columnar_eval_tdd_plan_bindings(const wl_plan_stratum_t *sp,
         wl_columnar_eval_tdd_plan_bindings_free(&result);
         return rc;
     }
+    result.owner_stratum = sp;
+    result.owner_relation = rel;
+    result.owner_ops = rel->ops;
+    result.owner_op_count = rel->op_count;
     *out = result;
     return 0;
+}
+
+int
+wl_columnar_eval_tdd_plan_bindings(const wl_plan_stratum_t *sp,
+    uint32_t relation_index, wl_columnar_eval_tdd_plan_manifest_t *out)
+{
+    return wl_columnar_eval_tdd_plan_collect(sp, relation_index, out, NULL);
+}
+
+/* Diagnostics only need validated counts; the owning binder retains its
+ * allocation and ENOMEM behavior. */
+int
+wl_columnar_eval_tdd_plan_binding_summary(const wl_plan_stratum_t *sp,
+    uint32_t relation_index, uint32_t counts[3])
+{
+    return wl_columnar_eval_tdd_plan_collect(sp, relation_index, NULL, counts);
 }
 
 /* Validate the captured schema without consulting mutable registry aliases. */

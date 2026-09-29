@@ -256,12 +256,18 @@ check_cspa(const wl_plan_stratum_t *sp)
     const uint32_t expected_alias[] = {0, 10, 20, 30, 41};
     const uint32_t indices[] = {flow, alias};
     for (uint32_t r = 0; r < 2; r++) {
+        uint32_t counts[3] = {UINT32_MAX, UINT32_MAX, UINT32_MAX};
+        CHECK(wl_columnar_eval_tdd_plan_binding_summary(sp, indices[r],
+            counts) == 0);
         wl_columnar_eval_tdd_plan_manifest_t manifest;
         CHECK(wl_columnar_eval_tdd_plan_bindings(sp, indices[r],
             &manifest) == 0);
         CHECK(manifest.alternative_count == (r == 0 ? 3u : 5u));
         CHECK(manifest.block_size == (r == 0 ? 16u : 9u));
         CHECK(manifest.slice_count == (r == 0 ? 15u : 10u));
+        CHECK(counts[0] == manifest.alternative_count
+            && counts[1] == manifest.slice_count
+            && counts[2] == manifest.read_count);
         uint32_t active = 0, seeds = 0, inactive = 0, prefilters = 0;
         for (uint32_t s = 0; s < manifest.slice_count; s++) {
             const wl_columnar_eval_tdd_plan_slice_t *slice =
@@ -315,6 +321,10 @@ check_cspa(const wl_plan_stratum_t *sp)
     wl_columnar_eval_tdd_plan_manifest_t manifest;
     CHECK(wl_columnar_eval_tdd_plan_bindings(sp, memory, &manifest) == ENOTSUP);
     CHECK(empty_result(ENOTSUP, &manifest) == 0);
+    uint32_t counts[3] = {UINT32_MAX, UINT32_MAX, UINT32_MAX};
+    CHECK(wl_columnar_eval_tdd_plan_binding_summary(sp, memory,
+        counts) == ENOTSUP);
+    CHECK(!counts[0] && !counts[1] && !counts[2]);
     CHECK(!tdd_stratum_global_read_candidate(sp));
     return 0;
 }
@@ -371,6 +381,10 @@ check_mutations(const wl_plan_stratum_t *original)
         if (!rc)
             fprintf(stderr, "unexpectedly accepted mutation %u\n", mutation);
         CHECK(empty_result(rc, &manifest) == 0);
+        uint32_t counts[3] = {UINT32_MAX, UINT32_MAX, UINT32_MAX};
+        CHECK(wl_columnar_eval_tdd_plan_binding_summary(&sp, ri,
+            counts) == rc);
+        CHECK(!counts[0] && !counts[1] && !counts[2]);
     }
     free(ops);
     wl_columnar_eval_tdd_plan_manifest_t manifest;
@@ -378,8 +392,22 @@ check_mutations(const wl_plan_stratum_t *original)
         &manifest) == 0);
     CHECK(empty_result(wl_columnar_eval_tdd_plan_bindings(original, 3,
         &manifest), &manifest) == 0);
+    uint32_t counts[3] = {UINT32_MAX, UINT32_MAX, UINT32_MAX};
+    CHECK(wl_columnar_eval_tdd_plan_binding_summary(NULL, 0,
+        counts) == EINVAL);
+    CHECK(!counts[0] && !counts[1] && !counts[2]);
+    CHECK(wl_columnar_eval_tdd_plan_binding_summary(original, 3,
+        counts) == EINVAL);
+    CHECK(!counts[0] && !counts[1] && !counts[2]);
+    CHECK(wl_columnar_eval_tdd_plan_binding_summary(original, ri,
+        NULL) == EINVAL);
 #ifdef WL_TEST_ALLOC_WRAP
     for (int failure = 0; failure < 2; failure++) {
+        fail_calloc_after = failure;
+        CHECK(wl_columnar_eval_tdd_plan_binding_summary(original, ri,
+            counts) == 0);
+        CHECK(counts[0] == 5 && counts[1] == 10 && counts[2] > 0);
+        CHECK(fail_calloc_after == failure);
         fail_calloc_after = failure;
         int rc = wl_columnar_eval_tdd_plan_bindings(original, ri, &manifest);
         fail_calloc_after = -1;

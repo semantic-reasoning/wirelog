@@ -3823,6 +3823,10 @@ int wl_columnar_eval_tdd_plan_resolve_input(wl_col_session_t *worker,
  * ENOMEM/EOVERFLOW: storage failure. No plan or session mutation. */
 int wl_columnar_eval_tdd_plan_bindings(const wl_plan_stratum_t *sp,
     uint32_t relation_index, wl_columnar_eval_tdd_plan_manifest_t *out);
+/* Validate and count without allocating occurrence arrays. Counts are
+ * alternatives, slices and reads; failures leave them zero. */
+int wl_columnar_eval_tdd_plan_binding_summary(const wl_plan_stratum_t *sp,
+    uint32_t relation_index, uint32_t counts[3]);
 void wl_columnar_eval_tdd_plan_bindings_free(
     wl_columnar_eval_tdd_plan_manifest_t *manifest);
 
