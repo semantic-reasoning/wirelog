@@ -2050,6 +2050,8 @@ int (*wl_columnar_eval_test_before_worker_dedup)(wl_col_session_t *,
     col_rel_t *, col_rel_t *, col_rel_t *);
 void (*wl_columnar_eval_test_after_worker_dedup)(wl_col_session_t *,
     col_rel_t *, int);
+void (*wl_columnar_eval_test_after_worker_private_error)(wl_col_session_t *,
+    col_rel_t *, col_rel_t *, col_rel_t *, int);
 #endif
 
 static int
@@ -2526,6 +2528,11 @@ tdd_worker_subpass_fn(void *arg)
                 rc2 = ENOSPC;
             if (rc2 == ENOSPC)
                 sess->memory_budget_denied = true;
+#ifdef WL_SESSION_TEST_HOOKS
+            if (wl_columnar_eval_test_after_worker_private_error)
+                wl_columnar_eval_test_after_worker_private_error(sess, r,
+                    image, delta, rc2);
+#endif
             if (queue_slot_held)
                 (void)wl_mpsc_reservation_cancel(&queue_slot);
             col_rel_mutable_image_discard(&image_txn);
