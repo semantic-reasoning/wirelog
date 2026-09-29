@@ -31,16 +31,10 @@ underlying cause changes; do not discard selected runs.
 
 The manual `Paired Perf Diagnostic` workflow gathers non-gating CRDT and CSPA
 evidence when the current nightly medians and historical targets disagree.
-After the workflow reaches the default branch, dispatch it on the candidate
-branch with a full 40-character `base_sha` from `main`. The candidate is the
-dispatch ref's exact SHA. Run one campaign with `first=base` and another with
-`first=candidate`; wait for each run to finish before starting the next.
-During the #2022 pre-merge campaign, a temporary push trigger on the trusted
-`codex/2022-relative-perf` branch uses baseline
-`8d91c2da2b188b94af5b9f1da21c569d80ccb387`: the first attempt starts
-with the baseline, and rerunning the same workflow reverses the first side.
-Remove this temporary trigger after the evidence is collected. The workflow
-serializes its own campaigns on the
+Dispatch it on the candidate branch with a full 40-character `base_sha` from
+`main`. The candidate is the dispatch ref's exact SHA. Run one campaign with
+`first=base` and another with `first=candidate`; wait for each run to finish
+before starting the next. The workflow serializes its own campaigns on the
 shared `wirelog-perf` runner. Other tagged jobs can still create contention,
 so inspect every attempt's host observations before drawing conclusions.
 
@@ -54,3 +48,41 @@ logs, build logs, `samples/metadata.json`, every warmup and trial in
 uploads the evidence. Treat missing trials, correctness failures, timeouts,
 runner pressure, and profile mismatch as ineligible evidence. The diagnostic
 summary has no pass/fail timing threshold and does not change nightly gates.
+
+For the #2022 diagnostic campaign, eligibility was declared before the first
+artifact was available in the [issue comment](https://github.com/semantic-reasoning/wirelog/issues/2022#issuecomment-5891544673).
+Both orders at identical source SHAs must complete all nine samples per side,
+full-fixture correctness, and exact source/data/compiler/build checks. Each
+side's CoV must be at most 3%. Every warmup and sample must have CPU PSI
+`some avg10` at most 10%, one-minute load at most the logical CPU count,
+and no increase in cgroup throttling, both before and after. Across the two
+attempts, each side's median and the candidate/base median ratio must have
+maximum/minimum at most 1.05. These checks decide whether the observations
+are usable; **1.05 is not a permitted performance regression**. Preserve all
+attempts and report ineligible campaigns as inconclusive.
+
+### Kernel-independent hotspot attribution
+
+If `perf` has no matching binary for the tagged runner kernel, use GNU `gprof`
+as a separate function-level diagnostic. Build each revision from the same
+source/data with profiling enabled for both compilation and linking:
+
+```sh
+meson setup build-gprof --buildtype=release -Dwirelog_log_max_level=trace \
+  -Dtests=true -DmbedTLS=disabled -Db_lto=false -Ddebug=true \
+  -Dc_args=-pg -Dc_link_args=-pg
+meson compile -C build-gprof bench_flowlog
+taskset -c 0 build-gprof/bench/bench_flowlog --workload cspa-fast \
+  --data-cspa bench/data/cspa --workers 1 --repeat 1
+gprof build-gprof/bench/bench_flowlog gmon.out > cspa-gprof.txt
+```
+
+Run each revision in its own output directory so `gmon.out` is not overwritten,
+and verify the expected 20,381 tuples and 6 iterations. For CRDT, use
+`--workload crdt --data-crdt bench/data/crdt` and verify 2,152,328 aggregate
+tuples and 14,148 iterations. We verified this path on both revisions with
+CSPA; it generated call graphs with matching correctness. `-pg` changes the
+build and runtime, so use its function counts and call graph only to investigate
+hotspots, never as the timing gate or a measured before/after speedup. See the
+[GNU gprof manual](https://sourceware.org/binutils/docs/gprof.html) for the
+profiling format and limitations.

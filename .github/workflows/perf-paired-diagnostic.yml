@@ -2,10 +2,6 @@ name: Paired Perf Diagnostic
 
 # Manual, non-gating evidence collection for #2022 on the shared tagged runner.
 on:
-  # Temporary pre-merge campaign for #2022; remove after tagged evidence lands.
-  push:
-    branches:
-      - codex/2022-relative-perf
   workflow_dispatch:
     inputs:
       base_sha:
@@ -34,9 +30,9 @@ jobs:
     runs-on: [self-hosted, Linux, X64, wirelog-perf]
     timeout-minutes: 150
     env:
-      BASE_SHA: ${{ github.event_name == 'push' && '8d91c2da2b188b94af5b9f1da21c569d80ccb387' || inputs.base_sha }}
+      BASE_SHA: ${{ inputs.base_sha }}
       CANDIDATE_SHA: ${{ github.sha }}
-      FIRST_SIDE: ${{ github.event_name == 'push' && (github.run_attempt == '1' && 'base' || 'candidate') || inputs.first }}
+      FIRST_SIDE: ${{ inputs.first }}
     steps:
       - uses: actions/checkout@v5
         with:
