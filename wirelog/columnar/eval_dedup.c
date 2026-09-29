@@ -59,10 +59,9 @@ wl_columnar_eval_dedup_set_bytes(const col_rel_t *r, uint64_t *bytes)
             ? 0 : EINVAL;
     }
     if (!r->dedup_slots || (r->dedup_cap & (r->dedup_cap - 1u))
-        || r->dedup_count > r->dedup_cap
-        || !wl_columnar_memory_size_mul(r->dedup_cap,
-        sizeof(*r->dedup_slots), bytes))
+        || r->dedup_count > r->dedup_cap)
         return EINVAL;
+    *bytes = (uint64_t)r->dedup_cap * sizeof(*r->dedup_slots);
     for (uint32_t i = 0; i < r->dedup_cap; i++)
         occupied += r->dedup_slots[i] != 0;
     if (occupied != r->dedup_count)
@@ -191,7 +190,8 @@ wl_columnar_eval_dedup_row_hash(const col_rel_t *r, uint32_t row)
 
 /* Grow the hash set to double capacity. */
 static int
-wl_columnar_eval_dedup_set_grow(col_rel_t *r)
+wl_columnar_eval_dedup_set_grow(col_rel_t *r, uint64_t incoming_hash,
+    bool *inserted)
 {
     uint32_t old_cap = r->dedup_cap;
     uint32_t new_cap;
@@ -209,11 +209,8 @@ wl_columnar_eval_dedup_set_grow(col_rel_t *r)
             return EBUSY;
     }
     new_cap = old_cap ? old_cap * 2u : 1024u;
-    if (!wl_columnar_memory_size_mul(old_cap, sizeof(uint64_t),
-        &old_bytes)
-        || !wl_columnar_memory_size_mul(new_cap, sizeof(uint64_t),
-        &new_bytes))
-        return EOVERFLOW;
+    old_bytes = (uint64_t)old_cap * sizeof(uint64_t);
+    new_bytes = (uint64_t)new_cap * sizeof(uint64_t);
 #if SIZE_MAX < UINT64_MAX
     if (new_bytes > SIZE_MAX)
         return EOVERFLOW;
@@ -248,17 +245,22 @@ wl_columnar_eval_dedup_set_grow(col_rel_t *r)
             abort();
         return ENOMEM;
     }
+    new_slots[incoming_hash & (new_cap - 1u)] = incoming_hash;
+    uint32_t count_inc = 1;
     /* Rehash existing entries. */
     for (uint32_t i = 0; i < old_cap; i++) {
         uint64_t h = r->dedup_slots[i];
         if (h == 0)
             continue;
-        uint32_t pos = UINT32_MAX;
-        if (!wl_dedup_probe(new_slots, new_cap, h, &pos)) {
-            if (pos == UINT32_MAX)
-                abort();
-            new_slots[pos] = h;
+        if (h == incoming_hash) {
+            count_inc = 0;
+            continue;
         }
+        uint32_t pos = (uint32_t)(h & (new_cap - 1u));
+        while (new_slots[pos] != 0 && new_slots[pos] != h)
+            pos = (pos + 1u) & (new_cap - 1u);
+        if (new_slots[pos] == 0)
+            new_slots[pos] = h;
     }
     if (r->memory_governor) {
         if (growth) {
@@ -277,6 +279,8 @@ wl_columnar_eval_dedup_set_grow(col_rel_t *r)
     free(r->dedup_slots);
     r->dedup_slots = new_slots;
     r->dedup_cap = new_cap;
+    r->dedup_count += count_inc;
+    *inserted = count_inc != 0;
     if (growth) {
         if (!wl_columnar_memory_reservation_downsize(
                 &r->dedup_reservation, new_bytes))
@@ -324,14 +328,10 @@ wl_columnar_eval_dedup_set_insert_checked(col_rel_t *r, uint64_t h,
         || r->dedup_count >= r->dedup_cap
         || (uint64_t)r->dedup_count * 10u
         >= (uint64_t)r->dedup_cap * 7u) {
-        int rc = wl_columnar_eval_dedup_set_grow(r);
+        int rc = wl_columnar_eval_dedup_set_grow(r, h, inserted);
         if (rc != 0)
             return rc;
-        empty = UINT32_MAX;
-        if (wl_dedup_probe(r->dedup_slots, r->dedup_cap, h, &empty)) {
-            *inserted = false;
-            return 0;
-        }
+        return 0;
     }
     if (empty == UINT32_MAX)
         return EBUSY;
