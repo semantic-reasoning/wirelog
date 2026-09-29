@@ -280,7 +280,8 @@ main(void)
         return SKIP_EXIT;
     }
 
-    if (!probe && !correctness_only && !parse_bool_env_("WIRELOG_PERF_GATE", 0)) {
+    if (!probe && !correctness_only && !parse_bool_env_("WIRELOG_PERF_GATE",
+        0)) {
         fprintf(stderr,
             "test_crdt_perf_gate: SKIP: set WIRELOG_PERF_GATE=1 to run "
             "(designed for dedicated perf hardware, not shared CI runners)\n");
@@ -307,7 +308,8 @@ main(void)
      * a trace build it is the first thing worth ruling out, and
      * WIRELOG_PERF_REQUIRE still makes it fatal for anyone who wants the
      * strict measurement build. */
-    if (!probe && !correctness_only && WL_LOG_COMPILE_MAX_LEVEL > WL_LOG_ERROR) {
+    if (!probe && !correctness_only &&
+        WL_LOG_COMPILE_MAX_LEVEL > WL_LOG_ERROR) {
         if (parse_bool_env_("WIRELOG_PERF_REQUIRE", 0)) {
             fprintf(stderr,
                 "test_crdt_perf_gate: FAIL: WIRELOG_PERF_REQUIRE=1 but "
@@ -395,7 +397,8 @@ main(void)
     }
 
     if (probe) {
-        printf("{\"schema_version\":1,\"measurement\":\"crdt_perf_gate_single_run\","
+        printf(
+            "{\"schema_version\":1,\"measurement\":\"crdt_perf_gate_single_run\","
             "\"workload\":\"crdt\",\"fixture\":\"%s\",\"workers\":1,"
             "\"elapsed_ms\":%.9f,\"result\":%" PRId64 ",\"expected\":%" PRId64
             ",\"aggregate\":%" PRId64 ",\"iterations\":%u,\"status\":\"OK\"}\n",
