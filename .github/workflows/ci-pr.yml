@@ -649,7 +649,9 @@ jobs:
         run: bash --version | head -1
 
       - name: Test with sanitizers
-        run: meson test -C builddir-san --print-errorlogs
+        # The required, pinned-Syft SBOM gate runs in build-primary. A host
+        # Syft here can make its redundant scan time out under sanitizer load.
+        run: meson test -C builddir-san --exclude sbom_snapshot --print-errorlogs
         env:
           ASAN_OPTIONS: abort_on_error=1:halt_on_error=1
           UBSAN_OPTIONS: abort_on_error=1:halt_on_error=1:print_stacktrace=1

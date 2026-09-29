@@ -147,6 +147,33 @@ assert 'release-tag.yml Tag/ABI sets WIRELOG_ABI_REQUIRED' \
     sets_in_step release-tag.yml 'Build and test ABI suite' WIRELOG_ABI_REQUIRED
 assert 'ci-pr.yml SBOM step sets WIRELOG_SBOM_REQUIRED' \
     sets_in_step ci-pr.yml 'SBOM snapshot gate' WIRELOG_SBOM_REQUIRED
+
+# The mandatory PR SBOM scan is distinct from the opportunistic scan in full
+# sanitizer suites. Exclude only that exact test: --no-suite sbom also drops
+# the locale and snapshot contract tests.
+sanitizer_excludes_snapshot() {
+    local file=$1 job=$2 builddir=$3
+    awk -v job="  $job:" \
+        -v expected="run: meson test -C $builddir --exclude sbom_snapshot --print-errorlogs" '
+        $0 == job { inside = 1; next }
+        inside && /^  [[:alnum:]_-]+:/ { exit }
+        inside {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            if (line == expected) found++
+        }
+        END { exit found == 1 ? 0 : 1 }
+    ' "$root/.github/workflows/$file"
+}
+assert 'ci-pr.yml sanitizer excludes only the duplicate SBOM snapshot' \
+    sanitizer_excludes_snapshot ci-pr.yml sanitizer-matrix builddir-san
+assert 'ci-main.yml sanitizer excludes only the duplicate SBOM snapshot' \
+    sanitizer_excludes_snapshot ci-main.yml sanitizer-matrix builddir
+assert 'tier1-sanitizers.yml sanitizer excludes only the duplicate SBOM snapshot' \
+    sanitizer_excludes_snapshot tier1-sanitizers.yml asan-ubsan builddir-san
+assert 'ci-pr.yml still runs the required SBOM suite' \
+    grep -Fq 'meson test -C builddir --suite sbom --print-errorlogs' \
+        "$root/.github/workflows/ci-pr.yml"
 assert 'release-tag.yml Tag/SBOM sets WIRELOG_SBOM_REQUIRED' \
     sets_in_step release-tag.yml 'Build and test SBOM suite' WIRELOG_SBOM_REQUIRED
 
