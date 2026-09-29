@@ -263,11 +263,13 @@ wl_columnar_source_access_cohort_exchange(
     return 0;
 }
 
+/* Validation is a snapshot only. The caller must externally serialize the
+ * cohort, reader/entry arrays, and gate lifecycle through restoration; this
+ * call does not reserve their state or prepare an atomic commit. */
 static inline int
-wl_columnar_source_access_cohort_restore(
-    wl_columnar_source_access_cohort_t *cohort)
+wl_columnar_source_access_cohort_validate(
+    const wl_columnar_source_access_cohort_t *cohort)
 {
-    uint64_t expected;
     if (!cohort || cohort->identity != (uintptr_t)cohort
         || !cohort->source || !cohort->reader_refs || !cohort->entries
         || !cohort->reader_count || !cohort->entry_count
@@ -314,6 +316,17 @@ wl_columnar_source_access_cohort_restore(
             || atomic_load_explicit(&cohort->entries[i].gate->state,
             memory_order_acquire) != WL_COLUMNAR_SOURCE_ACCESS_WRITER)
             return EBUSY;
+    return 0;
+}
+
+static inline int
+wl_columnar_source_access_cohort_restore(
+    wl_columnar_source_access_cohort_t *cohort)
+{
+    uint64_t expected;
+    int rc = wl_columnar_source_access_cohort_validate(cohort);
+    if (rc != 0)
+        return rc;
     for (size_t i = 0; i < cohort->entry_count; i++) {
         do {
             expected = WL_COLUMNAR_SOURCE_ACCESS_WRITER;

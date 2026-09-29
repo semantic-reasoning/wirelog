@@ -62,9 +62,11 @@ test_paired_cohort(bool shared_descriptor)
 {
     wl_columnar_source_access_gate_t source = { 0 }, first = { 0 };
     wl_columnar_source_access_gate_t second = { 0 };
+    wl_columnar_source_access_gate_t wrong_source = { 0 };
     wl_columnar_source_access_gate_t *other
         = shared_descriptor ? &first : &second;
     wl_columnar_source_access_reader_t a = { 0 }, b = { 0 };
+    wl_columnar_source_access_reader_t reader_copy;
     wl_columnar_source_access_reader_t *readers[] = { &a, &b };
     wl_columnar_source_access_cohort_entry_t entries[2] = { 0 };
     wl_columnar_source_access_cohort_t cohort = { 0 }, copy;
@@ -75,6 +77,7 @@ test_paired_cohort(bool shared_descriptor)
     wl_columnar_source_access_gate_init(&source);
     wl_columnar_source_access_gate_init(&first);
     wl_columnar_source_access_gate_init(&second);
+    wl_columnar_source_access_gate_init(&wrong_source);
     CHECK(paired_reader_acquire(&source, &first, &a) == 0,
         "first paired reader");
     CHECK(paired_reader_acquire(&source, other, &b) == 0,
@@ -85,7 +88,15 @@ test_paired_cohort(bool shared_descriptor)
     CHECK(cohort.entry_count == (shared_descriptor ? 1u : 2u)
         && entries[0].readers == (shared_descriptor ? 2u : 1u),
         "descriptor multiplicity recorded");
+    wl_columnar_source_access_cohort_t snapshot = cohort;
+    CHECK(wl_columnar_source_access_cohort_validate(&cohort) == 0
+        && memcmp(&cohort, &snapshot, sizeof(cohort)) == 0
+        && atomic_load_explicit(&source.state, memory_order_acquire)
+        == WL_COLUMNAR_SOURCE_ACCESS_WRITER,
+        "live cohort validation is read only");
     copy = cohort;
+    CHECK(wl_columnar_source_access_cohort_validate(&copy) == EINVAL,
+        "copied cohort validation rejected");
     CHECK(wl_columnar_source_access_cohort_restore(&copy) == EINVAL,
         "copied cohort rejected");
     CHECK(wl_columnar_source_access_reader_release(&a) == EINVAL
@@ -100,19 +111,76 @@ test_paired_cohort(bool shared_descriptor)
         == EBUSY
         && wl_columnar_source_access_gate_reader_acquire(&first) == EBUSY,
         "suspended gates deny new readers");
+    reader_copy = a;
+    readers[0] = &reader_copy;
+    CHECK(wl_columnar_source_access_cohort_validate(&cohort) == EINVAL,
+        "copied reader reference rejected");
+    readers[0] = &a;
+    CHECK(wl_columnar_source_access_cohort_validate(&cohort) == 0,
+        "repaired reader reference validates");
+    cohort.reader_count--;
+    CHECK(wl_columnar_source_access_cohort_validate(&cohort) == EINVAL,
+        "reader count mismatch rejected");
+    cohort.reader_count++;
+    CHECK(wl_columnar_source_access_cohort_validate(&cohort) == 0,
+        "repaired reader count validates");
+    if (!shared_descriptor) {
+        entries[1].gate = entries[0].gate;
+        CHECK(wl_columnar_source_access_cohort_validate(&cohort) == EINVAL,
+            "duplicate descriptor entry rejected");
+        entries[1].gate = &second;
+        CHECK(wl_columnar_source_access_cohort_validate(&cohort) == 0,
+            "repaired descriptor entry validates");
+    } else {
+        entries[1].gate = &second;
+        cohort.entry_count = 2;
+        CHECK(wl_columnar_source_access_cohort_validate(&cohort) == EBUSY,
+            "unused zero-reader entry retains EBUSY result");
+        cohort.entry_count = 1;
+        entries[1].gate = NULL;
+        CHECK(wl_columnar_source_access_cohort_validate(&cohort) == 0,
+            "repaired entry count validates");
+    }
+    cohort.source = &wrong_source;
+    CHECK(wl_columnar_source_access_cohort_validate(&cohort) == EINVAL,
+        "wrong source gate rejected");
+    cohort.source = &source;
+    CHECK(wl_columnar_source_access_cohort_validate(&cohort) == 0,
+        "repaired source gate validates");
+    atomic_store_explicit(&source.state, 2, memory_order_release);
+    CHECK(wl_columnar_source_access_cohort_validate(&cohort) == EBUSY,
+        "source without WRITER rejected");
+    atomic_store_explicit(&source.state, WL_COLUMNAR_SOURCE_ACCESS_WRITER,
+        memory_order_release);
+    CHECK(wl_columnar_source_access_cohort_validate(&cohort) == 0,
+        "repaired source WRITER validates");
+    atomic_store_explicit(&first.state, entries[0].readers,
+        memory_order_release);
+    CHECK(wl_columnar_source_access_cohort_validate(&cohort) == EBUSY,
+        "descriptor without WRITER rejected");
+    atomic_store_explicit(&first.state, WL_COLUMNAR_SOURCE_ACCESS_WRITER,
+        memory_order_release);
+    CHECK(wl_columnar_source_access_cohort_validate(&cohort) == 0,
+        "repaired descriptor WRITER validates");
     entries[0].readers++;
+    CHECK(wl_columnar_source_access_cohort_validate(&cohort) == EINVAL,
+        "descriptor multiplicity mismatch rejected");
     CHECK(wl_columnar_source_access_cohort_restore(&cohort) == EINVAL,
         "malformed cohort snapshot rejected");
     entries[0].readers--;
     wl_columnar_source_access_gate_t *saved_descriptor
         = a.secondary_owner;
     a.secondary_owner = &source;
+    CHECK(wl_columnar_source_access_cohort_validate(&cohort) == EINVAL,
+        "source-as-descriptor reader validation rejected");
     CHECK(wl_columnar_source_access_cohort_restore(&cohort) == EINVAL
         && atomic_load_explicit(&source.state, memory_order_acquire)
         == WL_COLUMNAR_SOURCE_ACCESS_WRITER,
         "source gate in reader descriptor rejected before mutation");
     a.secondary_owner = saved_descriptor;
     entries[0].gate = &source;
+    CHECK(wl_columnar_source_access_cohort_validate(&cohort) == EINVAL,
+        "source-as-descriptor entry validation rejected");
     CHECK(wl_columnar_source_access_cohort_restore(&cohort) == EINVAL
         && atomic_load_explicit(&source.state, memory_order_acquire)
         == WL_COLUMNAR_SOURCE_ACCESS_WRITER
