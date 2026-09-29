@@ -931,6 +931,12 @@ test('perf_nightly_governor_policy', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-perf-nightly-governor-policy.py'],
      suite: 'abi')
 
+if host_machine.system() == 'linux'
+  test('perf_paired_benchmark_contract', py3,
+       args: [meson.project_source_root() / 'scripts/perf/test-paired-benchmark.py'],
+       suite: 'abi')
+endif
+
 # Keep the longer Windows/MSVC build budget platform-specific; a global
 # timeout increase would hide Linux/macOS regressions in the PR gate.
 test('ci_pr_build_timeout_contract', py3,
