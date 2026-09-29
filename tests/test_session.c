@@ -8513,14 +8513,16 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
     wide_timestamp_arr_built = wide_timestamp_boundary_seen = false;
     wide_timestamp_arr_unchanged = false;
     wide_timestamp_boundary_source_unchanged = false;
-    wide_timestamp_capture_arr = fault_mode == 4 || fault_mode == 5
+    wide_timestamp_capture_arr = fault_mode == 2 || fault_mode == 3
+        || fault_mode == 4 || fault_mode == 5
         || fault_mode == 6 || fault_mode == 7;
     wl_columnar_eval_test_before_worker_delta = fault_mode == 3
         || fault_mode == 7
         ? wide_merge_before_delta : NULL;
     wl_columnar_eval_test_before_worker_image = wide_rollback_before_image;
-    wl_columnar_eval_test_subpass_boundary = fault_mode == 4
-        || fault_mode == 5 || fault_mode == 6 || fault_mode == 7
+    wl_columnar_eval_test_subpass_boundary = fault_mode == 2
+        || fault_mode == 3 || fault_mode == 4 || fault_mode == 5
+        || fault_mode == 6 || fault_mode == 7
         ? wide_timestamp_after_subpass : NULL;
     wl_columnar_eval_test_after_worker_image = fault_mode == 1
         ? wide_rollback_after_image : NULL;
@@ -8605,10 +8607,16 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
         && wide_timestamp_boundary_source_unchanged)
         : fault_mode == 3 ? (wide_merge_private_seen
         && wide_merge_after_seen && wide_merge_after_rc == rc
-        && wide_merge_fault_consumed && wide_merge_source_unchanged)
+        && wide_merge_fault_consumed && wide_merge_source_unchanged
+        && wide_timestamp_arr_built && wide_timestamp_boundary_seen
+        && wide_timestamp_arr_unchanged
+        && wide_timestamp_boundary_source_unchanged)
         : fault_mode == 2 ? (wide_dedup_seeded
         && wide_dedup_after_seen && wide_dedup_after_rc == rc
-        && wide_dedup_fault_consumed && wide_dedup_source_unchanged)
+        && wide_dedup_fault_consumed && wide_dedup_source_unchanged
+        && wide_timestamp_arr_built && wide_timestamp_boundary_seen
+        && wide_timestamp_arr_unchanged
+        && wide_timestamp_boundary_source_unchanged)
         : fault_mode == 1 ? (wide_rollback_prep_seen
         && wide_rollback_prep_rc == rc
         && wide_rollback_prep_fault_consumed
