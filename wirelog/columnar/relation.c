@@ -374,6 +374,64 @@ col_rel_storage_owner_resolve(const col_rel_t *src, col_rel_t **out_owner)
 }
 
 int
+col_rel_replacement_cohort_validate(
+    const col_rel_t *destination,
+    const wl_columnar_source_access_cohort_t *cohort,
+    col_rel_t *const *borrower_refs, size_t borrower_count)
+{
+    col_rel_t *owner;
+    size_t aliases = 0;
+    int rc = wl_columnar_source_access_cohort_validate(cohort);
+
+    if (rc != 0)
+        return rc;
+    if (!destination || !borrower_refs || borrower_count != cohort->reader_count
+        || col_rel_storage_owner_resolve(destination, &owner) != 0
+        || owner != destination || destination->col_shared
+        || cohort->source != &destination->source_access
+        || destination->storage_owner_generation
+        != destination->storage_generation)
+        return EINVAL;
+    for (size_t i = 0; i < borrower_count; i++) {
+        const col_rel_t *borrower = borrower_refs[i];
+        bool unique = true;
+        if (!borrower
+            || cohort->reader_refs[i]->secondary_owner
+            != &borrower->descriptor_access
+            || col_rel_storage_owner_resolve(borrower, &owner) != 0
+            || owner != destination
+            || borrower->storage_owner_identity
+            != destination->relation_identity
+            || borrower->storage_owner_generation
+            != destination->storage_generation
+            || borrower->ncols != destination->ncols
+            || borrower->nrows != destination->nrows
+            || borrower->capacity != destination->capacity
+            || (borrower->ncols
+            && (!borrower->columns || !destination->columns)))
+            return EINVAL;
+        if (borrower == destination)
+            continue;
+        if (!borrower->col_shared
+            || col_rel_storage_alias_borrow_count(borrower) != 0)
+            return EINVAL;
+        for (uint32_t c = 0; c < borrower->ncols; c++)
+            if (!borrower->col_shared[c]
+                || borrower->columns[c] != destination->columns[c])
+                return EINVAL;
+        for (size_t j = 0; j < i; j++)
+            if (borrower_refs[j] == borrower)
+                unique = false;
+        if (unique)
+            aliases++;
+    }
+    uint64_t live_aliases = col_rel_storage_alias_borrow_count(destination);
+    if (aliases > live_aliases)
+        return EINVAL;
+    return aliases == live_aliases ? 0 : EBUSY;
+}
+
+int
 col_rel_storage_alias_release(col_rel_t *alias)
 {
     col_rel_t *owner;

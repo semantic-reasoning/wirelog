@@ -2969,6 +2969,13 @@ int col_rel_storage_alias_release(col_rel_t *alias);
 uint64_t col_rel_storage_alias_borrow_count(const col_rel_t *owner);
 int col_rel_storage_alias_borrow_acquire(col_rel_t *owner);
 int col_rel_storage_alias_borrow_release(col_rel_t *owner);
+/* Read-only snapshot check while the caller owns the exchanged cohort and
+ * keeps its arrays and relation descriptors stable through restoration.
+ * Borrowers correspond to reader_refs by index; every live alias must occur. */
+int col_rel_replacement_cohort_validate(
+    const col_rel_t *destination,
+    const wl_columnar_source_access_cohort_t *cohort,
+    col_rel_t *const *borrower_refs, size_t borrower_count);
 int col_rel_storage_owner_destroy_status(const col_rel_t *owner);
 int col_rel_source_reader_acquire(const col_rel_t *,
     wl_columnar_source_access_reader_t *);
