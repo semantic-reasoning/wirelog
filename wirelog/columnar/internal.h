@@ -3699,7 +3699,8 @@ tdd_stratum_global_read_candidate(const wl_plan_stratum_t *sp);
  * This describes input requirements only, NEVER execution eligibility.
  * Names and ops are borrowed: the unchanged plan must outlive the manifest.
  * Every read in an active slice requires one immutable epoch; only DELTA
- * reads may be partitioned. Unexpanded/K=1 relations return ENOTSUP.
+ * reads may be partitioned. Unexpanded/K=1 relations return ENOTSUP except
+ * the verified CSPA memoryAlias recursive body; its seeds remain excluded.
  */
 typedef enum {
     WL_COLUMNAR_EVAL_TDD_PLAN_FULL,
@@ -3727,7 +3728,14 @@ typedef struct {
     bool inactive;
 } wl_columnar_eval_tdd_plan_slice_t;
 
+typedef enum {
+    WL_COLUMNAR_EVAL_TDD_PLAN_EXPANDED = 0,
+    /* Only the verified CSPA memoryAlias positive recursive body. */
+    WL_COLUMNAR_EVAL_TDD_PLAN_CSPA_K1,
+} wl_columnar_eval_tdd_plan_form_t;
+
 typedef struct {
+    wl_columnar_eval_tdd_plan_form_t form;
     uint32_t relation_index;
     uint32_t alternative_count;
     uint32_t block_size;

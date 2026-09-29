@@ -319,12 +319,28 @@ check_cspa(const wl_plan_stratum_t *sp)
         CHECK(!manifest.slices && !manifest.reads && !manifest.slice_count);
     }
     wl_columnar_eval_tdd_plan_manifest_t manifest;
-    CHECK(wl_columnar_eval_tdd_plan_bindings(sp, memory, &manifest) == ENOTSUP);
-    CHECK(empty_result(ENOTSUP, &manifest) == 0);
-    uint32_t counts[3] = {UINT32_MAX, UINT32_MAX, UINT32_MAX};
+    CHECK(wl_columnar_eval_tdd_plan_bindings(sp, memory, &manifest) == 0);
+    CHECK(manifest.form == WL_COLUMNAR_EVAL_TDD_PLAN_CSPA_K1
+        && manifest.alternative_count == 1 && manifest.slice_count == 1
+        && manifest.read_count == 4 && manifest.slices[0].start == 5
+        && manifest.slices[0].count == 4 && manifest.slices[0].driver == 6
+        && !manifest.slices[0].seed && !manifest.slices[0].inactive);
+    for (uint32_t i = 0; i < 4; i++) {
+        const wl_columnar_eval_tdd_plan_read_t *read = &manifest.reads[i];
+        CHECK(read->op_index == 5 + i && read->source_index == i
+            && read->right_operand == (i != 0)
+            && strcmp(read->relation_name,
+            i == 1 ? "valueAlias" : "dereference") == 0
+            && read->kind == (i == 1 ? WL_COLUMNAR_EVAL_TDD_PLAN_DELTA
+                : i == 2 ? WL_COLUMNAR_EVAL_TDD_PLAN_PREFILTER
+                : WL_COLUMNAR_EVAL_TDD_PLAN_FULL));
+    }
+    wl_columnar_eval_tdd_plan_bindings_free(&manifest);
+    uint32_t counts[3] = {0};
     CHECK(wl_columnar_eval_tdd_plan_binding_summary(sp, memory,
-        counts) == ENOTSUP);
-    CHECK(!counts[0] && !counts[1] && !counts[2]);
+        counts) == 0);
+    CHECK(counts[0] == 1 && counts[1] == 1 && counts[2] == 4);
+    /* Operator binding support alone never enables the full SCC. */
     CHECK(!tdd_stratum_global_read_candidate(sp));
     return 0;
 }
