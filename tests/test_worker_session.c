@@ -3573,6 +3573,106 @@ test_worker_deferred_relation_retries_locally(void)
 /* Main                                                                     */
 /* ======================================================================== */
 
+static int
+test_replacement_cohort_bindings(void)
+{
+    TEST("replacement cohort validates complete borrower bindings");
+    col_rel_t *root = col_rel_new_auto("cohort-root", 1);
+    col_rel_t *a = col_rel_new_auto("cohort-a", 1);
+    col_rel_t *b = col_rel_new_auto("cohort-b", 1);
+    wl_columnar_source_access_reader_t readers[4] = {0};
+    wl_columnar_source_access_reader_t *refs[] = {&readers[0], &readers[1],
+                                                  &readers[2], &readers[3]};
+    col_rel_t *borrowers[] = {a, a, b, root};
+    wl_columnar_source_access_cohort_entry_t entries[3] = {0};
+    wl_columnar_source_access_cohort_t cohort = {0};
+    int64_t row[] = {42};
+    int ok = root && a && b && col_rel_append_row(root, row) == 0 &&
+        col_rel_install_shared_view(a, root) == 0 &&
+        col_rel_install_shared_view(b, root) == 0;
+    for (size_t i = 0; ok && i < 4; i++)
+        ok = col_rel_source_reader_acquire_transferable(borrowers[i],
+                refs[i]) == 0;
+    if (ok)
+        ok = wl_columnar_source_access_cohort_exchange(&root->source_access,
+                refs,
+                4, entries, 3, &cohort) == 0;
+    if (ok) {
+        int64_t *old_column = root->columns[0];
+        uint64_t generation = root->storage_generation;
+        wl_columnar_source_access_cohort_t copied = cohort;
+        ok =
+            col_rel_replacement_cohort_validate(root, &cohort, borrowers,
+                4) == 0 &&
+            col_rel_replacement_cohort_validate(root, &copied, borrowers, 4) ==
+            EINVAL &&
+            col_rel_replacement_cohort_validate(root, &cohort, borrowers, 3) ==
+            EINVAL;
+        borrowers[0] = b;
+        ok = ok && col_rel_replacement_cohort_validate(root, &cohort, borrowers,
+                4) == EINVAL;
+        borrowers[0] = a;
+        a->storage_owner_identity++;
+        ok = ok && col_rel_replacement_cohort_validate(root, &cohort, borrowers,
+                4) == EINVAL;
+        a->storage_owner_identity--;
+        a->storage_owner_generation++;
+        ok = ok && col_rel_replacement_cohort_validate(root, &cohort, borrowers,
+                4) == EINVAL;
+        a->storage_owner_generation--;
+        atomic_store_explicit(&root->storage_alias_borrows, 1,
+            memory_order_release);
+        ok = ok && col_rel_replacement_cohort_validate(root, &cohort, borrowers,
+                4) == EINVAL;
+        atomic_store_explicit(&root->storage_alias_borrows, 2,
+            memory_order_release);
+        a->nrows++;
+        ok = ok && col_rel_replacement_cohort_validate(root, &cohort, borrowers,
+                4) == EINVAL;
+        a->nrows--;
+        a->columns[0] = NULL;
+        ok = ok && col_rel_replacement_cohort_validate(root, &cohort, borrowers,
+                4) == EINVAL;
+        a->columns[0] = old_column;
+        ok = ok && root->columns[0] == old_column &&
+            root->columns[0][0] == 42 &&
+            root->storage_generation == generation &&
+            cohort.identity == (uintptr_t)&cohort &&
+            col_rel_replacement_cohort_validate(root, &cohort, borrowers,
+                4) == 0;
+    }
+    if (cohort.identity)
+        ok = wl_columnar_source_access_cohort_restore(&cohort) == 0 && ok;
+    if (ok) {
+        ok = col_rel_source_reader_release(&readers[2]) == 0;
+        refs[2] = &readers[3];
+        borrowers[2] = root;
+        if (ok)
+            ok = wl_columnar_source_access_cohort_exchange(
+                &root->source_access, refs, 3, entries, 3, &cohort) == 0;
+        if (ok)
+            ok = col_rel_replacement_cohort_validate(root, &cohort, borrowers,
+                    3) ==
+                EBUSY;
+        if (cohort.identity)
+            ok = wl_columnar_source_access_cohort_restore(&cohort) == 0 && ok;
+    }
+    for (size_t i = 0; i < 4; i++)
+        if (readers[i].owner)
+            ok = col_rel_source_reader_release(&readers[i]) == 0 && ok;
+    col_rel_destroy(a);
+    col_rel_destroy(b);
+    if (root)
+        ok = col_rel_storage_alias_borrow_count(root) == 0 && ok;
+    col_rel_destroy(root);
+    if (!ok) {
+        FAIL("borrower validation or restored reader cleanup failed");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -3582,6 +3682,7 @@ main(int argc, char **argv)
     printf("Per-Worker Session State Tests (Issue #315)\n");
 
     test_create_destroy();
+    test_replacement_cohort_bindings();
     test_worker_borrows_extension_snapshot();
     test_worker_borrows_evaluation_control();
     test_identity_fields();
