@@ -520,6 +520,103 @@ test_payload_ownership(void)
     PASS();
 }
 
+static void
+test_reservation(void)
+{
+    TEST("reserved slot is exclusive, invisible, cancellable and ordered");
+    wl_mpsc_queue_t *q = wl_mpsc_queue_create(2, 2);
+    ASSERT(q != NULL, "create failed");
+    int a = 1, b = 2, c = 3;
+    wl_delta_msg_t out;
+    wl_mpsc_reservation_t lease, stale, other;
+
+    ASSERT(wl_mpsc_reserve(q, 2, &lease) != 0,
+        "invalid worker reserved slot");
+    ASSERT(wl_mpsc_enqueue(q, 0, &a, 0, 0) == 0,
+        "initial enqueue failed");
+    ASSERT(wl_mpsc_reserve(q, 0, &lease) == 0,
+        "reserve free slot failed");
+    stale = lease;
+    ASSERT(wl_mpsc_size(q) == 1, "reservation changed published size");
+    ASSERT(wl_mpsc_reserve(q, 0, &other) != 0,
+        "second reserve succeeded");
+    ASSERT(wl_mpsc_enqueue(q, 0, &b, 0, 1) != 0,
+        "enqueue bypassed reservation");
+    ASSERT(wl_mpsc_dequeue(q, &out) == 1 && out.delta == &a,
+        "prior item missing");
+    ASSERT(wl_mpsc_dequeue(q, &out) == 0,
+        "consumer saw unpublished slot");
+    ASSERT(wl_mpsc_reservation_cancel(&lease) == 0,
+        "cancel failed");
+    ASSERT(wl_mpsc_reservation_cancel(&lease) != 0,
+        "double cancel succeeded");
+    ASSERT(wl_mpsc_reservation_publish(&stale,
+        (wl_delta_msg_t){ .delta = &b, .worker_id = 0 }) != 0,
+        "cancelled lease published");
+
+    ASSERT(wl_mpsc_reserve(q, 0, &lease) == 0,
+        "reserve after cancel failed");
+    ASSERT(wl_mpsc_reservation_publish(&stale,
+        (wl_delta_msg_t){ .delta = &b, .worker_id = 0 }) != 0,
+        "stale generation published");
+    ASSERT(wl_mpsc_reservation_publish(&lease,
+        (wl_delta_msg_t){ .delta = &b, .worker_id = 1, .rel_idx = 9 }) == 0,
+        "valid publication failed");
+    ASSERT(wl_mpsc_reservation_publish(&lease,
+        (wl_delta_msg_t){ .delta = &c, .worker_id = 0 }) != 0,
+        "double publication succeeded");
+    ASSERT(wl_mpsc_dequeue(q, &out) == 1 && out.delta == &b
+        && out.rel_idx == 9 && out.worker_id == 0,
+        "published item missing or worker ID not derived from lease");
+
+    /* Exercise cursor wrap through repeated full and drained rings. */
+    for (int i = 0; i < 32; i++) {
+        ASSERT(wl_mpsc_enqueue(q, 0, &a, 0, 0) == 0,
+            "wrap enqueue failed");
+        ASSERT(wl_mpsc_enqueue(q, 0, &b, 0, 1) == 0,
+            "wrap fill failed");
+        ASSERT(wl_mpsc_reserve(q, 0, &lease) != 0,
+            "full ring reserved slot");
+        ASSERT(wl_mpsc_dequeue(q, &out) == 1 && out.delta == &a,
+            "wrap first dequeue failed");
+        ASSERT(wl_mpsc_reserve(q, 0, &lease) == 0,
+            "wrap reserve failed");
+        ASSERT(wl_mpsc_reservation_publish(&lease,
+            (wl_delta_msg_t){ .delta = &c, .worker_id = 0 }) == 0,
+            "wrap publish failed");
+        ASSERT(wl_mpsc_dequeue(q, &out) == 1 && out.delta == &b,
+            "wrap second dequeue failed");
+        ASSERT(wl_mpsc_dequeue(q, &out) == 1 && out.delta == &c,
+            "wrap third dequeue failed");
+    }
+    wl_mpsc_queue_destroy(q);
+    PASS();
+}
+
+static void
+test_reservation_ownership(void)
+{
+    TEST("only published reservations transfer payload ownership");
+    payload_destroy_count = 0;
+    wl_mpsc_queue_t *q = wl_mpsc_queue_create_with_destructor(
+        1, 2, counted_payload_destroy);
+    ASSERT(q != NULL, "create failed");
+    int *cancelled = (int *)malloc(sizeof(int));
+    int *published = (int *)malloc(sizeof(int));
+    ASSERT(cancelled && published, "allocation failed");
+    wl_mpsc_reservation_t lease;
+    ASSERT(wl_mpsc_reserve(q, 0, &lease) == 0, "reserve failed");
+    ASSERT(wl_mpsc_reservation_cancel(&lease) == 0, "cancel failed");
+    free(cancelled);
+    ASSERT(wl_mpsc_reserve(q, 0, &lease) == 0, "second reserve failed");
+    ASSERT(wl_mpsc_reservation_publish(&lease,
+        (wl_delta_msg_t){ .delta = published, .worker_id = 0 }) == 0,
+        "publish failed");
+    wl_mpsc_queue_destroy(q);
+    ASSERT(payload_destroy_count == 1, "published payload not destroyed once");
+    PASS();
+}
+
 /* ----------------------------------------------------------------
  * main
  * ---------------------------------------------------------------- */
@@ -538,6 +635,8 @@ main(void)
     test_saturation();
     test_concurrent();
     test_payload_ownership();
+    test_reservation();
+    test_reservation_ownership();
 
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n",
         pass_count, fail_count, test_count);
