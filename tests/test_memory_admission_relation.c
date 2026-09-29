@@ -567,12 +567,24 @@ test_dedup_attach_init_growth_and_clear(void)
     for (uint64_t hash = 1; hash <= 717u; hash++)
         CHECK(wl_columnar_eval_dedup_set_insert(rel, hash),
             "dedup insert below load threshold");
+    bool inserted = true;
+    CHECK(wl_columnar_eval_dedup_set_insert_checked(rel, 717u,
+        &inserted) == 0 && !inserted && rel->dedup_cap == 1024,
+        "checked duplicate at threshold avoids growth");
     CHECK(!wl_columnar_eval_dedup_set_insert(rel, 717u)
         && rel->dedup_cap == 1024,
         "duplicate probe does not trigger growth at threshold");
     bool pending_before_growth = rel->memory_budget_denial_pending;
     atomic_store_explicit(&governor->usable_bytes,
         base + 8192u + 16384u - 1u, memory_order_release);
+    uint64_t *old_slots = rel->dedup_slots;
+    inserted = true;
+    CHECK(wl_columnar_eval_dedup_set_insert_checked(rel, 718u,
+        &inserted) == ENOSPC && inserted
+        && rel->dedup_slots == old_slots && rel->dedup_cap == 1024
+        && rel->dedup_count == 717u
+        && wl_columnar_memory_reserved(governor) == base + 8192u,
+        "checked one-byte growth denial retains table and result");
     CHECK(wl_columnar_eval_dedup_set_insert(rel, 718u)
         && rel->dedup_cap == 1024 && rel->dedup_count == 717u
         && rel->memory_budget_denial_pending == pending_before_growth
@@ -580,7 +592,20 @@ test_dedup_attach_init_growth_and_clear(void)
         "dedup growth denial preserves unique fallback and old table");
     atomic_store_explicit(&governor->usable_bytes,
         base + 8192u + 16384u, memory_order_release);
-    CHECK(wl_columnar_eval_dedup_set_insert(rel, 718u)
+    wl_columnar_eval_dedup_test_fail_next_growth_alloc();
+    uint64_t token_bytes = rel->dedup_reservation.bytes;
+    uint64_t reserved_bytes = rel->dedup_reserved_bytes;
+    CHECK(wl_columnar_eval_dedup_set_insert_checked(rel, 718u,
+        &inserted) == ENOMEM && inserted
+        && rel->dedup_slots == old_slots && rel->dedup_cap == 1024
+        && rel->dedup_count == 717u && rel->dedup_slots[717u] == 717u
+        && rel->dedup_reservation.bytes == token_bytes
+        && rel->dedup_reserved_bytes == reserved_bytes
+        && wl_columnar_memory_reserved(governor) == base + 8192u
+        && rel->memory_budget_denial_pending,
+        "checked growth allocation failure rolls back reservation and table");
+    CHECK(wl_columnar_eval_dedup_set_insert_checked(rel, 718u,
+        &inserted) == 0 && inserted
         && rel->dedup_cap == 2048 && rel->dedup_count == 718u
         && rel->dedup_reserved_bytes == 16384u
         && wl_columnar_memory_reserved(governor) == base + 16384u,
@@ -611,11 +636,22 @@ test_dedup_full_probe_and_malformed_shape(void)
     rel->dedup_count = 4;
     for (uint32_t i = 0; i < 4; i++)
         rel->dedup_slots[i] = i + 1u;
+    bool inserted = true;
+    CHECK(wl_columnar_eval_dedup_set_insert_checked(rel, 1,
+        &inserted) == 0 && !inserted && rel->dedup_cap == 4,
+        "checked full-table duplicate avoids growth");
     CHECK(!wl_columnar_eval_dedup_set_contains(rel, 9)
         && !wl_columnar_eval_dedup_set_insert(rel, 1)
         && wl_columnar_eval_dedup_set_insert(rel, 9)
         && rel->dedup_cap == 8 && rel->dedup_count == 5,
         "full table probes terminate and unique insert grows");
+    rel->dedup_reserved_bytes = 1;
+    inserted = true;
+    CHECK(wl_columnar_eval_dedup_set_insert_checked(rel, 10,
+        &inserted) == EBUSY && inserted
+        && rel->dedup_cap == 8 && rel->dedup_count == 5,
+        "checked invalid token rejects without mutation");
+    rel->dedup_reserved_bytes = 0;
     rel->dedup_count = 8;
     uint64_t bytes = 0;
     CHECK(wl_columnar_eval_dedup_set_bytes(rel, &bytes) == EINVAL,
@@ -627,6 +663,12 @@ test_dedup_full_probe_and_malformed_shape(void)
         && rel->dedup_slots == NULL,
         "dedup init rejects row-count arithmetic overflow");
     rel->nrows = 0;
+    rel->dedup_cap = UINT32_C(1) << 31;
+    inserted = true;
+    CHECK(wl_columnar_eval_dedup_set_insert_checked(rel, 9,
+        &inserted) == EOVERFLOW && inserted && !rel->dedup_slots,
+        "checked capacity overflow retains empty table and result");
+    rel->dedup_cap = 0;
     col_rel_destroy(rel);
 }
 

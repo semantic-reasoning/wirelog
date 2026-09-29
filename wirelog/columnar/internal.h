@@ -3634,6 +3634,14 @@ int wl_columnar_eval_dedup_set_clone_exact(col_rel_t *dst,
     const col_rel_t *src);
 bool
 wl_columnar_eval_dedup_set_insert(col_rel_t *r, uint64_t h);
+/* Worker transaction path: a duplicate needs no growth.  On error neither
+ * the table nor *inserted changes; memory-budget denial may be recorded on
+ * the private relation image. */
+int wl_columnar_eval_dedup_set_insert_checked(col_rel_t *r, uint64_t h,
+    bool *inserted);
+#ifdef WL_SESSION_TEST_HOOKS
+void wl_columnar_eval_dedup_test_fail_next_growth_alloc(void);
+#endif
 bool
 wl_columnar_eval_dedup_set_contains(const col_rel_t *r, uint64_t h);
 int
