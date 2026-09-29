@@ -7127,6 +7127,8 @@ extern void (*wl_columnar_eval_test_before_worker_delta)(wl_col_session_t *,
     col_rel_t *, const char *, uint32_t);
 extern void (*wl_columnar_eval_test_after_worker_delta)(wl_col_session_t *,
     col_rel_t *, int);
+extern void (*wl_columnar_eval_test_before_worker_image)(wl_col_session_t *,
+    col_rel_t *, col_rel_t *);
 static bool ordinary_delta_hook_seen, ordinary_delta_hook_ok;
 static bool ordinary_delta_refusal_unchanged;
 static atomic_bool ordinary_delta_check_complete = ATOMIC_VAR_INIT(false);
@@ -7370,6 +7372,188 @@ cleanup:
     }
     PASS();
 #undef TDD_GATE_CHECK
+}
+
+extern int (*wl_columnar_eval_test_after_worker_private)(wl_col_session_t *,
+    col_rel_t *, col_rel_t *, col_rel_t *);
+
+static atomic_int wide_rollback_worker = ATOMIC_VAR_INIT(-1);
+static col_rel_t *wide_rollback_source;
+static uint64_t wide_rollback_before;
+static bool wide_rollback_private_seen, wide_rollback_source_unchanged;
+
+static uint64_t
+wide_rollback_fingerprint(const col_rel_t *source)
+{
+    uint64_t hash = UINT64_C(1469598103934665603);
+#define WIDE_MIX(value) do { hash ^= (uint64_t)(uintptr_t)(value); \
+                             hash *= UINT64_C(1099511628211); } while (0)
+    WIDE_MIX(source->nrows);
+    WIDE_MIX(source->sorted_nrows);
+    WIDE_MIX(source->base_nrows);
+    WIDE_MIX(source->run_count);
+    WIDE_MIX(source->merge_buf_cap);
+    WIDE_MIX(source->view_generation);
+    WIDE_MIX(source->storage_generation);
+    WIDE_MIX(source->columns);
+    WIDE_MIX(source->timestamps);
+    WIDE_MIX(source->timestamp_capacity);
+    WIDE_MIX(source->dedup_slots);
+    WIDE_MIX(source->dedup_cap);
+    WIDE_MIX(source->dedup_count);
+    WIDE_MIX(source->dedup_reserved_bytes);
+    WIDE_MIX(source->dedup_reservation.bytes);
+    for (uint32_t i = 0; i < source->run_count; i++)
+        WIDE_MIX(source->run_ends[i]);
+    for (uint32_t r = 0; r < source->nrows; r++)
+        for (uint32_t c = 0; c < source->ncols; c++)
+            WIDE_MIX(source->columns[c][r]);
+    for (uint32_t i = 0; i < source->dedup_cap; i++)
+        WIDE_MIX(source->dedup_slots[i]);
+#undef WIDE_MIX
+    return hash;
+}
+
+static void
+wide_rollback_before_image(wl_col_session_t *worker, col_rel_t *source,
+    col_rel_t *delta)
+{
+    (void)delta;
+    int unclaimed = -1;
+    if (!atomic_compare_exchange_strong_explicit(&wide_rollback_worker,
+        &unclaimed, (int)worker->worker_id, memory_order_acq_rel,
+        memory_order_acquire))
+        return;
+    wide_rollback_source = source;
+    wide_rollback_before = wide_rollback_fingerprint(source);
+}
+
+static int
+wide_rollback_after_private(wl_col_session_t *worker, col_rel_t *source,
+    col_rel_t *image, col_rel_t *delta)
+{
+    if ((int)worker->worker_id != atomic_load_explicit(
+            &wide_rollback_worker, memory_order_acquire)
+        || source != wide_rollback_source || wide_rollback_private_seen)
+        return 0;
+    wide_rollback_private_seen = image && image != source && delta
+        && delta->nrows > 0 && image->nrows > 0;
+    wide_rollback_source_unchanged =
+        wide_rollback_fingerprint(source) == wide_rollback_before;
+    return ENOMEM; /* fail after private consolidation, before source commit */
+}
+
+typedef struct {
+    uint32_t width;
+    uint32_t seen;
+    uint32_t count;
+    bool invalid;
+} wide_rollback_rows_t;
+
+static void
+wide_rollback_collect(const char *relation, const int64_t *row,
+    uint32_t ncols, void *user)
+{
+    wide_rollback_rows_t *rows = user;
+    rows->count++;
+    if (strcmp(relation, "output") != 0 || ncols != rows->width
+        || row[0] < 0 || row[0] >= 4) {
+        rows->invalid = true;
+        return;
+    }
+    uint32_t key = (uint32_t)row[0];
+    if (rows->seen & (1u << key))
+        rows->invalid = true;
+    rows->seen |= 1u << key;
+    for (uint32_t c = 1; c < ncols; c++)
+        if (row[c] != (int64_t)(key * 100u + c))
+            rows->invalid = true;
+}
+
+static void
+test_tdd_wide_worker_private_rollback(uint32_t width)
+{
+    TEST("wide TDD worker rollback after private consolidation and retry");
+    uint32_t key = 0;
+    uint32_t projection[32];
+    wirelog_column_type_t types[32];
+    for (uint32_t c = 0; c < width; c++) {
+        projection[c] = c;
+        types[c] = WIRELOG_TYPE_INT64;
+    }
+    const char *keys[] = { "col0" };
+    uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
+    wl_plan_op_exchange_t exchange = { .num_workers = 1,
+                                       .key_col_idxs = &key,
+                                       .key_col_count = 1 };
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "output" },
+        { .op = WL_PLAN_OP_JOIN, .right_relation = "output",
+          .left_keys = keys, .right_keys = keys, .key_count = 1,
+          .project_indices = projection, .project_count = width },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } },
+        { .op = WL_PLAN_OP_CONCAT },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    wl_plan_relation_t relation = { .name = "output",
+                                    .delta_name = "$d$output", .ops = ops,
+                                    .op_count = 6 };
+    wl_plan_stratum_t stratum = { .relations = &relation,
+                                  .relation_count = 1, .is_recursive = true };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    const uint32_t input_rows = 8192;
+    int64_t *values = malloc((size_t)input_rows * width
+            * sizeof(*values));
+    if (!values) {
+        FAIL("input allocation"); return;
+    }
+    for (uint32_t r = 0; r < input_rows; r++)
+        for (uint32_t c = 0; c < width; c++)
+            values[(size_t)r * width + c] = c
+                ? (int64_t)((r % 4u) * 100u + c) : (int64_t)(r % 4u);
+    wl_session_t *session = NULL;
+    col_rel_t *unowned = NULL;
+    const char *failure = NULL;
+    wide_rollback_rows_t rows = { .width = width };
+#define WIDE_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    WIDE_CHECK(wl_session_create(wl_backend_columnar(), &plan, 2,
+        &session) == 0, "create");
+    unowned = col_rel_new_auto("output", width);
+    WIDE_CHECK(unowned && col_rel_set_column_types(unowned, types,
+        width) == 0 && session_add_rel(COL_SESSION(session), unowned) == 0,
+        "typed empty output");
+    unowned = NULL;
+    WIDE_CHECK(wl_session_insert(session, "input", values, input_rows,
+        width) == 0, "insert");
+    atomic_store_explicit(&wide_rollback_worker, -1, memory_order_release);
+    wide_rollback_source = NULL;
+    wide_rollback_private_seen = wide_rollback_source_unchanged = false;
+    wl_columnar_eval_test_before_worker_image = wide_rollback_before_image;
+    wl_columnar_eval_test_after_worker_private = wide_rollback_after_private;
+    int rc = wl_session_snapshot(session, wide_rollback_collect, &rows);
+    wl_columnar_eval_test_before_worker_image = NULL;
+    wl_columnar_eval_test_after_worker_private = NULL;
+    WIDE_CHECK(rc == ENOMEM && rows.count == 0
+        && wide_rollback_private_seen && wide_rollback_source_unchanged,
+        "late private failure changed source or published output");
+    WIDE_CHECK(wl_session_snapshot(session, wide_rollback_collect,
+        &rows) == 0 && rows.count == 4 && rows.seen == 15u
+        && !rows.invalid, "retry lost or duplicated wide worker rows");
+cleanup:
+    wl_columnar_eval_test_before_worker_image = NULL;
+    wl_columnar_eval_test_after_worker_private = NULL;
+    col_rel_destroy(unowned);
+    free(values);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef WIDE_CHECK
 }
 
 static void
@@ -13729,6 +13913,8 @@ main(void)
         test_tdd_ordinary_frame_gates(8, mode);
     }
     test_tdd_ordinary_frame_gates(2, 5);
+    test_tdd_wide_worker_private_rollback(9);
+    test_tdd_wide_worker_private_rollback(32);
     test_worker_frame_admission(false);
     test_worker_frame_admission(true);
     test_worker_frame_retention(8, 0, true, false, 0);

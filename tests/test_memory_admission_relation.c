@@ -231,6 +231,20 @@ test_mutable_image_transaction(void)
         "mutable image rejects malformed source before admission");
     source->base_nrows = 0;
     ACCEPTS("after base_nrows");
+    /* BDX can lower nrows before a worker subpass while retaining a stale
+     * sorted cursor.  Preparing the private image must normalize its copy
+     * without changing the source until the transaction commits. */
+    source->sorted_nrows = source->nrows + 10u;
+    CHECK(col_rel_mutable_image_prepare(source, &txn) == 0
+        && col_rel_mutable_image_get(&txn)
+        && col_rel_mutable_image_get(&txn)->sorted_nrows == 0
+        && source->sorted_nrows == source->nrows + 10u,
+        "mutable image normalizes a stale BDX source cursor privately");
+    col_rel_mutable_image_discard(&txn);
+    CHECK(source->sorted_nrows == source->nrows + 10u
+        && wl_columnar_memory_reserved(governor) == baseline,
+        "discard retains stale source cursor and restores image credit");
+    source->sorted_nrows = old_sorted_nrows;
 #undef ACCEPTS
     wl_columnar_relation_test_fail_next_mutable_image_overflow();
     CHECK(col_rel_mutable_image_prepare(source, &txn) == EOVERFLOW

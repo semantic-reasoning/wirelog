@@ -455,9 +455,9 @@ wl_columnar_eval_delta_queue_capacity(uint32_t nrels, uint32_t *out)
      * 2^31 is its largest non-wrapping request on the current base. */
     if (nrels > (UINT32_C(1) << 30))
         return EOVERFLOW;
-    /* Each worker emits at most one delta for each relation in a subpass.
-     * Its private SPSC ring leaves one slot vacant, so a power-of-two ring
-     * of at least 2*nrels has room for all nrels messages without draining. */
+    /* Each worker can emit an outbound and an ordinary delta per relation
+     * before the coordinator drains the queue. The SPSC ring uses all of
+     * its slots, so 2*nrels covers that conservative maximum. */
     *out = nrels > 0 ? nrels * 2u : 2u;
     return 0;
 }
@@ -2040,6 +2040,10 @@ void (*wl_columnar_eval_test_before_worker_delta)(wl_col_session_t *,
     col_rel_t *, const char *, uint32_t);
 void (*wl_columnar_eval_test_after_worker_delta)(wl_col_session_t *,
     col_rel_t *, int);
+void (*wl_columnar_eval_test_before_worker_image)(wl_col_session_t *,
+    col_rel_t *, col_rel_t *);
+int (*wl_columnar_eval_test_after_worker_private)(wl_col_session_t *,
+    col_rel_t *, col_rel_t *, col_rel_t *);
 #endif
 
 static int
@@ -2387,6 +2391,16 @@ tdd_worker_subpass_fn(void *arg)
         if (!r || snap[ri] >= r->nrows)
             continue;
 
+        wl_col_session_t *coord = sess->coordinator;
+        if (!coord || !coord->delta_queue || !ctx->delta_rels
+            || ctx->delta_rels[ri] || sess->worker_id
+            >= coord->tdd_workers_count
+            || &coord->tdd_workers[sess->worker_id] != sess) {
+            ctx->rc = EBUSY;
+            free(snap);
+            TDD_WORKER_RETURN();
+        }
+
         const char *dname = sp->relations[ri].delta_name;
 #ifdef WL_SESSION_TEST_HOOKS
         if (wl_columnar_eval_test_before_worker_delta)
@@ -2413,119 +2427,121 @@ tdd_worker_subpass_fn(void *arg)
             TDD_WORKER_RETURN();
         }
 
-        int rc2 = 0;
-        if (r->dedup_slots) {
-            /* Hash-set dedup: O(D) per subpass instead of O(N) merge.
-             * For each new row, check the hash set. Keep only truly
-             * new rows in the relation and emit them to delta. */
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_eval_test_before_worker_image)
+            wl_columnar_eval_test_before_worker_image(sess, r, delta);
+#endif
+        col_rel_mutable_image_t image_txn = { 0 };
+        int rc2 = col_rel_mutable_image_prepare(r, &image_txn);
+        col_rel_t *image = col_rel_mutable_image_get(&image_txn);
+        if (rc2 == 0 && !image)
+            rc2 = EBUSY;
+        bool prior_budget_denial = image
+            && image->memory_budget_denial_pending;
+        if (image)
+            image->memory_budget_denial_pending = false;
+        if (rc2 == 0 && image->dedup_slots) {
+            /* Hash-set dedup mutates only the private image. Its eager
+             * row_scratch handles wide relations without another allocation. */
             int64_t row_buf[8];
-            int64_t *rbuf = r->ncols <= 8 ? row_buf
-                : (int64_t *)malloc((size_t)r->ncols * sizeof(int64_t));
-            if (!rbuf) {
-                col_rel_destroy(delta);
-                ctx->rc = ENOMEM;
-                free(snap);
-                sess->tdd_subpass_active = saved_tdd_subpass;
-                sess->tdd_outbound_only_active = saved_outbound_only;
-                sess->diff_operators_active = saved_diff;
-                TDD_WORKER_RETURN();
-            }
+            int64_t *rbuf = image->ncols <= 8 ? row_buf
+                : image->row_scratch;
             uint32_t keep = snap[ri];
-            for (uint32_t i = snap[ri]; i < r->nrows; i++) {
-                uint64_t h = WL_COLUMNAR_EVAL_DEDUP_ROW_HASH(r, i);
-                if (WL_COLUMNAR_EVAL_DEDUP_SET_INSERT(r, h)) {
-                    /* New row: compact into [keep] and emit to delta. */
+            for (uint32_t i = snap[ri]; i < image->nrows; i++) {
+                uint64_t h = WL_COLUMNAR_EVAL_DEDUP_ROW_HASH(image, i);
+                bool inserted = false;
+                rc2 = wl_columnar_eval_dedup_set_insert_checked(image, h,
+                        &inserted);
+                if (rc2 != 0)
+                    break;
+                if (inserted) {
                     if (keep != i)
-                        col_rel_row_move_raw(r, keep, i);
-                    for (uint32_t c = 0; c < r->ncols; c++)
-                        rbuf[c] = r->columns[c][keep];
+                        col_rel_row_move_raw(image, keep, i);
+                    for (uint32_t c = 0; c < image->ncols; c++)
+                        rbuf[c] = image->columns[c][keep];
                     rc2 = col_rel_append_row(delta, rbuf);
                     if (rc2 != 0)
                         break;
                     keep++;
                 }
             }
-            r->nrows = keep;
-            r->sorted_nrows = keep; /* not truly sorted but OK for hash joins */
-            wl_columnar_relation_touch_view(r);
-            if (rbuf != row_buf)
-                free(rbuf);
-        } else {
+            if (rc2 == 0) {
+                image->nrows = keep;
+                image->sorted_nrows = keep;
+                wl_columnar_relation_touch_view(image);
+            }
+        } else if (rc2 == 0) {
             int fast_flag = 0;
-            rc2 = col_op_consolidate_incremental_delta(r, snap[ri], delta,
-                    &fast_flag);
+            rc2 = col_op_consolidate_incremental_delta(image, snap[ri],
+                    delta, &fast_flag);
         }
-        /* rc2 != 0 propagates as a worker error so any_new is not set.
-         * Sources: col_op_consolidate_incremental_delta (EOVERFLOW/ENOMEM)
-         * or col_rel_append_row (ENOMEM) from the hash-set dedup path.
-         * Both are hard errors requiring coordinator intervention. */
-        if (rc2 != 0) {
-            /* Sorting/deduplication may have changed the source before a
-             * later admission error.  Keep arrangements coherent on error. */
-            col_session_invalidate_arrangements(&sess->base,
-                sp->relations[ri].name);
-            col_rel_destroy(delta);
-            ctx->rc = rc2;
-            free(snap);
-            sess->tdd_subpass_active = saved_tdd_subpass;
-            sess->tdd_outbound_only_active = saved_outbound_only;
-            sess->diff_operators_active = saved_diff;
-            TDD_WORKER_RETURN();
-        }
-
-        /* Consolidation changed the relation only after rc2 succeeded. */
-        col_session_invalidate_arrangements(&sess->base,
-            sp->relations[ri].name);
-
-        if (delta->nrows > 0) {
-            /* The timestamp image was admitted before source mutation. */
+        if (rc2 == 0 && delta->nrows > 0) {
             for (uint32_t ti = 0; ti < delta->nrows; ti++) {
                 delta->timestamps[ti].iteration = eff_iter;
                 delta->timestamps[ti].stratum = ctx->stratum_idx;
                 delta->timestamps[ti].worker = (uint16_t)sess->worker_id;
                 delta->timestamps[ti].multiplicity = 1;
             }
-
-            /* Enable target timestamps */
-            int timestamp_rc = col_rel_enable_timestamps(r);
-            if (timestamp_rc != 0) {
-                col_rel_destroy(delta);
-                ctx->rc = timestamp_rc;
-                free(snap);
-                sess->tdd_subpass_active = saved_tdd_subpass;
-                sess->tdd_outbound_only_active = saved_outbound_only;
-                sess->diff_operators_active = saved_diff;
-                TDD_WORKER_RETURN();
-            }
-
-            /* Issue #410, Commit 5: Queue-only transport.
-             * delta ownership transfers to queue; coordinator reconstructs
-             * ctxs via wl_columnar_eval_tdd_queue_reconstruct_delta_matrix
-             * after barrier.
-             * Fallback to ctx write when queue unavailable (alloc failure). */
-            if (sess->coordinator && sess->coordinator->delta_queue) {
-                /* Issue #1380: mirror of eval_tdd_queue.c publish. */
-                uint64_t transport_bytes = col_rel_transport_bytes(delta);
-                int enq_rc = wl_mpsc_enqueue(
-                    sess->coordinator->delta_queue,
-                    sess->worker_id, delta, ctx->stratum_idx, ri);
-                if (enq_rc == 0)
-                    wl_mem_ledger_alloc(&sess->coordinator->mem_ledger,
-                        WL_MEM_SUBSYS_CHANNEL, transport_bytes);
-                if (enq_rc != 0) {
-                    /* Queue full — signal error; destroy orphaned delta. */
-                    col_rel_destroy(delta);
-                    ctx->rc = ENOMEM;
-                    free(snap);
-                    sess->tdd_subpass_active = saved_tdd_subpass;
-                    sess->tdd_outbound_only_active = saved_outbound_only;
-                    sess->diff_operators_active = saved_diff;
-                    TDD_WORKER_RETURN();
-                }
-            } else {
-                /* No queue (creation failed): fall back to direct ctx write. */
-                ctx->delta_rels[ri] = delta;
-            }
+            rc2 = col_rel_enable_timestamps(image);
+        }
+#ifdef WL_SESSION_TEST_HOOKS
+        if (rc2 == 0 && wl_columnar_eval_test_after_worker_private)
+            rc2 = wl_columnar_eval_test_after_worker_private(sess, r,
+                    image, delta);
+#endif
+        wl_mpsc_reservation_t queue_slot = { 0 };
+        bool queue_slot_held = false;
+        if (rc2 == 0 && delta->nrows > 0) {
+            /* Claim transport capacity while the source is still private.
+             * A held slot cannot be consumed or bypassed by this producer. */
+            if (wl_mpsc_reserve(coord->delta_queue, sess->worker_id,
+                &queue_slot) != 0)
+                rc2 = ENOMEM;
+            else
+                queue_slot_held = true;
+        }
+        if (rc2 != 0) {
+            if (rc2 == ENOMEM && ((image
+                && image->memory_budget_denial_pending)
+                || delta->memory_budget_denial_pending))
+                rc2 = ENOSPC;
+            if (rc2 == ENOSPC)
+                sess->memory_budget_denied = true;
+            if (queue_slot_held)
+                (void)wl_mpsc_reservation_cancel(&queue_slot);
+            col_rel_mutable_image_discard(&image_txn);
+            col_rel_destroy(delta);
+            ctx->rc = rc2;
+            free(snap);
+            TDD_WORKER_RETURN();
+        }
+        image->memory_budget_denial_pending |= prior_budget_denial;
+        rc2 = col_rel_mutable_image_commit(&image_txn);
+        if (rc2 != 0) {
+            if (queue_slot_held)
+                (void)wl_mpsc_reservation_cancel(&queue_slot);
+            col_rel_mutable_image_discard(&image_txn);
+            col_rel_destroy(delta);
+            ctx->rc = rc2;
+            free(snap);
+            TDD_WORKER_RETURN();
+        }
+        col_session_invalidate_arrangements(&sess->base,
+            sp->relations[ri].name);
+        if (delta->nrows > 0) {
+            uint64_t transport_bytes = col_rel_transport_bytes(delta);
+            wl_delta_msg_t message = { 0 };
+            message.delta = delta;
+            message.stratum = ctx->stratum_idx;
+            message.rel_idx = ri;
+            /* Both operations are infallible for this held producer slot.
+             * Credit must precede publication to the consumer. */
+            wl_mem_ledger_alloc(&coord->mem_ledger,
+                WL_MEM_SUBSYS_CHANNEL, transport_bytes);
+            int publish_rc = wl_mpsc_reservation_publish(&queue_slot,
+                    message);
+            assert(publish_rc == 0);
+            (void)publish_rc;
             any_new = true;
         } else {
             col_rel_destroy(delta);
