@@ -7394,6 +7394,31 @@ static int wide_rollback_prep_rc;
 static bool wide_dedup_seeded, wide_dedup_after_seen;
 static bool wide_dedup_fault_consumed, wide_dedup_source_unchanged;
 static int wide_dedup_after_rc;
+static bool wide_merge_provisional[2], wide_merge_private_seen;
+static bool wide_merge_after_seen, wide_merge_source_unchanged;
+static bool wide_merge_fault_consumed;
+static int wide_merge_after_rc;
+#ifdef _MSC_VER
+#define WL_WIDE_MERGE_THREAD_LOCAL __declspec(thread)
+#else
+#define WL_WIDE_MERGE_THREAD_LOCAL _Thread_local
+#endif
+static WL_WIDE_MERGE_THREAD_LOCAL bool wide_merge_fail_next_alloc;
+#undef WL_WIDE_MERGE_THREAD_LOCAL
+
+static bool
+wide_merge_alloc_hook(const char *site)
+{
+    if (wide_merge_fail_next_alloc
+        && strcmp(site, "radix_workspace_perm_a") == 0) {
+        wide_merge_fail_next_alloc = false;
+        return true;
+    }
+    return false;
+}
+
+wl_columnar_consolidate_alloc_hook_t wl_columnar_consolidate_alloc_hook
+    = wide_merge_alloc_hook;
 
 static uint64_t
 wide_rollback_fingerprint(const col_rel_t *source)
@@ -7535,6 +7560,59 @@ wide_dedup_after(wl_col_session_t *worker, col_rel_t *source, int rc)
         wide_rollback_fingerprint(source) == wide_rollback_before;
 }
 
+static void
+wide_merge_before_delta(wl_col_session_t *worker, col_rel_t *source,
+    const char *name, uint32_t new_rows)
+{
+    (void)name;
+    if (worker->worker_id >= 2 || !source || !source->columns
+        || !source->column_types || source->ncols <= 8 || new_rows <= 32
+        || new_rows > source->nrows)
+        return;
+    for (uint32_t c = 0; c < source->ncols; c++)
+        if (source->column_types[c] != WIRELOG_TYPE_INT64)
+            return;
+    uint32_t first = source->nrows - new_rows;
+    for (uint32_t r = first + 1; r < source->nrows; r++) {
+        if (source->columns[0][r - 1] > source->columns[0][r]) {
+            wide_merge_provisional[worker->worker_id] = true;
+            break;
+        }
+    }
+}
+
+static int
+wide_merge_before(wl_col_session_t *worker, col_rel_t *source,
+    col_rel_t *image, col_rel_t *delta)
+{
+    if ((int)worker->worker_id != atomic_load_explicit(
+            &wide_rollback_worker, memory_order_acquire)
+        || source != wide_rollback_source)
+        return 0;
+    if (!image || image == source || !delta || !image->dedup_slots
+        || image->nrows == 0 || !wide_merge_provisional[worker->worker_id]
+        || wide_rollback_fingerprint(source) != wide_rollback_before)
+        return EINVAL;
+    wl_columnar_eval_dedup_set_clear(image);
+    wide_merge_private_seen = !image->dedup_slots;
+    wide_merge_fail_next_alloc = true;
+    return 0;
+}
+
+static void
+wide_merge_after(wl_col_session_t *worker, col_rel_t *source, int rc)
+{
+    if ((int)worker->worker_id != atomic_load_explicit(
+            &wide_rollback_worker, memory_order_acquire)
+        || source != wide_rollback_source)
+        return;
+    wide_merge_after_seen = true;
+    wide_merge_after_rc = rc;
+    wide_merge_fault_consumed = !wide_merge_fail_next_alloc;
+    wide_merge_source_unchanged =
+        wide_rollback_fingerprint(source) == wide_rollback_before;
+}
+
 typedef struct {
     uint32_t width;
     uint32_t seen;
@@ -7565,7 +7643,9 @@ wide_rollback_collect(const char *relation, const int64_t *row,
 static void
 test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
 {
-    TEST(fault_mode == 2 ?
+    TEST(fault_mode == 3 ?
+        "wide TDD worker merge allocation failure and session retry"
+        : fault_mode == 2 ?
         "wide TDD worker dedup growth allocator failure and retry"
         : fault_mode == 1 ?
         "wide TDD worker private image allocation failure and retry"
@@ -7635,24 +7715,34 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
     wide_dedup_seeded = wide_dedup_after_seen = false;
     wide_dedup_fault_consumed = wide_dedup_source_unchanged = false;
     wide_dedup_after_rc = 0;
+    wide_merge_provisional[0] = wide_merge_provisional[1] = false;
+    wide_merge_private_seen = wide_merge_after_seen = false;
+    wide_merge_source_unchanged = wide_merge_fault_consumed = false;
+    wide_merge_after_rc = 0;
+    wl_columnar_eval_test_before_worker_delta = fault_mode == 3
+        ? wide_merge_before_delta : NULL;
     wl_columnar_eval_test_before_worker_image = wide_rollback_before_image;
     wl_columnar_eval_test_after_worker_image = fault_mode == 1
         ? wide_rollback_after_image : NULL;
     wl_columnar_eval_test_after_worker_private = fault_mode == 0
         ? wide_rollback_after_private : NULL;
     wl_columnar_eval_test_before_worker_dedup = fault_mode == 2
-        ? wide_dedup_before : NULL;
+        ? wide_dedup_before : fault_mode == 3 ? wide_merge_before : NULL;
     wl_columnar_eval_test_after_worker_dedup = fault_mode == 2
-        ? wide_dedup_after : NULL;
+        ? wide_dedup_after : fault_mode == 3 ? wide_merge_after : NULL;
     int rc = wl_session_snapshot(session, wide_rollback_collect, &rows);
     wl_columnar_eval_test_before_worker_image = NULL;
     wl_columnar_eval_test_after_worker_image = NULL;
     wl_columnar_eval_test_after_worker_private = NULL;
+    wl_columnar_eval_test_before_worker_delta = NULL;
     wl_columnar_eval_test_before_worker_dedup = NULL;
     wl_columnar_eval_test_after_worker_dedup = NULL;
     WIDE_CHECK(rc == ENOMEM
         && rows.count == 0
-        && (fault_mode == 2 ? (wide_dedup_seeded
+        && (fault_mode == 3 ? (wide_merge_private_seen
+        && wide_merge_after_seen && wide_merge_after_rc == rc
+        && wide_merge_fault_consumed && wide_merge_source_unchanged)
+        : fault_mode == 2 ? (wide_dedup_seeded
         && wide_dedup_after_seen && wide_dedup_after_rc == rc
         && wide_dedup_fault_consumed && wide_dedup_source_unchanged)
         : fault_mode == 1 ? (wide_rollback_prep_seen
@@ -7662,10 +7752,13 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
             : (wide_rollback_private_seen
         && wide_rollback_source_unchanged)),
         "private failure changed source or published output");
-    WIDE_CHECK(wl_session_snapshot(session, wide_rollback_collect,
-        &rows) == 0 && rows.count == 4 && rows.seen == 15u
-        && !rows.invalid, "retry lost or duplicated wide worker rows");
+    int retry_rc = wl_session_snapshot(session, wide_rollback_collect,
+            &rows);
+    WIDE_CHECK(retry_rc == 0 && rows.count == 4 && rows.seen == 15u
+        && !rows.invalid,
+        "retry lost or duplicated wide worker rows");
 cleanup:
+    wl_columnar_eval_test_before_worker_delta = NULL;
     wl_columnar_eval_test_before_worker_image = NULL;
     wl_columnar_eval_test_after_worker_image = NULL;
     wl_columnar_eval_test_after_worker_private = NULL;
@@ -14043,6 +14136,8 @@ main(void)
     test_tdd_wide_worker_private_rollback(32, 0);
     test_tdd_wide_worker_private_rollback(32, true);
     test_tdd_wide_worker_private_rollback(9, 2);
+    test_tdd_wide_worker_private_rollback(9, 3);
+    test_tdd_wide_worker_private_rollback(32, 3);
     test_worker_frame_admission(false);
     test_worker_frame_admission(true);
     test_worker_frame_retention(8, 0, true, false, 0);
