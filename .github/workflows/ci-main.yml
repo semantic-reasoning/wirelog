@@ -354,7 +354,9 @@ jobs:
         run: meson compile -C builddir
 
       - name: Test
-        run: meson test -C builddir --print-errorlogs
+        # Required SBOM scans belong to PR and release gates. This main
+        # monitor may see host Syft; keep its sanitizer suite instrumented.
+        run: meson test -C builddir --exclude sbom_snapshot --print-errorlogs
         env:
           ASAN_OPTIONS: abort_on_error=1:halt_on_error=1
           UBSAN_OPTIONS: abort_on_error=1:halt_on_error=1:print_stacktrace=1
