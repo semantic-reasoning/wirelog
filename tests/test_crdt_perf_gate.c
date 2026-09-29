@@ -39,6 +39,13 @@
  *                                           exceeds the budget)
  *   - median wall > target               -> FAIL (the gate fires)
  *
+ * Diagnostic mode (Issue #2022): WIRELOG_CRDT_PROBE=1 runs exactly one
+ * complete run_crdt_once_ call with the existing wall timer and emits one
+ * JSON record on stdout. It bypasses opt-in, log/governor checks, and the
+ * median/CoV/target verdict while preserving pipeline and result failures.
+ * Diagnostics remain on stderr. The fixture and compiled gold are selected
+ * with the same WIRELOG_CRDT_SMALL setting as correctness-only mode.
+ *
  * Correctness-only mode (Issue #947):
  *   WIRELOG_GATE_CORRECTNESS_ONLY=1 runs the result-count sentinel and
  *   exits, requiring neither a stripped log ceiling nor a pinned cpufreq
@@ -164,6 +171,10 @@ resolve_crdt_data_dir_(void)
     candidates[nc++] = "bench/data/crdt";
     candidates[nc++] = "../../bench/data/crdt";
 
+    /* Probe provenance requires the exact requested fixture, never fallback. */
+    if (parse_bool_env_("WIRELOG_CRDT_PROBE", 0) && env && *env)
+        nc = 1;
+
     char path[1280];
     for (int i = 0; i < nc; i++) {
         snprintf(path, sizeof(path), "%s/Insert_input.csv", candidates[i]);
@@ -249,6 +260,8 @@ run_crdt_once_(const char *source, uint32_t num_workers,
 int
 main(void)
 {
+    /* Diagnostic single run: the timer below includes the complete pipeline. */
+    const int probe = parse_bool_env_("WIRELOG_CRDT_PROBE", 0);
     const int correctness_only
         = parse_bool_env_("WIRELOG_GATE_CORRECTNESS_ONLY", 0);
 
@@ -258,7 +271,7 @@ main(void)
      * Note suite membership does not gate anything here -- there is no
      * add_test_setup in this project, so a perf-suite entry still runs in a
      * default `meson test` and must opt out at runtime. */
-    if (correctness_only && !parse_bool_env_("WIRELOG_CRDT_SMALL", 0)
+    if (!probe && correctness_only && !parse_bool_env_("WIRELOG_CRDT_SMALL", 0)
         && !parse_bool_env_("WIRELOG_PERF_GATE", 0)) {
         fprintf(stderr,
             "test_crdt_perf_gate: SKIP: full-fixture correctness needs "
@@ -267,7 +280,7 @@ main(void)
         return SKIP_EXIT;
     }
 
-    if (!correctness_only && !parse_bool_env_("WIRELOG_PERF_GATE", 0)) {
+    if (!probe && !correctness_only && !parse_bool_env_("WIRELOG_PERF_GATE", 0)) {
         fprintf(stderr,
             "test_crdt_perf_gate: SKIP: set WIRELOG_PERF_GATE=1 to run "
             "(designed for dedicated perf hardware, not shared CI runners)\n");
@@ -294,7 +307,7 @@ main(void)
      * a trace build it is the first thing worth ruling out, and
      * WIRELOG_PERF_REQUIRE still makes it fatal for anyone who wants the
      * strict measurement build. */
-    if (!correctness_only && WL_LOG_COMPILE_MAX_LEVEL > WL_LOG_ERROR) {
+    if (!probe && !correctness_only && WL_LOG_COMPILE_MAX_LEVEL > WL_LOG_ERROR) {
         if (parse_bool_env_("WIRELOG_PERF_REQUIRE", 0)) {
             fprintf(stderr,
                 "test_crdt_perf_gate: FAIL: WIRELOG_PERF_REQUIRE=1 but "
@@ -313,7 +326,7 @@ main(void)
             (int)WL_LOG_COMPILE_MAX_LEVEL);
     }
 
-    if (!correctness_only && !wl_perf_stability_env_ok()) {
+    if (!probe && !correctness_only && !wl_perf_stability_env_ok()) {
         if (parse_bool_env_("WIRELOG_PERF_REQUIRE", 0)) {
             fprintf(stderr,
                 "test_crdt_perf_gate: FAIL: WIRELOG_PERF_REQUIRE=1 but the "
@@ -327,10 +340,11 @@ main(void)
     const char *data_dir = resolve_crdt_data_dir_();
     if (!data_dir) {
         fprintf(stderr,
-            "test_crdt_perf_gate: SKIP: CRDT data dir not found.  Set "
+            "test_crdt_perf_gate: %s: CRDT data dir not found.  Set "
             "WIRELOG_CRDT_DATA_DIR or run from a CWD where "
-            "bench/data/crdt/Insert_input.csv resolves.\n");
-        return SKIP_EXIT;
+            "bench/data/crdt/Insert_input.csv resolves.\n",
+            probe ? "FAIL" : "SKIP");
+        return probe ? 1 : SKIP_EXIT;
     }
 
     char *source = (char *)malloc(WL_BENCH_CRDT_SRC_BUFSZ);
@@ -378,6 +392,17 @@ main(void)
             warm_result, gold);
         free(source);
         return 1;
+    }
+
+    if (probe) {
+        printf("{\"schema_version\":1,\"measurement\":\"crdt_perf_gate_single_run\","
+            "\"workload\":\"crdt\",\"fixture\":\"%s\",\"workers\":1,"
+            "\"elapsed_ms\":%.9f,\"result\":%" PRId64 ",\"expected\":%" PRId64
+            ",\"aggregate\":%" PRId64 ",\"iterations\":%u,\"status\":\"OK\"}\n",
+            parse_bool_env_("WIRELOG_CRDT_SMALL", 0) ? "small" : "full",
+            warmup_ms, warm_result, gold, warm_aggregate, warm_iters);
+        free(source);
+        return 0;
     }
 
     if (correctness_only) {

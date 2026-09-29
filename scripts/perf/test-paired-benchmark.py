@@ -28,13 +28,9 @@ class PairedBenchmarkTests(unittest.TestCase):
 
     def binary(self, name="bench", wrong=False):
         path = self.root / name
-        crdt_tuples = 0 if wrong else 2152328
         path.write_text(
             "#!/bin/sh\n"
             "case \"$*\" in\n"
-            "  *'--workload crdt '*) "
-            "printf 'crdt\\t-\\t-\\t1\\t1\\t10.0\\t10.0\\t10.0\\t100\\t"
-            f"{crdt_tuples}\\t14148\\tOK\\n' ;;\n"
             "  *'--workload cspa-fast '*) "
             "printf 'cspa\\t-\\t-\\t1\\t1\\t2.0\\t2.0\\t2.0\\t100\\t"
             "20381\\t6\\tOK\\n' ;;\n"
@@ -51,11 +47,24 @@ class PairedBenchmarkTests(unittest.TestCase):
         path.chmod(0o755)
         return path
 
-    def args(self, base, candidate, samples=1):
+    def probe(self, name="probe", wrong=False):
+        path = self.root / name
+        record = {"schema_version": 1, "measurement": "crdt_perf_gate_single_run",
+                  "workload": "crdt", "fixture": "full", "workers": 1,
+                  "elapsed_ms": 10.0, "result": 0 if wrong else 104851,
+                  "expected": 104851, "aggregate": 2152328,
+                  "iterations": 14148, "status": "OK"}
+        path.write_text("#!/bin/sh\nprintf '%s\\n' '" + json.dumps(record) + "'\n", encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+    def args(self, base, candidate, samples=1, wrong=False):
         return argparse.Namespace(
             base_sha=SHA_BASE, candidate_sha=SHA_CANDIDATE,
             base_binary=base, candidate_binary=candidate,
-            data_root=self.root / "data", out_dir=self.root / "evidence",
+            base_crdt_binary=self.probe("base-probe", wrong),
+            candidate_crdt_binary=self.probe("candidate-probe", wrong),
+            base_data_root=self.root / "data", candidate_data_root=self.root / "data", out_dir=self.root / "evidence",
             cpu=self.cpu, samples=samples, first="base", timeout=5,
         )
 
@@ -69,14 +78,46 @@ class PairedBenchmarkTests(unittest.TestCase):
 
     def test_parser_rejects_wrong_result_and_malformed_timing(self):
         header = MODULE["HEADER"]
-        row = "crdt\t-\t-\t1\t1\t10.0\t10.0\t10.0\t100\t2152328\t14148\tOK"
-        self.assertEqual(MODULE["parse_tsv"](header + "\n" + row, "crdt")["elapsed_ms"], 10.0)
+        row = "cspa\t-\t-\t1\t1\t10.0\t10.0\t10.0\t100\t20381\t6\tOK"
+        self.assertEqual(MODULE["parse_tsv"](header + "\n" + row, "cspa-fast")["elapsed_ms"], 10.0)
         with self.assertRaisesRegex(ValueError, "wrong result"):
-            MODULE["parse_tsv"](header + "\n" + row.replace("2152328", "0"), "crdt")
+            MODULE["parse_tsv"](header + "\n" + row.replace("20381", "0"), "cspa-fast")
         with self.assertRaisesRegex(ValueError, "nonpositive or nonfinite"):
-            MODULE["parse_tsv"](header + "\n" + row.replace("10.0", "nan"), "crdt")
+            MODULE["parse_tsv"](header + "\n" + row.replace("10.0", "nan"), "cspa-fast")
         with self.assertRaisesRegex(ValueError, "malformed"):
-            MODULE["parse_tsv"](row, "crdt")
+            MODULE["parse_tsv"](row, "cspa-fast")
+
+    def test_crdt_bench_tsv_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "requires the gate single-run JSON probe"):
+            MODULE["parse_tsv"]("anything", "crdt")
+
+    def test_probe_parser_is_strict(self):
+        record = json.loads(self.probe().read_text().split("'", 3)[3].rsplit("'", 1)[0])
+        parse = MODULE["parse_crdt_probe"]
+        self.assertEqual(parse(json.dumps(record))["elapsed_ms"], 10.0)
+        for key, value in (("result", 0), ("expected", 0), ("iterations", 0),
+                           ("workers", True), ("schema_version", 2),
+                           ("fixture", "small"), ("status", "FAIL"),
+                           ("elapsed_ms", float("nan")), ("elapsed_ms", float("inf")),
+                           ("elapsed_ms", 0), ("aggregate", True)):
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                parse(json.dumps(dict(record, **{key: value})))
+        for text in ("{}", "[]", "bad", json.dumps(record) + "\n{}",
+                     json.dumps(dict(record, extra=1)),
+                     json.dumps(record).replace('"workers": 1', '"workers": 1, "workers": 1')):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                parse(text)
+
+    def test_nonzero_probe_is_failure_even_with_valid_stdout(self):
+        binary = self.binary()
+        args = self.args(binary, binary)
+        with args.base_crdt_binary.open("a") as stream:
+            stream.write("exit 9\n")
+        summary = MODULE["collect"](args)
+        self.assertEqual(summary["status"], "CORRECTNESS_FAILURE")
+        event = json.loads((args.out_dir / "attempts.jsonl").read_text().splitlines()[0])
+        self.assertEqual(event["exit_code"], 9)
+        self.assertIn('"status": "OK"', event["stdout"])
 
     def test_success_keeps_every_warmup_and_sample_without_timing_verdict(self):
         binary = self.binary()
@@ -90,12 +131,53 @@ class PairedBenchmarkTests(unittest.TestCase):
         self.assertEqual([event["phase"] for event in events],
                          ["warmup", "warmup", "sample", "sample"] * 2)
         self.assertTrue(all("host_before" in event and "host_after" in event for event in events))
+        metadata = json.loads((self.root / "evidence" / "metadata.json").read_text())
+        self.assertEqual(metadata["binary_sha256"]["base"]["crdt"],
+                         MODULE["sha256"](self.root / "base-probe"))
+        self.assertEqual(metadata["binary_sha256"]["base"]["cspa-fast"],
+                         MODULE["sha256"](binary))
+        self.assertTrue(all("--workload" not in event["command"]
+                            for event in events if event["workload"] == "crdt"))
+        self.assertTrue(all("--workload" in event["command"]
+                            for event in events if event["workload"] == "cspa-fast"))
+
+    def test_each_probe_uses_revision_local_fixture(self):
+        binary = self.binary()
+        args = self.args(binary, binary)
+        candidate_data = self.root / "candidate-data"
+        for relative in MODULE["FIXTURES"]:
+            path = candidate_data / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture\n")
+        args.candidate_data_root = candidate_data
+        for side in ("base", "candidate"):
+            probe = getattr(args, side + "_crdt_binary")
+            expected = getattr(args, side + "_data_root") / "crdt"
+            text = probe.read_text().replace("#!/bin/sh\n", "#!/bin/sh\n"
+                + f'[ "$WIRELOG_CRDT_DATA_DIR" = "{expected}" ] || exit 8\n'
+                + '[ "$WIRELOG_CRDT_PROBE" = 1 ] || exit 8\n'
+                + '[ "$WIRELOG_CRDT_SMALL" = 0 ] || exit 8\n')
+            probe.write_text(text)
+        self.assertEqual(MODULE["collect"](args)["status"], "DIAGNOSTIC")
+
+    def test_mismatched_revision_fixture_rejected_before_collection(self):
+        binary = self.binary()
+        args = self.args(binary, binary)
+        candidate_data = self.root / "candidate-data"
+        for relative in MODULE["FIXTURES"]:
+            path = candidate_data / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("changed\n")
+        args.candidate_data_root = candidate_data
+        with self.assertRaisesRegex(ValueError, "fixture hashes differ"):
+            MODULE["collect"](args)
+        self.assertFalse(args.out_dir.exists())
 
     def test_wrong_result_is_failure_and_durable(self):
         binary = self.binary(wrong=True)
-        summary = MODULE["collect"](self.args(binary, binary))
+        summary = MODULE["collect"](self.args(binary, binary, wrong=True))
         self.assertEqual(summary["status"], "CORRECTNESS_FAILURE")
-        self.assertIn("wrong result", summary["reason"])
+        self.assertIn("result", summary["reason"])
         self.assertEqual(len((self.root / "evidence" / "attempts.jsonl").read_text(
             encoding="utf-8").splitlines()), 1)
 

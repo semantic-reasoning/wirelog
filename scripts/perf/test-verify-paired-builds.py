@@ -63,6 +63,22 @@ class PairedBuildVerification(unittest.TestCase):
         candidate["source_sha256"][MODULE.SAME_SOURCES[0]] = "changed"
         self.assertIn("benchmark source differs", self.run_pair(base, candidate))
 
+    def test_changed_crdt_timer_contract_rejected(self):
+        for name in ("tests/test_crdt_perf_gate.c", "tests/test_perf_util.h"):
+            with self.subTest(name=name):
+                base, candidate = record(self.BASE), record(self.CANDIDATE)
+                candidate["source_sha256"][name] = "changed"
+                self.assertIn("benchmark source differs", self.run_pair(base, candidate))
+
+    def test_pre_probe_revision_rejected(self):
+        with TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            (source / "tests").mkdir()
+            (source / "tests/test_crdt_perf_gate.c").write_text("int main(void) {}")
+            with patch.object(MODULE, "git_output", side_effect=(self.BASE, "")):
+                with self.assertRaisesRegex(ValueError, "lacks the CRDT single-run probe"):
+                    MODULE.side_record(source, source / "build", self.BASE)
+
     def test_gate_output_requires_expected_result(self):
         MODULE.check_correctness("crdt", "test_crdt_perf_gate: correctness OK\n"
                                  "result = 104851 (expected 104851)\n"

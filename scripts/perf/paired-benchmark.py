@@ -69,6 +69,8 @@ def order(samples: int, first: str) -> list[tuple[int, str]]:
 
 
 def parse_tsv(stdout: str, workload: str) -> dict[str, int | float | str]:
+    if workload == "crdt":
+        raise ValueError("CRDT requires the gate single-run JSON probe, not bench TSV")
     lines = stdout.strip().splitlines()
     if len(lines) != 2 or lines[0] != HEADER:
         raise ValueError("missing or malformed bench TSV header/row")
@@ -93,6 +95,36 @@ def parse_tsv(stdout: str, workload: str) -> dict[str, int | float | str]:
             "iterations": iterations}
 
 
+def parse_crdt_probe(stdout: str) -> dict:
+    def unique_object(pairs):
+        record = {}
+        for key, value in pairs:
+            if key in record:
+                raise ValueError("duplicate CRDT probe key")
+            record[key] = value
+        return record
+
+    try:
+        record = json.loads(stdout, object_pairs_hook=unique_object)
+    except (ValueError, TypeError) as error:
+        raise ValueError("malformed CRDT probe record") from error
+    identity = {"schema_version": 1, "measurement": "crdt_perf_gate_single_run",
+                "workload": "crdt", "fixture": "full", "workers": 1,
+                "expected": 104851, "result": 104851, "iterations": 14148,
+                "status": "OK"}
+    if not isinstance(record, dict) or set(record) != set(identity) | {"elapsed_ms", "aggregate"}:
+        raise ValueError("wrong CRDT probe schema")
+    for key, value in identity.items():
+        if type(record[key]) is not type(value) or record[key] != value:
+            raise ValueError(f"wrong CRDT probe identity or result: {key}")
+    elapsed = record["elapsed_ms"]
+    if type(elapsed) not in (float, int) or not math.isfinite(elapsed) or elapsed <= 0:
+        raise ValueError("nonpositive or nonfinite CRDT probe timing")
+    if type(record["aggregate"]) is not int or record["aggregate"] < record["result"]:
+        raise ValueError("invalid CRDT probe aggregate")
+    return record
+
+
 def append_event(stream, event: dict) -> None:
     stream.write(json.dumps(event, sort_keys=True) + "\n")
     stream.flush()
@@ -101,15 +133,20 @@ def append_event(stream, event: dict) -> None:
 
 def run_once(binary: Path, workload: str, data_root: Path, cpu: int,
              timeout: int) -> dict:
-    _, data_option, _, _ = WORKLOADS[workload]
-    command = ["taskset", "-c", str(cpu), str(binary), "--workload", workload,
-               data_option, str(data_root / ("crdt" if workload == "crdt" else "cspa")),
-               "--workers", "1", "--repeat", "1"]
+    environment = os.environ.copy()
+    if workload == "crdt":
+        command = ["taskset", "-c", str(cpu), str(binary)]
+        environment.update(WIRELOG_CRDT_PROBE="1", WIRELOG_CRDT_SMALL="0",
+                           WIRELOG_CRDT_DATA_DIR=str(data_root / "crdt"))
+    else:
+        command = ["taskset", "-c", str(cpu), str(binary), "--workload", workload,
+                   "--data-cspa", str(data_root / "cspa"),
+                   "--workers", "1", "--repeat", "1"]
     before = read_host(cpu)
     try:
         result = subprocess.run(command, capture_output=True, text=True,
                                 encoding="utf-8", errors="replace",
-                                timeout=timeout, check=False)
+                                timeout=timeout, check=False, env=environment)
         event = {"command": command, "exit_code": result.returncode,
                  "stdout": result.stdout, "stderr": result.stderr}
     except subprocess.TimeoutExpired as error:
@@ -140,23 +177,37 @@ def collect(args: argparse.Namespace) -> dict:
         raise ValueError(f"CPU {args.cpu} is outside this process's affinity")
     if args.samples < 1 or args.timeout < 1:
         raise ValueError("samples and timeout must be positive")
-    binaries = {"base": args.base_binary.resolve(),
-                "candidate": args.candidate_binary.resolve()}
-    for binary in binaries.values():
+    binaries = {
+        "base": {"crdt": args.base_crdt_binary.resolve(),
+                 "cspa-fast": args.base_binary.resolve()},
+        "candidate": {"crdt": args.candidate_crdt_binary.resolve(),
+                      "cspa-fast": args.candidate_binary.resolve()},
+    }
+    data_roots = {"base": args.base_data_root.resolve(),
+                  "candidate": args.candidate_data_root.resolve()}
+    for binary in (path for side in binaries.values() for path in side.values()):
         if not binary.is_file() or not os.access(binary, os.X_OK):
             raise ValueError(f"missing executable benchmark: {binary}")
     fixtures = {}
-    for relative in FIXTURES:
-        path = args.data_root / relative
-        if not path.is_file():
-            raise ValueError(f"missing fixture: {path}")
-        fixtures[relative] = sha256(path)
+    for side, root in data_roots.items():
+        fixtures[side] = {}
+        for relative in FIXTURES:
+            path = root / relative
+            if not path.is_file():
+                raise ValueError(f"missing fixture: {path}")
+            fixtures[side][relative] = sha256(path)
+    if fixtures["base"] != fixtures["candidate"]:
+        raise ValueError("base/candidate fixture hashes differ")
     if args.out_dir.exists():
         raise ValueError(f"evidence directory already exists: {args.out_dir}")
     args.out_dir.mkdir(parents=True)
     metadata = {"schema_version": 1, "mode": "diagnostic_only",
                 "source_sha": {"base": args.base_sha, "candidate": args.candidate_sha},
-                "binary_sha256": {side: sha256(path) for side, path in binaries.items()},
+                "binary_sha256": {side: {workload: sha256(path) for workload, path in paths.items()}
+                                  for side, paths in binaries.items()},
+                "binary_paths": {side: {workload: str(path) for workload, path in paths.items()}
+                                 for side, paths in binaries.items()},
+                "data_roots": {side: str(root) for side, root in data_roots.items()},
                 "fixture_sha256": fixtures, "cpu": args.cpu, "samples_per_side": args.samples,
                 "first": args.first, "host": read_host(args.cpu)}
     (args.out_dir / "metadata.json").write_text(
@@ -173,7 +224,7 @@ def collect(args: argparse.Namespace) -> dict:
                 phase = "warmup" if index is None else "sample"
                 event = {"phase": phase, "workload": workload, "side": side,
                          "index": index}
-                event.update(run_once(binaries[side], workload, args.data_root,
+                event.update(run_once(binaries[side][workload], workload, data_roots[side],
                                       args.cpu, args.timeout))
                 if "timeout_seconds" in event:
                     status, reason = "INCONCLUSIVE", f"{workload} {side} {phase} timed out"
@@ -181,7 +232,8 @@ def collect(args: argparse.Namespace) -> dict:
                     status, reason = "CORRECTNESS_FAILURE", f"{workload} {side} {phase} exited nonzero"
                 else:
                     try:
-                        parsed = parse_tsv(event["stdout"], workload)
+                        parsed = (parse_crdt_probe(event["stdout"]) if workload == "crdt"
+                                  else parse_tsv(event["stdout"], workload))
                         event["parsed"] = parsed
                         if index is not None:
                             samples[workload][side].append(parsed["elapsed_ms"])
@@ -215,7 +267,10 @@ def main() -> int:
     parser.add_argument("--candidate-sha", required=True)
     parser.add_argument("--base-binary", type=Path, required=True)
     parser.add_argument("--candidate-binary", type=Path, required=True)
-    parser.add_argument("--data-root", type=Path, required=True)
+    parser.add_argument("--base-crdt-binary", type=Path, required=True)
+    parser.add_argument("--candidate-crdt-binary", type=Path, required=True)
+    parser.add_argument("--base-data-root", type=Path, required=True)
+    parser.add_argument("--candidate-data-root", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--cpu", type=int, required=True)
     parser.add_argument("--first", choices=("base", "candidate"), default="base")

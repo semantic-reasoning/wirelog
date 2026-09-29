@@ -32,7 +32,9 @@ underlying cause changes; do not discard selected runs.
 The manual `Paired Perf Diagnostic` workflow gathers non-gating CRDT and CSPA
 evidence when the current nightly medians and historical targets disagree.
 Dispatch it on the candidate branch with a full 40-character `base_sha` from
-`main`. The candidate is the dispatch ref's exact SHA. Run one campaign with
+`main` that contains the CRDT single-run probe. Baselines predating the probe
+are rejected; the next campaign must wait for the probe to merge and select
+a trusted main ancestor containing it. The candidate is the dispatch ref's exact SHA. Run one campaign with
 `first=base` and another with `first=candidate`; wait for each run to finish
 before starting the next. The workflow serializes its own campaigns on the
 shared `wirelog-perf` runner. Other tagged jobs can still create contention,
@@ -40,7 +42,19 @@ so inspect every attempt's host observations before drawing conclusions.
 
 The workflow builds both revisions with the same resolved release/TRACE profile,
 verifies benchmark source and fixture hashes, and runs each revision's full
-CRDT and CSPA correctness fixture before timing. Each campaign records nine
+CRDT and CSPA correctness fixture before timing. CRDT invokes each revision's
+`tests/test_crdt_perf_gate` with `WIRELOG_CRDT_PROBE=1`, full fixture, and W=1.
+Its one-record JSON measures the existing gate timer around `run_crdt_once_`,
+including parse, passes, plan, session, input loading, snapshot, and teardown.
+The probe preserves pipeline/result failures and emits the compiled result
+sentinel (104,851), aggregate diagnostic, and iterations (14,148). It bypasses
+the gate's opt-in, governor, log ceiling, nine-trial median, CoV, and target
+checks. CSPA continues to use `bench_flowlog --workload cspa-fast`. Each side
+uses its own fixture directory, and artifacts hash the actual workload binaries.
+The collector rejects malformed or extra JSON records, unexpected identities
+or counts, nonfinite timing, and nonzero exits.
+
+Each campaign records nine
 samples per side per workload, alternating which revision runs first. Its
 `perf-paired-<run>-<attempt>` artifact contains `preflight.json`, correctness
 logs, build logs, `samples/metadata.json`, every warmup and trial in
