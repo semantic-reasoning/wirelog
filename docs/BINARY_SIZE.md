@@ -1,21 +1,44 @@
 # Binary size monitoring and admission
 
-`tests/baseline_size.txt` records 408989 bytes, the canonical Ubuntu x86_64
+`tests/baseline_size.txt` records 414051 bytes, the canonical Ubuntu x86_64
 GCC `.text` measurement from main revision
-`13d9244a13503cd178c40bb0179daf7c818ee314`. The completed
-[main workflow run 36335594347](https://github.com/semantic-reasoning/wirelog/actions/runs/36335594347)
-produced `wirelog-size-monitor-ubuntu-latest` artifact `10936589708`.
+`863e011ec1cffcc145d8fba8b5d13d58e2897524`. The completed
+[main workflow run 36416622487](https://github.com/semantic-reasoning/wirelog/actions/runs/36416622487)
+produced `wirelog-size-monitor-ubuntu-latest` artifact `10967208747`.
 Its source, run, artifact, profile, library digests and measurement are pinned
 in `tests/baseline_size.provenance.json`. The unchanged verifier checks those
 identities and independently rebuilds that source to reproduce its profile and
 `.text` size through the normal `trusted-ci-artifact` policy.
 
-The workflow concluded successfully, and the report records successful
-configuration and build, but its test step failed. This artifact establishes
-the production-library measurement, not a passing test suite. The refresh
-does not reduce the binary's size or change TDD eligibility. The fixed
-5120-byte allowance is unchanged, so the resulting maximum is 414109 bytes.
-A rebuilt library may have different non-`.text` bytes due to LTO metadata.
+The run concluded successfully and the report's `workflow_steps` record
+`configure`, `build` and `test` each as success, with status `within-budget`
+on a 5062-byte delta. The measurement source carries the #1934 wide-hash
+change and predates the #1963 mutable-image transaction, so #1963 does not
+contribute to the recorded figure. #1964 had not landed on main when this
+figure was measured, so it does not contribute either. Worker code that landed
+earlier in the measured interval does contribute. The refresh does not reduce
+the binary's size or change TDD eligibility. The fixed 5120-byte allowance is
+unchanged, so the resulting maximum is 419171 bytes. A rebuilt library may
+have different non-`.text` bytes due to LTO metadata.
+
+414051 is main's measurement at `863e011e`, which is an ancestor of the branch
+tip rather than the tip itself. #1963 landed after it and shrank `.text` by 13
+bytes, so `eba14d28` measured 414038 (artifact `11011675575`). Main's
+measurement at any given tip is a moving figure and is deliberately not
+tracked here. Read it from the most recent concluded `main` run's
+`wirelog-size-monitor-ubuntu-latest` artifact, and compute headroom as 419171
+minus that measurement. Recording an ancestor rather than the tip stays valid
+as main advances, because `verify-size-baseline.py` requires, among its other
+checks, that the recorded revision be an ancestor of the event base. What does
+bound this record is the calendar: the verifier fails closed once the artifact
+expires, and it rebuilds the recorded revision, so a runner toolchain bump
+invalidates it independently of main.
+
+The previous baseline of 408989 bytes was measured at main revision
+`13d9244a`. The twenty commits that land after it through `863e011e`, the
+#1934 wide-hash change among them, consumed 5062 of the 5120-byte allowance.
+That left the old ceiling of 414109 only 58 bytes above `863e011e`, and the
+budget unusable for the work queued behind it.
 
 The production limit remains 5120 bytes. PR CI compares the production shared
 library from the exact `pull_request.base.sha` tree with the library from the

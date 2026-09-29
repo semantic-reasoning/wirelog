@@ -2,11 +2,11 @@
   "schema_version": 1,
   "status": "trusted-ci-artifact",
   "repository": "semantic-reasoning/wirelog",
-  "baseline_bytes": 408989,
-  "source_sha": "13d9244a13503cd178c40bb0179daf7c818ee314",
-  "run_id": 36335594347,
-  "artifact_id": 10936589708,
-  "artifact_sha256": "f099f285ae0ca1e0234c9e22a1630f5818acdf3b4c2cef23a51672cd7a2bbddb",
+  "baseline_bytes": 414051,
+  "source_sha": "863e011ec1cffcc145d8fba8b5d13d58e2897524",
+  "run_id": 36416622487,
+  "artifact_id": 10967208747,
+  "artifact_sha256": "58cb2cd56521cadb2225de2e0473d289545badd8bd950cf809c8b32b1072fcff",
   "profile_sha256": "e998de7827ab8b2c665e9f895e4e2e6e0f17b29450ae468c39efe41464aa97a7",
-  "library_sha256": "2a00c0a2532864f2064e91245e9b474ebcec764d1c96734f833c3d7e406f045d"
+  "library_sha256": "80a8f73cd68b9e56187b023db64d342ee443c66ecca8fdc0c453b0eaddc99682"
 }
