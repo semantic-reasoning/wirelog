@@ -3731,8 +3731,10 @@ test_session_exe = executable(
   override_options: host_machine.system() == 'linux' ? ['b_lto=false'] : [],
   c_args: host_machine.system() == 'linux' ?
     ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_TEST_ALLOC_WRAP=1',
-     '-DWL_TEST_RELATION_RESIZE_HOOK=1'] :
-    ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_TEST_RELATION_RESIZE_HOOK=1'],
+     '-DWL_TEST_RELATION_RESIZE_HOOK=1',
+     '-DWL_TEST_CONSOLIDATE_ALLOC_HOOK=1'] :
+    ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_TEST_RELATION_RESIZE_HOOK=1',
+     '-DWL_TEST_CONSOLIDATE_ALLOC_HOOK=1'],
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
