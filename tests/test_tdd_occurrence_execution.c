@@ -732,6 +732,108 @@ seed_refusals(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
     return 0;
 }
 
+/* Independent positive bag oracle for the unexpanded memoryAlias rule.
+ * Duplicate dereference matches must multiply JOIN, but not SEMIJOIN. */
+static int
+k1_rejections(wl_col_session_t *worker, const wl_plan_stratum_t *sp,
+    wl_columnar_eval_tdd_plan_manifest_t *manifest,
+    wl_columnar_eval_tdd_input_t inputs[4])
+{
+    uint64_t before = reserved(worker);
+    wl_columnar_eval_tdd_run_t run = {0};
+    for (unsigned c = 0; c < 10; c++) {
+        wl_columnar_eval_tdd_plan_manifest_t wrong = *manifest;
+        wl_columnar_eval_tdd_plan_slice_t slice = manifest->slices[0];
+        wrong.slices = &slice;
+        switch (c) {
+        case 0: wrong.form = WL_COLUMNAR_EVAL_TDD_PLAN_EXPANDED; break;
+        case 1: wrong.form = (wl_columnar_eval_tdd_plan_form_t)99; break;
+        case 2: wrong.alternative_count = 2; break;
+        case 3: slice.driver = 8; break;
+        case 4: slice.count = 5; break;
+        case 5: slice.start = 0; break;
+        case 6: slice.read_start = 1; break;
+        case 7: slice.ordinal = 1; break;
+        case 8: slice.seed = true; break;
+        case 9: wrong.block_size = 12; break;
+        }
+        CHECK(wl_columnar_eval_tdd_run_bound_slice_begin(worker, sp, &wrong,
+            0, &snapshot_token, &partition_token, 0, 1, inputs, 4, &run) != 0);
+        CHECK(!run.worker && reserved(worker) == before);
+    }
+    for (unsigned c = 0; c < 5; c++) {
+        wl_columnar_eval_tdd_plan_read_t saved = manifest->reads[1];
+        if (c == 0) manifest->reads[1].op_index = 8;
+        if (c == 1) manifest->reads[1].right_operand = false;
+        if (c == 2) manifest->reads[1].source_index = 3;
+        if (c == 3) manifest->reads[1].relation_name = "dereference";
+        if (c == 4) manifest->reads[1].kind = WL_COLUMNAR_EVAL_TDD_PLAN_FULL;
+        int rc = wl_columnar_eval_tdd_run_bound_slice_begin(worker, sp,
+                manifest, 0, &snapshot_token, &partition_token, 0, 1,
+                inputs, 4, &run);
+        manifest->reads[1] = saved;
+        CHECK(rc == EINVAL && !run.worker && reserved(worker) == before);
+    }
+    CHECK(sp->relation_count == 3);
+    for (unsigned c = 0; c < 37; c++) {
+        wl_plan_relation_t relations[3];
+        memcpy(relations, sp->relations, sizeof(relations));
+        wl_plan_op_t ops[12]; memcpy(ops, manifest->owner_ops, sizeof(ops));
+        wl_plan_stratum_t altered = *sp; altered.relations = relations;
+        wl_plan_relation_t *rel = &relations[manifest->relation_index];
+        rel->ops = ops;
+        wl_plan_op_exchange_t meta =
+            *(wl_plan_op_exchange_t *)ops[11].opaque_data;
+        ops[11].opaque_data = &meta;
+        uint32_t projection[] = {0, 1};
+        const char *null_key[] = {NULL};
+        wl_plan_expr_buffer_t exprs[2];
+        memcpy(exprs, ops[1].map_exprs, sizeof(exprs));
+        uint8_t bad_expr[] = {WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '0'};
+        switch (c) {
+        case 0: ops[4].op = WL_PLAN_OP_CONSOLIDATE; break;
+        case 1: ops[6].delta_mode = WL_DELTA_FORCE_DELTA; break;
+        case 2: ops[7].op = WL_PLAN_OP_LFTJ; break;
+        case 3: ops[8].right_relation = "valueAlias"; break;
+        case 4: ops[9].op = WL_PLAN_OP_CONSOLIDATE; break;
+        case 5: ops[10].op = WL_PLAN_OP_CONCAT; break;
+        case 6: ops[6].left_keys = NULL; break;
+        case 7: ops[6].left_keys = null_key; break;
+        case 8: ops[6].project_indices = projection; break;
+        case 9: ops[7].right_filter_expr.size = 1; break;
+        case 10: ops[5].relation_name = "valueAlias"; break;
+        case 11: ops[1].map_exprs = NULL; break;
+        case 12: exprs[0].data = bad_expr; ops[1].map_exprs = exprs; break;
+        case 13: meta.key_col_idxs = NULL; break;
+        case 14: meta.edb_rel_name = "dereference"; break;
+        case 15: rel->recursive_agg.has_spec = true; break;
+        case 16: ops[0].relation_name = "valueAlias"; break;
+        case 29: ops[5].left_keys = null_key; break;
+        case 30: ops[5].right_keys = null_key; break;
+        case 31: ops[4].project_indices = projection; break;
+        case 32: ops[10].group_by_indices = projection; break;
+        case 33: ops[9].map_exprs = exprs; break;
+        case 34: ops[11].filter_expr.data = bad_expr; break;
+        case 35: ops[11].right_filter_expr.data = bad_expr; break;
+        case 36: ops[7].agg_expr.data = bad_expr; break;
+        default: ops[c - 17].materialized = true; break;
+        }
+        wl_columnar_eval_tdd_plan_manifest_t rejected = {0};
+        CHECK(wl_columnar_eval_tdd_plan_bindings(&altered,
+            manifest->relation_index, &rejected) != 0);
+        CHECK(!rejected.slices && !rejected.reads && !rejected.owner_ops);
+        wl_columnar_eval_tdd_plan_manifest_t wrong = *manifest;
+        wrong.owner_stratum = &altered; wrong.owner_relation = rel;
+        wrong.owner_ops = ops;
+        CHECK(wl_columnar_eval_tdd_run_bound_slice_begin(worker, &altered,
+            &wrong, 0, &snapshot_token, &partition_token, 0, 1,
+            inputs, 4, &run) == EINVAL);
+        CHECK(!run.worker && !worker->cleanup_active &&
+            reserved(worker) == before);
+    }
+    return 0;
+}
+
 static int
 seed_cases(wl_col_session_t *coord, const wl_plan_stratum_t *sp)
 {
@@ -802,6 +904,191 @@ seed_cases(wl_col_session_t *coord, const wl_plan_stratum_t *sp)
     return 0;
 }
 
+static int
+k1_cases(wl_col_session_t *coord, const wl_plan_stratum_t *sp)
+{
+    static const int64_t edb[][2] = {{1, 10}, {1, 11}, {2, 20}, {2, 20},
+                                     {3, 30}, {8, 80}, {9, 90}};
+    static const int64_t changes[][2] = {{1, 2}, {2, 3}, {8, 9}, {1, 3},
+                                         {17, 2}};
+    uint32_t ri = 0;
+    while (ri < sp->relation_count && strcmp(sp->relations[ri].name,
+        "memoryAlias")) ri++;
+    CHECK(ri < sp->relation_count);
+    wl_columnar_eval_tdd_plan_manifest_t manifest = {0};
+#ifdef WL_TEST_ALLOC_WRAP
+    for (int at = 0; at < 2; at++) {
+        fail_calloc_after = at;
+        int rc = wl_columnar_eval_tdd_plan_bindings(sp, ri, &manifest);
+        fail_calloc_after = -1;
+        CHECK(rc == ENOMEM && !manifest.reads && !manifest.slices
+            && !manifest.owner_ops);
+    }
+#endif
+    CHECK(wl_columnar_eval_tdd_plan_bindings(sp, ri, &manifest) == 0);
+    CHECK(manifest.alternative_count == 1 && manifest.slice_count == 1
+        && manifest.read_count == 4 && manifest.slices[0].start == 5
+        && manifest.slices[0].count == 4 && manifest.slices[0].driver == 6);
+    const uint32_t widths[] = {1, 2, 8};
+    for (unsigned wi = 0; wi < 3; wi++) {
+        unsigned coverage[5] = {0};
+        for (uint32_t w = 0; w < widths[wi]; w++) {
+            wl_col_session_t worker = {0};
+            CHECK(col_worker_session_create(coord, w, NULL, 0, &worker) == 0);
+            /* Alternate missing and conflicting registry entries. */
+            const int64_t bad_rows[][2] = {{777, 888}};
+            const char *bad_names[] = {"assign", "dereference", "valueAlias",
+                                       "$d$valueAlias"};
+            for (unsigned i = 0; i < (w % 2 ? 1u : 4u); i++) {
+                col_rel_t *bad = relation(bad_names[i], bad_rows, 1, 0, 0);
+                CHECK(bad && session_add_rel(&worker, bad) == 0);
+            }
+            col_rel_t *full = relation("dereference", edb, 7, 0, 0);
+            col_rel_t *delta = relation("alias-partition", changes, 5,
+                    w, widths[wi]);
+            CHECK(full && delta);
+            int64_t expected[245][2]; unsigned used[245] = {0};
+            uint32_t n = 0;
+            for (uint32_t row = 0; row < delta->nrows; row++) {
+                unsigned d = 0;
+                while (d < 5 && (delta->columns[0][row] != changes[d][0]
+                    || delta->columns[1][row] != changes[d][1])) d++;
+                CHECK(d < 5 && (uint64_t)changes[d][0] % widths[wi] == w);
+                coverage[d]++;
+            }
+            for (unsigned d = 0; d < 5; d++) {
+                if ((uint64_t)changes[d][0] % widths[wi] != w) continue;
+                for (unsigned a = 0; a < 7; a++)
+                    for (unsigned b = 0; b < 7; b++)
+                        if (edb[a][0] == changes[d][0]
+                            && edb[b][0] == changes[d][1]) {
+                            expected[n][0] = edb[a][1];
+                            expected[n++][1] = edb[b][1];
+                        }
+            }
+            wl_columnar_eval_tdd_input_t inputs[4];
+            for (unsigned i = 0; i < 4; i++)
+                inputs[i] = capture(&manifest.reads[i],
+                        i == 1 ? delta : full, w, widths[wi]);
+            uint64_t before = reserved(&worker);
+            wl_columnar_eval_tdd_run_t run = {0};
+            if (wi == 0) {
+                CHECK(k1_rejections(&worker, sp, &manifest, inputs) == 0);
+                for (unsigned i = 0; i < 4; i++) {
+                    inputs[i].view_generation++;
+                    CHECK(wl_columnar_eval_tdd_run_bound_slice_begin(&worker,
+                        sp, &manifest, 0, &snapshot_token, &partition_token,
+                        w, widths[wi], inputs, 4, &run) == EINVAL);
+                    inputs[i].view_generation--;
+                    inputs[i].ncols++;
+                    CHECK(wl_columnar_eval_tdd_run_bound_slice_begin(&worker,
+                        sp, &manifest, 0, &snapshot_token, &partition_token,
+                        w, widths[wi], inputs, 4, &run) == EINVAL);
+                    inputs[i].ncols--;
+                }
+                col_rel_t *other_full = relation("dereference", edb, 7, 0, 0);
+                CHECK(other_full);
+                inputs[2] = capture(&manifest.reads[2], other_full, w,
+                        widths[wi]);
+                CHECK(wl_columnar_eval_tdd_run_bound_slice_begin(&worker,
+                    sp, &manifest, 0, &snapshot_token, &partition_token,
+                    w, widths[wi], inputs, 4, &run) == EINVAL);
+                inputs[2] = capture(&manifest.reads[2], full, w, widths[wi]);
+                col_rel_destroy(other_full);
+                wl_columnar_memory_governor_t *g =
+                    wl_columnar_memory_governor_ref_get(worker.memory_governor);
+                uint64_t limit = atomic_load_explicit(&g->usable_bytes,
+                        memory_order_seq_cst);
+                wl_columnar_memory_mode_t mode = g->mode;
+                g->mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+                atomic_store_explicit(&g->usable_bytes, before,
+                    memory_order_seq_cst);
+                worker.memory_budget_denied = false;
+                int rc = wl_columnar_eval_tdd_run_bound_slice_begin(&worker,
+                        sp, &manifest, 0, &snapshot_token, &partition_token,
+                        w, widths[wi], inputs, 4, &run);
+                atomic_store_explicit(&g->usable_bytes, limit,
+                    memory_order_seq_cst);
+                g->mode = mode;
+                CHECK(rc == ENOSPC && worker.memory_budget_denied
+                    && !run.worker && reserved(&worker) == before);
+                worker.memory_budget_denied = false;
+#ifdef WL_TEST_ALLOC_WRAP
+                fail_calloc_after = 0;
+                rc = wl_columnar_eval_tdd_run_bound_slice_begin(&worker, sp,
+                        &manifest, 0, &snapshot_token, &partition_token,
+                        w, widths[wi], inputs, 4, &run);
+                fail_calloc_after = -1;
+                CHECK(rc == ENOMEM && !run.worker &&
+                    !worker.memory_budget_denied
+                    && reserved(&worker) == before);
+#endif
+                evaluations = 0;
+                wl_columnar_eval_test_bound_slice_after_eval =
+                    pin_result_and_fail;
+                CHECK(wl_columnar_eval_tdd_run_bound_slice_begin(&worker,
+                    sp, &manifest, 0, &snapshot_token, &partition_token,
+                    w, widths[wi], inputs, 4, &run) == ENOMEM);
+                CHECK(run.worker && worker.cleanup_pending && held_result.owner
+                    && evaluations == 1);
+                CHECK(wl_columnar_eval_tdd_run_bound_slice_finish(&run,
+                    NULL) == ENOMEM);
+                CHECK(run.worker && evaluations == 1);
+                CHECK(col_rel_source_reader_release(&held_result) == 0);
+                wl_columnar_eval_test_bound_slice_after_eval = NULL;
+                CHECK(wl_columnar_eval_tdd_run_bound_slice_finish(&run,
+                    NULL) == ENOMEM);
+                CHECK(!run.worker && !worker.tdd_input_run &&
+                    reserved(&worker) == before);
+            }
+            evaluations = release_calls = 0;
+            wl_columnar_eval_test_bound_slice_after_eval = count_evaluation;
+            wl_columnar_eval_test_bound_slice_before_release =
+                refuse_release_once;
+            CHECK(wl_columnar_eval_tdd_run_bound_slice_begin(&worker, sp,
+                &manifest, 0, &snapshot_token, &partition_token,
+                w, widths[wi], inputs, 4, &run) == 0);
+            CHECK(col_worker_session_destroy(&worker) == EBUSY);
+            for (unsigned i = 0; i < 4; i++) {
+                wl_columnar_source_access_writer_t writer = {0};
+                CHECK(col_rel_source_writer_acquire(inputs[i].relation,
+                    &writer) == EBUSY);
+            }
+            col_rel_t *out = NULL, *saved = run.output;
+            CHECK(wl_columnar_eval_tdd_run_bound_slice_finish(&run,
+                &out) == EBUSY);
+            CHECK(!out && run.output == saved && evaluations == 1);
+            CHECK(wl_columnar_eval_tdd_run_bound_slice_finish(&run, &out) == 0);
+            wl_columnar_eval_test_bound_slice_after_eval = NULL;
+            wl_columnar_eval_test_bound_slice_before_release = NULL;
+            CHECK(out == saved && evaluations == 1 && out->ncols == 2
+                && out->nrows == n);
+            for (unsigned i = 0; i < 4; i++)
+                CHECK(inputs[i].relation->view_generation ==
+                    inputs[i].view_generation
+                    && inputs[i].relation->storage_generation ==
+                    inputs[i].storage_generation);
+            for (unsigned i = 0; i < 7; i++)
+                CHECK(full->columns[0][i] == edb[i][0]
+                    && full->columns[1][i] == edb[i][1]);
+            CHECK(col_rel_destroy_checked(full) == 0
+                && col_rel_destroy_checked(delta) == 0);
+            for (uint32_t r = 0; r < out->nrows; r++) {
+                uint32_t j = 0;
+                while (j < n && (used[j] || expected[j][0] != out->columns[0][r]
+                    || expected[j][1] != out->columns[1][r])) j++;
+                CHECK(j < n); used[j]++;
+            }
+            CHECK(col_rel_destroy_checked(out) == 0
+                && reserved(&worker) == before);
+            CHECK(col_worker_session_destroy(&worker) == 0);
+        }
+        for (unsigned d = 0; d < 5; d++) CHECK(coverage[d] == 1);
+    }
+    wl_columnar_eval_tdd_plan_bindings_free(&manifest);
+    return 0;
+}
+
 int main(void)
 {
     const char *path = getenv("WIRELOG_TEST_CSPA_PLAN");
@@ -845,6 +1132,7 @@ int main(void)
     CHECK(negative_cases(coord, sp, &manifest) == 0);
     CHECK(synthetic_cases(coord) == 0);
     CHECK(seed_cases(coord, sp) == 0);
+    CHECK(k1_cases(coord, sp) == 0);
     wl_session_destroy(session);
     wl_columnar_eval_tdd_plan_bindings_free(&manifest);
     wl_plan_free(plan); wirelog_program_free(program);

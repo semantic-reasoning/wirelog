@@ -355,6 +355,141 @@ wl_columnar_eval_tdd_plan_bindings_free(
     memset(manifest, 0, sizeof(*manifest));
 }
 
+/* Deliberately narrow grammar, rechecked at execution. K1 has no expanded
+ * FORCE_DELTA markers: only this proved right operand may bind AUTO to DELTA.
+ * The two seed bodies and outer CONCAT/CONS/EXCHANGE are not executed here. */
+static bool
+wl_columnar_eval_tdd_plan_relation_names_valid(const wl_plan_stratum_t *sp)
+{
+    for (uint32_t i = 0; i < sp->relation_count; i++) {
+        if (!sp->relations[i].name)
+            return false;
+        for (uint32_t j = 0; j < i; j++)
+            if (strcmp(sp->relations[i].name, sp->relations[j].name) == 0)
+                return false;
+    }
+    return true;
+}
+
+/* The K1 exception admits only the generated payload shape. The shared
+ * semantic comparator intentionally ignores pointers with zero lengths. */
+static bool
+wl_columnar_eval_tdd_plan_k1_ptr_shape(const wl_plan_op_t *op,
+    const wl_plan_op_t *expected)
+{
+    if (!!op->left_keys != !!expected->left_keys
+        || !!op->right_keys != !!expected->right_keys
+        || !!op->project_indices != !!expected->project_indices
+        || !!op->group_by_indices != !!expected->group_by_indices
+        || !!op->map_exprs != !!expected->map_exprs
+        || !!op->filter_expr.data != !!expected->filter_expr.data
+        || !!op->right_filter_expr.data != !!expected->right_filter_expr.data
+        || !!op->agg_expr.data != !!expected->agg_expr.data)
+        return false;
+    for (uint32_t i = 0; i < op->map_expr_count; i++)
+        if (!!op->map_exprs[i].data != !!expected->map_exprs[i].data)
+            return false;
+    return true;
+}
+
+/* Callers validate the current stratum's relation names before recognition. */
+static bool
+wl_columnar_eval_tdd_plan_cspa_k1(const wl_plan_stratum_t *sp,
+    const wl_plan_relation_t *rel)
+{
+    static const char *const col0[] = { "col0" }, *const col1[] = { "col1" };
+    static const uint32_t p11[] = { 1, 1 }, p00[] = { 0, 0 },
+        p13[] = { 1, 3 }, p03[] = { 0, 3 };
+    /* Borrowed comparison constants: never mutated or passed to a plan owner.
+     * Buffer fields are mutable pointer types, so no const-discard is needed. */
+    static uint8_t variables[2][7] = {
+        { WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '0' },
+        { WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1' },
+    };
+    static wl_plan_expr_buffer_t expressions[2][2] = {
+        { { .data = variables[0], .size = 7 },
+          { .data = variables[0], .size = 7 } },
+        { { .data = variables[1], .size = 7 },
+          { .data = variables[1], .size = 7 } },
+    };
+    static const wl_plan_op_t expected[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "assign" },
+        { .op = WL_PLAN_OP_MAP, .project_count = 2, .project_indices = p11,
+          .map_expr_count = 2, .map_exprs = expressions[1] },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "assign" },
+        { .op = WL_PLAN_OP_MAP, .project_count = 2, .project_indices = p00,
+          .map_expr_count = 2, .map_exprs = expressions[0] },
+        { .op = WL_PLAN_OP_CONCAT },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "dereference" },
+        { .op = WL_PLAN_OP_JOIN, .right_relation = "valueAlias",
+          .key_count = 1, .left_keys = col0, .right_keys = col0,
+          .project_count = 2, .project_indices = p13 },
+        { .op = WL_PLAN_OP_SEMIJOIN, .right_relation = "dereference",
+          .key_count = 1, .left_keys = col1, .right_keys = col0 },
+        { .op = WL_PLAN_OP_JOIN, .right_relation = "dereference",
+          .key_count = 1, .left_keys = col1, .right_keys = col0,
+          .project_count = 2, .project_indices = p03 },
+        { .op = WL_PLAN_OP_CONCAT },
+        { .op = WL_PLAN_OP_CONSOLIDATE },
+        { .op = WL_PLAN_OP_EXCHANGE },
+    };
+    if (!sp->is_recursive || !rel->ops || rel->op_count != 12
+        || !wl_columnar_eval_tdd_plan_string_equal(rel->name, "memoryAlias")
+        || rel->recursive_agg.has_spec)
+        return false;
+    if (!is_stratum_idb(sp, "valueAlias")
+        || is_stratum_idb(sp, "dereference") || is_stratum_idb(sp, "assign"))
+        return false;
+    for (uint32_t i = 0; i < 12; i++) {
+        wl_plan_op_t op = rel->ops[i];
+        if (i == 11)
+            op.opaque_data = NULL;
+        if (op.materialized || op.delta_mode != WL_DELTA_AUTO
+            || !wl_columnar_eval_tdd_plan_op_equal(&op, &expected[i])
+            || !wl_columnar_eval_tdd_plan_k1_ptr_shape(&op, &expected[i]))
+            return false;
+    }
+    const wl_plan_op_exchange_t *meta = rel->ops[11].opaque_data;
+    return meta && meta->num_workers == 0 && meta->key_col_count == 1
+           && meta->key_col_idxs && meta->key_col_idxs[0] == 0
+           && meta->edb_key_col_count == 1 && meta->edb_key_col_idxs
+           && meta->edb_key_col_idxs[0] == 0
+           && !meta->edb_rel_name;
+}
+
+static int
+wl_columnar_eval_tdd_plan_k1_manifest(const wl_plan_stratum_t *sp,
+    uint32_t relation_index, wl_columnar_eval_tdd_plan_manifest_t *out)
+{
+    const wl_plan_relation_t *rel = &sp->relations[relation_index];
+    *out = (wl_columnar_eval_tdd_plan_manifest_t){
+        .form = WL_COLUMNAR_EVAL_TDD_PLAN_CSPA_K1,
+        .relation_index = relation_index, .alternative_count = 1,
+        .block_size = 4, .slice_count = 1, .read_count = 4,
+        .owner_stratum = sp, .owner_relation = rel,
+        .owner_ops = rel->ops, .owner_op_count = rel->op_count,
+    };
+    out->slices = calloc(1, sizeof(*out->slices));
+    out->reads = calloc(4, sizeof(*out->reads));
+    if (!out->slices || !out->reads) {
+        wl_columnar_eval_tdd_plan_bindings_free(out);
+        return ENOMEM;
+    }
+    *out->slices = (wl_columnar_eval_tdd_plan_slice_t){
+        .start = 5, .count = 4, .driver = 6, .read_count = 4,
+    };
+    for (uint32_t i = 0; i < 4; i++)
+        out->reads[i] = (wl_columnar_eval_tdd_plan_read_t){
+            .op_index = 5 + i, .source_index = i,
+            .relation_name = wl_columnar_eval_tdd_plan_operand(&rel->ops[5+i]),
+            .right_operand = i != 0,
+            .kind = i == 1 ? WL_COLUMNAR_EVAL_TDD_PLAN_DELTA
+                : i == 2 ? WL_COLUMNAR_EVAL_TDD_PLAN_PREFILTER
+                : WL_COLUMNAR_EVAL_TDD_PLAN_FULL,
+        };
+    return 0;
+}
+
 static int
 wl_columnar_eval_tdd_plan_collect(const wl_plan_stratum_t *sp,
     uint32_t relation_index, wl_columnar_eval_tdd_plan_manifest_t *out,
@@ -368,14 +503,8 @@ wl_columnar_eval_tdd_plan_collect(const wl_plan_stratum_t *sp,
         memset(counts, 0, 3 * sizeof(*counts));
     if (!sp || !sp->relations || relation_index >= sp->relation_count)
         return EINVAL;
-    for (uint32_t r = 0; r < sp->relation_count; r++) {
-        if (!sp->relations[r].name)
-            return EINVAL;
-        for (uint32_t j = 0; j < r; j++) {
-            if (strcmp(sp->relations[r].name, sp->relations[j].name) == 0)
-                return EINVAL;
-        }
-    }
+    if (!wl_columnar_eval_tdd_plan_relation_names_valid(sp))
+        return EINVAL;
     const wl_plan_relation_t *rel = &sp->relations[relation_index];
     if (!sp->is_recursive || !rel->ops || rel->op_count < 4)
         return ENOTSUP;
@@ -392,8 +521,17 @@ wl_columnar_eval_tdd_plan_collect(const wl_plan_stratum_t *sp,
     uint32_t k = 0;
     for (uint32_t i = 0; i < count - 2; i++)
         k += rel->ops[i].delta_mode == WL_DELTA_FORCE_DELTA;
-    if (k < 2)
-        return ENOTSUP;
+    if (k < 2) {
+        if (!wl_columnar_eval_tdd_plan_cspa_k1(sp, rel))
+            return ENOTSUP;
+        if (counts) {
+            counts[0] = 1;
+            counts[1] = 1;
+            counts[2] = 4;
+            return 0;
+        }
+        return wl_columnar_eval_tdd_plan_k1_manifest(sp, relation_index, out);
+    }
     if ((count - 2) % k != 0)
         return EINVAL;
     uint32_t width = (count - 2) / k;
@@ -446,8 +584,8 @@ wl_columnar_eval_tdd_plan_bindings(const wl_plan_stratum_t *sp,
     return wl_columnar_eval_tdd_plan_collect(sp, relation_index, out, NULL);
 }
 
-/* Diagnostics only need validated counts; the owning binder retains its
- * allocation and ENOMEM behavior. */
+/* Diagnostics need validated counts, not owned occurrence arrays. The full
+ * manifest path retains its allocation and typed ENOMEM behavior. */
 int
 wl_columnar_eval_tdd_plan_binding_summary(const wl_plan_stratum_t *sp,
     uint32_t relation_index, uint32_t counts[3])
@@ -573,7 +711,20 @@ wl_columnar_eval_tdd_plan_prepare_inputs(wl_col_session_t *worker,
         return EINVAL;
     const wl_columnar_eval_tdd_plan_slice_t *slice =
         &manifest->slices[slice_index];
-    if (manifest->alternative_count < 2 || slice->inactive
+    bool k1 = manifest->form == WL_COLUMNAR_EVAL_TDD_PLAN_CSPA_K1;
+    if (k1) {
+        if (!wl_columnar_eval_tdd_plan_relation_names_valid(sp)
+            || !wl_columnar_eval_tdd_plan_cspa_k1(sp, rel)
+            || manifest->alternative_count != 1 || manifest->block_size != 4
+            || manifest->slice_count != 1 || manifest->read_count != 4
+            || slice_index != 0 || slice->start != 5 || slice->count != 4
+            || slice->driver != 6 || slice->read_start != 0
+            || slice->read_count != 4 || slice->alternative || slice->ordinal
+            || slice->seed || slice->inactive)
+            return EINVAL;
+    } else if (manifest->form != WL_COLUMNAR_EVAL_TDD_PLAN_EXPANDED)
+        return EINVAL;
+    if ((!k1 && manifest->alternative_count < 2) || slice->inactive
         || worker->diff_operators_active || worker->retraction_seeded
         || worker->retraction_right_pass || worker->delta_seeded
         || worker->join_batch_bytes > 0 || worker->join_batch_strict)
@@ -583,6 +734,9 @@ wl_columnar_eval_tdd_plan_prepare_inputs(wl_col_session_t *worker,
         || slice->read_start > manifest->read_count
         || slice->read_count > manifest->read_count - slice->read_start
         || input_count != slice->read_count || !input_count)
+        return EINVAL;
+    if (k1 && (inputs[0].relation != inputs[2].relation
+        || inputs[0].relation != inputs[3].relation))
         return EINVAL;
     bool seed = slice->seed;
     if (seed) {
@@ -625,13 +779,15 @@ wl_columnar_eval_tdd_plan_prepare_inputs(wl_col_session_t *worker,
             WL_PLAN_OP_SEMIJOIN ? WL_COLUMNAR_EVAL_TDD_PLAN_PREFILTER
             : WL_COLUMNAR_EVAL_TDD_PLAN_FULL;
         if (read->op_index != i || in->read != read || !name
+            || (k1 && in->ncols != 2)
+            || (k1 && read->source_index != i - 5)
             || !read->relation_name || strcmp(name, read->relation_name) != 0
             || read->right_operand != (op->op != WL_PLAN_OP_VARIABLE)
             || read->kind != kind || in->snapshot != snapshot
             || !wl_columnar_eval_tdd_plan_input_matches(in))
             return EINVAL;
         if (delta) {
-            if (op->delta_mode != WL_DELTA_FORCE_DELTA
+            if (op->delta_mode != (k1 ? WL_DELTA_AUTO : WL_DELTA_FORCE_DELTA)
                 || op->op == WL_PLAN_OP_SEMIJOIN
                 || in->partition != partition ||
                 in->worker_index != worker_index

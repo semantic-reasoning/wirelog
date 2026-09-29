@@ -229,18 +229,21 @@ performance improvements claimed by #1378.
 ## Occurrence binding diagnostics (#1984)
 
 `WIRELOG_TDD_DECISION_DEBUG=1` also emits a `TDD bindings` record per
-relation. `status=0` means that its explicit unfused multiway alternatives
-have a validated input-binding manifest. `status=ENOTSUP` (printed as the
-platform errno number) includes unexpanded/K=1 relations and unsupported
-forms; other nonzero statuses report malformed plans or allocation failure.
+relation. `status=0` means that its explicit unfused multiway alternatives,
+or the narrowly recognized CSPA `memoryAlias` K=1 recursive body, have a
+validated input-binding manifest. `status=ENOTSUP` (printed as the platform
+errno number) includes other unexpanded/K=1 relations and unsupported forms;
+other nonzero statuses report malformed plans.
 These records do **not** establish execution eligibility. The existing
 `TDD decision` and completed-work records remain the evidence for dispatch.
-The manifest is built only when this diagnostic is enabled or when explicitly
-requested internally; normal admission allocates no new manifest.
+Diagnostics count validated bindings without allocating a manifest. An owning
+manifest is built only when explicitly requested internally; normal admission
+allocates no new manifest.
 
 For the current lowered CSPA plan, `valueFlow` has three alternatives and
-`valueAlias` five. `memoryAlias` is unexpanded and has no manifest. This is
-not whole-SCC support. Bindings retain the exact operator occurrence and
+`valueAlias` five. The unexpanded `memoryAlias` has one manifest slice for
+its recursive body, excluding its two seed rules. This is not whole-SCC
+support. Bindings retain the exact operator occurrence and
 operand side, so repeated uses of `valueFlow` remain distinct. The inserted,
 non-projecting SEMIJOIN prefilter reads the full epoch even when the following
 JOIN reads a partitioned delta. Ambiguous forms, missing or duplicated driver
@@ -296,12 +299,21 @@ the initial positive phase, iteration zero, with worker 0 of 1 and a NULL
 partition. Complete operator and expression payloads must match the generated
 forms. The bound VARIABLE path bypasses ordinary later-iteration empty-seed
 selection, so other seed phases, alternatives and forms remain explicitly
-refused. Inactive slices, K=1, retractions/diff operators, batch pipelines,
+refused. Inactive slices, other K=1 forms, retractions/diff operators, batch pipelines,
 right filters and unsupported operators also refuse before evaluation.
 The caller must schedule each seed once; the helper does not enforce once-only
 execution across calls. Its outputs are raw tuple bags preserving duplicates,
 without UNION consolidation. Existing conservative TDD admission and SCC
 dispatch remain unchanged.
+
+The bounded K=1 exception recognizes the exact generated `memoryAlias` plan
+and executes only ops `[5,9)`: VARIABLE `dereference`, JOIN `valueAlias`,
+SEMIJOIN `dereference`, JOIN `dereference`. Its distinct manifest form is
+revalidated against the owning plan before each begin. Only the JOIN-right
+`valueAlias` occurrence may use an AUTO-mode delta partition; all three
+`dereference` reads pin the same complete immutable input through the bound
+frame. Seed MAP expressions and outer CONCAT/CONSOLIDATE/EXCHANGE are checked
+as part of the recognized grammar but are not executed by this slice.
 
 `meson test -C builddir tdd_occurrence_execution` runs all five active alternatives
 of the unmodified generated CSPA `valueAlias` plan with independently partitioned
@@ -314,7 +326,11 @@ raw-bag oracles for empty and duplicated/overlapping inputs, retaining duplicate
 multiplicity in each result and their concatenation. They check altered-plan
 and later-alternative refusals before execution, source/output lifetime,
 governed denial versus allocator failure, and cleanup-only retry without
-reevaluation. These tests establish bounded positive body execution, not signed
-multiplicities, convergence or whole-CSPA support. Epoch/read-set production,
-once-only seed scheduling, UNION consolidation, K=1 support and #1965 atomic
-SCC publication remain prerequisites for enabling that dispatch and for #1982.
+reevaluation. The K=1 fixture compares the exact raw positive recursive bag
+against an independent nested-loop rule oracle at W=1/2/8, including duplicate
+derivations, full-domain prefilter reads, empty partitions, seed exclusion,
+malformed plans and cleanup-only retry. These tests establish bounded positive
+body execution, not signed multiplicities, convergence or whole-CSPA support.
+Epoch/read-set production, once-only seed scheduling, UNION consolidation,
+and #1965 atomic SCC publication remain prerequisites for enabling that dispatch
+and for #1982.
