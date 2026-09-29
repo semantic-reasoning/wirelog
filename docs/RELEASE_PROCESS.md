@@ -340,6 +340,12 @@ shared local/default runs. The release tag job runs the corresponding
 correctness sentinel and records timing attempts; it does not promote a
 hosted timing observation to a blocking absolute-time result.
 
+The Linux `perf-nightly` suite records the observed CPU 0 governor and runs
+its timing gates even when it is not `performance`. Its calibrated targets,
+correctness checks, and coefficient-of-variation checks still apply. This
+nightly exception does not apply to the required performance suite or release
+timing path described below.
+
 The strict authoritative issue #948 timing job, when enabled, uses two
 release/perf build directories on a provisioned Linux runner. Configure the trace build with
 `-Dwirelog_log_max_level=trace` and run `log_perf_gate` there; configure the

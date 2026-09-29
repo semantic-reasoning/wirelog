@@ -741,8 +741,9 @@ endif
 # Requires WIRELOG_PERF_GATE=1 and a stable timing host. The authoritative CI
 # job uses separate trace and error build directories: log_perf_gate runs in
 # the trace build, while the three evaluator timing gates run in the error
-# build. Linux requires a 'performance' cpufreq governor; Windows uses thread affinity +
-# HIGH_PRIORITY_CLASS via bench_stability_prep() (issue #508 Phase 2).
+# build. Linux requires a 'performance' cpufreq governor except in the
+# perf-nightly suite, which records the observed value; Windows uses thread
+# affinity + HIGH_PRIORITY_CLASS via bench_stability_prep() (issue #508 Phase 2).
 # A baseline coefficient-of-variation self-check converts noisy runs to SKIP
 # instead of FAIL so shared CI runners never flag a false regression.
 #   Linux:   env WIRELOG_PERF_GATE=1 taskset -c 0 meson test -C build --suite perf
@@ -924,6 +925,10 @@ test('arm_asan_strict_align_selection', py3,
 # change Visual Studio versions. Native Windows CI verifies execution.
 test('perf_nightly_windows_contract', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-perf-nightly-windows.py'],
+     suite: 'abi')
+
+test('perf_nightly_governor_policy', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-perf-nightly-governor-policy.py'],
      suite: 'abi')
 
 # Keep the longer Windows/MSVC build budget platform-specific; a global
