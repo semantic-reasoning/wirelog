@@ -7378,6 +7378,10 @@ extern int (*wl_columnar_eval_test_after_worker_private)(wl_col_session_t *,
     col_rel_t *, col_rel_t *, col_rel_t *);
 extern void (*wl_columnar_eval_test_after_worker_image)(wl_col_session_t *,
     col_rel_t *, int);
+extern int (*wl_columnar_eval_test_before_worker_dedup)(wl_col_session_t *,
+    col_rel_t *, col_rel_t *, col_rel_t *);
+extern void (*wl_columnar_eval_test_after_worker_dedup)(wl_col_session_t *,
+    col_rel_t *, int);
 
 static atomic_int wide_rollback_worker = ATOMIC_VAR_INIT(-1);
 static col_rel_t *wide_rollback_source;
@@ -7387,6 +7391,9 @@ static bool wide_rollback_prep_fault;
 static bool wide_rollback_prep_seen, wide_rollback_prep_source_unchanged;
 static bool wide_rollback_prep_fault_consumed;
 static int wide_rollback_prep_rc;
+static bool wide_dedup_seeded, wide_dedup_after_seen;
+static bool wide_dedup_fault_consumed, wide_dedup_source_unchanged;
+static int wide_dedup_after_rc;
 
 static uint64_t
 wide_rollback_fingerprint(const col_rel_t *source)
@@ -7468,6 +7475,66 @@ wide_rollback_after_private(wl_col_session_t *worker, col_rel_t *source,
     return ENOMEM; /* fail after private consolidation, before source commit */
 }
 
+static int
+wide_dedup_before(wl_col_session_t *worker, col_rel_t *source,
+    col_rel_t *image, col_rel_t *delta)
+{
+    if ((int)worker->worker_id != atomic_load_explicit(
+            &wide_rollback_worker, memory_order_acquire)
+        || source != wide_rollback_source)
+        return 0;
+    if (!image || image == source || !delta || !image->dedup_slots
+        || image->dedup_cap != 1024 || image->dedup_count != 0
+        || image->nrows == 0)
+        return EINVAL;
+    uint64_t *row_hashes = malloc((size_t)image->nrows * sizeof(uint64_t));
+    if (!row_hashes)
+        return ENOMEM;
+    for (uint32_t r = 0; r < image->nrows; r++)
+        row_hashes[r] = wl_columnar_eval_dedup_row_hash(image, r);
+    uint32_t seeded = 0;
+    for (uint64_t candidate = 1; seeded < 717; candidate++) {
+        bool collision = false;
+        for (uint32_t r = 0; r < image->nrows; r++)
+            if (candidate == row_hashes[r]) {
+                collision = true;
+                break;
+            }
+        if (collision)
+            continue;
+        bool inserted = false;
+        int rc = wl_columnar_eval_dedup_set_insert_checked(image,
+                candidate, &inserted);
+        if (rc != 0 || !inserted) {
+            free(row_hashes);
+            return rc ? rc : EINVAL;
+        }
+        seeded++;
+    }
+    free(row_hashes);
+    if (image->dedup_cap != 1024 || image->dedup_count != 717
+        || wide_rollback_fingerprint(source) != wide_rollback_before)
+        return EINVAL;
+    wide_dedup_seeded = true;
+    wl_columnar_eval_dedup_test_fail_next_worker_growth_alloc();
+    return 0;
+}
+
+static void
+wide_dedup_after(wl_col_session_t *worker, col_rel_t *source, int rc)
+{
+    if ((int)worker->worker_id != atomic_load_explicit(
+            &wide_rollback_worker, memory_order_acquire)
+        || source != wide_rollback_source)
+        return;
+    wide_dedup_after_seen = true;
+    wide_dedup_after_rc = rc;
+    wide_dedup_fault_consumed =
+        !wl_columnar_eval_dedup_test_worker_growth_alloc_pending();
+    wide_dedup_source_unchanged =
+        wide_rollback_fingerprint(source) == wide_rollback_before;
+}
+
 typedef struct {
     uint32_t width;
     uint32_t seen;
@@ -7496,9 +7563,11 @@ wide_rollback_collect(const char *relation, const int64_t *row,
 }
 
 static void
-test_tdd_wide_worker_private_rollback(uint32_t width, bool prep_fault)
+test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
 {
-    TEST(prep_fault ?
+    TEST(fault_mode == 2 ?
+        "wide TDD worker dedup growth allocator failure and retry"
+        : fault_mode == 1 ?
         "wide TDD worker private image allocation failure and retry"
         : "wide TDD worker rollback after private consolidation and retry");
     uint32_t key = 0;
@@ -7559,22 +7628,34 @@ test_tdd_wide_worker_private_rollback(uint32_t width, bool prep_fault)
     atomic_store_explicit(&wide_rollback_worker, -1, memory_order_release);
     wide_rollback_source = NULL;
     wide_rollback_private_seen = wide_rollback_source_unchanged = false;
-    wide_rollback_prep_fault = prep_fault;
+    wide_rollback_prep_fault = fault_mode == 1;
     wide_rollback_prep_seen = wide_rollback_prep_source_unchanged = false;
     wide_rollback_prep_fault_consumed = false;
     wide_rollback_prep_rc = 0;
+    wide_dedup_seeded = wide_dedup_after_seen = false;
+    wide_dedup_fault_consumed = wide_dedup_source_unchanged = false;
+    wide_dedup_after_rc = 0;
     wl_columnar_eval_test_before_worker_image = wide_rollback_before_image;
-    wl_columnar_eval_test_after_worker_image = prep_fault
+    wl_columnar_eval_test_after_worker_image = fault_mode == 1
         ? wide_rollback_after_image : NULL;
-    wl_columnar_eval_test_after_worker_private = prep_fault
-        ? NULL : wide_rollback_after_private;
+    wl_columnar_eval_test_after_worker_private = fault_mode == 0
+        ? wide_rollback_after_private : NULL;
+    wl_columnar_eval_test_before_worker_dedup = fault_mode == 2
+        ? wide_dedup_before : NULL;
+    wl_columnar_eval_test_after_worker_dedup = fault_mode == 2
+        ? wide_dedup_after : NULL;
     int rc = wl_session_snapshot(session, wide_rollback_collect, &rows);
     wl_columnar_eval_test_before_worker_image = NULL;
     wl_columnar_eval_test_after_worker_image = NULL;
     wl_columnar_eval_test_after_worker_private = NULL;
+    wl_columnar_eval_test_before_worker_dedup = NULL;
+    wl_columnar_eval_test_after_worker_dedup = NULL;
     WIDE_CHECK(rc == ENOMEM
         && rows.count == 0
-        && (prep_fault ? (wide_rollback_prep_seen
+        && (fault_mode == 2 ? (wide_dedup_seeded
+        && wide_dedup_after_seen && wide_dedup_after_rc == rc
+        && wide_dedup_fault_consumed && wide_dedup_source_unchanged)
+        : fault_mode == 1 ? (wide_rollback_prep_seen
         && wide_rollback_prep_rc == rc
         && wide_rollback_prep_fault_consumed
         && wide_rollback_prep_source_unchanged)
@@ -7588,6 +7669,8 @@ cleanup:
     wl_columnar_eval_test_before_worker_image = NULL;
     wl_columnar_eval_test_after_worker_image = NULL;
     wl_columnar_eval_test_after_worker_private = NULL;
+    wl_columnar_eval_test_before_worker_dedup = NULL;
+    wl_columnar_eval_test_after_worker_dedup = NULL;
     wide_rollback_prep_fault = 0;
     col_rel_destroy(unowned);
     free(values);
@@ -13959,6 +14042,7 @@ main(void)
     test_tdd_wide_worker_private_rollback(9, 0);
     test_tdd_wide_worker_private_rollback(32, 0);
     test_tdd_wide_worker_private_rollback(32, true);
+    test_tdd_wide_worker_private_rollback(9, 2);
     test_worker_frame_admission(false);
     test_worker_frame_admission(true);
     test_worker_frame_retention(8, 0, true, false, 0);

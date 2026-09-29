@@ -3642,6 +3642,8 @@ int wl_columnar_eval_dedup_set_insert_checked(col_rel_t *r, uint64_t h,
     bool *inserted);
 #ifdef WL_SESSION_TEST_HOOKS
 void wl_columnar_eval_dedup_test_fail_next_growth_alloc(void);
+void wl_columnar_eval_dedup_test_fail_next_worker_growth_alloc(void);
+bool wl_columnar_eval_dedup_test_worker_growth_alloc_pending(void);
 #endif
 bool
 wl_columnar_eval_dedup_set_contains(const col_rel_t *r, uint64_t h);
