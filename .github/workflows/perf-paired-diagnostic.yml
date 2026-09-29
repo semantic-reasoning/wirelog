@@ -1,0 +1,179 @@
+name: Paired Perf Diagnostic
+
+# Manual, non-gating evidence collection for #2022 on the shared tagged runner.
+on:
+  # Temporary pre-merge campaign for #2022; remove after tagged evidence lands.
+  push:
+    branches:
+      - codex/2022-relative-perf
+  workflow_dispatch:
+    inputs:
+      base_sha:
+        description: 'Full SHA of a trusted main-ancestor baseline'
+        required: true
+        type: string
+      first:
+        description: 'First side in odd numbered pairs; invert on repeat run'
+        required: true
+        type: choice
+        options:
+          - base
+          - candidate
+        default: base
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wirelog-paired-perf-diagnostic
+  cancel-in-progress: false
+
+jobs:
+  paired:
+    name: Paired CRDT/CSPA evidence
+    runs-on: [self-hosted, Linux, X64, wirelog-perf]
+    timeout-minutes: 150
+    env:
+      BASE_SHA: ${{ github.event_name == 'push' && '8d91c2da2b188b94af5b9f1da21c569d80ccb387' || inputs.base_sha }}
+      CANDIDATE_SHA: ${{ github.sha }}
+      FIRST_SIDE: ${{ github.event_name == 'push' && (github.run_attempt == '1' && 'base' || 'candidate') || inputs.first }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Initialize durable evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p perf-artifacts/paired
+          printf 'run=%s attempt=%s candidate=%s base=%s first=%s\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$CANDIDATE_SHA" \
+            "$BASE_SHA" "$FIRST_SIDE" > perf-artifacts/paired/dispatch.txt
+          pair_root="$RUNNER_TEMP/wirelog-paired-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          printf 'BASE_SRC=%s/base\nCANDIDATE_SRC=%s/candidate\nBASE_BUILD=%s/base-build\nCANDIDATE_BUILD=%s/candidate-build\n' \
+            "$pair_root" "$pair_root" "$pair_root" "$pair_root" >> "$GITHUB_ENV"
+
+      - name: Validate and check out exact revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$FIRST_SIDE" == base || "$FIRST_SIDE" == candidate ]]
+          [[ "$BASE_SHA" != "$CANDIDATE_SHA" ]]
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          git fetch --no-tags origin main
+          git cat-file -e "$BASE_SHA^{commit}"
+          git merge-base --is-ancestor "$BASE_SHA" FETCH_HEAD
+          git worktree add --detach "$BASE_SRC" "$BASE_SHA"
+          git worktree add --detach "$CANDIDATE_SRC" "$CANDIDATE_SHA"
+          test "$(git -C "$BASE_SRC" rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C "$CANDIDATE_SRC" rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test -z "$(git -C "$BASE_SRC" status --porcelain --untracked-files=no)"
+          test -z "$(git -C "$CANDIDATE_SRC" status --porcelain --untracked-files=no)"
+          {
+            uname -srmo
+            gcc --version | head -n 1
+            lscpu | sed -n '1,25p'
+            taskset -pc $$
+            git -C "$BASE_SRC" rev-parse HEAD HEAD^{tree}
+            git -C "$CANDIDATE_SRC" rev-parse HEAD HEAD^{tree}
+          } > perf-artifacts/paired/revisions-host.txt
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+
+      - name: Build both production profiles
+        shell: bash
+        env:
+          CC: gcc
+        run: |
+          set -euo pipefail
+          meson setup "$BASE_BUILD" "$BASE_SRC" --buildtype=release \
+            -Dwirelog_log_max_level=trace -Dtests=true -DmbedTLS=disabled \
+            2>&1 | tee perf-artifacts/paired/base-configure.log
+          meson setup "$CANDIDATE_BUILD" "$CANDIDATE_SRC" --buildtype=release \
+            -Dwirelog_log_max_level=trace -Dtests=true -DmbedTLS=disabled \
+            2>&1 | tee perf-artifacts/paired/candidate-configure.log
+          meson compile -C "$BASE_BUILD" bench_flowlog test_crdt_perf_gate \
+            test_cspa_perf_gate 2>&1 | tee perf-artifacts/paired/base-build.log
+          meson compile -C "$CANDIDATE_BUILD" bench_flowlog \
+            test_crdt_perf_gate test_cspa_perf_gate \
+            2>&1 | tee perf-artifacts/paired/candidate-build.log
+
+      - name: Verify matched source, data, and effective build profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/perf/verify-paired-builds.py profile \
+            --base-source "$BASE_SRC" --base-build "$BASE_BUILD" \
+            --base-sha "$BASE_SHA" --candidate-source "$CANDIDATE_SRC" \
+            --candidate-build "$CANDIDATE_BUILD" \
+            --candidate-sha "$CANDIDATE_SHA" \
+            --output perf-artifacts/paired/preflight.json
+
+      - name: Verify both trees on full correctness fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          for side in base candidate; do
+            if [[ "$side" == base ]]; then
+              build="$BASE_BUILD"
+            else
+              build="$CANDIDATE_BUILD"
+            fi
+            env WIRELOG_PERF_GATE=1 WIRELOG_GATE_CORRECTNESS_ONLY=1 \
+              WIRELOG_CRDT_DATA_DIR="$CANDIDATE_SRC/bench/data/crdt" \
+              taskset -c 0 "$build/tests/test_crdt_perf_gate" \
+              2>&1 | tee "perf-artifacts/paired/$side-crdt-correctness.log"
+            python scripts/perf/verify-paired-builds.py correctness \
+              --workload crdt \
+              --log "perf-artifacts/paired/$side-crdt-correctness.log"
+            env WIRELOG_PERF_GATE=1 WIRELOG_GATE_CORRECTNESS_ONLY=1 \
+              WIRELOG_CSPA_DATA_DIR="$CANDIDATE_SRC/bench/data/cspa" \
+              taskset -c 0 "$build/tests/test_cspa_perf_gate" \
+              2>&1 | tee "perf-artifacts/paired/$side-cspa-correctness.log"
+            python scripts/perf/verify-paired-builds.py correctness \
+              --workload cspa \
+              --log "perf-artifacts/paired/$side-cspa-correctness.log"
+          done
+
+      - name: Collect serial paired samples
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/perf/paired-benchmark.py \
+            --base-sha "$BASE_SHA" --candidate-sha "$CANDIDATE_SHA" \
+            --base-binary "$BASE_BUILD/bench/bench_flowlog" \
+            --candidate-binary "$CANDIDATE_BUILD/bench/bench_flowlog" \
+            --data-root "$CANDIDATE_SRC/bench/data" \
+            --out-dir perf-artifacts/paired/samples \
+            --cpu 0 --first "$FIRST_SIDE" --timeout 180
+
+      - name: Upload all paired diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: perf-paired-${{ github.run_id }}-${{ github.run_attempt }}
+          path: perf-artifacts/paired
+          if-no-files-found: error
+          retention-days: 35
+
+      - name: Summarize diagnostic status
+        if: always()
+        shell: bash
+        run: |
+          echo '## Paired CRDT/CSPA diagnostic' >> "$GITHUB_STEP_SUMMARY"
+          echo 'This run does not change or replace the perf gate.' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f perf-artifacts/paired/samples/summary.json ]; then
+            cat perf-artifacts/paired/samples/summary.json >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'No complete sample summary; inspect uploaded evidence.' >> "$GITHUB_STEP_SUMMARY"
+          fi
