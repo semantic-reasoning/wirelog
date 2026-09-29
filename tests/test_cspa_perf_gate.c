@@ -506,6 +506,10 @@ main(void)
     double mean = wl_perf_mean_ms(trials_ms, (size_t)TRIALS);
     double stdev = wl_perf_stdev_ms(trials_ms, (size_t)TRIALS, mean);
     double cov = (mean > 0.0) ? stdev / mean : 0.0;
+    fprintf(stderr, "test_cspa_perf_gate: raw_ms =");
+    for (int i = 0; i < TRIALS; i++)
+        fprintf(stderr, " %.1f", trials_ms[i]);
+    fputc('\n', stderr);
     double median = wl_perf_median_ms_inplace(trials_ms, (size_t)TRIALS);
 
     fprintf(stderr,
