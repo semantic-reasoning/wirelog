@@ -658,6 +658,11 @@ int wl_columnar_relation_test_commit_replacement_locked(col_rel_t *dst,
     col_rel_replacement_t *replacement);
 #endif
 
+#ifdef WL_SESSION_TEST_HOOKS
+void wl_columnar_relation_test_fail_next_governed_timestamp_alloc(void);
+bool wl_columnar_relation_test_governed_timestamp_alloc_pending(void);
+#endif
+
 #ifdef WL_TEST_CONSOLIDATE_HOOK
 /* Test-only probes for the two consolidation COW windows. */
 typedef enum wl_columnar_consolidation_test_stage {

@@ -7382,6 +7382,8 @@ extern int (*wl_columnar_eval_test_before_worker_dedup)(wl_col_session_t *,
     col_rel_t *, col_rel_t *, col_rel_t *);
 extern void (*wl_columnar_eval_test_after_worker_dedup)(wl_col_session_t *,
     col_rel_t *, int);
+extern void (*wl_columnar_eval_test_after_worker_private_error)(
+    wl_col_session_t *, col_rel_t *, col_rel_t *, col_rel_t *, int);
 
 static atomic_int wide_rollback_worker = ATOMIC_VAR_INIT(-1);
 static col_rel_t *wide_rollback_source;
@@ -7398,6 +7400,11 @@ static bool wide_merge_provisional[2], wide_merge_private_seen;
 static bool wide_merge_after_seen, wide_merge_source_unchanged;
 static bool wide_merge_fault_consumed;
 static int wide_merge_after_rc;
+static col_rel_t *wide_timestamp_image, *wide_timestamp_delta;
+static bool wide_timestamp_prepared, wide_timestamp_armed;
+static bool wide_timestamp_error_seen, wide_timestamp_fault_consumed;
+static bool wide_timestamp_source_unchanged, wide_timestamp_image_unpublished;
+static int wide_timestamp_error_rc;
 #ifdef _MSC_VER
 #define WL_WIDE_MERGE_THREAD_LOCAL __declspec(thread)
 #else
@@ -7613,6 +7620,60 @@ wide_merge_after(wl_col_session_t *worker, col_rel_t *source, int rc)
         wide_rollback_fingerprint(source) == wide_rollback_before;
 }
 
+static int
+wide_timestamp_before(wl_col_session_t *worker, col_rel_t *source,
+    col_rel_t *image, col_rel_t *delta)
+{
+    if ((int)worker->worker_id != atomic_load_explicit(
+            &wide_rollback_worker, memory_order_acquire)
+        || source != wide_rollback_source)
+        return 0;
+    if (!image || image == source || !delta || !image->dedup_slots
+        || image->timestamps || image->capacity == 0
+        || !image->memory_governor
+        || wide_rollback_fingerprint(source) != wide_rollback_before)
+        return EINVAL;
+    wide_timestamp_image = image;
+    wide_timestamp_delta = delta;
+    wide_timestamp_prepared = true;
+    return 0;
+}
+
+static void
+wide_timestamp_after_dedup(wl_col_session_t *worker, col_rel_t *source,
+    int rc)
+{
+    if ((int)worker->worker_id != atomic_load_explicit(
+            &wide_rollback_worker, memory_order_acquire)
+        || source != wide_rollback_source)
+        return;
+    if (rc != 0 || !wide_timestamp_prepared || !wide_timestamp_image
+        || !wide_timestamp_delta || wide_timestamp_delta->nrows == 0
+        || wide_timestamp_image->timestamps)
+        return;
+    wide_timestamp_armed = true;
+    wl_columnar_relation_test_fail_next_governed_timestamp_alloc();
+}
+
+static void
+wide_timestamp_after_error(wl_col_session_t *worker, col_rel_t *source,
+    col_rel_t *image, col_rel_t *delta, int rc)
+{
+    if ((int)worker->worker_id != atomic_load_explicit(
+            &wide_rollback_worker, memory_order_acquire)
+        || source != wide_rollback_source)
+        return;
+    wide_timestamp_error_seen = true;
+    wide_timestamp_error_rc = rc;
+    wide_timestamp_fault_consumed =
+        !wl_columnar_relation_test_governed_timestamp_alloc_pending();
+    wide_timestamp_image_unpublished = image == wide_timestamp_image
+        && delta == wide_timestamp_delta && image != source
+        && image && !image->timestamps && image->timestamp_capacity == 0;
+    wide_timestamp_source_unchanged =
+        wide_rollback_fingerprint(source) == wide_rollback_before;
+}
+
 typedef struct {
     uint32_t width;
     uint32_t seen;
@@ -7643,7 +7704,9 @@ wide_rollback_collect(const char *relation, const int64_t *row,
 static void
 test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
 {
-    TEST(fault_mode == 3 ?
+    TEST(fault_mode == 4 ?
+        "wide TDD worker timestamp allocation failure and retry"
+        : fault_mode == 3 ?
         "wide TDD worker merge allocation failure and session retry"
         : fault_mode == 2 ?
         "wide TDD worker dedup growth allocator failure and retry"
@@ -7719,6 +7782,11 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
     wide_merge_private_seen = wide_merge_after_seen = false;
     wide_merge_source_unchanged = wide_merge_fault_consumed = false;
     wide_merge_after_rc = 0;
+    wide_timestamp_image = wide_timestamp_delta = NULL;
+    wide_timestamp_prepared = wide_timestamp_armed = false;
+    wide_timestamp_error_seen = wide_timestamp_fault_consumed = false;
+    wide_timestamp_source_unchanged = wide_timestamp_image_unpublished = false;
+    wide_timestamp_error_rc = 0;
     wl_columnar_eval_test_before_worker_delta = fault_mode == 3
         ? wide_merge_before_delta : NULL;
     wl_columnar_eval_test_before_worker_image = wide_rollback_before_image;
@@ -7727,9 +7795,13 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
     wl_columnar_eval_test_after_worker_private = fault_mode == 0
         ? wide_rollback_after_private : NULL;
     wl_columnar_eval_test_before_worker_dedup = fault_mode == 2
-        ? wide_dedup_before : fault_mode == 3 ? wide_merge_before : NULL;
+        ? wide_dedup_before : fault_mode == 3 ? wide_merge_before
+        : fault_mode == 4 ? wide_timestamp_before : NULL;
     wl_columnar_eval_test_after_worker_dedup = fault_mode == 2
-        ? wide_dedup_after : fault_mode == 3 ? wide_merge_after : NULL;
+        ? wide_dedup_after : fault_mode == 3 ? wide_merge_after
+        : fault_mode == 4 ? wide_timestamp_after_dedup : NULL;
+    wl_columnar_eval_test_after_worker_private_error = fault_mode == 4
+        ? wide_timestamp_after_error : NULL;
     int rc = wl_session_snapshot(session, wide_rollback_collect, &rows);
     wl_columnar_eval_test_before_worker_image = NULL;
     wl_columnar_eval_test_after_worker_image = NULL;
@@ -7737,9 +7809,16 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
     wl_columnar_eval_test_before_worker_delta = NULL;
     wl_columnar_eval_test_before_worker_dedup = NULL;
     wl_columnar_eval_test_after_worker_dedup = NULL;
+    wl_columnar_eval_test_after_worker_private_error = NULL;
     WIDE_CHECK(rc == ENOMEM
         && rows.count == 0
-        && (fault_mode == 3 ? (wide_merge_private_seen
+        && (fault_mode == 4 ? (wide_timestamp_prepared
+        && wide_timestamp_armed && wide_timestamp_error_seen
+        && wide_timestamp_error_rc == rc
+        && wide_timestamp_fault_consumed
+        && wide_timestamp_image_unpublished
+        && wide_timestamp_source_unchanged)
+        : fault_mode == 3 ? (wide_merge_private_seen
         && wide_merge_after_seen && wide_merge_after_rc == rc
         && wide_merge_fault_consumed && wide_merge_source_unchanged)
         : fault_mode == 2 ? (wide_dedup_seeded
@@ -7764,6 +7843,7 @@ cleanup:
     wl_columnar_eval_test_after_worker_private = NULL;
     wl_columnar_eval_test_before_worker_dedup = NULL;
     wl_columnar_eval_test_after_worker_dedup = NULL;
+    wl_columnar_eval_test_after_worker_private_error = NULL;
     wide_rollback_prep_fault = 0;
     col_rel_destroy(unowned);
     free(values);
@@ -14138,6 +14218,8 @@ main(void)
     test_tdd_wide_worker_private_rollback(9, 2);
     test_tdd_wide_worker_private_rollback(9, 3);
     test_tdd_wide_worker_private_rollback(32, 3);
+    test_tdd_wide_worker_private_rollback(9, 4);
+    test_tdd_wide_worker_private_rollback(32, 4);
     test_worker_frame_admission(false);
     test_worker_frame_admission(true);
     test_worker_frame_retention(8, 0, true, false, 0);

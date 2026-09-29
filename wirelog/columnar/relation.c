@@ -30,6 +30,29 @@ static wl_atomic_u64 wl_next_relation_identity = 1u;
 wl_columnar_append_transition_hook_t wl_columnar_append_transition_hook;
 #endif
 
+#ifdef WL_SESSION_TEST_HOOKS
+#ifdef _MSC_VER
+#define WL_RELATION_TIMESTAMP_TEST_THREAD_LOCAL __declspec(thread)
+#else
+#define WL_RELATION_TIMESTAMP_TEST_THREAD_LOCAL _Thread_local
+#endif
+static WL_RELATION_TIMESTAMP_TEST_THREAD_LOCAL bool
+wl_columnar_relation_fail_next_governed_timestamp_alloc;
+#undef WL_RELATION_TIMESTAMP_TEST_THREAD_LOCAL
+
+void
+wl_columnar_relation_test_fail_next_governed_timestamp_alloc(void)
+{
+    wl_columnar_relation_fail_next_governed_timestamp_alloc = true;
+}
+
+bool
+wl_columnar_relation_test_governed_timestamp_alloc_pending(void)
+{
+    return wl_columnar_relation_fail_next_governed_timestamp_alloc;
+}
+#endif
+
 #ifdef WL_TEST_SET_HOOK
 wl_columnar_set_transition_hook_t wl_columnar_set_transition_hook;
 #endif
@@ -1986,8 +2009,15 @@ col_rel_enable_timestamps_locked(col_rel_t *r)
         goto fail;
     }
 #endif
+#ifdef WL_SESSION_TEST_HOOKS
+    bool fail_alloc = wl_columnar_relation_fail_next_governed_timestamp_alloc;
+    wl_columnar_relation_fail_next_governed_timestamp_alloc = false;
+    timestamps = fail_alloc ? NULL : (col_delta_timestamp_t *)calloc(
+        r->capacity, sizeof(*timestamps));
+#else
     timestamps = (col_delta_timestamp_t *)calloc(
         r->capacity, sizeof(*timestamps));
+#endif
     if (!timestamps)
         goto fail;
     r->timestamps = timestamps;
