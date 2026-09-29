@@ -1748,14 +1748,12 @@ wl_columnar_session_tdd_debug_decision(const wl_plan_stratum_t *sp,
      * unsupported relations are reported explicitly, not silently omitted. */
     if (sp) {
         for (uint32_t r = 0; r < sp->relation_count; r++) {
-            wl_columnar_eval_tdd_plan_manifest_t bindings;
-            int rc = wl_columnar_eval_tdd_plan_bindings(sp, r, &bindings);
+            uint32_t counts[3];
+            int rc = wl_columnar_eval_tdd_plan_binding_summary(sp, r, counts);
             fprintf(stderr,
                 "TDD bindings rel=%s status=%d alternatives=%u slices=%u reads=%u\n",
                 sp->relations[r].name ? sp->relations[r].name : "(null)", rc,
-                bindings.alternative_count, bindings.slice_count,
-                bindings.read_count);
-            wl_columnar_eval_tdd_plan_bindings_free(&bindings);
+                counts[0], counts[1], counts[2]);
         }
     }
 
