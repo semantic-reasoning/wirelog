@@ -7415,6 +7415,7 @@ static struct {
     wl_mutex_t mutex;
     wl_cond_t changed;
     bool initialized, failed, released, changed_budget, exact_fit;
+    bool overflow, pad_held, pad_released;
     bool prepared, after_seen, error_seen, image_unchanged;
     bool reservation_unchanged, source_unchanged, growth_succeeded;
     unsigned arrived;
@@ -7423,6 +7424,8 @@ static struct {
     wl_columnar_memory_governor_t *governor;
     wl_columnar_memory_mode_t saved_mode;
     uint64_t saved_limit, baseline, bytes, retained_bytes, token_bytes;
+    uint64_t pad_bytes;
+    wl_columnar_memory_reservation_t pad;
     uint64_t token_replacement, token_owner, token_state;
     uint8_t token_transition;
     const void *token_identity;
@@ -8215,9 +8218,19 @@ wide_timestamp_after_error(wl_col_session_t *worker, col_rel_t *source,
 static void
 wide_timestamp_admission_release(void)
 {
+    if (wide_timestamp_admission.pad_held) {
+        if (!wl_columnar_memory_rollback(&wide_timestamp_admission.pad)
+            || wl_columnar_memory_reserved(
+                wide_timestamp_admission.governor)
+                != wide_timestamp_admission.baseline)
+            wide_timestamp_admission.failed = true;
+        wide_timestamp_admission.pad_held = false;
+        wide_timestamp_admission.pad_released = true;
+    }
     if (wide_timestamp_admission.changed_budget) {
-        wide_timestamp_admission.governor->mode =
-            wide_timestamp_admission.saved_mode;
+        if (!wide_timestamp_admission.overflow)
+            wide_timestamp_admission.governor->mode =
+                wide_timestamp_admission.saved_mode;
         atomic_store_explicit(&wide_timestamp_admission.governor->usable_bytes,
             wide_timestamp_admission.saved_limit, memory_order_relaxed);
         wide_timestamp_admission.changed_budget = false;
@@ -8344,10 +8357,41 @@ wide_timestamp_admission_after_dedup(wl_col_session_t *worker,
         wl_mutex_unlock(&wide_timestamp_admission.mutex);
         return;
     }
-    wide_timestamp_admission.saved_mode =
-        wide_timestamp_admission.governor->mode;
+    if (!wide_timestamp_admission.overflow)
+        wide_timestamp_admission.saved_mode =
+            wide_timestamp_admission.governor->mode;
     wide_timestamp_admission.saved_limit = atomic_load_explicit(
         &wide_timestamp_admission.governor->usable_bytes, memory_order_relaxed);
+    if (wide_timestamp_admission.overflow) {
+        wide_timestamp_admission.pad_bytes = UINT64_MAX
+            - wide_timestamp_admission.baseline
+            - wide_timestamp_admission.bytes + 1u;
+        wl_columnar_memory_reservation_init(&wide_timestamp_admission.pad);
+        atomic_store_explicit(&wide_timestamp_admission.governor->usable_bytes,
+            UINT64_MAX, memory_order_relaxed);
+        wide_timestamp_admission.changed_budget = true;
+        wl_columnar_memory_admission_status_t status =
+            wl_columnar_memory_reserve_checked(
+                wide_timestamp_admission.governor,
+                wide_timestamp_admission.pad_bytes,
+                &wide_timestamp_admission.pad);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            wide_timestamp_admission_fail();
+            wl_mutex_unlock(&wide_timestamp_admission.mutex);
+            return;
+        }
+        wide_timestamp_admission.pad_held = true;
+        if (wl_columnar_memory_reserved(wide_timestamp_admission.governor)
+            != wide_timestamp_admission.baseline
+                + wide_timestamp_admission.pad_bytes) {
+            wide_timestamp_admission_fail();
+            wl_mutex_unlock(&wide_timestamp_admission.mutex);
+            return;
+        }
+        wl_mutex_unlock(&wide_timestamp_admission.mutex);
+        return;
+    }
     wide_timestamp_admission.governor->mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
     atomic_store_explicit(&wide_timestamp_admission.governor->usable_bytes,
         wide_timestamp_admission.baseline + wide_timestamp_admission.bytes
@@ -8366,7 +8410,8 @@ wide_timestamp_admission_after_error(wl_col_session_t *worker,
         return;
     wl_mutex_lock(&wide_timestamp_admission.mutex);
     wide_timestamp_admission.error_seen = true;
-    wide_timestamp_admission.image_unchanged = rc == ENOSPC
+    wide_timestamp_admission.image_unchanged =
+        rc == (wide_timestamp_admission.overflow ? EOVERFLOW : ENOSPC)
         && image == wide_timestamp_admission.image
         && delta == wide_timestamp_admission.delta
         && image && !image->timestamps && image->timestamp_capacity == 0;
@@ -8374,7 +8419,9 @@ wide_timestamp_admission_after_error(wl_col_session_t *worker,
         && wide_timestamp_admission.governor
         && wide_timestamp_admission_token_unchanged(image)
         && wl_columnar_memory_reserved(wide_timestamp_admission.governor)
-        == wide_timestamp_admission.baseline;
+        == wide_timestamp_admission.baseline
+            + (wide_timestamp_admission.overflow
+                ? wide_timestamp_admission.pad_bytes : 0u);
     wide_timestamp_admission.source_unchanged = source == wide_rollback_source
         && wide_rollback_fingerprint(source) == wide_rollback_before;
     wide_timestamp_admission_release();
@@ -8458,6 +8505,8 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
 {
     TEST(fault_mode == 8 ?
         "wide TDD worker stamped merge failure and session retry"
+        : fault_mode == 9 ?
+        "wide TDD worker timestamp governor overflow and retry"
         : fault_mode == 6 ?
         "wide TDD worker timestamp admission boundary and retry"
         : fault_mode == 7 ?
@@ -8523,6 +8572,7 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
     WIDE_CHECK(wl_session_create(wl_backend_columnar(), &plan, 2,
         &session) == 0, "create");
     if (fault_mode == 4 || fault_mode == 5 || fault_mode == 6
+        || fault_mode == 9
         || fault_mode == 7) {
         governor_ref = COL_SESSION(session)->memory_governor;
         WIDE_CHECK(governor_ref, "wide rollback governor");
@@ -8545,9 +8595,10 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
             WIDE_CHECK(false, "dedup rendezvous condition");
         }
     }
-    if (fault_mode == 6) {
+    if (fault_mode == 6 || fault_mode == 9) {
         memset(&wide_timestamp_admission, 0,
             sizeof(wide_timestamp_admission));
+        wide_timestamp_admission.overflow = fault_mode == 9;
         WIDE_CHECK(wl_mutex_init(&wide_timestamp_admission.mutex) == 0,
             "timestamp rendezvous mutex");
         wide_timestamp_admission.initialized = true;
@@ -8628,7 +8679,7 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
     wide_timestamp_capture_arr = fault_mode == 2 || fault_mode == 3
         || fault_mode == 8
         || fault_mode == 4 || fault_mode == 5
-        || fault_mode == 6 || fault_mode == 7;
+        || fault_mode == 6 || fault_mode == 7 || fault_mode == 9;
     wl_columnar_eval_test_before_worker_delta = fault_mode == 3
         || fault_mode == 8
         || fault_mode == 7
@@ -8637,7 +8688,7 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
     wl_columnar_eval_test_subpass_boundary = fault_mode == 2
         || fault_mode == 3 || fault_mode == 4 || fault_mode == 5
         || fault_mode == 8
-        || fault_mode == 6 || fault_mode == 7
+        || fault_mode == 6 || fault_mode == 7 || fault_mode == 9
         ? wide_timestamp_after_subpass : NULL;
     wl_columnar_eval_test_after_worker_image = fault_mode == 1
         ? wide_rollback_after_image : NULL;
@@ -8648,9 +8699,11 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
         ? wide_dedup_before : fault_mode == 3 || fault_mode == 8
         ? wide_merge_before
         : fault_mode == 7 ? wide_radix_before
-        : fault_mode == 6 ? wide_timestamp_admission_before
+        : fault_mode == 6 || fault_mode == 9
+        ? wide_timestamp_admission_before
         : fault_mode == 4 ? wide_timestamp_before : NULL;
     wl_columnar_eval_test_after_worker_dedup = fault_mode == 6
+        || fault_mode == 9
         ? wide_timestamp_admission_after_dedup : fault_mode == 5
         ? wide_dedup_admission_after : fault_mode == 2
         ? wide_dedup_after : fault_mode == 3 || fault_mode == 8
@@ -8660,6 +8713,7 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
     wl_columnar_radix_admission_test_hook = fault_mode == 7
         ? wide_radix_transition : NULL;
     wl_columnar_eval_test_after_worker_private_error = fault_mode == 6
+        || fault_mode == 9
         ? wide_timestamp_admission_after_error : fault_mode == 4
         ? wide_timestamp_after_error : NULL;
     int rc = wl_session_snapshot(session, wide_rollback_collect, &rows);
@@ -8672,7 +8726,8 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
     wl_columnar_eval_test_after_worker_dedup = NULL;
     wl_columnar_eval_test_after_worker_private_error = NULL;
     wl_columnar_radix_admission_test_hook = NULL;
-    WIDE_CHECK(rc == (fault_mode == 5 || fault_mode == 6
+    WIDE_CHECK(rc == (fault_mode == 9 ? EOVERFLOW
+        : fault_mode == 5 || fault_mode == 6
         || fault_mode == 7 ? ENOSPC : ENOMEM)
         && rows.count == 0
         && (fault_mode == 7 ? (wide_radix_admission.prepared
@@ -8690,7 +8745,8 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
         && wide_timestamp_arr_built && wide_timestamp_boundary_seen
         && wide_timestamp_arr_unchanged
         && wide_timestamp_boundary_source_unchanged)
-        : fault_mode == 6 ? (wide_timestamp_admission.prepared
+        : fault_mode == 6 || fault_mode == 9
+        ? (wide_timestamp_admission.prepared
         && wide_timestamp_admission.arrived == 2
         && wide_timestamp_admission.after_seen
         && wide_timestamp_admission.after_rc == 0
@@ -8698,6 +8754,7 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
         && wide_timestamp_admission.image_unchanged
         && wide_timestamp_admission.reservation_unchanged
         && wide_timestamp_admission.source_unchanged
+        && (fault_mode != 9 || wide_timestamp_admission.pad_released)
         && !wide_timestamp_admission.failed
         && wide_timestamp_arr_built && wide_timestamp_boundary_seen
         && wide_timestamp_arr_unchanged
@@ -8919,7 +8976,8 @@ cleanup:
             wide_dedup_admission.saved_limit, memory_order_relaxed);
         wide_dedup_admission.changed_budget = false;
     }
-    if (fault_mode == 6 && wide_timestamp_admission.initialized) {
+    if ((fault_mode == 6 || fault_mode == 9)
+        && wide_timestamp_admission.initialized) {
         wl_mutex_lock(&wide_timestamp_admission.mutex);
         wide_timestamp_admission_release();
         wl_mutex_unlock(&wide_timestamp_admission.mutex);
@@ -15327,6 +15385,7 @@ main(void)
     test_tdd_wide_worker_private_rollback(32, 5);
     test_tdd_wide_worker_private_rollback(9, 6);
     test_tdd_wide_worker_private_rollback(32, 6);
+    test_tdd_wide_worker_private_rollback(9, 9);
     test_tdd_wide_worker_private_rollback(9, 7);
     test_tdd_wide_worker_private_rollback(32, 7);
     test_worker_frame_admission(false);
