@@ -94,7 +94,14 @@ wl_columnar_relation_test_rollback_cleanup_was_ordered(void)
     return wl_columnar_relation_test_rollback_cleanup_observed;
 }
 
-static bool wl_columnar_relation_fail_governed_copy_payload_alloc;
+#ifdef _MSC_VER
+#define WL_RELATION_TEST_THREAD_LOCAL __declspec(thread)
+#else
+#define WL_RELATION_TEST_THREAD_LOCAL _Thread_local
+#endif
+static WL_RELATION_TEST_THREAD_LOCAL bool
+wl_columnar_relation_fail_governed_copy_payload_alloc;
+#undef WL_RELATION_TEST_THREAD_LOCAL
 static bool wl_columnar_relation_fail_mutable_image_overflow;
 void (*wl_columnar_relation_test_after_governed_copy_admission)(
     const col_rel_t *);
@@ -104,6 +111,12 @@ void
 wl_columnar_relation_test_fail_next_governed_copy_payload_alloc(void)
 {
     wl_columnar_relation_fail_governed_copy_payload_alloc = true;
+}
+
+bool
+wl_columnar_relation_test_governed_copy_payload_alloc_pending(void)
+{
+    return wl_columnar_relation_fail_governed_copy_payload_alloc;
 }
 
 void

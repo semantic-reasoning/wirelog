@@ -7376,11 +7376,17 @@ cleanup:
 
 extern int (*wl_columnar_eval_test_after_worker_private)(wl_col_session_t *,
     col_rel_t *, col_rel_t *, col_rel_t *);
+extern void (*wl_columnar_eval_test_after_worker_image)(wl_col_session_t *,
+    col_rel_t *, int);
 
 static atomic_int wide_rollback_worker = ATOMIC_VAR_INIT(-1);
 static col_rel_t *wide_rollback_source;
 static uint64_t wide_rollback_before;
 static bool wide_rollback_private_seen, wide_rollback_source_unchanged;
+static bool wide_rollback_prep_fault;
+static bool wide_rollback_prep_seen, wide_rollback_prep_source_unchanged;
+static bool wide_rollback_prep_fault_consumed;
+static int wide_rollback_prep_rc;
 
 static uint64_t
 wide_rollback_fingerprint(const col_rel_t *source)
@@ -7426,6 +7432,25 @@ wide_rollback_before_image(wl_col_session_t *worker, col_rel_t *source,
         return;
     wide_rollback_source = source;
     wide_rollback_before = wide_rollback_fingerprint(source);
+    if (wide_rollback_prep_fault)
+        wl_columnar_relation_test_fail_next_governed_copy_payload_alloc();
+}
+
+static void
+wide_rollback_after_image(wl_col_session_t *worker, col_rel_t *source,
+    int rc)
+{
+    if ((int)worker->worker_id != atomic_load_explicit(
+            &wide_rollback_worker, memory_order_acquire)
+        || source != wide_rollback_source)
+        return;
+    wide_rollback_prep_seen = true;
+    wide_rollback_prep_rc = rc;
+    wide_rollback_prep_fault_consumed =
+        !wl_columnar_relation_test_governed_copy_payload_alloc_pending();
+    wl_columnar_relation_test_clear_governed_copy_payload_alloc();
+    wide_rollback_prep_source_unchanged =
+        wide_rollback_fingerprint(source) == wide_rollback_before;
 }
 
 static int
@@ -7471,9 +7496,11 @@ wide_rollback_collect(const char *relation, const int64_t *row,
 }
 
 static void
-test_tdd_wide_worker_private_rollback(uint32_t width)
+test_tdd_wide_worker_private_rollback(uint32_t width, bool prep_fault)
 {
-    TEST("wide TDD worker rollback after private consolidation and retry");
+    TEST(prep_fault ?
+        "wide TDD worker private image allocation failure and retry"
+        : "wide TDD worker rollback after private consolidation and retry");
     uint32_t key = 0;
     uint32_t projection[32];
     wirelog_column_type_t types[32];
@@ -7532,20 +7559,36 @@ test_tdd_wide_worker_private_rollback(uint32_t width)
     atomic_store_explicit(&wide_rollback_worker, -1, memory_order_release);
     wide_rollback_source = NULL;
     wide_rollback_private_seen = wide_rollback_source_unchanged = false;
+    wide_rollback_prep_fault = prep_fault;
+    wide_rollback_prep_seen = wide_rollback_prep_source_unchanged = false;
+    wide_rollback_prep_fault_consumed = false;
+    wide_rollback_prep_rc = 0;
     wl_columnar_eval_test_before_worker_image = wide_rollback_before_image;
-    wl_columnar_eval_test_after_worker_private = wide_rollback_after_private;
+    wl_columnar_eval_test_after_worker_image = prep_fault
+        ? wide_rollback_after_image : NULL;
+    wl_columnar_eval_test_after_worker_private = prep_fault
+        ? NULL : wide_rollback_after_private;
     int rc = wl_session_snapshot(session, wide_rollback_collect, &rows);
     wl_columnar_eval_test_before_worker_image = NULL;
+    wl_columnar_eval_test_after_worker_image = NULL;
     wl_columnar_eval_test_after_worker_private = NULL;
-    WIDE_CHECK(rc == ENOMEM && rows.count == 0
-        && wide_rollback_private_seen && wide_rollback_source_unchanged,
-        "late private failure changed source or published output");
+    WIDE_CHECK(rc == ENOMEM
+        && rows.count == 0
+        && (prep_fault ? (wide_rollback_prep_seen
+        && wide_rollback_prep_rc == rc
+        && wide_rollback_prep_fault_consumed
+        && wide_rollback_prep_source_unchanged)
+            : (wide_rollback_private_seen
+        && wide_rollback_source_unchanged)),
+        "private failure changed source or published output");
     WIDE_CHECK(wl_session_snapshot(session, wide_rollback_collect,
         &rows) == 0 && rows.count == 4 && rows.seen == 15u
         && !rows.invalid, "retry lost or duplicated wide worker rows");
 cleanup:
     wl_columnar_eval_test_before_worker_image = NULL;
+    wl_columnar_eval_test_after_worker_image = NULL;
     wl_columnar_eval_test_after_worker_private = NULL;
+    wide_rollback_prep_fault = 0;
     col_rel_destroy(unowned);
     free(values);
     wl_session_destroy(session);
@@ -13913,8 +13956,9 @@ main(void)
         test_tdd_ordinary_frame_gates(8, mode);
     }
     test_tdd_ordinary_frame_gates(2, 5);
-    test_tdd_wide_worker_private_rollback(9);
-    test_tdd_wide_worker_private_rollback(32);
+    test_tdd_wide_worker_private_rollback(9, 0);
+    test_tdd_wide_worker_private_rollback(32, 0);
+    test_tdd_wide_worker_private_rollback(32, true);
     test_worker_frame_admission(false);
     test_worker_frame_admission(true);
     test_worker_frame_retention(8, 0, true, false, 0);

@@ -2042,6 +2042,8 @@ void (*wl_columnar_eval_test_after_worker_delta)(wl_col_session_t *,
     col_rel_t *, int);
 void (*wl_columnar_eval_test_before_worker_image)(wl_col_session_t *,
     col_rel_t *, col_rel_t *);
+void (*wl_columnar_eval_test_after_worker_image)(wl_col_session_t *,
+    col_rel_t *, int);
 int (*wl_columnar_eval_test_after_worker_private)(wl_col_session_t *,
     col_rel_t *, col_rel_t *, col_rel_t *);
 #endif
@@ -2433,6 +2435,10 @@ tdd_worker_subpass_fn(void *arg)
 #endif
         col_rel_mutable_image_t image_txn = { 0 };
         int rc2 = col_rel_mutable_image_prepare(r, &image_txn);
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_eval_test_after_worker_image)
+            wl_columnar_eval_test_after_worker_image(sess, r, rc2);
+#endif
         col_rel_t *image = col_rel_mutable_image_get(&image_txn);
         if (rc2 == 0 && !image)
             rc2 = EBUSY;
