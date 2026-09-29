@@ -8,6 +8,20 @@
 
 static int failures;
 
+struct writer_move_thread_arg {
+    wl_columnar_source_access_writer_t *dst;
+    wl_columnar_source_access_writer_t *src;
+    int result;
+};
+
+static void *
+writer_move_on_thread(void *opaque)
+{
+    struct writer_move_thread_arg *arg = opaque;
+    arg->result = wl_columnar_source_access_writer_move(arg->dst, arg->src);
+    return NULL;
+}
+
 #define CHECK(condition, message) do { \
             if (!(condition)) { printf("FAIL: %s\n", message); failures++; \
                                 return; } \
@@ -257,6 +271,53 @@ test_lifecycle(void)
         "writer token reuse rejected");
     CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
         "writer release");
+}
+
+static void
+test_writer_move(void)
+{
+    wl_columnar_source_access_gate_t gate = { 0 }, descriptor = { 0 };
+    wl_columnar_source_access_writer_t src = { 0 }, dst = { 0 };
+    wl_columnar_source_access_writer_t occupied = { 0 }, copy;
+    struct writer_move_thread_arg arg = { &dst, &src, 0 };
+    wl_thread_t thread;
+    wl_columnar_source_access_gate_init(&gate);
+    wl_columnar_source_access_gate_init(&descriptor);
+    CHECK(wl_columnar_source_access_gate_reader_acquire(&descriptor) == 0,
+        "writer move secondary setup");
+    CHECK(wl_columnar_source_access_writer_acquire(&gate, &src) == 0,
+        "writer move source setup");
+    src.secondary_owner = &descriptor;
+    CHECK(wl_columnar_source_access_writer_move(&src, &src) == EINVAL,
+        "writer self move rejected");
+    copy = src;
+    CHECK(wl_columnar_source_access_writer_move(&dst, &copy) == EINVAL,
+        "copied writer move rejected");
+    occupied.owner = &gate;
+    CHECK(wl_columnar_source_access_writer_move(&occupied, &src) == EINVAL,
+        "occupied destination rejected");
+    occupied.owner = NULL;
+    CHECK(wl_thread_create(&thread, writer_move_on_thread, &arg) == 0
+        && wl_thread_join(&thread) == 0 && arg.result == EINVAL,
+        "cross-thread writer move rejected");
+    atomic_store_explicit(&gate.state, 0, memory_order_release);
+    CHECK(wl_columnar_source_access_writer_move(&dst, &src) == EBUSY,
+        "writer move requires held gate");
+    atomic_store_explicit(&gate.state, WL_COLUMNAR_SOURCE_ACCESS_WRITER,
+        memory_order_release);
+    CHECK(wl_columnar_source_access_writer_move(&dst, &src) == 0,
+        "writer move succeeds");
+    CHECK(dst.identity == (uintptr_t)&dst && dst.owner == &gate
+        && dst.secondary_owner == &descriptor && src.owner == NULL,
+        "writer move preserves owner and secondary gate");
+    CHECK(wl_columnar_source_access_writer_release(&src) == EINVAL,
+        "moved source token cannot release");
+    CHECK(wl_columnar_source_access_writer_release(&dst) == 0,
+        "moved writer releases both gates once");
+    CHECK(wl_columnar_source_access_writer_release(&dst) == EINVAL
+        && atomic_load_explicit(&gate.state, memory_order_acquire) == 0
+        && atomic_load_explicit(&descriptor.state, memory_order_acquire) == 0,
+        "moved writer duplicate release rejected");
 }
 
 struct cross_thread_arg {
@@ -628,6 +689,7 @@ main(void)
 {
     printf("Source access gate tests (#1492)\n");
     test_lifecycle();
+    test_writer_move();
     test_invalid_and_cross_thread();
     test_reader_overflow();
     test_concurrent_readers();

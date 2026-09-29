@@ -2456,6 +2456,12 @@ col_rel_prepare_replacement_locked(col_rel_t *dst,
 void
 col_rel_commit_replacement_locked(col_rel_t *dst,
     col_rel_replacement_t *replacement);
+/* Publish identically, moving the still-held writer into a caller-owned
+ * zeroed token. The caller releases that token after its larger transaction. */
+void
+col_rel_commit_replacement_retain_writer_locked(col_rel_t *dst,
+    col_rel_replacement_t *replacement,
+    wl_columnar_source_access_writer_t *retained_writer);
 /* Release a prepared replacement and its writer; safe after any prepare error
  * and idempotent after commit. */
 void

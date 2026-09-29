@@ -465,7 +465,7 @@ measured by `bench/bench_intern.c`; baselines are in `docs/INTERN_PERF.md`
 21 + 4 + 5 + 19 + 1 + 1 + 1 + 37 + 5 + 7 + 3 = **104 atomic call sites**
 before the source-access contract below.
 
-### 5.13 `wirelog/columnar/source_access.h` — relation source gate (19 rows)
+### 5.13 `wirelog/columnar/source_access.h` — relation source gate (20 rows)
 
 This header-only gate protects relation descriptors and canonical source storage.
 It is linked into the production relation lifecycle and its gate state is zero-initialized.
@@ -477,6 +477,8 @@ The prepared cohort exchange first changes the source gate from the exact
 transferable-reader count to WRITER, then changes each descriptor gate from
 its exact cohort count to WRITER. Its release-order rollback and restore keep
 the source gate closed until every descriptor has its reader count again.
+Writer relocation checks the held WRITER state before rekeying an address-bound
+token; it neither changes the gate nor publishes relation data.
 The relation descriptor itself is still a raw caller-owned pointer: before
 `col_rel_destroy_checked()` or pool reset/reuse, callers must stop new
 operations from starting and drain/join existing operations that may enter
@@ -509,6 +511,7 @@ those slots and arena allocations are quiescent.
 | `source_access.h:wl_columnar_source_access_writer_acquire` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Linearize exclusive writer admission and retry spurious failure |
 | `source_access.h:wl_columnar_source_access_writer_release` | `gate->state` | `atomic_load_explicit` | acquire | Validate the writer state before terminal publication |
 | `source_access.h:wl_columnar_source_access_writer_release#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Publish writer payload completion and retry spurious failure |
+| `source_access.h:wl_columnar_source_access_writer_move` | `src->owner->state` | `atomic_load_explicit` | acquire | Confirm that the source token still holds WRITER before moving its address-bound ownership to another token |
 
 ### 5.14 `wirelog/columnar/relation.c` and `session.c` — alias ownership and pool promotion (21 rows)
 
@@ -544,7 +547,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#2` | `src->retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Promote a committed reservation only when the pool slot still owns it |
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
-104 + 19 + 21 = **144 atomic call sites**.
+104 + 20 + 21 = **145 atomic call sites**.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -581,11 +584,11 @@ gate -- which reports EINVAL after a commit that in fact succeeded.
 | Anchor (file:function[#N]) | Field | Op | Order | Justification |
 |---|---|---|---|---|
 | `relation.c:col_rel_replacement_old_reservation_valid` | `dst->retained_reservation.state` | `atomic_load_explicit` | acquire | Confirm the destination's retained reservation is still committed before staging over it; acquire pairs with the release that published the reservation, so the bytes it accounts are visible before the replacement plans their release |
-| `relation.c:col_rel_commit_replacement_locked` | `old.source_access.state` | `atomic_load_explicit` | acquire | Capture the outgoing descriptor's admission state before `*dst = *staged` overwrites it, so the writer lease the caller holds across prepare and commit survives the swap |
-| `relation.c:col_rel_commit_replacement_locked#2` | `old.descriptor_access.state` | `atomic_load_explicit` | acquire | Capture the outgoing descriptor's peer-reader gate for the same reason as the source gate above; without it `*dst = *staged` discards the descriptor reader the writer release is about to account for, and the commit reports EINVAL after publishing successfully |
-| `relation.c:col_rel_commit_replacement_locked#3` | `dst->storage_alias_borrows` | `atomic_store_explicit` | relaxed | The committed descriptor starts with no child aliases; relaxed because the borrow count is republished under the gate stores below, which order it |
-| `relation.c:col_rel_commit_replacement_locked#4` | `dst->source_access.state` | `atomic_store_explicit` | release | Republish the captured admission state onto the committed descriptor; the release orders every field written above it before another thread can observe the gate |
-| `relation.c:col_rel_commit_replacement_locked#5` | `dst->descriptor_access.state` | `atomic_store_explicit` | release | Republish the captured peer-reader gate so a descriptor reader taken before the swap is still counted when the writer lease is released |
+| `relation.c:col_rel_commit_replacement_retain_writer_locked` | `old.source_access.state` | `atomic_load_explicit` | acquire | Capture the outgoing descriptor's admission state before `*dst = *staged` overwrites it, so the writer lease the caller holds across prepare and commit survives the swap |
+| `relation.c:col_rel_commit_replacement_retain_writer_locked#2` | `old.descriptor_access.state` | `atomic_load_explicit` | acquire | Capture the outgoing descriptor's peer-reader gate for the same reason as the source gate above; without it `*dst = *staged` discards the descriptor reader later writer release must account for |
+| `relation.c:col_rel_commit_replacement_retain_writer_locked#3` | `dst->storage_alias_borrows` | `atomic_store_explicit` | relaxed | The committed descriptor starts with no child aliases; relaxed because the borrow count is republished under the gate stores below, which order it |
+| `relation.c:col_rel_commit_replacement_retain_writer_locked#4` | `dst->source_access.state` | `atomic_store_explicit` | release | Republish the captured admission state onto the committed descriptor; the release orders every field written above it before another thread can observe the gate |
+| `relation.c:col_rel_commit_replacement_retain_writer_locked#5` | `dst->descriptor_access.state` | `atomic_store_explicit` | release | Republish the captured peer-reader gate so a descriptor reader taken before the swap is still counted when the writer lease is eventually released |
 
 ### 5.15a `wirelog/columnar/relation.c` — mutable governed image (7 rows)
 
@@ -669,7 +672,7 @@ the committed token after publication and before a growth transaction.
 | `eval_dedup.c:wl_columnar_eval_dedup_test_fail_next_growth_alloc` | test-only fault flag | `atomic_store_explicit` | release | Arm one allocation refusal before a test invokes dedup growth; excluded from the production library |
 | `eval_dedup.c:wl_columnar_eval_dedup_set_grow` | test-only fault flag | `atomic_exchange_explicit` | acquire-release | Consume the one-shot fault safely when test workers grow dedup tables; excluded from the production library |
 
-The complete source audit now contains **205 atomic call sites**.
+The complete source audit now contains **206 atomic call sites**.
 
 ---
 

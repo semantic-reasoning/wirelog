@@ -484,4 +484,28 @@ wl_columnar_source_access_writer_release(
     return 0;
 }
 
+/* Relocate an exclusive writer without reopening its gate. Tokens are bound
+ * to their address, so a plain struct copy cannot transfer ownership. */
+static inline int
+wl_columnar_source_access_writer_move(
+    wl_columnar_source_access_writer_t *dst,
+    wl_columnar_source_access_writer_t *src)
+{
+    if (!dst || !src || dst == src || dst->owner || dst->secondary_owner
+        || dst->identity || dst->thread_valid
+        || src->identity != (uintptr_t)src || !src->owner
+        || !wl_columnar_source_access_writer_thread_equal(src))
+        return EINVAL;
+    if (atomic_load_explicit(&src->owner->state, memory_order_acquire)
+        != WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+        return EBUSY;
+    *dst = *src;
+    dst->identity = (uintptr_t)dst;
+    src->owner = NULL;
+    src->secondary_owner = NULL;
+    src->identity = 0;
+    src->thread_valid = false;
+    return 0;
+}
+
 #endif
