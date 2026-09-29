@@ -79,6 +79,15 @@ typedef void (*wl_mpsc_payload_destroy_fn)(void *payload);
  */
 typedef struct wl_mpsc_queue wl_mpsc_queue_t;
 
+/* A producer-owned lease on one unpublished ring slot.  Keep it on the
+ * owning worker thread; it is invalid after publish or cancel. */
+typedef struct {
+    wl_mpsc_queue_t *queue;
+    uint32_t worker_id;
+    uint32_t tail;
+    uint64_t generation;
+} wl_mpsc_reservation_t;
+
 /* Exact allocation footprint after the per-worker capacity is rounded to
  * the same power of two used by queue creation. */
 int wl_mpsc_queue_footprint_checked(uint32_t num_workers, uint32_t capacity,
@@ -150,6 +159,28 @@ wl_mpsc_queue_destroy(wl_mpsc_queue_t *q);
 int
 wl_mpsc_enqueue(wl_mpsc_queue_t *q, uint32_t worker_id,
     void *delta, uint32_t stratum, uint32_t rel_idx);
+
+/* Reserve one slot before a fallible source transaction.  A reservation is
+ * exclusive for its worker: regular enqueue and a second reserve fail until
+ * it is published or cancelled.  The consumer cannot see the reserved slot.
+ * The caller retains payload ownership until successful publication.
+ * Each call must be made by the same thread that owns worker_id. */
+int
+wl_mpsc_reserve(wl_mpsc_queue_t *q, uint32_t worker_id,
+    wl_mpsc_reservation_t *out);
+
+/* Cancel a live reservation without changing queue contents.  Returns -1
+ * for a stale, copied-after-use, or otherwise invalid reservation. */
+int
+wl_mpsc_reservation_cancel(wl_mpsc_reservation_t *reservation);
+
+/* Publish a complete message into a live reservation.  For a valid lease
+ * this operation cannot allocate or fail; it sets message.worker_id from the
+ * lease and transfers delta ownership to the queue.  Invalid leases return
+ * -1 without publishing anything. */
+int
+wl_mpsc_reservation_publish(wl_mpsc_reservation_t *reservation,
+    wl_delta_msg_t message);
 
 /**
  * wl_mpsc_dequeue:

@@ -66,6 +66,8 @@ typedef struct {
     wl_delta_msg_t *slots;    /* ring buffer of elements          */
     uint32_t capacity;        /* number of slots (power of 2)     */
     uint32_t mask;            /* capacity - 1, for index wrapping */
+    uint32_t lease_active;    /* producer-owned, unpublished slot  */
+    uint64_t lease_generation;
 
     /*
      * Pad to cache-line boundary (64B on x86-64).
@@ -75,7 +77,7 @@ typedef struct {
      * causing cache-line ping-pong between producer and consumer.
      * Cost: 3 x 64B per ring; benefit: 2-10x throughput improvement.
      */
-    uint32_t _pad_to_tail[12];
+    uint32_t _pad_to_tail[8];
 
     /*
      * tail: producer write cursor (64B offset, isolated cache line).
@@ -142,6 +144,8 @@ spsc_destroy(wl_spsc_queue_t *q)
 static int
 spsc_enqueue(wl_spsc_queue_t *q, wl_delta_msg_t item)
 {
+    if (q->lease_active)
+        return -1;
     /* Own cursor: relaxed load (no ordering needed for self-owned index). */
     uint32_t tail = WL_ATOMIC_LOAD_RELAXED(&q->tail);
 
@@ -318,6 +322,67 @@ wl_mpsc_enqueue(wl_mpsc_queue_t *q, uint32_t worker_id,
     msg.rel_idx = rel_idx;
 
     return spsc_enqueue(&q->workers[worker_id], msg);
+}
+
+int
+wl_mpsc_reserve(wl_mpsc_queue_t *q, uint32_t worker_id,
+    wl_mpsc_reservation_t *out)
+{
+    if (!q || !out || worker_id >= q->num_workers)
+        return -1;
+    wl_spsc_queue_t *ring = &q->workers[worker_id];
+    if (ring->lease_active)
+        return -1;
+    uint32_t tail = WL_ATOMIC_LOAD_RELAXED(&ring->tail);
+    uint32_t head = WL_ATOMIC_LOAD_ACQUIRE(&ring->head);
+    if (tail - head >= ring->capacity)
+        return -1;
+    ring->lease_active = 1;
+    ring->lease_generation++;
+    *out = (wl_mpsc_reservation_t){ q, worker_id, tail,
+                                    ring->lease_generation };
+    return 0;
+}
+
+static wl_spsc_queue_t *
+reservation_ring(wl_mpsc_reservation_t *reservation)
+{
+    if (!reservation || !reservation->queue
+        || reservation->worker_id >= reservation->queue->num_workers)
+        return NULL;
+    wl_spsc_queue_t *ring =
+        &reservation->queue->workers[reservation->worker_id];
+    if (!ring->lease_active
+        || ring->lease_generation != reservation->generation
+        || WL_ATOMIC_LOAD_RELAXED(&ring->tail) != reservation->tail)
+        return NULL;
+    return ring;
+}
+
+int
+wl_mpsc_reservation_cancel(wl_mpsc_reservation_t *reservation)
+{
+    wl_spsc_queue_t *ring = reservation_ring(reservation);
+    if (!ring)
+        return -1;
+    ring->lease_active = 0;
+    reservation->queue = NULL;
+    return 0;
+}
+
+int
+wl_mpsc_reservation_publish(wl_mpsc_reservation_t *reservation,
+    wl_delta_msg_t message)
+{
+    wl_spsc_queue_t *ring = reservation_ring(reservation);
+    if (!ring)
+        return -1;
+    message.worker_id = reservation->worker_id;
+    ring->slots[reservation->tail & ring->mask] = message;
+    WL_ATOMIC_STORE_RELEASE(&ring->tail, reservation->tail + 1u);
+    ring->lease_active = 0;
+    reservation->queue = NULL;
+    return 0;
 }
 
 int
