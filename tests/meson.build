@@ -935,6 +935,9 @@ if host_machine.system() == 'linux'
   test('perf_paired_benchmark_contract', py3,
        args: [meson.project_source_root() / 'scripts/perf/test-paired-benchmark.py'],
        suite: 'abi')
+  test('perf_paired_build_contract', py3,
+       args: [meson.project_source_root() / 'scripts/perf/test-verify-paired-builds.py'],
+       suite: 'abi')
 endif
 
 # Keep the longer Windows/MSVC build budget platform-specific; a global

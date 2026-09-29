@@ -26,3 +26,31 @@ expected correctness result and its existing CoV check passes, and each gate's
 largest median divided by its smallest median is at most 1.05. Otherwise,
 investigate runner stability and start a new complete campaign after the
 underlying cause changes; do not discard selected runs.
+
+## Paired regression diagnosis
+
+The manual `Paired Perf Diagnostic` workflow gathers non-gating CRDT and CSPA
+evidence when the current nightly medians and historical targets disagree.
+After the workflow reaches the default branch, dispatch it on the candidate
+branch with a full 40-character `base_sha` from `main`. The candidate is the
+dispatch ref's exact SHA. Run one campaign with `first=base` and another with
+`first=candidate`; wait for each run to finish before starting the next.
+During the #2022 pre-merge campaign, a temporary push trigger on the trusted
+`codex/2022-relative-perf` branch uses baseline
+`8d91c2da2b188b94af5b9f1da21c569d80ccb387`: the first attempt starts
+with the baseline, and rerunning the same workflow reverses the first side.
+Remove this temporary trigger after the evidence is collected. The workflow
+serializes its own campaigns on the
+shared `wirelog-perf` runner. Other tagged jobs can still create contention,
+so inspect every attempt's host observations before drawing conclusions.
+
+The workflow builds both revisions with the same resolved release/TRACE profile,
+verifies benchmark source and fixture hashes, and runs each revision's full
+CRDT and CSPA correctness fixture before timing. Each campaign records nine
+samples per side per workload, alternating which revision runs first. Its
+`perf-paired-<run>-<attempt>` artifact contains `preflight.json`, correctness
+logs, build logs, `samples/metadata.json`, every warmup and trial in
+`samples/attempts.jsonl`, and `samples/summary.json`. A failed campaign still
+uploads the evidence. Treat missing trials, correctness failures, timeouts,
+runner pressure, and profile mismatch as ineligible evidence. The diagnostic
+summary has no pass/fail timing threshold and does not change nightly gates.
