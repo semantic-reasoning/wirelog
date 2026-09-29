@@ -13,6 +13,7 @@
 
 #include <errno.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #define WL_COLUMNAR_SOURCE_ACCESS_WRITER UINT64_MAX
@@ -80,6 +81,22 @@ typedef struct wl_columnar_source_access_writer {
 #endif
     bool thread_valid;
 } wl_columnar_source_access_writer_t;
+
+typedef struct wl_columnar_source_access_cohort_entry {
+    wl_columnar_source_access_gate_t *gate;
+    uint64_t readers;
+} wl_columnar_source_access_cohort_entry_t;
+
+/* The caller keeps reader and entry arrays stable and externally serializes
+ * their lifecycle. Suspended readers retain both gate references. */
+typedef struct wl_columnar_source_access_cohort {
+    uintptr_t identity;
+    wl_columnar_source_access_gate_t *source;
+    wl_columnar_source_access_reader_t *const *reader_refs;
+    wl_columnar_source_access_cohort_entry_t *entries;
+    size_t reader_count;
+    size_t entry_count;
+} wl_columnar_source_access_cohort_t;
 
 static inline void
 wl_columnar_source_access_gate_init(wl_columnar_source_access_gate_t *gate)
@@ -154,6 +171,169 @@ wl_columnar_source_access_writer_thread_equal(
     return token->thread_valid
            && pthread_equal(token->owner_thread, pthread_self()) != 0;
 #endif
+}
+
+static inline int
+wl_columnar_source_access_cohort_exchange(
+    wl_columnar_source_access_gate_t *source,
+    wl_columnar_source_access_reader_t *const *readers, size_t count,
+    wl_columnar_source_access_cohort_entry_t *entries, size_t capacity,
+    wl_columnar_source_access_cohort_t *cohort)
+{
+    uint64_t expected;
+    size_t unique = 0;
+    if (!source || !readers || !entries || !count || !cohort
+        || cohort->identity || cohort->source || cohort->reader_refs
+        || cohort->entries || cohort->reader_count || cohort->entry_count
+        || count >= WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+        return EINVAL;
+    for (size_t i = 0; i < count; i++) {
+        const wl_columnar_source_access_reader_t *reader = readers[i];
+        if (!reader || reader->identity != (uintptr_t)reader
+            || reader->owner != source || !reader->transferable
+            || reader->thread_valid || !reader->secondary_owner
+            || reader->secondary_owner == source)
+            return EINVAL;
+        for (size_t j = 0; j < i; j++)
+            if (readers[j] == reader)
+                return EINVAL;
+    }
+    for (size_t i = 0; i < count; i++) {
+        size_t j = 0;
+        while (j < i
+            && readers[j]->secondary_owner != readers[i]->secondary_owner)
+            j++;
+        if (j == i)
+            unique++;
+    }
+    if (capacity < unique)
+        return EINVAL;
+    unique = 0;
+    /* Source admission is first. Until it is restored, an ordinary release
+     * sees WRITER and cannot decrement either gate, even if a descriptor
+     * exchange fails partway through this loop. */
+    do {
+        expected = (uint64_t)count;
+        if (atomic_compare_exchange_weak_explicit(&source->state, &expected,
+            WL_COLUMNAR_SOURCE_ACCESS_WRITER, memory_order_acquire,
+            memory_order_relaxed))
+            break;
+        if (expected != count)
+            return EBUSY;
+    } while (true);
+    for (size_t i = 0; i < count; i++) {
+        wl_columnar_source_access_gate_t *gate
+            = readers[i]->secondary_owner;
+        size_t j = 0;
+        while (j < unique && entries[j].gate != gate)
+            j++;
+        if (j == unique) {
+            entries[unique].gate = gate;
+            entries[unique].readers = 1;
+            unique++;
+        } else {
+            entries[j].readers++;
+        }
+    }
+    for (size_t i = 0; i < unique; i++) {
+        do {
+            expected = entries[i].readers;
+            if (atomic_compare_exchange_weak_explicit(&entries[i].gate->state,
+                &expected, WL_COLUMNAR_SOURCE_ACCESS_WRITER,
+                memory_order_acquire, memory_order_relaxed))
+                break;
+            if (expected != entries[i].readers) {
+                while (i > 0) {
+                    i--;
+                    atomic_store_explicit(&entries[i].gate->state,
+                        entries[i].readers, memory_order_release);
+                }
+                atomic_store_explicit(&source->state, (uint64_t)count,
+                    memory_order_release);
+                return EBUSY;
+            }
+        } while (true);
+    }
+    cohort->identity = (uintptr_t)cohort;
+    cohort->source = source;
+    cohort->reader_refs = readers;
+    cohort->entries = entries;
+    cohort->reader_count = count;
+    cohort->entry_count = unique;
+    return 0;
+}
+
+static inline int
+wl_columnar_source_access_cohort_restore(
+    wl_columnar_source_access_cohort_t *cohort)
+{
+    uint64_t expected;
+    if (!cohort || cohort->identity != (uintptr_t)cohort
+        || !cohort->source || !cohort->reader_refs || !cohort->entries
+        || !cohort->reader_count || !cohort->entry_count
+        || cohort->entry_count > cohort->reader_count)
+        return EINVAL;
+    for (size_t i = 0; i < cohort->reader_count; i++) {
+        const wl_columnar_source_access_reader_t *reader
+            = cohort->reader_refs[i];
+        bool found = false;
+        if (!reader || reader->identity != (uintptr_t)reader
+            || reader->owner != cohort->source || !reader->transferable
+            || reader->thread_valid || !reader->secondary_owner
+            || reader->secondary_owner == cohort->source)
+            return EINVAL;
+        for (size_t j = 0; j < i; j++)
+            if (cohort->reader_refs[j] == reader)
+                return EINVAL;
+        for (size_t j = 0; j < cohort->entry_count; j++)
+            if (cohort->entries[j].gate == reader->secondary_owner)
+                found = true;
+        if (!found)
+            return EINVAL;
+    }
+    for (size_t i = 0; i < cohort->entry_count; i++) {
+        size_t count = 0;
+        if (!cohort->entries[i].gate
+            || cohort->entries[i].gate == cohort->source)
+            return EINVAL;
+        for (size_t j = 0; j < i; j++)
+            if (cohort->entries[j].gate == cohort->entries[i].gate)
+                return EINVAL;
+        for (size_t j = 0; j < cohort->reader_count; j++)
+            if (cohort->reader_refs[j]->secondary_owner
+                == cohort->entries[i].gate)
+                count++;
+        if (count != cohort->entries[i].readers)
+            return EINVAL;
+    }
+    if (atomic_load_explicit(&cohort->source->state, memory_order_acquire)
+        != WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+        return EBUSY;
+    for (size_t i = 0; i < cohort->entry_count; i++)
+        if (!cohort->entries[i].gate || !cohort->entries[i].readers
+            || atomic_load_explicit(&cohort->entries[i].gate->state,
+            memory_order_acquire) != WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+            return EBUSY;
+    for (size_t i = 0; i < cohort->entry_count; i++) {
+        do {
+            expected = WL_COLUMNAR_SOURCE_ACCESS_WRITER;
+        } while (!atomic_compare_exchange_weak_explicit(
+                &cohort->entries[i].gate->state, &expected,
+                cohort->entries[i].readers, memory_order_release,
+                memory_order_relaxed));
+    }
+    do {
+        expected = WL_COLUMNAR_SOURCE_ACCESS_WRITER;
+    } while (!atomic_compare_exchange_weak_explicit(&cohort->source->state,
+        &expected, (uint64_t)cohort->reader_count, memory_order_release,
+        memory_order_relaxed));
+    cohort->identity = 0;
+    cohort->source = NULL;
+    cohort->reader_refs = NULL;
+    cohort->entries = NULL;
+    cohort->reader_count = 0;
+    cohort->entry_count = 0;
+    return 0;
 }
 
 static inline int

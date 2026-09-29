@@ -465,7 +465,7 @@ measured by `bench/bench_intern.c`; baselines are in `docs/INTERN_PERF.md`
 21 + 4 + 5 + 19 + 1 + 1 + 1 + 37 + 5 + 7 + 3 = **104 atomic call sites**
 before the source-access contract below.
 
-### 5.13 `wirelog/columnar/source_access.h` — relation source gate (11 rows)
+### 5.13 `wirelog/columnar/source_access.h` — relation source gate (19 rows)
 
 This header-only gate protects relation descriptors and canonical source storage.
 It is linked into the production relation lifecycle and its gate state is zero-initialized.
@@ -473,6 +473,10 @@ Reader and writer tokens are caller-owned and address-bound; ordinary operation 
 are thread-confined, while session-owned source leases are transferable across serialized teardown.
 Relation readers pin the descriptor before resolving and pinning the canonical owner.
 Release drops the owner first, then the optional descriptor pin.
+The prepared cohort exchange first changes the source gate from the exact
+transferable-reader count to WRITER, then changes each descriptor gate from
+its exact cohort count to WRITER. Its release-order rollback and restore keep
+the source gate closed until every descriptor has its reader count again.
 The relation descriptor itself is still a raw caller-owned pointer: before
 `col_rel_destroy_checked()` or pool reset/reuse, callers must stop new
 operations from starting and drain/join existing operations that may enter
@@ -493,6 +497,14 @@ those slots and arena allocations are quiescent.
 | `source_access.h:wl_columnar_source_access_gate_reader_acquire#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Linearize reader admission without overflowing the writer sentinel |
 | `source_access.h:wl_columnar_source_access_gate_reader_release` | `gate->state` | `atomic_load_explicit` | acquire | Validate a live reader count before release |
 | `source_access.h:wl_columnar_source_access_gate_reader_release#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Publish reader completion and decrement the gate atomically |
+| `source_access.h:wl_columnar_source_access_cohort_exchange` | `source->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Claim source WRITER only when the complete transferable cohort is present, blocking releases before descriptor exchange |
+| `source_access.h:wl_columnar_source_access_cohort_exchange#2` | `entries[i].gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Exclude descriptor readers only when each descriptor has exactly its cohort multiplicity |
+| `source_access.h:wl_columnar_source_access_cohort_exchange#3` | `entries[i].gate->state` | `atomic_store_explicit` | release | Restore previously exchanged descriptor counts after a later descriptor denies exchange |
+| `source_access.h:wl_columnar_source_access_cohort_exchange#4` | `source->state` | `atomic_store_explicit` | release | Reopen the source cohort only after all exchanged descriptors have been restored |
+| `source_access.h:wl_columnar_source_access_cohort_restore` | `cohort->source->state` | `atomic_load_explicit` | acquire | Verify source WRITER before any restoration mutation |
+| `source_access.h:wl_columnar_source_access_cohort_restore#2` | `cohort->entries[i].gate->state` | `atomic_load_explicit` | acquire | Verify every descriptor WRITER before any restoration mutation |
+| `source_access.h:wl_columnar_source_access_cohort_restore#3` | `cohort->entries[i].gate->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Republish each descriptor's exact reader multiplicity before reopening the source gate |
+| `source_access.h:wl_columnar_source_access_cohort_restore#4` | `cohort->source->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Republish the source reader count after all descriptors are restored |
 | `source_access.h:wl_columnar_source_access_reader_release` | `gate->state` | `atomic_load_explicit` | acquire | Observe the active gate before releasing this reader |
 | `source_access.h:wl_columnar_source_access_writer_acquire` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Linearize exclusive writer admission and retry spurious failure |
 | `source_access.h:wl_columnar_source_access_writer_release` | `gate->state` | `atomic_load_explicit` | acquire | Validate the writer state before terminal publication |
@@ -532,7 +544,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#2` | `src->retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Promote a committed reservation only when the pool slot still owns it |
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
-104 + 11 + 21 = **136 atomic call sites**.
+104 + 19 + 21 = **144 atomic call sites**.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -657,7 +669,7 @@ the committed token after publication and before a growth transaction.
 | `eval_dedup.c:wl_columnar_eval_dedup_test_fail_next_growth_alloc` | test-only fault flag | `atomic_store_explicit` | release | Arm one allocation refusal before a test invokes dedup growth; excluded from the production library |
 | `eval_dedup.c:wl_columnar_eval_dedup_set_grow` | test-only fault flag | `atomic_exchange_explicit` | acquire-release | Consume the one-shot fault safely when test workers grow dedup tables; excluded from the production library |
 
-The complete source audit now contains **197 atomic call sites**.
+The complete source audit now contains **205 atomic call sites**.
 
 ---
 
