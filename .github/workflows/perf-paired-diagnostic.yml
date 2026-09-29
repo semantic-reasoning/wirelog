@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       base_sha:
-        description: 'Full SHA of a trusted main-ancestor baseline'
+        description: 'Trusted main-ancestor SHA containing the CRDT single-run probe'
         required: true
         type: string
       first:
@@ -63,6 +63,9 @@ jobs:
           git fetch --no-tags origin main
           git cat-file -e "$BASE_SHA^{commit}"
           git merge-base --is-ancestor "$BASE_SHA" FETCH_HEAD
+          # Both revisions must contain the same measurement contract. Older
+          # bench_flowlog evidence cannot serve as this probe's baseline.
+          git show "$BASE_SHA:tests/test_crdt_perf_gate.c" | grep 'WIRELOG_CRDT_PROBE' >/dev/null
           git worktree add --detach "$BASE_SRC" "$BASE_SHA"
           git worktree add --detach "$CANDIDATE_SRC" "$CANDIDATE_SHA"
           test "$(git -C "$BASE_SRC" rev-parse HEAD)" = "$BASE_SHA"
@@ -122,18 +125,20 @@ jobs:
           for side in base candidate; do
             if [[ "$side" == base ]]; then
               build="$BASE_BUILD"
+              source="$BASE_SRC"
             else
               build="$CANDIDATE_BUILD"
+              source="$CANDIDATE_SRC"
             fi
             env WIRELOG_PERF_GATE=1 WIRELOG_GATE_CORRECTNESS_ONLY=1 \
-              WIRELOG_CRDT_DATA_DIR="$CANDIDATE_SRC/bench/data/crdt" \
+              WIRELOG_CRDT_DATA_DIR="$source/bench/data/crdt" \
               taskset -c 0 "$build/tests/test_crdt_perf_gate" \
               2>&1 | tee "perf-artifacts/paired/$side-crdt-correctness.log"
             python scripts/perf/verify-paired-builds.py correctness \
               --workload crdt \
               --log "perf-artifacts/paired/$side-crdt-correctness.log"
             env WIRELOG_PERF_GATE=1 WIRELOG_GATE_CORRECTNESS_ONLY=1 \
-              WIRELOG_CSPA_DATA_DIR="$CANDIDATE_SRC/bench/data/cspa" \
+              WIRELOG_CSPA_DATA_DIR="$source/bench/data/cspa" \
               taskset -c 0 "$build/tests/test_cspa_perf_gate" \
               2>&1 | tee "perf-artifacts/paired/$side-cspa-correctness.log"
             python scripts/perf/verify-paired-builds.py correctness \
@@ -149,7 +154,10 @@ jobs:
             --base-sha "$BASE_SHA" --candidate-sha "$CANDIDATE_SHA" \
             --base-binary "$BASE_BUILD/bench/bench_flowlog" \
             --candidate-binary "$CANDIDATE_BUILD/bench/bench_flowlog" \
-            --data-root "$CANDIDATE_SRC/bench/data" \
+            --base-crdt-binary "$BASE_BUILD/tests/test_crdt_perf_gate" \
+            --candidate-crdt-binary "$CANDIDATE_BUILD/tests/test_crdt_perf_gate" \
+            --base-data-root "$BASE_SRC/bench/data" \
+            --candidate-data-root "$CANDIDATE_SRC/bench/data" \
             --out-dir perf-artifacts/paired/samples \
             --cpu 0 --first "$FIRST_SIDE" --timeout 180
 

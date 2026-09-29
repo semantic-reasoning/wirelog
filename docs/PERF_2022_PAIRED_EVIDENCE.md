@@ -1,5 +1,10 @@
 # Issue #2022: paired tagged-runner diagnostic, 2026-09-29
 
+These historical CRDT samples used `bench_flowlog` and measure a different
+interval from the CRDT gate. They cannot calibrate the gate or serve as the
+baseline for the new `crdt_perf_gate_single_run` probe. The next CRDT campaign
+must compare revisions containing that probe after it merges into main.
+
 The [paired run, attempts 1 and 2](https://github.com/semantic-reasoning/wirelog/actions/runs/36575995318)
 compared base `8d91c2da2b188b94af5b9f1da21c569d80ccb387` with candidate
 `2b0ea083c124a8721c86c922af52be33aafbaf83`. Attempt 1 led with the

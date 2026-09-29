@@ -16,7 +16,8 @@ PROFILE_OPTIONS = (
     "buildtype", "optimization", "b_lto", "b_sanitize", "c_args",
     "c_link_args", "wirelog_log_max_level", "tests", "mbedTLS", "threads",
 )
-SAME_SOURCES = ("bench/bench_flowlog.c", "bench/bench_crdt_workload.h")
+SAME_SOURCES = ("bench/bench_flowlog.c", "bench/bench_crdt_workload.h",
+                "tests/test_crdt_perf_gate.c", "tests/test_perf_util.h")
 GATE_SOURCES = ("tests/test_crdt_perf_gate.c", "tests/test_cspa_perf_gate.c")
 FIXTURES = (
     "bench/data/crdt/Insert_input.csv", "bench/data/crdt/Remove_input.csv",
@@ -45,6 +46,8 @@ def side_record(source: Path, build: Path, expected_sha: str) -> dict:
         raise ValueError(f"{source}: checkout SHA {actual_sha} != {expected_sha}")
     if git_output(source, "status", "--porcelain", "--untracked-files=no"):
         raise ValueError(f"{source}: tracked source files are dirty")
+    if '"WIRELOG_CRDT_PROBE"' not in (source / "tests/test_crdt_perf_gate.c").read_text(encoding="utf-8"):
+        raise ValueError(f"{source}: revision lacks the CRDT single-run probe; choose a trusted main ancestor after the probe merges")
     options_path = build / "meson-info/intro-buildoptions.json"
     compiler_path = build / "meson-info/intro-compilers.json"
     options = {item["name"]: item["value"] for item in json.loads(
