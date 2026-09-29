@@ -7429,8 +7429,12 @@ static struct {
     wl_columnar_memory_governor_t *token_governor;
 } wide_timestamp_admission;
 static bool wide_merge_provisional[2], wide_merge_private_seen;
+static uint32_t wide_merge_seeded_rows[2];
 static bool wide_merge_after_seen, wide_merge_source_unchanged;
 static bool wide_merge_fault_consumed;
+static bool wide_merge_check_timestamps, wide_merge_timestamp_source_valid;
+static atomic_bool wide_merge_timestamp_admission_failed;
+static atomic_bool wide_merge_timestamp_seed_invalid;
 static int wide_merge_after_rc;
 static struct {
     wl_mutex_t mutex;
@@ -7518,6 +7522,15 @@ wide_rollback_fingerprint(const col_rel_t *source)
     for (uint32_t r = 0; r < source->nrows; r++)
         for (uint32_t c = 0; c < source->ncols; c++)
             WIDE_MIX(source->columns[c][r]);
+    if (source->timestamps && source->timestamp_capacity >= source->nrows)
+        for (uint32_t r = 0; r < source->nrows; r++) {
+            const col_delta_timestamp_t *stamp = &source->timestamps[r];
+            WIDE_MIX(stamp->iteration);
+            WIDE_MIX(stamp->stratum);
+            WIDE_MIX(stamp->worker);
+            WIDE_MIX(stamp->_reserved);
+            WIDE_MIX(stamp->multiplicity);
+        }
     for (uint32_t i = 0; i < source->dedup_cap; i++)
         WIDE_MIX(source->dedup_slots[i]);
 #undef WIDE_MIX
@@ -7529,6 +7542,73 @@ wide_rollback_before_image(wl_col_session_t *worker, col_rel_t *source,
     col_rel_t *delta)
 {
     (void)delta;
+    bool stamped_source_valid = true;
+    /* Nonempty partition scatter creates an ungoverned relation; admit it
+     * before the private-image transaction on both attempts. */
+    if (wide_merge_check_timestamps && !source->memory_governor
+        && col_rel_attach_memory_governor(source,
+            worker->memory_governor) != 0)
+        atomic_store_explicit(&wide_merge_timestamp_admission_failed, true,
+            memory_order_release);
+    if (wide_merge_check_timestamps) {
+        uint32_t seeded = wide_merge_seeded_rows[worker->worker_id];
+        stamped_source_valid = seeded > 0 && seeded <= source->nrows
+            && source->ncols == 9 && source->columns
+            && source->timestamps
+            && source->timestamp_capacity >= source->nrows;
+        for (uint32_t c = 0; stamped_source_valid
+            && c < source->ncols; c++)
+            if (!source->columns[c])
+                stamped_source_valid = false;
+        uint32_t seen = 0;
+        for (uint32_t r = 0; stamped_source_valid
+            && r < source->nrows; r++) {
+            int64_t key = source->columns[0][r];
+            if (key < 0 || key >= 4) {
+                stamped_source_valid = false;
+                break;
+            }
+            for (uint32_t c = 1; c < source->ncols; c++)
+                if (source->columns[c][r] != key * 100 + c)
+                    stamped_source_valid = false;
+            if (r < seeded) {
+                const col_delta_timestamp_t *stamp = &source->timestamps[r];
+                if ((seen & (1u << key)) != 0
+                    || stamp->iteration != (uint32_t)key + 1u
+                    || stamp->stratum != (uint32_t)key + 2u
+                    || stamp->worker != (uint32_t)key + 3u
+                    || stamp->_reserved != 0 || stamp->multiplicity != 1)
+                    stamped_source_valid = false;
+                seen |= 1u << key;
+            }
+        }
+        if (!stamped_source_valid) {
+            atomic_store_explicit(&wide_merge_timestamp_seed_invalid, true,
+                memory_order_release);
+            return;
+        }
+        /* Provisional rows have not been stamped yet. Initialize only that
+         * suffix before the fingerprint and private-image copy. */
+        for (uint32_t r = seeded; r < source->nrows; r++) {
+            uint32_t key = (uint32_t)source->columns[0][r];
+            source->timestamps[r] = (col_delta_timestamp_t){
+                .iteration = key + 1u, .stratum = key + 2u,
+                .worker = key + 3u, ._reserved = 0, .multiplicity = 1
+            };
+        }
+        for (uint32_t r = 0; r < source->nrows; r++) {
+            uint32_t key = (uint32_t)source->columns[0][r];
+            const col_delta_timestamp_t *stamp = &source->timestamps[r];
+            if (stamp->iteration != key + 1u
+                || stamp->stratum != key + 2u
+                || stamp->worker != key + 3u
+                || stamp->_reserved != 0 || stamp->multiplicity != 1) {
+                atomic_store_explicit(&wide_merge_timestamp_seed_invalid,
+                    true, memory_order_release);
+                return;
+            }
+        }
+    }
     int unclaimed = -1;
     if (!atomic_compare_exchange_strong_explicit(&wide_rollback_worker,
         &unclaimed, (int)worker->worker_id, memory_order_acq_rel,
@@ -7536,6 +7616,8 @@ wide_rollback_before_image(wl_col_session_t *worker, col_rel_t *source,
         return;
     wide_rollback_source = source;
     wide_rollback_before = wide_rollback_fingerprint(source);
+    if (wide_merge_check_timestamps)
+        wide_merge_timestamp_source_valid = stamped_source_valid;
     if (wide_timestamp_capture_arr) {
         for (uint32_t i = 0; i < worker->arr_count; i++) {
             col_arr_entry_t *entry = &worker->arr_entries[i];
@@ -7842,6 +7924,8 @@ wide_merge_before_delta(wl_col_session_t *worker, col_rel_t *source,
         if (source->column_types[c] != WIRELOG_TYPE_INT64)
             return;
     uint32_t first = source->nrows - new_rows;
+    if (wide_merge_check_timestamps)
+        wide_merge_seeded_rows[worker->worker_id] = first;
     for (uint32_t r = first + 1; r < source->nrows; r++) {
         if (source->columns[0][r - 1] > source->columns[0][r]) {
             wide_merge_provisional[worker->worker_id] = true;
@@ -8372,7 +8456,9 @@ wide_rollback_collect(const char *relation, const int64_t *row,
 static void
 test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
 {
-    TEST(fault_mode == 6 ?
+    TEST(fault_mode == 8 ?
+        "wide TDD worker stamped merge failure and session retry"
+        : fault_mode == 6 ?
         "wide TDD worker timestamp admission boundary and retry"
         : fault_mode == 7 ?
         "wide TDD worker radix workspace admission boundary and retry"
@@ -8484,8 +8570,27 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
     }
     unowned = col_rel_new_auto("output", width);
     WIDE_CHECK(unowned && col_rel_set_column_types(unowned, types,
-        width) == 0 && session_add_rel(COL_SESSION(session), unowned) == 0,
-        "typed empty output");
+        width) == 0, "typed output");
+    if (fault_mode == 8) {
+        for (uint32_t k = 0; k < 4; k++) {
+            int64_t tuple[32];
+            for (uint32_t c = 0; c < width; c++)
+                tuple[c] = c ? (int64_t)(k * 100u + c) : (int64_t)k;
+            WIDE_CHECK(col_rel_append_row(unowned, tuple) == 0,
+                "seed stamped output");
+        }
+        WIDE_CHECK(col_rel_enable_timestamps(unowned) == 0
+            && unowned->timestamps
+            && unowned->timestamp_capacity >= unowned->nrows,
+            "enable stamped output");
+        for (uint32_t k = 0; k < 4; k++)
+            unowned->timestamps[k] = (col_delta_timestamp_t){
+                .iteration = k + 1u, .stratum = k + 2u,
+                .worker = k + 3u, ._reserved = 0, .multiplicity = 1
+            };
+    }
+    WIDE_CHECK(session_add_rel(COL_SESSION(session), unowned) == 0,
+        "add typed output");
     unowned = NULL;
     WIDE_CHECK(wl_session_insert(session, "input", values, input_rows,
         width) == 0, "insert");
@@ -8501,8 +8606,15 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
     wide_dedup_fault_consumed = wide_dedup_source_unchanged = false;
     wide_dedup_after_rc = 0;
     wide_merge_provisional[0] = wide_merge_provisional[1] = false;
+    wide_merge_seeded_rows[0] = wide_merge_seeded_rows[1] = 0;
     wide_merge_private_seen = wide_merge_after_seen = false;
     wide_merge_source_unchanged = wide_merge_fault_consumed = false;
+    wide_merge_check_timestamps = fault_mode == 8;
+    wide_merge_timestamp_source_valid = false;
+    atomic_store_explicit(&wide_merge_timestamp_admission_failed, false,
+        memory_order_release);
+    atomic_store_explicit(&wide_merge_timestamp_seed_invalid, false,
+        memory_order_release);
     wide_merge_after_rc = 0;
     wide_timestamp_image = wide_timestamp_delta = NULL;
     wide_timestamp_prepared = wide_timestamp_armed = false;
@@ -8514,14 +8626,17 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
     wide_timestamp_arr_unchanged = false;
     wide_timestamp_boundary_source_unchanged = false;
     wide_timestamp_capture_arr = fault_mode == 2 || fault_mode == 3
+        || fault_mode == 8
         || fault_mode == 4 || fault_mode == 5
         || fault_mode == 6 || fault_mode == 7;
     wl_columnar_eval_test_before_worker_delta = fault_mode == 3
+        || fault_mode == 8
         || fault_mode == 7
         ? wide_merge_before_delta : NULL;
     wl_columnar_eval_test_before_worker_image = wide_rollback_before_image;
     wl_columnar_eval_test_subpass_boundary = fault_mode == 2
         || fault_mode == 3 || fault_mode == 4 || fault_mode == 5
+        || fault_mode == 8
         || fault_mode == 6 || fault_mode == 7
         ? wide_timestamp_after_subpass : NULL;
     wl_columnar_eval_test_after_worker_image = fault_mode == 1
@@ -8530,14 +8645,16 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
         ? wide_rollback_after_private : NULL;
     wl_columnar_eval_test_before_worker_dedup = fault_mode == 5
         ? wide_dedup_admission_before : fault_mode == 2
-        ? wide_dedup_before : fault_mode == 3 ? wide_merge_before
+        ? wide_dedup_before : fault_mode == 3 || fault_mode == 8
+        ? wide_merge_before
         : fault_mode == 7 ? wide_radix_before
         : fault_mode == 6 ? wide_timestamp_admission_before
         : fault_mode == 4 ? wide_timestamp_before : NULL;
     wl_columnar_eval_test_after_worker_dedup = fault_mode == 6
         ? wide_timestamp_admission_after_dedup : fault_mode == 5
         ? wide_dedup_admission_after : fault_mode == 2
-        ? wide_dedup_after : fault_mode == 3 ? wide_merge_after
+        ? wide_dedup_after : fault_mode == 3 || fault_mode == 8
+        ? wide_merge_after
         : fault_mode == 7 ? wide_radix_after
         : fault_mode == 4 ? wide_timestamp_after_dedup : NULL;
     wl_columnar_radix_admission_test_hook = fault_mode == 7
@@ -8605,9 +8722,14 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
         && wide_timestamp_arr_built && wide_timestamp_boundary_seen
         && wide_timestamp_arr_unchanged
         && wide_timestamp_boundary_source_unchanged)
-        : fault_mode == 3 ? (wide_merge_private_seen
+        : fault_mode == 3 || fault_mode == 8 ? (wide_merge_private_seen
         && wide_merge_after_seen && wide_merge_after_rc == rc
         && wide_merge_fault_consumed && wide_merge_source_unchanged
+        && (fault_mode != 8 || wide_merge_timestamp_source_valid)
+        && (fault_mode != 8 || !atomic_load_explicit(
+            &wide_merge_timestamp_admission_failed, memory_order_acquire))
+        && (fault_mode != 8 || !atomic_load_explicit(
+            &wide_merge_timestamp_seed_invalid, memory_order_acquire))
         && wide_timestamp_arr_built && wide_timestamp_boundary_seen
         && wide_timestamp_arr_unchanged
         && wide_timestamp_boundary_source_unchanged)
@@ -8722,8 +8844,12 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
             wide_timestamp_after_subpass;
         wl_columnar_radix_admission_test_hook = wide_radix_transition;
     }
+    if (fault_mode == 8)
+        wl_columnar_eval_test_before_worker_image = wide_rollback_before_image;
     int retry_rc = wl_session_snapshot(session, wide_rollback_collect,
             &rows);
+    if (fault_mode == 8)
+        wl_columnar_eval_test_before_worker_image = NULL;
     if (fault_mode == 7) {
         WIDE_CHECK(retry_rc == ENOMEM && rows.count == 0
             && wide_radix_admission.prepared
@@ -8756,6 +8882,10 @@ test_tdd_wide_worker_private_rollback(uint32_t width, unsigned fault_mode)
     }
     WIDE_CHECK(retry_rc == 0 && rows.count == 4 && rows.seen == 15u
         && !rows.invalid
+        && (fault_mode != 8 || !atomic_load_explicit(
+            &wide_merge_timestamp_admission_failed, memory_order_acquire))
+        && (fault_mode != 8 || !atomic_load_explicit(
+            &wide_merge_timestamp_seed_invalid, memory_order_acquire))
         && (fault_mode != 6 || (wide_timestamp_admission.prepared
         && wide_timestamp_admission.arrived == 2
         && wide_timestamp_admission.after_seen
@@ -8781,6 +8911,7 @@ cleanup:
     wl_columnar_radix_admission_test_hook = NULL;
     wide_radix_armed_image = NULL;
     wide_timestamp_capture_arr = false;
+    wide_merge_check_timestamps = false;
     if (wide_dedup_admission.changed_budget) {
         wide_dedup_admission.governor->mode =
             wide_dedup_admission.saved_mode;
@@ -15188,6 +15319,7 @@ main(void)
     test_tdd_wide_worker_private_rollback(32, true);
     test_tdd_wide_worker_private_rollback(9, 2);
     test_tdd_wide_worker_private_rollback(9, 3);
+    test_tdd_wide_worker_private_rollback(9, 8);
     test_tdd_wide_worker_private_rollback(32, 3);
     test_tdd_wide_worker_private_rollback(9, 4);
     test_tdd_wide_worker_private_rollback(32, 4);
