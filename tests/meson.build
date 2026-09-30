@@ -928,9 +928,10 @@ test('perf_nightly_windows_contract', py3,
      suite: 'abi')
 
 # Protected-main trust boundary for the non-gating campaign-v1 shadow runner.
+# Nested Bash subprocesses need an explicit hang-detection timeout.
 test('perf_paired_shadow_workflow', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-perf-paired-shadow-workflow.py'],
-     suite: 'abi')
+     suite: 'abi', timeout: 60)
 
 test('perf_nightly_governor_policy', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-perf-nightly-governor-policy.py'],
