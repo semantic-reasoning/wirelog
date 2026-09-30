@@ -4199,8 +4199,9 @@ wl_columnar_relation_delta_restore_flat_overwrite(col_rel_t *rel,
  * If src has timestamps and dst has timestamp tracking enabled, the source
  * timestamps are propagated to the newly appended rows.
  * Optimized (Issue #300): bulk memcpy instead of per-row append. */
-int
-col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
+static int
+col_rel_append_all_impl(col_rel_t *dst, const col_rel_t *src,
+    wl_arena_t *arena, bool require_empty)
 {
     col_rel_t *src_owner = NULL;
     col_rel_t *dst_owner = NULL;
@@ -4216,13 +4217,16 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
     uint64_t metadata_bytes = 0;
     int rc;
     (void)arena;
-    if (!dst || !src || dst->ncols != src->ncols)
-        return EINVAL;
-    if (!wl_columnar_relation_compound_map_valid(dst)
-        || !wl_columnar_relation_compound_map_valid(src))
+    if (!dst || !src)
         return EINVAL;
     wl_columnar_memory_reservation_init(&metadata_pending);
-    if (src->nrows == 0) {
+    if (!require_empty && dst->ncols != src->ncols)
+        return EINVAL;
+    if (!require_empty
+        && (!wl_columnar_relation_compound_map_valid(dst)
+        || !wl_columnar_relation_compound_map_valid(src)))
+        return EINVAL;
+    if (!require_empty && src->nrows == 0) {
         /* An empty source still completes a destination ownership
          * transition.  In particular, a reused TDD destination may be a
          * shared view whose old source lease must not survive a successful
@@ -4246,7 +4250,7 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
      * resolution would turn a formerly valid row-count operation into EINVAL.
      * Initialized zero-column relations have an owner and use the normal
      * source-access gate below. */
-    if (dst->ncols == 0 && src->ncols == 0
+    if (!require_empty && dst->ncols == 0 && src->ncols == 0
         && !dst->storage_owner && !src->storage_owner) {
         if (src->nrows > UINT32_MAX - dst->nrows)
             return EOVERFLOW;
@@ -4281,6 +4285,26 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
         if (rc != 0)
             goto cleanup;
         destination_writer_acquired = true;
+    }
+
+    if (require_empty) {
+        /* This check is paired with the writer admission above.  A caller
+         * may have observed an empty destination before another writer
+         * populated it; appending after that race would lose sorted order. */
+        if (dst->nrows != 0) {
+            rc = EBUSY;
+            goto cleanup;
+        }
+        if (dst->ncols != src->ncols
+            || !wl_columnar_relation_compound_map_valid(dst)
+            || !wl_columnar_relation_compound_map_valid(src)) {
+            rc = EINVAL;
+            goto cleanup;
+        }
+        if (src->nrows == 0) {
+            rc = dst->col_shared ? col_rel_cow_unshare(dst, 0) : 0;
+            goto cleanup;
+        }
     }
 
     /* A typed relation must never receive lanes whose physical meaning is
@@ -4535,6 +4559,19 @@ cleanup:
         && rc == 0)
         rc = EINVAL;
     return rc;
+}
+
+int
+col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
+{
+    return col_rel_append_all_impl(dst, src, arena, false);
+}
+
+int
+wl_columnar_relation_append_all_if_empty(col_rel_t *dst,
+    const col_rel_t *src)
+{
+    return col_rel_append_all_impl(dst, src, NULL, true);
 }
 
 /* ---- compaction ---------------------------------------------------------- */

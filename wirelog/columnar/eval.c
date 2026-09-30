@@ -3779,50 +3779,173 @@ wl_columnar_eval_test_bdx_seed(col_rel_t *cidb,
 int
 tdd_sorted_merge_append(col_rel_t *dst, col_rel_t *src)
 {
-    if (!src || src->nrows == 0)
+    if (!src)
         return 0;
-    if (!dst || dst->ncols == 0)
+    wl_columnar_source_access_reader_t probe = { 0 };
+    int rc = col_rel_source_reader_acquire(src, &probe);
+    if (rc != 0)
+        return rc;
+    bool source_empty = src->nrows == 0;
+    if (col_rel_source_reader_release(&probe) != 0)
+        return EINVAL;
+    if (source_empty || !dst)
         return 0;
-
-    uint32_t N = dst->nrows;
-    uint32_t D = src->nrows;
-    uint32_t ncols = dst->ncols;
-    uint32_t total = 0;
-    if (wl_columnar_eval_checked_row_add(N, D, &total) != 0)
-        return EOVERFLOW;
-
-    if (N == 0)
-        return col_rel_append_all(dst, src, NULL);
-
-    /* Copy current dst rows into the persistent merge buffer */
-    if (dst->merge_buf_cap < N) {
-        int grid_rc = col_rel_reserve_merge_grid(dst, N);
-        if (grid_rc != 0)
-            return grid_rc;
+    if (dst == src)
+        return EINVAL;
+    rc = col_rel_source_reader_acquire(dst, &probe);
+    if (rc != 0)
+        return rc;
+    bool destination_empty = dst->nrows == 0;
+    bool destination_nullary = dst->ncols == 0;
+    if (col_rel_source_reader_release(&probe) != 0)
+        return EINVAL;
+    if (destination_nullary)
+        return 0;
+    if (destination_empty) {
+        /* The helper checks emptiness again while holding its own writer.
+         * A concurrent append between this observation and admission must
+         * not turn the copy into an unsorted append. */
+#ifdef WL_TEST_TDD_SORTED_MERGE_HOOK
+        extern void wl_columnar_eval_test_after_empty_probe(col_rel_t *);
+        wl_columnar_eval_test_after_empty_probe(dst);
+#endif
+        return wl_columnar_relation_append_all_if_empty(dst, src);
     }
-    for (uint32_t c = 0; c < ncols; c++)
-        memcpy(dst->merge_columns[c], dst->columns[c], N * sizeof(int64_t));
 
-    /* Grow dst columns to hold the merged result */
-    if (dst->capacity < total) {
-        if (dst->memory_governor) {
-            int grow_rc = col_rel_reserve_capacity_admitted(dst, total, NULL);
-            if (grow_rc != 0)
-                return grow_rc;
-        } else {
-            if (col_columns_realloc(dst->columns, ncols, total) != 0)
-                return ENOMEM;
-            dst->capacity = total;
-            wl_columnar_relation_touch_storage(dst);
+    /* Keep both descriptors and their canonical storage alive while the
+     * destination is prepared and published.  Shared storage cannot be both
+     * a source reader and destination writer in this operation. */
+    uint32_t N, D, ncols, total = 0;
+    wl_columnar_source_access_reader_t source_reader = { 0 };
+    wl_columnar_source_access_writer_t destination_writer = { 0 };
+    wl_columnar_memory_reservation_t scratch_reservation;
+    int64_t **private_scratch = NULL;
+    int64_t **scratch;
+    col_rel_t *dst_owner = NULL;
+    col_rel_t *src_owner = NULL;
+    wl_columnar_memory_reservation_init(&scratch_reservation);
+    rc = col_rel_source_reader_acquire(src, &source_reader);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_source_writer_acquire(dst, &destination_writer);
+    if (rc != 0)
+        goto release_source;
+
+    N = dst->nrows;
+    D = src->nrows;
+    ncols = dst->ncols;
+    if (D == 0 || ncols == 0) {
+        rc = 0;
+        goto cleanup;
+    }
+    rc = wl_columnar_eval_checked_row_add(N, D, &total);
+    if (rc != 0)
+        goto cleanup;
+    if (N == 0) {
+        rc = EBUSY; /* The destination changed after the empty fast path. */
+        goto cleanup;
+    }
+
+    rc = col_rel_storage_owner_resolve(src, &src_owner);
+    if (rc == 0)
+        rc = col_rel_storage_owner_resolve(dst, &dst_owner);
+    if (rc != 0)
+        goto cleanup;
+    if (src_owner == dst_owner || dst_owner != dst || dst->col_shared
+        || col_rel_storage_alias_borrow_count(dst_owner) != 0) {
+        rc = EBUSY;
+        goto cleanup;
+    }
+    if (dst->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+        || (dst->capacity < total
+        && dst->storage_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)) {
+        rc = EOVERFLOW;
+        goto cleanup;
+    }
+    if (src->ncols != ncols || !src->columns || !dst->columns
+        || src->capacity < D || dst->capacity < N
+        || src->timestamps || dst->timestamps
+        || (dst->merge_buf_cap && !dst->merge_columns)) {
+        rc = EINVAL;
+        goto cleanup;
+    }
+    for (uint32_t c = 0; c < ncols; c++) {
+        wirelog_column_type_t dst_type = dst->column_types
+            ? dst->column_types[c] : WIRELOG_TYPE_INT64;
+        wirelog_column_type_t src_type = src->column_types
+            ? src->column_types[c] : WIRELOG_TYPE_INT64;
+        /* The retained helper compares raw int64 lanes.  Float bit patterns
+         * require the typed comparator and cannot use this merge. */
+        if (!src->columns[c] || !dst->columns[c]
+            || dst_type != src_type || dst_type == WIRELOG_TYPE_FLOAT) {
+            rc = EINVAL;
+            goto cleanup;
         }
     }
+
+    /* Existing grid storage is safe as scratch only after every fallible
+     * preparation succeeds.  A smaller grid stays byte-for-byte unchanged
+     * on failure, so prepare private scratch rather than growing it. */
+    if (dst->merge_columns && dst->merge_buf_cap >= N) {
+        for (uint32_t c = 0; c < ncols; c++) {
+            if (!dst->merge_columns[c]) {
+                rc = EINVAL;
+                goto cleanup;
+            }
+        }
+        scratch = dst->merge_columns;
+    } else {
+        size_t rows_bytes, table_bytes;
+        if (wl_columnar_eval_checked_size_mul((size_t)N, sizeof(int64_t),
+            &rows_bytes) != 0
+            || wl_columnar_eval_checked_size_mul(ncols, rows_bytes,
+            &rows_bytes) != 0
+            || wl_columnar_eval_checked_size_mul(ncols,
+            sizeof(int64_t *), &table_bytes) != 0
+            || rows_bytes > SIZE_MAX - table_bytes) {
+            rc = EOVERFLOW;
+            goto cleanup;
+        }
+        if (dst->memory_governor) {
+            wl_columnar_memory_admission_status_t admission
+                = wl_columnar_memory_reserve_checked(
+                    wl_columnar_memory_governor_ref_get(
+                        dst->memory_governor), rows_bytes + table_bytes,
+                    &scratch_reservation);
+            if (admission != WL_COLUMNAR_MEMORY_ADMISSION_OK
+                && admission != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+                if (admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                    dst->memory_budget_denial_pending = true;
+                rc = admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                    ? ENOMEM
+                    : admission == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                    ? EOVERFLOW : EINVAL;
+                goto cleanup;
+            }
+        }
+        private_scratch = col_columns_alloc(ncols, N);
+        if (!private_scratch) {
+            rc = ENOMEM;
+            goto cleanup;
+        }
+        scratch = private_scratch;
+    }
+
+    /* Admitted growth is the final fallible step.  It never publishes a
+     * partial replacement, including when one column allocation fails. */
+    rc = col_rel_reserve_capacity_admitted(dst, total, NULL);
+    if (rc != 0)
+        goto cleanup;
+    for (uint32_t c = 0; c < ncols; c++)
+        memcpy(scratch[c], dst->columns[c], (size_t)N * sizeof(int64_t));
 
     /* Two-pointer merge: both sequences are sorted, no overlap */
     uint32_t i = 0, j = 0, wr = 0;
     while (i < N && j < D) {
         int cmp = 0;
         for (uint32_t c = 0; c < ncols; c++) {
-            int64_t a = dst->merge_columns[c][i];
+            int64_t a = scratch[c][i];
             int64_t b = src->columns[c][j];
             if (a < b) {
                 cmp = -1;
@@ -3835,7 +3958,7 @@ tdd_sorted_merge_append(col_rel_t *dst, col_rel_t *src)
         }
         if (cmp <= 0) {
             col_columns_copy_row(dst->columns, wr,
-                (int64_t *const *)dst->merge_columns, i, ncols);
+                (int64_t *const *)scratch, i, ncols);
             i++;
             wr++;
         } else {
@@ -3847,7 +3970,7 @@ tdd_sorted_merge_append(col_rel_t *dst, col_rel_t *src)
     }
     while (i < N) {
         col_columns_copy_row(dst->columns, wr,
-            (int64_t *const *)dst->merge_columns, i, ncols);
+            (int64_t *const *)scratch, i, ncols);
         i++;
         wr++;
     }
@@ -3858,8 +3981,22 @@ tdd_sorted_merge_append(col_rel_t *dst, col_rel_t *src)
         wr++;
     }
     dst->nrows = total;
+    dst->sorted_nrows = total;
+    dst->run_count = 1;
+    dst->run_ends[0] = total;
     wl_columnar_relation_touch_view(dst);
-    return 0;
+cleanup:
+    col_columns_free(private_scratch, ncols);
+    if (scratch_reservation.bytes
+        && !wl_columnar_memory_release(&scratch_reservation))
+        abort();
+    if (wl_columnar_source_access_writer_release(&destination_writer) != 0
+        && rc == 0)
+        rc = EINVAL;
+release_source:
+    if (col_rel_source_reader_release(&source_reader) != 0 && rc == 0)
+        rc = EINVAL;
+    return rc;
 }
 
 /*
