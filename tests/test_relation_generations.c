@@ -12,6 +12,23 @@
 #include <time.h>
 #endif
 
+#ifdef WL_TEST_CONSOLIDATE_ALLOC_HOOK
+wl_columnar_consolidate_alloc_hook_t wl_columnar_consolidate_alloc_hook;
+#endif
+#ifdef WL_SESSION_TEST_HOOKS
+/* This standalone backend target has no generic session implementation. */
+void
+wl_session_testhook_before_workqueue_drain(wl_session_t *session)
+{
+    (void)session;
+}
+void
+wl_session_testhook_after_worker_lease_release(wl_session_t *session)
+{
+    (void)session;
+}
+#endif
+
 #ifdef WL_TEST_ALLOC_WRAP
 void *__real_malloc(size_t size);
 void *__real_calloc(size_t count, size_t size);
@@ -47,6 +64,18 @@ void *
 __wrap_realloc(void *ptr, size_t size)
 {
     return fail_this_allocation() ? NULL : __real_realloc(ptr, size);
+}
+#endif
+
+#ifdef WL_TEST_ALLOC_WRAP
+void __real_free(void *pointer);
+static void (*radix_free_observer)(void *pointer);
+void
+__wrap_free(void *pointer)
+{
+    if (radix_free_observer)
+        radix_free_observer(pointer);
+    __real_free(pointer);
 }
 #endif
 
@@ -6313,6 +6342,834 @@ cleanup:
 }
 #endif
 
+/* Exact range preparation and descriptor-first radix admission (#2033). */
+typedef struct {
+    wl_columnar_relation_mutation_set_t set;
+    wl_columnar_relation_mutation_role_t role;
+    wl_columnar_relation_mutation_descriptor_t descriptor;
+    wl_columnar_relation_mutation_owner_t owner;
+    wl_columnar_relation_mutation_lease_t lease;
+    wl_columnar_relation_mutation_initialization_t initialization;
+} radix_test_lease_t;
+
+static int
+radix_test_acquire(col_rel_t *rel, radix_test_lease_t *held)
+{
+    held->role = (wl_columnar_relation_mutation_role_t){ rel,
+                                                         WL_COLUMNAR_RELATION_PAYLOAD_MUTATION };
+    return col_rel_mutation_set_acquire(&held->set, &held->role, 1,
+               &held->descriptor, 1, &held->owner, 1, &held->lease, 1,
+               &held->initialization, 1);
+}
+
+#ifdef WL_TEST_CONSOLIDATE_ALLOC_HOOK
+static const char *radix_fail_site;
+static unsigned radix_fault_calls;
+static bool
+radix_test_fault(const char *site)
+{
+    radix_fault_calls++;
+    return !radix_fail_site || strcmp(site, radix_fail_site) == 0;
+}
+#endif
+#ifdef WL_SESSION_TEST_HOOKS
+static unsigned radix_admission_calls;
+static void
+radix_test_admission(const col_rel_t *rel, uint64_t physical,
+    uint64_t additional, uint64_t total,
+    wl_columnar_radix_admission_phase_t phase,
+    wl_columnar_memory_admission_status_t status)
+{
+    (void)rel; (void)physical; (void)additional; (void)total;
+    (void)phase; (void)status;
+    radix_admission_calls++;
+}
+#endif
+
+static void
+test_leased_radix_kernels(void)
+{
+    const uint32_t counts[] = { 10, 70, 50000, 70 };
+    for (unsigned family = 0; family < 4; family++) {
+        for (unsigned shared = 0; shared < 2; shared++) {
+            for (unsigned timed = 0; timed < 2; timed++) {
+                uint32_t count = counts[family];
+                col_rel_t *root = new_relation();
+                col_rel_t *alias = new_relation();
+                col_rel_t *sibling = new_relation();
+                CHECK(root && alias && sibling, "radix family relations");
+                if (!root || !alias || !sibling)
+                    continue;
+                if (family == 3) {
+                    wirelog_column_type_t type = WIRELOG_TYPE_FLOAT;
+                    CHECK(col_rel_set_column_types(root, &type, 1) == 0,
+                        "float kernel exact type layout");
+                }
+                for (uint32_t i = 0; i < count + 2; i++) {
+                    int64_t value = count + 2 - i;
+                    CHECK(col_rel_append_row(root, &value) == 0,
+                        "radix family seed");
+                }
+                if (timed) {
+                    root->timestamps = calloc(root->capacity,
+                            sizeof(*root->timestamps));
+                    root->timestamp_capacity = root->capacity;
+                    CHECK(root->timestamps != NULL, "radix timestamp seed");
+                    for (uint32_t i = 0; i < root->nrows; i++)
+                        root->timestamps[i].iteration = i;
+                }
+                col_rel_t *rel = root;
+                if (shared) {
+                    CHECK(col_rel_install_shared_view(alias, root) == 0
+                        && col_rel_install_shared_view(sibling, root) == 0,
+                        "radix two aliases install");
+                    rel = alias;
+                }
+                wl_columnar_memory_resolution_t resolution = {
+                    .budget_bytes = 1u << 25, .usable_bytes = 1u << 25,
+                        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+                        .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+                        .status = WL_COLUMNAR_MEMORY_OK
+                };
+                wl_columnar_memory_governor_ref_t *ref
+                    = wl_columnar_memory_governor_ref_create(&resolution);
+                CHECK(ref && col_rel_attach_memory_governor(rel, ref) == 0,
+                    "radix workspace governed relation");
+                radix_test_lease_t held = { 0 };
+                wl_columnar_radix_workspace_t workspace = { 0 };
+                CHECK(radix_test_acquire(rel, &held) == 0
+                    && wl_columnar_relation_radix_workspace_prepare_with_lease(
+                        rel, 1, count, &workspace, &held.lease) == 0,
+                    "radix exact preparation");
+                for (unsigned malformed = 0; malformed < 3; malformed++) {
+                    wl_columnar_radix_workspace_t bad = workspace;
+                    if (family == 0 || family == 3) {
+                        if (malformed == 0) bad.insertion_rows = NULL;
+                        if (malformed == 1) bad.insertion_capacity = 1;
+                        if (malformed == 2) bad.insertion_bytes = 1;
+                    } else if (family == 2) {
+                        if (malformed == 0) bad.count16 = NULL;
+                        if (malformed == 1) bad.k16_capacity = 1;
+                        if (malformed == 2) bad.short_values = NULL;
+                    } else {
+                        if (malformed == 0) bad.perm_a = NULL;
+                        if (malformed == 1) bad.k8_capacity = 1;
+                        if (malformed == 2) bad.byte_values = NULL;
+                    }
+                    CHECK(wl_columnar_relation_radix_sort_with_lease(rel, 1,
+                        count, &bad, &held.lease) == EINVAL
+                        && rel->columns[0][1] == count + 1
+                        && rel->storage_owner == (shared ? root : rel),
+                        "every family rejects malformed physical scratch before detach");
+                }
+                col_rel_t before = *rel;
+                col_rel_t root_before = *root;
+                col_rel_t sibling_before = *sibling;
+#ifdef WL_TEST_CONSOLIDATE_ALLOC_HOOK
+                radix_fault_calls = 0;
+                radix_fail_site = NULL;
+                wl_columnar_consolidate_alloc_hook = radix_test_fault;
+#endif
+#ifdef WL_SESSION_TEST_HOOKS
+                radix_admission_calls = 0;
+                wl_columnar_radix_admission_test_hook = radix_test_admission;
+#endif
+                int rc = wl_columnar_relation_radix_sort_with_lease(rel, 1,
+                        count, &workspace, &held.lease);
+#ifdef WL_TEST_CONSOLIDATE_ALLOC_HOOK
+                wl_columnar_consolidate_alloc_hook = NULL;
+                CHECK(radix_fault_calls == 0,
+                    "prepared radix never reaches allocation hook");
+#endif
+#ifdef WL_SESSION_TEST_HOOKS
+                wl_columnar_radix_admission_test_hook = NULL;
+                CHECK(radix_admission_calls == 0,
+                    "prepared radix never reaches scratch admission hook");
+#endif
+                CHECK(rc == 0 &&
+                    rel->view_generation == before.view_generation + 1
+                    && rel->storage_generation ==
+                    before.storage_generation + shared,
+                    "radix publishes exactly one view and shared storage epoch");
+                CHECK(rel->columns[0][0] == count + 2
+                    && rel->columns[0][count + 1] == 1,
+                    "radix outside range bytes preserved");
+                bool ordered = true;
+                for (uint32_t i = 1; i <= count; i++) {
+                    ordered &= rel->columns[0][i] == (int64_t)i + 1;
+                    if (timed)
+                        ordered &= rel->timestamps[i].iteration ==
+                            count + 1 - i;
+                }
+                CHECK(ordered, "radix range order and timestamp provenance");
+                if (shared)
+                    CHECK(root->columns[0][1] == count + 1
+                        && mutation_payload_unchanged(sibling, &sibling_before)
+                        && root->view_generation == root_before.view_generation
+                        && root->storage_generation ==
+                        root_before.storage_generation
+                        && col_rel_storage_alias_borrow_count(root) == 1
+                        && rel->storage_owner == rel,
+                        "radix detaches one of two aliases and preserves peers");
+                if (!shared) {
+                    CHECK(wl_columnar_relation_radix_sort_with_lease(rel, 1,
+                        count, &workspace, &held.lease) == EINVAL,
+                        "successful radix makes workspace provenance stale");
+                    wl_columnar_radix_workspace_destroy(&workspace);
+                    CHECK(
+                        wl_columnar_relation_radix_workspace_prepare_with_lease(
+                            rel, 1, count, &workspace, &held.lease) == 0
+                        && wl_columnar_relation_radix_sort_with_lease(rel, 1,
+                        count, &workspace, &held.lease) == 0,
+                        "destroy and reprepare permits already sorted retry");
+                }
+                wl_columnar_radix_workspace_destroy(&workspace);
+                CHECK(col_rel_mutation_set_finish(&held.set, rc == 0) == 0,
+                    "radix set finish");
+                cleanup_relations();
+                CHECK(wl_columnar_memory_reserved(
+                        wl_columnar_memory_governor_ref_get(ref)) == 0,
+                    "radix releases retained and scratch credits");
+                wl_columnar_memory_governor_ref_release(ref);
+            }
+        }
+    }
+}
+
+static void
+test_leased_radix_provenance(void)
+{
+    col_rel_t *rel = new_relation();
+    col_rel_t *other = new_relation();
+    for (int64_t value = 12; value > 0; value--)
+        CHECK(col_rel_append_row(rel, &value) == 0, "radix provenance seed");
+    radix_test_lease_t held = { 0 };
+    wl_columnar_radix_workspace_t workspace = { 0 };
+    CHECK(radix_test_acquire(rel, &held) == 0
+        && wl_columnar_relation_radix_workspace_prepare_with_lease(rel, 0,
+        12, &workspace, &held.lease) == 0, "radix provenance prepare");
+    col_rel_t before = *rel;
+    wl_columnar_relation_mutation_lease_t copy = held.lease;
+    CHECK(wl_columnar_relation_radix_sort_with_lease(rel, 0, 12,
+        &workspace, &copy) == EINVAL
+        && wl_columnar_relation_radix_sort_with_lease(other, 0, 0,
+        &workspace, &held.lease) == EINVAL,
+        "radix rejects copied and foreign relation leases");
+    for (unsigned wrong = 0; wrong < 12; wrong++) {
+        wl_columnar_radix_workspace_t bad = workspace;
+        switch (wrong) {
+        case 0: bad.prepared_relation = other; break;
+        case 1: bad.prepared_identity++; break;
+        case 2: bad.prepared_view_generation++; break;
+        case 3: bad.prepared_storage_generation++; break;
+        case 4: bad.prepared_start++; break;
+        case 5: bad.prepared_count--; break;
+        case 6: bad.prepared_ncols++; break;
+        case 7: bad.prepared_capacity++; break;
+        case 8: bad.prepared_has_timestamps = true; break;
+        case 9: bad.prepared_has_types = true; break;
+        case 10: bad.prepared_type_fingerprint++; break;
+        default: bad.insertion_bytes = 0; break;
+        }
+        CHECK(wl_columnar_relation_radix_sort_with_lease(rel, 0, 12,
+            &bad, &held.lease) == EINVAL
+            && mutation_payload_unchanged(rel, &before)
+            && rel->columns[0][0] == 12,
+            "radix malformed workspace rejected before row mutation");
+    }
+    uint64_t generation = held.lease.relation_generation;
+    held.lease.relation_generation++;
+    CHECK(wl_columnar_relation_radix_sort_with_lease(rel, 0, 12,
+        &workspace, &held.lease) == EINVAL, "radix stale lease rejected");
+    held.lease.relation_generation = generation;
+    held.lease.role_flags = WL_COLUMNAR_RELATION_METADATA_DETACH;
+    CHECK(wl_columnar_relation_radix_sort_with_lease(rel, 0, 12,
+        &workspace, &held.lease) == EINVAL, "radix wrong role rejected");
+    held.lease.role_flags = WL_COLUMNAR_RELATION_PAYLOAD_MUTATION;
+    wl_columnar_radix_workspace_destroy(&workspace);
+    CHECK(col_rel_mutation_set_finish(&held.set, false) == 0,
+        "radix invalid input set finish");
+    cleanup_relations();
+}
+
+static void
+test_radix_descriptor_admission(void)
+{
+    for (unsigned full = 0; full < 2; full++) {
+        col_rel_t *root = new_relation();
+        col_rel_t *alias = new_relation();
+        for (int64_t value = 40; value > 0; value--)
+            CHECK(col_rel_append_row(root, &value) == 0,
+                "radix admission seed");
+        CHECK(col_rel_install_shared_view(alias, root) == 0,
+            "radix admission alias");
+        alias->memory_budget_denial_pending = true;
+        alias->sorted_nrows = 7;
+        col_rel_t before = *alias;
+        rebind_reader_pause_t pause = { .relation = alias };
+        atomic_init(&pause.ready, false);
+        atomic_init(&pause.proceed, false);
+        rebind_reader_pause = &pause;
+        wl_columnar_relation_test_reader_after_descriptor =
+            rebind_pause_after_descriptor;
+        wl_thread_t thread;
+        int started = wl_thread_create(&thread, rebind_paused_reader, &pause);
+        CHECK(started == 0, "radix descriptor reader starts");
+        if (!started) {
+            while (!atomic_load_explicit(&pause.ready, memory_order_acquire))
+                alias_accounting_yield();
+            int rc = full ? col_rel_radix_sort_int64(alias)
+                : col_rel_radix_sort(alias, 0, 40);
+            CHECK(rc == EBUSY && mutation_payload_unchanged(alias, &before)
+                && alias->sorted_nrows == 7 &&
+                alias->memory_budget_denial_pending,
+                "paused descriptor rejects radix without clearing denial");
+            atomic_store_explicit(&pause.proceed, true, memory_order_release);
+            CHECK(wl_thread_join(&thread) == 0 && pause.rc == 0,
+                "radix descriptor reader drains");
+        }
+        wl_columnar_relation_test_reader_after_descriptor = NULL;
+        rebind_reader_pause = NULL;
+        wl_columnar_source_access_reader_t peer = { 0 };
+        CHECK(col_rel_source_reader_acquire(root, &peer) == 0,
+            "radix owner reader starts");
+        int rc = full ? col_rel_radix_sort_int64(alias)
+            : col_rel_radix_sort(alias, 0, 40);
+        CHECK(rc == EBUSY && mutation_payload_unchanged(alias, &before)
+            && alias->sorted_nrows == 7 && alias->memory_budget_denial_pending,
+            "owner reader rejects radix and leaves sorted prefix intact");
+        CHECK(col_rel_source_reader_release(&peer) == 0,
+            "radix owner reader drains");
+        CHECK(col_rel_radix_sort(root, 0, 0) == EBUSY
+            && col_rel_radix_sort(root, 0, 1) == EBUSY,
+            "live root borrow rejects trivial radix before shortcut");
+        rc = full ? col_rel_radix_sort_int64(alias) : col_rel_radix_sort(alias,
+                0, 40);
+        CHECK(rc == 0 && alias->columns[0][0] == 1
+            && alias->storage_owner == alias
+            && !alias->memory_budget_denial_pending
+            && alias->sorted_nrows == (full ? 40 : 7),
+            "radix admitted retry publishes sort metadata");
+        cleanup_relations();
+    }
+}
+
+/* Failure snapshots include row/timestamp bytes as well as binding and credit. */
+typedef struct {
+    col_rel_t descriptor;
+    int64_t *rows;
+    col_delta_timestamp_t *timestamps;
+    uint64_t credit;
+} radix_snapshot_t;
+
+static void
+radix_snapshot_take(col_rel_t *rel, radix_snapshot_t *snapshot)
+{
+    snapshot->descriptor = *rel;
+    snapshot->rows = malloc((size_t)rel->nrows * sizeof(*snapshot->rows));
+    memcpy(snapshot->rows, rel->columns[0],
+        (size_t)rel->nrows * sizeof(*snapshot->rows));
+    snapshot->timestamps = NULL;
+    if (rel->timestamps) {
+        snapshot->timestamps = malloc((size_t)rel->nrows *
+                sizeof(*snapshot->timestamps));
+        memcpy(snapshot->timestamps, rel->timestamps,
+            (size_t)rel->nrows * sizeof(*snapshot->timestamps));
+    }
+    snapshot->credit = rel->memory_governor ? wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(rel->memory_governor)) : 0;
+}
+
+static bool
+radix_snapshot_matches(col_rel_t *rel, const radix_snapshot_t *snapshot)
+{
+    return mutation_payload_unchanged(rel, &snapshot->descriptor)
+           && rel->sorted_nrows == snapshot->descriptor.sorted_nrows
+           && memcmp(rel->columns[0], snapshot->rows,
+               (size_t)rel->nrows * sizeof(*snapshot->rows)) == 0
+           && (!rel->timestamps || memcmp(rel->timestamps, snapshot->timestamps,
+           (size_t)rel->nrows * sizeof(*snapshot->timestamps)) == 0)
+           && (!rel->memory_governor || wl_columnar_memory_reserved(
+               wl_columnar_memory_governor_ref_get(rel->memory_governor)) ==
+           snapshot->credit);
+}
+
+static void
+radix_snapshot_destroy(radix_snapshot_t *snapshot)
+{
+    free(snapshot->rows);
+    free(snapshot->timestamps);
+}
+
+static wl_columnar_memory_governor_ref_t *
+radix_test_governor(col_rel_t *rel)
+{
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = 1u << 25, .usable_bytes = 1u << 25,
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+            .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+            .status = WL_COLUMNAR_MEMORY_OK
+    };
+    wl_columnar_memory_governor_ref_t *ref =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    if (!ref || col_rel_attach_memory_governor(rel, ref))
+        return NULL;
+    return ref;
+}
+
+static void
+test_radix_preparation_failure_gates(void)
+{
+    const uint32_t counts[] = { 16, 70, 50000, 70 };
+    const char *sites[] = { "radix_workspace_timestamps",
+                            "radix_workspace_perm_a",
+                            "radix_workspace_perm_b",
+                            "radix_workspace_temp_column",
+                            "radix_workspace_bucket_values",
+                            "radix_workspace_count16",
+                            "radix_workspace_insertion_rows" };
+    for (unsigned family = 0; family < 4; family++) {
+        col_rel_t *rel = new_relation();
+        CHECK(rel, "radix failure relation");
+        if (family == 3) {
+            wirelog_column_type_t type = WIRELOG_TYPE_FLOAT;
+            CHECK(col_rel_set_column_types(rel, &type, 1) == 0,
+                "radix float failure layout");
+        }
+        for (uint32_t i = 0; i < counts[family]; i++) {
+            int64_t value = counts[family] - i;
+            CHECK(col_rel_append_row(rel, &value) == 0, "radix failure rows");
+        }
+        CHECK(col_rel_enable_timestamps(rel) == 0, "radix failure timestamps");
+        for (uint32_t i = 0; i < rel->nrows; i++)
+            rel->timestamps[i].iteration = i;
+        rel->sorted_nrows = 3;
+        wl_columnar_memory_governor_ref_t *ref = radix_test_governor(rel);
+        CHECK(ref, "radix failure governor");
+        wl_columnar_memory_governor_t *governor =
+            wl_columnar_memory_governor_ref_get(ref);
+        radix_snapshot_t before;
+        radix_snapshot_take(rel, &before);
+        wl_columnar_memory_reservation_t blocker;
+        wl_columnar_memory_reservation_init(&blocker);
+        CHECK(wl_columnar_memory_reserve(governor, (1u << 25) - before.credit,
+            &blocker)
+            && wl_columnar_memory_commit(&blocker, &blocker),
+            "radix scratch quota blocker");
+        rel->memory_budget_denial_pending = true;
+        CHECK(col_rel_radix_sort_int64(rel) == ENOMEM &&
+            rel->memory_budget_denial_pending
+            && mutation_payload_unchanged(rel, &before.descriptor)
+            && rel->sorted_nrows == 3 && memcmp(rel->columns[0], before.rows,
+            rel->nrows * sizeof(*before.rows)) == 0
+            && memcmp(rel->timestamps, before.timestamps,
+            rel->nrows * sizeof(*before.timestamps)) == 0
+            && wl_columnar_memory_reserved(governor) == (1u << 25),
+            "radix quota failure preserves bytes metadata and exact credit");
+        CHECK(wl_columnar_memory_release(&blocker), "radix quota unblock");
+        for (unsigned site = 0; site < 7; site++) {
+            bool insertion = family == 0 || family == 3;
+            bool used = site == 0 || (insertion ? site == 6
+                : (site >= 1 && site <= 4) || (family == 2 && site == 5));
+            if (!used)
+                continue;
+            radix_fail_site = sites[site];
+            radix_fault_calls = 0;
+            wl_columnar_consolidate_alloc_hook = radix_test_fault;
+            rel->memory_budget_denial_pending = true;
+            int rc = col_rel_radix_sort_int64(rel);
+            wl_columnar_consolidate_alloc_hook = NULL;
+            CHECK(rc == ENOMEM && radix_fault_calls > 0 &&
+                !rel->memory_budget_denial_pending
+                && radix_snapshot_matches(rel, &before),
+                "each radix allocator failure releases partial scratch and preserves state");
+        }
+        CHECK(col_rel_radix_sort_int64(rel) == 0 &&
+            !rel->memory_budget_denial_pending
+            && rel->sorted_nrows == counts[family]
+            && rel->view_generation == before.descriptor.view_generation + 1
+            && rel->storage_generation == before.descriptor.storage_generation
+            && wl_columnar_memory_reserved(governor) == before.credit,
+            "radix allocation and quota retry returns scratch credit");
+        radix_snapshot_destroy(&before);
+        cleanup_relations();
+        CHECK(wl_columnar_memory_reserved(governor) == 0,
+            "radix failure cleanup all credit");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+typedef struct {
+    col_rel_t *rel;
+    const wl_columnar_radix_workspace_t *workspace;
+    wl_columnar_relation_mutation_lease_t *lease;
+    int rc;
+} radix_wrong_thread_t;
+
+static void *
+radix_test_wrong_thread(void *opaque)
+{
+    radix_wrong_thread_t *args = opaque;
+    args->rc = wl_columnar_relation_radix_sort_with_lease(args->rel, 1,
+            args->rel->nrows - 2, args->workspace, args->lease);
+    return NULL;
+}
+
+static void
+test_radix_exact_authority_and_shape(void)
+{
+    col_rel_t *rel = new_relation();
+    col_rel_t *other = new_relation();
+    for (int64_t value = 72; value > 0; value--)
+        CHECK(col_rel_append_row(rel, &value) == 0
+            && col_rel_append_row(other, &value) == 0,
+            "radix exact shape seed");
+    wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    CHECK(col_rel_set_column_types(rel, &type, 1) == 0
+        && col_rel_enable_timestamps(rel) == 0,
+        "radix exact typed timestamp shape");
+    wl_columnar_memory_governor_ref_t *ref = radix_test_governor(rel);
+    CHECK(ref, "radix exact governor");
+    radix_test_lease_t held = { 0 };
+    wl_columnar_radix_workspace_t workspace = { 0 };
+    CHECK(radix_test_acquire(rel, &held) == 0
+        && wl_columnar_relation_radix_workspace_prepare_with_lease(rel, 1,
+        70, &workspace, &held.lease) == 0, "radix exact snapshot prepare");
+    radix_snapshot_t before;
+    radix_snapshot_take(rel, &before);
+    rel->memory_budget_denial_pending = true;
+    radix_wrong_thread_t args = { rel, &workspace, &held.lease, 0 };
+    wl_thread_t thread;
+    CHECK(wl_thread_create(&thread, radix_test_wrong_thread, &args) == 0
+        && wl_thread_join(&thread) == 0 && args.rc == EINVAL
+        && radix_snapshot_matches(rel,
+        &before) && rel->memory_budget_denial_pending,
+        "wrong-thread radix lease preserves bytes credit and denial");
+    for (unsigned mutation = 0; mutation < 9; mutation++) {
+        col_rel_t saved = *rel;
+        switch (mutation) {
+        case 0: rel->view_generation++; break;
+        case 1: rel->column_types[0] = WIRELOG_TYPE_FLOAT; break;
+        case 2: rel->timestamp_capacity++; break;
+        case 3: rel->timestamps = NULL; rel->timestamp_capacity = 0; break;
+        case 4: rel->ncols = 0; break;
+        case 5: rel->capacity++; break;
+        case 6: rel->nrows--; break;
+        case 7: rel->storage_generation++; break;
+        default: rel->column_types = NULL; break;
+        }
+        int rc = wl_columnar_relation_radix_sort_with_lease(rel, 1, 70,
+                &workspace, &held.lease);
+        rel->view_generation = saved.view_generation;
+        rel->storage_generation = saved.storage_generation;
+        rel->ncols = saved.ncols; rel->nrows = saved.nrows;
+        rel->capacity = saved.capacity;
+        rel->timestamps = saved.timestamps;
+        rel->timestamp_capacity = saved.timestamp_capacity;
+        rel->column_types = saved.column_types; rel->column_types[0] = type;
+        CHECK(rc == EINVAL && radix_snapshot_matches(rel, &before)
+            && rel->memory_budget_denial_pending,
+            "actual relation shape/type/generation changes invalidate workspace before writes");
+    }
+    for (unsigned malformed = 0; malformed < 9; malformed++) {
+        wl_columnar_radix_workspace_t bad = workspace;
+        switch (malformed) {
+        case 0: bad.perm_a = NULL; break;
+        case 1: bad.perm_b = NULL; break;
+        case 2: bad.temp_column = NULL; break;
+        case 3: bad.k8_capacity = 1; break;
+        case 4: bad.timestamp_capacity = 1; break;
+        case 5: bad.byte_values = NULL; break;
+        case 6: bad.prepared_timestamp_capacity++; break;
+        case 7: bad.prepared_nrows++; break;
+        default: bad.bucket_values = NULL; break;
+        }
+        CHECK(wl_columnar_relation_radix_sort_with_lease(rel, 1, 70,
+            &bad, &held.lease) == EINVAL && radix_snapshot_matches(rel,
+            &before),
+            "radix selected scratch capacity malformed before mutation");
+    }
+    CHECK(wl_columnar_relation_radix_sort_with_lease(rel, 0, 70, &workspace,
+        &held.lease) == EINVAL
+        && wl_columnar_relation_radix_sort_with_lease(rel, 1, 69, &workspace,
+        &held.lease) == EINVAL
+        && radix_snapshot_matches(rel, &before),
+        "radix exact range rejects compatible smaller range");
+    wl_columnar_radix_workspace_t foreign_workspace = { 0 };
+    uint32_t foreign_bounds[] = { 1, 71 };
+    CHECK(wl_columnar_radix_workspace_prepare(other, foreign_bounds, 1, 0,
+        &foreign_workspace) == 0
+        && wl_columnar_relation_radix_sort_with_lease(rel, 1, 70,
+        &foreign_workspace, &held.lease) == EINVAL
+        && radix_snapshot_matches(rel, &before),
+        "radix real same-shape foreign preparation is refused");
+    wl_columnar_radix_workspace_destroy(&foreign_workspace);
+    wl_columnar_source_access_writer_t writer_copy = held.descriptor.writer;
+    held.descriptor.writer = held.owner.writer;
+    CHECK(wl_columnar_relation_radix_sort_with_lease(rel, 1, 70, &workspace,
+        &held.lease) == EINVAL,
+        "radix copied foreign descriptor token rejected");
+    held.descriptor.writer = writer_copy;
+    CHECK(wl_columnar_relation_radix_sort_with_lease(rel, 1, 70,
+        &workspace, &held.lease) == 0, "radix authority restored retry");
+    CHECK(wl_columnar_relation_radix_sort_with_lease(rel, 1, 70,
+        &workspace, &held.lease) == EINVAL,
+        "radix successful generation consumes workspace");
+    wl_columnar_radix_workspace_destroy(&workspace);
+    CHECK(wl_columnar_relation_radix_workspace_prepare_with_lease(rel, 1, 70,
+        &workspace, &held.lease) == 0
+        && wl_columnar_relation_radix_sort_with_lease(rel, 1, 70,
+        &workspace, &held.lease) == 0, "radix exact reprepare sorted retry");
+    wl_columnar_radix_workspace_destroy(&workspace);
+    CHECK(col_rel_mutation_set_finish(&held.set, true) == 0,
+        "radix exact finish");
+    radix_snapshot_destroy(&before);
+    cleanup_relations();
+    CHECK(wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            ref)) == 0,
+        "radix exact cleanup credit");
+    wl_columnar_memory_governor_ref_release(ref);
+}
+
+#ifdef WL_TEST_ALLOC_WRAP
+static col_rel_t *radix_free_rel;
+static col_rel_t *radix_free_root;
+static void *radix_free_table;
+static uint64_t radix_free_view;
+static uint64_t radix_free_storage;
+static bool radix_detach_observed;
+static bool radix_sorted_observed;
+static bool radix_boundary_ok;
+
+/* GNU free wrapping observes real retirement; it neither allocates nor alters
+ * the production allocator. Table retirement precedes the final old-owner
+ * borrow decrement; scratch retirement follows full-wrapper metadata publish. */
+static void
+radix_free_boundary(void *pointer)
+{
+    if (!radix_free_rel)
+        return;
+    bool detach = pointer == radix_free_table;
+    bool sorted = radix_free_rel->view_generation == radix_free_view + 1;
+    if (!detach && !sorted)
+        return;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    int target_rc = col_rel_source_reader_acquire(radix_free_rel, &reader);
+    if (target_rc == 0)
+        (void)col_rel_source_reader_release(&reader);
+    int owner_rc = col_rel_source_reader_acquire(radix_free_root, &reader);
+    if (owner_rc == 0)
+        (void)col_rel_source_reader_release(&reader);
+    radix_boundary_ok &= target_rc == EBUSY && owner_rc == EBUSY;
+    if (detach) {
+        radix_detach_observed = true;
+        radix_boundary_ok &= radix_free_rel->col_shared == NULL
+            && radix_free_rel->storage_generation == radix_free_storage
+            && radix_free_rel->view_generation == radix_free_view
+            && col_rel_storage_alias_borrow_count(radix_free_root) == 2;
+    }
+    if (sorted) {
+        radix_sorted_observed = true;
+        radix_boundary_ok &= radix_free_rel->sorted_nrows ==
+            radix_free_rel->nrows
+            && radix_free_rel->storage_generation == radix_free_storage + 1
+            && radix_free_rel->storage_owner == radix_free_rel
+            && col_rel_storage_alias_borrow_count(radix_free_root) == 1;
+    }
+}
+#endif
+
+static void
+test_radix_cow_failures_and_publication(void)
+{
+    for (unsigned family = 0; family < 3; family++) {
+        uint32_t count = family == 0 ? 16 : family == 1 ? 70 : 50000;
+        col_rel_t *root = new_relation(), *alias = new_relation(),
+            *sibling = new_relation();
+        CHECK(root && alias && sibling, "radix COW test relations");
+        for (uint32_t i = 0; i < count; i++) {
+            int64_t value = count - i;
+            CHECK(col_rel_append_row(root, &value) == 0, "radix COW rows");
+        }
+        CHECK(col_rel_enable_timestamps(root) == 0
+            && col_rel_install_shared_view(alias, root) == 0
+            && col_rel_install_shared_view(sibling, root) == 0,
+            "radix COW two timed aliases");
+        wl_columnar_memory_governor_ref_t *ref = radix_test_governor(alias);
+        CHECK(ref && col_rel_attach_memory_governor(root, ref) == 0
+            && col_rel_attach_memory_governor(sibling, ref) == 0,
+            "radix COW governed peers");
+        alias->sorted_nrows = 3;
+        radix_snapshot_t before, root_before, sibling_before;
+        radix_snapshot_take(alias, &before);
+        radix_snapshot_take(root, &root_before);
+        radix_snapshot_take(sibling, &sibling_before);
+        for (unsigned failure = 0; failure < 2; failure++) {
+            alias->memory_budget_denial_pending = true;
+            if (failure == 0)
+                wl_columnar_relation_test_fail_next_prepare_resize();
+            else
+                wl_columnar_relation_test_fail_next_reservation_commit();
+            CHECK(col_rel_radix_sort_int64(alias) == ENOMEM
+                && !alias->memory_budget_denial_pending
+                && radix_snapshot_matches(alias, &before)
+                && radix_snapshot_matches(root, &root_before)
+                && radix_snapshot_matches(sibling, &sibling_before)
+                && col_rel_storage_alias_borrow_count(root) == 2,
+                "radix COW prepare/publication failure restores peers bytes borrows and credit");
+        }
+        radix_test_lease_t held = { 0 };
+        wl_columnar_radix_workspace_t workspace = { 0 };
+        CHECK(radix_test_acquire(alias, &held) == 0
+            && wl_columnar_relation_radix_workspace_prepare_with_lease(alias, 0,
+            count, &workspace, &held.lease) == 0,
+            "radix COW preprepared scratch");
+#ifdef WL_TEST_ALLOC_WRAP
+        uint64_t prepared_credit =
+            wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                    ref));
+        for (long failure = 0; failure < 2; failure++) {
+            allocation_calls = 0; allocation_fail_at = failure;
+            int rc = wl_columnar_relation_radix_sort_with_lease(alias, 0, count,
+                    &workspace, &held.lease);
+            allocation_fail_at = -1;
+            CHECK(rc == ENOMEM && mutation_payload_unchanged(alias,
+                &before.descriptor)
+                && memcmp(alias->columns[0], before.rows,
+                count * sizeof(*before.rows)) == 0
+                && alias->sorted_nrows == 3 &&
+                col_rel_storage_alias_borrow_count(root) == 2
+                && wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(ref)) ==
+                prepared_credit,
+                "radix COW each column/table allocator failure keeps prepared credit exact");
+        }
+#endif
+        wl_columnar_memory_governor_t *governor =
+            wl_columnar_memory_governor_ref_get(ref);
+        uint64_t scratch_credit = wl_columnar_memory_reserved(governor);
+        wl_columnar_memory_reservation_t blocker;
+        wl_columnar_memory_reservation_init(&blocker);
+        CHECK(wl_columnar_memory_reserve(governor, (1u << 25) - scratch_credit,
+            &blocker) && wl_columnar_memory_commit(&blocker, &blocker),
+            "radix prepared workspace leaves no COW quota");
+        alias->memory_budget_denial_pending = false;
+        CHECK(wl_columnar_relation_radix_sort_with_lease(alias, 0, count,
+            &workspace, &held.lease) == ENOMEM
+            && alias->memory_budget_denial_pending
+            && mutation_payload_unchanged(alias, &before.descriptor)
+            && memcmp(alias->columns[0], before.rows,
+            count * sizeof(*before.rows)) == 0
+            && memcmp(alias->timestamps, before.timestamps,
+            count * sizeof(*before.timestamps)) == 0
+            && col_rel_storage_alias_borrow_count(root) == 2
+            && wl_columnar_memory_reserved(governor) == (1u << 25),
+            "COW quota refusal preserves binding borrows bytes and prepared scratch");
+        CHECK(wl_columnar_memory_release(&blocker)
+            && wl_columnar_memory_reserved(governor) == scratch_credit,
+            "COW quota unblock retains exact prepared credit");
+        wl_columnar_radix_workspace_destroy(&workspace);
+        CHECK(col_rel_mutation_set_finish(&held.set, false) == 0
+            && radix_snapshot_matches(alias, &before),
+            "radix COW failed scratch cleanup");
+#ifdef WL_TEST_ALLOC_WRAP
+        radix_free_rel = alias; radix_free_root = root;
+        radix_free_table = alias->columns;
+        radix_free_view = alias->view_generation;
+        radix_free_storage = alias->storage_generation;
+        radix_detach_observed = false; radix_sorted_observed = false;
+        radix_boundary_ok = true;
+        radix_free_observer = radix_free_boundary;
+#endif
+        int rc = col_rel_radix_sort_int64(alias);
+#ifdef WL_TEST_ALLOC_WRAP
+        radix_free_observer = NULL; radix_free_rel = NULL;
+        CHECK(radix_detach_observed && radix_sorted_observed &&
+            radix_boundary_ok,
+            "radix retirement observers prove transition and sorted metadata remain excluded");
+#endif
+        CHECK(rc == 0 && alias->sorted_nrows == count
+            && alias->view_generation == before.descriptor.view_generation + 1
+            && alias->storage_generation ==
+            before.descriptor.storage_generation + 1
+            && col_rel_storage_alias_borrow_count(root) == 1
+            && alias->columns[0][0] == 1 && root->columns[0][0] == count
+            && sibling->columns[0][0] == count,
+            "radix COW retry publishes detach storage and sort once");
+        radix_snapshot_destroy(&before); radix_snapshot_destroy(&root_before);
+        radix_snapshot_destroy(&sibling_before);
+        cleanup_relations();
+        CHECK(wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                ref)) == 0,
+            "radix COW all governor cleanup");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_radix_opposite_address_contention(void)
+{
+    for (unsigned direction = 0; direction < 2; direction++) {
+        col_rel_t *first = new_relation(), *second = new_relation();
+        CHECK(first && second, "radix address relation pair");
+        col_rel_t *low = (uintptr_t)first < (uintptr_t)second ? first : second;
+        col_rel_t *high = low == first ? second : first;
+        col_rel_t *root = direction ? high : low;
+        col_rel_t *alias = direction ? low : high;
+        int64_t values[] = { 3, 2, 1 };
+        for (unsigned i = 0; i < 3; i++)
+            CHECK(col_rel_append_row(root, &values[i]) == 0,
+                "radix address root rows");
+        CHECK(col_rel_install_shared_view(alias, root) == 0,
+            "radix address alias binding");
+        radix_snapshot_t before;
+        radix_snapshot_take(alias, &before);
+        alias->sorted_nrows = 0;
+        alias->memory_budget_denial_pending = true;
+        for (unsigned repeat = 0; repeat < 16; repeat++) {
+            wl_columnar_source_access_reader_t peer = { 0 };
+            CHECK(col_rel_source_reader_acquire(root, &peer) == 0,
+                "radix address owner reader");
+            CHECK(col_rel_radix_sort_int64(alias) == EBUSY
+                && radix_snapshot_matches(alias,
+                &before) && alias->memory_budget_denial_pending,
+                "radix opposite owner phase denial remains exact");
+            CHECK(col_rel_source_reader_release(&peer) == 0,
+                "radix address reader release");
+            wl_columnar_source_access_reader_t descriptor_reader = { 0 };
+            CHECK(wl_columnar_source_access_reader_acquire(
+                    &alias->descriptor_access,
+                    &descriptor_reader) == 0,
+                "radix address descriptor reader");
+            CHECK(col_rel_radix_sort(alias, 0, 0) == EBUSY
+                && col_rel_radix_sort(alias, 0, 1) == EBUSY
+                && col_rel_radix_sort_int64(alias) == EBUSY
+                && radix_snapshot_matches(alias,
+                &before) && alias->memory_budget_denial_pending,
+                "radix descriptor contention validates authority before trivial shortcut");
+            CHECK(wl_columnar_source_access_reader_release(
+                    &descriptor_reader) == 0,
+                "radix address descriptor reader drains");
+            CHECK(col_rel_radix_sort(root, 0, 0) == EBUSY
+                && col_rel_radix_sort(root, 0, 1) == EBUSY,
+                "radix root 0/1 ranges refuse live alias in both address directions");
+        }
+        CHECK(col_rel_radix_sort_int64(alias) == 0 && alias->sorted_nrows == 3
+            && alias->columns[0][0] == 1 &&
+            col_rel_storage_alias_borrow_count(root) == 0,
+            "radix opposite addresses contention retry has no leaked gates");
+        uint64_t view = alias->view_generation,
+            storage = alias->storage_generation;
+        CHECK(col_rel_radix_sort(alias, 0, 0) == 0
+            && col_rel_radix_sort(alias, 0, 1) == 0
+            && alias->view_generation == view &&
+            alias->storage_generation == storage,
+            "radix admitted 0/1 ranges publish no epochs");
+        radix_snapshot_destroy(&before);
+        cleanup_relations();
+    }
+}
+
 int
 main(void)
 {
@@ -6323,6 +7180,13 @@ main(void)
     test_public_batch_lazy_and_timestamp_edges();
     test_public_batch_mutation_admission();
     test_public_batch_overlapping_input();
+    test_radix_preparation_failure_gates();
+    test_radix_exact_authority_and_shape();
+    test_radix_cow_failures_and_publication();
+    test_radix_opposite_address_contention();
+    test_radix_descriptor_admission();
+    test_leased_radix_provenance();
+    test_leased_radix_kernels();
     test_public_append_mutation_admission();
     test_append_overlapping_input(false);
     test_append_overlapping_input(true);
