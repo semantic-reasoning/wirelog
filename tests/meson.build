@@ -4203,6 +4203,21 @@ test_partition_exe = executable(
 
 test('partition', test_partition_exe)
 
+# Newly allocated partition/merge results must be discarded on every
+# partially completed multi-column realloc failure.
+if host_machine.system() == 'linux'
+  test_partition_realloc_failure_exe = executable(
+    'test_partition_realloc_failure',
+    files('test_partition_realloc_failure.c'),
+    include_directories: [wirelog_inc, wirelog_src_inc],
+    dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+    link_with: [testlib_prod],
+    link_args: ['-Wl,--wrap=realloc'],
+    override_options: ['b_lto=false'],
+  )
+  test('partition_realloc_failure', test_partition_realloc_failure_exe)
+endif
+
 # ============================================================================
 # col_rel_t compound metadata fields (Issue #532 Task 1)
 # ============================================================================
