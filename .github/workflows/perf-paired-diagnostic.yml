@@ -85,7 +85,7 @@ jobs:
           for revision in "$base_sha" "$candidate_sha"; do
             test "${#revision}" -eq 40
             case "$revision" in
-              *[!0-9a-f]*) exit 1 ;;
+              *[!0123456789abcdef]*) exit 1 ;;
             esac
             git cat-file -e "$revision^{commit}"
             git merge-base --is-ancestor "$MINIMUM_SHA" "$revision"
