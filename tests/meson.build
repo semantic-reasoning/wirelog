@@ -4094,6 +4094,9 @@ test_diff_consolidate_exe = executable(
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_args: host_machine.system() == 'linux'
+    ? ['-Wl,--wrap=calloc', '-Wl,--wrap=malloc'] : [],
+  override_options: host_machine.system() == 'linux' ? ['b_lto=false'] : [],
   link_with: [testlib_prod],
 )
 

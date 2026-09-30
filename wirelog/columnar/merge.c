@@ -1635,13 +1635,14 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
         work->run_ends[0] = out;
 
         /* Right-size columns after dedup (issue #218). */
-        if (out > 0 && work->capacity > out + out / 4) {
-            uint32_t tight = out + out / 4;
-            if (tight < COL_REL_INIT_CAP)
-                tight = COL_REL_INIT_CAP;
-            if (!work->memory_governor
-                && col_columns_realloc(work->columns, nc, tight) == 0) {
-                work->capacity = tight;
+        if (out > 0) {
+            uint64_t target = (uint64_t)out + out / 4;
+            if (target < COL_REL_INIT_CAP)
+                target = COL_REL_INIT_CAP;
+            if (!work->memory_governor && target < work->capacity
+                && col_columns_realloc_atomic(work->columns, nc,
+                work->capacity, (uint32_t)target) == 0) {
+                work->capacity = (uint32_t)target;
                 wl_columnar_relation_touch_storage(work);
             }
         }
