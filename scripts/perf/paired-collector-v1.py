@@ -5,6 +5,7 @@ from contextlib import ExitStack, contextmanager
 import json
 import math
 import os
+from os import open as open_fd  # File-descriptor open; no text encoding applies.
 from pathlib import Path
 import re
 import runpy
@@ -262,7 +263,7 @@ def atomic_json(path, value):
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
-    fd = os.open(path.parent, os.O_RDONLY)
+    fd = open_fd(path.parent, os.O_RDONLY)
     try:
         os.fsync(fd)
     finally:
@@ -288,7 +289,7 @@ def collect_campaign(args):
         if not re.fullmatch('[0-9a-f]{40}', sha):
             raise ValueError('invalid source SHA')
         records[side] = VERIFY['side_record'](source, build, sha)
-        options = json.loads((build / 'meson-info/intro-buildoptions.json').read_text())
+        options = json.loads((build / 'meson-info/intro-buildoptions.json').read_text(encoding='utf-8'))
         records[side]['profile'] = {item['name']: item['value'] for item in options}
         records[side]['timer_contract_sha256'] = {
             name: LEGACY['sha256'](source / name) for name in CONTRACT_SOURCES}
@@ -308,7 +309,7 @@ def collect_campaign(args):
         if records['base']['timer_contract_sha256'][name] != records['candidate']['timer_contract_sha256'][name]:
             raise ValueError(f'timer/benchmark contract differs: {name}')
     profiles = {s: {k: profile_value(v) for k, v in records[s]['profile'].items()} for s in SIDES}
-    host_id = Path('/etc/machine-id').read_text().strip()
+    host_id = Path('/etc/machine-id').read_text(encoding='utf-8').strip()
     manifest = dict(sources={s: records[s]['source_sha'] for s in SIDES}, profiles=profiles,
                     build_provenance={s: dict(build_instance_id=str(uuid.uuid4()), source_sha=records[s]['source_sha'], profile=profiles[s], build_log_sha256=artifacts[logs[s]]) for s in SIDES},
                     host_id=host_id, cpu=args.cpu, workloads={})
@@ -345,7 +346,7 @@ def collect_campaign(args):
         raise ValueError('artifact/source drift after collection')
     path = args.out_dir / 'campaign-v1.json'
     atomic_json(path, campaign)
-    result = subprocess.run([sys.executable, str(HERE / 'evaluate-paired-campaign.py'), str(path)], capture_output=True, text=True, check=False)
+    result = subprocess.run([sys.executable, str(HERE / 'evaluate-paired-campaign.py'), str(path)], capture_output=True, text=True, check=False, encoding='utf-8')
     (args.out_dir / 'evaluation-report.json').write_text(result.stdout, encoding='utf-8')
     atomic_json(args.out_dir / 'collection-status.json', dict(evaluator_exit=result.returncode, stderr=result.stderr, status=json.loads(result.stdout)['status']))
     return result.returncode

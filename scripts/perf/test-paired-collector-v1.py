@@ -4,6 +4,7 @@ import argparse
 import ctypes
 import json
 import os
+from os import open as open_fd  # File-descriptor open; no text encoding applies.
 from pathlib import Path
 import runpy
 import select
@@ -32,10 +33,10 @@ class CollectorTests(unittest.TestCase):
             for name in set(M['CONTRACT_SOURCES'] + M['VERIFY']['GATE_SOURCES'] + M['VERIFY']['FIXTURES']):
                 path = source / name
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text('"WIRELOG_CRDT_PROBE"\n')
+                path.write_text('"WIRELOG_CRDT_PROBE"\n', encoding='utf-8')
             subprocess.run(['git', '-C', str(source), 'add', '.'], check=True)
             subprocess.run(['git', '-C', str(source), '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'fixture'], check=True)
-            args[side + '_sha'] = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
+            args[side + '_sha'] = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True, encoding='utf-8').strip()
             for name in M['VERIFY']['BINARIES']:
                 path = build / name
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -44,14 +45,14 @@ class CollectorTests(unittest.TestCase):
                     text = "#!/bin/sh\nprintf '%s\\n' '" + json.dumps(record) + "'\n"
                 else:
                     text = "#!/bin/sh\nprintf '%s\\n' '" + M['LEGACY']['HEADER'] + "' 'cspa\t-\t-\t1\t1\t2\t2\t2\t100\t20381\t6\tOK'\n"
-                path.write_text(text)
+                path.write_text(text, encoding='utf-8')
                 path.chmod(0o755)
             info = build / 'meson-info'
             info.mkdir()
-            (info / 'intro-buildoptions.json').write_text(json.dumps([dict(name=k, value=True if k == 'tests' else [] if k == 'c_args' else 'release') for k in M['VERIFY']['PROFILE_OPTIONS']]))
-            (info / 'intro-compilers.json').write_text(json.dumps(dict(host=dict(c=dict(id='gcc', version='1', full_version='gcc 1', linker_id='ld', exelist=['cc'])))))
+            (info / 'intro-buildoptions.json').write_text(json.dumps([dict(name=k, value=True if k == 'tests' else [] if k == 'c_args' else 'release') for k in M['VERIFY']['PROFILE_OPTIONS']]), encoding='utf-8')
+            (info / 'intro-compilers.json').write_text(json.dumps(dict(host=dict(c=dict(id='gcc', version='1', full_version='gcc 1', linker_id='ld', exelist=['cc'])))), encoding='utf-8')
             log = self.root / (side + '.log')
-            log.write_text(side + ' build completed\n')
+            log.write_text(side + ' build completed\n', encoding='utf-8')
             args.update({side + '_source': source, side + '_build': build, side + '_build_log': log})
         # Commits have identical tree/content but timestamps can differ.
         subprocess.run(['git', '-C', str(args['candidate_source']), 'fetch', '-q', str(args['base_source']), args['base_sha']], check=True)
@@ -60,7 +61,7 @@ class CollectorTests(unittest.TestCase):
         self.args = argparse.Namespace(**args)
 
     def read(self, name):
-        return json.loads((self.args.out_dir / name).read_text())
+        return json.loads((self.args.out_dir / name).read_text(encoding='utf-8'))
 
     def test_complete_aa_and_exact_schedule(self):
         self.assertEqual(M['collect'](self.args), 0)
@@ -81,7 +82,7 @@ class CollectorTests(unittest.TestCase):
 
     def test_comparison_and_preflight(self):
         subprocess.run(['git', '-C', str(self.args.candidate_source), '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '--allow-empty', '-qm', 'candidate'], check=True)
-        self.args.candidate_sha = subprocess.check_output(['git', '-C', str(self.args.candidate_source), 'rev-parse', 'HEAD'], text=True).strip()
+        self.args.candidate_sha = subprocess.check_output(['git', '-C', str(self.args.candidate_source), 'rev-parse', 'HEAD'], text=True, encoding='utf-8').strip()
         self.args.mode = 'comparison'
         self.assertEqual(M['collect'](self.args), 0)
 
@@ -90,7 +91,7 @@ class CollectorTests(unittest.TestCase):
                    str(Path(__file__).with_name('paired-benchmark.py')), 'v1']
         for key, value in vars(self.args).items():
             command += ['--' + key.replace('_', '-'), str(value)]
-        result = subprocess.run(command, capture_output=True, text=True)
+        result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.read('collection-status.json')['status'], 'COMPLETE_VALID')
 
@@ -110,13 +111,13 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(M['collect'](self.args), 1)
         self.assertEqual(count, 80)
         self.assertEqual(len(self.read('campaign-v1.json')['attempts']), 79)
-        self.assertEqual(len((self.args.out_dir / 'raw-attempts.jsonl').read_text().splitlines()), 80)
+        self.assertEqual(len((self.args.out_dir / 'raw-attempts.jsonl').read_text(encoding='utf-8').splitlines()), 80)
 
     def test_unparseable_timeout_is_incomplete(self):
         with patch.dict(G, execute=lambda *_: dict(stdout='', stderr='timeout', exit_code=-9, timed_out=True, host_before={}, host_after={})):
             self.assertEqual(M['collect'](self.args), 3)
         self.assertEqual(self.read('collection-status.json')['status'], 'INCOMPLETE')
-        self.assertEqual(len((self.args.out_dir / 'raw-attempts.jsonl').read_text().splitlines()), 80)
+        self.assertEqual(len((self.args.out_dir / 'raw-attempts.jsonl').read_text(encoding='utf-8').splitlines()), 80)
 
     def test_drift_rejects_campaign(self):
         original = G['execute']
@@ -125,7 +126,7 @@ class CollectorTests(unittest.TestCase):
             nonlocal count
             count += 1
             if count == 80:
-                self.args.base_build_log.write_text('drift')
+                self.args.base_build_log.write_text('drift', encoding='utf-8')
             return original(*args)
         with patch.dict(G, execute=execute), self.assertRaisesRegex(ValueError, 'drift'):
             M['collect'](self.args)
@@ -144,12 +145,12 @@ class CollectorTests(unittest.TestCase):
         with patch.dict(G, execute=execute), patch('os.fsync', wraps=os.fsync) as sync, self.assertRaises(KeyboardInterrupt):
             M['collect'](self.args)
         self.assertGreaterEqual(sync.call_count, 4)
-        self.assertEqual(len((self.args.out_dir / 'raw-attempts.jsonl').read_text().splitlines()), 2)
+        self.assertEqual(len((self.args.out_dir / 'raw-attempts.jsonl').read_text(encoding='utf-8').splitlines()), 2)
         self.assertFalse((self.args.out_dir / 'campaign-v1.json').exists())
 
     def test_mismatch_rejected_before_launch(self):
         path = self.args.candidate_build / 'meson-info/intro-compilers.json'
-        path.write_text(path.read_text().replace('gcc 1', 'gcc 2'))
+        path.write_text(path.read_text(encoding='utf-8').replace('gcc 1', 'gcc 2'), encoding='utf-8')
         with self.assertRaisesRegex(ValueError, 'compiler'):
             M['collect'](self.args)
         self.assertFalse(self.args.out_dir.exists())
@@ -166,7 +167,7 @@ class CollectorTests(unittest.TestCase):
 
     def test_process_timeout_is_bounded_and_retains_partial_output(self):
         binary = self.root / 'timeout-probe'
-        binary.write_text("#!/bin/sh\nprintf 'partial\\n'\nsleep 30 &\nwait\n")
+        binary.write_text("#!/bin/sh\nprintf 'partial\\n'\nsleep 30 &\nwait\n", encoding='utf-8')
         binary.chmod(0o755)
         raw = M['execute'](binary, 'crdt', self.root, self.args.cpu, 1)
         self.assertTrue(raw['timed_out'])
@@ -175,20 +176,20 @@ class CollectorTests(unittest.TestCase):
 
     def test_wrong_typed_result_is_correctness_failure(self):
         path = self.args.base_build / 'tests/test_crdt_perf_gate'
-        path.write_text(path.read_text().replace('"aggregate": 2152328', '"aggregate": 2152327'))
+        path.write_text(path.read_text(encoding='utf-8').replace('"aggregate": 2152328', '"aggregate": 2152327'), encoding='utf-8')
         self.assertEqual(M['collect'](self.args), 1)
         self.assertEqual(self.read('collection-status.json')['status'], 'CORRECTNESS_FAILURE')
         self.assertEqual(len(self.read('campaign-v1.json')['attempts']), 80)
 
     def test_fixture_and_profile_mismatch_are_preflight_rejections(self):
         path = self.args.candidate_source / M['VERIFY']['FIXTURES'][0]
-        path.write_text('wrong fixture')
+        path.write_text('wrong fixture', encoding='utf-8')
         with self.assertRaisesRegex(ValueError, 'dirty'):
             M['collect'](self.args)
         self.assertFalse(self.args.out_dir.exists())
         subprocess.run(['git', '-C', str(self.args.candidate_source), 'checkout', '--', '.'], check=True)
         path = self.args.candidate_build / 'meson-info/intro-buildoptions.json'
-        path.write_text(path.read_text().replace('"value": true', '"value": false'))
+        path.write_text(path.read_text(encoding='utf-8').replace('"value": true', '"value": false'), encoding='utf-8')
         with self.assertRaisesRegex(ValueError, 'profile'):
             M['collect'](self.args)
 
@@ -198,7 +199,7 @@ class CollectorTests(unittest.TestCase):
                 self.args.out_dir = self.root / f'output-{number}-{iteration}'
                 ready = self.root / f'ready-{number}-{iteration}'
                 os.mkfifo(ready)
-                read_fd = os.open(ready, os.O_RDONLY | os.O_NONBLOCK)
+                read_fd = open_fd(ready, os.O_RDONLY | os.O_NONBLOCK)
                 probe = self.args.base_build / 'tests/test_crdt_perf_gate'
                 probe.write_text('#!' + sys.executable + '\n' + '''
 import os, signal, subprocess, sys
@@ -218,13 +219,13 @@ print('active partial stderr', file=sys.stderr, flush=True)
 with open(os.environ['WIRELOG_TEST_READY'], 'w') as stream:
     stream.write(str(os.getpid()) + ' ' + str(child.pid) + '\\n')
 signal.pause()
-''')
+''', encoding='utf-8')
                 command = [sys.executable, str(Path(__file__).with_name('paired-benchmark.py')), 'v1']
                 for key, value in vars(self.args).items():
                     command += ['--' + key.replace('_', '-'), str(value)]
                 environment = dict(os.environ, WIRELOG_TEST_READY=str(ready))
                 collector = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                             text=True, env=environment)
+                                             text=True, env=environment, encoding='utf-8')
                 group = None
                 try:
                     self.assertTrue(select.select([read_fd], [], [], 10)[0], 'benchmark did not become ready')
@@ -236,7 +237,7 @@ signal.pause()
                         os.killpg(group, 0)
                     for pid in (group, descendant):
                         self.assertFalse(Path(f'/proc/{pid}').exists())
-                    lines = (self.args.out_dir / 'raw-attempts.jsonl').read_text().splitlines()
+                    lines = (self.args.out_dir / 'raw-attempts.jsonl').read_text(encoding='utf-8').splitlines()
                     self.assertEqual(len(lines), 1)
                     raw = json.loads(lines[0])
                     self.assertTrue(raw['interrupted'])
@@ -295,7 +296,7 @@ signal.pause()
 
     def test_binary_capture_replaces_invalid_utf8(self):
         probe = self.root / 'binary-output'
-        probe.write_text('#!' + sys.executable + '\nimport os\nos.write(1, b"out\\xff\\n")\nos.write(2, b"err\\xfe\\n")\n')
+        probe.write_text('#!' + sys.executable + '\nimport os\nos.write(1, b"out\\xff\\n")\nos.write(2, b"err\\xfe\\n")\n', encoding='utf-8')
         probe.chmod(0o755)
         raw = M['execute'](probe, 'crdt', self.root, self.args.cpu, 1)
         self.assertEqual(raw['stdout'], 'out\ufffd\n')
@@ -318,7 +319,7 @@ if child == 0:
     os._exit(0)
 os.write(1, (str(os.getpid()) + ' ' + str(child) + '\\n').encode())
 os._exit(0)
-''')
+''', encoding='utf-8')
         probe.chmod(0o755)
         descendant = None
         try:
@@ -442,15 +443,15 @@ def wait(process, *args, **kwargs):
     return original(process, *args, **kwargs)
 subprocess.Popen.wait = wait
 raise SystemExit(module['main']())
-''')
+''', encoding='utf-8')
         command = [sys.executable, str(wrapper)]
         for key, value in vars(self.args).items():
             command += ['--' + key.replace('_', '-'), str(value)]
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
         try:
             stdout, stderr = process.communicate(timeout=10)
             self.assertEqual(process.returncode, -signal.SIGTERM, (stdout, stderr))
-            lines = (self.args.out_dir / 'raw-attempts.jsonl').read_text().splitlines()
+            lines = (self.args.out_dir / 'raw-attempts.jsonl').read_text(encoding='utf-8').splitlines()
             self.assertEqual(len(lines), 1)
             raw = json.loads(lines[0])
             self.assertTrue(raw['interrupted'])
@@ -476,7 +477,7 @@ raise SystemExit(module['main']())
 
         with patch.object(subprocess.Popen, 'wait', wait), self.assertRaises(KeyboardInterrupt):
             M['collect'](self.args)
-        lines = (self.args.out_dir / 'raw-attempts.jsonl').read_text().splitlines()
+        lines = (self.args.out_dir / 'raw-attempts.jsonl').read_text(encoding='utf-8').splitlines()
         self.assertEqual(len(lines), 1)
         raw = json.loads(lines[0])
         self.assertEqual(raw['interruption'], 'KeyboardInterrupt')

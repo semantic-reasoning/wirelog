@@ -138,14 +138,14 @@ class Tests(unittest.TestCase):
                 if mode=='failure': c['attempts'][0]['exit_code']=1
                 if mode=='invalid': c['schema_version']=2
                 if mode=='incomplete': c['attempts'].pop()
-                path.write_text(json.dumps(c))
-                run=subprocess.run([sys.executable,str(PATH),str(path)],capture_output=True,text=True)
+                path.write_text(json.dumps(c), encoding='utf-8')
+                run=subprocess.run([sys.executable,str(PATH),str(path)],capture_output=True,text=True, encoding='utf-8')
                 self.assertEqual(run.returncode,expected,run.stderr)
                 r=json.loads(run.stdout)
                 self.assertEqual(r['input_sha256'],evaluator.hashlib.sha256(path.read_bytes()).hexdigest())
-                self.assertEqual(run.stdout,subprocess.run([sys.executable,str(PATH),str(path)],capture_output=True,text=True).stdout)
+                self.assertEqual(run.stdout,subprocess.run([sys.executable,str(PATH),str(path)],capture_output=True,text=True, encoding='utf-8').stdout)
             for raw in ['{"schema_version":1,"schema_version":1}', 'NaN', '{']:
-                path.write_text(raw)
+                path.write_text(raw, encoding='utf-8')
                 self.assertEqual(subprocess.run([sys.executable,str(PATH),str(path)],capture_output=True).returncode,2)
 
 if __name__=='__main__': unittest.main()
