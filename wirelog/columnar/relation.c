@@ -276,20 +276,68 @@ wl_columnar_relation_radix_bench_enabled(void)
 
 /* ---- COW helpers --------------------------------------------------------- */
 
-static int col_rel_grow_owned_transition_impl(col_rel_t *r,
+/* Single-entry storage lives with the operation, including its role mapping. */
+typedef struct {
+    wl_columnar_relation_mutation_set_t set;
+    wl_columnar_relation_mutation_role_t role;
+    wl_columnar_relation_mutation_descriptor_t descriptor;
+    wl_columnar_relation_mutation_owner_t owner;
+    wl_columnar_relation_mutation_lease_t lease;
+    wl_columnar_relation_mutation_initialization_t initialization;
+} wl_columnar_relation_mutation_single_t;
+
+static int
+col_rel_mutation_single_acquire(col_rel_t *relation,
+    wl_columnar_relation_mutation_single_t *single)
+{
+    single->role.relation = relation;
+    single->role.role_flags = WL_COLUMNAR_RELATION_PAYLOAD_MUTATION;
+    return col_rel_mutation_set_acquire(&single->set, &single->role, 1,
+               &single->descriptor, 1, &single->owner, 1, &single->lease, 1,
+               &single->initialization, 1);
+}
+
+static int col_rel_grow_owned_transition_legacy_impl(col_rel_t *r,
     uint32_t new_cap, bool defer_alias_release);
 typedef struct {
     int64_t **columns;
     bool *shared;
 } col_rel_cow_deferred_t;
-static int col_rel_cow_unshare_impl(col_rel_t *r, uint32_t new_cap,
+static int col_rel_cow_unshare_legacy_impl(col_rel_t *r, uint32_t new_cap,
     bool defer_alias_release, bool defer_metadata_retirement,
     col_rel_cow_deferred_t *deferred_old);
+static int col_rel_grow_owned_transition_publish_impl(col_rel_t *r,
+    uint32_t new_cap, bool defer_alias_release,
+    wl_columnar_relation_mutation_lease_t *lease);
+static int col_rel_cow_unshare_publish_impl(col_rel_t *r, uint32_t new_cap,
+    bool defer_alias_release, bool defer_metadata_retirement,
+    col_rel_cow_deferred_t *deferred_old,
+    wl_columnar_relation_mutation_lease_t *lease);
+
+/* Temporary compatibility for unmigrated append/radix/batch transactions.
+ * NULL is an explicit legacy path, never a payload mutation lease. These
+ * private entry points disappear as their outer transactions acquire sets. */
+static int
+col_rel_grow_owned_transition_legacy_impl(col_rel_t *r, uint32_t new_cap,
+    bool defer_alias_release)
+{
+    return col_rel_grow_owned_transition_publish_impl(r, new_cap,
+               defer_alias_release, NULL);
+}
+
+static int
+col_rel_cow_unshare_legacy_impl(col_rel_t *r, uint32_t new_cap,
+    bool defer_alias_release, bool defer_metadata_retirement,
+    col_rel_cow_deferred_t *deferred_old)
+{
+    return col_rel_cow_unshare_publish_impl(r, new_cap, defer_alias_release,
+               defer_metadata_retirement, deferred_old, NULL);
+}
 
 static int
 col_rel_grow_owned_transition(col_rel_t *r, uint32_t new_cap)
 {
-    return col_rel_grow_owned_transition_impl(r, new_cap, false);
+    return col_rel_grow_owned_transition_legacy_impl(r, new_cap, false);
 }
 
 static void
@@ -1015,59 +1063,45 @@ col_rel_published_writer_acquire(const col_rel_t *rel,
 int
 col_rel_set(col_rel_t *r, uint32_t row, uint32_t col, int64_t val)
 {
-    wl_columnar_source_access_writer_t writer = { 0 };
-    bool alias_release_pending = false;
-    col_rel_t *owner = NULL;
+    wl_columnar_relation_mutation_single_t single = { 0 };
     int rc;
-
-    if (!r || !r->columns || row >= r->capacity || col >= r->ncols
-        || !r->columns[col])
+    if (!r)
         return EINVAL;
+    rc = col_rel_mutation_single_acquire(r, &single);
+    if (rc)
+        return rc;
+    if (!r->columns || row >= r->capacity || col >= r->ncols
+        || !r->columns[col]) {
+        rc = EINVAL;
+        goto finish;
+    }
     if (r->column_types && r->column_types[col] == WIRELOG_TYPE_FLOAT) {
-        if (!wl_columnar_float_bits_valid(val))
-            return EINVAL;
+        if (!wl_columnar_float_bits_valid(val)) {
+            rc = EINVAL;
+            goto finish;
+        }
         if (wl_columnar_float_bits_zero(val))
             val = 0;
     }
-
-    rc = col_rel_storage_owner_resolve(r, &owner);
-    if (rc != 0)
-        return rc;
-    rc = col_rel_source_writer_acquire(r, &writer);
-    if (rc != 0)
-        return rc;
-    if (r == owner && col_rel_storage_alias_borrow_count(owner) > 0) {
-        rc = EBUSY;
-        goto release_writer;
-    }
-
-    /* Keep the canonical owner writer admission held through the detach,
-     * cell write, and logical generation publication.  The deferred alias
-     * release prevents a new reader from entering through the detached view
-     * before this mutation is complete. */
-    if (r->col_shared) {
-        rc = col_rel_cow_unshare_impl(r, 0, true, false, NULL);
-        if (rc != 0)
-            goto release_writer;
-        alias_release_pending = true;
+    bool borrowed = r->col_shared != NULL;
+    if (borrowed) {
+        rc = col_rel_cow_unshare_publish_impl(r, 0, false, false, NULL,
+                &single.lease);
+        if (rc)
+            goto finish;
     }
 #ifdef WL_TEST_SET_HOOK
-    if (alias_release_pending && wl_columnar_set_transition_hook)
+    if (borrowed && wl_columnar_set_transition_hook)
         wl_columnar_set_transition_hook(r);
 #endif
     r->columns[col][row] = val;
     wl_columnar_relation_touch_view(r);
     rc = 0;
-
-release_writer:
-    if (alias_release_pending) {
-        int alias_rc = col_rel_storage_alias_release(r);
-        if (alias_rc != 0 && rc == 0)
-            rc = alias_rc;
+finish:
+    {
+        int finish_rc = col_rel_mutation_set_finish(&single.set, rc == 0);
+        return rc ? rc : finish_rc;
     }
-    if (wl_columnar_source_access_writer_release(&writer) != 0 && rc == 0)
-        rc = EINVAL;
-    return rc;
 }
 
 /* Prepare a complete private replacement for a relation resize.  This is
@@ -1940,8 +1974,8 @@ col_rel_reserve_transition(col_rel_t *r, uint32_t capacity,
  * prepared before the relation is changed, so admission or allocation
  * failure leaves the old ownership and reservation untouched. */
 static int
-col_rel_grow_owned_transition_impl(col_rel_t *r, uint32_t new_cap,
-    bool defer_alias_release)
+col_rel_grow_owned_transition_publish_impl(col_rel_t *r, uint32_t new_cap,
+    bool defer_alias_release, wl_columnar_relation_mutation_lease_t *lease)
 {
     col_rel_payload_txn_t pending;
     wl_columnar_memory_reservation_t previous;
@@ -1955,6 +1989,9 @@ col_rel_grow_owned_transition_impl(col_rel_t *r, uint32_t new_cap,
     bool old_arena;
     uint64_t ledger_before;
 
+    if (lease && (lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+        || col_rel_mutation_lease_validate(lease, r)))
+        return EINVAL;
     wl_columnar_memory_reservation_init(&previous);
 
     if (!r || (r->ncols && !r->columns) || new_cap < r->nrows)
@@ -2016,9 +2053,19 @@ col_rel_grow_owned_transition_impl(col_rel_t *r, uint32_t new_cap,
     col_rel_release_retired_reservation(&previous);
     col_rel_retire_payload_credit(r);
     col_rel_ledger_reconcile(r, ledger_before);
-    if (!defer_alias_release)
-        (void)col_rel_storage_alias_release(r);
-    wl_columnar_relation_touch_storage(r);
+    if (lease) {
+        if (!defer_alias_release) {
+            /* Publication cannot fail from here. Invalid authority means a
+             * broken invariant, never a recoverable partial-success return. */
+            if (col_rel_storage_alias_release_locked(r, lease))
+                abort();
+            wl_columnar_relation_touch_storage(r);
+        }
+    } else {
+        if (!defer_alias_release)
+            (void)col_rel_storage_alias_release(r);
+        wl_columnar_relation_touch_storage(r);
+    }
     return 0;
 
 fail:
@@ -2046,15 +2093,28 @@ col_rel_promote_arena_admitted(col_rel_t *r)
 int
 col_rel_cow_unshare(col_rel_t *r, uint32_t new_cap)
 {
-    if (r)
-        r->memory_budget_denial_pending = false;
-    return col_rel_cow_unshare_impl(r, new_cap, false, false, NULL);
+    wl_columnar_relation_mutation_single_t single = { 0 };
+    int rc;
+    if (!r)
+        return 0;
+    rc = col_rel_mutation_single_acquire(r, &single);
+    if (rc)
+        return rc;
+    /* ENOMEM provenance is an outward result channel: quota refusal sets
+     * it again; allocation failure keeps it clear. Guard contention above
+     * leaves prior evidence untouched. It is not mutation rollback state. */
+    r->memory_budget_denial_pending = false;
+    rc = col_rel_cow_unshare_publish_impl(r, new_cap, false, false, NULL,
+            &single.lease);
+    int finish_rc = col_rel_mutation_set_finish(&single.set, rc == 0);
+    return rc ? rc : finish_rc;
 }
 
 static int
-col_rel_cow_unshare_impl(col_rel_t *r, uint32_t new_cap,
+col_rel_cow_unshare_publish_impl(col_rel_t *r, uint32_t new_cap,
     bool defer_alias_release, bool defer_metadata_retirement,
-    col_rel_cow_deferred_t *deferred_old)
+    col_rel_cow_deferred_t *deferred_old,
+    wl_columnar_relation_mutation_lease_t *lease)
 {
     col_rel_payload_txn_t pending;
     wl_columnar_memory_reservation_t previous;
@@ -2066,6 +2126,9 @@ col_rel_cow_unshare_impl(col_rel_t *r, uint32_t new_cap,
     uint32_t capacity;
     uint64_t ledger_before;
 
+    if (lease && (lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+        || col_rel_mutation_lease_validate(lease, r)))
+        return EINVAL;
     wl_columnar_memory_reservation_init(&previous);
 
     if (!r || !r->col_shared)
@@ -2075,8 +2138,8 @@ col_rel_cow_unshare_impl(col_rel_t *r, uint32_t new_cap,
     if (deferred_old)
         *deferred_old = (col_rel_cow_deferred_t){ 0 };
     if (capacity > r->capacity)
-        return col_rel_grow_owned_transition_impl(r, capacity,
-                   defer_alias_release);
+        return col_rel_grow_owned_transition_publish_impl(r, capacity,
+                   defer_alias_release, lease);
     pending_rc = col_rel_reserve_transition(r, capacity,
             r->timestamps ? r->timestamp_capacity : 0, false, &pending,
             &new_bytes);
@@ -2122,9 +2185,19 @@ col_rel_cow_unshare_impl(col_rel_t *r, uint32_t new_cap,
         col_rel_retire_payload_credit(r);
     col_rel_ledger_reconcile(r, ledger_before);
     /* Private columns replaced the borrowed view: one storage epoch. */
-    if (!defer_alias_release)
-        (void)col_rel_storage_alias_release(r);
-    wl_columnar_relation_touch_storage(r);
+    if (lease) {
+        if (!defer_alias_release) {
+            /* Publication cannot fail from here. Invalid authority means a
+             * broken invariant, never a recoverable partial-success return. */
+            if (col_rel_storage_alias_release_locked(r, lease))
+                abort();
+            wl_columnar_relation_touch_storage(r);
+        }
+    } else {
+        if (!defer_alias_release)
+            (void)col_rel_storage_alias_release(r);
+        wl_columnar_relation_touch_storage(r);
+    }
     return 0;
 
 fail:
@@ -2136,8 +2209,11 @@ fail:
     return ENOMEM;
 }
 
+/* Temporary legacy entry point for hash dedup, kway merge, and
+ * incremental delta consolidation in merge.c. Their complete transactions
+ * migrate in 2B/the batch unit; a raw writer is not a mutation-set lease. */
 int
-col_rel_cow_unshare_with_source_writer(col_rel_t *r,
+col_rel_cow_unshare_legacy_with_source_writer(col_rel_t *r,
     const wl_columnar_source_access_writer_t *writer)
 {
     col_rel_t *owner = NULL;
@@ -2152,7 +2228,19 @@ col_rel_cow_unshare_with_source_writer(col_rel_t *r,
         || writer->identity != (uintptr_t)writer
         || !wl_columnar_source_access_writer_thread_equal(writer))
         return EINVAL;
-    return col_rel_cow_unshare_impl(r, 0, true, false, NULL);
+    return col_rel_cow_unshare_legacy_impl(r, 0, true, false, NULL);
+}
+
+/* A raw writer authorizes canonical non-detaching work only. */
+int
+col_rel_cow_unshare_with_source_writer(col_rel_t *r,
+    const wl_columnar_source_access_writer_t *writer)
+{
+    col_rel_t *owner = NULL;
+    if (!r || col_rel_storage_owner_resolve(r, &owner) || owner != r
+        || r->col_shared)
+        return EINVAL;
+    return col_rel_cow_unshare_legacy_with_source_writer(r, writer);
 }
 
 int
@@ -3968,7 +4056,7 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
             /* Ownership transitions stage columns and timestamps together;
              * admission happens before any source buffer is copied and the
              * helper publishes the storage generation on success. */
-            int transition_rc = col_rel_grow_owned_transition_impl(r,
+            int transition_rc = col_rel_grow_owned_transition_legacy_impl(r,
                     new_cap, true);
             if (transition_rc != 0) {
                 rc = transition_rc;
@@ -4030,7 +4118,7 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
     /* A shared view can still have spare capacity.  Privatize it before the
      * in-place row write even when no capacity growth is needed. */
     if (r->col_shared) {
-        rc = col_rel_cow_unshare_impl(r, 0, true, false, NULL);
+        rc = col_rel_cow_unshare_legacy_impl(r, 0, true, false, NULL);
         if (rc != 0)
             goto release_writer;
         alias_release_pending = true;
@@ -4273,14 +4361,14 @@ wl_columnar_relation_reserve_rows_impl(col_rel_t *r, uint32_t additional,
         if (r->storage_owner == r
             && col_rel_storage_alias_borrow_count(r) > 0)
             return EBUSY;
-        int rc = col_rel_grow_owned_transition_impl(r, r->capacity,
+        int rc = col_rel_grow_owned_transition_legacy_impl(r, r->capacity,
                 true);
         if (rc == 0)
             *out_alias_release_pending = alias_release_pending;
         return rc;
     }
     if (r->col_shared && required <= r->capacity) {
-        int rc = col_rel_cow_unshare_impl(r, 0, true, false, NULL);
+        int rc = col_rel_cow_unshare_legacy_impl(r, 0, true, false, NULL);
         if (rc == 0)
             *out_alias_release_pending = alias_release_pending;
         return rc;
@@ -4298,7 +4386,7 @@ wl_columnar_relation_reserve_rows_impl(col_rel_t *r, uint32_t additional,
         new_cap *= 2u;
     }
     if (r->col_shared || r->arena_owned) {
-        int rc = col_rel_grow_owned_transition_impl(r, new_cap, true);
+        int rc = col_rel_grow_owned_transition_legacy_impl(r, new_cap, true);
         if (rc == 0)
             *out_alias_release_pending = alias_release_pending;
         return rc;
@@ -4660,7 +4748,9 @@ col_rel_append_all_impl(col_rel_t *dst, const col_rel_t *src,
             rc = col_rel_source_writer_acquire(dst, &writer);
             if (rc != 0)
                 return rc;
-            rc = col_rel_cow_unshare(dst, 0);
+            /* Explicit temporary legacy path: append_all already owns its
+             * source writer and migrates as a complete read-source unit. */
+            rc = col_rel_cow_unshare_legacy_impl(dst, 0, false, false, NULL);
             if (wl_columnar_source_access_writer_release(&writer) != 0
                 && rc == 0)
                 rc = EINVAL;
@@ -4886,7 +4976,7 @@ col_rel_append_all_impl(col_rel_t *dst, const col_rel_t *src,
         } else if (dst->col_shared || dst->arena_owned
             || (dst->timestamps
             && new_nrows > dst->timestamp_capacity)) {
-            rc = col_rel_grow_owned_transition_impl(dst, new_cap, true);
+            rc = col_rel_grow_owned_transition_legacy_impl(dst, new_cap, true);
             if (rc != 0)
                 goto cleanup;
             transitioned = true;
@@ -4909,7 +4999,7 @@ col_rel_append_all_impl(col_rel_t *dst, const col_rel_t *src,
     /* Bulk append also mutates spare capacity, so a shared view must be
      * privatized even when the destination does not grow. */
     if (dst->col_shared) {
-        rc = col_rel_cow_unshare_impl(dst, 0, true, false, NULL);
+        rc = col_rel_cow_unshare_legacy_impl(dst, 0, true, false, NULL);
         if (rc != 0)
             goto cleanup;
         alias_release_pending = true;
@@ -9588,7 +9678,7 @@ col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
          * and releases it afterwards (or hands it back).  Releasing inside
          * the COW and then rolling back would restore a borrowed view whose
          * borrow the owner no longer counts. */
-        rc = col_rel_cow_unshare_impl(r, 0, true, true, &deferred);
+        rc = col_rel_cow_unshare_legacy_impl(r, 0, true, true, &deferred);
         if (rc != 0)
             goto cleanup_workspace;
 #ifdef WL_TEST_CONSOLIDATE_HOOK

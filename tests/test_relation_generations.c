@@ -135,11 +135,11 @@ set_transition_probe(col_rel_t *rel)
         && set_hook_owner->view_generation == set_hook_source_view_generation
         && set_hook_owner->storage_generation
         == set_hook_source_storage_generation
-        && rel->storage_owner == set_hook_owner
+        && rel->storage_owner == rel
         && rel->storage_generation != set_hook_storage_generation
         && rel->view_generation == set_hook_view_generation
         && rel->col_shared == NULL
-        && set_hook_owner->storage_alias_borrows == 1;
+        && set_hook_owner->storage_alias_borrows == 0;
     set_hook_reader_rc = col_rel_source_reader_acquire(rel, &reader);
     if (set_hook_reader_rc == 0)
         (void)col_rel_source_reader_release(&reader);
@@ -4588,6 +4588,286 @@ rebind_paused_reader(void *opaque)
     return NULL;
 }
 
+static int
+mutation_set_or_cow(col_rel_t *relation, unsigned operation)
+{
+    if (operation == 0)
+        return col_rel_set(relation, 0, 0, 91);
+    return col_rel_cow_unshare(relation,
+               operation == 2 ? relation->capacity + 1 : 0);
+}
+
+static void
+test_set_cow_descriptor_and_owner_admission(void)
+{
+    for (unsigned operation = 0; operation < 3; operation++) {
+        col_rel_t *root = new_relation();
+        col_rel_t *alias = new_relation();
+        int64_t value = 73;
+        CHECK(root && alias && col_rel_append_row(root, &value) == 0
+            && col_rel_install_shared_view(alias, root) == 0,
+            "set/COW mutation alias setup");
+        if (!root || !alias)
+            continue;
+        wl_columnar_memory_resolution_t resolution = {
+            .budget_bytes = 1u << 20,
+                .usable_bytes = 1u << 20,
+                .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+                .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+                .status = WL_COLUMNAR_MEMORY_OK
+        };
+        wl_columnar_memory_governor_ref_t *ref
+            = wl_columnar_memory_governor_ref_create(&resolution);
+        CHECK(ref && col_rel_attach_memory_governor(root, ref) == 0
+            && col_rel_attach_memory_governor(alias, ref) == 0,
+            "set/COW live governor setup");
+        uint64_t credit = ref ? wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) : 0;
+        col_rel_t snapshot = *alias;
+        uint64_t root_view = root->view_generation;
+        uint64_t root_storage = root->storage_generation;
+        rebind_reader_pause_t pause = { .relation = alias };
+        atomic_init(&pause.ready, false);
+        atomic_init(&pause.proceed, false);
+        rebind_reader_pause = &pause;
+        wl_columnar_relation_test_reader_after_descriptor
+            = rebind_pause_after_descriptor;
+        wl_thread_t thread;
+        bool started = wl_thread_create(&thread, rebind_paused_reader,
+                &pause) == 0;
+        CHECK(started, "set/COW paused source reader starts");
+        if (started) {
+            while (!atomic_load_explicit(&pause.ready, memory_order_acquire))
+                alias_accounting_yield();
+            /* Snapshot includes the admitted descriptor reader itself. */
+            snapshot = *alias;
+            CHECK(mutation_set_or_cow(alias, operation) == EBUSY
+                && memcmp(alias, &snapshot, sizeof(snapshot)) == 0
+                && col_rel_storage_alias_borrow_count(root) == 1
+                && root->columns[0][0] == value
+                && (!ref || wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(ref)) == credit),
+                "paused descriptor reader rejects set/COW without mutation");
+            atomic_store_explicit(&pause.proceed, true, memory_order_release);
+            CHECK(wl_thread_join(&thread) == 0 && pause.rc == 0,
+                "paused source reader drains successfully");
+        }
+        wl_columnar_relation_test_reader_after_descriptor = NULL;
+        rebind_reader_pause = NULL;
+        snapshot = *alias;
+        wl_columnar_source_access_reader_t peer = { 0 };
+        CHECK(col_rel_source_reader_acquire(root, &peer) == 0,
+            "set/COW peer owner reader setup");
+        CHECK(mutation_set_or_cow(alias, operation) == EBUSY
+            && memcmp(alias, &snapshot, sizeof(snapshot)) == 0
+            && col_rel_storage_alias_borrow_count(root) == 1
+            && (!ref || wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == credit),
+            "peer owner reader rejects set/COW without mutation");
+        wl_columnar_source_access_writer_t descriptor = { 0 };
+        CHECK(wl_columnar_source_access_writer_acquire(
+                &alias->descriptor_access,
+                &descriptor) == 0
+            && wl_columnar_source_access_writer_release(&descriptor) == 0,
+            "owner-phase denial fully releases descriptor writer");
+        CHECK(col_rel_source_reader_release(&peer) == 0,
+            "set/COW peer reader release");
+        col_rel_t root_snapshot = *root;
+        CHECK(col_rel_set(root, 0, 0, 92) == EBUSY
+            && col_rel_cow_unshare(root, 0) == EBUSY
+            && memcmp(root, &root_snapshot, sizeof(root_snapshot)) == 0,
+            "canonical mutation with live alias is rejected unchanged");
+        wl_columnar_source_access_writer_t raw = { 0 };
+        CHECK(col_rel_source_writer_acquire(alias, &raw) == 0,
+            "raw alias writer setup");
+        CHECK(col_rel_cow_unshare_with_source_writer(alias, &raw) == EINVAL
+            && memcmp(alias, &snapshot,
+            offsetof(col_rel_t, source_access)) == 0,
+            "raw source writer cannot authorize alias COW");
+        CHECK(wl_columnar_source_access_writer_release(&raw) == 0,
+            "raw alias writer release");
+        wl_columnar_relation_test_fail_next_prepare_resize();
+        CHECK(mutation_set_or_cow(alias, operation) == ENOMEM
+            && memcmp(alias, &snapshot, sizeof(snapshot)) == 0
+            && col_rel_storage_alias_borrow_count(root) == 1
+            && (!ref || wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == credit),
+            "lease-held preparation failure leaves relation and credit unchanged");
+        CHECK(mutation_set_or_cow(alias, operation) == 0
+            && alias->storage_owner == alias && !alias->col_shared
+            && col_rel_storage_alias_borrow_count(root) == 0
+            && alias->storage_generation == snapshot.storage_generation + 1
+            && alias->storage_owner_generation == alias->storage_generation
+            && alias->view_generation == snapshot.view_generation
+            + (operation == 0 ? 1 : 0)
+            && alias->columns[0][0] == (operation == 0 ? 91 : value)
+            && root->columns[0][0] == value
+            && root->view_generation == root_view
+            && root->storage_generation == root_storage,
+            "set/COW retry publishes one storage epoch and one borrow release");
+        cleanup_relations();
+        if (ref) {
+            CHECK(wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(ref)) == 0,
+                "set/COW governed cleanup releases all credit");
+            wl_columnar_memory_governor_ref_release(ref);
+        }
+    }
+}
+
+/* Denial evidence is an error result channel, outside the transactional
+ * payload snapshot. Compare the payload and ownership fields explicitly. */
+static bool
+mutation_payload_unchanged(const col_rel_t *rel, const col_rel_t *before)
+{
+    return rel->columns == before->columns &&
+           rel->col_shared == before->col_shared
+           && rel->timestamps == before->timestamps
+           && rel->capacity == before->capacity && rel->nrows == before->nrows
+           && rel->ncols == before->ncols
+           && rel->timestamp_capacity == before->timestamp_capacity
+           && rel->arena_owned == before->arena_owned
+           && rel->relation_identity == before->relation_identity
+           && rel->view_generation == before->view_generation
+           && rel->storage_generation == before->storage_generation
+           && rel->storage_owner == before->storage_owner
+           && rel->storage_owner_identity == before->storage_owner_identity
+           && rel->storage_owner_generation == before->storage_owner_generation
+           && col_rel_storage_alias_borrow_count(rel)
+           == col_rel_storage_alias_borrow_count(before)
+           && rel->retained_reserved_bytes == before->retained_reserved_bytes
+           && rel->retained_reservation.identity ==
+           before->retained_reservation.identity
+           && rel->retained_reservation.bytes ==
+           before->retained_reservation.bytes
+           && atomic_load_explicit(&rel->retained_reservation.state,
+               memory_order_acquire)
+           == atomic_load_explicit(&before->retained_reservation.state,
+               memory_order_acquire)
+           && atomic_load_explicit(&rel->retained_reservation.owner_bits,
+               memory_order_acquire)
+           == atomic_load_explicit(&before->retained_reservation.owner_bits,
+               memory_order_acquire);
+}
+
+static void
+test_set_cow_denial_provenance(void)
+{
+    for (unsigned operation = 0; operation < 2; operation++) {
+        col_rel_t *root = new_relation();
+        col_rel_t *alias = new_relation();
+        int64_t value = 67;
+        wl_columnar_memory_resolution_t resolution = {
+            .budget_bytes = 1u << 20,
+                .usable_bytes = 1u << 20,
+                .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+                .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+                .status = WL_COLUMNAR_MEMORY_OK
+        };
+        wl_columnar_memory_governor_ref_t *ref
+            = wl_columnar_memory_governor_ref_create(&resolution);
+        CHECK(root && alias && ref && col_rel_append_row(root, &value) == 0
+            && col_rel_install_shared_view(alias, root) == 0
+            && col_rel_attach_memory_governor(root, ref) == 0
+            && col_rel_attach_memory_governor(alias, ref) == 0,
+            "set/COW provenance governed shared-alias setup");
+        if (!root || !alias || !ref) {
+            cleanup_relations();
+            if (ref)
+                wl_columnar_memory_governor_ref_release(ref);
+            continue;
+        }
+        wl_columnar_memory_governor_t *governor
+            = wl_columnar_memory_governor_ref_get(ref);
+        uint64_t credit = wl_columnar_memory_reserved(governor);
+        col_rel_t alias_before = *alias;
+        col_rel_t root_before = *root;
+        /* Exhaust headroom without changing the live relation reservations. */
+        wl_columnar_memory_reservation_t blocker;
+        wl_columnar_memory_reservation_init(&blocker);
+        CHECK(wl_columnar_memory_reserve(governor,
+            resolution.usable_bytes - credit, &blocker)
+            && wl_columnar_memory_commit(&blocker, &blocker),
+            "set/COW quota denial blocker admitted");
+        for (unsigned prior = 0; prior < 2; prior++) {
+            alias->memory_budget_denial_pending = (uint8_t)prior;
+            CHECK(mutation_set_or_cow(alias, operation) == ENOMEM
+                && alias->memory_budget_denial_pending
+                && mutation_payload_unchanged(alias, &alias_before)
+                && mutation_payload_unchanged(root, &root_before)
+                && alias->columns[0][0] == value && root->columns[0][0] == value
+                && wl_columnar_memory_reserved(governor) ==
+                resolution.usable_bytes,
+                "quota ENOMEM publishes denial evidence without payload/credit mutation");
+        }
+        CHECK(wl_columnar_memory_release(&blocker)
+            && wl_columnar_memory_reserved(governor) == credit,
+            "set/COW quota blocker released for retry");
+        for (unsigned prior = 0; prior < 2; prior++) {
+            for (unsigned failure = 0; failure < 2; failure++) {
+                alias->memory_budget_denial_pending = (uint8_t)prior;
+                if (failure == 0)
+                    wl_columnar_relation_test_fail_next_prepare_resize();
+                else
+                    wl_columnar_relation_test_fail_next_reservation_commit();
+                CHECK(mutation_set_or_cow(alias, operation) == ENOMEM
+                    && alias->memory_budget_denial_pending ==
+                    (operation == 0 ? prior : 0)
+                    && mutation_payload_unchanged(alias, &alias_before)
+                    && mutation_payload_unchanged(root, &root_before)
+                    && alias->columns[0][0] == value &&
+                    root->columns[0][0] == value
+                    && wl_columnar_memory_reserved(governor) == credit,
+                    "nonbudget preparation/publication ENOMEM preserves payload and provenance");
+            }
+        }
+        alias->memory_budget_denial_pending = true;
+        wl_columnar_source_access_reader_t peer = { 0 };
+        CHECK(col_rel_source_reader_acquire(root, &peer) == 0,
+            "stale denial EBUSY peer admission");
+        CHECK(mutation_set_or_cow(alias, operation) == EBUSY
+            && alias->memory_budget_denial_pending
+            && mutation_payload_unchanged(alias, &alias_before)
+            && root->columns[0][0] == value
+            && wl_columnar_memory_reserved(governor) == credit,
+            "guard EBUSY preserves stale denial evidence before eager clear");
+        CHECK(col_rel_source_reader_release(&peer) == 0,
+            "stale denial EBUSY peer release");
+        CHECK(mutation_set_or_cow(alias, operation) == 0
+            && alias->memory_budget_denial_pending == (operation == 0 ? 1 : 0)
+            && alias->storage_owner == alias && !alias->col_shared
+            && col_rel_storage_alias_borrow_count(root) == 0
+            && alias->storage_generation == alias_before.storage_generation + 1
+            && alias->columns[0][0] == (operation == 0 ? 91 : value)
+            && root->columns[0][0] == value,
+            "successful retry clears COW evidence and preserves set evidence");
+        cleanup_relations();
+        CHECK(wl_columnar_memory_reserved(governor) == 0,
+            "provenance governed cleanup releases all credit");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_empty_append_all_legacy_cow_compatibility(void)
+{
+    col_rel_t *root = new_relation();
+    col_rel_t *alias = new_relation();
+    col_rel_t *empty = new_relation();
+    int64_t value = 81;
+    CHECK(root && alias && empty
+        && col_rel_append_row(root, &value) == 0
+        && col_rel_install_shared_view(alias, root) == 0,
+        "empty-source legacy COW setup");
+    CHECK(col_rel_append_all(alias, empty, NULL) == 0
+        && alias->storage_owner == alias && alias->col_shared == NULL
+        && alias->columns[0][0] == value && alias->nrows == 1
+        && root->columns[0][0] == value
+        && col_rel_storage_alias_borrow_count(root) == 0,
+        "empty append_all retains COW under its legacy raw writer");
+    cleanup_relations();
+}
+
 static void
 rebind_probe_descriptor_exclusion(const col_rel_t *relation)
 {
@@ -4843,6 +5123,9 @@ int
 main(void)
 {
 #ifdef WL_TEST_RELATION_RESIZE_HOOK
+    test_set_cow_descriptor_and_owner_admission();
+    test_set_cow_denial_provenance();
+    test_empty_append_all_legacy_cow_compatibility();
     test_leased_rebind_descriptor_exclusion();
     test_root_leased_rebind_restores_descriptor();
 #endif
