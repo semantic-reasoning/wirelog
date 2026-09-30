@@ -92,7 +92,7 @@ class PairedBenchmarkTests(unittest.TestCase):
             MODULE["parse_tsv"]("anything", "crdt")
 
     def test_probe_parser_is_strict(self):
-        record = json.loads(self.probe().read_text().split("'", 3)[3].rsplit("'", 1)[0])
+        record = json.loads(self.probe().read_text(encoding="utf-8").split("'", 3)[3].rsplit("'", 1)[0])
         parse = MODULE["parse_crdt_probe"]
         self.assertEqual(parse(json.dumps(record))["elapsed_ms"], 10.0)
         for key, value in (("result", 0), ("expected", 0), ("iterations", 0),
@@ -111,11 +111,11 @@ class PairedBenchmarkTests(unittest.TestCase):
     def test_nonzero_probe_is_failure_even_with_valid_stdout(self):
         binary = self.binary()
         args = self.args(binary, binary)
-        with args.base_crdt_binary.open("a") as stream:
+        with args.base_crdt_binary.open("a", encoding="utf-8") as stream:
             stream.write("exit 9\n")
         summary = MODULE["collect"](args)
         self.assertEqual(summary["status"], "CORRECTNESS_FAILURE")
-        event = json.loads((args.out_dir / "attempts.jsonl").read_text().splitlines()[0])
+        event = json.loads((args.out_dir / "attempts.jsonl").read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual(event["exit_code"], 9)
         self.assertIn('"status": "OK"', event["stdout"])
 
@@ -131,7 +131,7 @@ class PairedBenchmarkTests(unittest.TestCase):
         self.assertEqual([event["phase"] for event in events],
                          ["warmup", "warmup", "sample", "sample"] * 2)
         self.assertTrue(all("host_before" in event and "host_after" in event for event in events))
-        metadata = json.loads((self.root / "evidence" / "metadata.json").read_text())
+        metadata = json.loads((self.root / "evidence" / "metadata.json").read_text(encoding="utf-8"))
         self.assertEqual(metadata["binary_sha256"]["base"]["crdt"],
                          MODULE["sha256"](self.root / "base-probe"))
         self.assertEqual(metadata["binary_sha256"]["base"]["cspa-fast"],
@@ -148,16 +148,16 @@ class PairedBenchmarkTests(unittest.TestCase):
         for relative in MODULE["FIXTURES"]:
             path = candidate_data / relative
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("fixture\n")
+            path.write_text("fixture\n", encoding="utf-8")
         args.candidate_data_root = candidate_data
         for side in ("base", "candidate"):
             probe = getattr(args, side + "_crdt_binary")
             expected = getattr(args, side + "_data_root") / "crdt"
-            text = probe.read_text().replace("#!/bin/sh\n", "#!/bin/sh\n"
+            text = probe.read_text(encoding="utf-8").replace("#!/bin/sh\n", "#!/bin/sh\n"
                 + f'[ "$WIRELOG_CRDT_DATA_DIR" = "{expected}" ] || exit 8\n'
                 + '[ "$WIRELOG_CRDT_PROBE" = 1 ] || exit 8\n'
                 + '[ "$WIRELOG_CRDT_SMALL" = 0 ] || exit 8\n')
-            probe.write_text(text)
+            probe.write_text(text, encoding="utf-8")
         self.assertEqual(MODULE["collect"](args)["status"], "DIAGNOSTIC")
 
     def test_mismatched_revision_fixture_rejected_before_collection(self):
@@ -167,7 +167,7 @@ class PairedBenchmarkTests(unittest.TestCase):
         for relative in MODULE["FIXTURES"]:
             path = candidate_data / relative
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("changed\n")
+            path.write_text("changed\n", encoding="utf-8")
         args.candidate_data_root = candidate_data
         with self.assertRaisesRegex(ValueError, "fixture hashes differ"):
             MODULE["collect"](args)
