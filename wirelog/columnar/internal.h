@@ -2815,6 +2815,13 @@ wl_columnar_relation_delta_restore_flat_overwrite(col_rel_t *rel,
     uint32_t nrows, uint32_t ncols);
 int
 col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena);
+/* Append only while dst is still empty after canonical storage admission.
+ * EBUSY means another writer populated it before this operation acquired
+ * the destination gate.  The source and destination descriptors must remain
+ * alive for the call, as with col_rel_append_all. */
+int
+wl_columnar_relation_append_all_if_empty(col_rel_t *dst,
+    const col_rel_t *src);
 int
 col_rel_col_idx(const col_rel_t *r, const char *name);
 col_rel_t *

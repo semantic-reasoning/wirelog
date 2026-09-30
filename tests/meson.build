@@ -5059,6 +5059,20 @@ test_tdd_multiworker_exe = executable(
 
 test('tdd_multiworker', test_tdd_multiworker_exe)
 
+test_tdd_sorted_merge_atomic_exe = executable(
+  'test_tdd_sorted_merge_atomic',
+  files('test_tdd_sorted_merge_atomic.c', '../wirelog/columnar/eval.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+  c_args: ['-DWL_TEST_TDD_SORTED_MERGE_HOOK'],
+  link_args: host_machine.system() == 'linux'
+    ? ['-Wl,--wrap=calloc', '-Wl,--wrap=malloc'] : [],
+  override_options: host_machine.system() == 'linux' ? ['b_lto=false'] : [],
+)
+
+test('tdd_sorted_merge_atomic', test_tdd_sorted_merge_atomic_exe)
+
 test_relation_append_exe = executable(
   'test_relation_append',
   files('test_relation_append.c'),
