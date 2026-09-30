@@ -833,7 +833,7 @@ col_op_consolidate_hash_dedup(col_rel_t *rel,
      * came from the validated source relation, so publish has no expected
      * validation failure and performs no allocation. */
     if (rel->col_shared) {
-        int cow_rc = col_rel_cow_unshare_with_source_writer(rel, writer);
+        int cow_rc = col_rel_cow_unshare_legacy_with_source_writer(rel, writer);
         if (cow_rc != 0) {
             free(uniq_buf);
             HASH_RELEASE_SCRATCH();
@@ -1011,7 +1011,7 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
     /* Every buffer allocation is now complete.  A shared view may detach
      * before the first segment mutation; later sorting uses only workspace. */
     if (rel->col_shared) {
-        int cow_rc = col_rel_cow_unshare_with_source_writer(rel, writer);
+        int cow_rc = col_rel_cow_unshare_legacy_with_source_writer(rel, writer);
         if (cow_rc != 0) {
             result = cow_rc;
             goto cleanup;
@@ -2267,7 +2267,8 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
      * view before those mutations so the deferred cleanup can retire its
      * alias borrow while the owner writer remains held. */
     if (rel->col_shared) {
-        int cow_rc = col_rel_cow_unshare_with_source_writer(rel, rel_writer);
+        int cow_rc = col_rel_cow_unshare_legacy_with_source_writer(rel,
+                rel_writer);
         if (cow_rc != 0)
             return col_op_consolidate_incremental_delta_fail(delta_out,
                        delta_initial_nrows, cow_rc);

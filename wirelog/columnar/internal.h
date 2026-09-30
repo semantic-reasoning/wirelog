@@ -2675,8 +2675,10 @@ void col_rel_retire_payload_credit(col_rel_t *r);
  * @new_cap <= capacity it admits the buffers the relation already owns.
  * ENOMEM with *@denied set is a governor verdict, clear is an allocation
  * failure (Issue #1446). EOVERFLOW reports size/accounting overflow; EINVAL
- * reports invalid shape/state. Caller owns an unpublished relation or holds
- * its writer. This operation resets transient denial evidence. */
+ * reports invalid shape/state. Caller owns an unpublished/self-owned
+ * relation exclusively or holds its writer; the raw writer never authorizes
+ * alias detach through the mutation-set API. This operation resets transient
+ * denial evidence. */
 int
 col_rel_reserve_capacity_admitted(col_rel_t *r, uint32_t new_cap,
     bool *denied);
@@ -2689,7 +2691,8 @@ int
 col_rel_enable_timestamps_locked(col_rel_t *rel);
 /* Promote arena-backed relation columns to private heap storage.  Admission
  * and copying are transactional; failure leaves the relation unchanged.
- * Caller owns the relation exclusively. ENOMEM+pending denotes budget
+ * Caller owns the private/self-owned relation exclusively; this helper
+ * acquires no live mutation authority. ENOMEM+pending denotes budget
  * refusal; ENOMEM alone is allocation failure, EOVERFLOW/EINVAL stay typed. */
 int
 col_rel_promote_arena_admitted(col_rel_t *rel);
@@ -3072,11 +3075,17 @@ int col_rel_source_reader_acquire_transferable(const col_rel_t *,
 int col_rel_source_reader_release(wl_columnar_source_access_reader_t *);
 int col_rel_source_writer_acquire(const col_rel_t *,
     wl_columnar_source_access_writer_t *);
+/* Canonical non-detach authority only: raw writers cannot detach aliases. */
 int col_rel_cow_unshare_with_source_writer(col_rel_t *,
     const wl_columnar_source_access_writer_t *);
 
+/* Temporary compatibility used only by the three unmigrated merge
+ * transactions. Remove as those complete transactions acquire mutation sets. */
+int col_rel_cow_unshare_legacy_with_source_writer(col_rel_t *,
+    const wl_columnar_source_access_writer_t *);
+
 /* Checked single-cell mutation.  The implementation lives in relation.c so
- * it can hold canonical-owner source admission across COW and publication. */
+ * it holds descriptor and canonical-owner writers across COW/publication. */
 int col_rel_set(col_rel_t *, uint32_t row, uint32_t col, int64_t val);
 
 /* Test seam for the non-wrapping relation identity allocator. */
