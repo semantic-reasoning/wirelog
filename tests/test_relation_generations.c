@@ -1734,7 +1734,7 @@ test_source_reader_blocks_append_row(void)
     view_reserved = view->retained_reserved_bytes;
     view_aliases = view->storage_alias_borrows;
 #ifdef WL_TEST_APPEND_HOOK
-    append_hook_owner = source;
+    append_hook_owner = view;
     append_hook_source = source;
     append_hook_expected = view;
     append_hook_called = false;
@@ -1744,7 +1744,7 @@ test_source_reader_blocks_append_row(void)
     append_hook_source_expected_rows = source_rows;
     append_hook_expected_capacity = view_capacity;
     append_hook_source_columns = source_columns;
-    append_hook_source_aliases = source_aliases;
+    append_hook_source_aliases = source_aliases - 1;
     append_hook_view_generation = view_view;
     append_hook_storage_generation = view_storage;
     append_hook_reader_rc = 0;
@@ -1831,7 +1831,7 @@ test_source_reader_blocks_append_row(void)
     view_reserved = view->retained_reserved_bytes;
     view_aliases = view->storage_alias_borrows;
 #ifdef WL_TEST_APPEND_HOOK
-    append_hook_owner = source;
+    append_hook_owner = view;
     append_hook_source = source;
     append_hook_expected = view;
     append_hook_called = false;
@@ -1841,7 +1841,7 @@ test_source_reader_blocks_append_row(void)
     append_hook_source_expected_rows = source_rows;
     append_hook_expected_capacity = view_capacity;
     append_hook_source_columns = source_columns;
-    append_hook_source_aliases = source_aliases;
+    append_hook_source_aliases = source_aliases - 1;
     append_hook_view_generation = view_view;
     append_hook_storage_generation = view_storage;
     append_hook_reader_rc = 0;
@@ -4751,6 +4751,277 @@ mutation_payload_unchanged(const col_rel_t *rel, const col_rel_t *before)
 }
 
 static void
+test_public_append_mutation_admission(void)
+{
+    for (unsigned full = 0; full < 2; full++) {
+        col_rel_t *root = new_relation();
+        col_rel_t *alias = new_relation();
+        int64_t value = 37;
+        CHECK(root && alias, "public append admission relations");
+        uint32_t rows = full ? COL_REL_INIT_CAP : 1;
+        for (uint32_t i = 0; i < rows; i++)
+            CHECK(col_rel_append_row(root, &value) == 0,
+                "public append admission source rows");
+        CHECK(col_rel_enable_timestamps(root) == 0
+            && col_rel_install_shared_view(alias, root) == 0,
+            "public append admission shared timestamps");
+        wl_columnar_memory_resolution_t resolution = {
+            .budget_bytes = 1u << 20, .usable_bytes = 1u << 20,
+                .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+                .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+                .status = WL_COLUMNAR_MEMORY_OK
+        };
+        wl_columnar_memory_governor_ref_t *ref
+            = wl_columnar_memory_governor_ref_create(&resolution);
+        CHECK(ref && col_rel_attach_memory_governor(root, ref) == 0
+            && col_rel_attach_memory_governor(alias, ref) == 0,
+            "public append admission governor");
+        wl_columnar_memory_governor_t *governor
+            = wl_columnar_memory_governor_ref_get(ref);
+        uint64_t credit = wl_columnar_memory_reserved(governor);
+        col_rel_t root_before = *root, alias_before = *alias;
+        root->memory_budget_denial_pending = true;
+        CHECK(col_rel_append_row(root, &value) == EBUSY
+            && root->memory_budget_denial_pending
+            && mutation_payload_unchanged(root, &root_before),
+            "public root append rejects live alias even with spare capacity");
+        alias->memory_budget_denial_pending = true;
+        rebind_reader_pause_t pause = { .relation = alias };
+        atomic_init(&pause.ready, false);
+        atomic_init(&pause.proceed, false);
+        rebind_reader_pause = &pause;
+        wl_columnar_relation_test_reader_after_descriptor =
+            rebind_pause_after_descriptor;
+        wl_thread_t thread;
+        int start_rc = wl_thread_create(&thread, rebind_paused_reader, &pause);
+        if (start_rc != 0) {
+            wl_columnar_relation_test_reader_after_descriptor = NULL;
+            rebind_reader_pause = NULL;
+        }
+        CHECK(start_rc == 0, "public append paused descriptor reader starts");
+        while (!atomic_load_explicit(&pause.ready, memory_order_acquire))
+            alias_accounting_yield();
+        int paused_rc = col_rel_append_row(alias, &value);
+        bool paused_unchanged = mutation_payload_unchanged(alias, &alias_before)
+            && alias->memory_budget_denial_pending
+            && wl_columnar_memory_reserved(governor) == credit;
+        atomic_store_explicit(&pause.proceed, true, memory_order_release);
+        int join_rc = wl_thread_join(&thread);
+        wl_columnar_relation_test_reader_after_descriptor = NULL;
+        rebind_reader_pause = NULL;
+        CHECK(paused_rc == EBUSY && paused_unchanged && join_rc == 0 &&
+            pause.rc == 0,
+            "public append descriptor denial preserves state and stale evidence");
+        wl_columnar_source_access_reader_t peer = { 0 };
+        CHECK(col_rel_source_reader_acquire(root, &peer) == 0,
+            "public append peer owner reader");
+        int peer_rc = col_rel_append_row(alias, &value);
+        bool peer_unchanged = mutation_payload_unchanged(alias, &alias_before)
+            && alias->memory_budget_denial_pending;
+        CHECK(col_rel_source_reader_release(&peer) == 0
+            && peer_rc == EBUSY && peer_unchanged,
+            "public append owner phase denial is unchanged");
+        wl_columnar_memory_reservation_t blocker;
+        wl_columnar_memory_reservation_init(&blocker);
+        CHECK(wl_columnar_memory_reserve(governor,
+            resolution.usable_bytes - credit, &blocker)
+            && wl_columnar_memory_commit(&blocker, &blocker),
+            "public append budget blocker");
+        alias->memory_budget_denial_pending = false;
+        CHECK(col_rel_append_row(alias, &value) == ENOMEM
+            && alias->memory_budget_denial_pending
+            && mutation_payload_unchanged(alias, &alias_before)
+            && mutation_payload_unchanged(root, &root_before)
+            && wl_columnar_memory_reserved(governor) == resolution.usable_bytes,
+            "public alias append quota failure retains payload and credit");
+        CHECK(wl_columnar_memory_release(&blocker),
+            "public append unblock budget");
+        for (unsigned failure = 0; failure < 2; failure++) {
+            alias->memory_budget_denial_pending = true;
+            if (failure == 0)
+                wl_columnar_relation_test_fail_next_prepare_resize();
+            else
+                wl_columnar_relation_test_fail_next_reservation_commit();
+            CHECK(col_rel_append_row(alias, &value) == ENOMEM
+                && !alias->memory_budget_denial_pending
+                && mutation_payload_unchanged(alias, &alias_before)
+                && mutation_payload_unchanged(root, &root_before)
+                && wl_columnar_memory_reserved(governor) == credit,
+                "public alias append nonbudget failures roll back under lease");
+        }
+        CHECK(col_rel_append_row(alias, &value) == 0
+            && alias->storage_owner == alias && !alias->col_shared
+            && alias->nrows == rows + 1 && alias->columns[0][rows] == value
+            && alias->storage_generation == alias_before.storage_generation + 1
+            && alias->view_generation == alias_before.view_generation + 1
+            && col_rel_storage_alias_borrow_count(root) == 0
+            && root->nrows == rows && root->columns[0][0] == value
+            && alias->timestamps[rows].iteration == 0
+            && alias->timestamps[rows].multiplicity == 0,
+            "public alias append retry detaches before row/view publication");
+        cleanup_relations();
+        CHECK(wl_columnar_memory_reserved(governor) == 0,
+            "public append admission cleanup");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_public_append_overlapping_input(void)
+{
+    for (unsigned wide = 0; wide < 2; wide++) {
+        uint32_t width = wide ? 32 : 1;
+        col_rel_t *rel = track_relation(col_rel_new_auto("append_overlap",
+                width));
+        CHECK(rel, "public append overlap relation");
+        int64_t row[32];
+        for (uint32_t i = 0; i < COL_REL_INIT_CAP; i++) {
+            for (uint32_t c = 0; c < width; c++)
+                row[c] = (int64_t)i * 1000 + c;
+            CHECK(col_rel_append_row(rel, row) == 0,
+                "public overlap source rows");
+        }
+        wl_columnar_memory_resolution_t resolution = {
+            .budget_bytes = 1u << 22, .usable_bytes = 1u << 22,
+                .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+                .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+                .status = WL_COLUMNAR_MEMORY_OK
+        };
+        wl_columnar_memory_governor_ref_t *ref
+            = wl_columnar_memory_governor_ref_create(&resolution);
+        CHECK(ref && col_rel_attach_memory_governor(rel, ref) == 0,
+            "public append overlap governed relation");
+        wl_columnar_memory_governor_t *governor
+            = wl_columnar_memory_governor_ref_get(ref);
+        uint64_t credit = wl_columnar_memory_reserved(governor);
+        col_rel_t before = *rel;
+        const int64_t *inside = &rel->columns[0][3];
+        int64_t expected[32];
+        memcpy(expected, inside, width * sizeof(*inside));
+        if (wide) {
+            wl_columnar_memory_reservation_t blocker;
+            wl_columnar_memory_reservation_init(&blocker);
+            CHECK(wl_columnar_memory_reserve(governor,
+                resolution.usable_bytes - credit, &blocker)
+                && wl_columnar_memory_commit(&blocker, &blocker),
+                "wide staging budget blocker");
+            CHECK(col_rel_append_row(rel, inside) == ENOMEM
+                && rel->memory_budget_denial_pending
+                && mutation_payload_unchanged(rel, &before)
+                && wl_columnar_memory_reserved(governor) ==
+                resolution.usable_bytes,
+                "wide scratch admission failure is transactional and typed");
+            CHECK(wl_columnar_memory_release(&blocker), "wide staging unblock");
+#ifdef WL_TEST_ALLOC_WRAP
+            allocation_calls = 0;
+            allocation_fail_at = 0;
+            int failed_rc = col_rel_append_row(rel, inside);
+            allocation_fail_at = -1;
+            CHECK(failed_rc == ENOMEM && !rel->memory_budget_denial_pending
+                && mutation_payload_unchanged(rel, &before)
+                && wl_columnar_memory_reserved(governor) == credit,
+                "wide staging malloc failure returns all scratch credit");
+#endif
+        }
+        CHECK(col_rel_append_row(rel, inside) == 0
+            && rel->nrows == before.nrows + 1
+            && rel->storage_generation == before.storage_generation + 1,
+            "overlapping input survives owned growth and retired old column");
+        for (uint32_t c = 0; c < width; c++)
+            CHECK(rel->columns[c][before.nrows] == expected[c],
+                "whole overlapping tuple staged before replacement");
+        /* Spare-capacity append still stages overlapping input; an external
+         * tuple uses no scratch and leaves a malloc fault unconsumed. */
+        if (wide) {
+            credit = wl_columnar_memory_reserved(governor);
+#ifdef WL_TEST_ALLOC_WRAP
+            allocation_calls = 0;
+            allocation_fail_at = 0;
+            int external_rc = col_rel_append_row(rel, row);
+            long external_calls = allocation_calls;
+            int inside_rc = col_rel_append_row(rel, rel->columns[0]);
+            allocation_fail_at = -1;
+            CHECK(external_rc == 0 && external_calls == 0 && inside_rc == ENOMEM
+                && !rel->memory_budget_denial_pending
+                && wl_columnar_memory_reserved(governor) == credit,
+                "no-overlap append does not consume a wide-scratch malloc fault");
+#endif
+            uint32_t index = rel->nrows;
+            memcpy(expected, rel->columns[0], width * sizeof(*inside));
+            CHECK(col_rel_append_row(rel, rel->columns[0]) == 0
+                && wl_columnar_memory_reserved(governor) == credit,
+                "wide overlapping spare append returns its temporary reservation");
+            for (uint32_t c = 0; c < width; c++)
+                CHECK(rel->columns[c][index] == expected[c],
+                    "wide overlapping spare append preserves tuple");
+        }
+        cleanup_relations();
+        CHECK(wl_columnar_memory_reserved(governor) == 0,
+            "public append overlap cleanup returns all credit");
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_public_append_edges_and_locked_compatibility(void)
+{
+    col_rel_t *rel = new_relation();
+    int64_t row = 43;
+    CHECK(rel && col_rel_append_row(rel, &row) == 0,
+        "public append edge setup");
+    rel->memory_budget_denial_pending = true;
+    CHECK(col_rel_append_row(rel,
+        NULL) == EINVAL && rel->memory_budget_denial_pending,
+        "null input rejects before admission without clearing evidence");
+    col_rel_t before = *rel;
+    CHECK(col_rel_append_row(rel,
+        (const int64_t *)(UINTPTR_MAX - 3)) == EOVERFLOW
+        && !rel->memory_budget_denial_pending && mutation_payload_unchanged(rel,
+        &before),
+        "public append checks input uintptr overflow before loading row");
+    uint32_t old_rows = rel->nrows, old_capacity = rel->capacity;
+    rel->nrows = rel->capacity = UINT32_MAX;
+    col_rel_t overflow_before = *rel;
+    CHECK(col_rel_append_row(rel, &row) == EOVERFLOW
+        && mutation_payload_unchanged(rel, &overflow_before),
+        "public append rejects row-count overflow without publication");
+    rel->nrows = old_rows; rel->capacity = old_capacity;
+    rel->timestamp_capacity = 1;
+    CHECK(col_rel_append_row(rel, &row) == EINVAL,
+        "public append rejects inconsistent timestamp shape");
+    rel->timestamp_capacity = 0;
+    cleanup_relations();
+    rel = new_relation();
+    wirelog_column_type_t type = WIRELOG_TYPE_FLOAT;
+    CHECK(rel && col_rel_set_column_types(rel, &type, 1) == 0,
+        "public append float shape");
+    int64_t invalid = (int64_t)UINT64_C(0x7ff8000000000000);
+    before = *rel;
+    CHECK(col_rel_append_row(rel, &invalid) == EINVAL
+        && mutation_payload_unchanged(rel, &before),
+        "public append invalid float precedes publication");
+    cleanup_relations();
+    col_rel_t *root = new_relation(), *alias = new_relation();
+    CHECK(root && alias && col_rel_append_row(root, &row) == 0
+        && col_rel_install_shared_view(alias, root) == 0,
+        "locked append compatibility setup");
+    wl_columnar_source_access_writer_t writer = { 0 };
+    CHECK(col_rel_source_writer_acquire(alias, &writer) == 0,
+        "locked append legacy source writer");
+    CHECK(col_rel_append_row_locked(alias, &row, &writer) == 0
+        && alias->storage_owner == alias && alias->nrows == 2
+        && col_rel_storage_alias_borrow_count(root) == 0,
+        "locked append retains legacy admitted alias behavior");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "locked append compatibility release");
+    cleanup_relations();
+    col_rel_t *empty = track_relation(col_rel_new_auto("append_nullary", 0));
+    CHECK(empty && col_rel_append_row(empty, &row) == 0 && empty->nrows == 1,
+        "public append initialized nullary tuple");
+    cleanup_relations();
+}
+
+static void
 test_set_cow_denial_provenance(void)
 {
     for (unsigned operation = 0; operation < 2; operation++) {
@@ -5124,6 +5395,9 @@ main(void)
 {
 #ifdef WL_TEST_RELATION_RESIZE_HOOK
     test_set_cow_descriptor_and_owner_admission();
+    test_public_append_mutation_admission();
+    test_public_append_overlapping_input();
+    test_public_append_edges_and_locked_compatibility();
     test_set_cow_denial_provenance();
     test_empty_append_all_legacy_cow_compatibility();
     test_leased_rebind_descriptor_exclusion();

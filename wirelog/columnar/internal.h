@@ -2868,8 +2868,12 @@ int
 wl_col_rel_inline_project_column(col_rel_t *dst, uint32_t dst_row,
     const col_rel_t *src, uint32_t src_row, uint32_t logical_col);
 
-/* Row append and locked row reservation reset transient denial evidence
- * under the source writer. Actual budget refusal retains legacy ENOMEM plus
+/* Public row append owns descriptor and canonical source writers throughout
+ * publication. Input tuples may overlap column storage; the public path
+ * stages the complete tuple before any replacement. Caller keeps other input
+ * buffers stable for the call. Locked append/reservation retain their legacy
+ * source-writer contract. Outer attempts reset transient denial evidence.
+ * Actual budget refusal retains legacy ENOMEM plus
  * memory_budget_denial_pending; allocation ENOMEM, EOVERFLOW and EINVAL are
  * distinct. Lower nested admission helpers do not reset outer evidence. */
 int

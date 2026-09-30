@@ -3989,12 +3989,24 @@ col_rel_apply_compound_schema(col_rel_t *r,
 
 static int
 col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
-    wl_columnar_source_access_writer_t *writer, bool writer_held)
+    wl_columnar_source_access_writer_t *writer, bool writer_held,
+    wl_columnar_relation_mutation_lease_t *lease)
 {
     bool alias_release_pending = false;
+    int64_t inline_row[16];
+    int64_t *staged_row = NULL;
+    wl_columnar_memory_reservation_t row_admission;
+    bool row_credit_held = false;
     int rc;
 
+    wl_columnar_memory_reservation_init(&row_admission);
+
     if (!r || !row || !writer)
+        return EINVAL;
+    if (lease && (lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+        || col_rel_mutation_lease_validate(lease, r)))
+        return EINVAL;
+    if (lease && (!col_rel_timestamp_shape_valid(r) || r->nrows > r->capacity))
         return EINVAL;
     /* Do all structural validation before any resize, COW, or timestamp
      * publication.  In particular, a zero-column or partially initialized
@@ -4011,6 +4023,27 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
     for (uint32_t c = 0; c < r->ncols; c++)
         if ((!r->columns || !r->columns[c]) && !empty_unallocated)
             return EINVAL;
+    bool row_overlaps = false;
+    size_t row_bytes = 0;
+    if (lease) {
+        if (r->nrows == UINT32_MAX)
+            return EOVERFLOW;
+        uint64_t bytes = (uint64_t)r->ncols * sizeof(*row);
+        uint64_t column_bytes = (uint64_t)r->capacity * sizeof(*row);
+        uintptr_t row_start = (uintptr_t)row;
+        if (bytes > SIZE_MAX || bytes > UINTPTR_MAX - row_start)
+            return EOVERFLOW;
+        row_bytes = (size_t)bytes;
+        for (uint32_t c = 0; r->columns && c < r->ncols; c++) {
+            uintptr_t column_start = (uintptr_t)r->columns[c];
+            if (column_bytes > UINTPTR_MAX - column_start)
+                return EOVERFLOW;
+            if (row_bytes && column_bytes
+                && row_start < column_start + column_bytes
+                && column_start < row_start + row_bytes)
+                row_overlaps = true;
+        }
+    }
     if (r->column_types) {
         for (uint32_t c = 0; c < r->ncols; c++) {
             if (r->column_types[c] == WIRELOG_TYPE_FLOAT
@@ -4023,13 +4056,50 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
      * but before any resize, COW, timestamp, value, or generation mutation.
      * A reader on an alias therefore excludes append on every view of the
      * same backing storage. */
-    if (!writer_held) {
+    if (!lease && !writer_held) {
         rc = col_rel_source_writer_acquire(r, writer);
         if (rc != 0)
             return rc;
     }
 
-    r->memory_budget_denial_pending = false;
+    if (!lease)
+        r->memory_budget_denial_pending = false;
+
+    /* A valid input row may be a slice of a column that publication retires.
+     * Capture the complete tuple while its descriptor and source are closed,
+     * even when this append currently needs no replacement. */
+    if (row_overlaps) {
+        if (r->ncols <= sizeof(inline_row) / sizeof(inline_row[0])) {
+            memcpy(inline_row, row, row_bytes);
+            row = inline_row;
+        } else {
+            if (r->memory_governor) {
+                wl_columnar_memory_admission_status_t status
+                    = wl_columnar_memory_reserve_checked(
+                        wl_columnar_memory_governor_ref_get(r->memory_governor),
+                        row_bytes, &row_admission);
+                if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+                    && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+                    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED) {
+                        r->memory_budget_denial_pending = true;
+                        rc = ENOMEM;
+                    } else
+                        rc = status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                            ? EOVERFLOW : EINVAL;
+                    goto release_writer;
+                }
+                /* Rejected tokens retain bytes but own no governor credit. */
+                row_credit_held = true;
+                if (!wl_columnar_memory_commit(&row_admission, &row_admission))
+                    goto enomem;
+            }
+            staged_row = malloc(row_bytes);
+            if (!staged_row)
+                goto enomem;
+            memcpy(staged_row, row, row_bytes);
+            row = staged_row;
+        }
+    }
 
     bool needs_resize = r->nrows >= r->capacity;
     bool timestamp_short = r->timestamps
@@ -4056,8 +4126,10 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
             /* Ownership transitions stage columns and timestamps together;
              * admission happens before any source buffer is copied and the
              * helper publishes the storage generation on success. */
-            int transition_rc = col_rel_grow_owned_transition_legacy_impl(r,
-                    new_cap, true);
+            int transition_rc = lease
+                ? col_rel_grow_owned_transition_publish_impl(r, new_cap, false,
+                    lease)
+                : col_rel_grow_owned_transition_legacy_impl(r, new_cap, true);
             if (transition_rc != 0) {
                 rc = transition_rc;
                 goto release_writer;
@@ -4118,7 +4190,9 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
     /* A shared view can still have spare capacity.  Privatize it before the
      * in-place row write even when no capacity growth is needed. */
     if (r->col_shared) {
-        rc = col_rel_cow_unshare_legacy_impl(r, 0, true, false, NULL);
+        rc = lease
+            ? col_rel_cow_unshare_publish_impl(r, 0, false, false, NULL, lease)
+            : col_rel_cow_unshare_legacy_impl(r, 0, true, false, NULL);
         if (rc != 0)
             goto release_writer;
         alias_release_pending = true;
@@ -4131,8 +4205,13 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
         memset(&r->timestamps[r->nrows], 0, sizeof(col_delta_timestamp_t));
     /* Structural and value validation above makes this raw copy
     * non-failing; retain the check as a defensive invariant. */
-    if (col_rel_row_copy_in_raw(r, r->nrows, row) != 0)
+    if (col_rel_row_copy_in_raw(r, r->nrows, row) != 0) {
+        /* All shape/value checks and input staging preceded publication.
+         * A leased publication cannot report recoverable partial failure. */
+        if (lease)
+            abort();
         goto einval;
+    }
     if (r->column_types) {
         for (uint32_t c = 0; c < r->ncols; c++) {
             if (r->column_types[c] == WIRELOG_TYPE_FLOAT
@@ -4151,12 +4230,15 @@ enomem:
 einval:
     rc = EINVAL;
 release_writer:
-    if (alias_release_pending) {
+    free(staged_row);
+    if (row_credit_held)
+        col_rel_release_reservation_or_abort(&row_admission);
+    if (!lease && alias_release_pending) {
         int alias_rc = col_rel_storage_alias_release(r);
         if (alias_rc != 0 && rc == 0)
             rc = alias_rc;
     }
-    if (!writer_held
+    if (!lease && !writer_held
         && wl_columnar_source_access_writer_release(writer) != 0 && rc == 0)
         rc = EINVAL;
     return rc;
@@ -4165,15 +4247,25 @@ release_writer:
 int
 col_rel_append_row(col_rel_t *r, const int64_t *row)
 {
-    wl_columnar_source_access_writer_t writer = { 0 };
-    return col_rel_append_row_impl(r, row, &writer, false);
+    wl_columnar_relation_mutation_single_t single = { 0 };
+    if (!r || !row)
+        return EINVAL;
+    int rc = col_rel_mutation_single_acquire(r, &single);
+    if (rc)
+        return rc;
+    /* Outer attempt provenance starts only after both admissions succeed. */
+    r->memory_budget_denial_pending = false;
+    rc = col_rel_append_row_impl(r, row, &single.owner.writer, true,
+            &single.lease);
+    int finish_rc = col_rel_mutation_set_finish(&single.set, rc == 0);
+    return rc ? rc : finish_rc;
 }
 
 int
 col_rel_append_row_locked(col_rel_t *r, const int64_t *row,
     wl_columnar_source_access_writer_t *writer)
 {
-    return col_rel_append_row_impl(r, row, writer, true);
+    return col_rel_append_row_impl(r, row, writer, true, NULL);
 }
 
 static int
