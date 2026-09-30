@@ -3231,7 +3231,8 @@ col_rel_set_schema_impl_capacity(col_rel_t *r, uint32_t ncols,
     /* Existing timestamps remain owned by the source until publication. */
     image.timestamps = r->timestamps;
     image.timestamp_capacity = r->timestamp_capacity;
-    if (with_timestamps && image.timestamp_capacity < image.capacity)
+    if ((with_timestamps || image.timestamps)
+        && image.timestamp_capacity < image.capacity)
         image.timestamp_capacity = image.capacity;
     uint64_t incoming_grid = 0, incoming_scratch = 0;
     if (!col_rel_payload_private_bytes(r, ncols, image.capacity,
@@ -3247,7 +3248,8 @@ col_rel_set_schema_impl_capacity(col_rel_t *r, uint32_t ncols,
         col_rel_reservation_rollback(&metadata_pending);
         return EOVERFLOW;
     }
-    if (with_timestamps && !image.timestamps && image.timestamp_capacity) {
+    if ((with_timestamps || image.timestamps) && image.timestamp_capacity
+        && (!image.timestamps || r->timestamp_capacity < image.capacity)) {
         uint64_t timestamp_bytes;
         if (!wl_columnar_memory_size_mul(image.timestamp_capacity,
             sizeof(col_delta_timestamp_t), &timestamp_bytes)
@@ -3297,11 +3299,15 @@ col_rel_set_schema_impl_capacity(col_rel_t *r, uint32_t ncols,
                 goto fail;
         }
     }
-    if (with_timestamps && !image.timestamps && image.capacity > 0) {
+    if ((with_timestamps || image.timestamps) && image.capacity > 0
+        && (!image.timestamps || r->timestamp_capacity < image.capacity)) {
         image.timestamps = (col_delta_timestamp_t *)calloc(image.capacity,
                 sizeof(*image.timestamps));
         if (!image.timestamps)
             goto fail;
+        if (r->timestamps && r->nrows)
+            memcpy(image.timestamps, r->timestamps,
+                (size_t)r->nrows * sizeof(*image.timestamps));
         image.timestamp_capacity = image.capacity;
         image_owns_timestamps = true;
     }
@@ -3318,6 +3324,8 @@ col_rel_set_schema_impl_capacity(col_rel_t *r, uint32_t ncols,
     r->columns = image.columns;
     r->row_scratch = image.row_scratch;
     r->col_names = image.col_names;
+    if (image_owns_timestamps)
+        free(r->timestamps);
     r->timestamps = image.timestamps;
     r->timestamp_capacity = image.timestamp_capacity;
     r->schema = image.schema;
@@ -4288,14 +4296,19 @@ col_rel_capacity_for_rows(uint32_t current, uint32_t required,
 static int wl_columnar_relation_reserve_rows_impl(col_rel_t *r,
     uint32_t additional,
     wl_columnar_source_access_writer_t *writer,
-    bool *out_alias_release_pending, bool begin_operation);
+    bool *out_alias_release_pending, bool begin_operation,
+    wl_columnar_relation_mutation_lease_t *lease);
 
 int
 col_rel_append_rows_atomic(col_rel_t *r, const int64_t *rows,
     uint32_t num_rows, uint32_t num_cols, bool *denied)
 {
-    wl_columnar_source_access_writer_t writer = { 0 };
-    bool alias_release_pending = false;
+    wl_columnar_relation_mutation_single_t single = { 0 };
+    wl_columnar_memory_reservation_t scratch_admission;
+    int64_t inline_rows[32];
+    int64_t *staged_rows = NULL;
+    bool scratch_credit_held = false;
+    bool overlaps = false;
     bool schema_was_unset;
     uint32_t required_rows;
     uint32_t capacity;
@@ -4314,7 +4327,8 @@ col_rel_append_rows_atomic(col_rel_t *r, const int64_t *rows,
         &input_bytes)
         || input_bytes > SIZE_MAX)
         return EOVERFLOW;
-    rc = col_rel_source_writer_acquire(r, &writer);
+    wl_columnar_memory_reservation_init(&scratch_admission);
+    rc = col_rel_mutation_single_acquire(r, &single);
     if (rc != 0)
         return rc;
 
@@ -4322,6 +4336,10 @@ col_rel_append_rows_atomic(col_rel_t *r, const int64_t *rows,
      * ENOMEM is called a budget denial only if this operation sets the bit. */
     r->memory_budget_denial_pending = false;
 
+    if (!col_rel_timestamp_shape_valid(r) || r->nrows > r->capacity) {
+        rc = EINVAL;
+        goto finish;
+    }
     if (num_rows > UINT32_MAX - r->nrows) {
         rc = EOVERFLOW;
         goto finish;
@@ -4334,7 +4352,8 @@ col_rel_append_rows_atomic(col_rel_t *r, const int64_t *rows,
     }
     if (r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID
         - (schema_was_unset ? 2u : 1u)
-        || ((required_rows > r->capacity || r->col_shared || r->arena_owned)
+        || ((required_rows > r->capacity || r->col_shared || r->arena_owned
+        || (r->timestamps && required_rows > r->timestamp_capacity))
         && r->storage_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)) {
         rc = EOVERFLOW;
         goto finish;
@@ -4355,24 +4374,91 @@ col_rel_append_rows_atomic(col_rel_t *r, const int64_t *rows,
                 goto finish;
             }
         }
-        if (r->column_types) {
-            for (uint32_t row = 0; row < num_rows; row++) {
-                const int64_t *values = rows + (size_t)row * num_cols;
-                for (uint32_t col = 0; col < r->ncols; col++) {
-                    if (r->column_types[col] == WIRELOG_TYPE_FLOAT
-                        && !wl_columnar_float_bits_valid(values[col])) {
-                        rc = EINVAL;
-                        goto finish;
-                    }
+    }
+    /* Arrow metadata describes prospective types even before physical columns
+     * have been published. Never index an unverified prospective width. */
+    if (r->column_types) {
+        if (schema_was_unset && (r->schema.n_children < 0
+            || (uint64_t)r->schema.n_children != num_cols)) {
+            rc = EINVAL;
+            goto finish;
+        }
+    }
+    uintptr_t input_start = (uintptr_t)rows;
+    if (input_bytes > UINTPTR_MAX - input_start) {
+        rc = EOVERFLOW;
+        goto finish;
+    }
+    uint64_t column_bytes;
+    if (!wl_columnar_memory_size_mul(r->capacity, sizeof(int64_t),
+        &column_bytes) || column_bytes > SIZE_MAX) {
+        rc = EOVERFLOW;
+        goto finish;
+    }
+    for (uint32_t c = 0; r->columns && c < r->ncols; c++) {
+        uintptr_t column_start = (uintptr_t)r->columns[c];
+        if (column_bytes > UINTPTR_MAX - column_start) {
+            rc = EOVERFLOW;
+            goto finish;
+        }
+        if (input_bytes && column_bytes
+            && input_start < column_start + column_bytes
+            && column_start < input_start + input_bytes)
+            overlaps = true;
+    }
+    if (r->column_types) {
+        for (uint32_t row = 0; row < num_rows; row++) {
+            for (uint32_t col = 0; col < num_cols; col++) {
+                if (r->column_types[col] == WIRELOG_TYPE_FLOAT
+                    && !wl_columnar_float_bits_valid(
+                        rows[(size_t)row * num_cols + col])) {
+                    rc = EINVAL;
+                    goto finish;
                 }
             }
+        }
+    }
+    if (overlaps) {
+        if (input_bytes <= sizeof(inline_rows)) {
+            memcpy(inline_rows, rows, (size_t)input_bytes);
+            rows = inline_rows;
+        } else {
+            if (r->memory_governor) {
+                wl_columnar_memory_admission_status_t status
+                    = wl_columnar_memory_reserve_checked(
+                        wl_columnar_memory_governor_ref_get(r->memory_governor),
+                        input_bytes, &scratch_admission);
+                if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+                    && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+                    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED) {
+                        r->memory_budget_denial_pending = true;
+                        rc = ENOMEM;
+                    } else
+                        rc = status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                            ? EOVERFLOW : EINVAL;
+                    goto finish;
+                }
+                scratch_credit_held = true;
+                if (!wl_columnar_memory_commit(&scratch_admission,
+                    &scratch_admission)) {
+                    rc = ENOMEM;
+                    goto finish;
+                }
+            }
+            staged_rows = malloc((size_t)input_bytes);
+            if (!staged_rows) {
+                rc = ENOMEM;
+                goto finish;
+            }
+            memcpy(staged_rows, rows, (size_t)input_bytes);
+            rows = staged_rows;
         }
     }
 
     /* Publish a lazy schema only after every validation that can reject the
      * batch has completed.  Schema construction itself performs admission
      * and rolls back on allocation failure; its capacity covers the batch,
-     * so the reserve below cannot expose a partially appended relation. */
+     * so no fallible reserve is needed after schema publication. */
     if (schema_was_unset) {
         rc = col_rel_capacity_for_rows(r->capacity, required_rows,
                 &capacity);
@@ -4384,12 +4470,16 @@ col_rel_append_rows_atomic(col_rel_t *r, const int64_t *rows,
             goto finish;
     }
 
-    rc = wl_columnar_relation_reserve_rows_impl(r, num_rows, &writer,
-            &alias_release_pending, false);
-    if (rc != 0) {
-        if (denied && r->memory_budget_denial_pending)
-            *denied = true;
-        goto finish;
+    if (!schema_was_unset) {
+        rc = wl_columnar_relation_reserve_rows_impl(r, num_rows, NULL,
+                NULL, false, &single.lease);
+        if (rc != 0)
+            goto finish;
+    } else {
+        /* No recoverable work remains after schema publication. */
+        assert(r->schema_ok && r->ncols == num_cols);
+        assert(r->capacity >= required_rows);
+        assert(col_rel_timestamp_shape_valid(r));
     }
 
     /* Capacity/admission and COW are now complete.  The prevalidated raw
@@ -4409,11 +4499,12 @@ col_rel_append_rows_atomic(col_rel_t *r, const int64_t *rows,
         *denied = false;
 
 finish:
-    if (alias_release_pending
-        && col_rel_storage_alias_release(r) != 0)
-        abort();
-    if (wl_columnar_source_access_writer_release(&writer) != 0)
-        abort();
+    free(staged_rows);
+    if (scratch_credit_held)
+        col_rel_release_reservation_or_abort(&scratch_admission);
+    int finish_rc = col_rel_mutation_set_finish(&single.set, rc == 0);
+    if (rc == 0)
+        rc = finish_rc;
     if (rc != 0 && denied && r->memory_budget_denial_pending)
         *denied = true;
     return rc;
@@ -4426,20 +4517,30 @@ finish:
 static int
 wl_columnar_relation_reserve_rows_impl(col_rel_t *r, uint32_t additional,
     wl_columnar_source_access_writer_t *writer,
-    bool *out_alias_release_pending, bool begin_operation)
+    bool *out_alias_release_pending, bool begin_operation,
+    wl_columnar_relation_mutation_lease_t *lease)
 {
     col_rel_t *owner = NULL;
     int rc;
-    if (!r || !writer || !out_alias_release_pending)
+    if (!r)
         return EINVAL;
-    rc = col_rel_storage_owner_resolve(r, &owner);
-    if (rc != 0 || writer->owner != &owner->source_access
-        || writer->identity != (uintptr_t)writer
-        || !wl_columnar_source_access_writer_thread_equal(writer))
-        return rc != 0 ? rc : EINVAL;
-    if (begin_operation)
-        r->memory_budget_denial_pending = false;
-    *out_alias_release_pending = false;
+    if (lease) {
+        if (writer || out_alias_release_pending || begin_operation
+            || lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+            || col_rel_mutation_lease_validate(lease, r))
+            return EINVAL;
+    } else {
+        if (!writer || !out_alias_release_pending)
+            return EINVAL;
+        rc = col_rel_storage_owner_resolve(r, &owner);
+        if (rc != 0 || writer->owner != &owner->source_access
+            || writer->identity != (uintptr_t)writer
+            || !wl_columnar_source_access_writer_thread_equal(writer))
+            return rc != 0 ? rc : EINVAL;
+        if (begin_operation)
+            r->memory_budget_denial_pending = false;
+        *out_alias_release_pending = false;
+    }
     if (additional > UINT32_MAX - r->nrows)
         return EOVERFLOW;
     uint32_t required = r->nrows + additional;
@@ -4453,15 +4554,19 @@ wl_columnar_relation_reserve_rows_impl(col_rel_t *r, uint32_t additional,
         if (r->storage_owner == r
             && col_rel_storage_alias_borrow_count(r) > 0)
             return EBUSY;
-        int rc = col_rel_grow_owned_transition_legacy_impl(r, r->capacity,
-                true);
-        if (rc == 0)
+        int rc = lease
+            ? col_rel_grow_owned_transition_publish_impl(r, r->capacity,
+                false, lease)
+            : col_rel_grow_owned_transition_legacy_impl(r, r->capacity, true);
+        if (rc == 0 && !lease)
             *out_alias_release_pending = alias_release_pending;
         return rc;
     }
     if (r->col_shared && required <= r->capacity) {
-        int rc = col_rel_cow_unshare_legacy_impl(r, 0, true, false, NULL);
-        if (rc == 0)
+        int rc = lease
+            ? col_rel_cow_unshare_publish_impl(r, 0, false, false, NULL, lease)
+            : col_rel_cow_unshare_legacy_impl(r, 0, true, false, NULL);
+        if (rc == 0 && !lease)
             *out_alias_release_pending = alias_release_pending;
         return rc;
     }
@@ -4478,8 +4583,11 @@ wl_columnar_relation_reserve_rows_impl(col_rel_t *r, uint32_t additional,
         new_cap *= 2u;
     }
     if (r->col_shared || r->arena_owned) {
-        int rc = col_rel_grow_owned_transition_legacy_impl(r, new_cap, true);
-        if (rc == 0)
+        int rc = lease
+            ? col_rel_grow_owned_transition_publish_impl(r, new_cap, false,
+                lease)
+            : col_rel_grow_owned_transition_legacy_impl(r, new_cap, true);
+        if (rc == 0 && !lease)
             *out_alias_release_pending = alias_release_pending;
         return rc;
     }
@@ -4535,7 +4643,7 @@ col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
     bool *out_alias_release_pending)
 {
     return wl_columnar_relation_reserve_rows_impl(r, additional, writer,
-               out_alias_release_pending, true);
+               out_alias_release_pending, true, NULL);
 }
 
 int
