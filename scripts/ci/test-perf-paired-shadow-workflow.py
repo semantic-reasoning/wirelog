@@ -69,7 +69,8 @@ def validate(text):
         'git merge-base --is-ancestor "$MINIMUM_SHA" "$main_sha"',
         'candidate_sha="$main_sha"',
         'for revision in "$base_sha" "$candidate_sha"; do',
-        '[[ "$revision" =~ ^[0-9a-f]{40}$ ]]',
+        'test "${#revision}" -eq 40',
+        'case "$revision" in\n              *[!0-9a-f]*) exit 1 ;;\n            esac',
         'git cat-file -e "$revision^{commit}"',
         'git merge-base --is-ancestor "$MINIMUM_SHA" "$revision"',
         'git merge-base --is-ancestor "$revision" "$main_sha"',
@@ -166,7 +167,8 @@ class ShadowContract(unittest.TestCase):
         for fragment in ['test "$DISPATCH_SHA" = "$main_sha"',
                          'git merge-base --is-ancestor "$MINIMUM_SHA" "$revision"',
                          'git merge-base --is-ancestor "$revision" "$main_sha"',
-                         '[[ "$revision" =~ ^[0-9a-f]{40}$ ]]',
+                         'test "${#revision}" -eq 40',
+                         '*[!0-9a-f]*) exit 1 ;;',
                          'git cat-file -e "$revision^{commit}"',
                          'git show "$revision:tests/test_crdt_perf_gate.c"',
                          'persist-credentials: false', 'if: always()',
@@ -242,6 +244,8 @@ esac
                      ('workflow_dispatch', 'aa_control', base, main, False),
                      ('workflow_dispatch', 'other', '', main, False),
                      ('workflow_dispatch', 'comparison', 'b' * 39, main, False),
+                     ('workflow_dispatch', 'comparison', 'b' * 41, main, False),
+                     ('workflow_dispatch', 'comparison', 'g' * 40, main, False),
                      ('workflow_dispatch', 'comparison', 'B' * 40, main, False),
                      ('schedule', '', '', base, False)]
             for event, mode, selected, dispatch, success in cases:
