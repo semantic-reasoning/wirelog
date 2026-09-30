@@ -120,3 +120,75 @@ Malformed/failed process outputs that cannot supply valid timings/correctness
 must remain raw evidence and produce invalid/incomplete v1 evidence rather than
 invented numeric values. The collector migration and workflow integration are
 separate work; this unit changes neither existing collection nor any gate.
+
+## Explicit v1 collection
+
+The legacy `paired-benchmark.py --base-sha ...` invocation retains its existing
+CLI and evidence format. Select the v1 adapter explicitly:
+
+```sh
+python scripts/perf/paired-benchmark.py v1 \
+  --mode comparison --base-sha FULL_SHA --candidate-sha FULL_SHA \
+  --base-source /checkout/base --candidate-source /checkout/candidate \
+  --base-build /build/base --candidate-build /build/candidate \
+  --base-build-log /logs/base.log --candidate-build-log /logs/candidate.log \
+  --cpu 2 --timeout 180 --out-dir /evidence/new-campaign
+```
+
+Use `--mode aa_control` for equal source SHAs and independent builds. Separate
+build log paths and different log hashes are required; originals are copied
+into the evidence directory. Builds must expose Meson introspection files.
+Preflight resolves all build options, checks compiler/profile/fixture and
+benchmark timer source equality, and records exact commit/tree IDs and artifact
+hashes in `preflight.json`. Bool, list, string and integer options use compact
+JSON strings in the v1 profile. Build IDs identify distinct collection-side
+instances; logs and recorded provenance remain evidence, not proof of an
+independent build execution.
+
+The entire fixed AB then BA schedule is durable before the first launch. Each
+block and workload has two warmup launches followed by nine adjacent pairs:
+80 serialized launches total. `--timeout` is 1..3600 seconds per launch; the
+preflight records the theoretical sum of launch timeout budgets (80 times the
+selected timeout), excluding collector/telemetry overhead. Timeout terminates
+the whole process group. Benchmark failures never shorten the schedule.
+
+`raw-attempts.jsonl` is append-only and fsynced after every launch, with raw
+commands, output and timestamped host readings. Interrupted active launches
+are killed and journaled before propagating the interruption. Positive typed
+timings with complete correctness metrics become v1 attempts, including
+nonzero exits and incorrect results. Unparseable output leaves a sequence
+absent. No reruns, replacements, trimming, or performance thresholds exist.
+Unavailable host metrics carry explicit reasons.
+
+After collection, all source/build/fixture/log artifacts are checked for drift;
+drift writes `collection-status.json` and prevents campaign publication.
+`campaign-v1.json` is published atomically, then the existing offline evaluator
+writes `evaluation-report.json` and `collection-status.json`. Its exit status
+is returned. Existing output directories are refused, including interrupted
+campaign directories. The checked-in runner workflow still uses the legacy
+collector; workflow migration is a separate unit.
+
+The v1 adapter requires a single-threaded Linux collector process. During
+collection, main-thread library calls temporarily handle SIGTERM and SIGHUP
+and restore the caller's handlers in `finally`. Signals are blocked only across
+`Popen` and process assignment; the child restores the inherited prior mask
+before exec. Process group cleanup targets only the launched PID as PGID,
+sends TERM with a 0.5-second grace, then KILL, and bounds subsequent reaping to one second. Each launch redirects stdout and
+stderr into binary temporary files opened before spawning. After cleanup the
+files are flushed, fsynced and read once with UTF-8 replacement decoding; an
+asynchronous signal cannot discard process output held in a pipe reader's
+local buffer. Secondary cleanup failures stay in raw
+evidence without replacing the original interruption. SIGTERM/SIGHUP records
+include numeric/name signal identity, partial output and host readings; the
+journal is fsynced once before unwinding. Library calls propagate the
+termination request. The CLI restores the default handler and signals itself,
+so supervisors receive the original signal termination status. Interrupted
+collection does not publish campaign or evaluation JSON.
+
+Cleanup records ordinary wait/reap errors as diagnostics. Termination requests
+and keyboard interrupts propagate through cleanup into the active-launch
+journal path. If the first termination signal arrives during recovery from
+another interruption, the signal remains the effective control interruption;
+the original primary cause and its type are retained alongside it. Cleanup is
+retried idempotently before capture and journal fsync, and KILL is attempted even
+if an interruption ends the TERM grace period.
