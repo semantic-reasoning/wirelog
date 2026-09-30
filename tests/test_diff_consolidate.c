@@ -49,6 +49,38 @@
 static int tests_passed = 0;
 static int tests_failed = 0;
 
+#if defined(__linux__)
+/* Fault injection is armed only after the fixture and merge grid exist. */
+static uint32_t shrink_fault_cols;
+static unsigned shrink_fault_ordinal;
+static unsigned shrink_alloc_ordinal;
+static bool shrink_fault_active;
+void *__real_calloc(size_t, size_t);
+void *__real_malloc(size_t);
+void *
+__wrap_calloc(size_t count, size_t size)
+{
+    if (shrink_fault_active && count == shrink_fault_cols
+        && size == sizeof(int64_t *)) {
+        shrink_alloc_ordinal++;
+        if (shrink_alloc_ordinal == shrink_fault_ordinal)
+            return NULL;
+    }
+    return __real_calloc(count, size);
+}
+
+void *
+__wrap_malloc(size_t size)
+{
+    if (shrink_fault_active && size == 64u * sizeof(int64_t)) {
+        shrink_alloc_ordinal++;
+        if (shrink_alloc_ordinal == shrink_fault_ordinal)
+            return NULL;
+    }
+    return __real_malloc(size);
+}
+#endif
+
 /* ========================================================================
  * Helpers
  * ======================================================================== */
@@ -1451,6 +1483,262 @@ test_small_cons_metadata_guard(void)
     PASS;
 }
 
+#if defined(__linux__)
+static void
+test_incremental_shrink_atomic(void)
+{
+    TEST("incremental shrink is atomic across allocation failures");
+    const uint32_t widths[] = {1, 3, 8};
+    for (unsigned path = 0; path < 2; path++) {
+        for (unsigned w = 0; w < 3; w++) {
+            uint32_t ncols = widths[w];
+            for (unsigned fault = 0; fault <= ncols + 1; fault++) {
+                wl_col_session_t *sess = make_mock_session();
+                col_rel_t *rel = col_rel_new_auto("atomic-shrink", ncols);
+                eval_stack_t stack;
+                int64_t row[8];
+                int64_t *active_before[8];
+                int64_t *grid_before[8];
+                ASSERT_TRUE(sess && rel, "shrink fixture allocation");
+                for (uint32_t i = 0; i < 256; i++) {
+                    row[0] = i % 4;
+                    for (uint32_t c = 1; c < ncols; c++)
+                        row[c] = (int64_t)c * 10 + row[0];
+                    ASSERT_TRUE(col_rel_append_row(rel, row) == 0,
+                        "shrink fixture append");
+                }
+                rel->sorted_nrows = 1;
+                rel->run_count = 1;
+                rel->run_ends[0] = 1;
+                ASSERT_TRUE(rel->capacity == 256
+                    && col_rel_reserve_merge_grid(rel, 256) == 0,
+                    "shrink fixture grid");
+                int64_t **old_table = rel->columns;
+                int64_t **old_grid = rel->merge_columns;
+                uint64_t storage_before = rel->storage_generation;
+                for (uint32_t c = 0; c < ncols; c++) {
+                    active_before[c] = rel->columns[c];
+                    grid_before[c] = rel->merge_columns[c];
+                }
+                eval_stack_init(&stack);
+                ASSERT_TRUE(eval_stack_push(&stack, rel, true) == 0,
+                    "shrink fixture push");
+                shrink_fault_cols = ncols;
+                shrink_fault_ordinal = fault;
+                shrink_alloc_ordinal = 0;
+                shrink_fault_active = true;
+                int rc = path ? col_op_consolidate_diff(&stack, sess)
+                              : col_op_consolidate(&stack, sess);
+                shrink_fault_active = false;
+                ASSERT_TRUE(rc == 0 && stack.top == 1
+                    && stack.items[0].rel == rel && stack.items[0].owned,
+                    "shrink operation retains owned result");
+                ASSERT_TRUE(shrink_alloc_ordinal == ncols + 1u
+                    || (fault != 0 && shrink_alloc_ordinal == fault),
+                    "expected pointer table and column allocations");
+                bool failed = fault != 0 && fault <= ncols + 1u;
+                ASSERT_TRUE(rel->nrows == 4 && rel->sorted_nrows == 4
+                    && rel->run_count == 1 && rel->run_ends[0] == 4,
+                    "shrink rows and run metadata");
+                ASSERT_TRUE(rel->columns == old_grid
+                    && rel->merge_columns == old_table
+                    && rel->merge_buf_cap == 256
+                    && rel->capacity == (failed ? 256u : 64u)
+                    && rel->storage_generation == storage_before
+                    + (failed ? 1u : 2u),
+                    "shrink capacity, grid and storage generation");
+                for (uint32_t c = 0; c < ncols; c++) {
+                    ASSERT_TRUE(rel->merge_columns[c] == active_before[c]
+                        && (failed ? rel->columns[c] == grid_before[c]
+                                   : rel->columns[c] != grid_before[c]),
+                        "shrink preserves or replaces every active column");
+                    for (uint32_t i = 0; i < 4; i++)
+                        ASSERT_TRUE(rel->columns[c][i]
+                            == (int64_t)(c * 10u + i),
+                            "shrink output order");
+                    int64_t sentinel = INT64_C(0x12456789) + c;
+                    rel->columns[c][rel->capacity - 1u] = sentinel;
+                    ASSERT_TRUE(rel->columns[c][rel->capacity - 1u]
+                        == sentinel, "shrink capacity boundary is writable");
+                }
+                row[0] = 5;
+                for (uint32_t c = 1; c < ncols; c++)
+                    row[c] = (int64_t)c * 10 + row[0];
+                ASSERT_TRUE(col_rel_append_row(rel, row) == 0,
+                    "shrink result remains appendable");
+                rc = path ? col_op_consolidate_diff(&stack, sess)
+                          : col_op_consolidate(&stack, sess);
+                ASSERT_TRUE(rc == 0 && rel->nrows == 5
+                    && rel->sorted_nrows == 5 && rel->run_ends[0] == 5
+                    && col_rel_get(rel, 4, 0) == 5,
+                    "shrink result remains reusable");
+                ASSERT_TRUE(eval_stack_drain(&stack) == 0,
+                    "shrink result disposal");
+                destroy_mock_session(sess);
+            }
+        }
+    }
+    PASS;
+}
+
+static void
+test_borrowed_consolidation_preserves_source(void)
+{
+    TEST("borrowed consolidation preserves the source");
+    for (unsigned path = 0; path < 2; path++) {
+        wl_col_session_t *sess = make_mock_session();
+        col_rel_t *source = col_rel_new_auto("borrowed-shrink", 3);
+        eval_stack_t stack;
+        int64_t row[3];
+        ASSERT_TRUE(sess && source, "borrowed shrink fixture");
+        for (uint32_t i = 0; i < 256; i++) {
+            row[0] = i % 4;
+            row[1] = 10 + row[0];
+            row[2] = 20 + row[0];
+            ASSERT_TRUE(col_rel_append_row(source, row) == 0,
+                "borrowed shrink fixture append");
+        }
+        source->sorted_nrows = 1;
+        int64_t **source_columns = source->columns;
+        uint32_t source_capacity = source->capacity;
+        uint64_t source_storage = source->storage_generation;
+        uint64_t source_view = source->view_generation;
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, source, false) == 0,
+            "borrowed shrink push");
+        int rc = path ? col_op_consolidate_diff(&stack, sess)
+                      : col_op_consolidate(&stack, sess);
+        ASSERT_TRUE(rc == 0 && stack.top == 1
+            && stack.items[0].owned && stack.items[0].rel != source,
+            "borrowed shrink creates owned result");
+        col_rel_t *result = stack.items[0].rel;
+        ASSERT_TRUE(result->nrows == 4 && result->sorted_nrows == 4
+            && result->capacity == 256 && result->run_count == 1,
+            "borrowed consolidated result");
+        ASSERT_TRUE(source->columns == source_columns
+            && source->capacity == source_capacity
+            && source->storage_generation == source_storage
+            && source->view_generation == source_view
+            && source->nrows == 256,
+            "borrowed shrink source remains unchanged");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0,
+            "borrowed shrink result disposal");
+        col_rel_destroy(source);
+        destroy_mock_session(sess);
+    }
+    PASS;
+}
+
+static void
+test_incremental_shrink_refuses_live_borrows(void)
+{
+    TEST("incremental shrink waits for readers and storage aliases");
+    for (unsigned path = 0; path < 2; path++) {
+        for (unsigned block = 0; block < 2; block++) {
+            wl_col_session_t *sess = make_mock_session();
+            col_rel_t *rel = col_rel_new_auto("blocked-shrink", 3);
+            col_rel_t *alias = col_rel_new_auto("blocked-shrink-alias", 3);
+            wl_columnar_source_access_reader_t reader = { 0 };
+            eval_stack_t stack;
+            int64_t row[3] = {7, 8, 9};
+            ASSERT_TRUE(sess && rel && alias, "blocked shrink fixture");
+            for (uint32_t i = 0; i < 256; i++)
+                ASSERT_TRUE(col_rel_append_row(rel, row) == 0,
+                    "blocked shrink append");
+            rel->sorted_nrows = 1;
+            ASSERT_TRUE(col_rel_reserve_merge_grid(rel, 256) == 0,
+                "blocked shrink grid");
+            if (block == 0)
+                ASSERT_TRUE(col_rel_source_reader_acquire(rel, &reader) == 0,
+                    "blocked shrink reader");
+            else
+                ASSERT_TRUE(col_rel_install_shared_view(alias, rel) == 0,
+                    "blocked shrink alias");
+            int64_t **columns = rel->columns;
+            uint32_t capacity = rel->capacity;
+            uint64_t generation = rel->storage_generation;
+            eval_stack_init(&stack);
+            ASSERT_TRUE(eval_stack_push(&stack, rel, true) == 0,
+                "blocked shrink push");
+            int rc = path ? col_op_consolidate_diff(&stack, sess)
+                          : col_op_consolidate(&stack, sess);
+            ASSERT_TRUE(rc == EBUSY && stack.top == 1
+                && stack.items[0].rel == rel && stack.items[0].owned
+                && rel->columns == columns && rel->capacity == capacity
+                && rel->storage_generation == generation
+                && rel->nrows == 256,
+                "blocked shrink retains exact retry state");
+            if (block == 0)
+                ASSERT_TRUE(col_rel_source_reader_release(&reader) == 0,
+                    "blocked shrink reader release");
+            else
+                ASSERT_TRUE(col_rel_storage_alias_release(alias) == 0,
+                    "blocked shrink alias release");
+            rc = path ? col_op_consolidate_diff(&stack, sess)
+                      : col_op_consolidate(&stack, sess);
+            ASSERT_TRUE(rc == 0 && rel->nrows == 1
+                && rel->sorted_nrows == 1 && rel->capacity == 64,
+                "blocked shrink retries after release");
+            ASSERT_TRUE(eval_stack_drain(&stack) == 0,
+                "blocked shrink result disposal");
+            col_rel_destroy(alias);
+            destroy_mock_session(sess);
+        }
+    }
+    PASS;
+}
+
+static void
+test_incremental_shrink_governed(void)
+{
+    TEST("governed consolidation keeps balanced memory admission");
+    for (unsigned path = 0; path < 2; path++) {
+        wl_col_session_t *sess = make_mock_session();
+        col_rel_t *rel = col_rel_new_auto("governed-shrink", 3);
+        wl_columnar_memory_resolution_t resolution = { 0 };
+        eval_stack_t stack;
+        int64_t row[3] = {7, 8, 9};
+        ASSERT_TRUE(sess && rel, "governed shrink fixture");
+        for (uint32_t i = 0; i < 256; i++)
+            ASSERT_TRUE(col_rel_append_row(rel, row) == 0,
+                "governed shrink append");
+        rel->sorted_nrows = 1;
+        ASSERT_TRUE(col_rel_reserve_merge_grid(rel, 256) == 0,
+            "governed shrink grid");
+        resolution.budget_bytes = 1024u * 1024u;
+        resolution.usable_bytes = resolution.budget_bytes;
+        resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+        resolution.status = WL_COLUMNAR_MEMORY_OK;
+        wl_columnar_memory_governor_ref_t *ref
+            = wl_columnar_memory_governor_ref_create(&resolution);
+        ASSERT_TRUE(ref && col_rel_attach_memory_governor(rel, ref) == 0,
+            "governed shrink admission");
+        wl_columnar_memory_governor_t *governor
+            = wl_columnar_memory_governor_ref_get(ref);
+        ASSERT_TRUE(wl_columnar_memory_reserved(governor) > 0,
+            "governed shrink charged fixture");
+        eval_stack_init(&stack);
+        ASSERT_TRUE(eval_stack_push(&stack, rel, true) == 0,
+            "governed shrink push");
+        int rc = path ? col_op_consolidate_diff(&stack, sess)
+                      : col_op_consolidate(&stack, sess);
+        ASSERT_TRUE(rc == 0 && stack.top == 1 && rel->nrows == 1
+            && rel->sorted_nrows == 1 && rel->run_count == 1,
+            "governed shrink result");
+        if (path)
+            ASSERT_TRUE(rel->capacity == 256,
+                "differential governed path skips optional shrink");
+        ASSERT_TRUE(eval_stack_drain(&stack) == 0,
+            "governed shrink disposal");
+        ASSERT_TRUE(wl_columnar_memory_reserved(governor) == 0,
+            "governed shrink credits returned");
+        wl_columnar_memory_governor_ref_release(ref);
+        destroy_mock_session(sess);
+    }
+    PASS;
+}
+#endif
+
 int
 main(void)
 {
@@ -1476,6 +1764,12 @@ main(void)
     test_merge_buffer_reuse();
     test_sorted_nrows_set_correctly();
     test_small_cons_metadata_guard();
+#if defined(__linux__)
+    test_incremental_shrink_atomic();
+    test_borrowed_consolidation_preserves_source();
+    test_incremental_shrink_refuses_live_borrows();
+    test_incremental_shrink_governed();
+#endif
 
     printf("\n=== Results: %d/%d passed ===\n",
         tests_passed, tests_passed + tests_failed);
