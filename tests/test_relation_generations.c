@@ -4866,8 +4866,24 @@ test_public_append_mutation_admission(void)
     }
 }
 
+/* Exercise the same physical-overlap and governor contract through each
+ * append authority. The locked caller retains and releases its own writer. */
+static int
+append_overlap_attempt(col_rel_t *rel, const int64_t *row, bool locked)
+{
+    if (!locked)
+        return col_rel_append_row(rel, row);
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int rc = col_rel_source_writer_acquire(rel, &writer);
+    if (rc)
+        return rc;
+    rc = col_rel_append_row_locked(rel, row, &writer);
+    int release_rc = wl_columnar_source_access_writer_release(&writer);
+    return rc ? rc : release_rc;
+}
+
 static void
-test_public_append_overlapping_input(void)
+test_append_overlapping_input(bool locked)
 {
     for (unsigned wide = 0; wide < 2; wide++) {
         uint32_t width = wide ? 32 : 1;
@@ -4878,7 +4894,7 @@ test_public_append_overlapping_input(void)
         for (uint32_t i = 0; i < COL_REL_INIT_CAP; i++) {
             for (uint32_t c = 0; c < width; c++)
                 row[c] = (int64_t)i * 1000 + c;
-            CHECK(col_rel_append_row(rel, row) == 0,
+            CHECK(append_overlap_attempt(rel, row, locked) == 0,
                 "public overlap source rows");
         }
         wl_columnar_memory_resolution_t resolution = {
@@ -4905,7 +4921,7 @@ test_public_append_overlapping_input(void)
                 resolution.usable_bytes - credit, &blocker)
                 && wl_columnar_memory_commit(&blocker, &blocker),
                 "wide staging budget blocker");
-            CHECK(col_rel_append_row(rel, inside) == ENOMEM
+            CHECK(append_overlap_attempt(rel, inside, locked) == ENOMEM
                 && rel->memory_budget_denial_pending
                 && mutation_payload_unchanged(rel, &before)
                 && wl_columnar_memory_reserved(governor) ==
@@ -4915,7 +4931,7 @@ test_public_append_overlapping_input(void)
 #ifdef WL_TEST_ALLOC_WRAP
             allocation_calls = 0;
             allocation_fail_at = 0;
-            int failed_rc = col_rel_append_row(rel, inside);
+            int failed_rc = append_overlap_attempt(rel, inside, locked);
             allocation_fail_at = -1;
             CHECK(failed_rc == ENOMEM && !rel->memory_budget_denial_pending
                 && mutation_payload_unchanged(rel, &before)
@@ -4923,7 +4939,27 @@ test_public_append_overlapping_input(void)
                 "wide staging malloc failure returns all scratch credit");
 #endif
         }
-        CHECK(col_rel_append_row(rel, inside) == 0
+        if (locked) {
+#ifdef WL_TEST_ALLOC_WRAP
+            for (long fail = wide ? 1 : 0; fail < (wide ? 4 : 2); fail++) {
+                allocation_calls = 0;
+                allocation_fail_at = fail;
+                int failed_rc = append_overlap_attempt(rel, inside, true);
+                allocation_fail_at = -1;
+                CHECK(failed_rc == ENOMEM && !rel->memory_budget_denial_pending
+                    && mutation_payload_unchanged(rel, &before)
+                    && wl_columnar_memory_reserved(governor) == credit,
+                    "locked growth failure after staging rolls back all credit");
+            }
+#endif
+            wl_columnar_relation_test_fail_next_reservation_commit();
+            CHECK(append_overlap_attempt(rel, inside, true) == ENOMEM
+                && !rel->memory_budget_denial_pending
+                && mutation_payload_unchanged(rel, &before)
+                && wl_columnar_memory_reserved(governor) == credit,
+                "locked publication failure returns staged scratch credit");
+        }
+        CHECK(append_overlap_attempt(rel, inside, locked) == 0
             && rel->nrows == before.nrows + 1
             && rel->storage_generation == before.storage_generation + 1,
             "overlapping input survives owned growth and retired old column");
@@ -4937,9 +4973,10 @@ test_public_append_overlapping_input(void)
 #ifdef WL_TEST_ALLOC_WRAP
             allocation_calls = 0;
             allocation_fail_at = 0;
-            int external_rc = col_rel_append_row(rel, row);
+            int external_rc = append_overlap_attempt(rel, row, locked);
             long external_calls = allocation_calls;
-            int inside_rc = col_rel_append_row(rel, rel->columns[0]);
+            int inside_rc = append_overlap_attempt(rel, rel->columns[0],
+                    locked);
             allocation_fail_at = -1;
             CHECK(external_rc == 0 && external_calls == 0 && inside_rc == ENOMEM
                 && !rel->memory_budget_denial_pending
@@ -4948,7 +4985,7 @@ test_public_append_overlapping_input(void)
 #endif
             uint32_t index = rel->nrows;
             memcpy(expected, rel->columns[0], width * sizeof(*inside));
-            CHECK(col_rel_append_row(rel, rel->columns[0]) == 0
+            CHECK(append_overlap_attempt(rel, rel->columns[0], locked) == 0
                 && wl_columnar_memory_reserved(governor) == credit,
                 "wide overlapping spare append returns its temporary reservation");
             for (uint32_t c = 0; c < width; c++)
@@ -4959,6 +4996,357 @@ test_public_append_overlapping_input(void)
         CHECK(wl_columnar_memory_reserved(governor) == 0,
             "public append overlap cleanup returns all credit");
         wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_locked_append_alias_overlap(void)
+{
+    for (unsigned wide = 0; wide < 2; wide++) {
+        for (unsigned full = 0; full < 2; full++) {
+            uint32_t width = wide ? 32 : 1;
+            col_rel_t *root = track_relation(col_rel_new_auto("locked_root",
+                    width));
+            col_rel_t *alias = track_relation(col_rel_new_auto("locked_alias",
+                    width));
+            col_rel_t *sibling =
+                track_relation(col_rel_new_auto("locked_sibling", width));
+            CHECK(root && alias && sibling, "locked overlap aliases");
+            int64_t row[32], expected[32];
+            uint32_t count = full ? COL_REL_INIT_CAP : 40;
+            for (uint32_t i = 0; i < count; i++) {
+                for (uint32_t c = 0; c < width; c++)
+                    row[c] = (int64_t)i * 1000 + c;
+                CHECK(col_rel_append_row(root, row) == 0,
+                    "locked alias source rows");
+            }
+            CHECK(col_rel_install_shared_view(alias, root) == 0
+                && col_rel_install_shared_view(sibling, root) == 0,
+                "locked overlap installs two aliases");
+            wl_columnar_memory_resolution_t resolution = {
+                .budget_bytes = 1u << 22, .usable_bytes = 1u << 22,
+                    .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+                    .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+                    .status = WL_COLUMNAR_MEMORY_OK
+            };
+            wl_columnar_memory_governor_ref_t *ref
+                = wl_columnar_memory_governor_ref_create(&resolution);
+            CHECK(ref && col_rel_attach_memory_governor(alias, ref) == 0,
+                "locked alias governed");
+            wl_columnar_memory_governor_t *governor
+                = wl_columnar_memory_governor_ref_get(ref);
+            uint64_t credit = wl_columnar_memory_reserved(governor);
+            col_rel_t root_before = *root, before = *alias,
+                sibling_before = *sibling;
+            const int64_t *inside = &alias->columns[0][3];
+            CHECK(3 + width <= alias->capacity,
+                "wide tuple wholly inside allocation");
+            memcpy(expected, inside, width * sizeof(*inside));
+            wl_columnar_source_access_writer_t writer = { 0 };
+            CHECK(col_rel_source_writer_acquire(alias, &writer) == 0,
+                "locked alias writer admission");
+            wl_columnar_memory_reservation_t blocker;
+            wl_columnar_memory_reservation_init(&blocker);
+            CHECK(wl_columnar_memory_reserve(governor,
+                resolution.usable_bytes - credit, &blocker)
+                && wl_columnar_memory_commit(&blocker, &blocker),
+                "locked COW quota blocker");
+            CHECK(col_rel_append_row_locked(alias, inside, &writer) == ENOMEM
+                && alias->memory_budget_denial_pending
+                && mutation_payload_unchanged(alias, &before)
+                && mutation_payload_unchanged(root, &root_before)
+                && mutation_payload_unchanged(sibling, &sibling_before)
+                && col_rel_storage_alias_borrow_count(root) == 2,
+                "locked COW quota refusal preserves payload and alias borrows");
+            CHECK(wl_columnar_memory_release(&blocker)
+                && wl_columnar_memory_reserved(governor) == credit,
+                "locked COW quota blocker releases exact credit");
+#ifdef WL_TEST_ALLOC_WRAP
+            for (long fail = 0; fail < (wide ? 3 : 2); fail++) {
+                allocation_calls = 0;
+                allocation_fail_at = fail;
+                int failed_rc = col_rel_append_row_locked(alias, inside,
+                        &writer);
+                allocation_fail_at = -1;
+                CHECK(failed_rc == ENOMEM &&
+                    !alias->memory_budget_denial_pending
+                    && mutation_payload_unchanged(alias, &before)
+                    && mutation_payload_unchanged(root, &root_before)
+                    && mutation_payload_unchanged(sibling, &sibling_before)
+                    && col_rel_storage_alias_borrow_count(root) == 2
+                    && wl_columnar_memory_reserved(governor) == credit,
+                    "locked COW allocation failure returns scratch and payload credit");
+            }
+#endif
+            wl_columnar_relation_test_fail_next_prepare_resize();
+            CHECK(col_rel_append_row_locked(alias, inside, &writer) == ENOMEM
+                && !alias->memory_budget_denial_pending
+                && mutation_payload_unchanged(alias, &before)
+                && mutation_payload_unchanged(root, &root_before)
+                && mutation_payload_unchanged(sibling, &sibling_before)
+                && col_rel_storage_alias_borrow_count(root) == 2
+                && wl_columnar_memory_reserved(governor) == credit,
+                "locked COW preparation failure preserves both aliases and credit");
+            if (wide) {
+                wl_columnar_memory_reservation_init(&blocker);
+                CHECK(wl_columnar_memory_reserve(governor,
+                    resolution.usable_bytes - credit - sizeof(expected),
+                    &blocker)
+                    && wl_columnar_memory_commit(&blocker, &blocker),
+                    "wide COW admits scratch but blocks payload");
+                CHECK(col_rel_append_row_locked(alias, inside,
+                    &writer) == ENOMEM
+                    && alias->memory_budget_denial_pending
+                    && mutation_payload_unchanged(alias, &before)
+                    && mutation_payload_unchanged(root, &root_before)
+                    && mutation_payload_unchanged(sibling, &sibling_before)
+                    && col_rel_storage_alias_borrow_count(root) == 2
+                    && wl_columnar_memory_reserved(governor)
+                    == resolution.usable_bytes - sizeof(expected),
+                    "later payload quota denial returns wide scratch credit");
+                CHECK(wl_columnar_memory_release(&blocker),
+                    "wide COW payload quota blocker release");
+            } else {
+                wl_columnar_relation_test_fail_next_reservation_commit();
+                CHECK(col_rel_append_row_locked(alias, inside,
+                    &writer) == ENOMEM
+                    && !alias->memory_budget_denial_pending
+                    && mutation_payload_unchanged(alias, &before)
+                    && mutation_payload_unchanged(root, &root_before)
+                    && mutation_payload_unchanged(sibling, &sibling_before)
+                    && col_rel_storage_alias_borrow_count(root) == 2
+                    && wl_columnar_memory_reserved(governor) == credit,
+                    "locked COW publication failure rolls back borrows and credit");
+            }
+            CHECK(col_rel_append_row_locked(alias, inside, &writer) == 0
+                && alias->storage_owner == alias && !alias->col_shared
+                && alias->nrows == before.nrows + 1
+                && alias->view_generation == before.view_generation + 1
+                && alias->storage_generation == before.storage_generation + 1
+                && col_rel_storage_alias_borrow_count(root) == 1,
+                "locked COW immediately releases exactly one alias");
+            for (uint32_t c = 0; c < width; c++) {
+                CHECK(alias->columns[c][before.nrows] == expected[c],
+                    "locked COW copies complete overlapping tuple");
+                for (uint32_t i = 0; i < count; i++)
+                    CHECK(root->columns[c][i] == (int64_t)i * 1000 + c
+                        && sibling->columns[c][i] == root->columns[c][i],
+                        "locked COW leaves root and sibling data exact");
+            }
+            atomic_store_explicit(&root_before.storage_alias_borrows, 1,
+                memory_order_relaxed);
+            CHECK(mutation_payload_unchanged(root, &root_before)
+                && mutation_payload_unchanged(sibling, &sibling_before),
+                "locked COW preserves root and sibling pointers and epochs");
+            CHECK(writer.owner == &root->source_access
+                && wl_columnar_source_access_writer_release(&writer) == 0,
+                "locked append retains original owner writer for caller");
+            cleanup_relations();
+            CHECK(wl_columnar_memory_reserved(governor) == 0,
+                "locked alias cleanup releases all credit");
+            wl_columnar_memory_governor_ref_release(ref);
+        }
+    }
+}
+
+typedef struct {
+    col_rel_t *relation;
+    wl_columnar_source_access_writer_t *writer;
+    int rc;
+} locked_append_thread_args_t;
+
+static void *
+locked_append_foreign_thread(void *arg)
+{
+    locked_append_thread_args_t *args = arg;
+    /* An invalid row endpoint would overflow if payload validation ran. */
+    args->rc = col_rel_append_row_locked(args->relation,
+            (const int64_t *)(UINTPTR_MAX - 3), args->writer);
+    return NULL;
+}
+
+static void
+test_locked_append_authority_and_edges(void)
+{
+    col_rel_t *rel = new_relation(), *other = new_relation();
+    int64_t row = 17;
+    CHECK(rel && other && col_rel_append_row(rel, &row) == 0,
+        "locked edge relations");
+    rel->memory_budget_denial_pending = true;
+    wl_columnar_source_access_writer_t writer = { 0 }, invalid = { 0 };
+    CHECK(col_rel_append_row_locked(rel, (const int64_t *)(UINTPTR_MAX - 3),
+        &invalid) == EINVAL && rel->memory_budget_denial_pending,
+        "absent writer preserves evidence before row read");
+    CHECK(col_rel_source_writer_acquire(other, &writer) == 0,
+        "locked foreign owner writer");
+    CHECK(col_rel_append_row_locked(rel, (const int64_t *)(UINTPTR_MAX - 3),
+        &writer) == EINVAL && rel->memory_budget_denial_pending,
+        "foreign owner rejects before overlap arithmetic");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0
+        && col_rel_source_writer_acquire(rel, &writer) == 0,
+        "locked correct writer");
+    invalid = writer;
+    CHECK(col_rel_append_row_locked(rel, &row, &invalid) == EINVAL
+        && rel->memory_budget_denial_pending,
+        "copied writer rejects before admission");
+    locked_append_thread_args_t args = { .relation = rel, .writer = &writer };
+    wl_thread_t thread;
+    CHECK(wl_thread_create(&thread, locked_append_foreign_thread, &args) == 0
+        && wl_thread_join(&thread) == 0 && args.rc == EINVAL
+        && rel->memory_budget_denial_pending,
+        "foreign thread rejects before payload read");
+
+    col_rel_t before = *rel;
+    CHECK(col_rel_append_row_locked(rel, (const int64_t *)(UINTPTR_MAX - 3),
+        &writer) == EOVERFLOW && !rel->memory_budget_denial_pending
+        && mutation_payload_unchanged(rel, &before),
+        "admitted row endpoint overflow clears evidence without dereference");
+    int64_t *column = rel->columns[0];
+    rel->columns[0] = (int64_t *)(UINTPTR_MAX - 3);
+    rel->memory_budget_denial_pending = true;
+    CHECK(col_rel_append_row_locked(rel, &row, &writer) == EOVERFLOW
+        && !rel->memory_budget_denial_pending,
+        "column endpoint overflow precedes dereference");
+    rel->columns[0] = column;
+    rel->timestamp_capacity = 1;
+    rel->memory_budget_denial_pending = true;
+    CHECK(col_rel_append_row_locked(rel, &row, &writer) == EINVAL
+        && !rel->memory_budget_denial_pending,
+        "admitted shape rejection clears evidence");
+    rel->timestamp_capacity = 0;
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "locked edge writer release");
+    cleanup_relations();
+}
+
+static void
+test_locked_append_legacy_descriptor_topology(void)
+{
+    col_rel_t *root = new_relation(), *alias = new_relation(),
+        *sibling = new_relation();
+    int64_t row = 37;
+    CHECK(root && alias && sibling && col_rel_append_row(root, &row) == 0
+        && col_rel_install_shared_view(alias, root) == 0
+        && col_rel_install_shared_view(sibling, root) == 0,
+        "legacy append descriptor topology relations");
+    wl_columnar_source_access_writer_t writer = { 0 };
+    CHECK(col_rel_source_writer_acquire(alias, &writer) == 0,
+        "legacy topology first descriptor admission");
+    wl_columnar_source_access_gate_t *owner_gate = writer.owner;
+    wl_columnar_source_access_gate_t *alias_gate = writer.secondary_owner;
+    CHECK(owner_gate == &root->source_access &&
+        alias_gate == &alias->descriptor_access
+        && wl_columnar_source_access_writer_release(&writer) == 0,
+        "legacy first token pins alias descriptor and canonical owner");
+    CHECK(col_rel_source_writer_acquire(sibling, &writer) == 0,
+        "legacy topology second descriptor admission");
+    CHECK(writer.owner == owner_gate &&
+        writer.secondary_owner == &sibling->descriptor_access
+        && writer.secondary_owner != alias_gate
+        && wl_columnar_source_access_writer_release(&writer) == 0,
+        "same owner does not imply the same admitted descriptor");
+    /* TODO (#2033 Unit 2B3b2): exact target lease authority must reject an
+     * alias-A token used for alias B before reads, denial reset, or scratch.
+     * The legacy owner-only append contract provides no such guarantee;
+     * characterization deliberately performs no unsafe cross-descriptor write. */
+    cleanup_relations();
+}
+
+static void
+test_locked_append_generation_boundaries(void)
+{
+    /* spare heap, growing heap, shared COW, growing arena, short arena
+     * timestamps, short heap timestamps, and spare arena with timestamps. */
+    for (unsigned kind = 0; kind < 7; kind++) {
+        bool arena_kind = kind == 3 || kind == 4 || kind == 6;
+        bool growth = kind == 1 || kind == 3;
+        bool short_ts = kind == 4 || kind == 5;
+        bool replacement = kind != 0 && kind != 6;
+        delta_pool_t *pool = arena_kind
+            ? delta_pool_create(128, sizeof(col_rel_t), 4096) : NULL;
+        wl_arena_t *arena = arena_kind ? wl_arena_create(65536) : NULL;
+        col_rel_t *root = NULL;
+        col_rel_t *rel = arena_kind
+            ? col_rel_pool_new_auto(pool, arena, "locked_arena", 32)
+            : col_rel_new_auto("locked_epoch", 32);
+        CHECK(rel && (!arena_kind || (pool && arena && rel->arena_owned)),
+            "locked epoch relation");
+        int64_t row[32];
+        for (uint32_t c = 0; c < 32; c++)
+            row[c] = 73;
+        uint32_t count = growth ? rel->capacity : 1;
+        for (uint32_t i = 0; i < count; i++)
+            CHECK(col_rel_append_row(rel, row) == 0,
+                "locked epoch source rows");
+        if (kind == 2) {
+            root = rel;
+            rel = col_rel_new_auto("locked_epoch_alias", 32);
+            CHECK(rel && col_rel_install_shared_view(rel, root) == 0,
+                "locked epoch shared view");
+        }
+        if (short_ts || kind == 6) {
+            CHECK(col_rel_enable_timestamps(rel) == 0,
+                "locked epoch timestamps");
+            if (short_ts) {
+                col_delta_timestamp_t *ts = realloc(rel->timestamps,
+                        rel->nrows * sizeof(*ts));
+                CHECK(ts, "locked epoch short physical timestamps");
+                rel->timestamps = ts;
+                rel->timestamp_capacity = rel->nrows;
+            }
+        }
+        wl_columnar_source_access_writer_t writer = { 0 };
+        CHECK(col_rel_source_writer_acquire(rel, &writer) == 0,
+            "locked epoch writer");
+        uint64_t view = rel->view_generation, storage = rel->storage_generation;
+        for (unsigned boundary = 0; boundary < (replacement ? 2u : 1u);
+            boundary++) {
+            uint64_t *epoch =
+                boundary ? &rel->storage_generation : &rel->view_generation;
+            *epoch = WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+            if (boundary && rel->storage_owner == rel)
+                rel->storage_owner_generation = *epoch;
+            col_rel_t before = *rel;
+            rel->memory_budget_denial_pending = true;
+#ifdef WL_TEST_ALLOC_WRAP
+            allocation_calls = 0;
+            allocation_fail_at = 0;
+#endif
+            CHECK(col_rel_append_row_locked(rel, rel->columns[0],
+                &writer) == EOVERFLOW
+                && !rel->memory_budget_denial_pending
+                && mutation_payload_unchanged(rel, &before),
+                "locked epoch boundary rejects before staging or publication");
+#ifdef WL_TEST_ALLOC_WRAP
+            CHECK(allocation_calls == 0,
+                "epoch rejection consumes no allocation");
+            allocation_fail_at = -1;
+#endif
+            rel->view_generation = view;
+            rel->storage_generation = storage;
+            if (rel->storage_owner == rel)
+                rel->storage_owner_generation = storage;
+        }
+        /* No replacement is required by spare arena storage alone. */
+        if (!replacement) {
+            rel->storage_generation = WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+            rel->storage_owner_generation = rel->storage_generation;
+            storage = rel->storage_generation;
+        }
+        uint32_t rows = rel->nrows;
+        CHECK(col_rel_append_row_locked(rel, rel->columns[0], &writer) == 0
+            && rel->nrows == rows + 1 && rel->columns[0][rows] == row[0]
+            && rel->view_generation == view + 1
+            && rel->storage_generation == storage + (replacement ? 1 : 0)
+            && (!short_ts || rel->timestamp_capacity == rel->capacity)
+            && (kind != 6 || rel->arena_owned),
+            "locked epoch retry publishes exact view and storage epochs");
+        CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+            "locked epoch release");
+        col_rel_destroy(rel);
+        col_rel_destroy(root);
+        delta_pool_destroy(pool);
+        wl_arena_free(arena);
     }
 }
 
@@ -5936,7 +6324,12 @@ main(void)
     test_public_batch_mutation_admission();
     test_public_batch_overlapping_input();
     test_public_append_mutation_admission();
-    test_public_append_overlapping_input();
+    test_append_overlapping_input(false);
+    test_append_overlapping_input(true);
+    test_locked_append_alias_overlap();
+    test_locked_append_authority_and_edges();
+    test_locked_append_legacy_descriptor_topology();
+    test_locked_append_generation_boundaries();
     test_public_append_edges_and_locked_compatibility();
     test_set_cow_denial_provenance();
     test_empty_append_all_legacy_cow_compatibility();
