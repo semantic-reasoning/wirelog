@@ -578,6 +578,73 @@ test_first_iteration_dedup_all_new(void)
     PASS();
 }
 
+static void
+test_fallback_retains_merge_capacity_after_heavy_dedup(void)
+{
+    TEST(
+        "fallback keeps all column allocations and truthful capacity after dedup");
+
+    col_rel_t *rel = test_rel_alloc(3);
+    col_rel_t *delta_out = test_rel_alloc(3);
+    ASSERT(rel && delta_out, "test_rel_alloc failed");
+
+    const int64_t old_row[3] = { 1000, 10, 20 };
+    const int64_t duplicate[3] = { 5, 30, 40 };
+    for (uint32_t i = 0; i < 256; i++) {
+        const int64_t *row = i == 0 ? old_row : duplicate;
+        ASSERT(test_rel_append_row(rel, row) == 0,
+            "append old and duplicate rows");
+    }
+    ASSERT(col_rel_reserve_merge_grid(rel, 256) == 0,
+        "reserve fallback merge grid");
+    uint32_t retained_capacity = rel->merge_buf_cap;
+    int64_t *retained_columns[3] = {
+        rel->merge_columns[0], rel->merge_columns[1], rel->merge_columns[2]
+    };
+    ASSERT(retained_capacity >= 256, "merge grid has spare capacity");
+
+    int fast_path = -1;
+    ASSERT(col_op_consolidate_incremental_delta(rel, 1, delta_out,
+        &fast_path) == 0, "fallback consolidation succeeds");
+    ASSERT(fast_path == 0, "heavy duplicate delta takes fallback path");
+    ASSERT(rel->nrows == 2 && rel->sorted_nrows == 2,
+        "fallback leaves two sorted rows");
+    ASSERT(rel->run_count == 1 && rel->run_ends[0] == 2,
+        "fallback records one complete run");
+    ASSERT(test_row_match(rel, 0, duplicate)
+        && test_row_match(rel, 1, old_row),
+        "fallback keeps lexicographic row order");
+    ASSERT(delta_out->nrows == 1 && test_row_match(delta_out, 0, duplicate),
+        "delta output contains only the new row");
+
+    /* The removed shrink predicate was true here, with a tight bound of
+     * COL_REL_INIT_CAP. Every primary column must still own the merge grid. */
+    uint32_t old_tight = rel->nrows + rel->nrows / 4;
+    if (old_tight < COL_REL_INIT_CAP)
+        old_tight = COL_REL_INIT_CAP;
+    ASSERT(retained_capacity > old_tight,
+        "fixture would have entered the removed shrink block");
+    ASSERT(rel->capacity == retained_capacity,
+        "primary capacity matches retained allocations");
+    for (uint32_t c = 0; c < 3; c++) {
+        ASSERT(rel->columns[c] == retained_columns[c],
+            "primary column retains its merge allocation");
+        rel->columns[c][old_tight + 1] = (int64_t)(100 + c);
+        ASSERT(rel->columns[c][old_tight + 1] == (int64_t)(100 + c),
+            "column remains writable above the former tight bound");
+    }
+
+    const int64_t later_row[3] = { 2000, 50, 60 };
+    ASSERT(test_rel_append_row(rel, later_row) == 0,
+        "relation can append using retained capacity");
+    ASSERT(rel->nrows == 3 && test_row_match(rel, 2, later_row),
+        "appended row can be read back");
+
+    test_rel_free(delta_out);
+    test_rel_free(rel);
+    PASS();
+}
+
 /* ================================================================
  * Test 5: large dataset correctness oracle
  *
@@ -1357,6 +1424,7 @@ main(void)
     test_all_duplicate_delta_no_change();
     test_partial_delta_merged_and_new();
     test_first_iteration_dedup_all_new();
+    test_fallback_retains_merge_capacity_after_heavy_dedup();
     test_large_dataset_correctness();
 
     /* Fast-path tests (Issue #239) */

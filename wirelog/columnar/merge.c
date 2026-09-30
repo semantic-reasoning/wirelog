@@ -2330,18 +2330,6 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
     rel->run_count = 1;
     rel->run_ends[0] = out;
 
-    /* Phase 3b: Right-size columns after dedup (issue #218). */
-    if (out > 0 && rel->capacity > out + out / 4) {
-        uint32_t tight = out + out / 4;
-        if (tight < COL_REL_INIT_CAP)
-            tight = COL_REL_INIT_CAP;
-        if (!rel->memory_governor
-            && col_columns_realloc(rel->columns, nc, tight) == 0)
-            wl_columnar_relation_touch_storage(rel);
-        if (!rel->memory_governor)
-            rel->capacity = tight;
-    }
-
     if (rel->timestamps) {
         free(rel->timestamps);
         rel->timestamps = NULL;
