@@ -147,9 +147,10 @@ python scripts/perf/paired-benchmark.py v1
                       'for side in base candidate; do', 'git worktree remove --force "$pair_root/$side"',
                       'git worktree prune', 'rm -rf -- "$pair_root"'])
     assert cleanup.index('rm -rf') < cleanup.index('git worktree prune')
-    for item in all_steps:
-        if 'run: |' in item and 'shell: bash' in item:
-            subprocess.run(['bash', '-n'], input=shell(item), text=True, encoding='utf-8', check=True)
+    if os.name != 'nt':
+        for item in all_steps:
+            if 'run: |' in item and 'shell: bash' in item:
+                subprocess.run(['bash', '-n'], input=shell(item), text=True, encoding='utf-8', check=True)
 
 
 class ShadowContract(unittest.TestCase):
@@ -185,6 +186,7 @@ class ShadowContract(unittest.TestCase):
         with self.assertRaises(AssertionError):
             validate(moved)
 
+    @unittest.skipIf(os.name == 'nt', 'Executable Bash fixtures require a POSIX host; Windows bash may be a WSL stub')
     def test_actual_cleanup_shell(self):
         script = shell(named(self.text, 'Clean independent worktrees and builds'))
         with tempfile.TemporaryDirectory() as directory:
@@ -216,6 +218,7 @@ class ShadowContract(unittest.TestCase):
             self.assertTrue(unrelated.exists())
             self.assertFalse((root / 'calls').exists())
 
+    @unittest.skipIf(os.name == 'nt', 'Executable Bash fixtures require a POSIX host; Windows bash may be a WSL stub')
     def test_actual_resolution_shell(self):
         script = shell(named(self.text, 'Validate trusted revisions and resolve mode'))
         # Fake git owns only repository facts; run the exact shell with its
