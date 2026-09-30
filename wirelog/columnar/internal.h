@@ -3126,6 +3126,19 @@ typedef struct {
     uint32_t k16_capacity;
     uint32_t insertion_capacity;
     size_t insertion_bytes; /* Actual capacity, including the saved row. */
+    const col_rel_t *prepared_relation;
+    uint64_t prepared_identity;
+    uint64_t prepared_view_generation;
+    uint64_t prepared_storage_generation;
+    uint64_t prepared_type_fingerprint;
+    uint32_t prepared_start;
+    uint32_t prepared_count;
+    uint32_t prepared_nrows;
+    uint32_t prepared_ncols;
+    uint32_t prepared_capacity;
+    uint32_t prepared_timestamp_capacity;
+    bool prepared_has_timestamps;
+    bool prepared_has_types;
     wl_columnar_memory_reservation_t admission;
     bool admission_active;
 } wl_columnar_radix_workspace_t;
@@ -3170,6 +3183,22 @@ wl_columnar_relation_radix_sort_with_workspace(col_rel_t *rel,
     uint32_t start_row,
     uint32_t nrows, const wl_columnar_source_access_writer_t *writer,
     const wl_columnar_radix_workspace_t *workspace);
+
+/* Lease-scoped preparation allocates the complete scratch even for sorted
+ * ranges, and preflights authority, shape and epoch headroom before allocation. */
+WL_MUST_CHECK int
+wl_columnar_relation_radix_workspace_prepare_with_lease(col_rel_t *rel,
+    uint32_t start_row, uint32_t nrows,
+    wl_columnar_radix_workspace_t *workspace,
+    wl_columnar_relation_mutation_lease_t *lease);
+
+/* Exact prepared single-range snapshot, validated before any COW. Every call
+ * requires a workspace; mutations consume its generation provenance. The
+ * caller holds a PAYLOAD_MUTATION lease. Shared detach retires its borrow here. */
+WL_MUST_CHECK int
+wl_columnar_relation_radix_sort_with_lease(col_rel_t *rel, uint32_t start_row,
+    uint32_t nrows, const wl_columnar_radix_workspace_t *workspace,
+    wl_columnar_relation_mutation_lease_t *lease);
 
 /** Stable LSD radix sort of a row-major int64_t buffer by a single key
  *  column.  Used by arrangement.c (sarr_build) and lftj.c

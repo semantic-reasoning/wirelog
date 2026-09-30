@@ -8576,6 +8576,23 @@ col_radix_sort_rows_by_key(int64_t *data, uint32_t nrows, uint32_t ncols,
  * O(n^2) but low constant overhead — faster than radix sort for small N.
  */
 static int
+wl_columnar_radix_insertion_prepared(col_rel_t *r, uint32_t start_row,
+    uint32_t nrows,
+    const wl_columnar_radix_workspace_t *workspace,
+    col_delta_timestamp_t *timestamps);
+
+static int
+wl_columnar_radix_k16_prepared(col_rel_t *r, uint32_t start_row, uint32_t nrows,
+    const wl_columnar_radix_workspace_t *workspace,
+    col_delta_timestamp_t *timestamps);
+
+static int
+wl_columnar_radix_rows_prepared(col_rel_t *r, uint32_t start_row,
+    uint32_t nrows,
+    const wl_columnar_radix_workspace_t *workspace,
+    col_delta_timestamp_t *timestamps);
+
+static int
 col_rel_insertion_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows,
     const wl_columnar_radix_workspace_t *workspace,
     col_delta_timestamp_t *timestamps)
@@ -8597,70 +8614,12 @@ col_rel_insertion_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows,
         return EINVAL;
     if (!work)
         return ENOMEM;
-    for (uint32_t i = 0; i < nrows; i++)
-        col_rel_row_copy_out(r, start_row + i, work + (size_t)i * nc);
-
-    if (timestamps)
-        memcpy(timestamps, r->timestamps + start_row,
-            (size_t)nrows * sizeof(*timestamps));
-    for (uint32_t i = 1; i < nrows; i++) {
-        col_delta_timestamp_t saved_timestamp = { 0 };
-        if (timestamps)
-            saved_timestamp = timestamps[i];
-        int64_t *tbuf = work + (size_t)nrows * nc;
-        memcpy(tbuf, work + (size_t)i * nc,
-            (size_t)nc * sizeof(*work));
-        uint32_t j = i;
-        while (j > 0) {
-            /* Compare r[start_row + j - 1] against saved key
-             * in tbuf (not the relation -- row i is overwritten
-             * after the first shift). */
-            int cmp = 0;
-            for (uint32_t c = 0; c < nc; c++) {
-                int64_t va = work[(size_t)(j - 1) * nc + c];
-                int64_t vb = tbuf[c];
-                if (r->column_types
-                    && r->column_types[c] == WIRELOG_TYPE_FLOAT) {
-                    int fcmp = wl_columnar_float_compare_bits(va, vb);
-                    if (fcmp != 0) {
-                        cmp = fcmp;
-                        break;
-                    }
-                    continue;
-                }
-                if (va > vb) {
-                    cmp = 1;
-                    break;
-                }
-                if (va < vb) {
-                    cmp = -1;
-                    break;
-                }
-            }
-            if (cmp <= 0)
-                break;
-            memcpy(work + (size_t)j * nc,
-                work + (size_t)(j - 1) * nc,
-                (size_t)nc * sizeof(*work));
-            if (timestamps)
-                timestamps[j] = timestamps[j - 1];
-            j--;
-        }
-        if (timestamps)
-            timestamps[j] = saved_timestamp;
-        memcpy(work + (size_t)j * nc, tbuf,
-            (size_t)nc * sizeof(*work));
-    }
-
-    for (uint32_t c = 0; c < nc; c++)
-        for (uint32_t i = 0; i < nrows; i++)
-            r->columns[c][start_row + i] = work[(size_t)i * nc + c];
-    if (timestamps)
-        memcpy(r->timestamps + start_row, timestamps,
-            (size_t)nrows * sizeof(*timestamps));
+    wl_columnar_radix_workspace_t prepared = { .insertion_rows = work };
+    int rc = wl_columnar_radix_insertion_prepared(r, start_row, nrows,
+            &prepared, timestamps);
     if (owns_work)
         free(work);
-    return 0;
+    return rc;
 }
 
 /* ======================================================================== */
@@ -9085,11 +9044,8 @@ radix_sort_k16(col_rel_t *r, uint32_t start_row, uint32_t nrows,
     const wl_columnar_radix_workspace_t *workspace,
     col_delta_timestamp_t *timestamps)
 {
-    uint32_t nc = r->ncols;
 
-    const uint32_t radix_bits = 16u;
-    const uint32_t num_passes = 64u / radix_bits;  /* 4 for k=16 */
-    const uint32_t hist_size = 1u << radix_bits;   /* 65536 for k=16 */
+    const uint32_t hist_size = 65536u;
 
     bool owns_workspace = workspace == NULL;
     uint32_t *perm_a = workspace ? workspace->perm_a
@@ -9121,74 +9077,6 @@ radix_sort_k16(col_rel_t *r, uint32_t start_row, uint32_t nrows,
                            : ENOMEM;
     }
 
-    for (uint32_t i = 0; i < nrows; i++)
-        perm_a[i] = i;
-
-    uint32_t *src = perm_a;
-    uint32_t *dst = perm_b;
-
-#ifdef WL_RADIX_BENCH
-    uint64_t _tU = 0, _tS = 0, _tA = 0, _t0 = 0;
-    uint32_t _nSk = 0, _nPs = 0;
-#endif
-
-    for (int c = (int)nc - 1; c >= 0; c--) {
-        const int64_t *col_data = r->columns[c];
-        for (uint32_t pass = 0; pass < num_passes; pass++) {
-            int shift = (int)(pass * radix_bits);
-            int is_sign_pass = (pass == num_passes - 1);
-
-            uint16_t first_bv;
-            {
-                int64_t val = col_data[start_row + src[0]];
-                first_bv = (uint16_t)((uint64_t)val >> shift);
-                if (is_sign_pass)
-                    first_bv ^= 0x8000u;
-            }
-#ifdef WL_RADIX_BENCH
-            _t0 = now_ns();
-#endif
-            /* SIMD-dispatched fused uniform check + count pass for k=16
-             * (Issue #363 Phase 5c extension). */
-            if (radix_uniform_count_fused_k16_fast(col_data, start_row,
-                src, nrows, shift, is_sign_pass, first_bv,
-                bv_cache, count)) {
-#ifdef WL_RADIX_BENCH
-                _tU += now_ns() - _t0;
-                _nSk++;
-#endif
-                continue;
-            }
-#ifdef WL_RADIX_BENCH
-            _tU += now_ns() - _t0;
-            _nPs++;
-            _t0 = now_ns();
-#endif
-            {
-                uint32_t running = 0;
-                for (uint32_t i = 0; i < hist_size; i++) {
-                    uint32_t cnt = count[i];
-                    count[i] = running;
-                    running += cnt;
-                }
-            }
-            for (uint32_t i = 0; i < nrows; i++) {
-                if (i + 16u < nrows)
-                    WL_PREFETCH_W(dst + count[bv_cache[i + 16u]]);
-                dst[count[bv_cache[i]]++] = src[i];
-            }
-            uint32_t *t = src;
-            src = dst;
-            dst = t;
-#ifdef WL_RADIX_BENCH
-            _tS += now_ns() - _t0;
-#endif
-        }
-    }
-
-#ifdef WL_RADIX_BENCH
-    _t0 = now_ns();
-#endif
     int64_t *temp_col = workspace ? workspace->temp_column
         : (int64_t *)wl_columnar_relation_radix_malloc(
         nrows * sizeof(int64_t), "radix_temp_column");
@@ -9201,21 +9089,13 @@ radix_sort_k16(col_rel_t *r, uint32_t start_row, uint32_t nrows,
         }
         return ENOMEM;
     }
-    for (uint32_t c = 0; c < nc; c++) {
-        int64_t *col = r->columns[c];
-        for (uint32_t i = 0; i < nrows; i++) {
-            if (i + 8u < nrows)
-                WL_PREFETCH_R(col + start_row + src[i + 8u]);
-            temp_col[i] = col[start_row + src[i]];
-        }
-        memcpy(col + start_row, temp_col, nrows * sizeof(int64_t));
-    }
-    if (timestamps) {
-        for (uint32_t i = 0; i < nrows; i++)
-            timestamps[i] = r->timestamps[start_row + src[i]];
-        memcpy(r->timestamps + start_row, timestamps,
-            (size_t)nrows * sizeof(*timestamps));
-    }
+    wl_columnar_radix_workspace_t prepared = {
+        .perm_a = perm_a, .perm_b = perm_b, .temp_column = temp_col,
+        .short_values = bv_cache,
+        .count16 = count,
+    };
+    int rc = wl_columnar_radix_k16_prepared(r, start_row, nrows, &prepared,
+            timestamps);
     if (owns_workspace) {
         free(temp_col);
         free(perm_a);
@@ -9223,22 +9103,7 @@ radix_sort_k16(col_rel_t *r, uint32_t start_row, uint32_t nrows,
         free(bv_cache);
         free(count);
     }
-#ifdef WL_RADIX_BENCH
-    _tA = now_ns() - _t0;
-    if (wl_columnar_relation_radix_bench_enabled()) {
-        uint64_t _tot = _tU + _tS + _tA;
-        fprintf(stderr,
-            "[radix-bench k=16] nrows=%u nc=%u pass=%u skip=%u "
-            "uniform_+_count=%.0f%% scatter=%.0f%% apply=%.0f%% "
-            "total_ms=%.3f\n",
-            nrows, nc, _nPs, _nSk,
-            100.0 * (double)_tU / (double)(_tot + 1),
-            100.0 * (double)_tS / (double)(_tot + 1),
-            100.0 * (double)_tA / (double)(_tot + 1),
-            (double)_tot * 1e-6);
-    }
-#endif
-    return 0;
+    return rc;
 }
 
 /*
@@ -9308,10 +9173,6 @@ wl_columnar_relation_radix_sort_rows(col_rel_t *r, uint32_t start_row,
 
     /* k=8 SIMD path: 8 passes × 256 buckets (1KB histogram, stack-allocated).
      * SIMD-dispatched fused uniform+count avoids a separate gather loop. */
-    uint32_t nc = r->ncols;
-
-    const uint32_t radix_bits = 8u;
-    const uint32_t num_passes = 64u / radix_bits;  /* 8 for k=8 */
 
     bool owns_workspace = workspace == NULL;
     uint32_t *perm_a = workspace ? workspace->perm_a
@@ -9336,6 +9197,289 @@ wl_columnar_relation_radix_sort_rows(col_rel_t *r, uint32_t start_row,
                            : ENOMEM;
     }
 
+    int64_t *temp_col = workspace ? workspace->temp_column
+        : (int64_t *)wl_columnar_relation_radix_malloc(
+        nrows * sizeof(int64_t), "radix_temp_column");
+    if (!temp_col) {
+        if (owns_workspace) {
+            free(perm_a);
+            free(perm_b);
+            free(bv_cache);
+        }
+        return ENOMEM;
+    }
+    wl_columnar_radix_workspace_t prepared = {
+        .perm_a = perm_a, .perm_b = perm_b, .temp_column = temp_col,
+        .byte_values = bv_cache,
+    };
+    int rc = wl_columnar_radix_rows_prepared(r, start_row, nrows, &prepared,
+            timestamps);
+    if (owns_workspace) {
+        free(temp_col);
+        free(perm_a);
+        free(perm_b);
+        free(bv_cache);
+    }
+    return rc;
+
+insertion:
+    {
+        int rc = col_rel_insertion_sort(r, start_row, nrows, workspace,
+                timestamps);
+        if (rc == 0)
+            wl_columnar_relation_touch_view(r);
+        return rc;
+    }
+}
+
+/* Prepared-only kernels. Every buffer and capacity is validated before COW;
+ * no allocator, admission or fallback path is reachable from these kernels. */
+static int
+wl_columnar_radix_insertion_prepared(col_rel_t *r, uint32_t start_row,
+    uint32_t nrows,
+    const wl_columnar_radix_workspace_t *workspace,
+    col_delta_timestamp_t *timestamps)
+{
+    uint32_t nc = r->ncols;
+    int64_t *work = workspace->insertion_rows;
+    for (uint32_t i = 0; i < nrows; i++)
+        col_rel_row_copy_out(r, start_row + i, work + (size_t)i * nc);
+
+    if (timestamps)
+        memcpy(timestamps, r->timestamps + start_row,
+            (size_t)nrows * sizeof(*timestamps));
+    for (uint32_t i = 1; i < nrows; i++) {
+        col_delta_timestamp_t saved_timestamp = { 0 };
+        if (timestamps)
+            saved_timestamp = timestamps[i];
+        int64_t *tbuf = work + (size_t)nrows * nc;
+        memcpy(tbuf, work + (size_t)i * nc,
+            (size_t)nc * sizeof(*work));
+        uint32_t j = i;
+        while (j > 0) {
+            /* Compare r[start_row + j - 1] against saved key
+             * in tbuf (not the relation -- row i is overwritten
+             * after the first shift). */
+            int cmp = 0;
+            for (uint32_t c = 0; c < nc; c++) {
+                int64_t va = work[(size_t)(j - 1) * nc + c];
+                int64_t vb = tbuf[c];
+                if (r->column_types
+                    && r->column_types[c] == WIRELOG_TYPE_FLOAT) {
+                    int fcmp = wl_columnar_float_compare_bits(va, vb);
+                    if (fcmp != 0) {
+                        cmp = fcmp;
+                        break;
+                    }
+                    continue;
+                }
+                if (va > vb) {
+                    cmp = 1;
+                    break;
+                }
+                if (va < vb) {
+                    cmp = -1;
+                    break;
+                }
+            }
+            if (cmp <= 0)
+                break;
+            memcpy(work + (size_t)j * nc,
+                work + (size_t)(j - 1) * nc,
+                (size_t)nc * sizeof(*work));
+            if (timestamps)
+                timestamps[j] = timestamps[j - 1];
+            j--;
+        }
+        if (timestamps)
+            timestamps[j] = saved_timestamp;
+        memcpy(work + (size_t)j * nc, tbuf,
+            (size_t)nc * sizeof(*work));
+    }
+
+    for (uint32_t c = 0; c < nc; c++)
+        for (uint32_t i = 0; i < nrows; i++)
+            r->columns[c][start_row + i] = work[(size_t)i * nc + c];
+    if (timestamps)
+        memcpy(r->timestamps + start_row, timestamps,
+            (size_t)nrows * sizeof(*timestamps));
+    return 0;
+}
+static int
+wl_columnar_radix_k16_prepared(col_rel_t *r, uint32_t start_row, uint32_t nrows,
+    const wl_columnar_radix_workspace_t *workspace,
+    col_delta_timestamp_t *timestamps)
+{
+    uint32_t nc = r->ncols;
+
+    const uint32_t radix_bits = 16u;
+    const uint32_t num_passes = 64u / radix_bits;  /* 4 for k=16 */
+    const uint32_t hist_size = 1u << radix_bits;   /* 65536 for k=16 */
+
+    uint32_t *perm_a = workspace->perm_a;
+    uint32_t *perm_b = workspace->perm_b;
+    uint16_t *bv_cache = workspace->short_values;
+    uint32_t *count = workspace->count16;
+    for (uint32_t i = 0; i < nrows; i++)
+        perm_a[i] = i;
+
+    uint32_t *src = perm_a;
+    uint32_t *dst = perm_b;
+
+#ifdef WL_RADIX_BENCH
+    uint64_t _tU = 0, _tS = 0, _tA = 0, _t0 = 0;
+    uint32_t _nSk = 0, _nPs = 0;
+#endif
+
+    for (int c = (int)nc - 1; c >= 0; c--) {
+        const int64_t *col_data = r->columns[c];
+        for (uint32_t pass = 0; pass < num_passes; pass++) {
+            int shift = (int)(pass * radix_bits);
+            int is_sign_pass = (pass == num_passes - 1);
+
+            uint16_t first_bv;
+            {
+                int64_t val = col_data[start_row + src[0]];
+                first_bv = (uint16_t)((uint64_t)val >> shift);
+                if (is_sign_pass)
+                    first_bv ^= 0x8000u;
+            }
+#ifdef WL_RADIX_BENCH
+            _t0 = now_ns();
+#endif
+            /* SIMD-dispatched fused uniform check + count pass for k=16
+             * (Issue #363 Phase 5c extension). */
+            if (radix_uniform_count_fused_k16_fast(col_data, start_row,
+                src, nrows, shift, is_sign_pass, first_bv,
+                bv_cache, count)) {
+#ifdef WL_RADIX_BENCH
+                _tU += now_ns() - _t0;
+                _nSk++;
+#endif
+                continue;
+            }
+#ifdef WL_RADIX_BENCH
+            _tU += now_ns() - _t0;
+            _nPs++;
+            _t0 = now_ns();
+#endif
+            {
+                uint32_t running = 0;
+                for (uint32_t i = 0; i < hist_size; i++) {
+                    uint32_t cnt = count[i];
+                    count[i] = running;
+                    running += cnt;
+                }
+            }
+            for (uint32_t i = 0; i < nrows; i++) {
+                if (i + 16u < nrows)
+                    WL_PREFETCH_W(dst + count[bv_cache[i + 16u]]);
+                dst[count[bv_cache[i]]++] = src[i];
+            }
+            uint32_t *t = src;
+            src = dst;
+            dst = t;
+#ifdef WL_RADIX_BENCH
+            _tS += now_ns() - _t0;
+#endif
+        }
+    }
+
+#ifdef WL_RADIX_BENCH
+    _t0 = now_ns();
+#endif
+    int64_t *temp_col = workspace->temp_column;
+    for (uint32_t c = 0; c < nc; c++) {
+        int64_t *col = r->columns[c];
+        for (uint32_t i = 0; i < nrows; i++) {
+            if (i + 8u < nrows)
+                WL_PREFETCH_R(col + start_row + src[i + 8u]);
+            temp_col[i] = col[start_row + src[i]];
+        }
+        memcpy(col + start_row, temp_col, nrows * sizeof(int64_t));
+    }
+    if (timestamps) {
+        for (uint32_t i = 0; i < nrows; i++)
+            timestamps[i] = r->timestamps[start_row + src[i]];
+        memcpy(r->timestamps + start_row, timestamps,
+            (size_t)nrows * sizeof(*timestamps));
+    }
+
+#ifdef WL_RADIX_BENCH
+    _tA = now_ns() - _t0;
+    if (wl_columnar_relation_radix_bench_enabled()) {
+        uint64_t _tot = _tU + _tS + _tA;
+        fprintf(stderr,
+            "[radix-bench k=16] nrows=%u nc=%u pass=%u skip=%u "
+            "uniform_+_count=%.0f%% scatter=%.0f%% apply=%.0f%% "
+            "total_ms=%.3f\n",
+            nrows, nc, _nPs, _nSk,
+            100.0 * (double)_tU / (double)(_tot + 1),
+            100.0 * (double)_tS / (double)(_tot + 1),
+            100.0 * (double)_tA / (double)(_tot + 1),
+            (double)_tot * 1e-6);
+    }
+#endif
+    return 0;
+}
+
+static int
+wl_columnar_radix_rows_prepared(col_rel_t *r, uint32_t start_row,
+    uint32_t nrows,
+    const wl_columnar_radix_workspace_t *workspace,
+    col_delta_timestamp_t *timestamps)
+{
+    if (nrows <= 1)
+        return 0;
+
+    /* IEEE-754 keys need a different sign transform from signed integers.
+     * Keep the established radix fast path for integer-only relations and
+     * use the typed comparator until the float radix path is introduced. */
+    if (r->column_types) {
+        for (uint32_t c = 0; c < r->ncols; c++) {
+            if (r->column_types[c] == WIRELOG_TYPE_FLOAT)
+                goto insertion;
+        }
+    }
+
+    /* Hybrid threshold: insertion sort for small segments (Issue #343) */
+    if (nrows <= 32)
+        goto insertion;
+
+    /* Adaptive radix width (Issue #363 Phase 5c): dispatch to k=16 for large
+     * arrays where fewer passes outweigh the larger histogram cost.
+     *
+     * Empirical threshold (Apple M-series, 1-col, 64-bit uniform-random keys):
+     *   nrows=10K: k8=0.66ms  k16=0.81ms  k8 faster by 1.23x
+     *   nrows=20K: k8=0.81ms  k16=0.91ms  k8 faster by 1.12x
+     *   nrows=30K: k8=0.83ms  k16=0.89ms  k8 faster by 1.08x
+     *   nrows=40K: k8=0.81ms  k16=0.82ms  near parity
+     *   nrows=50K: k8=0.79ms  k16=0.78ms  k16 faster by 1.01x
+     *   nrows=60K: k8=0.82ms  k16=0.80ms  k16 faster by 1.02x
+     *   nrows=100K: k8=1.41ms k16=1.32ms  k16 faster by 1.07x
+     * Crossover at ~40-50K rows; 50000 is a conservative round boundary.
+     *
+     * k=16 uses a scalar fused loop (not SIMD): the 4-pass reduction
+     * already yields fewer total iterations than 8-pass k=8+SIMD, and a
+     * 256KB histogram makes SIMD gather impractical (cache pressure). */
+    if (nrows >= 50000u) {
+        int rc = wl_columnar_radix_k16_prepared(r, start_row, nrows, workspace,
+                timestamps);
+        if (rc == 0)
+            wl_columnar_relation_touch_view(r);
+        return rc;
+    }
+
+    /* k=8 SIMD path: 8 passes × 256 buckets (1KB histogram, stack-allocated).
+     * SIMD-dispatched fused uniform+count avoids a separate gather loop. */
+    uint32_t nc = r->ncols;
+
+    const uint32_t radix_bits = 8u;
+    const uint32_t num_passes = 64u / radix_bits;  /* 8 for k=8 */
+
+    uint32_t *perm_a = workspace->perm_a;
+    uint32_t *perm_b = workspace->perm_b;
+    uint8_t *bv_cache = workspace->byte_values;
     for (uint32_t i = 0; i < nrows; i++)
         perm_a[i] = i;
 
@@ -9411,17 +9555,7 @@ wl_columnar_relation_radix_sort_rows(col_rel_t *r, uint32_t start_row,
     _t0 = now_ns();
 #endif
     /* Apply permutation per-column (Issue #334): contiguous access pattern. */
-    int64_t *temp_col = workspace ? workspace->temp_column
-        : (int64_t *)wl_columnar_relation_radix_malloc(
-        nrows * sizeof(int64_t), "radix_temp_column");
-    if (!temp_col) {
-        if (owns_workspace) {
-            free(perm_a);
-            free(perm_b);
-            free(bv_cache);
-        }
-        return ENOMEM;
-    }
+    int64_t *temp_col = workspace->temp_column;
     for (uint32_t c = 0; c < nc; c++) {
         int64_t *col = r->columns[c];
         /* Gather: prefetch 8 elements ahead (Issue #363 Phase 3). */
@@ -9438,12 +9572,7 @@ wl_columnar_relation_radix_sort_rows(col_rel_t *r, uint32_t start_row,
         memcpy(r->timestamps + start_row, timestamps,
             (size_t)nrows * sizeof(*timestamps));
     }
-    if (owns_workspace) {
-        free(temp_col);
-        free(perm_a);
-        free(perm_b);
-        free(bv_cache);
-    }
+
 #ifdef WL_RADIX_BENCH
     _tA = now_ns() - _t0;
     if (wl_columnar_relation_radix_bench_enabled()) {
@@ -9464,7 +9593,8 @@ wl_columnar_relation_radix_sort_rows(col_rel_t *r, uint32_t start_row,
 
 insertion:
     {
-        int rc = col_rel_insertion_sort(r, start_row, nrows, workspace,
+        int rc = wl_columnar_radix_insertion_prepared(r, start_row, nrows,
+                workspace,
                 timestamps);
         if (rc == 0)
             wl_columnar_relation_touch_view(r);
@@ -9507,6 +9637,17 @@ wl_columnar_radix_workspace_destroy(wl_columnar_radix_workspace_t *workspace)
     memset(workspace, 0, sizeof(*workspace));
 }
 
+static uint64_t
+wl_columnar_radix_type_fingerprint(const col_rel_t *rel)
+{
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (uint32_t c = 0; rel->column_types && c < rel->ncols; c++) {
+        hash ^= (uint64_t)rel->column_types[c];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
 static int
 wl_columnar_relation_radix_workspace_prepare(const col_rel_t *rel,
     const uint32_t *seg_boundaries, uint32_t seg_count,
@@ -9536,7 +9677,8 @@ wl_columnar_relation_radix_workspace_prepare(const col_rel_t *rel,
         || workspace->temp_column || workspace->insertion_rows
         || workspace->timestamps || workspace->timestamp_capacity
         || workspace->k8_capacity || workspace->k16_capacity
-        || workspace->insertion_capacity || workspace->insertion_bytes)
+        || workspace->insertion_capacity || workspace->insertion_bytes
+        || workspace->prepared_relation)
         return EINVAL;
     /* Check the entire boundary sequence before comparing any row. Partial
      * relation ranges and empty segments are valid preparation inputs. */
@@ -9705,6 +9847,24 @@ wl_columnar_relation_radix_workspace_prepare(const col_rel_t *rel,
             goto no_memory;
         workspace->insertion_capacity = insertion_rows;
         workspace->insertion_bytes = insertion_bytes;
+    }
+    /* Exact provenance is available only for a complete single range. Raw
+     * multi-segment consumers continue using capacity validation. */
+    if (seg_count == 1) {
+        workspace->prepared_relation = rel;
+        workspace->prepared_identity = rel->relation_identity;
+        workspace->prepared_view_generation = rel->view_generation;
+        workspace->prepared_storage_generation = rel->storage_generation;
+        workspace->prepared_start = seg_boundaries[0];
+        workspace->prepared_count = seg_boundaries[1] - seg_boundaries[0];
+        workspace->prepared_nrows = rel->nrows;
+        workspace->prepared_ncols = rel->ncols;
+        workspace->prepared_capacity = rel->capacity;
+        workspace->prepared_timestamp_capacity = rel->timestamp_capacity;
+        workspace->prepared_has_timestamps = rel->timestamps != NULL;
+        workspace->prepared_has_types = rel->column_types != NULL;
+        workspace->prepared_type_fingerprint =
+            wl_columnar_radix_type_fingerprint(rel);
     }
     return 0;
 
@@ -9935,7 +10095,8 @@ cleanup_workspace:
     return rc;
 }
 
-/* Sort under a writer lease the caller already holds, so a wider mutation
+/* Transitional owner-only authority for Unit 2B3b2 consolidation callers.
+ * Sort under a writer lease the caller already holds, so a wider mutation
  * transaction can keep admission across the sort.
  *
  * defer_alias_release selects what happens to the borrow the deferred COW
@@ -9986,60 +10147,135 @@ col_rel_radix_sort_locked(col_rel_t *r, uint32_t start_row, uint32_t nrows,
     return rc;
 }
 
-/* Standalone entry point: takes the canonical-owner lease itself and holds
- * it across the whole COW, permutation and publication transaction. */
-int
-col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
+/* Validate authority and physical shape before reading keys or allocating. */
+static int
+wl_columnar_radix_lease_preflight(col_rel_t *r, uint32_t start,
+    uint32_t count, wl_columnar_relation_mutation_lease_t *lease)
 {
-    wl_columnar_source_access_writer_t writer = { 0 };
-    bool alias_release_pending = false;
-    int rc;
-
-    if (!r || start_row > r->nrows || nrows > r->nrows - start_row)
+    if (!lease || lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+        || col_rel_mutation_lease_validate(lease, r))
         return EINVAL;
-    rc = col_rel_source_writer_acquire(r, &writer);
-    if (rc != 0)
+    if (start > r->nrows || count > r->nrows - start
+        || r->nrows > r->capacity || !col_rel_timestamp_shape_valid(r)
+        || (r->ncols && !r->columns))
+        return EINVAL;
+    for (uint32_t c = 0; c < r->ncols; c++)
+        if (!r->columns[c])
+            return EINVAL;
+    if (!wl_columnar_relation_generation_valid(r->view_generation))
+        return EINVAL;
+    if (r->ncols && count > 1
+        && (r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+        || (r->col_shared && r->storage_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)))
+        return EOVERFLOW;
+    return 0;
+}
+
+int
+wl_columnar_relation_radix_workspace_prepare_with_lease(col_rel_t *r,
+    uint32_t start, uint32_t count,
+    wl_columnar_radix_workspace_t *workspace,
+    wl_columnar_relation_mutation_lease_t *lease)
+{
+    int rc = wl_columnar_radix_lease_preflight(r, start, count, lease);
+    if (rc)
+        return rc;
+    uint32_t bounds[] = { start, start + count };
+    return wl_columnar_relation_radix_workspace_prepare(r, bounds, 1, 0,
+               workspace, false);
+}
+
+int
+wl_columnar_relation_radix_sort_with_lease(col_rel_t *r, uint32_t start,
+    uint32_t count, const wl_columnar_radix_workspace_t *workspace,
+    wl_columnar_relation_mutation_lease_t *lease)
+{
+    int rc = wl_columnar_radix_lease_preflight(r, start, count, lease);
+    if (rc)
+        return rc;
+    if (!workspace)
+        return EINVAL;
+    if (workspace->prepared_relation != r
+        || workspace->prepared_identity != r->relation_identity
+        || workspace->prepared_view_generation != r->view_generation
+        || workspace->prepared_storage_generation != r->storage_generation
+        || workspace->prepared_start != start ||
+        workspace->prepared_count != count
+        || workspace->prepared_nrows != r->nrows
+        || workspace->prepared_ncols != r->ncols
+        || workspace->prepared_capacity != r->capacity
+        || workspace->prepared_timestamp_capacity != r->timestamp_capacity
+        || workspace->prepared_has_timestamps != (r->timestamps != NULL)
+        || workspace->prepared_has_types != (r->column_types != NULL)
+        || workspace->prepared_type_fingerprint !=
+        wl_columnar_radix_type_fingerprint(r))
+        return EINVAL;
+    if (!r->ncols || count <= 1)
+        return 0;
+    rc = wl_columnar_relation_radix_workspace_validate(r, count, workspace);
+    if (rc || workspace->byte_values != workspace->bucket_values
+        || (void *)workspace->short_values != workspace->bucket_values)
+        return rc ? rc : EINVAL;
+    if (r->col_shared) {
+        rc = col_rel_cow_unshare_publish_impl(r, 0, false, false, NULL, lease);
+        if (rc)
+            return rc;
+    }
+    /* After detach/first row move, prepared-only kernels cannot fail. */
+    rc = wl_columnar_radix_rows_prepared(r, start, count, workspace,
+            r->timestamps ? workspace->timestamps : NULL);
+    if (rc)
+        abort();
+    return 0;
+}
+
+/* One descriptor-first mutation set covers range capture, preparation,
+ * detach, permutation and optional full-sort metadata publication. */
+static int
+wl_columnar_radix_sort_admitted(col_rel_t *r, uint32_t start,
+    uint32_t count, bool full_relation)
+{
+    wl_columnar_relation_mutation_single_t single = { 0 };
+    wl_columnar_radix_workspace_t workspace = { 0 };
+    if (!r)
+        return EINVAL;
+    if (!full_relation && count > UINT32_MAX - start)
+        return EINVAL;
+    int rc = col_rel_mutation_single_acquire(r, &single);
+    if (rc)
         return rc;
     r->memory_budget_denial_pending = false;
-    rc = col_rel_radix_sort_locked(r, start_row, nrows, &writer, false,
-            &alias_release_pending);
-    if (wl_columnar_source_access_writer_release(&writer) != 0 && rc == 0)
-        rc = EINVAL;
+    if (full_relation) {
+        start = 0;
+        count = r->nrows;
+    }
+    rc = wl_columnar_radix_lease_preflight(r, start, count, &single.lease);
+    if (!rc) {
+        rc = wl_columnar_relation_radix_workspace_prepare_with_lease(r,
+                start, count, &workspace, &single.lease);
+    }
+    if (!rc)
+        rc = wl_columnar_relation_radix_sort_with_lease(r, start, count,
+                &workspace, &single.lease);
+    if (!rc && full_relation)
+        r->sorted_nrows = count;
+    wl_columnar_radix_workspace_destroy(&workspace);
+    if (col_rel_mutation_set_finish(&single.set, rc == 0))
+        abort();
     return rc;
 }
 
-/*
- * col_rel_radix_sort_int64: sort all rows of r in-place using LSD radix sort.
- *
- * Sorts lexicographically by all ncols columns (column 0 is most significant).
- * Handles signed int64_t by flipping the sign bit on the MSB of each column
- * so that unsigned byte comparison yields the correct signed ordering.
- *
- * Complexity: O(ncols * 8 * nrows) time, O(nrows * ncols) extra space.
- * Sets r->sorted_nrows = r->nrows on completion.
- * Falls back to insertion sort on allocation failure.
- */
+int
+col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
+{
+    return wl_columnar_radix_sort_admitted(r, start_row, nrows, false);
+}
+
 int
 col_rel_radix_sort_int64(col_rel_t *r)
 {
-    if (!r) {
-        return 0;
-    }
-    /* col_rel_radix_sort() detaches a shared view itself (through the
-     * admitted col_rel_cow_unshare) and rolls the detach back if the sort
-     * cannot allocate, so no COW happens here.  It takes the canonical-owner
-     * lease, so it can also refuse with EBUSY when the relation is an owner
-     * with live alias borrows or the gate is contended.  Callers must not
-     * treat the relation as sorted afterwards: sorted_nrows is left alone
-     * here, and the status is returned so a caller that depends on the
-     * ordering can stop rather than silently dedup an unsorted relation. */
-    int rc = col_rel_radix_sort(r, 0, r->nrows);
-    if (rc == 0)
-        r->sorted_nrows = r->nrows;
-    else
-        WL_LOG(WL_LOG_SEC_CONSOLIDATION, WL_LOG_WARN,
-            "radix sort refused for %s: rc=%d", r->name ? r->name : "?", rc);
-    return rc;
+    return r ? wl_columnar_radix_sort_admitted(r, 0, 0, true) : 0;
 }
 
 int
