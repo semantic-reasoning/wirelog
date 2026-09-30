@@ -465,7 +465,7 @@ measured by `bench/bench_intern.c`; baselines are in `docs/INTERN_PERF.md`
 21 + 4 + 5 + 19 + 1 + 1 + 1 + 37 + 5 + 7 + 3 = **104 atomic call sites**
 before the source-access contract below.
 
-### 5.13 `wirelog/columnar/source_access.h` — relation source gate (20 rows)
+### 5.13 `wirelog/columnar/source_access.h` — relation source gate (21 rows)
 
 This header-only gate protects relation descriptors and canonical source storage.
 It is linked into the production relation lifecycle and its gate state is zero-initialized.
@@ -509,11 +509,12 @@ those slots and arena allocations are quiescent.
 | `source_access.h:wl_columnar_source_access_cohort_restore#2` | `cohort->source->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Republish the source reader count after all descriptors are restored |
 | `source_access.h:wl_columnar_source_access_reader_release` | `gate->state` | `atomic_load_explicit` | acquire | Observe the active gate before releasing this reader |
 | `source_access.h:wl_columnar_source_access_writer_acquire` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Linearize exclusive writer admission and retry spurious failure |
+| `source_access.h:wl_columnar_source_access_writer_validate` | `gate->state` | `atomic_load_explicit` | acquire | Validate that the address-bound, same-thread token still owns the exact writer sentinel before authorizing mutation without consuming the token |
 | `source_access.h:wl_columnar_source_access_writer_release` | `gate->state` | `atomic_load_explicit` | acquire | Validate the writer state before terminal publication |
 | `source_access.h:wl_columnar_source_access_writer_release#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Publish writer payload completion and retry spurious failure |
 | `source_access.h:wl_columnar_source_access_writer_move` | `src->owner->state` | `atomic_load_explicit` | acquire | Confirm that the source token still holds WRITER before moving its address-bound ownership to another token |
 
-### 5.14 `wirelog/columnar/relation.c` and `session.c` — alias ownership and pool promotion (25 rows)
+### 5.14 `wirelog/columnar/relation.c` and `session.c` — alias ownership and pool promotion (28 rows)
 
 The canonical owner's flattened alias count uses `wl_atomic_u64` because a
 quiesced worker can retire its alias while unrelated readers still hold the
@@ -531,6 +532,9 @@ concurrent alias removals cannot underflow the count.
 | `relation.c:col_rel_storage_alias_borrow_acquire#2` | `storage_alias_borrows` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Publish one new alias borrow without wrapping; retry with the observed value after a lost race |
 | `relation.c:col_rel_storage_alias_borrow_release` | `storage_alias_borrows` | `atomic_load_explicit` | acquire | Read the candidate count before refusing underflow or attempting retirement |
 | `relation.c:col_rel_storage_alias_borrow_release#2` | `storage_alias_borrows` | `atomic_compare_exchange_weak_explicit` | acq_rel/acquire | Retire one borrow atomically while pairing peer-visible descriptor publication with removal |
+| `relation.c:col_rel_mutation_set_unwind` | `init->relation->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Restore the exact provisional legacy borrow snapshot under the descriptor writer; its later release publishes rollback |
+| `relation.c:col_rel_mutation_set_acquire` | `relation->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Initialize provisional legacy ownership under descriptor exclusion; finish publishes commit or restores the snapshot before descriptor release |
+| `relation.c:col_rel_storage_alias_release_locked` | `owner->storage_alias_borrows` | `atomic_fetch_sub_explicit` | acq_rel | Retire exactly one validated alias borrow as the final old-owner access; release publishes descriptor rebinding and acquire pairs with published borrow accounting |
 | `relation.c:col_rel_storage_alias_release` | `alias->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Clear child-borrow metadata while the alias descriptor is exclusively held |
 | `relation.c:col_rel_destroy_checked` | `r->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave an inert pool tombstone with no live alias borrows |
 | `relation.c:col_rel_destroy_checked#2` | `r->source_access.state` | `atomic_store_explicit` | release | Keep the retired pool slot closed until allocator reset or reuse |
@@ -551,7 +555,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#2` | `src->retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Promote a committed reservation only when the pool slot still owns it |
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
-104 + 20 + 25 = **149 atomic call sites**.
+104 + 21 + 28 = **153 atomic call sites**.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -676,7 +680,7 @@ the committed token after publication and before a growth transaction.
 | `eval_dedup.c:wl_columnar_eval_dedup_test_fail_next_growth_alloc` | test-only fault flag | `atomic_store_explicit` | release | Arm one allocation refusal before a test invokes dedup growth; excluded from the production library |
 | `eval_dedup.c:wl_columnar_eval_dedup_set_grow` | test-only fault flag | `atomic_exchange_explicit` | acquire-release | Consume the one-shot fault safely when test workers grow dedup tables; excluded from the production library |
 
-The complete source audit now contains **210 atomic call sites**.
+The complete source audit now contains **214 atomic call sites**.
 
 ---
 
