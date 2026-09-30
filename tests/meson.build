@@ -927,6 +927,11 @@ test('perf_nightly_windows_contract', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-perf-nightly-windows.py'],
      suite: 'abi')
 
+# Protected-main trust boundary for the non-gating campaign-v1 shadow runner.
+test('perf_paired_shadow_workflow', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-perf-paired-shadow-workflow.py'],
+     suite: 'abi')
+
 test('perf_nightly_governor_policy', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-perf-nightly-governor-policy.py'],
      suite: 'abi')

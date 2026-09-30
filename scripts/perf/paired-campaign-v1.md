@@ -165,8 +165,8 @@ drift writes `collection-status.json` and prevents campaign publication.
 `campaign-v1.json` is published atomically, then the existing offline evaluator
 writes `evaluation-report.json` and `collection-status.json`. Its exit status
 is returned. Existing output directories are refused, including interrupted
-campaign directories. The checked-in runner workflow still uses the legacy
-collector; workflow migration is a separate unit.
+campaign directories. The checked-in shadow workflow uses this explicit v1
+adapter.
 
 The v1 adapter requires a single-threaded Linux collector process. During
 collection, main-thread library calls temporarily handle SIGTERM and SIGHUP
@@ -192,3 +192,54 @@ another interruption, the signal remains the effective control interruption;
 the original primary cause and its type are retained alongside it. Cleanup is
 retried idempotently before capture and journal fsync, and KILL is attempted even
 if an interruption ends the TERM grace period.
+
+## Protected-main shadow workflow
+
+`Paired Campaign V1 Shadow` is a descriptive, non-gating diagnostic on the
+shared `wirelog-perf` runner. Dispatch it only on protected `main`. The job
+rejects other refs and repositories before allocating a runner. It freshly
+fetches `origin/main` and requires both the checkout and event SHA to equal
+that tip; a queued run becomes ineligible if main advances before validation.
+It accepts no candidate input, PR execution, or secrets and changes no required
+check or timing threshold.
+
+For `campaign_mode=comparison`, provide a full lowercase 40-character
+`base_sha` different from the current main tip. Both measured revisions must
+be ancestors of freshly fetched main at or after the #2029 minimum revision
+`c6e263d492828d1208fa11005c18d19b05342233` and contain
+`WIRELOG_CRDT_PROBE`. That probe supplies `crdt_perf_gate_single_run`;
+historical `bench_flowlog` CRDT samples are incompatible. Candidate always
+means the fetched protected-main tip.
+
+For `campaign_mode=aa_control`, leave `base_sha` empty. The weekly Monday
+schedule also selects A/A at current main. Equal source SHAs are checked out
+and built independently in separate worktrees with distinct provenance-bearing
+logs. Both sides compile `bench_flowlog`, `test_crdt_perf_gate`, and
+`test_cspa_perf_gate` for preflight hashing; only `bench_flowlog` (CSPA) and
+`test_crdt_perf_gate` (CRDT) execute during the collector's fixed 80-launch
+AB then BA schedule. CPU selection uses the process's available affinity and
+is recorded. The 360-minute job budget accommodates 80 launch timeouts of
+180 seconds plus build and collection overhead.
+
+The `perf-paired-v1-<run>-<attempt>` artifact retains the whole evidence root
+for 35 days, including dispatch and trusted-revision provenance, affinity,
+separate configure/build logs and complete side logs. Under `campaign/`, when
+produced, it includes `preflight.json`, copied build logs,
+`raw-attempts.jsonl`, `campaign-v1.json`, `evaluation-report.json`, and
+`collection-status.json`. Upload and status summary always run; rejected or
+interrupted runs preserve partial evidence. Collector statuses remain
+`COMPLETE_VALID`, `CORRECTNESS_FAILURE`, `INVALID_EVIDENCE`, and `INCOMPLETE`;
+invalid or incomplete collection may fail the job without a timing verdict.
+Final cleanup removes worktrees and their metadata and the guarded run-specific
+runner temporary directory after upload and summary, including on failures
+and cancellation when Actions can execute cleanup.
+
+A scheduled A/A campaign measures runner and control stability. It cannot
+establish a candidate speedup or regression. All timing statistics remain
+descriptive and this workflow does not replace any required perf gate.
+
+The integration is reviewed stacked on #2035; merge and dispatch must wait
+for that collector to reach protected main. After replaying this integration
+onto the exact collector merge result and rerunning static validation, a
+protected-main A/A smoke campaign must verify 80 launches, artifact/status,
+summary, and cleanup. Static checks alone do not establish hosted execution.

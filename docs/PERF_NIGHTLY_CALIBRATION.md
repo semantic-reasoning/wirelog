@@ -27,41 +27,57 @@ largest median divided by its smallest median is at most 1.05. Otherwise,
 investigate runner stability and start a new complete campaign after the
 underlying cause changes; do not discard selected runs.
 
-## Paired regression diagnosis
+## Paired campaign shadow diagnosis
 
-The manual `Paired Perf Diagnostic` workflow gathers non-gating CRDT and CSPA
-evidence when the current nightly medians and historical targets disagree.
-Dispatch it on the candidate branch with a full 40-character `base_sha` from
-`main` that contains the CRDT single-run probe. Baselines predating the probe
-are rejected; the next campaign must wait for the probe to merge and select
-a trusted main ancestor containing it. The candidate is the dispatch ref's exact SHA. Run one campaign with
-`first=base` and another with `first=candidate`; wait for each run to finish
-before starting the next. The workflow serializes its own campaigns on the
-shared `wirelog-perf` runner. Other tagged jobs can still create contention,
-so inspect every attempt's host observations before drawing conclusions.
+`Paired Campaign V1 Shadow` collects descriptive CRDT and CSPA evidence on the
+shared `wirelog-perf` runner. Dispatch only on protected `main` with
+`campaign_mode=comparison` and a full lowercase 40-character `base_sha` from
+trusted main ancestry, different from current main. Candidate is always the
+freshly fetched main tip. Both the checkout and dispatch SHA must equal that
+tip, so an intervening main update rejects the queued run. Both measured SHAs
+must be at or after #2029 revision
+`c6e263d492828d1208fa11005c18d19b05342233`, ancestors of current main, and
+contain `WIRELOG_CRDT_PROBE`. This compatible CRDT timer is
+`crdt_perf_gate_single_run`; historical `bench_flowlog` CRDT timing is not a
+campaign-v1 baseline.
 
-The workflow builds both revisions with the same resolved release/TRACE profile,
-verifies benchmark source and fixture hashes, and runs each revision's full
-CRDT and CSPA correctness fixture before timing. CRDT invokes each revision's
-`tests/test_crdt_perf_gate` with `WIRELOG_CRDT_PROBE=1`, full fixture, and W=1.
-Its one-record JSON measures the existing gate timer around `run_crdt_once_`,
-including parse, passes, plan, session, input loading, snapshot, and teardown.
-The probe preserves pipeline/result failures and emits the compiled result
-sentinel (104,851), aggregate diagnostic, and iterations (14,148). It bypasses
-the gate's opt-in, governor, log ceiling, nine-trial median, CoV, and target
-checks. CSPA continues to use `bench_flowlog --workload cspa-fast`. Each side
-uses its own fixture directory, and artifacts hash the actual workload binaries.
-The collector rejects malformed or extra JSON records, unexpected identities
-or counts, nonfinite timing, and nonzero exits.
+Dispatch `campaign_mode=aa_control` with an empty `base_sha` for two independent
+builds of current main. The weekly Monday schedule selects this same A/A mode.
+It measures runner/control stability and cannot establish candidate speedup
+or regression. Campaigns share serialized concurrency; other tagged jobs can
+still cause contention. The runner job excludes other refs and repositories
+before allocation. There is no PR execution, secrets, performance threshold,
+or required-check status.
 
-Each campaign records nine
-samples per side per workload, alternating which revision runs first. Its
-`perf-paired-<run>-<attempt>` artifact contains `preflight.json`, correctness
-logs, build logs, `samples/metadata.json`, every warmup and trial in
-`samples/attempts.jsonl`, and `samples/summary.json`. A failed campaign still
-uploads the evidence. Treat missing trials, correctness failures, timeouts,
-runner pressure, and profile mismatch as ineligible evidence. The diagnostic
-summary has no pass/fail timing threshold and does not change nightly gates.
+The workflow uses separate worktrees and builds with GCC and the release/TRACE
+profile. Both sides compile all three binaries required by preflight hashing;
+the v1 collector executes only `bench_flowlog` for CSPA and
+`test_crdt_perf_gate` for CRDT. It selects and records an available affinity
+CPU, runs fixed AB then BA blocks with two warmups and nine adjacent pairs per
+workload/block (80 serialized launches), and evaluates evidence offline.
+See [campaign v1](../scripts/perf/paired-campaign-v1.md) for the exact contract.
+
+The `perf-paired-v1-<run>-<attempt>` artifact retains the entire evidence root
+for 35 days: requested and trusted-revision provenance, affinity, separate
+configure/build logs and complete side logs, plus `campaign/preflight.json`,
+copied logs, `campaign/raw-attempts.jsonl`, atomic `campaign/campaign-v1.json`,
+`campaign/evaluation-report.json`, and atomic `campaign/collection-status.json`
+when produced. Failed and interrupted runs upload partial evidence. Statuses
+are `COMPLETE_VALID`, `CORRECTNESS_FAILURE`, `INVALID_EVIDENCE`, or `INCOMPLETE`;
+invalid collection can fail the diagnostic job without judging timing.
+Upload and summary precede always-run guarded worktree/build cleanup.
+The 360-minute budget allows 80 launch timeouts of 180 seconds plus overhead.
+All timing statistics are descriptive and do not change nightly or required
+perf gates. Integration dispatch waits for the #2035 collector merge and
+post-merge validation; a protected-main A/A smoke run verifies hosted behavior.
+
+### Legacy 2026 diagnostic evidence
+
+The historical diagnostic used `first=base` and `first=candidate`, nine samples
+per side, and `perf-paired-<run>-<attempt>` artifacts with
+`samples/metadata.json`, `samples/attempts.jsonl`, `samples/summary.json`,
+preflight and correctness logs. These are legacy evidence, not campaign-v1
+output. The historical eligibility requirements below apply to those runs.
 
 For the #2022 diagnostic campaign, eligibility was declared before the first
 artifact was available in the [issue comment](https://github.com/semantic-reasoning/wirelog/issues/2022#issuecomment-5891544673).

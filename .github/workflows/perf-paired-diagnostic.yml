@@ -1,21 +1,22 @@
-name: Paired Perf Diagnostic
+name: Paired Campaign V1 Shadow
 
-# Manual, non-gating evidence collection for #2022 on the shared tagged runner.
 on:
   workflow_dispatch:
     inputs:
-      base_sha:
-        description: 'Trusted main-ancestor SHA containing the CRDT single-run probe'
-        required: true
-        type: string
-      first:
-        description: 'First side in odd numbered pairs; invert on repeat run'
+      campaign_mode:
+        description: 'Descriptive comparison or independent A/A control'
         required: true
         type: choice
         options:
-          - base
-          - candidate
-        default: base
+          - comparison
+          - aa_control
+        default: aa_control
+      base_sha:
+        description: 'Full trusted main ancestor SHA (comparison only)'
+        required: false
+        type: string
+  schedule:
+    - cron: '23 4 * * 1'
 
 permissions:
   contents: read
@@ -26,15 +27,18 @@ concurrency:
 
 jobs:
   paired:
-    name: Paired CRDT/CSPA evidence
+    name: Campaign v1 shadow evidence
+    if: github.ref == 'refs/heads/main' && github.repository == 'semantic-reasoning/wirelog'
     runs-on: [self-hosted, Linux, X64, wirelog-perf]
-    timeout-minutes: 150
+    timeout-minutes: 360
     env:
-      BASE_SHA: ${{ inputs.base_sha }}
-      CANDIDATE_SHA: ${{ github.sha }}
-      FIRST_SIDE: ${{ inputs.first }}
+      REQUESTED_MODE: ${{ inputs.campaign_mode }}
+      REQUESTED_BASE: ${{ inputs.base_sha }}
+      DISPATCH_SHA: ${{ github.sha }}
+      # #2029 minimum measured revision; distinct from the collector implementation base.
+      MINIMUM_SHA: c6e263d492828d1208fa11005c18d19b05342233
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -44,42 +48,63 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p perf-artifacts/paired
-          printf 'run=%s attempt=%s candidate=%s base=%s first=%s\n' \
-            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$CANDIDATE_SHA" \
-            "$BASE_SHA" "$FIRST_SIDE" > perf-artifacts/paired/dispatch.txt
-          pair_root="$RUNNER_TEMP/wirelog-paired-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          printf 'BASE_SRC=%s/base\nCANDIDATE_SRC=%s/candidate\nBASE_BUILD=%s/base-build\nCANDIDATE_BUILD=%s/candidate-build\n' \
-            "$pair_root" "$pair_root" "$pair_root" "$pair_root" >> "$GITHUB_ENV"
+          printf 'event=%s requested_mode=%s requested_base=%s dispatch_sha=%s minimum_sha=%s\n' \
+            "$GITHUB_EVENT_NAME" "$REQUESTED_MODE" "$REQUESTED_BASE" \
+            "$DISPATCH_SHA" "$MINIMUM_SHA" > perf-artifacts/paired/dispatch.txt
 
-      - name: Validate and check out exact revisions
+      - name: Validate trusted revisions and resolve mode
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$FIRST_SIDE" == base || "$FIRST_SIDE" == candidate ]]
-          [[ "$BASE_SHA" != "$CANDIDATE_SHA" ]]
-          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
-          git fetch --no-tags origin main
-          git cat-file -e "$BASE_SHA^{commit}"
-          git merge-base --is-ancestor "$BASE_SHA" FETCH_HEAD
-          # Both revisions must contain the same measurement contract. Older
-          # bench_flowlog evidence cannot serve as this probe's baseline.
-          git show "$BASE_SHA:tests/test_crdt_perf_gate.c" | grep 'WIRELOG_CRDT_PROBE' >/dev/null
-          git worktree add --detach "$BASE_SRC" "$BASE_SHA"
-          git worktree add --detach "$CANDIDATE_SRC" "$CANDIDATE_SHA"
-          test "$(git -C "$BASE_SRC" rev-parse HEAD)" = "$BASE_SHA"
-          test "$(git -C "$CANDIDATE_SRC" rev-parse HEAD)" = "$CANDIDATE_SHA"
-          test -z "$(git -C "$BASE_SRC" status --porcelain --untracked-files=no)"
-          test -z "$(git -C "$CANDIDATE_SRC" status --porcelain --untracked-files=no)"
-          {
-            uname -srmo
-            gcc --version | head -n 1
-            lscpu | sed -n '1,25p'
-            taskset -pc $$
-            git -C "$BASE_SRC" rev-parse HEAD HEAD^{tree}
-            git -C "$CANDIDATE_SRC" rev-parse HEAD HEAD^{tree}
-          } > perf-artifacts/paired/revisions-host.txt
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          main_sha="$(git rev-parse refs/remotes/origin/main^{commit})"
+          test "$(git rev-parse HEAD)" = "$main_sha"
+          test "$DISPATCH_SHA" = "$main_sha"
+          git merge-base --is-ancestor "$MINIMUM_SHA" "$main_sha"
+          candidate_sha="$main_sha"
+          if [[ "$GITHUB_EVENT_NAME" == schedule ]]; then
+            mode=aa_control
+            base_sha="$main_sha"
+          elif [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            mode="$REQUESTED_MODE"
+            case "$mode" in
+              comparison)
+                base_sha="$REQUESTED_BASE"
+                test -n "$base_sha"
+                test "$base_sha" != "$candidate_sha"
+                ;;
+              aa_control)
+                test -z "$REQUESTED_BASE"
+                base_sha="$main_sha"
+                ;;
+              *) exit 1 ;;
+            esac
+          else
+            exit 1
+          fi
+          for revision in "$base_sha" "$candidate_sha"; do
+            [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+            git cat-file -e "$revision^{commit}"
+            git merge-base --is-ancestor "$MINIMUM_SHA" "$revision"
+            git merge-base --is-ancestor "$revision" "$main_sha"
+            git show "$revision:tests/test_crdt_perf_gate.c" | grep -F 'WIRELOG_CRDT_PROBE' >/dev/null
+          done
+          printf 'mode=%s base=%s candidate=%s fetched_main=%s\n' \
+            "$mode" "$base_sha" "$candidate_sha" "$main_sha" > perf-artifacts/paired/trusted-revisions.txt
+          printf 'CAMPAIGN_MODE=%s\nBASE_SHA=%s\nCANDIDATE_SHA=%s\n' \
+            "$mode" "$base_sha" "$candidate_sha" >> "$GITHUB_ENV"
+
+      - name: Create independent worktrees
+        shell: bash
+        run: |
+          set -euo pipefail
+          pair_root="$RUNNER_TEMP/wirelog-paired-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test ! -e "$pair_root"
+          mkdir "$pair_root"
+          git worktree add --detach "$pair_root/base" "$BASE_SHA"
+          git worktree add --detach "$pair_root/candidate" "$CANDIDATE_SHA"
+          printf 'BASE_SRC=%s/base\nCANDIDATE_SRC=%s/candidate\nBASE_BUILD=%s/base-build\nCANDIDATE_BUILD=%s/candidate-build\n' \
+            "$pair_root" "$pair_root" "$pair_root" "$pair_root" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
         run: |
@@ -89,83 +114,59 @@ jobs:
       - name: Set up Meson 1.12.0
         uses: ./.github/actions/setup-meson
 
+      - name: Select available CPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          cpu="$(python -c 'import os; print(min(os.sched_getaffinity(0)))')"
+          printf 'CAMPAIGN_CPU=%s\n' "$cpu" >> "$GITHUB_ENV"
+          printf 'cpu=%s\n' "$cpu" > perf-artifacts/paired/affinity.txt
+          taskset -pc $$ >> perf-artifacts/paired/affinity.txt
+
       - name: Build both production profiles
         shell: bash
         env:
           CC: gcc
         run: |
           set -euo pipefail
-          meson setup "$BASE_BUILD" "$BASE_SRC" --buildtype=release \
-            -Dwirelog_log_max_level=trace -Dtests=true -DmbedTLS=disabled \
-            2>&1 | tee perf-artifacts/paired/base-configure.log
-          meson setup "$CANDIDATE_BUILD" "$CANDIDATE_SRC" --buildtype=release \
-            -Dwirelog_log_max_level=trace -Dtests=true -DmbedTLS=disabled \
-            2>&1 | tee perf-artifacts/paired/candidate-configure.log
-          meson compile -C "$BASE_BUILD" bench_flowlog test_crdt_perf_gate \
-            test_cspa_perf_gate 2>&1 | tee perf-artifacts/paired/base-build.log
-          meson compile -C "$CANDIDATE_BUILD" bench_flowlog \
-            test_crdt_perf_gate test_cspa_perf_gate \
-            2>&1 | tee perf-artifacts/paired/candidate-build.log
-
-      - name: Verify matched source, data, and effective build profile
-        shell: bash
-        run: |
-          set -euo pipefail
-          python scripts/perf/verify-paired-builds.py profile \
-            --base-source "$BASE_SRC" --base-build "$BASE_BUILD" \
-            --base-sha "$BASE_SHA" --candidate-source "$CANDIDATE_SRC" \
-            --candidate-build "$CANDIDATE_BUILD" \
-            --candidate-sha "$CANDIDATE_SHA" \
-            --output perf-artifacts/paired/preflight.json
-
-      - name: Verify both trees on full correctness fixtures
-        shell: bash
-        run: |
-          set -euo pipefail
           for side in base candidate; do
             if [[ "$side" == base ]]; then
-              build="$BASE_BUILD"
               source="$BASE_SRC"
+              build="$BASE_BUILD"
             else
-              build="$CANDIDATE_BUILD"
               source="$CANDIDATE_SRC"
+              build="$CANDIDATE_BUILD"
             fi
-            env WIRELOG_PERF_GATE=1 WIRELOG_GATE_CORRECTNESS_ONLY=1 \
-              WIRELOG_CRDT_DATA_DIR="$source/bench/data/crdt" \
-              taskset -c 0 "$build/tests/test_crdt_perf_gate" \
-              2>&1 | tee "perf-artifacts/paired/$side-crdt-correctness.log"
-            python scripts/perf/verify-paired-builds.py correctness \
-              --workload crdt \
-              --log "perf-artifacts/paired/$side-crdt-correctness.log"
-            env WIRELOG_PERF_GATE=1 WIRELOG_GATE_CORRECTNESS_ONLY=1 \
-              WIRELOG_CSPA_DATA_DIR="$source/bench/data/cspa" \
-              taskset -c 0 "$build/tests/test_cspa_perf_gate" \
-              2>&1 | tee "perf-artifacts/paired/$side-cspa-correctness.log"
-            python scripts/perf/verify-paired-builds.py correctness \
-              --workload cspa \
-              --log "perf-artifacts/paired/$side-cspa-correctness.log"
+            {
+              printf 'side=%s source=%s build=%s phase=configure\n' "$side" "$source" "$build"
+              meson setup "$build" "$source" --buildtype=release \
+                -Dwirelog_log_max_level=trace -Dtests=true -DmbedTLS=disabled
+            } 2>&1 | tee "perf-artifacts/paired/$side-configure.log"
+            {
+              printf 'side=%s source=%s build=%s phase=compile\n' "$side" "$source" "$build"
+              meson compile -C "$build" bench_flowlog test_crdt_perf_gate test_cspa_perf_gate
+            } 2>&1 | tee "perf-artifacts/paired/$side-build.log"
+            cat "perf-artifacts/paired/$side-configure.log" "perf-artifacts/paired/$side-build.log" \
+              > "perf-artifacts/paired/$side-complete-build.log"
           done
 
-      - name: Collect serial paired samples
+      - name: Collect campaign v1
         shell: bash
         run: |
           set -euo pipefail
-          python scripts/perf/paired-benchmark.py \
-            --base-sha "$BASE_SHA" --candidate-sha "$CANDIDATE_SHA" \
-            --base-binary "$BASE_BUILD/bench/bench_flowlog" \
-            --candidate-binary "$CANDIDATE_BUILD/bench/bench_flowlog" \
-            --base-crdt-binary "$BASE_BUILD/tests/test_crdt_perf_gate" \
-            --candidate-crdt-binary "$CANDIDATE_BUILD/tests/test_crdt_perf_gate" \
-            --base-data-root "$BASE_SRC/bench/data" \
-            --candidate-data-root "$CANDIDATE_SRC/bench/data" \
-            --out-dir perf-artifacts/paired/samples \
-            --cpu 0 --first "$FIRST_SIDE" --timeout 180
+          python scripts/perf/paired-benchmark.py v1 \
+            --mode "$CAMPAIGN_MODE" --base-sha "$BASE_SHA" --candidate-sha "$CANDIDATE_SHA" \
+            --base-source "$BASE_SRC" --candidate-source "$CANDIDATE_SRC" \
+            --base-build "$BASE_BUILD" --candidate-build "$CANDIDATE_BUILD" \
+            --base-build-log perf-artifacts/paired/base-complete-build.log \
+            --candidate-build-log perf-artifacts/paired/candidate-complete-build.log \
+            --cpu "$CAMPAIGN_CPU" --timeout 180 --out-dir perf-artifacts/paired/campaign
 
       - name: Upload all paired diagnostic evidence
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: perf-paired-${{ github.run_id }}-${{ github.run_attempt }}
+          name: perf-paired-v1-${{ github.run_id }}-${{ github.run_attempt }}
           path: perf-artifacts/paired
           if-no-files-found: error
           retention-days: 35
@@ -174,10 +175,42 @@ jobs:
         if: always()
         shell: bash
         run: |
-          echo '## Paired CRDT/CSPA diagnostic' >> "$GITHUB_STEP_SUMMARY"
-          echo 'This run does not change or replace the perf gate.' >> "$GITHUB_STEP_SUMMARY"
-          if [ -f perf-artifacts/paired/samples/summary.json ]; then
-            cat perf-artifacts/paired/samples/summary.json >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo 'No complete sample summary; inspect uploaded evidence.' >> "$GITHUB_STEP_SUMMARY"
-          fi
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          lines = ["## Campaign v1 shadow diagnostic",
+                   "All timing statistics are descriptive. This workflow does not change or replace a required perf gate.",
+                   f"Mode: {os.environ.get('CAMPAIGN_MODE', 'unresolved')}",
+                   f"Trusted base: {os.environ.get('BASE_SHA', 'unresolved')}",
+                   f"Trusted candidate: {os.environ.get('CANDIDATE_SHA', 'unresolved')}",
+                   f"Artifact: perf-paired-v1-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"]
+          status = Path('perf-artifacts/paired/campaign/collection-status.json')
+          if status.exists():
+              lines.append('Collector status/reason: ' + json.dumps(json.loads(status.read_text(encoding='utf-8')), sort_keys=True))
+          else:
+              lines.append('Collector status unavailable; inspect partial evidence.')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write('\n\n'.join(lines) + '\n')
+          PY
+
+      - name: Clean independent worktrees and builds
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+          test -n "$RUNNER_TEMP"
+          test "$RUNNER_TEMP" != /
+          pair_root="$RUNNER_TEMP/wirelog-paired-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test "$(realpath -m "$pair_root")" = "$(realpath -m "$RUNNER_TEMP")/wirelog-paired-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          cleanup_status=0
+          for side in base candidate; do
+            if [[ -d "$pair_root/$side" ]]; then
+              git worktree remove --force "$pair_root/$side" || cleanup_status=1
+            fi
+          done
+          rm -rf -- "$pair_root" || cleanup_status=1
+          git worktree prune || cleanup_status=1
+          exit "$cleanup_status"
