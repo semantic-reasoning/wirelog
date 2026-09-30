@@ -4552,9 +4552,300 @@ cleanup:
 #undef REPLACEMENT_CHECK
 }
 
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+typedef struct rebind_reader_pause {
+    col_rel_t *relation;
+    atomic_bool ready;
+    atomic_bool proceed;
+    int rc;
+} rebind_reader_pause_t;
+
+static rebind_reader_pause_t *rebind_reader_pause;
+static int rebind_publication_reader_rc;
+static col_rel_t *rebind_probe_peer_owner;
+static wl_columnar_source_access_reader_t *rebind_probe_peer;
+static int rebind_probe_peer_rc;
+
+static void
+rebind_pause_after_descriptor(const col_rel_t *relation)
+{
+    rebind_reader_pause_t *pause = rebind_reader_pause;
+    if (!pause || pause->relation != relation)
+        return;
+    atomic_store_explicit(&pause->ready, true, memory_order_release);
+    while (!atomic_load_explicit(&pause->proceed, memory_order_acquire))
+        alias_accounting_yield();
+}
+
+static void *
+rebind_paused_reader(void *opaque)
+{
+    rebind_reader_pause_t *pause = opaque;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    pause->rc = col_rel_source_reader_acquire(pause->relation, &reader);
+    if (pause->rc == 0)
+        pause->rc = col_rel_source_reader_release(&reader);
+    return NULL;
+}
+
+static void
+rebind_probe_descriptor_exclusion(const col_rel_t *relation)
+{
+    wl_columnar_source_access_reader_t reader = { 0 };
+    rebind_publication_reader_rc
+        = col_rel_source_reader_acquire(relation, &reader);
+    if (rebind_publication_reader_rc == 0)
+        (void)col_rel_source_reader_release(&reader);
+}
+
+static void
+rebind_admit_peer_after_descriptor(const col_rel_t *relation)
+{
+    rebind_probe_descriptor_exclusion(relation);
+    rebind_probe_peer_rc = col_rel_source_reader_acquire(
+        rebind_probe_peer_owner, rebind_probe_peer);
+}
+
+static void
+test_leased_rebind_descriptor_exclusion(void)
+{
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = 1u << 20,
+            .usable_bytes = 1u << 20,
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+            .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+            .status = WL_COLUMNAR_MEMORY_OK,
+    };
+    wl_columnar_memory_governor_ref_t *ref
+        = wl_columnar_memory_governor_ref_create(&resolution);
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(ref);
+    col_rel_t *old_owner = new_relation();
+    col_rel_t *new_owner = new_relation();
+    col_rel_t *alias = new_relation();
+    wl_columnar_source_access_reader_t lease = { 0 }, peer = { 0 }, copied;
+    wl_thread_t thread;
+    rebind_reader_pause_t pause = { .relation = alias };
+    bool started = false;
+    const char *failure = NULL;
+    int64_t old_row = 11, new_row = 29;
+    uint64_t reserved = 0;
+    col_rel_t before;
+#define REBIND_CHECK(cond, message) do { \
+            if (!(cond)) { failure = message; goto cleanup; } \
+} while (0)
+    atomic_init(&pause.ready, false);
+    atomic_init(&pause.proceed, false);
+    REBIND_CHECK(ref && old_owner && new_owner && alias,
+        "leased rebind allocation");
+    REBIND_CHECK(col_rel_attach_memory_governor(alias, ref) == 0
+        && col_rel_append_row(old_owner, &old_row) == 0
+        && col_rel_append_row(new_owner, &new_row) == 0
+        && col_rel_install_shared_view(alias, old_owner) == 0
+        && col_rel_source_reader_acquire_transferable(old_owner, &lease) == 0,
+        "leased rebind setup");
+    reserved = wl_columnar_memory_reserved(governor);
+    copied = lease;
+    before = *alias;
+    REBIND_CHECK(wl_columnar_relation_install_shared_view_with_lease(alias,
+        new_owner, &copied) == EINVAL
+        && memcmp(&before, alias, sizeof(before)) == 0
+        && wl_columnar_memory_reserved(governor) == reserved,
+        "copied lease refused without mutation or admission change");
+
+    rebind_reader_pause = &pause;
+    wl_columnar_relation_test_reader_after_descriptor
+        = rebind_pause_after_descriptor;
+    REBIND_CHECK(wl_thread_create(&thread, rebind_paused_reader, &pause) == 0,
+        "paused rebind reader thread");
+    started = true;
+    uint64_t start = alias_accounting_now_ms();
+    while (!atomic_load_explicit(&pause.ready, memory_order_acquire)
+        && alias_accounting_now_ms() - start < 5000u)
+        alias_accounting_yield();
+    REBIND_CHECK(atomic_load_explicit(&pause.ready, memory_order_acquire),
+        "reader paused after descriptor admission");
+    before = *alias;
+    REBIND_CHECK(wl_columnar_relation_install_shared_view_with_lease(alias,
+        new_owner, &lease) == EBUSY
+        && memcmp(&before, alias, sizeof(before)) == 0
+        && col_rel_storage_alias_borrow_count(old_owner) == 1
+        && col_rel_storage_alias_borrow_count(new_owner) == 0
+        && wl_columnar_memory_reserved(governor) == reserved
+        && memcmp(&copied, &lease, sizeof(lease)) == 0,
+        "paused descriptor reader excludes leased rebind exactly");
+    atomic_store_explicit(&pause.proceed, true, memory_order_release);
+    REBIND_CHECK(wl_thread_join(&thread) == 0, "paused reader joins");
+    started = false;
+    wl_columnar_relation_test_reader_after_descriptor = NULL;
+    rebind_reader_pause = NULL;
+    REBIND_CHECK(pause.rc == 0, "paused reader retains old root lifetime");
+
+    rebind_probe_peer_owner = old_owner;
+    rebind_probe_peer = &peer;
+    wl_columnar_relation_test_rebind_after_descriptor
+        = rebind_admit_peer_after_descriptor;
+    before = *alias;
+    REBIND_CHECK(wl_columnar_relation_install_shared_view_with_lease(alias,
+        new_owner, &lease) == EBUSY
+        && rebind_probe_peer_rc == 0
+        && rebind_publication_reader_rc == EBUSY
+        && memcmp(&before, alias, sizeof(before)) == 0
+        && memcmp(&copied, &lease, sizeof(lease)) == 0
+        && wl_columnar_memory_reserved(governor) == reserved,
+        "source upgrade failure restores destination writer and lease");
+    wl_columnar_relation_test_rebind_after_descriptor = NULL;
+    REBIND_CHECK(col_rel_source_reader_release(&peer) == 0,
+        "peer source release");
+
+    before = *alias;
+    atomic_store_explicit(&governor->usable_bytes, reserved,
+        memory_order_relaxed);
+    REBIND_CHECK(wl_columnar_relation_install_shared_view_with_lease(alias,
+        new_owner, &lease) == ENOSPC
+        && alias->columns == before.columns
+        && alias->storage_owner == old_owner
+        && alias->view_generation == before.view_generation
+        && alias->storage_generation == before.storage_generation
+        && col_rel_storage_alias_borrow_count(old_owner) == 1
+        && col_rel_storage_alias_borrow_count(new_owner) == 0
+        && memcmp(&copied, &lease, sizeof(lease)) == 0
+        && atomic_load_explicit(&alias->descriptor_access.state,
+        memory_order_acquire) == 0
+        && wl_columnar_memory_reserved(governor) == reserved,
+        "exact governor denial restores all rebind gates and borrows");
+    atomic_store_explicit(&governor->usable_bytes, resolution.usable_bytes,
+        memory_order_relaxed);
+    wl_columnar_relation_test_fail_next_metadata_alloc();
+    REBIND_CHECK(wl_columnar_relation_install_shared_view_with_lease(alias,
+        new_owner, &lease) == ENOMEM
+        && alias->columns == before.columns
+        && alias->storage_owner == old_owner
+        && col_rel_storage_alias_borrow_count(old_owner) == 1
+        && wl_columnar_memory_reserved(governor) == reserved
+        && memcmp(&copied, &lease, sizeof(lease)) == 0,
+        "allocation failure restores lease, descriptor, and reservation");
+    rebind_publication_reader_rc = 0;
+    wl_columnar_relation_test_rebind_before_publication
+        = rebind_probe_descriptor_exclusion;
+    REBIND_CHECK(wl_columnar_relation_install_shared_view_with_lease(alias,
+        new_owner, &lease) == 0
+        && rebind_publication_reader_rc == EBUSY
+        && alias->columns[0] == new_owner->columns[0]
+        && alias->storage_owner == new_owner
+        && col_rel_storage_alias_borrow_count(old_owner) == 0
+        && col_rel_storage_alias_borrow_count(new_owner) == 1
+        && memcmp(&copied, &lease, sizeof(lease)) == 0,
+        "retry excludes readers and transfers precisely one borrow");
+    REBIND_CHECK(col_rel_source_reader_release(&lease) == 0,
+        "old lifetime lease release");
+    REBIND_CHECK(wl_columnar_relation_install_shared_view_with_lease(alias,
+        old_owner, NULL) == 0 && rebind_publication_reader_rc == EBUSY
+        && alias->storage_owner == old_owner
+        && col_rel_storage_alias_borrow_count(old_owner) == 1
+        && col_rel_storage_alias_borrow_count(new_owner) == 0,
+        "no-lease rebind holds independent descriptor and source writers");
+    REBIND_CHECK(col_rel_install_shared_view(alias, new_owner) == 0
+        && rebind_publication_reader_rc == EBUSY
+        && alias->storage_owner == new_owner
+        && col_rel_storage_alias_borrow_count(old_owner) == 0
+        && col_rel_storage_alias_borrow_count(new_owner) == 1,
+        "ordinary rebind validates descriptor permit and transfers borrow");
+cleanup:
+    if (started) {
+        atomic_store_explicit(&pause.proceed, true, memory_order_release);
+        (void)wl_thread_join(&thread);
+    }
+    wl_columnar_relation_test_reader_after_descriptor = NULL;
+    wl_columnar_relation_test_rebind_after_descriptor = NULL;
+    wl_columnar_relation_test_rebind_before_publication = NULL;
+    rebind_reader_pause = NULL;
+    if (peer.owner)
+        (void)col_rel_source_reader_release(&peer);
+    if (lease.owner)
+        (void)col_rel_source_reader_release(&lease);
+    cleanup_relations();
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+    if (failure) {
+        fprintf(stderr, "FAIL: %s\n", failure);
+        failures++;
+    }
+#undef REBIND_CHECK
+}
+
+static void
+test_root_leased_rebind_restores_descriptor(void)
+{
+    col_rel_t *src = new_relation();
+    col_rel_t *dst = new_relation();
+    wl_columnar_source_access_reader_t lease = { 0 }, copied, peer = { 0 };
+    int64_t row = 71;
+    const char *failure = NULL;
+#define ROOT_REBIND_CHECK(cond, message) do { \
+            if (!(cond)) { failure = message; goto cleanup; } \
+} while (0)
+    ROOT_REBIND_CHECK(dst && src && col_rel_append_row(src, &row) == 0
+        && col_rel_source_reader_acquire_transferable(dst, &lease) == 0,
+        "root leased rebind setup");
+    copied = lease;
+    ROOT_REBIND_CHECK(wl_columnar_source_access_gate_reader_acquire(
+            &dst->descriptor_access) == 0, "extra root descriptor reader");
+    int rc = wl_columnar_relation_install_shared_view_with_lease(dst, src,
+            &lease);
+    int release_rc = wl_columnar_source_access_gate_reader_release(
+        &dst->descriptor_access);
+    ROOT_REBIND_CHECK(rc == EBUSY && release_rc == 0
+        && memcmp(&copied, &lease, sizeof(lease)) == 0,
+        "root descriptor upgrade requires sole lease");
+    ROOT_REBIND_CHECK(wl_columnar_source_access_reader_acquire(
+            &dst->source_access, &peer) == 0,
+        "root source peer");
+    rc = wl_columnar_relation_install_shared_view_with_lease(dst, src, &lease);
+    ROOT_REBIND_CHECK(rc == EBUSY
+        && memcmp(&copied, &lease, sizeof(lease)) == 0,
+        "root source contention preserves lease");
+    ROOT_REBIND_CHECK(col_rel_source_reader_release(&peer) == 0,
+        "root source peer release");
+    wl_columnar_relation_test_fail_next_metadata_alloc();
+    ROOT_REBIND_CHECK(wl_columnar_relation_install_shared_view_with_lease(dst,
+        src, &lease) == ENOMEM
+        && atomic_load_explicit(&dst->descriptor_access.state,
+        memory_order_acquire) == 1
+        && atomic_load_explicit(&dst->source_access.state,
+        memory_order_acquire) == 1
+        && memcmp(&copied, &lease, sizeof(lease)) == 0,
+        "root paired upgrades restore on preparation failure");
+    ROOT_REBIND_CHECK(wl_columnar_relation_install_shared_view_with_lease(dst,
+        src, &lease) == 0 && dst->storage_owner == src
+        && col_rel_storage_alias_borrow_count(src) == 1
+        && atomic_load_explicit(&dst->descriptor_access.state,
+        memory_order_acquire) == 1
+        && atomic_load_explicit(&dst->source_access.state,
+        memory_order_acquire) == 1
+        && memcmp(&copied, &lease, sizeof(lease)) == 0,
+        "root paired upgrades restore transferable token after publication");
+cleanup:
+    if (peer.owner)
+        (void)col_rel_source_reader_release(&peer);
+    if (lease.owner)
+        (void)col_rel_source_reader_release(&lease);
+    cleanup_relations();
+    if (failure) {
+        fprintf(stderr, "FAIL: %s\n", failure);
+        failures++;
+    }
+#undef ROOT_REBIND_CHECK
+}
+#endif
+
 int
 main(void)
 {
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    test_leased_rebind_descriptor_exclusion();
+    test_root_leased_rebind_restores_descriptor();
+#endif
     test_same_row_count_mutation();
     test_source_reader_blocks_column_type_publication();
     test_live_alias_blocks_column_type_publication();
