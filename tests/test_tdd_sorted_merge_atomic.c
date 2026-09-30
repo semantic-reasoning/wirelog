@@ -420,6 +420,7 @@ check_source_emptied_after_probe(void)
     if (!owner || !dst || !src
         || col_rel_install_shared_view(dst, owner) != 0)
         return 0;
+    dst->memory_budget_denial_pending = true;
     empty_probe_interloper_rc = EINVAL;
     empty_probe_source_to_reset = src;
     int rc = tdd_sorted_merge_append(dst, src);
@@ -427,6 +428,7 @@ check_source_emptied_after_probe(void)
     int ok = rc == 0 && empty_probe_interloper_rc == 0
         && src->nrows == 0 && dst->nrows == 0
         && dst->col_shared == NULL && dst->storage_owner == dst
+        && !dst->memory_budget_denial_pending
         && owner->nrows == 0;
     col_rel_destroy(dst);
     col_rel_destroy(owner);

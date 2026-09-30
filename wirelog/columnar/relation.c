@@ -4302,7 +4302,14 @@ col_rel_append_all_impl(col_rel_t *dst, const col_rel_t *src,
             goto cleanup;
         }
         if (src->nrows == 0) {
-            rc = dst->col_shared ? col_rel_cow_unshare(dst, 0) : 0;
+            /* The canonical writer is already held.  Use the under-writer
+             * path so public COW may acquire its own gate independently. */
+            if (dst->col_shared) {
+                dst->memory_budget_denial_pending = false;
+                rc = col_rel_cow_unshare_impl(dst, 0, false, false, NULL);
+            } else {
+                rc = 0;
+            }
             goto cleanup;
         }
     }
