@@ -74,7 +74,7 @@ class PairedBuildVerification(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             source = Path(tmp)
             (source / "tests").mkdir()
-            (source / "tests/test_crdt_perf_gate.c").write_text("int main(void) {}")
+            (source / "tests/test_crdt_perf_gate.c").write_text("int main(void) {}", encoding="utf-8")
             with patch.object(MODULE, "git_output", side_effect=(self.BASE, "")):
                 with self.assertRaisesRegex(ValueError, "lacks the CRDT single-run probe"):
                     MODULE.side_record(source, source / "build", self.BASE)
