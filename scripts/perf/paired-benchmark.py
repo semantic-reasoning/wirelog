@@ -262,6 +262,12 @@ def collect(args: argparse.Namespace) -> dict:
 
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "v1":
+        # Keep the installed legacy invocation and artifacts unchanged.
+        import runpy
+        sys.argv = [sys.argv[0], *sys.argv[2:]]
+        return runpy.run_path(str(Path(__file__).with_name(
+            "paired-collector-v1.py")))["main"]()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-sha", required=True)
     parser.add_argument("--candidate-sha", required=True)
