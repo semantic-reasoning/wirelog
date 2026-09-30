@@ -549,6 +549,88 @@ typedef struct col_rel {
     struct wl_col_session_t *deferred_relation_session;
 } col_rel_t;
 
+/* Roles and caller-owned mutation storage must remain unchanged at their
+ * original addresses until
+ * finish. Roles contain descriptors only; owners are resolved after exclusion. */
+typedef enum {
+    WL_COLUMNAR_RELATION_PAYLOAD_MUTATION = 1,
+    WL_COLUMNAR_RELATION_METADATA_DETACH = 2
+} wl_columnar_relation_mutation_role_flags_t;
+
+typedef struct {
+    col_rel_t *relation;
+    wl_columnar_relation_mutation_role_flags_t role_flags;
+} wl_columnar_relation_mutation_role_t;
+
+typedef struct {
+    col_rel_t *relation;
+    wl_columnar_source_access_writer_t writer;
+} wl_columnar_relation_mutation_descriptor_t;
+
+typedef struct {
+    col_rel_t *owner;
+    wl_columnar_source_access_writer_t writer;
+} wl_columnar_relation_mutation_owner_t;
+
+typedef struct {
+    col_rel_t *relation;
+    uint64_t owner_identity;
+    uint64_t owner_generation;
+    uint64_t borrows;
+} wl_columnar_relation_mutation_initialization_t;
+
+struct wl_columnar_relation_mutation_set;
+typedef struct {
+    uintptr_t identity;
+    struct wl_columnar_relation_mutation_set *set;
+    col_rel_t *relation;
+    col_rel_t *owner;
+    size_t descriptor_slot;
+    size_t owner_slot;
+    uint64_t relation_identity;
+    uint64_t relation_generation;
+    uint64_t owner_identity;
+    uint64_t owner_generation;
+    wl_columnar_relation_mutation_role_flags_t role_flags;
+    bool detached;
+} wl_columnar_relation_mutation_lease_t;
+
+typedef struct wl_columnar_relation_mutation_set {
+    uintptr_t identity;
+    const wl_columnar_relation_mutation_role_t *roles;
+    wl_columnar_relation_mutation_descriptor_t *descriptors;
+    wl_columnar_relation_mutation_owner_t *owners;
+    wl_columnar_relation_mutation_lease_t *leases;
+    wl_columnar_relation_mutation_initialization_t *initializations;
+    size_t descriptor_count;
+    size_t owner_count;
+    size_t lease_count;
+    size_t initialization_count;
+    size_t descriptors_acquired;
+    size_t owners_acquired;
+} wl_columnar_relation_mutation_set_t;
+
+int col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
+    const wl_columnar_relation_mutation_role_t *roles, size_t role_count,
+    wl_columnar_relation_mutation_descriptor_t *descriptors,
+    size_t descriptor_cap,
+    wl_columnar_relation_mutation_owner_t *owners, size_t owner_cap,
+    wl_columnar_relation_mutation_lease_t *leases, size_t lease_cap,
+    wl_columnar_relation_mutation_initialization_t *initializations,
+    size_t initialization_cap);
+wl_columnar_relation_mutation_lease_t *col_rel_mutation_set_lease(
+    wl_columnar_relation_mutation_set_t *set, size_t index);
+int col_rel_mutation_lease_validate(
+    const wl_columnar_relation_mutation_lease_t *lease,
+    const col_rel_t *expected_relation);
+int col_rel_mutation_set_finish(wl_columnar_relation_mutation_set_t *set,
+    bool commit);
+/* Metadata detach publishes the independent binding before its final atomic
+ * old-owner borrow decrement. The caller must never access that old owner
+ * again through this lease after successful release. */
+int col_rel_storage_alias_release_locked(col_rel_t *alias,
+    wl_columnar_relation_mutation_lease_t *lease);
+
 /* Prepared terminal retirement of an independent heap relation. The token
  * holds the descriptor and source writers from prepare through cancel or
  * commit; callers must keep the descriptor pointer stable and must not copy,

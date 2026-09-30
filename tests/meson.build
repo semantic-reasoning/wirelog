@@ -4266,6 +4266,16 @@ test_col_rel_deep_copy_exe = executable(
 test('col_rel_deep_copy', test_col_rel_deep_copy_exe, timeout: 120)
 
 # Relation identity/generation contract and mutation instrumentation (Issue #1441)
+relation_mutation_set_exe = executable(
+  'test_relation_mutation_set',
+  files('test_relation_mutation_set.c', '../wirelog/evaluation_control.c'),
+  backend_src, intern_src, arena_src, thread_src, workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+test('relation_mutation_set', relation_mutation_set_exe,
+  suite: ['unit', 'tsan'], timeout: 60)
+
 test_relation_generations_exe = executable(
   'test_relation_generations',
   files('test_relation_generations.c', '../wirelog/evaluation_control.c'),

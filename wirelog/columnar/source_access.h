@@ -466,6 +466,21 @@ wl_columnar_source_access_writer_acquire(
     return 0;
 }
 
+/* Validate exclusive authority without consuming it. */
+static inline int
+wl_columnar_source_access_writer_validate(
+    const wl_columnar_source_access_writer_t *token,
+    const wl_columnar_source_access_gate_t *gate)
+{
+    if (!token || !gate || token->identity != (uintptr_t)token
+        || token->owner != gate || token->secondary_owner
+        || !wl_columnar_source_access_writer_thread_equal(token)
+        || atomic_load_explicit(&gate->state, memory_order_acquire)
+        != WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+        return EINVAL;
+    return 0;
+}
+
 static inline int
 wl_columnar_source_access_writer_release(
     wl_columnar_source_access_writer_t *token)
