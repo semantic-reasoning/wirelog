@@ -94,9 +94,7 @@ endif
 # bundles directly and are listed as retained in
 # docs/test-compilation-inventory.md.
 # ============================================================================
-testlib_prod = static_library(
-  'testlib_prod',
-  files(
+testlib_prod_src = files(
     '../wirelog/api_facade.c',
     '../wirelog/arena/arena.c',
     '../wirelog/arena/arena_admission.c',
@@ -179,14 +177,32 @@ testlib_prod = static_library(
     '../wirelog/workqueue.c',
     '../wirelog/wirelog-easy.c',
     '../wirelog/wirelog_advanced.c',
-  ),
-  thread_src,
+  ) + thread_src
+testlib_prod_c_args = ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_TEST_RELATION_RESIZE_HOOK=1',
+                       '-DWL_TEST_JOIN_CACHE_HOOK=1',
+                       '-DWL_TEST_JOIN_BATCH_DESCRIPTOR_HOOKS=1']
+
+testlib_prod = static_library(
+  'testlib_prod',
+  testlib_prod_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
-  c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_TEST_RELATION_RESIZE_HOOK=1',
-           '-DWL_TEST_JOIN_CACHE_HOOK=1',
-           '-DWL_TEST_JOIN_BATCH_DESCRIPTOR_HOOKS=1'],
+  c_args: testlib_prod_c_args,
 )
+
+# Linux allocation wrappers need native objects throughout the link so Clang
+# can link with LTO disabled and --wrap can intercept production allocations.
+testlib_prod_no_lto = testlib_prod
+if host_machine.system() == 'linux'
+  testlib_prod_no_lto = static_library(
+    'testlib_prod_no_lto',
+    testlib_prod_src,
+    include_directories: [wirelog_inc, wirelog_src_inc],
+    dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+    c_args: testlib_prod_c_args,
+    override_options: ['b_lto=false'],
+  )
+endif
 
 source_access_exe = executable(
   'test_source_access',
@@ -4097,7 +4113,7 @@ test_diff_consolidate_exe = executable(
   link_args: host_machine.system() == 'linux'
     ? ['-Wl,--wrap=calloc', '-Wl,--wrap=malloc'] : [],
   override_options: host_machine.system() == 'linux' ? ['b_lto=false'] : [],
-  link_with: [testlib_prod],
+  link_with: host_machine.system() == 'linux' ? [testlib_prod_no_lto] : [testlib_prod],
 )
 
 test('diff_consolidate', test_diff_consolidate_exe)
@@ -4214,7 +4230,7 @@ if host_machine.system() == 'linux'
     files('test_partition_realloc_failure.c'),
     include_directories: [wirelog_inc, wirelog_src_inc],
     dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
-    link_with: [testlib_prod],
+    link_with: [testlib_prod_no_lto],
     link_args: ['-Wl,--wrap=realloc'],
     override_options: ['b_lto=false'],
   )
@@ -5064,7 +5080,7 @@ test_tdd_sorted_merge_atomic_exe = executable(
   files('test_tdd_sorted_merge_atomic.c', '../wirelog/columnar/eval.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
-  link_with: [testlib_prod],
+  link_with: host_machine.system() == 'linux' ? [testlib_prod_no_lto] : [testlib_prod],
   c_args: ['-DWL_TEST_TDD_SORTED_MERGE_HOOK'],
   link_args: host_machine.system() == 'linux'
     ? ['-Wl,--wrap=calloc', '-Wl,--wrap=malloc'] : [],
