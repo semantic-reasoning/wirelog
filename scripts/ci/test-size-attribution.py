@@ -34,7 +34,7 @@ class SizeAttributionContractTests(unittest.TestCase):
         self.assertIn("- \"1956\"", workflow)
         self.assertIn("SIZE_REDUCTION_PR_NUMBER = 1956", (ROOT / "scripts/ci/collect-size-attribution.py").read_text(encoding="utf-8"))
         self.assertIn(
-            "description: 'Leave empty only for the initial PR #1903 or #1956 base/head report; "
+            "description: 'PR #2032 is a two-tree base/head measurement and must leave this empty. Leave empty only for the initial PR #1903 or #1956 base/head report; "
             "PR #1945 and later reductions require the reviewed fixed reference SHA and keep it fixed across runs'",
             workflow,
         )
@@ -285,7 +285,7 @@ class SizeAttributionContractTests(unittest.TestCase):
         args = collector.parse_args([
             "--repository", collector.REPOSITORY, "--pr-number", "1956",
             "--base-sha", base, "--candidate-sha", candidate,
-            "--workflow-ref", "refs/heads/main",
+            "--workflow-ref", "refs/heads/main", "--workflow-sha", "9" * 40,
         ])
         with mock.patch.object(collector, "collect_two_tree_candidate", return_value=0) as collect:
             self.assertEqual(collector.collect(args), 0)
@@ -294,7 +294,7 @@ class SizeAttributionContractTests(unittest.TestCase):
         args = collector.parse_args([
             "--repository", collector.REPOSITORY, "--pr-number", "1956",
             "--base-sha", base, "--reference-sha", reference,
-            "--candidate-sha", candidate, "--workflow-ref", "refs/heads/main",
+            "--candidate-sha", candidate, "--workflow-ref", "refs/heads/main", "--workflow-sha", "9" * 40,
         ])
         with mock.patch.object(collector, "collect_current_candidate", return_value=0) as collect:
             self.assertEqual(collector.collect(args), 0)
@@ -304,7 +304,7 @@ class SizeAttributionContractTests(unittest.TestCase):
         args = collector.parse_args([
             "--repository", collector.REPOSITORY, "--pr-number", "1903",
             "--base-sha", "1" * 40, "--candidate-sha", "3" * 40,
-            "--workflow-ref", "refs/heads/main",
+            "--workflow-ref", "refs/heads/main", "--workflow-sha", "9" * 40,
         ])
         with mock.patch.object(collector, "collect_two_tree_candidate", return_value=0) as collect:
             self.assertEqual(collector.collect(args), 0)
@@ -314,7 +314,7 @@ class SizeAttributionContractTests(unittest.TestCase):
         args = collector.parse_args([
             "--repository", collector.REPOSITORY, "--pr-number", "1903",
             "--base-sha", "1" * 40, "--reference-sha", "2" * 40,
-            "--candidate-sha", "3" * 40, "--workflow-ref", "refs/heads/main",
+            "--candidate-sha", "3" * 40, "--workflow-ref", "refs/heads/main", "--workflow-sha", "9" * 40,
         ])
         with mock.patch.object(collector, "collect_current_candidate", return_value=0) as collect:
             self.assertEqual(collector.collect(args), 0)
@@ -428,7 +428,7 @@ class SizeAttributionContractTests(unittest.TestCase):
         args = collector.parse_args([
             "--repository", collector.REPOSITORY, "--pr-number", "1945",
             "--base-sha", base, "--reference-sha", reference,
-            "--candidate-sha", candidate, "--workflow-ref", "refs/heads/main",
+            "--candidate-sha", candidate, "--workflow-ref", "refs/heads/main", "--workflow-sha", "9" * 40,
         ])
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -498,6 +498,202 @@ class SizeAttributionContractTests(unittest.TestCase):
             self.assertEqual(set(report["total_text_comparisons"]),
                              {"base_to_reference", "reference_to_candidate", "base_to_candidate"})
             self.assertTrue((Path(args.output) / "SHA256SUMS").is_file())
+
+    def test_exact_repository_authorization_and_fail_closed_identity(self):
+        base, head, workflow, main, tree = (collector.EXACT_SIZE_BASE_SHA,
+            collector.EXACT_SIZE_HEAD_SHA, "9" * 40, "8" * 40, "7" * 40)
+        request = [Path("."), collector.REPOSITORY, 2032, base, head,
+                   "refs/heads/main", "", workflow]
+        metadata = {"number": 2032, "state": "open", "base_ref": "main",
+                    "base_repository": collector.REPOSITORY,
+                    "head_repository": collector.REPOSITORY, "base_sha": main,
+                    "head_sha": head}
+
+        def check(req=None, meta=None, failure=None, response=None):
+            def git(command, **kwargs):
+                if response and tuple(command[1:]) == response[0]:
+                    return response[1]
+                if failure == tuple(command[1:]):
+                    raise collector.DiagnosticError("mock identity failure")
+                if command[1:3] == ["remote", "get-url"]:
+                    return "https://github.com/semantic-reasoning/wirelog.git"
+                if command[1] == "ls-remote":
+                    return head + " refs/pull/2032/head"
+                if command[1] == "rev-parse":
+                    name = command[-1]
+                    if name == "HEAD":
+                        return workflow
+                    if name == "refs/remotes/origin/main":
+                        return main
+                    if name == "refs/diagnostic/pr-2032-head":
+                        return head
+                    if name.endswith("^{tree}"):
+                        return tree
+                    return name.removesuffix("^{commit}")
+                self.assertNotIn("refs/pull/2032/merge", " ".join(command))
+                return ""
+            with mock.patch.object(collector, "run", side_effect=git), mock.patch.object(
+                    collector, "fetch_pull_request_metadata", return_value=meta or metadata):
+                return collector.verify_repository(*(req or request))
+
+        identity = check()
+        self.assertEqual(identity["remote_main"], main)
+        self.assertEqual(identity["workflow_sha"], workflow)
+        self.assertEqual(identity["workflow_tree"], tree)
+        for index, value in ((1, "other/repo"), (2, 2031), (3, "1" * 40),
+                             (4, "2" * 40), (5, "refs/heads/other"),
+                             (6, "3" * 40), (7, "invalid")):
+            with self.subTest(request=index), self.assertRaises(collector.DiagnosticError):
+                changed = request.copy()
+                changed[index] = value
+                check(changed)
+        for key, value in (("number", 2031), ("state", "closed"), ("base_ref", "other"),
+                           ("base_repository", "fork/repo"), ("head_repository", "fork/repo"),
+                           ("head_sha", "2" * 40)):
+            with self.subTest(metadata=key), self.assertRaises(collector.DiagnosticError):
+                check(meta={**metadata, key: value})
+        for command in (("rev-parse", "--verify", base + "^{commit}"),
+                        ("rev-parse", "--verify", head + "^{commit}"),
+                        ("rev-parse", "--verify", workflow + "^{commit}"),
+                        ("rev-parse", "HEAD"),
+                        ("merge-base", "--is-ancestor", base, head),
+                        ("merge-base", "--is-ancestor", base, main),
+                        ("merge-base", "--is-ancestor", workflow, "refs/remotes/origin/main"),
+                        ("ls-remote", "origin", "refs/pull/2032/head"),
+                        ("rev-parse", "refs/diagnostic/pr-2032-head")):
+            with self.subTest(command=command), self.assertRaises(collector.DiagnosticError):
+                check(failure=command)
+
+        for command, value in (
+                (("rev-parse", "HEAD"), "6" * 40),
+                (("rev-parse", "--verify", workflow + "^{commit}"), "6" * 40),
+                (("rev-parse", "--verify", base + "^{commit}"), "6" * 40),
+                (("rev-parse", "--verify", head + "^{commit}"), "6" * 40),
+                (("ls-remote", "origin", "refs/pull/2032/head"), "6" * 40 + " refs/pull/2032/head"),
+                (("rev-parse", "refs/diagnostic/pr-2032-head"), "6" * 40)):
+            with self.subTest(mismatch=command), self.assertRaises(collector.DiagnosticError):
+                check(response=(command, value))
+
+    def test_exact_dispatch_routing_and_workflow_defaults(self):
+        args = collector.parse_args(["--repository", collector.REPOSITORY,
+            "--pr-number", "2032", "--base-sha", collector.EXACT_SIZE_BASE_SHA,
+            "--candidate-sha", collector.EXACT_SIZE_HEAD_SHA,
+            "--workflow-ref", "refs/heads/main", "--workflow-sha", "9" * 40])
+        with mock.patch.object(collector, "collect_two_tree_candidate", return_value=0) as two, \
+             mock.patch.object(collector, "collect_current_candidate") as three:
+            self.assertEqual(collector.collect(args), 0)
+            two.assert_called_once_with(args)
+            with tempfile.TemporaryDirectory() as temp:
+                args.output = temp
+                args.reference_sha = "1" * 40
+                self.assertEqual(collector.collect(args), 1)
+            three.assert_not_called()
+        workflow = (ROOT / ".github/workflows/size-attribution.yml").read_text(encoding="utf-8")
+        for fragment in ('- "2032"', 'default: "2032"', collector.EXACT_SIZE_BASE_SHA,
+                         collector.EXACT_SIZE_HEAD_SHA, 'GH_WORKFLOW_SHA: ${{ github.sha }}',
+                         '--workflow-sha "$GH_WORKFLOW_SHA"', 'test "$WORKFLOW_REF" = "refs/heads/main"'):
+            self.assertIn(fragment, workflow)
+
+    def _collect_exact_fixture(self, head_bytes, post_failure=False, policy_failure=False):
+        base, candidate = collector.EXACT_SIZE_BASE_SHA, collector.EXACT_SIZE_HEAD_SHA
+        args = collector.parse_args([
+            "--repository", collector.REPOSITORY, "--pr-number", "2032",
+            "--base-sha", base,
+            "--candidate-sha", candidate, "--workflow-ref", "refs/heads/main", "--workflow-sha", "9" * 40,
+        ])
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args.repository_root = str(ROOT)
+            args.output = str(root / "artifacts")
+
+            def fake_build(repo, source, sha, target, env, map_path=None, build_root=None):
+                target.mkdir(parents=True, exist_ok=True)
+                profile = target / "profile.json"
+                profile.write_text(json.dumps({
+                    "schema_version": 1, "source_sha": sha,
+                    "options": {"optimization": "s", "b_lto": True},
+                    "effective_link_arguments": [{"parameters": ["-shared", "-flto"]}],
+                }), encoding="utf-8")
+                library = target / "libwirelog.so"
+                library.write_bytes(sha.encode())
+                if map_path is not None:
+                    map_path.write_text(" .text 0x1000 0x20 build/lib.p/a.o\n", encoding="utf-8")
+                digest = collector.sha256_file(library)
+                return {"build": build_root, "profile": profile, "library": library,
+                        "map": map_path, "setup_command": ["meson", "setup"],
+                        "compile_command": ["meson", "compile"], "binary_sha256": digest}
+
+            def fake_run(command, **kwargs):
+                if command[0] == "git" and command[1:3] == ["rev-parse", "HEAD"]:
+                    return "9" * 40 + "\n"
+                if command[0] == "gcc":
+                    return "13.3.0\n"
+                if command[0] == "ld":
+                    return "GNU ld 2.42\n"
+                if command[0] == "meson":
+                    return "1.12.0\n"
+                if command[0] == "ninja":
+                    return "1.11.1\n"
+                if command[0] == "readelf":
+                    return "[ 1] .debug_info [ 2] .debug_line"
+                return ""
+
+            def fake_measure(repo, library, sha, profile, output, env):
+                value = head_bytes if sha == candidate else 414051
+                return {"measured_bytes": value, "source_sha": sha}
+
+            with mock.patch.object(collector, "require_os_ubuntu_2404", return_value={"version_id": "24.04"}), \
+                 mock.patch.object(collector, "verify_repository", side_effect=[{"remote_main": base}, collector.DiagnosticError("post-build moved head") if post_failure else {"remote_main": base}]) as verify, \
+                 mock.patch.object(collector, "read_workflow_code_identity", return_value={"tool": "hash"}), \
+                 mock.patch.object(collector, "read_policy_identity", side_effect=[{"policy": "hash"}, {"policy": "hash"}, {"policy": "different" if policy_failure else "hash"}]), \
+                 mock.patch.object(collector, "run", side_effect=fake_run), \
+                 mock.patch.object(collector, "extract_tree"), \
+                 mock.patch.object(collector, "build_one", side_effect=fake_build), \
+                 mock.patch.object(collector, "measure_library", side_effect=fake_measure), \
+                 mock.patch.object(collector, "forensic_profile_matches", return_value=(True, [])), \
+                 mock.patch.object(collector, "text_size", return_value=360000), \
+                 mock.patch.object(collector, "map_text_objects", return_value=[
+                     {"object": "lib.p/a.o", "text_bytes": 32}]), \
+                 mock.patch.object(collector, "symbol_artifacts", side_effect=lambda *args, **kwargs: {"text_symbols": []}), \
+                 mock.patch.object(collector, "map_text_sections", return_value=[]), \
+                 mock.patch.object(collector, "lto_evidence", return_value={"enabled": True}), \
+                 mock.patch.object(collector, "join_symbols_to_objects", return_value=[]), \
+                 mock.patch.object(collector, "attach_source_locations"):
+                self.assertEqual(collector.collect(args), int(head_bytes > collector.EXACT_SIZE_CAP_BYTES or post_failure or policy_failure))
+                if not policy_failure:
+                    self.assertEqual(verify.call_count, 2)
+                    for call in verify.call_args_list:
+                        self.assertEqual(call.args[-2:], ("", args.workflow_sha))
+
+            report = json.loads((Path(args.output) / "report.json").read_text(encoding="utf-8"))
+            digest = collector.sha256_file(Path(args.output) / "report.json")
+            self.assertIn(f"{digest}  report.json", (Path(args.output) / "SHA256SUMS").read_text(encoding="utf-8"))
+            if policy_failure or post_failure:
+                self.assertEqual(report["status"], "failed")
+                self.assertIn("policy differs" if policy_failure else "post-build moved head", report["error"])
+            if not policy_failure:
+                authoritative = report["authoritative"]
+                self.assertEqual(authoritative["candidate"]["size_record"]["measured_bytes"], head_bytes)
+                self.assertEqual(authoritative["candidate"]["text_bytes"], head_bytes)
+                self.assertEqual(authoritative["base"]["text_bytes"], 414051)
+                self.assertEqual(authoritative["base_sha"], base)
+                self.assertEqual(authoritative["candidate_sha"], candidate)
+                self.assertEqual(authoritative["delta_bytes"], head_bytes - 414051)
+                self.assertEqual(authoritative["cap_bytes"], 419171)
+                self.assertEqual(authoritative["headroom_bytes"], 419171 - head_bytes)
+                self.assertEqual(authoritative["cap_status"], "fail" if head_bytes > 419171 else "pass")
+                self.assertEqual(set(report["attribution"]), {"base", "candidate"})
+                for label in ("base", "candidate"):
+                    self.assertIn("profile", authoritative[label])
+                    self.assertIn("binary_sha256", authoritative[label])
+                if not post_failure:
+                    self.assertEqual(report["status"], "complete")
+
+    def test_exact_collection_cap_and_failure_artifacts(self):
+        for head, post, policy in ((419171, False, False), (419172, False, False),
+                                   (419171, True, False), (419171, False, True)):
+            with self.subTest(head=head, post=post, policy=policy):
+                self._collect_exact_fixture(head, post, policy)
 
     def test_artifact_checksums_cover_report_and_map_files(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -906,7 +1102,7 @@ class SizeAttributionContractTests(unittest.TestCase):
         args = collector.parse_args([
             "--repository", collector.REPOSITORY, "--pr-number", "1903",
             "--base-sha", collector.BASE_SHA, "--candidate-sha", "a4c7c622daa3b7247378acf71a74b7f40f4ff556",
-            "--workflow-ref", "refs/heads/main",
+            "--workflow-ref", "refs/heads/main", "--workflow-sha", "9" * 40,
         ])
         args.repository_root = str(ROOT)
         with tempfile.TemporaryDirectory() as temp:

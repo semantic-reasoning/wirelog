@@ -24,6 +24,12 @@ ADMISSION_PR_NUMBER = 1945
 SIZE_REDUCTION_PR_NUMBER = 1956
 CURRENT_CANDIDATE_PR_NUMBERS = {PR_NUMBER, ADMISSION_PR_NUMBER, SIZE_REDUCTION_PR_NUMBER}
 CURRENT_TWO_TREE_PR_NUMBERS = {PR_NUMBER, SIZE_REDUCTION_PR_NUMBER}
+EXACT_SIZE_PR_NUMBER = 2032
+EXACT_SIZE_BASE_SHA = "438388c0ab834fa2b4e15b1357a095c3dec2c692"
+EXACT_SIZE_HEAD_SHA = "cd1061206182797e2833521043c89433b0af9c8f"
+EXACT_SIZE_CAP_BYTES = 419171
+EXACT_TWO_TREE_PR_NUMBERS = {EXACT_SIZE_PR_NUMBER}
+METADATA_PR_NUMBERS = CURRENT_CANDIDATE_PR_NUMBERS | EXACT_TWO_TREE_PR_NUMBERS
 BASE_SHA = "8d91c2da2b188b94af5b9f1da21c569d80ccb387"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 POLICY_FILES = (
@@ -202,7 +208,7 @@ def validate_current_candidate_request(repository: str, pr_number: int,
 
 
 def fetch_pull_request_metadata(repository: str, pr_number: int) -> dict[str, Any]:
-    if repository != REPOSITORY or pr_number not in CURRENT_CANDIDATE_PR_NUMBERS:
+    if repository != REPOSITORY or pr_number not in METADATA_PR_NUMBERS:
         raise DiagnosticError("pull request metadata is restricted to allowlisted same-repository PRs")
     url = f"https://api.github.com/repos/{REPOSITORY}/pulls/{pr_number}"
     request = urllib.request.Request(
@@ -273,9 +279,77 @@ def validate_current_baseline_request(repository: str, pr_number: int,
         raise DiagnosticError(f"PR #{pr_number} must originate from this repository")
 
 
+def verify_workflow_identity(repo: Path, workflow_sha: str) -> dict[str, str]:
+    validate_sha(workflow_sha, "workflow SHA")
+    resolved = run(["git", "rev-parse", "--verify", f"{workflow_sha}^{{commit}}"], cwd=repo).strip()
+    checkout = run(["git", "rev-parse", "HEAD"], cwd=repo).strip()
+    if resolved != workflow_sha or checkout != workflow_sha:
+        raise DiagnosticError("workflow SHA must resolve exactly and equal checkout HEAD")
+    run(["git", "merge-base", "--is-ancestor", workflow_sha,
+         "refs/remotes/origin/main"], cwd=repo)
+    tree = run(["git", "rev-parse", f"{workflow_sha}^{{tree}}"], cwd=repo).strip()
+    validate_sha(tree, "workflow tree")
+    return {"workflow_sha": checkout, "workflow_tree": tree}
+
+
+def verify_exact_size_repository(repo: Path, repository: str, pr_number: int,
+                                 base_sha: str, candidate_sha: str, workflow_ref: str,
+                                 reference_sha: str, workflow_sha: str) -> dict[str, Any]:
+    if (repository != REPOSITORY or pr_number != EXACT_SIZE_PR_NUMBER
+            or base_sha != EXACT_SIZE_BASE_SHA or candidate_sha != EXACT_SIZE_HEAD_SHA
+            or workflow_ref != "refs/heads/main" or reference_sha):
+        raise DiagnosticError("request differs from the pinned PR #2032 authorization")
+    validate_sha(workflow_sha, "workflow SHA")
+    origin = run(["git", "remote", "get-url", "origin"], cwd=repo).strip()
+    if not re.fullmatch(r"(?:https://github\.com/semantic-reasoning/wirelog(?:\.git)?|git@github\.com:semantic-reasoning/wirelog(?:\.git)?)", origin):
+        raise DiagnosticError(f"unexpected origin URL {origin!r}")
+    run(["git", "fetch", "--no-tags", "origin", "refs/heads/main:refs/remotes/origin/main"], cwd=repo)
+    main = run(["git", "rev-parse", "refs/remotes/origin/main"], cwd=repo).strip()
+    validate_sha(main, "remote main SHA")
+    workflow = verify_workflow_identity(repo, workflow_sha)
+    metadata = fetch_pull_request_metadata(repository, pr_number)
+    if (metadata.get("number") != pr_number or metadata.get("state") != "open"
+            or metadata.get("base_ref") != "main"
+            or metadata.get("base_repository") != REPOSITORY
+            or metadata.get("head_repository") != REPOSITORY
+            or metadata.get("head_sha") != candidate_sha):
+        raise DiagnosticError("live PR #2032 metadata differs from authorization")
+    validate_sha(metadata.get("base_sha", ""), "API base SHA")
+    ref = f"refs/pull/{pr_number}/head"
+    remote = run(["git", "ls-remote", "origin", ref], cwd=repo).split()
+    if remote != [candidate_sha, ref]:
+        raise DiagnosticError("live PR #2032 remote head differs from authorization")
+    local_ref = f"refs/diagnostic/pr-{pr_number}-head"
+    run(["git", "fetch", "--no-tags", "origin", f"{ref}:{local_ref}"], cwd=repo)
+    if run(["git", "rev-parse", local_ref], cwd=repo).strip() != candidate_sha:
+        raise DiagnosticError("fetched PR #2032 head differs from authorization")
+    for name, sha in (("base", base_sha), ("candidate", candidate_sha)):
+        if run(["git", "rev-parse", "--verify", f"{sha}^{{commit}}"], cwd=repo).strip() != sha:
+            raise DiagnosticError(f"{name} SHA did not resolve exactly")
+    run(["git", "merge-base", "--is-ancestor", base_sha, candidate_sha], cwd=repo)
+    run(["git", "merge-base", "--is-ancestor", base_sha, main], cwd=repo)
+    return {"origin": origin, "remote_main": main, "remote_pr_head": remote[0],
+            "pull_request": metadata, **workflow}
+
+
 def verify_repository(repo: Path, repository: str, pr_number: int,
                       base_sha: str, candidate_sha: str, workflow_ref: str,
-                      reference_sha: str | None = None) -> dict[str, str]:
+                      reference_sha: str | None = None,
+                      workflow_sha: str | None = None) -> dict[str, Any]:
+    if pr_number in EXACT_TWO_TREE_PR_NUMBERS:
+        return verify_exact_size_repository(
+            repo, repository, pr_number, base_sha, candidate_sha, workflow_ref,
+            reference_sha or "", workflow_sha or "")
+    if workflow_sha is not None:
+        if (repository != REPOSITORY or pr_number not in CURRENT_CANDIDATE_PR_NUMBERS
+                or workflow_ref != "refs/heads/main"):
+            raise DiagnosticError("workflow identity requires an allowlisted main dispatch")
+        origin = run(["git", "remote", "get-url", "origin"], cwd=repo).strip()
+        if not re.fullmatch(r"(?:https://github\.com/semantic-reasoning/wirelog(?:\.git)?|git@github\.com:semantic-reasoning/wirelog(?:\.git)?)", origin):
+            raise DiagnosticError(f"unexpected origin URL {origin!r}")
+        run(["git", "fetch", "--no-tags", "origin",
+             "refs/heads/main:refs/remotes/origin/main"], cwd=repo)
+        verify_workflow_identity(repo, workflow_sha)
     if pr_number in CURRENT_TWO_TREE_PR_NUMBERS and not reference_sha:
         if pr_number != PR_NUMBER or base_sha != BASE_SHA:
             return verify_current_baseline_repository(
@@ -801,7 +875,8 @@ def collect_two_tree_candidate(args: argparse.Namespace) -> int:
         "base_sha": args.base_sha,
         "candidate_sha": args.candidate_sha,
         "workflow_ref": args.workflow_ref,
-        "measurement_mode": ("historical-pr1903" if args.base_sha == BASE_SHA
+        "measurement_mode": ("exact-pr2032-base-head" if args.pr_number == EXACT_SIZE_PR_NUMBER
+                             else "historical-pr1903" if args.base_sha == BASE_SHA
                              else "current-base-head"),
         "status": "running",
         "attribution_status": "not-run",
@@ -813,7 +888,7 @@ def collect_two_tree_candidate(args: argparse.Namespace) -> int:
         repo = Path(args.repository_root).resolve()
         report["source_identity"] = verify_repository(repo, args.repository, args.pr_number,
                                                        args.base_sha, args.candidate_sha,
-                                                       args.workflow_ref)
+                                                       args.workflow_ref, "", args.workflow_sha)
         report["workflow_code_files_sha256"] = read_workflow_code_identity(repo)
         report["workflow_sha"] = run(["git", "rev-parse", "HEAD"], cwd=repo).strip()
         report["toolchain"] = {
@@ -888,6 +963,16 @@ def collect_two_tree_candidate(args: argparse.Namespace) -> int:
                     "candidate_compile": auth_candidate["compile_command"],
                 },
             }
+            if args.pr_number == EXACT_SIZE_PR_NUMBER:
+                head_bytes = auth_candidate_size["measured_bytes"]
+                if head_bytes != report["authoritative"]["candidate"]["text_bytes"]:
+                    raise DiagnosticError("authoritative candidate .text measurement differs")
+                report["authoritative"].update({
+                    "base_sha": args.base_sha, "candidate_sha": args.candidate_sha,
+                    "cap_bytes": EXACT_SIZE_CAP_BYTES,
+                    "headroom_bytes": EXACT_SIZE_CAP_BYTES - head_bytes,
+                    "cap_status": "pass" if head_bytes <= EXACT_SIZE_CAP_BYTES else "fail",
+                })
             write_json(report_path, report)
 
             attribution: dict[str, Any] = {}
@@ -984,7 +1069,7 @@ def collect_two_tree_candidate(args: argparse.Namespace) -> int:
                 }
         final_identity = verify_repository(repo, args.repository, args.pr_number,
                                            args.base_sha, args.candidate_sha,
-                                           args.workflow_ref)
+                                           args.workflow_ref, "", args.workflow_sha)
         report["source_identity"]["final_verification"] = final_identity
         report["status"] = "complete" if report["attribution_status"] == "usable" else "incomplete"
     except Exception as exc:  # noqa: BLE001 - preserve partial evidence for the always-upload step.
@@ -996,7 +1081,8 @@ def collect_two_tree_candidate(args: argparse.Namespace) -> int:
         return 1
     write_json(report_path, report)
     write_artifact_checksums(output)
-    return 0 if report["status"] == "complete" else 1
+    return 0 if (report["status"] == "complete"
+                 and report.get("authoritative", {}).get("cap_status") != "fail") else 1
 
 
 def profile_fingerprint(path: Path) -> str:
@@ -1038,7 +1124,7 @@ def collect_current_candidate(args: argparse.Namespace) -> int:
         repo = Path(args.repository_root).resolve()
         report["source_identity"] = verify_repository(
             repo, args.repository, args.pr_number, args.base_sha,
-            args.candidate_sha, args.workflow_ref, args.reference_sha)
+            args.candidate_sha, args.workflow_ref, args.reference_sha, args.workflow_sha)
         report["workflow_code_files_sha256"] = read_workflow_code_identity(repo)
         report["workflow_sha"] = run(["git", "rev-parse", "HEAD"], cwd=repo).strip()
         report["toolchain"] = {
@@ -1236,7 +1322,7 @@ def collect_current_candidate(args: argparse.Namespace) -> int:
                                     for item in report["total_text_comparisons"].values())
             final_identity = verify_repository(
                 repo, args.repository, args.pr_number, args.base_sha,
-                args.candidate_sha, args.workflow_ref, args.reference_sha)
+                args.candidate_sha, args.workflow_ref, args.reference_sha, args.workflow_sha)
             report["source_identity"]["final_verification"] = dict(final_identity)
             report["attribution_status"] = "usable" if usable else "unsafe-or-incomplete"
             if usable:
@@ -1289,7 +1375,7 @@ def collect(args: argparse.Namespace) -> int:
         write_artifact_checksums(output)
         print(report["error"], file=sys.stderr)
         return 1
-    if args.pr_number not in CURRENT_TWO_TREE_PR_NUMBERS:
+    if args.pr_number not in CURRENT_TWO_TREE_PR_NUMBERS | EXACT_TWO_TREE_PR_NUMBERS:
         raise DiagnosticError("two-tree attribution is restricted to allowlisted current candidates")
     return collect_two_tree_candidate(args)
 
@@ -1302,6 +1388,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--candidate-sha", required=True)
     parser.add_argument("--reference-sha", default="")
     parser.add_argument("--workflow-ref", required=True)
+    parser.add_argument("--workflow-sha", required=True)
     parser.add_argument("--repository-root", default=".")
     parser.add_argument("--output", default="size-attribution")
     return parser.parse_args(argv)

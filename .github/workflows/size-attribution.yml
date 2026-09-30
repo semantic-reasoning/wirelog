@@ -11,19 +11,20 @@ on:
           - "1903"
           - "1945"
           - "1956"
-        default: "1903"
+          - "2032"
+        default: "2032"
       base_sha:
-        description: Fresh origin/main SHA used as the pull request base
+        description: "Fresh origin/main SHA for existing modes; pinned historical base for PR #2032"
         required: true
         type: string
-        default: "65cd273685086a4b7410976be159d44d1615c48e"
+        default: "438388c0ab834fa2b4e15b1357a095c3dec2c692"
       candidate_sha:
         description: Full current PR head SHA from the selected pull request
         required: true
         type: string
-        default: "a4c7c622daa3b7247378acf71a74b7f40f4ff556"
+        default: "cd1061206182797e2833521043c89433b0af9c8f"
       reference_sha:
-        description: 'Leave empty only for the initial PR #1903 or #1956 base/head report; PR #1945 and later reductions require the reviewed fixed reference SHA and keep it fixed across runs'
+        description: 'PR #2032 is a two-tree base/head measurement and must leave this empty. Leave empty only for the initial PR #1903 or #1956 base/head report; PR #1945 and later reductions require the reviewed fixed reference SHA and keep it fixed across runs'
         required: false
         type: string
         default: ""
@@ -94,6 +95,7 @@ jobs:
           GH_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
           GH_REFERENCE_SHA: ${{ inputs.reference_sha }}
           WORKFLOW_REF: ${{ github.ref }}
+          GH_WORKFLOW_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           export PATH="$PWD/.venv-size-attribution/bin:$PATH"
@@ -103,6 +105,7 @@ jobs:
             --base-sha "$GH_BASE_SHA"
             --candidate-sha "$GH_CANDIDATE_SHA"
             --workflow-ref "$WORKFLOW_REF"
+            --workflow-sha "$GH_WORKFLOW_SHA"
             --repository-root "$PWD"
             --output "$PWD/size-attribution"
           )
