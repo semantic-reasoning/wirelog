@@ -61,6 +61,9 @@ wl_columnar_set_transition_hook_t wl_columnar_set_transition_hook;
 
 #ifdef WL_TEST_RELATION_RESIZE_HOOK
 bool wl_columnar_relation_test_fail_prepare_resize;
+void (*wl_columnar_relation_test_reader_after_descriptor)(const col_rel_t *);
+void (*wl_columnar_relation_test_rebind_after_descriptor)(const col_rel_t *);
+void (*wl_columnar_relation_test_rebind_before_publication)(const col_rel_t *);
 static bool wl_columnar_relation_test_fail_compact_rollback;
 static bool wl_columnar_relation_test_fail_compact_commit;
 static bool wl_columnar_relation_test_fail_reservation_commit;
@@ -531,6 +534,10 @@ col_rel_source_reader_acquire(const col_rel_t *rel,
         (wl_columnar_source_access_gate_t *)&rel->descriptor_access);
     if (rc != 0)
         return rc;
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    if (wl_columnar_relation_test_reader_after_descriptor)
+        wl_columnar_relation_test_reader_after_descriptor(rel);
+#endif
     rc = col_rel_storage_owner_resolve(rel, &owner);
     if (rc != 0) {
         (void)wl_columnar_source_access_gate_reader_release(
@@ -5112,8 +5119,99 @@ cleanup:
  * Issue #396: used by tdd_broadcast_deltas to eliminate O(|delta|) deep
  * copies when broadcasting the union delta to worker sessions.
  */
+/* Publication permits stay on the acquiring thread's stack.  A copied gate
+* token or permit cannot authorize a different descriptor's publication. */
+typedef struct wl_columnar_relation_rebind_permit {
+    uintptr_t identity;
+    col_rel_t *destination;
+    col_rel_t *old_owner;
+    wl_columnar_source_access_writer_t *descriptor_writer;
+    wl_columnar_source_access_reader_t *upgraded_lease;
+    bool lease_descriptor_upgraded;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD thread;
+#else
+    pthread_t thread;
+#endif
+} wl_columnar_relation_rebind_permit_t;
+
+static void
+wl_columnar_relation_rebind_permit_init(
+    wl_columnar_relation_rebind_permit_t *permit, col_rel_t *destination,
+    col_rel_t *old_owner, wl_columnar_source_access_writer_t *descriptor_writer,
+    wl_columnar_source_access_reader_t *upgraded_lease,
+    bool lease_descriptor_upgraded)
+{
+    permit->identity = (uintptr_t)permit;
+    permit->destination = destination;
+    permit->old_owner = old_owner;
+    permit->descriptor_writer = descriptor_writer;
+    permit->upgraded_lease = upgraded_lease;
+    permit->lease_descriptor_upgraded = lease_descriptor_upgraded;
+#if defined(WL_HAVE_C11_THREADS)
+    permit->thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    permit->thread = GetCurrentThreadId();
+#else
+    permit->thread = pthread_self();
+#endif
+}
+
+static bool
+wl_columnar_relation_rebind_permit_valid(
+    const wl_columnar_relation_rebind_permit_t *permit,
+    const col_rel_t *destination)
+{
+    if (!permit || permit->identity != (uintptr_t)permit ||
+        permit->destination != destination || !destination)
+        return false;
+#if defined(WL_HAVE_C11_THREADS)
+    if (!thrd_equal(permit->thread, thrd_current()))
+        return false;
+#elif defined(_WIN32) || defined(_WIN64)
+    if (permit->thread != GetCurrentThreadId())
+        return false;
+#else
+    if (!pthread_equal(permit->thread, pthread_self()))
+        return false;
+#endif
+    if (permit->lease_descriptor_upgraded) {
+        const wl_columnar_source_access_reader_t *lease =
+            permit->upgraded_lease;
+        return !permit->descriptor_writer && lease &&
+               lease->identity == (uintptr_t)lease && lease->transferable &&
+               !lease->thread_valid &&
+               lease->owner == &destination->source_access &&
+               lease->secondary_owner == &destination->descriptor_access &&
+               atomic_load_explicit(&lease->owner->state,
+                   memory_order_acquire) ==
+               WL_COLUMNAR_SOURCE_ACCESS_WRITER &&
+               atomic_load_explicit(&lease->secondary_owner->state,
+                   memory_order_acquire) ==
+               WL_COLUMNAR_SOURCE_ACCESS_WRITER;
+    }
+    return wl_columnar_relation_retirement_writer_valid(
+        permit->descriptor_writer, &destination->descriptor_access);
+}
+
 static int
-col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
+wl_columnar_relation_rebind_release_old_borrow(
+    const wl_columnar_relation_rebind_permit_t *permit, col_rel_t *old_owner)
+{
+    if (!wl_columnar_relation_rebind_permit_valid(
+            permit, permit ? permit->destination : NULL) ||
+        old_owner != permit->old_owner || old_owner == permit->destination)
+        return EINVAL;
+    /* Validate before decrementing.  After the successful decrement the old
+     * root may be destroyed immediately; do not inspect it again. */
+    return col_rel_storage_alias_borrow_release(old_owner);
+}
+
+static int
+col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src,
+    const wl_columnar_relation_rebind_permit_t *permit)
 {
     col_rel_t *source_owner = NULL;
     col_rel_t *old_owner = NULL;
@@ -5143,6 +5241,8 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
     wl_columnar_memory_reservation_init(&retained_pending);
     if (!dst || !src || dst == src || dst->ncols != src->ncols)
         return EINVAL;
+    if (!wl_columnar_relation_rebind_permit_valid(permit, dst))
+        return EINVAL;
     if (!col_rel_timestamp_shape_valid(src)
         || !col_rel_timestamp_shape_valid(dst)
         || src->nrows > src->capacity)
@@ -5154,6 +5254,8 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
         col_rel_storage_owner_init(dst);
     if (col_rel_storage_owner_resolve(src, &source_owner) != 0
         || col_rel_storage_owner_resolve(dst, &old_owner) != 0)
+        return EINVAL;
+    if (permit->old_owner != old_owner)
         return EINVAL;
     /* Pool and arena owners can outlive their relation descriptors through
      * allocator reset, so they cannot be represented by a raw owner pointer
@@ -5427,8 +5529,10 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
         /* Drop the old borrow only after dst no longer refers to that owner,
          * so a concurrent root destroy cannot observe an unborrowed live
          * alias descriptor. */
-        if (old_owner != dst)
-            (void)col_rel_storage_alias_borrow_release(old_owner);
+        if (old_owner != dst
+            && wl_columnar_relation_rebind_release_old_borrow(permit,
+            old_owner) != 0)
+            abort();
     }
     shared_columns = NULL;
     shared_flags = NULL;
@@ -5464,73 +5568,138 @@ wl_columnar_relation_install_shared_view_with_lease(col_rel_t *dst,
     wl_columnar_source_access_reader_t *destination_lease)
 {
     wl_columnar_source_access_reader_t source_reader = { 0 };
-    wl_columnar_source_access_writer_t writer = { 0 };
+    wl_columnar_source_access_writer_t descriptor_writer = { 0 };
+    wl_columnar_source_access_writer_t owner_writer = { 0 };
+    wl_columnar_relation_rebind_permit_t permit = { 0 };
+    wl_columnar_source_access_gate_t *source_descriptor;
     col_rel_t *owner = NULL;
     col_rel_t *destination_owner = NULL;
-    bool same_owner;
-    bool lease_upgraded = false;
+    bool descriptor_upgraded = false;
+    bool source_upgraded = false;
+    bool source_descriptor_held = false;
     int rc;
 
     if (!dst || !src || dst == src)
         return EINVAL;
-
     rc = col_rel_storage_owner_ensure_initialized((col_rel_t *)src);
     if (rc != 0)
         return rc;
-    rc = col_rel_storage_owner_resolve(src, &owner);
+    rc = col_rel_storage_owner_ensure_initialized(dst);
     if (rc != 0)
         return rc;
-    rc = col_rel_storage_owner_resolve(dst, &destination_owner);
-    if (rc != 0)
-        return rc;
-    same_owner = owner == destination_owner;
+    source_descriptor
+        = (wl_columnar_source_access_gate_t *)&src->descriptor_access;
+
+    /* Session lifetime leases usually pin the canonical root descriptor,
+     * independently of the alias being refreshed.  Preserve those readers.
+     * Only a lease on dst itself can supply its descriptor exclusion. */
     if (destination_lease
-        && (destination_lease->owner != &destination_owner->source_access
-        || destination_lease->identity != (uintptr_t)destination_lease
-        || !destination_lease->transferable
-        || destination_lease->thread_valid)){
-        return EINVAL;
-    }
-    if (!same_owner) {
-        rc = col_rel_source_reader_acquire(owner, &source_reader);
-        if (rc != 0)
-            return rc;
-    }
-    if (destination_lease) {
-        /* The session is externally serialized and lends its own lifetime
-         * lease for this call.  Upgrade only its sole reader atomically:
-         * external readers deny publication, and the owner stays protected
-         * even on preparation failure.  Keep the token intact for restoration
-         * before the session either reuses or retires the old lease. */
+        && destination_lease->secondary_owner == &dst->descriptor_access) {
+        if (destination_lease->identity != (uintptr_t)destination_lease
+            || !destination_lease->transferable
+            || destination_lease->thread_valid
+            || destination_lease->owner != &dst->source_access) {
+            rc = EINVAL;
+            goto cleanup;
+        }
         uint64_t expected = 1u;
         do {
-            lease_upgraded = atomic_compare_exchange_weak_explicit(
+            descriptor_upgraded = atomic_compare_exchange_weak_explicit(
+                &dst->descriptor_access.state, &expected,
+                WL_COLUMNAR_SOURCE_ACCESS_WRITER, memory_order_acquire,
+                memory_order_relaxed);
+        } while (!descriptor_upgraded && expected == 1u);
+        if (!descriptor_upgraded) {
+            rc = EBUSY;
+            goto cleanup;
+        }
+    } else {
+        rc = wl_columnar_source_access_writer_acquire(
+            &dst->descriptor_access, &descriptor_writer);
+        if (rc != 0)
+            goto cleanup;
+    }
+    rc = col_rel_storage_owner_resolve(dst, &destination_owner);
+    if (rc != 0)
+        goto cleanup;
+    rc = wl_columnar_source_access_gate_reader_acquire(source_descriptor);
+    if (rc != 0)
+        goto cleanup;
+    source_descriptor_held = true;
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    if (wl_columnar_relation_test_rebind_after_descriptor)
+        wl_columnar_relation_test_rebind_after_descriptor(dst);
+#endif
+    rc = col_rel_storage_owner_resolve(src, &owner);
+    if (rc != 0)
+        goto cleanup;
+    if (destination_lease
+        && (destination_lease->owner != &destination_owner->source_access
+        || destination_lease->secondary_owner
+        != &destination_owner->descriptor_access
+        || destination_lease->identity != (uintptr_t)destination_lease
+        || !destination_lease->transferable
+        || destination_lease->thread_valid
+        || (descriptor_upgraded && destination_owner != dst))) {
+        rc = EINVAL;
+        goto cleanup;
+    }
+    if (owner != destination_owner) {
+        rc = col_rel_source_reader_acquire(owner, &source_reader);
+        if (rc != 0)
+            goto cleanup;
+    }
+    if (destination_lease) {
+        /* Both upgrades are nonblocking and leave the transferable token at
+         * its original address.  Restore source before descriptor on every
+         * outcome, including admission or allocation failure. */
+        uint64_t expected = 1u;
+        do {
+            source_upgraded = atomic_compare_exchange_weak_explicit(
                 &destination_owner->source_access.state, &expected,
                 WL_COLUMNAR_SOURCE_ACCESS_WRITER, memory_order_acquire,
                 memory_order_relaxed);
-        } while (!lease_upgraded && expected == 1u);
-        rc = lease_upgraded ? 0 : EBUSY;
+        } while (!source_upgraded && expected == 1u);
+        if (!source_upgraded) {
+            rc = EBUSY;
+            goto cleanup;
+        }
     } else {
-        /* Alias readers use the canonical owner's gate too.  Refreshing the
-         * destination frees its descriptors, so exclude those readers even
-         * though the borrowed column buffers themselves stay unchanged.
-         * One writer also protects the source when both owners coincide. */
-        rc = col_rel_source_writer_acquire(dst, &writer);
+        rc = wl_columnar_source_access_writer_acquire(
+            &destination_owner->source_access, &owner_writer);
+        if (rc != 0)
+            goto cleanup;
     }
-    if (rc != 0) {
-        if (source_reader.owner)
-            (void)col_rel_source_reader_release(&source_reader);
-        return rc;
-    }
-    rc = col_rel_install_shared_view_unprotected(dst, src);
-    if (lease_upgraded)
-        (void)atomic_exchange_explicit(&destination_owner->source_access.state,
+    wl_columnar_relation_rebind_permit_init(&permit, dst, destination_owner,
+        descriptor_upgraded ? NULL : &descriptor_writer,
+        destination_lease, descriptor_upgraded);
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    if (wl_columnar_relation_test_rebind_before_publication)
+        wl_columnar_relation_test_rebind_before_publication(dst);
+#endif
+    rc = col_rel_install_shared_view_unprotected(dst, src, &permit);
+
+cleanup:
+    if (source_upgraded)
+        atomic_store_explicit(&destination_owner->source_access.state,
             1u, memory_order_release);
-    if (writer.owner
-        && wl_columnar_source_access_writer_release(&writer) != 0 && rc == 0)
+    if (owner_writer.owner
+        && wl_columnar_source_access_writer_release(&owner_writer) != 0
+        && rc == 0)
         rc = EINVAL;
     if (source_reader.owner
         && col_rel_source_reader_release(&source_reader) != 0 && rc == 0)
+        rc = EINVAL;
+    if (source_descriptor_held
+        && wl_columnar_source_access_gate_reader_release(source_descriptor)
+        != 0 && rc == 0)
+        rc = EINVAL;
+    if (descriptor_upgraded)
+        atomic_store_explicit(&dst->descriptor_access.state, 1u,
+            memory_order_release);
+    if (descriptor_writer.owner
+        && wl_columnar_source_access_writer_release(&descriptor_writer) != 0
+        && rc == 0)
         rc = EINVAL;
     return rc;
 }
@@ -5539,6 +5708,7 @@ int
 col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
 {
     wl_columnar_source_access_reader_t source_owner_reader = { 0 };
+    wl_columnar_relation_rebind_permit_t permit = { 0 };
     wl_columnar_source_access_writer_t dst_descriptor_writer = { 0 };
     wl_columnar_source_access_writer_t dst_owner_writer = { 0 };
     wl_columnar_source_access_gate_t *src_descriptor;
@@ -5626,7 +5796,13 @@ col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
         rc = EBUSY;
         goto cleanup;
     }
-    rc = col_rel_install_shared_view_unprotected(dst, src);
+    wl_columnar_relation_rebind_permit_init(&permit, dst, dst_owner,
+        &dst_descriptor_writer, NULL, false);
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    if (wl_columnar_relation_test_rebind_before_publication)
+        wl_columnar_relation_test_rebind_before_publication(dst);
+#endif
+    rc = col_rel_install_shared_view_unprotected(dst, src, &permit);
 
 cleanup:
     if (dst_owner_first && source_owner_reader_held

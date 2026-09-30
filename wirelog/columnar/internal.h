@@ -635,6 +635,12 @@ extern wl_columnar_set_transition_hook_t wl_columnar_set_transition_hook;
 #ifdef WL_TEST_RELATION_RESIZE_HOOK
 /* Test-only seam for forcing the private resize preparation to fail. */
 extern bool wl_columnar_relation_test_fail_prepare_resize;
+extern void (*wl_columnar_relation_test_reader_after_descriptor)(
+    const col_rel_t *);
+extern void (*wl_columnar_relation_test_rebind_after_descriptor)(
+    const col_rel_t *);
+extern void (*wl_columnar_relation_test_rebind_before_publication)(
+    const col_rel_t *);
 extern void (*wl_columnar_relation_test_after_retired_storage_free)(
     const col_rel_t *);
 wl_columnar_continuation_status_t
