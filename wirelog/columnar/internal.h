@@ -2870,9 +2870,17 @@ wl_col_rel_inline_project_column(col_rel_t *dst, uint32_t dst_row,
 
 /* Public row append owns descriptor and canonical source writers throughout
  * publication. Input tuples may overlap column storage; the public path
- * stages the complete tuple before any replacement. Caller keeps other input
- * buffers stable for the call. Locked append/reservation retain their legacy
- * source-writer contract. Outer attempts reset transient denial evidence.
+ * stages the complete tuple before any replacement. Locked append also
+ * stages overlap under its validated caller-owned canonical writer and
+ * releases a detached alias immediately before returning. Its transitional
+ * owner resolver requires a stable descriptor binding from the caller.
+ * Raw writer validation covers the canonical gate, not exact target
+ * descriptor authority; owner-only consolidation tokens remain supported
+ * pending the two-role lease migration (#2033). Both #2033 and #2034 remain
+ * open until that migration and removal of the live raw alias bridges.
+ * Caller keeps other input buffers stable for the call. Locked reservation
+ * retains its legacy source-writer contract. Outer attempts reset transient
+ * denial evidence only after authority admission.
  * Actual budget refusal retains legacy ENOMEM plus
  * memory_budget_denial_pending; allocation ENOMEM, EOVERFLOW and EINVAL are
  * distinct. Lower nested admission helpers do not reset outer evidence. */

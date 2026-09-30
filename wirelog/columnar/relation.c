@@ -4011,11 +4011,36 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
 
     if (!r || !row || !writer)
         return EINVAL;
+    if (!lease) {
+        col_rel_t *owner = NULL;
+        /* Transitional raw authority: owner resolution follows its existing
+         * stable-binding caller contract; no descriptor gate is acquired.
+         * This checks canonical owner authority only: owner-only tokens and
+         * tokens pinning a different same-owner descriptor remain legacy
+         * callers. Exact target authority requires the two-role consolidation
+         * lease migration (#2033). Validate before shape or payload reads. */
+        if (!writer_held || !writer->owner
+            || writer->identity != (uintptr_t)writer
+            || !writer->thread_valid
+            || !wl_columnar_source_access_writer_thread_equal(writer)
+            || col_rel_storage_owner_resolve(r, &owner) != 0
+            || !wl_columnar_relation_retirement_writer_valid(writer,
+            &owner->source_access))
+            return EINVAL;
+        r->memory_budget_denial_pending = false;
+    }
     if (lease && (lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
         || col_rel_mutation_lease_validate(lease, r)))
         return EINVAL;
-    if (lease && (!col_rel_timestamp_shape_valid(r) || r->nrows > r->capacity))
+    if (!col_rel_timestamp_shape_valid(r) || r->nrows > r->capacity)
         return EINVAL;
+    bool replaces_storage = r->col_shared || r->nrows >= r->capacity
+        || (r->timestamps && r->nrows >= r->timestamp_capacity);
+    if (r->nrows == UINT32_MAX
+        || r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+        || (replaces_storage && r->storage_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u))
+        return EOVERFLOW;
     /* Do all structural validation before any resize, COW, or timestamp
      * publication.  In particular, a zero-column or partially initialized
      * relation must fail without consuming capacity or a generation epoch. */
@@ -4033,7 +4058,7 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
             return EINVAL;
     bool row_overlaps = false;
     size_t row_bytes = 0;
-    if (lease) {
+    {
         if (r->nrows == UINT32_MAX)
             return EOVERFLOW;
         uint64_t bytes = (uint64_t)r->ncols * sizeof(*row);
@@ -4044,7 +4069,8 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
         row_bytes = (size_t)bytes;
         for (uint32_t c = 0; r->columns && c < r->ncols; c++) {
             uintptr_t column_start = (uintptr_t)r->columns[c];
-            if (column_bytes > UINTPTR_MAX - column_start)
+            if (column_bytes > SIZE_MAX
+                || column_bytes > UINTPTR_MAX - column_start)
                 return EOVERFLOW;
             if (row_bytes && column_bytes
                 && row_start < column_start + column_bytes
@@ -4059,19 +4085,6 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
                 return EINVAL;
         }
     }
-
-    /* Resolve and admit the canonical storage owner only after validation,
-     * but before any resize, COW, timestamp, value, or generation mutation.
-     * A reader on an alias therefore excludes append on every view of the
-     * same backing storage. */
-    if (!lease && !writer_held) {
-        rc = col_rel_source_writer_acquire(r, writer);
-        if (rc != 0)
-            return rc;
-    }
-
-    if (!lease)
-        r->memory_budget_denial_pending = false;
 
     /* A valid input row may be a slice of a column that publication retires.
      * Capture the complete tuple while its descriptor and source are closed,
