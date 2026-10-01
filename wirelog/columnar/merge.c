@@ -1936,9 +1936,10 @@ col_rel_compact_runs(col_rel_t *rel)
  * The path is chosen only after the delta sort, which itself advances the
  * view generation, so the bound is taken over every path still reachable:
  * one advance to retire timestamps, one to detach a shared view (by the
- * sort or before the binary/fallback mutation; the first detach clears
- * col_shared), and one for the fallback's column swap whenever the delta is
- * too large to guarantee the fast or binary path. */
+ * sort, before the fast path's run compaction, or before the
+ * binary/fallback mutation; the first detach clears col_shared), and one for
+ * the fallback's column swap whenever the delta is too large to guarantee
+ * the fast or binary path. */
 static uint32_t
 col_op_consolidate_storage_steps(const col_rel_t *rel, uint32_t old_nrows,
     uint32_t delta_count)
