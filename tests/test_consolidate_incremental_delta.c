@@ -1151,10 +1151,12 @@ test_shared_single_delta_fallback_detaches_view(void)
  * row 1000 is appended unconsolidated, so a one-row fast-path consolidation
  * of a view over this owner must compact.
  * ================================================================ */
-#define EIGHT_RUN_OWNER_ROWS 40u
+#define EIGHT_RUN_ROWS 39u
+#define EIGHT_RUN_OWNER_ROWS (EIGHT_RUN_ROWS + 1u)
 
+/* The eight interleaved runs alone: EIGHT_RUN_ROWS rows, run_ends 32..39. */
 static bool
-build_eight_run_owner(col_rel_t *owner)
+build_eight_runs(col_rel_t *owner)
 {
     int fast_path = -1;
     for (uint32_t i = 0; i < 32u; i++) {
@@ -1173,14 +1175,21 @@ build_eight_run_owner(col_rel_t *owner)
             &fast_path) != 0 || fast_path != 0)
             return false;
     }
-    if (owner->run_count != COL_MAX_RUNS || owner->nrows != 39u)
+    if (owner->run_count != COL_MAX_RUNS || owner->nrows != EIGHT_RUN_ROWS)
         return false;
     for (uint32_t r = 0; r < COL_MAX_RUNS; r++) {
         if (owner->run_ends[r] != 32u + r)
             return false;
     }
+    return true;
+}
+
+static bool
+build_eight_run_owner(col_rel_t *owner)
+{
     int64_t trailing = 1000;
-    return test_rel_append_row(owner, &trailing) == 0
+    return build_eight_runs(owner)
+           && test_rel_append_row(owner, &trailing) == 0
            && owner->nrows == EIGHT_RUN_OWNER_ROWS;
 }
 
@@ -1224,6 +1233,27 @@ eight_run_view_compacted(const col_rel_t *view, const int64_t *owner_columns)
         || !test_rel_is_sorted(view) || !test_rel_is_unique(view))
         return false;
     return memcmp(expected, view->columns[0], sizeof(expected)) == 0;
+}
+
+/* The binary path compacts the eight runs into one and appends the novel
+ * row as a second run after it. */
+static bool
+eight_run_binary_compacted(const col_rel_t *rel, int64_t novel)
+{
+    int64_t expected[EIGHT_RUN_ROWS];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < 32u; i++) {
+        int64_t value = (int64_t)i * 10;
+        expected[n++] = value;
+        if (value >= 10 && value <= 70)
+            expected[n++] = value + 5;
+    }
+    return n == EIGHT_RUN_ROWS && rel->nrows == EIGHT_RUN_ROWS + 1u
+           && rel->sorted_nrows == EIGHT_RUN_ROWS + 1u
+           && rel->run_count == 2 && rel->run_ends[0] == EIGHT_RUN_ROWS
+           && rel->run_ends[1] == EIGHT_RUN_ROWS + 1u
+           && memcmp(expected, rel->columns[0], sizeof(expected)) == 0
+           && rel->columns[0][EIGHT_RUN_ROWS] == novel;
 }
 
 static void
@@ -1497,6 +1527,104 @@ test_fast_path_compaction_denied_keeps_runs(void)
         ASSERT(!delta_out
             || (delta_out->nrows == 1 && delta_out->columns[0][0] == 1000),
             "retry emits the trailing row");
+
+        test_rel_free(delta_out);
+        test_rel_free(rel);
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    PASS();
+}
+
+/* Issue #2053: the binary path acquires its compaction scratch before it
+ * publishes rows, so a refused compaction leaves nrows, runs and the view
+ * generation as the delta sort left them.  Shape A is one novel row (no
+ * sort); shape B adds a duplicate of a published row, so the delta is
+ * sorted (advancing the view once) and an early nrows publication would
+ * shrink nrows from 41 to 40.  Shape B's two unique rows sit exactly at the
+ * binary-path limit old_nrows / 16; the retry's two-run layout shows that
+ * the binary path, not the fallback, ran. */
+static void
+test_binary_path_compaction_denied_keeps_runs(void)
+{
+    TEST("denied binary-path compaction keeps rows and runs (#2053)");
+
+    static const int64_t shape_a[] = { 85 };
+    static const int64_t shape_b[] = { 85, 20 };
+    for (uint32_t variant = 0; variant < 4; variant++) {
+        bool with_delta = (variant & 1u) != 0;
+        bool sorted_delta = (variant & 2u) != 0;
+        const int64_t *delta = sorted_delta ? shape_b : shape_a;
+        uint32_t ndelta = sorted_delta ? 2u : 1u;
+        col_rel_t *rel = test_rel_alloc(1);
+        col_rel_t *delta_out = with_delta ? test_rel_alloc(1) : NULL;
+        wl_columnar_memory_governor_ref_t *ref
+            = test_shared_compaction_governor_create(1u << 20);
+        ASSERT(rel && ref && (!with_delta || delta_out),
+            "binary denial relations");
+        ASSERT(build_eight_runs(rel), "eight-run relation");
+        for (uint32_t i = 0; i < ndelta; i++)
+            ASSERT(test_rel_append_row(rel, &delta[i]) == 0,
+                "binary denial delta");
+        ASSERT(col_rel_attach_memory_governor(rel, ref) == 0,
+            "governed binary relation");
+
+        int64_t before[EIGHT_RUN_ROWS];
+        memcpy(before, rel->columns[0], sizeof(before));
+        int64_t *columns = rel->columns[0];
+        uint32_t run_ends[COL_MAX_RUNS];
+        memcpy(run_ends, rel->run_ends, sizeof(run_ends));
+        uint32_t nrows = rel->nrows;
+        uint32_t sorted_nrows = rel->sorted_nrows;
+        uint64_t view_generation = rel->view_generation;
+        uint64_t storage_generation = rel->storage_generation;
+        wl_columnar_memory_governor_t *governor
+            = wl_columnar_memory_governor_ref_get(ref);
+        uint64_t reserved = wl_columnar_memory_reserved(governor);
+        ASSERT(!rel->memory_budget_denial_pending, "no prior denial");
+        /* One byte short of a scratch for the published rows (old rows plus
+         * the novel row): admits shape B's sort workspace, denies the
+         * compaction scratch, and pins its size from below. */
+        atomic_store_explicit(&governor->usable_bytes, reserved
+            + (uint64_t)(EIGHT_RUN_ROWS + 1u) * sizeof(int64_t) - 1u,
+            memory_order_release);
+
+        int fast_path = -1;
+        ASSERT(col_op_consolidate_incremental_delta(rel, EIGHT_RUN_ROWS,
+            delta_out, &fast_path) == ENOMEM && fast_path == -1
+            && rel->memory_budget_denial_pending,
+            "binary compaction scratch denial is refused");
+        ASSERT(rel->nrows == nrows,
+            "refused binary compaction does not publish nrows");
+        /* A multi-row delta is sorted, advancing the view once, before any
+         * path is chosen; a one-row delta is not sorted.  The refusal adds
+         * no advance of its own. */
+        ASSERT(rel->sorted_nrows == sorted_nrows
+            && rel->run_count == COL_MAX_RUNS
+            && memcmp(run_ends, rel->run_ends, sizeof(run_ends)) == 0
+            && rel->view_generation
+            == view_generation + (sorted_delta ? 1u : 0u),
+            "refused binary compaction publishes no runs or generations");
+        ASSERT(rel->storage_generation == storage_generation
+            && rel->columns[0] == columns
+            && memcmp(before, rel->columns[0], sizeof(before)) == 0
+            && wl_columnar_memory_reserved(governor) == reserved
+            && (!delta_out || delta_out->nrows == 0),
+            "refused binary compaction keeps rows, credit and delta_out");
+
+        atomic_store_explicit(&governor->usable_bytes, 1u << 20,
+            memory_order_release);
+        ASSERT(col_op_consolidate_incremental_delta(rel, EIGHT_RUN_ROWS,
+            delta_out, &fast_path) == 0 && fast_path == 0,
+            "retry after refused binary compaction succeeds");
+        ASSERT(eight_run_binary_compacted(rel, 85),
+            "retry compacts the old runs and appends the novel run");
+        ASSERT(wl_columnar_memory_reserved(governor)
+            == rel->descriptor_reserved_bytes + rel->metadata_reserved_bytes
+            + rel->retained_reserved_bytes,
+            "retry releases the compaction scratch credit");
+        ASSERT(!delta_out
+            || (delta_out->nrows == 1 && delta_out->columns[0][0] == 85),
+            "retry emits the novel row");
 
         test_rel_free(delta_out);
         test_rel_free(rel);
@@ -2592,6 +2720,7 @@ main(void)
     test_shared_fast_path_without_compaction_keeps_borrow();
     test_shared_fast_path_compaction_denied_is_transactional();
     test_fast_path_compaction_denied_keeps_runs();
+    test_binary_path_compaction_denied_keeps_runs();
     test_fastpath_counter_null_safe();
     test_initialized_zero_column_relation();
     test_source_exclusion_is_transactional();
