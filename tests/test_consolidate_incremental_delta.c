@@ -1412,6 +1412,607 @@ test_shared_delta_reader_excluded_through_append(void)
 }
 #endif
 
+/* ================================================================
+ * Issue #2046: every incremental path that retires timestamps publishes
+ * one storage-generation advance for the retirement, and every storage
+ * advance the call may make is reserved before it mutates anything.
+ *
+ * Fixture: one column, 32 sorted old rows 0, 10, ..., 310 forming one run,
+ * followed by the appended delta rows.  With 32 old rows the binary path
+ * accepts at most two unique delta rows that sort inside the old range.
+ * ================================================================ */
+#define TS_FIXTURE_OLD_ROWS 32u
+#define TS_FIXTURE_MAX_ROWS 40u
+
+typedef struct ts_fixture {
+    col_rel_t *rel;
+    wl_columnar_memory_governor_ref_t *ref;
+} ts_fixture_t;
+
+typedef struct ts_snapshot {
+    uint32_t nrows;
+    uint32_t sorted_nrows;
+    uint32_t run_count;
+    uint32_t run_ends[COL_MAX_RUNS];
+    uint32_t timestamp_capacity;
+    int64_t values[TS_FIXTURE_MAX_ROWS];
+    const col_delta_timestamp_t *timestamps;
+    uint64_t view_generation;
+    uint64_t storage_generation;
+    uint64_t storage_owner_generation;
+    uint64_t retained_reserved_bytes;
+    uint64_t governor_reserved_bytes;
+} ts_snapshot_t;
+
+static wl_columnar_memory_governor_ref_t *
+test_ts_governor_create(uint64_t usable_bytes)
+{
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    resolution.budget_bytes = usable_bytes;
+    resolution.usable_bytes = usable_bytes;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    return wl_columnar_memory_governor_ref_create(&resolution);
+}
+
+/* Release the relation before the governor it is attached to. */
+static void
+ts_fixture_fini(ts_fixture_t *f)
+{
+    test_rel_free(f->rel);
+    if (f->ref)
+        wl_columnar_memory_governor_ref_release(f->ref);
+    f->rel = NULL;
+    f->ref = NULL;
+}
+
+/* Build the old run, append the delta, then optionally publish timestamps
+ * and attach an enforcing 16 MiB governor.  Returns false on any setup
+ * failure, leaving the fixture safe to finalize. */
+static bool
+ts_fixture_init(ts_fixture_t *f, const int64_t *delta, uint32_t ndelta,
+    bool timestamps)
+{
+    int fast_path = -1;
+    f->rel = test_rel_alloc(1);
+    f->ref = NULL;
+    if (!f->rel)
+        return false;
+    for (uint32_t i = 0; i < TS_FIXTURE_OLD_ROWS; i++) {
+        int64_t value = (int64_t)i * 10;
+        if (test_rel_append_row(f->rel, &value) != 0)
+            return false;
+    }
+    if (col_op_consolidate_incremental_delta(f->rel, 0, NULL, &fast_path)
+        != 0 || fast_path != 1 || f->rel->run_count != 1
+        || f->rel->run_ends[0] != TS_FIXTURE_OLD_ROWS)
+        return false;
+    for (uint32_t i = 0; i < ndelta; i++) {
+        if (test_rel_append_row(f->rel, &delta[i]) != 0)
+            return false;
+    }
+    if (timestamps
+        && (col_rel_enable_timestamps(f->rel) != 0 || !f->rel->timestamps
+        || f->rel->timestamp_capacity == 0))
+        return false;
+    f->ref = test_ts_governor_create(16u << 20);
+    return f->ref && col_rel_attach_memory_governor(f->rel, f->ref) == 0;
+}
+
+static uint64_t
+ts_fixture_governor_reserved(const ts_fixture_t *f)
+{
+    return wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(f->ref));
+}
+
+/* The governor holds exactly the relation's descriptor, metadata and
+ * retained credit, and the retained credit matches the live payload. */
+static bool
+ts_fixture_credit_exact(const ts_fixture_t *f)
+{
+    uint64_t live = 0;
+    const col_rel_t *rel = f->rel;
+    return col_rel_retained_live_bytes(rel, &live)
+           && live == rel->retained_reserved_bytes
+           && ts_fixture_governor_reserved(f)
+           == rel->descriptor_reserved_bytes + rel->metadata_reserved_bytes
+           + rel->retained_reserved_bytes;
+}
+
+static void
+ts_snapshot_take(const ts_fixture_t *f, ts_snapshot_t *s)
+{
+    const col_rel_t *rel = f->rel;
+    memset(s, 0, sizeof(*s));
+    s->nrows = rel->nrows;
+    s->sorted_nrows = rel->sorted_nrows;
+    s->run_count = rel->run_count;
+    memcpy(s->run_ends, rel->run_ends, sizeof(s->run_ends));
+    for (uint32_t i = 0; i < rel->nrows && i < TS_FIXTURE_MAX_ROWS; i++)
+        s->values[i] = rel->columns[0][i];
+    s->timestamps = rel->timestamps;
+    s->timestamp_capacity = rel->timestamp_capacity;
+    s->view_generation = rel->view_generation;
+    s->storage_generation = rel->storage_generation;
+    s->storage_owner_generation = rel->storage_owner_generation;
+    s->retained_reserved_bytes = rel->retained_reserved_bytes;
+    s->governor_reserved_bytes = ts_fixture_governor_reserved(f);
+}
+
+static bool
+ts_snapshot_equal(const ts_snapshot_t *a, const ts_snapshot_t *b)
+{
+    return memcmp(a, b, sizeof(*a)) == 0;
+}
+
+/* Exhaustion fixtures pin the root's storage generation and its owner
+ * mirror together, preserving the root invariant the retirement checks. */
+static void
+ts_fixture_set_storage_generation(ts_fixture_t *f, uint64_t generation)
+{
+    f->rel->storage_generation = generation;
+    f->rel->storage_owner_generation = generation;
+}
+
+static bool
+ts_fixture_values_are(const col_rel_t *rel, const int64_t *expected,
+    uint32_t n)
+{
+    if (rel->nrows != n)
+        return false;
+    for (uint32_t i = 0; i < n; i++) {
+        if (rel->columns[0][i] != expected[i])
+            return false;
+    }
+    return true;
+}
+
+/* Old rows plus the sorted novel values in physical order: merged into one
+ * run by the fallback, or appended as a new run by the binary path. */
+static uint32_t
+ts_expected_rows(const int64_t *novel, uint32_t nnovel, bool merged,
+    int64_t *out)
+{
+    uint32_t n = 0, k = 0;
+    for (uint32_t i = 0; i < TS_FIXTURE_OLD_ROWS; i++) {
+        int64_t value = (int64_t)i * 10;
+        while (merged && k < nnovel && novel[k] < value)
+            out[n++] = novel[k++];
+        out[n++] = value;
+    }
+    while (k < nnovel)
+        out[n++] = novel[k++];
+    return n;
+}
+
+/* Successful retirement: rows, timestamp release, exactly one reclamation
+ * of the timestamp payload, and a synchronized root owner generation. */
+static bool
+ts_retired_exactly(const ts_fixture_t *f, const ts_snapshot_t *before)
+{
+    const col_rel_t *rel = f->rel;
+    uint64_t ts_bytes = (uint64_t)before->timestamp_capacity
+        * sizeof(col_delta_timestamp_t);
+    return rel->timestamps == NULL && rel->timestamp_capacity == 0
+           && rel->storage_owner == rel
+           && rel->storage_owner_generation == rel->storage_generation
+           && wl_columnar_relation_generation_valid(rel->storage_generation)
+           && before->retained_reserved_bytes - rel->retained_reserved_bytes
+           == ts_bytes
+           && before->governor_reserved_bytes
+           - ts_fixture_governor_reserved(f) == ts_bytes
+           && ts_fixture_credit_exact(f);
+}
+
+static void
+test_binary_retirement_advances_storage(void)
+{
+    TEST("binary timestamp retirement advances storage generation (#2046)");
+
+    static const int64_t deltas[] = { 10, 15 };
+    for (uint32_t d = 0; d < 2; d++) {
+        ts_fixture_t f;
+        ts_snapshot_t before;
+        int64_t expected[TS_FIXTURE_MAX_ROWS];
+        bool novel = deltas[d] == 15;
+        uint32_t n = ts_expected_rows(&deltas[d], novel ? 1u : 0u, false,
+                expected);
+        int fast_path = -1;
+
+        ASSERT(ts_fixture_init(&f, &deltas[d], 1, true),
+            "binary retirement fixture");
+        ts_snapshot_take(&f, &before);
+        ASSERT(before.timestamp_capacity > 0 && ts_fixture_credit_exact(&f),
+            "binary retirement fixture credit");
+        ASSERT(col_op_consolidate_incremental_delta(f.rel,
+            TS_FIXTURE_OLD_ROWS, NULL, &fast_path) == 0,
+            "binary retirement succeeds");
+        ASSERT(fast_path == 0, "single interleaved delta uses binary path");
+        ASSERT(ts_fixture_values_are(f.rel, expected, n)
+            && f.rel->sorted_nrows == n && test_rel_is_unique(f.rel),
+            "binary retirement publishes the merged rows");
+        ASSERT(novel
+            ? (f.rel->run_count == 2
+            && f.rel->run_ends[0] == TS_FIXTURE_OLD_ROWS
+            && f.rel->run_ends[1] == TS_FIXTURE_OLD_ROWS + 1u)
+            : (f.rel->run_count == 1
+            && f.rel->run_ends[0] == TS_FIXTURE_OLD_ROWS),
+            "binary retirement run metadata");
+        ASSERT(f.rel->storage_generation == before.storage_generation + 1u,
+            "binary retirement advances storage generation once");
+        ASSERT(f.rel->view_generation == before.view_generation + 1u,
+            "binary retirement advances view generation once");
+        ASSERT(ts_retired_exactly(&f, &before),
+            "binary retirement releases timestamps and credit exactly once");
+        ts_fixture_fini(&f);
+    }
+    PASS();
+}
+
+static void
+test_fast_and_fallback_retirement_advance_storage(void)
+{
+    TEST("fast and fallback timestamp retirement advance storage (#2046)");
+
+    ts_fixture_t f;
+    ts_snapshot_t before;
+    int64_t expected[TS_FIXTURE_MAX_ROWS];
+    int fast_path = -1;
+    static const int64_t fast_delta[] = { 400 };
+    static const int64_t fallback_delta[] = { 5, 15, 25 };
+
+    ASSERT(ts_fixture_init(&f, fast_delta, 1, true), "fast fixture");
+    ts_snapshot_take(&f, &before);
+    ASSERT(col_op_consolidate_incremental_delta(f.rel, TS_FIXTURE_OLD_ROWS,
+        NULL, &fast_path) == 0 && fast_path == 1,
+        "trailing delta uses fast path");
+    uint32_t n = ts_expected_rows(fast_delta, 1, true, expected);
+    ASSERT(ts_fixture_values_are(f.rel, expected, n),
+        "fast retirement publishes the appended row");
+    ASSERT(f.rel->storage_generation == before.storage_generation + 1u,
+        "fast retirement advances storage generation once");
+    ASSERT(ts_retired_exactly(&f, &before),
+        "fast retirement releases timestamps and credit exactly once");
+    ts_fixture_fini(&f);
+
+    /* The fallback also swaps in its merge grid, whose credit differs from
+     * the timestamp payload, so only the exact live credit is checked; the
+     * swap and the retirement are its only two storage advances. */
+    ASSERT(ts_fixture_init(&f, fallback_delta, 3, true), "fallback fixture");
+    ts_snapshot_take(&f, &before);
+    fast_path = -1;
+    ASSERT(col_op_consolidate_incremental_delta(f.rel, TS_FIXTURE_OLD_ROWS,
+        NULL, &fast_path) == 0 && fast_path == 0
+        && f.rel->run_count == 1,
+        "three interleaved rows use fallback");
+    n = ts_expected_rows(fallback_delta, 3, true, expected);
+    ASSERT(ts_fixture_values_are(f.rel, expected, n)
+        && f.rel->run_ends[0] == n,
+        "fallback retirement publishes the merged rows");
+    ASSERT(f.rel->storage_generation == before.storage_generation + 2u
+        && f.rel->timestamps == NULL && f.rel->timestamp_capacity == 0
+        && f.rel->storage_owner_generation == f.rel->storage_generation
+        && ts_fixture_credit_exact(&f),
+        "fallback retirement advances storage and keeps exact credit");
+    ts_fixture_fini(&f);
+    PASS();
+}
+
+static void
+test_binary_without_timestamps_keeps_storage(void)
+{
+    TEST("binary path without timestamps has no storage increment (#2046)");
+
+    static const int64_t deltas[] = { 10, 15 };
+    for (uint32_t d = 0; d < 2; d++) {
+        ts_fixture_t f;
+        ts_snapshot_t before;
+        int fast_path = -1;
+
+        ASSERT(ts_fixture_init(&f, &deltas[d], 1, false),
+            "untimestamped binary fixture");
+        ts_snapshot_take(&f, &before);
+        ASSERT(col_op_consolidate_incremental_delta(f.rel,
+            TS_FIXTURE_OLD_ROWS, NULL, &fast_path) == 0 && fast_path == 0,
+            "untimestamped binary consolidation");
+        ASSERT(f.rel->storage_generation == before.storage_generation
+            && f.rel->storage_owner_generation
+            == before.storage_owner_generation
+            && f.rel->view_generation == before.view_generation + 1u,
+            "untimestamped binary path only advances the view");
+        ASSERT(f.rel->retained_reserved_bytes
+            == before.retained_reserved_bytes
+            && ts_fixture_governor_reserved(&f)
+            == before.governor_reserved_bytes,
+            "untimestamped binary path keeps credit");
+        ts_fixture_fini(&f);
+    }
+
+    /* No storage advance is required, so the last representable storage
+     * generation does not refuse the operation. */
+    ts_fixture_t f;
+    int fast_path = -1;
+    static const int64_t novel[] = { 15 };
+    ASSERT(ts_fixture_init(&f, novel, 1, false), "saturated binary fixture");
+    uint64_t original = f.rel->storage_generation;
+    ts_fixture_set_storage_generation(&f,
+        WL_COLUMNAR_REL_GENERATION_INVALID - 1u);
+    ASSERT(col_op_consolidate_incremental_delta(f.rel, TS_FIXTURE_OLD_ROWS,
+        NULL, &fast_path) == 0 && fast_path == 0
+        && f.rel->nrows == TS_FIXTURE_OLD_ROWS + 1u
+        && f.rel->storage_generation
+        == WL_COLUMNAR_REL_GENERATION_INVALID - 1u,
+        "untimestamped binary path needs no storage headroom");
+    ts_fixture_set_storage_generation(&f, original);
+    ts_fixture_fini(&f);
+    PASS();
+}
+
+/* Reject at the given storage generation with nothing published, then
+ * restore the original generation and retry successfully. */
+static bool
+ts_exhaustion_rejects_then_retries(const int64_t *delta, uint32_t ndelta,
+    uint64_t pinned, int expected_fast, const char **why)
+{
+    ts_fixture_t f = { 0 };
+    ts_snapshot_t before, after;
+    int64_t expected[TS_FIXTURE_MAX_ROWS];
+    int64_t novel[TS_FIXTURE_MAX_ROWS];
+    uint32_t nnovel = 0, n;
+    uint64_t original = 0;
+    int fast_path = -1;
+    col_rel_t *delta_out = test_rel_alloc(1);
+    bool ok = false;
+
+    *why = "exhaustion fixture";
+    if (!delta_out || !ts_fixture_init(&f, delta, ndelta, true))
+        goto done;
+    original = f.rel->storage_generation;
+    ts_fixture_set_storage_generation(&f, pinned);
+    ts_snapshot_take(&f, &before);
+
+    *why = "exhaustion must reject with EOVERFLOW";
+    if (col_op_consolidate_incremental_delta(f.rel, TS_FIXTURE_OLD_ROWS,
+        delta_out, &fast_path) != EOVERFLOW)
+        goto done;
+    ts_snapshot_take(&f, &after);
+    *why = "exhaustion must leave rows, runs, timestamps, generations "
+        "and credit unchanged";
+    if (!ts_snapshot_equal(&before, &after) || fast_path != -1
+        || delta_out->nrows != 0)
+        goto done;
+
+    ts_fixture_set_storage_generation(&f, original);
+    ts_snapshot_take(&f, &before);
+    *why = "retry after exhaustion must succeed";
+    if (col_op_consolidate_incremental_delta(f.rel, TS_FIXTURE_OLD_ROWS,
+        delta_out, &fast_path) != 0 || fast_path != expected_fast)
+        goto done;
+    for (uint32_t i = 0; i < ndelta; i++) {
+        bool old_row = delta[i] >= 0
+            && delta[i] < (int64_t)TS_FIXTURE_OLD_ROWS * 10
+            && delta[i] % 10 == 0;
+        if (!old_row)
+            novel[nnovel++] = delta[i];
+    }
+    n = ts_expected_rows(novel, nnovel, expected_fast != 0 || ndelta > 1,
+            expected);
+    *why = "retry must publish rows, emit novel rows and retire timestamps";
+    if (!ts_fixture_values_are(f.rel, expected, n)
+        || delta_out->nrows != nnovel
+        || f.rel->storage_generation <= original
+        || f.rel->timestamps != NULL || f.rel->timestamp_capacity != 0
+        || f.rel->storage_owner_generation != f.rel->storage_generation
+        || !ts_fixture_credit_exact(&f))
+        goto done;
+    ok = true;
+
+done:
+    if (f.rel && original != 0)
+        ts_fixture_set_storage_generation(&f, original);
+    ts_fixture_fini(&f);
+    test_rel_free(delta_out);
+    return ok;
+}
+
+static void
+test_retirement_exhaustion_rejects_before_publication(void)
+{
+    TEST("storage exhaustion rejects retirement before publication (#2046)");
+
+    static const int64_t duplicate[] = { 10 };
+    static const int64_t novel[] = { 15 };
+    static const int64_t trailing[] = { 400 };
+    static const int64_t interleaved[] = { 5, 15, 25 };
+    const uint64_t last = WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+    const char *why = NULL;
+
+    ASSERT(ts_exhaustion_rejects_then_retries(duplicate, 1, last, 0, &why),
+        why);
+    ASSERT(ts_exhaustion_rejects_then_retries(novel, 1, last, 0, &why), why);
+    ASSERT(ts_exhaustion_rejects_then_retries(trailing, 1, last, 1, &why),
+        why);
+    ASSERT(ts_exhaustion_rejects_then_retries(interleaved, 3, last, 0, &why),
+        why);
+    /* The fallback replaces column storage before it retires timestamps,
+     * so it needs two advances and refuses with only one left. */
+    ASSERT(ts_exhaustion_rejects_then_retries(interleaved, 3, last - 1u, 0,
+        &why), why);
+    PASS();
+}
+
+static void
+test_binary_retirement_uses_last_generation(void)
+{
+    TEST("binary retirement may consume the last storage generation (#2046)");
+
+    ts_fixture_t f;
+    int fast_path = -1;
+    static const int64_t novel[] = { 15 };
+    const uint64_t last = WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+
+    ASSERT(ts_fixture_init(&f, novel, 1, true), "boundary fixture");
+    uint64_t original = f.rel->storage_generation;
+    ts_fixture_set_storage_generation(&f, last - 1u);
+    ASSERT(col_op_consolidate_incremental_delta(f.rel, TS_FIXTURE_OLD_ROWS,
+        NULL, &fast_path) == 0 && fast_path == 0,
+        "binary retirement with one advance left succeeds");
+    ASSERT(f.rel->storage_generation == last
+        && f.rel->storage_owner_generation == last
+        && wl_columnar_relation_generation_valid(f.rel->storage_generation)
+        && f.rel->timestamps == NULL && f.rel->timestamp_capacity == 0,
+        "binary retirement publishes the last valid generation");
+    ts_fixture_set_storage_generation(&f, original);
+    ts_fixture_fini(&f);
+    PASS();
+}
+
+/* A delta too large to guarantee the binary path may take the fallback,
+ * whose column swap needs a storage advance even without timestamps.  The
+ * refusal precedes the delta sort, so even the unsorted, duplicated delta
+ * keeps its physical order, and a retry produces the deduplicated merge. */
+static void
+test_fallback_exhaustion_without_timestamps(void)
+{
+    TEST("fallback storage swap is reserved before publication (#2046)");
+
+    ts_fixture_t f;
+    int fast_path = -1;
+    static const int64_t delta[] = { 25, 5, 15, 5 };
+    static const int64_t novel[] = { 5, 15, 25 };
+    int64_t expected[TS_FIXTURE_MAX_ROWS];
+
+    ts_snapshot_t before, after;
+
+    ASSERT(ts_fixture_init(&f, delta, 4, false), "fallback fixture");
+    uint64_t original = f.rel->storage_generation;
+    ts_fixture_set_storage_generation(&f,
+        WL_COLUMNAR_REL_GENERATION_INVALID - 1u);
+    ts_snapshot_take(&f, &before);
+    ASSERT(col_op_consolidate_incremental_delta(f.rel, TS_FIXTURE_OLD_ROWS,
+        NULL, &fast_path) == EOVERFLOW && fast_path == -1,
+        "fallback without storage headroom is refused");
+    ts_snapshot_take(&f, &after);
+    ASSERT(ts_snapshot_equal(&before, &after)
+        && after.nrows == TS_FIXTURE_OLD_ROWS + 4u
+        && after.values[TS_FIXTURE_OLD_ROWS] == 25
+        && after.values[TS_FIXTURE_OLD_ROWS + 3u] == 5
+        && ts_fixture_credit_exact(&f),
+        "refused fallback leaves rows, runs, generations and credit");
+
+    ts_fixture_set_storage_generation(&f, original);
+    ASSERT(col_op_consolidate_incremental_delta(f.rel, TS_FIXTURE_OLD_ROWS,
+        NULL, &fast_path) == 0 && fast_path == 0,
+        "fallback retry succeeds");
+    uint32_t n = ts_expected_rows(novel, 3, true, expected);
+    ASSERT(ts_fixture_values_are(f.rel, expected, n)
+        && f.rel->storage_generation > original,
+        "fallback retry publishes the deduplicated merge");
+    ts_fixture_fini(&f);
+    PASS();
+}
+
+/* Shared views: build a view over an owner holding the old run plus the
+ * delta.  The view's storage generation is its own; its owner mirror
+ * follows the canonical owner and is left alone. */
+static bool
+ts_shared_init(col_rel_t **owner, col_rel_t **view, const int64_t *delta,
+    uint32_t ndelta)
+{
+    int fast_path = -1;
+    *owner = test_rel_alloc(1);
+    *view = test_rel_alloc(1);
+    if (!*owner || !*view)
+        return false;
+    for (uint32_t i = 0; i < TS_FIXTURE_OLD_ROWS; i++) {
+        int64_t value = (int64_t)i * 10;
+        if (test_rel_append_row(*owner, &value) != 0)
+            return false;
+    }
+    if (col_op_consolidate_incremental_delta(*owner, 0, NULL, &fast_path)
+        != 0)
+        return false;
+    for (uint32_t i = 0; i < ndelta; i++) {
+        if (test_rel_append_row(*owner, &delta[i]) != 0)
+            return false;
+    }
+    return col_rel_install_shared_view(*view, *owner) == 0;
+}
+
+static void
+test_shared_view_storage_exhaustion(void)
+{
+    TEST("shared-view detach is reserved before publication (#2046)");
+
+    /* One-row binary delta: no sort, so the explicit detach is the only
+     * storage advance and must be reserved at dispatch. */
+    static const int64_t one[] = { 15 };
+    /* Two-row delta: the sort detaches the view before dispatch, so the
+     * advance must be reserved before sorting. */
+    static const int64_t two[] = { 25, 15 };
+    /* Three-row delta may take the fallback: the detach and the column
+     * swap together need two advances, refused with only one left. */
+    static const int64_t three[] = { 25, 5, 15 };
+    const uint64_t last = WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+    const struct {
+        const int64_t *delta;
+        uint32_t ndelta;
+        uint64_t pinned;
+    } cases[] = { { one, 1, last }, { two, 2, last }, { three, 3, last - 1u } };
+
+    for (uint32_t c = 0; c < 3; c++) {
+        col_rel_t *owner = NULL, *view = NULL;
+        int fast_path = -1;
+        ASSERT(ts_shared_init(&owner, &view, cases[c].delta,
+            cases[c].ndelta), "shared exhaustion fixture");
+        uint32_t nrows = view->nrows;
+        uint64_t original = view->storage_generation;
+        uint64_t view_generation = view->view_generation;
+        uint64_t owner_mirror = view->storage_owner_generation;
+        uint64_t borrows = col_rel_storage_alias_borrow_count(owner);
+        int64_t *borrowed = view->columns[0];
+        int64_t owner_values[TS_FIXTURE_MAX_ROWS];
+        memcpy(owner_values, owner->columns[0],
+            (size_t)owner->nrows * sizeof(int64_t));
+
+        view->storage_generation = cases[c].pinned;
+        ASSERT(col_op_consolidate_incremental_delta(view,
+            TS_FIXTURE_OLD_ROWS, NULL, &fast_path) == EOVERFLOW
+            && fast_path == -1, "shared detach without headroom is refused");
+        ASSERT(view->col_shared && view->col_shared[0]
+            && view->storage_owner == owner
+            && view->columns[0] == borrowed
+            && col_rel_storage_alias_borrow_count(owner) == borrows
+            && view->nrows == nrows
+            && view->view_generation == view_generation
+            && view->storage_generation == cases[c].pinned
+            && view->storage_owner_generation == owner_mirror,
+            "refused shared consolidation keeps the borrowed view");
+        ASSERT(memcmp(owner_values, owner->columns[0],
+            (size_t)owner->nrows * sizeof(int64_t)) == 0,
+            "refused shared consolidation keeps the canonical owner");
+
+        view->storage_generation = original;
+        ASSERT(col_op_consolidate_incremental_delta(view,
+            TS_FIXTURE_OLD_ROWS, NULL, &fast_path) == 0 && fast_path == 0,
+            "shared retry succeeds");
+        ASSERT(view->col_shared == NULL && view->storage_owner == view
+            && view->storage_owner_generation == view->storage_generation
+            && view->storage_generation > original
+            && view->nrows == TS_FIXTURE_OLD_ROWS + cases[c].ndelta
+            && view->sorted_nrows == view->nrows
+            && test_rel_is_unique(view)
+            && memcmp(owner_values, owner->columns[0],
+            (size_t)owner->nrows * sizeof(int64_t)) == 0,
+            "shared retry detaches and publishes private storage");
+        test_rel_free(view);
+        test_rel_free(owner);
+    }
+    PASS();
+}
+
 /* ----------------------------------------------------------------
  * main
  * ---------------------------------------------------------------- */
@@ -1443,6 +2044,15 @@ main(void)
     test_fastpath_counter_null_safe();
     test_initialized_zero_column_relation();
     test_source_exclusion_is_transactional();
+
+    /* Timestamp retirement storage publication (Issue #2046) */
+    test_binary_retirement_advances_storage();
+    test_fast_and_fallback_retirement_advance_storage();
+    test_binary_without_timestamps_keeps_storage();
+    test_retirement_exhaustion_rejects_before_publication();
+    test_binary_retirement_uses_last_generation();
+    test_fallback_exhaustion_without_timestamps();
+    test_shared_view_storage_exhaustion();
 #ifdef WL_TEST_CONSOLIDATE_HOOK
     test_sort_hook_scope_follows_the_deferred_alias();
     test_shared_source_reader_excluded_through_sort();
