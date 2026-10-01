@@ -1391,8 +1391,9 @@ test_shared_fast_path_compaction_denied_is_transactional(void)
     ASSERT(col_op_consolidate_incremental_delta(view, 39u, delta_out,
         &fast_path) == ENOMEM && fast_path == -1,
         "denied detach is refused");
-    /* Before #2048 the call also failed with ENOMEM, from the compaction
-     * scratch; the run, row-count and generation checks tell them apart. */
+    /* A refused compaction scratch also fails with ENOMEM and, since #2051,
+     * publishes no rows or runs either; the unchanged storage generation,
+     * shared columns and borrow show that the detach itself was refused. */
     ASSERT(view->nrows == nrows && view->sorted_nrows == sorted_nrows
         && view->run_count == run_count
         && memcmp(run_ends, view->run_ends, sizeof(run_ends)) == 0
@@ -1424,6 +1425,83 @@ test_shared_fast_path_compaction_denied_is_transactional(void)
     test_rel_free(view);
     test_rel_free(owner);
     wl_columnar_memory_governor_ref_release(ref);
+    PASS();
+}
+
+/* ================================================================
+ * Issue #2051: a refused fast-path run compaction must leave the relation
+ * as it was.  The compaction scratch is acquired before rows or runs are
+ * published, so a denial cannot leave nrows and the last run extended for
+ * a retry's run repair to fold eight interleaved runs into one.
+ * ================================================================ */
+static void
+test_fast_path_compaction_denied_keeps_runs(void)
+{
+    TEST("denied fast-path compaction keeps rows and runs (#2051)");
+
+    for (uint32_t with_delta = 0; with_delta < 2; with_delta++) {
+        col_rel_t *rel = test_rel_alloc(1);
+        col_rel_t *delta_out = with_delta ? test_rel_alloc(1) : NULL;
+        wl_columnar_memory_governor_ref_t *ref
+            = test_shared_compaction_governor_create(1u << 20);
+        ASSERT(rel && ref && (!with_delta || delta_out),
+            "denied compaction relations");
+        ASSERT(build_eight_run_owner(rel)
+            && col_rel_attach_memory_governor(rel, ref) == 0,
+            "governed eight-run relation");
+
+        int64_t before[EIGHT_RUN_OWNER_ROWS];
+        memcpy(before, rel->columns[0], sizeof(before));
+        int64_t *columns = rel->columns[0];
+        uint32_t run_ends[COL_MAX_RUNS];
+        memcpy(run_ends, rel->run_ends, sizeof(run_ends));
+        uint32_t nrows = rel->nrows;
+        uint32_t sorted_nrows = rel->sorted_nrows;
+        uint64_t view_generation = rel->view_generation;
+        uint64_t storage_generation = rel->storage_generation;
+        wl_columnar_memory_governor_t *governor
+            = wl_columnar_memory_governor_ref_get(ref);
+        uint64_t reserved = wl_columnar_memory_reserved(governor);
+        ASSERT(!rel->memory_budget_denial_pending, "no prior denial");
+        atomic_store_explicit(&governor->usable_bytes, reserved,
+            memory_order_release);
+
+        int fast_path = -1;
+        ASSERT(col_op_consolidate_incremental_delta(rel, 39u, delta_out,
+            &fast_path) == ENOMEM && fast_path == -1
+            && rel->memory_budget_denial_pending,
+            "compaction scratch denial is refused");
+        ASSERT(rel->sorted_nrows == sorted_nrows
+            && memcmp(run_ends, rel->run_ends, sizeof(run_ends)) == 0
+            && rel->view_generation == view_generation,
+            "refused compaction publishes no runs or view generation");
+        ASSERT(rel->nrows == nrows && rel->run_count == COL_MAX_RUNS
+            && rel->columns[0] == columns
+            && memcmp(before, rel->columns[0], sizeof(before)) == 0
+            && rel->storage_generation == storage_generation
+            && wl_columnar_memory_reserved(governor) == reserved
+            && (!delta_out || delta_out->nrows == 0),
+            "refused compaction keeps rows, storage, credit and delta");
+
+        atomic_store_explicit(&governor->usable_bytes, 1u << 20,
+            memory_order_release);
+        ASSERT(col_op_consolidate_incremental_delta(rel, 39u, delta_out,
+            &fast_path) == 0 && fast_path == 1,
+            "retry after refused compaction succeeds");
+        ASSERT(eight_run_view_compacted(rel, NULL),
+            "retry publishes one sorted compacted run");
+        ASSERT(wl_columnar_memory_reserved(governor)
+            == rel->descriptor_reserved_bytes + rel->metadata_reserved_bytes
+            + rel->retained_reserved_bytes,
+            "retry releases the compaction scratch credit");
+        ASSERT(!delta_out
+            || (delta_out->nrows == 1 && delta_out->columns[0][0] == 1000),
+            "retry emits the trailing row");
+
+        test_rel_free(delta_out);
+        test_rel_free(rel);
+        wl_columnar_memory_governor_ref_release(ref);
+    }
     PASS();
 }
 
@@ -1695,6 +1773,188 @@ test_shared_delta_reader_excluded_through_append(void)
     test_rel_free(delta_out);
     test_rel_free(owner);
     test_rel_free(rel);
+    PASS();
+}
+
+/* Issue #2051 with #2048: on a shared view the detach is admitted, then the
+ * hook caps the governor at its current reservation as the first row is
+ * emitted, so only the compaction scratch that follows is denied. */
+static wl_columnar_memory_governor_t *scratch_denial_governor;
+static uint32_t scratch_denial_fire_count;
+static uint64_t scratch_denial_reserved;
+
+static void
+scratch_denial_hook(col_rel_t *relation,
+    wl_columnar_consolidation_test_stage_t stage)
+{
+    (void)relation;
+    if (stage != WL_COLUMNAR_CONSOLIDATION_TEST_APPEND_AFTER_DETACH
+        || !scratch_denial_governor)
+        return;
+    scratch_denial_fire_count++;
+    scratch_denial_reserved = wl_columnar_memory_reserved(
+        scratch_denial_governor);
+    atomic_store_explicit(&scratch_denial_governor->usable_bytes,
+        scratch_denial_reserved, memory_order_release);
+}
+
+static void
+test_shared_fast_path_scratch_denied_after_detach(void)
+{
+    TEST("scratch denied after shared detach keeps runs (#2051)");
+
+    col_rel_t *owner = test_rel_alloc(1);
+    col_rel_t *view = test_rel_alloc(1);
+    col_rel_t *delta_out = test_rel_alloc(1);
+    wl_columnar_memory_governor_ref_t *ref
+        = test_shared_compaction_governor_create(1u << 20);
+    ASSERT(owner && view && delta_out && ref, "scratch denial relations");
+    ASSERT(build_eight_run_owner(owner), "eight-run owner fixture");
+    ASSERT(col_rel_attach_memory_governor(view, ref) == 0
+        && col_rel_install_shared_view(view, owner) == 0,
+        "governed shared view");
+
+    int64_t before[EIGHT_RUN_OWNER_ROWS];
+    memcpy(before, owner->columns[0], sizeof(before));
+    int64_t *owner_columns = owner->columns[0];
+    uint32_t run_ends[COL_MAX_RUNS];
+    memcpy(run_ends, view->run_ends, sizeof(run_ends));
+    uint32_t nrows = view->nrows;
+    uint32_t sorted_nrows = view->sorted_nrows;
+    uint32_t run_count = view->run_count;
+    uint64_t view_generation = view->view_generation;
+    uint64_t storage_generation = view->storage_generation;
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(ref);
+    ASSERT(!view->memory_budget_denial_pending, "no prior denial");
+
+    scratch_denial_governor = governor;
+    scratch_denial_fire_count = 0;
+    scratch_denial_reserved = 0;
+    wl_columnar_consolidation_transition_hook = scratch_denial_hook;
+    int fast_path = -1;
+    int rc = col_op_consolidate_incremental_delta(view, 39u, delta_out,
+            &fast_path);
+    wl_columnar_consolidation_transition_hook = NULL;
+    scratch_denial_governor = NULL;
+
+    ASSERT(rc == ENOMEM && fast_path == -1 && scratch_denial_fire_count == 1
+        && view->memory_budget_denial_pending,
+        "scratch denial after the detach is refused");
+    ASSERT(view->nrows == nrows && view->sorted_nrows == sorted_nrows
+        && view->run_count == run_count
+        && memcmp(run_ends, view->run_ends, sizeof(run_ends)) == 0
+        && view->view_generation == view_generation,
+        "refused compaction publishes no rows, runs or view generation");
+    ASSERT(view->storage_generation == storage_generation + 1u
+        && view->col_shared == NULL && view->storage_owner == view
+        && view->columns[0] != owner_columns
+        && memcmp(before, view->columns[0], sizeof(before)) == 0,
+        "the admitted detach leaves an identical private view");
+    ASSERT(col_rel_storage_alias_borrow_count(owner) == 0
+        && owner->columns[0] == owner_columns
+        && eight_run_owner_intact(owner, before),
+        "the deferred alias is released and the owner is intact");
+    ASSERT(delta_out->nrows == 0
+        && wl_columnar_memory_reserved(governor) == scratch_denial_reserved,
+        "refused compaction keeps delta_out and releases scratch credit");
+    wl_columnar_source_access_reader_t reader = { 0 };
+    ASSERT(col_rel_source_reader_acquire(view, &reader) == 0
+        && col_rel_source_reader_release(&reader) == 0,
+        "view accepts readers after the refused call");
+
+    atomic_store_explicit(&governor->usable_bytes, 1u << 20,
+        memory_order_release);
+    ASSERT(col_op_consolidate_incremental_delta(view, 39u, delta_out,
+        &fast_path) == 0 && fast_path == 1,
+        "retry after scratch denial succeeds");
+    ASSERT(eight_run_view_compacted(view, owner_columns)
+        && eight_run_owner_intact(owner, before)
+        && delta_out->nrows == 1 && delta_out->columns[0][0] == 1000,
+        "retry compacts privately and emits the trailing row");
+    ASSERT(wl_columnar_memory_reserved(governor)
+        == view->descriptor_reserved_bytes + view->metadata_reserved_bytes
+        + view->retained_reserved_bytes,
+        "retry releases the compaction scratch credit");
+
+    test_rel_free(delta_out);
+    test_rel_free(view);
+    test_rel_free(owner);
+    wl_columnar_memory_governor_ref_release(ref);
+    PASS();
+}
+
+/* A two-row delta first admits the sort's workspace, so the hook caps the
+ * governor at the first emitted row to deny only the compaction scratch.
+ * The duplicate trailing row makes an early nrows publication visible: the
+ * deduplicated delta would shrink nrows from 41 to 40. */
+static void
+test_fast_path_scratch_denied_with_duplicate_delta(void)
+{
+    TEST("scratch denied with a duplicate delta keeps nrows (#2051)");
+
+    col_rel_t *rel = test_rel_alloc(1);
+    col_rel_t *delta_out = test_rel_alloc(1);
+    wl_columnar_memory_governor_ref_t *ref
+        = test_shared_compaction_governor_create(1u << 20);
+    int64_t trailing = 1000;
+    ASSERT(rel && delta_out && ref, "duplicate delta relations");
+    ASSERT(build_eight_run_owner(rel)
+        && test_rel_append_row(rel, &trailing) == 0
+        && col_rel_attach_memory_governor(rel, ref) == 0,
+        "governed eight-run relation with a duplicate delta");
+
+    int64_t before[EIGHT_RUN_OWNER_ROWS];
+    memcpy(before, rel->columns[0], sizeof(before));
+    uint32_t run_ends[COL_MAX_RUNS];
+    memcpy(run_ends, rel->run_ends, sizeof(run_ends));
+    uint32_t nrows = rel->nrows;
+    uint32_t sorted_nrows = rel->sorted_nrows;
+    uint64_t view_generation = rel->view_generation;
+    uint64_t storage_generation = rel->storage_generation;
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(ref);
+    ASSERT(nrows == EIGHT_RUN_OWNER_ROWS + 1u
+        && !rel->memory_budget_denial_pending, "duplicate delta fixture");
+
+    scratch_denial_governor = governor;
+    scratch_denial_fire_count = 0;
+    scratch_denial_reserved = 0;
+    wl_columnar_consolidation_transition_hook = scratch_denial_hook;
+    int fast_path = -1;
+    int rc = col_op_consolidate_incremental_delta(rel, 39u, delta_out,
+            &fast_path);
+    wl_columnar_consolidation_transition_hook = NULL;
+    scratch_denial_governor = NULL;
+
+    ASSERT(rc == ENOMEM && fast_path == -1 && scratch_denial_fire_count == 1
+        && rel->memory_budget_denial_pending,
+        "scratch denial after the sort is refused");
+    ASSERT(rel->nrows == nrows, "refused compaction does not publish nrows");
+    /* The two-row delta is sorted before the fast path is chosen, and the
+     * sort advances the view generation itself; the refusal adds none. */
+    ASSERT(rel->sorted_nrows == sorted_nrows && rel->run_count == COL_MAX_RUNS
+        && memcmp(run_ends, rel->run_ends, sizeof(run_ends)) == 0
+        && rel->view_generation == view_generation + 1u
+        && rel->storage_generation == storage_generation
+        && memcmp(before, rel->columns[0], sizeof(before)) == 0,
+        "refused compaction publishes no runs or further generations");
+    ASSERT(delta_out->nrows == 0
+        && wl_columnar_memory_reserved(governor) == scratch_denial_reserved,
+        "refused compaction keeps delta_out and releases scratch credit");
+
+    atomic_store_explicit(&governor->usable_bytes, 1u << 20,
+        memory_order_release);
+    ASSERT(col_op_consolidate_incremental_delta(rel, 39u, delta_out,
+        &fast_path) == 0 && fast_path == 1,
+        "retry after scratch denial succeeds");
+    ASSERT(eight_run_view_compacted(rel, NULL)
+        && delta_out->nrows == 1 && delta_out->columns[0][0] == 1000,
+        "retry deduplicates and compacts");
+
+    test_rel_free(delta_out);
+    test_rel_free(rel);
+    wl_columnar_memory_governor_ref_release(ref);
     PASS();
 }
 #endif
@@ -2331,6 +2591,7 @@ main(void)
     test_shared_fast_path_compaction_detaches_view();
     test_shared_fast_path_without_compaction_keeps_borrow();
     test_shared_fast_path_compaction_denied_is_transactional();
+    test_fast_path_compaction_denied_keeps_runs();
     test_fastpath_counter_null_safe();
     test_initialized_zero_column_relation();
     test_source_exclusion_is_transactional();
@@ -2347,6 +2608,8 @@ main(void)
     test_sort_hook_scope_follows_the_deferred_alias();
     test_shared_source_reader_excluded_through_sort();
     test_shared_delta_reader_excluded_through_append();
+    test_shared_fast_path_scratch_denied_after_detach();
+    test_fast_path_scratch_denied_with_duplicate_delta();
 #endif
 
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n", pass_count,
