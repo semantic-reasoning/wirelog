@@ -1926,6 +1926,27 @@ col_rel_compact_runs(col_rel_t *rel)
     return 0;
 }
 
+/* Reserve the storage-generation advances an incremental consolidation may
+ * make before it mutates anything (Issue #2046).  Each successful advance
+ * from g needs g + 1 < WL_COLUMNAR_REL_GENERATION_INVALID, so `steps`
+ * advances fit only while g < INVALID - steps; otherwise a late touch would
+ * poison the counter after rows, runs, or timestamp ownership were already
+ * published.
+ *
+ * The path is chosen only after the delta sort, which itself advances the
+ * view generation, so the bound is taken over every path still reachable:
+ * one advance to retire timestamps, one to detach a shared view (by the
+ * sort or before the binary/fallback mutation; the first detach clears
+ * col_shared), and one for the fallback's column swap whenever the delta is
+ * too large to guarantee the fast or binary path. */
+static uint32_t
+col_op_consolidate_storage_steps(const col_rel_t *rel, uint32_t old_nrows,
+    uint32_t delta_count)
+{
+    return (rel->timestamps ? 1u : 0u) + (rel->col_shared ? 1u : 0u)
+           + (old_nrows > 0 && delta_count > old_nrows / 16 ? 1u : 0u);
+}
+
 /*
  * col_op_consolidate_incremental_delta - Incremental consolidation with delta output
  *
@@ -2012,6 +2033,14 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
     }
 
     uint32_t delta_count = nr - old_nrows;
+
+    uint32_t storage_steps = col_op_consolidate_storage_steps(rel,
+            old_nrows, delta_count);
+    if (storage_steps > 0
+        && rel->storage_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - (uint64_t)storage_steps)
+        return col_op_consolidate_incremental_delta_fail(delta_out,
+                   delta_initial_nrows, EOVERFLOW);
 
     /* Phase 1: sort only the new delta rows using radix sort.  Sorting can
      * allocate permutation buffers, so do not continue with an unsorted
@@ -2208,6 +2237,7 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
             rel->timestamps = NULL;
             rel->timestamp_capacity = 0;
             col_rel_retire_payload_credit(rel);
+            wl_columnar_relation_touch_storage(rel);
         }
         if (out_fast_path)
             *out_fast_path = 0;
