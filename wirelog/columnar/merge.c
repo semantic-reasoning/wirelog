@@ -2291,22 +2291,37 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
         col_row_buf_release(&drb);
 
         if (novel_count > 0) {
+            bool compact = rel->run_count >= COL_MAX_RUNS;
+            col_rel_compact_scratch_t scratch;
+            /* Acquire the compaction scratch before publishing rows
+             * (#2053), as the fast path does (#2051); it covers the rows
+             * published below, the size compaction reserved here before.
+             * The refusal itself publishes no rows, runs or generations.
+             * What came before it stays in effect: an admitted detach, the
+             * sort's view-generation advance, and an unconsolidated delta
+             * suffix whose novel rows were compacted to its front (its
+             * union with the published rows is kept); delta_out is rolled
+             * back. */
+            if (compact) {
+                int rc = col_rel_compact_scratch_prepare(rel,
+                        old_nrows + novel_count, &scratch);
+                if (rc != 0)
+                    return col_op_consolidate_incremental_delta_fail(
+                        delta_out, delta_initial_nrows, rc);
+            }
             rel->nrows = old_nrows + novel_count;
             wl_columnar_relation_touch_view(rel);
             /* Register novel rows as new run */
-            if (rel->run_count < COL_MAX_RUNS) {
+            if (!compact) {
                 rel->run_ends[rel->run_count] = rel->nrows;
                 rel->run_count++;
             } else {
                 /* Compact existing runs, preserving novel rows (#376).
                  * Novel rows at [old_nrows..old_nrows+novel_count) are not
-                 * in any run yet.  compact_runs only merges run-bounded
+                 * in any run yet.  The compaction only merges run-bounded
                  * data so novel rows are physically untouched.  Relocate
                  * them adjacent to the compacted prefix afterwards. */
-                int rc = col_rel_compact_runs(rel);
-                if (rc != 0)
-                    return col_op_consolidate_incremental_delta_fail(
-                        delta_out, delta_initial_nrows, rc);
+                col_rel_compact_runs_prepared(rel, &scratch);
                 uint32_t compacted = rel->nrows;
                 for (uint32_t j = 0; j < novel_count; j++)
                     col_rel_row_move_raw(rel, compacted + j, old_nrows + j);
