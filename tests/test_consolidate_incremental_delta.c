@@ -1141,6 +1141,293 @@ test_shared_single_delta_fallback_detaches_view(void)
 }
 
 /* ================================================================
+ * Issue #2048: fast-path run compaction rewrites rel->columns in place, so
+ * a shared view must detach before compacting or it rewrites the canonical
+ * owner's buffers.
+ *
+ * Fixture: 32 sorted rows 0, 10, ..., 310 form one run; seven binary-path
+ * consolidations then append the novel rows 15, 25, ..., 75 as singleton
+ * runs that interleave with the first, reaching COL_MAX_RUNS.  The trailing
+ * row 1000 is appended unconsolidated, so a one-row fast-path consolidation
+ * of a view over this owner must compact.
+ * ================================================================ */
+#define EIGHT_RUN_OWNER_ROWS 40u
+
+static bool
+build_eight_run_owner(col_rel_t *owner)
+{
+    int fast_path = -1;
+    for (uint32_t i = 0; i < 32u; i++) {
+        int64_t value = (int64_t)i * 10;
+        if (test_rel_append_row(owner, &value) != 0)
+            return false;
+    }
+    if (col_op_consolidate_incremental_delta(owner, 0, NULL, &fast_path) != 0
+        || fast_path != 1 || owner->run_count != 1)
+        return false;
+    for (int64_t k = 0; k < 7; k++) {
+        int64_t value = 15 + 10 * k;
+        uint32_t old_nrows = owner->nrows;
+        if (test_rel_append_row(owner, &value) != 0
+            || col_op_consolidate_incremental_delta(owner, old_nrows, NULL,
+            &fast_path) != 0 || fast_path != 0)
+            return false;
+    }
+    if (owner->run_count != COL_MAX_RUNS || owner->nrows != 39u)
+        return false;
+    for (uint32_t r = 0; r < COL_MAX_RUNS; r++) {
+        if (owner->run_ends[r] != 32u + r)
+            return false;
+    }
+    int64_t trailing = 1000;
+    return test_rel_append_row(owner, &trailing) == 0
+           && owner->nrows == EIGHT_RUN_OWNER_ROWS;
+}
+
+/* The owner keeps its interleaved physical layout and its eight runs. */
+static bool
+eight_run_owner_intact(const col_rel_t *owner, const int64_t *before)
+{
+    if (owner->nrows != EIGHT_RUN_OWNER_ROWS
+        || owner->run_count != COL_MAX_RUNS
+        || memcmp(before, owner->columns[0],
+        EIGHT_RUN_OWNER_ROWS * sizeof(int64_t)) != 0)
+        return false;
+    for (uint32_t r = 0; r < COL_MAX_RUNS; r++) {
+        if (owner->run_ends[r] != 32u + r)
+            return false;
+    }
+    for (uint32_t k = 0; k < 7u; k++) {
+        if (owner->columns[0][32u + k] != 15 + 10 * (int64_t)k)
+            return false;
+    }
+    return true;
+}
+
+/* The view publishes one private, compacted run of all 40 values. */
+static bool
+eight_run_view_compacted(const col_rel_t *view, const int64_t *owner_columns)
+{
+    int64_t expected[EIGHT_RUN_OWNER_ROWS];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < 32u; i++) {
+        int64_t value = (int64_t)i * 10;
+        expected[n++] = value;
+        if (value >= 10 && value <= 70)
+            expected[n++] = value + 5;
+    }
+    expected[n++] = 1000;
+    if (n != EIGHT_RUN_OWNER_ROWS || view->col_shared != NULL
+        || view->storage_owner != view || view->columns[0] == owner_columns
+        || view->nrows != n || view->sorted_nrows != n
+        || view->run_count != 1 || view->run_ends[0] != n
+        || !test_rel_is_sorted(view) || !test_rel_is_unique(view))
+        return false;
+    return memcmp(expected, view->columns[0], sizeof(expected)) == 0;
+}
+
+static void
+test_shared_fast_path_compaction_detaches_view(void)
+{
+    TEST("shared fast-path compaction detaches before rewriting (#2048)");
+
+    col_rel_t *owner = test_rel_alloc(1);
+    col_rel_t *view = test_rel_alloc(1);
+    col_rel_t *sibling = test_rel_alloc(1);
+    col_rel_t *delta_out = test_rel_alloc(1);
+    ASSERT(owner && view && sibling && delta_out,
+        "shared compaction relations");
+    ASSERT(build_eight_run_owner(owner), "eight-run owner fixture");
+
+    int64_t before[EIGHT_RUN_OWNER_ROWS];
+    memcpy(before, owner->columns[0], sizeof(before));
+    int64_t *owner_columns = owner->columns[0];
+    ASSERT(col_rel_install_shared_view(view, owner) == 0
+        && col_rel_install_shared_view(sibling, owner) == 0,
+        "shared compaction views");
+    ASSERT(col_rel_storage_alias_borrow_count(owner) == 2
+        && view->run_count == COL_MAX_RUNS && view->run_ends[7] == 39u,
+        "views borrow the eight-run owner");
+    uint64_t storage_generation = view->storage_generation;
+
+    int fast_path = -1;
+    ASSERT(col_op_consolidate_incremental_delta(view, 39u, delta_out,
+        &fast_path) == 0 && fast_path == 1,
+        "trailing one-row delta takes the compacting fast path");
+    ASSERT(owner->columns[0] == owner_columns
+        && eight_run_owner_intact(owner, before),
+        "compaction leaves the canonical owner's rows and runs intact");
+    ASSERT(col_rel_storage_alias_borrow_count(owner) == 1
+        && sibling->col_shared && sibling->col_shared[0]
+        && sibling->columns[0] == owner_columns
+        && memcmp(before, sibling->columns[0], sizeof(before)) == 0,
+        "only the detached view releases its borrow");
+    ASSERT(eight_run_view_compacted(view, owner_columns)
+        && view->storage_generation > storage_generation,
+        "view publishes private compacted storage");
+    ASSERT(delta_out->nrows == 1 && delta_out->columns[0][0] == 1000,
+        "fast path emits the trailing row");
+
+    wl_columnar_source_access_reader_t reader = { 0 };
+    ASSERT(col_rel_source_reader_acquire(view, &reader) == 0
+        && col_rel_source_reader_release(&reader) == 0,
+        "detached view accepts readers after cleanup");
+
+    test_rel_free(delta_out);
+    test_rel_free(view);
+    test_rel_free(sibling);
+    test_rel_free(owner);
+    PASS();
+}
+
+/* Without compaction the fast path writes no borrowed column buffer, so the
+ * view keeps borrowing; timestamp retirement frees only the view's copy. */
+static void
+test_shared_fast_path_without_compaction_keeps_borrow(void)
+{
+    TEST("shared fast path without compaction keeps its borrow (#2048)");
+
+    for (uint32_t with_timestamps = 0; with_timestamps < 2; with_timestamps++) {
+        col_rel_t *owner = test_rel_alloc(1);
+        col_rel_t *view = test_rel_alloc(1);
+        int fast_path = -1;
+        int64_t rows[] = { 10, 20, 30 };
+        ASSERT(owner && view, "borrowing fast-path relations");
+        ASSERT(test_rel_append_row(owner, &rows[0]) == 0
+            && test_rel_append_row(owner, &rows[1]) == 0
+            && col_op_consolidate_incremental_delta(owner, 0, NULL,
+            &fast_path) == 0
+            && test_rel_append_row(owner, &rows[2]) == 0,
+            "borrowing fast-path owner");
+        if (with_timestamps)
+            ASSERT(col_rel_enable_timestamps(owner) == 0
+                && owner->timestamps != NULL, "owner timestamps");
+        ASSERT(col_rel_install_shared_view(view, owner) == 0,
+            "borrowing fast-path view");
+        int64_t *owner_columns = owner->columns[0];
+        const col_delta_timestamp_t *owner_timestamps = owner->timestamps;
+        ASSERT(!with_timestamps
+            || (view->timestamps && view->timestamps != owner_timestamps),
+            "view holds a private timestamp copy");
+        uint64_t storage_generation = view->storage_generation;
+
+        fast_path = -1;
+        ASSERT(col_op_consolidate_incremental_delta(view, 2, NULL,
+            &fast_path) == 0 && fast_path == 1,
+            "trailing row takes the fast path");
+        ASSERT(view->col_shared && view->col_shared[0]
+            && view->columns[0] == owner_columns
+            && col_rel_storage_alias_borrow_count(owner) == 1,
+            "non-compacting fast path keeps the borrow");
+        ASSERT(view->nrows == 3 && view->run_count == 2
+            && view->run_ends[0] == 2 && view->run_ends[1] == 3,
+            "view registers the trailing run");
+        ASSERT(owner->nrows == 3 && owner->run_count == 1
+            && owner->run_ends[0] == 2
+            && owner->columns[0][0] == 10 && owner->columns[0][1] == 20
+            && owner->columns[0][2] == 30,
+            "owner rows and runs unchanged");
+        if (with_timestamps) {
+            ASSERT(view->timestamps == NULL && view->timestamp_capacity == 0
+                && owner->timestamps == owner_timestamps,
+                "retirement frees only the view's timestamp copy");
+        } else {
+            ASSERT(view->storage_generation == storage_generation,
+                "borrowing fast path does not replace storage");
+        }
+        test_rel_free(view);
+        test_rel_free(owner);
+    }
+    PASS();
+}
+
+static wl_columnar_memory_governor_ref_t *
+test_shared_compaction_governor_create(uint64_t usable_bytes)
+{
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    resolution.budget_bytes = usable_bytes;
+    resolution.usable_bytes = usable_bytes;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    return wl_columnar_memory_governor_ref_create(&resolution);
+}
+
+/* A denied detach refuses before the fast path emits a row or publishes
+ * nrows, runs, or a generation, so a retry takes the same path. */
+static void
+test_shared_fast_path_compaction_denied_is_transactional(void)
+{
+    TEST("denied shared fast-path detach publishes nothing (#2048)");
+
+    col_rel_t *owner = test_rel_alloc(1);
+    col_rel_t *view = test_rel_alloc(1);
+    col_rel_t *delta_out = test_rel_alloc(1);
+    wl_columnar_memory_governor_ref_t *ref
+        = test_shared_compaction_governor_create(1u << 20);
+    ASSERT(owner && view && delta_out && ref, "denied detach relations");
+    ASSERT(build_eight_run_owner(owner), "eight-run owner fixture");
+    ASSERT(col_rel_attach_memory_governor(view, ref) == 0
+        && col_rel_install_shared_view(view, owner) == 0,
+        "governed shared view");
+
+    int64_t before[EIGHT_RUN_OWNER_ROWS];
+    memcpy(before, owner->columns[0], sizeof(before));
+    int64_t *owner_columns = owner->columns[0];
+    const bool *shared = view->col_shared;
+    uint32_t run_ends[COL_MAX_RUNS];
+    memcpy(run_ends, view->run_ends, sizeof(run_ends));
+    uint32_t nrows = view->nrows;
+    uint32_t sorted_nrows = view->sorted_nrows;
+    uint32_t run_count = view->run_count;
+    uint64_t view_generation = view->view_generation;
+    uint64_t storage_generation = view->storage_generation;
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(ref);
+    atomic_store_explicit(&governor->usable_bytes,
+        wl_columnar_memory_reserved(governor), memory_order_release);
+
+    int fast_path = -1;
+    ASSERT(col_op_consolidate_incremental_delta(view, 39u, delta_out,
+        &fast_path) == ENOMEM && fast_path == -1,
+        "denied detach is refused");
+    /* Before #2048 the call also failed with ENOMEM, from the compaction
+     * scratch; the run, row-count and generation checks tell them apart. */
+    ASSERT(view->nrows == nrows && view->sorted_nrows == sorted_nrows
+        && view->run_count == run_count
+        && memcmp(run_ends, view->run_ends, sizeof(run_ends)) == 0
+        && view->view_generation == view_generation
+        && view->storage_generation == storage_generation,
+        "denied detach publishes no rows, runs or generations");
+    ASSERT(view->col_shared == shared && view->columns[0] == owner_columns
+        && col_rel_storage_alias_borrow_count(owner) == 1
+        && delta_out->nrows == 0
+        && eight_run_owner_intact(owner, before),
+        "denied detach keeps the borrow, the owner and delta_out");
+    ASSERT(wl_columnar_memory_reserved(governor)
+        == view->descriptor_reserved_bytes + view->metadata_reserved_bytes
+        + view->retained_reserved_bytes,
+        "denied detach leaks no governor credit");
+
+    atomic_store_explicit(&governor->usable_bytes, 1u << 20,
+        memory_order_release);
+    ASSERT(col_op_consolidate_incremental_delta(view, 39u, delta_out,
+        &fast_path) == 0 && fast_path == 1,
+        "retry after denial succeeds");
+    ASSERT(eight_run_view_compacted(view, owner_columns)
+        && eight_run_owner_intact(owner, before)
+        && col_rel_storage_alias_borrow_count(owner) == 0
+        && delta_out->nrows == 1 && delta_out->columns[0][0] == 1000,
+        "retry detaches and compacts privately");
+
+    test_rel_free(delta_out);
+    test_rel_free(view);
+    test_rel_free(owner);
+    wl_columnar_memory_governor_ref_release(ref);
+    PASS();
+}
+
+/* ================================================================
  * Test 15: NULL out_fast_path does not crash (Issue #278)
  *
  * Both fast and slow paths must be NULL-safe.
@@ -1440,6 +1727,9 @@ main(void)
     test_fastpath_counter_sorted_after();
     test_fastpath_counter_interleaved();
     test_shared_single_delta_fallback_detaches_view();
+    test_shared_fast_path_compaction_detaches_view();
+    test_shared_fast_path_without_compaction_keeps_borrow();
+    test_shared_fast_path_compaction_denied_is_transactional();
     test_fastpath_counter_null_safe();
     test_initialized_zero_column_relation();
     test_source_exclusion_is_transactional();

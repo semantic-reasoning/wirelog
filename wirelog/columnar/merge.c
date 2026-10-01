@@ -2064,6 +2064,21 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
     }
 
     if (fast_path) {
+        /* Compaction below rewrites rel->columns in place; on a shared view
+         * those are the canonical owner's buffers (#2048).  Detach before
+         * any emission or metadata change so a refused copy leaves rel and
+         * delta_out untouched.  A delta the sort reordered was detached by
+         * the sort itself, and the non-compacting fast path writes no
+         * borrowed column buffer, so it keeps the borrow. */
+        if (rel->col_shared && rel->run_count >= COL_MAX_RUNS) {
+            int cow_rc = col_rel_cow_unshare_with_source_writer(rel,
+                    rel_writer);
+            if (cow_rc != 0)
+                return col_op_consolidate_incremental_delta_fail(delta_out,
+                           delta_initial_nrows, cow_rc);
+            *out_rel_alias_release_pending = true;
+        }
+
         /* All d_unique rows are novel. Emit to delta_out and append as run. */
         if (delta_out) {
             col_row_buf_t drb;
