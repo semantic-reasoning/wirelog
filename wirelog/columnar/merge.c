@@ -1772,50 +1772,89 @@ col_op_consolidate_incremental(col_rel_t *rel, uint32_t old_nrows)
     return 0;
 }
 
+/* Flat row-major merge buffer for run compaction, with its governor credit.
+ * Acquiring it is the only fallible step of a compaction (#2051), so callers
+ * that must not publish a partial state acquire it first. */
+typedef struct col_rel_compact_scratch {
+    int64_t *merged;
+    uint32_t rows;
+    wl_columnar_memory_reservation_t reservation;
+} col_rel_compact_scratch_t;
+
 /*
- * col_rel_compact_runs - K-way merge of tiered sorted runs (#369).
+ * col_rel_compact_scratch_prepare - reserve and allocate room for `rows`
+ * merged rows.
  *
- * Merges all independently sorted+unique runs into a single sorted run.
- * Uses min-heap merge (runs are already sorted, no per-segment sort needed).
- * Writes merged result back into rel using flat buffer + scatter.
- *
- * @return 0 on success, ENOMEM on allocation failure.
+ * @return 0, EOVERFLOW when the size does not fit, the admission error
+ *         (ENOMEM with memory_budget_denial_pending set, EOVERFLOW or
+ *         EINVAL), or ENOMEM on allocation failure.  On failure nothing is
+ *         held and rel's rows, runs and generations are unchanged.
  */
 static int
-col_rel_compact_runs(col_rel_t *rel)
+col_rel_compact_scratch_prepare(col_rel_t *rel, uint32_t rows,
+    col_rel_compact_scratch_t *scratch)
 {
-    if (rel->run_count <= 1)
-        return 0;
-
-    uint32_t nc = rel->ncols;
-    uint32_t nr = rel->nrows;
-    uint32_t K = rel->run_count;
     uint64_t merged_bytes = 0;
-    wl_columnar_memory_reservation_t reservation;
 
-    if (!wl_columnar_memory_size_mul(nr,
-        (uint64_t)nc * sizeof(int64_t),
+    scratch->merged = NULL;
+    scratch->rows = 0;
+    wl_columnar_memory_reservation_init(&scratch->reservation);
+    if (!wl_columnar_memory_size_mul(rows,
+        (uint64_t)rel->ncols * sizeof(int64_t),
         &merged_bytes))
         return EOVERFLOW;
     if (merged_bytes > SIZE_MAX)
         return EOVERFLOW;
     int admission_rc = col_rel_merge_scratch_reserve(rel, merged_bytes,
-            &reservation);
+            &scratch->reservation);
     if (admission_rc != 0)
         return admission_rc;
+    scratch->merged = (int64_t *)malloc((size_t)merged_bytes);
+    if (!scratch->merged) {
+        col_rel_merge_scratch_release(&scratch->reservation);
+        return ENOMEM;
+    }
+    scratch->rows = rows;
+    return 0;
+}
+
+static void
+col_rel_compact_scratch_release(col_rel_compact_scratch_t *scratch)
+{
+    if (!scratch->merged)
+        return;
+    free(scratch->merged);
+    scratch->merged = NULL;
+    scratch->rows = 0;
+    col_rel_merge_scratch_release(&scratch->reservation);
+}
+
+/*
+ * col_rel_compact_runs_prepared - K-way merge of tiered sorted runs (#369).
+ *
+ * Merges all independently sorted+unique runs into a single sorted run.
+ * Uses min-heap merge (runs are already sorted, no per-segment sort needed).
+ * Writes merged result back into rel using the prepared flat buffer +
+ * scatter, then releases the scratch.  Cannot fail: the caller must hold a
+ * prepared scratch covering every run-bounded row.
+ */
+static void
+col_rel_compact_runs_prepared(col_rel_t *rel,
+    col_rel_compact_scratch_t *scratch)
+{
+    if (rel->run_count <= 1 || !scratch->merged
+        || rel->run_ends[rel->run_count - 1] > scratch->rows)
+        abort();
+
+    uint32_t nc = rel->ncols;
+    uint32_t K = rel->run_count;
+    int64_t *merged = scratch->merged;
 
     /* Build segment boundaries from run_ends */
     uint32_t seg_bounds[COL_MAX_RUNS + 1];
     seg_bounds[0] = 0;
     for (uint32_t i = 0; i < K; i++)
         seg_bounds[i + 1] = rel->run_ends[i];
-
-    /* Allocate merge output buffer (flat row-major) */
-    int64_t *merged = (int64_t *)malloc((size_t)merged_bytes);
-    if (!merged) {
-        col_rel_merge_scratch_release(&reservation);
-        return ENOMEM;
-    }
 
     /* Min-heap entries (stack-allocated, K <= COL_MAX_RUNS = 8).
      *
@@ -1915,14 +1954,32 @@ col_rel_compact_runs(col_rel_t *rel)
     /* Scatter flat merged buffer back into column-major */
     for (uint32_t r = 0; r < out; r++)
         col_rel_row_copy_in_raw(rel, r, merged + (size_t)r * nc);
-    free(merged);
-    col_rel_merge_scratch_release(&reservation);
+    col_rel_compact_scratch_release(scratch);
 
     rel->nrows = out;
     wl_columnar_relation_touch_view(rel);
     rel->sorted_nrows = out;
     rel->run_count = 1;
     rel->run_ends[0] = out;
+}
+
+/*
+ * col_rel_compact_runs - prepare a scratch for rel->nrows rows and compact.
+ *
+ * @return 0 on success, or a col_rel_compact_scratch_prepare error, in which
+ *         case rel's rows, runs and generations are unchanged.
+ */
+static int
+col_rel_compact_runs(col_rel_t *rel)
+{
+    col_rel_compact_scratch_t scratch;
+
+    if (rel->run_count <= 1)
+        return 0;
+    int rc = col_rel_compact_scratch_prepare(rel, rel->nrows, &scratch);
+    if (rc != 0)
+        return rc;
+    col_rel_compact_runs_prepared(rel, &scratch);
     return 0;
 }
 
@@ -2100,7 +2157,9 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
          * delta_out untouched.  A delta the sort reordered was detached by
          * the sort itself, and the non-compacting fast path writes no
          * borrowed column buffer, so it keeps the borrow. */
-        if (rel->col_shared && rel->run_count >= COL_MAX_RUNS) {
+        bool compact = rel->run_count >= COL_MAX_RUNS;
+        col_rel_compact_scratch_t scratch;
+        if (rel->col_shared && compact) {
             int cow_rc = col_rel_cow_unshare_with_source_writer(rel,
                     rel_writer);
             if (cow_rc != 0)
@@ -2130,21 +2189,35 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
             }
             col_row_buf_release(&drb);
         }
+
+        /* Acquire the compaction scratch before publishing rows or runs
+         * (#2051): a refusal after nrows and the last run were extended
+         * would let a retry's run repair fold the interleaved runs into one
+         * "sorted" run.  The refusal itself publishes no rows, runs or
+         * generations.  As for any failure after the sort, what came before
+         * it stays in effect: an admitted detach, a run repair, the sort's
+         * view-generation advance, and an unpublished delta suffix that may
+         * be reordered and deduplicated (its value set is kept); delta_out
+         * is rolled back. */
+        if (compact) {
+            int rc = col_rel_compact_scratch_prepare(rel,
+                    old_nrows + d_unique, &scratch);
+            if (rc != 0)
+                return col_op_consolidate_incremental_delta_fail(delta_out,
+                           delta_initial_nrows, rc);
+        }
         rel->nrows = old_nrows + d_unique;
         wl_columnar_relation_touch_view(rel);
         rel->sorted_nrows = rel->nrows;
 
         /* Register as new run */
-        if (rel->run_count < COL_MAX_RUNS) {
+        if (!compact) {
             rel->run_ends[rel->run_count] = rel->nrows;
             rel->run_count++;
         } else {
-            /* Temporarily extend last run to include new data, then compact */
+            /* Extend the last run to include new data, then compact */
             rel->run_ends[rel->run_count - 1] = rel->nrows;
-            int rc = col_rel_compact_runs(rel);
-            if (rc != 0)
-                return col_op_consolidate_incremental_delta_fail(delta_out,
-                           delta_initial_nrows, rc);
+            col_rel_compact_runs_prepared(rel, &scratch);
         }
 
         if (rel->timestamps) {
