@@ -954,6 +954,9 @@ test('perf_nightly_governor_policy', py3,
      suite: 'abi')
 
 if host_machine.system() == 'linux'
+  test('perf_batch_append_plan_contract', py3,
+       args: [meson.project_source_root() / 'scripts/perf/test-prepare-batch-append-campaign.py'],
+       suite: 'abi', timeout: 120)
   test('perf_paired_benchmark_contract', py3,
        args: [meson.project_source_root() / 'scripts/perf/test-paired-benchmark.py'],
        suite: 'abi')
