@@ -960,6 +960,9 @@ if host_machine.system() == 'linux'
   test('perf_batch_append_execution_contract', py3,
        args: [meson.project_source_root() / 'scripts/perf/test-prepare-batch-append-execution.py'],
        suite: 'abi', timeout: 120)
+  test('perf_batch_append_calibration_contract', py3,
+       args: [meson.project_source_root() / 'scripts/perf/test-calibrate-batch-append.py'],
+       suite: 'abi', timeout: 120)
   test('perf_paired_benchmark_contract', py3,
        args: [meson.project_source_root() / 'scripts/perf/test-paired-benchmark.py'],
        suite: 'abi')
