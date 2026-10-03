@@ -1009,7 +1009,6 @@ wl_columnar_relation_terminal_tokens_valid(
             continue;
         if (role->relation != relation || same->relation != relation
             || same->set != set || same->identity != (uintptr_t)same
-            || same->relation != relation
             || same->role_flags != role->role_flags)
             return false;
         if (role->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION)
