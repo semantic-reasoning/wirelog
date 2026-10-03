@@ -62,9 +62,17 @@ def source_provenance(label, source_arg, wrapper_arg, upstream_tree_arg, overlay
         raise PlanError(f'{label} upstream tree must be a full 40-character tree ID')
     if git(source, 'rev-parse', 'HEAD') != wrapper:
         raise PlanError(f'{label} HEAD does not match the supplied wrapper commit')
+    parents = git(source, 'show', '-s', '--format=%P', wrapper).split()
+    if len(parents) != 1:
+        raise PlanError(f'{label} wrapper commit must have exactly one parent')
+    parent = parents[0]
+    git(source, 'cat-file', '-e', f'{parent}^{{commit}}')
     wrapper_tree = git(source, 'rev-parse', f'{wrapper}^{{tree}}')
-    if wrapper_tree != expected_tree:
-        raise PlanError(f'{label} wrapper tree {wrapper_tree} does not match upstream tree {expected_tree}')
+    parent_tree = git(source, 'rev-parse', f'{parent}^{{tree}}')
+    if parent_tree != wrapper_tree or wrapper_tree != expected_tree:
+        raise PlanError(
+            f'{label} parent tree, wrapper tree, and declared upstream tree must match '
+            f'(parent={parent_tree}, wrapper={wrapper_tree}, upstream={expected_tree})')
 
     unstaged = subprocess.run(['git', '-C', str(source), 'diff', '--quiet'], check=False)
     if unstaged.returncode != 0:
@@ -83,13 +91,9 @@ def source_provenance(label, source_arg, wrapper_arg, upstream_tree_arg, overlay
     if applied.stdout != overlay_bytes:
         raise PlanError(f'{label} staged overlay does not exactly match the supplied overlay patch')
     measured_tree = git(source, 'write-tree')
-    parents = git(source, 'show', '-s', '--format=%P', wrapper).split()
-    if not parents:
-        raise PlanError(f'{label} wrapper commit must have a parent')
-    for parent in parents:
-        git(source, 'cat-file', '-e', f'{parent}^{{commit}}')
     return dict(source_root=str(source), wrapper_commit=wrapper,
-                wrapper_parents=parents, upstream_tree=expected_tree,
+                wrapper_parent_commit=parent, wrapper_parent_tree=parent_tree,
+                wrapper_tree=wrapper_tree, upstream_tree=expected_tree,
                 measured_tree=measured_tree,
                 overlay_sha256=sha256(overlay_bytes))
 
@@ -133,8 +137,11 @@ def build_plan(args):
     candidate = source_provenance('candidate', args.candidate_source,
                                   args.candidate_wrapper, args.candidate_upstream_tree,
                                   overlay)
-    if args.mode == 'aa_control' and base['upstream_tree'] != candidate['upstream_tree']:
+    same_upstream = base['upstream_tree'] == candidate['upstream_tree']
+    if args.mode == 'aa_control' and not same_upstream:
         raise PlanError('A/A control requires identical upstream trees')
+    if args.mode == 'comparison' and same_upstream:
+        raise PlanError('comparison requires different upstream trees')
     launches = schedule(args.seed)
     if len(launches) != 108:
         raise PlanError('internal schedule size error')
@@ -156,6 +163,9 @@ def build_plan(args):
 
 def write_fresh(output_arg, plan):
     output = safe_path(output_arg, 'output directory')
+    home = Path.home().resolve()
+    if output != home and home not in output.parents:
+        raise PlanError('output directory must be under HOME')
     if not output.parent.is_dir():
         raise PlanError('output parent directory must already exist')
     output.mkdir(mode=0o700, exist_ok=False)
