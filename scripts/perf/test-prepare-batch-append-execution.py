@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Profile-only preflight provenance, Meson, drift, and durability tests."""
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import runpy
+import stat
+import shutil
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -13,6 +17,8 @@ from unittest.mock import patch
 PERF = Path(__file__).parent
 PLAN = runpy.run_path(str(PERF / 'prepare-batch-append-campaign.py'))
 M = runpy.run_path(str(PERF / 'prepare-batch-append-execution.py'))
+REAL_VALIDATE_FALLBACKS = M['FALLBACKS']['validate_fallbacks']
+REAL_PLAN_VALIDATE_FALLBACKS = PLAN['FALLBACKS']['validate_fallbacks']
 
 
 class ExecutionPreflightTests(unittest.TestCase):
@@ -23,6 +29,21 @@ class ExecutionPreflightTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.assertTrue(self.root.is_relative_to(Path.home().resolve()))
+        def fake_validate(root):
+            M['FALLBACKS']['outer_status'](root)
+            return {'schema': M['FALLBACKS']['SCHEMA'],
+                    'outer_ignored_paths': list(M['FALLBACKS']['IGNORED_ROOTS']),
+                    'nanoarrow': {'commit': M['FALLBACKS']['NANO_COMMIT'],
+                                  'tree': M['FALLBACKS']['NANO_TREE'],
+                                  'manifest_sha256': 'a' * 64},
+                    'xxhash': {'archive_sha256': M['FALLBACKS']['XX_ARCHIVE_SHA256'],
+                               'manifest_sha256': 'b' * 64}}
+        self.fallback_patcher = patch.dict(M['FALLBACKS'], validate_fallbacks=fake_validate)
+        self.plan_fallback_patcher = patch.dict(PLAN['FALLBACKS'], validate_fallbacks=fake_validate)
+        self.fallback_patcher.start()
+        self.plan_fallback_patcher.start()
+        self.addCleanup(self.fallback_patcher.stop)
+        self.addCleanup(self.plan_fallback_patcher.stop)
         self.paths = {}
         self.paths['base'] = self.make_source('base', 'pre')
         self.paths['candidate'] = self.make_source('candidate', 'post')
@@ -77,10 +98,20 @@ class ExecutionPreflightTests(unittest.TestCase):
             self.git(source, 'update-ref', 'refs/heads/fixture', commit)
             self.git(source, 'checkout', '-q', '--detach', commit)
         self.write_overlay(source)
+        for ignored in M['FALLBACKS']['IGNORED_ROOTS']:
+            (source / ignored.rstrip('/')).mkdir(parents=True, exist_ok=True)
         return dict(source=source,
                     commit=self.git(source, 'rev-parse', 'HEAD'),
                     tree=self.git(source, 'rev-parse', 'HEAD^{tree}'),
                     product=product)
+
+    def install_real_fallbacks(self, source):
+        subprojects = PLAN['REPOSITORY_ROOT'] / 'subprojects'
+        for name in ('nanoarrow', 'xxHash-0.8.4', 'packagecache'):
+            target = source / 'subprojects' / name
+            shutil.rmtree(target)
+            shutil.copytree(subprojects / name, target, symlinks=True,
+                            copy_function=shutil.copy2)
 
     def write_overlay(self, source):
         contents = {
@@ -224,6 +255,257 @@ class ExecutionPreflightTests(unittest.TestCase):
             self.assertEqual(aa_artifact['status'], 'not_executable')
             self.assertTrue(aa_artifact['not_executable'])
 
+    def test_real_fallbacks_bind_pre_and_post_plan_and_profile(self):
+        fallback_api = M['FALLBACKS']
+        fake_validate = fallback_api['validate_fallbacks']
+        fallback_api['validate_fallbacks'] = REAL_VALIDATE_FALLBACKS
+        plan_api = PLAN['FALLBACKS']
+        fake_plan_validate = plan_api['validate_fallbacks']
+        plan_api['validate_fallbacks'] = REAL_PLAN_VALIDATE_FALLBACKS
+        self.addCleanup(lambda: fallback_api.__setitem__('validate_fallbacks', fake_validate))
+        self.addCleanup(lambda: plan_api.__setitem__('validate_fallbacks', fake_plan_validate))
+        for side in ('base', 'candidate'):
+            self.install_real_fallbacks(self.paths[side]['source'])
+        plan = self.make_plan(self.paths['base'], self.paths['candidate'])
+        self.plan_path.write_text(json.dumps(plan), encoding='utf-8')
+        artifact = self.artifact()
+        self.assertEqual(plan['sources']['base']['fallback_dependencies']['schema'],
+                         fallback_api['SCHEMA'])
+        for side in ('base', 'candidate'):
+            deps = artifact['fallback_dependencies'][side]
+            self.assertEqual(deps, plan['sources'][side]['fallback_dependencies'])
+            self.assertEqual(deps['nanoarrow']['commit'], fallback_api['NANO_COMMIT'])
+            self.assertEqual(deps['xxhash']['archive_sha256'],
+                             fallback_api['XX_ARCHIVE_SHA256'])
+            self.assertTrue(deps['nanoarrow']['manifest_sha256'])
+            self.assertTrue(deps['xxhash']['manifest_sha256'])
+        self.assertEqual(artifact['mode'], 'comparison')
+        self.assertEqual(artifact['fallback_dependencies']['base']['nanoarrow']['tree'],
+                         fallback_api['NANO_TREE'])
+        self.assertEqual(artifact['fallback_dependencies']['candidate']['nanoarrow']['tree'],
+                         fallback_api['NANO_TREE'])
+        # The fixed pre and synthetic post product source profiles share the
+        # same independently verified fallback identities.
+        self.assertEqual(plan['sources']['base']['fallback_dependencies'],
+                         plan['sources']['candidate']['fallback_dependencies'])
+
+        nested_link = self.paths['base']['source'] / 'subprojects/nanoarrow/python/subprojects/arrow-nanoarrow'
+        original_link = os.readlink(nested_link)
+        nested_link.unlink()
+        nested_link.symlink_to('../../../escape')
+        with self.assertRaisesRegex(M['PreflightError'], 'symlink differs|escapes'):
+            self.artifact()
+        nested_link.unlink()
+        nested_link.symlink_to(original_link)
+        nested_link.unlink()
+        nested_link.symlink_to('.')
+        with self.assertRaisesRegex(PLAN['PlanError'], 'symlink differs|resolve to checkout root'):
+            self.make_plan(self.paths['base'], self.paths['candidate'])
+        nested_link.unlink()
+        nested_link.symlink_to(original_link)
+
+        def rejects(pattern=''):
+            with self.assertRaises(PLAN['FALLBACKS']['FallbackError']) as caught:
+                REAL_PLAN_VALIDATE_FALLBACKS(self.paths['base']['source'])
+            if pattern:
+                self.assertRegex(str(caught.exception), pattern)
+
+        nested_root = self.paths['base']['source'] / 'subprojects/nanoarrow'
+        regular_link = nested_root / 'python/subprojects/arrow-nanoarrow'
+        regular_link.unlink()
+        regular_link.write_text('../..', encoding='utf-8')
+        rejects('tracked symlink')
+        regular_link.unlink()
+        regular_link.symlink_to('../..')
+        nested_git = PLAN['FALLBACKS']['git']
+        tracked = nested_git(nested_root, 'ls-files', '-s', '-z', binary=True)
+        tracked_files = []
+        for record in tracked.split(b'\0'):
+            if not record:
+                continue
+            metadata, path_bytes = record.split(b'\t', 1)
+            mode, _, _ = metadata.decode('ascii').split()
+            if mode in ('100644', '100755'):
+                tracked_files.append(path_bytes.decode('utf-8'))
+        tracked_path = nested_root / tracked_files[0]
+        tracked_name = tracked_files[0]
+        tracked_bytes = nested_git(nested_root, 'show', f'HEAD:{tracked_name}', binary=True)
+        tracked_mode = stat.S_IMODE(tracked_path.stat().st_mode)
+        nested_git(nested_root, 'update-index', '--assume-unchanged', tracked_name)
+        tracked_path.unlink()
+        tracked_path.write_bytes(tracked_bytes + b' assume-unchanged mutation')
+        tracked_path.chmod(tracked_mode)
+        try:
+            rejects('tracked file differs from Git blob')
+        finally:
+            tracked_path.unlink()
+            tracked_path.write_bytes(tracked_bytes)
+            tracked_path.chmod(tracked_mode)
+            nested_git(nested_root, 'update-index', '--no-assume-unchanged', tracked_name)
+
+        # Simulate mutation after the blob-verification loop but before the final
+        # filesystem walk. Assume-unchanged keeps nested Git status clean, so the
+        # physical walk must detect the race from exact manifest tuples.
+        nested_git(nested_root, 'update-index', '--assume-unchanged', tracked_name)
+        fallback_globals = REAL_PLAN_VALIDATE_FALLBACKS.__globals__
+        original_walk = fallback_globals['walk_tree']
+        mutated_during_walk = False
+
+        def mutate_before_walk(root, **kwargs):
+            nonlocal mutated_during_walk
+            if Path(root) == nested_root and not mutated_during_walk:
+                tracked_path.unlink()
+                tracked_path.write_bytes(tracked_bytes + b' race mutation')
+                tracked_path.chmod(tracked_mode)
+                mutated_during_walk = True
+            return original_walk(root, **kwargs)
+
+        try:
+            with patch.dict(fallback_globals, walk_tree=mutate_before_walk):
+                rejects('exact manifest')
+            self.assertTrue(mutated_during_walk)
+        finally:
+            if tracked_path.exists():
+                tracked_path.unlink()
+            tracked_path.write_bytes(tracked_bytes)
+            tracked_path.chmod(tracked_mode)
+            nested_git(nested_root, 'update-index', '--no-assume-unchanged', tracked_name)
+        extra_link = nested_root / 'extra-link'
+        extra_link.symlink_to('.')
+        rejects('additional files')
+        extra_link.unlink()
+        marker = nested_root / '.meson-subproject-wrap-hash.txt'
+        marker_bytes = marker.read_bytes()
+        marker.unlink()
+        marker.write_bytes(b'bad marker\n')
+        rejects('marker')
+        marker.unlink()
+        marker.write_bytes(marker_bytes)
+        marker.chmod(0o600)
+        rejects('marker type/mode')
+        marker.chmod(0o644)
+        xx_marker = self.paths['base']['source'] / 'subprojects/xxHash-0.8.4/.meson-subproject-wrap-hash.txt'
+        xx_marker_bytes = xx_marker.read_bytes()
+        xx_marker.unlink()
+        xx_marker.write_bytes(b'bad marker\n')
+        rejects('marker')
+        xx_marker.unlink()
+        xx_marker.write_bytes(xx_marker_bytes)
+        xx_marker.chmod(0o600)
+        rejects('mode differs')
+        xx_marker.chmod(0o644)
+
+        xx_root = self.paths['base']['source'] / 'subprojects/xxHash-0.8.4'
+        extracted = xx_root / 'xxhash.c'
+        extracted_mode = stat.S_IMODE(extracted.stat().st_mode)
+        extracted_bytes = extracted.read_bytes()
+        extracted.unlink()
+        extracted.write_bytes(extracted_bytes)
+        extracted.chmod(extracted_mode ^ 0o100)
+        rejects('mode differs')
+        extracted.unlink()
+        extracted.write_bytes(extracted_bytes + b' drift')
+        extracted.chmod(extracted_mode)
+        rejects('bytes differ')
+        extracted.unlink()
+        xxhash_source = PLAN['REPOSITORY_ROOT'] / 'subprojects/xxHash-0.8.4/xxhash.c'
+        shutil.copy2(xxhash_source, extracted)
+
+        archive = self.paths['base']['source'] / 'subprojects/packagecache/xxHash-0.8.4.tar.gz'
+        canonical_archive = PLAN['REPOSITORY_ROOT'] / 'subprojects/packagecache/xxHash-0.8.4.tar.gz'
+        cache = archive.parent
+        cache.chmod(0o700)
+        rejects('packagecache directory type/mode')
+        cache.chmod(0o755)
+        archive_bytes = archive.read_bytes()
+        archive.unlink()
+        archive.write_bytes(archive_bytes)
+        archive.chmod(0o644)
+        rejects('archive type/mode')
+        archive.unlink()
+        shutil.copy2(canonical_archive, archive)
+        archive.unlink()
+        archive.write_bytes(canonical_archive.read_bytes() + b'drift')
+        archive.chmod(0o600)
+        rejects('archive SHA-256')
+        archive.unlink()
+        shutil.copy2(canonical_archive, archive)
+        extra_cache = archive.parent / 'extra.archive'
+        extra_cache.write_bytes(b'extra')
+        rejects('exactly the pinned regular archive')
+        extra_cache.unlink()
+        unrelated = self.paths['base']['source'] / 'subprojects/unrelated'
+        unrelated.mkdir()
+        rejects('unapproved.*path')
+        unrelated.rmdir()
+
+        patch_path = (self.paths['base']['source'] /
+                      'subprojects/packagefiles/xxhash-0.8.4/meson.build')
+        patch_bytes = patch_path.read_bytes()
+        patch_path.write_bytes(patch_bytes + b' drift')
+        rejects('unapproved.*path')
+        patch_path.write_bytes(patch_bytes)
+
+        globals_dict = REAL_PLAN_VALIDATE_FALLBACKS.__globals__
+        with patch.dict(globals_dict, NANO_COMMIT='0' * 40):
+            rejects('revision differs')
+        with patch.dict(globals_dict, NANO_TREE='0' * 40):
+            rejects('identity mismatch')
+        with patch.dict(globals_dict, XX_ARCHIVE_SHA256='0' * 64):
+            rejects('archive identity')
+
+        revision = self.git(self.paths['base']['source'], 'rev-parse', 'HEAD')
+        wraps = globals_dict['check_wraps'](self.paths['base']['source'], revision)
+        unsafe_archives = (
+            ('traversal', [('../outside', tarfile.REGTYPE, '')]),
+            ('absolute', [('/outside', tarfile.REGTYPE, '')]),
+            ('duplicate', [('xxHash-0.8.4/duplicate', tarfile.REGTYPE, ''),
+                           ('xxHash-0.8.4/duplicate', tarfile.REGTYPE, '')]),
+            ('link', [('xxHash-0.8.4/link', tarfile.SYMTYPE, '../../outside')]),
+            ('special', [('xxHash-0.8.4/device', tarfile.CHRTYPE, '')]),
+        )
+        for case, members in unsafe_archives:
+            payload = io.BytesIO()
+            with tarfile.open(fileobj=payload, mode='w:gz') as archive_file:
+                root_info = tarfile.TarInfo('xxHash-0.8.4/')
+                root_info.type = tarfile.DIRTYPE
+                root_info.mode = 0o755
+                archive_file.addfile(root_info)
+                for member_name, member_type, linkname in members:
+                    info = tarfile.TarInfo(member_name)
+                    info.type = member_type
+                    info.mode = 0o644
+                    info.linkname = linkname
+                    data = b'x' if member_type == tarfile.REGTYPE else b''
+                    info.size = len(data)
+                    archive_file.addfile(info, io.BytesIO(data) if data else None)
+            archive_path = self.root / 'unsafe.tar.gz'
+            archive_path.write_bytes(payload.getvalue())
+            wrapped = json.loads(json.dumps(wraps))
+            wrapped['xxhash']['archive_sha256'] = hashlib.sha256(
+                payload.getvalue()).hexdigest()
+            with self.subTest(unsafe_archive=case), \
+                 patch.dict(globals_dict, XX_ARCHIVE_SHA256=wrapped['xxhash']['archive_sha256']):
+                with self.assertRaises(PLAN['FALLBACKS']['FallbackError']):
+                    globals_dict['archive_expected'](
+                        self.paths['base']['source'], revision, archive_path, wrapped)
+
+        marker_bytes = marker.read_bytes()
+        calls = 0
+        def mutate_after_initial_snapshot(root):
+            nonlocal calls
+            result = REAL_VALIDATE_FALLBACKS(root)
+            calls += 1
+            if calls == 6:
+                marker.unlink()
+                marker.write_bytes(b'mutated between snapshots\n')
+            return result
+        with patch.dict(M['FALLBACKS'], validate_fallbacks=mutate_after_initial_snapshot):
+            with self.assertRaisesRegex(M['PreflightError'], 'marker'):
+                self.artifact()
+        marker.unlink()
+        marker.write_bytes(marker_bytes)
+
     def test_rejects_v2_plan(self):
         changed = dict(self.plan)
         changed['schema'] = 'wirelog.batch-append-plan.v2'
@@ -242,14 +524,14 @@ class ExecutionPreflightTests(unittest.TestCase):
         self.write_plan(self.plan)
         helper = self.paths['base']['source'] / 'bench/bench_util.h'
         helper.write_text('drifted helper\n', encoding='utf-8')
-        with self.assertRaisesRegex(M['PreflightError'], 'changes'):
+        with self.assertRaisesRegex(M['PreflightError'], 'unapproved.*path'):
             self.artifact()
 
     def test_rejects_shallow_and_ignored_or_untracked_sources(self):
         source = self.paths['candidate']['source']
         ignored = source / 'ignored-local-file'
         ignored.write_text('must reject\n', encoding='utf-8')
-        with self.assertRaisesRegex(M['PreflightError'], 'ignored, or untracked'):
+        with self.assertRaisesRegex(M['PreflightError'], 'unapproved.*path'):
             self.artifact()
         ignored.unlink()
         self.git(source, 'update-ref', 'refs/heads/shallow-test',
@@ -314,7 +596,7 @@ class ExecutionPreflightTests(unittest.TestCase):
             return result
 
         with patch.dict(M['build_artifact'].__globals__, inspect_side=drift_helper):
-            with self.assertRaisesRegex(M['PreflightError'], 'changes'):
+            with self.assertRaisesRegex(M['PreflightError'], 'unapproved.*path'):
                 self.artifact()
 
     def test_rejects_pending_rebuild_and_overlapping_or_outside_paths(self):
@@ -374,6 +656,56 @@ class ExecutionPreflightTests(unittest.TestCase):
             M['write_atomic'](base_build / 'nested-output', artifact)
         with self.assertRaisesRegex(M['PreflightError'], 'outside build directories'):
             M['write_atomic'](candidate_build.parent, artifact)
+
+    def test_atomic_artifact_is_removed_when_fallback_drifts_after_replace(self):
+        from unittest.mock import patch as mock_patch
+        artifact = self.artifact()
+        output = self.root / 'post-replace-fallback-drift'
+        original_replace = os.replace
+        published = False
+
+        def drift_after_replace(root):
+            module = M['FALLBACKS']
+            module['outer_status'](root)
+            result = {'schema': module['SCHEMA'],
+                      'outer_ignored_paths': list(module['IGNORED_ROOTS']),
+                      'nanoarrow': {'commit': module['NANO_COMMIT'],
+                                    'tree': module['NANO_TREE'],
+                                    'manifest_sha256': 'a' * 64},
+                      'xxhash': {'archive_sha256': module['XX_ARCHIVE_SHA256'],
+                                 'manifest_sha256': 'b' * 64}}
+            if published:
+                result['nanoarrow']['manifest_sha256'] = 'c' * 64
+            return result
+
+        # The plan loader and profile loader use separate runpy namespaces.
+        def plan_drift_after_replace(root):
+            module = PLAN['FALLBACKS']
+            module['outer_status'](root)
+            result = {'schema': module['SCHEMA'],
+                      'outer_ignored_paths': list(module['IGNORED_ROOTS']),
+                      'nanoarrow': {'commit': module['NANO_COMMIT'],
+                                    'tree': module['NANO_TREE'],
+                                    'manifest_sha256': 'a' * 64},
+                      'xxhash': {'archive_sha256': module['XX_ARCHIVE_SHA256'],
+                                 'manifest_sha256': 'b' * 64}}
+            if published:
+                result['nanoarrow']['manifest_sha256'] = 'c' * 64
+            return result
+
+        def replace_then_mark_drift(source, destination):
+            nonlocal published
+            original_replace(source, destination)
+            published = True
+
+        with mock_patch.dict(M['FALLBACKS'], validate_fallbacks=drift_after_replace), \
+             mock_patch.dict(PLAN['FALLBACKS'],
+                             validate_fallbacks=plan_drift_after_replace), \
+             mock_patch('os.replace', side_effect=replace_then_mark_drift):
+            with self.assertRaisesRegex(M['PreflightError'], 'provenance'):
+                M['write_atomic'](output, artifact)
+        self.assertTrue(published)
+        self.assertFalse(output.exists())
 
 
 if __name__ == '__main__':

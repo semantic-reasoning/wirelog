@@ -8,12 +8,14 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import runpy
 
 SCHEMA = 'wirelog.batch-append-plan.v3'
 SCHEMA_VERSION = 3
 MANIFEST_PATH = Path(__file__).with_name('batch-append-revision-manifest-v1.json')
 MANIFEST_SHA256 = 'be21dfe6eb2c34a7b4b855d74e0020fa68b87cc570901ef41c09ba395ee69ad8'
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+FALLBACKS = runpy.run_path(str(Path(__file__).with_name('batch_append_fallbacks.py')))
 CASES = ('1x1', '1x256', '32x256')
 PAIR_ORDERS = ('AB', 'BA')
 PAIRS_PER_ORDER = 9
@@ -177,12 +179,6 @@ def source_provenance(label, source_arg, kind, manifest, overlay_bytes):
     unstaged = subprocess.run(['git', '-C', str(source), 'diff', '--quiet'], check=False)
     if unstaged.returncode != 0:
         raise PlanError(f'{label} worktree has unstaged changes')
-    status = git(source, 'status', '--porcelain', '--untracked-files=all',
-                 '--ignored=matching', '--', '.', ':!bench/bench_batch_append.c',
-                 ':!bench/meson.build', ':!tests/meson.build',
-                 ':!tests/test_bench_batch_append.c')
-    if status:
-        raise PlanError(f'{label} source has tracked, ignored, or untracked changes outside overlay')
     changed = git(source, 'diff', '--cached', '--name-only', checkout_commit).splitlines()
     if tuple(sorted(changed)) != tuple(sorted(OVERLAY_PATHS)):
         raise PlanError(f'{label} staged overlay paths differ from the required benchmark overlay')
@@ -195,13 +191,18 @@ def source_provenance(label, source_arg, kind, manifest, overlay_bytes):
     if applied.stdout != overlay_bytes:
         raise PlanError(f'{label} staged overlay does not exactly match the supplied overlay patch')
     execution_tree = git(source, 'write-tree')
+    try:
+        fallback_dependencies = FALLBACKS['validate_fallbacks'](source)
+    except FALLBACKS['FallbackError'] as error:
+        raise PlanError(f'{label} fallback dependency provenance failed: {error}') from error
     return dict(source_root=str(source), checkout_kind=checkout_kind,
                 checkout_commit=checkout_commit, checkout_tree=checkout_tree,
                 anchor_commit=anchor['commit'], anchor_tree=anchor['tree'],
                 product_tree=product_tree,
                 product_delta=dict(from_tree=product['pre_tree'], to_tree=product['post_tree'],
                                    paths=product['paths'], diff_sha256=product['diff_sha256']),
-                execution_tree=execution_tree, helper_sources=helpers)
+                execution_tree=execution_tree, helper_sources=helpers,
+                fallback_dependencies=fallback_dependencies)
 
 
 def schedule(seed):
@@ -257,6 +258,9 @@ def build_plan(args):
     base = source_provenance('base', args.base_source, base_kind, manifest, overlay)
     candidate = source_provenance('candidate', args.candidate_source,
                                   candidate_kind, manifest, overlay)
+    if FALLBACKS['canonical'](base['fallback_dependencies']) != \
+            FALLBACKS['canonical'](candidate['fallback_dependencies']):
+        raise PlanError('base and candidate fallback dependency identities differ')
     if args.mode == 'aa_control' and base['product_tree'] != candidate['product_tree']:
         raise PlanError('A/A control requires identical product trees')
     if base['helper_sources'] != candidate['helper_sources']:
@@ -288,7 +292,7 @@ def build_plan(args):
                            host_qualification='deferred'))
 
 
-def write_fresh(output_arg, plan):
+def write_fresh(output_arg, plan, args=None):
     output = safe_path(output_arg, 'output directory')
     home = Path.home().resolve()
     if output != home and home not in output.parents:
@@ -301,6 +305,13 @@ def write_fresh(output_arg, plan):
     path = output / 'campaign-plan.json'
     temporary = output / 'campaign-plan.json.tmp'
     try:
+        if args is not None:
+            current = build_plan(args)
+            current.pop('created_utc', None)
+            expected = dict(plan)
+            expected.pop('created_utc', None)
+            if current != expected:
+                raise PlanError('source/fallback provenance changed before plan publication')
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, 'wb') as stream:
             stream.write(payload)
@@ -313,6 +324,13 @@ def write_fresh(output_arg, plan):
                 os.fsync(dir_fd)
             finally:
                 os.close(dir_fd)
+        if args is not None:
+            current = build_plan(args)
+            current.pop('created_utc', None)
+            expected = dict(plan)
+            expected.pop('created_utc', None)
+            if current != expected:
+                raise PlanError('source/fallback provenance changed during plan publication')
     except BaseException:
         for artifact in (temporary, path):
             try:
@@ -344,7 +362,7 @@ def main(argv=None):
         parser().error('--aa-product is only valid with --mode aa_control')
     try:
         plan = build_plan(args)
-        write_fresh(args.output_dir, plan)
+        write_fresh(args.output_dir, plan, args)
     except (OSError, PlanError, UnicodeError) as error:
         print(f'prepare-batch-append-campaign: {error}', file=sys.stderr)
         return 2

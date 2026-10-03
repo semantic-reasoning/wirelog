@@ -8,6 +8,7 @@ import runpy
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 M = runpy.run_path(str(Path(__file__).with_name('prepare-batch-append-campaign.py')))
 
@@ -20,18 +21,30 @@ class PreparePlanTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.assertTrue(self.root.is_relative_to(Path.home().resolve()))
+        def fake_validate(root):
+            M['FALLBACKS']['outer_status'](root)
+            return {'schema': M['FALLBACKS']['SCHEMA'],
+                    'outer_ignored_paths': list(M['FALLBACKS']['IGNORED_ROOTS']),
+                    'nanoarrow': {'commit': M['FALLBACKS']['NANO_COMMIT'],
+                                  'tree': M['FALLBACKS']['NANO_TREE'],
+                                  'manifest_sha256': 'a' * 64},
+                    'xxhash': {'archive_sha256': M['FALLBACKS']['XX_ARCHIVE_SHA256'],
+                               'manifest_sha256': 'b' * 64}}
+        self.fallback_patcher = patch.dict(M['FALLBACKS'], validate_fallbacks=fake_validate)
+        self.fallback_patcher.start()
+        self.addCleanup(self.fallback_patcher.stop)
         self.overlay_paths = M['OVERLAY_PATHS']
         self.source_data = {'base': self.make_source('base', 'pre'),
                             'candidate': self.make_source('candidate', 'post')}
-        patch = self.root / 'overlay.patch'
-        patch.write_bytes(self.git_bytes(self.source_data['base'],
-                                         'diff', '--binary', 'HEAD',
-                                         '--', *self.overlay_paths))
-        self.patch = patch
+        patch_path = self.root / 'overlay.patch'
+        patch_path.write_bytes(self.git_bytes(self.source_data['base'],
+                                              'diff', '--binary', 'HEAD',
+                                              '--', *self.overlay_paths))
+        self.patch = patch_path
         self.args = dict(mode='comparison', seed='unit-test-seed',
                          base_source=self.source_data['base'],
                          candidate_source=self.source_data['candidate'], aa_product=None,
-                         overlay_patch=patch, output_dir=self.root / 'out')
+                         overlay_patch=patch_path, output_dir=self.root / 'out')
 
     @staticmethod
     def git(source, *args):
@@ -71,6 +84,8 @@ class PreparePlanTests(unittest.TestCase):
             self.git(source, 'update-ref', 'refs/heads/fixture', synthetic)
             self.git(source, 'checkout', '-q', '--detach', synthetic)
         self.add_overlay(source)
+        for ignored in M['FALLBACKS']['IGNORED_ROOTS']:
+            (source / ignored.rstrip('/')).mkdir(parents=True, exist_ok=True)
         return source
 
     def add_overlay(self, source):
@@ -186,6 +201,23 @@ class PreparePlanTests(unittest.TestCase):
         with self.assertRaisesRegex(M['PlanError'], 'explicitly select'):
             self.plan(mode='aa_control')
 
+    def test_rejects_different_fallback_dependency_identities_between_sides(self):
+        original = M['FALLBACKS']['validate_fallbacks']
+        calls = 0
+
+        def side_specific(root):
+            nonlocal calls
+            value = original(root)
+            calls += 1
+            if calls == 2:
+                value = json.loads(json.dumps(value))
+                value['nanoarrow']['manifest_sha256'] = 'e' * 64
+            return value
+
+        with patch.dict(M['FALLBACKS'], validate_fallbacks=side_specific):
+            with self.assertRaisesRegex(M['PlanError'], 'fallback dependency identities differ'):
+                self.plan()
+
     def test_rejects_mismatched_overlay_and_dirty_worktree(self):
         source = self.source_data['candidate']
         (source / 'bench/meson.build').write_text('tampered\n', encoding='utf-8')
@@ -294,6 +326,54 @@ class PreparePlanTests(unittest.TestCase):
             M['write_fresh'](self.args['output_dir'], plan)
         with self.assertRaisesRegex(M['PlanError'], 'under HOME'):
             M['write_fresh'](Path('/opt/wirelog-evidence'), plan)
+
+    def test_plan_publication_rejects_fallback_mutation_between_snapshots(self):
+        plan = self.plan()
+        original = M['FALLBACKS']['validate_fallbacks']
+        calls = 0
+
+        def drift(root):
+            nonlocal calls
+            result = original(root)
+            calls += 1
+            if calls in (3, 4):
+                result = json.loads(json.dumps(result))
+                result['nanoarrow']['manifest_sha256'] = 'f' * 64
+            return result
+
+        args = type('Args', (), dict(self.args))()
+        output = self.root / 'drifting-plan'
+        with patch.dict(M['FALLBACKS'], validate_fallbacks=drift):
+            with self.assertRaisesRegex(M['PlanError'], 'changed during plan publication'):
+                M['write_fresh'](output, plan, args)
+        self.assertFalse(output.exists())
+
+    def test_plan_publication_removes_artifact_when_fallback_drifts_after_replace(self):
+        plan = self.plan()
+        original_validate = M['FALLBACKS']['validate_fallbacks']
+        original_replace = os.replace
+        published = False
+
+        def drift_after_replace(root):
+            result = original_validate(root)
+            if published:
+                result = json.loads(json.dumps(result))
+                result['xxhash']['manifest_sha256'] = 'd' * 64
+            return result
+
+        def replace_then_mark_drift(source, destination):
+            nonlocal published
+            original_replace(source, destination)
+            published = True
+
+        args = type('Args', (), dict(self.args))()
+        output = self.root / 'post-replace-drift'
+        with patch.dict(M['FALLBACKS'], validate_fallbacks=drift_after_replace), \
+             patch('os.replace', side_effect=replace_then_mark_drift):
+            with self.assertRaisesRegex(M['PlanError'], 'changed during plan publication'):
+                M['write_fresh'](output, plan, args)
+        self.assertTrue(published)
+        self.assertFalse(output.exists())
 
 
 if __name__ == '__main__':

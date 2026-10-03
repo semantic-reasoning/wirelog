@@ -124,6 +124,8 @@ def profile_semantic_copy(profile_a, profile_b):
     left, right = dict(profile_a), dict(profile_b)
     left.pop('plan_sha256', None)
     right.pop('plan_sha256', None)
+    left.pop('plan_path', None)
+    right.pop('plan_path', None)
     if left != right:
         raise FreezeError('second profile differs beyond its bound plan hash')
 
