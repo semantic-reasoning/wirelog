@@ -2732,6 +2732,14 @@ col_rel_retained_live_bytes(const col_rel_t *r, uint64_t *out);
 /* Replace a persistent merge grid under the aggregate payload reservation.
  * On admission/allocation failure the relation and old grid are unchanged. */
 int col_rel_reserve_merge_grid(col_rel_t *r, uint32_t capacity);
+int col_rel_reserve_merge_grid_with_lease(col_rel_t *r, uint32_t capacity,
+    wl_columnar_relation_mutation_lease_t *lease);
+int col_rel_cow_unshare_with_lease(col_rel_t *r,
+    wl_columnar_relation_mutation_lease_t *lease);
+int col_rel_append_row_with_lease(col_rel_t *r, const int64_t *row,
+    wl_columnar_relation_mutation_lease_t *lease);
+int col_rel_reserve_rows_with_lease(col_rel_t *r, uint32_t additional,
+    wl_columnar_relation_mutation_lease_t *lease);
 /* Retire aggregate credit after a payload allocation has been freed. */
 void col_rel_retire_payload_credit(col_rel_t *r);
 /* Admit and grow @r to at least @new_cap rows as one transaction; with
@@ -3261,6 +3269,11 @@ wl_columnar_relation_radix_workspace_prepare_with_lease(col_rel_t *rel,
 WL_MUST_CHECK int
 wl_columnar_relation_radix_sort_with_lease(col_rel_t *rel, uint32_t start_row,
     uint32_t nrows, const wl_columnar_radix_workspace_t *workspace,
+    wl_columnar_relation_mutation_lease_t *lease);
+WL_MUST_CHECK int
+wl_columnar_relation_radix_sort_consolidation_with_lease(col_rel_t *rel,
+    uint32_t start_row, uint32_t nrows,
+    const wl_columnar_radix_workspace_t *workspace,
     wl_columnar_relation_mutation_lease_t *lease);
 
 /** Stable LSD radix sort of a row-major int64_t buffer by a single key

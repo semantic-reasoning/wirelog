@@ -84,11 +84,11 @@ consolidation_pause_hook(col_rel_t *relation,
         return;
     state->hook_state_ok = stage == state->expected_stage
         && relation == state->expected_relation
-        && relation->storage_owner == state->expected_owner
+        && relation->storage_owner == relation
         && relation->col_shared == NULL
         && relation->columns[0] != state->old_columns
         && relation->nrows == state->expected_nrows
-        && state->expected_owner->storage_alias_borrows > 0;
+        && state->expected_owner->storage_owner == state->expected_owner;
     for (uint32_t i = 0; state->hook_state_ok && i < relation->nrows; i++)
         state->hook_state_ok = relation->columns[0][i]
             == state->expected_values[i];
