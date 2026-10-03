@@ -101,6 +101,21 @@ class CalibrationTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(dir=home_tmp)
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        self.fallback_patchers = []
+        for api in (CAL['PROFILE']['PLAN']['FALLBACKS'], CAL['PROFILE']['FALLBACKS']):
+            def fake_validate(root, module=api):
+                module['outer_status'](root)
+                return {'schema': module['SCHEMA'],
+                        'outer_ignored_paths': list(module['IGNORED_ROOTS']),
+                        'nanoarrow': {'commit': module['NANO_COMMIT'],
+                                      'tree': module['NANO_TREE'],
+                                      'manifest_sha256': 'a' * 64},
+                        'xxhash': {'archive_sha256': module['XX_ARCHIVE_SHA256'],
+                                   'manifest_sha256': 'b' * 64}}
+            patcher = patch.dict(api, validate_fallbacks=fake_validate)
+            patcher.start()
+            self.fallback_patchers.append(patcher)
+            self.addCleanup(patcher.stop)
         fixture_class = EXEC_TESTS['ExecutionPreflightTests']
         self.fixture = fixture_class('test_valid_comparison_and_aa_artifacts_are_profile_only')
         self.fixture.setUp()
@@ -293,7 +308,7 @@ class CalibrationTests(unittest.TestCase):
         while time.monotonic() < deadline:
             try:
                 stat = Path(f'/proc/{child_pid}/stat').read_text(encoding='ascii')
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 break
             state = stat.rsplit(')', 1)[1].strip().split()[0]
             if state == 'Z':

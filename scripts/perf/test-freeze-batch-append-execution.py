@@ -7,6 +7,7 @@ from pathlib import Path
 import runpy
 import tempfile
 import unittest
+from unittest.mock import patch
 
 PERF = Path(__file__).parent
 FREEZER = runpy.run_path(str(PERF / 'freeze-batch-append-execution.py'))
@@ -26,6 +27,22 @@ class CommandFreezeTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(dir=home_tmp)
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        self.fallback_patchers = []
+        for api in (FREEZER['PLAN']['FALLBACKS'], PROFILE['FALLBACKS'],
+                    CAL['PROFILE']['PLAN']['FALLBACKS'], CAL['PROFILE']['FALLBACKS']):
+            def fake_validate(root, module=api):
+                module['outer_status'](root)
+                return {'schema': module['SCHEMA'],
+                        'outer_ignored_paths': list(module['IGNORED_ROOTS']),
+                        'nanoarrow': {'commit': module['NANO_COMMIT'],
+                                      'tree': module['NANO_TREE'],
+                                      'manifest_sha256': 'a' * 64},
+                        'xxhash': {'archive_sha256': module['XX_ARCHIVE_SHA256'],
+                                   'manifest_sha256': 'b' * 64}}
+            patcher = patch.dict(api, validate_fallbacks=fake_validate)
+            patcher.start()
+            self.fallback_patchers.append(patcher)
+            self.addCleanup(patcher.stop)
         self.fixture = EXEC_TESTS['ExecutionPreflightTests'](
             'test_valid_comparison_and_aa_artifacts_are_profile_only')
         self.fixture.setUp()

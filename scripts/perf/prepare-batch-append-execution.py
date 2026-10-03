@@ -17,6 +17,7 @@ import sys
 HERE = Path(__file__).resolve().parent
 PLAN = runpy.run_path(str(HERE / 'prepare-batch-append-campaign.py'))
 ARTIFACT_SCHEMA = 'wirelog.batch-append-profile.v2'
+FALLBACKS = PLAN['FALLBACKS']
 MESON_FILES = ('meson-info.json', 'intro-buildoptions.json',
                'intro-compilers.json', 'intro-machines.json', 'intro-targets.json',
                'intro-dependencies.json')
@@ -113,22 +114,14 @@ def validate_plan(path, overlay_patch):
 def verify_source_checkout(source):
     try:
         shallow = subprocess.run(['git', '-C', str(source), 'rev-parse',
-                                  '--is-shallow-repository'],
-                                 check=True, capture_output=True, text=True,
-                                 encoding='utf-8', timeout=30).stdout.strip()
-        status = subprocess.run(['git', '-C', str(source), 'status', '--porcelain',
-                                 '--untracked-files=all', '--ignored=matching', '--',
-                                 '.', ':!bench/bench_batch_append.c',
-                                 ':!bench/meson.build', ':!tests/meson.build',
-                                 ':!tests/test_bench_batch_append.c'],
-                                check=True, capture_output=True, text=True,
-                                encoding='utf-8', timeout=30).stdout
-    except (OSError, subprocess.SubprocessError) as error:
+                                  '--is-shallow-repository'], check=True,
+                                 capture_output=True, text=True, encoding='utf-8',
+                                 timeout=30).stdout.strip()
+        if shallow != 'false':
+            raise PreflightError(f'source checkout must not be shallow: {source}')
+        FALLBACKS['validate_fallbacks'](source)
+    except (OSError, subprocess.SubprocessError, FALLBACKS['FallbackError']) as error:
         raise PreflightError(f'cannot verify source checkout {source}: {error}') from error
-    if shallow != 'false':
-        raise PreflightError(f'source checkout must not be shallow: {source}')
-    if status:
-        raise PreflightError(f'source checkout has tracked, ignored, or untracked changes: {source}')
 
 
 def normalize(value, source_root, build_root):
@@ -297,6 +290,15 @@ def build_artifact(plan_path_arg, overlay_arg, base_build_arg, candidate_build_a
     base_build = under_home(base_build_arg, 'base build')
     candidate_build = under_home(candidate_build_arg, 'candidate build')
     plan, plan_hash = validate_plan(plan_path, overlay)
+    fallback_before = {}
+    for side in ('base', 'candidate'):
+        try:
+            fallback_before[side] = FALLBACKS['validate_fallbacks'](
+                Path(plan['sources'][side]['source_root']))
+        except FALLBACKS['FallbackError'] as error:
+            raise PreflightError(f'{side} fallback provenance failed before profile reads: {error}') from error
+        if fallback_before[side] != plan['sources'][side]['fallback_dependencies']:
+            raise PreflightError(f'{side} fallback identity differs from the frozen plan')
     sources = [Path(plan['sources'][side]['source_root']).resolve()
                for side in ('base', 'candidate')]
     for evidence_path, label in ((plan_path, 'plan'), (overlay, 'overlay patch')):
@@ -322,12 +324,22 @@ def build_artifact(plan_path_arg, overlay_arg, base_build_arg, candidate_build_a
     candidate_after = inspect_side(sources[1], candidate_build)
     if base_after != base or candidate_after != candidate:
         raise PreflightError('Meson profile or benchmark binary drifted during preflight')
+    fallback_after = {}
+    for side in ('base', 'candidate'):
+        try:
+            fallback_after[side] = FALLBACKS['validate_fallbacks'](sources[0 if side == 'base' else 1])
+        except FALLBACKS['FallbackError'] as error:
+            raise PreflightError(f'{side} fallback provenance failed after profile reads: {error}') from error
+    if fallback_after != fallback_before:
+        raise PreflightError('fallback dependency provenance drifted during profile preflight')
     return dict(schema=ARTIFACT_SCHEMA,
                 status='not_executable', source_build_verified=True,
                 not_executable=True,
                 plan_sha256=plan_hash, mode=plan['mode'],
+                plan_path=str(plan_path), overlay_path=str(overlay),
                 overlay_sha256=plan['overlay']['sha256'],
                 revision_manifest_sha256=plan['revision_manifest']['sha256'],
+                fallback_dependencies=fallback_after,
                 base=base, candidate=candidate,
                 profile_sha256=base['profile_sha256'],
                 benchmark_launches_performed=0)
@@ -343,6 +355,11 @@ def write_atomic(output_arg, artifact):
     outside_sources(output, builds, 'artifact output directory', 'build directories')
     if not output.parent.is_dir():
         raise PreflightError('artifact output parent must already exist')
+    current = build_artifact(artifact['plan_path'], artifact['overlay_path'],
+                             artifact['base']['build_root'],
+                             artifact['candidate']['build_root'])
+    if current != artifact:
+        raise PreflightError('plan/source/build/fallback profile drifted before publication')
     output.mkdir(mode=0o700, exist_ok=False)
     target = output / 'execution-preflight.json'
     temporary = output / 'execution-preflight.json.tmp'
@@ -361,6 +378,11 @@ def write_atomic(output_arg, artifact):
                 os.fsync(fd)
             finally:
                 os.close(fd)
+        current = build_artifact(artifact['plan_path'], artifact['overlay_path'],
+                                 artifact['base']['build_root'],
+                                 artifact['candidate']['build_root'])
+        if current != artifact:
+            raise PreflightError('plan/source/build/fallback profile drifted during publication')
     except BaseException:
         for path in (temporary, target):
             try:
