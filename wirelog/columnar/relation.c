@@ -4836,7 +4836,6 @@ col_rel_append_row_with_lease(col_rel_t *r, const int64_t *row,
         != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
         || col_rel_mutation_lease_validate(lease, r))
         return EINVAL;
-    r->memory_budget_denial_pending = false;
     return col_rel_append_row_impl(r, row,
                &lease->set->owners[lease->owner_slot].writer, true, lease);
 }
