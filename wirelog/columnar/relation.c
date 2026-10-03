@@ -5208,15 +5208,6 @@ wl_columnar_relation_reserve_rows_impl(col_rel_t *r, uint32_t additional,
 }
 
 int
-col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
-    wl_columnar_source_access_writer_t *writer,
-    bool *out_alias_release_pending)
-{
-    return wl_columnar_relation_reserve_rows_impl(r, additional, writer,
-               out_alias_release_pending, true, NULL);
-}
-
-int
 col_rel_reserve_rows_with_lease(col_rel_t *r, uint32_t additional,
     wl_columnar_relation_mutation_lease_t *lease)
 {

@@ -2967,10 +2967,6 @@ int
 col_rel_append_rows_atomic(col_rel_t *r, const int64_t *rows,
     uint32_t num_rows, uint32_t num_cols, bool *denied);
 int
-col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
-    wl_columnar_source_access_writer_t *writer,
-    bool *out_alias_release_pending);
-int
 col_rel_reset_rows_locked(col_rel_t *r,
     wl_columnar_source_access_writer_t *writer);
 /* Detach only row storage under descriptor/owner exclusion. The caller must

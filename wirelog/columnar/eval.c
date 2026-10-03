@@ -2002,21 +2002,10 @@ wl_columnar_eval_prepare_worker_delta(col_rel_t **out, const char *name,
         col_rel_destroy(delta);
         return EOVERFLOW;
     }
-    wl_columnar_source_access_writer_t writer = { 0 };
-    rc = col_rel_source_writer_acquire(delta, &writer);
-    if (rc == 0) {
-        bool alias_release_pending = false;
-        rc = col_rel_reserve_rows_locked(delta, rows, &writer,
-                &alias_release_pending);
-        /* A newly created heap delta cannot borrow another relation. */
-        if (rc == 0 && alias_release_pending)
-            rc = EBUSY;
-        if (rc == 0)
-            rc = col_rel_enable_timestamps_locked(delta);
-        int release_rc = wl_columnar_source_access_writer_release(&writer);
-        if (rc == 0)
-            rc = release_rc;
-    }
+    rc = rows > 0
+        ? col_rel_reserve_capacity_admitted(delta, target_capacity, NULL) : 0;
+    if (rc == 0)
+        rc = col_rel_enable_timestamps(delta);
     if (rc != 0) {
         if (rc == ENOMEM && delta->memory_budget_denial_pending)
             rc = ENOSPC;

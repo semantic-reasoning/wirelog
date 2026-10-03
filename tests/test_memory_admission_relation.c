@@ -4306,6 +4306,28 @@ cleanup:
  * A separate accounting-only token fills the counter; no huge allocation or
  * forged column dimensions are needed to force arithmetic overflow. */
 static int
+reserve_rows_with_exact_lease(col_rel_t *rel, uint32_t additional)
+{
+    wl_columnar_relation_mutation_role_t role = {
+        .relation = rel,
+        .role_flags = WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+    };
+    wl_columnar_relation_mutation_descriptor_t descriptor = { 0 };
+    wl_columnar_relation_mutation_owner_t owners[2] = { 0 };
+    wl_columnar_relation_mutation_lease_t lease = { 0 };
+    wl_columnar_relation_mutation_initialization_t initialization = { 0 };
+    wl_columnar_relation_mutation_set_t set = { 0 };
+    int rc = col_rel_mutation_set_acquire(&set, &role, 1, &descriptor, 1,
+            owners, 2, &lease, 1, &initialization, 1);
+    if (rc != 0)
+        return rc;
+    rel->memory_budget_denial_pending = false;
+    rc = col_rel_reserve_rows_with_lease(rel, additional, &lease);
+    int finish_rc = col_rel_mutation_set_finish(&set, rc == 0);
+    return rc ? rc : finish_rc;
+}
+
+static int
 exercise_growth_boundary(col_rel_t *rel, unsigned boundary, bool *denied)
 {
     int64_t row = 91;
@@ -4318,18 +4340,7 @@ exercise_growth_boundary(col_rel_t *rel, unsigned boundary, bool *denied)
         return col_rel_append_row(rel, &row);
     if (boundary == 3)
         return col_rel_append_rows_atomic(rel, &row, 1u, 1u, denied);
-    wl_columnar_source_access_writer_t writer = { 0 };
-    bool alias_pending = false;
-    int rc = col_rel_source_writer_acquire(rel, &writer);
-    if (rc != 0)
-        return rc;
-    rc = col_rel_reserve_rows_locked(rel, 1u, &writer, &alias_pending);
-    if (alias_pending)
-        CHECK(col_rel_storage_alias_release(rel) == 0,
-            "growth boundary releases deferred alias");
-    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
-        "growth boundary releases its writer");
-    return rc;
+    return reserve_rows_with_exact_lease(rel, 1u);
 }
 
 static void
@@ -4651,15 +4662,8 @@ test_no_growth_admission_provenance(void)
         == 0 && !denied && !rel->memory_budget_denial_pending
         && rel->columns == columns && rel->storage_generation == generation,
         "no-growth retry admits same physical image");
-    wl_columnar_source_access_writer_t writer = { 0 };
-    bool alias_pending = false;
-    CHECK(col_rel_source_writer_acquire(rel, &writer) == 0,
-        "row-count overflow writer");
-    CHECK(col_rel_reserve_rows_locked(rel, UINT32_MAX, &writer,
-        &alias_pending) == EOVERFLOW && !alias_pending,
-        "locked reserve reports capacity arithmetic overflow before allocation");
-    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
-        "row-count overflow writer release");
+    CHECK(reserve_rows_with_exact_lease(rel, UINT32_MAX) == EOVERFLOW,
+        "leased reserve reports capacity arithmetic overflow before allocation");
 cleanup:
     col_rel_destroy(rel);
     if (ref) {
