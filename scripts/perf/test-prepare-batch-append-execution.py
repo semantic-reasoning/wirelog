@@ -101,13 +101,14 @@ class ExecutionPreflightTests(unittest.TestCase):
         return PLAN['build_plan'](args)
 
     def make_build(self, side, source):
-        build = self.root / f'{side}-build'
+        build = self.root / 'build-storage' / f'{side}-build'
         (build / 'meson-info').mkdir(parents=True)
         (build / 'bench').mkdir()
         binary = build / 'bench/bench_batch_append'
         binary.write_bytes(f'fixture benchmark {side}\n'.encode())
         (build / 'build.ninja').write_text(
             'ninja_required_version = 1.3\n'
+            'build bench/bench_batch_append: phony\n'
             'build all: phony\n'
             'default all\n', encoding='utf-8')
         info = build / 'meson-info'
@@ -322,6 +323,23 @@ class ExecutionPreflightTests(unittest.TestCase):
         with self.assertRaisesRegex(M['PreflightError'], 'under HOME'):
             self.artifact(base_build_arg=Path('/opt/build'))
 
+    def test_requires_clean_benchmark_target_even_when_default_is_clean(self):
+        build = self.paths['candidate']['build']
+        graph = build / 'build.ninja'
+        graph.write_text('ninja_required_version = 1.3\nbuild all: phony\ndefault all\n',
+                         encoding='utf-8')
+        self.assertRegex(M['assert_no_pending_rebuild'](build), r'^[0-9a-f]{64}$')
+        with self.assertRaisesRegex(M['PreflightError'], 'pending work'):
+            self.artifact()
+        graph.write_text(
+            'ninja_required_version = 1.3\n'
+            'rule stale\n  command = true\n'
+            'build bench/bench_batch_append: stale bench/stale-input.c\n'
+            'build all: phony\ndefault all\n', encoding='utf-8')
+        (build / 'bench/stale-input.c').write_text('stale input\n', encoding='utf-8')
+        with self.assertRaisesRegex(M['PreflightError'], 'pending work'):
+            self.artifact()
+
     def test_atomic_home_artifact_refuses_existing_and_records_hashes(self):
         from unittest.mock import patch as mock_patch
         artifact = self.artifact()
@@ -339,6 +357,14 @@ class ExecutionPreflightTests(unittest.TestCase):
             M['write_atomic'](output, artifact)
         with self.assertRaisesRegex(M['PreflightError'], 'under HOME'):
             M['write_atomic'](Path('/opt/evidence'), artifact)
+        base_build = Path(artifact['base']['build_root'])
+        candidate_build = Path(artifact['candidate']['build_root'])
+        with self.assertRaisesRegex(M['PreflightError'], 'outside build directories'):
+            M['write_atomic'](base_build, artifact)
+        with self.assertRaisesRegex(M['PreflightError'], 'outside build directories'):
+            M['write_atomic'](base_build / 'nested-output', artifact)
+        with self.assertRaisesRegex(M['PreflightError'], 'outside build directories'):
+            M['write_atomic'](candidate_build.parent, artifact)
 
 
 if __name__ == '__main__':
