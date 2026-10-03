@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate plan-v2 source/build provenance and freeze a profile-only artifact.
+"""Validate plan-v3 source/build provenance and freeze a profile-only artifact.
 
 This tool never builds or launches the benchmark. Calibration acceptance and
 execution-argv generation are deliberately deferred to a later contract.
@@ -16,7 +16,7 @@ import sys
 
 HERE = Path(__file__).resolve().parent
 PLAN = runpy.run_path(str(HERE / 'prepare-batch-append-campaign.py'))
-ARTIFACT_SCHEMA = 'wirelog.batch-append-profile.v1'
+ARTIFACT_SCHEMA = 'wirelog.batch-append-profile.v2'
 MESON_FILES = ('meson-info.json', 'intro-buildoptions.json',
                'intro-compilers.json', 'intro-machines.json', 'intro-targets.json',
                'intro-dependencies.json')
@@ -74,30 +74,29 @@ def outside_sources(path, sources, label, root_label='source worktrees'):
 def validate_plan(path, overlay_patch):
     raw = path.read_bytes()
     plan = load_json(path)
-    if type(plan) is not dict or plan.get('schema') != 'wirelog.batch-append-plan.v2' \
-            or plan.get('schema_version') != 2:
-        raise PreflightError('execution preflight requires batch-append plan schema v2')
+    if type(plan) is not dict or plan.get('schema') != 'wirelog.batch-append-plan.v3' \
+            or plan.get('schema_version') != 3:
+        raise PreflightError('execution preflight requires batch-append plan schema v3')
     if plan.get('benchmark_output_contract') != PLAN['OUTPUT_CONTRACT']:
         raise PreflightError('plan benchmark output contract is unsupported')
-    upstream = plan.get('upstream')
-    if type(upstream) is not dict or set(upstream) != {'base', 'candidate'}:
+    if plan.get('mode') not in ('comparison', 'aa_control') \
+            or type(plan.get('seed')) is not str or not plan['seed']:
+        raise PreflightError('plan has invalid mode or schedule seed')
+    sources = plan.get('sources')
+    if type(sources) is not dict or set(sources) != {'base', 'candidate'}:
         raise PreflightError('plan has invalid source identities')
     for side in ('base', 'candidate'):
-        if type(upstream[side]) is not dict:
+        if type(sources[side]) is not dict:
             raise PreflightError(f'plan has invalid {side} source identity')
-        for key in ('source_root', 'wrapper_commit', 'upstream_tree'):
-            if type(upstream[side].get(key)) is not str or not upstream[side][key]:
+        for key in ('source_root', 'checkout_commit', 'checkout_tree', 'product_tree'):
+            if type(sources[side].get(key)) is not str or not sources[side][key]:
                 raise PreflightError(f'plan has invalid {side} {key}')
-        source = Path(upstream[side]['source_root']).resolve()
+        source = Path(sources[side]['source_root']).resolve()
         verify_source_checkout(source)
     args = argparse.Namespace(
-        mode=plan.get('mode'), seed=plan.get('seed'),
-        base_source=upstream['base'].get('source_root'),
-        base_wrapper=upstream['base'].get('wrapper_commit'),
-        base_upstream_tree=upstream['base'].get('upstream_tree'),
-        candidate_source=upstream['candidate'].get('source_root'),
-        candidate_wrapper=upstream['candidate'].get('wrapper_commit'),
-        candidate_upstream_tree=upstream['candidate'].get('upstream_tree'),
+        mode=plan.get('mode'), aa_product=plan.get('aa_product'), seed=plan.get('seed'),
+        base_source=sources['base'].get('source_root'),
+        candidate_source=sources['candidate'].get('source_root'),
         overlay_patch=overlay_patch)
     try:
         recomputed = PLAN['build_plan'](args)
@@ -298,7 +297,7 @@ def build_artifact(plan_path_arg, overlay_arg, base_build_arg, candidate_build_a
     base_build = under_home(base_build_arg, 'base build')
     candidate_build = under_home(candidate_build_arg, 'candidate build')
     plan, plan_hash = validate_plan(plan_path, overlay)
-    sources = [Path(plan['upstream'][side]['source_root']).resolve()
+    sources = [Path(plan['sources'][side]['source_root']).resolve()
                for side in ('base', 'candidate')]
     for evidence_path, label in ((plan_path, 'plan'), (overlay, 'overlay patch')):
         outside_sources(evidence_path, sources, label)
@@ -328,6 +327,7 @@ def build_artifact(plan_path_arg, overlay_arg, base_build_arg, candidate_build_a
                 not_executable=True,
                 plan_sha256=plan_hash, mode=plan['mode'],
                 overlay_sha256=plan['overlay']['sha256'],
+                revision_manifest_sha256=plan['revision_manifest']['sha256'],
                 base=base, candidate=candidate,
                 profile_sha256=base['profile_sha256'],
                 benchmark_launches_performed=0)

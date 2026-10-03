@@ -24,14 +24,12 @@ class ExecutionPreflightTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.assertTrue(self.root.is_relative_to(Path.home().resolve()))
         self.paths = {}
-        for side in ('base', 'candidate'):
-            self.paths[side] = self.make_source(side, distinct=(side == 'candidate'))
-        self.write_overlay(self.paths['base']['source'])
-        self.write_overlay(self.paths['candidate']['source'])
+        self.paths['base'] = self.make_source('base', 'pre')
+        self.paths['candidate'] = self.make_source('candidate', 'post')
         self.overlay = self.root / 'benchmark-overlay.patch'
         self.overlay.write_bytes(self.git_bytes(
             self.paths['base']['source'], 'diff', '--binary',
-            self.paths['base']['wrapper'], '--', *PLAN['OVERLAY_PATHS']))
+            'HEAD', '--', *PLAN['OVERLAY_PATHS']))
         self.plan_path = self.root / 'campaign-plan.json'
         self.plan = self.make_plan(self.paths['base'], self.paths['candidate'])
         self.plan_path.write_text(json.dumps(self.plan, indent=2), encoding='utf-8')
@@ -50,37 +48,45 @@ class ExecutionPreflightTests(unittest.TestCase):
     def git_bytes(source, *args):
         return subprocess.check_output(['git', '-C', str(source), *args])
 
-    def make_source(self, side, distinct=False):
+    def make_source(self, side, product):
         source = self.root / f'{side}-source'
         source.mkdir()
         self.git(source, 'init', '-q')
         self.git(source, 'config', 'user.name', 'Preflight Test')
         self.git(source, 'config', 'user.email', 'preflight@example.invalid')
-        contents = {
-            'baseline.txt': 'candidate\n' if distinct else 'baseline\n',
-            'bench/meson.build': 'baseline\n',
-            'tests/meson.build': 'baseline\n',
-            'bench/bench_util.h': 'unchanged helper\n',
-            'tests/test_perf_util.h': 'unchanged helper\n',
-            'wirelog/columnar/relation.c': 'source fixture\n',
-            '.gitignore': 'ignored-local-file\n',
-        }
-        for name, content in contents.items():
-            path = source / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding='utf-8')
-        self.git(source, 'add', '.')
-        self.git(source, 'commit', '-qm', 'upstream source fixture')
-        self.git(source, 'commit', '--allow-empty', '-qm', 'synthetic wrapper')
-        wrapper = self.git(source, 'rev-parse', 'HEAD')
-        tree = self.git(source, 'rev-parse', f'{wrapper}^{{tree}}')
-        return dict(source=source, wrapper=wrapper, tree=tree)
+        git_dir = Path(self.git(source, 'rev-parse', '--git-dir'))
+        if not git_dir.is_absolute():
+            git_dir = (source / git_dir).resolve()
+        alternates = git_dir / 'objects/info/alternates'
+        revision = PLAN['load_revision_manifest']()[0]
+        anchor = revision['anchor']['commit']
+        anchor_ref = PLAN['ANCHOR_REF']
+        self.git(source, 'fetch', '--no-tags', str(PLAN['ANCHOR_BUNDLE_PATH']), anchor_ref)
+        fetched_commit = self.git(source, 'rev-parse', 'FETCH_HEAD')
+        fetched_tree = self.git(source, 'rev-parse', 'FETCH_HEAD^{tree}')
+        if fetched_commit != anchor or fetched_tree != revision['anchor']['tree']:
+            raise AssertionError('fixture bundle differs from the pinned anchor commit/tree')
+        if alternates.exists():
+            raise AssertionError('fixture repository must not use Git object alternates')
+        self.git(source, 'cat-file', '-e', f'{anchor}^{{commit}}')
+        self.git(source, 'update-ref', 'refs/heads/fixture', anchor)
+        self.git(source, 'checkout', '-q', '--detach', anchor)
+        if product == 'post':
+            commit = self.git(source, 'commit-tree', revision['product']['post_tree'],
+                              '-p', anchor, '-m', 'synthetic product')
+            self.git(source, 'update-ref', 'refs/heads/fixture', commit)
+            self.git(source, 'checkout', '-q', '--detach', commit)
+        self.write_overlay(source)
+        return dict(source=source,
+                    commit=self.git(source, 'rev-parse', 'HEAD'),
+                    tree=self.git(source, 'rev-parse', 'HEAD^{tree}'),
+                    product=product)
 
     def write_overlay(self, source):
         contents = {
             'bench/bench_batch_append.c': '/* benchmark source */\n',
-            'bench/meson.build': 'benchmark target\n',
-            'tests/meson.build': 'benchmark smoke registration\n',
+            'bench/meson.build': 'benchmark target fixture\n',
+            'tests/meson.build': 'benchmark smoke registration fixture\n',
             'tests/test_bench_batch_append.c': '/* smoke */\n',
         }
         for name, content in contents.items():
@@ -89,14 +95,11 @@ class ExecutionPreflightTests(unittest.TestCase):
             path.write_text(content, encoding='utf-8')
         self.git(source, 'add', *PLAN['OVERLAY_PATHS'])
 
-    def make_plan(self, base, candidate, mode='comparison'):
+    def make_plan(self, base, candidate, mode='comparison', aa_product='pre'):
         args = type('Args', (), dict(
-            mode=mode, seed='execution-test-seed',
-            base_source=base['source'], base_wrapper=base['wrapper'],
-            base_upstream_tree=base['tree'],
-            candidate_source=candidate['source'],
-            candidate_wrapper=candidate['wrapper'],
-            candidate_upstream_tree=candidate['tree'],
+            mode=mode, aa_product=(aa_product if mode == 'aa_control' else None),
+            seed='execution-test-seed',
+            base_source=base['source'], candidate_source=candidate['source'],
             overlay_patch=self.overlay))()
         return PLAN['build_plan'](args)
 
@@ -206,22 +209,28 @@ class ExecutionPreflightTests(unittest.TestCase):
         self.assertFalse(any(any(str(arg) == binary for arg in command)
                              for command in invoked if isinstance(command, list)))
 
-        aa_source = self.root / 'aa-source'
-        subprocess.run(['git', 'clone', '-q', str(self.paths['base']['source']),
-                        str(aa_source)], check=True)
-        aa_wrapper = self.git(aa_source, 'rev-parse', 'HEAD')
-        aa_tree = self.git(aa_source, 'rev-parse', f'{aa_wrapper}^{{tree}}')
-        self.write_overlay(aa_source)
-        aa = dict(source=aa_source, wrapper=aa_wrapper, tree=aa_tree)
-        aa_plan = self.make_plan(self.paths['base'], aa, mode='aa_control')
-        aa_plan_path = self.root / 'aa-plan.json'
-        aa_plan_path.write_text(json.dumps(aa_plan), encoding='utf-8')
-        aa_build = self.make_build('aa', aa_source)
-        aa_artifact = M['build_artifact'](aa_plan_path, self.overlay,
-                                         self.paths['base']['build'], aa_build)
-        self.assertEqual(aa_artifact['mode'], 'aa_control')
-        self.assertEqual(aa_artifact['status'], 'not_executable')
-        self.assertTrue(aa_artifact['not_executable'])
+        for product in ('pre', 'post'):
+            aa_base = self.make_source(f'aa-{product}-base', product)
+            aa_candidate = self.make_source(f'aa-{product}-candidate', product)
+            aa_plan = self.make_plan(aa_base, aa_candidate, mode='aa_control',
+                                     aa_product=product)
+            aa_plan_path = self.root / f'aa-{product}-plan.json'
+            aa_plan_path.write_text(json.dumps(aa_plan), encoding='utf-8')
+            aa_base_build = self.make_build(f'aa-{product}-base', aa_base['source'])
+            aa_build = self.make_build(f'aa-{product}-candidate', aa_candidate['source'])
+            aa_artifact = M['build_artifact'](aa_plan_path, self.overlay,
+                                             aa_base_build, aa_build)
+            self.assertEqual(aa_artifact['mode'], 'aa_control')
+            self.assertEqual(aa_artifact['status'], 'not_executable')
+            self.assertTrue(aa_artifact['not_executable'])
+
+    def test_rejects_v2_plan(self):
+        changed = dict(self.plan)
+        changed['schema'] = 'wirelog.batch-append-plan.v2'
+        changed['schema_version'] = 2
+        self.write_plan(changed)
+        with self.assertRaisesRegex(M['PreflightError'], 'schema v3'):
+            self.artifact()
 
     def test_rejects_plan_schedule_tampering_and_helper_drift(self):
         changed = json.loads(self.plan_path.read_text(encoding='utf-8'))

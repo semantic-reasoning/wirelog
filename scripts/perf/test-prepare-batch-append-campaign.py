@@ -21,39 +21,16 @@ class PreparePlanTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.assertTrue(self.root.is_relative_to(Path.home().resolve()))
         self.overlay_paths = M['OVERLAY_PATHS']
-        self.source_data = {}
-        for side in ('base', 'candidate'):
-            source = self.root / f'{side}-source'
-            source.mkdir()
-            self.git(source, 'init', '-q')
-            self.git(source, 'config', 'user.name', 'Plan Test')
-            self.git(source, 'config', 'user.email', 'plan@example.invalid')
-            for path in ('baseline.txt', 'bench/meson.build', 'tests/meson.build',
-                         'bench/bench_util.h', 'tests/test_perf_util.h'):
-                (source / path).parent.mkdir(parents=True, exist_ok=True)
-                (source / path).write_text('baseline\n', encoding='utf-8')
-            if side == 'candidate':
-                (source / 'baseline.txt').write_text('candidate upstream\n', encoding='utf-8')
-            self.git(source, 'add', '.')
-            self.git(source, 'commit', '-qm', 'upstream fixture')
-            self.git(source, 'commit', '--allow-empty', '-qm', 'wrapper fixture')
-            wrapper = self.git(source, 'rev-parse', 'HEAD')
-            upstream_tree = self.git(source, 'rev-parse', f'{wrapper}^{{tree}}')
-            self.source_data[side] = (source, wrapper, upstream_tree)
-        for side, (source, _wrapper, _tree) in self.source_data.items():
-            self.add_overlay(source)
+        self.source_data = {'base': self.make_source('base', 'pre'),
+                            'candidate': self.make_source('candidate', 'post')}
         patch = self.root / 'overlay.patch'
-        patch.write_bytes(self.git_bytes(self.source_data['base'][0],
-                                         'diff', '--binary', self.source_data['base'][1],
+        patch.write_bytes(self.git_bytes(self.source_data['base'],
+                                         'diff', '--binary', 'HEAD',
                                          '--', *self.overlay_paths))
         self.patch = patch
         self.args = dict(mode='comparison', seed='unit-test-seed',
-                         base_source=self.source_data['base'][0],
-                         base_wrapper=self.source_data['base'][1],
-                         base_upstream_tree=self.source_data['base'][2],
-                         candidate_source=self.source_data['candidate'][0],
-                         candidate_wrapper=self.source_data['candidate'][1],
-                         candidate_upstream_tree=self.source_data['candidate'][2],
+                         base_source=self.source_data['base'],
+                         candidate_source=self.source_data['candidate'], aa_product=None,
                          overlay_patch=patch, output_dir=self.root / 'out')
 
     @staticmethod
@@ -65,11 +42,42 @@ class PreparePlanTests(unittest.TestCase):
     def git_bytes(source, *args):
         return subprocess.check_output(['git', '-C', str(source), *args])
 
+    def make_source(self, name, product):
+        source = self.root / f'{name}-source'
+        source.mkdir()
+        self.git(source, 'init', '-q')
+        self.git(source, 'config', 'user.name', 'Plan Test')
+        self.git(source, 'config', 'user.email', 'plan@example.invalid')
+        git_dir = Path(self.git(source, 'rev-parse', '--git-dir'))
+        if not git_dir.is_absolute():
+            git_dir = (source / git_dir).resolve()
+        alternates = git_dir / 'objects/info/alternates'
+        revision = M['load_revision_manifest']()[0]
+        anchor = revision['anchor']['commit']
+        anchor_ref = M['ANCHOR_REF']
+        self.git(source, 'fetch', '--no-tags', str(M['ANCHOR_BUNDLE_PATH']), anchor_ref)
+        fetched_commit = self.git(source, 'rev-parse', 'FETCH_HEAD')
+        fetched_tree = self.git(source, 'rev-parse', 'FETCH_HEAD^{tree}')
+        self.assertEqual(fetched_commit, anchor)
+        self.assertEqual(fetched_tree, revision['anchor']['tree'])
+        self.assertFalse(alternates.exists())
+        self.git(source, 'cat-file', '-e', f'{anchor}^{{commit}}')
+        self.git(source, 'update-ref', 'refs/heads/fixture', anchor)
+        self.git(source, 'checkout', '-q', '--detach', anchor)
+        if product == 'post':
+            tree = revision['product']['post_tree']
+            synthetic = self.git(source, 'commit-tree', tree, '-p', anchor,
+                                 '-m', 'synthetic product')
+            self.git(source, 'update-ref', 'refs/heads/fixture', synthetic)
+            self.git(source, 'checkout', '-q', '--detach', synthetic)
+        self.add_overlay(source)
+        return source
+
     def add_overlay(self, source):
         contents = {
             'bench/bench_batch_append.c': '/* benchmark fixture */\n',
-            'bench/meson.build': 'baseline\nbenchmark target\n',
-            'tests/meson.build': 'baseline\nsmoke test\n',
+            'bench/meson.build': 'benchmark target fixture\n',
+            'tests/meson.build': 'smoke test fixture\n',
             'tests/test_bench_batch_append.c': '/* smoke fixture */\n',
         }
         for path, text in contents.items():
@@ -121,26 +129,30 @@ class PreparePlanTests(unittest.TestCase):
             self.assertEqual(sum(row['pair_order'] == 'BA' for row in observed), 9)
         self.assertNotEqual(launches, M['schedule']('another-seed'))
 
-    def test_plan_records_wrapper_overlay_and_resulting_tree(self):
+    def test_plan_records_manifest_checkout_product_overlay_and_execution_identity(self):
         plan = self.plan()
         self.assertEqual(plan['schema'], M['SCHEMA'])
-        self.assertEqual(plan['schema_version'], 2)
+        self.assertEqual(plan['schema_version'], 3)
         self.assertEqual(plan['benchmark_output_contract'], M['OUTPUT_CONTRACT'])
         self.assertNotIn('performance_verdict', self.all_keys(plan))
         expected_hash = hashlib.sha256(self.patch.read_bytes()).hexdigest()
         self.assertEqual(plan['overlay']['sha256'], expected_hash)
-        self.assertEqual(plan['upstream']['base']['overlay_sha256'], expected_hash)
-        self.assertNotEqual(plan['upstream']['base']['measured_tree'],
-                            plan['upstream']['base']['upstream_tree'])
-        self.assertEqual(plan['upstream']['base']['wrapper_tree'],
-                         plan['upstream']['base']['wrapper_parent_tree'])
-        self.assertEqual(len(plan['upstream']['base']['wrapper_parent_commit']), 40)
-        self.assertEqual(plan['upstream']['base']['wrapper_tree'],
-                         plan['upstream']['base']['upstream_tree'])
+        self.assertEqual(plan['revision_manifest']['sha256'], M['MANIFEST_SHA256'])
+        base, candidate = plan['sources']['base'], plan['sources']['candidate']
+        self.assertEqual(base['checkout_kind'], 'direct_anchor')
+        self.assertEqual(base['checkout_commit'], plan['revision_manifest']['anchor']['commit'])
+        self.assertEqual(base['checkout_tree'], plan['revision_manifest']['product']['pre_tree'])
+        self.assertEqual(candidate['checkout_kind'], 'synthetic_product')
+        self.assertEqual(candidate['checkout_tree'], plan['revision_manifest']['product']['post_tree'])
+        self.assertEqual(base['execution_tree'], self.git(self.source_data['base'], 'write-tree'))
+        self.assertNotEqual(base['execution_tree'], base['checkout_tree'])
+        self.assertEqual(candidate['product_delta'], base['product_delta'])
+        self.assertEqual(base['product_tree'], plan['revision_manifest']['product']['pre_tree'])
+        self.assertEqual(candidate['product_tree'], plan['revision_manifest']['product']['post_tree'])
         helpers = plan['unchanged_helpers']
         self.assertEqual(tuple(helpers), M['HELPER_PATHS'])
-        self.assertEqual(plan['upstream']['base']['helper_sources'], helpers)
-        self.assertEqual(plan['upstream']['candidate']['helper_sources'], helpers)
+        self.assertEqual(base['helper_sources'], helpers)
+        self.assertEqual(candidate['helper_sources'], helpers)
         for metadata in helpers.values():
             self.assertTrue(metadata['git_blob_oid'])
             self.assertEqual(len(metadata['sha256']), 64)
@@ -159,77 +171,96 @@ class PreparePlanTests(unittest.TestCase):
                  iterations_status='starting point; unresolved until baseline calibration'),
         ])
 
-    def test_rejects_different_unchanged_helper_blobs(self):
-        source = self.root / 'different-helper-source'
-        subprocess.run(['git', 'clone', '-q', str(self.source_data['base'][0]),
-                        str(source)], check=True)
-        (source / 'bench/bench_util.h').write_text('changed helper\n', encoding='utf-8')
-        self.git(source, 'add', 'bench/bench_util.h')
-        self.git(source, 'commit', '-qm', 'different helper upstream')
-        self.git(source, 'commit', '--allow-empty', '-qm', 'wrapper fixture')
-        wrapper = self.git(source, 'rev-parse', 'HEAD')
-        tree = self.git(source, 'rev-parse', f'{wrapper}^{{tree}}')
-        self.add_overlay(source)
-        with self.assertRaisesRegex(M['PlanError'], 'helper Git blobs and SHA-256'):
-            self.plan(candidate_source=source, candidate_wrapper=wrapper,
-                      candidate_upstream_tree=tree)
-
     def test_mode_identity_is_symmetric_for_comparison_and_aa(self):
-        same_source = self.root / 'same-source'
-        subprocess.run(['git', 'clone', '-q', str(self.source_data['base'][0]), str(same_source)], check=True)
-        self.add_overlay(same_source)
-        with self.assertRaisesRegex(M['PlanError'], 'comparison requires different'):
-            self.plan(candidate_source=same_source, candidate_wrapper=self.source_data['base'][1],
-                      candidate_upstream_tree=self.source_data['base'][2])
-        aa = self.plan(mode='aa_control', candidate_source=same_source,
-                       candidate_wrapper=self.source_data['base'][1],
-                       candidate_upstream_tree=self.source_data['base'][2])
-        self.assertEqual(aa['mode'], 'aa_control')
+        for product in ('pre', 'post'):
+            base = self.make_source(f'aa-{product}-base', product)
+            candidate = self.make_source(f'aa-{product}-candidate', product)
+            aa = self.plan(mode='aa_control', aa_product=product,
+                           base_source=base, candidate_source=candidate)
+            self.assertEqual(aa['aa_product'], product)
+            self.assertEqual(aa['sources']['base']['product_tree'],
+                             aa['sources']['candidate']['product_tree'])
         comparison = self.plan()
-        self.assertNotEqual(comparison['upstream']['base']['upstream_tree'],
-                            comparison['upstream']['candidate']['upstream_tree'])
-        with self.assertRaisesRegex(M['PlanError'], 'A/A control requires identical'):
+        self.assertNotEqual(comparison['sources']['base']['product_tree'],
+                            comparison['sources']['candidate']['product_tree'])
+        with self.assertRaisesRegex(M['PlanError'], 'explicitly select'):
             self.plan(mode='aa_control')
 
     def test_rejects_mismatched_overlay_and_dirty_worktree(self):
-        source = self.source_data['candidate'][0]
+        source = self.source_data['candidate']
         (source / 'bench/meson.build').write_text('tampered\n', encoding='utf-8')
         self.git(source, 'add', 'bench/meson.build')
         with self.assertRaisesRegex(M['PlanError'], 'does not exactly match'):
             self.plan()
-        (source / 'bench/meson.build').write_text('baseline\nbenchmark target\n', encoding='utf-8')
+        (source / 'bench/meson.build').write_text('benchmark target fixture\n', encoding='utf-8')
         self.git(source, 'add', 'bench/meson.build')
         (source / 'README.local').write_text('untracked\n', encoding='utf-8')
         with self.assertRaisesRegex(M['PlanError'], 'untracked'):
             self.plan()
 
-    def test_rejects_invalid_supplied_wrapper(self):
-        with self.assertRaisesRegex(M['PlanError'], 'HEAD does not match'):
-            self.plan(base_wrapper='0' * 40)
+    def test_rejects_wrong_parent_count_and_product_tree(self):
+        revision = M['load_revision_manifest']()[0]
+        anchor = revision['anchor']['commit']
+        pre_tree = revision['product']['pre_tree']
+        post_tree = revision['product']['post_tree']
+        for case in ('wrong-parent', 'merge-parent-count', 'wrong-product-tree'):
+            source = self.make_source(f'invalid-{case}', 'post')
+            if case == 'wrong-parent':
+                intervening = self.git(source, 'commit-tree', pre_tree, '-p', anchor,
+                                       '-m', 'intervening')
+                commit = self.git(source, 'commit-tree', post_tree, '-p', intervening,
+                                  '-m', 'wrong parent')
+            elif case == 'merge-parent-count':
+                intervening = self.git(source, 'commit-tree', pre_tree, '-p', anchor,
+                                       '-m', 'second parent')
+                commit = self.git(source, 'commit-tree', post_tree, '-p', anchor,
+                                  '-p', intervening, '-m', 'merge')
+            else:
+                commit = self.git(source, 'commit-tree', pre_tree, '-p', anchor,
+                                  '-m', 'wrong product tree')
+            self.git(source, 'update-ref', 'refs/heads/fixture', commit)
+            self.git(source, 'checkout', '-q', '--force', '--detach', commit)
+            self.add_overlay(source)
+            with self.subTest(case=case), self.assertRaises(M['PlanError']):
+                self.plan(candidate_source=source)
 
-    def test_rejects_product_changing_and_merge_wrappers(self):
-        source = self.source_data['base'][0]
-        upstream_tree = self.source_data['base'][2]
-        (source / 'baseline.txt').write_text('wrapper changed product\n', encoding='utf-8')
-        self.git(source, 'add', 'baseline.txt')
-        self.git(source, 'commit', '-qm', 'invalid product wrapper')
-        product_wrapper = self.git(source, 'rev-parse', 'HEAD')
-        with self.assertRaisesRegex(M['PlanError'], 'parent tree, wrapper tree'):
-            self.plan(base_wrapper=product_wrapper, base_upstream_tree=upstream_tree)
+    def test_rejects_manifest_tamper_and_product_overlay_path_overlap(self):
+        from unittest.mock import patch
+        globals_dict = M['load_revision_manifest'].__globals__
+        with patch.dict(globals_dict, MANIFEST_SHA256='0' * 64):
+            with self.assertRaisesRegex(M['PlanError'], 'pinned hash'):
+                self.plan()
+        untracked = self.root / 'untracked-manifest.json'
+        untracked.write_bytes(M['MANIFEST_PATH'].read_bytes())
+        with patch.dict(globals_dict, MANIFEST_PATH=untracked):
+            with self.assertRaisesRegex(M['PlanError'], 'must be tracked'):
+                self.plan()
+        with patch.dict(M['load_revision_manifest'].__globals__, OVERLAY_PATHS=M['OVERLAY_PATHS'] +
+                        ('wirelog/columnar/relation.c',)):
+            with self.assertRaisesRegex(M['PlanError'], 'overlap'):
+                M['load_revision_manifest']()
 
-        merge_source = self.root / 'merge-source'
-        subprocess.run(['git', 'clone', '-q', str(self.source_data['base'][0]), str(merge_source)], check=True)
-        main_branch = self.git(merge_source, 'branch', '--show-current')
-        self.git(merge_source, 'branch', 'side', self.source_data['base'][1] + '^')
-        self.git(merge_source, 'checkout', '-q', 'side')
-        self.git(merge_source, 'commit', '--allow-empty', '-qm', 'side child')
-        self.git(merge_source, 'checkout', '-q', main_branch)
-        self.git(merge_source, 'merge', '--no-ff', '--no-edit', 'side')
-        merge_wrapper = self.git(merge_source, 'rev-parse', 'HEAD')
-        self.add_overlay(merge_source)
-        with self.assertRaisesRegex(M['PlanError'], 'exactly one parent'):
-            self.plan(base_source=merge_source, base_wrapper=merge_wrapper,
-                      base_upstream_tree=upstream_tree)
+        json_module = globals_dict['json']
+        original_loads = json_module.loads
+        def bad_paths(payload):
+            value = original_loads(payload)
+            value['product']['paths'][0] = 'wirelog/columnar/not_relation.c'
+            return value
+        with patch.object(json_module, 'loads', side_effect=bad_paths):
+            with self.assertRaisesRegex(M['PlanError'], 'identities or exact paths'):
+                M['load_revision_manifest']()
+
+        subprocess_module = globals_dict['subprocess']
+        original_run = subprocess_module.run
+        def bad_status(command, *args, **kwargs):
+            result = original_run(command, *args, **kwargs)
+            if 'diff' in command and '--name-status' in command:
+                return subprocess_module.CompletedProcess(
+                    command, 0, stdout='M\twirelog/columnar/relation.c\n', stderr='')
+            return result
+        with patch.object(subprocess_module, 'run', side_effect=bad_status):
+            with self.assertRaisesRegex(M['PlanError'], 'path/status/hash'):
+                M['load_revision_manifest']()
 
     def test_writes_durable_plan_only_to_fresh_directory(self):
         from unittest.mock import patch
