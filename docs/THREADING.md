@@ -277,7 +277,7 @@ The 64-byte padding between `tail` and `head`
 cache-line ping-pong between producer and consumer collapses
 throughput by 2-10x.
 
-### 5.3 Non-explicit atomic APIs — init and relation identity (8 rows)
+### 5.3 Init and relation identity/nonce allocators (8 rows)
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
@@ -290,13 +290,14 @@ throughput by 2-10x.
 | `relation.c:col_rel_mutation_set_nonce_allocate#2` | `wl_next_mutation_set_nonce` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Reserve a unique nonzero mutation-set nonce and retry with the observed value after a lost race; the RMW provides uniqueness without publishing payload state |
 | `relation.c:wl_columnar_relation_test_set_mutation_nonce` | `wl_next_mutation_set_nonce` | `atomic_store_explicit` | `relaxed` | Test-only seam selects allocator exhaustion or retry states before test admissions; tests do not race this reset with nonce allocation |
 
-These are the sites in `wirelog/` that use the **non-explicit** atomic APIs
-(`atomic_load`/`atomic_store`); they default to `memory_order_seq_cst`.
-The identity allocator uses the same default ordering because the CAS loop
-must reserve each relation identity without reuse; the test-only store is
-only used to exercise allocator exhaustion.
+Only the two `io_adapter.c` rows use non-explicit atomic APIs, which default
+to `memory_order_seq_cst`. The relation identity and mutation-set nonce
+allocator rows use the explicit relaxed order shown in the table: their CAS
+operations reserve unique nonwrapping values and do not publish payload state.
+The test-only stores reset allocator state before tests and do not race with
+allocation.
 
-### 5.4 `wirelog/columnar/join.c` — keyed-join cancel/budget and typed output (20 rows)
+### 5.4 `wirelog/columnar/join.c` — keyed-join cancel/budget and typed output (19 rows)
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
@@ -465,7 +466,7 @@ measured by `bench/bench_intern.c`; baselines are in `docs/INTERN_PERF.md`
 
 ### 5.12 Existing inventory total
 
-21 + 4 + 5 + 19 + 1 + 1 + 1 + 37 + 5 + 7 + 3 = **104 atomic call sites**
+21 + 4 + 8 + 19 + 2 + 2 + 3 + 37 + 5 + 7 + 3 = **111 atomic call sites**
 before the source-access contract below.
 
 ### 5.13 `wirelog/columnar/source_access.h` — relation source gate (21 rows)
@@ -560,7 +561,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#2` | `src->retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Promote a committed reservation only when the pool slot still owns it |
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
-104 + 21 + 28 = **153 atomic call sites**.
+111 + 21 + 30 = **162 atomic call sites**.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
