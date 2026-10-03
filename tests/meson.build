@@ -5954,6 +5954,18 @@ test('bench_intern_smoke', test_bench_intern_smoke_exe,
   depends: [bench_intern_exe],
 )
 
+# Batch-append benchmark smoke (Issue #2036). Timing values are never gated.
+test_bench_batch_append_smoke_exe = executable(
+  'test_bench_batch_append_smoke',
+  files('test_bench_batch_append.c'),
+  install: false,
+)
+
+test('bench_batch_append_smoke', test_bench_batch_append_smoke_exe,
+  args: [bench_batch_append_exe.full_path()],
+  depends: [bench_batch_append_exe],
+)
+
 # GC-only ownership of compound handle IDs during retained cleanup.
 test_compound_gc_hold_exe = executable(
   'test_compound_gc_hold',

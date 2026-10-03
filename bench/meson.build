@@ -194,6 +194,21 @@ bench_intern_exe = executable(
   install: false,
 )
 
+# Public batch-append mutation-set microbenchmark (Issue #2036).
+bench_batch_append_exe = executable(
+  'bench_batch_append',
+  files('bench_batch_append.c'),
+  bench_backend_src,
+  bench_evaluation_control_src,
+  files(subdir_wirelog / 'intern.c'),
+  bench_arena_src,
+  bench_thread_src,
+  bench_workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  install: false,
+)
+
 # Filter scan microbenchmark (fused vs split vs scan-only).
 #
 # Built twice so the AVX2 and scalar bodies of col_filter_select_rows can be
