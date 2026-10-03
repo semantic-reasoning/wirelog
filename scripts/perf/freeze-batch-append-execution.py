@@ -157,7 +157,88 @@ def evidence_snapshot(root):
 
 def host_identity(host):
     return {key: host[key] for key in (
-        'kernel', 'model', 'microcode', 'online_cpus', 'affinity_cpus', 'selected_cpu')}
+        'kernel', 'model', 'microcode', 'online_cpus', 'affinity_cpus', 'selected_cpu',
+        'smt_siblings')}
+
+
+def validate_host_snapshot(host, label):
+    exact_keys(host, ('timestamp_utc', 'kernel', 'online_cpus', 'affinity_cpus',
+                      'selected_cpu', 'governor', 'frequency_khz', 'model', 'microcode',
+                      'cpu_psi_some_total_usec', 'cgroup_v2_cpu', 'smt_siblings',
+                      'sibling_cpu_ticks'), label)
+    if type(host['timestamp_utc']) is not int or host['timestamp_utc'] <= 0:
+        raise FreezeError(f'{label} timestamp is invalid')
+    for key in ('kernel', 'governor', 'model', 'microcode'):
+        if type(host[key]) is not str or not host[key]:
+            raise FreezeError(f'{label} {key} is invalid')
+    for key in ('online_cpus', 'affinity_cpus', 'smt_siblings'):
+        value = host[key]
+        if type(value) is not list or any(type(cpu) is not int or cpu < 0 for cpu in value) \
+                or value != sorted(set(value)):
+            raise FreezeError(f'{label} {key} is invalid')
+    if type(host['selected_cpu']) is not int or host['selected_cpu'] not in host['online_cpus'] \
+            or host['selected_cpu'] not in host['affinity_cpus'] \
+            or host['selected_cpu'] in host['smt_siblings']:
+        raise FreezeError(f'{label} selected CPU/topology is invalid')
+    if type(host['frequency_khz']) is not int or host['frequency_khz'] <= 0:
+        raise FreezeError(f'{label} frequency is invalid')
+    if type(host['cpu_psi_some_total_usec']) is not int or host['cpu_psi_some_total_usec'] < 0:
+        raise FreezeError(f'{label} PSI counter is invalid')
+    exact_keys(host['cgroup_v2_cpu'], ('nr_throttled', 'throttled_usec'),
+               f'{label} cgroup counters')
+    if any(type(value) is not int or value < 0 for value in host['cgroup_v2_cpu'].values()):
+        raise FreezeError(f'{label} cgroup counters are invalid')
+    ticks = host['sibling_cpu_ticks']
+    if type(ticks) is not dict:
+        raise FreezeError(f'{label} SMT sibling ticks are invalid')
+    for cpu, counters in ticks.items():
+        try:
+            parsed_cpu = int(cpu)
+        except (TypeError, ValueError) as error:
+            raise FreezeError(f'{label} SMT CPU key is invalid') from error
+        if str(parsed_cpu) != cpu or parsed_cpu not in host['smt_siblings']:
+            raise FreezeError(f'{label} SMT CPU key is invalid')
+        exact_keys(counters, ('total', 'busy'), f'{label} SMT counters')
+        if any(type(value) is not int or value < 0 for value in counters.values()) \
+                or counters['busy'] > counters['total']:
+            raise FreezeError(f'{label} SMT counters are invalid')
+
+
+def validate_host_summaries(host_summary, attempts):
+    exact_keys(host_summary, ('initial', 'final'), 'calibration host summary')
+    initial, final = host_summary['initial'], host_summary['final']
+    validate_host_snapshot(initial, 'initial host summary')
+    validate_host_snapshot(final, 'final host summary')
+    snapshots = [initial]
+    for index, attempt in enumerate(attempts):
+        started, result = attempt['started'], attempt
+        before, after = started['host_before'], result['host_after']
+        validate_host_snapshot(before, f'attempt {index + 1} host-before')
+        validate_host_snapshot(after, f'attempt {index + 1} host-after')
+        snapshots.extend((before, after))
+    snapshots.append(final)
+    baseline_identity = host_identity(snapshots[0])
+    for snapshot in snapshots[1:]:
+        if host_identity(snapshot) != baseline_identity:
+            raise FreezeError('host identity or SMT topology changed across calibration')
+    if initial['timestamp_utc'] > snapshots[1]['timestamp_utc'] \
+            or final['timestamp_utc'] < snapshots[-2]['timestamp_utc']:
+        raise FreezeError('host summary timestamps do not bracket calibration attempts')
+    tick_keys = set(snapshots[0]['sibling_cpu_ticks'])
+    for previous, current in zip(snapshots, snapshots[1:]):
+        if current['timestamp_utc'] < previous['timestamp_utc']:
+            raise FreezeError('host telemetry timestamp moved backwards')
+        if current['cpu_psi_some_total_usec'] < previous['cpu_psi_some_total_usec']:
+            raise FreezeError('CPU PSI counter reset across calibration')
+        if set(current['sibling_cpu_ticks']) != tick_keys:
+            raise FreezeError('SMT sibling telemetry availability changed across calibration')
+        for key in ('nr_throttled', 'throttled_usec'):
+            if current['cgroup_v2_cpu'][key] < previous['cgroup_v2_cpu'][key]:
+                raise FreezeError(f'cgroup counter {key} reset across calibration')
+        for cpu in tick_keys:
+            for key in ('total', 'busy'):
+                if current['sibling_cpu_ticks'][cpu][key] < previous['sibling_cpu_ticks'][cpu][key]:
+                    raise FreezeError(f'SMT sibling {key} counter reset across calibration')
 
 
 def read_attempt_file(path):
@@ -236,7 +317,6 @@ def validate_calibration(plan_path, plan, plan_hash, profile_path, profile,
         raise FreezeError('calibration accepted counts must be positive integers')
     if type(artifact['attempts']) is not list or not artifact['attempts']:
         raise FreezeError('calibration artifact has no attempts')
-    exact_keys(artifact['host'], ('initial', 'final'), 'calibration host summary')
 
     expected_paths = {'calibration.json', 'private-home', 'private-tmp', 'private-bin',
                       'private-bin/bench_batch_append'}
@@ -302,6 +382,7 @@ def validate_calibration(plan_path, plan, plan_hash, profile_path, profile,
             if type(started['host_before']) is not dict:
                 raise FreezeError(f'{case} host-before telemetry is malformed')
             host_before = started['host_before']
+            validate_host_snapshot(host_before, f'{case} host-before telemetry')
             if host_before.get('selected_cpu') not in host_before.get('affinity_cpus', []) \
                     or host_before.get('selected_cpu') not in host_before.get('online_cpus', []):
                 raise FreezeError(f'{case} selected CPU was not online and allowed')
@@ -359,6 +440,7 @@ def validate_calibration(plan_path, plan, plan_hash, profile_path, profile,
                 raise FreezeError(f'{case} parsed output does not match raw benchmark stdout')
             if type(record['host_after']) is not dict:
                 raise FreezeError(f'{case} post-attempt telemetry is missing')
+            validate_host_snapshot(record['host_after'], f'{case} host-after telemetry')
             if host_identity(record['host_after']) != before_identity:
                 raise FreezeError(f'{case} host/CPU identity changed during calibration process')
             telemetry = CAL['host_eligibility'](
@@ -384,6 +466,7 @@ def validate_calibration(plan_path, plan, plan_hash, profile_path, profile,
 
     if all_attempts != artifact['attempts']:
         raise FreezeError('calibration attempts are not a canonical three-case sequence')
+    validate_host_summaries(artifact['host'], artifact['attempts'])
     actual_paths = {path.relative_to(evidence).as_posix() for path in evidence.rglob('*')}
     if actual_paths != expected_paths:
         raise FreezeError('calibration evidence directory has missing or extra files')
@@ -398,7 +481,38 @@ def validate_calibration(plan_path, plan, plan_hash, profile_path, profile,
                                  for case in CASE_NAMES})
 
 
-def validate_inputs(mode, overlay_arg, plan_paths, profile_paths, calibration_dirs):
+def validate_aa_origin(target, origin):
+    target_plan, target_profile = target['plan'], target['profile']
+    origin_plan, origin_profile = origin['plan'], origin['profile']
+    if origin_plan.get('mode') != 'comparison' or target_plan.get('mode') != 'aa_control' \
+            or target_plan.get('aa_product') != 'pre':
+        raise FreezeError('A/A calibration origin must be comparison-A and target must be A/A-pre')
+    if target_plan['revision_manifest'] != origin_plan['revision_manifest'] \
+            or target_plan['overlay'] != origin_plan['overlay'] \
+            or target_plan['unchanged_helpers'] != origin_plan['unchanged_helpers'] \
+            or target_plan['benchmark_case_contract'] != origin_plan['benchmark_case_contract'] \
+            or target_plan['benchmark_output_contract'] != origin_plan['benchmark_output_contract']:
+        raise FreezeError('A/A target differs from calibration origin manifest/overlay/helpers/contracts')
+    for side in ('base', 'candidate'):
+        source = target_plan['sources'][side]
+        if source['product_tree'] != BASE_TREE:
+            raise FreezeError('A/A target source is not the pre product tree')
+        compared = dict(source)
+        compared.pop('source_root', None)
+        expected = dict(origin_plan['sources']['base'])
+        expected.pop('source_root', None)
+        if compared != expected:
+            raise FreezeError('A/A target source provenance differs from calibration base')
+        if target_profile[side]['profile_sha256'] != origin_profile['base']['profile_sha256']:
+            raise FreezeError('A/A target normalized build profile differs from calibration origin')
+        if target_profile[side]['binary_sha256'] != origin_profile['base']['binary_sha256']:
+            raise FreezeError('A/A target binary differs from calibrated baseline binary')
+    if target_profile['profile_sha256'] != origin_profile['profile_sha256']:
+        raise FreezeError('A/A target profile fingerprint differs from calibration origin')
+
+
+def validate_inputs(mode, overlay_arg, plan_paths, profile_paths, calibration_dirs,
+                    calibration_origin=None):
     overlay = under_home(overlay_arg, 'overlay patch')
     expected_inputs = 2 if mode == 'comparison' else 1
     if len(plan_paths) != expected_inputs or len(profile_paths) != expected_inputs \
@@ -430,22 +544,47 @@ def validate_inputs(mode, overlay_arg, plan_paths, profile_paths, calibration_di
     elif mode == 'aa_control':
         if normalized[0]['plan'].get('aa_product') != 'pre':
             raise FreezeError('A/A freeze requires one explicit aa_control plan selecting pre')
+        if calibration_origin is None or len(calibration_origin) != 2 \
+                or any(value is None for value in calibration_origin):
+            raise FreezeError('A/A freeze requires exact calibration-origin plan/profile inputs')
+        origin_plan_path, origin_plan, origin_plan_hash = strict_plan(calibration_origin[0], overlay)
+        origin_profile_path, origin_profile, origin_profile_hash = profile_for_plan(
+            origin_plan_path, origin_plan, overlay, calibration_origin[1])
+        if origin_plan['mode'] != 'comparison':
+            raise FreezeError('calibration origin must be a comparison plan')
+        roots = [Path(origin_plan['sources'][side]['source_root']).resolve()
+                 for side in ('base', 'candidate')]
+        for path in (origin_plan_path, origin_profile_path):
+            try:
+                PROFILE['outside_sources'](path, roots, 'calibration origin input')
+            except PROFILE['PreflightError'] as error:
+                raise FreezeError(str(error)) from error
+        origin = dict(plan_path=origin_plan_path, plan=origin_plan,
+                      plan_sha256=origin_plan_hash, profile_path=origin_profile_path,
+                      profile=origin_profile, profile_sha256=origin_profile_hash)
+        validate_aa_origin(normalized[0], origin)
+        input_paths[str(origin_plan_path)] = origin_plan_hash
+        input_paths[str(origin_profile_path)] = origin_profile_hash
+        normalized[0]['calibration_origin'] = origin
     else:
         raise FreezeError('unsupported freeze mode')
+    calibration_owner = normalized[0]['calibration_origin'] if mode == 'aa_control' else normalized[0]
     calibration = validate_calibration(
-        normalized[0]['plan_path'], normalized[0]['plan'], normalized[0]['plan_sha256'],
-        normalized[0]['profile_path'], normalized[0]['profile'],
-        normalized[0]['profile_sha256'], overlay, calibration_dirs[0])
+        calibration_owner['plan_path'], calibration_owner['plan'], calibration_owner['plan_sha256'],
+        calibration_owner['profile_path'], calibration_owner['profile'],
+        calibration_owner['profile_sha256'], overlay, calibration_dirs[0])
     try:
         PROFILE['outside_sources'](
             Path(calibration['evidence_path']),
-            [Path(normalized[0]['plan']['sources'][side]['source_root']).resolve()
+            [Path(calibration_owner['plan']['sources'][side]['source_root']).resolve()
              for side in ('base', 'candidate')], 'command-freeze input')
     except PROFILE['PreflightError'] as error:
         raise FreezeError(str(error)) from error
     input_paths.update({str(Path(calibration['evidence_path']) / name): digest
                         for name, digest in calibration['evidence_files_sha256'].items()})
     normalized[0]['calibration'] = calibration
+    if mode == 'aa_control':
+        normalized[0]['calibration_origin']['calibration'] = calibration
     if mode == 'comparison':
         normalized[1]['calibration'] = calibration
     return overlay, normalized, input_paths
@@ -524,6 +663,13 @@ def output_path(output_arg, normalized, overlay_path=None):
     for item in normalized:
         inputs.extend((item['plan_path'], item['profile_path'],
                        Path(item['calibration']['evidence_path'])))
+        if 'calibration_origin' in item:
+            origin = item['calibration_origin']
+            inputs.extend((origin['plan_path'], origin['profile_path']))
+            inputs.extend(Path(origin['plan']['sources'][side]['source_root'])
+                          for side in ('base', 'candidate'))
+            inputs.extend(Path(origin['profile'][side]['build_root'])
+                          for side in ('base', 'candidate'))
         inputs.extend(Path(item['plan']['sources'][side]['source_root'])
                       for side in ('base', 'candidate'))
         inputs.extend(Path(item['profile'][side]['build_root']) for side in ('base', 'candidate'))
@@ -577,8 +723,11 @@ def freeze(args):
         plans = (args.plan,)
         profiles = (args.profile,)
         calibrations = (args.calibration,)
+    calibration_origin = ((args.calibration_origin_plan, args.calibration_origin_profile)
+                          if mode == 'aa_control' else None)
     overlay, normalized, input_hashes = validate_inputs(
-        mode, args.overlay_patch, plans, profiles, calibrations)
+        mode, args.overlay_patch, plans, profiles, calibrations,
+        calibration_origin=calibration_origin)
     output = output_path(args.output_dir, normalized, overlay)
     rows = command_rows(mode, normalized, output)
     artifact = dict(schema=SCHEMA, schema_version=1, status='commands_frozen', mode=mode,
@@ -592,10 +741,19 @@ def freeze(args):
                                 accepted_iteration_counts=item['calibration']['accepted_iteration_counts'])
                            for item in normalized],
                     commands=rows)
+    if mode == 'aa_control':
+        origin = normalized[0]['calibration_origin']
+        artifact['calibration_origin'] = dict(
+            plan_sha256=origin['plan_sha256'], profile_sha256=origin['profile_sha256'],
+            calibration_sha256=origin['calibration']['calibration_sha256'],
+            source_tree=origin['plan']['sources']['base']['product_tree'],
+            execution_tree=origin['plan']['sources']['base']['execution_tree'],
+            binary_sha256=origin['profile']['base']['binary_sha256'])
     if contains_verdict_key(artifact):
         raise FreezeError('command artifact must not include performance verdict fields')
     # Revalidate every input and raw evidence file immediately before publish.
-    _, _, final_hashes = validate_inputs(mode, args.overlay_patch, plans, profiles, calibrations)
+    _, _, final_hashes = validate_inputs(mode, args.overlay_patch, plans, profiles, calibrations,
+                                         calibration_origin=calibration_origin)
     if final_hashes != input_hashes:
         raise FreezeError('plan/profile/calibration inputs changed before command publication')
     artifact['input_sha256'] = final_hashes
@@ -616,6 +774,8 @@ def parser():
     result.add_argument('--plan')
     result.add_argument('--profile')
     result.add_argument('--calibration')
+    result.add_argument('--calibration-origin-plan')
+    result.add_argument('--calibration-origin-profile')
     return result
 
 
@@ -625,13 +785,17 @@ def main(argv=None):
         required = (args.plan_a, args.profile_a, args.calibration_a,
                     args.plan_b, args.profile_b)
         if any(value is None for value in required) or any(
-                value is not None for value in (args.plan, args.profile, args.calibration)):
+                value is not None for value in (args.plan, args.profile, args.calibration,
+                                                 args.calibration_origin_plan,
+                                                 args.calibration_origin_profile)):
             parser().error('comparison requires plan/profile A and B plus calibration A only')
-    elif any(value is None for value in (args.plan, args.profile, args.calibration)) \
+    elif any(value is None for value in (args.plan, args.profile, args.calibration,
+                                         args.calibration_origin_plan,
+                                         args.calibration_origin_profile)) \
             or any(value is not None for value in (
                 args.plan_a, args.profile_a, args.calibration_a,
                 args.plan_b, args.profile_b)):
-        parser().error('aa_control requires --plan/--profile/--calibration only')
+        parser().error('aa_control requires target --plan/--profile, origin plan/profile, and calibration')
     try:
         path, artifact = freeze(args)
     except (OSError, FreezeError, PROFILE['PreflightError'], PLAN['PlanError'],
