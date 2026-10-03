@@ -7,6 +7,11 @@ import subprocess
 import sys
 import tempfile
 
+if (os.environ.get("TMPDIR", "").startswith(("/tmp/", "/dev/shm/")) or
+        os.environ.get("TMPDIR") in ("/tmp", "/dev/shm", None, "")):
+    os.environ["TMPDIR"] = str(Path.home()/".tmp")
+Path(os.environ["TMPDIR"]).mkdir(parents=True, exist_ok=True)
+
 root=Path(sys.argv[1]).resolve()
 orchestrator=root/"scripts/ci/run-size-comparison.sh"
 if sys.platform != "linux":
@@ -45,14 +50,14 @@ with tempfile.TemporaryDirectory(prefix="wirelog-size-merge-fixture-") as temp_n
     run(["git","add","."],cwd=repo); run(["git","commit","-qm","base"],cwd=repo)
     base=run(["git","rev-parse","HEAD"],cwd=repo).stdout.strip()
 
-    def commit_branch(name, edit):
-        run(["git","checkout","-q","-b",name,base],cwd=repo)
+    def commit_branch(name, edit, from_base=base):
+        run(["git","checkout","-q","-b",name,from_base],cwd=repo)
         edit()
         run(["git","add","."],cwd=repo); run(["git","commit","-qm",name],cwd=repo)
         return run(["git","rev-parse","HEAD"],cwd=repo).stdout.strip()
-    def merge_commit(pr_head):
+    def merge_commit(pr_head, merge_base=base):
         tree=run(["git","rev-parse",f"{pr_head}^{{tree}}"],cwd=repo).stdout.strip()
-        return run(["git","commit-tree",tree,"-p",base,"-p",pr_head,"-m","synthetic PR merge"],cwd=repo).stdout.strip()
+        return run(["git","commit-tree",tree,"-p",merge_base,"-p",pr_head,"-m","synthetic PR merge"],cwd=repo).stdout.strip()
     def checkout_merge(merge):
         run(["git","update-ref","refs/heads/main",merge],cwd=repo)
         run(["git","checkout","-q","-f","main"],cwd=repo)
@@ -91,11 +96,41 @@ with tempfile.TemporaryDirectory(prefix="wirelog-size-merge-fixture-") as temp_n
 
     pr_growth=commit_branch("pr-growth",lambda: write_source(10100))
     merge_growth=merge_commit(pr_growth); checkout_merge(merge_growth)
-    compare(base,pr_growth,merge_growth,1)
+    compare(base,pr_growth,merge_growth,0)
     growth_report=json.loads(report.read_text(encoding="utf-8"))
     assert growth_report["status"]=="over-budget" and growth_report["head_bytes"]>growth_report["base_bytes"]
     assert growth_report["allowed_head_bytes"]==growth_report["base_bytes"]
     assert growth_report["base_sha"]==base and growth_report["head_sha"]==merge_growth
+    assert growth_report["mode"]=="advisory"
+
+    run(["git","checkout","-q","-b","enforced-base",base],cwd=repo)
+    (repo/"tests/size_policy_mode.txt").write_text("enforced\n",encoding="utf-8")
+    run(["git","add","."],cwd=repo); run(["git","commit","-qm","enforced policy"],cwd=repo)
+    enforced_base=run(["git","rev-parse","HEAD"],cwd=repo).stdout.strip()
+    enforced_growth=commit_branch("pr-enforced-growth",lambda: write_source(10100),enforced_base)
+    enforced_merge=merge_commit(enforced_growth,enforced_base); checkout_merge(enforced_merge)
+    compare(enforced_base,enforced_growth,enforced_merge,1)
+    enforced_report=json.loads(report.read_text(encoding="utf-8"))
+    assert enforced_report["mode"]=="enforced" and enforced_report["status"]=="over-budget"
+
+    def candidate_downgrades_policy():
+        (repo/"tests/size_policy_mode.txt").write_text("advisory\n",encoding="utf-8")
+        write_source(10100)
+    downgrade_head=commit_branch("pr-policy-downgrade",candidate_downgrades_policy,enforced_base)
+    downgrade_merge=merge_commit(downgrade_head,enforced_base); checkout_merge(downgrade_merge)
+    compare(enforced_base,downgrade_head,downgrade_merge,1)
+    downgrade_report=json.loads(report.read_text(encoding="utf-8"))
+    assert downgrade_report["mode"]=="enforced" and downgrade_report["status"]=="over-budget"
+
+    run(["git","checkout","-q","-b","invalid-mode-base",base],cwd=repo)
+    (repo/"tests/size_policy_mode.txt").write_text("invalid\n",encoding="utf-8")
+    run(["git","add","."],cwd=repo); run(["git","commit","-qm","invalid policy mode"],cwd=repo)
+    invalid_base=run(["git","rev-parse","HEAD"],cwd=repo).stdout.strip()
+    invalid_head=commit_branch("pr-invalid-mode",lambda: write_source(10100),invalid_base)
+    invalid_merge=merge_commit(invalid_head,invalid_base); checkout_merge(invalid_merge)
+    invalid=compare(invalid_base,invalid_head,invalid_merge,2)
+    assert "base-owned size policy mode is invalid" in invalid.stderr
+    assert not report.exists(), "invalid event-base mode must fail before policy output"
 
     def inflate_candidate_baseline():
         (repo/"tests/baseline_size.txt").write_text("999999999\n", encoding="utf-8")
@@ -122,4 +157,4 @@ with tempfile.TemporaryDirectory(prefix="wirelog-size-merge-fixture-") as temp_n
     result=compare(pr_doc,pr_inflate,merge_inflate,2)
     assert "first parent differs" in result.stderr
 
-print("test-size-comparison: exact merge, inherited debt, growth, and baseline authorization passed")
+print("test-size-comparison: exact merge, advisory and enforced growth, inherited debt, and baseline authorization passed")
