@@ -3,9 +3,13 @@
 `freeze-batch-append-execution.py` writes a provenance-bound command artifact
 without running benchmarks. Comparison mode consumes two plan-v3 files,
 their profile-v2 artifacts, and one completed calibration bound to plan/profile
-A. A/A mode
-consumes one plan/profile/calibration set and accepts only explicit
-`aa_control` product `pre`.
+A. A/A mode consumes an A/A-pre target plan/profile plus one calibration bound
+to an exact comparison-A plan/profile. The target’s base and candidate must
+both match that origin’s pre product source, overlay, helpers, contracts,
+normalized build profile, and baseline binary hash. Both target builds are
+independently revalidated. A/A commands use target binaries while reusing the
+origin calibration counts and evidence hash; the artifact records origin and
+target plan/profile hashes separately.
 
 Each profile is recomputed against its plan, source checkouts, staged overlay,
 Meson metadata, no-pending-rebuild state, and both executable binary hashes.
@@ -21,7 +25,10 @@ raw benchmark-v2 stream, recomputes PSI/cgroup/SMT eligibility, checks child
 affinity and binary identity, and confirms the complete iteration-scaling
 chain stopped at the first eligible sample of at least 250 ms. It rejects
 missing or extra evidence files and does not infer performance verdicts from
-calibration telemetry.
+calibration telemetry. It also validates complete initial/final host snapshots,
+matches stable CPU identity and SMT topology to the attempt records, and checks
+timestamps and PSI/cgroup/sibling counters for bounds and resets. Governor and
+frequency values remain informational observations.
 
 Comparison output contains exactly 216 planned commands: 108 for each plan,
 with adjacent AB or BA pairs, nine pairs of each order per case, and identical

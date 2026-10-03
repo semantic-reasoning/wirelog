@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """No-launch command-freeze provenance, calibration, and tamper tests."""
 import json
+import copy
 import os
 from pathlib import Path
 import runpy
@@ -194,20 +195,120 @@ class CommandFreezeTests(unittest.TestCase):
         candidate_build = self.fixture.make_build('aa-freeze-candidate', aa_candidate['source'])
         for build in (base_build, candidate_build):
             os.chmod(build / 'bench/bench_batch_append', 0o755)
+            (build / 'bench/bench_batch_append').write_bytes(
+                Path(self.profile_a['base']['binary_path']).read_bytes())
         profile = PROFILE['build_artifact'](plan_path, self.overlay, base_build, candidate_build)
         profile_dir = self.root / 'aa-profile'
         PROFILE['write_atomic'](profile_dir, profile)
         profile_path = profile_dir / 'execution-preflight.json'
-        cal_dir = self.make_calibration(plan_path, profile_path, 'aa-cal',
-                                       [300_000_000] * 3)
+        before = len(FakeProcess.calls)
         args = type('Args', (), dict(
             mode='aa_control', overlay_patch=self.overlay, plan=plan_path,
-            profile=profile_path, calibration=cal_dir, output_dir=self.root / 'aa-frozen'))()
+            profile=profile_path, calibration=self.cal_a,
+            calibration_origin_plan=self.plan_a_path,
+            calibration_origin_profile=self.profile_a_path,
+            output_dir=self.root / 'aa-frozen'))()
         _, artifact = FREEZER['freeze'](args)
+        _, comparison_artifact = self.freeze_comparison('aa-reuse-origin-check')
+        self.assertEqual(before, len(FakeProcess.calls))
         self.assertEqual(artifact['mode'], 'aa_control')
         self.assertEqual(artifact['aa_product'], 'pre')
         self.assertEqual(artifact['planned_command_count'], 108)
         self.assertEqual(artifact['benchmark_launches_performed'], 0)
+        self.assertEqual(artifact['calibration_origin']['plan_sha256'],
+                         FREEZER['sha256'](self.plan_a_path.read_bytes()))
+        self.assertEqual(artifact['calibration_origin']['calibration_sha256'],
+                         FREEZER['sha256']((self.cal_a / 'calibration.json').read_bytes()))
+        self.assertEqual(artifact['plans'][0]['calibration_sha256'],
+                         artifact['calibration_origin']['calibration_sha256'])
+        self.assertEqual(artifact['plans'][0]['accepted_iteration_counts'],
+                         json.loads((self.cal_a / 'calibration.json').read_text(
+                             encoding='utf-8'))['accepted_iteration_counts'])
+        self.assertEqual(artifact['calibration_origin']['calibration_sha256'],
+                         comparison_artifact['plans'][0]['calibration_sha256'])
+        self.assertEqual(artifact['plans'][0]['accepted_iteration_counts'],
+                         comparison_artifact['plans'][0]['accepted_iteration_counts'])
+
+    def test_aa_requires_exact_origin_and_rejects_target_binary_drift(self):
+        aa_base = self.fixture.make_source('aa-origin-base', 'pre')
+        aa_candidate = self.fixture.make_source('aa-origin-candidate', 'pre')
+        plan = self.fixture.make_plan(aa_base, aa_candidate, mode='aa_control', aa_product='pre')
+        plan_path = self.root / 'aa-origin-plan.json'
+        plan_path.write_text(json.dumps(plan), encoding='utf-8')
+        builds = [self.fixture.make_build('aa-origin-' + side, source['source'])
+                  for side, source in (('base', aa_base), ('candidate', aa_candidate))]
+        for build in builds:
+            binary = build / 'bench/bench_batch_append'
+            binary.write_bytes(Path(self.profile_a['base']['binary_path']).read_bytes())
+            os.chmod(binary, 0o755)
+        profile = PROFILE['build_artifact'](plan_path, self.overlay, *builds)
+        profile_dir = self.root / 'aa-origin-profile'
+        PROFILE['write_atomic'](profile_dir, profile)
+        profile_path = profile_dir / 'execution-preflight.json'
+        target_path, target_plan, target_hash = FREEZER['strict_plan'](plan_path, self.overlay)
+        _, target_profile, target_profile_hash = FREEZER['profile_for_plan'](
+            target_path, target_plan, self.overlay, profile_path)
+        _, origin_plan, origin_hash = FREEZER['strict_plan'](self.plan_a_path, self.overlay)
+        _, origin_profile, origin_profile_hash = FREEZER['profile_for_plan'](
+            self.plan_a_path, origin_plan, self.overlay, self.profile_a_path)
+        target = dict(plan=target_plan, profile=target_profile,
+                      plan_path=target_path, plan_sha256=target_hash,
+                      profile_path=profile_path, profile_sha256=target_profile_hash)
+        origin = dict(plan=origin_plan, profile=origin_profile,
+                      plan_path=self.plan_a_path, plan_sha256=origin_hash,
+                      profile_path=self.profile_a_path, profile_sha256=origin_profile_hash)
+        FREEZER['validate_aa_origin'](target, origin)
+        for label, mutate in (
+                ('source tree', lambda p: p['sources']['base'].__setitem__('product_tree', '0' * 40)),
+                ('source identity', lambda p: p['sources']['candidate'].__setitem__(
+                    'checkout_commit', '0' * 40)),
+                ('overlay', lambda p: p['overlay'].__setitem__('sha256', '0' * 64)),
+                ('helper', lambda p: p['unchanged_helpers'].__setitem__(
+                    next(iter(p['unchanged_helpers'])), '0' * 64)),
+                ('profile', lambda p: p['base'].__setitem__('profile_sha256', '0' * 64)),
+                ('binary', lambda p: p['candidate'].__setitem__('binary_sha256', '0' * 64))):
+            with self.subTest(drift=label):
+                altered = copy.deepcopy(target)
+                mutate(altered['plan'] if label in ('source tree', 'source identity',
+                                                     'overlay', 'helper')
+                       else altered['profile'])
+                with self.assertRaises(FREEZER['FreezeError']):
+                    FREEZER['validate_aa_origin'](altered, origin)
+        args = type('Args', (), dict(
+            mode='aa_control', overlay_patch=self.overlay, plan=plan_path,
+            profile=profile_path, calibration=self.cal_a,
+            calibration_origin_plan=None, calibration_origin_profile=None,
+            output_dir=self.root / 'missing-origin'))()
+        with self.assertRaisesRegex(FREEZER['FreezeError'], 'origin plan/profile'):
+            FREEZER['freeze'](args)
+        args.calibration_origin_plan = self.plan_b_path
+        args.calibration_origin_profile = self.profile_b_path
+        with self.assertRaises(FREEZER['FreezeError']):
+            FREEZER['freeze'](args)
+
+    def test_host_summary_schema_identity_timestamp_and_counters_are_reconstructed(self):
+        calibration = json.loads((self.cal_a / 'calibration.json').read_text(encoding='utf-8'))
+        original_host = calibration['host']
+        attempts = calibration['attempts']
+        mutations = (
+            ('host identity', lambda host: host['initial'].__setitem__('model', 'tampered')),
+            ('SMT topology', lambda host: host['final'].__setitem__('smt_siblings', [99])),
+            ('required schema', lambda host: host['initial'].pop('cgroup_v2_cpu')),
+            ('timestamps', lambda host: host['initial'].__setitem__('timestamp_utc', 2)),
+            ('final timestamp', lambda host: host['final'].__setitem__('timestamp_utc', 0)),
+            ('counter reset', lambda host: host['final'].__setitem__(
+                'cpu_psi_some_total_usec', host['initial']['cpu_psi_some_total_usec'] - 1)),
+            ('cgroup reset', lambda host: host['final']['cgroup_v2_cpu'].__setitem__(
+                'nr_throttled', host['initial']['cgroup_v2_cpu']['nr_throttled'] - 1)),
+            ('sibling reset', lambda host: host['final']['sibling_cpu_ticks']['1'].__setitem__(
+                'total', host['initial']['sibling_cpu_ticks']['1']['total'] - 1)),
+        )
+        for expected, mutate in mutations:
+            with self.subTest(expected=expected):
+                host = copy.deepcopy(original_host)
+                mutate(host)
+                with self.assertRaises(FREEZER['FreezeError']):
+                    FREEZER['validate_host_summaries'](host, attempts)
 
     def test_rejects_aa_post_and_output_overlaps(self):
         aa_base = self.fixture.make_source('aa-post-base', 'post')
