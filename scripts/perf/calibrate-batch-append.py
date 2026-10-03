@@ -303,7 +303,7 @@ def validate_bound_inputs(plan_path, profile_path, overlay_path,
         profile_raw = Path(profile_path).read_bytes()
         if sha256(profile_raw) != expected_profile_hash:
             raise CalibrationError('profile artifact changed during calibration')
-        profile = load_json(profile_path)
+        profile = load_json(Path(profile_path))
         if type(profile) is not dict or profile.get('schema') != PROFILE_SCHEMA \
                 or profile.get('status') != 'not_executable' \
                 or profile.get('not_executable') is not True:

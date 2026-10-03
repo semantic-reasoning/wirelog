@@ -239,6 +239,17 @@ class CalibrationTests(unittest.TestCase):
             stderr = path.parent / attempt['stderr_path']
             self.assertEqual(CAL['sha256'](stderr.read_bytes()), attempt['stderr_sha256'])
 
+    def test_calibrate_accepts_string_paths_from_cli(self):
+        FakeProcess.next_outputs = [150_000_000, 300_000_000, 280_000_000, 260_000_000]
+        output = self.evidence_dir('string-paths')
+        path, artifact = CAL['calibrate'](
+            str(self.plan_path), str(self.profile_path), str(self.overlay), str(output),
+            timeout_seconds=5, probe=FakeProbe(), popen_factory=FakeProcess,
+            affinity_getter=lambda _pid: {0})
+        self.assertEqual(len(artifact['accepted_iteration_counts']), 3)
+        self.assertEqual(artifact['candidate_launches'], 0)
+        self.assertTrue(path.is_file())
+
     def test_under_threshold_stops_after_six_attempts_without_artifact(self):
         FakeProcess.next_outputs = [100_000_000] * 18
         with self.assertRaisesRegex(CAL['CalibrationError'], 'did not reach'):
