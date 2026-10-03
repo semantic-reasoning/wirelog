@@ -2904,6 +2904,163 @@ test_view_generation_headroom_reserved(void)
     PASS();
 }
 
+/* ================================================================
+ * Issue #2057: delta_out's view generation advances once per emitted row
+ * (col_rel_append_row_locked) and once more when a failure rolls the
+ * emission back.  Every such advance is reserved before delta_out is first
+ * mutated, so exhaustion is refused with EOVERFLOW instead of saturating
+ * delta_out's view generation behind a successful return.
+ * ================================================================ */
+typedef struct do_snapshot {
+    uint32_t nrows;
+    uint32_t capacity;
+    uint64_t view_generation;
+    uint64_t storage_generation;
+} do_snapshot_t;
+
+static void
+do_snapshot_take(const col_rel_t *rel, do_snapshot_t *s)
+{
+    memset(s, 0, sizeof(*s));
+    s->nrows = rel->nrows;
+    s->capacity = rel->capacity;
+    s->view_generation = rel->view_generation;
+    s->storage_generation = rel->storage_generation;
+}
+
+/* Refused with delta_count valid advances left on delta_out, then succeeds
+ * with delta_count + 1, advancing delta_out once per novel row. */
+static bool
+do_case_run(const int64_t *delta, uint32_t ndelta, uint32_t nnovel,
+    int expected_fast, const char **why)
+{
+    col_rel_t *rel = test_rel_alloc(1);
+    col_rel_t *delta_out = test_rel_alloc(1);
+    vh_snapshot_t rel_before, rel_after;
+    do_snapshot_t out_before, out_after;
+    int fast_path = -1;
+    bool ok = false;
+
+    *why = "delta_out headroom fixture";
+    if (!rel || !delta_out || !vh_build_base(rel, VH_ONE_RUN))
+        goto done;
+    for (uint32_t i = 0; i < ndelta; i++) {
+        if (test_rel_append_row(rel, &delta[i]) != 0)
+            goto done;
+    }
+
+    delta_out->view_generation
+        = WL_COLUMNAR_REL_GENERATION_INVALID - (ndelta + 1u);
+    vh_snapshot_take(rel, &rel_before);
+    do_snapshot_take(delta_out, &out_before);
+    *why = "delta_out view exhaustion must be refused with EOVERFLOW";
+    if (col_op_consolidate_incremental_delta(rel, 32u, delta_out,
+        &fast_path) != EOVERFLOW || fast_path != -1)
+        goto done;
+    vh_snapshot_take(rel, &rel_after);
+    do_snapshot_take(delta_out, &out_after);
+    *why = "refused call must leave rel and delta_out unchanged";
+    if (memcmp(&rel_before, &rel_after, sizeof(rel_before)) != 0
+        || memcmp(&out_before, &out_after, sizeof(out_before)) != 0)
+        goto done;
+
+    uint64_t pinned = WL_COLUMNAR_REL_GENERATION_INVALID - 2u - ndelta;
+    delta_out->view_generation = pinned;
+    *why = "retry with the reserved headroom must succeed";
+    if (col_op_consolidate_incremental_delta(rel, 32u, delta_out,
+        &fast_path) != 0 || fast_path != expected_fast)
+        goto done;
+    *why = "retry must emit the novel rows, one view advance each";
+    if (delta_out->nrows != nnovel
+        || delta_out->view_generation != pinned + nnovel
+        || !wl_columnar_relation_generation_valid(
+            delta_out->view_generation))
+        goto done;
+    ok = true;
+
+done:
+    test_rel_free(delta_out);
+    test_rel_free(rel);
+    return ok;
+}
+
+static void
+test_delta_out_view_headroom_reserved(void)
+{
+    TEST("delta_out view-generation advances are reserved (#2057)");
+
+    static const int64_t fast[] = { 400, 500, 600 };
+    static const int64_t binary[] = { 15, 25 };
+    static const int64_t binary_dup[] = { 10, 15 };
+    static const int64_t fallback[] = { 25, 5, 15 };
+    const char *why = NULL;
+
+    ASSERT(do_case_run(fast, 3, 3, 1, &why), why);
+    ASSERT(do_case_run(binary, 2, 2, 0, &why), why);
+    ASSERT(do_case_run(binary_dup, 2, 1, 0, &why), why);
+    ASSERT(do_case_run(fallback, 3, 3, 0, &why), why);
+    PASS();
+}
+
+/* A failure after emission rolls delta_out back with one more view
+ * advance.  With one valid advance left (the emission's), the call is
+ * refused up front; with two (the rollback's too), the late compaction
+ * denial returns ENOMEM and leaves delta_out's view generation valid. */
+static void
+test_delta_out_rollback_headroom_reserved(void)
+{
+    TEST("delta_out rollback advance is reserved (#2057)");
+
+    static const uint64_t headroom[] = { 1u, 2u };
+    for (uint32_t h = 0; h < 2; h++) {
+        col_rel_t *rel = test_rel_alloc(1);
+        col_rel_t *delta_out = test_rel_alloc(1);
+        wl_columnar_memory_governor_ref_t *ref
+            = test_shared_compaction_governor_create(1u << 20);
+        ASSERT(rel && delta_out && ref, "rollback headroom relations");
+        ASSERT(build_eight_run_owner(rel)
+            && col_rel_attach_memory_governor(rel, ref) == 0,
+            "governed eight-run relation");
+        wl_columnar_memory_governor_t *governor
+            = wl_columnar_memory_governor_ref_get(ref);
+        atomic_store_explicit(&governor->usable_bytes,
+            wl_columnar_memory_reserved(governor), memory_order_release);
+
+        uint64_t pinned = WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+            - headroom[h];
+        delta_out->view_generation = pinned;
+        do_snapshot_t out_before, out_after;
+        do_snapshot_take(delta_out, &out_before);
+        uint32_t nrows = rel->nrows;
+        uint32_t run_count = rel->run_count;
+        uint64_t rel_view = rel->view_generation;
+        int fast_path = -1;
+        int rc = col_op_consolidate_incremental_delta(rel, 39u, delta_out,
+                &fast_path);
+        do_snapshot_take(delta_out, &out_after);
+        if (h == 0) {
+            ASSERT(rc == EOVERFLOW && fast_path == -1
+                && memcmp(&out_before, &out_after, sizeof(out_before)) == 0
+                && rel->nrows == nrows,
+                "emission plus rollback without headroom is refused");
+        } else {
+            ASSERT(rc == ENOMEM && fast_path == -1 && delta_out->nrows == 0
+                && rel->nrows == nrows && rel->run_count == run_count
+                && rel->view_generation == rel_view,
+                "late compaction denial rolls delta_out back");
+            ASSERT(delta_out->view_generation == pinned + 2u
+                && wl_columnar_relation_generation_valid(
+                    delta_out->view_generation),
+                "rollback consumes the reserved advance without saturating");
+        }
+
+        test_rel_free(delta_out);
+        test_rel_free(rel);
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+    PASS();
+}
+
 /* ----------------------------------------------------------------
  * main
  * ---------------------------------------------------------------- */
@@ -2952,6 +3109,10 @@ main(void)
 
     /* View-generation headroom (Issue #2049) */
     test_view_generation_headroom_reserved();
+
+    /* delta_out view-generation headroom (Issue #2057) */
+    test_delta_out_view_headroom_reserved();
+    test_delta_out_rollback_headroom_reserved();
 #ifdef WL_TEST_CONSOLIDATE_HOOK
     test_sort_hook_scope_follows_the_deferred_alias();
     test_shared_source_reader_excluded_through_sort();

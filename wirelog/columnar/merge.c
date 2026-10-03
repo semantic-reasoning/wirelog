@@ -2586,6 +2586,17 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     if (delta_out) {
         uint32_t delta_count = rel->nrows > old_nrows
             ? rel->nrows - old_nrows : 0;
+        /* Reserve delta_out's view-generation advances before its first
+         * mutation (Issue #2057): each emitted row is a locked append that
+         * advances the view once, at most delta_count of them, and a
+         * failure after emission rolls delta_out back with one more. */
+        if (delta_count > 0
+            && delta_out->view_generation
+            >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+            - (uint64_t)delta_count) {
+            rc = EOVERFLOW;
+            goto cleanup;
+        }
         rc = col_rel_reserve_rows_locked(delta_out, delta_count,
                 delta_writer_ptr, &delta_alias_release_pending);
         if (rc != 0)
