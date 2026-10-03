@@ -25,6 +25,36 @@
  * which has no C11 atomics in its default C mode.  Relaxed ordering is
  * sufficient: the counter only has to hand out distinct values. */
 static wl_atomic_u64 wl_next_relation_identity = 1u;
+static wl_atomic_u64 wl_next_mutation_set_nonce = 1u;
+
+#ifdef WL_TEST_MUTATION_SET_HOOK
+void
+wl_columnar_relation_test_set_mutation_nonce(uint64_t next_nonce)
+{
+    atomic_store_explicit(&wl_next_mutation_set_nonce, next_nonce,
+        memory_order_relaxed);
+}
+#endif
+
+static int
+col_rel_mutation_set_nonce_allocate(uint64_t *nonce)
+{
+    uint64_t observed;
+    if (!nonce)
+        return EINVAL;
+    observed = atomic_load_explicit(&wl_next_mutation_set_nonce,
+            memory_order_relaxed);
+    for (;;) {
+        if (observed == 0 || observed == UINT64_MAX)
+            return EOVERFLOW;
+        uint64_t desired = observed + 1u;
+        if (atomic_compare_exchange_weak_explicit(&wl_next_mutation_set_nonce,
+            &observed, desired, memory_order_relaxed, memory_order_relaxed)) {
+            *nonce = observed;
+            return 0;
+        }
+    }
+}
 
 #ifdef WL_TEST_APPEND_HOOK
 wl_columnar_append_transition_hook_t wl_columnar_append_transition_hook;
@@ -484,6 +514,7 @@ col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
         return EOVERFLOW;
     max_owners = role_count * 2u;
     if (!set || set->identity || set->roles || set->descriptors ||
+        set->acquisition_nonce ||
         set->owners || set->leases
         || set->initializations || set->descriptor_count || set->owner_count
         || set->lease_count || set->initialization_count
@@ -525,7 +556,8 @@ col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
             && roles[i].role_flags != WL_COLUMNAR_RELATION_METADATA_DETACH)
             || descriptors[i].relation
             || !col_rel_mutation_writer_inert(&descriptors[i].writer)
-            || leases[i].identity || leases[i].set || leases[i].relation
+            || leases[i].identity || leases[i].acquisition_nonce
+            || leases[i].set || leases[i].relation
             || leases[i].owner || leases[i].descriptor_slot
             || leases[i].owner_slot || leases[i].self_owner_slot
             || leases[i].relation_identity
@@ -542,7 +574,12 @@ col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
         if (owners[i].owner
             || !col_rel_mutation_writer_inert(&owners[i].writer))
             return EINVAL;
+    uint64_t acquisition_nonce;
+    rc = col_rel_mutation_set_nonce_allocate(&acquisition_nonce);
+    if (rc)
+        return rc;
     set->identity = (uintptr_t)set;
+    set->acquisition_nonce = acquisition_nonce;
     set->roles = roles;
     set->descriptors = descriptors;
     set->owners = owners;
@@ -616,6 +653,7 @@ col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
         }
         wl_columnar_relation_mutation_lease_t *lease = &leases[i];
         lease->set = set;
+        lease->acquisition_nonce = set->acquisition_nonce;
         lease->relation = relation;
         lease->owner = owner;
         lease->role_flags = roles[i].role_flags;
@@ -708,11 +746,14 @@ col_rel_mutation_lease_validate(
     const col_rel_t *expected_relation)
 {
     if (!lease || lease->identity != (uintptr_t)lease || !lease->set
+        || !lease->acquisition_nonce
         || !expected_relation || lease->relation != expected_relation
         || lease->detached)
         return EINVAL;
     const wl_columnar_relation_mutation_set_t *set = lease->set;
-    if (set->identity != (uintptr_t)set || !set->roles || !set->leases ||
+    if (set->identity != (uintptr_t)set || !set->acquisition_nonce
+        || lease->acquisition_nonce != set->acquisition_nonce
+        || !set->roles || !set->leases ||
         !set->descriptors
         || !set->owners || set->descriptors_acquired != set->descriptor_count
         || set->owners_acquired != set->owner_count
@@ -10730,6 +10771,248 @@ wl_columnar_radix_lease_preflight(col_rel_t *r, uint32_t start,
         || (r->col_shared && r->storage_generation
         >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)))
         return EOVERFLOW;
+    return 0;
+}
+
+void
+wl_columnar_relation_radix_sequence_destroy(
+    wl_columnar_relation_radix_sequence_t *sequence)
+{
+    if (!sequence)
+        return;
+    free(sequence->boundaries);
+    free(sequence->needs_sort);
+    if (sequence->metadata_admission_active)
+        (void)wl_columnar_memory_release(&sequence->metadata_admission);
+    wl_columnar_radix_workspace_destroy(&sequence->workspace);
+    memset(sequence, 0, sizeof(*sequence));
+}
+
+static bool
+wl_columnar_memory_reservation_inert(
+    const wl_columnar_memory_reservation_t *reservation)
+{
+    return reservation && !reservation->governor && !reservation->bytes
+           && !reservation->replacement_bytes && !reservation->transition_kind
+           && !atomic_load_explicit(&reservation->owner_bits,
+               memory_order_relaxed)
+           && !atomic_load_explicit(&reservation->state, memory_order_relaxed)
+           && !reservation->identity;
+}
+
+static bool
+wl_columnar_radix_workspace_inert(const wl_columnar_radix_workspace_t *w)
+{
+    return w && !w->perm_a && !w->perm_b && !w->bucket_values
+           && !w->byte_values && !w->short_values && !w->count16
+           && !w->temp_column && !w->insertion_rows && !w->timestamps
+           && !w->timestamp_capacity && !w->k8_capacity && !w->k16_capacity
+           && !w->insertion_capacity && !w->insertion_bytes
+           && !w->prepared_relation && !w->prepared_identity
+           && !w->prepared_view_generation && !w->prepared_storage_generation
+           && !w->prepared_type_fingerprint && !w->prepared_start
+           && !w->prepared_count && !w->prepared_nrows && !w->prepared_ncols
+           && !w->prepared_capacity && !w->prepared_timestamp_capacity
+           && !w->prepared_has_timestamps && !w->prepared_has_types
+           && !w->admission_active
+           && wl_columnar_memory_reservation_inert(&w->admission);
+}
+
+int
+wl_columnar_relation_radix_sequence_prepare_with_lease(col_rel_t *r,
+    const uint32_t *bounds, uint32_t seg_count,
+    wl_columnar_relation_radix_sequence_t *sequence,
+    wl_columnar_relation_mutation_lease_t *lease)
+{
+    int rc;
+    size_t boundary_count, boundary_bytes, mask_bytes;
+    uint64_t extra;
+    if (!sequence || sequence->identity || sequence->acquisition_nonce
+        || sequence->set || sequence->lease || sequence->relation
+        || sequence->owner || sequence->relation_identity
+        || sequence->relation_generation || sequence->owner_identity
+        || sequence->owner_generation || sequence->view_generation
+        || sequence->type_fingerprint || sequence->columns
+        || sequence->column_types || sequence->timestamps || sequence->nrows
+        || sequence->ncols || sequence->capacity || sequence->timestamp_capacity
+        || sequence->boundaries || sequence->needs_sort || sequence->seg_count
+        || sequence->needs_sort_count || sequence->metadata_admission_active
+        || !wl_columnar_memory_reservation_inert(
+            &sequence->metadata_admission)
+        || sequence->prepared || sequence->consumed
+        || !wl_columnar_radix_workspace_inert(&sequence->workspace))
+        return EINVAL;
+    if (!r || !bounds || !seg_count)
+        return EINVAL;
+    if (seg_count == UINT32_MAX)
+        return EOVERFLOW;
+#if SIZE_MAX <= UINT32_MAX
+    if (seg_count > SIZE_MAX / sizeof(uint32_t) - 1u)
+        return EOVERFLOW;
+#endif
+    rc = wl_columnar_radix_lease_preflight(r, 0, 0, lease);
+    if (rc)
+        return rc;
+    boundary_count = (size_t)seg_count + 1u;
+    if (boundary_count > SIZE_MAX / sizeof(uint32_t))
+        return EOVERFLOW;
+    boundary_bytes = boundary_count * sizeof(uint32_t);
+    mask_bytes = (size_t)seg_count * sizeof(uint8_t);
+    if (boundary_bytes > UINT64_MAX - (uint64_t)mask_bytes)
+        return EOVERFLOW;
+    extra = (uint64_t)boundary_bytes + (uint64_t)mask_bytes;
+    for (uint32_t i = 0; i < seg_count; i++)
+        if (bounds[i] > bounds[i + 1] || bounds[i + 1] > r->nrows)
+            return EINVAL;
+    uint32_t needs_sort_count = 0;
+    for (uint32_t i = 0; i < seg_count; i++) {
+        uint32_t start = bounds[i];
+        uint32_t end = bounds[i + 1];
+        bool sorted = end - start <= 1u;
+        if (!sorted) {
+            sorted = true;
+            for (uint32_t row = start + 1u; row < end; row++)
+                if (col_rel_row_cmp(r, row - 1u, row) > 0) {
+                    sorted = false;
+                    break;
+                }
+        }
+        needs_sort_count += !sorted;
+    }
+    if (needs_sort_count
+        && (r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID
+        - needs_sort_count
+        || (r->col_shared && r->storage_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)))
+        return EOVERFLOW;
+    if (needs_sort_count && r->col_shared && lease->storage_transitioned)
+        return EINVAL;
+    if (r->memory_governor && extra) {
+        wl_columnar_memory_reservation_init(&sequence->metadata_admission);
+        wl_columnar_memory_admission_status_t status
+            = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(r->memory_governor),
+                extra, &sequence->metadata_admission);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                r->memory_budget_denial_pending = true;
+            wl_columnar_relation_radix_sequence_destroy(sequence);
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOMEM
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : EINVAL;
+        }
+        sequence->metadata_admission_active = true;
+    }
+    sequence->boundaries = malloc(boundary_bytes);
+    sequence->needs_sort = calloc(seg_count, sizeof(*sequence->needs_sort));
+    if (!sequence->boundaries || !sequence->needs_sort) {
+        wl_columnar_relation_radix_sequence_destroy(sequence);
+        return ENOMEM;
+    }
+    memcpy(sequence->boundaries, bounds, boundary_bytes);
+    sequence->seg_count = seg_count;
+    sequence->needs_sort_count = needs_sort_count;
+    for (uint32_t i = 0; i < seg_count; i++) {
+        uint32_t start = sequence->boundaries[i];
+        uint32_t end = sequence->boundaries[i + 1];
+        if (end - start <= 1u)
+            continue;
+        for (uint32_t row = start + 1u; row < end; row++)
+            if (col_rel_row_cmp(r, row - 1u, row) > 0) {
+                sequence->needs_sort[i] = 1u;
+                break;
+            }
+    }
+    rc = wl_columnar_relation_radix_workspace_prepare(r,
+            sequence->boundaries, seg_count, 0, &sequence->workspace, true);
+    if (rc) {
+        wl_columnar_relation_radix_sequence_destroy(sequence);
+        return rc;
+    }
+    sequence->set = lease->set;
+    sequence->lease = lease;
+    sequence->relation = r;
+    sequence->owner = lease->owner;
+    sequence->acquisition_nonce = lease->acquisition_nonce;
+    sequence->relation_identity = r->relation_identity;
+    sequence->relation_generation = r->storage_generation;
+    sequence->owner_identity = lease->owner_identity;
+    sequence->owner_generation = lease->owner_generation;
+    sequence->view_generation = r->view_generation;
+    sequence->type_fingerprint = wl_columnar_radix_type_fingerprint(r);
+    sequence->columns = (const int64_t *const *)r->columns;
+    sequence->column_types = r->column_types;
+    sequence->timestamps = r->timestamps;
+    sequence->nrows = r->nrows;
+    sequence->ncols = r->ncols;
+    sequence->capacity = r->capacity;
+    sequence->timestamp_capacity = r->timestamp_capacity;
+    sequence->identity = (uintptr_t)sequence;
+    sequence->prepared = true;
+    return 0;
+}
+
+int
+wl_columnar_relation_radix_sequence_execute_with_lease(
+    wl_columnar_relation_radix_sequence_t *sequence,
+    wl_columnar_relation_mutation_lease_t *lease)
+{
+    if (!sequence || sequence->identity != (uintptr_t)sequence
+        || !sequence->prepared || sequence->consumed || !lease
+        || !sequence->set || !lease->set
+        || sequence->lease != lease || sequence->set != lease->set
+        || sequence->acquisition_nonce != lease->acquisition_nonce
+        || sequence->relation != lease->relation
+        || lease->set->acquisition_nonce != sequence->acquisition_nonce
+        || col_rel_mutation_lease_validate(lease, sequence->relation))
+        return EINVAL;
+    col_rel_t *r = sequence->relation;
+    if (r->relation_identity != sequence->relation_identity
+        || r->storage_generation != sequence->relation_generation
+        || r->view_generation != sequence->view_generation
+        || lease->owner != sequence->owner
+        || lease->owner_identity != sequence->owner_identity
+        || lease->owner_generation != sequence->owner_generation
+        || r->columns != (int64_t **)sequence->columns
+        || r->column_types != sequence->column_types
+        || r->timestamps != sequence->timestamps
+        || r->nrows != sequence->nrows || r->ncols != sequence->ncols
+        || r->capacity != sequence->capacity
+        || r->timestamp_capacity != sequence->timestamp_capacity
+        || wl_columnar_radix_type_fingerprint(r) != sequence->type_fingerprint)
+        return EINVAL;
+    if (!sequence->needs_sort_count) {
+        sequence->consumed = true;
+        return 0;
+    }
+    for (uint32_t i = 0; i < sequence->seg_count; i++) {
+        if (!sequence->needs_sort[i])
+            continue;
+        uint32_t count = sequence->boundaries[i + 1]
+            - sequence->boundaries[i];
+        int rc = wl_columnar_relation_radix_workspace_validate(r, count,
+                &sequence->workspace);
+        if (rc)
+            return rc;
+    }
+    if (r->col_shared) {
+        int rc = col_rel_cow_unshare_publish_impl(r, 0, false, false, NULL,
+                lease);
+        if (rc)
+            return rc;
+    }
+    sequence->consumed = true;
+    for (uint32_t i = 0; i < sequence->seg_count; i++) {
+        if (!sequence->needs_sort[i])
+            continue;
+        int rc = wl_columnar_radix_rows_prepared(r,
+                sequence->boundaries[i], sequence->boundaries[i + 1]
+                - sequence->boundaries[i], &sequence->workspace,
+                r->timestamps ? sequence->workspace.timestamps : NULL);
+        if (rc)
+            abort();
+    }
     return 0;
 }
 
