@@ -11002,10 +11002,11 @@ wl_columnar_relation_radix_sequence_execute_with_lease(
         if (rc)
             return rc;
     }
-    sequence->consumed = true;
     for (uint32_t i = 0; i < sequence->seg_count; i++) {
         if (!sequence->needs_sort[i])
             continue;
+        lease->set->published = true;
+        sequence->consumed = true;
         int rc = wl_columnar_radix_rows_prepared(r,
                 sequence->boundaries[i], sequence->boundaries[i + 1]
                 - sequence->boundaries[i], &sequence->workspace,
