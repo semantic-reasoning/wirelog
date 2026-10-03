@@ -6347,7 +6347,7 @@ typedef struct {
     wl_columnar_relation_mutation_set_t set;
     wl_columnar_relation_mutation_role_t role;
     wl_columnar_relation_mutation_descriptor_t descriptor;
-    wl_columnar_relation_mutation_owner_t owner;
+    wl_columnar_relation_mutation_owner_t owners[2];
     wl_columnar_relation_mutation_lease_t lease;
     wl_columnar_relation_mutation_initialization_t initialization;
 } radix_test_lease_t;
@@ -6358,7 +6358,7 @@ radix_test_acquire(col_rel_t *rel, radix_test_lease_t *held)
     held->role = (wl_columnar_relation_mutation_role_t){ rel,
                                                          WL_COLUMNAR_RELATION_PAYLOAD_MUTATION };
     return col_rel_mutation_set_acquire(&held->set, &held->role, 1,
-               &held->descriptor, 1, &held->owner, 1, &held->lease, 1,
+               &held->descriptor, 1, held->owners, 2, &held->lease, 1,
                &held->initialization, 1);
 }
 
@@ -6905,7 +6905,7 @@ test_radix_exact_authority_and_shape(void)
         "radix real same-shape foreign preparation is refused");
     wl_columnar_radix_workspace_destroy(&foreign_workspace);
     wl_columnar_source_access_writer_t writer_copy = held.descriptor.writer;
-    held.descriptor.writer = held.owner.writer;
+    held.descriptor.writer = held.owners[held.lease.owner_slot].writer;
     CHECK(wl_columnar_relation_radix_sort_with_lease(rel, 1, 70, &workspace,
         &held.lease) == EINVAL,
         "radix copied foreign descriptor token rejected");
