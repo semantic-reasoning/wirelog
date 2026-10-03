@@ -1964,6 +1964,17 @@ col_rel_reserve_merge_grid(col_rel_t *r, uint32_t capacity)
     return 0;
 }
 
+int
+col_rel_reserve_merge_grid_with_lease(col_rel_t *r, uint32_t capacity,
+    wl_columnar_relation_mutation_lease_t *lease)
+{
+    if (!r || !lease || lease->role_flags
+        != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+        || col_rel_mutation_lease_validate(lease, r))
+        return EINVAL;
+    return col_rel_reserve_merge_grid(r, capacity);
+}
+
 static void
 col_rel_release_reservation_or_abort(
     wl_columnar_memory_reservation_t *reservation)
@@ -2604,6 +2615,17 @@ col_rel_cow_unshare(col_rel_t *r, uint32_t new_cap)
             &single.lease);
     int finish_rc = col_rel_mutation_set_finish(&single.set, rc == 0);
     return rc ? rc : finish_rc;
+}
+
+int
+col_rel_cow_unshare_with_lease(col_rel_t *r,
+    wl_columnar_relation_mutation_lease_t *lease)
+{
+    if (!r || !lease || lease->role_flags
+        != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+        || col_rel_mutation_lease_validate(lease, r))
+        return EINVAL;
+    return col_rel_cow_unshare_publish_impl(r, 0, false, false, NULL, lease);
 }
 
 static int
@@ -4797,6 +4819,18 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
 }
 
 int
+col_rel_append_row_with_lease(col_rel_t *r, const int64_t *row,
+    wl_columnar_relation_mutation_lease_t *lease)
+{
+    if (!r || !row || !lease || lease->role_flags
+        != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+        || col_rel_mutation_lease_validate(lease, r))
+        return EINVAL;
+    return col_rel_append_row_impl(r, row,
+               &lease->set->owners[lease->owner_slot].writer, true, lease);
+}
+
+int
 col_rel_append_row_locked(col_rel_t *r, const int64_t *row,
     wl_columnar_source_access_writer_t *writer)
 {
@@ -5181,6 +5215,18 @@ col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
 {
     return wl_columnar_relation_reserve_rows_impl(r, additional, writer,
                out_alias_release_pending, true, NULL);
+}
+
+int
+col_rel_reserve_rows_with_lease(col_rel_t *r, uint32_t additional,
+    wl_columnar_relation_mutation_lease_t *lease)
+{
+    if (!r || !lease || lease->role_flags
+        != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+        || col_rel_mutation_lease_validate(lease, r))
+        return EINVAL;
+    return wl_columnar_relation_reserve_rows_impl(r, additional, NULL, NULL,
+               false, lease);
 }
 
 int
@@ -10711,10 +10757,10 @@ wl_columnar_relation_radix_workspace_prepare_with_lease(col_rel_t *r,
                workspace, false);
 }
 
-int
-wl_columnar_relation_radix_sort_with_lease(col_rel_t *r, uint32_t start,
+static int
+wl_columnar_relation_radix_sort_with_lease_impl(col_rel_t *r, uint32_t start,
     uint32_t count, const wl_columnar_radix_workspace_t *workspace,
-    wl_columnar_relation_mutation_lease_t *lease)
+    wl_columnar_relation_mutation_lease_t *lease, bool consolidation_hook)
 {
     int rc = wl_columnar_radix_lease_preflight(r, start, count, lease);
     if (rc)
@@ -10746,6 +10792,14 @@ wl_columnar_relation_radix_sort_with_lease(col_rel_t *r, uint32_t start,
         rc = col_rel_cow_unshare_publish_impl(r, 0, false, false, NULL, lease);
         if (rc)
             return rc;
+#ifdef WL_TEST_CONSOLIDATE_HOOK
+        if (consolidation_hook
+            && wl_columnar_consolidation_transition_hook)
+            wl_columnar_consolidation_transition_hook(r,
+                WL_COLUMNAR_CONSOLIDATION_TEST_SORT_AFTER_DETACH);
+#else
+        (void)consolidation_hook;
+#endif
     }
     /* After detach/first row move, prepared-only kernels cannot fail. */
     rc = wl_columnar_radix_rows_prepared(r, start, count, workspace,
@@ -10753,6 +10807,25 @@ wl_columnar_relation_radix_sort_with_lease(col_rel_t *r, uint32_t start,
     if (rc)
         abort();
     return 0;
+}
+
+int
+wl_columnar_relation_radix_sort_with_lease(col_rel_t *r, uint32_t start,
+    uint32_t count, const wl_columnar_radix_workspace_t *workspace,
+    wl_columnar_relation_mutation_lease_t *lease)
+{
+    return wl_columnar_relation_radix_sort_with_lease_impl(r, start, count,
+               workspace, lease, false);
+}
+
+int
+wl_columnar_relation_radix_sort_consolidation_with_lease(col_rel_t *r,
+    uint32_t start, uint32_t count,
+    const wl_columnar_radix_workspace_t *workspace,
+    wl_columnar_relation_mutation_lease_t *lease)
+{
+    return wl_columnar_relation_radix_sort_with_lease_impl(r, start, count,
+               workspace, lease, true);
 }
 
 /* One descriptor-first mutation set covers range capture, preparation,
