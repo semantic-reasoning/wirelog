@@ -1061,8 +1061,8 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
 
     lease->set->published = true;
     for (uint32_t s = 0; s < seg_count; s++) {
-        uint32_t start = seg_boundaries[s];
-        uint32_t end = seg_boundaries[s + 1];
+        uint32_t start = sort_sequence.boundaries[s];
+        uint32_t end = sort_sequence.boundaries[s + 1];
         uint32_t count = end - start;
         seg_starts[s] = start;
 
