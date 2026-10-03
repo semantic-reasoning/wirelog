@@ -159,10 +159,12 @@ def schedule(seed):
 
 def build_plan(args):
     overlay = safe_path(args.overlay_patch, 'overlay patch').read_bytes()
+    base_source = safe_path(args.base_source, 'base source')
     if not overlay:
         raise PlanError('overlay patch is empty')
-    parsed = subprocess.run(['git', 'apply', '--numstat', str(safe_path(args.overlay_patch, 'overlay patch'))],
-                            capture_output=True, text=True, encoding='utf-8')
+    parsed = subprocess.run(
+        ['git', 'apply', '--numstat', str(safe_path(args.overlay_patch, 'overlay patch'))],
+        cwd=base_source, capture_output=True, text=True, encoding='utf-8')
     if parsed.returncode:
         raise PlanError(f'overlay patch is not a valid Git patch: {parsed.stderr.strip()}')
     patch_paths = tuple(sorted(line.split('\t', 2)[2] for line in parsed.stdout.splitlines()
