@@ -6,6 +6,7 @@ from pathlib import Path
 import runpy
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -55,6 +56,7 @@ class FakeProcess:
     started_flags = []
     tamper_path = None
     tamper_payload = b'tampered while benchmark ran'
+    interrupt_on_start = False
 
     def __init__(self, argv, **kwargs):
         self.argv = list(argv)
@@ -64,6 +66,9 @@ class FakeProcess:
         self.stdout = b''
         self.stderr = b''
         self.calls.append(self.argv)
+        if self.interrupt_on_start:
+            self.interrupt_on_start = False
+            CAL['terminate_active_process'](15, None)
         home = Path(kwargs['env']['HOME'])
         self.started_exists_at_spawn = any(home.parent.glob('*-started.json'))
         self.started_flags.append(self.started_exists_at_spawn)
@@ -113,6 +118,7 @@ class CalibrationTests(unittest.TestCase):
         FakeProcess.started_flags = []
         FakeProcess.tamper_path = None
         FakeProcess.tamper_payload = b'tampered while benchmark ran'
+        FakeProcess.interrupt_on_start = False
 
     def evidence_dir(self, suffix):
         return self.root / f'calibration-{suffix}'
@@ -121,7 +127,8 @@ class CalibrationTests(unittest.TestCase):
         FakeProcess.next_outputs = list(totals)
         return CAL['calibrate'](self.plan_path, self.profile_path, self.overlay,
                                 self.evidence_dir(suffix), timeout_seconds=5,
-                                probe=FakeProbe(), popen_factory=FakeProcess)
+                                probe=FakeProbe(), popen_factory=FakeProcess,
+                                affinity_getter=lambda _pid: {0})
 
     def test_parser_accepts_exact_success_and_rejects_malformed_contract(self):
         valid = stdout_for('32x256', 10000, 300_000_000)
@@ -148,18 +155,22 @@ class CalibrationTests(unittest.TestCase):
         (sysfs / 'fs/cgroup/test').mkdir(parents=True)
         (proc / 'self').mkdir(parents=True)
         (proc / 'pressure').mkdir()
-        (sysfs / 'devices/system/cpu/online').write_text('0-1\n')
-        (sysfs / 'devices/system/cpu/cpu0/topology/thread_siblings_list').write_text('0,1\n')
-        (sysfs / 'devices/system/cpu/cpu0/cpufreq/scaling_governor').write_text('performance\n')
-        (sysfs / 'devices/system/cpu/cpu0/cpufreq/scaling_cur_freq').write_text('2000000\n')
+        (sysfs / 'devices/system/cpu/online').write_text('0-1\n', encoding='utf-8')
+        (sysfs / 'devices/system/cpu/cpu0/topology/thread_siblings_list').write_text(
+            '0,1\n', encoding='utf-8')
+        (sysfs / 'devices/system/cpu/cpu0/cpufreq/scaling_governor').write_text(
+            'performance\n', encoding='utf-8')
+        (sysfs / 'devices/system/cpu/cpu0/cpufreq/scaling_cur_freq').write_text(
+            '2000000\n', encoding='utf-8')
         (proc / 'cpuinfo').write_text(
             'processor : 0\nmodel name : fixture cpu\nmicrocode : 0x1\n\n'
-            'processor : 1\nmodel name : fixture cpu\nmicrocode : 0x1\n')
-        (proc / 'self/cgroup').write_text('0::/test\n')
+            'processor : 1\nmodel name : fixture cpu\nmicrocode : 0x1\n', encoding='utf-8')
+        (proc / 'self/cgroup').write_text('0::/test\n', encoding='utf-8')
         (sysfs / 'fs/cgroup/test/cpu.stat').write_text(
-            'nr_periods 3\nnr_throttled 0\nthrottled_usec 0\n')
-        (proc / 'pressure/cpu').write_text('some avg10=0.00 avg60=0.00 avg300=0.00 total=100\n')
-        (proc / 'stat').write_text('cpu1 10 0 10 80 0 0 0 0 0 0\n')
+            'nr_periods 3\nnr_throttled 0\nthrottled_usec 0\n', encoding='utf-8')
+        (proc / 'pressure/cpu').write_text(
+            'some avg10=0.00 avg60=0.00 avg300=0.00 total=100\n', encoding='utf-8')
+        (proc / 'stat').write_text('cpu1 10 0 10 80 0 0 0 0 0 0\n', encoding='utf-8')
         probe = CAL['HostProbe'](proc, sysfs, affinity={0, 1})
         snapshot = probe.snapshot()
         self.assertEqual(snapshot['selected_cpu'], 0)
@@ -181,7 +192,7 @@ class CalibrationTests(unittest.TestCase):
                                                          280_000_000, 260_000_000])
         self.assertEqual(artifact['schema'], CAL['ARTIFACT_SCHEMA'])
         self.assertEqual(artifact['candidate_launches'], 0)
-        self.assertEqual(artifact['benchmark_launches_performed'], 0)
+        self.assertNotIn('benchmark_launches_performed', artifact)
         self.assertNotIn('performance_verdict', artifact)
         self.assertEqual(len(artifact['attempts']), 4)
         self.assertTrue(all(record['accepted'] for record in (
@@ -203,6 +214,9 @@ class CalibrationTests(unittest.TestCase):
                             record['process_monotonic_started_ns']
                             for record in artifact['attempts']))
         self.assertTrue(all(record['telemetry']['eligible'] for record in artifact['attempts']))
+        self.assertTrue(all(record['child_affinity_cpus'] == [0]
+                            and record['child_affinity_error'] is None
+                            for record in artifact['attempts']))
         self.assertTrue(path.is_file())
         for attempt in artifact['attempts']:
             evidence = path.parent / attempt['stdout_path']
@@ -215,7 +229,8 @@ class CalibrationTests(unittest.TestCase):
         with self.assertRaisesRegex(CAL['CalibrationError'], 'did not reach'):
             CAL['calibrate'](self.plan_path, self.profile_path, self.overlay,
                             self.evidence_dir('short'), timeout_seconds=5,
-                            probe=FakeProbe(), popen_factory=FakeProcess)
+                            probe=FakeProbe(), popen_factory=FakeProcess,
+                            affinity_getter=lambda _pid: {0})
         output = self.evidence_dir('short')
         self.assertFalse((output / 'calibration.json').exists())
         self.assertEqual(len(list(output.glob('1x1-attempt-*-result.json'))), 6)
@@ -260,12 +275,46 @@ class CalibrationTests(unittest.TestCase):
         self.assertEqual(CAL['next_iterations'](MAX := CAL['MAX_ITERATIONS'], 1), MAX)
 
     def test_timeout_terminates_and_reaps_the_process_group(self):
+        pid_file = self.root / 'pipe-holding-descendant.pid'
+        child = ("import os,signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                 f"fd=os.open({str(pid_file)!r}, os.O_CREAT|os.O_WRONLY, 0o600); "
+                 "os.write(fd, str(os.getpid()).encode()); os.close(fd); "
+                 "print('ready', flush=True); time.sleep(10)")
+        leader = ("import subprocess,sys; "
+                  "subprocess.Popen([sys.executable, '-c', sys.argv[1]])")
         result = CAL['launch_process'](
-            ['/bin/sh', '-c', 'sleep 10 & wait'], self.root,
-            dict(PATH='/usr/bin:/bin'), timeout_seconds=0.1)
+            ['/usr/bin/python3', '-c', leader, child], self.root,
+            dict(PATH='/usr/bin:/bin'), timeout_seconds=0.5)
         self.assertTrue(result['timed_out'])
         self.assertIsNotNone(result['exit_code'])
         self.assertLess(result['wall_ns'], 5_000_000_000)
+        child_pid = int(pid_file.read_text(encoding='ascii'))
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                stat = Path(f'/proc/{child_pid}/stat').read_text(encoding='ascii')
+            except FileNotFoundError:
+                break
+            state = stat.rsplit(')', 1)[1].strip().split()[0]
+            if state == 'Z':
+                break
+            time.sleep(0.02)
+        else:
+            self.fail('pipe-holding process-group descendant survived timeout cleanup')
+
+    def test_signal_preserves_started_and_output_evidence_without_artifact(self):
+        FakeProcess.next_outputs = [300_000_000]
+        FakeProcess.interrupt_on_start = True
+        with self.assertRaisesRegex(CAL['CalibrationError'], 'interrupted by signal 15'):
+            self.run_calibration('interrupted', [300_000_000])
+        output = self.evidence_dir('interrupted')
+        self.assertTrue((output / '1x1-attempt-01-started.json').is_file())
+        self.assertTrue((output / '1x1-attempt-01-stdout.bin').is_file())
+        self.assertTrue((output / '1x1-attempt-01-stderr.bin').is_file())
+        record = json.loads((output / '1x1-attempt-01-result.json').read_text(encoding='utf-8'))
+        self.assertEqual(record['interrupted_signal'], 15)
+        self.assertIn('interrupted by signal 15', record['diagnostic'])
+        self.assertFalse((output / 'calibration.json').exists())
 
 
 if __name__ == '__main__':

@@ -129,6 +129,8 @@ class EncodingVisitor(ast.NodeVisitor):
             self.add(node, f"Path.{attr}() must specify encoding=\"utf-8\"")
         elif (attr == "open" and not _has_explicit_encoding(node)
               and not (isinstance(function.value, ast.Name)
+                       and function.value.id == "os")
+              and not (isinstance(function.value, ast.Name)
                        and function.value.id in self.url_opener_names[-1])
               and not (isinstance(function.value, ast.Call)
                        and isinstance(function.value.func, ast.Name)
