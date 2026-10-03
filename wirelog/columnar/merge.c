@@ -2190,7 +2190,7 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
         bool compact = rel->run_count >= COL_MAX_RUNS;
         col_rel_compact_scratch_t scratch;
         if (rel->col_shared && compact) {
-            int cow_rc = col_rel_cow_unshare_with_source_writer(rel,
+            int cow_rc = col_rel_cow_unshare_legacy_with_source_writer(rel,
                     rel_writer);
             if (cow_rc != 0)
                 return col_op_consolidate_incremental_delta_fail(delta_out,

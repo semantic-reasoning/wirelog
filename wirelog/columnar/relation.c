@@ -5033,7 +5033,8 @@ col_rel_append_all_impl(col_rel_t *dst, const col_rel_t *src,
              * path so public COW may acquire its own gate independently. */
             if (dst->col_shared) {
                 dst->memory_budget_denial_pending = false;
-                rc = col_rel_cow_unshare_impl(dst, 0, false, false, NULL);
+                rc = col_rel_cow_unshare_legacy_impl(dst, 0, false, false,
+                        NULL);
             } else {
                 rc = 0;
             }
