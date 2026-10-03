@@ -1,0 +1,16 @@
+{
+  "schema": "wirelog.batch-append-revision-manifest.v1",
+  "anchor": {
+    "commit": "64bd12f499b357d60d1928d5dba08326af58426f",
+    "tree": "4c10e21ab4ba034dbc50abd92a59d22e8b975130"
+  },
+  "product": {
+    "pre_tree": "4c10e21ab4ba034dbc50abd92a59d22e8b975130",
+    "post_tree": "9fa822ba32dd3b89e71d0158efa27422e49a06d4",
+    "paths": [
+      "tests/test_relation_generations.c",
+      "wirelog/columnar/relation.c"
+    ],
+    "diff_sha256": "059b699ee5a802b13a54f9e7e6bc04cc043b9f95aa311294801593d3fc7f977d"
+  }
+}
