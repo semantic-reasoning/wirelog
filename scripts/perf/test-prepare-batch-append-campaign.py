@@ -262,6 +262,23 @@ class PreparePlanTests(unittest.TestCase):
             with self.assertRaisesRegex(M['PlanError'], 'path/status/hash'):
                 M['load_revision_manifest']()
 
+    def test_rejects_extra_product_tree_path(self):
+        from unittest.mock import patch
+        subprocess_module = M['load_revision_manifest'].__globals__['subprocess']
+        original_run = subprocess_module.run
+        def extra_path(command, *args, **kwargs):
+            result = original_run(command, *args, **kwargs)
+            if 'diff' in command and '--name-status' in command:
+                return subprocess_module.CompletedProcess(
+                    command, 0,
+                    stdout=('M\ttests/test_relation_generations.c\n'
+                            'M\twirelog/columnar/relation.c\n'
+                            'A\tunexpected/product.c\n'), stderr='')
+            return result
+        with patch.object(subprocess_module, 'run', side_effect=extra_path):
+            with self.assertRaisesRegex(M['PlanError'], 'path/status/hash'):
+                M['load_revision_manifest']()
+
     def test_writes_durable_plan_only_to_fresh_directory(self):
         from unittest.mock import patch
         plan = self.plan()
