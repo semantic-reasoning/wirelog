@@ -164,16 +164,27 @@ run_case(const append_case_t *test_case, uint64_t iterations,
     uint32_t samples, uint32_t warmups)
 {
     col_rel_t *rel = NULL;
-    int64_t *rows = NULL;
+    int64_t *rows = NULL, *probe_rows = NULL;
     int rc = prepare_relation(test_case, &rel, &rows);
     if (rc != 0)
         return 1;
+
+    size_t cells = (size_t)test_case->ncols * test_case->nrows;
+    probe_rows = malloc(cells * sizeof(*probe_rows));
+    if (!probe_rows) {
+        free(rows);
+        col_rel_destroy(rel);
+        return 1;
+    }
+    for (size_t i = 0; i < cells; i++)
+        probe_rows[i] = rows[i] + INT64_C(17);
 
     uint64_t *append_ns = calloc(samples, sizeof(*append_ns));
     uint64_t *reset_ns = calloc(samples, sizeof(*reset_ns));
     if (!append_ns || !reset_ns) {
         free(append_ns);
         free(reset_ns);
+        free(probe_rows);
         free(rows);
         col_rel_destroy(rel);
         return 1;
@@ -218,6 +229,24 @@ run_case(const append_case_t *test_case, uint64_t iterations,
                 if (check_result(test_case, rel, rows, BENCH_CAPACITY) != 0) {
                     fprintf(stderr, "correctness/capacity check failed: %s\n",
                         test_case->name);
+                    rc = EINVAL;
+                    goto done;
+                }
+                /* Verify a different tuple outside the timed region so stale
+                 * values from the previous timed append cannot mask skipped
+                 * copies. The next measured append still starts from nrows=0
+                 * and uses the original disjoint input. */
+                reset_nrows(rel);
+                bool probe_denied = false;
+                rc = col_rel_append_rows_atomic(rel, probe_rows,
+                        test_case->nrows, test_case->ncols, &probe_denied);
+                if (rc != 0 || probe_denied
+                    || check_result(test_case, rel, probe_rows,
+                    BENCH_CAPACITY) != 0) {
+                    fprintf(stderr,
+                        "distinct-input correctness probe failed: case=%s"
+                        " rc=%d denied=%d\n", test_case->name, rc,
+                        probe_denied);
                     rc = EINVAL;
                     goto done;
                 }
@@ -278,6 +307,7 @@ run_case(const append_case_t *test_case, uint64_t iterations,
 done:
     free(append_ns);
     free(reset_ns);
+    free(probe_rows);
     free(rows);
     col_rel_destroy(rel);
     return rc == 0 ? 0 : 1;
