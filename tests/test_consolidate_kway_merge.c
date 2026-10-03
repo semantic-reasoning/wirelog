@@ -71,10 +71,21 @@ static const char *consolidate_fail_site = NULL;
 static bool consolidate_fail_used = false;
 static uint32_t consolidate_fail_match = 1;
 static uint32_t consolidate_seen_matches = 0;
+static const char *consolidate_mutate_site = NULL;
+static uint32_t *consolidate_mutate_boundaries = NULL;
+static uint32_t consolidate_mutate_index = 0;
+static uint32_t consolidate_mutate_value = 0;
+static bool consolidate_mutation_used = false;
 
 static bool
 test_consolidate_alloc_should_fail(const char *site)
 {
+    if (consolidate_mutate_site && !consolidate_mutation_used
+        && strcmp(site, consolidate_mutate_site) == 0) {
+        consolidate_mutate_boundaries[consolidate_mutate_index]
+            = consolidate_mutate_value;
+        consolidate_mutation_used = true;
+    }
     if (consolidate_fail_site && !consolidate_fail_used
         && strcmp(site, consolidate_fail_site) == 0) {
         consolidate_seen_matches++;
@@ -111,6 +122,25 @@ static void
 clear_consolidate_allocation_failure(void)
 {
     consolidate_fail_site = NULL;
+}
+
+static void
+mutate_consolidate_boundaries_at(const char *site, uint32_t *boundaries,
+    uint32_t index, uint32_t value)
+{
+    consolidate_mutate_site = site;
+    consolidate_mutate_boundaries = boundaries;
+    consolidate_mutate_index = index;
+    consolidate_mutate_value = value;
+    consolidate_mutation_used = false;
+}
+
+static void
+clear_consolidate_boundary_mutation(void)
+{
+    consolidate_mutate_site = NULL;
+    consolidate_mutate_boundaries = NULL;
+    consolidate_mutation_used = false;
 }
 
 #define TEST(name)                                      \
@@ -1978,6 +2008,41 @@ test_merge_epoch_headroom_preflight(void)
 }
 
 static void
+test_merge_uses_owned_prepared_boundaries(void)
+{
+    uint32_t boundaries[] = { 0, 2, 4 };
+    const int64_t values[] = { 2, 1, 3, 0 };
+    TEST("merge uses its copied partition after caller boundary mutation");
+    col_rel_t *rel = test_rel_alloc(1);
+    if (!rel)
+        FAIL("relation allocation failed");
+    for (uint32_t i = 0; i < 4; i++) {
+        if (test_rel_append_row(rel, &values[i]) != 0) {
+            test_rel_free(rel);
+            FAIL("failed to append partition fixture");
+        }
+    }
+    uint64_t view_generation = rel->view_generation;
+    /* This callback runs at segment_starts allocation, after sequence
+     * preparation copied and validated [0, 2, 4]. The replacement remains
+     * monotone and in-range, but describes a different partition. */
+    mutate_consolidate_boundaries_at("segment_starts", boundaries, 1, 1);
+    int rc = col_op_consolidate_kway_merge(rel, boundaries, 2);
+    bool hook_used = consolidate_mutation_used;
+    clear_consolidate_boundary_mutation();
+    clear_consolidate_allocation_failure();
+    if (rc != 0 || !hook_used || boundaries[1] != 1 || rel->nrows != 4
+        || rel->view_generation != view_generation + 3u
+        || rel->columns[0][0] != 0 || rel->columns[0][1] != 1
+        || rel->columns[0][2] != 2 || rel->columns[0][3] != 3) {
+        test_rel_free(rel);
+        FAIL("post-prepare caller mutation changed merge partition semantics");
+    }
+    test_rel_free(rel);
+    PASS();
+}
+
+static void
 test_nullary_alias_large_hash_merge(void)
 {
     const uint32_t row_count = 10001;
@@ -3271,6 +3336,7 @@ main(void)
     test_shared_view_merge_oom_preserves_view_state();
     test_leased_merge_alias_epoch_paths();
     test_merge_epoch_headroom_preflight();
+    test_merge_uses_owned_prepared_boundaries();
     test_nullary_alias_large_hash_merge();
     test_merge_output_oom_is_transactional();
     test_zero_arity_merge_output_is_never_zero_sized();
