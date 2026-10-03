@@ -2739,6 +2739,9 @@ int col_rel_reserve_merge_grid_with_lease(col_rel_t *r, uint32_t capacity,
     wl_columnar_relation_mutation_lease_t *lease);
 int col_rel_cow_unshare_with_lease(col_rel_t *r,
     wl_columnar_relation_mutation_lease_t *lease);
+WL_MUST_CHECK int
+wl_columnar_relation_privatize_shared_view_with_lease(col_rel_t *r,
+    wl_columnar_relation_mutation_lease_t *lease);
 int col_rel_append_row_with_lease(col_rel_t *r, const int64_t *row,
     wl_columnar_relation_mutation_lease_t *lease);
 int col_rel_reserve_rows_with_lease(col_rel_t *r, uint32_t additional,
