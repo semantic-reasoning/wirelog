@@ -65,10 +65,10 @@ def under_home(path, label):
     return result
 
 
-def outside_sources(path, sources, label):
+def outside_sources(path, sources, label, root_label='source worktrees'):
     for source in sources:
         if path == source or source in path.parents or path in source.parents:
-            raise PreflightError(f'{label} must be outside source worktrees')
+            raise PreflightError(f'{label} must be outside {root_label}')
 
 
 def validate_plan(path, overlay_patch):
@@ -263,9 +263,12 @@ def read_meson_profile(source_root, build_root):
                 ninja_no_pending_work=True)
 
 
-def assert_no_pending_rebuild(build_root):
+def assert_no_pending_rebuild(build_root, target=None):
+    command = ['ninja', '-C', str(build_root), '-n']
+    if target is not None:
+        command.append(target)
     try:
-        result = subprocess.run(['ninja', '-C', str(build_root), '-n'],
+        result = subprocess.run(command,
                                 capture_output=True, text=True, encoding='utf-8',
                                 timeout=30, check=False)
     except (OSError, subprocess.TimeoutExpired) as error:
@@ -278,11 +281,14 @@ def assert_no_pending_rebuild(build_root):
 
 
 def inspect_side(source, build):
-    dry_run_hash = assert_no_pending_rebuild(build)
+    default_dry_run_hash = assert_no_pending_rebuild(build)
+    target_dry_run_hash = assert_no_pending_rebuild(build, 'bench/bench_batch_append')
     result = read_meson_profile(source, build)
-    if assert_no_pending_rebuild(build) != dry_run_hash:
+    if assert_no_pending_rebuild(build) != default_dry_run_hash \
+            or assert_no_pending_rebuild(build, 'bench/bench_batch_append') != target_dry_run_hash:
         raise PreflightError(f'Ninja dry-run evidence changed during inspection in {build}')
-    result['ninja_dry_run_stdout_sha256'] = dry_run_hash
+    result['ninja_dry_run_stdout_sha256'] = dict(
+        default=default_dry_run_hash, benchmark_target=target_dry_run_hash)
     return result
 
 
@@ -332,6 +338,9 @@ def write_atomic(output_arg, artifact):
     sources = [Path(artifact[side]['source_root']).resolve()
                for side in ('base', 'candidate')]
     outside_sources(output, sources, 'artifact output directory')
+    builds = [Path(artifact[side]['build_root']).resolve()
+              for side in ('base', 'candidate')]
+    outside_sources(output, builds, 'artifact output directory', 'build directories')
     if not output.parent.is_dir():
         raise PreflightError('artifact output parent must already exist')
     output.mkdir(mode=0o700, exist_ok=False)
