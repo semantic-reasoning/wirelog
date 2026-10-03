@@ -2995,7 +2995,7 @@ test_view_generation_headroom_reserved(void)
 
 /* ================================================================
  * Issue #2057: delta_out's view generation advances once per emitted row
- * (col_rel_append_row_locked) and once more when a failure rolls the
+ * (col_rel_append_row_with_lease) and once more when a failure rolls the
  * emission back.  Every such advance is reserved before delta_out is first
  * mutated, so exhaustion is refused with EOVERFLOW instead of saturating
  * delta_out's view generation behind a successful return.
