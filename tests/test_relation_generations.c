@@ -6639,6 +6639,15 @@ test_leased_radix_sequence(void)
         && sequence.identity == 0,
         "radix sequence preflights the exact view event count");
     alias->view_generation = sequence_view;
+    uint64_t sequence_storage = alias->storage_generation;
+    alias->storage_generation = WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+    held.lease.relation_generation = alias->storage_generation;
+    CHECK(wl_columnar_relation_radix_sequence_prepare_with_lease(alias,
+        bounds, 3, &sequence, &held.lease) == EOVERFLOW
+        && sequence.identity == 0,
+        "radix sequence preflights shared storage epoch exhaustion");
+    alias->storage_generation = sequence_storage;
+    held.lease.relation_generation = sequence_storage;
     held.lease.storage_transitioned = true;
     CHECK(wl_columnar_relation_radix_sequence_prepare_with_lease(alias,
         bounds, 3, &sequence, &held.lease) == EINVAL
@@ -6745,6 +6754,20 @@ test_leased_radix_sequence(void)
         && col_rel_storage_alias_borrow_count(root) == 1,
         "zero-sort sequence consumes without detaching or advancing epochs");
     wl_columnar_relation_radix_sequence_destroy(&sequence);
+    memset(&sequence, 0, sizeof(sequence));
+    uint32_t sorted_multirow_bounds[] = { 0, 3 };
+    CHECK(wl_columnar_relation_radix_sequence_prepare_with_lease(alias,
+        sorted_multirow_bounds, 1, &sequence, &held.lease) == 0,
+        "radix multirow sorted alias prepare");
+    view_before = alias->view_generation;
+    storage_before = alias->storage_generation;
+    CHECK(wl_columnar_relation_radix_sequence_execute_with_lease(&sequence,
+        &held.lease) == 0 && alias->view_generation == view_before
+        && alias->storage_generation == storage_before
+        && alias->storage_owner == root
+        && col_rel_storage_alias_borrow_count(root) == 1,
+        "multirow sorted alias does not detach or advance generations");
+    wl_columnar_relation_radix_sequence_destroy(&sequence);
     CHECK(col_rel_mutation_set_finish(&held.set, true) == 0,
         "radix zero-sort finish");
     memset(&sequence, 0, sizeof(sequence));
@@ -6792,6 +6815,8 @@ test_leased_radix_sequence(void)
             tiny_resolution.budget_bytes - already_reserved - 1u,
             &blocker) == WL_COLUMNAR_MEMORY_ADMISSION_OK,
         "radix sequence reserve all but one governor byte");
+    uint64_t reserved_before_refusal = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(tiny_ref));
     memset(&held, 0, sizeof(held));
     memset(&sequence, 0, sizeof(sequence));
     uint32_t admission_bounds[] = { 0, 8 };
@@ -6803,7 +6828,10 @@ test_leased_radix_sequence(void)
         && root->memory_budget_denial_pending
         && mutation_payload_unchanged(root, &before_denial)
         && root->view_generation == before_denial.view_generation
-        && root->storage_generation == before_denial.storage_generation,
+        && root->storage_generation == before_denial.storage_generation
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(tiny_ref))
+        == reserved_before_refusal,
         "radix sequence budget denial precedes mutation");
     CHECK(col_rel_mutation_set_finish(&held.set, false) == 0,
         "radix sequence denial finish");
@@ -6901,6 +6929,60 @@ test_leased_radix_sequence(void)
     wl_columnar_relation_radix_sequence_destroy(&sequence);
     CHECK(col_rel_mutation_set_finish(&held.set, true) == 0,
         "radix sequence float finish");
+    cleanup_relations();
+}
+
+static void
+test_radix_sequence_lazy_publication(void)
+{
+    col_rel_t *rel = new_relation();
+    for (int64_t value = 4; value > 0; value--)
+        CHECK(col_rel_append_row(rel, &value) == 0,
+            "lazy radix sequence seed");
+    rel->storage_owner = NULL;
+    rel->storage_owner_identity = 0;
+    rel->storage_owner_generation = 0;
+    radix_test_lease_t held = { 0 };
+    wl_columnar_relation_radix_sequence_t sequence = { 0 };
+    uint32_t bounds[] = { 0, 4 };
+    CHECK(radix_test_acquire(rel, &held) == 0
+        && wl_columnar_relation_radix_sequence_prepare_with_lease(rel,
+        bounds, 1, &sequence, &held.lease) == 0
+        && wl_columnar_relation_radix_sequence_execute_with_lease(&sequence,
+        &held.lease) == 0 && held.set.published,
+        "canonical radix sort marks mutation-set publication before moving rows");
+    uint64_t identity = rel->storage_owner_identity;
+    uint64_t generation = rel->storage_owner_generation;
+    CHECK(col_rel_mutation_set_finish(&held.set, false) == 0
+        && rel->storage_owner == rel
+        && rel->storage_owner_identity == identity
+        && rel->storage_owner_generation == generation,
+        "failed finish retains lazy owner metadata after radix publication");
+    wl_columnar_relation_radix_sequence_destroy(&sequence);
+    cleanup_relations();
+
+    rel = new_relation();
+    for (int64_t value = 1; value <= 3; value++)
+        CHECK(col_rel_append_row(rel, &value) == 0,
+            "zero-sort lazy radix seed");
+    rel->storage_owner = NULL;
+    rel->storage_owner_identity = 0;
+    rel->storage_owner_generation = 0;
+    memset(&held, 0, sizeof(held));
+    memset(&sequence, 0, sizeof(sequence));
+    uint32_t sorted_bounds[] = { 0, 3 };
+    CHECK(radix_test_acquire(rel, &held) == 0
+        && wl_columnar_relation_radix_sequence_prepare_with_lease(rel,
+        sorted_bounds, 1, &sequence, &held.lease) == 0
+        && wl_columnar_relation_radix_sequence_execute_with_lease(&sequence,
+        &held.lease) == 0 && !held.set.published,
+        "zero-sort sequence leaves mutation set unpublished");
+    CHECK(col_rel_mutation_set_finish(&held.set, false) == 0
+        && rel->storage_owner == NULL
+        && rel->storage_owner_identity == 0
+        && rel->storage_owner_generation == 0,
+        "zero-sort failed finish rolls lazy owner initialization back");
+    wl_columnar_relation_radix_sequence_destroy(&sequence);
     cleanup_relations();
 }
 
@@ -7499,6 +7581,7 @@ main(void)
     test_radix_descriptor_admission();
     test_leased_radix_provenance();
     test_leased_radix_sequence();
+    test_radix_sequence_lazy_publication();
     test_leased_radix_kernels();
     test_public_append_mutation_admission();
     test_append_overlapping_input(false);
