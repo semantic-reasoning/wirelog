@@ -2668,6 +2668,32 @@ col_rel_cow_unshare_with_lease(col_rel_t *r,
     return col_rel_cow_unshare_publish_impl(r, 0, false, false, NULL, lease);
 }
 
+int
+wl_columnar_relation_privatize_shared_view_with_lease(col_rel_t *r,
+    wl_columnar_relation_mutation_lease_t *lease)
+{
+    int rc;
+    if (!r || !lease || lease->role_flags
+        != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+        || col_rel_mutation_lease_validate(lease, r))
+        return EINVAL;
+    if (r->col_shared)
+        return col_rel_cow_unshare_publish_impl(r, 0, false, false, NULL,
+                   lease);
+    if (lease->owner == r)
+        return 0;
+    if (r->storage_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
+        return EOVERFLOW;
+    uint64_t prior_generation = r->storage_generation;
+    rc = col_rel_storage_alias_release_locked(r, lease);
+    if (rc)
+        return rc;
+    wl_columnar_relation_touch_storage(r);
+    if (col_rel_mutation_lease_advance_storage(lease, prior_generation) != 0)
+        abort();
+    return 0;
+}
+
 static int
 col_rel_cow_unshare_publish_impl(col_rel_t *r, uint32_t new_cap,
     bool defer_alias_release, bool defer_metadata_retirement,
