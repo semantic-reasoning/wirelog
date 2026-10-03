@@ -11,12 +11,9 @@
 #      the workflow would leave the behavioural assertions green -- the
 #      silent-downgrade shape this gate exists to prevent.
 #
-#   2. Behaviour -- the real gate (scripts/ci/check-text-size.sh) FAILs on
-#      an intentionally oversize library and PASSes on a small one, against
-#      the committed baseline.  A fixture that only ever supplied a passing
-#      library would pin nothing: the negative control must drive the gate's
-#      own fail path, which is what #1573 moved earlier in the job so a size
-#      regression fails within minutes instead of ~24.
+#   2. Behaviour -- the real gate reports an intentionally oversize library
+#      as advisory in pre-stable mode and fails it in explicitly enforced
+#      mode. A small library passes in both modes.
 #
 # The wiring half runs FIRST and needs only awk + the workflow file; the
 # behavioural half needs cc/size and platform-specific size tools, and is the
@@ -186,7 +183,9 @@ if ! command -v cc >/dev/null 2>&1 || ! command -v size >/dev/null 2>&1 \
     exit 77
 fi
 
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/wirelog-early-size.XXXXXX")
+case "${TMPDIR:-}" in ''|/tmp|/tmp/*|/dev/shm|/dev/shm/*) TMPDIR="${HOME:?HOME must be set}/.tmp"; export TMPDIR ;; esac
+mkdir -p "$TMPDIR"
+tmp=$(mktemp -d "$TMPDIR/wirelog-early-size.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 
 # Negative control: size it relative to the committed baseline so it remains
@@ -240,12 +239,23 @@ else
         printf 'test-early-size-gate: generated fixture is not above the budget (%s <= %s)\n' "$actual_size" "$budget_limit" >&2
         failures=$((failures + 1))
     fi
-    negative_control() {
+    advisory_control() {
         local st=0
         "$gate" "$big_so" >/dev/null 2>&1 || st=$?
+        [ "$st" = 0 ]
+    }
+    assert 'oversize library is advisory before stable declaration' advisory_control
+    enforced_control() {
+        local st=0
+        "$gate" "$big_so" --mode enforced >/dev/null 2>&1 || st=$?
         [ "$st" = 1 ]
     }
-    assert 'oversize library FAILs the size gate (negative control)' negative_control
+    assert 'oversize library fails in enforced mode' enforced_control
+    advisory_override() {
+        printf 'enforced\n' >"$tmp/enforced-mode.txt"
+        "$gate" "$big_so" --mode-file "$tmp/enforced-mode.txt" --mode advisory >/dev/null 2>&1
+    }
+    assert 'explicit advisory mode overrides the default mode file' advisory_override
 fi
 
 # Positive control: a small library must PASS against the same baseline.

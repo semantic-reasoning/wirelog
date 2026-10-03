@@ -4,6 +4,12 @@
 set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd -P)
+case "${TMPDIR:-}" in ''|/tmp|/tmp/*|/dev/shm|/dev/shm/*)
+    TMPDIR="${HOME:?HOME must be set}/.tmp"
+    export TMPDIR
+    ;;
+esac
+mkdir -p "$TMPDIR" || { printf 'size comparison setup error: cannot create TMPDIR %s\n' "$TMPDIR" >&2; exit 2; }
 head_build=${1:-}
 base_sha=${2:-}
 head_sha=${3:-}
@@ -35,6 +41,14 @@ baseline=$(git show "$base_sha:tests/baseline_size.txt") || die "base-owned base
 printf '%s\n' "$baseline" >"$tmp/base-baseline.txt"
 case "$baseline" in ''|*[!0-9]*) die "base-owned baseline is invalid" ;; esac
 policy_baseline=$baseline
+# Until the user declares a stable version, the size allowance is advisory.
+# Older event bases lack the policy file and inherit that pre-stable mode.
+policy_mode=advisory
+if git cat-file -e "$base_sha:tests/size_policy_mode.txt" 2>/dev/null; then
+    policy_mode=$(git show "$base_sha:tests/size_policy_mode.txt") \
+        || die "base-owned size policy mode is unreadable"
+fi
+case "$policy_mode" in advisory|enforced) ;; *) die "base-owned size policy mode is invalid" ;; esac
 
 git show "$head_sha:tests/baseline_size.provenance.json" >"$tmp/head-baseline.provenance.json" 2>/dev/null \
     || die "candidate baseline provenance sidecar is missing"
@@ -67,4 +81,4 @@ base_profile=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d.po
 head_profile=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d.pop("source_sha",None); import hashlib; print(hashlib.sha256(json.dumps(d,sort_keys=True,separators=(",",":")).encode()).hexdigest())' "$tmp/head-profile.json")
 python3 "$script_dir/text-size-policy.py" --base-size "$base_bytes" --head-size "$head_bytes" \
     --baseline "$policy_baseline" --base-profile "$base_profile" --head-profile "$head_profile" \
-    --base-sha "$base_sha" --head-sha "$head_sha" --output "$report"
+    --base-sha "$base_sha" --head-sha "$head_sha" --mode "$policy_mode" --output "$report"

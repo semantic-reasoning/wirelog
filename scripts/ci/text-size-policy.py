@@ -17,18 +17,21 @@ def byte_count(value, name):
         raise ValueError(f"{name} is invalid or out of range")
     return number
 
-def compare(base_size, head_size, baseline, base_profile, head_profile, threshold=5120):
+def compare(base_size, head_size, baseline, base_profile, head_profile, threshold=5120,
+            mode="advisory"):
     base_size = byte_count(base_size, "base size")
     head_size = byte_count(head_size, "head size")
     baseline = byte_count(baseline, "baseline")
     threshold = byte_count(threshold, "threshold")
+    if mode not in ("advisory", "enforced"):
+        raise ValueError("mode must be advisory or enforced")
     if not base_profile or base_profile != head_profile:
         raise ValueError("production profile mismatch between base and head")
     ceiling = baseline + threshold
     inherited_overage = base_size > ceiling
     allowed = base_size if inherited_overage else ceiling
     status = "pass" if head_size <= allowed else "over-budget"
-    return {"schema_version": 1, "status": status, "base_bytes": base_size,
+    return {"schema_version": 1, "status": status, "mode": mode, "base_bytes": base_size,
             "head_bytes": head_size, "baseline_bytes": baseline,
             "budget_bytes": threshold, "allowed_head_bytes": allowed,
             "delta_from_baseline_bytes": head_size - baseline,
@@ -45,13 +48,14 @@ def main():
     parser.add_argument("--base-sha", required=True)
     parser.add_argument("--head-sha", required=True)
     parser.add_argument("--threshold", default="5120")
+    parser.add_argument("--mode", choices=("advisory", "enforced"), default="advisory")
     parser.add_argument("--output")
     args = parser.parse_args()
     try:
         if not args.base_sha or not args.head_sha or args.base_sha == "unknown" or args.head_sha == "unknown":
             raise ValueError("base/head source SHA is missing")
         report = compare(args.base_size, args.head_size, args.baseline,
-                         args.base_profile, args.head_profile, args.threshold)
+                         args.base_profile, args.head_profile, args.threshold, args.mode)
         report.update({"base_sha": args.base_sha, "head_sha": args.head_sha})
         text = json.dumps(report, sort_keys=True, indent=2) + "\n"
         if args.output:
@@ -60,7 +64,7 @@ def main():
         print(text, end="")
         if report["inherited_overage"]:
             print("inherited over-budget base; head may not exceed measured base size", file=sys.stderr)
-        return 0 if report["status"] == "pass" else 1
+        return 0 if report["status"] == "pass" or report["mode"] == "advisory" else 1
     except (OSError, ValueError) as exc:
         print(f"text-size-policy: {exc}", file=sys.stderr)
         return 2

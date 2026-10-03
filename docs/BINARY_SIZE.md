@@ -1,5 +1,16 @@
 # Binary size monitoring and admission
 
+## Pre-stable policy mode
+
+Until the user explicitly declares a stable version, the 5120-byte allowance
+and resulting `.text` ceiling are reference values. PR CI reports a valid
+overage as `over-budget` but exits successfully. Measurement failures,
+production profile mismatches, malformed provenance, and tested-merge identity
+failures remain blocking. The comparison reads the policy mode from the event
+base; older bases without `tests/size_policy_mode.txt` use advisory mode. A
+future switch to `enforced` requires the user's stable-version declaration and
+a separate reviewed policy change.
+
 `tests/baseline_size.txt` records 419135 bytes, the canonical Ubuntu x86_64
 GCC `.text` measurement from eligible successful main ancestor
 `c6e263d492828d1208fa11005c18d19b05342233`, rather than current main or PR #2032.
@@ -33,17 +44,18 @@ Historically, the 408989-byte baseline at `13d9244a` rose to 414051 bytes at
 `863e011e`, consuming 5062 bytes of the same fixed allowance. This reset
 replaces that ancestor measurement with the authenticated 419135-byte figure.
 
-The production limit remains 5120 bytes. PR CI compares the production shared
-library from the exact `pull_request.base.sha` tree with the library from the
+The production reference allowance remains 5120 bytes. PR CI compares the
+production shared library from the exact `pull_request.base.sha` tree with the library from the
 tested merge SHA. It verifies that the tested SHA is the merge commit and that
 its first parent is the event base. Both libraries are configured and built on
 the same runner with `-Dtests=true -DmbedTLS=disabled`, and the resolved Meson
 options, compiler/linker identity and version, target, platform, and effective
 wirelog build commands must match. A profile mismatch is an error. The
-candidate's baseline file is used only after its main CI provenance is verified.
+candidate baseline is used only after its CI provenance is verified.
 
-Normally the head may be at most baseline + 5120 bytes. If the measured base
-already exceeds that ceiling, the head may not exceed the measured base. A
+The reference allowance normally places the head at baseline + 5120 bytes. If
+the measured base already exceeds that ceiling, the reference size is the
+measured base. In enforced mode, a head above that allowed size fails. A
 docs-only change receives no special exemption; equal measured binaries pass
 because they add no size to the base.
 

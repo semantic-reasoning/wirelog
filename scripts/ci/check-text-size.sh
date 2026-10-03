@@ -10,8 +10,11 @@ json_out=
 source_sha=${SOURCE_SHA:-unknown}
 profile_file=${SIZE_PROFILE_FILE:-}
 measure_only=no
+mode_file="$repo_root/tests/size_policy_mode.txt"
+mode=advisory
+mode_explicit=no
 
-usage() { echo "usage: $0 <library> [--baseline-file FILE] [--json FILE] [--source-sha SHA] [--profile FILE]" >&2; exit 2; }
+usage() { echo "usage: $0 <library> [--baseline-file FILE] [--json FILE] [--source-sha SHA] [--profile FILE] [--mode advisory|enforced] [--mode-file FILE]" >&2; exit 2; }
 [ "$#" -ge 1 ] || usage
 library=$1; shift
 while [ "$#" -gt 0 ]; do
@@ -20,6 +23,8 @@ while [ "$#" -gt 0 ]; do
         --json) [ "$#" -ge 2 ] || usage; json_out=$2; shift 2 ;;
         --source-sha) [ "$#" -ge 2 ] || usage; source_sha=$2; shift 2 ;;
         --profile) [ "$#" -ge 2 ] || usage; profile_file=$2; shift 2 ;;
+        --mode) [ "$#" -ge 2 ] || usage; mode=$2; mode_explicit=yes; shift 2 ;;
+        --mode-file) [ "$#" -ge 2 ] || usage; mode_file=$2; shift 2 ;;
         --measure-only) measure_only=yes; shift ;;
         *) usage ;;
     esac
@@ -27,6 +32,12 @@ done
 fail() { printf 'error: %s\n' "$1" >&2; exit 2; }
 [ -f "$library" ] || fail "library not found: $library"
 [ "$measure_only" = yes ] || [ -f "$baseline_file" ] || fail "baseline file not found: $baseline_file"
+if [ "$measure_only" != yes ]; then
+    if [ "$mode_explicit" = no ] && [ -f "$mode_file" ]; then
+        mode=$(cat "$mode_file") || fail "size policy mode file unreadable: $mode_file"
+    fi
+    case "$mode" in advisory|enforced) ;; *) fail "invalid size policy mode: $mode" ;; esac
+fi
 
 case $(uname -s) in
     Linux) raw=$(size --format=sysv "$library") || fail "size failed for $library"; section=.text ;;
@@ -65,8 +76,12 @@ fi
 if [ "$measure_only" = yes ]; then
     exit 0
 fi
-if [ "$status" = over-budget ]; then
+if [ "$status" = over-budget ] && [ "$mode" = enforced ]; then
     printf '\nFAIL: .text growth (%+d) exceeds %s-byte budget\n' "$delta" "$threshold" >&2
     exit 1
+fi
+if [ "$status" = over-budget ]; then
+    printf '\nADVISORY: .text growth (%+d) exceeds %s-byte reference budget\n' "$delta" "$threshold"
+    exit 0
 fi
 printf '\nPASS: .text delta within budget\n'
