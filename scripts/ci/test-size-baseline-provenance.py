@@ -15,6 +15,11 @@ import zipfile
 from unittest import mock
 from types import SimpleNamespace
 
+if (os.environ.get("TMPDIR", "").startswith(("/tmp/", "/dev/shm/")) or
+        os.environ.get("TMPDIR") in ("/tmp", "/dev/shm", None, "")):
+    os.environ["TMPDIR"] = str(Path.home()/".tmp")
+Path(os.environ["TMPDIR"]).mkdir(parents=True, exist_ok=True)
+
 path = Path(__file__).with_name("verify-size-baseline.py")
 spec = importlib.util.spec_from_file_location("verify_size_baseline", path)
 mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
@@ -186,6 +191,46 @@ check("PR 1961 keeps base and measured-source baseline values distinct",
       if (mod.REVIEWED_PR1961_BASELINE["base_repository_baseline_bytes"],
           mod.REVIEWED_PR1961_BASELINE["source_baseline_bytes"],
           mod.REVIEWED_PR1961_BASELINE["budget_bytes"]) != (395540, 397579, 5120) else None)
+reviewed2037_paths = {
+    "docs/BINARY_SIZE.md", "scripts/ci/verify-size-baseline.py",
+    "scripts/ci/test-size-baseline-provenance.py", "scripts/ci/text-size-policy.py",
+    "scripts/ci/run-size-comparison.sh", "scripts/ci/check-text-size.sh",
+    "scripts/ci/test-text-size-policy.sh", "scripts/ci/test-size-comparison.py",
+    "scripts/ci/test-early-size-gate.sh", "tests/size_policy_mode.txt", "tests/baseline_size.txt",
+    "tests/baseline_size.provenance.json",
+}
+repo_root = Path(__file__).resolve().parents[2]
+checked_provenance = json.loads(
+    (repo_root / "tests/baseline_size.provenance.json").read_text(encoding="utf-8"))
+check("checked-in PR 2037 sidecar matches the exact verifier record",
+      lambda: (_ for _ in ()).throw(AssertionError("sidecar differs from verifier record"))
+      if checked_provenance != mod.REVIEWED_PR2037_BASELINE else None)
+check("checked-in baseline is the measured PR 2037 head size",
+      lambda: (_ for _ in ()).throw(AssertionError("baseline differs from measured head"))
+      if (repo_root / "tests/baseline_size.txt").read_text(encoding="ascii").strip()
+         != str(mod.REVIEWED_PR2037_BASELINE["baseline_bytes"]) else None)
+check("PR 2037 exception has only its reviewed policy and baseline paths",
+      lambda: (_ for _ in ()).throw(AssertionError("path scope changed"))
+      if mod.reviewed_pr_repair_paths(mod.REVIEWED_PR2037_BASELINE) != reviewed2037_paths else None)
+check("PR 2037 pins the measured base, head, budget, and run identity",
+      lambda: (_ for _ in ()).throw(AssertionError("pinned values changed"))
+      if (mod.REVIEWED_PR2037_BASELINE["pr_number"],
+          mod.REVIEWED_PR2037_BASELINE["baseline_bytes"],
+          mod.REVIEWED_PR2037_BASELINE["base_repository_baseline_bytes"],
+          mod.REVIEWED_PR2037_BASELINE["measured_base_bytes"],
+          mod.REVIEWED_PR2037_BASELINE["run_id"],
+          mod.REVIEWED_PR2037_BASELINE["job_id"],
+          mod.REVIEWED_PR2037_BASELINE["budget_bytes"])
+      != (2037, 428046, 419135, 421283, 37110844170, 111168520922, 5120) else None)
+for field, value in (("base_sha", "d" * 40), ("source_sha", "f" * 40),
+                     ("tested_merge_sha", "e" * 40),
+                     ("run_id", 37110844171), ("job_id", 111168520923),
+                     ("profile_sha256", "0" * 64), ("job_log_sha256", "1" * 64)):
+    altered_2037_record = dict(mod.REVIEWED_PR2037_BASELINE, **{field: value})
+    check(f"altered PR 2037 {field} is rejected",
+          lambda p=altered_2037_record: mod.authorize_reviewed_pr(
+              "semantic-reasoning/wirelog", "base", "candidate", 419135, 428046, p, "token"),
+          "exact approved record")
 check("legacy PR 1959 measurement remains a separate compatible record",
       lambda: (_ for _ in ()).throw(AssertionError("legacy record changed"))
       if (mod.REVIEWED_PR_BASELINE["pr_number"] != 1959 or
