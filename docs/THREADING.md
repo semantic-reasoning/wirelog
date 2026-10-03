@@ -277,7 +277,7 @@ The 64-byte padding between `tail` and `head`
 cache-line ping-pong between producer and consumer collapses
 throughput by 2-10x.
 
-### 5.3 Non-explicit atomic APIs — init and relation identity (5 rows)
+### 5.3 Non-explicit atomic APIs — init and relation identity (8 rows)
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
@@ -286,6 +286,9 @@ throughput by 2-10x.
 | `relation.c:col_rel_new_identity` | `wl_next_relation_identity` | `atomic_load_explicit` | `relaxed` | Read the candidate identity before the non-wrapping CAS reservation loop; the counter only has to hand out distinct values, no other memory is published through it |
 | `relation.c:col_rel_new_identity#2` | `wl_next_relation_identity` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Reserve a unique relation identity and retry with the observed value after a lost race; uniqueness comes from the RMW, not from ordering |
 | `relation.c:col_rel_test_set_next_identity` | `wl_next_relation_identity` | `atomic_store_explicit` | `relaxed` | Test-only seam for selecting the terminal allocator state; production allocation is not concurrent with this reset |
+| `relation.c:col_rel_mutation_set_nonce_allocate` | `wl_next_mutation_set_nonce` | `atomic_load_explicit` | `relaxed` | Read the candidate nonce before the nonwrapping CAS reservation loop; the counter only supplies unique admission provenance and publishes no other state |
+| `relation.c:col_rel_mutation_set_nonce_allocate#2` | `wl_next_mutation_set_nonce` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Reserve a unique nonzero mutation-set nonce and retry with the observed value after a lost race; the RMW provides uniqueness without publishing payload state |
+| `relation.c:wl_columnar_relation_test_set_mutation_nonce` | `wl_next_mutation_set_nonce` | `atomic_store_explicit` | `relaxed` | Test-only seam selects allocator exhaustion or retry states before test admissions; tests do not race this reset with nonce allocation |
 
 These are the sites in `wirelog/` that use the **non-explicit** atomic APIs
 (`atomic_load`/`atomic_store`); they default to `memory_order_seq_cst`.
@@ -514,7 +517,7 @@ those slots and arena allocations are quiescent.
 | `source_access.h:wl_columnar_source_access_writer_release#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Publish writer payload completion and retry spurious failure |
 | `source_access.h:wl_columnar_source_access_writer_move` | `src->owner->state` | `atomic_load_explicit` | acquire | Confirm that the source token still holds WRITER before moving its address-bound ownership to another token |
 
-### 5.14 `wirelog/columnar/relation.c` and `session.c` — alias ownership and pool promotion (28 rows)
+### 5.14 `wirelog/columnar/relation.c` and `session.c` — alias ownership and pool promotion (30 rows)
 
 The canonical owner's flattened alias count uses `wl_atomic_u64` because a
 quiesced worker can retire its alias while unrelated readers still hold the
@@ -540,6 +543,8 @@ concurrent alias removals cannot underflow the count.
 | `relation.c:col_rel_destroy_checked#2` | `r->source_access.state` | `atomic_store_explicit` | release | Keep the retired pool slot closed until allocator reset or reuse |
 | `relation.c:col_rel_destroy_checked#3` | `r->descriptor_access.state` | `atomic_store_explicit` | release | Keep the retired descriptor closed until allocator reset or reuse |
 | `relation.c:col_rel_install_shared_view_unprotected` | `dst->storage_alias_borrows` | `atomic_store_explicit` | relaxed | A newly installed alias descriptor has no child aliases of its own |
+| `relation.c:wl_columnar_memory_reservation_inert` | `reservation->owner_bits` | `atomic_load_explicit` | relaxed | Confirm a prepared radix workspace reservation has no owner before reusing its caller-owned token storage; the helper is called while the exact mutation lease stabilizes the relation and workspace |
+| `relation.c:wl_columnar_memory_reservation_inert#2` | `reservation->state` | `atomic_load_explicit` | relaxed | Confirm the token is inert before workspace preparation; this is an initialization check, not a concurrent ownership decision, under the caller's mutation lease |
 | `relation.c:wl_columnar_relation_rebind_permit_valid` | `lease->owner->state` | `atomic_load_explicit` | acquire | Validate that the upgraded canonical source gate holds WRITER before publication |
 | `relation.c:wl_columnar_relation_rebind_permit_valid#2` | `lease->secondary_owner->state` | `atomic_load_explicit` | acquire | Validate that the upgraded destination descriptor gate holds WRITER before publication |
 | `relation.c:wl_columnar_relation_install_shared_view_with_lease` | `dst->descriptor_access.state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Upgrade the sole transferable descriptor reader to exclusive descriptor admission and retry spurious failure |
@@ -680,7 +685,7 @@ the committed token after publication and before a growth transaction.
 | `eval_dedup.c:wl_columnar_eval_dedup_test_fail_next_growth_alloc` | test-only fault flag | `atomic_store_explicit` | release | Arm one allocation refusal before a test invokes dedup growth; excluded from the production library |
 | `eval_dedup.c:wl_columnar_eval_dedup_set_grow` | test-only fault flag | `atomic_exchange_explicit` | acquire-release | Consume the one-shot fault safely when test workers grow dedup tables; excluded from the production library |
 
-The complete source audit now contains **214 atomic call sites**.
+The complete source audit now contains **219 atomic call sites**.
 
 ---
 
