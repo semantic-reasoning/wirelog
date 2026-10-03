@@ -621,7 +621,7 @@ restores them after moving the image's current reservations to the source.
 | `relation.c:col_rel_mutable_image_commit#5` | `old.storage_alias_borrows` | `atomic_store_explicit` | relaxed | Clear the stack retirement copy's alias count before physical cleanup; the copy is private |
 
 ### 5.16 `wirelog/columnar/memory_governor.c` and `relation.c` — atomic
-replacement admission and compaction (19 rows)
+replacement admission and compaction (27 rows)
 
 Replacement admission temporarily accounts for the new footprint while the
 old reservation remains committed. The overlap CAS is the admission
