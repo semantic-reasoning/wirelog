@@ -2031,6 +2031,26 @@ col_op_consolidate_view_steps(const col_rel_t *rel, uint32_t old_nrows,
            + (compacting ? 3u : 1u);
 }
 
+static int
+col_op_consolidate_incremental_delta_generation_preflight(
+    const col_rel_t *rel, uint32_t old_nrows)
+{
+    if (rel->nrows == 0 || old_nrows >= rel->nrows)
+        return 0;
+    uint32_t delta_count = rel->nrows - old_nrows;
+    uint32_t storage_steps = col_op_consolidate_storage_steps(rel,
+            old_nrows, delta_count);
+    uint32_t view_steps = col_op_consolidate_view_steps(rel, old_nrows,
+            delta_count);
+    if ((storage_steps > 0
+        && rel->storage_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - (uint64_t)storage_steps)
+        || rel->view_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - (uint64_t)view_steps)
+        return EOVERFLOW;
+    return 0;
+}
+
 /*
  * col_op_consolidate_incremental_delta - Incremental consolidation with delta output
  *
@@ -2115,18 +2135,6 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
     }
 
     uint32_t delta_count = nr - old_nrows;
-
-    uint32_t storage_steps = col_op_consolidate_storage_steps(rel,
-            old_nrows, delta_count);
-    uint32_t view_steps = col_op_consolidate_view_steps(rel, old_nrows,
-            delta_count);
-    if ((storage_steps > 0
-        && rel->storage_generation
-        >= WL_COLUMNAR_REL_GENERATION_INVALID - (uint64_t)storage_steps)
-        || rel->view_generation
-        >= WL_COLUMNAR_REL_GENERATION_INVALID - (uint64_t)view_steps)
-        return col_op_consolidate_incremental_delta_fail(delta_out,
-                   delta_initial_nrows, EOVERFLOW);
 
     /* Sort only the new delta rows after preparing all permutation scratch.
      * The exact source lease covers the relation being sorted, regardless of
@@ -2569,6 +2577,9 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
             descriptors, 2, owners, 4, leases, 2, initializations, 2);
     if (rc != 0)
         return rc;
+    rel->memory_budget_denial_pending = false;
+    if (delta_out)
+        delta_out->memory_budget_denial_pending = false;
     if (!wl_columnar_relation_float_values_valid(rel)
         || (delta_out
         && (!wl_columnar_relation_float_values_valid(delta_out)
@@ -2577,7 +2588,12 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
         goto finish;
     }
 
-    if (delta_out) {
+    rc = col_op_consolidate_incremental_delta_generation_preflight(rel,
+            old_nrows);
+    if (rc != 0)
+        goto finish;
+
+    if (delta_out && rel->nrows > old_nrows) {
         uint32_t delta_count = rel->nrows > old_nrows
             ? rel->nrows - old_nrows : 0;
         /* Reserve delta_out's view-generation advances before its first
