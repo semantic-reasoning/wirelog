@@ -124,6 +124,14 @@ def host_identity(snapshot):
     return {field: snapshot[field] for field in fields}
 
 
+def stable_admission(artifact):
+    value = dict(artifact)
+    host = dict(value['host_attestation'])
+    host['initial'] = host_identity(host['initial'])
+    value['host_attestation'] = host
+    return value
+
+
 def admit(args, expected_host=None, host_probe=None):
     plans, profiles, calibrations, origin = strict_args(args)
     try:
@@ -143,8 +151,8 @@ def admit(args, expected_host=None, host_probe=None):
         if raw_freeze != rebuilt_bytes or supplied != rebuilt:
             raise CollectionError('command-freeze artifact differs byte-for-byte from validated inputs')
         output = FREEZER['output_path'](args.output_dir, normalized, overlay)
-        if output == freeze_root or output in freeze_root.parents:
-            raise CollectionError('collection output must be a fresh child of the command-freeze directory')
+        if output.parent != freeze_root:
+            raise CollectionError('collection output must be a fresh direct child of the command-freeze directory')
     except (FREEZER['FreezeError'], FREEZER['PROFILE']['PreflightError'],
             FREEZER['PLAN']['PlanError'], FREEZER['CAL']['CalibrationError'],
             OSError) as error:
@@ -222,7 +230,7 @@ def collect(args, host_probe=None):
         # Recompute every validated input and the complete command vector before
         # making the staged directory visible at its requested path.
         before_output, before = admit(args, expected_host=initial_host, host_probe=host_probe)
-        if before_output != output or before != artifact:
+        if before_output != output or stable_admission(before) != stable_admission(artifact):
             raise CollectionError('inputs changed while preparing collection directory')
         if output.exists() or output.is_symlink():
             raise FileExistsError(output)
@@ -232,7 +240,7 @@ def collect(args, host_probe=None):
 
         # Repeat validation after publication; a failed race must leave no artifact.
         after_output, after = admit(args, expected_host=initial_host, host_probe=host_probe)
-        if after_output != output or after != artifact:
+        if after_output != output or stable_admission(after) != stable_admission(artifact):
             raise CollectionError('inputs changed during collection publication')
     except BaseException:
         remove_tree(stage)

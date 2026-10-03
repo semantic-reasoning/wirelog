@@ -109,6 +109,41 @@ class CollectionTests(unittest.TestCase):
         with self.assertRaisesRegex(COLLECTOR['CollectionError'], 'CPU 0'):
             COLLECTOR['admit'](self.args, host_probe=MissingCpu())
 
+    def test_host_counters_and_timestamps_may_advance_during_revalidation(self):
+        class AdvancingProbe:
+            def __init__(self):
+                self.calls = 0
+
+            def snapshot(self):
+                self.calls += 1
+                host = FakeProbe().snapshot()
+                host['timestamp_utc'] += self.calls
+                host['cpu_psi_some_total_usec'] += 3 * self.calls
+                host['cgroup_v2_cpu']['nr_throttled'] += self.calls
+                host['cgroup_v2_cpu']['throttled_usec'] += 11 * self.calls
+                host['frequency_khz'] += 100 * self.calls
+                return host
+
+        probe = AdvancingProbe()
+        _, artifact = COLLECTOR['collect'](self.args, host_probe=probe)
+        self.assertEqual(probe.calls, 3)
+        initial = artifact['host_attestation']['initial']
+        self.assertEqual(initial['timestamp_utc'], 2)
+        self.assertEqual(initial['cpu_psi_some_total_usec'], 103)
+
+    def test_collection_output_must_be_strictly_inside_freeze_directory(self):
+        self.args.output_dir = self.freeze_path.parent.parent / 'sibling-collection'
+        with self.assertRaisesRegex(COLLECTOR['CollectionError'], 'direct child'):
+            COLLECTOR['admit'](self.args, host_probe=FakeProbe())
+        nested_parent = self.freeze_path.parent / 'nested-parent'
+        nested_parent.mkdir()
+        self.args.output_dir = nested_parent / 'nested-collection'
+        try:
+            with self.assertRaisesRegex(COLLECTOR['CollectionError'], 'direct child'):
+                COLLECTOR['admit'](self.args, host_probe=FakeProbe())
+        finally:
+            nested_parent.rmdir()
+
     def test_rejects_tampered_frozen_command_bytes(self):
         original = self.freeze_path.read_bytes()
         freeze = json.loads(original.decode('utf-8'))
