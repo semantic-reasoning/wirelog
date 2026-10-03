@@ -2594,10 +2594,10 @@ tdd_worker_subpass_fn(void *arg)
     }
 
     ctx->any_new = any_new;
-    sess->tdd_subpass_active = saved_tdd_subpass;
-    sess->tdd_outbound_only_active = saved_outbound_only;
-    sess->diff_operators_active = saved_diff;
-    ctx->runtime_ns = now_ns() - worker_t0;
+    /* Leave through the same restore as the early exits after the flags
+     * were saved, so the fall-through cannot skip one (#1977:
+     * delta_seeded). */
+    TDD_WORKER_RETURN();
 #undef TDD_WORKER_RETURN
 }
 
