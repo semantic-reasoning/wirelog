@@ -5,13 +5,14 @@
 host, or produce a performance verdict. Build-profile and host qualification
 are separate later steps.
 
-The caller supplies read-only wrapper worktrees. Each wrapper commit's tree
-must equal its declared upstream tree. Repositories must be non-shallow, and each
-wrapper parent must be present; parent IDs are recorded. Each worktree must have
-the same four benchmark overlay files staged, no unstaged or untracked files, and the staged
-binary diff must byte-match the supplied overlay patch. The plan records both
-wrapper commit IDs and parents, upstream tree IDs, resulting staged tree IDs,
-and the overlay SHA-256. For an A/A control, upstream tree IDs must match.
+The caller supplies read-only wrapper worktrees. Each wrapper commit must have
+exactly one parent, and the parent tree, wrapper tree, and declared upstream tree
+must match. Repositories must be non-shallow, and the parent commit must be
+present. The plan records wrapper and parent commit/tree IDs. Each worktree must
+have the same four benchmark overlay files staged, no unstaged or untracked
+files, and the staged binary diff must byte-match the supplied overlay patch.
+The plan records resulting staged tree IDs and the overlay SHA-256. A/A mode
+requires identical upstream trees; comparison mode requires different trees.
 
 The schedule has 54 adjacent pairs: each of `1x1`, `1x256`, and `32x256` has
 nine AB and nine BA pairs. Pair descriptors are ordered by SHA-256 of
@@ -20,6 +21,7 @@ the schedule reproducible without relying on Python's random implementation.
 Each pair's two calls stay adjacent. Each future process is specified to use
 two internal warmups and one measured sample, for 108 total launches.
 
-The output directory must not exist and its parent must already exist. The
-manifest file and directory are fsynced before success is reported. Temporary
-paths under `/tmp` and `/dev/shm` are rejected.
+The output directory must be a new directory under HOME, and its parent must
+already exist. The manifest is written to a temporary file, fsynced, renamed
+atomically, and the containing directory is fsynced before success is reported.
+Paths under `/tmp` and `/dev/shm` are rejected.
