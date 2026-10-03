@@ -251,6 +251,8 @@ generation_test_append_with_lease(col_rel_t *rel, const int64_t *row)
     int rc = generation_test_mutation_acquire(rel, &held);
     if (rc != 0)
         return rc;
+    /* This helper models a new outer admitted append attempt. */
+    rel->memory_budget_denial_pending = false;
     rc = col_rel_append_row_with_lease(rel, row, &held.lease);
     int finish_rc = generation_test_mutation_finish(&held, rc == 0);
     return rc ? rc : finish_rc;
@@ -4648,9 +4650,11 @@ test_append_overlapping_input(bool locked)
             "public append overlap governed relation");
         wl_columnar_memory_governor_t *governor
             = wl_columnar_memory_governor_ref_get(ref);
-        if (locked)
+        if (locked) {
             CHECK(generation_test_mutation_acquire(rel, &held) == 0,
                 "append overlap mutation admission");
+            rel->memory_budget_denial_pending = false;
+        }
         uint64_t credit = wl_columnar_memory_reserved(governor);
         col_rel_t before = *rel;
         const int64_t *inside = &rel->columns[0][3];
@@ -4677,7 +4681,8 @@ test_append_overlapping_input(bool locked)
             int failed_rc = append_overlap_attempt(rel, inside,
                     locked ? &held : NULL);
             allocation_fail_at = -1;
-            CHECK(failed_rc == ENOMEM && !rel->memory_budget_denial_pending
+            CHECK(failed_rc == ENOMEM
+                && rel->memory_budget_denial_pending == (locked && wide)
                 && mutation_payload_unchanged(rel, &before)
                 && wl_columnar_memory_reserved(governor) == credit,
                 "wide staging malloc failure returns all scratch credit");
@@ -4690,7 +4695,8 @@ test_append_overlapping_input(bool locked)
                 allocation_fail_at = fail;
                 int failed_rc = append_overlap_attempt(rel, inside, &held);
                 allocation_fail_at = -1;
-                CHECK(failed_rc == ENOMEM && !rel->memory_budget_denial_pending
+                CHECK(failed_rc == ENOMEM
+                    && rel->memory_budget_denial_pending == wide
                     && mutation_payload_unchanged(rel, &before)
                     && wl_columnar_memory_reserved(governor) == credit,
                     "locked growth failure after staging rolls back all credit");
@@ -4699,7 +4705,7 @@ test_append_overlapping_input(bool locked)
             wl_columnar_relation_test_fail_next_reservation_commit();
             int publish_rc = append_overlap_attempt(rel, inside, &held);
             CHECK(publish_rc == ENOMEM
-                && !rel->memory_budget_denial_pending
+                && rel->memory_budget_denial_pending == wide
                 && mutation_payload_unchanged(rel, &before)
                 && wl_columnar_memory_reserved(governor) == credit,
                 "locked publication failure returns staged scratch credit");
@@ -4725,7 +4731,7 @@ test_append_overlapping_input(bool locked)
                     locked ? &held : NULL);
             allocation_fail_at = -1;
             CHECK(external_rc == 0 && external_calls == 0 && inside_rc == ENOMEM
-                && !rel->memory_budget_denial_pending
+                && rel->memory_budget_denial_pending == locked
                 && wl_columnar_memory_reserved(governor) == credit,
                 "no-overlap append does not consume a wide-scratch malloc fault");
 #endif
@@ -4788,6 +4794,7 @@ test_leased_append_alias_overlap(void)
                 = wl_columnar_memory_governor_ref_get(ref);
             CHECK(generation_test_mutation_acquire(alias, &held) == 0,
                 "locked alias mutation admission");
+            alias->memory_budget_denial_pending = false;
             uint64_t credit = wl_columnar_memory_reserved(governor);
             col_rel_t root_before = *root, before = *alias,
                 sibling_before = *sibling;
@@ -4820,7 +4827,7 @@ test_leased_append_alias_overlap(void)
                         &held.lease);
                 allocation_fail_at = -1;
                 CHECK(failed_rc == ENOMEM &&
-                    !alias->memory_budget_denial_pending
+                    alias->memory_budget_denial_pending
                     && mutation_payload_unchanged(alias, &before)
                     && mutation_payload_unchanged(root, &root_before)
                     && mutation_payload_unchanged(sibling, &sibling_before)
@@ -4833,7 +4840,7 @@ test_leased_append_alias_overlap(void)
             int prepare_rc = col_rel_append_row_with_lease(alias, inside,
                     &held.lease);
             CHECK(prepare_rc == ENOMEM
-                && !alias->memory_budget_denial_pending
+                && alias->memory_budget_denial_pending
                 && mutation_payload_unchanged(alias, &before)
                 && mutation_payload_unchanged(root, &root_before)
                 && mutation_payload_unchanged(sibling, &sibling_before)
@@ -4863,7 +4870,7 @@ test_leased_append_alias_overlap(void)
                 wl_columnar_relation_test_fail_next_reservation_commit();
                 CHECK(col_rel_append_row_with_lease(alias, inside, &held.lease)
                     == ENOMEM
-                    && !alias->memory_budget_denial_pending
+                    && alias->memory_budget_denial_pending
                     && mutation_payload_unchanged(alias, &before)
                     && mutation_payload_unchanged(root, &root_before)
                     && mutation_payload_unchanged(sibling, &sibling_before)
@@ -4967,22 +4974,42 @@ test_leased_append_authority_and_edges(void)
     rel->memory_budget_denial_pending = true;
     CHECK(col_rel_append_row_with_lease(rel,
         (const int64_t *)(UINTPTR_MAX - 3), &held.lease) == EOVERFLOW
-        && !rel->memory_budget_denial_pending
+        && rel->memory_budget_denial_pending
         && mutation_payload_unchanged(rel, &before),
-        "admitted row endpoint overflow clears evidence without dereference");
+        "nested row endpoint overflow preserves denial evidence without dereference");
     int64_t *column = rel->columns[0];
     rel->columns[0] = (int64_t *)(UINTPTR_MAX - 3);
     CHECK(col_rel_append_row_with_lease(rel, &row, &held.lease) == EOVERFLOW
-        && !rel->memory_budget_denial_pending,
+        && rel->memory_budget_denial_pending,
         "column endpoint overflow precedes dereference");
     rel->columns[0] = column;
     rel->timestamp_capacity = 1;
     CHECK(col_rel_append_row_with_lease(rel, &row, &held.lease) == EINVAL
-        && !rel->memory_budget_denial_pending,
-        "admitted shape rejection clears evidence");
+        && rel->memory_budget_denial_pending,
+        "nested shape rejection preserves denial evidence");
     rel->timestamp_capacity = 0;
     CHECK(generation_test_mutation_finish(&held, false) == 0,
         "lease edge release");
+    cleanup_relations();
+
+    col_rel_t *nested = new_relation();
+    generation_test_mutation_t nested_held = { 0 };
+    CHECK(nested && generation_test_mutation_acquire(nested, &nested_held) == 0,
+        "nested append lease acquisition");
+    nested->memory_budget_denial_pending = true;
+    CHECK(col_rel_append_row_with_lease(nested, &row, &nested_held.lease) == 0
+        && nested->memory_budget_denial_pending,
+        "successful nested append preserves outer quota-denial evidence");
+    CHECK(generation_test_mutation_finish(&nested_held, true) == 0,
+        "nested append lease finish");
+    cleanup_relations();
+
+    col_rel_t *public_retry = new_relation();
+    CHECK(public_retry != NULL, "public stale-evidence relation");
+    public_retry->memory_budget_denial_pending = true;
+    CHECK(col_rel_append_row(public_retry, &row) == 0
+        && !public_retry->memory_budget_denial_pending,
+        "public append starts a fresh denial-evidence attempt");
     cleanup_relations();
 }
 
@@ -5075,6 +5102,7 @@ test_leased_append_generation_boundaries(void)
             int append_rc = col_rel_append_row_with_lease(rel,
                     rel->columns[0], &held.lease);
             CHECK(append_rc == EOVERFLOW
+                && rel->memory_budget_denial_pending
                 && mutation_payload_unchanged(rel, &before),
                 "locked epoch boundary rejects before staging or publication");
             CHECK(generation_test_mutation_finish(&held, false) == 0,
@@ -5099,6 +5127,7 @@ test_leased_append_generation_boundaries(void)
         generation_test_mutation_t held = { 0 };
         CHECK(generation_test_mutation_acquire(rel, &held) == 0,
             "epoch success mutation admission");
+        rel->memory_budget_denial_pending = false;
         CHECK(col_rel_append_row_with_lease(rel, rel->columns[0],
             &held.lease) == 0
             && rel->nrows == rows + 1 && rel->columns[0][rows] == row[0]
