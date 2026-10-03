@@ -25,6 +25,7 @@ MAX_ITERATIONS = 100_000_000
 MAX_ATTEMPTS_PER_CASE = 6
 CASE_NAMES = ('1x1', '1x256', '32x256')
 _ACTIVE_PROCESS = None
+_INTERRUPTED_SIGNAL = None
 
 
 class CalibrationError(ValueError):
@@ -195,7 +196,7 @@ class HostProbe:
         self.affinity = affinity
 
     def snapshot(self):
-        online = parse_cpu_list((self.sys / 'devices/system/cpu/online').read_text())
+        online = parse_cpu_list((self.sys / 'devices/system/cpu/online').read_text(encoding='ascii'))
         try:
             affinity = sorted(self.affinity if self.affinity is not None
                               else os.sched_getaffinity(0))
@@ -207,7 +208,7 @@ class HostProbe:
         cpu = allowed[0]
         cpu_root = self.sys / f'devices/system/cpu/cpu{cpu}'
         topology = cpu_root / 'topology/thread_siblings_list'
-        siblings = sorted(set(parse_cpu_list(topology.read_text())) - {cpu}) \
+        siblings = sorted(set(parse_cpu_list(topology.read_text(encoding='ascii'))) - {cpu}) \
             if topology.is_file() else []
         cpufreq = cpu_root / 'cpufreq'
         governor_path = cpufreq / 'scaling_governor'
@@ -350,27 +351,57 @@ def copy_baseline_binary(original, private_copy, expected_hash):
 
 
 def terminate_group(process, grace_seconds=3):
-    if process.poll() is not None:
-        return
+    # The session leader may already have exited while a descendant still
+    # holds stdout/stderr open. Signal the saved process group regardless.
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         pass
     try:
-        process.communicate(timeout=grace_seconds)
+        output = process.communicate(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.communicate()
-    if process.poll() is None:
-        process.wait()
+        output = None
+    # communicate() can finish when a descendant closes its pipes even if it
+    # ignores TERM and remains in the process group. Kill that saved group too.
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        if output is not None:
+            return output
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    if output is not None:
+        if process.poll() is None:
+            try:
+                process.wait(timeout=grace_seconds)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        return output
+    try:
+        return process.communicate(timeout=grace_seconds)
+    except subprocess.TimeoutExpired as error:
+        # Escaped descendants can retain pipe descriptors. Preserve the
+        # bytes collected so far, close our ends, and still reap the leader.
+        stdout = error.output or b''
+        stderr = error.stderr or b''
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+        if process.poll() is None:
+            try:
+                process.wait(timeout=grace_seconds)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        return stdout, stderr
 
 
 def launch_process(argv, cwd, env, timeout_seconds, popen_factory=subprocess.Popen,
-                   selected_cpu=None):
-    global _ACTIVE_PROCESS
+                   selected_cpu=None, affinity_getter=os.sched_getaffinity):
+    global _ACTIVE_PROCESS, _INTERRUPTED_SIGNAL
     started_ns = time.monotonic_ns()
     try:
         options = dict(cwd=str(cwd), env=env, stdout=subprocess.PIPE,
@@ -386,18 +417,44 @@ def launch_process(argv, cwd, env, timeout_seconds, popen_factory=subprocess.Pop
                     spawn_error=str(error))
     _ACTIVE_PROCESS = process
     try:
-        try:
-            stdout, stderr = process.communicate(timeout=timeout_seconds)
-            timed_out = False
-        except subprocess.TimeoutExpired:
-            terminate_group(process)
-            stdout, stderr = process.communicate()
-            timed_out = True
+        if _INTERRUPTED_SIGNAL is not None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        child_affinity = None
+        affinity_error = None
+        if selected_cpu is not None:
+            try:
+                child_affinity = sorted(affinity_getter(process.pid))
+            except (OSError, ProcessLookupError) as error:
+                affinity_error = str(error)
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            if _INTERRUPTED_SIGNAL is not None:
+                stdout, stderr = terminate_group(process)
+                timed_out = False
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stdout, stderr = terminate_group(process)
+                timed_out = True
+                break
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+                timed_out = False
+                break
+            except subprocess.TimeoutExpired:
+                continue
         finished_ns = time.monotonic_ns()
+        interrupted = _INTERRUPTED_SIGNAL
+        if interrupted is not None:
+            _INTERRUPTED_SIGNAL = None
         return dict(stdout=stdout, stderr=stderr, exit_code=process.returncode,
                     timed_out=timed_out, wall_ns=finished_ns - started_ns,
                     monotonic_started_ns=started_ns, monotonic_finished_ns=finished_ns,
-                    spawn_error=None)
+                    spawn_error=None, child_affinity_cpus=child_affinity,
+                    child_affinity_error=affinity_error, interrupted_signal=interrupted)
     except BaseException:
         terminate_group(process)
         raise
@@ -463,7 +520,10 @@ def calibration_inputs(plan_path, profile_path, overlay_path):
 
 
 def calibrate(plan_path, profile_path, overlay_path, evidence_dir,
-              timeout_seconds=300, probe=None, popen_factory=subprocess.Popen):
+              timeout_seconds=300, probe=None, popen_factory=subprocess.Popen,
+              affinity_getter=os.sched_getaffinity):
+    global _INTERRUPTED_SIGNAL
+    _INTERRUPTED_SIGNAL = None
     plan, profile, plan_hash, profile_hash, binary_hash = calibration_inputs(
         plan_path, profile_path, overlay_path)
     output = prepare_evidence_directory(evidence_dir, plan, profile)
@@ -516,7 +576,8 @@ def calibrate(plan_path, profile_path, overlay_path, evidence_dir,
             write_json_exclusive(output / f'{prefix}-started.json', started)
             result = launch_process(argv, build_cwd, environment, timeout_seconds,
                                     popen_factory=popen_factory,
-                                    selected_cpu=before['selected_cpu'])
+                                    selected_cpu=before['selected_cpu'],
+                                    affinity_getter=affinity_getter)
             stdout_path = output / f'{prefix}-stdout.bin'
             stderr_path = output / f'{prefix}-stderr.bin'
             write_exclusive(stdout_path, result['stdout'])
@@ -534,6 +595,9 @@ def calibrate(plan_path, profile_path, overlay_path, evidence_dir,
                     stderr_sha256=sha256(result['stderr']), exit_code=result['exit_code'],
                     timed_out=result['timed_out'], wall_ns=result['wall_ns'],
                     spawn_error=result['spawn_error'], host_after=None, eligible=False,
+                    interrupted_signal=result.get('interrupted_signal'),
+                    child_affinity_cpus=result.get('child_affinity_cpus'),
+                    child_affinity_error=result.get('child_affinity_error'),
                     accepted=False, append_total_ns=None,
                     diagnostic=f'required post-attempt host telemetry unavailable: {telemetry_error}')
                 write_json_exclusive(output / f'{prefix}-result.json', result_record)
@@ -548,14 +612,25 @@ def calibrate(plan_path, profile_path, overlay_path, evidence_dir,
                           stderr_sha256=sha256(result['stderr']),
                           exit_code=result['exit_code'], timed_out=result['timed_out'],
                           wall_ns=result['wall_ns'], spawn_error=result['spawn_error'],
+                          interrupted_signal=result.get('interrupted_signal'),
+                          child_affinity_cpus=result.get('child_affinity_cpus'),
+                          child_affinity_error=result.get('child_affinity_error'),
                           host_after=after, telemetry=eligibility,
                           eligible=eligibility['eligible'], accepted=False,
                           append_total_ns=None, diagnostic=None)
             try:
                 if result['timed_out']:
                     raise CalibrationError('benchmark process timed out and was reaped')
+                if result.get('interrupted_signal') is not None:
+                    raise CalibrationInterrupted(
+                        f"interrupted by signal {result['interrupted_signal']}; "
+                        'process group terminated and output captured')
                 if result['spawn_error'] is not None:
                     raise CalibrationError(f'benchmark process could not start: {result["spawn_error"]}')
+                if result.get('child_affinity_error') is not None:
+                    raise CalibrationError(f"child CPU affinity unavailable: {result['child_affinity_error']}")
+                if result.get('child_affinity_cpus') != [before['selected_cpu']]:
+                    raise CalibrationError('child CPU affinity does not match selected CPU')
                 if result['exit_code'] != 0:
                     raise CalibrationError(f'benchmark exited with status {result["exit_code"]}')
                 parsed = OUTPUT['parse_output'](result['stdout'], case, iterations,
@@ -573,6 +648,9 @@ def calibrate(plan_path, profile_path, overlay_path, evidence_dir,
                 record['diagnostic'] = str(error)
             write_json_exclusive(output / f'{prefix}-result.json', record)
             attempts.append(record)
+            if _INTERRUPTED_SIGNAL is not None:
+                raise CalibrationInterrupted(
+                    f'interrupted by signal {_INTERRUPTED_SIGNAL}; attempt evidence preserved')
             verify()
             if record['diagnostic']:
                 raise CalibrationError(f'{case} attempt {attempt_index + 1} failed: {record["diagnostic"]}')
@@ -585,6 +663,9 @@ def calibrate(plan_path, profile_path, overlay_path, evidence_dir,
             raise CalibrationError(f'{case} did not reach {MIN_APPEND_NS} ns in '
                                    f'{MAX_ATTEMPTS_PER_CASE} eligible attempts')
 
+    if _INTERRUPTED_SIGNAL is not None:
+        raise CalibrationInterrupted(
+            f'interrupted by signal {_INTERRUPTED_SIGNAL}; calibration artifact not published')
     verify()
     final_host = probe.snapshot()
     artifact = dict(
@@ -595,17 +676,20 @@ def calibrate(plan_path, profile_path, overlay_path, evidence_dir,
         private_binary_sha256=hash_file(private_binary),
         host=dict(initial=initial_host, final=final_host),
         accepted_iteration_counts=accepted_counts,
-        attempts=attempts, candidate_launches=0,
-        benchmark_launches_performed=0)
+        attempts=attempts, candidate_launches=0)
     write_json_atomic(output / 'calibration.json', artifact)
     return output / 'calibration.json', artifact
 
 
 def terminate_active_process(signum, _frame):
+    global _INTERRUPTED_SIGNAL
+    _INTERRUPTED_SIGNAL = signum
     process = _ACTIVE_PROCESS
     if process is not None:
-        terminate_group(process)
-    raise CalibrationInterrupted(f'interrupted by signal {signum}; child process group reaped')
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
 
 
 def main(argv=None):

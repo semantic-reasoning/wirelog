@@ -76,6 +76,7 @@ def bad(path):
     def test_binary_and_explicit_encoding_are_allowed(self):
         source = """
 import subprocess
+import os
 from pathlib import Path
 
 def good(path):
@@ -83,6 +84,7 @@ def good(path):
     path.write_text('x', encoding='utf-8')
     path.open('rb')
     open(path, 'wb')
+    os.open(path, os.O_RDONLY)
     subprocess.run(['tool'], text=True, encoding='utf-8')
 """
         with tempfile.TemporaryDirectory() as directory:
