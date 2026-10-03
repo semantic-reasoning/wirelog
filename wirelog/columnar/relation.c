@@ -281,7 +281,7 @@ typedef struct {
     wl_columnar_relation_mutation_set_t set;
     wl_columnar_relation_mutation_role_t role;
     wl_columnar_relation_mutation_descriptor_t descriptor;
-    wl_columnar_relation_mutation_owner_t owner;
+    wl_columnar_relation_mutation_owner_t owners[2];
     wl_columnar_relation_mutation_lease_t lease;
     wl_columnar_relation_mutation_initialization_t initialization;
 } wl_columnar_relation_mutation_single_t;
@@ -293,7 +293,7 @@ col_rel_mutation_single_acquire(col_rel_t *relation,
     single->role.relation = relation;
     single->role.role_flags = WL_COLUMNAR_RELATION_PAYLOAD_MUTATION;
     return col_rel_mutation_set_acquire(&single->set, &single->role, 1,
-               &single->descriptor, 1, &single->owner, 1, &single->lease, 1,
+               &single->descriptor, 1, single->owners, 2, &single->lease, 1,
                &single->initialization, 1);
 }
 
@@ -313,6 +313,8 @@ static int col_rel_cow_unshare_publish_impl(col_rel_t *r, uint32_t new_cap,
     bool defer_alias_release, bool defer_metadata_retirement,
     col_rel_cow_deferred_t *deferred_old,
     wl_columnar_relation_mutation_lease_t *lease);
+static int col_rel_mutation_lease_advance_storage(
+    wl_columnar_relation_mutation_lease_t *lease, uint64_t prior_generation);
 
 /* Temporary compatibility for unmigrated append/radix/batch transactions.
  * NULL is an explicit legacy path, never a payload mutation lease. These
@@ -474,18 +476,24 @@ col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
     size_t initialization_cap)
 {
     int rc = EINVAL;
+    size_t max_owners;
+    if (!role_count)
+        return EINVAL;
+    if (role_count > SIZE_MAX / 2u)
+        return EOVERFLOW;
+    max_owners = role_count * 2u;
     if (!set || set->identity || set->roles || set->descriptors ||
         set->owners || set->leases
         || set->initializations || set->descriptor_count || set->owner_count
         || set->lease_count || set->initialization_count
-        || set->descriptors_acquired || set->owners_acquired
+        || set->descriptors_acquired || set->owners_acquired || set->published
         || !role_count || !roles || !descriptors || !owners || !leases
         || !initializations || descriptor_cap < role_count
-        || owner_cap < role_count || lease_cap < role_count
+        || owner_cap < max_owners || lease_cap < role_count
         || initialization_cap < role_count)
         return EINVAL;
     if (role_count > SIZE_MAX / sizeof(*descriptors)
-        || role_count > SIZE_MAX / sizeof(*owners)
+        || max_owners > SIZE_MAX / sizeof(*owners)
         || role_count > SIZE_MAX / sizeof(*leases)
         || role_count > SIZE_MAX / sizeof(*initializations))
         return EOVERFLOW;
@@ -496,7 +504,7 @@ col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
                           (uintptr_t)initializations};
     size_t lengths[] = {sizeof(*set), role_count * sizeof(*roles),
                         role_count * sizeof(*descriptors),
-                        role_count * sizeof(*owners),
+                        max_owners * sizeof(*owners),
                         role_count * sizeof(*leases),
                         role_count * sizeof(*initializations)};
     for (size_t i = 0; i < sizeof(starts) / sizeof(starts[0]); i++) {
@@ -511,20 +519,25 @@ col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
         if (!roles[i].relation
             || (roles[i].role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
             && roles[i].role_flags != WL_COLUMNAR_RELATION_METADATA_DETACH)
-            || descriptors[i].relation || owners[i].owner
+            || descriptors[i].relation
             || !col_rel_mutation_writer_inert(&descriptors[i].writer)
-            || !col_rel_mutation_writer_inert(&owners[i].writer)
             || leases[i].identity || leases[i].set || leases[i].relation
             || leases[i].owner || leases[i].descriptor_slot
-            || leases[i].owner_slot || leases[i].relation_identity
+            || leases[i].owner_slot || leases[i].self_owner_slot
+            || leases[i].relation_identity
             || leases[i].relation_generation || leases[i].owner_identity
             || leases[i].owner_generation || leases[i].role_flags
-            || leases[i].detached || initializations[i].relation
+            || leases[i].detached || leases[i].storage_transitioned
+            || initializations[i].relation
             || initializations[i].owner_identity
             || initializations[i].owner_generation ||
             initializations[i].borrows)
             return EINVAL;
     }
+    for (size_t i = 0; i < max_owners; i++)
+        if (owners[i].owner
+            || !col_rel_mutation_writer_inert(&owners[i].writer))
+            return EINVAL;
     set->identity = (uintptr_t)set;
     set->roles = roles;
     set->descriptors = descriptors;
@@ -615,6 +628,11 @@ col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
                 j++;
             if (j == set->owner_count)
                 owners[set->owner_count++].owner = owner;
+            j = 0;
+            while (j < set->owner_count && owners[j].owner != relation)
+                j++;
+            if (j == set->owner_count)
+                owners[set->owner_count++].owner = relation;
         }
     }
     for (size_t i = 1; i < set->owner_count; i++) {
@@ -640,6 +658,14 @@ col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
             for (size_t j = 0; j < set->owner_count; j++)
                 if (owners[j].owner == lease->owner)
                     lease->owner_slot = j;
+            for (size_t j = 0; j < set->owner_count; j++)
+                if (owners[j].owner == lease->relation)
+                    lease->self_owner_slot = j;
+            if (lease->self_owner_slot >= set->owner_count
+                || owners[lease->self_owner_slot].owner != lease->relation) {
+                rc = EINVAL;
+                goto fail;
+            }
             if (lease->relation == lease->owner
                 && col_rel_storage_alias_borrow_count(lease->owner)) {
                 rc = EBUSY;
@@ -721,11 +747,145 @@ col_rel_mutation_lease_validate(
         return 0;
     if (lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
         || lease->owner_slot >= set->owner_count
-        || set->owners[lease->owner_slot].owner != owner)
+        || set->owners[lease->owner_slot].owner != owner
+        || lease->self_owner_slot >= set->owner_count
+        || set->owners[lease->self_owner_slot].owner != expected_relation
+        || wl_columnar_source_access_writer_validate(
+            &set->owners[lease->self_owner_slot].writer,
+            &expected_relation->source_access))
         return EINVAL;
     return wl_columnar_source_access_writer_validate(
         &set->owners[lease->owner_slot].writer, &owner->source_access);
 }
+
+/* A leased publisher may advance this lease only for the exact storage
+ * generation it just published. Mutation-set acquisition holds both the
+ * current owner and the prospective self-owner source gates, so alias COW
+ * can continue under a real token for the newly canonical relation. */
+static int
+col_rel_mutation_lease_advance_storage(
+    wl_columnar_relation_mutation_lease_t *lease, uint64_t prior_generation)
+{
+    if (!lease || lease->identity != (uintptr_t)lease || !lease->set
+        || (lease->detached && lease->owner == lease->relation)
+        || lease->storage_transitioned
+        || lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+        || !lease->relation || !lease->owner
+        || lease->relation_generation != prior_generation
+        || prior_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
+        return EINVAL;
+    wl_columnar_relation_mutation_set_t *set = lease->set;
+    col_rel_t *relation = lease->relation;
+    if (set->identity != (uintptr_t)set || !set->leases || !set->roles
+        || !set->descriptors || !set->owners
+        || set->descriptors_acquired != set->descriptor_count
+        || set->owners_acquired != set->owner_count
+        || lease->descriptor_slot >= set->descriptor_count
+        || lease->owner_slot >= set->owner_count
+        || lease->self_owner_slot >= set->owner_count
+        || set->descriptors[lease->descriptor_slot].relation != relation
+        || set->owners[lease->owner_slot].owner != lease->owner
+        || set->owners[lease->self_owner_slot].owner != relation)
+        return EINVAL;
+    bool member = false;
+    col_rel_t *prior_owner = lease->owner;
+    uint64_t prior_owner_identity = lease->owner_identity;
+    uint64_t prior_owner_generation = lease->owner_generation;
+    for (size_t i = 0; i < set->lease_count; i++)
+        if (&set->leases[i] == lease
+            && set->roles[i].relation == relation
+            && set->roles[i].role_flags == lease->role_flags) {
+            member = true;
+        }
+    if (!member || !relation
+        || relation->relation_identity != lease->relation_identity
+        || wl_columnar_source_access_writer_validate(
+            &set->descriptors[lease->descriptor_slot].writer,
+            &relation->descriptor_access)
+        || wl_columnar_source_access_writer_validate(
+            &set->owners[lease->owner_slot].writer,
+            &lease->owner->source_access)
+        || wl_columnar_source_access_writer_validate(
+            &set->owners[lease->self_owner_slot].writer,
+            &relation->source_access))
+        return EINVAL;
+
+    uint64_t next_generation = prior_generation + 1u;
+    if (relation->storage_generation != next_generation
+        || relation->storage_owner != relation
+        || relation->storage_owner_identity != relation->relation_identity
+        || relation->storage_owner_generation != next_generation
+        || !wl_columnar_relation_generation_valid(next_generation))
+        return EINVAL;
+
+    if (prior_owner == relation) {
+        /* Same-owner reserve/resize: the identity and matching token stay
+         * fixed while storage and owner generation advance together. */
+        if (lease->detached || lease->owner_slot != lease->self_owner_slot
+            || lease->owner_identity != relation->relation_identity
+            || lease->owner_generation != prior_generation
+            || relation->storage_owner_identity != lease->owner_identity)
+            return EINVAL;
+    } else {
+        /* Alias COW: only a just-released binding may move to the exact
+         * pre-acquired self-owner token; arbitrary stale leases cannot. */
+        if (!lease->detached || prior_owner == NULL
+            || prior_owner_identity != prior_owner->relation_identity
+            || prior_owner_generation != prior_owner->storage_generation)
+            return EINVAL;
+    }
+
+    /* A mutation set may hold the same descriptor in multiple payload
+     * roles. Validate every matching lease against the pre-publication
+     * binding before advancing any of them, then advance them together so
+     * commit validation observes one consistent published generation. */
+    for (size_t i = 0; i < set->lease_count; i++) {
+        wl_columnar_relation_mutation_lease_t *same = &set->leases[i];
+        if (set->roles[i].relation != relation
+            || set->roles[i].role_flags
+            != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION)
+            continue;
+        if (same->set != set || same->identity != (uintptr_t)same
+            || same->relation != relation || same->storage_transitioned
+            || same->relation_identity != lease->relation_identity
+            || same->relation_generation != prior_generation
+            || same->owner != prior_owner
+            || same->owner_identity != prior_owner_identity
+            || same->owner_generation != prior_owner_generation
+            || same->descriptor_slot != lease->descriptor_slot
+            || same->owner_slot != lease->owner_slot
+            || same->self_owner_slot != lease->self_owner_slot
+            || same->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION)
+            return EINVAL;
+    }
+    for (size_t i = 0; i < set->lease_count; i++) {
+        wl_columnar_relation_mutation_lease_t *same = &set->leases[i];
+        if (set->roles[i].relation != relation
+            || set->roles[i].role_flags
+            != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION)
+            continue;
+        if (prior_owner != relation) {
+            same->owner = relation;
+            same->owner_slot = same->self_owner_slot;
+            same->owner_identity = relation->relation_identity;
+            same->detached = false;
+        }
+        same->relation_generation = next_generation;
+        same->owner_generation = next_generation;
+        same->storage_transitioned = true;
+    }
+    set->published = true;
+    return 0;
+}
+
+#ifdef WL_TEST_MUTATION_SET_HOOK
+int
+wl_columnar_relation_test_mutation_lease_advance_storage(
+    wl_columnar_relation_mutation_lease_t *lease, uint64_t prior_generation)
+{
+    return col_rel_mutation_lease_advance_storage(lease, prior_generation);
+}
+#endif
 
 int
 col_rel_mutation_set_finish(wl_columnar_relation_mutation_set_t *set,
@@ -751,7 +911,14 @@ col_rel_mutation_set_finish(wl_columnar_relation_mutation_set_t *set,
         if (wl_columnar_source_access_writer_validate(&set->owners[i].writer,
             &set->owners[i].owner->source_access))
             return EINVAL;
-    col_rel_mutation_set_unwind(set, commit);
+    if (commit || set->published)
+        for (size_t i = 0; i < set->lease_count; i++)
+            if (set->roles[i].role_flags
+                == WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+                && col_rel_mutation_lease_validate(&set->leases[i],
+                set->roles[i].relation) != 0)
+                abort();
+    col_rel_mutation_set_unwind(set, commit || set->published);
     return 0;
 }
 
@@ -1988,10 +2155,14 @@ col_rel_grow_owned_transition_publish_impl(col_rel_t *r, uint32_t new_cap,
     bool *old_shared_flags;
     bool old_arena;
     uint64_t ledger_before;
+    uint64_t prior_generation;
 
-    if (lease && (lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+    if (lease && (lease->storage_transitioned
+        || lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
         || col_rel_mutation_lease_validate(lease, r)))
         return EINVAL;
+    prior_generation = lease ? lease->relation_generation
+        : (r ? r->storage_generation : 0);
     wl_columnar_memory_reservation_init(&previous);
 
     if (!r || (r->ncols && !r->columns) || new_cap < r->nrows)
@@ -2060,6 +2231,9 @@ col_rel_grow_owned_transition_publish_impl(col_rel_t *r, uint32_t new_cap,
             if (col_rel_storage_alias_release_locked(r, lease))
                 abort();
             wl_columnar_relation_touch_storage(r);
+            if (col_rel_mutation_lease_advance_storage(lease,
+                prior_generation) != 0)
+                abort();
         }
     } else {
         if (!defer_alias_release)
@@ -2125,10 +2299,14 @@ col_rel_cow_unshare_publish_impl(col_rel_t *r, uint32_t new_cap,
     bool *old_shared;
     uint32_t capacity;
     uint64_t ledger_before;
+    uint64_t prior_generation;
 
-    if (lease && (lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+    if (lease && (lease->storage_transitioned
+        || lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
         || col_rel_mutation_lease_validate(lease, r)))
         return EINVAL;
+    prior_generation = lease ? lease->relation_generation
+        : (r ? r->storage_generation : 0);
     wl_columnar_memory_reservation_init(&previous);
 
     if (!r || !r->col_shared)
@@ -2192,6 +2370,9 @@ col_rel_cow_unshare_publish_impl(col_rel_t *r, uint32_t new_cap,
             if (col_rel_storage_alias_release_locked(r, lease))
                 abort();
             wl_columnar_relation_touch_storage(r);
+            if (col_rel_mutation_lease_advance_storage(lease,
+                prior_generation) != 0)
+                abort();
         }
     } else {
         if (!defer_alias_release)
@@ -4006,6 +4187,7 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
     wl_columnar_memory_reservation_t row_admission;
     bool row_credit_held = false;
     int rc;
+    uint64_t prior_storage_generation = 0;
 
     wl_columnar_memory_reservation_init(&row_admission);
 
@@ -4032,6 +4214,8 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
     if (lease && (lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
         || col_rel_mutation_lease_validate(lease, r)))
         return EINVAL;
+    prior_storage_generation = lease ? lease->relation_generation
+        : r->storage_generation;
     if (!col_rel_timestamp_shape_valid(r) || r->nrows > r->capacity)
         return EINVAL;
     bool replaces_storage = r->col_shared || r->nrows >= r->capacity
@@ -4126,6 +4310,10 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
     bool timestamp_short = r->timestamps
         && r->nrows >= r->timestamp_capacity;
     if (needs_resize || timestamp_short) {
+        if (lease && lease->storage_transitioned) {
+            rc = EINVAL;
+            goto release_writer;
+        }
         /* Canonical-owner storage replacement frees the old buffers.  Live
          * shared views still point at those buffers, so refuse growth until
          * the aliases are released.  A shared-view destination is allowed
@@ -4206,6 +4394,9 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
             col_rel_retire_payload_credit(r);
             col_rel_ledger_reconcile(r, ledger_before);
             wl_columnar_relation_touch_storage(r);
+            if (lease && col_rel_mutation_lease_advance_storage(lease,
+                prior_storage_generation) != 0)
+                abort();
         }
     }
     /* A shared view can still have spare capacity.  Privatize it before the
@@ -4276,7 +4467,8 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
         return rc;
     /* Outer attempt provenance starts only after both admissions succeed. */
     r->memory_budget_denial_pending = false;
-    rc = col_rel_append_row_impl(r, row, &single.owner.writer, true,
+    rc = col_rel_append_row_impl(r, row,
+            &single.owners[single.lease.owner_slot].writer, true,
             &single.lease);
     int finish_rc = col_rel_mutation_set_finish(&single.set, rc == 0);
     return rc ? rc : finish_rc;
@@ -4535,6 +4727,7 @@ wl_columnar_relation_reserve_rows_impl(col_rel_t *r, uint32_t additional,
 {
     col_rel_t *owner = NULL;
     int rc;
+    uint64_t prior_storage_generation = 0;
     if (!r)
         return EINVAL;
     if (lease) {
@@ -4542,6 +4735,7 @@ wl_columnar_relation_reserve_rows_impl(col_rel_t *r, uint32_t additional,
             || lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
             || col_rel_mutation_lease_validate(lease, r))
             return EINVAL;
+        prior_storage_generation = lease->relation_generation;
     } else {
         if (!writer || !out_alias_release_pending)
             return EINVAL;
@@ -4563,6 +4757,11 @@ wl_columnar_relation_reserve_rows_impl(col_rel_t *r, uint32_t additional,
      * first locked append.  Perform that fallible transition up front. */
     bool timestamp_short = r->timestamps
         && required > r->timestamp_capacity;
+    bool will_replace_storage = (required <= r->capacity && timestamp_short)
+        || (r->col_shared && required <= r->capacity)
+        || required > r->capacity;
+    if (lease && lease->storage_transitioned && will_replace_storage)
+        return EINVAL;
     if (required <= r->capacity && timestamp_short) {
         if (r->storage_owner == r
             && col_rel_storage_alias_borrow_count(r) > 0)
@@ -4647,6 +4846,9 @@ wl_columnar_relation_reserve_rows_impl(col_rel_t *r, uint32_t additional,
     col_rel_retire_payload_credit(r);
     col_rel_ledger_reconcile(r, ledger_before);
     wl_columnar_relation_touch_storage(r);
+    if (lease && col_rel_mutation_lease_advance_storage(lease,
+        prior_storage_generation) != 0)
+        abort();
     return 0;
 }
 

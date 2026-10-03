@@ -4272,6 +4272,7 @@ relation_mutation_set_exe = executable(
   backend_src, intern_src, arena_src, thread_src, workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_TEST_MUTATION_SET_HOOK=1'],
 )
 test('relation_mutation_set', relation_mutation_set_exe,
   suite: ['unit', 'tsan'], timeout: 60)

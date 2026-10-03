@@ -587,12 +587,14 @@ typedef struct {
     col_rel_t *owner;
     size_t descriptor_slot;
     size_t owner_slot;
+    size_t self_owner_slot;
     uint64_t relation_identity;
     uint64_t relation_generation;
     uint64_t owner_identity;
     uint64_t owner_generation;
     wl_columnar_relation_mutation_role_flags_t role_flags;
     bool detached;
+    bool storage_transitioned;
 } wl_columnar_relation_mutation_lease_t;
 
 typedef struct wl_columnar_relation_mutation_set {
@@ -608,6 +610,7 @@ typedef struct wl_columnar_relation_mutation_set {
     size_t initialization_count;
     size_t descriptors_acquired;
     size_t owners_acquired;
+    bool published;
 } wl_columnar_relation_mutation_set_t;
 
 int col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
@@ -625,6 +628,10 @@ int col_rel_mutation_lease_validate(
     const col_rel_t *expected_relation);
 int col_rel_mutation_set_finish(wl_columnar_relation_mutation_set_t *set,
     bool commit);
+#ifdef WL_TEST_MUTATION_SET_HOOK
+int wl_columnar_relation_test_mutation_lease_advance_storage(
+    wl_columnar_relation_mutation_lease_t *lease, uint64_t prior_generation);
+#endif
 /* Metadata detach publishes the independent binding before its final atomic
  * old-owner borrow decrement. The caller must never access that old owner
  * again through this lease after successful release. */

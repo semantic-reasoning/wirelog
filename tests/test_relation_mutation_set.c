@@ -10,7 +10,7 @@
 typedef struct {
     wl_columnar_relation_mutation_set_t set;
     wl_columnar_relation_mutation_descriptor_t descriptors[4];
-    wl_columnar_relation_mutation_owner_t owners[4];
+    wl_columnar_relation_mutation_owner_t owners[8];
     wl_columnar_relation_mutation_lease_t leases[4];
     wl_columnar_relation_mutation_initialization_t initializations[4];
 } fixture_t;
@@ -19,7 +19,7 @@ static int
 acquire(fixture_t *f, wl_columnar_relation_mutation_role_t *roles, size_t n)
 {
     return col_rel_mutation_set_acquire(&f->set, roles, n,
-               f->descriptors, 4, f->owners, 4, f->leases, 4,
+               f->descriptors, 4, f->owners, 8, f->leases, 4,
                f->initializations, 4);
 }
 
@@ -80,7 +80,14 @@ lease_tests(void)
         {&a, WL_COLUMNAR_RELATION_PAYLOAD_MUTATION}
     };
     assert(acquire(&f, roles, 3) == 0);
-    assert(f.set.descriptor_count == 2 && f.set.owner_count == 1);
+    assert(f.set.descriptor_count == 2 && f.set.owner_count == 3);
+    assert(wl_columnar_source_access_gate_busy(&root.source_access));
+    assert(wl_columnar_source_access_gate_busy(&a.source_access));
+    assert(wl_columnar_source_access_gate_busy(&b.source_access));
+    assert(f.owners[f.leases[0].owner_slot].owner == &root
+        && f.owners[f.leases[0].self_owner_slot].owner == &a
+        && f.owners[f.leases[1].owner_slot].owner == &root
+        && f.owners[f.leases[1].self_owner_slot].owner == &b);
     assert(&f.leases[0] != &f.leases[2]);
     for (size_t i = 0; i < 3; i++)
         assert(col_rel_mutation_set_lease(&f.set, i) == &f.leases[i]);
@@ -108,17 +115,16 @@ lease_tests(void)
     wl_thread_t thread;
     assert(wl_thread_create(&thread, cross_thread, &f.leases[0]) == 0);
     assert(wl_thread_join(&thread) == 0);
-    assert(col_rel_storage_alias_release_locked(&a, &f.leases[0]) == 0);
-    assert(a.storage_owner == &a &&
-        col_rel_storage_alias_borrow_count(&root) == 1);
-    assert(col_rel_storage_alias_release_locked(&a, &f.leases[0]) == EINVAL);
-    assert(col_rel_mutation_lease_validate(&f.leases[2], &a) == EINVAL);
-    assert(col_rel_storage_alias_release_locked(&b, &f.leases[1]) == 0);
+    assert(col_rel_mutation_lease_validate(&f.leases[0], &a) == 0
+        && col_rel_mutation_lease_validate(&f.leases[1], &b) == 0
+        && col_rel_mutation_lease_validate(&f.leases[2], &a) == 0);
+    assert(col_rel_storage_alias_borrow_count(&root) == 2);
     assert(col_rel_mutation_set_finish(&f.set, true) == 0);
     assert_open(&root);
     assert_open(&a);
     assert_open(&b);
     assert(col_rel_mutation_lease_validate(&f.leases[0], &a) == EINVAL);
+    assert(col_rel_storage_alias_borrow_count(&root) == 2);
     /* A raw source writer has no descriptor/set authority. */
     wl_columnar_source_access_writer_t raw = {0};
     assert(wl_columnar_source_access_writer_acquire(&root.source_access,
@@ -126,6 +132,35 @@ lease_tests(void)
     copy = (wl_columnar_relation_mutation_lease_t){0};
     assert(col_rel_storage_alias_release_locked(&a, &copy) == EINVAL);
     assert(wl_columnar_source_access_writer_release(&raw) == 0);
+}
+
+static void
+duplicate_role_publication_tests(void)
+{
+    col_rel_t relation;
+    root_init(&relation, 12);
+    fixture_t f = {0};
+    wl_columnar_relation_mutation_role_t roles[] = {
+        {&relation, WL_COLUMNAR_RELATION_PAYLOAD_MUTATION},
+        {&relation, WL_COLUMNAR_RELATION_PAYLOAD_MUTATION}
+    };
+    assert(acquire(&f, roles, 2) == 0);
+    assert(f.set.descriptor_count == 1 && f.set.owner_count == 1);
+
+    /* Model an irreversible same-owner resize publication. Advancing either
+     * role must advance both leases before failed-transaction cleanup. */
+    relation.storage_generation = 2;
+    relation.storage_owner_generation = 2;
+    assert(wl_columnar_relation_test_mutation_lease_advance_storage(
+            &f.leases[0], 1) == 0);
+    assert(f.leases[0].storage_transitioned
+        && f.leases[1].storage_transitioned);
+    assert(col_rel_mutation_lease_validate(&f.leases[0], &relation) == 0
+        && col_rel_mutation_lease_validate(&f.leases[1], &relation) == 0);
+    /* A later operation may fail after publication. Finish must retain the
+    * publication and validate its refreshed authority before unwinding. */
+    assert(col_rel_mutation_set_finish(&f.set, false) == 0);
+    assert_open(&relation);
 }
 
 static void
@@ -161,6 +196,14 @@ contention_tests(void)
     assert(memcmp(&a, &before, sizeof(a)) == 0);
     assert(wl_columnar_memory_reserved(&governor) == 64);
     assert(col_rel_storage_alias_borrow_count(&root) == 1);
+    assert(wl_columnar_source_access_reader_release(&reader) == 0);
+    assert(wl_columnar_source_access_reader_acquire(&a.source_access,
+        &reader) == 0);
+    before = a;
+    assert(acquire(&f, &role, 1) == EBUSY);
+    assert(memcmp(&a, &before, sizeof(a)) == 0);
+    assert(!wl_columnar_source_access_gate_busy(&root.source_access));
+    assert(!wl_columnar_source_access_gate_busy(&a.descriptor_access));
     assert(wl_columnar_source_access_reader_release(&reader) == 0);
     assert(wl_columnar_source_access_reader_acquire(&root.source_access,
         &reader) == 0);
@@ -269,7 +312,7 @@ invalid_tests(void)
     assert(col_rel_mutation_set_finish(&f.set, true) == EINVAL);
     assert(col_rel_mutation_set_lease(&f.set, 0) == NULL);
     assert(col_rel_mutation_set_acquire(NULL, &role, 1,
-        f.descriptors, 4, f.owners, 4, f.leases, 4,
+        f.descriptors, 4, f.owners, 8, f.leases, 4,
         f.initializations, 4) == EINVAL);
     assert(col_rel_mutation_set_acquire(&f.set, &role, SIZE_MAX,
         f.descriptors, SIZE_MAX, f.owners, SIZE_MAX, f.leases, SIZE_MAX,
@@ -279,7 +322,7 @@ invalid_tests(void)
     assert(acquire(&f, &role, 1) == EINVAL);
     role.relation = &root;
     assert(col_rel_mutation_set_acquire(&f.set, &role, 1,
-        f.descriptors, 0, f.owners, 4, f.leases, 4,
+        f.descriptors, 0, f.owners, 8, f.leases, 4,
         f.initializations, 4) == EINVAL);
     f.descriptors[0].writer.identity = 1;
     assert(acquire(&f, &role, 1) == EINVAL);
@@ -295,6 +338,7 @@ int
 main(void)
 {
     lease_tests();
+    duplicate_role_publication_tests();
     contention_tests();
     rollback_tests();
     invalid_tests();
