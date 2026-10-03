@@ -10,8 +10,10 @@ and tree `4c10e21ab4ba034dbc50abd92a59d22e8b975130`, product pre tree equal to
 that anchor tree, and post tree `9fa822ba32dd3b89e71d0158efa27422e49a06d4`.
 The only product delta is the exact two modified paths
 `tests/test_relation_generations.c` and `wirelog/columnar/relation.c`, bound by
-the canonical Git diff SHA-256 in the manifest. Product paths are disjoint from
-the four benchmark overlay paths.
+the canonical, unrestricted Git diff SHA-256 in the manifest. The validator
+checks the complete pre-to-post tree status set and full diff with renames,
+external diff drivers, and text conversion disabled; extra changed paths fail
+validation. Product paths are disjoint from the four benchmark overlay paths.
 
 Comparison mode requires the base HEAD to be the direct anchor commit and the
 candidate HEAD to be a pre-created synthetic commit with exactly one parent:

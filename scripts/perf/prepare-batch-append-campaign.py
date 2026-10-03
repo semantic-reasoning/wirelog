@@ -118,12 +118,14 @@ def load_revision_manifest():
         raise PlanError('revision product paths overlap benchmark overlay paths')
     try:
         changed = subprocess.run(
-            ['git', '-C', str(REPOSITORY_ROOT), 'diff', '--name-status',
-             product['pre_tree'], product['post_tree'], '--', *product['paths']],
+            ['git', '-C', str(REPOSITORY_ROOT), 'diff', '--no-renames',
+             '--no-ext-diff', '--no-textconv', '--name-status',
+             product['pre_tree'], product['post_tree']],
             check=True, capture_output=True, text=True, encoding='utf-8').stdout.splitlines()
         diff = subprocess.run(
-            ['git', '-C', str(REPOSITORY_ROOT), 'diff', '--binary',
-             product['pre_tree'], product['post_tree'], '--', *product['paths']],
+            ['git', '-C', str(REPOSITORY_ROOT), 'diff', '--no-renames',
+             '--no-ext-diff', '--no-textconv', '--binary',
+             product['pre_tree'], product['post_tree']],
             check=True, capture_output=True).stdout
     except (OSError, subprocess.SubprocessError) as error:
         raise PlanError(f'cannot verify revision product delta: {error}') from error
