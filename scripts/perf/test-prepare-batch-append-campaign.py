@@ -28,7 +28,8 @@ class PreparePlanTests(unittest.TestCase):
             self.git(source, 'init', '-q')
             self.git(source, 'config', 'user.name', 'Plan Test')
             self.git(source, 'config', 'user.email', 'plan@example.invalid')
-            for path in ('baseline.txt', 'bench/meson.build', 'tests/meson.build'):
+            for path in ('baseline.txt', 'bench/meson.build', 'tests/meson.build',
+                         'bench/bench_util.h', 'tests/test_perf_util.h'):
                 (source / path).parent.mkdir(parents=True, exist_ok=True)
                 (source / path).write_text('baseline\n', encoding='utf-8')
             if side == 'candidate':
@@ -82,6 +83,20 @@ class PreparePlanTests(unittest.TestCase):
         values.update(overrides)
         return M['build_plan'](type('Args', (), values)())
 
+    @staticmethod
+    def all_keys(value):
+        if isinstance(value, dict):
+            result = set(value)
+            for item in value.values():
+                result.update(PreparePlanTests.all_keys(item))
+            return result
+        if isinstance(value, list):
+            result = set()
+            for item in value:
+                result.update(PreparePlanTests.all_keys(item))
+            return result
+        return set()
+
     def test_frozen_schedule_is_reproducible_balanced_and_adjacent(self):
         plan = self.plan()
         repeated = self.plan()
@@ -92,7 +107,7 @@ class PreparePlanTests(unittest.TestCase):
         self.assertEqual(plan['schedule']['warmups_per_process'], 2)
         self.assertEqual(plan['schedule']['measured_samples_per_process'], 1)
         self.assertEqual(plan['scope']['benchmark_launches_performed'], 0)
-        self.assertEqual(plan['scope']['performance_verdict'], 'not produced')
+        self.assertNotIn('performance_verdict', self.all_keys(plan))
         pairs = [launches[index:index + 2] for index in range(0, len(launches), 2)]
         self.assertEqual(len(pairs), 54)
         for first, second in pairs:
@@ -109,6 +124,9 @@ class PreparePlanTests(unittest.TestCase):
     def test_plan_records_wrapper_overlay_and_resulting_tree(self):
         plan = self.plan()
         self.assertEqual(plan['schema'], M['SCHEMA'])
+        self.assertEqual(plan['schema_version'], 2)
+        self.assertEqual(plan['benchmark_output_contract'], M['OUTPUT_CONTRACT'])
+        self.assertNotIn('performance_verdict', self.all_keys(plan))
         expected_hash = hashlib.sha256(self.patch.read_bytes()).hexdigest()
         self.assertEqual(plan['overlay']['sha256'], expected_hash)
         self.assertEqual(plan['upstream']['base']['overlay_sha256'], expected_hash)
@@ -119,6 +137,42 @@ class PreparePlanTests(unittest.TestCase):
         self.assertEqual(len(plan['upstream']['base']['wrapper_parent_commit']), 40)
         self.assertEqual(plan['upstream']['base']['wrapper_tree'],
                          plan['upstream']['base']['upstream_tree'])
+        helpers = plan['unchanged_helpers']
+        self.assertEqual(tuple(helpers), M['HELPER_PATHS'])
+        self.assertEqual(plan['upstream']['base']['helper_sources'], helpers)
+        self.assertEqual(plan['upstream']['candidate']['helper_sources'], helpers)
+        for metadata in helpers.values():
+            self.assertTrue(metadata['git_blob_oid'])
+            self.assertEqual(len(metadata['sha256']), 64)
+        cases = plan['benchmark_case_contract']
+        self.assertIn('unresolved until later baseline calibration',
+                      cases['iteration_counts'])
+        self.assertEqual(cases['cases'], [
+            dict(name='1x1', ncols=1, rows_per_call=1, capacity=512,
+                 default_iterations_start=2000000,
+                 iterations_status='starting point; unresolved until baseline calibration'),
+            dict(name='1x256', ncols=1, rows_per_call=256, capacity=512,
+                 default_iterations_start=10000,
+                 iterations_status='starting point; unresolved until baseline calibration'),
+            dict(name='32x256', ncols=32, rows_per_call=256, capacity=512,
+                 default_iterations_start=10000,
+                 iterations_status='starting point; unresolved until baseline calibration'),
+        ])
+
+    def test_rejects_different_unchanged_helper_blobs(self):
+        source = self.root / 'different-helper-source'
+        subprocess.run(['git', 'clone', '-q', str(self.source_data['base'][0]),
+                        str(source)], check=True)
+        (source / 'bench/bench_util.h').write_text('changed helper\n', encoding='utf-8')
+        self.git(source, 'add', 'bench/bench_util.h')
+        self.git(source, 'commit', '-qm', 'different helper upstream')
+        self.git(source, 'commit', '--allow-empty', '-qm', 'wrapper fixture')
+        wrapper = self.git(source, 'rev-parse', 'HEAD')
+        tree = self.git(source, 'rev-parse', f'{wrapper}^{{tree}}')
+        self.add_overlay(source)
+        with self.assertRaisesRegex(M['PlanError'], 'helper Git blobs and SHA-256'):
+            self.plan(candidate_source=source, candidate_wrapper=wrapper,
+                      candidate_upstream_tree=tree)
 
     def test_mode_identity_is_symmetric_for_comparison_and_aa(self):
         same_source = self.root / 'same-source'

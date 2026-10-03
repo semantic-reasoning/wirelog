@@ -51,11 +51,11 @@ main(int argc, char **argv)
         }
     }
     size_t sample_count = 0, summary_count = 0;
-    for (const char *p = output; (p = strstr(p, "sample\tcase=")) != NULL;
-        p += sizeof("sample\tcase=") - 1)
+    for (const char *p = output; (p = strstr(p, "sample\tcontract=")) != NULL;
+        p += sizeof("sample\tcontract=") - 1)
         sample_count++;
-    for (const char *p = output; (p = strstr(p, "summary\tcase=")) != NULL;
-        p += sizeof("summary\tcase=") - 1)
+    for (const char *p = output; (p = strstr(p, "summary\tcontract=")) != NULL;
+        p += sizeof("summary\tcontract=") - 1)
         summary_count++;
     if (sample_count != 6 || summary_count != 3) {
         fprintf(stderr,
@@ -69,6 +69,81 @@ main(int argc, char **argv)
         || !strstr(output, "cov_append_percent=")
         || !strstr(output, "status=OK")) {
         fprintf(stderr, "bench_batch_append_smoke: incomplete metrics\n%s",
+            output);
+        return 1;
+    }
+    static const char *const success_fields[] = {
+        "contract=wirelog.batch-append-benchmark.v2",
+        "denied=0",
+        "row_count_check=OK",
+        "capacity_check=OK",
+        "value_check=OK",
+        "distinct_input_probe=OK",
+        "status=OK",
+    };
+    size_t sample_records = 0, case_records = 0;
+    for (char *line = output; line && *line;) {
+        char *next = strchr(line, '\n');
+        if (next)
+            *next++ = '\0';
+        if (strncmp(line, "sample\t", 7) == 0
+            || strncmp(line, "case\t", 5) == 0) {
+            if (strncmp(line, "sample\t", 7) == 0)
+                sample_records++;
+            else
+                case_records++;
+            for (size_t i = 0;
+                i < sizeof(success_fields) / sizeof(success_fields[0]); i++) {
+                if (!strstr(line, success_fields[i])) {
+                    fprintf(stderr,
+                        "bench_batch_append_smoke: missing %s from success record\n%s\n",
+                        success_fields[i], line);
+                    return 1;
+                }
+            }
+        } else if (strncmp(line, "summary\t", 8) == 0
+            && !strstr(line, "contract=wirelog.batch-append-benchmark.v2")) {
+            fprintf(stderr,
+                "bench_batch_append_smoke: missing output schema from summary\n%s\n",
+                line);
+            return 1;
+        }
+        line = next;
+    }
+    if (sample_records != 6 || case_records != 3) {
+        fprintf(stderr,
+            "bench_batch_append_smoke: expected six sample and three case records\n%s",
+            output);
+        return 1;
+    }
+    if (!strstr(output,
+        "bench_batch_append\tcontract=wirelog.batch-append-benchmark.v2")) {
+        fprintf(stderr,
+            "bench_batch_append_smoke: missing output schema header\n%s",
+            output);
+        return 1;
+    }
+    written = snprintf(command, sizeof(command), "\"%s\" --iterations 0",
+            argv[1]);
+    if (written < 0 || (size_t)written >= sizeof(command)) {
+        fprintf(stderr,
+            "bench_batch_append_smoke: failure probe path too long\n");
+        return 1;
+    }
+    pipe = popen(command, "r");
+    if (!pipe) {
+        fprintf(stderr,
+            "bench_batch_append_smoke: failure probe popen failed\n");
+        return 1;
+    }
+    length = fread(output, 1, sizeof(output) - 1, pipe);
+    output[length] = '\0';
+    status = pclose(pipe);
+    if (status == 0 || strstr(output, "status=OK")
+        || strstr(output, "row_count_check=OK")
+        || strstr(output, "distinct_input_probe=OK")) {
+        fprintf(stderr,
+            "bench_batch_append_smoke: failure emitted a success record\n%s",
             output);
         return 1;
     }

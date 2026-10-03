@@ -39,13 +39,14 @@
 typedef struct {
     uint32_t ncols;
     uint32_t nrows;
+    uint64_t initial_iterations;
     const char *name;
 } append_case_t;
 
 static const append_case_t cases[] = {
-    { 1, 1, "1x1" },
-    { 1, 256, "1x256" },
-    { 32, 256, "32x256" },
+    { 1, 1, UINT64_C(2000000), "1x1" },
+    { 1, 256, UINT64_C(10000), "1x256" },
+    { 32, 256, UINT64_C(10000), "32x256" },
 };
 
 static BENCH_NOINLINE void
@@ -70,7 +71,7 @@ parse_options(int argc, char **argv, const char **which, uint64_t *iterations,
     uint32_t *samples, uint32_t *warmups)
 {
     *which = "all";
-    *iterations = 0; /* Per-case default, scaled by rows per call. */
+    *iterations = 0; /* Use the case's calibration starting point. */
     *samples = 9;
     *warmups = 2;
     for (int i = 1; i < argc; i++) {
@@ -254,14 +255,6 @@ run_case(const append_case_t *test_case, uint64_t iterations,
         }
     }
 
-    for (uint32_t i = 0; i < samples; i++) {
-        printf("sample\tcase=%s\tindex=%u\titerations=%" PRIu64
-            "\tappend_total_ns=%" PRIu64 "\treset_total_ns=%" PRIu64
-            "\tappend_ns_per_call=%.3f\treset_ns_per_call=%.3f\tstatus=OK\n",
-            test_case->name, i, iterations, append_ns[i], reset_ns[i],
-            (double)append_ns[i] / (double)iterations,
-            (double)reset_ns[i] / (double)iterations);
-    }
     uint64_t *ordered = malloc((size_t)samples * sizeof(*ordered));
     if (!ordered) {
         rc = ENOMEM;
@@ -287,7 +280,19 @@ run_case(const append_case_t *test_case, uint64_t iterations,
         ? (double)ordered[samples / 2]
         : ((double)ordered[samples / 2 - 1]
         + (double)ordered[samples / 2]) / 2.0;
-    printf("summary\tcase=%s\tmedian_append_ns_per_call=%.3f"
+    for (uint32_t i = 0; i < samples; i++) {
+        printf("sample\tcontract=wirelog.batch-append-benchmark.v2"
+            "\tcase=%s\tindex=%u\titerations=%" PRIu64
+            "\tappend_total_ns=%" PRIu64 "\treset_total_ns=%" PRIu64
+            "\tappend_ns_per_call=%.3f\treset_ns_per_call=%.3f"
+            "\tdenied=0\trow_count_check=OK\tcapacity_check=OK"
+            "\tvalue_check=OK\tdistinct_input_probe=OK\tstatus=OK\n",
+            test_case->name, i, iterations, append_ns[i], reset_ns[i],
+            (double)append_ns[i] / (double)iterations,
+            (double)reset_ns[i] / (double)iterations);
+    }
+    printf("summary\tcontract=wirelog.batch-append-benchmark.v2"
+        "\tcase=%s\tmedian_append_ns_per_call=%.3f"
         "\tmin_append_ns_per_call=%.3f\tmax_append_ns_per_call=%.3f"
         "\tcov_append_percent=%.3f\tmean_reset_ns_per_call=%.3f\n",
         test_case->name,
@@ -298,8 +303,11 @@ run_case(const append_case_t *test_case, uint64_t iterations,
             : 0.0,
         mean_reset);
     free(ordered);
-    printf("case\tname=%s\tcolumns=%u\trows_per_call=%u\tcapacity=%u"
-        "\titerations=%" PRIu64 "\tsamples=%u\twarmups=%u\tstatus=OK\n",
+    printf("case\tcontract=wirelog.batch-append-benchmark.v2"
+        "\tname=%s\tcolumns=%u\trows_per_call=%u\tcapacity=%u"
+        "\titerations=%" PRIu64 "\tsamples=%u\twarmups=%u"
+        "\tdenied=0\trow_count_check=OK\tcapacity_check=OK"
+        "\tvalue_check=OK\tdistinct_input_probe=OK\tstatus=OK\n",
         test_case->name, test_case->ncols, test_case->nrows, BENCH_CAPACITY,
         iterations, samples, warmups);
     rc = 0;
@@ -326,18 +334,15 @@ main(int argc, char **argv)
             " [--iterations N] [--samples N] [--warmups N]\n", argv[0]);
         return 2;
     }
-    printf("bench_batch_append\treset=nrows-only-before-each-call"
+    printf("bench_batch_append\tcontract=wirelog.batch-append-benchmark.v2"
+        "\treset=nrows-only-before-each-call"
         "\tinput=disjoint\tgovernor=off\treserved_capacity=%u\n",
         BENCH_CAPACITY);
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         if (strcmp(which, "all") != 0 && strcmp(which, cases[i].name) != 0)
             continue;
-        uint64_t case_iterations = iterations;
-        if (case_iterations == 0) {
-            case_iterations = UINT64_C(2000000) / cases[i].nrows;
-            if (case_iterations < 10000)
-                case_iterations = 10000;
-        }
+        uint64_t case_iterations = iterations == 0
+            ? cases[i].initial_iterations : iterations;
         if (run_case(&cases[i], case_iterations, samples, warmups) != 0)
             return 1;
     }
