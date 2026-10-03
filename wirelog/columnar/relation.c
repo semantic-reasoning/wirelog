@@ -25,6 +25,36 @@
  * which has no C11 atomics in its default C mode.  Relaxed ordering is
  * sufficient: the counter only has to hand out distinct values. */
 static wl_atomic_u64 wl_next_relation_identity = 1u;
+static wl_atomic_u64 wl_next_mutation_set_nonce = 1u;
+
+#ifdef WL_TEST_MUTATION_SET_HOOK
+void
+wl_columnar_relation_test_set_mutation_nonce(uint64_t next_nonce)
+{
+    atomic_store_explicit(&wl_next_mutation_set_nonce, next_nonce,
+        memory_order_relaxed);
+}
+#endif
+
+static int
+col_rel_mutation_set_nonce_allocate(uint64_t *nonce)
+{
+    uint64_t observed;
+    if (!nonce)
+        return EINVAL;
+    observed = atomic_load_explicit(&wl_next_mutation_set_nonce,
+            memory_order_relaxed);
+    for (;;) {
+        if (observed == 0 || observed == UINT64_MAX)
+            return EOVERFLOW;
+        uint64_t desired = observed + 1u;
+        if (atomic_compare_exchange_weak_explicit(&wl_next_mutation_set_nonce,
+            &observed, desired, memory_order_relaxed, memory_order_relaxed)) {
+            *nonce = observed;
+            return 0;
+        }
+    }
+}
 
 #ifdef WL_TEST_APPEND_HOOK
 wl_columnar_append_transition_hook_t wl_columnar_append_transition_hook;
@@ -281,7 +311,7 @@ typedef struct {
     wl_columnar_relation_mutation_set_t set;
     wl_columnar_relation_mutation_role_t role;
     wl_columnar_relation_mutation_descriptor_t descriptor;
-    wl_columnar_relation_mutation_owner_t owner;
+    wl_columnar_relation_mutation_owner_t owners[2];
     wl_columnar_relation_mutation_lease_t lease;
     wl_columnar_relation_mutation_initialization_t initialization;
 } wl_columnar_relation_mutation_single_t;
@@ -293,30 +323,26 @@ col_rel_mutation_single_acquire(col_rel_t *relation,
     single->role.relation = relation;
     single->role.role_flags = WL_COLUMNAR_RELATION_PAYLOAD_MUTATION;
     return col_rel_mutation_set_acquire(&single->set, &single->role, 1,
-               &single->descriptor, 1, &single->owner, 1, &single->lease, 1,
+               &single->descriptor, 1, single->owners, 2, &single->lease, 1,
                &single->initialization, 1);
 }
 
 static int col_rel_grow_owned_transition_legacy_impl(col_rel_t *r,
     uint32_t new_cap, bool defer_alias_release);
-typedef struct {
-    int64_t **columns;
-    bool *shared;
-} col_rel_cow_deferred_t;
 static int col_rel_cow_unshare_legacy_impl(col_rel_t *r, uint32_t new_cap,
-    bool defer_alias_release, bool defer_metadata_retirement,
-    col_rel_cow_deferred_t *deferred_old);
+    bool defer_alias_release);
 static int col_rel_grow_owned_transition_publish_impl(col_rel_t *r,
     uint32_t new_cap, bool defer_alias_release,
     wl_columnar_relation_mutation_lease_t *lease);
 static int col_rel_cow_unshare_publish_impl(col_rel_t *r, uint32_t new_cap,
-    bool defer_alias_release, bool defer_metadata_retirement,
-    col_rel_cow_deferred_t *deferred_old,
+    bool defer_alias_release,
     wl_columnar_relation_mutation_lease_t *lease);
+static int col_rel_mutation_lease_advance_storage(
+    wl_columnar_relation_mutation_lease_t *lease, uint64_t prior_generation);
+static bool col_rel_timestamp_shape_valid(const col_rel_t *r);
 
-/* Temporary compatibility for unmigrated append/radix/batch transactions.
- * NULL is an explicit legacy path, never a payload mutation lease. These
- * private entry points disappear as their outer transactions acquire sets. */
+/* Append-all, batch and replacement transactions retain their existing
+ * private authority until those complete transactions migrate. */
 static int
 col_rel_grow_owned_transition_legacy_impl(col_rel_t *r, uint32_t new_cap,
     bool defer_alias_release)
@@ -327,11 +353,10 @@ col_rel_grow_owned_transition_legacy_impl(col_rel_t *r, uint32_t new_cap,
 
 static int
 col_rel_cow_unshare_legacy_impl(col_rel_t *r, uint32_t new_cap,
-    bool defer_alias_release, bool defer_metadata_retirement,
-    col_rel_cow_deferred_t *deferred_old)
+    bool defer_alias_release)
 {
     return col_rel_cow_unshare_publish_impl(r, new_cap, defer_alias_release,
-               defer_metadata_retirement, deferred_old, NULL);
+               NULL);
 }
 
 static int
@@ -474,18 +499,28 @@ col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
     size_t initialization_cap)
 {
     int rc = EINVAL;
+    size_t max_owners;
+    if (!role_count)
+        return EINVAL;
+    if (role_count > SIZE_MAX / 2u)
+        return EOVERFLOW;
+    max_owners = role_count * 2u;
     if (!set || set->identity || set->roles || set->descriptors ||
+        set->acquisition_nonce ||
         set->owners || set->leases
         || set->initializations || set->descriptor_count || set->owner_count
         || set->lease_count || set->initialization_count
         || set->descriptors_acquired || set->owners_acquired
+        || set->terminal_sequence || set->terminal_expected_events
+        || set->terminal_observed_events || set->terminal_sequence_consumed
+        || set->published
         || !role_count || !roles || !descriptors || !owners || !leases
         || !initializations || descriptor_cap < role_count
-        || owner_cap < role_count || lease_cap < role_count
+        || owner_cap < max_owners || lease_cap < role_count
         || initialization_cap < role_count)
         return EINVAL;
     if (role_count > SIZE_MAX / sizeof(*descriptors)
-        || role_count > SIZE_MAX / sizeof(*owners)
+        || max_owners > SIZE_MAX / sizeof(*owners)
         || role_count > SIZE_MAX / sizeof(*leases)
         || role_count > SIZE_MAX / sizeof(*initializations))
         return EOVERFLOW;
@@ -496,7 +531,7 @@ col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
                           (uintptr_t)initializations};
     size_t lengths[] = {sizeof(*set), role_count * sizeof(*roles),
                         role_count * sizeof(*descriptors),
-                        role_count * sizeof(*owners),
+                        max_owners * sizeof(*owners),
                         role_count * sizeof(*leases),
                         role_count * sizeof(*initializations)};
     for (size_t i = 0; i < sizeof(starts) / sizeof(starts[0]); i++) {
@@ -511,21 +546,32 @@ col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
         if (!roles[i].relation
             || (roles[i].role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
             && roles[i].role_flags != WL_COLUMNAR_RELATION_METADATA_DETACH)
-            || descriptors[i].relation || owners[i].owner
+            || descriptors[i].relation
             || !col_rel_mutation_writer_inert(&descriptors[i].writer)
-            || !col_rel_mutation_writer_inert(&owners[i].writer)
-            || leases[i].identity || leases[i].set || leases[i].relation
+            || leases[i].identity || leases[i].acquisition_nonce
+            || leases[i].set || leases[i].relation
             || leases[i].owner || leases[i].descriptor_slot
-            || leases[i].owner_slot || leases[i].relation_identity
+            || leases[i].owner_slot || leases[i].self_owner_slot
+            || leases[i].relation_identity
             || leases[i].relation_generation || leases[i].owner_identity
             || leases[i].owner_generation || leases[i].role_flags
-            || leases[i].detached || initializations[i].relation
+            || leases[i].detached || leases[i].storage_transitioned
+            || initializations[i].relation
             || initializations[i].owner_identity
             || initializations[i].owner_generation ||
             initializations[i].borrows)
             return EINVAL;
     }
+    for (size_t i = 0; i < max_owners; i++)
+        if (owners[i].owner
+            || !col_rel_mutation_writer_inert(&owners[i].writer))
+            return EINVAL;
+    uint64_t acquisition_nonce;
+    rc = col_rel_mutation_set_nonce_allocate(&acquisition_nonce);
+    if (rc)
+        return rc;
     set->identity = (uintptr_t)set;
+    set->acquisition_nonce = acquisition_nonce;
     set->roles = roles;
     set->descriptors = descriptors;
     set->owners = owners;
@@ -599,6 +645,7 @@ col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
         }
         wl_columnar_relation_mutation_lease_t *lease = &leases[i];
         lease->set = set;
+        lease->acquisition_nonce = set->acquisition_nonce;
         lease->relation = relation;
         lease->owner = owner;
         lease->role_flags = roles[i].role_flags;
@@ -615,6 +662,11 @@ col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
                 j++;
             if (j == set->owner_count)
                 owners[set->owner_count++].owner = owner;
+            j = 0;
+            while (j < set->owner_count && owners[j].owner != relation)
+                j++;
+            if (j == set->owner_count)
+                owners[set->owner_count++].owner = relation;
         }
     }
     for (size_t i = 1; i < set->owner_count; i++) {
@@ -640,6 +692,14 @@ col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
             for (size_t j = 0; j < set->owner_count; j++)
                 if (owners[j].owner == lease->owner)
                     lease->owner_slot = j;
+            for (size_t j = 0; j < set->owner_count; j++)
+                if (owners[j].owner == lease->relation)
+                    lease->self_owner_slot = j;
+            if (lease->self_owner_slot >= set->owner_count
+                || owners[lease->self_owner_slot].owner != lease->relation) {
+                rc = EINVAL;
+                goto fail;
+            }
             if (lease->relation == lease->owner
                 && col_rel_storage_alias_borrow_count(lease->owner)) {
                 rc = EBUSY;
@@ -678,11 +738,14 @@ col_rel_mutation_lease_validate(
     const col_rel_t *expected_relation)
 {
     if (!lease || lease->identity != (uintptr_t)lease || !lease->set
+        || !lease->acquisition_nonce
         || !expected_relation || lease->relation != expected_relation
         || lease->detached)
         return EINVAL;
     const wl_columnar_relation_mutation_set_t *set = lease->set;
-    if (set->identity != (uintptr_t)set || !set->roles || !set->leases ||
+    if (set->identity != (uintptr_t)set || !set->acquisition_nonce
+        || lease->acquisition_nonce != set->acquisition_nonce
+        || !set->roles || !set->leases ||
         !set->descriptors
         || !set->owners || set->descriptors_acquired != set->descriptor_count
         || set->owners_acquired != set->owner_count
@@ -721,11 +784,145 @@ col_rel_mutation_lease_validate(
         return 0;
     if (lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
         || lease->owner_slot >= set->owner_count
-        || set->owners[lease->owner_slot].owner != owner)
+        || set->owners[lease->owner_slot].owner != owner
+        || lease->self_owner_slot >= set->owner_count
+        || set->owners[lease->self_owner_slot].owner != expected_relation
+        || wl_columnar_source_access_writer_validate(
+            &set->owners[lease->self_owner_slot].writer,
+            &expected_relation->source_access))
         return EINVAL;
     return wl_columnar_source_access_writer_validate(
         &set->owners[lease->owner_slot].writer, &owner->source_access);
 }
+
+/* A leased publisher may advance this lease only for the exact storage
+ * generation it just published. Mutation-set acquisition holds both the
+ * current owner and the prospective self-owner source gates, so alias COW
+ * can continue under a real token for the newly canonical relation. */
+static int
+col_rel_mutation_lease_advance_storage(
+    wl_columnar_relation_mutation_lease_t *lease, uint64_t prior_generation)
+{
+    if (!lease || lease->identity != (uintptr_t)lease || !lease->set
+        || (lease->detached && lease->owner == lease->relation)
+        || lease->storage_transitioned
+        || lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+        || !lease->relation || !lease->owner
+        || lease->relation_generation != prior_generation
+        || prior_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
+        return EINVAL;
+    wl_columnar_relation_mutation_set_t *set = lease->set;
+    col_rel_t *relation = lease->relation;
+    if (set->identity != (uintptr_t)set || !set->leases || !set->roles
+        || !set->descriptors || !set->owners
+        || set->descriptors_acquired != set->descriptor_count
+        || set->owners_acquired != set->owner_count
+        || lease->descriptor_slot >= set->descriptor_count
+        || lease->owner_slot >= set->owner_count
+        || lease->self_owner_slot >= set->owner_count
+        || set->descriptors[lease->descriptor_slot].relation != relation
+        || set->owners[lease->owner_slot].owner != lease->owner
+        || set->owners[lease->self_owner_slot].owner != relation)
+        return EINVAL;
+    bool member = false;
+    col_rel_t *prior_owner = lease->owner;
+    uint64_t prior_owner_identity = lease->owner_identity;
+    uint64_t prior_owner_generation = lease->owner_generation;
+    for (size_t i = 0; i < set->lease_count; i++)
+        if (&set->leases[i] == lease
+            && set->roles[i].relation == relation
+            && set->roles[i].role_flags == lease->role_flags) {
+            member = true;
+        }
+    if (!member || !relation
+        || relation->relation_identity != lease->relation_identity
+        || wl_columnar_source_access_writer_validate(
+            &set->descriptors[lease->descriptor_slot].writer,
+            &relation->descriptor_access)
+        || wl_columnar_source_access_writer_validate(
+            &set->owners[lease->owner_slot].writer,
+            &lease->owner->source_access)
+        || wl_columnar_source_access_writer_validate(
+            &set->owners[lease->self_owner_slot].writer,
+            &relation->source_access))
+        return EINVAL;
+
+    uint64_t next_generation = prior_generation + 1u;
+    if (relation->storage_generation != next_generation
+        || relation->storage_owner != relation
+        || relation->storage_owner_identity != relation->relation_identity
+        || relation->storage_owner_generation != next_generation
+        || !wl_columnar_relation_generation_valid(next_generation))
+        return EINVAL;
+
+    if (prior_owner == relation) {
+        /* Same-owner reserve/resize: the identity and matching token stay
+         * fixed while storage and owner generation advance together. */
+        if (lease->detached || lease->owner_slot != lease->self_owner_slot
+            || lease->owner_identity != relation->relation_identity
+            || lease->owner_generation != prior_generation
+            || relation->storage_owner_identity != lease->owner_identity)
+            return EINVAL;
+    } else {
+        /* Alias COW: only a just-released binding may move to the exact
+         * pre-acquired self-owner token; arbitrary stale leases cannot. */
+        if (!lease->detached || prior_owner == NULL
+            || prior_owner_identity != prior_owner->relation_identity
+            || prior_owner_generation != prior_owner->storage_generation)
+            return EINVAL;
+    }
+
+    /* A mutation set may hold the same descriptor in multiple payload
+     * roles. Validate every matching lease against the pre-publication
+     * binding before advancing any of them, then advance them together so
+     * commit validation observes one consistent published generation. */
+    for (size_t i = 0; i < set->lease_count; i++) {
+        wl_columnar_relation_mutation_lease_t *same = &set->leases[i];
+        if (set->roles[i].relation != relation
+            || set->roles[i].role_flags
+            != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION)
+            continue;
+        if (same->set != set || same->identity != (uintptr_t)same
+            || same->relation != relation || same->storage_transitioned
+            || same->relation_identity != lease->relation_identity
+            || same->relation_generation != prior_generation
+            || same->owner != prior_owner
+            || same->owner_identity != prior_owner_identity
+            || same->owner_generation != prior_owner_generation
+            || same->descriptor_slot != lease->descriptor_slot
+            || same->owner_slot != lease->owner_slot
+            || same->self_owner_slot != lease->self_owner_slot
+            || same->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION)
+            return EINVAL;
+    }
+    for (size_t i = 0; i < set->lease_count; i++) {
+        wl_columnar_relation_mutation_lease_t *same = &set->leases[i];
+        if (set->roles[i].relation != relation
+            || set->roles[i].role_flags
+            != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION)
+            continue;
+        if (prior_owner != relation) {
+            same->owner = relation;
+            same->owner_slot = same->self_owner_slot;
+            same->owner_identity = relation->relation_identity;
+            same->detached = false;
+        }
+        same->relation_generation = next_generation;
+        same->owner_generation = next_generation;
+        same->storage_transitioned = true;
+    }
+    set->published = true;
+    return 0;
+}
+
+#ifdef WL_TEST_MUTATION_SET_HOOK
+int
+wl_columnar_relation_test_mutation_lease_advance_storage(
+    wl_columnar_relation_mutation_lease_t *lease, uint64_t prior_generation)
+{
+    return col_rel_mutation_lease_advance_storage(lease, prior_generation);
+}
+#endif
 
 int
 col_rel_mutation_set_finish(wl_columnar_relation_mutation_set_t *set,
@@ -735,6 +932,8 @@ col_rel_mutation_set_finish(wl_columnar_relation_mutation_set_t *set,
         || set->descriptors_acquired != set->descriptor_count
         || set->owners_acquired != set->owner_count)
         return EINVAL;
+    if (set->terminal_sequence)
+        abort();
     if (!set->leases || !set->roles || !set->descriptors || !set->owners
         || !set->initializations || !set->lease_count || !set->descriptor_count)
         return EINVAL;
@@ -751,7 +950,329 @@ col_rel_mutation_set_finish(wl_columnar_relation_mutation_set_t *set,
         if (wl_columnar_source_access_writer_validate(&set->owners[i].writer,
             &set->owners[i].owner->source_access))
             return EINVAL;
-    col_rel_mutation_set_unwind(set, commit);
+    if (commit || set->published)
+        for (size_t i = 0; i < set->lease_count; i++)
+            if (set->roles[i].role_flags
+                == WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+                && col_rel_mutation_lease_validate(&set->leases[i],
+                set->roles[i].relation) != 0)
+                abort();
+    col_rel_mutation_set_unwind(set, commit || set->published);
+    return 0;
+}
+
+static uint32_t
+wl_columnar_relation_terminal_event_count(uint32_t events)
+{
+    uint32_t count = 0;
+    for (uint32_t bits = events; bits; bits &= bits - 1u)
+        count++;
+    return count;
+}
+
+static bool
+wl_columnar_relation_terminal_tokens_valid(
+    const wl_columnar_relation_terminal_sequence_t *sequence,
+    bool validate_postconditions)
+{
+    if (!sequence || sequence->identity != (uintptr_t)sequence
+        || !sequence->armed || sequence->consumed || !sequence->set
+        || !sequence->lease || !sequence->relation || !sequence->owner)
+        return false;
+    const uint32_t allowed_events =
+        WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP
+        | WL_COLUMNAR_RELATION_TERMINAL_TIMESTAMP_RETIRE;
+    wl_columnar_relation_mutation_set_t *set = sequence->set;
+    const wl_columnar_relation_mutation_lease_t *lease = sequence->lease;
+    col_rel_t *relation = sequence->relation;
+    if (set->identity != (uintptr_t)set || set->terminal_sequence != sequence
+        || set->terminal_sequence_consumed
+        || !sequence->expected_events
+        || (sequence->expected_events & ~allowed_events)
+        || set->terminal_expected_events != sequence->expected_events
+        || set->terminal_observed_events != sequence->observed_events
+        || (sequence->observed_events & ~sequence->expected_events)
+        || lease->set != set
+        || lease->identity != (uintptr_t)lease || lease->relation != relation
+        || lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+        || !set->roles || !set->leases || !set->descriptors || !set->owners
+        || lease->descriptor_slot != sequence->descriptor_slot
+        || lease->self_owner_slot != sequence->self_owner_slot
+        || set->descriptors_acquired != set->descriptor_count
+        || set->owners_acquired != set->owner_count
+        || sequence->descriptor_slot >= set->descriptor_count
+        || sequence->owner_slot >= set->owner_count
+        || sequence->self_owner_slot >= set->owner_count
+        || set->descriptors[sequence->descriptor_slot].relation != relation
+        || set->owners[sequence->owner_slot].owner != sequence->owner
+        || set->owners[sequence->self_owner_slot].owner != relation
+        || set->descriptors[sequence->descriptor_slot].writer.identity
+        != sequence->descriptor_writer_identity
+        || set->owners[sequence->owner_slot].writer.identity
+        != sequence->owner_writer_identity
+        || set->owners[sequence->self_owner_slot].writer.identity
+        != sequence->self_writer_identity
+        || wl_columnar_source_access_writer_validate(
+            &set->descriptors[sequence->descriptor_slot].writer,
+            &relation->descriptor_access)
+        || wl_columnar_source_access_writer_validate(
+            &set->owners[sequence->owner_slot].writer,
+            &sequence->owner->source_access)
+        || wl_columnar_source_access_writer_validate(
+            &set->owners[sequence->self_owner_slot].writer,
+            &relation->source_access))
+        return false;
+    uint32_t observed_steps =
+        wl_columnar_relation_terminal_event_count(sequence->observed_events);
+    uint64_t observed_generation = sequence->relation_generation
+        + observed_steps;
+    bool lease_member = false;
+    for (size_t i = 0; i < set->lease_count; i++) {
+        const wl_columnar_relation_mutation_lease_t *same = &set->leases[i];
+        const wl_columnar_relation_mutation_role_t *role = &set->roles[i];
+        if (same == lease) {
+            if (role->relation != relation
+                || role->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+                || same->role_flags
+                != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION)
+                return false;
+            lease_member = true;
+        }
+        if (role->relation != relation && same->relation != relation)
+            continue;
+        if (role->relation != relation || same->relation != relation
+            || same->set != set || same->identity != (uintptr_t)same
+            || same->role_flags != role->role_flags)
+            return false;
+        if (role->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION)
+            continue;
+        if (same->owner != sequence->owner
+            || same->relation_identity != sequence->relation_identity
+            || same->owner_identity != sequence->owner_identity
+            || same->relation_generation != sequence->relation_generation
+            || same->owner_generation != sequence->owner_generation
+            || same->descriptor_slot != sequence->descriptor_slot
+            || same->owner_slot != sequence->owner_slot
+            || same->self_owner_slot != sequence->self_owner_slot
+            || same->detached != sequence->detached_before
+            || same->storage_transitioned
+            != sequence->storage_transitioned_before)
+            return false;
+    }
+    bool grid_swapped = (sequence->observed_events
+        & WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP) != 0;
+    bool timestamps_retired = (sequence->observed_events
+        & WL_COLUMNAR_RELATION_TERMINAL_TIMESTAMP_RETIRE) != 0;
+    return lease_member
+           && relation->relation_identity == sequence->relation_identity
+           && relation->storage_owner == sequence->owner
+           && relation->storage_owner_identity == sequence->owner_identity
+           && (!validate_postconditions
+           || relation->storage_generation == observed_generation)
+           && relation->storage_owner_generation
+           == (sequence->owner == relation ? observed_generation
+                                            : sequence->owner_generation)
+           && sequence->owner->relation_identity == sequence->owner_identity
+           && sequence->owner->storage_generation
+           == (sequence->owner == relation ? observed_generation
+                                            : sequence->owner_generation)
+           && (!validate_postconditions || (grid_swapped
+            ? (relation->columns == sequence->merge_columns_before
+           && relation->capacity == sequence->merge_capacity_before
+           && relation->merge_columns == sequence->columns_before
+           && relation->merge_buf_cap == sequence->capacity_before)
+            : (relation->columns == sequence->columns_before
+           && relation->capacity == sequence->capacity_before
+           && relation->merge_columns
+           == sequence->merge_columns_before
+           && relation->merge_buf_cap
+           == sequence->merge_capacity_before)))
+           && (!validate_postconditions || (timestamps_retired
+            ? (relation->timestamps == NULL
+           && relation->timestamp_capacity == 0)
+            : (relation->timestamps == sequence->timestamps_before
+           && relation->timestamp_capacity
+           == sequence->timestamp_capacity_before)));
+}
+
+int
+wl_columnar_relation_terminal_sequence_begin(
+    wl_columnar_relation_terminal_sequence_t *sequence,
+    wl_columnar_relation_mutation_lease_t *lease, uint32_t expected_events)
+{
+    const uint32_t allowed = WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP
+        | WL_COLUMNAR_RELATION_TERMINAL_TIMESTAMP_RETIRE;
+    if (!sequence || sequence->identity || sequence->armed
+        || sequence->consumed || !lease || (expected_events & ~allowed)
+        || !expected_events
+        || col_rel_mutation_lease_validate(lease, lease->relation) != 0)
+        return EINVAL;
+    col_rel_t *relation = lease->relation;
+    bool retires_timestamps = (expected_events
+        & WL_COLUMNAR_RELATION_TERMINAL_TIMESTAMP_RETIRE) != 0;
+    if (retires_timestamps != (relation->timestamps != NULL)
+        || (retires_timestamps && (relation->timestamp_capacity == 0
+        || !col_rel_timestamp_shape_valid(relation)))
+        || ((expected_events & WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP)
+        && ((relation->ncols && (!relation->columns
+        || !relation->merge_columns))
+        || (lease->owner != relation && relation->ncols != 0)
+        || relation->merge_buf_cap == 0)))
+        return EINVAL;
+    uint32_t steps = wl_columnar_relation_terminal_event_count(
+        expected_events);
+    if (steps == 0
+        || relation->storage_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - (uint64_t)steps)
+        return EOVERFLOW;
+    if (lease->set->terminal_sequence
+        || lease->set->terminal_sequence_consumed)
+        return EINVAL;
+    if (lease->set->terminal_expected_events
+        || lease->set->terminal_observed_events)
+        return EINVAL;
+    if (lease->owner_slot >= lease->set->owner_count
+        || lease->self_owner_slot >= lease->set->owner_count)
+        return EINVAL;
+    memset(sequence, 0, sizeof(*sequence));
+    sequence->identity = (uintptr_t)sequence;
+    sequence->set = lease->set;
+    sequence->lease = lease;
+    sequence->relation = relation;
+    sequence->owner = lease->owner;
+    sequence->descriptor_slot = lease->descriptor_slot;
+    sequence->owner_slot = lease->owner_slot;
+    sequence->self_owner_slot = lease->self_owner_slot;
+    sequence->descriptor_writer_identity =
+        lease->set->descriptors[lease->descriptor_slot].writer.identity;
+    sequence->owner_writer_identity =
+        lease->set->owners[lease->owner_slot].writer.identity;
+    sequence->self_writer_identity =
+        lease->set->owners[lease->self_owner_slot].writer.identity;
+    sequence->relation_identity = lease->relation_identity;
+    sequence->owner_identity = lease->owner_identity;
+    sequence->relation_generation = lease->relation_generation;
+    sequence->owner_generation = lease->owner_generation;
+    sequence->columns_before = relation->columns;
+    sequence->merge_columns_before = relation->merge_columns;
+    sequence->timestamps_before = relation->timestamps;
+    sequence->capacity_before = relation->capacity;
+    sequence->merge_capacity_before = relation->merge_buf_cap;
+    sequence->timestamp_capacity_before = relation->timestamp_capacity;
+    sequence->expected_events = expected_events;
+    sequence->detached_before = lease->detached;
+    sequence->storage_transitioned_before = lease->storage_transitioned;
+    sequence->armed = true;
+    lease->set->terminal_sequence = sequence;
+    lease->set->terminal_expected_events = expected_events;
+    lease->set->terminal_observed_events = 0;
+    if (!wl_columnar_relation_terminal_tokens_valid(sequence, true)) {
+        lease->set->terminal_sequence = NULL;
+        lease->set->terminal_expected_events = 0;
+        lease->set->terminal_observed_events = 0;
+        memset(sequence, 0, sizeof(*sequence));
+        return EINVAL;
+    }
+    lease->set->published = true;
+    return 0;
+}
+
+static void
+wl_columnar_relation_terminal_publish_event(
+    wl_columnar_relation_terminal_sequence_t *sequence, uint32_t event)
+{
+    if (!wl_columnar_relation_terminal_tokens_valid(sequence, false)
+        || !sequence->set->published
+        || (event != WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP
+        && event != WL_COLUMNAR_RELATION_TERMINAL_TIMESTAMP_RETIRE)
+        || !(sequence->expected_events & event)
+        || (sequence->observed_events & event))
+        abort();
+    col_rel_t *relation = sequence->relation;
+    if (event == WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP) {
+        if (relation->columns != sequence->merge_columns_before
+            || relation->capacity != sequence->merge_capacity_before
+            || relation->merge_columns != sequence->columns_before
+            || relation->merge_buf_cap != sequence->capacity_before)
+            abort();
+    } else if (relation->timestamps != NULL
+        || relation->timestamp_capacity != 0
+        || sequence->timestamps_before == NULL
+        || sequence->timestamp_capacity_before == 0) {
+        abort();
+    }
+    wl_columnar_relation_touch_storage(relation);
+    sequence->observed_events |= event;
+    sequence->set->terminal_observed_events |= event;
+}
+
+#ifdef WL_TEST_MUTATION_SET_HOOK
+bool
+wl_columnar_relation_test_terminal_sequence_validate(
+    const wl_columnar_relation_terminal_sequence_t *sequence)
+{
+    return wl_columnar_relation_terminal_tokens_valid(sequence, true);
+}
+#endif
+
+void
+wl_columnar_relation_terminal_sequence_publish_grid_swap(
+    wl_columnar_relation_terminal_sequence_t *sequence)
+{
+    wl_columnar_relation_terminal_publish_event(sequence,
+        WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP);
+}
+
+void
+wl_columnar_relation_terminal_sequence_publish_timestamp_retirement(
+    wl_columnar_relation_terminal_sequence_t *sequence)
+{
+    wl_columnar_relation_terminal_publish_event(sequence,
+        WL_COLUMNAR_RELATION_TERMINAL_TIMESTAMP_RETIRE);
+}
+
+int
+wl_columnar_relation_terminal_sequence_finish(
+    wl_columnar_relation_terminal_sequence_t *sequence)
+{
+    if (!wl_columnar_relation_terminal_tokens_valid(sequence, true)
+        || sequence->observed_events != sequence->expected_events)
+        return EINVAL;
+    wl_columnar_relation_mutation_set_t *set = sequence->set;
+    col_rel_t *relation = sequence->relation;
+    uint32_t steps = wl_columnar_relation_terminal_event_count(
+        sequence->expected_events);
+    uint64_t final_generation = sequence->relation_generation + steps;
+    if (relation->storage_generation != final_generation
+        || (sequence->owner == relation
+        && (relation->storage_owner != relation
+        || relation->storage_owner_identity != relation->relation_identity
+        || relation->storage_owner_generation != final_generation))
+        || (sequence->owner != relation
+        && (relation->storage_owner != sequence->owner
+        || relation->storage_owner_identity != sequence->owner_identity
+        || relation->storage_owner_generation != sequence->owner_generation
+        || ((sequence->expected_events
+        & WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP)
+        && relation->ncols != 0))))
+        return EINVAL;
+    for (size_t i = 0; i < set->lease_count; i++) {
+        wl_columnar_relation_mutation_lease_t *same = &set->leases[i];
+        if (set->roles[i].relation != relation
+            || set->roles[i].role_flags
+            != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION)
+            continue;
+        same->relation_generation = final_generation;
+        if (sequence->owner == relation)
+            same->owner_generation = final_generation;
+    }
+    sequence->consumed = true;
+    sequence->armed = false;
+    set->terminal_sequence = NULL;
+    set->terminal_expected_events = 0;
+    set->terminal_observed_events = 0;
+    set->terminal_sequence_consumed = true;
+    set->published = true;
     return 0;
 }
 
@@ -1085,8 +1606,7 @@ col_rel_set(col_rel_t *r, uint32_t row, uint32_t col, int64_t val)
     }
     bool borrowed = r->col_shared != NULL;
     if (borrowed) {
-        rc = col_rel_cow_unshare_publish_impl(r, 0, false, false, NULL,
-                &single.lease);
+        rc = col_rel_cow_unshare_publish_impl(r, 0, false, &single.lease);
         if (rc)
             goto finish;
     }
@@ -1473,6 +1993,17 @@ col_rel_reserve_merge_grid(col_rel_t *r, uint32_t capacity)
         r->retained_reserved_bytes = exact;
     }
     return 0;
+}
+
+int
+col_rel_reserve_merge_grid_with_lease(col_rel_t *r, uint32_t capacity,
+    wl_columnar_relation_mutation_lease_t *lease)
+{
+    if (!r || !lease || lease->role_flags
+        != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+        || col_rel_mutation_lease_validate(lease, r))
+        return EINVAL;
+    return col_rel_reserve_merge_grid(r, capacity);
 }
 
 static void
@@ -1988,10 +2519,14 @@ col_rel_grow_owned_transition_publish_impl(col_rel_t *r, uint32_t new_cap,
     bool *old_shared_flags;
     bool old_arena;
     uint64_t ledger_before;
+    uint64_t prior_generation;
 
-    if (lease && (lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+    if (lease && (lease->storage_transitioned
+        || lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
         || col_rel_mutation_lease_validate(lease, r)))
         return EINVAL;
+    prior_generation = lease ? lease->relation_generation
+        : (r ? r->storage_generation : 0);
     wl_columnar_memory_reservation_init(&previous);
 
     if (!r || (r->ncols && !r->columns) || new_cap < r->nrows)
@@ -2060,6 +2595,9 @@ col_rel_grow_owned_transition_publish_impl(col_rel_t *r, uint32_t new_cap,
             if (col_rel_storage_alias_release_locked(r, lease))
                 abort();
             wl_columnar_relation_touch_storage(r);
+            if (col_rel_mutation_lease_advance_storage(lease,
+                prior_generation) != 0)
+                abort();
         }
     } else {
         if (!defer_alias_release)
@@ -2104,16 +2642,50 @@ col_rel_cow_unshare(col_rel_t *r, uint32_t new_cap)
      * it again; allocation failure keeps it clear. Guard contention above
      * leaves prior evidence untouched. It is not mutation rollback state. */
     r->memory_budget_denial_pending = false;
-    rc = col_rel_cow_unshare_publish_impl(r, new_cap, false, false, NULL,
-            &single.lease);
+    rc = col_rel_cow_unshare_publish_impl(r, new_cap, false, &single.lease);
     int finish_rc = col_rel_mutation_set_finish(&single.set, rc == 0);
     return rc ? rc : finish_rc;
 }
 
+int
+col_rel_cow_unshare_with_lease(col_rel_t *r,
+    wl_columnar_relation_mutation_lease_t *lease)
+{
+    if (!r || !lease || lease->role_flags
+        != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+        || col_rel_mutation_lease_validate(lease, r))
+        return EINVAL;
+    return col_rel_cow_unshare_publish_impl(r, 0, false, lease);
+}
+
+int
+wl_columnar_relation_privatize_shared_view_with_lease(col_rel_t *r,
+    wl_columnar_relation_mutation_lease_t *lease)
+{
+    int rc;
+    if (!r || !lease || lease->role_flags
+        != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+        || col_rel_mutation_lease_validate(lease, r))
+        return EINVAL;
+    if (r->col_shared)
+        return col_rel_cow_unshare_publish_impl(r, 0, false, lease);
+    if (lease->owner == r)
+        return 0;
+    if (r->storage_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
+        return EOVERFLOW;
+    uint64_t prior_generation = r->storage_generation;
+    rc = col_rel_storage_alias_release_locked(r, lease);
+    if (rc)
+        return rc;
+    wl_columnar_relation_touch_storage(r);
+    if (col_rel_mutation_lease_advance_storage(lease, prior_generation) != 0)
+        abort();
+    return 0;
+}
+
 static int
 col_rel_cow_unshare_publish_impl(col_rel_t *r, uint32_t new_cap,
-    bool defer_alias_release, bool defer_metadata_retirement,
-    col_rel_cow_deferred_t *deferred_old,
+    bool defer_alias_release,
     wl_columnar_relation_mutation_lease_t *lease)
 {
     col_rel_payload_txn_t pending;
@@ -2125,18 +2697,20 @@ col_rel_cow_unshare_publish_impl(col_rel_t *r, uint32_t new_cap,
     bool *old_shared;
     uint32_t capacity;
     uint64_t ledger_before;
+    uint64_t prior_generation;
 
-    if (lease && (lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+    if (lease && (lease->storage_transitioned
+        || lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
         || col_rel_mutation_lease_validate(lease, r)))
         return EINVAL;
+    prior_generation = lease ? lease->relation_generation
+        : (r ? r->storage_generation : 0);
     wl_columnar_memory_reservation_init(&previous);
 
     if (!r || !r->col_shared)
         return 0;
     capacity = new_cap ? new_cap : (r->capacity ? r->capacity
                                                     : COL_REL_INIT_CAP);
-    if (deferred_old)
-        *deferred_old = (col_rel_cow_deferred_t){ 0 };
     if (capacity > r->capacity)
         return col_rel_grow_owned_transition_publish_impl(r, capacity,
                    defer_alias_release, lease);
@@ -2167,22 +2741,14 @@ col_rel_cow_unshare_publish_impl(col_rel_t *r, uint32_t new_cap,
     r->columns = private_cols;
     r->col_shared = NULL;
     private_cols = NULL;
-    if (defer_metadata_retirement) {
-        if (!deferred_old)
-            abort();
-        deferred_old->columns = old_columns;
-        deferred_old->shared = old_shared;
-    } else {
-        for (uint32_t c = 0; c < r->ncols; c++)
-            if (!old_shared[c])
-                free(old_columns[c]);
-        free((void *)old_columns);
-        free(old_shared);
-        col_rel_retire_shared_table_credit(r);
-    }
+    for (uint32_t c = 0; c < r->ncols; c++)
+        if (!old_shared[c])
+            free(old_columns[c]);
+    free((void *)old_columns);
+    free(old_shared);
+    col_rel_retire_shared_table_credit(r);
     col_rel_release_retired_reservation(&previous);
-    if (!defer_metadata_retirement)
-        col_rel_retire_payload_credit(r);
+    col_rel_retire_payload_credit(r);
     col_rel_ledger_reconcile(r, ledger_before);
     /* Private columns replaced the borrowed view: one storage epoch. */
     if (lease) {
@@ -2192,6 +2758,9 @@ col_rel_cow_unshare_publish_impl(col_rel_t *r, uint32_t new_cap,
             if (col_rel_storage_alias_release_locked(r, lease))
                 abort();
             wl_columnar_relation_touch_storage(r);
+            if (col_rel_mutation_lease_advance_storage(lease,
+                prior_generation) != 0)
+                abort();
         }
     } else {
         if (!defer_alias_release)
@@ -2207,40 +2776,6 @@ fail:
 #endif
     col_rel_payload_txn_rollback(r, &pending);
     return ENOMEM;
-}
-
-/* Temporary legacy entry point for hash dedup, kway merge, and
- * incremental delta consolidation in merge.c. Their complete transactions
- * migrate in 2B/the batch unit; a raw writer is not a mutation-set lease. */
-int
-col_rel_cow_unshare_legacy_with_source_writer(col_rel_t *r,
-    const wl_columnar_source_access_writer_t *writer)
-{
-    col_rel_t *owner = NULL;
-    int rc;
-
-    if (!r || !writer)
-        return EINVAL;
-    rc = col_rel_storage_owner_resolve(r, &owner);
-    if (rc != 0)
-        return rc;
-    if (writer->owner != &owner->source_access
-        || writer->identity != (uintptr_t)writer
-        || !wl_columnar_source_access_writer_thread_equal(writer))
-        return EINVAL;
-    return col_rel_cow_unshare_legacy_impl(r, 0, true, false, NULL);
-}
-
-/* A raw writer authorizes canonical non-detaching work only. */
-int
-col_rel_cow_unshare_with_source_writer(col_rel_t *r,
-    const wl_columnar_source_access_writer_t *writer)
-{
-    col_rel_t *owner = NULL;
-    if (!r || col_rel_storage_owner_resolve(r, &owner) || owner != r
-        || r->col_shared)
-        return EINVAL;
-    return col_rel_cow_unshare_legacy_with_source_writer(r, writer);
 }
 
 int
@@ -4006,6 +4541,7 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
     wl_columnar_memory_reservation_t row_admission;
     bool row_credit_held = false;
     int rc;
+    uint64_t prior_storage_generation = 0;
 
     wl_columnar_memory_reservation_init(&row_admission);
 
@@ -4032,6 +4568,8 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
     if (lease && (lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
         || col_rel_mutation_lease_validate(lease, r)))
         return EINVAL;
+    prior_storage_generation = lease ? lease->relation_generation
+        : r->storage_generation;
     if (!col_rel_timestamp_shape_valid(r) || r->nrows > r->capacity)
         return EINVAL;
     bool replaces_storage = r->col_shared || r->nrows >= r->capacity
@@ -4126,6 +4664,10 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
     bool timestamp_short = r->timestamps
         && r->nrows >= r->timestamp_capacity;
     if (needs_resize || timestamp_short) {
+        if (lease && lease->storage_transitioned) {
+            rc = EINVAL;
+            goto release_writer;
+        }
         /* Canonical-owner storage replacement frees the old buffers.  Live
          * shared views still point at those buffers, so refuse growth until
          * the aliases are released.  A shared-view destination is allowed
@@ -4206,14 +4748,17 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
             col_rel_retire_payload_credit(r);
             col_rel_ledger_reconcile(r, ledger_before);
             wl_columnar_relation_touch_storage(r);
+            if (lease && col_rel_mutation_lease_advance_storage(lease,
+                prior_storage_generation) != 0)
+                abort();
         }
     }
     /* A shared view can still have spare capacity.  Privatize it before the
      * in-place row write even when no capacity growth is needed. */
     if (r->col_shared) {
         rc = lease
-            ? col_rel_cow_unshare_publish_impl(r, 0, false, false, NULL, lease)
-            : col_rel_cow_unshare_legacy_impl(r, 0, true, false, NULL);
+            ? col_rel_cow_unshare_publish_impl(r, 0, false, lease)
+            : col_rel_cow_unshare_legacy_impl(r, 0, true);
         if (rc != 0)
             goto release_writer;
         alias_release_pending = true;
@@ -4276,17 +4821,23 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
         return rc;
     /* Outer attempt provenance starts only after both admissions succeed. */
     r->memory_budget_denial_pending = false;
-    rc = col_rel_append_row_impl(r, row, &single.owner.writer, true,
+    rc = col_rel_append_row_impl(r, row,
+            &single.owners[single.lease.owner_slot].writer, true,
             &single.lease);
     int finish_rc = col_rel_mutation_set_finish(&single.set, rc == 0);
     return rc ? rc : finish_rc;
 }
 
 int
-col_rel_append_row_locked(col_rel_t *r, const int64_t *row,
-    wl_columnar_source_access_writer_t *writer)
+col_rel_append_row_with_lease(col_rel_t *r, const int64_t *row,
+    wl_columnar_relation_mutation_lease_t *lease)
 {
-    return col_rel_append_row_impl(r, row, writer, true, NULL);
+    if (!r || !row || !lease || lease->role_flags
+        != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+        || col_rel_mutation_lease_validate(lease, r))
+        return EINVAL;
+    return col_rel_append_row_impl(r, row,
+               &lease->set->owners[lease->owner_slot].writer, true, lease);
 }
 
 static int
@@ -4535,6 +5086,7 @@ wl_columnar_relation_reserve_rows_impl(col_rel_t *r, uint32_t additional,
 {
     col_rel_t *owner = NULL;
     int rc;
+    uint64_t prior_storage_generation = 0;
     if (!r)
         return EINVAL;
     if (lease) {
@@ -4542,6 +5094,7 @@ wl_columnar_relation_reserve_rows_impl(col_rel_t *r, uint32_t additional,
             || lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
             || col_rel_mutation_lease_validate(lease, r))
             return EINVAL;
+        prior_storage_generation = lease->relation_generation;
     } else {
         if (!writer || !out_alias_release_pending)
             return EINVAL;
@@ -4563,6 +5116,11 @@ wl_columnar_relation_reserve_rows_impl(col_rel_t *r, uint32_t additional,
      * first locked append.  Perform that fallible transition up front. */
     bool timestamp_short = r->timestamps
         && required > r->timestamp_capacity;
+    bool will_replace_storage = (required <= r->capacity && timestamp_short)
+        || (r->col_shared && required <= r->capacity)
+        || required > r->capacity;
+    if (lease && lease->storage_transitioned && will_replace_storage)
+        return EINVAL;
     if (required <= r->capacity && timestamp_short) {
         if (r->storage_owner == r
             && col_rel_storage_alias_borrow_count(r) > 0)
@@ -4577,8 +5135,8 @@ wl_columnar_relation_reserve_rows_impl(col_rel_t *r, uint32_t additional,
     }
     if (r->col_shared && required <= r->capacity) {
         int rc = lease
-            ? col_rel_cow_unshare_publish_impl(r, 0, false, false, NULL, lease)
-            : col_rel_cow_unshare_legacy_impl(r, 0, true, false, NULL);
+            ? col_rel_cow_unshare_publish_impl(r, 0, false, lease)
+            : col_rel_cow_unshare_legacy_impl(r, 0, true);
         if (rc == 0 && !lease)
             *out_alias_release_pending = alias_release_pending;
         return rc;
@@ -4647,16 +5205,22 @@ wl_columnar_relation_reserve_rows_impl(col_rel_t *r, uint32_t additional,
     col_rel_retire_payload_credit(r);
     col_rel_ledger_reconcile(r, ledger_before);
     wl_columnar_relation_touch_storage(r);
+    if (lease && col_rel_mutation_lease_advance_storage(lease,
+        prior_storage_generation) != 0)
+        abort();
     return 0;
 }
 
 int
-col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
-    wl_columnar_source_access_writer_t *writer,
-    bool *out_alias_release_pending)
+col_rel_reserve_rows_with_lease(col_rel_t *r, uint32_t additional,
+    wl_columnar_relation_mutation_lease_t *lease)
 {
-    return wl_columnar_relation_reserve_rows_impl(r, additional, writer,
-               out_alias_release_pending, true, NULL);
+    if (!r || !lease || lease->role_flags
+        != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+        || col_rel_mutation_lease_validate(lease, r))
+        return EINVAL;
+    return wl_columnar_relation_reserve_rows_impl(r, additional, NULL, NULL,
+               false, lease);
 }
 
 int
@@ -4963,7 +5527,7 @@ col_rel_append_all_impl(col_rel_t *dst, const col_rel_t *src,
                 return rc;
             /* Explicit temporary legacy path: append_all already owns its
              * source writer and migrates as a complete read-source unit. */
-            rc = col_rel_cow_unshare_legacy_impl(dst, 0, false, false, NULL);
+            rc = col_rel_cow_unshare_legacy_impl(dst, 0, false);
             if (wl_columnar_source_access_writer_release(&writer) != 0
                 && rc == 0)
                 rc = EINVAL;
@@ -5033,8 +5597,7 @@ col_rel_append_all_impl(col_rel_t *dst, const col_rel_t *src,
              * path so public COW may acquire its own gate independently. */
             if (dst->col_shared) {
                 dst->memory_budget_denial_pending = false;
-                rc = col_rel_cow_unshare_legacy_impl(dst, 0, false, false,
-                        NULL);
+                rc = col_rel_cow_unshare_legacy_impl(dst, 0, false);
             } else {
                 rc = 0;
             }
@@ -5213,7 +5776,7 @@ col_rel_append_all_impl(col_rel_t *dst, const col_rel_t *src,
     /* Bulk append also mutates spare capacity, so a shared view must be
      * privatized even when the destination does not grow. */
     if (dst->col_shared) {
-        rc = col_rel_cow_unshare_legacy_impl(dst, 0, true, false, NULL);
+        rc = col_rel_cow_unshare_legacy_impl(dst, 0, true);
         if (rc != 0)
             goto cleanup;
         alias_release_pending = true;
@@ -8593,36 +9156,6 @@ wl_columnar_radix_rows_prepared(col_rel_t *r, uint32_t start_row,
     const wl_columnar_radix_workspace_t *workspace,
     col_delta_timestamp_t *timestamps);
 
-static int
-col_rel_insertion_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows,
-    const wl_columnar_radix_workspace_t *workspace,
-    col_delta_timestamp_t *timestamps)
-{
-    uint32_t nc = r->ncols;
-#if SIZE_MAX <= UINT32_MAX
-    if (nrows == UINT32_MAX)
-        return EOVERFLOW;
-#endif
-    size_t row_count = (size_t)nrows + 1u;
-    if (nc != 0 && row_count > SIZE_MAX
-        / ((size_t)nc * sizeof(int64_t)))
-        return EOVERFLOW;
-    size_t work_count = row_count * nc;
-    bool owns_work = workspace == NULL;
-    int64_t *work = workspace ? workspace->insertion_rows
-        : (int64_t *)malloc(work_count * sizeof(*work));
-    if (workspace && workspace->insertion_capacity < nrows)
-        return EINVAL;
-    if (!work)
-        return ENOMEM;
-    wl_columnar_radix_workspace_t prepared = { .insertion_rows = work };
-    int rc = wl_columnar_radix_insertion_prepared(r, start_row, nrows,
-            &prepared, timestamps);
-    if (owns_work)
-        free(work);
-    return rc;
-}
-
 /* ======================================================================== */
 /* Fused Uniform Check + Count Pass (Issue #363 Phase 1)                    */
 /* ======================================================================== */
@@ -9032,206 +9565,6 @@ radix_uniform_count_fused_k16_scalar(const int64_t *col_data,
 #else
 #define radix_uniform_count_fused_k16_fast radix_uniform_count_fused_k16_scalar
 #endif
-
-/*
- * radix_sort_k16: LSD radix sort using 16-bit radix (Issue #363 Phase 5b/5c).
- *
- * 4 passes × 65536 buckets.  Scalar fused uniform+count loop with
- * WL_PREFETCH_R; in-place prefix sum avoids a separate 256KB prefix[].
- * Called for nrows >= 50000 where fewer passes justify the larger histogram.
- */
-static int
-radix_sort_k16(col_rel_t *r, uint32_t start_row, uint32_t nrows,
-    const wl_columnar_radix_workspace_t *workspace,
-    col_delta_timestamp_t *timestamps)
-{
-
-    const uint32_t hist_size = 65536u;
-
-    bool owns_workspace = workspace == NULL;
-    uint32_t *perm_a = workspace ? workspace->perm_a
-        : (uint32_t *)wl_columnar_relation_radix_malloc(
-        nrows * sizeof(uint32_t), "radix_perm_a");
-    uint32_t *perm_b = workspace ? workspace->perm_b
-        : (uint32_t *)wl_columnar_relation_radix_malloc(
-        nrows * sizeof(uint32_t), "radix_perm_b");
-    uint16_t *bv_cache = workspace ? workspace->short_values
-        : (uint16_t *)wl_columnar_relation_radix_malloc(
-        nrows * sizeof(uint16_t), "radix_short_values");
-    uint32_t *count = workspace ? workspace->count16
-        : (uint32_t *)wl_columnar_relation_radix_malloc(
-        hist_size * sizeof(uint32_t), "radix_count16");
-    if (workspace && workspace->k16_capacity < nrows)
-        return EINVAL;
-    if (!perm_a || !perm_b || !bv_cache || !count) {
-        if (owns_workspace) {
-            free(perm_a);
-            free(perm_b);
-            free(bv_cache);
-            free(count);
-        }
-        /* The transactional insertion fallback is intentionally limited to
-         * small inputs.  Running O(n^2) insertion sort for a failed 50K-row
-         * k16 allocation would turn an allocation failure into a timeout. */
-        return nrows <= 32 ? col_rel_insertion_sort(r, start_row, nrows,
-                   workspace, timestamps)
-                           : ENOMEM;
-    }
-
-    int64_t *temp_col = workspace ? workspace->temp_column
-        : (int64_t *)wl_columnar_relation_radix_malloc(
-        nrows * sizeof(int64_t), "radix_temp_column");
-    if (!temp_col) {
-        if (owns_workspace) {
-            free(perm_a);
-            free(perm_b);
-            free(bv_cache);
-            free(count);
-        }
-        return ENOMEM;
-    }
-    wl_columnar_radix_workspace_t prepared = {
-        .perm_a = perm_a, .perm_b = perm_b, .temp_column = temp_col,
-        .short_values = bv_cache,
-        .count16 = count,
-    };
-    int rc = wl_columnar_radix_k16_prepared(r, start_row, nrows, &prepared,
-            timestamps);
-    if (owns_workspace) {
-        free(temp_col);
-        free(perm_a);
-        free(perm_b);
-        free(bv_cache);
-        free(count);
-    }
-    return rc;
-}
-
-/*
- * col_rel_radix_sort: index-permutation LSD radix sort (Phase B, Issue #330).
- *
- * Sort sub-range [start_row, start_row + nrows) of r in-place.
- * Uses col_rel_get() for key extraction (layout-independent).
- * Sorts a permutation array instead of scattering full rows.
- * Permutation is applied once at the end via col_rel_row_copy_out/in.
- *
- * Optimizations (Issue #343):
- *   - Hybrid threshold: insertion sort for nrows <= 32
- *   - Skip-pass: skip byte positions where all values have the same byte
- *   - Byte-value cache: read column data once per pass, reuse for scatter
- *
- * Adaptive radix width (Issue #363 Phase 5c):
- *   - nrows >= 50000: k=16 via radix_sort_k16() — 4 passes × 65536 buckets
- *   - nrows <  50000: k=8  with SIMD fused uniform+count — 8 passes × 256 buckets
- *
- * Falls back to insertion sort on allocation failure.
- */
-static int
-wl_columnar_relation_radix_sort_rows(col_rel_t *r, uint32_t start_row,
-    uint32_t nrows,
-    const wl_columnar_radix_workspace_t *workspace,
-    col_delta_timestamp_t *timestamps)
-{
-    if (nrows <= 1)
-        return 0;
-
-    /* IEEE-754 keys need a different sign transform from signed integers.
-     * Keep the established radix fast path for integer-only relations and
-     * use the typed comparator until the float radix path is introduced. */
-    if (r->column_types) {
-        for (uint32_t c = 0; c < r->ncols; c++) {
-            if (r->column_types[c] == WIRELOG_TYPE_FLOAT)
-                goto insertion;
-        }
-    }
-
-    /* Hybrid threshold: insertion sort for small segments (Issue #343) */
-    if (nrows <= 32)
-        goto insertion;
-
-    /* Adaptive radix width (Issue #363 Phase 5c): dispatch to k=16 for large
-     * arrays where fewer passes outweigh the larger histogram cost.
-     *
-     * Empirical threshold (Apple M-series, 1-col, 64-bit uniform-random keys):
-     *   nrows=10K: k8=0.66ms  k16=0.81ms  k8 faster by 1.23x
-     *   nrows=20K: k8=0.81ms  k16=0.91ms  k8 faster by 1.12x
-     *   nrows=30K: k8=0.83ms  k16=0.89ms  k8 faster by 1.08x
-     *   nrows=40K: k8=0.81ms  k16=0.82ms  near parity
-     *   nrows=50K: k8=0.79ms  k16=0.78ms  k16 faster by 1.01x
-     *   nrows=60K: k8=0.82ms  k16=0.80ms  k16 faster by 1.02x
-     *   nrows=100K: k8=1.41ms k16=1.32ms  k16 faster by 1.07x
-     * Crossover at ~40-50K rows; 50000 is a conservative round boundary.
-     *
-     * k=16 uses a scalar fused loop (not SIMD): the 4-pass reduction
-     * already yields fewer total iterations than 8-pass k=8+SIMD, and a
-     * 256KB histogram makes SIMD gather impractical (cache pressure). */
-    if (nrows >= 50000u) {
-        int rc = radix_sort_k16(r, start_row, nrows, workspace, timestamps);
-        if (rc == 0)
-            wl_columnar_relation_touch_view(r);
-        return rc;
-    }
-
-    /* k=8 SIMD path: 8 passes × 256 buckets (1KB histogram, stack-allocated).
-     * SIMD-dispatched fused uniform+count avoids a separate gather loop. */
-
-    bool owns_workspace = workspace == NULL;
-    uint32_t *perm_a = workspace ? workspace->perm_a
-        : (uint32_t *)wl_columnar_relation_radix_malloc(
-        nrows * sizeof(uint32_t), "radix_perm_a");
-    uint32_t *perm_b = workspace ? workspace->perm_b
-        : (uint32_t *)wl_columnar_relation_radix_malloc(
-        nrows * sizeof(uint32_t), "radix_perm_b");
-    uint8_t *bv_cache = workspace ? workspace->byte_values
-        : (uint8_t *)wl_columnar_relation_radix_malloc(
-        nrows, "radix_byte_values");
-    if (workspace && workspace->k8_capacity < nrows)
-        return EINVAL;
-    if (!perm_a || !perm_b || !bv_cache) {
-        if (owns_workspace) {
-            free(perm_a);
-            free(perm_b);
-            free(bv_cache);
-        }
-        return nrows <= 32 ? col_rel_insertion_sort(r, start_row, nrows,
-                   workspace, timestamps)
-                           : ENOMEM;
-    }
-
-    int64_t *temp_col = workspace ? workspace->temp_column
-        : (int64_t *)wl_columnar_relation_radix_malloc(
-        nrows * sizeof(int64_t), "radix_temp_column");
-    if (!temp_col) {
-        if (owns_workspace) {
-            free(perm_a);
-            free(perm_b);
-            free(bv_cache);
-        }
-        return ENOMEM;
-    }
-    wl_columnar_radix_workspace_t prepared = {
-        .perm_a = perm_a, .perm_b = perm_b, .temp_column = temp_col,
-        .byte_values = bv_cache,
-    };
-    int rc = wl_columnar_radix_rows_prepared(r, start_row, nrows, &prepared,
-            timestamps);
-    if (owns_workspace) {
-        free(temp_col);
-        free(perm_a);
-        free(perm_b);
-        free(bv_cache);
-    }
-    return rc;
-
-insertion:
-    {
-        int rc = col_rel_insertion_sort(r, start_row, nrows, workspace,
-                timestamps);
-        if (rc == 0)
-            wl_columnar_relation_touch_view(r);
-        return rc;
-    }
-}
 
 /* Prepared-only kernels. Every buffer and capacity is validated before COW;
  * no allocator, admission or fallback path is reachable from these kernels. */
@@ -9916,238 +10249,6 @@ wl_columnar_relation_radix_workspace_validate(const col_rel_t *rel,
            workspace->k8_capacity >= nrows ? 0 : EINVAL;
 }
 
-static int
-col_rel_radix_sort_raw(col_rel_t *r, uint32_t start_row, uint32_t nrows,
-    const wl_columnar_radix_workspace_t *workspace)
-{
-    if (!r->timestamps || nrows <= 1)
-        return wl_columnar_relation_radix_sort_rows(r, start_row, nrows,
-                   workspace, NULL);
-    if (workspace) {
-        if (!workspace->timestamps || workspace->timestamp_capacity < nrows)
-            return EINVAL;
-        return wl_columnar_relation_radix_sort_rows(r, start_row, nrows,
-                   workspace,
-                   workspace->timestamps);
-    }
-    size_t bytes = 0;
-    if (!col_rel_size_multiply(nrows, sizeof(col_delta_timestamp_t), &bytes))
-        return ENOMEM;
-    wl_columnar_memory_reservation_t admission;
-    wl_columnar_memory_reservation_init(&admission);
-    bool admitted = false;
-    if (r->memory_governor) {
-        wl_columnar_memory_admission_status_t status =
-            wl_columnar_memory_reserve_checked(
-            wl_columnar_memory_governor_ref_get(r->memory_governor),
-            bytes, &admission);
-        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
-            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
-            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
-                r->memory_budget_denial_pending = true;
-            return ENOMEM;
-        }
-        admitted = true;
-    }
-    col_delta_timestamp_t *timestamps = wl_columnar_relation_radix_malloc(
-        bytes, "radix_timestamps");
-    int rc = timestamps ? wl_columnar_relation_radix_sort_rows(r, start_row,
-            nrows,
-            NULL, timestamps) : ENOMEM;
-    free(timestamps);
-    if (admitted)
-        (void)wl_columnar_memory_release(&admission);
-    return rc;
-}
-
-static int
-col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
-    bool defer_alias_release, bool *out_alias_release_pending,
-    const wl_columnar_radix_workspace_t *workspace);
-
-/* Sort under a writer lease, using the caller's scratch workspace.  Shared
-* views take the same transactional COW path as the locked/consolidation
-* entry point; the alias lease is released after successful publication. */
-int
-wl_columnar_relation_radix_sort_with_workspace(col_rel_t *r,
-    uint32_t start_row,
-    uint32_t nrows, const wl_columnar_source_access_writer_t *writer,
-    const wl_columnar_radix_workspace_t *workspace)
-{
-    col_rel_t *owner = NULL;
-    int rc;
-
-    if (!r || !workspace || start_row > r->nrows
-        || nrows > r->nrows - start_row)
-        return EINVAL;
-    rc = col_rel_storage_owner_resolve(r, &owner);
-    if (rc != 0)
-        return rc;
-    if (!writer || writer->owner != &owner->source_access
-        || writer->identity != (uintptr_t)writer
-        || !wl_columnar_source_access_writer_thread_equal(writer))
-        return EINVAL;
-    /* Contention is reported as EBUSY, matching col_rel_radix_sort_locked.
-     * Folding it into the EINVAL conjunction above made one family answer a
-     * caller two different ways for the same condition. */
-    if (r == owner && col_rel_storage_alias_borrow_count(owner) > 0)
-        return EBUSY;
-    if (r->ncols == 0 || nrows <= 1)
-        return 0;
-    bool alias_release_pending = false;
-    rc = col_rel_radix_sort_impl(r, start_row, nrows, false,
-            &alias_release_pending, workspace);
-    if (alias_release_pending) {
-        int alias_rc = col_rel_storage_alias_release(r);
-        if (alias_rc != 0 && rc == 0)
-            rc = alias_rc;
-    }
-    return rc;
-}
-
-/* defer_alias_release describes the transactional shape of this call: the
- * alias borrow taken by the deferred copy-on-write outlives it and the
- * caller retires it later.  That is the window the consolidation test hook
- * probes, so the hook is keyed on it rather than on which wrapper called in
- * -- a caller-identity flag would silently lose hook coverage the moment a
- * new consolidation entry point routed through a different wrapper. */
-static int
-col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
-    bool defer_alias_release, bool *out_alias_release_pending,
-    const wl_columnar_radix_workspace_t *workspace)
-{
-    if (out_alias_release_pending)
-        *out_alias_release_pending = false;
-    if (!r || start_row > r->nrows || nrows > r->nrows - start_row)
-        return EINVAL;
-    if (nrows <= 1)
-        return 0;
-
-    wl_columnar_radix_workspace_t local_workspace = { 0 };
-    bool owns_workspace = !workspace && r->memory_governor;
-    int rc;
-    if (owns_workspace) {
-        uint32_t bounds[] = { start_row, start_row + nrows };
-        rc = wl_columnar_relation_radix_workspace_prepare(r, bounds, 1, 0,
-                &local_workspace, false);
-        if (rc != 0)
-            return rc;
-        workspace = &local_workspace;
-    }
-    if (workspace) {
-        rc = wl_columnar_relation_radix_workspace_validate(r, nrows, workspace);
-        if (rc != 0)
-            goto cleanup_workspace;
-    }
-    col_rel_cow_deferred_t deferred = { 0 };
-    uint64_t ledger_before = 0;
-    uint64_t old_view = 0;
-    uint64_t old_storage = 0;
-    bool borrowed = r->col_shared != NULL;
-    if (borrowed) {
-        ledger_before = col_rel_owned_ledger_bytes(r);
-        old_view = r->view_generation;
-        old_storage = r->storage_generation;
-        /* Always defer: every caller now holds the alias across the sort
-         * and releases it afterwards (or hands it back).  Releasing inside
-         * the COW and then rolling back would restore a borrowed view whose
-         * borrow the owner no longer counts. */
-        rc = col_rel_cow_unshare_legacy_impl(r, 0, true, true, &deferred);
-        if (rc != 0)
-            goto cleanup_workspace;
-#ifdef WL_TEST_CONSOLIDATE_HOOK
-        if (defer_alias_release
-            && wl_columnar_consolidation_transition_hook)
-            wl_columnar_consolidation_transition_hook(r,
-                WL_COLUMNAR_CONSOLIDATION_TEST_SORT_AFTER_DETACH);
-#endif
-    }
-
-    rc = col_rel_radix_sort_raw(r, start_row, nrows, workspace);
-    if (rc != 0 && borrowed) {
-        col_columns_free(r->columns, r->ncols);
-        r->columns = deferred.columns;
-        r->col_shared = deferred.shared;
-        deferred.columns = NULL;
-        deferred.shared = NULL;
-        col_rel_retire_payload_credit(r);
-        col_rel_ledger_reconcile(r, ledger_before);
-        /* The detach was rolled back; its storage epoch goes with it. */
-        r->view_generation = old_view;
-        r->storage_generation = old_storage;
-    } else if (borrowed) {
-        if (!deferred.columns || !deferred.shared)
-            abort();
-        for (uint32_t c = 0; c < r->ncols; c++)
-            if (!deferred.shared[c])
-                free(deferred.columns[c]);
-        free((void *)deferred.columns);
-        free(deferred.shared);
-        deferred.columns = NULL;
-        deferred.shared = NULL;
-        col_rel_retire_shared_table_credit(r);
-        col_rel_retire_payload_credit(r);
-        if (out_alias_release_pending)
-            *out_alias_release_pending = true;
-    }
-cleanup_workspace:
-    if (owns_workspace)
-        wl_columnar_radix_workspace_destroy(&local_workspace);
-    return rc;
-}
-
-/* Transitional owner-only authority for Unit 2B3b2 consolidation callers.
- * Sort under a writer lease the caller already holds, so a wider mutation
- * transaction can keep admission across the sort.
- *
- * defer_alias_release selects what happens to the borrow the deferred COW
- * takes: false releases it here, true hands it back through
- * *out_alias_release_pending for the caller's own cleanup path.  The out
- * parameter is mandatory in both modes -- a caller that meant to defer but
- * passed NULL would otherwise have its borrow released out from under a
- * transaction that still believes it holds one, so that mistake is refused
- * rather than guessed at.
- *
- * Validation runs before the range shortcut, so a foreign, absent or
- * wrong-thread writer is refused at every row count.  The alias predicate
- * is deliberately r == owner rather than the unconditioned form used by
- * col_rel_reset_rows_locked: sorting an alias while its owner has live
- * borrows is exactly the consolidation case and must stay admissible. */
-int
-col_rel_radix_sort_locked(col_rel_t *r, uint32_t start_row, uint32_t nrows,
-    const wl_columnar_source_access_writer_t *writer,
-    bool defer_alias_release, bool *out_alias_release_pending)
-{
-    col_rel_t *owner = NULL;
-    int rc;
-
-    if (!out_alias_release_pending)
-        return EINVAL;
-    *out_alias_release_pending = false;
-    if (!r || start_row > r->nrows || nrows > r->nrows - start_row)
-        return EINVAL;
-    rc = col_rel_storage_owner_resolve(r, &owner);
-    if (rc != 0)
-        return rc;
-    if (!writer || writer->owner != &owner->source_access
-        || writer->identity != (uintptr_t)writer
-        || !wl_columnar_source_access_writer_thread_equal(writer))
-        return EINVAL;
-    if (r == owner && col_rel_storage_alias_borrow_count(owner) > 0)
-        return EBUSY;
-    if (r->ncols == 0 || nrows <= 1)
-        return 0;
-    rc = col_rel_radix_sort_impl(r, start_row, nrows, defer_alias_release,
-            out_alias_release_pending, NULL);
-    if (!defer_alias_release && *out_alias_release_pending) {
-        int alias_rc = col_rel_storage_alias_release(r);
-        if (alias_rc != 0 && rc == 0)
-            rc = alias_rc;
-        *out_alias_release_pending = false;
-    }
-    return rc;
-}
-
 /* Validate authority and physical shape before reading keys or allocating. */
 static int
 wl_columnar_radix_lease_preflight(col_rel_t *r, uint32_t start,
@@ -10173,6 +10274,248 @@ wl_columnar_radix_lease_preflight(col_rel_t *r, uint32_t start,
     return 0;
 }
 
+void
+wl_columnar_relation_radix_sequence_destroy(
+    wl_columnar_relation_radix_sequence_t *sequence)
+{
+    if (!sequence)
+        return;
+    free(sequence->boundaries);
+    free(sequence->needs_sort);
+    if (sequence->metadata_admission_active)
+        (void)wl_columnar_memory_release(&sequence->metadata_admission);
+    wl_columnar_radix_workspace_destroy(&sequence->workspace);
+    memset(sequence, 0, sizeof(*sequence));
+}
+
+static bool
+wl_columnar_memory_reservation_inert(
+    const wl_columnar_memory_reservation_t *reservation)
+{
+    return reservation && !reservation->governor && !reservation->bytes
+           && !reservation->replacement_bytes && !reservation->transition_kind
+           && !atomic_load_explicit(&reservation->owner_bits,
+               memory_order_relaxed)
+           && !atomic_load_explicit(&reservation->state, memory_order_relaxed)
+           && !reservation->identity;
+}
+
+static bool
+wl_columnar_radix_workspace_inert(const wl_columnar_radix_workspace_t *w)
+{
+    return w && !w->perm_a && !w->perm_b && !w->bucket_values
+           && !w->byte_values && !w->short_values && !w->count16
+           && !w->temp_column && !w->insertion_rows && !w->timestamps
+           && !w->timestamp_capacity && !w->k8_capacity && !w->k16_capacity
+           && !w->insertion_capacity && !w->insertion_bytes
+           && !w->prepared_relation && !w->prepared_identity
+           && !w->prepared_view_generation && !w->prepared_storage_generation
+           && !w->prepared_type_fingerprint && !w->prepared_start
+           && !w->prepared_count && !w->prepared_nrows && !w->prepared_ncols
+           && !w->prepared_capacity && !w->prepared_timestamp_capacity
+           && !w->prepared_has_timestamps && !w->prepared_has_types
+           && !w->admission_active
+           && wl_columnar_memory_reservation_inert(&w->admission);
+}
+
+int
+wl_columnar_relation_radix_sequence_prepare_with_lease(col_rel_t *r,
+    const uint32_t *bounds, uint32_t seg_count,
+    wl_columnar_relation_radix_sequence_t *sequence,
+    wl_columnar_relation_mutation_lease_t *lease)
+{
+    int rc;
+    size_t boundary_count, boundary_bytes, mask_bytes;
+    uint64_t extra;
+    if (!sequence || sequence->identity || sequence->acquisition_nonce
+        || sequence->set || sequence->lease || sequence->relation
+        || sequence->owner || sequence->relation_identity
+        || sequence->relation_generation || sequence->owner_identity
+        || sequence->owner_generation || sequence->view_generation
+        || sequence->type_fingerprint || sequence->columns
+        || sequence->column_types || sequence->timestamps || sequence->nrows
+        || sequence->ncols || sequence->capacity || sequence->timestamp_capacity
+        || sequence->boundaries || sequence->needs_sort || sequence->seg_count
+        || sequence->needs_sort_count || sequence->metadata_admission_active
+        || !wl_columnar_memory_reservation_inert(
+            &sequence->metadata_admission)
+        || sequence->prepared || sequence->consumed
+        || !wl_columnar_radix_workspace_inert(&sequence->workspace))
+        return EINVAL;
+    if (!r || !bounds || !seg_count)
+        return EINVAL;
+    if (seg_count == UINT32_MAX)
+        return EOVERFLOW;
+#if SIZE_MAX <= UINT32_MAX
+    if (seg_count > SIZE_MAX / sizeof(uint32_t) - 1u)
+        return EOVERFLOW;
+#endif
+    rc = wl_columnar_radix_lease_preflight(r, 0, 0, lease);
+    if (rc)
+        return rc;
+    boundary_count = (size_t)seg_count + 1u;
+    if (boundary_count > SIZE_MAX / sizeof(uint32_t))
+        return EOVERFLOW;
+    boundary_bytes = boundary_count * sizeof(uint32_t);
+    mask_bytes = (size_t)seg_count * sizeof(uint8_t);
+    if (boundary_bytes > UINT64_MAX - (uint64_t)mask_bytes)
+        return EOVERFLOW;
+    extra = (uint64_t)boundary_bytes + (uint64_t)mask_bytes;
+    for (uint32_t i = 0; i < seg_count; i++)
+        if (bounds[i] > bounds[i + 1] || bounds[i + 1] > r->nrows)
+            return EINVAL;
+    uint32_t needs_sort_count = 0;
+    for (uint32_t i = 0; i < seg_count; i++) {
+        uint32_t start = bounds[i];
+        uint32_t end = bounds[i + 1];
+        bool sorted = end - start <= 1u;
+        if (!sorted) {
+            sorted = true;
+            for (uint32_t row = start + 1u; row < end; row++)
+                if (col_rel_row_cmp(r, row - 1u, row) > 0) {
+                    sorted = false;
+                    break;
+                }
+        }
+        needs_sort_count += !sorted;
+    }
+    if (needs_sort_count
+        && (r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID
+        - needs_sort_count
+        || (r->col_shared && r->storage_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)))
+        return EOVERFLOW;
+    if (needs_sort_count && r->col_shared && lease->storage_transitioned)
+        return EINVAL;
+    if (r->memory_governor && extra) {
+        wl_columnar_memory_reservation_init(&sequence->metadata_admission);
+        wl_columnar_memory_admission_status_t status
+            = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(r->memory_governor),
+                extra, &sequence->metadata_admission);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                r->memory_budget_denial_pending = true;
+            wl_columnar_relation_radix_sequence_destroy(sequence);
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOMEM
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : EINVAL;
+        }
+        sequence->metadata_admission_active = true;
+    }
+    sequence->boundaries = malloc(boundary_bytes);
+    sequence->needs_sort = calloc(seg_count, sizeof(*sequence->needs_sort));
+    if (!sequence->boundaries || !sequence->needs_sort) {
+        wl_columnar_relation_radix_sequence_destroy(sequence);
+        return ENOMEM;
+    }
+    memcpy(sequence->boundaries, bounds, boundary_bytes);
+    sequence->seg_count = seg_count;
+    sequence->needs_sort_count = needs_sort_count;
+    for (uint32_t i = 0; i < seg_count; i++) {
+        uint32_t start = sequence->boundaries[i];
+        uint32_t end = sequence->boundaries[i + 1];
+        if (end - start <= 1u)
+            continue;
+        for (uint32_t row = start + 1u; row < end; row++)
+            if (col_rel_row_cmp(r, row - 1u, row) > 0) {
+                sequence->needs_sort[i] = 1u;
+                break;
+            }
+    }
+    rc = wl_columnar_relation_radix_workspace_prepare(r,
+            sequence->boundaries, seg_count, 0, &sequence->workspace, true);
+    if (rc) {
+        wl_columnar_relation_radix_sequence_destroy(sequence);
+        return rc;
+    }
+    sequence->set = lease->set;
+    sequence->lease = lease;
+    sequence->relation = r;
+    sequence->owner = lease->owner;
+    sequence->acquisition_nonce = lease->acquisition_nonce;
+    sequence->relation_identity = r->relation_identity;
+    sequence->relation_generation = r->storage_generation;
+    sequence->owner_identity = lease->owner_identity;
+    sequence->owner_generation = lease->owner_generation;
+    sequence->view_generation = r->view_generation;
+    sequence->type_fingerprint = wl_columnar_radix_type_fingerprint(r);
+    sequence->columns = (const int64_t *const *)r->columns;
+    sequence->column_types = r->column_types;
+    sequence->timestamps = r->timestamps;
+    sequence->nrows = r->nrows;
+    sequence->ncols = r->ncols;
+    sequence->capacity = r->capacity;
+    sequence->timestamp_capacity = r->timestamp_capacity;
+    sequence->identity = (uintptr_t)sequence;
+    sequence->prepared = true;
+    return 0;
+}
+
+int
+wl_columnar_relation_radix_sequence_execute_with_lease(
+    wl_columnar_relation_radix_sequence_t *sequence,
+    wl_columnar_relation_mutation_lease_t *lease)
+{
+    if (!sequence || sequence->identity != (uintptr_t)sequence
+        || !sequence->prepared || sequence->consumed || !lease
+        || !sequence->set || !lease->set
+        || sequence->lease != lease || sequence->set != lease->set
+        || sequence->acquisition_nonce != lease->acquisition_nonce
+        || sequence->relation != lease->relation
+        || lease->set->acquisition_nonce != sequence->acquisition_nonce
+        || col_rel_mutation_lease_validate(lease, sequence->relation))
+        return EINVAL;
+    col_rel_t *r = sequence->relation;
+    if (r->relation_identity != sequence->relation_identity
+        || r->storage_generation != sequence->relation_generation
+        || r->view_generation != sequence->view_generation
+        || lease->owner != sequence->owner
+        || lease->owner_identity != sequence->owner_identity
+        || lease->owner_generation != sequence->owner_generation
+        || r->columns != (int64_t **)sequence->columns
+        || r->column_types != sequence->column_types
+        || r->timestamps != sequence->timestamps
+        || r->nrows != sequence->nrows || r->ncols != sequence->ncols
+        || r->capacity != sequence->capacity
+        || r->timestamp_capacity != sequence->timestamp_capacity
+        || wl_columnar_radix_type_fingerprint(r) != sequence->type_fingerprint)
+        return EINVAL;
+    if (!sequence->needs_sort_count) {
+        sequence->consumed = true;
+        return 0;
+    }
+    for (uint32_t i = 0; i < sequence->seg_count; i++) {
+        if (!sequence->needs_sort[i])
+            continue;
+        uint32_t count = sequence->boundaries[i + 1]
+            - sequence->boundaries[i];
+        int rc = wl_columnar_relation_radix_workspace_validate(r, count,
+                &sequence->workspace);
+        if (rc)
+            return rc;
+    }
+    if (r->col_shared) {
+        int rc = col_rel_cow_unshare_publish_impl(r, 0, false, lease);
+        if (rc)
+            return rc;
+    }
+    for (uint32_t i = 0; i < sequence->seg_count; i++) {
+        if (!sequence->needs_sort[i])
+            continue;
+        lease->set->published = true;
+        sequence->consumed = true;
+        int rc = wl_columnar_radix_rows_prepared(r,
+                sequence->boundaries[i], sequence->boundaries[i + 1]
+                - sequence->boundaries[i], &sequence->workspace,
+                r->timestamps ? sequence->workspace.timestamps : NULL);
+        if (rc)
+            abort();
+    }
+    return 0;
+}
+
 int
 wl_columnar_relation_radix_workspace_prepare_with_lease(col_rel_t *r,
     uint32_t start, uint32_t count,
@@ -10187,10 +10530,10 @@ wl_columnar_relation_radix_workspace_prepare_with_lease(col_rel_t *r,
                workspace, false);
 }
 
-int
-wl_columnar_relation_radix_sort_with_lease(col_rel_t *r, uint32_t start,
+static int
+wl_columnar_relation_radix_sort_with_lease_impl(col_rel_t *r, uint32_t start,
     uint32_t count, const wl_columnar_radix_workspace_t *workspace,
-    wl_columnar_relation_mutation_lease_t *lease)
+    wl_columnar_relation_mutation_lease_t *lease, bool consolidation_hook)
 {
     int rc = wl_columnar_radix_lease_preflight(r, start, count, lease);
     if (rc)
@@ -10219,9 +10562,17 @@ wl_columnar_relation_radix_sort_with_lease(col_rel_t *r, uint32_t start,
         || (void *)workspace->short_values != workspace->bucket_values)
         return rc ? rc : EINVAL;
     if (r->col_shared) {
-        rc = col_rel_cow_unshare_publish_impl(r, 0, false, false, NULL, lease);
+        rc = col_rel_cow_unshare_publish_impl(r, 0, false, lease);
         if (rc)
             return rc;
+#ifdef WL_TEST_CONSOLIDATE_HOOK
+        if (consolidation_hook
+            && wl_columnar_consolidation_transition_hook)
+            wl_columnar_consolidation_transition_hook(r,
+                WL_COLUMNAR_CONSOLIDATION_TEST_SORT_AFTER_DETACH);
+#else
+        (void)consolidation_hook;
+#endif
     }
     /* After detach/first row move, prepared-only kernels cannot fail. */
     rc = wl_columnar_radix_rows_prepared(r, start, count, workspace,
@@ -10229,6 +10580,25 @@ wl_columnar_relation_radix_sort_with_lease(col_rel_t *r, uint32_t start,
     if (rc)
         abort();
     return 0;
+}
+
+int
+wl_columnar_relation_radix_sort_with_lease(col_rel_t *r, uint32_t start,
+    uint32_t count, const wl_columnar_radix_workspace_t *workspace,
+    wl_columnar_relation_mutation_lease_t *lease)
+{
+    return wl_columnar_relation_radix_sort_with_lease_impl(r, start, count,
+               workspace, lease, false);
+}
+
+int
+wl_columnar_relation_radix_sort_consolidation_with_lease(col_rel_t *r,
+    uint32_t start, uint32_t count,
+    const wl_columnar_radix_workspace_t *workspace,
+    wl_columnar_relation_mutation_lease_t *lease)
+{
+    return wl_columnar_relation_radix_sort_with_lease_impl(r, start, count,
+               workspace, lease, true);
 }
 
 /* One descriptor-first mutation set covers range capture, preparation,

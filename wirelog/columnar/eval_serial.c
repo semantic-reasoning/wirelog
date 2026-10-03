@@ -846,17 +846,8 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                  * one timestamp slot admissible before consolidation can emit
                  * their first tuple. */
                 if (delta->capacity == 0) {
-                    wl_columnar_source_access_writer_t writer = { 0 };
-                    bool alias_release_pending = false;
-                    int reserve_rc = col_rel_source_writer_acquire(delta,
-                            &writer);
-                    if (reserve_rc == 0)
-                        reserve_rc = col_rel_reserve_rows_locked(delta, 1,
-                                &writer, &alias_release_pending);
-                    int release_rc =
-                        wl_columnar_source_access_writer_release(&writer);
-                    if (reserve_rc == 0)
-                        reserve_rc = release_rc;
+                    int reserve_rc = col_rel_reserve_capacity_admitted(delta,
+                            COL_REL_INIT_CAP, NULL);
                     if (reserve_rc != 0) {
                         col_rel_destroy(delta);
                         outer_rc = reserve_rc;

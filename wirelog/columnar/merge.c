@@ -646,16 +646,20 @@ col_op_consolidate_hash_rows_sort(const col_rel_t *rel, int64_t *rows,
 
 static int
 col_op_consolidate_hash_dedup(col_rel_t *rel,
-    const wl_columnar_source_access_writer_t *writer,
-    bool *alias_release_pending)
+    wl_columnar_relation_mutation_lease_t *lease)
 {
     uint32_t nc = rel->ncols;
     uint32_t nr = rel->nrows;
-    size_t row_bytes = (size_t)nc * sizeof(int64_t);
+    size_t row_bytes;
+    if (!col_op_consolidate_size_multiply(nc, sizeof(int64_t), &row_bytes))
+        return EOVERFLOW;
+    size_t allocated_row_bytes = row_bytes ? row_bytes : sizeof(int64_t);
     uint64_t scratch_bytes = 0;
     uint64_t bytes = 0;
     uint64_t max_ht_cap = 8192;
     uint64_t max_uniq_cap = 4096;
+    uint64_t max_hash_live_cap;
+    uint64_t max_uniq_live_cap;
     wl_columnar_memory_reservation_t reservation;
 
     while (max_ht_cap <= (uint64_t)nr * 2u
@@ -663,19 +667,30 @@ col_op_consolidate_hash_dedup(col_rel_t *rel,
         max_ht_cap *= 2u;
     while (max_uniq_cap < nr && max_uniq_cap <= UINT32_MAX / 2u)
         max_uniq_cap *= 2u;
-    if (max_uniq_cap < nr
-        || !wl_columnar_memory_size_mul(max_ht_cap, row_bytes, &bytes)
+    if (max_uniq_cap < nr)
+        return EOVERFLOW;
+    /* Rehash allocates the doubled table while the old table remains live. */
+    max_hash_live_cap = max_ht_cap
+        + (max_ht_cap > 8192u ? max_ht_cap / 2u : 0u);
+    max_uniq_live_cap = max_uniq_cap
+        + (max_uniq_cap > 4096u ? max_uniq_cap / 2u : 0u);
+    if (max_hash_live_cap < max_ht_cap || max_uniq_live_cap < max_uniq_cap
+        || !wl_columnar_memory_size_mul(max_hash_live_cap,
+        allocated_row_bytes, &bytes)
         || !wl_columnar_memory_size_add(scratch_bytes, bytes,
         &scratch_bytes)
-        || !wl_columnar_memory_size_add(scratch_bytes, max_ht_cap,
+        || !wl_columnar_memory_size_add(scratch_bytes, max_hash_live_cap,
         &scratch_bytes)
-        || !wl_columnar_memory_size_mul(max_uniq_cap, row_bytes, &bytes)
+        || !wl_columnar_memory_size_mul(max_uniq_live_cap,
+        allocated_row_bytes, &bytes)
         || !wl_columnar_memory_size_add(scratch_bytes, bytes,
         &scratch_bytes)
         || (nc > COL_STACK_MAX
         && (!wl_columnar_memory_size_mul(nc, sizeof(int64_t), &bytes)
         || !wl_columnar_memory_size_add(scratch_bytes, bytes,
         &scratch_bytes))))
+        return EOVERFLOW;
+    if (scratch_bytes > SIZE_MAX)
         return EOVERFLOW;
     int admission_rc = col_rel_merge_scratch_reserve(rel, scratch_bytes,
             &reservation);
@@ -687,7 +702,7 @@ col_op_consolidate_hash_dedup(col_rel_t *rel,
     uint32_t ht_cap = 8192;
     uint32_t ht_mask = ht_cap - 1;
     int64_t *ht_vals = (int64_t *)col_op_consolidate_malloc(
-        (size_t)ht_cap * row_bytes, "hash_table");
+        (size_t)ht_cap * allocated_row_bytes, "hash_table");
     uint8_t *ht_used = (uint8_t *)col_op_consolidate_calloc(ht_cap, 1,
             "hash_table_used");
     if (!ht_vals || !ht_used) {
@@ -701,7 +716,7 @@ col_op_consolidate_hash_dedup(col_rel_t *rel,
     uint32_t uniq_cap = 4096;
     uint32_t uniq_count = 0;
     int64_t *uniq_buf = (int64_t *)col_op_consolidate_malloc(
-        (size_t)uniq_cap * row_bytes, "hash_unique_rows");
+        (size_t)uniq_cap * allocated_row_bytes, "hash_unique_rows");
     if (!uniq_buf) {
         free(ht_vals);
         free(ht_used);
@@ -756,7 +771,8 @@ col_op_consolidate_hash_dedup(col_rel_t *rel,
                 uint32_t new_cap = ht_cap * 2;
                 uint32_t new_mask = new_cap - 1;
                 int64_t *new_vals = (int64_t *)col_op_consolidate_malloc(
-                    (size_t)new_cap * row_bytes, "hash_rehash_rows");
+                    (size_t)new_cap * allocated_row_bytes,
+                    "hash_rehash_rows");
                 uint8_t *new_used = (uint8_t *)col_op_consolidate_calloc(
                     new_cap, 1, "hash_rehash_used");
                 if (!new_vals || !new_used) {
@@ -804,7 +820,8 @@ col_op_consolidate_hash_dedup(col_rel_t *rel,
             if (uniq_count >= uniq_cap) {
                 uniq_cap *= 2;
                 int64_t *nb = (int64_t *)col_op_consolidate_realloc(uniq_buf,
-                        (size_t)uniq_cap * row_bytes, "hash_unique_grow");
+                        (size_t)uniq_cap * allocated_row_bytes,
+                        "hash_unique_grow");
                 if (!nb) {
                     if (rb != _rb) free(rb);
                     free(ht_vals);
@@ -832,17 +849,18 @@ col_op_consolidate_hash_dedup(col_rel_t *rel,
     /* Detach only after hash/sort staging is complete.  All emitted rows
      * came from the validated source relation, so publish has no expected
      * validation failure and performs no allocation. */
-    if (rel->col_shared) {
-        int cow_rc = col_rel_cow_unshare_legacy_with_source_writer(rel, writer);
+    if (lease->owner != rel) {
+        int cow_rc = wl_columnar_relation_privatize_shared_view_with_lease(
+            rel, lease);
         if (cow_rc != 0) {
             free(uniq_buf);
             HASH_RELEASE_SCRATCH();
             return cow_rc;
         }
-        *alias_release_pending = true;
     }
 
     /* Publish the complete sorted result only after all fallible work. */
+    lease->set->published = true;
     for (uint32_t r = 0; r < uniq_count; r++)
         col_rel_row_copy_in_raw(rel, r, uniq_buf + (size_t)r * nc);
     rel->nrows = uniq_count;
@@ -885,8 +903,7 @@ wl_columnar_merge_heap_compare(const col_rel_t *rel, uint32_t left,
 static int
 col_op_consolidate_kway_merge_impl(col_rel_t *rel,
     const uint32_t *seg_boundaries, uint32_t seg_count,
-    const wl_columnar_source_access_writer_t *writer,
-    bool *alias_release_pending)
+    wl_columnar_relation_mutation_lease_t *lease)
 {
     typedef struct {
         uint32_t seg;    /* segment index */
@@ -899,8 +916,6 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
     uint32_t nc = rel->ncols;
     uint32_t nr = rel->nrows;
 
-    if (nr <= 1)
-        return 0;
     if (!seg_boundaries || seg_count == 0
         || seg_boundaries[0] != 0 || seg_boundaries[seg_count] != nr)
         return EINVAL;
@@ -909,15 +924,17 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
             || seg_boundaries[s + 1] > nr)
             return EINVAL;
     }
+    if (nr <= 1)
+        return 0;
     size_t segment_bytes;
     size_t heap_bytes;
     size_t row_bytes = 0;
     size_t merged_bytes = 0;
     size_t merged_alloc_bytes = 0;
     size_t timestamp_bytes = 0;
-    size_t segment_total_bytes;
-    size_t additional_scratch_bytes;
-    wl_columnar_radix_workspace_t sort_workspace = { 0 };
+    size_t aggregate_scratch_bytes;
+    wl_columnar_memory_reservation_t merge_reservation;
+    wl_columnar_relation_radix_sequence_t sort_sequence = { 0 };
     uint32_t *seg_starts = NULL;
     uint32_t *seg_ends = NULL;
     int64_t *merged = NULL;
@@ -926,15 +943,17 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
     heap_entry_t *heap = stack_heap;
     heap_entry_t *heap_storage = NULL;
     int result = 0;
+    wl_columnar_memory_reservation_init(&merge_reservation);
     if (!col_op_consolidate_size_multiply(seg_count, sizeof(uint32_t),
         &segment_bytes)
         || !col_op_consolidate_size_multiply(seg_count, sizeof(heap_entry_t),
         &heap_bytes))
         return EOVERFLOW;
+    size_t segment_total_bytes;
     if (!col_op_consolidate_size_multiply(segment_bytes, 2u,
         &segment_total_bytes))
         return EOVERFLOW;
-    additional_scratch_bytes = segment_total_bytes;
+    aggregate_scratch_bytes = segment_total_bytes;
     if (seg_count >= 2) {
         /* Keep one element of storage for zero-arity relations: malloc(0)
          * is permitted to return NULL, which would otherwise look like
@@ -946,21 +965,24 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
             || !col_op_consolidate_size_add(merged_bytes, sizeof(int64_t),
             &merged_alloc_bytes))
             return EOVERFLOW;
-        if (!col_op_consolidate_size_add(additional_scratch_bytes,
-            merged_alloc_bytes, &additional_scratch_bytes))
+        if (!col_op_consolidate_size_add(aggregate_scratch_bytes,
+            merged_alloc_bytes, &aggregate_scratch_bytes))
             return EOVERFLOW;
     }
     if (rel->timestamps && seg_count >= 2) {
         if (!col_op_consolidate_size_multiply(nr,
             sizeof(*merged_timestamps), &timestamp_bytes)
-            || !col_op_consolidate_size_add(additional_scratch_bytes,
-            timestamp_bytes, &additional_scratch_bytes))
+            || !col_op_consolidate_size_add(aggregate_scratch_bytes,
+            timestamp_bytes, &aggregate_scratch_bytes))
             return EOVERFLOW;
     }
-    if (seg_count >= 3
-        && !col_op_consolidate_size_add(additional_scratch_bytes, heap_bytes,
-        &additional_scratch_bytes))
-        return EOVERFLOW;
+    if (seg_count >= 3) {
+        size_t total;
+        if (!col_op_consolidate_size_add(aggregate_scratch_bytes,
+            heap_bytes, &total))
+            return EOVERFLOW;
+        aggregate_scratch_bytes = total;
+    }
 
     /* Hash-based dedup for large datasets (#369): O(N) scan + O(U log U) sort
      * where U is the unique count.  When U << N (common in recursive Datalog
@@ -969,8 +991,7 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
      * including signed/zero multiplicity. The hash shortcut does not carry
      * that provenance, so retain stable segment sorting for these inputs. */
     if (nr > 10000 && !rel->timestamps) {
-        int rc = col_op_consolidate_hash_dedup(rel, writer,
-                alias_release_pending);
+        int rc = col_op_consolidate_hash_dedup(rel, lease);
         if (rc == 0)
             return 0;
         if (rc != -1)
@@ -978,11 +999,27 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
         /* The unique-count heuristic requests the ordinary sort+merge path. */
     }
 
-    int workspace_rc = wl_columnar_radix_workspace_prepare(rel,
-            seg_boundaries, seg_count, additional_scratch_bytes,
-            &sort_workspace);
+    int workspace_rc = wl_columnar_relation_radix_sequence_prepare_with_lease(
+        rel, seg_boundaries, seg_count, &sort_sequence, lease);
     if (workspace_rc != 0)
         return workspace_rc;
+    uint64_t publication_events = (uint64_t)sort_sequence.needs_sort_count + 1u;
+    if (rel->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID
+        - publication_events) {
+        result = EOVERFLOW;
+        goto cleanup;
+    }
+    if (lease->owner != rel && rel->storage_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u) {
+        result = EOVERFLOW;
+        goto cleanup;
+    }
+    int admission_rc = col_rel_merge_scratch_reserve(rel,
+            aggregate_scratch_bytes, &merge_reservation);
+    if (admission_rc != 0) {
+        result = admission_rc;
+        goto cleanup;
+    }
 
     /* Allocate every buffer that can fail before the first in-place sort or
      * dedup mutation.  The workspace reservation includes these buffers. */
@@ -1008,47 +1045,28 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
         goto cleanup;
     }
 
-    /* Every buffer allocation is now complete.  A shared view may detach
-     * before the first segment mutation; later sorting uses only workspace. */
-    if (rel->col_shared) {
-        int cow_rc = col_rel_cow_unshare_legacy_with_source_writer(rel, writer);
-        if (cow_rc != 0) {
-            result = cow_rc;
+    /* Every buffer and reservation is live before the first mutation. */
+    result = wl_columnar_relation_radix_sequence_execute_with_lease(
+        &sort_sequence, lease);
+    if (result != 0)
+        goto cleanup;
+    if (lease->owner != rel && !lease->detached) {
+        result = wl_columnar_relation_privatize_shared_view_with_lease(rel,
+                lease);
+        if (result != 0)
             goto cleanup;
-        }
-        *alias_release_pending = true;
     }
 
-    /* Sort each segment in-place using radix sort.
-     * Optimization (#369): skip sort for already-sorted segments (e.g.,
-     * from consolidated IDB reads). Also dedup within each segment after
-     * sort to reduce merge input. Track per-segment unique counts. */
+    /* Sort is complete. Deduplicate each segment to reduce merge input. */
 
+    lease->set->published = true;
     for (uint32_t s = 0; s < seg_count; s++) {
-        uint32_t start = seg_boundaries[s];
-        uint32_t end = seg_boundaries[s + 1];
+        uint32_t start = sort_sequence.boundaries[s];
+        uint32_t end = sort_sequence.boundaries[s + 1];
         uint32_t count = end - start;
         seg_starts[s] = start;
 
         if (count > 1) {
-            /* Quick sorted-check: bail on first out-of-order pair */
-            bool already_sorted = true;
-            for (uint32_t r = start + 1; r < end; r++) {
-                if (col_rel_row_cmp(rel, r - 1, r) > 0) {
-                    already_sorted = false;
-                    break;
-                }
-            }
-            if (!already_sorted) {
-                int sort_rc =
-                    wl_columnar_relation_radix_sort_with_workspace(rel,
-                        start, count, writer, &sort_workspace);
-                if (sort_rc != 0) {
-                    result = sort_rc;
-                    goto cleanup;
-                }
-            }
-
             /* Intra-segment dedup: compact unique rows to reduce merge */
             uint32_t out_r = start + 1;
             for (uint32_t r = start + 1; r < end; r++) {
@@ -1166,7 +1184,8 @@ cleanup:
     free(heap_storage);
     free(seg_starts);
     free(seg_ends);
-    wl_columnar_radix_workspace_destroy(&sort_workspace);
+    wl_columnar_relation_radix_sequence_destroy(&sort_sequence);
+    col_rel_merge_scratch_release(&merge_reservation);
     return result;
 }
 
@@ -1175,53 +1194,104 @@ wl_columnar_merge_consolidate_checked(col_rel_t *rel,
     const uint32_t *seg_boundaries, uint32_t seg_count, bool finalize,
     bool *out_published)
 {
-    wl_columnar_source_access_writer_t writer = { 0 };
+    wl_columnar_relation_mutation_set_t set = { 0 };
+    wl_columnar_relation_mutation_role_t role = { 0 };
+    wl_columnar_relation_mutation_descriptor_t descriptor = { 0 };
+    wl_columnar_relation_mutation_owner_t owners[2] = { 0 };
+    wl_columnar_relation_mutation_lease_t lease = { 0 };
+    wl_columnar_relation_mutation_initialization_t initialization = { 0 };
     col_rel_t *owner = NULL;
-    bool alias_release_pending = false;
     int rc;
 
     if (out_published)
         *out_published = false;
     if (!rel)
         return EINVAL;
-    rc = col_rel_source_writer_acquire(rel, &writer);
+    role.relation = rel;
+    role.role_flags = WL_COLUMNAR_RELATION_PAYLOAD_MUTATION;
+    rc = col_rel_mutation_set_acquire(&set, &role, 1, &descriptor, 1,
+            owners, 2, &lease, 1, &initialization, 1);
     if (rc != 0)
         return rc;
     rel->memory_budget_denial_pending = false;
     if (!wl_columnar_relation_float_values_valid(rel)) {
         rc = EINVAL;
-        goto release_writer;
+        goto finish;
     }
+    if (rel->nrows > rel->capacity
+        || (rel->timestamps
+        && rel->timestamp_capacity < rel->nrows)
+        || (rel->ncols && !rel->columns)) {
+        rc = EINVAL;
+        goto finish;
+    }
+    for (uint32_t c = 0; c < rel->ncols; c++)
+        if (!rel->columns[c]) {
+            rc = EINVAL;
+            goto finish;
+        }
+    if (!seg_boundaries || !seg_count || seg_count == UINT32_MAX) {
+        rc = seg_count == UINT32_MAX ? EOVERFLOW : EINVAL;
+        goto finish;
+    }
+    if (seg_boundaries[0] != 0
+        || seg_boundaries[seg_count] != rel->nrows) {
+        rc = EINVAL;
+        goto finish;
+    }
+    for (uint32_t s = 0; s < seg_count; s++)
+        if (seg_boundaries[s] > seg_boundaries[s + 1]
+            || seg_boundaries[s + 1] > rel->nrows) {
+            rc = EINVAL;
+            goto finish;
+        }
     if (rel->nrows <= 1 && !finalize) {
         rc = 0;
-        goto release_writer;
+        goto finish;
     }
     rc = col_rel_storage_owner_resolve(rel, &owner);
     if (rc != 0)
-        goto release_writer;
+        goto finish;
     if (rel == owner
         && col_rel_storage_alias_borrow_count(owner) > 0) {
         rc = EBUSY;
-        goto release_writer;
+        goto finish;
+    }
+    if (!wl_columnar_relation_generation_valid(rel->view_generation)) {
+        rc = EINVAL;
+        goto finish;
+    }
+    if (lease.owner != rel && rel->storage_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u) {
+        rc = EOVERFLOW;
+        goto finish;
+    }
+    /* Hash candidate publication has one view event and may privatize one
+     * alias. Check both before it reads or allocates candidate state. */
+    if (rel->nrows > 10000 && !rel->timestamps
+        && (rel->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+        || (lease.owner != rel && rel->storage_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u))) {
+        rc = EOVERFLOW;
+        goto finish;
     }
 
     rc = col_op_consolidate_kway_merge_impl(rel, seg_boundaries, seg_count,
-            &writer, &alias_release_pending);
+            &lease);
     if (rc == 0 && finalize) {
+        set.published = true;
         rel->sorted_nrows = rel->nrows;
         rel->run_count = 1;
         rel->run_ends[0] = rel->nrows;
     }
     if (rc == 0 && out_published)
         *out_published = true;
-release_writer:
-    if (alias_release_pending) {
-        int alias_rc = col_rel_storage_alias_release(rel);
-        if (alias_rc != 0 && rc == 0)
-            rc = alias_rc;
+finish:
+    {
+        int finish_rc = col_rel_mutation_set_finish(&set, false);
+        if (rc == 0)
+            rc = finish_rc;
     }
-    if (wl_columnar_source_access_writer_release(&writer) != 0 && rc == 0)
-        rc = EINVAL;
     return rc;
 }
 
@@ -2031,6 +2101,26 @@ col_op_consolidate_view_steps(const col_rel_t *rel, uint32_t old_nrows,
            + (compacting ? 3u : 1u);
 }
 
+static int
+col_op_consolidate_incremental_delta_generation_preflight(
+    const col_rel_t *rel, uint32_t old_nrows)
+{
+    if (rel->nrows == 0 || old_nrows >= rel->nrows)
+        return 0;
+    uint32_t delta_count = rel->nrows - old_nrows;
+    uint32_t storage_steps = col_op_consolidate_storage_steps(rel,
+            old_nrows, delta_count);
+    uint32_t view_steps = col_op_consolidate_view_steps(rel, old_nrows,
+            delta_count);
+    if ((storage_steps > 0
+        && rel->storage_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - (uint64_t)storage_steps)
+        || rel->view_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - (uint64_t)view_steps)
+        return EOVERFLOW;
+    return 0;
+}
+
 /*
  * col_op_consolidate_incremental_delta - Incremental consolidation with delta output
  *
@@ -2073,8 +2163,8 @@ col_op_consolidate_incremental_delta_fail(col_rel_t *delta_out,
 }
 
 static int
-col_op_consolidate_incremental_delta_append_locked(col_rel_t *delta_out,
-    const int64_t *row, wl_columnar_source_access_writer_t *delta_writer,
+col_op_consolidate_incremental_delta_append_with_lease(col_rel_t *delta_out,
+    const int64_t *row, wl_columnar_relation_mutation_lease_t *delta_lease,
     bool *test_hook_called)
 {
 #ifdef WL_TEST_CONSOLIDATE_HOOK
@@ -2087,19 +2177,17 @@ col_op_consolidate_incremental_delta_append_locked(col_rel_t *delta_out,
 #else
     (void)test_hook_called;
 #endif
-    return col_rel_append_row_locked(delta_out, row, delta_writer);
+    return col_rel_append_row_with_lease(delta_out, row, delta_lease);
 }
 
 static int
 col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
     col_rel_t *delta_out, int *out_fast_path,
-    wl_columnar_source_access_writer_t *delta_writer,
-    const wl_columnar_source_access_writer_t *rel_writer,
-    bool *out_rel_alias_release_pending)
+    wl_columnar_relation_mutation_lease_t *rel_lease,
+    wl_columnar_relation_mutation_lease_t *delta_lease)
 {
-    if (!out_rel_alias_release_pending)
+    if (!rel_lease || (delta_out && !delta_lease))
         return EINVAL;
-    *out_rel_alias_release_pending = false;
     if (!wl_columnar_relation_float_values_valid(rel)
         || (delta_out && !wl_columnar_relation_float_values_valid(delta_out)))
         return EINVAL;
@@ -2118,29 +2206,22 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
 
     uint32_t delta_count = nr - old_nrows;
 
-    uint32_t storage_steps = col_op_consolidate_storage_steps(rel,
-            old_nrows, delta_count);
-    uint32_t view_steps = col_op_consolidate_view_steps(rel, old_nrows,
-            delta_count);
-    if ((storage_steps > 0
-        && rel->storage_generation
-        >= WL_COLUMNAR_REL_GENERATION_INVALID - (uint64_t)storage_steps)
-        || rel->view_generation
-        >= WL_COLUMNAR_REL_GENERATION_INVALID - (uint64_t)view_steps)
-        return col_op_consolidate_incremental_delta_fail(delta_out,
-                   delta_initial_nrows, EOVERFLOW);
-
-    /* Phase 1: sort only the new delta rows using radix sort.  Sorting can
-     * allocate permutation buffers, so do not continue with an unsorted
-     * source if admission fails. */
-    /* rel_writer, never delta_writer: the latter is a lease on delta_out's
-     * canonical owner, which is a different gate whenever the two relations
-     * do not share one. */
-    int sort_rc = col_rel_radix_sort_locked(rel, old_nrows, delta_count,
-            rel_writer, true, out_rel_alias_release_pending);
+    /* Sort only the new delta rows after preparing all permutation scratch.
+     * The exact source lease covers the relation being sorted, regardless of
+     * whether delta_out shares its owner. */
+    wl_columnar_radix_workspace_t sort_workspace = { 0 };
+    int sort_rc = wl_columnar_relation_radix_workspace_prepare_with_lease(rel,
+            old_nrows, delta_count, &sort_workspace, rel_lease);
+    if (sort_rc == 0)
+        sort_rc = wl_columnar_relation_radix_sort_consolidation_with_lease(
+            rel, old_nrows, delta_count, &sort_workspace, rel_lease);
+    wl_columnar_radix_workspace_destroy(&sort_workspace);
     if (sort_rc != 0)
         return col_op_consolidate_incremental_delta_fail(delta_out,
                    delta_initial_nrows, sort_rc);
+
+    /* From here on, partial progress is intentionally retained on errors. */
+    rel_lease->set->published = true;
 
     /* Phase 1b: dedup within delta */
     uint32_t d_unique = 1;
@@ -2190,12 +2271,10 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
         bool compact = rel->run_count >= COL_MAX_RUNS;
         col_rel_compact_scratch_t scratch;
         if (rel->col_shared && compact) {
-            int cow_rc = col_rel_cow_unshare_legacy_with_source_writer(rel,
-                    rel_writer);
+            int cow_rc = col_rel_cow_unshare_with_lease(rel, rel_lease);
             if (cow_rc != 0)
                 return col_op_consolidate_incremental_delta_fail(delta_out,
                            delta_initial_nrows, cow_rc);
-            *out_rel_alias_release_pending = true;
         }
 
         /* All d_unique rows are novel. Emit to delta_out and append as run. */
@@ -2208,8 +2287,8 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
             for (uint32_t k = 0; k < d_unique; k++) {
                 for (uint32_t c = 0; c < nc; c++)
                     dr[c] = rel->columns[c][old_nrows + k];
-                int rc = col_op_consolidate_incremental_delta_append_locked(
-                    delta_out, dr, delta_writer,
+                int rc = col_op_consolidate_incremental_delta_append_with_lease(
+                    delta_out, dr, delta_lease,
                     &delta_append_hook_called);
                 if (rc != 0) {
                     col_row_buf_release(&drb);
@@ -2251,11 +2330,21 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
         }
 
         if (rel->timestamps) {
+            wl_columnar_relation_terminal_sequence_t terminal = { 0 };
+            int terminal_rc = wl_columnar_relation_terminal_sequence_begin(
+                &terminal, rel_lease,
+                WL_COLUMNAR_RELATION_TERMINAL_TIMESTAMP_RETIRE);
+            if (terminal_rc != 0)
+                return col_op_consolidate_incremental_delta_fail(delta_out,
+                           delta_initial_nrows, terminal_rc);
             free(rel->timestamps);
             rel->timestamps = NULL;
             rel->timestamp_capacity = 0;
             col_rel_retire_payload_credit(rel);
-            wl_columnar_relation_touch_storage(rel);
+            wl_columnar_relation_terminal_sequence_publish_timestamp_retirement(
+                &terminal);
+            if (wl_columnar_relation_terminal_sequence_finish(&terminal) != 0)
+                abort();
         }
         if (out_fast_path)
             *out_fast_path = 1;
@@ -2267,12 +2356,10 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
      * view before those mutations so the deferred cleanup can retire its
      * alias borrow while the owner writer remains held. */
     if (rel->col_shared) {
-        int cow_rc = col_rel_cow_unshare_legacy_with_source_writer(rel,
-                rel_writer);
+        int cow_rc = col_rel_cow_unshare_with_lease(rel, rel_lease);
         if (cow_rc != 0)
             return col_op_consolidate_incremental_delta_fail(delta_out,
                        delta_initial_nrows, cow_rc);
-        *out_rel_alias_release_pending = true;
     }
 
     /* Adaptive dispatch (#369): use binary-search dedup when D << N,
@@ -2307,8 +2394,9 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
                     for (uint32_t c = 0; c < nc; c++)
                         dr[c] = rel->columns[c][old_nrows + novel_count];
                     int rc
-                        = col_op_consolidate_incremental_delta_append_locked(
-                            delta_out, dr, delta_writer,
+                        = col_op_consolidate_incremental_delta_append_with_lease
+                        (
+                            delta_out, dr, delta_lease,
                             &delta_append_hook_called);
                     if (rc != 0) {
                         col_row_buf_release(&drb);
@@ -2368,11 +2456,21 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
         rel->sorted_nrows = rel->nrows;
 
         if (rel->timestamps) {
+            wl_columnar_relation_terminal_sequence_t terminal = { 0 };
+            int terminal_rc = wl_columnar_relation_terminal_sequence_begin(
+                &terminal, rel_lease,
+                WL_COLUMNAR_RELATION_TERMINAL_TIMESTAMP_RETIRE);
+            if (terminal_rc != 0)
+                return col_op_consolidate_incremental_delta_fail(delta_out,
+                           delta_initial_nrows, terminal_rc);
             free(rel->timestamps);
             rel->timestamps = NULL;
             rel->timestamp_capacity = 0;
             col_rel_retire_payload_credit(rel);
-            wl_columnar_relation_touch_storage(rel);
+            wl_columnar_relation_terminal_sequence_publish_timestamp_retirement(
+                &terminal);
+            if (wl_columnar_relation_terminal_sequence_finish(&terminal) != 0)
+                abort();
         }
         if (out_fast_path)
             *out_fast_path = 0;
@@ -2389,7 +2487,8 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
                                : rel->merge_buf_cap * 2;
         if (new_cap < max_rows)
             new_cap = max_rows;
-        int grid_rc = col_rel_reserve_merge_grid(rel, new_cap);
+        int grid_rc = col_rel_reserve_merge_grid_with_lease(rel, new_cap,
+                rel_lease);
         if (grid_rc != 0)
             return col_op_consolidate_incremental_delta_fail(delta_out,
                        delta_initial_nrows, grid_rc);
@@ -2441,8 +2540,8 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
             if (delta_out) {
                 for (uint32_t c = 0; c < nc; c++)
                     delta_row[c] = merged_cols[c][out];
-                int rc = col_op_consolidate_incremental_delta_append_locked(
-                    delta_out, delta_row, delta_writer,
+                int rc = col_op_consolidate_incremental_delta_append_with_lease(
+                    delta_out, delta_row, delta_lease,
                     &delta_append_hook_called);
                 if (rc != 0) {
                     col_row_buf_release(&delta_rb);
@@ -2465,8 +2564,8 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
         if (delta_out) {
             for (uint32_t c = 0; c < nc; c++)
                 delta_row[c] = merged_cols[c][out];
-            int rc = col_op_consolidate_incremental_delta_append_locked(
-                delta_out, delta_row, delta_writer,
+            int rc = col_op_consolidate_incremental_delta_append_with_lease(
+                delta_out, delta_row, delta_lease,
                 &delta_append_hook_called);
             if (rc != 0) {
                 col_row_buf_release(&delta_rb);
@@ -2482,13 +2581,32 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
 
     /* Swap merge_columns and columns to avoid O(N) memcpy (issue #218). */
     {
+        wl_columnar_relation_terminal_sequence_t terminal = { 0 };
+        uint32_t terminal_events = WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP;
+        if (rel->timestamps)
+            terminal_events |= WL_COLUMNAR_RELATION_TERMINAL_TIMESTAMP_RETIRE;
+        int terminal_rc = wl_columnar_relation_terminal_sequence_begin(
+            &terminal, rel_lease, terminal_events);
+        if (terminal_rc != 0)
+            return col_op_consolidate_incremental_delta_fail(delta_out,
+                       delta_initial_nrows, terminal_rc);
         int64_t **old_cols = rel->columns;
         uint32_t old_cap = rel->capacity;
         rel->columns = rel->merge_columns;
         rel->capacity = rel->merge_buf_cap;
         rel->merge_columns = old_cols;
         rel->merge_buf_cap = old_cap;
-        wl_columnar_relation_touch_storage(rel);
+        wl_columnar_relation_terminal_sequence_publish_grid_swap(&terminal);
+        if (rel->timestamps) {
+            free(rel->timestamps);
+            rel->timestamps = NULL;
+            rel->timestamp_capacity = 0;
+            col_rel_retire_payload_credit(rel);
+            wl_columnar_relation_terminal_sequence_publish_timestamp_retirement(
+                &terminal);
+        }
+        if (wl_columnar_relation_terminal_sequence_finish(&terminal) != 0)
+            abort();
     }
     rel->nrows = out;
     wl_columnar_relation_touch_view(rel);
@@ -2496,13 +2614,6 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
     rel->run_count = 1;
     rel->run_ends[0] = out;
 
-    if (rel->timestamps) {
-        free(rel->timestamps);
-        rel->timestamps = NULL;
-        rel->timestamp_capacity = 0;
-        col_rel_retire_payload_credit(rel);
-        wl_columnar_relation_touch_storage(rel);
-    }
     if (out_fast_path)
         *out_fast_path = 0;
     return 0;
@@ -2512,79 +2623,47 @@ int
 col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     col_rel_t *delta_out, int *out_fast_path)
 {
-    col_rel_t *rel_owner = NULL;
-    col_rel_t *delta_owner = NULL;
-    wl_columnar_source_access_writer_t rel_writer = { 0 };
-    wl_columnar_source_access_writer_t delta_writer = { 0 };
-    wl_columnar_source_access_writer_t *delta_writer_ptr = NULL;
-    bool rel_acquired = false;
-    bool delta_acquired = false;
-    bool rel_alias_release_pending = false;
-    bool delta_alias_release_pending = false;
+    wl_columnar_relation_mutation_role_t roles[2] = { 0 };
+    wl_columnar_relation_mutation_descriptor_t descriptors[2] = { 0 };
+    wl_columnar_relation_mutation_owner_t owners[4] = { 0 };
+    wl_columnar_relation_mutation_lease_t leases[2] = { 0 };
+    wl_columnar_relation_mutation_initialization_t initializations[2] = { 0 };
+    wl_columnar_relation_mutation_set_t set = { 0 };
+    size_t role_count = delta_out ? 2u : 1u;
     int rc;
 
-    if (!wl_columnar_relation_float_values_valid(rel)
-        || (delta_out && !wl_columnar_relation_float_values_valid(delta_out)))
+    if (!rel || delta_out == rel)
         return EINVAL;
-    if (delta_out == rel
-        || (delta_out && delta_out->ncols != rel->ncols))
-        return EINVAL;
-    rc = col_rel_storage_owner_resolve(rel, &rel_owner);
+    roles[0] = (wl_columnar_relation_mutation_role_t) {
+        .relation = rel,
+        .role_flags = WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+    };
+    if (delta_out)
+        roles[1] = (wl_columnar_relation_mutation_role_t) {
+            .relation = delta_out,
+            .role_flags = WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+        };
+    rc = col_rel_mutation_set_acquire(&set, roles, role_count,
+            descriptors, 2, owners, 4, leases, 2, initializations, 2);
     if (rc != 0)
         return rc;
-    if (delta_out) {
-        rc = col_rel_storage_owner_resolve(delta_out, &delta_owner);
-        if (rc != 0)
-            return rc;
+    rel->memory_budget_denial_pending = false;
+    if (delta_out)
+        delta_out->memory_budget_denial_pending = false;
+    if (!wl_columnar_relation_float_values_valid(rel)
+        || (delta_out
+        && (!wl_columnar_relation_float_values_valid(delta_out)
+        || delta_out->ncols != rel->ncols))) {
+        rc = EINVAL;
+        goto finish;
     }
 
-    /* Acquire the two canonical owners in address order.  The same owner is
-     * acquired only once when rel and delta_out alias the same relation. */
-    if (!delta_owner || rel_owner == delta_owner) {
-        rc = wl_columnar_source_access_writer_acquire(
-            &rel_owner->source_access, &rel_writer);
-        if (rc != 0)
-            return rc;
-        rel_acquired = true;
-        delta_writer_ptr = delta_out ? &rel_writer : NULL;
-    } else if ((uintptr_t)rel_owner < (uintptr_t)delta_owner) {
-        rc = wl_columnar_source_access_writer_acquire(
-            &rel_owner->source_access, &rel_writer);
-        if (rc != 0)
-            return rc;
-        rel_acquired = true;
-        rc = wl_columnar_source_access_writer_acquire(
-            &delta_owner->source_access, &delta_writer);
-        if (rc != 0)
-            goto cleanup;
-        delta_acquired = true;
-        delta_writer_ptr = &delta_writer;
-    } else {
-        rc = wl_columnar_source_access_writer_acquire(
-            &delta_owner->source_access, &delta_writer);
-        if (rc != 0)
-            return rc;
-        delta_acquired = true;
-        rc = wl_columnar_source_access_writer_acquire(
-            &rel_owner->source_access, &rel_writer);
-        if (rc != 0)
-            goto cleanup;
-        rel_acquired = true;
-        delta_writer_ptr = &delta_writer;
-    }
+    rc = col_op_consolidate_incremental_delta_generation_preflight(rel,
+            old_nrows);
+    if (rc != 0)
+        goto finish;
 
-    /* Owner alias counts are policy state, not a safe preflight snapshot.
-     * All involved writer gates are held here, so a zero count cannot become
-     * stale before the in-place operation begins. */
-    if ((rel_owner == rel
-        && col_rel_storage_alias_borrow_count(rel_owner) > 0)
-        || (delta_out && delta_owner == delta_out
-        && col_rel_storage_alias_borrow_count(delta_owner) > 0)) {
-        rc = EBUSY;
-        goto cleanup;
-    }
-
-    if (delta_out) {
+    if (delta_out && rel->nrows > old_nrows) {
         uint32_t delta_count = rel->nrows > old_nrows
             ? rel->nrows - old_nrows : 0;
         /* Reserve delta_out's view-generation advances before its first
@@ -2596,38 +2675,23 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
             >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
             - (uint64_t)delta_count) {
             rc = EOVERFLOW;
-            goto cleanup;
+            goto finish;
         }
-        rc = col_rel_reserve_rows_locked(delta_out, delta_count,
-                delta_writer_ptr, &delta_alias_release_pending);
+        rc = col_rel_reserve_rows_with_lease(delta_out, delta_count,
+                &leases[1]);
         if (rc != 0)
-            goto cleanup;
+            goto finish;
     }
 
     rc = col_op_consolidate_incremental_delta_impl(rel, old_nrows,
-            delta_out, out_fast_path, delta_writer_ptr, &rel_writer,
-            &rel_alias_release_pending);
+            delta_out, out_fast_path, &leases[0],
+            delta_out ? &leases[1] : NULL);
 
-cleanup:
-    /* Keep each old canonical-owner gate closed until every mutation is
-     * complete, then end the deferred aliases before releasing its writer. */
-    if (delta_alias_release_pending) {
-        int alias_rc = col_rel_storage_alias_release(delta_out);
-        if (alias_rc != 0 && rc == 0)
-            rc = alias_rc;
+finish:
+    {
+        int finish_rc = col_rel_mutation_set_finish(&set, rc == 0);
+        if (rc == 0)
+            rc = finish_rc;
     }
-    if (rel_alias_release_pending) {
-        int alias_rc = col_rel_storage_alias_release(rel);
-        if (alias_rc != 0 && rc == 0)
-            rc = alias_rc;
-    }
-    if (delta_acquired
-        && wl_columnar_source_access_writer_release(&delta_writer) != 0
-        && rc == 0)
-        rc = EINVAL;
-    if (rel_acquired
-        && wl_columnar_source_access_writer_release(&rel_writer) != 0
-        && rc == 0)
-        rc = EINVAL;
     return rc;
 }

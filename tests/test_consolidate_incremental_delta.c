@@ -84,11 +84,11 @@ consolidation_pause_hook(col_rel_t *relation,
         return;
     state->hook_state_ok = stage == state->expected_stage
         && relation == state->expected_relation
-        && relation->storage_owner == state->expected_owner
+        && relation->storage_owner == relation
         && relation->col_shared == NULL
         && relation->columns[0] != state->old_columns
         && relation->nrows == state->expected_nrows
-        && state->expected_owner->storage_alias_borrows > 0;
+        && state->expected_owner->storage_owner == state->expected_owner;
     for (uint32_t i = 0; state->hook_state_ok && i < relation->nrows; i++)
         state->hook_state_ok = relation->columns[0][i]
             == state->expected_values[i];
@@ -2688,6 +2688,95 @@ test_shared_view_storage_exhaustion(void)
     PASS();
 }
 
+static void
+test_source_exhaustion_precedes_delta_reservation(void)
+{
+    TEST("source exhaustion precedes shared delta COW and clears stale denial");
+
+    col_rel_t *rel = test_rel_alloc(1);
+    col_rel_t *delta_owner = test_rel_alloc(1);
+    col_rel_t *delta_out = test_rel_alloc(1);
+    int64_t source_rows[] = { 10, 20 };
+    int64_t owner_row = 99;
+    ASSERT(rel && delta_owner && delta_out, "source preflight relations");
+    ASSERT(test_rel_append_row(rel, &source_rows[0]) == 0
+        && test_rel_append_row(rel, &source_rows[1]) == 0
+        && test_rel_append_row(delta_owner, &owner_row) == 0
+        && col_rel_install_shared_view(delta_out, delta_owner) == 0,
+        "source and shared delta fixtures");
+
+    uint64_t last = WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+    rel->storage_generation = last;
+    rel->storage_owner_generation = last;
+    rel->memory_budget_denial_pending = true;
+    delta_out->memory_budget_denial_pending = true;
+    int64_t *delta_columns = delta_out->columns[0];
+    uint64_t delta_generation = delta_out->storage_generation;
+    uint64_t delta_view_generation = delta_out->view_generation;
+    uint64_t delta_borrows = col_rel_storage_alias_borrow_count(delta_owner);
+    uint64_t owner_generation = delta_owner->storage_generation;
+    int fast_path = -1;
+
+    ASSERT(col_op_consolidate_incremental_delta(rel, 1, delta_out,
+        &fast_path) == EOVERFLOW && fast_path == -1,
+        "exhausted source is refused before reserving output");
+    ASSERT(!rel->memory_budget_denial_pending
+        && !delta_out->memory_budget_denial_pending,
+        "admitted non-budget failure clears stale denial evidence");
+    ASSERT(rel->nrows == 2 && rel->columns[0][0] == 10
+        && rel->columns[0][1] == 20
+        && rel->storage_generation == last
+        && rel->storage_owner_generation == last,
+        "source remains unchanged at exhausted generation");
+    ASSERT(delta_out->col_shared && delta_out->col_shared[0]
+        && delta_out->storage_owner == delta_owner
+        && delta_out->columns[0] == delta_columns
+        && delta_out->storage_generation == delta_generation
+        && delta_out->view_generation == delta_view_generation
+        && col_rel_storage_alias_borrow_count(delta_owner) == delta_borrows
+        && delta_owner->storage_generation == owner_generation
+        && delta_out->nrows == 1 && delta_out->columns[0][0] == owner_row,
+        "shared delta remains borrowed without COW or generation changes");
+
+    test_rel_free(delta_out);
+    test_rel_free(delta_owner);
+    test_rel_free(rel);
+    PASS();
+}
+
+static void
+test_admission_failure_preserves_stale_denial(void)
+{
+    TEST("mutation admission failure preserves stale denial evidence");
+
+    col_rel_t *rel = test_rel_alloc(1);
+    col_rel_t *delta_out = test_rel_alloc(1);
+    int64_t source_row = 10, delta_row = 20;
+    wl_columnar_source_access_writer_t held = { 0 };
+    ASSERT(rel && delta_out
+        && test_rel_append_row(rel, &source_row) == 0
+        && test_rel_append_row(delta_out, &delta_row) == 0,
+        "admission failure relations");
+    rel->memory_budget_denial_pending = true;
+    delta_out->memory_budget_denial_pending = true;
+    ASSERT(col_rel_source_writer_acquire(rel, &held) == 0,
+        "hold source writer to refuse mutation-set admission");
+    int fast_path = -1;
+    int rc = col_op_consolidate_incremental_delta(rel, 0, delta_out,
+            &fast_path);
+    ASSERT(wl_columnar_source_access_writer_release(&held) == 0,
+        "release held source writer");
+    ASSERT(rc == EBUSY && fast_path == -1
+        && rel->memory_budget_denial_pending
+        && delta_out->memory_budget_denial_pending
+        && rel->nrows == 1 && delta_out->nrows == 1,
+        "failed admission preserves prior evidence and rows");
+
+    test_rel_free(delta_out);
+    test_rel_free(rel);
+    PASS();
+}
+
 /* ================================================================
  * Issue #2049: every view-generation advance an incremental consolidation
  * may make is reserved before the delta sort, as #2046 does for storage.
@@ -2906,7 +2995,7 @@ test_view_generation_headroom_reserved(void)
 
 /* ================================================================
  * Issue #2057: delta_out's view generation advances once per emitted row
- * (col_rel_append_row_locked) and once more when a failure rolls the
+ * (col_rel_append_row_with_lease) and once more when a failure rolls the
  * emission back.  Every such advance is reserved before delta_out is first
  * mutated, so exhaustion is refused with EOVERFLOW instead of saturating
  * delta_out's view generation behind a successful return.
@@ -3106,6 +3195,8 @@ main(void)
     test_binary_retirement_uses_last_generation();
     test_fallback_exhaustion_without_timestamps();
     test_shared_view_storage_exhaustion();
+    test_source_exhaustion_precedes_delta_reservation();
+    test_admission_failure_preserves_stale_denial();
 
     /* View-generation headroom (Issue #2049) */
     test_view_generation_headroom_reserved();

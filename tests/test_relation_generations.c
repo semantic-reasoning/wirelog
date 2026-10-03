@@ -216,6 +216,48 @@ new_relation(void)
     return track_relation(rel);
 }
 
+typedef struct {
+    wl_columnar_relation_mutation_set_t set;
+    wl_columnar_relation_mutation_role_t role;
+    wl_columnar_relation_mutation_descriptor_t descriptor;
+    wl_columnar_relation_mutation_owner_t owners[2];
+    wl_columnar_relation_mutation_lease_t lease;
+    wl_columnar_relation_mutation_initialization_t initialization;
+} generation_test_mutation_t;
+
+static int
+generation_test_mutation_acquire(col_rel_t *rel,
+    generation_test_mutation_t *held)
+{
+    held->role = (wl_columnar_relation_mutation_role_t){
+        rel, WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+    };
+    return col_rel_mutation_set_acquire(&held->set, &held->role, 1,
+               &held->descriptor, 1, held->owners, 2, &held->lease, 1,
+               &held->initialization, 1);
+}
+
+static int
+generation_test_mutation_finish(generation_test_mutation_t *held,
+    bool published)
+{
+    return col_rel_mutation_set_finish(&held->set, published);
+}
+
+static int
+generation_test_append_with_lease(col_rel_t *rel, const int64_t *row)
+{
+    generation_test_mutation_t held = { 0 };
+    int rc = generation_test_mutation_acquire(rel, &held);
+    if (rc != 0)
+        return rc;
+    /* This helper models a new outer admitted append attempt. */
+    rel->memory_budget_denial_pending = false;
+    rc = col_rel_append_row_with_lease(rel, row, &held.lease);
+    int finish_rc = generation_test_mutation_finish(&held, rc == 0);
+    return rc ? rc : finish_rc;
+}
+
 static void
 test_same_row_count_mutation(void)
 {
@@ -822,175 +864,22 @@ test_source_reader_blocks_checked_destroy(void)
     owned_relation_count--;
 }
 
-/* Issue #1594: the collapsed radix-sort entry point validates every caller
- * uniformly.  Its predecessor col_rel_radix_sort_deferred() took no writer
- * and checked nothing, so a caller holding no lease could reorder an
- * owner's storage while a live alias was borrowing those exact buffers. */
-
-/* A foreign writer names a different gate.  The fixture is a shared view so
- * a rejection that arrived after the COW would be visible as a detached
- * relation rather than an untouched one. */
-static void
-test_radix_sort_locked_rejects_foreign_writer(void)
-{
-    col_rel_t *source = new_relation();
-    col_rel_t *view = new_relation();
-    col_rel_t *other = new_relation();
-    wl_columnar_source_access_writer_t writer = { 0 };
-    int64_t high = 8, low = 3;
-    bool pending = true;
-    int64_t **columns_before;
-    uint64_t view_before;
-
-    CHECK(source && view && other, "foreign writer relations");
-    CHECK(col_rel_append_row(source, &high) == 0, "foreign writer row 0");
-    CHECK(col_rel_append_row(source, &low) == 0, "foreign writer row 1");
-    CHECK(col_rel_install_shared_view(view, source) == 0,
-        "foreign writer shared view");
-    CHECK(col_rel_source_writer_acquire(other, &writer) == 0,
-        "foreign writer acquisition");
-    columns_before = view->columns;
-    view_before = view->view_generation;
-    CHECK(col_rel_radix_sort_locked(view, 0, view->nrows, &writer, false,
-        &pending) == EINVAL,
-        "foreign writer refused");
-    CHECK(pending == false, "foreign writer clears the out parameter");
-    CHECK(view->col_shared != NULL && view->columns == columns_before
-        && view->view_generation == view_before
-        && source->storage_alias_borrows == 1,
-        "foreign writer refusal precedes the copy-on-write");
-    CHECK(col_rel_get(source, 0, 0) == high && col_rel_get(source, 1, 0) == low,
-        "foreign writer refusal leaves the source unsorted");
-    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
-        "foreign writer release");
-    cleanup_relations();
-}
-
-/* NULL writer and NULL out parameter.  The out parameter is mandatory in
- * both modes: a caller that meant to defer but passed NULL would otherwise
- * have its borrow released under a transaction that still holds one. */
-static void
-test_radix_sort_locked_rejects_absent_writer_and_out(void)
-{
-    col_rel_t *rel = new_relation();
-    wl_columnar_source_access_writer_t writer = { 0 };
-    int64_t high = 5, low = 1;
-    bool pending = true;
-
-    CHECK(rel != NULL, "absent writer relation");
-    CHECK(col_rel_append_row(rel, &high) == 0, "absent writer row 0");
-    CHECK(col_rel_append_row(rel, &low) == 0, "absent writer row 1");
-    CHECK(col_rel_radix_sort_locked(rel, 0, rel->nrows, NULL, false,
-        &pending) == EINVAL,
-        "absent writer refused");
-    CHECK(pending == false, "absent writer clears the out parameter");
-    CHECK(col_rel_get(rel, 0, 0) == high,
-        "absent writer refusal leaves the relation unsorted");
-    CHECK(col_rel_source_writer_acquire(rel, &writer) == 0,
-        "mandatory out acquisition");
-    CHECK(col_rel_radix_sort_locked(rel, 0, rel->nrows, &writer, true,
-        NULL) == EINVAL,
-        "NULL out parameter refused even with a valid writer");
-    CHECK(col_rel_get(rel, 0, 0) == high,
-        "NULL out refusal leaves the relation unsorted");
-    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
-        "mandatory out release");
-    cleanup_relations();
-}
-
-/* Validation now runs at every row count, including the range shortcut. */
-static void
-test_radix_sort_locked_validates_below_the_range_shortcut(void)
-{
-    col_rel_t *rel = new_relation();
-    col_rel_t *other = new_relation();
-    wl_columnar_source_access_writer_t writer = { 0 };
-    int64_t only = 4;
-    bool pending = true;
-
-    CHECK(rel && other, "range shortcut relations");
-    CHECK(col_rel_append_row(rel, &only) == 0, "range shortcut row");
-    CHECK(col_rel_source_writer_acquire(other, &writer) == 0,
-        "range shortcut foreign acquisition");
-    CHECK(col_rel_radix_sort_locked(rel, 0, rel->nrows, &writer, false,
-        &pending) == EINVAL,
-        "single-row sort still refuses a foreign writer");
-    CHECK(col_rel_radix_sort_locked(rel, 0, 0, &writer, false,
-        &pending) == EINVAL,
-        "empty sort still refuses a foreign writer");
-    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
-        "range shortcut release");
-    cleanup_relations();
-}
-
-/* Every radix-sort entry point must reject a contended or malformed trivial
- * range before treating it as a no-op.  The implicit-writer wrappers are
- * checked separately with a source reader because a standalone call cannot
- * be supplied a foreign writer. */
+/* Public mutation APIs validate contention before trivial-range shortcuts. */
 static void
 test_radix_sort_family_validates_trivial_ranges(void)
 {
-    col_rel_t *rel = new_relation();
-    col_rel_t *other = new_relation();
+    col_rel_t *rel = NULL;
     col_rel_t *owner = new_relation();
     col_rel_t *alias = new_relation();
-    wl_columnar_source_access_writer_t writer = { 0 };
-    wl_columnar_source_access_writer_t malformed = { 0 };
     wl_columnar_source_access_reader_t reader = { 0 };
-    wl_columnar_radix_workspace_t workspace = { 0 };
-    const uint32_t boundaries[] = { 0u, 1u };
     int64_t value = 7;
-    bool pending = true;
     uint32_t sorted_before;
 
-    CHECK(rel && other && owner && alias, "trivial-range family relations");
-    CHECK(col_rel_append_row(rel, &value) == 0,
-        "trivial-range family row");
-    CHECK(wl_columnar_radix_workspace_prepare(rel, boundaries, 1, 0,
-        &workspace) == 0, "trivial-range workspace preparation");
-    CHECK(col_rel_source_writer_acquire(other, &writer) == 0,
-        "trivial-range foreign writer acquisition");
-    CHECK(col_rel_radix_sort_locked(rel, 0, 1, &writer, false, &pending)
-        == EINVAL, "locked sort rejects foreign writer for one row");
-    CHECK(pending == false, "locked sort clears pending on rejection");
-    CHECK(wl_columnar_relation_radix_sort_with_workspace(rel, 0, 1,
-        &writer, &workspace) == EINVAL,
-        "workspace sort rejects foreign writer for one row");
-    malformed.owner = &rel->source_access;
-    malformed.identity = (uintptr_t)&malformed;
-    CHECK(col_rel_radix_sort_locked(rel, 0, 1, &malformed, false, &pending)
-        == EINVAL, "locked sort rejects invalid writer thread token");
-    CHECK(wl_columnar_relation_radix_sort_with_workspace(rel, 0, 1,
-        &malformed, &workspace) == EINVAL,
-        "workspace sort rejects invalid writer thread token");
-    CHECK(col_rel_radix_sort_locked(rel, 0, 0, &writer, false, &pending)
-        == EINVAL, "locked sort rejects foreign writer for empty range");
-    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
-        "trivial-range foreign writer release");
-    wl_columnar_radix_workspace_destroy(&workspace);
-
+    CHECK(owner && alias, "trivial-range relations");
     CHECK(col_rel_append_row(owner, &value) == 0,
         "trivial-range owner row");
     CHECK(col_rel_install_shared_view(alias, owner) == 0,
         "trivial-range owner shared view");
-    wl_columnar_radix_workspace_destroy(&workspace);
-    CHECK(wl_columnar_radix_workspace_prepare(owner, boundaries, 1, 0,
-        &workspace) == 0, "trivial-range owner workspace preparation");
-    CHECK(col_rel_source_writer_acquire(owner, &writer) == 0,
-        "trivial-range owner writer acquisition");
-    CHECK(col_rel_radix_sort_locked(owner, 0, 0, &writer, false, &pending)
-        == EBUSY, "locked sort reports owner borrow for empty range");
-    CHECK(col_rel_radix_sort_locked(owner, 0, 1, &writer, false, &pending)
-        == EBUSY, "locked sort reports owner borrow for one row");
-    CHECK(wl_columnar_relation_radix_sort_with_workspace(owner, 0, 0,
-        &writer, &workspace) == EBUSY,
-        "workspace sort reports owner borrow for empty range");
-    CHECK(wl_columnar_relation_radix_sort_with_workspace(owner, 0, 1,
-        &writer, &workspace) == EBUSY,
-        "workspace sort reports owner borrow for one row");
-    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
-        "trivial-range owner writer release");
-    wl_columnar_radix_workspace_destroy(&workspace);
     sorted_before = owner->sorted_nrows;
     CHECK(col_rel_radix_sort(owner, 0, 0) == EBUSY,
         "standalone sort reports owner borrow for empty range");
@@ -1028,9 +917,6 @@ test_radix_sort_family_validates_trivial_ranges(void)
     cleanup_relations();
 
     col_rel_t *zero = NULL;
-    wl_columnar_source_access_writer_t zero_writer = { 0 };
-    wl_columnar_radix_workspace_t zero_workspace = { 0 };
-    const uint32_t zero_boundaries[] = { 0u, 3u };
     CHECK(col_rel_alloc(&zero, "trivial-range-zero") == 0,
         "zero-column relation allocation");
     CHECK(track_relation(zero) != NULL
@@ -1039,19 +925,6 @@ test_radix_sort_family_validates_trivial_ranges(void)
     for (uint32_t i = 0; i < 3; i++)
         CHECK(col_rel_append_row(zero, &value) == 0,
             "zero-column relation row");
-    CHECK(wl_columnar_radix_workspace_prepare(zero, zero_boundaries, 1, 0,
-        &zero_workspace) == 0, "zero-column workspace preparation");
-    CHECK(col_rel_source_writer_acquire(zero, &zero_writer) == 0,
-        "zero-column writer acquisition");
-    CHECK(col_rel_radix_sort_locked(zero, 0, zero->nrows, &zero_writer,
-        false, &pending) == 0,
-        "zero-column locked sort remains a validated no-op");
-    CHECK(wl_columnar_relation_radix_sort_with_workspace(zero, 0,
-        zero->nrows, &zero_writer, &zero_workspace) == 0,
-        "zero-column workspace sort remains a validated no-op");
-    CHECK(wl_columnar_source_access_writer_release(&zero_writer) == 0,
-        "zero-column writer release");
-    wl_columnar_radix_workspace_destroy(&zero_workspace);
     CHECK(col_rel_radix_sort_int64(zero) == 0
         && zero->sorted_nrows == zero->nrows,
         "zero-column sort keeps its no-op behavior after validation");
@@ -1066,163 +939,6 @@ test_radix_sort_family_validates_trivial_ranges(void)
         "zero-column refusal preserves generation and sorted count");
     CHECK(col_rel_source_reader_release(&reader) == 0,
         "zero-column reader release");
-    cleanup_relations();
-}
-
-/* An owner with live borrows is refused with EBUSY.  The source gate is
- * deliberately left uncontended so the status can only come from the alias
- * predicate, not from a reader holding the gate. */
-static void
-test_radix_sort_locked_owner_with_borrows_is_busy(void)
-{
-    col_rel_t *owner = new_relation();
-    col_rel_t *alias = new_relation();
-    wl_columnar_source_access_writer_t writer = { 0 };
-    int64_t high = 9, low = 2;
-    bool pending = true;
-    uint64_t view_before;
-
-    CHECK(owner && alias, "busy owner relations");
-    CHECK(col_rel_append_row(owner, &high) == 0, "busy owner row 0");
-    CHECK(col_rel_append_row(owner, &low) == 0, "busy owner row 1");
-    CHECK(col_rel_install_shared_view(alias, owner) == 0,
-        "busy owner shared view");
-    CHECK(owner->storage_alias_borrows == 1, "busy owner borrow recorded");
-    CHECK(col_rel_source_writer_acquire(owner, &writer) == 0,
-        "busy owner writer acquisition");
-    view_before = owner->view_generation;
-    CHECK(col_rel_radix_sort_locked(owner, 0, owner->nrows, &writer, false,
-        &pending) == EBUSY,
-        "owner with live borrows refused");
-    CHECK(pending == false, "busy owner clears the out parameter");
-    CHECK(col_rel_get(owner, 0, 0) == high && col_rel_get(owner, 1, 0) == low
-        && owner->view_generation == view_before
-        && owner->storage_alias_borrows == 1,
-        "busy owner refusal reorders nothing");
-    CHECK(col_rel_storage_alias_release(alias) == 0, "busy owner release");
-    CHECK(col_rel_radix_sort_locked(owner, 0, owner->nrows, &writer, false,
-        &pending) == 0,
-        "owner sorts once the borrow is retired");
-    CHECK(col_rel_get(owner, 0, 0) == low && col_rel_get(owner, 1, 0) == high,
-        "retired borrow admits the sort");
-    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
-        "busy owner writer release");
-    cleanup_relations();
-}
-
-/* defer_alias_release == true hands the borrow back to the caller. */
-static void
-test_radix_sort_locked_hands_back_the_alias(void)
-{
-    col_rel_t *source = new_relation();
-    col_rel_t *view = new_relation();
-    wl_columnar_source_access_writer_t writer = { 0 };
-    int64_t high = 7, low = 0;
-    bool pending = false;
-    int64_t **source_columns;
-
-    CHECK(source && view, "hand-back relations");
-    CHECK(col_rel_append_row(source, &high) == 0, "hand-back row 0");
-    CHECK(col_rel_append_row(source, &low) == 0, "hand-back row 1");
-    CHECK(col_rel_install_shared_view(view, source) == 0,
-        "hand-back shared view");
-    source_columns = source->columns;
-    CHECK(col_rel_source_writer_acquire(source, &writer) == 0,
-        "hand-back writer acquisition");
-    CHECK(col_rel_radix_sort_locked(view, 0, view->nrows, &writer, true,
-        &pending) == 0,
-        "hand-back sort admitted");
-    CHECK(pending == true, "hand-back reports the pending release");
-    CHECK(source->storage_alias_borrows == 1,
-        "hand-back keeps the borrow live");
-    CHECK(view->storage_owner == source,
-        "hand-back leaves the borrow on the original owner");
-    CHECK(view->col_shared == NULL, "hand-back detached the view");
-    CHECK(col_rel_get(view, 0, 0) == low && col_rel_get(view, 1, 0) == high,
-        "hand-back sorted the view");
-    CHECK(source->columns == source_columns
-        && col_rel_get(source, 0, 0) == high
-        && col_rel_get(source, 1, 0) == low,
-        "hand-back left the owner's storage alone");
-    CHECK(col_rel_storage_alias_release(view) == 0, "hand-back release");
-    CHECK(source->storage_alias_borrows == 0, "hand-back borrow retired");
-    CHECK(view->storage_owner == view, "hand-back view owns its storage");
-    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
-        "hand-back writer release");
-    cleanup_relations();
-}
-
-/* defer_alias_release == false releases the borrow here.  This is what
- * replaces the old "NULL means never defer" guarantee. */
-static void
-test_radix_sort_locked_releases_the_alias_itself(void)
-{
-    col_rel_t *source = new_relation();
-    col_rel_t *view = new_relation();
-    wl_columnar_source_access_writer_t writer = { 0 };
-    int64_t high = 6, low = 1;
-    bool pending = true;
-
-    CHECK(source && view, "self-release relations");
-    CHECK(col_rel_append_row(source, &high) == 0, "self-release row 0");
-    CHECK(col_rel_append_row(source, &low) == 0, "self-release row 1");
-    CHECK(col_rel_install_shared_view(view, source) == 0,
-        "self-release shared view");
-    CHECK(col_rel_source_writer_acquire(source, &writer) == 0,
-        "self-release writer acquisition");
-    CHECK(col_rel_radix_sort_locked(view, 0, view->nrows, &writer, false,
-        &pending) == 0,
-        "self-release sort admitted");
-    CHECK(pending == false, "self-release reports no pending release");
-    CHECK(source->storage_alias_borrows == 0,
-        "self-release retired the borrow");
-    CHECK(view->storage_owner == view, "self-release view owns its storage");
-    CHECK(col_rel_get(view, 0, 0) == low && col_rel_get(view, 1, 0) == high,
-        "self-release sorted the view");
-    CHECK(col_rel_get(source, 0, 0) == high
-        && col_rel_get(source, 1, 0) == low,
-        "self-release left the owner's storage alone");
-    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
-        "self-release writer release");
-    cleanup_relations();
-}
-
-/* Issue #1594: the workspace variant reported a live alias borrow as EINVAL
- * while the rest of the family reported the same condition as EBUSY, so one
- * family answered a caller two different ways.  The k-way merge wrapper
- * pre-checks the condition, which is why nothing caught the split. */
-static void
-test_radix_sort_with_workspace_owner_with_borrows_is_busy(void)
-{
-    col_rel_t *owner = new_relation();
-    col_rel_t *alias = new_relation();
-    wl_columnar_radix_workspace_t workspace = { 0 };
-    wl_columnar_source_access_writer_t writer = { 0 };
-    const uint32_t boundaries[] = { 0u, 2u };
-    int64_t high = 11, low = 4;
-    bool prepared = false;
-
-    CHECK(owner && alias, "workspace busy relations");
-    CHECK(col_rel_append_row(owner, &high) == 0, "workspace busy row 0");
-    CHECK(col_rel_append_row(owner, &low) == 0, "workspace busy row 1");
-    CHECK(col_rel_install_shared_view(alias, owner) == 0,
-        "workspace busy shared view");
-    CHECK(owner->storage_alias_borrows == 1, "workspace busy borrow");
-    /* One segment spanning both rows; the boundaries array carries
-     * seg_count + 1 entries. */
-    prepared = wl_columnar_radix_workspace_prepare(owner, boundaries, 1, 0,
-            &workspace) == 0;
-    CHECK(prepared, "workspace busy prepare");
-    CHECK(col_rel_source_writer_acquire(owner, &writer) == 0,
-        "workspace busy writer acquisition");
-    CHECK(wl_columnar_relation_radix_sort_with_workspace(owner, 0,
-        owner->nrows, &writer, &workspace) == EBUSY,
-        "workspace sort reports a live borrow as EBUSY");
-    CHECK(col_rel_get(owner, 0, 0) == high && col_rel_get(owner, 1, 0) == low,
-        "workspace busy refusal reorders nothing");
-    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
-        "workspace busy writer release");
-    wl_columnar_radix_workspace_destroy(&workspace);
     cleanup_relations();
 }
 
@@ -1437,7 +1153,7 @@ test_workspace_sort_cows_shared_view(void)
 {
     col_rel_t *source = new_relation();
     col_rel_t *view = new_relation();
-    wl_columnar_source_access_writer_t writer = { 0 };
+    generation_test_mutation_t held = { 0 };
     wl_columnar_radix_workspace_t workspace = { 0 };
     uint32_t boundaries[2];
     bool *old_shared;
@@ -1453,21 +1169,20 @@ test_workspace_sort_cows_shared_view(void)
     boundaries[1] = view->nrows;
     CHECK(wl_columnar_radix_workspace_prepare(view, boundaries, 1, 0,
         &workspace) == 0, "workspace shared-view preparation");
-    CHECK(wl_columnar_source_access_writer_acquire(
-            &source->source_access, &writer) == 0,
-        "workspace shared-view writer admission");
+    CHECK(generation_test_mutation_acquire(view, &held) == 0,
+        "workspace shared-view mutation admission");
     old_column = view->columns[0];
     old_shared = view->col_shared;
-    CHECK(wl_columnar_relation_radix_sort_with_workspace(view, 0,
-        view->nrows, &writer, &workspace) == 0,
+    CHECK(wl_columnar_relation_radix_sort_with_lease(view, 0,
+        view->nrows, &workspace, &held.lease) == 0,
         "workspace sort COWs shared view");
     CHECK(view->columns[0] != old_column && view->col_shared == NULL
         && source->storage_alias_borrows == 0
         && view->columns[0][0] == 1 && view->columns[0][view->nrows - 1u] == 40,
         "workspace sort publishes detached sorted storage");
     CHECK(old_shared != NULL, "workspace sort started from shared storage");
-    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
-        "workspace shared-view writer release");
+    CHECK(generation_test_mutation_finish(&held, true) == 0,
+        "workspace shared-view mutation finish");
     wl_columnar_radix_workspace_destroy(&workspace);
     cleanup_relations();
 }
@@ -1477,8 +1192,9 @@ test_source_writer_cow_shared_view(void)
 {
     col_rel_t *source = new_relation();
     col_rel_t *view = new_relation();
-    wl_columnar_source_access_writer_t writer = { 0 };
-    bool alias_release_pending = true;
+    generation_test_mutation_t held = { 0 };
+    wl_columnar_radix_workspace_t workspace = { 0 };
+    uint32_t boundaries[2];
     int64_t source_first;
 
     CHECK(source && view, "source-writer shared-view relation allocation");
@@ -1488,25 +1204,24 @@ test_source_writer_cow_shared_view(void)
     CHECK(col_rel_install_shared_view(view, source) == 0,
         "source-writer shared-view install");
     source_first = source->columns[0][0];
-    CHECK(wl_columnar_source_access_writer_acquire(
-            &source->source_access, &writer) == 0,
-        "source-writer shared-view admission");
-    /* defer_alias_release == false is the self-releasing mode the wrapper
-     * this test was written against provided before #1594 collapsed the
-     * radix-sort lease wrappers into col_rel_radix_sort_locked. */
-    CHECK(col_rel_radix_sort_locked(view, 0, view->nrows, &writer, false,
-        &alias_release_pending) == 0,
+    CHECK(generation_test_mutation_acquire(view, &held) == 0,
+        "source-writer shared-view mutation admission");
+    boundaries[0] = 0;
+    boundaries[1] = view->nrows;
+    CHECK(wl_columnar_radix_workspace_prepare(view, boundaries, 1, 0,
+        &workspace) == 0, "source-writer shared-view workspace");
+    CHECK(wl_columnar_relation_radix_sort_with_lease(view, 0, view->nrows,
+        &workspace, &held.lease) == 0,
         "source-writer sorts shared view through COW");
-    CHECK(alias_release_pending == false,
-        "source-writer COW released the alias itself");
     CHECK(source->columns[0][0] == source_first
         && view->col_shared == NULL
         && source->storage_alias_borrows == 0
         && view->columns[0][0] == 1
         && view->columns[0][view->nrows - 1u] == 40,
         "source-writer COW preserves source and detaches view");
-    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
-        "source-writer shared-view release");
+    CHECK(generation_test_mutation_finish(&held, true) == 0,
+        "source-writer shared-view mutation finish");
+    wl_columnar_radix_workspace_destroy(&workspace);
     cleanup_relations();
 }
 
@@ -1522,7 +1237,7 @@ test_workspace_sort_rejects_undersized_workspace_and_rolls_back(void)
     col_rel_t *view = new_relation();
     col_rel_t *sorted = new_relation();
     wl_columnar_radix_workspace_t undersized = { 0 };
-    wl_columnar_source_access_writer_t writer = { 0 };
+    generation_test_mutation_t held = { 0 };
     uint32_t boundaries[2];
     int64_t low = 1;
     int64_t high = 2;
@@ -1567,11 +1282,10 @@ test_workspace_sort_rejects_undersized_workspace_and_rolls_back(void)
         && undersized.insertion_capacity == 0,
         "undersized workspace really is undersized");
 
-    CHECK(wl_columnar_source_access_writer_acquire(
-            &source->source_access, &writer) == 0,
-        "undersized workspace writer admission");
-    CHECK(wl_columnar_relation_radix_sort_with_workspace(view, 0,
-        view->nrows, &writer, &undersized) == EINVAL,
+    CHECK(generation_test_mutation_acquire(view, &held) == 0,
+        "undersized workspace mutation admission");
+    CHECK(wl_columnar_relation_radix_sort_with_lease(view, 0,
+        view->nrows, &undersized, &held.lease) == EINVAL,
         "undersized workspace refused rather than silently reallocated");
     CHECK(view->col_shared != NULL && view->storage_owner == source
         && source->storage_alias_borrows == 1,
@@ -1586,8 +1300,8 @@ test_workspace_sort_rejects_undersized_workspace_and_rolls_back(void)
                 wl_columnar_memory_governor_ref_get(governor))
             == old_reserved,
             "refused workspace sort restores exact retained token and credit");
-    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
-        "undersized workspace writer release");
+    CHECK(generation_test_mutation_finish(&held, false) == 0,
+        "undersized workspace mutation rollback");
     wl_columnar_radix_workspace_destroy(&undersized);
     cleanup_relations();
     if (governor) {
@@ -4706,15 +4420,17 @@ test_set_cow_descriptor_and_owner_admission(void)
             && col_rel_cow_unshare(root, 0) == EBUSY
             && memcmp(root, &root_snapshot, sizeof(root_snapshot)) == 0,
             "canonical mutation with live alias is rejected unchanged");
-        wl_columnar_source_access_writer_t raw = { 0 };
-        CHECK(col_rel_source_writer_acquire(alias, &raw) == 0,
-            "raw alias writer setup");
-        CHECK(col_rel_cow_unshare_with_source_writer(alias, &raw) == EINVAL
+        generation_test_mutation_t alias_mutation = { 0 };
+        CHECK(generation_test_mutation_acquire(alias, &alias_mutation) == 0,
+            "alias COW mutation lease setup");
+        wl_columnar_relation_mutation_lease_t copied_lease
+            = alias_mutation.lease;
+        CHECK(col_rel_cow_unshare_with_lease(alias, &copied_lease) == EINVAL
             && memcmp(alias, &snapshot,
             offsetof(col_rel_t, source_access)) == 0,
-            "raw source writer cannot authorize alias COW");
-        CHECK(wl_columnar_source_access_writer_release(&raw) == 0,
-            "raw alias writer release");
+            "copied lease cannot authorize alias COW");
+        CHECK(generation_test_mutation_finish(&alias_mutation, false) == 0,
+            "alias COW mutation lease release");
         wl_columnar_relation_test_fail_next_prepare_resize();
         CHECK(mutation_set_or_cow(alias, operation) == ENOMEM
             && memcmp(alias, &snapshot, sizeof(snapshot)) == 0
@@ -4895,20 +4611,15 @@ test_public_append_mutation_admission(void)
     }
 }
 
-/* Exercise the same physical-overlap and governor contract through each
- * append authority. The locked caller retains and releases its own writer. */
+/* Exercise overlap through the public single-operation and explicit-lease
+ * admitted paths. */
 static int
-append_overlap_attempt(col_rel_t *rel, const int64_t *row, bool locked)
+append_overlap_attempt(col_rel_t *rel, const int64_t *row,
+    generation_test_mutation_t *held)
 {
-    if (!locked)
+    if (!held)
         return col_rel_append_row(rel, row);
-    wl_columnar_source_access_writer_t writer = { 0 };
-    int rc = col_rel_source_writer_acquire(rel, &writer);
-    if (rc)
-        return rc;
-    rc = col_rel_append_row_locked(rel, row, &writer);
-    int release_rc = wl_columnar_source_access_writer_release(&writer);
-    return rc ? rc : release_rc;
+    return col_rel_append_row_with_lease(rel, row, &held->lease);
 }
 
 static void
@@ -4919,11 +4630,12 @@ test_append_overlapping_input(bool locked)
         col_rel_t *rel = track_relation(col_rel_new_auto("append_overlap",
                 width));
         CHECK(rel, "public append overlap relation");
+        generation_test_mutation_t held = { 0 };
         int64_t row[32];
         for (uint32_t i = 0; i < COL_REL_INIT_CAP; i++) {
             for (uint32_t c = 0; c < width; c++)
                 row[c] = (int64_t)i * 1000 + c;
-            CHECK(append_overlap_attempt(rel, row, locked) == 0,
+            CHECK(append_overlap_attempt(rel, row, NULL) == 0,
                 "public overlap source rows");
         }
         wl_columnar_memory_resolution_t resolution = {
@@ -4938,6 +4650,11 @@ test_append_overlapping_input(bool locked)
             "public append overlap governed relation");
         wl_columnar_memory_governor_t *governor
             = wl_columnar_memory_governor_ref_get(ref);
+        if (locked) {
+            CHECK(generation_test_mutation_acquire(rel, &held) == 0,
+                "append overlap mutation admission");
+            rel->memory_budget_denial_pending = false;
+        }
         uint64_t credit = wl_columnar_memory_reserved(governor);
         col_rel_t before = *rel;
         const int64_t *inside = &rel->columns[0][3];
@@ -4950,7 +4667,8 @@ test_append_overlapping_input(bool locked)
                 resolution.usable_bytes - credit, &blocker)
                 && wl_columnar_memory_commit(&blocker, &blocker),
                 "wide staging budget blocker");
-            CHECK(append_overlap_attempt(rel, inside, locked) == ENOMEM
+            CHECK(append_overlap_attempt(rel, inside,
+                locked ? &held : NULL) == ENOMEM
                 && rel->memory_budget_denial_pending
                 && mutation_payload_unchanged(rel, &before)
                 && wl_columnar_memory_reserved(governor) ==
@@ -4960,9 +4678,11 @@ test_append_overlapping_input(bool locked)
 #ifdef WL_TEST_ALLOC_WRAP
             allocation_calls = 0;
             allocation_fail_at = 0;
-            int failed_rc = append_overlap_attempt(rel, inside, locked);
+            int failed_rc = append_overlap_attempt(rel, inside,
+                    locked ? &held : NULL);
             allocation_fail_at = -1;
-            CHECK(failed_rc == ENOMEM && !rel->memory_budget_denial_pending
+            CHECK(failed_rc == ENOMEM
+                && rel->memory_budget_denial_pending == (locked && wide)
                 && mutation_payload_unchanged(rel, &before)
                 && wl_columnar_memory_reserved(governor) == credit,
                 "wide staging malloc failure returns all scratch credit");
@@ -4973,22 +4693,24 @@ test_append_overlapping_input(bool locked)
             for (long fail = wide ? 1 : 0; fail < (wide ? 4 : 2); fail++) {
                 allocation_calls = 0;
                 allocation_fail_at = fail;
-                int failed_rc = append_overlap_attempt(rel, inside, true);
+                int failed_rc = append_overlap_attempt(rel, inside, &held);
                 allocation_fail_at = -1;
-                CHECK(failed_rc == ENOMEM && !rel->memory_budget_denial_pending
+                CHECK(failed_rc == ENOMEM
+                    && rel->memory_budget_denial_pending == wide
                     && mutation_payload_unchanged(rel, &before)
                     && wl_columnar_memory_reserved(governor) == credit,
                     "locked growth failure after staging rolls back all credit");
             }
 #endif
             wl_columnar_relation_test_fail_next_reservation_commit();
-            CHECK(append_overlap_attempt(rel, inside, true) == ENOMEM
-                && !rel->memory_budget_denial_pending
+            int publish_rc = append_overlap_attempt(rel, inside, &held);
+            CHECK(publish_rc == ENOMEM
+                && rel->memory_budget_denial_pending == wide
                 && mutation_payload_unchanged(rel, &before)
                 && wl_columnar_memory_reserved(governor) == credit,
                 "locked publication failure returns staged scratch credit");
         }
-        CHECK(append_overlap_attempt(rel, inside, locked) == 0
+        CHECK(append_overlap_attempt(rel, inside, locked ? &held : NULL) == 0
             && rel->nrows == before.nrows + 1
             && rel->storage_generation == before.storage_generation + 1,
             "overlapping input survives owned growth and retired old column");
@@ -5002,25 +4724,30 @@ test_append_overlapping_input(bool locked)
 #ifdef WL_TEST_ALLOC_WRAP
             allocation_calls = 0;
             allocation_fail_at = 0;
-            int external_rc = append_overlap_attempt(rel, row, locked);
+            int external_rc = append_overlap_attempt(rel, row,
+                    locked ? &held : NULL);
             long external_calls = allocation_calls;
             int inside_rc = append_overlap_attempt(rel, rel->columns[0],
-                    locked);
+                    locked ? &held : NULL);
             allocation_fail_at = -1;
             CHECK(external_rc == 0 && external_calls == 0 && inside_rc == ENOMEM
-                && !rel->memory_budget_denial_pending
+                && rel->memory_budget_denial_pending == locked
                 && wl_columnar_memory_reserved(governor) == credit,
                 "no-overlap append does not consume a wide-scratch malloc fault");
 #endif
             uint32_t index = rel->nrows;
             memcpy(expected, rel->columns[0], width * sizeof(*inside));
-            CHECK(append_overlap_attempt(rel, rel->columns[0], locked) == 0
+            CHECK(append_overlap_attempt(rel, rel->columns[0],
+                locked ? &held : NULL) == 0
                 && wl_columnar_memory_reserved(governor) == credit,
                 "wide overlapping spare append returns its temporary reservation");
             for (uint32_t c = 0; c < width; c++)
                 CHECK(rel->columns[c][index] == expected[c],
                     "wide overlapping spare append preserves tuple");
         }
+        if (locked)
+            CHECK(generation_test_mutation_finish(&held, true) == 0,
+                "append overlap mutation finish");
         cleanup_relations();
         CHECK(wl_columnar_memory_reserved(governor) == 0,
             "public append overlap cleanup returns all credit");
@@ -5029,7 +4756,7 @@ test_append_overlapping_input(bool locked)
 }
 
 static void
-test_locked_append_alias_overlap(void)
+test_leased_append_alias_overlap(void)
 {
     for (unsigned wide = 0; wide < 2; wide++) {
         for (unsigned full = 0; full < 2; full++) {
@@ -5041,6 +4768,7 @@ test_locked_append_alias_overlap(void)
             col_rel_t *sibling =
                 track_relation(col_rel_new_auto("locked_sibling", width));
             CHECK(root && alias && sibling, "locked overlap aliases");
+            generation_test_mutation_t held = { 0 };
             int64_t row[32], expected[32];
             uint32_t count = full ? COL_REL_INIT_CAP : 40;
             for (uint32_t i = 0; i < count; i++) {
@@ -5064,6 +4792,9 @@ test_locked_append_alias_overlap(void)
                 "locked alias governed");
             wl_columnar_memory_governor_t *governor
                 = wl_columnar_memory_governor_ref_get(ref);
+            CHECK(generation_test_mutation_acquire(alias, &held) == 0,
+                "locked alias mutation admission");
+            alias->memory_budget_denial_pending = false;
             uint64_t credit = wl_columnar_memory_reserved(governor);
             col_rel_t root_before = *root, before = *alias,
                 sibling_before = *sibling;
@@ -5071,16 +4802,14 @@ test_locked_append_alias_overlap(void)
             CHECK(3 + width <= alias->capacity,
                 "wide tuple wholly inside allocation");
             memcpy(expected, inside, width * sizeof(*inside));
-            wl_columnar_source_access_writer_t writer = { 0 };
-            CHECK(col_rel_source_writer_acquire(alias, &writer) == 0,
-                "locked alias writer admission");
             wl_columnar_memory_reservation_t blocker;
             wl_columnar_memory_reservation_init(&blocker);
             CHECK(wl_columnar_memory_reserve(governor,
                 resolution.usable_bytes - credit, &blocker)
                 && wl_columnar_memory_commit(&blocker, &blocker),
                 "locked COW quota blocker");
-            CHECK(col_rel_append_row_locked(alias, inside, &writer) == ENOMEM
+            CHECK(col_rel_append_row_with_lease(alias, inside,
+                &held.lease) == ENOMEM
                 && alias->memory_budget_denial_pending
                 && mutation_payload_unchanged(alias, &before)
                 && mutation_payload_unchanged(root, &root_before)
@@ -5094,11 +4823,11 @@ test_locked_append_alias_overlap(void)
             for (long fail = 0; fail < (wide ? 3 : 2); fail++) {
                 allocation_calls = 0;
                 allocation_fail_at = fail;
-                int failed_rc = col_rel_append_row_locked(alias, inside,
-                        &writer);
+                int failed_rc = col_rel_append_row_with_lease(alias, inside,
+                        &held.lease);
                 allocation_fail_at = -1;
                 CHECK(failed_rc == ENOMEM &&
-                    !alias->memory_budget_denial_pending
+                    alias->memory_budget_denial_pending
                     && mutation_payload_unchanged(alias, &before)
                     && mutation_payload_unchanged(root, &root_before)
                     && mutation_payload_unchanged(sibling, &sibling_before)
@@ -5108,8 +4837,10 @@ test_locked_append_alias_overlap(void)
             }
 #endif
             wl_columnar_relation_test_fail_next_prepare_resize();
-            CHECK(col_rel_append_row_locked(alias, inside, &writer) == ENOMEM
-                && !alias->memory_budget_denial_pending
+            int prepare_rc = col_rel_append_row_with_lease(alias, inside,
+                    &held.lease);
+            CHECK(prepare_rc == ENOMEM
+                && alias->memory_budget_denial_pending
                 && mutation_payload_unchanged(alias, &before)
                 && mutation_payload_unchanged(root, &root_before)
                 && mutation_payload_unchanged(sibling, &sibling_before)
@@ -5123,8 +4854,8 @@ test_locked_append_alias_overlap(void)
                     &blocker)
                     && wl_columnar_memory_commit(&blocker, &blocker),
                     "wide COW admits scratch but blocks payload");
-                CHECK(col_rel_append_row_locked(alias, inside,
-                    &writer) == ENOMEM
+                CHECK(col_rel_append_row_with_lease(alias, inside, &held.lease)
+                    == ENOMEM
                     && alias->memory_budget_denial_pending
                     && mutation_payload_unchanged(alias, &before)
                     && mutation_payload_unchanged(root, &root_before)
@@ -5137,9 +4868,9 @@ test_locked_append_alias_overlap(void)
                     "wide COW payload quota blocker release");
             } else {
                 wl_columnar_relation_test_fail_next_reservation_commit();
-                CHECK(col_rel_append_row_locked(alias, inside,
-                    &writer) == ENOMEM
-                    && !alias->memory_budget_denial_pending
+                CHECK(col_rel_append_row_with_lease(alias, inside, &held.lease)
+                    == ENOMEM
+                    && alias->memory_budget_denial_pending
                     && mutation_payload_unchanged(alias, &before)
                     && mutation_payload_unchanged(root, &root_before)
                     && mutation_payload_unchanged(sibling, &sibling_before)
@@ -5147,7 +4878,7 @@ test_locked_append_alias_overlap(void)
                     && wl_columnar_memory_reserved(governor) == credit,
                     "locked COW publication failure rolls back borrows and credit");
             }
-            CHECK(col_rel_append_row_locked(alias, inside, &writer) == 0
+            CHECK(col_rel_append_row_with_lease(alias, inside, &held.lease) == 0
                 && alias->storage_owner == alias && !alias->col_shared
                 && alias->nrows == before.nrows + 1
                 && alias->view_generation == before.view_generation + 1
@@ -5167,9 +4898,8 @@ test_locked_append_alias_overlap(void)
             CHECK(mutation_payload_unchanged(root, &root_before)
                 && mutation_payload_unchanged(sibling, &sibling_before),
                 "locked COW preserves root and sibling pointers and epochs");
-            CHECK(writer.owner == &root->source_access
-                && wl_columnar_source_access_writer_release(&writer) == 0,
-                "locked append retains original owner writer for caller");
+            CHECK(generation_test_mutation_finish(&held, true) == 0,
+                "locked alias mutation finish");
             cleanup_relations();
             CHECK(wl_columnar_memory_reserved(governor) == 0,
                 "locked alias cleanup releases all credit");
@@ -5180,76 +4910,111 @@ test_locked_append_alias_overlap(void)
 
 typedef struct {
     col_rel_t *relation;
-    wl_columnar_source_access_writer_t *writer;
+    wl_columnar_relation_mutation_lease_t *lease;
     int rc;
-} locked_append_thread_args_t;
+} leased_append_thread_args_t;
 
 static void *
-locked_append_foreign_thread(void *arg)
+leased_append_foreign_thread(void *arg)
 {
-    locked_append_thread_args_t *args = arg;
+    leased_append_thread_args_t *args = arg;
     /* An invalid row endpoint would overflow if payload validation ran. */
-    args->rc = col_rel_append_row_locked(args->relation,
-            (const int64_t *)(UINTPTR_MAX - 3), args->writer);
+    args->rc = col_rel_append_row_with_lease(args->relation,
+            (const int64_t *)(UINTPTR_MAX - 3), args->lease);
     return NULL;
 }
 
 static void
-test_locked_append_authority_and_edges(void)
+test_leased_append_authority_and_edges(void)
 {
     col_rel_t *rel = new_relation(), *other = new_relation();
     int64_t row = 17;
     CHECK(rel && other && col_rel_append_row(rel, &row) == 0,
-        "locked edge relations");
+        "leased edge relations");
     rel->memory_budget_denial_pending = true;
-    wl_columnar_source_access_writer_t writer = { 0 }, invalid = { 0 };
-    CHECK(col_rel_append_row_locked(rel, (const int64_t *)(UINTPTR_MAX - 3),
-        &invalid) == EINVAL && rel->memory_budget_denial_pending,
-        "absent writer preserves evidence before row read");
-    CHECK(col_rel_source_writer_acquire(other, &writer) == 0,
-        "locked foreign owner writer");
-    CHECK(col_rel_append_row_locked(rel, (const int64_t *)(UINTPTR_MAX - 3),
-        &writer) == EINVAL && rel->memory_budget_denial_pending,
-        "foreign owner rejects before overlap arithmetic");
-    CHECK(wl_columnar_source_access_writer_release(&writer) == 0
-        && col_rel_source_writer_acquire(rel, &writer) == 0,
-        "locked correct writer");
-    invalid = writer;
-    CHECK(col_rel_append_row_locked(rel, &row, &invalid) == EINVAL
+    CHECK(col_rel_append_row_with_lease(rel,
+        (const int64_t *)(UINTPTR_MAX - 3), NULL) == EINVAL
         && rel->memory_budget_denial_pending,
-        "copied writer rejects before admission");
-    locked_append_thread_args_t args = { .relation = rel, .writer = &writer };
+        "absent lease preserves evidence before row read");
+    generation_test_mutation_t foreign = { 0 }, held = { 0 },
+        other_held = { 0 };
+    CHECK(generation_test_mutation_acquire(other, &foreign) == 0,
+        "foreign relation lease");
+    CHECK(col_rel_append_row_with_lease(rel,
+        (const int64_t *)(UINTPTR_MAX - 3), &foreign.lease) == EINVAL
+        && rel->memory_budget_denial_pending,
+        "foreign relation lease rejects before overlap arithmetic");
+    CHECK(generation_test_mutation_finish(&foreign, false) == 0
+        && generation_test_mutation_acquire(rel, &held) == 0
+        && generation_test_mutation_acquire(other, &other_held) == 0,
+        "exact relation lease acquisition");
+    wl_columnar_relation_mutation_lease_t copied = held.lease;
+    CHECK(col_rel_append_row_with_lease(rel, &row, &copied) == EINVAL
+        && rel->memory_budget_denial_pending,
+        "copied lease rejects before admission");
+    CHECK(col_rel_append_row_with_lease(rel,
+        (const int64_t *)(UINTPTR_MAX - 3), &other_held.lease) == EINVAL
+        && rel->memory_budget_denial_pending,
+        "foreign lease rejects before payload arithmetic");
+    CHECK(generation_test_mutation_finish(&other_held, false) == 0,
+        "foreign test lease release");
+    leased_append_thread_args_t args = { .relation = rel,
+                                         .lease = &held.lease };
     wl_thread_t thread;
-    CHECK(wl_thread_create(&thread, locked_append_foreign_thread, &args) == 0
+    CHECK(wl_thread_create(&thread, leased_append_foreign_thread, &args) == 0
         && wl_thread_join(&thread) == 0 && args.rc == EINVAL
         && rel->memory_budget_denial_pending,
-        "foreign thread rejects before payload read");
+        "wrong thread rejects before payload read");
 
+    CHECK(generation_test_mutation_finish(&held, false) == 0,
+        "finish provenance checks before stale denial admission");
+    CHECK(generation_test_mutation_acquire(rel, &held) == 0,
+        "admitted non-budget failure mutation lease");
     col_rel_t before = *rel;
-    CHECK(col_rel_append_row_locked(rel, (const int64_t *)(UINTPTR_MAX - 3),
-        &writer) == EOVERFLOW && !rel->memory_budget_denial_pending
+    rel->memory_budget_denial_pending = true;
+    CHECK(col_rel_append_row_with_lease(rel,
+        (const int64_t *)(UINTPTR_MAX - 3), &held.lease) == EOVERFLOW
+        && rel->memory_budget_denial_pending
         && mutation_payload_unchanged(rel, &before),
-        "admitted row endpoint overflow clears evidence without dereference");
+        "nested row endpoint overflow preserves denial evidence without dereference");
     int64_t *column = rel->columns[0];
     rel->columns[0] = (int64_t *)(UINTPTR_MAX - 3);
-    rel->memory_budget_denial_pending = true;
-    CHECK(col_rel_append_row_locked(rel, &row, &writer) == EOVERFLOW
-        && !rel->memory_budget_denial_pending,
+    CHECK(col_rel_append_row_with_lease(rel, &row, &held.lease) == EOVERFLOW
+        && rel->memory_budget_denial_pending,
         "column endpoint overflow precedes dereference");
     rel->columns[0] = column;
     rel->timestamp_capacity = 1;
-    rel->memory_budget_denial_pending = true;
-    CHECK(col_rel_append_row_locked(rel, &row, &writer) == EINVAL
-        && !rel->memory_budget_denial_pending,
-        "admitted shape rejection clears evidence");
+    CHECK(col_rel_append_row_with_lease(rel, &row, &held.lease) == EINVAL
+        && rel->memory_budget_denial_pending,
+        "nested shape rejection preserves denial evidence");
     rel->timestamp_capacity = 0;
-    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
-        "locked edge writer release");
+    CHECK(generation_test_mutation_finish(&held, false) == 0,
+        "lease edge release");
+    cleanup_relations();
+
+    col_rel_t *nested = new_relation();
+    generation_test_mutation_t nested_held = { 0 };
+    CHECK(nested && generation_test_mutation_acquire(nested, &nested_held) == 0,
+        "nested append lease acquisition");
+    nested->memory_budget_denial_pending = true;
+    CHECK(col_rel_append_row_with_lease(nested, &row, &nested_held.lease) == 0
+        && nested->memory_budget_denial_pending,
+        "successful nested append preserves outer quota-denial evidence");
+    CHECK(generation_test_mutation_finish(&nested_held, true) == 0,
+        "nested append lease finish");
+    cleanup_relations();
+
+    col_rel_t *public_retry = new_relation();
+    CHECK(public_retry != NULL, "public stale-evidence relation");
+    public_retry->memory_budget_denial_pending = true;
+    CHECK(col_rel_append_row(public_retry, &row) == 0
+        && !public_retry->memory_budget_denial_pending,
+        "public append starts a fresh denial-evidence attempt");
     cleanup_relations();
 }
 
 static void
-test_locked_append_legacy_descriptor_topology(void)
+test_append_lease_descriptor_topology(void)
 {
     col_rel_t *root = new_relation(), *alias = new_relation(),
         *sibling = new_relation();
@@ -5257,32 +5022,25 @@ test_locked_append_legacy_descriptor_topology(void)
     CHECK(root && alias && sibling && col_rel_append_row(root, &row) == 0
         && col_rel_install_shared_view(alias, root) == 0
         && col_rel_install_shared_view(sibling, root) == 0,
-        "legacy append descriptor topology relations");
-    wl_columnar_source_access_writer_t writer = { 0 };
-    CHECK(col_rel_source_writer_acquire(alias, &writer) == 0,
-        "legacy topology first descriptor admission");
-    wl_columnar_source_access_gate_t *owner_gate = writer.owner;
-    wl_columnar_source_access_gate_t *alias_gate = writer.secondary_owner;
-    CHECK(owner_gate == &root->source_access &&
-        alias_gate == &alias->descriptor_access
-        && wl_columnar_source_access_writer_release(&writer) == 0,
-        "legacy first token pins alias descriptor and canonical owner");
-    CHECK(col_rel_source_writer_acquire(sibling, &writer) == 0,
-        "legacy topology second descriptor admission");
-    CHECK(writer.owner == owner_gate &&
-        writer.secondary_owner == &sibling->descriptor_access
-        && writer.secondary_owner != alias_gate
-        && wl_columnar_source_access_writer_release(&writer) == 0,
-        "same owner does not imply the same admitted descriptor");
-    /* TODO (#2033 Unit 2B3b2): exact target lease authority must reject an
-     * alias-A token used for alias B before reads, denial reset, or scratch.
-     * The legacy owner-only append contract provides no such guarantee;
-     * characterization deliberately performs no unsafe cross-descriptor write. */
+        "append lease descriptor topology relations");
+    generation_test_mutation_t alias_lease = { 0 }, sibling_lease = { 0 };
+    CHECK(generation_test_mutation_acquire(alias, &alias_lease) == 0
+        && alias_lease.descriptor.relation == alias
+        && alias_lease.lease.owner == root,
+        "alias lease binds its exact descriptor and shared owner");
+    CHECK(generation_test_mutation_finish(&alias_lease, false) == 0
+        && generation_test_mutation_acquire(sibling, &sibling_lease) == 0
+        && sibling_lease.descriptor.relation == sibling
+        && sibling_lease.lease.owner == root
+        && &sibling_lease.descriptor != &alias_lease.descriptor,
+        "same owner retains distinct alias descriptor leases");
+    CHECK(generation_test_mutation_finish(&sibling_lease, false) == 0,
+        "append descriptor leases released");
     cleanup_relations();
 }
 
 static void
-test_locked_append_generation_boundaries(void)
+test_leased_append_generation_boundaries(void)
 {
     /* spare heap, growing heap, shared COW, growing arena, short arena
      * timestamps, short heap timestamps, and spare arena with timestamps. */
@@ -5324,9 +5082,6 @@ test_locked_append_generation_boundaries(void)
                 rel->timestamp_capacity = rel->nrows;
             }
         }
-        wl_columnar_source_access_writer_t writer = { 0 };
-        CHECK(col_rel_source_writer_acquire(rel, &writer) == 0,
-            "locked epoch writer");
         uint64_t view = rel->view_generation, storage = rel->storage_generation;
         for (unsigned boundary = 0; boundary < (replacement ? 2u : 1u);
             boundary++) {
@@ -5336,16 +5091,22 @@ test_locked_append_generation_boundaries(void)
             if (boundary && rel->storage_owner == rel)
                 rel->storage_owner_generation = *epoch;
             col_rel_t before = *rel;
-            rel->memory_budget_denial_pending = true;
+            generation_test_mutation_t held = { 0 };
+            CHECK(generation_test_mutation_acquire(rel, &held) == 0,
+                "epoch operation mutation admission");
 #ifdef WL_TEST_ALLOC_WRAP
             allocation_calls = 0;
             allocation_fail_at = 0;
 #endif
-            CHECK(col_rel_append_row_locked(rel, rel->columns[0],
-                &writer) == EOVERFLOW
-                && !rel->memory_budget_denial_pending
+            rel->memory_budget_denial_pending = true;
+            int append_rc = col_rel_append_row_with_lease(rel,
+                    rel->columns[0], &held.lease);
+            CHECK(append_rc == EOVERFLOW
+                && rel->memory_budget_denial_pending
                 && mutation_payload_unchanged(rel, &before),
                 "locked epoch boundary rejects before staging or publication");
+            CHECK(generation_test_mutation_finish(&held, false) == 0,
+                "epoch operation lease rollback");
 #ifdef WL_TEST_ALLOC_WRAP
             CHECK(allocation_calls == 0,
                 "epoch rejection consumes no allocation");
@@ -5363,15 +5124,20 @@ test_locked_append_generation_boundaries(void)
             storage = rel->storage_generation;
         }
         uint32_t rows = rel->nrows;
-        CHECK(col_rel_append_row_locked(rel, rel->columns[0], &writer) == 0
+        generation_test_mutation_t held = { 0 };
+        CHECK(generation_test_mutation_acquire(rel, &held) == 0,
+            "epoch success mutation admission");
+        rel->memory_budget_denial_pending = false;
+        CHECK(col_rel_append_row_with_lease(rel, rel->columns[0],
+            &held.lease) == 0
             && rel->nrows == rows + 1 && rel->columns[0][rows] == row[0]
             && rel->view_generation == view + 1
             && rel->storage_generation == storage + (replacement ? 1 : 0)
             && (!short_ts || rel->timestamp_capacity == rel->capacity)
             && (kind != 6 || rel->arena_owned),
             "locked epoch retry publishes exact view and storage epochs");
-        CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
-            "locked epoch release");
+        CHECK(generation_test_mutation_finish(&held, true) == 0,
+            "epoch success mutation finish");
         col_rel_destroy(rel);
         col_rel_destroy(root);
         delta_pool_destroy(pool);
@@ -5915,7 +5681,7 @@ test_public_batch_lazy_and_timestamp_edges(void)
 }
 
 static void
-test_public_append_edges_and_locked_compatibility(void)
+test_public_and_leased_append_edges(void)
 {
     col_rel_t *rel = new_relation();
     int64_t row = 43;
@@ -5956,16 +5722,11 @@ test_public_append_edges_and_locked_compatibility(void)
     col_rel_t *root = new_relation(), *alias = new_relation();
     CHECK(root && alias && col_rel_append_row(root, &row) == 0
         && col_rel_install_shared_view(alias, root) == 0,
-        "locked append compatibility setup");
-    wl_columnar_source_access_writer_t writer = { 0 };
-    CHECK(col_rel_source_writer_acquire(alias, &writer) == 0,
-        "locked append legacy source writer");
-    CHECK(col_rel_append_row_locked(alias, &row, &writer) == 0
+        "leased append compatibility setup");
+    CHECK(generation_test_append_with_lease(alias, &row) == 0
         && alias->storage_owner == alias && alias->nrows == 2
         && col_rel_storage_alias_borrow_count(root) == 0,
-        "locked append retains legacy admitted alias behavior");
-    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
-        "locked append compatibility release");
+        "lease append retains admitted alias behavior");
     cleanup_relations();
     col_rel_t *empty = track_relation(col_rel_new_auto("append_nullary", 0));
     CHECK(empty && col_rel_append_row(empty, &row) == 0 && empty->nrows == 1,
@@ -6347,7 +6108,7 @@ typedef struct {
     wl_columnar_relation_mutation_set_t set;
     wl_columnar_relation_mutation_role_t role;
     wl_columnar_relation_mutation_descriptor_t descriptor;
-    wl_columnar_relation_mutation_owner_t owner;
+    wl_columnar_relation_mutation_owner_t owners[2];
     wl_columnar_relation_mutation_lease_t lease;
     wl_columnar_relation_mutation_initialization_t initialization;
 } radix_test_lease_t;
@@ -6358,7 +6119,7 @@ radix_test_acquire(col_rel_t *rel, radix_test_lease_t *held)
     held->role = (wl_columnar_relation_mutation_role_t){ rel,
                                                          WL_COLUMNAR_RELATION_PAYLOAD_MUTATION };
     return col_rel_mutation_set_acquire(&held->set, &held->role, 1,
-               &held->descriptor, 1, &held->owner, 1, &held->lease, 1,
+               &held->descriptor, 1, held->owners, 2, &held->lease, 1,
                &held->initialization, 1);
 }
 
@@ -6589,6 +6350,404 @@ test_leased_radix_provenance(void)
     wl_columnar_radix_workspace_destroy(&workspace);
     CHECK(col_rel_mutation_set_finish(&held.set, false) == 0,
         "radix invalid input set finish");
+    cleanup_relations();
+}
+
+typedef struct {
+    wl_columnar_relation_radix_sequence_t *sequence;
+    wl_columnar_relation_mutation_lease_t *lease;
+    int rc;
+} radix_sequence_wrong_thread_t;
+
+static void *
+radix_sequence_test_wrong_thread(void *opaque)
+{
+    radix_sequence_wrong_thread_t *args = opaque;
+    args->rc = wl_columnar_relation_radix_sequence_execute_with_lease(
+        args->sequence, args->lease);
+    return NULL;
+}
+
+static void
+test_leased_radix_sequence(void)
+{
+    col_rel_t *root = new_relation();
+    col_rel_t *alias = new_relation();
+    for (int64_t value = 1; value <= 4; value++)
+        CHECK(col_rel_append_row(root, &value) == 0,
+            "radix sequence sorted seed");
+    for (int64_t value = 8; value >= 5; value--)
+        CHECK(col_rel_append_row(root, &value) == 0,
+            "radix sequence unsorted seed");
+    for (int64_t value = 12; value >= 9; value--)
+        CHECK(col_rel_append_row(root, &value) == 0,
+            "radix sequence second unsorted seed");
+    CHECK(col_rel_enable_timestamps(root) == 0,
+        "radix sequence timestamp allocation");
+    for (uint32_t i = 0; i < root->nrows; i++)
+        root->timestamps[i].iteration = (uint64_t)(100u + i);
+    CHECK(col_rel_install_shared_view(alias, root) == 0,
+        "radix sequence alias");
+    radix_test_lease_t held = { 0 };
+    wl_columnar_relation_radix_sequence_t sequence = { 0 };
+    uint32_t bounds[] = { 0, 4, 8, 12 };
+    CHECK(radix_test_acquire(alias, &held) == 0,
+        "radix sequence acquire");
+    uint64_t sequence_view = alias->view_generation;
+    alias->view_generation = WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+    CHECK(wl_columnar_relation_radix_sequence_prepare_with_lease(alias,
+        bounds, 3, &sequence, &held.lease) == EOVERFLOW
+        && sequence.identity == 0,
+        "radix sequence preflights the exact view event count");
+    alias->view_generation = sequence_view;
+    uint64_t sequence_storage = alias->storage_generation;
+    alias->storage_generation = WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+    held.lease.relation_generation = alias->storage_generation;
+    CHECK(wl_columnar_relation_radix_sequence_prepare_with_lease(alias,
+        bounds, 3, &sequence, &held.lease) == EOVERFLOW
+        && sequence.identity == 0,
+        "radix sequence preflights shared storage epoch exhaustion");
+    alias->storage_generation = sequence_storage;
+    held.lease.relation_generation = sequence_storage;
+    held.lease.storage_transitioned = true;
+    CHECK(wl_columnar_relation_radix_sequence_prepare_with_lease(alias,
+        bounds, 3, &sequence, &held.lease) == EINVAL
+        && sequence.identity == 0,
+        "shared radix sequence rejects a prior storage transition");
+    held.lease.storage_transitioned = false;
+#ifdef WL_TEST_ALLOC_WRAP
+    col_rel_t before_alloc_failure = *alias;
+    for (long fail_at = 0; fail_at < 4; fail_at++) {
+        allocation_calls = 0;
+        allocation_fail_at = fail_at;
+        int alloc_rc = wl_columnar_relation_radix_sequence_prepare_with_lease(
+            alias, bounds, 3, &sequence, &held.lease);
+        allocation_fail_at = -1;
+        CHECK(alloc_rc == ENOMEM && sequence.identity == 0
+            && mutation_payload_unchanged(alias, &before_alloc_failure)
+            && alias->storage_generation ==
+            before_alloc_failure.storage_generation,
+            "radix sequence allocation failure precedes all mutation");
+    }
+#endif
+    CHECK(wl_columnar_relation_radix_sequence_prepare_with_lease(alias,
+        bounds, 3, &sequence, &held.lease) == 0,
+        "radix sequence prepare");
+    radix_sequence_wrong_thread_t wrong_thread = { &sequence, &held.lease, 0 };
+    wl_thread_t worker;
+    CHECK(wl_thread_create(&worker, radix_sequence_test_wrong_thread,
+        &wrong_thread) == 0 && wl_thread_join(&worker) == 0
+        && wrong_thread.rc == EINVAL && !sequence.consumed,
+        "radix sequence rejects wrong-thread execution without consumption");
+    col_rel_t *foreign = new_relation();
+    radix_test_lease_t foreign_held = { 0 };
+    CHECK(radix_test_acquire(foreign, &foreign_held) == 0
+        && wl_columnar_relation_radix_sequence_execute_with_lease(&sequence,
+        &foreign_held.lease) == EINVAL
+        && col_rel_mutation_set_finish(&foreign_held.set, false) == 0,
+        "radix sequence rejects a foreign lease");
+    bounds[1] = 8; /* The token owns the original boundaries. */
+    wl_columnar_relation_radix_sequence_t copy = sequence;
+    CHECK(wl_columnar_relation_radix_sequence_execute_with_lease(&copy,
+        &held.lease) == EINVAL,
+        "radix sequence rejects a copied token");
+    uint64_t view_before = alias->view_generation;
+    uint64_t storage_before = alias->storage_generation;
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    col_rel_t before_cow_failure = *alias;
+    wl_columnar_relation_test_fail_next_prepare_resize();
+    CHECK(wl_columnar_relation_radix_sequence_execute_with_lease(&sequence,
+        &held.lease) == ENOMEM && !sequence.consumed
+        && mutation_payload_unchanged(alias, &before_cow_failure)
+        && alias->storage_generation == storage_before
+        && col_rel_storage_alias_borrow_count(root) == 1,
+        "failed sequence COW leaves token retryable and payload unchanged");
+#endif
+    CHECK(wl_columnar_relation_radix_sequence_execute_with_lease(&sequence,
+        &held.lease) == 0
+        && alias->view_generation == view_before + 2
+        && alias->storage_generation == storage_before + 1
+        && alias->columns[0][0] == 1 && alias->columns[0][3] == 4
+        && alias->columns[0][4] == 5 && alias->columns[0][7] == 8
+        && alias->columns[0][8] == 9 && alias->columns[0][11] == 12
+        && alias->timestamps[4].iteration == 107
+        && alias->timestamps[7].iteration == 104
+        && alias->timestamps[8].iteration == 111
+        && alias->timestamps[11].iteration == 108
+        && root->columns[0][4] == 8
+        && col_rel_storage_alias_borrow_count(root) == 0,
+        "radix sequence sorts copied ranges after one alias detach");
+    CHECK(wl_columnar_relation_radix_sequence_execute_with_lease(&sequence,
+        &held.lease) == EINVAL,
+        "radix sequence rejects replay");
+    wl_columnar_relation_radix_sequence_destroy(&sequence);
+    CHECK(col_rel_mutation_set_finish(&held.set, true) == 0,
+        "radix sequence finish");
+    cleanup_relations();
+
+    root = new_relation();
+    alias = new_relation();
+    for (int64_t value = 1; value <= 3; value++)
+        CHECK(col_rel_append_row(root, &value) == 0,
+            "radix zero-sort seed");
+    CHECK(col_rel_install_shared_view(alias, root) == 0,
+        "radix zero-sort alias");
+    memset(&held, 0, sizeof(held));
+    memset(&sequence, 0, sizeof(sequence));
+    uint32_t invalid_bounds[] = { 0, 4, 3 };
+    uint32_t sorted_bounds[] = { 0, 0, 1, 3 };
+    CHECK(radix_test_acquire(alias, &held) == 0,
+        "radix zero-sort lease");
+    CHECK(wl_columnar_relation_radix_sequence_prepare_with_lease(alias,
+        invalid_bounds, 2, &sequence, &held.lease) == EINVAL
+        && sequence.identity == 0,
+        "radix sequence validates every boundary before preparing");
+    CHECK(wl_columnar_relation_radix_sequence_prepare_with_lease(alias,
+        sorted_bounds, 3, &sequence, &held.lease) == 0,
+        "radix zero-sort prepare accepts empty and singleton segments");
+    view_before = alias->view_generation;
+    storage_before = alias->storage_generation;
+    CHECK(wl_columnar_relation_radix_sequence_execute_with_lease(&sequence,
+        &held.lease) == 0
+        && alias->view_generation == view_before
+        && alias->storage_generation == storage_before
+        && alias->storage_owner == root
+        && col_rel_storage_alias_borrow_count(root) == 1,
+        "zero-sort sequence consumes without detaching or advancing epochs");
+    wl_columnar_relation_radix_sequence_destroy(&sequence);
+    memset(&sequence, 0, sizeof(sequence));
+    uint32_t sorted_multirow_bounds[] = { 0, 3 };
+    CHECK(wl_columnar_relation_radix_sequence_prepare_with_lease(alias,
+        sorted_multirow_bounds, 1, &sequence, &held.lease) == 0,
+        "radix multirow sorted alias prepare");
+    view_before = alias->view_generation;
+    storage_before = alias->storage_generation;
+    CHECK(wl_columnar_relation_radix_sequence_execute_with_lease(&sequence,
+        &held.lease) == 0 && alias->view_generation == view_before
+        && alias->storage_generation == storage_before
+        && alias->storage_owner == root
+        && col_rel_storage_alias_borrow_count(root) == 1,
+        "multirow sorted alias does not detach or advance generations");
+    wl_columnar_relation_radix_sequence_destroy(&sequence);
+    CHECK(col_rel_mutation_set_finish(&held.set, true) == 0,
+        "radix zero-sort finish");
+    memset(&sequence, 0, sizeof(sequence));
+    memset(&held.set, 0, sizeof(held.set));
+    CHECK(radix_test_acquire(alias, &held) == 0
+        && wl_columnar_relation_radix_sequence_prepare_with_lease(alias,
+        sorted_bounds, 3, &sequence, &held.lease) == 0,
+        "radix sequence prepares before reacquisition");
+    uint64_t prior_nonce = held.set.acquisition_nonce;
+    CHECK(col_rel_mutation_set_finish(&held.set, true) == 0,
+        "radix sequence prior set finish");
+    memset(&held.set, 0, sizeof(held.set));
+    CHECK(radix_test_acquire(alias, &held) == 0
+        && held.set.acquisition_nonce != prior_nonce
+        && wl_columnar_relation_radix_sequence_execute_with_lease(&sequence,
+        &held.lease) == EINVAL,
+        "sequence cannot revive after unchanged descriptor reacquisition");
+    wl_columnar_relation_radix_sequence_destroy(&sequence);
+    CHECK(col_rel_mutation_set_finish(&held.set, true) == 0,
+        "radix sequence reacquired set finish");
+    cleanup_relations();
+
+#ifdef WL_SESSION_TEST_HOOKS
+    root = new_relation();
+    for (int64_t value = 8; value > 0; value--)
+        CHECK(col_rel_append_row(root, &value) == 0,
+            "radix sequence admission seed");
+    wl_columnar_memory_resolution_t tiny_resolution = {
+        .budget_bytes = 1u << 20, .usable_bytes = 1u << 20,
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+            .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+            .status = WL_COLUMNAR_MEMORY_OK
+    };
+    wl_columnar_memory_governor_ref_t *tiny_ref
+        = wl_columnar_memory_governor_ref_create(&tiny_resolution);
+    CHECK(tiny_ref && col_rel_attach_memory_governor(root, tiny_ref) == 0,
+        "radix sequence attach tiny governor");
+    wl_columnar_memory_reservation_t blocker;
+    wl_columnar_memory_reservation_init(&blocker);
+    uint64_t already_reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(tiny_ref));
+    CHECK(already_reserved < tiny_resolution.budget_bytes
+        && wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(tiny_ref),
+            tiny_resolution.budget_bytes - already_reserved - 1u,
+            &blocker) == WL_COLUMNAR_MEMORY_ADMISSION_OK,
+        "radix sequence reserve all but one governor byte");
+    uint64_t reserved_before_refusal = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(tiny_ref));
+    memset(&held, 0, sizeof(held));
+    memset(&sequence, 0, sizeof(sequence));
+    uint32_t admission_bounds[] = { 0, 8 };
+    CHECK(radix_test_acquire(root, &held) == 0,
+        "radix sequence admission lease");
+    col_rel_t before_denial = *root;
+    CHECK(wl_columnar_relation_radix_sequence_prepare_with_lease(root,
+        admission_bounds, 1, &sequence, &held.lease) == ENOMEM
+        && root->memory_budget_denial_pending
+        && mutation_payload_unchanged(root, &before_denial)
+        && root->view_generation == before_denial.view_generation
+        && root->storage_generation == before_denial.storage_generation
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(tiny_ref))
+        == reserved_before_refusal,
+        "radix sequence budget denial precedes mutation");
+    CHECK(col_rel_mutation_set_finish(&held.set, false) == 0,
+        "radix sequence denial finish");
+    CHECK(wl_columnar_memory_release(&blocker),
+        "radix sequence release quota blocker");
+    cleanup_relations();
+    wl_columnar_memory_governor_ref_release(tiny_ref);
+#endif
+
+    root = new_relation();
+    CHECK(col_rel_set_schema(root, 0, NULL) == 0,
+        "radix sequence nullary schema");
+    int64_t dummy = 0;
+    CHECK(col_rel_append_row(root, &dummy) == 0
+        && col_rel_append_row(root, &dummy) == 0,
+        "radix sequence nullary rows");
+    alias = new_relation();
+    CHECK(col_rel_install_shared_view(alias, root) == 0,
+        "radix sequence nullary alias");
+    memset(&held, 0, sizeof(held));
+    memset(&sequence, 0, sizeof(sequence));
+    uint32_t nullary_bounds[] = { 0, 1, 2 };
+    CHECK(radix_test_acquire(alias, &held) == 0
+        && wl_columnar_relation_radix_sequence_prepare_with_lease(alias,
+        nullary_bounds, 2, &sequence, &held.lease) == 0,
+        "radix sequence nullary prepare");
+    view_before = alias->view_generation;
+    storage_before = alias->storage_generation;
+    CHECK(wl_columnar_relation_radix_sequence_execute_with_lease(&sequence,
+        &held.lease) == 0 && alias->view_generation == view_before
+        && alias->storage_generation == storage_before
+        && alias->storage_owner == root,
+        "nullary shared sequence is a zero-sort no-op");
+    wl_columnar_relation_radix_sequence_destroy(&sequence);
+    CHECK(col_rel_mutation_set_finish(&held.set, true) == 0,
+        "radix sequence nullary finish");
+    cleanup_relations();
+
+    root = new_relation();
+    alias = new_relation();
+    CHECK(col_rel_install_shared_view(alias, root) == 0,
+        "radix sequence zero-capacity alias");
+    memset(&held, 0, sizeof(held));
+    memset(&sequence, 0, sizeof(sequence));
+    uint32_t empty_bounds[] = { 0, 0 };
+    CHECK(radix_test_acquire(alias, &held) == 0
+        && wl_columnar_relation_radix_sequence_prepare_with_lease(alias,
+        empty_bounds, 1, &sequence, &held.lease) == 0,
+        "radix sequence zero-capacity prepare");
+    view_before = alias->view_generation;
+    storage_before = alias->storage_generation;
+    CHECK(wl_columnar_relation_radix_sequence_execute_with_lease(&sequence,
+        &held.lease) == 0 && alias->view_generation == view_before
+        && alias->storage_generation == storage_before
+        && alias->storage_owner == root,
+        "zero-capacity alias sequence has no publication");
+    wl_columnar_relation_radix_sequence_destroy(&sequence);
+    CHECK(col_rel_mutation_set_finish(&held.set, true) == 0,
+        "radix sequence zero-capacity finish");
+    cleanup_relations();
+
+    root = new_relation();
+    wirelog_column_type_t float_type = WIRELOG_TYPE_FLOAT;
+    CHECK(col_rel_set_column_types(root, &float_type, 1) == 0,
+        "radix sequence float type");
+    const double float_values[] = { 4.0, 1.0, 3.0, 2.0 };
+    for (size_t i = 0; i < sizeof(float_values) / sizeof(float_values[0]);
+        i++) {
+        int64_t bits;
+        memcpy(&bits, &float_values[i], sizeof(bits));
+        CHECK(col_rel_append_row(root, &bits) == 0,
+            "radix sequence float seed");
+    }
+    CHECK(col_rel_enable_timestamps(root) == 0,
+        "radix sequence float timestamps");
+    for (uint32_t i = 0; i < root->nrows; i++)
+        root->timestamps[i].iteration = 20u + i;
+    memset(&held, 0, sizeof(held));
+    memset(&sequence, 0, sizeof(sequence));
+    uint32_t float_bounds[] = { 0, 4 };
+    CHECK(radix_test_acquire(root, &held) == 0
+        && wl_columnar_relation_radix_sequence_prepare_with_lease(root,
+        float_bounds, 1, &sequence, &held.lease) == 0
+        && wl_columnar_relation_radix_sequence_execute_with_lease(&sequence,
+        &held.lease) == 0,
+        "radix sequence sorts float typed segment");
+    const uint64_t expected_timestamps[] = { 21, 23, 22, 20 };
+    for (uint32_t i = 0; i < root->nrows; i++) {
+        double value;
+        memcpy(&value, &root->columns[0][i], sizeof(value));
+        CHECK(value == (double)(i + 1u)
+            && root->timestamps[i].iteration == expected_timestamps[i],
+            "radix sequence float timestamp permutation");
+    }
+    wl_columnar_relation_radix_sequence_destroy(&sequence);
+    CHECK(col_rel_mutation_set_finish(&held.set, true) == 0,
+        "radix sequence float finish");
+    cleanup_relations();
+}
+
+static void
+test_radix_sequence_lazy_publication(void)
+{
+    col_rel_t *rel = new_relation();
+    for (int64_t value = 4; value > 0; value--)
+        CHECK(col_rel_append_row(rel, &value) == 0,
+            "lazy radix sequence seed");
+    rel->storage_owner = NULL;
+    rel->storage_owner_identity = 0;
+    rel->storage_owner_generation = 0;
+    radix_test_lease_t held = { 0 };
+    wl_columnar_relation_radix_sequence_t sequence = { 0 };
+    uint32_t bounds[] = { 0, 4 };
+    CHECK(radix_test_acquire(rel, &held) == 0
+        && wl_columnar_relation_radix_sequence_prepare_with_lease(rel,
+        bounds, 1, &sequence, &held.lease) == 0
+        && wl_columnar_relation_radix_sequence_execute_with_lease(&sequence,
+        &held.lease) == 0 && held.set.published,
+        "canonical radix sort marks mutation-set publication before moving rows");
+    uint64_t identity = rel->storage_owner_identity;
+    uint64_t generation = rel->storage_owner_generation;
+    CHECK(col_rel_mutation_set_finish(&held.set, false) == 0
+        && rel->storage_owner == rel
+        && rel->storage_owner_identity == identity
+        && rel->storage_owner_generation == generation,
+        "failed finish retains lazy owner metadata after radix publication");
+    wl_columnar_relation_radix_sequence_destroy(&sequence);
+    cleanup_relations();
+
+    rel = new_relation();
+    for (int64_t value = 1; value <= 3; value++)
+        CHECK(col_rel_append_row(rel, &value) == 0,
+            "zero-sort lazy radix seed");
+    rel->storage_owner = NULL;
+    rel->storage_owner_identity = 0;
+    rel->storage_owner_generation = 0;
+    memset(&held, 0, sizeof(held));
+    memset(&sequence, 0, sizeof(sequence));
+    uint32_t sorted_bounds[] = { 0, 3 };
+    CHECK(radix_test_acquire(rel, &held) == 0
+        && wl_columnar_relation_radix_sequence_prepare_with_lease(rel,
+        sorted_bounds, 1, &sequence, &held.lease) == 0
+        && wl_columnar_relation_radix_sequence_execute_with_lease(&sequence,
+        &held.lease) == 0 && !held.set.published,
+        "zero-sort sequence leaves mutation set unpublished");
+    CHECK(col_rel_mutation_set_finish(&held.set, false) == 0
+        && rel->storage_owner == NULL
+        && rel->storage_owner_identity == 0
+        && rel->storage_owner_generation == 0,
+        "zero-sort failed finish rolls lazy owner initialization back");
+    wl_columnar_relation_radix_sequence_destroy(&sequence);
+    /* Restore a destroyable canonical descriptor after verifying rollback. */
+    rel->storage_owner = rel;
+    rel->storage_owner_identity = rel->relation_identity;
+    rel->storage_owner_generation = rel->storage_generation;
     cleanup_relations();
 }
 
@@ -6905,7 +7064,7 @@ test_radix_exact_authority_and_shape(void)
         "radix real same-shape foreign preparation is refused");
     wl_columnar_radix_workspace_destroy(&foreign_workspace);
     wl_columnar_source_access_writer_t writer_copy = held.descriptor.writer;
-    held.descriptor.writer = held.owner.writer;
+    held.descriptor.writer = held.owners[held.lease.owner_slot].writer;
     CHECK(wl_columnar_relation_radix_sort_with_lease(rel, 1, 70, &workspace,
         &held.lease) == EINVAL,
         "radix copied foreign descriptor token rejected");
@@ -7186,15 +7345,17 @@ main(void)
     test_radix_opposite_address_contention();
     test_radix_descriptor_admission();
     test_leased_radix_provenance();
+    test_leased_radix_sequence();
+    test_radix_sequence_lazy_publication();
     test_leased_radix_kernels();
     test_public_append_mutation_admission();
     test_append_overlapping_input(false);
     test_append_overlapping_input(true);
-    test_locked_append_alias_overlap();
-    test_locked_append_authority_and_edges();
-    test_locked_append_legacy_descriptor_topology();
-    test_locked_append_generation_boundaries();
-    test_public_append_edges_and_locked_compatibility();
+    test_leased_append_alias_overlap();
+    test_leased_append_authority_and_edges();
+    test_append_lease_descriptor_topology();
+    test_leased_append_generation_boundaries();
+    test_public_and_leased_append_edges();
     test_set_cow_denial_provenance();
     test_empty_append_all_legacy_cow_compatibility();
     test_leased_rebind_descriptor_exclusion();
@@ -7215,14 +7376,7 @@ main(void)
     test_legacy_storage_owner_metadata_initialization();
     test_peer_reader_alias_accounting_is_race_safe();
     test_source_reader_blocks_radix_sort();
-    test_radix_sort_locked_rejects_foreign_writer();
-    test_radix_sort_locked_rejects_absent_writer_and_out();
-    test_radix_sort_locked_validates_below_the_range_shortcut();
     test_radix_sort_family_validates_trivial_ranges();
-    test_radix_sort_locked_owner_with_borrows_is_busy();
-    test_radix_sort_locked_hands_back_the_alias();
-    test_radix_sort_locked_releases_the_alias_itself();
-    test_radix_sort_with_workspace_owner_with_borrows_is_busy();
     test_workspace_sort_cows_shared_view();
     test_workspace_sort_rejects_undersized_workspace_and_rolls_back();
     test_source_writer_cow_shared_view();

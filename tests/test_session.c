@@ -9439,6 +9439,21 @@ test_worker_delta_preflight(uint32_t ncols, uint32_t rows)
     uint64_t source_storage = source->storage_generation;
     int64_t **source_columns = source->columns;
     uint64_t baseline = wl_columnar_memory_reserved(budget);
+    if (rows == 0) {
+        uint32_t initial_capacity = source->capacity;
+        DELTA_CHECK(wl_columnar_eval_test_prepare_worker_delta(&delta,
+            "$d$source", source, 0, sess->memory_governor) == 0
+            && delta && delta->capacity == initial_capacity
+            && delta->timestamp_capacity == initial_capacity
+            && (!!delta->timestamps == (initial_capacity != 0)),
+            "empty worker delta keeps its initial capacity and timestamps");
+        DELTA_CHECK(col_rel_destroy_checked(delta) == 0,
+            "empty worker delta teardown");
+        delta = NULL;
+        DELTA_CHECK(wl_columnar_memory_reserved(budget) == baseline,
+            "empty worker delta returns its credit");
+        goto cleanup;
+    }
     DELTA_CHECK(wl_columnar_eval_test_prepare_worker_delta(&delta,
         "$d$source", source, UINT32_MAX, sess->memory_governor)
         == EOVERFLOW && !delta
@@ -9461,15 +9476,16 @@ test_worker_delta_preflight(uint32_t ncols, uint32_t rows)
         "$d$source", source, sess->memory_governor) == 0,
         "measure descriptor stage");
     constructor_peak = wl_columnar_memory_reserved(budget);
-    wl_columnar_source_access_writer_t writer = { 0 };
-    DELTA_CHECK(col_rel_source_writer_acquire(delta, &writer) == 0,
-        "measure writer");
-    bool alias_release_pending = false;
-    int stage_rc = col_rel_reserve_rows_locked(delta, rows, &writer,
-            &alias_release_pending);
-    int release_rc = wl_columnar_source_access_writer_release(&writer);
-    DELTA_CHECK(stage_rc == 0 && release_rc == 0
-        && !alias_release_pending, "measure grid stage");
+    uint32_t target_capacity = delta->capacity
+        ? delta->capacity : COL_REL_INIT_CAP;
+    while (target_capacity < rows) {
+        DELTA_CHECK(target_capacity <= UINT32_MAX / 2u,
+            "measure capacity bound");
+        target_capacity *= 2u;
+    }
+    int stage_rc = col_rel_reserve_capacity_admitted(delta, target_capacity,
+            NULL);
+    DELTA_CHECK(stage_rc == 0, "measure grid stage");
     grid_peak = wl_columnar_memory_reserved(budget);
     DELTA_CHECK(constructor_peak > baseline && grid_peak >= constructor_peak
         && peak > grid_peak, "strict timestamp stage");
@@ -15722,6 +15738,7 @@ main(void)
     test_worker_delta_preflight(1, 1);
     test_worker_delta_preflight(1, 17);
     test_worker_delta_preflight(0, 17);
+    test_worker_delta_preflight(1, 0);
 #ifdef WL_TEST_ALLOC_WRAP
     test_recursive_delta_publication_failure(true);
 #endif
