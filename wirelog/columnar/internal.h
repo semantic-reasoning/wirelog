@@ -582,6 +582,7 @@ typedef struct {
 struct wl_columnar_relation_mutation_set;
 typedef struct {
     uintptr_t identity;
+    uint64_t acquisition_nonce;
     struct wl_columnar_relation_mutation_set *set;
     col_rel_t *relation;
     col_rel_t *owner;
@@ -600,6 +601,7 @@ typedef struct {
 struct wl_columnar_relation_terminal_sequence;
 typedef struct wl_columnar_relation_mutation_set {
     uintptr_t identity;
+    uint64_t acquisition_nonce;
     const wl_columnar_relation_mutation_role_t *roles;
     wl_columnar_relation_mutation_descriptor_t *descriptors;
     wl_columnar_relation_mutation_owner_t *owners;
@@ -681,6 +683,7 @@ void wl_columnar_relation_terminal_sequence_publish_timestamp_retirement(
 int wl_columnar_relation_terminal_sequence_finish(
     wl_columnar_relation_terminal_sequence_t *sequence);
 #ifdef WL_TEST_MUTATION_SET_HOOK
+void wl_columnar_relation_test_set_mutation_nonce(uint64_t next_nonce);
 bool wl_columnar_relation_test_terminal_sequence_validate(
     const wl_columnar_relation_terminal_sequence_t *sequence);
 #endif
@@ -3210,6 +3213,35 @@ typedef struct {
     bool admission_active;
 } wl_columnar_radix_workspace_t;
 
+/* Owning prepared token for one whole multi-segment radix sequence. Initialize
+ * to zero, prepare once, execute once, then destroy even after failures. */
+typedef struct wl_columnar_relation_radix_sequence {
+    uintptr_t identity;
+    uint64_t acquisition_nonce;
+    wl_columnar_relation_mutation_set_t *set;
+    wl_columnar_relation_mutation_lease_t *lease;
+    col_rel_t *relation;
+    col_rel_t *owner;
+    uint64_t relation_identity;
+    uint64_t relation_generation;
+    uint64_t owner_identity;
+    uint64_t owner_generation;
+    uint64_t view_generation;
+    uint64_t type_fingerprint;
+    const int64_t *const *columns;
+    const uint32_t *column_types;
+    const col_delta_timestamp_t *timestamps;
+    uint32_t nrows, ncols, capacity, timestamp_capacity;
+    uint32_t *boundaries;
+    uint8_t *needs_sort;
+    uint32_t seg_count, needs_sort_count;
+    wl_columnar_memory_reservation_t metadata_admission;
+    bool metadata_admission_active;
+    wl_columnar_radix_workspace_t workspace;
+    bool prepared;
+    bool consumed;
+} wl_columnar_relation_radix_sequence_t;
+
 /* Prepare a zero-initialized or fully destroyed workspace. Live workspaces
  * are refused unchanged; destroy releases their buffers and admission once.
  * Partial, empty and sorted ranges are supported. All boundaries are checked
@@ -3271,6 +3303,15 @@ wl_columnar_relation_radix_sort_consolidation_with_lease(col_rel_t *rel,
     uint32_t start_row, uint32_t nrows,
     const wl_columnar_radix_workspace_t *workspace,
     wl_columnar_relation_mutation_lease_t *lease);
+WL_MUST_CHECK int wl_columnar_relation_radix_sequence_prepare_with_lease(
+    col_rel_t *rel, const uint32_t *seg_boundaries, uint32_t seg_count,
+    wl_columnar_relation_radix_sequence_t *sequence,
+    wl_columnar_relation_mutation_lease_t *lease);
+WL_MUST_CHECK int wl_columnar_relation_radix_sequence_execute_with_lease(
+    wl_columnar_relation_radix_sequence_t *sequence,
+    wl_columnar_relation_mutation_lease_t *lease);
+void wl_columnar_relation_radix_sequence_destroy(
+    wl_columnar_relation_radix_sequence_t *sequence);
 
 /** Stable LSD radix sort of a row-major int64_t buffer by a single key
  *  column.  Used by arrangement.c (sarr_build) and lftj.c

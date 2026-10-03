@@ -572,6 +572,18 @@ main(void)
     rollback_tests();
     invalid_tests();
     metadata_final_access_test();
+    {
+        col_rel_t root;
+        fixture_t f = {0};
+        root_init(&root, 3);
+        wl_columnar_relation_mutation_role_t role = { &root,
+                                                      WL_COLUMNAR_RELATION_PAYLOAD_MUTATION };
+        wl_columnar_relation_test_set_mutation_nonce(UINT64_MAX);
+        assert(acquire(&f, &role, 1) == EOVERFLOW);
+        assert(f.set.identity == 0 && f.set.acquisition_nonce == 0
+            && atomic_load_explicit(&root.descriptor_access.state,
+            memory_order_relaxed) == 0);
+    }
     puts("relation mutation set tests passed");
     return 0;
 }
