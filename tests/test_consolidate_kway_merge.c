@@ -1329,6 +1329,34 @@ test_consolidate_governor_create(uint64_t usable_bytes)
     return wl_columnar_memory_governor_ref_create(&resolution);
 }
 
+typedef struct {
+    wl_columnar_relation_mutation_set_t set;
+    wl_columnar_relation_mutation_role_t role;
+    wl_columnar_relation_mutation_descriptor_t descriptor;
+    wl_columnar_relation_mutation_owner_t owners[2];
+    wl_columnar_relation_mutation_lease_t lease;
+    wl_columnar_relation_mutation_initialization_t initialization;
+} consolidate_test_mutation_t;
+
+static int
+consolidate_test_mutation_acquire(col_rel_t *rel,
+    consolidate_test_mutation_t *held)
+{
+    held->role = (wl_columnar_relation_mutation_role_t){
+        rel, WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+    };
+    return col_rel_mutation_set_acquire(&held->set, &held->role, 1,
+               &held->descriptor, 1, held->owners, 2, &held->lease, 1,
+               &held->initialization, 1);
+}
+
+static int
+consolidate_test_mutation_finish(consolidate_test_mutation_t *held,
+    bool published)
+{
+    return col_rel_mutation_set_finish(&held->set, published);
+}
+
 static void
 test_consolidate_scratch_admission(void)
 {
@@ -2577,7 +2605,7 @@ test_radix_workspace_preflight(uint32_t count, bool timestamped)
     wl_columnar_memory_governor_ref_t *ref =
         test_consolidate_governor_create(UINT64_C(1) << 30);
     wl_columnar_radix_workspace_t workspace = { 0 };
-    wl_columnar_source_access_writer_t writer = { 0 };
+    consolidate_test_mutation_t held = { 0 };
     int64_t *before = malloc((size_t)count * sizeof(*before));
     col_delta_timestamp_t *before_ts = timestamped
         ? calloc(count, sizeof(*before_ts)) : NULL;
@@ -2689,11 +2717,12 @@ test_radix_workspace_preflight(uint32_t count, bool timestamped)
         (size_t)count * sizeof(*before_ts)) == 0)
         && rel->view_generation == view && rel->storage_generation == storage,
         "preparation must preserve source bytes and generations");
-    WP_CHECK(col_rel_source_writer_acquire(rel, &writer) == 0, "writer");
-    rc = wl_columnar_relation_radix_sort_with_workspace(rel, 0, count,
-            &writer, &workspace);
-    WP_CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
-        "release writer");
+    WP_CHECK(consolidate_test_mutation_acquire(rel, &held) == 0,
+        "payload lease");
+    rc = wl_columnar_relation_radix_sort_with_lease(rel, 0, count,
+            &workspace, &held.lease);
+    WP_CHECK(consolidate_test_mutation_finish(&held, rc == 0) == 0,
+        "finish payload lease");
     WP_CHECK(rc == 0 &&
         wl_columnar_memory_reserved(g) == baseline + scratch + extra,
         "prepared sort must not charge twice");
@@ -2712,8 +2741,8 @@ test_radix_workspace_preflight(uint32_t count, bool timestamped)
         "sorted and empty ranges");
 cleanup:
     clear_consolidate_allocation_failure();
-    if (writer.owner)
-        (void)wl_columnar_source_access_writer_release(&writer);
+    if (held.set.identity)
+        (void)consolidate_test_mutation_finish(&held, false);
     wl_columnar_radix_workspace_destroy(&workspace);
     col_rel_destroy(rel);
     free(before);
@@ -2739,15 +2768,19 @@ test_radix_admitted_call(col_rel_t *rel, unsigned route)
         return col_rel_radix_sort_int64(rel);
     if (route == 0)
         return col_rel_radix_sort(rel, 0, rel->nrows);
-    wl_columnar_source_access_writer_t writer = { 0 };
-    int rc = col_rel_source_writer_acquire(rel, &writer);
+    consolidate_test_mutation_t held = { 0 };
+    wl_columnar_radix_workspace_t workspace = { 0 };
+    int rc = consolidate_test_mutation_acquire(rel, &held);
     if (rc != 0)
         return rc;
-    bool pending = false;
-    rc = col_rel_radix_sort_locked(rel, 0, rel->nrows, &writer, false,
-            &pending);
-    int release_rc = wl_columnar_source_access_writer_release(&writer);
-    return rc != 0 ? rc : release_rc;
+    rc = wl_columnar_relation_radix_workspace_prepare_with_lease(rel, 0,
+            rel->nrows, &workspace, &held.lease);
+    if (rc == 0)
+        rc = wl_columnar_relation_radix_sort_with_lease(rel, 0, rel->nrows,
+                &workspace, &held.lease);
+    wl_columnar_radix_workspace_destroy(&workspace);
+    int finish_rc = consolidate_test_mutation_finish(&held, rc == 0);
+    return rc ? rc : finish_rc;
 }
 
 static void
@@ -2926,13 +2959,13 @@ cleanup:
 static void
 test_radix_workspace_width(uint32_t count, bool floating)
 {
-    TEST("insertion workspace checks byte capacity before COW");
+    TEST("radix workspace snapshot checks precede COW");
     col_rel_t *narrow = col_rel_new_auto("narrow", 1);
     col_rel_t *wide = col_rel_new_auto("wide", 2), *view = NULL;
     wl_columnar_memory_governor_ref_t *ref =
         test_consolidate_governor_create(UINT64_C(1) << 30);
     wl_columnar_radix_workspace_t workspace = { 0 };
-    wl_columnar_source_access_writer_t writer = { 0 };
+    consolidate_test_mutation_t held = { 0 };
     const char *failure = NULL;
 #define WW_CHECK(c, m) do { if (!(c)) { failure = m; goto cleanup; } } while (0)
     WW_CHECK(narrow && wide && ref, "fixture");
@@ -2965,17 +2998,19 @@ test_radix_workspace_width(uint32_t count, bool floating)
     uint64_t generation = view->view_generation,
         storage = view->storage_generation;
     int64_t *old_column = view->columns[0];
-    WW_CHECK(col_rel_source_writer_acquire(view, &writer) == 0, "view writer");
+    WW_CHECK(consolidate_test_mutation_acquire(view, &held) == 0,
+        "view mutation lease");
     /* If COW is tried first, this limit yields ENOMEM, not required EINVAL. */
     atomic_store_explicit(&g->usable_bytes, admitted, memory_order_seq_cst);
-    WW_CHECK(wl_columnar_relation_radix_sort_with_workspace(view, 0, count,
-        &writer, &workspace) == EINVAL && view->col_shared
+    WW_CHECK(wl_columnar_relation_radix_sort_with_lease(view, 0, count,
+        &workspace, &held.lease) == EINVAL
+        && consolidate_test_mutation_finish(&held, false) == 0
+        && view->col_shared
         && view->columns[0] == old_column && view->view_generation == generation
         && view->storage_generation == storage
         && col_rel_storage_alias_borrow_count(wide) == 1
         && wl_columnar_memory_reserved(g) == admitted,
-        "width refusal before COW");
-    WW_CHECK(wl_columnar_source_access_writer_release(&writer) == 0, "release");
+        "foreign-width workspace refusal before COW");
     for (uint32_t i = 0; i < count; i++) {
         int64_t a = count - i, b = (count - i) * 10;
         if (floating) {
@@ -2985,11 +3020,11 @@ test_radix_workspace_width(uint32_t count, bool floating)
         WW_CHECK(view->columns[0][i] == a && view->columns[1][i] == b,
             "wide bytes preserved");
     }
-    WW_CHECK(col_rel_source_writer_acquire(narrow, &writer) == 0,
-        "narrow writer");
-    WW_CHECK(wl_columnar_relation_radix_sort_with_workspace(narrow, 0, count,
-        &writer, &workspace) == 0, "original workspace still usable");
-    WW_CHECK(wl_columnar_source_access_writer_release(&writer) == 0, "release");
+    WW_CHECK(consolidate_test_mutation_acquire(narrow, &held) == 0
+        && wl_columnar_relation_radix_sort_with_lease(narrow, 0, count,
+        &workspace, &held.lease) == 0
+        && consolidate_test_mutation_finish(&held, true) == 0,
+        "exact narrow workspace remains usable");
     wl_columnar_radix_workspace_destroy(&workspace);
     WW_CHECK(workspace.insertion_bytes == 0
         && wl_columnar_memory_reserved(g) == baseline,
@@ -3000,16 +3035,17 @@ test_radix_workspace_width(uint32_t count, bool floating)
         &workspace) == 0, "wide reprepare");
     admitted = wl_columnar_memory_reserved(g);
     atomic_store_explicit(&g->usable_bytes, admitted, memory_order_seq_cst);
-    WW_CHECK(col_rel_source_writer_acquire(narrow, &writer) == 0,
-        "narrow writer");
-    WW_CHECK(wl_columnar_relation_radix_sort_with_workspace(narrow, 0, count,
-        &writer, &workspace) == 0 && wl_columnar_memory_reserved(g) == admitted,
-        "wider capacity may serve narrower input without another charge");
-    WW_CHECK(wl_columnar_source_access_writer_release(&writer) == 0, "release");
-    for (uint32_t i = 0; i < count; i++)
-        WW_CHECK(narrow->columns[0][i] == (floating
-            ? wl_columnar_float_to_bits((double)i + 1) : (int64_t)i + 1),
-            "narrow sorted output");
+    WW_CHECK(consolidate_test_mutation_acquire(narrow, &held) == 0,
+        "narrow lease for foreign workspace");
+    WW_CHECK(wl_columnar_relation_radix_sort_with_lease(narrow, 0, count,
+        &workspace, &held.lease) == EINVAL
+        && consolidate_test_mutation_finish(&held, false) == 0
+        && wl_columnar_memory_reserved(g) == admitted,
+        "workspace provenance rejects a different relation");
+    wl_columnar_radix_workspace_destroy(&workspace);
+    WW_CHECK(wl_columnar_radix_workspace_prepare(view, bounds, 1, 0,
+        &workspace) == 0, "shared view exact workspace");
+    admitted = wl_columnar_memory_reserved(g);
 
     /* The supplied workspace is admitted; force the later COW reservation
      * to overflow with a real padding token, and preserve its typed cause. */
@@ -3018,10 +3054,12 @@ test_radix_workspace_width(uint32_t count, bool floating)
     atomic_store_explicit(&g->usable_bytes, UINT64_MAX, memory_order_seq_cst);
     WW_CHECK(wl_columnar_memory_reserve_checked(g, UINT64_MAX - admitted,
         &padding) == WL_COLUMNAR_MEMORY_ADMISSION_OK, "COW overflow padding");
-    int rc = col_rel_source_writer_acquire(view, &writer);
-    if (rc == 0)
-        rc = wl_columnar_relation_radix_sort_with_workspace(view, 0, count,
-                &writer, &workspace);
+    WW_CHECK(consolidate_test_mutation_acquire(view, &held) == 0,
+        "shared view lease");
+    int rc = wl_columnar_relation_radix_sort_with_lease(view, 0, count,
+            &workspace, &held.lease);
+    WW_CHECK(consolidate_test_mutation_finish(&held, false) == 0,
+        "failed shared sort lease release");
     bool released = wl_columnar_memory_release(&padding);
     atomic_store_explicit(&g->usable_bytes, UINT64_C(1) << 30,
         memory_order_seq_cst);
@@ -3030,10 +3068,12 @@ test_radix_workspace_width(uint32_t count, bool floating)
         && view->view_generation == generation &&
         view->storage_generation == storage,
         "COW overflow must keep local cause and ownership");
-    WW_CHECK(wl_columnar_relation_radix_sort_with_workspace(view, 0, count,
-        &writer, &workspace) == 0 && !view->col_shared
+    WW_CHECK(consolidate_test_mutation_acquire(view, &held) == 0
+        && wl_columnar_relation_radix_sort_with_lease(view, 0, count,
+        &workspace, &held.lease) == 0
+        && consolidate_test_mutation_finish(&held, true) == 0
+        && !view->col_shared
         && col_rel_storage_alias_borrow_count(wide) == 0, "COW exact retry");
-    WW_CHECK(wl_columnar_source_access_writer_release(&writer) == 0, "release");
     for (uint32_t i = 0; i < count; i++) {
         int64_t a = i + 1, b = (i + 1) * 10;
         if (floating) {
@@ -3044,8 +3084,8 @@ test_radix_workspace_width(uint32_t count, bool floating)
             "COW sorted result");
     }
 cleanup:
-    if (writer.owner)
-        (void)wl_columnar_source_access_writer_release(&writer);
+    if (held.set.identity)
+        (void)consolidate_test_mutation_finish(&held, false);
     wl_columnar_radix_workspace_destroy(&workspace);
     col_rel_destroy(view);
     col_rel_destroy(narrow);

@@ -2945,27 +2945,12 @@ int
 wl_col_rel_inline_project_column(col_rel_t *dst, uint32_t dst_row,
     const col_rel_t *src, uint32_t src_row, uint32_t logical_col);
 
-/* Public row append owns descriptor and canonical source writers throughout
- * publication. Input tuples may overlap column storage; the public path
- * stages the complete tuple before any replacement. Locked append also
- * stages overlap under its validated caller-owned canonical writer and
- * releases a detached alias immediately before returning. Its transitional
- * owner resolver requires a stable descriptor binding from the caller.
- * Raw writer validation covers the canonical gate, not exact target
- * descriptor authority; owner-only consolidation tokens remain supported
- * pending the two-role lease migration (#2033). Both #2033 and #2034 remain
- * open until that migration and removal of the live raw alias bridges.
- * Caller keeps other input buffers stable for the call. Locked reservation
- * retains its legacy source-writer contract. Outer attempts reset transient
- * denial evidence only after authority admission.
- * Actual budget refusal retains legacy ENOMEM plus
- * memory_budget_denial_pending; allocation ENOMEM, EOVERFLOW and EINVAL are
- * distinct. Lower nested admission helpers do not reset outer evidence. */
+/* Public append acquires exact descriptor and canonical-owner authority.
+ * The lease form is used by wider transactions that already hold a mutation
+ * set. Both stage overlapping tuples before replacement and preserve the
+ * distinction between quota denial, allocator ENOMEM, EOVERFLOW and EINVAL. */
 int
 col_rel_append_row(col_rel_t *r, const int64_t *row);
-int
-col_rel_append_row_locked(col_rel_t *r, const int64_t *row,
-    wl_columnar_source_access_writer_t *writer);
 /* Append a complete input batch under one relation writer.  All row/type
  * validation and governor admission complete before the first row publishes.
  * On ENOMEM, *@denied distinguishes governor refusal from allocator failure. */
@@ -3160,15 +3145,6 @@ int col_rel_source_reader_acquire_transferable(const col_rel_t *,
 int col_rel_source_reader_release(wl_columnar_source_access_reader_t *);
 int col_rel_source_writer_acquire(const col_rel_t *,
     wl_columnar_source_access_writer_t *);
-/* Canonical non-detach authority only: raw writers cannot detach aliases. */
-int col_rel_cow_unshare_with_source_writer(col_rel_t *,
-    const wl_columnar_source_access_writer_t *);
-
-/* Temporary compatibility used only by the three unmigrated merge
- * transactions. Remove as those complete transactions acquire mutation sets. */
-int col_rel_cow_unshare_legacy_with_source_writer(col_rel_t *,
-    const wl_columnar_source_access_writer_t *);
-
 /* Checked single-cell mutation.  The implementation lives in relation.c so
  * it holds descriptor and canonical-owner writers across COW/publication. */
 int col_rel_set(col_rel_t *, uint32_t row, uint32_t col, int64_t val);
@@ -3259,33 +3235,6 @@ wl_columnar_radix_workspace_prepare(const col_rel_t *rel,
     wl_columnar_radix_workspace_t *workspace);
 void
 wl_columnar_radix_workspace_destroy(wl_columnar_radix_workspace_t *workspace);
-/* Sort through a caller-supplied workspace.  A still-shared view is
- * accepted: it takes the same transactional copy-on-write path as
- * col_rel_radix_sort_locked, threading the caller's scratch buffers
- * through, and the alias borrow it takes is released here after
- * publication.  That unification is #1603; before it, this entry point
- * refused a shared view with EINVAL while col_rel_radix_sort_locked
- * unshared and sorted the same relation.
- *
- * A NULL relation or workspace, and a bad range, are refused at every row
- * count.  Writer, owner-linkage and contention checks also run before the
- * nrows <= 1 shortcut, so a malformed or contended call is never masked by
- * a trivial range.  Workspace capacity is not needed for a trivial range.
- *
- * EBUSY here is the same predicate and the same status
- * col_rel_radix_sort_locked reports.
- *
- * EINVAL: NULL relation or workspace; a bad range; an absent, foreign or
- *         wrong-thread writer; a stale canonical-owner linkage; or a
- *         workspace whose capacity was prepared for a smaller range than
- *         the one requested.
- * EBUSY:  rel is its own canonical owner and has live alias borrows. */
-int
-wl_columnar_relation_radix_sort_with_workspace(col_rel_t *rel,
-    uint32_t start_row,
-    uint32_t nrows, const wl_columnar_source_access_writer_t *writer,
-    const wl_columnar_radix_workspace_t *workspace);
-
 /* Lease-scoped preparation allocates the complete scratch even for sorted
  * ranges, and preflights authority, shape and epoch headroom before allocation. */
 WL_MUST_CHECK int
@@ -3336,31 +3285,6 @@ wl_columnar_relation_radix_sort_rows_by_key_typed(int64_t *data,
  *  Phase C: permutation-apply uses col_rel_row_copy_out/in. */
 int
 col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows);
-/* Sort [start_row, start_row + nrows) under a source-access writer the
-* caller already holds on r's canonical storage owner.
-*
-* defer_alias_release == false: any alias borrow the deferred COW takes is
-*   released before this returns, and *out_alias_release_pending is false.
-* defer_alias_release == true: the borrow is handed back.
-*   *out_alias_release_pending is true iff the caller must call
-*   col_rel_storage_alias_release(r) once its wider mutation transaction
-*   ends.  Consolidation uses this to keep the borrow across the whole
-*   transaction and release it from its centralized cleanup path.
-*
-* out_alias_release_pending is mandatory in both modes and is written on
-* every path, including every rejection.
-*
-* EINVAL: NULL out parameter, bad range, or an absent, foreign or
-*         wrong-thread writer -- checked at every row count.
-* EBUSY:  r is its own canonical owner and has live alias borrows.  An
-*         alias of a borrowed owner is still admissible; that is the
-*         consolidation case.
-* ENOMEM: COW or permutation allocation failed; r is left unchanged. */
-WL_MUST_CHECK int
-col_rel_radix_sort_locked(col_rel_t *r, uint32_t start_row, uint32_t nrows,
-    const wl_columnar_source_access_writer_t *writer,
-    bool defer_alias_release, bool *out_alias_release_pending);
-
 /* ======================================================================== */
 /* Cache & Materialized Join (columnar/cache.c)                             */
 /* ======================================================================== */

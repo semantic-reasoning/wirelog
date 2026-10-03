@@ -588,7 +588,12 @@ test_timestamp_sort(uint32_t count, bool prepared, bool floating, bool alias)
     timestamp_sort_oracle_t *expected = calloc(count, sizeof(*expected));
     wl_columnar_radix_workspace_t workspace = { 0 };
     wl_columnar_source_access_reader_t reader = { 0 };
-    wl_columnar_source_access_writer_t writer = { 0 };
+    wl_columnar_relation_mutation_set_t mutation_set = { 0 };
+    wl_columnar_relation_mutation_role_t mutation_role = { 0 };
+    wl_columnar_relation_mutation_descriptor_t mutation_descriptor = { 0 };
+    wl_columnar_relation_mutation_owner_t mutation_owners[2] = { 0 };
+    wl_columnar_relation_mutation_lease_t mutation_lease = { 0 };
+    wl_columnar_relation_mutation_initialization_t mutation_init = { 0 };
     wl_columnar_memory_governor_ref_t *governor = NULL;
     const char *failure = NULL;
 #define TS_CHECK(c, m) do { if (!(c)) { failure = m; goto cleanup; } } while (0)
@@ -660,11 +665,17 @@ test_timestamp_sort(uint32_t count, bool prepared, bool floating, bool alias)
             &workspace) == 0, "prepare workspace");
         TS_CHECK(workspace.timestamps && workspace.timestamp_capacity >= count,
             "timestamp scratch admitted in workspace");
-        TS_CHECK(col_rel_source_writer_acquire(r, &writer) == 0, "writer");
-        int rc = wl_columnar_relation_radix_sort_with_workspace(r, 1, count,
-                &writer, &workspace);
-        TS_CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
-            "release writer");
+        mutation_role = (wl_columnar_relation_mutation_role_t){
+            r, WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+        };
+        TS_CHECK(col_rel_mutation_set_acquire(&mutation_set, &mutation_role,
+            1, &mutation_descriptor, 1, mutation_owners, 2,
+            &mutation_lease, 1, &mutation_init, 1) == 0,
+            "mutation lease");
+        int rc = wl_columnar_relation_radix_sort_with_lease(r, 1, count,
+                &workspace, &mutation_lease);
+        TS_CHECK(col_rel_mutation_set_finish(&mutation_set, rc == 0) == 0,
+            "finish mutation lease");
         TS_CHECK(rc == 0, "prepared sort");
     } else {
         TS_CHECK(col_rel_radix_sort(r, 1, count) == 0, "sort retry");
@@ -693,8 +704,6 @@ test_timestamp_sort(uint32_t count, bool prepared, bool floating, bool alias)
                 timestamp_sort_record(i)), "COW source changed");
         }
 cleanup:
-    if (writer.owner)
-        (void)wl_columnar_source_access_writer_release(&writer);
     if (reader.owner)
         (void)col_rel_source_reader_release(&reader);
     wl_columnar_radix_workspace_destroy(&workspace);
