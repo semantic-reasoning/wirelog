@@ -9,10 +9,33 @@ from pathlib import Path
 import subprocess
 import sys
 
-SCHEMA = 'wirelog.batch-append-plan.v1'
+SCHEMA = 'wirelog.batch-append-plan.v2'
 CASES = ('1x1', '1x256', '32x256')
 PAIR_ORDERS = ('AB', 'BA')
 PAIRS_PER_ORDER = 9
+HELPER_PATHS = ('bench/bench_util.h', 'tests/test_perf_util.h')
+CASE_CONTRACT = (
+    dict(name='1x1', ncols=1, rows_per_call=1, capacity=512,
+         default_iterations_start=2000000),
+    dict(name='1x256', ncols=1, rows_per_call=256, capacity=512,
+         default_iterations_start=10000),
+    dict(name='32x256', ncols=32, rows_per_call=256, capacity=512,
+         default_iterations_start=10000),
+)
+OUTPUT_CONTRACT = dict(
+    schema='wirelog.batch-append-benchmark.v2',
+    schema_version=2,
+    records=dict(
+        header=['contract', 'reset', 'input', 'governor', 'reserved_capacity'],
+        sample=['contract', 'case', 'index', 'iterations', 'append_total_ns', 'reset_total_ns',
+                'append_ns_per_call', 'reset_ns_per_call'],
+        case=['contract', 'name', 'columns', 'rows_per_call', 'capacity', 'iterations',
+              'samples', 'warmups'],
+        summary=['contract', 'case', 'median_append_ns_per_call',
+                 'min_append_ns_per_call', 'max_append_ns_per_call',
+                 'cov_append_percent', 'mean_reset_ns_per_call']),
+    success_fields=['denied=0', 'row_count_check=OK', 'capacity_check=OK',
+                    'value_check=OK', 'distinct_input_probe=OK', 'status=OK'])
 OVERLAY_PATHS = (
     'bench/bench_batch_append.c',
     'bench/meson.build',
@@ -31,6 +54,14 @@ def git(source, *args):
     if result.returncode:
         raise PlanError(f'git {args[0]} failed in {source}: {result.stderr.strip()}')
     return result.stdout.strip()
+
+
+def git_bytes(source, *args):
+    result = subprocess.run(['git', '-C', str(source), *args],
+                            capture_output=True, check=False)
+    if result.returncode:
+        raise PlanError(f'git {args[0]} failed in {source}: {result.stderr.decode(errors="replace").strip()}')
+    return result.stdout
 
 
 def safe_path(value, label):
@@ -74,6 +105,12 @@ def source_provenance(label, source_arg, wrapper_arg, upstream_tree_arg, overlay
             f'{label} parent tree, wrapper tree, and declared upstream tree must match '
             f'(parent={parent_tree}, wrapper={wrapper_tree}, upstream={expected_tree})')
 
+    helpers = {}
+    for path in HELPER_PATHS:
+        blob_oid = git(source, 'rev-parse', f'{wrapper}:{path}')
+        blob = git_bytes(source, 'show', f'{wrapper}:{path}')
+        helpers[path] = dict(git_blob_oid=blob_oid, sha256=sha256(blob))
+
     unstaged = subprocess.run(['git', '-C', str(source), 'diff', '--quiet'], check=False)
     if unstaged.returncode != 0:
         raise PlanError(f'{label} worktree has unstaged changes')
@@ -95,7 +132,7 @@ def source_provenance(label, source_arg, wrapper_arg, upstream_tree_arg, overlay
                 wrapper_parent_commit=parent, wrapper_parent_tree=parent_tree,
                 wrapper_tree=wrapper_tree, upstream_tree=expected_tree,
                 measured_tree=measured_tree,
-                overlay_sha256=sha256(overlay_bytes))
+                overlay_sha256=sha256(overlay_bytes), helper_sources=helpers)
 
 
 def schedule(seed):
@@ -106,7 +143,7 @@ def schedule(seed):
             for index in range(PAIRS_PER_ORDER):
                 pairs.append(dict(case=case, order=order, pair_index=index,
                                   pair_id=f'{case}:{order}:{index:02d}'))
-    key = b'wirelog-batch-append-plan-v1\0' + seed.encode('utf-8') + b'\0'
+    key = b'wirelog-batch-append-plan-v2\0' + seed.encode('utf-8') + b'\0'
     pairs.sort(key=lambda pair: (hashlib.sha256(key + pair['pair_id'].encode('ascii')).digest(),
                                  pair['pair_id']))
     launches = []
@@ -142,14 +179,22 @@ def build_plan(args):
         raise PlanError('A/A control requires identical upstream trees')
     if args.mode == 'comparison' and same_upstream:
         raise PlanError('comparison requires different upstream trees')
+    if base['helper_sources'] != candidate['helper_sources']:
+        raise PlanError('benchmark helper Git blobs and SHA-256 values must match on both sides')
     launches = schedule(args.seed)
     if len(launches) != 108:
         raise PlanError('internal schedule size error')
-    return dict(schema=SCHEMA, mode=args.mode, seed=args.seed,
-                seed_algorithm='SHA-256 hash-sort of pair IDs; key prefix wirelog-batch-append-plan-v1',
+    case_contract = [dict(case, iterations_status='starting point; unresolved until baseline calibration')
+                     for case in CASE_CONTRACT]
+    return dict(schema=SCHEMA, schema_version=2, mode=args.mode, seed=args.seed,
+                seed_algorithm='SHA-256 hash-sort of pair IDs; key prefix wirelog-batch-append-plan-v2',
                 created_utc=datetime.now(timezone.utc).isoformat(),
                 upstream=dict(base=base, candidate=candidate),
                 overlay=dict(sha256=sha256(overlay), paths=list(OVERLAY_PATHS)),
+                unchanged_helpers=base['helper_sources'],
+                benchmark_case_contract=dict(cases=case_contract,
+                    iteration_counts='starting points only; unresolved until later baseline calibration'),
+                benchmark_output_contract=OUTPUT_CONTRACT,
                 schedule=dict(case_order=list(CASES), pairs_per_case=18,
                               pairs_per_order=PAIRS_PER_ORDER, launch_count=len(launches),
                               pairing='adjacent calls; each pair has one baseline and one candidate launch',
@@ -157,8 +202,7 @@ def build_plan(args):
                               launches=launches),
                 scope=dict(benchmark_launches_performed=0,
                            build_profile_validation='deferred',
-                           host_qualification='deferred',
-                           performance_verdict='not produced'))
+                           host_qualification='deferred'))
 
 
 def write_fresh(output_arg, plan):
