@@ -56,11 +56,29 @@ REVIEWED_PR1961_BASELINE = {
     "budget_bytes": 5120, "measurement_status": "over-budget",
 }
 
+REVIEWED_PR2037_BASELINE = {
+    "schema_version": 1, "status": "trusted-reviewed-pr-size-job",
+    "authorization_id": "pr-2037-reviewed-head-2a41e98f",
+    "repository": "semantic-reasoning/wirelog", "pr_number": 2037,
+    "baseline_bytes": 428046,
+    "source_sha": "2a41e98f818082f72b3782af1e187a91b185164f",
+    "base_sha": "a8b5b5dd144054558cd5a93cbfe03c301d243164",
+    "tested_merge_sha": "8afc19a14f978589aac1f953b7cd6ad0e952b068",
+    "run_id": 37110844170, "job_id": 111168520922,
+    "profile_sha256": "cd6cc2f2c54520ba56c8efc0241b17d722d00c8b569cb6c6bb38f5e10d5e1508",
+    "job_log_sha256": "406f85e46bf713be7f807c1fafddb7fdb90786ba15653b2758c376442d1a3d2c",
+    "base_repository_baseline_bytes": 419135,
+    "source_baseline_bytes": 419135, "measured_base_bytes": 421283,
+    "reported_baseline_bytes": 419135,
+    "budget_bytes": 5120, "measurement_status": "over-budget",
+}
+
 
 def reviewed_pr_baselines():
     # A function keeps the legacy #1959 fixture patchable without weakening
     # exact-record equality for production authorization.
-    return (REVIEWED_PR_BASELINE, REVIEWED_PR1961_BASELINE)
+    return (REVIEWED_PR_BASELINE, REVIEWED_PR1961_BASELINE,
+            REVIEWED_PR2037_BASELINE)
 
 def reviewed_pr_measurement(p):
     if p == REVIEWED_PR_BASELINE:
@@ -172,6 +190,16 @@ def reviewed_pr_repair_paths(p):
         return {
             "docs/BINARY_SIZE.md", "scripts/ci/verify-size-baseline.py",
             "scripts/ci/test-size-baseline-provenance.py",
+            "tests/baseline_size.txt", "tests/baseline_size.provenance.json",
+        }
+    if p == REVIEWED_PR2037_BASELINE:
+        return {
+            "docs/BINARY_SIZE.md", "scripts/ci/verify-size-baseline.py",
+            "scripts/ci/test-size-baseline-provenance.py",
+            "scripts/ci/text-size-policy.py", "scripts/ci/run-size-comparison.sh",
+            "scripts/ci/check-text-size.sh", "scripts/ci/test-text-size-policy.sh",
+            "scripts/ci/test-size-comparison.py", "scripts/ci/test-early-size-gate.sh",
+            "tests/size_policy_mode.txt",
             "tests/baseline_size.txt", "tests/baseline_size.provenance.json",
         }
     fail("reviewed PR baseline record is not recognized")
