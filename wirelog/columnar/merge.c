@@ -2005,6 +2005,32 @@ col_op_consolidate_storage_steps(const col_rel_t *rel, uint32_t old_nrows,
            + (old_nrows > 0 && delta_count > old_nrows / 16 ? 1u : 0u);
 }
 
+/* Reserve the view-generation advances an incremental consolidation may
+ * make before it mutates anything (Issue #2049), on the same g < INVALID -
+ * steps bound as col_op_consolidate_storage_steps.  The delta sort makes one
+ * advance when it sorts two or more delta rows of a relation with columns.
+ * After it, each path publishes nrows once, except where it compacts runs:
+ * the fast path's compaction makes two advances, and the binary path's (at
+ * COL_MAX_RUNS, with novel rows) and the fallback's (over more than one
+ * run) make three.  Whether a path may compact depends on the repaired run
+ * count, which the sort does not change, so it is known here; the path is
+ * not.  At COL_MAX_RUNS three advances are therefore reserved, even for a
+ * delta the sort will route to the fast path.  Below it, only the fallback
+ * compacts, and only a delta too large to guarantee the binary path can
+ * reach it. */
+static uint32_t
+col_op_consolidate_view_steps(const col_rel_t *rel, uint32_t old_nrows,
+    uint32_t delta_count)
+{
+    uint32_t runs = rel->run_count;
+    if (runs == 0 || rel->run_ends[runs - 1] != old_nrows)
+        runs = old_nrows > 0 ? 1u : 0u;
+    bool compacting = runs >= COL_MAX_RUNS
+        || (runs > 1 && delta_count > old_nrows / 16);
+    return (rel->ncols > 0 && delta_count > 1 ? 1u : 0u)
+           + (compacting ? 3u : 1u);
+}
+
 /*
  * col_op_consolidate_incremental_delta - Incremental consolidation with delta output
  *
@@ -2094,9 +2120,13 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
 
     uint32_t storage_steps = col_op_consolidate_storage_steps(rel,
             old_nrows, delta_count);
-    if (storage_steps > 0
+    uint32_t view_steps = col_op_consolidate_view_steps(rel, old_nrows,
+            delta_count);
+    if ((storage_steps > 0
         && rel->storage_generation
         >= WL_COLUMNAR_REL_GENERATION_INVALID - (uint64_t)storage_steps)
+        || rel->view_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - (uint64_t)view_steps)
         return col_op_consolidate_incremental_delta_fail(delta_out,
                    delta_initial_nrows, EOVERFLOW);
 

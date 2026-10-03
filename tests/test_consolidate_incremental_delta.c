@@ -2688,6 +2688,222 @@ test_shared_view_storage_exhaustion(void)
     PASS();
 }
 
+/* ================================================================
+ * Issue #2049: every view-generation advance an incremental consolidation
+ * may make is reserved before the delta sort, as #2046 does for storage.
+ * Exhaustion is refused with EOVERFLOW and nothing mutated, rather than
+ * saturating view_generation to WL_COLUMNAR_REL_GENERATION_INVALID after
+ * rows and runs were published.
+ *
+ * Each case names the reserved bound (the sort's advance plus the most any
+ * path still reachable before the sort can make) and the advances the
+ * path actually taken makes.  The relation is refused with `bound`
+ * advances left, then succeeds with one more and ends exactly `steps`
+ * above its pinned generation.
+ * ================================================================ */
+#define VH_MAX_ROWS 48u
+
+typedef enum vh_base {
+    VH_ONE_RUN,    /* 0, 10, ..., 310: one run of 32 rows */
+    VH_TWO_RUNS,   /* VH_ONE_RUN plus the binary-path run {15} */
+    VH_EIGHT_RUNS, /* build_eight_runs: COL_MAX_RUNS runs of 39 rows */
+} vh_base_t;
+
+typedef struct vh_case {
+    const char *name;
+    vh_base_t base;
+    const int64_t *delta;
+    uint32_t ndelta;
+    int fast_path;
+    uint32_t bound;
+    uint32_t steps;
+} vh_case_t;
+
+typedef struct vh_snapshot {
+    uint32_t nrows;
+    uint32_t sorted_nrows;
+    uint32_t run_count;
+    uint32_t run_ends[COL_MAX_RUNS];
+    int64_t values[VH_MAX_ROWS];
+    uint64_t view_generation;
+    uint64_t storage_generation;
+} vh_snapshot_t;
+
+static bool
+vh_build_base(col_rel_t *rel, vh_base_t base)
+{
+    int fast_path = -1;
+    if (base == VH_EIGHT_RUNS)
+        return build_eight_runs(rel);
+    for (uint32_t i = 0; i < 32u; i++) {
+        int64_t value = (int64_t)i * 10;
+        if (test_rel_append_row(rel, &value) != 0)
+            return false;
+    }
+    if (col_op_consolidate_incremental_delta(rel, 0, NULL, &fast_path) != 0
+        || rel->run_count != 1)
+        return false;
+    if (base == VH_ONE_RUN)
+        return true;
+    int64_t novel = 15;
+    return test_rel_append_row(rel, &novel) == 0
+           && col_op_consolidate_incremental_delta(rel, 32u, NULL,
+               &fast_path) == 0
+           && fast_path == 0 && rel->run_count == 2;
+}
+
+static void
+vh_snapshot_take(const col_rel_t *rel, vh_snapshot_t *s)
+{
+    memset(s, 0, sizeof(*s));
+    s->nrows = rel->nrows;
+    s->sorted_nrows = rel->sorted_nrows;
+    s->run_count = rel->run_count;
+    memcpy(s->run_ends, rel->run_ends, sizeof(s->run_ends));
+    for (uint32_t i = 0; i < rel->nrows && i < VH_MAX_ROWS; i++)
+        s->values[i] = rel->columns[0][i];
+    s->view_generation = rel->view_generation;
+    s->storage_generation = rel->storage_generation;
+}
+
+static int
+vh_value_cmp(const void *a, const void *b)
+{
+    int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+    return (x > y) - (x < y);
+}
+
+/* Sort and deduplicate values[0..n) in place; returns the unique count. */
+static uint32_t
+vh_sorted_unique(int64_t *values, uint32_t n)
+{
+    uint32_t out = 0;
+    qsort(values, n, sizeof(*values), vh_value_cmp);
+    for (uint32_t i = 0; i < n; i++) {
+        if (out == 0 || values[out - 1] != values[i])
+            values[out++] = values[i];
+    }
+    return out;
+}
+
+static bool
+vh_case_run(const vh_case_t *c, const char **why)
+{
+    col_rel_t *rel = test_rel_alloc(1);
+    col_rel_t *delta_out = test_rel_alloc(1);
+    vh_snapshot_t before, after;
+    int64_t expected[VH_MAX_ROWS], actual[VH_MAX_ROWS];
+    uint32_t nbase = 0, nexpected, nnovel = 0;
+    int fast_path = -1;
+    bool ok = false;
+
+    *why = "view headroom fixture";
+    if (!rel || !delta_out || !vh_build_base(rel, c->base))
+        goto done;
+    uint32_t old_nrows = rel->nrows;
+    nbase = old_nrows;
+    memcpy(expected, rel->columns[0], (size_t)nbase * sizeof(int64_t));
+    for (uint32_t i = 0; i < c->ndelta; i++) {
+        bool published = false;
+        for (uint32_t j = 0; j < nbase; j++)
+            published = published || expected[j] == c->delta[i];
+        for (uint32_t j = 0; j < i; j++)
+            published = published || c->delta[j] == c->delta[i];
+        nnovel += published ? 0u : 1u;
+        expected[nbase + i] = c->delta[i];
+        if (test_rel_append_row(rel, &c->delta[i]) != 0)
+            goto done;
+    }
+    nexpected = vh_sorted_unique(expected, nbase + c->ndelta);
+
+    rel->view_generation = WL_COLUMNAR_REL_GENERATION_INVALID - c->bound;
+    vh_snapshot_take(rel, &before);
+    *why = "view exhaustion must be refused with EOVERFLOW";
+    if (col_op_consolidate_incremental_delta(rel, old_nrows, delta_out,
+        &fast_path) != EOVERFLOW || fast_path != -1)
+        goto done;
+    vh_snapshot_take(rel, &after);
+    *why = "refused call must leave rows, runs, generations and delta_out";
+    if (memcmp(&before, &after, sizeof(before)) != 0 || delta_out->nrows != 0)
+        goto done;
+
+    uint64_t pinned = WL_COLUMNAR_REL_GENERATION_INVALID - 1u - c->bound;
+    rel->view_generation = pinned;
+    *why = "retry with the reserved headroom must succeed";
+    if (col_op_consolidate_incremental_delta(rel, old_nrows, delta_out,
+        &fast_path) != 0 || fast_path != c->fast_path)
+        goto done;
+    *why = "retry must advance the view by exactly the path's steps";
+    if (rel->view_generation != pinned + c->steps
+        || !wl_columnar_relation_generation_valid(rel->view_generation))
+        goto done;
+    *why = "retry must publish the merged rows and emit the novel ones";
+    if (rel->nrows != nexpected || rel->sorted_nrows != nexpected
+        || delta_out->nrows != nnovel || rel->run_count == 0
+        || rel->run_ends[rel->run_count - 1] != nexpected)
+        goto done;
+    memcpy(actual, rel->columns[0], (size_t)nexpected * sizeof(int64_t));
+    if (vh_sorted_unique(actual, nexpected) != nexpected
+        || memcmp(actual, expected, (size_t)nexpected * sizeof(int64_t))
+        != 0)
+        goto done;
+    ok = true;
+
+done:
+    test_rel_free(delta_out);
+    test_rel_free(rel);
+    return ok;
+}
+
+static void
+test_view_generation_headroom_reserved(void)
+{
+    TEST("view-generation advances are reserved before the sort (#2049)");
+
+    static const int64_t trailing[] = { 400 };
+    static const int64_t trailing_pair[] = { 500, 400 };
+    static const int64_t eight_trailing[] = { 1000 };
+    static const int64_t duplicate[] = { 10 };
+    static const int64_t novel[] = { 15 };
+    static const int64_t eight_novel[] = { 85 };
+    static const int64_t eight_novel_dup[] = { 85, 20 };
+    static const int64_t interleaved[] = { 25, 5, 15 };
+    static const int64_t two_run_interleaved[] = { 25, 5, 35 };
+    static const int64_t two_run_trailing[] = { 400, 500, 600 };
+    /* The reservation assumes compaction whenever the run count allows it
+     * (COL_MAX_RUNS runs, or more than one run with a delta too large to
+     * guarantee the binary path), since the path is chosen only after the
+     * sort.  A path that then does not compact, or the fast path's
+     * two-advance compaction, takes fewer advances than reserved, as the
+     * last three cases show. */
+    static const vh_case_t cases[] = {
+        { "fast append", VH_ONE_RUN, trailing, 1, 1, 1, 1 },
+        { "fast append after sort", VH_ONE_RUN, trailing_pair, 2, 1, 2, 2 },
+        { "binary duplicate", VH_ONE_RUN, duplicate, 1, 0, 1, 1 },
+        { "binary novel", VH_ONE_RUN, novel, 1, 0, 1, 1 },
+        { "binary compaction", VH_EIGHT_RUNS, eight_novel, 1, 0, 3, 3 },
+        { "binary compaction after sort", VH_EIGHT_RUNS, eight_novel_dup, 2,
+          0, 4, 4 },
+        { "fallback", VH_ONE_RUN, interleaved, 3, 0, 2, 2 },
+        { "fallback compaction", VH_TWO_RUNS, two_run_interleaved, 3, 0, 4,
+          4 },
+        { "fast compaction", VH_EIGHT_RUNS, eight_trailing, 1, 1, 3, 2 },
+        { "binary duplicate at COL_MAX_RUNS", VH_EIGHT_RUNS, duplicate, 1, 0,
+          3, 1 },
+        { "fast append over two runs", VH_TWO_RUNS, two_run_trailing, 3, 1, 4,
+          2 },
+    };
+
+    for (uint32_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *why = NULL;
+        if (!vh_case_run(&cases[i], &why)) {
+            fprintf(stderr, "  case '%s': %s\n", cases[i].name, why);
+            ASSERT(false, why);
+        }
+    }
+    PASS();
+}
+
 /* ----------------------------------------------------------------
  * main
  * ---------------------------------------------------------------- */
@@ -2733,6 +2949,9 @@ main(void)
     test_binary_retirement_uses_last_generation();
     test_fallback_exhaustion_without_timestamps();
     test_shared_view_storage_exhaustion();
+
+    /* View-generation headroom (Issue #2049) */
+    test_view_generation_headroom_reserved();
 #ifdef WL_TEST_CONSOLIDATE_HOOK
     test_sort_hook_scope_follows_the_deferred_alias();
     test_shared_source_reader_excluded_through_sort();
