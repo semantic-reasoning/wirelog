@@ -164,6 +164,234 @@ duplicate_role_publication_tests(void)
 }
 
 static void
+terminal_sequence_tests(void)
+{
+    col_rel_t relation;
+    root_init(&relation, 20);
+    int64_t old_value = 1, new_value = 2;
+    int64_t *old_columns[] = { &old_value };
+    int64_t *new_columns[] = { &new_value };
+    relation.columns = old_columns;
+    relation.capacity = 3;
+    relation.merge_columns = new_columns;
+    relation.merge_buf_cap = 4;
+    relation.timestamps = malloc(sizeof(*relation.timestamps) * 3);
+    assert(relation.timestamps != NULL);
+    relation.timestamp_capacity = 3;
+
+    fixture_t f = {0};
+    wl_columnar_relation_mutation_role_t roles[] = {
+        {&relation, WL_COLUMNAR_RELATION_PAYLOAD_MUTATION},
+        {&relation, WL_COLUMNAR_RELATION_PAYLOAD_MUTATION}
+    };
+    assert(acquire(&f, roles, 2) == 0);
+    wl_columnar_relation_terminal_sequence_t sequence = {0};
+    assert(wl_columnar_relation_terminal_sequence_begin(&sequence,
+        &f.leases[0], 0) == EINVAL);
+    uint64_t original_generation = relation.storage_generation;
+    f.leases[1].storage_transitioned = true;
+    assert(wl_columnar_relation_terminal_sequence_begin(&sequence,
+        &f.leases[0], WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP
+        | WL_COLUMNAR_RELATION_TERMINAL_TIMESTAMP_RETIRE) == EINVAL);
+    assert(f.set.terminal_sequence == NULL
+        && f.set.terminal_expected_events == 0
+        && f.set.terminal_observed_events == 0);
+    f.leases[1].storage_transitioned = false;
+    relation.storage_generation++;
+    relation.storage_owner_generation++;
+    assert(wl_columnar_relation_test_mutation_lease_advance_storage(
+            &f.leases[0], original_generation) == 0);
+    original_generation = relation.storage_generation;
+    assert(f.leases[0].storage_transitioned
+        && f.leases[1].storage_transitioned
+        && f.leases[0].relation_generation == original_generation
+        && f.leases[1].relation_generation == original_generation);
+    assert(wl_columnar_relation_terminal_sequence_begin(&sequence,
+        &f.leases[0], WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP
+        | WL_COLUMNAR_RELATION_TERMINAL_TIMESTAMP_RETIRE) == 0);
+    assert(wl_columnar_relation_test_terminal_sequence_validate(&sequence));
+    uint32_t saved_expected = sequence.expected_events;
+    sequence.expected_events = WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP;
+    assert(!wl_columnar_relation_test_terminal_sequence_validate(&sequence));
+    sequence.expected_events = saved_expected;
+    uint32_t saved_role = roles[1].role_flags;
+    col_rel_t unrelated;
+    roles[1].relation = &unrelated;
+    roles[1].role_flags = WL_COLUMNAR_RELATION_METADATA_DETACH;
+    assert(!wl_columnar_relation_test_terminal_sequence_validate(&sequence));
+    roles[1].relation = &relation;
+    roles[1].role_flags = saved_role;
+    saved_role = f.leases[1].role_flags;
+    f.leases[1].role_flags = WL_COLUMNAR_RELATION_METADATA_DETACH;
+    assert(!wl_columnar_relation_test_terminal_sequence_validate(&sequence));
+    f.leases[1].role_flags = saved_role;
+    bool saved_detached = f.leases[1].detached;
+    f.leases[1].detached = !saved_detached;
+    assert(!wl_columnar_relation_test_terminal_sequence_validate(&sequence));
+    f.leases[1].detached = saved_detached;
+    bool saved_transitioned = f.leases[1].storage_transitioned;
+    f.leases[1].storage_transitioned = !saved_transitioned;
+    assert(!wl_columnar_relation_test_terminal_sequence_validate(&sequence));
+    f.leases[1].storage_transitioned = saved_transitioned;
+    assert(wl_columnar_relation_test_terminal_sequence_validate(&sequence));
+
+    int64_t **columns = relation.columns;
+    uint32_t capacity = relation.capacity;
+    relation.columns = relation.merge_columns;
+    relation.capacity = relation.merge_buf_cap;
+    relation.merge_columns = columns;
+    relation.merge_buf_cap = capacity;
+    wl_columnar_relation_terminal_sequence_publish_grid_swap(&sequence);
+    columns = relation.columns;
+    capacity = relation.capacity;
+    relation.columns = relation.merge_columns;
+    relation.capacity = relation.merge_buf_cap;
+    relation.merge_columns = columns;
+    relation.merge_buf_cap = capacity;
+    assert(!wl_columnar_relation_test_terminal_sequence_validate(&sequence));
+    columns = relation.columns;
+    capacity = relation.capacity;
+    relation.columns = relation.merge_columns;
+    relation.capacity = relation.merge_buf_cap;
+    relation.merge_columns = columns;
+    relation.merge_buf_cap = capacity;
+    assert(wl_columnar_relation_test_terminal_sequence_validate(&sequence));
+    free(relation.timestamps);
+    relation.timestamps = NULL;
+    relation.timestamp_capacity = 0;
+    wl_columnar_relation_terminal_sequence_publish_timestamp_retirement(
+        &sequence);
+    assert(wl_columnar_relation_terminal_sequence_finish(&sequence) == 0);
+    assert(relation.storage_generation == original_generation + 2
+        && relation.storage_owner_generation == original_generation + 2
+        && f.leases[0].relation_generation == original_generation + 2
+        && f.leases[1].relation_generation == original_generation + 2
+        && f.leases[0].owner_generation == original_generation + 2
+        && f.leases[1].owner_generation == original_generation + 2);
+    wl_columnar_relation_terminal_sequence_t replay = {0};
+    assert(wl_columnar_relation_terminal_sequence_begin(&replay,
+        &f.leases[0], WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP) == EINVAL);
+    assert(relation.storage_generation == original_generation + 2);
+    assert(col_rel_mutation_set_finish(&f.set, true) == 0);
+    assert_open(&relation);
+
+    col_rel_t owner, alias;
+    root_init(&owner, 21);
+    alias_init(&alias, &owner, 22);
+    alias.capacity = 1;
+    alias.timestamps = malloc(sizeof(*alias.timestamps));
+    assert(alias.timestamps != NULL);
+    alias.timestamp_capacity = 1;
+    fixture_t af = {0};
+    wl_columnar_relation_mutation_role_t alias_roles[] = {
+        {&alias, WL_COLUMNAR_RELATION_PAYLOAD_MUTATION},
+        {&alias, WL_COLUMNAR_RELATION_PAYLOAD_MUTATION}
+    };
+    assert(acquire(&af, alias_roles, 2) == 0);
+    wl_columnar_relation_terminal_sequence_t alias_sequence = {0};
+    assert(wl_columnar_relation_terminal_sequence_begin(&alias_sequence,
+        &af.leases[0],
+        WL_COLUMNAR_RELATION_TERMINAL_TIMESTAMP_RETIRE) == 0);
+    free(alias.timestamps);
+    alias.timestamps = NULL;
+    alias.timestamp_capacity = 0;
+    wl_columnar_relation_terminal_sequence_publish_timestamp_retirement(
+        &alias_sequence);
+    assert(wl_columnar_relation_terminal_sequence_finish(&alias_sequence) == 0);
+    assert(alias.storage_owner == &owner
+        && alias.storage_owner_identity == owner.relation_identity
+        && alias.storage_owner_generation == owner.storage_generation
+        && alias.storage_generation == af.leases[0].relation_generation
+        && af.leases[0].owner_generation == owner.storage_generation
+        && af.leases[1].owner_generation == owner.storage_generation);
+    assert(col_rel_mutation_set_finish(&af.set, true) == 0);
+    assert_open(&owner);
+    assert_open(&alias);
+
+    root_init(&relation, 24);
+    relation.capacity = 2;
+    relation.merge_buf_cap = 3;
+    fixture_t nf = {0};
+    wl_columnar_relation_mutation_role_t nullary_role = {
+        &relation, WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+    };
+    assert(acquire(&nf, &nullary_role, 1) == 0);
+    wl_columnar_relation_terminal_sequence_t nullary_sequence = {0};
+    assert(wl_columnar_relation_terminal_sequence_begin(&nullary_sequence,
+        &nf.leases[0], WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP) == 0);
+    uint32_t old_capacity = relation.capacity;
+    relation.capacity = relation.merge_buf_cap;
+    relation.merge_buf_cap = old_capacity;
+    wl_columnar_relation_terminal_sequence_publish_grid_swap(
+        &nullary_sequence);
+    assert(wl_columnar_relation_terminal_sequence_finish(
+            &nullary_sequence) == 0);
+    assert(relation.storage_generation == 2
+        && relation.storage_owner_generation == 2);
+    assert(col_rel_mutation_set_finish(&nf.set, true) == 0);
+    assert_open(&relation);
+
+    col_rel_t nullary_owner, nullary_alias;
+    root_init(&nullary_owner, 25);
+    alias_init(&nullary_alias, &nullary_owner, 26);
+    nullary_alias.capacity = 2;
+    nullary_alias.merge_buf_cap = 3;
+    fixture_t naf = {0};
+    wl_columnar_relation_mutation_role_t nullary_alias_role = {
+        &nullary_alias, WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+    };
+    assert(acquire(&naf, &nullary_alias_role, 1) == 0);
+    wl_columnar_relation_terminal_sequence_t nullary_alias_sequence = {0};
+    assert(wl_columnar_relation_terminal_sequence_begin(
+            &nullary_alias_sequence, &naf.leases[0],
+            WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP) == 0);
+    old_capacity = nullary_alias.capacity;
+    nullary_alias.capacity = nullary_alias.merge_buf_cap;
+    nullary_alias.merge_buf_cap = old_capacity;
+    wl_columnar_relation_terminal_sequence_publish_grid_swap(
+        &nullary_alias_sequence);
+    assert(wl_columnar_relation_terminal_sequence_finish(
+            &nullary_alias_sequence) == 0);
+    assert(nullary_alias.storage_owner == &nullary_owner
+        && nullary_alias.storage_owner_generation
+        == nullary_owner.storage_generation
+        && nullary_alias.storage_generation == 2
+        && naf.leases[0].relation_generation == 2
+        && naf.leases[0].owner_generation == 1);
+    assert(col_rel_mutation_set_finish(&naf.set, true) == 0);
+    assert_open(&nullary_owner);
+    assert_open(&nullary_alias);
+
+    fixture_t denied = {0};
+    root_init(&relation, 23);
+    relation.columns = old_columns;
+    relation.capacity = 3;
+    relation.merge_columns = new_columns;
+    relation.merge_buf_cap = 4;
+    relation.timestamps = malloc(sizeof(*relation.timestamps) * 3);
+    assert(relation.timestamps != NULL);
+    relation.timestamp_capacity = 3;
+    relation.storage_generation = WL_COLUMNAR_REL_GENERATION_INVALID - 2u;
+    relation.storage_owner_generation = relation.storage_generation;
+    wl_columnar_relation_mutation_role_t denied_role = {
+        &relation, WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+    };
+    assert(acquire(&denied, &denied_role, 1) == 0);
+    wl_columnar_relation_terminal_sequence_t denied_sequence = {0};
+    assert(wl_columnar_relation_terminal_sequence_begin(&denied_sequence,
+        &denied.leases[0], WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP
+        | WL_COLUMNAR_RELATION_TERMINAL_TIMESTAMP_RETIRE) == EOVERFLOW);
+    assert(relation.storage_generation
+        == WL_COLUMNAR_REL_GENERATION_INVALID - 2u
+        && relation.timestamps != NULL);
+    free(relation.timestamps);
+    relation.timestamps = NULL;
+    relation.timestamp_capacity = 0;
+    assert(col_rel_mutation_set_finish(&denied.set, false) == 0);
+    assert_open(&relation);
+}
+
+static void
 contention_tests(void)
 {
     col_rel_t root, a;
@@ -339,6 +567,7 @@ main(void)
 {
     lease_tests();
     duplicate_role_publication_tests();
+    terminal_sequence_tests();
     contention_tests();
     rollback_tests();
     invalid_tests();

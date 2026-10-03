@@ -315,6 +315,7 @@ static int col_rel_cow_unshare_publish_impl(col_rel_t *r, uint32_t new_cap,
     wl_columnar_relation_mutation_lease_t *lease);
 static int col_rel_mutation_lease_advance_storage(
     wl_columnar_relation_mutation_lease_t *lease, uint64_t prior_generation);
+static bool col_rel_timestamp_shape_valid(const col_rel_t *r);
 
 /* Temporary compatibility for unmigrated append/radix/batch transactions.
  * NULL is an explicit legacy path, never a payload mutation lease. These
@@ -486,7 +487,10 @@ col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
         set->owners || set->leases
         || set->initializations || set->descriptor_count || set->owner_count
         || set->lease_count || set->initialization_count
-        || set->descriptors_acquired || set->owners_acquired || set->published
+        || set->descriptors_acquired || set->owners_acquired
+        || set->terminal_sequence || set->terminal_expected_events
+        || set->terminal_observed_events || set->terminal_sequence_consumed
+        || set->published
         || !role_count || !roles || !descriptors || !owners || !leases
         || !initializations || descriptor_cap < role_count
         || owner_cap < max_owners || lease_cap < role_count
@@ -895,6 +899,8 @@ col_rel_mutation_set_finish(wl_columnar_relation_mutation_set_t *set,
         || set->descriptors_acquired != set->descriptor_count
         || set->owners_acquired != set->owner_count)
         return EINVAL;
+    if (set->terminal_sequence)
+        abort();
     if (!set->leases || !set->roles || !set->descriptors || !set->owners
         || !set->initializations || !set->lease_count || !set->descriptor_count)
         return EINVAL;
@@ -919,6 +925,322 @@ col_rel_mutation_set_finish(wl_columnar_relation_mutation_set_t *set,
                 set->roles[i].relation) != 0)
                 abort();
     col_rel_mutation_set_unwind(set, commit || set->published);
+    return 0;
+}
+
+static uint32_t
+wl_columnar_relation_terminal_event_count(uint32_t events)
+{
+    uint32_t count = 0;
+    for (uint32_t bits = events; bits; bits &= bits - 1u)
+        count++;
+    return count;
+}
+
+static bool
+wl_columnar_relation_terminal_tokens_valid(
+    const wl_columnar_relation_terminal_sequence_t *sequence,
+    bool validate_postconditions)
+{
+    if (!sequence || sequence->identity != (uintptr_t)sequence
+        || !sequence->armed || sequence->consumed || !sequence->set
+        || !sequence->lease || !sequence->relation || !sequence->owner)
+        return false;
+    const uint32_t allowed_events =
+        WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP
+        | WL_COLUMNAR_RELATION_TERMINAL_TIMESTAMP_RETIRE;
+    wl_columnar_relation_mutation_set_t *set = sequence->set;
+    const wl_columnar_relation_mutation_lease_t *lease = sequence->lease;
+    col_rel_t *relation = sequence->relation;
+    if (set->identity != (uintptr_t)set || set->terminal_sequence != sequence
+        || set->terminal_sequence_consumed
+        || !sequence->expected_events
+        || (sequence->expected_events & ~allowed_events)
+        || set->terminal_expected_events != sequence->expected_events
+        || set->terminal_observed_events != sequence->observed_events
+        || (sequence->observed_events & ~sequence->expected_events)
+        || lease->set != set
+        || lease->identity != (uintptr_t)lease || lease->relation != relation
+        || lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+        || !set->roles || !set->leases || !set->descriptors || !set->owners
+        || lease->descriptor_slot != sequence->descriptor_slot
+        || lease->self_owner_slot != sequence->self_owner_slot
+        || set->descriptors_acquired != set->descriptor_count
+        || set->owners_acquired != set->owner_count
+        || sequence->descriptor_slot >= set->descriptor_count
+        || sequence->owner_slot >= set->owner_count
+        || sequence->self_owner_slot >= set->owner_count
+        || set->descriptors[sequence->descriptor_slot].relation != relation
+        || set->owners[sequence->owner_slot].owner != sequence->owner
+        || set->owners[sequence->self_owner_slot].owner != relation
+        || set->descriptors[sequence->descriptor_slot].writer.identity
+        != sequence->descriptor_writer_identity
+        || set->owners[sequence->owner_slot].writer.identity
+        != sequence->owner_writer_identity
+        || set->owners[sequence->self_owner_slot].writer.identity
+        != sequence->self_writer_identity
+        || wl_columnar_source_access_writer_validate(
+            &set->descriptors[sequence->descriptor_slot].writer,
+            &relation->descriptor_access)
+        || wl_columnar_source_access_writer_validate(
+            &set->owners[sequence->owner_slot].writer,
+            &sequence->owner->source_access)
+        || wl_columnar_source_access_writer_validate(
+            &set->owners[sequence->self_owner_slot].writer,
+            &relation->source_access))
+        return false;
+    uint32_t observed_steps =
+        wl_columnar_relation_terminal_event_count(sequence->observed_events);
+    uint64_t observed_generation = sequence->relation_generation
+        + observed_steps;
+    bool lease_member = false;
+    for (size_t i = 0; i < set->lease_count; i++) {
+        const wl_columnar_relation_mutation_lease_t *same = &set->leases[i];
+        const wl_columnar_relation_mutation_role_t *role = &set->roles[i];
+        if (same == lease) {
+            if (role->relation != relation
+                || role->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+                || same->role_flags
+                != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION)
+                return false;
+            lease_member = true;
+        }
+        if (role->relation != relation && same->relation != relation)
+            continue;
+        if (role->relation != relation || same->relation != relation
+            || same->set != set || same->identity != (uintptr_t)same
+            || same->relation != relation
+            || same->role_flags != role->role_flags)
+            return false;
+        if (role->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION)
+            continue;
+        if (same->owner != sequence->owner
+            || same->relation_identity != sequence->relation_identity
+            || same->owner_identity != sequence->owner_identity
+            || same->relation_generation != sequence->relation_generation
+            || same->owner_generation != sequence->owner_generation
+            || same->descriptor_slot != sequence->descriptor_slot
+            || same->owner_slot != sequence->owner_slot
+            || same->self_owner_slot != sequence->self_owner_slot
+            || same->detached != sequence->detached_before
+            || same->storage_transitioned
+            != sequence->storage_transitioned_before)
+            return false;
+    }
+    bool grid_swapped = (sequence->observed_events
+        & WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP) != 0;
+    bool timestamps_retired = (sequence->observed_events
+        & WL_COLUMNAR_RELATION_TERMINAL_TIMESTAMP_RETIRE) != 0;
+    return lease_member
+           && relation->relation_identity == sequence->relation_identity
+           && relation->storage_owner == sequence->owner
+           && relation->storage_owner_identity == sequence->owner_identity
+           && (!validate_postconditions
+           || relation->storage_generation == observed_generation)
+           && relation->storage_owner_generation
+           == (sequence->owner == relation ? observed_generation
+                                            : sequence->owner_generation)
+           && sequence->owner->relation_identity == sequence->owner_identity
+           && sequence->owner->storage_generation
+           == (sequence->owner == relation ? observed_generation
+                                            : sequence->owner_generation)
+           && (!validate_postconditions || (grid_swapped
+            ? (relation->columns == sequence->merge_columns_before
+           && relation->capacity == sequence->merge_capacity_before
+           && relation->merge_columns == sequence->columns_before
+           && relation->merge_buf_cap == sequence->capacity_before)
+            : (relation->columns == sequence->columns_before
+           && relation->capacity == sequence->capacity_before
+           && relation->merge_columns
+           == sequence->merge_columns_before
+           && relation->merge_buf_cap
+           == sequence->merge_capacity_before)))
+           && (!validate_postconditions || (timestamps_retired
+            ? (relation->timestamps == NULL
+           && relation->timestamp_capacity == 0)
+            : (relation->timestamps == sequence->timestamps_before
+           && relation->timestamp_capacity
+           == sequence->timestamp_capacity_before)));
+}
+
+int
+wl_columnar_relation_terminal_sequence_begin(
+    wl_columnar_relation_terminal_sequence_t *sequence,
+    wl_columnar_relation_mutation_lease_t *lease, uint32_t expected_events)
+{
+    const uint32_t allowed = WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP
+        | WL_COLUMNAR_RELATION_TERMINAL_TIMESTAMP_RETIRE;
+    if (!sequence || sequence->identity || sequence->armed
+        || sequence->consumed || !lease || (expected_events & ~allowed)
+        || !expected_events
+        || col_rel_mutation_lease_validate(lease, lease->relation) != 0)
+        return EINVAL;
+    col_rel_t *relation = lease->relation;
+    bool retires_timestamps = (expected_events
+        & WL_COLUMNAR_RELATION_TERMINAL_TIMESTAMP_RETIRE) != 0;
+    if (retires_timestamps != (relation->timestamps != NULL)
+        || (retires_timestamps && (relation->timestamp_capacity == 0
+        || !col_rel_timestamp_shape_valid(relation)))
+        || ((expected_events & WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP)
+        && ((relation->ncols && (!relation->columns
+        || !relation->merge_columns))
+        || (lease->owner != relation && relation->ncols != 0)
+        || relation->merge_buf_cap == 0)))
+        return EINVAL;
+    uint32_t steps = wl_columnar_relation_terminal_event_count(
+        expected_events);
+    if (steps == 0
+        || relation->storage_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - (uint64_t)steps)
+        return EOVERFLOW;
+    if (lease->set->terminal_sequence
+        || lease->set->terminal_sequence_consumed)
+        return EINVAL;
+    if (lease->set->terminal_expected_events
+        || lease->set->terminal_observed_events)
+        return EINVAL;
+    if (lease->owner_slot >= lease->set->owner_count
+        || lease->self_owner_slot >= lease->set->owner_count)
+        return EINVAL;
+    memset(sequence, 0, sizeof(*sequence));
+    sequence->identity = (uintptr_t)sequence;
+    sequence->set = lease->set;
+    sequence->lease = lease;
+    sequence->relation = relation;
+    sequence->owner = lease->owner;
+    sequence->descriptor_slot = lease->descriptor_slot;
+    sequence->owner_slot = lease->owner_slot;
+    sequence->self_owner_slot = lease->self_owner_slot;
+    sequence->descriptor_writer_identity =
+        lease->set->descriptors[lease->descriptor_slot].writer.identity;
+    sequence->owner_writer_identity =
+        lease->set->owners[lease->owner_slot].writer.identity;
+    sequence->self_writer_identity =
+        lease->set->owners[lease->self_owner_slot].writer.identity;
+    sequence->relation_identity = lease->relation_identity;
+    sequence->owner_identity = lease->owner_identity;
+    sequence->relation_generation = lease->relation_generation;
+    sequence->owner_generation = lease->owner_generation;
+    sequence->columns_before = relation->columns;
+    sequence->merge_columns_before = relation->merge_columns;
+    sequence->timestamps_before = relation->timestamps;
+    sequence->capacity_before = relation->capacity;
+    sequence->merge_capacity_before = relation->merge_buf_cap;
+    sequence->timestamp_capacity_before = relation->timestamp_capacity;
+    sequence->expected_events = expected_events;
+    sequence->detached_before = lease->detached;
+    sequence->storage_transitioned_before = lease->storage_transitioned;
+    sequence->armed = true;
+    lease->set->terminal_sequence = sequence;
+    lease->set->terminal_expected_events = expected_events;
+    lease->set->terminal_observed_events = 0;
+    if (!wl_columnar_relation_terminal_tokens_valid(sequence, true)) {
+        lease->set->terminal_sequence = NULL;
+        lease->set->terminal_expected_events = 0;
+        lease->set->terminal_observed_events = 0;
+        memset(sequence, 0, sizeof(*sequence));
+        return EINVAL;
+    }
+    lease->set->published = true;
+    return 0;
+}
+
+static void
+wl_columnar_relation_terminal_publish_event(
+    wl_columnar_relation_terminal_sequence_t *sequence, uint32_t event)
+{
+    if (!wl_columnar_relation_terminal_tokens_valid(sequence, false)
+        || !sequence->set->published
+        || (event != WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP
+        && event != WL_COLUMNAR_RELATION_TERMINAL_TIMESTAMP_RETIRE)
+        || !(sequence->expected_events & event)
+        || (sequence->observed_events & event))
+        abort();
+    col_rel_t *relation = sequence->relation;
+    if (event == WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP) {
+        if (relation->columns != sequence->merge_columns_before
+            || relation->capacity != sequence->merge_capacity_before
+            || relation->merge_columns != sequence->columns_before
+            || relation->merge_buf_cap != sequence->capacity_before)
+            abort();
+    } else if (relation->timestamps != NULL
+        || relation->timestamp_capacity != 0
+        || sequence->timestamps_before == NULL
+        || sequence->timestamp_capacity_before == 0) {
+        abort();
+    }
+    wl_columnar_relation_touch_storage(relation);
+    sequence->observed_events |= event;
+    sequence->set->terminal_observed_events |= event;
+}
+
+#ifdef WL_TEST_MUTATION_SET_HOOK
+bool
+wl_columnar_relation_test_terminal_sequence_validate(
+    const wl_columnar_relation_terminal_sequence_t *sequence)
+{
+    return wl_columnar_relation_terminal_tokens_valid(sequence, true);
+}
+#endif
+
+void
+wl_columnar_relation_terminal_sequence_publish_grid_swap(
+    wl_columnar_relation_terminal_sequence_t *sequence)
+{
+    wl_columnar_relation_terminal_publish_event(sequence,
+        WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP);
+}
+
+void
+wl_columnar_relation_terminal_sequence_publish_timestamp_retirement(
+    wl_columnar_relation_terminal_sequence_t *sequence)
+{
+    wl_columnar_relation_terminal_publish_event(sequence,
+        WL_COLUMNAR_RELATION_TERMINAL_TIMESTAMP_RETIRE);
+}
+
+int
+wl_columnar_relation_terminal_sequence_finish(
+    wl_columnar_relation_terminal_sequence_t *sequence)
+{
+    if (!wl_columnar_relation_terminal_tokens_valid(sequence, true)
+        || sequence->observed_events != sequence->expected_events)
+        return EINVAL;
+    wl_columnar_relation_mutation_set_t *set = sequence->set;
+    col_rel_t *relation = sequence->relation;
+    uint32_t steps = wl_columnar_relation_terminal_event_count(
+        sequence->expected_events);
+    uint64_t final_generation = sequence->relation_generation + steps;
+    if (relation->storage_generation != final_generation
+        || (sequence->owner == relation
+        && (relation->storage_owner != relation
+        || relation->storage_owner_identity != relation->relation_identity
+        || relation->storage_owner_generation != final_generation))
+        || (sequence->owner != relation
+        && (relation->storage_owner != sequence->owner
+        || relation->storage_owner_identity != sequence->owner_identity
+        || relation->storage_owner_generation != sequence->owner_generation
+        || ((sequence->expected_events
+        & WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP)
+        && relation->ncols != 0))))
+        return EINVAL;
+    for (size_t i = 0; i < set->lease_count; i++) {
+        wl_columnar_relation_mutation_lease_t *same = &set->leases[i];
+        if (set->roles[i].relation != relation
+            || set->roles[i].role_flags
+            != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION)
+            continue;
+        same->relation_generation = final_generation;
+        if (sequence->owner == relation)
+            same->owner_generation = final_generation;
+    }
+    sequence->consumed = true;
+    sequence->armed = false;
+    set->terminal_sequence = NULL;
+    set->terminal_expected_events = 0;
+    set->terminal_observed_events = 0;
+    set->terminal_sequence_consumed = true;
+    set->published = true;
     return 0;
 }
 

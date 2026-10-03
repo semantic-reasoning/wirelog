@@ -597,6 +597,7 @@ typedef struct {
     bool storage_transitioned;
 } wl_columnar_relation_mutation_lease_t;
 
+struct wl_columnar_relation_terminal_sequence;
 typedef struct wl_columnar_relation_mutation_set {
     uintptr_t identity;
     const wl_columnar_relation_mutation_role_t *roles;
@@ -610,8 +611,50 @@ typedef struct wl_columnar_relation_mutation_set {
     size_t initialization_count;
     size_t descriptors_acquired;
     size_t owners_acquired;
+    struct wl_columnar_relation_terminal_sequence *terminal_sequence;
+    uint32_t terminal_expected_events;
+    uint32_t terminal_observed_events;
+    bool terminal_sequence_consumed;
     bool published;
 } wl_columnar_relation_mutation_set_t;
+
+typedef enum {
+    WL_COLUMNAR_RELATION_TERMINAL_GRID_SWAP = 1u << 0,
+    WL_COLUMNAR_RELATION_TERMINAL_TIMESTAMP_RETIRE = 1u << 1
+} wl_columnar_relation_terminal_event_t;
+
+/* A zero-initialized, transaction-local record for storage publications after
+ * incremental consolidation has completed every fallible preparation step.
+ * Its event mask is consumed by relation-specific publication helpers. */
+typedef struct wl_columnar_relation_terminal_sequence {
+    uintptr_t identity;
+    wl_columnar_relation_mutation_set_t *set;
+    wl_columnar_relation_mutation_lease_t *lease;
+    col_rel_t *relation;
+    col_rel_t *owner;
+    int64_t **columns_before;
+    int64_t **merge_columns_before;
+    col_delta_timestamp_t *timestamps_before;
+    size_t descriptor_slot;
+    size_t owner_slot;
+    size_t self_owner_slot;
+    uintptr_t descriptor_writer_identity;
+    uintptr_t owner_writer_identity;
+    uintptr_t self_writer_identity;
+    uint64_t relation_identity;
+    uint64_t owner_identity;
+    uint64_t relation_generation;
+    uint64_t owner_generation;
+    uint32_t capacity_before;
+    uint32_t merge_capacity_before;
+    uint32_t timestamp_capacity_before;
+    uint32_t expected_events;
+    uint32_t observed_events;
+    bool detached_before;
+    bool storage_transitioned_before;
+    bool armed;
+    bool consumed;
+} wl_columnar_relation_terminal_sequence_t;
 
 int col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
     const wl_columnar_relation_mutation_role_t *roles, size_t role_count,
@@ -628,6 +671,19 @@ int col_rel_mutation_lease_validate(
     const col_rel_t *expected_relation);
 int col_rel_mutation_set_finish(wl_columnar_relation_mutation_set_t *set,
     bool commit);
+int wl_columnar_relation_terminal_sequence_begin(
+    wl_columnar_relation_terminal_sequence_t *sequence,
+    wl_columnar_relation_mutation_lease_t *lease, uint32_t expected_events);
+void wl_columnar_relation_terminal_sequence_publish_grid_swap(
+    wl_columnar_relation_terminal_sequence_t *sequence);
+void wl_columnar_relation_terminal_sequence_publish_timestamp_retirement(
+    wl_columnar_relation_terminal_sequence_t *sequence);
+int wl_columnar_relation_terminal_sequence_finish(
+    wl_columnar_relation_terminal_sequence_t *sequence);
+#ifdef WL_TEST_MUTATION_SET_HOOK
+bool wl_columnar_relation_test_terminal_sequence_validate(
+    const wl_columnar_relation_terminal_sequence_t *sequence);
+#endif
 #ifdef WL_TEST_MUTATION_SET_HOOK
 int wl_columnar_relation_test_mutation_lease_advance_storage(
     wl_columnar_relation_mutation_lease_t *lease, uint64_t prior_generation);
