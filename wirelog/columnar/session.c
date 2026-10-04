@@ -2446,11 +2446,29 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
 {
     wl_columnar_memory_governor_ref_t *memory_governor;
     const wl_columnar_memory_governor_t *governor;
+    uint64_t join_output_limit = 0;
     bool intern_attached_here = false;
     int relation_create_rc = ENOMEM;
 
     if (!plan || !out)
         return EINVAL;
+    *out = NULL;
+    {
+        const char *env = getenv("WIRELOG_JOIN_OUTPUT_LIMIT");
+        if (env && env[0] != '\0') {
+            uint64_t value = 0;
+            for (const unsigned char *p = (const unsigned char *)env;
+                *p != '\0'; p++) {
+                if (*p < '0' || *p > '9'
+                    || value > (UINT64_MAX - (*p - '0')) / 10)
+                    return EINVAL;
+                value = value * 10 + (*p - '0');
+            }
+            join_output_limit = value;
+        }
+        if (join_output_limit > UINT32_MAX)
+            join_output_limit = UINT32_MAX;
+    }
     if (options && options->memory_governor) {
         /* #1473: an injected governor replaces environment and host
          * resolution.  The session holds its own reference; the caller's
@@ -2649,47 +2667,9 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
     sess->callback_parallel_execution = false;
     sess->callback_session_key = sess;
 
-    /* Dynamic join output limit (Issue #221) */
-    {
-        const char *join_limit_env = getenv("WIRELOG_JOIN_OUTPUT_LIMIT");
-        bool env_valid = false;
-        if (join_limit_env && join_limit_env[0] != '\0') {
-            char *endp = NULL;
-            errno = 0;
-            uint64_t val = strtoull(join_limit_env, &endp, 10);
-            if (endp != join_limit_env && *endp == '\0' && errno != ERANGE) {
-                sess->join_output_limit = val;
-                env_valid = true;
-            }
-        }
-        if (!env_valid) {
-            uint64_t phys = col_detect_physical_memory();
-            if (phys > 0) {
-                /* Global per-join cap: 25% of RAM / (8 bytes * 3 avg cols).
-                 * Each K-fusion worker processes a 1/K data partition, so
-                 * per-partition join output does NOT scale with K.  Dividing
-                 * by num_workers here was a regression (commit 6929689) that
-                 * caused silent data loss in multi-worker mode (Issue #404).
-                 * Dynamic mem_ledger backpressure handles runtime coordination.
-                 *
-                 * Avg-col assumption was 5 (Issue #221, /40), but DOOP-class
-                 * points-to analyses dominate the recursive recursive-join
-                 * cost on 2-3 column intermediates (SubtypeOf, MethodLookup,
-                 * VarPointsTo, CallGraphEdge); /40 was conservatively low and
-                 * caused DOOP to hit the cap at ~105M intermediate rows on
-                 * 16 GB hosts (Issue #791).  /24 is a 67 % headroom bump that
-                 * preserves the 25 % RAM safety margin and matches the
-                 * narrow-join workloads that dominate the v0.43 portfolio. */
-                sess->join_output_limit = (phys / 4) / 24ULL;
-            } else {
-                sess->join_output_limit
-                    = (uint64_t)COL_JOIN_OUTPUT_LIMIT_DEFAULT;
-            }
-        }
-        /* Clamp to UINT32_MAX since nrows is uint32_t */
-        if (sess->join_output_limit > UINT32_MAX)
-            sess->join_output_limit = UINT32_MAX;
-    }
+    /* Zero leaves the legacy row cap disabled; memory admission governs
+     * allocations independently. A configured positive cap remains optional. */
+    sess->join_output_limit = join_output_limit;
     /* Bounded keyed-join sub-batches (Issue #1446): strict decimals like
      * the siblings above; anything else leaves the mode off. */
     {

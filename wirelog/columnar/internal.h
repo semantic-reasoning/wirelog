@@ -195,14 +195,6 @@ now_ns(void)
 #define COL_ARR_CACHE_MAX 128u
 #define COL_ARR_CACHE_LIMIT_BYTES (256ULL * 1024ULL * 1024ULL) /* 256 MB default */
 
-/* Default maximum output rows per single join operation (issue #218, #221).
- * Prevents unbounded memory growth from cardinality explosion in
- * cross-product-heavy joins (e.g., DOOP VarPointsTo). When exceeded,
- * the join returns EOVERFLOW. Set to 0 to disable the limit.
- * At runtime, the session uses a dynamically computed limit based on
- * available physical memory (see wl_col_session_t.join_output_limit). */
-#define COL_JOIN_OUTPUT_LIMIT_DEFAULT (50u * 1000u * 1000u) /* 50M rows */
-
 typedef enum wl_columnar_internal_tdd_fallback_reason {
     WL_COLUMNAR_INTERNAL_TDD_FALLBACK_NONE = 0,
     WL_COLUMNAR_INTERNAL_TDD_FALLBACK_NON_RECURSIVE,
@@ -2113,10 +2105,9 @@ typedef struct wl_col_session_t {
     uint32_t callback_active_workers;
     bool callback_parallel_execution;
     const void *callback_session_key;
-    /* Dynamic join output limit (Issue #221).
-     * Maximum output rows per single join operation. Computed at session init
-     * based on available physical memory, num_workers, and estimated row width.
-     * 0 = disabled (no limit). Overridable via WIRELOG_JOIN_OUTPUT_LIMIT env var. */
+    /* Optional legacy maximum output rows per single join, configured through
+     * WIRELOG_JOIN_OUTPUT_LIMIT. Zero disables the row cap; memory admission
+     * is enforced separately. */
     uint64_t join_output_limit;
     /* Bounded keyed-join sub-batches (Issue #1446).  join_batch_bytes is
      * the per-producer batch payload budget from WIRELOG_JOIN_BATCH_BYTES;
