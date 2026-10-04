@@ -687,7 +687,18 @@ the committed token after publication and before a growth transaction.
 | `eval_dedup.c:wl_columnar_eval_dedup_test_fail_next_growth_alloc` | test-only fault flag | `atomic_store_explicit` | release | Arm one allocation refusal before a test invokes dedup growth; excluded from the production library |
 | `eval_dedup.c:wl_columnar_eval_dedup_set_grow` | test-only fault flag | `atomic_exchange_explicit` | acquire-release | Consume the one-shot fault safely when test workers grow dedup tables; excluded from the production library |
 
-The complete source audit now contains **220 atomic call sites**.
+### 5.19 `wirelog/columnar/lftj.c` — governed admission test hook (2 rows)
+
+The test-only admission hook temporarily lowers the governor limit to force
+the inner LFTJ reservation down its denial path. The load and store are
+excluded from the production library.
+
+| Anchor (file:function[#N]) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `lftj.c:wl_columnar_lftj_join_typed_governed` | `memory_governor->usable_bytes` | `atomic_load_explicit` | relaxed | Save the configured admission limit before the test hook applies a temporary denial limit |
+| `lftj.c:wl_columnar_lftj_join_typed_governed#2` | `memory_governor->usable_bytes` | `atomic_store_explicit` | relaxed | Apply the test-only denial limit while this thread forces the inner reservation failure; excluded from the production library |
+
+The complete source audit now contains **222 atomic call sites**.
 
 ---
 

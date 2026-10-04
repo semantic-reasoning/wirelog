@@ -180,7 +180,8 @@ testlib_prod_src = files(
   ) + thread_src
 testlib_prod_c_args = ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_TEST_RELATION_RESIZE_HOOK=1',
                        '-DWL_TEST_JOIN_CACHE_HOOK=1',
-                       '-DWL_TEST_JOIN_BATCH_DESCRIPTOR_HOOKS=1']
+                       '-DWL_TEST_JOIN_BATCH_DESCRIPTOR_HOOKS=1',
+                       '-DWL_TEST_LFTJ_ADMISSION_HOOKS=1']
 
 testlib_prod = static_library(
   'testlib_prod',
@@ -2931,6 +2932,7 @@ test_lftj_exe = executable(
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],
+  c_args: ['-DWL_TEST_LFTJ_ADMISSION_HOOKS=1'],
 )
 
 test('lftj', test_lftj_exe)
@@ -3939,6 +3941,7 @@ test_lftj_integration_exe = executable(
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],
+  c_args: ['-DWL_TEST_LFTJ_ADMISSION_HOOKS=1'],
 )
 
 test('lftj_integration', test_lftj_integration_exe)

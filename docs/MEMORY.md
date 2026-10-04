@@ -544,8 +544,10 @@ advisory/unbounded. Explicit `0`, malformed values, overflow, and values below
 256 MiB are invalid. This resolver does not use physical RAM as an enforcing
 fallback. The legacy ledger worker-share hint remains separate from governor
 admission. Fixed eval-arena, delta-pool, compound-arena backing storage, and
-the covered join allocation paths use admission; LFTJ, auxiliary metadata,
-and eval-entry segment allocations remain follow-up work.
+the covered join allocation paths use admission. LFTJ iterator/sort workspace
+and operator staging use governor reservations; remaining LFTJ output/source
+boundaries, auxiliary metadata, and eval-entry segment allocations remain
+follow-up work tracked by #1978.
 
 The ledger's RELATION worker-share hint can still trigger join backpressure
 at 80% (`wl_mem_ledger_should_backpressure(RELATION, 80)`). The governor also
