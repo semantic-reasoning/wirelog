@@ -344,19 +344,27 @@ class PreparePlanTests(unittest.TestCase):
     def test_clean_clone_reconstructs_delta_without_post_tree_object(self):
         clone = self.root / 'clean-clone'
         clone.mkdir()
-        head = self.git(M['REPOSITORY_ROOT'], 'rev-parse', 'HEAD')
         self.git(clone, 'init', '-q')
-        self.git(clone, 'remote', 'add', 'source', str(M['REPOSITORY_ROOT']))
-        self.git(clone, 'fetch', '--no-tags', 'source', head)
-        self.git(clone, 'checkout', '-q', '-b', 'clean-clone', 'FETCH_HEAD')
-        patch_path = clone / 'scripts/perf/batch-append-product-delta-v1.patch'
-        patch_path.parent.mkdir(parents=True, exist_ok=True)
+        self.git(clone, 'config', 'user.name', 'Clean Clone Fixture')
+        self.git(clone, 'config', 'user.email', 'clean-clone@example.invalid')
+        perf_dir = clone / 'scripts/perf'
+        perf_dir.mkdir(parents=True)
+        manifest_path = perf_dir / 'batch-append-revision-manifest-v1.json'
+        patch_path = perf_dir / 'batch-append-product-delta-v1.patch'
+        bundle_path = perf_dir / 'batch-append-anchor-v1.bundle'
+        shutil.copyfile(M['MANIFEST_PATH'], manifest_path)
         shutil.copyfile(M['PRODUCT_PATCH_PATH'], patch_path)
-        bundle_path = clone / 'scripts/perf/batch-append-anchor-v1.bundle'
         shutil.copyfile(M['ANCHOR_BUNDLE_PATH'], bundle_path)
-        self.assertEqual(self.git(clone, 'ls-files', '--error-unmatch',
-                                  'scripts/perf/batch-append-product-delta-v1.patch'),
-                         'scripts/perf/batch-append-product-delta-v1.patch')
+        expected_inputs = {
+            'scripts/perf/batch-append-revision-manifest-v1.json',
+            'scripts/perf/batch-append-product-delta-v1.patch',
+            'scripts/perf/batch-append-anchor-v1.bundle'}
+        self.git(clone, 'add', *sorted(expected_inputs))
+        self.git(clone, 'commit', '-q', '-m', 'commit isolated campaign inputs')
+        self.assertEqual(set(self.git(clone, 'ls-files').splitlines()), expected_inputs)
+        self.assertEqual(self.git(clone, 'remote'), '')
+        self.assertEqual(self.git(clone, 'rev-parse', '--is-shallow-repository'), 'false')
+        self.assertFalse((clone / '.git/objects/info/alternates').exists())
 
         revision = json.loads(M['MANIFEST_PATH'].read_text(encoding='utf-8'))
         post_tree = revision['product']['post_tree']

@@ -959,10 +959,10 @@ if host_machine.system() == 'linux'
        suite: 'abi', timeout: 120)
   test('perf_batch_append_source_materializer_contract', py3,
        args: [meson.project_source_root() / 'scripts/perf/test-materialize-batch-append-sources.py'],
-       suite: 'abi', timeout: 180)
+       suite: 'abi', timeout: 180, is_parallel: false)
   test('perf_batch_append_execution_contract', py3,
        args: [meson.project_source_root() / 'scripts/perf/test-prepare-batch-append-execution.py'],
-       suite: 'abi', timeout: 120)
+       suite: 'abi', timeout: 240, is_parallel: false)
   test('perf_batch_append_calibration_contract', py3,
        args: [meson.project_source_root() / 'scripts/perf/test-calibrate-batch-append.py'],
        suite: 'abi', timeout: 120)

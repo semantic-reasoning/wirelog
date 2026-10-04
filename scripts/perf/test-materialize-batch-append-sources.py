@@ -171,6 +171,26 @@ class MaterializerIntegrationTests(unittest.TestCase):
                                         self.root / 'missing-seed', 'clean')
         self.assertFalse(output.exists())
 
+    def test_output_overlapping_external_caller_is_rejected_before_home_check(self):
+        caller = Path('/opt/wirelog-external-caller-fixture')
+        output = caller / 'materialized'
+        materializer_campaign = MATERIALIZER['materialize'].__globals__['campaign']
+        with patch.dict(materializer_campaign, REPOSITORY_ROOT=caller):
+            with self.assertRaisesRegex(ValueError, 'must not overlap the caller checkout'):
+                MATERIALIZER['materialize'](
+                    output, CAMPAIGN['PRODUCT_PATCH_PATH'], self.root / 'overlay.patch',
+                    self.root / 'seed', 'clean')
+        self.assertFalse(output.exists())
+
+    def test_output_outside_home_is_rejected_without_creating_output(self):
+        output = Path('/opt/wirelog-materializer-outside-home-fixture')
+        self.assertFalse(output.exists())
+        with self.assertRaisesRegex(ValueError, 'must be a child of HOME'):
+            MATERIALIZER['materialize'](
+                output, CAMPAIGN['PRODUCT_PATCH_PATH'], self.root / 'overlay.patch',
+                self.root / 'seed', 'clean')
+        self.assertFalse(output.exists())
+
 
 if __name__ == '__main__':
     unittest.main()
