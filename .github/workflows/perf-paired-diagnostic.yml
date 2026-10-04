@@ -4,12 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       campaign_mode:
-        description: 'Descriptive comparison or independent A/A control'
+        description: 'Descriptive comparison, A/A control, or pinned #1913 diagnosis'
         required: true
         type: choice
         options:
           - comparison
           - aa_control
+          - issue_1913
         default: aa_control
       base_sha:
         description: 'Full trusted main ancestor SHA (comparison only)'
@@ -37,6 +38,11 @@ jobs:
       DISPATCH_SHA: ${{ github.sha }}
       # #2029 minimum measured revision; distinct from the collector implementation base.
       MINIMUM_SHA: c6e263d492828d1208fa11005c18d19b05342233
+      ISSUE1913_BASE_SHA: 8d91c2da2b188b94af5b9f1da21c569d80ccb387
+      ISSUE1913_CANDIDATE_SHA: 10d5ba8d9daba473476fa7a2aa75072da42cef39
+      ISSUE1913_PROBE_SOURCE_SHA: 5f9d6c51df10766b4c099af9ebf9bcb362f9778a
+      ISSUE1913_PROBE_BLOB: 06aa75dd22cae319a0ca17acfdfc63f6501abd95
+      CANONICAL_REPOSITORY: https://github.com/semantic-reasoning/wirelog.git
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -77,6 +83,11 @@ jobs:
                 test -z "$REQUESTED_BASE"
                 base_sha="$main_sha"
                 ;;
+              issue_1913)
+                test -z "$REQUESTED_BASE"
+                base_sha="$ISSUE1913_BASE_SHA"
+                candidate_sha="$ISSUE1913_CANDIDATE_SHA"
+                ;;
               *) exit 1 ;;
             esac
           else
@@ -87,34 +98,17 @@ jobs:
             case "$revision" in
               *[!0123456789abcdef]*) exit 1 ;;
             esac
-            git cat-file -e "$revision^{commit}"
-            git merge-base --is-ancestor "$MINIMUM_SHA" "$revision"
-            git merge-base --is-ancestor "$revision" "$main_sha"
-            git show "$revision:tests/test_crdt_perf_gate.c" | grep -F 'WIRELOG_CRDT_PROBE' >/dev/null
+            if [[ "$mode" != issue_1913 ]]; then
+              git cat-file -e "$revision^{commit}"
+              git merge-base --is-ancestor "$MINIMUM_SHA" "$revision"
+              git merge-base --is-ancestor "$revision" "$main_sha"
+              git show "$revision:tests/test_crdt_perf_gate.c" | grep -F 'WIRELOG_CRDT_PROBE' >/dev/null
+            fi
           done
           printf 'mode=%s base=%s candidate=%s fetched_main=%s\n' \
             "$mode" "$base_sha" "$candidate_sha" "$main_sha" > perf-artifacts/paired/trusted-revisions.txt
           printf 'CAMPAIGN_MODE=%s\nBASE_SHA=%s\nCANDIDATE_SHA=%s\n' \
             "$mode" "$base_sha" "$candidate_sha" >> "$GITHUB_ENV"
-
-      - name: Create independent worktrees
-        shell: bash
-        run: |
-          set -euo pipefail
-          pair_root="$RUNNER_TEMP/wirelog-paired-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          test ! -e "$pair_root"
-          mkdir "$pair_root"
-          git worktree add --detach "$pair_root/base" "$BASE_SHA"
-          if [[ "$CAMPAIGN_MODE" == aa_control ]]; then
-            printf 'BASE_SRC=%s/base\nCANDIDATE_SRC=%s/base\nBASE_BUILD=%s/base-build\nCANDIDATE_BUILD=%s/base-build\n' \
-              "$pair_root" "$pair_root" "$pair_root" "$pair_root" >> "$GITHUB_ENV"
-          else
-            git worktree add --detach "$pair_root/candidate" "$CANDIDATE_SHA"
-            printf 'BASE_SRC=%s/base\nCANDIDATE_SRC=%s/candidate\nBASE_BUILD=%s/base-build\nCANDIDATE_BUILD=%s/candidate-build\n' \
-              "$pair_root" "$pair_root" "$pair_root" "$pair_root" >> "$GITHUB_ENV"
-          fi
-          printf 'BASE_BUILD_LOG=%s/base-complete-build.log\nCANDIDATE_BUILD_LOG=%s/base-complete-build.log\n' \
-            "$GITHUB_WORKSPACE/perf-artifacts/paired" "$GITHUB_WORKSPACE/perf-artifacts/paired" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
         run: |
@@ -123,6 +117,102 @@ jobs:
 
       - name: Set up Meson 1.12.0
         uses: ./.github/actions/setup-meson
+
+      - name: Create HOME-contained Python environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          home_real="$(realpath -e "$HOME")"
+          cache_root="$home_real/.cache"
+          mkdir -p "$cache_root"
+          test "$(realpath -e "$cache_root")" = "$cache_root"
+          python_venv="$cache_root/wirelog-perf-python-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test "$(realpath -m "$python_venv")" = "$python_venv"
+          test ! -e "$python_venv"
+          printf 'PERF_VENV=%s\n' "$python_venv" >> "$GITHUB_ENV"
+          uv venv --system-site-packages "$python_venv"
+          printf '%s/bin\n' "$python_venv" >> "$GITHUB_PATH"
+          test "$("$python_venv/bin/python" -c 'import sys; print(sys.prefix)')" = "$python_venv"
+
+      - name: Fetch and materialize pinned #1913 sources
+        if: env.CAMPAIGN_MODE == 'issue_1913'
+        shell: bash
+        run: |
+          set -euo pipefail
+          home_real="$(realpath -e "$HOME")"
+          cache_root="$home_real/.cache"
+          mkdir -p "$cache_root"
+          test "$(realpath -e "$cache_root")" = "$cache_root"
+          pair_root="$cache_root/wirelog-1913-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test "$(realpath -m "$pair_root")" = "$pair_root"
+          test ! -e "$pair_root"
+          mkdir "$pair_root"
+          printf '%s\n' "$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT" \
+            > "$pair_root/.wirelog-perf-owned"
+          repo="$pair_root/repository"
+          printf 'PAIR_ROOT=%s\nSOURCE_REPO=%s\n' "$pair_root" "$repo" >> "$GITHUB_ENV"
+          mkdir "$repo"
+          test "$(python -c 'import sys; print(sys.prefix)')" = "$PERF_VENV"
+          git -C "$repo" init --quiet
+          git -C "$repo" remote add canonical "$CANONICAL_REPOSITORY"
+          git -C "$repo" fetch --no-tags canonical \
+            "$ISSUE1913_BASE_SHA" "$ISSUE1913_CANDIDATE_SHA" \
+            "$ISSUE1913_PROBE_SOURCE_SHA"
+          for revision in "$ISSUE1913_BASE_SHA" "$ISSUE1913_CANDIDATE_SHA" \
+                          "$ISSUE1913_PROBE_SOURCE_SHA"; do
+            test "$(git -C "$repo" cat-file -t "$revision")" = commit
+          done
+          test "$(git -C "$repo" rev-parse \
+            "$ISSUE1913_PROBE_SOURCE_SHA:tests/test_crdt_perf_gate.c")" = \
+            "$ISSUE1913_PROBE_BLOB"
+          test "$(git -C "$repo" cat-file -t "$ISSUE1913_PROBE_BLOB")" = blob
+          materialization_dir="$GITHUB_WORKSPACE/perf-artifacts/paired/materialization"
+          mkdir -p "$materialization_dir"
+          (cd "$repo" && python \
+            "$GITHUB_WORKSPACE/scripts/perf/materialize-1913-diagnostic.py" \
+            --side base) | tee "$materialization_dir/base.json"
+          (cd "$repo" && python \
+            "$GITHUB_WORKSPACE/scripts/perf/materialize-1913-diagnostic.py" \
+            --side candidate) | tee "$materialization_dir/candidate.json"
+          base_wrapper="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["wrapper_sha"])' \
+            "$materialization_dir/base.json")"
+          candidate_wrapper="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["wrapper_sha"])' \
+            "$materialization_dir/candidate.json")"
+          test "$base_wrapper" != "$candidate_wrapper"
+          printf 'ORIGINAL_BASE_SHA=%s\nORIGINAL_CANDIDATE_SHA=%s\n' \
+            "$ISSUE1913_BASE_SHA" "$ISSUE1913_CANDIDATE_SHA" >> "$GITHUB_ENV"
+          printf 'BASE_SHA=%s\nCANDIDATE_SHA=%s\nSOURCE_REPO=%s\nPAIR_ROOT=%s\n' \
+            "$base_wrapper" "$candidate_wrapper" "$repo" "$pair_root" >> "$GITHUB_ENV"
+
+      - name: Create independent worktrees
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$CAMPAIGN_MODE" == issue_1913 ]]; then
+            pair_root="$PAIR_ROOT"
+            source_repo="$SOURCE_REPO"
+            base_revision="$BASE_SHA"
+          else
+            pair_root="$RUNNER_TEMP/wirelog-paired-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            test ! -e "$pair_root"
+            mkdir "$pair_root"
+            printf '%s\n' "$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT" \
+              > "$pair_root/.wirelog-perf-owned"
+            source_repo="$GITHUB_WORKSPACE"
+            base_revision="$BASE_SHA"
+          fi
+          git -C "$source_repo" worktree add --detach "$pair_root/base" "$base_revision"
+          if [[ "$CAMPAIGN_MODE" == aa_control ]]; then
+            printf 'BASE_SRC=%s/base\nCANDIDATE_SRC=%s/base\nBASE_BUILD=%s/base-build\nCANDIDATE_BUILD=%s/base-build\n' \
+              "$pair_root" "$pair_root" "$pair_root" "$pair_root" >> "$GITHUB_ENV"
+          else
+            git -C "$source_repo" worktree add --detach "$pair_root/candidate" "$CANDIDATE_SHA"
+            printf 'BASE_SRC=%s/base\nCANDIDATE_SRC=%s/candidate\nBASE_BUILD=%s/base-build\nCANDIDATE_BUILD=%s/candidate-build\n' \
+              "$pair_root" "$pair_root" "$pair_root" "$pair_root" >> "$GITHUB_ENV"
+          fi
+          printf 'SOURCE_REPO=%s\nPAIR_ROOT=%s\n' "$source_repo" "$pair_root" >> "$GITHUB_ENV"
+          printf 'BASE_BUILD_LOG=%s/base-complete-build.log\nCANDIDATE_BUILD_LOG=%s/base-complete-build.log\n' \
+            "$GITHUB_WORKSPACE/perf-artifacts/paired" "$GITHUB_WORKSPACE/perf-artifacts/paired" >> "$GITHUB_ENV"
 
       - name: Select available CPU
         shell: bash
@@ -182,12 +272,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          collector_mode="$CAMPAIGN_MODE"
+          if [[ "$collector_mode" == issue_1913 ]]; then
+            collector_mode=comparison
+          fi
           aa_option=()
-          if [[ "$CAMPAIGN_MODE" == aa_control ]]; then
+          if [[ "$collector_mode" == aa_control ]]; then
             aa_option+=(--qualify-aa)
           fi
           python scripts/perf/paired-benchmark.py v1 \
-            --mode "$CAMPAIGN_MODE" --base-sha "$BASE_SHA" --candidate-sha "$CANDIDATE_SHA" \
+            --mode "$collector_mode" --base-sha "$BASE_SHA" --candidate-sha "$CANDIDATE_SHA" \
             --base-source "$BASE_SRC" --candidate-source "$CANDIDATE_SRC" \
             --base-build "$BASE_BUILD" --candidate-build "$CANDIDATE_BUILD" \
             --base-build-log "$BASE_BUILD_LOG" \
@@ -228,6 +322,13 @@ jobs:
                    f"Trusted base: {os.environ.get('BASE_SHA', 'unresolved')}",
                    f"Trusted candidate: {os.environ.get('CANDIDATE_SHA', 'unresolved')}",
                    f"Artifact: perf-paired-v1-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"]
+          if os.environ.get('CAMPAIGN_MODE') == 'issue_1913':
+              lines.extend([
+                  f"Original #1913 baseline: {os.environ.get('ORIGINAL_BASE_SHA', 'unresolved')}",
+                  f"Original #1913 candidate: {os.environ.get('ORIGINAL_CANDIDATE_SHA', 'unresolved')}",
+                  "Synthetic source provenance: perf-artifacts/paired/materialization/*.json",
+                  "Collector timing and source identity: perf-artifacts/paired/campaign/campaign-v1.json",
+              ])
           status = Path('perf-artifacts/paired/campaign/collection-status.json')
           if status.exists():
               lines.append('Collector status/reason: ' + json.dumps(json.loads(status.read_text(encoding='utf-8')), sort_keys=True))
@@ -249,16 +350,44 @@ jobs:
           set -euo pipefail
           [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
           [[ "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
-          test -n "$RUNNER_TEMP"
-          test "$RUNNER_TEMP" != /
-          pair_root="$RUNNER_TEMP/wirelog-paired-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          test "$(realpath -m "$pair_root")" = "$(realpath -m "$RUNNER_TEMP")/wirelog-paired-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          campaign_mode="${CAMPAIGN_MODE:-${REQUESTED_MODE:-unresolved}}"
+          if [[ "$campaign_mode" == issue_1913 ]]; then
+            home_real="$(realpath -e "$HOME")"
+            pair_root="${PAIR_ROOT:-$home_real/.cache/wirelog-1913-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT}"
+            source_repo="${SOURCE_REPO:-$pair_root/repository}"
+            test "$(realpath -m "$pair_root")" = \
+              "$home_real/.cache/wirelog-1913-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            if [[ ! -f "$pair_root/.wirelog-perf-owned" ]] || \
+               [[ "$(cat "$pair_root/.wirelog-perf-owned")" != "$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT" ]]; then
+              pair_root=''
+            fi
+          else
+            test -n "$RUNNER_TEMP"
+            test "$RUNNER_TEMP" != /
+            pair_root="$RUNNER_TEMP/wirelog-paired-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            source_repo="$GITHUB_WORKSPACE"
+            test "$(realpath -m "$pair_root")" = "$(realpath -m "$RUNNER_TEMP")/wirelog-paired-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            if [[ ! -f "$pair_root/.wirelog-perf-owned" ]] || \
+               [[ "$(cat "$pair_root/.wirelog-perf-owned")" != "$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT" ]]; then
+              pair_root=''
+            fi
+          fi
           cleanup_status=0
           for side in base candidate; do
-            if [[ -d "$pair_root/$side" ]]; then
-              git worktree remove --force "$pair_root/$side" || cleanup_status=1
+            if [[ -n "$pair_root" && -d "$pair_root/$side" && -e "$source_repo/.git" ]]; then
+              git -C "$source_repo" worktree remove --force "$pair_root/$side" || cleanup_status=1
             fi
           done
-          rm -rf -- "$pair_root" || cleanup_status=1
-          git worktree prune || cleanup_status=1
+          if [[ -n "$pair_root" ]]; then
+            rm -rf -- "$pair_root" || cleanup_status=1
+          fi
+          if [[ -e "$source_repo/.git" ]]; then
+            git -C "$source_repo" worktree prune || cleanup_status=1
+          fi
+          if [[ -n "${PERF_VENV:-}" ]]; then
+            home_real="$(realpath -e "$HOME")"
+            test "$(realpath -m "$PERF_VENV")" = \
+              "$home_real/.cache/wirelog-perf-python-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            rm -rf -- "$PERF_VENV" || cleanup_status=1
+          fi
           exit "$cleanup_status"
