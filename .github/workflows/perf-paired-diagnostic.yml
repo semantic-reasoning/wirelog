@@ -299,6 +299,19 @@ jobs:
             --preflight perf-artifacts/paired/campaign/preflight.json \
             --output perf-artifacts/paired/campaign/aa-qualification-v1.json
 
+      - name: Validate complete #1913 source and campaign provenance
+        if: always() && env.CAMPAIGN_MODE == 'issue_1913'
+        shell: bash
+        run: |
+          set -euo pipefail
+          home_real="$(realpath -e "$HOME")"
+          repository="${SOURCE_REPO:-$home_real/.cache/wirelog-1913-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/repository}"
+          python scripts/perf/validate-1913-diagnostic.py \
+            --repository "$repository" \
+            --materialization-dir perf-artifacts/paired/materialization \
+            --evidence-dir perf-artifacts/paired/campaign \
+            --output perf-artifacts/paired/issue-1913-validation.json
+
       - name: Upload all paired diagnostic evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -327,7 +340,9 @@ jobs:
                   f"Original #1913 baseline: {os.environ.get('ORIGINAL_BASE_SHA', 'unresolved')}",
                   f"Original #1913 candidate: {os.environ.get('ORIGINAL_CANDIDATE_SHA', 'unresolved')}",
                   "Synthetic source provenance: perf-artifacts/paired/materialization/*.json",
+                  "Fail-closed source/campaign validation: perf-artifacts/paired/issue-1913-validation.json",
                   "Collector timing and source identity: perf-artifacts/paired/campaign/campaign-v1.json",
+                  "CSPA bench_flowlog repeat=1 is descriptive and is not cspa_w1_gate or its 2050ms target.",
               ])
           status = Path('perf-artifacts/paired/campaign/collection-status.json')
           if status.exists():
