@@ -658,6 +658,16 @@ typedef struct wl_columnar_relation_terminal_sequence {
     bool consumed;
 } wl_columnar_relation_terminal_sequence_t;
 
+/* Single-entry storage lives with the operation, including its role mapping. */
+typedef struct {
+    wl_columnar_relation_mutation_set_t set;
+    wl_columnar_relation_mutation_role_t role;
+    wl_columnar_relation_mutation_descriptor_t descriptor;
+    wl_columnar_relation_mutation_owner_t owners[2];
+    wl_columnar_relation_mutation_lease_t lease;
+    wl_columnar_relation_mutation_initialization_t initialization;
+} wl_columnar_relation_mutation_single_t;
+
 int col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
     const wl_columnar_relation_mutation_role_t *roles, size_t role_count,
     wl_columnar_relation_mutation_descriptor_t *descriptors,
@@ -684,6 +694,7 @@ int wl_columnar_relation_terminal_sequence_finish(
     wl_columnar_relation_terminal_sequence_t *sequence);
 #ifdef WL_TEST_MUTATION_SET_HOOK
 void wl_columnar_relation_test_set_mutation_nonce(uint64_t next_nonce);
+uint64_t wl_columnar_relation_test_mutation_nonce_peek(void);
 bool wl_columnar_relation_test_terminal_sequence_validate(
     const wl_columnar_relation_terminal_sequence_t *sequence);
 #endif
@@ -2744,6 +2755,33 @@ int col_rel_cow_unshare_with_lease(col_rel_t *r,
 WL_MUST_CHECK int
 wl_columnar_relation_privatize_shared_view_with_lease(col_rel_t *r,
     wl_columnar_relation_mutation_lease_t *lease);
+/* Append many rows to one relation under a held mutation lease instead of
+ * one per row (col_rel_append_row acquires and finishes a mutation set for
+ * every row).  begin acquires the lease; row appends exactly as
+ * col_rel_append_row would, starting a fresh lease only before a row that
+ * replaces storage once this lease has already published a transition; end
+ * finishes it and is a no-op on an inactive batch.
+ *
+ * While a batch is active this thread holds the relation's descriptor and
+ * source writer gates, and for a shared view also its storage owner's
+ * source writer gate: readers of either get EBUSY, and destroying the
+ * relation fails, so end the batch before destroying, publishing or
+ * returning it.
+ * The struct holds address- and thread-bound tokens: keep it in the frame
+ * that runs the loop, pass it by pointer, never copy it.  A failed row leaves
+ * the relation as that append's own contract says and the batch active; a
+ * failed lease renewal leaves it inactive. */
+typedef struct {
+    wl_columnar_relation_mutation_single_t single;
+    col_rel_t *relation;
+    bool active;
+} col_rel_append_batch_t;
+
+int col_rel_append_batch_begin(col_rel_append_batch_t *batch, col_rel_t *r);
+int col_rel_append_batch_row(col_rel_append_batch_t *batch,
+    const int64_t *row);
+int col_rel_append_batch_end(col_rel_append_batch_t *batch, bool commit);
+
 int col_rel_append_row_with_lease(col_rel_t *r, const int64_t *row,
     wl_columnar_relation_mutation_lease_t *lease);
 int col_rel_reserve_rows_with_lease(col_rel_t *r, uint32_t additional,
