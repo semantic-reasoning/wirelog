@@ -1289,6 +1289,8 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                 sess ? sess->memory_governor : NULL);
         if (rc == 0)
             rc = ctx.rc;
+        if (rc == ENOSPC && sess)
+            sess->memory_budget_denied = true;
 
         free(tmp);
         if (rc != 0) {

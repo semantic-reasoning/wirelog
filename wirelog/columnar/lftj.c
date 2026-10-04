@@ -29,6 +29,44 @@
 #define WL_COLUMNAR_LFTJ_NOINLINE
 #endif
 
+#ifdef WL_TEST_LFTJ_ADMISSION_HOOKS
+#if defined(_MSC_VER)
+#define WL_COLUMNAR_LFTJ_TEST_TLS __declspec(thread)
+#else
+#define WL_COLUMNAR_LFTJ_TEST_TLS _Thread_local
+#endif
+static WL_COLUMNAR_LFTJ_TEST_TLS wl_columnar_lftj_test_hook_state_t
+lftj_test_hook_state;
+
+void
+wl_columnar_lftj_test_fail_next_iters_alloc(void)
+{
+    lftj_test_hook_state.fail_iters_pending = true;
+    lftj_test_hook_state.fail_iters_consumed = false;
+}
+
+void
+wl_columnar_lftj_test_deny_next_inner_admission(void)
+{
+    lftj_test_hook_state.deny_inner_pending = true;
+    lftj_test_hook_state.deny_inner_consumed = false;
+}
+
+void
+wl_columnar_lftj_test_get_hook_state(
+    wl_columnar_lftj_test_hook_state_t *out)
+{
+    if (out)
+        *out = lftj_test_hook_state;
+}
+
+void
+wl_columnar_lftj_test_clear_hooks(void)
+{
+    memset(&lftj_test_hook_state, 0, sizeof(lftj_test_hook_state));
+}
+#endif
+
 /* ======================================================================== */
 /* LFTJ Iterator                                                            */
 /* ======================================================================== */
@@ -277,22 +315,57 @@ wl_columnar_lftj_join_typed_governed(const wl_lftj_input_t *inputs,
     wl_columnar_memory_reservation_t reservation;
     wl_columnar_memory_reservation_init(&reservation);
     if (governor && scratch_bytes > 0) {
+        wl_columnar_memory_governor_t *memory_governor
+            = wl_columnar_memory_governor_ref_get(governor);
+#ifdef WL_TEST_LFTJ_ADMISSION_HOOKS
+        if (lftj_test_hook_state.deny_inner_pending) {
+            uint64_t reserved = wl_columnar_memory_reserved(memory_governor);
+            uint64_t previous = atomic_load_explicit(
+                &memory_governor->usable_bytes, memory_order_relaxed);
+            uint64_t limited = 0;
+            lftj_test_hook_state.deny_inner_pending = false;
+            lftj_test_hook_state.deny_inner_consumed = true;
+            lftj_test_hook_state.previous_usable_bytes = previous;
+            lftj_test_hook_state.reserved_before_inner = reserved;
+            if (!wl_columnar_memory_size_add(reserved,
+                scratch_bytes - 1u, &limited)) {
+                lftj_test_hook_state.limited_usable_bytes = previous;
+            } else {
+                lftj_test_hook_state.limited_usable_bytes = limited;
+                atomic_store_explicit(&memory_governor->usable_bytes,
+                    limited, memory_order_relaxed);
+            }
+        }
+#endif
         wl_columnar_memory_admission_status_t status
-            = wl_columnar_memory_reserve_checked(
-                wl_columnar_memory_governor_ref_get(governor), scratch_bytes,
-                &reservation);
+            = wl_columnar_memory_reserve_checked(memory_governor,
+                scratch_bytes, &reservation);
+#ifdef WL_TEST_LFTJ_ADMISSION_HOOKS
+        if (lftj_test_hook_state.deny_inner_consumed)
+            lftj_test_hook_state.inner_status = status;
+#endif
         if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
-            return status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
-                ? EOVERFLOW : ENOMEM;
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
+                : EINVAL;
     }
 
     /* Allocate and sort per-relation iterators. */
-    lftj_iter_t *iters = (lftj_iter_t *)calloc(k, sizeof(lftj_iter_t));
-    if (!iters)
-        return ENOMEM;
-
     int rc = 0;
+    lftj_iter_t *iters = NULL;
+#ifdef WL_TEST_LFTJ_ADMISSION_HOOKS
+    if (lftj_test_hook_state.fail_iters_pending) {
+        lftj_test_hook_state.fail_iters_pending = false;
+        lftj_test_hook_state.fail_iters_consumed = true;
+    } else
+#endif
+    iters = (lftj_iter_t *)calloc(k, sizeof(lftj_iter_t));
+    if (!iters) {
+        rc = ENOMEM;
+        goto cleanup;
+    }
+
     for (uint32_t i = 0; i < k; i++) {
         if (key_type == WIRELOG_TYPE_FLOAT) {
             for (uint32_t row = 0; row < inputs[i].nrows; row++) {
@@ -410,8 +483,10 @@ done:
     }
 
 cleanup:
-    for (uint32_t i = 0; i < k; i++)
-        lftj_iter_free(&iters[i]);
+    if (iters) {
+        for (uint32_t i = 0; i < k; i++)
+            lftj_iter_free(&iters[i]);
+    }
     free(iters);
     wl_columnar_memory_release(&reservation);
     return rc;

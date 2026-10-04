@@ -24,12 +24,27 @@
 
 #include "../wirelog/columnar/lftj.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static wl_columnar_memory_governor_ref_t *
+test_governor(uint64_t usable_bytes)
+{
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = usable_bytes,
+        .headroom_bytes = 0,
+        .usable_bytes = usable_bytes,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+        .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+        .status = WL_COLUMNAR_MEMORY_OK,
+    };
+    return wl_columnar_memory_governor_ref_create(&resolution);
+}
 
 /* ----------------------------------------------------------------
  * Test framework
@@ -801,6 +816,104 @@ test_integer_negative_key_order(void)
     PASS();
 }
 
+static void
+test_governed_denial_and_retry(void)
+{
+    TEST("governed workspace denial returns ENOSPC and permits retry");
+    int64_t left[] = { 1 };
+    int64_t right[] = { 1 };
+    wl_lftj_input_t inputs[2] = {
+        { left, 1, 1, 0 },
+        { right, 1, 1, 0 },
+    };
+    wl_columnar_memory_governor_ref_t *ref = test_governor(1);
+    const char *failure = NULL;
+    int64_t count = 0;
+    int rc;
+
+    if (!ref) {
+        failure = "governor creation failed";
+        goto cleanup;
+    }
+    rc = wl_columnar_lftj_join_typed_governed(inputs, WIRELOG_TYPE_INT64,
+            2, count_cb, &count, ref);
+    if (rc != ENOSPC || count != 0
+        || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != 0) {
+        failure = "denial did not return ENOSPC without retaining bytes";
+        goto cleanup;
+    }
+    atomic_store_explicit(
+        &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
+        UINT64_C(1) << 20, memory_order_relaxed);
+    rc = wl_columnar_lftj_join_typed_governed(inputs, WIRELOG_TYPE_INT64,
+            2, count_cb, &count, ref);
+    if (rc != 0 || count != 1
+        || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != 0) {
+        failure = "successful retry did not release workspace";
+        goto cleanup;
+    }
+
+cleanup:
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+    if (failure)
+        FAIL(failure);
+    PASS();
+}
+
+static void
+test_iters_allocation_failure_rollback(void)
+{
+    TEST("iterator allocation failure rolls back admitted workspace");
+    int64_t left[] = { 1 };
+    int64_t right[] = { 1 };
+    wl_lftj_input_t inputs[2] = {
+        { left, 1, 1, 0 },
+        { right, 1, 1, 0 },
+    };
+    wl_columnar_memory_governor_ref_t *ref = test_governor(UINT64_C(1) << 20);
+    const char *failure = NULL;
+    wl_columnar_lftj_test_hook_state_t hook_state = {0};
+    int64_t count = 0;
+    int rc;
+
+    if (!ref) {
+        failure = "governor creation failed";
+        goto cleanup;
+    }
+    wl_columnar_lftj_test_clear_hooks();
+    wl_columnar_lftj_test_fail_next_iters_alloc();
+    rc = wl_columnar_lftj_join_typed_governed(inputs, WIRELOG_TYPE_INT64,
+            2, count_cb, &count, ref);
+    wl_columnar_lftj_test_get_hook_state(&hook_state);
+    if (rc != ENOMEM || count != 0 || !hook_state.fail_iters_consumed
+        || hook_state.fail_iters_pending
+        || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != 0) {
+        failure = "injected failure did not roll back reservation";
+        goto cleanup;
+    }
+    count = 0;
+    rc = wl_columnar_lftj_join_typed_governed(inputs, WIRELOG_TYPE_INT64,
+            2, count_cb, &count, ref);
+    if (rc != 0 || count != 1
+        || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != 0) {
+        failure = "retry after allocation failure did not succeed cleanly";
+        goto cleanup;
+    }
+
+cleanup:
+    wl_columnar_lftj_test_clear_hooks();
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+    if (failure)
+        FAIL(failure);
+    PASS();
+}
+
 /* ================================================================
  * main
  * ================================================================ */
@@ -827,6 +940,8 @@ main(void)
     test_einval_k_too_large();
     test_float_key_semantics();
     test_integer_negative_key_order();
+    test_governed_denial_and_retry();
+    test_iters_allocation_failure_rollback();
 
     printf("\nResults: %d/%d passed", pass_count, test_count);
     if (fail_count > 0)

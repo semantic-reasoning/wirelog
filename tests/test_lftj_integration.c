@@ -14,6 +14,8 @@
 
 #include "../wirelog/backend.h"
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/columnar/lftj.h"
+#include "../wirelog/columnar/memory_governor.h"
 #include "../wirelog/exec_plan.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/passes/fusion.h"
@@ -24,6 +26,7 @@
 #include "../wirelog/wirelog-parser.h"
 #include "../wirelog/wirelog.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -205,6 +208,20 @@ count_lftj_ops(const wl_plan_t *plan)
         }
     }
     return n;
+}
+
+static wl_columnar_memory_governor_ref_t *
+test_governor(uint64_t usable_bytes)
+{
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = usable_bytes,
+        .headroom_bytes = 0,
+        .usable_bytes = usable_bytes,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+        .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+        .status = WL_COLUMNAR_MEMORY_OK,
+    };
+    return wl_columnar_memory_governor_ref_create(&resolution);
 }
 
 /* ----------------------------------------------------------------
@@ -453,6 +470,186 @@ test_lftj_stack_overflow_releases_output(void)
     PASS();
 }
 
+static void
+test_lftj_inner_denial_propagates_and_retries(void)
+{
+    TEST("inner LFTJ denial restores state and permits retry");
+    const char *src = ".decl r1(x: int32, a: int32)\n"
+        ".decl r2(x: int32, b: int32)\n"
+        ".decl r3(x: int32, c: int32)\n"
+        ".decl out(x: int32, a: int32, b: int32, c: int32)\n"
+        "r1(1, 10). r2(1, 100). r3(1, 1000).\n"
+        "out(x, a, b, c) :- r1(x, a), r2(x, b), r3(x, c).\n";
+    wirelog_program_t *prog = NULL;
+    wl_plan_t *plan = NULL;
+    wl_session_t *session = NULL;
+    wl_columnar_memory_governor_ref_t *ref
+        = test_governor(UINT64_C(1) << 30);
+    wl_session_options_t options;
+    eval_stack_t stack;
+    bool stack_initialized = false;
+    wl_columnar_lftj_test_hook_state_t hook_state = {0};
+    wl_col_session_t *columnar = NULL;
+    const wl_plan_op_t *lftj_op = NULL;
+    const char *failure = NULL;
+    uint64_t baseline_reserved = 0;
+    uint64_t original_usable = UINT64_C(1) << 30;
+    int64_t expected_row[16] = { 0 };
+    uint32_t expected_ncols = 0;
+    int rc;
+
+    wl_columnar_lftj_test_clear_hooks();
+    if (!ref) {
+        failure = "governor creation failed";
+        goto cleanup;
+    }
+    if (make_plan_no_opt(src, &plan, &prog) != 0) {
+        failure = "plan creation failed";
+        goto cleanup;
+    }
+    wl_session_options_init(&options);
+    options.memory_governor = ref;
+    if (wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session) != 0 || !session) {
+        failure = "session creation failed";
+        goto cleanup;
+    }
+    if (wl_session_load_facts(session, prog) != 0) {
+        failure = "loading EDB facts failed";
+        goto cleanup;
+    }
+    for (uint32_t s = 0; s < plan->stratum_count && !lftj_op; s++) {
+        const wl_plan_stratum_t *stratum = &plan->strata[s];
+        for (uint32_t r = 0; r < stratum->relation_count && !lftj_op; r++) {
+            const wl_plan_relation_t *relation = &stratum->relations[r];
+            for (uint32_t o = 0; o < relation->op_count; o++) {
+                if (relation->ops[o].op == WL_PLAN_OP_LFTJ) {
+                    lftj_op = &relation->ops[o];
+                    break;
+                }
+            }
+        }
+    }
+    if (!lftj_op) {
+        failure = "plan has no LFTJ operation";
+        goto cleanup;
+    }
+    columnar = COL_SESSION(session);
+    original_usable = atomic_load_explicit(
+        &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
+        memory_order_relaxed);
+    eval_stack_init(&stack);
+    stack_initialized = true;
+
+    /* First execution creates and retains sorted arrangements. */
+    rc = col_op_lftj(lftj_op, &stack, columnar);
+    if (rc != 0 || stack.top != 1 || !stack.items[0].rel
+        || stack.items[0].rel->nrows != 1) {
+        failure = "LFTJ warmup did not produce the expected row";
+        goto cleanup;
+    }
+    expected_ncols = stack.items[0].rel->ncols;
+    if (expected_ncols > sizeof(expected_row) / sizeof(expected_row[0])) {
+        failure = "LFTJ warmup produced an unexpected schema width";
+        goto cleanup;
+    }
+    for (uint32_t col = 0; col < expected_ncols; col++)
+        expected_row[col] = stack.items[0].rel->columns[col][0];
+    eval_stack_drain(&stack);
+    baseline_reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+    if (columnar->sarr_active_pins != 0 || baseline_reserved == 0
+        || columnar->sarr_count < 3) {
+        failure = "warm sorted arrangements did not reach a stable baseline";
+        goto cleanup;
+    }
+
+    columnar->memory_budget_denied = false;
+    wl_columnar_lftj_test_deny_next_inner_admission();
+    rc = col_op_lftj(lftj_op, &stack, columnar);
+    wl_columnar_lftj_test_get_hook_state(&hook_state);
+    if (hook_state.deny_inner_consumed) {
+        atomic_store_explicit(
+            &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
+            hook_state.previous_usable_bytes, memory_order_relaxed);
+    }
+    if (!hook_state.deny_inner_consumed
+        || hook_state.inner_status != WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+        || hook_state.reserved_before_inner <= baseline_reserved
+        || rc != ENOSPC || !columnar->memory_budget_denied || stack.top != 0) {
+        failure = "operator did not propagate a real inner-admission denial";
+        goto cleanup;
+    }
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != baseline_reserved) {
+        failure = "inner denial leaked temporary reservation bytes";
+        goto cleanup;
+    }
+    if (columnar->sarr_active_pins != 0) {
+        failure = "inner denial leaked an arrangement probe";
+        goto cleanup;
+    }
+    for (uint32_t i = 0; i < columnar->sarr_count; i++) {
+        if (columnar->sarr_entries[i].sarr.pin_count != 0) {
+            failure = "inner denial left a sorted arrangement pinned";
+            goto cleanup;
+        }
+    }
+    for (uint32_t i = 0; i < 3; i++) {
+        static const char *const names[] = { "r1", "r2", "r3" };
+        col_rel_t *rel = session_find_rel(columnar, names[i]);
+        if (!rel || wl_columnar_source_access_gate_busy(&rel->source_access)) {
+            failure = "inner denial leaked an input source reader";
+            goto cleanup;
+        }
+    }
+
+    wl_columnar_lftj_test_clear_hooks();
+    columnar->memory_budget_denied = false;
+    rc = col_op_lftj(lftj_op, &stack, columnar);
+    if (rc != 0 || columnar->memory_budget_denied || stack.top != 1
+        || !stack.items[0].rel || stack.items[0].rel->nrows != 1
+        || stack.items[0].rel->ncols != expected_ncols) {
+        failure = "LFTJ retry did not publish the expected row";
+        goto cleanup;
+    }
+    for (uint32_t col = 0; col < expected_ncols; col++) {
+        if (stack.items[0].rel->columns[col][0] != expected_row[col]) {
+            failure = "LFTJ retry row differs from successful warmup";
+            goto cleanup;
+        }
+    }
+    eval_stack_drain(&stack);
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != baseline_reserved) {
+        failure = "successful retry did not release output reservation";
+        goto cleanup;
+    }
+
+cleanup:
+    wl_columnar_lftj_test_clear_hooks();
+    if (columnar && ref) {
+        atomic_store_explicit(
+            &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
+            original_usable,
+            memory_order_relaxed);
+        columnar->memory_budget_denied = false;
+    }
+    if (stack_initialized)
+        eval_stack_drain(&stack);
+    if (session)
+        wl_session_destroy(session);
+    if (plan)
+        wl_plan_free(plan);
+    if (prog)
+        wirelog_program_free(prog);
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+    if (failure)
+        FAIL(failure);
+    PASS();
+}
+
 /* Test 5: IDB relation in chain prevents LFTJ rewrite. */
 static void
 test_idb_not_rewritten(void)
@@ -662,6 +859,7 @@ main(void)
     test_4way_join_result();
     test_idb_not_rewritten();
     test_lftj_stack_overflow_releases_output();
+    test_lftj_inner_denial_propagates_and_retries();
     test_tdd_lftj_metadata_is_conservative();
 
     printf("\nResults: %d/%d passed", pass_count, test_count);

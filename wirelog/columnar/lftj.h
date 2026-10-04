@@ -105,10 +105,36 @@ wl_columnar_lftj_join_typed(const wl_lftj_input_t *inputs,
     wirelog_column_type_t key_type, uint32_t k,
     wl_lftj_result_fn cb, void *user);
 
+/* Internal governed form. Returns ENOSPC when the governor denies temporary
+ * workspace, EOVERFLOW for workspace-size overflow, EINVAL for invalid
+ * admission state, and ENOMEM for allocator failure. */
 int
 wl_columnar_lftj_join_typed_governed(const wl_lftj_input_t *inputs,
     wirelog_column_type_t key_type, uint32_t k,
     wl_lftj_result_fn cb, void *user,
     wl_columnar_memory_governor_ref_t *governor);
+
+#ifdef WL_TEST_LFTJ_ADMISSION_HOOKS
+typedef struct {
+    bool fail_iters_pending;
+    bool fail_iters_consumed;
+    bool deny_inner_pending;
+    bool deny_inner_consumed;
+    uint64_t previous_usable_bytes;
+    uint64_t limited_usable_bytes;
+    uint64_t reserved_before_inner;
+    wl_columnar_memory_admission_status_t inner_status;
+} wl_columnar_lftj_test_hook_state_t;
+
+void
+wl_columnar_lftj_test_fail_next_iters_alloc(void);
+void
+wl_columnar_lftj_test_deny_next_inner_admission(void);
+void
+wl_columnar_lftj_test_get_hook_state(
+    wl_columnar_lftj_test_hook_state_t *out);
+void
+wl_columnar_lftj_test_clear_hooks(void);
+#endif
 
 #endif /* WL_COLUMNAR_LFTJ_H */
