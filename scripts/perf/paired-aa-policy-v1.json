@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "policy_id": "protected-main-aa-noise-v1",
+  "source_plan": {
+    "commit": "83a1e047accf615dac17a20637c8ade9c0da48b1",
+    "path": "docs/benchmarks/2026-10-04-flowlog-attribution/plan.json",
+    "sha256": "2dca39eb45290ffbb8ea949f4e55d52e37a20c838ce7e049a1fd2aee4338ffbd"
+  },
+  "same_binary": true,
+  "bootstrap": {
+    "resamples": 10000,
+    "seed": 1361,
+    "max_abs_median_log_ratio": 0.02,
+    "max_ci_half_width": 0.05,
+    "percentile_indices": [249, 9749],
+    "rng": "sha256-counter-rejection-v1"
+  },
+  "host_eligibility": {
+    "cpu_psi_some_avg10_max_percent": 1.0,
+    "cpu_psi_full_avg10_max_percent": 0.1,
+    "memory_psi_full_avg10_max_percent": 0.1,
+    "machine_id_and_governor_must_match": true,
+    "require_no_swap_delta": true,
+    "require_no_cgroup_throttle_delta": true,
+    "missing_telemetry": "inconclusive",
+    "wide_confidence_interval": "inconclusive"
+  },
+  "campaign": {
+    "mode": "aa_control",
+    "workloads": ["crdt", "cspa-fast"],
+    "attempts": 80,
+    "sample_pairs_per_order_per_workload": 9,
+    "same_source_build_and_logs": true
+  }
+}

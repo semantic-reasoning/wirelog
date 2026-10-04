@@ -17,10 +17,12 @@ keys and NaN/Infinity constants are rejected by the CLI.
 Required fields: `schema_version` (integer 1), nonempty `campaign_id` string,
 `campaign_mode`, `manifest`, `blocks`, and `attempts`.
 `campaign_mode` is exactly `comparison` or `aa_control`. Comparison requires
-different source SHAs; A/A requires equal source SHAs. Both require distinct
-nonempty build instance IDs. Equal binary hashes are allowed. Provenance is
-recorded evidence, not proof that builds were independently executed; the next
-collector unit must retain separate build logs.
+different source SHAs; A/A requires equal source SHAs. Comparison requires
+distinct nonempty build instance IDs. A/A may use one shared build instance
+only when source, profile, build-log digest, and every workload binary digest
+match. A/A with separate build instances remains structurally valid for
+descriptive collection but cannot pass the protected-main noise qualification.
+Provenance records evidence and does not prove how a build was executed.
 
 `manifest` has exactly these fields:
 
@@ -113,7 +115,8 @@ report does not estimate confidence intervals or validate a speedup claim.
 
 New collector fields: campaign mode/ID, block IDs, immutable manifest digest on
 every attempt, full resolved profile for both sides, host identity, timer ID and
-scope, distinct build instance IDs and separate build log digests/provenance.
+scope, and build instance IDs/log digests that satisfy the selected mode's
+provenance contract.
 Old raw stdout/stderr, commands, binary paths, data roots and host timestamps can
 remain in companion raw artifacts; they are not accepted as extra v1 fields.
 Malformed/failed process outputs that cannot supply valid timings/correctness
@@ -135,15 +138,19 @@ python scripts/perf/paired-benchmark.py v1 \
   --cpu 2 --timeout 180 --out-dir /evidence/new-campaign
 ```
 
-Use `--mode aa_control` for equal source SHAs and independent builds. Separate
-build log paths and different log hashes are required; originals are copied
-into the evidence directory. Builds must expose Meson introspection files.
+Use `--mode aa_control` for equal source SHAs. Descriptive A/A may use separate
+builds; pass `--qualify-aa` only when both labels resolve to the exact same
+physical source, build, and build-log paths. Qualification prechecks equal
+binary hashes before any launch. Originals are copied into the evidence
+directory. Builds must expose Meson introspection files.
 Preflight resolves all build options, checks compiler/profile/fixture and
 benchmark timer source equality, and records exact commit/tree IDs and artifact
 hashes in `preflight.json`. Bool, list, string and integer options use compact
-JSON strings in the v1 profile. Build IDs identify distinct collection-side
-instances; logs and recorded provenance remain evidence, not proof of an
-independent build execution.
+JSON strings in the v1 profile. Comparison campaigns identify distinct
+collection-side build instances. Qualified A/A requires both sides to use the
+same shared build identity and physical source, build, and build-log paths.
+Logs and recorded provenance remain evidence, not proof of an independent
+build execution.
 
 The entire fixed AB then BA schedule is durable before the first launch. Each
 block and workload has two warmup launches followed by nine adjacent pairs:
@@ -212,9 +219,10 @@ historical `bench_flowlog` CRDT samples are incompatible. Candidate always
 means the fetched protected-main tip.
 
 For `campaign_mode=aa_control`, leave `base_sha` empty. The weekly Monday
-schedule also selects A/A at current main. Equal source SHAs are checked out
-and built independently in separate worktrees with distinct provenance-bearing
-logs. Both sides compile `bench_flowlog`, `test_crdt_perf_gate`, and
+schedule also selects A/A at current main. Equal source SHAs use one worktree,
+one build directory, and one completed build log for both labels. Both sides
+refer to the same resulting build instance. The workflow compiles
+`bench_flowlog`, `test_crdt_perf_gate`, and
 `test_cspa_perf_gate` for preflight hashing; only `bench_flowlog` (CSPA) and
 `test_crdt_perf_gate` (CRDT) execute during the collector's fixed 80-launch
 AB then BA schedule. CPU selection uses the process's available affinity and
@@ -225,8 +233,9 @@ The `perf-paired-v1-<run>-<attempt>` artifact retains the whole evidence root
 for 35 days, including dispatch and trusted-revision provenance, affinity,
 separate configure/build logs and complete side logs. Under `campaign/`, when
 produced, it includes `preflight.json`, copied build logs,
-`raw-attempts.jsonl`, `campaign-v1.json`, `evaluation-report.json`, and
-`collection-status.json`. Upload and status summary always run; rejected or
+`raw-attempts.jsonl`, `aa-attempt-links.jsonl`, `campaign-v1.json`,
+`evaluation-report.json`, `collection-status.json`, and the separate
+`aa-qualification-v1.json` report for A/A. Upload and status summary always run; rejected or
 interrupted runs preserve partial evidence. Collector statuses remain
 `COMPLETE_VALID`, `CORRECTNESS_FAILURE`, `INVALID_EVIDENCE`, and `INCOMPLETE`;
 invalid or incomplete collection may fail the job without a timing verdict.
@@ -238,8 +247,18 @@ A scheduled A/A campaign measures runner and control stability. It cannot
 establish a candidate speedup or regression. All timing statistics remain
 descriptive and this workflow does not replace any required perf gate.
 
-The integration is reviewed stacked on #2035; merge and dispatch must wait
-for that collector to reach protected main. After replaying this integration
-onto the exact collector merge result and rerunning static validation, a
-protected-main A/A smoke campaign must verify 80 launches, artifact/status,
+For A/A runs, `qualify-paired-aa.py` independently validates the frozen policy
+snapshot, exact raw-line hashes and schedule, shared executable identity,
+correctness results, host pressure, affinity, swap, and cgroup throttle
+counters. Its deterministic order-stratified bootstrap reports a noise-control
+status only. `PASS` means both measured workloads met the frozen A/A noise
+criteria on an eligible host; `FAIL` records a valid binary mismatch,
+correctness failure, or noise-floor breach; `INCONCLUSIVE` means the evidence,
+host, or interval cannot support that qualification. This does not qualify the
+48-row FlowLog attribution portfolio or make timing a required gate.
+
+The collector prerequisite #2035 is merged on protected main at
+`044dddc3da56757fa2d188d47875ea8e186ac6b1`. This integration is based on that
+collector. After this change reaches protected main, a protected-main A/A
+smoke campaign must verify 80 launches, qualification output, artifact/status,
 summary, and cleanup. Static checks alone do not establish hosted execution.
