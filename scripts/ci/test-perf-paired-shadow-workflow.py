@@ -14,6 +14,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / '.github/workflows/perf-paired-diagnostic.yml'
 MINIMUM = 'c6e263d492828d1208fa11005c18d19b05342233'
+TEST_TMP = Path.home() / '.cache' / 'wirelog-test-tmp'
+TEST_TMP.mkdir(parents=True, exist_ok=True)
 
 
 def steps(text):
@@ -41,13 +43,14 @@ def validate(text):
     triggers = text.split('\non:\n', 1)[1].split('\npermissions:', 1)[0]
     assert re.findall(r'^  ([a-z_]+):', triggers, re.M) == ['workflow_dispatch', 'schedule']
     assert re.findall(r'^      ([a-z_]+):', triggers, re.M) == ['campaign_mode', 'base_sha']
-    require(triggers, ['required: false', '- comparison', '- aa_control'])
+    require(triggers, ['required: false', '- comparison', '- aa_control', '- issue_1913'])
     assert text.split('\npermissions:\n', 1)[1].split('\nconcurrency:', 1)[0].strip() == 'contents: read'
     assert not re.search(r'secrets\.|pull_request|pull_request_target|workflow_run|workflow_call|\benvironment:|^\s+push:', text, re.M)
     require(text, ['name: Paired Campaign V1 Shadow', 'name: Campaign v1 shadow evidence',
                    "if: github.ref == 'refs/heads/main' && github.repository == 'semantic-reasoning/wirelog'",
                    'group: wirelog-paired-perf-diagnostic', 'cancel-in-progress: false',
-                   'runs-on: [self-hosted, Linux, X64, wirelog-perf]', 'MINIMUM_SHA: ' + MINIMUM])
+                   'runs-on: [self-hosted, Linux, X64, wirelog-perf]', 'MINIMUM_SHA: ' + MINIMUM,
+                   'CANONICAL_REPOSITORY: https://github.com/semantic-reasoning/wirelog.git'])
     assert int(re.search(r'timeout-minutes: (\d+)', text)[1]) >= 300
     assert re.findall(r'^    if: (.*)$', text, re.M) == ["github.ref == 'refs/heads/main' && github.repository == 'semantic-reasoning/wirelog'"]
     external = re.findall(r'uses: (?!\./)(\S+)', text)
@@ -71,6 +74,7 @@ def validate(text):
         'for revision in "$base_sha" "$candidate_sha"; do',
         'test "${#revision}" -eq 40',
         'case "$revision" in\n              *[!0123456789abcdef]*) exit 1 ;;\n            esac',
+        'if [[ "$mode" != issue_1913 ]]; then',
         'git cat-file -e "$revision^{commit}"',
         'git merge-base --is-ancestor "$MINIMUM_SHA" "$revision"',
         'git merge-base --is-ancestor "$revision" "$main_sha"',
@@ -85,17 +89,33 @@ def validate(text):
                            'mode="$REQUESTED_MODE"', 'case "$mode" in',
                            'base_sha="$REQUESTED_BASE"', 'test -n "$base_sha"',
                            'test "$base_sha" != "$candidate_sha"', 'test -z "$REQUESTED_BASE"',
+                           'issue_1913)', 'base_sha="$ISSUE1913_BASE_SHA"',
+                           'candidate_sha="$ISSUE1913_CANDIDATE_SHA"',
+                           'issue_1913)\n                test -z "$REQUESTED_BASE"',
                            '*) exit 1 ;;'])
     assert 'if:' not in validate_step and 'continue-on-error' not in validate_step
     # Only pinned checkout and plain evidence initialization precede validation.
     assert all_steps[1].startswith('name: Initialize durable evidence\n')
     assert all_steps[2] == validate_step
+    assert all_steps[3].startswith('name: Install build dependencies\n')
+    assert all_steps[4].startswith('name: Set up Meson 1.12.0\n')
+    python_environment = named(text, 'Create HOME-contained Python environment')
+    require(python_environment, ['uv venv --system-site-packages', 'home_real="$(realpath -e "$HOME")"',
+                                'wirelog-perf-python-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT'])
+    materialize = named(text, 'Fetch and materialize pinned #1913 sources')
+    require(materialize, ["if: env.CAMPAIGN_MODE == 'issue_1913'", 'git -C "$repo" fetch --no-tags canonical',
+                          'ISSUE1913_BASE_SHA', 'ISSUE1913_CANDIDATE_SHA',
+                          'ISSUE1913_PROBE_SOURCE_SHA', 'ISSUE1913_PROBE_BLOB',
+                          '"$ISSUE1913_PROBE_SOURCE_SHA:tests/test_crdt_perf_gate.c"',
+                          '"$ISSUE1913_PROBE_BLOB")" = blob',
+                          'materialize-1913-diagnostic.py',
+                          'SOURCE_REPO=%s', 'PAIR_ROOT=%s'])
+    assert all_steps.index(materialize) < all_steps.index(named(text, 'Create independent worktrees'))
     assert not re.search(r'uses:|meson|python|worktree|sudo|uv ', all_steps[1] + validate_step)
     trees = named(text, 'Create independent worktrees')
-    assert all_steps[3] == trees
-    require(trees, ['test ! -e "$pair_root"',
-                    'git worktree add --detach "$pair_root/base" "$BASE_SHA"',
-                    'git worktree add --detach "$pair_root/candidate" "$CANDIDATE_SHA"',
+    require(trees, ['if [[ "$CAMPAIGN_MODE" == issue_1913 ]]',
+                    'git -C "$source_repo" worktree add --detach "$pair_root/base" "$base_revision"',
+                    'git -C "$source_repo" worktree add --detach "$pair_root/candidate" "$CANDIDATE_SHA"',
                     'BASE_BUILD=%s/base-build', 'CANDIDATE_BUILD=%s/candidate-build'])
     cpu = named(text, 'Select available CPU')
     require(cpu, ['min(os.sched_getaffinity(0))', 'CAMPAIGN_CPU=%s', 'affinity.txt'])
@@ -110,7 +130,9 @@ def validate(text):
                     '$side-configure.log', '$side-build.log', '$side-complete-build.log'])
     collect = named(text, 'Collect campaign v1')
     require(collect, ['set -euo pipefail', 'python scripts/perf/paired-benchmark.py v1',
-                      '--mode "$CAMPAIGN_MODE" --base-sha "$BASE_SHA" --candidate-sha "$CANDIDATE_SHA"',
+                      'if [[ "$collector_mode" == issue_1913 ]]; then',
+                      'collector_mode=comparison',
+                      '--mode "$collector_mode" --base-sha "$BASE_SHA" --candidate-sha "$CANDIDATE_SHA"',
                       '--base-source "$BASE_SRC" --candidate-source "$CANDIDATE_SRC"',
                       '--base-build "$BASE_BUILD" --candidate-build "$CANDIDATE_BUILD"',
                       '--base-build-log "$BASE_BUILD_LOG"',
@@ -119,12 +141,16 @@ def validate(text):
     assert '--first' not in collect and '--base-binary' not in collect
     command = shell(collect).replace('\\\n', '').split()
     expected = '''set -euo pipefail
+collector_mode="$CAMPAIGN_MODE"
+if [[ "$collector_mode" == issue_1913 ]]; then
+collector_mode=comparison
+fi
 aa_option=()
-if [[ "$CAMPAIGN_MODE" == aa_control ]]; then
+if [[ "$collector_mode" == aa_control ]]; then
 aa_option+=(--qualify-aa)
 fi
 python scripts/perf/paired-benchmark.py v1
---mode "$CAMPAIGN_MODE" --base-sha "$BASE_SHA" --candidate-sha "$CANDIDATE_SHA"
+--mode "$collector_mode" --base-sha "$BASE_SHA" --candidate-sha "$CANDIDATE_SHA"
 --base-source "$BASE_SRC" --candidate-source "$CANDIDATE_SRC"
 --base-build "$BASE_BUILD" --candidate-build "$CANDIDATE_BUILD"
 --base-build-log "$BASE_BUILD_LOG"
@@ -141,22 +167,33 @@ python scripts/perf/paired-benchmark.py v1
                      'retention-days: 35', 'perf-paired-v1-${{ github.run_id }}-${{ github.run_attempt }}'])
     summary = named(text, 'Summarize diagnostic status')
     require(summary, ['if: always()', 'CAMPAIGN_MODE', 'BASE_SHA', 'CANDIDATE_SHA',
-                      'collection-status.json', 'descriptive', 'required perf gate'])
+                      'collection-status.json', 'descriptive', 'required perf gate',
+                      'CSPA bench_flowlog repeat=1 is descriptive and is not cspa_w1_gate or its 2050ms target.'])
     qualification = named(text, 'Qualify A/A noise and host control')
     require(qualification, ["if: always() && env.CAMPAIGN_MODE == 'aa_control'",
                            'continue-on-error: true', 'scripts/perf/qualify-paired-aa.py',
                            'aa-qualification-v1.json'])
     assert (ROOT / 'scripts/perf/qualify-paired-aa.py').is_file()
     cleanup = named(text, 'Clean independent worktrees and builds')
-    assert all_steps[-4:] == [qualification, upload, summary, cleanup]
+    provenance = named(text, 'Validate complete #1913 source and campaign provenance')
+    require(provenance, ["if: always() && env.CAMPAIGN_MODE == 'issue_1913'",
+                         'validate-1913-diagnostic.py', '--materialization-dir', '--evidence-dir',
+                         '--output perf-artifacts/paired/issue-1913-validation.json'])
+    assert all_steps[-5:] == [qualification, provenance, upload, summary, cleanup]
     require(cleanup, ['if: always()', 'set -euo pipefail',
                       '[[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]', '[[ "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]',
+                      'campaign_mode="${CAMPAIGN_MODE:-${REQUESTED_MODE:-unresolved}}"',
+                      'if [[ "$campaign_mode" == issue_1913 ]]; then',
+                      'home_real="$(realpath -e "$HOME")"',
+                      'wirelog-1913-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT',
+                      'wirelog-perf-owned', 'git -C "$source_repo" worktree remove --force',
+                      "source_repo=''", '[[ -n "$source_repo" && -e "$source_repo/.git" ]]',
                       'test -n "$RUNNER_TEMP"', 'test "$RUNNER_TEMP" != /',
                       'pair_root="$RUNNER_TEMP/wirelog-paired-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"',
                       'test "$(realpath -m "$pair_root")" = "$(realpath -m "$RUNNER_TEMP")/wirelog-paired-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"',
-                      'for side in base candidate; do', 'git worktree remove --force "$pair_root/$side"',
-                      'git worktree prune', 'rm -rf -- "$pair_root"'])
-    assert cleanup.index('rm -rf') < cleanup.index('git worktree prune')
+                      'for side in base candidate; do', 'git -C "$source_repo" worktree prune',
+                      'rm -rf -- "$pair_root"', 'wirelog-perf-python-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT'])
+    assert cleanup.index('rm -rf') < cleanup.index('worktree prune')
     if os.name != 'nt':
         for item in all_steps:
             if 'run: |' in item and 'shell: bash' in item:
@@ -183,9 +220,19 @@ class ShadowContract(unittest.TestCase):
                          'git cat-file -e "$revision^{commit}"',
                          'git show "$revision:tests/test_crdt_perf_gate.c"',
                          'persist-credentials: false', 'if: always()',
-                         'min(os.sched_getaffinity(0))', 'git worktree remove --force',
-                         'git worktree prune', 'test -z "$REQUESTED_BASE"']:
+                         'min(os.sched_getaffinity(0))',
+                         'git -C "$source_repo" worktree remove --force',
+                         'git -C "$source_repo" worktree prune',
+                         'issue_1913)\n                test -z "$REQUESTED_BASE"']:
             with self.subTest(fragment=fragment), self.assertRaises((AssertionError, ValueError)):
+                validate(self.text.replace(fragment, '# removed', 1))
+        for fragment in ['CANONICAL_REPOSITORY: https://github.com/semantic-reasoning/wirelog.git',
+                         '"$ISSUE1913_PROBE_SOURCE_SHA:tests/test_crdt_perf_gate.c"',
+                         '"$ISSUE1913_PROBE_BLOB")" = blob',
+                         "if: always() && env.CAMPAIGN_MODE == 'issue_1913'",
+                         '--output perf-artifacts/paired/issue-1913-validation.json',
+                         'CSPA bench_flowlog repeat=1 is descriptive and is not cspa_w1_gate or its 2050ms target.']:
+            with self.subTest(fragment=fragment), self.assertRaises(AssertionError):
                 validate(self.text.replace(fragment, '# removed', 1))
         for before, after in [('timeout-minutes: 360', 'timeout-minutes: 150'),
                               ('actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09', 'actions/checkout@v5')]:
@@ -199,7 +246,7 @@ class ShadowContract(unittest.TestCase):
     @unittest.skipIf(os.name == 'nt', 'Executable Bash fixtures require a POSIX host; Windows bash may be a WSL stub')
     def test_actual_cleanup_shell(self):
         script = shell(named(self.text, 'Clean independent worktrees and builds'))
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as directory:
             root = Path(directory)
             git = root / 'git'
             git.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$CLEANUP_CALLS"\n[[ "$*" != *"/base" ]]\n', encoding='utf-8')
@@ -207,10 +254,14 @@ class ShadowContract(unittest.TestCase):
             run_root = root / 'wirelog-paired-123-2'
             for path in ['base', 'candidate', 'base-build', 'candidate-build']:
                 (run_root / path).mkdir(parents=True)
+            (run_root / '.wirelog-perf-owned').write_text('123/2\n', encoding='utf-8')
+            workspace = root / 'workspace'
+            (workspace / '.git').mkdir(parents=True)
             unrelated = root / 'keep'
             unrelated.mkdir()
             env = dict(os.environ, PATH=str(root) + ':' + os.environ['PATH'],
                        RUNNER_TEMP=str(root), GITHUB_RUN_ID='123', GITHUB_RUN_ATTEMPT='2',
+                       GITHUB_WORKSPACE=str(workspace), CAMPAIGN_MODE='comparison',
                        CLEANUP_CALLS=str(root / 'calls'))
             result = subprocess.run(['bash'], input=script, text=True, encoding='utf-8', cwd=root, env=env, capture_output=True)
             self.assertNotEqual(result.returncode, 0)  # First removal failed.
@@ -229,11 +280,78 @@ class ShadowContract(unittest.TestCase):
             self.assertFalse((root / 'calls').exists())
 
     @unittest.skipIf(os.name == 'nt', 'Executable Bash fixtures require a POSIX host; Windows bash may be a WSL stub')
+    def test_actual_issue1913_cleanup_uses_owned_home_roots(self):
+        script = shell(named(self.text, 'Clean independent worktrees and builds'))
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as directory:
+            root = Path(directory)
+            home = root / 'home'
+            cache = home / '.cache'
+            pair_root = cache / 'wirelog-1913-123-2'
+            source_repo = pair_root / 'repository'
+            source_repo.joinpath('.git').mkdir(parents=True)
+            for path in ('base', 'candidate', 'base-build', 'candidate-build'):
+                (pair_root / path).mkdir(parents=True)
+            (pair_root / '.wirelog-perf-owned').write_text('123/2\n', encoding='utf-8')
+            venv = cache / 'wirelog-perf-python-123-2'
+            venv.mkdir(parents=True)
+            git = root / 'git'
+            git.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$CLEANUP_CALLS"\n'
+                           '[[ "$*" != *"/base" ]]\n', encoding='utf-8')
+            git.chmod(0o755)
+            runner_temp = root / 'runner-temp'
+            unrelated = root / 'keep'
+            unrelated.mkdir()
+            env = dict(os.environ, PATH=str(root) + ':' + os.environ['PATH'],
+                       HOME=str(home), CAMPAIGN_MODE='issue_1913',
+                       REQUESTED_MODE='issue_1913', PAIR_ROOT=str(pair_root),
+                       SOURCE_REPO=str(source_repo), PERF_VENV=str(venv),
+                       RUNNER_TEMP=str(runner_temp), GITHUB_WORKSPACE=str(root),
+                       GITHUB_RUN_ID='123', GITHUB_RUN_ATTEMPT='2',
+                       CLEANUP_CALLS=str(root / 'calls'))
+            result = subprocess.run(['bash'], input=script, text=True, encoding='utf-8',
+                                    cwd=root, env=env, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)  # First removal failed, cleanup continued.
+            self.assertFalse(pair_root.exists())
+            self.assertFalse(venv.exists())
+            self.assertFalse(runner_temp.exists())
+            self.assertTrue(unrelated.exists())
+            calls = (root / 'calls').read_text(encoding='utf-8')
+            self.assertIn('worktree remove --force ' + str(pair_root / 'base'), calls)
+            self.assertIn('worktree remove --force ' + str(pair_root / 'candidate'), calls)
+
+    @unittest.skipIf(os.name == 'nt', 'Executable Bash fixtures require a POSIX host; Windows bash may be a WSL stub')
+    def test_unowned_issue1913_repository_is_never_pruned(self):
+        script = shell(named(self.text, 'Clean independent worktrees and builds'))
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as directory:
+            root = Path(directory)
+            home = root / 'home'
+            pair_root = home / '.cache' / 'wirelog-1913-123-2'
+            repository = pair_root / 'repository'
+            (repository / '.git').mkdir(parents=True)
+            keep = repository / 'keep.txt'
+            keep.write_text('preexisting repository data\n', encoding='utf-8')
+            git = root / 'git'
+            git.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$CLEANUP_CALLS"\nexit 99\n',
+                           encoding='utf-8')
+            git.chmod(0o755)
+            env = dict(os.environ, PATH=str(root) + ':' + os.environ['PATH'], HOME=str(home),
+                       CAMPAIGN_MODE='issue_1913', REQUESTED_MODE='issue_1913',
+                       PAIR_ROOT=str(pair_root), SOURCE_REPO=str(repository),
+                       RUNNER_TEMP=str(root / 'runner-temp'), GITHUB_WORKSPACE=str(root),
+                       GITHUB_RUN_ID='123', GITHUB_RUN_ATTEMPT='2',
+                       CLEANUP_CALLS=str(root / 'calls'))
+            result = subprocess.run(['bash'], input=script, text=True, encoding='utf-8',
+                                    cwd=root, env=env, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(keep.is_file())
+            self.assertFalse((root / 'calls').exists())
+
+    @unittest.skipIf(os.name == 'nt', 'Executable Bash fixtures require a POSIX host; Windows bash may be a WSL stub')
     def test_actual_resolution_shell(self):
         script = shell(named(self.text, 'Validate trusted revisions and resolve mode'))
         # Fake git owns only repository facts; run the exact shell with its
         # real mode, full-SHA and ancestry checks and output propagation.
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as directory:
             root = Path(directory)
             git = root / 'git'
             git.write_text('''#!/bin/bash
@@ -260,12 +378,16 @@ esac
                      ('workflow_dispatch', 'comparison', 'b' * 41, main, False),
                      ('workflow_dispatch', 'comparison', 'g' * 40, main, False),
                      ('workflow_dispatch', 'comparison', 'B' * 40, main, False),
+                     ('workflow_dispatch', 'issue_1913', '', main, True),
+                     ('workflow_dispatch', 'issue_1913', base, main, False),
                      ('schedule', '', '', base, False)]
             for event, mode, selected, dispatch, success in cases:
                 with self.subTest(event=event, mode=mode, base=selected):
                     env = dict(os.environ, PATH=str(root) + ':' + os.environ['PATH'],
                                GITHUB_EVENT_NAME=event, REQUESTED_MODE=mode, REQUESTED_BASE=selected,
                                DISPATCH_SHA=dispatch, MINIMUM_SHA=MINIMUM, FAKE_MAIN=main,
+                               ISSUE1913_BASE_SHA='8d91c2da2b188b94af5b9f1da21c569d80ccb387',
+                               ISSUE1913_CANDIDATE_SHA='10d5ba8d9daba473476fa7a2aa75072da42cef39',
                                GITHUB_ENV=str(root / 'env'), REJECT_SHA='', MISSING_SHA='')
                     (root / 'perf-artifacts/paired').mkdir(parents=True, exist_ok=True)
                     result = subprocess.run(['bash'], input=script, text=True, encoding='utf-8', env=env, cwd=root,
@@ -273,8 +395,13 @@ esac
                     self.assertEqual(result.returncode == 0, success, result.stderr)
                     if success:
                         output = (root / 'env').read_text(encoding='utf-8')
-                        self.assertIn('CANDIDATE_SHA=' + main, output)
-                        self.assertIn('BASE_SHA=' + (selected if mode == 'comparison' else main), output)
+                        expected_candidate = ('10d5ba8d9daba473476fa7a2aa75072da42cef39'
+                                              if mode == 'issue_1913' else main)
+                        expected_base = ('8d91c2da2b188b94af5b9f1da21c569d80ccb387'
+                                         if mode == 'issue_1913' else
+                                         selected if mode == 'comparison' else main)
+                        self.assertIn('CANDIDATE_SHA=' + expected_candidate, output)
+                        self.assertIn('BASE_SHA=' + expected_base, output)
                     (root / 'env').unlink(missing_ok=True)
             for reject in [base, main, MINIMUM]:
                 env.update(GITHUB_EVENT_NAME='workflow_dispatch', REQUESTED_MODE='comparison',
