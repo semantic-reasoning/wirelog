@@ -650,6 +650,232 @@ cleanup:
     PASS();
 }
 
+static void
+test_lftj_output_growth_denial_propagates_and_retries(void)
+{
+    TEST("LFTJ output growth denial and allocator failure restore state");
+    char source[8192];
+    size_t used = 0;
+    const char *prefix = ".decl r1(x: int32, a: int32)\n"
+        ".decl r2(x: int32, b: int32)\n"
+        ".decl r3(x: int32, c: int32)\n"
+        ".decl out(x: int32, a: int32, b: int32, c: int32)\n";
+    int written = snprintf(source, sizeof(source), "%s", prefix);
+    if (written < 0 || (size_t)written >= sizeof(source))
+        FAIL("query prefix did not fit the test buffer");
+    used = (size_t)written;
+    for (uint32_t i = 1; i <= 100; i++) {
+        written = snprintf(source + used, sizeof(source) - used,
+                "r1(%u, %u). r2(%u, %u). r3(%u, %u).\n",
+                i, i + 100u, i, i + 200u, i, i + 300u);
+        if (written < 0 || (size_t)written >= sizeof(source) - used)
+            FAIL("generated input facts did not fit the test buffer");
+        used += (size_t)written;
+    }
+    written = snprintf(source + used, sizeof(source) - used,
+            "out(x, a, b, c) :- r1(x, a), r2(x, b), r3(x, c).\n");
+    if (written < 0 || (size_t)written >= sizeof(source) - used)
+        FAIL("query rule did not fit the test buffer");
+
+    wirelog_program_t *prog = NULL;
+    wl_plan_t *plan = NULL;
+    wl_session_t *session = NULL;
+    wl_columnar_memory_governor_ref_t *ref
+        = test_governor(UINT64_C(1) << 30);
+    wl_session_options_t options;
+    eval_stack_t stack;
+    bool stack_initialized = false;
+    wl_columnar_lftj_output_test_hook_state_t hook_state = {0};
+    wl_col_session_t *columnar = NULL;
+    const wl_plan_op_t *lftj_op = NULL;
+    const char *failure = NULL;
+    uint64_t baseline_reserved = 0;
+    uint64_t original_usable = UINT64_C(1) << 30;
+    int rc;
+
+    wl_columnar_lftj_test_clear_hooks();
+    wl_columnar_lftj_test_clear_output_hooks();
+    if (!ref) {
+        failure = "governor creation failed";
+        goto cleanup;
+    }
+    if (make_plan_no_opt(source, &plan, &prog) != 0) {
+        failure = "plan creation failed";
+        goto cleanup;
+    }
+    wl_session_options_init(&options);
+    options.memory_governor = ref;
+    if (wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session) != 0 || !session) {
+        failure = "session creation failed";
+        goto cleanup;
+    }
+    if (wl_session_load_facts(session, prog) != 0) {
+        failure = "loading EDB facts failed";
+        goto cleanup;
+    }
+    for (uint32_t s = 0; s < plan->stratum_count && !lftj_op; s++) {
+        const wl_plan_stratum_t *stratum = &plan->strata[s];
+        for (uint32_t r = 0; r < stratum->relation_count && !lftj_op; r++) {
+            const wl_plan_relation_t *relation = &stratum->relations[r];
+            for (uint32_t o = 0; o < relation->op_count; o++) {
+                if (relation->ops[o].op == WL_PLAN_OP_LFTJ) {
+                    lftj_op = &relation->ops[o];
+                    break;
+                }
+            }
+        }
+    }
+    if (!lftj_op) {
+        failure = "plan has no LFTJ operation";
+        goto cleanup;
+    }
+    columnar = COL_SESSION(session);
+    original_usable = atomic_load_explicit(
+        &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
+        memory_order_relaxed);
+    eval_stack_init(&stack);
+    stack_initialized = true;
+
+    rc = col_op_lftj(lftj_op, &stack, columnar);
+    if (rc != 0 || stack.top != 1 || !stack.items[0].rel
+        || stack.items[0].rel->nrows != 100) {
+        failure = "warmup did not publish all 100 expected rows";
+        goto cleanup;
+    }
+    eval_stack_drain(&stack);
+    baseline_reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+    if (baseline_reserved == 0 || columnar->sarr_active_pins != 0) {
+        failure = "warm arrangements did not reach a stable baseline";
+        goto cleanup;
+    }
+
+    columnar->memory_budget_denied = false;
+    wl_columnar_lftj_test_deny_next_output_growth();
+    rc = col_op_lftj(lftj_op, &stack, columnar);
+    wl_columnar_lftj_test_get_output_hook_state(&hook_state);
+    if (hook_state.deny_output_growth_consumed) {
+        atomic_store_explicit(
+            &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
+            hook_state.previous_usable_bytes, memory_order_relaxed);
+    }
+    if (!hook_state.deny_output_growth_consumed
+        || hook_state.reserved_before_growth < baseline_reserved
+        || rc != ENOSPC || !columnar->memory_budget_denied || stack.top != 0) {
+        failure = "output growth denial was not propagated as ENOSPC";
+        goto cleanup;
+    }
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != baseline_reserved) {
+        failure = "output growth denial leaked reservation bytes";
+        goto cleanup;
+    }
+    if (columnar->sarr_active_pins != 0) {
+        failure = "output growth denial leaked an arrangement probe";
+        goto cleanup;
+    }
+    for (uint32_t i = 0; i < columnar->sarr_count; i++) {
+        if (columnar->sarr_entries[i].sarr.pin_count != 0) {
+            failure = "output growth denial left an arrangement pinned";
+            goto cleanup;
+        }
+    }
+    for (uint32_t i = 0; i < 3; i++) {
+        static const char *const names[] = { "r1", "r2", "r3" };
+        col_rel_t *rel = session_find_rel(columnar, names[i]);
+        if (!rel || wl_columnar_source_access_gate_busy(&rel->source_access)) {
+            failure = "output growth denial leaked a source reader";
+            goto cleanup;
+        }
+    }
+
+    wl_columnar_lftj_test_clear_output_hooks();
+    columnar->memory_budget_denied = false;
+    rc = col_op_lftj(lftj_op, &stack, columnar);
+    if (rc != 0 || columnar->memory_budget_denied || stack.top != 1
+        || !stack.items[0].rel || stack.items[0].rel->nrows != 100) {
+        failure = "retry after output growth denial failed";
+        goto cleanup;
+    }
+    eval_stack_drain(&stack);
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != baseline_reserved) {
+        failure = "successful retry leaked output reservation bytes";
+        goto cleanup;
+    }
+
+    columnar->memory_budget_denied = false;
+    wl_columnar_lftj_test_fail_next_output_append();
+    rc = col_op_lftj(lftj_op, &stack, columnar);
+    wl_columnar_lftj_test_get_output_hook_state(&hook_state);
+    if (!hook_state.fail_output_append_consumed || rc != ENOMEM
+        || hook_state.failure_pending_flag || columnar->memory_budget_denied
+        || stack.top != 0) {
+        failure = "ordinary output allocator failure was misclassified";
+        goto cleanup;
+    }
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != baseline_reserved) {
+        failure = "ordinary output failure leaked reservations";
+        goto cleanup;
+    }
+    if (columnar->sarr_active_pins != 0) {
+        failure = "ordinary output failure leaked an arrangement probe";
+        goto cleanup;
+    }
+    for (uint32_t i = 0; i < columnar->sarr_count; i++) {
+        if (columnar->sarr_entries[i].sarr.pin_count != 0) {
+            failure = "ordinary output failure left an arrangement pinned";
+            goto cleanup;
+        }
+    }
+    for (uint32_t i = 0; i < 3; i++) {
+        static const char *const names[] = { "r1", "r2", "r3" };
+        col_rel_t *rel = session_find_rel(columnar, names[i]);
+        if (!rel || wl_columnar_source_access_gate_busy(&rel->source_access)) {
+            failure = "ordinary output failure leaked a source reader";
+            goto cleanup;
+        }
+    }
+    wl_columnar_lftj_test_clear_output_hooks();
+    rc = col_op_lftj(lftj_op, &stack, columnar);
+    if (rc != 0 || stack.top != 1 || !stack.items[0].rel
+        || stack.items[0].rel->nrows != 100) {
+        failure = "retry after ordinary output failure failed";
+        goto cleanup;
+    }
+    eval_stack_drain(&stack);
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != baseline_reserved) {
+        failure = "ordinary output retry leaked reservation bytes";
+        goto cleanup;
+    }
+
+cleanup:
+    wl_columnar_lftj_test_clear_hooks();
+    wl_columnar_lftj_test_clear_output_hooks();
+    if (columnar && ref) {
+        atomic_store_explicit(
+            &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
+            original_usable, memory_order_relaxed);
+        columnar->memory_budget_denied = false;
+    }
+    if (stack_initialized)
+        eval_stack_drain(&stack);
+    if (session)
+        wl_session_destroy(session);
+    if (plan)
+        wl_plan_free(plan);
+    if (prog)
+        wirelog_program_free(prog);
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+    if (failure)
+        FAIL(failure);
+    PASS();
+}
+
 /* Test 5: IDB relation in chain prevents LFTJ rewrite. */
 static void
 test_idb_not_rewritten(void)
@@ -860,6 +1086,7 @@ main(void)
     test_idb_not_rewritten();
     test_lftj_stack_overflow_releases_output();
     test_lftj_inner_denial_propagates_and_retries();
+    test_lftj_output_growth_denial_propagates_and_retries();
     test_tdd_lftj_metadata_is_conservative();
 
     printf("\nResults: %d/%d passed", pass_count, test_count);
