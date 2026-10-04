@@ -451,29 +451,6 @@ def run_campaign(args, *, popen_factory=None, affinity_getter=None, probe_factor
         output, args, host_probe=host_probe)
     if output.parent != Path(preflight['command_freeze_path']).resolve().parent:
         raise RunnerError('collection directory is not a direct child of its frozen command directory')
-    lock_path = output / RUN_LOCK
-    lock_value = dict(schema='wirelog.batch-append-run-lock.v1', pid=os.getpid(),
-                      created_monotonic_ns=time.monotonic_ns())
-    try:
-        fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError as error:
-        raise RunnerError('campaign run lock already exists; concurrent/retry/resume is forbidden') from error
-    with os.fdopen(fd, 'wb') as stream:
-        stream.write((json.dumps(lock_value, sort_keys=True) + '\n').encode('utf-8'))
-        stream.flush()
-        os.fsync(stream.fileno())
-    fsync_directory(output)
-    run_id = secrets.token_hex(16)
-    launched = 0
-    eligible_count = 0
-    ineligible_count = 0
-    failure_index = None
-    current_status = dict(schema=STATUS_SCHEMA, status='running',
-                          benchmark_launches_performed=0,
-                          planned_command_count=len(rows),
-                          preflight_sha256=digest(preflight_raw), run_id=run_id,
-                          started_monotonic_ns=time.monotonic_ns())
-    write_status(output / 'status.json', current_status)
     CAL = FREEZER['CAL']
     CAL['_INTERRUPTED_SIGNAL'] = None
     CAL['_LAST_RUN_SIGNAL'] = None
@@ -483,10 +460,26 @@ def run_campaign(args, *, popen_factory=None, affinity_getter=None, probe_factor
     try:
         for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             previous_handlers[signum] = signal.signal(signum, capture_signal)
-    except ValueError:
-        # Direct embedding from a non-main test thread cannot install process
-        # handlers; the CLI always runs in the main thread.
-        previous_handlers = {}
+    except (OSError, ValueError) as error:
+        for signum, previous in previous_handlers.items():
+            signal.signal(signum, previous)
+        raise RunnerError(f'cannot install campaign signal handlers before claiming run: {error}',
+                          'signal_setup') from error
+
+    lock_path = output / RUN_LOCK
+    lock_value = dict(schema='wirelog.batch-append-run-lock.v1', pid=os.getpid(),
+                      created_monotonic_ns=time.monotonic_ns())
+    run_id = secrets.token_hex(16)
+    launched = 0
+    eligible_count = 0
+    ineligible_count = 0
+    failure_index = None
+    claimed = False
+    current_status = dict(schema=STATUS_SCHEMA, status='running',
+                          benchmark_launches_performed=0,
+                          planned_command_count=len(rows),
+                          preflight_sha256=digest(preflight_raw), run_id=run_id,
+                          started_monotonic_ns=time.monotonic_ns())
 
     def revalidate():
         saved = (output / 'collector-preflight.json').read_bytes()
@@ -505,6 +498,24 @@ def run_campaign(args, *, popen_factory=None, affinity_getter=None, probe_factor
                                                 error=str(error)))
 
     try:
+        if CAL.get('_INTERRUPTED_SIGNAL') is not None:
+            raise RunnerError(f'interrupted by signal {CAL["_INTERRUPTED_SIGNAL"]}', 'interrupted')
+        try:
+            fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError as error:
+            raise RunnerError(
+                'campaign run lock already exists; concurrent/retry/resume is forbidden') from error
+        claimed = True
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write((json.dumps(lock_value, sort_keys=True) + '\n').encode('utf-8'))
+            stream.flush()
+            os.fsync(stream.fileno())
+        fsync_directory(output)
+        if CAL.get('_INTERRUPTED_SIGNAL') is not None:
+            raise RunnerError(f'interrupted by signal {CAL["_INTERRUPTED_SIGNAL"]}', 'interrupted')
+        write_status(output / 'status.json', current_status)
+        if CAL.get('_INTERRUPTED_SIGNAL') is not None:
+            raise RunnerError(f'interrupted by signal {CAL["_INTERRUPTED_SIGNAL"]}', 'interrupted')
         revalidate()
         for index, row in enumerate(rows):
             failure_index = index
@@ -636,10 +647,11 @@ def run_campaign(args, *, popen_factory=None, affinity_getter=None, probe_factor
                     error.category if isinstance(error, RunnerError) else
                     'host_provenance' if isinstance(error, CollectionError) else 'evidence_or_process')
         failed = incomplete(category, failure_index, error)
-        try:
-            write_status(output / 'status.json', failed)
-        except BaseException:
-            pass
+        if claimed:
+            try:
+                write_status(output / 'status.json', failed)
+            except BaseException:
+                pass
         if isinstance(error, RunnerError):
             raise
         raise RunnerError(f'campaign capture failed: {error}') from error
