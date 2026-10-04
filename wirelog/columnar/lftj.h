@@ -126,6 +126,16 @@ typedef struct {
     wl_columnar_memory_admission_status_t inner_status;
 } wl_columnar_lftj_test_hook_state_t;
 
+typedef struct {
+    bool deny_output_growth_pending;
+    bool deny_output_growth_consumed;
+    bool fail_output_append_pending;
+    bool fail_output_append_consumed;
+    bool failure_pending_flag;
+    uint64_t previous_usable_bytes;
+    uint64_t reserved_before_growth;
+} wl_columnar_lftj_output_test_hook_state_t;
+
 void
 wl_columnar_lftj_test_fail_next_iters_alloc(void);
 void
@@ -135,6 +145,16 @@ wl_columnar_lftj_test_get_hook_state(
     wl_columnar_lftj_test_hook_state_t *out);
 void
 wl_columnar_lftj_test_clear_hooks(void);
+
+void
+wl_columnar_lftj_test_deny_next_output_growth(void);
+void
+wl_columnar_lftj_test_fail_next_output_append(void);
+void
+wl_columnar_lftj_test_get_output_hook_state(
+    wl_columnar_lftj_output_test_hook_state_t *out);
+void
+wl_columnar_lftj_test_clear_output_hooks(void);
 #endif
 
 #endif /* WL_COLUMNAR_LFTJ_H */
