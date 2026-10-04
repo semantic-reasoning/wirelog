@@ -24,6 +24,8 @@ no writes or benchmark launches.
 The separate Unit 3A collector binds raw baseline stdout/stderr and provenance
 and accepts at least 250 ms per case. Unit 3B then validates every calibration
 file and freezes either 216 comparison commands or 108 A/A-pre commands in
-`batch-append-command-freeze-v1.md`. This profile remains non-executable; a
-future runner must revalidate runtime host eligibility before launching any
-frozen command. No benchmark is launched by either preflight or freezer.
+`batch-append-command-freeze-v1.md`. This profile remains non-executable;
+`collect-batch-append-campaign.py --run` revalidates host identity before each
+launch and records fresh per-run eligibility after each process, as described
+in `batch-append-campaign-collection-v1.md`. Neither preflight nor freezer
+launches a benchmark.
