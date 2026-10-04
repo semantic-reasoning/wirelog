@@ -72,7 +72,11 @@ output_prefix="$out_dir/wirelog-${version}"
 # scan boundary; test-generate-sbom.sh asserts both spellings together.
 # An array, not a string: a repo path may contain spaces. Plain `+=` and no
 # `readarray` -- macOS ships bash 3.2, where readarray/mapfile do not exist.
-syft_exclude_args=(--exclude '**/workflow-tools/**')
+#
+# The repository-root uv environment that AGENTS.md has contributors create is
+# not a wirelog dependency either; exclude that one directory, `./`-relative
+# like the build root below (#1919).
+syft_exclude_args=(--exclude '**/workflow-tools/**' --exclude './.venv/**')
 if [ -d "$build_root" ]; then
     build_abs="$(cd "$build_root" && pwd)"
     case "$build_abs" in

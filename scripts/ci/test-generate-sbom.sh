@@ -163,11 +163,15 @@ assert 'the SPDX document lands there too' test -f "$out/wirelog-9.9.9.spdx.json
 assert 'the CycloneDX document lands there too' test -f "$out/wirelog-9.9.9.cdx.json"
 refute 'the default directory is not touched when one is given' test -e "$repo/sbom"
 
+# Each of the three scans passes exactly the two fixed exclusions: nested
+# workflow-tools checkouts, and the repository-root uv environment (#1919).
 all_scans_exclude_workflow_tools() {
-    [[ $(wc -l < "$scanned") -eq 3 && $(wc -l < "$excludes") -eq 3 ]] || return 1
-    ! grep -qvxF '**/workflow-tools/**' "$excludes"
+    [[ $(wc -l < "$scanned") -eq 3 && $(wc -l < "$excludes") -eq 6 ]] || return 1
+    [[ $(grep -cxF '**/workflow-tools/**' "$excludes") -eq 3 ]] || return 1
+    [[ $(grep -cxF './.venv/**' "$excludes") -eq 3 ]] || return 1
+    ! grep -qvxF -e '**/workflow-tools/**' -e './.venv/**' "$excludes"
 }
-assert 'every generated SBOM excludes nested workflow-tools checkouts' \
+assert 'every generated SBOM excludes workflow-tools checkouts and the root .venv' \
     all_scans_exclude_workflow_tools
 assert 'the generated baseline retains the declared workflow-tools action reference once' \
     test "$(grep -Fxc './workflow-tools/.github/actions/setup-meson@UNKNOWN:NOASSERTION' "$out/snapshot.txt")" -eq 1
@@ -190,10 +194,12 @@ check_snapshot() {
         "$repo/scripts/ci/check-sbom-snapshot.sh" "$@"
 }
 expect_status 'the snapshot gate accepts its generated baseline' 0 check_snapshot
-assert 'the snapshot gate passes the exact workflow-tools exclusion' \
-    test "$(wc -l < "$check_excludes")" -eq 1
+assert 'the snapshot gate passes exactly the two fixed exclusions' \
+    test "$(wc -l < "$check_excludes")" -eq 2
 assert 'the snapshot gate passes the exact workflow-tools exclusion' \
     grep -Fxq '**/workflow-tools/**' "$check_excludes"
+assert 'the snapshot gate passes the exact root .venv exclusion' \
+    grep -Fxq './.venv/**' "$check_excludes"
 
 # --- the build tree the gate must not read (#1917) -------------------------
 # A configured meson build dir sits inside repo_root in CI, and syft reads
@@ -211,14 +217,14 @@ assert 'the gate excludes a build root inside the repo' \
     grep -Fxq './builddir-san/**' "$check_excludes"
 assert 'the gate still excludes the helper checkout alongside it' \
     grep -Fxq '**/workflow-tools/**' "$check_excludes"
-assert 'the gate passes exactly those two exclusions' \
-    test "$(wc -l < "$check_excludes")" -eq 2
+assert 'the gate passes exactly those three exclusions' \
+    test "$(wc -l < "$check_excludes")" -eq 3
 
 # Outside repo_root there is nothing to exclude: syft never walks it, and a
 # `./`-relative pattern could not name it anyway.
 check_snapshot "$tmp/fake-build"
 assert 'a build root outside the repo adds no exclusion' \
-    test "$(wc -l < "$check_excludes")" -eq 1
+    test "$(wc -l < "$check_excludes")" -eq 2
 check_snapshot_with_unexcluded_checkout() {
     SYFT_IGNORE_EXCLUDE=1 SYFT_EXCLUDES="$tmp/ignored-excludes.txt" \
         PATH="$repo/bin:$PATH" "$repo/scripts/ci/check-sbom-snapshot.sh"
@@ -262,11 +268,14 @@ SYFT_SCANNED="$scanned" SYFT_EXCLUDES="$gen_excludes" PATH="$repo/bin:$PATH" \
     "$repo/scripts/release/generate-sbom.sh" "$inside_build" "$out" >/dev/null
 assert 'the generator excludes a build root inside the repo' \
     grep -Fxq './builddir-gen/**' "$gen_excludes"
-# Three scans, two exclusions each: the exclusion must reach every document,
-# not just the snapshot. A generator that excluded it from one output and not
-# the others would ship an SPDX file describing a different tree.
-assert 'every generator scan carries both exclusions' \
-    test "$(wc -l < "$gen_excludes")" -eq 6
+# Three scans, three exclusions each (workflow-tools, the root .venv and the
+# build root): every exclusion must reach every document, not just the
+# snapshot. A generator that excluded one from one output and not the others
+# would ship an SPDX file describing a different tree.
+assert 'every generator scan carries all three exclusions' \
+    test "$(wc -l < "$gen_excludes")" -eq 9
+assert 'every generator scan excludes the build root' \
+    test "$(grep -cxF './builddir-gen/**' "$gen_excludes")" -eq 3
 
 # --- the default, which every existing caller relies on --------------------
 expect_status 'the output directory is optional' 0 gen "$tmp/fake-build"
