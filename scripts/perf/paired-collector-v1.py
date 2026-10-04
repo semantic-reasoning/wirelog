@@ -26,6 +26,7 @@ EVALUATOR = runpy.run_path(str(HERE / 'evaluate-paired-campaign.py'))
 AA_HOST = runpy.run_path(str(HERE / 'paired-aa-host.py'))
 AA_LAUNCHER = HERE / 'paired-aa-affinity-launcher.py'
 SIDES = ('base', 'candidate')
+BM_POLICY_SHA256 = '523029143376f1765e920d6932181cc049831dcebddd7531ffa70cc713848e55'
 TIMERS = {
     'crdt': dict(id='crdt_perf_gate_single_run', unit='ms', scope='run_crdt_once_: full pipeline, one worker'),
     'cspa-fast': dict(id='bench_flowlog_repeat_1', unit='ms', scope='run_pipeline_count: full pipeline, one worker'),
@@ -149,6 +150,24 @@ def telemetry(raw):
                 governor=metric('governor', str))
 
 
+def bm_host_observation(cpu):
+    """Capture the predeclared B/M eligibility fields at an attempt boundary."""
+    snapshot = AA_HOST['_snapshot'](cpu, None)
+    try:
+        load_one = dict(value=float(Path('/proc/loadavg').read_text(
+            encoding='utf-8').split()[0]), unavailable_reason=None)
+    except (OSError, ValueError, IndexError) as error:
+        load_one = dict(value=None, unavailable_reason=f'{type(error).__name__}: {error}')
+    count = os.cpu_count()
+    return dict(machine_id=snapshot['machine_id'],
+                logical_cpu_count=(dict(value=count, unavailable_reason=None)
+                                   if type(count) is int and count > 0 else
+                                   dict(value=None, unavailable_reason='logical CPU count unavailable')),
+                load_one=load_one,
+                cpu_psi_some_avg10_percent=snapshot['cpu_psi_some_avg10_percent'],
+                cgroup=snapshot['cgroup'])
+
+
 def parse_result(stdout, workload):
     if workload == 'crdt':
         record = json.loads(stdout, object_pairs_hook=EVALUATOR['unique_object'])
@@ -212,7 +231,7 @@ def _attempt_command(binary, workload, root, cpu, ready_fd=None, release_fd=None
     return command, env
 
 
-def execute(binary, workload, root, cpu, timeout, *, qualify_aa=False,
+def execute(binary, workload, root, cpu, timeout, *, qualify_aa=False, qualify_bm=False,
             handshake_timeout=5):
     if threading.active_count() != 1:
         raise ValueError('benchmark launch requires a single-threaded Linux collector')
@@ -235,6 +254,8 @@ def execute(binary, workload, root, cpu, timeout, *, qualify_aa=False,
         try:
             if not qualify_aa:
                 raw['host_before'] = LEGACY['read_host'](cpu)
+            if qualify_bm:
+                raw['bm_host_before'] = bm_host_observation(cpu)
             previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, TERMINATION_SIGNALS)
             try:
                 # Single-threaded child: only restore the inherited mask before exec.
@@ -325,6 +346,8 @@ def execute(binary, workload, root, cpu, timeout, *, qualify_aa=False,
                             cause = further_interruption
                             mark_interruption(raw, further_interruption)
         finally:
+            if qualify_bm:
+                raw['bm_host_after'] = bm_host_observation(cpu)
             if qualify_aa:
                 raw['aa_host_after'] = AA_HOST['read_snapshot'](
                     cpu, child_affinity=raw.get('launcher_ready', {}).get('affinity'))
@@ -348,6 +371,9 @@ def execute(binary, workload, root, cpu, timeout, *, qualify_aa=False,
                 observed_exit_code = process.poll()
                 if observed_exit_code is not None:
                     raw['exit_code'] = observed_exit_code
+            if raw.get('interrupted') and type(raw.get('exit_code')) is not int:
+                signum = raw.get('signal_number')
+                raw['exit_code'] = 128 + signum if type(signum) is int else 125
             for descriptor in (ready_read, ready_write, release_read, release_write):
                 if descriptor is not None:
                     try:
@@ -396,12 +422,54 @@ def qualification_preflight(args, records, artifacts, binaries, sources, builds,
                         executables={name: str(path.resolve())
                                      for name, path in binaries[side].items()})
              for side in SIDES}
-    return dict(schema_version=1, mode=args.mode, qualify_aa=bool(args.qualify_aa),
-                campaign_id=campaign_id, manifest=manifest,
-                records=records, artifacts={str(path): digest for path, digest in artifacts.items()},
-                paths=paths, schedule=planned,
-                theoretical_launch_timeout_ceiling_seconds=len(planned) * args.timeout,
-                launcher_sha256=LEGACY['sha256'](AA_LAUNCHER) if args.qualify_aa else None)
+    result = dict(schema_version=1, mode=args.mode, qualify_aa=bool(args.qualify_aa),
+                  campaign_id=campaign_id, manifest=manifest,
+                  records=records, artifacts={str(path): digest for path, digest in artifacts.items()},
+                  paths=paths, schedule=planned,
+                  theoretical_launch_timeout_ceiling_seconds=len(planned) * args.timeout,
+                  launcher_sha256=LEGACY['sha256'](AA_LAUNCHER) if args.qualify_aa else None)
+    if getattr(args, 'qualify_bm', False):
+        result.update(qualify_bm=True, bm_plan_sha256=args.bm_plan_sha256)
+    return result
+
+
+def require_bm_plan(plan, base_sha, candidate_sha):
+    def require(condition, message):
+        if not condition:
+            raise ValueError(message)
+    required = {'schema_version', 'plan_id', 'base_sha', 'candidate_sha',
+                'base_tree_sha', 'candidate_tree_sha', 'policy_id', 'policy_sha256',
+                'campaign_mode', 'workloads', 'attempts', 'note'}
+    policy_path = HERE / 'paired-bm-policy-v1.json'
+    require(type(plan) is dict and set(plan) == required and
+            plan.get('schema_version') == 1 and plan.get('plan_id') ==
+            'tagged-runner-bm-repeat-v1' and
+            plan.get('base_sha') == base_sha and
+            plan.get('candidate_sha') == candidate_sha and
+            all(type(plan.get(f'{side}_tree_sha')) is str and
+                re.fullmatch('[0-9a-f]{40}', plan[f'{side}_tree_sha'])
+                for side in SIDES) and
+            plan.get('policy_id') == 'tagged-runner-bm-eligibility-v1' and
+            hashlib.sha256(policy_path.read_bytes()).hexdigest() == BM_POLICY_SHA256 and
+            plan.get('policy_sha256') == BM_POLICY_SHA256 and
+            plan.get('campaign_mode') == 'comparison' and
+            plan.get('workloads') == ['crdt', 'cspa-fast'] and
+            plan.get('attempts') == ['attempt-1', 'attempt-2'],
+            'invalid_or_stale_bm_plan')
+
+
+def require_committed_bm_plan(path):
+    root = HERE.parents[1]
+    try:
+        relative = path.resolve().relative_to(root).as_posix()
+        subprocess.check_output(['git', '-C', str(root), 'ls-files', '--error-unmatch', relative],
+                                stderr=subprocess.DEVNULL, encoding='utf-8')
+        committed = subprocess.check_output(['git', '-C', str(root), 'show', f'HEAD:{relative}'],
+                                            stderr=subprocess.DEVNULL)
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        raise ValueError('B/M plan must be tracked and committed before collection') from error
+    if hashlib.sha256(committed).digest() != hashlib.sha256(path.read_bytes()).digest():
+        raise ValueError('B/M plan differs from committed policy plan; publish it before collection')
 
 
 def reject_aa_preflight(args, document, status, reason, workloads):
@@ -423,6 +491,18 @@ def collect(args):
 
 def collect_campaign(args):
     args.qualify_aa = bool(getattr(args, 'qualify_aa', False))
+    args.qualify_bm = bool(getattr(args, 'qualify_bm', False))
+    if args.qualify_aa and args.qualify_bm:
+        raise ValueError('A/A and B/M qualification modes are mutually exclusive')
+    if args.qualify_bm:
+        if args.mode != 'comparison' or not getattr(args, 'bm_plan', None):
+            raise ValueError('--qualify-bm requires comparison mode and --bm-plan')
+        require_committed_bm_plan(args.bm_plan)
+        plan = AA_HOST['strict_json'](args.bm_plan.read_text(encoding='utf-8'))
+        require_bm_plan(plan, args.base_sha, args.candidate_sha)
+        args.bm_plan_sha256 = hashlib.sha256(args.bm_plan.read_bytes()).hexdigest()
+    else:
+        args.bm_plan_sha256 = None
     if args.qualify_aa and args.mode != 'aa_control':
         raise ValueError('--qualify-aa is only valid with --mode aa_control')
     if args.out_dir.exists():
@@ -446,7 +526,9 @@ def collect_campaign(args):
         roots[side] = source / 'bench/data'
         binaries[side] = {'crdt': build / 'tests/test_crdt_perf_gate', 'cspa-fast': build / 'bench/bench_flowlog'}
         logs[side] = getattr(args, side + '_build_log').resolve()
-        for path in [logs[side], *binaries[side].values(), *(source / p for p in CONTRACT_SOURCES + VERIFY['GATE_SOURCES'] + VERIFY['FIXTURES']), build / 'meson-info/intro-buildoptions.json', build / 'meson-info/intro-compilers.json']:
+        build_binaries = ([build / p for p in VERIFY['BINARIES']] if args.qualify_bm
+                          else list(binaries[side].values()))
+        for path in [logs[side], *build_binaries, *(source / p for p in CONTRACT_SOURCES + VERIFY['GATE_SOURCES'] + VERIFY['FIXTURES']), build / 'meson-info/intro-buildoptions.json', build / 'meson-info/intro-compilers.json']:
             artifacts[path] = LEGACY['sha256'](path)
         if any(not os.access(p, os.X_OK) for p in binaries[side].values()):
             raise ValueError('benchmark is not executable')
@@ -498,20 +580,32 @@ def collect_campaign(args):
     atomic_json(args.out_dir / 'preflight.json', preflight)
     for side in SIDES:
         (args.out_dir / f'{side}-build.log').write_bytes(logs[side].read_bytes())
+        if args.qualify_bm:
+            build = builds[side]
+            (args.out_dir / f'{side}-intro-buildoptions.json').write_bytes(
+                (build / 'meson-info/intro-buildoptions.json').read_bytes())
+            (args.out_dir / f'{side}-intro-compilers.json').write_bytes(
+                (build / 'meson-info/intro-compilers.json').read_bytes())
     with (args.out_dir / 'raw-attempts.jsonl').open('x', encoding='utf-8') as stream:
-      link_context = ((args.out_dir / 'aa-attempt-links.jsonl').open('x', encoding='utf-8')
-                      if args.qualify_aa else None)
+      link_name = 'aa-attempt-links.jsonl' if args.qualify_aa else 'bm-attempt-links.jsonl'
+      link_context = ((args.out_dir / link_name).open('x', encoding='utf-8')
+                      if args.qualify_aa or args.qualify_bm else None)
       try:
         for ordinal, item in enumerate(planned):
             try:
-                execute_args = (dict(qualify_aa=True) if args.qualify_aa else {})
+                execute_args = (dict(qualify_aa=True) if args.qualify_aa else
+                                dict(qualify_bm=True) if args.qualify_bm else {})
                 raw = dict(item, **execute(binaries[item['side']][item['workload']], item['workload'], roots[item['side']], args.cpu, args.timeout, **execute_args))
             except InterruptedLaunch as error:
                 raw = dict(item, **error.raw)
                 if args.qualify_aa:
                     raw.update(ordinal=ordinal, campaign_id=campaign['campaign_id'],
                                manifest_sha256=EVALUATOR['digest'](manifest))
-                append_raw_attempt(stream, raw, link_context, ordinal if args.qualify_aa else None)
+                elif args.qualify_bm:
+                    raw.update(ordinal=ordinal, campaign_id=campaign['campaign_id'],
+                               manifest_sha256=EVALUATOR['digest'](manifest))
+                append_raw_attempt(stream, raw, link_context,
+                                   ordinal if args.qualify_aa or args.qualify_bm else None)
                 raise error.cause
             try:
                 elapsed, correctness = parse_result(raw['stdout'], item['workload'])
@@ -521,7 +615,11 @@ def collect_campaign(args):
             if args.qualify_aa:
                 raw.update(ordinal=ordinal, campaign_id=campaign['campaign_id'],
                            manifest_sha256=EVALUATOR['digest'](manifest))
-            append_raw_attempt(stream, raw, link_context, ordinal if args.qualify_aa else None)
+            elif args.qualify_bm:
+                raw.update(ordinal=ordinal, campaign_id=campaign['campaign_id'],
+                           manifest_sha256=EVALUATOR['digest'](manifest))
+            append_raw_attempt(stream, raw, link_context,
+                               ordinal if args.qualify_aa or args.qualify_bm else None)
             if raw.get('prelaunch_rejected'):
                 break
       finally:
@@ -554,6 +652,10 @@ def main():
     parser.add_argument('--timeout', type=int, default=180)
     parser.add_argument('--qualify-aa', action='store_true',
                         help='collect the protected-main A/A qualification evidence')
+    parser.add_argument('--qualify-bm', action='store_true',
+                        help='collect companion host evidence for a frozen B/M plan')
+    parser.add_argument('--bm-plan', type=Path,
+                        help='public frozen plan produced by freeze-paired-bm-plan.py')
     args = parser.parse_args()
     try:
         return collect(args)
