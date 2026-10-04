@@ -194,6 +194,44 @@ class RunnerTests(unittest.TestCase):
                 self.args, popen_factory=lambda *a, **k: self.fail('launched'),
                 host_probe=CAL_TEST['FakeProbe']())
 
+    def test_signal_after_claim_before_first_row_publishes_incomplete_status(self):
+        freezer = self.runner['FREEZER']
+        globals_dict = self.runner['run_campaign'].__globals__
+        original_write_status = globals_dict['write_status']
+        emitted = []
+
+        def inject_after_running(path, value):
+            original_write_status(path, value)
+            if value['status'] == 'running':
+                emitted.append(value['status'])
+                signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+
+        def stable_admit(args, expected_host=None, host_probe=None):
+            return self.collection, self.preflight
+
+        def no_spawn(*args, **kwargs):
+            self.fail('signal before first started row must prevent spawn')
+
+        with patch.dict(globals_dict, admit=stable_admit, write_status=inject_after_running), \
+                patch.object(self.runner['os'], 'fsync', return_value=None), \
+                patch.dict(freezer['CAL'],
+                           terminate_active_process=lambda signum, frame:
+                           freezer['CAL'].__setitem__('_INTERRUPTED_SIGNAL', signum)):
+            with self.assertRaisesRegex(RUNNER['RunnerError'], 'interrupted by signal'):
+                self.runner['run_campaign'](
+                    self.args, popen_factory=no_spawn, host_probe=CAL_TEST['FakeProbe']())
+        status = json.loads((self.output / 'status.json').read_text(encoding='utf-8'))
+        self.assertEqual(emitted, ['running'])
+        self.assertEqual(status['status'], 'incomplete_capture')
+        self.assertEqual(status['benchmark_launches_performed'], 0)
+        self.assertEqual(status['failure']['category'], 'interrupted')
+        self.assertIsNone(status['failure']['command_index'])
+        self.assertTrue((self.output / RUNNER['RUN_LOCK']).is_file())
+        self.assertEqual((self.output / 'journal.jsonl').read_bytes(), b'')
+        with self.assertRaisesRegex(RUNNER['RunnerError'], 'status is not fresh'):
+            self.runner['run_campaign'](
+                self.args, popen_factory=no_spawn, host_probe=CAL_TEST['FakeProbe']())
+
     def test_signal_persists_process_result_and_incomplete_status(self):
         freezer = self.runner['FREEZER']
         case = self.preflight['frozen_preflight']['commands'][0]['case']
