@@ -41,3 +41,41 @@ future process uses two internal warmups and one measured sample.
 The manifest output directory must be fresh and under HOME. The file is
 fsynced and atomically renamed, then its containing directories are fsynced.
 Paths under `/tmp` and `/dev/shm` are rejected.
+
+## Clean-clone source preparation
+
+The anchor commit and candidate tree are not guaranteed to exist in a fresh
+checkout. `batch-append-anchor-v1.bundle` contains the complete pinned history,
+and `batch-append-product-delta-v1.patch` reconstructs the exact candidate
+tree. The planner verifies their pinned size, hashes, ref, and tree identities,
+then reconstructs the product delta in a disposable repository under
+`$HOME/.tmp`. It does not read or write the caller checkout's Git object
+database.
+
+Hydrate and validate a local Meson fallback seed before preparing a campaign
+from a fresh clone, then stage the exact four benchmark overlay paths. The
+source materializer requires that seed explicitly and never downloads or
+changes dependencies. For example:
+
+```sh
+git diff --cached --binary HEAD -- \
+  bench/bench_batch_append.c bench/meson.build tests/meson.build \
+  tests/test_bench_batch_append.c > "$HOME/.tmp/batch-append-overlay.patch"
+uv run python scripts/perf/materialize-batch-append-sources.py \
+  --output-root "$HOME/.tmp/batch-append-sources-run-001" \
+  --mode comparison \
+  --overlay-patch "$HOME/.tmp/batch-append-overlay.patch" \
+  --fallback-seed "$HOME/src/wirelog-fallback-seed" \
+  --fallback-seed-mode overlay_staged
+```
+
+Use `--fallback-seed-mode clean` only when the seed contains exactly the three
+validated ignored fallback roots and no staged overlay. The materializer
+creates detached `base-source` and `candidate-source` repositories, stages the
+same overlay in both, copies only the three validated fallback roots, then
+rechecks source and fallback provenance. Pass those two directories to the
+campaign planner. The generated sources remain available for build and profile
+steps; choose a new, absent output root for each materialization.
+For an A/A control, pass `--mode aa_control --aa-product pre` or
+`--mode aa_control --aa-product post`; each generated pair then has the same
+product tree on both sides.
