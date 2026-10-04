@@ -752,6 +752,61 @@ test_lftj_output_growth_denial_propagates_and_retries(void)
     }
 
     columnar->memory_budget_denied = false;
+    wl_columnar_lftj_test_deny_next_output_construction();
+    rc = col_op_lftj(lftj_op, &stack, columnar);
+    wl_columnar_lftj_test_get_output_hook_state(&hook_state);
+    if (hook_state.deny_output_construction_consumed) {
+        atomic_store_explicit(
+            &wl_columnar_memory_governor_ref_get(ref)->usable_bytes,
+            hook_state.previous_constructor_usable_bytes,
+            memory_order_relaxed);
+    }
+    if (!hook_state.deny_output_construction_consumed
+        || hook_state.reserved_before_construction <= baseline_reserved
+        || rc != ENOSPC || !columnar->memory_budget_denied || stack.top != 0) {
+        failure = "output constructor denial did not set session state";
+        goto cleanup;
+    }
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != baseline_reserved) {
+        failure = "output constructor denial leaked reservations";
+        goto cleanup;
+    }
+    if (columnar->sarr_active_pins != 0) {
+        failure = "output constructor denial leaked an arrangement probe";
+        goto cleanup;
+    }
+    for (uint32_t i = 0; i < columnar->sarr_count; i++) {
+        if (columnar->sarr_entries[i].sarr.pin_count != 0) {
+            failure = "output constructor denial left an arrangement pinned";
+            goto cleanup;
+        }
+    }
+    for (uint32_t i = 0; i < 3; i++) {
+        static const char *const names[] = { "r1", "r2", "r3" };
+        col_rel_t *rel = session_find_rel(columnar, names[i]);
+        if (!rel || wl_columnar_source_access_gate_busy(&rel->source_access)) {
+            failure = "output constructor denial leaked a source reader";
+            goto cleanup;
+        }
+    }
+
+    wl_columnar_lftj_test_clear_output_hooks();
+    columnar->memory_budget_denied = false;
+    rc = col_op_lftj(lftj_op, &stack, columnar);
+    if (rc != 0 || columnar->memory_budget_denied || stack.top != 1
+        || !stack.items[0].rel || stack.items[0].rel->nrows != 100) {
+        failure = "retry after output constructor denial failed";
+        goto cleanup;
+    }
+    eval_stack_drain(&stack);
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != baseline_reserved) {
+        failure = "output constructor retry leaked reservations";
+        goto cleanup;
+    }
+
+    columnar->memory_budget_denied = false;
     wl_columnar_lftj_test_deny_next_output_growth();
     rc = col_op_lftj(lftj_op, &stack, columnar);
     wl_columnar_lftj_test_get_output_hook_state(&hook_state);
