@@ -709,8 +709,8 @@ from the production library.
 
 | Anchor (file:function[#N]) | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `ops.c:lftj_test_before_output_append` | `memory_governor->usable_bytes` | `atomic_load_explicit` | relaxed | Save the configured limit before the test hook forces output-growth admission to fail; test-only and excluded from the production library |
-| `ops.c:lftj_test_before_output_append#2` | `memory_governor->usable_bytes` | `atomic_store_explicit` | relaxed | Temporarily set the limit to the current reserved total so the output-growth reservation is denied; test-only and excluded from the production library |
+| `ops.c:lftj_test_before_output_growth` | `memory_governor->usable_bytes` | `atomic_load_explicit` | relaxed | Save the configured limit before the test hook forces output-growth admission to fail; test-only and excluded from the production library |
+| `ops.c:lftj_test_before_output_growth#2` | `memory_governor->usable_bytes` | `atomic_store_explicit` | relaxed | Temporarily set the limit to the current reserved total so the output-growth reservation is denied; test-only and excluded from the production library |
 | `ops.c:lftj_test_after_output_append` | `memory_governor->usable_bytes` | `atomic_store_explicit` | relaxed | Restore the saved governor limit after the append attempt; test-only and excluded from the production library |
 
 The complete source audit now contains **225 atomic call sites**.
