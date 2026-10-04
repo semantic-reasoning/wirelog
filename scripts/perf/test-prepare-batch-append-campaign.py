@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -45,6 +46,7 @@ class PreparePlanTests(unittest.TestCase):
                          base_source=self.source_data['base'],
                          candidate_source=self.source_data['candidate'], aa_product=None,
                          overlay_patch=patch_path, output_dir=self.root / 'out')
+        M['VERIFIED_PRODUCT_DELTAS'].clear()
 
     @staticmethod
     def git(source, *args):
@@ -78,7 +80,9 @@ class PreparePlanTests(unittest.TestCase):
         self.git(source, 'update-ref', 'refs/heads/fixture', anchor)
         self.git(source, 'checkout', '-q', '--detach', anchor)
         if product == 'post':
-            tree = revision['product']['post_tree']
+            self.git(source, 'apply', '--index', str(M['PRODUCT_PATCH_PATH']))
+            tree = self.git(source, 'write-tree')
+            self.assertEqual(tree, revision['product']['post_tree'])
             synthetic = self.git(source, 'commit-tree', tree, '-p', anchor,
                                  '-m', 'synthetic product')
             self.git(source, 'update-ref', 'refs/heads/fixture', synthetic)
@@ -291,7 +295,7 @@ class PreparePlanTests(unittest.TestCase):
                     command, 0, stdout='M\twirelog/columnar/relation.c\n', stderr='')
             return result
         with patch.object(subprocess_module, 'run', side_effect=bad_status):
-            with self.assertRaisesRegex(M['PlanError'], 'path/status/hash'):
+            with self.assertRaisesRegex(M['PlanError'], 'unexpected paths or statuses'):
                 M['load_revision_manifest']()
 
     def test_rejects_extra_product_tree_path(self):
@@ -308,8 +312,112 @@ class PreparePlanTests(unittest.TestCase):
                             'A\tunexpected/product.c\n'), stderr='')
             return result
         with patch.object(subprocess_module, 'run', side_effect=extra_path):
-            with self.assertRaisesRegex(M['PlanError'], 'path/status/hash'):
+            with self.assertRaisesRegex(M['PlanError'], 'unexpected paths or statuses'):
                 M['load_revision_manifest']()
+
+    def test_rejects_tampered_and_unsafe_product_patch(self):
+        from unittest.mock import patch
+        globals_dict = M['verify_product_patch'].__globals__
+        patch_path = self.root / 'scripts/perf/batch-append-product-delta-v1.patch'
+        patch_path.parent.mkdir(parents=True, exist_ok=True)
+        original = M['PRODUCT_PATCH_PATH'].read_bytes()
+        product = dict(diff_sha256=M['PRODUCT_PATCH_SHA256'],
+                       pre_tree='4c10e21ab4ba034dbc50abd92a59d22e8b975130',
+                       post_tree='9fa822ba32dd3b89e71d0158efa27422e49a06d4')
+        paths = dict(REPOSITORY_ROOT=self.root, PRODUCT_PATCH_PATH=patch_path)
+
+        patch_path.write_bytes(original + b'\n')
+        with patch.dict(globals_dict, paths):
+            with self.assertRaisesRegex(M['PlanError'], 'code-pinned hash'):
+                M['verify_product_patch'](product)
+
+        for addition in (
+                b'\ndiff --git a/../../escape b/../../escape\n',
+                b'\nold mode 100644\nnew mode 100755\n'):
+            payload = original + addition
+            patch_path.write_bytes(payload)
+            digest = M['sha256'](payload)
+            with patch.dict(globals_dict, {**paths, 'PRODUCT_PATCH_SHA256': digest}):
+                with self.assertRaisesRegex(M['PlanError'], 'pinned paths|file modes'):
+                    M['verify_product_patch'](dict(product, diff_sha256=digest))
+
+    def test_clean_clone_reconstructs_delta_without_post_tree_object(self):
+        clone = self.root / 'clean-clone'
+        clone.mkdir()
+        head = self.git(M['REPOSITORY_ROOT'], 'rev-parse', 'HEAD')
+        self.git(clone, 'init', '-q')
+        self.git(clone, 'remote', 'add', 'source', str(M['REPOSITORY_ROOT']))
+        self.git(clone, 'fetch', '--no-tags', 'source', head)
+        self.git(clone, 'checkout', '-q', '-b', 'clean-clone', 'FETCH_HEAD')
+        patch_path = clone / 'scripts/perf/batch-append-product-delta-v1.patch'
+        patch_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(M['PRODUCT_PATCH_PATH'], patch_path)
+        bundle_path = clone / 'scripts/perf/batch-append-anchor-v1.bundle'
+        shutil.copyfile(M['ANCHOR_BUNDLE_PATH'], bundle_path)
+        self.git(clone, 'config', 'user.name', 'Clean Clone Test')
+        self.git(clone, 'config', 'user.email', 'clean-clone@example.invalid')
+        self.git(clone, 'add', 'scripts/perf/batch-append-product-delta-v1.patch')
+        self.git(clone, 'commit', '-qm', 'fixture tracked product delta')
+
+        revision = json.loads(M['MANIFEST_PATH'].read_text(encoding='utf-8'))
+        post_tree = revision['product']['post_tree']
+        missing_objects = (revision['anchor']['commit'], revision['anchor']['tree'],
+                           revision['product']['pre_tree'], post_tree)
+        for oid in missing_objects:
+            with self.subTest(missing_oid=oid):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    self.git(clone, 'cat-file', '-e', f'{oid}^{{object}}')
+        globals_dict = M['load_revision_manifest'].__globals__
+        paths = dict(REPOSITORY_ROOT=clone,
+                     MANIFEST_PATH=clone / 'scripts/perf/batch-append-revision-manifest-v1.json',
+                     PRODUCT_PATCH_PATH=patch_path, ANCHOR_BUNDLE_PATH=bundle_path)
+
+        def object_inventory(root):
+            object_dir = Path(self.git(root, 'rev-parse', '--git-path', 'objects'))
+            if not object_dir.is_absolute():
+                object_dir = (root / object_dir).resolve()
+            return sorted((str(path.relative_to(object_dir)), path.stat().st_size,
+                           path.stat().st_mtime_ns)
+                          for path in object_dir.rglob('*') if path.is_file())
+
+        before = dict(
+            refs=self.git(clone, 'show-ref'),
+            status=self.git(clone, 'status', '--porcelain'),
+            index=(clone / '.git/index').read_bytes(),
+            objects=object_inventory(clone))
+        temporary_root = Path.home() / '.tmp'
+        temporary_root.mkdir(mode=0o700, exist_ok=True)
+        temporary_pattern = f'batch-append-tree-{os.getpid()}-*'
+        temporary_before = set(temporary_root.glob(temporary_pattern))
+        with patch.dict(globals_dict, paths):
+            loaded, _digest = M['load_revision_manifest']()
+        temporary_after = set(temporary_root.glob(temporary_pattern))
+        after = dict(
+            refs=self.git(clone, 'show-ref'),
+            status=self.git(clone, 'status', '--porcelain'),
+            index=(clone / '.git/index').read_bytes(),
+            objects=object_inventory(clone))
+        self.assertEqual(loaded['product']['post_tree'], post_tree)
+        self.assertEqual(before, after)
+        self.assertEqual(temporary_before, temporary_after)
+        for oid in missing_objects:
+            with self.subTest(missing_after=oid):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    self.git(clone, 'cat-file', '-e', f'{oid}^{{object}}')
+
+        original_bundle = bundle_path.read_bytes()
+        bundle_path.write_bytes(original_bundle + b'changed')
+        with patch.dict(globals_dict, paths):
+            with self.assertRaisesRegex(M['PlanError'], 'anchor bundle bytes'):
+                M['load_revision_manifest']()
+        bundle_path.write_bytes(original_bundle)
+
+        wrong_post = dict(loaded['product'], post_tree='0' * 40)
+        with patch.dict(globals_dict, paths):
+            with self.assertRaisesRegex(M['PlanError'], 'does not match pinned post tree'):
+                M['verify_product_patch'](wrong_post)
+        self.assertEqual(temporary_before,
+                         set(temporary_root.glob(temporary_pattern)))
 
     def test_writes_durable_plan_only_to_fresh_directory(self):
         from unittest.mock import patch

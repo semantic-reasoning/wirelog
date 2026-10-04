@@ -9,11 +9,21 @@ from pathlib import Path
 import subprocess
 import sys
 import runpy
+import tempfile
 
 SCHEMA = 'wirelog.batch-append-plan.v3'
 SCHEMA_VERSION = 3
 MANIFEST_PATH = Path(__file__).with_name('batch-append-revision-manifest-v1.json')
 MANIFEST_SHA256 = 'be21dfe6eb2c34a7b4b855d74e0020fa68b87cc570901ef41c09ba395ee69ad8'
+PRODUCT_PATCH_PATH = Path(__file__).with_name('batch-append-product-delta-v1.patch')
+PRODUCT_PATCH_SHA256 = '059b699ee5a802b13a54f9e7e6bc04cc043b9f95aa311294801593d3fc7f977d'
+ANCHOR_BUNDLE_PATH = Path(__file__).with_name('batch-append-anchor-v1.bundle')
+ANCHOR_BUNDLE_SIZE = 9853557
+ANCHOR_BUNDLE_SHA256 = '20bac73d57b374248c32a05bc1f02e20a035da4585c123ce291d28fb8461c995'
+ANCHOR_REF = 'refs/heads/batch-append-anchor'
+ANCHOR_COMMIT = '64bd12f499b357d60d1928d5dba08326af58426f'
+ANCHOR_TREE = '4c10e21ab4ba034dbc50abd92a59d22e8b975130'
+VERIFIED_PRODUCT_DELTAS = set()
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 FALLBACKS = runpy.run_path(str(Path(__file__).with_name('batch_append_fallbacks.py')))
 CASES = ('1x1', '1x256', '32x256')
@@ -83,6 +93,119 @@ def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def verify_product_patch(product):
+    expected_paths = ['tests/test_relation_generations.c', 'wirelog/columnar/relation.c']
+    try:
+        patch_relative = PRODUCT_PATCH_PATH.resolve().relative_to(REPOSITORY_ROOT)
+        patch_raw = PRODUCT_PATCH_PATH.read_bytes()
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        raise PlanError('product delta patch must be a repository input') from error
+    if patch_relative.as_posix() != 'scripts/perf/batch-append-product-delta-v1.patch':
+        raise PlanError('product delta patch path is not the pinned repository input')
+    if sha256(patch_raw) != PRODUCT_PATCH_SHA256 \
+            or product.get('diff_sha256') != PRODUCT_PATCH_SHA256:
+        raise PlanError('product delta patch bytes do not match the code-pinned hash')
+    try:
+        patch_lines = patch_raw.decode('utf-8').splitlines()
+    except UnicodeError as error:
+        raise PlanError('product delta patch must be UTF-8 text') from error
+
+    expected_headers = [f'diff --git a/{path} b/{path}' for path in expected_paths]
+    actual_headers = [line for line in patch_lines if line.startswith('diff --git ')]
+    if actual_headers != expected_headers:
+        raise PlanError('product delta patch must modify exactly the pinned paths')
+    forbidden_headers = ('old mode ', 'new mode ', 'new file mode ', 'deleted file mode ',
+                         'rename from ', 'rename to ', 'copy from ', 'copy to ')
+    if any(line.startswith(forbidden_headers) for line in patch_lines):
+        raise PlanError('product delta patch cannot rename paths or change file modes')
+    for path in expected_paths:
+        if patch_lines.count(f'--- a/{path}') != 1 \
+                or patch_lines.count(f'+++ b/{path}') != 1:
+            raise PlanError('product delta patch has unsafe or unexpected file paths')
+
+    try:
+        bundle_relative = ANCHOR_BUNDLE_PATH.resolve().relative_to(REPOSITORY_ROOT)
+        bundle_raw = ANCHOR_BUNDLE_PATH.read_bytes()
+    except (OSError, ValueError) as error:
+        raise PlanError('anchor bundle must be a repository input') from error
+    if bundle_relative.as_posix() != 'scripts/perf/batch-append-anchor-v1.bundle' \
+            or len(bundle_raw) != ANCHOR_BUNDLE_SIZE \
+            or sha256(bundle_raw) != ANCHOR_BUNDLE_SHA256:
+        raise PlanError('anchor bundle bytes do not match the code-pinned identity')
+    verification_key = (str(REPOSITORY_ROOT.resolve()), str(PRODUCT_PATCH_PATH.resolve()),
+                        PRODUCT_PATCH_SHA256, str(ANCHOR_BUNDLE_PATH.resolve()),
+                        len(bundle_raw), ANCHOR_BUNDLE_SHA256,
+                        product.get('pre_tree'), product.get('post_tree'),
+                        product.get('diff_sha256'))
+    if verification_key in VERIFIED_PRODUCT_DELTAS:
+        return
+    home_tmp = safe_path(Path.home() / '.tmp', 'revision verification temporary directory')
+    home_tmp.mkdir(mode=0o700, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+            dir=home_tmp, prefix=f'batch-append-tree-{os.getpid()}-') as name:
+        isolated = Path(name)
+        repo = isolated / 'repo'
+        repo.mkdir(mode=0o700)
+        subprocess.run(['git', '-C', str(repo), 'init', '-q'], check=True,
+                       capture_output=True)
+        env = os.environ.copy()
+        env['GIT_OPTIONAL_LOCKS'] = '0'
+
+        def isolated_git(*args, text=True):
+            result = subprocess.run(
+                ['git', '-C', str(repo), *args], env=env,
+                capture_output=True, check=False, text=text,
+                encoding='utf-8' if text else None)
+            if result.returncode:
+                stderr = result.stderr if text else result.stderr.decode(errors='replace')
+                raise PlanError(f'cannot reconstruct pinned product delta: {stderr.strip()}')
+            return result.stdout
+
+        bundle_check = subprocess.run(['git', 'bundle', 'verify', str(ANCHOR_BUNDLE_PATH)],
+                                      cwd=repo, capture_output=True, text=True,
+                                      encoding='utf-8', check=False)
+        if bundle_check.returncode or 'records a complete history' not in bundle_check.stdout:
+            raise PlanError('anchor bundle must contain complete history without prerequisites')
+        refs = subprocess.run(['git', 'bundle', 'list-heads', str(ANCHOR_BUNDLE_PATH)],
+                              cwd=repo, capture_output=True, text=True,
+                              encoding='utf-8', check=False)
+        if refs.returncode or refs.stdout.strip().splitlines() != [f'{ANCHOR_COMMIT} {ANCHOR_REF}']:
+            raise PlanError('anchor bundle must advertise exactly the pinned anchor ref')
+        isolated_git('fetch', '--no-tags', str(ANCHOR_BUNDLE_PATH), ANCHOR_REF)
+        if isolated_git('rev-parse', 'FETCH_HEAD').strip() != ANCHOR_COMMIT \
+                or isolated_git('rev-parse', 'FETCH_HEAD^{tree}').strip() != ANCHOR_TREE:
+            raise PlanError('anchor bundle commit/tree differs from the pinned identity')
+        isolated_git('read-tree', product['pre_tree'])
+        isolated_git('apply', '--cached', '--check', str(PRODUCT_PATCH_PATH))
+        isolated_git('apply', '--cached', str(PRODUCT_PATCH_PATH))
+        reconstructed_tree = isolated_git('write-tree').strip()
+        if reconstructed_tree != product.get('post_tree'):
+            raise PlanError('reconstructed product tree does not match pinned post tree')
+
+        changed = isolated_git(
+            'diff', '--no-renames', '--no-ext-diff', '--no-textconv', '--name-status',
+            product['pre_tree'], reconstructed_tree).splitlines()
+        if changed != [f'M\t{path}' for path in expected_paths]:
+            raise PlanError('reconstructed product delta has unexpected paths or statuses')
+        raw = isolated_git(
+            'diff', '--no-renames', '--no-ext-diff', '--no-textconv', '--raw',
+            product['pre_tree'], reconstructed_tree).splitlines()
+        if len(raw) != len(expected_paths):
+            raise PlanError('reconstructed product delta has unexpected raw entries')
+        for line, path in zip(raw, expected_paths, strict=True):
+            header, actual_path = line.split('\t', 1)
+            fields = header.split()
+            if actual_path != path or fields[0:2] != [':100644', '100644'] \
+                    or fields[-1] != 'M':
+                raise PlanError('reconstructed product delta changed a path type or mode')
+        diff = isolated_git(
+            'diff', '--no-renames', '--no-ext-diff', '--no-textconv', '--binary',
+            product['pre_tree'], reconstructed_tree, text=False)
+        if sha256(diff) != product.get('diff_sha256'):
+            raise PlanError('reconstructed product delta does not match pinned patch hash')
+    VERIFIED_PRODUCT_DELTAS.add(verification_key)
+
+
 def load_revision_manifest():
     try:
         manifest_relative = MANIFEST_PATH.resolve().relative_to(REPOSITORY_ROOT)
@@ -118,22 +241,7 @@ def load_revision_manifest():
         raise PlanError('revision manifest identities or exact paths are invalid')
     if set(product['paths']) & set(OVERLAY_PATHS):
         raise PlanError('revision product paths overlap benchmark overlay paths')
-    try:
-        changed = subprocess.run(
-            ['git', '-C', str(REPOSITORY_ROOT), 'diff', '--no-renames',
-             '--no-ext-diff', '--no-textconv', '--name-status',
-             product['pre_tree'], product['post_tree']],
-            check=True, capture_output=True, text=True, encoding='utf-8').stdout.splitlines()
-        diff = subprocess.run(
-            ['git', '-C', str(REPOSITORY_ROOT), 'diff', '--no-renames',
-             '--no-ext-diff', '--no-textconv', '--binary',
-             product['pre_tree'], product['post_tree']],
-            check=True, capture_output=True).stdout
-    except (OSError, subprocess.SubprocessError) as error:
-        raise PlanError(f'cannot verify revision product delta: {error}') from error
-    if changed != [f'M\t{path}' for path in paths] \
-            or sha256(diff) != product.get('diff_sha256'):
-        raise PlanError('revision product delta does not match manifest path/status/hash')
+    verify_product_patch(product)
     return manifest, sha256(raw)
 
 

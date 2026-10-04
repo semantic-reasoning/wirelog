@@ -957,6 +957,9 @@ if host_machine.system() == 'linux'
   test('perf_batch_append_plan_contract', py3,
        args: [meson.project_source_root() / 'scripts/perf/test-prepare-batch-append-campaign.py'],
        suite: 'abi', timeout: 120)
+  test('perf_batch_append_source_materializer_contract', py3,
+       args: [meson.project_source_root() / 'scripts/perf/test-materialize-batch-append-sources.py'],
+       suite: 'abi', timeout: 180)
   test('perf_batch_append_execution_contract', py3,
        args: [meson.project_source_root() / 'scripts/perf/test-prepare-batch-append-execution.py'],
        suite: 'abi', timeout: 120)

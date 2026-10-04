@@ -93,7 +93,11 @@ class ExecutionPreflightTests(unittest.TestCase):
         self.git(source, 'update-ref', 'refs/heads/fixture', anchor)
         self.git(source, 'checkout', '-q', '--detach', anchor)
         if product == 'post':
-            commit = self.git(source, 'commit-tree', revision['product']['post_tree'],
+            self.git(source, 'apply', '--index', str(PLAN['PRODUCT_PATCH_PATH']))
+            tree = self.git(source, 'write-tree')
+            if tree != revision['product']['post_tree']:
+                raise AssertionError('fixture product patch did not reconstruct pinned tree')
+            commit = self.git(source, 'commit-tree', tree,
                               '-p', anchor, '-m', 'synthetic product')
             self.git(source, 'update-ref', 'refs/heads/fixture', commit)
             self.git(source, 'checkout', '-q', '--detach', commit)

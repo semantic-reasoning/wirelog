@@ -407,3 +407,38 @@ def validate_fallbacks(source_root):
         raise FallbackError('outer source status changed during fallback verification')
     return dict(schema=SCHEMA, outer_ignored_paths=list(IGNORED_ROOTS),
                 nanoarrow=nano, xxhash=xxhash)
+
+
+def validate_fallback_seed(seed_root, status_mode):
+    """Validate a hydrated local donor without requiring benchmark overlay files."""
+    seed_root = Path(seed_root).resolve()
+    def status_snapshot():
+        if status_mode == 'overlay_staged':
+            return outer_status(seed_root)
+        if status_mode != 'clean':
+            raise FallbackError('fallback seed status mode must be clean or overlay_staged')
+        raw = git(seed_root, 'status', '--porcelain=v1', '-z', '--untracked-files=all',
+                  '--ignored=matching', binary=True)
+        records = [record for record in raw.split(b'\0') if record]
+        observed = {}
+        for record in records:
+            if len(record) < 4 or record[2:3] != b' ':
+                raise FallbackError('fallback seed outer Git status record is malformed')
+            code = record[:2].decode('ascii')
+            path = record[3:].decode('utf-8', errors='strict')
+            if code != '!!' or path not in IGNORED_ROOTS or path in observed:
+                raise FallbackError(f'fallback seed has an unapproved outer status entry: {code} {path}')
+            observed[path] = code
+        if observed != {path: '!!' for path in IGNORED_ROOTS}:
+            raise FallbackError('clean fallback seed must contain exactly the three ignored dependency roots')
+        return observed
+
+    outer = status_snapshot()
+    revision = git(seed_root, 'rev-parse', 'HEAD')
+    wraps = check_wraps(seed_root, revision)
+    nano = nanoarrow_manifest(seed_root, wraps)
+    xxhash = xxhash_manifest(seed_root, revision, wraps)
+    if status_snapshot() != outer:
+        raise FallbackError('fallback seed changed during provenance verification')
+    return dict(schema=SCHEMA, outer_ignored_paths=list(IGNORED_ROOTS),
+                nanoarrow=nano, xxhash=xxhash)
