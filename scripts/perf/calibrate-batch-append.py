@@ -105,9 +105,10 @@ def hash_file(path):
 
 def parse_cpu_list(value):
     cpus = set()
-    for item in value.strip().split(','):
-        if not item:
-            continue
+    items = value.strip().split(',')
+    if any(not item for item in items):
+        raise CalibrationError(f'invalid Linux CPU list {value!r}')
+    for item in items:
         first, separator, last = item.partition('-')
         if not first.isdecimal() or (separator and not last.isdecimal()):
             raise CalibrationError(f'invalid Linux CPU list {value!r}')
@@ -159,11 +160,25 @@ def cgroup_cpu_stat(proc_cgroup, cgroup_root):
 def proc_cpu_ticks(proc_stat, cpu_ids):
     result = {}
     wanted = {f'cpu{cpu}' for cpu in cpu_ids}
-    for line in Path(proc_stat).read_text(encoding='ascii').splitlines():
+    try:
+        lines = Path(proc_stat).read_text(encoding='ascii').splitlines()
+    except (OSError, UnicodeError) as error:
+        raise CalibrationError(f'SMT sibling CPU counters are unavailable: {error}') from error
+    for line in lines:
         fields = line.split()
         if fields and fields[0] in wanted and len(fields) >= 9:
-            counters = [int(value) for value in fields[1:9]]
-            result[int(fields[0][3:])] = dict(
+            values = fields[1:9]
+            if any(not value.isascii() or not value.isdecimal() for value in values):
+                raise CalibrationError(
+                    f'SMT sibling CPU counters are malformed for {fields[0]}')
+            counters = [int(value) for value in values]
+            if any(value < 0 for value in counters):
+                raise CalibrationError(
+                    f'SMT sibling CPU counters are negative for {fields[0]}')
+            cpu = int(fields[0][3:])
+            if cpu in result:
+                raise CalibrationError(f'duplicate SMT sibling CPU counters for cpu{cpu}')
+            result[cpu] = dict(
                 total=sum(counters), busy=sum(counters[:3]) + sum(counters[5:8]))
     return result
 
@@ -208,8 +223,14 @@ class HostProbe:
         cpu = allowed[0]
         cpu_root = self.sys / f'devices/system/cpu/cpu{cpu}'
         topology = cpu_root / 'topology/thread_siblings_list'
-        siblings = sorted(set(parse_cpu_list(topology.read_text(encoding='ascii'))) - {cpu}) \
-            if topology.is_file() else []
+        try:
+            topology_cpus = parse_cpu_list(topology.read_text(encoding='ascii'))
+        except (OSError, UnicodeError, CalibrationError) as error:
+            raise CalibrationError(f'SMT sibling topology is unavailable: {error}') from error
+        if cpu not in topology_cpus:
+            raise CalibrationError(
+                f'SMT sibling topology does not include selected CPU {cpu}')
+        siblings = sorted(set(topology_cpus) - {cpu})
         cpufreq = cpu_root / 'cpufreq'
         governor_path = cpufreq / 'scaling_governor'
         frequency_path = cpufreq / 'scaling_cur_freq'
@@ -239,6 +260,11 @@ def host_eligibility(before, after, wall_ns):
             or before['selected_cpu'] not in after['online_cpus'] \
             or before['selected_cpu'] not in after['affinity_cpus']:
         diagnostics.append('selected CPU online/affinity changed during attempt')
+    siblings = before['smt_siblings']
+    after_siblings = after['smt_siblings']
+    topology_changed = siblings != after_siblings
+    if topology_changed:
+        diagnostics.append('SMT sibling topology changed during attempt')
     psi_delta = after['cpu_psi_some_total_usec'] - before['cpu_psi_some_total_usec']
     if psi_delta < 0 or wall_ns <= 0:
         diagnostics.append('CPU PSI or monotonic wall clock moved backwards')
@@ -253,28 +279,72 @@ def host_eligibility(before, after, wall_ns):
         cgroup_delta[key] = delta
         if delta != 0:
             diagnostics.append(f'cgroup v2 {key} changed by {delta}')
-    siblings = before['smt_siblings']
     measured = {}
-    unavailable = []
+    unavailable = sorted(set(siblings) ^ set(after_siblings))
+    before_ticks = before.get('sibling_cpu_ticks')
+    after_ticks = after.get('sibling_cpu_ticks')
+    if type(before_ticks) is not dict:
+        diagnostics.append('SMT sibling before-sample counter map is malformed')
+    elif set(before_ticks) != set(siblings) or any(type(cpu) is not int for cpu in before_ticks):
+        diagnostics.append('SMT sibling before-sample counter map is partial or unexpected')
+    if type(after_ticks) is not dict:
+        diagnostics.append('SMT sibling after-sample counter map is malformed')
+    elif set(after_ticks) != set(after_siblings) \
+            or any(type(cpu) is not int for cpu in after_ticks):
+        diagnostics.append('SMT sibling after-sample counter map is partial or unexpected')
+    for cpu in unavailable:
+        diagnostics.append(f'SMT sibling CPU {cpu} is absent from one topology sample')
     for cpu in siblings:
-        left = before['sibling_cpu_ticks'].get(cpu)
-        right = after['sibling_cpu_ticks'].get(cpu)
+        left = before_ticks.get(cpu) if type(before_ticks) is dict else None
+        right = after_ticks.get(cpu) if type(after_ticks) is dict else None
         if left is None or right is None:
             unavailable.append(cpu)
+            missing = []
+            if left is None:
+                missing.append('before')
+            if right is None:
+                missing.append('after')
+            diagnostics.append(
+                f'SMT sibling CPU {cpu} counters missing from {" and ".join(missing)} sample')
+            continue
+        if type(left) is not dict or type(right) is not dict \
+                or set(left) != {'total', 'busy'} or set(right) != {'total', 'busy'} \
+                or any(type(sample.get(key)) is not int or sample[key] < 0
+                       for sample in (left, right) for key in ('total', 'busy')) \
+                or any(sample['busy'] > sample['total'] for sample in (left, right)):
+            unavailable.append(cpu)
+            diagnostics.append(f'SMT sibling CPU {cpu} counters are malformed')
             continue
         total_delta = right['total'] - left['total']
         busy_delta = right['busy'] - left['busy']
-        if total_delta <= 0 or busy_delta < 0:
+        if total_delta <= 0:
             unavailable.append(cpu)
+            diagnostics.append(
+                f'SMT sibling CPU {cpu} total ticks did not increase ({total_delta})')
+            continue
+        if busy_delta < 0:
+            unavailable.append(cpu)
+            diagnostics.append(f'SMT sibling CPU {cpu} busy ticks regressed ({busy_delta})')
+            continue
+        if busy_delta > total_delta:
+            unavailable.append(cpu)
+            diagnostics.append(
+                f'SMT sibling CPU {cpu} busy ticks exceed total ticks ({busy_delta}>{total_delta})')
             continue
         busy_percent = busy_delta * 100.0 / total_delta
         measured[str(cpu)] = busy_percent
         if busy_percent > 1.0:
             diagnostics.append(f'SMT sibling CPU {cpu} busy exceeded 1% ({busy_percent:.3f}%)')
-    sibling_status = 'measured' if measured else 'none'
+    if not siblings and not after_siblings:
+        sibling_status = 'none'
+    elif unavailable or topology_changed:
+        sibling_status = 'unmeasurable'
+    else:
+        sibling_status = 'measured'
+    unavailable = sorted(set(unavailable))
     sibling = dict(status=sibling_status, cpus=siblings,
                    busy_percent_by_cpu=measured,
-                   absent_reason=('no measurable SMT sibling' if not measured else None),
+                   absent_reason=('no SMT siblings in verified topology' if not siblings else None),
                    unmeasurable_cpus=unavailable)
     return dict(eligible=not diagnostics, diagnostics=diagnostics,
                 cpu_psi_some_total_delta_usec=psi_delta,
@@ -585,10 +655,10 @@ def calibrate(plan_path, profile_path, overlay_path, evidence_dir,
             try:
                 after = probe.snapshot()
                 telemetry_error = None
-            except CalibrationError as error:
+            except (CalibrationError, OSError, ValueError) as error:
                 after = None
                 telemetry_error = str(error)
-            if telemetry_error:
+            if telemetry_error is not None:
                 result_record = dict(
                     started=started, stdout_path=stdout_path.name,
                     stdout_sha256=sha256(result['stdout']), stderr_path=stderr_path.name,

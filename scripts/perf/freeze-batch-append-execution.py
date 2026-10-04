@@ -193,6 +193,9 @@ def validate_host_snapshot(host, label):
     ticks = host['sibling_cpu_ticks']
     if type(ticks) is not dict:
         raise FreezeError(f'{label} SMT sibling ticks are invalid')
+    expected_tick_keys = {str(cpu) for cpu in host['smt_siblings']}
+    if set(ticks) != expected_tick_keys:
+        raise FreezeError(f'{label} SMT sibling tick coverage differs from topology')
     for cpu, counters in ticks.items():
         try:
             parsed_cpu = int(cpu)

@@ -41,13 +41,17 @@ def stdout_for(case, iterations, append_total_ns):
 
 
 class FakeProbe:
+    def __init__(self):
+        self.calls = 0
+
     def snapshot(self):
-        return dict(timestamp_utc=1, kernel='test-kernel', online_cpus=[0, 1],
+        self.calls += 1
+        return dict(timestamp_utc=self.calls, kernel='test-kernel', online_cpus=[0, 1],
                     affinity_cpus=[0, 1], selected_cpu=0, governor='performance',
                     frequency_khz=2000000, model='fixture cpu', microcode='0x1',
                     cpu_psi_some_total_usec=100, cgroup_v2_cpu=dict(
                         nr_throttled=2, throttled_usec=100), smt_siblings=[1],
-                    sibling_cpu_ticks={'1': dict(total=1000, busy=500)})
+                    sibling_cpu_ticks={1: dict(total=1000 + self.calls * 100, busy=500)})
 
 
 class FakeProcess:
@@ -196,11 +200,100 @@ class CalibrationTests(unittest.TestCase):
         after['cgroup_v2_cpu'] = dict(nr_throttled=0, throttled_usec=0)
         good = CAL['host_eligibility'](snapshot, after, 1_000_000_000)
         self.assertTrue(good['eligible'])
+        self.assertEqual(good['smt_sibling']['status'], 'measured')
         self.assertLessEqual(good['smt_sibling']['busy_percent_by_cpu']['1'], 1.0)
+        self.assertEqual(good['smt_sibling']['unmeasurable_cpus'], [])
         noisy = dict(after, cpu_psi_some_total_usec=20_000)
         self.assertFalse(CAL['host_eligibility'](snapshot, noisy, 1_000_000_000)['eligible'])
         throttled = dict(after, cgroup_v2_cpu=dict(nr_throttled=1, throttled_usec=1))
         self.assertFalse(CAL['host_eligibility'](snapshot, throttled, 1_000_000_000)['eligible'])
+
+        no_siblings_before = dict(snapshot, smt_siblings=[], sibling_cpu_ticks={})
+        no_siblings_after = dict(after, smt_siblings=[], sibling_cpu_ticks={})
+        no_siblings = CAL['host_eligibility'](
+            no_siblings_before, no_siblings_after, 1_000_000_000)
+        self.assertTrue(no_siblings['eligible'])
+        self.assertEqual(no_siblings['smt_sibling']['status'], 'none')
+
+        missing_before = dict(snapshot, sibling_cpu_ticks={})
+        unavailable = CAL['host_eligibility'](missing_before, after, 1_000_000_000)
+        self.assertFalse(unavailable['eligible'])
+        self.assertEqual(unavailable['smt_sibling']['status'], 'unmeasurable')
+        self.assertEqual(unavailable['smt_sibling']['unmeasurable_cpus'], [1])
+        self.assertTrue(any('before' in item for item in unavailable['diagnostics']))
+
+        missing_after = dict(after, sibling_cpu_ticks={})
+        unavailable = CAL['host_eligibility'](snapshot, missing_after, 1_000_000_000)
+        self.assertFalse(unavailable['eligible'])
+        self.assertTrue(any('after' in item for item in unavailable['diagnostics']))
+
+        partial_before = dict(snapshot, smt_siblings=[1, 2], sibling_cpu_ticks={
+            1: dict(total=1000, busy=500), 2: dict(total=1000, busy=500)})
+        partial_after = dict(after, smt_siblings=[1, 2], sibling_cpu_ticks={
+            1: dict(total=2000, busy=500)})
+        partial = CAL['host_eligibility'](partial_before, partial_after, 1_000_000_000)
+        self.assertFalse(partial['eligible'])
+        self.assertEqual(partial['smt_sibling']['unmeasurable_cpus'], [2])
+
+        zero_delta = dict(snapshot, sibling_cpu_ticks={
+            1: dict(total=1000, busy=500)})
+        unchanged = CAL['host_eligibility'](zero_delta, zero_delta, 1_000_000_000)
+        self.assertFalse(unchanged['eligible'])
+        self.assertTrue(any('did not increase' in item for item in unchanged['diagnostics']))
+        counter_before = dict(snapshot, sibling_cpu_ticks={
+            1: dict(total=1000, busy=500)})
+        regressed = dict(after, sibling_cpu_ticks={
+            1: dict(total=999, busy=499)})
+        decreasing = CAL['host_eligibility'](counter_before, regressed, 1_000_000_000)
+        self.assertFalse(decreasing['eligible'])
+        self.assertTrue(any('did not increase' in item for item in decreasing['diagnostics']))
+        busy_regressed = dict(after, sibling_cpu_ticks={
+            1: dict(total=2100, busy=499)})
+        counter_after = dict(after, sibling_cpu_ticks={
+            1: dict(total=2000, busy=500)})
+        decreasing = CAL['host_eligibility'](counter_after, busy_regressed, 1_000_000_000)
+        self.assertFalse(decreasing['eligible'])
+        self.assertTrue(any('busy ticks regressed' in item
+                            for item in decreasing['diagnostics']))
+        malformed = dict(after, sibling_cpu_ticks={
+            1: dict(total=True, busy=500)})
+        self.assertFalse(CAL['host_eligibility'](
+            snapshot, malformed, 1_000_000_000)['eligible'])
+        impossible_busy = dict(after, sibling_cpu_ticks={
+            1: dict(total=1001, busy=700)})
+        inconsistent = CAL['host_eligibility'](
+            counter_before, impossible_busy, 1_000_000_000)
+        self.assertFalse(inconsistent['eligible'])
+        self.assertTrue(any('busy ticks exceed total ticks' in item
+                            for item in inconsistent['diagnostics']))
+        over_busy = dict(after, sibling_cpu_ticks={
+            1: dict(total=2000, busy=600)})
+        too_busy = CAL['host_eligibility'](snapshot, over_busy, 1_000_000_000)
+        self.assertFalse(too_busy['eligible'])
+        self.assertTrue(any('exceeded 1%' in item for item in too_busy['diagnostics']))
+
+        topology_path = sysfs / 'devices/system/cpu/cpu0/topology/thread_siblings_list'
+        topology_path.unlink()
+        with self.assertRaisesRegex(CAL['CalibrationError'], 'SMT sibling topology'):
+            probe.snapshot()
+        topology_path.mkdir()
+        with self.assertRaisesRegex(CAL['CalibrationError'], 'SMT sibling topology'):
+            probe.snapshot()
+        topology_path.rmdir()
+        topology_path.write_text('malformed\n', encoding='ascii')
+        with self.assertRaisesRegex(CAL['CalibrationError'], 'SMT sibling topology'):
+            probe.snapshot()
+        topology_path.write_text('1\n', encoding='ascii')
+        with self.assertRaisesRegex(CAL['CalibrationError'], 'does not include selected CPU'):
+            probe.snapshot()
+        topology_path.write_text('0,1\n', encoding='ascii')
+        (proc / 'stat').write_text('cpu1 invalid 0 0 0 0 0 0 0 0\n', encoding='ascii')
+        with self.assertRaisesRegex(CAL['CalibrationError'], 'counters are malformed'):
+            probe.snapshot()
+        topology_path.write_text('0\n', encoding='ascii')
+        no_sibling_snapshot = probe.snapshot()
+        self.assertEqual(no_sibling_snapshot['smt_siblings'], [])
+        self.assertEqual(no_sibling_snapshot['sibling_cpu_ticks'], {})
 
     def test_scaling_retains_attempts_and_publishes_only_after_three_cases(self):
         path, artifact = self.run_calibration('success', [150_000_000, 300_000_000,
@@ -229,6 +322,9 @@ class CalibrationTests(unittest.TestCase):
                             record['process_monotonic_started_ns']
                             for record in artifact['attempts']))
         self.assertTrue(all(record['telemetry']['eligible'] for record in artifact['attempts']))
+        self.assertTrue(all(record['telemetry']['smt_sibling']['status'] == 'measured'
+                            and record['telemetry']['smt_sibling']['unmeasurable_cpus'] == []
+                            for record in artifact['attempts']))
         self.assertTrue(all(record['child_affinity_cpus'] == [0]
                             and record['child_affinity_error'] is None
                             for record in artifact['attempts']))
@@ -238,6 +334,64 @@ class CalibrationTests(unittest.TestCase):
             self.assertEqual(CAL['sha256'](evidence.read_bytes()), attempt['stdout_sha256'])
             stderr = path.parent / attempt['stderr_path']
             self.assertEqual(CAL['sha256'](stderr.read_bytes()), attempt['stderr_sha256'])
+
+    def test_post_launch_telemetry_failure_keeps_attempt_evidence_and_no_calibration(self):
+        failures = (
+            (CAL['CalibrationError'], 'SMT sibling CPU counters are malformed'),
+            (OSError, 'host telemetry read failed'),
+            (ValueError, 'host telemetry parse failed'),
+            (ValueError, ''),
+        )
+        for failure_index, (error_type, message) in enumerate(failures, 1):
+            with self.subTest(error_type=error_type.__name__):
+                class FailingAfterProbe(FakeProbe):
+                    def snapshot(inner):
+                        if inner.calls == 2:
+                            raise error_type(message)
+                        return super(FailingAfterProbe, inner).snapshot()
+
+                FakeProcess.next_outputs = [300_000_000]
+                evidence = self.evidence_dir(
+                    f'post-telemetry-failure-{failure_index}-{error_type.__name__}')
+                with self.assertRaisesRegex(
+                        CAL['CalibrationError'], 'post-attempt host telemetry'):
+                    CAL['calibrate'](
+                        self.plan_path, self.profile_path, self.overlay, evidence,
+                        timeout_seconds=5, probe=FailingAfterProbe(),
+                        popen_factory=FakeProcess, affinity_getter=lambda _pid: {0})
+                self.assertTrue((evidence / '1x1-attempt-01-started.json').is_file())
+                self.assertTrue((evidence / '1x1-attempt-01-stdout.bin').is_file())
+                self.assertTrue((evidence / '1x1-attempt-01-stderr.bin').is_file())
+                result = json.loads((evidence / '1x1-attempt-01-result.json').read_text(
+                    encoding='utf-8'))
+                self.assertFalse(result['eligible'])
+                self.assertFalse(result['accepted'])
+                self.assertIsNone(result['host_after'])
+                self.assertIn('required post-attempt host telemetry unavailable',
+                              result['diagnostic'])
+                self.assertIn(message, result['diagnostic'])
+                self.assertFalse((evidence / 'calibration.json').exists())
+
+    def test_missing_known_sibling_after_sample_is_retained_and_not_accepted(self):
+        class MissingAfterProbe(FakeProbe):
+            def snapshot(inner):
+                value = super(MissingAfterProbe, inner).snapshot()
+                if inner.calls == 3:
+                    value['sibling_cpu_ticks'] = {}
+                return value
+
+        FakeProcess.next_outputs = [300_000_000]
+        evidence = self.evidence_dir('missing-sibling-after')
+        with self.assertRaisesRegex(CAL['CalibrationError'], 'counters missing from after'):
+            CAL['calibrate'](self.plan_path, self.profile_path, self.overlay, evidence,
+                             timeout_seconds=5, probe=MissingAfterProbe(),
+                             popen_factory=FakeProcess, affinity_getter=lambda _pid: {0})
+        result = json.loads((evidence / '1x1-attempt-01-result.json').read_text(
+            encoding='utf-8'))
+        self.assertFalse(result['eligible'])
+        self.assertFalse(result['accepted'])
+        self.assertEqual(result['telemetry']['smt_sibling']['unmeasurable_cpus'], [1])
+        self.assertFalse((evidence / 'calibration.json').exists())
 
     def test_calibrate_accepts_string_paths_from_cli(self):
         FakeProcess.next_outputs = [150_000_000, 300_000_000, 280_000_000, 260_000_000]
