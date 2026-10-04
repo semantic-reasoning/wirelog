@@ -16,7 +16,22 @@ FakeProcess = FIXTURE_MODULE['FakeProcess']
 FakeProbe = runpy.run_path(str(PERF / 'test-calibrate-batch-append.py'))['FakeProbe']
 
 
+def cleanup_nested_fixture(fixture):
+    if not fixture.doCleanups():
+        raise AssertionError('nested fixture cleanup failed')
+
+
 class CollectionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # This suite drives CommandFreezeTests.setUp() manually rather than
+        # through unittest's class lifecycle. Bracket its shared fixture here.
+        FIXTURE_MODULE['CommandFreezeTests'].setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        FIXTURE_MODULE['CommandFreezeTests'].tearDownClass()
+
     def setUp(self):
         home_tmp = Path.home() / '.tmp'
         home_tmp.mkdir(mode=0o700, exist_ok=True)
@@ -43,8 +58,8 @@ class CollectionTests(unittest.TestCase):
             self.addCleanup(patcher.stop)
         self.fixture = FIXTURE_MODULE['CommandFreezeTests'](
             'test_comparison_freezes_216_adjacent_rows_without_launches')
+        self.addCleanup(cleanup_nested_fixture, self.fixture)
         self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
         self.overlay = self.fixture.overlay
         self.freeze_path, self.source_freeze = self.fixture.freeze_comparison('source-freeze')
         self.output = self.freeze_path.parent / 'collection'
@@ -57,6 +72,19 @@ class CollectionTests(unittest.TestCase):
             plan=None, profile=None, calibration=None,
             calibration_origin_plan=None, calibration_origin_profile=None))()
         self.fake_calls_before = len(FakeProcess.calls)
+
+    def test_nested_fixture_cleanup_failure_is_reported_after_all_cleanups(self):
+        fixture = unittest.TestCase()
+        callbacks = []
+        fixture.addCleanup(callbacks.append, 'remaining')
+
+        def fail_cleanup():
+            raise RuntimeError('nested cleanup failed')
+
+        fixture.addCleanup(fail_cleanup)
+        with self.assertRaisesRegex(AssertionError, 'nested fixture cleanup failed'):
+            cleanup_nested_fixture(fixture)
+        self.assertEqual(callbacks, ['remaining'])
 
     def test_comparison_admits_216_rows_with_empty_durable_journal_and_no_launch(self):
         with patch('os.fsync', wraps=os.fsync) as sync:
@@ -79,7 +107,7 @@ class CollectionTests(unittest.TestCase):
         self.assertEqual(status['benchmark_launches_performed'], 0)
         self.assertEqual(status['planned_command_count'], 216)
         self.assertEqual(status['preflight_sha256'], COLLECTOR['digest'](preflight_bytes))
-        self.assertEqual(json.loads(preflight_bytes), artifact)
+        self.assertEqual(json.loads(preflight_bytes), json.loads(json.dumps(artifact)))
         original_rows = json.loads(self.freeze_path.read_text(encoding='utf-8'))['commands']
         self.assertEqual(frozen['commands'], original_rows)
         self.assertEqual(frozen['commands'][0]['environment']['HOME'],

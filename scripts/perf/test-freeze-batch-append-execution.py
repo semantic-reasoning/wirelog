@@ -2,6 +2,7 @@
 """No-launch command-freeze provenance, calibration, and tamper tests."""
 import json
 import copy
+import hashlib
 import os
 from pathlib import Path
 import runpy
@@ -20,7 +21,112 @@ FakeProcess = CAL_TESTS['FakeProcess']
 FakeProbe = CAL_TESTS['FakeProbe']
 
 
+class _FixtureContext:
+    """Plain fixture helper for setup shared by the freeze test methods."""
+
+    def __init__(self, root=None):
+        self.root = root
+        self.cleanups = []
+
+    def addCleanup(self, function, *args, **kwargs):
+        self.cleanups.append((function, args, kwargs))
+
+    def assertTrue(self, value, message=None):
+        if not value:
+            raise AssertionError(message or 'fixture root must be below HOME')
+
+    def doCleanups(self):
+        cleanups = reversed(self.cleanups)
+        self.cleanups = []
+        first_error = None
+        for function, args, kwargs in cleanups:
+            try:
+                function(*args, **kwargs)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = (error, error.__traceback__)
+        if first_error is not None:
+            error, traceback = first_error
+            raise error.with_traceback(traceback)
+
+    def __getattr__(self, name):
+        method = getattr(EXEC_TESTS['ExecutionPreflightTests'], name, None)
+        if callable(method):
+            if name in ('git', 'git_bytes', 'all_keys'):
+                return method
+            return method.__get__(self, type(self))
+        raise AttributeError(name)
+
+
 class CommandFreezeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        home_tmp = Path.home() / '.tmp'
+        home_tmp.mkdir(mode=0o700, exist_ok=True)
+        cls.class_fallback_patchers = []
+        for api in (FREEZER['PLAN']['FALLBACKS'], PROFILE['FALLBACKS'],
+                    CAL['PROFILE']['PLAN']['FALLBACKS'], CAL['PROFILE']['FALLBACKS']):
+            def fake_validate(root, module=api):
+                module['outer_status'](root)
+                return {'schema': module['SCHEMA'],
+                        'outer_ignored_paths': list(module['IGNORED_ROOTS']),
+                        'nanoarrow': {'commit': module['NANO_COMMIT'],
+                                      'tree': module['NANO_TREE'],
+                                      'manifest_sha256': 'a' * 64},
+                        'xxhash': {'archive_sha256': module['XX_ARCHIVE_SHA256'],
+                                   'manifest_sha256': 'b' * 64}}
+            patcher = patch.dict(api, validate_fallbacks=fake_validate)
+            patcher.start()
+            cls.class_fallback_patchers.append(patcher)
+        cls.fixture = _FixtureContext()
+        EXEC_TESTS['ExecutionPreflightTests'].setUp(cls.fixture)
+        for side in ('base', 'candidate'):
+            os.chmod(cls.fixture.paths[side]['build'] / 'bench/bench_batch_append', 0o755)
+        cls.plan_a_path = cls.fixture.root / 'plan-a-template.json'
+        cls.plan_a_path.write_text(json.dumps(cls.fixture.plan, indent=2), encoding='utf-8')
+        args = type('Args', (), dict(
+            mode='comparison', aa_product=None, seed='different-schedule-seed',
+            base_source=cls.fixture.paths['base']['source'],
+            candidate_source=cls.fixture.paths['candidate']['source'],
+            overlay_patch=cls.fixture.overlay))()
+        plan_b = PLAN['build_plan'](args)
+        cls.plan_b_path = cls.fixture.root / 'plan-b-template.json'
+        cls.plan_b_path.write_text(json.dumps(plan_b, indent=2), encoding='utf-8')
+        cls.profile_templates = {}
+        for name, plan_path in (('profile-a', cls.plan_a_path),
+                                ('profile-b', cls.plan_b_path)):
+            artifact = PROFILE['build_artifact'](
+                plan_path, cls.fixture.overlay, cls.fixture.paths['base']['build'],
+                cls.fixture.paths['candidate']['build'])
+            output = cls.fixture.root / f'{name}-template'
+            PROFILE['write_atomic'](output, artifact)
+            cls.profile_templates[name] = (output / 'execution-preflight.json').read_bytes()
+        cls.shared_fixture_snapshot = cls.snapshot_fixture(cls.fixture.root)
+
+    @classmethod
+    def tearDownClass(cls):
+        first_error = None
+        try:
+            if cls.snapshot_fixture(cls.fixture.root) != cls.shared_fixture_snapshot:
+                raise AssertionError(
+                    'class-scoped freeze fixture changed during the test class')
+        except BaseException as error:
+            first_error = (error, error.__traceback__)
+        try:
+            cls.fixture.doCleanups()
+        except BaseException as error:
+            if first_error is None:
+                first_error = (error, error.__traceback__)
+        for patcher in reversed(cls.class_fallback_patchers):
+            try:
+                patcher.stop()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = (error, error.__traceback__)
+        if first_error is not None:
+            error, traceback = first_error
+            raise error.with_traceback(traceback)
+
     def setUp(self):
         home_tmp = Path.home() / '.tmp'
         home_tmp.mkdir(mode=0o700, exist_ok=True)
@@ -43,24 +149,77 @@ class CommandFreezeTests(unittest.TestCase):
             patcher.start()
             self.fallback_patchers.append(patcher)
             self.addCleanup(patcher.stop)
-        self.fixture = EXEC_TESTS['ExecutionPreflightTests'](
-            'test_valid_comparison_and_aa_artifacts_are_profile_only')
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        self._shared_fixture_snapshot = self.snapshot_fixture(self.__class__.fixture.root)
+        self.addCleanup(self.assert_shared_fixture_unchanged)
+        self.fixture = _FixtureContext(self.root)
+        self.fixture.paths = self.__class__.fixture.paths
+        self.fixture.overlay = self.__class__.fixture.overlay
+        self.fixture.plan = self.__class__.fixture.plan
         for side in ('base', 'candidate'):
             os.chmod(self.fixture.paths[side]['build'] / 'bench/bench_batch_append', 0o755)
         self.overlay = self.fixture.overlay
         self.plan_a_path = self.root / 'plan-a.json'
-        self.plan_a_path.write_text(json.dumps(self.fixture.plan, indent=2), encoding='utf-8')
-        plan_b = self.make_plan('different-schedule-seed')
+        self.plan_a_path.write_bytes(self.__class__.plan_a_path.read_bytes())
         self.plan_b_path = self.root / 'plan-b.json'
-        self.plan_b_path.write_text(json.dumps(plan_b, indent=2), encoding='utf-8')
+        self.plan_b_path.write_bytes(self.__class__.plan_b_path.read_bytes())
         self.plan_b_bytes = self.plan_b_path.read_bytes()
-        self.profile_a_path, self.profile_a = self.make_profile(self.plan_a_path, 'profile-a')
-        self.profile_b_path, self.profile_b = self.make_profile(self.plan_b_path, 'profile-b')
+        self.profile_a_path, self.profile_a = self.copy_profile(
+            'profile-a', self.plan_a_path)
+        self.profile_b_path, self.profile_b = self.copy_profile(
+            'profile-b', self.plan_b_path)
+        self._fake_process_state = {
+            name: copy.deepcopy(getattr(FakeProcess, name))
+            for name in ('calls', 'started_flags', 'next_outputs', 'tamper_path',
+                         'tamper_payload', 'interrupt_on_start')}
+        FakeProcess.calls = []
+        FakeProcess.started_flags = []
+        FakeProcess.next_outputs = []
+        FakeProcess.tamper_path = None
+        FakeProcess.tamper_payload = b'tampered while benchmark ran'
+        FakeProcess.interrupt_on_start = False
+        self.addCleanup(self.restore_fake_process)
         self.cal_a = self.make_calibration(self.plan_a_path, self.profile_a_path, 'cal-a',
                                            [300_000_000] * 3)
         self.fake_call_count = len(FakeProcess.calls)
+
+    @staticmethod
+    def snapshot_fixture(root):
+        snapshot = {}
+        for path in sorted(root.rglob('*')):
+            relative = path.relative_to(root).as_posix()
+            info = path.lstat()
+            if path.is_symlink():
+                snapshot[relative] = ('symlink', os.readlink(path))
+            elif path.is_dir():
+                snapshot[relative] = ('directory', info.st_mode & 0o777)
+            elif path.is_file():
+                snapshot[relative] = ('file', info.st_mode & 0o777,
+                                      hashlib.sha256(path.read_bytes()).hexdigest())
+            else:
+                snapshot[relative] = ('special', info.st_mode)
+        return snapshot
+
+    def assert_shared_fixture_unchanged(self):
+        if self.snapshot_fixture(self.__class__.fixture.root) != self._shared_fixture_snapshot:
+            raise AssertionError('class-scoped freeze fixture changed during a test')
+
+    @staticmethod
+    def copy_profile(name, plan_path):
+        template = CommandFreezeTests.profile_templates[name]
+        artifact = json.loads(template)
+        artifact['plan_path'] = str(plan_path.resolve())
+        output = plan_path.parent / name
+        output.mkdir(mode=0o700)
+        target = output / 'execution-preflight.json'
+        target.write_text(json.dumps(artifact, sort_keys=True, indent=2,
+                                     ensure_ascii=False, allow_nan=False) + '\n',
+                          encoding='utf-8')
+        return target, artifact
+
+    def restore_fake_process(self):
+        for name, value in self._fake_process_state.items():
+            setattr(FakeProcess, name, value)
+
 
     def make_plan(self, seed, mode='comparison', product='pre'):
         args = type('Args', (), dict(
@@ -169,6 +328,52 @@ class CommandFreezeTests(unittest.TestCase):
         calibration_path.write_text(json.dumps(artifact), encoding='utf-8')
         with self.assertRaisesRegex(FREEZER['FreezeError'], 'telemetry eligibility'):
             self.freeze_comparison('ineligible-telemetry')
+
+    def test_rejects_consistently_forged_success_with_missing_sibling_counters(self):
+        calibration_path = self.cal_a / 'calibration.json'
+        artifact = json.loads(calibration_path.read_text(encoding='utf-8'))
+        for summary in artifact['host'].values():
+            summary['sibling_cpu_ticks'] = {}
+        for record in artifact['attempts']:
+            started = record['started']
+            started['host_before']['sibling_cpu_ticks'] = {}
+            record['host_after']['sibling_cpu_ticks'] = {}
+            record['eligible'] = True
+            record['accepted'] = True
+            record['telemetry']['eligible'] = True
+            prefix = f"{started['case']}-attempt-{started['attempt_index']:02d}"
+            for suffix, value in (('started', started), ('result', record)):
+                path = self.cal_a / f'{prefix}-{suffix}.json'
+                path.write_text(json.dumps(value, sort_keys=True, indent=2,
+                                           ensure_ascii=False, allow_nan=False) + '\n',
+                                encoding='utf-8')
+        calibration_path.write_text(json.dumps(artifact, sort_keys=True, indent=2,
+                                               ensure_ascii=False, allow_nan=False) + '\n',
+                                    encoding='utf-8')
+        with self.assertRaisesRegex(FREEZER['FreezeError'], 'sibling tick coverage'):
+            self.freeze_comparison('forged-missing-sibling')
+
+    def test_recomputes_and_rejects_forged_success_with_zero_sibling_delta(self):
+        calibration_path = self.cal_a / 'calibration.json'
+        artifact = json.loads(calibration_path.read_text(encoding='utf-8'))
+        counters = {'1': {'total': 1000, 'busy': 500}}
+        for summary in artifact['host'].values():
+            summary['sibling_cpu_ticks'] = copy.deepcopy(counters)
+        for record in artifact['attempts']:
+            started = record['started']
+            started['host_before']['sibling_cpu_ticks'] = copy.deepcopy(counters)
+            record['host_after']['sibling_cpu_ticks'] = copy.deepcopy(counters)
+            prefix = f"{started['case']}-attempt-{started['attempt_index']:02d}"
+            for suffix, value in (('started', started), ('result', record)):
+                path = self.cal_a / f'{prefix}-{suffix}.json'
+                path.write_text(json.dumps(value, sort_keys=True, indent=2,
+                                           ensure_ascii=False, allow_nan=False) + '\n',
+                                encoding='utf-8')
+        calibration_path.write_text(json.dumps(artifact, sort_keys=True, indent=2,
+                                               ensure_ascii=False, allow_nan=False) + '\n',
+                                    encoding='utf-8')
+        with self.assertRaisesRegex(FREEZER['FreezeError'], 'telemetry eligibility'):
+            self.freeze_comparison('forged-zero-sibling-delta')
 
     def test_one_first_bound_calibration_counts_apply_to_both_plans(self):
         self.cal_a = self.make_calibration(
@@ -311,7 +516,7 @@ class CommandFreezeTests(unittest.TestCase):
             ('host identity', lambda host: host['initial'].__setitem__('model', 'tampered')),
             ('SMT topology', lambda host: host['final'].__setitem__('smt_siblings', [99])),
             ('required schema', lambda host: host['initial'].pop('cgroup_v2_cpu')),
-            ('timestamps', lambda host: host['initial'].__setitem__('timestamp_utc', 2)),
+            ('timestamps', lambda host: host['initial'].__setitem__('timestamp_utc', 3)),
             ('final timestamp', lambda host: host['final'].__setitem__('timestamp_utc', 0)),
             ('counter reset', lambda host: host['final'].__setitem__(
                 'cpu_psi_some_total_usec', host['initial']['cpu_psi_some_total_usec'] - 1)),
@@ -340,6 +545,23 @@ class CommandFreezeTests(unittest.TestCase):
                 plan_path=self.plan_a_path, profile_path=self.profile_a_path,
                 calibration=dict(evidence_path=str(self.cal_a)), plan=self.fixture.plan,
                 profile=self.profile_a)])
+
+
+class FixtureContextTests(unittest.TestCase):
+    def test_cleanup_stack_runs_after_a_cleanup_fails(self):
+        context = _FixtureContext()
+        completed = []
+        context.addCleanup(completed.append, 'first')
+
+        def fail_cleanup():
+            completed.append('failure')
+            raise RuntimeError('cleanup failed')
+
+        context.addCleanup(fail_cleanup)
+        context.addCleanup(completed.append, 'last')
+        with self.assertRaisesRegex(RuntimeError, 'cleanup failed'):
+            context.doCleanups()
+        self.assertEqual(completed, ['last', 'failure', 'first'])
 
 
 if __name__ == '__main__':

@@ -27,8 +27,13 @@ chain stopped at the first eligible sample of at least 250 ms. It rejects
 missing or extra evidence files and does not infer performance verdicts from
 calibration telemetry. It also validates complete initial/final host snapshots,
 matches stable CPU identity and SMT topology to the attempt records, and checks
-timestamps and PSI/cgroup/sibling counters for bounds and resets. Governor and
-frequency values remain informational observations.
+timestamps and PSI/cgroup/sibling counters for bounds and resets. Every known
+SMT sibling must have a canonical counter entry in every snapshot; an empty
+counter map is valid only when the verified sibling topology is empty. The
+freezer recomputes positive total-tick deltas, nonnegative busy-tick deltas, and
+the 1% sibling busy threshold, regardless of stored eligibility or acceptance
+flags. Missing, partial, zero-delta, or regressing counters prevent freezing.
+Governor and frequency values remain informational observations.
 
 Comparison output contains exactly 216 planned commands: 108 for each plan,
 with adjacent AB or BA pairs, nine pairs of each order per case, and identical

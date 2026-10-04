@@ -27,14 +27,22 @@ is limited to six retained attempts; the first eligible sample at or above
 
 Every attempt records online CPUs and affinity, selected pinned CPU, governor,
 frequency, model, microcode, kernel, CPU PSI some.total, cgroup-v2 CPU throttle
-counters, and SMT sibling counters when measurable. PSI some.total increase
-must be at most 1% of full process monotonic wall time. Cgroup throttle counters
-must not change. A measurable SMT sibling must be at most 1% busy; absent or
-unmeasurable siblings are recorded explicitly as `none`. Governor/frequency are
-recorded without making stability judgments from changes. Missing required
+counters, and SMT sibling counters. The selected CPU's readable, valid
+`thread_siblings_list` topology is required. Only a verified topology with no
+other sibling may report sibling status `none`. For every known sibling, both
+snapshots must contain valid nonnegative total and busy counters, busy must not
+exceed total, total ticks must increase, and busy ticks must not regress or
+increase faster than total ticks. Missing, partial, malformed, zero-delta, or
+regressing counters make the attempt ineligible with per-CPU diagnostics; they
+are never reported as `none`. A qualified sibling must be at most 1% busy. PSI
+some.total increase must be at most 1% of full process monotonic wall time.
+Cgroup throttle counters must not change. Governor/frequency are recorded
+without making stability judgments from changes. Missing topology or required
 telemetry, ineligible host data, timeout, bad output, or failed correctness
-checks leave durable diagnostics and prevent calibration publication. Timing
-from an ineligible attempt is never used to scale N.
+checks leave durable diagnostics and prevent calibration publication. In
+particular, a post-launch telemetry read/parse failure preserves the started
+record and raw process output with a failed result record. Timing from an
+ineligible attempt is never used to scale N.
 
 Only after all three cases have accepted counts does the collector atomically
 publish `calibration.json`. It binds the plan/profile/manifest hashes, baseline

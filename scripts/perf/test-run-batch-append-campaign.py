@@ -30,17 +30,25 @@ class CpuProbe:
         value['cpu_psi_some_total_usec'] += 200_000 * self.calls
         value['cgroup_v2_cpu']['nr_throttled'] += self.calls
         value['cgroup_v2_cpu']['throttled_usec'] += 5 * self.calls
-        value['sibling_cpu_ticks'] = {'1': {'total': 1000 + self.tick,
-                                             'busy': 500 + self.tick}}
+        value['sibling_cpu_ticks'] = {1: {'total': 1000 + self.tick + self.calls * 100,
+                                           'busy': 500 + self.tick}}
         return value
 
 
 class RunnerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        BASE['CollectionTests'].setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        BASE['CollectionTests'].tearDownClass()
+
     def setUp(self):
         self.fixture = BASE['CollectionTests'](
             'test_comparison_admits_216_rows_with_empty_durable_journal_and_no_launch')
+        self.addCleanup(BASE['cleanup_nested_fixture'], self.fixture)
         self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
         self.runner = RUNNER
         self.fallback_patchers = []
         freezer = self.runner['FREEZER']
@@ -71,7 +79,7 @@ class RunnerTests(unittest.TestCase):
             self.args, host_probe=CAL_TEST['FakeProbe']())
         self.original_admit = self.runner['admit']
 
-    def _run_with_fake_processes(self):
+    def _run_with_fake_processes(self, probe_factory=None, row_limit=None):
         calls = []
         started_flags = []
         passed_rows = []
@@ -101,8 +109,9 @@ class RunnerTests(unittest.TestCase):
             def poll(inner):
                 return inner.returncode
 
-        def probe_factory(cpu):
-            return CpuProbe(self.fixture.root)
+        if probe_factory is None:
+            def probe_factory(cpu):
+                return CpuProbe(self.fixture.root)
 
         # Full admission ran before this test. Keep every subsequent pre/post
         # check on the same immutable admitted artifact while exercising the
@@ -110,13 +119,61 @@ class RunnerTests(unittest.TestCase):
         def stable_admit(args, expected_host=None, host_probe=None):
             return self.collection, self.preflight
 
-        with patch.dict(self.runner['run_campaign'].__globals__, admit=stable_admit), \
+        def read_collection(*args, **kwargs):
+            result = self.runner['read_collection'](*args, **kwargs)
+            if row_limit is None:
+                return result
+            return (*result[:-1], result[-1][:row_limit])
+
+        with patch.dict(self.runner['run_campaign'].__globals__, admit=stable_admit,
+                        read_collection=read_collection), \
                 patch.object(self.runner['os'], 'fsync', return_value=None):
             result_path, status = self.runner['run_campaign'](
                 self.args, popen_factory=Process,
                 affinity_getter=lambda pid: {0}, probe_factory=probe_factory,
                 host_probe=CAL_TEST['FakeProbe']())
         return result_path, status, calls, started_flags, passed_rows
+
+    def test_missing_known_sibling_after_sample_is_retained_and_schedule_continues(self):
+        class MissingAfterSiblingProbe:
+            def __init__(self, proc):
+                self.calls = 0
+                self.proc = proc
+
+            def snapshot(self):
+                self.calls += 1
+                value = CAL_TEST['FakeProbe']().snapshot()
+                value['timestamp_utc'] = self.calls
+                if self.calls == 1:
+                    value['sibling_cpu_ticks'] = {
+                        1: dict(total=1000, busy=500)}
+                else:
+                    value['sibling_cpu_ticks'] = {}
+                return value
+
+        result_path, status, calls, _, _ = self._run_with_fake_processes(
+            probe_factory=lambda _cpu: MissingAfterSiblingProbe(self.fixture.root),
+            row_limit=2)
+        count = 2
+        events = [json.loads(line) for line in (self.output / 'journal.jsonl').read_text(
+            encoding='utf-8').splitlines()]
+        started, result = events[:2]
+        self.assertEqual(status['status'], 'complete_capture')
+        self.assertEqual(status['benchmark_launches_performed'], count)
+        self.assertEqual(status['eligibility_summary'], dict(eligible=0, ineligible=count))
+        self.assertEqual(len(calls), count)
+        self.assertEqual(len(events), count * 2)
+        self.assertEqual(started['host_before']['sibling_cpu_ticks'], {
+            '1': dict(total=1000, busy=500)})
+        self.assertEqual(result['host_after']['sibling_cpu_ticks'], {})
+        sibling = result['host_eligibility']['smt_sibling']
+        self.assertFalse(result['host_eligibility']['eligible'])
+        self.assertEqual(sibling['unmeasurable_cpus'], [1])
+        self.assertTrue(any('CPU 1' in reason
+                            for reason in result['host_eligibility']['diagnostics']))
+        self.assertTrue((self.output / result['stdout_path']).is_file())
+        self.assertTrue((self.output / result['stderr_path']).is_file())
+        self.assertEqual(result_path, self.output / 'status.json')
 
     def test_runs_exact_frozen_schedule_and_durably_records_every_row(self):
         result_path, status, calls, started_flags, passed_rows = self._run_with_fake_processes()
@@ -144,8 +201,8 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(first['timeout_seconds'], 300)
         self.assertIn('load_average', result['host_before'])
         self.assertIn('cgroup_identity', result['host_after'])
-        self.assertTrue(any('SMT sibling telemetry unavailable' in item
-                            for item in result['host_eligibility']['diagnostics']))
+        self.assertEqual(result['host_eligibility']['smt_sibling']['status'], 'measured')
+        self.assertEqual(result['host_eligibility']['smt_sibling']['unmeasurable_cpus'], [])
         self.assertEqual(result['stdout_sha256'], RUNNER['digest'](
             (self.output / result['stdout_path']).read_bytes()))
         self.assertEqual(result_path, self.output / 'status.json')
@@ -400,8 +457,8 @@ class RunnerTests(unittest.TestCase):
     def test_aa_control_executes_exactly_108_frozen_rows_in_order(self):
         aa_suite = BASE['CollectionTests'](
             'test_aa_pre_admits_exactly_108_rows_with_origin_calibration')
+        self.addCleanup(BASE['cleanup_nested_fixture'], aa_suite)
         aa_suite.setUp()
-        self.addCleanup(aa_suite.doCleanups)
         aa_suite.test_aa_pre_admits_exactly_108_rows_with_origin_calibration()
         self.args = aa_suite.args
         self.args.output_dir = Path(self.args.freeze_artifact).parent / 'runner-collection'

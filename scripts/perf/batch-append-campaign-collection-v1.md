@@ -52,6 +52,15 @@ record. Process, output, host-identity, or provenance failures leave a typed
 schedule continues. Only a complete schedule receives `complete_capture`.
 Neither state contains a performance verdict or ratio.
 
+Each command's before/after host telemetry is separately qualified for that
+row. Only a verified empty sibling topology may report sibling status `none`;
+otherwise every known sibling needs valid counters in both snapshots, a
+positive total-tick delta, and a nonnegative plausible busy-tick delta. Busy
+time above 1% makes the row ineligible. Missing, partial, malformed,
+zero-delta, or regressing counters retain CPU-specific diagnostics and make
+the row ineligible, while the frozen schedule continues. The preflight's
+identity-only telemetry does not replace this per-command qualification.
+
 The frozen per-command `HOME`, `TMPDIR`, argv, cwd, and environment are used
 unchanged. SIGINT, SIGTERM, and SIGHUP trigger process-group cleanup; the
 result and incomplete status are persisted before the command returns.
