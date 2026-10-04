@@ -2643,8 +2643,10 @@ col_join_output_width(const col_rel_t *left, const col_rel_t *right,
 int
 col_join_set_output_types(col_rel_t *out, const col_rel_t *left,
     const col_rel_t *right, const wl_plan_op_t *op);
-/* Writes one joined row at @out_row with col_rel_set_raw; the caller
- * publishes nrows and the view generation once per batch. */
+/* Writes one joined row at @out_row with col_rel_set_raw and publishes
+ * neither nrows nor a view generation; its callers arrange that.  The
+ * batch producers publish nrows after every written row (#1909); the keyed
+ * fill workers leave a single publication to their coordinator. */
 int
 col_join_write_pair_at(col_rel_t *out, uint64_t out_row,
     const col_rel_t *left, uint32_t lr, const col_rel_t *right, uint32_t rr,

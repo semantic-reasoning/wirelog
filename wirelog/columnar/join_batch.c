@@ -173,13 +173,13 @@ producer_validate(void *context,
  * relation pre-allocated and clamping to rows_per_batch.  Returns false when
  * the row cannot be written, which the caller turns into a short batch.
  *
- * p->batch->nrows MUST be set to n before the reserve.  producer_produce
- * zeroes nrows while filling and only restores it at emit, and
- * col_rel_prepare_resize copies exactly nrows rows -- so growing with nrows
- * still 0 copies nothing, frees the old columns, and leaves every row written
- * so far pointing at uninitialised malloc memory.  That is a silently wrong
- * join, and neither ASan nor UBSan reports it; only an oracle comparison
- * across a grow does.  #1481.
+ * col_rel_prepare_resize copies exactly nrows rows (and nrows timestamps),
+ * so p->batch->nrows must equal n here.  A stale nrows copies too little,
+ * frees the old columns, and leaves rows written so far pointing at
+ * uninitialised malloc memory: a silently wrong join that neither ASan nor
+ * UBSan reports, only an oracle comparison across a grow (#1481).
+ * producer_produce publishes nrows after every written row (#1909), so no
+ * reallocation site has a sync point to forget.
  */
 static bool
 grow_scratch(col_join_batch_producer_t *p, uint32_t n)
@@ -196,7 +196,6 @@ grow_scratch(col_join_batch_producer_t *p, uint32_t n)
      * without growing whenever want <= capacity, so reporting its status
      * would be reporting the call rather than the outcome. */
     want = cap < p->rows_per_batch / 2u ? cap * 2u : p->rows_per_batch;
-    p->batch->nrows = n;
     rc = col_rel_reserve_capacity_admitted(p->batch, want, &denied);
     if (rc == 0 && p->batch->capacity > n)
         return true;
@@ -263,6 +262,9 @@ producer_produce(void *context, const wl_columnar_continuation_cursor_t *cursor,
                     memset(&p->batch->timestamps[n], 0,
                         sizeof(col_delta_timestamp_t));
                 n++;
+                /* Keep the live prefix structurally current, so every
+                 * relocation preserves the row just written. */
+                p->batch->nrows = n;
                 if (n == p->rows_per_batch) {
                     /* Batch full: park on the first unexamined candidate.
                      * UINT32_MAX is stored only as "probe the next left
