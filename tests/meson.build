@@ -1596,6 +1596,16 @@ if host_machine.system() == 'linux' and sh.found()
        timeout: 120)
 endif
 
+# Issue #1919: the repository-root uv environment AGENTS.md asks for is not a
+# wirelog dependency. Runs the real gate and real syft against a fixture tree
+# with and without a populated root .venv; skips (77) without syft or jq.
+if sh.found()
+  test('sbom_venv_exclusion', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-sbom-venv-exclusion.sh'],
+       suite: 'sbom',
+       timeout: 120)
+endif
+
 # Issue #788: warning-only platform ABI surface advisory checks.
 # Linux remains the hard v1.0 ABI gate.  These checks run on every
 # default `meson test` invocation but only emit GitHub warning

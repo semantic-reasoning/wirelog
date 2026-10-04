@@ -64,7 +64,13 @@ baseline="$repo_root/sbom/snapshot.txt"
 #
 # An array, not a string: a repo path may contain spaces. Plain `+=` and no
 # `readarray` -- macOS ships bash 3.2, where readarray/mapfile do not exist.
-syft_exclude_args=(--exclude '**/workflow-tools/**')
+#
+# Issue #1919: AGENTS.md has contributors create a uv environment at the
+# repository root, and syft catalogs the packages installed there (meson,
+# ninja) as wirelog dependencies, so an ordinary local setup failed this gate.
+# Only the root .venv is excluded, `./`-relative for the reason given below; a
+# .venv anywhere else is still scanned. generate-sbom.sh uses the same pair.
+syft_exclude_args=(--exclude '**/workflow-tools/**' --exclude './.venv/**')
 sbom_build_root="${1:-}"
 if [ -n "$sbom_build_root" ] && [ -d "$sbom_build_root" ]; then
     sbom_build_abs="$(cd "$sbom_build_root" && pwd)"
