@@ -354,10 +354,9 @@ class PreparePlanTests(unittest.TestCase):
         shutil.copyfile(M['PRODUCT_PATCH_PATH'], patch_path)
         bundle_path = clone / 'scripts/perf/batch-append-anchor-v1.bundle'
         shutil.copyfile(M['ANCHOR_BUNDLE_PATH'], bundle_path)
-        self.git(clone, 'config', 'user.name', 'Clean Clone Test')
-        self.git(clone, 'config', 'user.email', 'clean-clone@example.invalid')
-        self.git(clone, 'add', 'scripts/perf/batch-append-product-delta-v1.patch')
-        self.git(clone, 'commit', '-qm', 'fixture tracked product delta')
+        self.assertEqual(self.git(clone, 'ls-files', '--error-unmatch',
+                                  'scripts/perf/batch-append-product-delta-v1.patch'),
+                         'scripts/perf/batch-append-product-delta-v1.patch')
 
         revision = json.loads(M['MANIFEST_PATH'].read_text(encoding='utf-8'))
         post_tree = revision['product']['post_tree']
