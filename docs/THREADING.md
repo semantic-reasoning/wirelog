@@ -715,6 +715,20 @@ from the production library.
 
 The complete source audit now contains **225 atomic call sites**.
 
+### 5.21 `wirelog/columnar/ops.c` — LFTJ output construction admission test hook (3 rows)
+
+The test-only constructor hook records and temporarily lowers the governor
+limit to exercise denied initial output allocation, then restores the limit.
+These operations are excluded from the production library.
+
+| Anchor (file:function[#N]) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `ops.c:lftj_test_before_output_construction` | `memory_governor->usable_bytes` | `atomic_load_explicit` | relaxed | Save the configured limit before the test hook forces initial output-construction admission to fail; test-only and excluded from the production library |
+| `ops.c:lftj_test_before_output_construction#2` | `memory_governor->usable_bytes` | `atomic_store_explicit` | relaxed | Temporarily lower the limit so initial output construction is denied; test-only and excluded from the production library |
+| `ops.c:lftj_test_after_output_construction` | `memory_governor->usable_bytes` | `atomic_store_explicit` | relaxed | Restore the saved limit after the constructor attempt; test-only and excluded from the production library |
+
+The complete source audit now contains **228 atomic call sites**.
+
 ---
 
 ## 6. Lock-free SPSC delta queue

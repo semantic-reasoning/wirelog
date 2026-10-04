@@ -1054,6 +1054,13 @@ wl_columnar_lftj_test_deny_next_output_growth(void)
 }
 
 void
+wl_columnar_lftj_test_deny_next_output_construction(void)
+{
+    lftj_output_test_hook_state.deny_output_construction_pending = true;
+    lftj_output_test_hook_state.deny_output_construction_consumed = false;
+}
+
+void
 wl_columnar_lftj_test_fail_next_output_growth(void)
 {
     lftj_output_test_hook_state.fail_output_growth_pending = true;
@@ -1073,6 +1080,45 @@ wl_columnar_lftj_test_clear_output_hooks(void)
 {
     memset(&lftj_output_test_hook_state, 0,
         sizeof(lftj_output_test_hook_state));
+}
+
+static void
+lftj_test_before_output_construction(
+    wl_columnar_memory_governor_ref_t *governor)
+{
+    wl_columnar_lftj_output_test_hook_state_t *state
+        = &lftj_output_test_hook_state;
+    if (!state->deny_output_construction_pending || !governor)
+        return;
+    wl_columnar_memory_governor_t *memory_governor
+        = wl_columnar_memory_governor_ref_get(governor);
+    if (!memory_governor)
+        return;
+    state->previous_constructor_usable_bytes = atomic_load_explicit(
+        &memory_governor->usable_bytes, memory_order_relaxed);
+    state->reserved_before_construction
+        = wl_columnar_memory_reserved(memory_governor);
+    atomic_store_explicit(&memory_governor->usable_bytes,
+        state->reserved_before_construction, memory_order_relaxed);
+    state->deny_output_construction_pending = false;
+    state->deny_output_construction_consumed = true;
+    state->deny_output_construction_restore_pending = true;
+}
+
+static void
+lftj_test_after_output_construction(
+    wl_columnar_memory_governor_ref_t *governor)
+{
+    wl_columnar_lftj_output_test_hook_state_t *state
+        = &lftj_output_test_hook_state;
+    if (!state->deny_output_construction_restore_pending || !governor)
+        return;
+    wl_columnar_memory_governor_t *memory_governor
+        = wl_columnar_memory_governor_ref_get(governor);
+    if (memory_governor)
+        atomic_store_explicit(&memory_governor->usable_bytes,
+            state->previous_constructor_usable_bytes, memory_order_relaxed);
+    state->deny_output_construction_restore_pending = false;
 }
 
 static bool
@@ -1367,8 +1413,14 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     {
         col_rel_t *out = NULL;
         if (sess->memory_governor) {
+#ifdef WL_TEST_LFTJ_ADMISSION_HOOKS
+            lftj_test_before_output_construction(sess->memory_governor);
+#endif
             rc = wl_columnar_relation_new_auto_governed("$lftj",
                     total_binary_ncols, 0, false, sess->memory_governor, &out);
+#ifdef WL_TEST_LFTJ_ADMISSION_HOOKS
+            lftj_test_after_output_construction(sess->memory_governor);
+#endif
         } else {
             out = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
                     "$lftj", total_binary_ncols);
@@ -1401,8 +1453,6 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                 sess ? sess->memory_governor : NULL);
         if (rc == 0)
             rc = ctx.rc;
-        if (rc == ENOSPC && sess)
-            sess->memory_budget_denied = true;
 
         free(tmp);
         if (rc != 0) {
@@ -1472,6 +1522,8 @@ cleanup_arrays:
     free(binary_offsets);
     WL_LFTJ_RELEASE_SCRATCH();
 #undef WL_LFTJ_RELEASE_SCRATCH
+    if (rc == ENOSPC && sess)
+        sess->memory_budget_denied = true;
     return rc;
 }
 

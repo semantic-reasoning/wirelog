@@ -127,6 +127,9 @@ typedef struct {
 } wl_columnar_lftj_test_hook_state_t;
 
 typedef struct {
+    bool deny_output_construction_pending;
+    bool deny_output_construction_consumed;
+    bool deny_output_construction_restore_pending;
     bool deny_output_growth_pending;
     bool deny_output_growth_consumed;
     bool deny_output_growth_restore_pending;
@@ -137,6 +140,8 @@ typedef struct {
     uint32_t output_capacity_at_growth;
     uint64_t previous_usable_bytes;
     uint64_t reserved_before_growth;
+    uint64_t previous_constructor_usable_bytes;
+    uint64_t reserved_before_construction;
 } wl_columnar_lftj_output_test_hook_state_t;
 
 void
@@ -151,6 +156,8 @@ wl_columnar_lftj_test_clear_hooks(void);
 
 void
 wl_columnar_lftj_test_deny_next_output_growth(void);
+void
+wl_columnar_lftj_test_deny_next_output_construction(void);
 void
 wl_columnar_lftj_test_fail_next_output_growth(void);
 void
