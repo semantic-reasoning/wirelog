@@ -2052,6 +2052,117 @@ out:
     fixture_fini(&f);
 }
 
+/* #1909: the projected test above runs at seven rows per batch, below the
+ * 64-row floor, so projection never meets a scratch reallocation.  Here the
+ * 90 projected matches cross the floor inside one batch. */
+static void
+test_projected_output_across_grow(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1, 1 };
+    uint32_t project[] = { 1, 3 };
+    wl_columnar_continuation_t *cont = NULL;
+    col_rel_t *oracle = NULL;
+    col_rel_t *out2 = NULL;
+    uint32_t cap0, capN;
+    int rc;
+
+    TEST("projected output across a scratch grow matches the oracle");
+    if (!fixture_init(&f, 1u << 24, keys, 3, 2, 30)) {
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    f.op.project_indices = project;
+    f.op.project_count = 2;
+    out2 = col_rel_new_auto("$join", 2);
+    if (!out2 || col_join_set_output_types(out2, f.left, f.right, &f.op)
+        != 0) {
+        FAIL("projected output");
+        goto out;
+    }
+    rc = col_join_batch_producer_create(f.sess, &f.op, f.left, false, KEY0,
+            KEY0, 1, 512u * 16u, &cont);
+    if (rc != 0 || col_join_batch_rows_per_batch(cont) <= 90u) {
+        FAIL("producer create or rows_per_batch");
+        goto out;
+    }
+    cap0 = col_join_batch_scratch_capacity(cont);
+    rc = col_join_batch_run_to_relation(cont, f.sess, out2);
+    capN = col_join_batch_scratch_capacity(cont);
+    oracle = run_oracle(f.sess, f.left, &f.op);
+    if (rc != 0 || !oracle || !same_rows(oracle, out2) || out2->nrows != 90u)
+        FAIL("projected result differs from the oracle across a grow");
+    else if (cap0 != COL_REL_INIT_CAP || capN <= cap0)
+        FAIL("the projected scratch did not start at the floor and grow");
+    else
+        PASS();
+out:
+    if (oracle)
+        col_rel_destroy(oracle);
+    if (out2)
+        col_rel_destroy(out2);
+    if (cont)
+        wl_columnar_continuation_destroy(cont);
+    fixture_fini(&f);
+}
+
+/* #1909: a timestamped left gives the scratch a timestamp array, which the
+ * resize path copies by nrows just as it copies the columns.  The producer
+ * writes zero timestamps, so the columns are what can be lost; the sink's
+ * timestamps must stay zero. */
+static void
+test_timestamped_scratch_across_grow(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1, 2 };
+    wl_columnar_continuation_t *cont = NULL;
+    col_rel_t *oracle = NULL;
+    uint32_t cap0, capN;
+    bool zero = true;
+    int rc;
+
+    TEST("timestamped scratch across a grow matches the oracle");
+    if (!fixture_init(&f, 1u << 24, keys, 3, 5, 47)
+        || col_rel_enable_timestamps(f.left) != 0
+        || col_rel_enable_timestamps(f.out) != 0) {
+        FAIL("timestamped fixture");
+        fixture_fini(&f);
+        return;
+    }
+    rc = col_join_batch_producer_create(f.sess, &f.op, f.left, false, KEY0,
+            KEY0, 1, 1u << 16, &cont);
+    if (rc != 0 || col_join_batch_rows_per_batch(cont) <= 3u * 47u) {
+        FAIL("producer create or rows_per_batch");
+        goto out;
+    }
+    cap0 = col_join_batch_scratch_capacity(cont);
+    rc = col_join_batch_run_to_relation(cont, f.sess, f.out);
+    capN = col_join_batch_scratch_capacity(cont);
+    oracle = run_oracle(f.sess, f.left, &f.op);
+    for (uint32_t i = 0; f.out->timestamps && i < f.out->nrows; i++) {
+        const col_delta_timestamp_t *ts = &f.out->timestamps[i];
+        if (ts->multiplicity != 0 || ts->iteration != 0 || ts->stratum != 0
+            || ts->worker != 0)
+            zero = false;
+    }
+    if (rc != 0 || !oracle || !same_rows(oracle, f.out)
+        || f.out->nrows != 3u * 47u)
+        FAIL("timestamped result differs from the oracle across a grow");
+    else if (!f.out->timestamps || !zero)
+        FAIL("the sink did not publish zero timestamps");
+    else if (cap0 != COL_REL_INIT_CAP || capN <= cap0)
+        FAIL("the timestamped scratch did not start at the floor and grow");
+    else
+        PASS();
+out:
+    if (oracle)
+        col_rel_destroy(oracle);
+    if (cont)
+        wl_columnar_continuation_destroy(cont);
+    fixture_fini(&f);
+}
+
 static int64_t
 double_bits(double d)
 {
@@ -3157,6 +3268,8 @@ main(void)
     test_batch_payload_uses_right_governor_fallback();
     test_batch_payload_denial_rolls_back_and_retries();
     test_projected_output();
+    test_projected_output_across_grow();
+    test_timestamped_scratch_across_grow();
     test_float_key();
     test_unsupported_budget_and_pooled_output();
     test_row_cap_trips_after_a_committed_batch();
