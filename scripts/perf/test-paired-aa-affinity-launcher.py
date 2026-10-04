@@ -20,7 +20,7 @@ class AffinityLauncherTests(unittest.TestCase):
             root = Path(temporary)
             marker = root / 'started'
             probe = root / 'probe.py'
-            probe.write_text('from pathlib import Path; Path(%r).write_text("started")\n' % str(marker))
+            probe.write_text('from pathlib import Path; Path(%r).write_text("started")\n' % str(marker), encoding='utf-8')
             ready_r, ready_w = os.pipe()
             release_r, release_w = os.pipe()
             command = [sys.executable, str(launcher), '--cpu', str(min(os.sched_getaffinity(0))),
@@ -40,6 +40,7 @@ class AffinityLauncherTests(unittest.TestCase):
                 os.close(ready_r)
                 os.close(release_w)
 
+            marker.unlink()
             ready_r, ready_w = os.pipe()
             release_r, release_w = os.pipe()
             command = [sys.executable, str(launcher), '--cpu', str(min(os.sched_getaffinity(0))),
@@ -54,7 +55,7 @@ class AffinityLauncherTests(unittest.TestCase):
                 os.close(release_w)
                 release_w = -1
                 self.assertEqual(process.wait(timeout=5), 125)
-                self.assertTrue(marker.exists())
+                self.assertFalse(marker.exists())
             finally:
                 os.close(ready_r)
                 if release_w >= 0:

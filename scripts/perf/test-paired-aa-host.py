@@ -17,8 +17,8 @@ class HostEvidenceTests(unittest.TestCase):
             leaf = mount / 'job' / 'leaf'
             leaf.mkdir(parents=True)
             for path, count in ((mount, 1), (mount / 'job', 2), (leaf, 3)):
-                (path / 'cpu.stat').write_text(f'nr_throttled {count}\nthrottled_usec {count * 11}\n')
-                (path / 'cpu.max').write_text('max 100000')
+                (path / 'cpu.stat').write_text(f'nr_throttled {count}\nthrottled_usec {count * 11}\n', encoding='utf-8')
+                (path / 'cpu.max').write_text('max 100000', encoding='utf-8')
             membership = '0::/job/leaf\n'
             mountinfo = f'31 20 0:29 / {mount} rw - cgroup2 cgroup rw\n'
             result = M['resolve_cgroup'](membership, mountinfo)
@@ -31,9 +31,9 @@ class HostEvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=TEST_TMP) as temporary:
             mount = Path(temporary) / 'cpu'
             mount.mkdir()
-            (mount / 'cpu.stat').write_text('nr_throttled 4\nthrottled_time 987654321\n')
-            (mount / 'cpu.cfs_quota_us').write_text('50000')
-            (mount / 'cpu.cfs_period_us').write_text('100000')
+            (mount / 'cpu.stat').write_text('nr_throttled 4\nthrottled_time 987654321\n', encoding='utf-8')
+            (mount / 'cpu.cfs_quota_us').write_text('50000', encoding='utf-8')
+            (mount / 'cpu.cfs_period_us').write_text('100000', encoding='utf-8')
             membership = '2:cpu,cpuacct:/\n'
             mountinfo = f'32 20 0:30 / {mount} rw - cgroup cgroup rw,cpu,cpuacct\n'
             result = M['resolve_cgroup'](membership, mountinfo)

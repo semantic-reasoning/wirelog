@@ -965,7 +965,7 @@ if host_machine.system() == 'linux'
        suite: 'abi')
   test('perf_paired_aa_affinity_launcher', py3,
        args: [meson.project_source_root() / 'scripts/perf/test-paired-aa-affinity-launcher.py'],
-       suite: 'abi')
+       suite: 'abi', timeout: 60)
   test('perf_paired_collector_v1', py3,
        args: [meson.project_source_root() / 'scripts/perf/test-paired-collector-v1.py'],
        suite: 'abi', timeout: 120)
