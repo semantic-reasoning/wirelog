@@ -827,6 +827,129 @@ join_session_destroy(wl_col_session_t *s)
     free(s);
 }
 
+/* #2072: the serial join probe loops append each joined pair under one
+ * batch lease instead of a col_rel_set lease per cell.  Each case runs one
+ * serial path on a 4096-row output and checks the mutation sets it took,
+ * the rows it produced and which path ran. */
+static col_rel_t *
+join_rel(const char *name, uint32_t ncols)
+{
+    static const char *const names[] = { "k", "v" };
+    col_rel_t *r = col_rel_new_auto(name, ncols);
+    assert(r && col_rel_set_schema(r, ncols, names) == 0);
+    return r;
+}
+
+static uint8_t join_pass_all_filter[] = {
+    WL_PLAN_EXPR_VAR, 1, 0, 'k',
+    WL_PLAN_EXPR_CONST_INT, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    WL_PLAN_EXPR_CMP_GT
+};
+
+typedef enum {
+    JOIN_ARRANGEMENT, JOIN_UNARY, JOIN_DIFF_PERSISTENT, JOIN_DIFF_EPHEMERAL
+} join_case_t;
+
+static void
+join_batch_case(join_case_t which)
+{
+    enum { KEYS = 64, FANOUT = 64, ROWS = KEYS * FANOUT };
+    static const char *const keys[] = { "k" };
+    bool unary = which == JOIN_UNARY;
+    wl_col_session_t *sess = join_session();
+    /* Keyed cases: left(k, v) has one row per key, right(k, v) FANOUT rows
+     * per key.  Unary: left has FANOUT rows per key, right(k) one per key. */
+    col_rel_t *left = join_rel("left", 2);
+    col_rel_t *right = join_rel("right", unary ? 1u : 2u);
+    for (uint32_t i = 0; i < (unary ? ROWS : KEYS); i++) {
+        int64_t row[2] = { (int64_t)(i % KEYS), (int64_t)i };
+        assert(col_rel_append_row(left, row) == 0);
+    }
+    for (uint32_t i = 0; i < (unary ? KEYS : ROWS); i++) {
+        int64_t row[2] = { (int64_t)(i % KEYS), 1000 + (int64_t)i };
+        assert(col_rel_append_row(right, row) == 0);
+    }
+    assert(session_add_rel(sess, right) == 0);
+
+    wl_plan_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op = WL_PLAN_OP_JOIN;
+    op.right_relation = "right";
+    op.key_count = 1;
+    op.left_keys = keys;
+    op.right_keys = keys;
+    op.delta_mode = WL_DELTA_FORCE_FULL;
+    if (which == JOIN_DIFF_EPHEMERAL) {
+        op.right_filter_expr.data = join_pass_all_filter;
+        op.right_filter_expr.size = sizeof(join_pass_all_filter);
+    }
+
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    assert(eval_stack_push(&stack, left, true) == 0);
+    wl_columnar_relation_test_set_mutation_nonce(1000);
+    uint64_t before = wl_columnar_relation_test_mutation_nonce_peek();
+    int rc = (which == JOIN_DIFF_PERSISTENT || which == JOIN_DIFF_EPHEMERAL)
+        ? wl_columnar_join_diff_op(&op, &stack, sess)
+        : wl_columnar_join_op(&op, &stack, sess);
+    uint64_t acquisitions
+        = wl_columnar_relation_test_mutation_nonce_peek() - before;
+    assert(rc == 0 && stack.top == 1);
+    eval_entry_t result = eval_stack_pop(&stack);
+    col_rel_t *out = result.rel;
+
+    /* The path this case exists for is the one that ran. */
+    if (which == JOIN_ARRANGEMENT)
+        assert(sess->arr_count > 0);
+    /* The unary hash path builds its own table; the same keyed shape with
+     * two columns on the right registers an arrangement instead. */
+    if (which == JOIN_UNARY)
+        assert(sess->arr_count == 0);
+    if (which == JOIN_DIFF_PERSISTENT)
+        assert(sess->diff_arr_count > 0);
+    if (which == JOIN_DIFF_EPHEMERAL)
+        assert(sess->diff_arr_count == 0);
+
+    /* Every key pairs every right row with its left row exactly once. */
+    uint32_t ncols = unary ? 3u : 4u;
+    assert(out && out->nrows == ROWS && out->ncols == ncols);
+    static bool seen[ROWS];
+    memset(seen, 0, sizeof(seen));
+    for (uint32_t r = 0; r < out->nrows; r++) {
+        int64_t k = out->columns[0][r];
+        int64_t lv = out->columns[1][r];
+        int64_t rk = out->columns[2][r];
+        assert(k >= 0 && k < KEYS && rk == k);
+        uint32_t slot;
+        if (unary) {
+            assert(lv >= 0 && lv < ROWS && lv % KEYS == k);
+            slot = (uint32_t)lv;
+        } else {
+            int64_t rv = out->columns[3][r] - 1000;
+            assert(lv == k && rv >= 0 && rv < ROWS && rv % KEYS == k);
+            slot = (uint32_t)rv;
+        }
+        assert(!seen[slot]);
+        seen[slot] = true;
+    }
+    /* A lease per cell needs at least ROWS * ncols sets, one per row at
+     * least ROWS; growing 64 -> 4096 takes seven storage epochs. */
+    assert(acquisitions >= 1 && acquisitions <= 16);
+
+    if (result.owned)
+        assert(col_rel_destroy_checked(out) == 0);
+    join_session_destroy(sess);
+}
+
+static void
+join_batch_tests(void)
+{
+    join_batch_case(JOIN_ARRANGEMENT);
+    join_batch_case(JOIN_UNARY);
+    join_batch_case(JOIN_DIFF_PERSISTENT);
+    join_batch_case(JOIN_DIFF_EPHEMERAL);
+}
+
 /* Batch failure paths (#2072 acceptance, covering #2073's appender). */
 static wl_columnar_memory_governor_ref_t *
 enforcing_governor(uint64_t budget)
@@ -1049,6 +1172,70 @@ filter_denial_tests(void)
     }
 }
 
+/* A join whose second output growth the governor refuses ends its batch
+ * before destroying the output: ENOSPC with the session's denial flag and
+ * every reserved byte returned.  A cross join on a session without workers
+ * runs the serial merge loop; eight right rows per left row make 16 left
+ * rows one growth past the 64-row floor and 32 left rows two. */
+static int
+join_denial_run(uint32_t left_rows, uint64_t budget, bool check_cleanup)
+{
+    wl_col_session_t *sess = join_session();
+    wl_columnar_memory_governor_ref_t *ref = enforcing_governor(budget);
+    sess->memory_governor = ref;
+    col_rel_t *left = join_rel("left", 2);
+    col_rel_t *right = join_rel("right", 2);
+    for (uint32_t i = 0; i < left_rows; i++) {
+        int64_t row[2] = { (int64_t)i, (int64_t)i };
+        assert(col_rel_append_row(left, row) == 0);
+    }
+    for (uint32_t i = 0; i < 8u; i++) {
+        int64_t row[2] = { (int64_t)i, 1000 + (int64_t)i };
+        assert(col_rel_append_row(right, row) == 0);
+    }
+    assert(session_add_rel(sess, right) == 0);
+    wl_plan_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op = WL_PLAN_OP_JOIN;
+    op.right_relation = "right";
+    op.key_count = 0;
+    op.delta_mode = WL_DELTA_FORCE_FULL;
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    assert(eval_stack_push(&stack, left, true) == 0);
+    uint64_t baseline = governor_reserved(ref);
+    int rc = wl_columnar_join_op(&op, &stack, sess);
+    if (rc == 0) {
+        eval_entry_t result = eval_stack_pop(&stack);
+        assert(result.rel->nrows == left_rows * 8u);
+        if (result.owned)
+            assert(col_rel_destroy_checked(result.rel) == 0);
+    } else if (check_cleanup) {
+        assert(rc == ENOSPC && sess->memory_budget_denied
+            && stack.top == 0);
+        assert(governor_reserved(ref) == baseline);
+    }
+    sess->memory_governor = NULL;
+    join_session_destroy(sess);
+    wl_columnar_memory_governor_ref_release(ref);
+    return rc;
+}
+
+static void
+join_denial_tests(void)
+{
+    uint64_t lo = 0, hi = 1u << 24;
+    assert(join_denial_run(16, hi, false) == 0);
+    while (hi - lo > 1) {
+        uint64_t mid = lo + (hi - lo) / 2u;
+        if (join_denial_run(16, mid, false) == 0)
+            hi = mid;
+        else
+            lo = mid;
+    }
+    assert(join_denial_run(32, hi, true) == ENOSPC);
+}
+
 int
 main(void)
 {
@@ -1062,9 +1249,11 @@ main(void)
     append_batch_tests();
     filter_batch_tests();
     filter_op_batch_tests();
+    join_batch_tests();
     batch_denial_tests();
     batch_renewal_failure_tests();
     filter_denial_tests();
+    join_denial_tests();
     {
         col_rel_t root;
         fixture_t f = {0};

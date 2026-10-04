@@ -1118,52 +1118,35 @@ col_join_hash_rel_keys(const col_rel_t *rel, uint32_t row,
     return h;
 }
 
+/* Stage one joined pair into @row and append it under @batch, which holds
+ * out's mutation lease for the whole serial probe loop.  Writing each cell
+ * with col_rel_set took a mutation lease per cell (#2072); this takes one
+ * per storage epoch and publishes one view advance per row. */
 static int
-col_join_append_pair(col_rel_t *out, const col_rel_t *left, uint32_t lr,
-    const col_rel_t *right, uint32_t rr, const uint32_t *project_indices,
-    uint32_t project_count, int64_t *fallback_row)
+col_join_append_pair(col_rel_append_batch_t *batch, const col_rel_t *left,
+    uint32_t lr, const col_rel_t *right, uint32_t rr,
+    const uint32_t *project_indices, uint32_t project_count, int64_t *row)
 {
-    if (out->nrows < out->capacity) {
-        uint32_t out_row = out->nrows;
-        if (out->timestamps)
-            memset(&out->timestamps[out_row], 0,
-                sizeof(col_delta_timestamp_t));
-        if (project_count > 0 && project_indices) {
-            for (uint32_t c = 0; c < project_count; c++) {
-                int rc = col_rel_set(out, out_row, c,
-                        col_join_pair_value(left, lr, right, rr,
-                        project_indices[c]));
-                if (rc != 0)
-                    return rc;
-            }
-        } else {
-            for (uint32_t c = 0; c < left->ncols; c++) {
-                int rc = col_rel_set(out, out_row, c, left->columns[c][lr]);
-                if (rc != 0)
-                    return rc;
-            }
-            for (uint32_t c = 0; c < right->ncols; c++) {
-                int rc = col_rel_set(out, out_row, left->ncols + c,
-                        right->columns[c][rr]);
-                if (rc != 0)
-                    return rc;
-            }
-        }
-        out->nrows++;
-        return 0;
-    }
-
     if (project_count > 0 && project_indices) {
         for (uint32_t c = 0; c < project_count; c++)
-            fallback_row[c] = col_join_pair_value(left, lr, right, rr,
+            row[c] = col_join_pair_value(left, lr, right, rr,
                     project_indices[c]);
     } else {
         for (uint32_t c = 0; c < left->ncols; c++)
-            fallback_row[c] = left->columns[c][lr];
+            row[c] = left->columns[c][lr];
         for (uint32_t c = 0; c < right->ncols; c++)
-            fallback_row[left->ncols + c] = right->columns[c][rr];
+            row[left->ncols + c] = right->columns[c][rr];
     }
-    return col_rel_append_row(out, fallback_row);
+    return col_rel_append_batch_row(batch, row);
+}
+
+/* End a serial probe loop's batch right after the loop, before any exit
+ * that could destroy, publish or replace out, folding its status into rc. */
+static int
+col_join_pair_batch_end(col_rel_append_batch_t *batch, int rc)
+{
+    int end_rc = col_rel_append_batch_end(batch, rc == 0);
+    return rc != 0 ? rc : end_rc;
 }
 
 typedef struct {
@@ -1642,7 +1625,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         }
 
         /* Probe: iterate non-unary side, test membership in hash set. */
-        int join_rc = 0;
+        col_rel_append_batch_t pair_batch = { 0 };
+        int join_rc = col_rel_append_batch_begin(&pair_batch, out);
         for (uint32_t pr = 0; pr < probe->nrows && join_rc == 0; pr++) {
             int64_t pkey = probe->columns[probe_kcol][pr];
             uint32_t h = col_join_hash_rel_keys(probe, pr, &probe_kcol, 1);
@@ -1657,11 +1641,11 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     continue;
                 uint32_t lr = right_is_unary ? pr : bi;
                 uint32_t rr = right_is_unary ? bi : pr;
-                join_rc = col_join_append_pair(out, left, lr, right, rr,
-                        op->project_indices, op->project_count, tmp);
+                join_rc = col_join_append_pair(&pair_batch, left, lr, right,
+                        rr, op->project_indices, op->project_count, tmp);
                 if (join_rc != 0) {
                     WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_ERROR,
-                        "col_rel_append_row failed with rc=%d at "
+                        "join pair append failed with rc=%d at "
                         "unary join",
                         join_rc);
                     break;
@@ -1678,6 +1662,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             }
         }
 
+        join_rc = col_join_pair_batch_end(&pair_batch, join_rc);
         free(ht_head);
         free(ht_next);
         if (hash_admitted)
@@ -2069,7 +2054,11 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 join_rc = 0;
             else if (join_rc == 0 && join_overflow)
                 join_rc = EOVERFLOW;
-        } else if (!run_bounded) for (uint32_t lr = 0;
+        } else if (!run_bounded) {
+            col_rel_append_batch_t pair_batch = { 0 };
+            if (join_rc == 0)
+                join_rc = col_rel_append_batch_begin(&pair_batch, out);
+            for (uint32_t lr = 0;
                 lr < left->nrows && join_rc == 0; lr++) {
                 if (arr) {
                     /* Arrangement probe: fill key_row at right-side positions. */
@@ -2081,16 +2070,16 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                         /* Verify key match: find_next may return collision rows. */
                         if (col_join_keys_match_rel(left, lr, lk, right, rr, rk,
                             kc)) {
-                            join_rc = col_join_append_pair(out, left, lr, right,
-                                    rr, op->project_indices, op->project_count,
-                                    tmp);
+                            join_rc = col_join_append_pair(&pair_batch, left,
+                                    lr, right, rr, op->project_indices,
+                                    op->project_count, tmp);
                             if (join_rc != 0) {
                                 /* Issue #1477: a governed output makes
                                  * rc=ENOMEM a routine budget denial, so this
                                  * goes through the structured logger rather
                                  * than unconditional consumer stderr. */
                                 WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_ERROR,
-                                    "col_rel_append_row failed in "
+                                    "join pair append failed in "
                                     "arrangement probe with rc=%d",
                                     join_rc);
                                 break;
@@ -2118,11 +2107,12 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                             rk,
                             kc))
                             continue;
-                        join_rc = col_join_append_pair(out, left, lr, right, rr,
-                                op->project_indices, op->project_count, tmp);
+                        join_rc = col_join_append_pair(&pair_batch, left, lr,
+                                right, rr, op->project_indices,
+                                op->project_count, tmp);
                         if (join_rc != 0) {
                             WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_ERROR,
-                                "col_rel_append_row failed in ephemeral "
+                                "join pair append failed in ephemeral "
                                 "hash probe with rc=%d",
                                 join_rc);
                             break;
@@ -2139,6 +2129,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     }
                 }
             }
+            join_rc = col_join_pair_batch_end(&pair_batch, join_rc);
+        }
 
         WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
             "Merge-join loop completed, out->nrows=%u, rc=%d",
@@ -3563,6 +3555,9 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
         }
 
         /* Probe left against the persistent diff arrangement hash table */
+        col_rel_append_batch_t pair_batch = { 0 };
+        if (join_rc == 0)
+            join_rc = col_rel_append_batch_begin(&pair_batch, out);
         for (uint32_t lr = 0; lr < left->nrows && join_rc == 0; lr++) {
             uint32_t h = col_join_hash_rel_keys(left, lr, lk, kc) & (nbk - 1);
             for (uint32_t e = darr->ht_head[h]; e != 0;
@@ -3570,8 +3565,8 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 uint32_t rr = e - 1;
                 if (!col_join_keys_match_rel(left, lr, lk, right, rr, rk, kc))
                     continue;
-                join_rc = col_join_append_pair(out, left, lr, right, rr,
-                        op->project_indices, op->project_count, tmp);
+                join_rc = col_join_append_pair(&pair_batch, left, lr, right,
+                        rr, op->project_indices, op->project_count, tmp);
                 if (join_rc != 0)
                     break;
                 if (col_join_output_limit_reached(sess, out)) {
@@ -3585,6 +3580,7 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 }
             }
         }
+        join_rc = col_join_pair_batch_end(&pair_batch, join_rc);
 
         if (join_rc != 0) {
             WL_DIFF_RELEASE_TMP();
@@ -3683,6 +3679,9 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
             ht_next_ep[rr] = ht_head_ep[h];
             ht_head_ep[h] = rr + 1;
         }
+        col_rel_append_batch_t pair_batch = { 0 };
+        if (join_rc == 0)
+            join_rc = col_rel_append_batch_begin(&pair_batch, out);
         for (uint32_t lr = 0; lr < left->nrows && join_rc == 0; lr++) {
             uint32_t h = col_join_hash_rel_keys(left, lr, lk, kc)
                 & (nbuckets_ep - 1);
@@ -3691,8 +3690,8 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 uint32_t rr = e - 1;
                 if (!col_join_keys_match_rel(left, lr, lk, right, rr, rk, kc))
                     continue;
-                join_rc = col_join_append_pair(out, left, lr, right, rr,
-                        op->project_indices, op->project_count, tmp);
+                join_rc = col_join_append_pair(&pair_batch, left, lr, right,
+                        rr, op->project_indices, op->project_count, tmp);
                 if (join_rc != 0)
                     break;
                 if (col_join_output_limit_reached(sess, out)) {
@@ -3706,6 +3705,7 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 }
             }
         }
+        join_rc = col_join_pair_batch_end(&pair_batch, join_rc);
         free(ht_head_ep);
         free(ht_next_ep);
         if (hash_admitted)
