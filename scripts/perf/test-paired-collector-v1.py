@@ -2,6 +2,7 @@
 """Collector v1 provenance, durability and complete schedule contracts."""
 import argparse
 import ctypes
+import hashlib
 import json
 import os
 from os import open as open_fd  # File-descriptor open; no text encoding applies.
@@ -12,16 +13,19 @@ import signal
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
 M = runpy.run_path(str(Path(__file__).with_name('paired-collector-v1.py')))
 G = M['collect'].__globals__
+TEST_TMP = Path.home() / '.cache' / 'wirelog-test-tmp'
+TEST_TMP.mkdir(parents=True, exist_ok=True)
 
 
 class CollectorTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(dir=TEST_TMP)
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         args = dict(mode='aa_control', base_sha='a' * 40, candidate_sha='a' * 40,
@@ -155,6 +159,53 @@ class CollectorTests(unittest.TestCase):
             M['collect'](self.args)
         self.assertFalse(self.args.out_dir.exists())
 
+    def test_qualified_aa_binary_mismatch_rejects_before_any_launch(self):
+        self.args.qualify_aa = True
+        binary = self.args.candidate_build / 'bench/bench_flowlog'
+        binary.write_text(binary.read_text(encoding='utf-8') + '# changed bytes\n', encoding='utf-8')
+        with patch.dict(G, execute=Mock(side_effect=AssertionError('must not launch'))):
+            self.assertEqual(M['collect'](self.args), 4)
+        result = self.read('aa-qualification-preflight.json')
+        self.assertEqual(result['status'], 'FAIL')
+        self.assertEqual(result['reason'], 'binary_sha_mismatch')
+        self.assertEqual(result['benchmark_launches'], 0)
+        self.assertFalse((self.args.out_dir / 'raw-attempts.jsonl').exists())
+
+    def test_qualified_aa_writes_shared_build_identity_and_exact_attempt_links(self):
+        self.args.qualify_aa = True
+        self.args.candidate_source = self.args.base_source
+        self.args.candidate_build = self.args.base_build
+        self.args.candidate_build_log = self.args.base_build_log
+        before = dict(value=1, unavailable_reason=None, unit='percent')
+        host = dict(timestamp_utc='2026-10-04T00:00:00+00:00', monotonic_ns=1,
+                    machine_id=dict(value='machine', unavailable_reason=None),
+                    governor=dict(value='performance', unavailable_reason=None),
+                    cpu_psi_some_avg10_percent=before, cpu_psi_full_avg10_percent=before,
+                    memory_psi_full_avg10_percent=before, swap_pages=dict(value={'pswpin': 0, 'pswpout': 0}, unavailable_reason=None),
+                    cgroup=dict(value={'version': 'v2', 'levels': []}, unavailable_reason=None),
+                    child_affinity=dict(value=[self.args.cpu], unavailable_reason=None))
+        def fake_execute(binary, workload, root, cpu, timeout, **kwargs):
+            self.assertTrue(kwargs['qualify_aa'])
+            if workload == 'crdt':
+                record = dict(schema_version=1, measurement='crdt_perf_gate_single_run', workload='crdt', fixture='full', workers=1, expected=104851, result=104851, aggregate=2152328, iterations=14148, status='OK', elapsed_ms=10)
+                stdout = json.dumps(record) + '\n'
+            else:
+                stdout = M['LEGACY']['HEADER'] + '\ncspa\t-\t-\t1\t1\t2\t2\t2\t100\t20381\t6\tOK\n'
+            return dict(stdout=stdout, stderr='', exit_code=0, timed_out=False,
+                        host_before={}, host_after={}, aa_host_before=host, aa_host_after=host)
+        with patch.dict(G, execute=fake_execute):
+            self.assertEqual(M['collect'](self.args), 0)
+        campaign = self.read('campaign-v1.json')
+        provenance = campaign['manifest']['build_provenance']
+        self.assertEqual(provenance['base']['build_instance_id'], provenance['candidate']['build_instance_id'])
+        links = [json.loads(line) for line in (self.args.out_dir / 'aa-attempt-links.jsonl').read_text().splitlines()]
+        raw_lines = (self.args.out_dir / 'raw-attempts.jsonl').read_bytes().splitlines(keepends=True)
+        self.assertEqual(len(links), 80)
+        self.assertEqual(len(raw_lines), 80)
+        for ordinal, (link, raw) in enumerate(zip(links, raw_lines)):
+            self.assertEqual(link['ordinal'], ordinal)
+            self.assertEqual(link['raw_line_sha256'], hashlib.sha256(raw).hexdigest())
+
     def test_typed_parse_and_unavailable_telemetry(self):
         result = dict(schema_version=1, measurement='crdt_perf_gate_single_run', workload='crdt', fixture='full', workers=1, expected=104851, result=0, aggregate=2, iterations=0, status='FAIL', elapsed_ms=10)
         self.assertEqual(M['parse_result'](json.dumps(result), 'crdt')[1]['observed']['result'], 0)
@@ -173,6 +224,57 @@ class CollectorTests(unittest.TestCase):
         self.assertTrue(raw['timed_out'])
         self.assertIn(raw['exit_code'], (-signal.SIGTERM, -signal.SIGKILL))
         self.assertEqual(raw['stdout'], 'partial\n')
+
+    def test_qualified_execute_verifies_child_affinity_before_exec(self):
+        binary = self.root / 'qualified-probe'
+        binary.write_text('#!/bin/sh\nprintf "qualified\\n"\n', encoding='utf-8')
+        binary.chmod(0o755)
+        raw = M['execute'](binary, 'crdt', self.root, self.args.cpu, 5, qualify_aa=True)
+        self.assertEqual(raw['exit_code'], 0)
+        self.assertEqual(raw['stdout'], 'qualified\n')
+        self.assertEqual(raw['launcher_ready']['affinity'], [self.args.cpu])
+        self.assertEqual(raw['aa_host_before']['child_affinity']['value'], [self.args.cpu])
+        self.assertEqual(raw['aa_host_after']['child_affinity']['observation'],
+                         'carried_forward_from_verified_preexec_affinity')
+
+    def test_post_spawn_oserror_kills_and_reaps_launcher_process_group(self):
+        binary = self.root / 'qualified-probe'
+        binary.write_text('#!/bin/sh\nsleep 30\n', encoding='utf-8')
+        binary.chmod(0o755)
+        with patch.dict(G, select=SimpleNamespace(
+                select=Mock(side_effect=OSError('injected handshake I/O failure')))):
+            raw = M['execute'](binary, 'crdt', self.root, self.args.cpu, 5, qualify_aa=True)
+        self.assertEqual(raw['launch_error'], 'OSError: injected handshake I/O failure')
+        self.assertIsNotNone(raw['exit_code'])
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(raw['process_group_id'], 0)
+
+    def test_qualified_handshake_oserror_stops_campaign_before_benchmark_exec(self):
+        self.args.qualify_aa = True
+        self.args.candidate_source = self.args.base_source
+        self.args.candidate_build = self.args.base_build
+        self.args.candidate_build_log = self.args.base_build_log
+        marker = self.root / 'benchmark-started'
+        binary = self.args.base_build / 'tests/test_crdt_perf_gate'
+        binary.write_text('#!' + sys.executable + '\nfrom pathlib import Path; Path(%r).write_text("started")\n' % str(marker))
+        binary.chmod(0o755)
+        original = M['execute']
+        calls = []
+        def counted_execute(*args, **kwargs):
+            calls.append(args[0])
+            return original(*args, **kwargs)
+        with patch.dict(G, execute=counted_execute), patch('select.select',
+                side_effect=OSError('injected first-launch handshake failure')):
+            self.assertEqual(M['collect'](self.args), 3)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(marker.exists())
+        raw_lines = (self.args.out_dir / 'raw-attempts.jsonl').read_text(encoding='utf-8').splitlines()
+        links = (self.args.out_dir / 'aa-attempt-links.jsonl').read_text(encoding='utf-8').splitlines()
+        self.assertEqual(len(raw_lines), 1)
+        self.assertEqual(len(links), 1)
+        raw = json.loads(raw_lines[0])
+        self.assertTrue(raw['prelaunch_rejected'])
+        self.assertIn('handshake_io_error', raw['launch_rejection'])
 
     def test_wrong_typed_result_is_correctness_failure(self):
         path = self.args.base_build / 'tests/test_crdt_perf_gate'

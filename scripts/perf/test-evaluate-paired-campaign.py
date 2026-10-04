@@ -64,6 +64,16 @@ class Tests(unittest.TestCase):
         for b in r['workloads']['crdt']['blocks'].values():
             self.assertEqual(b['paired_log_ratios'],[0]*9)
         self.assertEqual(r['workloads']['crdt']['order_effect_log_ratio'],0)
+    def test_aa_shared_build_identity_is_valid_only_for_matching_inputs(self):
+        c=fixture(True)
+        c['manifest']['build_provenance']['candidate']['build_instance_id']='base-build'
+        refresh(c)
+        self.assertEqual(self.evaluate(c)['status'],'COMPLETE_VALID')
+        c['manifest']['workloads']['crdt']['binary_sha256']['candidate']='e'*64
+        refresh(c)
+        r=self.evaluate(c)
+        self.assertEqual(r['status'],'INVALID_EVIDENCE')
+        self.assertEqual(r['reason'],'shared A/A build provenance differs')
     def test_malformed_attempts(self):
         changes={'sequence':[True,-1,20,'2'], 'elapsed_ms':[True,0,-1,float('nan'),float('inf'),'10'],
                  'pair_index':[9,True,'0'], 'campaign_id':['other'], 'manifest_sha256':['f'*64],
