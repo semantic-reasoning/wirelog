@@ -5,13 +5,13 @@
  * Licensed under LGPL-3.0
  * For commercial licenses, contact: inquiry@cleverplant.com
  *
- * Validates that join_output_limit is correctly computed at session init:
- *   - Default: auto-detected from physical RAM / num_workers
- *   - Env override: WIRELOG_JOIN_OUTPUT_LIMIT sets exact value
- *   - Disable: WIRELOG_JOIN_OUTPUT_LIMIT=0 disables the limit
- *   - Scaling: 8-worker limit is ~1/8 of 1-worker limit
+ * Validates optional legacy join row-cap configuration:
+ *   - Unset, empty and zero disable the cap
+ *   - Env override: WIRELOG_JOIN_OUTPUT_LIMIT sets a positive cap
+ *   - Malformed values fail session creation
+ *   - Disabled caps still preserve join output high-water accounting
  *
- * Issue #221: Dynamic join output limit based on available memory
+ * Issue #1369: remove the implicit physical-memory-derived row cap
  */
 
 #define _GNU_SOURCE
@@ -27,7 +27,9 @@
 #include "../wirelog/wirelog.h"
 #include "plan_fixture.h"
 
+#include <errno.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -97,13 +99,13 @@ build_plan(const char *src)
 }
 
 /* ======================================================================== */
-/* Test 1: Default limit is auto-detected (> 0)                            */
+/* Test 1: Unset limit leaves the optional row cap disabled                */
 /* ======================================================================== */
 
 static int
 test_default_limit(void)
 {
-    TEST("Default join_output_limit > 0 (auto-detected from RAM)");
+    TEST("Unset WIRELOG_JOIN_OUTPUT_LIMIT disables the row cap");
 
     /* Remove env override if present */
     unsetenv("WIRELOG_JOIN_OUTPUT_LIMIT");
@@ -125,12 +127,12 @@ test_default_limit(void)
     }
 
     wl_col_session_t *sess = (wl_col_session_t *)session;
-    bool ok = sess->join_output_limit > 0;
+    bool ok = sess->join_output_limit == 0;
 
     if (!ok) {
         char msg[128];
         snprintf(msg, sizeof(msg),
-            "join_output_limit == 0 (expected > 0), got %llu",
+            "expected join_output_limit=0, got %llu",
             (unsigned long long)sess->join_output_limit);
         FAIL(msg);
     }
@@ -239,16 +241,72 @@ test_env_disable(void)
     return ok ? 0 : 1;
 }
 
+static int
+test_empty_env_is_disabled(void)
+{
+    TEST("empty WIRELOG_JOIN_OUTPUT_LIMIT disables the row cap");
+    setenv("WIRELOG_JOIN_OUTPUT_LIMIT", "", 1);
+    wl_plan_t *plan = build_plan(".decl a(x: int32)\n"
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
+    if (!plan) {
+        unsetenv("WIRELOG_JOIN_OUTPUT_LIMIT");
+        FAIL("could not generate plan");
+        return 1;
+    }
+    wl_session_t *session = NULL;
+    int rc = wl_session_create(wl_backend_columnar(), plan, 1, &session);
+    bool ok = rc == 0 && session != NULL
+        && ((wl_col_session_t *)session)->join_output_limit == 0;
+    if (session)
+        wl_session_destroy(session);
+    wl_plan_free(plan);
+    unsetenv("WIRELOG_JOIN_OUTPUT_LIMIT");
+    if (ok)
+        PASS();
+    else
+        FAIL("empty value did not disable the row cap");
+    return ok ? 0 : 1;
+}
+
+static int
+test_env_clamps_to_row_width(void)
+{
+    TEST("positive row cap is clamped to UINT32_MAX");
+    setenv("WIRELOG_JOIN_OUTPUT_LIMIT", "18446744073709551615", 1);
+    wl_plan_t *plan = build_plan(".decl a(x: int32)\n"
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
+    if (!plan) {
+        unsetenv("WIRELOG_JOIN_OUTPUT_LIMIT");
+        FAIL("could not generate plan");
+        return 1;
+    }
+    wl_session_t *session = NULL;
+    int rc = wl_session_create(wl_backend_columnar(), plan, 1, &session);
+    bool ok = rc == 0 && session != NULL
+        && ((wl_col_session_t *)session)->join_output_limit == UINT32_MAX;
+    if (session)
+        wl_session_destroy(session);
+    wl_plan_free(plan);
+    unsetenv("WIRELOG_JOIN_OUTPUT_LIMIT");
+    if (ok)
+        PASS();
+    else
+        FAIL("positive cap was not clamped to UINT32_MAX");
+    return ok ? 0 : 1;
+}
+
 /* ======================================================================== */
-/* Test 4: Limit is constant regardless of num_workers (Issue #404)        */
+/* Test 4: Disabled cap is independent of configured worker count           */
 /* ======================================================================== */
 
 static int
 test_limit_constant_across_workers(void)
 {
-    TEST("join_output_limit is constant across W=1, W=4, W=8 (Issue #404)");
+    TEST("disabled row cap stays zero at W=1, W=4, W=8");
 
-    /* Remove env override to exercise auto-detection path */
+    /* Remove env override to exercise unset configuration. */
     unsetenv("WIRELOG_JOIN_OUTPUT_LIMIT");
 
     wl_plan_t *plan = build_plan(".decl a(x: int32)\n"
@@ -290,15 +348,13 @@ test_limit_constant_across_workers(void)
     uint64_t limit4 = ((wl_col_session_t *)sess4)->join_output_limit;
     uint64_t limit8 = ((wl_col_session_t *)sess8)->join_output_limit;
 
-    /* Global per-join cap: limit must be identical for W=1, W=4, W=8.
-     * Regression check for Issue #404: commit 6929689 divided by num_workers,
-     * causing silent data loss in multi-worker mode. */
-    bool ok = (limit1 > 0 && limit1 == limit4 && limit1 == limit8);
+    /* These simple plans exercise coordinator session configuration only. */
+    bool ok = (limit1 == 0 && limit4 == 0 && limit8 == 0);
 
     if (!ok) {
         char msg[256];
         snprintf(msg, sizeof(msg),
-            "limit1=%llu limit4=%llu limit8=%llu: expected all equal",
+            "limit1=%llu limit4=%llu limit8=%llu: expected all zero",
             (unsigned long long)limit1,
             (unsigned long long)limit4,
             (unsigned long long)limit8);
@@ -315,6 +371,66 @@ test_limit_constant_across_workers(void)
     return ok ? 0 : 1;
 }
 
+static int
+test_invalid_env_values(void)
+{
+    static const char *const invalid[] = {
+        "-1", "+1", " 1", "1 ", "1x", "18446744073709551616"
+    };
+    TEST("malformed row-cap values fail before session allocation");
+    wl_plan_t *plan = build_plan(".decl a(x: int32)\n"
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
+    if (!plan) {
+        unsetenv("WIRELOG_JOIN_OUTPUT_LIMIT");
+        FAIL("could not generate plan");
+        return 1;
+    }
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        setenv("WIRELOG_JOIN_OUTPUT_LIMIT", invalid[i], 1);
+        wl_session_t *session = (wl_session_t *)(uintptr_t)1;
+        int rc = wl_session_create(wl_backend_columnar(), plan, 1, &session);
+        if (rc != EINVAL || session != NULL) {
+            if (session && session != (wl_session_t *)(uintptr_t)1)
+                wl_session_destroy(session);
+            wl_plan_free(plan);
+            unsetenv("WIRELOG_JOIN_OUTPUT_LIMIT");
+            FAIL("invalid value did not return EINVAL with NULL output");
+            return 1;
+        }
+    }
+    setenv("WIRELOG_JOIN_OUTPUT_LIMIT", "0", 1);
+    wl_session_t *session = NULL;
+    int rc = wl_session_create(wl_backend_columnar(), plan, 1, &session);
+    bool ok = rc == 0 && session != NULL
+        && ((wl_col_session_t *)session)->join_output_limit == 0;
+    if (session)
+        wl_session_destroy(session);
+    wl_plan_free(plan);
+    unsetenv("WIRELOG_JOIN_OUTPUT_LIMIT");
+    if (ok)
+        PASS();
+    else
+        FAIL("valid creation failed after malformed configuration");
+    return ok ? 0 : 1;
+}
+
+static int
+test_disabled_limit_records_high_water(void)
+{
+    TEST("disabled row cap still records the output high-water mark");
+    wl_col_session_t session = {0};
+    col_rel_t output = {0};
+    output.nrows = 17;
+    bool stopped = col_join_output_limit_reached(&session, &output);
+    bool ok = !stopped && session.join_output_peak == 17;
+    if (ok)
+        PASS();
+    else
+        FAIL("zero cap stopped output or lost its high-water mark");
+    return ok ? 0 : 1;
+}
+
 /* ======================================================================== */
 /* main                                                                     */
 /* ======================================================================== */
@@ -322,12 +438,16 @@ test_limit_constant_across_workers(void)
 int
 main(void)
 {
-    printf("=== test_join_limit (Issue #221) ===\n");
+    printf("=== test_join_limit (Issue #1369) ===\n");
 
     test_default_limit();
     test_env_override();
     test_env_disable();
+    test_empty_env_is_disabled();
+    test_env_clamps_to_row_width();
     test_limit_constant_across_workers();
+    test_invalid_env_values();
+    test_disabled_limit_records_high_water();
 
     printf("\nPassed: %d/%d\n", tests_passed, tests_run);
     printf("Failed: %d/%d\n", tests_failed, tests_run);

@@ -364,9 +364,9 @@ memory use, how to read the numbers, what they cost, and the baselines that
 bounded-memory work (Issue #1367 and its sub-issues) starts from.  It covers
 Issue #1380.
 
-Nothing here enforces a limit.  The ledger is an accounting instrument; the
-budget it carries (`WIRELOG_MEMORY_BUDGET`) only drives the join operator's
-backpressure poll described in §6.
+The ledger is an accounting instrument, while the memory governor uses the
+resolved budget to admit covered allocation classes before they grow. Coverage
+is incremental; the sections below describe which paths participate.
 
 ## 1. Units and conventions
 
@@ -543,15 +543,17 @@ and host Job Object limits; when no finite source exists, the resolver is
 advisory/unbounded. Explicit `0`, malformed values, overflow, and values below
 256 MiB are invalid. This resolver does not use physical RAM as an enforcing
 fallback. The legacy ledger worker-share hint remains separate from governor
-admission; fixed eval-arena, delta-pool, and compound-arena backing storage
-are now admitted. Joins and other allocation classes remain follow-up work.
+admission. Fixed eval-arena, delta-pool, compound-arena backing storage, and
+the covered join allocation paths use admission; LFTJ, auxiliary metadata,
+and eval-entry segment allocations remain follow-up work.
 
-The only consumer is the join operator: when RELATION reaches 80% of its
-share (`wl_mem_ledger_should_backpressure(RELATION, 80)`), a worker session
-stops generating rows for the current join and reports the condition
-upstream.  The join row cap (`WIRELOG_JOIN_OUTPUT_LIMIT`, Issue #221) is a
-separate mechanism.  Replacing both with admission control is #1367
-(foundation in #1368).
+The ledger's RELATION worker-share hint can still trigger join backpressure
+at 80% (`wl_mem_ledger_should_backpressure(RELATION, 80)`). The governor also
+admits covered allocations and reports refusals upstream. The legacy
+`WIRELOG_JOIN_OUTPUT_LIMIT` row cap is disabled when unset, empty, or zero; a
+positive decimal keeps the optional per-join cap, clamped to `UINT32_MAX`.
+Malformed values fail session creation. This row cap is not the memory budget
+and does not replace allocation admission.
 
 ## 7. Baselines
 
