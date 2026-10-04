@@ -1054,10 +1054,10 @@ wl_columnar_lftj_test_deny_next_output_growth(void)
 }
 
 void
-wl_columnar_lftj_test_fail_next_output_append(void)
+wl_columnar_lftj_test_fail_next_output_growth(void)
 {
-    lftj_output_test_hook_state.fail_output_append_pending = true;
-    lftj_output_test_hook_state.fail_output_append_consumed = false;
+    lftj_output_test_hook_state.fail_output_growth_pending = true;
+    lftj_output_test_hook_state.fail_output_growth_consumed = false;
 }
 
 void
@@ -1076,13 +1076,21 @@ wl_columnar_lftj_test_clear_output_hooks(void)
 }
 
 static bool
-lftj_test_before_output_append(wl_columnar_memory_governor_ref_t *governor)
+lftj_test_before_output_growth(col_rel_t *out,
+    wl_columnar_memory_governor_ref_t *governor)
 {
     wl_columnar_lftj_output_test_hook_state_t *state
         = &lftj_output_test_hook_state;
-    if (state->fail_output_append_pending) {
-        state->fail_output_append_pending = false;
-        state->fail_output_append_consumed = true;
+    if (!out || out->nrows == 0 || out->nrows < out->capacity)
+        return false;
+    if (!state->fail_output_growth_pending
+        && !state->deny_output_growth_pending)
+        return false;
+    state->output_rows_at_growth = out->nrows;
+    state->output_capacity_at_growth = out->capacity;
+    if (state->fail_output_growth_pending) {
+        state->fail_output_growth_pending = false;
+        state->fail_output_growth_consumed = true;
         return true;
     }
     if (state->deny_output_growth_pending && governor) {
@@ -1097,6 +1105,7 @@ lftj_test_before_output_append(wl_columnar_memory_governor_ref_t *governor)
                 state->reserved_before_growth, memory_order_relaxed);
             state->deny_output_growth_pending = false;
             state->deny_output_growth_consumed = true;
+            state->deny_output_growth_restore_pending = true;
         }
     }
     return false;
@@ -1107,13 +1116,14 @@ lftj_test_after_output_append(wl_columnar_memory_governor_ref_t *governor)
 {
     wl_columnar_lftj_output_test_hook_state_t *state
         = &lftj_output_test_hook_state;
-    if (!state->deny_output_growth_consumed || !governor)
+    if (!state->deny_output_growth_restore_pending || !governor)
         return;
     wl_columnar_memory_governor_t *memory_governor
         = wl_columnar_memory_governor_ref_get(governor);
     if (memory_governor)
         atomic_store_explicit(&memory_governor->usable_bytes,
             state->previous_usable_bytes, memory_order_relaxed);
+    state->deny_output_growth_restore_pending = false;
 }
 #endif
 
@@ -1175,7 +1185,7 @@ lftj_binary_cb(const int64_t *row, uint32_t lftj_ncols, void *user)
         }
     }
 #ifdef WL_TEST_LFTJ_ADMISSION_HOOKS
-    if (lftj_test_before_output_append(ctx->governor)) {
+    if (lftj_test_before_output_growth(ctx->out, ctx->governor)) {
         lftj_output_test_hook_state.failure_pending_flag
             = ctx->out->memory_budget_denial_pending;
         ctx->rc = ENOMEM;

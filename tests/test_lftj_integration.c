@@ -761,6 +761,9 @@ test_lftj_output_growth_denial_propagates_and_retries(void)
             hook_state.previous_usable_bytes, memory_order_relaxed);
     }
     if (!hook_state.deny_output_growth_consumed
+        || hook_state.output_rows_at_growth == 0
+        || hook_state.output_rows_at_growth
+        < hook_state.output_capacity_at_growth
         || hook_state.reserved_before_growth < baseline_reserved
         || rc != ENOSPC || !columnar->memory_budget_denied || stack.top != 0) {
         failure = "output growth denial was not propagated as ENOSPC";
@@ -806,10 +809,14 @@ test_lftj_output_growth_denial_propagates_and_retries(void)
     }
 
     columnar->memory_budget_denied = false;
-    wl_columnar_lftj_test_fail_next_output_append();
+    wl_columnar_lftj_test_fail_next_output_growth();
     rc = col_op_lftj(lftj_op, &stack, columnar);
     wl_columnar_lftj_test_get_output_hook_state(&hook_state);
-    if (!hook_state.fail_output_append_consumed || rc != ENOMEM
+    if (!hook_state.fail_output_growth_consumed
+        || hook_state.output_rows_at_growth == 0
+        || hook_state.output_rows_at_growth
+        < hook_state.output_capacity_at_growth
+        || rc != ENOMEM
         || hook_state.failure_pending_flag || columnar->memory_budget_denied
         || stack.top != 0) {
         failure = "ordinary output allocator failure was misclassified";
