@@ -85,10 +85,29 @@
 #
 # Exit codes: 0 = OK, 1 = leak detected, 2 = script setup failure.
 #
-# 1 means a leak and nothing else.  Every other failure -- scratch creation,
-# meson, a missing artifact, cleanup -- must exit 2, because a bare `set -e`
-# abort exits 1 and would be read as an erasure regression.  A leak verdict is
-# never downgraded by a later cleanup problem.
+# 1 is the leak verdict.  Every failure the script detects -- scratch
+# creation, meson, a missing artifact, cleanup -- exits 2, because a bare
+# `set -e` abort exits 1 and would be read as an erasure regression.
+#
+# Other statuses come only from the process being signalled, its stdio
+# breaking, or the script being read from stdin; none is a verdict:
+#   - A fatal signal other than INT, TERM and HUP ends the script by that
+#     signal (a shell reports 128 + its number): SIGKILL, which cannot be
+#     trapped and which meson test sends shortly after SIGTERM if the gate is
+#     still running, or an untrapped one such as SIGPIPE when the reader of
+#     stdout or stderr has gone.  A SIGKILL after mktemp leaves the scratch
+#     directory behind.
+#   - INT, TERM and HUP exit 2 once the traps below are installed.  Before
+#     that, while the source root and the scratch directory are resolved,
+#     they take their default action (130, 143, 129).  One that arrives
+#     during cleanup after a leak verdict turns the 1 into a 2.
+#   - A write of a diagnostic that fails (closed stdout or stderr, full disk)
+#     aborts under `set -e` with 1, as does an unbound ${BASH_SOURCE[0]} when
+#     the script is read from stdin.
+# Resolving the source root outside a checkout is a setup failure like any
+# other and exits 2 (#1863); scripts/ci/test-log-abi-source-root.sh runs a
+# copy of the gate placed outside any git repository and requires exit 2
+# with "could not resolve the source root".
 
 set -euo pipefail
 
@@ -137,10 +156,11 @@ case "${SCRATCH_ROOT}" in
 esac
 # Installed immediately after the assignment: earlier and the body would read
 # an unset variable, later and any failure in between leaks the directory.
-# INT/TERM/HUP first: bash does not run an EXIT trap on an uncaught fatal
-# signal, so a `meson test` timeout or a Ctrl-C would otherwise leave the
-# scratch directory behind -- and unlike the old fixed path, nothing reclaims
-# it on the next run.  Exiting from these handlers makes the EXIT trap fire.
+# The INT/TERM/HUP handlers: uncaught, these signals end the script with 128+n,
+# which is not a verdict, and this script does not rely on bash running the
+# EXIT trap in that case to remove the scratch directory -- unlike the old
+# fixed path, nothing reclaims it on the next run.  Exiting from these handlers
+# makes the EXIT trap run and choose the status.
 trap 'exit 2' INT TERM HUP
 trap erasure_cleanup EXIT
 BUILD_DIR="${SCRATCH_ROOT}/build"
