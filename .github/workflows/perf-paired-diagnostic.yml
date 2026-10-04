@@ -105,9 +105,16 @@ jobs:
           test ! -e "$pair_root"
           mkdir "$pair_root"
           git worktree add --detach "$pair_root/base" "$BASE_SHA"
-          git worktree add --detach "$pair_root/candidate" "$CANDIDATE_SHA"
-          printf 'BASE_SRC=%s/base\nCANDIDATE_SRC=%s/candidate\nBASE_BUILD=%s/base-build\nCANDIDATE_BUILD=%s/candidate-build\n' \
-            "$pair_root" "$pair_root" "$pair_root" "$pair_root" >> "$GITHUB_ENV"
+          if [[ "$CAMPAIGN_MODE" == aa_control ]]; then
+            printf 'BASE_SRC=%s/base\nCANDIDATE_SRC=%s/base\nBASE_BUILD=%s/base-build\nCANDIDATE_BUILD=%s/base-build\n' \
+              "$pair_root" "$pair_root" "$pair_root" "$pair_root" >> "$GITHUB_ENV"
+          else
+            git worktree add --detach "$pair_root/candidate" "$CANDIDATE_SHA"
+            printf 'BASE_SRC=%s/base\nCANDIDATE_SRC=%s/candidate\nBASE_BUILD=%s/base-build\nCANDIDATE_BUILD=%s/candidate-build\n' \
+              "$pair_root" "$pair_root" "$pair_root" "$pair_root" >> "$GITHUB_ENV"
+          fi
+          printf 'BASE_BUILD_LOG=%s/base-complete-build.log\nCANDIDATE_BUILD_LOG=%s/base-complete-build.log\n' \
+            "$GITHUB_WORKSPACE/perf-artifacts/paired" "$GITHUB_WORKSPACE/perf-artifacts/paired" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
         run: |
@@ -132,6 +139,21 @@ jobs:
           CC: gcc
         run: |
           set -euo pipefail
+          if [[ "$CAMPAIGN_MODE" == aa_control ]]; then
+            source="$BASE_SRC"
+            build="$BASE_BUILD"
+            {
+              printf 'side=shared-aa source=%s build=%s phase=configure\n' "$source" "$build"
+              meson setup "$build" "$source" --buildtype=release \
+                -Dwirelog_log_max_level=trace -Dtests=true -DmbedTLS=disabled
+            } 2>&1 | tee "perf-artifacts/paired/base-configure.log"
+            {
+              printf 'side=shared-aa source=%s build=%s phase=compile\n' "$source" "$build"
+              meson compile -C "$build" bench_flowlog test_crdt_perf_gate test_cspa_perf_gate
+            } 2>&1 | tee "perf-artifacts/paired/base-build.log"
+            cat "perf-artifacts/paired/base-configure.log" "perf-artifacts/paired/base-build.log" \
+              > "$BASE_BUILD_LOG"
+          else
           for side in base candidate; do
             if [[ "$side" == base ]]; then
               source="$BASE_SRC"
@@ -152,18 +174,36 @@ jobs:
             cat "perf-artifacts/paired/$side-configure.log" "perf-artifacts/paired/$side-build.log" \
               > "perf-artifacts/paired/$side-complete-build.log"
           done
+            printf 'BASE_BUILD_LOG=%s/base-complete-build.log\nCANDIDATE_BUILD_LOG=%s/candidate-complete-build.log\n' \
+              "$GITHUB_WORKSPACE/perf-artifacts/paired" "$GITHUB_WORKSPACE/perf-artifacts/paired" >> "$GITHUB_ENV"
+          fi
 
       - name: Collect campaign v1
         shell: bash
         run: |
           set -euo pipefail
+          aa_option=()
+          if [[ "$CAMPAIGN_MODE" == aa_control ]]; then
+            aa_option+=(--qualify-aa)
+          fi
           python scripts/perf/paired-benchmark.py v1 \
             --mode "$CAMPAIGN_MODE" --base-sha "$BASE_SHA" --candidate-sha "$CANDIDATE_SHA" \
             --base-source "$BASE_SRC" --candidate-source "$CANDIDATE_SRC" \
             --base-build "$BASE_BUILD" --candidate-build "$CANDIDATE_BUILD" \
-            --base-build-log perf-artifacts/paired/base-complete-build.log \
-            --candidate-build-log perf-artifacts/paired/candidate-complete-build.log \
-            --cpu "$CAMPAIGN_CPU" --timeout 180 --out-dir perf-artifacts/paired/campaign
+            --base-build-log "$BASE_BUILD_LOG" \
+            --candidate-build-log "$CANDIDATE_BUILD_LOG" \
+            --cpu "$CAMPAIGN_CPU" --timeout 180 --out-dir perf-artifacts/paired/campaign \
+            "${aa_option[@]}"
+
+      - name: Qualify A/A noise and host control
+        if: always() && env.CAMPAIGN_MODE == 'aa_control'
+        continue-on-error: true
+        shell: bash
+        run: |
+          python scripts/perf/qualify-paired-aa.py \
+            --evidence-dir perf-artifacts/paired/campaign \
+            --preflight perf-artifacts/paired/campaign/preflight.json \
+            --output perf-artifacts/paired/campaign/aa-qualification-v1.json
 
       - name: Upload all paired diagnostic evidence
         if: always()
@@ -193,6 +233,11 @@ jobs:
               lines.append('Collector status/reason: ' + json.dumps(json.loads(status.read_text(encoding='utf-8')), sort_keys=True))
           else:
               lines.append('Collector status unavailable; inspect partial evidence.')
+          qualification = Path('perf-artifacts/paired/campaign/aa-qualification-v1.json')
+          if qualification.exists():
+              result = json.loads(qualification.read_text(encoding='utf-8'))
+              lines.append('A/A qualification (separate from descriptive v1 status): ' +
+                           json.dumps({'status': result.get('status'), 'reason': result.get('reason')}, sort_keys=True))
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
               summary.write('\n\n'.join(lines) + '\n')
           PY

@@ -43,7 +43,7 @@ def validate(text):
     assert re.findall(r'^      ([a-z_]+):', triggers, re.M) == ['campaign_mode', 'base_sha']
     require(triggers, ['required: false', '- comparison', '- aa_control'])
     assert text.split('\npermissions:\n', 1)[1].split('\nconcurrency:', 1)[0].strip() == 'contents: read'
-    assert not re.search(r'secrets\.|pull_request|pull_request_target|workflow_run|workflow_call|continue-on-error|\benvironment:|^\s+push:', text, re.M)
+    assert not re.search(r'secrets\.|pull_request|pull_request_target|workflow_run|workflow_call|\benvironment:|^\s+push:', text, re.M)
     require(text, ['name: Paired Campaign V1 Shadow', 'name: Campaign v1 shadow evidence',
                    "if: github.ref == 'refs/heads/main' && github.repository == 'semantic-reasoning/wirelog'",
                    'group: wirelog-paired-perf-diagnostic', 'cancel-in-progress: false',
@@ -113,23 +113,28 @@ def validate(text):
                       '--mode "$CAMPAIGN_MODE" --base-sha "$BASE_SHA" --candidate-sha "$CANDIDATE_SHA"',
                       '--base-source "$BASE_SRC" --candidate-source "$CANDIDATE_SRC"',
                       '--base-build "$BASE_BUILD" --candidate-build "$CANDIDATE_BUILD"',
-                      '--base-build-log perf-artifacts/paired/base-complete-build.log',
-                      '--candidate-build-log perf-artifacts/paired/candidate-complete-build.log',
+                      '--base-build-log "$BASE_BUILD_LOG"',
+                      '--candidate-build-log "$CANDIDATE_BUILD_LOG"',
                       '--cpu "$CAMPAIGN_CPU" --timeout 180 --out-dir perf-artifacts/paired/campaign'])
     assert '--first' not in collect and '--base-binary' not in collect
     command = shell(collect).replace('\\\n', '').split()
     expected = '''set -euo pipefail
+aa_option=()
+if [[ "$CAMPAIGN_MODE" == aa_control ]]; then
+aa_option+=(--qualify-aa)
+fi
 python scripts/perf/paired-benchmark.py v1
 --mode "$CAMPAIGN_MODE" --base-sha "$BASE_SHA" --candidate-sha "$CANDIDATE_SHA"
 --base-source "$BASE_SRC" --candidate-source "$CANDIDATE_SRC"
 --base-build "$BASE_BUILD" --candidate-build "$CANDIDATE_BUILD"
---base-build-log perf-artifacts/paired/base-complete-build.log
---candidate-build-log perf-artifacts/paired/candidate-complete-build.log
---cpu "$CAMPAIGN_CPU" --timeout 180 --out-dir perf-artifacts/paired/campaign'''.split()
+--base-build-log "$BASE_BUILD_LOG"
+--candidate-build-log "$CANDIDATE_BUILD_LOG"
+--cpu "$CAMPAIGN_CPU" --timeout 180 --out-dir perf-artifacts/paired/campaign
+"${aa_option[@]}"'''.split()
     assert command == expected, 'collector must own all scheduling and evaluation'
     # Workflow delegates all execution and timing to the collector, including
     # bench_flowlog and test_crdt_perf_gate; test_cspa_perf_gate is built only.
-    assert text.count('test_cspa_perf_gate') == 1
+    assert text.count('test_cspa_perf_gate') == 2
     assert not re.search(r'taskset -c|--cpu 0|CoV|median|ratio|speedup|regression', text)
     upload = named(text, 'Upload all paired diagnostic evidence')
     require(upload, ['if: always()', 'path: perf-artifacts/paired', 'if-no-files-found: error',
@@ -137,8 +142,13 @@ python scripts/perf/paired-benchmark.py v1
     summary = named(text, 'Summarize diagnostic status')
     require(summary, ['if: always()', 'CAMPAIGN_MODE', 'BASE_SHA', 'CANDIDATE_SHA',
                       'collection-status.json', 'descriptive', 'required perf gate'])
+    qualification = named(text, 'Qualify A/A noise and host control')
+    require(qualification, ["if: always() && env.CAMPAIGN_MODE == 'aa_control'",
+                           'continue-on-error: true', 'scripts/perf/qualify-paired-aa.py',
+                           'aa-qualification-v1.json'])
+    assert (ROOT / 'scripts/perf/qualify-paired-aa.py').is_file()
     cleanup = named(text, 'Clean independent worktrees and builds')
-    assert all_steps[-3:] == [upload, summary, cleanup]
+    assert all_steps[-4:] == [qualification, upload, summary, cleanup]
     require(cleanup, ['if: always()', 'set -euo pipefail',
                       '[[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]', '[[ "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]',
                       'test -n "$RUNNER_TEMP"', 'test "$RUNNER_TEMP" != /',
