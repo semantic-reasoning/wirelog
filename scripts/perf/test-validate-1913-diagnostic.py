@@ -194,7 +194,10 @@ class ValidatorTests(unittest.TestCase):
     def test_swapped_side_records_rejected(self):
         base = self.materialization_dir / 'base.json'
         candidate = self.materialization_dir / 'candidate.json'
-        base_value, candidate_value = json.loads(base.read_text()), json.loads(candidate.read_text())
+        base_value, candidate_value = (
+            json.loads(base.read_text(encoding='utf-8')),
+            json.loads(candidate.read_text(encoding='utf-8')),
+        )
         self.write(base, candidate_value)
         self.write(candidate, base_value)
         self.assert_rejected()
@@ -207,7 +210,7 @@ class ValidatorTests(unittest.TestCase):
         )
         for field, value in mutations:
             with self.subTest(field=field):
-                record = json.loads((self.materialization_dir / 'base.json').read_text())
+                record = json.loads((self.materialization_dir / 'base.json').read_text(encoding='utf-8'))
                 record[field] = value
                 self.write(self.materialization_dir / 'base.json', record)
                 self.assert_rejected()

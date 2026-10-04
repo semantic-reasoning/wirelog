@@ -375,6 +375,7 @@ jobs:
             if [[ ! -f "$pair_root/.wirelog-perf-owned" ]] || \
                [[ "$(cat "$pair_root/.wirelog-perf-owned")" != "$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT" ]]; then
               pair_root=''
+              source_repo=''
             fi
           else
             test -n "$RUNNER_TEMP"
@@ -396,7 +397,7 @@ jobs:
           if [[ -n "$pair_root" ]]; then
             rm -rf -- "$pair_root" || cleanup_status=1
           fi
-          if [[ -e "$source_repo/.git" ]]; then
+          if [[ -n "$source_repo" && -e "$source_repo/.git" ]]; then
             git -C "$source_repo" worktree prune || cleanup_status=1
           fi
           if [[ -n "${PERF_VENV:-}" ]]; then
