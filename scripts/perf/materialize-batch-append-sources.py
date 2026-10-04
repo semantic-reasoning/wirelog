@@ -50,7 +50,7 @@ def copy_fallbacks(seed, target):
 
 def materialize(output_root, patch, overlay, fallback_seed, seed_mode,
                 mode='comparison', aa_product=None):
-    output_root = under_home(output_root, 'output root')
+    output_root = campaign['safe_path'](output_root, 'output root')
     fallback_seed = campaign['safe_path'](fallback_seed, 'fallback seed')
     caller_root = Path(campaign['REPOSITORY_ROOT']).resolve()
     if output_root == caller_root or caller_root in output_root.parents \
@@ -59,6 +59,7 @@ def materialize(output_root, patch, overlay, fallback_seed, seed_mode,
     if output_root == fallback_seed or fallback_seed in output_root.parents \
             or output_root in fallback_seed.parents:
         raise ValueError('fallback seed and output root must not overlap')
+    output_root = under_home(output_root, 'output root')
     if not output_root.parent.is_dir():
         raise ValueError('output parent must already exist')
     seed_identity = fallbacks['validate_fallback_seed'](fallback_seed, seed_mode)
