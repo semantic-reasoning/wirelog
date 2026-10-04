@@ -993,6 +993,9 @@ if host_machine.system() == 'linux'
   test('perf_paired_aa_qualification', py3,
        args: [meson.project_source_root() / 'scripts/perf/test-qualify-paired-aa.py'],
        suite: 'abi', timeout: 120)
+  test('perf_paired_bm_qualification', py3,
+       args: [meson.project_source_root() / 'scripts/perf/test-qualify-paired-bm.py'],
+       suite: 'abi', timeout: 120)
 endif
 
 # Keep the longer Windows/MSVC build budget platform-specific; a global

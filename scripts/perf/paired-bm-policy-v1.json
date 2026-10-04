@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "policy_id": "tagged-runner-bm-eligibility-v1",
+  "purpose": "diagnostic eligibility only; no performance verdict",
+  "campaign": {
+    "count": 2,
+    "mode": "comparison",
+    "workloads": ["crdt", "cspa-fast"],
+    "measured_samples_per_side_workload": 9,
+    "required_complete_campaigns": 2
+  },
+  "limits": {
+    "max_cov_percent": 3.0,
+    "max_cpu_psi_some_avg10_percent": 10.0,
+    "max_load_one_per_logical_cpu": 1.0,
+    "max_cgroup_nr_throttled_delta": 0,
+    "max_same_side_median_spread_ratio": 1.05,
+    "max_candidate_base_median_spread_ratio": 1.05
+  },
+  "timers": {
+    "crdt": "crdt_perf_gate_single_run",
+    "cspa-fast": "bench_flowlog_repeat_1",
+    "cspa_absolute_gate": "run_cspa_validation.sh median; evaluated separately"
+  },
+  "outcomes": {
+    "missing_evidence": "INCONCLUSIVE",
+    "malformed_or_inconsistent_evidence": "INVALID_EVIDENCE",
+    "correctness_failure": "CORRECTNESS_FAILURE",
+    "eligible": "ELIGIBLE; interpretation only; never a performance PASS"
+  }
+}
