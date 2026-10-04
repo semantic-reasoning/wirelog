@@ -774,6 +774,281 @@ filter_op_batch_tests(void)
     }
 }
 
+/* A bare single-threaded session for driving operators directly. */
+static wl_col_session_t *
+join_session(void)
+{
+    wl_col_session_t *s = calloc(1, sizeof(*s));
+    assert(s);
+    s->frontier_ops = &col_frontier_epoch_ops;
+    s->delta_pool = delta_pool_create(256, sizeof(col_rel_t), 1024 * 1024);
+    assert(s->delta_pool);
+    wl_mem_ledger_init(&s->mem_ledger, 0);
+    return s;
+}
+
+static void
+join_session_destroy(wl_col_session_t *s)
+{
+    wl_workqueue_destroy(s->wq);
+    for (uint32_t i = 0; i < s->nrels; i++)
+        col_rel_destroy(s->rels[i]);
+    free(s->rels);
+    for (uint32_t i = 0; i < s->arr_count; i++) {
+        free(s->arr_entries[i].rel_name);
+        free(s->arr_entries[i].key_cols);
+        arr_free_contents(&s->arr_entries[i].arr);
+    }
+    free(s->arr_entries);
+    col_session_free_diff_arrangements(s);
+    col_session_free_delta_arrangements(s);
+    col_session_free_filt_arrangements(s);
+    col_mat_cache_clear(&s->mat_cache);
+    /* Cached right filters own their relations, as in session teardown. */
+    assert(s->filt_cache_active_pins == 0);
+    for (uint32_t i = 0; i < s->filt_cache_count; i++) {
+        free(s->filt_cache[i].rel_name);
+        free(s->filt_cache[i].filter_data);
+        if (s->filt_cache[i].metadata_reservation) {
+            (void)wl_columnar_memory_rollback(
+                s->filt_cache[i].metadata_reservation);
+            free(s->filt_cache[i].metadata_reservation);
+        }
+        if (s->filt_cache[i].filtered)
+            col_rel_destroy(s->filt_cache[i].filtered);
+    }
+    free(s->filt_cache);
+    if (s->filt_cache_array_reservation) {
+        (void)wl_columnar_memory_rollback(s->filt_cache_array_reservation);
+        free(s->filt_cache_array_reservation);
+    }
+    session_rel_free_hash(s);
+    delta_pool_destroy(s->delta_pool);
+    free(s);
+}
+
+/* Batch failure paths (#2072 acceptance, covering #2073's appender). */
+static wl_columnar_memory_governor_ref_t *
+enforcing_governor(uint64_t budget)
+{
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    resolution.budget_bytes = budget;
+    resolution.usable_bytes = budget;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    wl_columnar_memory_governor_ref_t *ref
+        = wl_columnar_memory_governor_ref_create(&resolution);
+    assert(ref);
+    return ref;
+}
+
+static uint64_t
+governor_reserved(wl_columnar_memory_governor_ref_t *ref)
+{
+    return wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                   ref));
+}
+
+/* A growth the governor refuses mid-batch fails that row with the denial
+ * evidence set, keeps the batch active and the rows before it, and still
+ * ends and destroys cleanly. */
+static void
+batch_denial_tests(void)
+{
+    wl_columnar_memory_governor_ref_t *ref = enforcing_governor(1u << 24);
+    col_rel_t *r = NULL;
+    assert(wl_columnar_relation_new_auto_governed("batch_denied", 2,
+        COL_REL_INIT_CAP, false, ref, &r) == 0);
+    col_rel_append_batch_t batch = { 0 };
+    int64_t row[2] = { 0, 0 };
+    assert(col_rel_append_batch_begin(&batch, r) == 0);
+    uint32_t first_growth = COL_REL_INIT_CAP * 2u;
+    for (uint32_t i = 0; i < first_growth; i++) {
+        row[0] = (int64_t)i;
+        assert(col_rel_append_batch_row(&batch, row) == 0);
+    }
+    assert(r->nrows == first_growth && r->capacity == first_growth
+        && batch.single.lease.storage_transitioned);
+    /* Calibrated from what is held now, not from a byte count: the next
+    * growth needs at least a second column set, far above the slack. */
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, governor_reserved(ref) + 64u,
+        memory_order_release);
+    uint64_t storage = r->storage_generation;
+    r->memory_budget_denial_pending = false;
+    assert(col_rel_append_batch_row(&batch, row) == ENOMEM);
+    assert(r->memory_budget_denial_pending && batch.active
+        && r->nrows == first_growth && r->capacity == first_growth
+        && r->storage_generation == storage);
+    assert(col_rel_append_batch_end(&batch, false) == 0);
+    assert(col_rel_destroy_checked(r) == 0);
+    assert(governor_reserved(ref) == 0);
+    wl_columnar_memory_governor_ref_release(ref);
+}
+
+/* A lease renewal that cannot acquire leaves the batch inactive with the
+ * relation unchanged and its gates released. */
+static void
+batch_renewal_failure_tests(void)
+{
+    col_rel_t *r = col_rel_new_auto("batch_renewal", 2);
+    assert(r);
+    col_rel_append_batch_t batch = { 0 };
+    int64_t row[2] = { 0, 0 };
+    wl_columnar_relation_test_set_mutation_nonce(1000);
+    assert(col_rel_append_batch_begin(&batch, r) == 0);
+    while (!(batch.single.lease.storage_transitioned
+        && r->nrows == r->capacity)) {
+        row[0]++;
+        assert(col_rel_append_batch_row(&batch, row) == 0);
+    }
+    uint32_t nrows = r->nrows, capacity = r->capacity;
+    uint64_t storage = r->storage_generation;
+    wl_columnar_relation_test_set_mutation_nonce(UINT64_MAX);
+    int rc = col_rel_append_batch_row(&batch, row);
+    wl_columnar_relation_test_set_mutation_nonce(1000);
+    assert(rc == EOVERFLOW && !batch.active);
+    assert(r->nrows == nrows && r->capacity == capacity
+        && r->storage_generation == storage);
+    wl_columnar_source_access_reader_t reader = {0};
+    assert(col_rel_source_reader_acquire(r, &reader) == 0);
+    assert(col_rel_source_reader_release(&reader) == 0);
+    assert(col_rel_append_batch_end(&batch, true) == 0);
+    assert(col_rel_destroy_checked(r) == 0);
+}
+
+/* The filter operator's fills under a governor that refuses their second
+ * growth: ENOSPC with the session's denial flag, the input disposed, and
+ * every byte the attempt reserved returned. */
+enum { DENIAL_SRC_ROWS = 512 };
+
+static col_rel_t *
+denial_source(bool timestamped)
+{
+    col_rel_t *src = col_rel_new_auto("denial_src", 2);
+    assert(src);
+    if (timestamped)
+        assert(col_rel_enable_timestamps(src) == 0);
+    for (uint32_t i = 0; i < DENIAL_SRC_ROWS; i++) {
+        int64_t row[2] = { (int64_t)i, (int64_t)i };
+        assert(col_rel_append_row(src, row) == 0);
+    }
+    return src;
+}
+
+/* col1 < keep (simple), or col1 + 1 < keep + 1 (compiled slow path). */
+static void
+denial_expr(bool compiled, int64_t keep, uint8_t *buf, uint32_t *size)
+{
+    uint32_t n = 0;
+    buf[n++] = WL_PLAN_EXPR_VAR;
+    buf[n++] = 4;
+    buf[n++] = 0;
+    memcpy(buf + n, "col1", 4);
+    n += 4;
+    if (compiled) {
+        int64_t one = 1;
+        buf[n++] = WL_PLAN_EXPR_CONST_INT;
+        memcpy(buf + n, &one, 8);
+        n += 8;
+        buf[n++] = WL_PLAN_EXPR_ARITH_ADD;
+        keep += 1;
+    }
+    buf[n++] = WL_PLAN_EXPR_CONST_INT;
+    memcpy(buf + n, &keep, 8);
+    n += 8;
+    buf[n++] = WL_PLAN_EXPR_CMP_LT;
+    *size = n;
+}
+
+typedef enum { DENY_FILTER_OP, DENY_RIGHT_FILTER } deny_entry_t;
+
+/* Run one filter selecting @keep of DENIAL_SRC_ROWS under @budget. */
+static int
+denial_run(deny_entry_t entry, bool timestamped, bool compiled, int64_t keep,
+    uint64_t budget, bool check_cleanup)
+{
+    wl_col_session_t *sess = join_session();
+    wl_columnar_memory_governor_ref_t *ref = enforcing_governor(budget);
+    sess->memory_governor = ref;
+    col_rel_t *src = denial_source(timestamped);
+    uint8_t buf[64];
+    uint32_t size = 0;
+    denial_expr(compiled, keep, buf, &size);
+    uint64_t baseline = governor_reserved(ref);
+    int rc;
+    if (entry == DENY_FILTER_OP) {
+        wl_plan_op_t op;
+        memset(&op, 0, sizeof(op));
+        op.filter_expr.data = buf;
+        op.filter_expr.size = size;
+        eval_stack_t stack;
+        eval_stack_init(&stack);
+        assert(eval_stack_push(&stack, src, true) == 0);
+        rc = wl_columnar_filter_op(&op, &stack, sess);
+        if (rc == 0) {
+            eval_entry_t result = eval_stack_pop(&stack);
+            assert(result.rel->nrows == (uint32_t)keep);
+            assert(col_rel_destroy_checked(result.rel) == 0);
+        } else if (check_cleanup) {
+            assert(stack.top == 0);
+        }
+    } else {
+        wl_plan_expr_buffer_t expr = { buf, size };
+        col_rel_t *out = NULL;
+        rc = wl_columnar_filter_apply_right_filter_governed_checked(&expr,
+                src, sess->delta_pool, NULL, ref, sess, &out);
+        if (rc == 0) {
+            assert(out && out->nrows == (uint32_t)keep);
+            assert(col_rel_destroy_checked(out) == 0);
+        } else {
+            assert(out == NULL);
+        }
+        assert(col_rel_destroy_checked(src) == 0);
+    }
+    if (rc != 0 && check_cleanup) {
+        assert(rc == ENOSPC && sess->memory_budget_denied);
+        assert(governor_reserved(ref) == baseline);
+    }
+    sess->memory_governor = NULL;
+    join_session_destroy(sess);
+    wl_columnar_memory_governor_ref_release(ref);
+    return rc;
+}
+
+static void
+filter_denial_tests(void)
+{
+    static const struct {
+        deny_entry_t entry;
+        bool timestamped, compiled;
+    } cases[] = {
+        { DENY_FILTER_OP, true, false },
+        { DENY_FILTER_OP, true, true },
+        { DENY_RIGHT_FILTER, true, false },
+        { DENY_RIGHT_FILTER, false, true },
+    };
+    for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+        /* Smallest budget at which a 128-row selection (one growth past the
+         * 64-row floor) succeeds; a 256-row selection needs a second, larger
+         * growth and must be refused at that budget. */
+        uint64_t lo = 0, hi = 1u << 24;
+        assert(denial_run(cases[k].entry, cases[k].timestamped,
+            cases[k].compiled, 128, hi, false) == 0);
+        while (hi - lo > 1) {
+            uint64_t mid = lo + (hi - lo) / 2u;
+            if (denial_run(cases[k].entry, cases[k].timestamped,
+                cases[k].compiled, 128, mid, false) == 0)
+                hi = mid;
+            else
+                lo = mid;
+        }
+        assert(denial_run(cases[k].entry, cases[k].timestamped,
+            cases[k].compiled, 256, hi, true) == ENOSPC);
+    }
+}
+
 int
 main(void)
 {
@@ -787,6 +1062,9 @@ main(void)
     append_batch_tests();
     filter_batch_tests();
     filter_op_batch_tests();
+    batch_denial_tests();
+    batch_renewal_failure_tests();
+    filter_denial_tests();
     {
         col_rel_t root;
         fixture_t f = {0};
