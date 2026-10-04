@@ -83,8 +83,10 @@ def evaluate(campaign, input_sha256):
                     build['source_sha'] == manifest['sources'][side] and
                     build['profile'] == manifest['profiles'][side] and sha(build['build_log_sha256'], 64),
                     'invalid build provenance')
-        require(manifest['build_provenance']['base']['build_instance_id'] !=
-                manifest['build_provenance']['candidate']['build_instance_id'], 'build instance ID reused')
+        same_build = (manifest['build_provenance']['base']['build_instance_id'] ==
+                      manifest['build_provenance']['candidate']['build_instance_id'])
+        if mode == 'comparison':
+            require(not same_build, 'build instance ID reused')
         require(type(manifest['host_id']) is str and bool(manifest['host_id']), 'missing host identity')
         require(type(manifest['cpu']) is int and manifest['cpu'] >= 0, 'invalid CPU')
         workloads = manifest['workloads']
@@ -106,6 +108,14 @@ def evaluate(campaign, input_sha256):
             require(type(spec['expected']) is dict and bool(spec['expected']) and
                     all(type(k) is str and bool(k) and type(v) is int and v >= 0 for k,v in spec['expected'].items()),
                     'invalid expected correctness')
+        if mode == 'aa_control' and same_build:
+            require(manifest['sources']['base'] == manifest['sources']['candidate'] and
+                    manifest['profiles']['base'] == manifest['profiles']['candidate'] and
+                    manifest['build_provenance']['base']['build_log_sha256'] ==
+                    manifest['build_provenance']['candidate']['build_log_sha256'] and
+                    all(spec['binary_sha256']['base'] == spec['binary_sha256']['candidate']
+                        for spec in workloads.values()),
+                    'shared A/A build provenance differs')
         blocks = campaign['blocks']
         require(type(blocks) is list and len(blocks) == 2, 'exactly two blocks required')
         orders = {}

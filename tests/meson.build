@@ -960,6 +960,15 @@ if host_machine.system() == 'linux'
   test('perf_paired_build_contract', py3,
        args: [meson.project_source_root() / 'scripts/perf/test-verify-paired-builds.py'],
        suite: 'abi')
+  test('perf_paired_aa_host_evidence', py3,
+       args: [meson.project_source_root() / 'scripts/perf/test-paired-aa-host.py'],
+       suite: 'abi')
+  test('perf_paired_aa_affinity_launcher', py3,
+       args: [meson.project_source_root() / 'scripts/perf/test-paired-aa-affinity-launcher.py'],
+       suite: 'abi')
+  test('perf_paired_collector_v1', py3,
+       args: [meson.project_source_root() / 'scripts/perf/test-paired-collector-v1.py'],
+       suite: 'abi', timeout: 120)
 endif
 
 # Keep the longer Windows/MSVC build budget platform-specific; a global

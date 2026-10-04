@@ -2,6 +2,7 @@
 """Collect one immutable paired campaign; no performance verdict is defined."""
 import argparse
 from contextlib import ExitStack, contextmanager
+import hashlib
 import json
 import math
 import os
@@ -9,6 +10,7 @@ from os import open as open_fd  # File-descriptor open; no text encoding applies
 from pathlib import Path
 import re
 import runpy
+import select
 import signal
 import subprocess
 import sys
@@ -21,6 +23,8 @@ HERE = Path(__file__).resolve().parent
 LEGACY = runpy.run_path(str(HERE / 'paired-benchmark.py'))
 VERIFY = runpy.run_path(str(HERE / 'verify-paired-builds.py'))
 EVALUATOR = runpy.run_path(str(HERE / 'evaluate-paired-campaign.py'))
+AA_HOST = runpy.run_path(str(HERE / 'paired-aa-host.py'))
+AA_LAUNCHER = HERE / 'paired-aa-affinity-launcher.py'
 SIDES = ('base', 'candidate')
 TIMERS = {
     'crdt': dict(id='crdt_perf_gate_single_run', unit='ms', scope='run_crdt_once_: full pipeline, one worker'),
@@ -176,41 +180,125 @@ def parse_result(stdout, workload):
     return elapsed, dict(status=status, observed=observed)
 
 
-def execute(binary, workload, root, cpu, timeout):
-    if threading.active_count() != 1:
-        raise ValueError('benchmark launch requires a single-threaded Linux collector')
+def proc_affinity(pid):
+    status = Path(f'/proc/{pid}/status').read_text(encoding='utf-8')
+    match = re.search(r'^Cpus_allowed_list:\s*(\S+)$', status, re.M)
+    if match is None:
+        raise ValueError('child Cpus_allowed_list is unavailable')
+    values = set()
+    for part in match.group(1).split(','):
+        if '-' in part:
+            start, end = map(int, part.split('-', 1))
+            values.update(range(start, end + 1))
+        else:
+            values.add(int(part))
+    return sorted(values)
+
+
+def _attempt_command(binary, workload, root, cpu, ready_fd=None, release_fd=None):
+    args = []
     env = os.environ.copy()
-    command = ['taskset', '-c', str(cpu), str(binary)]
     if workload == 'crdt':
         env.update(WIRELOG_CRDT_PROBE='1', WIRELOG_CRDT_SMALL='0', WIRELOG_CRDT_DATA_DIR=str(root / 'crdt'))
     else:
-        command += ['--workload', workload, '--data-cspa', str(root / 'cspa'), '--workers', '1', '--repeat', '1']
+        args = ['--workload', workload, '--data-cspa', str(root / 'cspa'), '--workers', '1', '--repeat', '1']
+    if ready_fd is None:
+        command = ['taskset', '-c', str(cpu), str(binary)]
+    else:
+        command = [sys.executable, str(AA_LAUNCHER), '--cpu', str(cpu),
+                   '--ready-fd', str(ready_fd), '--release-fd', str(release_fd),
+                   str(binary)]
+    command.extend(args)
+    return command, env
+
+
+def execute(binary, workload, root, cpu, timeout, *, qualify_aa=False,
+            handshake_timeout=5):
+    if threading.active_count() != 1:
+        raise ValueError('benchmark launch requires a single-threaded Linux collector')
+    ready_read = ready_write = release_read = release_write = None
+    if qualify_aa:
+        ready_read, ready_write = os.pipe()
+        release_read, release_write = os.pipe()
+    command, env = _attempt_command(binary, workload, root, cpu,
+                                    ready_write if qualify_aa else None,
+                                    release_read if qualify_aa else None)
     raw = dict(command=command, host_before={}, host_after={}, timed_out=False,
                stdout='', stderr='', exit_code=None)
     process = None
+    benchmark_released = False
     cause = None
     primary_cause = None
     with ExitStack() as files:
         stdout_file = files.enter_context(tempfile.TemporaryFile(mode='w+b'))
         stderr_file = files.enter_context(tempfile.TemporaryFile(mode='w+b'))
         try:
-            raw['host_before'] = LEGACY['read_host'](cpu)
+            if not qualify_aa:
+                raw['host_before'] = LEGACY['read_host'](cpu)
             previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, TERMINATION_SIGNALS)
             try:
                 # Single-threaded child: only restore the inherited mask before exec.
                 process = subprocess.Popen(command, stdout=stdout_file, stderr=stderr_file,
                                            env=env, start_new_session=True,
+                                           pass_fds=((ready_write, release_read)
+                                                     if qualify_aa else ()),
                                            preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask))
             finally:
                 signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            raw['process_group_id'] = process.pid
+            if qualify_aa:
+                os.close(ready_write)
+                ready_write = None
+                os.close(release_read)
+                release_read = None
+                readable, _, _ = select.select([ready_read], [], [], handshake_timeout)
+                if not readable:
+                    raw.update(prelaunch_rejected=True, launch_rejection='affinity_handshake_timeout')
+                    raise TimeoutError('affinity launcher readiness timed out')
+                message = os.read(ready_read, 4096)
+                try:
+                    ready = AA_HOST['strict_json'](message.decode('utf-8'))
+                    child_affinity = ready['affinity']
+                    observed = proc_affinity(process.pid)
+                    if ready.get('pid') != process.pid or child_affinity != [cpu] or observed != [cpu]:
+                        raise ValueError(f'child affinity is not the selected singleton CPU: {observed}')
+                except (KeyError, UnicodeError, ValueError) as error:
+                    raw.update(prelaunch_rejected=True, launch_rejection=f'affinity_verification_failed: {error}')
+                    raise RuntimeError(raw['launch_rejection']) from error
+                raw['launcher_ready'] = ready
+                raw['aa_host_before'] = AA_HOST['read_snapshot'](cpu, child_affinity=observed)
+                raw['host_before'] = LEGACY['read_host'](cpu)
+                if release_write is None:
+                    raise RuntimeError('affinity release pipe is unavailable')
+                os.write(release_write, b'1')
+                benchmark_released = True
+                os.close(release_write)
+                release_write = None
+            else:
+                raw['host_before'] = LEGACY['read_host'](cpu)
             try:
                 process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 raw['timed_out'] = True
             # Normal leader exit can leave descendants alive in the saved group.
             cleanup_process_group(process, raw)
+        except (RuntimeError, TimeoutError) as error:
+            raw.update(stderr=f'{type(error).__name__}: {error}', exit_code=125)
+            if process is not None:
+                try:
+                    cleanup_process_group(process, raw)
+                except Exception as cleanup_error:
+                    raw['cleanup_error'] = f'{type(cleanup_error).__name__}: {cleanup_error}'
         except OSError as error:
-            raw.update(stderr=str(error), exit_code=127)
+            raw.update(stderr=str(error), launch_error=f'{type(error).__name__}: {error}', exit_code=127)
+            if qualify_aa and not benchmark_released:
+                raw.update(prelaunch_rejected=True,
+                           launch_rejection=f'affinity_handshake_io_error: {type(error).__name__}: {error}')
+            if process is not None:
+                try:
+                    cleanup_process_group(process, raw)
+                except Exception as cleanup_error:
+                    raw['cleanup_error'] = f'{type(cleanup_error).__name__}: {cleanup_error}'
         except BaseException as error:
             cause = primary_cause = error
             mark_interruption(raw, error)
@@ -237,7 +325,15 @@ def execute(binary, workload, root, cpu, timeout):
                             cause = further_interruption
                             mark_interruption(raw, further_interruption)
         finally:
-            raw['host_after'] = LEGACY['read_host'](cpu)
+            if qualify_aa:
+                raw['aa_host_after'] = AA_HOST['read_snapshot'](
+                    cpu, child_affinity=raw.get('launcher_ready', {}).get('affinity'))
+                if raw.get('launcher_ready'):
+                    raw['aa_host_after']['child_affinity']['observation'] = (
+                        'carried_forward_from_verified_preexec_affinity')
+                raw['host_after'] = LEGACY['read_host'](cpu)
+            else:
+                raw['host_after'] = LEGACY['read_host'](cpu)
             for key, output in (('stdout', stdout_file), ('stderr', stderr_file)):
                 try:
                     output.flush()
@@ -249,7 +345,15 @@ def execute(binary, workload, root, cpu, timeout):
                 except OSError as error:
                     raw['capture_error'] = f'{key}: {error}'
             if process is not None:
-                raw['exit_code'] = process.poll()
+                observed_exit_code = process.poll()
+                if observed_exit_code is not None:
+                    raw['exit_code'] = observed_exit_code
+            for descriptor in (ready_read, ready_write, release_read, release_write):
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
         if cause is not None:
             raise InterruptedLaunch(raw, cause, primary_cause) from cause
     return raw
@@ -270,21 +374,67 @@ def atomic_json(path, value):
         os.close(fd)
 
 
+def append_raw_attempt(stream, event, link_stream=None, ordinal=None):
+    line = (json.dumps(event, sort_keys=True) + '\n').encode('utf-8')
+    stream.buffer.write(line)
+    stream.flush()
+    os.fsync(stream.fileno())
+    if link_stream is not None:
+        link = dict(ordinal=ordinal, campaign_id=event['campaign_id'],
+                    manifest_sha256=event['manifest_sha256'], block_id=event['block_id'],
+                    workload=event['workload'], sequence=event['sequence'], side=event['side'],
+                    raw_line_sha256=hashlib.sha256(line).hexdigest())
+        link_stream.write(json.dumps(link, sort_keys=True) + '\n')
+        link_stream.flush()
+        os.fsync(link_stream.fileno())
+
+
+def qualification_preflight(args, records, artifacts, binaries, sources, builds, logs,
+                            campaign_id, manifest, planned):
+    paths = {side: dict(source=str(sources[side]), build=str(builds[side]),
+                        log=str(logs[side]),
+                        executables={name: str(path.resolve())
+                                     for name, path in binaries[side].items()})
+             for side in SIDES}
+    return dict(schema_version=1, mode=args.mode, qualify_aa=bool(args.qualify_aa),
+                campaign_id=campaign_id, manifest=manifest,
+                records=records, artifacts={str(path): digest for path, digest in artifacts.items()},
+                paths=paths, schedule=planned,
+                theoretical_launch_timeout_ceiling_seconds=len(planned) * args.timeout,
+                launcher_sha256=LEGACY['sha256'](AA_LAUNCHER) if args.qualify_aa else None)
+
+
+def reject_aa_preflight(args, document, status, reason, workloads):
+    args.out_dir.mkdir(parents=True)
+    atomic_json(args.out_dir / 'preflight.json', document)
+    result = dict(schema_version=1, status=status, reason=reason,
+                  benchmark_launches=0, workloads=workloads)
+    atomic_json(args.out_dir / 'aa-qualification-preflight.json', result)
+    atomic_json(args.out_dir / 'collection-status.json',
+                dict(status='AA_PREFLIGHT_REJECTED', qualification_status=status,
+                     reason=reason, benchmark_launches=0))
+    return 4 if status == 'FAIL' else 5
+
+
 def collect(args):
     with termination_handlers():
         return collect_campaign(args)
 
 
 def collect_campaign(args):
+    args.qualify_aa = bool(getattr(args, 'qualify_aa', False))
+    if args.qualify_aa and args.mode != 'aa_control':
+        raise ValueError('--qualify-aa is only valid with --mode aa_control')
     if args.out_dir.exists():
         raise ValueError('evidence directory already exists')
     if args.cpu not in os.sched_getaffinity(0) or not 1 <= args.timeout <= 3600:
         raise ValueError('invalid CPU or timeout (1..3600 seconds)')
     if args.mode == 'aa_control' and args.base_sha != args.candidate_sha or args.mode == 'comparison' and args.base_sha == args.candidate_sha:
         raise ValueError('source SHAs do not match campaign mode')
-    records, artifacts, binaries, roots, logs = {}, {}, {}, {}, {}
+    records, artifacts, binaries, roots, logs, sources, builds = {}, {}, {}, {}, {}, {}, {}
     for side in SIDES:
         source, build = getattr(args, side + '_source').resolve(), getattr(args, side + '_build').resolve()
+        sources[side], builds[side] = source, build
         sha = getattr(args, side + '_sha')
         if not re.fullmatch('[0-9a-f]{40}', sha):
             raise ValueError('invalid source SHA')
@@ -301,7 +451,8 @@ def collect_campaign(args):
         if any(not os.access(p, os.X_OK) for p in binaries[side].values()):
             raise ValueError('benchmark is not executable')
     if logs['base'] == logs['candidate'] or artifacts[logs['base']] == artifacts[logs['candidate']]:
-        raise ValueError('distinct build log paths and hashes required')
+        if not args.qualify_aa or logs['base'] != logs['candidate']:
+            raise ValueError('distinct build log paths and hashes required')
     for key in ('profile', 'compiler', 'fixture_sha256'):
         if records['base'][key] != records['candidate'][key]:
             raise ValueError(f'mismatched {key}')
@@ -310,32 +461,72 @@ def collect_campaign(args):
             raise ValueError(f'timer/benchmark contract differs: {name}')
     profiles = {s: {k: profile_value(v) for k, v in records[s]['profile'].items()} for s in SIDES}
     host_id = Path('/etc/machine-id').read_text(encoding='utf-8').strip()
+    planned = schedule()
+    shared_paths = (sources['base'] == sources['candidate'] and builds['base'] == builds['candidate']
+                    and logs['base'] == logs['candidate'])
+    if args.qualify_aa:
+        mismatch = []
+        for workload in EXPECTED:
+            base_hash = artifacts[binaries['base'][workload]]
+            candidate_hash = artifacts[binaries['candidate'][workload]]
+            if base_hash != candidate_hash:
+                mismatch.append(dict(workload=workload, base_sha256=base_hash,
+                                     candidate_sha256=candidate_hash))
+        campaign_id = str(uuid.uuid4())
+        preflight = qualification_preflight(args, records, artifacts, binaries, sources,
+                                            builds, logs, campaign_id, {}, planned)
+        if mismatch:
+            return reject_aa_preflight(args, preflight, 'FAIL', 'binary_sha_mismatch', mismatch)
+        if not shared_paths:
+            return reject_aa_preflight(args, preflight, 'INCONCLUSIVE',
+                                       'shared_build_path_identity_missing', [])
+    instance_id = str(uuid.uuid4())
+    build_ids = {side: (instance_id if args.qualify_aa and shared_paths else str(uuid.uuid4()))
+                 for side in SIDES}
     manifest = dict(sources={s: records[s]['source_sha'] for s in SIDES}, profiles=profiles,
-                    build_provenance={s: dict(build_instance_id=str(uuid.uuid4()), source_sha=records[s]['source_sha'], profile=profiles[s], build_log_sha256=artifacts[logs[s]]) for s in SIDES},
+                    build_provenance={s: dict(build_instance_id=build_ids[s], source_sha=records[s]['source_sha'], profile=profiles[s], build_log_sha256=artifacts[logs[s]]) for s in SIDES},
                     host_id=host_id, cpu=args.cpu, workloads={})
     for workload in EXPECTED:
         prefix = 'bench/data/crdt/' if workload == 'crdt' else 'bench/data/cspa/'
         manifest['workloads'][workload] = dict(binary_sha256={s: artifacts[binaries[s][workload]] for s in SIDES}, fixture_sha256={s: {k: v for k, v in records[s]['fixture_sha256'].items() if k.startswith(prefix)} for s in SIDES}, timer=TIMERS[workload], expected=EXPECTED[workload])
-    campaign = dict(schema_version=1, campaign_id=str(uuid.uuid4()), campaign_mode=args.mode, manifest=manifest,
+    campaign_id = campaign_id if args.qualify_aa else str(uuid.uuid4())
+    campaign = dict(schema_version=1, campaign_id=campaign_id, campaign_mode=args.mode, manifest=manifest,
                     blocks=[dict(block_id=o, order=o) for o in ('AB', 'BA')], attempts=[])
-    planned = schedule()
+    preflight = qualification_preflight(args, records, artifacts, binaries, sources, builds,
+                                        logs, campaign['campaign_id'], manifest, planned)
     args.out_dir.mkdir(parents=True)
-    atomic_json(args.out_dir / 'preflight.json', dict(records=records, artifacts={str(k): v for k, v in artifacts.items()}, schedule=planned, campaign_id=campaign['campaign_id'], manifest=manifest, theoretical_launch_timeout_ceiling_seconds=len(planned) * args.timeout))
+    atomic_json(args.out_dir / 'preflight.json', preflight)
     for side in SIDES:
         (args.out_dir / f'{side}-build.log').write_bytes(logs[side].read_bytes())
     with (args.out_dir / 'raw-attempts.jsonl').open('x', encoding='utf-8') as stream:
-        for item in planned:
+      link_context = ((args.out_dir / 'aa-attempt-links.jsonl').open('x', encoding='utf-8')
+                      if args.qualify_aa else None)
+      try:
+        for ordinal, item in enumerate(planned):
             try:
-                raw = dict(item, **execute(binaries[item['side']][item['workload']], item['workload'], roots[item['side']], args.cpu, args.timeout))
+                execute_args = (dict(qualify_aa=True) if args.qualify_aa else {})
+                raw = dict(item, **execute(binaries[item['side']][item['workload']], item['workload'], roots[item['side']], args.cpu, args.timeout, **execute_args))
             except InterruptedLaunch as error:
-                LEGACY['append_event'](stream, dict(item, **error.raw))
+                raw = dict(item, **error.raw)
+                if args.qualify_aa:
+                    raw.update(ordinal=ordinal, campaign_id=campaign['campaign_id'],
+                               manifest_sha256=EVALUATOR['digest'](manifest))
+                append_raw_attempt(stream, raw, link_context, ordinal if args.qualify_aa else None)
                 raise error.cause
             try:
                 elapsed, correctness = parse_result(raw['stdout'], item['workload'])
                 campaign['attempts'].append(dict(item, campaign_id=campaign['campaign_id'], manifest_sha256=EVALUATOR['digest'](manifest), elapsed_ms=elapsed, correctness=correctness, exit_code=raw['exit_code'], timed_out=raw['timed_out'], host_before=telemetry(raw['host_before']), host_after=telemetry(raw['host_after'])))
             except (ValueError, TypeError, KeyError) as error:
                 raw['parse_error'] = str(error)
-            LEGACY['append_event'](stream, raw)
+            if args.qualify_aa:
+                raw.update(ordinal=ordinal, campaign_id=campaign['campaign_id'],
+                           manifest_sha256=EVALUATOR['digest'](manifest))
+            append_raw_attempt(stream, raw, link_context, ordinal if args.qualify_aa else None)
+            if raw.get('prelaunch_rejected'):
+                break
+      finally:
+        if link_context is not None:
+            link_context.close()
     drift = [str(path) for path, digest in artifacts.items() if not path.is_file() or LEGACY['sha256'](path) != digest]
     for side in SIDES:
         source = getattr(args, side + '_source')
@@ -361,6 +552,8 @@ def main():
     parser.add_argument('--out-dir', type=Path, required=True)
     parser.add_argument('--cpu', type=int, required=True)
     parser.add_argument('--timeout', type=int, default=180)
+    parser.add_argument('--qualify-aa', action='store_true',
+                        help='collect the protected-main A/A qualification evidence')
     args = parser.parse_args()
     try:
         return collect(args)
