@@ -91,7 +91,7 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(M['collect'](self.args), 0)
 
     def test_explicit_v1_cli_dispatch(self):
-        command = [str(Path(__file__).parents[2] / '.venv/bin/python'),
+        command = [sys.executable,
                    str(Path(__file__).with_name('paired-benchmark.py')), 'v1']
         for key, value in vars(self.args).items():
             command += ['--' + key.replace('_', '-'), str(value)]
@@ -198,7 +198,7 @@ class CollectorTests(unittest.TestCase):
         campaign = self.read('campaign-v1.json')
         provenance = campaign['manifest']['build_provenance']
         self.assertEqual(provenance['base']['build_instance_id'], provenance['candidate']['build_instance_id'])
-        links = [json.loads(line) for line in (self.args.out_dir / 'aa-attempt-links.jsonl').read_text().splitlines()]
+        links = [json.loads(line) for line in (self.args.out_dir / 'aa-attempt-links.jsonl').read_text(encoding='utf-8').splitlines()]
         raw_lines = (self.args.out_dir / 'raw-attempts.jsonl').read_bytes().splitlines(keepends=True)
         self.assertEqual(len(links), 80)
         self.assertEqual(len(raw_lines), 80)
@@ -256,7 +256,7 @@ class CollectorTests(unittest.TestCase):
         self.args.candidate_build_log = self.args.base_build_log
         marker = self.root / 'benchmark-started'
         binary = self.args.base_build / 'tests/test_crdt_perf_gate'
-        binary.write_text('#!' + sys.executable + '\nfrom pathlib import Path; Path(%r).write_text("started")\n' % str(marker))
+        binary.write_text('#!' + sys.executable + '\nfrom pathlib import Path; Path(%r).write_text("started")\n' % str(marker), encoding='utf-8')
         binary.chmod(0o755)
         original = M['execute']
         calls = []

@@ -143,9 +143,9 @@ class QualificationTests(unittest.TestCase):
 
     def test_raw_sidecar_tampering_is_inconclusive(self):
         path = self.evidence / 'raw-attempts.jsonl'
-        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
         rows[0]['stdout'] = rows[0]['stdout'].replace('"elapsed_ms": 10', '"elapsed_ms": 11')
-        path.write_text(''.join(json.dumps(row, sort_keys=True) + '\n' for row in rows))
+        path.write_text(''.join(json.dumps(row, sort_keys=True) + '\n' for row in rows), encoding='utf-8')
         result = Q.qualify(self.evidence, self.preflight_path)
         self.assertEqual((result['status'], result['reason']), ('INCONCLUSIVE', 'invalid_evidence'))
 
@@ -210,31 +210,31 @@ class QualificationTests(unittest.TestCase):
 
     def test_host_pressure_or_swap_makes_valid_campaign_inconclusive(self):
         path = self.evidence / 'raw-attempts.jsonl'
-        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
         rows[0]['aa_host_before']['cpu_psi_some_avg10_percent']['value'] = 1.1
         rows[0]['aa_host_after']['swap_pages']['value']['pswpout'] = 1
-        path.write_text(''.join(json.dumps(row, sort_keys=True) + '\n' for row in rows))
+        path.write_text(''.join(json.dumps(row, sort_keys=True) + '\n' for row in rows), encoding='utf-8')
         links_path = self.evidence / 'aa-attempt-links.jsonl'
-        links = [json.loads(line) for line in links_path.read_text().splitlines()]
+        links = [json.loads(line) for line in links_path.read_text(encoding='utf-8').splitlines()]
         for index, (row, link) in enumerate(zip(rows, links)):
             encoded = (json.dumps(row, sort_keys=True) + '\n').encode()
             link['raw_line_sha256'] = hashlib.sha256(encoded).hexdigest()
             link['ordinal'] = index
-        links_path.write_text(''.join(json.dumps(link, sort_keys=True) + '\n' for link in links))
+        links_path.write_text(''.join(json.dumps(link, sort_keys=True) + '\n' for link in links), encoding='utf-8')
         result = Q.qualify(self.evidence, self.preflight_path)
         self.assertEqual((result['status'], result['reason']), ('INCONCLUSIVE', 'host_ineligible'))
 
     def test_missing_required_host_telemetry_is_inconclusive(self):
         path = self.evidence / 'raw-attempts.jsonl'
-        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
         rows[0]['aa_host_before']['governor'] = dict(value=None,
                                                       unavailable_reason='governor file missing')
-        path.write_text(''.join(json.dumps(row, sort_keys=True) + '\n' for row in rows))
+        path.write_text(''.join(json.dumps(row, sort_keys=True) + '\n' for row in rows), encoding='utf-8')
         links_path = self.evidence / 'aa-attempt-links.jsonl'
-        links = [json.loads(line) for line in links_path.read_text().splitlines()]
+        links = [json.loads(line) for line in links_path.read_text(encoding='utf-8').splitlines()]
         links[0]['raw_line_sha256'] = hashlib.sha256(
             (json.dumps(rows[0], sort_keys=True) + '\n').encode()).hexdigest()
-        links_path.write_text(''.join(json.dumps(link, sort_keys=True) + '\n' for link in links))
+        links_path.write_text(''.join(json.dumps(link, sort_keys=True) + '\n' for link in links), encoding='utf-8')
         result = Q.qualify(self.evidence, self.preflight_path)
         self.assertEqual((result['status'], result['reason']), ('INCONCLUSIVE', 'host_ineligible'))
 
@@ -257,11 +257,11 @@ class QualificationTests(unittest.TestCase):
                     after_level['path'] = 'job/changed'
                 else:
                     after_level['cpu_limit']['quota'] = '50000'
-                raw_path.write_text(''.join(json.dumps(row, sort_keys=True) + '\n' for row in rows))
+                raw_path.write_text(''.join(json.dumps(row, sort_keys=True) + '\n' for row in rows), encoding='utf-8')
                 links = [json.loads(line) for line in original_links.splitlines()]
                 links[0]['raw_line_sha256'] = hashlib.sha256(
                     (json.dumps(rows[0], sort_keys=True) + '\n').encode()).hexdigest()
-                links_path.write_text(''.join(json.dumps(link, sort_keys=True) + '\n' for link in links))
+                links_path.write_text(''.join(json.dumps(link, sort_keys=True) + '\n' for link in links), encoding='utf-8')
                 result = Q.qualify(self.evidence, self.preflight_path)
                 self.assertEqual((result['status'], result['reason']),
                                  ('INCONCLUSIVE', 'host_ineligible'))
@@ -269,7 +269,7 @@ class QualificationTests(unittest.TestCase):
         links_path.write_bytes(original_links)
 
     def test_binary_mismatch_fails_before_runs(self):
-        preflight = json.loads(self.preflight_path.read_text())
+        preflight = json.loads(self.preflight_path.read_text(encoding='utf-8'))
         base_path = preflight['paths']['base']['executables']['crdt']
         candidate = self.root / 'different-crdt-binary'
         candidate.write_text('different binary bytes\n', encoding='utf-8')
@@ -282,18 +282,18 @@ class QualificationTests(unittest.TestCase):
                         workloads=[dict(workload='crdt',
                                         base_sha256=preflight['artifacts'][base_path],
                                         candidate_sha256=candidate_hash)])
-        (self.evidence / 'aa-qualification-preflight.json').write_text(json.dumps(document))
+        (self.evidence / 'aa-qualification-preflight.json').write_text(json.dumps(document), encoding='utf-8')
         result = Q.qualify(self.evidence, self.preflight_path)
         self.assertEqual((result['status'], result['reason']), ('FAIL', 'binary_sha_mismatch'))
         self.assertEqual(result['benchmark_launches'], 0)
         document['benchmark_launches'] = False
-        (self.evidence / 'aa-qualification-preflight.json').write_text(json.dumps(document))
+        (self.evidence / 'aa-qualification-preflight.json').write_text(json.dumps(document), encoding='utf-8')
         result = Q.qualify(self.evidence, self.preflight_path)
         self.assertEqual((result['status'], result['reason']),
                          ('INCONCLUSIVE', 'invalid_evidence'))
 
     def test_preflight_schema_version_boolean_is_invalid_evidence(self):
-        preflight = json.loads(self.preflight_path.read_text())
+        preflight = json.loads(self.preflight_path.read_text(encoding='utf-8'))
         preflight['schema_version'] = True
         self.preflight_path.write_text(json.dumps(preflight), encoding='utf-8')
         result = Q.qualify(self.evidence, self.preflight_path)
@@ -301,34 +301,34 @@ class QualificationTests(unittest.TestCase):
                          ('INCONCLUSIVE', 'invalid_evidence'))
 
     def test_shared_path_early_result_rejects_boolean_launch_count(self):
-        preflight = json.loads(self.preflight_path.read_text())
+        preflight = json.loads(self.preflight_path.read_text(encoding='utf-8'))
         preflight['paths']['candidate']['build'] = str(self.root / 'different-build')
         self.preflight_path.write_text(json.dumps(preflight), encoding='utf-8')
         document = dict(schema_version=1, status='INCONCLUSIVE',
                         reason='shared_build_path_identity_missing', workloads=[],
                         benchmark_launches=False)
-        (self.evidence / 'aa-qualification-preflight.json').write_text(json.dumps(document))
+        (self.evidence / 'aa-qualification-preflight.json').write_text(json.dumps(document), encoding='utf-8')
         result = Q.qualify(self.evidence, self.preflight_path)
         self.assertEqual((result['status'], result['reason']),
                          ('INCONCLUSIVE', 'invalid_evidence'))
 
     def test_valid_correctness_failure_fails_campaign(self):
         raw_path = self.evidence / 'raw-attempts.jsonl'
-        rows = [json.loads(line) for line in raw_path.read_text().splitlines()]
+        rows = [json.loads(line) for line in raw_path.read_text(encoding='utf-8').splitlines()]
         record = json.loads(rows[0]['stdout'])
         record['result'] -= 1
         record['status'] = 'FAIL'
         rows[0]['stdout'] = json.dumps(record) + '\n'
         rows[0]['aa_host_before']['governor'] = dict(
             value=None, unavailable_reason='governor file missing')
-        raw_path.write_text(''.join(json.dumps(row, sort_keys=True) + '\n' for row in rows))
+        raw_path.write_text(''.join(json.dumps(row, sort_keys=True) + '\n' for row in rows), encoding='utf-8')
         link_path = self.evidence / 'aa-attempt-links.jsonl'
-        links = [json.loads(line) for line in link_path.read_text().splitlines()]
+        links = [json.loads(line) for line in link_path.read_text(encoding='utf-8').splitlines()]
         links[0]['raw_line_sha256'] = hashlib.sha256(
             (json.dumps(rows[0], sort_keys=True) + '\n').encode()).hexdigest()
-        link_path.write_text(''.join(json.dumps(link, sort_keys=True) + '\n' for link in links))
+        link_path.write_text(''.join(json.dumps(link, sort_keys=True) + '\n' for link in links), encoding='utf-8')
         campaign_path = self.evidence / 'campaign-v1.json'
-        campaign = json.loads(campaign_path.read_text())
+        campaign = json.loads(campaign_path.read_text(encoding='utf-8'))
         elapsed, correctness = COLLECTOR['parse_result'](rows[0]['stdout'], 'crdt')
         campaign['attempts'][0]['elapsed_ms'] = elapsed
         campaign['attempts'][0]['correctness'] = correctness
@@ -339,23 +339,23 @@ class QualificationTests(unittest.TestCase):
 
     def test_wide_interval_is_inconclusive_before_noise_floor_verdict(self):
         path = self.evidence / 'raw-attempts.jsonl'
-        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
         # One order stratum has a large spread while retaining valid output and host evidence.
         for row in rows:
             if row['workload'] == 'crdt' and row['block_id'] == 'AB' and row['sequence'] in range(3, 19, 2):
                 record = json.loads(row['stdout'])
                 record['elapsed_ms'] = 10 * math.exp(0.3)
                 row['stdout'] = json.dumps(record) + '\n'
-        path.write_text(''.join(json.dumps(row, sort_keys=True) + '\n' for row in rows))
+        path.write_text(''.join(json.dumps(row, sort_keys=True) + '\n' for row in rows), encoding='utf-8')
         links_path = self.evidence / 'aa-attempt-links.jsonl'
-        links = [json.loads(line) for line in links_path.read_text().splitlines()]
+        links = [json.loads(line) for line in links_path.read_text(encoding='utf-8').splitlines()]
         for index, (row, link) in enumerate(zip(rows, links)):
             encoded = (json.dumps(row, sort_keys=True) + '\n').encode()
             link['raw_line_sha256'] = hashlib.sha256(encoded).hexdigest()
-        links_path.write_text(''.join(json.dumps(link, sort_keys=True) + '\n' for link in links))
+        links_path.write_text(''.join(json.dumps(link, sort_keys=True) + '\n' for link in links), encoding='utf-8')
         # Campaign attempts must tie to updated raw timings.
         camp_path = self.evidence / 'campaign-v1.json'
-        campaign = json.loads(camp_path.read_text())
+        campaign = json.loads(camp_path.read_text(encoding='utf-8'))
         for row, attempt in zip(rows, campaign['attempts']):
             elapsed, correctness = COLLECTOR['parse_result'](row['stdout'], row['workload'])
             attempt['elapsed_ms'] = elapsed
