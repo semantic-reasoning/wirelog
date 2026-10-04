@@ -16,6 +16,7 @@
 #include "../wirelog/backend.h"
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/columnar/join_batch.h"
+#include "../wirelog/util/log.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
 #include "../wirelog/wirelog-parser.h"
@@ -26,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
 static int
@@ -43,6 +45,11 @@ wl_test_unsetenv_(const char *name)
 
 #define setenv wl_test_setenv_
 #define unsetenv wl_test_unsetenv_
+#include <process.h>
+#define wl_test_getpid _getpid
+#else
+#include <unistd.h>
+#define wl_test_getpid getpid
 #endif
 
 static int tests_run;
@@ -2163,6 +2170,183 @@ out:
     fixture_fini(&f);
 }
 
+/* #1909: the grow-refusal WARN is operator-facing, and no producer test
+ * could see it: the logger was not initialised until this binary's last
+ * test, and removing the warning, its once-per-producer gate, or rotating
+ * its reason strings survived the suite.  Capture the JOIN section to a
+ * file and check the reason for a refused allocation and for an admission
+ * denial, and that two refused grows in one producer warn once.  The
+ * caller's WL_LOG and WL_LOG_FILE are saved and restored. */
+static char warn_log_path[512];
+static char *warn_saved_log;
+static char *warn_saved_file;
+
+static char *
+warn_env_dup(const char *name)
+{
+    const char *value = getenv(name);
+    char *copy;
+    size_t len;
+
+    if (!value)
+        return NULL;
+    len = strlen(value) + 1u;
+    copy = (char *)malloc(len);
+    if (copy)
+        memcpy(copy, value, len);
+    return copy;
+}
+
+static void
+warn_env_restore(const char *name, char **saved)
+{
+    if (*saved)
+        (void)setenv(name, *saved, 1);
+    else
+        (void)unsetenv(name);
+    free(*saved);
+    *saved = NULL;
+}
+
+static bool
+warn_log_begin(void)
+{
+    const char *dir = getenv("TMPDIR");
+#ifdef _WIN32
+    if (!dir || !*dir)
+        dir = getenv("TEMP");
+#endif
+    if (!dir || !*dir)
+        dir = ".";
+    /* The process id keeps concurrent runs sharing a TMPDIR apart. */
+    snprintf(warn_log_path, sizeof(warn_log_path),
+        "%s/wl_join_batch_warn_%ld_%lu.log", dir, (long)wl_test_getpid(),
+        (unsigned long)time(NULL));
+    (void)remove(warn_log_path);
+    warn_saved_log = warn_env_dup("WL_LOG");
+    warn_saved_file = warn_env_dup("WL_LOG_FILE");
+    if (setenv("WL_LOG_FILE", warn_log_path, 1) != 0
+        || setenv("WL_LOG", "JOIN:2", 1) != 0)
+        return false;
+    return wl_log_init() == 0;
+}
+
+/* Stop capturing, read the file into buf and restore the caller's logging
+ * configuration. */
+static void
+warn_log_end(char *buf, size_t size)
+{
+    FILE *fp;
+    size_t n = 0;
+
+    wl_log_shutdown();
+    fp = fopen(warn_log_path, "r");
+    if (fp) {
+        n = fread(buf, 1, size - 1u, fp);
+        fclose(fp);
+    }
+    buf[n] = '\0';
+    (void)remove(warn_log_path);
+    warn_env_restore("WL_LOG", &warn_saved_log);
+    warn_env_restore("WL_LOG_FILE", &warn_saved_file);
+    (void)wl_log_init();
+}
+
+static unsigned
+count_substr(const char *haystack, const char *needle)
+{
+    unsigned count = 0;
+    for (const char *p = strstr(haystack, needle); p;
+        p = strstr(p + 1, needle))
+        count++;
+    return count;
+}
+
+static void
+test_grow_refusal_warn_reason(void)
+{
+    for (int denied = 0; denied < 2; denied++) {
+        fixture_t f;
+        const int64_t keys[] = { 0, 1, 2 };
+        wl_columnar_continuation_t *cont = NULL;
+        wl_columnar_continuation_sink_t sink;
+        col_join_batch_relation_sink_t sctx;
+        wl_columnar_continuation_status_t st = WL_COLUMNAR_CONTINUATION_OK;
+        wl_columnar_memory_governor_t *governor;
+        col_rel_t *oracle = NULL;
+        bool refused_ok = true;
+        char log[4096];
+
+        TEST(denied ? "a denied scratch grow warns: admission denied"
+                    : "failed scratch grows warn once: allocation failed");
+        /* The ceiling is a project-wide define, so it matches the library;
+         * 2 is WL_LOG_WARN, which #if cannot name. */
+#if WL_LOG_COMPILE_MAX_LEVEL < 2
+        printf("SKIP (WARN compiled out) ");
+        PASS();
+        continue;
+#endif
+        if (!fixture_init(&f, 1u << 24, keys, 3, 5, 47)
+            || col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+            KEY0, KEY0, 1, 512u * 32u, &cont) != 0
+            || col_join_batch_relation_sink_init(&sctx, &sink, f.sess,
+            f.out) != 0 || !warn_log_begin()) {
+            FAIL("fixture, producer, sink or log capture");
+            if (cont)
+                wl_columnar_continuation_destroy(cont);
+            fixture_fini(&f);
+            continue;
+        }
+        governor = wl_columnar_memory_governor_ref_get(f.sess->memory_governor);
+        if (denied) {
+            /* Room for a 64-row payload (2 KiB at four columns) but not
+             * for growing the scratch to 128 rows, which holds the old and
+             * the new buffers at once: the first batch is emitted short. */
+            atomic_store_explicit(&governor->usable_bytes,
+                reserved_of(f.sess) + 64u * 32u * 2u, memory_order_release);
+            st = wl_columnar_continuation_publish(cont, &sink);
+            refused_ok = st == WL_COLUMNAR_CONTINUATION_OK
+                && f.out->nrows == COL_REL_INIT_CAP;
+            atomic_store_explicit(&governor->usable_bytes, 1u << 24,
+                memory_order_release);
+        } else {
+            /* Refuse the grow of two consecutive batches: both are emitted
+             * short, and the producer warns only for the first. */
+            for (int b = 0; b < 2 && refused_ok; b++) {
+                wl_columnar_relation_test_fail_next_prepare_resize();
+                st = wl_columnar_continuation_publish(cont, &sink);
+                refused_ok = st == WL_COLUMNAR_CONTINUATION_OK
+                    && f.out->nrows == COL_REL_INIT_CAP * (uint32_t)(b + 1)
+                    && col_join_batch_scratch_capacity(cont)
+                    == COL_REL_INIT_CAP;
+            }
+            wl_columnar_relation_test_clear_prepare_resize();
+        }
+        while (refused_ok && st == WL_COLUMNAR_CONTINUATION_OK)
+            st = wl_columnar_continuation_publish(cont, &sink);
+        warn_log_end(log, sizeof(log));
+        oracle = run_oracle(f.sess, f.left, &f.op);
+        if (!refused_ok)
+            FAIL("a refused grow did not emit a short batch");
+        else if (st != WL_COLUMNAR_CONTINUATION_DONE || !oracle
+            || !same_rows(oracle, f.out) || f.out->nrows != 3u * 47u)
+            FAIL("a refused grow lost or duplicated a row");
+        else if (count_substr(log, "join batch scratch stuck") != 1u)
+            FAIL("the refusals did not warn exactly once");
+        else if (count_substr(log, denied ? "admission denied"
+            : "allocation failed") != 1u
+            || count_substr(log, denied ? "allocation failed"
+            : "admission denied") != 0u)
+            FAIL("the warning names the wrong reason");
+        else
+            PASS();
+        if (oracle)
+            col_rel_destroy(oracle);
+        wl_columnar_continuation_destroy(cont);
+        fixture_fini(&f);
+    }
+}
+
 static int64_t
 double_bits(double d)
 {
@@ -3270,6 +3454,7 @@ main(void)
     test_projected_output();
     test_projected_output_across_grow();
     test_timestamped_scratch_across_grow();
+    test_grow_refusal_warn_reason();
     test_float_key();
     test_unsupported_budget_and_pooled_output();
     test_row_cap_trips_after_a_committed_batch();
