@@ -34,6 +34,15 @@ wl_columnar_relation_test_set_mutation_nonce(uint64_t next_nonce)
     atomic_store_explicit(&wl_next_mutation_set_nonce, next_nonce,
         memory_order_relaxed);
 }
+
+/* The next nonce to be handed out: a delta across a single-threaded window
+ * counts the mutation sets acquired in it. */
+uint64_t
+wl_columnar_relation_test_mutation_nonce_peek(void)
+{
+    return atomic_load_explicit(&wl_next_mutation_set_nonce,
+               memory_order_relaxed);
+}
 #endif
 
 static int
@@ -305,16 +314,6 @@ wl_columnar_relation_radix_bench_enabled(void)
 #endif
 
 /* ---- COW helpers --------------------------------------------------------- */
-
-/* Single-entry storage lives with the operation, including its role mapping. */
-typedef struct {
-    wl_columnar_relation_mutation_set_t set;
-    wl_columnar_relation_mutation_role_t role;
-    wl_columnar_relation_mutation_descriptor_t descriptor;
-    wl_columnar_relation_mutation_owner_t owners[2];
-    wl_columnar_relation_mutation_lease_t lease;
-    wl_columnar_relation_mutation_initialization_t initialization;
-} wl_columnar_relation_mutation_single_t;
 
 static int
 col_rel_mutation_single_acquire(col_rel_t *relation,
@@ -4530,6 +4529,17 @@ col_rel_apply_compound_schema(col_rel_t *r,
     return rc;
 }
 
+/* Whether appending one row to r replaces its storage: a shared view is
+ * copied on write, and full column or timestamp capacity grows.  The append
+ * publishes a storage transition exactly when this holds, which is why the
+ * batch appender below uses it to start a fresh lease before such a row. */
+static bool
+col_rel_append_replaces_storage(const col_rel_t *r)
+{
+    return r->col_shared || r->nrows >= r->capacity
+           || (r->timestamps && r->nrows >= r->timestamp_capacity);
+}
+
 static int
 col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
     wl_columnar_source_access_writer_t *writer, bool writer_held,
@@ -4572,8 +4582,7 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
         : r->storage_generation;
     if (!col_rel_timestamp_shape_valid(r) || r->nrows > r->capacity)
         return EINVAL;
-    bool replaces_storage = r->col_shared || r->nrows >= r->capacity
-        || (r->timestamps && r->nrows >= r->timestamp_capacity);
+    bool replaces_storage = col_rel_append_replaces_storage(r);
     if (r->nrows == UINT32_MAX
         || r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
         || (replaces_storage && r->storage_generation
@@ -4838,6 +4847,58 @@ col_rel_append_row_with_lease(col_rel_t *r, const int64_t *row,
         return EINVAL;
     return col_rel_append_row_impl(r, row,
                &lease->set->owners[lease->owner_slot].writer, true, lease);
+}
+
+int
+col_rel_append_batch_begin(col_rel_append_batch_t *batch, col_rel_t *r)
+{
+    if (!batch || !r || batch->active)
+        return EINVAL;
+    memset(batch, 0, sizeof(*batch));
+    int rc = col_rel_mutation_single_acquire(r, &batch->single);
+    if (rc) {
+        memset(batch, 0, sizeof(*batch));
+        return rc;
+    }
+    batch->relation = r;
+    batch->active = true;
+    return 0;
+}
+
+int
+col_rel_append_batch_row(col_rel_append_batch_t *batch, const int64_t *row)
+{
+    if (!batch || !batch->active || !row)
+        return EINVAL;
+    col_rel_t *r = batch->relation;
+    /* A lease publishes at most one storage transition.  Once it has, a row
+     * that would replace storage again starts the next epoch's lease. */
+    if (batch->single.lease.storage_transitioned
+        && col_rel_append_replaces_storage(r)) {
+        int rc = col_rel_mutation_set_finish(&batch->single.set, true);
+        if (rc == 0) {
+            memset(&batch->single, 0, sizeof(batch->single));
+            rc = col_rel_mutation_single_acquire(r, &batch->single);
+        }
+        if (rc) {
+            batch->active = false;
+            return rc;
+        }
+    }
+    /* Each row's denial evidence starts clean, as for col_rel_append_row. */
+    r->memory_budget_denial_pending = false;
+    return col_rel_append_row_impl(r, row,
+               &batch->single.owners[batch->single.lease.owner_slot].writer,
+               true, &batch->single.lease);
+}
+
+int
+col_rel_append_batch_end(col_rel_append_batch_t *batch, bool commit)
+{
+    if (!batch || !batch->active)
+        return 0;
+    batch->active = false;
+    return col_rel_mutation_set_finish(&batch->single.set, commit);
 }
 
 static int

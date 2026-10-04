@@ -277,7 +277,7 @@ The 64-byte padding between `tail` and `head`
 cache-line ping-pong between producer and consumer collapses
 throughput by 2-10x.
 
-### 5.3 Init and relation identity/nonce allocators (8 rows)
+### 5.3 Init and relation identity/nonce allocators (9 rows)
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
@@ -289,6 +289,7 @@ throughput by 2-10x.
 | `relation.c:col_rel_mutation_set_nonce_allocate` | `wl_next_mutation_set_nonce` | `atomic_load_explicit` | `relaxed` | Read the candidate nonce before the nonwrapping CAS reservation loop; the counter only supplies unique admission provenance and publishes no other state |
 | `relation.c:col_rel_mutation_set_nonce_allocate#2` | `wl_next_mutation_set_nonce` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Reserve a unique nonzero mutation-set nonce and retry with the observed value after a lost race; the RMW provides uniqueness without publishing payload state |
 | `relation.c:wl_columnar_relation_test_set_mutation_nonce` | `wl_next_mutation_set_nonce` | `atomic_store_explicit` | `relaxed` | Test-only seam selects allocator exhaustion or retry states before test admissions; tests do not race this reset with nonce allocation |
+| `relation.c:wl_columnar_relation_test_mutation_nonce_peek` | `wl_next_mutation_set_nonce` | `atomic_load_explicit` | `relaxed` | Test-only seam reads the next nonce so a single-threaded window can count the mutation sets acquired in it; only the delta matters, and no other state is read through it |
 
 Only the two `io_adapter.c` rows use non-explicit atomic APIs, which default
 to `memory_order_seq_cst`. The relation identity and mutation-set nonce
@@ -466,7 +467,7 @@ measured by `bench/bench_intern.c`; baselines are in `docs/INTERN_PERF.md`
 
 ### 5.12 Existing inventory total
 
-21 + 4 + 8 + 19 + 2 + 2 + 3 + 37 + 5 + 7 + 3 = **111 atomic call sites**
+21 + 4 + 9 + 19 + 2 + 2 + 3 + 37 + 5 + 7 + 3 = **112 atomic call sites**
 before the source-access contract below.
 
 ### 5.13 `wirelog/columnar/source_access.h` — relation source gate (21 rows)
@@ -561,7 +562,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#2` | `src->retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Promote a committed reservation only when the pool slot still owns it |
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
-111 + 21 + 30 = **162 atomic call sites**.
+112 + 21 + 30 = **163 atomic call sites**.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -686,7 +687,7 @@ the committed token after publication and before a growth transaction.
 | `eval_dedup.c:wl_columnar_eval_dedup_test_fail_next_growth_alloc` | test-only fault flag | `atomic_store_explicit` | release | Arm one allocation refusal before a test invokes dedup growth; excluded from the production library |
 | `eval_dedup.c:wl_columnar_eval_dedup_set_grow` | test-only fault flag | `atomic_exchange_explicit` | acquire-release | Consume the one-shot fault safely when test workers grow dedup tables; excluded from the production library |
 
-The complete source audit now contains **219 atomic call sites**.
+The complete source audit now contains **220 atomic call sites**.
 
 ---
 

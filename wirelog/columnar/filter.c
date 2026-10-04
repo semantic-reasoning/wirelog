@@ -602,19 +602,35 @@ wl_columnar_filter_status(wl_col_session_t *sess, col_rel_t *relation,
     return rc;
 }
 
+/* Appends through @batch, which holds out's mutation lease for the whole
+ * fill: a lease per appended row made the filter operator's cost dominated
+ * by lease acquisition (main CI timeouts after #2037).  The timestamp store
+ * below therefore also happens under the held writer gates. */
 static int
-wl_columnar_filter_append_selected(col_rel_t *out, const col_rel_t *src,
-    uint32_t src_row, const int64_t *row, wl_col_session_t *sess)
+wl_columnar_filter_append_selected(col_rel_append_batch_t *batch,
+    col_rel_t *out, const col_rel_t *src, uint32_t src_row,
+    const int64_t *row, wl_col_session_t *sess)
 {
-    if (!out || !src || !row || src_row >= src->nrows
+    if (!batch || !out || !src || !row || src_row >= src->nrows
         || (src->timestamps && !out->timestamps))
         return EINVAL;
     uint32_t dst_row = out->nrows;
     int rc = wl_columnar_filter_status(sess, out,
-            col_rel_append_row(out, row));
+            col_rel_append_batch_row(batch, row));
     if (rc == 0 && src->timestamps)
         out->timestamps[dst_row] = src->timestamps[src_row];
     return rc;
+}
+
+/* Every exit from a fill region ends its batch before out is destroyed or
+ * published: destroying a relation whose writer gates are still held fails,
+ * and the destroy result is ignored on these paths. */
+static void
+wl_columnar_filter_discard_batch_out(col_rel_append_batch_t *batch,
+    col_rel_t *out)
+{
+    (void)col_rel_append_batch_end(batch, false);
+    (void)col_rel_destroy_checked(out);
 }
 
 static int
@@ -758,6 +774,15 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
 #ifdef __AVX2__
             use_selection = true;
 #endif
+            col_rel_append_batch_t batch = { 0 };
+            int batch_rc = wl_columnar_filter_status(sess, out,
+                    col_rel_append_batch_begin(&batch, out));
+            if (batch_rc != 0) {
+                free(row);
+                wl_columnar_filter_scratch_release(&scratch);
+                (void)col_rel_destroy_checked(out);
+                return wl_columnar_filter_dispose_input(stack, &e, batch_rc);
+            }
             if (use_selection) {
                 uint32_t *sel = (uint32_t *)malloc(
                     ((size_t)COL_FILTER_TILE + COL_FILTER_SEL_SLACK)
@@ -765,7 +790,7 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 if (!sel) {
                     free(row);
                     wl_columnar_filter_scratch_release(&scratch);
-                    (void)col_rel_destroy_checked(out);
+                    wl_columnar_filter_discard_batch_out(&batch, out);
                     return wl_columnar_filter_dispose_input(stack, &e,
                                ENOMEM);
                 }
@@ -784,13 +809,13 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
                         uint32_t src_row = base + sel[i];
                         for (uint32_t c = 0; c < ncols; c++)
                             row[c] = columns[c][src_row];
-                        int rc = wl_columnar_filter_append_selected(out,
-                                e.rel, src_row, row, sess);
+                        int rc = wl_columnar_filter_append_selected(&batch,
+                                out, e.rel, src_row, row, sess);
                         if (rc != 0) {
                             free(sel);
                             free(row);
                             wl_columnar_filter_scratch_release(&scratch);
-                            (void)col_rel_destroy_checked(out);
+                            wl_columnar_filter_discard_batch_out(&batch, out);
                             return wl_columnar_filter_dispose_input(stack,
                                        &e, rc);
                         }
@@ -807,18 +832,23 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
                         continue;
                     for (uint32_t c = 0; c < ncols; c++)
                         row[c] = columns[c][r];
-                    int rc = wl_columnar_filter_append_selected(out, e.rel, r,
-                            row, sess);
+                    int rc = wl_columnar_filter_append_selected(&batch, out,
+                            e.rel, r, row, sess);
                     if (rc != 0) {
                         free(row);
                         wl_columnar_filter_scratch_release(&scratch);
-                        (void)col_rel_destroy_checked(out);
+                        wl_columnar_filter_discard_batch_out(&batch, out);
                         return wl_columnar_filter_dispose_input(stack, &e, rc);
                     }
                 }
             }
             free(row);
             wl_columnar_filter_scratch_release(&scratch);
+            batch_rc = col_rel_append_batch_end(&batch, true);
+            if (batch_rc != 0) {
+                (void)col_rel_destroy_checked(out);
+                return wl_columnar_filter_dispose_input(stack, &e, batch_rc);
+            }
             int cleanup_rc = wl_columnar_filter_dispose_input(stack, &e, 0);
             if (cleanup_rc != 0) {
                 (void)col_rel_destroy_checked(out);
@@ -950,15 +980,21 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
             }
         }
 
-        /* Bulk-copy the passing rows into the output relation */
-        for (uint32_t r = 0; r < nout; r++) {
-            int rc = col_rel_append_row(out, tmp + (size_t)r * ncols);
-            if (rc != 0) {
-                free(tmp);
-                wl_columnar_filter_scratch_release(&scratch);
-                col_rel_destroy(out);
-                return wl_columnar_filter_dispose_input(stack, &e, rc);
-            }
+        /* Bulk-copy the passing rows into the output relation, under one
+         * lease per storage epoch rather than one per row. */
+        col_rel_append_batch_t batch = { 0 };
+        int batch_rc = col_rel_append_batch_begin(&batch, out);
+        for (uint32_t r = 0; batch_rc == 0 && r < nout; r++)
+            batch_rc = col_rel_append_batch_row(&batch,
+                    tmp + (size_t)r * ncols);
+        if (batch_rc == 0)
+            batch_rc = col_rel_append_batch_end(&batch, true);
+        if (batch_rc != 0) {
+            free(tmp);
+            wl_columnar_filter_scratch_release(&scratch);
+            (void)col_rel_append_batch_end(&batch, false);
+            col_rel_destroy(out);
+            return wl_columnar_filter_dispose_input(stack, &e, batch_rc);
         }
         free(tmp);
         wl_columnar_filter_scratch_release(&scratch);
@@ -1008,6 +1044,16 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
     }
 
     int64_t *const row = row_rb.ptr;
+    col_rel_append_batch_t batch = { 0 };
+    int batch_rc = wl_columnar_filter_status(sess, out,
+            col_rel_append_batch_begin(&batch, out));
+    if (batch_rc != 0) {
+        col_row_buf_release(&row_rb);
+        wl_columnar_filter_scratch_release(&row_scratch);
+        wl_columnar_expr_compiled_free(ce);
+        (void)col_rel_destroy_checked(out);
+        return wl_columnar_filter_dispose_input(stack, &e, batch_rc);
+    }
     wl_columnar_expr_context_t expr_ctx = {
         .intern = sess ? sess->intern : NULL,
         .extensions = sess ? sess->base.extension_snapshot : NULL,
@@ -1039,7 +1085,7 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 col_row_buf_release(&row_rb);
                 wl_columnar_filter_scratch_release(&row_scratch);
                 wl_columnar_expr_compiled_free(ce);
-                (void)col_rel_destroy_checked(out);
+                wl_columnar_filter_discard_batch_out(&batch, out);
                 /* A refused string allocation fails the step as a memory
                  * error (Issue #1470). */
                 return wl_columnar_filter_dispose_input(stack, &e,
@@ -1049,13 +1095,13 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
             pass = err == WL_COLUMNAR_EXPR_OK && val != 0;
         }
         if (pass) {
-            int rc = wl_columnar_filter_append_selected(out, e.rel, r, row,
-                    sess);
+            int rc = wl_columnar_filter_append_selected(&batch, out, e.rel,
+                    r, row, sess);
             if (rc != 0) {
                 col_row_buf_release(&row_rb);
                 wl_columnar_filter_scratch_release(&row_scratch);
                 wl_columnar_expr_compiled_free(ce);
-                (void)col_rel_destroy_checked(out);
+                wl_columnar_filter_discard_batch_out(&batch, out);
                 return wl_columnar_filter_dispose_input(stack, &e, rc);
             }
         }
@@ -1063,6 +1109,11 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
     col_row_buf_release(&row_rb);
     wl_columnar_filter_scratch_release(&row_scratch);
     wl_columnar_expr_compiled_free(ce);
+    batch_rc = col_rel_append_batch_end(&batch, true);
+    if (batch_rc != 0) {
+        (void)col_rel_destroy_checked(out);
+        return wl_columnar_filter_dispose_input(stack, &e, batch_rc);
+    }
 
     int cleanup_rc = wl_columnar_filter_dispose_input(stack, &e, 0);
     if (cleanup_rc != 0) {
@@ -1131,22 +1182,20 @@ fill_filtered_rel(const uint8_t *buf, uint32_t bsz, col_rel_t *rel,
 
     /* Fast path: simple colA CMP CONST or colA CMP colB predicate */
     simple_filter_cmp_t cmp;
+    col_rel_append_batch_t batch = { 0 };
     if (filter_is_simple_cmp(buf, bsz, &cmp)) {
-        for (uint32_t r = 0; r < rel->nrows; r++) {
+        int rc = wl_columnar_filter_status(sess, out,
+                col_rel_append_batch_begin(&batch, out));
+        for (uint32_t r = 0; rc == 0 && r < rel->nrows; r++) {
             col_rel_row_copy_out(rel, r, row_buf);
-            if (col_filter_cmp_row(row_buf, rel->ncols, &cmp)) {
-                int rc = wl_columnar_filter_append_selected(out, rel, r,
+            if (col_filter_cmp_row(row_buf, rel->ncols, &cmp))
+                rc = wl_columnar_filter_append_selected(&batch, out, rel, r,
                         row_buf, sess);
-                if (rc != 0) {
-                    col_row_buf_release(&rb);
-                    wl_columnar_filter_scratch_release(&scratch);
-                    return rc;
-                }
-            }
         }
+        int end_rc = col_rel_append_batch_end(&batch, rc == 0);
         col_row_buf_release(&rb);
         wl_columnar_filter_scratch_release(&scratch);
-        return 0;
+        return rc != 0 ? rc : end_rc;
     }
 
     /* Slow path: compile once, evaluate per row */
@@ -1156,6 +1205,14 @@ fill_filtered_rel(const uint8_t *buf, uint32_t bsz, col_rel_t *rel,
     if (compile_rc != ENOTSUP && compile_rc != 0) {
         col_row_buf_release(&rb);
         return compile_rc;
+    }
+    int batch_rc = wl_columnar_filter_status(sess, out,
+            col_rel_append_batch_begin(&batch, out));
+    if (batch_rc != 0) {
+        col_row_buf_release(&rb);
+        wl_columnar_filter_scratch_release(&scratch);
+        wl_columnar_expr_compiled_free(ce);
+        return batch_rc;
     }
     for (uint32_t r = 0; r < rel->nrows; r++) {
         col_rel_row_copy_out(rel, r, row_buf);
@@ -1174,9 +1231,10 @@ fill_filtered_rel(const uint8_t *buf, uint32_t bsz, col_rel_t *rel,
             pass = (err == 0) ? (val != 0 ? 1 : 0) : 0; /* fail-closed */
         }
         if (pass) {
-            int rc = wl_columnar_filter_append_selected(out, rel, r,
+            int rc = wl_columnar_filter_append_selected(&batch, out, rel, r,
                     row_buf, sess);
             if (rc != 0) {
+                (void)col_rel_append_batch_end(&batch, false);
                 col_row_buf_release(&rb);
                 wl_columnar_filter_scratch_release(&scratch);
                 wl_columnar_expr_compiled_free(ce);
@@ -1184,10 +1242,11 @@ fill_filtered_rel(const uint8_t *buf, uint32_t bsz, col_rel_t *rel,
             }
         }
     }
+    batch_rc = col_rel_append_batch_end(&batch, true);
     col_row_buf_release(&rb);
     wl_columnar_filter_scratch_release(&scratch);
     wl_columnar_expr_compiled_free(ce);
-    return 0;
+    return batch_rc;
 }
 
 /**

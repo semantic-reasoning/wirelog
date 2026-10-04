@@ -562,6 +562,218 @@ invalid_tests(void)
     assert(col_rel_storage_alias_borrow_count(&root) == 1);
 }
 
+/* A held-lease batch appender (main CI regression after #2037): one
+ * mutation set per storage transition instead of one per row, with the
+ * same rows, capacities and generations as per-row col_rel_append_row. */
+static col_rel_t *
+batch_relation(const char *name)
+{
+    static const wirelog_column_type_t types[2] = {
+        WIRELOG_TYPE_INT64, WIRELOG_TYPE_FLOAT
+    };
+    col_rel_t *r = col_rel_new_auto(name, 2);
+    assert(r);
+    assert(col_rel_set_column_types(r, types, 2) == 0);
+    assert(col_rel_enable_timestamps(r) == 0);
+    return r;
+}
+
+static void
+batch_row_values(uint32_t i, int64_t row[2])
+{
+    double value = (i % 7u == 0u) ? -0.0 : (double)i;
+    row[0] = (int64_t)i;
+    memcpy(&row[1], &value, sizeof(value));
+}
+
+static void
+append_batch_tests(void)
+{
+    enum { ROWS = 1000 };
+    col_rel_t *ref = batch_relation("batch_ref");
+    col_rel_t *out = batch_relation("batch_out");
+    int64_t row[2];
+    uint64_t ref_storage_before = ref->storage_generation;
+    uint64_t ref_view_before = ref->view_generation;
+    for (uint32_t i = 0; i < ROWS; i++) {
+        batch_row_values(i, row);
+        assert(col_rel_append_row(ref, row) == 0);
+    }
+
+    wl_columnar_relation_test_set_mutation_nonce(1000);
+    uint64_t storage_before = out->storage_generation;
+    uint64_t view_before = out->view_generation;
+    col_rel_append_batch_t batch;
+    memset(&batch, 0, sizeof(batch));
+    assert(col_rel_append_batch_row(&batch, row) == EINVAL);
+    assert(col_rel_append_batch_end(&batch, true) == 0);
+    uint64_t nonce_before = wl_columnar_relation_test_mutation_nonce_peek();
+    assert(col_rel_append_batch_begin(&batch, out) == 0);
+    assert(col_rel_append_batch_begin(&batch, out) == EINVAL);
+    for (uint32_t i = 0; i < ROWS; i++) {
+        batch_row_values(i, row);
+        assert(col_rel_append_batch_row(&batch, row) == 0);
+        if (i == 10) {
+            /* The held gates exclude readers until the batch ends. */
+            wl_columnar_source_access_reader_t reader = {0};
+            assert(col_rel_source_reader_acquire(out, &reader) == EBUSY);
+        }
+    }
+    assert(col_rel_append_batch_end(&batch, true) == 0);
+    uint64_t acquisitions
+        = wl_columnar_relation_test_mutation_nonce_peek() - nonce_before;
+    assert(col_rel_append_batch_end(&batch, true) == 0);
+    assert(col_rel_append_batch_row(&batch, row) == EINVAL);
+
+    /* Same storage shape and publications as the per-row reference. */
+    assert(out->nrows == ref->nrows && out->capacity == ref->capacity
+        && out->timestamp_capacity == ref->timestamp_capacity);
+    for (uint32_t c = 0; c < 2; c++)
+        assert(memcmp(out->columns[c], ref->columns[c],
+            ROWS * sizeof(int64_t)) == 0);
+    uint64_t transitions = out->storage_generation - storage_before;
+    assert(transitions == ref->storage_generation - ref_storage_before);
+    assert(transitions > 1);
+    assert(out->view_generation - view_before
+        == ref->view_generation - ref_view_before);
+    /* One set per storage epoch: at least one, never more than the
+     * transitions plus the first, and far below one per row. */
+    assert(acquisitions >= 1 && acquisitions <= transitions + 1);
+
+    wl_columnar_source_access_reader_t reader = {0};
+    assert(col_rel_source_reader_acquire(out, &reader) == 0);
+    assert(col_rel_source_reader_release(&reader) == 0);
+    assert(col_rel_destroy_checked(out) == 0);
+    assert(col_rel_destroy_checked(ref) == 0);
+}
+
+/* The filter operator appends its selected rows under the batch appender:
+ * a right-side filter of 4096 timestamped rows acquires a handful of
+ * mutation sets (one per storage epoch plus construction), not one per
+ * selected row, and produces exactly the per-row result. */
+static uint8_t batch_filter_simple[] = {
+    WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1',
+    WL_PLAN_EXPR_CONST_INT, 150, 0, 0, 0, 0, 0, 0, 0,
+    WL_PLAN_EXPR_CMP_GT
+};
+static uint8_t batch_filter_compiled[] = {
+    WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1',
+    WL_PLAN_EXPR_CONST_INT, 1, 0, 0, 0, 0, 0, 0, 0,
+    WL_PLAN_EXPR_ARITH_ADD,
+    WL_PLAN_EXPR_CONST_INT, 151, 0, 0, 0, 0, 0, 0, 0,
+    WL_PLAN_EXPR_CMP_GT
+};
+
+static void
+filter_batch_tests(void)
+{
+    enum { ROWS = 4096, KEPT = ROWS - 151 };
+    col_rel_t *src = col_rel_new_auto("filter_src", 2);
+    delta_pool_t *pool = delta_pool_create(32, sizeof(col_rel_t), 4096);
+    assert(src && pool && col_rel_enable_timestamps(src) == 0);
+    for (uint32_t i = 0; i < ROWS; i++) {
+        int64_t row[2] = { (int64_t)(i * 3u), (int64_t)i };
+        assert(col_rel_append_row(src, row) == 0);
+        src->timestamps[i] = (col_delta_timestamp_t){
+            .iteration = i, .stratum = 7u, .worker = i % 5u,
+            .multiplicity = (int64_t)(i % 3u) + 1
+        };
+    }
+    wl_plan_expr_buffer_t exprs[2] = {
+        { batch_filter_simple, sizeof(batch_filter_simple) },
+        { batch_filter_compiled, sizeof(batch_filter_compiled) }
+    };
+    for (int e = 0; e < 2; e++) {
+        wl_columnar_relation_test_set_mutation_nonce(1000);
+        uint64_t before = wl_columnar_relation_test_mutation_nonce_peek();
+        col_rel_t *out = wl_columnar_filter_apply_right_filter(&exprs[e],
+                src, pool, NULL);
+        uint64_t acquisitions
+            = wl_columnar_relation_test_mutation_nonce_peek() - before;
+        assert(out && out->nrows == KEPT && out->timestamps);
+        /* Per-row acquisition would be at least KEPT; growing 64 -> 4096
+         * takes six storage epochs. */
+        assert(acquisitions >= 1 && acquisitions <= 16);
+        for (uint32_t i = 0; i < KEPT; i++) {
+            uint32_t s = i + 151u;
+            assert(out->columns[0][i] == (int64_t)(s * 3u)
+                && out->columns[1][i] == (int64_t)s
+                && out->timestamps[i].iteration == s
+                && out->timestamps[i].stratum == 7u
+                && out->timestamps[i].worker == s % 5u
+                && out->timestamps[i].multiplicity == (int64_t)(s % 3u) + 1);
+        }
+        /* The batch has ended: the result is readable and destroyable. */
+        wl_columnar_source_access_reader_t reader = {0};
+        assert(col_rel_source_reader_acquire(out, &reader) == 0);
+        assert(col_rel_source_reader_release(&reader) == 0);
+        assert(col_rel_destroy_checked(out) == 0);
+    }
+    delta_pool_destroy(pool);
+    assert(col_rel_destroy_checked(src) == 0);
+}
+
+/* The filter operator itself, on its three fills: timestamped simple
+ * predicate, untimestamped bulk copy, and the compiled slow path.  These are
+ * the paths the evaluator runs; each must take a handful of mutation sets,
+ * not one per selected row. */
+static void
+filter_op_batch_tests(void)
+{
+    enum { ROWS = 4096, KEPT = ROWS - 151 };
+    struct {
+        bool timestamped;
+        uint8_t *expr;
+        uint32_t size;
+    } cases[] = {
+        { true, batch_filter_simple, sizeof(batch_filter_simple) },
+        { false, batch_filter_simple, sizeof(batch_filter_simple) },
+        { true, batch_filter_compiled, sizeof(batch_filter_compiled) },
+    };
+    for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+        col_rel_t *src = col_rel_new_auto("filter_op_src", 2);
+        assert(src);
+        if (cases[k].timestamped)
+            assert(col_rel_enable_timestamps(src) == 0);
+        for (uint32_t i = 0; i < ROWS; i++) {
+            int64_t row[2] = { (int64_t)(i * 3u), (int64_t)i };
+            assert(col_rel_append_row(src, row) == 0);
+            if (cases[k].timestamped)
+                src->timestamps[i] = (col_delta_timestamp_t){
+                    .iteration = i, .stratum = 9u, .worker = 1u,
+                    .multiplicity = 1
+                };
+        }
+        wl_plan_op_t op;
+        memset(&op, 0, sizeof(op));
+        op.filter_expr.data = cases[k].expr;
+        op.filter_expr.size = cases[k].size;
+        eval_stack_t stack;
+        eval_stack_init(&stack);
+        assert(eval_stack_push(&stack, src, true) == 0);
+        wl_columnar_relation_test_set_mutation_nonce(1000);
+        uint64_t before = wl_columnar_relation_test_mutation_nonce_peek();
+        assert(wl_columnar_filter_op(&op, &stack, &(wl_col_session_t){ 0 })
+            == 0);
+        uint64_t acquisitions
+            = wl_columnar_relation_test_mutation_nonce_peek() - before;
+        eval_entry_t result = eval_stack_pop(&stack);
+        col_rel_t *out = result.rel;
+        assert(out && out->nrows == KEPT
+            && (out->timestamps != NULL) == cases[k].timestamped);
+        assert(acquisitions >= 1 && acquisitions <= 16);
+        for (uint32_t i = 0; i < KEPT; i++) {
+            uint32_t s = i + 151u;
+            assert(out->columns[0][i] == (int64_t)(s * 3u)
+                && out->columns[1][i] == (int64_t)s);
+            if (cases[k].timestamped)
+                assert(out->timestamps[i].iteration == s
+                    && out->timestamps[i].stratum == 9u);
+        }
+        assert(col_rel_destroy_checked(out) == 0);
+    }
+}
+
 int
 main(void)
 {
@@ -572,6 +784,9 @@ main(void)
     rollback_tests();
     invalid_tests();
     metadata_final_access_test();
+    append_batch_tests();
+    filter_batch_tests();
+    filter_op_batch_tests();
     {
         col_rel_t root;
         fixture_t f = {0};
