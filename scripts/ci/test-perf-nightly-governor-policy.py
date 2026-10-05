@@ -11,6 +11,7 @@ NIGHTLY = ROOT / ".github/workflows/perf-nightly.yml"
 REQUIRED = ROOT / ".github/workflows/perf-suite-required.yml"
 RELEASE = ROOT / ".github/workflows/release-tag.yml"
 MARKER = "WIRELOG_PERF_NIGHTLY: '1'"
+RUNNER = ROOT / "scripts/ci/run-perf-nightly-linux.sh"
 
 
 def step(workflow: str, name: str) -> str:
@@ -25,10 +26,11 @@ def step(workflow: str, name: str) -> str:
 def validate(nightly: str, required: str, release: str) -> None:
     linux = step(nightly, "Run perf suite (Linux)")
     assert "if: runner.os == 'Linux'" in linux
-    assert "WIRELOG_PERF_GATE: '1'" in linux
-    assert MARKER in linux, "Linux nightly must opt out of governor eligibility"
-    assert "taskset -c 0 meson test -C build-perf --suite perf" in linux
-    assert nightly.count(MARKER) == 1, "marker must belong only to Linux perf suite"
+    assert "run-perf-nightly-linux.sh" in linux
+    runner = RUNNER.read_text(encoding="utf-8")
+    assert "WIRELOG_PERF_GATE=1 WIRELOG_PERF_REQUIRE=1" in runner
+    assert "WIRELOG_PERF_GATE=1 WIRELOG_PERF_NIGHTLY=1" in runner, \
+        "the legacy trace suite retains its existing governor policy"
     assert MARKER not in step(nightly, "Run perf suite (Windows)")
     assert MARKER not in required and MARKER not in release, \
         "required and release paths must retain governor eligibility"
@@ -54,12 +56,11 @@ def validate(nightly: str, required: str, release: str) -> None:
     assert "always() && runner.os == 'Linux'" in capture
     for evidence in ("github.sha", "github.run_id", "RUNNER_NAME",
                      "taskset -pc $$", "scaling_governor", "mode=nightly",
-                     "governor_eligibility=bypassed", "meson-logs/testlog.txt",
+                     "governor_eligibility=required", "meson-logs/testlog.txt",
                      "source_tree=", "requested_affinity=0", "boot_id=",
                      "cpu_model=", "loadavg=", "cpu.stat", "/proc/pressure/cpu",
                      "scaling_cur_freq", "scaling_min_freq", "scaling_max_freq",
-                     "cpuinfo_cur_freq",
-                     "meson-config.txt", "compilers.json", "sha256.txt",
+                     "cpuinfo_cur_freq", "sha256.txt",
                      "test_crdt_perf_gate", "test_cspa_perf_gate",
                      "bench/data/crdt/Insert_input.csv",
                      "bench/data/crdt/Remove_input.csv",
@@ -90,17 +91,14 @@ class GovernorPolicyContract(unittest.TestCase):
 
     def test_global_marker_fails(self):
         changed = self.nightly.replace(
-            "WIRELOG_PERF_GATE: '1'\n        run:",
-            "WIRELOG_PERF_GATE: '1'\n          " + MARKER + "\n        run:",
-            1,
+            "run-perf-nightly-linux.sh", "missing-runner.sh", 1,
         )
         with self.assertRaises(AssertionError):
             validate(changed, self.required, self.release)
 
     def test_missing_affinity_fails(self):
         changed = self.nightly.replace(
-            "taskset -c 0 meson test -C build-perf --suite perf",
-            "meson test -C build-perf --suite perf",
+            "run-perf-nightly-linux.sh", "meson test --suite perf",
             1,
         )
         with self.assertRaises(AssertionError):

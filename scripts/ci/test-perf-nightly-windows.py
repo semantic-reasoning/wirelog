@@ -68,7 +68,11 @@ def validate(text: str) -> None:
     windows_matrix(text)
     bodies = {name: step(text, name) for name in (CONFIGURE, BUILD, TEST)}
     for name, body in bodies.items():
-        assert "        if: runner.os == 'Windows'\n" in body, name
+        if_line = next((line for line in body.splitlines()
+                        if line.startswith("        if: ")), "")
+        assert "runner.os == 'Windows'" in if_line, name
+        assert "!inputs.strict_smoke" in if_line, \
+            f"{name} must be omitted in the strict Linux smoke"
         assert "        shell: cmd\n" in body, name
         assert "vcvars" not in body, f"hardcoded activation in {name}"
 
