@@ -43,8 +43,11 @@ gate_block 1 crdt_perf_gate 1 \
     "$good_crdt" > "$tmp_dir/target-miss.log"
 gate_block 2 cspa_w1_gate 0 'test_cspa_perf_gate OK' "$good_cspa" >> "$tmp_dir/target-miss.log"
 if ! "$script_dir/check-nightly-crdt-cspa.sh" "$tmp_dir/target-miss.log" \
-    | grep -Fxq 'performance_verdict=fail'; then
+    > "$tmp_dir/target-miss.result"; then
     echo 'complete target-miss fixture did not preserve acquisition status' >&2; exit 1
+fi
+if ! grep -Fxq 'performance_verdict=fail' "$tmp_dir/target-miss.result"; then
+    echo 'complete target-miss fixture did not preserve performance verdict' >&2; exit 1
 fi
 
 gate_block 1 crdt_perf_gate 77 'test_crdt_perf_gate: SKIP: noisy' "$good_crdt" > "$tmp_dir/skip.log"
@@ -116,7 +119,8 @@ if "$script_dir/check-nightly-host-telemetry.sh" \
     "$tmp_dir/host-before" "$tmp_dir/host-after"; then
     echo 'throttled telemetry fixture unexpectedly passed' >&2; exit 1
 fi
-sed -i '/^governor=/d' "$tmp_dir/host-after"
+sed '/^governor=/d' "$tmp_dir/host-after" > "$tmp_dir/host-after.tmp"
+mv "$tmp_dir/host-after.tmp" "$tmp_dir/host-after"
 if "$script_dir/check-nightly-host-telemetry.sh" \
     "$tmp_dir/host-before" "$tmp_dir/host-after"; then
     echo 'missing telemetry fixture unexpectedly passed' >&2; exit 1
@@ -147,14 +151,23 @@ some avg10=0.00 avg60=0.00 avg300=0.00 total=1
 full avg10=0.00 avg60=0.00 avg300=0.00 total=1
 EOF
 write_kernel_cpu_stat() {
-    cat > "$tmp_dir/kernel-cpu.stat" <<EOF
-usage_usec 20
-user_usec 10
-system_usec 10
-nr_periods 2
-nr_throttled 0
-throttled_usec $1
-EOF
+    local throttled=$1 variant=${2:-valid}
+    printf 'usage_usec 20\n' > "$tmp_dir/kernel-cpu.stat"
+    printf 'user_usec 10\n' >> "$tmp_dir/kernel-cpu.stat"
+    printf 'system_usec 1\n' >> "$tmp_dir/kernel-cpu.stat"
+    printf 'nice_usec 0\n' >> "$tmp_dir/kernel-cpu.stat"
+    case $variant in
+        malformed_key) printf 'core-sched.force_idle_usec 0\n' >> "$tmp_dir/kernel-cpu.stat" ;;
+        malformed_value) printf 'core_sched.force_idle_usec invalid\n' >> "$tmp_dir/kernel-cpu.stat" ;;
+        *) printf 'core_sched.force_idle_usec 0\n' >> "$tmp_dir/kernel-cpu.stat" ;;
+    esac
+    printf 'nr_periods 2\n' >> "$tmp_dir/kernel-cpu.stat"
+    if [[ $variant != missing_required ]]; then
+        printf 'nr_throttled 0\n' >> "$tmp_dir/kernel-cpu.stat"
+    fi
+    printf 'throttled_usec %s\n' "$throttled" >> "$tmp_dir/kernel-cpu.stat"
+    printf 'nr_bursts 0\n' >> "$tmp_dir/kernel-cpu.stat"
+    printf 'burst_usec 0\n' >> "$tmp_dir/kernel-cpu.stat"
 }
 capture_fixture() {
     CPUFREQ_ROOT="$tmp_dir/cpufreq" CPU_PSI_PATH="$tmp_dir/psi" \
@@ -166,7 +179,7 @@ capture_fixture() {
 write_kernel_cpu_stat 15
 capture_fixture "$tmp_dir/captured-before"
 capture_fixture "$tmp_dir/captured-after"
-grep -Fxq 'cpu_stat=usage_usec=20 user_usec=10 system_usec=10 nr_periods=2 nr_throttled=0 throttled_usec=15' \
+grep -Fxq 'cpu_stat=usage_usec=20 user_usec=10 system_usec=1 nice_usec=0 core_sched.force_idle_usec=0 nr_periods=2 nr_throttled=0 throttled_usec=15 nr_bursts=0 burst_usec=0' \
     "$tmp_dir/captured-before"
 "$script_dir/check-nightly-host-telemetry.sh" \
     "$tmp_dir/captured-before" "$tmp_dir/captured-after"
@@ -176,16 +189,13 @@ if "$script_dir/check-nightly-host-telemetry.sh" \
     "$tmp_dir/captured-before" "$tmp_dir/captured-after-throttled"; then
     echo 'captured kernel throttling delta unexpectedly passed' >&2; exit 1
 fi
-printf 'usage_usec 20\n' > "$tmp_dir/kernel-cpu.stat"
-printf 'user_usec 10\n' >> "$tmp_dir/kernel-cpu.stat"
-printf 'system_usec invalid\n' >> "$tmp_dir/kernel-cpu.stat"
-printf 'nr_periods 2\n' >> "$tmp_dir/kernel-cpu.stat"
-printf 'nr_throttled 0\n' >> "$tmp_dir/kernel-cpu.stat"
-printf 'throttled_usec 15\n' >> "$tmp_dir/kernel-cpu.stat"
-capture_fixture "$tmp_dir/captured-malformed"
-if "$script_dir/check-nightly-host-telemetry.sh" \
-    "$tmp_dir/captured-before" "$tmp_dir/captured-malformed"; then
-    echo 'malformed captured kernel cpu.stat unexpectedly passed' >&2; exit 1
-fi
+for variant in malformed_key malformed_value missing_required; do
+    write_kernel_cpu_stat 15 "$variant"
+    capture_fixture "$tmp_dir/captured-$variant"
+    if "$script_dir/check-nightly-host-telemetry.sh" \
+        "$tmp_dir/captured-before" "$tmp_dir/captured-$variant"; then
+        echo "$variant captured kernel cpu.stat unexpectedly passed" >&2; exit 1
+    fi
+done
 
 echo 'nightly CRDT/CSPA checker fixtures: OK'
