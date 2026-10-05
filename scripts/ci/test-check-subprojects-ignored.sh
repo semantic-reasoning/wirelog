@@ -78,7 +78,6 @@ cases=0
 
 GOOD='subprojects/*
 !subprojects/*.wrap
-!subprojects/.wraplock
 !subprojects/packagefiles/'
 
 # strip_wraps / strip_tracked: post-build mutators for the floor cases. They
@@ -89,8 +88,7 @@ strip_wraps() {
 strip_tracked() {
     rm -f "$1"/subprojects/packagefiles/xxhash-0.8.4/LICENSE.build \
           "$1"/subprojects/packagefiles/xxhash-0.8.4/meson_options.txt \
-          "$1"/subprojects/packagefiles/xxhash-0.8.4/meson.build \
-          "$1"/subprojects/.wraplock
+          "$1"/subprojects/packagefiles/xxhash-0.8.4/meson.build
 }
 
 # fixture <name> <gitignore-rule> [extra-wrap-body] [mutator]
@@ -99,7 +97,6 @@ fixture() {
     local d="$work/$name"
     rm -rf "$d"
     mkdir -p "$d/subprojects/packagefiles/xxhash-0.8.4"
-    : >"$d/subprojects/.wraplock"
     printf '[wrap-file]\ndirectory = xxHash-0.8.4\n' >"$d/subprojects/xxhash.wrap"
     printf '[wrap-git]\nrevision = abc\n' >"$d/subprojects/nanoarrow.wrap"
     local f
@@ -125,6 +122,9 @@ fixture() {
     fixture_git -c init.templateDir="$work/notmpl" init -q >/dev/null 2>&1
     fixture_git add -A >/dev/null 2>&1
     fixture_git commit -qm fixture --no-verify >/dev/null 2>&1
+    # Meson's lock file appears per checkout, after the tracked inputs, and is
+    # never committed (#1898); create it the same way.
+    : >"$d/subprojects/.wraplock"
     printf '%s\n' "$rule" >"$d/.gitignore"
     printf '%s' "$d"
 }
@@ -179,27 +179,35 @@ says_not() {
 #    gate that fails on everything.
 expect good 0 "the deny-by-default rule passes" "$GOOD"
 
-# 2-4. Assertion A: each re-inclusion is load-bearing. A tracked path that the
+# 2-3. Assertion A: each re-inclusion is load-bearing. A tracked path that the
 #      rule swallows must fail, and `git add` would then refuse it by name
 #      while `git add -A` would drop it silently.
-expect no_wraplock 1 "a rule that swallows the tracked .wraplock fails" \
-    'subprojects/*
-!subprojects/*.wrap
-!subprojects/packagefiles/'
-says "tracked paths under subprojects/ are ignored" "the tracked-side failure is named"
-# Positive and negative together. says_not alone passes trivially on an empty
-# list, so deleting the whole culprit pipeline read exactly like a working
-# filter -- the same "absence proves nothing" shape the gate itself guards.
-says "subprojects/.wraplock" "the culprit is named in the diagnostic"
-says_not "!subprojects/*.wrap" "correctly-visible paths are not listed as culprits"
 expect no_wrap_reinclude 1 "a rule that swallows the tracked wrap files fails" \
     'subprojects/*
-!subprojects/.wraplock
 !subprojects/packagefiles/'
+says "tracked paths under subprojects/ are ignored" "the tracked-side failure is named"
+says "subprojects/xxhash.wrap" "the culprit is named in the diagnostic"
+# This case's -v output mixes culprit rows (subprojects/* swallowing the
+# packagefiles) with negation rows (!subprojects/*.wrap matching the wraps), so
+# it is the one where dropping the negation filter would list a visible path.
+# Positive and negative together: says_not alone passes trivially on an empty
+# list, so deleting the whole culprit pipeline read exactly like a working
+# filter -- the same "absence proves nothing" shape the gate itself guards.
 expect no_packagefiles 1 "a rule that swallows tracked packagefiles/ fails" \
     'subprojects/*
-!subprojects/*.wrap
-!subprojects/.wraplock'
+!subprojects/*.wrap'
+says "subprojects/packagefiles/xxhash-0.8.4/meson.build" "the swallowed packagefiles are named"
+says_not "subprojects/xxhash.wrap" "correctly-visible paths are not listed as culprits"
+
+# 4. Assertion B's lock probe. Meson's lock file is created in every checkout
+#    and must stay ignored (#1898). Re-including it -- the rule this
+#    repository carried until #1898 -- leaves assertion A nothing to catch,
+#    since no tracked path is ignored, and only the lock probe fails.
+expect wraplock_reincluded 1 "a rule that re-includes meson's .wraplock fails" \
+    "$GOOD
+!subprojects/.wraplock"
+says "meson creates subprojects/.wraplock but .gitignore does not ignore it" \
+    "the lock-file failure is named"
 
 # 5. Assertion C, and THE case for this issue. Every directory that exists
 #    today is named, so assertions A and B are satisfied -- this is exactly the
@@ -208,6 +216,7 @@ expect no_packagefiles 1 "a rule that swallows tracked packagefiles/ fails" \
 expect version_pinned 1 "a rule naming today's directories one by one fails" \
     'subprojects/xxHash-0.8.4/
 subprojects/packagecache/
+subprojects/.wraplock
 subprojects/nanoarrow/
 subprojects/xxhash/'
 says "rule names particular directories" "the version-pinned rule is named as such"
@@ -217,6 +226,7 @@ says "rule names particular directories" "the version-pinned rule is named as su
 expect new_wrap 1 "a wrap whose directory is not ignored fails" \
     'subprojects/xxHash-0.8.4/
 subprojects/packagecache/
+subprojects/.wraplock
 subprojects/nanoarrow/
 subprojects/xxhash/
 subprojects/extra/
@@ -230,7 +240,6 @@ says "but .gitignore does not ignore it" "the unignored extraction directory is 
 expect no_packagecache 1 "an unignored packagecache fails" \
     'subprojects/*
 !subprojects/*.wrap
-!subprojects/.wraplock
 !subprojects/packagefiles/
 !subprojects/packagecache/'
 
@@ -241,6 +250,7 @@ expect no_packagecache 1 "an unignored packagecache fails" \
 expect capital_key 1 "a Directory = key is read, not skipped" \
     'subprojects/xxHash-0.8.4/
 subprojects/packagecache/
+subprojects/.wraplock
 subprojects/nanoarrow/
 subprojects/xxhash/
 subprojects/extra/
@@ -255,6 +265,7 @@ says "subprojects/NotIgnored" "the capitalised key's value is the one reported"
 expect wrap_name 1 "a wrap name that is not ignored fails" \
     'subprojects/xxHash-0.8.4/
 subprojects/packagecache/
+subprojects/.wraplock
 subprojects/xxhash/
 subprojects/zz-extraction-probe/'
 says "subprojects/nanoarrow" "the unignored wrap name is the one reported"
@@ -276,6 +287,7 @@ says "expected at least 3" "the tracked-path floor is named, not the wraps floor
 expect colon_delim 1 "a directory: key is read, not skipped" \
     'subprojects/xxHash-0.8.4/
 subprojects/packagecache/
+subprojects/.wraplock
 subprojects/nanoarrow/
 subprojects/xxhash/
 subprojects/extra/
