@@ -6840,6 +6840,9 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             col_rel_t *r = session_find_rel(coord, sp->relations[ri].name);
             if (r && r->nrows > 0) {
                 rc = tdd_reset_coord_relation(r);
+                /* Issue #1994: keep the relation's own input rows. */
+                if (rc == 0)
+                    rc = wl_columnar_session_restore_seed(coord, r);
                 if (rc != 0) {
                     coord->tdd_total_ns += now_ns() - tdd_total_t0;
                     return rc;

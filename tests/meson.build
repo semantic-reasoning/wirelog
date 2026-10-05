@@ -5754,6 +5754,18 @@ test_extension_replay_exe = executable(
 
 test('extension_replay', test_extension_replay_exe)
 
+# Issue #1994: a session stepped without a delta callback must hold exactly
+# the current model -- no copy per step, no residue after a retraction.
+test_easy_plain_step_exe = executable(
+  'test_easy_plain_step',
+  files('test_easy_plain_step.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+
+test('easy_plain_step', test_easy_plain_step_exe)
+
 # ============================================================================
 # I/O Context Accessor Tests (#452)
 # ============================================================================

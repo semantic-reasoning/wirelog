@@ -21,12 +21,12 @@
  * docs/SEMANTICS.md.  If you change the engine on purpose, update these
  * numbers and re-read that section to check it still holds.
  *
- * Every case installs a delta callback and drives the session with
- * wirelog_easy_step().  Without a delta callback the addon runs once per
- * derived row on every step, including steps with nothing pending, but that
- * count is unspecified and a stepped session has no non-perturbing way to
- * observe anything through this API, so it is deliberately not pinned here:
- * pinning it would freeze behavior nobody has characterised.  Issue #1994.
+ * Every case drives the session with wirelog_easy_step(), and all but two
+ * of them, named below, do so with a delta callback installed throughout.
+ * test_plain_step_rederives_every_rule drives the same rule with no
+ * callback (Issue #1994): there a step with pending input re-derives every
+ * rule in full and an idle step does nothing.  The second-to-last case
+ * removes its callback before a step that fails.
  */
 
 #include "wirelog/wirelog-easy.h"
@@ -77,10 +77,9 @@ typedef struct {
     int32_t diff;
 } event_t;
 
-/* Host-side z-set mirror of a derived relation, rebuilt from the deltas.
- * wirelog_easy_snapshot() is itself an evaluating call and must not follow
- * wirelog_easy_step() on the same session, so the deltas are the only
- * non-perturbing way to observe what the engine published. */
+/* Host-side z-set mirror of a derived relation, rebuilt from the deltas,
+ * so the delta-callback cases check what the engine published rather than
+ * what it holds. */
 typedef struct {
     int64_t col[MAX_ROWS][2];
     int32_t mult[MAX_ROWS];
@@ -181,6 +180,18 @@ stable_action(const wirelog_extension_value_t *args, uint32_t nargs,
     return 0;
 }
 
+/* Stable addon that fails while flaky_fail is set. */
+static int flaky_fail;
+
+static int
+flaky_action(const wirelog_extension_value_t *args, uint32_t nargs,
+    wirelog_extension_value_t *result, void *user_data)
+{
+    if (flaky_fail)
+        return -1;
+    return stable_action(args, nargs, result, user_data);
+}
+
 /* Unstable addon: a fresh value on every invocation, which is what a host
  * handing out tickets does.  Declares no PURE or DETERMINISTIC bit, and
  * nothing in the engine asks for one. */
@@ -223,6 +234,18 @@ static const char *const JOIN_PROGRAM =
     "started(id, @call(\"replay.action\", id)) :- ready(id),"
     " enabled(id).\n";
 
+/* REPLAY_PROGRAM's call site beside a recursive rule head the host also
+ * writes into.  `reach` shares no relation with `started`. */
+static const char *const REACH_PROGRAM =
+    ".decl ready(id: int64)\n"
+    ".decl started(id: int64, ticket: int64)\n"
+    ".decl src(x: int64)\n"
+    ".decl edge(a: int64, b: int64)\n"
+    ".decl reach(x: int64)\n"
+    "started(id, @call(\"replay.action\", id)) :- ready(id).\n"
+    "reach(x) :- src(x).\n"
+    "reach(y) :- reach(x), edge(x, y).\n";
+
 typedef struct {
     wirelog_extension_registry_t *registry;
     wirelog_extension_snapshot_t *snapshot;
@@ -232,7 +255,7 @@ typedef struct {
 static char message[256];
 
 static const char *
-fixture_open(fixture_t *fx, const char *program, uint32_t policy,
+fixture_open_plain(fixture_t *fx, const char *program, uint32_t policy,
     wirelog_extension_scalar_fn fn)
 {
     uint32_t types[] = { WIRELOG_EXTENSION_VALUE_INT64 };
@@ -273,6 +296,16 @@ fixture_open(fixture_t *fx, const char *program, uint32_t policy,
         snprintf(message, sizeof(message), "open_opts returned %d", (int)rc);
         return message;
     }
+    return NULL;
+}
+
+static const char *
+fixture_open(fixture_t *fx, const char *program, uint32_t policy,
+    wirelog_extension_scalar_fn fn)
+{
+    const char *why = fixture_open_plain(fx, program, policy, fn);
+    if (why)
+        return why;
     if (wirelog_easy_set_delta_cb(fx->session, on_delta, NULL) != WIRELOG_OK)
         return "set_delta_cb";
     return NULL;
@@ -380,6 +413,32 @@ expect_one_event(const char *relation, int64_t a, int64_t b, int32_t diff,
         return message;
     }
     return NULL;
+}
+
+/* Counts the `started` rows a snapshot emits, each of which must carry the
+ * stable addon's value for its id.  A repeated row counts twice. */
+static void
+on_started_row(const char *relation, const int64_t *row, uint32_t ncols,
+    void *user_data)
+{
+    unsigned *rows = (unsigned *)user_data;
+    (void)relation;
+    if (ncols == 2 && row[1] == row[0] * 10)
+        (*rows)++;
+    else
+        *rows += 1000; /* a malformed row can never read as a match */
+}
+
+static const char *
+expect_snapshot(fixture_t *fx, unsigned want, const char *what)
+{
+    unsigned rows = 0;
+    if (wirelog_easy_snapshot(fx->session, "started", on_started_row, &rows)
+        != WIRELOG_OK) {
+        snprintf(message, sizeof(message), "%s: snapshot failed", what);
+        return message;
+    }
+    return expect_count(rows, want, what);
 }
 
 /* ======================================================================== */
@@ -801,6 +860,206 @@ test_selective_body_narrows_the_count(void)
         PASS();
 }
 
+/* Issue #1994: the same rule with no delta callback.  A step with pending
+ * input re-derives every rule in full -- a host insert or removal without a
+ * callback is not incremental -- so the count follows the derivation of
+ * every rule, including one the mutation does not reach.  A step with
+ * nothing pending does no work at all.  The snapshots read the stable model
+ * a completed step leaves behind: with nothing pending they do not evaluate,
+ * which the unchanged invocation counter around them proves. */
+static void
+test_plain_step_rederives_every_rule(void)
+{
+    static const int64_t loaded[] = { 1, 2, 3, 4, 5 };
+    static const int64_t survivors[] = { 2, 3, 4, 5 };
+    fixture_t fx;
+    const char *why;
+    unsigned n = 0;
+    unsigned before;
+    int64_t value;
+
+    TEST("without a delta callback only steps with pending input invoke");
+    calls = 0;
+    why = fixture_open_plain(&fx, REPLAY_PROGRAM,
+            WIRELOG_EXTENSION_CALLBACK_THREAD_SAFE, stable_action);
+    for (unsigned i = 0; !why && i < 5; i++) {
+        value = (int64_t)(i + 1);
+        if (wirelog_easy_insert(fx.session, "ready", &value, 1)
+            != WIRELOG_OK)
+            why = "insert ready";
+    }
+    if (!why)
+        why = step_once(&fx, &n);
+    if (!why)
+        why = expect_count(n, 5, "load");
+    if (!why)
+        why = expect_args(loaded, 5, "load args");
+    for (unsigned i = 0; !why && i < 3; i++) {
+        why = step_once(&fx, &n);
+        if (!why)
+            why = expect_count(n, 0, "idle step");
+    }
+    before = calls;
+    if (!why)
+        why = expect_snapshot(&fx, 5, "after idle steps");
+    if (!why)
+        why = expect_count(calls - before, 0, "stable snapshot");
+
+    value = 7;
+    if (!why && wirelog_easy_insert(fx.session, "other", &value, 1)
+        != WIRELOG_OK)
+        why = "insert other";
+    if (!why)
+        why = step_once(&fx, &n);
+    if (!why)
+        why = expect_count(n, 5, "insert into an unread relation");
+
+    value = 1;
+    if (!why && wirelog_easy_remove(fx.session, "ready", &value, 1)
+        != WIRELOG_OK)
+        why = "remove ready";
+    if (!why)
+        why = step_once(&fx, &n);
+    if (!why)
+        why = expect_count(n, 4, "retraction with four survivors");
+    if (!why)
+        why = expect_args(survivors, 4, "retraction args");
+    before = calls;
+    if (!why)
+        why = expect_snapshot(&fx, 4, "after retraction");
+    if (!why)
+        why = expect_count(calls - before, 0, "stable snapshot");
+    if (!why)
+        why = expect_count(calls, 14, "total invocations");
+    {
+        const char *teardown = fixture_close(&fx);
+        if (!why)
+            why = teardown;
+    }
+    if (why)
+        FAIL(why);
+    else
+        PASS();
+}
+
+/* Issue #1994: a plain step discards the derived relations before it
+ * re-derives them.  If it then fails, nothing it discarded may stay lost:
+ * the next evaluation must still be a full one.  The pending insert below
+ * is staged with a callback installed, so on its own it would let a
+ * snapshot evaluate only the stratum it reaches. */
+static void
+test_failed_plain_step_leaves_a_full_evaluation_pending(void)
+{
+    fixture_t fx;
+    const char *why;
+    unsigned n = 0;
+    int64_t value;
+
+    TEST("a plain step that fails after discarding still re-derives later");
+    calls = 0;
+    flaky_fail = 0;
+    why = fixture_open(&fx, REPLAY_PROGRAM,
+            WIRELOG_EXTENSION_CALLBACK_THREAD_SAFE, flaky_action);
+    for (unsigned i = 0; !why && i < 3; i++) {
+        value = (int64_t)(i + 1);
+        if (wirelog_easy_insert(fx.session, "ready", &value, 1)
+            != WIRELOG_OK)
+            why = "insert ready";
+    }
+    if (!why)
+        why = step_once(&fx, &n);
+    if (!why)
+        why = expect_count(n, 3, "load");
+    value = 7;
+    if (!why && wirelog_easy_insert(fx.session, "other", &value, 1)
+        != WIRELOG_OK)
+        why = "insert other";
+    if (!why && wirelog_easy_set_delta_cb(fx.session, NULL, NULL)
+        != WIRELOG_OK)
+        why = "clear delta_cb";
+    if (!why) {
+        flaky_fail = 1;
+        if (wirelog_easy_step(fx.session) == WIRELOG_OK)
+            why = "a step whose addon fails reported success";
+        flaky_fail = 0;
+    }
+    if (!why)
+        why = expect_snapshot(&fx, 3, "snapshot after the failed step");
+    if (!why)
+        why = step_once(&fx, &n);
+    if (!why)
+        why = expect_snapshot(&fx, 3, "idle step after the snapshot");
+    {
+        const char *teardown = fixture_close(&fx);
+        if (!why)
+            why = teardown;
+    }
+    if (why)
+        FAIL(why);
+    else
+        PASS();
+}
+
+/* Issue #1994: removing a host row from a rule head also removes it from the
+ * head's input record.  When the relation no longer holds the row -- a
+ * delta-callback step can drop it -- the model does not change, so the next
+ * step must leave a rule in another stratum alone. */
+static void
+test_input_only_removal_leaves_other_rules_alone(void)
+{
+    fixture_t fx;
+    const char *why;
+    unsigned n = 0;
+    int64_t value;
+    int64_t edge[2] = { 1, 2 };
+
+    TEST("removing input the model already lacks re-runs no other rule");
+    calls = 0;
+    why = fixture_open(&fx, REACH_PROGRAM,
+            WIRELOG_EXTENSION_CALLBACK_THREAD_SAFE, stable_action);
+    for (unsigned i = 0; !why && i < 3; i++) {
+        value = (int64_t)(i + 1);
+        if (wirelog_easy_insert(fx.session, "ready", &value, 1)
+            != WIRELOG_OK)
+            why = "insert ready";
+    }
+    value = 1;
+    if (!why && (wirelog_easy_insert(fx.session, "src", &value, 1)
+        != WIRELOG_OK
+        || wirelog_easy_insert(fx.session, "edge", edge, 2) != WIRELOG_OK))
+        why = "insert reach inputs";
+    if (!why)
+        why = step_once(&fx, &n);
+    if (!why)
+        why = expect_count(n, 3, "load");
+    value = 7;
+    if (!why && wirelog_easy_insert(fx.session, "reach", &value, 1)
+        != WIRELOG_OK)
+        why = "insert reach(7)";
+    if (!why)
+        why = step_once(&fx, &n);
+    if (!why)
+        why = expect_count(n, 0, "insert into the other stratum");
+    if (!why && wirelog_easy_remove(fx.session, "reach", &value, 1)
+        != WIRELOG_OK)
+        why = "remove reach(7)";
+    if (!why)
+        why = step_once(&fx, &n);
+    if (!why)
+        why = expect_count(n, 0, "removal the model already reflects");
+    if (!why)
+        why = expect_count(nevents, 0, "events for that removal");
+    {
+        const char *teardown = fixture_close(&fx);
+        if (!why)
+            why = teardown;
+    }
+    if (why)
+        FAIL(why);
+    else
+        PASS();
+}
+
 int
 main(void)
 {
@@ -811,6 +1070,9 @@ main(void)
     test_selective_body_narrows_the_count();
     test_purity_bits_do_not_change_the_count();
     test_unstable_value_republishes_unchanged_rows();
+    test_plain_step_rederives_every_rule();
+    test_failed_plain_step_leaves_a_full_evaluation_pending();
+    test_input_only_removal_leaves_other_rules_alone();
 
     printf("\n");
     printf("Passed: %d/%d\n", tests_passed, tests_run);

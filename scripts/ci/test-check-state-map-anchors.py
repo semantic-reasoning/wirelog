@@ -399,9 +399,11 @@ def main() -> int:
         # The attribution check, read column: a function that exists, is
         # uniquely defined, and never touches the field beside it.
         row_edit("a real function that never reads the field fails",
-                 "| `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`,",
+                 "| `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`,"
+                 " `col_session_step_impl`, `session_note_inserted_input` |",
                  "| `arr_build_full`, `col_eval_stratum_tdd_recursive`,"
-                 " `col_session_snapshot_impl`,")
+                 " `col_session_snapshot_impl`, `col_session_step_impl`,"
+                 " `session_note_inserted_input` |")
 
         # The same for the write column, so `writes()` is not free to be
         # `return True` at this level either.

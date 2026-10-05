@@ -87,11 +87,15 @@ engine decides that at stratum granularity rather than per rule --
 reaches a particular rule is a property of how the program stratifies, and
 mutating a relation the rule does not read is not on its own a guarantee.
 
-How many invocations a session performs under other configurations differs and
-is not specified here; issue #1994 tracks the one difference that is known.
-Choosing a configuration for its invocation count would rest on something a
-release may change, so a host should not do it -- and a delta callback is
-installed because the host wants deltas, not as a tuning knob.
+Without a delta callback, `wirelog_easy_step` is not incremental (#1994). A
+step with an insert or removal pending since the last step or snapshot that
+evaluated discards the derived rows and re-derives every rule, so the addon
+callback runs once for every row its rule then derives, whether or not the
+mutation reaches that rule. A step with nothing pending derives nothing and
+invokes nothing. Other configurations are not specified here. Choosing a
+configuration for its invocation count would rest on something a release may
+change, so a host should not do it -- and a delta callback is installed because
+the host wants deltas, not as a tuning knob.
 
 The delta stream carries the set difference, so a re-derivation that
 reproduces a row publishes nothing. Inserting a sixth row into a five-row
@@ -840,7 +844,7 @@ an earlier revision summarised it here and got it wrong within one round.
 | `last_inserted_relation` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create`, `session_note_inserted_input` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | PRESERVE |
 | `pending_input_change` | `col_session_create_internal`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
 | `pending_full_input_eval` | `col_session_insert`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
-| `has_evaluated` | `col_session_snapshot_impl`, `col_session_step_impl` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl` | PRESERVE |
+| `has_evaluated` | `col_session_snapshot_impl`, `col_session_step_impl` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
 | `snapshot_stable_valid` | `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl` | PRESERVE |
 | `delta_seeded` | `col_session_snapshot_impl`, `tdd_worker_subpass_fn` | `col_op_variable`, `col_session_snapshot_impl`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_eval_tdd_plan_prepare_inputs` | PRESERVE |
 | `last_removed_relation` | `col_session_remove_incremental`, `col_session_step_impl`, `col_worker_session_create` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
@@ -849,7 +853,7 @@ an earlier revision summarised it here and got it wrong within one round.
 | `plain_step_completion_phase` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE |
 | `plain_step_completion_step_context` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl` | PRESERVE |
 | `plain_step_completion_active` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_snapshot_impl`, `col_session_step_impl` | **COMMIT** on the step path -- a re-entrancy latch, not progress. While it stays set beside `plain_step_completion_pending`, the entry guard of both `col_session_step_impl` and `col_session_snapshot_impl` returns `EBUSY` above every line that would clear it. The snapshot path never writes it, so the snapshot cutoff has nothing to perform here. |
-| `col_rel_t::base_nrows` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_reset_rows_locked`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `tdd_empty_relation_candidate`, `tdd_seed_bdx_coordinator_idb`, `wl_columnar_eval_serial_canonicalize_aggregate_locked`, `wl_retraction_restore` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_mutable_image_validate`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_stratum_step_retraction_nonrecursive`, `wl_retraction_stage_prepare` | PRESERVE -- the snapshot delta pre-seed skips a relation whose `base_nrows` is zero or whose `nrows <= base_nrows`, so committing the bookkeeping's `base_nrows = nrows` changes what the next attempt pre-seeds, including whether it pre-seeds at all. That is the whole verified consequence; see the note below before adding another |
+| `col_rel_t::base_nrows` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_reset_rows_locked`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `session_seed_shadow_truncate`, `tdd_empty_relation_candidate`, `tdd_seed_bdx_coordinator_idb`, `wl_columnar_eval_serial_canonicalize_aggregate_locked`, `wl_retraction_restore` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_mutable_image_validate`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_stratum_step_retraction_nonrecursive`, `session_seed_shadow_truncate`, `wl_retraction_stage_prepare` | PRESERVE -- the snapshot delta pre-seed skips a relation whose `base_nrows` is zero or whose `nrows <= base_nrows`, so committing the bookkeeping's `base_nrows = nrows` changes what the next attempt pre-seeds, including whether it pre-seeds at all. That is the whole verified consequence; see the note below before adding another |
 
 Two non-field actions sit in the same region and need their own verdicts.
 `col_session_reclaim_quiescent` is **COMMIT**: the step cutoff's unwind calls
