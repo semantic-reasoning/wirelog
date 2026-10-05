@@ -1207,9 +1207,10 @@ test('program_lifetime_selftest', py3,
 # the Windows runner -- so the rule covers every suite.
 sh = find_program('bash', required: false)
 if sh.found()
+  # Windows measured 31.57s; 120s leaves a 60s budget under the 50% walltime gate.
   test('nightly_crdt_cspa_evidence_contract', sh,
        args: [meson.project_source_root() / 'scripts/ci/test-nightly-crdt-cspa.sh'],
-       suite: 'abi', timeout: 60)
+       suite: 'abi', timeout: 120)
 endif
 
 if sh.found() and host_machine.system() != 'windows'

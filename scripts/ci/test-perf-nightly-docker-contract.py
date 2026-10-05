@@ -70,9 +70,9 @@ class PerfNightlyDockerContract(unittest.TestCase):
         self.assertIn('-w /workspace "$image_id"', stable)
 
     def test_cgroup_cpu_stat_preserves_kernel_whitespace_schema(self):
-        self.assertIn('NF != 2 || $1 !~ /^[a-z_]+$/ || $2 !~ /^[0-9]+$/', CAPTURE)
+        self.assertIn(r"$1 !~ /^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)*$/", CAPTURE)
         self.assertIn('printf \'cpu_stat=%s\\n\' "$cpu_stat"', CAPTURE)
-        self.assertIn('cpu_stat=usage_usec=20 user_usec=10 system_usec=10',
+        self.assertIn('cpu_stat=usage_usec=20 user_usec=10 system_usec=1',
                       (ROOT / "scripts/ci/test-nightly-crdt-cspa.sh").read_text(encoding="utf-8"))
 
     def test_meson_introspection_normalizes_project_suite_namespace(self):

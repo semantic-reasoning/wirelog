@@ -24,7 +24,8 @@ taskset_bin=${TASKSET_BIN:-taskset}
     printf 'cpuinfo_cur_freq=%s\n' "$(cat "$cpufreq/cpuinfo_cur_freq" 2>/dev/null || echo unavailable)"
     printf 'psi_cpu=%s\n' "$(tr '\n' ';' < "$psi" 2>/dev/null || echo unavailable)"
     cpu_stat=$(awk '
-        NF != 2 || $1 !~ /^[a-z_]+$/ || $2 !~ /^[0-9]+$/ { bad = 1; next }
+        NF != 2 || $1 !~ /^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)*$/ \
+            || $2 !~ /^[0-9]+$/ { bad = 1; next }
         { printf "%s%s=%s", separator, $1, $2; separator = " " }
         END { if (bad || separator == "") exit 1; print "" }
     ' "$cgroup" 2>/dev/null) || cpu_stat=unavailable
