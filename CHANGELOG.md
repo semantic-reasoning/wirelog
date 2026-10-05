@@ -19,6 +19,17 @@ All notable changes to wirelog are documented in this file.
 
 ### Changed
 
+- **Bounded join pipelines consume expression MAPs** (#1777): with
+  `WIRELOG_JOIN_BATCH_BYTES` set, a `JOIN -> FILTER* -> MAP` pipeline
+  whose MAP computes integer or float arithmetic or comparisons is now
+  evaluated batch by batch instead of materializing the whole join first;
+  previously only projection MAPs qualified.  String, digest, UUID,
+  aggregate and extension expressions still fall back to the one-shot
+  join (`ENOTSUP` under `WIRELOG_JOIN_BATCH_STRICT=1`).  A FILTER or MAP
+  failure inside the pipeline now returns that operator's errno -- for
+  MAP, `ERANGE` for an expression error and `ENOSPC` for a denied
+  admission -- where every such failure previously became `ENOMEM`.
+
 - **Bounded join scratch is sized lazily** (#1481):
   `col_join_batch_producer_create` reserved `WIRELOG_JOIN_BATCH_BYTES /
   row_bytes` rows of governed scratch at create, whatever the join's

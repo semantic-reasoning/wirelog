@@ -2069,6 +2069,7 @@ test_join_pipeline_exe = executable(
   'test_join_pipeline',
   files('test_join_pipeline.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],
 )

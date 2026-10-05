@@ -6,9 +6,13 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Row-local numeric bytecode: variables, literals and comparisons, a pure
+ * function of the current row that reads no intern, extension or session
+ * state.  MAP (Issue #1777) also admits integer and float arithmetic, whose
+ * checked failures surface as the ordinary MAP's ERANGE; FILTER does not. */
 static bool
-wl_columnar_join_pipeline_filter_is_row_local(
-    const wl_plan_expr_buffer_t *expr)
+wl_columnar_join_pipeline_expr_is_row_local(
+    const wl_plan_expr_buffer_t *expr, bool allow_arithmetic)
 {
     const uint8_t *data;
     uint32_t pos = 0;
@@ -63,10 +67,32 @@ wl_columnar_join_pipeline_filter_is_row_local(
                 return false;
             depth--;
             break;
+        case WL_PLAN_EXPR_ARITH_ADD:
+        case WL_PLAN_EXPR_ARITH_SUB:
+        case WL_PLAN_EXPR_ARITH_MUL:
+        case WL_PLAN_EXPR_ARITH_DIV:
+        case WL_PLAN_EXPR_ARITH_MOD:
+        case WL_PLAN_EXPR_ARITH_BAND:
+        case WL_PLAN_EXPR_ARITH_BOR:
+        case WL_PLAN_EXPR_ARITH_BXOR:
+        case WL_PLAN_EXPR_ARITH_SHL:
+        case WL_PLAN_EXPR_ARITH_SHR:
+        case WL_PLAN_EXPR_ARITH_FLOAT_ADD:
+        case WL_PLAN_EXPR_ARITH_FLOAT_SUB:
+        case WL_PLAN_EXPR_ARITH_FLOAT_MUL:
+        case WL_PLAN_EXPR_ARITH_FLOAT_DIV:
+            if (!allow_arithmetic || depth < 2u)
+                return false;
+            depth--;
+            break;
+        case WL_PLAN_EXPR_ARITH_BNOT:
+            if (!allow_arithmetic || depth < 1u)
+                return false;
+            break;
         default:
-            /* Strings, arithmetic, aggregates, extensions and unknown tags
-             * stay on the materialized path until their batch contract is
-             * specified. */
+            /* Strings, digests, UUIDs, aggregates, extensions and unknown
+             * tags stay on the materialized path until their batch contract
+             * is specified. */
             return false;
         }
     }
@@ -101,8 +127,8 @@ wl_columnar_join_pipeline_preflight(const wl_plan_relation_t *plan,
     while (i < plan->op_count && plan->ops[i].op == WL_PLAN_OP_FILTER) {
         if (plan->ops[i].materialized)
             return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_FILTER;
-        if (!wl_columnar_join_pipeline_filter_is_row_local(
-                &plan->ops[i].filter_expr))
+        if (!wl_columnar_join_pipeline_expr_is_row_local(
+                &plan->ops[i].filter_expr, false))
             return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_FILTER;
         i++;
     }
@@ -110,10 +136,22 @@ wl_columnar_join_pipeline_preflight(const wl_plan_relation_t *plan,
         return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_SHAPE;
 
     map = &plan->ops[i];
-    if (map->map_expr_count != 0 || map->map_exprs != NULL
-        || map->project_count == 0 || !map->project_indices
-        || map->materialized)
+    if (map->project_count == 0 || map->materialized)
         return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_MAP;
+    if (map->map_expr_count == 0) {
+        if (map->map_exprs != NULL || !map->project_indices)
+            return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_MAP;
+    } else {
+        if (!map->map_exprs)
+            return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_MAP;
+        /* An empty slot projects its column, as in col_op_map(). */
+        for (uint32_t c = 0; c < map->map_expr_count; c++) {
+            const wl_plan_expr_buffer_t *expr = &map->map_exprs[c];
+            if ((expr->data && expr->size > 0)
+                && !wl_columnar_join_pipeline_expr_is_row_local(expr, true))
+                return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_MAP;
+        }
+    }
 
     if (map_index)
         *map_index = i;
@@ -144,6 +182,7 @@ typedef struct {
     uint32_t map_index;
     col_rel_t *out;
     uint32_t pending_begin;
+    int error; /* errno of a failed FILTER/MAP, reported unchanged */
     bool begun;
 } wl_join_pipeline_sink_t;
 
@@ -204,13 +243,16 @@ pipeline_sink_append(void *context,
 
     eval_stack_init(&batch_stack);
     rc = eval_stack_push(&batch_stack, (col_rel_t *)batch->payload, false);
-    if (rc != 0)
+    if (rc != 0) {
+        sink->error = rc;
         return WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
+    }
     for (uint32_t i = sink->first_filter; i < sink->map_index; i++) {
         rc = wl_columnar_filter_op(&sink->plan->ops[i], &batch_stack,
                 sink->sess);
         if (rc != 0) {
             (void)eval_stack_drain(&batch_stack);
+            sink->error = rc;
             return WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
         }
     }
@@ -218,6 +260,7 @@ pipeline_sink_append(void *context,
             sink->sess);
     if (rc != 0) {
         (void)eval_stack_drain(&batch_stack);
+        sink->error = rc;
         return WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
     }
     rc = eval_stack_pop_relation(&batch_stack, &result);
@@ -398,7 +441,14 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
             col_rel_destroy(out);
             if (eval_stack_repush_entry(stack, &left_entry) != 0)
                 return EFAULT;
-            return status == WL_COLUMNAR_CONTINUATION_STALE ? EAGAIN : ENOMEM;
+            if (status == WL_COLUMNAR_CONTINUATION_STALE)
+                return EAGAIN;
+            /* A FILTER/MAP failure keeps the operator's own errno (for
+             * MAP, ERANGE for an expression error and ENOSPC for a denied
+             * admission) instead of collapsing into ENOMEM.  An errno the
+             * caller treats as a fallback (EAGAIN, ENOENT, ENOTSUP) re-runs
+             * the restored input on the one-shot path. */
+            return sink_ctx.error != 0 ? sink_ctx.error : ENOMEM;
         }
         if (col_join_output_limit_reached(sess, out)) {
             wl_columnar_continuation_cancel(continuation);

@@ -1219,8 +1219,22 @@ join; the session records the fallback count and last reason and logs one
 `JOIN` warning per reason.  `WIRELOG_JOIN_BATCH_STRICT=1` (ignored unless
 the bytes knob is set) turns a fallback into an `ENOTSUP` failure, which is
 the explicit bounded-mode result for unsupported shapes.  Differential
-keyed joins have the separate producer described below; pipeline consumption
-of batches on the eval stack (JOIN -> FILTER* -> MAP) remains #1475.
+keyed joins have the separate producer described below.
+
+A non-differential eligible join followed by `FILTER* -> MAP` is consumed
+batch by batch on the eval stack (#1475), so the full join intermediate is
+not materialized while the pipeline runs: each batch is filtered and mapped
+into one output relation, which is published only after the last batch.  The
+FILTERs may use only numeric variables, numeric and boolean literals, and
+comparisons.  The MAP may project columns or evaluate numeric expressions --
+integer and float arithmetic and comparisons (#1777).  A MAP with a string,
+digest, UUID, aggregate or extension expression is not consumed; those have
+no batch contract yet.  A JOIN whose downstream operators are not
+consumable, or whose input goes stale mid-stream, falls back to the one-shot
+join with reason `pipeline-not-consumable` (`ENOTSUP` under
+`WIRELOG_JOIN_BATCH_STRICT=1`).  A FILTER or MAP failure inside the pipeline
+returns that operator's errno -- for MAP, `ERANGE` for a failed expression
+and `ENOSPC` for a denied admission -- and publishes no rows.
 
 Ownership and admission:
 
