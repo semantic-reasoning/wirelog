@@ -14,9 +14,11 @@ typedef enum {
     WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_MAP,
 } wl_columnar_join_pipeline_eligibility_t;
 
-/* Conservative preflight for the first continuation consumer.  Projection
- * MAPs are row-local without consulting intern or extension/session state;
- * expression MAPs remain excluded until their transactional sink exists. */
+/* Conservative preflight for the continuation consumer.  Projection MAPs
+ * and numeric expression MAPs (Issue #1777) are row-local without consulting
+ * intern or extension/session state; string, digest, UUID, aggregate and
+ * extension expressions remain excluded until their ownership and retry
+ * contracts are defined. */
 wl_columnar_join_pipeline_eligibility_t
 wl_columnar_join_pipeline_preflight(const wl_plan_relation_t *plan,
     uint32_t join_index, const wl_col_session_t *sess, uint32_t *map_index);
@@ -25,7 +27,7 @@ const char *
 wl_columnar_join_pipeline_eligibility_name(
     wl_columnar_join_pipeline_eligibility_t reason);
 
-/* Consume an eligible JOIN -> FILTER* -> projection MAP pipeline directly
+/* Consume an eligible JOIN -> FILTER* -> MAP pipeline directly
  * from a bounded join continuation.  Returns 0 when the shape is not
  * eligible, 1 when the pipeline was evaluated and pushed, or an errno value
  * when an eligible pipeline could not be completed.  The caller may then
