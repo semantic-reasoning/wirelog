@@ -2352,12 +2352,23 @@ typedef struct wl_col_session_t {
      * reused. The report flag prevents retry from double-counting metrics. */
     bool teardown_started;
     bool teardown_reported;
+    /* Issue #1994: identities of relations a host insert found to be no
+     * rule head, direct-mapped by identity, so inserts into input relations
+     * skip the seed-shadow lookup.  Rule-head membership is fixed by the
+     * plan, and relation identities are never reused, so an entry cannot go
+     * stale; a collision only costs a lookup. */
+    uint64_t seed_none_identity[16];
 } wl_col_session_t;
 
 bool
 wl_columnar_session_budget_denied(const void *session);
 void
 wl_columnar_session_budget_denial_clear(wl_col_session_t *sess);
+/* Issue #1994: append the input rows a rule-head relation holds in its
+ * `$in$<name>` seed shadow back into @r after @r was reset for a full
+ * re-evaluation.  Returns 0 when @r has no shadow. */
+int
+wl_columnar_session_restore_seed(wl_col_session_t *sess, col_rel_t *r);
 
 typedef struct wl_columnar_session_hash_registry_image
     wl_columnar_session_hash_registry_image_t;

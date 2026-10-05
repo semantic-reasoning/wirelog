@@ -219,6 +219,212 @@ session_note_inserted_input(wl_col_session_t *sess, const col_rel_t *relation,
     sess->snapshot_stable_valid = false;
 }
 
+/*
+ * Seed shadows (Issue #1994).
+ *
+ * A rule head can also receive input -- inline facts such as `reach(1).`, or
+ * a host insert -- and then holds its input rows and its derived rows in one
+ * relation.  A full re-evaluation discards the derived rows by resetting the
+ * whole relation, which would discard the input too.  Every rule head
+ * therefore has a private copy of its input rows in `$in$<name>`, registered
+ * on the first insert into it (see session_seed_shadow_for_insert), kept in
+ * step with every insert and removal, and appended back after each reset.
+ * No plan operator names a `$in$` relation, so evaluation never reads it.
+ */
+#define WL_SEED_SHADOW_PREFIX "$in$"
+
+static int
+session_seed_shadow_name(const char *relation, char *out, size_t cap)
+{
+    int len = snprintf(out, cap, WL_SEED_SHADOW_PREFIX "%s", relation);
+    return len < 0 || (size_t)len >= cap ? EOVERFLOW : 0;
+}
+
+static col_rel_t *
+session_seed_shadow(wl_col_session_t *sess, const char *relation)
+{
+    char name[256];
+    if (!sess || !relation
+        || session_seed_shadow_name(relation, name, sizeof(name)) != 0)
+        return NULL;
+    return session_find_rel(sess, name);
+}
+
+static bool
+session_plan_has_rule_head(const wl_plan_t *plan, const char *relation)
+{
+    for (uint32_t si = 0; plan && si < plan->stratum_count; si++)
+        for (uint32_t ri = 0; ri < plan->strata[si].relation_count; ri++)
+            if (plan->strata[si].relations[ri].name
+                && strcmp(plan->strata[si].relations[ri].name, relation)
+                == 0)
+                return true;
+    return false;
+}
+
+static int
+session_seed_shadow_create(wl_col_session_t *sess, const char *relation)
+{
+    char name[256];
+    col_rel_t *seed = NULL;
+    int rc = session_seed_shadow_name(relation, name, sizeof(name));
+    if (rc == 0)
+        rc = wl_columnar_relation_alloc_governed(&seed, name,
+                sess->memory_governor);
+    if (rc != 0)
+        return rc;
+    rc = session_add_rel(sess, seed);
+    if (rc != 0) {
+        rc = rc == ENOMEM && seed->memory_budget_denial_pending ? ENOSPC : rc;
+        col_rel_destroy(seed);
+    }
+    return rc;
+}
+
+/* The shadow a host insert into @r must also write, created on the first
+ * insert into a rule head -- inline facts are loaded through this same
+ * insert path.  *seed_out is NULL for a relation that is not a rule head.
+ * On the common path -- inserts into plain input relations --
+ * seed_none_identity answers without a lookup. */
+static int
+session_seed_shadow_for_insert(wl_col_session_t *sess, const col_rel_t *r,
+    col_rel_t **seed_out)
+{
+    uint64_t *none = &sess->seed_none_identity[r->relation_identity
+            % (sizeof(sess->seed_none_identity)
+            / sizeof(sess->seed_none_identity[0]))];
+
+    *seed_out = NULL;
+    if (r->relation_identity != 0 && r->relation_identity == *none)
+        return 0;
+    *seed_out = session_seed_shadow(sess, r->name);
+    if (*seed_out)
+        return 0;
+    if (!session_plan_has_rule_head(sess->plan, r->name)) {
+        *none = r->relation_identity;
+        return 0;
+    }
+    int rc = session_seed_shadow_create(sess, r->name);
+    if (rc == 0)
+        *seed_out = session_seed_shadow(sess, r->name);
+    return rc;
+}
+
+/* Drop rows [nrows, seed->nrows) appended by a batch whose relation write
+ * then failed.  The shadow is private to the session, so nothing reads it
+ * between the two writes. */
+static void
+session_seed_shadow_truncate(col_rel_t *seed, uint32_t nrows)
+{
+    if (!seed || seed->nrows <= nrows)
+        return;
+    seed->nrows = nrows;
+    if (seed->base_nrows > nrows)
+        seed->base_nrows = nrows;
+    seed->sorted_nrows = 0;
+    seed->run_count = 0;
+    memset(seed->run_ends, 0, sizeof(seed->run_ends));
+    wl_columnar_eval_dedup_set_clear(seed);
+    wl_columnar_relation_touch_view(seed);
+}
+
+/* Mark, without changing the shadow, one shadow row for each requested row
+ * it holds.  *mask_out is NULL when there is no shadow or nothing matched;
+ * otherwise the caller passes it to session_seed_shadow_apply_remove once the
+ * relation's own removal has committed, or frees it. */
+static int
+session_seed_shadow_plan_remove(col_rel_t *seed, const int64_t *data,
+    uint32_t num_rows, uint32_t num_cols, uint8_t **mask_out)
+{
+    int64_t row_stack[COL_STACK_MAX];
+    int64_t *row_buf = row_stack;
+    uint8_t *mask = NULL;
+    bool any = false;
+
+    *mask_out = NULL;
+    if (!seed || seed->nrows == 0 || seed->ncols != num_cols)
+        return 0;
+    mask = (uint8_t *)calloc(seed->nrows, sizeof(*mask));
+    if (!mask)
+        return ENOMEM;
+    if (num_cols > COL_STACK_MAX) {
+        row_buf = (int64_t *)malloc((size_t)num_cols * sizeof(*row_buf));
+        if (!row_buf) {
+            free(mask);
+            return ENOMEM;
+        }
+    }
+    for (uint32_t di = 0; di < num_rows; di++) {
+        const int64_t *del = data + (size_t)di * num_cols;
+        for (uint32_t ri = 0; ri < seed->nrows; ri++) {
+            if (mask[ri])
+                continue;
+            col_rel_row_copy_out(seed, ri, row_buf);
+            if (memcmp(row_buf, del, (size_t)num_cols * sizeof(*del)) == 0) {
+                mask[ri] = 1;
+                any = true;
+                break;
+            }
+        }
+    }
+    if (row_buf != row_stack)
+        free(row_buf);
+    if (!any) {
+        free(mask);
+        return 0;
+    }
+    *mask_out = mask;
+    return 0;
+}
+
+/* Apply a planned removal.  No allocation or fallible operation. */
+static void
+session_seed_shadow_apply_remove(col_rel_t *seed, uint8_t *mask)
+{
+    uint32_t out_r = 0;
+
+    if (!seed || !mask)
+        return;
+    for (uint32_t ri = 0; ri < seed->nrows; ri++) {
+        if (mask[ri])
+            continue;
+        if (out_r != ri)
+            col_rel_row_move_raw(seed, out_r, ri);
+        out_r++;
+    }
+    session_seed_shadow_truncate(seed, out_r);
+    free(mask);
+}
+
+int
+wl_columnar_session_restore_seed(wl_col_session_t *sess, col_rel_t *r)
+{
+    col_rel_t *seed = r ? session_seed_shadow(sess, r->name) : NULL;
+    int64_t *rows = NULL;
+    uint64_t cells = 0;
+    uint64_t bytes = 0;
+    bool denied = false;
+    int rc;
+
+    if (!seed || seed->nrows == 0)
+        return 0;
+    if (r->ncols != 0 && r->ncols != seed->ncols)
+        return EINVAL;
+    if (!wl_columnar_memory_size_mul(seed->nrows, seed->ncols, &cells)
+        || !wl_columnar_memory_size_mul(cells, sizeof(int64_t), &bytes)
+        || bytes > SIZE_MAX)
+        return EOVERFLOW;
+    rows = (int64_t *)malloc((size_t)bytes);
+    if (!rows)
+        return ENOMEM;
+    for (uint32_t i = 0; i < seed->nrows; i++)
+        col_rel_row_copy_out(seed, i, rows + (size_t)i * seed->ncols);
+    rc = col_rel_append_rows_atomic(r, rows, seed->nrows, seed->ncols,
+            &denied);
+    free(rows);
+    return rc == ENOMEM && denied ? ENOSPC : rc;
+}
+
 /* Shared views borrow a root relation's columns. Teardown must release the
  * aliases before their root; otherwise the root's owner metadata would point
  * at freed storage. A root owned by another session is left for that owner
@@ -3865,11 +4071,23 @@ col_session_insert(wl_session_t *session, const char *relation,
         return EINVAL; /* column count mismatch */
     }
 
+    /* Issue #1994: the seed shadow takes the batch first, so a failure on
+     * either side leaves the two in step. */
+    col_rel_t *seed = NULL;
+    int rc = session_seed_shadow_for_insert(COL_SESSION(session), r, &seed);
+    if (rc != 0)
+        return rc;
+    uint32_t seed_rows = seed ? seed->nrows : 0;
     bool denied = false;
-    int rc = col_rel_append_rows_atomic(r, data, num_rows, num_cols,
-            &denied);
+    rc = seed ? col_rel_append_rows_atomic(seed, data, num_rows, num_cols,
+            &denied) : 0;
     if (rc != 0)
         return rc == ENOMEM && denied ? ENOSPC : rc;
+    rc = col_rel_append_rows_atomic(r, data, num_rows, num_cols, &denied);
+    if (rc != 0) {
+        session_seed_shadow_truncate(seed, seed_rows);
+        return rc == ENOMEM && denied ? ENOSPC : rc;
+    }
 
     session_note_inserted_input(sess, r, false);
     /* The non-incremental API must force a full epoch evaluation even when
@@ -4045,11 +4263,23 @@ col_session_insert_incremental(wl_session_t *session, const char *relation,
 
     /* Append the complete batch atomically; frontier[] is intentionally NOT
      * modified by the incremental path. */
+    /* Issue #1994: the seed shadow takes the batch first, so a failure on
+     * either side leaves the two in step. */
+    col_rel_t *seed = NULL;
+    int rc = session_seed_shadow_for_insert(COL_SESSION(session), r, &seed);
+    if (rc != 0)
+        return rc;
+    uint32_t seed_rows = seed ? seed->nrows : 0;
     bool denied = false;
-    int rc = col_rel_append_rows_atomic(r, data, num_rows, num_cols,
-            &denied);
+    rc = seed ? col_rel_append_rows_atomic(seed, data, num_rows, num_cols,
+            &denied) : 0;
     if (rc != 0)
         return rc == ENOMEM && denied ? ENOSPC : rc;
+    rc = col_rel_append_rows_atomic(r, data, num_rows, num_cols, &denied);
+    if (rc != 0) {
+        session_seed_shadow_truncate(seed, seed_rows);
+        return rc == ENOMEM && denied ? ENOSPC : rc;
+    }
 
     wl_col_session_t *sess = COL_SESSION(session);
     session_note_inserted_input(sess, r, true);
@@ -4104,6 +4334,8 @@ col_session_remove(wl_session_t *session, const char *relation,
         return writer_rc;
 
     uint8_t *matched = NULL;
+    uint8_t *seed_mask = NULL;
+    col_rel_t *seed = NULL;
     int64_t row_stack[COL_STACK_MAX];
     int64_t *row_buf = row_stack;
     uint32_t remove_count = 0;
@@ -4160,6 +4392,14 @@ col_session_remove(wl_session_t *session, const char *relation,
         goto remove_release;
     }
 
+    /* Issue #1994: the seed shadow records input, so a request removes from
+     * it even when the relation itself no longer holds the row. */
+    seed = session_seed_shadow(sess, r->name);
+    writer_rc = session_seed_shadow_plan_remove(seed, data, num_rows,
+            num_cols, &seed_mask);
+    if (writer_rc != 0)
+        goto remove_release;
+
     /* No allocation or fallible operation follows the first row write. */
     if (remove_count != 0) {
         uint32_t out_r = 0;
@@ -4189,6 +4429,10 @@ col_session_remove(wl_session_t *session, const char *relation,
         wl_columnar_eval_dedup_set_clear(r);
         wl_columnar_relation_touch_view(r);
     }
+    /* A row only the shadow still holds is already absent from the model,
+     * so taking it out of the input changes nothing to re-evaluate. */
+    session_seed_shadow_apply_remove(seed, seed_mask);
+    seed_mask = NULL;
     if (remove_count != 0) {
         session_invalidate_relation_caches(sess, r->name);
         sess->pending_input_change = true;
@@ -4198,6 +4442,7 @@ col_session_remove(wl_session_t *session, const char *relation,
 remove_release:
     if (row_buf != row_stack)
         free(row_buf);
+    free(seed_mask);
     free(matched);
     if (writer.owner) {
         int release_rc = wl_columnar_source_access_writer_release(&writer);
@@ -4263,6 +4508,8 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
         uint32_t source_row;
     } *match_plan = NULL;
     uint8_t *matched = NULL;
+    uint8_t *seed_mask = NULL;
+    col_rel_t *seed = NULL;
     col_rel_t *rdelta = NULL;
     col_rel_t *previous_delta = NULL;
     wl_columnar_source_access_reader_t previous_reader = { 0 };
@@ -4326,9 +4573,21 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
         }
     }
 
-    /* A miss is a true no-op: it must not replace an earlier staged retraction
-     * or disturb any input/session publication state. */
+    /* Issue #1994: the seed shadow records input, so a request removes from
+     * it even when the relation itself no longer holds the row. */
+    seed = session_seed_shadow(sess, r->name);
+    writer_rc = session_seed_shadow_plan_remove(seed, data, num_rows,
+            num_cols, &seed_mask);
+    if (writer_rc != 0)
+        goto incremental_release;
+
+    /* A miss is a no-op for the model: it must not replace an earlier
+     * staged retraction or disturb any session publication state.  It still
+     * removes the input the seed shadow holds -- a row the model already
+     * lacks -- so a later full re-evaluation does not bring it back. */
     if (match_count == 0) {
+        session_seed_shadow_apply_remove(seed, seed_mask);
+        seed_mask = NULL;
         writer_rc = 0;
         goto incremental_release;
     }
@@ -4463,6 +4722,8 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
     wl_columnar_relation_touch_view(r);
     session_rel_registration_commit(sess, rdelta, &registration);
     rdelta = NULL;
+    session_seed_shadow_apply_remove(seed, seed_mask);
+    seed_mask = NULL;
     session_invalidate_relation_caches(sess, r->name);
     sess->last_removed_relation = r->name;
     sess->outer_epoch++;
@@ -4483,6 +4744,7 @@ incremental_release:
     if (row_buf != row_stack)
         free(row_buf);
     free(match_plan);
+    free(seed_mask);
     free(matched);
     if (writer.owner) {
         int release_rc = wl_columnar_source_access_writer_release(&writer);
@@ -4592,6 +4854,9 @@ col_session_publication_cutoff(wl_col_session_t *sess)
 }
 
 static int
+col_session_clear_idb_rows(const wl_plan_t *plan, wl_col_session_t *sess);
+
+static int
 col_session_step_impl(wl_session_t *session)
 {
     wl_col_session_t *sess = COL_SESSION(session);
@@ -4642,7 +4907,11 @@ col_session_step_impl(wl_session_t *session)
     }
     sess->extension_expr_status = 0;
 
-    if (!completing_plain_step && !sess->delta_observer && sess->delta_cb
+    /* A step with nothing pending has nothing to derive, with or without a
+     * delta callback (Issue #1994).  Every write that invalidates the stable
+     * model also sets pending_input_change, and a session starts with it
+     * set, so the first step still evaluates. */
+    if (!completing_plain_step && !sess->delta_observer
         && !sess->pending_input_change
         && sess->last_inserted_relation == NULL
         && sess->last_removed_relation == NULL){
@@ -4673,9 +4942,34 @@ col_session_step_impl(wl_session_t *session)
                 session, sess->last_removed_relation);
         }
     }
+    /* Issue #1994: a step with no delta callback is not incremental.  It
+     * re-derives every stratum from scratch, so once the session has evaluated
+     * it first discards what that evaluation derived and resets every stratum
+     * frontier, under the same has_evaluated condition a snapshot uses before
+     * a full re-evaluation; the rule frontiers are reset below.  Without the
+     * clear every step appended another copy of each derived row and a
+     * retraction never reached the rows it had derived; without the stratum
+     * reset a stale frontier skips iterations a recursive stratum needs after
+     * the clear.  A resumed step (completing_plain_step) keeps what its first
+     * attempt already merged. */
     if (sess->plain_step_completion_step_context
-        && !completing_plain_step)
+        && !completing_plain_step) {
+        affected_mask = UINT64_MAX;
+        if (sess->has_evaluated) {
+            /* Until this step commits, the derived relations are empty or
+             * partial, so whatever evaluates next must clear and evaluate in
+             * full; only the commit below resets this. */
+            sess->pending_full_input_eval = true;
+            int clear_rc = col_session_clear_idb_rows(plan, sess);
+            if (clear_rc != 0)
+                return clear_rc;
+            for (uint32_t si = 0; si < plan->stratum_count && si < MAX_STRATA;
+                si++)
+                sess->frontier_ops->reset_stratum_frontier(sess, si,
+                    sess->outer_epoch);
+        }
         sess->plain_step_completion_mask = affected_mask;
+    }
 
     if (!completing_plain_step && sess->delta_observer) {
         affected_mask = wl_columnar_eval_delta_observer_mask(sess);
@@ -4693,8 +4987,11 @@ col_session_step_impl(wl_session_t *session)
      * set (removal via col_session_remove_incremental), check if $r$<name>
      * exists for retractions, and set retraction_seeded.  This block does
      * not narrow affected_mask; the removal's contribution to it is unioned
-     * in above (Issue #1031). */
-    if (sess->last_removed_relation != NULL) {
+     * in above (Issue #1031).  A plain step re-derives from scratch instead
+     * (Issue #1994): seeding there would make the first iteration read the
+     * removed rows in place of the relation. */
+    if (sess->last_removed_relation != NULL
+        && !sess->plain_step_completion_step_context) {
         char rname[256];
         if (retraction_rel_name(sess->last_removed_relation, rname,
             sizeof(rname))
@@ -5031,6 +5328,7 @@ col_session_clear_idb_rows(const wl_plan_t *plan, wl_col_session_t *sess)
     wl_columnar_source_access_writer_t *writers = NULL;
     uint32_t target_count = 0;
     uint32_t owner_count = 0;
+    uint32_t reset_count = 0;
     uint32_t capacity = sess ? (sess->nrels ? sess->nrels : 1) : 0;
     int rc = 0;
 
@@ -5129,6 +5427,7 @@ col_session_clear_idb_rows(const wl_plan_t *plan, wl_col_session_t *sess)
         rc = col_rel_reset_rows_locked(targets[i], writer);
         if (rc != 0)
             goto cleanup;
+        reset_count = i + 1u;
         col_session_invalidate_arrangements(&sess->base, targets[i]->name);
     }
 
@@ -5141,6 +5440,14 @@ cleanup:
     for (uint32_t i = owner_count; i > 0; i--)
         if (writers[i - 1].owner)
             (void)wl_columnar_source_access_writer_release(&writers[i - 1]);
+    /* Issue #1994: a reset relation that also holds input gets its input
+     * back.  This appends under the relation's own writer, so it runs only
+     * once every writer above is released. */
+    for (uint32_t i = 0; i < reset_count; i++) {
+        int seed_rc = wl_columnar_session_restore_seed(sess, targets[i]);
+        if (rc == 0 && seed_rc != 0)
+            rc = seed_rc;
+    }
     free((void *)targets);
     free((void *)owners);
     free(writers);

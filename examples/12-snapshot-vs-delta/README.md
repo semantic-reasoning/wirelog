@@ -62,9 +62,10 @@ simpler when you just need the current answer without tracking history.
 
 - **Semantic equivalence** -- the incremental delta path produces the
   same derived facts as full re-evaluation via snapshot.
-- **Two independent sessions** -- because `wirelog_easy_snapshot` is an
-  evaluating call, the driver uses separate sessions to avoid
-  double-counting.  See `wirelog-easy.h` for the full contract.
+- **Two independent sessions** -- the snapshot side runs in its own
+  session, so it is a full evaluation that shares no state with the
+  incremental side it is compared against.  See `wirelog-easy.h` for how
+  a snapshot behaves after a step on the same session.
 - **Deterministic comparison** -- both result sets are sorted before
   comparison so the test is stable regardless of backend evaluation
   order.

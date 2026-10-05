@@ -51,6 +51,28 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Steps without a delta callback no longer pile up derived rows**
+  (#1994): `wirelog_easy_step()` on a session with no delta callback
+  re-derived every rule on every step on top of what the previous step
+  had derived.  Each step appended another copy of every derived row, a
+  removal never retracted the rows it had derived, and a step with
+  nothing pending re-ran every rule, invoking each value-position
+  `@call` once per derived row.  A step with an insert or removal
+  pending now discards the derived rows and re-derives every rule, as a
+  full snapshot does, and a step with nothing pending does nothing.  A
+  snapshot taken after such a step therefore reads exactly the model the
+  step derived, and `wirelog-easy.h` no longer warns against that
+  combination.
+
+- **Full re-evaluation keeps a rule head's own input rows** (#1994): a
+  relation that is a rule head and also holds input -- an inline fact
+  such as `reach(1).`, or a host row -- lost that input whenever a full
+  re-evaluation discarded the derived rows.  A second snapshot after an
+  insert returned `reach` empty, and so did the multi-worker recursive
+  path.  Such a relation now keeps its input rows in a private
+  `$in$<name>` copy, maintained on every insert and removal and restored
+  after each discard.
+
 - **Every configure left the worktree dirty** (#1814): `.gitignore`
   ignored `subprojects/xxHash-0.8.3/` while `subprojects/xxhash.wrap`
   pins `directory = xxHash-0.8.4`, so the rule named a directory meson

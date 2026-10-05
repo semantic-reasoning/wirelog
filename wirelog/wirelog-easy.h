@@ -290,6 +290,13 @@ wirelog_easy_remove_sym(wirelog_easy_session_t *s, const char *relation, ...);
  *
  * Advance the session by one step, lazily building the plan if needed.
  *
+ * With a delta callback installed (wirelog_easy_set_delta_cb()) a step is
+ * incremental and reports what changed to the callback.  Without one a step
+ * is a full re-evaluation: when anything was inserted or removed since the
+ * last step or snapshot that evaluated, it discards the derived rows and
+ * re-derives every rule, keeping the input rows of a relation that is also
+ * a rule head.  Either way a step with nothing pending does no evaluation.
+ *
  * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure.
  */
 WIRELOG_API wirelog_error_t
@@ -351,14 +358,11 @@ wirelog_easy_banner(const char *label);
  * Take a snapshot of the current state and forward only tuples whose
  * relation name matches @relation to @cb.
  *
- * IMPORTANT: wirelog_easy_snapshot() is an *evaluating* call — the underlying
- * columnar backend re-evaluates every stratum and emits the resulting IDB
- * rows.  Do NOT call wirelog_easy_step() followed by wirelog_easy_snapshot() on the
- * same insert batch: step() already derives and appends the IDB rows, and
- * a subsequent snapshot() will re-derive and append again, producing
- * duplicated tuples.  Choose one mode per batch:
- *   - Incremental / delta mode: wirelog_easy_set_delta_cb() + wirelog_easy_step()
- *   - Query mode:               wirelog_easy_snapshot() (no prior step)
+ * wirelog_easy_snapshot() evaluates when input is pending: if anything was
+ * inserted or removed since the last evaluation, it evaluates before it
+ * emits.  After a completed wirelog_easy_step() with nothing inserted or
+ * removed since, it emits the model that step left without evaluating
+ * again, so a snapshot may follow a step on the same session.
  *
  * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure.
  */

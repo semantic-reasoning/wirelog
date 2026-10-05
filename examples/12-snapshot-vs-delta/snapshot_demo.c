@@ -23,11 +23,9 @@
  * wirelog_easy_step (delta callback, streaming) and wirelog_easy_snapshot
  * (one-shot batch) and verifies that they produce identical results.
  *
- * IMPORTANT: wirelog_easy_snapshot() is an evaluating call -- calling
- * wirelog_easy_step() followed by wirelog_easy_snapshot() on the same insert
- * batch would double-count derived tuples.  This driver therefore
- * uses two independent sessions: one for the delta path and one for
- * the snapshot path.
+ * The driver uses two independent sessions, one for the delta path and
+ * one for the snapshot path, so the snapshot side is a full evaluation
+ * that shares no state with the incremental side it is checked against.
  *
  * Build: meson compile -C build snapshot_demo
  * Run:   ./build/examples/12-snapshot-vs-delta/snapshot_demo
