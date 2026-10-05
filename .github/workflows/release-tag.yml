@@ -529,7 +529,11 @@ jobs:
             # that found nothing -- collapsing either into no-matching-runner
             # would report the inventory dishonestly.
             if detail=$(jq -r '
-                  [ .[].runners[]? | select(any(.labels[]?.name; . == "wirelog-perf")) ]
+                  [ .[].runners[]? | select(
+                      any(.labels[]?.name; . == "self-hosted") and
+                      any(.labels[]?.name; . == "Linux") and
+                      any(.labels[]?.name; . == "X64") and
+                      any(.labels[]?.name; . == "perf")) ]
                     as $matching
                   | if ($matching | length) == 0 then "no-matching-runner"
                     elif any($matching[]; .status == "online" and .busy == false)

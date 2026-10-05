@@ -21,12 +21,24 @@ def refuse(needle: str, haystack: str, why: str) -> None:
         raise AssertionError(f"forbidden text {needle!r}: {why}")
 
 
+def is_linux_perf_runner(labels: set[str]) -> bool:
+    return {"self-hosted", "Linux", "X64", "perf"}.issubset(labels)
+
+
 def main() -> int:
     require("perf-rss-status:", RELEASE)
     require("authoritative-runner-unavailable", RELEASE)
     require("Administration:read", RELEASE)
     require("gh api --paginate --slurp", RELEASE)
     require('status == \"online\" and .busy == false', RELEASE)
+    for label in ('"self-hosted"', '"Linux"', '"X64"', '"perf"'):
+        require(f"any(.labels[]?.name; . == {label})", RELEASE)
+    refuse('any(.labels[]?.name; . == "wirelog-perf")', RELEASE,
+           "the legacy Windows wirelog-perf label cannot establish Linux perf availability")
+    if is_linux_perf_runner({"self-hosted", "Windows", "X64", "wirelog-perf"}):
+        raise AssertionError("legacy Windows wirelog-perf labels matched Linux perf")
+    if not is_linux_perf_runner({"self-hosted", "Linux", "X64", "perf"}):
+        raise AssertionError("the authoritative Linux perf runner was not recognized")
 
     # The needs: list and its hardcoded `-eq N` are NOT asserted here. Both are
     # covered more strongly by scripts/ci/test-required-gates.sh, which derives

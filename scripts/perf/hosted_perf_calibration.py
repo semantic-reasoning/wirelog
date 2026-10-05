@@ -42,7 +42,7 @@ COV_RE = re.compile(r"CoV\s+([0-9]+(?:\.[0-9]+)?)%")
 
 def run_text(command: list[str], *, timeout: int = 10) -> str | None:
     try:
-        result = subprocess.run(command, text=True, capture_output=True,
+        result = subprocess.run(command, text=True, encoding="utf-8", capture_output=True,
                                 check=False, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         return None

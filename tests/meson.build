@@ -1206,6 +1206,11 @@ test('program_lifetime_selftest', py3,
 # membership is not a proxy for platform exposure -- sbom_wrap_pin runs on
 # the Windows runner -- so the rule covers every suite.
 sh = find_program('bash', required: false)
+if sh.found()
+  test('nightly_crdt_cspa_evidence_contract', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-nightly-crdt-cspa.sh'],
+       suite: 'abi', timeout: 60)
+endif
 
 if sh.found() and host_machine.system() != 'windows'
   # Issue #694: deterministic shell self-test for the hosted fuzz shard helper.
@@ -2538,6 +2543,10 @@ endif
 
 test('perf_nightly_doop_contract', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-perf-nightly-doop.py'],
+     suite: 'abi')
+
+test('perf_nightly_docker_contract', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-perf-nightly-docker-contract.py'],
      suite: 'abi')
 
 test('release_perf_rss_contract', py3,

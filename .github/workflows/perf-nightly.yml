@@ -9,8 +9,9 @@ name: Perf Nightly
 #   means regressions can slip to main. Nightly is the compromise.
 #
 # Runners:
-#   wirelog-perf    - self-hosted Linux x64 GCC runner; requests the
-#                     performance governor when available and pins to CPU 0.
+#   perf            - self-hosted Linux x64 runner. Build and test tools run
+#                     in its local semantic-reasoning:ubuntu26 image; W=1
+#                     CRDT/CSPA measurements require CPU 0 and valid telemetry.
 #   windows-latest  - MSVC; bench_stability_prep() in the test handles
 #                     thread affinity + HIGH_PRIORITY_CLASS internally.
 #
@@ -44,6 +45,10 @@ on:
       portfolio_repeat:
         description: 'Portfolio repeat count'
         default: '1'
+      strict_smoke:
+        description: 'Run only strict CRDT/CSPA acquisition on the Linux perf host'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -52,14 +57,19 @@ permissions:
 jobs:
   perf:
     name: Perf / ${{ matrix.os }} / ${{ matrix.compiler }}
+    if: github.repository == 'semantic-reasoning/wirelog' && github.ref == 'refs/heads/main'
     runs-on: ${{ fromJSON(matrix.runner) }}
-    continue-on-error: true
+    continue-on-error: ${{ matrix.os == 'windows' }}
+    concurrency:
+      group: wirelog-perf-${{ matrix.os }}
+      queue: max
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: linux
-            runner: '["self-hosted", "Linux", "X64", "wirelog-perf"]'
+            runner: '["self-hosted", "Linux", "X64", "perf"]'
             compiler: gcc
             cc: gcc
           - os: windows
@@ -70,19 +80,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build linux-tools-common linux-tools-generic
-
       - name: Install dependencies (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && !inputs.strict_smoke
         run: |
           choco install pkgconfiglite -y
 
       - name: Set up Meson 1.12.0
         uses: ./.github/actions/setup-meson
+        if: runner.os == 'Windows' && !inputs.strict_smoke
 
       # Request the performance governor as a best-effort noise reduction.
       # The Linux nightly suite records the observed value as provenance.
@@ -95,19 +100,8 @@ jobs:
             echo "governor($cpu) = $(cat "$cpu" 2>/dev/null || echo 'unreadable')"
           done
 
-      - name: Configure release + trace ceiling (Linux)
-        if: runner.os == 'Linux'
-        run: >
-          meson setup build-perf
-          --buildtype=release
-          -Dwirelog_log_max_level=trace
-          -Dtests=true
-          -DmbedTLS=disabled
-        env:
-          CC: ${{ matrix.cc }}
-
       - name: Configure release + trace ceiling (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && !inputs.strict_smoke
         shell: cmd
         env:
           CC: ${{ matrix.cc }}
@@ -117,12 +111,8 @@ jobs:
         run: |
           meson setup build-perf --vsenv --buildtype=release -Dwirelog_log_max_level=trace -Dtests=true -DmbedTLS=disabled
 
-      - name: Build (Linux)
-        if: runner.os == 'Linux'
-        run: meson compile -C build-perf
-
       - name: Build (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && !inputs.strict_smoke
         shell: cmd
         run: |
           meson compile -C build-perf
@@ -154,15 +144,18 @@ jobs:
             done
           } > perf-artifacts/linux-suite/host-before.txt
 
-      # Linux: taskset pins the meson test harness to CPU 0. Nightly
-      # records the governor but does not use it as a gate precondition.
+      # The image-owned Linux runner applies CPU 0 only to strict W=1 CRDT and
+      # CSPA gates. Its broader legacy suite and portfolio retain full affinity.
       - name: Run perf suite (Linux)
         if: runner.os == 'Linux'
         env:
-          WIRELOG_PERF_GATE: '1'
-          WIRELOG_PERF_NIGHTLY: '1'
+          PORTFOLIO_TIER: ${{ github.event.inputs.portfolio_tier || 'readme-full' }}
+          PORTFOLIO_WORKERS: ${{ github.event.inputs.portfolio_workers || '1' }}
+          PORTFOLIO_REPEAT: ${{ github.event.inputs.portfolio_repeat || '1' }}
+          PERF_ARTIFACT_DIR: ${{ github.workspace }}/perf-artifacts/linux-suite
+          PERF_STRICT_SMOKE: ${{ inputs.strict_smoke }}
         run: |
-          taskset -c 0 meson test -C build-perf --suite perf --print-errorlogs --num-processes 1
+          scripts/ci/run-perf-nightly-linux.sh
 
       - name: Capture Linux perf suite evidence
         if: ${{ always() && runner.os == 'Linux' }}
@@ -179,15 +172,13 @@ jobs:
             echo "source_tree=$(git rev-parse HEAD^{tree})"
             echo "run=$RUN_ID attempt=$RUN_ATTEMPT"
             echo "runner=$RUNNER_NAME os=$RUNNER_OS arch=$RUNNER_ARCH"
-            echo 'runner_labels=self-hosted,Linux,X64,wirelog-perf'
-            echo 'mode=nightly governor_eligibility=bypassed'
-            echo 'WIRELOG_PERF_GATE=1 WIRELOG_PERF_NIGHTLY=1'
+            echo 'runner_labels=self-hosted,Linux,X64,perf'
+            echo 'mode=nightly strict_CRDT_CSPA=true governor_eligibility=required'
+            echo 'WIRELOG_PERF_GATE=1 WIRELOG_PERF_REQUIRE=1'
             echo 'requested_affinity=0'
             taskset -pc $$
             echo "kernel=$(uname -srmo)"
             echo "cpu_model=$(awk -F: '/^model name[[:space:]]*:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }' /proc/cpuinfo)"
-            echo "compiler=$(gcc --version | head -n 1)"
-            echo "meson=$(meson --version)"
             echo "boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unavailable)"
             echo "loadavg=$(cat /proc/loadavg 2>/dev/null || echo unavailable)"
             for file in /sys/fs/cgroup/cpuset.cpus.effective /sys/fs/cgroup/cpu.stat /proc/pressure/cpu; do
@@ -208,13 +199,11 @@ jobs:
               fi
             done
           } > perf-artifacts/linux-suite/host.txt
-          { meson configure build-perf || echo unavailable; } > perf-artifacts/linux-suite/meson-config.txt
-          { meson introspect build-perf --compilers || echo unavailable; } > perf-artifacts/linux-suite/compilers.json
           {
             for file in \
-              build-perf/tests/test_crdt_perf_gate \
-              build-perf/tests/test_cspa_perf_gate \
-              build-perf/meson-info/intro-buildoptions.json \
+              build-perf-nightly/tests/test_crdt_perf_gate \
+              build-perf-nightly/tests/test_cspa_perf_gate \
+              build-perf-nightly/meson-info/intro-buildoptions.json \
               bench/data/crdt/Insert_input.csv \
               bench/data/crdt/Remove_input.csv \
               bench/data/cspa/assign.csv \
@@ -226,8 +215,8 @@ jobs:
               fi
             done
           } > perf-artifacts/linux-suite/sha256.txt
-          if [ -f build-perf/meson-logs/testlog.txt ]; then
-            cp build-perf/meson-logs/testlog.txt perf-artifacts/linux-suite/testlog.txt
+          if [ -f build-perf-nightly/meson-logs/testlog.txt ]; then
+            cp build-perf-nightly/meson-logs/testlog.txt perf-artifacts/linux-suite/testlog.txt
           fi
 
       - name: Upload Linux perf suite evidence
@@ -243,7 +232,7 @@ jobs:
       # priority class from inside the test process. No external wrapper
       # needed; meson test invokes the binary directly.
       - name: Run perf suite (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && !inputs.strict_smoke
         shell: cmd
         env:
           WIRELOG_PERF_GATE: '1'
@@ -251,28 +240,16 @@ jobs:
           meson test -C build-perf --suite perf --print-errorlogs --num-processes 1
 
       - name: Collect flowlog portfolio (Linux)
-        if: ${{ always() && runner.os == 'Linux' }}
+        if: ${{ always() && runner.os == 'Linux' && !inputs.strict_smoke }}
         shell: bash
-        env:
-          PORTFOLIO_TIER: ${{ github.event.inputs.portfolio_tier || 'readme-full' }}
-          PORTFOLIO_WORKERS: ${{ github.event.inputs.portfolio_workers || '1' }}
-          PORTFOLIO_REPEAT: ${{ github.event.inputs.portfolio_repeat || '1' }}
         run: |
-          set +e
-          python scripts/perf/run-flowlog-portfolio.py \
-            --bench build-perf/bench/bench_flowlog \
-            --tier "$PORTFOLIO_TIER" \
-            --workers "$PORTFOLIO_WORKERS" \
-            --repeat "$PORTFOLIO_REPEAT" \
-            --out-dir perf-artifacts/portfolio
-          rc=$?
+          rc=$(awk -F= '$1 == "portfolio" { print $2 }' perf-artifacts/linux-suite/legacy-coverage-status.txt 2>/dev/null || echo 1)
           echo "portfolio_exit=$rc" >> "$GITHUB_OUTPUT"
           echo "PORTFOLIO_EXIT=$rc" >> "$GITHUB_ENV"
           echo "portfolio_exit=$rc" >> "$GITHUB_STEP_SUMMARY"
-          exit 0
 
       - name: Collect flowlog portfolio (Windows)
-        if: ${{ always() && runner.os == 'Windows' }}
+        if: ${{ always() && runner.os == 'Windows' && !inputs.strict_smoke }}
         shell: bash
         env:
           PORTFOLIO_TIER: ${{ github.event.inputs.portfolio_tier || 'readme-full' }}
@@ -293,7 +270,7 @@ jobs:
           exit 0
 
       - name: Upload flowlog portfolio artifacts
-        if: always()
+        if: ${{ always() && !inputs.strict_smoke }}
         uses: actions/upload-artifact@v7
         with:
           name: perf-portfolio-${{ matrix.os }}-${{ matrix.compiler }}
@@ -302,7 +279,7 @@ jobs:
           retention-days: 35
 
       - name: Summarize flowlog portfolio
-        if: always()
+        if: ${{ always() && !inputs.strict_smoke }}
         shell: bash
         run: |
           python scripts/perf/summarize-flowlog-portfolio.py \
@@ -319,11 +296,22 @@ jobs:
           echo '' >> "$GITHUB_STEP_SUMMARY"
           echo "Status: **${STATUS}**" >> "$GITHUB_STEP_SUMMARY"
           echo '' >> "$GITHUB_STEP_SUMMARY"
-          if [ -f build-perf/meson-logs/testlog.txt ]; then
+          if [ "$RUNNER_OS" = Linux ]; then
+            testlog=build-perf-nightly-trace/meson-logs/testlog.txt
+            [ -f "$testlog" ] || testlog=build-perf-nightly/meson-logs/testlog.txt
+            if [ -f perf-artifacts/linux-suite/campaign-status.txt ]; then
+              echo '```text' >> "$GITHUB_STEP_SUMMARY"
+              cat perf-artifacts/linux-suite/campaign-status.txt >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            testlog=build-perf/meson-logs/testlog.txt
+          fi
+          if [ -f "$testlog" ]; then
             echo '<details><summary>Perf suite testlog</summary>' >> "$GITHUB_STEP_SUMMARY"
             echo '' >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
-            grep -A 30 'test_log_perf_gate' build-perf/meson-logs/testlog.txt 2>/dev/null \
+            grep -A 30 'test_log_perf_gate' "$testlog" 2>/dev/null \
               | head -200 >> "$GITHUB_STEP_SUMMARY" || true
             echo '```' >> "$GITHUB_STEP_SUMMARY"
             echo '</details>' >> "$GITHUB_STEP_SUMMARY"
@@ -332,7 +320,7 @@ jobs:
   portfolio-skip-rate:
     name: Perf portfolio SKIP-rate history
     needs: perf
-    if: always()
+    if: ${{ always() && !inputs.strict_smoke }}
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -402,17 +390,14 @@ jobs:
   # threshold is enforced; the governor is captured as provenance only.
   perf-stable:
     name: Perf wirelog-perf / correctness + DOOP
-    runs-on: [self-hosted, Linux, X64, wirelog-perf]
+    if: github.repository == 'semantic-reasoning/wirelog' && github.ref == 'refs/heads/main' && !(github.event_name == 'workflow_dispatch' && inputs.strict_smoke)
+    runs-on: [self-hosted, Linux, X64, perf]
+    concurrency:
+      group: wirelog-perf-linux
+      queue: max
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v5
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build curl unzip linux-tools-common linux-tools-generic
-
-      - name: Set up Meson 1.12.0
-        uses: ./.github/actions/setup-meson
 
       - name: Verify perf runner capacity
         shell: bash
@@ -422,56 +407,10 @@ jobs:
           nproc --all
           taskset -pc $$ | grep -Eq ':[[:space:]]*[0-9]'
 
-      - name: Configure stripped build
-        run: >
-          meson setup build-perf-error
-          --buildtype=release
-          -Dwirelog_log_max_level=error
-          -Dtests=true
-          -DmbedTLS=disabled
+      - name: Run correctness and DOOP gates in the local perf image
         env:
-          CC: gcc
-
-      - name: Download pinned DOOP dataset
-        run: bench/data/doop/download.sh
-
-      - name: Build stripped build
-        run: meson compile -C build-perf-error
-
-      - name: Run evaluator correctness gates
-        env:
-          WIRELOG_PERF_GATE: '1'
-        run: >
-          meson test -C build-perf-error
-          crdt_correctness_full cspa_correctness
-          --print-errorlogs --num-processes 1
-
-      # DOOP is W=8 and must not inherit the single-CPU affinity used by the
-      # W=1 evaluator gates above.  Keep a separate Meson log, then append it
-      # to the authoritative error log so the common execution checker still
-      # verifies one complete evidence stream.
-      - name: Run DOOP W=8 timing gate
-        if: always()
-        env:
-          WIRELOG_PERF_GATE: '1'
-          WIRELOG_PERF_REQUIRE: '1'
-          WIRELOG_DOOP_PERF_MODE: strict-tagged
           WL_DOOP_PERF_GATE_TARGET_MS: ${{ vars.WL_DOOP_PERF_GATE_TARGET_MS }}
-        run: |
-          doop_affinity=$(taskset -pc $$ | sed 's/.*: //')
-          test -n "$doop_affinity"
-          set +e
-          taskset -c "$doop_affinity" meson test -C build-perf-error doop_w8_gate \
-            --logbase doop-testlog --print-errorlogs --num-processes 1
-          rc=$?
-          cat build-perf-error/meson-logs/doop-testlog.txt >> \
-            build-perf-error/meson-logs/testlog.txt
-          exit "$rc"
-
-      - name: Verify DOOP gate executed
-        run: >
-          scripts/ci/check-doop-perf-gate-execution.sh
-          build-perf-error/meson-logs/doop-testlog.txt
+        run: scripts/ci/run-perf-stable-linux.sh
 
       - name: Upload authoritative perf logs
         if: always()
@@ -538,6 +477,7 @@ jobs:
   # ==========================================================================
   stress:
     name: Stress / ubuntu-latest / gcc / TSan
+    if: ${{ !inputs.strict_smoke }}
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
