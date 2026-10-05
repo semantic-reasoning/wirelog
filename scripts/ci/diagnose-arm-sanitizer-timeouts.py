@@ -19,6 +19,20 @@ TARGETS = {
 }
 MESON = {"b_sanitize": "address,undefined", "b_lundef": False,
          "tests": True, "buildtype": "debugoptimized"}
+XXHASH_WRAP = Path(__file__).resolve().parents[2] / "subprojects/xxhash.wrap"
+
+
+def wrap_directory(wrap):
+    """The `directory` a meson wrap extracts into, read rather than hardcoded:
+    a version bump renames it, and a stale copy here named a directory meson
+    no longer creates (#1899)."""
+    for line in wrap.read_text(encoding="utf-8").splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == "directory":
+            value = value.split("#", 1)[0].strip()
+            if value:
+                return value
+    raise ValueError(f"{wrap} declares no directory")
 
 
 def observer_env():
@@ -29,7 +43,8 @@ def observer_env():
 def child_env(build):
     env = observer_env()
     env["LD_LIBRARY_PATH"] = ":".join(str(path) for path in (
-        build, build / "subprojects/nanoarrow", build / "subprojects/xxHash-0.8.3"))
+        build, build / "subprojects/nanoarrow",
+        build / "subprojects" / wrap_directory(XXHASH_WRAP)))
     env["ASAN_OPTIONS"] = "abort_on_error=1:halt_on_error=1:print_stacktrace=1"
     env["UBSAN_OPTIONS"] = "abort_on_error=1:halt_on_error=1:print_stacktrace=1"
     return env

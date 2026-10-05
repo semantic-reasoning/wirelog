@@ -103,6 +103,28 @@ class DiagnosticTests(unittest.TestCase):
         self.assertNotIn("/sanitized", child["LD_LIBRARY_PATH"])
         self.assertIn(str(self.root), child["LD_LIBRARY_PATH"])
 
+    def test_wrap_directory_reads_the_wrap(self):
+        # #1899: the xxHash build directory comes from the wrap, so a bump
+        # cannot leave the loader path naming a directory meson no longer
+        # creates.
+        wrap = self.root / "xxhash.wrap"
+        wrap.write_text("[wrap-file]\ndirectory = xxHash-9.9.9  # pin\n"
+                        "source_filename = xxHash-9.9.9.tar.gz\n",
+                        encoding="utf-8")
+        self.assertEqual(diagnose.wrap_directory(wrap), "xxHash-9.9.9")
+        wrap.write_text("[wrap-file]\nsource_filename = x.tar.gz\n",
+                        encoding="utf-8")
+        with self.assertRaises(ValueError):
+            diagnose.wrap_directory(wrap)
+
+    def test_child_env_names_the_declared_xxhash_directory(self):
+        declared = diagnose.wrap_directory(diagnose.XXHASH_WRAP)
+        paths = diagnose.child_env(self.root)["LD_LIBRARY_PATH"].split(":")
+        self.assertIn(str(self.root / "subprojects" / declared), paths)
+        self.assertEqual(
+            [p for p in paths if "/subprojects/xxHash-" in p],
+            [str(self.root / "subprojects" / declared)])
+
     def test_manifest_selected_config(self):
         with mock.patch.dict(os.environ, {"SECRET": "never-record"}), \
                 mock.patch.object(diagnose.subprocess, "run", return_value=
