@@ -953,6 +953,10 @@ test('perf_nightly_governor_policy', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-perf-nightly-governor-policy.py'],
      suite: 'abi')
 
+test('hosted_perf_calibration_contract', py3,
+     args: [meson.project_source_root() / 'scripts/perf/test-hosted-perf-calibration.py'],
+     suite: 'abi', timeout: 60)
+
 if host_machine.system() == 'linux'
   test('perf_batch_append_plan_contract', py3,
        args: [meson.project_source_root() / 'scripts/perf/test-prepare-batch-append-campaign.py'],
