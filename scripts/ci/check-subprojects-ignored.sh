@@ -115,8 +115,8 @@ require_ignored() {
 # The verdict is taken from the NON-VERBOSE form. `check-ignore -v` prints a
 # row for every path matching any pattern INCLUDING the negations, and exits 0
 # either way -- measured: a correct tree and a tree missing
-# `!subprojects/.wraplock` both give rc 0 and three rows, so a -v verdict
-# cannot tell them apart. -v is re-run only to name the culprits on failure.
+# `!subprojects/*.wrap` both give rc 0 and two rows, so a -v verdict cannot
+# tell them apart. -v is re-run only to name the culprits on failure.
 # The list is held in a file, not a variable: command substitution strips NUL
 # bytes, so a -z list read into a shell variable silently becomes empty and the
 # floor below would be the only thing standing between that and a vacuous pass.
@@ -173,6 +173,19 @@ fi
 # subproject. packagefiles is excluded from the probes below because it is a
 # TRACKED input that must stay visible -- assertion A covers it.
 require_ignored packagecache "mesonbuild/wrap/wrap.py:377 creates it"
+
+# Meson also takes a lock file directly under subprojects/: mesonbuild/wrap/
+# wrap.py calls DirectoryLock(self.subdir_root, '.wraplock', ...), which
+# opens it with mode 'w+' (line numbers move between meson releases).
+# It is created per checkout and must stay untracked and ignored: tracked, a
+# future meson that writes into it would dirty every worktree (#1898).
+if ! is_ignored 'subprojects/.wraplock'; then
+    if [ -n "$ignore_error" ]; then
+        note_fail "could not test subprojects/.wraplock: ${ignore_error}"
+    else
+        note_fail "meson creates subprojects/.wraplock but .gitignore does not ignore it (meson's wrap lock file)"
+    fi
+fi
 
 # `directory =` is read WITHOUT section anchoring, deliberately. Meson takes it
 # from the first section only (wrap.py:298,304 and `values.get('directory',
@@ -240,4 +253,4 @@ if [ "$fail" -ne 0 ]; then
     echo "check-subprojects-ignored: FAILED" >&2
     exit 1
 fi
-echo "check-subprojects-ignored: OK; ${tracked_count} tracked path(s) visible, ${wraps} wrap(s) and packagecache ignored, rule is version-independent"
+echo "check-subprojects-ignored: OK; ${tracked_count} tracked path(s) visible, ${wraps} wrap(s), packagecache and .wraplock ignored, rule is version-independent"

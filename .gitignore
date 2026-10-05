@@ -81,7 +81,8 @@ Thumbs.db
 #
 # `subprojects/*` carries an internal slash, so git anchors it here and `*`
 # does not cross `/`: it matches the direct children only, not any depth.
-# `*` does match a leading dot, so .wraplock needs its own re-inclusion.
+# `*` also matches a leading dot, which is what keeps meson's per-checkout
+# lock file, subprojects/.wraplock, ignored (#1898).
 # scripts/ci/check-subprojects-ignored.sh asserts both halves.
 #
 # To track a NEW file directly under subprojects/, add a "!" line below.
@@ -89,7 +90,6 @@ Thumbs.db
 # with no message at all.
 subprojects/*
 !subprojects/*.wrap
-!subprojects/.wraplock
 !subprojects/packagefiles/
 
 *.uncrustify
