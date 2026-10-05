@@ -1,0 +1,343 @@
+name: Hosted PR performance calibration
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Open pull request number to measure against its base
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  resolve-identity:
+    name: Freeze PR identity
+    if: github.repository == 'semantic-reasoning/wirelog' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      pr_number: ${{ steps.identity.outputs.pr_number }}
+      base_sha: ${{ steps.identity.outputs.base_sha }}
+      head_sha: ${{ steps.identity.outputs.head_sha }}
+      merge_sha: ${{ steps.identity.outputs.merge_sha }}
+    steps:
+      - name: Prepare HOME-local TMPDIR
+        run: |
+          mkdir -p "$HOME/.tmp"
+          echo "TMPDIR=$HOME/.tmp" >> "$GITHUB_ENV"
+      - name: Resolve and verify PR identity
+        id: identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          response=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")
+          state=$(jq -r '.state' <<<"$response")
+          base_repo=$(jq -r '.base.repo.full_name // ""' <<<"$response")
+          base_ref=$(jq -r '.base.ref // ""' <<<"$response")
+          base_sha=$(jq -r '.base.sha // ""' <<<"$response")
+          head_sha=$(jq -r '.head.sha // ""' <<<"$response")
+          merge_sha=$(jq -r '.merge_commit_sha // ""' <<<"$response")
+          [[ "$state" == open && "$base_repo" == "$GITHUB_REPOSITORY" && "$base_ref" == main ]]
+          [[ "$base_sha" =~ ^[0-9a-f]{40}$ && "$head_sha" =~ ^[0-9a-f]{40}$ && "$merge_sha" =~ ^[0-9a-f]{40}$ ]]
+          merge_ref=$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" \
+            "refs/pull/${PR_NUMBER}/merge" | awk 'NR == 1 { print $1 }')
+          [[ "$merge_ref" == "$merge_sha" ]]
+          {
+            printf 'pr_number=%s\n' "$PR_NUMBER"
+            printf 'base_sha=%s\n' "$base_sha"
+            printf 'head_sha=%s\n' "$head_sha"
+            printf 'merge_sha=%s\n' "$merge_sha"
+          } >> "$GITHUB_OUTPUT"
+          mkdir -p evidence
+          jq -n --arg pr "$PR_NUMBER" --arg base "$base_sha" \
+            --arg head "$head_sha" --arg merge "$merge_sha" \
+            --arg state "$state" --arg repo "$base_repo" --arg ref "$base_ref" \
+            '{pr_number:$pr,base_sha:$base,head_sha:$head,merge_sha:$merge,state:$state,base_repo:$repo,base_ref:$ref}' \
+            > evidence/identity.json
+      - name: Upload frozen identity
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: hosted-calibration-${{ github.run_id }}-identity
+          path: evidence/identity.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  calibration-arm:
+    name: Arm ${{ matrix.ordinal }} / ${{ matrix.first }} to ${{ matrix.second }}
+    needs: [resolve-identity]
+    if: github.repository == 'semantic-reasoning/wirelog' && github.ref == 'refs/heads/main' && needs.resolve-identity.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - ordinal: '01'
+            first: base
+            second: head
+          - ordinal: '02'
+            first: head
+            second: base
+          - ordinal: '03'
+            first: base
+            second: head
+          - ordinal: '04'
+            first: head
+            second: base
+          - ordinal: '05'
+            first: base
+            second: base
+          - ordinal: '06'
+            first: head
+            second: head
+    steps:
+      - name: Prepare isolated evidence directory and TMPDIR
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.tmp" "evidence/${{ matrix.ordinal }}"
+          echo "TMPDIR=$HOME/.tmp" >> "$GITHUB_ENV"
+
+      - name: Checkout trusted workflow tools
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Freeze arm identity
+        env:
+          PR_NUMBER: ${{ needs.resolve-identity.outputs.pr_number }}
+          BASE_SHA: ${{ needs.resolve-identity.outputs.base_sha }}
+          HEAD_SHA: ${{ needs.resolve-identity.outputs.head_sha }}
+          MERGE_SHA: ${{ needs.resolve-identity.outputs.merge_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -n --arg pr "$PR_NUMBER" --arg base "$BASE_SHA" \
+            --arg head "$HEAD_SHA" --arg merge "$MERGE_SHA" \
+            '{pr_number:$pr,base_sha:$base,head_sha:$head,merge_sha:$merge,state:"open",base_repo:"semantic-reasoning/wirelog",base_ref:"main"}' \
+            > "evidence/${{ matrix.ordinal }}/identity.json"
+
+      - name: Checkout immutable first source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.first == 'base' && needs.resolve-identity.outputs.base_sha || needs.resolve-identity.outputs.merge_sha }}
+          path: source/run-01
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout immutable second source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.second == 'base' && needs.resolve-identity.outputs.base_sha || needs.resolve-identity.outputs.merge_sha }}
+          path: source/run-02
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install dependencies and pinned Meson
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build linux-tools-common linux-tools-generic
+        shell: bash
+      - name: Set up Meson 1.12.0
+        id: meson
+        uses: ./trusted/.github/actions/setup-meson
+
+      - name: Request performance governor (best effort)
+        continue-on-error: true
+        shell: bash
+        run: |
+          sudo cpupower frequency-set -g performance || true
+          for cpu in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do
+            echo "governor($cpu) = $(cat "$cpu" 2>/dev/null || echo unavailable)"
+          done
+
+      - name: Build isolated sources and run paired actual gates
+        working-directory: trusted
+        env:
+          CC: gcc
+        shell: bash
+        run: |
+          set -euo pipefail
+          for run_no in 01 02; do
+            source="$GITHUB_WORKSPACE/source/run-$run_no"
+            build="$GITHUB_WORKSPACE/build-${{ matrix.ordinal }}-$run_no"
+            evidence="$GITHUB_WORKSPACE/evidence/${{ matrix.ordinal }}/run-$run_no"
+            mkdir -p "$evidence"
+            git -C "$source" status --porcelain > "$evidence/source-status.txt"
+            git -C "$source" rev-parse HEAD > "$evidence/source-sha.txt"
+            git -C "$source" rev-parse 'HEAD^{tree}' > "$evidence/source-tree.txt"
+            set +e
+            meson setup "$build" "$source" --buildtype=release \
+              -Dwirelog_log_max_level=trace -Dtests=true -DmbedTLS=disabled \
+              > "$evidence/meson-setup.stdout.log" \
+              2> "$evidence/meson-setup.stderr.log"
+            status=$?
+            set -e
+            printf '%s\n' "$status" > "$evidence/meson-setup.exit"
+            if [ "$status" -ne 0 ]; then
+              exit "$status"
+            fi
+            set +e
+            meson compile -C "$build" test_crdt_perf_gate test_cspa_perf_gate \
+              > "$evidence/meson-compile.stdout.log" \
+              2> "$evidence/meson-compile.stderr.log"
+            status=$?
+            set -e
+            printf '%s\n' "$status" > "$evidence/meson-compile.exit"
+            if [ "$status" -ne 0 ]; then
+              exit "$status"
+            fi
+            sha256sum "$build/tests/test_crdt_perf_gate" \
+              "$build/tests/test_cspa_perf_gate" > "$evidence/binary-sha256.txt"
+            for gate in crdt cspa; do
+              case "$gate" in
+                crdt) test_name=crdt_perf_gate ;;
+                cspa) test_name=cspa_w1_gate ;;
+              esac
+              gate_dir="$evidence/$gate"
+              mkdir -p "$gate_dir"
+              taskset -c 0 env TMPDIR="$HOME/.tmp" \
+                python scripts/perf/hosted_perf_calibration.py capture-host \
+                --output "$gate_dir/host-before.json"
+              set +e
+              taskset -c 0 env WIRELOG_PERF_GATE=1 \
+                meson test -C "$build" "$test_name" --print-errorlogs \
+                  --verbose --num-processes 1 \
+                  > "$gate_dir/stdout.log" 2> "$gate_dir/stderr.log"
+              status=$?
+              set -e
+              printf '%s\n' "$status" > "$gate_dir/exit"
+              cp "$build/meson-logs/testlog.txt" \
+                "$gate_dir/meson-testlog.txt"
+              taskset -c 0 env TMPDIR="$HOME/.tmp" \
+                python scripts/perf/hosted_perf_calibration.py capture-host \
+                --output "$gate_dir/host-after.json" || true
+              echo "$run_no $gate Meson exit status: $status"
+              # Target misses, skips, and correctness failures remain evidence.
+            done
+          done
+
+      - name: Capture host state and parsed arm evidence
+        if: always() && steps.meson.outcome == 'success'
+        working-directory: trusted
+        env:
+          ORDINAL: ${{ matrix.ordinal }}
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.tmp" "evidence/$ORDINAL"
+          TMPDIR="$HOME/.tmp" python scripts/perf/hosted_perf_calibration.py capture-ordinal \
+            --ordinal "$ORDINAL" \
+            --identity "$GITHUB_WORKSPACE/evidence/$ORDINAL/identity.json" \
+            --source "$GITHUB_WORKSPACE/source" \
+            --evidence "$GITHUB_WORKSPACE/evidence/$ORDINAL" \
+            --output "$GITHUB_WORKSPACE/evidence/$ORDINAL/$ORDINAL.json" || true
+
+      - name: Upload arm evidence, including partial failures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hosted-calibration-${{ github.run_id }}-${{ matrix.ordinal }}
+          path: evidence/${{ matrix.ordinal }}/
+          if-no-files-found: warn
+          retention-days: 30
+
+  aggregate:
+    name: Aggregate calibration evidence
+    needs: [resolve-identity, calibration-arm]
+    if: always() && github.repository == 'semantic-reasoning/wirelog' && github.ref == 'refs/heads/main' && needs.resolve-identity.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepare aggregate workspace and TMPDIR
+        run: |
+          mkdir -p "$HOME/.tmp" evidence/downloaded
+          echo "TMPDIR=$HOME/.tmp" >> "$GITHUB_ENV"
+      - name: Checkout trusted workflow tools
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download every available arm artifact
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v6
+        with:
+          pattern: hosted-calibration-${{ github.run_id }}-0*
+          path: evidence/downloaded
+          merge-multiple: false
+      - name: Recheck PR and merge identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.resolve-identity.outputs.pr_number }}
+          BASE_SHA: ${{ needs.resolve-identity.outputs.base_sha }}
+          HEAD_SHA: ${{ needs.resolve-identity.outputs.head_sha }}
+          MERGE_SHA: ${{ needs.resolve-identity.outputs.merge_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          response=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}") || response='{}'
+          state=$(jq -r '.state // ""' <<<"$response")
+          base_repo=$(jq -r '.base.repo.full_name // ""' <<<"$response")
+          base_ref=$(jq -r '.base.ref // ""' <<<"$response")
+          base_sha=$(jq -r '.base.sha // ""' <<<"$response")
+          head_sha=$(jq -r '.head.sha // ""' <<<"$response")
+          merge_sha=$(jq -r '.merge_commit_sha // ""' <<<"$response")
+          merge_ref=$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" \
+            "refs/pull/${PR_NUMBER}/merge" | awk 'NR == 1 { print $1 }' || true)
+          if [[ "$merge_ref" != "$MERGE_SHA" ]]; then
+            merge_sha=stale
+          fi
+          jq -n --arg pr "$PR_NUMBER" --arg base "$base_sha" \
+            --arg head "$head_sha" --arg merge "$merge_sha" \
+            --arg state "$state" --arg repo "$base_repo" --arg ref "$base_ref" \
+            '{pr_number:$pr,base_sha:$base,head_sha:$head,merge_sha:$merge,state:$state,base_repo:$repo,base_ref:$ref}' \
+            > evidence/current-identity.json
+          jq -n --arg pr "$PR_NUMBER" --arg base "$BASE_SHA" \
+            --arg head "$HEAD_SHA" --arg merge "$MERGE_SHA" \
+            '{pr_number:$pr,base_sha:$base,head_sha:$head,merge_sha:$merge,state:"open",base_repo:"semantic-reasoning/wirelog",base_ref:"main"}' \
+            > evidence/expected-identity.json
+      - name: Classify complete or partial evidence
+        if: always()
+        working-directory: trusted
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.tmp"
+          TMPDIR="$HOME/.tmp" python scripts/perf/hosted_perf_calibration.py aggregate \
+            --identity "$GITHUB_WORKSPACE/evidence/expected-identity.json" \
+            --current-identity "$GITHUB_WORKSPACE/evidence/current-identity.json" \
+            --evidence "$GITHUB_WORKSPACE/evidence/downloaded" \
+            --output "$GITHUB_WORKSPACE/evidence/campaign-result.json" \
+            | tee "$GITHUB_WORKSPACE/evidence/campaign-status.txt"
+      - name: Publish campaign status
+        if: always()
+        run: |
+          echo '## Hosted performance calibration' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f evidence/campaign-status.txt ]; then
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            cat evidence/campaign-status.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Campaign result is incomplete; no final classification was produced.' \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload aggregate result and logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hosted-calibration-${{ github.run_id }}-aggregate
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 30
