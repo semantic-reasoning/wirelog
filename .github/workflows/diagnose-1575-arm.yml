@@ -74,7 +74,14 @@ jobs:
       - name: Sample reproducers under parent GDB
         run: |
           mkdir -p parent-gdb-1575
-          inferior_ldpath="$PWD/builddir-san/subprojects/nanoarrow:$PWD/builddir-san/subprojects/xxHash-0.8.3"
+          # The xxHash directory comes from the wrap, so a version bump cannot
+          # leave this naming one meson no longer creates (#1899).
+          xxhash_dir=$(sed -n 's/^[[:space:]]*directory[[:space:]]*=[[:space:]]*\([^[:space:]#]*\).*/\1/p' subprojects/xxhash.wrap)
+          if [ -z "$xxhash_dir" ]; then
+            echo "subprojects/xxhash.wrap declares no directory" >&2
+            exit 1
+          fi
+          inferior_ldpath="$PWD/builddir-san/subprojects/nanoarrow:$PWD/builddir-san/subprojects/$xxhash_dir"
           for target in test_compaction test_diff_join test_col_rel_deep_copy \
             test_tdd_decision_stats test_tdd_decision_stats_nofusion; do
             command=(env -i PATH=/usr/bin:/bin LANG=C.UTF-8 DEBUGINFOD_URLS=

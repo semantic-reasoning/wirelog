@@ -1400,6 +1400,22 @@ if sh.found()
        args: [meson.project_source_root() / 'scripts/ci/test-check-subprojects-ignored.sh'],
        suite: 'abi',
        timeout: 120)
+
+  # Issue #1899: the same bump left two build-tree library paths naming
+  # subprojects/xxHash-0.8.3, which .gitignore checks cannot reach.  Every
+  # versioned subprojects/[packagefiles/]NAME-VERSION spelled in a tracked file
+  # must be a directory some wrap declares (comment lines, CHANGELOG.md and the
+  # two fixture-writing selftests aside; names assembled from parts are not
+  # seen).
+  test('wrap_directory_references', sh,
+       args: [meson.project_source_root() / 'scripts/ci/check-wrap-directory-references.sh',
+              meson.project_source_root()],
+       suite: 'abi',
+       timeout: 120)
+  test('wrap_directory_references_selftest', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-check-wrap-directory-references.sh'],
+       suite: 'abi',
+       timeout: 120)
 endif
 
 # Issue #1343: the two wrap-reading gates must agree on what a section header
