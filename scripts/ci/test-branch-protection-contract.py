@@ -8,6 +8,7 @@ full YAML parser would make this gate harder to run on every supported runner.
 
 from __future__ import annotations
 
+import importlib.util
 import re
 import shutil
 import sys
@@ -17,6 +18,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
+spec = importlib.util.spec_from_file_location(
+    'required_correctness', ROOT / 'scripts/ci/check-required-correctness.py')
+correctness = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(correctness)
 CI_PR = Path(".github/workflows/ci-pr.yml")
 CLA_WORKFLOW = Path(".github/workflows/cla-required.yml")
 LINT_PR = Path(".github/workflows/lint-pr.yml")
@@ -250,12 +255,29 @@ def check_perf_workflow(root: Path) -> None:
     trigger = pull_request_block(text)
     require(re.search(r"(?m)^    paths:\s*$", trigger) is not None,
             "perf-suite-required must remain pull-request path-filtered")
-    require(re.search(r"(?m)^\s+- ['\"]?wirelog/columnar/ops\.c['\"]?\s*$", trigger),
-            "perf-suite-required path filter lost its compact-runs surface")
-    require(not re.search(r"(?m)^\s*WIRELOG_PERF_REQUIRE(?:\s*:|=)", text),
-            "path-filtered perf-suite-required must not set WIRELOG_PERF_REQUIRE")
-    require(re.search(r"(?m)^\s*WIRELOG_PERF_GATE:\s*['\"]?1['\"]?\s*$", text),
-            "perf-suite-required must invoke the perf gate explicitly")
+    paths = re.findall(r"(?m)^\s+- ['\"]([^'\"]+)['\"]\s*$", trigger)
+    require(paths == ['wirelog/columnar/ops.c', 'wirelog/columnar/internal.h',
+                      '.github/workflows/perf-suite-required.yml', 'tests/test_crdt_perf_gate.c'],
+            "required correctness must preserve its four path filters")
+    for identity in ('name: Perf Suite Required', '  perf-gate:',
+                     '    name: Perf Suite (col_rel_compact_runs / heap surfaces)',
+                     '    runs-on: ubuntu-latest'):
+        require(identity in text, "required correctness check identity or host changed")
+    require(not any(token in text for token in ('self-hosted', 'WIRELOG_PERF_GATE',
+                'WIRELOG_PERF_REQUIRE', '--suite perf', 'taskset', 'cpupower')),
+            "hosted correctness must not enable timing")
+    require(re.search(r"(?m)^\s*WIRELOG_CRDT_FULL_CORRECTNESS:\s*['\"]?1['\"]?\s*$", text),
+            "required correctness must opt into full CRDT")
+    require('--no-rebuild' in text, "correctness must disable implicit rebuilding")
+    require('python3 scripts/ci/check-required-correctness.py build-perf/meson-logs/testlog.json' in text,
+            "required correctness must validate JSON evidence")
+    require('performance_status=not_evaluated' in text,
+            "correctness summary must not claim timing evidence")
+    command = text.split('meson test -C build-perf', 1)[-1].split('\n          python3', 1)[0]
+    selected = command.replace('\\\n', ' ').split()
+    require(selected == ['--no-rebuild', '--print-errorlogs', '--num-processes', '1',
+                         *correctness.TESTS],
+            "required correctness must run all nine tests explicitly")
 
 
 def check_release_docs(root: Path) -> None:
@@ -380,6 +402,19 @@ class BranchProtectionContractTests(unittest.TestCase):
             lambda text: text.replace("  lint:\n", "  lint-renamed:\n", 1),
             "missing.*'lint'",
         )
+
+    def test_correctness_workflow_mutations_are_rejected(self) -> None:
+        for old, new in (
+            ("WIRELOG_CRDT_FULL_CORRECTNESS: '1'", "WIRELOG_CRDT_FULL_CORRECTNESS: '0'"),
+            ('crdt_correctness_full cspa_correctness', 'cspa_correctness'),
+            ('python3 scripts/ci/check-required-correctness.py', 'echo checker_removed'),
+            ("WIRELOG_CRDT_FULL_CORRECTNESS: '1'", "WIRELOG_PERF_GATE: '1'"),
+        ):
+            with self.subTest(old=old):
+                shutil.copy2(ROOT / PERF_WORKFLOW, self.root / PERF_WORKFLOW)
+                self.assert_mutation_fails(PERF_WORKFLOW,
+                                          lambda text, old=old, new=new: text.replace(old, new),
+                                          'correctness')
 
     def test_stale_docs_perf_contract_is_rejected(self) -> None:
         self.assert_mutation_fails(
