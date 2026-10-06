@@ -55,7 +55,8 @@
  *   configure a trace ceiling and skip before the governor check is even
  *   reached.
  *
- *   The full fixture additionally keeps the WIRELOG_PERF_GATE=1 opt-in,
+ *   The full fixture additionally needs WIRELOG_CRDT_FULL_CORRECTNESS=1
+ *   (or the existing WIRELOG_PERF_GATE=1 opt-in),
  *   because one run costs ~23s (and ~126s in the -O0 sanitizer legs); see
  *   the check at the top of main().  WIRELOG_CRDT_SMALL=1 selects the
  *   closure-derived subset fixture instead (bench/data/crdt-small, see
@@ -267,15 +268,16 @@ main(void)
 
     /* The subset fixture is cheap enough to validate unconditionally; the
      * full one takes ~23s (and ~126s in the -O0 sanitizer legs), so
-     * full-fixture correctness keeps the same opt-in as the timing gate.
+     * full-fixture correctness needs its own opt-in (or the timing opt-in).
      * Note suite membership does not gate anything here -- there is no
      * add_test_setup in this project, so a perf-suite entry still runs in a
      * default `meson test` and must opt out at runtime. */
     if (!probe && correctness_only && !parse_bool_env_("WIRELOG_CRDT_SMALL", 0)
-        && !parse_bool_env_("WIRELOG_PERF_GATE", 0)) {
+        && !parse_bool_env_("WIRELOG_PERF_GATE", 0)
+        && !parse_bool_env_("WIRELOG_CRDT_FULL_CORRECTNESS", 0)) {
         fprintf(stderr,
             "test_crdt_perf_gate: SKIP: full-fixture correctness needs "
-            "WIRELOG_PERF_GATE=1 (~23s); WIRELOG_CRDT_SMALL=1 runs the "
+            "WIRELOG_CRDT_FULL_CORRECTNESS=1 (~23s); WIRELOG_CRDT_SMALL=1 runs the "
             "subset instead\n");
         return SKIP_EXIT;
     }

@@ -543,7 +543,8 @@ perf hardware and a realistic budget is established.
 | `rotate_latency_release_pinned` | `stress-release` | 100000 | on | pinned | release-tier (manual) |
 
 The `perf` suite is invoked by `.github/workflows/perf-nightly.yml` (via
-`meson test --suite perf`) and by the path-filtered `perf-suite-required.yml`;
+`meson test --suite perf`). The path-filtered `perf-suite-required.yml` runs
+explicit correctness tests and validates their evidence without evaluating timing;
 `ci-pr.yml` does NOT pass `--suite perf`. Graph timing remains diagnostic on
 hosted runners because they cannot guarantee the `performance` cpufreq
 governor. DOOP has a separate mandatory hosted execution lane: it runs

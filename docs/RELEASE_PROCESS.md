@@ -340,11 +340,12 @@ shared local/default runs. The release tag job runs the corresponding
 correctness sentinel and records timing attempts; it does not promote a
 hosted timing observation to a blocking absolute-time result.
 
-The Linux `perf-nightly` suite records the observed CPU 0 governor and runs
-its timing gates even when it is not `performance`. Its calibrated targets,
-correctness checks, and coefficient-of-variation checks still apply. This
-nightly exception does not apply to the required performance suite or release
-timing path described below.
+The dedicated Linux `perf-nightly` job uses the local
+`semantic-reasoning:ubuntu26` image and requires the `performance` governor
+and eligible host telemetry. Its ERROR-ceiling CRDT and CSPA timing gates
+require nine trials, correct results, stable coefficient of variation, and
+calibrated targets. The path-filtered required check on `ubuntu-latest` runs
+heap and LFTJ correctness tests and reports `performance_status=not_evaluated`.
 
 The strict authoritative issue #948 timing job, when enabled, uses two
 release/perf build directories on a provisioned Linux runner. Configure the trace build with

@@ -6130,3 +6130,9 @@ test_tdd_occurrence_execution_exe = executable(
 )
 test('tdd_occurrence_execution', test_tdd_occurrence_execution_exe,
      env: ['WIRELOG_TEST_CSPA_PLAN=' + meson.project_source_root() / 'bench/workloads/cspa.dl'])
+
+# Hosted heap correctness evidence must contain every required result.
+test('required_correctness_contract', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-required-correctness.py',
+            test_crdt_perf_gate_exe],
+     suite: 'abi', timeout: 60)

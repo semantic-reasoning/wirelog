@@ -1,41 +1,7 @@
 name: Perf Suite Required
 
-# Issue #738: rerun the --suite perf gate when `col_rel_compact_runs`
-# or any heap-related macro in wirelog/columnar/ops.c changes.
-#
-# Why this exists:
-#   PR #731 added a CRDT median-time gate to `meson test --suite perf`
-#   (`tests/test_crdt_perf_gate.c`).  The gate's win came from a
-#   leading-key shadow array in `col_rel_compact_runs`'s K-way merge
-#   heap (`wirelog/columnar/ops.c:4505+`).  `compact_runs` is shared
-#   with every recursive workload (DOOP, CSPA, Galen, Polonius), so
-#   a regression there silently regresses all of them.
-#
-# Without this gate a future contributor editing `compact_runs`, the
-# K-way merge heap, or `COMPACT_SIFT_DOWN` does not have to rerun the
-# perf-suite gate before merge, and the CRDT W=8 win silently
-# regresses.
-#
-# Trigger surface (coarse, file-level): any change to
-#   wirelog/columnar/ops.c
-# triggers this workflow.  Most edits to that file are unrelated to
-# the heap path, but the perf gate is cheap (~30s), self-skips on
-# noisy runners, and treats "no measurement" as SKIP rather than
-# FAIL, so the false-positive cost is bounded.
-#
-# Stability posture:
-#   - Linux runner: best-effort cpufreq governor = performance, pin
-#     to CPU 0 via taskset.  If the governor cannot be set, the test
-#     self-SKIPs (exit 77) so background load never produces a false
-#     regression.  When the gate actually FAILs, it means a real
-#     regression slipped through.
-#   - continue-on-error: false (required check) -- a real FAIL blocks
-#     the PR.
-#
-# This is the per-PR mirror of `perf-nightly.yml`; the two workflows
-# share the same suite, the same WIRELOG_PERF_GATE=1 entry, and the
-# same SKIP-on-noise self-protection.  The nightly continues to run
-# the full surface unconditionally.
+
+# Hosted correctness covers the shared heap surfaces; perf-nightly owns timing.
 
 on:
   pull_request:
@@ -58,22 +24,10 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build linux-tools-common linux-tools-generic
+          sudo apt-get install -y ninja-build
 
       - name: Set up Meson 1.12.0
         uses: ./.github/actions/setup-meson
-
-      # Best-effort: request the 'performance' cpufreq governor. If
-      # the governor cannot be set (no permission / no governor
-      # driver), the test self-SKIPs with a diagnostic rather than
-      # FAILing.  This matches perf-nightly.yml.
-      - name: Set cpufreq governor (best-effort)
-        continue-on-error: true
-        run: |
-          sudo cpupower frequency-set -g performance || true
-          for cpu in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do
-            echo "governor($cpu) = $(cat "$cpu" 2>/dev/null || echo 'unreadable')"
-          done
 
       - name: Configure release + trace ceiling
         run: >
@@ -88,30 +42,20 @@ jobs:
       - name: Build
         run: meson compile -C build-perf
 
-      # taskset pins the meson test harness to CPU 0. The test still
-      # benefits from the operator-imposed cpufreq=performance check
-      # pre-gate; if that check fails, the test SKIPs cleanly.
-      - name: Run perf suite
+      - name: Run required correctness tests
         env:
-          WIRELOG_PERF_GATE: '1'
+          WIRELOG_CRDT_FULL_CORRECTNESS: '1'
         run: |
-          taskset -c 0 meson test -C build-perf --suite perf --print-errorlogs --num-processes 1
+          meson test -C build-perf --no-rebuild --print-errorlogs --num-processes 1 \
+            crdt_correctness_full cspa_correctness consolidate_kway_merge \
+            compaction k_fusion_merge tdd_sorted_merge_atomic radix_sort lftj lftj_integration
+          python3 scripts/ci/check-required-correctness.py build-perf/meson-logs/testlog.json
 
       - name: Publish results
         if: always()
         shell: bash
         run: |
-          STATUS="${{ job.status }}"
-          echo "## Perf Suite (col_rel_compact_runs / heap)" >> "$GITHUB_STEP_SUMMARY"
-          echo '' >> "$GITHUB_STEP_SUMMARY"
-          echo "Status: **${STATUS}**" >> "$GITHUB_STEP_SUMMARY"
-          echo '' >> "$GITHUB_STEP_SUMMARY"
-          if [ -f build-perf/meson-logs/testlog.txt ]; then
-            echo '<details><summary>Perf suite testlog</summary>' >> "$GITHUB_STEP_SUMMARY"
-            echo '' >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            grep -A 30 'crdt_perf_gate\|test_log_perf_gate' build-perf/meson-logs/testlog.txt 2>/dev/null \
-              | head -200 >> "$GITHUB_STEP_SUMMARY" || true
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            echo '</details>' >> "$GITHUB_STEP_SUMMARY"
-          fi
+          echo "## Required heap correctness" >> "$GITHUB_STEP_SUMMARY"
+          echo "correctness_job_status=${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "performance_status=not_evaluated" >> "$GITHUB_STEP_SUMMARY"
+          echo "Strict timing evidence is owned by perf-nightly." >> "$GITHUB_STEP_SUMMARY"
