@@ -75,6 +75,16 @@ class PerfNightlyDockerContract(unittest.TestCase):
         self.assertIn('cpu_stat=usage_usec=20 user_usec=10 system_usec=1',
                       (ROOT / "scripts/ci/test-nightly-crdt-cspa.sh").read_text(encoding="utf-8"))
 
+    def test_repeated_runs_clear_only_the_owned_meson_environment(self):
+        stable = (ROOT / "scripts/ci/run-perf-stable-linux.sh").read_text(encoding="utf-8")
+        for runner, parent in ((RUNNER, "$tmp_root"), (stable, "$TMPDIR")):
+            with self.subTest(parent=parent):
+                self.assertIn(f'python_env="{parent}/meson-venv"', runner)
+                commands = [line.strip() for line in runner.splitlines()
+                            if line.strip().startswith("uv venv ")]
+                self.assertEqual(commands,
+                                 ['uv venv --clear --python python3 "$python_env"'])
+
     def test_meson_introspection_normalizes_project_suite_namespace(self):
         tests = [
             {"name": "strict gate", "suite": ["wirelog:perf"],

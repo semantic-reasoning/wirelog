@@ -12,7 +12,7 @@ if [[ ${1:-} == --inside-image ]]; then
     export TMPDIR="$HOME/.tmp"
     export UV_CACHE_DIR="$TMPDIR/uv-cache"
     python_env="$TMPDIR/meson-venv"
-    uv venv --python python3 "$python_env"
+    uv venv --clear --python python3 "$python_env"
     uv pip install --python "$python_env/bin/python" 'meson==1.12.0' ninja
     export PATH="$python_env/bin:$PATH"
     rm -rf build-perf-error

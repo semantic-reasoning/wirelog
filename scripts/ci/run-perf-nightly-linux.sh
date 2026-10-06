@@ -13,7 +13,7 @@ if [[ ${1:-} == --inside-image ]]; then
     mkdir -p "$tmp_root"
     export UV_CACHE_DIR="$tmp_root/uv-cache"
     python_env="$tmp_root/meson-venv"
-    uv venv --python python3 "$python_env"
+    uv venv --clear --python python3 "$python_env"
     uv pip install --python "$python_env/bin/python" 'meson==1.12.0' ninja
     export PATH="$python_env/bin:$PATH"
     test "$(meson --version)" = 1.12.0
