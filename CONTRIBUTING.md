@@ -97,30 +97,39 @@ any file or index entry changes.
 See the [clang-tidy Ratchet](CLAUDE.md#clang-tidy-ratchet-issue-1100) section
 and the ratchet registers under `scripts/ci/` for linting policy and checks.
 
-### Perf-suite gate for heap-touching edits
+### Required heap correctness check
 
-The CRDT median-time gate at `tests/test_crdt_perf_gate.c` derives its
-win from a leading-key shadow array in `col_rel_compact_runs`'s K-way
-merge heap (`wirelog/columnar/ops.c`). Because `compact_runs` is
-shared with every recursive workload (DOOP, CSPA, Galen, Polonius),
-a regression in the heap path silently regresses all of them.
+The K-way merge compaction (`col_rel_compact_runs`,
+`col_rel_compact_runs_prepared`, `COMPACT_SIFT_DOWN`) and the K-way
+consolidation live in `wirelog/columnar/merge.c` and are shared with every
+recursive workload (DOOP, CSPA, Galen, Polonius), so a defect there
+silently breaks all of them.
 
-A required-check workflow
-(`.github/workflows/perf-suite-required.yml`) reruns
-`meson test --suite perf` on any PR that touches `wirelog/columnar/ops.c`
-or `wirelog/columnar/internal.h`. The workflow is best-effort on
-shared-runner cpufreq stability:
-
-* If `cpufreq=performance` cannot be set, the test self-SKIPs (exit 77).
-* If a real regression slips through, the gate FAILs and blocks the PR.
+The required check `Perf Suite (col_rel_compact_runs / heap surfaces)`
+(`.github/workflows/perf-suite-required.yml`) runs nine deterministic
+correctness tests on a hosted runner, from CRDT and CSPA full
+correctness to compaction, K-way merge, radix sort and LFTJ, and
+`scripts/ci/check-required-correctness.py` validates their Meson JSON
+evidence. Timing is not evaluated there; `perf-nightly.yml` owns it. The
+workflow is path-filtered: it runs on PRs that touch `merge.c` or
+`ops.c`, any header under `wirelog/` or template of a generated one, the
+nine tests' own test files, with the headers they include and their
+data, any `meson.build`, `meson_options.txt`, the subproject wraps and
+packagefiles, the workflow, its setup action, or the evidence checker
+(#2084). `scripts/ci/test-branch-protection-contract.py` checks that the
+filter covers every in-repo file that `merge.c` and those test sources
+include.
 
 Local reproduction:
 
 ```sh
 meson setup build-perf --buildtype=release -Dwirelog_log_max_level=trace -Dtests=true
 meson compile -C build-perf
-sudo cpupower frequency-set -g performance     # if available
-taskset -c 0 WIRELOG_PERF_GATE=1 meson test -C build-perf --suite perf --print-errorlogs
+WIRELOG_CRDT_FULL_CORRECTNESS=1 meson test -C build-perf --no-rebuild \
+  --print-errorlogs --num-processes 1 crdt_correctness_full cspa_correctness \
+  consolidate_kway_merge compaction k_fusion_merge tdd_sorted_merge_atomic \
+  radix_sort lftj lftj_integration
+python3 scripts/ci/check-required-correctness.py build-perf/meson-logs/testlog.json
 ```
 
 ### Shell-gate walltime budget

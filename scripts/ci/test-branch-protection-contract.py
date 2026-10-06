@@ -250,15 +250,121 @@ def check_lint_contexts(root: Path) -> None:
     )
 
 
+# Issue #2084: the compaction code moved from ops.c to merge.c (9c26ca49).
+# These entries must stay in the filter; check_perf_coverage() then proves
+# the filter covers every in-repo file that merge.c and the required tests
+# include, directly or not.
+REQUIRED_PERF_PATHS = (
+    "wirelog/columnar/ops.c",
+    "wirelog/columnar/internal.h",
+    ".github/workflows/perf-suite-required.yml",
+    "tests/test_crdt_perf_gate.c",
+    "wirelog/columnar/merge.c",
+    "scripts/ci/check-required-correctness.py",
+    # Inputs no #include reaches: the gates' data and the build itself.
+    "bench/data/crdt/**",
+    "bench/data/cspa/**",
+    "**/meson.build",
+    "meson_options.txt",
+    "subprojects/*.wrap",
+    "subprojects/packagefiles/**",
+)
+
+# The source each required correctness test is built from (tests/meson.build).
+REQUIRED_TEST_SOURCES = {
+    "crdt_correctness_full": "tests/test_crdt_perf_gate.c",
+    "cspa_correctness": "tests/test_cspa_perf_gate.c",
+    "consolidate_kway_merge": "tests/test_consolidate_kway_merge.c",
+    "compaction": "tests/test_compaction.c",
+    "k_fusion_merge": "tests/test_k_fusion_merge.c",
+    "tdd_sorted_merge_atomic": "tests/test_tdd_sorted_merge_atomic.c",
+    "radix_sort": "tests/test_radix_sort.c",
+    "lftj": "tests/test_lftj.c",
+    "lftj_integration": "tests/test_lftj_integration.c",
+}
+
+# Includes that resolve outside this repository.
+EXTERNAL_INCLUDES = frozenset({"nanoarrow/nanoarrow.h"})
+
+
+def glob_regex(pattern: str) -> re.Pattern[str]:
+    """Translate a GitHub `paths` glob (`**/` = zero or more directories)."""
+    out = []
+    i = 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile("^" + "".join(out) + "$")
+
+
+def include_closure(starts) -> set[str]:
+    """In-repo files reachable from @starts through `#include "..."`.
+
+    A header meson generates is represented by its `.in` template.
+    """
+    include = re.compile(r'(?m)^\s*#\s*include\s*"([^"]+)"')
+    seen: set[str] = set()
+    stack = list(starts)
+    while stack:
+        path = stack.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        source = ROOT / path
+        require(source.is_file(), f"required correctness input missing: {path}")
+        for name in include.findall(source.read_text(encoding="utf-8",
+                                                     errors="replace")):
+            for base in (Path(path).parent, Path("wirelog"), Path(".")):
+                resolved = (ROOT / base / name).resolve()
+                try:
+                    relative = resolved.relative_to(ROOT).as_posix()
+                except ValueError:
+                    continue
+                if resolved.is_file():
+                    stack.append(relative)
+                    break
+                if resolved.with_name(resolved.name + ".in").is_file():
+                    seen.add(relative + ".in")
+                    break
+            else:
+                require(name in EXTERNAL_INCLUDES,
+                        f"{path} includes {name}, which resolves nowhere")
+    return seen
+
+
+def check_perf_coverage(paths: list[str]) -> None:
+    require(set(REQUIRED_TEST_SOURCES) == set(correctness.TESTS),
+            "REQUIRED_TEST_SOURCES must map every required correctness test")
+    patterns = [glob_regex(path) for path in paths]
+    starts = ["wirelog/columnar/merge.c", *REQUIRED_TEST_SOURCES.values()]
+    uncovered = sorted(path for path in include_closure(starts)
+                       if not any(p.match(path) for p in patterns))
+    require(not uncovered,
+            f"required correctness path filter does not cover {uncovered}")
+
+
 def check_perf_workflow(root: Path) -> None:
     text = strip_yaml_comments(read(root, PERF_WORKFLOW))
     trigger = pull_request_block(text)
     require(re.search(r"(?m)^    paths:\s*$", trigger) is not None,
             "perf-suite-required must remain pull-request path-filtered")
     paths = re.findall(r"(?m)^\s+- ['\"]([^'\"]+)['\"]\s*$", trigger)
-    require(paths == ['wirelog/columnar/ops.c', 'wirelog/columnar/internal.h',
-                      '.github/workflows/perf-suite-required.yml', 'tests/test_crdt_perf_gate.c'],
-            "required correctness must preserve its four path filters")
+    require(not any(path.startswith("!") for path in paths),
+            "required correctness path filter must not negate a path")
+    missing = [path for path in REQUIRED_PERF_PATHS if path not in paths]
+    require(not missing,
+            f"required correctness path filter lost {missing}")
+    check_perf_coverage(paths)
     for identity in ('name: Perf Suite Required', '  perf-gate:',
                      '    name: Perf Suite (col_rel_compact_runs / heap surfaces)',
                      '    runs-on: ubuntu-latest'):
@@ -415,6 +521,44 @@ class BranchProtectionContractTests(unittest.TestCase):
                 self.assert_mutation_fails(PERF_WORKFLOW,
                                           lambda text, old=old, new=new: text.replace(old, new),
                                           'correctness')
+
+    def test_perf_filter_without_merge_c_is_rejected(self) -> None:
+        self.assert_mutation_fails(
+            PERF_WORKFLOW,
+            lambda text: text.replace("      - 'wirelog/columnar/merge.c'\n", "", 1),
+            "path filter lost",
+        )
+
+    def test_perf_filter_negation_is_rejected(self) -> None:
+        self.assert_mutation_fails(
+            PERF_WORKFLOW,
+            lambda text: text.replace("      - 'wirelog/**/*.h'\n",
+                                      "      - 'wirelog/**/*.h'\n"
+                                      "      - '!wirelog/columnar/merge.c'\n", 1),
+            "must not negate",
+        )
+
+    def test_perf_filter_without_build_files_is_rejected(self) -> None:
+        self.assert_mutation_fails(
+            PERF_WORKFLOW,
+            lambda text: text.replace("      - '**/meson.build'\n", "", 1),
+            "path filter lost",
+        )
+
+    def test_perf_filter_without_headers_is_rejected(self) -> None:
+        self.assert_mutation_fails(
+            PERF_WORKFLOW,
+            lambda text: text.replace("      - 'wirelog/**/*.h'\n", "", 1),
+            "does not cover",
+        )
+
+    def test_perf_filter_without_a_test_source_is_rejected(self) -> None:
+        self.assert_mutation_fails(
+            PERF_WORKFLOW,
+            lambda text: text.replace("      - 'tests/test_lftj_integration.c'\n",
+                                      "", 1),
+            "does not cover",
+        )
 
     def test_stale_docs_perf_contract_is_rejected(self) -> None:
         self.assert_mutation_fails(

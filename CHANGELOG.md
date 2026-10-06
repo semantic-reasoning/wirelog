@@ -51,6 +51,23 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **The required heap correctness check watches the moved compaction
+  code** (#2084): `perf-suite-required.yml` fired only on
+  `wirelog/columnar/ops.c`, `wirelog/columnar/internal.h`, the CRDT gate
+  and the workflow, but `col_rel_compact_runs`,
+  `col_rel_compact_runs_prepared` and `COMPACT_SIFT_DOWN` moved to
+  `wirelog/columnar/merge.c` in `9c26ca49`, so an edit to the compaction
+  code did not run the check.  The filter now also watches `merge.c`,
+  every header under `wirelog/` and the templates of the generated ones,
+  the nine required correctness tests' own test files, with the headers
+  they include and their data, every `meson.build`, `meson_options.txt`,
+  the subproject wraps and packagefiles, the setup action and the
+  evidence checker.  `test-branch-protection-contract.py` no longer pins
+  the filter to its four original paths; it requires those plus
+  `merge.c`, the checker, the data and the build inputs, rejects negated
+  entries, and proves the filter covers every in-repo file that
+  `merge.c` and the required tests include, directly or not.
+
 - **Steps without a delta callback no longer pile up derived rows**
   (#1994): `wirelog_easy_step()` on a session with no delta callback
   re-derived every rule on every step on top of what the previous step
