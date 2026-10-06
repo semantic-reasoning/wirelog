@@ -2,6 +2,18 @@ name: Perf Suite Required
 
 
 # Hosted correctness covers the shared heap surfaces; perf-nightly owns timing.
+#
+# Path filter (#2084): the compaction code (col_rel_compact_runs,
+# col_rel_compact_runs_prepared, COMPACT_SIFT_DOWN) and the K-way
+# consolidation live in wirelog/columnar/merge.c since 9c26ca49, not in
+# ops.c.  The filter watches merge.c and ops.c, every header under
+# wirelog/ and the templates of the generated ones, the nine correctness
+# tests' own test files below, with the headers they include and their
+# data, every meson.build and meson_options.txt, the subproject wraps and
+# packagefiles, this workflow, its setup action, and the evidence checker.
+# Together these cover every in-repo file that merge.c and those test
+# sources include, directly or not; test-branch-protection-contract.py
+# checks that.
 
 on:
   pull_request:
@@ -10,6 +22,29 @@ on:
       - 'wirelog/columnar/internal.h'
       - '.github/workflows/perf-suite-required.yml'
       - 'tests/test_crdt_perf_gate.c'
+      - 'wirelog/columnar/merge.c'
+      - 'wirelog/**/*.h'
+      - 'wirelog/**/*.h.in'
+      - 'tests/test_cspa_perf_gate.c'
+      - 'tests/test_perf_util.h'
+      - 'tests/plan_fixture.h'
+      - 'bench/bench_crdt_workload.h'
+      - 'bench/data/crdt/**'
+      - 'bench/data/cspa/**'
+      - 'tests/test_consolidate_kway_merge.c'
+      - 'tests/test_compaction.c'
+      - 'tests/test_k_fusion_merge.c'
+      - 'tests/test_tdd_sorted_merge_atomic.c'
+      - 'tests/test_radix_sort.c'
+      - 'tests/test_lftj.c'
+      - 'tests/test_lftj_integration.c'
+      - '**/meson.build'
+      - 'meson_options.txt'
+      - 'subprojects/*.wrap'
+      - 'subprojects/packagefiles/**'
+      - '.github/actions/setup-meson/**'
+      - 'scripts/ci/check-required-correctness.py'
+      - 'scripts/ci/test-required-correctness.py'
 
 permissions:
   contents: read

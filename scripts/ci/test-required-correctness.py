@@ -67,9 +67,13 @@ class Evidence(unittest.TestCase):
         command = workflow.split('meson test -C build-perf', 1)[1].split('\n          python3', 1)[0]
         selected = command.replace('\\\n', ' ').split()
         self.assertEqual([word for word in selected if word in checker.TESTS], list(checker.TESTS))
-        self.assertEqual(re.findall(r"      - '([^']+)'", workflow),
+        paths = re.findall(r"      - '([^']+)'", workflow)
+        self.assertEqual(paths[:4],
                          ['wirelog/columnar/ops.c', 'wirelog/columnar/internal.h',
                           '.github/workflows/perf-suite-required.yml', 'tests/test_crdt_perf_gate.c'])
+        # Issue #2084: the compaction code lives in merge.c; the coverage of
+        # the rest of the surface is proven by test-branch-protection-contract.py.
+        self.assertIn('wirelog/columnar/merge.c', paths)
         self.assertIn('name: Perf Suite Required', workflow)
         self.assertIn('  perf-gate:', workflow)
         self.assertIn('name: Perf Suite (col_rel_compact_runs / heap surfaces)', workflow)
