@@ -250,8 +250,11 @@ def check_perf_workflow(root: Path) -> None:
     trigger = pull_request_block(text)
     require(re.search(r"(?m)^    paths:\s*$", trigger) is not None,
             "perf-suite-required must remain pull-request path-filtered")
-    require(re.search(r"(?m)^\s+- ['\"]?wirelog/columnar/ops\.c['\"]?\s*$", trigger),
+    # Issue #2084: the compaction code lives in merge.c since 9c26ca49.
+    require(re.search(r"(?m)^\s+- ['\"]?wirelog/columnar/merge\.c['\"]?\s*$", trigger),
             "perf-suite-required path filter lost its compact-runs surface")
+    require('git show "$BASE_SHA:scripts/ci/classify-perf-surface.py"' in text,
+            "perf-suite-required must run the classifier from the base SHA")
     require(not re.search(r"(?m)^\s*WIRELOG_PERF_REQUIRE(?:\s*:|=)", text),
             "path-filtered perf-suite-required must not set WIRELOG_PERF_REQUIRE")
     require(re.search(r"(?m)^\s*WIRELOG_PERF_GATE:\s*['\"]?1['\"]?\s*$", text),
@@ -379,6 +382,22 @@ class BranchProtectionContractTests(unittest.TestCase):
             CI_PR,
             lambda text: text.replace("  lint:\n", "  lint-renamed:\n", 1),
             "missing.*'lint'",
+        )
+
+    def test_perf_filter_without_merge_c_is_rejected(self) -> None:
+        self.assert_mutation_fails(
+            PERF_WORKFLOW,
+            lambda text: text.replace("- 'wirelog/columnar/merge.c'\n", "", 1),
+            "lost its compact-runs surface",
+        )
+
+    def test_perf_classifier_from_head_is_rejected(self) -> None:
+        self.assert_mutation_fails(
+            PERF_WORKFLOW,
+            lambda text: text.replace(
+                '"$BASE_SHA:scripts/ci/classify-perf-surface.py"',
+                '"$HEAD_SHA:scripts/ci/classify-perf-surface.py"', 1),
+            "classifier from the base SHA",
         )
 
     def test_stale_docs_perf_contract_is_rejected(self) -> None:

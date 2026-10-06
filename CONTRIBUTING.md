@@ -101,14 +101,23 @@ and the ratchet registers under `scripts/ci/` for linting policy and checks.
 
 The CRDT median-time gate at `tests/test_crdt_perf_gate.c` derives its
 win from a leading-key shadow array in `col_rel_compact_runs`'s K-way
-merge heap (`wirelog/columnar/ops.c`). Because `compact_runs` is
+merge heap (`wirelog/columnar/merge.c`). Because `compact_runs` is
 shared with every recursive workload (DOOP, CSPA, Galen, Polonius),
 a regression in the heap path silently regresses all of them.
 
-A required-check workflow
-(`.github/workflows/perf-suite-required.yml`) reruns
-`meson test --suite perf` on any PR that touches `wirelog/columnar/ops.c`
-or `wirelog/columnar/internal.h`. The workflow is best-effort on
+A required-check workflow (`.github/workflows/perf-suite-required.yml`)
+reruns `meson test --suite perf` on PRs that touch the compaction
+surface: `wirelog/columnar/merge.c`, any header under `wirelog/` or
+template of a generated one, the CRDT and CSPA gates with the headers
+they include and their data, the meson build files, the workflow, its
+setup action, or its classifier. It also fires on
+`wirelog/columnar/ops.c`, where the heap used to live.
+`scripts/ci/classify-perf-surface.py`, taken from the PR's base commit,
+reads the whole PR diff and skips the suite only for `ops.c` edits whose
+changed lines are comments or stay inside function bodies, change no
+preprocessor line, use no assembly, attribute, pragma or reserved
+identifier, and name no compaction symbol; every other case runs it, and
+the job summary records why (#2084). The workflow is best-effort on
 shared-runner cpufreq stability:
 
 * If `cpufreq=performance` cannot be set, the test self-SKIPs (exit 77).

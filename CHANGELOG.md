@@ -51,6 +51,25 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **The required Perf Suite watches the moved compaction code**
+  (#2084): `perf-suite-required.yml` still fired on
+  `wirelog/columnar/ops.c`, but `col_rel_compact_runs`,
+  `col_rel_compact_runs_prepared` and `COMPACT_SIFT_DOWN` moved to
+  `wirelog/columnar/merge.c` in `9c26ca49`, so an edit to the compaction
+  code no longer ran the check.  Its path filter now watches `merge.c`,
+  every header under `wirelog/` and the generated headers' templates,
+  the CRDT and CSPA gates with the headers they include and their data,
+  the build inputs, the workflow, its setup action and a new classifier,
+  `scripts/ci/classify-perf-surface.py`.  The workflow runs the
+  classifier as it exists at the pull request's base SHA, and the
+  classifier reads the complete base...head diff.  It skips the strict
+  suite only for an `ops.c` edit whose changed lines, read with
+  backslash-newlines spliced, are comments or lie inside function
+  bodies, touch no preprocessor line, use no assembly, attribute, pragma
+  or reserved identifier, and name no compaction symbol; anything else
+  runs the suite.  The check keeps its name, and the job summary records
+  the verdict, its reasons and the compared SHAs.
+
 - **Steps without a delta callback no longer pile up derived rows**
   (#1994): `wirelog_easy_step()` on a session with no delta callback
   re-derived every rule on every step on top of what the previous step

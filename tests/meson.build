@@ -1020,6 +1020,13 @@ test('branch_protection_contract', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-branch-protection-contract.py'],
      suite: 'abi')
 
+# Issue #2084: the required Perf Suite's applicability classifier, against a
+# fixture repository (it runs git, hence the explicit timeout).
+test('classify_perf_surface', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-classify-perf-surface.py'],
+     suite: 'abi',
+     timeout: 120)
+
 # Issue #1464: every shell-seeded test registered in this file must carry an
 # explicit positive timeout that is not Meson's 30s default (see the rule
 # above `sh = find_program('bash', ...)`).  Registered outside `if sh.found()`

@@ -1,13 +1,13 @@
 name: Perf Suite Required
 
 # Issue #738: rerun the --suite perf gate when `col_rel_compact_runs`
-# or any heap-related macro in wirelog/columnar/ops.c changes.
+# or any heap-related macro in wirelog/columnar/merge.c changes.
 #
 # Why this exists:
 #   PR #731 added a CRDT median-time gate to `meson test --suite perf`
 #   (`tests/test_crdt_perf_gate.c`).  The gate's win came from a
 #   leading-key shadow array in `col_rel_compact_runs`'s K-way merge
-#   heap (`wirelog/columnar/ops.c:4505+`).  `compact_runs` is shared
+#   heap (`wirelog/columnar/merge.c`).  `compact_runs` is shared
 #   with every recursive workload (DOOP, CSPA, Galen, Polonius), so
 #   a regression there silently regresses all of them.
 #
@@ -16,12 +16,29 @@ name: Perf Suite Required
 # perf-suite gate before merge, and the CRDT W=8 win silently
 # regresses.
 #
-# Trigger surface (coarse, file-level): any change to
-#   wirelog/columnar/ops.c
-# triggers this workflow.  Most edits to that file are unrelated to
-# the heap path, but the perf gate is cheap (~30s), self-skips on
-# noisy runners, and treats "no measurement" as SKIP rather than
-# FAIL, so the false-positive cost is bounded.
+# Trigger surface (#2084): the compaction code moved to
+# wirelog/columnar/merge.c (9c26ca49), so the path filter below watches
+# merge.c, every header under wirelog/ and the templates of the generated
+# ones, the CRDT/CSPA gates with the headers they include and their data,
+# the build inputs, this workflow, its setup action, and the classifier.
+# Together these cover every in-repo file that merge.c and the two gates
+# include, directly or not.  It also still watches wirelog/columnar/ops.c,
+# the former home of the code.  scripts/ci/classify-perf-surface.py, run
+# as it exists at the pull request's base SHA, then decides from the
+# complete base...head diff whether the strict suite applies: an ops.c
+# edit is judged unrelated only when every changed line, read with
+# backslash-newlines spliced, is a comment or lies inside a function body
+# at every character, is no preprocessor directive, uses no assembly,
+# attribute, pragma or reserved identifier, and names no compaction
+# symbol.  Anything else -- including a protected path on either side of a
+# rename, missing history, malformed input, or a classifier that cannot
+# run -- runs the strict suite.  The job keeps its name either way, and
+# the summary records the verdict, its reasons and the compared SHAs.
+#
+# A pull_request workflow runs the definition from the pull request
+# itself, so a pull request that edits this file can change how it is
+# judged; the classifier is pinned to the base, and this file is itself a
+# protected path, but reviewing workflow edits remains the backstop.
 #
 # Stability posture:
 #   - Linux runner: best-effort cpufreq governor = performance, pin
@@ -40,10 +57,25 @@ name: Perf Suite Required
 on:
   pull_request:
     paths:
-      - 'wirelog/columnar/ops.c'
-      - 'wirelog/columnar/internal.h'
-      - '.github/workflows/perf-suite-required.yml'
+      - 'wirelog/columnar/merge.c'
+      - 'wirelog/**/*.h'
+      - 'wirelog/**/*.h.in'
+      - 'config.h.in'
       - 'tests/test_crdt_perf_gate.c'
+      - 'tests/test_cspa_perf_gate.c'
+      - 'tests/test_perf_util.h'
+      - 'bench/bench_crdt_workload.h'
+      - 'bench/data/crdt/**'
+      - 'bench/data/cspa/**'
+      - 'meson.build'
+      - 'meson_options.txt'
+      - 'tests/meson.build'
+      - 'wirelog/meson.build'
+      - '.github/workflows/perf-suite-required.yml'
+      - '.github/actions/setup-meson/**'
+      - 'scripts/ci/classify-perf-surface.py'
+      - 'scripts/ci/test-classify-perf-surface.py'
+      - 'wirelog/columnar/ops.c'
 
 permissions:
   contents: read
@@ -54,13 +86,52 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # Issue #2084: the classifier comes from the base SHA, never from the
+      # pull request, and only a single well-formed `applicable=false` line
+      # from a clean exit skips the suite.
+      - name: Classify the change against the protected surface
+        id: classify
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -u
+          trusted="$RUNNER_TEMP/classify-perf-surface.py"
+          verdict="applicable=true"
+          fallback() {
+            {
+              echo "## Perf Suite applicability (#2084)"
+              echo ""
+              echo "- base: \`$BASE_SHA\`"
+              echo "- head: \`$HEAD_SHA\`"
+              echo "- verdict: **applicable** ($1)"
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+          if ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            fallback "the base SHA is not in the fetched history"
+          elif ! git show "$BASE_SHA:scripts/ci/classify-perf-surface.py" > "$trusted" 2>/dev/null; then
+            fallback "no classifier at the base SHA"
+          elif ! out=$(python3 "$trusted" --repo . --base "$BASE_SHA" --head "$HEAD_SHA" \
+                         --summary "$GITHUB_STEP_SUMMARY"); then
+            fallback "the base classifier exited non-zero"
+          elif [ "$out" = "applicable=false" ]; then
+            verdict="applicable=false"
+          fi
+          echo "$verdict" >> "$GITHUB_OUTPUT"
+          echo "$verdict"
 
       - name: Install dependencies
+        if: steps.classify.outputs.applicable == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build linux-tools-common linux-tools-generic
 
       - name: Set up Meson 1.12.0
+        if: steps.classify.outputs.applicable == 'true'
         uses: ./.github/actions/setup-meson
 
       # Best-effort: request the 'performance' cpufreq governor. If
@@ -68,6 +139,7 @@ jobs:
       # driver), the test self-SKIPs with a diagnostic rather than
       # FAILing.  This matches perf-nightly.yml.
       - name: Set cpufreq governor (best-effort)
+        if: steps.classify.outputs.applicable == 'true'
         continue-on-error: true
         run: |
           sudo cpupower frequency-set -g performance || true
@@ -76,6 +148,7 @@ jobs:
           done
 
       - name: Configure release + trace ceiling
+        if: steps.classify.outputs.applicable == 'true'
         run: >
           meson setup build-perf
           --buildtype=release
@@ -86,12 +159,14 @@ jobs:
           CC: gcc
 
       - name: Build
+        if: steps.classify.outputs.applicable == 'true'
         run: meson compile -C build-perf
 
       # taskset pins the meson test harness to CPU 0. The test still
       # benefits from the operator-imposed cpufreq=performance check
       # pre-gate; if that check fails, the test SKIPs cleanly.
       - name: Run perf suite
+        if: steps.classify.outputs.applicable == 'true'
         env:
           WIRELOG_PERF_GATE: '1'
         run: |
@@ -102,9 +177,10 @@ jobs:
         shell: bash
         run: |
           STATUS="${{ job.status }}"
+          APPLICABLE="${{ steps.classify.outputs.applicable }}"
           echo "## Perf Suite (col_rel_compact_runs / heap)" >> "$GITHUB_STEP_SUMMARY"
           echo '' >> "$GITHUB_STEP_SUMMARY"
-          echo "Status: **${STATUS}**" >> "$GITHUB_STEP_SUMMARY"
+          echo "Status: **${STATUS}** (strict suite applicable: ${APPLICABLE:-unknown})" >> "$GITHUB_STEP_SUMMARY"
           echo '' >> "$GITHUB_STEP_SUMMARY"
           if [ -f build-perf/meson-logs/testlog.txt ]; then
             echo '<details><summary>Perf suite testlog</summary>' >> "$GITHUB_STEP_SUMMARY"
