@@ -1001,9 +1001,9 @@ test_failed_plain_step_leaves_a_full_evaluation_pending(void)
 }
 
 /* Issue #1994: removing a host row from a rule head also removes it from the
- * head's input record.  When the relation no longer holds the row -- a
- * delta-callback step can drop it -- the model does not change, so the next
- * step must leave a rule in another stratum alone. */
+ * head's input record, and the next step must leave a rule in another
+ * stratum alone.  Issue #2091: a delta-callback step keeps the row in the
+ * head, so the removal retracts it and publishes exactly that one event. */
 static void
 test_input_only_removal_leaves_other_rules_alone(void)
 {
@@ -1013,7 +1013,7 @@ test_input_only_removal_leaves_other_rules_alone(void)
     int64_t value;
     int64_t edge[2] = { 1, 2 };
 
-    TEST("removing input the model already lacks re-runs no other rule");
+    TEST("removing a host row from a rule head re-runs no other rule");
     calls = 0;
     why = fixture_open(&fx, REACH_PROGRAM,
             WIRELOG_EXTENSION_CALLBACK_THREAD_SAFE, stable_action);
@@ -1046,9 +1046,9 @@ test_input_only_removal_leaves_other_rules_alone(void)
     if (!why)
         why = step_once(&fx, &n);
     if (!why)
-        why = expect_count(n, 0, "removal the model already reflects");
+        why = expect_count(n, 0, "removal from the other stratum");
     if (!why)
-        why = expect_count(nevents, 0, "events for that removal");
+        why = expect_one_event("reach", 7, 0, -1, "events for that removal");
     {
         const char *teardown = fixture_close(&fx);
         if (!why)

@@ -291,7 +291,13 @@ wirelog_easy_remove_sym(wirelog_easy_session_t *s, const char *relation, ...);
  * Advance the session by one step, lazily building the plan if needed.
  *
  * With a delta callback installed (wirelog_easy_set_delta_cb()) a step is
- * incremental and reports what changed to the callback.  Without one a step
+ * incremental and reports to the callback the set difference between the
+ * model it derives and the one the last step or snapshot that evaluated
+ * left.  The input rows of a relation that is also a rule head belong to
+ * that model like its derived rows: an inline fact there, or a host row
+ * inserted into it, is reported as +1 by the step that first adds it, and a
+ * host removal of such a row as -1 once neither a rule nor another inserted
+ * copy still holds it.  Without one a step
  * is a full re-evaluation: when anything was inserted or removed since the
  * last step or snapshot that evaluated, it discards the derived rows and
  * re-derives every rule, keeping the input rows of a relation that is also
