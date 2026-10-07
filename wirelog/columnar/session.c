@@ -5060,6 +5060,13 @@ col_session_step_impl(wl_session_t *session)
             return rc;
         }
         if (sess->plain_step_completion_step_context) {
+            /* The stratum, including checked cleanup/finalization, committed.
+             * Preserve that prefix if a later W1 stratum returns an ordinary
+             * error before the final compaction continuation is armed. */
+            if (sess->num_workers <= 1) {
+                sess->plain_step_completion_pending = true;
+                sess->plain_step_completion_active = true;
+            }
             sess->plain_step_completion_stratum = si;
             sess->plain_step_completion_phase =
                 WL_COLUMNAR_PLAIN_STEP_COMPLETION_EVALUATE_REMAINING;

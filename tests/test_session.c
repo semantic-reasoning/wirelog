@@ -15393,9 +15393,273 @@ cleanup:
 }
 #endif
 
+#ifdef WL_SESSION_TEST_HOOKS
+static wl_columnar_source_access_reader_t plain_error_reader;
+static unsigned plain_error_hook_count, plain_error_target_call;
+static unsigned plain_error_action;
+static bool plain_error_prefix_completed;
+static int plain_error_hook_status;
+
+static bool
+plain_error_exact_prefix(const wl_col_session_t *sess, const char *name)
+{
+    col_rel_t *rel = session_find_rel((wl_col_session_t *)sess, name);
+    return rel && rel->ncols == 1 && rel->nrows == 3
+           && rel->columns[0][0] == 1 && rel->columns[0][1] == 2
+           && rel->columns[0][2] == 3;
+}
+
+static void
+plain_error_after_plan(wl_col_session_t *sess, eval_stack_t *stack,
+    eval_entry_t *result)
+{
+    (void)stack;
+    if (++plain_error_hook_count != plain_error_target_call)
+        return;
+    plain_error_prefix_completed = plain_error_exact_prefix(sess, "first");
+    plain_error_hook_status = EINVAL;
+    if (!result->owned || !result->rel)
+        return;
+    if (plain_error_action == 0) {
+        plain_error_hook_status = col_rel_source_reader_acquire(result->rel,
+                &plain_error_reader);
+#ifdef WL_TEST_ALLOC_WRAP
+    } else {
+        /* The next real allocation is the checked result rename (initial
+         * evaluation) or publication copy (a warmed session). */
+        fail_next_alloc = true;
+        plain_error_hook_status = 0;
+#endif
+    }
+}
+
+static void
+plain_error_arm(unsigned call, unsigned action)
+{
+    plain_error_hook_count = 0;
+    plain_error_target_call = call;
+    plain_error_action = action;
+    plain_error_prefix_completed = false;
+    plain_error_hook_status = EINVAL;
+    wl_columnar_eval_serial_test_after_plan = plain_error_after_plan;
+}
+static int
+plain_error_value_compare(const void *a, const void *b)
+{
+    int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+    return (x > y) - (x < y);
+}
+static bool
+plain_error_compare_bags(wl_col_session_t *actual, wl_col_session_t *reference)
+{
+    bool equal = actual->nrels == reference->nrels;
+    for (uint32_t i = 0; i < actual->nrels; i++) {
+        col_rel_t *a = actual->rels[i];
+        col_rel_t *b = session_find_rel(reference, a->name);
+        printf("\n  relation=%s actual_rows=%u reference_rows=%u actual_bag=",
+            a->name, a->nrows, b ? b->nrows : 0);
+        int64_t av[16], bv[16];
+        if (!b || a->ncols != 1 || b->ncols != 1 || a->nrows > 16
+            || b->nrows > 16) {
+            equal = false;
+            puts("invalid fixture relation");
+            continue;
+        }
+        for (uint32_t r = 0; r < a->nrows; r++) av[r] = a->columns[0][r];
+        for (uint32_t r = 0; r < b->nrows; r++) bv[r] = b->columns[0][r];
+        qsort(av, a->nrows, sizeof(*av), plain_error_value_compare);
+        qsort(bv, b->nrows, sizeof(*bv), plain_error_value_compare);
+        for (uint32_t r = 0; r < a->nrows;
+            r++) printf("%lld,", (long long)av[r]);
+        printf(" reference_bag=");
+        for (uint32_t r = 0; r < b->nrows;
+            r++) printf("%lld,", (long long)bv[r]);
+        puts("");
+        if (a->nrows != b->nrows || (a->nrows == b->nrows
+            && memcmp(av, bv, a->nrows * sizeof(*av)) != 0)) equal = false;
+    }
+    return equal;
+}
+
+/* mode: STEP, SNAPSHOT, repeated ENOMEM, first-stratum refusal, destruction,
+ * or a third-stratum refusal after the resumed second stratum commits. */
+static void
+test_plain_step_ordinary_error(bool warmed, unsigned mode)
+{
+    TEST("callback-free W1 ordinary error resumes exact completed-prefix bags");
+    uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } }
+    };
+    wl_plan_relation_t relations[] = {
+        { .name = "first", .ops = ops, .op_count = 2 },
+        { .name = "second", .ops = ops, .op_count = 2 },
+        { .name = "third", .ops = ops, .op_count = 2 }
+    };
+    wl_plan_stratum_t strata[] = {
+        { .relations = &relations[0], .relation_count = 1,
+          .is_recursive = false },
+        { .relations = &relations[1], .relation_count = 1,
+          .is_recursive = false },
+        { .relations = &relations[2], .relation_count = 1,
+          .is_recursive = false }
+    };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = strata, .stratum_count = mode == 5 ? 3 : 2,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL, *reference = NULL;
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    const char *failure = NULL;
+#define PLAIN_ERROR_CHECK(c, m) do { if (!(c)) { failure = (m); goto cleanup; \
+                                     } } while (0)
+    int64_t seed[] = { 1, 2 }, inserted = 3, blocked = 4;
+    PLAIN_ERROR_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0 && wl_session_create(wl_backend_columnar(), &plan, 1,
+        &reference) == 0, "create independent sessions");
+    wl_col_session_t *sess = COL_SESSION(session);
+    governor = sess->memory_governor;
+    wl_columnar_memory_governor_ref_retain(governor);
+    PLAIN_ERROR_CHECK(sess->num_workers == 1 && !session->evaluation_control
+        && !sess->delta_cb && !sess->delta_observer,
+        "no-control no-callback W1 preconditions");
+    for (unsigned i = 0; i < 2; i++) {
+        wl_session_t *s = i ? reference : session;
+        PLAIN_ERROR_CHECK(wl_session_insert(s, "input", seed, 2, 1) == 0
+            && (!warmed || wl_session_step(s) == 0)
+            && wl_session_insert(s, "input", &inserted, 1, 1) == 0,
+            "seed and optional baseline STEP");
+    }
+    PLAIN_ERROR_CHECK(sess->has_evaluated == warmed,
+        "first STEP versus warmed-session precondition");
+    plain_error_arm(mode == 3 ? 1 : 2, 0);
+    int rc = wl_session_step(session);
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    PLAIN_ERROR_CHECK(rc == EBUSY &&
+        plain_error_hook_count == (mode == 3 ? 1 : 2)
+        && plain_error_hook_status == 0,
+        "real deterministic owned-result reader refusal");
+    if (mode == 3) {
+        PLAIN_ERROR_CHECK(!sess->plain_step_completion_pending
+            && !sess->plain_step_completion_active,
+            "failed first stratum creates no completed-prefix cursor");
+    } else {
+        PLAIN_ERROR_CHECK(plain_error_prefix_completed
+            && plain_error_exact_prefix(sess, "first")
+            && sess->plain_step_completion_pending
+            && !sess->plain_step_completion_active
+            && sess->plain_step_completion_stratum == 0
+            && sess->plain_step_completion_phase
+            == WL_COLUMNAR_PLAIN_STEP_COMPLETION_EVALUATE_REMAINING,
+            "only fully completed first stratum is durable");
+        PLAIN_ERROR_CHECK(wl_session_insert(session, "input", &blocked, 1,
+            1) == EBUSY
+            && wl_session_remove(session, "input", &seed[0], 1, 1) == EBUSY,
+            "pending continuation excludes input mutations");
+        PLAIN_ERROR_CHECK(wl_session_step(session) == EBUSY
+            && plain_error_exact_prefix(sess, "first")
+            && sess->plain_step_completion_stratum == 0
+            && !sess->plain_step_completion_active,
+            "repeated reader refusal preserves completed prefix");
+    }
+    PLAIN_ERROR_CHECK(col_rel_source_reader_release(&plain_error_reader) == 0,
+        "release result reader on creator thread");
+    if (mode == 4)
+        goto destroy_pending;
+#ifdef WL_TEST_ALLOC_WRAP
+    if (mode == 2) {
+        for (unsigned attempt = 0; attempt < 2; attempt++) {
+            plain_error_arm(1, 1);
+            rc = wl_session_step(session);
+            wl_columnar_eval_serial_test_after_plan = NULL;
+            PLAIN_ERROR_CHECK(rc == ENOMEM && plain_error_hook_count == 1
+                && plain_error_hook_status == 0 && !fail_next_alloc
+                && plain_error_exact_prefix(sess, "first")
+                && sess->plain_step_completion_pending
+                && sess->plain_step_completion_stratum == 0
+                && !sess->plain_step_completion_active
+                && !sess->memory_budget_denied,
+                "real resumed ENOMEM preserves earlier cursor repeatedly");
+        }
+    }
+#endif
+    if (mode == 5) {
+        plain_error_arm(2, 0);
+        rc = wl_session_step(session);
+        wl_columnar_eval_serial_test_after_plan = NULL;
+        PLAIN_ERROR_CHECK(rc == EBUSY && plain_error_hook_count == 2
+            && plain_error_hook_status == 0
+            && plain_error_exact_prefix(sess, "first")
+            && plain_error_exact_prefix(sess, "second")
+            && sess->plain_step_completion_stratum == 1
+            && sess->plain_step_completion_pending
+            && !sess->plain_step_completion_active,
+            "cursor advances only after resumed second stratum succeeds");
+        PLAIN_ERROR_CHECK(wl_session_step(session) == EBUSY
+            && sess->plain_step_completion_stratum == 1
+            && plain_error_exact_prefix(sess, "first")
+            && plain_error_exact_prefix(sess, "second"),
+            "repeated third refusal never replays completed prefix");
+        PLAIN_ERROR_CHECK(col_rel_source_reader_release(&plain_error_reader) ==
+            0,
+            "release third-stratum result reader");
+    }
+    plain_error_arm(UINT32_MAX, 0);
+    if (mode == 1) {
+        uint64_t emitted = 0;
+        rc = wl_session_snapshot(session, count_tuple_only, &emitted);
+        PLAIN_ERROR_CHECK(rc == 0 && emitted == 6,
+            "SNAPSHOT drains cursor before emitting full relation bags");
+    } else {
+        rc = wl_session_step(session);
+    }
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    PLAIN_ERROR_CHECK(rc == 0
+        && plain_error_hook_count == (mode == 3 ? 2 : 1)
+        && !sess->plain_step_completion_pending
+        && !sess->plain_step_completion_active,
+        "retry evaluates only the unfinished suffix and clears cursor");
+    PLAIN_ERROR_CHECK(wl_session_step(reference) == 0
+        && plain_error_compare_bags(sess, COL_SESSION(reference)),
+        "all relation bags equal independent uninterrupted reference");
+    PLAIN_ERROR_CHECK(wl_session_step(session) == 0
+        && plain_error_compare_bags(sess, COL_SESSION(reference)),
+        "committed subsequent STEP is idempotent");
+destroy_pending:
+    wl_session_destroy(session);
+    session = NULL;
+    PLAIN_ERROR_CHECK(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)) == 0,
+        "destroy releases completed-prefix and refused-result reservations");
+cleanup:
+    wl_columnar_eval_serial_test_after_plan = NULL;
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = false;
+#endif
+    if (plain_error_reader.owner)
+        (void)col_rel_source_reader_release(&plain_error_reader);
+    wl_session_destroy(session);
+    wl_session_destroy(reference);
+    wl_columnar_memory_governor_ref_release(governor);
+    if (failure) FAIL(failure);
+    else PASS();
+#undef PLAIN_ERROR_CHECK
+}
+#endif
+
 int
 main(void)
 {
+#ifdef WL_SESSION_TEST_HOOKS
+    for (unsigned mode = 0; mode < 6; mode++) {
+#ifndef WL_TEST_ALLOC_WRAP
+        if (mode == 2) continue;
+#endif
+        test_plain_step_ordinary_error(false, mode);
+    }
+    test_plain_step_ordinary_error(true, 0);
+    test_plain_step_ordinary_error(true, 1);
+#endif
 #ifdef WL_SESSION_TEST_HOOKS
     test_governed_retraction_transaction();
     test_retraction_row_buffer_failure_before_removal();
