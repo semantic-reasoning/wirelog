@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -26,11 +27,51 @@ class CollectionTests(unittest.TestCase):
     def setUpClass(cls):
         # This suite drives CommandFreezeTests.setUp() manually rather than
         # through unittest's class lifecycle. Bracket its shared fixture here.
-        FIXTURE_MODULE['CommandFreezeTests'].setUpClass()
+        freeze_tests = FIXTURE_MODULE['CommandFreezeTests']
+        freeze_tests.setUpClass()
+        try:
+            cls.extend_case_template(freeze_tests)
+        except BaseException:
+            freeze_tests.tearDownClass()
+            raise
+
+    @classmethod
+    def extend_case_template(cls, freeze_tests):
+        # Issue #2082: every test also needs the comparison freeze of that
+        # case.  Freeze it once into the case directory and hand
+        # CommandFreezeTests a pristine copy that already holds it; setUp()
+        # then restores the freeze with the rest of the case.  The original
+        # template is put back in tearDownClass().
+        cls.saved_case_template = (freeze_tests.case_pristine,
+                                   freeze_tests.case_snapshot)
+        cls.case_tmp = tempfile.TemporaryDirectory(dir=Path.home() / '.tmp')
+        try:
+            builder = freeze_tests(
+                'test_comparison_freezes_216_adjacent_rows_without_launches')
+            try:
+                builder.setUp()
+                freeze_path, _ = builder.freeze_comparison('source-freeze')
+                cls.freeze_relative = freeze_path.relative_to(builder.root)
+                pristine = Path(cls.case_tmp.name) / 'pristine'
+                shutil.copytree(builder.root, pristine, symlinks=True)
+            finally:
+                cleanup_nested_fixture(builder)
+            snapshot = freeze_tests.snapshot_fixture(pristine)
+        except BaseException:
+            cls.case_tmp.cleanup()
+            raise
+        freeze_tests.case_pristine = pristine
+        freeze_tests.case_snapshot = snapshot
 
     @classmethod
     def tearDownClass(cls):
-        FIXTURE_MODULE['CommandFreezeTests'].tearDownClass()
+        freeze_tests = FIXTURE_MODULE['CommandFreezeTests']
+        try:
+            freeze_tests.case_pristine, freeze_tests.case_snapshot = \
+                cls.saved_case_template
+            cls.case_tmp.cleanup()
+        finally:
+            freeze_tests.tearDownClass()
 
     def setUp(self):
         home_tmp = Path.home() / '.tmp'
@@ -61,7 +102,7 @@ class CollectionTests(unittest.TestCase):
         self.addCleanup(cleanup_nested_fixture, self.fixture)
         self.fixture.setUp()
         self.overlay = self.fixture.overlay
-        self.freeze_path, self.source_freeze = self.fixture.freeze_comparison('source-freeze')
+        self.freeze_path = self.fixture.root / self.freeze_relative
         self.output = self.freeze_path.parent / 'collection'
         self.args = type('Args', (), dict(
             mode='comparison', overlay_patch=self.overlay, freeze_artifact=self.freeze_path,

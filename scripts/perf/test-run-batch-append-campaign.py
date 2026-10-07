@@ -455,6 +455,11 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(status['failure']['category'], 'host_identity')
 
     def test_aa_control_executes_exactly_108_frozen_rows_in_order(self):
+        # The freeze fixture nested in setUp()'s comparison fixture owns the
+        # per-process case directory (#2082); release just that before the AA
+        # fixture takes the directory over.  The comparison fixture's own root
+        # stays: the runner probe reads its loadavg and cgroup files.
+        BASE['cleanup_nested_fixture'](self.fixture.fixture)
         aa_suite = BASE['CollectionTests'](
             'test_aa_pre_admits_exactly_108_rows_with_origin_calibration')
         self.addCleanup(BASE['cleanup_nested_fixture'], aa_suite)
@@ -476,6 +481,8 @@ class RunnerTests(unittest.TestCase):
         starts = [json.loads(line) for line in (self.output / 'journal.jsonl').read_text(
             encoding='utf-8').splitlines()[::2]]
         self.assertEqual([row['command_index'] for row in starts], list(range(108)))
+        self.assertTrue(all(row['host_before'] is not None for row in starts),
+                        'host telemetry must be available for every AA row')
 
 
 class ProcessGroupTests(unittest.TestCase):
