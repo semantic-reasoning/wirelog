@@ -7,7 +7,7 @@ on:
       - '.github/workflows/diagnose-1575-arm.yml'
       - 'scripts/ci/diagnose-arm-sanitizer-timeouts.py'
       - 'scripts/ci/test-diagnose-arm-sanitizer-timeouts.py'
-      - '.github/actions/setup-meson/action.yml'
+      - '.github/actions/setup-meson/**'
 
 permissions:
   contents: read
@@ -67,9 +67,9 @@ jobs:
       - name: Compile five reproducers
         run: |
           set -o pipefail
-          ninja -C builddir-san tests/test_compaction tests/test_diff_join \
-            tests/test_col_rel_deep_copy tests/test_tdd_decision_stats \
-            tests/test_tdd_decision_stats_nofusion \
+          meson compile -C builddir-san test_compaction test_diff_join \
+            test_col_rel_deep_copy test_tdd_decision_stats \
+            test_tdd_decision_stats_nofusion \
             2>&1 | tee diagnostics-1575/build.log
       - name: Sample reproducers under parent GDB
         run: |

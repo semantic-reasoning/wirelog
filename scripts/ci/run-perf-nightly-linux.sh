@@ -16,11 +16,14 @@ if [[ ${1:-} == --inside-image ]]; then
     uv venv --clear --python python3 "$python_env"
     uv pip install --python "$python_env/bin/python" 'meson==1.12.0' ninja
     export PATH="$python_env/bin:$PATH"
+    # Resolve the container's Ninja; inherited host paths are not valid here.
+    export WIRELOG_NINJA_REAL="$(command -v ninja)"
+    export NINJA="$repo_root/.github/actions/setup-meson/ninja-cap.py"
     test "$(meson --version)" = 1.12.0
     rm -rf build-perf-nightly build-perf-nightly-trace
     gcc --version > "$artifact_mount/gcc-version.txt"
     meson --version > "$artifact_mount/meson-version.txt"
-    ninja --version > "$artifact_mount/ninja-version.txt"
+    "$WIRELOG_NINJA_REAL" --version > "$artifact_mount/ninja-version.txt"
     uv --version > "$artifact_mount/uv-version.txt"
     meson setup build-perf-nightly --buildtype=release \
         -Dwirelog_log_max_level=error -Dtests=true -DmbedTLS=disabled \

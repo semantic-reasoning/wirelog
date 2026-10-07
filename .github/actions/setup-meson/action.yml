@@ -24,8 +24,12 @@ runs:
         test "$(meson --version)" = '1.12.0'
         command -v python
         python --version
-        command -v ninja
-        ninja --version
+        launcher="${{ github.action_path }}/ninja-cap.py"
+        real_ninja=$(python "$launcher" --wirelog-resolve-backend)
+        export WIRELOG_NINJA_REAL="$real_ninja" NINJA="$launcher"
+        printf 'WIRELOG_NINJA_REAL=%s\nNINJA=%s\n' "$real_ninja" "$launcher" >> "$GITHUB_ENV"
+        printf '%s\n' "$real_ninja"
+        "$real_ninja" --version
 
     - name: Install Meson 1.12.0 and Ninja (Windows)
       if: runner.os == 'Windows'
@@ -52,5 +56,13 @@ runs:
         if ($ninjaPath -ne (Join-Path $toolScripts 'ninja.exe')) {
           throw "Expected Ninja from $toolScripts, got $ninjaPath"
         }
-        Get-Command ninja
-        ninja --version
+        $launcher = Join-Path '${{ github.action_path }}' 'ninja-cap.py'
+        $realNinja = (& $toolPython $launcher --wirelog-resolve-backend)
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve Ninja backend' }
+        $env:WIRELOG_NINJA_REAL = $realNinja
+        $env:NINJA = $launcher
+        Add-Content -Path $env:GITHUB_ENV -Value "WIRELOG_NINJA_REAL=$realNinja"
+        Add-Content -Path $env:GITHUB_ENV -Value "NINJA=$launcher"
+        Write-Output $realNinja
+        & $realNinja --version
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot probe Ninja backend' }
