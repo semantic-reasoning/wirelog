@@ -158,6 +158,10 @@ wirelog_easy_open_opts(const char *dl_src,
  * inserts of the same row add a second multiplicity (z-set semantics): a
  * subsequent wirelog_easy_remove() decrements one multiplicity, so a host that
  * mirrors a static fact and later retracts must mirror the retract too.
+ * When a relation is also a rule head, an input row in it -- an inline fact
+ * or a host row -- appears to rules and snapshots once, however many times
+ * it was inserted and whether or not a rule also derives it.  The copies
+ * only decide how many removals it takes to retract the input row.
  * Hosts that need to know which rows are already present from the source
  * can read them via wirelog_program_get_facts().
  *

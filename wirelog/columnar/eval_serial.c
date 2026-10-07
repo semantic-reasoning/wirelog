@@ -357,6 +357,32 @@ done:;
     return cleanup_rc != 0 ? cleanup_rc : rc;
 }
 
+/* Issue #2100: a rule head that also holds input -- inline facts or host
+ * rows, which its seed shadow records -- keeps that input beside what its
+ * rules derive, so it can repeat a derived row, and an input row inserted
+ * more than once is there once per insert.  Rules and snapshots must see
+ * such a row once, as they see a derived row, so sort and deduplicate each
+ * such head of @sp, as the multi-worker non-recursive path's finalization
+ * does for every head.  The seed shadow keeps the copies, so a removal still
+ * takes out one insert at a time. */
+int
+wl_columnar_eval_consolidate_input_heads(const wl_plan_stratum_t *sp,
+    wl_col_session_t *sess)
+{
+    for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+        const char *name = sp->relations[ri].name;
+        col_rel_t *seed = wl_columnar_session_seed_rows(sess, name);
+        col_rel_t *head = session_find_rel(sess, name);
+        if (!seed || seed->nrows == 0 || !head || head->nrows <= 1)
+            continue;
+        int rc = wl_columnar_eval_delta_consolidate(head, sess);
+        if (rc != 0)
+            return rc;
+        col_session_invalidate_arrangements(&sess->base, name);
+    }
+    return 0;
+}
+
 /*
  * col_eval_stratum:
  * Evaluate one stratum, writing results into session relations.
@@ -404,12 +430,17 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             if (rc != 0)
                 return rc;
         }
-        /* Completion point for the non-recursive branch: the rule loop above
-         * is the last thing that can fail, so every head is final from here.
-         * This must stay below that loop -- setting it where the branch opens
-         * would report true on the two rule failures that return from it, and
-         * the caller would skip a restore the heads still need.  Move this
-         * with the completion boundary if the loop ever grows a new exit. */
+        /* Issue #2100: this stratum's rows landed on top of the input. */
+        int input_rc = wl_columnar_eval_consolidate_input_heads(sp, sess);
+        if (input_rc != 0)
+            return input_rc;
+        /* Completion point for the non-recursive branch: the rule loop and
+         * the input-head consolidation above are the last things that can
+         * fail, so every head is final from here.  This must stay below them
+         * -- setting it where the branch opens would report true on the
+         * failures that return from them, and the caller would skip a
+         * restore the heads still need.  Move this with the completion
+         * boundary if either ever grows a new exit. */
         sess->eval_stratum_heads_final = true;
         col_mat_cache_release_pins(&sess->mat_cache);
         assert(sess->mat_cache.active_pins == 0);
@@ -455,6 +486,13 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
 
         return 0;
     }
+
+    /* Issue #2100: the loop below merges each iteration's rows into the
+     * head's sorted prefix and drops the ones already there, so a head that
+     * enters it deduplicated leaves it deduplicated. */
+    int input_rc = wl_columnar_eval_consolidate_input_heads(sp, sess);
+    if (input_rc != 0)
+        return input_rc;
 
     /*
      * Recursive stratum: semi-naive fixed-point iteration.
