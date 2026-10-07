@@ -4,6 +4,7 @@
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 
 
@@ -113,7 +114,11 @@ def main(args):
         if not selection or not Path(selection).is_absolute():
             raise ValueError(f'{REAL_ENV} must name an absolute Ninja executable')
         backend = executable_path(selection)
-        os.execv(backend, [backend, *bounded_args(args, available_jobs())])
+        command = [backend, *bounded_args(args, available_jobs())]
+        if os.name == 'nt':
+            # Windows execv can let Meson continue before Ninja finishes.
+            return subprocess.run(command).returncode
+        os.execv(backend, command)
     except (OSError, ValueError) as exc:
         print(f'ninja-cap: {exc}', file=sys.stderr)
         return 2
