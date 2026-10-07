@@ -178,7 +178,7 @@ image_id=$(jq -r '.[0].Id // empty' "$artifact_dir/image-inspect.json")
     echo "invalid inspected Docker image ID: $image_id" >&2
     exit 1
 }
-printf 'tag=%s\nimage_id=%s\n' "$image" "$image_id" \
+printf 'tag=%s\nimage_id=%s\ndocker_network=host\n' "$image" "$image_id" \
     > "$artifact_dir/image-identity.txt"
 {
     echo "commit=$(git rev-parse HEAD)"
@@ -202,7 +202,9 @@ printf 'tag=%s\nimage_id=%s\n' "$image" "$image_id" \
     done
 } > "$artifact_dir/host.txt"
 
-"$docker_bin" run --pull=never --rm --user "$(id -u):$(id -g)" \
+# Dedicated Linux host networking avoids bridge/veth setup while retaining
+# outbound access for package installation and dataset downloads.
+"$docker_bin" run --pull=never --network=host --rm --user "$(id -u):$(id -g)" \
     -e HOME=/home/perf -e TMPDIR=/home/perf/tmp \
     -e PORTFOLIO_TIER="${PORTFOLIO_TIER:-readme-full}" \
     -e PORTFOLIO_WORKERS="${PORTFOLIO_WORKERS:-1}" \

@@ -79,9 +79,11 @@ image_id=$(jq -r '.[0].Id // empty' "$artifacts/image-inspect.json")
     echo "invalid inspected Docker image ID: $image_id" >&2
     exit 1
 }
-printf 'tag=%s\nimage_id=%s\n' "$image" "$image_id" \
+printf 'tag=%s\nimage_id=%s\ndocker_network=host\n' "$image" "$image_id" \
     > "$artifacts/image-identity.txt"
-"$docker_bin" run --pull=never --rm --user "$(id -u):$(id -g)" \
+# Dedicated Linux host networking avoids bridge/veth setup while retaining
+# outbound access for package installation and dataset downloads.
+"$docker_bin" run --pull=never --network=host --rm --user "$(id -u):$(id -g)" \
     -e HOME=/home/perf -e TMPDIR=/home/perf/.tmp \
     -e WL_DOOP_PERF_GATE_TARGET_MS="${WL_DOOP_PERF_GATE_TARGET_MS:-}" \
     -v "$repo_root:/workspace" -v "$artifacts:/artifacts" \
