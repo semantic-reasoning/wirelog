@@ -938,6 +938,10 @@ test('arm_asan_strict_align_selection', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-arm-asan-strict-align-selection.py'],
      suite: 'abi', timeout: 120)
 
+test('ci_build_cap', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-ci-build-cap.py'],
+     suite: 'abi', timeout: 60)
+
 # The nightly MSVC job must not silently select MinGW when hosted images
 # change Visual Studio versions. Native Windows CI verifies execution.
 test('perf_nightly_windows_contract', py3,

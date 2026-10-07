@@ -15,6 +15,9 @@ if [[ ${1:-} == --inside-image ]]; then
     uv venv --clear --python python3 "$python_env"
     uv pip install --python "$python_env/bin/python" 'meson==1.12.0' ninja
     export PATH="$python_env/bin:$PATH"
+    # Resolve the container's Ninja; inherited host paths are not valid here.
+    export WIRELOG_NINJA_REAL="$(command -v ninja)"
+    export NINJA="$repo_root/.github/actions/setup-meson/ninja-cap.py"
     rm -rf build-perf-error
     bench/data/doop/download.sh > /artifacts/doop-download.log 2>&1
     meson setup build-perf-error --buildtype=release \
@@ -25,7 +28,7 @@ if [[ ${1:-} == --inside-image ]]; then
         > /artifacts/build.log 2>&1
     gcc --version > /artifacts/gcc-version.txt
     meson --version > /artifacts/meson-version.txt
-    ninja --version > /artifacts/ninja-version.txt
+    "$WIRELOG_NINJA_REAL" --version > /artifacts/ninja-version.txt
     uv --version > /artifacts/uv-version.txt
     meson configure build-perf-error > /artifacts/meson-config.txt
     meson introspect build-perf-error --compilers > /artifacts/compilers.json
