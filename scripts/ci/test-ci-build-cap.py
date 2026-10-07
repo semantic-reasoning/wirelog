@@ -102,6 +102,7 @@ class LauncherContract(unittest.TestCase):
     def test_main_forwards_bounded_argv_to_exact_backend(self):
         backend = str(Path(sys.executable).resolve())
         with patch.dict(os.environ, {cap.REAL_ENV: backend}, clear=True), patch.object(
+                cap, 'WINDOWS', False), patch.object(
                 cap, 'available_jobs', return_value=8), patch.object(cap.os, 'execv') as execute:
             self.assertEqual(cap.main(['-C', 'space path', '-vj64', 'target']), 0)
             execute.assert_called_once_with(backend, [backend, '-j', '8', '-C', 'space path', '-v', 'target'])
@@ -109,6 +110,35 @@ class LauncherContract(unittest.TestCase):
             with self.subTest(backend=backend), patch.dict(
                     os.environ, {cap.REAL_ENV: backend}, clear=True), patch('sys.stderr'):
                 self.assertEqual(cap.main([]), 2)
+
+    def test_windows_waits_for_backend_and_returns_its_status(self):
+        # Issue #2104: os.execv on Windows starts the backend as a new process
+        # and ends the caller at once, so Meson saw the build finish while
+        # Ninja still ran.  The Windows branch must run the backend as a
+        # child, wait for it, and return its exit status.
+        with temp_directory() as temp:
+            root = Path(temp)
+            done = root / 'done'
+            backend = root / 'slow-backend.py'
+            backend.write_text('import pathlib, sys, time\n'
+                               'time.sleep(0.5)\n'
+                               'pathlib.Path(sys.argv[-1]).write_text("ok")\n'
+                               'sys.exit(17)\n', encoding='utf-8')
+            python = str(Path(sys.executable).resolve())
+            argv = []
+            real_popen = subprocess.Popen
+
+            def popen(command, **kwargs):
+                argv.append(command)
+                return real_popen([python, str(backend), *command[1:]], **kwargs)
+
+            with patch.dict(os.environ, {cap.REAL_ENV: python}, clear=True), patch.object(
+                    cap, 'WINDOWS', True), patch.object(cap, 'available_jobs', return_value=8), patch.object(
+                    cap.subprocess, 'Popen', side_effect=popen), patch.object(cap.os, 'execv') as execute:
+                self.assertEqual(cap.main(['-vj64', str(done)]), 17)
+                execute.assert_not_called()
+            self.assertTrue(done.exists(), 'launcher returned before the backend finished')
+            self.assertEqual(argv, [[python, '-j', '8', '-v', str(done)]])
 
     def test_common_action_and_container_wiring(self):
         action = (ROOT / '.github/actions/setup-meson/action.yml').read_text(encoding='utf-8')

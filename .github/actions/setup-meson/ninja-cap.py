@@ -4,11 +4,16 @@
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 
 
 MAX_JOBS = 8
 REAL_ENV = 'WIRELOG_NINJA_REAL'
+# os.execv replaces the process only on POSIX.  On Windows it starts the
+# program as a new process and ends the caller at once (#2104), so Meson
+# would see Ninja finish while the build still ran.
+WINDOWS = os.name == 'nt'
 
 
 def available_jobs():
@@ -113,7 +118,16 @@ def main(args):
         if not selection or not Path(selection).is_absolute():
             raise ValueError(f'{REAL_ENV} must name an absolute Ninja executable')
         backend = executable_path(selection)
-        os.execv(backend, [backend, *bounded_args(args, available_jobs())])
+        command = [backend, *bounded_args(args, available_jobs())]
+        if WINDOWS:
+            child = subprocess.Popen(command)
+            while True:
+                try:
+                    return child.wait()
+                except KeyboardInterrupt:
+                    # Ninja got the same Ctrl-C; let it stop on its own.
+                    continue
+        os.execv(backend, command)
     except (OSError, ValueError) as exc:
         print(f'ninja-cap: {exc}', file=sys.stderr)
         return 2
