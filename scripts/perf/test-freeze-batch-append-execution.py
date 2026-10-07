@@ -6,6 +6,7 @@ import hashlib
 import os
 from pathlib import Path
 import runpy
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -102,6 +103,47 @@ class CommandFreezeTests(unittest.TestCase):
             PROFILE['write_atomic'](output, artifact)
             cls.profile_templates[name] = (output / 'execution-preflight.json').read_bytes()
         cls.shared_fixture_snapshot = cls.snapshot_fixture(cls.fixture.root)
+        # Issue #2082: every test starts from the same private case directory --
+        # its own plan and profile copies and a calibration of plan A -- and
+        # building it, the calibration above all, is most of each setUp().  It
+        # is built once here at a fixed path, so the paths recorded inside the
+        # evidence stay valid, and setUp() restores that path from a pristine
+        # copy before every test.  Each test still owns a fresh case directory;
+        # the pristine copy is proven unchanged after every test.
+        case_tmp = tempfile.TemporaryDirectory(dir=home_tmp)
+        cls.fixture.addCleanup(case_tmp.cleanup)
+        cls.case_root = Path(case_tmp.name) / 'case'
+        cls.case_pristine = Path(case_tmp.name) / 'pristine'
+        cls.case_root.mkdir(mode=0o700)
+        cls.build_case(cls.case_root)
+        shutil.copytree(cls.case_root, cls.case_pristine, symlinks=True)
+        shutil.rmtree(cls.case_root)
+        cls.case_snapshot = cls.snapshot_fixture(cls.case_pristine)
+
+    @classmethod
+    def build_case(cls, root):
+        plan_a = root / 'plan-a.json'
+        plan_a.write_bytes(cls.plan_a_path.read_bytes())
+        plan_b = root / 'plan-b.json'
+        plan_b.write_bytes(cls.plan_b_path.read_bytes())
+        profile_a, _ = cls.copy_profile('profile-a', plan_a)
+        cls.copy_profile('profile-b', plan_b)
+        saved = {name: copy.deepcopy(getattr(FakeProcess, name))
+                 for name in ('calls', 'started_flags', 'next_outputs', 'tamper_path',
+                              'tamper_payload', 'interrupt_on_start')}
+        try:
+            FakeProcess.calls = []
+            FakeProcess.started_flags = []
+            FakeProcess.next_outputs = [300_000_000] * 3
+            FakeProcess.tamper_path = None
+            FakeProcess.tamper_payload = b'tampered while benchmark ran'
+            FakeProcess.interrupt_on_start = False
+            CAL['calibrate'](plan_a, profile_a, cls.fixture.overlay, root / 'cal-a',
+                             timeout_seconds=5, probe=FakeProbe(),
+                             popen_factory=FakeProcess, affinity_getter=lambda _pid: {0})
+        finally:
+            for name, value in saved.items():
+                setattr(FakeProcess, name, value)
 
     @classmethod
     def tearDownClass(cls):
@@ -128,11 +170,16 @@ class CommandFreezeTests(unittest.TestCase):
             raise error.with_traceback(traceback)
 
     def setUp(self):
-        home_tmp = Path.home() / '.tmp'
-        home_tmp.mkdir(mode=0o700, exist_ok=True)
-        self.tmp = tempfile.TemporaryDirectory(dir=home_tmp)
-        self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        case_root = self.__class__.case_root
+        # One case directory per process: a second live fixture would share
+        # it, so refuse rather than overwrite the first one's private state.
+        if case_root.exists():
+            raise AssertionError(f'case directory {case_root} is already in use; '
+                                 'clean up the enclosing fixture first')
+        self.addCleanup(shutil.rmtree, case_root, True)
+        shutil.copytree(self.__class__.case_pristine, case_root, symlinks=True)
+        self.addCleanup(self.assert_case_template_unchanged)
+        self.root = case_root
         self.fallback_patchers = []
         for api in (FREEZER['PLAN']['FALLBACKS'], PROFILE['FALLBACKS'],
                     CAL['PROFILE']['PLAN']['FALLBACKS'], CAL['PROFILE']['FALLBACKS']):
@@ -149,7 +196,6 @@ class CommandFreezeTests(unittest.TestCase):
             patcher.start()
             self.fallback_patchers.append(patcher)
             self.addCleanup(patcher.stop)
-        self._shared_fixture_snapshot = self.snapshot_fixture(self.__class__.fixture.root)
         self.addCleanup(self.assert_shared_fixture_unchanged)
         self.fixture = _FixtureContext(self.root)
         self.fixture.paths = self.__class__.fixture.paths
@@ -159,14 +205,12 @@ class CommandFreezeTests(unittest.TestCase):
             os.chmod(self.fixture.paths[side]['build'] / 'bench/bench_batch_append', 0o755)
         self.overlay = self.fixture.overlay
         self.plan_a_path = self.root / 'plan-a.json'
-        self.plan_a_path.write_bytes(self.__class__.plan_a_path.read_bytes())
         self.plan_b_path = self.root / 'plan-b.json'
-        self.plan_b_path.write_bytes(self.__class__.plan_b_path.read_bytes())
         self.plan_b_bytes = self.plan_b_path.read_bytes()
-        self.profile_a_path, self.profile_a = self.copy_profile(
-            'profile-a', self.plan_a_path)
-        self.profile_b_path, self.profile_b = self.copy_profile(
-            'profile-b', self.plan_b_path)
+        self.profile_a_path = self.root / 'profile-a/execution-preflight.json'
+        self.profile_a = json.loads(self.profile_a_path.read_text(encoding='utf-8'))
+        self.profile_b_path = self.root / 'profile-b/execution-preflight.json'
+        self.profile_b = json.loads(self.profile_b_path.read_text(encoding='utf-8'))
         self._fake_process_state = {
             name: copy.deepcopy(getattr(FakeProcess, name))
             for name in ('calls', 'started_flags', 'next_outputs', 'tamper_path',
@@ -178,8 +222,7 @@ class CommandFreezeTests(unittest.TestCase):
         FakeProcess.tamper_payload = b'tampered while benchmark ran'
         FakeProcess.interrupt_on_start = False
         self.addCleanup(self.restore_fake_process)
-        self.cal_a = self.make_calibration(self.plan_a_path, self.profile_a_path, 'cal-a',
-                                           [300_000_000] * 3)
+        self.cal_a = self.root / 'cal-a'
         self.fake_call_count = len(FakeProcess.calls)
 
     @staticmethod
@@ -200,8 +243,16 @@ class CommandFreezeTests(unittest.TestCase):
         return snapshot
 
     def assert_shared_fixture_unchanged(self):
-        if self.snapshot_fixture(self.__class__.fixture.root) != self._shared_fixture_snapshot:
+        # Compared with the class-level snapshot.  While every earlier test
+        # passed this check, a mismatch here belongs to this test.
+        if self.snapshot_fixture(self.__class__.fixture.root) != \
+                self.__class__.shared_fixture_snapshot:
             raise AssertionError('class-scoped freeze fixture changed during a test')
+
+    def assert_case_template_unchanged(self):
+        if self.snapshot_fixture(self.__class__.case_pristine) != \
+                self.__class__.case_snapshot:
+            raise AssertionError('pristine case directory changed during a test')
 
     @staticmethod
     def copy_profile(name, plan_path):

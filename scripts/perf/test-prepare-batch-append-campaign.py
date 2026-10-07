@@ -14,12 +14,62 @@ from unittest.mock import patch
 M = runpy.run_path(str(Path(__file__).with_name('prepare-batch-append-campaign.py')))
 
 
+def snapshot_tree(root):
+    """Content snapshot of every entry below @root, for integrity checks."""
+    snapshot = {}
+    for path in sorted(root.rglob('*')):
+        relative = path.relative_to(root).as_posix()
+        info = path.lstat()
+        if path.is_symlink():
+            snapshot[relative] = ('symlink', os.readlink(path))
+        elif path.is_dir():
+            snapshot[relative] = ('directory', info.st_mode & 0o777)
+        else:
+            snapshot[relative] = ('file', info.st_mode & 0o777,
+                                  hashlib.sha256(path.read_bytes()).hexdigest())
+    return snapshot
+
+
 class PreparePlanTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Issue #2082: each source fixture is the verified anchor bundle checked
+        # out once per product side.  Building it costs a fetch, a checkout and,
+        # for the post side, a patch application, and every test needs two or
+        # more of them.  Build each side once here; make_source() hands every
+        # caller a private copy, and the templates are proven unchanged after
+        # each test and at class end.
+        home_tmp = Path.home() / '.tmp'
+        home_tmp.mkdir(mode=0o700, exist_ok=True)
+        cls.class_tmp = tempfile.TemporaryDirectory(dir=home_tmp)
+        try:
+            root = Path(cls.class_tmp.name)
+            cls.source_templates = {
+                product: cls.build_source(root / f'template-{product}-source', product)
+                for product in ('pre', 'post')}
+            cls.template_snapshot = snapshot_tree(root)
+        except BaseException:
+            cls.class_tmp.cleanup()
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            if snapshot_tree(Path(cls.class_tmp.name)) != cls.template_snapshot:
+                raise AssertionError('source templates changed during the test class')
+        finally:
+            cls.class_tmp.cleanup()
+
+    def assert_templates_unchanged(self):
+        if snapshot_tree(Path(self.class_tmp.name)) != self.template_snapshot:
+            raise AssertionError('source templates changed during a test')
+
     def setUp(self):
         home_tmp = Path.home() / '.tmp'
         home_tmp.mkdir(mode=0o700, exist_ok=True)
         self.tmp = tempfile.TemporaryDirectory(dir=home_tmp)
         self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.assert_templates_unchanged)
         self.root = Path(self.tmp.name)
         self.assertTrue(self.root.is_relative_to(Path.home().resolve()))
         def fake_validate(root):
@@ -58,41 +108,54 @@ class PreparePlanTests(unittest.TestCase):
         return subprocess.check_output(['git', '-C', str(source), *args])
 
     def make_source(self, name, product):
+        """A private copy of the verified source template for @product."""
         source = self.root / f'{name}-source'
+        shutil.copytree(self.source_templates[product], source, symlinks=True)
+        return source
+
+    @classmethod
+    def build_source(cls, source, product):
+        def require(condition, message):
+            if not condition:
+                raise AssertionError(message)
+
         source.mkdir()
-        self.git(source, 'init', '-q')
-        self.git(source, 'config', 'user.name', 'Plan Test')
-        self.git(source, 'config', 'user.email', 'plan@example.invalid')
-        git_dir = Path(self.git(source, 'rev-parse', '--git-dir'))
+        cls.git(source, 'init', '-q')
+        cls.git(source, 'config', 'user.name', 'Plan Test')
+        cls.git(source, 'config', 'user.email', 'plan@example.invalid')
+        git_dir = Path(cls.git(source, 'rev-parse', '--git-dir'))
         if not git_dir.is_absolute():
             git_dir = (source / git_dir).resolve()
         alternates = git_dir / 'objects/info/alternates'
         revision = M['load_revision_manifest']()[0]
         anchor = revision['anchor']['commit']
         anchor_ref = M['ANCHOR_REF']
-        self.git(source, 'fetch', '--no-tags', str(M['ANCHOR_BUNDLE_PATH']), anchor_ref)
-        fetched_commit = self.git(source, 'rev-parse', 'FETCH_HEAD')
-        fetched_tree = self.git(source, 'rev-parse', 'FETCH_HEAD^{tree}')
-        self.assertEqual(fetched_commit, anchor)
-        self.assertEqual(fetched_tree, revision['anchor']['tree'])
-        self.assertFalse(alternates.exists())
-        self.git(source, 'cat-file', '-e', f'{anchor}^{{commit}}')
-        self.git(source, 'update-ref', 'refs/heads/fixture', anchor)
-        self.git(source, 'checkout', '-q', '--detach', anchor)
+        cls.git(source, 'fetch', '--no-tags', str(M['ANCHOR_BUNDLE_PATH']), anchor_ref)
+        require(cls.git(source, 'rev-parse', 'FETCH_HEAD') == anchor,
+                'anchor bundle commit differs from the revision manifest')
+        require(cls.git(source, 'rev-parse', 'FETCH_HEAD^{tree}')
+                == revision['anchor']['tree'],
+                'anchor bundle tree differs from the revision manifest')
+        require(not alternates.exists(), 'source fixture must not borrow objects')
+        cls.git(source, 'cat-file', '-e', f'{anchor}^{{commit}}')
+        cls.git(source, 'update-ref', 'refs/heads/fixture', anchor)
+        cls.git(source, 'checkout', '-q', '--detach', anchor)
         if product == 'post':
-            self.git(source, 'apply', '--index', str(M['PRODUCT_PATCH_PATH']))
-            tree = self.git(source, 'write-tree')
-            self.assertEqual(tree, revision['product']['post_tree'])
-            synthetic = self.git(source, 'commit-tree', tree, '-p', anchor,
-                                 '-m', 'synthetic product')
-            self.git(source, 'update-ref', 'refs/heads/fixture', synthetic)
-            self.git(source, 'checkout', '-q', '--detach', synthetic)
-        self.add_overlay(source)
+            cls.git(source, 'apply', '--index', str(M['PRODUCT_PATCH_PATH']))
+            tree = cls.git(source, 'write-tree')
+            require(tree == revision['product']['post_tree'],
+                    'product patch did not produce the manifest post tree')
+            synthetic = cls.git(source, 'commit-tree', tree, '-p', anchor,
+                                '-m', 'synthetic product')
+            cls.git(source, 'update-ref', 'refs/heads/fixture', synthetic)
+            cls.git(source, 'checkout', '-q', '--detach', synthetic)
+        cls.add_overlay(source)
         for ignored in M['FALLBACKS']['IGNORED_ROOTS']:
             (source / ignored.rstrip('/')).mkdir(parents=True, exist_ok=True)
         return source
 
-    def add_overlay(self, source):
+    @classmethod
+    def add_overlay(cls, source):
         contents = {
             'bench/bench_batch_append.c': '/* benchmark fixture */\n',
             'bench/meson.build': 'benchmark target fixture\n',
@@ -103,7 +166,7 @@ class PreparePlanTests(unittest.TestCase):
             file_path = source / path
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(text, encoding='utf-8')
-        self.git(source, 'add', *self.overlay_paths)
+        cls.git(source, 'add', *M['OVERLAY_PATHS'])
 
     def plan(self, **overrides):
         values = dict(self.args)
