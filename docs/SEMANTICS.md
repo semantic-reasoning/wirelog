@@ -736,6 +736,14 @@ distinct stop errors through both facades, without exposing these internal types
 
 ### Publication-cutoff state map (#1953; both paths implemented)
 
+A callback-free W1 STEP arms `EVALUATE_REMAINING` after each fully successful
+stratum, including checked cleanup. A later ordinary error preserves that
+completed prefix; STEP or SNAPSHOT resumes at the next stratum. A failed first
+stratum creates no completed-prefix token. Nonempty input mutation remains
+excluded while the token is pending, and successful STEP completion clears it.
+Worker `FINALIZE_NONREC` and final `COMPACT` continuations retain their existing
+precedence.
+
 Rows name fields and functions, never line numbers, for the reason
 `scripts/ci/ownership_doc_anchors.py` records: a line citation rots within
 days. `scripts/ci/check-state-map-anchors.py` checks both columns of every row
