@@ -4625,7 +4625,8 @@ remove_release:
  *   4. Records the removal for affected-stratum calculation
  *
  * The $r$<name> relation is used during the next session_step to seed
- * the retraction evaluation, enabling delta-only propagation.
+ * the retraction evaluation, enabling delta-only propagation.  A snapshot
+ * that evaluates first discards it instead (Issue #2106).
  */
 static int
 col_session_remove_incremental(wl_session_t *session, const char *relation,
@@ -4930,6 +4931,28 @@ incremental_release:
             writer_rc = release_rc;
     }
     return writer_rc;
+}
+
+/* Issue #158: forget the removal a step or snapshot has just evaluated --
+ * the pending relation, the retraction flag and every `$r$<name>` staging
+ * relation.  Issue #2106: a snapshot that evaluated a removal staged with a
+ * delta callback installed kept all three, so every later snapshot missed
+ * the stable path and evaluated again on top of the model it had emitted. */
+static void
+session_retraction_cleanup(wl_col_session_t *sess)
+{
+    sess->last_removed_relation = NULL;
+    sess->retraction_seeded = false;
+    for (uint32_t i = 0; i < sess->nrels;) {
+        col_rel_t *r = sess->rels[i];
+        if (r && strncmp(r->name, "$r$", 3) == 0) {
+            if (session_remove_rel(sess, r->name) != 0)
+                i++;
+            /* A successful removal leaves the same index for the next slot. */
+        } else {
+            i++;
+        }
+    }
 }
 
 /*
@@ -5334,19 +5357,7 @@ compact_staged_deltas:
     }
 
     /* Issue #158: Cleanup retraction state and delta relations after step */
-    sess->last_removed_relation = NULL;
-    sess->retraction_seeded = false;
-    /* Remove all $r$<name> relations from session */
-    for (uint32_t i = 0; i < sess->nrels;) {
-        col_rel_t *r = sess->rels[i];
-        if (r && strncmp(r->name, "$r$", 3) == 0) {
-            if (session_remove_rel(sess, r->name) != 0)
-                i++;
-            /* A successful removal leaves the same index for the next slot. */
-        } else {
-            i++;
-        }
-    }
+    session_retraction_cleanup(sess);
 
     /* Reset after successful eval so next plain session_step runs all strata */
     sess->last_inserted_relation = NULL;
@@ -6305,6 +6316,7 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
     }
 
     /* Reset after successful eval so next plain snapshot runs all strata. */
+    session_retraction_cleanup(sess);
     sess->last_inserted_relation = NULL;
     sess->delta_seeded = false;
     sess->pending_input_change = false;

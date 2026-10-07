@@ -102,6 +102,16 @@ All notable changes to wirelog are documented in this file.
   still records each insert, so a row inserted twice still takes two
   removals to retract.
 
+- **Snapshots after a removal no longer pile up rows with a delta
+  callback installed** (#2106): a removal made while a delta callback is
+  installed is staged for the next step.  A session read through
+  snapshots alone evaluated that removal but left it staged, so every
+  later snapshot skipped the stable model and evaluated again on top of
+  what it had emitted: `r(x) :- e(x).` showed `r(7)` three times and
+  `n(x, count(x)) :- r(x).` grew a row per snapshot, and after such a
+  snapshot a removal from another relation was refused.  A snapshot now
+  clears the staged removal when it commits, as a step does.
+
 - **Steps with a delta callback keep a rule head's own input rows**
   (#2091): with a delta callback installed, a step emptied each rule
   head it re-derived and never put back the rows the head held as input
