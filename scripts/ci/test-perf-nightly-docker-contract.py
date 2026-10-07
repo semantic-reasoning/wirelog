@@ -2,7 +2,12 @@
 """Protect the strict local-image perf-nightly owner contract."""
 
 from pathlib import Path
+import json
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 
 
@@ -17,6 +22,100 @@ from list_perf_suite_targets import perf_suite_targets
 
 
 class PerfNightlyDockerContract(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "Linux perf wrappers require Linux host telemetry")
+    def test_both_wrappers_launch_explicit_host_network_and_propagate_failure(self):
+        if not shutil.which("bash") or not shutil.which("jq"):
+            self.skipTest("wrapper runtime contract requires bash and jq")
+        home_tmp = Path.home() / ".tmp"
+        home_tmp.mkdir(parents=True, exist_ok=True)
+        image_id = "sha256:" + "a" * 64
+        with tempfile.TemporaryDirectory(prefix="perf-docker-contract-",
+                                         dir=home_tmp) as directory:
+            fixture = Path(directory)
+            fake_bin = fixture / "bin"
+            fake_bin.mkdir()
+            fake_git = fake_bin / "git"
+            fake_git.write_text(
+                f"#!{sys.executable}\n"
+                "import os, sys\n"
+                "arg = sys.argv[-1]\n"
+                "print(os.environ['FAKE_REPO'] if arg == '--show-toplevel' "
+                "else 'b' * 40)\n", encoding="utf-8")
+            fake_git.chmod(0o755)
+            fake_docker = fake_bin / "docker"
+            fake_docker.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os, sys\n"
+                "with open(os.environ['DOCKER_CAPTURE'], 'a') as output:\n"
+                "    output.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                "if sys.argv[1:3] == ['image', 'inspect']:\n"
+                "    print(json.dumps([{'Id': os.environ['FAKE_IMAGE_ID']}]))\n"
+                "elif sys.argv[1] == 'run':\n"
+                "    sys.exit(int(os.environ['DOCKER_EXIT']))\n"
+                "else:\n"
+                "    sys.exit(99)\n", encoding="utf-8")
+            fake_docker.chmod(0o755)
+            for wrapper in ("nightly", "stable"):
+                for exit_code in (0, 125):
+                    with self.subTest(wrapper=wrapper, exit_code=exit_code):
+                        case = fixture / f"{wrapper}-{exit_code}"
+                        repo = case / "repo"
+                        home = case / "home"
+                        repo.mkdir(parents=True)
+                        home.mkdir()
+                        capture = case / "docker.jsonl"
+                        artifacts = (case / "artifacts" if wrapper == "nightly"
+                                     else repo / "perf-artifacts/doop")
+                        env = dict(os.environ, HOME=str(home),
+                                   TMPDIR=str(home / ".tmp"),
+                                   PATH=str(fake_bin) + os.pathsep + os.environ["PATH"],
+                                   DOCKER_BIN=str(fake_docker),
+                                   DOCKER_CAPTURE=str(capture), FAKE_REPO=str(repo),
+                                   FAKE_IMAGE_ID=image_id, DOCKER_EXIT=str(exit_code),
+                                   PERF_ARTIFACT_DIR=str(artifacts))
+                        script = f"scripts/ci/run-perf-{wrapper}-linux.sh"
+                        result = subprocess.run(["bash", str(ROOT / script)],
+                                                cwd=repo, env=env,
+                                                capture_output=True, encoding="utf-8",
+                                                timeout=30)
+                        self.assertEqual(result.returncode, exit_code, result.stderr)
+                        calls = [json.loads(line) for line in
+                                 capture.read_text(encoding="utf-8").splitlines()]
+                        self.assertEqual(calls[0],
+                                         ["image", "inspect", "semantic-reasoning:ubuntu26"])
+                        self.assertEqual(len(calls), 2, "inspect then one run; no retry")
+                        args = calls[1]
+                        self.assertEqual(args[0], "run")
+                        self.assertEqual(args.count("--network=host"), 1)
+                        self.assertIn("--pull=never", args)
+                        self.assertIn("--rm", args)
+                        self.assertEqual(args[args.index("--user") + 1],
+                                         f"{os.getuid()}:{os.getgid()}")
+                        mounts = [args[index + 1] for index, arg in enumerate(args)
+                                  if arg == "-v"]
+                        self.assertEqual(mounts, [f"{repo}:/workspace",
+                                                 f"{artifacts}:/artifacts",
+                                                 f"{home / '.tmp'}:/home/perf"])
+                        container_env = [args[index + 1]
+                                         for index, arg in enumerate(args) if arg == "-e"]
+                        self.assertIn("HOME=/home/perf", container_env)
+                        self.assertIn("TMPDIR=/home/perf/" +
+                                      ("tmp" if wrapper == "nightly" else ".tmp"),
+                                      container_env)
+                        workdir = args.index("-w")
+                        self.assertEqual(args[workdir + 1:workdir + 3],
+                                         ["/workspace", image_id])
+                        self.assertEqual(args[workdir + 3:workdir + 6],
+                                         ["bash", script, "--inside-image"])
+                        self.assertFalse(any(arg.startswith(("--privileged", "--cap-add"))
+                                             for arg in args))
+                        identity = (artifacts / "image-identity.txt").read_text(
+                            encoding="utf-8")
+                        self.assertEqual(identity,
+                                         f"tag=semantic-reasoning:ubuntu26\n"
+                                         f"image_id={image_id}\ndocker_network=host\n")
+
     def test_linux_owner_is_guarded_and_serialized_on_perf_label(self):
         perf_job = WORKFLOW.split("\n  perf:\n", 1)[1].split("\n  portfolio-skip-rate:", 1)[0]
         self.assertIn("github.repository == 'semantic-reasoning/wirelog'", perf_job)
