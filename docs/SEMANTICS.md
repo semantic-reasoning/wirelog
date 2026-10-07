@@ -840,12 +840,16 @@ A cutoff above the pre-seed therefore does not leave the flag clear on its own
 account; it only forgoes this attempt's pre-seed. What the snapshot unit has to
 settle is what it owes the entry state, not which placement escapes it.
 
-A field's row does not mean both paths write it. Six do not: the step path
+A field's row does not mean both paths write it. Four do not: the step path
 never touches `delta_seeded`, and the snapshot path never writes
-`last_removed_relation`, `retraction_seeded`, `plain_step_completion_pending`,
-`plain_step_completion_phase` or `plain_step_completion_active`. Which of those
-five the snapshot path still reads is in the read column, one field at a time;
-an earlier revision summarised it here and got it wrong within one round.
+`plain_step_completion_pending`, `plain_step_completion_phase` or
+`plain_step_completion_active`. Which of those three the snapshot path still
+reads is in the read column, one field at a time; an earlier revision
+summarised it here and got it wrong within one round. Both paths clear
+`last_removed_relation` and `retraction_seeded` in their bookkeeping block
+through `session_retraction_cleanup`; the snapshot path started doing so in
+#2106, when a snapshot that kept a removal staged re-evaluated on every later
+call.
 
 | field | written by | read by | verdict |
 |---|---|---|---|
@@ -855,8 +859,8 @@ an earlier revision summarised it here and got it wrong within one round.
 | `has_evaluated` | `col_session_snapshot_impl`, `col_session_step_impl` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
 | `snapshot_stable_valid` | `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl` | PRESERVE |
 | `delta_seeded` | `col_session_snapshot_impl`, `tdd_worker_subpass_fn` | `col_op_variable`, `col_session_snapshot_impl`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_eval_tdd_plan_prepare_inputs` | PRESERVE |
-| `last_removed_relation` | `col_session_remove_incremental`, `col_session_step_impl`, `col_worker_session_create` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
-| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta` | `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_eval_tdd_plan_prepare_inputs` | PRESERVE |
+| `last_removed_relation` | `col_session_remove_incremental`, `col_worker_session_create`, `session_retraction_cleanup` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
+| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `session_retraction_cleanup` | `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_eval_tdd_plan_prepare_inputs` | PRESERVE |
 | `plain_step_completion_pending` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create` | `col_session_insert`, `col_session_insert_incremental`, `col_session_make_compound`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE -- with `plain_step_completion_phase` this is the resume token |
 | `plain_step_completion_phase` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE |
 | `plain_step_completion_step_context` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl` | PRESERVE |
