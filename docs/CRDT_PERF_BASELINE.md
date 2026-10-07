@@ -6,6 +6,17 @@ This document records the correctness sentinel and wall-time provenance for
 the `crdt_perf_gate` test. The gate evaluates the complete Kleppmann sequence
 CRDT workload with one worker and measures a full-session snapshot.
 
+## Current execution contract
+
+The July measurements and 38,120 ms target provenance below remain historical
+records. For the current dedicated Linux runner, local image, strict ERROR
+build profile, endpoint eligibility and latest-main observations, see
+[perf-nightly calibration evidence](PERF_NIGHTLY_CALIBRATION.md). That document
+separates acquisition, host eligibility and performance verdicts; the latest
+2026-10-07 run passes CRDT but misses CSPA. Issue #2022 remains open pending
+its provisioned-profile versus measured-target decision. Neither these records
+nor the newer diagnostic aggregate establish a replacement correctness gold.
+
 ## Correctness boundary
 
 Issue #914 fixed iteration state leaking from recursive strata into later
