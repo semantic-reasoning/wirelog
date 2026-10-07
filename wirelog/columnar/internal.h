@@ -2379,6 +2379,11 @@ wl_columnar_session_retired_rows(wl_col_session_t *sess,
  * Its rows [base_nrows, nrows) were inserted since the last commit. */
 col_rel_t *
 wl_columnar_session_seed_rows(wl_col_session_t *sess, const char *relation);
+/* Issue #2100: sort and deduplicate each head of @sp that also holds input.
+ * Defined in eval_serial.c. */
+int
+wl_columnar_eval_consolidate_input_heads(const wl_plan_stratum_t *sp,
+    wl_col_session_t *sess);
 
 typedef struct wl_columnar_session_hash_registry_image
     wl_columnar_session_hash_registry_image_t;

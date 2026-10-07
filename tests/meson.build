@@ -5784,6 +5784,16 @@ test_easy_delta_head_input_exe = executable(
 
 test('easy_delta_head_input', test_easy_delta_head_input_exe)
 
+test_easy_head_input_set_exe = executable(
+  'test_easy_head_input_set',
+  files('test_easy_head_input_set.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+
+test('easy_head_input_set', test_easy_head_input_set_exe)
+
 # ============================================================================
 # I/O Context Accessor Tests (#452)
 # ============================================================================

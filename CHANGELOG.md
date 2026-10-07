@@ -90,6 +90,18 @@ All notable changes to wirelog are documented in this file.
   `$in$<name>` copy, maintained on every insert and removal and restored
   after each discard.
 
+- **A rule head holding input is a set** (#2100): a relation that is a
+  rule head and also holds input -- an inline fact, or a host row --
+  kept that input beside the rows its rules derive, and kept every copy
+  of an input row inserted or written more than once.  A snapshot then
+  emitted such a tuple twice, and an aggregate over the head, such as
+  `n(x, count(x)) :- r(x).`, counted it twice, after a plain step or a
+  snapshot on one worker or four.  Evaluating a stratum now sorts and
+  deduplicates each of its heads that holds input, after a non-recursive
+  stratum and before a recursive one iterates.  The `$in$<name>` copy
+  still records each insert, so a row inserted twice still takes two
+  removals to retract.
+
 - **Steps with a delta callback keep a rule head's own input rows**
   (#2091): with a delta callback installed, a step emptied each rule
   head it re-derived and never put back the rows the head held as input
