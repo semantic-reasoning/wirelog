@@ -795,6 +795,7 @@ typedef struct {
     int64_t *rows;
     int64_t *current;
     uint32_t nrows, ncols;
+    uint32_t pending_nrows;
     uint32_t current_nrows, current_ncols;
     wl_columnar_source_access_reader_t reader;
 } wl_columnar_eval_delta_observer_entry_t;
@@ -842,6 +843,20 @@ wl_columnar_eval_delta_observer_sift(int64_t *rows, uint32_t root,
 
 /* An independent byte order is sufficient for exact row identity. Sort both
  * sets identically, without assuming the engine's typed sort uses this order. */
+static void
+wl_columnar_eval_delta_observer_sort(int64_t *rows, uint32_t count,
+    uint32_t ncols)
+{
+    if (count < 2 || ncols == 0)
+        return;
+    for (uint32_t i = count / 2; i > 0; i--)
+        wl_columnar_eval_delta_observer_sift(rows, i - 1, count, ncols);
+    for (uint32_t end = count; end > 1; end--) {
+        wl_columnar_eval_delta_observer_swap(rows, 0, end - 1, ncols);
+        wl_columnar_eval_delta_observer_sift(rows, 0, end - 1, ncols);
+    }
+}
+
 static uint32_t
 wl_columnar_eval_delta_observer_normalize(int64_t *rows, uint32_t count,
     uint32_t ncols)
@@ -850,12 +865,7 @@ wl_columnar_eval_delta_observer_normalize(int64_t *rows, uint32_t count,
         return count;
     if (ncols == 0)
         return 1;
-    for (uint32_t i = count / 2; i > 0; i--)
-        wl_columnar_eval_delta_observer_sift(rows, i - 1, count, ncols);
-    for (uint32_t end = count; end > 1; end--) {
-        wl_columnar_eval_delta_observer_swap(rows, 0, end - 1, ncols);
-        wl_columnar_eval_delta_observer_sift(rows, 0, end - 1, ncols);
-    }
+    wl_columnar_eval_delta_observer_sort(rows, count, ncols);
     uint32_t out = 1;
     size_t width = (size_t)ncols * sizeof(*rows);
     for (uint32_t i = 1; i < count; i++) {
@@ -866,6 +876,32 @@ wl_columnar_eval_delta_observer_normalize(int64_t *rows, uint32_t count,
                     width);
             out++;
         }
+    }
+    return out;
+}
+
+/* Remove from @rows one copy of each row of @minus, both sorted by
+ * wl_columnar_eval_delta_observer_sort.  Returns the remaining count. */
+static uint32_t
+wl_columnar_eval_delta_observer_subtract(int64_t *rows, uint32_t count,
+    const int64_t *minus, uint32_t nminus, uint32_t ncols)
+{
+    size_t width = (size_t)ncols * sizeof(*rows);
+    uint32_t out = 0, j = 0;
+
+    for (uint32_t i = 0; i < count; i++) {
+        int cmp = 1;
+        while (j < nminus && (cmp = memcmp(minus + (size_t)j * ncols,
+            rows + (size_t)i * ncols, width)) < 0)
+            j++;
+        if (j < nminus && cmp == 0) {
+            j++;
+            continue;
+        }
+        if (out != i)
+            memmove(rows + (size_t)out * ncols, rows + (size_t)i * ncols,
+                width);
+        out++;
     }
     return out;
 }
@@ -1085,10 +1121,34 @@ wl_columnar_eval_delta_observer_begin(wl_col_session_t *sess, uint64_t mask)
                     goto fail;
                 entry->nrows = rel->nrows;
                 entry->ncols = rel->ncols;
+                /* Issue #2091: the baseline is the committed model, not the
+                 * head as the host has since written it.  Its retired rows
+                 * go back in and its uncommitted inserts, staged after the
+                 * baseline rows, come out once the rows are sorted. */
+                col_rel_t *retired =
+                    wl_columnar_session_retired_rows(sess, name);
+                col_rel_t *seed = wl_columnar_session_seed_rows(sess, name);
+                uint32_t retired_nrows = retired ? retired->nrows : 0;
+                if ((retired_nrows && retired->ncols != rel->ncols)
+                    || (seed && seed->base_nrows < seed->nrows
+                    && seed->ncols != rel->ncols)) {
+                    rc = EINVAL;
+                    goto fail;
+                }
+                if (seed && seed->base_nrows < seed->nrows)
+                    entry->pending_nrows = seed->nrows - seed->base_nrows;
+                if (retired_nrows > UINT32_MAX - entry->nrows
+                    || entry->pending_nrows
+                    > UINT32_MAX - entry->nrows - retired_nrows) {
+                    rc = EOVERFLOW;
+                    goto fail;
+                }
+                entry->nrows += retired_nrows;
             }
             uint64_t row_bytes;
-            if (!wl_columnar_eval_delta_observer_row_bytes(entry->nrows,
-                entry->ncols, &row_bytes)
+            if (!wl_columnar_eval_delta_observer_row_bytes(
+                    entry->nrows + entry->pending_nrows, entry->ncols,
+                    &row_bytes)
                 || !wl_columnar_memory_size_add(payload_bytes, row_bytes,
                 &payload_bytes)
                 || !wl_columnar_memory_size_add(payload_bytes,
@@ -1117,8 +1177,9 @@ wl_columnar_eval_delta_observer_begin(wl_col_session_t *sess, uint64_t mask)
         }
         if (entry->nrows) {
             uint64_t row_bytes;
-            if (!wl_columnar_eval_delta_observer_row_bytes(entry->nrows,
-                entry->ncols, &row_bytes)) {
+            if (!wl_columnar_eval_delta_observer_row_bytes(
+                    entry->nrows + entry->pending_nrows, entry->ncols,
+                    &row_bytes)) {
                 rc = EOVERFLOW;
                 goto fail;
             }
@@ -1128,10 +1189,31 @@ wl_columnar_eval_delta_observer_begin(wl_col_session_t *sess, uint64_t mask)
                 goto fail;
             }
             col_rel_t *rel = session_find_rel(sess, entry->name);
-            for (uint32_t row = 0; row < entry->nrows; row++)
+            for (uint32_t row = 0; row < rel->nrows; row++)
                 for (uint32_t col = 0; col < entry->ncols; col++)
                     entry->rows[(size_t)row * entry->ncols + col]
                         = rel->columns[col][row];
+            col_rel_t *retired =
+                wl_columnar_session_retired_rows(sess, entry->name);
+            for (uint32_t row = rel->nrows; row < entry->nrows; row++)
+                col_rel_row_copy_out(retired, row - rel->nrows,
+                    entry->rows + (size_t)row * entry->ncols);
+            col_rel_t *seed =
+                wl_columnar_session_seed_rows(sess, entry->name);
+            if (entry->pending_nrows && seed) {
+                int64_t *pending = entry->rows
+                    + (size_t)entry->nrows * entry->ncols;
+                for (uint32_t row = 0; row < entry->pending_nrows; row++)
+                    col_rel_row_copy_out(seed, seed->base_nrows + row,
+                        pending + (size_t)row * entry->ncols);
+                wl_columnar_eval_delta_observer_sort(entry->rows,
+                    entry->nrows, entry->ncols);
+                wl_columnar_eval_delta_observer_sort(pending,
+                    entry->pending_nrows, entry->ncols);
+                entry->nrows = wl_columnar_eval_delta_observer_subtract(
+                    entry->rows, entry->nrows, pending, entry->pending_nrows,
+                    entry->ncols);
+            }
             entry->nrows = wl_columnar_eval_delta_observer_normalize(
                 entry->rows, entry->nrows, entry->ncols);
         }
@@ -1861,6 +1943,17 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             if (rc != 0)
                 goto cleanup;
         }
+    }
+    /* Issue #2091: detaching emptied each head, input rows included; give
+     * every head its own input rows back before it is re-derived. */
+    for (uint32_t i = 0; i < rc_cnt; i++) {
+        wl_columnar_eval_delta_snapshot_t *entry = &rollback->entries[i];
+        if (!entry->detached)
+            continue;
+        rc = wl_columnar_session_restore_seed(sess,
+                session_find_rel(sess, entry->name));
+        if (rc != 0)
+            goto cleanup;
     }
 
     /* Step 2: evaluate stratum (appends new rows to IDB relations).

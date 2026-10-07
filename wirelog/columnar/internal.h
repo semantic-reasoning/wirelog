@@ -2369,6 +2369,16 @@ wl_columnar_session_budget_denial_clear(wl_col_session_t *sess);
  * re-evaluation.  Returns 0 when @r has no shadow. */
 int
 wl_columnar_session_restore_seed(wl_col_session_t *sess, col_rel_t *r);
+/* Issue #2091: the rows host removals have taken out of rule head
+ * @relation's committed model since the last commit.  NULL until the first
+ * such removal registers the relation; empty after a commit. */
+col_rel_t *
+wl_columnar_session_retired_rows(wl_col_session_t *sess,
+    const char *relation);
+/* Issue #2091: rule head @relation's `$in$<name>` seed shadow, or NULL.
+ * Its rows [base_nrows, nrows) were inserted since the last commit. */
+col_rel_t *
+wl_columnar_session_seed_rows(wl_col_session_t *sess, const char *relation);
 
 typedef struct wl_columnar_session_hash_registry_image
     wl_columnar_session_hash_registry_image_t;

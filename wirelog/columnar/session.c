@@ -262,23 +262,44 @@ session_plan_has_rule_head(const wl_plan_t *plan, const char *relation)
     return false;
 }
 
+/* The strata among the first 64 that list @relation as a rule head. */
+static uint64_t
+session_head_strata(const wl_plan_t *plan, const char *relation)
+{
+    uint64_t mask = 0;
+
+    for (uint32_t si = 0; plan && si < plan->stratum_count && si < 64; si++)
+        for (uint32_t ri = 0; ri < plan->strata[si].relation_count; ri++)
+            if (plan->strata[si].relations[ri].name
+                && strcmp(plan->strata[si].relations[ri].name, relation)
+                == 0)
+                mask |= (uint64_t)1 << si;
+    return mask;
+}
+
+/* Register an empty session-private relation called @name. */
+static int
+session_private_rel_create(wl_col_session_t *sess, const char *name)
+{
+    col_rel_t *rel = NULL;
+    int rc = wl_columnar_relation_alloc_governed(&rel, name,
+            sess->memory_governor);
+    if (rc != 0)
+        return rc;
+    rc = session_add_rel(sess, rel);
+    if (rc != 0) {
+        rc = rc == ENOMEM && rel->memory_budget_denial_pending ? ENOSPC : rc;
+        col_rel_destroy(rel);
+    }
+    return rc;
+}
+
 static int
 session_seed_shadow_create(wl_col_session_t *sess, const char *relation)
 {
     char name[256];
-    col_rel_t *seed = NULL;
     int rc = session_seed_shadow_name(relation, name, sizeof(name));
-    if (rc == 0)
-        rc = wl_columnar_relation_alloc_governed(&seed, name,
-                sess->memory_governor);
-    if (rc != 0)
-        return rc;
-    rc = session_add_rel(sess, seed);
-    if (rc != 0) {
-        rc = rc == ENOMEM && seed->memory_budget_denial_pending ? ENOSPC : rc;
-        col_rel_destroy(seed);
-    }
-    return rc;
+    return rc != 0 ? rc : session_private_rel_create(sess, name);
 }
 
 /* The shadow a host insert into @r must also write, created on the first
@@ -310,31 +331,37 @@ session_seed_shadow_for_insert(wl_col_session_t *sess, const col_rel_t *r,
     return rc;
 }
 
-/* Drop rows [nrows, seed->nrows) appended by a batch whose relation write
- * then failed.  The shadow is private to the session, so nothing reads it
- * between the two writes. */
+/* Drop rows [nrows, rel->nrows) of a session-private relation: a seed
+ * shadow's rows appended by a batch whose relation write then failed, or the
+ * retired rows a commit has consumed.  No evaluation reads the relation. */
 static void
-session_seed_shadow_truncate(col_rel_t *seed, uint32_t nrows)
+session_private_rel_truncate(col_rel_t *rel, uint32_t nrows)
 {
-    if (!seed || seed->nrows <= nrows)
+    if (!rel || rel->nrows <= nrows)
         return;
-    seed->nrows = nrows;
-    if (seed->base_nrows > nrows)
-        seed->base_nrows = nrows;
-    seed->sorted_nrows = 0;
-    seed->run_count = 0;
-    memset(seed->run_ends, 0, sizeof(seed->run_ends));
-    wl_columnar_eval_dedup_set_clear(seed);
-    wl_columnar_relation_touch_view(seed);
+    rel->nrows = nrows;
+    if (rel->base_nrows > nrows)
+        rel->base_nrows = nrows;
+    rel->sorted_nrows = 0;
+    rel->run_count = 0;
+    memset(rel->run_ends, 0, sizeof(rel->run_ends));
+    wl_columnar_eval_dedup_set_clear(rel);
+    wl_columnar_relation_touch_view(rel);
 }
 
+/* Per-request flags a removal collects (Issue #2091). */
+#define SESSION_REMOVE_IN_RELATION 1u /* the relation held the row */
+#define SESSION_REMOVE_PENDING 2u     /* it cancels an uncommitted insert */
+
 /* Mark, without changing the shadow, one shadow row for each requested row
- * it holds.  *mask_out is NULL when there is no shadow or nothing matched;
- * otherwise the caller passes it to session_seed_shadow_apply_remove once the
- * relation's own removal has committed, or frees it. */
+ * it holds, and flag in @state each request whose row was inserted since the
+ * last commit (Issue #2091).  *mask_out is NULL when there is no shadow or
+ * nothing matched; otherwise the caller passes it to
+ * session_seed_shadow_apply_remove once the relation's own removal has
+ * committed, or frees it. */
 static int
 session_seed_shadow_plan_remove(col_rel_t *seed, const int64_t *data,
-    uint32_t num_rows, uint32_t num_cols, uint8_t **mask_out)
+    uint32_t num_rows, uint32_t num_cols, uint8_t **mask_out, uint8_t *state)
 {
     int64_t row_stack[COL_STACK_MAX];
     int64_t *row_buf = row_stack;
@@ -354,6 +381,8 @@ session_seed_shadow_plan_remove(col_rel_t *seed, const int64_t *data,
             return ENOMEM;
         }
     }
+    uint32_t committed = seed->base_nrows < seed->nrows
+        ? seed->base_nrows : seed->nrows;
     for (uint32_t di = 0; di < num_rows; di++) {
         const int64_t *del = data + (size_t)di * num_cols;
         for (uint32_t ri = 0; ri < seed->nrows; ri++) {
@@ -362,6 +391,8 @@ session_seed_shadow_plan_remove(col_rel_t *seed, const int64_t *data,
             col_rel_row_copy_out(seed, ri, row_buf);
             if (memcmp(row_buf, del, (size_t)num_cols * sizeof(*del)) == 0) {
                 mask[ri] = 1;
+                if (ri >= committed)
+                    state[di] |= SESSION_REMOVE_PENDING;
                 any = true;
                 break;
             }
@@ -382,18 +413,135 @@ static void
 session_seed_shadow_apply_remove(col_rel_t *seed, uint8_t *mask)
 {
     uint32_t out_r = 0;
+    uint32_t committed = 0;
 
     if (!seed || !mask)
         return;
     for (uint32_t ri = 0; ri < seed->nrows; ri++) {
         if (mask[ri])
             continue;
+        if (ri < seed->base_nrows)
+            committed++;
         if (out_r != ri)
             col_rel_row_move_raw(seed, out_r, ri);
         out_r++;
     }
-    session_seed_shadow_truncate(seed, out_r);
+    session_private_rel_truncate(seed, out_r);
+    /* Issue #2091: rows below base_nrows are the committed input. */
+    seed->base_nrows = committed;
     free(mask);
+}
+
+/*
+ * Committed model of a rule head (Issue #2091).
+ *
+ * A step with a delta callback publishes the difference between the model
+ * it derives and the model the previous step or snapshot committed.  A rule
+ * head written by the host since that commit no longer holds that model:
+ *
+ *   - its seed shadow's rows [base_nrows, nrows) were inserted since -- the
+ *     step and snapshot commits set base_nrows to nrows on every relation,
+ *     an insert appends, and a removal keeps that boundary -- and until the
+ *     next evaluation the head holds a copy of each;
+ *   - a removal that took a row out of the head without cancelling such an
+ *     insert copies the row to `$out$<name>`, which the next commit empties.
+ *
+ * The delta observer therefore takes the committed model to be the head plus
+ * its `$out$` rows less its uncommitted inserts, counting copies.  A head the
+ * host has not written since the commit is unchanged by that rule.  The
+ * rule holds between a commit and the next evaluation; an evaluation that
+ * stops short of committing -- a failed snapshot -- can consolidate the head
+ * first, and the baseline is then only approximate.  Like a seed shadow, no
+ * plan operator names `$out$<name>`.
+ */
+#define WL_RETIRED_PREFIX "$out$"
+
+col_rel_t *
+wl_columnar_session_retired_rows(wl_col_session_t *sess, const char *relation)
+{
+    char name[256];
+    int len = snprintf(name, sizeof(name), WL_RETIRED_PREFIX "%s", relation);
+    if (len < 0 || (size_t)len >= sizeof(name))
+        return NULL;
+    return session_find_rel(sess, name);
+}
+
+col_rel_t *
+wl_columnar_session_seed_rows(wl_col_session_t *sess, const char *relation)
+{
+    return session_seed_shadow(sess, relation);
+}
+
+/* Copy to rule head @r's retired rows each requested row @state marks as held
+ * by @r and not as cancelling an uncommitted insert.  Call before the removal
+ * changes @r, and before any relation registration is prepared, since this
+ * may register the retired relation.  A failure leaves the retired rows
+ * unchanged.  On success *retired_out and *prior_out let a caller whose
+ * removal then fails take the copy back with session_private_rel_truncate();
+ * *retired_out is NULL when nothing was copied. */
+static int
+session_retire_committed_rows(wl_col_session_t *sess, const col_rel_t *r,
+    const int64_t *data, uint32_t num_rows, const uint8_t *state,
+    col_rel_t **retired_out, uint32_t *prior_out)
+{
+    uint32_t count = 0;
+    uint64_t cells = 0;
+    uint64_t bytes = 0;
+    bool denied = false;
+    int64_t *rows;
+    col_rel_t *retired;
+    int rc;
+
+    *retired_out = NULL;
+    *prior_out = 0;
+    for (uint32_t di = 0; di < num_rows; di++)
+        if (state[di] == SESSION_REMOVE_IN_RELATION)
+            count++;
+    if (count == 0 || !session_plan_has_rule_head(sess->plan, r->name))
+        return 0;
+    retired = wl_columnar_session_retired_rows(sess, r->name);
+    if (!retired) {
+        char name[256];
+        int len = snprintf(name, sizeof(name), WL_RETIRED_PREFIX "%s",
+                r->name);
+        if (len < 0 || (size_t)len >= sizeof(name))
+            return EOVERFLOW;
+        rc = session_private_rel_create(sess, name);
+        if (rc != 0)
+            return rc;
+        retired = session_find_rel(sess, name);
+    }
+    if (!wl_columnar_memory_size_mul(count, r->ncols, &cells)
+        || !wl_columnar_memory_size_mul(cells, sizeof(int64_t), &bytes)
+        || bytes > SIZE_MAX)
+        return EOVERFLOW;
+    rows = (int64_t *)malloc((size_t)bytes);
+    if (!rows)
+        return ENOMEM;
+    *prior_out = retired->nrows;
+    count = 0;
+    for (uint32_t di = 0; di < num_rows; di++)
+        if (state[di] == SESSION_REMOVE_IN_RELATION)
+            memcpy(rows + (size_t)count++ * r->ncols,
+                data + (size_t)di * r->ncols, (size_t)r->ncols
+                * sizeof(*rows));
+    rc = col_rel_append_rows_atomic(retired, rows, count, r->ncols, &denied);
+    free(rows);
+    if (rc == 0)
+        *retired_out = retired;
+    return rc == ENOMEM && denied ? ENOSPC : rc;
+}
+
+/* A commit makes the current rows the committed model again. */
+static void
+session_retired_rows_clear(wl_col_session_t *sess)
+{
+    for (uint32_t i = 0; i < sess->nrels; i++) {
+        col_rel_t *r = sess->rels[i];
+        if (r && strncmp(r->name, WL_RETIRED_PREFIX,
+            sizeof(WL_RETIRED_PREFIX) - 1) == 0)
+            session_private_rel_truncate(r, 0);
+    }
 }
 
 int
@@ -4085,7 +4233,7 @@ col_session_insert(wl_session_t *session, const char *relation,
         return rc == ENOMEM && denied ? ENOSPC : rc;
     rc = col_rel_append_rows_atomic(r, data, num_rows, num_cols, &denied);
     if (rc != 0) {
-        session_seed_shadow_truncate(seed, seed_rows);
+        session_private_rel_truncate(seed, seed_rows);
         return rc == ENOMEM && denied ? ENOSPC : rc;
     }
 
@@ -4277,7 +4425,7 @@ col_session_insert_incremental(wl_session_t *session, const char *relation,
         return rc == ENOMEM && denied ? ENOSPC : rc;
     rc = col_rel_append_rows_atomic(r, data, num_rows, num_cols, &denied);
     if (rc != 0) {
-        session_seed_shadow_truncate(seed, seed_rows);
+        session_private_rel_truncate(seed, seed_rows);
         return rc == ENOMEM && denied ? ENOSPC : rc;
     }
 
@@ -4335,6 +4483,7 @@ col_session_remove(wl_session_t *session, const char *relation,
 
     uint8_t *matched = NULL;
     uint8_t *seed_mask = NULL;
+    uint8_t *request_state = NULL;
     col_rel_t *seed = NULL;
     int64_t row_stack[COL_STACK_MAX];
     int64_t *row_buf = row_stack;
@@ -4352,9 +4501,12 @@ col_session_remove(wl_session_t *session, const char *relation,
     /* Prepare the entire match plan before changing the EDB.  A request can
      * consume only one still-unmatched source row, so duplicate requests
      * remove duplicate tuples only when those tuples actually exist. */
-    matched = r->nrows
-        ? (uint8_t *)calloc(r->nrows, sizeof(*matched)) : NULL;
-    if (r->nrows != 0 && !matched) {
+    /* The relation writer held across this call keeps r->nrows fixed. */
+    uint32_t matched_nrows = r->nrows;
+    matched = matched_nrows
+        ? (uint8_t *)calloc(matched_nrows, sizeof(*matched)) : NULL;
+    request_state = (uint8_t *)calloc(num_rows, sizeof(*request_state));
+    if ((matched_nrows != 0 && !matched) || !request_state) {
         writer_rc = ENOMEM;
         goto remove_release;
     }
@@ -4374,6 +4526,7 @@ col_session_remove(wl_session_t *session, const char *relation,
             col_rel_row_copy_out(r, ri, row_buf);
             if (memcmp(row_buf, del, row_bytes) == 0) {
                 matched[ri] = 1;
+                request_state[di] = SESSION_REMOVE_IN_RELATION;
                 remove_count++;
                 break;
             }
@@ -4396,14 +4549,22 @@ col_session_remove(wl_session_t *session, const char *relation,
      * it even when the relation itself no longer holds the row. */
     seed = session_seed_shadow(sess, r->name);
     writer_rc = session_seed_shadow_plan_remove(seed, data, num_rows,
-            num_cols, &seed_mask);
+            num_cols, &seed_mask, request_state);
     if (writer_rc != 0)
         goto remove_release;
+    if (remove_count != 0) {
+        col_rel_t *retired = NULL;
+        uint32_t retired_prior = 0;
+        writer_rc = session_retire_committed_rows(sess, r, data, num_rows,
+                request_state, &retired, &retired_prior);
+        if (writer_rc != 0)
+            goto remove_release;
+    }
 
     /* No allocation or fallible operation follows the first row write. */
     if (remove_count != 0) {
         uint32_t out_r = 0;
-        uint32_t old_nrows = r->nrows;
+        uint32_t old_nrows = matched_nrows;
         uint32_t old_base_nrows = r->base_nrows < old_nrows
             ? r->base_nrows : old_nrows;
         uint32_t new_base_nrows = 0;
@@ -4443,6 +4604,7 @@ remove_release:
     if (row_buf != row_stack)
         free(row_buf);
     free(seed_mask);
+    free(request_state);
     free(matched);
     if (writer.owner) {
         int release_rc = wl_columnar_source_access_writer_release(&writer);
@@ -4509,9 +4671,12 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
     } *match_plan = NULL;
     uint8_t *matched = NULL;
     uint8_t *seed_mask = NULL;
+    uint8_t *request_state = NULL;
     col_rel_t *seed = NULL;
     col_rel_t *rdelta = NULL;
     col_rel_t *previous_delta = NULL;
+    col_rel_t *retired = NULL;
+    uint32_t retired_prior = 0;
     wl_columnar_source_access_reader_t previous_reader = { 0 };
     session_rel_registration_t registration;
     session_rel_registration_init(&registration);
@@ -4538,9 +4703,13 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
         goto incremental_release;
     }
     match_plan = calloc(match_plan_count, sizeof(*match_plan));
-    matched = r->nrows ? (uint8_t *)calloc(r->nrows, sizeof(*matched)) : NULL;
-    if (!match_plan
-        || (r->nrows != 0 && !matched)) {
+    /* The relation writer held across this call keeps r->nrows fixed. */
+    uint32_t matched_nrows = r->nrows;
+    matched = matched_nrows
+        ? (uint8_t *)calloc(matched_nrows, sizeof(*matched)) : NULL;
+    request_state = (uint8_t *)calloc(num_rows, sizeof(*request_state));
+    if (!match_plan || !request_state
+        || (matched_nrows != 0 && !matched)) {
         writer_rc = ENOMEM;
         goto incremental_release;
     }
@@ -4565,6 +4734,7 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
                     goto incremental_release;
                 }
                 matched[ri] = 1;
+                request_state[di] = SESSION_REMOVE_IN_RELATION;
                 match_plan[match_count].request_row = di;
                 match_plan[match_count].source_row = ri;
                 match_count++;
@@ -4577,7 +4747,7 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
      * it even when the relation itself no longer holds the row. */
     seed = session_seed_shadow(sess, r->name);
     writer_rc = session_seed_shadow_plan_remove(seed, data, num_rows,
-            num_cols, &seed_mask);
+            num_cols, &seed_mask, request_state);
     if (writer_rc != 0)
         goto incremental_release;
 
@@ -4689,14 +4859,21 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
         }
     }
     previous_delta = NULL;
+    rc = session_retire_committed_rows(sess, r, data, num_rows,
+            request_state, &retired, &retired_prior);
+    if (rc != 0) {
+        writer_rc = rc;
+        goto incremental_release;
+    }
     rc = session_rel_registration_prepare(sess, rdelta, &registration);
     if (rc != 0) {
+        session_private_rel_truncate(retired, retired_prior);
         writer_rc = rc;
         goto incremental_release;
     }
 
     /* From this point onward, EDB compaction and publication cannot fail. */
-    uint32_t old_nrows = r->nrows;
+    uint32_t old_nrows = matched_nrows;
     uint32_t old_base_nrows = r->base_nrows < old_nrows
         ? r->base_nrows : old_nrows;
     uint32_t out_r = 0;
@@ -4745,6 +4922,7 @@ incremental_release:
         free(row_buf);
     free(match_plan);
     free(seed_mask);
+    free(request_state);
     free(matched);
     if (writer.owner) {
         int release_rc = wl_columnar_source_access_writer_release(&writer);
@@ -4933,13 +5111,21 @@ col_session_step_impl(wl_session_t *session)
         && (sess->last_inserted_relation != NULL
         || sess->last_removed_relation != NULL)) {
         affected_mask = 0;
+        /* Issue #2091: col_compute_affected_strata marks the strata that
+         * read a relation.  A rule head written by the host must also be
+         * re-derived by the strata that define it, or a removed row that a
+         * rule still derives stays out of the model. */
         if (sess->last_inserted_relation != NULL) {
             affected_mask |= col_compute_affected_strata(
                 session, sess->last_inserted_relation);
+            affected_mask |= session_head_strata(plan,
+                    sess->last_inserted_relation);
         }
         if (sess->last_removed_relation != NULL) {
             affected_mask |= col_compute_affected_strata(
                 session, sess->last_removed_relation);
+            affected_mask |= session_head_strata(plan,
+                    sess->last_removed_relation);
         }
     }
     /* Issue #1994: a step with no delta callback is not incremental.  It
@@ -5177,6 +5363,7 @@ compact_staged_deltas:
         if (r)
             r->base_nrows = r->nrows;
     }
+    session_retired_rows_clear(sess);
     sess->snapshot_stable_valid = true;
     if (sess->delta_observer) {
         int finish_rc = wl_columnar_eval_delta_observer_finish(sess);
@@ -6133,6 +6320,7 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
         if (r)
             r->base_nrows = r->nrows;
     }
+    session_retired_rows_clear(sess);
 
     /* Issue #1380: final STORED/TEMPORARY gauge sample for this pass. */
     col_session_mem_sample(sess);

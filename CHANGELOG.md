@@ -90,6 +90,24 @@ All notable changes to wirelog are documented in this file.
   `$in$<name>` copy, maintained on every insert and removal and restored
   after each discard.
 
+- **Steps with a delta callback keep a rule head's own input rows**
+  (#2091): with a delta callback installed, a step emptied each rule
+  head it re-derived and never put back the rows the head held as input
+  -- an inline fact such as `reach(1).`, or a host row.  The step
+  published that row as `-1`, dropped it from the model, and lost
+  everything derived from it.  The step now restores the input from the
+  `$in$<name>` copy before re-deriving, and the callback is told the
+  difference from the model the last step or snapshot committed rather
+  than from the relation as the step found it: such an input row is
+  published `+1` when it enters the model, and a host removal of it
+  publishes `-1` once neither a rule nor another inserted copy still
+  holds the row.  Committed rows a removal takes out are kept in a
+  private `$out$<name>` copy until the next commit so the baseline can
+  still show them.  After a host write to a rule head, a step also
+  re-derives the strata that define it, not only those that read it, so
+  removing input from `r` in `r(x) :- e(x).` no longer drops a row that
+  `e` still derives.
+
 - **Every configure left the worktree dirty** (#1814): `.gitignore`
   ignored `subprojects/xxHash-0.8.3/` while `subprojects/xxhash.wrap`
   pins `directory = xxHash-0.8.4`, so the rule named a directory meson
