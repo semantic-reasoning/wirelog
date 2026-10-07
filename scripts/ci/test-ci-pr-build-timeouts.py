@@ -15,7 +15,7 @@ WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/ci-pr.yml"
 EXPECTED_TIMEOUTS = {
     "ubuntu-latest": 60,
     "macos-latest": 60,
-    "windows-latest": 90,
+    "windows-latest": 120,
 }
 
 
@@ -63,17 +63,20 @@ class CiPrBuildTimeoutTests(unittest.TestCase):
         mutated = self.text.replace(
             "timeout-minutes: ${{ matrix.timeout_minutes }}",
             "timeout-minutes: 90")
+        self.assertNotEqual(mutated, self.text)
         with self.assertRaisesRegex(AssertionError, "matrix-specific"):
             validate(mutated)
 
     def test_missing_windows_budget_is_rejected(self):
-        mutated = re.sub(r"\n            timeout_minutes: 90(?=\n\n    steps:)",
+        mutated = re.sub(r"\n            timeout_minutes: 120(?=\n\n    steps:)",
                          "", self.text)
+        self.assertNotEqual(mutated, self.text)
         with self.assertRaisesRegex(AssertionError, "lacks a timeout"):
             validate(mutated)
 
     def test_windows_budget_must_remain_distinct(self):
-        mutated = self.text.replace("timeout_minutes: 90", "timeout_minutes: 60")
+        mutated = self.text.replace("timeout_minutes: 120", "timeout_minutes: 60")
+        self.assertNotEqual(mutated, self.text)
         with self.assertRaisesRegex(AssertionError, "unexpected"):
             validate(mutated)
 
@@ -81,13 +84,15 @@ class CiPrBuildTimeoutTests(unittest.TestCase):
         entry = ("          - os: windows-latest\n"
                  "            compiler: msvc\n"
                  "            cc: cl\n"
-                 "            timeout_minutes: 90\n")
+                 "            timeout_minutes: 120\n")
         mutated = self.text.replace(entry, entry + entry)
+        self.assertNotEqual(mutated, self.text)
         with self.assertRaisesRegex(AssertionError, "duplicate"):
             validate(mutated)
 
     def test_linux_budget_cannot_be_relaxed_accidentally(self):
         mutated = self.text.replace("timeout_minutes: 60", "timeout_minutes: 90", 1)
+        self.assertNotEqual(mutated, self.text)
         with self.assertRaisesRegex(AssertionError, "unexpected"):
             validate(mutated)
 
