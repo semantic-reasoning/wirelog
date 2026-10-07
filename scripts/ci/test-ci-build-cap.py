@@ -6,10 +6,12 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -101,14 +103,95 @@ class LauncherContract(unittest.TestCase):
 
     def test_main_forwards_bounded_argv_to_exact_backend(self):
         backend = str(Path(sys.executable).resolve())
-        with patch.dict(os.environ, {cap.REAL_ENV: backend}, clear=True), patch.object(
-                cap, 'available_jobs', return_value=8), patch.object(cap.os, 'execv') as execute:
-            self.assertEqual(cap.main(['-C', 'space path', '-vj64', 'target']), 0)
-            execute.assert_called_once_with(backend, [backend, '-j', '8', '-C', 'space path', '-v', 'target'])
+        command = [backend, '-j', '8', '-C', 'space path', '-v', 'target']
+        for platform in ('nt', 'posix'):
+            with self.subTest(platform=platform), patch.dict(
+                    os.environ, {cap.REAL_ENV: backend}, clear=True), patch.object(
+                    cap, 'available_jobs', return_value=8), patch.object(
+                    cap.os, 'execv') as execute, patch.object(
+                    cap.subprocess, 'run', return_value=SimpleNamespace(returncode=17)) as run:
+                # Replace only the launcher's reference; changing os.name globally
+                # would make pathlib construct paths for the wrong host platform.
+                with patch.object(cap, 'os', SimpleNamespace(
+                        name=platform, environ=os.environ, execv=execute)):
+                    self.assertEqual(cap.main(['-C', 'space path', '-vj64', 'target']),
+                                     17 if platform == 'nt' else 0)
+                if platform == 'nt':
+                    run.assert_called_once_with(command)
+                    execute.assert_not_called()
+                else:
+                    execute.assert_called_once_with(backend, command)
+                    run.assert_not_called()
         for backend in ('', 'ninja', str(LAUNCHER), str(ROOT / 'missing-ninja')):
             with self.subTest(backend=backend), patch.dict(
                     os.environ, {cap.REAL_ENV: backend}, clear=True), patch('sys.stderr'):
                 self.assertEqual(cap.main([]), 2)
+
+    def test_real_ninja_waits_and_propagates_status(self):
+        ninja = shutil.which('ninja')
+        self.assertIsNotNone(ninja, 'CI setup must install Ninja for the lifecycle contract')
+        with temp_directory() as temp:
+            for status in (0, 1):
+                with self.subTest(worker_status=status):
+                    root = Path(temp) / f'build path with spaces {status}'
+                    root.mkdir()
+                    worker = root / 'marker worker.py'
+                    worker.write_text(
+                        'import pathlib, sys, time\n'
+                        'root = pathlib.Path(__file__).parent\n'
+                        'print("worker stdout", flush=True)\n'
+                        'print("worker stderr", file=sys.stderr, flush=True)\n'
+                        '(root / "started").touch()\n'
+                        'deadline = time.monotonic() + 10\n'
+                        'while not (root / "release").exists():\n'
+                        '    if time.monotonic() >= deadline:\n'
+                        '        (root / "completed").touch()\n'
+                        '        sys.exit(99)\n'
+                        '    time.sleep(0.01)\n'
+                        '(root / "completed").touch()\n'
+                        'sys.exit(int(sys.argv[1]))\n', encoding='utf-8')
+                    argv = [sys.executable, str(worker), str(status)]
+                    command = (subprocess.list2cmdline(argv) if os.name == 'nt'
+                               else shlex.join(argv)).replace('$', '$$')
+                    (root / 'build.ninja').write_text(
+                        f'rule marker\n  command = {command}\nbuild marker: marker\n',
+                        encoding='utf-8')
+                    env = dict(os.environ, WIRELOG_NINJA_REAL=str(Path(ninja).resolve()))
+                    # File-backed streams cannot hide early launcher exit by keeping
+                    # captured pipe handles open in an independently running child.
+                    with (root / 'stdout.log').open('w', encoding='utf-8') as stdout, (
+                            root / 'stderr.log').open('w', encoding='utf-8') as stderr:
+                        process = subprocess.Popen(
+                            [sys.executable, str(LAUNCHER)], cwd=root, env=env,
+                            stdout=stdout, stderr=stderr)
+                        try:
+                            deadline = time.monotonic() + 10
+                            while not (root / 'started').exists():
+                                self.assertLess(time.monotonic(), deadline,
+                                                'Ninja worker did not start')
+                                time.sleep(0.01)
+                            self.assertIsNone(process.poll(),
+                                              'launcher exited while Ninja was running')
+                            (root / 'release').touch()
+                            self.assertEqual(process.wait(timeout=10), 0 if status == 0 else 1)
+                            self.assertTrue((root / 'completed').exists())
+                        finally:
+                            # Release the worker even when detecting an early exit.
+                            (root / 'release').touch()
+                            try:
+                                process.wait(timeout=10)
+                            except subprocess.TimeoutExpired:
+                                process.terminate()
+                                process.wait(timeout=5)
+                            deadline = time.monotonic() + 10
+                            while (root / 'started').exists() and not (root / 'completed').exists():
+                                self.assertLess(time.monotonic(), deadline,
+                                                'Ninja worker did not finish during cleanup')
+                                time.sleep(0.01)
+                    output = ((root / 'stdout.log').read_text(encoding='utf-8') +
+                              (root / 'stderr.log').read_text(encoding='utf-8'))
+                    self.assertIn('worker stdout', output)
+                    self.assertIn('worker stderr', output)
 
     def test_common_action_and_container_wiring(self):
         action = (ROOT / '.github/actions/setup-meson/action.yml').read_text(encoding='utf-8')
