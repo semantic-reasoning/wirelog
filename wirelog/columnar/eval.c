@@ -3445,9 +3445,13 @@ tdd_compound_map_entries(const col_rel_t *rel, uint32_t *entries_out)
 }
 
 /* Worker results must have compatible physical and logical schema metadata
-* before any result row is copied into the private candidate.  A missing
-* type vector is the legacy spelling of an all-INT64 schema; append promotes
-* that destination metadata transactionally when the source is explicit. */
+ * before any result row is copied into the private candidate.  A missing
+ * type vector is the legacy spelling of an all-INT64 schema; append promotes
+ * that destination metadata transactionally when the source is explicit.
+ * declared_ncols is the `.decl` width a relation that takes input checks
+ * host inserts against; a worker's delta may carry none, so only two
+ * different declared widths conflict (Issue #2105: a recursive head seeded
+ * by an inline fact has one, and its workers' deltas were refused). */
 static bool
 tdd_relation_schema_compatible(const col_rel_t *expected,
     const col_rel_t *actual)
@@ -3456,7 +3460,8 @@ tdd_relation_schema_compatible(const col_rel_t *expected,
     uint32_t actual_entries;
 
     if (!expected || !actual || expected->ncols != actual->ncols
-        || expected->declared_ncols != actual->declared_ncols
+        || (expected->declared_ncols != 0 && actual->declared_ncols != 0
+        && expected->declared_ncols != actual->declared_ncols)
         || expected->schema_ok != actual->schema_ok
         || expected->has_graph_column != actual->has_graph_column
         || expected->graph_col_idx != actual->graph_col_idx
