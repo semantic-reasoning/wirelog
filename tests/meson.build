@@ -2553,7 +2553,7 @@ test('perf_nightly_doop_contract', py3,
 
 test('perf_nightly_docker_contract', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-perf-nightly-docker-contract.py'],
-     suite: 'abi')
+     suite: 'abi', timeout: 60)
 
 test('release_perf_rss_contract', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-release-perf-rss-contract.py'],
