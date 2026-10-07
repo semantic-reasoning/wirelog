@@ -112,6 +112,16 @@ All notable changes to wirelog are documented in this file.
   snapshot a removal from another relation was refused.  A snapshot now
   clears the staged removal when it commits, as a step does.
 
+- **A recursive head seeded by an inline fact evaluates on more than one
+  worker** (#2105): with `r(0).` beside `r(y) :- r(x), edge(x, y).`, a
+  plain step or a snapshot on two or more workers returned an error and
+  left `r` empty.  The inline fact gives `r` the width its `.decl`
+  declares, which host inserts are checked against; the rows the workers
+  derive carry no declared width, and merging them into `r` refused the
+  pair as incompatible.  The merge now treats a missing declared width
+  as compatible with any, so only two different declared widths
+  conflict.
+
 - **Steps with a delta callback keep a rule head's own input rows**
   (#2091): with a delta callback installed, a step emptied each rule
   head it re-derived and never put back the rows the head held as input

@@ -5804,6 +5804,16 @@ test_easy_callback_snapshot_exe = executable(
 
 test('easy_callback_snapshot', test_easy_callback_snapshot_exe)
 
+test_easy_recursive_seed_workers_exe = executable(
+  'test_easy_recursive_seed_workers',
+  files('test_easy_recursive_seed_workers.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+
+test('easy_recursive_seed_workers', test_easy_recursive_seed_workers_exe)
+
 # ============================================================================
 # I/O Context Accessor Tests (#452)
 # ============================================================================

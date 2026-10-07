@@ -2636,6 +2636,10 @@ test_tdd_merge_schema_mismatch_rollback(void)
         return 1;
     }
     prepare_bdx_seed_metadata(target);
+    /* Issue #2105: a missing declared width (0) is compatible with any, so
+     * the conflict needs two different declared widths. */
+    target->declared_ncols = target->ncols;
+    worker->declared_ncols = target->declared_ncols;
     capture_bdx_seed_snapshot(target, &snapshot);
 
     worker->declared_ncols = target->declared_ncols + 1;
