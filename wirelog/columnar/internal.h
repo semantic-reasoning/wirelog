@@ -3959,6 +3959,18 @@ wl_columnar_expr_compiled_t *
 wl_columnar_expr_compile_governed(const uint8_t *buf, uint32_t size,
     const wl_intern_t *intern, wl_columnar_memory_governor_ref_t *governor,
     wl_col_session_t *sess, int *error_out);
+int
+wl_columnar_expr_compile_controlled(const uint8_t *buf, uint32_t size,
+    wl_columnar_memory_governor_ref_t *governor, wl_col_session_t *sess,
+    wl_columnar_expr_compiled_t **out, bool *supported,
+    wl_evaluation_control_t *control);
+int
+wl_columnar_expr_eval_compiled_controlled(const wl_columnar_expr_compiled_t *c,
+    const int64_t *row, uint32_t ncols, int64_t *value, bool *failed,
+    wl_evaluation_control_t *control);
+void
+wl_columnar_expr_compiled_free_controlled(wl_columnar_expr_compiled_t *c,
+    wl_evaluation_control_t *control);
 void
 wl_columnar_expr_compiled_free(wl_columnar_expr_compiled_t *c);
 int

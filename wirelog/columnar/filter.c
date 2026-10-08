@@ -840,6 +840,8 @@ wl_columnar_filter_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     bool scratch_held = false, popped = false, committed = false;
     int64_t dummy = 0, *tuple = NULL;
     simple_filter_cmp_t cmp = {0};
+    wl_columnar_expr_compiled_t *compiled = NULL;
+    bool compiled_mode = false;
     rc = wl_evaluation_control_charge(control, 16);
     if (rc) return rc;
     sess->memory_budget_denied = false;
@@ -879,25 +881,29 @@ wl_columnar_filter_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     }
     bool predicate = op->filter_expr.data && op->filter_expr.size;
     if (predicate) {
-        if (!source->nrows) {
-            rc = ENOTSUP; goto cleanup;
+        compiled_mode = !source->nrows;
+        if (!compiled_mode) {
+            rc = wl_columnar_filter_controlled_decode(op->filter_expr.data,
+                    op->filter_expr.size, &cmp, control);
+            if (rc == ENOTSUP) {
+                compiled_mode = true; rc = 0;
+            }
+            if (rc) goto cleanup;
         }
-        rc = wl_columnar_filter_controlled_decode(op->filter_expr.data,
-                op->filter_expr.size, &cmp, control);
-        if (rc) goto cleanup;
-        rc = wl_evaluation_control_charge(control, cmp.b_is_const ? 1u : 2u);
-        if (rc) goto cleanup;
-        if (cmp.col_a >= source->ncols
-            || (!cmp.b_is_const && cmp.col_b >= source->ncols)
-            || (source->column_types
-            && (!wl_columnar_filter_controlled_integer(
-                source->column_types[cmp.col_a])
-            || (!cmp.b_is_const && !wl_columnar_filter_controlled_integer(
-                source->column_types[cmp.col_b]))))) {
-            rc = ENOTSUP; goto cleanup;
+        if (!compiled_mode) {
+            rc = wl_evaluation_control_charge(control,
+                    cmp.b_is_const ? 1u : 2u);
+            if (rc) goto cleanup;
+            if (cmp.col_a >= source->ncols
+                || (!cmp.b_is_const && cmp.col_b >= source->ncols)
+                || (source->column_types
+                && (!wl_columnar_filter_controlled_integer(
+                    source->column_types[cmp.col_a])
+                || (!cmp.b_is_const && !wl_columnar_filter_controlled_integer(
+                    source->column_types[cmp.col_b]))))) compiled_mode = true;
+            rc = wl_columnar_filter_controlled_tail(control);
+            if (rc) goto cleanup;
         }
-        rc = wl_columnar_filter_controlled_tail(control);
-        if (rc) goto cleanup;
     }
     uint64_t bytes;
     if (!wl_columnar_memory_size_mul(source->ncols, sizeof(*tuple), &bytes)
@@ -955,21 +961,49 @@ wl_columnar_filter_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     if (rc) goto cleanup;
     *private_output = (eval_entry_t){.rel = out, .owned = true,
                                      .kind = WL_COLUMNAR_EVAL_ENTRY_RELATION};
+    if (compiled_mode) {
+        bool supported;
+        rc = wl_columnar_expr_compile_controlled(op->filter_expr.data,
+                op->filter_expr.size, sess->memory_governor, sess, &compiled,
+                &supported, control);
+        if (rc) goto cleanup;
+        if (!supported) {
+            rc = ENOTSUP; goto cleanup;
+        }
+    }
     rc = wl_columnar_relation_append_batch_begin_controlled(&batch, out,
             control);
     if (rc) goto cleanup;
     for (uint32_t r = 0; r < source->nrows; r++) {
-        rc = wl_evaluation_control_charge(control, predicate ? 4u : 1u);
+        rc = wl_evaluation_control_charge(control,
+                predicate && !compiled_mode ? 4u : 1u);
         if (rc) goto cleanup;
-        bool pass = !predicate || col_filter_cmp_scalar(
-            source->columns[cmp.col_a][r], cmp.b_is_const ? cmp.const_b
-            : source->columns[cmp.col_b][r], cmp.cmp_op);
+        bool pass = !predicate || (!compiled_mode && col_filter_cmp_scalar(
+                source->columns[cmp.col_a][r], cmp.b_is_const ? cmp.const_b
+            : source->columns[cmp.col_b][r], cmp.cmp_op));
+        if (compiled_mode) {
+            for (uint32_t c = 0; c < source->ncols; c++) {
+                rc = wl_evaluation_control_charge(control, 1);
+                if (rc) goto cleanup;
+                tuple[c] = source->columns[c][r];
+                wl_columnar_filter_controlled_checkpoint(control, 4, c + 1u,
+                    group, source);
+                rc = wl_columnar_filter_controlled_tail(control);
+                if (rc) goto cleanup;
+            }
+            int64_t value; bool failed;
+            rc = wl_columnar_expr_eval_compiled_controlled(compiled,
+                    tuple ? tuple : &dummy, source->ncols, &value, &failed,
+                    control);
+            if (rc) goto cleanup;
+            pass = !failed && value != 0;
+        }
         wl_columnar_filter_controlled_checkpoint(control, 3, r + 1u, group,
             source);
         rc = wl_columnar_filter_controlled_tail(control);
         if (rc) goto cleanup;
         if (!pass) continue;
-        for (uint32_t c = 0; c < source->ncols; c++) {
+        for (uint32_t c = 0; !compiled_mode && c < source->ncols; c++) {
             rc = wl_evaluation_control_charge(control, 1);
             if (rc) goto cleanup;
             tuple[c] = source->columns[c][r];
@@ -985,6 +1019,8 @@ wl_columnar_filter_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     rc = wl_columnar_relation_append_batch_end_controlled(&batch, true,
             control);
     if (rc) goto cleanup;
+    wl_columnar_expr_compiled_free_controlled(compiled, control);
+    compiled = NULL;
     free(tuple); tuple = NULL;
     if (scratch_held) {
         if (!wl_columnar_memory_release(&scratch)) abort();
@@ -1034,6 +1070,7 @@ wl_columnar_filter_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     *private_output = (eval_entry_t){0};
     return 0;
 cleanup:
+    wl_columnar_expr_compiled_free_controlled(compiled, control);
     if (batch.active) {
         int cleanup_rc = wl_columnar_relation_append_batch_end_controlled(
             &batch, false, control);

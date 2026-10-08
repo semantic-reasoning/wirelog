@@ -264,6 +264,317 @@ wl_columnar_ops_reject_null_session(eval_stack_t *stack)
     return eval_stack_pop_relation(stack, &discarded);
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_ops_map_test_controlled_checkpoint)(
+    wl_evaluation_control_t *, int, uint64_t,
+    wl_columnar_relation_source_group_t *, col_rel_t *);
+#endif
+static void
+wl_columnar_ops_map_controlled_checkpoint(wl_evaluation_control_t *control,
+    int stage, uint64_t progress, wl_columnar_relation_source_group_t *group,
+    col_rel_t *source)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_ops_map_test_controlled_checkpoint)
+        wl_columnar_ops_map_test_controlled_checkpoint(control, stage, progress,
+            group, source);
+#else
+    (void)control; (void)stage; (void)progress; (void)group; (void)source;
+#endif
+}
+static int
+wl_columnar_ops_map_controlled_tail(wl_evaluation_control_t *control)
+{
+    return wl_evaluation_control_charge(control, 0);
+}
+static int
+wl_columnar_ops_map_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess, wl_evaluation_control_t *control)
+{
+    if (!op || !stack || !sess) return EINVAL;
+    if (sess->num_workers > 1 || sess->diff_operators_active
+        || sess->tdd_input_run || sess->tdd_subpass_active
+        || sess->tdd_outbound_only_active || sess->delta_seeded
+        || sess->retraction_seeded || sess->retraction_right_pass
+        || sess->current_iteration || sess->delta_observer
+        || !sess->memory_governor) return ENOTSUP;
+    wl_columnar_relation_source_group_t *group;
+    eval_entry_t *private_output;
+    int rc = wl_columnar_eval_stack_cleanup_join_owner(sess, stack, &group,
+            &private_output);
+    if (rc) return rc;
+    if (!stack->top || stack->top > COL_STACK_MAX
+        || stack->items[stack->top - 1].kind != WL_COLUMNAR_EVAL_ENTRY_RELATION
+        || !stack->items[stack->top - 1].rel) return EINVAL;
+    uint32_t slot = stack->top - 1;
+    col_rel_t *source = stack->items[slot].rel, *out = NULL;
+    eval_entry_t input = {0};
+    col_rel_append_batch_t batch = {0};
+    wl_columnar_memory_reservation_t scratch;
+    wl_columnar_memory_reservation_init(&scratch);
+    bool scratch_held = false, popped = false, committed = false;
+    void *scratch_mem = NULL;
+    int64_t *tuple = NULL, *row = NULL, inline_row[COL_STACK_MAX];
+    wl_columnar_expr_compiled_t **expressions = NULL;
+    uint32_t initialized = 0;
+    rc = wl_evaluation_control_charge(control, 16);
+    if (rc) return rc;
+    sess->memory_budget_denied = false;
+    rc = wl_columnar_ops_map_controlled_tail(control);
+    if (rc) return rc;
+    rc = wl_columnar_relation_source_group_acquire_controlled(group, source,
+            NULL, control);
+    wl_columnar_ops_map_controlled_checkpoint(control, 1, 0, group, source);
+    if (rc) goto cleanup;
+    rc = wl_evaluation_control_charge(control, 16);
+    if (rc) goto cleanup;
+    if (source->nrows > source->capacity
+        || (source->nrows && source->ncols && !source->columns)) {
+        rc = EINVAL; goto cleanup;
+    }
+    if (source->timestamps || source->arena_owned
+        || source->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        || source->compound_count || source->inline_physical_offset
+        || source->compound_arity_map || source->compound_arity_len) {
+        rc = ENOTSUP; goto cleanup;
+    }
+    rc = wl_columnar_ops_map_controlled_tail(control);
+    if (rc) goto cleanup;
+    for (uint32_t c = 0; source->nrows && c < source->ncols; c++) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc) goto cleanup;
+        if (!source->columns[c]) {
+            rc = EINVAL; goto cleanup;
+        }
+        rc = wl_columnar_ops_map_controlled_tail(control);
+        if (rc) goto cleanup;
+    }
+    rc = wl_evaluation_control_charge(control, 64);
+    if (rc) goto cleanup;
+    uint32_t pc = op->project_count;
+    bool with_expressions = op->map_exprs && op->map_expr_count;
+    uint32_t expression_count = with_expressions
+        ? op->map_expr_count < pc ? op->map_expr_count : pc : 0;
+    uint64_t tuple_bytes, row_bytes = 0, table_bytes = 0, bytes;
+    if (!wl_columnar_memory_size_mul(pc ? pc : 1u, sizeof(*tuple), &tuple_bytes)
+        || (source->ncols > COL_STACK_MAX
+        && !wl_columnar_memory_size_mul(source->ncols, sizeof(*row),
+        &row_bytes))
+        || (with_expressions
+        && !wl_columnar_memory_size_mul(pc, sizeof(*expressions), &table_bytes))
+        || !wl_columnar_memory_size_add(tuple_bytes, row_bytes, &bytes)
+        || !wl_columnar_memory_size_add(bytes, table_bytes, &bytes)
+        || bytes > SIZE_MAX) {
+        rc = EOVERFLOW; goto cleanup;
+    }
+    rc = wl_columnar_ops_map_controlled_tail(control);
+    if (rc) goto cleanup;
+    wl_columnar_memory_admission_status_t status;
+    rc = wl_columnar_memory_governor_reserve_checked_controlled(
+        wl_columnar_memory_governor_ref_get(sess->memory_governor), bytes,
+        &scratch, &status, control);
+    if (rc) goto cleanup;
+    if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+        && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+        rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+            : status ==
+            WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : ENOMEM;
+        if (rc == ENOSPC) sess->memory_budget_denied = true;
+        goto cleanup;
+    }
+    scratch_held = true;
+    rc = wl_evaluation_control_charge(control, 1);
+    if (rc) goto cleanup;
+    scratch_mem = malloc((size_t)bytes);
+    if (!scratch_mem) {
+        rc = ENOMEM; goto cleanup;
+    }
+    tuple = scratch_mem;
+    row = row_bytes ? (int64_t *)((char *)scratch_mem +
+        tuple_bytes) : inline_row;
+    expressions = with_expressions ? (wl_columnar_expr_compiled_t **)
+        ((char *)scratch_mem + tuple_bytes + row_bytes) : NULL;
+    rc = wl_columnar_ops_map_controlled_tail(control);
+    if (rc) goto cleanup;
+    bool accepted;
+    rc = wl_columnar_memory_governor_commit_controlled(&scratch, scratch_mem,
+            &accepted, control);
+    if (rc) goto cleanup;
+    if (!accepted) {
+        rc = ENOMEM; goto cleanup;
+    }
+    rc = eval_stack_pop_relation(stack, &input);
+    if (rc) goto cleanup;
+    popped = true;
+    rc = wl_columnar_relation_new_auto_governed_controlled("$map", pc,
+            source->nrows, false, sess->memory_governor, &out, control);
+    if (rc) goto cleanup;
+    *private_output = (eval_entry_t){.rel = out, .owned = true,
+                                     .kind = WL_COLUMNAR_EVAL_ENTRY_RELATION};
+    if (with_expressions) {
+        for (uint32_t c = 0; c < pc; c++) {
+            rc = wl_evaluation_control_charge(control, 1);
+            if (rc) goto cleanup;
+            expressions[c] = NULL; initialized++;
+            wl_columnar_ops_map_controlled_checkpoint(control, 2, c + 1u, group,
+                source);
+            rc = wl_columnar_ops_map_controlled_tail(control);
+            if (rc) goto cleanup;
+        }
+        for (uint32_t c = 0; c < expression_count; c++) {
+            rc = wl_evaluation_control_charge(control, 1);
+            if (rc) goto cleanup;
+            const wl_plan_expr_buffer_t *expr = &op->map_exprs[c];
+            bool nonempty = expr->data && expr->size;
+            rc = wl_columnar_ops_map_controlled_tail(control);
+            if (rc) goto cleanup;
+            if (!nonempty) continue;
+            bool supported;
+            rc = wl_columnar_expr_compile_controlled(expr->data, expr->size,
+                    sess->memory_governor, sess, &expressions[c], &supported,
+                    control);
+            if (rc) goto cleanup;
+            if (!supported) {
+                rc = ENOTSUP; goto cleanup;
+            }
+        }
+    }
+    rc = wl_columnar_relation_append_batch_begin_controlled(&batch, out,
+            control);
+    if (rc) goto cleanup;
+    for (uint32_t r = 0; r < source->nrows; r++) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc) goto cleanup;
+        for (uint32_t c = 0; c < source->ncols; c++) {
+            rc = wl_evaluation_control_charge(control, 1);
+            if (rc) goto cleanup;
+            row[c] = source->columns[c][r];
+            wl_columnar_ops_map_controlled_checkpoint(control, 3, c + 1u, group,
+                source);
+            rc = wl_columnar_ops_map_controlled_tail(control);
+            if (rc) goto cleanup;
+        }
+        for (uint32_t c = 0; c < pc; c++) {
+            rc = wl_evaluation_control_charge(control, 1);
+            if (rc) goto cleanup;
+            if (expressions && c < expression_count && expressions[c]) {
+                bool failed; int64_t value;
+                rc = wl_columnar_expr_eval_compiled_controlled(expressions[c],
+                        row, source->ncols, &value, &failed, control);
+                if (rc) goto cleanup;
+                if (failed) {
+                    rc = ERANGE; goto cleanup;
+                }
+                rc = wl_evaluation_control_charge(control, 1);
+                if (rc) goto cleanup;
+                tuple[c] = value;
+            } else {
+                rc = wl_evaluation_control_charge(control, 3);
+                if (rc) goto cleanup;
+                uint32_t source_column =
+                    op->project_indices ? op->project_indices[c] : c;
+                tuple[c] = source_column <
+                    source->ncols ? row[source_column] : 0;
+            }
+            wl_columnar_ops_map_controlled_checkpoint(control, 4, c + 1u, group,
+                source);
+            rc = wl_columnar_ops_map_controlled_tail(control);
+            if (rc) goto cleanup;
+        }
+        rc = wl_columnar_relation_append_batch_row_controlled(&batch, tuple,
+                control);
+        if (rc) goto cleanup;
+    }
+    rc = wl_columnar_relation_append_batch_end_controlled(&batch, true,
+            control);
+    if (rc) goto cleanup;
+    for (uint32_t c = 0; c < initialized; c++)
+        wl_columnar_expr_compiled_free_controlled(expressions[c], control);
+    initialized = 0;
+    free(scratch_mem); scratch_mem = NULL;
+    if (scratch_held) {
+        if (!wl_columnar_memory_release(&scratch)) abort();
+        scratch_held = false;
+    }
+    wl_columnar_ops_map_controlled_checkpoint(control, 5, 0, group, source);
+    int reader_rc = wl_columnar_relation_source_group_release_readers(group, 0);
+    wl_columnar_ops_map_controlled_checkpoint(control, 5, 1, group, source);
+    rc = wl_evaluation_control_charge(control, 16);
+    if (rc) {
+        if (rc < 0 && reader_rc > 0)
+            rc = reader_rc;
+        goto cleanup;
+    }
+    if (reader_rc) {
+        rc = reader_rc; goto cleanup;
+    }
+    rc = wl_columnar_relation_source_group_validate_writers(group);
+    if (rc) goto cleanup;
+    rc = wl_columnar_ops_map_controlled_tail(control);
+    if (rc) goto cleanup;
+    rc = wl_evaluation_control_charge(control, 16);
+    if (rc) goto cleanup;
+    if (stack->top != slot || slot >= COL_STACK_MAX
+        || private_output->rel != out || !private_output->owned) {
+        rc = EBUSY; goto cleanup;
+    }
+    wl_columnar_ops_map_controlled_checkpoint(control, 6, 0, group, source);
+    rc = wl_columnar_ops_map_controlled_tail(control);
+    if (rc) goto cleanup;
+    rc = wl_evaluation_control_charge(control, 84);
+    if (rc) goto cleanup;
+    wl_columnar_ops_map_controlled_checkpoint(control, 7, 0, group, source);
+    rc = wl_columnar_ops_map_controlled_tail(control);
+    if (rc) goto cleanup;
+    wl_columnar_relation_source_group_commit(group); committed = true;
+    wl_columnar_ops_map_controlled_checkpoint(NULL, 8, 0, group, source);
+    rc = wl_columnar_relation_source_group_drain(group, 0);
+    if (rc) goto cleanup;
+    rc = eval_entry_dispose(&input);
+    if (rc) goto cleanup;
+    stack->items[slot] = (eval_entry_t){.rel = out, .owned = true,
+                                        .kind = WL_COLUMNAR_EVAL_ENTRY_RELATION,
+                                        .is_delta = false};
+    stack->top = slot + 1u;
+    *private_output = (eval_entry_t){0};
+    return 0;
+cleanup:
+    if (batch.active) {
+        int cleanup_rc = wl_columnar_relation_append_batch_end_controlled(
+            &batch, false, control);
+        if (cleanup_rc > 0 && rc <= 0) rc = cleanup_rc;
+    }
+    for (uint32_t c = 0; c < initialized; c++)
+        wl_columnar_expr_compiled_free_controlled(expressions[c], control);
+    free(scratch_mem);
+    if (scratch_held) {
+        uint64_t state = atomic_load_explicit(&scratch.state,
+                memory_order_acquire);
+        bool released = state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+            ? wl_columnar_memory_release(&scratch)
+            : wl_columnar_memory_rollback(&scratch);
+        if (!released) abort();
+    }
+    int cleanup_rc = wl_columnar_relation_source_group_drain(group, rc);
+    if (cleanup_rc > 0 && rc <= 0) rc = cleanup_rc;
+    if (popped) {
+        if (committed || group->descriptor_count || group->owner_count) {
+            if (input.rel || input.seg_boundaries) {
+                stack->items[slot] = input; stack->top = slot + 1u;
+            }
+        } else {
+            cleanup_rc = eval_entry_dispose(&input);
+            if (cleanup_rc) {
+                stack->items[slot] = input; stack->top = slot + 1u;
+                if (rc <= 0) rc = cleanup_rc;
+            }
+            cleanup_rc = eval_entry_dispose(private_output);
+            if (cleanup_rc > 0 && rc <= 0) rc = cleanup_rc;
+        }
+    }
+    if (rc == ENOSPC) sess->memory_budget_denied = true;
+    return rc;
+}
 int
 col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
 {
@@ -271,6 +582,9 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         return EINVAL;
     if (!sess)
         return wl_columnar_ops_reject_null_session(stack);
+    if (sess->base.evaluation_control)
+        return wl_columnar_ops_map_controlled(op, stack, sess,
+                   sess->base.evaluation_control);
     eval_entry_t e;
     int pop_rc = eval_stack_pop_relation(stack, &e);
     if (pop_rc != 0)
