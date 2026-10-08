@@ -3153,6 +3153,9 @@ enum {
     WL_COLUMNAR_RELATION_CONSTRUCTOR_TIMESTAMP_ZERO,
     WL_COLUMNAR_RELATION_CONSTRUCTOR_RUN_VALIDATE,
     WL_COLUMNAR_RELATION_CONSTRUCTOR_RUN_COPY,
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_BEFORE_COMMIT,
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_POOL_ZERO,
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_POOL_ACQUIRED,
 };
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_relation_test_before_identity_cas)(
@@ -3253,6 +3256,13 @@ col_rel_t *wl_columnar_relation_pool_new_like_governed(delta_pool_t *pool,
 int wl_columnar_relation_pool_new_like_governed_checked(col_rel_t **out,
     delta_pool_t *pool, const char *name, const col_rel_t *like,
     wl_columnar_memory_governor_ref_t *governor);
+/* Exclusive nonreentrant pool use is required through preparation/cleanup.
+ * Slots are slab-owned, contents heap-owned; NULL control delegates legacy. */
+int
+wl_columnar_relation_pool_new_like_governed_checked_controlled(col_rel_t **out,
+    delta_pool_t *pool, const char *name, const col_rel_t *like,
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_evaluation_control_t *control);
 
 /*
  * col_rel_deep_copy (Issue #553):

@@ -975,6 +975,8 @@ constructor_equal(col_rel_t *a, col_rel_t *b)
         a->nrows == b->nrows);
     CHECK((a->column_types != NULL) == (b->column_types != NULL));
     CHECK(a->memory_governor == b->memory_governor);
+    CHECK(a->pool_owned == b->pool_owned &&
+        a->pool_name_reserved_bytes == b->pool_name_reserved_bytes);
     CHECK(a->declared_ncols == b->declared_ncols &&
         a->has_graph_column == b->has_graph_column &&
         a->graph_col_idx == b->graph_col_idx);
@@ -2205,6 +2207,418 @@ test_logical_invalid_runs_and_failures(void)
     destroy(src); governor_empty(g); wl_columnar_memory_governor_ref_release(g);
 }
 
+static uint64_t
+pool_cost(const delta_pool_t *pool, const char *name, const col_rel_t *src,
+    bool governed)
+{
+    uint64_t cost = new_like_cost(name, src, governed, false);
+    if (!pool)
+        return cost;
+    if (pool->slot_used == pool->slot_cap)
+        return cost + 4;
+    return cost + pool->slot_size + 3; /* byte zeroing + shape4 - heapalloc1 */
+}
+
+static delta_pool_t *pool_fixture;
+static col_rel_t *pool_prior;
+static unsigned char *pool_prior_bytes;
+static size_t pool_saved_arena_used;
+static bool pool_acquired_reached;
+static col_rel_t *pool_later;
+static bool pool_acquire_later;
+
+static void
+pool_checkpoint(wl_evaluation_control_t *c, int phase, uint64_t progress)
+{
+    CHECK(memcmp(pool_fixture->slab, pool_prior_bytes,
+        pool_fixture->slot_size) == 0);
+    CHECK(strcmp(pool_prior->name,
+        "prior-slot") == 0 && pool_prior->columns[0][0] == 909);
+    CHECK(pool_fixture->arena_used == pool_saved_arena_used);
+    for (size_t i = 0; i < pool_saved_arena_used; i++)
+        CHECK((unsigned char)pool_fixture->arena[i] == 0x5a);
+    if (phase == WL_COLUMNAR_RELATION_CONSTRUCTOR_POOL_ACQUIRED) {
+        CHECK(pool_fixture->slot_used == 2 && progress == 1);
+        pool_acquired_reached = true;
+        if (pool_acquire_later) {
+            pool_acquire_later = false;
+            CHECK(wl_columnar_relation_pool_new_like_governed_checked(
+                    &pool_later,
+                    pool_fixture, "later-slot", new_like_source, NULL) == 0);
+            CHECK(pool_later ==
+                (col_rel_t *)(pool_fixture->slab + 2 *
+                pool_fixture->slot_size));
+            pool_later->columns[0][0] = 707;
+            wl_evaluation_control_request_cancel(c);
+        }
+    }
+    if (phase == WL_COLUMNAR_RELATION_CONSTRUCTOR_SOURCE_NAME ||
+        phase == WL_COLUMNAR_RELATION_CONSTRUCTOR_COLUMN_NAME_COPY) {
+        CHECK(atomic_load(&new_like_source->descriptor_access.state) == 1);
+        CHECK(atomic_load(&new_like_canonical->source_access.state) == 1);
+    }
+    if (phase == constructor_cancel_phase
+        && (phase == WL_COLUMNAR_RELATION_CONSTRUCTOR_COMMITTED
+        || phase == WL_COLUMNAR_RELATION_CONSTRUCTOR_BEFORE_COMMIT)
+        && progress != constructor_cancel_progress)
+        return;
+    constructor_checkpoint(c, phase, progress);
+}
+
+static void
+pool_baseline(delta_pool_t *pool, uint64_t credits,
+    wl_columnar_memory_governor_ref_t *g)
+{
+    CHECK(pool->slot_used == 1 && pool->arena_used == pool_saved_arena_used);
+    CHECK(memcmp(pool->slab, pool_prior_bytes, pool->slot_size) == 0);
+    CHECK(atomic_load(&wl_columnar_memory_governor_ref_get(
+            g)->reserved_bytes) == credits);
+    source_unpinned(new_like_source, new_like_canonical);
+}
+
+static void
+test_pool_real_slot_stops_and_faults(void)
+{
+    wl_columnar_memory_governor_ref_t *g = fresh_governor();
+    col_rel_t *src = NULL;
+    CHECK(wl_columnar_relation_alloc_governed(&src, "pool-source", g) == 0);
+    char long_name[701]; memset(long_name, 'p', 700); long_name[700] = 0;
+    const char *names[300]; wirelog_column_type_t types[300];
+    for (uint32_t i = 0; i < 300; i++) {
+        names[i] = i == 150 ? long_name : NULL;
+        types[i] = i == 150 ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_INT64;
+    }
+    CHECK(col_rel_set_schema(src, 300, names) == 0);
+    CHECK(col_rel_set_column_types(src, types, 300) == 0);
+    CHECK(col_rel_enable_timestamps(src) == 0);
+    src->nrows = 1; src->columns[150][0] = INT64_C(0x7ff8000000000001);
+    col_rel_t *alias = relation(300, 4, 0, false, g);
+    CHECK(col_rel_install_shared_view(alias, src) == 0);
+    size_t slot_size = sizeof(col_rel_t) + 512;
+    delta_pool_t *pool = delta_pool_create_managed(3, slot_size, 64,
+            wl_columnar_memory_governor_ref_get(g));
+    delta_pool_t *reference_pool = delta_pool_create(2, slot_size, 64);
+    CHECK(pool && reference_pool);
+    memset(pool->slab, 0xa5, pool->slot_size * pool->slot_cap);
+    CHECK(wl_columnar_relation_pool_new_like_governed_checked(&pool_prior,
+        pool, "prior-slot", alias, g) == 0);
+    pool_prior->columns[0][0] = 909;
+    CHECK(delta_pool_alloc_data(pool, 32) != NULL);
+    memset(pool->arena, 0x5a, pool->arena_used);
+    pool_fixture = pool; pool_saved_arena_used = pool->arena_used;
+    pool_prior_bytes = malloc(slot_size); CHECK(pool_prior_bytes != NULL);
+    memcpy(pool_prior_bytes, pool->slab, slot_size);
+    new_like_source = alias; new_like_canonical = src;
+    wl_columnar_relation_test_constructor_checkpoint = pool_checkpoint;
+    uint64_t baseline =
+        atomic_load(&wl_columnar_memory_governor_ref_get(g)->reserved_bytes);
+    uint64_t cost = pool_cost(pool, long_name, alias, true);
+    wl_evaluation_control_t *c = control(cost);
+    col_rel_t *actual = NULL, *reference = NULL;
+    pool_acquired_reached = false;
+    CHECK(wl_columnar_relation_pool_new_like_governed_checked_controlled(
+            &actual,
+            pool, long_name, alias, g, c) == 0);
+    CHECK(actual == (col_rel_t *)(pool->slab + slot_size) &&
+        pool_acquired_reached);
+    CHECK(actual->pool_owned && !actual->arena_owned &&
+        actual->timestamps == NULL);
+    CHECK(actual->descriptor_reserved_bytes == 0 &&
+        actual->pool_name_reserved_bytes == 701);
+    CHECK(finish(c, 0) == cost);
+    CHECK(wl_columnar_relation_pool_new_like_governed_checked(&reference,
+        reference_pool, long_name, alias, g) == 0);
+    constructor_equal(actual, reference);
+    for (size_t byte = sizeof(col_rel_t); byte < slot_size; byte++)
+        CHECK((unsigned char)pool->slab[slot_size + byte] == 0);
+    destroy(actual); destroy(reference);
+    CHECK(pool->slot_used == 2); /* Success destroy does not pop a pool slot. */
+    /* Actual checked bulk cleanup followed by real reset, then reuse prior. */
+    destroy(pool_prior); delta_pool_reset(pool);
+    delta_pool_reset(reference_pool);
+    CHECK(wl_columnar_relation_pool_new_like_governed_checked(&pool_prior,
+        pool, "prior-slot", alias, g) == 0);
+    pool_prior->columns[0][0] = 909;
+    CHECK(delta_pool_alloc_data(pool, 32) != NULL);
+    memset(pool->arena, 0x5a, pool->arena_used);
+    memcpy(pool_prior_bytes, pool->slab, slot_size);
+    CHECK(atomic_load(&wl_columnar_memory_governor_ref_get(
+            g)->reserved_bytes) == baseline);
+    retry(c, cost - 1);
+    CHECK(wl_columnar_relation_pool_new_like_governed_checked_controlled(
+            &actual,
+            pool, long_name, alias, g, c) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(actual == NULL); finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT);
+    pool_baseline(pool, baseline, g);
+    const int phases[] = { WL_COLUMNAR_RELATION_CONSTRUCTOR_IDENTITY,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_POOL_ZERO,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_POOL_ZERO,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_POOL_ZERO,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_POOL_ACQUIRED,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_NAME,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_SOURCE_NAME,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_COLUMN,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_COLUMN_NAME_COPY,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_TYPES,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_BEFORE_COMMIT,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_COMMITTED,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_BEFORE_COMMIT,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_COMMITTED,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_BEFORE_COMMIT,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_COMMITTED,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_FINAL };
+    const uint64_t points[] = { 1, 256, 512, slot_size, 1, 512, 151, 150, 512,
+                                256, 4, 4, 2, 2, 3, 3, 0 };
+    for (uint32_t i = 0; i < sizeof(phases) / sizeof(phases[0]); i++) {
+        retry(c, 0); pool_acquired_reached = false;
+        constructor_cancel_phase = phases[i];
+        constructor_cancel_progress = points[i];
+        CHECK(wl_columnar_relation_pool_new_like_governed_checked_controlled(
+                &actual,
+                pool, long_name, alias, g,
+                c) == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(actual == NULL); finish(c, WL_EVALUATION_CONTROL_CANCELLED);
+        if (i > 3) CHECK(pool_acquired_reached);
+        pool_baseline(pool, baseline, g);
+    }
+    constructor_cancel_phase = 0;
+    /* Genuine independent legacy identity consumption before counted CAS. */
+    retry(c, 0); identity_failures = identity_successes = 0;
+    identity_cancel_failure = true;
+    wl_columnar_relation_test_before_identity_cas = consume_identity;
+    CHECK(wl_columnar_relation_pool_new_like_governed_checked_controlled(
+            &actual,
+            pool, long_name, alias, g, c) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(actual == NULL && identity_failures == 1 && identity_successes == 0);
+    finish(c, WL_EVALUATION_CONTROL_CANCELLED);
+    destroy(identity_winner); identity_winner = NULL;
+    identity_cancel_failure = false;
+    pool_baseline(pool, baseline, g);
+    const int64_t allocations[] = { 0, 1, 2, 3, 152, 302, 303, 304, 305, 454,
+                                    604, 605 };
+    for (uint32_t i = 0; i < sizeof(allocations) / sizeof(allocations[0]);
+        i++) {
+        retry(c, 0);
+        wl_columnar_relation_test_constructor_fail_allocation = allocations[i];
+        CHECK(wl_columnar_relation_pool_new_like_governed_checked_controlled(
+                &actual,
+                pool, long_name, alias, g, c) == ENOMEM);
+        CHECK(actual == NULL); finish(c, ENOMEM);
+        pool_baseline(pool, baseline, g);
+    }
+    const int stages[] = { 4, 2, 3 };
+    const uint64_t previous[] = { 0, 4, 2 };
+    for (uint32_t i = 0; i < 3; i++) {
+        retry(c, 0); constructor_committed = 0;
+        wl_columnar_relation_test_constructor_fail_commit = stages[i];
+        int expected = stages[i] == 4 ? EINVAL : ENOMEM;
+        CHECK(wl_columnar_relation_pool_new_like_governed_checked_controlled(
+                &actual,
+                pool, long_name, alias, g, c) == expected);
+        CHECK(actual == NULL && constructor_committed == previous[i]);
+        finish(c, expected); pool_baseline(pool, baseline, g);
+    }
+    /* Same positive admitted name-token fault on the actual NULL legacy branch. */
+    wl_columnar_relation_test_constructor_fail_commit = 4;
+    CHECK(wl_columnar_relation_pool_new_like_governed_checked_controlled(
+            &actual,
+            pool, long_name, alias, g, NULL) == EINVAL && actual == NULL);
+    pool_baseline(pool, baseline, g);
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(g);
+    uint64_t usable = atomic_load(&governor->usable_bytes);
+    CHECK(wl_columnar_relation_pool_new_like_governed_checked(&reference,
+        reference_pool, long_name, alias, g) == 0);
+    uint64_t name_bytes = reference->pool_name_reserved_bytes;
+    uint64_t metadata_bytes = reference->metadata_reserved_bytes;
+    destroy(reference); delta_pool_reset(reference_pool);
+    const uint64_t limits[] = { baseline, baseline + name_bytes,
+                                baseline + name_bytes + 300 * sizeof(uint64_t),
+                                baseline + name_bytes + 300 * sizeof(uint64_t) +
+                                metadata_bytes };
+    for (uint32_t i = 0; i < 4; i++) {
+        retry(c, 0); atomic_store(&governor->usable_bytes, limits[i]);
+        CHECK(wl_columnar_relation_pool_new_like_governed_checked_controlled(
+                &actual,
+                pool, long_name, alias, g, c) == ENOSPC);
+        CHECK(actual == NULL); finish(c, ENOSPC);
+        pool_baseline(pool, baseline, g);
+    }
+    atomic_store(&governor->usable_bytes, usable);
+    /* Real release consumes both pins; checked second release fails EBUSY. */
+    for (uint32_t stop = 0; stop < 2; stop++) {
+        retry(c, 0);
+        constructor_cancel_phase =
+            stop ? WL_COLUMNAR_RELATION_CONSTRUCTOR_FINAL : 0;
+        constructor_cancel_progress = 0;
+        wl_columnar_relation_test_new_like_before_reader_release =
+            consume_new_like_reader;
+        CHECK(wl_columnar_relation_pool_new_like_governed_checked_controlled(
+                &actual,
+                pool, long_name, alias, g, c) == EBUSY);
+        CHECK(actual == NULL); finish(c, EBUSY);
+        if (stop) {
+            wl_evaluation_control_report_t report;
+            CHECK(wl_evaluation_control_report(c,
+                &report) == 0 &&
+                report.stop_reason == WL_EVALUATION_CONTROL_CANCELLED);
+        }
+        pool_baseline(pool, baseline, g);
+    }
+    constructor_cancel_phase = 0;
+    retry(c, cost - 1);
+    wl_columnar_relation_test_new_like_before_reader_release =
+        consume_new_like_reader;
+    CHECK(wl_columnar_relation_pool_new_like_governed_checked_controlled(
+            &actual,
+            pool, long_name, alias, g, c) == EBUSY);
+    CHECK(actual == NULL); finish(c, EBUSY);
+    wl_evaluation_control_report_t limit_report;
+    CHECK(wl_evaluation_control_report(c, &limit_report) == 0 &&
+        limit_report.stop_reason == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    pool_baseline(pool, baseline, g);
+    retry(c, 0);
+    wl_columnar_relation_test_new_like_before_reader_release =
+        cancel_after_new_like_reads;
+    CHECK(wl_columnar_relation_pool_new_like_governed_checked_controlled(
+            &actual,
+            pool, long_name, alias, g, c) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(actual == NULL); finish(c, WL_EVALUATION_CONTROL_CANCELLED);
+    pool_baseline(pool, baseline, g);
+    retry(c, 0); wl_columnar_relation_test_constructor_fail_commit = 4;
+    wl_columnar_relation_test_new_like_before_reader_release =
+        consume_new_like_reader;
+    CHECK(wl_columnar_relation_pool_new_like_governed_checked_controlled(
+            &actual,
+            pool, long_name, alias, g, c) == EINVAL);
+    CHECK(actual == NULL); finish(c, EINVAL); pool_baseline(pool, baseline, g);
+    /* Defensive post-acquisition later slot: never pop its descriptor. */
+    retry(c, 0); pool_acquire_later = true; pool_later = NULL;
+    CHECK(wl_columnar_relation_pool_new_like_governed_checked_controlled(
+            &actual,
+            pool, long_name, alias, g, c) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(actual == NULL && pool->slot_used == 3 && pool_later != NULL);
+    finish(c, WL_EVALUATION_CONTROL_CANCELLED);
+    col_rel_t *tombstone = (col_rel_t *)(pool->slab + slot_size);
+    CHECK(tombstone->relation_identity == 0 &&
+        tombstone->storage_owner == NULL && tombstone->memory_governor == NULL);
+    CHECK(atomic_load(&tombstone->pool_name_reservation.state) ==
+        WL_COLUMNAR_MEMORY_RESERVATION_EMPTY);
+    CHECK(pool_later->columns[0][0] == 707 && strcmp(pool_later->name,
+        "later-slot") == 0);
+    CHECK(col_rel_pool_destroy_roots_checked(pool, 1, 3) == 0);
+    CHECK(memcmp(pool->slab, pool_prior_bytes, slot_size) == 0);
+    wl_columnar_relation_test_constructor_checkpoint = NULL;
+    destroy(pool_prior); release(c); free(pool_prior_bytes);
+    pool_prior_bytes = NULL;
+    delta_pool_destroy(reference_pool); delta_pool_destroy(pool);
+    destroy(alias); destroy(src); governor_empty(g);
+    wl_columnar_memory_governor_ref_release(g);
+}
+
+static void
+test_pool_fallback_nullary_and_shapes(void)
+{
+    wl_columnar_memory_governor_ref_t *g = fresh_governor();
+    for (uint32_t width = 0; width < 2; width++)
+        for (uint32_t managed = 0; managed < 2; managed++) {
+            col_rel_t *src = relation(width, 4, 0, true, g);
+            bool schema = src->schema_ok; src->schema_ok = false;
+            delta_pool_t *pool = delta_pool_create(1, sizeof(col_rel_t), 32);
+            delta_pool_t *reference_pool = delta_pool_create(1,
+                    sizeof(col_rel_t), 32);
+            CHECK(pool && reference_pool);
+            col_rel_t *actual = NULL, *reference = NULL;
+            wl_evaluation_control_t *c = control(pool_cost(pool, "pool-empty",
+                    src, managed != 0));
+            if (!managed)
+                wl_columnar_relation_test_constructor_fail_commit = 4;
+            CHECK(
+                wl_columnar_relation_pool_new_like_governed_checked_controlled(
+                    &actual,
+                    pool, "pool-empty", src, managed ? g : NULL, c) == 0);
+            CHECK(finish(c, 0) == pool_cost(reference_pool, "pool-empty", src,
+                managed != 0));
+            CHECK(wl_columnar_relation_pool_new_like_governed_checked(
+                    &reference,
+                    reference_pool, "pool-empty", src,
+                    managed ? g : NULL) == 0);
+            constructor_equal(actual, reference);
+            if (!managed) {
+                CHECK(wl_columnar_relation_test_constructor_fail_commit == 4);
+                wl_columnar_relation_test_constructor_fail_commit = 0;
+            }
+            CHECK(actual->schema_ok && actual->column_types == NULL &&
+                actual->timestamps == NULL);
+            destroy(actual); destroy(reference);
+            uint64_t baseline =
+                atomic_load(&wl_columnar_memory_governor_ref_get(
+                        g)->reserved_bytes);
+            for (uint32_t exhausted = 0; exhausted < 2; exhausted++) {
+                delta_pool_t *selected = exhausted ? pool : NULL;
+                uint64_t cost = pool_cost(selected, "fallback", src,
+                        managed != 0);
+                retry(c, cost);
+                CHECK(
+                    wl_columnar_relation_pool_new_like_governed_checked_controlled
+                        (&actual,
+                    selected, "fallback", src, managed ? g : NULL, c) == 0);
+                CHECK(!actual->pool_owned && actual->timestamps == NULL &&
+                    finish(c, 0) == cost);
+                CHECK(wl_columnar_relation_pool_new_like_governed_checked(
+                        &reference,
+                        selected, "fallback", src, managed ? g : NULL) == 0);
+                constructor_equal(actual, reference); destroy(actual);
+                destroy(reference);
+                retry(c, cost - 1);
+                CHECK(
+                    wl_columnar_relation_pool_new_like_governed_checked_controlled
+                        (&actual,
+                    selected, "fallback", src, managed ? g : NULL,
+                    c) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+                CHECK(actual == NULL);
+                finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT);
+                CHECK(pool->slot_used == 1 && pool->arena_used == 0);
+                CHECK(atomic_load(&wl_columnar_memory_governor_ref_get(
+                        g)->reserved_bytes) == baseline);
+            }
+            src->schema_ok = schema;
+            release(c); delta_pool_destroy(pool);
+            delta_pool_destroy(reference_pool);
+            destroy(src); governor_empty(g);
+        }
+    col_rel_t *src = relation(1, 4, 0, false, g), *out = NULL;
+    delta_pool_t *pool = delta_pool_create(1, sizeof(col_rel_t), 32);
+    CHECK(pool != NULL);
+    wl_evaluation_control_t *c = control(0);
+    size_t original_size = pool->slot_size; char *original_slab = pool->slab;
+    for (uint32_t malformed = 0; malformed < 6; malformed++) {
+        if (malformed) retry(c, 0);
+        pool->slot_used = 1; /* Check invalid shape even when apparently exhausted. */
+        pool->slot_size = original_size; pool->slab = original_slab;
+        pool->slot_cap = 1;
+        int expected = EINVAL;
+        if (malformed == 0) pool->slot_used = 2;
+        if (malformed == 1) pool->slot_size = sizeof(col_rel_t) - 1;
+        if (malformed == 2) pool->slab = original_slab + 1;
+        if (malformed == 3) pool->slot_size = sizeof(col_rel_t) + 1;
+        if (malformed == 4) {
+            pool->slot_cap = 2; pool->slot_size = SIZE_MAX;
+            expected = EOVERFLOW;
+        }
+        if (malformed == 5) pool->slab = NULL;
+        CHECK(wl_columnar_relation_pool_new_like_governed_checked_controlled(
+                &out,
+                pool, "bad-pool", src, g, c) == expected);
+        CHECK(out == NULL && finish(c, expected) == 4);
+        source_unpinned(src, src);
+    }
+    pool->slot_used = 0; pool->slot_cap = 1; pool->slot_size = original_size;
+    pool->slab = original_slab;
+    release(c); delta_pool_destroy(pool); destroy(src); governor_empty(g);
+    wl_columnar_memory_governor_ref_release(g);
+}
+
 int
 main(void)
 {
@@ -2240,6 +2654,8 @@ main(void)
     test_logical_shape_and_governors();
     test_logical_wide_alias_payload_and_runs();
     test_logical_invalid_runs_and_failures();
+    test_pool_real_slot_stops_and_faults();
+    test_pool_fallback_nullary_and_shapes();
     puts("evaluation_work: OK");
     return 0;
 }

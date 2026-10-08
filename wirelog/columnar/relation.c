@@ -8291,15 +8291,20 @@ wl_columnar_relation_constructor_commit(col_rel_t *r,
 {
     if (!pending->bytes)
         return wl_evaluation_control_charge(control, 0);
+    wl_columnar_relation_constructor_checkpoint(control,
+        WL_COLUMNAR_RELATION_CONSTRUCTOR_BEFORE_COMMIT, (uint64_t)stage);
+    int rc = wl_evaluation_control_charge(control, 0);
+    if (rc != 0)
+        return rc;
 #ifdef WL_SESSION_TEST_HOOKS
     if (wl_columnar_relation_test_constructor_fail_commit == stage) {
         wl_columnar_relation_test_constructor_fail_commit = 0;
-        return ENOMEM;
+        return stage == 4 ? EINVAL : ENOMEM;
     }
 #endif
     if (pending->bytes) {
         if (!wl_columnar_memory_commit(pending, r))
-            return ENOMEM;
+            return stage == 4 ? EINVAL : ENOMEM;
         if (!wl_columnar_memory_reservation_move(canonical, pending))
             abort();
     }
@@ -8327,7 +8332,8 @@ static int
 wl_columnar_relation_new_private_controlled(const char *name,
     uint32_t ncols, uint32_t initial_capacity, bool timestamps,
     wl_columnar_memory_governor_ref_t *governor, const col_rel_t *source,
-    bool logical_copy, col_rel_t **out, wl_evaluation_control_t *control)
+    bool logical_copy, col_rel_t *external_slot, uint64_t external_identity,
+    col_rel_t **out, wl_evaluation_control_t *control)
 {
     col_rel_t *r = NULL;
     uint64_t *lengths = NULL;
@@ -8367,7 +8373,8 @@ wl_columnar_relation_new_private_controlled(const char *name,
         if (rc != 0)
             goto done;
     }
-    if (!wl_columnar_memory_size_add(sizeof(*r), name_length, &descriptor_bytes)
+    if (!wl_columnar_memory_size_add(external_slot ? 0 : sizeof(*r),
+        name_length, &descriptor_bytes)
         || descriptor_bytes > SIZE_MAX
         || !wl_columnar_memory_size_mul(ncols, sizeof(int64_t *),
         &column_table_bytes)
@@ -8391,14 +8398,19 @@ wl_columnar_relation_new_private_controlled(const char *name,
             &descriptor);
     if (rc != 0)
         goto done;
-    rc = wl_evaluation_control_charge(control, 1);
-    if (rc != 0)
-        goto done;
-    r = wl_columnar_relation_constructor_allocation_fails() ? NULL
-        : (col_rel_t *)calloc(1, sizeof(*r));
-    if (!r) {
-        rc = ENOMEM;
-        goto done;
+    if (external_slot) {
+        r = external_slot;
+        r->pool_owned = true;
+    } else {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc != 0)
+            goto done;
+        r = wl_columnar_relation_constructor_allocation_fails() ? NULL
+            : (col_rel_t *)calloc(1, sizeof(*r));
+        if (!r) {
+            rc = ENOMEM;
+            goto done;
+        }
     }
     /* Every token identity is valid before any private object cleanup. */
     wl_columnar_memory_reservation_init(&r->descriptor_reservation);
@@ -8411,9 +8423,11 @@ wl_columnar_relation_new_private_controlled(const char *name,
         wl_columnar_memory_governor_ref_retain(governor);
         governor_retained = true;
     }
-    rc = wl_columnar_relation_work_tail(control, 1);
-    if (rc != 0)
-        goto done;
+    if (!external_slot) {
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc != 0)
+            goto done;
+    }
     if (name) {
         rc = wl_evaluation_control_charge(control, 1);
         if (rc != 0)
@@ -8443,18 +8457,27 @@ wl_columnar_relation_new_private_controlled(const char *name,
         if (rc != 0)
             goto done;
     }
-    rc = wl_columnar_relation_identity_controlled(&r->relation_identity,
-            control);
-    if (rc != 0)
-        goto done;
+    if (external_slot)
+        r->relation_identity = external_identity;
+    else {
+        rc = wl_columnar_relation_identity_controlled(&r->relation_identity,
+                control);
+        if (rc != 0)
+            goto done;
+    }
     r->view_generation = 1;
     r->storage_generation = 1;
     col_rel_storage_owner_init(r);
     rc = wl_columnar_relation_constructor_commit(r, &descriptor,
-            &r->descriptor_reservation, 1, control);
+            external_slot ? &r->pool_name_reservation :
+            &r->descriptor_reservation,
+            external_slot ? 4 : 1, control);
     if (rc != 0)
         goto done;
-    r->descriptor_reserved_bytes = governor ? descriptor_bytes : 0;
+    if (external_slot)
+        r->pool_name_reserved_bytes = governor ? descriptor_bytes : 0;
+    else
+        r->descriptor_reserved_bytes = governor ? descriptor_bytes : 0;
     r->ncols = ncols;
     r->capacity = initial_capacity;
     rc = wl_columnar_relation_constructor_reserve(governor, length_bytes,
@@ -8904,6 +8927,10 @@ done:
             && !wl_columnar_memory_reservation_move(&descriptor,
             &r->descriptor_reservation))
             abort();
+        if (r->pool_name_reservation.bytes
+            && !wl_columnar_memory_reservation_move(&descriptor,
+            &r->pool_name_reservation))
+            abort();
         if (r->metadata_reservation.bytes
             && !wl_columnar_memory_reservation_move(&metadata,
             &r->metadata_reservation))
@@ -8912,7 +8939,8 @@ done:
             && !wl_columnar_memory_reservation_move(&payload,
             &r->retained_reservation))
             abort();
-        free(r);
+        if (!external_slot)
+            free(r);
     }
     wl_columnar_relation_constructor_retire_token(&scratch);
     wl_columnar_relation_constructor_retire_token(&payload);
@@ -8937,7 +8965,8 @@ wl_columnar_relation_new_auto_governed_controlled(const char *name,
     if (!governor)
         return EINVAL;
     return wl_columnar_relation_new_private_controlled(name, ncols,
-               initial_capacity, timestamps, governor, NULL, false, out,
+               initial_capacity, timestamps, governor, NULL, false, NULL, 0,
+               out,
                control);
 }
 
@@ -9113,7 +9142,7 @@ wl_columnar_relation_new_like_governed_checked_mode_controlled(const char *name,
         goto done;
     rc = wl_columnar_relation_new_private_controlled(name, src->ncols,
             COL_REL_INIT_CAP, preserve_timestamps && src->timestamps, governor,
-            src, false, &r, control);
+            src, false, NULL, 0, &r, control);
 done:
 #ifdef WL_SESSION_TEST_HOOKS
     /* All protected source reads have finished. Hook may consume the actual
@@ -9245,6 +9274,14 @@ wl_columnar_relation_pool_new_like_governed_checked(col_rel_t **out,
         goto fail_name;
     }
     if (governor) {
+#ifdef WL_SESSION_TEST_HOOKS
+        if (name_pending.bytes
+            && wl_columnar_relation_test_constructor_fail_commit == 4) {
+            wl_columnar_relation_test_constructor_fail_commit = 0;
+            rc = EINVAL;
+            goto fail_name;
+        }
+#endif
         if (!wl_columnar_memory_reservation_move(
                 &r->pool_name_reservation, &name_pending)
             || !wl_columnar_memory_commit(&r->pool_name_reservation,
@@ -9304,6 +9341,146 @@ done:
         }
         col_rel_destroy(fallback);
     }
+    return rc;
+}
+
+/* Private constructor owns contents only; this wrapper owns the slab slot.
+ * The pool must be exclusively and nonreentrantly owned during preparation.
+ * A defensive lost-top tombstone never retires a later acquired descriptor. */
+static void
+wl_columnar_relation_pool_retire_private_slot(delta_pool_t *pool,
+    uint32_t slot_index, col_rel_t *slot, bool complete)
+{
+    if (complete)
+        col_rel_free_contents(slot);
+    /* Mandatory private cleanup, not preparation work: all physical heap
+     * contents/tokens have already been freed/retired before tombstoning. */
+    memset(slot, 0, sizeof(*slot));
+    wl_columnar_memory_reservation_init(&slot->descriptor_reservation);
+    wl_columnar_memory_reservation_init(&slot->pool_name_reservation);
+    wl_columnar_memory_reservation_init(&slot->metadata_reservation);
+    wl_columnar_memory_reservation_init(&slot->retained_reservation);
+    wl_columnar_memory_reservation_init(&slot->dedup_reservation);
+    if (pool->slot_used == slot_index + 1u
+        && pool->slab + (size_t)slot_index * pool->slot_size == (char *)slot)
+        pool->slot_used = slot_index;
+}
+
+int
+wl_columnar_relation_pool_new_like_governed_checked_controlled(col_rel_t **out,
+    delta_pool_t *pool, const char *name, const col_rel_t *like,
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_evaluation_control_t *control)
+{
+    wl_columnar_source_access_reader_t reader = { 0 };
+    col_rel_t *slot = NULL, *r = NULL;
+    uint32_t slot_index = 0;
+    uint64_t identity = 0;
+    int rc;
+    if (!control)
+        return wl_columnar_relation_pool_new_like_governed_checked(out, pool,
+                   name, like, governor);
+    if (!out)
+        return EINVAL;
+    *out = NULL;
+    if (!name || !like)
+        return EINVAL;
+    if (!pool)
+        return wl_columnar_relation_new_like_governed_checked_mode_controlled(
+            name, like, governor, false, out, control);
+    rc = wl_evaluation_control_charge(control, 4);
+    if (rc != 0)
+        return rc;
+#ifdef _MSC_VER
+    const size_t alignment = __alignof(col_rel_t);
+#else
+    const size_t alignment = _Alignof(col_rel_t);
+#endif
+    if (!pool->slab || pool->slot_used > pool->slot_cap
+        || pool->slot_size < sizeof(col_rel_t))
+        return EINVAL;
+    if (pool->slot_cap && pool->slot_size > SIZE_MAX / pool->slot_cap)
+        return EOVERFLOW;
+    if ((uintptr_t)pool->slab % alignment || pool->slot_size % alignment)
+        return EINVAL;
+    rc = wl_columnar_relation_work_tail(control, 4);
+    if (rc != 0)
+        return rc;
+    if (pool->slot_used == pool->slot_cap)
+        return wl_columnar_relation_new_like_governed_checked_mode_controlled(
+            name, like, governor, false, out, control);
+    rc = col_rel_source_reader_acquire(like, &reader);
+    if (rc != 0)
+        return rc;
+    rc = wl_evaluation_control_charge(control, 6);
+    if (rc != 0)
+        goto done;
+    if ((like->compound_arity_map == NULL) != (like->compound_arity_len == 0)
+        || like->compound_arity_len > like->ncols
+        || (like->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        && like->compound_kind != WIRELOG_COMPOUND_KIND_INLINE
+        && like->compound_kind != WIRELOG_COMPOUND_KIND_SIDE)
+        || (like->compound_kind == WIRELOG_COMPOUND_KIND_NONE
+        && (like->compound_count || like->inline_physical_offset))
+        || (like->has_graph_column && like->graph_col_idx >= like->ncols)) {
+        rc = EINVAL;
+        goto done;
+    }
+    if (like->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        || like->compound_arity_map || like->compound_arity_len) {
+        rc = ENOTSUP;
+        goto done;
+    }
+    rc = wl_columnar_relation_work_tail(control, 6);
+    if (rc != 0)
+        goto done;
+    rc = wl_columnar_relation_identity_controlled(&identity, control);
+    if (rc != 0)
+        goto done;
+    slot_index = pool->slot_used;
+    char *slot_bytes = pool->slab + (size_t)slot_index * pool->slot_size;
+    /* Do not read any slot atomic/pointer until every byte is initialized.
+    * During this unused-slot stage hooks may only request cancellation. */
+    for (size_t zeroed = 0; zeroed < pool->slot_size;) {
+        size_t n = pool->slot_size - zeroed;
+        if (n > WL_EVALUATION_CONTROL_QUANTUM)
+            n = (size_t)WL_EVALUATION_CONTROL_QUANTUM;
+        rc = wl_evaluation_control_charge(control, n);
+        if (rc != 0)
+            goto done;
+        memset(slot_bytes + zeroed, 0, n);
+        zeroed += n;
+        wl_columnar_relation_constructor_checkpoint(control,
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_POOL_ZERO, zeroed);
+        rc = wl_columnar_relation_work_tail(control, n);
+        if (rc != 0)
+            goto done;
+    }
+    slot = (col_rel_t *)slot_bytes;
+    pool->slot_used++;
+    wl_columnar_relation_constructor_checkpoint(control,
+        WL_COLUMNAR_RELATION_CONSTRUCTOR_POOL_ACQUIRED, slot_index);
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc != 0)
+        goto done;
+    rc = wl_columnar_relation_new_private_controlled(name, like->ncols,
+            COL_REL_INIT_CAP, false, governor, like, false, slot, identity, &r,
+            control);
+done:
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_new_like_before_reader_release)
+        wl_columnar_relation_test_new_like_before_reader_release(control,
+            &reader);
+#endif
+    if (col_rel_source_reader_release(&reader) != 0 && rc <= 0)
+        rc = EBUSY;
+    if (rc == 0)
+        rc = wl_evaluation_control_charge(control, 0);
+    if (rc == 0)
+        *out = r;
+    else if (slot)
+        wl_columnar_relation_pool_retire_private_slot(pool, slot_index, slot,
+            r != NULL);
     return rc;
 }
 
@@ -10045,7 +10222,8 @@ wl_columnar_relation_deep_copy_governed_controlled(const col_rel_t *src,
     if (rc != 0)
         goto done;
     rc = wl_columnar_relation_new_private_controlled(src->name, src->ncols,
-            src->capacity, src->timestamps != NULL, governor, src, true, &r,
+            src->capacity, src->timestamps != NULL, governor, src, true, NULL,
+            0, &r,
             control);
 done:
 #ifdef WL_SESSION_TEST_HOOKS
