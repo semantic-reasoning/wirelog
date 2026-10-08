@@ -4360,11 +4360,12 @@ test_snapshot_preseed_failure(int fault)
             values) == 0,
             "prefix suffix fixture");
     uint32_t count = fault == 2 ? COL_REL_INIT_CAP + 1 : 1;
-    delta_collector_t deltas = { 0 };
-    wl_session_set_delta_cb(session, collect_delta, &deltas);
-    SEED_CHECK(wl_session_insert(session, "input", values, count, 1) == 0
+    /* Stage the insert on the incremental route directly: clearing a delta
+     * callback after an insert keeps the full re-evaluation the callback
+     * promised (#2108), so it no longer reaches the preseed. */
+    SEED_CHECK(col_session_insert_incremental(session, "input", values, count,
+        1) == 0
         && !sess->pending_full_input_eval, "incremental insert");
-    wl_session_set_delta_cb(session, NULL, NULL);
     if (fault == 0) {
         SEED_CHECK(col_rel_source_reader_acquire(held, &reader) == 0, "reader");
         reader_active = true;

@@ -5407,6 +5407,17 @@ col_session_set_delta_cb(wl_session_t *session, wirelog_on_delta_fn callback,
     wl_col_session_t *sess = COL_SESSION(session);
     sess->delta_cb = callback;
     sess->delta_data = user_data;
+    /* Issue #2108: an insert made with a callback installed is staged for an
+     * incremental evaluation, and unless an insert into a second relation
+     * already asked for a full one, only the callback told a snapshot to
+     * re-evaluate in full instead (#1030).  Clearing it left that insert,
+     * and any removal staged beside it, to a snapshot's incremental route,
+     * which ignores the removal and emits the rows of the strata below the
+     * inserted relation again; keep the full re-evaluation the callback
+     * promised. */
+    if (!callback && sess->last_inserted_relation != NULL
+        && sess->has_evaluated)
+        sess->pending_full_input_eval = true;
     if (!callback) {
         if (sess->delta_publish_active)
             sess->delta_publish_cancelled = true;

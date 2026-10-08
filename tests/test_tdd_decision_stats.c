@@ -133,17 +133,6 @@ static void
 count_cb(const char *relation, const int64_t *row, uint32_t ncols,
     void *user_data);
 
-static void
-frame_delta_cb(const char *relation, const int64_t *row, uint32_t ncols,
-    int32_t diff, void *user_data)
-{
-    (void)relation;
-    (void)row;
-    (void)ncols;
-    (void)diff;
-    (void)user_data;
-}
-
 static int
 run_snapshot_frames(void)
 {
@@ -200,12 +189,10 @@ run_snapshot_frames(void)
         rc = wl_session_insert(sess, "b", first, 1, 2);
     if (rc == 0)
         rc = wl_session_snapshot(sess, count_cb, &ctx);
-    /* Use the incremental insert route, then unregister the callback so
-     * snapshot's callback-specific full-evaluation fallback does not apply. */
-    wl_session_set_delta_cb(sess, frame_delta_cb, NULL);
+    /* Use the incremental insert route without a delta callback, so the
+     * snapshot does not fall back to a full evaluation (#1030, #2108). */
     if (rc == 0)
-        rc = wl_session_insert(sess, "a", second, 1, 2);
-    wl_session_set_delta_cb(sess, NULL, NULL);
+        rc = col_session_insert_incremental(sess, "a", second, 1, 2);
     if (rc == 0)
         rc = wl_session_snapshot(sess, count_cb, &ctx);
     if (rc == 0)
