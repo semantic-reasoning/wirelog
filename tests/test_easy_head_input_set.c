@@ -353,10 +353,7 @@ main(void)
             test_inline_fact_also_derived((mode_t_)m, workers[w]);
             test_inline_fact_written_twice((mode_t_)m, workers[w]);
             test_host_rows((mode_t_)m, workers[w]);
-            /* A recursive head seeded by an inline fact does not evaluate
-             * on more than one worker yet, before and after this fix. */
-            if (workers[w] == 1)
-                test_recursive_head((mode_t_)m, workers[w]);
+            test_recursive_head((mode_t_)m, workers[w]);
         }
     }
     printf("%d run, %d passed, %d failed\n", tests_run, tests_passed,
