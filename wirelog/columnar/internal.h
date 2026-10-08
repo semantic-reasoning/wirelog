@@ -4125,6 +4125,13 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
 int
 col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess);
 int
+wl_columnar_join_controlled_lookup(wl_col_session_t *sess, const char *name,
+    col_rel_t **out, wl_evaluation_control_t *control);
+int
+wl_columnar_relation_new_like_held_controlled(const char *name,
+    const col_rel_t *src, wl_columnar_memory_governor_ref_t *governor,
+    col_rel_t **out, wl_evaluation_control_t *control);
+int
 wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess);
 int

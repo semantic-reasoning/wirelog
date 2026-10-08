@@ -1253,6 +1253,7 @@ wl_columnar_join_controlled_equal_name(const char *a, const char *b,
         int rc = wl_evaluation_control_charge(control, 1);
         if (rc) return rc;
         char av = a[i], bv = b[i];
+        wl_columnar_join_controlled_checkpoint(control, 12, i + 1u, NULL, NULL);
         rc = wl_columnar_join_controlled_tail(control);
         if (rc) return rc;
         if (av != bv) return 0;
@@ -1261,7 +1262,7 @@ wl_columnar_join_controlled_equal_name(const char *a, const char *b,
         }
     }
 }
-static int
+int
 wl_columnar_join_controlled_lookup(wl_col_session_t *sess, const char *name,
     col_rel_t **out, wl_evaluation_control_t *control)
 {

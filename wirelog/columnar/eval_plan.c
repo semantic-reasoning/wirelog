@@ -231,27 +231,43 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
         int rc = wl_evaluation_control_charge(control, 32);
         if (rc)
             return rc;
-        /* Fixed route/mode/slot predicates (at most22); no plan/name scan.
-         * This temporary route is extended only with reviewed bounded bodies. */
-        if (rplan->op_count != 1)
+        /* Two fixed admitted routes; no plan/name scan before refusal. The
+         * larger VARIABLE/FILTER route is charged separately below. */
+        bool join = rplan->op_count == 1
+            && rplan->ops[0].op == WL_PLAN_OP_JOIN;
+        bool filter = rplan->op_count == 2
+            && rplan->ops[0].op == WL_PLAN_OP_VARIABLE
+            && rplan->ops[1].op == WL_PLAN_OP_FILTER;
+        if (!join && !filter)
             return ENOTSUP;
         const wl_plan_op_t *op = &rplan->ops[0];
-        if (op->op != WL_PLAN_OP_JOIN || sess->num_workers > 1
-            || sess->diff_operators_active || sess->tdd_input_run
-            || sess->tdd_subpass_active || sess->tdd_outbound_only_active
-            || sess->delta_seeded || sess->retraction_seeded
-            || sess->retraction_right_pass || sess->join_batch_bytes
-            || sess->join_output_shared_count || !sess->memory_governor
-            || op->delta_mode != WL_DELTA_FORCE_FULL
-            || op->right_filter_expr.size || op->materialized)
+        if (sess->num_workers > 1 || sess->diff_operators_active
+            || sess->tdd_input_run || sess->tdd_subpass_active
+            || sess->tdd_outbound_only_active || sess->delta_seeded
+            || sess->retraction_seeded || sess->retraction_right_pass
+            || sess->join_batch_bytes || sess->join_output_shared_count
+            || !sess->memory_governor
+            || op->delta_mode != WL_DELTA_FORCE_FULL)
             return ENOTSUP;
-        if (!stack->top || stack->top > COL_STACK_MAX
-            || stack->items[stack->top - 1].kind !=
-            WL_COLUMNAR_EVAL_ENTRY_RELATION
-            || !stack->items[stack->top - 1].rel)
-            return EINVAL;
-        if (stack->items[stack->top - 1].is_delta)
-            return ENOTSUP;
+        if (filter) {
+            rc = wl_evaluation_control_charge(control, 16);
+            if (rc)
+                return rc;
+            if (sess->current_iteration || sess->delta_observer)
+                return ENOTSUP;
+            if (stack->top >= COL_STACK_MAX)
+                return ENOMEM;
+        } else {
+            if (op->right_filter_expr.size || op->materialized)
+                return ENOTSUP;
+            if (!stack->top || stack->top > COL_STACK_MAX
+                || stack->items[stack->top - 1].kind !=
+                WL_COLUMNAR_EVAL_ENTRY_RELATION
+                || !stack->items[stack->top - 1].rel)
+                return EINVAL;
+            if (stack->items[stack->top - 1].is_delta)
+                return ENOTSUP;
+        }
 #ifdef WL_SESSION_TEST_HOOKS
         if (wl_columnar_eval_plan_test_entry_checkpoint)
             wl_columnar_eval_plan_test_entry_checkpoint(control);

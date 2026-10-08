@@ -107,6 +107,32 @@ int
 col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
 {
+    if (sess->base.evaluation_control) {
+        wl_evaluation_control_t *control = sess->base.evaluation_control;
+        int rc = wl_evaluation_control_charge(control, 16);
+        if (rc)
+            return rc;
+        if (op->delta_mode != WL_DELTA_FORCE_FULL)
+            return ENOTSUP;
+        if (stack->top >= COL_STACK_MAX)
+            return ENOMEM;
+        col_rel_t *full = NULL;
+        rc = wl_columnar_join_controlled_lookup(sess, op->relation_name,
+                &full, control);
+        if (rc)
+            return rc;
+        if (!full)
+            return ENOENT;
+        rc = wl_evaluation_control_charge(control, 8);
+        if (rc)
+            return rc;
+        /* Registry lifetime is host serialized. No storage/owner fields are
+         * inspected until FILTER acquires its real grouped source authority. */
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc)
+            return rc;
+        return eval_stack_push_delta(stack, full, false, false);
+    }
     if (sess->tdd_input_run) {
         col_rel_t *bound = NULL;
         bool delta = false;

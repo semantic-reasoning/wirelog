@@ -11097,6 +11097,29 @@ done:
     return rc;
 }
 
+/* Caller retains grouped descriptor/owner authority through its operator
+ * cutoff. Building this private image never finalizes the source journal. */
+int
+wl_columnar_relation_new_like_held_controlled(const char *name,
+    const col_rel_t *src, wl_columnar_memory_governor_ref_t *governor,
+    col_rel_t **out, wl_evaluation_control_t *control)
+{
+    if (!name || !src || !out || !control)
+        return EINVAL;
+    *out = NULL;
+    int rc = wl_evaluation_control_charge(control, 16);
+    if (rc)
+        return rc;
+    if (src->has_graph_column && src->graph_col_idx >= src->ncols)
+        return EINVAL;
+    rc = wl_columnar_relation_work_tail(control, 16);
+    if (rc)
+        return rc;
+    return wl_columnar_relation_new_private_controlled(name, src->ncols,
+               COL_REL_INIT_CAP, false, governor, src, false, NULL, 0,
+               out, control);
+}
+
 int
 wl_columnar_relation_new_like_governed_checked_controlled(col_rel_t **out,
     const char *name, const col_rel_t *src,
