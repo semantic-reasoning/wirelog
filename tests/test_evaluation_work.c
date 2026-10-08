@@ -1,4 +1,5 @@
 /* #1821: bounded real scalar materialization, before engine integration. */
+#define WL_TEST_RELATION_RESIZE_HOOK 1
 #include "../wirelog/columnar/internal.h"
 #include <stdio.h>
 
@@ -348,9 +349,11 @@ test_rejected_shapes(void)
     col_rel_t *src = relation(1, 4, 4, false, NULL);
     col_rel_t *dst = relation(1, 4, 1, false, NULL);
     wl_evaluation_control_t *c = control(0);
+    dst->arena_owned = true;
     CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
         c) == ENOTSUP);
     CHECK(finish(c, ENOTSUP) == 0 && dst->nrows == 1);
+    dst->arena_owned = false;
     src->nrows = 1;
     dst->compound_arity_len = UINT32_MAX;
     retry(c, 0);
@@ -383,6 +386,236 @@ test_rejected_shapes(void)
     release(c); destroy(dst); destroy(src);
 }
 
+typedef struct {
+    int64_t **columns;
+    col_delta_timestamp_t *timestamps;
+    uint32_t capacity, timestamp_capacity, rows;
+    uint64_t view, storage, reserved, credit;
+} growth_snapshot_t;
+
+static growth_snapshot_t
+snapshot(col_rel_t *r)
+{
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(r->memory_governor);
+    return (growth_snapshot_t){ r->columns, r->timestamps, r->capacity,
+                                r->timestamp_capacity, r->nrows,
+                                r->view_generation,
+                                r->storage_generation,
+                                atomic_load(&g->reserved_bytes),
+                                r->retained_reserved_bytes };
+}
+
+static void
+unchanged(col_rel_t *r, growth_snapshot_t before)
+{
+    growth_snapshot_t now = snapshot(r);
+    CHECK(now.columns == before.columns && now.timestamps == before.timestamps);
+    CHECK(now.capacity == before.capacity &&
+        now.timestamp_capacity == before.timestamp_capacity);
+    CHECK(now.rows == before.rows && now.view == before.view &&
+        now.storage == before.storage);
+    CHECK(now.reserved == before.reserved && now.credit == before.credit);
+    for (uint32_t c = 0; c < r->ncols; c++)
+        for (uint32_t row = 0; row < r->nrows; row++)
+            CHECK(r->columns[c][row] == (int64_t)c * 10000 + row);
+    if (r->timestamps)
+        for (uint32_t row = 0; row < r->nrows; row++)
+            CHECK(r->timestamps[row].iteration == row);
+}
+
+static void
+test_growth_exact_and_cancel(void)
+{
+    col_rel_t *src = relation(2, 300, 300, true, NULL);
+    col_rel_t *dst = relation(2, 300, 300, true, NULL);
+    col_rel_t *reference = relation(2, 300, 300, true, NULL);
+    uint64_t cost = 4207; /* 2 metadata, 1 doubling, 4 allocations, 1200 cells, 3000 fields. */
+    growth_snapshot_t before = snapshot(dst);
+    wl_evaluation_control_t *c = control(cost - 1);
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT) <= cost - 1);
+    unchanged(dst, before); released(dst); released(src);
+    const uint64_t boundaries[] = { 261, 2707, 4207 };
+    for (uint32_t i = 0; i < 3; i++) {
+        retry(c, 0);
+        cancel_at = boundaries[i];
+        CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c)
+            == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(finish(c, WL_EVALUATION_CONTROL_CANCELLED) == boundaries[i]);
+        CHECK(max_chunk <= 256);
+        unchanged(dst, before); released(dst); released(src);
+    }
+    retry(c, cost);
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c) == 0);
+    CHECK(finish(c, 0) == cost && seen == cost);
+    CHECK(dst->columns != before.columns &&
+        dst->timestamps != before.timestamps);
+    CHECK(dst->capacity == 600 && dst->nrows == 600);
+    CHECK(dst->storage_generation == before.storage + 1 &&
+        dst->view_generation == before.view + 1);
+    CHECK(wl_columnar_relation_append_all_controlled(reference, src, NULL,
+        NULL) == 0);
+    payload_equal(dst, reference, 0);
+    release(c); destroy(reference); destroy(dst); destroy(src);
+}
+
+static void
+test_growth_wide_and_same_owner(void)
+{
+    col_rel_t *src = relation(300, 2, 2, false, NULL);
+    col_rel_t *dst = relation(300, 1, 1, false, NULL);
+    /* Capacity1->4 takes two doublings, table1 and columns300. */
+    uint64_t cost = 300 + 2 + 1 + 300 + 300 + 600;
+    wl_evaluation_control_t *c = control(cost);
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c) == 0);
+    CHECK(finish(c, 0) == cost);
+    payload_equal(dst, src, 1);
+    release(c); destroy(dst); destroy(src);
+    dst = relation(1, 3, 3, true, NULL);
+    c = control(41);
+    CHECK(wl_columnar_relation_append_all_controlled(dst, dst, NULL, c) == 0);
+    CHECK(finish(c, 0) == 41 && dst->nrows == 6);
+    for (uint32_t row = 0; row < 3; row++) {
+        CHECK(dst->columns[0][row] == dst->columns[0][row + 3]);
+        CHECK(dst->timestamps[row].multiplicity ==
+            dst->timestamps[row + 3].multiplicity);
+    }
+    released(dst); release(c); destroy(dst);
+    src = relation(0, 3, 2, false, NULL);
+    dst = relation(0, 1, 1, false, NULL);
+    c = control(2);
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c) == 0);
+    CHECK(finish(c, 0) == 2 && dst->nrows == 3 && dst->capacity == 4);
+    release(c); destroy(dst); destroy(src);
+}
+
+static void
+test_growth_float_and_timestamp_shortage(void)
+{
+    col_rel_t *src = relation(1, 2, 0, true, NULL);
+    col_rel_t *dst = relation(1, 1, 0, true, NULL);
+    wirelog_column_type_t type = WIRELOG_TYPE_FLOAT;
+    CHECK(col_rel_set_column_types(src, &type, 1) == 0);
+    CHECK(col_rel_set_column_types(dst, &type, 1) == 0);
+    src->nrows = 2; dst->nrows = 1;
+    src->columns[0][0] = INT64_MIN;
+    src->columns[0][1] = wl_columnar_float_to_bits(3.5);
+    dst->columns[0][0] = wl_columnar_float_to_bits(1.5);
+    wl_evaluation_control_t *c = control(28); /* meta1+validation2+doubling2+alloc3+old1+new2+norm2+timestamp15 */
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c) == 0);
+    CHECK(finish(c, 0) == 28);
+    CHECK(dst->columns[0][0] == wl_columnar_float_to_bits(1.5));
+    CHECK(dst->columns[0][1] == 0 && dst->columns[0][2] == src->columns[0][1]);
+    release(c); destroy(dst); destroy(src);
+    src = relation(1, 2, 2, true, NULL);
+    dst = relation(1, 4, 1, false, NULL);
+    CHECK(col_rel_enable_timestamps(dst) == 0);
+    /* Valid independent timestamp storage can be smaller than the column grid.
+    * Construct its private owner and retire surplus credit before the test. */
+    col_delta_timestamp_t *small = calloc(1, sizeof(*small));
+    CHECK(small != NULL);
+    free(dst->timestamps);
+    dst->timestamps = small;
+    dst->timestamp_capacity = 1;
+    col_rel_retire_payload_credit(dst);
+    uint64_t generation = dst->storage_generation;
+    c = control(0);
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c) == 0);
+    CHECK(finish(c, 0) == 22); /* metadata1+alloc3+old1+new2+timestamp15 */
+    CHECK(dst->capacity == 4 && dst->timestamp_capacity == 4);
+    CHECK(dst->storage_generation == generation + 1);
+    release(c); destroy(dst); destroy(src);
+}
+
+static void
+test_growth_auxiliary_and_ledger(void)
+{
+    col_rel_t *src = relation(2, 2, 2, true, NULL);
+    col_rel_t *dst = relation(2, 1, 1, true, NULL);
+    CHECK(col_rel_reserve_merge_grid(dst, 3) == 0);
+    int64_t **merge = dst->merge_columns;
+    int64_t *scratch = dst->row_scratch;
+    merge[0][0] = 99;
+    uint64_t old_payload = dst->retained_reserved_bytes;
+    uint64_t old_grid = 2 * sizeof(int64_t *) + 2 * sizeof(int64_t);
+    uint64_t new_grid = 2 * sizeof(int64_t *) + 2 * 4 * sizeof(int64_t);
+    wl_mem_ledger_t ledger;
+    wl_mem_ledger_init(&ledger, 0);
+    dst->mem_ledger = &ledger;
+    col_rel_ledger_reconcile(dst, 0);
+    growth_snapshot_t before = snapshot(dst);
+    wl_evaluation_control_t *c = control(0);
+    wl_columnar_relation_test_fail_next_reservation_commit();
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
+        c) == ENOMEM);
+    CHECK(finish(c, ENOMEM) == 29);
+    unchanged(dst, before);
+    CHECK(dst->merge_columns == merge && dst->row_scratch == scratch);
+    CHECK(atomic_load(&ledger.subsys_bytes[WL_MEM_SUBSYS_RELATION]) == 16);
+    CHECK(atomic_load(&ledger.subsys_bytes[WL_MEM_SUBSYS_TIMESTAMP]) ==
+        sizeof(col_delta_timestamp_t));
+    retry(c, 29);
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c) == 0);
+    CHECK(finish(c, 0) == 29);
+    CHECK(dst->merge_columns == merge && dst->row_scratch == scratch &&
+        merge[0][0] == 99);
+    CHECK(dst->retained_reserved_bytes == old_payload - old_grid + new_grid
+        + 3 * sizeof(col_delta_timestamp_t));
+    CHECK(atomic_load(&ledger.subsys_bytes[WL_MEM_SUBSYS_RELATION]) == 64);
+    CHECK(atomic_load(&ledger.subsys_bytes[WL_MEM_SUBSYS_TIMESTAMP]) ==
+        4 * sizeof(col_delta_timestamp_t));
+    release(c); destroy(dst);
+    CHECK(atomic_load(&ledger.current_bytes) == 0);
+    destroy(src);
+}
+
+static void
+test_growth_faults(void)
+{
+    col_rel_t *src = relation(1, 2, 2, false, NULL);
+    col_rel_t *dst = relation(1, 1, 1, false, NULL);
+    growth_snapshot_t before = snapshot(dst);
+    wl_evaluation_control_t *c = control(0);
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(dst->memory_governor);
+    uint64_t usable = atomic_load(&g->usable_bytes);
+    atomic_store(&g->usable_bytes, before.reserved);
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
+        c) == ENOMEM);
+    CHECK(dst->memory_budget_denial_pending);
+    CHECK(finish(c, ENOMEM) == 3); /* metadata + doubling2, before allocation */
+    unchanged(dst, before); released(dst); released(src);
+    atomic_store(&g->usable_bytes, usable);
+    retry(c, 0);
+    wl_columnar_relation_test_fail_next_prepare_resize();
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
+        c) == ENOMEM);
+    CHECK(!dst->memory_budget_denial_pending);
+    CHECK(finish(c, ENOMEM) == 4);
+    unchanged(dst, before); released(dst); released(src);
+    retry(c, 0);
+    wl_columnar_relation_test_fail_next_reservation_commit();
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
+        c) == ENOMEM);
+    CHECK(!dst->memory_budget_denial_pending);
+    CHECK(finish(c, ENOMEM) == 8); /* Actual copied source and old prefix admitted. */
+    unchanged(dst, before); released(dst); released(src);
+    retry(c, 0);
+    dst->storage_generation = WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
+        c) == EOVERFLOW);
+    CHECK(finish(c, EOVERFLOW) == 0);
+    dst->storage_generation = before.storage;
+    unchanged(dst, before);
+    retry(c, 8);
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c) == 0);
+    CHECK(finish(c, 0) == 8);
+    payload_equal(dst, src, 1);
+    release(c); destroy(dst); destroy(src);
+}
+
 int
 main(void)
 {
@@ -397,6 +630,11 @@ main(void)
     test_real_alias_and_gate();
     test_malformed_plain_compound_metadata();
     test_rejected_shapes();
+    test_growth_exact_and_cancel();
+    test_growth_wide_and_same_owner();
+    test_growth_float_and_timestamp_shortage();
+    test_growth_auxiliary_and_ledger();
+    test_growth_faults();
     puts("evaluation_work: OK");
     return 0;
 }
