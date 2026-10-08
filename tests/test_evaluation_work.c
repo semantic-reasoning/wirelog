@@ -973,7 +973,11 @@ constructor_equal(col_rel_t *a, col_rel_t *b)
 {
     CHECK(a->ncols == b->ncols && a->capacity == b->capacity &&
         a->nrows == b->nrows);
-    CHECK(a->column_types == NULL && b->column_types == NULL);
+    CHECK((a->column_types != NULL) == (b->column_types != NULL));
+    CHECK(a->memory_governor == b->memory_governor);
+    CHECK(a->declared_ncols == b->declared_ncols &&
+        a->has_graph_column == b->has_graph_column &&
+        a->graph_col_idx == b->graph_col_idx);
     CHECK((a->columns != NULL) == (b->columns != NULL));
     CHECK((a->col_names != NULL) == (b->col_names != NULL));
     CHECK((a->row_scratch != NULL) == (b->row_scratch != NULL));
@@ -992,6 +996,8 @@ constructor_equal(col_rel_t *a, col_rel_t *b)
     CHECK(a->storage_owner_identity == a->relation_identity);
     for (uint32_t c = 0; c < a->ncols; c++) {
         CHECK(a->columns[c] != NULL && b->columns[c] != NULL);
+        if (a->column_types)
+            CHECK(a->column_types[c] == b->column_types[c]);
         CHECK(strcmp(a->col_names[c], b->col_names[c]) == 0);
         CHECK(strcmp(a->schema.children[c]->name,
             b->schema.children[c]->name) == 0);
@@ -1289,6 +1295,419 @@ test_constructor_faults_and_long_name(void)
     wl_columnar_relation_test_constructor_checkpoint = NULL;
 }
 
+static uint64_t
+new_like_cost(const char *name, const col_rel_t *src, bool governed,
+    bool preserve_timestamps)
+{
+    uint64_t n = strlen(name) + 1, lengths = 0, named = 0;
+    for (uint32_t i = 0; i < src->ncols; i++) {
+        char text[32];
+        const char *column = src->col_names ? src->col_names[i] : NULL;
+        if (column)
+            named++;
+        else {
+            snprintf(text, sizeof(text), "col%u", i);
+            column = text;
+        }
+        lengths += strlen(column) + 1;
+    }
+    uint64_t cost = src->ncols
+        ? 2 * n + 11 + 14 * (uint64_t)src->ncols + 3 * lengths - 2 * named
+        : 2 * n + 6;
+    cost += 6 + (preserve_timestamps && src->timestamps ? 1 : 0);
+    if (src->ncols && !governed)
+        cost--;
+    if (src->ncols && src->column_types)
+        cost += 1 + src->ncols;
+    return cost;
+}
+
+static void
+source_unpinned(col_rel_t *src, col_rel_t *canonical)
+{
+    CHECK(atomic_load(&src->descriptor_access.state) == 0);
+    CHECK(atomic_load(&canonical->source_access.state) == 0);
+}
+
+static void
+test_new_like_matrix(void)
+{
+    wl_columnar_memory_governor_ref_t *g = fresh_governor();
+    for (uint32_t width_mode = 0; width_mode < 2; width_mode++)
+        for (uint32_t typed = 0; typed < 2; typed++)
+            for (uint32_t timestamped = 0; timestamped < 2; timestamped++) {
+                uint32_t width = width_mode ? 3 : 0;
+                col_rel_t *src = relation(width, 4, 0, timestamped != 0, g);
+                wirelog_column_type_t types[] = {
+                    WIRELOG_TYPE_FLOAT, WIRELOG_TYPE_INT64, WIRELOG_TYPE_INT32
+                };
+                if (typed) {
+                    CHECK(col_rel_set_column_types(src, types, width) == 0);
+                    /* Zero-width legacy still touches view for a nonNULL input
+                     * type pointer, but returns a NULL result type array. */
+                    if (!width)
+                        src->column_types = types;
+                }
+                src->declared_ncols = 17;
+                src->has_graph_column = width != 0;
+                src->graph_col_idx = width ? 2 : 41;
+                if (width) {
+                    src->nrows = 1;
+                    src->columns[0][0] = INT64_C(0x7ff8000000000001);
+                }
+                uint64_t baseline = atomic_load(&
+                        wl_columnar_memory_governor_ref_get(g)->reserved_bytes);
+                uint64_t view = src->view_generation,
+                    storage = src->storage_generation;
+                for (uint32_t governed = 0; governed < 2; governed++)
+                    for (uint32_t preserve = 0; preserve < 2; preserve++) {
+                        col_rel_t *actual = NULL, *reference = NULL;
+                        wl_evaluation_control_t *c = control(new_like_cost(
+                                    "empty", src, governed != 0,
+                                    preserve != 0));
+                        int matrix_rc =
+                            wl_columnar_relation_new_like_governed_checked_mode_controlled
+                            (
+                            "empty", src, governed ? g : NULL, preserve != 0,
+                            &actual, c);
+                        CHECK(matrix_rc == 0);
+                        CHECK(finish(c, 0) == new_like_cost("empty", src,
+                            governed != 0, preserve != 0));
+                        CHECK(
+                            wl_columnar_relation_new_like_governed_checked_mode_controlled
+                            (
+                                "empty", src, governed ? g : NULL,
+                                preserve != 0,
+                                &reference, NULL) == 0);
+                        constructor_equal(actual, reference);
+                        CHECK(actual->nrows == 0 &&
+                            actual->capacity == COL_REL_INIT_CAP);
+                        CHECK(actual->memory_governor == (governed ? g : NULL));
+                        CHECK((actual->row_scratch != NULL) == (governed &&
+                            width));
+                        CHECK((actual->timestamps != NULL) == (preserve &&
+                            timestamped));
+                        if (width)
+                            CHECK(src->columns[0][0] ==
+                                INT64_C(0x7ff8000000000001));
+                        CHECK(src->view_generation == view &&
+                            src->storage_generation == storage);
+                        source_unpinned(src, src);
+                        destroy(actual); destroy(reference); release(c);
+                        CHECK(atomic_load(&wl_columnar_memory_governor_ref_get(
+                                g)->reserved_bytes) == baseline);
+                    }
+                if (typed && !width)
+                    src->column_types = NULL;
+                destroy(src); governor_empty(g);
+            }
+    col_rel_t *unmanaged = col_rel_new_auto("unmanaged-source", 2);
+    CHECK(unmanaged != NULL && unmanaged->memory_governor == NULL);
+    for (uint32_t governed = 0; governed < 2; governed++) {
+        col_rel_t *actual = NULL, *reference = NULL;
+        wl_evaluation_control_t *c = control(new_like_cost("unmanaged-empty",
+                unmanaged, governed != 0, true));
+        CHECK(wl_columnar_relation_new_like_governed_checked_controlled(&actual,
+            "unmanaged-empty", unmanaged, governed ? g : NULL, c) == 0);
+        CHECK(finish(c, 0) == new_like_cost("unmanaged-empty", unmanaged,
+            governed != 0, true));
+        CHECK(wl_columnar_relation_new_like_governed_checked(&reference,
+            "unmanaged-empty", unmanaged, governed ? g : NULL) == 0);
+        constructor_equal(actual, reference);
+        destroy(actual); destroy(reference); release(c); governor_empty(g);
+    }
+    destroy(unmanaged);
+    wl_columnar_memory_governor_ref_release(g);
+}
+
+static col_rel_t *new_like_source, *new_like_canonical;
+static bool new_like_checked_pins;
+static void
+new_like_checkpoint(wl_evaluation_control_t *c, int phase, uint64_t progress)
+{
+    if (phase == WL_COLUMNAR_RELATION_CONSTRUCTOR_SOURCE_NAME ||
+        phase == WL_COLUMNAR_RELATION_CONSTRUCTOR_COLUMN_NAME_COPY) {
+        CHECK(atomic_load(&new_like_source->descriptor_access.state) == 1);
+        CHECK(atomic_load(&new_like_canonical->source_access.state) == 1);
+        wl_columnar_source_access_writer_t token = { 0 };
+        CHECK(col_rel_source_writer_acquire(new_like_source, &token) == EBUSY);
+        new_like_checked_pins = true;
+    }
+    constructor_checkpoint(c, phase, progress);
+}
+
+static void
+test_new_like_wide_alias_and_names(void)
+{
+    wl_columnar_memory_governor_ref_t *g = fresh_governor();
+    col_rel_t *src = NULL;
+    CHECK(wl_columnar_relation_alloc_governed(&src, "wide-named", g) == 0);
+    char long_name[701]; memset(long_name, 'x', 700); long_name[700] = 0;
+    const char *names[600];
+    wirelog_column_type_t types[600];
+    for (uint32_t i = 0; i < 600; i++) {
+        names[i] = i == 300 ? long_name : NULL;
+        types[i] = i == 300 ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_INT64;
+    }
+    CHECK(col_rel_set_schema(src, 600, names) == 0);
+    CHECK(col_rel_enable_timestamps(src) == 0);
+    CHECK(col_rel_set_column_types(src, types, 600) == 0);
+    col_rel_t *alias = relation(600, 4, 0, false, g);
+    CHECK(col_rel_install_shared_view(alias, src) == 0);
+    new_like_source = alias; new_like_canonical = src;
+    wl_columnar_relation_test_constructor_checkpoint = new_like_checkpoint;
+    uint64_t baseline =
+        atomic_load(&wl_columnar_memory_governor_ref_get(g)->reserved_bytes);
+    uint64_t cost = new_like_cost("alias-empty", alias, true, true);
+    col_rel_t *actual = NULL, *reference = NULL;
+    wl_evaluation_control_t *c = control(cost);
+    new_like_checked_pins = false;
+    CHECK(wl_columnar_relation_new_like_governed_checked_controlled(&actual,
+        "alias-empty", alias, g, c) == 0);
+    CHECK(finish(c, 0) == cost && new_like_checked_pins);
+    CHECK(wl_columnar_relation_new_like_governed_checked(&reference,
+        "alias-empty", alias, g) == 0);
+    constructor_equal(actual, reference);
+    destroy(actual); destroy(reference);
+    CHECK(atomic_load(&wl_columnar_memory_governor_ref_get(
+            g)->reserved_bytes) == baseline);
+    retry(c, cost - 1);
+    CHECK(wl_columnar_relation_new_like_governed_checked_controlled(&actual,
+        "alias-empty", alias, g, c) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(actual == NULL && finish(c,
+        WL_EVALUATION_CONTROL_WORK_LIMIT) <= cost - 1);
+    source_unpinned(alias, src);
+    const int phases[] = { WL_COLUMNAR_RELATION_CONSTRUCTOR_SOURCE_NAME,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_COLUMN_NAME_COPY,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_TYPES,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_COLUMNS_ZERO,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_FINAL };
+    const uint64_t points[] = { 301, 512, 512, 512, 0 };
+    for (uint32_t i = 0; i < 5; i++) {
+        retry(c, 0);
+        constructor_cancel_phase = phases[i];
+        constructor_cancel_progress = points[i];
+        int stop_rc =
+            wl_columnar_relation_new_like_governed_checked_controlled(&actual,
+                "alias-empty", alias, g, c);
+        CHECK(stop_rc == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(actual == NULL && finish(c,
+            WL_EVALUATION_CONTROL_CANCELLED) == seen);
+        source_unpinned(alias, src);
+        CHECK(atomic_load(&wl_columnar_memory_governor_ref_get(
+                g)->reserved_bytes) == baseline);
+    }
+    constructor_cancel_phase = 0;
+    wl_columnar_relation_test_metadata_checkpoint = metadata_checkpoint;
+    const int schema_phases[] = { WL_COLUMNAR_RELATION_METADATA_TABLE_ZERO,
+                                  WL_COLUMNAR_RELATION_METADATA_CHILD,
+                                  WL_COLUMNAR_RELATION_METADATA_NAME };
+    const uint64_t schema_points[] = { 512, 301, 512 };
+    for (uint32_t i = 0; i < 3; i++) {
+        retry(c, 0); metadata_cancel_phase = schema_phases[i];
+        metadata_cancel_progress = schema_points[i];
+        CHECK(wl_columnar_relation_new_like_governed_checked_controlled(&actual,
+            "alias-empty", alias, g, c) == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(actual == NULL); finish(c, WL_EVALUATION_CONTROL_CANCELLED);
+        source_unpinned(alias, src);
+        CHECK(atomic_load(&wl_columnar_memory_governor_ref_get(
+                g)->reserved_bytes) == baseline);
+    }
+    metadata_cancel_phase = 0;
+    wl_columnar_relation_test_metadata_checkpoint = NULL;
+    retry(c, cost);
+    CHECK(wl_columnar_relation_new_like_governed_checked_controlled(&actual,
+        "alias-empty", alias, g, c) == 0);
+    CHECK(finish(c, 0) == cost);
+    destroy(actual); release(c);
+    wl_columnar_relation_test_constructor_checkpoint = NULL;
+    destroy(alias); destroy(src); governor_empty(g);
+    wl_columnar_memory_governor_ref_release(g);
+}
+
+static bool new_like_release_cancel;
+static uint64_t new_like_release_calls;
+static void
+consume_new_like_reader(wl_evaluation_control_t *c,
+    wl_columnar_source_access_reader_t *reader)
+{
+    wl_columnar_relation_test_new_like_before_reader_release = NULL;
+    CHECK(col_rel_source_reader_release(reader) == 0);
+    new_like_release_calls++;
+    if (new_like_release_cancel)
+        wl_evaluation_control_request_cancel(c);
+}
+
+static void
+cancel_after_new_like_reads(wl_evaluation_control_t *c,
+    wl_columnar_source_access_reader_t *reader)
+{
+    CHECK(reader->owner != NULL && reader->secondary_owner != NULL);
+    wl_columnar_relation_test_new_like_before_reader_release = NULL;
+    wl_evaluation_control_request_cancel(c);
+}
+
+static void
+test_new_like_failures_and_defaults(void)
+{
+    wl_columnar_memory_governor_ref_t *g = fresh_governor();
+    col_rel_t *src = relation(2, 4, 0, true, g);
+    uint64_t baseline =
+        atomic_load(&wl_columnar_memory_governor_ref_get(g)->reserved_bytes);
+    col_rel_t *actual = NULL, *reference = NULL;
+    wl_evaluation_control_t *c = control(0);
+    /* Missing names and missing input schema do not suppress fresh schema. */
+    char **saved_names = src->col_names;
+    bool saved_schema = src->schema_ok;
+    src->col_names = NULL; src->schema_ok = false;
+    CHECK(wl_columnar_relation_new_like_governed_checked_controlled(&actual,
+        "defaults", src, NULL, c) == 0);
+    CHECK(finish(c, 0) == new_like_cost("defaults", src, false, true));
+    CHECK(wl_columnar_relation_new_like_governed_checked(&reference,
+        "defaults", src, NULL) == 0);
+    constructor_equal(actual, reference);
+    destroy(actual); destroy(reference);
+    src->col_names = saved_names; src->schema_ok = saved_schema;
+    char *saved_name = src->col_names[1]; src->col_names[1] = NULL;
+    retry(c, 0);
+    CHECK(wl_columnar_relation_new_like_governed_checked_controlled(&actual,
+        "defaults", src, g, c) == 0);
+    CHECK(finish(c, 0) == new_like_cost("defaults", src, true, true));
+    CHECK(wl_columnar_relation_new_like_governed_checked(&reference,
+        "defaults", src, g) == 0);
+    constructor_equal(actual, reference);
+    destroy(actual); destroy(reference); src->col_names[1] = saved_name;
+    CHECK(atomic_load(&wl_columnar_memory_governor_ref_get(
+            g)->reserved_bytes) == baseline);
+    /* Genuine actual-token cleanup refusal, with both source pins consumed. */
+    for (uint32_t disposition = 0; disposition < 3; disposition++) {
+        retry(c, 0); new_like_release_cancel = false;
+        constructor_cancel_phase = disposition == 2
+            ? WL_COLUMNAR_RELATION_CONSTRUCTOR_FINAL : 0;
+        constructor_cancel_progress = 0;
+        wl_columnar_relation_test_constructor_checkpoint =
+            constructor_checkpoint;
+        src->has_graph_column = disposition == 1; src->graph_col_idx = 2;
+        wl_columnar_relation_test_new_like_before_reader_release =
+            consume_new_like_reader;
+        int expected = disposition == 1 ? EINVAL : EBUSY;
+        CHECK(wl_columnar_relation_new_like_governed_checked_controlled(&actual,
+            "cleanup", src, g, c) == expected);
+        CHECK(actual == NULL); finish(c, expected);
+        wl_evaluation_control_report_t report;
+        CHECK(wl_evaluation_control_report(c, &report) == 0);
+        if (disposition == 2)
+            CHECK(report.stop_reason == WL_EVALUATION_CONTROL_CANCELLED);
+        source_unpinned(src, src);
+        CHECK(atomic_load(&wl_columnar_memory_governor_ref_get(
+                g)->reserved_bytes) == baseline);
+    }
+    CHECK(new_like_release_calls == 3);
+    constructor_cancel_phase = 0;
+    retry(c, new_like_cost("cleanup", src, true, true) - 1);
+    src->has_graph_column = false;
+    wl_columnar_relation_test_new_like_before_reader_release =
+        consume_new_like_reader;
+    CHECK(wl_columnar_relation_new_like_governed_checked_controlled(&actual,
+        "cleanup", src, g, c) == EBUSY);
+    CHECK(actual == NULL); finish(c, EBUSY);
+    wl_evaluation_control_report_t limit_report;
+    CHECK(wl_evaluation_control_report(c, &limit_report) == 0);
+    CHECK(limit_report.stop_reason == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    source_unpinned(src, src);
+    CHECK(atomic_load(&wl_columnar_memory_governor_ref_get(
+            g)->reserved_bytes) == baseline);
+    constructor_cancel_phase = 0;
+    wl_columnar_relation_test_constructor_checkpoint = NULL;
+    src->has_graph_column = false;
+    retry(c, 0);
+    wl_columnar_relation_test_new_like_before_reader_release =
+        cancel_after_new_like_reads;
+    CHECK(wl_columnar_relation_new_like_governed_checked_controlled(&actual,
+        "tail", src, g, c) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(actual == NULL); finish(c, WL_EVALUATION_CONTROL_CANCELLED);
+    source_unpinned(src, src);
+    CHECK(atomic_load(&wl_columnar_memory_governor_ref_get(
+            g)->reserved_bytes) == baseline);
+    wl_columnar_source_access_writer_t writer = { 0 };
+    CHECK(col_rel_source_writer_acquire(src, &writer) == 0);
+    retry(c, 0);
+    CHECK(wl_columnar_relation_new_like_governed_checked_controlled(&actual,
+        "blocked", src, g, c) == EBUSY);
+    CHECK(actual == NULL && finish(c, EBUSY) == 0);
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0);
+    source_unpinned(src, src);
+    wirelog_column_type_t fault_types[] = { WIRELOG_TYPE_FLOAT,
+                                            WIRELOG_TYPE_INT64 };
+    CHECK(col_rel_set_column_types(src, fault_types, 2) == 0);
+    baseline =
+        atomic_load(&wl_columnar_memory_governor_ref_get(g)->reserved_bytes);
+    for (uint32_t malformed = 0; malformed < 4; malformed++) {
+        retry(c, 0);
+        src->compound_count = malformed == 0 ? 1 : 0;
+        src->inline_physical_offset = malformed == 1 ? 1 : 0;
+        src->compound_arity_len = malformed == 2 ? 1 : 0;
+        src->has_graph_column = malformed == 3;
+        src->graph_col_idx = 2;
+        CHECK(wl_columnar_relation_new_like_governed_checked_controlled(&actual,
+            "malformed", src, g, c) == EINVAL);
+        CHECK(actual == NULL && finish(c, EINVAL) == 6);
+        CHECK(wl_columnar_relation_new_like_governed_checked(&reference,
+            "malformed", src, g) == EINVAL && reference == NULL);
+        source_unpinned(src, src);
+        CHECK(atomic_load(&wl_columnar_memory_governor_ref_get(
+                g)->reserved_bytes) == baseline);
+    }
+    src->compound_count = 0; src->inline_physical_offset = 0;
+    src->compound_arity_len = 0; src->has_graph_column = false;
+    /* Admission and real preparation/commit faults retain stage evidence. */
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(g);
+    uint64_t usable = atomic_load(&governor->usable_bytes);
+    CHECK(wl_columnar_relation_new_like_governed_checked(&reference,
+        "faults", src, g) == 0);
+    uint64_t descriptor = reference->descriptor_reserved_bytes;
+    uint64_t metadata = reference->metadata_reserved_bytes;
+    destroy(reference);
+    const uint64_t limits[] = { baseline, baseline + descriptor,
+                                baseline + descriptor + 2 * sizeof(uint64_t),
+                                baseline + descriptor + 2 * sizeof(uint64_t) +
+                                metadata };
+    for (uint32_t i = 0; i < 4; i++) {
+        atomic_store(&governor->usable_bytes, limits[i]);
+        retry(c, 0);
+        CHECK(wl_columnar_relation_new_like_governed_checked_controlled(&actual,
+            "faults", src, g, c) == ENOSPC);
+        CHECK(actual == NULL); finish(c, ENOSPC); source_unpinned(src, src);
+        CHECK(atomic_load(&governor->reserved_bytes) == baseline);
+    }
+    atomic_store(&governor->usable_bytes, usable);
+    for (int64_t allocation = 0; allocation < 12; allocation++) {
+        retry(c, 0);
+        wl_columnar_relation_test_constructor_fail_allocation = allocation;
+        CHECK(wl_columnar_relation_new_like_governed_checked_controlled(&actual,
+            "faults", src, g, c) == ENOMEM);
+        CHECK(actual == NULL); finish(c, ENOMEM); source_unpinned(src, src);
+        CHECK(atomic_load(&governor->reserved_bytes) == baseline);
+    }
+    wl_columnar_relation_test_constructor_checkpoint = constructor_checkpoint;
+    for (int commit = 1; commit <= 3; commit++) {
+        retry(c, 0); constructor_committed = 0;
+        wl_columnar_relation_test_constructor_fail_commit = commit;
+        CHECK(wl_columnar_relation_new_like_governed_checked_controlled(&actual,
+            "faults", src, g, c) == ENOMEM);
+        CHECK(actual == NULL && constructor_committed == (uint64_t)commit - 1);
+        finish(c, ENOMEM); source_unpinned(src, src);
+        CHECK(atomic_load(&governor->reserved_bytes) == baseline);
+    }
+    wl_columnar_relation_test_constructor_checkpoint = NULL;
+    retry(c, 0);
+    CHECK(wl_columnar_relation_new_like_governed_checked_controlled(&actual,
+        "faults", src, g, c) == 0);
+    finish(c, 0); destroy(actual); release(c);
+    destroy(src); governor_empty(g); wl_columnar_memory_governor_ref_release(g);
+}
+
 int
 main(void)
 {
@@ -1318,6 +1737,9 @@ main(void)
     test_constructor_wide_and_stops();
     test_constructor_identity();
     test_constructor_faults_and_long_name();
+    test_new_like_matrix();
+    test_new_like_wide_alias_and_names();
+    test_new_like_failures_and_defaults();
     puts("evaluation_work: OK");
     return 0;
 }

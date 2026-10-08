@@ -3145,6 +3145,9 @@ enum {
     WL_COLUMNAR_RELATION_CONSTRUCTOR_GENERATED_NAME,
     WL_COLUMNAR_RELATION_CONSTRUCTOR_COMMITTED,
     WL_COLUMNAR_RELATION_CONSTRUCTOR_FINAL,
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_SOURCE_NAME,
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_COLUMN_NAME_COPY,
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_TYPES,
 };
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_relation_test_before_identity_cas)(
@@ -3153,6 +3156,8 @@ extern void (*wl_columnar_relation_test_constructor_checkpoint)(
     wl_evaluation_control_t *control, int phase, uint64_t progress);
 extern int64_t wl_columnar_relation_test_constructor_fail_allocation;
 extern int wl_columnar_relation_test_constructor_fail_commit;
+extern void (*wl_columnar_relation_test_new_like_before_reader_release)(
+    wl_evaluation_control_t *, wl_columnar_source_access_reader_t *);
 #endif
 /* Allocate a heap descriptor and optional name under a known governor. */
 int
@@ -3181,6 +3186,19 @@ int
 wl_columnar_relation_new_like_governed_checked_mode(const char *name,
     const col_rel_t *src, wl_columnar_memory_governor_ref_t *governor,
     bool preserve_timestamps, col_rel_t **out);
+/* Empty checked new-like with borrowed control; optional governor remains NULL.
+ * NULL control delegates original; source descriptor and owner are both pinned. */
+int
+wl_columnar_relation_new_like_governed_checked_mode_controlled(const char *name,
+    const col_rel_t *src, wl_columnar_memory_governor_ref_t *governor,
+    bool preserve_timestamps, col_rel_t **out,
+    wl_evaluation_control_t *control);
+int
+wl_columnar_relation_new_like_governed_checked_controlled(col_rel_t **out,
+    const char *name, const col_rel_t *src,
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_evaluation_control_t *control);
+
 #ifdef WL_TEST_BDX_SEED
 int
 wl_columnar_eval_test_bdx_seed(col_rel_t *cidb,
