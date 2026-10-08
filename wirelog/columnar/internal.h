@@ -3148,6 +3148,11 @@ enum {
     WL_COLUMNAR_RELATION_CONSTRUCTOR_SOURCE_NAME,
     WL_COLUMNAR_RELATION_CONSTRUCTOR_COLUMN_NAME_COPY,
     WL_COLUMNAR_RELATION_CONSTRUCTOR_TYPES,
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_CELLS,
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_TIMESTAMP_LIVE,
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_TIMESTAMP_ZERO,
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_RUN_VALIDATE,
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_RUN_COPY,
 };
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_relation_test_before_identity_cas)(
@@ -3278,6 +3283,13 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena);
 int
 wl_columnar_relation_deep_copy_governed(const col_rel_t *src, col_rel_t **out,
     wl_columnar_memory_governor_ref_t *governor);
+/* Logical live-row twin only; NULL control delegates, NULL governor falls back
+ * to source. Source descriptor and canonical owner remain pinned until final. */
+int
+wl_columnar_relation_deep_copy_governed_controlled(const col_rel_t *src,
+    col_rel_t **out, wl_columnar_memory_governor_ref_t *governor,
+    wl_evaluation_control_t *control);
+
 col_rel_t *
 col_rel_pool_new_auto(delta_pool_t *pool, wl_arena_t *arena,
     const char *name, uint32_t ncols);
