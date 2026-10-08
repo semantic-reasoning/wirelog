@@ -2944,7 +2944,7 @@ test_reserve_no_growth_and_empty(void)
     CHECK(wl_columnar_relation_reserve_capacity_admitted_controlled(r,
         r->capacity + 1, &denied, c) == ENOTSUP);
     CHECK(!denied && finish(c, ENOTSUP) == 0 && r->columns == arena_columns);
-    destroy(r); delta_pool_destroy(pool); wl_arena_destroy(arena); release(c);
+    destroy(r); delta_pool_destroy(pool); wl_arena_free(arena); release(c);
     CHECK(col_rel_alloc(&r, "reserve-overflow") == 0);
     r->ncols = UINT32_MAX;
     c = control(0);
