@@ -661,6 +661,16 @@ typedef struct {
     wl_columnar_relation_mutation_initialization_t initialization;
 } wl_columnar_relation_mutation_single_t;
 
+int wl_columnar_relation_reader_acquire_controlled(
+    wl_columnar_source_access_gate_t *,
+    wl_columnar_source_access_reader_t *, wl_evaluation_control_t *);
+int wl_columnar_relation_writer_acquire_controlled(
+    wl_columnar_source_access_gate_t *,
+    wl_columnar_source_access_writer_t *, wl_evaluation_control_t *);
+int wl_columnar_relation_mutation_single_acquire_controlled(col_rel_t *,
+    wl_columnar_relation_mutation_single_t *, wl_evaluation_control_t *);
+int wl_columnar_relation_mutation_single_finish_controlled(
+    wl_columnar_relation_mutation_single_t *, int, wl_evaluation_control_t *);
 int col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
     const wl_columnar_relation_mutation_role_t *roles, size_t role_count,
     wl_columnar_relation_mutation_descriptor_t *descriptors,
@@ -3175,6 +3185,23 @@ enum {
     WL_COLUMNAR_RELATION_CONSTRUCTOR_POOL_ACQUIRED,
 };
 #ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_relation_test_before_reader_cas)(
+    wl_evaluation_control_t *,
+    wl_columnar_source_access_gate_t *, uint64_t);
+extern void (*wl_columnar_relation_test_after_reader_cas)(
+    wl_evaluation_control_t *,
+    wl_columnar_source_access_gate_t *, bool);
+extern void (*wl_columnar_relation_test_before_writer_cas)(
+    wl_evaluation_control_t *,
+    wl_columnar_source_access_gate_t *);
+extern void (*wl_columnar_relation_test_after_lazy_commit)(
+    wl_evaluation_control_t *,
+    wl_columnar_source_access_writer_t *);
+extern void (*wl_columnar_relation_test_before_nonce_cas)(
+    wl_evaluation_control_t *, uint64_t);
+extern void (*wl_columnar_relation_test_single_before_cleanup)(
+    wl_evaluation_control_t *,
+    wl_columnar_relation_mutation_single_t *);
 extern void (*wl_columnar_relation_test_before_identity_cas)(
     wl_evaluation_control_t *control, uint64_t expected);
 extern void (*wl_columnar_relation_test_constructor_checkpoint)(

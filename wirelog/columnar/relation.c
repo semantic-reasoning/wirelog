@@ -6026,6 +6026,568 @@ wl_columnar_relation_work_tail(wl_evaluation_control_t *control, uint64_t work)
     return wl_evaluation_control_charge(control, 0);
 }
 
+/* Forward gate attempts are result work. Releases are mandatory cleanup. */
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_relation_test_before_reader_cas)(wl_evaluation_control_t *,
+    wl_columnar_source_access_gate_t *, uint64_t);
+void (*wl_columnar_relation_test_after_reader_cas)(wl_evaluation_control_t *,
+    wl_columnar_source_access_gate_t *, bool);
+void (*wl_columnar_relation_test_before_writer_cas)(wl_evaluation_control_t *,
+    wl_columnar_source_access_gate_t *);
+void (*wl_columnar_relation_test_after_lazy_commit)(wl_evaluation_control_t *,
+    wl_columnar_source_access_writer_t *);
+void (*wl_columnar_relation_test_before_nonce_cas)(wl_evaluation_control_t *,
+    uint64_t);
+void (*wl_columnar_relation_test_single_before_cleanup)(
+    wl_evaluation_control_t *,
+    wl_columnar_relation_mutation_single_t *);
+#endif
+
+int
+wl_columnar_relation_reader_acquire_controlled(
+    wl_columnar_source_access_gate_t *gate,
+    wl_columnar_source_access_reader_t *token, wl_evaluation_control_t *control)
+{
+    if (!control)
+        return wl_columnar_source_access_reader_acquire(gate, token);
+    if (!gate || !token || token->owner || token->secondary_owner
+        || token->identity || token->thread_valid || token->transferable)
+        return EINVAL;
+    uint64_t observed = atomic_load_explicit(&gate->state,
+            memory_order_relaxed);
+    for (;;) {
+        int rc = wl_evaluation_control_charge(control, 1);
+        if (rc)
+            return rc;
+        if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER) {
+            (void)wl_columnar_relation_work_tail(control, 1);
+            return EBUSY;
+        }
+        if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER - 1u) {
+            (void)wl_columnar_relation_work_tail(control, 1);
+            return EOVERFLOW;
+        }
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_relation_test_before_reader_cas)
+            wl_columnar_relation_test_before_reader_cas(control, gate,
+                observed);
+#endif
+#ifdef _MSC_VER
+        bool acquired = atomic_compare_exchange_weak_explicit(&gate->state,
+                &observed, observed + 1u, memory_order_acquire,
+                memory_order_relaxed);
+#else
+        bool acquired = atomic_compare_exchange_strong_explicit(&gate->state,
+                &observed, observed + 1u, memory_order_acquire,
+                memory_order_relaxed);
+#endif
+        if (acquired)
+            wl_columnar_source_access_reader_initialize(gate, token, false);
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_relation_test_after_reader_cas)
+            wl_columnar_relation_test_after_reader_cas(control, gate, acquired);
+#endif
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc && acquired) {
+            int cleanup = wl_columnar_source_access_reader_release(token);
+            return cleanup ? cleanup : rc;
+        }
+        if (rc || acquired)
+            return rc;
+    }
+}
+
+int
+wl_columnar_relation_writer_acquire_controlled(
+    wl_columnar_source_access_gate_t *gate,
+    wl_columnar_source_access_writer_t *token, wl_evaluation_control_t *control)
+{
+    if (!control)
+        return wl_columnar_source_access_writer_acquire(gate, token);
+    if (!gate || !token || token->owner || token->secondary_owner
+        || token->identity || token->thread_valid)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 1);
+    if (rc)
+        return rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_before_writer_cas)
+        wl_columnar_relation_test_before_writer_cas(control, gate);
+#endif
+    uint64_t expected = 0;
+#ifdef _MSC_VER
+    bool acquired = atomic_compare_exchange_weak_explicit(&gate->state,
+            &expected, WL_COLUMNAR_SOURCE_ACCESS_WRITER, memory_order_acquire,
+            memory_order_relaxed);
+#else
+    bool acquired = atomic_compare_exchange_strong_explicit(&gate->state,
+            &expected, WL_COLUMNAR_SOURCE_ACCESS_WRITER, memory_order_acquire,
+            memory_order_relaxed);
+#endif
+    if (!acquired) {
+        (void)wl_columnar_relation_work_tail(control, 1);
+        return EBUSY;
+    }
+    wl_columnar_source_access_writer_initialize(gate, token);
+    rc = wl_columnar_relation_work_tail(control, 1);
+    if (rc) {
+        int cleanup = wl_columnar_source_access_writer_release(token);
+        if (cleanup)
+            rc = cleanup;
+    }
+    return rc;
+}
+
+typedef struct {
+    col_rel_t *relation;
+    wl_columnar_source_access_reader_t reader;
+    wl_columnar_source_access_reader_t descriptor;
+    wl_columnar_source_access_writer_t writer;
+    uint64_t prior_identity;
+    uint64_t prior_generation;
+    bool journal;
+    bool reader_held;
+    bool descriptor_held;
+    bool writer_held;
+} wl_columnar_relation_source_admission_t;
+
+static int
+wl_columnar_relation_cleanup_result(int result, int cleanup)
+{
+    return cleanup > 0 && result <= 0 ? cleanup : result;
+}
+
+/* Finite direct one-hop resolution: charge six invariant metadata checks. */
+static int
+wl_columnar_relation_resolve_controlled(const col_rel_t *src,
+    col_rel_t **owner, wl_evaluation_control_t *control)
+{
+    int rc = wl_evaluation_control_charge(control, 6);
+    if (rc)
+        return rc;
+    rc = col_rel_storage_owner_resolve(src, owner);
+    int stop = wl_columnar_relation_work_tail(control, 6);
+    return rc ? rc : stop;
+}
+
+/* Restore only while the actual exclusive descriptor token remains valid. */
+static int
+wl_columnar_relation_source_finish_writer(
+    wl_columnar_relation_source_admission_t *ctx, int rc,
+    wl_evaluation_control_t *control, bool map_busy)
+{
+    if (!ctx->writer_held)
+        return rc;
+    int valid = wl_columnar_source_access_writer_validate(&ctx->writer,
+            &ctx->relation->descriptor_access);
+    if (ctx->journal && rc != 0 && !valid) {
+        ctx->relation->storage_owner = NULL;
+        ctx->relation->storage_owner_identity = ctx->prior_identity;
+        ctx->relation->storage_owner_generation = ctx->prior_generation;
+    }
+    rc = wl_columnar_relation_cleanup_result(rc,
+            map_busy && valid ? EBUSY : valid);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (!rc && ctx->journal && wl_columnar_relation_test_after_lazy_commit)
+        wl_columnar_relation_test_after_lazy_commit(control, &ctx->writer);
+#else
+    (void)control;
+#endif
+    int cleanup = wl_columnar_source_access_writer_release(&ctx->writer);
+    if (!cleanup || !ctx->writer.owner)
+        ctx->writer_held = false;
+    return wl_columnar_relation_cleanup_result(rc,
+               map_busy && cleanup ? EBUSY : cleanup);
+}
+
+/* All protected reads must finish before this last cutoff. A lazy writer is
+ * retained through owner cleanup and the cutoff, never a secondary reader. */
+static int
+wl_columnar_relation_source_cutoff(wl_columnar_relation_source_admission_t *ctx,
+    int rc, wl_evaluation_control_t *control, bool map_busy)
+{
+    int first_cleanup = 0;
+    if (ctx->reader_held) {
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_relation_test_new_like_before_reader_release)
+            wl_columnar_relation_test_new_like_before_reader_release(control,
+                &ctx->reader);
+#endif
+        int cleanup = col_rel_source_reader_release(&ctx->reader);
+        if (!cleanup || !ctx->reader.owner)
+            ctx->reader_held = false;
+        first_cleanup = wl_columnar_relation_cleanup_result(first_cleanup,
+                map_busy && cleanup ? EBUSY : cleanup);
+    }
+    if (ctx->descriptor_held) {
+        int cleanup =
+            wl_columnar_source_access_reader_release(&ctx->descriptor);
+        if (!cleanup || !ctx->descriptor.owner)
+            ctx->descriptor_held = false;
+        first_cleanup = wl_columnar_relation_cleanup_result(first_cleanup,
+                map_busy && cleanup ? EBUSY : cleanup);
+    }
+    /* Observe the last cutoff even when cleanup won over a negative stop:
+     * an already latched positive accounting error is execution provenance. */
+    int cutoff = wl_evaluation_control_charge(control, 0);
+    if (rc <= 0 && cutoff > 0)
+        rc = cutoff;
+    else if (!rc)
+        rc = cutoff;
+    return wl_columnar_relation_cleanup_result(rc, first_cleanup);
+}
+
+static int
+wl_columnar_relation_source_finish(wl_columnar_relation_source_admission_t *ctx,
+    int rc, wl_evaluation_control_t *control, bool map_busy)
+{
+    int result = wl_columnar_relation_source_cutoff(ctx, rc, control, map_busy);
+    result = wl_columnar_relation_source_finish_writer(ctx, result, control,
+            map_busy);
+    return result;
+}
+
+static int
+wl_columnar_relation_source_acquire_controlled(const col_rel_t *src,
+    wl_columnar_relation_source_admission_t *ctx,
+    wl_evaluation_control_t *control)
+{
+    ctx->relation = (col_rel_t *)src;
+    col_rel_t *owner = NULL;
+    int rc = wl_columnar_relation_reader_acquire_controlled(
+        &ctx->relation->descriptor_access, &ctx->descriptor, control);
+    if (rc)
+        return rc;
+    ctx->descriptor_held = true;
+    rc = wl_evaluation_control_charge(control, 1);
+    if (rc)
+        goto fail;
+    bool initialized = src->storage_owner != NULL;
+    rc = wl_columnar_relation_work_tail(control, 1);
+    if (rc)
+        goto fail;
+    if (!initialized) {
+        rc = wl_columnar_source_access_reader_release(&ctx->descriptor);
+        if (rc)
+            goto fail;
+        ctx->descriptor_held = false;
+        rc = wl_columnar_relation_writer_acquire_controlled(
+            &ctx->relation->descriptor_access, &ctx->writer, control);
+        if (rc)
+            goto fail;
+        ctx->writer_held = true;
+        rc = wl_evaluation_control_charge(control, 4);
+        if (rc)
+            goto fail;
+        if (!src->storage_owner) {
+            if (!src->relation_identity
+                || !wl_columnar_relation_generation_valid(
+                    src->storage_generation)) {
+                rc = EINVAL;
+                goto fail;
+            }
+            ctx->prior_identity = src->storage_owner_identity;
+            ctx->prior_generation = src->storage_owner_generation;
+            ctx->journal = true;
+            ctx->relation->storage_owner = ctx->relation;
+            ctx->relation->storage_owner_identity = src->relation_identity;
+            ctx->relation->storage_owner_generation = src->storage_generation;
+        }
+        rc = wl_columnar_relation_work_tail(control, 4);
+        if (rc)
+            goto fail;
+    }
+    rc = wl_columnar_relation_resolve_controlled(src, &owner, control);
+    if (rc)
+        goto fail;
+    rc = wl_columnar_relation_reader_acquire_controlled(&owner->source_access,
+            &ctx->reader, control);
+    if (rc)
+        goto fail;
+    ctx->reader_held = true;
+    if (ctx->descriptor_held) {
+        ctx->reader.secondary_owner = ctx->descriptor.owner;
+        /* Transfer this actual descriptor pin into the combined reader. */
+        ctx->descriptor.owner = NULL;
+        ctx->descriptor.identity = 0;
+        ctx->descriptor.thread_valid = false;
+        ctx->descriptor_held = false;
+    }
+    return 0;
+fail:
+    return wl_columnar_relation_source_finish(ctx, rc, control, false);
+}
+
+static int
+wl_columnar_relation_nonce_controlled(uint64_t *nonce,
+    wl_evaluation_control_t *control)
+{
+    uint64_t observed = atomic_load_explicit(&wl_next_mutation_set_nonce,
+            memory_order_relaxed);
+    for (;;) {
+        int rc = wl_evaluation_control_charge(control, 1);
+        if (rc)
+            return rc;
+        if (!observed || observed == UINT64_MAX)
+            return EOVERFLOW;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_relation_test_before_nonce_cas)
+            wl_columnar_relation_test_before_nonce_cas(control, observed);
+#endif
+#ifdef _MSC_VER
+        bool acquired = atomic_compare_exchange_weak_explicit(
+            &wl_next_mutation_set_nonce, &observed, observed + 1u,
+            memory_order_relaxed, memory_order_relaxed);
+#else
+        bool acquired = atomic_compare_exchange_strong_explicit(
+            &wl_next_mutation_set_nonce, &observed, observed + 1u,
+            memory_order_relaxed, memory_order_relaxed);
+#endif
+        if (acquired)
+            *nonce = observed;
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc || acquired)
+            return rc;
+    }
+}
+
+/* Fixed one-role admission owns at most two owner tokens. This finalizer must
+ * not use generic finish/unwind, which can skip cleanup or ignore its errors. */
+int
+wl_columnar_relation_mutation_single_finish_controlled(
+    wl_columnar_relation_mutation_single_t *single, int rc,
+    wl_evaluation_control_t *control)
+{
+    if (!control) {
+        if (!single)
+            return EINVAL;
+        int cleanup = col_rel_mutation_set_finish(&single->set, rc == 0);
+        return wl_columnar_relation_cleanup_result(rc, cleanup);
+    }
+    if (!single || single->set.identity != (uintptr_t)&single->set)
+        return EINVAL;
+    wl_columnar_relation_mutation_set_t *set = &single->set;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_single_before_cleanup)
+        wl_columnar_relation_test_single_before_cleanup(control, single);
+#else
+    (void)control;
+#endif
+    int execution = rc;
+    bool all_retired = true;
+    for (size_t i = set->owners_acquired; i > 0; i--) {
+        wl_columnar_source_access_writer_t *writer = &single->owners[i -
+                1].writer;
+        int cleanup = wl_columnar_source_access_writer_release(writer);
+        rc = wl_columnar_relation_cleanup_result(rc, cleanup);
+        if (writer->owner)
+            all_retired = false;
+    }
+    int cutoff = wl_evaluation_control_charge(control, 0);
+    if (execution <= 0 && cutoff > 0)
+        rc = cutoff;
+    else if (!rc)
+        rc = cutoff;
+    /* A stopped/failed admission may have initialized legacy metadata. */
+    if (rc && set->initialization_count) {
+        int valid = wl_columnar_source_access_writer_validate(
+            &single->descriptor.writer,
+            &single->initialization.relation->descriptor_access);
+        if (!valid) {
+            col_rel_t *r = single->initialization.relation;
+            r->storage_owner = NULL;
+            r->storage_owner_identity = single->initialization.owner_identity;
+            r->storage_owner_generation =
+                single->initialization.owner_generation;
+            atomic_store_explicit(&r->storage_alias_borrows,
+                single->initialization.borrows, memory_order_relaxed);
+        }
+        rc = wl_columnar_relation_cleanup_result(rc, valid);
+    }
+    if (set->descriptors_acquired) {
+        int cleanup =
+            wl_columnar_source_access_writer_release(
+            &single->descriptor.writer);
+        rc = wl_columnar_relation_cleanup_result(rc, cleanup);
+        if (single->descriptor.writer.owner)
+            all_retired = false;
+    }
+    if (all_retired) {
+        single->set = (wl_columnar_relation_mutation_set_t){0};
+        single->descriptor = (wl_columnar_relation_mutation_descriptor_t){0};
+        single->owners[0] = (wl_columnar_relation_mutation_owner_t){0};
+        single->owners[1] = (wl_columnar_relation_mutation_owner_t){0};
+        single->lease = (wl_columnar_relation_mutation_lease_t){0};
+        single->initialization =
+            (wl_columnar_relation_mutation_initialization_t){0};
+    }
+    return rc;
+}
+
+int
+wl_columnar_relation_mutation_single_acquire_controlled(col_rel_t *relation,
+    wl_columnar_relation_mutation_single_t *single,
+    wl_evaluation_control_t *control)
+{
+    if (!control)
+        return col_rel_mutation_single_acquire(relation, single);
+    if (!relation || !single)
+        return EINVAL;
+    wl_columnar_relation_mutation_set_t *set = &single->set;
+    int rc = wl_evaluation_control_charge(control, 32);
+    if (rc)
+        return rc;
+    if (set->identity || set->acquisition_nonce || set->roles ||
+        set->descriptors
+        || set->owners || set->leases || set->initializations
+        || set->descriptor_count || set->owner_count || set->lease_count
+        || set->initialization_count || set->descriptors_acquired
+        || set->owners_acquired || set->terminal_sequence
+        || set->terminal_expected_events || set->terminal_observed_events
+        || set->terminal_sequence_consumed || set->published
+        || single->descriptor.relation
+        || !col_rel_mutation_writer_inert(&single->descriptor.writer)
+        || single->owners[0].owner || single->owners[1].owner
+        || !col_rel_mutation_writer_inert(&single->owners[0].writer)
+        || !col_rel_mutation_writer_inert(&single->owners[1].writer)
+        || single->lease.identity || single->lease.acquisition_nonce
+        || single->lease.set || single->lease.relation || single->lease.owner
+        || single->lease.descriptor_slot || single->lease.owner_slot
+        || single->lease.self_owner_slot || single->lease.relation_identity
+        || single->lease.relation_generation || single->lease.owner_identity
+        || single->lease.owner_generation || single->lease.role_flags
+        || single->lease.detached || single->lease.storage_transitioned
+        || single->initialization.relation ||
+        single->initialization.owner_identity
+        || single->initialization.owner_generation ||
+        single->initialization.borrows)
+        return EINVAL;
+    rc = wl_columnar_relation_work_tail(control, 32);
+    if (rc)
+        return rc;
+    uint64_t nonce;
+    rc = wl_columnar_relation_nonce_controlled(&nonce, control);
+    if (rc)
+        return rc;
+    single->role.relation = relation;
+    single->role.role_flags = WL_COLUMNAR_RELATION_PAYLOAD_MUTATION;
+    *set = (wl_columnar_relation_mutation_set_t){
+        .identity = (uintptr_t)set, .acquisition_nonce = nonce,
+        .roles = &single->role, .descriptors = &single->descriptor,
+        .owners = single->owners, .leases = &single->lease,
+        .initializations = &single->initialization,
+        .descriptor_count = 1, .lease_count = 1
+    };
+    single->descriptor.relation = relation;
+    rc =
+        wl_columnar_relation_writer_acquire_controlled(
+        &relation->descriptor_access,
+        &single->descriptor.writer, control);
+    if (rc)
+        goto fail;
+    set->descriptors_acquired = 1;
+    rc = wl_evaluation_control_charge(control, 6);
+    if (rc)
+        goto fail;
+    if (!relation->storage_owner) {
+        if (!relation->relation_identity ||
+            col_rel_storage_alias_borrow_count(relation)
+            || !wl_columnar_relation_generation_valid(
+                relation->storage_generation)) {
+            rc = EINVAL;
+            goto fail;
+        }
+        single->initialization =
+            (wl_columnar_relation_mutation_initialization_t){
+            .relation = relation,
+            .owner_identity = relation->storage_owner_identity,
+            .owner_generation = relation->storage_owner_generation,
+            .borrows = col_rel_storage_alias_borrow_count(relation)
+        };
+        set->initialization_count = 1;
+        relation->storage_owner = relation;
+        relation->storage_owner_identity = relation->relation_identity;
+        relation->storage_owner_generation = relation->storage_generation;
+        atomic_store_explicit(&relation->storage_alias_borrows, 0,
+            memory_order_relaxed);
+    }
+    rc = wl_columnar_relation_work_tail(control, 6);
+    if (rc)
+        goto fail;
+    col_rel_t *owner = NULL;
+    rc = wl_columnar_relation_resolve_controlled(relation, &owner, control);
+    if (rc)
+        goto fail;
+    rc = wl_evaluation_control_charge(control, 12);
+    if (rc)
+        goto fail;
+    if (!relation->relation_identity || !owner->relation_identity
+        || !wl_columnar_relation_generation_valid(relation->storage_generation)
+        || !wl_columnar_relation_generation_valid(owner->storage_generation)
+        || relation->storage_owner_identity != owner->relation_identity
+        || relation->storage_owner_generation != owner->storage_generation) {
+        rc = EINVAL;
+        goto fail;
+    }
+    single->owners[0].owner = owner;
+    set->owner_count = 1;
+    if (relation != owner) {
+        single->owners[1].owner = relation;
+        set->owner_count = 2;
+        if ((uintptr_t)&owner->source_access >
+            (uintptr_t)&relation->source_access) {
+            single->owners[0].owner = relation;
+            single->owners[1].owner = owner;
+        }
+    }
+    single->lease = (wl_columnar_relation_mutation_lease_t){
+        .set = set, .acquisition_nonce = nonce, .relation = relation,
+        .owner = owner,
+        .role_flags = WL_COLUMNAR_RELATION_PAYLOAD_MUTATION,
+        .relation_identity = relation->relation_identity,
+        .relation_generation = relation->storage_generation,
+        .owner_identity = owner->relation_identity,
+        .owner_generation = owner->storage_generation,
+        .owner_slot = single->owners[0].owner == owner ? 0u : 1u,
+        .self_owner_slot = single->owners[0].owner == relation ? 0u : 1u
+    };
+    rc = wl_columnar_relation_work_tail(control, 12);
+    if (rc)
+        goto fail;
+    for (size_t i = 0; i < set->owner_count; i++) {
+        rc = wl_columnar_relation_writer_acquire_controlled(
+            &single->owners[i].owner->source_access,
+            &single->owners[i].writer, control);
+        if (rc)
+            goto fail;
+        set->owners_acquired++;
+    }
+    rc = wl_evaluation_control_charge(control, 1);
+    if (rc)
+        goto fail;
+    if (owner == relation && col_rel_storage_alias_borrow_count(owner)) {
+        rc = EBUSY;
+        goto fail;
+    }
+    single->lease.identity = (uintptr_t)&single->lease;
+    rc = wl_columnar_relation_work_tail(control, 1);
+    if (rc)
+        goto fail;
+    /* Generic validation is finite here: exactly one lease and <=2 owners. */
+    rc = wl_evaluation_control_charge(control, 32);
+    if (rc)
+        goto fail;
+    rc = col_rel_mutation_lease_validate(&single->lease, relation);
+    int stop = wl_columnar_relation_work_tail(control, 32);
+    if (!rc)
+        rc = stop;
+    if (!rc)
+        return 0;
+fail:
+    return wl_columnar_relation_mutation_single_finish_controlled(single, rc,
+               control);
+}
+
 static void
 wl_columnar_relation_metadata_checkpoint(wl_evaluation_control_t *control,
     int phase, uint64_t progress)
@@ -6791,23 +7353,23 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
         || dst->col_shared || src->col_shared || dst->arena_owned
         || src->arena_owned || arena)
         return ENOTSUP;
-    rc = col_rel_storage_owner_resolve(src, &src_owner);
+    rc = wl_columnar_relation_resolve_controlled(src, &src_owner, control);
     if (rc != 0)
         return rc;
-    rc = col_rel_storage_owner_resolve(dst, &dst_owner);
+    rc = wl_columnar_relation_resolve_controlled(dst, &dst_owner, control);
     if (rc != 0)
         return rc;
     if (src_owner != src || dst_owner != dst)
         return ENOTSUP;
     if (src_owner != dst_owner) {
-        rc = wl_columnar_source_access_reader_acquire(
-            &src_owner->source_access, &reader);
+        rc = wl_columnar_relation_reader_acquire_controlled(
+            &src_owner->source_access, &reader, control);
         if (rc != 0)
             return rc;
         read_held = true;
     }
-    rc = wl_columnar_source_access_writer_acquire(
-        &dst_owner->source_access, &writer);
+    rc = wl_columnar_relation_writer_acquire_controlled(
+        &dst_owner->source_access, &writer, control);
     if (rc != 0)
         goto done;
     write_held = true;
@@ -9344,7 +9906,7 @@ wl_columnar_relation_new_like_governed_checked_mode_controlled(const char *name,
     const col_rel_t *src, wl_columnar_memory_governor_ref_t *governor,
     bool preserve_timestamps, col_rel_t **out, wl_evaluation_control_t *control)
 {
-    wl_columnar_source_access_reader_t reader = { 0 };
+    wl_columnar_relation_source_admission_t admission = { 0 };
     col_rel_t *r = NULL;
     int rc;
     if (!control)
@@ -9355,7 +9917,8 @@ wl_columnar_relation_new_like_governed_checked_mode_controlled(const char *name,
     *out = NULL;
     if (!name || !src)
         return EINVAL;
-    rc = col_rel_source_reader_acquire(src, &reader);
+    rc = wl_columnar_relation_source_acquire_controlled(src, &admission,
+            control);
     if (rc != 0)
         return rc;
     rc = wl_evaluation_control_charge(control, 6);
@@ -9385,17 +9948,7 @@ wl_columnar_relation_new_like_governed_checked_mode_controlled(const char *name,
             COL_REL_INIT_CAP, preserve_timestamps && src->timestamps, governor,
             src, false, NULL, 0, &r, control);
 done:
-#ifdef WL_SESSION_TEST_HOOKS
-    /* All protected source reads have finished. Hook may consume the actual
-     * token, but cannot manufacture release status or gate counters. */
-    if (wl_columnar_relation_test_new_like_before_reader_release)
-        wl_columnar_relation_test_new_like_before_reader_release(control,
-            &reader);
-#endif
-    if (col_rel_source_reader_release(&reader) != 0 && rc <= 0)
-        rc = EBUSY;
-    if (rc == 0)
-        rc = wl_evaluation_control_charge(control, 0);
+    rc = wl_columnar_relation_source_finish(&admission, rc, control, true);
     if (rc == 0)
         *out = r;
     else
@@ -9613,7 +10166,7 @@ wl_columnar_relation_pool_new_like_governed_checked_controlled(col_rel_t **out,
     wl_columnar_memory_governor_ref_t *governor,
     wl_evaluation_control_t *control)
 {
-    wl_columnar_source_access_reader_t reader = { 0 };
+    wl_columnar_relation_source_admission_t admission = { 0 };
     col_rel_t *slot = NULL, *r = NULL;
     uint32_t slot_index = 0;
     uint64_t identity = 0;
@@ -9650,7 +10203,8 @@ wl_columnar_relation_pool_new_like_governed_checked_controlled(col_rel_t **out,
     if (pool->slot_used == pool->slot_cap)
         return wl_columnar_relation_new_like_governed_checked_mode_controlled(
             name, like, governor, false, out, control);
-    rc = col_rel_source_reader_acquire(like, &reader);
+    rc = wl_columnar_relation_source_acquire_controlled(like, &admission,
+            control);
     if (rc != 0)
         return rc;
     rc = wl_evaluation_control_charge(control, 6);
@@ -9708,15 +10262,7 @@ wl_columnar_relation_pool_new_like_governed_checked_controlled(col_rel_t **out,
             COL_REL_INIT_CAP, false, governor, like, false, slot, identity, &r,
             control);
 done:
-#ifdef WL_SESSION_TEST_HOOKS
-    if (wl_columnar_relation_test_new_like_before_reader_release)
-        wl_columnar_relation_test_new_like_before_reader_release(control,
-            &reader);
-#endif
-    if (col_rel_source_reader_release(&reader) != 0 && rc <= 0)
-        rc = EBUSY;
-    if (rc == 0)
-        rc = wl_evaluation_control_charge(control, 0);
+    rc = wl_columnar_relation_source_finish(&admission, rc, control, true);
     if (rc == 0)
         *out = r;
     else if (slot)
@@ -10422,7 +10968,7 @@ wl_columnar_relation_deep_copy_governed_controlled(const col_rel_t *src,
     col_rel_t **out, wl_columnar_memory_governor_ref_t *governor,
     wl_evaluation_control_t *control)
 {
-    wl_columnar_source_access_reader_t reader = { 0 };
+    wl_columnar_relation_source_admission_t admission = { 0 };
     col_rel_t *r = NULL;
     int rc;
     if (!control)
@@ -10432,7 +10978,8 @@ wl_columnar_relation_deep_copy_governed_controlled(const col_rel_t *src,
     *out = NULL;
     if (!src)
         return EINVAL;
-    rc = col_rel_source_reader_acquire(src, &reader);
+    rc = wl_columnar_relation_source_acquire_controlled(src, &admission,
+            control);
     if (rc != 0)
         return rc;
     rc = wl_evaluation_control_charge(control, 12);
@@ -10467,16 +11014,7 @@ wl_columnar_relation_deep_copy_governed_controlled(const col_rel_t *src,
             0, &r,
             control);
 done:
-#ifdef WL_SESSION_TEST_HOOKS
-    if (wl_columnar_relation_test_new_like_before_reader_release)
-        wl_columnar_relation_test_new_like_before_reader_release(control,
-            &reader);
-#endif
-    int release_rc = col_rel_source_reader_release(&reader);
-    if (release_rc != 0 && rc <= 0)
-        rc = release_rc;
-    if (rc == 0)
-        rc = wl_evaluation_control_charge(control, 0);
+    rc = wl_columnar_relation_source_finish(&admission, rc, control, false);
     if (rc == 0)
         *out = r;
     else
