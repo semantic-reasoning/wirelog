@@ -25,6 +25,17 @@ struct wl_evaluation_control {
     bool active;
     wl_evaluation_control_report_t completed;
 };
+#ifdef _MSC_VER
+typedef char wl_evaluation_control_atomic_alignment[(__alignof(
+            struct wl_evaluation_control) >= 8) ? 1 : -1];
+#else
+_Static_assert(_Alignof(struct wl_evaluation_control) >= 8,
+    "64-bit atomic container alignment");
+_Static_assert(offsetof(struct wl_evaluation_control, references) % 8 == 0,
+    "64-bit atomic field offset");
+_Static_assert(offsetof(struct wl_evaluation_control, cancelled) % 8 == 0,
+    "64-bit atomic field offset");
+#endif
 
 int
 wl_evaluation_control_create(uint64_t limit, wl_evaluation_control_t **out)
@@ -35,6 +46,12 @@ wl_evaluation_control_create(uint64_t limit, wl_evaluation_control_t **out)
     wl_evaluation_control_t *control = calloc(1, sizeof(*control));
     if (!control)
         return ENOMEM;
+
+#if defined(WL_SESSION_TEST_HOOKS) || defined(WL_COLUMNAR_MEMORY_TEST_HOOKS)
+    if ((uintptr_t)&control->references % 8 ||
+        (uintptr_t)&control->cancelled % 8)
+        abort(); /* Actual allocated atomic fields, effective with NDEBUG. */
+#endif
     if (wl_mutex_init(&control->mutex) != 0) {
         free(control);
         return ENOMEM;

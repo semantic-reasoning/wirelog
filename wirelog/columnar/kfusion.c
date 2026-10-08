@@ -294,6 +294,14 @@ struct wl_columnar_kfusion_cohort {
     int operation_rc;
     atomic_uint_fast64_t shared_join_count;
 };
+#ifdef _MSC_VER
+typedef char wl_columnar_kfusion_atomic_alignment[
+        (__alignof(struct wl_columnar_kfusion_cohort) >= 8) ? 1 : -1];
+#else
+_Static_assert(offsetof(struct wl_columnar_kfusion_cohort,
+    shared_join_count) % 8 == 0,
+    "cohort shared atomic offset");
+#endif
 
 #ifdef WL_SESSION_TEST_HOOKS
 void (*wl_columnar_kfusion_test_before_cleanup)(wl_col_session_t *sess,
@@ -964,6 +972,10 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
      * The TDD worker path (eval.c) has used it since #426; this is the same
      * treatment on the K-fusion branch path, so the cap bounds the aggregate
      * across branches -- which is what a global row budget means. */
+#ifdef WL_SESSION_TEST_HOOKS
+    if ((uintptr_t)&cohort->shared_join_count % 8)
+        abort();
+#endif
     atomic_store_explicit(&cohort->shared_join_count, 0,
         memory_order_relaxed);
 

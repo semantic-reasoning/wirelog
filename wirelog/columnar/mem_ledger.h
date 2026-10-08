@@ -27,6 +27,7 @@
 /* MSVC: Use intrinsic functions instead of <stdatomic.h> */
 #include <windows.h>
 #include <intrin.h>
+#include <string.h>
 
 /* MSVC does not support C11 _Atomic as a type qualifier or keyword.
  * Use volatile uint64_t as the atomic field type; all mutations go through
@@ -38,7 +39,7 @@ typedef volatile uint64_t wl_atomic_u64;
  * Field accesses are paired with the atomic_*_explicit shims below; for
  * relaxed-order callers a volatile-qualified plain type is sufficient on
  * the architectures MSVC targets (x86/x64/ARM64), and the shimmed
- * fetch_add still routes through _InterlockedCompareExchange64 for the
+ * fetch_add/sub route through InterlockedExchangeAdd64 for the
  * read-modify-write ops. */
 typedef volatile bool atomic_bool;
 typedef volatile int atomic_int;
@@ -46,38 +47,48 @@ typedef volatile uint_fast64_t atomic_uint_fast64_t;
 #define ATOMIC_VAR_INIT(x) (x)
 #define atomic_init(ptr, val) (*(ptr) = (val))
 
+typedef char wl_columnar_mem_ledger_long64_width[(sizeof(LONG64) ==
+        8) ? 1 : -1];
+typedef char wl_columnar_mem_ledger_u64_width[(sizeof(wl_atomic_u64) ==
+        8) ? 1 : -1];
+typedef char wl_columnar_mem_ledger_fast64_width[(sizeof(atomic_uint_fast64_t)
+        == 8) ? 1 : -1];
+typedef char wl_columnar_mem_ledger_u64_alignment[(__alignof(wl_atomic_u64) >=
+        8) ? 1 : -1];
+typedef char wl_columnar_mem_ledger_fast64_alignment[(__alignof(
+            atomic_uint_fast64_t) >= 8) ? 1 : -1];
+
 /* MSVC atomic macros using intrinsics that are guaranteed to exist */
 #define atomic_load_explicit(ptr, order) (*(ptr))
 #define atomic_store_explicit(ptr, val, order) (*(ptr) = (val))
 
-/* Implement fetch_add/fetch_sub using compare-exchange loop since _InterlockedAdd64
- * may not be available on all MSVC versions. This is slightly slower but portable. */
-static inline int64_t
-wl_atomic_fetch_add_internal(volatile __int64 *ptr, __int64 inc)
+/* One Windows platform atomic operation, with a full memory barrier. The SDK
+ * may implement this API with multiple instructions on some architectures.
+ * Unsigned arguments/results preserve C11 modulo arithmetic at caller sites.
+ * Fixed-size memcpy converts representations without signed overflow or aliasing. */
+static inline uint64_t
+wl_columnar_mem_ledger_fetch_add_internal(volatile LONG64 *ptr, uint64_t delta)
 {
-    __int64 old, updated;
-    do {
-        old = *ptr;
-        updated = old + inc;
-    } while (_InterlockedCompareExchange64(ptr, updated, old) != old);
-    return old;
+    LONG64 addend;
+    memcpy(&addend, &delta, sizeof(addend));
+    LONG64 previous = InterlockedExchangeAdd64(ptr, addend);
+    uint64_t old_bits;
+    memcpy(&old_bits, &previous, sizeof(old_bits));
+    return old_bits;
 }
 
-static inline int64_t
-wl_atomic_fetch_sub_internal(volatile __int64 *ptr, __int64 dec)
+static inline uint64_t
+wl_columnar_mem_ledger_fetch_sub_internal(volatile LONG64 *ptr, uint64_t delta)
 {
-    __int64 old, updated;
-    do {
-        old = *ptr;
-        updated = old - dec;
-    } while (_InterlockedCompareExchange64(ptr, updated, old) != old);
-    return old;
+    return wl_columnar_mem_ledger_fetch_add_internal(ptr, UINT64_C(0) - delta);
 }
 
 #define atomic_fetch_add_explicit(ptr, inc, order) \
-        wl_atomic_fetch_add_internal((volatile __int64 *)(ptr), (__int64)(inc))
+        wl_columnar_mem_ledger_fetch_add_internal((volatile LONG64 *)(ptr), \
+            (uint64_t)(inc))
 #define atomic_fetch_sub_explicit(ptr, dec, order) \
-        wl_atomic_fetch_sub_internal((volatile __int64 *)(ptr), (__int64)(dec))
+        wl_columnar_mem_ledger_fetch_sub_internal((volatile LONG64 *)(ptr), \
+            (uint64_t)(dec))
 
 static inline bool
 wl_atomic_compare_exchange_weak_internal(volatile __int64 *ptr,
@@ -109,6 +120,8 @@ wl_atomic_compare_exchange_weak_internal(volatile __int64 *ptr,
 #include <stdatomic.h>
 /* Portable atomic uint64 type for struct fields */
 typedef _Atomic uint64_t wl_atomic_u64;
+_Static_assert(sizeof(wl_atomic_u64) == 8, "64-bit atomic width");
+_Static_assert(sizeof(atomic_uint_fast64_t) == 8, "64-bit fast atomic width");
 #endif
 
 /* Reclaimers are invoked only at an owner-defined quiescent point.  The

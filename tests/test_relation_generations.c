@@ -973,11 +973,20 @@ typedef struct alias_borrow_reader_args {
     atomic_uint_fast64_t reads_during_accounting;
     int rc;
 } alias_borrow_reader_args_t;
+#ifdef _MSC_VER
+typedef char wl_columnar_mem_ledger_reads_during_accounting_alignment[(__alignof
+            (alias_borrow_reader_args_t) >= 8) ? 1 : -1];
+#else
+_Static_assert(offsetof(alias_borrow_reader_args_t,
+    reads_during_accounting) % 8 == 0, "shared counter offset");
+#endif
 
 static void *
 read_alias_borrows_while_peer_lease_is_active(void *opaque)
 {
     alias_borrow_reader_args_t *args = (alias_borrow_reader_args_t *)opaque;
+    if ((uintptr_t)&args->reads_during_accounting % 8)
+        abort();
     wl_columnar_source_access_reader_t reader = { 0 };
     args->rc = col_rel_source_reader_acquire(args->owner, &reader);
     atomic_store_explicit(&args->ready, true, memory_order_release);

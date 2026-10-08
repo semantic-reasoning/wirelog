@@ -1033,6 +1033,10 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
         ctxs[w].stage = &stages->items[w];
     uint32_t chunk = (driver->nrows + W - 1u) / W;
     atomic_uint_fast64_t shared_join_count;
+#ifdef WL_SESSION_TEST_HOOKS
+    if ((uintptr_t)&shared_join_count % 8)
+        abort();
+#endif
     atomic_store_explicit(&shared_join_count, 0, memory_order_relaxed);
     for (uint32_t w = 0; w < W && rc == 0; w++) {
         worker_rels[w] = (col_rel_t **)calloc(relation_slots,

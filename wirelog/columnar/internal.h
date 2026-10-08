@@ -876,6 +876,15 @@ _Static_assert(offsetof(col_rel_t, relation_identity) >
     "relation generation fields must remain outside the legacy prefix");
 #endif /* C11 _Static_assert */
 
+#ifdef _MSC_VER
+typedef char wl_columnar_relation_atomic_alignment[(__alignof(col_rel_t) >=
+        8) ? 1 : -1];
+#else
+_Static_assert(_Alignof(col_rel_t) >= 8, "relation atomic container alignment");
+_Static_assert(offsetof(col_rel_t, storage_alias_borrows) % 8 == 0,
+    "relation borrow atomic offset");
+#endif
+
 #define WL_COLUMNAR_REL_GENERATION_INVALID UINT64_MAX
 
 static inline col_relation_snapshot_t

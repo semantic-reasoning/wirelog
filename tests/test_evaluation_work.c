@@ -39,6 +39,7 @@ relation(uint32_t width, uint32_t capacity, uint32_t rows, bool timestamps,
     CHECK(wl_columnar_relation_new_auto_governed("work", width, capacity,
         timestamps, governor, &r) == 0);
     CHECK(r != NULL);
+    CHECK((uintptr_t)&r->storage_alias_borrows % 8 == 0);
     if (local_governor)
         wl_columnar_memory_governor_ref_release(governor);
     r->nrows = rows;
@@ -2310,6 +2311,13 @@ test_pool_real_slot_stops_and_faults(void)
             wl_columnar_memory_governor_ref_get(g));
     delta_pool_t *reference_pool = delta_pool_create(2, slot_size, 64);
     CHECK(pool && reference_pool);
+    col_rel_t stack_relation;
+    CHECK((uintptr_t)&stack_relation.storage_alias_borrows % 8 == 0);
+    for (uint32_t slot = 0; slot < pool->slot_cap; slot++) {
+        col_rel_t *actual_slot = (col_rel_t *)(pool->slab + slot *
+            pool->slot_size);
+        CHECK((uintptr_t)&actual_slot->storage_alias_borrows % 8 == 0);
+    }
     memset(pool->slab, 0xa5, pool->slot_size * pool->slot_cap);
     CHECK(wl_columnar_relation_pool_new_like_governed_checked(&pool_prior,
         pool, "prior-slot", alias, g) == 0);

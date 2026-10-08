@@ -3180,6 +3180,14 @@ typedef struct peer_reader_teardown_args {
     atomic_uint_fast64_t reads_during_retirement;
     int rc;
 } peer_reader_teardown_args_t;
+#ifdef _MSC_VER
+typedef char wl_columnar_mem_ledger_retirement_counter_alignment[
+        (__alignof(peer_reader_teardown_args_t) >= 8) ? 1 : -1];
+#else
+_Static_assert(offsetof(peer_reader_teardown_args_t,
+    reads_during_retirement) % 8 == 0,
+    "shared retirement counter offset");
+#endif
 
 static uint64_t
 peer_test_now_ms(void)
@@ -3236,6 +3244,8 @@ exercise_peer_reads_during_alias_retirement(void *opaque)
 {
     peer_reader_teardown_args_t *args
         = (peer_reader_teardown_args_t *)opaque;
+    if ((uintptr_t)&args->reads_during_retirement % 8)
+        abort();
     wl_columnar_source_access_reader_t reader = { 0 };
 
     args->rc = col_rel_source_reader_acquire(args->owner, &reader);

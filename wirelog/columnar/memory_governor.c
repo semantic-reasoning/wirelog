@@ -71,6 +71,15 @@ struct wl_columnar_memory_governor_ref {
     wl_columnar_memory_governor_t governor;
     wl_atomic_u64 references;
 };
+#ifdef _MSC_VER
+typedef char wl_columnar_memory_governor_ref_alignment[(__alignof(
+            struct wl_columnar_memory_governor_ref) >= 8) ? 1 : -1];
+#else
+_Static_assert(_Alignof(struct wl_columnar_memory_governor_ref) >= 8,
+    "64-bit atomic container alignment");
+_Static_assert(offsetof(struct wl_columnar_memory_governor_ref,
+    references) % 8 == 0, "64-bit atomic field offset");
+#endif
 
 typedef enum {
     WL_MEMORY_PARSE_INVALID,
@@ -453,6 +462,11 @@ wl_columnar_memory_governor_ref_create(
     ref = (wl_columnar_memory_governor_ref_t *)calloc(1, sizeof(*ref));
     if (!ref)
         return NULL;
+
+#if defined(WL_SESSION_TEST_HOOKS) || defined(WL_COLUMNAR_MEMORY_TEST_HOOKS)
+    if ((uintptr_t)&ref->references % 8)
+        abort(); /* Actual allocated atomic fields, effective with NDEBUG. */
+#endif
     if (wl_columnar_memory_governor_init(&ref->governor, resolution)
         != WL_COLUMNAR_MEMORY_OK) {
         free(ref);
