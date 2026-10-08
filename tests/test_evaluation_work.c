@@ -379,9 +379,8 @@ test_rejected_shapes(void)
     CHECK(col_rel_set_column_types(src, &type, 1) == 0);
     src->nrows = 1;
     retry(c, 0);
-    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
-        c) == ENOTSUP);
-    CHECK(finish(c, ENOTSUP) == 0);
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c) == 0);
+    CHECK(finish(c, 0) > 0 && dst->column_types != NULL);
     released(src); released(dst);
     release(c); destroy(dst); destroy(src);
 }
@@ -616,6 +615,322 @@ test_growth_faults(void)
     release(c); destroy(dst); destroy(src);
 }
 
+static int metadata_cancel_phase;
+static uint64_t metadata_cancel_progress, allocation_after_child;
+static bool committed_seen, fail_payload_after_metadata;
+
+static void
+metadata_checkpoint(wl_evaluation_control_t *c, int phase, uint64_t progress)
+{
+    if (phase == WL_COLUMNAR_RELATION_METADATA_COMMITTED) {
+        CHECK(progress != 0);
+        committed_seen = true;
+        if (fail_payload_after_metadata)
+            wl_columnar_relation_test_fail_next_reservation_commit();
+    }
+    if (phase == WL_COLUMNAR_RELATION_METADATA_CHILD && allocation_after_child
+        && progress == allocation_after_child)
+        wl_columnar_relation_test_fail_next_metadata_alloc();
+    if (phase == metadata_cancel_phase && progress >= metadata_cancel_progress)
+        wl_evaluation_control_request_cancel(c);
+}
+
+static col_rel_t *
+typed_source(uint32_t width, uint32_t rows, wirelog_column_type_t type,
+    bool timestamps)
+{
+    col_rel_t *r = relation(width, rows, 0, timestamps, NULL);
+    wirelog_column_type_t *types = malloc(width * sizeof(*types));
+    CHECK(types != NULL);
+    for (uint32_t c = 0; c < width; c++)
+        types[c] = type;
+    CHECK(col_rel_set_column_types(r, types, width) == 0);
+    free(types);
+    r->nrows = rows;
+    for (uint32_t c = 0; c < width; c++)
+        for (uint32_t row = 0; row < rows; row++)
+            r->columns[c][row] = type == WIRELOG_TYPE_FLOAT
+                ? wl_columnar_float_to_bits(row ? 1.5 : -0.0)
+                : (int64_t)c * 10000 + row;
+    return r;
+}
+
+static uint64_t
+installation_cost(col_rel_t *dst, col_rel_t *src)
+{
+    uint64_t lengths = 0;
+    for (uint32_t c = 0; c < dst->ncols; c++)
+        lengths += strlen(dst->col_names &&
+                dst->col_names[c] ? dst->col_names[c] : "") + 1;
+    /* 8 width actions: compatibility, length-write, type-copy, zero-table,
+     * child-init, format two chars, name allocation. Fixed6 covers scratch,
+     * types table, root format3, child-pointer table. Visit/copy names includes NUL. */
+    uint64_t cost = 8 * (uint64_t)dst->ncols + 2 * lengths + 6
+        + 2 * (uint64_t)src->ncols * src->nrows
+        + (uint64_t)dst->ncols * dst->nrows;
+    for (uint32_t c = 0; c < src->ncols; c++)
+        if (src->column_types[c] == WIRELOG_TYPE_FLOAT)
+            cost += src->nrows;
+    if (dst->timestamps && src->timestamps)
+        cost += 5 * src->nrows;
+    return cost;
+}
+
+static void
+schema_equal(col_rel_t *a, col_rel_t *b)
+{
+    CHECK(a->schema_ok && b->schema_ok &&
+        a->schema.n_children == b->schema.n_children);
+    CHECK(strcmp(a->schema.format, b->schema.format) == 0);
+    for (uint32_t c = 0; c < a->ncols; c++) {
+        CHECK(a->column_types[c] == b->column_types[c]);
+        CHECK(strcmp(a->schema.children[c]->format,
+            b->schema.children[c]->format) == 0);
+        CHECK(strcmp(a->schema.children[c]->name,
+            b->schema.children[c]->name) == 0);
+    }
+}
+
+static void
+metadata_unchanged(col_rel_t *dst, growth_snapshot_t before,
+    struct ArrowSchema old_schema, uint64_t metadata_credit)
+{
+    unchanged(dst, before);
+    CHECK(dst->column_types == NULL);
+    CHECK(dst->schema.children == old_schema.children &&
+        dst->schema.format == old_schema.format);
+    CHECK(dst->schema.n_children == old_schema.n_children);
+    CHECK(dst->metadata_reserved_bytes == metadata_credit);
+    released(dst);
+}
+
+static void
+test_metadata_partial_construction(void)
+{
+    col_rel_t *src = typed_source(600, 1, WIRELOG_TYPE_INT32, false);
+    col_rel_t *dst = relation(600, 4, 0, false, NULL);
+    col_rel_t *reference = relation(600, 4, 0, false, NULL);
+    growth_snapshot_t before = snapshot(dst);
+    struct ArrowSchema old_schema = dst->schema;
+    uint64_t metadata_credit = dst->metadata_reserved_bytes;
+    uint64_t cost = installation_cost(dst, src);
+    wl_evaluation_control_t *c = control(cost - 1);
+    wl_columnar_relation_test_metadata_checkpoint = metadata_checkpoint;
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT) < cost);
+    metadata_unchanged(dst, before, old_schema, metadata_credit);
+    const int phases[] = { WL_COLUMNAR_RELATION_METADATA_TYPES,
+                           WL_COLUMNAR_RELATION_METADATA_TABLE_ZERO,
+                           WL_COLUMNAR_RELATION_METADATA_CHILD };
+    const uint64_t progress[3][3] = { { 1, 300, 600 }, { 256, 512, 600 },
+                                      { 1, 300, 600 } };
+    for (uint32_t phase = 0; phase < 3; phase++)
+        for (uint32_t point = 0; point < 3; point++) {
+            retry(c, 0);
+            metadata_cancel_phase = phases[phase];
+            metadata_cancel_progress = progress[phase][point];
+            CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c)
+                == WL_EVALUATION_CONTROL_CANCELLED);
+            CHECK(finish(c, WL_EVALUATION_CONTROL_CANCELLED) == seen);
+            metadata_unchanged(dst, before, old_schema, metadata_credit);
+            released(src);
+        }
+    metadata_cancel_phase = 0;
+    retry(c, 0);
+    allocation_after_child = 300;
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
+        c) == ENOMEM);
+    CHECK(finish(c, ENOMEM) > 0);
+    metadata_unchanged(dst, before, old_schema, metadata_credit);
+    allocation_after_child = 0;
+    retry(c, cost);
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c) == 0);
+    CHECK(finish(c, 0) == cost);
+    CHECK(wl_columnar_relation_append_all_controlled(reference, src, NULL,
+        NULL) == 0);
+    schema_equal(dst, reference); payload_equal(dst, reference, 0);
+    release(c); destroy(reference); destroy(dst); destroy(src);
+    wl_columnar_relation_test_metadata_checkpoint = NULL;
+}
+
+static void
+test_metadata_long_name_and_compatibility(void)
+{
+    char name[701]; memset(name, 'n', 700); name[700] = 0;
+    const char *names[] = { name };
+    col_rel_t *src = typed_source(1, 2, WIRELOG_TYPE_INT32, true);
+    col_rel_t *dst = relation(0, 0, 0, false, NULL);
+    col_rel_t *reference = relation(0, 0, 0, false, NULL);
+    CHECK(col_rel_set_schema(dst, 1, names) == 0);
+    CHECK(col_rel_set_schema(reference, 1, names) == 0);
+    CHECK(col_rel_reserve_capacity_admitted(dst, 4, NULL) == 0);
+    CHECK(col_rel_reserve_capacity_admitted(reference, 4, NULL) == 0);
+    CHECK(col_rel_enable_timestamps(dst) == 0);
+    CHECK(col_rel_enable_timestamps(reference) == 0);
+    CHECK(strlen(dst->col_names[0]) == 700);
+    CHECK(dst->timestamps != NULL && src->timestamps != NULL);
+    growth_snapshot_t before = snapshot(dst);
+    struct ArrowSchema old_schema = dst->schema;
+    uint64_t metadata_credit = dst->metadata_reserved_bytes;
+    uint64_t cost = installation_cost(dst, src);
+    wl_evaluation_control_t *c = control(0);
+    wl_columnar_relation_test_metadata_checkpoint = metadata_checkpoint;
+    metadata_cancel_phase = WL_COLUMNAR_RELATION_METADATA_NAME;
+    const uint64_t points[] = { 256, 512, 701 };
+    for (uint32_t i = 0; i < 3; i++) {
+        if (i)
+            retry(c, 0);
+        metadata_cancel_progress = points[i];
+        CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c)
+            == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(finish(c, WL_EVALUATION_CONTROL_CANCELLED) == seen);
+        metadata_unchanged(dst, before, old_schema, metadata_credit);
+    }
+    metadata_cancel_phase = 0;
+    retry(c, 0);
+    cancel_at = cost; /* The final actual timestamp tail must poll. */
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c)
+        == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(finish(c, WL_EVALUATION_CONTROL_CANCELLED) == cost);
+    metadata_unchanged(dst, before, old_schema, metadata_credit);
+    retry(c, cost);
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c) == 0);
+    CHECK(finish(c, 0) == cost);
+    CHECK(dst->columns[0][0] == 0 &&
+        dst->column_types[0] == WIRELOG_TYPE_INT32);
+    CHECK(wl_columnar_relation_append_all_controlled(reference, src, NULL,
+        NULL) == 0);
+    schema_equal(dst, reference); payload_equal(dst, reference, 0);
+    release(c); destroy(reference); destroy(dst); destroy(src);
+    wl_columnar_relation_test_metadata_checkpoint = NULL;
+    src = typed_source(1, 1, WIRELOG_TYPE_FLOAT, false);
+    dst = relation(1, 4, 1, false, NULL);
+    before = snapshot(dst); old_schema = dst->schema;
+    metadata_credit = dst->metadata_reserved_bytes;
+    c = control(0);
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
+        c) == EINVAL);
+    CHECK(finish(c, EINVAL) == 1);
+    metadata_unchanged(dst, before, old_schema, metadata_credit);
+    dst->nrows = 0;
+    retry(c, 0);
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
+        c) == EINVAL);
+    CHECK(finish(c, EINVAL) == 1 && dst->column_types == NULL);
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
+        NULL) == EINVAL);
+    src->nrows = 0;
+    uint64_t generation = dst->view_generation;
+    retry(c, 0);
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c) == 0);
+    CHECK(finish(c, 0) == 1 && dst->column_types == NULL);
+    CHECK(dst->nrows == 0 && dst->view_generation == generation);
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
+        NULL) == 0);
+    release(c); destroy(dst); destroy(src);
+}
+
+static void
+test_metadata_quota_provenance(void)
+{
+    col_rel_t *src = typed_source(1, 2, WIRELOG_TYPE_INT32, false);
+    col_rel_t *dst = relation(1, 1, 1, false, NULL);
+    growth_snapshot_t before = snapshot(dst);
+    struct ArrowSchema old_schema = dst->schema;
+    uint64_t metadata_credit = dst->metadata_reserved_bytes;
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(dst->memory_governor);
+    uint64_t usable = atomic_load(&g->usable_bytes);
+    wl_evaluation_control_t *c = control(0);
+    atomic_store(&g->usable_bytes, before.reserved);
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
+        c) == ENOSPC);
+    CHECK(dst->memory_budget_denial_pending);
+    CHECK(finish(c, ENOSPC) == 4); /* Compatibility + two source visits + old visit. */
+    metadata_unchanged(dst, before, old_schema, metadata_credit);
+    atomic_store(&g->usable_bytes, before.reserved + sizeof(uint64_t));
+    retry(c, 0);
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
+        c) == ENOSPC);
+    CHECK(dst->memory_budget_denial_pending);
+    CHECK(finish(c, ENOSPC) == 11); /* Scratch admitted, actual name length gathered. */
+    metadata_unchanged(dst, before, old_schema, metadata_credit);
+    uint64_t incoming_metadata = metadata_credit +
+        sizeof(wirelog_column_type_t);
+    atomic_store(&g->usable_bytes,
+        before.reserved + incoming_metadata + sizeof(uint64_t));
+    retry(c, 0);
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
+        c) == ENOMEM);
+    CHECK(dst->memory_budget_denial_pending);
+    CHECK(finish(c, ENOMEM) > 11); /* Metadata staged, payload coexistence denied. */
+    metadata_unchanged(dst, before, old_schema, metadata_credit);
+    atomic_store(&g->usable_bytes, usable);
+    retry(c, 0);
+    wl_columnar_relation_test_fail_next_metadata_alloc();
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
+        c) == ENOMEM);
+    CHECK(!dst->memory_budget_denial_pending);
+    CHECK(finish(c, ENOMEM) == 5);
+    metadata_unchanged(dst, before, old_schema, metadata_credit);
+    release(c); destroy(dst); destroy(src);
+}
+
+static void
+test_metadata_no_governor(void)
+{
+    col_rel_t *src = typed_source(1, 2, WIRELOG_TYPE_INT32, false);
+    col_rel_t *dst = col_rel_new_auto("unmanaged", 1);
+    CHECK(dst != NULL && dst->memory_governor == NULL);
+    CHECK(col_rel_reserve_capacity_admitted(dst, 4, NULL) == 0);
+    uint64_t cost = installation_cost(dst, src);
+    wl_evaluation_control_t *c = control(cost);
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c) == 0);
+    CHECK(finish(c, 0) == cost && dst->nrows == 2);
+    CHECK(dst->column_types[0] == WIRELOG_TYPE_INT32 &&
+        dst->metadata_reserved_bytes == 0);
+    CHECK(dst->schema_ok && strcmp(dst->schema.children[0]->format, "l") == 0);
+    release(c); destroy(dst); destroy(src);
+}
+
+static void
+test_metadata_commit_order(bool growth)
+{
+    col_rel_t *src = typed_source(1, 2, WIRELOG_TYPE_INT32, false);
+    col_rel_t *dst = relation(1, growth ? 1 : 4, 1, false, NULL);
+    growth_snapshot_t before = snapshot(dst);
+    struct ArrowSchema old_schema = dst->schema;
+    uint64_t metadata_credit = dst->metadata_reserved_bytes;
+    uint64_t cost = installation_cost(dst, src) + (growth ? 5 : 0);
+    wl_evaluation_control_t *c = control(0);
+    wl_columnar_relation_test_metadata_checkpoint = metadata_checkpoint;
+    committed_seen = false;
+    wl_columnar_relation_test_fail_metadata_commit = true;
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
+        c) == ENOMEM);
+    CHECK(!committed_seen && !wl_columnar_relation_test_fail_metadata_commit);
+    CHECK(finish(c, ENOMEM) == cost);
+    metadata_unchanged(dst, before, old_schema, metadata_credit); released(src);
+    if (growth) {
+        retry(c, 0);
+        committed_seen = false; fail_payload_after_metadata = true;
+        CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
+            c) == ENOMEM);
+        CHECK(committed_seen);
+        CHECK(finish(c, ENOMEM) == cost);
+        metadata_unchanged(dst, before, old_schema, metadata_credit);
+        released(src);
+        fail_payload_after_metadata = false;
+    }
+    retry(c, cost); committed_seen = false;
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c) == 0);
+    CHECK(committed_seen && finish(c, 0) == cost);
+    CHECK(dst->column_types[0] == WIRELOG_TYPE_INT32 && dst->nrows == 3);
+    release(c); destroy(dst); destroy(src);
+    wl_columnar_relation_test_metadata_checkpoint = NULL;
+}
+
 int
 main(void)
 {
@@ -635,6 +950,12 @@ main(void)
     test_growth_float_and_timestamp_shortage();
     test_growth_auxiliary_and_ledger();
     test_growth_faults();
+    test_metadata_partial_construction();
+    test_metadata_long_name_and_compatibility();
+    test_metadata_quota_provenance();
+    test_metadata_commit_order(false);
+    test_metadata_commit_order(true);
+    test_metadata_no_governor();
     puts("evaluation_work: OK");
     return 0;
 }

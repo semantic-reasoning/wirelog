@@ -3093,7 +3093,7 @@ wl_columnar_relation_delta_restore_flat_overwrite(col_rel_t *rel,
 int
 col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena);
 /* Controlled private heap scalar append. No aliases, COW, arena,
- * compound data or schema installation. Negative control dispositions leave
+ * compound data. Negative control dispositions leave
  * logical rows and generation unchanged; spare cells may have been written.
  * Descriptors must remain alive and externally serialized during the call. */
 int
@@ -3101,6 +3101,16 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
     const col_rel_t *src, wl_arena_t *arena,
     wl_evaluation_control_t *control);
 #ifdef WL_SESSION_TEST_HOOKS
+enum {
+    WL_COLUMNAR_RELATION_METADATA_TYPES = 1,
+    WL_COLUMNAR_RELATION_METADATA_TABLE_ZERO,
+    WL_COLUMNAR_RELATION_METADATA_CHILD,
+    WL_COLUMNAR_RELATION_METADATA_NAME,
+    WL_COLUMNAR_RELATION_METADATA_COMMITTED,
+};
+extern void (*wl_columnar_relation_test_metadata_checkpoint)(
+    wl_evaluation_control_t *control, int phase, uint64_t progress);
+extern bool wl_columnar_relation_test_fail_metadata_commit;
 extern void (*wl_columnar_relation_test_work_checkpoint)(
     wl_evaluation_control_t *control, uint64_t work);
 #endif
