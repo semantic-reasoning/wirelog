@@ -27,6 +27,7 @@
 #include "columnar/kfusion_adaptive.h"
 #include "columnar/progress.h"
 #include "session.h"
+#include "evaluation_control.h"
 #include "intern.h"
 #include "util/lockfree_queue.h"
 #include "workqueue.h"
@@ -3091,6 +3092,18 @@ wl_columnar_relation_delta_restore_flat_overwrite(col_rel_t *rel,
     uint32_t nrows, uint32_t ncols);
 int
 col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena);
+/* Controlled preallocated scalar append. No growth, aliases, COW, arena,
+ * compound data or schema installation. Negative control dispositions leave
+ * logical rows and generation unchanged; spare cells may have been written.
+ * Descriptors must remain alive and externally serialized during the call. */
+int
+wl_columnar_relation_append_all_controlled(col_rel_t *dst,
+    const col_rel_t *src, wl_arena_t *arena,
+    wl_evaluation_control_t *control);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_relation_test_work_checkpoint)(
+    wl_evaluation_control_t *control, uint64_t work);
+#endif
 /* Append only while dst is still empty after canonical storage admission.
  * EBUSY means another writer populated it before this operation acquired
  * the destination gate.  The source and destination descriptors must remain
