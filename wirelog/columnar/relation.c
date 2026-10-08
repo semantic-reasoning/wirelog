@@ -6066,6 +6066,127 @@ wl_columnar_relation_name_length_controlled(const char *name,
 }
 
 static int
+wl_columnar_relation_build_schema_controlled(const col_rel_t *dst,
+    const uint64_t *lengths, const wirelog_column_type_t *types,
+    struct ArrowSchema *schema, wl_evaluation_control_t *control)
+{
+    uint64_t table_bytes;
+    bool schema_initialized = false;
+    int rc;
+    if (!wl_columnar_memory_size_mul(dst->ncols, sizeof(struct ArrowSchema *),
+        &table_bytes)
+        || table_bytes > SIZE_MAX || table_bytes > INT64_MAX)
+        return EOVERFLOW;
+    rc = wl_evaluation_control_charge(control, 3);
+    if (rc != 0)
+        goto done;
+    ArrowSchemaInit(schema);
+    schema_initialized = true;
+    rc = ArrowSchemaSetFormat(schema, "+s");
+    if (rc != 0)
+        goto done;
+    rc = wl_columnar_relation_work_tail(control, 3);
+    if (rc != 0)
+        goto done;
+    if (dst->ncols == 0)
+        return 0;
+    rc = wl_evaluation_control_charge(control, 1);
+    if (rc != 0)
+        goto done;
+    schema->children = (struct ArrowSchema **)ArrowMalloc((int64_t)table_bytes);
+    if (!schema->children && table_bytes) {
+        rc = ENOMEM;
+        goto done;
+    }
+    rc = wl_columnar_relation_work_tail(control, 1);
+    if (rc != 0)
+        goto done;
+    /* n_children stays zero until every uninitialized pointer has been cleared. */
+    for (uint32_t c = 0; c < dst->ncols;) {
+        uint32_t n = dst->ncols - c;
+        if (n > WL_EVALUATION_CONTROL_QUANTUM)
+            n = (uint32_t)WL_EVALUATION_CONTROL_QUANTUM;
+        rc = wl_evaluation_control_charge(control, n);
+        if (rc != 0)
+            goto done;
+        for (uint32_t i = 0; i < n; i++)
+            schema->children[c + i] = NULL;
+        c += n;
+        wl_columnar_relation_metadata_checkpoint(control, 2, c);
+        rc = wl_columnar_relation_work_tail(control, n);
+        if (rc != 0)
+            goto done;
+    }
+    for (uint32_t c = 0; c < dst->ncols; c++) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc != 0)
+            goto done;
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+        if (wl_columnar_relation_test_fail_metadata_alloc) {
+            wl_columnar_relation_test_fail_metadata_alloc = false;
+            rc = ENOMEM;
+            goto done;
+        }
+#endif
+        struct ArrowSchema *child =
+            (struct ArrowSchema *)ArrowMalloc(sizeof(*child));
+        if (!child) {
+            rc = ENOMEM;
+            goto done;
+        }
+        ArrowSchemaInit(child);
+        schema->children[c] = child;
+        schema->n_children = (int64_t)c + 1;
+        wl_columnar_relation_metadata_checkpoint(control, 3, c + 1u);
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc != 0)
+            goto done;
+        rc = wl_evaluation_control_charge(control, 2);
+        if (rc != 0)
+            goto done;
+        rc = ArrowSchemaSetFormat(child,
+                types && types[c] == WIRELOG_TYPE_FLOAT ? "g" : "l");
+        if (rc != 0)
+            goto done;
+        rc = wl_columnar_relation_work_tail(control, 2);
+        if (rc != 0)
+            goto done;
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc != 0)
+            goto done;
+        child->name = (const char *)ArrowMalloc((int64_t)lengths[c]);
+        if (!child->name) {
+            rc = ENOMEM;
+            goto done;
+        }
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc != 0)
+            goto done;
+        const char *name = dst->col_names &&
+            dst->col_names[c] ? dst->col_names[c] : "";
+        for (uint64_t pos = 0; pos < lengths[c];) {
+            uint64_t n = lengths[c] - pos;
+            if (n > WL_EVALUATION_CONTROL_QUANTUM)
+                n = WL_EVALUATION_CONTROL_QUANTUM;
+            rc = wl_evaluation_control_charge(control, n);
+            if (rc != 0)
+                goto done;
+            memcpy((char *)child->name + pos, name + pos, (size_t)n);
+            pos += n;
+            wl_columnar_relation_metadata_checkpoint(control, 4, pos);
+            rc = wl_columnar_relation_work_tail(control, n);
+            if (rc != 0)
+                goto done;
+        }
+    }
+    return 0;
+done:
+    if (schema_initialized)
+        ArrowSchemaRelease(schema);
+    return rc;
+}
+
+static int
 wl_columnar_relation_prepare_types_controlled(const col_rel_t *dst,
     const wirelog_column_type_t *types, wirelog_column_type_t **types_out,
     struct ArrowSchema *schema, uint64_t *metadata_bytes,
@@ -6075,7 +6196,6 @@ wl_columnar_relation_prepare_types_controlled(const col_rel_t *dst,
     uint64_t *lengths = NULL;
     wirelog_column_type_t *copy = NULL;
     wl_columnar_memory_reservation_t scratch;
-    bool schema_initialized = false;
     uint64_t bytes = 3;
     int rc;
     wl_columnar_memory_reservation_init(&scratch);
@@ -6165,118 +6285,19 @@ wl_columnar_relation_prepare_types_controlled(const col_rel_t *dst,
         if (rc != 0)
             goto done;
     }
-    rc = wl_evaluation_control_charge(control, 3);
+    rc = wl_columnar_relation_build_schema_controlled(dst, lengths, copy,
+            schema, control);
     if (rc != 0)
         goto done;
-    ArrowSchemaInit(schema);
-    schema_initialized = true;
-    rc = ArrowSchemaSetFormat(schema, "+s");
-    if (rc != 0)
-        goto done;
-    rc = wl_columnar_relation_work_tail(control, 3);
-    if (rc != 0)
-        goto done;
-    rc = wl_evaluation_control_charge(control, 1);
-    if (rc != 0)
-        goto done;
-    schema->children = (struct ArrowSchema **)ArrowMalloc((int64_t)table_bytes);
-    if (!schema->children && table_bytes) {
-        rc = ENOMEM;
-        goto done;
-    }
-    rc = wl_columnar_relation_work_tail(control, 1);
-    if (rc != 0)
-        goto done;
-    /* n_children stays zero until every uninitialized pointer has been cleared. */
-    for (uint32_t c = 0; c < dst->ncols;) {
-        uint32_t n = dst->ncols - c;
-        if (n > WL_EVALUATION_CONTROL_QUANTUM)
-            n = (uint32_t)WL_EVALUATION_CONTROL_QUANTUM;
-        rc = wl_evaluation_control_charge(control, n);
-        if (rc != 0)
-            goto done;
-        for (uint32_t i = 0; i < n; i++)
-            schema->children[c + i] = NULL;
-        c += n;
-        wl_columnar_relation_metadata_checkpoint(control, 2, c);
-        rc = wl_columnar_relation_work_tail(control, n);
-        if (rc != 0)
-            goto done;
-    }
-    for (uint32_t c = 0; c < dst->ncols; c++) {
-        rc = wl_evaluation_control_charge(control, 1);
-        if (rc != 0)
-            goto done;
-#ifdef WL_TEST_RELATION_RESIZE_HOOK
-        if (wl_columnar_relation_test_fail_metadata_alloc) {
-            wl_columnar_relation_test_fail_metadata_alloc = false;
-            rc = ENOMEM;
-            goto done;
-        }
-#endif
-        struct ArrowSchema *child =
-            (struct ArrowSchema *)ArrowMalloc(sizeof(*child));
-        if (!child) {
-            rc = ENOMEM;
-            goto done;
-        }
-        ArrowSchemaInit(child);
-        schema->children[c] = child;
-        schema->n_children = (int64_t)c + 1;
-        wl_columnar_relation_metadata_checkpoint(control, 3, c + 1u);
-        rc = wl_columnar_relation_work_tail(control, 1);
-        if (rc != 0)
-            goto done;
-        rc = wl_evaluation_control_charge(control, 2);
-        if (rc != 0)
-            goto done;
-        rc = ArrowSchemaSetFormat(child,
-                copy[c] == WIRELOG_TYPE_FLOAT ? "g" : "l");
-        if (rc != 0)
-            goto done;
-        rc = wl_columnar_relation_work_tail(control, 2);
-        if (rc != 0)
-            goto done;
-        rc = wl_evaluation_control_charge(control, 1);
-        if (rc != 0)
-            goto done;
-        child->name = (const char *)ArrowMalloc((int64_t)lengths[c]);
-        if (!child->name) {
-            rc = ENOMEM;
-            goto done;
-        }
-        rc = wl_columnar_relation_work_tail(control, 1);
-        if (rc != 0)
-            goto done;
-        const char *name = dst->col_names &&
-            dst->col_names[c] ? dst->col_names[c] : "";
-        for (uint64_t pos = 0; pos < lengths[c];) {
-            uint64_t n = lengths[c] - pos;
-            if (n > WL_EVALUATION_CONTROL_QUANTUM)
-                n = WL_EVALUATION_CONTROL_QUANTUM;
-            rc = wl_evaluation_control_charge(control, n);
-            if (rc != 0)
-                goto done;
-            memcpy((char *)child->name + pos, name + pos, (size_t)n);
-            pos += n;
-            wl_columnar_relation_metadata_checkpoint(control, 4, pos);
-            rc = wl_columnar_relation_work_tail(control, n);
-            if (rc != 0)
-                goto done;
-        }
-    }
     *metadata_bytes = bytes;
     *types_out = copy;
     copy = NULL;
-    schema_initialized = false;
     rc = 0;
 done:
     free(lengths);
     if (scratch.bytes)
         col_rel_reservation_rollback(&scratch);
     free(copy);
-    if (schema_initialized)
-        ArrowSchemaRelease(schema);
     /* Caller owns pending on success and failure; release it exactly once. */
     return rc;
 }
@@ -8160,6 +8181,544 @@ wl_columnar_relation_new_auto_governed(const char *name, uint32_t ncols,
     }
     *out = r;
     return 0;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_relation_test_before_identity_cas)(
+    wl_evaluation_control_t *control, uint64_t expected);
+void (*wl_columnar_relation_test_constructor_checkpoint)(
+    wl_evaluation_control_t *control, int phase, uint64_t progress);
+int64_t wl_columnar_relation_test_constructor_fail_allocation = -1;
+int wl_columnar_relation_test_constructor_fail_commit;
+#endif
+
+static void
+wl_columnar_relation_constructor_checkpoint(wl_evaluation_control_t *control,
+    int phase, uint64_t progress)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_constructor_checkpoint)
+        wl_columnar_relation_test_constructor_checkpoint(control, phase,
+            progress);
+#else
+    (void)control;
+    (void)phase;
+    (void)progress;
+#endif
+}
+
+static bool
+wl_columnar_relation_constructor_allocation_fails(void)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_constructor_fail_allocation >= 0) {
+        if (wl_columnar_relation_test_constructor_fail_allocation-- == 0) {
+            wl_columnar_relation_test_constructor_fail_allocation = -1;
+            return true;
+        }
+    }
+#endif
+    return false;
+}
+
+static int
+wl_columnar_relation_identity_controlled(uint64_t *identity,
+    wl_evaluation_control_t *control)
+{
+    uint64_t current = atomic_load_explicit(&wl_next_relation_identity,
+            memory_order_relaxed);
+    for (;;) {
+        if (!current || current == UINT64_MAX)
+            return EOVERFLOW;
+        int rc = wl_evaluation_control_charge(control, 1);
+        if (rc != 0)
+            return rc;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_relation_test_before_identity_cas)
+            wl_columnar_relation_test_before_identity_cas(control, current);
+#endif
+        uint64_t consumed = current;
+        bool success;
+#ifdef _MSC_VER
+        /* Existing InterlockedCompareExchange64-backed shim is strong despite
+         * its weak_explicit spelling: it never fails spuriously. */
+        success =
+            atomic_compare_exchange_weak_explicit(&wl_next_relation_identity,
+                &current, current + 1u, memory_order_relaxed,
+                memory_order_relaxed);
+#else
+        success =
+            atomic_compare_exchange_strong_explicit(&wl_next_relation_identity,
+                &current, current + 1u, memory_order_relaxed,
+                memory_order_relaxed);
+#endif
+        wl_columnar_relation_constructor_checkpoint(control,
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_IDENTITY, success ? 1u : 0u);
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc != 0)
+            return rc; /* Even successful identities are never refunded. */
+        if (success) {
+            *identity = consumed;
+            return 0;
+        }
+    }
+}
+
+static int
+wl_columnar_relation_constructor_reserve(
+    wl_columnar_memory_governor_ref_t *governor, uint64_t bytes,
+    wl_columnar_memory_reservation_t *token)
+{
+    if (!bytes)
+        return 0;
+    wl_columnar_memory_admission_status_t status =
+        wl_columnar_memory_reserve_checked(
+        wl_columnar_memory_governor_ref_get(governor), bytes, token);
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+        || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+        return 0;
+    /* Failed admission owns no credit, even if requested bytes were staged. */
+    wl_columnar_memory_reservation_init(token);
+    return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+        : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : EINVAL;
+}
+
+static int
+wl_columnar_relation_constructor_commit(col_rel_t *r,
+    wl_columnar_memory_reservation_t *pending,
+    wl_columnar_memory_reservation_t *canonical, int stage,
+    wl_evaluation_control_t *control)
+{
+    if (!pending->bytes)
+        return wl_evaluation_control_charge(control, 0);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_constructor_fail_commit == stage) {
+        wl_columnar_relation_test_constructor_fail_commit = 0;
+        return ENOMEM;
+    }
+#endif
+    if (pending->bytes) {
+        if (!wl_columnar_memory_commit(pending, r))
+            return ENOMEM;
+        if (!wl_columnar_memory_reservation_move(canonical, pending))
+            abort();
+    }
+    wl_columnar_relation_constructor_checkpoint(control,
+        WL_COLUMNAR_RELATION_CONSTRUCTOR_COMMITTED, (uint64_t)stage);
+    return wl_evaluation_control_charge(control, 0);
+}
+
+static void
+wl_columnar_relation_constructor_retire_token(
+    wl_columnar_memory_reservation_t *token)
+{
+    if (!token->bytes)
+        return;
+    uint64_t state = atomic_load_explicit(&token->state, memory_order_acquire);
+    if (state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED)
+        col_rel_reservation_rollback(token);
+    else if (state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED)
+        col_rel_release_reservation_or_abort(token);
+    else
+        abort();
+}
+
+int
+wl_columnar_relation_new_auto_governed_controlled(const char *name,
+    uint32_t ncols, uint32_t initial_capacity, bool timestamps,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out,
+    wl_evaluation_control_t *control)
+{
+    col_rel_t *r = NULL;
+    uint64_t *lengths = NULL;
+    uint32_t columns_owned = 0, names_owned = 0;
+    bool governor_retained = false;
+    wl_columnar_memory_reservation_t descriptor, metadata, payload, scratch;
+    uint64_t name_length, descriptor_bytes, metadata_bytes = 3, payload_bytes;
+    uint64_t lane_bytes, column_table_bytes, name_table_bytes, scratch_bytes;
+    uint64_t length_bytes, timestamp_bytes;
+    col_rel_payload_shape_t shape = {
+        .ncols = ncols, .owned_columns = ncols,
+        .column_capacity = initial_capacity,
+        .timestamp_capacity = timestamps ? initial_capacity : 0,
+        .active_table = ncols != 0, .scratch = ncols != 0,
+    };
+    int rc;
+    if (!control)
+        return wl_columnar_relation_new_auto_governed(name, ncols,
+                   initial_capacity,
+                   timestamps, governor, out);
+    if (out)
+        *out = NULL;
+    if (!name || !governor || !out)
+        return EINVAL;
+    wl_columnar_memory_reservation_init(&descriptor);
+    wl_columnar_memory_reservation_init(&metadata);
+    wl_columnar_memory_reservation_init(&payload);
+    wl_columnar_memory_reservation_init(&scratch);
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc != 0)
+        goto done;
+    rc = wl_columnar_relation_name_length_controlled(name, &name_length,
+            control);
+    if (rc != 0)
+        goto done;
+    if (!wl_columnar_memory_size_add(sizeof(*r), name_length, &descriptor_bytes)
+        || descriptor_bytes > SIZE_MAX
+        || !wl_columnar_memory_size_mul(ncols, sizeof(int64_t *),
+        &column_table_bytes)
+        || !wl_columnar_memory_size_mul(ncols, sizeof(char *),
+        &name_table_bytes)
+        || !wl_columnar_memory_size_mul(ncols, sizeof(uint64_t), &length_bytes)
+        || !wl_columnar_memory_size_mul(ncols, sizeof(int64_t), &scratch_bytes)
+        || !wl_columnar_memory_size_mul(initial_capacity ? initial_capacity :
+        1u,
+        sizeof(int64_t), &lane_bytes)
+        || !wl_columnar_memory_size_mul(timestamps ? initial_capacity : 0,
+        sizeof(col_delta_timestamp_t), &timestamp_bytes)
+        || column_table_bytes > SIZE_MAX || name_table_bytes > SIZE_MAX
+        || length_bytes > SIZE_MAX || scratch_bytes > SIZE_MAX
+        || lane_bytes > SIZE_MAX || timestamp_bytes > SIZE_MAX
+        || !col_rel_payload_shape_bytes(&shape, &payload_bytes)) {
+        rc = EOVERFLOW;
+        goto done;
+    }
+    rc = wl_columnar_relation_constructor_reserve(governor, descriptor_bytes,
+            &descriptor);
+    if (rc != 0)
+        goto done;
+    rc = wl_evaluation_control_charge(control, 1);
+    if (rc != 0)
+        goto done;
+    r = wl_columnar_relation_constructor_allocation_fails() ? NULL
+        : (col_rel_t *)calloc(1, sizeof(*r));
+    if (!r) {
+        rc = ENOMEM;
+        goto done;
+    }
+    /* Every token identity is valid before any private object cleanup. */
+    wl_columnar_memory_reservation_init(&r->descriptor_reservation);
+    wl_columnar_memory_reservation_init(&r->metadata_reservation);
+    wl_columnar_memory_reservation_init(&r->retained_reservation);
+    wl_columnar_memory_reservation_init(&r->pool_name_reservation);
+    wl_columnar_memory_reservation_init(&r->dedup_reservation);
+    r->memory_governor = governor;
+    wl_columnar_memory_governor_ref_retain(governor);
+    governor_retained = true;
+    rc = wl_columnar_relation_work_tail(control, 1);
+    if (rc != 0)
+        goto done;
+    rc = wl_evaluation_control_charge(control, 1);
+    if (rc != 0)
+        goto done;
+    r->name = wl_columnar_relation_constructor_allocation_fails() ? NULL
+        : (char *)malloc((size_t)name_length);
+    if (!r->name) {
+        rc = ENOMEM;
+        goto done;
+    }
+    rc = wl_columnar_relation_work_tail(control, 1);
+    if (rc != 0)
+        goto done;
+    for (uint64_t pos = 0; pos < name_length;) {
+        uint64_t n = name_length - pos;
+        if (n > WL_EVALUATION_CONTROL_QUANTUM)
+            n = WL_EVALUATION_CONTROL_QUANTUM;
+        rc = wl_evaluation_control_charge(control, n);
+        if (rc != 0)
+            goto done;
+        memcpy(r->name + pos, name + pos, (size_t)n);
+        pos += n;
+        wl_columnar_relation_constructor_checkpoint(control,
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_NAME, pos);
+        rc = wl_columnar_relation_work_tail(control, n);
+        if (rc != 0)
+            goto done;
+    }
+    rc = wl_columnar_relation_identity_controlled(&r->relation_identity,
+            control);
+    if (rc != 0)
+        goto done;
+    r->view_generation = 1;
+    r->storage_generation = 1;
+    col_rel_storage_owner_init(r);
+    rc = wl_columnar_relation_constructor_commit(r, &descriptor,
+            &r->descriptor_reservation, 1, control);
+    if (rc != 0)
+        goto done;
+    r->descriptor_reserved_bytes = descriptor_bytes;
+    r->ncols = ncols;
+    r->capacity = initial_capacity;
+    rc = wl_columnar_relation_constructor_reserve(governor, length_bytes,
+            &scratch);
+    if (rc != 0)
+        goto done;
+    if (ncols) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc != 0)
+            goto done;
+        lengths = wl_columnar_relation_constructor_allocation_fails() ? NULL
+            : (uint64_t *)malloc((size_t)length_bytes);
+        if (!lengths) {
+            rc = ENOMEM;
+            goto done;
+        }
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc != 0)
+            goto done;
+    }
+    for (uint32_t c = 0; c < ncols; c++) {
+        char generated[32];
+        uint64_t length, fixed = sizeof(char *) + sizeof(struct ArrowSchema *)
+            + sizeof(struct ArrowSchema) + 2u;
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc != 0)
+            goto done;
+        int printed = snprintf(generated, sizeof(generated), "col%u", c);
+        if (printed < 0 || (size_t)printed >= sizeof(generated)) {
+            rc = EOVERFLOW;
+            goto done;
+        }
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc != 0)
+            goto done;
+        rc = wl_columnar_relation_name_length_controlled(generated, &length,
+                control);
+        if (rc != 0)
+            goto done;
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc != 0)
+            goto done;
+        lengths[c] = length;
+        if (!wl_columnar_memory_size_add(metadata_bytes, fixed, &metadata_bytes)
+            || !wl_columnar_memory_size_add(metadata_bytes, length,
+            &metadata_bytes)
+            || !wl_columnar_memory_size_add(metadata_bytes, length,
+            &metadata_bytes)) {
+            rc = EOVERFLOW;
+            goto done;
+        }
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc != 0)
+            goto done;
+    }
+    rc = wl_columnar_relation_constructor_reserve(governor, metadata_bytes,
+            &metadata);
+    if (rc != 0)
+        goto done;
+    rc = wl_columnar_relation_constructor_reserve(governor, payload_bytes,
+            &payload);
+    if (rc != 0)
+        goto done;
+    if (ncols) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc != 0)
+            goto done;
+        r->columns = wl_columnar_relation_constructor_allocation_fails() ? NULL
+            : (int64_t **)malloc((size_t)column_table_bytes);
+        if (!r->columns) {
+            rc = ENOMEM;
+            goto done;
+        }
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc != 0)
+            goto done;
+        for (uint32_t c = 0; c < ncols;) {
+            uint32_t n = ncols - c;
+            if (n > WL_EVALUATION_CONTROL_QUANTUM)
+                n = (uint32_t)WL_EVALUATION_CONTROL_QUANTUM;
+            rc = wl_evaluation_control_charge(control, n);
+            if (rc != 0)
+                goto done;
+            for (uint32_t i = 0; i < n; i++)
+                r->columns[c + i] = NULL;
+            c += n;
+            wl_columnar_relation_constructor_checkpoint(control,
+                WL_COLUMNAR_RELATION_CONSTRUCTOR_COLUMNS_ZERO, c);
+            rc = wl_columnar_relation_work_tail(control, n);
+            if (rc != 0)
+                goto done;
+        }
+        for (uint32_t c = 0; c < ncols; c++) {
+            rc = wl_evaluation_control_charge(control, 1);
+            if (rc != 0)
+                goto done;
+            r->columns[c] =
+                wl_columnar_relation_constructor_allocation_fails() ? NULL
+                : (int64_t *)malloc((size_t)lane_bytes);
+            if (!r->columns[c]) {
+                rc = ENOMEM;
+                goto done;
+            }
+            columns_owned++;
+            wl_columnar_relation_constructor_checkpoint(control,
+                WL_COLUMNAR_RELATION_CONSTRUCTOR_COLUMN, columns_owned);
+            rc = wl_columnar_relation_work_tail(control, 1);
+            if (rc != 0)
+                goto done;
+        }
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc != 0)
+            goto done;
+        r->row_scratch =
+            wl_columnar_relation_constructor_allocation_fails() ? NULL
+            : (int64_t *)malloc((size_t)scratch_bytes);
+        if (!r->row_scratch) {
+            rc = ENOMEM;
+            goto done;
+        }
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc != 0)
+            goto done;
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc != 0)
+            goto done;
+        r->col_names =
+            wl_columnar_relation_constructor_allocation_fails() ? NULL
+            : (char **)malloc((size_t)name_table_bytes);
+        if (!r->col_names) {
+            rc = ENOMEM;
+            goto done;
+        }
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc != 0)
+            goto done;
+        for (uint32_t c = 0; c < ncols;) {
+            uint32_t n = ncols - c;
+            if (n > WL_EVALUATION_CONTROL_QUANTUM)
+                n = (uint32_t)WL_EVALUATION_CONTROL_QUANTUM;
+            rc = wl_evaluation_control_charge(control, n);
+            if (rc != 0)
+                goto done;
+            for (uint32_t i = 0; i < n; i++)
+                r->col_names[c + i] = NULL;
+            c += n;
+            wl_columnar_relation_constructor_checkpoint(control,
+                WL_COLUMNAR_RELATION_CONSTRUCTOR_NAMES_ZERO, c);
+            rc = wl_columnar_relation_work_tail(control, n);
+            if (rc != 0)
+                goto done;
+        }
+        for (uint32_t c = 0; c < ncols; c++) {
+            char generated[32];
+            rc = wl_evaluation_control_charge(control, 1);
+            if (rc != 0)
+                goto done;
+            int printed = snprintf(generated, sizeof(generated), "col%u", c);
+            if (printed < 0 || (size_t)printed + 1u != lengths[c]) {
+                rc = EOVERFLOW;
+                goto done;
+            }
+            rc = wl_columnar_relation_work_tail(control, 1);
+            if (rc != 0)
+                goto done;
+            rc = wl_evaluation_control_charge(control, 1);
+            if (rc != 0)
+                goto done;
+            r->col_names[c] =
+                wl_columnar_relation_constructor_allocation_fails() ? NULL
+                : (char *)malloc((size_t)lengths[c]);
+            if (!r->col_names[c]) {
+                rc = ENOMEM;
+                goto done;
+            }
+            names_owned++;
+            rc = wl_columnar_relation_work_tail(control, 1);
+            if (rc != 0)
+                goto done;
+            rc = wl_evaluation_control_charge(control, lengths[c]);
+            if (rc != 0)
+                goto done;
+            memcpy(r->col_names[c], generated, (size_t)lengths[c]);
+            wl_columnar_relation_constructor_checkpoint(control,
+                WL_COLUMNAR_RELATION_CONSTRUCTOR_GENERATED_NAME, names_owned);
+            rc = wl_columnar_relation_work_tail(control, lengths[c]);
+            if (rc != 0)
+                goto done;
+        }
+    }
+    if (timestamp_bytes) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc != 0)
+            goto done;
+        r->timestamps =
+            wl_columnar_relation_constructor_allocation_fails() ? NULL
+            : (col_delta_timestamp_t *)calloc(initial_capacity,
+                sizeof(*r->timestamps));
+        if (!r->timestamps) {
+            rc = ENOMEM;
+            goto done;
+        }
+        r->timestamp_capacity = initial_capacity;
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc != 0)
+            goto done;
+    }
+    rc = wl_columnar_relation_build_schema_controlled(r, lengths, NULL,
+            &r->schema, control);
+    if (rc != 0)
+        goto done;
+    r->schema_ok = true;
+    rc = wl_columnar_relation_constructor_commit(r, &metadata,
+            &r->metadata_reservation, 2, control);
+    if (rc != 0)
+        goto done;
+    r->metadata_reserved_bytes = metadata_bytes;
+    rc = wl_columnar_relation_constructor_commit(r, &payload,
+            &r->retained_reservation, 3, control);
+    if (rc != 0)
+        goto done;
+    r->retained_reserved_bytes = payload_bytes;
+    free(lengths);
+    lengths = NULL;
+    wl_columnar_relation_constructor_retire_token(&scratch);
+    wl_columnar_memory_reservation_init(&scratch);
+    wl_columnar_relation_touch_view(r);
+    wl_columnar_relation_constructor_checkpoint(control,
+        WL_COLUMNAR_RELATION_CONSTRUCTOR_FINAL, 0);
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc != 0)
+        goto done;
+    *out = r;
+    return 0;
+done:
+    free(lengths);
+    if (r) {
+        /* Never generic-destroy a partial object. Prefix counters are authority,
+        * including while table entries outside that prefix are uninitialized. */
+        for (uint32_t c = 0; c < columns_owned; c++)
+            free(r->columns[c]);
+        for (uint32_t c = 0; c < names_owned; c++)
+            free(r->col_names[c]);
+        free(r->columns);
+        free(r->col_names);
+        free(r->row_scratch);
+        free(r->timestamps);
+        free(r->name);
+        if (r->schema_ok)
+            ArrowSchemaRelease(&r->schema);
+        /* Keep every committed token reachable after descriptor retirement. */
+        if (r->descriptor_reservation.bytes
+            && !wl_columnar_memory_reservation_move(&descriptor,
+            &r->descriptor_reservation))
+            abort();
+        if (r->metadata_reservation.bytes
+            && !wl_columnar_memory_reservation_move(&metadata,
+            &r->metadata_reservation))
+            abort();
+        if (r->retained_reservation.bytes
+            && !wl_columnar_memory_reservation_move(&payload,
+            &r->retained_reservation))
+            abort();
+        free(r);
+    }
+    wl_columnar_relation_constructor_retire_token(&scratch);
+    wl_columnar_relation_constructor_retire_token(&payload);
+    wl_columnar_relation_constructor_retire_token(&metadata);
+    wl_columnar_relation_constructor_retire_token(&descriptor);
+    if (governor_retained)
+        wl_columnar_memory_governor_ref_release(governor);
+    return rc;
 }
 
 /* Helper: create owned relation copying col_names from src.

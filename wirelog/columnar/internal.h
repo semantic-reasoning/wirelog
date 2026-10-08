@@ -3129,6 +3129,31 @@ int
 wl_columnar_relation_new_auto_governed(const char *name, uint32_t ncols,
     uint32_t initial_capacity, bool timestamps,
     wl_columnar_memory_governor_ref_t *governor, col_rel_t **out);
+/* Fresh governed auto constructor with bounded engine preparation. NULL
+ * delegates legacy; failure/stop leaves *out NULL and returns all staging. */
+int
+wl_columnar_relation_new_auto_governed_controlled(const char *name,
+    uint32_t ncols, uint32_t initial_capacity, bool timestamps,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out,
+    wl_evaluation_control_t *control);
+enum {
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_NAME = 1,
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_IDENTITY,
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_COLUMNS_ZERO,
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_NAMES_ZERO,
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_COLUMN,
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_GENERATED_NAME,
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_COMMITTED,
+    WL_COLUMNAR_RELATION_CONSTRUCTOR_FINAL,
+};
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_relation_test_before_identity_cas)(
+    wl_evaluation_control_t *control, uint64_t expected);
+extern void (*wl_columnar_relation_test_constructor_checkpoint)(
+    wl_evaluation_control_t *control, int phase, uint64_t progress);
+extern int64_t wl_columnar_relation_test_constructor_fail_allocation;
+extern int wl_columnar_relation_test_constructor_fail_commit;
+#endif
 /* Allocate a heap descriptor and optional name under a known governor. */
 int
 wl_columnar_relation_alloc_governed(col_rel_t **out, const char *name,

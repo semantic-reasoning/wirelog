@@ -931,6 +931,364 @@ test_metadata_commit_order(bool growth)
     wl_columnar_relation_test_metadata_checkpoint = NULL;
 }
 
+static wl_columnar_memory_governor_ref_t *
+fresh_governor(void)
+{
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+    };
+    wl_columnar_memory_governor_ref_t *g =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(g != NULL);
+    return g;
+}
+
+static void
+governor_empty(wl_columnar_memory_governor_ref_t *g)
+{
+    CHECK(atomic_load(&wl_columnar_memory_governor_ref_get(
+            g)->reserved_bytes) == 0);
+    CHECK(wl_columnar_memory_governor_ref_is_sole(g));
+}
+
+static uint64_t
+constructor_cost(const char *name, uint32_t width, uint32_t capacity,
+    bool timestamps)
+{
+    uint64_t length = strlen(name) + 1;
+    uint64_t generated = 0;
+    for (uint32_t c = 0; c < width; c++) {
+        char text[32]; snprintf(text, sizeof(text), "col%u", c);
+        generated += strlen(text) + 1;
+    }
+    return width ? 2 * length + 11 + 12 * (uint64_t)width + 3 * generated
+           + (timestamps && capacity ? 1 : 0)
+        : 2 * length + 6 + (timestamps && capacity ? 1 : 0);
+}
+
+static void
+constructor_equal(col_rel_t *a, col_rel_t *b)
+{
+    CHECK(a->ncols == b->ncols && a->capacity == b->capacity &&
+        a->nrows == b->nrows);
+    CHECK(a->column_types == NULL && b->column_types == NULL);
+    CHECK((a->columns != NULL) == (b->columns != NULL));
+    CHECK((a->col_names != NULL) == (b->col_names != NULL));
+    CHECK((a->row_scratch != NULL) == (b->row_scratch != NULL));
+    CHECK((a->timestamps != NULL) == (b->timestamps != NULL));
+    CHECK(a->timestamp_capacity == b->timestamp_capacity);
+    CHECK(a->schema_ok == b->schema_ok &&
+        a->schema.n_children == b->schema.n_children);
+    CHECK((a->schema.children != NULL) == (b->schema.children != NULL));
+    CHECK(strcmp(a->schema.format, b->schema.format) == 0);
+    CHECK(a->view_generation == b->view_generation &&
+        a->storage_generation == b->storage_generation);
+    CHECK(a->descriptor_reserved_bytes == b->descriptor_reserved_bytes);
+    CHECK(a->metadata_reserved_bytes == b->metadata_reserved_bytes);
+    CHECK(a->retained_reserved_bytes == b->retained_reserved_bytes);
+    CHECK(a->relation_identity != 0 && a->storage_owner == a);
+    CHECK(a->storage_owner_identity == a->relation_identity);
+    for (uint32_t c = 0; c < a->ncols; c++) {
+        CHECK(a->columns[c] != NULL && b->columns[c] != NULL);
+        CHECK(strcmp(a->col_names[c], b->col_names[c]) == 0);
+        CHECK(strcmp(a->schema.children[c]->name,
+            b->schema.children[c]->name) == 0);
+        CHECK(strcmp(a->schema.children[c]->format,
+            b->schema.children[c]->format) == 0);
+    }
+    for (uint32_t row = 0; row < a->timestamp_capacity; row++) {
+        CHECK(a->timestamps[row].iteration == 0 &&
+            a->timestamps[row].stratum == 0);
+        CHECK(a->timestamps[row].worker == 0 &&
+            a->timestamps[row]._reserved == 0);
+        CHECK(a->timestamps[row].multiplicity == 0);
+    }
+}
+
+static int constructor_cancel_phase;
+static uint64_t constructor_cancel_progress;
+static bool identity_cancel_failure;
+static uint64_t identity_failures, identity_successes, constructor_committed;
+
+static void
+constructor_checkpoint(wl_evaluation_control_t *c, int phase, uint64_t progress)
+{
+    if (phase == WL_COLUMNAR_RELATION_CONSTRUCTOR_IDENTITY) {
+        if (progress)
+            identity_successes++;
+        else {
+            identity_failures++;
+            if (identity_cancel_failure)
+                wl_evaluation_control_request_cancel(c);
+        }
+    }
+    if (phase == WL_COLUMNAR_RELATION_CONSTRUCTOR_COMMITTED)
+        constructor_committed = progress;
+    if (phase == constructor_cancel_phase &&
+        progress >= constructor_cancel_progress)
+        wl_evaluation_control_request_cancel(c);
+}
+
+static col_rel_t *identity_winner;
+static void
+consume_identity(wl_evaluation_control_t *c, uint64_t expected)
+{
+    (void)c;
+    wl_columnar_relation_test_before_identity_cas = NULL;
+    identity_winner = col_rel_new_auto("identity-winner", 0);
+    CHECK(identity_winner != NULL &&
+        identity_winner->relation_identity == expected);
+}
+
+static void
+test_constructor_matrix(void)
+{
+    wl_columnar_memory_governor_ref_t *g = fresh_governor();
+    const uint32_t widths[] = { 0, 2 };
+    const uint32_t capacities[] = { 0, 4 };
+    for (uint32_t w = 0; w < 2; w++)
+        for (uint32_t cap = 0; cap < 2; cap++)
+            for (uint32_t ts = 0; ts < 2; ts++) {
+                col_rel_t *actual = NULL, *reference = NULL;
+                uint64_t cost = constructor_cost("fresh", widths[w],
+                        capacities[cap], ts != 0);
+                wl_evaluation_control_t *c = control(cost);
+                CHECK(wl_columnar_relation_new_auto_governed_controlled("fresh",
+                    widths[w],
+                    capacities[cap], ts != 0, g, &actual, c) == 0);
+                CHECK(finish(c, 0) == cost && seen == cost);
+                CHECK(wl_columnar_relation_new_auto_governed_controlled("fresh",
+                    widths[w],
+                    capacities[cap], ts != 0, g, &reference, NULL) == 0);
+                constructor_equal(actual, reference);
+                released(actual);
+                release(c); destroy(reference); destroy(actual);
+                governor_empty(g);
+            }
+    wl_columnar_memory_governor_ref_release(g);
+}
+
+static void
+test_constructor_wide_and_stops(void)
+{
+    wl_columnar_memory_governor_ref_t *g = fresh_governor();
+    col_rel_t *actual = NULL, *reference = NULL;
+    uint64_t cost = constructor_cost("fresh", 600, 4, true);
+    CHECK(cost == 19494);
+    wl_evaluation_control_t *c = control(cost - 1);
+    CHECK(wl_columnar_relation_new_auto_governed_controlled("fresh", 600, 4,
+        true,
+        g, &actual, c) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(actual == NULL && finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT) < cost);
+    governor_empty(g);
+    wl_columnar_relation_test_constructor_checkpoint = constructor_checkpoint;
+    const int phases[] = { WL_COLUMNAR_RELATION_CONSTRUCTOR_COLUMNS_ZERO,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_NAMES_ZERO,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_COLUMN,
+                           WL_COLUMNAR_RELATION_CONSTRUCTOR_GENERATED_NAME };
+    const uint64_t points[4][3] = { { 256, 512, 600 }, { 256, 512, 600 },
+                                    { 1, 300, 600 }, { 1, 300, 600 } };
+    for (uint32_t phase = 0; phase < 4; phase++)
+        for (uint32_t point = 0; point < 3; point++) {
+            retry(c, 0);
+            constructor_cancel_phase = phases[phase];
+            constructor_cancel_progress = points[phase][point];
+            CHECK(wl_columnar_relation_new_auto_governed_controlled("fresh",
+                600, 4, true,
+                g, &actual, c) == WL_EVALUATION_CONTROL_CANCELLED);
+            CHECK(actual == NULL && finish(c,
+                WL_EVALUATION_CONTROL_CANCELLED) == seen);
+            governor_empty(g);
+        }
+    constructor_cancel_phase = 0;
+    wl_columnar_relation_test_metadata_checkpoint = metadata_checkpoint;
+    metadata_cancel_phase = WL_COLUMNAR_RELATION_METADATA_TABLE_ZERO;
+    for (uint32_t point = 0; point < 3; point++) {
+        retry(c, 0);
+        metadata_cancel_progress = points[0][point];
+        CHECK(wl_columnar_relation_new_auto_governed_controlled("fresh", 600, 4,
+            true,
+            g, &actual, c) == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(actual == NULL && finish(c,
+            WL_EVALUATION_CONTROL_CANCELLED) == seen);
+        governor_empty(g);
+    }
+    metadata_cancel_phase = WL_COLUMNAR_RELATION_METADATA_CHILD;
+    metadata_cancel_progress = 300;
+    retry(c, 0);
+    CHECK(wl_columnar_relation_new_auto_governed_controlled("fresh", 600, 4,
+        true,
+        g, &actual, c) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(actual == NULL && finish(c, WL_EVALUATION_CONTROL_CANCELLED) == seen);
+    governor_empty(g);
+    metadata_cancel_phase = 0;
+    wl_columnar_relation_test_metadata_checkpoint = NULL;
+    constructor_cancel_phase = WL_COLUMNAR_RELATION_CONSTRUCTOR_FINAL;
+    constructor_cancel_progress = 0;
+    retry(c, 0);
+    CHECK(wl_columnar_relation_new_auto_governed_controlled("fresh", 600, 4,
+        true,
+        g, &actual, c) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(actual == NULL && finish(c, WL_EVALUATION_CONTROL_CANCELLED) == cost);
+    governor_empty(g);
+    constructor_cancel_phase = 0;
+    retry(c, cost);
+    CHECK(wl_columnar_relation_new_auto_governed_controlled("fresh", 600, 4,
+        true,
+        g, &actual, c) == 0);
+    CHECK(finish(c, 0) == cost);
+    CHECK(wl_columnar_relation_new_auto_governed("fresh", 600, 4, true, g,
+        &reference) == 0);
+    constructor_equal(actual, reference);
+    release(c); destroy(reference); destroy(actual); governor_empty(g);
+    wl_columnar_memory_governor_ref_release(g);
+    wl_columnar_relation_test_constructor_checkpoint = NULL;
+}
+
+static void
+test_constructor_identity(void)
+{
+    wl_columnar_memory_governor_ref_t *g = fresh_governor();
+    wl_evaluation_control_t *c = control(0);
+    col_rel_t *r = NULL;
+    wl_columnar_relation_test_constructor_checkpoint = constructor_checkpoint;
+    wl_columnar_relation_test_before_identity_cas = consume_identity;
+    identity_failures = identity_successes = 0;
+    CHECK(wl_columnar_relation_new_auto_governed_controlled("fresh", 2, 4,
+        false,
+        g, &r, c) == 0);
+    CHECK(identity_failures == 1 && identity_successes == 1);
+    CHECK(finish(c, 0) == constructor_cost("fresh", 2, 4, false) + 1);
+    CHECK(r->relation_identity > identity_winner->relation_identity);
+    destroy(identity_winner); identity_winner = NULL; destroy(r);
+    governor_empty(g);
+    retry(c, 0);
+    identity_cancel_failure = true;
+    identity_failures = identity_successes = 0;
+    wl_columnar_relation_test_before_identity_cas = consume_identity;
+    CHECK(wl_columnar_relation_new_auto_governed_controlled("fresh", 2, 4,
+        false,
+        g, &r, c) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(r == NULL && identity_failures == 1 && identity_successes == 0);
+    CHECK(finish(c, WL_EVALUATION_CONTROL_CANCELLED) == 15);
+    uint64_t next = identity_winner->relation_identity + 1;
+    destroy(identity_winner); identity_winner = NULL; governor_empty(g);
+    identity_cancel_failure = false;
+    retry(c, 0);
+    CHECK(wl_columnar_relation_new_auto_governed_controlled("fresh", 2, 4,
+        false,
+        g, &r, c) == 0);
+    CHECK(r->relation_identity == next);
+    CHECK(finish(c, 0) == constructor_cost("fresh", 2, 4, false));
+    next = r->relation_identity + 1;
+    destroy(r); governor_empty(g);
+    /* A successful CAS followed by cancellation consumes that ID forever. */
+    constructor_cancel_phase = WL_COLUMNAR_RELATION_CONSTRUCTOR_IDENTITY;
+    constructor_cancel_progress = 1;
+    retry(c, 0);
+    CHECK(wl_columnar_relation_new_auto_governed_controlled("fresh", 2, 4,
+        false,
+        g, &r, c) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(r == NULL && finish(c, WL_EVALUATION_CONTROL_CANCELLED) == 15);
+    governor_empty(g);
+    constructor_cancel_phase = 0;
+    retry(c, 0);
+    CHECK(wl_columnar_relation_new_auto_governed_controlled("fresh", 2, 4,
+        false,
+        g, &r, c) == 0);
+    CHECK(r->relation_identity == next + 1);
+    CHECK(finish(c, 0) == constructor_cost("fresh", 2, 4, false));
+    next = r->relation_identity + 1;
+    destroy(r); governor_empty(g);
+    CHECK(col_rel_test_set_next_identity(UINT64_MAX) == 0);
+    retry(c, 0);
+    CHECK(wl_columnar_relation_new_auto_governed_controlled("fresh", 2, 4,
+        false,
+        g, &r, c) == EOVERFLOW);
+    CHECK(r == NULL && finish(c, EOVERFLOW) == 14);
+    governor_empty(g);
+    CHECK(col_rel_test_set_next_identity(next) == 0);
+    release(c); wl_columnar_memory_governor_ref_release(g);
+    wl_columnar_relation_test_constructor_checkpoint = NULL;
+}
+
+static void
+test_constructor_faults_and_long_name(void)
+{
+    wl_columnar_memory_governor_ref_t *g = fresh_governor();
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(g);
+    col_rel_t *r = NULL;
+    wl_evaluation_control_t *c = control(0);
+    const uint64_t limits[] = { 0, sizeof(col_rel_t) + 6,
+                                sizeof(col_rel_t) + 6 + 2 * sizeof(uint64_t),
+                                sizeof(col_rel_t) + 6 + 2 * sizeof(uint64_t) + 3
+                                + 2 *
+                                (sizeof(char *) + sizeof(struct ArrowSchema *) +
+                                sizeof(struct ArrowSchema) + 2) + 20 };
+    uint64_t usable = atomic_load(&governor->usable_bytes);
+    for (uint32_t i = 0; i < 4; i++) {
+        if (i)
+            retry(c, 0);
+        atomic_store(&governor->usable_bytes, limits[i]);
+        CHECK(wl_columnar_relation_new_auto_governed_controlled("fresh", 2, 4,
+            false,
+            g, &r, c) == ENOSPC);
+        CHECK(r == NULL && finish(c, ENOSPC) > 0);
+        governor_empty(g);
+    }
+    atomic_store(&governor->usable_bytes, usable);
+    for (int64_t fail = 0; fail < 11; fail++) {
+        retry(c, 0);
+        wl_columnar_relation_test_constructor_fail_allocation = fail;
+        CHECK(wl_columnar_relation_new_auto_governed_controlled("fresh", 2, 4,
+            true,
+            g, &r, c) == ENOMEM);
+        CHECK(r == NULL && finish(c, ENOMEM) > 0);
+        governor_empty(g);
+    }
+    wl_columnar_relation_test_constructor_checkpoint = constructor_checkpoint;
+    for (int fail = 1; fail <= 3; fail++) {
+        retry(c, 0);
+        constructor_committed = 0;
+        wl_columnar_relation_test_constructor_fail_commit = fail;
+        CHECK(wl_columnar_relation_new_auto_governed_controlled("fresh", 2, 4,
+            true,
+            g, &r, c) == ENOMEM);
+        CHECK(constructor_committed == (uint64_t)fail - 1);
+        CHECK(r == NULL && finish(c, ENOMEM) > 0);
+        governor_empty(g);
+    }
+    retry(c, 0);
+    CHECK(wl_columnar_relation_new_auto_governed_controlled("fresh", UINT32_MAX,
+        UINT32_MAX, true, g, &r, c) == EOVERFLOW);
+    CHECK(r == NULL && finish(c, EOVERFLOW) == 6);
+    governor_empty(g);
+    char name[701]; memset(name, 'r', 700); name[700] = 0;
+    constructor_cancel_phase = WL_COLUMNAR_RELATION_CONSTRUCTOR_NAME;
+    const uint64_t points[] = { 256, 512, 701 };
+    for (uint32_t i = 0; i < 3; i++) {
+        retry(c, 0);
+        constructor_cancel_progress = points[i];
+        CHECK(wl_columnar_relation_new_auto_governed_controlled(name, 2, 4,
+            true,
+            g, &r, c) == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(r == NULL && finish(c, WL_EVALUATION_CONTROL_CANCELLED) == seen);
+        governor_empty(g);
+    }
+    constructor_cancel_phase = 0;
+    retry(c, constructor_cost(name, 2, 4, true));
+    CHECK(wl_columnar_relation_new_auto_governed_controlled(name, 2, 4, true,
+        g, &r, c) == 0);
+    CHECK(finish(c, 0) == constructor_cost(name, 2, 4, true));
+    CHECK(strcmp(r->name, name) == 0);
+    destroy(r); governor_empty(g);
+    release(c); wl_columnar_memory_governor_ref_release(g);
+    wl_columnar_relation_test_constructor_checkpoint = NULL;
+}
+
 int
 main(void)
 {
@@ -956,6 +1314,10 @@ main(void)
     test_metadata_commit_order(false);
     test_metadata_commit_order(true);
     test_metadata_no_governor();
+    test_constructor_matrix();
+    test_constructor_wide_and_stops();
+    test_constructor_identity();
+    test_constructor_faults_and_long_name();
     puts("evaluation_work: OK");
     return 0;
 }
