@@ -7568,6 +7568,538 @@ done:
     return rc;
 }
 
+/* Mandatory single-role cleanup never observes control after a published row.
+ * Only our pending initialization may be restored, under its real descriptor
+ * writer. An independent initializer has no journal in this set. */
+static int
+wl_columnar_relation_row_finish(wl_columnar_relation_mutation_single_t *single,
+    int rc, bool restore, wl_evaluation_control_t *control)
+{
+    wl_columnar_relation_mutation_set_t *set = &single->set;
+    if (set->identity != (uintptr_t)set)
+        return wl_columnar_relation_cleanup_result(rc, EINVAL);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_single_before_cleanup)
+        wl_columnar_relation_test_single_before_cleanup(control, single);
+#else
+    (void)control;
+#endif
+    if (restore && set->initialization_count) {
+        col_rel_t *r = single->initialization.relation;
+        int valid = wl_columnar_source_access_writer_validate(
+            &single->descriptor.writer, &r->descriptor_access);
+        if (!valid) {
+            r->storage_owner = NULL;
+            r->storage_owner_identity = single->initialization.owner_identity;
+            r->storage_owner_generation =
+                single->initialization.owner_generation;
+            atomic_store_explicit(&r->storage_alias_borrows,
+                single->initialization.borrows, memory_order_relaxed);
+        }
+        rc = wl_columnar_relation_cleanup_result(rc, valid);
+    }
+    bool retired = true;
+    for (size_t i = set->owners_acquired; i > 0; i--) {
+        wl_columnar_source_access_writer_t *writer = &single->owners[i -
+                1].writer;
+        rc = wl_columnar_relation_cleanup_result(rc,
+                wl_columnar_source_access_writer_release(writer));
+        if (writer->owner)
+            retired = false;
+    }
+    if (set->descriptors_acquired) {
+        rc = wl_columnar_relation_cleanup_result(rc,
+                wl_columnar_source_access_writer_release(
+                    &single->descriptor.writer));
+        if (single->descriptor.writer.owner)
+            retired = false;
+    }
+    if (retired)
+        *single = (wl_columnar_relation_mutation_single_t){0};
+    return rc;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_relation_test_row_checkpoint)(
+    wl_evaluation_control_t *, int, uint64_t);
+bool wl_columnar_relation_test_fail_row_scratch_alloc;
+bool wl_columnar_relation_test_fail_row_scratch_commit;
+#endif
+static void
+wl_columnar_relation_row_checkpoint(wl_evaluation_control_t *control,
+    int stage, uint64_t progress)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_row_checkpoint)
+        wl_columnar_relation_test_row_checkpoint(control, stage, progress);
+#else
+    (void)control; (void)stage; (void)progress;
+#endif
+}
+
+/* One validated tuple is copied into unreachable spare cells or private growth.
+ * The prefix is always raw, including FLOAT bit patterns. */
+static int
+wl_columnar_relation_row_copy_controlled(col_rel_t *r, int64_t **columns,
+    uint32_t index, const int64_t *row, wl_evaluation_control_t *control)
+{
+    for (uint32_t c = 0; c < r->ncols; c++) {
+        uint64_t work = r->column_types ? 3u : 1u;
+        int rc = wl_evaluation_control_charge(control, work);
+        if (rc)
+            return rc;
+        int64_t value = row[c];
+        if (r->column_types && r->column_types[c] == WIRELOG_TYPE_FLOAT
+            && wl_columnar_float_bits_zero(value))
+            value = 0;
+        columns[c][index] = value;
+        wl_columnar_relation_row_checkpoint(control,
+            WL_COLUMNAR_RELATION_ROW_COPY, c + 1u);
+        rc = wl_columnar_relation_work_tail(control, work);
+        if (rc)
+            return rc;
+    }
+    return 0;
+}
+
+enum { WL_COLUMNAR_RELATION_ROW_PUBLICATION_WORK = 173 };
+typedef char wl_columnar_relation_row_publication_bound[
+        WL_COLUMNAR_RELATION_ROW_PUBLICATION_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+    ? 1 : -1];
+
+/* Fixed forward publication allowance: payload/token 64, lease/journal 48,
+ * rows/view 8, two ledger requests 48 and timestamp gauge 1, final G 4 =173.
+ * Bounds are admitted reservations, not exact processed-work telemetry. Old
+ * grids and scratch retirement are mandatory cleanup, physical before credit.
+ */
+static int
+wl_columnar_relation_row_body(col_rel_t *r, const int64_t *row,
+    wl_columnar_relation_mutation_single_t *single,
+    wl_evaluation_control_t *control)
+{
+    wl_columnar_relation_mutation_lease_t *lease = &single->lease;
+    col_rel_payload_shape_t old_shape, final_shape;
+    col_rel_payload_txn_t pending;
+    wl_columnar_memory_reservation_t previous, scratch_credit;
+    wl_columnar_mem_ledger_exclusive_prepared_t ledger_prepared;
+    int64_t inline_row[16], *scratch = NULL, **columns = NULL;
+    col_delta_timestamp_t *timestamps = NULL;
+    bool transaction = false, scratch_held = false;
+    uint64_t final_bytes = 0, ts_bytes = 0;
+    int rc = wl_evaluation_control_charge(control, 32);
+    if (rc)
+        return rc;
+    rc = col_rel_mutation_lease_validate(lease, r);
+    if (rc)
+        return rc;
+    rc = wl_columnar_relation_work_tail(control, 32);
+    if (rc)
+        return rc;
+    rc = wl_evaluation_control_charge(control, 64);
+    if (rc)
+        return rc;
+    if (!col_rel_timestamp_shape_valid(r) || r->nrows > r->capacity)
+        return EINVAL;
+    bool replaces = col_rel_append_replaces_storage(r);
+    if (r->nrows == UINT32_MAX
+        || r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+        || (replaces && r->storage_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u))
+        return EOVERFLOW;
+    if (!r->ncols && (!r->relation_identity || !r->view_generation
+        || !r->storage_generation))
+        return EINVAL;
+    if (r->col_shared || r->arena_owned || r->storage_owner != r
+        || r->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        || r->compound_count || r->inline_physical_offset
+        || r->compound_arity_map || r->compound_arity_len)
+        return ENOTSUP;
+    bool empty = !r->nrows && !r->capacity;
+    if ((r->ncols && !r->columns && !empty)
+        || (r->columns && r->columns == r->merge_columns)
+        || (r->columns && r->columns == r->retract_backup_columns)
+        || (r->merge_columns && r->merge_columns == r->retract_backup_columns)
+        || (!r->ncols && (r->merge_columns || r->retract_backup_columns)))
+        return EINVAL;
+    old_shape = (col_rel_payload_shape_t){
+        .ncols = r->ncols, .column_capacity = r->capacity,
+        .timestamp_capacity = r->timestamp_capacity,
+        .merge_capacity = r->merge_buf_cap,
+        .backup_capacity = r->retract_backup_capacity,
+        .backup_timestamp_capacity = r->retract_backup_timestamp_capacity,
+        .active_table = r->columns != NULL,
+        .merge_table = r->merge_columns != NULL,
+        .backup_table = r->retract_backup_columns != NULL,
+        .scratch = r->row_scratch != NULL,
+    };
+    rc = wl_columnar_relation_work_tail(control, 64);
+    if (rc)
+        return rc;
+    for (uint32_t c = 0; c < r->ncols; c++) {
+        uint64_t work = 1u + (r->merge_columns != NULL)
+            + (r->retract_backup_columns != NULL);
+        rc = wl_evaluation_control_charge(control, work);
+        if (rc)
+            return rc;
+        if ((!r->columns || !r->columns[c]) && !empty)
+            return EINVAL;
+        if (r->columns && r->columns[c])
+            old_shape.owned_columns++;
+        if ((r->merge_columns && !r->merge_columns[c])
+            || (r->retract_backup_columns && !r->retract_backup_columns[c]))
+            return EINVAL;
+        wl_columnar_relation_row_checkpoint(control,
+            WL_COLUMNAR_RELATION_ROW_STRUCTURE, c + 1u);
+        rc = wl_columnar_relation_work_tail(control, work);
+        if (rc)
+            return rc;
+    }
+    rc = wl_evaluation_control_charge(control, 16);
+    if (rc)
+        return rc;
+    uint64_t row_bytes, lane_bytes, table_bytes;
+    uintptr_t start = (uintptr_t)row;
+    if (!wl_columnar_memory_size_mul(r->ncols, sizeof(*row), &row_bytes)
+        || row_bytes > SIZE_MAX || row_bytes > UINTPTR_MAX - start
+        || !wl_columnar_memory_size_mul(r->capacity, sizeof(*row), &lane_bytes))
+        return EOVERFLOW;
+    rc = wl_columnar_relation_work_tail(control, 16);
+    if (rc)
+        return rc;
+    bool overlap = false;
+    for (uint32_t c = 0; r->columns && c < r->ncols; c++) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc)
+            return rc;
+        uintptr_t col = (uintptr_t)r->columns[c];
+        if (lane_bytes > SIZE_MAX || lane_bytes > UINTPTR_MAX - col)
+            return EOVERFLOW;
+        if (row_bytes && lane_bytes && start < col + lane_bytes
+            && col < start + row_bytes)
+            overlap = true;
+        wl_columnar_relation_row_checkpoint(control,
+            WL_COLUMNAR_RELATION_ROW_OVERLAP, c + 1u);
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc)
+            return rc;
+    }
+    for (uint32_t c = 0; r->column_types && c < r->ncols; c++) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc)
+            return rc;
+        if (r->column_types[c] == WIRELOG_TYPE_FLOAT
+            && !wl_columnar_float_bits_valid(row[c]))
+            return EINVAL;
+        wl_columnar_relation_row_checkpoint(control,
+            WL_COLUMNAR_RELATION_ROW_TYPES, c + 1u);
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc)
+            return rc;
+    }
+    wl_columnar_memory_reservation_init(&scratch_credit);
+    wl_columnar_memory_reservation_init(&previous);
+    if (overlap) {
+        int64_t *capture = inline_row;
+        if (r->ncols > 16) {
+            if (r->memory_governor) {
+                wl_columnar_memory_admission_status_t status;
+                rc = wl_columnar_memory_governor_reserve_checked_controlled(
+                    wl_columnar_memory_governor_ref_get(r->memory_governor),
+                    row_bytes, &scratch_credit, &status, control);
+                if (rc)
+                    goto done;
+                if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+                    && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+                    r->memory_budget_denial_pending = status ==
+                        WL_COLUMNAR_MEMORY_ADMISSION_DENIED;
+                    rc = r->memory_budget_denial_pending ? ENOMEM
+                        : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                        ? EOVERFLOW : EINVAL;
+                    goto done;
+                }
+                scratch_held = true;
+#ifdef WL_SESSION_TEST_HOOKS
+                if (wl_columnar_relation_test_fail_row_scratch_commit) {
+                    if (atomic_load(&scratch_credit.state)
+                        != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+                        || !scratch_credit.bytes)
+                        abort();
+                    wl_columnar_relation_test_fail_row_scratch_commit = false;
+                    rc = ENOMEM;
+                    goto done;
+                }
+#endif
+                bool committed;
+                rc = wl_columnar_memory_governor_commit_controlled(
+                    &scratch_credit, &scratch_credit, &committed, control);
+                if (rc)
+                    goto done;
+                if (!committed) {
+                    rc = ENOMEM;
+                    goto done;
+                }
+            }
+            rc = wl_evaluation_control_charge(control, 1);
+            if (rc)
+                goto done;
+#ifdef WL_SESSION_TEST_HOOKS
+            if (wl_columnar_relation_test_fail_row_scratch_alloc) {
+                wl_columnar_relation_test_fail_row_scratch_alloc = false;
+                rc = ENOMEM;
+                goto done;
+            }
+#endif
+            scratch = malloc((size_t)row_bytes);
+            if (!scratch) {
+                rc = ENOMEM;
+                goto done;
+            }
+            rc = wl_columnar_relation_work_tail(control, 1);
+            if (rc)
+                goto done;
+            capture = scratch;
+        }
+        for (uint32_t c = 0; c < r->ncols; c++) {
+            rc = wl_evaluation_control_charge(control, 1);
+            if (rc)
+                goto done;
+            capture[c] = row[c];
+            wl_columnar_relation_row_checkpoint(control,
+                WL_COLUMNAR_RELATION_ROW_CAPTURE, c + 1u);
+            rc = wl_columnar_relation_work_tail(control, 1);
+            if (rc)
+                goto done;
+        }
+        row = capture;
+    }
+    bool resize = r->nrows >= r->capacity;
+    bool short_ts = r->timestamps && r->nrows >= r->timestamp_capacity;
+    bool growth = resize || short_ts;
+    uint32_t capacity = resize ? (r->capacity ? r->capacity * 2u
+        : COL_REL_INIT_CAP) : r->capacity;
+    if (growth && (lease->storage_transitioned || lease->detached
+        || lease->owner != r || lease->owner_slot != lease->self_owner_slot
+        || lease->owner_generation != r->storage_generation)) {
+        rc = EINVAL;
+        goto done;
+    }
+    if (resize && capacity <= r->capacity) {
+        rc = EOVERFLOW;
+        goto done;
+    }
+    if (growth) {
+        rc = wl_evaluation_control_charge(control, 64);
+        if (rc)
+            goto done;
+        uint64_t incoming, before, after;
+        final_shape = old_shape;
+        final_shape.owned_columns = r->ncols;
+        final_shape.active_table = r->ncols != 0;
+        final_shape.column_capacity = capacity;
+        final_shape.timestamp_capacity = r->timestamps ? capacity : 0;
+        if (!col_rel_payload_shape_bytes(&final_shape, &final_bytes)
+            || !col_rel_payload_grid_bytes(r->ncols, r->ncols, capacity,
+            r->ncols != 0, &incoming)
+            || !wl_columnar_memory_size_mul(capacity, sizeof(int64_t),
+            &lane_bytes)
+            || !wl_columnar_memory_size_mul(r->ncols, sizeof(int64_t *),
+            &table_bytes)
+            || !wl_columnar_memory_size_mul(final_shape.timestamp_capacity,
+            sizeof(col_delta_timestamp_t), &ts_bytes)
+            || !wl_columnar_memory_size_add(incoming, ts_bytes, &incoming)
+            || !wl_columnar_memory_size_mul(old_shape.owned_columns,
+            r->capacity, &before)
+            || !wl_columnar_memory_size_mul(before, sizeof(int64_t), &before)
+            || !wl_columnar_memory_size_mul(r->ncols, capacity, &after)
+            || !wl_columnar_memory_size_mul(after, sizeof(int64_t), &after)
+            || lane_bytes > SIZE_MAX || table_bytes > SIZE_MAX ||
+            ts_bytes > SIZE_MAX) {
+            rc = EOVERFLOW;
+            goto done;
+        }
+        rc = wl_columnar_relation_work_tail(control, 64);
+        if (rc)
+            goto done;
+        rc = wl_columnar_relation_payload_begin_controlled(r, final_bytes,
+                incoming, &pending, &transaction, control);
+        if (rc)
+            goto done;
+        rc = wl_columnar_relation_prepare_growth_controlled(r, &old_shape,
+                capacity, lane_bytes, table_bytes, ts_bytes, !short_ts,
+                &columns, &timestamps, control);
+        if (rc)
+            goto done;
+        rc = wl_columnar_relation_ledger_prepare_exclusive(r, before, after,
+                ts_bytes, &ledger_prepared, control);
+        if (rc)
+            goto done;
+    }
+    rc = wl_columnar_relation_row_copy_controlled(r,
+            growth ? columns : r->columns, r->nrows, row, control);
+    if (rc)
+        goto done;
+    /* Nonshort growth already initialized this whole tail, including the row. */
+    if (r->timestamps && (!growth || short_ts)) {
+        rc = wl_evaluation_control_charge(control, 5);
+        if (rc)
+            goto done;
+        col_delta_timestamp_t *ts = growth ? timestamps : r->timestamps;
+        ts[r->nrows] = (col_delta_timestamp_t){0};
+        rc = wl_columnar_relation_work_tail(control, 5);
+        if (rc)
+            goto done;
+    }
+    if (single->set.initialization_count
+        && (single->set.initialization_count != 1
+        || single->initialization.relation != r
+        || wl_columnar_source_access_writer_validate(
+            &single->descriptor.writer, &r->descriptor_access))) {
+        rc = EINVAL;
+        goto done;
+    }
+    rc = wl_evaluation_control_charge(control,
+            WL_COLUMNAR_RELATION_ROW_PUBLICATION_WORK);
+    if (rc)
+        goto done;
+    wl_columnar_relation_row_checkpoint(control,
+        WL_COLUMNAR_RELATION_ROW_FINAL, 0);
+    rc = wl_columnar_relation_work_tail(control,
+            WL_COLUMNAR_RELATION_ROW_PUBLICATION_WORK);
+    if (rc)
+        goto done;
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc)
+        goto done;
+    if (transaction) {
+        rc = wl_columnar_relation_publish_payload_controlled(r, &pending,
+                final_bytes, &previous, control);
+        if (rc)
+            goto done;
+        transaction = false;
+    }
+    /* No callbacks/control after canonical credit: commit init with the row. */
+    single->set.initialization_count = 0;
+    single->initialization =
+        (wl_columnar_relation_mutation_initialization_t){0};
+    if (growth) {
+        int64_t **old_columns = r->columns;
+        col_delta_timestamp_t *old_ts = r->timestamps;
+        r->columns = columns; r->timestamps = timestamps;
+        r->capacity = capacity;
+        r->timestamp_capacity = timestamps ? capacity : 0;
+        columns = NULL; timestamps = NULL;
+        wl_columnar_relation_touch_storage(r);
+        /* The fixed single role and same-owner advancement predicates were
+         * checked before the cutoff; no generic role scan or fallible advance. */
+        lease->relation_generation = r->storage_generation;
+        lease->owner_generation = r->storage_generation;
+        lease->storage_transitioned = true;
+        single->set.published = true;
+        col_columns_free(old_columns, r->ncols);
+        free(old_ts);
+        col_rel_release_retired_reservation(&previous);
+        wl_columnar_relation_retire_payload_credit_known(r, final_bytes);
+        wl_columnar_relation_ledger_apply_exclusive(r, ts_bytes,
+            &ledger_prepared);
+    }
+    r->nrows++;
+    wl_columnar_relation_touch_view(r);
+    rc = 0;
+done:
+    col_columns_free(columns, r->ncols);
+    free(timestamps);
+    if (transaction)
+        col_rel_payload_txn_rollback(r, &pending);
+    free(scratch);
+    if (scratch_held)
+        col_rel_reservation_rollback(&scratch_credit);
+    return rc;
+}
+
+int
+wl_columnar_relation_append_row_controlled(col_rel_t *r, const int64_t *row,
+    wl_evaluation_control_t *control)
+{
+    if (!control)
+        return col_rel_append_row(r, row);
+    if (!r || !row)
+        return EINVAL;
+    wl_columnar_relation_mutation_single_t single = {0};
+    int rc = wl_columnar_relation_mutation_single_acquire_controlled(r,
+            &single, control);
+    if (rc)
+        return rc;
+    r->memory_budget_denial_pending = false;
+    rc = wl_columnar_relation_row_body(r, row, &single, control);
+    return wl_columnar_relation_row_finish(&single, rc, rc != 0, control);
+}
+
+int
+wl_columnar_relation_append_batch_begin_controlled(
+    col_rel_append_batch_t *batch,
+    col_rel_t *r, wl_evaluation_control_t *control)
+{
+    if (!control)
+        return col_rel_append_batch_begin(batch, r);
+    if (!batch || !r || batch->active)
+        return EINVAL;
+    *batch = (col_rel_append_batch_t){0};
+    int rc = wl_columnar_relation_mutation_single_acquire_controlled(r,
+            &batch->single, control);
+    if (rc)
+        return rc;
+    batch->relation = r;
+    batch->active = true;
+    return 0;
+}
+
+int
+wl_columnar_relation_append_batch_row_controlled(col_rel_append_batch_t *batch,
+    const int64_t *row, wl_evaluation_control_t *control)
+{
+    if (!control)
+        return col_rel_append_batch_row(batch, row);
+    if (!batch || !batch->active || !row)
+        return EINVAL;
+    col_rel_t *r = batch->relation;
+    if (batch->single.lease.storage_transitioned
+        && col_rel_append_replaces_storage(r)) {
+        int rc = wl_columnar_relation_row_finish(&batch->single, 0, false,
+                control);
+        batch->active = false;
+        if (rc)
+            return rc;
+        batch->controlled_row_committed = false;
+        rc = wl_columnar_relation_mutation_single_acquire_controlled(r,
+                &batch->single, control);
+        if (rc)
+            return rc;
+        batch->active = true;
+    }
+    r->memory_budget_denial_pending = false;
+    int rc = wl_columnar_relation_row_body(r, row, &batch->single, control);
+    if (!rc)
+        batch->controlled_row_committed = true;
+    return rc;
+}
+
+int
+wl_columnar_relation_append_batch_end_controlled(col_rel_append_batch_t *batch,
+    bool commit, wl_evaluation_control_t *control)
+{
+    if (!control)
+        return col_rel_append_batch_end(batch, commit);
+    if (!batch || !batch->active)
+        return 0;
+    batch->active = false;
+    if (!batch->controlled_row_committed && commit)
+        return wl_columnar_relation_mutation_single_finish_controlled(
+            &batch->single, 0, control);
+    return wl_columnar_relation_row_finish(&batch->single, 0,
+               !batch->controlled_row_committed, control);
+}
+
 int
 wl_columnar_relation_append_all_controlled(col_rel_t *dst,
     const col_rel_t *src, wl_arena_t *arena, wl_evaluation_control_t *control)

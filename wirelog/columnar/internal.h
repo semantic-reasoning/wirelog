@@ -2864,12 +2864,47 @@ typedef struct {
     wl_columnar_relation_mutation_single_t single;
     col_rel_t *relation;
     bool active;
+    /* Controlled single-role epoch: published rows commit its own journal. */
+    bool controlled_row_committed;
 } col_rel_append_batch_t;
 
 int col_rel_append_batch_begin(col_rel_append_batch_t *batch, col_rel_t *r);
 int col_rel_append_batch_row(col_rel_append_batch_t *batch,
     const int64_t *row);
 int col_rel_append_batch_end(col_rel_append_batch_t *batch, bool commit);
+
+/* Foundation subset: owned flat heap payload, including pool descriptors.
+ * External tuples remain stable throughout the call. Attached ledgers require
+ * exclusive caller writer authority. Each row commits independently; ending
+ * a batch cannot undo its already published prefix. NULL control delegates
+ * the corresponding raw operation. Unsupported alias/arena/compound shapes
+ * remain later controlled materialization work, not an engine dispatch policy.
+ */
+int wl_columnar_relation_append_row_controlled(col_rel_t *r,
+    const int64_t *row, wl_evaluation_control_t *control);
+int wl_columnar_relation_append_batch_begin_controlled(
+    col_rel_append_batch_t *batch, col_rel_t *r,
+    wl_evaluation_control_t *control);
+int wl_columnar_relation_append_batch_row_controlled(
+    col_rel_append_batch_t *batch, const int64_t *row,
+    wl_evaluation_control_t *control);
+int wl_columnar_relation_append_batch_end_controlled(
+    col_rel_append_batch_t *batch, bool commit,
+    wl_evaluation_control_t *control);
+enum {
+    WL_COLUMNAR_RELATION_ROW_STRUCTURE = 1,
+    WL_COLUMNAR_RELATION_ROW_OVERLAP,
+    WL_COLUMNAR_RELATION_ROW_TYPES,
+    WL_COLUMNAR_RELATION_ROW_CAPTURE,
+    WL_COLUMNAR_RELATION_ROW_COPY,
+    WL_COLUMNAR_RELATION_ROW_FINAL,
+};
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_relation_test_row_checkpoint)(
+    wl_evaluation_control_t *, int, uint64_t);
+extern bool wl_columnar_relation_test_fail_row_scratch_alloc;
+extern bool wl_columnar_relation_test_fail_row_scratch_commit;
+#endif
 
 int col_rel_append_row_with_lease(col_rel_t *r, const int64_t *row,
     wl_columnar_relation_mutation_lease_t *lease);
