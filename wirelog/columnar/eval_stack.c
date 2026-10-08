@@ -251,6 +251,7 @@ struct wl_columnar_eval_stack_cleanup_frame {
     wl_columnar_eval_stack_cleanup_frame_t *next;
     eval_stack_t stack;
     eval_entry_t result;
+    wl_columnar_relation_source_group_t join_sources;
     wl_columnar_memory_reservation_t reservation;
     wl_columnar_memory_governor_ref_t *governor;
 };
@@ -334,6 +335,25 @@ wl_columnar_eval_stack_cleanup_result(
     return frame ? &frame->result : NULL;
 }
 
+int
+wl_columnar_eval_stack_cleanup_join_owner(wl_col_session_t *sess,
+    eval_stack_t *stack, wl_columnar_relation_source_group_t **group,
+    eval_entry_t **result)
+{
+    if (!sess || !stack || !group || !result || !sess->cleanup_active)
+        return EINVAL;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = sess->cleanup_active;
+    if (&frame->stack != stack || frame->session != sess
+        || frame->result.rel || frame->result.continuation
+        || frame->result.seg_boundaries || frame->result.owned
+        || frame->join_sources.descriptor_count ||
+        frame->join_sources.owner_count)
+        return EBUSY;
+    *group = &frame->join_sources;
+    *result = &frame->result;
+    return 0;
+}
+
 static void
 wl_columnar_eval_stack_cleanup_continuations(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
@@ -349,7 +369,11 @@ static int
 wl_columnar_eval_stack_cleanup_dispose(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
 {
-    int result = eval_entry_dispose(&frame->result);
+    int result = wl_columnar_relation_source_group_drain(&frame->join_sources,
+            0);
+    if (result != 0)
+        return result;
+    result = eval_entry_dispose(&frame->result);
     /* Visit lower entries even if a higher one refuses. Their destruction
      * can release dependencies needed by other pending frames. */
     for (uint32_t i = frame->stack.top; i > 0; i--) {
@@ -421,6 +445,13 @@ wl_columnar_eval_stack_cleanup_retry(wl_col_session_t *sess)
         frame; frame = frame->next)
         wl_columnar_eval_stack_cleanup_continuations(frame);
     int result = 0;
+    /* Drain ALL source dependencies before attempting ANY pending image. */
+    for (wl_columnar_eval_stack_cleanup_frame_t *frame = sess->cleanup_pending;
+        frame; frame = frame->next){
+        int rc = wl_columnar_relation_source_group_drain(&frame->join_sources,
+                0);
+        if (!result) result = rc;
+    }
     wl_columnar_eval_stack_cleanup_frame_t **slot = &sess->cleanup_pending;
     while (*slot) {
         wl_columnar_eval_stack_cleanup_frame_t *frame = *slot;

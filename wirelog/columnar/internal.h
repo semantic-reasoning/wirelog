@@ -671,6 +671,46 @@ int wl_columnar_relation_mutation_single_acquire_controlled(col_rel_t *,
     wl_columnar_relation_mutation_single_t *, wl_evaluation_control_t *);
 int wl_columnar_relation_mutation_single_finish_controlled(
     wl_columnar_relation_mutation_single_t *, int, wl_evaluation_control_t *);
+/* Fixed two-input source group. Storage and tokens must remain at this address
+ * in a durable evaluator cleanup frame until every actual pin retires. */
+typedef struct {
+    col_rel_t *relation;
+    wl_columnar_source_access_reader_t reader;
+    wl_columnar_source_access_writer_t writer;
+    uint64_t prior_identity, prior_generation;
+    bool reader_held, writer_held, journal;
+} wl_columnar_relation_source_group_descriptor_t;
+typedef struct {
+    col_rel_t *owner;
+    wl_columnar_source_access_reader_t reader;
+    bool held;
+} wl_columnar_relation_source_group_owner_t;
+typedef struct {
+    wl_columnar_relation_source_group_descriptor_t descriptors[2];
+    wl_columnar_relation_source_group_owner_t owners[2];
+    uint32_t input_descriptor[2], input_owner[2];
+    uint32_t descriptor_count, owner_count;
+    bool committed;
+} wl_columnar_relation_source_group_t;
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_eval_plan_test_entry_checkpoint)(
+    wl_evaluation_control_t *);
+extern void (*wl_columnar_join_test_controlled_checkpoint)(
+    wl_evaluation_control_t *, int, uint64_t,
+    wl_columnar_relation_source_group_t *, col_rel_t *);
+#endif
+int wl_columnar_relation_source_group_acquire_controlled(
+    wl_columnar_relation_source_group_t *, col_rel_t *, col_rel_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_relation_source_group_release_readers(
+    wl_columnar_relation_source_group_t *, int);
+int wl_columnar_relation_source_group_validate_writers(
+    const wl_columnar_relation_source_group_t *);
+void wl_columnar_relation_source_group_commit(
+    wl_columnar_relation_source_group_t *);
+int wl_columnar_relation_source_group_drain(
+    wl_columnar_relation_source_group_t *, int);
+
 int col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
     const wl_columnar_relation_mutation_role_t *roles, size_t role_count,
     wl_columnar_relation_mutation_descriptor_t *descriptors,
@@ -2616,6 +2656,11 @@ wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
 eval_stack_t *
 wl_columnar_eval_stack_cleanup_stack(
     wl_columnar_eval_stack_cleanup_frame_t *frame);
+/* First controlled JOIN requires the actual top cleanup frame's stack and
+ * empty private-result slot before it may transfer any left ownership. */
+int wl_columnar_eval_stack_cleanup_join_owner(wl_col_session_t *,
+    eval_stack_t *,
+    wl_columnar_relation_source_group_t **, eval_entry_t **);
 /* Move a popped entry only into an empty result slot; clear it on transfer. */
 eval_entry_t *
 wl_columnar_eval_stack_cleanup_result(
@@ -2880,6 +2925,10 @@ int col_rel_append_batch_end(col_rel_append_batch_t *batch, bool commit);
  * the corresponding raw operation. Unsupported alias/arena/compound shapes
  * remain later controlled materialization work, not an engine dispatch policy.
  */
+/* Actual fresh private JOIN output schema BUILD, including declared FLOAT.
+ * This is not untyped append compatibility or a generic live type setter. */
+int wl_columnar_relation_join_types_controlled(col_rel_t *,
+    const wirelog_column_type_t *, wl_evaluation_control_t *);
 int wl_columnar_relation_append_row_controlled(col_rel_t *r,
     const int64_t *row, wl_evaluation_control_t *control);
 int wl_columnar_relation_append_batch_begin_controlled(

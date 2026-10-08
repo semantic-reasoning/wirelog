@@ -6537,6 +6537,235 @@ fail:
     return wl_columnar_relation_source_finish(ctx, rc, control, false);
 }
 
+int
+wl_columnar_relation_source_group_release_readers(
+    wl_columnar_relation_source_group_t *group, int rc)
+{
+    for (uint32_t i = group->owner_count; i > 0; i--) {
+        wl_columnar_relation_source_group_owner_t *owner = &group->owners[i -
+                1];
+        if (!owner->held)
+            continue;
+        int cleanup = wl_columnar_source_access_reader_release(&owner->reader);
+        if (!owner->reader.owner)
+            owner->held = false;
+        rc = wl_columnar_relation_cleanup_result(rc, cleanup);
+    }
+    for (uint32_t i = group->descriptor_count; i > 0; i--) {
+        wl_columnar_relation_source_group_descriptor_t *desc =
+            &group->descriptors[i - 1];
+        if (!desc->reader_held)
+            continue;
+        int cleanup = wl_columnar_source_access_reader_release(&desc->reader);
+        if (!desc->reader.owner)
+            desc->reader_held = false;
+        rc = wl_columnar_relation_cleanup_result(rc, cleanup);
+    }
+    return rc;
+}
+
+int
+wl_columnar_relation_source_group_validate_writers(
+    const wl_columnar_relation_source_group_t *group)
+{
+    for (uint32_t i = 0; i < group->descriptor_count; i++) {
+        const wl_columnar_relation_source_group_descriptor_t *desc =
+            &group->descriptors[i];
+        if (desc->writer_held && wl_columnar_source_access_writer_validate(
+                &desc->writer, &desc->relation->descriptor_access))
+            return EINVAL;
+        if (desc->journal && !desc->writer_held)
+            return EINVAL;
+    }
+    return 0;
+}
+
+void
+wl_columnar_relation_source_group_commit(
+    wl_columnar_relation_source_group_t *group)
+{
+    group->committed = true;
+    for (uint32_t i = 0; i < group->descriptor_count; i++)
+        group->descriptors[i].journal = false;
+}
+
+/* Mandatory cleanup has no control dependency, including pending-frame retry.
+ * Restore only own pending journals under their actual descriptor writers. */
+int
+wl_columnar_relation_source_group_drain(
+    wl_columnar_relation_source_group_t *group,
+    int rc)
+{
+    rc = wl_columnar_relation_source_group_release_readers(group, rc);
+    bool retired = true;
+    for (uint32_t i = group->descriptor_count; i > 0; i--) {
+        wl_columnar_relation_source_group_descriptor_t *desc =
+            &group->descriptors[i - 1];
+        if (desc->journal) {
+            int valid = desc->writer_held ?
+                wl_columnar_source_access_writer_validate(&desc->writer,
+                    &desc->relation->descriptor_access) : EINVAL;
+            if (!valid) {
+                desc->relation->storage_owner = NULL;
+                desc->relation->storage_owner_identity = desc->prior_identity;
+                desc->relation->storage_owner_generation =
+                    desc->prior_generation;
+                desc->journal = false;
+            }
+            rc = wl_columnar_relation_cleanup_result(rc, valid);
+            /* Genuinely lost authority cannot restore metadata. Keep that
+             * pending disposition reachable rather than pretend rollback. */
+            if (valid)
+                retired = false;
+        }
+        if (desc->writer_held) {
+            int cleanup =
+                wl_columnar_source_access_writer_release(&desc->writer);
+            if (!desc->writer.owner)
+                desc->writer_held = false;
+            rc = wl_columnar_relation_cleanup_result(rc, cleanup);
+        }
+        if (desc->reader_held || desc->writer_held)
+            retired = false;
+    }
+    for (uint32_t i = 0; i < group->owner_count; i++)
+        if (group->owners[i].held)
+            retired = false;
+    if (retired) {
+        /* Every actual token retired and every held/journal flag is false.
+         * Prior scalar snapshots are inactive and overwritten before reuse.
+         * Eleven finite map/pointer/count stores fit final group12. */
+        group->descriptors[0].relation = NULL;
+        group->descriptors[1].relation = NULL;
+        group->owners[0].owner = NULL;
+        group->owners[1].owner = NULL;
+        group->input_descriptor[0] = 0;
+        group->input_descriptor[1] = 0;
+        group->input_owner[0] = 0;
+        group->input_owner[1] = 0;
+        group->descriptor_count = 0;
+        group->owner_count = 0;
+        group->committed = false;
+    }
+    return rc;
+}
+
+int
+wl_columnar_relation_source_group_acquire_controlled(
+    wl_columnar_relation_source_group_t *group, col_rel_t *left,
+    col_rel_t *right,
+    wl_evaluation_control_t *control)
+{
+    int rc = wl_evaluation_control_charge(control, 80);
+    if (rc)
+        return rc;
+    if (!group || !left || group->descriptor_count || group->owner_count
+        || group->committed)
+        return EINVAL;
+    /*41 entry/inert/flag predicates, <=16 setup/maps and bookkeeping slack.
+     * Never treat an existing caller token as this group's new acquisition. */
+    for (uint32_t i = 0; i < 2; i++) {
+        const wl_columnar_relation_source_group_descriptor_t *desc =
+            &group->descriptors[i];
+        const wl_columnar_relation_source_group_owner_t *owner =
+            &group->owners[i];
+        if (desc->reader.owner || desc->reader.secondary_owner
+            || desc->reader.identity || desc->reader.thread_valid
+            || desc->reader.transferable ||
+            !col_rel_mutation_writer_inert(&desc->writer)
+            || desc->reader_held || desc->writer_held || desc->journal
+            || owner->reader.owner || owner->reader.secondary_owner
+            || owner->reader.identity || owner->reader.thread_valid
+            || owner->reader.transferable || owner->held)
+            return EINVAL;
+    }
+    group->descriptors[0].relation = left;
+    group->descriptor_count = 1;
+    group->input_descriptor[0] = 0;
+    group->input_descriptor[1] = 0;
+    if (right && right != left) {
+        group->descriptors[1].relation = right;
+        group->descriptor_count = 2;
+        group->input_descriptor[1] = 1;
+    }
+    rc = wl_columnar_relation_work_tail(control, 80);
+    if (rc)
+        return rc;
+    for (uint32_t i = 0; i < group->descriptor_count; i++) {
+        wl_columnar_relation_source_group_descriptor_t *desc =
+            &group->descriptors[i];
+        col_rel_t *r = desc->relation, *owner = NULL;
+        rc =
+            wl_columnar_relation_reader_acquire_controlled(
+            &r->descriptor_access,
+            &desc->reader, control);
+        desc->reader_held = desc->reader.owner != NULL;
+        if (rc)
+            return rc;
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc)
+            return rc;
+        bool initialized = r->storage_owner != NULL;
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc)
+            return rc;
+        if (!initialized) {
+            rc = wl_columnar_source_access_reader_release(&desc->reader);
+            desc->reader_held = desc->reader.owner != NULL;
+            if (rc)
+                return rc;
+            rc =
+                wl_columnar_relation_writer_acquire_controlled(
+                &r->descriptor_access,
+                &desc->writer, control);
+            desc->writer_held = desc->writer.owner != NULL;
+            if (rc)
+                return rc;
+            rc = wl_evaluation_control_charge(control, 4);
+            if (rc)
+                return rc;
+            if (!r->storage_owner) {
+                if (!r->relation_identity ||
+                    !wl_columnar_relation_generation_valid(
+                        r->storage_generation))
+                    return EINVAL;
+                desc->prior_identity = r->storage_owner_identity;
+                desc->prior_generation = r->storage_owner_generation;
+                desc->journal = true;
+                r->storage_owner = r;
+                r->storage_owner_identity = r->relation_identity;
+                r->storage_owner_generation = r->storage_generation;
+            }
+            rc = wl_columnar_relation_work_tail(control, 4);
+            if (rc)
+                return rc;
+        }
+        rc = wl_columnar_relation_resolve_controlled(r, &owner, control);
+        if (rc)
+            return rc;
+        /* <=2 comparisons and fixed mapping writes are in setup80. */
+        uint32_t slot = 0;
+        if (!group->owner_count || group->owners[0].owner != owner) {
+            slot = group->owner_count++;
+            group->owners[slot].owner = owner;
+        }
+        for (uint32_t input = 0; input < 2; input++)
+            if (group->input_descriptor[input] == i)
+                group->input_owner[input] = slot;
+    }
+    for (uint32_t i = 0; i < group->owner_count; i++) {
+        wl_columnar_relation_source_group_owner_t *owner = &group->owners[i];
+        rc =
+            wl_columnar_relation_reader_acquire_controlled(
+            &owner->owner->source_access,
+            &owner->reader, control);
+        owner->held = owner->reader.owner != NULL;
+        if (rc)
+            return rc;
+    }
+    return 0;
+}
+
 static int
 wl_columnar_relation_nonce_controlled(uint64_t *nonce,
     wl_evaluation_control_t *control)
@@ -7165,6 +7394,76 @@ wl_columnar_relation_publish_committed_metadata(col_rel_t *dst,
         pending))
         abort();
     dst->metadata_reserved_bytes = bytes;
+}
+
+int
+wl_columnar_relation_join_types_controlled(col_rel_t *out,
+    const wirelog_column_type_t *types, wl_evaluation_control_t *control)
+{
+    wirelog_column_type_t *copy = NULL;
+    struct ArrowSchema schema;
+    wl_columnar_memory_reservation_t pending, previous;
+    uint64_t bytes = 0;
+    bool schema_owned = false;
+    wl_columnar_memory_reservation_init(&pending);
+    wl_columnar_memory_reservation_init(&previous);
+    if (!control || !out || out->nrows || out->column_types
+        || (out->ncols && !types))
+        return EINVAL;
+    if (out->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
+        return EOVERFLOW;
+    struct ArrowSchema old_schema = out->schema;
+    bool old_schema_owned = out->schema_ok;
+    int rc = wl_columnar_relation_prepare_types_controlled(out, types, &copy,
+            &schema, &bytes, &pending, control);
+    if (rc)
+        goto done;
+    schema_owned = true;
+    rc = wl_evaluation_control_charge(control, 112);
+    if (rc)
+        goto done;
+    if (!wl_columnar_relation_metadata_tokens_valid(out, &pending, &previous,
+        bytes)) {
+        rc = ENOMEM;
+        goto done;
+    }
+    rc = wl_columnar_relation_work_tail(control, 112);
+    if (rc)
+        goto done;
+    if (out->memory_governor && bytes) {
+        bool committed;
+        rc = wl_columnar_memory_governor_commit_controlled(&pending, out,
+                &committed, control);
+        if (rc)
+            goto done;
+        if (!committed) {
+            rc = ENOMEM;
+            goto done;
+        }
+    }
+    wl_columnar_relation_metadata_checkpoint(control,
+        5, bytes);
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc)
+        goto done;
+    out->column_types = copy;
+    out->schema = schema;
+    out->schema_ok = true;
+    copy = NULL; schema_owned = false;
+    wl_columnar_relation_publish_committed_metadata(out, &pending, bytes,
+        &previous);
+    if (old_schema_owned)
+        ArrowSchemaRelease(&old_schema);
+    col_rel_release_retired_reservation(&previous);
+    wl_columnar_relation_touch_view(out);
+    return 0;
+done:
+    if (schema_owned)
+        ArrowSchemaRelease(&schema);
+    free(copy);
+    if (pending.bytes)
+        col_rel_reservation_rollback(&pending);
+    return rc;
 }
 
 static int

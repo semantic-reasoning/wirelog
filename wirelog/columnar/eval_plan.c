@@ -145,6 +145,9 @@ normal_eval:
             rc = wl_columnar_filter_op(op, stack, sess);
             break;
         case WL_PLAN_OP_JOIN:
+            if (sess->base.evaluation_control
+                && (sess->diff_operators_active || sess->join_batch_bytes))
+                return ENOTSUP;
             if (!sess->diff_operators_active && sess->join_batch_bytes > 0) {
                 uint32_t next_index = i;
                 int pipeline_rc = wl_columnar_join_pipeline_try_eval(rplan, i,
@@ -213,10 +216,50 @@ ordinary_join:
     return 0;
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_eval_plan_test_entry_checkpoint)(wl_evaluation_control_t *);
+#endif
+
 int
 col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
     wl_col_session_t *sess)
 {
+    if (!rplan || !stack || !sess || (rplan->op_count && !rplan->ops))
+        return EINVAL;
+    if (sess->base.evaluation_control) {
+        wl_evaluation_control_t *control = sess->base.evaluation_control;
+        int rc = wl_evaluation_control_charge(control, 32);
+        if (rc)
+            return rc;
+        /* Fixed route/mode/slot predicates (at most22); no plan/name scan.
+         * This temporary route is extended only with reviewed bounded bodies. */
+        if (rplan->op_count != 1)
+            return ENOTSUP;
+        const wl_plan_op_t *op = &rplan->ops[0];
+        if (op->op != WL_PLAN_OP_JOIN || sess->num_workers > 1
+            || sess->diff_operators_active || sess->tdd_input_run
+            || sess->tdd_subpass_active || sess->tdd_outbound_only_active
+            || sess->delta_seeded || sess->retraction_seeded
+            || sess->retraction_right_pass || sess->join_batch_bytes
+            || sess->join_output_shared_count || !sess->memory_governor
+            || op->delta_mode != WL_DELTA_FORCE_FULL
+            || op->right_filter_expr.size || op->materialized)
+            return ENOTSUP;
+        if (!stack->top || stack->top > COL_STACK_MAX
+            || stack->items[stack->top - 1].kind !=
+            WL_COLUMNAR_EVAL_ENTRY_RELATION
+            || !stack->items[stack->top - 1].rel)
+            return EINVAL;
+        if (stack->items[stack->top - 1].is_delta)
+            return ENOTSUP;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_eval_plan_test_entry_checkpoint)
+            wl_columnar_eval_plan_test_entry_checkpoint(control);
+#endif
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc)
+            return rc;
+    }
     if (!sess->tdd_input_run)
         return wl_columnar_eval_plan_body(rplan, stack, sess);
     wl_columnar_eval_tdd_run_t *run = sess->tdd_input_run;
