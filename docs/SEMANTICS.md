@@ -853,10 +853,10 @@ call.
 
 | field | written by | read by | verdict |
 |---|---|---|---|
-| `last_inserted_relation` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create`, `session_note_inserted_input` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | PRESERVE |
+| `last_inserted_relation` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create`, `session_note_inserted_input` | `col_eval_stratum_tdd_recursive`, `col_session_set_delta_cb`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | PRESERVE |
 | `pending_input_change` | `col_session_create_internal`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
-| `pending_full_input_eval` | `col_session_insert`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
-| `has_evaluated` | `col_session_snapshot_impl`, `col_session_step_impl` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
+| `pending_full_input_eval` | `col_session_insert`, `col_session_set_delta_cb`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
+| `has_evaluated` | `col_session_snapshot_impl`, `col_session_step_impl` | `col_eval_stratum_tdd_recursive`, `col_session_set_delta_cb`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
 | `snapshot_stable_valid` | `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl` | PRESERVE |
 | `delta_seeded` | `col_session_snapshot_impl`, `tdd_worker_subpass_fn` | `col_op_variable`, `col_session_snapshot_impl`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_eval_tdd_plan_prepare_inputs` | PRESERVE |
 | `last_removed_relation` | `col_session_remove_incremental`, `col_worker_session_create`, `session_retraction_cleanup` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |

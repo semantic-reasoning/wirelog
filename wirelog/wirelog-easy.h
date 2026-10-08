@@ -321,7 +321,10 @@ wirelog_easy_step(wirelog_easy_session_t *s);
  * Register a delta callback.  This eagerly builds the plan and underlying
  * session (lazy-init path), which may fail; the return value propagates
  * that error to the caller.  Symbol interning via wirelog_easy_intern() may
- * happen before OR after this call.
+ * happen before OR after this call.  Clearing the callback (a NULL @cb)
+ * keeps the inserts and removals made while it was installed and not yet
+ * evaluated: the next snapshot or step evaluates them as it would in a
+ * session that never had a callback.
  *
  * Returns: WIRELOG_OK on success, or a wirelog_error_t describing the
  * plan/session build failure.  A NULL @s returns WIRELOG_ERR_EXEC.

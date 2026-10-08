@@ -122,6 +122,17 @@ All notable changes to wirelog are documented in this file.
   as compatible with any, so only two different declared widths
   conflict.
 
+- **Clearing the delta callback keeps the staged changes intact**
+  (#2108): an insert made with a delta callback installed is staged for
+  an incremental evaluation, and unless inserts into two relations were
+  staged, only the installed callback made the next snapshot re-evaluate
+  in full.  Clearing it first sent that snapshot down the incremental
+  route: with `r(x) :- e(x).` and `n(x, count(x)) :- r(x).`, removing
+  `e(8)` and inserting `e(9)` left `r(8)` in the model, and `n(7,1)` and
+  `n(8,1)` appeared twice, in every later snapshot as well.  Clearing the
+  callback while an insert is staged now keeps the full re-evaluation the
+  callback would have made.
+
 - **Steps with a delta callback keep a rule head's own input rows**
   (#2091): with a delta callback installed, a step emptied each rule
   head it re-derived and never put back the rows the head held as input
