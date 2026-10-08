@@ -2387,6 +2387,56 @@ col_rel_payload_txn_begin(col_rel_t *r, uint64_t final_bytes,
         ? -EOVERFLOW : -EINVAL;
 }
 
+static int wl_columnar_relation_work_tail(wl_evaluation_control_t *, uint64_t);
+
+/* Execution rc and pending ownership are distinct from the legacy 0/1/-errno
+ * transaction convention. Any control failure propagates without errno mapping. */
+static int
+wl_columnar_relation_payload_begin_controlled(col_rel_t *r,
+    uint64_t final_bytes,
+    uint64_t incoming, col_rel_payload_txn_t *txn, bool *active,
+    wl_evaluation_control_t *control)
+{
+    col_rel_payload_txn_init(txn);
+    if (!r)
+        return EINVAL;
+    *active = false;
+    if (!r->memory_governor ||
+        (!incoming && final_bytes <= r->retained_reserved_bytes))
+        return 0;
+    wl_columnar_memory_admission_status_t status;
+    int rc;
+    if (r->retained_reserved_bytes && incoming) {
+        rc = wl_columnar_memory_governor_begin_growth_controlled(
+            &r->retained_reservation, incoming, &status, control);
+        if (rc != 0)
+            return rc;
+        if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+            || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            txn->growth = true; txn->incoming_bytes = incoming;
+            *active = true;
+            return 0;
+        }
+    } else if (final_bytes) {
+        rc = wl_columnar_memory_governor_reserve_checked_controlled(
+            wl_columnar_memory_governor_ref_get(r->memory_governor),
+            final_bytes, &txn->fresh, &status, control);
+        if (rc != 0)
+            return rc;
+        if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+            || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            *active = true;
+            return 0;
+        }
+    } else
+        return 0;
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED) {
+        r->memory_budget_denial_pending = true;
+        return ENOMEM;
+    }
+    return status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : EINVAL;
+}
+
 static int
 col_rel_reserve_retained_shape(col_rel_t *r, uint32_t capacity,
     uint32_t timestamp_capacity, bool allocate_grid,
@@ -2495,6 +2545,116 @@ col_rel_publish_payload_txn(col_rel_t *r, col_rel_payload_txn_t *txn,
     }
 #endif
     if (!wl_columnar_memory_commit_growth(&r->retained_reservation))
+        return ENOMEM;
+    r->retained_reserved_bytes += txn->incoming_bytes;
+    txn->growth = false;
+    return 0;
+}
+
+/* Canonical token movement cannot be allowed to fail after G's final cutoff.
+ * All destinations have been initialized by the controlled caller. */
+static int
+wl_columnar_relation_publish_retained_controlled(col_rel_t *r,
+    wl_columnar_memory_reservation_t *pending, uint64_t bytes,
+    wl_columnar_memory_reservation_t *previous_out,
+    wl_evaluation_control_t *control)
+{
+    if (!r || !pending)
+        return EINVAL;
+    if (!r->memory_governor || !bytes)
+        return 0;
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    if (wl_columnar_relation_test_fail_reservation_commit) {
+        wl_columnar_relation_test_fail_reservation_commit = false;
+        return ENOMEM;
+    }
+#endif
+    int rc = wl_evaluation_control_charge(control, 6);
+    if (rc != 0)
+        return rc;
+    uint64_t old_bytes = r->retained_reserved_bytes;
+    uint64_t state = atomic_load_explicit(&r->retained_reservation.state,
+            memory_order_acquire);
+    if (pending->identity != pending ||
+        r->retained_reservation.identity != &r->retained_reservation
+        || pending == &r->retained_reservation
+        || (old_bytes ? state != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        && state != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        : state != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+        && state != WL_COLUMNAR_MEMORY_RESERVATION_RELEASED)
+        || (previous_out &&
+        (previous_out == pending || previous_out == &r->retained_reservation
+        || previous_out->identity != previous_out
+        || (atomic_load_explicit(&previous_out->state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+        && atomic_load_explicit(&previous_out->state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_RELEASED))))
+        return ENOMEM;
+    wl_columnar_memory_reservation_t previous;
+    wl_columnar_memory_reservation_init(&previous);
+    rc = wl_columnar_relation_work_tail(control, 6);
+    if (rc != 0)
+        return rc;
+    bool committed;
+    rc = wl_columnar_memory_governor_commit_controlled(pending, r, &committed,
+            control);
+    if (rc != 0)
+        return rc;
+    if (!committed)
+        return ENOMEM;
+    /* All remaining moves are fixed, prevalidated, non-failing publication. */
+    if (old_bytes && !wl_columnar_memory_reservation_move(&previous,
+        &r->retained_reservation))
+        abort();
+    if (!wl_columnar_memory_reservation_move(&r->retained_reservation, pending))
+        abort();
+    if (old_bytes) {
+        if (previous_out) {
+            if (!wl_columnar_memory_reservation_move(previous_out, &previous))
+                abort();
+        } else
+            col_rel_release_reservation_or_abort(&previous);
+    }
+    r->retained_reserved_bytes = bytes;
+    return 0;
+}
+
+static int
+wl_columnar_relation_publish_payload_controlled(col_rel_t *r,
+    col_rel_payload_txn_t *txn, uint64_t final_bytes,
+    wl_columnar_memory_reservation_t *previous_out,
+    wl_evaluation_control_t *control)
+{
+    if (!r->memory_governor)
+        return 0;
+    if (!txn->growth)
+        return txn->fresh.bytes ?
+               wl_columnar_relation_publish_retained_controlled(r,
+                   &txn->fresh, final_bytes, previous_out, control) : 0;
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    if (wl_columnar_relation_test_fail_reservation_commit) {
+        wl_columnar_relation_test_fail_reservation_commit = false;
+        return ENOMEM;
+    }
+#endif
+    int rc = wl_evaluation_control_charge(control, 4);
+    if (rc != 0)
+        return rc;
+    if (r->retained_reservation.identity != &r->retained_reservation
+        || txn->incoming_bytes > UINT64_MAX - r->retained_reserved_bytes
+        || (previous_out && (previous_out->identity != previous_out
+        || atomic_load_explicit(&previous_out->state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY)))
+        return ENOMEM;
+    rc = wl_columnar_relation_work_tail(control, 4);
+    if (rc != 0)
+        return rc;
+    bool committed;
+    rc = wl_columnar_memory_governor_commit_growth_controlled(
+        &r->retained_reservation, &committed, control);
+    if (rc != 0)
+        return rc;
+    if (!committed)
         return ENOMEM;
     r->retained_reserved_bytes += txn->incoming_bytes;
     txn->growth = false;
@@ -6602,6 +6762,29 @@ wl_columnar_relation_metadata_checkpoint(wl_evaluation_control_t *control,
 #endif
 }
 
+static int
+wl_columnar_relation_reserve_metadata_controlled(col_rel_t *r, uint64_t bytes,
+    wl_columnar_memory_reservation_t *pending, wl_evaluation_control_t *control)
+{
+    wl_columnar_memory_reservation_init(pending);
+    if (!r->memory_governor || !bytes)
+        return 0;
+    wl_columnar_memory_admission_status_t status;
+    int rc = wl_columnar_memory_governor_reserve_checked_controlled(
+        wl_columnar_memory_governor_ref_get(r->memory_governor), bytes,
+        pending, &status, control);
+    if (rc != 0)
+        return rc;
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+        || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+        return 0;
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+        r->memory_budget_denial_pending = true;
+    wl_columnar_memory_reservation_init(pending);
+    return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+        : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : EINVAL;
+}
+
 /* The scalar metadata metric includes visited/copied characters and NUL.
  * These phase IDs stay private; only test builds expose their symbolic names. */
 static int
@@ -6772,7 +6955,8 @@ wl_columnar_relation_prepare_types_controlled(const col_rel_t *dst,
         return EOVERFLOW;
     /* Scratch is physically live beside both canonical and incoming metadata.
      * Admit it independently before allocating the length cache. */
-    rc = col_rel_reserve_metadata((col_rel_t *)dst, length_bytes, &scratch);
+    rc = wl_columnar_relation_reserve_metadata_controlled((col_rel_t *)dst,
+            length_bytes, &scratch, control);
     if (rc != 0)
         goto done;
     rc = wl_evaluation_control_charge(control, 1);
@@ -6823,7 +7007,8 @@ wl_columnar_relation_prepare_types_controlled(const col_rel_t *dst,
         if (rc != 0)
             goto done;
     }
-    rc = col_rel_reserve_metadata((col_rel_t *)dst, bytes, pending);
+    rc = wl_columnar_relation_reserve_metadata_controlled((col_rel_t *)dst,
+            bytes, pending, control);
     if (rc != 0)
         goto done;
     rc = wl_evaluation_control_charge(control, 1);
@@ -7210,10 +7395,12 @@ wl_columnar_relation_reserve_capacity_admitted_controlled(col_rel_t *r,
     if (!growth) {
         if (old_bytes <= r->retained_reserved_bytes)
             return wl_evaluation_control_charge(control, 0);
-        wl_columnar_memory_admission_status_t status =
-            wl_columnar_memory_reserve_growth(
+        wl_columnar_memory_admission_status_t status;
+        rc = wl_columnar_memory_governor_reserve_growth_controlled(
             wl_columnar_memory_governor_ref_get(r->memory_governor),
-            r->retained_reserved_bytes, old_bytes, &existing);
+            r->retained_reserved_bytes, old_bytes, &existing, &status, control);
+        if (rc != 0)
+            return rc;
         if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
             bool refusal = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED;
@@ -7227,8 +7414,9 @@ wl_columnar_relation_reserve_capacity_admitted_controlled(col_rel_t *r,
             WL_COLUMNAR_RELATION_RESERVE_FINAL, 0);
         rc = wl_evaluation_control_charge(control, 0);
         if (rc == 0)
-            rc = col_rel_publish_retained_reservation(r, &existing, old_bytes,
-                    NULL);
+            rc = wl_columnar_relation_publish_retained_controlled(r, &existing,
+                    old_bytes,
+                    NULL, control);
         if (rc != 0)
             col_rel_reservation_rollback(&existing);
         return rc;
@@ -7257,12 +7445,12 @@ wl_columnar_relation_reserve_capacity_admitted_controlled(col_rel_t *r,
         || lane_bytes > SIZE_MAX || table_bytes > SIZE_MAX ||
         ts_bytes > SIZE_MAX)
         return EOVERFLOW;
-    rc = col_rel_payload_txn_begin(r, final_bytes, incoming, &pending);
-    if (rc < 0) {
+    rc = wl_columnar_relation_payload_begin_controlled(r, final_bytes, incoming,
+            &pending, &transaction, control);
+    if (rc != 0) {
         if (denied) *denied = r->memory_budget_denial_pending;
-        return -rc;
+        return rc;
     }
-    transaction = rc > 0;
     rc = wl_columnar_relation_prepare_growth_controlled(r, &old_shape,
             requested,
             lane_bytes, table_bytes, ts_bytes, true, &columns, &timestamps,
@@ -7281,7 +7469,8 @@ wl_columnar_relation_reserve_capacity_admitted_controlled(col_rel_t *r,
     if (rc != 0)
         goto done;
     if (transaction) {
-        rc = col_rel_publish_payload_txn(r, &pending, final_bytes, &previous);
+        rc = wl_columnar_relation_publish_payload_controlled(r, &pending,
+                final_bytes, &previous, control);
         if (rc != 0)
             goto done;
         transaction = false;
@@ -7334,6 +7523,7 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
         return col_rel_append_all(dst, src, arena);
     wl_columnar_memory_reservation_init(&metadata_pending);
     wl_columnar_memory_reservation_init(&old_metadata);
+    wl_columnar_memory_reservation_init(&previous);
     if (!dst || !src || dst->ncols != src->ncols)
         return EINVAL;
     rc = wl_evaluation_control_charge(control, 0);
@@ -7547,12 +7737,10 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
         }
         (void)old_bytes; /* Validated complete old shape, including auxiliaries. */
         dst->memory_budget_denial_pending = false;
-        rc = col_rel_payload_txn_begin(dst, final_bytes, incoming, &pending);
-        if (rc < 0) {
-            rc = -rc;
+        rc = wl_columnar_relation_payload_begin_controlled(dst, final_bytes,
+                incoming, &pending, &transaction_active, control);
+        if (rc != 0)
             goto done;
-        }
-        transaction_active = true;
         rc = wl_columnar_relation_prepare_growth_controlled(dst, &old_shape,
                 new_capacity, lane_bytes, table_bytes, timestamp_bytes, false,
                 &prepared_columns, &prepared_timestamps, control);
@@ -7584,7 +7772,14 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
         rc = EINVAL;
         goto done;
     }
-    rc = wl_evaluation_control_charge(control, 0);
+    /* Admit canonical pointer/schema/row publication work BEFORE the final
+     * governor credit commitment. No charge or stop after that commitment. */
+    uint64_t publication_work = (growth ? 4u : 0u)
+        + (prepared_schema_ok ? 4u : 0u) + (count ? 2u : 0u);
+    rc = wl_evaluation_control_charge(control, publication_work);
+    if (rc != 0)
+        goto done;
+    rc = wl_columnar_relation_work_tail(control, publication_work);
     if (rc == 0 && prepared_schema_ok) {
 #ifdef WL_SESSION_TEST_HOOKS
         if (wl_columnar_relation_test_fail_metadata_commit) {
@@ -7593,17 +7788,25 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
             goto done;
         }
 #endif
-        if (metadata_pending.bytes &&
-            !wl_columnar_memory_commit(&metadata_pending, dst)) {
-            rc = ENOMEM;
-            goto done;
+        if (metadata_pending.bytes) {
+            bool committed;
+            rc =
+                wl_columnar_memory_governor_commit_controlled(&metadata_pending,
+                    dst, &committed, control);
+            if (rc != 0)
+                goto done;
+            if (!committed) {
+                rc = ENOMEM;
+                goto done;
+            }
         }
         metadata_committed = metadata_pending.bytes != 0;
         wl_columnar_relation_metadata_checkpoint(control, 5,
             metadata_pending.bytes);
     }
     if (rc == 0 && growth) {
-        rc = col_rel_publish_payload_txn(dst, &pending, final_bytes, &previous);
+        rc = wl_columnar_relation_publish_payload_controlled(dst, &pending,
+                final_bytes, &previous, control);
         if (rc != 0)
             goto done;
         transaction_active = false;
@@ -9070,13 +9273,16 @@ wl_columnar_relation_identity_controlled(uint64_t *identity,
 static int
 wl_columnar_relation_constructor_reserve(
     wl_columnar_memory_governor_ref_t *governor, uint64_t bytes,
-    wl_columnar_memory_reservation_t *token)
+    wl_columnar_memory_reservation_t *token, wl_evaluation_control_t *control)
 {
     if (!governor || !bytes)
         return 0;
-    wl_columnar_memory_admission_status_t status =
-        wl_columnar_memory_reserve_checked(
-        wl_columnar_memory_governor_ref_get(governor), bytes, token);
+    wl_columnar_memory_admission_status_t status;
+    int rc = wl_columnar_memory_governor_reserve_checked_controlled(
+        wl_columnar_memory_governor_ref_get(governor), bytes, token,
+        &status, control);
+    if (rc != 0)
+        return rc;
     if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
         || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
         return 0;
@@ -9106,7 +9312,25 @@ wl_columnar_relation_constructor_commit(col_rel_t *r,
     }
 #endif
     if (pending->bytes) {
-        if (!wl_columnar_memory_commit(pending, r))
+        /* Prevalidate the fixed move before irreversible commitment. */
+        rc = wl_evaluation_control_charge(control, 4);
+        if (rc != 0)
+            return rc;
+        uint64_t state = atomic_load_explicit(&canonical->state,
+                memory_order_acquire);
+        if (pending->identity != pending || canonical->identity != canonical
+            || (state != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+            && state != WL_COLUMNAR_MEMORY_RESERVATION_RELEASED))
+            return stage == 4 ? EINVAL : ENOMEM;
+        rc = wl_columnar_relation_work_tail(control, 4);
+        if (rc != 0)
+            return rc;
+        bool committed;
+        rc = wl_columnar_memory_governor_commit_controlled(pending, r,
+                &committed, control);
+        if (rc != 0)
+            return rc;
+        if (!committed)
             return stage == 4 ? EINVAL : ENOMEM;
         if (!wl_columnar_memory_reservation_move(canonical, pending))
             abort();
@@ -9198,7 +9422,7 @@ wl_columnar_relation_new_private_controlled(const char *name,
         goto done;
     }
     rc = wl_columnar_relation_constructor_reserve(governor, descriptor_bytes,
-            &descriptor);
+            &descriptor, control);
     if (rc != 0)
         goto done;
     if (external_slot) {
@@ -9284,7 +9508,7 @@ wl_columnar_relation_new_private_controlled(const char *name,
     r->ncols = ncols;
     r->capacity = initial_capacity;
     rc = wl_columnar_relation_constructor_reserve(governor, length_bytes,
-            &scratch);
+            &scratch, control);
     if (rc != 0)
         goto done;
     if (ncols) {
@@ -9362,11 +9586,11 @@ wl_columnar_relation_new_private_controlled(const char *name,
         }
     }
     rc = wl_columnar_relation_constructor_reserve(governor, metadata_bytes,
-            &metadata);
+            &metadata, control);
     if (rc != 0)
         goto done;
     rc = wl_columnar_relation_constructor_reserve(governor, payload_bytes,
-            &payload);
+            &payload, control);
     if (rc != 0)
         goto done;
     if (ncols) {

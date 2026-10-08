@@ -40,7 +40,7 @@ optimizer_src = files(
 # Meson deduplicates against targets that already list thread_src.
 intern_src = [
   files('../wirelog/intern.c'),
-  files('../wirelog/columnar/memory_governor.c'),
+  files('../wirelog/columnar/memory_governor.c', '../wirelog/evaluation_control.c'),
   wirelog_thread_src,
 ]
 
@@ -51,11 +51,13 @@ string_ops_src = files(
 csv_src = files(
   '../wirelog/io/csv_reader.c',
   '../wirelog/columnar/memory_governor.c',
+  '../wirelog/evaluation_control.c',
 )
 
 io_src = files(
   '../wirelog/io/csv_reader.c',
   '../wirelog/columnar/memory_governor.c',
+  '../wirelog/evaluation_control.c',
   '../wirelog/io/io_adapter.c',
   '../wirelog/io/csv_adapter.c',
   '../wirelog/io/io_ctx.c',
@@ -139,6 +141,7 @@ testlib_prod_src = files(
     '../wirelog/columnar/lftj.c',
     '../wirelog/columnar/mem_ledger.c',
     '../wirelog/columnar/memory_governor.c',
+    '../wirelog/evaluation_control.c',
     '../wirelog/columnar/merge.c',
     '../wirelog/columnar/mobius.c',
     '../wirelog/columnar/ops.c',
@@ -416,6 +419,7 @@ if get_option('enable_fuzz')
         files(
           '../wirelog/io/csv_reader.c',
           '../wirelog/columnar/memory_governor.c',
+          '../wirelog/evaluation_control.c',
           '../wirelog/intern.c',
         ),
         wirelog_thread_src,
@@ -1961,7 +1965,7 @@ test('mem_ledger_contract', test_mem_ledger_exe, suite: 'unit')
 
 test_memory_governor_exe = executable(
   'test_memory_governor',
-  files('test_memory_governor.c', '../wirelog/columnar/memory_governor.c')
+  files('test_memory_governor.c', '../wirelog/columnar/memory_governor.c', '../wirelog/evaluation_control.c')
     + thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [threads_dep],
@@ -1975,6 +1979,7 @@ test_memory_admission_arena_exe = executable(
         '../wirelog/arena/arena.c',
         '../wirelog/arena/arena_admission.c',
         '../wirelog/columnar/memory_governor.c',
+        '../wirelog/evaluation_control.c',
         '../wirelog/util/log.c',
         '../wirelog/util/log_emit.c') + thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
@@ -1987,7 +1992,7 @@ test_memory_admission_delta_exe = executable(
   files('test_memory_admission_delta.c',
         '../wirelog/columnar/delta_pool.c',
         '../wirelog/columnar/delta_pool_admission.c',
-        '../wirelog/columnar/memory_governor.c') + thread_src,
+        '../wirelog/columnar/memory_governor.c', '../wirelog/evaluation_control.c') + thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [threads_dep],
 )
@@ -1999,6 +2004,7 @@ test_memory_admission_compound_exe = executable(
         '../wirelog/arena/compound_arena.c',
         '../wirelog/arena/compound_arena_admission.c',
         '../wirelog/columnar/memory_governor.c',
+        '../wirelog/evaluation_control.c',
         '../wirelog/util/log.c',
         '../wirelog/util/log_emit.c') + thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
@@ -2048,6 +2054,7 @@ backend_src = files(
   '../wirelog/columnar/lftj.c',
   '../wirelog/columnar/mem_ledger.c',
   '../wirelog/columnar/memory_governor.c',
+  '../wirelog/evaluation_control.c',
   '../wirelog/columnar/diff_trace.c',
   '../wirelog/columnar/diff_arrangement.c',
   '../wirelog/columnar/diff_vtable.c',
@@ -2078,6 +2085,7 @@ arena_src = files(
   '../wirelog/arena/compound_arena.c',
   '../wirelog/arena/compound_arena_admission.c',
   '../wirelog/columnar/memory_governor.c',
+  '../wirelog/evaluation_control.c',
 )
 
 workqueue_src = files(
@@ -4194,6 +4202,8 @@ test_diff_arrangement_deep_copy_buckets_exe = executable(
   '../wirelog/columnar/diff_arrangement.c',
   '../wirelog/columnar/mem_ledger.c',
   '../wirelog/columnar/memory_governor.c',
+  '../wirelog/evaluation_control.c',
+  thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [threads_dep],
 )
@@ -4563,6 +4573,8 @@ test_arena_observability_exe = executable(
     '../wirelog/util/log.c',
     '../wirelog/util/log_emit.c',
   ),
+  thread_src,
+  dependencies: [threads_dep],
   include_directories: [wirelog_inc, wirelog_src_inc],
 )
 
@@ -5778,7 +5790,7 @@ endif
 
 test_io_adapter_exe = executable(
   'test_io_adapter',
-  files('test_io_adapter.c', '../wirelog/io/io_adapter.c', '../wirelog/io/csv_adapter.c', '../wirelog/io/csv_reader.c', '../wirelog/columnar/memory_governor.c', '../wirelog/io/io_ctx.c', '../wirelog/intern.c'),
+  files('test_io_adapter.c', '../wirelog/io/io_adapter.c', '../wirelog/io/csv_adapter.c', '../wirelog/io/csv_reader.c', '../wirelog/columnar/memory_governor.c', '../wirelog/evaluation_control.c', '../wirelog/io/io_ctx.c', '../wirelog/intern.c'),
   thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   c_args: ['-DWIRELOG_BUILDING'],
@@ -6078,6 +6090,7 @@ test_io_adapter_concurrent_exe = executable(
         '../wirelog/io/csv_adapter.c',
         '../wirelog/io/csv_reader.c',
         '../wirelog/columnar/memory_governor.c',
+        '../wirelog/evaluation_control.c',
         '../wirelog/io/io_ctx.c',
         '../wirelog/intern.c'),
   thread_src,
@@ -6101,6 +6114,7 @@ test_io_adapter_asan_exe = executable(
         '../wirelog/io/csv_adapter.c',
         '../wirelog/io/csv_reader.c',
         '../wirelog/columnar/memory_governor.c',
+        '../wirelog/evaluation_control.c',
         '../wirelog/io/io_ctx.c',
         '../wirelog/intern.c'),
   thread_src,
@@ -6142,6 +6156,7 @@ if io_plugin_dlopen_option == 'enabled' and not is_windows
           '../wirelog/io/csv_adapter.c',
           '../wirelog/io/csv_reader.c',
           '../wirelog/columnar/memory_governor.c',
+          '../wirelog/evaluation_control.c',
           '../wirelog/io/io_ctx.c',
           '../wirelog/intern.c'),
     thread_src,

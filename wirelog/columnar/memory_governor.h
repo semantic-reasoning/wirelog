@@ -11,6 +11,7 @@
 #define WL_COLUMNAR_MEMORY_GOVERNOR_H
 
 #include "columnar/mem_ledger.h"
+#include "evaluation_control.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -157,6 +158,50 @@ enum {
 void
 wl_columnar_memory_test_hook(wl_columnar_memory_reservation_t *reservation,
     unsigned phase);
+#endif
+
+/* Controlled forward admission requires exclusive ownership of this token;
+ * unrelated tokens may concurrently share the same governor. Outputs are valid
+ * only when execution rc is zero. Callers propagate a nonzero returned execution
+ * rc unchanged. A pending typed failure beats a later negative tail stop, but
+ * positive control accounting error before return overrides the typed failure. */
+int wl_columnar_memory_governor_reserve_checked_controlled(
+    wl_columnar_memory_governor_t *, uint64_t,
+    wl_columnar_memory_reservation_t *,
+    wl_columnar_memory_admission_status_t *, wl_evaluation_control_t *);
+int wl_columnar_memory_governor_reserve_growth_controlled(
+    wl_columnar_memory_governor_t *, uint64_t, uint64_t,
+    wl_columnar_memory_reservation_t *, wl_columnar_memory_admission_status_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_memory_governor_begin_growth_controlled(
+    wl_columnar_memory_reservation_t *, uint64_t,
+    wl_columnar_memory_admission_status_t *, wl_evaluation_control_t *);
+int wl_columnar_memory_governor_commit_controlled(
+    wl_columnar_memory_reservation_t *, const void *, bool *,
+    wl_evaluation_control_t *);
+int wl_columnar_memory_governor_commit_growth_controlled(
+    wl_columnar_memory_reservation_t *, bool *, wl_evaluation_control_t *);
+
+#if defined(WL_SESSION_TEST_HOOKS) || defined(WL_COLUMNAR_MEMORY_TEST_HOOKS)
+enum {
+    WL_COLUMNAR_MEMORY_GOVERNOR_VALIDATED = 1,
+    WL_COLUMNAR_MEMORY_GOVERNOR_CLAIMED,
+    WL_COLUMNAR_MEMORY_GOVERNOR_SNAPSHOT,
+    WL_COLUMNAR_MEMORY_GOVERNOR_PREPARED,
+    WL_COLUMNAR_MEMORY_GOVERNOR_ADMITTED,
+    WL_COLUMNAR_MEMORY_GOVERNOR_RESERVED,
+    WL_COLUMNAR_MEMORY_GOVERNOR_COMMITTING,
+    WL_COLUMNAR_MEMORY_GOVERNOR_COMMIT_CUTOFF,
+    WL_COLUMNAR_MEMORY_GOVERNOR_VERDICT
+};
+extern void (*wl_columnar_memory_governor_test_work_checkpoint)(
+    wl_evaluation_control_t *, uint64_t);
+extern void (*wl_columnar_memory_governor_test_checkpoint)(
+    wl_evaluation_control_t *, wl_columnar_memory_reservation_t *, unsigned);
+extern void (*wl_columnar_memory_governor_test_before_total_cas)(
+    wl_evaluation_control_t *, wl_columnar_memory_governor_t *, uint64_t, bool);
+extern void (*wl_columnar_memory_governor_test_after_total_cas)(
+    wl_evaluation_control_t *, wl_columnar_memory_governor_t *, bool, bool);
 #endif
 
 /* Initialize a caller-owned token before its first reserve or reuse.
