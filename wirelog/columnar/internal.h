@@ -2869,6 +2869,23 @@ void col_rel_retire_payload_credit(col_rel_t *r);
 int
 col_rel_reserve_capacity_admitted(col_rel_t *r, uint32_t new_cap,
     bool *denied);
+/* Unpublished/exclusive raw writer authority; does not advance a mutation lease. */
+int
+wl_columnar_relation_reserve_capacity_admitted_controlled(col_rel_t *r,
+    uint32_t new_cap, bool *denied, wl_evaluation_control_t *control);
+enum {
+    WL_COLUMNAR_RELATION_RESERVE_SHAPE = 1,
+    WL_COLUMNAR_RELATION_RESERVE_COLUMN,
+    WL_COLUMNAR_RELATION_RESERVE_CELLS,
+    WL_COLUMNAR_RELATION_RESERVE_TIMESTAMP_LIVE,
+    WL_COLUMNAR_RELATION_RESERVE_TIMESTAMP_ZERO,
+    WL_COLUMNAR_RELATION_RESERVE_FINAL,
+};
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_relation_test_reserve_checkpoint)(
+    wl_evaluation_control_t *, int, uint64_t);
+#endif
+
 int
 col_rel_enable_timestamps(col_rel_t *rel);
 /* Enable timestamp storage while the canonical owner writer is held.

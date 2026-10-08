@@ -2619,6 +2619,343 @@ test_pool_fallback_nullary_and_shapes(void)
     wl_columnar_memory_governor_ref_release(g);
 }
 
+static col_rel_t *
+reserve_image(wl_columnar_memory_governor_ref_t *g)
+{
+    col_rel_t *r = col_rel_new_auto("reserve-image", 300);
+    CHECK(r != NULL);
+    wirelog_column_type_t types[300];
+    for (uint32_t c = 0; c < 300;
+        c++) types[c] = c ? WIRELOG_TYPE_INT64 : WIRELOG_TYPE_FLOAT;
+    CHECK(col_rel_set_column_types(r, types, 300) == 0);
+    CHECK(col_rel_reserve_capacity_admitted(r, 320, NULL) == 0);
+    CHECK(col_rel_enable_timestamps(r) == 0);
+    r->timestamps = realloc(r->timestamps, 380 * sizeof(*r->timestamps));
+    CHECK(r->timestamps); r->timestamp_capacity = 380; r->nrows = 300;
+    for (uint32_t c = 0; c < 300; c++)
+        for (uint32_t row = 0; row < 300;
+            row++) r->columns[c][row] = (int64_t)c * 10000 + row;
+    r->columns[0][0] = INT64_MIN;
+    r->columns[0][1] = INT64_C(0x7ff8000000000001);
+    for (uint32_t row = 0; row < 380; row++) {
+        r->timestamps[row].iteration = row + 1;
+        r->timestamps[row].stratum = row + 2;
+        r->timestamps[row].worker = row + 3; r->timestamps[row]._reserved = 4;
+        r->timestamps[row].multiplicity = row + 5;
+    }
+    CHECK(col_rel_reserve_merge_grid(r, 4) == 0); r->merge_columns[0][0] = 77;
+    r->retract_backup_columns = col_columns_alloc(300, 2);
+    r->retract_backup_timestamps = calloc(2,
+            sizeof(*r->retract_backup_timestamps));
+    CHECK(r->retract_backup_columns && r->retract_backup_timestamps);
+    r->retract_backup_capacity = 2; r->retract_backup_nrows = 1;
+    r->retract_backup_timestamp_capacity = 2;
+    r->retract_backup_columns[0][0] = 88;
+    r->base_nrows = 111; r->sorted_nrows = 200; r->run_count = 2;
+    r->run_ends[0] = 100; r->run_ends[1] = 300;
+    r->declared_ncols = 299; r->has_graph_column = true; r->graph_col_idx = 299;
+    if (g) CHECK(col_rel_attach_memory_governor(r, g) == 0);
+    return r;
+}
+
+static void
+reserve_equal(const col_rel_t *a, const col_rel_t *b)
+{
+    CHECK(a->capacity == b->capacity && a->ncols == b->ncols &&
+        a->nrows == b->nrows);
+    CHECK(a->view_generation == b->view_generation &&
+        a->storage_generation == b->storage_generation);
+    CHECK(a->retained_reserved_bytes == b->retained_reserved_bytes);
+    CHECK(a->declared_ncols == b->declared_ncols &&
+        a->graph_col_idx == b->graph_col_idx &&
+        a->has_graph_column == b->has_graph_column);
+    CHECK(a->base_nrows == b->base_nrows &&
+        a->sorted_nrows == b->sorted_nrows && a->run_count == b->run_count);
+    for (uint32_t i = 0; i < COL_MAX_RUNS;
+        i++) CHECK(a->run_ends[i] == b->run_ends[i]);
+    for (uint32_t c = 0; c < a->ncols; c++) {
+        CHECK(a->column_types[c] == b->column_types[c]);
+        CHECK(strcmp(a->col_names[c], b->col_names[c]) == 0 &&
+            strcmp(a->schema.children[c]->format,
+            b->schema.children[c]->format) == 0);
+        for (uint32_t row = 0; row < a->nrows;
+            row++) CHECK(a->columns[c][row] == b->columns[c][row]);
+    }
+    CHECK(a->timestamp_capacity == b->timestamp_capacity);
+    for (uint32_t row = 0; row < a->timestamp_capacity; row++) {
+        CHECK(a->timestamps[row].iteration == b->timestamps[row].iteration &&
+            a->timestamps[row].stratum == b->timestamps[row].stratum &&
+            a->timestamps[row].worker == b->timestamps[row].worker &&
+            a->timestamps[row]._reserved == b->timestamps[row]._reserved &&
+            a->timestamps[row].multiplicity == b->timestamps[row].multiplicity);
+    }
+    CHECK(a->merge_columns[0][0] == 77 && b->merge_columns[0][0] == 77 &&
+        a->retract_backup_columns[0][0] == 88 &&
+        b->retract_backup_columns[0][0] == 88);
+}
+
+static int reserve_cancel_phase, reserve_chunk_phase;
+static uint64_t reserve_cancel_progress, reserve_chunk_size;
+static bool reserve_stage_reached;
+static void
+reserve_checkpoint(wl_evaluation_control_t *c, int phase, uint64_t progress)
+{
+    if (phase == reserve_chunk_phase) {
+        reserve_stage_reached = true; cancel_at = seen + reserve_chunk_size;
+    }
+    if (phase == reserve_cancel_phase && progress >= reserve_cancel_progress) {
+        reserve_stage_reached = true; wl_evaluation_control_request_cancel(c);
+    }
+}
+
+static uint64_t
+reserve_cost(const col_rel_t *r, uint32_t target)
+{
+    return (r->columns ? r->ncols : 0) + (r->ncols ? 1u : 0u)
+           + (uint64_t)r->ncols * (1u + r->nrows)
+           + (r->timestamps ? 1u + 5u * (uint64_t)target : 0u) + 4u;
+}
+
+static void
+test_reserve_owned_atomic(void)
+{
+    wl_columnar_memory_governor_ref_t *g = fresh_governor();
+    for (uint32_t managed = 0; managed < 2; managed++) {
+        col_rel_t *r = reserve_image(managed ? g : NULL);
+        col_rel_t *reference = reserve_image(managed ? g : NULL);
+        wl_mem_ledger_t ledger;
+        wl_mem_ledger_init(&ledger, 0);
+        uint64_t relation_bytes = (uint64_t)r->ncols * r->capacity *
+            sizeof(int64_t);
+        uint64_t timestamp_bytes = (uint64_t)r->timestamp_capacity *
+            sizeof(*r->timestamps);
+        wl_mem_ledger_alloc(&ledger, WL_MEM_SUBSYS_RELATION, relation_bytes);
+        wl_mem_ledger_alloc(&ledger, WL_MEM_SUBSYS_TIMESTAMP, timestamp_bytes);
+        r->mem_ledger = &ledger; r->ledger_ts_bytes = timestamp_bytes;
+        wl_mem_ledger_t ledger_before = ledger;
+        col_rel_t before = *r;
+        uint64_t baseline =
+            atomic_load(&wl_columnar_memory_governor_ref_get(
+                    g)->reserved_bytes);
+        uint64_t cost = reserve_cost(r, 351);
+        wl_evaluation_control_t *c = control(cost - 1);
+        bool denied = true;
+        CHECK(wl_columnar_relation_reserve_capacity_admitted_controlled(r, 351,
+            &denied, c) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        CHECK(!denied && r->columns == before.columns &&
+            r->timestamps == before.timestamps &&
+            r->capacity == before.capacity &&
+            r->storage_generation == before.storage_generation);
+        finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT);
+        CHECK(atomic_load(&wl_columnar_memory_governor_ref_get(
+                g)->reserved_bytes) == baseline);
+        wl_columnar_relation_test_reserve_checkpoint = reserve_checkpoint;
+        const int phases[] = { WL_COLUMNAR_RELATION_RESERVE_SHAPE,
+                               WL_COLUMNAR_RELATION_RESERVE_COLUMN,
+                               WL_COLUMNAR_RELATION_RESERVE_CELLS,
+                               WL_COLUMNAR_RELATION_RESERVE_TIMESTAMP_LIVE,
+                               WL_COLUMNAR_RELATION_RESERVE_TIMESTAMP_ZERO,
+                               WL_COLUMNAR_RELATION_RESERVE_FINAL };
+        for (uint32_t i = 0; i < 6; i++) {
+            retry(c, 0); reserve_stage_reached = false;
+            reserve_cancel_phase = i == 0 || i == 1 || i == 5 ? phases[i] : 0;
+            reserve_cancel_progress = i == 0 || i == 1 ? 150 : 0;
+            reserve_chunk_phase = i >= 2 && i <= 4 ? phases[i] : 0;
+            reserve_chunk_size = i == 2 ? 256 : 255;
+            CHECK(wl_columnar_relation_reserve_capacity_admitted_controlled(r,
+                351, &denied, c) == WL_EVALUATION_CONTROL_CANCELLED);
+            CHECK(reserve_stage_reached && !denied &&
+                !r->memory_budget_denial_pending);
+            CHECK(r->columns == before.columns &&
+                r->timestamps == before.timestamps &&
+                r->capacity == before.capacity &&
+                r->storage_generation == before.storage_generation);
+            finish(c, WL_EVALUATION_CONTROL_CANCELLED);
+            CHECK(atomic_load(&wl_columnar_memory_governor_ref_get(
+                    g)->reserved_bytes) == baseline);
+            reserve_equal(r, reference);
+            CHECK(memcmp(&ledger, &ledger_before, sizeof(ledger)) == 0);
+        }
+        reserve_cancel_phase = reserve_chunk_phase = 0;
+        if (managed) {
+            retry(c, 0);
+            wl_columnar_relation_test_fail_next_reservation_commit();
+            CHECK(wl_columnar_relation_reserve_capacity_admitted_controlled(r,
+                351, &denied, c) == ENOMEM);
+            CHECK(!denied && finish(c, ENOMEM) == cost);
+            CHECK(r->columns == before.columns &&
+                r->capacity == before.capacity);
+            CHECK(atomic_load(&wl_columnar_memory_governor_ref_get(
+                    g)->reserved_bytes) == baseline);
+            wl_columnar_memory_governor_t *governor =
+                wl_columnar_memory_governor_ref_get(g);
+            uint64_t usable = atomic_load(&governor->usable_bytes);
+            atomic_store(&governor->usable_bytes, baseline);
+            retry(c, 0);
+            CHECK(wl_columnar_relation_reserve_capacity_admitted_controlled(r,
+                351, &denied, c) == ENOMEM);
+            CHECK(denied && r->memory_budget_denial_pending); finish(c, ENOMEM);
+            atomic_store(&governor->usable_bytes, usable);
+        }
+        retry(c, 0); wl_columnar_relation_test_fail_prepare_resize = true;
+        CHECK(wl_columnar_relation_reserve_capacity_admitted_controlled(r, 351,
+            &denied, c) == ENOMEM);
+        CHECK(!denied && !r->memory_budget_denial_pending); finish(c, ENOMEM);
+        retry(c, cost);
+        wl_columnar_source_access_writer_t writer = { 0 };
+        CHECK(col_rel_source_writer_acquire(r, &writer) == 0);
+        CHECK(wl_columnar_relation_reserve_capacity_admitted_controlled(r, 351,
+            &denied, c) == 0);
+        CHECK(wl_columnar_source_access_writer_release(&writer) == 0);
+        CHECK(!denied && finish(c, 0) == cost);
+        CHECK(wl_columnar_relation_reserve_capacity_admitted_controlled(
+                reference, 351, NULL, NULL) == 0);
+        reserve_equal(r, reference);
+        CHECK(r->capacity == 351 &&
+            r->view_generation == before.view_generation &&
+            r->storage_generation == before.storage_generation + 1);
+        CHECK(r->column_types == before.column_types &&
+            r->col_names == before.col_names &&
+            r->schema.children == before.schema.children &&
+            r->merge_columns == before.merge_columns &&
+            r->retract_backup_columns == before.retract_backup_columns &&
+            r->row_scratch == before.row_scratch);
+        CHECK(atomic_load(&ledger.current_bytes) ==
+            (uint64_t)300 * 351 * sizeof(int64_t)
+            + (uint64_t)351 * sizeof(*r->timestamps));
+        CHECK(r->ledger_ts_bytes == (uint64_t)351 * sizeof(*r->timestamps));
+        wl_columnar_relation_test_reserve_checkpoint = NULL;
+        destroy(r); CHECK(atomic_load(&ledger.current_bytes) == 0);
+        destroy(reference); release(c); governor_empty(g);
+    }
+    wl_columnar_memory_governor_ref_release(g);
+}
+
+static void
+test_reserve_no_growth_and_empty(void)
+{
+    wl_columnar_memory_governor_ref_t *g = fresh_governor();
+    col_rel_t *r = relation(2, 4, 0, true, g);
+    col_rel_t *alias = relation(2, 4, 0, false, g);
+    CHECK(col_rel_install_shared_view(alias, r) == 0);
+    uint64_t storage = r->storage_generation;
+    r->storage_generation = WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+    r->storage_owner_generation = r->storage_generation;
+    /* Alias binding must continue to refer to the original storage epoch. */
+    alias->storage_owner_generation = r->storage_generation;
+    wl_evaluation_control_t *c = control(2); bool denied = true;
+    CHECK(wl_columnar_relation_reserve_capacity_admitted_controlled(r, 4,
+        &denied, c) == 0);
+    CHECK(!denied && finish(c, 0) == 2);
+    retry(c, 0);
+    CHECK(wl_columnar_relation_reserve_capacity_admitted_controlled(r, 5,
+        &denied, c) == EBUSY);
+    CHECK(!denied); finish(c, EBUSY);
+    /* Real existing unadmitted payload, with aliases and exhausted generation. */
+    CHECK(wl_columnar_memory_release(&r->retained_reservation));
+    r->retained_reserved_bytes = 0;
+    uint64_t baseline =
+        atomic_load(&wl_columnar_memory_governor_ref_get(g)->reserved_bytes);
+    wl_columnar_relation_test_reserve_checkpoint = reserve_checkpoint;
+    reserve_cancel_phase = WL_COLUMNAR_RELATION_RESERVE_FINAL;
+    reserve_cancel_progress = 0;
+    retry(c, 0);
+    CHECK(wl_columnar_relation_reserve_capacity_admitted_controlled(r, 4,
+        &denied, c) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(!denied && r->retained_reserved_bytes == 0);
+    finish(c, WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(atomic_load(&wl_columnar_memory_governor_ref_get(
+            g)->reserved_bytes) == baseline);
+    reserve_cancel_phase = 0;
+    retry(c, 0); wl_columnar_relation_test_fail_next_reservation_commit();
+    CHECK(wl_columnar_relation_reserve_capacity_admitted_controlled(r, 4,
+        &denied, c) == ENOMEM);
+    CHECK(!denied && !r->memory_budget_denial_pending &&
+        r->retained_reserved_bytes == 0);
+    CHECK(finish(c, ENOMEM) == 2);
+    CHECK(atomic_load(&wl_columnar_memory_governor_ref_get(
+            g)->reserved_bytes) == baseline);
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(g);
+    uint64_t usable = atomic_load(&governor->usable_bytes);
+    atomic_store(&governor->usable_bytes, baseline);
+    retry(c, 0);
+    CHECK(wl_columnar_relation_reserve_capacity_admitted_controlled(r, 4,
+        &denied, c) == ENOMEM);
+    CHECK(denied && r->memory_budget_denial_pending); finish(c, ENOMEM);
+    atomic_store(&governor->usable_bytes, usable);
+    retry(c, 2);
+    CHECK(wl_columnar_relation_reserve_capacity_admitted_controlled(r, 4,
+        &denied, c) == 0);
+    CHECK(!denied && r->retained_reserved_bytes > 0 && finish(c, 0) == 2);
+    CHECK(r->storage_generation == WL_COLUMNAR_REL_GENERATION_INVALID - 1u);
+    wl_columnar_relation_test_reserve_checkpoint = NULL;
+    retry(c, 0);
+    CHECK(wl_columnar_relation_reserve_capacity_admitted_controlled(alias, 4,
+        &denied, c) == 0 && !denied);
+    CHECK(finish(c, 0) == 0);
+    r->storage_generation = storage; r->storage_owner_generation = storage;
+    alias->storage_owner_generation = storage;
+    destroy(alias);
+    r->storage_generation = WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+    retry(c, 0);
+    CHECK(wl_columnar_relation_reserve_capacity_admitted_controlled(r, 5,
+        &denied, c) == EOVERFLOW && !denied);
+    finish(c, EOVERFLOW); r->storage_generation = storage;
+    destroy(r); release(c); governor_empty(g);
+    for (uint32_t width = 0; width < 2; width++) {
+        r = relation(width, 0, 0, false, g);
+        /* Supported empty absent grid, with actual retained credit retired. */
+        if (r->retained_reserved_bytes) {
+            CHECK(wl_columnar_memory_release(&r->retained_reservation));
+            r->retained_reserved_bytes = 0;
+        }
+        col_columns_free(r->columns, width); r->columns = NULL;
+        c = control(reserve_cost(r, 7));
+        CHECK(wl_columnar_relation_reserve_capacity_admitted_controlled(r, 7,
+            &denied, c) == 0);
+        CHECK(!denied && r->capacity == 7 && finish(c, 0) == (width ? 6 : 4));
+        if (width) CHECK(r->columns && r->columns[0]);
+        destroy(r); release(c); governor_empty(g);
+    }
+    r = relation(1, 4, 0, false, g);
+    delta_pool_t *pool = delta_pool_create(1, sizeof(col_rel_t), 32);
+    col_rel_t *pooled = NULL;
+    CHECK(pool && wl_columnar_relation_pool_new_like_governed_checked(&pooled,
+        pool, "reserve-pooled", r, g) == 0);
+    c = control(reserve_cost(pooled, 77));
+    CHECK(wl_columnar_relation_reserve_capacity_admitted_controlled(pooled, 77,
+        &denied, c) == 0);
+    CHECK(pooled->pool_owned && !pooled->arena_owned &&
+        pooled->capacity == 77 && finish(c, 0) == 7);
+    destroy(pooled); delta_pool_destroy(pool); destroy(r); release(c);
+    governor_empty(g);
+    /* Genuine arena-backed no-growth is a no-op, growth remains excluded. */
+    wl_arena_t *arena = wl_arena_create(4096);
+    pool = delta_pool_create(1, sizeof(col_rel_t), 32);
+    CHECK(arena && pool);
+    r = col_rel_pool_new_auto(pool, arena, "reserve-arena", 1);
+    CHECK(r && r->arena_owned);
+    c = control(0); int64_t **arena_columns = r->columns;
+    CHECK(wl_columnar_relation_reserve_capacity_admitted_controlled(r,
+        r->capacity, &denied, c) == 0);
+    CHECK(!denied && finish(c, 0) == 0 && r->columns == arena_columns);
+    retry(c, 0);
+    CHECK(wl_columnar_relation_reserve_capacity_admitted_controlled(r,
+        r->capacity + 1, &denied, c) == ENOTSUP);
+    CHECK(!denied && finish(c, ENOTSUP) == 0 && r->columns == arena_columns);
+    destroy(r); delta_pool_destroy(pool); wl_arena_destroy(arena); release(c);
+    CHECK(col_rel_alloc(&r, "reserve-overflow") == 0);
+    r->ncols = UINT32_MAX;
+    c = control(0);
+    CHECK(wl_columnar_relation_reserve_capacity_admitted_controlled(r,
+        UINT32_MAX, &denied, c) == EOVERFLOW);
+    CHECK(!denied && finish(c,
+        EOVERFLOW) == 0 && r->columns == NULL && r->capacity == 0);
+    r->ncols = 0; destroy(r); release(c);
+    wl_columnar_memory_governor_ref_release(g);
+}
+
 int
 main(void)
 {
@@ -2656,6 +2993,8 @@ main(void)
     test_logical_invalid_runs_and_failures();
     test_pool_real_slot_stops_and_faults();
     test_pool_fallback_nullary_and_shapes();
+    test_reserve_owned_atomic();
+    test_reserve_no_growth_and_empty();
     puts("evaluation_work: OK");
     return 0;
 }
