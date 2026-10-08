@@ -1957,7 +1957,8 @@ test('memory_admission_intern', test_memory_admission_intern_exe,
 # accounting-only; reservation/admission is owned by the #1368/#1369 units.
 test_mem_ledger_exe = executable(
   'test_mem_ledger',
-  files('test_mem_ledger.c', '../wirelog/columnar/mem_ledger.c') + thread_src,
+  files('test_mem_ledger.c', '../wirelog/columnar/mem_ledger.c',
+        '../wirelog/evaluation_control.c') + thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [threads_dep],
 )

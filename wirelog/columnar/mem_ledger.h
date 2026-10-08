@@ -18,6 +18,8 @@
 #ifndef WL_COLUMNAR_MEM_LEDGER_H
 #define WL_COLUMNAR_MEM_LEDGER_H
 
+#include "evaluation_control.h"
+#include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -218,6 +220,56 @@ typedef struct wl_mem_ledger {
     wl_mem_reclaimer_slot_t reclaimers[WL_MEM_LEDGER_MAX_RECLAIMERS];
     wl_mem_reclaimer_handle_t next_reclaimer_handle;
 } wl_mem_ledger_t;
+
+/* Caller owns exclusive ledger writer authority through prepare and apply.
+ * These are requested deltas, never snapshots of mutable counters. Raw/shared
+ * ledger APIs retain their independent atomic/CAS semantics. */
+typedef struct {
+    int subsystem;
+    uint64_t bytes;
+    bool allocate;
+} wl_columnar_mem_ledger_exclusive_request_t;
+
+typedef struct {
+    wl_mem_ledger_t *ledger;
+    uint32_t count;
+    wl_columnar_mem_ledger_exclusive_request_t requests[2];
+} wl_columnar_mem_ledger_exclusive_prepared_t;
+
+/* Per request: <=8 validation/copy/loop actions and <=24 current-counter
+ * arithmetic/load/store actions at apply. Fixed validation/descriptor setup is8.
+ * Admission covers future apply before the caller's final publication cutoff. */
+static inline int
+wl_columnar_mem_ledger_prepare_exclusive_controlled(wl_mem_ledger_t *ledger,
+    const wl_columnar_mem_ledger_exclusive_request_t *requests, uint32_t count,
+    wl_columnar_mem_ledger_exclusive_prepared_t *out,
+    wl_evaluation_control_t *control)
+{
+    if (!out || count > 2 || (count && !requests))
+        return EINVAL;
+    out->ledger = NULL;
+    out->count = 0;
+    if (!ledger || count == 0)
+        return 0;
+    int rc = control ? wl_evaluation_control_charge(control,
+            8u + 32u * count) : 0;
+    if (rc != 0)
+        return rc;
+    for (uint32_t i = 0; i < count; i++) {
+        if (requests[i].subsystem < 0 ||
+            requests[i].subsystem >= WL_MEM_SUBSYS_COUNT)
+            return EINVAL;
+        out->requests[i] = requests[i];
+    }
+    out->ledger = ledger;
+    out->count = count;
+    return 0;
+}
+
+/* Non-failing, callback-free, no control calls or CAS retries. Exclusivity is
+ * an internal caller obligation; current counters are read only at apply. */
+void wl_columnar_mem_ledger_apply_exclusive(
+    const wl_columnar_mem_ledger_exclusive_prepared_t *prepared);
 
 /*
  * wl_mem_ledger_snapshot_t: plain (non-atomic) copy of a ledger, taken by

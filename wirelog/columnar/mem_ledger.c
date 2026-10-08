@@ -191,6 +191,52 @@ wl_mem_ledger_free(wl_mem_ledger_t *ledger, int subsys, uint64_t bytes)
     counter_sub_clamped(&ledger->current_bytes, bytes);
 }
 
+void
+wl_columnar_mem_ledger_apply_exclusive(
+    const wl_columnar_mem_ledger_exclusive_prepared_t *prepared)
+{
+    if (!prepared || !prepared->ledger)
+        return;
+    wl_mem_ledger_t *ledger = prepared->ledger;
+    for (uint32_t i = 0; i < prepared->count; i++) {
+        const wl_columnar_mem_ledger_exclusive_request_t *request =
+            &prepared->requests[i];
+        uint64_t bytes = request->bytes;
+        if (!bytes)
+            continue;
+        int subsystem = request->subsystem;
+        uint64_t sub = atomic_load_explicit(&ledger->subsys_bytes[subsystem],
+                memory_order_relaxed);
+        uint64_t total;
+        if (request->allocate) {
+            sub = UINT64_MAX - sub < bytes ? UINT64_MAX : sub + bytes;
+            atomic_store_explicit(&ledger->subsys_bytes[subsystem], sub,
+                memory_order_relaxed);
+            uint64_t peak =
+                atomic_load_explicit(&ledger->subsys_peak[subsystem],
+                    memory_order_relaxed);
+            atomic_store_explicit(&ledger->subsys_peak[subsystem],
+                peak < sub ? sub : peak, memory_order_relaxed);
+            total = atomic_load_explicit(&ledger->current_bytes,
+                    memory_order_relaxed);
+            total = UINT64_MAX - total < bytes ? UINT64_MAX : total + bytes;
+            atomic_store_explicit(&ledger->current_bytes, total,
+                memory_order_relaxed);
+            peak = atomic_load_explicit(&ledger->peak_bytes,
+                    memory_order_relaxed);
+            atomic_store_explicit(&ledger->peak_bytes,
+                peak < total ? total : peak, memory_order_relaxed);
+        } else {
+            atomic_store_explicit(&ledger->subsys_bytes[subsystem],
+                bytes > sub ? 0 : sub - bytes, memory_order_relaxed);
+            total = atomic_load_explicit(&ledger->current_bytes,
+                    memory_order_relaxed);
+            atomic_store_explicit(&ledger->current_bytes,
+                bytes > total ? 0 : total - bytes, memory_order_relaxed);
+        }
+    }
+}
+
 int
 wl_mem_ledger_register_reclaimer(wl_mem_ledger_t *ledger,
     wl_mem_reclaimer_fn fn, void *owner, wl_mem_reclaimer_handle_t *out)

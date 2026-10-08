@@ -2889,6 +2889,9 @@ int
 col_rel_reserve_capacity_admitted(col_rel_t *r, uint32_t new_cap,
     bool *denied);
 /* Unpublished/exclusive raw writer authority; does not advance a mutation lease. */
+/* Controlled callers must own exclusive writer authority for any attached
+ * mem_ledger for the entire call. Configured multiworker engine enablement must
+ * be refused before worker/TDD setup; these internals are not publicly enabled. */
 int
 wl_columnar_relation_reserve_capacity_admitted_controlled(col_rel_t *r,
     uint32_t new_cap, bool *denied, wl_evaluation_control_t *control);
@@ -3132,6 +3135,8 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena);
  * compound data. Negative control dispositions leave
  * logical rows and generation unchanged; spare cells may have been written.
  * Descriptors must remain alive and externally serialized during the call. */
+/* Any attached destination mem_ledger requires exclusive caller writer
+ * authority throughout this controlled call; raw/shared paths are separate. */
 int
 wl_columnar_relation_append_all_controlled(col_rel_t *dst,
     const col_rel_t *src, wl_arena_t *arena,

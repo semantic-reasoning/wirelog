@@ -788,6 +788,109 @@ test_atomic_unique_prior_values(void)
     PASS(); return 0;
 }
 
+static bool
+wl_columnar_mem_ledger_test_equal(wl_mem_ledger_t *a, wl_mem_ledger_t *b)
+{
+    if (atomic_load_explicit(&a->current_bytes, memory_order_relaxed)
+        != atomic_load_explicit(&b->current_bytes, memory_order_relaxed)
+        || atomic_load_explicit(&a->peak_bytes, memory_order_relaxed)
+        != atomic_load_explicit(&b->peak_bytes,
+        memory_order_relaxed)) return false;
+    for (unsigned i = 0; i < WL_MEM_SUBSYS_COUNT; i++)
+        if (atomic_load_explicit(&a->subsys_bytes[i], memory_order_relaxed)
+            != atomic_load_explicit(&b->subsys_bytes[i], memory_order_relaxed)
+            || atomic_load_explicit(&a->subsys_peak[i], memory_order_relaxed)
+            != atomic_load_explicit(&b->subsys_peak[i],
+            memory_order_relaxed)) return false;
+    return true;
+}
+static int
+test_exclusive_prepared_ledger(void)
+{
+    TEST(
+        "exclusive requests preserve raw saturation order and current sibling updates");
+    const uint64_t baselines[] = {0, 19, UINT64_MAX - 32};
+    for (unsigned scenario = 0; scenario < 3; scenario++) {
+        wl_mem_ledger_t actual, raw;
+        wl_mem_ledger_init(&actual, 0); wl_mem_ledger_init(&raw, 0);
+        wl_mem_ledger_alloc(&actual, WL_MEM_SUBSYS_RELATION,
+            baselines[scenario]);
+        wl_mem_ledger_alloc(&raw, WL_MEM_SUBSYS_RELATION, baselines[scenario]);
+        wl_mem_ledger_alloc(&actual, WL_MEM_SUBSYS_TIMESTAMP, 16);
+        wl_mem_ledger_alloc(&raw, WL_MEM_SUBSYS_TIMESTAMP, 16);
+        wl_columnar_mem_ledger_exclusive_request_t requests[2] = {
+            {WL_MEM_SUBSYS_RELATION, 64, true},
+            {WL_MEM_SUBSYS_TIMESTAMP, 20, false}
+        };
+        wl_columnar_mem_ledger_exclusive_prepared_t prepared;
+        if (wl_columnar_mem_ledger_prepare_exclusive_controlled(&actual,
+            requests, 2,
+            &prepared, NULL)) {
+            FAIL("prepare raw/no control"); return 1;
+        }
+        /* Real intervening updates to the SAME ledger, not counter snapshots. */
+        wl_mem_ledger_alloc(&actual, WL_MEM_SUBSYS_CACHE, 23);
+        wl_mem_ledger_alloc(&raw, WL_MEM_SUBSYS_CACHE, 23);
+        wl_mem_ledger_free(&actual, WL_MEM_SUBSYS_CACHE, 7);
+        wl_mem_ledger_free(&raw, WL_MEM_SUBSYS_CACHE, 7);
+        wl_columnar_mem_ledger_apply_exclusive(&prepared);
+        wl_mem_ledger_alloc(&raw, WL_MEM_SUBSYS_RELATION, 64);
+        wl_mem_ledger_free(&raw, WL_MEM_SUBSYS_TIMESTAMP, 20);
+        if (!wl_columnar_mem_ledger_test_equal(&actual, &raw)) {
+            FAIL("raw sequential mixed delta saturation/clamp/peaks"); return 1;
+        }
+    }
+    wl_mem_ledger_t actual; wl_mem_ledger_init(&actual, 0);
+    wl_columnar_mem_ledger_exclusive_request_t request =
+    {WL_MEM_SUBSYS_RELATION, 0, true};
+    wl_columnar_mem_ledger_exclusive_prepared_t prepared;
+    if (wl_columnar_mem_ledger_prepare_exclusive_controlled(NULL, &request, 1,
+        &prepared, NULL)
+        || prepared.count != 0) {
+        FAIL("NULL no-op"); return 1;
+    }
+    wl_columnar_mem_ledger_apply_exclusive(&prepared);
+    if (wl_columnar_mem_ledger_prepare_exclusive_controlled(&actual, &request,
+        0, &prepared, NULL)
+        || prepared.count != 0) {
+        FAIL("zero request count"); return 1;
+    }
+    request.subsystem = -1;
+    if (wl_columnar_mem_ledger_prepare_exclusive_controlled(&actual, &request,
+        1, &prepared, NULL)
+        != EINVAL || prepared.count != 0) {
+        FAIL("invalid subsystem"); return 1;
+    }
+    request.subsystem = WL_MEM_SUBSYS_RELATION; request.bytes = 7;
+    for (unsigned exact = 0; exact < 2; exact++) {
+        wl_evaluation_control_t *c = NULL; int owner;
+        if (wl_evaluation_control_create(exact ? 40 : 39, &c)
+            || wl_evaluation_control_attach(c, &owner)
+            || wl_evaluation_control_begin(c, &owner)) {
+            FAIL("control fixture"); return 1;
+        }
+        int rc = wl_columnar_mem_ledger_prepare_exclusive_controlled(&actual,
+                &request, 1, &prepared, c);
+        if (rc != (exact ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT)) {
+            FAIL("exact/minus-one precharge"); return 1;
+        }
+        if (exact) wl_columnar_mem_ledger_apply_exclusive(&prepared);
+        else if (prepared.count != 0) {
+            FAIL("failed preparation inert"); return 1;
+        }
+        if (wl_evaluation_control_finish(c, &owner, 0, 0) != rc
+            || wl_evaluation_control_detach(c, &owner)) {
+            FAIL("control finish"); return 1;
+        }
+        wl_evaluation_control_release(c);
+    }
+    if (atomic_load_explicit(&actual.current_bytes,
+        memory_order_relaxed) != 7) {
+        FAIL("only exact prepared delta applied"); return 1;
+    }
+    PASS(); return 0;
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -814,6 +917,7 @@ main(void)
     test_subsys_table();
     test_atomic_unsigned_bits();
     test_atomic_unique_prior_values();
+    test_exclusive_prepared_ledger();
 
     printf("\n");
     printf("Passed: %d/%d\n", tests_passed, tests_run);

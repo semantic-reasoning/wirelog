@@ -3380,6 +3380,65 @@ wl_columnar_relation_ledger_reconcile_known(col_rel_t *r,
     ledger_sync_timestamps(r);
 }
 
+/* Aggregate finite FORWARD actions, across original retirement segments:
+ * growth/token/grid64 + metadata112 + row/view8 + two ledger applies48 +
+ * timestamp gauge1 + successful final G writes4 =237 <= one quantum.
+ * Width-based old-image/known Arrow destruction and credit retirement are
+ * mandatory cleanup, not a claim of a contiguous bounded instruction region. */
+typedef char wl_columnar_relation_publication_quantum[
+        (64u + 112u + 8u + 2u * 24u + 1u + 4u <=
+        WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
+
+/* Exclusive attached-ledger writer authority belongs to the controlled caller.
+ * Requests describe only deltas. The final apply reads CURRENT counters after
+ * all callbacks and preserves RELATION then TIMESTAMP raw reconciliation order. */
+static int
+wl_columnar_relation_ledger_prepare_exclusive(col_rel_t *r,
+    uint64_t before, uint64_t after, uint64_t timestamps,
+    wl_columnar_mem_ledger_exclusive_prepared_t *prepared,
+    wl_evaluation_control_t *control)
+{
+    prepared->ledger = NULL;
+    prepared->count = 0;
+    if (!r->mem_ledger)
+        return 0;
+    /* <=24 scalar request construction/shape/gauge actions; apply gauge1 is
+    * included here, before the final callback-free publication sequence. */
+    int rc = wl_evaluation_control_charge(control, 24);
+    if (rc != 0)
+        return rc;
+    wl_columnar_mem_ledger_exclusive_request_t requests[2];
+    uint32_t count = 0;
+    if (before != after) {
+        requests[count].subsystem = WL_MEM_SUBSYS_RELATION;
+        requests[count].allocate = after > before;
+        requests[count++].bytes = after >
+            before ? after - before : before - after;
+    }
+    if (timestamps != r->ledger_ts_bytes) {
+        requests[count].subsystem = WL_MEM_SUBSYS_TIMESTAMP;
+        requests[count].allocate = timestamps > r->ledger_ts_bytes;
+        requests[count++].bytes = timestamps > r->ledger_ts_bytes
+            ? timestamps - r->ledger_ts_bytes : r->ledger_ts_bytes - timestamps;
+    }
+    rc = wl_columnar_mem_ledger_prepare_exclusive_controlled(r->mem_ledger,
+            requests, count, prepared, control);
+    if (rc != 0)
+        return rc;
+    return wl_columnar_relation_work_tail(control,
+               24u + (count ? 8u + 32u * count : 0u));
+}
+
+static void
+wl_columnar_relation_ledger_apply_exclusive(col_rel_t *r, uint64_t timestamps,
+    const wl_columnar_mem_ledger_exclusive_prepared_t *prepared)
+{
+    if (!r->mem_ledger)
+        return;
+    wl_columnar_mem_ledger_apply_exclusive(prepared);
+    r->ledger_ts_bytes = timestamps;
+}
+
 void
 col_rel_ledger_reconcile(col_rel_t *r, uint64_t before_bytes)
 {
@@ -7316,6 +7375,7 @@ wl_columnar_relation_reserve_capacity_admitted_controlled(col_rel_t *r,
         ts_bytes;
     uint64_t ledger_before, ledger_after;
     bool transaction = false;
+    wl_columnar_mem_ledger_exclusive_prepared_t ledger_prepared;
     int rc;
     if (!control)
         return col_rel_reserve_capacity_admitted(r, requested, denied);
@@ -7410,6 +7470,16 @@ wl_columnar_relation_reserve_capacity_admitted_controlled(col_rel_t *r,
                    WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
                 ? EOVERFLOW : EINVAL;
         }
+        rc = wl_evaluation_control_charge(control, 96);
+        if (rc != 0) {
+            col_rel_reservation_rollback(&existing);
+            return rc;
+        }
+        rc = wl_columnar_relation_work_tail(control, 96);
+        if (rc != 0) {
+            col_rel_reservation_rollback(&existing);
+            return rc;
+        }
         wl_columnar_relation_reserve_checkpoint(control,
             WL_COLUMNAR_RELATION_RESERVE_FINAL, 0);
         rc = wl_evaluation_control_charge(control, 0);
@@ -7457,12 +7527,16 @@ wl_columnar_relation_reserve_capacity_admitted_controlled(col_rel_t *r,
             control);
     if (rc != 0)
         goto done;
-    rc = wl_evaluation_control_charge(control, 4);
+    rc = wl_columnar_relation_ledger_prepare_exclusive(r, ledger_before,
+            ledger_after, ts_bytes, &ledger_prepared, control);
+    if (rc != 0)
+        goto done;
+    rc = wl_evaluation_control_charge(control, 64);
     if (rc != 0)
         goto done;
     wl_columnar_relation_reserve_checkpoint(control,
         WL_COLUMNAR_RELATION_RESERVE_FINAL, 0);
-    rc = wl_columnar_relation_work_tail(control, 4);
+    rc = wl_columnar_relation_work_tail(control, 64);
     if (rc != 0)
         goto done;
     rc = wl_evaluation_control_charge(control, 0);
@@ -7485,7 +7559,7 @@ wl_columnar_relation_reserve_capacity_admitted_controlled(col_rel_t *r,
     col_columns_free(old_columns, r->ncols); free(old_timestamps);
     col_rel_release_retired_reservation(&previous);
     wl_columnar_relation_retire_payload_credit_known(r, final_bytes);
-    wl_columnar_relation_ledger_reconcile_known(r, ledger_before, ledger_after);
+    wl_columnar_relation_ledger_apply_exclusive(r, ts_bytes, &ledger_prepared);
     return 0;
 done:
     col_columns_free(columns, r->ncols); free(timestamps);
@@ -7518,6 +7592,8 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
     col_rel_payload_txn_t pending;
     wl_columnar_memory_reservation_t previous;
     uint64_t final_bytes = 0, ledger_before = 0, ledger_after = 0;
+    wl_columnar_mem_ledger_exclusive_prepared_t ledger_prepared;
+    uint64_t ledger_timestamps = 0;
     int rc;
     if (!control)
         return col_rel_append_all(dst, src, arena);
@@ -7772,10 +7848,18 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
         rc = EINVAL;
         goto done;
     }
+    if (growth) {
+        ledger_timestamps = prepared_timestamps
+            ? (uint64_t)new_capacity * sizeof(*prepared_timestamps) : 0;
+        rc = wl_columnar_relation_ledger_prepare_exclusive(dst, ledger_before,
+                ledger_after, ledger_timestamps, &ledger_prepared, control);
+        if (rc != 0)
+            goto done;
+    }
     /* Admit canonical pointer/schema/row publication work BEFORE the final
      * governor credit commitment. No charge or stop after that commitment. */
-    uint64_t publication_work = (growth ? 4u : 0u)
-        + (prepared_schema_ok ? 4u : 0u) + (count ? 2u : 0u);
+    uint64_t publication_work = (growth ? 64u : 0u)
+        + (prepared_schema_ok ? 112u : 0u) + (count ? 8u : 0u);
     rc = wl_evaluation_control_charge(control, publication_work);
     if (rc != 0)
         goto done;
@@ -7825,9 +7909,11 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
         free(old_timestamps);
         col_rel_release_retired_reservation(&previous);
         wl_columnar_relation_retire_payload_credit_known(dst, final_bytes);
-        wl_columnar_relation_ledger_reconcile_known(dst, ledger_before,
-            ledger_after);
+        wl_columnar_relation_ledger_apply_exclusive(dst, ledger_timestamps,
+            &ledger_prepared);
     }
+    if (rc == 0 && !growth)
+        rc = wl_evaluation_control_charge(control, 0);
     if (rc == 0 && prepared_schema_ok) {
         struct ArrowSchema old_schema = dst->schema;
         bool old_schema_ok = dst->schema_ok;
