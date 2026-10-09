@@ -1948,6 +1948,62 @@ done:
     if (held && !wl_columnar_memory_rollback(&token)) abort();
     return rc;
 }
+/* Local reflected CRC has no raw lazy table or hardware/cache initialization.
+ * Metadata16, native copy8, init8, byte17 (visit1 + bits8 + state8),
+ * and finalize8 each end at a real cutoff. Borrowed symbol lifetime is
+ * supplied by the ordinary caller; native storage stays in this frame. */
+static int
+wl_columnar_expr_controlled_crc(expr_stack_t *stack, uint8_t op,
+    wl_col_session_t *sess, wl_evaluation_control_t *control)
+{
+    int rc = wl_evaluation_control_charge(control, 16);
+    if (rc) return rc;
+    int64_t operand = expr_pop(stack);
+    bool symbol = op == WL_PLAN_EXPR_ARITH_CRC32_ETH_S
+        || op == WL_PLAN_EXPR_ARITH_CRC32_CAST_S;
+    const char *text = symbol && sess && sess->intern
+        ? wl_intern_reverse(sess->intern, operand) : NULL;
+    uint32_t polynomial = op == WL_PLAN_EXPR_ARITH_CRC32_ETH
+        || op == WL_PLAN_EXPR_ARITH_CRC32_ETH_S
+        ? UINT32_C(0xedb88320) : UINT32_C(0x82f63b78);
+    rc = wl_columnar_expr_controlled_tail(control);
+    if (rc) return rc;
+    uint8_t native[8]; const uint8_t *bytes; size_t length;
+    if (text) {
+        rc = wl_columnar_expr_controlled_string_length(text, &length, control);
+        if (rc) return rc;
+        bytes = (const uint8_t *)text;
+    } else {
+        rc = wl_evaluation_control_charge(control, 8);
+        if (rc) return rc;
+        memcpy(native, &operand, sizeof(native));
+        bytes = native; length = sizeof(native);
+        rc = wl_columnar_expr_controlled_tail(control);
+        if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(control, 8);
+    if (rc) return rc;
+    uint32_t crc = UINT32_MAX;
+    rc = wl_columnar_expr_controlled_tail(control);
+    if (rc) return rc;
+    for (size_t i = 0; i < length; i++) {
+        rc = wl_evaluation_control_charge(control, 17);
+        if (rc) return rc;
+        crc ^= bytes[i];
+        for (unsigned bit = 0; bit < 8; bit++)
+            crc = (crc >> 1) ^ ((crc & 1) ? polynomial : 0);
+        wl_columnar_expr_controlled_checkpoint(control, 25, i + 1, false);
+        rc = wl_columnar_expr_controlled_tail(control);
+        if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(control, 8);
+    if (rc) return rc;
+    int64_t result = (int64_t)(crc ^ UINT32_MAX);
+    rc = wl_columnar_expr_controlled_tail(control);
+    if (rc) return rc;
+    expr_push(stack, result);
+    return 0;
+}
 static int
 wl_columnar_expr_controlled_string_match(const char *hay, size_t available,
     const char *needle, size_t length, bool *matches,
@@ -2480,6 +2536,8 @@ wl_columnar_expr_controlled_interpreter_decode(const uint8_t *buf,
         in->iarg = length; in->larg = *pos; *pos += length;
         break;
     }
+    case WL_PLAN_EXPR_ARITH_CRC32_ETH: case WL_PLAN_EXPR_ARITH_CRC32_ETH_S:
+    case WL_PLAN_EXPR_ARITH_CRC32_CAST: case WL_PLAN_EXPR_ARITH_CRC32_CAST_S:
     case WL_PLAN_EXPR_STR_FN_CAT: case WL_PLAN_EXPR_STR_FN_SUBSTR:
     case WL_PLAN_EXPR_STR_FN_STRLEN: case WL_PLAN_EXPR_STR_FN_CONTAINS:
     case WL_PLAN_EXPR_STR_FN_STR_PREFIX: case WL_PLAN_EXPR_STR_FN_STR_SUFFIX:
@@ -2635,6 +2693,12 @@ wl_columnar_expr_eval_interpreter_controlled(const uint8_t *buf,
                     sess, &allocation, control);
             if (rc) return rc;
             pending = allocation;
+        } else if (!pending && (in.op == WL_PLAN_EXPR_ARITH_CRC32_ETH
+            || in.op == WL_PLAN_EXPR_ARITH_CRC32_ETH_S
+            || in.op == WL_PLAN_EXPR_ARITH_CRC32_CAST
+            || in.op == WL_PLAN_EXPR_ARITH_CRC32_CAST_S)) {
+            rc = wl_columnar_expr_controlled_crc(&stack, in.op, sess, control);
+            if (rc) return rc;
         } else if (!pending && in.op >= WL_PLAN_EXPR_STR_FN_STRLEN
             && in.op <= WL_PLAN_EXPR_STR_FN_TO_NUMBER) {
             rc = wl_columnar_expr_controlled_builtin(&stack, in.op, sess,

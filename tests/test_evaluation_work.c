@@ -6,6 +6,8 @@
 #include <math.h>
 #include "../wirelog/intern.h"
 #include "../wirelog/string_ops.h"
+#include "../wirelog/exec_plan_gen.h"
+#include "../wirelog/wirelog.h"
 #include "../wirelog/thread.h"
 
 #define CHECK(x) do { if (!(x)) { \
@@ -8050,6 +8052,233 @@ test_builtin_shared_reverse_parent_stop(void)
     wl_columnar_memory_governor_ref_release(t);
 }
 
+static void
+test_crc_actual_twins(void)
+{
+    const uint8_t ops[] = {WL_PLAN_EXPR_ARITH_CRC32_ETH,
+                           WL_PLAN_EXPR_ARITH_CRC32_ETH_S,
+                           WL_PLAN_EXPR_ARITH_CRC32_CAST,
+                           WL_PLAN_EXPR_ARITH_CRC32_CAST_S};
+    const int64_t values[] = {0, 2, 3, 4, -1, 99, INT64_MIN, INT64_MAX};
+    for (uint32_t k = 0; k < sizeof(ops); k++)
+        for (int domain = -1; domain < 3; domain++)
+            for (uint32_t j = 0; j < sizeof(values)/sizeof(*values); j++) {
+                uint8_t buf[16]; uint32_t n = compiled_const(buf, 0, values[j]);
+                buf[n++] = ops[k];
+                string_caller_twins(buf, n, 0, domain, j == 0);
+            }
+    /* Typed serialized length retains the embedded NUL, while CRC consumes
+     * only the actual intern prefix. Saturated prefix really ignores pushes;
+     * unary CRC then pops, so its own push necessarily fits. */
+    const char embedded[] = {'a', 'b', 0, 'c', 'd'};
+    for (uint32_t k = 1; k < sizeof(ops); k += 2) {
+        uint8_t buf[1100]; uint32_t n = string_literal(buf, 0, embedded, 5);
+        buf[n++] = ops[k]; string_caller_twins(buf, n, 0, 2, true);
+        n = 0;
+        for (uint32_t j = 0; j < 513; j++) {
+            buf[n++] = WL_PLAN_EXPR_BOOL; buf[n++] = 0;
+        }
+        buf[n-1] = 1; buf[n++] = ops[k];
+        string_caller_twins(buf, n, 0, 2, true);
+        buf[0] = ops[k]; string_caller_twins(buf, 1, 0, -1, true);
+    }
+}
+/* Actual ordinary caller, preseeded borrowed symbol, no expression put. */
+static uint64_t
+crc_caller_trial_expr(uint8_t op, const char *text, int map, uint64_t limit,
+    int expected, int stage, bool positive, int64_t golden, bool reject,
+    const wl_plan_expr_buffer_t *generated)
+{
+    wl_col_session_t *sess = join_session(), *raw = join_session();
+    sess->intern = string_table(sess->memory_governor, 0);
+    raw->intern = string_table(raw->memory_governor, 0);
+    CHECK(wl_intern_put(sess->intern, text) == 0);
+    CHECK(wl_intern_put(raw->intern, text) == 0);
+    col_rel_t *source = relation(1, 1, 1, false, sess->memory_governor);
+    col_rel_t *ref = relation(1, 1, 1, false, raw->memory_governor);
+    source->columns[0][0] = ref->columns[0][0] = 0;
+    CHECK(session_add_rel(sess, source) == 0 && session_add_rel(raw, ref) == 0);
+    make_lazy(source);
+    uint64_t before = string_reserved(sess->memory_governor);
+    uint8_t buf[64]; uint32_t n = compiled_var(buf, 0, "col0");
+    buf[n++] = op;
+    if (reject) {
+        n = compiled_const(buf, n, -1); buf[n++] = WL_PLAN_EXPR_CMP_EQ;
+    }
+    wl_plan_expr_buffer_t expr = generated ? *generated :
+        (wl_plan_expr_buffer_t){buf, n};
+    wl_plan_op_t ops[2] = {
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+         .delta_mode = WL_DELTA_FORCE_FULL},
+        {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+         .filter_expr = expr, .project_count = 1,
+         .map_exprs = &expr, .map_expr_count = 1}
+    };
+    wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+    wl_columnar_eval_stack_cleanup_frame_t *reference = filter_frame(raw);
+    wl_evaluation_control_t *c = control(limit);
+    if (stage) {
+        string_stop_stage = (unsigned)stage; string_stop_progress = 300;
+        string_stop_positive = positive; string_stop_reached = 0;
+        wl_columnar_expr_test_controlled_checkpoint = string_expr_stop;
+    }
+    CHECK(compiled_dispatch(sess, frame, ops, 2, c) == expected);
+    uint64_t cost = finish(c, expected);
+    CHECK(!sess->memory_budget_denied && wl_intern_count(sess->intern) == 1);
+    if (stage) CHECK(string_stop_reached == 1);
+    CHECK(compiled_dispatch(raw, reference, ops, 2, NULL) == 0);
+    if (!expected) {
+        filter_equal(join_output(frame), join_output(reference));
+        if (golden >= 0 && map && !reject)
+            CHECK(join_output(frame)->columns[0][0] == golden);
+        if (reject || (!*text && !map)) CHECK(join_output(frame)->nrows ==
+                (map ? 1u : 0u));
+    } else {
+        lazy_unchanged(source);
+        CHECK(!wl_columnar_eval_stack_cleanup_result(frame)->rel);
+    }
+    source_unpinned(source, source);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&reference) == 0);
+    CHECK(string_reserved(sess->memory_governor) == before);
+    /* Same attempt reset, same original intern mapping and raw CRC cache.
+     * Source shape may have been published on success, so equality of work
+     * is asserted across fresh equivalent trials below, not this warm retry. */
+    frame = filter_frame(sess);
+    retry(c, expected == WL_EVALUATION_CONTROL_WORK_LIMIT ? limit+1 : 0);
+    CHECK(compiled_dispatch(sess, frame, ops, 2, c) == 0);
+    uint64_t retry_cost = finish(c, 0);
+    if (expected == WL_EVALUATION_CONTROL_WORK_LIMIT)
+        CHECK(retry_cost == limit+1);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+    CHECK(wl_intern_count(sess->intern) == 1 &&
+        string_reserved(sess->memory_governor) == before);
+    wl_intern_free(sess->intern); wl_intern_free(raw->intern);
+    sess->intern = raw->intern = NULL; release(c);
+    join_session_destroy(sess); join_session_destroy(raw);
+    return cost;
+}
+static uint64_t
+crc_caller_trial(uint8_t op, const char *text, int map, uint64_t limit,
+    int expected, int stage, bool positive, int64_t golden, bool reject)
+{
+    return crc_caller_trial_expr(op, text, map, limit, expected, stage,
+               positive, golden, reject, NULL);
+}
+static void
+test_crc_declared_symbol_plan(void)
+{
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(
+        ".decl S(s: symbol)\nS(\"123456789\").\n"
+        ".decl C(e: int64, k: int64)\n"
+        "C(crc32_ethernet(s), crc32_castagnoli(s)) :- S(s).\n", &error);
+    CHECK(program && error == WIRELOG_OK);
+    wl_plan_t *plan = NULL; CHECK(wl_plan_from_program(program, &plan) == 0);
+    unsigned found = 0;
+    for (uint32_t st = 0; st < plan->stratum_count; st++)
+        for (uint32_t r = 0; r < plan->strata[st].relation_count; r++) {
+            const wl_plan_relation_t *rel = &plan->strata[st].relations[r];
+            for (uint32_t i = 0; i < rel->op_count; i++) {
+                const wl_plan_op_t *op = &rel->ops[i];
+                if (op->op != WL_PLAN_OP_MAP) continue;
+                for (uint32_t j = 0; j < op->map_expr_count; j++) {
+                    const wl_plan_expr_buffer_t *expr = &op->map_exprs[j];
+                    if (!expr->size) continue;
+                    uint8_t tag = expr->data[expr->size-1];
+                    if (tag != WL_PLAN_EXPR_ARITH_CRC32_ETH_S &&
+                        tag != WL_PLAN_EXPR_ARITH_CRC32_CAST_S) continue;
+                    found |= tag == WL_PLAN_EXPR_ARITH_CRC32_ETH_S ? 1 : 2;
+                    for (int map = 0; map < 2; map++)
+                        crc_caller_trial_expr(tag, "123456789", map, 0, 0, 0,
+                            false, tag == WL_PLAN_EXPR_ARITH_CRC32_ETH_S ?
+                            INT64_C(0xcbf43926) : INT64_C(0xe3069283), false,
+                            expr);
+                }
+            }
+        }
+    CHECK(found == 3); wl_plan_free(plan); wirelog_program_free(program);
+}
+static void
+test_crc_lengths_goldens_and_stops(void)
+{
+    const uint32_t lengths[] = {0, 1, 63, 64, 127, 128, 255, 256, 513, 4097};
+    const uint8_t ops[] = {WL_PLAN_EXPR_ARITH_CRC32_ETH_S,
+                           WL_PLAN_EXPR_ARITH_CRC32_CAST_S};
+    char text[4098];
+    for (uint32_t k = 0; k < sizeof(ops);
+        k++) for (int map = 0; map < 2; map++) {
+            CHECK(crc_caller_trial(ops[k], "123456789", map, 0, 0, 0, false,
+                k ? INT64_C(0xe3069283) : INT64_C(0xcbf43926), false) > 0);
+            for (uint32_t j = 0; j < sizeof(lengths)/sizeof(*lengths); j++) {
+                memset(text, 'a', lengths[j]); text[lengths[j]] = 0;
+                uint64_t cost = crc_caller_trial(ops[k], text, map, 0, 0, 0,
+                        false, -1, false);
+                CHECK(cost > 1);
+                crc_caller_trial(ops[k], text, map, cost-1,
+                    WL_EVALUATION_CONTROL_WORK_LIMIT, 0, false, -1, false);
+                CHECK(crc_caller_trial(ops[k], text, map, cost, 0, 0, false,
+                    -1, false) == cost);
+                /* Actual scan2 per visited byte+NUL, CRC17 per byte. All other
+                 * bytecode and caller shape are identical for nonempty strings. */
+                if (j == 9) {
+                    text[513] = 0;
+                    uint64_t short_cost = crc_caller_trial(ops[k], text, map, 0,
+                            0, 0, false, -1, false);
+                    CHECK(cost-short_cost == (4097u-513u)*19u);
+                }
+            }
+            memset(text, 'a', 4097); text[4097] = 0;
+            for (int stage = 14; stage <= 25; stage += 11)
+                for (int positive = 0; positive < 2; positive++)
+                    crc_caller_trial(ops[k], text, map, 0,
+                        positive ? EOVERFLOW : WL_EVALUATION_CONTROL_CANCELLED,
+                        stage, positive, -1, true);
+            crc_caller_trial(ops[k], text, map, 0, 0, 0, false, -1, true);
+        }
+}
+
+static void
+test_crc_owned_cleanup(void)
+{
+    for (int map = 0; map < 2; map++) {
+        wl_col_session_t *sess = join_session();
+        sess->intern = string_table(sess->memory_governor, 0);
+        CHECK(wl_intern_put(sess->intern, "input-lower") == 0);
+        col_rel_t *source = relation(2, 2, 2, false, sess->memory_governor);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = join_frame(sess, source,
+                true);
+        uint8_t buf[64];
+        uint32_t n = compiled_const(buf, 0, 0);
+        buf[n++] = WL_PLAN_EXPR_ARITH_CRC32_ETH_S;
+        wl_plan_expr_buffer_t expr = {buf, n};
+        wl_plan_op_t op = {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+                           .filter_expr = expr, .project_count = 1,
+                           .map_exprs = &expr, .map_expr_count = 1};
+        wl_evaluation_control_t *c = control(0);
+        sess->base.evaluation_control = c;
+        filter_reached = 0;
+        if (map) wl_columnar_ops_map_test_controlled_checkpoint =
+                map_owned_cleanup_fault;
+        else wl_columnar_filter_test_controlled_checkpoint =
+                filter_cleanup_fault;
+        CHECK((map ? col_op_map(&op,
+            wl_columnar_eval_stack_cleanup_stack(frame), sess)
+            : wl_columnar_filter_op(&op,
+            wl_columnar_eval_stack_cleanup_stack(frame), sess)) == EBUSY);
+        sess->base.evaluation_control = NULL; finish(c, EBUSY);
+        CHECK(filter_reached == 1 && wl_intern_count(sess->intern) == 1);
+        CHECK(strcmp(wl_intern_reverse(sess->intern, 0), "input-lower") == 0);
+        CHECK(wl_columnar_eval_stack_cleanup_result(frame)->rel);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == EBUSY &&
+            !frame && sess->cleanup_pending);
+        CHECK(col_rel_source_reader_release(&join_retained_reader) == 0);
+        CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0);
+        wl_intern_free(sess->intern); sess->intern = NULL;
+        release(c); join_session_destroy(sess);
+    }
+}
+
 int
 main(void)
 {
@@ -8161,6 +8390,10 @@ main(void)
     test_builtin_actual_resource_and_publication();
     test_builtin_owned_cleanup();
     test_builtin_shared_reverse_parent_stop();
+    test_crc_actual_twins();
+    test_crc_declared_symbol_plan();
+    test_crc_lengths_goldens_and_stops();
+    test_crc_owned_cleanup();
     puts("evaluation_work: OK");
     return 0;
 }
