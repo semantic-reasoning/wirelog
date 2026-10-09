@@ -4220,6 +4220,17 @@ join_multiset_equal(const col_rel_t *a, const col_rel_t *b)
     }
     free(matched);
 }
+static uint64_t
+private_writer_begin_cost(void)
+{
+    uint64_t bytes = sizeof(wl_columnar_relation_mutation_single_t);
+    /* Shape64; inert64/phase8/full clear/per-chunk8/final8; bind16;
+     * nonce1/install8+96/writer1+counter8/resolve6+owner96/lease128/
+     * writer1+counter8/identity16/validator32/HELD8; active16. */
+    return 64u + 64u + 8u + bytes + ((bytes + 127u) / 128u) * 8u + 8u
+           + 16u + 1u + 8u + 96u + 1u + 8u + 6u + 96u + 128u + 1u
+           + 8u + 16u + 32u + 8u + 16u;
+}
 static void
 test_controlled_join_cartesian(void)
 {
@@ -4304,10 +4315,11 @@ test_controlled_join_keyed_first(void)
         if (empty) {
             /* Entry guard32 + name/entry22 + grouped inputs98 + shape34,
              * arithmetic64 + bucket doubling11 + scratch16 + keys13 + types2,
-             * fresh ctor161 + type BUILD186 + ledger56 + batch admission92,
+             * fresh ctor161 + type BUILD186 + ledger56 + durable writer admission,
              * bucket zero2048 + build1539 + empty probes1026 + outer513 + final116. */
             CHECK(cost == 32 + 22 + 98 + 34 + 64 + 11 + 16 + 13 + 2
-                + 161 + 186 + 56 + 92 + 2048 + 1539 + 1026 + 513 + 116);
+                + 161 + 186 + 56 + private_writer_begin_cost() + 2048 + 1539
+                + 1026 + 513 + 116 + 96 + 64);
         }
         CHECK(join_dispatch(raw, reference, &op, NULL) == 0);
         CHECK(join_output(frame)->nrows == (empty ? 0u : 9u));
@@ -4996,7 +5008,8 @@ test_controlled_join_empty_right_visits(void)
         * BUILD schema, one L request, B1 admission,513 visits and final116. */
         CHECK(cost == 32 + 22 + 98 + 33 + 64 + 16 + (zero ? 1u : 2u)
             + constructor_cost("$join", zero ? 1u : 2u, COL_REL_INIT_CAP, false)
-            + (zero ? 169u : 186u) + 56 + 92 + 513 + 116);
+            + (zero ? 169u : 186u) + 56 + private_writer_begin_cost()
+            + 513 + 116 + 96 + 64);
         CHECK(join_dispatch(raw, reference, &op, NULL) == 0);
         join_multiset_equal(join_output(frame), join_output(reference));
         CHECK(!join_output(frame)->nrows &&
@@ -12798,6 +12811,273 @@ test_shared_owned_reader_and_reuse(void)
         release(c); join_session_destroy(sess);
     }
 }
+static unsigned join_writer_pairs, join_writer_pairs_at_reset;
+static bool join_writer_committed;
+static void
+join_writer_checkpoint(wl_evaluation_control_t *c, int stage, uint64_t progress,
+    wl_columnar_relation_source_group_t *group, col_rel_t *left)
+{
+    (void)progress;
+    if (stage == 5) join_writer_pairs++;
+    if (stage == 13 && shared_fault_stage == 13)
+        shared_authority_fault(c,
+            wl_columnar_eval_stack_cleanup_reduce_batch(shared_frame), 13, 0);
+    if (stage == 9) {
+        CHECK(!c && group->committed); join_writer_committed = true;
+    }
+    if (stage == 14 && shared_keep_reader) {
+        CHECK(!c && join_writer_committed && !group->descriptor_count &&
+            !group->owner_count);
+        CHECK(col_rel_source_reader_acquire(left, &join_retained_reader) == 0);
+        shared_visits++;
+    }
+}
+static void
+join_writer_reset_stop(wl_evaluation_control_t *c,
+    wl_columnar_relation_private_batch_t *record, int stage, uint64_t progress)
+{
+    unsigned before = shared_visits;
+    shared_reset_stop(c, record, stage, progress);
+    if (shared_visits != before) join_writer_pairs_at_reset = join_writer_pairs;
+}
+static uint64_t
+join_writer_ledger(wl_col_session_t *sess)
+{
+    return atomic_load(&sess->mem_ledger.subsys_bytes[WL_MEM_SUBSYS_RELATION]);
+}
+static void
+test_join_writer_authority_and_ledger(void)
+{
+    for (unsigned fault = 0; fault < 3; fault++) {
+        wl_col_session_t *sess = join_session();
+        col_rel_t *left = relation(1, 3, 3, false, sess->memory_governor),
+            *right = relation(1, 1, 1, false, sess->memory_governor);
+        CHECK(session_add_rel(sess, right) == 0); make_lazy(left);
+        make_lazy(right);
+        uint64_t baseline = string_reserved(sess->memory_governor),
+            ledger = join_writer_ledger(sess);
+        shared_frame = join_frame(sess, left, false);
+        wl_plan_op_t op = {.op = WL_PLAN_OP_JOIN, .right_relation = "work",
+                           .delta_mode = WL_DELTA_FORCE_FULL};
+        wl_evaluation_control_t *c = control(0);
+        shared_fault_stage = fault == 0 ? 2 : fault == 1 ? 3 : 13;
+        shared_visits = 0; shared_keep_reader = false;
+        wl_columnar_relation_test_private_checkpoint = shared_authority_fault;
+        wl_columnar_join_test_controlled_checkpoint = join_writer_checkpoint;
+        CHECK(join_dispatch(sess, shared_frame, &op, c) == EINVAL);
+        finish(c, EINVAL);
+        wl_columnar_relation_test_private_checkpoint = NULL;
+        wl_columnar_join_test_controlled_checkpoint = NULL;
+        shared_fault_stage = 0;
+        CHECK(shared_visits == 1 &&
+            shared_record->phase == WL_COLUMNAR_RELATION_PRIVATE_RETIRING
+            && !shared_record->batch.active);
+        col_rel_t *out =
+            wl_columnar_eval_stack_cleanup_result(shared_frame)->rel;
+        CHECK(out && out == shared_record->batch.relation &&
+            out->mem_ledger == &sess->mem_ledger);
+        CHECK(join_writer_ledger(sess) ==
+            ledger + (uint64_t)out->ncols * out->capacity * sizeof(int64_t));
+        CHECK(shared_writer->owner && !shared_writer->thread_valid
+            && shared_writer->identity == (uintptr_t)shared_writer
+            && atomic_load(&shared_writer->owner->state) ==
+            WL_COLUMNAR_SOURCE_ACCESS_WRITER);
+        lazy_unchanged(left); lazy_unchanged(right);
+        source_unpinned(left, left); source_unpinned(right, right);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&shared_frame) == EINVAL &&
+            sess->cleanup_pending);
+        CHECK(string_reserved(sess->memory_governor) > baseline &&
+            join_writer_ledger(sess) > ledger);
+        shared_writer->thread_valid = shared_thread_valid;
+        CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0);
+        CHECK(string_reserved(sess->memory_governor) == baseline &&
+            join_writer_ledger(sess) == ledger);
+        CHECK(!sess->memory_budget_denied);
+        CHECK(col_rel_storage_owner_ensure_initialized(left) == 0);
+        shared_frame = join_frame(sess, left, false); retry(c, 0);
+        CHECK(join_dispatch(sess, shared_frame, &op, c) == 0); finish(c, 0);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&shared_frame) == 0);
+        release(c); destroy(left); join_session_destroy(sess);
+    }
+}
+static void
+test_join_writer_growth_reset(void)
+{
+    const char *keys[1] = {"col0"};
+    for (unsigned keyed = 0; keyed < 2; keyed++)
+        for (unsigned epoch = 1; epoch <= 2; epoch++)
+            for (unsigned overflow = 0; overflow < 2; overflow++)
+                for (unsigned retained = 0; retained < 2; retained++) {
+                    wl_col_session_t *sess = join_session(),
+                        *raw = join_session();
+                    col_rel_t *left = relation(1, 1, 1, false,
+                            sess->memory_governor),
+                        *right = relation(2, 513, 513, false,
+                            sess->memory_governor),
+                        *rl = relation(1, 1, 1, false, raw->memory_governor),
+                        *rr = relation(2, 513, 513, false,
+                            raw->memory_governor);
+                    for (unsigned i = 0; i < 513;
+                        i++) right->columns[0][i] = rr->columns[0][i] = 0;
+                    CHECK(session_add_rel(sess,
+                        right) == 0 && session_add_rel(raw, rr) == 0);
+                    make_lazy(left); make_lazy(right);
+                    uint64_t baseline = string_reserved(sess->memory_governor);
+                    shared_frame = join_frame(sess, left, false);
+                    wl_plan_op_t op = {.op = WL_PLAN_OP_JOIN,
+                                       .right_relation = "work",
+                                       .delta_mode = WL_DELTA_FORCE_FULL,
+                                       .key_count = keyed,
+                                       .left_keys = keys, .right_keys = keys};
+                    wl_evaluation_control_t *c = control(0);
+                    shared_visits = shared_epoch = join_writer_pairs = 0;
+                    shared_target_epoch = epoch; shared_fault_stage = 0;
+                    shared_growth = shared_reuse_reset = false;
+                    shared_overflow = overflow; shared_keep_reader = retained;
+                    wl_columnar_relation_test_private_checkpoint =
+                        join_writer_reset_stop;
+                    wl_columnar_join_test_controlled_checkpoint =
+                        join_writer_checkpoint;
+                    int expected =
+                        overflow ? EOVERFLOW : retained ? EBUSY :
+                        WL_EVALUATION_CONTROL_CANCELLED;
+                    CHECK(join_dispatch(sess, shared_frame, &op,
+                        c) == expected); CHECK(finish(c, expected) > 0);
+                    uint64_t output_peak = sess->join_output_peak,
+                        ledger_peak = atomic_load(&sess->mem_ledger.peak_bytes);
+                    CHECK(output_peak == ((uint64_t)COL_REL_INIT_CAP << epoch)
+                        && ledger_peak > 0 && !sess->memory_budget_denied);
+                    wl_columnar_join_test_controlled_checkpoint = NULL;
+                    CHECK(shared_visits == 1 && shared_epoch == epoch
+                        && join_writer_pairs == join_writer_pairs_at_reset
+                        && join_writer_pairs ==
+                        (((unsigned)COL_REL_INIT_CAP << epoch) + 1u));
+                    CHECK(shared_record->phase ==
+                        WL_COLUMNAR_RELATION_PRIVATE_RESETTING);
+                    CHECK(
+                        wl_columnar_relation_private_append_batch_begin_controlled
+                            (shared_record, left, c) == EBUSY);
+                    retry(c, 0);
+                    wl_columnar_relation_private_batch_t *found = NULL;
+                    CHECK(wl_columnar_eval_stack_cleanup_private_batch_owner(
+                            sess,
+                            wl_columnar_eval_stack_cleanup_stack(shared_frame),
+                            &found, c) == EBUSY && !found);
+                    finish(c, EBUSY);
+                    lazy_unchanged(left); lazy_unchanged(right);
+                    source_unpinned(left, left); source_unpinned(right, right);
+                    CHECK(wl_columnar_eval_stack_cleanup_finish(
+                            &shared_frame) == (retained ? EBUSY : 0));
+                    if (retained) {
+                        CHECK(sess->cleanup_pending && join_writer_ledger(sess)
+                            == (uint64_t)shared_output->ncols *
+                            shared_output->capacity * sizeof(int64_t));
+                        CHECK(string_reserved(sess->memory_governor) >
+                            baseline);
+                        CHECK(col_rel_source_reader_release(
+                                &join_retained_reader) == 0);
+                        CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0);
+                    }
+                    CHECK(string_reserved(sess->memory_governor) == baseline &&
+                        !join_writer_ledger(sess));
+                    CHECK(sess->join_output_peak == output_peak
+                        && atomic_load(&sess->mem_ledger.peak_bytes) ==
+                        ledger_peak);
+                    shared_keep_reader = false;
+                    shared_frame = join_frame(sess, left, false); retry(c, 0);
+                    CHECK(join_dispatch(sess, shared_frame, &op, c) == 0);
+                    finish(c, 0);
+                    wl_columnar_eval_stack_cleanup_frame_t *reference =
+                        join_frame(raw, rl, false);
+                    CHECK(join_dispatch(raw, reference, &op, NULL) == 0);
+                    join_multiset_equal(join_output(shared_frame),
+                        join_output(reference));
+                    CHECK(join_output(shared_frame)->nrows == 513);
+                    CHECK(wl_columnar_eval_stack_cleanup_finish(
+                            &shared_frame) == 0
+                        && wl_columnar_eval_stack_cleanup_finish(&reference) ==
+                        0);
+                    CHECK(!join_writer_ledger(sess));
+                    release(c); destroy(left); destroy(rl);
+                    join_session_destroy(sess); join_session_destroy(raw);
+                }
+}
+static void
+test_join_writer_owned_and_reuse(void)
+{
+    for (unsigned mode = 0; mode < 3; mode++) {
+        wl_col_session_t *sess = join_session();
+        col_rel_t *left = relation(1, 3, 3, false, sess->memory_governor),
+            *right = relation(1, 1, 1, false, sess->memory_governor);
+        CHECK(session_add_rel(sess, right) == 0);
+        if (!mode) make_lazy(left);
+        shared_frame = join_frame(sess, left, !mode);
+        wl_plan_op_t op = {.op = WL_PLAN_OP_JOIN, .right_relation = "work",
+                           .delta_mode = WL_DELTA_FORCE_FULL};
+        wl_evaluation_control_t *c = control(0);
+        shared_keep_reader = !mode; shared_visits = 0; shared_fault_stage = 0;
+        join_writer_committed = false;
+        wl_columnar_join_test_controlled_checkpoint = join_writer_checkpoint;
+        int expected = !mode ? EBUSY : 0;
+        CHECK(join_dispatch(sess, shared_frame, &op, c) == expected);
+        wl_columnar_join_test_controlled_checkpoint = NULL;
+        if (!mode) {
+            finish(c, EBUSY);
+            CHECK(join_writer_committed && shared_visits == 1);
+            CHECK(wl_columnar_eval_stack_cleanup_stack(
+                    shared_frame)->items[0].rel == left
+                && wl_columnar_eval_stack_cleanup_result(shared_frame)->rel);
+            CHECK(join_writer_ledger(sess) &&
+                string_reserved(sess->memory_governor));
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&shared_frame) ==
+                EBUSY);
+            /* Independent retired output is physically disposable while the
+             * real owned input reader still retains the pending frame. */
+            CHECK(sess->cleanup_pending && !join_writer_ledger(sess)
+                && string_reserved(sess->memory_governor));
+            CHECK(col_rel_source_reader_release(&join_retained_reader) == 0);
+            CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0 &&
+                !join_writer_ledger(sess));
+        } else {
+            wl_columnar_relation_private_batch_t *record =
+                wl_columnar_eval_stack_cleanup_reduce_batch(shared_frame);
+            CHECK(join_dispatch(sess, shared_frame, &op, c) == 0);
+            CHECK(wl_columnar_eval_stack_cleanup_reduce_batch(shared_frame) ==
+                record);
+            eval_entry_t former;
+            eval_stack_t *stack =
+                wl_columnar_eval_stack_cleanup_stack(shared_frame);
+            CHECK(eval_stack_pop_relation(stack, &former) == 0 && former.owned);
+            CHECK(eval_entry_dispose(&former) == 0 &&
+                !join_writer_ledger(sess));
+            CHECK(eval_stack_push(stack, left, false) == 0);
+            if (mode == 2) {
+                shared_visits = 0; shared_growth = false;
+                shared_reuse_reset = true;
+                shared_keep_reader = shared_overflow = false;
+                wl_columnar_relation_test_private_checkpoint =
+                    shared_reset_stop;
+            }
+            expected = mode == 2 ? WL_EVALUATION_CONTROL_CANCELLED : 0;
+            CHECK(join_dispatch(sess, shared_frame, &op, c) == expected);
+            finish(c, expected);
+            CHECK(wl_columnar_eval_stack_cleanup_reduce_batch(shared_frame) ==
+                record);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&shared_frame) == 0 &&
+                !join_writer_ledger(sess));
+            if (mode == 2) {
+                CHECK(shared_visits == 1); shared_reuse_reset = false;
+                shared_frame = join_frame(sess, left, false); retry(c, 0);
+                CHECK(join_dispatch(sess, shared_frame, &op, c) == 0);
+                finish(c, 0);
+                CHECK(wl_columnar_eval_stack_cleanup_finish(&shared_frame) ==
+                    0);
+            }
+            destroy(left);
+        }
+        shared_keep_reader = false; release(c); join_session_destroy(sess);
+    }
+}
 int
 main(void)
 {
@@ -12821,6 +13101,9 @@ main(void)
     test_shared_writer_authority_refusals();
     test_shared_filter_growth_reset();
     test_shared_owned_reader_and_reuse();
+    test_join_writer_authority_and_ledger();
+    test_join_writer_growth_reset();
+    test_join_writer_owned_and_reuse();
     wl_columnar_relation_test_work_checkpoint = checkpoint;
     wl_columnar_memory_governor_test_work_checkpoint = checkpoint;
     test_counted_gates();

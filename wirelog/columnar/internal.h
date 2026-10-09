@@ -2928,7 +2928,7 @@ typedef struct {
     wl_columnar_relation_private_phase_t phase;
     bool ready;
 } wl_columnar_relation_private_batch_t;
-/* The frame-owned private writer is shared by controlled MAP/FILTER/REDUCE.
+/* The frame-owned private writer is shared by controlled MAP/FILTER/REDUCE/JOIN.
  * Forward lookup rejects terminal RESETTING; disposal alone may skip its prefix. */
 bool wl_columnar_relation_private_batch_disposable(
     const wl_columnar_relation_private_batch_t *);

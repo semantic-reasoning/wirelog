@@ -1407,7 +1407,7 @@ wl_columnar_join_controlled_hash(const col_rel_t *r, uint32_t row,
 static int
 wl_columnar_join_controlled_pair(const wl_plan_op_t *op,
     const col_rel_t *left, uint32_t lr, const col_rel_t *right, uint32_t rr,
-    uint32_t width, int64_t *row, col_rel_append_batch_t *batch,
+    uint32_t width, int64_t *row, wl_columnar_relation_private_batch_t *record,
     wl_col_session_t *sess, wl_evaluation_control_t *control)
 {
     bool projected = op->project_count && op->project_indices;
@@ -1419,12 +1419,14 @@ wl_columnar_join_controlled_pair(const wl_plan_op_t *op,
         rc = wl_columnar_join_controlled_tail(control);
         if (rc) return rc;
     }
-    int rc = wl_columnar_relation_append_batch_row_controlled(batch, row,
+    int rc = wl_columnar_relation_private_append_batch_row_controlled(record,
+            row,
             control);
-    if (rc) return wl_columnar_join_output_error(sess, batch->relation, rc);
+    if (rc) return wl_columnar_join_output_error(sess, record->batch.relation,
+                   rc);
     rc = wl_evaluation_control_charge(control, 8);
     if (rc) return rc;
-    bool limit = col_join_output_limit_reached(sess, batch->relation);
+    bool limit = col_join_output_limit_reached(sess, record->batch.relation);
     int tail = wl_columnar_join_controlled_tail(control);
     return limit ? EOVERFLOW : tail;
 }
@@ -1450,6 +1452,10 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     int rc = wl_columnar_eval_stack_cleanup_join_owner(sess, stack, &group,
             &private_output);
     if (rc) return rc;
+    wl_columnar_relation_private_batch_t *record = NULL;
+    rc = wl_columnar_eval_stack_cleanup_private_batch_owner(sess, stack,
+            &record, control);
+    if (rc) return rc;
     if (!stack->top || stack->top > COL_STACK_MAX
         || stack->items[stack->top - 1].kind != WL_COLUMNAR_EVAL_ENTRY_RELATION
         || !stack->items[stack->top - 1].rel)
@@ -1458,7 +1464,6 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     uint32_t slot = stack->top - 1;
     col_rel_t *left = stack->items[slot].rel, *right = NULL, *out = NULL;
     eval_entry_t left_entry = {0};
-    col_rel_append_batch_t batch = {0};
     wl_columnar_memory_reservation_t scratch_admission;
     wl_columnar_memory_reservation_init(&scratch_admission);
     bool scratch_held = false, popped = false, committed = false;
@@ -1633,7 +1638,7 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     rc = wl_columnar_join_controlled_tail(control); if (rc) goto cleanup;
     wl_columnar_mem_ledger_apply_exclusive(&ledger_prepared);
     out->mem_ledger = &sess->mem_ledger;
-    rc = wl_columnar_relation_append_batch_begin_controlled(&batch, out,
+    rc = wl_columnar_relation_private_append_batch_begin_controlled(record, out,
             control);
     if (rc) goto cleanup;
     for (uint32_t b = 0; b < buckets; b++) {
@@ -1698,7 +1703,7 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
             }
             if (match) {
                 rc = wl_columnar_join_controlled_pair(op, left, lr, right, rr,
-                        width, tuple, &batch, sess, control);
+                        width, tuple, record, sess, control);
                 if (rc) goto cleanup;
             }
             if (kc) {
@@ -1710,8 +1715,8 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
             }
         }
     }
-    rc = wl_columnar_relation_append_batch_end_controlled(&batch, true,
-            control);
+    wl_columnar_join_controlled_checkpoint(control, 13, 0, group, left);
+    rc = wl_columnar_relation_private_append_batch_end_controlled(record);
     if (rc) goto cleanup;
     free(scratch); scratch = NULL;
     if (scratch_held) {
@@ -1722,6 +1727,12 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     int reader_cleanup =
         wl_columnar_relation_source_group_release_readers(group, 0);
     wl_columnar_join_controlled_checkpoint(control, 6, 1, group, left);
+    rc = wl_evaluation_control_charge(control, 64);
+    if (!rc && (record->phase != WL_COLUMNAR_RELATION_PRIVATE_RETIRED
+        || !wl_columnar_relation_private_batch_disposable(record))) rc = EINVAL;
+    if (!rc) rc = wl_columnar_join_controlled_tail(control);
+    if (reader_cleanup > 0 && rc <= 0) rc = reader_cleanup;
+    if (rc) goto cleanup;
     rc = wl_evaluation_control_charge(control, 16);
     if (rc) {
         if (rc < 0 && reader_cleanup > 0) rc = reader_cleanup;
@@ -1754,6 +1765,7 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_columnar_join_controlled_checkpoint(NULL, 9, 0, group, left);
     rc = wl_columnar_relation_source_group_drain(group, 0);
     if (rc) goto cleanup;
+    wl_columnar_join_controlled_checkpoint(NULL, 14, 0, group, left);
     rc = eval_entry_dispose(&left_entry);
     if (rc) goto cleanup;
     stack->items[slot] = (eval_entry_t){.rel = out, .owned = true,
@@ -1763,12 +1775,7 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     *private_output = (eval_entry_t){0};
     return 0;
 cleanup:
-    if (batch.active) {
-        int cleanup_rc =
-            wl_columnar_relation_append_batch_end_controlled(&batch, false,
-                control);
-        if (cleanup_rc > 0 && rc <= 0) rc = cleanup_rc;
-    }
+    rc = wl_columnar_relation_private_batch_retire(record, rc);
     free(scratch);
     if (scratch_held &&
         !wl_columnar_memory_release(&scratch_admission)) abort();
@@ -1787,8 +1794,10 @@ cleanup:
                 stack->items[slot] = left_entry; stack->top = slot + 1u;
                 if (rc <= 0) rc = cleanup_rc;
             }
-            cleanup_rc = eval_entry_dispose(private_output);
-            if (cleanup_rc > 0 && rc <= 0) rc = cleanup_rc;
+            if (wl_columnar_relation_private_batch_disposable(record)) {
+                cleanup_rc = eval_entry_dispose(private_output);
+                if (cleanup_rc > 0 && rc <= 0) rc = cleanup_rc;
+            } else if (rc <= 0) rc = EINVAL;
         }
     }
     return wl_columnar_join_memory_error(sess, rc);
