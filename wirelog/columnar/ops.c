@@ -435,7 +435,7 @@ wl_columnar_ops_map_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
                     control);
             if (rc) goto cleanup;
             if (!supported) {
-                rc = wl_columnar_expr_numeric_interpreter_supported_controlled(
+                rc = wl_columnar_expr_interpreter_supported_controlled(
                     expr->data, expr->size, &supported, control);
                 if (rc) goto cleanup;
                 if (!supported) {
@@ -465,16 +465,19 @@ wl_columnar_ops_map_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
             if (expressions && c < expression_count && op->map_exprs[c].data
                 && op->map_exprs[c].size) {
                 bool failed; int64_t value;
+                wl_columnar_expr_status_t status = WL_COLUMNAR_EXPR_OK;
                 rc =
                     expressions[c] ?
                     wl_columnar_expr_eval_compiled_controlled(expressions[c],
                         row, source->ncols, &value, &failed, control)
-                    : wl_columnar_expr_eval_numeric_interpreter_controlled(
+                    : wl_columnar_expr_eval_interpreter_controlled(
                     op->map_exprs[c].data, op->map_exprs[c].size,
-                    row, source->ncols, &value, &failed, control);
+                    row, source->ncols, &value, &failed, sess, &status,
+                    control);
                 if (rc) goto cleanup;
                 if (failed) {
-                    rc = ERANGE; goto cleanup;
+                    rc = status == WL_COLUMNAR_EXPR_ALLOCATION_FAILURE
+                        ? ENOMEM : ERANGE; goto cleanup;
                 }
                 rc = wl_evaluation_control_charge(control, 1);
                 if (rc) goto cleanup;

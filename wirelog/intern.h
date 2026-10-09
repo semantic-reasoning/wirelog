@@ -32,6 +32,9 @@
 #define WIRELOG_INTERN_H
 
 #include <stdint.h>
+#include <stdbool.h>
+
+typedef struct wl_evaluation_control wl_evaluation_control_t;
 
 typedef struct wl_intern wl_intern_t;
 typedef struct wl_columnar_memory_governor_ref
@@ -99,6 +102,19 @@ wl_intern_put(wl_intern_t *intern, const char *str);
  * denial, ordinary allocation failure, and arithmetic overflow. */
 int
 wl_intern_put_checked(wl_intern_t *intern, const char *str, int64_t *out_id);
+
+/* Execution rc is separate from checked-put status. Results are valid only
+ * with rc0. Published IDs remain table-owned after a later caller stop. */
+int
+wl_intern_put_controlled(wl_intern_t *intern, const char *str, int64_t *out_id,
+    int *status, bool *budget_denied, wl_evaluation_control_t *control);
+
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_intern_test_controlled_checkpoint)(wl_evaluation_control_t *,
+    unsigned, uint64_t);
+extern int wl_intern_test_fail_allocation;
+extern bool wl_intern_test_fail_commit;
+#endif
 
 /**
  * wl_intern_get:

@@ -721,6 +721,363 @@ fail:
     return failure;
 }
 
+/* Controlled publication keeps the existing table governor under its actual
+ * writer lock. All engine loops poll; mutex waiting is a platform primitive. */
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_intern_test_controlled_checkpoint)(wl_evaluation_control_t *,
+    unsigned, uint64_t);
+int wl_intern_test_fail_allocation = -1;
+bool wl_intern_test_fail_commit;
+#endif
+static int
+wl_intern_controlled_step(wl_evaluation_control_t *control, unsigned stage,
+    uint64_t progress)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_intern_test_controlled_checkpoint)
+        wl_intern_test_controlled_checkpoint(control, stage, progress);
+#else
+    (void)stage; (void)progress;
+#endif
+    return wl_evaluation_control_charge(control, 0);
+}
+static void *
+wl_intern_controlled_malloc(size_t bytes)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_intern_test_fail_allocation >= 0
+        && wl_intern_test_fail_allocation-- == 0) {
+        wl_intern_test_fail_allocation = -1;
+        return NULL;
+    }
+#endif
+    return malloc(bytes);
+}
+static int
+wl_intern_controlled_hash(const char *str, uint32_t *out,
+    wl_evaluation_control_t *control, unsigned stage)
+{
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0;; i++) {
+        int rc = wl_evaluation_control_charge(control, 4);
+        if (rc) return rc;
+        unsigned char byte = (unsigned char)str[i];
+        if (byte) {
+            hash ^= byte; hash *= 16777619u;
+        }
+        rc = wl_intern_controlled_step(control, stage, i + 1);
+        if (rc) return rc;
+        if (!byte) {
+            *out = hash; return 0;
+        }
+    }
+}
+static int
+wl_intern_controlled_equal(const char *a, const char *b, bool *equal,
+    wl_evaluation_control_t *control)
+{
+    for (size_t i = 0;; i++) {
+        int rc = wl_evaluation_control_charge(control, 3);
+        if (rc) return rc;
+        unsigned char av = (unsigned char)a[i], bv = (unsigned char)b[i];
+        rc = wl_intern_controlled_step(control, 4, i + 1);
+        if (rc) return rc;
+        if (av != bv || !av) {
+            *equal = av == bv; return 0;
+        }
+    }
+}
+static int
+wl_intern_controlled_admit(wl_columnar_memory_governor_t *governor,
+    uint64_t old, uint64_t bytes, bool growth,
+    wl_columnar_memory_reservation_t *token, int *status, bool *denied,
+    wl_evaluation_control_t *control)
+{
+    wl_columnar_memory_admission_status_t admission;
+    int rc = growth ? wl_columnar_memory_governor_reserve_growth_controlled(
+        governor, old, bytes, token, &admission, control)
+        : wl_columnar_memory_governor_reserve_checked_controlled(governor,
+            bytes, token, &admission, control);
+    if (rc) return rc;
+    if (admission == WL_COLUMNAR_MEMORY_ADMISSION_OK
+        || admission == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) return 0;
+    *denied = admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED;
+    *status = *denied ? WL_INTERN_ERR_MEMORY_BUDGET :
+        admission == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : EINVAL;
+    return 0;
+}
+int
+wl_intern_put_controlled(wl_intern_t *intern, const char *str, int64_t *out_id,
+    int *status, bool *budget_denied, wl_evaluation_control_t *control)
+{
+    if (!intern || !str || !out_id || !status || !budget_denied) return EINVAL;
+    if (!control) {
+        *status = wl_intern_put_checked(intern, str, out_id);
+        *budget_denied = *status == WL_INTERN_ERR_MEMORY_BUDGET;
+        return 0;
+    }
+    int rc = wl_evaluation_control_charge(control, 48), failure = 0;
+    if (rc) return rc;
+    bool denied = false, scratch_live = false, pending_live = false;
+    bool pending_committed = false;
+    char *copy = NULL; char **segment = NULL;
+    wl_intern_slot_t *slots = NULL;
+    wl_columnar_memory_reservation_t scratch, pending, retired;
+    wl_columnar_memory_reservation_init(&scratch);
+    wl_columnar_memory_reservation_init(&pending);
+    wl_columnar_memory_reservation_init(&retired);
+    wl_mutex_lock(&intern->lock);
+    wl_columnar_memory_governor_t *governor = intern->memory_governor
+        ? wl_columnar_memory_governor_ref_get(intern->memory_governor) : NULL;
+    size_t length = 0;
+    for (;;) {
+        rc = wl_evaluation_control_charge(control, 2);
+        if (rc) goto fail;
+        unsigned char byte = (unsigned char)str[length];
+        rc = wl_intern_controlled_step(control, 1, length + 1);
+        if (rc) goto fail;
+        if (!byte) break;
+        if (length == SIZE_MAX - 1) {
+            rc = EOVERFLOW; goto fail;
+        }
+        length++;
+    }
+    size_t bytes = length + 1;
+    if (governor) {
+        rc = wl_intern_controlled_admit(governor, 0, bytes, false, &scratch,
+                &failure, &denied, control);
+        if (rc || failure) goto fail;
+        scratch_live = true;
+    }
+    rc = wl_evaluation_control_charge(control, 1);
+    if (rc) goto fail;
+    copy = wl_intern_controlled_malloc(bytes);
+    if (!copy) {
+        failure = ENOMEM; goto fail;
+    }
+    rc = wl_intern_controlled_step(control, 2, 0);
+    if (rc) goto fail;
+    for (size_t i = 0; i < bytes; i++) {
+        rc = wl_evaluation_control_charge(control, 2);
+        if (rc) goto fail;
+        copy[i] = str[i];
+        rc = wl_intern_controlled_step(control, 2, i + 1);
+        if (rc) goto fail;
+    }
+    uint32_t hash;
+    rc = wl_intern_controlled_hash(copy, &hash, control, 3);
+    if (rc) goto fail;
+    uint32_t h = hash & (intern->slot_capacity - 1);
+    int64_t result = -1;
+    for (;;) {
+        rc = wl_evaluation_control_charge(control, 20);
+        if (rc) goto fail;
+        uint32_t id = intern->slots[h].string_id;
+        rc = wl_intern_controlled_step(control, 5, h);
+        if (rc) goto fail;
+        if (id == SLOT_EMPTY) break;
+        bool equal;
+        rc = wl_intern_controlled_equal(intern_string_at(intern, id), copy,
+                &equal, control);
+        if (rc) goto fail;
+        if (equal) {
+            result = id; break;
+        }
+        h = (h + 1) & (intern->slot_capacity - 1);
+    }
+    if (result >= 0) {
+        rc = wl_evaluation_control_charge(control, 16);
+        if (rc) goto fail;
+        rc = wl_intern_controlled_step(control, 9, 0);
+        if (rc) goto fail;
+        free(copy); copy = NULL;
+        if (scratch_live && !wl_columnar_memory_rollback(&scratch)) abort();
+        wl_mutex_unlock(&intern->lock);
+        *out_id = result; *status = 0; *budget_denied = false;
+        return 0;
+    }
+    rc = wl_evaluation_control_charge(control, 48);
+    if (rc) goto fail;
+    uint32_t id = WL_INTERN_LOAD_RELAXED(&intern->count);
+    if (id >= INTERN_MAX_STRINGS) {
+        failure = EOVERFLOW; goto fail;
+    }
+    uint32_t seg = intern_seg_of(id);
+    bool need_segment = !intern->segments[seg];
+    bool resize = (uint64_t)(id + 1) * INTERN_LOAD_FACTOR_DEN
+        > (uint64_t)intern->slot_capacity * INTERN_LOAD_FACTOR_NUM;
+    if (resize && intern->slot_capacity > UINT32_MAX / 2) {
+        rc = EOVERFLOW; goto fail;
+    }
+    uint32_t capacity = resize ? intern->slot_capacity *
+        2 : intern->slot_capacity;
+    uint64_t segment_bytes = need_segment
+        ? (uint64_t)intern_seg_size(seg) * sizeof(char *) : 0;
+    uint64_t slot_bytes = resize ? (uint64_t)capacity * sizeof(*slots) : 0;
+    uint64_t old_slots = resize ? (uint64_t)intern->slot_capacity *
+        sizeof(*slots) : 0;
+    uint64_t retained = intern->reserved_bytes;
+    if (segment_bytes > SIZE_MAX || slot_bytes > SIZE_MAX) {
+        rc = EOVERFLOW; goto fail;
+    }
+    if (governor) {
+        if (old_slots > retained
+            || !wl_columnar_memory_size_add(retained - old_slots, bytes,
+            &retained)
+            || !wl_columnar_memory_size_add(retained, segment_bytes, &retained)
+            || !wl_columnar_memory_size_add(retained, slot_bytes, &retained)) {
+            rc = EOVERFLOW; goto fail;
+        }
+    }
+    rc = wl_intern_controlled_step(control, 6, 0);
+    if (rc) goto fail;
+    if (governor) {
+        rc = wl_intern_controlled_admit(governor, intern->reserved_bytes,
+                retained, true, &pending, &failure, &denied, control);
+        if (rc || failure) goto fail;
+        pending_live = true;
+    }
+    if (need_segment) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc) goto fail;
+        segment = wl_intern_controlled_malloc((size_t)segment_bytes);
+        if (!segment) {
+            failure = ENOMEM; goto fail;
+        }
+        for (uint32_t i = 0; i < intern_seg_size(seg); i++) {
+            rc = wl_evaluation_control_charge(control, 1);
+            if (rc) goto fail;
+            segment[i] = NULL;
+            rc = wl_intern_controlled_step(control, 7, i + 1);
+            if (rc) goto fail;
+        }
+    }
+    if (resize) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc) goto fail;
+        slots = wl_intern_controlled_malloc((size_t)slot_bytes);
+        if (!slots) {
+            failure = ENOMEM; goto fail;
+        }
+        for (uint32_t i = 0; i < capacity; i++) {
+            rc = wl_evaluation_control_charge(control, 1);
+            if (rc) goto fail;
+            slots[i].string_id = SLOT_EMPTY;
+            rc = wl_intern_controlled_step(control, 8, i + 1);
+            if (rc) goto fail;
+        }
+        for (uint32_t i = 0; i < id; i++) {
+            rc = wl_evaluation_control_charge(control, 20);
+            if (rc) goto fail;
+            const char *old = intern_string_at(intern, i);
+            rc = wl_intern_controlled_step(control, 10, i + 1);
+            if (rc) goto fail;
+            uint32_t key;
+            rc = wl_intern_controlled_hash(old, &key, control, 11);
+            if (rc) goto fail;
+            uint32_t at = key & (capacity - 1);
+            for (;;) {
+                rc = wl_evaluation_control_charge(control, 2);
+                if (rc) goto fail;
+                bool empty = slots[at].string_id == SLOT_EMPTY;
+                rc = wl_intern_controlled_step(control, 12, at);
+                if (rc) goto fail;
+                if (empty) break;
+                at = (at + 1) & (capacity - 1);
+            }
+            rc = wl_evaluation_control_charge(control, 1);
+            if (rc) goto fail;
+            slots[at].string_id = i;
+            rc = wl_intern_controlled_step(control, 10, i + 1);
+            if (rc) goto fail;
+        }
+        h = hash & (capacity - 1);
+        for (;;) {
+            rc = wl_evaluation_control_charge(control, 2);
+            if (rc) goto fail;
+            bool empty = slots[h].string_id == SLOT_EMPTY;
+            rc = wl_intern_controlled_step(control, 12, h);
+            if (rc) goto fail;
+            if (empty) break;
+            h = (h + 1) & (capacity - 1);
+        }
+    }
+    if (governor) {
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_intern_test_fail_commit) {
+            wl_intern_test_fail_commit = false; failure = ENOMEM; goto fail;
+        }
+#endif
+        bool accepted;
+        rc = wl_columnar_memory_governor_commit_controlled(&pending, intern,
+                &accepted, control);
+        if (rc) goto fail;
+        if (!accepted) {
+            failure = ENOMEM; goto fail;
+        }
+        pending_committed = true;
+    }
+    rc = wl_evaluation_control_charge(control, 48);
+    if (rc) goto fail;
+    if (governor && (pending.identity != &pending
+        || pending.bytes != retained || pending.governor != governor
+        || atomic_load_explicit(&pending.state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        || intern->reservation.identity != &intern->reservation
+        || intern->reservation.bytes != intern->reserved_bytes
+        || intern->reservation.governor != governor
+        || atomic_load_explicit(&intern->reservation.state,
+        memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED)) {
+        failure = EINVAL; goto fail;
+    }
+    rc = wl_intern_controlled_step(control, 13, id);
+    if (rc) goto fail;
+    /* Two real token moves32 EACH (64), canonical/address fields at most16,
+     * result fields3 and unlock1 total84;96 covers publication. Credit
+     * retirement below is mandatory owner cleanup, not forward engine work. */
+    rc = wl_evaluation_control_charge(control, 96);
+    if (rc) goto fail;
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto fail;
+    wl_intern_slot_t *old = intern->slots;
+    if (governor) {
+        if (!wl_columnar_memory_reservation_move(&retired, &intern->reservation)
+            || !wl_columnar_memory_reservation_move(&intern->reservation,
+            &pending))
+            abort();
+        pending_live = false;
+    }
+    if (resize) {
+        intern->slots = slots; intern->slot_capacity = capacity; slots = NULL;
+    }
+    if (segment) {
+        intern->segments[seg] = segment; segment = NULL;
+    }
+    intern->segments[seg][id - intern_seg_base(seg)] = copy; copy = NULL;
+    intern->slots[h].string_id = id;
+    if (governor) intern->reserved_bytes = retained;
+    WL_INTERN_STORE_RELEASE(&intern->count, id + 1);
+    if (resize) free(old);
+    if (governor && !wl_columnar_memory_release(&retired)) abort();
+    if (scratch_live && !wl_columnar_memory_rollback(&scratch)) abort();
+    wl_mutex_unlock(&intern->lock);
+    *out_id = id; *status = 0; *budget_denied = false;
+    return 0;
+fail:
+    free(copy); free(segment); free(slots);
+    if (pending_live) {
+        bool released = pending_committed ? wl_columnar_memory_release(&pending)
+            : wl_columnar_memory_rollback(&pending);
+        if (!released) abort();
+    }
+    if (scratch_live && !wl_columnar_memory_rollback(&scratch)) abort();
+    wl_mutex_unlock(&intern->lock);
+    if (rc) return rc;
+    *out_id = -1; *status = failure; *budget_denied = denied;
+    return 0;
+}
+
 int64_t
 wl_intern_get(const wl_intern_t *intern, const char *str)
 {
