@@ -1559,6 +1559,21 @@ wl_columnar_merge_consolidate_shape(col_rel_t *r, wl_evaluation_control_t *c)
     return 0;
 }
 
+/* Fresh actual MAP output only; borrowed shape validation remains separate. */
+static int
+wl_columnar_merge_consolidate_owned_shape(col_rel_t *r,
+    wl_evaluation_control_t *c)
+{
+    int rc = wl_evaluation_control_charge(c, 64); if (rc) return rc;
+    if (r->storage_owner != r || !r->relation_identity || r->arena_owned
+        || r->col_shared || col_rel_storage_alias_borrow_count(r)
+        || r->storage_owner_identity != r->relation_identity
+        || r->storage_owner_generation != r->storage_generation)
+        return ENOTSUP;
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    return wl_columnar_merge_consolidate_shape(r, c);
+}
+
 static int
 wl_columnar_merge_consolidate_dedup(wl_columnar_consolidate_record_t *record,
     wl_columnar_relation_private_batch_t *writer, col_rel_t *r,
@@ -1658,19 +1673,36 @@ wl_columnar_merge_consolidate_controlled(eval_stack_t *stack,
         || !stack->items[stack->top - 1u].rel) return EINVAL;
     uint32_t slot = stack->top - 1u;
     eval_entry_t *original = &stack->items[slot];
-    if (original->owned || original->is_delta) return ENOTSUP;
+    if (original->is_delta) return ENOTSUP;
+    bool owned = original->owned;
+    /* Scalar producer binding only: no stale prior payload dereference. */
+    rc = wl_evaluation_control_charge(c, 32); if (rc) return rc;
+    if (owned && (writer->phase != WL_COLUMNAR_RELATION_PRIVATE_RETIRED
+        || writer->batch.relation != original->rel)) return ENOTSUP;
+    wl_columnar_relation_consolidate_checkpoint(c, 42, 0, record,
+        original->rel);
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    uint32_t *segments = original->seg_boundaries;
+    uint32_t segment_count = original->seg_count;
     col_rel_t *in = original->rel, *out = NULL;
     bool committed = false;
     rc = wl_columnar_relation_source_group_acquire_controlled(group, in, NULL,
             c);
     wl_columnar_relation_consolidate_checkpoint(c, 25, 0, record, in);
     if (rc) goto cleanup;
-    rc = wl_columnar_merge_consolidate_shape(in, c); if (rc) goto cleanup;
-    if (in->nrows <= 1u) {
+    rc = owned ? wl_columnar_merge_consolidate_owned_shape(in, c)
+        : wl_columnar_merge_consolidate_shape(in, c);
+    if (rc) goto cleanup;
+    rc = wl_evaluation_control_charge(c, 32); if (rc) goto cleanup;
+    bool normalized_small = in->nrows <= 1u && in->sorted_nrows == in->nrows
+        && in->run_count == 1 && in->run_ends[0] == in->nrows && !segments;
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto cleanup;
+    if (in->nrows <= 1u && (!owned || normalized_small)) {
         rc = wl_columnar_relation_source_group_release_readers(group, 0);
         if (rc) goto cleanup;
         rc = wl_evaluation_control_charge(c, 32); if (rc) goto cleanup;
-        if (stack->top != slot + 1u || original->rel != in || original->owned) {
+        if (stack->top != slot + 1u || original->rel != in ||
+            original->owned != owned) {
             rc = EBUSY; goto cleanup;
         }
         rc = wl_columnar_relation_source_group_validate_writers(group);
@@ -1683,14 +1715,67 @@ wl_columnar_merge_consolidate_controlled(eval_stack_t *stack,
         return wl_columnar_relation_source_group_drain(group, 0);
     }
     rc = wl_evaluation_control_charge(c, 32); if (rc) goto cleanup;
-    if (in->nrows > 10000 || original->seg_count > 1
+    if (in->nrows > 1u && (in->nrows > 10000 || original->seg_count > 1
         || (original->seg_boundaries && (original->seg_count != 1
         || original->seg_boundaries[0] ||
         original->seg_boundaries[1] != in->nrows))
-        || (in->sorted_nrows && in->sorted_nrows < in->nrows)) {
+        || (in->sorted_nrows && in->sorted_nrows < in->nrows))) {
         rc = ENOTSUP; goto cleanup;
     }
     rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto cleanup;
+    if (owned) {
+        /* Readonly authority must be completely drained before mutation. */
+        rc = wl_columnar_relation_source_group_drain(group, 0);
+        if (rc) goto cleanup;
+        rc = wl_evaluation_control_charge(c, 64); if (rc) goto cleanup;
+        if (stack->top != slot + 1u || original->rel != in
+            || !original->owned || original->is_delta
+            || original->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION
+            || original->seg_boundaries != segments
+            || original->seg_count != segment_count) {
+            rc = EBUSY; goto cleanup;
+        }
+        wl_columnar_relation_consolidate_checkpoint(c, 38, 0, record, in);
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto cleanup;
+        /* Charge both entry writes; no poll between the sole-owner move. */
+        rc = wl_evaluation_control_charge(c, 2u * sizeof(*result));
+        if (rc) goto cleanup;
+        *result = *original; *original = (eval_entry_t){0}; out = in;
+        wl_columnar_relation_consolidate_checkpoint(c, 39, 0, record, out);
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto cleanup;
+        rc = wl_columnar_relation_private_append_batch_begin_controlled(writer,
+                out, c); if (rc) goto cleanup;
+        rc = wl_columnar_merge_consolidate_owned_shape(out, c);
+        if (rc) goto cleanup;
+        rc = wl_evaluation_control_charge(c, 32); if (rc) goto cleanup;
+        if (out->nrows > 1u && (out->nrows > 10000 || result->seg_count > 1
+            || (result->seg_boundaries && (result->seg_count != 1
+            || result->seg_boundaries[0]
+            || result->seg_boundaries[1] != out->nrows))
+            || (out->sorted_nrows && out->sorted_nrows < out->nrows))) {
+            rc = ENOTSUP; goto cleanup;
+        }
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto cleanup;
+        if (out->nrows <= 1u) {
+            rc = wl_evaluation_control_charge(c, 64); if (rc) goto cleanup;
+            if (col_rel_mutation_lease_validate(&writer->batch.single.lease,
+                out)) {
+                rc = EINVAL; goto cleanup;
+            }
+            rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto cleanup;
+            rc = wl_evaluation_control_charge(c, 32); if (rc) goto cleanup;
+            wl_columnar_relation_consolidate_checkpoint(c, 40, 0, record, out);
+            rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto cleanup;
+            free(result->seg_boundaries); result->seg_boundaries = NULL;
+            result->seg_count = 0;
+            out->sorted_nrows = out->nrows; out->run_count = 1;
+            out->run_ends[0] = out->nrows;
+            goto owned_finish;
+        }
+        rc = wl_columnar_merge_consolidate_reset(record, c);
+        if (rc) goto cleanup;
+        goto prepare;
+    }
     rc = wl_columnar_merge_consolidate_reset(record, c); if (rc) goto cleanup;
     rc = wl_columnar_relation_pool_new_like_held_controlled(&out,
             sess->delta_pool,
@@ -1728,6 +1813,7 @@ wl_columnar_merge_consolidate_controlled(eval_stack_t *stack,
     if (rc) goto cleanup;
     rc = wl_columnar_relation_private_append_batch_begin_controlled(writer, out,
             c); if (rc) goto cleanup;
+prepare:;
     wl_columnar_relation_mutation_lease_t *lease = &writer->batch.single.lease;
     wl_columnar_memory_admission_status_t status;
     rc = wl_columnar_memory_governor_reserve_checked_controlled(
@@ -1786,10 +1872,35 @@ wl_columnar_merge_consolidate_controlled(eval_stack_t *stack,
     if (rc) goto cleanup;
     wl_columnar_relation_consolidate_checkpoint(c, 32, out->view_generation,
         record, out);
+owned_finish:
     rc = wl_columnar_relation_private_append_batch_end_controlled(writer);
     if (rc) goto cleanup;
     rc = wl_columnar_relation_consolidate_retire(record, 0);
     if (rc) goto cleanup;
+    if (owned) {
+        rc = wl_evaluation_control_charge(c, 96); if (rc) goto cleanup;
+        if (!wl_columnar_relation_private_batch_disposable(writer)
+            || (record->phase != WL_COLUMNAR_CONSOLIDATE_RETIRED
+            && record->phase != WL_COLUMNAR_CONSOLIDATE_INERT)
+            || stack->top != slot + 1u || original->rel || original->owned
+            || original->seg_boundaries || original->continuation
+            || result->rel != out || !result->owned
+            || group->descriptor_count || group->owner_count) {
+            rc = EBUSY; goto cleanup;
+        }
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto cleanup;
+        /* Two entry writes plus segment disposal/transport scalar writes. */
+        rc = wl_evaluation_control_charge(c, 2u * sizeof(*result) + 32u);
+        if (rc) goto cleanup;
+        wl_columnar_relation_consolidate_checkpoint(c, 41, 0, record, out);
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto cleanup;
+        /* Segment transport is no longer needed after whole-boundary SET. */
+        free(result->seg_boundaries); result->seg_boundaries = NULL;
+        result->seg_count = 0;
+        /* No fallible operation between the two ownership writes. */
+        *original = *result; *result = (eval_entry_t){0};
+        return 0;
+    }
     rc = wl_columnar_relation_source_group_release_readers(group, 0);
     if (rc) goto cleanup;
     rc = wl_evaluation_control_charge(c, 64); if (rc) goto cleanup;

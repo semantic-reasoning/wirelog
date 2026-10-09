@@ -228,12 +228,12 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
         return EINVAL;
     if (sess->base.evaluation_control) {
         wl_evaluation_control_t *control = sess->base.evaluation_control;
-        int rc = wl_evaluation_control_charge(control, 32);
+        int rc = wl_evaluation_control_charge(control, 40);
         if (rc)
             return rc;
-        /* Five exact routes. Share the two-op VARIABLE predicate so the
-         * finite header still fits32; no plan/name traversal occurs here.
-         * Suffixes retain FILTER48, MAP/REDUCE56 and pipeline64. */
+        /* Seven exact routes: shared pair/triple predicates and bounded opcode
+         * checks fit the charged 40-unit header. No plan traversal occurs.
+         * Three-op suffixes charge32, pair MAP/REDUCE/CONSOLIDATE24. */
         bool join = rplan->op_count == 1
             && rplan->ops[0].op == WL_PLAN_OP_JOIN;
         bool variable_pair = rplan->op_count == 2
@@ -243,11 +243,16 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
         bool reduce = variable_pair && rplan->ops[1].op == WL_PLAN_OP_REDUCE;
         bool consolidate = variable_pair &&
             rplan->ops[1].op == WL_PLAN_OP_CONSOLIDATE;
-        bool pipeline = rplan->op_count == 3
-            && rplan->ops[0].op == WL_PLAN_OP_VARIABLE
+        bool variable_triple = rplan->op_count == 3
+            && rplan->ops[0].op == WL_PLAN_OP_VARIABLE;
+        bool pipeline = variable_triple
             && rplan->ops[1].op == WL_PLAN_OP_FILTER
             && rplan->ops[2].op == WL_PLAN_OP_MAP;
-        if (!join && !filter && !map && !pipeline && !reduce && !consolidate)
+        bool owned_consolidate = variable_triple
+            && rplan->ops[1].op == WL_PLAN_OP_MAP
+            && rplan->ops[2].op == WL_PLAN_OP_CONSOLIDATE;
+        if (!join && !filter && !map && !pipeline && !reduce && !consolidate
+            && !owned_consolidate)
             return ENOTSUP;
         const wl_plan_op_t *op = &rplan->ops[0];
         if (sess->num_workers > 1 || sess->diff_operators_active
@@ -258,9 +263,11 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
             || !sess->memory_governor
             || op->delta_mode != WL_DELTA_FORCE_FULL)
             return ENOTSUP;
-        if (filter || map || pipeline || reduce || consolidate) {
+        if (filter || map || pipeline || reduce || consolidate ||
+            owned_consolidate) {
             rc = wl_evaluation_control_charge(control,
-                    pipeline ? 32u : map || reduce || consolidate ? 24u : 16u);
+                    pipeline || owned_consolidate ? 32u : map || reduce ||
+                    consolidate ? 24u : 16u);
             if (rc)
                 return rc;
             if (sess->current_iteration || sess->delta_observer)

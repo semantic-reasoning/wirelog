@@ -4313,11 +4313,11 @@ test_controlled_join_keyed_first(void)
         CHECK(join_dispatch(sess, frame, &op, c) == 0);
         uint64_t cost = finish(c, 0);
         if (empty) {
-            /* Entry guard32 + name/entry22 + grouped inputs98 + shape34,
+            /* Entry guard40 + name/entry22 + grouped inputs98 + shape34,
              * arithmetic64 + bucket doubling11 + scratch16 + keys13 + types2,
              * fresh ctor161 + type BUILD186 + ledger56 + durable writer admission,
              * bucket zero2048 + build1539 + empty probes1026 + outer513 + final116. */
-            CHECK(cost == 32 + 22 + 98 + 34 + 64 + 11 + 16 + 13 + 2
+            CHECK(cost == 40 + 22 + 98 + 34 + 64 + 11 + 16 + 13 + 2
                 + 161 + 186 + 56 + private_writer_begin_cost() + 2048 + 1539
                 + 1026 + 513 + 116 + 96 + 64);
         }
@@ -4868,11 +4868,11 @@ test_controlled_join_entry_refusal(void)
         } else {
             plan.op_count = 0;
         }
-        wl_evaluation_control_t *c = control(mode == 20 ? 31 : 32);
+        wl_evaluation_control_t *c = control(mode == 20 ? 39 : 40);
         sess->base.evaluation_control = c;
         int expected = mode == 20 ? WL_EVALUATION_CONTROL_WORK_LIMIT : ENOTSUP;
         CHECK(col_eval_relation_plan(&plan, stack, sess) == expected);
-        CHECK(finish(c, expected) == (mode == 20 ? 0u : 32u));
+        CHECK(finish(c, expected) == (mode == 20 ? 0u : 40u));
         CHECK(stack->top == 1 && !memcmp(&before, &stack->items[0],
             sizeof(before)));
         CHECK(!wl_columnar_eval_stack_cleanup_result(frame)->rel &&
@@ -4899,7 +4899,7 @@ test_controlled_join_entry_refusal(void)
         int expected = positive ? EOVERFLOW : WL_EVALUATION_CONTROL_CANCELLED;
         CHECK(join_dispatch(sess, frame, &op,
             c) == expected && join_entry_reached == 1);
-        CHECK(finish(c, expected) == 32);
+        CHECK(finish(c, expected) == 40);
         CHECK(wl_columnar_eval_stack_cleanup_stack(frame)->top == 1);
         CHECK(!wl_columnar_eval_stack_cleanup_result(frame)->rel);
         source_unpinned(left, left);
@@ -5006,7 +5006,7 @@ test_controlled_join_empty_right_visits(void)
         uint64_t cost = finish(c, 0);
         /* Fixed entry/group/shape/scratch, actual type and constructor widths,
         * BUILD schema, one L request, B1 admission,513 visits and final116. */
-        CHECK(cost == 32 + 22 + 98 + 33 + 64 + 16 + (zero ? 1u : 2u)
+        CHECK(cost == 40 + 22 + 98 + 33 + 64 + 16 + (zero ? 1u : 2u)
             + constructor_cost("$join", zero ? 1u : 2u, COL_REL_INIT_CAP, false)
             + (zero ? 169u : 186u) + 56 + private_writer_begin_cost()
             + 513 + 116 + 96 + 64);
@@ -5528,7 +5528,7 @@ test_controlled_filter_rejected_cost_and_registry(void)
     wl_columnar_join_test_controlled_checkpoint = join_stop;
     CHECK(filter_dispatch(sess, frame, (wl_plan_expr_buffer_t){0}, name, c)
         == WL_EVALUATION_CONTROL_CANCELLED);
-    CHECK(finish(c, WL_EVALUATION_CONTROL_CANCELLED) == 48u + 16u + 1u + 300u);
+    CHECK(finish(c, WL_EVALUATION_CONTROL_CANCELLED) == 56u + 16u + 1u + 300u);
     CHECK(join_stage_reached == 1);
     CHECK(!wl_columnar_eval_stack_cleanup_stack(frame)->top);
     source_unpinned(source, source);
@@ -5737,9 +5737,9 @@ test_controlled_filter_graph_precedence(void)
                         0);
             wl_evaluation_control_t *c = control(0);
             CHECK(filter_dispatch(sess, frame, expr, "work", c) == EINVAL);
-            /* Dispatch48 + VARIABLE30 + frame owner96 + FILTER16 + lazy group94 + shape16.
+            /* Dispatch56 + VARIABLE30 + frame owner96 + FILTER16 + lazy group94 + shape16.
              * No expression, scratch or constructor primitive was reached. */
-            CHECK(finish(c, EINVAL) == 300);
+            CHECK(finish(c, EINVAL) == 308);
             CHECK(wl_columnar_relation_test_constructor_fail_allocation == 1);
             CHECK(wl_columnar_filter_test_fail_next_scratch_alloc ==
                 (failure == 1));
@@ -14078,10 +14078,350 @@ test_consolidate_exact_work(void)
     }
 }
 
+/* Complete actual MAP producer -> owned SET suffix. MAP's output schema is
+ * implicit INT64, including any integer intern-ID payload. */
+static wl_columnar_eval_stack_cleanup_frame_t *owned_consolidate_frame;
+static col_rel_t *owned_consolidate_output;
+static wl_columnar_relation_mutation_lease_t *owned_consolidate_lease;
+static uint64_t owned_consolidate_old_nonce, owned_consolidate_view;
+static uint64_t owned_consolidate_storage;
+static unsigned owned_consolidate_mode, owned_consolidate_seen;
+static int owned_consolidate_stop_stage;
+static bool owned_consolidate_overflow, owned_consolidate_map_done;
+static bool owned_consolidate_reset_stop, owned_consolidate_needs_sort;
+static unsigned owned_consolidate_constructor_baseline,
+    owned_consolidate_adoptions;
+static void
+owned_consolidate_map(wl_evaluation_control_t *c, int stage, uint64_t progress,
+    wl_columnar_relation_source_group_t *group, col_rel_t *source)
+{
+    (void)c; (void)progress; (void)group; (void)source;
+    if (stage != 9) return;
+    eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(
+        owned_consolidate_frame);
+    wl_columnar_relation_private_batch_t *writer =
+        wl_columnar_eval_stack_cleanup_reduce_batch(owned_consolidate_frame);
+    CHECK(result->owned && writer && writer->batch.relation == result->rel
+        && writer->phase == WL_COLUMNAR_RELATION_PRIVATE_HELD);
+    owned_consolidate_output = result->rel;
+    CHECK(!result->rel->column_types);
+    owned_consolidate_lease = &writer->batch.single.lease;
+    CHECK(col_rel_mutation_lease_validate(owned_consolidate_lease,
+        result->rel) == 0);
+    owned_consolidate_old_nonce = owned_consolidate_lease->acquisition_nonce;
+    owned_consolidate_view = result->rel->view_generation;
+    owned_consolidate_storage = result->rel->storage_generation;
+    owned_consolidate_needs_sort = false;
+    for (uint32_t row = 1; row < result->rel->nrows; row++)
+        if (col_rel_row_cmp(result->rel, row - 1u, row) > 0)
+            owned_consolidate_needs_sort = true;
+    owned_consolidate_constructor_baseline = consolidate_constructor_calls;
+    /* Metadata fixture writes occur under this actual producer writer. */
+    if (owned_consolidate_mode == 1) {
+        result->rel->sorted_nrows = result->rel->nrows;
+        result->rel->run_count = 1;
+        result->rel->run_ends[0] = result->rel->nrows;
+    } else if (owned_consolidate_mode == 2) {
+        result->rel->run_count = 0;
+    }
+    if (owned_consolidate_mode == 1 || owned_consolidate_mode == 2)
+        wl_columnar_consolidate_test_fail_allocation = 0;
+    owned_consolidate_map_done = true;
+}
+static void
+owned_consolidate_private(wl_evaluation_control_t *c,
+    wl_columnar_relation_private_batch_t *writer, int stage, uint64_t progress)
+{
+    if (!owned_consolidate_map_done || !owned_consolidate_reset_stop
+        || stage != 1 || progress != 128 || owned_consolidate_seen) return;
+    CHECK(writer->phase == WL_COLUMNAR_RELATION_PRIVATE_RESETTING);
+    owned_consolidate_seen++;
+    wl_evaluation_control_request_cancel(c);
+}
+static void
+owned_consolidate_checkpoint(wl_evaluation_control_t *c, int stage,
+    uint64_t progress, wl_columnar_consolidate_record_t *record, col_rel_t *r)
+{
+    (void)progress; (void)record;
+    if (!c) return;
+    eval_stack_t *st = wl_columnar_eval_stack_cleanup_stack(
+        owned_consolidate_frame);
+    eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(
+        owned_consolidate_frame);
+    if (stage == 42) {
+        /* Actual stack-owned metadata after MAP publication; no schema retag. */
+        if (owned_consolidate_mode == 1) st->items[0].seg_count = 7;
+        else if (owned_consolidate_mode == 2) {
+            st->items[0].seg_boundaries = malloc(2u * sizeof(uint32_t));
+            CHECK(st->items[0].seg_boundaries);
+            st->items[0].seg_boundaries[0] = 0;
+            st->items[0].seg_boundaries[1] = r->nrows;
+            st->items[0].seg_count = 1;
+        }
+    }
+    if (stage == 25) {
+        CHECK(r == owned_consolidate_output && st->top == 1
+            && st->items[0].rel == r && st->items[0].owned && !result->rel);
+        CHECK(wl_columnar_relation_private_batch_disposable(
+                wl_columnar_eval_stack_cleanup_reduce_batch(
+                    owned_consolidate_frame)));
+    }
+    CHECK(consolidate_constructor_calls ==
+        owned_consolidate_constructor_baseline);
+    if (stage == 39) owned_consolidate_adoptions++;
+    if (stage == 26 || stage == 40) {
+        CHECK(record->phase == WL_COLUMNAR_CONSOLIDATE_INERT
+            && !record->starts && !record->ends && !record->sequence.boundaries
+            && !record->sequence.workspace.perm_a
+            && !record->sequence.workspace.insertion_rows
+            && !record->sequence.workspace.admission_active);
+        if (stage == 26) CHECK(!owned_consolidate_adoptions);
+    }
+    if (stage == 38) CHECK(st->items[0].owned && !result->rel);
+    if (stage == 39 || stage == 40 || stage == 41 || stage == 37) {
+        CHECK(st->top == 1 && !st->items[0].rel && !st->items[0].owned
+            && result->owned && result->rel == owned_consolidate_output);
+    }
+    if (stage == 37 || stage == 40) {
+        wl_columnar_relation_private_batch_t *writer =
+            wl_columnar_eval_stack_cleanup_reduce_batch(
+            owned_consolidate_frame);
+        CHECK(writer && &writer->batch.single.lease == owned_consolidate_lease
+            && owned_consolidate_lease->acquisition_nonce !=
+            owned_consolidate_old_nonce
+            && col_rel_mutation_lease_validate(owned_consolidate_lease,
+            r) == 0);
+    }
+    if (stage != owned_consolidate_stop_stage || owned_consolidate_seen) return;
+    owned_consolidate_seen++;
+    if (owned_consolidate_mode == 3 || owned_consolidate_mode == 4) {
+        CHECK(col_rel_source_reader_acquire(r, &join_retained_reader) == 0);
+        if (owned_consolidate_mode == 3) return;
+    }
+    if (owned_consolidate_overflow)
+        CHECK(wl_evaluation_control_charge(c, UINT64_MAX) == EOVERFLOW);
+    else wl_evaluation_control_request_cancel(c);
+}
+static int
+owned_consolidate_dispatch(wl_col_session_t *sess,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_evaluation_control_t *c,
+    uint32_t width)
+{
+    uint32_t *projections = malloc((width ? width : 1u) * sizeof(uint32_t));
+    CHECK(projections);
+    for (uint32_t col = 0; col < width; col++) projections[col] = col;
+    wl_plan_op_t ops[3] = {
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+         .delta_mode = WL_DELTA_FORCE_FULL},
+        {.op = WL_PLAN_OP_MAP, .project_count = width,
+         .project_indices = projections},
+        {.op = WL_PLAN_OP_CONSOLIDATE}
+    };
+    int rc = compiled_dispatch(sess, frame, ops, 3, c);
+    free(projections);
+    return rc;
+}
+static void
+owned_consolidate_hooks(wl_columnar_eval_stack_cleanup_frame_t *frame,
+    unsigned mode, int stop, bool overflow, bool reset)
+{
+    owned_consolidate_frame = frame; owned_consolidate_mode = mode;
+    owned_consolidate_stop_stage = stop; owned_consolidate_overflow = overflow;
+    owned_consolidate_reset_stop = reset; owned_consolidate_seen = 0;
+    owned_consolidate_map_done = false; owned_consolidate_adoptions = 0;
+    consolidate_constructor_calls = 0;
+    wl_columnar_relation_test_constructor_checkpoint =
+        consolidate_constructor_count;
+    wl_columnar_ops_map_test_controlled_checkpoint = owned_consolidate_map;
+    wl_columnar_consolidate_test_checkpoint = owned_consolidate_checkpoint;
+    wl_columnar_relation_test_private_checkpoint = owned_consolidate_private;
+}
+static void
+owned_consolidate_unhook(void)
+{
+    if (owned_consolidate_map_done)
+        CHECK(consolidate_constructor_calls ==
+            owned_consolidate_constructor_baseline);
+    if (owned_consolidate_mode == 1 || owned_consolidate_mode == 2)
+        CHECK(wl_columnar_consolidate_test_fail_allocation == 0);
+    wl_columnar_consolidate_test_fail_allocation = -1;
+    wl_columnar_ops_map_test_controlled_checkpoint = NULL;
+    wl_columnar_consolidate_test_checkpoint = NULL;
+    wl_columnar_relation_test_private_checkpoint = NULL;
+    wl_columnar_relation_test_constructor_checkpoint = NULL;
+}
+static void
+test_owned_consolidate_actual_twins(void)
+{
+    const uint32_t sizes[] = {0, 1, 2, 31, 32, 33, 513, 10000, 33, 33};
+    for (unsigned item = 0; item < sizeof(sizes) / sizeof(sizes[0]); item++)
+        for (unsigned order = 0; order < 4; order++) {
+            uint32_t rows = sizes[item], width = item == 8 ? 0u :
+                item == 9 ? 300u : 2u;
+            wl_col_session_t *sess = join_session(), *raw = join_session();
+            col_rel_t *source = relation(width, rows ? rows : 1u, rows, false,
+                    sess->memory_governor);
+            col_rel_t *ref = relation(width, rows ? rows : 1u, rows, false,
+                    raw->memory_governor);
+            consolidate_populate(source, order, false);
+            consolidate_populate(ref, order, false);
+            CHECK(session_add_rel(sess, source) == 0 &&
+                session_add_rel(raw, ref) == 0);
+            uint64_t hash = consolidate_source_hash(source),
+                view = source->view_generation,
+                storage = source->storage_generation,
+                baseline = string_reserved(sess->memory_governor);
+            wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess),
+                *rf = filter_frame(raw);
+            wl_evaluation_control_t *c = control(0);
+            owned_consolidate_hooks(frame, 0, -1, false, false);
+            int actual = owned_consolidate_dispatch(sess, frame, c, width);
+            if (actual) fprintf(stderr,
+                    "owned twin rows=%u width=%u order=%u rc=%d\n",
+                    rows, width, order, actual);
+            CHECK(actual == 0);
+            finish(c, 0); owned_consolidate_unhook();
+            CHECK(owned_consolidate_dispatch(raw, rf, NULL, width) == 0);
+            col_rel_t *out = join_output(frame), *expected = join_output(rf);
+            CHECK(out == owned_consolidate_output && !out->column_types
+                && out->nrows == expected->nrows && out->ncols == width
+                && out->storage_generation == owned_consolidate_storage
+                && out->sorted_nrows == out->nrows && out->run_count == 1
+                && out->run_ends[0] == out->nrows);
+            for (uint32_t col = 0; col < width; col++)
+                for (uint32_t row = 0; row < out->nrows; row++)
+                    CHECK(out->columns[col][row] ==
+                        expected->columns[col][row]);
+            CHECK(out->view_generation == owned_consolidate_view +
+                (rows > 1 ? 1u + owned_consolidate_needs_sort : 0u));
+            CHECK(consolidate_source_hash(source) == hash &&
+                source->view_generation == view &&
+                source->storage_generation == storage);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 &&
+                wl_columnar_eval_stack_cleanup_finish(&rf) == 0 &&
+                string_reserved(sess->memory_governor) == baseline);
+            release(c); join_session_destroy(sess); join_session_destroy(raw);
+        }
+}
+static void
+test_owned_consolidate_lifecycle(void)
+{
+    const int stages[] = {25, 38, 39, 37, 30, 31, 24, 22, 23, 41, 10, 12};
+    for (unsigned item = 0; item < sizeof(stages) / sizeof(stages[0]); item++)
+        for (unsigned overflow = 0; overflow < 2; overflow++) {
+            wl_col_session_t *sess = join_session();
+            col_rel_t *source = relation(2, 513, 513, false,
+                    sess->memory_governor);
+            consolidate_populate(source, 2, false);
+            CHECK(session_add_rel(sess, source) == 0);
+            uint64_t hash = consolidate_source_hash(source),
+                baseline = string_reserved(sess->memory_governor);
+            wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+            wl_evaluation_control_t *c = control(0);
+            owned_consolidate_hooks(frame, 0, stages[item], overflow, false);
+            int expected =
+                overflow ? EOVERFLOW : WL_EVALUATION_CONTROL_CANCELLED;
+            CHECK(owned_consolidate_dispatch(sess, frame, c, 2) == expected);
+            CHECK(owned_consolidate_seen == 1); finish(c, expected);
+            owned_consolidate_unhook();
+            CHECK(consolidate_source_hash(source) == hash);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 &&
+                string_reserved(sess->memory_governor) == baseline);
+            release(c); join_session_destroy(sess);
+        }
+    /* Genuine readers cause acquisition/disposal refusal; no token repair. */
+    for (unsigned zero = 0; zero < 2; zero++)
+        for (unsigned mode = 1; mode <= (zero ? 2u : 5u); mode++) {
+            wl_col_session_t *sess = join_session();
+            uint32_t rows = mode <= 2 ? (zero ? 0u : 1u) : 33u;
+            col_rel_t *source = relation(2, rows ? rows : 1u, rows, false,
+                    sess->memory_governor);
+            consolidate_populate(source, 2, false);
+            CHECK(session_add_rel(sess, source) == 0);
+            uint64_t baseline = string_reserved(sess->memory_governor);
+            wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+            wl_evaluation_control_t *c = control(0);
+            owned_consolidate_hooks(frame, mode,
+                mode == 3 ? 25 : mode == 4 ? 41 :
+                -1, false, mode == 5);
+            int expected = mode <= 2 ? 0 : mode <= 4 ? EBUSY :
+                WL_EVALUATION_CONTROL_CANCELLED;
+            int actual = owned_consolidate_dispatch(sess, frame, c, 2);
+            if (actual != expected) fprintf(stderr,
+                    "owned lifecycle mode=%u rc=%d expected=%d\n",
+                    mode, actual, expected);
+            CHECK(actual == expected);
+            owned_consolidate_unhook();
+            if (mode <= 2) {
+                eval_stack_t *st = wl_columnar_eval_stack_cleanup_stack(frame);
+                CHECK(st->items[0].rel == owned_consolidate_output &&
+                    st->items[0].rel->view_generation ==
+                    owned_consolidate_view);
+                CHECK(st->items[0].seg_count == (mode == 1 ? 7u : 0u)
+                    && !st->items[0].seg_boundaries);
+            } else if (mode <= 4) {
+                CHECK(owned_consolidate_seen == 1 && join_retained_reader.owner
+                    && string_reserved(sess->memory_governor) > baseline);
+                eval_stack_t *st = wl_columnar_eval_stack_cleanup_stack(frame);
+                eval_entry_t *result =
+                    wl_columnar_eval_stack_cleanup_result(frame);
+                CHECK(st->top == 1 && !st->items[0].rel && !st->items[0].owned
+                    && result->rel == owned_consolidate_output &&
+                    result->owned);
+                CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == EBUSY
+                    && !frame && sess->cleanup_pending);
+                CHECK(col_rel_source_reader_release(&join_retained_reader) ==
+                    0);
+                CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0
+                    && !sess->cleanup_pending);
+            } else CHECK(owned_consolidate_seen == 1);
+            if (frame) CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) ==
+                    0);
+            finish(c, expected);
+            CHECK(string_reserved(sess->memory_governor) == baseline);
+            release(c); join_session_destroy(sess);
+        }
+}
+
+static void
+test_owned_consolidate_exact_work(void)
+{
+    for (unsigned kind = 0; kind < 3; kind++) {
+        uint64_t cost = 0;
+        for (unsigned attempt = 0; attempt < 3; attempt++) {
+            uint32_t rows = kind == 0 ? 1u : kind == 1 ? 31u : 513u;
+            wl_col_session_t *sess = join_session();
+            col_rel_t *source = relation(2, rows, rows, false,
+                    sess->memory_governor);
+            consolidate_populate(source, 2, false);
+            CHECK(session_add_rel(sess, source) == 0);
+            uint64_t baseline = string_reserved(sess->memory_governor),
+                hash = consolidate_source_hash(source);
+            wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+            wl_evaluation_control_t *c = control(!attempt ? 0 : attempt == 1 ?
+                    cost : cost - 1u);
+            owned_consolidate_hooks(frame, 0, -1, false, false);
+            int expected = attempt == 2 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0;
+            CHECK(owned_consolidate_dispatch(sess, frame, c, 2) == expected);
+            uint64_t used = finish(c, expected); owned_consolidate_unhook();
+            if (!attempt) cost = used;
+            else if (attempt == 1) CHECK(used == cost);
+            else CHECK(used <= cost - 1u);
+            CHECK(consolidate_source_hash(source) == hash);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 &&
+                string_reserved(sess->memory_governor) == baseline);
+            release(c); join_session_destroy(sess);
+        }
+    }
+}
+
 int
 main(void)
 {
     hmac_required_startup();
+    test_owned_consolidate_actual_twins();
+    test_owned_consolidate_lifecycle();
+    test_owned_consolidate_exact_work();
     test_consolidate_actual_twins();
     test_consolidate_reached_stops();
     test_consolidate_original_noop();
