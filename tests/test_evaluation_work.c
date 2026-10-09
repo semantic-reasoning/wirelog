@@ -7265,6 +7265,8 @@ test_string_full_image_domain_overlap(void)
 typedef struct {
     wl_intern_t *table;
     const char *new_text;
+    const char *const *expected_texts;
+    uint32_t expected_count;
     wl_atomic_u64 stop;
     wl_mutex_t lock;
     wl_cond_t condition;
@@ -7282,13 +7284,17 @@ string_reverse_reader(void *arg)
         uint32_t count = wl_intern_count(reader->table);
         for (uint32_t i = 0; i < count; i++) {
             const char *text = wl_intern_reverse(reader->table, i);
-            CHECK(text && (i == 0 ? strcmp(text, "seed-0") == 0:
+            CHECK(text && (reader->expected_texts ?
+                i < reader->expected_count && strcmp(text,
+                reader->expected_texts[i]) == 0 :
+                (i == 0 ? strcmp(text, "seed-0") == 0:
                 strcmp(text,
-                reader->new_text ? reader->new_text : "shared-new") == 0));
+                reader->new_text ? reader->new_text : "shared-new") == 0)));
         }
         if (count > reader->max_seen) {
             reader->max_seen = count;
-            if (count == 2) {
+            if (count ==
+                (reader->expected_count ? reader->expected_count : 2)){
                 wl_mutex_lock(&reader->lock); reader->observed_new = true;
                 wl_cond_signal(&reader->condition);
                 wl_mutex_unlock(&reader->lock);
@@ -8598,14 +8604,20 @@ digest_lifecycle_trial_kind(int map, int stop_stage, int primary, int override,
     wl_col_session_t *sess = join_session();
     sess->intern = string_table(sess->memory_governor, 0);
     char text[601]; memset(text, 'a', 600); text[600] = 0;
-    CHECK(wl_intern_put(sess->intern, text) == 0);
+    if (pair >= 3) {
+        CHECK(wl_intern_put(sess->intern, pair == 4 ? text :
+            "6ba7b810-9dad-11d1-80b4-00c04fd430c8") == 0);
+        CHECK(wl_intern_put(sess->intern, text) == (pair == 4 ? 0 : 1));
+    } else CHECK(wl_intern_put(sess->intern, text) == 0);
+    uint32_t initial_count = wl_intern_count(sess->intern);
     col_rel_t *source = relation(1, 1, 1, false, sess->memory_governor);
     CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
     uint64_t before = string_reserved(sess->memory_governor);
     uint8_t buf[32]; uint32_t n = compiled_const(buf, 0,
             pair == 2 ? INT64_MAX : 0);
-    if (pair) n = compiled_const(buf, n, 0);
-    buf[n++] = pair == 2 ? WL_PLAN_EXPR_ARITH_UUID5_IS :
+    if (pair) n = compiled_const(buf, n, pair >= 3 && pair != 4 ? 1 : 0);
+    buf[n++] = pair >= 3 ? WL_PLAN_EXPR_STR_FN_UUID5_RFC : pair ==
+        2 ? WL_PLAN_EXPR_ARITH_UUID5_IS :
         pair ? WL_PLAN_EXPR_ARITH_UUID5_SS : WL_PLAN_EXPR_ARITH_SHA256_S;
     wl_plan_expr_buffer_t expr = {buf, n}; wl_plan_op_t ops[2] = {
         {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
@@ -8620,12 +8632,14 @@ digest_lifecycle_trial_kind(int map, int stop_stage, int primary, int override,
     digest_stop_stage = stop_stage;
     digest_stop_progress = stop_stage == 14 ? 300 : stop_stage == 32 ? 320 :
         stop_stage == 3 ? (pair ? 3 : 2) :
-        (stop_stage == 41 || stop_stage == 43) ? 320 : 0;
+        (stop_stage == 41 || stop_stage == 43) ? 320 :
+        stop_stage == 49 ? 18 : stop_stage == 47 ? 8 : 0;
     digest_primary = primary; digest_override_stage = override;
     digest_abort_error = abort_error; digest_length_error = length_error;
     wl_columnar_expr_digest_test_provider_result = digest_provider_report;
     if (stop_stage) {
-        if (stop_stage == 14 || stop_stage == 3)
+        if (stop_stage == 14 || stop_stage == 3 || stop_stage == 49 ||
+            stop_stage == 50)
             wl_columnar_expr_test_controlled_checkpoint =
                 digest_checkpoint_stop;
         else if (stop_stage == 28)
@@ -8656,7 +8670,7 @@ digest_lifecycle_trial_kind(int map, int stop_stage, int primary, int override,
     finish(c, expected); CHECK(!sess->memory_budget_denied);
     if (stop_stage) CHECK(digest_reached == 1);
 #ifdef WL_MBEDTLS_ENABLED
-    if (stop_stage == 14 || stop_stage == 37)
+    if (stop_stage == 14 || stop_stage == 37 || stop_stage == 49)
         CHECK(!digest_calls[0] && !digest_calls[1]);
     else if (override == 0) {
         CHECK(digest_calls[0] == 1 && !digest_calls[1] && !digest_calls[4]);
@@ -8670,8 +8684,13 @@ digest_lifecycle_trial_kind(int map, int stop_stage, int primary, int override,
 #endif
     if (expected) lazy_unchanged(source);
     CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
-    CHECK(string_reserved(sess->memory_governor) == before &&
-        wl_intern_count(sess->intern) == 1);
+    bool retained = false;
+#ifdef WL_MBEDTLS_ENABLED
+    retained = pair == 3 && stop_stage == 3;
+#endif
+    CHECK(string_reserved(sess->memory_governor) == before + (retained ? 37 : 0)
+        && wl_intern_count(sess->intern) == initial_count + retained);
+    if (retained) CHECK(wl_intern_reverse(sess->intern, initial_count));
     wl_columnar_expr_digest_test_provider_result = NULL;
     wl_columnar_expr_digest_test_checkpoint = NULL;
     wl_columnar_expr_hash_test_controlled_checkpoint = NULL;
@@ -8680,6 +8699,7 @@ digest_lifecycle_trial_kind(int map, int stop_stage, int primary, int override,
     digest_abort_error = digest_length_error = false;
     frame = filter_frame(sess); retry(c, 0);
     expected =
+        pair == 4 ? (map ? ERANGE : 0) :
         (pair ? uuid_pair_available() :
         digest_available(WL_PLAN_EXPR_ARITH_SHA256)) ? 0 : map ? ERANGE : 0;
     CHECK(compiled_dispatch(sess, frame, ops, 2, c) == expected);
@@ -8815,21 +8835,25 @@ test_digest_zero_calls_and_id_independence(void)
     test_digest_zero_calls_and_id_independence_kind(false);
 }
 static void
-test_digest_owned_cleanup_kind(bool pair)
+test_digest_owned_cleanup_kind(int pair)
 {
     if (!(pair ? uuid_pair_available() :
         digest_available(WL_PLAN_EXPR_ARITH_SHA256))) return;
     for (int map = 0; map < 2; map++) {
         wl_col_session_t *sess = join_session();
         sess->intern = string_table(sess->memory_governor, 0);
-        CHECK(wl_intern_put(sess->intern, "input-lower") == 0);
+        if (pair == 2) CHECK(wl_intern_put(sess->intern,
+                "6ba7b810-9dad-11d1-80b4-00c04fd430c8") == 0);
+        CHECK(wl_intern_put(sess->intern,
+            "input-lower") == (pair == 2 ? 1 : 0));
         col_rel_t *source = relation(2, 2, 2, false, sess->memory_governor);
         wl_columnar_eval_stack_cleanup_frame_t *frame = join_frame(sess, source,
                 true);
         uint8_t buf[64];
         uint32_t n = compiled_const(buf, 0, 0);
-        if (pair) n = compiled_const(buf, n, 0);
-        buf[n++] = pair ? WL_PLAN_EXPR_ARITH_UUID5_SS :
+        if (pair) n = compiled_const(buf, n, pair == 2 ? 1 : 0);
+        buf[n++] = pair == 2 ? WL_PLAN_EXPR_STR_FN_UUID5_RFC :
+            pair ? WL_PLAN_EXPR_ARITH_UUID5_SS :
             WL_PLAN_EXPR_ARITH_SHA256_S;
         wl_plan_expr_buffer_t expr = {buf, n};
         wl_plan_op_t op = {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
@@ -8838,6 +8862,11 @@ test_digest_owned_cleanup_kind(bool pair)
         wl_evaluation_control_t *c = control(0);
         sess->base.evaluation_control = c;
         filter_reached = 0;
+        if (pair == 2) {
+            memset(digest_calls, 0, sizeof(digest_calls));
+            wl_columnar_expr_digest_test_provider_result =
+                digest_provider_report;
+        }
         if (map) wl_columnar_ops_map_test_controlled_checkpoint =
                 map_owned_cleanup_fault;
         else wl_columnar_filter_test_controlled_checkpoint =
@@ -8847,8 +8876,17 @@ test_digest_owned_cleanup_kind(bool pair)
             : wl_columnar_filter_op(&op,
             wl_columnar_eval_stack_cleanup_stack(frame), sess)) == EBUSY);
         sess->base.evaluation_control = NULL; finish(c, EBUSY);
-        CHECK(filter_reached == 1 && wl_intern_count(sess->intern) == 1);
-        CHECK(strcmp(wl_intern_reverse(sess->intern, 0), "input-lower") == 0);
+        if (pair == 2) {
+            CHECK(digest_calls[1] >= 1 && digest_calls[3] >= 1 &&
+                !digest_calls[4]);
+            wl_columnar_expr_digest_test_provider_result = NULL;
+        }
+        CHECK(filter_reached == 1 &&
+            wl_intern_count(sess->intern) == (pair == 2 ? 3u : 1u));
+        if (pair == 2) CHECK(strcmp(wl_intern_reverse(sess->intern, 2),
+                "b02acf5f-2a8c-5c50-8471-177fae928cab") == 0);
+        CHECK(strcmp(wl_intern_reverse(sess->intern, pair == 2 ? 1 : 0),
+            "input-lower") == 0);
         CHECK(wl_columnar_eval_stack_cleanup_result(frame)->rel);
         CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == EBUSY &&
             !frame && sess->cleanup_pending);
@@ -9077,6 +9115,537 @@ test_uuid_pair_vectors(void)
       uuid_known_vector("abcdefgh", "abcdefgh", expected); }
 }
 
+static const char rfc_namespace[] = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+static const char rfc_python[] = "886313e1-3b8a-5372-9b90-0c9aee199e5d";
+static uint32_t
+rfc_ids(uint8_t *buf, int64_t ns, int64_t name)
+{
+    uint32_t n = compiled_const(buf, 0, ns);
+    n = compiled_const(buf, n, name); buf[n++] = WL_PLAN_EXPR_STR_FN_UUID5_RFC;
+    return n;
+}
+static void
+rfc_known_twins(int domain, int mode, const char *ns, const char *name,
+    const char *expected)
+{
+    if (!uuid_pair_available()) return;
+    uint64_t measured[2] = {0};
+    for (int map = 0; map < 2; map++) for (int trial = 0; trial < 3; trial++) {
+            wl_col_session_t *sess = join_session(), *raw = join_session();
+            wl_columnar_memory_governor_ref_t *t = domain ==
+                2 ? fresh_governor() : NULL;
+            wl_columnar_memory_governor_ref_t *tr = domain ==
+                2 ? fresh_governor() : NULL;
+            sess->intern = string_table(domain == 1 ? sess->memory_governor : t,
+                    0);
+            raw->intern = string_table(domain == 1 ? raw->memory_governor : tr,
+                    0);
+            if (mode == 2) {
+                CHECK(wl_intern_put(sess->intern, "unrelated") == 0);
+                CHECK(wl_intern_put(raw->intern, "unrelated") == 0);
+            }
+            if (mode) {
+                CHECK(wl_intern_put(sess->intern, expected) == mode-1);
+                CHECK(wl_intern_put(raw->intern, expected) == mode-1);
+            }
+            int64_t ns_id = wl_intern_put(sess->intern, ns);
+            int64_t name_id = wl_intern_put(sess->intern, name);
+            CHECK(wl_intern_put(raw->intern, ns) == ns_id &&
+                wl_intern_put(raw->intern, name) == name_id);
+            uint32_t count = wl_intern_count(sess->intern);
+            int64_t result = mode ? (int64_t)mode-1 : (int64_t)count;
+            col_rel_t *source = relation(1, 1, 1, false, sess->memory_governor);
+            col_rel_t *ref = relation(1, 1, 1, false, raw->memory_governor);
+            CHECK(session_add_rel(sess, source) == 0 && session_add_rel(raw,
+                ref) == 0);
+            make_lazy(source);
+            uint64_t before = string_reserved(domain ==
+                    1 ? sess->memory_governor : t);
+            uint8_t buf[32]; uint32_t n = rfc_ids(buf, ns_id, name_id);
+            wl_plan_expr_buffer_t expr = {buf, n};
+            wl_plan_op_t ops[2] = {
+                {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+                 .delta_mode = WL_DELTA_FORCE_FULL},
+                {.op = map?WL_PLAN_OP_MAP:WL_PLAN_OP_FILTER,
+                 .filter_expr = expr,
+                 .project_count = 1, .map_exprs = &expr, .map_expr_count = 1}
+            };
+            wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess),
+                *reference = filter_frame(raw);
+            wl_evaluation_control_t *c = control(trial == 1?measured[map]-1:
+                    trial == 2?measured[map]:0);
+            int rc = trial == 1?WL_EVALUATION_CONTROL_WORK_LIMIT:0;
+            CHECK(compiled_dispatch(sess, frame, ops, 2, c) == rc);
+            uint64_t cost = finish(c, rc);
+            if (!trial) measured[map] = cost;
+            if (trial == 2) CHECK(cost == measured[map]);
+            CHECK(compiled_dispatch(raw, reference, ops, 2, NULL) == 0);
+            if (!rc) {
+                filter_equal(join_output(frame), join_output(reference));
+                CHECK(join_output(frame)->nrows == (map || result != 0));
+                if (map) CHECK(join_output(frame)->columns[0][0] == result);
+                CHECK(strcmp(wl_intern_reverse(sess->intern, result),
+                    expected) == 0);
+            } else lazy_unchanged(source);
+            CHECK(!sess->memory_budget_denied); source_unpinned(source, source);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 &&
+                wl_columnar_eval_stack_cleanup_finish(&reference) == 0);
+            /* Work can stop after successful dictionary publication. */
+            uint32_t after = wl_intern_count(sess->intern);
+            CHECK(after == count || (!mode && after == count+1));
+            if (after > count) CHECK(strcmp(wl_intern_reverse(sess->intern,
+                    count), expected) == 0);
+            CHECK(string_reserved(domain == 1?sess->memory_governor:t) ==
+                before+((domain && after > count)?37:0));
+            if (!rc) {
+                CHECK(after == wl_intern_count(raw->intern));
+                for (uint32_t id = 0; id < after; id++) CHECK(strcmp(
+                            wl_intern_reverse(sess->intern, id),
+                            wl_intern_reverse(raw->intern, id)) == 0);
+            }
+            wl_intern_free(sess->intern); wl_intern_free(raw->intern);
+            sess->intern = raw->intern = NULL; release(c);
+            join_session_destroy(sess); join_session_destroy(raw);
+            if (t) {
+                governor_empty(t); governor_empty(tr);
+                wl_columnar_memory_governor_ref_release(t);
+                wl_columnar_memory_governor_ref_release(tr);
+            }
+        }
+}
+static void
+test_rfc_twins_and_vectors(void)
+{
+    int expected = uuid_pair_available()?0:ERANGE;
+    for (int domain = 0; domain < 3; domain++)for (int mode = 0; mode < 3;
+            mode++){
+            rfc_known_twins(domain, mode, rfc_namespace, "python.org",
+                rfc_python);
+            rfc_known_twins(domain, mode,
+                "6BA7B810-9DAD-11D1-80B4-00C04FD430C8",
+                "python.org", rfc_python);
+        }
+    rfc_known_twins(2, 0, rfc_namespace, "",
+        "4ebd0208-8328-5d69-8c44-ec50939c0967");
+    rfc_known_twins(2, 0, rfc_namespace, "a\xff",
+        "4808b8f9-4d10-5659-803b-63f917162f06");
+    uint8_t buf[8300]; char text[4098];
+    const unsigned lengths[] = {0, 35, 37, 513, 4097};
+    for (unsigned j = 0; j < sizeof(lengths)/sizeof(*lengths); j++) {
+        memset(text, 'a', lengths[j]); text[lengths[j]] = 0;
+        uint32_t n = string_literal(buf, 0, text, (uint16_t)lengths[j]);
+        n = string_literal(buf, n, "name", 4);
+        buf[n++] = WL_PLAN_EXPR_STR_FN_UUID5_RFC;
+        string_caller_twins(buf, n, ERANGE, 2, j == 4);
+    }
+    const unsigned badpos[] = {0, 8, 13, 18, 23, 35};
+    for (unsigned j = 0; j < sizeof(badpos)/sizeof(*badpos); j++) {
+        memcpy(text, rfc_namespace, 37); text[badpos[j]] = j?'x':'\xff';
+        uint32_t n = string_literal(buf, 0, text, 36);
+        n = string_literal(buf, n, "name", 4);
+        buf[n++] = WL_PLAN_EXPR_STR_FN_UUID5_RFC;
+        string_caller_twins(buf, n, ERANGE, 2, false);
+    }
+    const char *namespaces[] = {"{6ba7b810-9dad-11d1-80b4-00c04fd430c8}",
+                                " 6ba7b810-9dad-11d1-80b4-00c04fd430c8", "bad",
+                                ""};
+    for (unsigned j = 0; j < 4; j++) {
+        uint32_t n = string_literal(buf, 0, namespaces[j],
+                (uint16_t)strlen(namespaces[j]));
+        n = string_literal(buf, n, "name", 4);
+        buf[n++] = WL_PLAN_EXPR_STR_FN_UUID5_RFC;
+        string_caller_twins(buf, n, ERANGE, 2, false);
+    }
+    const unsigned namelen[] = {0, 1, 63, 64, 65, 127, 128, 129, 513, 4097};
+    for (unsigned j = 0; j < sizeof(namelen)/sizeof(*namelen); j++) {
+        memset(text, 'a', namelen[j]); text[namelen[j]] = 0;
+        uint32_t n = string_literal(buf, 0, rfc_namespace, 36);
+        n = string_literal(buf, n, text, (uint16_t)namelen[j]);
+        buf[n++] = WL_PLAN_EXPR_STR_FN_UUID5_RFC;
+        string_caller_twins(buf, n, expected, 2, j == 9);
+    }
+    const char hidden[] = {'a', '\xff', 0, 'x'};
+    uint32_t n = string_literal(buf, 0, rfc_namespace, 36);
+    n = string_literal(buf, n, hidden, 4);
+    buf[n++] = WL_PLAN_EXPR_STR_FN_UUID5_RFC;
+    string_caller_twins(buf, n, expected, 2, true);
+    memcpy(text, rfc_namespace, 37); memcpy(text+37, "hidden", 6);
+    n = string_literal(buf, 0, text, 43); n = string_literal(buf, n, "name", 4);
+    buf[n++] = WL_PLAN_EXPR_STR_FN_UUID5_RFC;
+    string_caller_twins(buf, n, expected, 2, true);
+    text[20] = 0; n = string_literal(buf, 0, text, 43);
+    n = string_literal(buf, n, "name", 4);
+    buf[n++] = WL_PLAN_EXPR_STR_FN_UUID5_RFC;
+    string_caller_twins(buf, n, ERANGE, 2, true);
+    n = string_literal(buf, 0, "ffffffff-ffff-ffff-ffff-ffffffffffff", 36);
+    n = string_literal(buf, n, "name", 4);
+    buf[n++] = WL_PLAN_EXPR_STR_FN_UUID5_RFC;
+    string_caller_twins(buf, n, expected, 2, false);
+    for (int domain = -1; domain < 3; domain++)for (int missing =
+            0; missing < 2;
+            missing++) {
+            n = rfc_ids(buf, missing?99:0, missing?0:99);
+            string_caller_twins(buf, n, ERANGE, domain, true);
+        }
+    buf[0] = WL_PLAN_EXPR_STR_FN_UUID5_RFC;
+    string_caller_twins(buf, 1, ERANGE, -1, true);
+}
+
+static void
+test_rfc_lifecycle(void)
+{
+    for (int map = 0; map < 2; map++) {
+#ifdef WL_MBEDTLS_ENABLED
+        if (!uuid_pair_available()) continue;
+        const int stages[] = {14, 49, 31, 36, 40, 41, 33, 45, 47, 48, 50, 3};
+        for (unsigned j = 0; j < sizeof(stages)/sizeof(*stages); j++)
+            for (int positive = 0; positive < 2; positive++)
+                digest_lifecycle_trial_kind(map, stages[j], positive, -1, false,
+                    false, 3);
+        for (int positive = 0; positive < 2; positive++)
+            digest_lifecycle_trial_kind(map, 14, positive, -1, false, false, 4);
+        for (int stage = 0; stage <= 3; stage++)
+            digest_lifecycle_trial_kind(map, 0, 0, stage, false, false, 3);
+        digest_lifecycle_trial_kind(map, 0, 0, -1, false, true, 3);
+        digest_lifecycle_trial_kind(map, 0, 0, 2, true, false, 3);
+        digest_lifecycle_trial_kind(map, 31, 0, -1, true, false, 3);
+        digest_lifecycle_trial_kind(map, 31, -1, -1, true, false, 3);
+        digest_lifecycle_trial_kind(map, 41, 1, -1, true, false, 3);
+#else
+        for (int positive = 0; positive < 2; positive++)
+            digest_lifecycle_trial_kind(map, 3, positive, -1, false, false, 3);
+#endif
+    }
+}
+static void
+test_rfc_original_table_faults(void)
+{
+    if (!uuid_pair_available())return;
+    for (int map = 0; map < 2; map++)for (int domain = 0; domain < 3; domain++)
+            for (int fault = 0; fault < 5; fault++) {
+                wl_col_session_t *sess = join_session();
+                wl_columnar_memory_governor_ref_t *t = domain ==
+                    2?fresh_governor():
+                    domain == 1?sess->memory_governor:NULL;
+                sess->intern = string_table(t, fault == 1?46:0);
+                int64_t ns = wl_intern_put(sess->intern, rfc_namespace),
+                    name = wl_intern_put(sess->intern, "python.org");
+                uint32_t count = wl_intern_count(sess->intern);
+                col_rel_t *source = relation(1, 1, 1, false,
+                        sess->memory_governor);
+                CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+                uint64_t before_s = string_reserved(sess->memory_governor),
+                    before_t = string_reserved(t);
+                uint8_t buf[32]; uint32_t n = rfc_ids(buf, ns, name);
+                wl_plan_expr_buffer_t expr = {buf, n}; wl_plan_op_t ops[2] = {
+                    {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+                     .delta_mode = WL_DELTA_FORCE_FULL},
+                    {.op = map?WL_PLAN_OP_MAP:WL_PLAN_OP_FILTER,
+                     .filter_expr = expr,
+                     .project_count = 1, .map_exprs = &expr,
+                     .map_expr_count = 1}
+                };
+                wl_columnar_eval_stack_cleanup_frame_t *frame =
+                    filter_frame(sess);
+                wl_evaluation_control_t *c = control(0);
+                if (fault < 2) wl_intern_test_fail_allocation = fault;
+                if (fault == 2 && t) wl_intern_test_fail_commit = true;
+                if (fault >= 3 && t) {
+                    string_quota_governor =
+                        wl_columnar_memory_governor_ref_get(t);
+                    wl_columnar_memory_reservation_init(&string_quota);
+                    string_quota_reached = false;
+                    string_quota_stage = fault == 3?1:6;
+                    wl_intern_test_controlled_checkpoint = string_quota_hook;
+                }
+                memset(digest_calls, 0, sizeof(digest_calls));
+                wl_columnar_expr_digest_test_provider_result =
+                    digest_provider_report;
+                bool failing = fault < 2 || t != NULL;
+                int expected = failing?ENOMEM:0;
+                CHECK(compiled_dispatch(sess, frame, ops, 2, c) == expected);
+                finish(c, expected);
+                CHECK(digest_calls[0] == 1 && digest_calls[1] == 1 &&
+                    digest_calls[2] == 2 && digest_calls[3] == 1 &&
+                    !digest_calls[4]);
+                wl_columnar_expr_digest_test_provider_result = NULL;
+                CHECK(sess->memory_budget_denied == (fault >= 3 && t));
+                if (failing) lazy_unchanged(source);
+                CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+                if (fault >= 3 && t) {
+                    CHECK(string_quota_reached);
+                    CHECK(wl_columnar_memory_rollback(&string_quota));
+                }
+                CHECK(wl_intern_count(sess->intern) == count+!failing);
+                uint64_t growth = fault == 1?293:37;
+                CHECK(string_reserved(t) == before_t+(t && !failing?growth:0));
+                CHECK(string_reserved(sess->memory_governor) == before_s+
+                    (domain == 1 && !failing?growth:0));
+                CHECK(wl_intern_test_fail_allocation == -1 &&
+                    !wl_intern_test_fail_commit);
+                wl_intern_test_controlled_checkpoint = NULL;
+                frame = filter_frame(sess); retry(c, 0);
+                CHECK(compiled_dispatch(sess, frame, ops, 2, c) == 0);
+                uint64_t fresh = finish(c, 0);
+                CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+                CHECK(wl_intern_count(sess->intern) == count+1 && strcmp(
+                        wl_intern_reverse(sess->intern, count),
+                        rfc_python) == 0);
+                frame = filter_frame(sess); retry(c, 0);
+                CHECK(compiled_dispatch(sess, frame, ops, 2, c) == 0);
+                uint64_t warm = finish(c, 0); CHECK(warm <= fresh);
+                CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 &&
+                    wl_intern_count(sess->intern) == count+1);
+                wl_intern_free(sess->intern); sess->intern = NULL; release(c);
+                join_session_destroy(sess);
+                if (domain == 2) {
+                    governor_empty(t);
+                    wl_columnar_memory_governor_ref_release(t);
+                }
+            }
+}
+static void
+test_rfc_original_table_overlap_and_stops(void)
+{
+    if (!uuid_pair_available())return;
+    for (int map = 0; map < 2; map++)for (int domain = 0; domain < 3; domain++)
+            for (int stage = 0; stage < 3; stage++) for (int positive = 0;
+                    positive < 2; positive++){
+                    wl_col_session_t *sess = join_session();
+                    wl_columnar_memory_governor_ref_t *t = domain ==
+                        2?fresh_governor():
+                        domain == 1?sess->memory_governor:NULL;
+                    uint64_t initial = string_reserved(t);
+                    sess->intern = string_table(t, 0);
+                    CHECK(wl_intern_put(sess->intern, rfc_namespace) == 0 &&
+                        wl_intern_put(sess->intern, "python.org") == 1);
+                    uint64_t own_image = string_reserved(t)-initial;
+                    col_rel_t *source = relation(1, 1, 1, false,
+                            sess->memory_governor);
+                    CHECK(session_add_rel(sess, source) == 0);
+                    make_lazy(source);
+                    uint64_t before_s = string_reserved(sess->memory_governor),
+                        before_t = string_reserved(t);
+                    uint8_t buf[32]; uint32_t n = rfc_ids(buf, 0, 1);
+                    wl_plan_expr_buffer_t expr = {buf, n};
+                    wl_plan_op_t ops[2] = {
+                        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+                         .delta_mode = WL_DELTA_FORCE_FULL},
+                        {.op = map?WL_PLAN_OP_MAP:WL_PLAN_OP_FILTER,
+                         .filter_expr = expr,
+                         .project_count = 1, .map_exprs = &expr,
+                         .map_expr_count = 1}
+                    };
+                    wl_columnar_eval_stack_cleanup_frame_t *frame =
+                        filter_frame(sess);
+                    wl_evaluation_control_t *c = control(0);
+                    if (!stage && t) {
+                        string_overlap_governor =
+                            wl_columnar_memory_governor_ref_get(t);
+                        string_overlap_copy = 37;
+                        string_overlap_image = own_image+37;
+                        string_overlap_flags = 0;
+                        wl_intern_test_controlled_checkpoint =
+                            string_overlap_hook;
+                    } else if (stage) {
+                        string_stop_stage = stage == 1?13:3;
+                        string_stop_progress = stage == 1?0:3;
+                        string_stop_positive = positive != 0;
+                        string_stop_reached = 0;
+                        if (stage ==
+                            1) wl_intern_test_controlled_checkpoint =
+                                string_intern_stop;
+                        else wl_columnar_expr_test_controlled_checkpoint =
+                                string_expr_stop;
+                    }
+                    int expected =
+                        stage?
+                        (positive?EOVERFLOW:WL_EVALUATION_CONTROL_CANCELLED):0;
+                    CHECK(compiled_dispatch(sess, frame, ops, 2,
+                        c) == expected);
+                    finish(c, expected);
+                    if (!stage && t) CHECK(string_overlap_flags == 7);
+                    if (stage) {
+                        CHECK(string_stop_reached == 1); lazy_unchanged(source);
+                    }
+                    wl_intern_test_controlled_checkpoint = NULL;
+                    wl_columnar_expr_test_controlled_checkpoint = NULL;
+                    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+                    bool retained = stage != 1;
+                    CHECK(wl_intern_count(sess->intern) ==
+                        2u+(uint32_t)retained);
+                    CHECK(string_reserved(t) == before_t+(t && retained?37:0));
+                    CHECK(string_reserved(sess->memory_governor) == before_s+
+                        (domain == 1 && retained?37:0));
+                    CHECK(strcmp(wl_intern_reverse(sess->intern, 0),
+                        rfc_namespace) == 0 &&
+                        strcmp(wl_intern_reverse(sess->intern, 1),
+                        "python.org") == 0);
+                    if (retained) CHECK(strcmp(wl_intern_reverse(sess->intern,
+                            2), rfc_python) == 0);
+                    frame = filter_frame(sess); retry(c, 0);
+                    CHECK(compiled_dispatch(sess, frame, ops, 2, c) == 0);
+                    finish(c, 0);
+                    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 &&
+                        wl_intern_count(sess->intern) == 3 &&
+                        strcmp(wl_intern_reverse(sess->intern, 2),
+                        rfc_python) == 0);
+                    wl_intern_free(sess->intern); sess->intern = NULL;
+                    release(c); join_session_destroy(sess);
+                    if (domain == 2) {
+                        governor_empty(t);
+                        wl_columnar_memory_governor_ref_release(t);
+                    }
+                }
+    string_overlap_governor = NULL;
+}
+static void
+test_rfc_zero_and_short_circuit(void)
+{
+    for (int map = 0; map < 2; map++)for (int kind = 0; kind < 3; kind++) {
+            wl_col_session_t *sess = join_session();
+            sess->intern = string_table(sess->memory_governor, 0);
+            char long_text[601]; memset(long_text, 'a', 600);
+            long_text[600] = 0;
+            const char *ns = kind == 1?long_text:kind == 2?
+                "xba7b810-9dad-11d1-80b4-00c04fd430c8":rfc_namespace;
+            CHECK(wl_intern_put(sess->intern,
+                ns) == 0 && wl_intern_put(sess->intern,
+                kind == 1?"name":long_text) == 1);
+            col_rel_t *source = relation(1, kind?1:0, kind?1:0, false,
+                    sess->memory_governor);
+            CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+            uint8_t buf[32]; uint32_t n = rfc_ids(buf, 0, kind == 1?99:1);
+            wl_plan_expr_buffer_t expr = {buf, n}; wl_plan_op_t ops[2] = {
+                {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+                 .delta_mode = WL_DELTA_FORCE_FULL},
+                {.op = map?WL_PLAN_OP_MAP:WL_PLAN_OP_FILTER,
+                 .filter_expr = expr,
+                 .project_count = 1, .map_exprs = &expr, .map_expr_count = 1}
+            };
+            wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+            wl_evaluation_control_t *c = control(0);
+            memset(digest_calls, 0, sizeof(digest_calls)); digest_reached = 0;
+            digest_stop_stage = 14; digest_stop_progress = 300;
+            digest_primary = 0;
+            wl_columnar_expr_test_controlled_checkpoint =
+                digest_checkpoint_stop;
+            wl_columnar_expr_digest_test_provider_result =
+                digest_provider_report;
+            wl_intern_test_fail_allocation = 0;
+            int expected = kind && map?ERANGE:0;
+            CHECK(compiled_dispatch(sess, frame, ops, 2, c) == expected);
+            finish(c, expected);
+            CHECK(!digest_reached && wl_intern_test_fail_allocation == 0);
+            for (unsigned i = 0; i < 5; i++) CHECK(!digest_calls[i]);
+            wl_intern_test_fail_allocation = -1;
+            wl_columnar_expr_test_controlled_checkpoint = NULL;
+            wl_columnar_expr_digest_test_provider_result = NULL;
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 &&
+                wl_intern_count(sess->intern) == 2);
+            wl_intern_free(sess->intern); sess->intern = NULL; release(c);
+            join_session_destroy(sess);
+        }
+}
+static void
+test_rfc_shared_reverse_parent_stop(void)
+{
+    if (!uuid_pair_available())return;
+    wl_col_session_t *sess = join_session();
+    wl_columnar_memory_governor_ref_t *t = fresh_governor();
+    sess->intern = string_table(t, 0);
+    CHECK(wl_intern_put(sess->intern, rfc_namespace) == 0 &&
+        wl_intern_put(sess->intern, "python.org") == 1);
+    const char *expected_texts[] = {rfc_namespace, "python.org", rfc_python};
+    string_reader_t reader = {.table = sess->intern,
+                              .expected_texts = expected_texts,
+                              .expected_count = 3};
+    atomic_init(&reader.stop, 0);
+    CHECK(wl_mutex_init(&reader.lock) == 0 &&
+        wl_cond_init(&reader.condition) == 0);
+    wl_thread_t thread;
+    CHECK(wl_thread_create(&thread, string_reverse_reader, &reader) == 0);
+    wl_mutex_lock(&reader.lock);
+    while (!reader.ready)wl_cond_wait(&reader.condition, &reader.lock);
+    wl_mutex_unlock(&reader.lock);
+    col_rel_t *source = relation(1, 1, 1, false, sess->memory_governor);
+    CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+    uint64_t before = string_reserved(t);
+    uint8_t buf[32]; uint32_t n = rfc_ids(buf, 0, 1);
+    wl_plan_expr_buffer_t expr = {buf, n}; wl_plan_op_t ops[2] = {
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+         .delta_mode = WL_DELTA_FORCE_FULL},
+        {.op = WL_PLAN_OP_MAP, .project_count = 1, .map_exprs = &expr,
+         .map_expr_count = 1}
+    };
+    wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+    wl_evaluation_control_t *c = control(0);
+    string_stop_stage = 3; string_stop_progress = 3;
+    string_stop_positive = false;
+    string_stop_reached = 0;
+    wl_columnar_expr_test_controlled_checkpoint = string_expr_stop;
+    CHECK(compiled_dispatch(sess, frame, ops, 2,
+        c) == WL_EVALUATION_CONTROL_CANCELLED);
+    finish(c, WL_EVALUATION_CONTROL_CANCELLED); CHECK(string_stop_reached == 1);
+    lazy_unchanged(source);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+    CHECK(wl_intern_count(sess->intern) == 3 &&
+        string_reserved(t) == before+37 &&
+        wl_intern_get(sess->intern, rfc_python) == 2);
+    frame = filter_frame(sess); retry(c, 0);
+    CHECK(compiled_dispatch(sess, frame, ops, 2, c) == 0);
+    finish(c, 0); CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 &&
+        wl_intern_count(sess->intern) == 3 && string_reserved(t) == before+37);
+    wl_mutex_lock(&reader.lock);
+    while (!reader.observed_new)wl_cond_wait(&reader.condition, &reader.lock);
+    wl_mutex_unlock(&reader.lock); atomic_store(&reader.stop, 1);
+    CHECK(wl_thread_join(&thread) == 0 && reader.max_seen == 3);
+    wl_cond_destroy(&reader.condition); wl_mutex_destroy(&reader.lock);
+    wl_intern_free(sess->intern); sess->intern = NULL; release(c);
+    join_session_destroy(sess);
+    governor_empty(t); wl_columnar_memory_governor_ref_release(t);
+}
+static void
+test_rfc_saturated_operands(void)
+{
+    if (!uuid_pair_available())return;
+    for (int map = 0; map < 2; map++)for (int saturated = 0; saturated < 2;
+            saturated++){
+            wl_col_session_t *sess = join_session();
+            sess->intern = string_table(sess->memory_governor, 0);
+            CHECK(wl_intern_put(sess->intern, rfc_namespace) == 0);
+            col_rel_t *source = relation(1, 1, 1, false, sess->memory_governor);
+            CHECK(session_add_rel(sess, source) == 0);
+            uint8_t buf[1100]; uint32_t n = 0;
+            if (saturated) for (unsigned i = 0; i < 513; i++) {
+                    buf[n++] = WL_PLAN_EXPR_BOOL; buf[n++] = 0;
+                }
+            buf[n++] = WL_PLAN_EXPR_STR_FN_UUID5_RFC;
+            wl_plan_expr_buffer_t expr = {buf, n}; wl_plan_op_t ops[2] = {
+                {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+                 .delta_mode = WL_DELTA_FORCE_FULL},
+                {.op = map?WL_PLAN_OP_MAP:WL_PLAN_OP_FILTER,
+                 .filter_expr = expr,
+                 .project_count = 1, .map_exprs = &expr, .map_expr_count = 1}
+            };
+            wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+            wl_evaluation_control_t *c = control(0);
+            CHECK(compiled_dispatch(sess, frame, ops, 2, c) == 0); finish(c, 0);
+            CHECK(join_output(frame)->nrows == 1);
+            if (map) CHECK(join_output(frame)->columns[0][0] == 1);
+            CHECK(wl_intern_count(sess->intern) == 2 && strcmp(
+                    wl_intern_reverse(sess->intern, 1),
+                    "4cbce65e-cfcd-541c-b23c-74415552d2be") == 0);
+            wl_columnar_expr_context_t ctx = {.intern = sess->intern};
+            int64_t value; wl_columnar_expr_status_t status;
+            CHECK(wl_columnar_expr_eval_run_ctx(buf, n, NULL, 0, &value, &ctx,
+                &status) == 0 &&
+                status == WL_COLUMNAR_EXPR_OK && value == 1);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+            wl_intern_free(sess->intern); sess->intern = NULL; release(c);
+            join_session_destroy(sess);
+        }
+}
 int
 main(void)
 {
@@ -9205,6 +9774,14 @@ main(void)
     test_uuid_pair_native_and_fallback_vectors();
     test_uuid_pair_mixed_vectors();
     test_uuid_pair_lifecycle();
+    test_rfc_twins_and_vectors();
+    test_rfc_lifecycle();
+    test_rfc_original_table_faults();
+    test_rfc_original_table_overlap_and_stops();
+    test_rfc_zero_and_short_circuit();
+    test_rfc_shared_reverse_parent_stop();
+    test_rfc_saturated_operands();
+    test_digest_owned_cleanup_kind(2);
     test_digest_zero_calls_and_id_independence_kind(true);
     test_digest_owned_cleanup_kind(true);
     puts("evaluation_work: OK");

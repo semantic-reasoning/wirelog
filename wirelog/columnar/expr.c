@@ -2124,6 +2124,82 @@ wl_columnar_expr_controlled_uuid_pair(expr_stack_t *stack, uint8_t op,
 #endif
 }
 static int
+wl_columnar_expr_controlled_uuid_rfc(expr_stack_t *stack,
+    wl_col_session_t *sess, bool *failed, bool *allocation,
+    wl_evaluation_control_t *control)
+{
+    int rc = wl_evaluation_control_charge(control, 32);
+    if (rc) return rc;
+    int64_t name_id = expr_pop(stack), ns_id = expr_pop(stack);
+#ifndef WL_MBEDTLS_ENABLED
+    (void)sess; (void)name_id; (void)ns_id; (void)allocation;
+    *failed = true; return 0;
+#else
+    rc = wl_columnar_expr_controlled_tail(control);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 16);
+    if (rc) return rc;
+    wl_intern_t *intern = sess ? sess->intern : NULL;
+    const char *ns = intern ? wl_intern_reverse(intern, ns_id) : NULL;
+    const char *name = intern ? wl_intern_reverse(intern, name_id) : NULL;
+    rc = wl_columnar_expr_controlled_tail(control);
+    if (rc) return rc;
+    if (!ns || !name) {
+        *failed = true; return 0;
+    }
+    size_t length;
+    rc = wl_columnar_expr_controlled_string_length(ns, &length, control);
+    if (rc) return rc;
+    if (length != 36) {
+        *failed = true; return 0;
+    }
+    uint8_t namespace_uuid[16]; size_t pos = 0;
+    for (size_t i = 0; i < 36; i++) {
+        rc = wl_evaluation_control_charge(control, 8);
+        if (rc) return rc;
+        unsigned char c = (unsigned char)ns[i]; bool invalid = false;
+        if (i == 8 || i == 13 || i == 18 || i == 23) invalid = c != '-';
+        else {
+            unsigned char nibble = 0;
+            if (c >= '0' && c <= '9') nibble = c - '0';
+            else if (c >= 'a' && c <= 'f') nibble = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') nibble = c - 'A' + 10;
+            else invalid = true;
+            if (!invalid) {
+                if (!(pos & 1)) namespace_uuid[pos / 2] = nibble << 4;
+                else namespace_uuid[pos / 2] |= nibble;
+                pos++;
+            }
+        }
+        wl_columnar_expr_controlled_checkpoint(control, 49, i + 1, invalid);
+        rc = wl_columnar_expr_controlled_tail(control);
+        if (rc) return rc;
+        if (invalid) {
+            *failed = true; return 0;
+        }
+    }
+    rc = wl_columnar_expr_controlled_string_length(name, &length, control);
+    if (rc) return rc;
+    char text[37];
+    rc = wl_columnar_expr_uuid_rfc_run(namespace_uuid, (const uint8_t *)name,
+            length, text, failed, control);
+    if (rc || *failed) return rc;
+    int64_t result; int semantic; bool denied;
+    wl_columnar_expr_controlled_checkpoint(control, 50, 36, false);
+    rc = wl_columnar_expr_controlled_tail(control);
+    if (rc) return rc;
+    rc = wl_intern_put_controlled(intern, text, &result, &semantic, &denied,
+            control);
+    if (rc) return rc;
+    if (denied) sess->memory_budget_denied = true;
+    if (semantic) {
+        *allocation = true; return 0;
+    }
+    expr_push(stack, result);
+    return 0;
+#endif
+}
+static int
 wl_columnar_expr_controlled_string_match(const char *hay, size_t available,
     const char *needle, size_t length, bool *matches,
     wl_evaluation_control_t *control)
@@ -2655,6 +2731,7 @@ wl_columnar_expr_controlled_interpreter_decode(const uint8_t *buf,
         in->iarg = length; in->larg = *pos; *pos += length;
         break;
     }
+    case WL_PLAN_EXPR_STR_FN_UUID5_RFC:
     case WL_PLAN_EXPR_ARITH_UUID5: case WL_PLAN_EXPR_ARITH_UUID5_SS:
     case WL_PLAN_EXPR_ARITH_UUID5_SI: case WL_PLAN_EXPR_ARITH_UUID5_IS:
     case WL_PLAN_EXPR_ARITH_MD5: case WL_PLAN_EXPR_ARITH_MD5_S:
@@ -2819,6 +2896,11 @@ wl_columnar_expr_eval_interpreter_controlled(const uint8_t *buf,
                     sess, &allocation, control);
             if (rc) return rc;
             pending = allocation;
+        } else if (!pending && in.op == WL_PLAN_EXPR_STR_FN_UUID5_RFC) {
+            rc = wl_columnar_expr_controlled_uuid_rfc(&stack, sess, &pending,
+                    &allocation, control);
+            if (rc) return rc;
+            pending = pending || allocation;
         } else if (!pending && (in.op == WL_PLAN_EXPR_ARITH_UUID5
             || in.op == WL_PLAN_EXPR_ARITH_UUID5_SS
             || in.op == WL_PLAN_EXPR_ARITH_UUID5_SI
