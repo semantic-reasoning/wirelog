@@ -9,6 +9,7 @@
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/wirelog.h"
 #include "../wirelog/thread.h"
+#include <xxhash.h>
 
 #define CHECK(x) do { if (!(x)) { \
                           fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, \
@@ -8052,6 +8053,16 @@ test_builtin_shared_reverse_parent_stop(void)
     wl_columnar_memory_governor_ref_release(t);
 }
 
+extern void (*wl_columnar_expr_hash_test_controlled_checkpoint)(
+    wl_evaluation_control_t *, int, uint64_t, bool);
+static void
+hash_stage_stop(wl_evaluation_control_t *c, int stage, uint64_t progress,
+    bool failed)
+{
+    string_expr_stop(c, stage, progress, failed);
+    if (string_stop_reached) wl_columnar_expr_hash_test_controlled_checkpoint =
+            NULL;
+}
 static void
 test_crc_actual_twins(void)
 {
@@ -8118,9 +8129,12 @@ crc_caller_trial_expr(uint8_t op, const char *text, int map, uint64_t limit,
     wl_columnar_eval_stack_cleanup_frame_t *reference = filter_frame(raw);
     wl_evaluation_control_t *c = control(limit);
     if (stage) {
-        string_stop_stage = (unsigned)stage; string_stop_progress = 300;
+        string_stop_stage = (unsigned)stage;
+        string_stop_progress = stage == 3 ? 2 : stage >= 27 ? 576 : 300;
         string_stop_positive = positive; string_stop_reached = 0;
-        wl_columnar_expr_test_controlled_checkpoint = string_expr_stop;
+        if (stage >= 26)
+            wl_columnar_expr_hash_test_controlled_checkpoint = hash_stage_stop;
+        else wl_columnar_expr_test_controlled_checkpoint = string_expr_stop;
     }
     CHECK(compiled_dispatch(sess, frame, ops, 2, c) == expected);
     uint64_t cost = finish(c, expected);
@@ -8131,7 +8145,9 @@ crc_caller_trial_expr(uint8_t op, const char *text, int map, uint64_t limit,
         filter_equal(join_output(frame), join_output(reference));
         if (golden >= 0 && map && !reject)
             CHECK(join_output(frame)->columns[0][0] == golden);
-        if (reject || (!*text && !map)) CHECK(join_output(frame)->nrows ==
+        if (reject || (!*text && !map
+            && op !=
+            WL_PLAN_EXPR_ARITH_HASH_S)) CHECK(join_output(frame)->nrows ==
                 (map ? 1u : 0u));
     } else {
         lazy_unchanged(source);
@@ -8279,6 +8295,205 @@ test_crc_owned_cleanup(void)
     }
 }
 
+static void
+test_hash_actual_twins_and_lengths(void)
+{
+    const uint8_t ops[] = {WL_PLAN_EXPR_ARITH_HASH, WL_PLAN_EXPR_ARITH_HASH_S};
+    const int64_t values[] = {0, 2, 3, 4, -1, 99, INT64_MIN, INT64_MAX,
+                              INT64_C(0x1234567812345678)};
+    for (uint32_t k = 0; k < sizeof(ops); k++)
+        for (int domain = -1; domain < 3; domain++)
+            for (uint32_t j = 0; j < sizeof(values)/sizeof(*values); j++) {
+                uint8_t buf[16]; uint32_t n = compiled_const(buf, 0, values[j]);
+                buf[n++] = ops[k]; string_caller_twins(buf, n, 0, domain,
+                    j == 0);
+            }
+    const char embedded[] = {'a', 'b', 0, 'c', 'd'};
+    uint8_t buf[1100]; uint32_t n = string_literal(buf, 0, embedded, 5);
+    buf[n++] = WL_PLAN_EXPR_ARITH_HASH_S;
+    string_caller_twins(buf, n, 0, 2, true);
+    n = 0;
+    for (uint32_t i = 0; i < 513; i++) {
+        buf[n++] = WL_PLAN_EXPR_BOOL; buf[n++] = 0;
+    }
+    buf[n-1] = 1; buf[n++] = WL_PLAN_EXPR_ARITH_HASH_S;
+    string_caller_twins(buf, n, 0, 2, true);
+    buf[0] = WL_PLAN_EXPR_ARITH_HASH; string_caller_twins(buf, 1, 0, -1, true);
+    const uint32_t lengths[] = {0, 1, 3, 4, 8, 9, 16, 17, 31, 32, 63, 64, 65,
+                                127, 128, 129,
+                                239, 240, 241, 255, 256, 257, 319, 320, 321,
+                                511, 512, 513, 1023, 1024, 1025, 4097};
+    char text[4098];
+    for (int map = 0; map < 2; map++) {
+        for (uint32_t j = 0; j < sizeof(lengths)/sizeof(*lengths); j++) {
+            uint32_t length = lengths[j]; memset(text, 'a', length);
+            text[length] = 0;
+            uint64_t cost = crc_caller_trial(WL_PLAN_EXPR_ARITH_HASH_S, text,
+                    map, 0, 0, 0, false, -1, false);
+            crc_caller_trial(WL_PLAN_EXPR_ARITH_HASH_S, text, map, cost-1,
+                WL_EVALUATION_CONTROL_WORK_LIMIT, 0, false, -1, false);
+            CHECK(crc_caller_trial(WL_PLAN_EXPR_ARITH_HASH_S, text, map,
+                cost, 0, 0, false, -1, false) == cost);
+            if (length) {
+                text[length-1] = 'b';
+                CHECK(crc_caller_trial(WL_PLAN_EXPR_ARITH_HASH_S, text,
+                    map, 0, 0, 0, false, -1, false) == cost);
+            }
+            if (length == 4097) {
+                text[4096] = 0;
+                uint64_t shorter = crc_caller_trial(WL_PLAN_EXPR_ARITH_HASH_S,
+                        text, map, 0, 0, 0, false, -1, false);
+                /* Extra byte has scan2 + input1 + new chunk fixed140
+                 * (selection8, primitive128, offset4). */
+                CHECK(cost-shorter == 143);
+            }
+        }
+        memset(text, 'a', 4097); text[4097] = 0;
+        const int stages[] = {14, 27, 28, 29, 3};
+        for (uint32_t i = 0; i < sizeof(stages)/sizeof(*stages); i++)
+            for (int positive = 0; positive < 2; positive++)
+                crc_caller_trial(WL_PLAN_EXPR_ARITH_HASH_S, text, map, 0,
+                    positive ? EOVERFLOW : WL_EVALUATION_CONTROL_CANCELLED,
+                    stages[i], positive, -1, true);
+        crc_caller_trial(WL_PLAN_EXPR_ARITH_HASH_S, text, map, 0, 0, 0,
+            false, -1, true);
+    }
+}
+static void
+test_hash_symbol_assignment_independence(void)
+{
+    for (int map = 0; map < 2; map++) for (int extra = 0; extra < 2; extra++) {
+            wl_col_session_t *sess = join_session();
+            sess->intern = string_table(sess->memory_governor, 0);
+            if (extra) CHECK(wl_intern_put(sess->intern, "unrelated") == 0);
+            CHECK(wl_intern_put(sess->intern, "aa") == extra);
+            col_rel_t *source = relation(1, 1, 1, false, sess->memory_governor);
+            CHECK(session_add_rel(sess, source) == 0);
+            uint8_t buf[32]; uint32_t n = compiled_const(buf, 0, extra);
+            buf[n++] = WL_PLAN_EXPR_ARITH_HASH_S;
+            if (!map) {
+                n = compiled_const(buf, n, INT64_C(3932278706564862771));
+                buf[n++] = WL_PLAN_EXPR_CMP_EQ;
+            }
+            wl_plan_expr_buffer_t expr = {buf, n};
+            wl_plan_op_t ops[2] = {
+                {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+                 .delta_mode = WL_DELTA_FORCE_FULL},
+                {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+                 .filter_expr = expr, .project_count = 1, .map_exprs = &expr,
+                 .map_expr_count = 1}
+            };
+            wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+            wl_evaluation_control_t *c = control(0);
+            CHECK(compiled_dispatch(sess, frame, ops, 2, c) == 0); finish(c, 0);
+            CHECK(join_output(frame)->nrows == 1);
+            if (map) CHECK(join_output(frame)->columns[0][0] ==
+                    INT64_C(3932278706564862771));
+            CHECK(wl_intern_count(sess->intern) == (uint32_t)extra+1);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+            wl_intern_free(sess->intern); sess->intern = NULL;
+            release(c); join_session_destroy(sess);
+        }
+}
+static uint32_t hash_alignment_seen;
+static void
+hash_alignment(wl_evaluation_control_t *c, int stage, uint64_t address,
+    bool failed)
+{
+    (void)c;
+    if (stage == 26) {
+        CHECK(!failed && address && address % 64 == 0);
+        hash_alignment_seen++;
+    }
+}
+static void
+test_hash_real_alignment_and_unaligned_input(void)
+{
+    uint8_t input[1027];
+    for (uint32_t i = 0; i < sizeof(input); i++) input[i] = (uint8_t)(i*31+7);
+    CHECK((uintptr_t)(input+1) % 64 != 0 ||
+        (uintptr_t)(input+2) % 64 != 0);
+    hash_alignment_seen = 0;
+    wl_columnar_expr_hash_test_controlled_checkpoint = hash_alignment;
+    for (uint32_t offset = 1; offset <= 2; offset++) {
+        wl_evaluation_control_t *c = control(0); int64_t value = 123;
+        bool failed = true;
+        CHECK(wl_columnar_expr_hash_run(input+offset, 1025, &value, &failed,
+            c) == 0 && !failed);
+        CHECK(value == (int64_t)XXH3_64bits(input+offset, 1025));
+        uint64_t cost = finish(c, 0);
+        CHECK(cost == 8+128+128+1025+17*(8+128+4));
+        retry(c, cost); value = 123; failed = true;
+        CHECK(wl_columnar_expr_hash_run(input+offset, 1025, &value, &failed,
+            c) == 0 && !failed);
+        CHECK(finish(c, 0) == cost); release(c);
+    }
+    CHECK(hash_alignment_seen == 4);
+    wl_columnar_expr_hash_test_controlled_checkpoint = NULL;
+    wl_col_session_t *sess = join_session();
+    col_rel_t *source = relation(1, 0, 0, false, sess->memory_governor);
+    CHECK(session_add_rel(sess, source) == 0);
+    uint8_t buf[16]; uint32_t n = compiled_const(buf, 0, 99);
+    buf[n++] = WL_PLAN_EXPR_ARITH_HASH_S;
+    wl_plan_expr_buffer_t expr = {buf, n};
+    wl_plan_op_t ops[2] = {
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+         .delta_mode = WL_DELTA_FORCE_FULL},
+        {.op = WL_PLAN_OP_MAP, .project_count = 1, .map_exprs = &expr,
+         .map_expr_count = 1}
+    };
+    hash_alignment_seen = 0;
+    wl_columnar_expr_hash_test_controlled_checkpoint = hash_alignment;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+    wl_evaluation_control_t *c = control(0);
+    CHECK(compiled_dispatch(sess, frame, ops, 2, c) == 0); finish(c, 0);
+    CHECK(!hash_alignment_seen && !join_output(frame)->nrows);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+    wl_columnar_expr_hash_test_controlled_checkpoint = NULL;
+    release(c); join_session_destroy(sess);
+}
+
+static void
+test_hash_owned_cleanup(void)
+{
+    for (int map = 0; map < 2; map++) {
+        wl_col_session_t *sess = join_session();
+        sess->intern = string_table(sess->memory_governor, 0);
+        CHECK(wl_intern_put(sess->intern, "input-lower") == 0);
+        col_rel_t *source = relation(2, 2, 2, false, sess->memory_governor);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = join_frame(sess, source,
+                true);
+        uint8_t buf[64];
+        uint32_t n = compiled_const(buf, 0, 0);
+        buf[n++] = WL_PLAN_EXPR_ARITH_HASH_S;
+        wl_plan_expr_buffer_t expr = {buf, n};
+        wl_plan_op_t op = {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+                           .filter_expr = expr, .project_count = 1,
+                           .map_exprs = &expr, .map_expr_count = 1};
+        wl_evaluation_control_t *c = control(0);
+        sess->base.evaluation_control = c;
+        filter_reached = 0;
+        if (map) wl_columnar_ops_map_test_controlled_checkpoint =
+                map_owned_cleanup_fault;
+        else wl_columnar_filter_test_controlled_checkpoint =
+                filter_cleanup_fault;
+        CHECK((map ? col_op_map(&op,
+            wl_columnar_eval_stack_cleanup_stack(frame), sess)
+            : wl_columnar_filter_op(&op,
+            wl_columnar_eval_stack_cleanup_stack(frame), sess)) == EBUSY);
+        sess->base.evaluation_control = NULL; finish(c, EBUSY);
+        CHECK(filter_reached == 1 && wl_intern_count(sess->intern) == 1);
+        CHECK(strcmp(wl_intern_reverse(sess->intern, 0), "input-lower") == 0);
+        CHECK(wl_columnar_eval_stack_cleanup_result(frame)->rel);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == EBUSY &&
+            !frame && sess->cleanup_pending);
+        CHECK(col_rel_source_reader_release(&join_retained_reader) == 0);
+        CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0);
+        wl_intern_free(sess->intern); sess->intern = NULL;
+        release(c); join_session_destroy(sess);
+    }
+}
+
 int
 main(void)
 {
@@ -8394,6 +8609,10 @@ main(void)
     test_crc_declared_symbol_plan();
     test_crc_lengths_goldens_and_stops();
     test_crc_owned_cleanup();
+    test_hash_actual_twins_and_lengths();
+    test_hash_symbol_assignment_independence();
+    test_hash_real_alignment_and_unaligned_input();
+    test_hash_owned_cleanup();
     puts("evaluation_work: OK");
     return 0;
 }

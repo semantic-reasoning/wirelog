@@ -3965,6 +3965,9 @@ wl_columnar_expr_compile_controlled(const uint8_t *buf, uint32_t size,
     wl_columnar_expr_compiled_t **out, bool *supported,
     wl_evaluation_control_t *control);
 int
+wl_columnar_expr_hash_run(const uint8_t *bytes, size_t length, int64_t *value,
+    bool *failed, wl_evaluation_control_t *control);
+int
 wl_columnar_expr_interpreter_supported_controlled(const uint8_t *buf,
     uint32_t size, bool *supported, wl_evaluation_control_t *control);
 int
