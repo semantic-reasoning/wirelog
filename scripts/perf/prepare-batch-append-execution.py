@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import runpy
 import shutil
 import subprocess
@@ -140,6 +141,27 @@ def normalize(value, source_root, build_root):
     return value
 
 
+# Meson names an anonymous declare_dependency() 'dep' plus a fresh uuid4
+# integer on every configure, so identical builds would never compare equal.
+# Only exact anonymous names in the benchmark target's dependency list are
+# replaced; named dependencies, flags, compile commands, and the binary hash
+# still bind both sides.
+ANONYMOUS_DEPENDENCY = re.compile(r'dep[0-9]{1,40}')
+
+
+def normalize_target_dependencies(target):
+    dependencies = target.get('dependencies')
+    if dependencies is None:
+        return target
+    if type(dependencies) is not list or any(type(item) is not str for item in dependencies):
+        raise PreflightError('invalid benchmark target dependency metadata')
+    target = dict(target)
+    target['dependencies'] = ['$ANONYMOUS_DEPENDENCY'
+                              if ANONYMOUS_DEPENDENCY.fullmatch(item) else item
+                              for item in dependencies]
+    return target
+
+
 def read_meson_profile(source_root, build_root):
     info = build_root / 'meson-info'
     files = {name: info / name for name in MESON_FILES}
@@ -215,7 +237,7 @@ def read_meson_profile(source_root, build_root):
         machines=normalize(machines, source_root, build_root),
         dependencies=normalize(dependencies, source_root, build_root),
         toolchain_executables=toolchain_executables,
-        target=normalize(target, source_root, build_root))
+        target=normalize(normalize_target_dependencies(target), source_root, build_root))
     cpu_flags = []
     link_flags = []
     for source in sources:

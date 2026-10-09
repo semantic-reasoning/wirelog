@@ -12,6 +12,7 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+import uuid
 from unittest.mock import patch
 
 PERF = Path(__file__).parent
@@ -169,6 +170,7 @@ class ExecutionPreflightTests(unittest.TestCase):
                 name='bench_batch_append', id='fake@@bench_batch_append@exe',
                 type='executable', defined_in=str(source / 'bench/meson.build'),
                 filename=[str(binary)], build_by_default=True,
+                dependencies=['threads', 'dep' + str(uuid.uuid4().int), 'm'],
                 target_sources=[
                     dict(language='c', machine='host', compiler=['/bin/true'],
                          parameters=['-I' + str(source / 'bench'), '-O2', '-mavx2'],
@@ -569,6 +571,35 @@ class ExecutionPreflightTests(unittest.TestCase):
                 self.edit_metadata('candidate', filename, edit)
                 with self.assertRaisesRegex(M['PreflightError'], 'profiles differ'):
                     self.artifact()
+
+    def test_anonymous_target_dependency_ids_do_not_split_profiles(self):
+        artifact = self.artifact()
+        for side in ('base', 'candidate'):
+            self.assertEqual(artifact[side]['normalized_target']['dependencies'],
+                             ['threads', '$ANONYMOUS_DEPENDENCY', 'm'])
+
+    def test_rejects_named_or_reordered_target_dependency_mismatch(self):
+        edits = (
+            lambda data: data[0]['dependencies'].__setitem__(1, 'xxhash'),
+            lambda data: data[0]['dependencies'].reverse(),
+            lambda data: data[0]['dependencies'].append('dep1x'),
+            lambda data: data[0]['dependencies'].pop(1),
+        )
+        filename = 'intro-targets.json'
+        for index, edit in enumerate(edits):
+            with self.subTest(edit=index):
+                path = self.paths['candidate']['build'] / 'meson-info' / filename
+                path.write_bytes(self.paths['candidate']['metadata_bytes'][filename])
+                self.edit_metadata('candidate', filename, edit)
+                with self.assertRaisesRegex(M['PreflightError'], 'profiles differ'):
+                    self.artifact()
+
+    def test_rejects_malformed_target_dependency_metadata(self):
+        filename = 'intro-targets.json'
+        self.edit_metadata('candidate', filename,
+                           lambda data: data[0].__setitem__('dependencies', [7]))
+        with self.assertRaisesRegex(M['PreflightError'], 'dependency metadata'):
+            self.artifact()
 
     def test_rejects_binary_drift_between_snapshots(self):
         original = M['inspect_side']
