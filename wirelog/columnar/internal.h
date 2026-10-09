@@ -2928,6 +2928,13 @@ typedef struct {
     wl_columnar_relation_private_phase_t phase;
     bool ready;
 } wl_columnar_relation_private_batch_t;
+/* The frame-owned private writer is shared by controlled MAP/FILTER/REDUCE.
+ * Forward lookup rejects terminal RESETTING; disposal alone may skip its prefix. */
+bool wl_columnar_relation_private_batch_disposable(
+    const wl_columnar_relation_private_batch_t *);
+int wl_columnar_eval_stack_cleanup_private_batch_owner(wl_col_session_t *,
+    eval_stack_t *, wl_columnar_relation_private_batch_t **,
+    wl_evaluation_control_t *);
 int wl_columnar_relation_private_batch_retire(
     wl_columnar_relation_private_batch_t *, int);
 int wl_columnar_relation_private_append_batch_begin_controlled(

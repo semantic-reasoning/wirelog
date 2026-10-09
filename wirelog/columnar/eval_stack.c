@@ -484,6 +484,36 @@ wl_columnar_eval_stack_cleanup_join_owner(wl_col_session_t *sess,
     return 0;
 }
 
+int
+wl_columnar_eval_stack_cleanup_private_batch_owner(wl_col_session_t *sess,
+    eval_stack_t *stack, wl_columnar_relation_private_batch_t **record,
+    wl_evaluation_control_t *control)
+{
+    if (!sess || !stack || !record || *record || !control) return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 96);
+    if (rc) return rc;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = sess->cleanup_active;
+    if (!frame || frame->session != sess || &frame->stack != stack)
+        return EINVAL;
+    if (frame->result.rel || frame->result.continuation
+        || frame->result.seg_boundaries || frame->result.owned
+        || frame->join_sources.descriptor_count
+        || frame->join_sources.owner_count) return EBUSY;
+    wl_columnar_relation_private_batch_t *candidate = &frame->reduce_batch;
+    if (!candidate->ready) return EINVAL;
+    if (candidate->phase == WL_COLUMNAR_RELATION_PRIVATE_INSTALLING
+        || candidate->phase == WL_COLUMNAR_RELATION_PRIVATE_HELD
+        || candidate->phase == WL_COLUMNAR_RELATION_PRIVATE_RETIRING
+        || candidate->phase == WL_COLUMNAR_RELATION_PRIVATE_RESETTING)
+        return EBUSY;
+    if (!wl_columnar_relation_private_batch_disposable(
+            candidate)) return EINVAL;
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) return rc;
+    *record = candidate;
+    return 0;
+}
+
 wl_columnar_relation_private_batch_t *
 wl_columnar_eval_stack_cleanup_reduce_batch(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
@@ -517,6 +547,8 @@ wl_columnar_eval_stack_cleanup_dispose(
     int result = wl_columnar_relation_private_batch_retire(&frame->reduce_batch,
             0);
     if (result != 0) return result;
+    if (!wl_columnar_relation_private_batch_disposable(&frame->reduce_batch))
+        return EINVAL;
     result = wl_columnar_relation_source_group_drain(&frame->join_sources, 0);
     if (result != 0)
         return result;

@@ -8334,6 +8334,22 @@ wl_columnar_relation_private_checkpoint(wl_evaluation_control_t *control,
 #endif
 }
 
+bool
+wl_columnar_relation_private_batch_disposable(
+    const wl_columnar_relation_private_batch_t *record)
+{
+    if (!record || !record->ready) return false;
+    if (record->phase == WL_COLUMNAR_RELATION_PRIVATE_RESETTING) return true;
+    if (record->phase != WL_COLUMNAR_RELATION_PRIVATE_INERT
+        && record->phase != WL_COLUMNAR_RELATION_PRIVATE_RETIRED) return false;
+    const wl_columnar_relation_mutation_single_t *single =
+        &record->batch.single;
+    return !record->batch.active
+           && col_rel_mutation_writer_inert(&single->descriptor.writer)
+           && col_rel_mutation_writer_inert(&single->owners[0].writer)
+           && col_rel_mutation_writer_inert(&single->owners[1].writer);
+}
+
 int
 wl_columnar_relation_private_batch_retire(
     wl_columnar_relation_private_batch_t *record, int rc)

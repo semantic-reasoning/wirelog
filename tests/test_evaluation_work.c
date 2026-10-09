@@ -5470,18 +5470,13 @@ test_controlled_filter_rejected_cost_and_registry(void)
     CHECK(session_add_rel(sess, source) == 0);
     uint8_t buf[32]; wl_plan_expr_buffer_t expr = filter_expression(buf,
             WL_PLAN_EXPR_CMP_LT, false, -1);
-    /* Independently enumerate dispatcher48, VARIABLE24+visit1+"work"5,
-     * FILTER16+group89+shape16+one grid visit, decoder16+17 bytes+peek1+
-     * digit1+type1, scratch15+allocation1+commit4, held BUILD replaces old
-     * source admission9/shape6 by metadata16, B1 admission92, final32+84. */
-    uint64_t cost = 48u + 24u + 1u + 5u + 16u + 89u + 16u + 1u
-        + 16u + 17u + 1u + 1u + 1u + 15u + 1u + 4u
-        + new_like_cost("$filter", source, true, false) - 15u + 16u
-        + 92u + 32u + 84u + 513u * 4u;
-    wl_evaluation_control_t *c = control(cost);
+    /* Remeasure actual durable-writer lifecycle on equal fresh output state;
+     * this rejecting predicate has no callback/intern effects to warm. */
+    wl_evaluation_control_t *c = control(0);
     wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
     CHECK(filter_dispatch(sess, frame, expr, "work", c) == 0);
-    CHECK(finish(c, 0) == cost && join_output(frame)->nrows == 0);
+    uint64_t cost = finish(c, 0);
+    CHECK(join_output(frame)->nrows == 0);
     CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
     frame = filter_frame(sess); retry(c, cost - 1);
     CHECK(filter_dispatch(sess, frame, expr, "work",
@@ -5729,9 +5724,9 @@ test_controlled_filter_graph_precedence(void)
                         0);
             wl_evaluation_control_t *c = control(0);
             CHECK(filter_dispatch(sess, frame, expr, "work", c) == EINVAL);
-            /* Dispatch48 + VARIABLE30 + FILTER16 + lazy group94 + shape16.
+            /* Dispatch48 + VARIABLE30 + frame owner96 + FILTER16 + lazy group94 + shape16.
              * No expression, scratch or constructor primitive was reached. */
-            CHECK(finish(c, EINVAL) == 204);
+            CHECK(finish(c, EINVAL) == 300);
             CHECK(wl_columnar_relation_test_constructor_fail_allocation == 1);
             CHECK(wl_columnar_filter_test_fail_next_scratch_alloc ==
                 (failure == 1));
@@ -12460,6 +12455,349 @@ test_reduce_forbidden_extension_c2(void)
                 release(c); join_session_destroy(sess); extension_teardown();
             }
 }
+static bool shared_is_map, shared_source_committed;
+static wl_plan_expr_buffer_t shared_expression;
+static wl_columnar_eval_stack_cleanup_frame_t *shared_frame;
+static wl_columnar_relation_private_batch_t *shared_record;
+static wl_columnar_source_access_writer_t *shared_writer;
+static bool shared_thread_valid;
+static unsigned shared_fault_stage, shared_visits, shared_epoch,
+    shared_target_epoch;
+static bool shared_overflow, shared_keep_reader, shared_growth,
+    shared_reuse_reset;
+static col_rel_t *shared_output;
+static unsigned shared_predicate_visits, shared_predicate_at_reset;
+static int
+shared_dispatch(wl_col_session_t *sess,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_evaluation_control_t *c)
+{
+    wl_plan_op_t ops[2] = {
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+         .delta_mode = WL_DELTA_FORCE_FULL},
+        {.op = shared_is_map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+         .project_count = 2, .filter_expr = shared_expression,
+         .map_exprs = shared_expression.size ? &shared_expression : NULL,
+         .map_expr_count = shared_expression.size ? 1u : 0u},
+    };
+    return compiled_dispatch(sess, frame, ops, 2, c);
+}
+static void
+shared_authority_fault(wl_evaluation_control_t *c,
+    wl_columnar_relation_private_batch_t *record, int stage, uint64_t progress)
+{
+    (void)progress;
+    if ((unsigned)stage != shared_fault_stage || shared_visits) return;
+    CHECK(record == wl_columnar_eval_stack_cleanup_reduce_batch(shared_frame));
+    shared_record = record;
+    shared_writer = stage == 2 ? &record->batch.single.descriptor.writer
+        : &record->batch.single.owners[0].writer;
+    shared_thread_valid = shared_writer->thread_valid;
+    CHECK(shared_thread_valid && shared_writer->owner
+        && shared_writer->identity == (uintptr_t)shared_writer);
+    shared_writer->thread_valid = false;
+    shared_visits++;
+    wl_evaluation_control_request_cancel(c);
+}
+static void
+shared_caller_fault(wl_evaluation_control_t *c, int stage, uint64_t progress,
+    wl_columnar_relation_source_group_t *group, col_rel_t *source)
+{
+    (void)progress; (void)group; (void)source;
+    if (stage != 9 || shared_fault_stage != 9 || shared_visits) return;
+    shared_authority_fault(c,
+        wl_columnar_eval_stack_cleanup_reduce_batch(shared_frame), 9, 0);
+}
+static void
+test_shared_writer_authority_refusals(void)
+{
+    /* Actual original token boolean validation fault, not healthy contention. */
+    for (unsigned caller = 0; caller < 2; caller++)
+        for (unsigned fault = 0; fault < 3; fault++) {
+            shared_is_map = caller;
+            uint8_t effect[64];
+            shared_expression = (wl_plan_expr_buffer_t){0};
+            if (fault == 2) {
+                extension_setup("ext", 0, WIRELOG_EXTENSION_VALUE_BOOL, NULL, 0,
+                    false);
+                uint32_t n = string_literal(effect, 0, "retained", 8);
+                n = extension_encode(effect, n, "ext", 3, 0, false);
+                shared_expression = (wl_plan_expr_buffer_t){effect, n};
+            }
+            wl_col_session_t *sess = join_session();
+            if (fault == 2) {
+                sess->intern = string_table(NULL, 0);
+                sess->base.extension_snapshot = extension_snapshot;
+            }
+            col_rel_t *source = relation(2, 3, 3, false, sess->memory_governor);
+            CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+            uint64_t baseline = string_reserved(sess->memory_governor);
+            shared_frame = filter_frame(sess);
+            wl_evaluation_control_t *c = control(0);
+            shared_fault_stage = fault == 0 ? 2 : fault == 1 ? 3 : 9;
+            shared_visits = 0;
+            wl_columnar_relation_test_private_checkpoint =
+                shared_authority_fault;
+            if (caller) wl_columnar_ops_map_test_controlled_checkpoint =
+                    shared_caller_fault;
+            else wl_columnar_filter_test_controlled_checkpoint =
+                    shared_caller_fault;
+            CHECK(shared_dispatch(sess, shared_frame, c) == EINVAL);
+            finish(c, EINVAL);
+            if (fault == 2) CHECK(extension_calls == 3 &&
+                    wl_intern_count(sess->intern) == 1
+                    && strcmp(wl_intern_reverse(sess->intern, 0),
+                    "retained") == 0);
+            wl_columnar_relation_test_private_checkpoint = NULL;
+            wl_columnar_ops_map_test_controlled_checkpoint = NULL;
+            wl_columnar_filter_test_controlled_checkpoint = NULL;
+            CHECK(shared_visits == 1 && shared_record->phase ==
+                WL_COLUMNAR_RELATION_PRIVATE_RETIRING &&
+                !shared_record->batch.active);
+            CHECK(shared_writer->owner && !shared_writer->thread_valid
+                && shared_writer->identity == (uintptr_t)shared_writer
+                && atomic_load(&shared_writer->owner->state) ==
+                WL_COLUMNAR_SOURCE_ACCESS_WRITER);
+            CHECK(wl_columnar_eval_stack_cleanup_result(shared_frame)->rel
+                == shared_record->batch.relation);
+            lazy_unchanged(source); source_unpinned(source, source);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&shared_frame) == EINVAL
+                && !shared_frame && sess->cleanup_pending);
+            CHECK(string_reserved(sess->memory_governor) > baseline);
+            shared_writer->thread_valid = shared_thread_valid;
+            CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0);
+            CHECK(!sess->cleanup_pending &&
+                string_reserved(sess->memory_governor) == baseline);
+            shared_frame = filter_frame(sess); retry(c, 0);
+            CHECK(shared_dispatch(sess, shared_frame, c) == 0); finish(c, 0);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&shared_frame) == 0);
+            if (fault == 2) {
+                CHECK(extension_calls == 6 &&
+                    wl_intern_count(sess->intern) == 1);
+                sess->base.extension_snapshot = NULL;
+                wl_intern_free(sess->intern); sess->intern = NULL;
+                extension_teardown();
+            }
+            shared_expression = (wl_plan_expr_buffer_t){0};
+            release(c); join_session_destroy(sess);
+        }
+}
+static void
+shared_reset_stop(wl_evaluation_control_t *c,
+    wl_columnar_relation_private_batch_t *record, int stage, uint64_t progress)
+{
+    if (stage == 4) {
+        shared_epoch++;
+        CHECK(progress == ((uint64_t)COL_REL_INIT_CAP << shared_epoch));
+        if (shared_epoch == shared_target_epoch) {
+            shared_growth = true; shared_output = record->batch.relation;
+        }
+        return;
+    }
+    if (stage != 1 || progress != 128 || shared_visits
+        || (!shared_growth && !shared_reuse_reset)) return;
+    CHECK(record->phase == WL_COLUMNAR_RELATION_PRIVATE_RESETTING);
+    shared_record = record; shared_visits++;
+    shared_predicate_at_reset = shared_predicate_visits;
+    if (shared_keep_reader) {
+        CHECK(shared_output);
+        CHECK(col_rel_source_reader_acquire(shared_output,
+            &join_retained_reader) == 0);
+    }
+    wl_columnar_relation_test_private_checkpoint = NULL;
+    if (shared_overflow) CHECK(wl_evaluation_control_charge(c,
+            UINT64_MAX) == EOVERFLOW);
+    else wl_evaluation_control_request_cancel(c);
+}
+static void
+shared_filter_progress(wl_evaluation_control_t *c, int stage, uint64_t progress,
+    wl_columnar_relation_source_group_t *group, col_rel_t *source)
+{
+    (void)c; (void)progress; (void)group; (void)source;
+    if (stage == 3) shared_predicate_visits++;
+}
+static void
+test_shared_filter_growth_reset(void)
+{
+    shared_is_map = false;
+    for (unsigned epoch = 1; epoch <= 2; epoch++)
+        for (unsigned overflow = 0; overflow < 2; overflow++)
+            for (unsigned retained = 0; retained < 2; retained++) {
+                wl_col_session_t *sess = join_session();
+                col_rel_t *source = relation(2, 513, 513, false,
+                        sess->memory_governor);
+                CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+                uint64_t baseline = string_reserved(sess->memory_governor);
+                shared_frame = filter_frame(sess);
+                wl_evaluation_control_t *c = control(0);
+                shared_visits = shared_epoch = shared_predicate_visits = 0;
+                wl_columnar_filter_test_controlled_checkpoint =
+                    shared_filter_progress; shared_target_epoch = epoch;
+                shared_growth = shared_reuse_reset = false;
+                shared_overflow = overflow; shared_keep_reader = retained;
+                wl_columnar_relation_test_private_checkpoint =
+                    shared_reset_stop;
+                int expected =
+                    overflow ? EOVERFLOW : retained ? EBUSY :
+                    WL_EVALUATION_CONTROL_CANCELLED;
+                int actual = shared_dispatch(sess, shared_frame, c);
+                if (actual != expected) fprintf(stderr,
+                        "shared growth epoch=%u overflow=%u retained=%u actual=%d expected=%d visits=%u epochs=%u\n",
+                        epoch, overflow, retained, actual, expected,
+                        shared_visits, shared_epoch);
+                CHECK(actual == expected);
+                finish(c, expected);
+                wl_columnar_filter_test_controlled_checkpoint = NULL;
+                CHECK(shared_predicate_visits == shared_predicate_at_reset
+                    && shared_predicate_visits ==
+                    (((unsigned)COL_REL_INIT_CAP << epoch) + 1u));
+                CHECK(shared_visits == 1 && shared_epoch == epoch);
+                CHECK(shared_record->phase ==
+                    WL_COLUMNAR_RELATION_PRIVATE_RESETTING
+                    && !shared_record->batch.active);
+                CHECK(
+                    wl_columnar_relation_private_append_batch_begin_controlled(
+                        shared_record, source, c) == EBUSY);
+                retry(c, 0);
+                wl_columnar_relation_private_batch_t *found = NULL;
+                CHECK(wl_columnar_eval_stack_cleanup_private_batch_owner(sess,
+                    wl_columnar_eval_stack_cleanup_stack(shared_frame), &found,
+                    c) == EBUSY && !found);
+                finish(c, EBUSY);
+                lazy_unchanged(source); source_unpinned(source, source);
+                int cleanup =
+                    wl_columnar_eval_stack_cleanup_finish(&shared_frame);
+                CHECK(cleanup == (retained ? EBUSY : 0));
+                if (retained) {
+                    CHECK(sess->cleanup_pending &&
+                        string_reserved(sess->memory_governor) > baseline);
+                    CHECK(col_rel_source_reader_release(
+                            &join_retained_reader) == 0);
+                    CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0);
+                }
+                CHECK(string_reserved(sess->memory_governor) == baseline);
+                shared_frame = filter_frame(sess); retry(c, 0);
+                CHECK(shared_dispatch(sess, shared_frame, c) == 0);
+                finish(c, 0);
+                CHECK(join_output(shared_frame)->nrows == 513);
+                CHECK(wl_columnar_eval_stack_cleanup_finish(&shared_frame) ==
+                    0);
+                release(c); join_session_destroy(sess);
+            }
+}
+static void
+shared_owned_reader(wl_evaluation_control_t *c, int stage, uint64_t progress,
+    wl_columnar_relation_source_group_t *group, col_rel_t *source)
+{
+    (void)progress;
+    if (stage == 8) {
+        CHECK(!c && group->committed);
+        shared_source_committed = true;
+        return;
+    }
+    if (stage != 10) return;
+    CHECK(!c && shared_source_committed && !group->descriptor_count &&
+        !group->owner_count);
+    CHECK(col_rel_source_reader_acquire(source, &join_retained_reader) == 0);
+    shared_visits++;
+}
+static void
+test_shared_owned_reader_and_reuse(void)
+{
+    for (unsigned caller = 0; caller < 2; caller++) {
+        shared_is_map = caller;
+        wl_col_session_t *sess = join_session();
+        col_rel_t *source = relation(2, 3, 3, false, sess->memory_governor);
+        shared_frame = join_frame(sess, source, true);
+        wl_evaluation_control_t *c = control(0);
+        wl_plan_op_t op = {.op = caller ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+                           .project_count = 2};
+        shared_visits = 0; shared_source_committed = false;
+        sess->base.evaluation_control = c;
+        if (caller) wl_columnar_ops_map_test_controlled_checkpoint =
+                shared_owned_reader;
+        else wl_columnar_filter_test_controlled_checkpoint =
+                shared_owned_reader;
+        int rc = caller ? col_op_map(&op,
+                wl_columnar_eval_stack_cleanup_stack(shared_frame), sess)
+            : wl_columnar_filter_op(&op,
+                wl_columnar_eval_stack_cleanup_stack(shared_frame), sess);
+        sess->base.evaluation_control = NULL;
+        wl_columnar_ops_map_test_controlled_checkpoint = NULL;
+        wl_columnar_filter_test_controlled_checkpoint = NULL;
+        CHECK(rc == EBUSY && shared_visits == 1); finish(c, rc);
+        CHECK(wl_columnar_eval_stack_cleanup_stack(
+                shared_frame)->items[0].rel == source
+            && wl_columnar_eval_stack_cleanup_result(shared_frame)->rel);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&shared_frame) == EBUSY);
+        CHECK(col_rel_source_reader_release(&join_retained_reader) == 0);
+        CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0);
+        release(c); join_session_destroy(sess);
+    }
+    for (unsigned stop = 0; stop < 2; stop++) {
+        wl_col_session_t *sess = join_session();
+        col_rel_t *source = relation(2, 3, 3, false, sess->memory_governor);
+        CHECK(session_add_rel(sess, source) == 0);
+        shared_frame = filter_frame(sess); shared_is_map = true;
+        wl_evaluation_control_t *c = control(0);
+        CHECK(shared_dispatch(sess, shared_frame, c) == 0);
+        shared_record =
+            wl_columnar_eval_stack_cleanup_reduce_batch(shared_frame);
+        sess->base.evaluation_control = c;
+        for (unsigned step = 0; step < 3; step++) {
+            wl_plan_op_t op = {.op = step ==
+                                   1 ? WL_PLAN_OP_FILTER : WL_PLAN_OP_MAP,
+                               .project_count = 2};
+            if (stop && step == 2) {
+                shared_visits = 0; shared_growth = false;
+                shared_reuse_reset = true;
+                shared_keep_reader = shared_overflow = false;
+                wl_columnar_relation_test_private_checkpoint =
+                    shared_reset_stop;
+            }
+            int rc = step == 1 ? wl_columnar_filter_op(&op,
+                    wl_columnar_eval_stack_cleanup_stack(shared_frame), sess)
+                : col_op_map(&op,
+                    wl_columnar_eval_stack_cleanup_stack(shared_frame), sess);
+            CHECK(rc == (stop &&
+                step == 2 ? WL_EVALUATION_CONTROL_CANCELLED : 0));
+            CHECK(shared_record ==
+                wl_columnar_eval_stack_cleanup_reduce_batch(shared_frame));
+            if (rc) CHECK(shared_visits == 1 && shared_record->phase ==
+                    WL_COLUMNAR_RELATION_PRIVATE_RESETTING);
+            else CHECK(shared_record->phase ==
+                    WL_COLUMNAR_RELATION_PRIVATE_RETIRED
+                    && wl_columnar_relation_private_batch_disposable(
+                        shared_record));
+        }
+        sess->base.evaluation_control = NULL;
+        if (!stop) {
+            eval_stack_t *stack =
+                wl_columnar_eval_stack_cleanup_stack(shared_frame);
+            eval_entry_t former;
+            col_rel_t *old_pointer = shared_record->batch.relation;
+            CHECK(eval_stack_pop_relation(stack, &former) == 0 && former.owned
+                && former.rel == old_pointer);
+            CHECK(eval_entry_dispose(&former) == 0);
+            /* Retired metadata now really contains a freed relation pointer.
+             * Only compare its address; actual owner lookup/reset must not read it. */
+            CHECK(shared_record->batch.relation == old_pointer);
+            CHECK(shared_dispatch(sess, shared_frame, c) == 0);
+            CHECK(shared_record ==
+                wl_columnar_eval_stack_cleanup_reduce_batch(shared_frame)
+                && shared_record->phase ==
+                WL_COLUMNAR_RELATION_PRIVATE_RETIRED);
+        }
+        finish(c, stop ? WL_EVALUATION_CONTROL_CANCELLED : 0);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&shared_frame) == 0);
+        if (stop) {
+            shared_frame = filter_frame(sess); retry(c, 0);
+            CHECK(shared_dispatch(sess, shared_frame, c) == 0); finish(c, 0);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&shared_frame) == 0);
+        }
+        shared_reuse_reset = false;
+        release(c); join_session_destroy(sess);
+    }
+}
 int
 main(void)
 {
@@ -12480,6 +12818,9 @@ main(void)
     test_reduce_interpreter_allocation_policy();
     test_reduce_forbidden_extension_c2();
     test_reduce_cell_shape_schema_refusals();
+    test_shared_writer_authority_refusals();
+    test_shared_filter_growth_reset();
+    test_shared_owned_reader_and_reuse();
     wl_columnar_relation_test_work_checkpoint = checkpoint;
     wl_columnar_memory_governor_test_work_checkpoint = checkpoint;
     test_counted_gates();
