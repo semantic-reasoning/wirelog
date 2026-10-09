@@ -3107,20 +3107,27 @@ int
 wl_columnar_expr_eval_interpreter_controlled(const uint8_t *buf,
     uint32_t size, const int64_t *row, uint32_t ncols, int64_t *value,
     bool *failed, wl_col_session_t *sess, wl_columnar_expr_status_t *status,
-    bool allow_extension_scalar_result, wl_evaluation_control_t *control)
+    bool allow_extension_scalar_result, bool allow_extension_calls,
+    wl_evaluation_control_t *control)
 {
     if (!value || !failed || (size && !buf) || (ncols && !row)) return EINVAL;
     if (!control) {
         wl_columnar_expr_context_t ctx = {
             .intern = sess ? sess->intern : NULL,
-            .extensions = sess ? sess->base.extension_snapshot : NULL,
-            .allow_extension_scalar_result = allow_extension_scalar_result,
+            .extensions = allow_extension_calls &&
+                sess ? sess->base.extension_snapshot : NULL,
+            .allow_extension_scalar_result = allow_extension_calls &&
+                allow_extension_scalar_result,
             .configured_worker_count =
+                allow_extension_calls &&
                 sess ? sess->callback_configured_workers : 1,
-            .active_worker_count = sess ? sess->callback_active_workers : 1,
+            .active_worker_count = allow_extension_calls &&
+                sess ? sess->callback_active_workers : 1,
             .parallel_execution =
+                allow_extension_calls &&
                 sess ? sess->callback_parallel_execution : false,
-            .session_key = sess ? sess->callback_session_key : NULL
+            .session_key = allow_extension_calls &&
+                sess ? sess->callback_session_key : NULL
         };
         *failed = wl_columnar_expr_eval_run_ctx(buf, size, row, ncols, value,
                 &ctx, status) != 0;
@@ -3145,6 +3152,10 @@ wl_columnar_expr_eval_interpreter_controlled(const uint8_t *buf,
         if (in.op == WL_PLAN_EXPR_EXTENSION_CALL
             || in.op == WL_PLAN_EXPR_EXTENSION_CALL_ABI) {
             pending_status = WL_COLUMNAR_EXPR_EXTENSION_MALFORMED;
+            if (!pending && !allow_extension_calls) {
+                pending_status = WL_COLUMNAR_EXPR_MISSING_EXTENSION;
+                pending = true;
+            }
             if (!pending) {
                 rc = wl_columnar_expr_controlled_extension(&stack, &extension,
                         sess, allow_extension_scalar_result, &pending_status,

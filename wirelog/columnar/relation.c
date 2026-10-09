@@ -8316,6 +8316,339 @@ done:
     return rc;
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_relation_test_private_checkpoint)(wl_evaluation_control_t *,
+    wl_columnar_relation_private_batch_t *, int, uint64_t);
+#endif
+
+static void
+wl_columnar_relation_private_checkpoint(wl_evaluation_control_t *control,
+    wl_columnar_relation_private_batch_t *record, int phase, uint64_t progress)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_private_checkpoint)
+        wl_columnar_relation_test_private_checkpoint(control, record, phase,
+            progress);
+#else
+    (void)control; (void)record; (void)phase; (void)progress;
+#endif
+}
+
+int
+wl_columnar_relation_private_batch_retire(
+    wl_columnar_relation_private_batch_t *record, int rc)
+{
+    if (!record || !record->ready) return EINVAL;
+    /* RESETTING is a terminal discard marker, never a partially valid single. */
+    if (record->phase == WL_COLUMNAR_RELATION_PRIVATE_RESETTING
+        || record->phase == WL_COLUMNAR_RELATION_PRIVATE_RETIRED
+        || record->phase == WL_COLUMNAR_RELATION_PRIVATE_INERT) return rc;
+    if (record->phase != WL_COLUMNAR_RELATION_PRIVATE_INSTALLING
+        && record->phase != WL_COLUMNAR_RELATION_PRIVATE_HELD
+        && record->phase != WL_COLUMNAR_RELATION_PRIVATE_RETIRING)
+        return wl_columnar_relation_cleanup_result(rc, EINVAL);
+    record->phase = WL_COLUMNAR_RELATION_PRIVATE_RETIRING;
+    record->batch.active = false;
+    wl_columnar_relation_mutation_single_t *single = &record->batch.single;
+    if (!col_rel_mutation_writer_inert(&single->owners[1].writer)
+        || single->set.initialization_count)
+        return wl_columnar_relation_cleanup_result(rc, EINVAL);
+    /* Inspect actual tokens, including a descriptor whose counter is not yet
+     * published. Owner exclusion retires before descriptor exclusion. */
+    wl_columnar_source_access_writer_t *owner = &single->owners[0].writer;
+    wl_columnar_source_access_writer_t *descriptor = &single->descriptor.writer;
+    if (owner->owner) {
+        int valid = single->owners[0].owner == record->batch.relation
+            ? wl_columnar_source_access_writer_validate(owner,
+                &record->batch.relation->source_access) : EINVAL;
+        rc = wl_columnar_relation_cleanup_result(rc, valid ? valid
+                : wl_columnar_source_access_writer_release(owner));
+    } else if (!col_rel_mutation_writer_inert(owner))
+        rc = wl_columnar_relation_cleanup_result(rc, EINVAL);
+    if (descriptor->owner) {
+        int valid = single->descriptor.relation == record->batch.relation
+            ? wl_columnar_source_access_writer_validate(descriptor,
+                &record->batch.relation->descriptor_access) : EINVAL;
+        rc = wl_columnar_relation_cleanup_result(rc, valid ? valid
+                : wl_columnar_source_access_writer_release(descriptor));
+    } else if (!col_rel_mutation_writer_inert(descriptor))
+        rc = wl_columnar_relation_cleanup_result(rc, EINVAL);
+    if (col_rel_mutation_writer_inert(owner)
+        && col_rel_mutation_writer_inert(descriptor))
+        record->phase = WL_COLUMNAR_RELATION_PRIVATE_RETIRED;
+    return rc;
+}
+
+static int
+wl_columnar_relation_private_single_reset(
+    wl_columnar_relation_private_batch_t *record,
+    wl_evaluation_control_t *control)
+{
+    if (!record || !record->ready) return EINVAL;
+    if (record->phase == WL_COLUMNAR_RELATION_PRIVATE_RESETTING) return EBUSY;
+    if (record->phase != WL_COLUMNAR_RELATION_PRIVATE_INERT
+        && record->phase != WL_COLUMNAR_RELATION_PRIVATE_RETIRED) return EBUSY;
+    wl_columnar_relation_mutation_single_t *single = &record->batch.single;
+    int rc = wl_evaluation_control_charge(control, 64);
+    if (rc) return rc;
+    if (!col_rel_mutation_writer_inert(&single->descriptor.writer)
+        || !col_rel_mutation_writer_inert(&single->owners[0].writer)
+        || !col_rel_mutation_writer_inert(
+            &single->owners[1].writer)) return EBUSY;
+    rc = wl_columnar_relation_work_tail(control, 64);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 8);
+    if (rc) return rc;
+    record->phase = WL_COLUMNAR_RELATION_PRIVATE_RESETTING;
+    rc = wl_columnar_relation_work_tail(control, 8);
+    if (rc) return rc;
+    for (size_t offset = 0; offset < sizeof(*single);) {
+        size_t bytes = sizeof(*single) - offset;
+        if (bytes > 128) bytes = 128;
+        rc = wl_evaluation_control_charge(control, bytes);
+        if (rc) return rc;
+        memset((char *)single + offset, 0, bytes);
+        offset += bytes;
+        wl_columnar_relation_private_checkpoint(control, record, 1, offset);
+        rc = wl_columnar_relation_work_tail(control, bytes);
+        if (rc) return rc;
+        rc = wl_evaluation_control_charge(control, 8);
+        if (rc) return rc;
+        rc = wl_columnar_relation_work_tail(control, 8);
+        if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(control, 8);
+    if (rc) return rc;
+    rc = wl_columnar_relation_work_tail(control, 8);
+    if (rc) return rc;
+    record->phase = WL_COLUMNAR_RELATION_PRIVATE_INERT;
+    return 0;
+}
+
+static int
+wl_columnar_relation_private_single_acquire(
+    wl_columnar_relation_private_batch_t *record, col_rel_t *r,
+    wl_evaluation_control_t *control)
+{
+    wl_columnar_relation_mutation_single_t *single = &record->batch.single;
+    wl_columnar_relation_mutation_set_t *set = &single->set;
+    uint64_t nonce;
+    int rc = wl_columnar_relation_nonce_controlled(&nonce, control);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 8);
+    if (rc) return rc;
+    record->phase = WL_COLUMNAR_RELATION_PRIVATE_INSTALLING;
+    rc = wl_columnar_relation_work_tail(control, 8);
+    if (rc) goto fail;
+    rc = wl_evaluation_control_charge(control, 96);
+    if (rc) goto fail;
+    single->role.relation = r;
+    single->role.role_flags = WL_COLUMNAR_RELATION_PAYLOAD_MUTATION;
+    set->identity = (uintptr_t)set; set->acquisition_nonce = nonce;
+    set->roles = &single->role; set->descriptors = &single->descriptor;
+    set->owners = single->owners; set->leases = &single->lease;
+    set->initializations = &single->initialization;
+    set->descriptor_count = 1; set->lease_count = 1;
+    single->descriptor.relation = r;
+    rc = wl_columnar_relation_work_tail(control, 96);
+    if (rc) goto fail;
+    rc = wl_columnar_relation_writer_acquire_controlled(&r->descriptor_access,
+            &single->descriptor.writer, control);
+    if (rc) goto fail;
+    rc = wl_evaluation_control_charge(control, 8);
+    if (rc) goto fail;
+    set->descriptors_acquired = 1;
+    wl_columnar_relation_private_checkpoint(control, record, 2, 0);
+    rc = wl_columnar_relation_work_tail(control, 8);
+    if (rc) goto fail;
+    col_rel_t *owner = NULL;
+    rc = wl_columnar_relation_resolve_controlled(r, &owner, control);
+    if (rc) goto fail;
+    rc = wl_evaluation_control_charge(control, 96);
+    if (rc) goto fail;
+    if (owner != r || !r->relation_identity
+        || !wl_columnar_relation_generation_valid(r->storage_generation)
+        || r->storage_owner_identity != r->relation_identity
+        || r->storage_owner_generation != r->storage_generation
+        || col_rel_storage_alias_borrow_count(r)) {
+        rc = EINVAL; goto fail;
+    }
+    single->owners[0].owner = r; set->owner_count = 1;
+    rc = wl_columnar_relation_work_tail(control, 96);
+    if (rc) goto fail;
+    rc = wl_evaluation_control_charge(control, 128);
+    if (rc) goto fail;
+    single->lease.set = set; single->lease.acquisition_nonce = nonce;
+    single->lease.relation = r; single->lease.owner = r;
+    single->lease.role_flags = WL_COLUMNAR_RELATION_PAYLOAD_MUTATION;
+    single->lease.relation_identity = r->relation_identity;
+    single->lease.relation_generation = r->storage_generation;
+    single->lease.owner_identity = r->relation_identity;
+    single->lease.owner_generation = r->storage_generation;
+    rc = wl_columnar_relation_work_tail(control, 128);
+    if (rc) goto fail;
+    rc = wl_columnar_relation_writer_acquire_controlled(&r->source_access,
+            &single->owners[0].writer, control);
+    if (rc) goto fail;
+    rc = wl_evaluation_control_charge(control, 8);
+    if (rc) goto fail;
+    set->owners_acquired = 1;
+    wl_columnar_relation_private_checkpoint(control, record, 3, 0);
+    rc = wl_columnar_relation_work_tail(control, 8);
+    if (rc) goto fail;
+    rc = wl_evaluation_control_charge(control, 16);
+    if (rc) goto fail;
+    if (col_rel_storage_alias_borrow_count(r)) {
+        rc = EBUSY; goto fail;
+    }
+    single->lease.identity = (uintptr_t)&single->lease;
+    rc = wl_columnar_relation_work_tail(control, 16);
+    if (rc) goto fail;
+    rc = wl_evaluation_control_charge(control, 32);
+    if (rc) goto fail;
+    rc = col_rel_mutation_lease_validate(&single->lease, r);
+    int stop = wl_columnar_relation_work_tail(control, 32);
+    if (!rc) rc = stop;
+    if (rc) goto fail;
+    rc = wl_evaluation_control_charge(control, 8);
+    if (rc) goto fail;
+    rc = wl_columnar_relation_work_tail(control, 8);
+    if (rc) goto fail;
+    record->phase = WL_COLUMNAR_RELATION_PRIVATE_HELD;
+    return 0;
+fail:
+    return wl_columnar_relation_private_batch_retire(record, rc);
+}
+
+int
+wl_columnar_relation_private_append_batch_begin_controlled(
+    wl_columnar_relation_private_batch_t *record, col_rel_t *r,
+    wl_evaluation_control_t *control)
+{
+    if (!record || !record->ready || !r || !control) return EINVAL;
+    if (record->phase == WL_COLUMNAR_RELATION_PRIVATE_RESETTING) return EBUSY;
+    if (record->phase != WL_COLUMNAR_RELATION_PRIVATE_INERT
+        && record->phase != WL_COLUMNAR_RELATION_PRIVATE_RETIRED) return EBUSY;
+    int rc = wl_evaluation_control_charge(control, 64);
+    if (rc) return rc;
+    if (record->batch.active || r->storage_owner != r
+        || col_rel_storage_alias_borrow_count(r) || !r->relation_identity)
+        return EBUSY;
+    rc = wl_columnar_relation_work_tail(control, 64);
+    if (rc) return rc;
+    rc = wl_columnar_relation_private_single_reset(record, control);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 16);
+    if (rc) return rc;
+    record->batch.relation = r; record->batch.controlled_row_committed = false;
+    rc = wl_columnar_relation_work_tail(control, 16);
+    if (rc) return rc;
+    rc = wl_columnar_relation_private_single_acquire(record, r, control);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 16);
+    if (rc) return wl_columnar_relation_private_batch_retire(record, rc);
+    rc = wl_columnar_relation_work_tail(control, 16);
+    if (rc) return wl_columnar_relation_private_batch_retire(record, rc);
+    record->batch.active = true;
+    return 0;
+}
+
+int
+wl_columnar_relation_private_append_batch_row_controlled(
+    wl_columnar_relation_private_batch_t *record, const int64_t *row,
+    wl_evaluation_control_t *control)
+{
+    if (!record || !record->ready || !control || !row
+        || record->phase != WL_COLUMNAR_RELATION_PRIVATE_HELD
+        || !record->batch.active) return EINVAL;
+    col_rel_t *r = record->batch.relation;
+    if (record->batch.single.lease.storage_transitioned
+        && col_rel_append_replaces_storage(r)) {
+        wl_columnar_relation_private_checkpoint(control, record, 4, r->nrows);
+        int rc = wl_columnar_relation_private_batch_retire(record, 0);
+        if (rc) return rc;
+        rc = wl_columnar_relation_private_append_batch_begin_controlled(record,
+                r, control);
+        if (rc) return rc;
+    }
+    r->memory_budget_denial_pending = false;
+    int rc = wl_columnar_relation_row_body(r, row, &record->batch.single,
+            control);
+    if (!rc) record->batch.controlled_row_committed = true;
+    return rc;
+}
+
+int
+wl_columnar_relation_private_append_batch_end_controlled(
+    wl_columnar_relation_private_batch_t *record)
+{
+    return wl_columnar_relation_private_batch_retire(record, 0);
+}
+
+int
+wl_columnar_relation_private_cell_controlled(
+    wl_columnar_relation_private_batch_t *record, uint32_t row, uint32_t col,
+    int64_t value, wl_evaluation_control_t *control)
+{
+    if (!record || !record->ready || !control
+        || record->phase != WL_COLUMNAR_RELATION_PRIVATE_HELD) return EINVAL;
+    col_rel_append_batch_t *batch = &record->batch;
+    col_rel_t *r = batch->relation;
+    wl_columnar_relation_mutation_single_t *single = &batch->single;
+    int rc = wl_evaluation_control_charge(control, 32);
+    if (rc) return rc;
+    wl_columnar_relation_private_checkpoint(control, record, 7, row);
+    if (!batch->active
+        || single->set.identity != (uintptr_t)&single->set
+        || single->set.roles != &single->role
+        || single->set.descriptors != &single->descriptor
+        || single->set.owners != single->owners
+        || single->set.leases != &single->lease
+        || single->set.initializations != &single->initialization
+        || single->lease.identity != (uintptr_t)&single->lease
+        || single->lease.set != &single->set
+        || single->lease.relation != r || single->descriptor.relation != r
+        || single->set.descriptor_count != 1
+        || single->set.lease_count != 1 || single->set.owner_count != 1
+        || single->set.initialization_count || single->owners[0].owner != r
+        || !col_rel_mutation_writer_inert(&single->owners[1].writer)
+        || single->lease.owner_slot || single->lease.self_owner_slot
+        || single->lease.owner != r) return EINVAL;
+    rc = col_rel_mutation_lease_validate(&single->lease, r);
+    int stop = wl_columnar_relation_work_tail(control, 32);
+    if (!rc) rc = stop;
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 48);
+    if (rc) return rc;
+    wl_columnar_relation_private_checkpoint(control, record, 5, row);
+    if (r->nrows > r->capacity || row >= r->nrows || row >= r->capacity
+        || col >= r->ncols || !r->columns
+        || !r->columns[col] || r->storage_owner != r || r->col_shared
+        || r->arena_owned || r->compound_kind != WIRELOG_COMPOUND_KIND_NONE)
+        return EINVAL;
+    if (r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
+        return EOVERFLOW;
+    wirelog_column_type_t type = r->column_types ? r->column_types[col]
+        : WIRELOG_TYPE_INT64;
+    if (type != WIRELOG_TYPE_INT64 && type != WIRELOG_TYPE_FLOAT) return EINVAL;
+    if (type == WIRELOG_TYPE_FLOAT) {
+        if (!wl_columnar_float_bits_valid(value)) return EINVAL;
+        value = (int64_t)wl_columnar_float_canonical_bits(value);
+    }
+    uint64_t generation = r->view_generation + 1u;
+    rc = wl_columnar_relation_work_tail(control, 48);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 16);
+    if (rc) return rc;
+    rc = wl_columnar_relation_work_tail(control, 16);
+    if (rc) return rc;
+    r->columns[col][row] = value;
+    r->view_generation = generation;
+    single->set.published = true;
+    batch->controlled_row_committed = true;
+    return 0;
+}
+
 int
 wl_columnar_relation_append_row_controlled(col_rel_t *r, const int64_t *row,
     wl_evaluation_control_t *control)

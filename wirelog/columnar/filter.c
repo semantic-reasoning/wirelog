@@ -1005,7 +1005,7 @@ wl_columnar_filter_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
                 wl_columnar_expr_eval_interpreter_controlled(
                 op->filter_expr.data, op->filter_expr.size,
                 tuple ? tuple : &dummy, source->ncols, &value, &failed,
-                sess, &status, false, control);
+                sess, &status, false, true, control);
             if (rc) goto cleanup;
             if (failed && status == WL_COLUMNAR_EXPR_ALLOCATION_FAILURE) {
                 rc = ENOMEM; goto cleanup;

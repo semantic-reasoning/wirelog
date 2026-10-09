@@ -252,9 +252,17 @@ struct wl_columnar_eval_stack_cleanup_frame {
     eval_stack_t stack;
     eval_entry_t result;
     wl_columnar_relation_source_group_t join_sources;
+    wl_columnar_relation_private_batch_t reduce_batch;
     wl_columnar_memory_reservation_t reservation;
     wl_columnar_memory_governor_ref_t *governor;
 };
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_eval_stack_test_constructor_checkpoint)(
+    wl_evaluation_control_t *, uint64_t);
+bool wl_columnar_eval_stack_test_fail_allocation;
+bool wl_columnar_eval_stack_test_fail_commit;
+#endif
 
 int
 wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
@@ -263,6 +271,10 @@ wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
     wl_columnar_memory_reservation_t reservation;
     wl_columnar_eval_stack_cleanup_frame_t *frame;
     uint64_t bytes;
+    wl_evaluation_control_t *control =
+        sess ? sess->base.evaluation_control : NULL;
+    int admission = control ? wl_evaluation_control_charge(control, 32) : 0;
+    if (admission) return admission;
     if (!sess || !out || *out)
         return EINVAL;
     if (sess->cleanup_pending)
@@ -275,12 +287,28 @@ wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
     if (!wl_columnar_memory_size_add(sess->cleanup_reserved_bytes,
         sizeof(*frame), &bytes))
         return EOVERFLOW;
+    if (control) {
+        admission = wl_evaluation_control_charge(control, 0);
+        if (admission) return admission;
+    }
     wl_columnar_memory_reservation_init(&reservation);
     if (sess->memory_governor) {
-        wl_columnar_memory_admission_status_t status
-            = wl_columnar_memory_reserve_checked(
+        wl_columnar_memory_admission_status_t status;
+        int rc = sess->base.evaluation_control
+            ? wl_columnar_memory_governor_reserve_checked_controlled(
+            wl_columnar_memory_governor_ref_get(sess->memory_governor),
+            sizeof(*frame), &reservation, &status,
+            sess->base.evaluation_control) : 0;
+        if (!sess->base.evaluation_control)
+            status = wl_columnar_memory_reserve_checked(
                 wl_columnar_memory_governor_ref_get(sess->memory_governor),
                 sizeof(*frame), &reservation);
+        if (rc) {
+            if (atomic_load(&reservation.state)
+                == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED)
+                (void)wl_columnar_memory_rollback(&reservation);
+            return rc;
+        }
         if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
             if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
@@ -290,25 +318,127 @@ wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
                 : EINVAL;
         }
     }
-    frame = calloc(1, sizeof(*frame));
+    admission = control ? wl_evaluation_control_charge(control, 1) : 0;
+    if (admission) {
+        if (sess->memory_governor) (void)wl_columnar_memory_rollback(
+                &reservation);
+        return admission;
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_stack_test_fail_allocation) {
+        wl_columnar_eval_stack_test_fail_allocation = false;
+        frame = NULL;
+    } else
+#endif
+    frame = control ? malloc(sizeof(*frame)) : calloc(1, sizeof(*frame));
     if (!frame) {
         if (sess->memory_governor)
             (void)wl_columnar_memory_rollback(&reservation);
         return ENOMEM;
     }
+    if (control) {
+        int rc = wl_evaluation_control_charge(control, 0);
+        for (size_t offset = 0; !rc && offset < sizeof(*frame);) {
+            size_t count = sizeof(*frame) - offset;
+            if (count > 128) count = 128;
+            rc = wl_evaluation_control_charge(control, count);
+            if (rc) break;
+            memset((char *)frame + offset, 0, count);
+            offset += count;
+#ifdef WL_SESSION_TEST_HOOKS
+            if (wl_columnar_eval_stack_test_constructor_checkpoint)
+                wl_columnar_eval_stack_test_constructor_checkpoint(control,
+                    offset);
+#endif
+            rc = wl_evaluation_control_charge(control, 0);
+            if (rc) break;
+            rc = wl_evaluation_control_charge(control, 8);
+            if (rc) break;
+            rc = wl_evaluation_control_charge(control, 0);
+            if (rc) break;
+        }
+        if (rc) {
+            free(frame);
+            if (sess->memory_governor)
+                (void)wl_columnar_memory_rollback(&reservation);
+            return rc;
+        }
+    }
+    if (control) {
+        admission = wl_evaluation_control_charge(control, 32);
+        if (admission) {
+            free(frame);
+            if (sess->memory_governor) (void)wl_columnar_memory_rollback(
+                    &reservation);
+            return admission;
+        }
+    }
+    frame->reduce_batch.ready = true;
     wl_columnar_memory_reservation_init(&frame->reservation);
+    if (control) {
+        admission = wl_evaluation_control_charge(control, 0);
+        if (admission) {
+            free(frame);
+            if (sess->memory_governor) (void)wl_columnar_memory_rollback(
+                    &reservation);
+            return admission;
+        }
+    }
     if (sess->memory_governor) {
+        int rc = control ? wl_evaluation_control_charge(control, 32) : 0;
+        if (rc) {
+            free(frame); (void)wl_columnar_memory_rollback(&reservation);
+            return rc;
+        }
         if (!wl_columnar_memory_reservation_move(&frame->reservation,
             &reservation)) {
+            free(frame);
             (void)wl_columnar_memory_rollback(&reservation);
-            free(frame);
             return EINVAL;
         }
-        if (!wl_columnar_memory_commit(&frame->reservation, frame)) {
-            (void)wl_columnar_memory_rollback(&frame->reservation);
-            free(frame);
-            return EINVAL;
+        bool accepted;
+        rc = control ? wl_evaluation_control_charge(control, 0) : 0;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (!rc && wl_columnar_eval_stack_test_fail_commit) {
+            wl_columnar_eval_stack_test_fail_commit = false;
+            rc = ENOMEM;
         }
+#endif
+        if (!rc && control)
+            rc = wl_columnar_memory_governor_commit_controlled(
+                &frame->reservation, frame, &accepted, control);
+        else if (!rc)
+            accepted = wl_columnar_memory_commit(&frame->reservation, frame);
+        if (rc || !accepted) {
+            if (!wl_columnar_memory_reservation_move(&reservation,
+                &frame->reservation)) abort();
+            free(frame);
+            uint64_t state = atomic_load(&reservation.state);
+            bool released = state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+                ? wl_columnar_memory_release(&reservation)
+                : wl_columnar_memory_rollback(&reservation);
+            if (!released) abort();
+            return rc ? rc : EINVAL;
+        }
+    }
+    if (control) {
+        int rc = wl_evaluation_control_charge(control, 96);
+        if (!rc) rc = wl_evaluation_control_charge(control, 0);
+        if (rc) {
+            if (sess->memory_governor &&
+                !wl_columnar_memory_reservation_move(&reservation,
+                &frame->reservation)) abort();
+            wl_columnar_memory_governor_ref_t *governor = sess->memory_governor;
+            free(frame);
+            if (governor) {
+                if (!wl_columnar_memory_release(&reservation)) abort();
+            }
+            return rc;
+        }
+    }
+    /* The admitted final publication includes this fixed retain and pointer
+     * installation; no fallible control call follows the final cutoff. */
+    if (sess->memory_governor) {
         frame->governor = sess->memory_governor;
         wl_columnar_memory_governor_ref_retain(frame->governor);
     }
@@ -354,6 +484,21 @@ wl_columnar_eval_stack_cleanup_join_owner(wl_col_session_t *sess,
     return 0;
 }
 
+wl_columnar_relation_private_batch_t *
+wl_columnar_eval_stack_cleanup_reduce_batch(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    if (!frame || !frame->session || !frame->reduce_batch.ready) return NULL;
+    wl_columnar_relation_private_batch_t *record = &frame->reduce_batch;
+    if ((record->phase == WL_COLUMNAR_RELATION_PRIVATE_INSTALLING
+        || record->phase == WL_COLUMNAR_RELATION_PRIVATE_HELD
+        || record->phase == WL_COLUMNAR_RELATION_PRIVATE_RETIRING)
+        && (frame->result.rel != record->batch.relation ||
+        !frame->result.owned))
+        return NULL;
+    return record;
+}
+
 static void
 wl_columnar_eval_stack_cleanup_continuations(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
@@ -369,8 +514,10 @@ static int
 wl_columnar_eval_stack_cleanup_dispose(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
 {
-    int result = wl_columnar_relation_source_group_drain(&frame->join_sources,
+    int result = wl_columnar_relation_private_batch_retire(&frame->reduce_batch,
             0);
+    if (result != 0) return result;
+    result = wl_columnar_relation_source_group_drain(&frame->join_sources, 0);
     if (result != 0)
         return result;
     result = eval_entry_dispose(&frame->result);

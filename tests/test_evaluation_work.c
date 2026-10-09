@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <limits.h>
 #include <math.h>
+#include <float.h>
 #include "../wirelog/intern.h"
 #include "../wirelog/string_ops.h"
 #include "../wirelog/exec_plan_gen.h"
@@ -7504,12 +7505,12 @@ test_string_unmanaged_caller_governed_table(void)
     int64_t value = INT64_MIN; bool failed = true;
     wl_columnar_expr_status_t status = WL_COLUMNAR_EXPR_MALFORMED;
     CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL, 0, &value,
-        &failed, &sess, &status, false, c) == 0);
+        &failed, &sess, &status, false, true, c) == 0);
     finish(c, 0); CHECK(!failed && status == WL_COLUMNAR_EXPR_OK && value == 0);
     CHECK(wl_intern_count(table) == 1 && string_reserved(t) == 256+512+12);
     retry(c, 0);
     CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL, 0, &value,
-        &failed, &sess, &status, false, c) == 0); finish(c, 0);
+        &failed, &sess, &status, false, true, c) == 0); finish(c, 0);
     CHECK(!failed && value == 0 && string_reserved(t) == 256+512+12);
     wl_intern_free(table); release(c); governor_empty(t);
     wl_columnar_memory_governor_ref_release(t);
@@ -8979,7 +8980,7 @@ uuid_known_vector(const char *ns, const char *name, const uint8_t expected[20])
     wl_columnar_expr_status_t status; bool failed; int64_t actual;
     wl_evaluation_control_t *c = control(0);
     CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL, 0,
-        &actual, &failed, sess, &status, false, c) == 0);
+        &actual, &failed, sess, &status, false, true, c) == 0);
     CHECK(!failed && actual == 1 && status == WL_COLUMNAR_EXPR_OK);
     finish(c, 0); release(c); wl_intern_free(sess->intern);
     sess->intern = NULL; join_session_destroy(sess);
@@ -9046,7 +9047,8 @@ test_uuid_pair_native_and_fallback_vectors(void)
             bool failed; int64_t value; wl_columnar_expr_status_t status;
             wl_evaluation_control_t *c = control(0);
             CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL,
-                0, &value, &failed, NULL, &status, false, c) == 0 && !failed &&
+                0, &value, &failed, NULL, &status, false, true,
+                c) == 0 && !failed &&
                 value == 1);
             finish(c, 0); release(c);
         }
@@ -9088,7 +9090,7 @@ test_uuid_pair_mixed_vectors(void)
         bool failed; int64_t value; wl_columnar_expr_status_t status;
         wl_evaluation_control_t *c = control(0);
         CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL, 0,
-            &value, &failed, sess, &status, false,
+            &value, &failed, sess, &status, false, true,
             c) == 0 && !failed && value == 1);
         finish(c, 0); release(c); wl_intern_free(sess->intern);
         sess->intern = NULL; join_session_destroy(sess);
@@ -10712,7 +10714,8 @@ extension_nested_eval(bool controlled)
     wl_evaluation_control_t *c = controlled ? control(0) : NULL;
     CHECK(wl_columnar_expr_eval_interpreter_controlled(extension_nested_buf,
         extension_nested_size, NULL, 0, &value, &failed,
-        extension_nested_session, &extension_nested_status, false, c) == 0);
+        extension_nested_session, &extension_nested_status, false, true,
+        c) == 0);
     CHECK(failed);
     if (c) {
         finish(c, 0); release(c);
@@ -10757,7 +10760,7 @@ extension_invoke(const wirelog_extension_value_t *args, uint32_t nargs,
         wl_evaluation_control_t *c = control(0);
         CHECK(wl_columnar_expr_eval_interpreter_controlled(extension_nested_buf,
             extension_nested_size, NULL, 0, &value, &failed,
-            extension_nested_session, &status, false, c) == 0);
+            extension_nested_session, &status, false, true, c) == 0);
         finish(c, 0); release(c);
         if (extension_depth == 64) CHECK(failed &&
                 status == WL_COLUMNAR_EXPR_CALLBACK_REENTRANT);
@@ -10773,7 +10776,8 @@ extension_invoke(const wirelog_extension_value_t *args, uint32_t nargs,
         CHECK(wl_columnar_expr_eval_interpreter_controlled(extension_nested_buf,
             extension_nested_size, NULL, 0, &value, &failed,
             extension_nested_session,
-            &status, false, nested_control) == 0 && !failed && value == 1);
+            &status, false, true,
+            nested_control) == 0 && !failed && value == 1);
         if (nested_control) {
             finish(nested_control, 0); release(nested_control);
         }
@@ -11343,7 +11347,7 @@ test_extension_direct_release_and_destructor_tls(void)
         wl_columnar_expr_status_t status;
         CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL, 0,
             &value, &failed,
-            &sess, &status, false,
+            &sess, &status, false, true,
             c) == 0 && !failed && value == 1 && status == WL_COLUMNAR_EXPR_OK);
         /* This is one call: the borrowed direct snapshot was consumed by host.
          * Clear it immediately; never use it as later-row ownership evidence. */
@@ -11377,7 +11381,7 @@ test_extension_tls_depth_and_policy(void)
     wl_evaluation_control_t *c = control(0); int64_t value; bool failed;
     wl_columnar_expr_status_t status;
     CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL, 0, &value,
-        &failed, &sess, &status, false, c) == 0 &&
+        &failed, &sess, &status, false, true, c) == 0 &&
         !failed && value == 1 && extension_calls == 64 &&
         extension_tls_visits == (64*65)/2);
     finish(c, 0); release(c);
@@ -11387,7 +11391,7 @@ test_extension_tls_depth_and_policy(void)
     for (int controlled = 0; controlled < 2; controlled++) {
         c = controlled ? control(0) : NULL;
         CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL, 0,
-            &value, &failed, &sess, &status, false, c) == 0 &&
+            &value, &failed, &sess, &status, false, true, c) == 0 &&
             failed && status == WL_COLUMNAR_EXPR_CALLBACK_POLICY &&
             extension_calls == 64);
         if (c) {
@@ -11397,7 +11401,7 @@ test_extension_tls_depth_and_policy(void)
     sess.callback_parallel_execution = false;
     c = control(0);
     CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL, 0, &value,
-        &failed, &sess, &status, false, c) == 0 && !failed && value == 1);
+        &failed, &sess, &status, false, true, c) == 0 && !failed && value == 1);
     finish(c, 0); release(c);
     extension_teardown();
 }
@@ -11420,7 +11424,7 @@ test_extension_same_session_policy_and_owner_guard(void)
             wl_evaluation_control_t *c = governed ? control(0) : NULL;
             int64_t value; bool failed; wl_columnar_expr_status_t status;
             CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL, 0,
-                &value, &failed, &sess, &status, false,
+                &value, &failed, &sess, &status, false, true,
                 c) == 0 && !failed && value == 1);
             if (c) {
                 finish(c, 0); release(c);
@@ -11434,10 +11438,1048 @@ test_extension_same_session_policy_and_owner_guard(void)
     extension_caller_twins(buf, n, 1, 0, 0, false);
     extension_teardown();
 }
+/* REDUCE exercises the actual VARIABLE dispatcher and original-address private
+ * frame record. Raw references never receive the unsafe nonempty zero-width
+ * grouped shape. */
+static int
+reduce_dispatch(wl_col_session_t *sess,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_plan_op_t *reduce,
+    wl_evaluation_control_t *c)
+{
+    wl_plan_op_t ops[2] = {
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+         .delta_mode = WL_DELTA_FORCE_FULL}, *reduce
+    };
+    return compiled_dispatch(sess, frame, ops, 2, c);
+}
+
+static void
+test_reduce_actual_twins(void)
+{
+    for (unsigned mode = 0; mode < 15; mode++) {
+        wl_col_session_t *sess = join_session(), *raw = join_session();
+        uint32_t width = mode == 10 ? 301 : mode == 11 || mode == 12 ? 0 : 3;
+        uint32_t rows = mode == 9 || mode == 12 ? 0 : mode == 10 ? 3 : 19;
+        col_rel_t *source = relation(width, rows, rows, false,
+                sess->memory_governor);
+        col_rel_t *ref = relation(width, rows, rows, false,
+                raw->memory_governor);
+        uint32_t indices[300];
+        for (uint32_t k = 0; k < 300; k++) indices[k] = k;
+        bool floating = mode >= 5 && mode <= 8;
+        for (uint32_t r = 0; r < rows; r++) {
+            for (uint32_t k = 0; k < width; k++)
+                source->columns[k][r] = ref->columns[k][r] = k + r % 3;
+            if (width) source->columns[0][r] = ref->columns[0][r] = r % 3;
+            if (width > 1) source->columns[1][r] = ref->columns[1][r] = floating
+                ? wl_columnar_float_to_bits((double)(r % 5) -
+                        2.0) : (int64_t)r - 8;
+        }
+        if (floating) {
+            wirelog_column_type_t types[3] = {WIRELOG_TYPE_INT64,
+                                              WIRELOG_TYPE_FLOAT,
+                                              WIRELOG_TYPE_INT64};
+            source->nrows = ref->nrows = 0;
+            CHECK(col_rel_set_column_types(source, types, 3) == 0);
+            CHECK(col_rel_set_column_types(ref, types, 3) == 0);
+            source->nrows = ref->nrows = rows;
+        }
+        CHECK(session_add_rel(sess, source) == 0 && session_add_rel(raw,
+            ref) == 0);
+        uint8_t expr[10000]; uint32_t n = 0;
+        if (mode == 13) {
+            n = compiled_var(expr, n, "col1");
+            n = compiled_const(expr, n, 2); expr[n++] = WL_PLAN_EXPR_ARITH_MUL;
+        } else if (mode == 14) {
+            n = compiled_const(expr, n, 0);
+            expr[n++] = WL_PLAN_EXPR_STR_FN_STRLEN;
+        }
+        wirelog_agg_fn_t fns[] = {WIRELOG_AGG_COUNT, WIRELOG_AGG_SUM,
+                                  WIRELOG_AGG_MIN, WIRELOG_AGG_MAX,
+                                  WIRELOG_AGG_AVG};
+        wl_plan_op_t op = {.op = WL_PLAN_OP_REDUCE,
+                           .group_by_count = mode == 10 ? 300 : mode ==
+                               11 ? 0 : 1,
+                           .group_by_indices = indices,
+                           .agg_fn = floating ? fns[mode - 4] : fns[mode % 5],
+                           .agg_operand_type =
+                               floating ? WL_PLAN_AGG_OPERAND_FLOAT
+                : WL_PLAN_AGG_OPERAND_SCALAR,
+                           .aggregate_index = mode == 4 ? 0 : UINT32_MAX,
+                           .agg_expr = {expr, n}};
+        if (mode == 14) op.agg_fn = WIRELOG_AGG_SUM;
+        wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess),
+            *reference = filter_frame(raw);
+        wl_evaluation_control_t *c = control(0);
+        int rc = reduce_dispatch(sess, frame, &op, c);
+        int expected = reduce_dispatch(raw, reference, &op, NULL);
+        if (rc != expected) fprintf(stderr, "reduce mode=%u rc=%d raw=%d\n",
+                mode, rc, expected);
+        CHECK(rc == expected); uint64_t cost = finish(c, rc);
+        if (!rc) filter_equal(join_output(frame), join_output(reference));
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+        if (!rc && mode != 14) {
+            frame = filter_frame(sess); retry(c, cost - 1u);
+            CHECK(reduce_dispatch(sess, frame, &op,
+                c) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+            finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+            frame = filter_frame(sess); retry(c, cost);
+            CHECK(reduce_dispatch(sess, frame, &op, c) == 0);
+            CHECK(finish(c, 0) == cost);
+            filter_equal(join_output(frame), join_output(reference));
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+        }
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&reference) == 0);
+        source_unpinned(source, source); release(c);
+        join_session_destroy(sess); join_session_destroy(raw);
+    }
+}
+
+static unsigned reduce_stage, reduce_reached, reduce_grows, reduce_epoch;
+static uint64_t reduce_at;
+static bool reduce_overflow, reduce_keep_result;
+static wl_columnar_relation_private_batch_t *reduce_record;
+static void
+reduce_stop(wl_evaluation_control_t *c)
+{
+    reduce_reached++;
+    if (reduce_overflow) CHECK(wl_evaluation_control_charge(c,
+            UINT64_MAX) == EOVERFLOW);
+    else wl_evaluation_control_request_cancel(c);
+}
+static void
+reduce_operator_stop(wl_evaluation_control_t *c, int stage, uint64_t progress,
+    wl_columnar_relation_private_batch_t *record, col_rel_t *source)
+{
+    (void)source;
+    if ((unsigned)stage != reduce_stage || progress < reduce_at) return;
+    wl_columnar_ops_reduce_test_checkpoint = NULL;
+    reduce_record = record;
+    reduce_stop(c);
+}
+static void
+reduce_private_stop(wl_evaluation_control_t *c,
+    wl_columnar_relation_private_batch_t *record, int stage, uint64_t progress)
+{
+    if (stage == 4) {
+        reduce_grows++; return;
+    }
+    if ((unsigned)stage != reduce_stage || progress < reduce_at
+        || reduce_grows < reduce_epoch) return;
+    wl_columnar_relation_test_private_checkpoint = NULL;
+    reduce_record = record;
+    if (reduce_keep_result)
+        CHECK(col_rel_source_reader_acquire(record->batch.relation,
+            &join_retained_reader) == 0);
+    reduce_stop(c);
+}
+static void
+test_reduce_long_reached_stops(void)
+{
+    const unsigned stages[] = {1, 2, 3, 4, 6, 7};
+    for (unsigned s = 0; s < sizeof(stages)/sizeof(stages[0]); s++)
+        for (unsigned overflow = 0; overflow < 2; overflow++) {
+            wl_col_session_t *sess = join_session();
+            col_rel_t *source = relation(301, 3, 3, false,
+                    sess->memory_governor);
+            for (uint32_t col = 0; col < 301; col++) {
+                source->columns[col][0] = col;
+                source->columns[col][1] = col;
+                source->columns[col][2] = col+1;
+            }
+            CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+            wl_plan_op_t op = {.op = WL_PLAN_OP_REDUCE,
+                               .group_by_count = 300,
+                               .aggregate_index = UINT32_MAX,
+                               .agg_fn = WIRELOG_AGG_SUM};
+            wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+            wl_evaluation_control_t *c = control(0);
+            reduce_stage = stages[s]; reduce_at = 300;
+            reduce_overflow = overflow; reduce_reached = 0;
+            wl_columnar_ops_reduce_test_checkpoint = reduce_operator_stop;
+            int expected =
+                overflow ? EOVERFLOW : WL_EVALUATION_CONTROL_CANCELLED;
+            CHECK(reduce_dispatch(sess, frame, &op, c) == expected);
+            finish(c, expected); CHECK(reduce_reached == 1);
+            lazy_unchanged(source); source_unpinned(source, source);
+            CHECK(!wl_columnar_eval_stack_cleanup_result(frame)->rel);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+            frame = filter_frame(sess); retry(c, 0);
+            CHECK(reduce_dispatch(sess, frame, &op, c) == 0); finish(c, 0);
+            CHECK(join_output(frame)->nrows == 2);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+            release(c); join_session_destroy(sess);
+        }
+}
+
+static void
+test_reduce_two_growth_reset(void)
+{
+    for (unsigned epoch = 1; epoch <= 2; epoch++)
+        for (unsigned overflow = 0; overflow < 2; overflow++)
+            for (unsigned retained = 0; retained < 2; retained++) {
+                wl_col_session_t *sess = join_session();
+                uint32_t rows = COL_REL_INIT_CAP * 4u + 1u;
+                col_rel_t *source = relation(2, rows, rows, false,
+                        sess->memory_governor);
+                CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+                wl_plan_op_t op = {.op = WL_PLAN_OP_REDUCE, .group_by_count = 1,
+                                   .aggregate_index = UINT32_MAX,
+                                   .agg_fn = WIRELOG_AGG_SUM};
+                wl_columnar_eval_stack_cleanup_frame_t *frame =
+                    filter_frame(sess);
+                wl_evaluation_control_t *c = control(0);
+                reduce_stage = 1; reduce_at = 128; reduce_epoch = epoch;
+                reduce_grows = reduce_reached = 0; reduce_overflow = overflow;
+                reduce_keep_result = retained;
+                wl_columnar_relation_test_private_checkpoint =
+                    reduce_private_stop;
+                int expected =
+                    overflow ? EOVERFLOW : retained ? EBUSY :
+                    WL_EVALUATION_CONTROL_CANCELLED;
+                CHECK(reduce_dispatch(sess, frame, &op, c) == expected);
+                finish(c, expected);
+                CHECK(reduce_reached == 1 && reduce_grows == epoch);
+                CHECK(reduce_record ==
+                    wl_columnar_eval_stack_cleanup_reduce_batch(frame));
+                CHECK(reduce_record->phase ==
+                    WL_COLUMNAR_RELATION_PRIVATE_RESETTING
+                    && !reduce_record->batch.active);
+                /* The single prefix is partially cleared. Forward refusal must
+                * read the independent phase before any pointer/token field. */
+                CHECK(
+                    wl_columnar_relation_private_append_batch_begin_controlled(
+                        reduce_record, source, c) == EBUSY);
+                lazy_unchanged(source); source_unpinned(source, source);
+                if (retained) {
+                    CHECK(wl_columnar_eval_stack_cleanup_result(frame)->rel
+                        == reduce_record->batch.relation);
+                    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) ==
+                        EBUSY);
+                    CHECK(sess->cleanup_pending && !frame);
+                    CHECK(
+                        wl_columnar_relation_private_append_batch_begin_controlled
+                        (
+                            reduce_record, source, c) == EBUSY);
+                    CHECK(col_rel_source_reader_release(
+                            &join_retained_reader) == 0);
+                    CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0);
+                } else CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) ==
+                        0);
+                reduce_keep_result = false;
+                frame = filter_frame(sess); retry(c, 0);
+                CHECK(reduce_dispatch(sess, frame, &op, c) == 0); finish(c, 0);
+                CHECK(join_output(frame)->nrows == rows);
+                CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+                release(c); join_session_destroy(sess);
+            }
+}
+
+static void
+test_reduce_extension_context(void)
+{
+    for (unsigned result = 0; result < 2; result++)
+        for (unsigned abi = 0; abi < 2; abi++)
+            for (unsigned count = 0; count < 2; count++) {
+                extension_setup("ext", 0, result ? WIRELOG_EXTENSION_VALUE_INT64
+                    : WIRELOG_EXTENSION_VALUE_BOOL, NULL, 0, false);
+                extension_mode = 0; extension_calls = 0;
+                uint8_t buf[32];
+                uint32_t n = extension_encode(buf, 0, "ext", 3, 0, abi);
+                wl_col_session_t *sess = join_session();
+                sess->base.extension_snapshot = extension_snapshot;
+                sess->intern = string_table(sess->memory_governor, 0);
+                col_rel_t *source = relation(1, 1, 1, false,
+                        sess->memory_governor);
+                CHECK(session_add_rel(sess, source) == 0);
+                wl_plan_op_t op = {.op = WL_PLAN_OP_REDUCE, .group_by_count = 0,
+                                   .aggregate_index = UINT32_MAX,
+                                   .agg_fn =
+                                       count ? WIRELOG_AGG_COUNT :
+                                       WIRELOG_AGG_SUM,
+                                   .agg_expr = {buf, n}};
+                extension_zero_lookup_visits = 0;
+                wl_extension_test_controlled_checkpoint = extension_zero_lookup;
+                for (unsigned controlled = 0; controlled < 2; controlled++) {
+                    wl_columnar_eval_stack_cleanup_frame_t *frame =
+                        filter_frame(sess);
+                    wl_evaluation_control_t *c = controlled ? control(0) : NULL;
+                    CHECK(reduce_dispatch(sess, frame, &op,
+                        c) == (count ? 0 : ERANGE));
+                    if (c) {
+                        finish(c, count ? 0 : ERANGE); release(c);
+                    }
+                    CHECK(!extension_calls && !sess->extension_expr_status
+                        && !extension_zero_lookup_visits);
+                    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+                }
+                wl_extension_test_controlled_checkpoint = NULL;
+                wl_intern_free(sess->intern); sess->intern = NULL;
+                sess->base.extension_snapshot = NULL;
+                join_session_destroy(sess); extension_teardown();
+            }
+}
+static void
+reduce_frame_stop(wl_evaluation_control_t *c, uint64_t bytes)
+{
+    if (bytes < 300) return;
+    wl_columnar_eval_stack_test_constructor_checkpoint = NULL;
+    reduce_stop(c);
+}
+static void
+test_reduce_controlled_frame_factory(void)
+{
+    for (unsigned mode = 0; mode < 7; mode++) {
+        wl_col_session_t *sess = join_session();
+        col_rel_t *source = relation(1, 1, 1, false, sess->memory_governor);
+        CHECK(session_add_rel(sess, source) == 0);
+        uint64_t baseline = string_reserved(sess->memory_governor);
+        wl_columnar_memory_governor_t *g =
+            wl_columnar_memory_governor_ref_get(sess->memory_governor);
+        uint64_t usable = atomic_load(&g->usable_bytes);
+        wl_evaluation_control_t *c = control(0);
+        sess->base.evaluation_control = c;
+        wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+        int expected = 0;
+        reduce_reached = 0;
+        if (mode < 2) {
+            reduce_overflow = mode;
+            wl_columnar_eval_stack_test_constructor_checkpoint =
+                reduce_frame_stop;
+            expected = mode ? EOVERFLOW : WL_EVALUATION_CONTROL_CANCELLED;
+        } else if (mode == 2) {
+            wl_columnar_eval_stack_test_fail_allocation = true;
+            expected = ENOMEM;
+        } else if (mode == 3) {
+            wl_columnar_eval_stack_test_fail_commit = true; expected = ENOMEM;
+        }
+        if (mode == 6) {
+            atomic_store(&g->usable_bytes, baseline); expected = ENOSPC;
+        }
+        CHECK(wl_columnar_eval_stack_cleanup_begin(sess, &frame) == expected);
+        atomic_store(&g->usable_bytes, usable);
+        CHECK(sess->memory_budget_denied == (mode == 6));
+        sess->base.evaluation_control = NULL;
+        if (expected) {
+            finish(c, expected);
+            CHECK(!frame && !sess->cleanup_active && !sess->cleanup_pending
+                && !sess->cleanup_active_count &&
+                !sess->cleanup_reserved_bytes);
+            CHECK(string_reserved(sess->memory_governor) == baseline);
+            if (mode < 2) CHECK(reduce_reached == 1);
+            retry(c, 0); sess->base.evaluation_control = c;
+            CHECK(wl_columnar_eval_stack_cleanup_begin(sess, &frame) == 0);
+            sess->base.evaluation_control = NULL;
+        }
+        CHECK(wl_columnar_eval_stack_cleanup_reduce_batch(frame)->ready);
+        wl_plan_op_t ops[2] = {
+            {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+             .delta_mode = WL_DELTA_FORCE_FULL},
+            {.op = mode == 5 ? WL_PLAN_OP_FILTER : WL_PLAN_OP_MAP,
+             .project_count = 1}
+        };
+        CHECK(compiled_dispatch(sess, frame, ops, 2, c) == 0); finish(c, 0);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+        CHECK(string_reserved(sess->memory_governor) == baseline);
+        release(c); join_session_destroy(sess);
+    }
+}
+
+static void
+test_reduce_shape_and_resource_failures(void)
+{
+    for (unsigned mode = 0; mode < 6; mode++) {
+        wl_col_session_t *sess = join_session();
+        col_rel_t *source = relation(mode == 0 ? 0 : 2, 2, 2, false,
+                sess->memory_governor);
+        CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+        uint64_t before = string_reserved(sess->memory_governor);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+        wl_evaluation_control_t *c = control(0);
+        wl_plan_op_t op = {.op = WL_PLAN_OP_REDUCE, .group_by_count = 1,
+                           .aggregate_index = UINT32_MAX,
+                           .agg_fn = WIRELOG_AGG_SUM};
+        wl_columnar_memory_governor_t *g =
+            wl_columnar_memory_governor_ref_get(sess->memory_governor);
+        uint64_t usable = atomic_load(&g->usable_bytes);
+        int expected = mode == 0 ? EINVAL : mode == 1 ? ENOSPC : ENOMEM;
+        if (mode == 1) atomic_store(&g->usable_bytes,
+                string_reserved(sess->memory_governor));
+        if (mode ==
+            2) wl_columnar_ops_reduce_test_fail_scratch_allocation = true;
+        if (mode == 3) wl_columnar_ops_reduce_test_fail_scratch_commit = true;
+        if (mode ==
+            4) wl_columnar_relation_test_constructor_fail_allocation = 1;
+        if (mode == 5) wl_columnar_relation_test_constructor_fail_commit = 1;
+        CHECK(reduce_dispatch(sess, frame, &op, c) == expected);
+        finish(c, expected); atomic_store(&g->usable_bytes, usable);
+        CHECK(sess->memory_budget_denied == (mode == 1));
+        lazy_unchanged(source); source_unpinned(source, source);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+        CHECK(string_reserved(sess->memory_governor) == before);
+        release(c); join_session_destroy(sess);
+    }
+}
+
+static void
+test_reduce_probe_symbol_expression_stops(void)
+{
+    for (unsigned kind = 0; kind < 3; kind++)
+        for (unsigned overflow = 0; overflow < 2; overflow++) {
+            wl_col_session_t *sess = join_session();
+            uint32_t rows = kind == 0 ? 513 : 2;
+            col_rel_t *source = relation(2, rows, rows, false,
+                    sess->memory_governor);
+            uint8_t expr[10000]; uint32_t n = 0;
+            if (kind == 0) for (uint32_t r = 0; r < rows; r++)
+                    source->columns[0][r] = (int64_t)r * 2048;
+            if (kind == 1) {
+                sess->intern = string_table(sess->memory_governor, 0);
+                char a[602], b[602]; memset(a, 'a', 600); memset(b, 'a', 600);
+                a[600] = 'z'; b[600] = 'b'; a[601] = b[601] = 0;
+                source->columns[0][0] = source->columns[0][1] = 0;
+                source->columns[1][0] = wl_intern_put(sess->intern, a);
+                source->columns[1][1] = wl_intern_put(sess->intern, b);
+            }
+            if (kind == 2) {
+                for (unsigned j = 0; j < 513; j++) {
+                    n = compiled_const(expr, n, 1);
+                    if (j) expr[n++] = WL_PLAN_EXPR_ARITH_ADD;
+                }
+            }
+            CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+            wl_plan_op_t op = {.op = WL_PLAN_OP_REDUCE, .group_by_count = 1,
+                               .aggregate_index = UINT32_MAX,
+                               .agg_fn = kind == 1 ? WIRELOG_AGG_MIN
+                    : WIRELOG_AGG_SUM,
+                               .agg_operand_type = kind ==
+                                   1 ? WL_PLAN_AGG_OPERAND_STRING
+                    : WL_PLAN_AGG_OPERAND_SCALAR,
+                               .agg_expr = {expr, n}};
+            wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+            wl_evaluation_control_t *c = control(0);
+            reduce_overflow = overflow; reduce_reached = 0;
+            if (kind < 2) {
+                reduce_stage = kind == 0 ? 5 : 9; reduce_at = 300;
+                wl_columnar_ops_reduce_test_checkpoint = reduce_operator_stop;
+            } else {
+                compiled_stop_stage = 3; compiled_stop_progress = 300;
+                compiled_stop_positive = overflow;
+                compiled_require_failed = false;
+                compiled_reached = 0;
+                wl_columnar_expr_test_controlled_checkpoint =
+                    compiled_stage_stop;
+            }
+            int expected =
+                overflow ? EOVERFLOW : WL_EVALUATION_CONTROL_CANCELLED;
+            CHECK(reduce_dispatch(sess, frame, &op, c) == expected);
+            finish(c, expected);
+            CHECK(kind < 2 ? reduce_reached == 1 : compiled_reached == 1);
+            lazy_unchanged(source); source_unpinned(source, source);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+            frame = filter_frame(sess); retry(c, 0);
+            CHECK(reduce_dispatch(sess, frame, &op, c) == 0); finish(c, 0);
+            CHECK(join_output(frame)->nrows ==
+                (kind == 0 ? rows : kind == 1 ? 1 : 2));
+            if (kind ==
+                1) CHECK(join_output(frame)->columns[1][0] ==
+                    source->columns[1][1]);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+            if (sess->intern) {
+                wl_intern_free(sess->intern); sess->intern = NULL;
+            }
+            release(c); join_session_destroy(sess);
+        }
+}
+static wl_columnar_source_access_writer_t *reduce_fault_writer;
+static bool reduce_original_thread_valid;
+static unsigned reduce_fault_kind;
+static uint64_t reduce_cell_before, reduce_cell_generation;
+static void
+reduce_refusal_fault(wl_evaluation_control_t *c,
+    wl_columnar_relation_private_batch_t *record, int stage, uint64_t progress)
+{
+    (void)progress;
+    if ((reduce_fault_kind == 0 && stage != 2)
+        || (reduce_fault_kind == 2 && stage != 4)
+        || (reduce_fault_kind == 3 && stage != 5)
+        || (reduce_fault_kind == 4 && stage != 7)
+        || reduce_fault_kind == 1) return;
+    wl_columnar_relation_test_private_checkpoint = NULL;
+    reduce_record = record; reduce_reached++;
+    reduce_fault_writer = reduce_fault_kind == 0 || reduce_fault_kind == 2
+        ? &record->batch.single.descriptor.writer :
+        &record->batch.single.owners[0].writer;
+    reduce_original_thread_valid = reduce_fault_writer->thread_valid;
+    CHECK(reduce_original_thread_valid && reduce_fault_writer->owner
+        && reduce_fault_writer->identity == (uintptr_t)reduce_fault_writer
+        && atomic_load(&reduce_fault_writer->owner->state) ==
+        WL_COLUMNAR_SOURCE_ACCESS_WRITER);
+    if (reduce_fault_kind >= 3) {
+        col_rel_t *out = record->batch.relation;
+        reduce_cell_before = out->columns[1][0];
+        reduce_cell_generation = out->view_generation;
+        if (reduce_fault_kind ==
+            3) out->view_generation = WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+        else {
+            record->batch.single.lease.relation_generation--;
+            CHECK(col_rel_mutation_lease_validate(&record->batch.single.lease,
+                out) == EINVAL);
+        }
+    } else wl_evaluation_control_request_cancel(c);
+    reduce_fault_writer->thread_valid = false;
+}
+static void
+reduce_held_fault(wl_evaluation_control_t *c, int stage, uint64_t progress,
+    wl_columnar_relation_private_batch_t *record, col_rel_t *source)
+{
+    (void)progress; (void)source;
+    if (stage != 11) return;
+    wl_columnar_ops_reduce_test_checkpoint = NULL;
+    CHECK(record->phase == WL_COLUMNAR_RELATION_PRIVATE_HELD);
+    reduce_record = record; reduce_reached++;
+    reduce_fault_writer = &record->batch.single.owners[0].writer;
+    reduce_original_thread_valid = reduce_fault_writer->thread_valid;
+    CHECK(reduce_original_thread_valid && reduce_fault_writer->owner);
+    reduce_fault_writer->thread_valid = false;
+    wl_evaluation_control_request_cancel(c);
+}
+static void
+test_reduce_retirement_authority_faults(void)
+{
+    /* Deliberately malformed thread-authority validation, NOT healthy reader
+     * contention or a release-call failure: only this saved bool is changed. */
+    for (unsigned kind = 0; kind < 5; kind++) {
+        wl_col_session_t *sess = join_session();
+        uint32_t rows = kind == 2 ? COL_REL_INIT_CAP * 4u + 1u : 2;
+        col_rel_t *source = relation(2, rows, rows, false,
+                sess->memory_governor);
+        if (kind >= 3) source->columns[0][1] = source->columns[0][0];
+        CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+        uint64_t baseline = string_reserved(sess->memory_governor);
+        wl_plan_op_t op = {.op = WL_PLAN_OP_REDUCE, .group_by_count = 1,
+                           .aggregate_index = UINT32_MAX,
+                           .agg_fn = WIRELOG_AGG_SUM};
+        wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+        wl_evaluation_control_t *c = control(0);
+        reduce_fault_kind = kind; reduce_reached = 0;
+        if (kind ==
+            1) wl_columnar_ops_reduce_test_checkpoint = reduce_held_fault;
+        else wl_columnar_relation_test_private_checkpoint =
+                reduce_refusal_fault;
+        int expected = kind == 3 ? EOVERFLOW : EINVAL;
+        CHECK(reduce_dispatch(sess, frame, &op, c) == expected);
+        finish(c, expected); CHECK(reduce_reached == 1);
+        CHECK(reduce_record ==
+            wl_columnar_eval_stack_cleanup_reduce_batch(frame));
+        CHECK(reduce_record->phase == WL_COLUMNAR_RELATION_PRIVATE_RETIRING
+            && !reduce_record->batch.active);
+        col_rel_t *out = wl_columnar_eval_stack_cleanup_result(frame)->rel;
+        CHECK(out && out == reduce_record->batch.relation);
+        CHECK(reduce_fault_writer->owner && !reduce_fault_writer->thread_valid
+            && reduce_fault_writer->identity == (uintptr_t)reduce_fault_writer
+            && atomic_load(&reduce_fault_writer->owner->state) ==
+            WL_COLUMNAR_SOURCE_ACCESS_WRITER);
+        if (kind == 0) CHECK(!reduce_record->batch.single.owners[0].writer.owner
+                && !reduce_record->batch.single.set.owner_count &&
+                out->nrows == 0);
+        if (kind >= 3) {
+            CHECK(out->columns[1][0] == (int64_t)reduce_cell_before);
+            CHECK(out->view_generation ==
+                (kind == 3 ? WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+                    : reduce_cell_generation));
+        }
+        lazy_unchanged(source); source_unpinned(source, source);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == EINVAL &&
+            !frame);
+        CHECK(sess->cleanup_pending && sess->cleanup_pending_count == 1
+            && string_reserved(sess->memory_governor) > baseline);
+        CHECK(wl_columnar_eval_stack_cleanup_reduce_batch(
+                sess->cleanup_pending) == reduce_record);
+        reduce_fault_writer->thread_valid = reduce_original_thread_valid;
+        CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0);
+        CHECK(!sess->cleanup_pending &&
+            string_reserved(sess->memory_governor) == baseline);
+        frame = filter_frame(sess); retry(c, 0);
+        CHECK(reduce_dispatch(sess, frame, &op, c) == 0); finish(c, 0);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+        release(c); join_session_destroy(sess);
+    }
+}
+static void
+test_reduce_typed_edges_and_symbols(void)
+{
+    for (unsigned mode = 0; mode < 10; mode++) {
+        wl_col_session_t *sess = join_session(), *raw = join_session();
+        col_rel_t *source = relation(2, 3, 0, false, sess->memory_governor),
+            *ref = relation(2, 3, 0, false, raw->memory_governor);
+        bool floating = mode >= 1 && mode <= 4;
+        wirelog_column_type_t types[2] = {mode == 0 ? WIRELOG_TYPE_FLOAT
+            : WIRELOG_TYPE_INT64,
+                                          floating ? WIRELOG_TYPE_FLOAT :
+                                          WIRELOG_TYPE_INT64};
+        CHECK(col_rel_set_column_types(source, types, 2) == 0);
+        CHECK(col_rel_set_column_types(ref, types, 2) == 0);
+        source->nrows = ref->nrows = mode == 9 ? 0 : 3;
+        for (unsigned r = 0; r < 3; r++) {
+            source->columns[0][r] = ref->columns[0][r] = mode == 0
+                ? wl_columnar_float_to_bits(r == 0 ? -0.0 : r ==
+                    1 ? 0.0 : 1.0) : 0;
+            source->columns[1][r] = ref->columns[1][r] = floating
+                ? wl_columnar_float_to_bits(mode == 1 ? (r ? 0.0 : -0.0)
+                    : mode == 4 ? NAN : DBL_MAX)
+                : mode == 5 ? (r ? 1 : INT64_MAX) : (int64_t)r;
+        }
+        uint32_t fallback = UINT32_MAX;
+        uint8_t buf[32]; uint32_t n = 0;
+        if (mode == 8 || mode == 9) {
+            n = compiled_const(buf, 0, 1); n = compiled_const(buf, n, 2);
+            buf[n++] = WL_PLAN_EXPR_ARITH_HMAC_SHA256;
+        }
+        wl_plan_op_t op = {.op = WL_PLAN_OP_REDUCE, .group_by_count = 1,
+                           .group_by_indices = mode == 6 ? &fallback : NULL,
+                           .aggregate_index = mode == 7 ? 0 : UINT32_MAX,
+                           .agg_fn = mode == 0 || mode == 8 ||
+                               mode == 9 ? WIRELOG_AGG_COUNT
+                : mode == 3 ? WIRELOG_AGG_AVG : WIRELOG_AGG_SUM,
+                           .agg_operand_type =
+                               floating ? WL_PLAN_AGG_OPERAND_FLOAT :
+                               WL_PLAN_AGG_OPERAND_SCALAR,
+                           .agg_expr = {buf, n}};
+        CHECK(session_add_rel(sess, source) == 0 && session_add_rel(raw,
+            ref) == 0);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess),
+            *reference = filter_frame(raw);
+        wl_evaluation_control_t *c = control(0);
+        int expected = mode == 2 || mode == 3 ||
+            mode == 5 ? ERANGE : mode == 4 ? EINVAL : 0;
+        memset(hmac_calls, 0, sizeof(hmac_calls));
+        wl_columnar_expr_hmac_test_provider_result = hmac_provider_report;
+        CHECK(reduce_dispatch(sess, frame, &op, c) == expected);
+        finish(c, expected);
+        CHECK(reduce_dispatch(raw, reference, &op, NULL) == expected);
+        wl_columnar_expr_hmac_test_provider_result = NULL;
+        for (unsigned k = 0; k < 7; k++) CHECK(!hmac_calls[k]);
+        if (!expected) {
+            filter_equal(join_output(frame), join_output(reference));
+            if (mode == 0) CHECK(join_output(frame)->nrows == 2
+                    && join_output(frame)->columns[0][0] == 0
+                    && join_output(frame)->columns[1][0] == 2);
+            if (mode == 1) CHECK(join_output(frame)->columns[1][0] == 0);
+        }
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0
+            && wl_columnar_eval_stack_cleanup_finish(&reference) == 0);
+        release(c); join_session_destroy(sess); join_session_destroy(raw);
+    }
+    for (unsigned maximum = 0; maximum < 2; maximum++)
+        for (unsigned missing = 0; missing < 3; missing++) {
+            wl_col_session_t *sess = join_session(), *raw = join_session();
+            sess->intern = string_table(sess->memory_governor, 0);
+            raw->intern = string_table(raw->memory_governor, 0);
+            CHECK(wl_intern_put(sess->intern,
+                "z") == 0 && wl_intern_put(raw->intern, "z") == 0);
+            CHECK(wl_intern_put(sess->intern,
+                "a") == 1 && wl_intern_put(raw->intern, "a") == 1);
+            col_rel_t *source = relation(2, 3, 3, false, sess->memory_governor),
+                *ref = relation(2, 3, 3, false, raw->memory_governor);
+            for (unsigned r = 0; r < 3; r++) {
+                source->columns[0][r] = ref->columns[0][r] = 0;
+                source->columns[1][r] = ref->columns[1][r] = missing == 2
+                    ? (r ? INT64_MAX : INT64_MIN) : missing == 1 && r != 1
+                    ? INT64_MAX : (int64_t)(r % 2);
+            }
+            CHECK(session_add_rel(sess, source) == 0 && session_add_rel(raw,
+                ref) == 0);
+            wl_plan_op_t op = {.op = WL_PLAN_OP_REDUCE, .group_by_count = 1,
+                               .aggregate_index = UINT32_MAX,
+                               .agg_fn =
+                                   maximum ? WIRELOG_AGG_MAX : WIRELOG_AGG_MIN,
+                               .agg_operand_type = WL_PLAN_AGG_OPERAND_STRING};
+            wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess),
+                *reference = filter_frame(raw);
+            wl_evaluation_control_t *c = control(0);
+            CHECK(reduce_dispatch(sess, frame, &op, c) == 0); finish(c, 0);
+            CHECK(reduce_dispatch(raw, reference, &op, NULL) == 0);
+            filter_equal(join_output(frame), join_output(reference));
+            CHECK(join_output(frame)->columns[1][0] == (missing == 2
+                ? maximum ? INT64_MAX : INT64_MIN : missing ==
+                1 ? 1 : maximum ? 0 : 1));
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0
+                && wl_columnar_eval_stack_cleanup_finish(&reference) == 0);
+            wl_intern_free(sess->intern); wl_intern_free(raw->intern);
+            sess->intern = raw->intern = NULL;
+            release(c); join_session_destroy(sess); join_session_destroy(raw);
+        }
+}
+
+static void
+test_reduce_intern_context_and_c2(void)
+{
+    for (unsigned mode = 0; mode < 3; mode++) {
+        wl_col_session_t *sess = join_session();
+        sess->intern = string_table(sess->memory_governor, 0);
+        CHECK(wl_intern_put(sess->intern, "prior") == 0);
+        col_rel_t *source = relation(1, 1, 1, false, sess->memory_governor);
+        CHECK(session_add_rel(sess, source) == 0);
+        uint8_t buf[64]; uint32_t n = string_literal(buf, 0, "prefix", 6);
+        n = string_literal(buf, n, "-value", 6);
+        buf[n++] = WL_PLAN_EXPR_STR_FN_CAT;
+        wl_plan_op_t op = {.op = WL_PLAN_OP_REDUCE, .group_by_count = 0,
+                           .agg_fn = WIRELOG_AGG_MIN,
+                           .agg_operand_type = WL_PLAN_AGG_OPERAND_STRING,
+                           .agg_expr = {buf, n}};
+        wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+        wl_evaluation_control_t *c = control(0);
+        if (mode) {
+            compiled_stop_stage = 3; compiled_stop_progress = 3;
+            compiled_stop_positive = mode == 2; compiled_require_failed = false;
+            compiled_reached = 0;
+            wl_columnar_expr_test_controlled_checkpoint = compiled_stage_stop;
+        }
+        int expected = mode == 2 ? EOVERFLOW : mode ==
+            1 ? WL_EVALUATION_CONTROL_CANCELLED : 0;
+        CHECK(reduce_dispatch(sess, frame, &op, c) == expected);
+        finish(c, expected);
+        CHECK(wl_intern_count(sess->intern) == 4);
+        CHECK(!strcmp(wl_intern_reverse(sess->intern, 0), "prior")
+            && !strcmp(wl_intern_reverse(sess->intern, 3), "prefix-value"));
+        if (!mode) CHECK(join_output(frame)->columns[0][0] == 3);
+        else CHECK(compiled_reached == 1);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+        frame = filter_frame(sess); retry(c, 0);
+        CHECK(reduce_dispatch(sess, frame, &op, c) == 0); finish(c, 0);
+        CHECK(join_output(frame)->columns[0][0] == 3 &&
+            wl_intern_count(sess->intern) == 4);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+        frame = filter_frame(sess);
+        CHECK(reduce_dispatch(sess, frame, &op, NULL) == 0);
+        CHECK(join_output(frame)->columns[0][0] == 3);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+        wl_intern_free(sess->intern); sess->intern = NULL;
+        release(c); join_session_destroy(sess);
+    }
+}
+
+static void
+reduce_growth_quota(wl_evaluation_control_t *c,
+    wl_columnar_relation_private_batch_t *record, int stage, uint64_t progress)
+{
+    (void)c; (void)progress;
+    if (stage != 4) return;
+    wl_columnar_relation_test_private_checkpoint = NULL;
+    wl_columnar_memory_governor_t *g = wl_columnar_memory_governor_ref_get(
+        record->batch.relation->memory_governor);
+    atomic_store(&g->usable_bytes, wl_columnar_memory_reserved(g));
+    reduce_reached++;
+}
+static void
+test_reduce_growth_quota_and_alias(void)
+{
+    for (unsigned mode = 0; mode < 2; mode++) {
+        wl_col_session_t *sess = join_session();
+        uint32_t rows = mode ? 3 : COL_REL_INIT_CAP * 4u + 1u;
+        col_rel_t *owner = relation(2, rows, rows, false,
+                sess->memory_governor);
+        col_rel_t *source = owner;
+        if (mode) {
+            source = relation(2, 0, 0, false, sess->memory_governor);
+            CHECK(col_rel_install_shared_view(source, owner) == 0);
+        }
+        CHECK(session_add_rel(sess, source) == 0);
+        uint64_t before = string_reserved(sess->memory_governor);
+        wl_columnar_memory_governor_t *g =
+            wl_columnar_memory_governor_ref_get(sess->memory_governor);
+        uint64_t usable = atomic_load(&g->usable_bytes);
+        wl_plan_op_t op = {.op = WL_PLAN_OP_REDUCE, .group_by_count = 1,
+                           .aggregate_index = UINT32_MAX,
+                           .agg_fn = WIRELOG_AGG_SUM};
+        wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+        wl_evaluation_control_t *c = control(0);
+        reduce_reached = 0;
+        if (!mode) wl_columnar_relation_test_private_checkpoint =
+                reduce_growth_quota;
+        int expected = mode ? 0 : ENOSPC;
+        CHECK(reduce_dispatch(sess, frame, &op, c) == expected);
+        finish(c, expected);
+        CHECK(sess->memory_budget_denied == !mode);
+        if (!mode) CHECK(reduce_reached == 1);
+        else CHECK(join_output(frame)->nrows == rows);
+        atomic_store(&g->usable_bytes, usable);
+        source_unpinned(source, owner);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+        CHECK(string_reserved(sess->memory_governor) == before);
+        release(c);
+        if (mode) {
+            destroy(source); sess->nrels = 0; destroy(owner);
+        }
+        join_session_destroy(sess);
+    }
+}
+
+static unsigned reduce_owned_phase;
+static void
+reduce_owned_stop(wl_evaluation_control_t *c, int stage, uint64_t progress,
+    wl_columnar_relation_private_batch_t *record, col_rel_t *source)
+{
+    (void)record; (void)progress;
+    if ((unsigned)stage != reduce_owned_phase) return;
+    wl_columnar_ops_reduce_test_checkpoint = NULL;
+    CHECK(col_rel_source_reader_acquire(source, &join_retained_reader) == 0);
+    reduce_reached++;
+    if (c) wl_evaluation_control_request_cancel(c);
+}
+static void
+test_reduce_owned_cleanup(void)
+{
+    for (unsigned phase = 12; phase <= 12; phase += 2) {
+        reduce_owned_phase = phase;
+        wl_col_session_t *sess = join_session();
+        col_rel_t *source = relation(2, 3, 3, false, sess->memory_governor);
+        make_lazy(source);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = join_frame(sess, source,
+                true);
+        wl_plan_op_t op = {.op = WL_PLAN_OP_REDUCE, .group_by_count = 1,
+                           .aggregate_index = UINT32_MAX,
+                           .agg_fn = WIRELOG_AGG_SUM};
+        wl_evaluation_control_t *c = control(0);
+        wl_columnar_ops_reduce_test_checkpoint = reduce_owned_stop;
+        reduce_reached = 0;
+        sess->base.evaluation_control = c;
+        CHECK(col_op_reduce(&op, wl_columnar_eval_stack_cleanup_stack(frame),
+            sess) == EBUSY);
+        sess->base.evaluation_control = NULL;
+        finish(c, EBUSY); CHECK(reduce_reached == 1);
+        if (phase == 10) lazy_unchanged(source);
+        else CHECK(source->storage_owner == source);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == EBUSY);
+        CHECK(sess->cleanup_pending && !frame);
+        CHECK(col_rel_source_reader_release(&join_retained_reader) == 0);
+        CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0);
+        release(c); join_session_destroy(sess);
+    }
+}
+static uint64_t reduce_observed_view, reduce_observed_storage;
+static unsigned reduce_cell_visits;
+static void
+reduce_cell_observe(wl_evaluation_control_t *c,
+    wl_columnar_relation_private_batch_t *record, int stage, uint64_t row)
+{
+    (void)c; (void)row;
+    if (stage != 5) return;
+    col_rel_t *out = record->batch.relation;
+    CHECK(record->phase == WL_COLUMNAR_RELATION_PRIVATE_HELD
+        && record->batch.single.lease.relation_generation ==
+        out->storage_generation
+        && record->batch.single.lease.owner_generation ==
+        out->storage_generation);
+    CHECK(col_rel_mutation_lease_validate(&record->batch.single.lease,
+        out) == 0);
+    reduce_observed_view = out->view_generation;
+    reduce_observed_storage = out->storage_generation;
+    reduce_cell_visits++;
+}
+static void
+test_reduce_growth_current_cell(void)
+{
+    wl_col_session_t *sess = join_session(), *raw = join_session();
+    uint32_t rows = COL_REL_INIT_CAP * 4u + 2u;
+    col_rel_t *source = relation(2, rows, rows, false, sess->memory_governor),
+        *ref = relation(2, rows, rows, false, raw->memory_governor);
+    source->columns[0][rows-1] = ref->columns[0][rows-1] = 0;
+    source->columns[1][rows-1] = ref->columns[1][rows-1] = 7;
+    CHECK(session_add_rel(sess, source) == 0 && session_add_rel(raw, ref) == 0);
+    wl_plan_op_t op = {.op = WL_PLAN_OP_REDUCE, .group_by_count = 1,
+                       .aggregate_index = UINT32_MAX,
+                       .agg_fn = WIRELOG_AGG_SUM};
+    wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess),
+        *reference = filter_frame(raw);
+    wl_evaluation_control_t *c = control(0);
+    reduce_cell_visits = 0;
+    wl_columnar_relation_test_private_checkpoint = reduce_cell_observe;
+    CHECK(reduce_dispatch(sess, frame, &op, c) == 0); finish(c, 0);
+    wl_columnar_relation_test_private_checkpoint = NULL;
+    CHECK(reduce_dispatch(raw, reference, &op, NULL) == 0);
+    filter_equal(join_output(frame), join_output(reference));
+    col_rel_t *out = join_output(frame);
+    CHECK(reduce_cell_visits == 1 && out->nrows == rows-1
+        && out->columns[1][0] == 10007);
+    CHECK(out->view_generation == reduce_observed_view + 1
+        && out->storage_generation == reduce_observed_storage);
+    wl_columnar_relation_private_batch_t *record =
+        wl_columnar_eval_stack_cleanup_reduce_batch(frame);
+    CHECK(record->batch.single.set.published &&
+        record->batch.controlled_row_committed);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0
+        && wl_columnar_eval_stack_cleanup_finish(&reference) == 0);
+    release(c); join_session_destroy(sess); join_session_destroy(raw);
+}
+static void
+test_reduce_interpreter_allocation_policy(void)
+{
+    wl_col_session_t *sess = join_session();
+    sess->intern = string_table(sess->memory_governor, 0);
+    col_rel_t *source = relation(1, 1, 1, false, sess->memory_governor);
+    CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+    uint8_t buf[32]; uint32_t n = string_literal(buf, 0, "allocation", 10);
+    wl_plan_op_t op = {.op = WL_PLAN_OP_REDUCE, .group_by_count = 0,
+                       .agg_fn = WIRELOG_AGG_MIN,
+                       .agg_operand_type = WL_PLAN_AGG_OPERAND_STRING,
+                       .agg_expr = {buf, n}};
+    uint64_t baseline = string_reserved(sess->memory_governor);
+    wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+    wl_evaluation_control_t *c = control(0);
+    wl_columnar_expr_test_fail_allocation = 0;
+    CHECK(reduce_dispatch(sess, frame, &op, c) == ERANGE); finish(c, ERANGE);
+    CHECK(wl_columnar_expr_test_fail_allocation == -1 &&
+        !sess->memory_budget_denied
+        && !sess->extension_expr_status && wl_intern_count(sess->intern) == 0);
+    lazy_unchanged(source); source_unpinned(source, source);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+    CHECK(string_reserved(sess->memory_governor) == baseline);
+    wl_intern_free(sess->intern); sess->intern = NULL;
+    release(c); join_session_destroy(sess);
+}
+static unsigned reduce_cell_shape_kind, reduce_cell_shape_reached;
+static void
+reduce_cell_shape_refusal(wl_evaluation_control_t *c, int stage,
+    uint64_t progress, wl_columnar_relation_private_batch_t *record,
+    col_rel_t *source)
+{
+    (void)progress;
+    if (stage != 11) return;
+    col_rel_t *out = record->batch.relation;
+    CHECK(record->ready && record->phase == WL_COLUMNAR_RELATION_PRIVATE_HELD
+        && record->batch.active && out->nrows == 1 && out->ncols == 2
+        && out->capacity && out->column_types);
+    CHECK(col_rel_mutation_lease_validate(&record->batch.single.lease,
+        out) == 0);
+    int64_t payload[2] = {out->columns[0][0], out->columns[1][0]};
+    uint64_t view = out->view_generation, storage = out->storage_generation;
+    uint64_t source_view = source->view_generation,
+        source_storage = source->storage_generation;
+    bool published = record->batch.single.set.published,
+        committed = record->batch.controlled_row_committed;
+    uint64_t credit = string_reserved(out->memory_governor);
+    uint32_t capacity = out->capacity;
+    wirelog_column_type_t type = out->column_types[1];
+    /* Intentionally malformed private metadata only. The physical payload
+     * remains allocated; the refused call must never write out of bounds. */
+    if (!reduce_cell_shape_kind) out->capacity = 0;
+    else out->column_types[1] = WIRELOG_TYPE_STRING;
+    CHECK(wl_columnar_relation_private_cell_controlled(record, 0, 1, 777, c)
+        == EINVAL);
+    CHECK(out->columns[0][0] == payload[0] && out->columns[1][0] == payload[1]
+        && out->view_generation == view && out->storage_generation == storage
+        && record->batch.single.set.published == published
+        && record->batch.controlled_row_committed == committed);
+    CHECK(source->view_generation == source_view
+        && source->storage_generation == source_storage
+        && string_reserved(out->memory_governor) == credit
+        && record->phase == WL_COLUMNAR_RELATION_PRIVATE_HELD
+        && record->batch.active);
+    CHECK(col_rel_mutation_lease_validate(&record->batch.single.lease,
+        out) == 0);
+    out->capacity = capacity;
+    out->column_types[1] = type;
+    CHECK(col_rel_mutation_lease_validate(&record->batch.single.lease,
+        out) == 0);
+    reduce_cell_shape_reached++;
+}
+static void
+test_reduce_cell_shape_schema_refusals(void)
+{
+    for (unsigned kind = 0; kind < 2; kind++) {
+        wl_col_session_t *sess = join_session();
+        col_rel_t *source = relation(2, 2, 2, false, sess->memory_governor);
+        source->columns[0][1] = source->columns[0][0];
+        CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+        uint64_t baseline = string_reserved(sess->memory_governor);
+        wl_plan_op_t op = {.op = WL_PLAN_OP_REDUCE, .group_by_count = 1,
+                           .aggregate_index = UINT32_MAX,
+                           .agg_fn = WIRELOG_AGG_SUM};
+        wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+        wl_evaluation_control_t *c = control(0);
+        reduce_cell_shape_kind = kind; reduce_cell_shape_reached = 0;
+        wl_columnar_ops_reduce_test_checkpoint = reduce_cell_shape_refusal;
+        CHECK(reduce_dispatch(sess, frame, &op, c) == 0); finish(c, 0);
+        wl_columnar_ops_reduce_test_checkpoint = NULL;
+        CHECK(reduce_cell_shape_reached == 1 && !sess->memory_budget_denied);
+        col_rel_t *out = join_output(frame);
+        CHECK(out->nrows == 1 && out->columns[1][0] == 20001);
+        source_unpinned(source, source);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+        CHECK(string_reserved(sess->memory_governor) == baseline);
+        release(c); join_session_destroy(sess);
+    }
+}
+static void
+test_reduce_forbidden_extension_c2(void)
+{
+    for (unsigned result = 0; result < 2; result++)
+        for (unsigned abi = 0; abi < 2; abi++)
+            for (unsigned overflow = 0; overflow < 2; overflow++) {
+                extension_setup("ext", 0, result ? WIRELOG_EXTENSION_VALUE_INT64
+                    : WIRELOG_EXTENSION_VALUE_BOOL, NULL, 0, false);
+                extension_mode = 0; extension_calls = 0;
+                uint8_t buf[32];
+                uint32_t n = extension_encode(buf, 0, "ext", 3, 0, abi);
+                wl_col_session_t *sess = join_session();
+                sess->base.extension_snapshot = extension_snapshot;
+                col_rel_t *source = relation(1, 1, 1, false,
+                        sess->memory_governor);
+                CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+                uint64_t baseline = string_reserved(sess->memory_governor);
+                wl_plan_op_t op = {.op = WL_PLAN_OP_REDUCE, .group_by_count = 0,
+                                   .agg_fn = WIRELOG_AGG_SUM,
+                                   .agg_expr = {buf, n}};
+                wl_columnar_eval_stack_cleanup_frame_t *frame =
+                    filter_frame(sess);
+                wl_evaluation_control_t *c = control(0);
+                compiled_stop_stage = 3; compiled_stop_progress = 1;
+                compiled_stop_positive = overflow;
+                compiled_require_failed = true;
+                compiled_reached = extension_zero_lookup_visits = 0;
+                wl_columnar_expr_test_controlled_checkpoint =
+                    compiled_stage_stop;
+                wl_extension_test_controlled_checkpoint = extension_zero_lookup;
+                int expected =
+                    overflow ? EOVERFLOW : WL_EVALUATION_CONTROL_CANCELLED;
+                CHECK(reduce_dispatch(sess, frame, &op, c) == expected);
+                finish(c, expected);
+                CHECK(compiled_reached == 1 && !extension_calls
+                    && !extension_zero_lookup_visits &&
+                    !sess->extension_expr_status
+                    && !sess->memory_budget_denied);
+                wl_extension_test_controlled_checkpoint = NULL;
+                lazy_unchanged(source); source_unpinned(source, source);
+                CHECK(!wl_columnar_eval_stack_cleanup_result(frame)->rel);
+                CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+                CHECK(string_reserved(sess->memory_governor) == baseline);
+                sess->base.extension_snapshot = NULL;
+                release(c); join_session_destroy(sess); extension_teardown();
+            }
+}
 int
 main(void)
 {
     hmac_required_startup();
+    test_reduce_actual_twins();
+    test_reduce_long_reached_stops();
+    test_reduce_two_growth_reset();
+    test_reduce_extension_context();
+    test_reduce_controlled_frame_factory();
+    test_reduce_shape_and_resource_failures();
+    test_reduce_probe_symbol_expression_stops();
+    test_reduce_retirement_authority_faults();
+    test_reduce_typed_edges_and_symbols();
+    test_reduce_intern_context_and_c2();
+    test_reduce_growth_quota_and_alias();
+    test_reduce_owned_cleanup();
+    test_reduce_growth_current_cell();
+    test_reduce_interpreter_allocation_policy();
+    test_reduce_forbidden_extension_c2();
+    test_reduce_cell_shape_schema_refusals();
     wl_columnar_relation_test_work_checkpoint = checkpoint;
     wl_columnar_memory_governor_test_work_checkpoint = checkpoint;
     test_counted_gates();

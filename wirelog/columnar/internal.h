@@ -2913,6 +2913,51 @@ typedef struct {
     bool controlled_row_committed;
 } col_rel_append_batch_t;
 
+/* Original-address writer storage for frame-owned private reducers. Phase and
+ * readiness are outside the single prefix cleared between growth epochs. */
+typedef enum {
+    WL_COLUMNAR_RELATION_PRIVATE_INERT = 0,
+    WL_COLUMNAR_RELATION_PRIVATE_INSTALLING,
+    WL_COLUMNAR_RELATION_PRIVATE_HELD,
+    WL_COLUMNAR_RELATION_PRIVATE_RETIRING,
+    WL_COLUMNAR_RELATION_PRIVATE_RETIRED,
+    WL_COLUMNAR_RELATION_PRIVATE_RESETTING
+} wl_columnar_relation_private_phase_t;
+typedef struct {
+    col_rel_append_batch_t batch;
+    wl_columnar_relation_private_phase_t phase;
+    bool ready;
+} wl_columnar_relation_private_batch_t;
+int wl_columnar_relation_private_batch_retire(
+    wl_columnar_relation_private_batch_t *, int);
+int wl_columnar_relation_private_append_batch_begin_controlled(
+    wl_columnar_relation_private_batch_t *, col_rel_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_relation_private_append_batch_row_controlled(
+    wl_columnar_relation_private_batch_t *, const int64_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_relation_private_append_batch_end_controlled(
+    wl_columnar_relation_private_batch_t *);
+int wl_columnar_relation_private_cell_controlled(
+    wl_columnar_relation_private_batch_t *, uint32_t, uint32_t, int64_t,
+    wl_evaluation_control_t *);
+wl_columnar_relation_private_batch_t *
+wl_columnar_eval_stack_cleanup_reduce_batch(
+    wl_columnar_eval_stack_cleanup_frame_t *);
+#ifdef WL_SESSION_TEST_HOOKS
+extern bool wl_columnar_eval_stack_test_fail_allocation;
+extern bool wl_columnar_eval_stack_test_fail_commit;
+extern bool wl_columnar_ops_reduce_test_fail_scratch_allocation;
+extern bool wl_columnar_ops_reduce_test_fail_scratch_commit;
+extern void (*wl_columnar_eval_stack_test_constructor_checkpoint)(
+    wl_evaluation_control_t *, uint64_t);
+extern void (*wl_columnar_ops_reduce_test_checkpoint)(wl_evaluation_control_t *,
+    int, uint64_t, wl_columnar_relation_private_batch_t *, col_rel_t *);
+extern void (*wl_columnar_relation_test_private_checkpoint)(
+    wl_evaluation_control_t *, wl_columnar_relation_private_batch_t *,
+    int, uint64_t);
+#endif
+
 int col_rel_append_batch_begin(col_rel_append_batch_t *batch, col_rel_t *r);
 int col_rel_append_batch_row(col_rel_append_batch_t *batch,
     const int64_t *row);
@@ -3998,7 +4043,8 @@ int
 wl_columnar_expr_eval_interpreter_controlled(const uint8_t *buf,
     uint32_t size, const int64_t *row, uint32_t ncols, int64_t *value,
     bool *failed, wl_col_session_t *sess, wl_columnar_expr_status_t *status,
-    bool allow_extension_scalar_result, wl_evaluation_control_t *control);
+    bool allow_extension_scalar_result, bool allow_extension_calls,
+    wl_evaluation_control_t *control);
 int
 wl_columnar_expr_eval_compiled_controlled(const wl_columnar_expr_compiled_t *c,
     const int64_t *row, uint32_t ncols, int64_t *value, bool *failed,
