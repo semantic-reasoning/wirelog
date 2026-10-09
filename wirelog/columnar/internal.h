@@ -4186,6 +4186,23 @@ int wl_columnar_eval_tdd_plan_insert_bindings(const wl_plan_stratum_t *sp,
     uint32_t relation_index, const char *const *changed,
     uint32_t changed_count, bool round0,
     wl_columnar_eval_tdd_plan_manifest_t *out);
+/* Issue #2114: bring the heads of @sp up to date after rows were appended to
+ * the @changed relations, without re-deriving what the heads hold.
+ * @changed_delta[c] holds exactly the rows appended to @changed[c], without
+ * delta timestamps; @changed[c] itself must already hold them.  Round 0 runs
+ * the instances driven by the changed relations; a recursive stratum then
+ * runs those driven by its own heads, bound to the rows the previous round
+ * added, until a round adds nothing.  Each head ends sorted and unique, and
+ * may end without the delta timestamps it had.  On success @head_delta[ri]
+ * (sp->relation_count entries) owns the rows head ri gained, without
+ * timestamps, or is NULL when it gained none.  Every manifest is built
+ * before anything is mutated, so ENOTSUP from the binder leaves the session
+ * unchanged; any later failure may leave heads partly updated, and the
+ * caller must then re-evaluate in full. */
+int wl_columnar_eval_tdd_insert_stratum(wl_col_session_t *sess,
+    const wl_plan_stratum_t *sp, const char *const *changed,
+    col_rel_t *const *changed_delta, uint32_t nchanged,
+    col_rel_t **head_delta);
 
 typedef struct {
     uint32_t total_segments;

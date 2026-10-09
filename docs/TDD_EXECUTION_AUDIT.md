@@ -329,8 +329,13 @@ FULL and those may be timestamped; the #1984 forms still refuse them. A run's
 output is a raw bag, as for the other forms: the caller consolidates the
 union of instance outputs. The
 operators it refuses are the ones the binder already refuses, so every
-instance the binder lists can begin. Retractions, differential operators and
-batch pipelines still refuse before evaluation.
+instance the binder lists can begin on a worker in a plain state: a worker
+with retraction or delta seeding, differential operators or a batch pipeline
+active is refused before evaluation, and so is a run the memory governor
+denies. `wl_columnar_eval_tdd_insert_stratum()` runs the instances on one
+worker clone with those session flags cleared, since a clone copies them
+from the coordinator; a session's bounded join batching, strict mode
+included, is therefore off for these runs.
 
 `meson test -C builddir tdd_occurrence_execution` runs all five active alternatives
 of the unmodified generated CSPA `valueAlias` plan with independently partitioned

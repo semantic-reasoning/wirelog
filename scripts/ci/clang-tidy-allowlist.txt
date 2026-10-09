@@ -62,6 +62,7 @@ wirelog/columnar/eval_dedup.c
 wirelog/columnar/eval_delta.c
 wirelog/columnar/eval_serial.c
 wirelog/columnar/eval_stack.c
+wirelog/columnar/eval_tdd_insert.c
 wirelog/columnar/eval_tdd_plan.c
 wirelog/columnar/filter.c
 wirelog/columnar/frontier.c
