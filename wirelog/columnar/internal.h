@@ -4012,6 +4012,8 @@ typedef enum {
     WL_COLUMNAR_EVAL_TDD_PLAN_EXPANDED = 0,
     /* Only the verified CSPA memoryAlias positive recursive body. */
     WL_COLUMNAR_EVAL_TDD_PLAN_CSPA_K1,
+    /* Issue #2114: insertion instances over wl_plan_stratum_t.bodies. */
+    WL_COLUMNAR_EVAL_TDD_PLAN_INSERT,
 } wl_columnar_eval_tdd_plan_form_t;
 
 typedef struct {
@@ -4117,6 +4119,26 @@ int wl_columnar_eval_tdd_plan_binding_summary(const wl_plan_stratum_t *sp,
     uint32_t relation_index, uint32_t counts[3]);
 void wl_columnar_eval_tdd_plan_bindings_free(
     wl_columnar_eval_tdd_plan_manifest_t *manifest);
+/* Issue #2114: the instances that find the derivations an insert adds to the
+ * relation @relation_index of @sp, over its lowered body (sp->bodies).  One
+ * instance per (rule slice, driving occurrence): the driver reads DELTA,
+ * a recognised SEMIJOIN prefilter reads PREFILTER, every other read FULL.
+ * With @round0 the drivers are the occurrences of the @changed relations,
+ * none of which may be a head of @sp (EINVAL); otherwise they are the
+ * occurrences of the heads of @sp.  A rule slice with no driver yields no
+ * instance.  FULL means the relation as it stands after the insert, new
+ * rows included: that is what lets an instance driven by one changed
+ * occurrence also pair new rows with new rows at another.  The manifest
+ * has form WL_COLUMNAR_EVAL_TDD_PLAN_INSERT and borrows the body as
+ * owner_ops, so op_index and driver index the body, not the relation's
+ * rewritten ops, and source_index is relative to the rule slice.
+ * ENOTSUP: no recorded bodies, or a body operator outside VARIABLE, JOIN,
+ * SEMIJOIN (prefilter only), MAP, FILTER, CONCAT and CONSOLIDATE --
+ * negation and aggregation among them.  Every failure leaves @out empty. */
+int wl_columnar_eval_tdd_plan_insert_bindings(const wl_plan_stratum_t *sp,
+    uint32_t relation_index, const char *const *changed,
+    uint32_t changed_count, bool round0,
+    wl_columnar_eval_tdd_plan_manifest_t *out);
 
 typedef struct {
     uint32_t total_segments;

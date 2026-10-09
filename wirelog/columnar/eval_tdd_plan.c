@@ -593,6 +593,201 @@ wl_columnar_eval_tdd_plan_binding_summary(const wl_plan_stratum_t *sp,
     return wl_columnar_eval_tdd_plan_collect(sp, relation_index, NULL, counts);
 }
 
+/* Issue #2114: is @name one of the relations an insertion instance may be
+ * driven from in this round. */
+static bool
+wl_columnar_eval_tdd_plan_insert_driver(const wl_plan_stratum_t *sp,
+    const char *name, const char *const *changed, uint32_t changed_count,
+    bool round0)
+{
+    if (!name)
+        return false;
+    if (!round0)
+        return is_stratum_idb(sp, name);
+    for (uint32_t c = 0; c < changed_count; c++) {
+        if (strcmp(name, changed[c]) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Emit, or with NULL arrays count, the instances of the rule slice
+ * ops[start, end): one per driving occurrence, each followed by every read
+ * of the slice. */
+static int
+wl_columnar_eval_tdd_plan_insert_slice(const wl_plan_stratum_t *sp,
+    const wl_plan_op_t *ops, uint32_t start, uint32_t end, uint32_t ordinal,
+    const char *const *changed, uint32_t changed_count, bool round0,
+    wl_columnar_eval_tdd_plan_manifest_t *m)
+{
+    for (uint32_t i = start; i < end; i++) {
+        if (ops[i].op == WL_PLAN_OP_SEMIJOIN
+            && !wl_columnar_eval_tdd_plan_prefilter(ops, i, end))
+            return ENOTSUP;
+    }
+    for (uint32_t d = start; d < end; d++) {
+        const wl_plan_op_t *driver = &ops[d];
+        if ((driver->op != WL_PLAN_OP_VARIABLE
+            && driver->op != WL_PLAN_OP_JOIN)
+            || !wl_columnar_eval_tdd_plan_insert_driver(sp,
+            wl_columnar_eval_tdd_plan_operand(driver), changed,
+            changed_count, round0))
+            continue;
+        uint32_t read_start = m->read_count;
+        for (uint32_t i = start; i < end; i++) {
+            const char *name = wl_columnar_eval_tdd_plan_operand(&ops[i]);
+            if (!name)
+                continue;
+            if (m->reads) {
+                m->reads[m->read_count] = (wl_columnar_eval_tdd_plan_read_t){
+                    .op_index = i, .source_index = i - start,
+                    .relation_name = name,
+                    .right_operand = ops[i].op != WL_PLAN_OP_VARIABLE,
+                    .kind = i == d ? WL_COLUMNAR_EVAL_TDD_PLAN_DELTA
+                        : ops[i].op == WL_PLAN_OP_SEMIJOIN
+                        ? WL_COLUMNAR_EVAL_TDD_PLAN_PREFILTER
+                        : WL_COLUMNAR_EVAL_TDD_PLAN_FULL,
+                };
+            }
+            if (m->read_count == UINT32_MAX)
+                return EOVERFLOW;
+            m->read_count++;
+        }
+        if (m->slices) {
+            m->slices[m->slice_count] = (wl_columnar_eval_tdd_plan_slice_t){
+                .alternative = 0, .ordinal = ordinal, .start = start,
+                .count = end - start, .driver = d, .read_start = read_start,
+                .read_count = m->read_count - read_start,
+            };
+        }
+        if (m->slice_count == UINT32_MAX)
+            return EOVERFLOW;
+        m->slice_count++;
+    }
+    return 0;
+}
+
+/* Walk the body as a union of rule slices: each starts at a VARIABLE and
+ * runs through JOIN, SEMIJOIN, MAP and FILTER operators; CONCAT and
+ * CONSOLIDATE only close and combine them.  An operator after a CONCAT or
+ * CONSOLIDATE that is not one itself would apply to the union rather than to
+ * one rule, so it is refused with every other operator. */
+static int
+wl_columnar_eval_tdd_plan_insert_walk(const wl_plan_stratum_t *sp,
+    const wl_plan_op_t *ops, uint32_t op_count, const char *const *changed,
+    uint32_t changed_count, bool round0,
+    wl_columnar_eval_tdd_plan_manifest_t *m)
+{
+    uint32_t depth = 0, ordinal = 0, start = UINT32_MAX;
+    for (uint32_t i = 0; i <= op_count; i++) {
+        bool closes = i == op_count || ops[i].op == WL_PLAN_OP_VARIABLE
+            || ops[i].op == WL_PLAN_OP_CONCAT
+            || ops[i].op == WL_PLAN_OP_CONSOLIDATE;
+        if (closes && start != UINT32_MAX) {
+            int rc = wl_columnar_eval_tdd_plan_insert_slice(sp, ops, start, i,
+                    ordinal++, changed, changed_count, round0, m);
+            if (rc != 0)
+                return rc;
+            start = UINT32_MAX;
+        }
+        if (i == op_count)
+            break;
+        const wl_plan_op_t *op = &ops[i];
+        if (op->opaque_data)
+            return ENOTSUP;
+        switch (op->op) {
+        case WL_PLAN_OP_VARIABLE:
+            if (!op->relation_name)
+                return EINVAL;
+            depth++;
+            start = i;
+            break;
+        case WL_PLAN_OP_CONCAT:
+            if (depth < 2)
+                return EINVAL;
+            depth--;
+            break;
+        case WL_PLAN_OP_CONSOLIDATE:
+            if (depth != 1)
+                return EINVAL;
+            break;
+        case WL_PLAN_OP_JOIN:
+        case WL_PLAN_OP_SEMIJOIN:
+            if (!op->right_relation)
+                return EINVAL;
+        /* fall through */
+        case WL_PLAN_OP_MAP:
+        case WL_PLAN_OP_FILTER:
+            if (start == UINT32_MAX)
+                return ENOTSUP;
+            break;
+        default:
+            return ENOTSUP;
+        }
+    }
+    return depth == 1 ? 0 : EINVAL;
+}
+
+int
+wl_columnar_eval_tdd_plan_insert_bindings(const wl_plan_stratum_t *sp,
+    uint32_t relation_index, const char *const *changed,
+    uint32_t changed_count, bool round0,
+    wl_columnar_eval_tdd_plan_manifest_t *out)
+{
+    if (!out)
+        return EINVAL;
+    memset(out, 0, sizeof(*out));
+    if (!sp || !sp->relations || relation_index >= sp->relation_count
+        || (changed_count && !changed))
+        return EINVAL;
+    for (uint32_t c = 0; round0 && c < changed_count; c++) {
+        if (!changed[c] || is_stratum_idb(sp, changed[c]))
+            return EINVAL;
+    }
+    if (!sp->bodies)
+        return ENOTSUP;
+    const wl_plan_body_t *body = &sp->bodies[relation_index];
+    if (!body->ops || body->op_count == 0)
+        return ENOTSUP;
+    wl_columnar_eval_tdd_plan_manifest_t result = {
+        .form = WL_COLUMNAR_EVAL_TDD_PLAN_INSERT,
+        .relation_index = relation_index, .alternative_count = 1,
+        .block_size = body->op_count,
+    };
+    int rc = wl_columnar_eval_tdd_plan_insert_walk(sp, body->ops,
+            body->op_count, changed, changed_count, round0, &result);
+    if (rc != 0)
+        return rc;
+    if (result.slice_count) {
+        size_t slice_bytes, read_bytes;
+        if (wl_columnar_eval_checked_size_mul(result.slice_count,
+            sizeof(*result.slices), &slice_bytes) != 0
+            || wl_columnar_eval_checked_size_mul(result.read_count,
+            sizeof(*result.reads), &read_bytes) != 0)
+            return EOVERFLOW;
+        result.slices = calloc(1, slice_bytes);
+        result.reads = calloc(1, read_bytes);
+        if (!result.slices || !result.reads) {
+            wl_columnar_eval_tdd_plan_bindings_free(&result);
+            return ENOMEM;
+        }
+        result.slice_count = 0;
+        result.read_count = 0;
+        rc = wl_columnar_eval_tdd_plan_insert_walk(sp, body->ops,
+                body->op_count, changed, changed_count, round0, &result);
+        if (rc != 0) {
+            wl_columnar_eval_tdd_plan_bindings_free(&result);
+            return rc;
+        }
+    }
+    result.owner_stratum = sp;
+    result.owner_relation = &sp->relations[relation_index];
+    result.owner_ops = body->ops;
+    result.owner_op_count = body->op_count;
+    *out = result;
+    return 0;
+}
+
 /* Validate the captured schema without consulting mutable registry aliases. */
 static bool
 wl_columnar_eval_tdd_plan_input_matches(const wl_columnar_eval_tdd_input_t *in)
