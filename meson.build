@@ -225,6 +225,7 @@ int main(void) {
   (void)psa_hash_setup(&hash_op, PSA_ALG_SHA_1);
   (void)psa_hash_update(&hash_op, input, sizeof(input));
   (void)psa_hash_finish(&hash_op, output, sizeof(output), &output_len);
+  (void)psa_hash_abort(&hash_op);
   psa_set_key_type(&attributes, PSA_KEY_TYPE_HMAC);
   psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_MESSAGE);
   psa_set_key_algorithm(&attributes, PSA_ALG_HMAC(PSA_ALG_SHA_256));

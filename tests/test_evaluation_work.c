@@ -10,6 +10,9 @@
 #include "../wirelog/wirelog.h"
 #include "../wirelog/thread.h"
 #include <xxhash.h>
+#ifdef WL_MBEDTLS_ENABLED
+#include <psa/crypto.h>
+#endif
 
 #define CHECK(x) do { if (!(x)) { \
                           fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, \
@@ -8494,6 +8497,333 @@ test_hash_owned_cleanup(void)
     }
 }
 
+extern void (*wl_columnar_expr_digest_test_checkpoint)(
+    wl_evaluation_control_t *, int, uint64_t, bool);
+extern int64_t (*wl_columnar_expr_digest_test_provider_result)(
+    int, int64_t, size_t *);
+static bool
+digest_available(uint8_t op)
+{
+    uint8_t buf[16]; uint32_t n = compiled_const(buf, 0, 0); buf[n++] = op;
+    int64_t value; wl_columnar_expr_status_t status;
+    return wl_columnar_expr_eval_run_ctx(buf, n, NULL, 0, &value, NULL,
+               &status) == 0 && status == WL_COLUMNAR_EXPR_OK;
+}
+static void
+test_digest_actual_twins(void)
+{
+    const uint8_t ops[] = {WL_PLAN_EXPR_ARITH_MD5, WL_PLAN_EXPR_ARITH_MD5_S,
+                           WL_PLAN_EXPR_ARITH_SHA1, WL_PLAN_EXPR_ARITH_SHA1_S,
+                           WL_PLAN_EXPR_ARITH_SHA256,
+                           WL_PLAN_EXPR_ARITH_SHA256_S,
+                           WL_PLAN_EXPR_ARITH_SHA512,
+                           WL_PLAN_EXPR_ARITH_SHA512_S};
+    const int64_t values[] = {0, 2, 3, 4, -1, 99, INT64_MIN, INT64_MAX};
+    for (uint32_t k = 0; k < sizeof(ops); k++) {
+        int expected = digest_available(ops[k]) ? 0 : ERANGE;
+        for (int domain = -1; domain < 3; domain++)
+            for (uint32_t j = 0; j < sizeof(values)/sizeof(*values); j++) {
+                uint8_t buf[16]; uint32_t n = compiled_const(buf, 0, values[j]);
+                buf[n++] = ops[k]; string_caller_twins(buf, n, expected,
+                    domain, j == 0);
+            }
+        uint8_t buf[1100]; uint32_t n = 0;
+        for (uint32_t i = 0; i < 513; i++) {
+            buf[n++] = WL_PLAN_EXPR_BOOL; buf[n++] = 0;
+        }
+        buf[n-1] = 1; buf[n++] = ops[k];
+        string_caller_twins(buf, n, expected, 2, true);
+        buf[0] = ops[k]; string_caller_twins(buf, 1, expected, -1, true);
+        if (k % 2) {
+            const char embedded[] = {'a', 'b', 0, 'c', 'd'};
+            n = string_literal(buf, 0, embedded, 5); buf[n++] = ops[k];
+            string_caller_twins(buf, n, expected, 2, true);
+            const uint32_t lengths[] = {0, 1, 63, 64, 65, 127, 128, 129, 255,
+                                        256,
+                                        513, 4097};
+            char text[4098]; uint8_t large[4120];
+            for (uint32_t j = 0; j < sizeof(lengths)/sizeof(*lengths); j++) {
+                memset(text, 'a', lengths[j]); text[lengths[j]] = 0;
+                n = string_literal(large, 0, text, (uint16_t)lengths[j]);
+                large[n++] = ops[k];
+                string_caller_twins(large, n, expected, 2, j == 11);
+            }
+        }
+    }
+}
+static int digest_stop_stage, digest_primary;
+static uint64_t digest_stop_progress;
+static uint32_t digest_reached, digest_calls[5];
+static int digest_override_stage = -1;
+static bool digest_abort_error, digest_length_error;
+static void
+digest_checkpoint_stop(wl_evaluation_control_t *c, int stage,
+    uint64_t progress, bool failed)
+{
+    (void)failed;
+    if (stage != digest_stop_stage || progress < digest_stop_progress) return;
+    wl_columnar_expr_digest_test_checkpoint = NULL;
+    wl_columnar_expr_hash_test_controlled_checkpoint = NULL;
+    wl_columnar_expr_test_controlled_checkpoint = NULL;
+    digest_reached++;
+    if (digest_primary > 0) CHECK(wl_evaluation_control_charge(c,
+            UINT64_MAX) == EOVERFLOW);
+    else if (digest_primary < 0) CHECK(wl_evaluation_control_charge(c,
+            UINT64_MAX) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    else wl_evaluation_control_request_cancel(c);
+}
+static int64_t
+digest_provider_report(int stage, int64_t actual, size_t *length)
+{
+    CHECK(stage >= 0 && stage < 5); digest_calls[stage]++;
+    if (stage == 3 && digest_length_error && actual == 0) {
+        CHECK(length && *length); (*length)--;
+    }
+    /* Real provider has already run; abort override is only after genuine
+     * terminal call. This is report injection, not hardware reclaim proof. */
+    if (stage == digest_override_stage || (stage == 4 && digest_abort_error))
+#ifdef WL_MBEDTLS_ENABLED
+        return stage == 4 ? PSA_ERROR_GENERIC_ERROR :
+               PSA_ERROR_INSUFFICIENT_MEMORY;
+#else
+        return actual; /* no real PSA call can reach this disabled fixture */
+#endif
+    return actual;
+}
+static void
+digest_lifecycle_trial(int map, int stop_stage, int primary, int override,
+    bool abort_error, bool length_error)
+{
+    wl_col_session_t *sess = join_session();
+    sess->intern = string_table(sess->memory_governor, 0);
+    char text[601]; memset(text, 'a', 600); text[600] = 0;
+    CHECK(wl_intern_put(sess->intern, text) == 0);
+    col_rel_t *source = relation(1, 1, 1, false, sess->memory_governor);
+    CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+    uint64_t before = string_reserved(sess->memory_governor);
+    uint8_t buf[16]; uint32_t n = compiled_const(buf, 0, 0);
+    buf[n++] = WL_PLAN_EXPR_ARITH_SHA256_S;
+    wl_plan_expr_buffer_t expr = {buf, n}; wl_plan_op_t ops[2] = {
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+         .delta_mode = WL_DELTA_FORCE_FULL},
+        {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+         .filter_expr = expr, .project_count = 1, .map_exprs = &expr,
+         .map_expr_count = 1}
+    };
+    wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+    wl_evaluation_control_t *c = control(primary < 0 ? UINT64_MAX-1 : 0);
+    memset(digest_calls, 0, sizeof(digest_calls)); digest_reached = 0;
+    digest_stop_stage = stop_stage;
+    digest_stop_progress = stop_stage == 14 ? 300 : stop_stage == 32 ? 320 :
+        stop_stage == 3 ? 2 : 0;
+    digest_primary = primary; digest_override_stage = override;
+    digest_abort_error = abort_error; digest_length_error = length_error;
+    wl_columnar_expr_digest_test_provider_result = digest_provider_report;
+    if (stop_stage) {
+        if (stop_stage == 14 || stop_stage == 3)
+            wl_columnar_expr_test_controlled_checkpoint =
+                digest_checkpoint_stop;
+        else if (stop_stage == 28)
+            wl_columnar_expr_hash_test_controlled_checkpoint =
+                digest_checkpoint_stop;
+        else wl_columnar_expr_digest_test_checkpoint = digest_checkpoint_stop;
+    }
+    int expected = 0;
+    if (stop_stage) expected = primary > 0 ? EOVERFLOW : primary < 0 ?
+            WL_EVALUATION_CONTROL_WORK_LIMIT : WL_EVALUATION_CONTROL_CANCELLED;
+#ifdef WL_MBEDTLS_ENABLED
+    if (override >= 0 || length_error) expected = map ? ERANGE : 0;
+    bool abort_needed = stop_stage == 31 || stop_stage == 32 ||
+        override == 1 || override == 2;
+    if (abort_needed && abort_error && !(stop_stage && primary > 0))
+        expected = EIO;
+#else
+    if (!stop_stage) expected = map ? ERANGE : 0;
+#endif
+    int actual_rc = compiled_dispatch(sess, frame, ops, 2, c);
+    if (actual_rc != expected) fprintf(stderr,
+            "digest lifecycle map%d stop%d primary%d override%d abort%d length%d: "
+            "actual%d expected%d\n", map, stop_stage, primary, override,
+            abort_error, length_error, actual_rc, expected);
+    CHECK(actual_rc == expected);
+    finish(c, expected); CHECK(!sess->memory_budget_denied);
+    if (stop_stage) CHECK(digest_reached == 1);
+#ifdef WL_MBEDTLS_ENABLED
+    if (stop_stage == 14) CHECK(!digest_calls[0] && !digest_calls[1]);
+    else {
+        CHECK(digest_calls[0] == 1 && digest_calls[1] == 1);
+        CHECK(digest_calls[4] == (abort_needed ? 1u : 0u));
+        if (!abort_needed) CHECK(digest_calls[3] == 1);
+    }
+#else
+    for (uint32_t i = 0; i < 5; i++) CHECK(!digest_calls[i]);
+#endif
+    if (expected) lazy_unchanged(source);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+    CHECK(string_reserved(sess->memory_governor) == before &&
+        wl_intern_count(sess->intern) == 1);
+    wl_columnar_expr_digest_test_provider_result = NULL;
+    wl_columnar_expr_digest_test_checkpoint = NULL;
+    wl_columnar_expr_hash_test_controlled_checkpoint = NULL;
+    wl_columnar_expr_test_controlled_checkpoint = NULL;
+    digest_override_stage = -1;
+    digest_abort_error = digest_length_error = false;
+    frame = filter_frame(sess); retry(c, 0);
+    expected =
+        digest_available(WL_PLAN_EXPR_ARITH_SHA256) ? 0 : map ? ERANGE : 0;
+    CHECK(compiled_dispatch(sess, frame, ops, 2, c) == expected);
+    finish(c, expected);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+    wl_intern_free(sess->intern); sess->intern = NULL; release(c);
+    join_session_destroy(sess);
+}
+static void
+test_digest_lifecycle_and_stops(void)
+{
+    for (int map = 0; map < 2; map++) {
+#ifdef WL_MBEDTLS_ENABLED
+        if (!digest_available(WL_PLAN_EXPR_ARITH_SHA256)) continue;
+        const int stages[] = {14, 31, 32, 33, 28, 34, 3};
+        for (uint32_t i = 0; i < sizeof(stages)/sizeof(*stages); i++)
+            for (int positive = 0; positive < 2; positive++)
+                digest_lifecycle_trial(map, stages[i], positive, -1, false,
+                    false);
+        for (int stage = 1; stage <= 3; stage++)
+            digest_lifecycle_trial(map, 0, 0, stage, false, false);
+        digest_lifecycle_trial(map, 0, 0, -1, false, true);
+        /* Genuine abort runs FIRST then reports error: EIO wins pending0 and
+         * negative control, while first positive EOVERFLOW is preserved. */
+        digest_lifecycle_trial(map, 0, 0, 2, true, false);
+        digest_lifecycle_trial(map, 31, 0, -1, true, false);
+        digest_lifecycle_trial(map, 31, -1, -1, true, false);
+        digest_lifecycle_trial(map, 32, 1, -1, true, false);
+#else
+        for (int positive = 0; positive < 2; positive++)
+            digest_lifecycle_trial(map, 3, positive, -1, false, false);
+        digest_lifecycle_trial(map, 0, 0, -1, false, false);
+#endif
+    }
+}
+
+static void
+test_digest_zero_calls_and_id_independence(void)
+{
+    const uint8_t ops[] = {WL_PLAN_EXPR_ARITH_MD5, WL_PLAN_EXPR_ARITH_MD5_S,
+                           WL_PLAN_EXPR_ARITH_SHA1, WL_PLAN_EXPR_ARITH_SHA1_S,
+                           WL_PLAN_EXPR_ARITH_SHA256,
+                           WL_PLAN_EXPR_ARITH_SHA256_S,
+                           WL_PLAN_EXPR_ARITH_SHA512,
+                           WL_PLAN_EXPR_ARITH_SHA512_S};
+    for (int map = 0; map < 2;
+        map++) for (uint32_t k = 0; k < sizeof(ops); k++) {
+            wl_col_session_t *sess = join_session();
+            col_rel_t *source = relation(1, 0, 0, false, sess->memory_governor);
+            CHECK(session_add_rel(sess, source) == 0);
+            uint8_t buf[16]; uint32_t n = compiled_const(buf, 0, 99);
+            buf[n++] = ops[k]; wl_plan_expr_buffer_t expr = {buf, n};
+            wl_plan_op_t plan_ops[2] = {
+                {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+                 .delta_mode = WL_DELTA_FORCE_FULL},
+                {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+                 .filter_expr = expr, .project_count = 1, .map_exprs = &expr,
+                 .map_expr_count = 1}
+            };
+            memset(digest_calls, 0, sizeof(digest_calls));
+            wl_columnar_expr_digest_test_provider_result =
+                digest_provider_report;
+            wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+            wl_evaluation_control_t *c = control(0);
+            CHECK(compiled_dispatch(sess, frame, plan_ops, 2, c) == 0);
+            finish(c, 0);
+            CHECK(!join_output(frame)->nrows);
+            for (uint32_t i = 0; i < 5; i++) CHECK(!digest_calls[i]);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+            wl_columnar_expr_digest_test_provider_result = NULL;
+            release(c); join_session_destroy(sess);
+        }
+    if (!digest_available(WL_PLAN_EXPR_ARITH_SHA256)) return;
+    int64_t reference = 0;
+    for (int map = 0; map < 2; map++) for (int extra = 0; extra < 2; extra++) {
+            wl_col_session_t *sess = join_session();
+            sess->intern = string_table(sess->memory_governor, 0);
+            if (extra) CHECK(wl_intern_put(sess->intern, "unrelated") == 0);
+            CHECK(wl_intern_put(sess->intern, "digest-body") == extra);
+            uint8_t buf[32]; uint32_t n = compiled_const(buf, 0, extra);
+            buf[n++] = WL_PLAN_EXPR_ARITH_SHA256_S;
+            wl_columnar_expr_context_t ctx = {.intern = sess->intern};
+            wl_columnar_expr_status_t status; int64_t actual_raw;
+            CHECK(wl_columnar_expr_eval_run_ctx(buf, n, NULL, 0, &actual_raw,
+                &ctx, &status) == 0 && status == WL_COLUMNAR_EXPR_OK);
+            if (!map && !extra) reference = actual_raw;
+            CHECK(reference == actual_raw);
+            if (!map) {
+                n = compiled_const(buf, n, reference);
+                buf[n++] = WL_PLAN_EXPR_CMP_EQ;
+            }
+            col_rel_t *source = relation(1, 1, 1, false, sess->memory_governor);
+            CHECK(session_add_rel(sess, source) == 0);
+            wl_plan_expr_buffer_t expr = {buf, n}; wl_plan_op_t plan_ops[2] = {
+                {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+                 .delta_mode = WL_DELTA_FORCE_FULL},
+                {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+                 .filter_expr = expr, .project_count = 1, .map_exprs = &expr,
+                 .map_expr_count = 1}
+            };
+            wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+            wl_evaluation_control_t *c = control(0);
+            CHECK(compiled_dispatch(sess, frame, plan_ops, 2, c) == 0);
+            finish(c, 0);
+            CHECK(join_output(frame)->nrows == 1);
+            if (map) CHECK(join_output(frame)->columns[0][0] == reference);
+            CHECK(wl_intern_count(sess->intern) == (uint32_t)extra+1);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+            wl_intern_free(sess->intern); sess->intern = NULL;
+            release(c); join_session_destroy(sess);
+        }
+}
+
+static void
+test_digest_owned_cleanup(void)
+{
+    if (!digest_available(WL_PLAN_EXPR_ARITH_SHA256)) return;
+    for (int map = 0; map < 2; map++) {
+        wl_col_session_t *sess = join_session();
+        sess->intern = string_table(sess->memory_governor, 0);
+        CHECK(wl_intern_put(sess->intern, "input-lower") == 0);
+        col_rel_t *source = relation(2, 2, 2, false, sess->memory_governor);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = join_frame(sess, source,
+                true);
+        uint8_t buf[64];
+        uint32_t n = compiled_const(buf, 0, 0);
+        buf[n++] = WL_PLAN_EXPR_ARITH_SHA256_S;
+        wl_plan_expr_buffer_t expr = {buf, n};
+        wl_plan_op_t op = {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+                           .filter_expr = expr, .project_count = 1,
+                           .map_exprs = &expr, .map_expr_count = 1};
+        wl_evaluation_control_t *c = control(0);
+        sess->base.evaluation_control = c;
+        filter_reached = 0;
+        if (map) wl_columnar_ops_map_test_controlled_checkpoint =
+                map_owned_cleanup_fault;
+        else wl_columnar_filter_test_controlled_checkpoint =
+                filter_cleanup_fault;
+        CHECK((map ? col_op_map(&op,
+            wl_columnar_eval_stack_cleanup_stack(frame), sess)
+            : wl_columnar_filter_op(&op,
+            wl_columnar_eval_stack_cleanup_stack(frame), sess)) == EBUSY);
+        sess->base.evaluation_control = NULL; finish(c, EBUSY);
+        CHECK(filter_reached == 1 && wl_intern_count(sess->intern) == 1);
+        CHECK(strcmp(wl_intern_reverse(sess->intern, 0), "input-lower") == 0);
+        CHECK(wl_columnar_eval_stack_cleanup_result(frame)->rel);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == EBUSY &&
+            !frame && sess->cleanup_pending);
+        CHECK(col_rel_source_reader_release(&join_retained_reader) == 0);
+        CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0);
+        wl_intern_free(sess->intern); sess->intern = NULL;
+        release(c); join_session_destroy(sess);
+    }
+}
+
 int
 main(void)
 {
@@ -8613,6 +8943,10 @@ main(void)
     test_hash_symbol_assignment_independence();
     test_hash_real_alignment_and_unaligned_input();
     test_hash_owned_cleanup();
+    test_digest_actual_twins();
+    test_digest_lifecycle_and_stops();
+    test_digest_zero_calls_and_id_independence();
+    test_digest_owned_cleanup();
     puts("evaluation_work: OK");
     return 0;
 }

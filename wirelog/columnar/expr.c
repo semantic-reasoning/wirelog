@@ -2034,6 +2034,41 @@ wl_columnar_expr_controlled_hash(expr_stack_t *stack, uint8_t op,
     return rc;
 }
 static int
+wl_columnar_expr_controlled_digest(expr_stack_t *stack, uint8_t op,
+    wl_col_session_t *sess, bool *failed, wl_evaluation_control_t *control)
+{
+    int rc = wl_evaluation_control_charge(control, 16);
+    if (rc) return rc;
+    int64_t operand = expr_pop(stack);
+#ifndef WL_MBEDTLS_ENABLED
+    (void)op; (void)sess; (void)operand; *failed = true; return 0;
+#else
+    const char *text = (op >= WL_PLAN_EXPR_ARITH_MD5_S &&
+        op <= WL_PLAN_EXPR_ARITH_SHA512_S) && sess && sess->intern
+        ? wl_intern_reverse(sess->intern, operand) : NULL;
+    rc = wl_columnar_expr_controlled_tail(control);
+    if (rc) return rc;
+    uint8_t native[8]; const uint8_t *bytes; size_t length;
+    if (text) {
+        rc = wl_columnar_expr_controlled_string_length(text, &length, control);
+        if (rc) return rc;
+        bytes = (const uint8_t *)text;
+    } else {
+        rc = wl_evaluation_control_charge(control, 8);
+        if (rc) return rc;
+        memcpy(native, &operand, sizeof(native));
+        bytes = native; length = sizeof(native);
+        rc = wl_columnar_expr_controlled_tail(control);
+        if (rc) return rc;
+    }
+    int64_t value;
+    rc = wl_columnar_expr_digest_run(op, bytes, length, &value, failed,
+            control);
+    if (!rc && !*failed) expr_push(stack, value);
+    return rc;
+#endif
+}
+static int
 wl_columnar_expr_controlled_string_match(const char *hay, size_t available,
     const char *needle, size_t length, bool *matches,
     wl_evaluation_control_t *control)
@@ -2565,6 +2600,10 @@ wl_columnar_expr_controlled_interpreter_decode(const uint8_t *buf,
         in->iarg = length; in->larg = *pos; *pos += length;
         break;
     }
+    case WL_PLAN_EXPR_ARITH_MD5: case WL_PLAN_EXPR_ARITH_MD5_S:
+    case WL_PLAN_EXPR_ARITH_SHA1: case WL_PLAN_EXPR_ARITH_SHA1_S:
+    case WL_PLAN_EXPR_ARITH_SHA256: case WL_PLAN_EXPR_ARITH_SHA256_S:
+    case WL_PLAN_EXPR_ARITH_SHA512: case WL_PLAN_EXPR_ARITH_SHA512_S:
     case WL_PLAN_EXPR_ARITH_HASH: case WL_PLAN_EXPR_ARITH_HASH_S:
     case WL_PLAN_EXPR_ARITH_CRC32_ETH: case WL_PLAN_EXPR_ARITH_CRC32_ETH_S:
     case WL_PLAN_EXPR_ARITH_CRC32_CAST: case WL_PLAN_EXPR_ARITH_CRC32_CAST_S:
@@ -2723,6 +2762,13 @@ wl_columnar_expr_eval_interpreter_controlled(const uint8_t *buf,
                     sess, &allocation, control);
             if (rc) return rc;
             pending = allocation;
+        } else if (!pending && ((in.op >= WL_PLAN_EXPR_ARITH_MD5
+            && in.op <= WL_PLAN_EXPR_ARITH_SHA512)
+            || (in.op >= WL_PLAN_EXPR_ARITH_MD5_S
+            && in.op <= WL_PLAN_EXPR_ARITH_SHA512_S))) {
+            rc = wl_columnar_expr_controlled_digest(&stack, in.op, sess,
+                    &pending, control);
+            if (rc) return rc;
         } else if (!pending && (in.op == WL_PLAN_EXPR_ARITH_HASH
             || in.op == WL_PLAN_EXPR_ARITH_HASH_S)) {
             rc = wl_columnar_expr_controlled_hash(&stack, in.op, sess, &pending,
