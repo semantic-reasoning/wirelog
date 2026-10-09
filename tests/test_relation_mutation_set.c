@@ -3,6 +3,7 @@
 #include "../wirelog/thread.h"
 #include <assert.h>
 #include <errno.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -132,6 +133,92 @@ lease_tests(void)
     copy = (wl_columnar_relation_mutation_lease_t){0};
     assert(col_rel_storage_alias_release_locked(&a, &copy) == EINVAL);
     assert(wl_columnar_source_access_writer_release(&raw) == 0);
+}
+
+/* Each writer token a lease names must stay live for lease validation and
+ * finish, including the canonical self-owned case where the owner and self
+ * slots are the same token (#2036). */
+static void
+expect_token_required(fixture_t *f, wl_columnar_source_access_writer_t *token,
+    col_rel_t *relation)
+{
+    assert(col_rel_mutation_lease_validate(&f->leases[0], relation) == 0);
+    token->thread_valid = false;
+    assert(col_rel_mutation_lease_validate(&f->leases[0], relation) == EINVAL);
+    assert(col_rel_mutation_set_lease(&f->set, 0) == NULL);
+    assert(col_rel_mutation_set_finish(&f->set, true) == EINVAL);
+    token->thread_valid = true;
+    uintptr_t identity = token->identity;
+    token->identity = 0;
+    assert(col_rel_mutation_lease_validate(&f->leases[0], relation) == EINVAL);
+    assert(col_rel_mutation_set_finish(&f->set, true) == EINVAL);
+    token->identity = identity;
+    assert(col_rel_mutation_lease_validate(&f->leases[0], relation) == 0);
+}
+
+static void
+writer_token_liveness_tests(void)
+{
+    col_rel_t root, alias;
+    fixture_t f = {0};
+    root_init(&root, 31);
+    wl_columnar_relation_mutation_role_t role = { &root,
+                                                  WL_COLUMNAR_RELATION_PAYLOAD_MUTATION };
+    assert(acquire(&f, &role, 1) == 0);
+    assert(f.set.owner_count == 1
+        && f.leases[0].owner_slot == f.leases[0].self_owner_slot);
+    expect_token_required(&f,
+        &f.descriptors[f.leases[0].descriptor_slot].writer,
+        &root);
+    expect_token_required(&f, &f.owners[f.leases[0].owner_slot].writer, &root);
+    assert(col_rel_mutation_set_finish(&f.set, true) == 0);
+    assert_open(&root);
+
+    memset(&f, 0, sizeof(f));
+    alias_init(&alias, &root, 32);
+    role.relation = &alias;
+    assert(acquire(&f, &role, 1) == 0);
+    assert(f.set.owner_count == 2
+        && f.leases[0].owner_slot != f.leases[0].self_owner_slot
+        && f.owners[f.leases[0].owner_slot].owner == &root);
+    expect_token_required(&f,
+        &f.descriptors[f.leases[0].descriptor_slot].writer,
+        &alias);
+    expect_token_required(&f, &f.owners[f.leases[0].owner_slot].writer, &alias);
+    expect_token_required(&f, &f.owners[f.leases[0].self_owner_slot].writer,
+        &alias);
+    assert(col_rel_mutation_set_finish(&f.set, false) == 0);
+    assert_open(&root);
+    assert_open(&alias);
+    assert(col_rel_storage_alias_borrow_release(&root) == 0);
+}
+
+/* Only the internal single-relation path may skip the caller-storage overlap
+ * scan; the public entry point still rejects aliased bookkeeping (#2036). */
+static void
+overlapping_storage_tests(void)
+{
+    col_rel_t root;
+    fixture_t f = {0};
+    root_init(&root, 33);
+    wl_columnar_relation_mutation_role_t role = { &root,
+                                                  WL_COLUMNAR_RELATION_PAYLOAD_MUTATION };
+    _Alignas(max_align_t) unsigned char shared[
+        sizeof(wl_columnar_relation_mutation_lease_t)
+        + sizeof(wl_columnar_relation_mutation_initialization_t)] = {0};
+    assert(col_rel_mutation_set_acquire(&f.set, &role, 1,
+        f.descriptors, 4, f.owners, 8,
+        (wl_columnar_relation_mutation_lease_t *)shared, 1,
+        (wl_columnar_relation_mutation_initialization_t *)shared, 1)
+        == EINVAL);
+    assert(col_rel_mutation_set_acquire(&f.set, &role, 1,
+        (wl_columnar_relation_mutation_descriptor_t *)f.owners, 4, f.owners, 8,
+        f.leases, 4, f.initializations, 4) == EINVAL);
+    assert(f.set.identity == 0);
+    assert_open(&root);
+    assert(acquire(&f, &role, 1) == 0);
+    assert(col_rel_mutation_set_finish(&f.set, true) == 0);
+    assert_open(&root);
 }
 
 static void
@@ -663,6 +750,50 @@ static uint8_t batch_filter_compiled[] = {
     WL_PLAN_EXPR_CONST_INT, 151, 0, 0, 0, 0, 0, 0, 0,
     WL_PLAN_EXPR_CMP_GT
 };
+
+/* The public batch append copies whole rows at once (#2036): every cell must
+ * land in its column at the existing row offset, float -0.0 must be stored as
+ * +0.0, stale timestamp slots must be cleared, and an invalid float anywhere
+ * in the batch must leave the relation unchanged. */
+static void
+public_batch_copy_tests(void)
+{
+    col_rel_t *r = batch_relation("public_batch_copy");
+    int64_t first[2] = { 5, 0 };
+    assert(col_rel_append_rows_atomic(r, first, 1, 2, NULL) == 0);
+    assert(col_rel_reserve_capacity_admitted(r, 8, NULL) == 0);
+    for (uint32_t i = 1; i < r->timestamp_capacity; i++)
+        memset(&r->timestamps[i], 0xa5, sizeof(r->timestamps[i]));
+    const int64_t negative_zero = (int64_t)UINT64_C(0x8000000000000000);
+    const int64_t one = (int64_t)UINT64_C(0x3ff0000000000000);
+    const int64_t minus_two = (int64_t)UINT64_C(0xc000000000000000);
+    int64_t rows[3][2] = { { 7, negative_zero }, { -8, one },
+                           { 9, minus_two } };
+    bool denied = true;
+    assert(col_rel_append_rows_atomic(r, &rows[0][0], 3, 2, &denied) == 0
+        && !denied && r->nrows == 4);
+    const int64_t expect[4][2] = { { 5, 0 }, { 7, 0 }, { -8, one },
+                                   { 9, minus_two } };
+    col_delta_timestamp_t zero;
+    memset(&zero, 0, sizeof(zero));
+    for (uint32_t i = 0; i < 4; i++) {
+        assert(r->columns[0][i] == expect[i][0]
+            && r->columns[1][i] == expect[i][1]);
+        assert(memcmp(&r->timestamps[i], &zero, sizeof(zero)) == 0);
+    }
+    col_delta_timestamp_t stale;
+    memset(&stale, 0xa5, sizeof(stale));
+    assert(memcmp(&r->timestamps[4], &stale, sizeof(stale)) == 0);
+
+    int64_t invalid[2][2] = { { 10, one },
+                              { 11, (int64_t)UINT64_C(0x7ff8000000000000) } };
+    uint64_t view = r->view_generation;
+    assert(col_rel_append_rows_atomic(r, &invalid[0][0], 2, 2, &denied)
+        == EINVAL && !denied);
+    assert(r->nrows == 4 && r->view_generation == view
+        && memcmp(&r->timestamps[4], &stale, sizeof(stale)) == 0);
+    assert(col_rel_destroy_checked(r) == 0);
+}
 
 static void
 filter_batch_tests(void)
@@ -1240,6 +1371,8 @@ int
 main(void)
 {
     lease_tests();
+    writer_token_liveness_tests();
+    overlapping_storage_tests();
     duplicate_role_publication_tests();
     terminal_sequence_tests();
     contention_tests();
@@ -1247,6 +1380,7 @@ main(void)
     invalid_tests();
     metadata_final_access_test();
     append_batch_tests();
+    public_batch_copy_tests();
     filter_batch_tests();
     filter_op_batch_tests();
     join_batch_tests();
