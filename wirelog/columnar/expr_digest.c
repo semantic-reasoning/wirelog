@@ -1,4 +1,4 @@
-/* Scoped controlled unary PSA digests. Copyright (C) CleverPlant.
+/* Scoped controlled PSA digests and UUID5 pairs. Copyright (C) CleverPlant.
  * Licensed under LGPL-3.0. */
 #include "internal.h"
 #include <errno.h>
@@ -38,18 +38,21 @@ wl_columnar_expr_digest_report(int stage, psa_status_t actual, size_t *length)
     return actual;
 }
 #endif
-int
-wl_columnar_expr_digest_run(uint8_t op, const uint8_t *bytes, size_t length,
+static int
+wl_columnar_expr_digest_segments(uint8_t op, const uint8_t *const *parts,
+    const size_t *lengths, size_t part_count, bool uuid,
     int64_t *value, bool *failed, wl_evaluation_control_t *control)
 {
 #ifndef WL_MBEDTLS_ENABLED
-    (void)op; (void)bytes; (void)length; (void)value; (void)control;
+    (void)op; (void)parts; (void)lengths; (void)part_count; (void)uuid;
+    (void)value; (void)control;
     *failed = true; return 0;
 #else
     int rc = wl_evaluation_control_charge(control, 8);
     if (rc) return rc;
     psa_algorithm_t alg; size_t expected;
     switch (op) {
+    case WL_PLAN_EXPR_ARITH_UUID5: alg = PSA_ALG_SHA_1; expected = 20; break;
     case WL_PLAN_EXPR_ARITH_MD5: case WL_PLAN_EXPR_ARITH_MD5_S:
         alg = PSA_ALG_MD5; expected = 16; break;
     case WL_PLAN_EXPR_ARITH_SHA1: case WL_PLAN_EXPR_ARITH_SHA1_S:
@@ -97,28 +100,38 @@ wl_columnar_expr_digest_run(uint8_t op, const uint8_t *bytes, size_t length,
     wl_columnar_expr_digest_checkpoint(control, 31, 0, semantic);
     rc = wl_evaluation_control_charge(control, 0);
     if (rc || semantic) goto cleanup;
-    for (size_t offset = 0; offset < length;) {
+    for (size_t segment = 0; segment < part_count; segment++) {
         rc = wl_evaluation_control_charge(control, 8);
         if (rc) goto cleanup;
-        size_t count = length - offset;
-        if (count > 64) count = 64;
-        const uint8_t *part = bytes + offset;
+        const uint8_t *bytes = parts[segment]; size_t length = lengths[segment];
+        wl_columnar_expr_digest_checkpoint(control, 36, segment, false);
         rc = wl_evaluation_control_charge(control, 0);
         if (rc) goto cleanup;
-        rc = wl_evaluation_control_charge(control, 128 + count);
-        if (rc) goto cleanup;
-        status = wl_columnar_expr_digest_report(2,
-                psa_hash_update(&operation, part, count), NULL);
-        semantic = status != PSA_SUCCESS;
-        wl_columnar_expr_digest_checkpoint(control, 32, offset + count,
-            semantic);
-        rc = wl_evaluation_control_charge(control, 0);
-        if (rc || semantic) goto cleanup;
-        rc = wl_evaluation_control_charge(control, 4);
-        if (rc) goto cleanup;
-        offset += count;
-        rc = wl_evaluation_control_charge(control, 0);
-        if (rc) goto cleanup;
+        for (size_t offset = 0; offset < length;) {
+            rc = wl_evaluation_control_charge(control, 8);
+            if (rc) goto cleanup;
+            size_t count = length - offset;
+            if (count > 64) count = 64;
+            const uint8_t *part = bytes + offset;
+            rc = wl_evaluation_control_charge(control, 0);
+            if (rc) goto cleanup;
+            rc = wl_evaluation_control_charge(control, 128 + count);
+            if (rc) goto cleanup;
+            status = wl_columnar_expr_digest_report(2,
+                    psa_hash_update(&operation, part, count), NULL);
+            semantic = status != PSA_SUCCESS;
+            wl_columnar_expr_digest_checkpoint(control, 32, offset + count,
+                semantic);
+            if (uuid) wl_columnar_expr_digest_checkpoint(control,
+                    40 + (int)segment, offset + count, semantic);
+            rc = wl_evaluation_control_charge(control, 0);
+            if (rc || semantic) goto cleanup;
+            rc = wl_evaluation_control_charge(control, 4);
+            if (rc) goto cleanup;
+            offset += count;
+            rc = wl_evaluation_control_charge(control, 0);
+            if (rc) goto cleanup;
+        }
     }
     rc = wl_evaluation_control_charge(control, 128 + expected);
     if (rc) goto cleanup;
@@ -140,6 +153,23 @@ cleanup:
     if (semantic) {
         *failed = true; return 0;
     }
+    if (uuid) {
+        rc = wl_evaluation_control_charge(control, 8);
+        if (rc) return rc;
+        digest[6] = (digest[6] & 0x0f) | 0x50;
+        digest[8] = (digest[8] & 0x3f) | 0x80;
+        wl_columnar_expr_digest_checkpoint(control, 45, 20, false);
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return rc;
+        rc = wl_evaluation_control_charge(control, 8);
+        if (rc) return rc;
+        int64_t pending;
+        memcpy(&pending, digest, 8);
+        wl_columnar_expr_digest_checkpoint(control, 46, 8, false);
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return rc;
+        *value = pending; *failed = false; return 0;
+    }
     int64_t pending; bool fold_failed;
     rc = wl_columnar_expr_hash_run(digest, expected, &pending, &fold_failed,
             control);
@@ -151,4 +181,46 @@ cleanup:
     if (!fold_failed) *value = pending;
     return 0;
 #endif
+}
+
+int
+wl_columnar_expr_digest_run(uint8_t op, const uint8_t *bytes, size_t length,
+    int64_t *value, bool *failed, wl_evaluation_control_t *control)
+{
+    return wl_columnar_expr_digest_segments(op, &bytes, &length, 1, false,
+               value, failed, control);
+}
+int
+wl_columnar_expr_uuid_pair_run(const uint8_t *ns, size_t ns_length,
+    bool ns_symbol, const uint8_t *name, size_t name_length, bool name_symbol,
+    bool framed, int64_t *value, bool *failed, wl_evaluation_control_t *control)
+{
+    uint8_t headers[2][9];
+    const uint8_t *parts[4]; size_t lengths[4]; size_t count = 0;
+    int rc = wl_evaluation_control_charge(control, 16);
+    if (rc) return rc;
+    const uint8_t *bodies[2] = {ns, name};
+    const size_t sizes[2] = {ns_length, name_length};
+    const bool domains[2] = {ns_symbol, name_symbol};
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) return rc;
+    for (size_t i = 0; i < 2; i++) {
+        rc = wl_evaluation_control_charge(control, 24);
+        if (rc) return rc;
+        if (framed) {
+            headers[i][0] = domains[i] ? 'S' : 'I';
+            uint64_t length = (uint64_t)sizes[i];
+            for (unsigned j = 0; j < 8; j++)
+                headers[i][j + 1] = (uint8_t)(length >> (8 * j));
+            parts[count] = headers[i]; lengths[count++] = 9;
+        }
+        parts[count] = bodies[i]; lengths[count++] = sizes[i];
+#ifdef WL_MBEDTLS_ENABLED
+        wl_columnar_expr_digest_checkpoint(control, 37, i, false);
+#endif
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return rc;
+    }
+    return wl_columnar_expr_digest_segments(WL_PLAN_EXPR_ARITH_UUID5, parts,
+               lengths, count, true, value, failed, control);
 }

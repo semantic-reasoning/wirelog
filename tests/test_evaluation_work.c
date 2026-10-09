@@ -8590,9 +8590,10 @@ digest_provider_report(int stage, int64_t actual, size_t *length)
 #endif
     return actual;
 }
+static bool uuid_pair_available(void);
 static void
-digest_lifecycle_trial(int map, int stop_stage, int primary, int override,
-    bool abort_error, bool length_error)
+digest_lifecycle_trial_kind(int map, int stop_stage, int primary, int override,
+    bool abort_error, bool length_error, int pair)
 {
     wl_col_session_t *sess = join_session();
     sess->intern = string_table(sess->memory_governor, 0);
@@ -8601,8 +8602,11 @@ digest_lifecycle_trial(int map, int stop_stage, int primary, int override,
     col_rel_t *source = relation(1, 1, 1, false, sess->memory_governor);
     CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
     uint64_t before = string_reserved(sess->memory_governor);
-    uint8_t buf[16]; uint32_t n = compiled_const(buf, 0, 0);
-    buf[n++] = WL_PLAN_EXPR_ARITH_SHA256_S;
+    uint8_t buf[32]; uint32_t n = compiled_const(buf, 0,
+            pair == 2 ? INT64_MAX : 0);
+    if (pair) n = compiled_const(buf, n, 0);
+    buf[n++] = pair == 2 ? WL_PLAN_EXPR_ARITH_UUID5_IS :
+        pair ? WL_PLAN_EXPR_ARITH_UUID5_SS : WL_PLAN_EXPR_ARITH_SHA256_S;
     wl_plan_expr_buffer_t expr = {buf, n}; wl_plan_op_t ops[2] = {
         {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
          .delta_mode = WL_DELTA_FORCE_FULL},
@@ -8615,7 +8619,8 @@ digest_lifecycle_trial(int map, int stop_stage, int primary, int override,
     memset(digest_calls, 0, sizeof(digest_calls)); digest_reached = 0;
     digest_stop_stage = stop_stage;
     digest_stop_progress = stop_stage == 14 ? 300 : stop_stage == 32 ? 320 :
-        stop_stage == 3 ? 2 : 0;
+        stop_stage == 3 ? (pair ? 3 : 2) :
+        (stop_stage == 41 || stop_stage == 43) ? 320 : 0;
     digest_primary = primary; digest_override_stage = override;
     digest_abort_error = abort_error; digest_length_error = length_error;
     wl_columnar_expr_digest_test_provider_result = digest_provider_report;
@@ -8634,7 +8639,9 @@ digest_lifecycle_trial(int map, int stop_stage, int primary, int override,
 #ifdef WL_MBEDTLS_ENABLED
     if (override >= 0 || length_error) expected = map ? ERANGE : 0;
     bool abort_needed = stop_stage == 31 || stop_stage == 32 ||
-        override == 1 || override == 2;
+        override == 1 || override == 2 || stop_stage == 36 ||
+        stop_stage == 40 || stop_stage == 41 || stop_stage == 42 ||
+        stop_stage == 43;
     if (abort_needed && abort_error && !(stop_stage && primary > 0))
         expected = EIO;
 #else
@@ -8649,8 +8656,11 @@ digest_lifecycle_trial(int map, int stop_stage, int primary, int override,
     finish(c, expected); CHECK(!sess->memory_budget_denied);
     if (stop_stage) CHECK(digest_reached == 1);
 #ifdef WL_MBEDTLS_ENABLED
-    if (stop_stage == 14) CHECK(!digest_calls[0] && !digest_calls[1]);
-    else {
+    if (stop_stage == 14 || stop_stage == 37)
+        CHECK(!digest_calls[0] && !digest_calls[1]);
+    else if (override == 0) {
+        CHECK(digest_calls[0] == 1 && !digest_calls[1] && !digest_calls[4]);
+    } else {
         CHECK(digest_calls[0] == 1 && digest_calls[1] == 1);
         CHECK(digest_calls[4] == (abort_needed ? 1u : 0u));
         if (!abort_needed) CHECK(digest_calls[3] == 1);
@@ -8670,12 +8680,20 @@ digest_lifecycle_trial(int map, int stop_stage, int primary, int override,
     digest_abort_error = digest_length_error = false;
     frame = filter_frame(sess); retry(c, 0);
     expected =
-        digest_available(WL_PLAN_EXPR_ARITH_SHA256) ? 0 : map ? ERANGE : 0;
+        (pair ? uuid_pair_available() :
+        digest_available(WL_PLAN_EXPR_ARITH_SHA256)) ? 0 : map ? ERANGE : 0;
     CHECK(compiled_dispatch(sess, frame, ops, 2, c) == expected);
     finish(c, expected);
     CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
     wl_intern_free(sess->intern); sess->intern = NULL; release(c);
     join_session_destroy(sess);
+}
+static void
+digest_lifecycle_trial(int map, int stop_stage, int primary, int override,
+    bool abort_error, bool length_error)
+{
+    digest_lifecycle_trial_kind(map, stop_stage, primary, override, abort_error,
+        length_error, false);
 }
 static void
 test_digest_lifecycle_and_stops(void)
@@ -8706,7 +8724,7 @@ test_digest_lifecycle_and_stops(void)
 }
 
 static void
-test_digest_zero_calls_and_id_independence(void)
+test_digest_zero_calls_and_id_independence_kind(bool pair)
 {
     const uint8_t ops[] = {WL_PLAN_EXPR_ARITH_MD5, WL_PLAN_EXPR_ARITH_MD5_S,
                            WL_PLAN_EXPR_ARITH_SHA1, WL_PLAN_EXPR_ARITH_SHA1_S,
@@ -8715,12 +8733,18 @@ test_digest_zero_calls_and_id_independence(void)
                            WL_PLAN_EXPR_ARITH_SHA512,
                            WL_PLAN_EXPR_ARITH_SHA512_S};
     for (int map = 0; map < 2;
-        map++) for (uint32_t k = 0; k < sizeof(ops); k++) {
+        map++) for (uint32_t k = 0; k < (pair ? 4 : sizeof(ops)); k++) {
             wl_col_session_t *sess = join_session();
             col_rel_t *source = relation(1, 0, 0, false, sess->memory_governor);
             CHECK(session_add_rel(sess, source) == 0);
-            uint8_t buf[16]; uint32_t n = compiled_const(buf, 0, 99);
-            buf[n++] = ops[k]; wl_plan_expr_buffer_t expr = {buf, n};
+            uint8_t buf[32]; uint32_t n = compiled_const(buf, 0, 99);
+            if (pair) n = compiled_const(buf, n, 99);
+            const uint8_t pair_ops[] = {WL_PLAN_EXPR_ARITH_UUID5,
+                                        WL_PLAN_EXPR_ARITH_UUID5_SS,
+                                        WL_PLAN_EXPR_ARITH_UUID5_SI,
+                                        WL_PLAN_EXPR_ARITH_UUID5_IS};
+            buf[n++] = pair ? pair_ops[k] : ops[k];
+            wl_plan_expr_buffer_t expr = {buf, n};
             wl_plan_op_t plan_ops[2] = {
                 {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
                  .delta_mode = WL_DELTA_FORCE_FULL},
@@ -8741,7 +8765,8 @@ test_digest_zero_calls_and_id_independence(void)
             wl_columnar_expr_digest_test_provider_result = NULL;
             release(c); join_session_destroy(sess);
         }
-    if (!digest_available(WL_PLAN_EXPR_ARITH_SHA256)) return;
+    if (!(pair ? uuid_pair_available() :
+        digest_available(WL_PLAN_EXPR_ARITH_SHA256))) return;
     int64_t reference = 0;
     for (int map = 0; map < 2; map++) for (int extra = 0; extra < 2; extra++) {
             wl_col_session_t *sess = join_session();
@@ -8749,7 +8774,9 @@ test_digest_zero_calls_and_id_independence(void)
             if (extra) CHECK(wl_intern_put(sess->intern, "unrelated") == 0);
             CHECK(wl_intern_put(sess->intern, "digest-body") == extra);
             uint8_t buf[32]; uint32_t n = compiled_const(buf, 0, extra);
-            buf[n++] = WL_PLAN_EXPR_ARITH_SHA256_S;
+            if (pair) n = compiled_const(buf, n, extra);
+            buf[n++] = pair ? WL_PLAN_EXPR_ARITH_UUID5_SS :
+                WL_PLAN_EXPR_ARITH_SHA256_S;
             wl_columnar_expr_context_t ctx = {.intern = sess->intern};
             wl_columnar_expr_status_t status; int64_t actual_raw;
             CHECK(wl_columnar_expr_eval_run_ctx(buf, n, NULL, 0, &actual_raw,
@@ -8783,9 +8810,15 @@ test_digest_zero_calls_and_id_independence(void)
 }
 
 static void
-test_digest_owned_cleanup(void)
+test_digest_zero_calls_and_id_independence(void)
 {
-    if (!digest_available(WL_PLAN_EXPR_ARITH_SHA256)) return;
+    test_digest_zero_calls_and_id_independence_kind(false);
+}
+static void
+test_digest_owned_cleanup_kind(bool pair)
+{
+    if (!(pair ? uuid_pair_available() :
+        digest_available(WL_PLAN_EXPR_ARITH_SHA256))) return;
     for (int map = 0; map < 2; map++) {
         wl_col_session_t *sess = join_session();
         sess->intern = string_table(sess->memory_governor, 0);
@@ -8795,7 +8828,9 @@ test_digest_owned_cleanup(void)
                 true);
         uint8_t buf[64];
         uint32_t n = compiled_const(buf, 0, 0);
-        buf[n++] = WL_PLAN_EXPR_ARITH_SHA256_S;
+        if (pair) n = compiled_const(buf, n, 0);
+        buf[n++] = pair ? WL_PLAN_EXPR_ARITH_UUID5_SS :
+            WL_PLAN_EXPR_ARITH_SHA256_S;
         wl_plan_expr_buffer_t expr = {buf, n};
         wl_plan_op_t op = {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
                            .filter_expr = expr, .project_count = 1,
@@ -8822,6 +8857,224 @@ test_digest_owned_cleanup(void)
         wl_intern_free(sess->intern); sess->intern = NULL;
         release(c); join_session_destroy(sess);
     }
+}
+
+static void
+test_digest_owned_cleanup(void)
+{
+    test_digest_owned_cleanup_kind(false);
+}
+static bool
+uuid_pair_available(void)
+{
+    uint8_t buf[32]; uint32_t n = compiled_const(buf, 0, 0);
+    n = compiled_const(buf, n, 0); buf[n++] = WL_PLAN_EXPR_ARITH_UUID5;
+    int64_t value; wl_columnar_expr_status_t status;
+    return wl_columnar_expr_eval_run_ctx(buf, n, NULL, 0, &value, NULL,
+               &status) == 0 && status == WL_COLUMNAR_EXPR_OK;
+}
+static void
+test_uuid_pair_twins(void)
+{
+    const uint8_t ops[] = {WL_PLAN_EXPR_ARITH_UUID5,
+                           WL_PLAN_EXPR_ARITH_UUID5_SS,
+                           WL_PLAN_EXPR_ARITH_UUID5_SI,
+                           WL_PLAN_EXPR_ARITH_UUID5_IS};
+    const int64_t values[] = {0, 2, 3, 4, -1, 99, INT64_MIN, INT64_MAX};
+    int expected = uuid_pair_available() ? 0 : ERANGE;
+    for (unsigned k = 0; k < sizeof(ops); k++) {
+        for (int domain = -1; domain < 3; domain++)
+            for (unsigned j = 0; j < sizeof(values)/sizeof(*values); j++) {
+                uint8_t buf[32]; uint32_t n = compiled_const(buf, 0,
+                        values[j]);
+                n = compiled_const(buf, n, values[7-j]); buf[n++] = ops[k];
+                string_caller_twins(buf, n, expected, domain, j == 0);
+            }
+        uint8_t full[1100]; uint32_t n = 0;
+        for (unsigned i = 0; i < 513; i++) {
+            full[n++] = WL_PLAN_EXPR_BOOL; full[n++] = 1;
+        }
+        full[n++] = ops[k];
+        string_caller_twins(full, n, expected, -1, true);
+        full[0] = ops[k]; string_caller_twins(full, 1, expected, -1, true);
+        if (!k) continue;
+        const uint32_t lengths[] = {0, 1, 63, 64, 65, 127, 128, 129, 513, 4097};
+        char text[4098]; uint8_t buf[8300];
+        for (unsigned j = 0; j < sizeof(lengths)/sizeof(*lengths); j++) {
+            memset(text, 'a', lengths[j]); text[lengths[j]] = 0;
+            n = k != 3 ? string_literal(buf, 0, text,
+                    (uint16_t)lengths[j]) : compiled_const(buf, 0, INT64_MIN);
+            n = k != 2 ? string_literal(buf, n, text,
+                    (uint16_t)lengths[j]) : compiled_const(buf, n, INT64_MAX);
+            buf[n++] = ops[k];
+            string_caller_twins(buf, n, expected, 2, j == 9);
+            if (j == 9 && !expected) {
+                n = compiled_const(buf, n, -1); buf[n++] = WL_PLAN_EXPR_CMP_EQ;
+                string_caller_twins(buf, n, 0, 2, true);
+            }
+        }
+        const char embedded[] = {'a', '\xff', 0, 'b'};
+        n = string_literal(buf, 0, embedded, 4);
+        n = string_literal(buf, n, embedded, 4); buf[n++] = ops[k];
+        string_caller_twins(buf, n, expected, 2, true);
+    }
+}
+/* Expected SHA1 bytes below are independently computed from explicitly framed
+ * input, not from the production pair helper. Native prefix is read with memcpy. */
+static void
+uuid_known_vector(const char *ns, const char *name, const uint8_t expected[20])
+{
+    if (!uuid_pair_available()) return;
+    uint8_t buf[128]; uint32_t n = string_literal(buf, 0, ns,
+            (uint16_t)strlen(ns));
+    n = string_literal(buf, n, name, (uint16_t)strlen(name));
+    buf[n++] = WL_PLAN_EXPR_ARITH_UUID5_SS;
+    uint8_t digest[20]; memcpy(digest, expected, 20);
+    digest[6] = (digest[6] & 15) | 0x50;
+    digest[8] = (digest[8] & 63) | 0x80;
+    int64_t value; memcpy(&value, digest, 8);
+    n = compiled_const(buf, n, value); buf[n++] = WL_PLAN_EXPR_CMP_EQ;
+    string_caller_twins(buf, n, 0, 2, true);
+    /* Above BOTH callers must emit the independently known true value. */
+    wl_col_session_t *sess = join_session();
+    sess->intern = string_table(sess->memory_governor, 0);
+    wl_columnar_expr_status_t status; bool failed; int64_t actual;
+    wl_evaluation_control_t *c = control(0);
+    CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL, 0,
+        &actual, &failed, sess, &status, c) == 0);
+    CHECK(!failed && actual == 1 && status == WL_COLUMNAR_EXPR_OK);
+    finish(c, 0); release(c); wl_intern_free(sess->intern);
+    sess->intern = NULL; join_session_destroy(sess);
+}
+static void
+test_uuid_pair_lifecycle(void)
+{
+    for (int map = 0; map < 2; map++) {
+#ifdef WL_MBEDTLS_ENABLED
+        if (!uuid_pair_available()) continue;
+        const int stages[] = {14, 37, 31, 36, 41, 43, 33, 45, 46, 3};
+        for (unsigned i = 0; i < sizeof(stages)/sizeof(*stages); i++)
+            for (int positive = 0; positive < 2; positive++)
+                digest_lifecycle_trial_kind(map, stages[i], positive, -1,
+                    false, false, true);
+        for (int positive = 0; positive < 2; positive++)
+            digest_lifecycle_trial_kind(map, 14, positive, -1, false, false, 2);
+        for (int stage = 0; stage <= 3; stage++)
+            digest_lifecycle_trial_kind(map, 0, 0, stage, false, false, true);
+        digest_lifecycle_trial_kind(map, 0, 0, -1, false, true, true);
+        digest_lifecycle_trial_kind(map, 0, 0, 2, true, false, true);
+        digest_lifecycle_trial_kind(map, 31, 0, -1, true, false, true);
+        digest_lifecycle_trial_kind(map, 31, -1, -1, true, false, true);
+        digest_lifecycle_trial_kind(map, 41, 1, -1, true, false, true);
+#else
+        for (int positive = 0; positive < 2; positive++)
+            digest_lifecycle_trial_kind(map, 3, positive, -1, false, false,
+                true);
+#endif
+    }
+}
+static void
+test_uuid_pair_native_and_fallback_vectors(void)
+{
+#ifdef WL_MBEDTLS_ENABLED
+    if (!uuid_pair_available()) return;
+    const uint8_t ops[] = {WL_PLAN_EXPR_ARITH_UUID5,
+                           WL_PLAN_EXPR_ARITH_UUID5_SS,
+                           WL_PLAN_EXPR_ARITH_UUID5_SI,
+                           WL_PLAN_EXPR_ARITH_UUID5_IS};
+    const int64_t operands[][2] = {{INT64_MIN, INT64_MAX}, {99, -1}, {0, 1}};
+    for (unsigned k = 0; k < sizeof(ops); k++)
+        for (unsigned j = 0; j < 3; j++) {
+            unsigned char input[34]; size_t length = 0;
+            for (unsigned i = 0; i < 2; i++) {
+                if (k) {
+                    input[length++] = 'I'; input[length++] = 8;
+                    for (unsigned b = 1; b < 8; b++) input[length++] = 0;
+                }
+                memcpy(input + length, &operands[j][i], 8); length += 8;
+            }
+            unsigned char digest[20]; size_t actual_length;
+            CHECK(psa_hash_compute(PSA_ALG_SHA_1, input, length, digest, 20,
+                &actual_length) == PSA_SUCCESS && actual_length == 20);
+            digest[6] = (digest[6] & 15) | 0x50;
+            digest[8] = (digest[8] & 63) | 0x80;
+            int64_t expected; memcpy(&expected, digest, 8);
+            uint8_t buf[48]; uint32_t n = compiled_const(buf, 0,
+                    operands[j][0]);
+            n = compiled_const(buf, n, operands[j][1]); buf[n++] = ops[k];
+            n = compiled_const(buf, n, expected);
+            buf[n++] = WL_PLAN_EXPR_CMP_EQ;
+            string_caller_twins(buf, n, 0, -1, true);
+            bool failed; int64_t value; wl_columnar_expr_status_t status;
+            wl_evaluation_control_t *c = control(0);
+            CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL,
+                0, &value, &failed, NULL, &status, c) == 0 && !failed &&
+                value == 1);
+            finish(c, 0); release(c);
+        }
+#endif
+}
+static void
+test_uuid_pair_mixed_vectors(void)
+{
+#ifdef WL_MBEDTLS_ENABLED
+    if (!uuid_pair_available()) return;
+    const uint8_t ops[] = {WL_PLAN_EXPR_ARITH_UUID5_SS,
+                           WL_PLAN_EXPR_ARITH_UUID5_SI,
+                           WL_PLAN_EXPR_ARITH_UUID5_IS};
+    const char text[] = "abcdefgh";
+    int64_t native; memcpy(&native, text, 8);
+    for (unsigned k = 0; k < sizeof(ops); k++) {
+        bool symbols[2] = {k != 2, k != 1};
+        unsigned char input[34]; size_t length = 0;
+        uint8_t buf[64]; uint32_t n = 0;
+        for (unsigned i = 0; i < 2; i++) {
+            input[length++] = symbols[i] ? 'S' : 'I';
+            input[length++] = 8;
+            for (unsigned b = 1; b < 8; b++) input[length++] = 0;
+            memcpy(input + length, text, 8); length += 8;
+            n = symbols[i] ? string_literal(buf, n, text, 8) :
+                compiled_const(buf, n, native);
+        }
+        unsigned char digest[20]; size_t actual_length;
+        CHECK(psa_hash_compute(PSA_ALG_SHA_1, input, length, digest, 20,
+            &actual_length) == PSA_SUCCESS && actual_length == 20);
+        digest[6] = (digest[6] & 15) | 0x50;
+        digest[8] = (digest[8] & 63) | 0x80;
+        int64_t expected; memcpy(&expected, digest, 8);
+        buf[n++] = ops[k]; n = compiled_const(buf, n, expected);
+        buf[n++] = WL_PLAN_EXPR_CMP_EQ;
+        string_caller_twins(buf, n, 0, 2, true);
+        wl_col_session_t *sess = join_session();
+        sess->intern = string_table(sess->memory_governor, 0);
+        bool failed; int64_t value; wl_columnar_expr_status_t status;
+        wl_evaluation_control_t *c = control(0);
+        CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL, 0,
+            &value, &failed, sess, &status, c) == 0 && !failed && value == 1);
+        finish(c, 0); release(c); wl_intern_free(sess->intern);
+        sess->intern = NULL; join_session_destroy(sess);
+    }
+#endif
+}
+static void
+test_uuid_pair_vectors(void)
+{
+    { const uint8_t expected[20] = {0x84, 0x85, 0x06, 0x9a, 0xb7, 0x9f, 0x21,
+                                    0xcd, 0xfc, 0x50, 0x59, 0x19, 0x82, 0x8c,
+                                    0x91, 0x0e, 0xe9, 0x80, 0x50, 0x41};
+      uuid_known_vector("ab", "c", expected); }
+    { const uint8_t expected[20] = {0x24, 0x44, 0xa9, 0xc0, 0xfd, 0x88, 0xf7,
+                                    0xea, 0x3d, 0x1b, 0xeb, 0x38, 0xe8, 0xdf,
+                                    0xc2, 0xd7, 0x62, 0xf4, 0x21, 0xe0};
+      uuid_known_vector("a", "bc", expected); }
+    { const uint8_t expected[20] = {0x8a, 0x85, 0xda, 0x92, 0xa1, 0xfa, 0x7e,
+                                    0xb2, 0xf5, 0x75, 0x10, 0x6f, 0x87, 0x2f,
+                                    0x84, 0x45, 0x33, 0x2f, 0xc1, 0x08};
+      uuid_known_vector("", "", expected); }
+    { const uint8_t expected[20] = {0x13, 0xe1, 0xe1, 0x7b, 0xed, 0xd4, 0xa4,
+                                    0x2b, 0x99, 0x80, 0x8b, 0x46, 0xf2, 0x9f,
+                                    0x48, 0x5b, 0xb4, 0x45, 0xf9, 0x07};
+      uuid_known_vector("abcdefgh", "abcdefgh", expected); }
 }
 
 int
@@ -8947,6 +9200,13 @@ main(void)
     test_digest_lifecycle_and_stops();
     test_digest_zero_calls_and_id_independence();
     test_digest_owned_cleanup();
+    test_uuid_pair_twins();
+    test_uuid_pair_vectors();
+    test_uuid_pair_native_and_fallback_vectors();
+    test_uuid_pair_mixed_vectors();
+    test_uuid_pair_lifecycle();
+    test_digest_zero_calls_and_id_independence_kind(true);
+    test_digest_owned_cleanup_kind(true);
     puts("evaluation_work: OK");
     return 0;
 }

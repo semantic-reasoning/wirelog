@@ -3968,6 +3968,11 @@ int
 wl_columnar_expr_digest_run(uint8_t op, const uint8_t *bytes, size_t length,
     int64_t *value, bool *failed, wl_evaluation_control_t *control);
 int
+wl_columnar_expr_uuid_pair_run(const uint8_t *ns, size_t ns_length,
+    bool ns_symbol, const uint8_t *name, size_t name_length, bool name_symbol,
+    bool framed, int64_t *value, bool *failed,
+    wl_evaluation_control_t *control);
+int
 wl_columnar_expr_hash_run(const uint8_t *bytes, size_t length, int64_t *value,
     bool *failed, wl_evaluation_control_t *control);
 int
