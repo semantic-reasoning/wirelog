@@ -3149,6 +3149,16 @@ test_incremental_insertion_exe = executable(
 
 test('incremental_insertion', test_incremental_insertion_exe)
 
+test_incremental_snapshot_full_exe = executable(
+  'test_incremental_snapshot_full',
+  files('test_incremental_snapshot_full.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+
+test('incremental_snapshot_full', test_incremental_snapshot_full_exe)
+
 bench_incremental_frontier_exe = executable(
   'bench_incremental_frontier',
   files('bench_incremental_frontier.c'),
