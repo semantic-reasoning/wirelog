@@ -119,6 +119,7 @@ testlib_prod_src = files(
     '../wirelog/columnar/eval_plan.c',
     '../wirelog/columnar/eval_serial.c',
     '../wirelog/columnar/eval_stack.c',
+    '../wirelog/columnar/eval_tdd_insert.c',
     '../wirelog/columnar/eval_tdd_plan.c',
     '../wirelog/columnar/eval_tdd_queue.c',
     '../wirelog/columnar/expr.c',
@@ -2012,6 +2013,7 @@ backend_src = files(
   '../wirelog/columnar/eval_delta.c',
   '../wirelog/columnar/eval_tdd_queue.c',
   '../wirelog/columnar/eval_tdd_plan.c',
+  '../wirelog/columnar/eval_tdd_insert.c',
   '../wirelog/columnar/eval_plan.c',
   '../wirelog/columnar/eval_stack.c',
   '../wirelog/columnar/eval_serial.c',
@@ -3188,6 +3190,16 @@ test_tdd_insert_run_exe = executable(
 )
 
 test('tdd_insert_run', test_tdd_insert_run_exe)
+
+test_tdd_insert_stratum_exe = executable(
+  'test_tdd_insert_stratum',
+  files('test_tdd_insert_stratum.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+
+test('tdd_insert_stratum', test_tdd_insert_stratum_exe)
 
 bench_incremental_frontier_exe = executable(
   'bench_incremental_frontier',
