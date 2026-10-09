@@ -20,9 +20,11 @@
 #endif
 
 #include <errno.h>
+#include <ctype.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 #define WL_CALLBACK_SESSION_STACK_MAX 64
@@ -1812,7 +1814,7 @@ wl_columnar_expr_controlled_string_copy(char *out, const char *source,
  * advances to that byte. It checks at most4 bytes, including any terminator. */
 static int
 wl_columnar_expr_controlled_utf8_next(const char *text, const char **out,
-    wl_evaluation_control_t *control)
+    int64_t *value, wl_evaluation_control_t *control)
 {
     int rc = wl_evaluation_control_charge(control, 12);
     if (rc) return rc;
@@ -1820,18 +1822,29 @@ wl_columnar_expr_controlled_utf8_next(const char *text, const char **out,
     unsigned length = c < 0x80 ? 1 : (c & 0xe0) == 0xc0 ? 2
         : (c & 0xf0) == 0xe0 ? 3 : (c & 0xf8) == 0xf0 ? 4 : 1;
     *out = !c ? NULL : text + 1;
+    int64_t cp = c < 0x80 ? c : length == 2 ? c & 0x1f : length == 3
+        ? c & 0x0f : length == 4 ? c & 7 : -1;
+    if (!c) cp = -1;
     rc = wl_columnar_expr_controlled_tail(control);
-    if (rc || !c) return rc;
+    if (rc) return rc;
+    if (!c) {
+        if (value) {
+            *value = cp;
+        }
+        return 0;
+    }
     for (unsigned i = 1; i < length; i++) {
         rc = wl_evaluation_control_charge(control, 4);
         if (rc) return rc;
         unsigned char byte = (unsigned char)text[i];
         *out = text + ((byte & 0xc0) == 0x80 ? i + 1 : i);
+        cp = (byte & 0xc0) == 0x80 ? (cp << 6) | (byte & 0x3f) : -1;
         wl_columnar_expr_controlled_checkpoint(control, 17, i, false);
         rc = wl_columnar_expr_controlled_tail(control);
         if (rc) return rc;
         if ((byte & 0xc0) != 0x80) break;
     }
+    if (value) *value = cp;
     return 0;
 }
 static int
@@ -1880,7 +1893,8 @@ wl_columnar_expr_controlled_string_produce(expr_stack_t *stack,
             int64_t i = 0;
             while (i < start) {
                 const char *next;
-                rc = wl_columnar_expr_controlled_utf8_next(p, &next, control);
+                rc = wl_columnar_expr_controlled_utf8_next(p, &next, NULL,
+                        control);
                 if (rc) return rc;
                 if (!next) {
                     expr_push(stack, -1); return 0;
@@ -1890,7 +1904,8 @@ wl_columnar_expr_controlled_string_produce(expr_stack_t *stack,
             a = p;
             for (i = 0; i < count; i++) {
                 const char *next;
-                rc = wl_columnar_expr_controlled_utf8_next(p, &next, control);
+                rc = wl_columnar_expr_controlled_utf8_next(p, &next, NULL,
+                        control);
                 if (rc) return rc;
                 if (!next) break;
                 p = next;
@@ -1930,6 +1945,326 @@ wl_columnar_expr_controlled_string_produce(expr_stack_t *stack,
     else expr_push(stack, result);
 done:
     free(temporary);
+    if (held && !wl_columnar_memory_rollback(&token)) abort();
+    return rc;
+}
+static int
+wl_columnar_expr_controlled_string_match(const char *hay, size_t available,
+    const char *needle, size_t length, bool *matches,
+    wl_evaluation_control_t *control)
+{
+    int rc = wl_evaluation_control_charge(control, 1);
+    if (rc) return rc;
+    *matches = false;
+    rc = wl_columnar_expr_controlled_tail(control);
+    if (rc || length > available) return rc;
+    for (size_t i = 0; i < length; i++) {
+        rc = wl_evaluation_control_charge(control, 3);
+        if (rc) return rc;
+        bool same = (unsigned char)hay[i] == (unsigned char)needle[i];
+        wl_columnar_expr_controlled_checkpoint(control, 18, i + 1, false);
+        rc = wl_columnar_expr_controlled_tail(control);
+        if (rc) return rc;
+        if (!same) return 0;
+    }
+    *matches = true;
+    return 0;
+}
+static int
+wl_columnar_expr_controlled_string_put(const char *text, int64_t *value,
+    wl_col_session_t *sess, bool *allocation, wl_evaluation_control_t *control)
+{
+    int status; bool denied;
+    int rc = wl_intern_put_controlled(sess->intern, text, value, &status,
+            &denied, control);
+    if (rc) return rc;
+    if (denied) sess->memory_budget_denied = true;
+    if (status) *allocation = true;
+    return 0;
+}
+static int
+wl_columnar_expr_controlled_number_byte(const char *text, size_t offset,
+    unsigned char *out, int stage, wl_evaluation_control_t *control)
+{
+    int rc = wl_evaluation_control_charge(control, 2);
+    if (rc) return rc;
+    unsigned char byte = (unsigned char)text[offset];
+    wl_columnar_expr_controlled_checkpoint(control, stage, offset + 1, false);
+    rc = wl_columnar_expr_controlled_tail(control);
+    if (rc) return rc;
+    *out = byte; return 0;
+}
+static int
+wl_columnar_expr_controlled_number(const char *text, int64_t *value,
+    bool *failed, wl_evaluation_control_t *control)
+{
+    if (!text) {
+        *value = 0; return 0;
+    }
+    size_t offset = 0; unsigned char byte; int rc;
+    for (;;) {
+        rc = wl_columnar_expr_controlled_number_byte(text, offset, &byte, 19,
+                control);
+        if (rc) return rc;
+        if (!isspace(byte)) break;
+        if (offset == SIZE_MAX - 1) return EOVERFLOW;
+        offset++;
+    }
+    bool negative = byte == '-';
+    if (negative || byte == '+') {
+        if (offset == SIZE_MAX - 1) return EOVERFLOW;
+        offset++;
+        rc = wl_columnar_expr_controlled_number_byte(text, offset, &byte, 20,
+                control);
+        if (rc) return rc;
+    }
+    uint64_t magnitude = 0, threshold = (uint64_t)INT64_MAX + negative;
+    bool overflow = false; uint64_t digits = 0;
+    while (byte >= '0' && byte <= '9') {
+        rc = wl_evaluation_control_charge(control, 12);
+        if (rc) return rc;
+        unsigned digit = byte - '0';
+        if (!overflow) {
+            overflow = magnitude > threshold / 10
+                || (magnitude == threshold / 10 && digit > threshold % 10);
+            if (!overflow) magnitude = magnitude * 10 + digit;
+        }
+        wl_columnar_expr_controlled_checkpoint(control, 21, ++digits, overflow);
+        rc = wl_columnar_expr_controlled_tail(control);
+        if (rc) return rc;
+        if (offset == SIZE_MAX - 1) return EOVERFLOW;
+        offset++;
+        rc = wl_columnar_expr_controlled_number_byte(text, offset, &byte, 20,
+                control);
+        if (rc) return rc;
+    }
+    if (overflow) *failed = true;
+    else *value = negative ? magnitude == (uint64_t)INT64_MAX + 1 ? INT64_MIN
+        : -(int64_t)magnitude : (int64_t)magnitude;
+    return 0;
+}
+static int
+wl_columnar_expr_controlled_builtin(expr_stack_t *stack, uint8_t op,
+    wl_col_session_t *sess, bool *failed, bool *allocation,
+    wl_evaluation_control_t *control)
+{
+    int64_t c = 0, b = 0;
+    if (op == WL_PLAN_EXPR_STR_FN_STR_REPLACE) c = expr_pop(stack);
+    if (op == WL_PLAN_EXPR_STR_FN_STR_REPLACE
+        || op == WL_PLAN_EXPR_STR_FN_CONTAINS
+        || op == WL_PLAN_EXPR_STR_FN_STR_PREFIX
+        || op == WL_PLAN_EXPR_STR_FN_STR_SUFFIX) b = expr_pop(stack);
+    int64_t a = expr_pop(stack), result = 0;
+    wl_intern_t *intern = sess ? sess->intern : NULL;
+    if (!intern) {
+        if (op == WL_PLAN_EXPR_STR_FN_TO_NUMBER) *failed = true;
+        else expr_push(stack, op == WL_PLAN_EXPR_STR_FN_TO_UPPER
+                || op == WL_PLAN_EXPR_STR_FN_TO_LOWER
+                || op == WL_PLAN_EXPR_STR_FN_TRIM
+                || op == WL_PLAN_EXPR_STR_FN_STR_REPLACE ? a : 0);
+        return 0;
+    }
+    if (op == WL_PLAN_EXPR_STR_FN_TO_STRING) {
+        int rc = wl_evaluation_control_charge(control, 64);
+        if (rc) return rc;
+        char text[24];
+        int written = snprintf(text, sizeof(text), "%" PRId64, a);
+        rc = wl_columnar_expr_controlled_tail(control);
+        if (rc) return rc;
+        if (written < 0 || (size_t)written >= sizeof(text)) {
+            expr_push(stack, -1); return 0;
+        }
+        rc = wl_columnar_expr_controlled_string_put(text, &result, sess,
+                allocation, control);
+        if (rc) return rc;
+        if (!*allocation) expr_push(stack, result);
+        return 0;
+    }
+    int rc = wl_evaluation_control_charge(control, 48);
+    if (rc) return rc;
+    const char *source = wl_intern_reverse(intern, a);
+    const char *pattern = NULL, *replacement = NULL;
+    bool binary = op == WL_PLAN_EXPR_STR_FN_CONTAINS
+        || op == WL_PLAN_EXPR_STR_FN_STR_PREFIX
+        || op == WL_PLAN_EXPR_STR_FN_STR_SUFFIX
+        || op == WL_PLAN_EXPR_STR_FN_STR_REPLACE;
+    if (binary) pattern = wl_intern_reverse(intern, b);
+    if (op == WL_PLAN_EXPR_STR_FN_STR_REPLACE)
+        replacement = wl_intern_reverse(intern, c);
+    rc = wl_columnar_expr_controlled_tail(control);
+    if (rc) return rc;
+    if (op == WL_PLAN_EXPR_STR_FN_TO_NUMBER) {
+        rc = wl_columnar_expr_controlled_number(source, &result, failed,
+                control);
+        if (rc) return rc;
+        if (!*failed) expr_push(stack, result);
+        return 0;
+    }
+    if (!source || (binary && !pattern)
+        || (op == WL_PLAN_EXPR_STR_FN_STR_REPLACE && !replacement)) {
+        expr_push(stack, op == WL_PLAN_EXPR_STR_FN_CONTAINS
+            || op == WL_PLAN_EXPR_STR_FN_STR_PREFIX
+            || op == WL_PLAN_EXPR_STR_FN_STR_SUFFIX ? 0 : -1);
+        return 0;
+    }
+    if (op == WL_PLAN_EXPR_STR_FN_STRLEN || op == WL_PLAN_EXPR_STR_FN_STR_ORD) {
+        const char *p = source;
+        if (op == WL_PLAN_EXPR_STR_FN_STR_ORD) {
+            rc = wl_columnar_expr_controlled_utf8_next(p, &p, &result, control);
+            if (rc) return rc;
+        } else {
+            for (;;) {
+                rc = wl_evaluation_control_charge(control, 1);
+                if (rc) return rc;
+                const char *next;
+                rc = wl_columnar_expr_controlled_utf8_next(p, &next, NULL,
+                        control);
+                if (rc) return rc;
+                if (!next) break;
+                if (result == INT64_MAX) return EOVERFLOW;
+                p = next; result++;
+                wl_columnar_expr_controlled_checkpoint(control, 22,
+                    (uint64_t)result, false);
+                rc = wl_columnar_expr_controlled_tail(control);
+                if (rc) return rc;
+            }
+        }
+        expr_push(stack, result); return 0;
+    }
+    size_t length, pattern_length = 0, replacement_length = 0;
+    rc = wl_columnar_expr_controlled_string_length(source, &length, control);
+    if (rc) return rc;
+    if (binary) {
+        rc = wl_columnar_expr_controlled_string_length(pattern, &pattern_length,
+                control);
+        if (rc) return rc;
+    }
+    if (op == WL_PLAN_EXPR_STR_FN_CONTAINS ||
+        op == WL_PLAN_EXPR_STR_FN_STR_PREFIX
+        || op == WL_PLAN_EXPR_STR_FN_STR_SUFFIX) {
+        bool matches = false;
+        if (op == WL_PLAN_EXPR_STR_FN_CONTAINS) {
+            for (size_t i = 0;; i++) {
+                rc = wl_columnar_expr_controlled_string_match(source + i,
+                        length - i, pattern, pattern_length, &matches, control);
+                if (rc) return rc;
+                if (matches || i == length) break;
+            }
+        } else {
+            size_t offset = op == WL_PLAN_EXPR_STR_FN_STR_SUFFIX
+                && pattern_length <= length ? length - pattern_length : 0;
+            rc = wl_columnar_expr_controlled_string_match(source + offset,
+                    length - offset, pattern, pattern_length, &matches,
+                    control);
+            if (rc) return rc;
+        }
+        expr_push(stack, matches); return 0;
+    }
+    size_t begin = 0, end = length, output_length = length, matches = 0;
+    if (op == WL_PLAN_EXPR_STR_FN_TRIM) {
+        while (begin < length) {
+            rc = wl_evaluation_control_charge(control, 3);
+            if (rc) return rc;
+            bool space = isspace((unsigned char)source[begin]);
+            wl_columnar_expr_controlled_checkpoint(control, 23, begin + 1,
+                false);
+            rc = wl_columnar_expr_controlled_tail(control);
+            if (rc) return rc;
+            if (!space) break;
+            begin++;
+        }
+        while (end > begin) {
+            rc = wl_evaluation_control_charge(control, 3);
+            if (rc) return rc;
+            bool space = isspace((unsigned char)source[end - 1]);
+            wl_columnar_expr_controlled_checkpoint(control, 24,
+                length - end + 1, false);
+            rc = wl_columnar_expr_controlled_tail(control);
+            if (rc) return rc;
+            if (!space) break;
+            end--;
+        }
+        output_length = end - begin;
+    } else if (op == WL_PLAN_EXPR_STR_FN_STR_REPLACE) {
+        if (!pattern_length) {
+            expr_push(stack, a); return 0;
+        }
+        rc = wl_columnar_expr_controlled_string_length(replacement,
+                &replacement_length, control);
+        if (rc) return rc;
+        for (size_t i = 0; i < length;) {
+            bool same;
+            rc = wl_columnar_expr_controlled_string_match(source + i,
+                    length - i,
+                    pattern, pattern_length, &same, control);
+            if (rc) return rc;
+            if (same) {
+                matches++; i += pattern_length;
+            } else i++;
+        }
+        if (!matches) {
+            expr_push(stack, a); return 0;
+        }
+        uint64_t difference, size;
+        size_t delta = replacement_length >= pattern_length
+            ? replacement_length - pattern_length : pattern_length -
+            replacement_length;
+        if (!wl_columnar_memory_size_mul(matches, delta,
+            &difference)) return EOVERFLOW;
+        if (replacement_length >= pattern_length) {
+            if (!wl_columnar_memory_size_add(length, difference,
+                &size)) return EOVERFLOW;
+        } else {
+            if (difference > length) return EOVERFLOW;
+            size = length - difference;
+        }
+        if (size >= SIZE_MAX) return EOVERFLOW;
+        output_length = (size_t)size;
+    }
+    if (output_length == SIZE_MAX) return EOVERFLOW;
+    char *buffer = NULL; wl_columnar_memory_reservation_t token; bool held;
+    rc = wl_columnar_expr_controlled_string_temporary(output_length + 1,
+            &buffer, &token, &held, sess, allocation, control);
+    if (rc || *allocation) goto done;
+    if (op == WL_PLAN_EXPR_STR_FN_STR_REPLACE) {
+        size_t output = 0;
+        for (size_t i = 0; i < length;) {
+            bool same;
+            rc = wl_columnar_expr_controlled_string_match(source + i,
+                    length - i,
+                    pattern, pattern_length, &same, control);
+            if (rc) goto done;
+            size_t count = same ? replacement_length : 1;
+            rc = wl_columnar_expr_controlled_string_copy(buffer + output,
+                    same ? replacement : source + i, count, control);
+            if (rc) goto done;
+            output += count; i += same ? pattern_length : 1;
+        }
+    } else {
+        for (size_t i = 0; i < output_length; i++) {
+            rc = wl_evaluation_control_charge(control, 4);
+            if (rc) goto done;
+            unsigned char byte = (unsigned char)source[begin + i];
+            if (op == WL_PLAN_EXPR_STR_FN_TO_UPPER && byte >= 'a' &&
+                byte <= 'z') byte -= 32;
+            if (op == WL_PLAN_EXPR_STR_FN_TO_LOWER && byte >= 'A' &&
+                byte <= 'Z') byte += 32;
+            buffer[i] = (char)byte;
+            wl_columnar_expr_controlled_checkpoint(control, 16, i + 1, false);
+            rc = wl_columnar_expr_controlled_tail(control);
+            if (rc) goto done;
+        }
+    }
+    rc = wl_evaluation_control_charge(control, 1);
+    if (rc) goto done;
+    buffer[output_length] = '\0';
+    rc = wl_columnar_expr_controlled_tail(control);
+    if (rc) goto done;
+    rc = wl_columnar_expr_controlled_string_put(buffer, &result, sess,
+            allocation, control);
+    if (!rc && !*allocation) expr_push(stack, result);
+done:
+    free(buffer);
     if (held && !wl_columnar_memory_rollback(&token)) abort();
     return rc;
 }
@@ -2146,6 +2481,12 @@ wl_columnar_expr_controlled_interpreter_decode(const uint8_t *buf,
         break;
     }
     case WL_PLAN_EXPR_STR_FN_CAT: case WL_PLAN_EXPR_STR_FN_SUBSTR:
+    case WL_PLAN_EXPR_STR_FN_STRLEN: case WL_PLAN_EXPR_STR_FN_CONTAINS:
+    case WL_PLAN_EXPR_STR_FN_STR_PREFIX: case WL_PLAN_EXPR_STR_FN_STR_SUFFIX:
+    case WL_PLAN_EXPR_STR_FN_STR_ORD: case WL_PLAN_EXPR_STR_FN_TO_UPPER:
+    case WL_PLAN_EXPR_STR_FN_TO_LOWER: case WL_PLAN_EXPR_STR_FN_STR_REPLACE:
+    case WL_PLAN_EXPR_STR_FN_TRIM: case WL_PLAN_EXPR_STR_FN_TO_STRING:
+    case WL_PLAN_EXPR_STR_FN_TO_NUMBER:
         break;
     case WL_PLAN_EXPR_CONST_INT: case WL_PLAN_EXPR_CONST_FLOAT: {
         uint8_t encoded[8];
@@ -2294,6 +2635,12 @@ wl_columnar_expr_eval_interpreter_controlled(const uint8_t *buf,
                     sess, &allocation, control);
             if (rc) return rc;
             pending = allocation;
+        } else if (!pending && in.op >= WL_PLAN_EXPR_STR_FN_STRLEN
+            && in.op <= WL_PLAN_EXPR_STR_FN_TO_NUMBER) {
+            rc = wl_columnar_expr_controlled_builtin(&stack, in.op, sess,
+                    &pending, &allocation, control);
+            if (rc) return rc;
+            pending = pending || allocation;
         } else if (!pending) {
             rc = wl_columnar_expr_controlled_numeric_step(&stack, &in, row,
                     ncols, true, &pending, sess ? sess->intern : NULL, control);
