@@ -2531,6 +2531,83 @@ col_should_activate_diff(const wl_col_session_t *sess, uint64_t affected_mask)
 }
 
 /*
+ * session_rule_reads_one_atom: Whether every operator of @rp is one a rule
+ * reading a single atom is built from -- no join of any kind.
+ */
+static bool
+session_rule_reads_one_atom(const wl_plan_relation_t *rp)
+{
+    for (uint32_t oi = 0; oi < rp->op_count; oi++) {
+        switch (rp->ops[oi].op) {
+        case WL_PLAN_OP_VARIABLE:
+        case WL_PLAN_OP_MAP:
+        case WL_PLAN_OP_FILTER:
+        case WL_PLAN_OP_CONCAT:
+        case WL_PLAN_OP_CONSOLIDATE:
+        case WL_PLAN_OP_EXCHANGE:
+            break;
+        default:
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * session_snapshot_delta_safe: Whether a snapshot may evaluate the strata in
+ * @mask over an inserted delta, on top of the rows the last evaluation left
+ * (Issue #2114).  Any of these sends the snapshot to a full evaluation:
+ *   - a stratum that retracts through negation, which must lose rows the
+ *     delta does not name;
+ *   - an aggregate, which over the delta alone replaces nothing;
+ *   - a join in a non-recursive stratum.  Without the semi-naive rewrite a
+ *     recursive stratum gets, each operand picks the delta or the full
+ *     relation on its own, so a join of two changed operands derives only
+ *     the new-by-old half and misses the rest.
+ */
+static bool
+session_snapshot_delta_safe(const wl_plan_t *plan, uint64_t mask)
+{
+    for (uint32_t si = 0; si < plan->stratum_count; si++) {
+        if (!col_affected_mask_contains(mask, si))
+            continue;
+        const wl_plan_stratum_t *sp = &plan->strata[si];
+        if (!sp->is_monotone || sp->has_aggregate)
+            return false;
+        if (sp->is_recursive)
+            continue;
+        for (uint32_t ri = 0; ri < sp->relation_count; ri++)
+            if (!session_rule_reads_one_atom(&sp->relations[ri]))
+                return false;
+    }
+    return true;
+}
+
+/*
+ * session_consolidate_stratum_heads: Sort and deduplicate every head of @sp
+ * (Issue #2114).  A non-recursive stratum that a snapshot evaluates over an
+ * inserted delta appends what its rules derive to the rows its heads already
+ * hold; a rule that reads the inserted relation through another head
+ * derives its earlier rows again.
+ */
+static int
+session_consolidate_stratum_heads(const wl_plan_stratum_t *sp,
+    wl_col_session_t *sess)
+{
+    for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+        const char *name = sp->relations[ri].name;
+        col_rel_t *head = session_find_rel(sess, name);
+        if (!head || head->nrows <= 1)
+            continue;
+        int rc = wl_columnar_eval_delta_consolidate(head, sess);
+        if (rc != 0)
+            return rc;
+        col_session_invalidate_arrangements(&sess->base, name);
+    }
+    return 0;
+}
+
+/*
  * col_detect_physical_memory: Detect total physical RAM in bytes (Issue #221).
  *
  * Uses platform-specific syscalls to query total installed RAM. Returns 0 if
@@ -4597,6 +4674,9 @@ col_session_remove(wl_session_t *session, const char *relation,
     if (remove_count != 0) {
         session_invalidate_relation_caches(sess, r->name);
         sess->pending_input_change = true;
+        /* Issue #2114: nothing records which rows went, so a later
+         * incremental insert must not narrow the evaluation to its strata. */
+        sess->pending_full_input_eval = true;
         sess->snapshot_stable_valid = false;
     }
 
@@ -5850,6 +5930,20 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
         return rc;
     }
 
+    /* Issue #2114: the incremental route below evaluates the strata the
+     * inserted relation reaches over its new rows, on top of the rows the
+     * last evaluation left.  It ignores a staged removal, it never
+     * re-evaluates the stratum that defines an inserted rule head, and it is
+     * not correct for every stratum (session_snapshot_delta_safe), so any of
+     * those makes this a full re-evaluation. */
+    if (sess->has_evaluated && !sess->pending_full_input_eval
+        && sess->last_inserted_relation != NULL
+        && (sess->last_removed_relation != NULL
+        || session_plan_has_rule_head(plan, sess->last_inserted_relation)
+        || !session_snapshot_delta_safe(plan, col_compute_affected_strata(
+            session, sess->last_inserted_relation))))
+        sess->pending_full_input_eval = true;
+
     if (sess->has_evaluated
         && (sess->pending_full_input_eval
         || (sess->pending_input_change
@@ -5864,6 +5958,7 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
      * On the first snapshot (has_evaluated == false), always evaluate all strata
      * to establish the baseline. */
     uint64_t affected_mask = UINT64_MAX;
+    bool incremental_route = false;
     if (!sess->pending_full_input_eval && sess->last_inserted_relation != NULL
         && sess->has_evaluated) {
         affected_mask = col_compute_affected_strata(
@@ -5903,6 +5998,7 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
             }
         }
         sess->delta_seeded = true;
+        incremental_route = true;
     }
 
     /* Issue #264: Activate differential operators when session toggle is on
@@ -6223,6 +6319,12 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
                 col_rel_destroy(pre_saved[ri]);
             free((void *)pre_saved);
         }
+
+        /* Issue #2114: on the incremental route a non-recursive stratum's
+         * rows landed on top of the ones its heads held. */
+        if (rc == 0 && incremental_route
+            && !plan->strata[si].is_recursive)
+            rc = session_consolidate_stratum_heads(&plan->strata[si], sess);
 
         if (rc != 0) {
             if (wl_columnar_session_has_retained_cleanup(sess)) {

@@ -4319,7 +4319,10 @@ test_snapshot_preseed_failure(int fault)
     wl_plan_op_t op = { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" };
     wl_plan_relation_t relation = { .name = "output", .ops = &op,
                                     .op_count = 1 };
-    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1 };
+    /* Issue #2114: a monotone stratum without an aggregate, which is what
+     * lets the snapshot evaluate the insert over its delta. */
+    wl_plan_stratum_t stratum = { .is_monotone = true, .relations = &relation,
+                                  .relation_count = 1 };
     const char *edb[] = { "prefix", "input" };
     wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
                        .edb_relations = edb, .edb_count = 2 };

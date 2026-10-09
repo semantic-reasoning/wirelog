@@ -611,6 +611,11 @@ typedef struct {
  * @is_monotone:    True if all rules in this stratum only derive facts
  *                  (no deletion via negation/antijoin/subtraction).
  *                  Used for DRedL-style deletion phase optimization.
+ * @has_aggregate:  Issue #2114.  True if a relation of this stratum
+ *                  aggregates (a REDUCE operator, or a recursive aggregate
+ *                  spec), recorded before the plan rewrites can hide the
+ *                  operator.  A snapshot evaluates such a stratum in full
+ *                  rather than over an inserted delta.
  * @relations:      Array of per-relation plans (caller-owned).
  * @relation_count: Number of relations in this stratum.
  * @rule_refs:      Issue #1019.  @relation_count entries, owned, parallel to
@@ -651,6 +656,7 @@ typedef struct {
     uint32_t stratum_id;
     bool is_recursive;
     bool is_monotone;
+    bool has_aggregate;
     const wl_plan_relation_t *relations;
     uint32_t relation_count;
     wl_plan_refset_t *rule_refs;

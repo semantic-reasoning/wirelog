@@ -854,13 +854,18 @@ test_guard_true_then_false_transition(void)
     rc = wl_session_snapshot(sess, noop_cb, NULL);
     ASSERT(rc == 0, "initial snapshot failed");
 
+    /* Issue #2114: `filtered` negates `other`, so a snapshot evaluates an
+     * insert into either relation in full; a step with a delta callback is
+     * where the incremental update turns differential operators on. */
+    wl_session_set_delta_cb(sess, noop_delta_cb, NULL);
+
     /* Partial insert: other -> affects only filtered stratum */
     int64_t val1[1] = { 2 };
     rc = col_session_insert_incremental(sess, "other", val1, 1, 1);
     ASSERT(rc == 0, "partial insert failed");
 
-    rc = wl_session_snapshot(sess, noop_cb, NULL);
-    ASSERT(rc == 0, "snapshot after partial insert failed");
+    rc = wl_session_step(sess);
+    ASSERT(rc == 0, "step after partial insert failed");
 
     bool was_active = cs->diff_operators_active;
     printf("(after_partial=%d) ", (int)was_active);
@@ -870,8 +875,8 @@ test_guard_true_then_false_transition(void)
     rc = col_session_insert_incremental(sess, "base", val2, 1, 1);
     ASSERT(rc == 0, "full-mask insert failed");
 
-    rc = wl_session_snapshot(sess, noop_cb, NULL);
-    ASSERT(rc == 0, "snapshot after full-mask insert failed");
+    rc = wl_session_step(sess);
+    ASSERT(rc == 0, "step after full-mask insert failed");
 
     printf("(after_full=%d) ", (int)cs->diff_operators_active);
 

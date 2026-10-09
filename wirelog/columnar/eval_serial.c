@@ -220,9 +220,9 @@ wl_columnar_eval_serial_canonicalize_aggregates(const wl_plan_stratum_t *sp,
      *
      * The correction that matters to a reader of the old comment here:
      * wl_plan_stratum_t.is_monotone is no longer "hardcoded false and never
-     * computed".  wl_plan_from_program() computes it (negation only), and it
-     * still has no consumer, so a true value is not yet a signal anything may
-     * act on.
+     * computed".  wl_plan_from_program() computes it (negation only).  Its
+     * one consumer is the snapshot's incremental-route gate (#2114), which
+     * reads a false value as "evaluate in full"; nothing here acts on it.
      */
     for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
         const wl_plan_relation_t *rp = &sp->relations[ri];

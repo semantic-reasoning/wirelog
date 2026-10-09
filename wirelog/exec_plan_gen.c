@@ -4277,6 +4277,7 @@ wl_plan_from_program_with_snapshot(struct wirelog_program *prog,
          * exist.  Seeded false so every early-exit path leaves the
          * conservative value. */
         dst->is_monotone = false;
+        dst->has_aggregate = false;
 
         /* Count unique relations in this stratum */
         /* Build per-relation plan from relation_irs[] */
@@ -4466,11 +4467,11 @@ wl_plan_from_program_with_snapshot(struct wirelog_program *prog,
          * clearance for that.  #1021's remaining work is that analysis plus
          * moving domination into consolidation across all three call sites.
          *
-         * Nothing reads this today: stratum_is_monotone[] is written in
-         * session.c and has no consumer, so the "deletion phase skip
-         * optimization" its comment describes does not exist.  Computing it
-         * therefore cannot change any answer; it is the prerequisite the
-         * issue asks for, made observable so the next step can be tested. */
+         * A snapshot reads it (#2114): an inserted delta reaching a stratum
+         * that retracts through negation is evaluated in full.  The session
+         * copy, stratum_is_monotone[], still has no consumer, so the
+         * "deletion phase skip optimization" its comment describes does not
+         * exist. */
         bool has_negation = false;
         for (uint32_t v = 0; v < unique_count && !has_negation; v++) {
             for (uint32_t o = 0; o < rels[v].op_count; o++) {
@@ -4481,6 +4482,20 @@ wl_plan_from_program_with_snapshot(struct wirelog_program *prog,
             }
         }
         dst->is_monotone = !has_negation;
+
+        /* Issue #2114: scanned here before the rewrites hide a REDUCE. */
+        for (uint32_t v = 0; v < unique_count && !dst->has_aggregate; v++) {
+            if (rels[v].recursive_agg.has_spec) {
+                dst->has_aggregate = true;
+                break;
+            }
+            for (uint32_t o = 0; o < rels[v].op_count; o++) {
+                if (rels[v].ops[o].op == WL_PLAN_OP_REDUCE) {
+                    dst->has_aggregate = true;
+                    break;
+                }
+            }
+        }
 
         WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_DEBUG,
             "stratum %u is_monotone=%d (negation=%d, relations=%u); "
