@@ -41,11 +41,12 @@ wl_columnar_expr_digest_report(int stage, psa_status_t actual, size_t *length)
 static int
 wl_columnar_expr_digest_segments(uint8_t op, const uint8_t *const *parts,
     const size_t *lengths, size_t part_count, bool uuid, char *uuid_text,
+    uint8_t *full,
     int64_t *value, bool *failed, wl_evaluation_control_t *control)
 {
 #ifndef WL_MBEDTLS_ENABLED
     (void)op; (void)parts; (void)lengths; (void)part_count; (void)uuid;
-    (void)uuid_text;
+    (void)uuid_text; (void)full;
     (void)value; (void)control;
     *failed = true; return 0;
 #else
@@ -154,6 +155,15 @@ cleanup:
     if (semantic) {
         *failed = true; return 0;
     }
+    if (full) {
+        rc = wl_evaluation_control_charge(control, 32);
+        if (rc) return rc;
+        memcpy(full, digest, 32);
+        wl_columnar_expr_digest_checkpoint(control, 66, 32, false);
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return rc;
+        *failed = false; return 0;
+    }
     if (uuid) {
         rc = wl_evaluation_control_charge(control, 8);
         if (rc) return rc;
@@ -211,7 +221,15 @@ wl_columnar_expr_digest_run(uint8_t op, const uint8_t *bytes, size_t length,
     int64_t *value, bool *failed, wl_evaluation_control_t *control)
 {
     return wl_columnar_expr_digest_segments(op, &bytes, &length, 1, false, NULL,
+               NULL,
                value, failed, control);
+}
+int
+wl_columnar_expr_digest_sha256_full(const uint8_t *bytes, size_t length,
+    uint8_t digest[32], bool *failed, wl_evaluation_control_t *control)
+{
+    return wl_columnar_expr_digest_segments(WL_PLAN_EXPR_ARITH_SHA256,
+               &bytes, &length, 1, false, NULL, digest, NULL, failed, control);
 }
 int
 wl_columnar_expr_uuid_pair_run(const uint8_t *ns, size_t ns_length,
@@ -245,7 +263,7 @@ wl_columnar_expr_uuid_pair_run(const uint8_t *ns, size_t ns_length,
         if (rc) return rc;
     }
     return wl_columnar_expr_digest_segments(WL_PLAN_EXPR_ARITH_UUID5, parts,
-               lengths, count, true, NULL, value, failed, control);
+               lengths, count, true, NULL, NULL, value, failed, control);
 }
 
 int
@@ -260,7 +278,7 @@ wl_columnar_expr_uuid_rfc_run(const uint8_t namespace_uuid[16],
     rc = wl_evaluation_control_charge(control, 0);
     if (rc) return rc;
     return wl_columnar_expr_digest_segments(WL_PLAN_EXPR_ARITH_UUID5, parts,
-               lengths, 2, true, text, NULL, failed, control);
+               lengths, 2, true, text, NULL, NULL, failed, control);
 }
 
 #ifdef WL_SESSION_TEST_HOOKS

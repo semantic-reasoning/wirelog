@@ -3965,6 +3965,15 @@ wl_columnar_expr_compile_controlled(const uint8_t *buf, uint32_t size,
     wl_columnar_expr_compiled_t **out, bool *supported,
     wl_evaluation_control_t *control);
 int
+wl_columnar_expr_digest_sha256_full(const uint8_t *bytes, size_t length,
+    uint8_t digest[32], bool *failed, wl_evaluation_control_t *control);
+int
+wl_columnar_expr_hmac_eligible(wl_evaluation_control_t *control);
+int
+wl_columnar_expr_hmac_run(const uint8_t *message, size_t message_length,
+    const uint8_t *key, size_t key_length, int64_t *value, bool *failed,
+    wl_evaluation_control_t *control);
+int
 wl_columnar_expr_digest_run(uint8_t op, const uint8_t *bytes, size_t length,
     int64_t *value, bool *failed, wl_evaluation_control_t *control);
 int

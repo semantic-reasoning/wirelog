@@ -2069,6 +2069,60 @@ wl_columnar_expr_controlled_digest(expr_stack_t *stack, uint8_t op,
 #endif
 }
 static int
+wl_columnar_expr_controlled_hmac(expr_stack_t *stack, uint8_t op,
+    wl_col_session_t *sess, bool *failed, wl_evaluation_control_t *control)
+{
+    int rc = wl_columnar_expr_hmac_eligible(control);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 32);
+    if (rc) return rc;
+    int64_t key = expr_pop(stack), message = expr_pop(stack);
+#ifndef WL_MBEDTLS_ENABLED
+    (void)op; (void)sess; (void)key; (void)message; *failed = true; return 0;
+#else
+    rc = wl_columnar_expr_controlled_tail(control);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 32);
+    if (rc) return rc;
+    uint8_t native[2][8]; const uint8_t *bytes[2]; size_t lengths[2];
+    const int64_t values[2] = {message, key};
+    const bool requested[2] = {
+        op == WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS ||
+        op == WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI,
+        op == WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS ||
+        op == WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS
+    };
+    rc = wl_columnar_expr_controlled_tail(control);
+    if (rc) return rc;
+    for (unsigned i = 0; i < 2; i++) {
+        rc = wl_evaluation_control_charge(control, 16);
+        if (rc) return rc;
+        const char *text = requested[i] && sess && sess->intern
+            ? wl_intern_reverse(sess->intern, values[i]) : NULL;
+        rc = wl_columnar_expr_controlled_tail(control);
+        if (rc) return rc;
+        if (text) {
+            rc = wl_columnar_expr_controlled_string_length(text, &lengths[i],
+                    control);
+            if (rc) return rc;
+            bytes[i] = (const uint8_t *)text;
+        } else {
+            rc = wl_evaluation_control_charge(control, 8);
+            if (rc) return rc;
+            memcpy(native[i], &values[i], 8);
+            bytes[i] = native[i]; lengths[i] = 8;
+            rc = wl_columnar_expr_controlled_tail(control);
+            if (rc) return rc;
+        }
+    }
+    int64_t value;
+    rc = wl_columnar_expr_hmac_run(bytes[0], lengths[0], bytes[1], lengths[1],
+            &value, failed, control);
+    if (!rc && !*failed) expr_push(stack, value);
+    return rc;
+#endif
+}
+static int
 wl_columnar_expr_controlled_uuid_pair(expr_stack_t *stack, uint8_t op,
     wl_col_session_t *sess, bool *failed, wl_evaluation_control_t *control)
 {
@@ -2731,6 +2785,14 @@ wl_columnar_expr_controlled_interpreter_decode(const uint8_t *buf,
         in->iarg = length; in->larg = *pos; *pos += length;
         break;
     }
+    case WL_PLAN_EXPR_ARITH_HMAC_SHA256: case WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS:
+    case WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI: case
+        WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS:
+        if (classify) {
+            rc = wl_columnar_expr_hmac_eligible(control);
+            if (rc) return rc;
+        }
+        break;
     case WL_PLAN_EXPR_ARITH_UUID4:
     case WL_PLAN_EXPR_STR_FN_UUID5_RFC:
     case WL_PLAN_EXPR_ARITH_UUID5: case WL_PLAN_EXPR_ARITH_UUID5_SS:
@@ -2897,6 +2959,13 @@ wl_columnar_expr_eval_interpreter_controlled(const uint8_t *buf,
                     sess, &allocation, control);
             if (rc) return rc;
             pending = allocation;
+        } else if (!pending && (in.op == WL_PLAN_EXPR_ARITH_HMAC_SHA256
+            || in.op == WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS
+            || in.op == WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI
+            || in.op == WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS)) {
+            rc = wl_columnar_expr_controlled_hmac(&stack, in.op, sess, &pending,
+                    control);
+            if (rc) return rc;
         } else if (!pending && in.op == WL_PLAN_EXPR_ARITH_UUID4) {
             int64_t value;
             rc = wl_columnar_expr_uuid4_run(&value, &pending, control);

@@ -210,6 +210,7 @@ int main(void) {
   unsigned char output[64] = {0};
   size_t output_len = 0;
   psa_hash_operation_t hash_op = PSA_HASH_OPERATION_INIT;
+  psa_mac_operation_t mac_op = PSA_MAC_OPERATION_INIT;
   psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
   psa_key_id_t key = 0;
   psa_status_t status = psa_crypto_init();
@@ -234,6 +235,10 @@ int main(void) {
   if (status != PSA_SUCCESS) return 1;
   (void)psa_mac_compute(key, PSA_ALG_HMAC(PSA_ALG_SHA_256), input,
                         sizeof(input), output, sizeof(output), &output_len);
+  (void)psa_mac_sign_setup(&mac_op, key, PSA_ALG_HMAC(PSA_ALG_SHA_256));
+  (void)psa_mac_update(&mac_op, input, sizeof(input));
+  (void)psa_mac_sign_finish(&mac_op, output, sizeof(output), &output_len);
+  (void)psa_mac_abort(&mac_op);
   (void)psa_destroy_key(key);
   (void)psa_generate_random(output, 16);
   return 0;
@@ -382,6 +387,59 @@ if mbedtls_option == 'auto' or mbedtls_option == 'enabled'
   if mbedtls_psa_provider != ''
     message('  mbedTLS PSA provider: ' + mbedtls_psa_provider + ' ' + mbedtls_psa_provider_version)
     add_project_arguments('-DWL_MBEDTLS_ENABLED=1', language: 'c')
+    _hmac_software_probe = '''
+#include <psa/crypto.h>
+#include <mbedtls/version.h>
+#if MBEDTLS_VERSION_MAJOR == 2 && MBEDTLS_VERSION_MINOR == 28
+#ifdef MBEDTLS_CONFIG_FILE
+#include MBEDTLS_CONFIG_FILE
+#else
+#include <mbedtls/config.h>
+#endif
+#include <mbedtls/config_psa.h>
+#elif MBEDTLS_VERSION_MAJOR == 3 && MBEDTLS_VERSION_MINOR == 6
+#include <mbedtls/build_info.h>
+#elif MBEDTLS_VERSION_MAJOR == 4 && MBEDTLS_VERSION_MINOR == 2
+#include <mbedtls/build_info.h>
+#include <tf-psa-crypto/build_info.h>
+#if TF_PSA_CRYPTO_VERSION_MAJOR != 1 || TF_PSA_CRYPTO_VERSION_MINOR != 2
+#error unaudited TF PSA Crypto software family
+#endif
+#else
+#error unaudited Mbed TLS software family
+#endif
+#if !defined(MBEDTLS_PSA_CRYPTO_C) || !defined(PSA_WANT_KEY_TYPE_HMAC) || !defined(PSA_WANT_ALG_HMAC) || !defined(PSA_WANT_ALG_SHA_256) || !defined(MBEDTLS_PSA_BUILTIN_ALG_HMAC) || !defined(MBEDTLS_PSA_BUILTIN_ALG_SHA_256) || !defined(MBEDTLS_MD_C) || !defined(MBEDTLS_SHA256_C)
+#error required local built-in HMAC and SHA256 configuration absent
+#endif
+#if defined(MBEDTLS_PSA_ACCEL_ALG_HMAC) || defined(MBEDTLS_PSA_ACCEL_ALG_SHA_256) || defined(MBEDTLS_PSA_ACCEL_KEY_TYPE_HMAC) || defined(MBEDTLS_SHA256_ALT) || defined(MBEDTLS_SHA256_PROCESS_ALT) || defined(PSA_CRYPTO_DRIVER_TEST) || defined(MBEDTLS_TEST_LIBTESTDRIVER1) || defined(MBEDTLS_PSA_CRYPTO_PLATFORM_FILE) || defined(MBEDTLS_PSA_CRYPTO_STRUCT_FILE)
+#error custom HMAC or SHA256 implementation is not audited
+#endif
+int main(void) { return 0; }
+'''
+    _hmac_software_supported = cc.compiles(_hmac_software_probe,
+      dependencies: mbedtls_dep, name: 'controlled HMAC audited software profile')
+    message('  controlled HMAC software profile: ' + _hmac_software_supported.to_string())
+    if _hmac_software_supported
+      add_project_arguments('-DWL_COLUMNAR_HMAC_SOFTWARE_PROFILE_SUPPORTED=1', language: 'c')
+      if cc.links('''
+#include <mbedtls/version.h>
+#ifndef MBEDTLS_VERSION_C
+#error public version getter disabled
+#endif
+int main(void) { return mbedtls_version_get_number() == MBEDTLS_VERSION_NUMBER; }
+''', dependencies: mbedtls_dep, name: 'selected dependency Mbed TLS public version getter')
+        add_project_arguments('-DWL_COLUMNAR_HMAC_MBED_VERSION_GETTER=1', language: 'c')
+      endif
+      if cc.links('''
+#include <tf-psa-crypto/version.h>
+#ifndef TF_PSA_CRYPTO_VERSION
+#error public version getter disabled
+#endif
+int main(void) { return tf_psa_crypto_version_get_number() == TF_PSA_CRYPTO_VERSION_NUMBER; }
+''', dependencies: mbedtls_dep, name: 'selected dependency TF PSA public version getter')
+        add_project_arguments('-DWL_COLUMNAR_HMAC_TF_VERSION_GETTER=1', language: 'c')
+      endif
+    endif
   elif mbedtls_option == 'auto'
     warning('mbedTLS auto-detection did not find a linkable PSA Crypto provider; crypto built-ins will remain disabled. Candidates: ' + '; '.join(mbedtls_psa_rejections))
   else

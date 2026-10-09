@@ -9926,9 +9926,746 @@ test_uuid4_owned_cleanup(void)
     }
 #endif
 }
+extern bool (*wl_columnar_expr_hmac_test_eligible)(void);
+extern void (*wl_columnar_expr_hmac_test_checkpoint)(wl_evaluation_control_t *,
+    int, uint64_t, bool);
+extern int64_t (*wl_columnar_expr_hmac_test_provider_result)(int, int64_t,
+    size_t *);
+extern void (*wl_columnar_expr_hmac_test_normalized_key)(const uint8_t *,
+    size_t);
+extern void (*wl_columnar_expr_hmac_test_mac)(const uint8_t *, size_t);
+static uint32_t hmac_calls[7], hmac_reached;
+static int hmac_stage, hmac_primary, hmac_override = -1;
+static bool hmac_abort_error, hmac_destroy_error, hmac_length_error;
+static uint8_t hmac_expected_key[64], hmac_expected_mac[32];
+static size_t hmac_expected_key_length;
+static uint32_t hmac_key_seen, hmac_mac_seen;
+static int64_t
+hmac_provider_report(int stage, int64_t actual, size_t *length)
+{
+    CHECK(stage >= 0 && stage < 7); hmac_calls[stage]++;
+#ifdef WL_MBEDTLS_ENABLED
+    CHECK(actual == PSA_SUCCESS);
+    if (stage == 4 && hmac_length_error) {
+        CHECK(length && *length == 32); (*length)--;
+    }
+    /* Provider FIRST, including actual abort/destroy FIRST. Report overrides
+    * prove protocol/precedence, never genuine failed-release reclamation. */
+    if (stage == hmac_override || (stage == 5 && hmac_abort_error) ||
+        (stage == 6 &&
+        hmac_destroy_error)) return PSA_ERROR_INSUFFICIENT_MEMORY;
+#else
+    (void)length;
+#endif
+    return actual;
+}
+static void
+hmac_stop(wl_evaluation_control_t *c, int stage, uint64_t progress, bool failed)
+{
+    (void)failed;
+    uint64_t threshold = stage == 14 ? 300 : stage == 32 ||
+        stage == 75 ? 320 : stage == 3 ? 3 : 0;
+    if (stage != hmac_stage || progress < threshold) return;
+    wl_columnar_expr_hmac_test_checkpoint = NULL;
+    wl_columnar_expr_digest_test_checkpoint = NULL;
+    wl_columnar_expr_hash_test_controlled_checkpoint = NULL;
+    wl_columnar_expr_test_controlled_checkpoint = NULL;
+    hmac_reached++;
+    if (hmac_primary > 0) CHECK(wl_evaluation_control_charge(c,
+            UINT64_MAX) == EOVERFLOW);
+    else if (hmac_primary < 0) CHECK(wl_evaluation_control_charge(c,
+            UINT64_MAX) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    else wl_evaluation_control_request_cancel(c);
+}
+static void
+hmac_hooks_clear(void)
+{
+    wl_columnar_expr_hmac_test_checkpoint = NULL;
+    wl_columnar_expr_hmac_test_provider_result = NULL;
+    wl_columnar_expr_hmac_test_eligible = NULL;
+    wl_columnar_expr_hmac_test_normalized_key = NULL;
+    wl_columnar_expr_hmac_test_mac = NULL;
+    wl_columnar_expr_digest_test_checkpoint = NULL;
+    wl_columnar_expr_digest_test_provider_result = NULL;
+    wl_columnar_expr_hash_test_controlled_checkpoint = NULL;
+    wl_columnar_expr_test_controlled_checkpoint = NULL;
+    hmac_override = -1;
+    hmac_abort_error = hmac_destroy_error = hmac_length_error = false;
+}
+static void
+hmac_normalized_observe(const uint8_t *key, size_t length)
+{
+    CHECK(length == hmac_expected_key_length && length <= 64 &&
+        memcmp(key, hmac_expected_key, length) == 0); hmac_key_seen++;
+}
+static void
+hmac_mac_observe(const uint8_t *mac, size_t length)
+{
+    CHECK(length == 32 && memcmp(mac, hmac_expected_mac, 32) == 0);
+    hmac_mac_seen++;
+}
+static void
+test_hmac_actual_twins(void)
+{
+#if defined(WL_MBEDTLS_ENABLED) && \
+    !defined(WL_COLUMNAR_HMAC_SOFTWARE_PROFILE_SUPPORTED)
+    return; /* Genuine optional configured-false is tested separately. */
+#endif
+#ifdef WL_MBEDTLS_ENABLED
+    wl_evaluation_control_t *qualification = control(0);
+    CHECK(wl_columnar_expr_hmac_eligible(qualification) == 0);
+    finish(qualification, 0); release(qualification);
+    printf("HMAC qualification: audited software predicate=true; ");
+#ifdef WL_COLUMNAR_HMAC_MBED_VERSION_GETTER
+    printf("Mbed getter=linked; ");
+#else
+    printf("Mbed getter=unavailable; ");
+#endif
+#ifdef WL_COLUMNAR_HMAC_TF_VERSION_GETTER
+    printf("TF getter=linked\n");
+#else
+    printf("TF getter=unavailable\n");
+#endif
+    int expected = 0;
+#else
+    int expected = ERANGE;
+#endif
+    const uint8_t ops[] = {WL_PLAN_EXPR_ARITH_HMAC_SHA256,
+                           WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS,
+                           WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI,
+                           WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS};
+    const int64_t values[] = {0, 2, 3, 4, -1, 99, INT64_MIN, INT64_MAX};
+    for (unsigned k = 0; k < sizeof(ops); k++) {
+        for (int domain = -1; domain < 3; domain++)
+            for (unsigned j = 0; j < sizeof(values)/sizeof(*values); j++) {
+                uint8_t buf[32]; uint32_t n = compiled_const(buf, 0, values[j]);
+                n = compiled_const(buf, n, values[7-j]); buf[n++] = ops[k];
+                string_caller_twins(buf, n, expected, domain, j == 0);
+            }
+        uint8_t full[1100]; uint32_t n = 0;
+        for (unsigned j = 0; j < 513; j++) {
+            full[n++] = WL_PLAN_EXPR_BOOL; full[n++] = 1;
+        }
+        full[n++] = ops[k]; string_caller_twins(full, n, expected, -1, true);
+        full[0] = ops[k]; string_caller_twins(full, 1, expected, -1, true);
+        const uint32_t keys[] = {0, 1, 8, 31, 32, 63, 64, 65, 127, 128, 129,
+                                 513, 4097};
+        const uint32_t messages[] = {0, 1, 63, 64, 65, 513, 4097};
+        char key[4098], message[4098]; uint8_t buf[8300];
+        for (unsigned which = 0; which < 2; which++) {
+            unsigned count = which ? sizeof(messages)/
+                sizeof(*messages) : sizeof(keys)/sizeof(*keys);
+            for (unsigned j = 0; j < count; j++) {
+                uint32_t kl = which ? 65 : keys[j],
+                    ml = which ? messages[j] : 513;
+                memset(key, 'k', kl); key[kl] = 0; memset(message, 'm', ml);
+                message[ml] = 0;
+                n = k == 1 || k == 2 ? string_literal(buf, 0, message,
+                        (uint16_t)ml) : compiled_const(buf, 0, INT64_MIN);
+                n = k == 1 || k == 3 ? string_literal(buf, n, key,
+                        (uint16_t)kl) : compiled_const(buf, n, INT64_MAX);
+                buf[n++] = ops[k];
+                string_caller_twins(buf, n, expected, 2, j == count-1);
+                if (j == count-1 && !expected) {
+                    n = compiled_const(buf, n, -1);
+                    buf[n++] = WL_PLAN_EXPR_CMP_EQ;
+                    string_caller_twins(buf, n, 0, 2, true); /* computed before rejection */
+                }
+            }
+        }
+        const char bytes[] = {'a', '\xff', 0, 'b'};
+        n = string_literal(buf, 0, bytes, 4);
+        n = string_literal(buf, n, bytes, 4); buf[n++] = ops[k];
+        string_caller_twins(buf, n, expected, 2, true);
+    }
+}
+static void
+test_hmac_id_independence(void)
+{
+#if defined(WL_MBEDTLS_ENABLED) && \
+    defined(WL_COLUMNAR_HMAC_SOFTWARE_PROFILE_SUPPORTED)
+    const uint8_t tags[] = {WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS,
+                            WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI,
+                            WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS};
+    for (unsigned tag = 0; tag < sizeof(tags); tag++) for (int map = 0; map < 2;
+            map++){
+            int64_t expected_value = 0; uint32_t expected_rows = 0;
+            for (uint32_t seeds = 0; seeds < 8; seeds += 7) {
+                wl_col_session_t *sess = join_session();
+                sess->intern = string_table(sess->memory_governor, seeds);
+                int64_t message = wl_intern_put(sess->intern, "same message");
+                int64_t key = wl_intern_put(sess->intern, "same key");
+                CHECK(message == seeds && key == seeds + 1);
+                col_rel_t *source = relation(1, 1, 1, false,
+                        sess->memory_governor);
+                CHECK(session_add_rel(sess, source) == 0);
+                uint8_t buf[32]; uint32_t n = compiled_const(buf, 0,
+                        tag == 2 ? INT64_MIN : message);
+                n = compiled_const(buf, n, tag == 1 ? INT64_MAX : key);
+                buf[n++] = tags[tag]; wl_plan_expr_buffer_t expr = {buf, n};
+                wl_plan_op_t ops[2] = {
+                    {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+                     .delta_mode = WL_DELTA_FORCE_FULL},
+                    {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+                     .filter_expr = expr, .project_count = 1,
+                     .map_exprs = &expr,
+                     .map_expr_count = 1}
+                };
+                wl_columnar_expr_context_t ctx = {.intern = sess->intern};
+                int64_t raw; wl_columnar_expr_status_t status;
+                CHECK(wl_columnar_expr_eval_run_ctx(buf, n, NULL, 0, &raw, &ctx,
+                    &status) == 0 && status == WL_COLUMNAR_EXPR_OK);
+                wl_columnar_eval_stack_cleanup_frame_t *frame =
+                    filter_frame(sess);
+                wl_evaluation_control_t *c = control(0);
+                CHECK(compiled_dispatch(sess, frame, ops, 2, c) == 0);
+                finish(c, 0);
+                col_rel_t *out = join_output(frame);
+                CHECK(out->nrows == (uint32_t)(map || raw != 0));
+                if (map) CHECK(out->columns[0][0] == raw);
+                if (!seeds) {
+                    expected_value = raw; expected_rows = out->nrows;
+                }else CHECK(raw == expected_value &&
+                        out->nrows == expected_rows);
+                source_unpinned(source, source);
+                CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+                wl_intern_free(sess->intern); sess->intern = NULL; release(c);
+                join_session_destroy(sess);
+            }
+        }
+#endif
+}
+static void
+test_hmac_full_bytes(void)
+{
+#if defined(WL_MBEDTLS_ENABLED) && \
+    defined(WL_COLUMNAR_HMAC_SOFTWARE_PROFILE_SUPPORTED)
+    /* RFC2104 data construction and independent Python hashlib/hmac vectors
+     * are fixed fixture oracles, separate from actual one-shot PSA raw twins. */
+    const char *messages[] = {"Hi There",
+                              "Test Using Larger Than Block-Size Key - Hash Key First"};
+    const size_t lengths[] = {20, 131}; const uint8_t fill[] = {0x0b, 0xaa};
+    static const uint8_t expected_mac[2][32] = {
+        {0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53, 0x5c, 0xa8, 0xaf, 0xce,
+         0xaf, 0x0b, 0xf1, 0x2b, 0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7,
+         0x26, 0xe9, 0x37, 0x6c, 0x2e, 0x32, 0xcf, 0xf7},
+        {0x60, 0xe4, 0x31, 0x59, 0x1e, 0xe0, 0xb6, 0x7f, 0x0d, 0x8a, 0x26, 0xaa,
+         0xcb, 0xf5, 0xb7, 0x7f, 0x8e, 0x0b, 0xc6, 0x21, 0x37, 0x28, 0xc5, 0x14,
+         0x05, 0x46, 0x04, 0x0f, 0x0e, 0xe3, 0x7f, 0x54}
+    };
+    for (unsigned j = 0; j < 2; j++) {
+        char key[132]; memset(key, fill[j], lengths[j]); key[lengths[j]] = 0;
+        hmac_expected_key_length = lengths[j];
+        if (j) {
+            size_t out;
+            CHECK(psa_hash_compute(PSA_ALG_SHA_256, (const uint8_t *)key,
+                lengths[j], hmac_expected_key, 32,
+                &out) == PSA_SUCCESS && out == 32);
+            hmac_expected_key_length = 32;
+        } else memcpy(hmac_expected_key, key, lengths[j]);
+        memcpy(hmac_expected_mac, expected_mac[j], 32);
+        hmac_key_seen = hmac_mac_seen = 0;
+        wl_columnar_expr_hmac_test_normalized_key = hmac_normalized_observe;
+        wl_columnar_expr_hmac_test_mac = hmac_mac_observe;
+        uint8_t buf[256];
+        uint32_t n = string_literal(buf, 0, messages[j],
+                (uint16_t)strlen(messages[j]));
+        n = string_literal(buf, n, key, (uint16_t)lengths[j]);
+        buf[n++] = WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS;
+        string_caller_twins(buf, n, 0, 2, true);
+        CHECK(hmac_key_seen && hmac_mac_seen); hmac_hooks_clear();
+    }
+#endif
+}
+static void
+hmac_lifecycle_trial(int map, int stop, int primary, int override,
+    bool abort_error, bool destroy_error, bool length_error)
+{
+    wl_col_session_t *sess = join_session();
+    sess->intern = string_table(sess->memory_governor, 0);
+    char body[601]; memset(body, 'm', 600); body[600] = 0;
+    CHECK(wl_intern_put(sess->intern, body) == 0);
+    memset(body, 'k', 600); CHECK(wl_intern_put(sess->intern, body) == 1);
+    col_rel_t *source = relation(1, 1, 1, false, sess->memory_governor);
+    CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+    uint64_t before = string_reserved(sess->memory_governor);
+    uint8_t buf[32]; uint32_t n = compiled_const(buf, 0, 0);
+    n = compiled_const(buf, n, 1); buf[n++] = WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS;
+    wl_plan_expr_buffer_t expr = {buf, n}; wl_plan_op_t ops[2] = {
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+         .delta_mode = WL_DELTA_FORCE_FULL},
+        {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER, .filter_expr = expr,
+         .project_count = 1, .map_exprs = &expr, .map_expr_count = 1}
+    };
+    wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+    wl_evaluation_control_t *c = control(primary < 0 ? UINT64_MAX-1 : 0);
+    memset(hmac_calls, 0, sizeof(hmac_calls));
+    memset(digest_calls, 0, sizeof(digest_calls)); hmac_reached = 0;
+    hmac_stage = stop; hmac_primary = primary; hmac_override = override;
+    hmac_abort_error = abort_error; hmac_destroy_error = destroy_error;
+    hmac_length_error = length_error;
+    wl_columnar_expr_hmac_test_provider_result = hmac_provider_report;
+    digest_override_stage = -1;
+    digest_abort_error = digest_length_error = false;
+    wl_columnar_expr_digest_test_provider_result = digest_provider_report;
+    if (stop == 14 ||
+        stop == 3) wl_columnar_expr_test_controlled_checkpoint = hmac_stop;
+    else if (stop ==
+        28) wl_columnar_expr_hash_test_controlled_checkpoint = hmac_stop;
+    else if (stop == 31 || stop == 32 || stop == 33 ||
+        stop == 66) wl_columnar_expr_digest_test_checkpoint = hmac_stop;
+    else if (stop) wl_columnar_expr_hmac_test_checkpoint = hmac_stop;
+    int expected = 0;
+#ifdef WL_MBEDTLS_ENABLED
+    if (override >= 0 || length_error) expected = map ? ERANGE : 0;
+#else
+    expected = map ? ERANGE : 0;
+#endif
+    if (stop) expected = primary > 0 ? EOVERFLOW : primary <
+            0 ? WL_EVALUATION_CONTROL_WORK_LIMIT :
+            WL_EVALUATION_CONTROL_CANCELLED;
+#ifdef WL_MBEDTLS_ENABLED
+    bool mac_abort = stop == 74 || stop == 75 || override == 2 || override == 3;
+    bool imported = !(stop == 14 || stop == 70 || stop == 71 || stop == 79 ||
+        stop == 80 || stop == 72 || stop == 31 || stop == 32 || stop == 33 ||
+        stop == 66 || override == 0);
+    if ((abort_error && mac_abort) || (destroy_error && imported)) {
+        if (!(stop && primary > 0)) expected = EIO;
+    }
+#endif
+    int rc = compiled_dispatch(sess, frame, ops, 2, c);
+    if (rc != expected) fprintf(stderr,
+            "hmac map%d stop%d primary%d override%d abort%d destroy%d rc%d expected%d\n",
+            map, stop, primary, override, abort_error, destroy_error, rc,
+            expected);
+    CHECK(rc == expected); finish(c, expected);
+    CHECK(!sess->memory_budget_denied);
+    if (stop) CHECK(hmac_reached == 1);
+#ifdef WL_MBEDTLS_ENABLED
+    CHECK(hmac_calls[6] == (uint32_t)imported &&
+        hmac_calls[5] == (uint32_t)mac_abort);
+    if (stop == 14 || stop == 70) CHECK(!digest_calls[0] && !hmac_calls[0]);
+    if (stop == 31 || stop == 32) CHECK(digest_calls[4] == 1 && !hmac_calls[0]);
+    if (stop == 73) CHECK(hmac_calls[1] == 1 && !hmac_calls[2] &&
+            hmac_calls[6] == 1);
+    if (stop == 76 || stop == 77 || stop == 78 || stop == 28 || stop == 3 ||
+        override == 4 || length_error)
+        CHECK(hmac_calls[4] == 1 && !hmac_calls[5] && hmac_calls[6] == 1);
+#else
+    for (unsigned j = 0; j < 7; j++) CHECK(!hmac_calls[j]);
+    for (unsigned j = 0; j < 5; j++) CHECK(!digest_calls[j]);
+#endif
+    if (expected) lazy_unchanged(source);
+    source_unpinned(source, source);
+#ifdef WL_MBEDTLS_ENABLED
+    psa_key_id_t other_key = 0; uint8_t other_before[32], other_after[32];
+    const uint8_t other_bytes[8] = {'o', 't', 'h', 'e', 'r', 'k', 'e', 'y'};
+    if (destroy_error) {
+        psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+        psa_set_key_type(&attributes, PSA_KEY_TYPE_HMAC);
+        psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_MESSAGE);
+        psa_set_key_algorithm(&attributes, PSA_ALG_HMAC(PSA_ALG_SHA_256));
+        CHECK(psa_import_key(&attributes, other_bytes, 8,
+            &other_key) == PSA_SUCCESS);
+        psa_reset_key_attributes(&attributes);
+        size_t length;
+        CHECK(psa_mac_compute(other_key, PSA_ALG_HMAC(PSA_ALG_SHA_256),
+            other_bytes, 8,
+            other_before, 32, &length) == PSA_SUCCESS && length == 32);
+    }
+#endif
+    CHECK(wl_intern_count(sess->intern) == 2);
+    for (unsigned j = 0; j < 600; j++) {
+        CHECK(wl_intern_reverse(sess->intern,
+            0)[j] == 'm' && wl_intern_reverse(sess->intern, 1)[j] == 'k');
+    }
+    CHECK(!wl_intern_reverse(sess->intern,
+        0)[600] && !wl_intern_reverse(sess->intern, 1)[600]);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 &&
+        string_reserved(sess->memory_governor) == before);
+    hmac_hooks_clear(); frame = filter_frame(sess); retry(c, 0);
+#ifdef WL_MBEDTLS_ENABLED
+    expected = 0;
+#else
+    expected = map ? ERANGE : 0;
+#endif
+    CHECK(compiled_dispatch(sess, frame, ops, 2, c) == expected);
+    finish(c, expected);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 &&
+        string_reserved(sess->memory_governor) == before);
+#ifdef WL_MBEDTLS_ENABLED
+    if (destroy_error) {
+        size_t length;
+        CHECK(psa_mac_compute(other_key, PSA_ALG_HMAC(PSA_ALG_SHA_256),
+            other_bytes, 8,
+            other_after, 32,
+            &length) == PSA_SUCCESS && length == 32 && memcmp(other_before,
+            other_after, 32) == 0);
+        CHECK(psa_destroy_key(other_key) == PSA_SUCCESS);
+    }
+#endif
+    wl_intern_free(sess->intern); sess->intern = NULL; release(c);
+    join_session_destroy(sess);
+}
+static void
+test_hmac_lifecycle(void)
+{
+#if defined(WL_MBEDTLS_ENABLED) && \
+    !defined(WL_COLUMNAR_HMAC_SOFTWARE_PROFILE_SUPPORTED)
+    return; /* Genuine optional configured-false is tested separately. */
+#endif
+    for (int map = 0; map < 2; map++) {
+#ifdef WL_MBEDTLS_ENABLED
+        const int stages[] = {14, 70, 31, 32, 33, 66, 71, 79, 80, 72, 73, 74,
+                              75, 76, 77, 28, 78, 3};
+        for (unsigned j = 0; j < sizeof(stages)/sizeof(*stages);
+            j++) for (int positive = 0;
+                positive < 2; positive++)
+                hmac_lifecycle_trial(map, stages[j], positive, -1, false, false,
+                    false);
+        for (int stage = 0; stage <= 4;
+            stage++) hmac_lifecycle_trial(map, 0, 0, stage, false, false,
+                false);
+        hmac_lifecycle_trial(map, 0, 0, -1, false, false, true);
+        hmac_lifecycle_trial(map, 0, 0, 3, true, true, false);
+        for (int primary = -1; primary < 2; primary++) {
+            hmac_lifecycle_trial(map, 74, primary, -1, true, true, false);
+            hmac_lifecycle_trial(map, 73, primary, -1, false, true, false);
+        }
+        hmac_lifecycle_trial(map, 0, 0, -1, false, true, false);
+#else
+        for (int positive = 0; positive < 2;
+            positive++) hmac_lifecycle_trial(map, 3, positive, -1, false, false,
+                false);
+        hmac_lifecycle_trial(map, 0, 0, -1, false, false, false);
+#endif
+    }
+}
+static bool hmac_refuse(void) {
+    return false;
+}
+static unsigned hmac_scan_visits;
+static void
+hmac_refusal_scan(wl_evaluation_control_t *c, int stage, uint64_t progress,
+    bool failed)
+{
+    (void)c; (void)progress; (void)failed;
+    if (stage == 14) hmac_scan_visits++;
+}
+static void
+test_hmac_zero_and_early_refusal(void)
+{
+#if defined(WL_MBEDTLS_ENABLED) && \
+    !defined(WL_COLUMNAR_HMAC_SOFTWARE_PROFILE_SUPPORTED)
+    return; /* Non-hook configured-false matrix is separate. */
+#endif
+    const uint8_t tags[] = {WL_PLAN_EXPR_ARITH_HMAC_SHA256,
+                            WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS,
+                            WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI,
+                            WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS};
+    for (int map = 0; map < 2; map++) for (unsigned k = 0; k < sizeof(tags);
+            k++) for (int refuse = 0; refuse < 2; refuse++) for (int rows = 0;
+                    rows <= refuse; rows++){
+#ifndef WL_MBEDTLS_ENABLED
+                    if (refuse) continue; /* disabled pending semantics, not optional-profile ENOTSUP */
+#endif
+                    wl_col_session_t *sess = join_session();
+                    sess->intern = string_table(sess->memory_governor, 1);
+                    col_rel_t *source = relation(1, rows, rows, false,
+                            sess->memory_governor);
+                    CHECK(session_add_rel(sess, source) == 0);
+                    make_lazy(source);
+                    uint64_t before = string_reserved(sess->memory_governor);
+                    uint8_t buf[128];
+                    uint32_t n = string_literal(buf, 0, "must-not-intern", 15);
+                    n = compiled_const(buf, n, 0); buf[n++] = tags[k];
+                    wl_plan_expr_buffer_t expr = {buf, n};
+                    wl_plan_op_t ops[2] = {
+                        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+                         .delta_mode = WL_DELTA_FORCE_FULL},
+                        {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+                         .filter_expr = expr, .project_count = 1,
+                         .map_exprs = &expr, .map_expr_count = 1}
+                    };
+                    memset(hmac_calls, 0, sizeof(hmac_calls));
+                    memset(digest_calls, 0, sizeof(digest_calls));
+                    wl_columnar_expr_hmac_test_provider_result =
+                        hmac_provider_report;
+                    wl_columnar_expr_digest_test_provider_result =
+                        digest_provider_report;
+                    if (refuse) wl_columnar_expr_hmac_test_eligible =
+                            hmac_refuse;
+                    hmac_scan_visits = 0;
+                    wl_columnar_expr_test_controlled_checkpoint =
+                        hmac_refusal_scan;
+                    wl_columnar_eval_stack_cleanup_frame_t *frame =
+                        filter_frame(sess);
+                    wl_evaluation_control_t *c = control(0);
+                    int expected = refuse ? ENOTSUP : 0;
+                    CHECK(compiled_dispatch(sess, frame, ops, 2,
+                        c) == expected); finish(c, expected);
+                    for (unsigned j = 0; j < 7; j++) CHECK(!hmac_calls[j]);
+                    for (unsigned j = 0; j < 5; j++) CHECK(!digest_calls[j]);
+                    CHECK(!hmac_scan_visits);
+                    CHECK(wl_intern_count(sess->intern) == 1 &&
+                        strcmp(wl_intern_reverse(sess->intern, 0),
+                        "seed-0") == 0);
+                    if (refuse) lazy_unchanged(source);
+                    source_unpinned(source, source);
+                    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 &&
+                        string_reserved(sess->memory_governor) == before);
+                    hmac_hooks_clear(); wl_intern_free(sess->intern);
+                    sess->intern = NULL; release(c); join_session_destroy(sess);
+                }
+}
+static void
+test_hmac_owned_cleanup(void)
+{
+#if defined(WL_MBEDTLS_ENABLED) && \
+    defined(WL_COLUMNAR_HMAC_SOFTWARE_PROFILE_SUPPORTED)
+    for (int map = 0; map < 2; map++) {
+        wl_col_session_t *sess = join_session();
+        sess->intern = string_table(sess->memory_governor, 0);
+        CHECK(wl_intern_put(sess->intern, "message") == 0);
+        CHECK(wl_intern_put(sess->intern, "key") == 1);
+        col_rel_t *source = relation(2, 2, 2, false, sess->memory_governor);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = join_frame(sess, source,
+                true);
+        uint8_t buf[64]; uint32_t n = compiled_const(buf, 0, 0);
+        n = compiled_const(buf, n, 1);
+        buf[n++] = WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS;
+        if (!map) {
+            buf[n++] = WL_PLAN_EXPR_BOOL; buf[n++] = 1;
+        }
+        wl_plan_expr_buffer_t expr = {buf, n};
+        wl_plan_op_t op = {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+                           .filter_expr = expr, .project_count = 1,
+                           .map_exprs = &expr, .map_expr_count = 1};
+        wl_evaluation_control_t *c = control(0);
+        sess->base.evaluation_control = c;
+        memset(hmac_calls, 0, sizeof(hmac_calls));
+        wl_columnar_expr_hmac_test_provider_result = hmac_provider_report;
+        filter_reached = 0;
+        if (map) wl_columnar_ops_map_test_controlled_checkpoint =
+                map_owned_cleanup_fault;
+        else wl_columnar_filter_test_controlled_checkpoint =
+                filter_cleanup_fault;
+        CHECK((map ? col_op_map(&op,
+            wl_columnar_eval_stack_cleanup_stack(frame),
+            sess) : wl_columnar_filter_op(&op,
+            wl_columnar_eval_stack_cleanup_stack(frame), sess)) == EBUSY);
+        sess->base.evaluation_control = NULL; finish(c, EBUSY);
+        CHECK(filter_reached == 1 && hmac_calls[1] >= 1 &&
+            hmac_calls[1] == hmac_calls[6] && !hmac_calls[5] &&
+            wl_intern_count(sess->intern) == 2);
+        hmac_hooks_clear();
+        CHECK(wl_columnar_eval_stack_cleanup_result(frame)->rel);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == EBUSY &&
+            !frame && sess->cleanup_pending);
+        CHECK(col_rel_source_reader_release(&join_retained_reader) == 0);
+        CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0);
+        wl_intern_free(sess->intern); sess->intern = NULL; release(c);
+        join_session_destroy(sess);
+    }
+#endif
+}
+
+static void
+hmac_required_startup(void)
+{
+    const char *required = getenv("WIRELOG_REQUIRE_HMAC_QUALIFICATION");
+    if (!required || !*required) return;
+    if (strcmp(required, "1") != 0) {
+        fputs("invalid WIRELOG_REQUIRE_HMAC_QUALIFICATION: expected 1\n",
+            stderr);
+        exit(1);
+    }
+#if defined(WL_MBEDTLS_ENABLED) && \
+    defined(WL_COLUMNAR_HMAC_SOFTWARE_PROFILE_SUPPORTED)
+    wl_evaluation_control_t *c = control(0);
+    CHECK(wl_columnar_expr_hmac_eligible(c) == 0); finish(c, 0); release(c);
+#else
+    fputs(
+        "required HMAC qualification unavailable: enabled audited software profile required\n",
+        stderr);
+    exit(1);
+#endif
+}
+static void
+test_hmac_configured_false_raw(void)
+{
+#if defined(WL_MBEDTLS_ENABLED) && \
+    !defined(WL_COLUMNAR_HMAC_SOFTWARE_PROFILE_SUPPORTED)
+    const uint8_t tags[] = {WL_PLAN_EXPR_ARITH_HMAC_SHA256,
+                            WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS,
+                            WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI,
+                            WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS};
+    CHECK(psa_crypto_init() == PSA_SUCCESS);
+    const size_t lengths[] = {65, 513};
+    for (unsigned j = 0; j < sizeof(lengths)/sizeof(*lengths); j++) {
+        char message[514], key[514]; memset(message, 'm', lengths[j]);
+        memset(key, 'k', lengths[j]); message[lengths[j]] = key[lengths[j]] = 0;
+        wl_intern_t *table = string_table(NULL, 0);
+        CHECK(wl_intern_put(table, message) == 0 && wl_intern_put(table,
+            key) == 1);
+        for (unsigned k = 0; k < sizeof(tags); k++) for (int missing = 0;
+                missing < 2; missing++){
+                int64_t a = missing ? INT64_MIN : 0,
+                    b = missing ? INT64_MAX : 1;
+                const uint8_t *m = (const uint8_t *)&a,
+                    *secret = (const uint8_t *)&b;
+                size_t ml = 8, kl = 8;
+                if (!missing && (k == 1 || k == 2)) {
+                    m = (const uint8_t *)message; ml = lengths[j];
+                }
+                if (!missing && (k == 1 || k == 3)) {
+                    secret = (const uint8_t *)key; kl = lengths[j];
+                }
+                psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+                psa_set_key_type(&attributes, PSA_KEY_TYPE_HMAC);
+                psa_set_key_usage_flags(&attributes,
+                    PSA_KEY_USAGE_SIGN_MESSAGE);
+                psa_set_key_algorithm(&attributes,
+                    PSA_ALG_HMAC(PSA_ALG_SHA_256));
+                psa_key_id_t id;
+                CHECK(psa_import_key(&attributes, secret, kl,
+                    &id) == PSA_SUCCESS);
+                psa_reset_key_attributes(&attributes); uint8_t mac[32];
+                size_t out;
+                CHECK(psa_mac_compute(id, PSA_ALG_HMAC(PSA_ALG_SHA_256), m, ml,
+                    mac, 32, &out) == PSA_SUCCESS && out == 32);
+                CHECK(psa_destroy_key(id) == PSA_SUCCESS);
+                uint8_t buf[32]; uint32_t n = compiled_const(buf, 0, a);
+                n = compiled_const(buf, n, b); buf[n++] = tags[k];
+                wl_columnar_expr_context_t ctx = {.intern = table};
+                int64_t value; wl_columnar_expr_status_t status;
+                CHECK(wl_columnar_expr_eval_run_ctx(buf, n, NULL, 0, &value,
+                    &ctx,
+                    &status) == 0 && status == WL_COLUMNAR_EXPR_OK &&
+                    value == (int64_t)XXH3_64bits(mac, 32));
+            }
+        wl_intern_free(table);
+    }
+    /* Independent known FULL32 vector, separate from one-shot raw parity. */
+    const uint8_t expected[32] = {0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38,
+                                  0x53,
+                                  0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b, 0xf1,
+                                  0x2b, 0x88, 0x1d, 0xc2, 0x00,
+                                  0xc9, 0x83, 0x3d, 0xa7, 0x26, 0xe9, 0x37,
+                                  0x6c, 0x2e, 0x32, 0xcf, 0xf7};
+    char key[21]; memset(key, 11, 20); key[20] = 0;
+    wl_intern_t *table = string_table(NULL, 0);
+    CHECK(wl_intern_put(table, "Hi There") == 0 && wl_intern_put(table,
+        key) == 1);
+    uint8_t buf[32]; uint32_t n = compiled_const(buf, 0, 0);
+    n = compiled_const(buf, n, 1); buf[n++] = WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS;
+    wl_columnar_expr_context_t ctx = {.intern = table};
+    int64_t value; wl_columnar_expr_status_t status;
+    CHECK(wl_columnar_expr_eval_run_ctx(buf, n, NULL, 0, &value, &ctx,
+        &status) == 0 && status == WL_COLUMNAR_EXPR_OK &&
+        value == (int64_t)XXH3_64bits(expected, 32));
+    wl_intern_free(table);
+#endif
+}
+static void
+test_hmac_configured_false_refusal(void)
+{
+#if defined(WL_MBEDTLS_ENABLED) && \
+    !defined(WL_COLUMNAR_HMAC_SOFTWARE_PROFILE_SUPPORTED)
+    const uint8_t tags[] = {WL_PLAN_EXPR_ARITH_HMAC_SHA256,
+                            WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS,
+                            WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI,
+                            WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS};
+    for (unsigned k = 0; k < sizeof(tags); k++) for (int map = 0; map < 2;
+            map++)
+            for (int rows = 0; rows < 2; rows++) {
+                wl_col_session_t *sess = join_session();
+                sess->intern = string_table(sess->memory_governor, 1);
+                char body[514]; memset(body, 'm', 513); body[513] = 0;
+                CHECK(wl_intern_put(sess->intern, body) == 1);
+                memset(body, 'k', 513);
+                CHECK(wl_intern_put(sess->intern, body) == 2);
+                col_rel_t *source = relation(1, rows, rows, false,
+                        sess->memory_governor);
+                CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+                uint64_t before = string_reserved(sess->memory_governor);
+                uint8_t buf[128];
+                uint32_t n = string_literal(buf, 0, "must-not-intern", 15);
+                n = compiled_const(buf, n, 1); n = compiled_const(buf, n, 2);
+                buf[n++] = tags[k];
+                wl_plan_expr_buffer_t expr = {buf, n}; wl_plan_op_t ops[2] = {
+                    {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+                     .delta_mode = WL_DELTA_FORCE_FULL},
+                    {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+                     .filter_expr = expr,
+                     .project_count = 1, .map_exprs = &expr,
+                     .map_expr_count = 1}
+                };
+                hmac_hooks_clear(); hmac_scan_visits = 0;
+                memset(hmac_calls, 0, sizeof(hmac_calls));
+                memset(digest_calls, 0, sizeof(digest_calls));
+                wl_columnar_expr_hmac_test_provider_result =
+                    hmac_provider_report;
+                wl_columnar_expr_digest_test_provider_result =
+                    digest_provider_report;
+                wl_columnar_expr_test_controlled_checkpoint = hmac_refusal_scan;
+                CHECK(!wl_columnar_expr_hmac_test_eligible);
+                wl_evaluation_control_t *c = control(0);
+                wl_columnar_eval_stack_cleanup_frame_t *frame =
+                    filter_frame(sess);
+                CHECK(compiled_dispatch(sess, frame, ops, 2, c) == ENOTSUP);
+                finish(c, ENOTSUP);
+                CHECK(!hmac_scan_visits && !sess->memory_budget_denied);
+                for (unsigned j = 0; j < 7; j++) CHECK(!hmac_calls[j]);
+                for (unsigned j = 0; j < 5; j++) CHECK(!digest_calls[j]);
+                CHECK(wl_intern_count(sess->intern) == 3 &&
+                    !strcmp(wl_intern_reverse(sess->intern, 0), "seed-0"));
+                CHECK(strlen(wl_intern_reverse(sess->intern,
+                    1)) == 513 && strlen(wl_intern_reverse(sess->intern,
+                    2)) == 513);
+                lazy_unchanged(source); source_unpinned(source, source);
+                CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 &&
+                    string_reserved(sess->memory_governor) == before);
+                hmac_hooks_clear(); wl_intern_free(sess->intern);
+                sess->intern = NULL;
+                release(c); join_session_destroy(sess);
+            }
+    /* Preflight refusal leaves actual owned input; a real retained reader makes
+     * cleanup EBUSY, then release/drain restores ownership, without fake output. */
+    for (int map = 0; map < 2; map++) {
+        wl_col_session_t *sess = join_session();
+        col_rel_t *source = relation(1, 1, 1, false, sess->memory_governor);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = join_frame(sess, source,
+                true);
+        CHECK(col_rel_source_reader_acquire(source,
+            &join_retained_reader) == 0);
+        uint8_t tag = WL_PLAN_EXPR_ARITH_HMAC_SHA256;
+        wl_plan_expr_buffer_t expr = {&tag, 1};
+        wl_plan_op_t op = {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+                           .filter_expr = expr, .project_count = 1,
+                           .map_exprs = &expr, .map_expr_count = 1};
+        wl_evaluation_control_t *c = control(0);
+        sess->base.evaluation_control = c;
+        CHECK((map ? col_op_map(&op,
+            wl_columnar_eval_stack_cleanup_stack(frame), sess)
+            : wl_columnar_filter_op(&op,
+            wl_columnar_eval_stack_cleanup_stack(frame), sess)) == ENOTSUP);
+        sess->base.evaluation_control = NULL; finish(c, ENOTSUP);
+        CHECK(wl_columnar_eval_stack_cleanup_stack(frame)->items[0].rel ==
+            source);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == EBUSY &&
+            !frame && sess->cleanup_pending);
+        CHECK(col_rel_source_reader_release(&join_retained_reader) == 0);
+        CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0);
+        release(c); join_session_destroy(sess);
+    }
+#endif
+}
+
 int
 main(void)
 {
+    hmac_required_startup();
     wl_columnar_relation_test_work_checkpoint = checkpoint;
     wl_columnar_memory_governor_test_work_checkpoint = checkpoint;
     test_counted_gates();
@@ -10064,6 +10801,22 @@ main(void)
     test_uuid4_actual_bytes_and_work();
     test_uuid4_reached_stops_and_status();
     test_uuid4_owned_cleanup();
+    test_hmac_configured_false_raw();
+    test_hmac_configured_false_refusal();
+    test_hmac_actual_twins();
+    test_hmac_id_independence();
+    test_hmac_full_bytes();
+    test_hmac_lifecycle();
+    test_hmac_zero_and_early_refusal();
+    test_hmac_owned_cleanup();
+#if defined(WL_MBEDTLS_ENABLED) && \
+    defined(WL_COLUMNAR_HMAC_SOFTWARE_PROFILE_SUPPORTED)
+    puts(
+        "HMAC qualification complete: audited software predicate=true; all four domains, long-key, multipart and cleanup assertions passed");
+#elif defined(WL_MBEDTLS_ENABLED)
+    puts(
+        "HMAC configured-false proof complete: raw HMAC succeeded; controlled refusal before effects passed");
+#endif
     test_digest_owned_cleanup_kind(2);
     test_digest_zero_calls_and_id_independence_kind(true);
     test_digest_owned_cleanup_kind(true);
