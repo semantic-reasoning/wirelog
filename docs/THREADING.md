@@ -228,7 +228,8 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **170**).
+match the script's count (currently **308**). The earlier audit sections
+retain their historical per-section counts.
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -729,7 +730,7 @@ These operations are excluded from the production library.
 
 The complete source audit now contains **228 atomic call sites**.
 
-### 5.22 `wirelog/columnar/eval_tdd_insert.c` — insertion round counter (4 rows)
+### 5.21a `wirelog/columnar/eval_tdd_insert.c` — insertion round counter (4 rows)
 
 Issue #2122: the tasks of one insertion round take the round's runs from a
 shared counter and stop early once any task has failed.  Apart from shared
@@ -748,6 +749,103 @@ coordinator's reads.
 | `eval_tdd_insert.c:wl_columnar_eval_tdd_insert_stratum` | `round.stop` | `atomic_store_explicit` | release | Stop the tasks already submitted when a later submit fails, before the coordinator drains the queue |
 
 The complete source audit now contains **232 atomic call sites**.
+
+### 5.22 Accumulated controlled primitives and CONSOLIDATE (80 rows)
+
+The 228 existing audit rows are preserved. Committed base c58b54b1 has 299
+actual sites, with 71 missing from those sections. The borrowed CONSOLIDATE
+unit adds nine actual sites: three embedded frame EMPTY stores, three reset
+EMPTY stores, one retirement state load and two exclusive reuse loads. This
+section reconciles all 80 omissions; the current combined inventory is 312 (including the four insertion-round sites).
+
+The existing cleanup_begin second load moves from its old source ordinal #2
+to #5 because three new stores occur before it. That load was itself an
+undocumented base site; it is listed at its actual current anchor below.
+Defaults for atomic_load are sequential consistency. Explicit relaxed token
+checks under exclusive ownership do not imply an acquire publication edge.
+
+| Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `eval_stack.c:wl_columnar_eval_stack_cleanup_begin` | `reservation.state` | `atomic_load` | `seq_cst (default)` | Local frame construction selects actual reservation rollback/release; no frame publication occurs before initialized embedded identities. |
+| `eval_stack.c:wl_columnar_eval_stack_cleanup_begin#2` | `frame->consolidate.sequence.metadata_admission.state` | `atomic_store_explicit` | `relaxed` | Relaxed EMPTY initialization of an exclusively constructed original embedded consolidation reservation; actual identity is set before frame publication. |
+| `eval_stack.c:wl_columnar_eval_stack_cleanup_begin#3` | `frame->consolidate.sequence.workspace.admission.state` | `atomic_store_explicit` | `relaxed` | Relaxed EMPTY initialization of an exclusively constructed original embedded consolidation reservation; actual identity is set before frame publication. |
+| `eval_stack.c:wl_columnar_eval_stack_cleanup_begin#4` | `frame->consolidate.merge_admission.state` | `atomic_store_explicit` | `relaxed` | Relaxed EMPTY initialization of an exclusively constructed original embedded consolidation reservation; actual identity is set before frame publication. |
+| `eval_stack.c:wl_columnar_eval_stack_cleanup_begin#5` | `reservation.state` | `atomic_load` | `seq_cst (default)` | Local frame construction selects actual reservation rollback/release; no frame publication occurs before initialized embedded identities. |
+| `expr.c:wl_columnar_expr_compiled_free_controlled` | `token.state` | `atomic_load_explicit` | `acquire` | Observe published reservation state after physical compiled storage retirement to choose mandatory release or rollback. |
+| `filter.c:wl_columnar_filter_op_controlled` | `scratch.state` | `atomic_load_explicit` | `acquire` | Select mandatory scratch release/rollback after physical scratch disposal under the caller ownership. |
+| `mem_ledger.c:wl_columnar_mem_ledger_apply_exclusive` | `ledger->subsys_bytes[subsystem]` | `atomic_load_explicit` | `relaxed` | Prepared exclusive ledger request updates accounting/peak under external exclusivity; relaxed counters provide no payload publication edge. |
+| `mem_ledger.c:wl_columnar_mem_ledger_apply_exclusive#2` | `ledger->subsys_bytes[subsystem]` | `atomic_store_explicit` | `relaxed` | Prepared exclusive ledger request updates accounting/peak under external exclusivity; relaxed counters provide no payload publication edge. |
+| `mem_ledger.c:wl_columnar_mem_ledger_apply_exclusive#3` | `ledger->subsys_peak[subsystem]` | `atomic_load_explicit` | `relaxed` | Prepared exclusive ledger request updates accounting/peak under external exclusivity; relaxed counters provide no payload publication edge. |
+| `mem_ledger.c:wl_columnar_mem_ledger_apply_exclusive#4` | `ledger->subsys_peak[subsystem]` | `atomic_store_explicit` | `relaxed` | Prepared exclusive ledger request updates accounting/peak under external exclusivity; relaxed counters provide no payload publication edge. |
+| `mem_ledger.c:wl_columnar_mem_ledger_apply_exclusive#5` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Prepared exclusive ledger request updates accounting/peak under external exclusivity; relaxed counters provide no payload publication edge. |
+| `mem_ledger.c:wl_columnar_mem_ledger_apply_exclusive#6` | `ledger->current_bytes` | `atomic_store_explicit` | `relaxed` | Prepared exclusive ledger request updates accounting/peak under external exclusivity; relaxed counters provide no payload publication edge. |
+| `mem_ledger.c:wl_columnar_mem_ledger_apply_exclusive#7` | `ledger->peak_bytes` | `atomic_load_explicit` | `relaxed` | Prepared exclusive ledger request updates accounting/peak under external exclusivity; relaxed counters provide no payload publication edge. |
+| `mem_ledger.c:wl_columnar_mem_ledger_apply_exclusive#8` | `ledger->peak_bytes` | `atomic_store_explicit` | `relaxed` | Prepared exclusive ledger request updates accounting/peak under external exclusivity; relaxed counters provide no payload publication edge. |
+| `mem_ledger.c:wl_columnar_mem_ledger_apply_exclusive#9` | `ledger->subsys_bytes[subsystem]` | `atomic_store_explicit` | `relaxed` | Prepared exclusive ledger request updates accounting/peak under external exclusivity; relaxed counters provide no payload publication edge. |
+| `mem_ledger.c:wl_columnar_mem_ledger_apply_exclusive#10` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Prepared exclusive ledger request updates accounting/peak under external exclusivity; relaxed counters provide no payload publication edge. |
+| `mem_ledger.c:wl_columnar_mem_ledger_apply_exclusive#11` | `ledger->current_bytes` | `atomic_store_explicit` | `relaxed` | Prepared exclusive ledger request updates accounting/peak under external exclusivity; relaxed counters provide no payload publication edge. |
+| `memory_governor.c:wl_columnar_memory_governor_strong` | `state` | `atomic_compare_exchange_weak_explicit` | `acq_rel`/`acquire` | Single bounded token/total CAS claims transition authority; success acq_rel and failure acquire preserve competing published state. |
+| `memory_governor.c:wl_columnar_memory_governor_strong#2` | `state` | `atomic_compare_exchange_strong_explicit` | `acq_rel`/`acquire` | Single bounded token/total CAS claims transition authority; success acq_rel and failure acquire preserve competing published state. |
+| `memory_governor.c:wl_columnar_memory_governor_snapshot` | `token->owner_bits` | `atomic_load_explicit` | `relaxed` | Exclusive claimed token snapshots owner bits; no new cross-thread publication is acquired. |
+| `memory_governor.c:wl_columnar_memory_governor_restore` | `token->owner_bits` | `atomic_store_explicit` | `relaxed` | Mandatory exclusive restoration publishes owner before release state, retaining genuine outstanding credit on refusal. |
+| `memory_governor.c:wl_columnar_memory_governor_restore#2` | `token->state` | `atomic_store_explicit` | `release` | Mandatory exclusive restoration publishes owner before release state, retaining genuine outstanding credit on refusal. |
+| `memory_governor.c:wl_columnar_memory_governor_admit` | `governor->reserved_bytes` | `atomic_load_explicit` | `relaxed` | Read current aggregate admission and usable limit; actual strong CAS, not these relaxed observations, arbitrates reservation. |
+| `memory_governor.c:wl_columnar_memory_governor_admit#2` | `governor->usable_bytes` | `atomic_load_explicit` | `relaxed` | Read current aggregate admission and usable limit; actual strong CAS, not these relaxed observations, arbitrates reservation. |
+| `memory_governor.c:wl_columnar_memory_governor_reserve_checked_controlled` | `token->state` | `atomic_store_explicit` | `release` | Publish actual prepared reservation/terminal refusal state with release; exclusive owner_bits clear precedes publication. |
+| `memory_governor.c:wl_columnar_memory_governor_reserve_checked_controlled#2` | `token->state` | `atomic_store_explicit` | `release` | Publish actual prepared reservation/terminal refusal state with release; exclusive owner_bits clear precedes publication. |
+| `memory_governor.c:wl_columnar_memory_governor_reserve_checked_controlled#3` | `token->owner_bits` | `atomic_store_explicit` | `relaxed` | Publish actual prepared reservation/terminal refusal state with release; exclusive owner_bits clear precedes publication. |
+| `memory_governor.c:wl_columnar_memory_governor_reserve_checked_controlled#4` | `token->state` | `atomic_store_explicit` | `release` | Publish actual prepared reservation/terminal refusal state with release; exclusive owner_bits clear precedes publication. |
+| `memory_governor.c:wl_columnar_memory_governor_reserve_checked_controlled#5` | `token->state` | `atomic_store_explicit` | `release` | Publish actual prepared reservation/terminal refusal state with release; exclusive owner_bits clear precedes publication. |
+| `memory_governor.c:wl_columnar_memory_governor_reserve_growth_controlled` | `token->state` | `atomic_load_explicit` | `acquire` | Acquire actual reservation state before admitted growth transition and owner validation. |
+| `memory_governor.c:wl_columnar_memory_governor_begin_growth_controlled` | `token->state` | `atomic_store_explicit` | `release` | Release actual growth state only after transition metadata/credit is installed; refusal restores a real terminal state. |
+| `memory_governor.c:wl_columnar_memory_governor_begin_growth_controlled#2` | `token->state` | `atomic_store_explicit` | `release` | Release actual growth state only after transition metadata/credit is installed; refusal restores a real terminal state. |
+| `memory_governor.c:wl_columnar_memory_governor_begin_growth_controlled#3` | `token->state` | `atomic_store_explicit` | `release` | Release actual growth state only after transition metadata/credit is installed; refusal restores a real terminal state. |
+| `memory_governor.c:wl_columnar_memory_governor_commit_private` | `token->state` | `atomic_store_explicit` | `release` | Exclusive private token commit publishes actual owner and final state; failure restores real reservation authority. |
+| `memory_governor.c:wl_columnar_memory_governor_commit_private#2` | `token->owner_bits` | `atomic_store_explicit` | `release` | Exclusive private token commit publishes actual owner and final state; failure restores real reservation authority. |
+| `memory_governor.c:wl_columnar_memory_governor_commit_private#3` | `token->state` | `atomic_store_explicit` | `release` | Exclusive private token commit publishes actual owner and final state; failure restores real reservation authority. |
+| `memory_governor.c:wl_columnar_memory_governor_commit_private#4` | `token->state` | `atomic_store_explicit` | `release` | Exclusive private token commit publishes actual owner and final state; failure restores real reservation authority. |
+| `merge.c:wl_columnar_merge_consolidate_reset` | `record->sequence.metadata_admission.state` | `atomic_store_explicit` | `relaxed` | Exclusive durable reset initializes EMPTY at original embedded identity before preparing workspace; no acquire/publication edge. |
+| `merge.c:wl_columnar_merge_consolidate_reset#2` | `record->sequence.workspace.admission.state` | `atomic_store_explicit` | `relaxed` | Exclusive durable reset initializes EMPTY at original embedded identity before preparing workspace; no acquire/publication edge. |
+| `merge.c:wl_columnar_merge_consolidate_reset#3` | `record->merge_admission.state` | `atomic_store_explicit` | `relaxed` | Exclusive durable reset initializes EMPTY at original embedded identity before preparing workspace; no acquire/publication edge. |
+| `ops.c:wl_columnar_ops_map_controlled` | `scratch.state` | `atomic_load_explicit` | `acquire` | Observe scratch reservation publication before physical-free/mandatory credit retirement decision. |
+| `ops.c:wl_columnar_ops_reduce_controlled` | `scratch.state` | `atomic_load` | `seq_cst (default)` | Default seq_cst observes actual scratch state for retained cleanup/release/rollback; this is not a fake credit refund. |
+| `ops.c:wl_columnar_ops_reduce_controlled#2` | `scratch.state` | `atomic_load` | `seq_cst (default)` | Default seq_cst observes actual scratch state for retained cleanup/release/rollback; this is not a fake credit refund. |
+| `ops.c:wl_columnar_ops_reduce_controlled#3` | `scratch.state` | `atomic_load` | `seq_cst (default)` | Default seq_cst observes actual scratch state for retained cleanup/release/rollback; this is not a fake credit refund. |
+| `relation.c:wl_columnar_relation_retire_payload_credit_known` | `r->retained_reservation.state` | `atomic_load_explicit` | `acquire` | Acquire retained payload credit state before checked mandatory retirement of physically retired storage. |
+| `relation.c:wl_columnar_relation_publish_retained_controlled` | `r->retained_reservation.state` | `atomic_load_explicit` | `acquire` | Acquire actual old/new reservation states before validated owner-transfer publication; no detached token copy. |
+| `relation.c:wl_columnar_relation_publish_retained_controlled#2` | `previous_out->state` | `atomic_load_explicit` | `acquire` | Acquire actual old/new reservation states before validated owner-transfer publication; no detached token copy. |
+| `relation.c:wl_columnar_relation_publish_retained_controlled#3` | `previous_out->state` | `atomic_load_explicit` | `acquire` | Acquire actual old/new reservation states before validated owner-transfer publication; no detached token copy. |
+| `relation.c:wl_columnar_relation_publish_payload_controlled` | `previous_out->state` | `atomic_load_explicit` | `acquire` | Acquire actual previous payload reservation state before publication/retirement of the old physical payload. |
+| `relation.c:wl_columnar_relation_reader_acquire_controlled` | `gate->state` | `atomic_load_explicit` | `relaxed` | Observe gate then acquire reader authority by bounded CAS; relaxed failed CAS carries only retry state, not payload authority. |
+| `relation.c:wl_columnar_relation_reader_acquire_controlled#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | `acquire`/`relaxed` | Observe gate then acquire reader authority by bounded CAS; relaxed failed CAS carries only retry state, not payload authority. |
+| `relation.c:wl_columnar_relation_reader_acquire_controlled#3` | `gate->state` | `atomic_compare_exchange_strong_explicit` | `acquire`/`relaxed` | Observe gate then acquire reader authority by bounded CAS; relaxed failed CAS carries only retry state, not payload authority. |
+| `relation.c:wl_columnar_relation_writer_acquire_controlled` | `gate->state` | `atomic_compare_exchange_weak_explicit` | `acquire`/`relaxed` | Acquire exclusive writer gate on successful CAS before payload use; relaxed failure supplies retry value only. |
+| `relation.c:wl_columnar_relation_writer_acquire_controlled#2` | `gate->state` | `atomic_compare_exchange_strong_explicit` | `acquire`/`relaxed` | Acquire exclusive writer gate on successful CAS before payload use; relaxed failure supplies retry value only. |
+| `relation.c:wl_columnar_relation_nonce_controlled` | `wl_next_mutation_set_nonce` | `atomic_load_explicit` | `relaxed` | Monotone atomic nonce allocation identifies acquisition, not payload publication; relaxed CAS and retry observation suffice. |
+| `relation.c:wl_columnar_relation_nonce_controlled#2` | `wl_next_mutation_set_nonce` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Monotone atomic nonce allocation identifies acquisition, not payload publication; relaxed CAS and retry observation suffice. |
+| `relation.c:wl_columnar_relation_nonce_controlled#3` | `wl_next_mutation_set_nonce` | `atomic_compare_exchange_strong_explicit` | `relaxed`/`relaxed` | Monotone atomic nonce allocation identifies acquisition, not payload publication; relaxed CAS and retry observation suffice. |
+| `relation.c:wl_columnar_relation_mutation_single_finish_controlled` | `r->storage_alias_borrows` | `atomic_store_explicit` | `relaxed` | Restore journaled alias count while actual descriptor writer is held; relaxed store does not substitute for ownership. |
+| `relation.c:wl_columnar_relation_mutation_single_acquire_controlled` | `relation->storage_alias_borrows` | `atomic_store_explicit` | `relaxed` | Initialize lazy alias metadata while holding actual descriptor writer; source gate subsequently protects payload access. |
+| `relation.c:wl_columnar_relation_metadata_tokens_valid` | `previous->state` | `atomic_load_explicit` | `acquire` | Acquire actual pending/previous token state and owner publications before checked metadata ownership handoff. |
+| `relation.c:wl_columnar_relation_metadata_tokens_valid#2` | `pending->owner_bits` | `atomic_load_explicit` | `acquire` | Acquire actual pending/previous token state and owner publications before checked metadata ownership handoff. |
+| `relation.c:wl_columnar_relation_metadata_tokens_valid#3` | `pending->state` | `atomic_load_explicit` | `acquire` | Acquire actual pending/previous token state and owner publications before checked metadata ownership handoff. |
+| `relation.c:wl_columnar_relation_metadata_tokens_valid#4` | `dst->metadata_reservation.state` | `atomic_load_explicit` | `acquire` | Acquire actual pending/previous token state and owner publications before checked metadata ownership handoff. |
+| `relation.c:wl_columnar_relation_metadata_tokens_valid#5` | `dst->metadata_reservation.owner_bits` | `atomic_load_explicit` | `acquire` | Acquire actual pending/previous token state and owner publications before checked metadata ownership handoff. |
+| `relation.c:wl_columnar_relation_publish_committed_metadata` | `pending->state` | `atomic_load_explicit` | `acquire` | Acquire actual committed state and owner publication before moving metadata ownership to the original canonical token. |
+| `relation.c:wl_columnar_relation_publish_committed_metadata#2` | `pending->owner_bits` | `atomic_load_explicit` | `acquire` | Acquire actual committed state and owner publication before moving metadata ownership to the original canonical token. |
+| `relation.c:wl_columnar_relation_reserve_capacity_admitted_controlled` | `r->retained_reservation.state` | `atomic_load_explicit` | `acquire` | Acquire actual retained reservation before validated capacity growth; allocation and checked token ownership remain distinct. |
+| `relation.c:wl_columnar_relation_row_finish` | `r->storage_alias_borrows` | `atomic_store_explicit` | `relaxed` | Restore lazy alias journal under real descriptor writer before release; relaxed count write has no independent publication role. |
+| `relation.c:wl_columnar_relation_row_body` | `scratch_credit.state` | `atomic_load` | `seq_cst (default)` | Default seq_cst selects actual scratch rollback/release after physical retirement under the admitted row writer. |
+| `relation.c:wl_columnar_relation_identity_controlled` | `wl_next_relation_identity` | `atomic_load_explicit` | `relaxed` | Allocate monotone relation identity by relaxed atomic CAS; identity uniqueness is separate from payload synchronization. |
+| `relation.c:wl_columnar_relation_identity_controlled#2` | `wl_next_relation_identity` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Allocate monotone relation identity by relaxed atomic CAS; identity uniqueness is separate from payload synchronization. |
+| `relation.c:wl_columnar_relation_identity_controlled#3` | `wl_next_relation_identity` | `atomic_compare_exchange_strong_explicit` | `relaxed`/`relaxed` | Allocate monotone relation identity by relaxed atomic CAS; identity uniqueness is separate from payload synchronization. |
+| `relation.c:wl_columnar_relation_constructor_commit` | `canonical->state` | `atomic_load_explicit` | `acquire` | Acquire canonical reservation state before validated constructor ownership publication. |
+| `relation.c:wl_columnar_relation_constructor_retire_token` | `token->state` | `atomic_load_explicit` | `acquire` | Acquire actual constructor token state to choose mandatory rollback/release after physical allocation retirement. |
+| `relation.c:wl_columnar_relation_consolidate_retire` | `tokens[i]->state` | `atomic_load` | `seq_cst (default)` | Default seq_cst selects actual release versus rollback after physical buffer free; refusal preserves active original token. |
+| `relation.c:wl_columnar_relation_consolidate_reservation_empty` | `r->owner_bits` | `atomic_load_explicit` | `relaxed` | Relaxed owner_bits then state observations validate exclusive original durable record reuse; neither load acquires cross-thread publication. |
+| `relation.c:wl_columnar_relation_consolidate_reservation_empty#2` | `r->state` | `atomic_load_explicit` | `relaxed` | Relaxed owner_bits then state observations validate exclusive original durable record reuse; neither load acquires cross-thread publication. |
+| `intern.c:wl_intern_put_controlled` | `pending.state` | `atomic_load_explicit` | `acquire` | Acquire actual pending/canonical reservation state before physical old-slot credit retirement under the original intern mutex. |
+| `intern.c:wl_intern_put_controlled#2` | `intern->reservation.state` | `atomic_load_explicit` | `acquire` | Acquire actual pending/canonical reservation state before physical old-slot credit retirement under the original intern mutex. |
 
 ---
 

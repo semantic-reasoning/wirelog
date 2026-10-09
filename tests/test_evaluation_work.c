@@ -13078,10 +13078,1023 @@ test_join_writer_owned_and_reuse(void)
         shared_keep_reader = false; release(c); join_session_destroy(sess);
     }
 }
+/* Actual VARIABLE -> controlled borrowed CONSOLIDATE, with raw twins. */
+static int consolidate_last_stage;
+static uint64_t consolidate_last_progress;
+static void
+consolidate_diagnose(wl_evaluation_control_t *c, int stage, uint64_t progress,
+    wl_columnar_consolidate_record_t *record, col_rel_t *r)
+{
+    (void)c; (void)record; (void)r;
+    consolidate_last_stage = stage; consolidate_last_progress = progress;
+}
+static int
+consolidate_dispatch(wl_col_session_t *sess,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_evaluation_control_t *c)
+{
+    wl_plan_op_t ops[2] = {
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+         .delta_mode = WL_DELTA_FORCE_FULL},
+        {.op = WL_PLAN_OP_CONSOLIDATE}
+    };
+    return compiled_dispatch(sess, frame, ops, 2, c);
+}
+static uint64_t
+consolidate_source_hash(col_rel_t *r)
+{
+    uint64_t h = UINT64_C(14695981039346656037);
+    for (uint32_t col = 0; col < r->ncols; col++)
+        for (uint32_t row = 0; row < r->nrows; row++) {
+            h ^= (uint64_t)r->columns[col][row]; h *= UINT64_C(1099511628211);
+        }
+    return h;
+}
+static void
+consolidate_populate(col_rel_t *r, unsigned order, bool floating)
+{
+    wirelog_column_type_t *types = calloc(r->ncols ? r->ncols : 1u,
+            sizeof(*types));
+    CHECK(types);
+    for (uint32_t col = 0; col < r->ncols; col++)
+        types[col] = floating ? WIRELOG_TYPE_FLOAT
+            : col == 1 ? WIRELOG_TYPE_STRING : WIRELOG_TYPE_INT64;
+    /* Establish FLOAT schema on the empty private fixture before population;
+     * the public API rightly refuses retagging an implicit numeric payload. */
+    uint32_t rows = r->nrows;
+    r->nrows = 0;
+    if (r->ncols) CHECK(col_rel_set_column_types(r, types, r->ncols) == 0);
+    r->nrows = rows;
+    free(types);
+    for (uint32_t col = 0; col < r->ncols; col++) {
+        r->column_types[col] = floating ? WIRELOG_TYPE_FLOAT
+            : col == 1 ? WIRELOG_TYPE_STRING : WIRELOG_TYPE_INT64;
+        for (uint32_t row = 0; row < r->nrows; row++) {
+            int64_t v = order == 0 ? row : order == 1 ? r->nrows - row
+                : order == 2 ? (row * 37u) % (r->nrows ? r->nrows : 1u) : 0;
+            if (order == 2) v /= 2;
+            if (!floating && order == 2 && col != 1 &&
+                row % 11u == 0) v = INT64_MIN;
+            if (!floating && order == 2 && col != 1 &&
+                row % 13u == 0) v = INT64_MAX;
+            if (floating) {
+                double value = row % 7u == 0 ? -0.0 : (double)v / 2.0;
+                if (row == 1) value = DBL_MAX;
+                if (row == 2) value = -DBL_MAX;
+                memcpy(&r->columns[col][row], &value, sizeof(value));
+            } else r->columns[col][row] = v;
+        }
+    }
+}
+static void
+test_consolidate_actual_twins(void)
+{
+    const uint32_t sizes[] = {0, 1, 2, 31, 32, 33, 513, 10000};
+    for (unsigned item = 0; item < sizeof(sizes) / sizeof(sizes[0]); item++)
+        for (unsigned order = 0; order < 4; order++) {
+            wl_col_session_t *sess = join_session(), *raw = join_session();
+            uint32_t nr = sizes[item];
+            col_rel_t *source = relation(2, nr ? nr : 1, nr, false,
+                    sess->memory_governor);
+            col_rel_t *ref = relation(2, nr ? nr : 1, nr, false,
+                    raw->memory_governor);
+            consolidate_populate(source, order, false);
+            consolidate_populate(ref, order, false);
+            CHECK(session_add_rel(sess, source) == 0 && session_add_rel(raw,
+                ref) == 0);
+            make_lazy(source);
+            uint64_t hash = consolidate_source_hash(source),
+                view = source->view_generation;
+            uint64_t baseline = string_reserved(sess->memory_governor);
+            wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess),
+                *raw_frame = filter_frame(raw);
+            wl_evaluation_control_t *c = control(0);
+            wl_columnar_consolidate_test_checkpoint = consolidate_diagnose;
+            int actual = consolidate_dispatch(sess, frame, c);
+            wl_columnar_consolidate_test_checkpoint = NULL;
+            if (actual) fprintf(stderr,
+                    "consolidate twins nr=%u order=%u rc=%d stage=%d progress=%llu\n",
+                    nr, order,
+                    actual, consolidate_last_stage,
+                    (unsigned long long)consolidate_last_progress);
+            CHECK(actual == 0); finish(c, 0);
+            CHECK(consolidate_dispatch(raw, raw_frame, NULL) == 0);
+            eval_stack_t *st = wl_columnar_eval_stack_cleanup_stack(frame);
+            eval_stack_t *rt = wl_columnar_eval_stack_cleanup_stack(raw_frame);
+            CHECK(st->top == 1 && rt->top == 1);
+            col_rel_t *out = st->items[0].rel, *expected = rt->items[0].rel;
+            CHECK(out->ncols == expected->ncols &&
+                out->nrows == expected->nrows);
+            for (uint32_t col = 0; col < out->ncols; col++) {
+                CHECK(out->column_types[col] == expected->column_types[col]);
+                for (uint32_t row = 0; row < out->nrows; row++)
+                    CHECK(out->columns[col][row] ==
+                        expected->columns[col][row]);
+            }
+            CHECK(source->nrows == nr && source->view_generation == view
+                && consolidate_source_hash(source) == hash);
+            if (nr <= 1) {
+                CHECK(out == source && !st->items[0].owned);
+                lazy_unchanged(source);
+            }else CHECK(out != source && st->items[0].owned &&
+                    out->run_count == 1
+                    && out->run_ends[0] == out->nrows &&
+                    out->sorted_nrows == out->nrows);
+            source_unpinned(source, source);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0
+                && wl_columnar_eval_stack_cleanup_finish(&raw_frame) == 0);
+            CHECK(string_reserved(sess->memory_governor) == baseline);
+            release(c); join_session_destroy(sess); join_session_destroy(raw);
+        }
+    /* Orthogonal wide/zero-arity and small FLOAT insertion cases. */
+    for (unsigned kind = 0; kind < 3; kind++) {
+        wl_col_session_t *sess = join_session(), *raw = join_session();
+        uint32_t nc = kind == 0 ? 300u : kind == 1 ? 0u : 2u;
+        uint32_t nr = kind == 2 ? 31u : 33u;
+        col_rel_t *source = relation(nc, nr, nr, false, sess->memory_governor);
+        col_rel_t *ref = relation(nc, nr, nr, false, raw->memory_governor);
+        consolidate_populate(source, 2, kind == 2);
+        consolidate_populate(ref, 2, kind == 2);
+        CHECK(session_add_rel(sess, source) == 0 && session_add_rel(raw,
+            ref) == 0);
+        uint64_t hash = consolidate_source_hash(source);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess),
+            *rf = filter_frame(raw);
+        wl_evaluation_control_t *c = control(0);
+        CHECK(consolidate_dispatch(sess, frame, c) == 0); finish(c, 0);
+        CHECK(consolidate_dispatch(raw, rf, NULL) == 0);
+        col_rel_t *out = join_output(frame), *expected = join_output(rf);
+        CHECK(out->nrows == expected->nrows && out->ncols == nc);
+        for (uint32_t col = 0; col < nc; col++) for (uint32_t row = 0;
+                row < out->nrows; row++)
+                CHECK(out->columns[col][row] == expected->columns[col][row]);
+        CHECK(consolidate_source_hash(source) == hash);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0
+            && wl_columnar_eval_stack_cleanup_finish(&rf) == 0);
+        release(c); join_session_destroy(sess); join_session_destroy(raw);
+    }
+}
+
+static int consolidate_stop_stage;
+static uint64_t consolidate_stop_progress;
+static unsigned consolidate_stop_visits;
+static bool consolidate_stop_overflow;
+static void
+consolidate_stop(wl_evaluation_control_t *c, int stage, uint64_t progress,
+    wl_columnar_consolidate_record_t *record, col_rel_t *r)
+{
+    (void)record; (void)r;
+    if (!c || stage != consolidate_stop_stage ||
+        progress < consolidate_stop_progress
+        || consolidate_stop_visits) return;
+    consolidate_stop_visits++;
+    if (consolidate_stop_overflow) CHECK(wl_evaluation_control_charge(c,
+            UINT64_MAX) == EOVERFLOW);
+    else wl_evaluation_control_request_cancel(c);
+}
+static void
+test_consolidate_reached_stops(void)
+{
+    const struct {int stage; uint64_t progress; uint32_t width, rows;
+                  bool floating;} cases[] = {
+        {20, 128, 2, 513, false}, {27, 300, 2, 513, false},
+        {28, 300, 2, 513, false},
+        {2, 300, 300, 2, false}, {3, 300, 300, 2, false},
+        {4, 300, 300, 2, false},
+        {5, 300, 300, 3, true}, {6, 300, 300, 3, true}, {7, 300, 300, 3, true},
+        {8, 300, 2, 513, false}, {9, 300, 2, 513, false},
+        {10, 128, 2, 513, false},
+        {11, 300, 2, 513, false}, {12, 128, 2, 513, false},
+        {13, 300, 2, 513, false},
+        {14, 300, 2, 513, false}, {15, 300, 2, 513, false},
+        {22, 300, 2, 513, false},
+        {23, 300, 2, 513, false}, {24, 0, 2, 513, false},
+        {30, 0, 2, 513, false},
+        {31, 0, 2, 513, false}, {33, 0, 2, 513, false}
+    };
+    for (unsigned item = 0; item < sizeof(cases) / sizeof(cases[0]); item++)
+        for (unsigned overflow = 0; overflow < 2; overflow++) {
+            wl_col_session_t *sess = join_session();
+            col_rel_t *source = relation(cases[item].width, cases[item].rows,
+                    cases[item].rows, false, sess->memory_governor);
+            consolidate_populate(source, cases[item].floating ? 1u : 2u,
+                cases[item].floating);
+            if (cases[item].stage == 4)
+                for (uint32_t col = 0; col < source->ncols; col++)
+                    source->columns[col][1] = source->columns[col][0];
+            CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+            uint64_t hash = consolidate_source_hash(source),
+                view = source->view_generation;
+            uint64_t storage = source->storage_generation,
+                baseline = string_reserved(sess->memory_governor);
+            wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+            wl_evaluation_control_t *c = control(0);
+            consolidate_stop_stage = cases[item].stage;
+            consolidate_stop_progress = cases[item].progress;
+            consolidate_stop_visits = 0; consolidate_stop_overflow = overflow;
+            wl_columnar_consolidate_test_checkpoint = consolidate_stop;
+            int actual = consolidate_dispatch(sess, frame, c);
+            wl_columnar_consolidate_test_checkpoint = NULL;
+            int expected =
+                overflow ? EOVERFLOW : WL_EVALUATION_CONTROL_CANCELLED;
+            if (actual != expected || !consolidate_stop_visits)
+                fprintf(stderr,
+                    "consolidate stop stage=%d progress=%llu overflow=%u rc=%d visits=%u\n",
+                    cases[item].stage, (unsigned long long)cases[item].progress,
+                    overflow, actual, consolidate_stop_visits);
+            CHECK(actual == expected && consolidate_stop_visits == 1);
+            finish(c, expected);
+            CHECK(consolidate_source_hash(source) == hash &&
+                source->view_generation == view
+                && source->storage_generation == storage &&
+                source->nrows == cases[item].rows);
+            lazy_unchanged(source); source_unpinned(source, source);
+            eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame);
+            CHECK(stack->top == 1 && stack->items[0].rel == source &&
+                !stack->items[0].owned);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0
+                && string_reserved(sess->memory_governor) == baseline);
+            retry(c, 0); frame = filter_frame(sess);
+            CHECK(consolidate_dispatch(sess, frame, c) == 0); finish(c, 0);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0
+                && string_reserved(sess->memory_governor) == baseline);
+            release(c); join_session_destroy(sess);
+        }
+}
+static unsigned consolidate_constructor_calls;
+static void
+consolidate_constructor_count(wl_evaluation_control_t *c, int stage,
+    uint64_t progress)
+{
+    (void)c; (void)stage; (void)progress;
+    consolidate_constructor_calls++;
+}
+static void
+test_consolidate_original_noop(void)
+{
+    for (unsigned rows = 0; rows <= 1; rows++) {
+        wl_col_session_t *sess = join_session();
+        col_rel_t *source = relation(2, 1, rows, false, sess->memory_governor);
+        consolidate_populate(source, 0, true); make_lazy(source);
+        source->sorted_nrows = 0; source->run_count = 2;
+        source->run_ends[0] = 77; source->run_ends[1] = 88;
+        wl_columnar_eval_stack_cleanup_frame_t *frame = join_frame(sess, source,
+                false);
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame);
+        uint32_t *segments = malloc(3 * sizeof(*segments)); CHECK(segments);
+        segments[0] = 7; segments[1] = 8; segments[2] = 9;
+        stack->items[0].seg_boundaries = segments;
+        stack->items[0].seg_count = 2;
+        uint64_t hash = consolidate_source_hash(source),
+            view = source->view_generation;
+        uint64_t storage = source->storage_generation,
+            baseline = string_reserved(sess->memory_governor);
+        wl_evaluation_control_t *c = control(0);
+        consolidate_constructor_calls = 0;
+        wl_columnar_relation_test_constructor_checkpoint =
+            consolidate_constructor_count;
+        wl_columnar_consolidate_test_fail_allocation = 0;
+        sess->base.evaluation_control = c;
+        CHECK(col_op_consolidate(stack, sess) == 0);
+        sess->base.evaluation_control = NULL; finish(c, 0);
+        wl_columnar_relation_test_constructor_checkpoint = NULL;
+        CHECK(!consolidate_constructor_calls &&
+            wl_columnar_consolidate_test_fail_allocation == 0);
+        wl_columnar_consolidate_test_fail_allocation = -1;
+        CHECK(stack->top == 1 && stack->items[0].rel == source &&
+            !stack->items[0].owned
+            && stack->items[0].seg_boundaries == segments &&
+            stack->items[0].seg_count == 2
+            && segments[0] == 7 && segments[1] == 8 && segments[2] == 9
+            && source->run_count == 2 && source->run_ends[0] == 77 &&
+            source->run_ends[1] == 88
+            && source->sorted_nrows == 0 && source->view_generation == view
+            && source->storage_generation == storage &&
+            consolidate_source_hash(source) == hash);
+        lazy_unchanged(source); source_unpinned(source, source);
+        CHECK(string_reserved(sess->memory_governor) == baseline);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+        release(c);
+        CHECK(col_rel_storage_owner_ensure_initialized(source) == 0);
+        destroy(source); join_session_destroy(sess);
+    }
+}
+
+static unsigned consolidate_provenance_checks;
+static uint64_t consolidate_clone_nonce;
+static void
+consolidate_provenance(wl_evaluation_control_t *c, int stage, uint64_t progress,
+    wl_columnar_consolidate_record_t *record, col_rel_t *r)
+{
+    (void)progress;
+    if (stage == 29) {
+        wl_columnar_relation_private_batch_t *writer =
+            wl_columnar_eval_stack_cleanup_reduce_batch(shared_frame);
+        CHECK(writer && writer->phase == WL_COLUMNAR_RELATION_PRIVATE_HELD);
+        consolidate_clone_nonce = writer->batch.single.lease.acquisition_nonce;
+        return;
+    }
+    if (stage != 30 && stage != 31) return;
+    wl_columnar_relation_radix_sequence_t *seq = &record->sequence;
+    wl_columnar_relation_mutation_lease_t *lease = seq->lease;
+    CHECK(lease && lease->acquisition_nonce != consolidate_clone_nonce
+        && col_rel_mutation_lease_validate(lease, r) == 0);
+    uint64_t hash = consolidate_source_hash(r), view = r->view_generation;
+    bool published = lease->set->published;
+    if (stage == 31) {
+        CHECK(seq->consumed);
+        CHECK(wl_columnar_relation_radix_sequence_execute_with_lease_controlled(
+                seq, lease, c) == EINVAL);
+        CHECK(consolidate_source_hash(r) == hash && r->view_generation == view
+            && lease->set->published == published);
+        consolidate_provenance_checks++;
+        return;
+    }
+    CHECK(seq->prepared && !seq->consumed && seq->needs_sort_count == 1);
+    for (unsigned kind = 0; kind < 9; kind++) {
+        int64_t **columns = r->columns;
+        uint32_t capacity = r->capacity, boundary = seq->boundaries[1];
+        wirelog_column_type_t type = r->column_types[0];
+        uint64_t storage = r->storage_generation,
+            nonce = lease->acquisition_nonce;
+        size_t count = lease->set->lease_count;
+        uint32_t *permutation = seq->workspace.perm_a;
+        if (kind == 0) r->view_generation++;
+        else if (kind == 1) r->storage_generation++;
+        else if (kind == 2) r->columns = NULL;
+        else if (kind == 3) r->column_types[0] = WIRELOG_TYPE_BOOL;
+        else if (kind == 4) r->capacity = r->nrows - 1u;
+        else if (kind == 5) lease->acquisition_nonce = consolidate_clone_nonce;
+        else if (kind == 6) lease->set->lease_count = 2;
+        else if (kind == 7) seq->boundaries[1]--;
+        else seq->workspace.perm_a = NULL;
+        CHECK(wl_columnar_relation_radix_sequence_execute_with_lease_controlled(
+                seq, lease, c) == EINVAL);
+        r->view_generation = view; r->storage_generation = storage;
+        r->columns = columns; r->column_types[0] = type; r->capacity = capacity;
+        lease->acquisition_nonce = nonce; lease->set->lease_count = count;
+        seq->boundaries[1] = boundary; seq->workspace.perm_a = permutation;
+        CHECK(!seq->consumed && consolidate_source_hash(r) == hash
+            && lease->set->published == published &&
+            col_rel_mutation_lease_validate(lease, r) == 0);
+        consolidate_provenance_checks++;
+    }
+}
+static void
+test_consolidate_prepared_provenance(void)
+{
+    wl_col_session_t *sess = join_session();
+    col_rel_t *source = relation(2, 513, 513, false, sess->memory_governor);
+    consolidate_populate(source, 2, false);
+    CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+    uint64_t source_hash = consolidate_source_hash(source);
+    shared_frame = filter_frame(sess); wl_evaluation_control_t *c = control(0);
+    consolidate_provenance_checks = 0; consolidate_clone_nonce = 0;
+    wl_columnar_consolidate_test_checkpoint = consolidate_provenance;
+    CHECK(consolidate_dispatch(sess, shared_frame, c) == 0); finish(c, 0);
+    wl_columnar_consolidate_test_checkpoint = NULL;
+    CHECK(consolidate_provenance_checks == 10 &&
+        consolidate_source_hash(source) == source_hash);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&shared_frame) == 0);
+    release(c); join_session_destroy(sess);
+}
+static unsigned consolidate_pool_zero_visits;
+static void
+consolidate_pool_zero_stop(wl_evaluation_control_t *c, int stage,
+    uint64_t progress)
+{
+    if (stage != WL_COLUMNAR_RELATION_CONSTRUCTOR_POOL_ZERO ||
+        progress < 128) return;
+    consolidate_pool_zero_visits++;
+    wl_columnar_relation_test_constructor_checkpoint = NULL;
+    wl_evaluation_control_request_cancel(c);
+}
+static bool consolidate_pool_partial_acquired;
+static void
+consolidate_pool_partial_stop(wl_evaluation_control_t *c, int stage,
+    uint64_t progress)
+{
+    if (stage == WL_COLUMNAR_RELATION_CONSTRUCTOR_POOL_ACQUIRED)
+        consolidate_pool_partial_acquired = true;
+    if (stage != WL_COLUMNAR_RELATION_CONSTRUCTOR_NAME ||
+        progress != sizeof("$consol")) return;
+    CHECK(consolidate_pool_partial_acquired);
+    consolidate_pool_zero_visits++;
+    wl_columnar_relation_test_constructor_checkpoint = NULL;
+    wl_evaluation_control_request_cancel(c);
+}
+static void
+test_consolidate_actual_pools(void)
+{
+    for (unsigned mode = 0; mode < 5; mode++) {
+        wl_col_session_t *sess = join_session();
+        col_rel_t *source = relation(2, 33, 33, false, sess->memory_governor);
+        consolidate_populate(source, 2, false);
+        CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+        delta_pool_t *pool = mode ? delta_pool_create(1, sizeof(col_rel_t),
+                64) : NULL;
+        CHECK(!mode || pool); sess->delta_pool = pool;
+        col_rel_t *prior = NULL;
+        if (mode == 2) {
+            CHECK(wl_columnar_relation_pool_new_like_governed_checked(&prior,
+                pool, "prior", source, sess->memory_governor) == 0);
+            prior->columns[0][0] = 987;
+            make_lazy(source);
+        }
+        if (mode >= 3) memset(pool->slab, 0xa5, pool->slot_size);
+        uint32_t slot_used = pool ? pool->slot_used : 0;
+        uint64_t source_hash = consolidate_source_hash(source),
+            baseline = string_reserved(sess->memory_governor);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+        wl_evaluation_control_t *c = control(0);
+        consolidate_pool_zero_visits = 0;
+        consolidate_pool_partial_acquired = false;
+        if (mode ==
+            3) wl_columnar_relation_test_constructor_checkpoint =
+                consolidate_pool_zero_stop;
+        if (mode ==
+            4) wl_columnar_relation_test_constructor_checkpoint =
+                consolidate_pool_partial_stop;
+        int expected = mode >= 3 ? WL_EVALUATION_CONTROL_CANCELLED : 0;
+        CHECK(consolidate_dispatch(sess, frame, c) == expected);
+        finish(c, expected);
+        wl_columnar_relation_test_constructor_checkpoint = NULL;
+        if (mode == 3) {
+            CHECK(consolidate_pool_zero_visits == 1 &&
+                pool->slot_used == slot_used);
+            for (size_t byte = 0; byte < 128;
+                byte++) CHECK(pool->slab[byte] == 0);
+            for (size_t byte = 128; byte < pool->slot_size;
+                byte++) CHECK((unsigned char)pool->slab[byte] == 0xa5);
+            lazy_unchanged(source);
+        } else if (mode == 4) {
+            CHECK(consolidate_pool_zero_visits == 1 &&
+                consolidate_pool_partial_acquired
+                && pool->slot_used == slot_used);
+            col_rel_t *slot = (col_rel_t *)pool->slab;
+            CHECK(!slot->name && !slot->columns && !slot->column_types
+                && !slot->col_names && !slot->row_scratch && !slot->timestamps
+                && !slot->nrows && !slot->ncols && !slot->capacity
+                && !slot->schema_ok && !slot->relation_identity &&
+                !slot->storage_owner);
+            wl_columnar_memory_reservation_t *tokens[] = {
+                &slot->descriptor_reservation, &slot->pool_name_reservation,
+                &slot->metadata_reservation, &slot->retained_reservation,
+                &slot->dedup_reservation
+            };
+            for (unsigned token = 0; token < 5; token++) CHECK(
+                    tokens[token]->identity == tokens[token] &&
+                    !tokens[token]->governor
+                    && !tokens[token]->bytes &&
+                    !tokens[token]->replacement_bytes
+                    && !tokens[token]->transition_kind &&
+                    !atomic_load(&tokens[token]->owner_bits)
+                    && atomic_load(&tokens[token]->state) ==
+                    WL_COLUMNAR_MEMORY_RESERVATION_EMPTY);
+            lazy_unchanged(source);
+        } else {
+            col_rel_t *out = join_output(frame);
+            CHECK(out->capacity == COL_REL_INIT_CAP);
+            if (mode == 1) CHECK((char *)out == pool->slab &&
+                    pool->slot_used == 1);
+            if (mode == 2) CHECK((char *)out != pool->slab &&
+                    pool->slot_used == slot_used
+                    && prior->columns[0][0] == 987);
+        }
+        CHECK(consolidate_source_hash(source) == source_hash);
+        source_unpinned(source, source);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0
+            && string_reserved(sess->memory_governor) == baseline);
+        if (prior) destroy(prior);
+        sess->delta_pool = NULL; if (pool) delta_pool_destroy(pool);
+        release(c); join_session_destroy(sess);
+    }
+}
+
+static unsigned consolidate_fault_kind, consolidate_fault_visits;
+static wl_columnar_source_access_writer_t *consolidate_fault_writer;
+static bool consolidate_fault_thread_valid;
+static wl_columnar_relation_source_group_t *consolidate_fault_group;
+static void
+consolidate_authority_fault(wl_evaluation_control_t *c,
+    wl_columnar_relation_private_batch_t *writer, int stage, uint64_t progress)
+{
+    if (consolidate_fault_visits || (consolidate_fault_kind == 0 ? stage != 2
+        : consolidate_fault_kind == 2 ? stage != 4 ||
+        progress != 128 : true)) return;
+    consolidate_fault_writer = &writer->batch.single.descriptor.writer;
+    CHECK(consolidate_fault_writer->owner &&
+        consolidate_fault_writer->identity ==
+        (uintptr_t)consolidate_fault_writer
+        && consolidate_fault_writer->thread_valid);
+    consolidate_fault_thread_valid = consolidate_fault_writer->thread_valid;
+    /* Intentionally malformed authority validation, not healthy contention. */
+    consolidate_fault_writer->thread_valid = false;
+    consolidate_fault_visits++; wl_evaluation_control_request_cancel(c);
+}
+static void
+consolidate_owner_checkpoint(wl_evaluation_control_t *c, int stage,
+    uint64_t progress, wl_columnar_consolidate_record_t *record, col_rel_t *r)
+{
+    (void)progress; (void)record; (void)r;
+    if (consolidate_fault_visits) return;
+    if (consolidate_fault_kind == 1 && stage == 29) {
+        wl_columnar_relation_private_batch_t *writer =
+            wl_columnar_eval_stack_cleanup_reduce_batch(shared_frame);
+        CHECK(writer && writer->phase == WL_COLUMNAR_RELATION_PRIVATE_HELD);
+        consolidate_fault_writer = &writer->batch.single.owners[0].writer;
+    } else if (consolidate_fault_kind == 3 && stage == 26) {
+        CHECK(consolidate_fault_group->descriptor_count == 1
+            && consolidate_fault_group->descriptors[0].journal);
+        consolidate_fault_writer =
+            &consolidate_fault_group->descriptors[0].writer;
+    } else return;
+    CHECK(consolidate_fault_writer->owner &&
+        consolidate_fault_writer->identity ==
+        (uintptr_t)consolidate_fault_writer
+        && consolidate_fault_writer->thread_valid);
+    consolidate_fault_thread_valid = consolidate_fault_writer->thread_valid;
+    consolidate_fault_writer->thread_valid = false;
+    consolidate_fault_visits++; wl_evaluation_control_request_cancel(c);
+}
+static void
+test_consolidate_authority_retention(void)
+{
+    for (unsigned kind = 0; kind < 4; kind++) {
+        wl_col_session_t *sess = join_session();
+        uint32_t rows = kind == 3 ? 1u : 513u;
+        col_rel_t *source = relation(2, rows, rows, false,
+                sess->memory_governor);
+        consolidate_populate(source, 2, false);
+        CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+        uint64_t source_hash = consolidate_source_hash(source),
+            baseline = string_reserved(sess->memory_governor);
+        shared_frame = filter_frame(sess);
+        eval_entry_t *result;
+        CHECK(wl_columnar_eval_stack_cleanup_join_owner(sess,
+            wl_columnar_eval_stack_cleanup_stack(shared_frame),
+            &consolidate_fault_group, &result) == 0);
+        wl_evaluation_control_t *c = control(0);
+        consolidate_fault_kind = kind; consolidate_fault_visits = 0;
+        consolidate_fault_writer = NULL;
+        wl_columnar_relation_test_private_checkpoint =
+            consolidate_authority_fault;
+        wl_columnar_consolidate_test_checkpoint = consolidate_owner_checkpoint;
+        CHECK(consolidate_dispatch(sess, shared_frame, c) == EINVAL);
+        finish(c, EINVAL);
+        wl_columnar_relation_test_private_checkpoint = NULL;
+        wl_columnar_consolidate_test_checkpoint = NULL;
+        CHECK(consolidate_fault_visits == 1 && consolidate_fault_writer->owner
+            && !consolidate_fault_writer->thread_valid
+            && consolidate_fault_writer->identity ==
+            (uintptr_t)consolidate_fault_writer
+            && atomic_load(&consolidate_fault_writer->owner->state) ==
+            WL_COLUMNAR_SOURCE_ACCESS_WRITER);
+        CHECK(consolidate_source_hash(source) == source_hash);
+        eval_stack_t *stack =
+            wl_columnar_eval_stack_cleanup_stack(shared_frame);
+        CHECK(stack->top == 1 && stack->items[0].rel == source &&
+            !stack->items[0].owned);
+        if (kind == 3) CHECK(source->storage_owner == source &&
+                consolidate_fault_group->descriptors[0].journal);
+        else CHECK(result->rel && result->owned);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&shared_frame) == EINVAL
+            && !shared_frame && sess->cleanup_pending);
+        CHECK(string_reserved(sess->memory_governor) > baseline);
+        consolidate_fault_writer->thread_valid = consolidate_fault_thread_valid;
+        CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0 &&
+            !sess->cleanup_pending
+            && string_reserved(sess->memory_governor) == baseline);
+        lazy_unchanged(source); source_unpinned(source, source);
+        shared_frame = filter_frame(sess); retry(c, 0);
+        CHECK(consolidate_dispatch(sess, shared_frame, c) == 0); finish(c, 0);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&shared_frame) == 0);
+        release(c); join_session_destroy(sess);
+    }
+}
+static unsigned consolidate_resource_kind, consolidate_resource_visits;
+static uint64_t consolidate_resource_usable;
+static void
+consolidate_resource_checkpoint(wl_evaluation_control_t *c, int stage,
+    uint64_t progress, wl_columnar_consolidate_record_t *record, col_rel_t *r)
+{
+    (void)c; (void)progress; (void)record;
+    if (stage != 37 || consolidate_resource_visits) return;
+    consolidate_resource_visits++;
+    if (consolidate_resource_kind ==
+        0) r->view_generation = WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+    else {
+        wl_columnar_memory_governor_t *g =
+            wl_columnar_memory_governor_ref_get(r->memory_governor);
+        consolidate_resource_usable = atomic_load(&g->usable_bytes);
+        atomic_store(&g->usable_bytes, wl_columnar_memory_reserved(g));
+    }
+}
+static void
+test_consolidate_resource_failures(void)
+{
+    for (unsigned mode = 0; mode < 11; mode++) {
+        wl_col_session_t *sess = join_session();
+        col_rel_t *source = relation(2, 513, 513, false, sess->memory_governor);
+        consolidate_populate(source, 2, false);
+        CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+        uint64_t source_hash = consolidate_source_hash(source),
+            baseline = string_reserved(sess->memory_governor);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+        wl_evaluation_control_t *c = control(0);
+        if (mode < 8) wl_columnar_consolidate_test_fail_allocation = (int)mode;
+        else if (mode == 8) wl_columnar_consolidate_test_fail_commit = true;
+        else {
+            consolidate_resource_kind = mode - 9u;
+            consolidate_resource_visits = 0;
+            wl_columnar_consolidate_test_checkpoint =
+                consolidate_resource_checkpoint;
+        }
+        int expected = mode < 9 ? ENOMEM : mode == 9 ? EOVERFLOW : ENOSPC;
+        int actual = consolidate_dispatch(sess, frame, c);
+        if (actual != expected) fprintf(stderr,
+                "consolidate resource mode=%u rc=%d expected=%d\n", mode,
+                actual, expected);
+        CHECK(actual == expected); finish(c, expected);
+        if (mode ==
+            10) atomic_store(&wl_columnar_memory_governor_ref_get(
+                    sess->memory_governor)->usable_bytes,
+                consolidate_resource_usable);
+        wl_columnar_consolidate_test_checkpoint = NULL;
+        CHECK(wl_columnar_consolidate_test_fail_allocation == -1 &&
+            !wl_columnar_consolidate_test_fail_commit);
+        CHECK(sess->memory_budget_denied == (mode == 10));
+        CHECK(consolidate_source_hash(source) == source_hash);
+        lazy_unchanged(source); source_unpinned(source, source);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 &&
+            string_reserved(sess->memory_governor) == baseline);
+        retry(c, 0); frame = filter_frame(sess);
+        CHECK(consolidate_dispatch(sess, frame, c) == 0); finish(c, 0);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+        release(c); join_session_destroy(sess);
+    }
+}
+
+static wl_columnar_consolidate_record_t *consolidate_credit_record;
+static const void *consolidate_credit_identity;
+static unsigned consolidate_credit_visits;
+static void
+consolidate_credit_fault(wl_evaluation_control_t *c, int stage,
+    uint64_t progress,
+    wl_columnar_consolidate_record_t *record, col_rel_t *r)
+{
+    (void)progress; (void)r;
+    if (stage != 37 || consolidate_credit_visits) return;
+    CHECK(record->ready && record->phase == WL_COLUMNAR_CONSOLIDATE_PREPARING
+        && record->merge_admission_active && record->starts && record->ends
+        && record->merge_admission.bytes == 8
+        && record->merge_admission.identity == &record->merge_admission
+        && atomic_load(&record->merge_admission.state) ==
+        WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+    consolidate_credit_record = record;
+    consolidate_credit_identity = record->merge_admission.identity;
+    /* Deliberately malformed reservation validation, not healthy contention. */
+    record->merge_admission.identity = NULL;
+    consolidate_credit_visits++; wl_evaluation_control_request_cancel(c);
+}
+static void
+test_consolidate_credit_retention(void)
+{
+    wl_col_session_t *sess = join_session();
+    col_rel_t *source = relation(2, 33, 33, false, sess->memory_governor);
+    consolidate_populate(source, 2, false);
+    CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+    uint64_t baseline = string_reserved(sess->memory_governor),
+        source_hash = consolidate_source_hash(source);
+    wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+    wl_evaluation_control_t *c = control(0);
+    consolidate_credit_visits = 0;
+    wl_columnar_consolidate_test_checkpoint = consolidate_credit_fault;
+    CHECK(consolidate_dispatch(sess, frame, c) == EINVAL);
+    wl_columnar_consolidate_test_checkpoint = NULL;
+    wl_columnar_consolidate_record_t *record = consolidate_credit_record;
+    CHECK(consolidate_credit_visits == 1 &&
+        record->phase == WL_COLUMNAR_CONSOLIDATE_RETIRING
+        && !record->starts && !record->ends && record->merge_admission_active
+        && record->merge_admission.bytes == 8 &&
+        !record->merge_admission.identity
+        && atomic_load(&record->merge_admission.state) ==
+        WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        && !record->sequence.boundaries && !record->sequence.needs_sort
+        && !record->sequence.metadata_admission_active &&
+        !record->sequence.workspace.admission_active);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame);
+    CHECK(stack->top == 1 && stack->items[0].rel == source &&
+        !stack->items[0].owned);
+    CHECK(wl_columnar_eval_stack_cleanup_result(frame)->owned
+        && wl_columnar_eval_stack_cleanup_result(frame)->rel);
+    CHECK(consolidate_source_hash(source) == source_hash);
+    lazy_unchanged(source);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == EINVAL && !frame
+        && sess->cleanup_pending && sess->cleanup_pending_count == 1
+        && string_reserved(sess->memory_governor) > baseline);
+    CHECK(record->merge_admission.identity == NULL
+        && consolidate_credit_identity == &record->merge_admission);
+    record->merge_admission.identity = consolidate_credit_identity;
+    CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0 &&
+        !sess->cleanup_pending
+        && !sess->cleanup_pending_count &&
+        string_reserved(sess->memory_governor) == baseline);
+    CHECK(wl_evaluation_control_charge(c,
+        0) == WL_EVALUATION_CONTROL_CANCELLED);
+    finish(c, EINVAL); release(c); join_session_destroy(sess);
+}
+static unsigned consolidate_growth_epoch, consolidate_growth_target,
+    consolidate_growth_visits;
+static bool consolidate_growth_reset, consolidate_growth_overflow;
+static wl_columnar_relation_private_batch_t *consolidate_growth_record;
+static int64_t *consolidate_row_scratch;
+static void
+consolidate_growth_stop(wl_evaluation_control_t *c,
+    wl_columnar_relation_private_batch_t *writer, int stage, uint64_t progress)
+{
+    if (stage == 4) {
+        consolidate_growth_epoch++;
+        CHECK(progress ==
+            ((uint64_t)COL_REL_INIT_CAP << consolidate_growth_epoch));
+        CHECK(writer->batch.relation->row_scratch == consolidate_row_scratch);
+        if (consolidate_growth_epoch ==
+            consolidate_growth_target) consolidate_growth_reset = true;
+        return;
+    }
+    if (stage != 1 || progress != 128 || !consolidate_growth_reset ||
+        consolidate_growth_visits) return;
+    CHECK(writer->phase == WL_COLUMNAR_RELATION_PRIVATE_RESETTING &&
+        !writer->batch.active);
+    consolidate_growth_record = writer; consolidate_growth_visits++;
+    if (consolidate_growth_overflow) CHECK(wl_evaluation_control_charge(c,
+            UINT64_MAX) == EOVERFLOW);
+    else wl_evaluation_control_request_cancel(c);
+}
+static void
+consolidate_scratch_observe(wl_evaluation_control_t *c, int stage,
+    uint64_t progress, wl_columnar_consolidate_record_t *record, col_rel_t *r)
+{
+    (void)c; (void)progress; (void)record;
+    if (stage == 27 &&
+        !consolidate_row_scratch) consolidate_row_scratch = r->row_scratch;
+    if (stage == 27) CHECK(r->row_scratch &&
+            r->row_scratch == consolidate_row_scratch);
+}
+static void
+test_consolidate_clone_growth_reset(void)
+{
+    for (unsigned epoch = 1; epoch <= 2; epoch++) for (unsigned overflow = 0;
+            overflow < 2; overflow++) {
+            wl_col_session_t *sess = join_session();
+            col_rel_t *source = relation(2, 513, 513, false,
+                    sess->memory_governor);
+            consolidate_populate(source, 2, false);
+            CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+            uint64_t baseline = string_reserved(sess->memory_governor),
+                hash = consolidate_source_hash(source);
+            wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+            wl_evaluation_control_t *c = control(0);
+            consolidate_growth_epoch = consolidate_growth_visits = 0;
+            consolidate_growth_target = epoch;
+            consolidate_growth_reset = false;
+            consolidate_growth_overflow = overflow;
+            consolidate_row_scratch = NULL;
+            wl_columnar_relation_test_private_checkpoint =
+                consolidate_growth_stop;
+            wl_columnar_consolidate_test_checkpoint =
+                consolidate_scratch_observe;
+            int expected =
+                overflow ? EOVERFLOW : WL_EVALUATION_CONTROL_CANCELLED;
+            CHECK(consolidate_dispatch(sess, frame, c) == expected);
+            finish(c, expected);
+            wl_columnar_relation_test_private_checkpoint = NULL;
+            wl_columnar_consolidate_test_checkpoint = NULL;
+            CHECK(consolidate_growth_visits == 1 &&
+                consolidate_growth_epoch == epoch
+                && consolidate_growth_record->phase ==
+                WL_COLUMNAR_RELATION_PRIVATE_RESETTING);
+            CHECK(consolidate_source_hash(source) == hash);
+            lazy_unchanged(source); source_unpinned(source, source);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 &&
+                string_reserved(sess->memory_governor) == baseline);
+            retry(c, 0); frame = filter_frame(sess);
+            CHECK(consolidate_dispatch(sess, frame, c) == 0); finish(c, 0);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+            release(c); join_session_destroy(sess);
+        }
+}
+static unsigned consolidate_reader_mode, consolidate_reader_visits;
+static void
+consolidate_retained_reader(wl_evaluation_control_t *c, int stage,
+    uint64_t progress, wl_columnar_consolidate_record_t *record, col_rel_t *r)
+{
+    (void)progress;
+    if (stage != (consolidate_reader_mode == 2 ? 34 : 33) ||
+        consolidate_reader_visits) return;
+    CHECK(record->phase == WL_COLUMNAR_CONSOLIDATE_RETIRED);
+    CHECK(col_rel_source_reader_acquire(r, &join_retained_reader) == 0);
+    consolidate_reader_visits++;
+    if (consolidate_reader_mode == 0) wl_evaluation_control_request_cancel(c);
+    else if (consolidate_reader_mode == 1) CHECK(wl_evaluation_control_charge(c,
+            UINT64_MAX) == EOVERFLOW);
+    else CHECK(!c);
+}
+static void
+test_consolidate_healthy_reader_cleanup(void)
+{
+    for (unsigned mode = 0; mode < 3; mode++) {
+        wl_col_session_t *sess = join_session();
+        col_rel_t *source = relation(2, 33, 33, false, sess->memory_governor);
+        consolidate_populate(source, 2, false);
+        CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+        uint64_t baseline = string_reserved(sess->memory_governor),
+            hash = consolidate_source_hash(source);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+        wl_evaluation_control_t *c = control(0);
+        consolidate_reader_mode = mode; consolidate_reader_visits = 0;
+        wl_columnar_consolidate_test_checkpoint = consolidate_retained_reader;
+        int expected = mode == 0 ? EBUSY : mode == 1 ? EOVERFLOW : 0;
+        CHECK(consolidate_dispatch(sess, frame, c) == expected);
+        finish(c, expected);
+        wl_columnar_consolidate_test_checkpoint = NULL;
+        CHECK(consolidate_reader_visits == 1 && join_retained_reader.owner
+            && consolidate_source_hash(source) == hash);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == EBUSY && !frame
+            && sess->cleanup_pending &&
+            string_reserved(sess->memory_governor) > baseline);
+        CHECK(col_rel_source_reader_release(&join_retained_reader) == 0);
+        CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0
+            && !sess->cleanup_pending &&
+            string_reserved(sess->memory_governor) == baseline);
+        source_unpinned(source, source);
+        release(c); join_session_destroy(sess);
+    }
+}
+
+static unsigned consolidate_absent_visits;
+static uint64_t consolidate_sort_view;
+static bool consolidate_sort_needed;
+static void
+consolidate_absent_schema(wl_evaluation_control_t *c, int stage,
+    uint64_t progress,
+    wl_columnar_consolidate_record_t *record, col_rel_t *r)
+{
+    (void)c; (void)progress;
+    if (stage == 30) {
+        CHECK(!r->column_types &&
+            record->sequence.type_fingerprint == UINT64_C(14695981039346656037)
+            && record->sequence.workspace.prepared_type_fingerprint ==
+            UINT64_C(14695981039346656037));
+        consolidate_sort_view = r->view_generation;
+        consolidate_sort_needed = record->sequence.needs_sort_count != 0;
+        consolidate_absent_visits++;
+    } else if (stage == 31) {
+        CHECK(r->view_generation ==
+            consolidate_sort_view + consolidate_sort_needed);
+        consolidate_absent_visits++;
+    } else if (stage == 32) {
+        CHECK(r->view_generation ==
+            consolidate_sort_view + consolidate_sort_needed + 1u);
+        consolidate_absent_visits++;
+    }
+}
+static void
+test_consolidate_absent_and_shared(void)
+{
+    for (unsigned mode = 0; mode < 3; mode++) {
+        wl_col_session_t *sess = join_session();
+        col_rel_t *owner = NULL;
+        if (mode == 2) {
+            CHECK(wl_columnar_relation_new_auto_governed("canonical", 2, 33,
+                false, sess->memory_governor, &owner) == 0);
+            owner->nrows = 33;
+        } else owner = relation(2, 33, 33, false, sess->memory_governor);
+        if (mode != 1) for (uint32_t col = 0; col < 2; col++)
+                for (uint32_t row = 0; row < 33;
+                    row++) owner->columns[col][row] = 33 - row;
+        col_rel_t *source = owner;
+        if (mode == 2) {
+            source = relation(2, 1, 0, false, sess->memory_governor);
+            CHECK(col_rel_install_shared_view(source, owner) == 0);
+            CHECK(source->storage_owner == owner && source->col_shared
+                && col_rel_storage_alias_borrow_count(owner) == 1);
+        }
+        CHECK(session_add_rel(sess, source) == 0);
+        if (mode == 2) CHECK(session_add_rel(sess, owner) == 0);
+        uint64_t hash = consolidate_source_hash(source),
+            view = source->view_generation;
+        uint64_t baseline = string_reserved(sess->memory_governor);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+        wl_columnar_consolidate_record_t *record =
+            wl_columnar_eval_stack_cleanup_consolidate(frame);
+        CHECK(record && record->ready &&
+            record->phase == WL_COLUMNAR_CONSOLIDATE_INERT
+            && record->sequence.metadata_admission.identity ==
+            &record->sequence.metadata_admission
+            && record->sequence.workspace.admission.identity ==
+            &record->sequence.workspace.admission
+            && record->merge_admission.identity == &record->merge_admission
+            && !record->sequence.prepared && !record->merge_admission_active);
+        CHECK((uintptr_t)record >= (uintptr_t)frame
+            && (uintptr_t)record + sizeof(*record) <=
+            (uintptr_t)frame + sess->cleanup_reserved_bytes);
+        wl_evaluation_control_t *c = control(0);
+        consolidate_absent_visits = 0;
+        wl_columnar_consolidate_test_checkpoint = consolidate_absent_schema;
+        CHECK(consolidate_dispatch(sess, frame, c) == 0); finish(c, 0);
+        wl_columnar_consolidate_test_checkpoint = NULL;
+        CHECK(consolidate_absent_visits == 3 &&
+            !join_output(frame)->column_types);
+        CHECK(join_output(frame)->nrows == 33 &&
+            consolidate_source_hash(source) == hash
+            && source->view_generation == view);
+        if (mode == 2) CHECK(source->storage_owner == owner
+                && col_rel_storage_alias_borrow_count(owner) == 1);
+        source_unpinned(source, owner);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 &&
+            string_reserved(sess->memory_governor) == baseline);
+        release(c); join_session_destroy(sess);
+
+    }
+}
+static void
+test_consolidate_invalid_float(void)
+{
+    for (unsigned rows = 1; rows <= 2; rows++) {
+        wl_col_session_t *sess = join_session();
+        col_rel_t *source = relation(1, 2, rows, false, sess->memory_governor);
+        consolidate_populate(source, 0, true);
+        source->columns[0][0] = (int64_t)UINT64_C(0x7ff8000000000000);
+        CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+        uint64_t baseline = string_reserved(sess->memory_governor),
+            hash = consolidate_source_hash(source);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+        wl_evaluation_control_t *c = control(0);
+        consolidate_constructor_calls = 0;
+        wl_columnar_relation_test_constructor_checkpoint =
+            consolidate_constructor_count;
+        CHECK(consolidate_dispatch(sess, frame, c) == EINVAL);
+        finish(c, EINVAL);
+        wl_columnar_relation_test_constructor_checkpoint = NULL;
+        CHECK(!consolidate_constructor_calls &&
+            consolidate_source_hash(source) == hash);
+        lazy_unchanged(source); source_unpinned(source, source);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 &&
+            string_reserved(sess->memory_governor) == baseline);
+        release(c); join_session_destroy(sess);
+    }
+}
+static void
+test_consolidate_exact_work(void)
+{
+    for (unsigned rows_case = 0; rows_case < 3; rows_case++) {
+        uint64_t cost = 0;
+        for (unsigned attempt = 0; attempt < 3; attempt++) {
+            wl_col_session_t *sess = join_session();
+            uint32_t rows = rows_case == 0 ? 1u : rows_case == 1 ? 31u : 513u;
+            col_rel_t *source = relation(2, rows, rows, false,
+                    sess->memory_governor);
+            consolidate_populate(source, 2, false);
+            CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+            uint64_t hash = consolidate_source_hash(source),
+                baseline = string_reserved(sess->memory_governor);
+            wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+            wl_evaluation_control_t *c = control(attempt == 0 ? 0 : attempt ==
+                    1 ? cost : cost - 1u);
+            int expected = attempt == 2 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0;
+            CHECK(consolidate_dispatch(sess, frame, c) == expected);
+            uint64_t used = finish(c, expected);
+            if (!attempt) {
+                cost = used; CHECK(cost > 84);
+            }else if (attempt == 1) CHECK(used == cost);
+            else CHECK(used <= cost - 1u);
+            CHECK(consolidate_source_hash(source) == hash);
+            source_unpinned(source, source);
+            if (attempt == 2 || rows == 1) lazy_unchanged(source);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0
+                && string_reserved(sess->memory_governor) == baseline);
+            release(c); join_session_destroy(sess);
+        }
+    }
+}
+
 int
 main(void)
 {
     hmac_required_startup();
+    test_consolidate_actual_twins();
+    test_consolidate_reached_stops();
+    test_consolidate_original_noop();
+    test_consolidate_prepared_provenance();
+    test_consolidate_actual_pools();
+    test_consolidate_authority_retention();
+    test_consolidate_resource_failures();
+    test_consolidate_credit_retention();
+    test_consolidate_clone_growth_reset();
+    test_consolidate_healthy_reader_cleanup();
+    test_consolidate_absent_and_shared();
+    test_consolidate_invalid_float();
+    test_consolidate_exact_work();
     test_reduce_actual_twins();
     test_reduce_long_reached_stops();
     test_reduce_two_growth_reset();

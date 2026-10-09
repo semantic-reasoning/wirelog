@@ -3612,6 +3612,61 @@ typedef struct wl_columnar_relation_radix_sequence {
     bool consumed;
 } wl_columnar_relation_radix_sequence_t;
 
+typedef enum {
+    WL_COLUMNAR_CONSOLIDATE_INERT = 0,
+    WL_COLUMNAR_CONSOLIDATE_PREPARING,
+    WL_COLUMNAR_CONSOLIDATE_PREPARED,
+    WL_COLUMNAR_CONSOLIDATE_EXECUTING,
+    WL_COLUMNAR_CONSOLIDATE_CONSUMED,
+    WL_COLUMNAR_CONSOLIDATE_RETIRING,
+    WL_COLUMNAR_CONSOLIDATE_RETIRED,
+    WL_COLUMNAR_CONSOLIDATE_RESETTING
+} wl_columnar_consolidate_phase_t;
+typedef struct {
+    wl_columnar_relation_radix_sequence_t sequence;
+    uint32_t *starts, *ends;
+    wl_columnar_memory_reservation_t merge_admission;
+    bool merge_admission_active;
+    wl_columnar_consolidate_phase_t phase;
+    bool ready;
+} wl_columnar_consolidate_record_t;
+wl_columnar_consolidate_record_t *
+wl_columnar_eval_stack_cleanup_consolidate(
+    wl_columnar_eval_stack_cleanup_frame_t *);
+int wl_columnar_relation_consolidate_allocate_controlled(void **, size_t,
+    wl_evaluation_control_t *);
+int wl_columnar_relation_consolidate_commit_controlled(
+    wl_columnar_memory_reservation_t *, bool, const void *,
+    wl_evaluation_control_t *);
+int wl_columnar_relation_consolidate_retire(wl_columnar_consolidate_record_t *,
+    int);
+int wl_columnar_relation_pool_new_like_held_controlled(col_rel_t **,
+    delta_pool_t *, const char *, const col_rel_t *,
+    wl_columnar_memory_governor_ref_t *, wl_evaluation_control_t *);
+void wl_columnar_relation_consolidate_checkpoint(wl_evaluation_control_t *,
+    int, uint64_t, wl_columnar_consolidate_record_t *, col_rel_t *);
+int wl_columnar_relation_radix_workspace_prepare_with_lease_controlled(
+    col_rel_t *,
+    uint32_t, uint32_t, wl_columnar_radix_workspace_t *,
+    wl_columnar_relation_mutation_lease_t *, wl_evaluation_control_t *);
+int wl_columnar_relation_radix_type_fingerprint_controlled(const col_rel_t *,
+    uint64_t *, wl_evaluation_control_t *);
+int wl_columnar_relation_radix_sequence_prepare_with_lease_controlled(
+    col_rel_t *,
+    const uint32_t *, uint32_t, wl_columnar_relation_radix_sequence_t *,
+    wl_columnar_relation_mutation_lease_t *, wl_evaluation_control_t *);
+int wl_columnar_relation_radix_sequence_execute_with_lease_controlled(
+    wl_columnar_relation_radix_sequence_t *,
+    wl_columnar_relation_mutation_lease_t *,
+    wl_evaluation_control_t *);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_consolidate_test_checkpoint)(
+    wl_evaluation_control_t *,
+    int, uint64_t, wl_columnar_consolidate_record_t *, col_rel_t *);
+extern int wl_columnar_consolidate_test_fail_allocation;
+extern bool wl_columnar_consolidate_test_fail_commit;
+#endif
+
 /* Prepare a zero-initialized or fully destroyed workspace. Live workspaces
  * are refused unchanged; destroy releases their buffers and admission once.
  * Partial, empty and sorted ranges are supported. All boundaries are checked

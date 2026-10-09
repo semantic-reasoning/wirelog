@@ -253,6 +253,7 @@ struct wl_columnar_eval_stack_cleanup_frame {
     eval_entry_t result;
     wl_columnar_relation_source_group_t join_sources;
     wl_columnar_relation_private_batch_t reduce_batch;
+    wl_columnar_consolidate_record_t consolidate;
     wl_columnar_memory_reservation_t reservation;
     wl_columnar_memory_governor_ref_t *governor;
 };
@@ -375,6 +376,29 @@ wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
     }
     frame->reduce_batch.ready = true;
     wl_columnar_memory_reservation_init(&frame->reservation);
+    if (control) {
+        admission = wl_evaluation_control_charge(control, 64);
+        if (admission) {
+            free(frame);
+            if (sess->memory_governor) (void)wl_columnar_memory_rollback(
+                    &reservation);
+            return admission;
+        }
+    }
+    frame->consolidate.sequence.metadata_admission.identity =
+        &frame->consolidate.sequence.metadata_admission;
+    atomic_store_explicit(&frame->consolidate.sequence.metadata_admission.state,
+        WL_COLUMNAR_MEMORY_RESERVATION_EMPTY, memory_order_relaxed);
+    frame->consolidate.sequence.workspace.admission.identity =
+        &frame->consolidate.sequence.workspace.admission;
+    atomic_store_explicit(
+        &frame->consolidate.sequence.workspace.admission.state,
+        WL_COLUMNAR_MEMORY_RESERVATION_EMPTY, memory_order_relaxed);
+    frame->consolidate.merge_admission.identity =
+        &frame->consolidate.merge_admission;
+    atomic_store_explicit(&frame->consolidate.merge_admission.state,
+        WL_COLUMNAR_MEMORY_RESERVATION_EMPTY, memory_order_relaxed);
+    frame->consolidate.ready = true;
     if (control) {
         admission = wl_evaluation_control_charge(control, 0);
         if (admission) {
@@ -529,6 +553,14 @@ wl_columnar_eval_stack_cleanup_reduce_batch(
     return record;
 }
 
+wl_columnar_consolidate_record_t *
+wl_columnar_eval_stack_cleanup_consolidate(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    return frame && frame->session && frame->consolidate.ready
+        ? &frame->consolidate : NULL;
+}
+
 static void
 wl_columnar_eval_stack_cleanup_continuations(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
@@ -549,6 +581,8 @@ wl_columnar_eval_stack_cleanup_dispose(
     if (result != 0) return result;
     if (!wl_columnar_relation_private_batch_disposable(&frame->reduce_batch))
         return EINVAL;
+    result = wl_columnar_relation_consolidate_retire(&frame->consolidate, 0);
+    if (result) return result;
     result = wl_columnar_relation_source_group_drain(&frame->join_sources, 0);
     if (result != 0)
         return result;
