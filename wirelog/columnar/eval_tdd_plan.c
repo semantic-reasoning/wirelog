@@ -788,9 +788,18 @@ wl_columnar_eval_tdd_plan_insert_bindings(const wl_plan_stratum_t *sp,
     return 0;
 }
 
-/* Validate the captured schema without consulting mutable registry aliases. */
+/* Validate the captured schema without consulting mutable registry aliases.
+ * The #1984 forms bind snapshots without delta timestamps.  An insertion
+ * instance (Issue #2114) also reads a recursive stratum's own heads FULL,
+ * and those may carry timestamps, so @allow_timestamps admits them.  The
+ * run cannot act on them: a JOIN builds its output without timestamps, the
+ * operator that reads a row's multiplicity (REDUCE) is one the binder
+ * refuses, and the input stays pinned, so nothing can change its
+ * timestamps meanwhile.  The run's output is a raw bag; the caller
+ * consolidates the union of instance outputs. */
 static bool
-wl_columnar_eval_tdd_plan_input_matches(const wl_columnar_eval_tdd_input_t *in)
+wl_columnar_eval_tdd_plan_input_matches(const wl_columnar_eval_tdd_input_t *in,
+    bool allow_timestamps)
 {
     const col_rel_t *rel = in->relation;
     if (!rel || rel->ncols != in->ncols
@@ -805,7 +814,8 @@ wl_columnar_eval_tdd_plan_input_matches(const wl_columnar_eval_tdd_input_t *in)
            && rel->view_generation == in->view_generation
            && rel->storage_generation == in->storage_generation
            && rel->declared_ncols == in->declared_ncols
-           && rel->schema_ok == in->schema_ok && !rel->timestamps
+           && rel->schema_ok == in->schema_ok
+           && (allow_timestamps || !rel->timestamps)
            && (rel->column_types == NULL) == (in->column_types == NULL)
            && (!rel->column_types || memcmp(rel->column_types, in->column_types,
            rel->ncols * sizeof(*rel->column_types)) == 0)
@@ -878,6 +888,163 @@ wl_columnar_eval_tdd_plan_seed_supported(const wl_plan_stratum_t *sp,
            && wl_columnar_eval_tdd_plan_op_equal(&ops[1], &expected_map);
 }
 
+/* Reserve the run's input slots, attach @run to @worker and pin every
+ * distinct input relation for the run.  Shared by every manifest form once
+ * its inputs are validated. */
+static int
+wl_columnar_eval_tdd_plan_bind_slots(wl_col_session_t *worker,
+    const wl_columnar_eval_tdd_plan_manifest_t *manifest,
+    const wl_columnar_eval_tdd_plan_slice_t *slice,
+    const wl_columnar_eval_tdd_input_t *inputs, uint32_t input_count,
+    wl_columnar_eval_tdd_run_t *run)
+{
+    size_t bytes;
+    if (wl_columnar_eval_checked_size_mul(input_count,
+        sizeof(*run->slots), &bytes) != 0)
+        return EOVERFLOW;
+    /* Reserve in the stable caller handle: even failed setup has a durable
+     * token if releasing credit refuses. No live token is abandoned locally. */
+    wl_columnar_memory_reservation_init(&run->reservation);
+    if (worker->memory_governor) {
+        wl_columnar_memory_admission_status_t status =
+            wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(worker->memory_governor),
+            bytes, &run->reservation);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                worker->memory_budget_denied = true;
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
+                : EINVAL;
+        }
+        run->governor = worker->memory_governor;
+        wl_columnar_memory_governor_ref_retain(run->governor);
+    }
+    run->worker = worker;
+    run->manifest = manifest;
+    run->slice = slice;
+    worker->tdd_input_run = run;
+    run->slots = calloc(input_count, sizeof(*run->slots));
+    if (!run->slots)
+        return ENOMEM;
+    run->input_count = input_count;
+    if (run->governor && !wl_columnar_memory_commit(&run->reservation,
+        run->slots))
+        return EINVAL;
+    wl_columnar_eval_tdd_input_slot_t *slots = run->slots;
+    for (uint32_t i = 0; i < input_count; i++) {
+        slots[i].input = inputs[i];
+        bool duplicate = false;
+        for (uint32_t j = 0; j < i; j++)
+            duplicate |= slots[j].input.relation == inputs[i].relation;
+        if (!duplicate) {
+            int rc = col_rel_source_reader_acquire(inputs[i].relation,
+                    &slots[i].reader);
+            if (rc != 0)
+                return rc;
+        }
+        if (!wl_columnar_eval_tdd_plan_input_matches(&inputs[i],
+            manifest->form == WL_COLUMNAR_EVAL_TDD_PLAN_INSERT))
+            return EINVAL;
+    }
+    return 0;
+}
+
+/* Issue #2114: validate the inputs of one insertion instance.  Unlike the
+ * #1984 forms, which bind only the verified CSPA shapes, an insertion
+ * instance may come from any rule wl_columnar_eval_tdd_plan_insert_bindings()
+ * accepts, so this accepts any relation name and width, expressions in MAP,
+ * FILTER and a JOIN's right operand, and a serial run on one worker with no
+ * partition.  It refuses nothing that the binder admits: the operators it
+ * rejects are the ones the binder already refuses, so whatever admission
+ * accepts, this runs. */
+static int
+wl_columnar_eval_tdd_plan_prepare_insert(wl_col_session_t *worker,
+    const wl_plan_stratum_t *sp,
+    const wl_columnar_eval_tdd_plan_manifest_t *manifest, uint32_t slice_index,
+    const void *snapshot, const void *partition,
+    uint32_t worker_index, uint32_t worker_count,
+    const wl_columnar_eval_tdd_input_t *inputs, uint32_t input_count,
+    wl_columnar_eval_tdd_run_t *run)
+{
+    if (!sp->bodies)
+        return EINVAL;
+    const wl_plan_body_t *body = &sp->bodies[manifest->relation_index];
+    if (manifest->owner_relation != &sp->relations[manifest->relation_index]
+        || manifest->owner_ops != body->ops
+        || manifest->owner_op_count != body->op_count || !body->ops
+        || !manifest->slices || !manifest->reads
+        || slice_index >= manifest->slice_count)
+        return EINVAL;
+    const wl_columnar_eval_tdd_plan_slice_t *slice =
+        &manifest->slices[slice_index];
+    if (slice->seed || slice->inactive)
+        return EINVAL;
+    if (worker->diff_operators_active || worker->retraction_seeded
+        || worker->retraction_right_pass || worker->delta_seeded
+        || worker->join_batch_bytes > 0 || worker->join_batch_strict)
+        return ENOTSUP;
+    if (!slice->count || slice->start >= body->op_count
+        || slice->count > body->op_count - slice->start
+        || slice->driver < slice->start
+        || slice->driver - slice->start >= slice->count
+        || slice->read_start > manifest->read_count
+        || slice->read_count > manifest->read_count - slice->read_start
+        || input_count != slice->read_count || !input_count)
+        return EINVAL;
+    if (!partition && (worker_count != 1 || worker_index != 0))
+        return EINVAL;
+    const wl_plan_op_t *ops = body->ops;
+    uint32_t end = slice->start + slice->count;
+    uint32_t reads = 0, drivers = 0;
+    for (uint32_t i = slice->start; i < end; i++) {
+        const wl_plan_op_t *op = &ops[i];
+        if (op->opaque_data || op->agg_expr.size)
+            return ENOTSUP;
+        if (op->op == WL_PLAN_OP_MAP || op->op == WL_PLAN_OP_FILTER)
+            continue;
+        if (op->op != WL_PLAN_OP_VARIABLE && op->op != WL_PLAN_OP_JOIN
+            && op->op != WL_PLAN_OP_SEMIJOIN)
+            return ENOTSUP;
+        if ((i == slice->start) != (op->op == WL_PLAN_OP_VARIABLE)
+            || reads >= input_count)
+            return EINVAL;
+        if (op->op == WL_PLAN_OP_SEMIJOIN
+            && !wl_columnar_eval_tdd_plan_prefilter(ops, i, end))
+            return ENOTSUP;
+        const wl_columnar_eval_tdd_plan_read_t *read =
+            &manifest->reads[slice->read_start + reads];
+        const wl_columnar_eval_tdd_input_t *in = &inputs[reads++];
+        const char *name = wl_columnar_eval_tdd_plan_operand(op);
+        bool delta = i == slice->driver;
+        wl_columnar_eval_tdd_plan_read_kind_t kind = delta
+            ? WL_COLUMNAR_EVAL_TDD_PLAN_DELTA
+            : op->op == WL_PLAN_OP_SEMIJOIN
+            ? WL_COLUMNAR_EVAL_TDD_PLAN_PREFILTER
+            : WL_COLUMNAR_EVAL_TDD_PLAN_FULL;
+        if (read->op_index != i || in->read != read || !name
+            || !read->relation_name || strcmp(name, read->relation_name) != 0
+            || read->right_operand != (op->op != WL_PLAN_OP_VARIABLE)
+            || read->kind != kind || in->snapshot != snapshot
+            || !wl_columnar_eval_tdd_plan_input_matches(in, true))
+            return EINVAL;
+        if (delta) {
+            if (op->op == WL_PLAN_OP_SEMIJOIN || in->partition != partition
+                || in->worker_index != worker_index
+                || in->worker_count != worker_count)
+                return EINVAL;
+            drivers++;
+        } else if (in->partition) {
+            return EINVAL;
+        }
+    }
+    if (reads != input_count || drivers != 1)
+        return EINVAL;
+    return wl_columnar_eval_tdd_plan_bind_slots(worker, manifest, slice,
+               inputs, input_count, run);
+}
+
 int
 wl_columnar_eval_tdd_plan_prepare_inputs(wl_col_session_t *worker,
     const wl_plan_stratum_t *sp,
@@ -898,6 +1065,10 @@ wl_columnar_eval_tdd_plan_prepare_inputs(wl_col_session_t *worker,
     if (manifest->owner_stratum != sp || !sp->relations
         || manifest->relation_index >= sp->relation_count)
         return EINVAL;
+    if (manifest->form == WL_COLUMNAR_EVAL_TDD_PLAN_INSERT)
+        return wl_columnar_eval_tdd_plan_prepare_insert(worker, sp, manifest,
+                   slice_index, snapshot, partition, worker_index,
+                   worker_count, inputs, input_count, run);
     const wl_plan_relation_t *rel = &sp->relations[manifest->relation_index];
     if (manifest->owner_relation != rel || manifest->owner_ops != rel->ops
         || manifest->owner_op_count != rel->op_count || !rel->ops
@@ -979,7 +1150,7 @@ wl_columnar_eval_tdd_plan_prepare_inputs(wl_col_session_t *worker,
             || !read->relation_name || strcmp(name, read->relation_name) != 0
             || read->right_operand != (op->op != WL_PLAN_OP_VARIABLE)
             || read->kind != kind || in->snapshot != snapshot
-            || !wl_columnar_eval_tdd_plan_input_matches(in))
+            || !wl_columnar_eval_tdd_plan_input_matches(in, false))
             return EINVAL;
         if (delta) {
             if (op->delta_mode != (k1 ? WL_DELTA_AUTO : WL_DELTA_FORCE_DELTA)
@@ -1000,56 +1171,8 @@ wl_columnar_eval_tdd_plan_prepare_inputs(wl_col_session_t *worker,
     }
     if (reads != input_count || drivers != (seed ? 0u : 1u))
         return EINVAL;
-    size_t bytes;
-    if (wl_columnar_eval_checked_size_mul(input_count,
-        sizeof(*run->slots), &bytes) != 0)
-        return EOVERFLOW;
-    /* Reserve in the stable caller handle: even failed setup has a durable
-     * token if releasing credit refuses. No live token is abandoned locally. */
-    wl_columnar_memory_reservation_init(&run->reservation);
-    if (worker->memory_governor) {
-        wl_columnar_memory_admission_status_t status =
-            wl_columnar_memory_reserve_checked(
-            wl_columnar_memory_governor_ref_get(worker->memory_governor),
-            bytes, &run->reservation);
-        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
-            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
-            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
-                worker->memory_budget_denied = true;
-            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
-                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
-                : EINVAL;
-        }
-        run->governor = worker->memory_governor;
-        wl_columnar_memory_governor_ref_retain(run->governor);
-    }
-    run->worker = worker;
-    run->manifest = manifest;
-    run->slice = slice;
-    worker->tdd_input_run = run;
-    run->slots = calloc(input_count, sizeof(*run->slots));
-    if (!run->slots)
-        return ENOMEM;
-    run->input_count = input_count;
-    if (run->governor && !wl_columnar_memory_commit(&run->reservation,
-        run->slots))
-        return EINVAL;
-    wl_columnar_eval_tdd_input_slot_t *slots = run->slots;
-    for (uint32_t i = 0; i < input_count; i++) {
-        slots[i].input = inputs[i];
-        bool duplicate = false;
-        for (uint32_t j = 0; j < i; j++)
-            duplicate |= slots[j].input.relation == inputs[i].relation;
-        if (!duplicate) {
-            int rc = col_rel_source_reader_acquire(inputs[i].relation,
-                    &slots[i].reader);
-            if (rc != 0)
-                return rc;
-        }
-        if (!wl_columnar_eval_tdd_plan_input_matches(&inputs[i]))
-            return EINVAL;
-    }
-    return 0;
+    return wl_columnar_eval_tdd_plan_bind_slots(worker, manifest, slice,
+               inputs, input_count, run);
 }
 
 int

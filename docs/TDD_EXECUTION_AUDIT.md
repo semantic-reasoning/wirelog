@@ -315,6 +315,23 @@ revalidated against the owning plan before each begin. Only the JOIN-right
 frame. Seed MAP expressions and outer CONCAT/CONSOLIDATE/EXCHANGE are checked
 as part of the recognized grammar but are not executed by this slice.
 
+Insertion instances (Issue #2114) are a third manifest form,
+`WL_COLUMNAR_EVAL_TDD_PLAN_INSERT`, built by
+`wl_columnar_eval_tdd_plan_insert_bindings()` over the relation's body as
+lowered (`wl_plan_stratum_t.bodies`) rather than its rewritten operators. The
+helper validates them separately and does not apply the CSPA-only grammar
+above: any relation name and width, MAP and FILTER expressions, right filters
+and inline compound columns are accepted, and a serial run on worker 0 of 1
+may pass a NULL partition. Exactly one read, the instance's driver, is DELTA;
+a SEMIJOIN must be the recognised prefilter. Inputs of this form may carry
+delta timestamps, because the instance reads a recursive stratum's own heads
+FULL and those may be timestamped; the #1984 forms still refuse them. A run's
+output is a raw bag, as for the other forms: the caller consolidates the
+union of instance outputs. The
+operators it refuses are the ones the binder already refuses, so every
+instance the binder lists can begin. Retractions, differential operators and
+batch pipelines still refuse before evaluation.
+
 `meson test -C builddir tdd_occurrence_execution` runs all five active alternatives
 of the unmodified generated CSPA `valueAlias` plan with independently partitioned
 small inputs at W=1/2/8 and checks exact output tuples. It also exercises a

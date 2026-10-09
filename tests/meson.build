@@ -3182,6 +3182,16 @@ test_tdd_insert_manifest_exe = executable(
 
 test('tdd_insert_manifest', test_tdd_insert_manifest_exe)
 
+test_tdd_insert_run_exe = executable(
+  'test_tdd_insert_run',
+  files('test_tdd_insert_run.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+
+test('tdd_insert_run', test_tdd_insert_run_exe)
+
 bench_incremental_frontier_exe = executable(
   'bench_incremental_frontier',
   files('bench_incremental_frontier.c'),
