@@ -3,6 +3,7 @@
 #include "wirelog/wirelog.h"
 #include "wirelog/intern.h"
 #include "wirelog/thread.h"
+#include "wirelog/evaluation_control.h"
 #include <errno.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -567,6 +568,113 @@ wl_extension_callback_lease_release(void *lease)
     wl_mutex_unlock(&entry->registry->mutex);
     if (destroy)
         wl_extension_entry_destroy(entry);
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_extension_test_controlled_checkpoint)(wl_evaluation_control_t *, int,
+    size_t);
+#endif
+static void
+wl_extension_controlled_checkpoint(wl_evaluation_control_t *control, int stage,
+    size_t progress)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_extension_test_controlled_checkpoint)
+        wl_extension_test_controlled_checkpoint(control, stage, progress);
+#else
+    (void)control; (void)stage; (void)progress;
+#endif
+}
+static bool
+wl_extension_trim_byte(unsigned char c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+int
+wl_extension_callback_lookup_controlled(
+    const wirelog_extension_snapshot_t *snapshot, const char *name,
+    const wirelog_extension_descriptor_t **descriptor, void **lease,
+    wl_evaluation_control_t *control)
+{
+    if (!descriptor || !lease || !control) return EINVAL;
+    *descriptor = NULL; *lease = NULL;
+    if (!snapshot || !name) return 0;
+    char normalized[256]; size_t length = 0, begin = 0, end;
+    int rc;
+    for (;;) {
+        rc = wl_evaluation_control_charge(control, 2); if (rc) return rc;
+        unsigned char c = (unsigned char)name[length];
+        wl_extension_controlled_checkpoint(control, 81, length + 1);
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (!c) break;
+        if (length == 255) return 0;
+        length++;
+    }
+    while (begin < length) {
+        rc = wl_evaluation_control_charge(control, 2); if (rc) return rc;
+        bool trim = wl_extension_trim_byte((unsigned char)name[begin]);
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (!trim) break;
+        begin++;
+    }
+    end = length;
+    while (end > begin) {
+        rc = wl_evaluation_control_charge(control, 2); if (rc) return rc;
+        bool trim = wl_extension_trim_byte((unsigned char)name[end - 1]);
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (!trim) break;
+        end--;
+    }
+    if (end == begin) return 0;
+    for (size_t i = 0; i < end - begin; i++) {
+        rc = wl_evaluation_control_charge(control, 2); if (rc) return rc;
+        normalized[i] = name[begin + i];
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(control, 1); if (rc) return rc;
+    normalized[end - begin] = 0;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    wl_extension_entry_t *owned = NULL;
+    /* Platform mutex waiting is an explicit external synchronization boundary.
+     * Every control exit while locked takes the actual mandatory unlock. */
+    wl_mutex_lock(&snapshot->registry->mutex);
+    for (size_t i = 0; i < snapshot->count; i++) {
+        rc = wl_evaluation_control_charge(control, 8); if (rc) goto unlock;
+        wl_extension_entry_t *entry = snapshot->entries[i];
+        wl_extension_controlled_checkpoint(control, 82, i + 1);
+        rc = wl_evaluation_control_charge(control, 0); if (rc) goto unlock;
+        bool equal = true;
+        for (size_t j = 0;; j++) {
+            rc = wl_evaluation_control_charge(control, 3); if (rc) goto unlock;
+            unsigned char a = (unsigned char)entry->name[j];
+            unsigned char b = (unsigned char)normalized[j];
+            wl_extension_controlled_checkpoint(control, 83, j + 1);
+            rc = wl_evaluation_control_charge(control, 0); if (rc) goto unlock;
+            if (a != b) {
+                equal = false; break;
+            }
+            if (!a) break;
+        }
+        if (!equal) continue;
+        rc = wl_evaluation_control_charge(control, 16); if (rc) goto unlock;
+        if (entry->references == SIZE_MAX ||
+            snapshot->registry->active_leases == SIZE_MAX) {
+            rc = EOVERFLOW; goto unlock;
+        }
+        entry->references++; snapshot->registry->active_leases++; owned = entry;
+        break;
+    }
+unlock:
+    wl_mutex_unlock(&snapshot->registry->mutex);
+    if (rc) return rc;
+    if (!owned) return 0;
+    wl_extension_controlled_checkpoint(control, 84, 1);
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) {
+        wl_extension_callback_lease_release(owned); return rc;
+    }
+    *descriptor = &owned->descriptor; *lease = owned;
+    return 0;
 }
 
 int

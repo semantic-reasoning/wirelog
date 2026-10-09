@@ -55,6 +55,12 @@ wl_extension_callback_lease_acquire(
     const wirelog_extension_descriptor_t *descriptor);
 void
 wl_extension_callback_lease_release(void *lease);
+struct wl_evaluation_control;
+int
+wl_extension_callback_lookup_controlled(
+    const wirelog_extension_snapshot_t *snapshot, const char *name,
+    const wirelog_extension_descriptor_t **descriptor, void **lease,
+    struct wl_evaluation_control *control);
 
 /* Issue #2122: true when every extension in @snapshot declares a
  * thread-safe callback, and for a NULL or empty snapshot. */

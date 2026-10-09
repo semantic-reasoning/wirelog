@@ -7504,12 +7504,12 @@ test_string_unmanaged_caller_governed_table(void)
     int64_t value = INT64_MIN; bool failed = true;
     wl_columnar_expr_status_t status = WL_COLUMNAR_EXPR_MALFORMED;
     CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL, 0, &value,
-        &failed, &sess, &status, c) == 0);
+        &failed, &sess, &status, false, c) == 0);
     finish(c, 0); CHECK(!failed && status == WL_COLUMNAR_EXPR_OK && value == 0);
     CHECK(wl_intern_count(table) == 1 && string_reserved(t) == 256+512+12);
     retry(c, 0);
     CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL, 0, &value,
-        &failed, &sess, &status, c) == 0); finish(c, 0);
+        &failed, &sess, &status, false, c) == 0); finish(c, 0);
     CHECK(!failed && value == 0 && string_reserved(t) == 256+512+12);
     wl_intern_free(table); release(c); governor_empty(t);
     wl_columnar_memory_governor_ref_release(t);
@@ -8979,7 +8979,7 @@ uuid_known_vector(const char *ns, const char *name, const uint8_t expected[20])
     wl_columnar_expr_status_t status; bool failed; int64_t actual;
     wl_evaluation_control_t *c = control(0);
     CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL, 0,
-        &actual, &failed, sess, &status, c) == 0);
+        &actual, &failed, sess, &status, false, c) == 0);
     CHECK(!failed && actual == 1 && status == WL_COLUMNAR_EXPR_OK);
     finish(c, 0); release(c); wl_intern_free(sess->intern);
     sess->intern = NULL; join_session_destroy(sess);
@@ -9046,7 +9046,7 @@ test_uuid_pair_native_and_fallback_vectors(void)
             bool failed; int64_t value; wl_columnar_expr_status_t status;
             wl_evaluation_control_t *c = control(0);
             CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL,
-                0, &value, &failed, NULL, &status, c) == 0 && !failed &&
+                0, &value, &failed, NULL, &status, false, c) == 0 && !failed &&
                 value == 1);
             finish(c, 0); release(c);
         }
@@ -9088,7 +9088,8 @@ test_uuid_pair_mixed_vectors(void)
         bool failed; int64_t value; wl_columnar_expr_status_t status;
         wl_evaluation_control_t *c = control(0);
         CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL, 0,
-            &value, &failed, sess, &status, c) == 0 && !failed && value == 1);
+            &value, &failed, sess, &status, false,
+            c) == 0 && !failed && value == 1);
         finish(c, 0); release(c); wl_intern_free(sess->intern);
         sess->intern = NULL; join_session_destroy(sess);
     }
@@ -10662,6 +10663,777 @@ test_hmac_configured_false_refusal(void)
 #endif
 }
 
+/* Actual extension lookup, callback effects and operator result channels. */
+extern void (*wl_extension_test_controlled_checkpoint)(
+    wl_evaluation_control_t *, int, size_t);
+static wirelog_extension_registry_t *extension_registry;
+static wirelog_extension_snapshot_t *extension_snapshot;
+static char extension_registered_names[520][256];
+static unsigned extension_registered_count;
+static bool extension_unregistered;
+static unsigned extension_calls, extension_destroyed, extension_mode;
+static wl_evaluation_control_t *extension_callback_control;
+static bool extension_positive;
+static uint32_t extension_expected_args, extension_declared_result;
+static unsigned extension_zero_lookup_visits;
+static const uint8_t *extension_string;
+static size_t extension_string_size;
+static wl_col_session_t *extension_nested_session;
+static const uint8_t *extension_nested_buf;
+static uint32_t extension_nested_size;
+static wl_columnar_expr_status_t extension_nested_status;
+static bool extension_destructor_controlled;
+static int extension_session_keys[65];
+static unsigned extension_depth, extension_tls_visits;
+
+static uint32_t
+extension_encode(uint8_t *buf, uint32_t pos, const void *name,
+    uint16_t length, uint32_t nargs, bool abi)
+{
+    buf[pos++] = abi ? WL_PLAN_EXPR_EXTENSION_CALL_ABI :
+        WL_PLAN_EXPR_EXTENSION_CALL;
+    buf[pos++] = (uint8_t)length; buf[pos++] = (uint8_t)(length >> 8);
+    if (length) memcpy(buf + pos, name, length);
+    pos += length;
+    for (unsigned j = 0; j < 4; j++) buf[pos++] = (uint8_t)(nargs >> (j * 8));
+    if (abi) {
+        for (unsigned j = 0; j < 8;
+            j++) buf[pos++] = (uint8_t)(UINT64_C(0x1020304050607080) >>
+                (j * 8));
+        for (unsigned j = 0; j < 4; j++) buf[pos++] = (uint8_t)(7u >> (j * 8));
+    }
+    return pos;
+}
+static void
+extension_nested_eval(bool controlled)
+{
+    int64_t value = INT64_MIN; bool failed = false;
+    extension_nested_status = WL_COLUMNAR_EXPR_OK;
+    wl_evaluation_control_t *c = controlled ? control(0) : NULL;
+    CHECK(wl_columnar_expr_eval_interpreter_controlled(extension_nested_buf,
+        extension_nested_size, NULL, 0, &value, &failed,
+        extension_nested_session, &extension_nested_status, false, c) == 0);
+    CHECK(failed);
+    if (c) {
+        finish(c, 0); release(c);
+    }
+}
+static void
+extension_destroy(void *data)
+{
+    (void)data;
+    extension_destroyed++;
+    if (extension_nested_session) extension_nested_eval(
+            extension_destructor_controlled);
+}
+static int
+extension_invoke(const wirelog_extension_value_t *args, uint32_t nargs,
+    wirelog_extension_value_t *result, void *data)
+{
+    (void)data;
+    extension_calls++;
+    CHECK(nargs == extension_expected_args);
+    if (extension_string) {
+        CHECK(nargs == 1 && args[0].type == WIRELOG_EXTENSION_VALUE_STRING &&
+            args[0].size == extension_string_size &&
+            args[0].as.string_value.length == extension_string_size &&
+            memcmp(args[0].as.string_value.data, extension_string,
+            extension_string_size) == 0);
+    }
+    if (extension_mode == 4 && extension_snapshot) {
+        CHECK(wirelog_extension_unregister(extension_registry, "ext") == 0);
+        extension_unregistered = true;
+        wirelog_extension_snapshot_t *held = extension_snapshot;
+        extension_snapshot = NULL;
+        wirelog_extension_snapshot_release(held);
+        CHECK(!extension_destroyed);
+    }
+    if (extension_mode == 5) {
+        extension_depth++;
+        const void *old_key = extension_nested_session->callback_session_key;
+        extension_nested_session->callback_session_key =
+            &extension_session_keys[extension_depth];
+        int64_t value; bool failed; wl_columnar_expr_status_t status;
+        wl_evaluation_control_t *c = control(0);
+        CHECK(wl_columnar_expr_eval_interpreter_controlled(extension_nested_buf,
+            extension_nested_size, NULL, 0, &value, &failed,
+            extension_nested_session, &status, false, c) == 0);
+        finish(c, 0); release(c);
+        if (extension_depth == 64) CHECK(failed &&
+                status == WL_COLUMNAR_EXPR_CALLBACK_REENTRANT);
+        else CHECK(!failed && value == 1);
+        extension_nested_session->callback_session_key = old_key;
+        extension_depth--;
+    }
+    if (extension_mode == 6 && extension_depth < 2) {
+        extension_depth++;
+        int64_t value; bool failed; wl_columnar_expr_status_t status;
+        wl_evaluation_control_t *nested_control =
+            extension_destructor_controlled ? control(0) : NULL;
+        CHECK(wl_columnar_expr_eval_interpreter_controlled(extension_nested_buf,
+            extension_nested_size, NULL, 0, &value, &failed,
+            extension_nested_session,
+            &status, false, nested_control) == 0 && !failed && value == 1);
+        if (nested_control) {
+            finish(nested_control, 0); release(nested_control);
+        }
+        extension_depth--;
+    }
+    if (extension_mode == 7) {
+        extension_nested_eval(extension_destructor_controlled);
+        CHECK(extension_nested_status == WL_COLUMNAR_EXPR_CALLBACK_REENTRANT);
+    }
+    if (extension_mode == 8) {
+        wl_plan_stratum_t nested_stratum = {0};
+        CHECK(col_eval_stratum(&nested_stratum, extension_nested_session,
+            0) == EBUSY);
+    }
+    if (extension_callback_control) {
+        if (extension_positive) CHECK(wl_evaluation_control_charge(
+                    extension_callback_control, UINT64_MAX) == EOVERFLOW);
+        else wl_evaluation_control_request_cancel(extension_callback_control);
+    }
+    result->type = extension_mode == 2 ? WIRELOG_EXTENSION_VALUE_STRING :
+        extension_mode == 3 ? WIRELOG_EXTENSION_VALUE_INT64 :
+        WIRELOG_EXTENSION_VALUE_BOOL;
+    result->size = extension_mode == 3 ? sizeof(int64_t) : sizeof(uint8_t);
+    if (extension_mode == 3) result->as.int64_value = -19;
+    else result->as.bool_value = 1;
+    return extension_mode == 1 ? -777 : 0;
+}
+static void
+extension_register(const char *name, uint32_t arity, uint32_t type,
+    const uint32_t *arguments, uint32_t policy, bool destructor)
+{
+    /* Public registration requires a valid type for every actual argument;
+    * the evaluator's defensive zero-wildcard branch is not registrable. */
+    uint32_t integer_types[COL_FILTER_STACK];
+    CHECK(arity <= COL_FILTER_STACK);
+    if (arity && !arguments) {
+        for (uint32_t j = 0; j < arity;
+            j++) integer_types[j] = WIRELOG_EXTENSION_VALUE_INT64;
+        arguments = integer_types;
+    }
+    wirelog_extension_descriptor_t descriptor = {
+        .abi_version = WIRELOG_EXTENSION_ABI_VERSION,
+        .size = sizeof(descriptor),
+        .name = name, .arity = arity, .argument_types = arguments,
+        .result_type = type, .invoke = extension_invoke,
+        .destroy = destructor ? extension_destroy : NULL,
+        .callback_policy = policy,
+        .addon_abi_identity = UINT64_C(0x1020304050607080),
+        .addon_abi_version = 7
+    };
+    CHECK(wirelog_extension_register(extension_registry, &descriptor) == 0);
+    CHECK(extension_registered_count < 520);
+    strcpy(extension_registered_names[extension_registered_count++], name);
+}
+static void
+extension_setup(const char *name, uint32_t arity, uint32_t type,
+    const uint32_t *arguments, uint32_t policy, bool destructor)
+{
+    extension_calls = extension_destroyed = extension_mode = 0;
+    extension_registered_count = 0; extension_unregistered = false;
+    extension_expected_args = arity; extension_declared_result = type;
+    extension_callback_control = NULL;
+    extension_string = NULL; extension_nested_session = NULL;
+    extension_registry = wirelog_extension_registry_create();
+    CHECK(extension_registry);
+    extension_register(name, arity, type, arguments, policy, destructor);
+    extension_snapshot = wirelog_extension_snapshot_acquire(extension_registry);
+    CHECK(extension_snapshot);
+}
+static void
+extension_teardown(void)
+{
+    if (extension_snapshot) wirelog_extension_snapshot_release(
+            extension_snapshot);
+    extension_snapshot = NULL;
+    for (unsigned i = 0; i < extension_registered_count; i++) {
+        if (extension_unregistered && strcmp(extension_registered_names[i],
+            "ext") == 0) continue;
+        CHECK(wirelog_extension_unregister(extension_registry,
+            extension_registered_names[i]) == 0);
+    }
+    CHECK(wirelog_extension_registry_destroy(extension_registry) == 0);
+    extension_registry = NULL;
+}
+static void
+extension_zero_lookup(wl_evaluation_control_t *c, int stage, size_t progress)
+{
+    (void)c; (void)stage; (void)progress;
+    extension_zero_lookup_visits++;
+}
+static void
+extension_caller_twins(uint8_t *buf, uint32_t size, uint32_t rows,
+    int filter_error, int map_error, bool exact)
+{
+    for (int map = 0; map < 2; map++) {
+        wl_col_session_t *sess = join_session(), *raw = join_session();
+        sess->base.extension_snapshot = raw->base.extension_snapshot =
+            extension_snapshot;
+        sess->callback_session_key = sess; raw->callback_session_key = raw;
+        sess->intern = string_table(sess->memory_governor, 0);
+        raw->intern = string_table(raw->memory_governor, 0);
+        col_rel_t *source = relation(1, rows, rows, false,
+                sess->memory_governor);
+        col_rel_t *ref = relation(1, rows, rows, false, raw->memory_governor);
+        CHECK(session_add_rel(sess, source) == 0 && session_add_rel(raw,
+            ref) == 0);
+        wl_plan_expr_buffer_t expr = {buf, size};
+        wl_plan_op_t ops[2] = {
+            {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+             .delta_mode = WL_DELTA_FORCE_FULL},
+            {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+             .filter_expr = expr,
+             .project_count = 1, .map_exprs = &expr, .map_expr_count = 1}
+        };
+        wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess),
+            *reference = filter_frame(raw);
+        wl_evaluation_control_t *c = control(0);
+        unsigned before = extension_calls;
+        if (!rows) {
+            extension_zero_lookup_visits = 0;
+            wl_extension_test_controlled_checkpoint = extension_zero_lookup;
+        }
+        int expected = rows ? (map ? map_error : filter_error) : 0;
+        if (extension_mode == 8) extension_nested_session = sess;
+        CHECK(compiled_dispatch(sess, frame, ops, 2, c) == expected);
+        uint64_t cost = finish(c, expected);
+        if (!rows) {
+            CHECK(!extension_zero_lookup_visits);
+            wl_extension_test_controlled_checkpoint = NULL;
+        }
+        unsigned actual_calls = extension_calls - before;
+        if (!map &&
+            extension_declared_result ==
+            WIRELOG_EXTENSION_VALUE_INT64) CHECK(!actual_calls);
+        before = extension_calls;
+        if (extension_mode == 8) extension_nested_session = raw;
+        CHECK(compiled_dispatch(raw, reference, ops, 2, NULL) == expected);
+        if (extension_mode == 8) extension_nested_session = NULL;
+        CHECK(extension_calls - before == actual_calls);
+        if (!rows) CHECK(!actual_calls);
+        if (expected) CHECK(sess->extension_expr_status == expected &&
+                raw->extension_expr_status == expected);
+        else filter_equal(join_output(frame), join_output(reference));
+        source_unpinned(source, source);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+        if (exact && !expected) {
+            wl_intern_free(sess->intern);
+            sess->intern = string_table(sess->memory_governor, 0);
+            frame = filter_frame(sess); retry(c, cost - 1);
+            CHECK(compiled_dispatch(sess, frame, ops, 2,
+                c) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+            finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+            wl_intern_free(sess->intern);
+            sess->intern = string_table(sess->memory_governor, 0);
+            frame = filter_frame(sess); retry(c, cost);
+            CHECK(compiled_dispatch(sess, frame, ops, 2, c) == 0 && finish(c,
+                0) == cost);
+            filter_equal(join_output(frame), join_output(reference));
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+        }
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&reference) == 0);
+        wl_intern_free(sess->intern); wl_intern_free(raw->intern);
+        sess->intern = raw->intern = NULL;
+        release(c); join_session_destroy(sess); join_session_destroy(raw);
+    }
+}
+static void
+test_extension_actual_twins(void)
+{
+    for (int abi = 0; abi < 2; abi++) {
+        uint8_t buf[6000];
+        extension_setup("ext", 1, WIRELOG_EXTENSION_VALUE_BOOL, NULL, 0, false);
+        uint32_t n = compiled_var(buf, 0, "col0");
+        n = extension_encode(buf, n, "ext", 3, 1, abi);
+        extension_caller_twins(buf, n, 3, 0, 0, true);
+        extension_caller_twins(buf, n, 0, 0, 0, false);
+        for (unsigned mode = 1; mode <= 3; mode++) {
+            extension_mode = mode;
+            extension_caller_twins(buf, n, 1,
+                mode ==
+                1 ? WL_COLUMNAR_EXPR_CALLBACK_FAILURE :
+                WL_COLUMNAR_EXPR_INVALID_RESULT,
+                mode == 1 ? WL_COLUMNAR_EXPR_CALLBACK_FAILURE : mode ==
+                2 ? WL_COLUMNAR_EXPR_INVALID_RESULT : 0, false);
+        }
+        extension_mode = 0;
+        if (abi) {
+            buf[n-1] ^= 1;
+            extension_caller_twins(buf, n, 1,
+                WL_COLUMNAR_EXPR_EXTENSION_ABI_MISMATCH,
+                WL_COLUMNAR_EXPR_EXTENSION_ABI_MISMATCH, false); buf[n-1] ^= 1;
+            extension_caller_twins(buf, n-1, 1,
+                WL_COLUMNAR_EXPR_EXTENSION_MALFORMED,
+                WL_COLUMNAR_EXPR_EXTENSION_MALFORMED, false);
+        }
+        n = compiled_const(buf, 0, 3);
+        const char serialized[] = {' ', '\t', '\n', '\r', 'e', 'x', 't', ' ',
+                                   '\t', '\r', '\n', 0, 'z'};
+        n = extension_encode(buf, n, serialized, sizeof(serialized), 1, abi);
+        extension_caller_twins(buf, n, 1, 0, 0, false);
+        n = extension_encode(buf, 0, "ext", 3, 1, abi);
+        extension_caller_twins(buf, n, 1, WL_COLUMNAR_EXPR_ARITY_MISMATCH,
+            WL_COLUMNAR_EXPR_ARITY_MISMATCH, false);
+        n = extension_encode(buf, 0, "missing", 7, 0, abi);
+        extension_caller_twins(buf, n, 1, WL_COLUMNAR_EXPR_MISSING_EXTENSION,
+            WL_COLUMNAR_EXPR_MISSING_EXTENSION, false);
+        for (unsigned length = 0; length <= 256; length += 256) {
+            char name[256]; memset(name, 'n', sizeof(name));
+            n = extension_encode(buf, 0, name, (uint16_t)length, 0, abi);
+            extension_caller_twins(buf, n, 1,
+                WL_COLUMNAR_EXPR_EXTENSION_MALFORMED,
+                WL_COLUMNAR_EXPR_EXTENSION_MALFORMED, false);
+        }
+        n = extension_encode(buf, 0, "e", 1, 0, abi);
+        extension_caller_twins(buf, n, 1, WL_COLUMNAR_EXPR_MISSING_EXTENSION,
+            WL_COLUMNAR_EXPR_MISSING_EXTENSION, false);
+        n = extension_encode(buf, 0, "ext", 3, 1, false);
+        extension_caller_twins(buf, n-1, 1,
+            WL_COLUMNAR_EXPR_EXTENSION_MALFORMED,
+            WL_COLUMNAR_EXPR_EXTENSION_MALFORMED, false);
+        extension_teardown();
+        uint32_t required = WIRELOG_EXTENSION_VALUE_STRING;
+        extension_setup("ext", 1, WIRELOG_EXTENSION_VALUE_BOOL, &required, 0,
+            false);
+        const uint8_t text[] = {'a', 0, 'b', 255};
+        extension_string = text; extension_string_size = sizeof(text);
+        n = string_literal(buf, 0, (const char *)text, sizeof(text));
+        n = extension_encode(buf, n, "ext", 3, 1, abi);
+        extension_caller_twins(buf, n, 1, 0, 0, true);
+        extension_string = NULL;
+        n = compiled_const(buf, 0, 4);
+        n = extension_encode(buf, n, "ext", 3, 1, abi);
+        extension_caller_twins(buf, n, 1, WL_COLUMNAR_EXPR_TYPE_MISMATCH,
+            WL_COLUMNAR_EXPR_TYPE_MISMATCH, false);
+        extension_teardown();
+        required = WIRELOG_EXTENSION_VALUE_BOOL;
+        extension_setup("ext", 1, WIRELOG_EXTENSION_VALUE_BOOL, &required, 0,
+            false);
+        buf[0] = WL_PLAN_EXPR_BOOL; buf[1] = 1;
+        n = extension_encode(buf, 2, "ext", 3, 1, abi);
+        extension_caller_twins(buf, n, 1, 0, 0, false); extension_teardown();
+        extension_setup("ext", 0, WIRELOG_EXTENSION_VALUE_INT64, NULL, 0,
+            false);
+        extension_mode = 3; n = extension_encode(buf, 0, "ext", 3, 0, abi);
+        extension_caller_twins(buf, n, 1, WL_COLUMNAR_EXPR_INVALID_RESULT, 0,
+            false); extension_teardown();
+        extension_setup("ext", COL_FILTER_STACK, WIRELOG_EXTENSION_VALUE_BOOL,
+            NULL, 0, false);
+        n = 0;
+        for (unsigned j = 0; j < COL_FILTER_STACK;
+            j++) n = compiled_const(buf, n, j);
+        n = extension_encode(buf, n, "ext", 3, COL_FILTER_STACK, abi);
+        extension_caller_twins(buf, n, 1, 0, 0, true); extension_teardown();
+    }
+}
+
+static int extension_stop_stage;
+static size_t extension_stop_progress;
+static unsigned extension_stop_reached;
+static void
+extension_registry_stop(wl_evaluation_control_t *c, int stage, size_t progress)
+{
+    if (stage != extension_stop_stage ||
+        progress != extension_stop_progress) return;
+    extension_stop_reached++;
+    wl_extension_test_controlled_checkpoint = NULL;
+    if (extension_positive) CHECK(wl_evaluation_control_charge(c,
+            UINT64_MAX) == EOVERFLOW);
+    else wl_evaluation_control_request_cancel(c);
+}
+static void
+extension_expr_stop(wl_evaluation_control_t *c, int stage, uint64_t progress,
+    bool failed)
+{
+    (void)failed;
+    if (stage == 85) extension_tls_visits++;
+    if (stage != extension_stop_stage ||
+        progress != extension_stop_progress) return;
+    extension_stop_reached++;
+    wl_columnar_expr_test_controlled_checkpoint = NULL;
+    if (extension_positive) CHECK(wl_evaluation_control_charge(c,
+            UINT64_MAX) == EOVERFLOW);
+    else wl_evaluation_control_request_cancel(c);
+}
+static void
+extension_stop_trial(uint8_t *buf, uint32_t size, int map, int stage,
+    size_t progress, bool positive, unsigned mode)
+{
+    wl_col_session_t *sess = join_session();
+    sess->base.extension_snapshot = extension_snapshot;
+    sess->callback_session_key = sess;
+    col_rel_t *source = relation(1, 1, 1, false, sess->memory_governor);
+    CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+    uint64_t before = string_reserved(sess->memory_governor);
+    wl_plan_expr_buffer_t expr = {buf, size};
+    wl_plan_op_t ops[2] = {
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+         .delta_mode = WL_DELTA_FORCE_FULL},
+        {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER, .filter_expr = expr,
+         .project_count = 1, .map_exprs = &expr, .map_expr_count = 1}
+    };
+    wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+    wl_evaluation_control_t *c = control(0);
+    unsigned calls = extension_calls;
+    extension_mode = mode;
+    extension_stop_stage = stage; extension_stop_progress = progress;
+    extension_stop_reached = 0; extension_positive = positive;
+    if (stage >= 81 &&
+        stage <=
+        84) wl_extension_test_controlled_checkpoint = extension_registry_stop;
+    else if (stage) wl_columnar_expr_test_controlled_checkpoint =
+            extension_expr_stop;
+    else {
+        CHECK(wl_evaluation_control_retain(c) == 0);
+        extension_callback_control = c;
+    }
+    int expected = positive ? EOVERFLOW : WL_EVALUATION_CONTROL_CANCELLED;
+    CHECK(compiled_dispatch(sess, frame, ops, 2, c) == expected);
+    finish(c, expected);
+    CHECK(!sess->memory_budget_denied && !sess->extension_expr_status);
+    if (stage) CHECK(extension_stop_reached == 1);
+    CHECK(extension_calls - calls == (unsigned)(stage == 0 || stage == 88 ||
+        stage == 3));
+    lazy_unchanged(source); source_unpinned(source, source);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 &&
+        string_reserved(sess->memory_governor) == before);
+    wl_extension_test_controlled_checkpoint = NULL;
+    wl_columnar_expr_test_controlled_checkpoint = NULL;
+    if (!stage) wl_evaluation_control_release(extension_callback_control);
+    extension_callback_control = NULL; extension_mode = 0;
+    frame = filter_frame(sess); retry(c, 0); calls = extension_calls;
+    CHECK(compiled_dispatch(sess, frame, ops, 2, c) == 0); finish(c, 0);
+    CHECK(extension_calls == calls + 1);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 &&
+        string_reserved(sess->memory_governor) == before);
+    release(c); join_session_destroy(sess);
+}
+static void
+test_extension_registry_and_callback_stops(void)
+{
+    uint8_t buf[6000]; char name[256]; memset(name, 'n', 255); name[255] = 0;
+    extension_setup(name, COL_FILTER_STACK, WIRELOG_EXTENSION_VALUE_BOOL, NULL,
+        0, false);
+    wirelog_extension_snapshot_release(extension_snapshot);
+    for (unsigned i = 0; i < 513; i++) {
+        char other[256]; memcpy(other, name, 256);
+        snprintf(other + 248, 8, "%07u", i);
+        extension_register(other, COL_FILTER_STACK,
+            WIRELOG_EXTENSION_VALUE_BOOL, NULL, 0, false);
+    }
+    extension_snapshot = wirelog_extension_snapshot_acquire(extension_registry);
+    CHECK(extension_snapshot);
+    uint32_t n = 0;
+    for (unsigned i = 0; i < COL_FILTER_STACK;
+        i++) n = compiled_const(buf, n, i);
+    char last[256]; memcpy(last, name, 256);
+    snprintf(last + 248, 8, "%07u", 512u);
+    n = extension_encode(buf, n, last, 255, COL_FILTER_STACK, true);
+    extension_caller_twins(buf, n, 1, 0, 0, true);
+    for (int map = 0; map < 2; map++) for (int positive = 0; positive < 2;
+            positive++){
+            const int stages[] = {81, 82, 83, 84, 86, 87, 88, 3};
+            const size_t progress[] = {128, 300, 128, 1, 32, COL_FILTER_STACK,
+                                       COL_FILTER_STACK, COL_FILTER_STACK+1};
+            for (unsigned i = 0; i < sizeof(stages)/sizeof(*stages); i++)
+                extension_stop_trial(buf, n, map, stages[i], progress[i],
+                    positive, 0);
+            for (unsigned mode = 0; mode < 4;
+                mode++) extension_stop_trial(buf, n, map, 0, 0, positive, mode);
+        }
+    last[254] = 'x';
+    n = extension_encode(buf, 0, last, 255, 0, false);
+    extension_caller_twins(buf, n, 1, WL_COLUMNAR_EXPR_MISSING_EXTENSION,
+        WL_COLUMNAR_EXPR_MISSING_EXTENSION, false);
+    extension_teardown(); /* Fails if any acquired lease leaked on a stop. */
+}
+static unsigned extension_quota_reached;
+static void
+extension_full_sink_quota(wl_evaluation_control_t *c, int stage,
+    uint64_t progress)
+{
+    (void)c;
+    if (stage != WL_COLUMNAR_RELATION_CONSTRUCTOR_NAME || progress != 5) return;
+    wl_columnar_relation_test_constructor_checkpoint = NULL;
+    extension_quota_reached++;
+    /* $map descriptor/name are already admitted. Leave exactly one length
+     * slot and real column schema metadata; the full row payload must fail. */
+    uint64_t available = compiled_quota_governor->budget_bytes -
+        wl_columnar_memory_reserved(compiled_quota_governor);
+    uint64_t metadata_and_lengths = sizeof(uint64_t) + 3 + sizeof(char *) +
+        sizeof(struct ArrowSchema *) + sizeof(struct ArrowSchema) + 2 + 10;
+    CHECK(available >= metadata_and_lengths);
+    CHECK(wl_columnar_memory_reserve_checked(compiled_quota_governor,
+        available - metadata_and_lengths,
+        &compiled_quota) == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+}
+static void
+test_extension_initial_map_admission(void)
+{
+    extension_setup("ext", 0, WIRELOG_EXTENSION_VALUE_BOOL, NULL, 0, false);
+    uint8_t buf[32]; uint32_t n = extension_encode(buf, 0, "ext", 3, 0, false);
+    for (int failure = 0; failure < 6; failure++) {
+        wl_col_session_t *sess = join_session();
+        sess->base.extension_snapshot = extension_snapshot;
+        col_rel_t *source = relation(1, 2, 2, false, sess->memory_governor);
+        CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+        wl_plan_expr_buffer_t expr = {buf, n};
+        wl_plan_op_t ops[2] = {
+            {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+             .delta_mode = WL_DELTA_FORCE_FULL},
+            {.op = WL_PLAN_OP_MAP, .project_count = 1, .map_exprs = &expr,
+             .map_expr_count = 1}
+        };
+        uint64_t before = string_reserved(sess->memory_governor);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+        wl_evaluation_control_t *c = control(0);
+        unsigned calls = extension_calls;
+        compiled_quota_governor =
+            wl_columnar_memory_governor_ref_get(sess->memory_governor);
+        wl_columnar_memory_reservation_init(&compiled_quota);
+        if (!failure) CHECK(wl_columnar_memory_reserve_checked(
+                    compiled_quota_governor,
+                    compiled_quota_governor->budget_bytes -
+                    string_reserved(sess->memory_governor),
+                    &compiled_quota) == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+        if (failure ==
+            1) wl_columnar_relation_test_constructor_fail_allocation = 0;
+        if (failure == 2) wl_columnar_relation_test_constructor_fail_commit = 1;
+        if (failure == 3) {
+            extension_quota_reached = 0;
+            wl_columnar_relation_test_constructor_checkpoint =
+                extension_full_sink_quota;
+        }
+        if (failure ==
+            4) wl_columnar_relation_test_constructor_fail_allocation = 3;
+        if (failure == 5) wl_columnar_relation_test_constructor_fail_commit = 3;
+        int expected = failure == 0 || failure == 3 ? ENOSPC : ENOMEM;
+        CHECK(compiled_dispatch(sess, frame, ops, 2, c) == expected);
+        finish(c, expected);
+        CHECK(extension_calls == calls &&
+            sess->memory_budget_denied == (expected == ENOSPC));
+        lazy_unchanged(source);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+        if (expected ==
+            ENOSPC) CHECK(wl_columnar_memory_rollback(&compiled_quota));
+        if (failure == 3) CHECK(extension_quota_reached == 1);
+        CHECK(string_reserved(sess->memory_governor) == before);
+        frame = filter_frame(sess); retry(c, 0);
+        CHECK(compiled_dispatch(sess, frame, ops, 2, c) == 0); finish(c, 0);
+        CHECK(extension_calls == calls+2);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+        release(c); join_session_destroy(sess);
+    }
+    extension_teardown();
+}
+static void
+test_extension_owned_cleanup(void)
+{
+    extension_setup("ext", 0, WIRELOG_EXTENSION_VALUE_BOOL, NULL, 0, false);
+    uint8_t buf[32]; uint32_t n = extension_encode(buf, 0, "ext", 3, 0, true);
+    for (int map = 0; map < 2; map++) {
+        wl_col_session_t *sess = join_session();
+        sess->base.extension_snapshot = extension_snapshot;
+        col_rel_t *source = relation(1, 1, 1, false, sess->memory_governor);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = join_frame(sess, source,
+                true);
+        wl_plan_expr_buffer_t expr = {buf, n};
+        wl_plan_op_t op = {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+                           .filter_expr = expr, .project_count = 1,
+                           .map_exprs = &expr, .map_expr_count = 1};
+        wl_evaluation_control_t *c = control(0);
+        sess->base.evaluation_control = c;
+        unsigned calls = extension_calls; filter_reached = 0;
+        if (map) wl_columnar_ops_map_test_controlled_checkpoint =
+                map_owned_cleanup_fault;
+        else wl_columnar_filter_test_controlled_checkpoint =
+                filter_cleanup_fault;
+        CHECK((map ? col_op_map(&op,
+            wl_columnar_eval_stack_cleanup_stack(frame), sess) :
+            wl_columnar_filter_op(&op,
+            wl_columnar_eval_stack_cleanup_stack(frame),
+            sess)) == EBUSY);
+        sess->base.evaluation_control = NULL; finish(c, EBUSY);
+        CHECK(extension_calls == calls+1 && filter_reached == 1 &&
+            wl_columnar_eval_stack_cleanup_result(frame)->rel);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == EBUSY &&
+            !frame && sess->cleanup_pending);
+        CHECK(col_rel_source_reader_release(&join_retained_reader) == 0);
+        CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0);
+        release(c); join_session_destroy(sess);
+    }
+    extension_teardown();
+}
+
+static void
+test_extension_real_snapshot_owner(void)
+{
+    for (int map = 0; map < 2; map++) for (int governed = 0; governed < 2;
+            governed++) {
+            extension_setup("ext", 0, WIRELOG_EXTENSION_VALUE_BOOL, NULL, 0,
+                true);
+            wl_plan_t plan = {0}; wl_session_t *session = NULL;
+            CHECK(wl_session_create_with_snapshot(wl_backend_columnar(), &plan,
+                1, extension_snapshot, &session) == 0);
+            CHECK(session->owns_extension_snapshot &&
+                session->extension_snapshot == extension_snapshot);
+            wl_col_session_t *sess = COL_SESSION(session);
+            col_rel_t *source = relation(1, 3, 3, false, sess->memory_governor);
+            CHECK(session_add_rel(sess, source) == 0);
+            uint8_t buf[32];
+            uint32_t n = extension_encode(buf, 0, "ext", 3, 0, true);
+            wl_plan_expr_buffer_t expr = {buf, n};
+            wl_plan_op_t ops[2] = {
+                {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+                 .delta_mode = WL_DELTA_FORCE_FULL},
+                {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+                 .filter_expr = expr,
+                 .project_count = 1, .map_exprs = &expr, .map_expr_count = 1}
+            };
+            extension_mode = 4;
+            wl_evaluation_control_t *c = governed ? control(0) : NULL;
+            for (unsigned repeat = 0; repeat < 2; repeat++) {
+                wl_columnar_eval_stack_cleanup_frame_t *frame =
+                    filter_frame(sess);
+                if (repeat && c) retry(c, 0);
+                CHECK(compiled_dispatch(sess, frame, ops, 2, c) == 0);
+                if (c) finish(c, 0);
+                CHECK(extension_calls == 3*(repeat+1) && !extension_destroyed &&
+                    !extension_snapshot);
+                CHECK(join_output(frame)->nrows == 3);
+                CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+            }
+            if (c) release(c);
+            wl_session_destroy(session);
+            CHECK(extension_destroyed == 1);
+            extension_teardown();
+        }
+}
+static void
+test_extension_direct_release_and_destructor_tls(void)
+{
+    for (int governed = 0; governed < 2; governed++) {
+        extension_setup("ext", 0, WIRELOG_EXTENSION_VALUE_BOOL, NULL, 0, true);
+        wirelog_extension_registry_t *original = extension_registry;
+        wirelog_extension_registry_t *nested_registry =
+            wirelog_extension_registry_create(); CHECK(nested_registry);
+        extension_registry = nested_registry;
+        unsigned saved_count = extension_registered_count;
+        extension_register("ext", 0, WIRELOG_EXTENSION_VALUE_BOOL, NULL, 0,
+            false);
+        wirelog_extension_snapshot_t *nested =
+            wirelog_extension_snapshot_acquire(nested_registry); CHECK(nested);
+        extension_registry = original;
+        extension_registered_count = saved_count;
+        uint8_t buf[32];
+        uint32_t n = extension_encode(buf, 0, "ext", 3, 0, false);
+        wl_col_session_t sess = {0}, nested_sess = {0};
+        sess.base.extension_snapshot = extension_snapshot;
+        nested_sess.base.extension_snapshot = nested;
+        sess.callback_session_key = nested_sess.callback_session_key = &sess;
+        extension_nested_session = &nested_sess; extension_nested_buf = buf;
+        extension_nested_size = n;
+        extension_destructor_controlled = governed; extension_mode = 4;
+        wl_evaluation_control_t *c = governed ? control(0) : NULL;
+        int64_t value = INT64_MIN; bool failed = true;
+        wl_columnar_expr_status_t status;
+        CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL, 0,
+            &value, &failed,
+            &sess, &status, false,
+            c) == 0 && !failed && value == 1 && status == WL_COLUMNAR_EXPR_OK);
+        /* This is one call: the borrowed direct snapshot was consumed by host.
+         * Clear it immediately; never use it as later-row ownership evidence. */
+        sess.base.extension_snapshot = NULL;
+        if (c) {
+            finish(c, 0); release(c);
+        }
+        CHECK(extension_calls == 1 && extension_destroyed == 1 &&
+            !extension_snapshot &&
+            extension_nested_status == WL_COLUMNAR_EXPR_CALLBACK_REENTRANT);
+        extension_nested_session = NULL;
+        wirelog_extension_snapshot_release(nested);
+        CHECK(wirelog_extension_unregister(nested_registry, "ext") == 0);
+        CHECK(wirelog_extension_registry_destroy(nested_registry) == 0);
+        extension_teardown();
+    }
+}
+static void
+test_extension_tls_depth_and_policy(void)
+{
+    extension_setup("ext", 0, WIRELOG_EXTENSION_VALUE_BOOL, NULL, 0, false);
+    uint8_t buf[32]; uint32_t n = extension_encode(buf, 0, "ext", 3, 0, true);
+    wl_col_session_t sess = {0};
+    sess.base.extension_snapshot = extension_snapshot;
+    sess.callback_session_key = &extension_session_keys[0];
+    extension_nested_session = &sess; extension_nested_buf = buf;
+    extension_nested_size = n;
+    extension_depth = extension_tls_visits = 0; extension_mode = 5;
+    extension_stop_stage = -1;
+    wl_columnar_expr_test_controlled_checkpoint = extension_expr_stop;
+    wl_evaluation_control_t *c = control(0); int64_t value; bool failed;
+    wl_columnar_expr_status_t status;
+    CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL, 0, &value,
+        &failed, &sess, &status, false, c) == 0 &&
+        !failed && value == 1 && extension_calls == 64 &&
+        extension_tls_visits == (64*65)/2);
+    finish(c, 0); release(c);
+    wl_columnar_expr_test_controlled_checkpoint = NULL;
+    extension_nested_session = NULL; extension_mode = 0;
+    sess.callback_parallel_execution = true; sess.callback_active_workers = 2;
+    for (int controlled = 0; controlled < 2; controlled++) {
+        c = controlled ? control(0) : NULL;
+        CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL, 0,
+            &value, &failed, &sess, &status, false, c) == 0 &&
+            failed && status == WL_COLUMNAR_EXPR_CALLBACK_POLICY &&
+            extension_calls == 64);
+        if (c) {
+            finish(c, 0); release(c);
+        }
+    }
+    sess.callback_parallel_execution = false;
+    c = control(0);
+    CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL, 0, &value,
+        &failed, &sess, &status, false, c) == 0 && !failed && value == 1);
+    finish(c, 0); release(c);
+    extension_teardown();
+}
+
+static void
+test_extension_same_session_policy_and_owner_guard(void)
+{
+    uint8_t buf[32]; uint32_t n = extension_encode(buf, 0, "ext", 3, 0, false);
+    for (int governed = 0; governed < 2; governed++) for (unsigned mode = 6;
+            mode < 8; mode++) {
+            extension_setup("ext", 0, WIRELOG_EXTENSION_VALUE_BOOL, NULL,
+                mode == 6 ? WIRELOG_EXTENSION_CALLBACK_REENTRANT : 0, false);
+            wl_col_session_t sess = {0};
+            sess.base.extension_snapshot = extension_snapshot;
+            sess.callback_session_key = &sess;
+            extension_nested_session = &sess; extension_nested_buf = buf;
+            extension_nested_size = n;
+            extension_depth = 0; extension_mode = mode;
+            extension_destructor_controlled = governed;
+            wl_evaluation_control_t *c = governed ? control(0) : NULL;
+            int64_t value; bool failed; wl_columnar_expr_status_t status;
+            CHECK(wl_columnar_expr_eval_interpreter_controlled(buf, n, NULL, 0,
+                &value, &failed, &sess, &status, false,
+                c) == 0 && !failed && value == 1);
+            if (c) {
+                finish(c, 0); release(c);
+            }
+            CHECK(extension_calls == (mode == 6 ? 3u : 1u));
+            extension_nested_session = NULL;
+            extension_teardown();
+        }
+    extension_setup("ext", 0, WIRELOG_EXTENSION_VALUE_BOOL, NULL, 0, false);
+    extension_mode = 8;
+    extension_caller_twins(buf, n, 1, 0, 0, false);
+    extension_teardown();
+}
 int
 main(void)
 {
@@ -10809,6 +11581,14 @@ main(void)
     test_hmac_lifecycle();
     test_hmac_zero_and_early_refusal();
     test_hmac_owned_cleanup();
+    test_extension_actual_twins();
+    test_extension_registry_and_callback_stops();
+    test_extension_initial_map_admission();
+    test_extension_owned_cleanup();
+    test_extension_real_snapshot_owner();
+    test_extension_direct_release_and_destructor_tls();
+    test_extension_tls_depth_and_policy();
+    test_extension_same_session_policy_and_owner_guard();
 #if defined(WL_MBEDTLS_ENABLED) && \
     defined(WL_COLUMNAR_HMAC_SOFTWARE_PROFILE_SUPPORTED)
     puts(

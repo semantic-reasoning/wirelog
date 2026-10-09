@@ -5809,7 +5809,8 @@ test('io_adapter', test_io_adapter_exe)
 # Scalar addon registry ABI/lifecycle core (Issue #1245, first atomic unit).
 test_extension_registry_exe = executable(
   'test_extension_registry',
-  files('test_extension_registry.c', '../wirelog/extension_registry.c'),
+  files('test_extension_registry.c', '../wirelog/extension_registry.c',
+        '../wirelog/evaluation_control.c'),
   thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   c_args: ['-DWIRELOG_BUILDING'],

@@ -1409,6 +1409,14 @@ typedef struct {
     int64_t larg;
 } expr_instr_t;
 
+typedef struct {
+    char name[256];
+    uint32_t nargs;
+    uint64_t identity;
+    uint32_t version;
+    bool abi;
+} wl_columnar_expr_extension_call_t;
+
 struct wl_columnar_expr_compiled {
     expr_instr_t *instrs;
     uint32_t ninstr;
@@ -2711,12 +2719,169 @@ wl_columnar_expr_eval_compiled_controlled(const wl_columnar_expr_compiled_t *c,
     return 0;
 }
 
+/* The lease protects the descriptor only for this invocation. The session or
+ * direct caller must keep the snapshot alive across the complete attempt. */
+static int
+wl_columnar_expr_controlled_extension(expr_stack_t *stack,
+    const wl_columnar_expr_extension_call_t *call, wl_col_session_t *sess,
+    bool allow_scalar, wl_columnar_expr_status_t *pending_status,
+    wl_evaluation_control_t *control)
+{
+    const wirelog_extension_descriptor_t *descriptor = NULL;
+    void *lease = NULL;
+    bool tls_pushed = false;
+    int64_t scalar = 0;
+    uint32_t scalar_type = WIRELOG_EXTENSION_VALUE_BOOL;
+    const void *session_key = sess ? sess->callback_session_key : NULL;
+    *pending_status = WL_COLUMNAR_EXPR_OK;
+    if (!sess || !sess->base.extension_snapshot) {
+        *pending_status = WL_COLUMNAR_EXPR_MISSING_EXTENSION;
+        return 0;
+    }
+    int rc = wl_extension_callback_lookup_controlled(
+        sess->base.extension_snapshot, call->name, &descriptor, &lease,
+        control);
+    if (rc) return rc;
+    if (!descriptor) {
+        *pending_status = WL_COLUMNAR_EXPR_MISSING_EXTENSION;
+        return 0;
+    }
+    rc = wl_evaluation_control_charge(control, 48);
+    if (rc) goto cleanup;
+    /* Copy the metadata needed after invocation before any host effects. */
+    uint32_t policy = descriptor->callback_policy;
+    uint32_t arity = descriptor->arity;
+    uint32_t declared_result = descriptor->result_type;
+    uint64_t identity = descriptor->addon_abi_identity;
+    uint32_t version = descriptor->addon_abi_version;
+    const uint32_t *expected_types = descriptor->argument_types;
+    wirelog_extension_scalar_fn invoke = descriptor->invoke;
+    void *user_data = descriptor->user_data;
+    rc = wl_columnar_expr_controlled_tail(control);
+    if (rc) goto cleanup;
+    if (call->abi && (call->identity != identity || call->version != version)) {
+        *pending_status = WL_COLUMNAR_EXPR_EXTENSION_ABI_MISMATCH;
+        goto cleanup;
+    }
+    if (sess->callback_parallel_execution && sess->callback_active_workers > 1
+        && !(policy & WIRELOG_EXTENSION_CALLBACK_THREAD_SAFE)) {
+        *pending_status = WL_COLUMNAR_EXPR_CALLBACK_POLICY;
+        goto cleanup;
+    }
+    if (session_key && !(policy & WIRELOG_EXTENSION_CALLBACK_REENTRANT)) {
+        for (uint32_t depth = 0; depth < wl_callback_session_depth; depth++) {
+            rc = wl_evaluation_control_charge(control, 4);
+            if (rc) goto cleanup;
+            bool same = wl_callback_session_stack[depth] == session_key;
+            wl_columnar_expr_controlled_checkpoint(control, 85, depth + 1,
+                same);
+            rc = wl_columnar_expr_controlled_tail(control);
+            if (rc) goto cleanup;
+            if (same) {
+                *pending_status = WL_COLUMNAR_EXPR_CALLBACK_REENTRANT;
+                goto cleanup;
+            }
+        }
+    }
+    rc = wl_evaluation_control_charge(control, 16);
+    if (rc) goto cleanup;
+    if (call->nargs != arity || call->nargs > stack->top
+        || call->nargs > COL_FILTER_STACK) {
+        *pending_status = WL_COLUMNAR_EXPR_ARITY_MISMATCH;
+        goto cleanup;
+    }
+    if (declared_result != WIRELOG_EXTENSION_VALUE_BOOL
+        && (!allow_scalar ||
+        declared_result != WIRELOG_EXTENSION_VALUE_INT64)){
+        *pending_status = WL_COLUMNAR_EXPR_INVALID_RESULT;
+        goto cleanup;
+    }
+    rc = wl_columnar_expr_controlled_tail(control);
+    if (rc) goto cleanup;
+    wirelog_extension_value_t args[COL_FILTER_STACK];
+    for (uint32_t arg = 0; arg < call->nargs; arg++) {
+        rc = wl_evaluation_control_charge(control, 32);
+        if (rc) goto cleanup;
+        uint32_t index = stack->top - call->nargs + arg;
+        uint32_t actual = stack->types[index];
+        uint32_t expected = expected_types ? expected_types[arg] : 0;
+        bool mismatch = expected != 0 && actual != expected;
+        if (!mismatch) {
+            args[arg].type = actual;
+            args[arg].size = actual == WIRELOG_EXTENSION_VALUE_BOOL
+                ? sizeof(uint8_t) : actual == WIRELOG_EXTENSION_VALUE_STRING
+                ? stack->string_lengths[index] : sizeof(int64_t);
+            if (actual == WIRELOG_EXTENSION_VALUE_BOOL)
+                args[arg].as.bool_value = stack->vals[index] != 0;
+            else if (actual == WIRELOG_EXTENSION_VALUE_STRING) {
+                args[arg].as.string_value.data =
+                    (const char *)stack->string_data[index];
+                args[arg].as.string_value.length = stack->string_lengths[index];
+            } else args[arg].as.int64_value = stack->vals[index];
+        }
+        wl_columnar_expr_controlled_checkpoint(control, 86, arg + 1, mismatch);
+        rc = wl_columnar_expr_controlled_tail(control);
+        if (rc) goto cleanup;
+        if (mismatch) {
+            *pending_status = WL_COLUMNAR_EXPR_TYPE_MISMATCH;
+            goto cleanup;
+        }
+    }
+    /* Admit pop/TLS/result initialization (24), scalar validation/copy (24)
+    * and final typed push (16) before the non-preemptible host callback. */
+    rc = wl_evaluation_control_charge(control, 64);
+    if (rc) goto cleanup;
+    stack->top -= call->nargs;
+    if (session_key &&
+        wl_callback_session_depth >= WL_CALLBACK_SESSION_STACK_MAX){
+        *pending_status = WL_COLUMNAR_EXPR_CALLBACK_REENTRANT;
+        goto cleanup;
+    }
+    if (session_key) {
+        wl_callback_session_stack[wl_callback_session_depth++] = session_key;
+        tls_pushed = true;
+    }
+    wirelog_extension_value_t result;
+    result.type = 0;
+    result.size = 0;
+    result.as.int64_value = 0;
+    wl_columnar_expr_controlled_checkpoint(control, 87, call->nargs, false);
+    rc = wl_columnar_expr_controlled_tail(control);
+    if (rc) goto cleanup;
+    int callback_rc = invoke ? invoke(args, call->nargs, &result,
+            user_data) : -1;
+    if (callback_rc != 0)
+        *pending_status = WL_COLUMNAR_EXPR_CALLBACK_FAILURE;
+    else if (result.type == WIRELOG_EXTENSION_VALUE_BOOL
+        && result.size == sizeof(uint8_t)) {
+        scalar = result.as.bool_value != 0;
+    } else if (allow_scalar && result.type == WIRELOG_EXTENSION_VALUE_INT64
+        && result.size == sizeof(int64_t)) {
+        scalar = result.as.int64_value;
+        scalar_type = WIRELOG_EXTENSION_VALUE_INT64;
+    } else *pending_status = WL_COLUMNAR_EXPR_INVALID_RESULT;
+cleanup:
+    /* A final entry release may invoke destroy_userdata. Keep raw TLS ordering
+     * so same-session reentry from that destructor still sees the active call. */
+    wl_extension_callback_lease_release(lease);
+    if (tls_pushed) wl_callback_session_depth--;
+    if (rc) return rc;
+    wl_columnar_expr_controlled_checkpoint(control, 88, call->nargs,
+        *pending_status != WL_COLUMNAR_EXPR_OK);
+    rc = wl_columnar_expr_controlled_tail(control);
+    if (rc) return rc;
+    if (*pending_status == WL_COLUMNAR_EXPR_OK)
+        expr_push_typed(stack, scalar, scalar_type);
+    return 0;
+}
+
 /* Admitted fallback decodes real instruction boundaries. Classification never
  * loads a row or treats bytes after an unknown/truncated instruction as tags. */
 static int
 wl_columnar_expr_controlled_interpreter_decode(const uint8_t *buf,
     uint32_t size, uint32_t *pos, expr_instr_t *in, long *column,
     bool classify, bool *malformed, bool *excluded,
+    wl_columnar_expr_extension_call_t *extension,
     wl_evaluation_control_t *control)
 {
     int rc = wl_evaluation_control_charge(control, 33);
@@ -2783,6 +2948,50 @@ wl_columnar_expr_controlled_interpreter_decode(const uint8_t *buf,
         rc = wl_evaluation_control_charge(control, 1);
         if (rc) return rc;
         in->iarg = length; in->larg = *pos; *pos += length;
+        break;
+    }
+    case WL_PLAN_EXPR_EXTENSION_CALL: case WL_PLAN_EXPR_EXTENSION_CALL_ABI: {
+        uint8_t encoded[12];
+        rc = wl_columnar_expr_controlled_bytes(buf, size, pos, encoded, 2,
+                classify ? 6 : 7, control);
+        if (rc) break;
+        uint16_t length = (uint16_t)encoded[0] | (uint16_t)encoded[1] << 8;
+        if (!length || length >= sizeof(extension->name) ||
+            length > size - *pos || size - *pos - length < 4) {
+            *malformed = true; return 0;
+        }
+        rc = wl_columnar_expr_controlled_bytes(buf, size, pos,
+                (uint8_t *)extension->name, length, classify ? 6 : 7, control);
+        if (rc) break;
+        rc = wl_evaluation_control_charge(control, 1); if (rc) return rc;
+        extension->name[length] = 0;
+        rc = wl_columnar_expr_controlled_tail(control); if (rc) return rc;
+        rc = wl_columnar_expr_controlled_bytes(buf, size, pos, encoded, 4,
+                classify ? 6 : 7, control);
+        if (rc) break;
+        rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+        extension->nargs = (uint32_t)encoded[0] | (uint32_t)encoded[1] << 8 |
+            (uint32_t)encoded[2] << 16 | (uint32_t)encoded[3] << 24;
+        extension->identity = 0; extension->version = 0;
+        extension->abi = in->op == WL_PLAN_EXPR_EXTENSION_CALL_ABI;
+        rc = wl_columnar_expr_controlled_tail(control); if (rc) return rc;
+        if (extension->abi) {
+            rc = wl_columnar_expr_controlled_bytes(buf, size, pos, encoded, 12,
+                    classify ? 6 : 7, control);
+            if (rc) break;
+            for (uint32_t j = 0; j < 8; j++) {
+                rc = wl_evaluation_control_charge(control, 2);
+                if (rc) return rc;
+                extension->identity |= (uint64_t)encoded[j] << (j * 8);
+                rc = wl_columnar_expr_controlled_tail(control);
+                if (rc) return rc;
+            }
+            rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+            extension->version = (uint32_t)encoded[8] | (uint32_t)encoded[9] <<
+                8 |
+                (uint32_t)encoded[10] << 16 | (uint32_t)encoded[11] << 24;
+            rc = wl_columnar_expr_controlled_tail(control); if (rc) return rc;
+        }
         break;
     }
     case WL_PLAN_EXPR_ARITH_HMAC_SHA256: case WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS:
@@ -2881,8 +3090,10 @@ wl_columnar_expr_interpreter_supported_controlled(const uint8_t *buf,
     uint32_t pos = 0;
     while (pos < size) {
         expr_instr_t in; long column; bool malformed, excluded;
+        wl_columnar_expr_extension_call_t extension;
         int rc = wl_columnar_expr_controlled_interpreter_decode(buf, size,
-                &pos, &in, &column, true, &malformed, &excluded, control);
+                &pos, &in, &column, true, &malformed, &excluded, &extension,
+                control);
         if (rc) return rc;
         if (excluded) {
             *supported = false; return 0;
@@ -2896,11 +3107,21 @@ int
 wl_columnar_expr_eval_interpreter_controlled(const uint8_t *buf,
     uint32_t size, const int64_t *row, uint32_t ncols, int64_t *value,
     bool *failed, wl_col_session_t *sess, wl_columnar_expr_status_t *status,
-    wl_evaluation_control_t *control)
+    bool allow_extension_scalar_result, wl_evaluation_control_t *control)
 {
     if (!value || !failed || (size && !buf) || (ncols && !row)) return EINVAL;
     if (!control) {
-        wl_columnar_expr_context_t ctx = {.intern = sess ? sess->intern : NULL};
+        wl_columnar_expr_context_t ctx = {
+            .intern = sess ? sess->intern : NULL,
+            .extensions = sess ? sess->base.extension_snapshot : NULL,
+            .allow_extension_scalar_result = allow_extension_scalar_result,
+            .configured_worker_count =
+                sess ? sess->callback_configured_workers : 1,
+            .active_worker_count = sess ? sess->callback_active_workers : 1,
+            .parallel_execution =
+                sess ? sess->callback_parallel_execution : false,
+            .session_key = sess ? sess->callback_session_key : NULL
+        };
         *failed = wl_columnar_expr_eval_run_ctx(buf, size, row, ncols, value,
                 &ctx, status) != 0;
         return 0;
@@ -2909,16 +3130,29 @@ wl_columnar_expr_eval_interpreter_controlled(const uint8_t *buf,
     uint32_t pos = 0, instruction = 0;
     while (pos < size) {
         expr_instr_t in; long column; bool pending, excluded;
+        wl_columnar_expr_extension_call_t extension;
         bool allocation = false;
+        wl_columnar_expr_status_t pending_status = WL_COLUMNAR_EXPR_MALFORMED;
         int rc = wl_columnar_expr_controlled_interpreter_decode(buf, size,
-                &pos, &in, &column, false, &pending, &excluded, control);
+                &pos, &in, &column, false, &pending, &excluded, &extension,
+                control);
         if (rc) return rc;
         if (excluded) return ENOTSUP;
         if (!pending) {
             rc = wl_evaluation_control_charge(control, 32);
             if (rc) return rc;
         }
-        if (!pending &&
+        if (in.op == WL_PLAN_EXPR_EXTENSION_CALL
+            || in.op == WL_PLAN_EXPR_EXTENSION_CALL_ABI) {
+            pending_status = WL_COLUMNAR_EXPR_EXTENSION_MALFORMED;
+            if (!pending) {
+                rc = wl_columnar_expr_controlled_extension(&stack, &extension,
+                        sess, allow_extension_scalar_result, &pending_status,
+                        control);
+                if (rc) return rc;
+                pending = pending_status != WL_COLUMNAR_EXPR_OK;
+            }
+        } else if (!pending &&
             (in.op == WL_PLAN_EXPR_VAR || in.op == WL_PLAN_EXPR_VAR_FLOAT
             || in.op == WL_PLAN_EXPR_VAR_STRING)){
             rc = wl_evaluation_control_charge(control, 8);
@@ -3020,7 +3254,7 @@ wl_columnar_expr_eval_interpreter_controlled(const uint8_t *buf,
             *failed = true; *value = 0;
             if (status) *status =
                     allocation ? WL_COLUMNAR_EXPR_ALLOCATION_FAILURE
-                : WL_COLUMNAR_EXPR_MALFORMED;
+                : pending_status;
             return 0;
         }
     }

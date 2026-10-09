@@ -473,11 +473,15 @@ wl_columnar_ops_map_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
                     : wl_columnar_expr_eval_interpreter_controlled(
                     op->map_exprs[c].data, op->map_exprs[c].size,
                     row, source->ncols, &value, &failed, sess, &status,
-                    control);
+                    true, control);
                 if (rc) goto cleanup;
                 if (failed) {
-                    rc = status == WL_COLUMNAR_EXPR_ALLOCATION_FAILURE
-                        ? ENOMEM : ERANGE; goto cleanup;
+                    if (status ==
+                        WL_COLUMNAR_EXPR_ALLOCATION_FAILURE) rc = ENOMEM;
+                    else if (status >= WL_COLUMNAR_EXPR_EXTENSION_MALFORMED) {
+                        sess->extension_expr_status = status; rc = (int)status;
+                    } else rc = ERANGE;
+                    goto cleanup;
                 }
                 rc = wl_evaluation_control_charge(control, 1);
                 if (rc) goto cleanup;
