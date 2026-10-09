@@ -602,6 +602,21 @@ typedef struct {
 } wl_plan_refset_t;
 
 /**
+ * wl_plan_body_t:
+ *
+ * One relation's operators as lowered, before the plan rewrites (Issue
+ * #2114).
+ *
+ * @ops:      Owned deep copy of the relation's operator list, NULL when
+ *            @op_count is 0.
+ * @op_count: Number of operators.
+ */
+typedef struct {
+    const wl_plan_op_t *ops;
+    uint32_t op_count;
+} wl_plan_body_t;
+
+/**
  * wl_plan_stratum_t:
  *
  * Execution plan for a single stratum.
@@ -651,6 +666,17 @@ typedef struct {
  *                  type is deliberately NOT private to wl_plan_t: hand-built
  *                  strata passed straight to the columnar frontier helpers
  *                  are an established pattern in those three files.
+ * @bodies:         Issue #2114.  @relation_count entries, owned, parallel to
+ *                  @relations: each relation's operators as lowered from the
+ *                  program wl_plan_from_program() receives, so after any IR
+ *                  pass the caller ran on it (SIP, for one, can add SEMIJOIN
+ *                  reads the source does not spell).  Copied at the same
+ *                  point as @rule_refs and for the same reason: the rewrites
+ *                  that follow fuse, chain or wrap them, and an evaluator
+ *                  that binds each body occurrence to a delta or to a full
+ *                  relation needs them unrewritten.  NULL means "not
+ *                  recorded": hand-built strata leave it so, and no
+ *                  evaluator may then bind occurrences for the stratum.
  */
 typedef struct {
     uint32_t stratum_id;
@@ -660,6 +686,7 @@ typedef struct {
     const wl_plan_relation_t *relations;
     uint32_t relation_count;
     wl_plan_refset_t *rule_refs;
+    wl_plan_body_t *bodies;
 } wl_plan_stratum_t;
 
 /* ======================================================================== */

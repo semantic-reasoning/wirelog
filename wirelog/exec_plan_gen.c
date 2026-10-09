@@ -3695,6 +3695,71 @@ plan_stratum_record_refs(wl_plan_stratum_t *st)
     return 0;
 }
 
+/*
+ * plan_bodies_free - Release a wl_plan_stratum_t.bodies array of @count
+ * entries.  NULL-safe.
+ */
+static void
+plan_bodies_free(wl_plan_body_t *bodies, uint32_t count)
+{
+    if (!bodies)
+        return;
+    for (uint32_t r = 0; r < count; r++) {
+        if (!bodies[r].ops)
+            continue;
+        for (uint32_t o = 0; o < bodies[r].op_count; o++)
+            free_op((wl_plan_op_t *)&bodies[r].ops[o]);
+        free((void *)bodies[r].ops);
+    }
+    free(bodies);
+}
+
+/*
+ * plan_stratum_record_bodies - Issue #2114: copy each relation's operators
+ * into @st->bodies while they are still the lowered list.  Called next to
+ * plan_stratum_record_refs() for the reason that function gives: the
+ * rewrites that follow fuse, chain or wrap these operators.
+ *
+ * Returns 0 on success, -1 on allocation failure with @st->bodies left NULL.
+ */
+static int
+plan_stratum_record_bodies(wl_plan_stratum_t *st)
+{
+    if (st->relation_count == 0 || !st->relations)
+        return 0;
+
+    wl_plan_body_t *bodies = (wl_plan_body_t *)calloc(st->relation_count,
+            sizeof(wl_plan_body_t));
+    if (!bodies)
+        return -1;
+
+    for (uint32_t r = 0; r < st->relation_count; r++) {
+        const wl_plan_relation_t *rel = &st->relations[r];
+        if (rel->op_count == 0 || !rel->ops)
+            continue;
+        wl_plan_op_t *ops = (wl_plan_op_t *)calloc(rel->op_count,
+                sizeof(wl_plan_op_t));
+        if (!ops) {
+            plan_bodies_free(bodies, st->relation_count);
+            return -1;
+        }
+        for (uint32_t o = 0; o < rel->op_count; o++) {
+            if (clone_plan_op(&rel->ops[o], &ops[o]) != 0) {
+                for (uint32_t k = 0; k < o; k++)
+                    free_op(&ops[k]);
+                free(ops);
+                plan_bodies_free(bodies, st->relation_count);
+                return -1;
+            }
+        }
+        bodies[r].ops = ops;
+        bodies[r].op_count = rel->op_count;
+    }
+
+    st->bodies = bodies;
+    return 0;
+}
+
 /* ======================================================================== */
 /* Public API                                                               */
 /* ======================================================================== */
@@ -3923,6 +3988,7 @@ wl_plan_free(wl_plan_t *plan)
             /* Issue #1019: parallel to st->relations, so freed with the same
              * count.  relation_count is 0 whenever relations is NULL. */
             plan_refsets_free(st->rule_refs, st->relation_count);
+            plan_bodies_free(st->bodies, st->relation_count);
         }
         free((void *)plan->strata);
     }
@@ -4509,7 +4575,8 @@ wl_plan_from_program_with_snapshot(struct wirelog_program *prog,
          * wl_plan_free() reaches every allocation made so far, so the failure
          * path does not have to unwind rels[] by hand.  Still ahead of all four
          * rewrites below, which is what the record is for. */
-        if (plan_stratum_record_refs(dst) != 0) {
+        if (plan_stratum_record_refs(dst) != 0
+            || plan_stratum_record_bodies(dst) != 0) {
             wl_plan_free(plan);
             return -1;
         }
