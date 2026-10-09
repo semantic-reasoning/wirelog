@@ -968,7 +968,13 @@ wl_columnar_filter_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
                 &supported, control);
         if (rc) goto cleanup;
         if (!supported) {
-            rc = ENOTSUP; goto cleanup;
+            rc = wl_columnar_expr_numeric_interpreter_supported_controlled(
+                op->filter_expr.data, op->filter_expr.size, &supported,
+                control);
+            if (rc) goto cleanup;
+            if (!supported) {
+                rc = ENOTSUP; goto cleanup;
+            }
         }
     }
     rc = wl_columnar_relation_append_batch_begin_controlled(&batch, out,
@@ -992,9 +998,13 @@ wl_columnar_filter_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
                 if (rc) goto cleanup;
             }
             int64_t value; bool failed;
-            rc = wl_columnar_expr_eval_compiled_controlled(compiled,
+            rc = compiled ? wl_columnar_expr_eval_compiled_controlled(compiled,
                     tuple ? tuple : &dummy, source->ncols, &value, &failed,
-                    control);
+                    control) :
+                wl_columnar_expr_eval_numeric_interpreter_controlled(
+                op->filter_expr.data, op->filter_expr.size,
+                tuple ? tuple : &dummy, source->ncols, &value, &failed,
+                control);
             if (rc) goto cleanup;
             pass = !failed && value != 0;
         }

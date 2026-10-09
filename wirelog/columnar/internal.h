@@ -3965,6 +3965,13 @@ wl_columnar_expr_compile_controlled(const uint8_t *buf, uint32_t size,
     wl_columnar_expr_compiled_t **out, bool *supported,
     wl_evaluation_control_t *control);
 int
+wl_columnar_expr_numeric_interpreter_supported_controlled(const uint8_t *buf,
+    uint32_t size, bool *supported, wl_evaluation_control_t *control);
+int
+wl_columnar_expr_eval_numeric_interpreter_controlled(const uint8_t *buf,
+    uint32_t size, const int64_t *row, uint32_t ncols, int64_t *value,
+    bool *failed, wl_evaluation_control_t *control);
+int
 wl_columnar_expr_eval_compiled_controlled(const wl_columnar_expr_compiled_t *c,
     const int64_t *row, uint32_t ncols, int64_t *value, bool *failed,
     wl_evaluation_control_t *control);

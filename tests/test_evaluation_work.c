@@ -3,6 +3,7 @@
 #include "../wirelog/columnar/internal.h"
 #include <stdio.h>
 #include <limits.h>
+#include <math.h>
 
 #define CHECK(x) do { if (!(x)) { \
                           fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, \
@@ -5369,7 +5370,7 @@ test_controlled_filter_refusals_and_faults(void)
         CHECK(session_add_rel(raw, reference_source) == 0);
         uint8_t buf[32]; wl_plan_expr_buffer_t expr = filter_expression(buf,
                 WL_PLAN_EXPR_CMP_GTE, false, 0);
-        int expected = mode == 0 || mode == 2 || mode == 3 ? 0 : ENOTSUP;
+        int expected = 0;
         if (mode == 1) buf[0] = 0xff;
         if (mode == 2) buf[6] = '9';
         if (mode == 3) {
@@ -6355,6 +6356,381 @@ test_compiled_arithmetic_stack_twins(void)
         }
 }
 
+static uint32_t
+numeric_float(uint8_t *buf, uint32_t pos, double value)
+{
+    buf[pos++] = WL_PLAN_EXPR_CONST_FLOAT;
+    memcpy(buf + pos, &value, 8);
+    return pos + 8;
+}
+/* Real ordinary dispatcher twins, including the private output constructor. */
+static void
+numeric_caller_twin(uint8_t *buf, uint32_t size, uint32_t rows,
+    int expected_map, bool exact)
+{
+    for (int map = 0; map < 2; map++) {
+        wl_col_session_t *sess = join_session(), *raw = join_session();
+        col_rel_t *source = relation(17, rows ? rows : 1, rows, false,
+                sess->memory_governor);
+        col_rel_t *ref = relation(17, rows ? rows : 1, rows, false,
+                raw->memory_governor);
+        for (uint32_t r = 0; r < rows; r++) {
+            double d = r ? -0.0 : 1.5;
+            memcpy(&source->columns[0][r], &d, 8);
+            memcpy(&ref->columns[0][r], &d, 8);
+            d = NAN;
+            memcpy(&source->columns[1][r], &d, 8);
+            memcpy(&ref->columns[1][r], &d, 8);
+        }
+        col_rel_t *alias_owner = NULL;
+        if (rows && exact && buf[0] == WL_PLAN_EXPR_VAR_FLOAT) {
+            alias_owner = source;
+            source = relation(17, rows, 0, false, sess->memory_governor);
+            CHECK(col_rel_install_shared_view(source, alias_owner) == 0);
+        }
+        CHECK(session_add_rel(sess, source) == 0 && session_add_rel(raw,
+            ref) == 0);
+        wl_plan_expr_buffer_t expr = {buf, size};
+        wl_plan_op_t ops[2] = {
+            {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+             .delta_mode = WL_DELTA_FORCE_FULL},
+            {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+             .filter_expr = expr,
+             .project_count = 1, .map_exprs = &expr, .map_expr_count = 1}
+        };
+        wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess),
+            *reference = filter_frame(raw);
+        wl_evaluation_control_t *c = control(0);
+        int expected = map && rows ? expected_map : 0;
+        if (!rows) {
+            compiled_stop_stage = 3; compiled_stop_progress = 1;
+            compiled_stop_positive = false; compiled_require_failed = false;
+            compiled_reached = 0;
+            wl_columnar_expr_test_controlled_checkpoint = compiled_stage_stop;
+        }
+        CHECK(compiled_dispatch(sess, frame, ops, 2, c) == expected);
+        if (!rows) {
+            CHECK(compiled_reached == 0);
+            wl_columnar_expr_test_controlled_checkpoint = NULL;
+        }
+        uint64_t cost = finish(c, expected);
+        CHECK(compiled_dispatch(raw, reference, ops, 2, NULL) == expected);
+        if (!expected) filter_equal(join_output(frame), join_output(reference));
+        source_unpinned(source, alias_owner ? alias_owner : source);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+        if (exact && !expected) {
+            frame = filter_frame(sess); retry(c, cost - 1);
+            CHECK(compiled_dispatch(sess, frame, ops, 2,
+                c) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+            finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+            frame = filter_frame(sess); retry(c, cost);
+            CHECK(compiled_dispatch(sess, frame, ops, 2, c) == 0 && finish(c,
+                0) == cost);
+            filter_equal(join_output(frame), join_output(reference));
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+        }
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&reference) == 0);
+        release(c);
+        if (alias_owner) {
+            destroy(source); sess->nrels = 0; destroy(alias_owner);
+        }
+        join_session_destroy(sess); join_session_destroy(raw);
+    }
+}
+static void
+test_numeric_float_and_interpreter_twins(void)
+{
+    const uint8_t floats[] = {WL_PLAN_EXPR_ARITH_FLOAT_ADD,
+                              WL_PLAN_EXPR_ARITH_FLOAT_SUB,
+                              WL_PLAN_EXPR_ARITH_FLOAT_MUL,
+                              WL_PLAN_EXPR_ARITH_FLOAT_DIV,
+                              WL_PLAN_EXPR_CMP_FLOAT_EQ,
+                              WL_PLAN_EXPR_CMP_FLOAT_NEQ,
+                              WL_PLAN_EXPR_CMP_FLOAT_LT,
+                              WL_PLAN_EXPR_CMP_FLOAT_GT,
+                              WL_PLAN_EXPR_CMP_FLOAT_LTE,
+                              WL_PLAN_EXPR_CMP_FLOAT_GTE};
+    for (uint32_t k = 0; k < sizeof(floats); k++) {
+        uint8_t buf[64]; uint32_t n = numeric_float(buf, 0, -0.0);
+        n = numeric_float(buf, n, k == 3 ? 1.0 : 0x1p-1074);
+        buf[n++] = floats[k];
+        numeric_caller_twin(buf, n, 2, 0, k == 0);
+        n = compiled_var(buf, 0, "col0"); buf[0] = WL_PLAN_EXPR_VAR_FLOAT;
+        n = numeric_float(buf, n, 1.0); buf[n++] = floats[k];
+        numeric_caller_twin(buf, n, 2, 0, k == 0);
+    }
+    const char *names[] = {"col  +0junk", "col-1", "col99",
+                           "col0000000000000009tail",
+                           "col9223372036854775807", "col+0000000000000",
+                           "other", "col0", "col1"};
+    for (uint32_t k = 0; k < sizeof(names)/sizeof(*names); k++) {
+        uint8_t buf[96]; uint32_t n = compiled_var(buf, 0, names[k]);
+        if (k == 7) buf[6] = 0; /* Embedded NUL, native length retained. */
+        numeric_caller_twin(buf, n, 2, 0, k == 0);
+        if (k != 7) {
+            buf[0] = WL_PLAN_EXPR_VAR_FLOAT;
+            numeric_caller_twin(buf, n, 2,
+                k == 1 || k == 2 || k == 4 || k == 8 ? ERANGE : 0, false);
+        }
+    }
+    uint8_t malformed[][12] = {{0xff, WL_PLAN_EXPR_CONST_STR},
+                               {WL_PLAN_EXPR_CONST_FLOAT,
+                                WL_PLAN_EXPR_CONST_STR},
+                               {WL_PLAN_EXPR_VAR_FLOAT, 8, 0, 'c', 'o', 'l',
+                                WL_PLAN_EXPR_CONST_STR}};
+    const uint32_t lengths[] = {2, 2, 7};
+    for (uint32_t k = 0; k < 3; k++) {
+        numeric_caller_twin(malformed[k], lengths[k], 1, ERANGE, false);
+        numeric_caller_twin(malformed[k], lengths[k], 0, 0, true);
+    }
+    /* Finite validation and computed result overflow are actual row errors. */
+    const double bad[] = {INFINITY, NAN, 0x1.fffffffffffffp1023};
+    for (uint32_t k = 0; k < 3; k++) {
+        uint8_t buf[32]; uint32_t n = numeric_float(buf, 0, bad[k]);
+        if (k == 2) {
+            n = numeric_float(buf, n, 2.0);
+            buf[n++] = WL_PLAN_EXPR_ARITH_FLOAT_MUL;
+        }
+        numeric_caller_twin(buf, n, 1, ERANGE, false);
+        numeric_caller_twin(buf, n, 0, 0, true);
+    }
+}
+static void
+test_numeric_widened_failure_tail(void)
+{
+    for (int map = 0; map < 2; map++) for (int floating = 0; floating < 4;
+            floating++)
+            for (int action = 0; action < 3; action++) {
+                wl_col_session_t *sess = join_session();
+                col_rel_t *source = relation(1, 1, 1, false,
+                        sess->memory_governor);
+                CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+                uint8_t buf[32];
+                uint32_t size = compiled_var(buf, 0, "col4294967296");
+                if (floating == 1) buf[0] = WL_PLAN_EXPR_VAR_FLOAT;
+                if (floating == 2) size = numeric_float(buf, 0, NAN);
+                if (floating == 3) {
+                    size = compiled_var(buf, 0, "col0");
+                    buf[0] = WL_PLAN_EXPR_VAR_FLOAT;
+                    double nan = NAN; memcpy(&source->columns[0][0], &nan, 8);
+                }
+                wl_plan_expr_buffer_t expr = {buf, size};
+                wl_plan_op_t ops[2] = {
+                    {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+                     .delta_mode = WL_DELTA_FORCE_FULL},
+                    {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+                     .filter_expr = expr,
+                     .project_count = 1, .map_exprs = &expr,
+                     .map_expr_count = 1}
+                };
+                uint64_t retained =
+                    wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(sess->memory_governor));
+                wl_columnar_eval_stack_cleanup_frame_t *frame =
+                    filter_frame(sess);
+                wl_evaluation_control_t *c = control(0);
+                bool unsafe = LONG_MAX > INT32_MAX || floating;
+                int expected = unsafe && map ? ERANGE : 0;
+                if (action && unsafe) {
+                    compiled_stop_stage = 3; compiled_stop_progress = 1;
+                    compiled_stop_positive = action == 2;
+                    compiled_require_failed = true; compiled_reached = 0;
+                    wl_columnar_expr_test_controlled_checkpoint =
+                        compiled_stage_stop;
+                    expected = action ==
+                        2 ? EOVERFLOW : WL_EVALUATION_CONTROL_CANCELLED;
+                }
+                CHECK(compiled_dispatch(sess, frame, ops, 2, c) == expected);
+                finish(c, expected);
+                if (action && unsafe) {
+                    CHECK(compiled_reached == 1); lazy_unchanged(source);
+                }else source_unpinned(source, source);
+                CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+                CHECK(wl_columnar_memory_reserved(
+                        wl_columnar_memory_governor_ref_get(
+                            sess->memory_governor)) == retained);
+                frame = filter_frame(sess); retry(c, 0);
+                expected = unsafe && map ? ERANGE : 0;
+                CHECK(compiled_dispatch(sess, frame, ops, 2, c) == expected);
+                finish(c, expected);
+                CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+                release(c); join_session_destroy(sess);
+            }
+}
+static void
+test_numeric_float_zero_row_failures(void)
+{
+    uint8_t buf[32]; uint32_t size = numeric_float(buf, 0, 1.0);
+    size = numeric_float(buf, size, 1.0);
+    buf[size++] = WL_PLAN_EXPR_ARITH_FLOAT_ADD;
+    wl_plan_expr_buffer_t expr = {buf, size};
+    for (int map = 0; map < 2; map++) for (int failure = 0; failure < 5;
+            failure++){
+            wl_col_session_t *sess = join_session(), *raw = join_session();
+            col_rel_t *source = relation(2, 0, 0, false, sess->memory_governor);
+            col_rel_t *ref = relation(2, 0, 0, false, raw->memory_governor);
+            CHECK(session_add_rel(sess, source) == 0);
+            CHECK(session_add_rel(raw, ref) == 0);
+            make_lazy(source);
+            compiled_quota_governor =
+                wl_columnar_memory_governor_ref_get(sess->memory_governor);
+            uint64_t retained =
+                wl_columnar_memory_reserved(compiled_quota_governor);
+            wl_columnar_memory_reservation_init(&compiled_quota);
+            wl_plan_op_t ops[2] = {
+                {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+                 .delta_mode = WL_DELTA_FORCE_FULL},
+                {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+                 .filter_expr = expr,
+                 .project_count = 1, .map_exprs = &expr, .map_expr_count = 1},
+            };
+            if (failure == 0) {
+                compiled_reached = 0;
+                wl_columnar_expr_test_controlled_checkpoint =
+                    compiled_quota_hook;
+            }
+            if (failure == 1 ||
+                failure ==
+                2) wl_columnar_expr_test_fail_allocation = failure - 1;
+            if (failure == 3) wl_columnar_expr_test_fail_commit = true;
+            wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+            wl_columnar_eval_stack_cleanup_frame_t *reference =
+                filter_frame(raw);
+            wl_evaluation_control_t *c = control(0);
+            int expected = failure == 0 ? ENOSPC : failure < 4 ? ENOMEM : 0;
+            CHECK(compiled_dispatch(sess, frame, ops, 2, c) == expected);
+            finish(c, expected);
+            CHECK(sess->memory_budget_denied == (failure == 0));
+            CHECK(wl_columnar_expr_test_fail_allocation == -1 &&
+                !wl_columnar_expr_test_fail_commit);
+            if (failure < 4) {
+                lazy_unchanged(source);
+                CHECK(!wl_columnar_eval_stack_cleanup_result(frame)->rel);
+            }
+            CHECK(compiled_dispatch(raw, reference, ops, 2, NULL) == 0);
+            if (!expected) filter_equal(join_output(frame),
+                    join_output(reference));
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+            if (failure == 0) {
+                CHECK(compiled_reached == 1);
+                CHECK(wl_columnar_memory_reserved(compiled_quota_governor) ==
+                    retained + compiled_quota.bytes);
+                CHECK(wl_columnar_memory_rollback(&compiled_quota));
+            }
+            CHECK(wl_columnar_memory_reserved(compiled_quota_governor) ==
+                retained);
+            frame = filter_frame(sess); retry(c, 0);
+            CHECK(compiled_dispatch(sess, frame, ops, 2, c) == 0); finish(c, 0);
+            filter_equal(join_output(frame), join_output(reference));
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&reference) == 0);
+            release(c); join_session_destroy(sess); join_session_destroy(raw);
+        }
+    compiled_quota_governor = NULL;
+}
+
+static void
+test_numeric_long_paths(void)
+{
+    for (int interpreted = 0; interpreted < 2; interpreted++) {
+        uint8_t buf[4624]; uint32_t n = 0;
+        for (uint32_t k = 0; k < 513; k++) {
+            if (interpreted) {
+                buf[n++] = WL_PLAN_EXPR_BOOL; buf[n++] = 0;
+            }else n = numeric_float(buf, n, -0.0);
+        }
+        if (interpreted) {
+            uint32_t begin = n; n = compiled_var(buf, n, "col0");
+            buf[begin] = WL_PLAN_EXPR_VAR_FLOAT;
+        }
+        numeric_caller_twin(buf, n, 1, 0, true);
+        for (int map = 0; map < 2; map++) for (int stage_index = 0;
+                stage_index < 3; stage_index++)
+                for (int positive = 0; positive < 2; positive++) {
+                    wl_col_session_t *sess = join_session();
+                    col_rel_t *source = relation(17, 1, 1, false,
+                            sess->memory_governor);
+                    CHECK(session_add_rel(sess, source) == 0);
+                    make_lazy(source);
+                    uint64_t retained =
+                        wl_columnar_memory_reserved(
+                        wl_columnar_memory_governor_ref_get(
+                            sess->memory_governor));
+                    wl_plan_expr_buffer_t expr = {buf, n};
+                    wl_plan_op_t ops[2] = {
+                        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+                         .delta_mode = WL_DELTA_FORCE_FULL},
+                        {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+                         .filter_expr = expr,
+                         .project_count = 1, .map_exprs = &expr,
+                         .map_expr_count = 1}
+                    };
+                    wl_columnar_eval_stack_cleanup_frame_t *frame =
+                        filter_frame(sess);
+                    wl_evaluation_control_t *c = control(0);
+                    compiled_stop_stage = stage_index ==
+                        2 ? 3 : interpreted ? 6 + stage_index : 1 + stage_index;
+                    compiled_stop_progress = 300;
+                    compiled_stop_positive = positive;
+                    compiled_require_failed = false; compiled_reached = 0;
+                    wl_columnar_expr_test_controlled_checkpoint =
+                        compiled_stage_stop;
+                    int expected =
+                        positive ? EOVERFLOW : WL_EVALUATION_CONTROL_CANCELLED;
+                    CHECK(compiled_dispatch(sess, frame, ops, 2,
+                        c) == expected); finish(c, expected);
+                    CHECK(compiled_reached == 1); lazy_unchanged(source);
+                    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+                    CHECK(wl_columnar_memory_reserved(
+                            wl_columnar_memory_governor_ref_get(
+                                sess->memory_governor)) == retained);
+                    frame = filter_frame(sess); retry(c, 0);
+                    CHECK(compiled_dispatch(sess, frame, ops, 2, c) == 0);
+                    finish(c, 0);
+                    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+                    release(c); join_session_destroy(sess);
+                }
+    }
+}
+static void
+test_numeric_owned_interpreter_cleanup(void)
+{
+    for (int map = 0; map < 2; map++) {
+        wl_col_session_t *sess = join_session();
+        col_rel_t *source = relation(2, 2, 2, false, sess->memory_governor);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = join_frame(sess, source,
+                true);
+        uint8_t buf[16]; uint32_t n = compiled_var(buf, 0, "col0");
+        buf[0] = WL_PLAN_EXPR_VAR_FLOAT;
+        wl_plan_expr_buffer_t expr = {buf, n};
+        wl_plan_op_t op = {.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER,
+                           .filter_expr = expr, .project_count = 1,
+                           .map_exprs = &expr, .map_expr_count = 1};
+        wl_evaluation_control_t *c = control(0);
+        sess->base.evaluation_control = c;
+        filter_reached = 0;
+        if (map) wl_columnar_ops_map_test_controlled_checkpoint =
+                map_owned_cleanup_fault;
+        else wl_columnar_filter_test_controlled_checkpoint =
+                filter_cleanup_fault;
+        CHECK((map ? col_op_map(&op,
+            wl_columnar_eval_stack_cleanup_stack(frame), sess)
+            : wl_columnar_filter_op(&op,
+            wl_columnar_eval_stack_cleanup_stack(frame), sess)) == EBUSY);
+        sess->base.evaluation_control = NULL; finish(c, EBUSY);
+        CHECK(filter_reached == 1 &&
+            wl_columnar_eval_stack_cleanup_stack(frame)->items[0].rel ==
+            source);
+        CHECK(wl_columnar_eval_stack_cleanup_result(frame)->rel);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == EBUSY &&
+            !frame && sess->cleanup_pending);
+        CHECK(col_rel_source_reader_release(&join_retained_reader) == 0);
+        CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0);
+        release(c); join_session_destroy(sess);
+    }
+}
+
 int
 main(void)
 {
@@ -6440,6 +6816,11 @@ main(void)
     test_compiled_map_wide_stops();
     test_compiled_map_owned_cleanup();
     test_compiled_arithmetic_stack_twins();
+    test_numeric_float_and_interpreter_twins();
+    test_numeric_widened_failure_tail();
+    test_numeric_float_zero_row_failures();
+    test_numeric_long_paths();
+    test_numeric_owned_interpreter_cleanup();
     puts("evaluation_work: OK");
     return 0;
 }

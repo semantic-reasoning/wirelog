@@ -231,8 +231,9 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
         int rc = wl_evaluation_control_charge(control, 32);
         if (rc)
             return rc;
-        /* Two fixed admitted routes; no plan/name scan before refusal. The
-         * larger VARIABLE/FILTER route is charged separately below. */
+        /* Four exact routes; no plan/name scan before refusal. Short-circuit
+         * predicates fit32; suffixes total FILTER48, MAP56 and pipeline64.
+         * The single JOIN route retains its admitted32. */
         bool join = rplan->op_count == 1
             && rplan->ops[0].op == WL_PLAN_OP_JOIN;
         bool filter = rplan->op_count == 2
