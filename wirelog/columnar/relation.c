@@ -315,15 +315,27 @@ wl_columnar_relation_radix_bench_enabled(void)
 
 /* ---- COW helpers --------------------------------------------------------- */
 
+static int col_rel_mutation_set_acquire_impl(
+    wl_columnar_relation_mutation_set_t *set,
+    const wl_columnar_relation_mutation_role_t *roles, size_t role_count,
+    wl_columnar_relation_mutation_descriptor_t *descriptors,
+    size_t descriptor_cap,
+    wl_columnar_relation_mutation_owner_t *owners, size_t owner_cap,
+    wl_columnar_relation_mutation_lease_t *leases, size_t lease_cap,
+    wl_columnar_relation_mutation_initialization_t *initializations,
+    size_t initialization_cap, bool storage_disjoint);
+
 static int
 col_rel_mutation_single_acquire(col_rel_t *relation,
     wl_columnar_relation_mutation_single_t *single)
 {
     single->role.relation = relation;
     single->role.role_flags = WL_COLUMNAR_RELATION_PAYLOAD_MUTATION;
-    return col_rel_mutation_set_acquire(&single->set, &single->role, 1,
+    /* Distinct members of one object never overlap, so the caller-storage
+     * overlap scan cannot reject this layout. */
+    return col_rel_mutation_set_acquire_impl(&single->set, &single->role, 1,
                &single->descriptor, 1, single->owners, 2, &single->lease, 1,
-               &single->initialization, 1);
+               &single->initialization, 1, true);
 }
 
 static int col_rel_grow_owned_transition_legacy_impl(col_rel_t *r,
@@ -339,6 +351,9 @@ static int col_rel_cow_unshare_publish_impl(col_rel_t *r, uint32_t new_cap,
 static int col_rel_mutation_lease_advance_storage(
     wl_columnar_relation_mutation_lease_t *lease, uint64_t prior_generation);
 static bool col_rel_timestamp_shape_valid(const col_rel_t *r);
+static int col_rel_mutation_lease_validate_binding(
+    const wl_columnar_relation_mutation_lease_t *lease,
+    const col_rel_t *expected_relation);
 
 /* Append-all, batch and replacement transactions retain their existing
  * private authority until those complete transactions migrate. */
@@ -497,6 +512,21 @@ col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
     wl_columnar_relation_mutation_initialization_t *initializations,
     size_t initialization_cap)
 {
+    return col_rel_mutation_set_acquire_impl(set, roles, role_count,
+               descriptors, descriptor_cap, owners, owner_cap, leases,
+               lease_cap, initializations, initialization_cap, false);
+}
+
+static int
+col_rel_mutation_set_acquire_impl(wl_columnar_relation_mutation_set_t *set,
+    const wl_columnar_relation_mutation_role_t *roles, size_t role_count,
+    wl_columnar_relation_mutation_descriptor_t *descriptors,
+    size_t descriptor_cap,
+    wl_columnar_relation_mutation_owner_t *owners, size_t owner_cap,
+    wl_columnar_relation_mutation_lease_t *leases, size_t lease_cap,
+    wl_columnar_relation_mutation_initialization_t *initializations,
+    size_t initialization_cap, bool storage_disjoint)
+{
     int rc = EINVAL;
     size_t max_owners;
     if (!role_count)
@@ -533,7 +563,8 @@ col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
                         max_owners * sizeof(*owners),
                         role_count * sizeof(*leases),
                         role_count * sizeof(*initializations)};
-    for (size_t i = 0; i < sizeof(starts) / sizeof(starts[0]); i++) {
+    for (size_t i = 0; !storage_disjoint
+        && i < sizeof(starts) / sizeof(starts[0]); i++) {
         if (lengths[i] > UINTPTR_MAX - starts[i])
             return EOVERFLOW;
         for (size_t j = 0; j < i; j++)
@@ -707,9 +738,12 @@ col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
         }
         lease->identity = (uintptr_t)lease;
     }
-    /* Ownership snapshots must still match after source admission. */
+    /* Ownership snapshots must still match after source admission.  This
+     * call acquired every descriptor and owner token on this thread and has
+     * released none, so only the binding needs to be rechecked. */
     for (size_t i = 0; i < role_count; i++) {
-        rc = col_rel_mutation_lease_validate(&leases[i], roles[i].relation);
+        rc = col_rel_mutation_lease_validate_binding(&leases[i],
+                roles[i].relation);
         if (rc)
             goto fail;
     }
@@ -731,8 +765,13 @@ col_rel_mutation_set_lease(wl_columnar_relation_mutation_set_t *set,
     return &set->leases[index];
 }
 
-int
-col_rel_mutation_lease_validate(
+/* Every lease check except writer-token liveness: set membership, slot
+ * structure, canonical owner, and identity/generation snapshots.  Callers
+ * that use this directly must already prove, on this thread and without an
+ * intervening release, that every descriptor and owner token of the set is a
+ * live writer for its gate. */
+static int
+col_rel_mutation_lease_validate_binding(
     const wl_columnar_relation_mutation_lease_t *lease,
     const col_rel_t *expected_relation)
 {
@@ -760,11 +799,7 @@ col_rel_mutation_lease_validate(
         }
     if (!member)
         return EINVAL;
-    const wl_columnar_relation_mutation_descriptor_t *descriptor
-        = &set->descriptors[lease->descriptor_slot];
-    if (descriptor->relation != expected_relation
-        || wl_columnar_source_access_writer_validate(&descriptor->writer,
-        &expected_relation->descriptor_access))
+    if (set->descriptors[lease->descriptor_slot].relation != expected_relation)
         return EINVAL;
     col_rel_t *owner;
     if (col_rel_storage_owner_resolve(expected_relation, &owner)
@@ -785,13 +820,38 @@ col_rel_mutation_lease_validate(
         || lease->owner_slot >= set->owner_count
         || set->owners[lease->owner_slot].owner != owner
         || lease->self_owner_slot >= set->owner_count
-        || set->owners[lease->self_owner_slot].owner != expected_relation
-        || wl_columnar_source_access_writer_validate(
+        || set->owners[lease->self_owner_slot].owner != expected_relation)
+        return EINVAL;
+    return 0;
+}
+
+int
+col_rel_mutation_lease_validate(
+    const wl_columnar_relation_mutation_lease_t *lease,
+    const col_rel_t *expected_relation)
+{
+    int rc = col_rel_mutation_lease_validate_binding(lease, expected_relation);
+    if (rc)
+        return rc;
+    const wl_columnar_relation_mutation_set_t *set = lease->set;
+    if (wl_columnar_source_access_writer_validate(
+            &set->descriptors[lease->descriptor_slot].writer,
+            &expected_relation->descriptor_access))
+        return EINVAL;
+    if (lease->role_flags == WL_COLUMNAR_RELATION_METADATA_DETACH)
+        return 0;
+    if (wl_columnar_source_access_writer_validate(
             &set->owners[lease->self_owner_slot].writer,
             &expected_relation->source_access))
         return EINVAL;
+    /* The binding proved owners[owner_slot] is the canonical owner and
+     * owners[self_owner_slot] is this relation, so equal slots name the
+     * token and gate validated just above. */
+    if (lease->owner_slot == lease->self_owner_slot)
+        return 0;
     return wl_columnar_source_access_writer_validate(
-        &set->owners[lease->owner_slot].writer, &owner->source_access);
+        &set->owners[lease->owner_slot].writer,
+        &lease->owner->source_access);
 }
 
 /* A leased publisher may advance this lease only for the exact storage
@@ -949,11 +1009,13 @@ col_rel_mutation_set_finish(wl_columnar_relation_mutation_set_t *set,
         if (wl_columnar_source_access_writer_validate(&set->owners[i].writer,
             &set->owners[i].owner->source_access))
             return EINVAL;
+    /* Every descriptor and owner token was validated just above, and each
+     * binding names one of those exact token/gate pairs. */
     if (commit || set->published)
         for (size_t i = 0; i < set->lease_count; i++)
             if (set->roles[i].role_flags
                 == WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
-                && col_rel_mutation_lease_validate(&set->leases[i],
+                && col_rel_mutation_lease_validate_binding(&set->leases[i],
                 set->roles[i].relation) != 0)
                 abort();
     col_rel_mutation_set_unwind(set, commit || set->published);
@@ -5109,14 +5171,11 @@ col_rel_append_rows_atomic(col_rel_t *r, const int64_t *rows,
 
     /* Capacity/admission and COW are now complete.  The prevalidated raw
      * copies below do not allocate and cannot fail while this writer is held. */
-    for (uint32_t row = 0; row < num_rows; row++) {
-        uint32_t dst = r->nrows + row;
-        if (r->timestamps)
-            memset(&r->timestamps[dst], 0, sizeof(r->timestamps[dst]));
-        if (col_rel_row_copy_in_raw(r, dst,
-            rows + (size_t)row * num_cols) != 0)
-            abort();
-    }
+    if (r->timestamps)
+        memset(&r->timestamps[r->nrows], 0,
+            (size_t)num_rows * sizeof(*r->timestamps));
+    if (col_rel_rows_copy_in_raw(r, r->nrows, rows, num_rows) != 0)
+        abort();
     r->nrows = required_rows;
     wl_columnar_relation_touch_view(r);
     rc = 0;

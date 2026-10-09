@@ -1142,6 +1142,55 @@ col_rel_row_copy_in(col_rel_t *r, uint32_t row, const int64_t *src)
     return rc;
 }
 
+/* Copy count consecutive rows in with the same per-cell validation and float
+ * normalization as col_rel_row_copy_in_raw().  The column and type tables are
+ * read once: cell stores cannot change them, and rereading them for every
+ * cell made the wide-batch loop slower and sensitive to code placement. */
+static inline int
+col_rel_rows_copy_in_raw(col_rel_t *r, uint32_t row, const int64_t *src,
+    uint32_t count)
+{
+    if (!r || (!src && count != 0))
+        return EINVAL;
+    if (r->ncols == 0) {
+        return r->relation_identity != 0
+               && r->view_generation != 0
+               && r->storage_generation != 0
+            ? 0
+            : EINVAL;
+    }
+    int64_t *const *columns = r->columns;
+    const wirelog_column_type_t *types = r->column_types;
+    const uint32_t ncols = r->ncols;
+    if (!columns)
+        return EINVAL;
+    for (uint32_t c = 0; c < ncols; c++)
+        if (columns[c] == NULL)
+            return EINVAL;
+    for (uint32_t c = 0; types && c < ncols; c++) {
+        if (types[c] != WIRELOG_TYPE_FLOAT)
+            continue;
+        for (uint32_t i = 0; i < count; i++) {
+            int64_t value = 0;
+            memcpy(&value, &src[(size_t)i * ncols + c], sizeof(value));
+            if (!wl_columnar_float_bits_valid(value))
+                return EINVAL;
+        }
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        const int64_t *in = src + (size_t)i * ncols;
+        for (uint32_t c = 0; c < ncols; c++) {
+            int64_t value = 0;
+            memcpy(&value, &in[c], sizeof(value));
+            if (types && types[c] == WIRELOG_TYPE_FLOAT
+                && wl_columnar_float_bits_zero(value))
+                value = 0;
+            memcpy(&columns[c][row + i], &value, sizeof(value));
+        }
+    }
+    return 0;
+}
+
 /** Compute buffer size in bytes for row_count rows. */
 static inline size_t
 col_rel_buf_bytes(const col_rel_t *r, uint32_t row_count)
