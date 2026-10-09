@@ -3977,6 +3977,9 @@ wl_columnar_expr_uuid_rfc_run(const uint8_t namespace_uuid[16],
     const uint8_t *name, size_t name_length, char text[37], bool *failed,
     wl_evaluation_control_t *control);
 int
+wl_columnar_expr_uuid4_run(int64_t *value, bool *failed,
+    wl_evaluation_control_t *control);
+int
 wl_columnar_expr_hash_run(const uint8_t *bytes, size_t length, int64_t *value,
     bool *failed, wl_evaluation_control_t *control);
 int

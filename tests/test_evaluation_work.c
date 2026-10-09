@@ -9646,6 +9646,286 @@ test_rfc_saturated_operands(void)
             join_session_destroy(sess);
         }
 }
+extern void (*wl_columnar_expr_uuid4_test_checkpoint)(wl_evaluation_control_t *,
+    int, uint64_t, bool);
+extern int64_t (*wl_columnar_expr_uuid4_test_provider_result)(int, int64_t);
+extern void (*wl_columnar_expr_uuid4_test_bytes)(int, const uint8_t *);
+extern void (*wl_columnar_expr_uuid4_test_override_bytes)(uint8_t *);
+static uint32_t uuid4_calls[2], uuid4_seen[2], uuid4_reached;
+static int64_t uuid4_actual[2];
+static int uuid4_override = -1, uuid4_stage, uuid4_primary;
+static bool uuid4_known;
+static uint8_t uuid4_recorded[2][16];
+static const uint8_t uuid4_vector[16] = {0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5,
+                                         0xf6, 0xf7,
+                                         0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd,
+                                         0xfe, 0xff};
+static int64_t
+uuid4_provider_report(int stage, int64_t actual)
+{
+    CHECK(stage >= 0 && stage < 2); uuid4_calls[stage]++;
+    uuid4_actual[stage] = actual;
+#ifdef WL_MBEDTLS_ENABLED
+    if (stage == uuid4_override &&
+        actual == PSA_SUCCESS) return PSA_ERROR_INSUFFICIENT_MEMORY;
+#endif
+    return actual;
+}
+static void
+uuid4_record_bytes(int stage, const uint8_t *bytes)
+{
+    CHECK(stage == 0 || stage == 1); uuid4_seen[stage]++;
+    memcpy(uuid4_recorded[stage], bytes, 16);
+    if (stage == 1) {
+        uint8_t expected[16];
+        memcpy(expected, uuid4_known?uuid4_vector:uuid4_recorded[0], 16);
+        expected[6] = (expected[6]&15)|0x40;
+        expected[8] = (expected[8]&63)|0x80;
+        CHECK(memcmp(expected, bytes, 16) == 0 && (bytes[6]&0xf0) == 0x40 &&
+            (bytes[8]&0xc0) == 0x80);
+    }
+}
+static void
+uuid4_known_override(uint8_t *bytes)
+{
+    /* Separate deterministic transform proof, AFTER genuine success. */
+    memcpy(bytes, uuid4_vector, 16);
+}
+static void
+uuid4_checkpoint_stop(wl_evaluation_control_t *c, int stage, uint64_t progress,
+    bool failed)
+{
+    (void)progress; (void)failed;
+    if (stage != uuid4_stage)return;
+    wl_columnar_expr_uuid4_test_checkpoint = NULL;
+    wl_columnar_expr_test_controlled_checkpoint = NULL;
+    uuid4_reached++;
+    if (uuid4_primary)CHECK(wl_evaluation_control_charge(c,
+            UINT64_MAX) == EOVERFLOW);
+    else wl_evaluation_control_request_cancel(c);
+}
+static void
+uuid4_hooks_reset(void)
+{
+    memset(uuid4_calls, 0, sizeof(uuid4_calls));
+    memset(uuid4_seen, 0, sizeof(uuid4_seen));
+    uuid4_reached = 0; uuid4_actual[0] = uuid4_actual[1] = INT64_MIN;
+}
+static void
+uuid4_hooks_clear(void)
+{
+    wl_columnar_expr_uuid4_test_checkpoint = NULL;
+    wl_columnar_expr_test_controlled_checkpoint = NULL;
+    wl_columnar_expr_uuid4_test_provider_result = NULL;
+    wl_columnar_expr_uuid4_test_bytes = NULL;
+    wl_columnar_expr_uuid4_test_override_bytes = NULL;
+    uuid4_override = -1; uuid4_known = false;
+}
+static uint32_t
+uuid4_bytecode(uint8_t *buf, int map, bool saturated)
+{
+    uint32_t n = 0;
+    if (saturated)for (unsigned j = 0; j < 513; j++) {
+            buf[n++] = WL_PLAN_EXPR_BOOL; buf[n++] = 0;
+        }
+    buf[n++] = WL_PLAN_EXPR_ARITH_UUID4;
+    if (!map && !saturated) {
+        buf[n++] = WL_PLAN_EXPR_BOOL; buf[n++] = 1;
+    }
+    return n;
+}
+static uint64_t
+uuid4_caller_trial(int map, bool rows, bool saturated, bool known, int stop,
+    int primary, int override, uint64_t budget, bool reset, bool budget_denied)
+{
+    wl_col_session_t *sess = join_session();
+    sess->intern = string_table(sess->memory_governor, 1);
+    col_rel_t *source = relation(1, rows?1:0, rows?1:0, false,
+            sess->memory_governor);
+    CHECK(session_add_rel(sess, source) == 0); make_lazy(source);
+    uint64_t before = string_reserved(sess->memory_governor);
+    uint8_t buf[1100]; uint32_t n = uuid4_bytecode(buf, map, saturated);
+    wl_plan_expr_buffer_t expr = {buf, n}; wl_plan_op_t ops[2] = {
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "work",
+         .delta_mode = WL_DELTA_FORCE_FULL},
+        {.op = map?WL_PLAN_OP_MAP:WL_PLAN_OP_FILTER, .filter_expr = expr,
+         .project_count = 1, .map_exprs = &expr, .map_expr_count = 1}
+    };
+    wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+    wl_evaluation_control_t *c = control(budget);
+    uuid4_hooks_reset(); uuid4_known = known; uuid4_override = override;
+    wl_columnar_expr_uuid4_test_provider_result = uuid4_provider_report;
+    wl_columnar_expr_uuid4_test_bytes = uuid4_record_bytes;
+    wl_columnar_expr_uuid4_test_override_bytes =
+        known?uuid4_known_override:NULL;
+    uuid4_stage = stop; uuid4_primary = primary;
+    if (stop) {
+        if (stop ==
+            3) wl_columnar_expr_test_controlled_checkpoint =
+                uuid4_checkpoint_stop;
+        else wl_columnar_expr_uuid4_test_checkpoint = uuid4_checkpoint_stop;
+    }
+    int expected = 0;
+#ifdef WL_MBEDTLS_ENABLED
+    if (rows && override >= 0)expected = map?ERANGE:0;
+#else
+    if (rows)expected = map?ERANGE:0;
+#endif
+    if (rows &&
+        stop) expected = primary?EOVERFLOW:WL_EVALUATION_CONTROL_CANCELLED;
+    if (rows && budget_denied)expected = WL_EVALUATION_CONTROL_WORK_LIMIT;
+    int rc = compiled_dispatch(sess, frame, ops, 2, c);
+    if (rc != expected)fprintf(stderr,
+            "uuid4 map%d rows%d stop%d primary%d override%d budget%llu rc%d expected%d\n",
+            map, rows, stop, primary, override, (unsigned long long)budget, rc,
+            expected);
+    CHECK(rc == expected); uint64_t work = finish(c, expected);
+    CHECK(uuid4_reached == (uint32_t)(rows && stop));
+#ifdef WL_MBEDTLS_ENABLED
+    uint32_t init = rows && stop != 60;
+    uint32_t random = init && stop != 61 && stop != 62 && override != 0;
+    CHECK(uuid4_calls[0] == init && uuid4_calls[1] == random);
+    if (init)CHECK(uuid4_actual[0] == PSA_SUCCESS);
+    if (random)CHECK(uuid4_actual[1] == PSA_SUCCESS);
+    if (rows && !stop && override < 0 &&
+        !budget) CHECK(uuid4_seen[0] == 1 && uuid4_seen[1] == 1);
+#else
+    CHECK(!uuid4_calls[0] && !uuid4_calls[1] && !uuid4_seen[0] &&
+        !uuid4_seen[1]);
+#endif
+    CHECK(!sess->memory_budget_denied && wl_intern_count(sess->intern) == 1 &&
+        strcmp(wl_intern_reverse(sess->intern, 0), "seed-0") == 0);
+    if (expected)lazy_unchanged(source);
+    if (!expected && rows && override < 0) {
+#ifdef WL_MBEDTLS_ENABLED
+        CHECK(join_output(frame)->nrows == (map || !saturated));
+        if (map) {
+            int64_t value; memcpy(&value, uuid4_recorded[1], 8);
+            CHECK(join_output(frame)->columns[0][0] == (saturated?0:value));
+        }
+#endif
+    }
+    source_unpinned(source, source);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 &&
+        string_reserved(sess->memory_governor) == before);
+    uuid4_hooks_clear();
+    if (reset) {
+        retry(c, 0); frame = filter_frame(sess); uuid4_hooks_reset();
+        wl_columnar_expr_uuid4_test_provider_result = uuid4_provider_report;
+        wl_columnar_expr_uuid4_test_bytes = uuid4_record_bytes;
+#ifdef WL_MBEDTLS_ENABLED
+        expected = 0;
+#else
+        expected = rows && map?ERANGE:0;
+#endif
+        CHECK(compiled_dispatch(sess, frame, ops, 2, c) == expected);
+        finish(c, expected);
+#ifdef WL_MBEDTLS_ENABLED
+        CHECK(uuid4_calls[0] == (uint32_t)rows &&
+            uuid4_calls[1] == (uint32_t)rows);
+        CHECK(uuid4_seen[0] == (uint32_t)rows &&
+            uuid4_seen[1] == (uint32_t)rows);
+#endif
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 &&
+            string_reserved(sess->memory_governor) == before);
+        uuid4_hooks_clear();
+    }
+    wl_intern_free(sess->intern); sess->intern = NULL; release(c);
+    join_session_destroy(sess);
+    return work;
+}
+static void
+test_uuid4_actual_bytes_and_work(void)
+{
+    for (int map = 0; map < 2; map++) {
+        uuid4_caller_trial(map, false, false, false, 0, 0, -1, 0, false, false);
+#ifdef WL_MBEDTLS_ENABLED
+        /* Unmodified REAL random16 is distinct from the known-vector fixture. */
+        uint64_t work = uuid4_caller_trial(map, true, false, false, 0, 0, -1, 0,
+                true, false);
+        CHECK(uuid4_caller_trial(map, true, false, false, 0, 0, -1, work,
+            false, false) == work);
+        uuid4_caller_trial(map, true, false, false, 0, 0, -1, work-1, true,
+            true);
+        uuid4_caller_trial(map, true, false, true, 0, 0, -1, 0, false, false);
+        uuid4_caller_trial(map, true, true, false, 0, 0, -1, 0, false, false);
+#else
+        uuid4_caller_trial(map, true, false, false, 0, 0, -1, 0, true, false);
+#endif
+    }
+}
+static void
+test_uuid4_reached_stops_and_status(void)
+{
+    for (int map = 0; map < 2; map++) {
+#ifdef WL_MBEDTLS_ENABLED
+        const int stages[] = {60, 61, 62, 63, 64, 65, 3};
+        for (unsigned j = 0; j < sizeof(stages)/sizeof(*stages); j++)
+            for (int positive = 0; positive < 2; positive++)
+                uuid4_caller_trial(map, true, false, false, stages[j], positive,
+                    -1, 0, true, false);
+        for (int fault = 0; fault < 2; fault++) {
+            uuid4_caller_trial(map, true, false, false, 0, 0, fault, 0, true,
+                false);
+            for (int positive = 0; positive < 2; positive++) {
+                uuid4_caller_trial(map, true, false, false, fault?63:61,
+                    positive, fault, 0, true, false);
+                uuid4_caller_trial(map, true, false, false, 3, positive, fault,
+                    0, true, false);
+            }
+        }
+#else
+        for (int positive = 0; positive < 2; positive++)
+            uuid4_caller_trial(map, true, false, false, 3, positive, -1, 0,
+                true, false);
+#endif
+    }
+}
+static void
+test_uuid4_owned_cleanup(void)
+{
+#ifdef WL_MBEDTLS_ENABLED
+    for (int map = 0; map < 2; map++) {
+        wl_col_session_t *sess = join_session();
+        sess->intern = string_table(sess->memory_governor, 1);
+        col_rel_t *source = relation(2, 2, 2, false, sess->memory_governor);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = join_frame(sess, source,
+                true);
+        uint8_t buf[8]; uint32_t n = uuid4_bytecode(buf, map, false);
+        wl_plan_expr_buffer_t expr = {buf, n}; wl_plan_op_t op = {
+            .op = map?WL_PLAN_OP_MAP:WL_PLAN_OP_FILTER, .filter_expr = expr,
+            .project_count = 1, .map_exprs = &expr, .map_expr_count = 1
+        };
+        wl_evaluation_control_t *c = control(0);
+        sess->base.evaluation_control = c;
+        uuid4_hooks_reset(); uuid4_known = false;
+        wl_columnar_expr_uuid4_test_provider_result = uuid4_provider_report;
+        wl_columnar_expr_uuid4_test_bytes = uuid4_record_bytes;
+        filter_reached = 0;
+        if (map)wl_columnar_ops_map_test_controlled_checkpoint =
+                map_owned_cleanup_fault;
+        else wl_columnar_filter_test_controlled_checkpoint =
+                filter_cleanup_fault;
+        CHECK((map?col_op_map(&op, wl_columnar_eval_stack_cleanup_stack(frame),
+            sess):
+            wl_columnar_filter_op(&op,
+            wl_columnar_eval_stack_cleanup_stack(frame), sess)) == EBUSY);
+        sess->base.evaluation_control = NULL; finish(c, EBUSY);
+        CHECK(uuid4_calls[1] >= 1 && uuid4_seen[1] >= 1 &&
+            filter_reached == 1 &&
+            wl_intern_count(sess->intern) == 1 &&
+            strcmp(wl_intern_reverse(sess->intern, 0), "seed-0") == 0);
+        uuid4_hooks_clear();
+        CHECK(wl_columnar_eval_stack_cleanup_result(frame)->rel);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == EBUSY &&
+            !frame && sess->cleanup_pending);
+        CHECK(col_rel_source_reader_release(&join_retained_reader) == 0);
+        CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0);
+        wl_intern_free(sess->intern); sess->intern = NULL; release(c);
+        join_session_destroy(sess);
+    }
+#endif
+}
 int
 main(void)
 {
@@ -9781,6 +10061,9 @@ main(void)
     test_rfc_zero_and_short_circuit();
     test_rfc_shared_reverse_parent_stop();
     test_rfc_saturated_operands();
+    test_uuid4_actual_bytes_and_work();
+    test_uuid4_reached_stops_and_status();
+    test_uuid4_owned_cleanup();
     test_digest_owned_cleanup_kind(2);
     test_digest_zero_calls_and_id_independence_kind(true);
     test_digest_owned_cleanup_kind(true);

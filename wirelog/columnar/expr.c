@@ -2731,6 +2731,7 @@ wl_columnar_expr_controlled_interpreter_decode(const uint8_t *buf,
         in->iarg = length; in->larg = *pos; *pos += length;
         break;
     }
+    case WL_PLAN_EXPR_ARITH_UUID4:
     case WL_PLAN_EXPR_STR_FN_UUID5_RFC:
     case WL_PLAN_EXPR_ARITH_UUID5: case WL_PLAN_EXPR_ARITH_UUID5_SS:
     case WL_PLAN_EXPR_ARITH_UUID5_SI: case WL_PLAN_EXPR_ARITH_UUID5_IS:
@@ -2896,6 +2897,11 @@ wl_columnar_expr_eval_interpreter_controlled(const uint8_t *buf,
                     sess, &allocation, control);
             if (rc) return rc;
             pending = allocation;
+        } else if (!pending && in.op == WL_PLAN_EXPR_ARITH_UUID4) {
+            int64_t value;
+            rc = wl_columnar_expr_uuid4_run(&value, &pending, control);
+            if (rc) return rc;
+            if (!pending) expr_push(&stack, value);
         } else if (!pending && in.op == WL_PLAN_EXPR_STR_FN_UUID5_RFC) {
             rc = wl_columnar_expr_controlled_uuid_rfc(&stack, sess, &pending,
                     &allocation, control);

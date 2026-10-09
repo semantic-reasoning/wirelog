@@ -262,3 +262,106 @@ wl_columnar_expr_uuid_rfc_run(const uint8_t namespace_uuid[16],
     return wl_columnar_expr_digest_segments(WL_PLAN_EXPR_ARITH_UUID5, parts,
                lengths, 2, true, text, NULL, failed, control);
 }
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_expr_uuid4_test_checkpoint)(wl_evaluation_control_t *, int,
+    uint64_t, bool);
+int64_t (*wl_columnar_expr_uuid4_test_provider_result)(int, int64_t);
+void (*wl_columnar_expr_uuid4_test_bytes)(int, const uint8_t *);
+void (*wl_columnar_expr_uuid4_test_override_bytes)(uint8_t *);
+#endif
+#ifdef WL_MBEDTLS_ENABLED
+static void
+wl_columnar_expr_uuid4_checkpoint(wl_evaluation_control_t *control, int stage,
+    bool failed)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_expr_uuid4_test_checkpoint)
+        wl_columnar_expr_uuid4_test_checkpoint(control, stage, 16, failed);
+#else
+    (void)control; (void)stage; (void)failed;
+#endif
+}
+static psa_status_t
+wl_columnar_expr_uuid4_report(int stage, psa_status_t actual)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_expr_uuid4_test_provider_result) {
+        psa_status_t reported = (psa_status_t)
+            wl_columnar_expr_uuid4_test_provider_result(stage, actual);
+        /* Report injection may never make real failure look successful. */
+        return actual != PSA_SUCCESS &&
+               reported == PSA_SUCCESS ? actual : reported;
+    }
+#else
+    (void)stage;
+#endif
+    return actual;
+}
+#endif
+int
+wl_columnar_expr_uuid4_run(int64_t *value, bool *failed,
+    wl_evaluation_control_t *control)
+{
+#ifndef WL_MBEDTLS_ENABLED
+    (void)value; (void)control; *failed = true; return 0;
+#else
+    int rc = wl_evaluation_control_charge(control, 8);
+    if (rc) return rc;
+    uint8_t uuid[16];
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) return rc;
+    wl_columnar_expr_uuid4_checkpoint(control, 60, false);
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) return rc;
+    /* Separate fixed-input external init/random16 primitives. Provider RNG
+     * state persists/advances: no per-call owner, abort, free or fake G token. */
+    rc = wl_evaluation_control_charge(control, 128);
+    if (rc) return rc;
+    psa_status_t status = wl_columnar_expr_uuid4_report(0, psa_crypto_init());
+    wl_columnar_expr_uuid4_checkpoint(control, 61, status != PSA_SUCCESS);
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) return rc;
+    if (status != PSA_SUCCESS) {
+        *failed = true; return 0;
+    }
+    rc = wl_evaluation_control_charge(control, 128);
+    if (rc) return rc;
+    wl_columnar_expr_uuid4_checkpoint(control, 62, false);
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) return rc;
+    status = wl_columnar_expr_uuid4_report(1, psa_generate_random(uuid, 16));
+    wl_columnar_expr_uuid4_checkpoint(control, 63, status != PSA_SUCCESS);
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) return rc;
+    if (status != PSA_SUCCESS) {
+        *failed = true; return 0;
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    /* Mandatory real-byte observation is separate from the optional known
+     * vector fixture. Neither can run after failed/partial provider output. */
+    if (wl_columnar_expr_uuid4_test_bytes)
+        wl_columnar_expr_uuid4_test_bytes(0, uuid);
+    if (wl_columnar_expr_uuid4_test_override_bytes)
+        wl_columnar_expr_uuid4_test_override_bytes(uuid);
+#endif
+    rc = wl_evaluation_control_charge(control, 16);
+    if (rc) return rc;
+    uuid[6] = (uuid[6] & 0x0f) | 0x40;
+    uuid[8] = (uuid[8] & 0x3f) | 0x80;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_expr_uuid4_test_bytes)
+        wl_columnar_expr_uuid4_test_bytes(1, uuid);
+#endif
+    wl_columnar_expr_uuid4_checkpoint(control, 64, false);
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 8);
+    if (rc) return rc;
+    int64_t pending; memcpy(&pending, uuid, 8);
+    wl_columnar_expr_uuid4_checkpoint(control, 65, false);
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) return rc;
+    *value = pending; *failed = false; return 0;
+#endif
+}
