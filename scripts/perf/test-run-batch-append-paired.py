@@ -76,7 +76,7 @@ class PairedRunTests(unittest.TestCase):
             source = self.root / f'src-{side}'
             source.mkdir()
             self.git(source, 'init', '-q')
-            (source / 'README').write_text(side)
+            (source / 'README').write_text(side, encoding='utf-8')
             self.git(source, 'add', 'README')
             self.git(source, '-c', 'user.name=t', '-c', 'user.email=t@e', 'commit', '-q',
                      '-m', side)
@@ -91,7 +91,7 @@ class PairedRunTests(unittest.TestCase):
         value = dict(schema='wirelog.batch-append-calibration.v1', status='calibrated',
                      accepted_iteration_counts=dict(COUNTS))
         value.update(overrides)
-        (self.root / 'calibration.json').write_text(json.dumps(value))
+        (self.root / 'calibration.json').write_text(json.dumps(value), encoding='utf-8')
 
     def collect(self, timing=same, name='evidence', launcher=None, **overrides):
         args = Args(self.root, out=str(self.root / name), **overrides)
@@ -112,20 +112,21 @@ class PairedRunTests(unittest.TestCase):
         self.assertEqual(status['status'], 'complete_capture')
         self.assertEqual(status['benchmark_launches_performed'], 108)
         self.assertEqual(len(launcher.calls), 108)
-        manifest = json.loads((out / 'manifest.json').read_text())
+        manifest = json.loads((out / 'manifest.json').read_text(encoding='utf-8'))
         for side in RUN['SIDES']:
             source = self.root / f'src-{side}'
             head = subprocess.run(['git', '-C', str(source), 'rev-parse', 'HEAD', 'HEAD^{tree}'],
-                                  capture_output=True, text=True, check=True).stdout.split()
+                                  capture_output=True, text=True, encoding='utf-8',
+                                  check=True).stdout.split()
             self.assertEqual([manifest['binaries'][side]['commit'],
                               manifest['binaries'][side]['tree']], head)
-        schedule = json.loads((out / 'schedule.json').read_text())['commands']
+        schedule = json.loads((out / 'schedule.json').read_text(encoding='utf-8'))['commands']
         for call, row in zip(launcher.calls, schedule):
             self.assertEqual(call['argv'], row['argv'])
             self.assertEqual(call['cpu'], 0)
             self.assertTrue(call['argv'][0].startswith(str(out)))
             self.assertEqual(row['iterations'], COUNTS[row['case']])
-        records = (out / 'journal.jsonl').read_text().splitlines()
+        records = (out / 'journal.jsonl').read_text(encoding='utf-8').splitlines()
         self.assertEqual(len(records), 216)
         self.assertTrue(all(json.loads(r).get('host_eligibility', {'eligible': True})['eligible']
                             for r in records))
@@ -142,7 +143,7 @@ class PairedRunTests(unittest.TestCase):
                        launcher=FakeLauncher('test-seed', same), home=self.root / 'src-base')
 
     def test_rejects_dirty_source_and_invalid_calibration(self):
-        (self.root / 'src-candidate/untracked').write_text('x')
+        (self.root / 'src-candidate/untracked').write_text('x', encoding='utf-8')
         with self.assertRaisesRegex(RUN['RunError'], 'untracked'):
             self.collect()
         (self.root / 'src-candidate/untracked').unlink()
@@ -161,7 +162,7 @@ class PairedRunTests(unittest.TestCase):
         launcher = FakeLauncher('test-seed', same, on_call=tamper)
         with self.assertRaisesRegex(RUN['RunError'], 'binary drift'):
             self.collect(launcher=launcher)
-        status = json.loads((self.root / 'evidence/status.json').read_text())
+        status = json.loads((self.root / 'evidence/status.json').read_text(encoding='utf-8'))
         self.assertEqual(status['status'], 'aborted')
         self.assertLess(len(launcher.calls), 108)
 
@@ -263,17 +264,17 @@ class PairedRunTests(unittest.TestCase):
     def test_evaluator_rejects_schedule_or_binary_tampering(self):
         out, _, _ = self.collect()
         journal = out / 'journal.jsonl'
-        original = journal.read_text()
+        original = journal.read_text(encoding='utf-8')
         for field, value, message in (('pair_order', 'XX', 'frozen schedule'),
                                       ('executable_sha256', '0' * 64, 'executable hash')):
             lines = original.splitlines()
             record = json.loads(lines[0])
             record['command_row'][field] = value
             lines[0] = json.dumps(record)
-            journal.write_text('\n'.join(lines) + '\n')
+            journal.write_text('\n'.join(lines) + '\n', encoding='utf-8')
             with self.assertRaisesRegex(EVAL['EvaluationError'], message):
                 EVAL['analyze'](out)
-        journal.write_text(original + original.splitlines()[0] + '\n')
+        journal.write_text(original + original.splitlines()[0] + '\n', encoding='utf-8')
         with self.assertRaisesRegex(EVAL['EvaluationError'], 'duplicate'):
             EVAL['analyze'](out)
 
