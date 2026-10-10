@@ -119,15 +119,19 @@ col_session_memory_governor_ref(wl_session_t *session);
  * @num_workers:       Number of target workers (W).
  * @key_col_idxs:      IDB partition key columns (owned array).
  * @key_col_count:     Number of IDB key columns.
- * @edb_key_col_idxs:  EDB-side join columns matching key_col_idxs (owned).
- *                      Used by tdd_init_workers_hybrid to partition the
- *                      joinable EDB by the join key for work splitting.
- *                      NULL when no EDB partition info is available.
+ * @edb_key_col_idxs:  Columns of an EDB that is a direct operand of the
+ *                      join the EXCHANGE keys come from (owned), matching
+ *                      key_col_idxs through that join; NULL otherwise.
  * @edb_key_col_count: Number of EDB key columns.
- * @edb_rel_name:      Name of the EDB relation to partition (owned string).
- *                      Only this relation is hash-partitioned; all other
- *                      non-IDB relations are replicated for correctness
- *                      (e.g. anti-join tables need full copies).
+ * @edb_rel_name:      Name of the EDB relation tdd_init_workers_hybrid
+ *                      hash-partitions by edb_key_col_idxs (owned string).
+ *                      Set only when the stratum relation it is joined
+ *                      with is partitioned by exactly key_col_idxs, and
+ *                      every relation of the stratum that reads this EDB
+ *                      reads it once and names it with the same keys
+ *                      (Issue #2118); all other non-IDB
+ *                      relations are replicated for correctness (e.g.
+ *                      anti-join tables need full copies).
  */
 typedef struct {
     uint32_t num_workers;
