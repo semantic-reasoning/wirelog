@@ -51,6 +51,34 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Recursive strata keep their model when an input relation is
+  partitioned across workers** (#2118): a recursive stratum evaluated on
+  several workers may hash-partition one input relation instead of
+  copying it to every worker.  The plan took that relation's key columns
+  from the last join reading a relation of the stratum, even when the
+  join's left side was the result of an earlier join, so the columns
+  addressed that result rather than the input.  Without the fusion, JPP
+  and SIP passes, `a(x, z) :- e(x, y), a(y, w), a(w, z).` failed with
+  `EINVAL` at two or more workers, and the Andersen points-to rules
+  returned 1171 rows instead of 1200 on the test's data.  Separately, two
+  relations of one stratum reading the same input through different
+  columns each partitioned it their own way: with `a(x, z) :- e(x, y),
+  a(y, z).`, `b(x, z) :- e(z, x), b(z, y).` and the two relations feeding
+  each other, rows were lost with and without the passes.  So were rows
+  of `a(x, y) :- e(x, y), b(x, y).` when `b` was partitioned by the same
+  columns in the other order, as `b(u, v) :- g(u, v), b(v, u).` makes
+  it.  An input relation is now partitioned only when it is a direct
+  operand of a join against a relation of the stratum that is
+  partitioned by that join's columns in the join's order, and when every
+  relation of the stratum that reads it reads it once with the same
+  columns; otherwise it is copied to every worker.  An input read only by
+  a rule that reads no relation of the stratum, such as `r :- edge.`
+  beside `r :- r, r.`, is now copied too: partitioning such an input
+  lost rows under the bdx strategy for `a(x, y) :- g(x, y), x < 2.`
+  beside `a(x0, x3) :- a(x0, x1), h(x1, x2), a(x3, x2).`.  The `tdd-bdx`
+  benchmark on 5000 edges takes about 126 ms instead of 100 ms at eight
+  workers as a result.
+
 - **The required heap correctness check watches the moved compaction
   code** (#2084): `perf-suite-required.yml` fired only on
   `wirelog/columnar/ops.c`, `wirelog/columnar/internal.h`, the CRDT gate

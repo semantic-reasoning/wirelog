@@ -2183,6 +2183,18 @@ test_plan_exchange_exe = executable(
 
 test('plan_exchange', test_plan_exchange_exe)
 
+# Issue #2118: recursive strata keep their model at every worker count,
+# with and without the planning passes.
+test_tdd_partition_metadata_exe = executable(
+  'test_tdd_partition_metadata',
+  files('test_tdd_partition_metadata.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+
+test('tdd_partition_metadata', test_tdd_partition_metadata_exe)
+
 # ============================================================================
 # RDF Named-Graph Integration Tests (Issue #535)
 # ============================================================================
