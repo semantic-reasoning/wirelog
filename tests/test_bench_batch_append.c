@@ -147,5 +147,32 @@ main(int argc, char **argv)
             output);
         return 1;
     }
+
+    /* 32x256-float (#2125) runs only when named; "all" is checked above. */
+    written = snprintf(command, sizeof(command),
+            "\"%s\" --case 32x256-float --iterations 4 --samples 2"
+            " --warmups 1", argv[1]);
+    if (written < 0 || (size_t)written >= sizeof(command)) {
+        fprintf(stderr, "bench_batch_append_smoke: float path too long\n");
+        return 1;
+    }
+    pipe = popen(command, "r");
+    if (!pipe) {
+        fprintf(stderr, "bench_batch_append_smoke: float popen failed\n");
+        return 1;
+    }
+    length = fread(output, 1, sizeof(output) - 1, pipe);
+    output[length] = '\0';
+    status = pclose(pipe);
+    if (status != 0
+        || !strstr(output, "case\tcontract=wirelog.batch-append-benchmark.v2"
+        "\tname=32x256-float\tcolumns=32\trows_per_call=256")
+        || !strstr(output, "value_check=OK")
+        || !strstr(output, "distinct_input_probe=OK")
+        || strstr(output, "case=1x1\t")) {
+        fprintf(stderr, "bench_batch_append_smoke: float case failed\n%s",
+            output);
+        return 1;
+    }
     return 0;
 }

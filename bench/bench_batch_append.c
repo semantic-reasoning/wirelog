@@ -12,6 +12,10 @@
  * Each operation resets only nrows before the call; a matching reset-only
  * control reports that loop's cost separately instead of subtracting it.
  *
+ * 32x256-float (#2125) is the 32x256 shape with every column typed FLOAT, so
+ * each cell takes the float validation and -0.0 normalization path.  It runs
+ * only when named with --case; "all" stays the three #2036 cases.
+ *
  * Raw per-sample timings are evidence; this executable does not decide
  * whether a change is an improvement. Pin the process and collect paired
  * base/candidate runs with scripts/perf tooling for comparisons.
@@ -41,12 +45,15 @@ typedef struct {
     uint32_t nrows;
     uint64_t initial_iterations;
     const char *name;
+    bool float_columns; /* every column WIRELOG_TYPE_FLOAT */
+    bool named_only;    /* excluded from --case all */
 } append_case_t;
 
 static const append_case_t cases[] = {
     { 1, 1, UINT64_C(2000000), "1x1" },
     { 1, 256, UINT64_C(10000), "1x256" },
     { 32, 256, UINT64_C(10000), "32x256" },
+    { 32, 256, UINT64_C(10000), "32x256-float", true, true },
 };
 
 static BENCH_NOINLINE void
@@ -126,9 +133,33 @@ prepare_relation(const append_case_t *test_case, col_rel_t **out_rel,
         return ENOMEM;
     }
     for (uint32_t row = 0; row < test_case->nrows; row++) {
-        for (uint32_t col = 0; col < test_case->ncols; col++)
-            rows[(size_t)row * test_case->ncols + col]
-                = (int64_t)row * INT64_C(1000003) + col;
+        for (uint32_t col = 0; col < test_case->ncols; col++) {
+            int64_t *cell = &rows[(size_t)row * test_case->ncols + col];
+            if (test_case->float_columns) {
+                /* Finite, non-zero bit patterns; the probe's +17 on the bits
+                 * stays finite and non-zero, so stored bits must match. */
+                double value = (double)row * 0.5 + (double)col + 1.0;
+                memcpy(cell, &value, sizeof(*cell));
+            } else {
+                *cell = (int64_t)row * INT64_C(1000003) + col;
+            }
+        }
+    }
+    if (test_case->float_columns) {
+        wirelog_column_type_t *types = malloc(
+            (size_t)test_case->ncols * sizeof(*types));
+        int type_rc = types ? 0 : ENOMEM;
+        for (uint32_t col = 0; types && col < test_case->ncols; col++)
+            types[col] = WIRELOG_TYPE_FLOAT;
+        if (type_rc == 0)
+            type_rc = col_rel_set_column_types(rel, types, test_case->ncols);
+        free(types);
+        if (type_rc != 0 || !rel->column_types) {
+            fprintf(stderr, "setup column types failed: rc=%d\n", type_rc);
+            free(rows);
+            col_rel_destroy(rel);
+            return type_rc ? type_rc : EINVAL;
+        }
     }
     bool denied = false;
     int rc = col_rel_reserve_capacity_admitted(rel, BENCH_CAPACITY, &denied);
@@ -330,7 +361,7 @@ main(int argc, char **argv)
     int rc = parse_options(argc, argv, &which, &iterations, &samples,
             &warmups);
     if (rc != 0) {
-        fprintf(stderr, "Usage: %s [--case all|1x1|1x256|32x256]"
+        fprintf(stderr, "Usage: %s [--case all|1x1|1x256|32x256|32x256-float]"
             " [--iterations N] [--samples N] [--warmups N]\n", argv[0]);
         return 2;
     }
@@ -339,7 +370,8 @@ main(int argc, char **argv)
         "\tinput=disjoint\tgovernor=off\treserved_capacity=%u\n",
         BENCH_CAPACITY);
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-        if (strcmp(which, "all") != 0 && strcmp(which, cases[i].name) != 0)
+        if (strcmp(which, "all") == 0 ? cases[i].named_only
+            : strcmp(which, cases[i].name) != 0)
             continue;
         uint64_t case_iterations = iterations == 0
             ? cases[i].initial_iterations : iterations;
