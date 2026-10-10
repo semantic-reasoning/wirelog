@@ -133,27 +133,34 @@ All notable changes to wirelog are documented in this file.
   callback while an insert is staged now keeps the full re-evaluation the
   callback would have made.
 
-- **Snapshots after an incremental insert: non-recursive strata are
-  correct** (#2114, partly): a snapshot after an insert on the
-  incremental route -- a compound made with `wl_session_make_compound`,
-  or the internal `col_session_insert_incremental` -- evaluated only the
-  strata the inserted relation reaches, over its new rows, on top of the
-  rows the last evaluation had left.  A rule reading that relation
-  through another head emitted its rows again (`n(x, count(x)) :- r(x).`
-  showed `n(7,1)` twice), an aggregate was computed over the new rows
-  alone (`n(sum(x)) :- e(x).` kept `n(15)` and added `n(9)`), a negated
-  atom over the inserted relation removed nothing, and a non-recursive
-  join of two changed atoms missed rows (`m(A, B) :- f(A), f(B), A < B.`
-  over compounds lacked `m(7,9)` and `m(8,9)`), and a removal made with
-  `wl_session_remove` before or after the insert was ignored.  Such a
-  snapshot now deduplicates the heads of each non-recursive stratum it
-  evaluates, and evaluates in full when a stratum it reaches aggregates,
-  negates, or is non-recursive and joins, when the inserted relation is
-  a rule head, or when a removal is pending beside the insert.  A
-  recursive stratum still takes the incremental route and can still miss
-  rows: with `a(x, y) :- e(x, y).` and `a(x, z) :- e(x, y), a(y, z).`,
-  inserting `e(2,3)` after `e(1,2)` does not derive `a(1,3)`.  That
-  remains open under #2114.
+- **Snapshots after an incremental insert keep a correct model** (#2114):
+  a snapshot after an insert on the incremental route -- a compound made
+  with `wl_session_make_compound`, or the internal
+  `col_session_insert_incremental` -- re-evaluated the strata the
+  inserted relation reaches on top of the rows the last evaluation had
+  left, with the new rows seeded as a delta that every later iteration
+  kept reading.  It lost rows and duplicated others: with
+  `a(x, y) :- e(x, y).` and `a(x, z) :- e(x, y), a(y, z).`, inserting
+  `e(2,3)` after `e(1,2)` never derived `a(1,3)`; a rule reading the
+  inserted relation through another head emitted its rows again
+  (`n(x, count(x)) :- r(x).` showed `n(7,1)` twice); an aggregate was
+  computed over the new rows alone (`n(sum(x)) :- e(x).` kept `n(15)` and
+  added `n(9)`); a negated atom over the inserted relation removed
+  nothing; and a removal made with `wl_session_remove` beside the insert
+  was ignored.  Such a snapshot now brings each reached stratum up to date
+  with occurrence-bound TDD instances: one run per rule and per occurrence
+  that can hold a new row, with that occurrence bound to the new rows and
+  every other one to the whole relation, then rounds driven by the rows
+  each round adds, until none are added.  A stratum that negates or
+  aggregates, an insert into a rule head, and a pending removal still
+  take a full evaluation.  The seeded-delta route, its frontier
+  persistence and its differential operators are gone from snapshots;
+  after an incremental snapshot every frontier is reset.  The instances
+  run serially: when inserted rows overlap the existing ones, a snapshot
+  with eight or more workers can now be slower than the full evaluation
+  it replaces, which uses the workers.  If the instances fail with an
+  error other than a refusal, the snapshot returns it and the session
+  evaluates in full on the next call.
 
 - **Steps with a delta callback keep a rule head's own input rows**
   (#2091): with a delta callback installed, a step emptied each rule

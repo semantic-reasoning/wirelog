@@ -818,30 +818,24 @@ converse: compaction can return `EBUSY`, and `wl_evaluation_control_finish`
 prefers a non-zero execution status over `control->stop`, so compacting first
 would report that failure for an attempt the caller asked to cancel.
 
-Cost varies across that range, but not in a way that picks a placement, and the
-reason is worth stating because two earlier drafts of this paragraph got it
-wrong. The delta pre-seed runs before compaction, under three conditions at
-once: a relation was inserted, nothing forces a full re-evaluation, and an
-evaluation has run before. It sets `delta_seeded` after its loop whether or not
-the loop registered anything, and the loop skips a relation whose `base_nrows`
-is zero or whose `nrows` has not passed it -- so the flag can stand for no
-`$d$` relations at all.
+Until #2114 the snapshot path also pre-seeded `$d$<name>` deltas between its
+entry and the bookkeeping, for an evaluation that re-ran the strata an
+incremental insert reached on top of the rows the last one had left, reading
+the seeded delta in every iteration. That route lost rows and is gone. After
+an incremental insert, `session_snapshot_insert` now brings the reached strata
+up to date with occurrence-bound instances
+(`wl_columnar_eval_tdd_insert_stratum`) and registers no `$d$` relation; any
+other evaluation clears the derived rows and evaluates every stratum in full.
+A stop between those heads' update and the bookkeeping leaves
+`last_inserted_relation`, `pending_input_change` and every `base_nrows` as
+they were, so a retry runs the insert route again from the same appended rows
+and finds nothing the heads do not already hold. A caller that installs a
+delta callback and steps instead of retrying is not told about the rows those
+heads already gained; the removed pre-seed route behaved the same way.
 
-What keeps that from deciding the cutoff is the carry-over. No write outside
-the bookkeeping clears a flag the pre-seed set, because those two are the only
-writes that reach the coordinator session `col_session_snapshot_impl` was
-called on. Every other write to the field under `wirelog/` lands on a worker
-clone, or on a session being created or torn down. Every stopping return
-between the pre-seed and the bookkeeping -- the retained-cleanup unwind, the
-evaluation-failure unwind, and the compaction check, whose own comment calls
-its `EBUSY` a state-preserving outcome -- leaves the guard's three conditions
-intact, so the next attempt runs the pre-seed again with the flag already set.
-A cutoff above the pre-seed therefore does not leave the flag clear on its own
-account; it only forgoes this attempt's pre-seed. What the snapshot unit has to
-settle is what it owes the entry state, not which placement escapes it.
-
-A field's row does not mean both paths write it. Four do not: the step path
-never touches `delta_seeded`, and the snapshot path never writes
+A field's row does not mean both paths write it. Four do not: neither path
+touches the coordinator's `delta_seeded`, which a TDD worker sub-pass and the
+insert route write only on worker clones, and the snapshot path never writes
 `plain_step_completion_pending`, `plain_step_completion_phase` or
 `plain_step_completion_active`. Which of those three the snapshot path still
 reads is in the read column, one field at a time; an earlier revision
@@ -853,19 +847,19 @@ call.
 
 | field | written by | read by | verdict |
 |---|---|---|---|
-| `last_inserted_relation` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create`, `session_note_inserted_input` | `col_eval_stratum_tdd_recursive`, `col_session_set_delta_cb`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | PRESERVE |
+| `last_inserted_relation` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create`, `session_note_inserted_input` | `col_eval_stratum_tdd_recursive`, `col_session_set_delta_cb`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `session_snapshot_insert` | PRESERVE |
 | `pending_input_change` | `col_session_create_internal`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
 | `pending_full_input_eval` | `col_session_insert`, `col_session_remove`, `col_session_set_delta_cb`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
 | `has_evaluated` | `col_session_snapshot_impl`, `col_session_step_impl` | `col_eval_stratum_tdd_recursive`, `col_session_set_delta_cb`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
 | `snapshot_stable_valid` | `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl` | PRESERVE |
-| `delta_seeded` | `col_session_snapshot_impl`, `tdd_worker_subpass_fn`, `wl_columnar_eval_tdd_insert_stratum` | `col_op_variable`, `col_session_snapshot_impl`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert` | PRESERVE |
+| `delta_seeded` | `tdd_worker_subpass_fn`, `wl_columnar_eval_tdd_insert_stratum` | `col_op_variable`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert` | PRESERVE |
 | `last_removed_relation` | `col_session_remove_incremental`, `col_worker_session_create`, `session_retraction_cleanup` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
 | `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `session_retraction_cleanup`, `wl_columnar_eval_tdd_insert_stratum` | `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert` | PRESERVE |
 | `plain_step_completion_pending` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create` | `col_session_insert`, `col_session_insert_incremental`, `col_session_make_compound`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE -- with `plain_step_completion_phase` this is the resume token |
 | `plain_step_completion_phase` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE |
 | `plain_step_completion_step_context` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl` | PRESERVE |
 | `plain_step_completion_active` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_snapshot_impl`, `col_session_step_impl` | **COMMIT** on the step path -- a re-entrancy latch, not progress. While it stays set beside `plain_step_completion_pending`, the entry guard of both `col_session_step_impl` and `col_session_snapshot_impl` returns `EBUSY` above every line that would clear it. The snapshot path never writes it, so the snapshot cutoff has nothing to perform here. |
-| `col_rel_t::base_nrows` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_reset_rows_locked`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `tdd_empty_relation_candidate`, `tdd_seed_bdx_coordinator_idb`, `wl_columnar_eval_serial_canonicalize_aggregate_locked`, `wl_retraction_restore` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_mutable_image_validate`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `session_seed_shadow_plan_remove`, `wl_columnar_eval_delta_observer_begin`, `wl_retraction_stage_prepare` | PRESERVE -- the snapshot delta pre-seed skips a relation whose `base_nrows` is zero or whose `nrows <= base_nrows`, so committing the bookkeeping's `base_nrows = nrows` changes what the next attempt pre-seeds, including whether it pre-seeds at all. That is the whole verified consequence; see the note below before adding another |
+| `col_rel_t::base_nrows` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_reset_rows_locked`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `tdd_empty_relation_candidate`, `tdd_seed_bdx_coordinator_idb`, `wl_columnar_eval_serial_canonicalize_aggregate_locked`, `wl_retraction_restore` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_mutable_image_validate`, `col_session_remove`, `col_session_remove_incremental`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_snapshot_insert`, `session_seed_shadow_apply_remove`, `session_seed_shadow_plan_remove`, `wl_columnar_eval_delta_observer_begin`, `wl_retraction_stage_prepare` | PRESERVE -- the insert route (`session_snapshot_insert`) takes rows `[base_nrows, nrows)` of the inserted relation as the rows an incremental insert appended, so committing the bookkeeping's `base_nrows = nrows` on a stopped attempt would make the retry find no inserted rows and leave the heads without them. That is the whole verified consequence; see the note below before adding another |
 
 Two non-field actions sit in the same region and need their own verdicts.
 `col_session_reclaim_quiescent` is **COMMIT**: the step cutoff's unwind calls
@@ -897,20 +891,9 @@ streams is the plain-step drain, and that returns through the step path's own
 cutoff. What is genuinely unpolled is the fixpoint itself -- nothing in
 `eval*.c` charges -- and that is the operator-checkpoint item, not this one.
 
-`delta_seeded` and `retraction_seeded` are both left set by a stop above their
-commit, but their consequences differ. A stale `delta_seeded` may or may not
-come with `$d$<name>` relations still registered -- the pre-seed sets the flag
-even when its loop registered none, and the evaluation-failure unwind, which
-removes every `$d$`-prefixed relation by name rather than only the pre-seed's,
-leaves the flag set and keeps any whose checked removal refuses. That refusal
-is deliberate, and the loop's own comment says why: a reader may still depend
-on a delta after evaluation fails. When they are registered, the snapshot
-pre-seed re-registers those names through `session_add_rel`, whose same-name
-branch destroys the previously registered owner -- or, when that destroy is
-refused, restores its source lease and returns `EBUSY`. A stale
-`retraction_seeded` registers nothing -- the step path's retraction pre-seed
-only looks relations up -- but it keeps the snapshot fast path closed and
-changes forced-delta selection.
+A `retraction_seeded` left set by a stop above its commit registers nothing --
+the step path's retraction pre-seed only looks relations up -- but it keeps the
+snapshot fast path closed and changes forced-delta selection.
 
 Successive drafts of the step-path comment each asserted a further purpose for
 `base_nrows` and each was falsified: that the retry route reads it, that
@@ -918,5 +901,5 @@ advancing it would describe unpublished rows, that it routes the retry, that
 advancing it would silently drop rows. Some were wrong about direction or role;
 the last was wrong about consequence, because `col_session_emit_snapshot`
 iterates `row < r->nrows` and never mentions the field. The row above therefore
-names the one consequence that was read out of the pre-seed's own condition,
+names the one consequence that was read out of the observer's own condition,
 and a new claim about this field belongs in a test before it belongs here.

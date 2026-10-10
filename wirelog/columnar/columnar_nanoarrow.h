@@ -548,15 +548,12 @@ col_compute_affected_rules(wl_session_t *session,
 /**
  * col_session_insert:
  *
- * Append facts to an EDB relation and enable incremental re-evaluation mode.
+ * Append facts to an EDB relation.
  *
- * This is the primary insert function for the columnar backend. It appends
- * facts and sets last_inserted_relation to activate affected-stratum skip
- * optimization in col_session_snapshot, enabling frontier persistence benefits.
- *
- * Phase 4 incremental frontier integration: Setting last_inserted_relation
- * allows affected-stratum detection to skip strata that don't depend on the
- * inserted relation, achieving iteration reduction (6->5 on CSPA, ~15% speedup).
+ * This is the primary insert function for the columnar backend.  With a
+ * delta callback installed it hands the rows to
+ * col_session_insert_incremental(); otherwise the next step or snapshot
+ * re-evaluates every stratum.
  *
  * Facts are appended to the existing relation; existing rows are kept.
  * Schema is lazily initialised on the first call.
@@ -578,10 +575,12 @@ col_session_insert(wl_session_t *session, const char *relation,
  *
  * Append facts to an EDB relation WITHOUT resetting per-stratum frontiers.
  *
- * Unlike col_session_insert(), this function preserves the frontiers[] array
- * across calls so that a subsequent col_session_snapshot() call performs
- * incremental re-evaluation: strata whose frontier has already converged past
- * the current iteration are skipped.
+ * Unlike col_session_insert() without a delta callback, this does not by
+ * itself ask for a full evaluation (an insert into a second relation still
+ * does): a later step with a delta callback evaluates the
+ * strata the insert affects, and a later snapshot brings the strata it
+ * reaches up to date from the appended rows with occurrence-bound instances
+ * (#2114).
  *
  * Facts are appended to the existing relation; existing rows are kept.
  * Schema is lazily initialised on the first call (same rule as col_session_insert).

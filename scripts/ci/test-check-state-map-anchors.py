@@ -401,10 +401,11 @@ def main() -> int:
         row_edit("a real function that never reads the field fails",
                  "| `col_eval_stratum_tdd_recursive`, `col_session_set_delta_cb`,"
                  " `col_session_snapshot_impl`, `col_session_step_impl`,"
-                 " `session_note_inserted_input` |",
+                 " `session_note_inserted_input`, `session_snapshot_insert` |",
                  "| `arr_build_full`, `col_eval_stratum_tdd_recursive`,"
                  " `col_session_set_delta_cb`, `col_session_snapshot_impl`,"
-                 " `col_session_step_impl`, `session_note_inserted_input` |")
+                 " `col_session_step_impl`, `session_note_inserted_input`,"
+                 " `session_snapshot_insert` |")
 
         # The same for the write column, so `writes()` is not free to be
         # `return True` at this level either.
@@ -508,9 +509,10 @@ def main() -> int:
         row_edit("a dropped reader fails",
                  "| `col_eval_stratum_tdd_recursive`, `col_session_set_delta_cb`,"
                  " `col_session_snapshot_impl`, `col_session_step_impl`,"
-                 " `session_note_inserted_input` |",
+                 " `session_note_inserted_input`, `session_snapshot_insert` |",
                  "| `col_eval_stratum_tdd_recursive`, `col_session_set_delta_cb`,"
-                 " `col_session_snapshot_impl`, `col_session_step_impl` |")
+                 " `col_session_snapshot_impl`, `col_session_step_impl`,"
+                 " `session_note_inserted_input` |")
 
         # An anchor ADDED rather than substituted is caught only by the
         # unresolvable-symbol branch, because completeness still sees every real

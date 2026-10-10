@@ -3161,6 +3161,17 @@ test_incremental_snapshot_full_exe = executable(
 
 test('incremental_snapshot_full', test_incremental_snapshot_full_exe)
 
+test_incremental_snapshot_recursive_exe = executable(
+  'test_incremental_snapshot_recursive',
+  files('test_incremental_snapshot_recursive.c'),
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+
+test('incremental_snapshot_recursive', test_incremental_snapshot_recursive_exe)
+
 test_plan_body_ops_exe = executable(
   'test_plan_body_ops',
   files('test_plan_body_ops.c'),

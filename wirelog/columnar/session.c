@@ -2531,39 +2531,13 @@ col_should_activate_diff(const wl_col_session_t *sess, uint64_t affected_mask)
 }
 
 /*
- * session_rule_reads_one_atom: Whether every operator of @rp is one a rule
- * reading a single atom is built from -- no join of any kind.
- */
-static bool
-session_rule_reads_one_atom(const wl_plan_relation_t *rp)
-{
-    for (uint32_t oi = 0; oi < rp->op_count; oi++) {
-        switch (rp->ops[oi].op) {
-        case WL_PLAN_OP_VARIABLE:
-        case WL_PLAN_OP_MAP:
-        case WL_PLAN_OP_FILTER:
-        case WL_PLAN_OP_CONCAT:
-        case WL_PLAN_OP_CONSOLIDATE:
-        case WL_PLAN_OP_EXCHANGE:
-            break;
-        default:
-            return false;
-        }
-    }
-    return true;
-}
-
-/*
- * session_snapshot_delta_safe: Whether a snapshot may evaluate the strata in
- * @mask over an inserted delta, on top of the rows the last evaluation left
- * (Issue #2114).  Any of these sends the snapshot to a full evaluation:
- *   - a stratum that retracts through negation, which must lose rows the
- *     delta does not name;
- *   - an aggregate, which over the delta alone replaces nothing;
- *   - a join in a non-recursive stratum.  Without the semi-naive rewrite a
- *     recursive stratum gets, each operand picks the delta or the full
- *     relation on its own, so a join of two changed operands derives only
- *     the new-by-old half and misses the rest.
+ * session_snapshot_delta_safe: Whether the strata in @mask may be brought
+ * up to date over an inserted delta (Issue #2114).  A stratum that retracts
+ * through negation must lose rows no delta names, and an aggregate over new
+ * rows alone replaces nothing, so either sends the snapshot to a full
+ * evaluation.  The insertion binder refuses both operators as well; this
+ * reads the flags the plan recorded before its rewrites, which no fusion
+ * can hide.
  */
 static bool
 session_snapshot_delta_safe(const wl_plan_t *plan, uint64_t mask)
@@ -2571,40 +2545,143 @@ session_snapshot_delta_safe(const wl_plan_t *plan, uint64_t mask)
     for (uint32_t si = 0; si < plan->stratum_count; si++) {
         if (!col_affected_mask_contains(mask, si))
             continue;
-        const wl_plan_stratum_t *sp = &plan->strata[si];
-        if (!sp->is_monotone || sp->has_aggregate)
+        if (!plan->strata[si].is_monotone || plan->strata[si].has_aggregate)
             return false;
-        if (sp->is_recursive)
+    }
+    return true;
+}
+
+/* Reset every stratum and rule frontier to (current_epoch, UINT32_MAX), so
+ * no frontier recorded before this evaluation can skip an iteration. */
+static void
+session_reset_frontiers(const wl_plan_t *plan, wl_col_session_t *sess)
+{
+    for (uint32_t si = 0; si < plan->stratum_count && si < MAX_STRATA; si++)
+        sess->frontier_ops->reset_stratum_frontier(sess, si,
+            sess->outer_epoch);
+    for (uint32_t ri = 0; ri < MAX_RULES; ri++)
+        sess->frontier_ops->reset_rule_frontier(sess, ri, sess->outer_epoch);
+}
+
+/* Issue #2114: may every stratum in @mask be bound by the insertion binder?
+ * Asked before anything is mutated; the binder's refusals do not depend on
+ * which relations changed, so none are passed. */
+static bool
+session_snapshot_insert_admitted(const wl_plan_t *plan, uint64_t mask)
+{
+    for (uint32_t si = 0; si < plan->stratum_count; si++) {
+        if (!col_affected_mask_contains(mask, si))
             continue;
-        for (uint32_t ri = 0; ri < sp->relation_count; ri++)
-            if (!session_rule_reads_one_atom(&sp->relations[ri]))
-                return false;
+        const wl_plan_stratum_t *sp = &plan->strata[si];
+        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+            for (int round = 0; round < (sp->is_recursive ? 2 : 1); round++) {
+                wl_columnar_eval_tdd_plan_manifest_t m;
+                int rc = wl_columnar_eval_tdd_plan_insert_bindings(sp, ri,
+                        NULL, 0, round == 0, &m);
+                wl_columnar_eval_tdd_plan_bindings_free(&m);
+                if (rc != 0)
+                    return false;
+            }
+        }
     }
     return true;
 }
 
 /*
- * session_consolidate_stratum_heads: Sort and deduplicate every head of @sp
- * (Issue #2114).  A non-recursive stratum that a snapshot evaluates over an
- * inserted delta appends what its rules derive to the rows its heads already
- * hold; a rule that reads the inserted relation through another head
- * derives its earlier rows again.
+ * session_snapshot_insert: Bring the strata an incremental insert reaches up
+ * to date without re-deriving what their heads hold (Issue #2114).
+ *
+ * The rows appended to the inserted relation since the last evaluation are
+ * rows [base_nrows, nrows).  Each reached stratum, in plan order, runs the
+ * insertion rounds of wl_columnar_eval_tdd_insert_stratum() with every
+ * relation that has gained rows so far as a changed relation: the inserted
+ * one, and the heads of the strata before it.  Returns ENOTSUP, with nothing
+ * mutated, when a reached stratum negates, aggregates or holds an operator
+ * the binder cannot bind; any other failure may leave heads partly updated.
  */
 static int
-session_consolidate_stratum_heads(const wl_plan_stratum_t *sp,
-    wl_col_session_t *sess)
+session_snapshot_insert(wl_session_t *session, const wl_plan_t *plan)
 {
-    for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
-        const char *name = sp->relations[ri].name;
-        col_rel_t *head = session_find_rel(sess, name);
-        if (!head || head->nrows <= 1)
-            continue;
-        int rc = wl_columnar_eval_delta_consolidate(head, sess);
-        if (rc != 0)
-            return rc;
-        col_session_invalidate_arrangements(&sess->base, name);
+    wl_col_session_t *sess = COL_SESSION(session);
+    const char *inserted = sess->last_inserted_relation;
+    col_rel_t *rel = session_find_rel(sess, inserted);
+    uint64_t mask = col_compute_affected_strata(session, inserted);
+
+    if (!rel || rel->base_nrows > rel->nrows
+        || !session_snapshot_delta_safe(plan, mask)
+        || !session_snapshot_insert_admitted(plan, mask))
+        return ENOTSUP;
+
+    uint32_t capacity = 1;
+    for (uint32_t si = 0; si < plan->stratum_count; si++) {
+        if (col_affected_mask_contains(mask, si))
+            capacity += plan->strata[si].relation_count;
     }
-    return 0;
+    const char **names = (const char **)calloc(capacity, sizeof(*names));
+    col_rel_t **deltas = (col_rel_t **)calloc(capacity, sizeof(*deltas));
+    col_rel_t **heads = NULL;
+    uint32_t heads_count = 0;
+    uint32_t nchanged = 0;
+    int rc = 0;
+
+    if (!names || !deltas) {
+        rc = ENOMEM;
+        goto done;
+    }
+    rc = wl_columnar_relation_new_like_governed_checked_mode("$inserted",
+            rel, sess->memory_governor, false, &deltas[0]);
+    if (rc != 0)
+        goto done;
+    for (uint32_t row = rel->base_nrows; row < rel->nrows; row++) {
+        rc = col_rel_append_row(deltas[0], col_rel_row(rel, row));
+        if (rc != 0)
+            goto done;
+    }
+    names[0] = inserted;
+    nchanged = 1;
+
+    for (uint32_t si = 0; si < plan->stratum_count; si++) {
+        if (!col_affected_mask_contains(mask, si))
+            continue;
+        const wl_plan_stratum_t *sp = &plan->strata[si];
+        uint32_t nheads = sp->relation_count;
+        heads = (col_rel_t **)calloc(nheads ? nheads : 1, sizeof(*heads));
+        if (!heads) {
+            rc = ENOMEM;
+            goto done;
+        }
+        heads_count = nheads;
+        rc = wl_columnar_eval_tdd_insert_stratum(sess, sp, names,
+                (col_rel_t *const *)deltas, nchanged, heads);
+        if (rc != 0)
+            goto done;
+        for (uint32_t ri = 0; ri < nheads; ri++) {
+            if (!heads[ri])
+                continue;
+            if (nchanged >= capacity) {
+                rc = EOVERFLOW;
+                goto done;
+            }
+            names[nchanged] = sp->relations[ri].name;
+            deltas[nchanged++] = heads[ri];
+            heads[ri] = NULL;
+        }
+        free((void *)heads);
+        heads = NULL;
+        heads_count = 0;
+    }
+
+done:
+    if (heads) {
+        for (uint32_t ri = 0; ri < heads_count; ri++)
+            col_rel_destroy(heads[ri]);
+        free((void *)heads);
+    }
+    for (uint32_t c = 0; deltas && c < capacity; c++)
+        col_rel_destroy(deltas[c]);
+    free((void *)names);
+    free((void *)deltas);
+    return rc;
 }
 
 /*
@@ -5297,10 +5374,7 @@ col_session_step_impl(wl_session_t *session)
 
     /* Issue #106 (US-106-004): Reset rule frontiers with stratum context awareness.
      * col_session_step is for delta callback mode (no pre-seeded deltas).
-     * Always reset affected rules to force re-evaluation.
-     * Selective reset based on pre-seeded delta is only in col_session_snapshot.
-     *
-     * @see col_session_snapshot for selective rule frontier reset (Issue #107) */
+     * Always reset affected rules to force re-evaluation. */
     if (affected_mask == UINT64_MAX && !completing_plain_step) {
         /* Full evaluation (non-incremental): reset all rules to (current_epoch, UINT32_MAX)
          * sentinel. Prevents premature skip across different evaluation contexts. */
@@ -5880,7 +5954,6 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
         && !sess->pending_full_input_eval
         && sess->last_inserted_relation == NULL
         && sess->last_removed_relation == NULL
-        && !sess->delta_seeded
         && !sess->retraction_seeded) {
         if (tdd_profile_active)
             wl_columnar_session_profile_begin(plan, 0, sess->num_workers, true);
@@ -5899,17 +5972,10 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
          * "It does no work, so the entry poll is adjacent enough" does not hold.
          * A refused plain step is drained above by calling col_session_step_impl
          * inside this attempt, and that drain compacts every relation before
-         * writing six of the seven fields this branch tests -- four in its
-         * commit block, and last_removed_relation and retraction_seeded in the
-         * retraction cleanup just above it.  The seventh, delta_seeded, the step
-         * path never writes at all; only this function's own pre-seed sets it
-         * and its own bookkeeping clears it.  So a drain can leave control here
-         * with the whole model just compacted.  What routes a retry away from
-         * this branch is a delta_seeded left set by a snapshot that stopped
-         * between its own pre-seed and its own bookkeeping -- the only two
-         * writes that reach the coordinator's copy of the field; the write in
-         * tdd_worker_subpass_fn lands on a worker clone and is save-restored
-         * around it.  That is what makes such a retry a full re-evaluation.
+         * writing all six fields this branch tests -- four in its commit block,
+         * and last_removed_relation and retraction_seeded in the retraction
+         * cleanup just above it.  So a drain can leave control here with the
+         * whole model just compacted.
          *
          * The unwind performs the quiescent boundary and nothing else.  It does
          * not sample the memory ledger because this branch's success route does
@@ -5930,19 +5996,34 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
         return rc;
     }
 
-    /* Issue #2114: the incremental route below evaluates the strata the
-     * inserted relation reaches over its new rows, on top of the rows the
-     * last evaluation left.  It ignores a staged removal, it never
-     * re-evaluates the stratum that defines an inserted rule head, and it is
-     * not correct for every stratum (session_snapshot_delta_safe), so any of
-     * those makes this a full re-evaluation. */
+    /* Issue #2114: after an incremental insert, the strata it reaches are
+     * brought up to date with occurrence-bound instances
+     * (session_snapshot_insert).  A staged removal and an insert into a rule
+     * head are not insertions those can evaluate, so either makes this a
+     * full re-evaluation. */
     if (sess->has_evaluated && !sess->pending_full_input_eval
         && sess->last_inserted_relation != NULL
         && (sess->last_removed_relation != NULL
-        || session_plan_has_rule_head(plan, sess->last_inserted_relation)
-        || !session_snapshot_delta_safe(plan, col_compute_affected_strata(
-            session, sess->last_inserted_relation))))
+        || session_plan_has_rule_head(plan, sess->last_inserted_relation)))
         sess->pending_full_input_eval = true;
+    if (sess->has_evaluated && !sess->pending_full_input_eval
+        && sess->last_inserted_relation != NULL) {
+        int insert_rc = session_snapshot_insert(session, plan);
+        if (insert_rc == 0) {
+            /* The insert route bypasses the stratum evaluators, which keep
+             * the frontiers; reset them as a full evaluation does. */
+            sess->diff_operators_active = false;
+            session_reset_frontiers(plan, sess);
+            goto evaluated;
+        }
+        /* A refusal at admission left the session as it was; any later
+         * failure may have left heads partly updated.  Either way the
+         * evaluation is redone in full, and the flag stays set until a
+         * snapshot or step commits, so a retry after an error does too. */
+        sess->pending_full_input_eval = true;
+        if (insert_rc != ENOTSUP && insert_rc != EINVAL)
+            return insert_rc;
+    }
 
     if (sess->has_evaluated
         && (sess->pending_full_input_eval
@@ -5953,165 +6034,23 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
             return clear_rc;
     }
 
-    /* Phase 4 incremental skip: when last_inserted_relation is set, only
-     * re-evaluate strata that transitively depend on the inserted relation.
-     * On the first snapshot (has_evaluated == false), always evaluate all strata
-     * to establish the baseline. */
-    uint64_t affected_mask = UINT64_MAX;
-    bool incremental_route = false;
-    if (!sess->pending_full_input_eval && sess->last_inserted_relation != NULL
-        && sess->has_evaluated) {
-        affected_mask = col_compute_affected_strata(
-            session, sess->last_inserted_relation);
-
-        /* Issue #83: Pre-seed EDB delta relations for delta-only propagation.
-         * For each relation with nrows > base_nrows, create a $d$<name> delta
-         * containing only the new rows. This allows FORCE_DELTA at iteration 0
-         * to use the delta instead of the full relation, avoiding full
-         * re-derivation of existing IDB tuples. */
-        for (uint32_t i = 0; i < sess->nrels; i++) {
-            col_rel_t *r = sess->rels[i];
-            if (!r || r->base_nrows == 0 || r->nrows <= r->base_nrows)
-                continue;
-            /* Create delta relation with rows[base_nrows..nrows) */
-            char dname[256];
-            snprintf(dname, sizeof(dname), "$d$%s", r->name);
-            uint32_t delta_nrows = r->nrows - r->base_nrows;
-            col_rel_t *delta = col_rel_new_auto(dname, r->ncols);
-            if (!delta)
-                return ENOMEM;
-            for (uint32_t row = 0; row < delta_nrows; row++) {
-                int seed_rc = col_rel_append_row(
-                    delta, col_rel_row(r, r->base_nrows + row));
-                if (seed_rc != 0) {
-                    col_rel_destroy(delta);
-                    return seed_rc;
-                }
-            }
-            /* Replacement is atomic per relation. On failure session_add_rel
-            * leaves delta with its caller and preserves the registered owner;
-            * hash allocation failure uses the successful linear fallback. */
-            int seed_rc = session_add_rel(sess, delta);
-            if (seed_rc != 0) {
-                col_rel_destroy(delta);
-                return seed_rc;
-            }
-        }
-        sess->delta_seeded = true;
-        incremental_route = true;
-    }
-
-    /* Issue #264: Activate differential operators when session toggle is on
-     * and only partial strata are affected (see col_should_activate_diff). */
-    sess->diff_operators_active = col_should_activate_diff(sess, affected_mask);
-
-    /* For affected strata, selectively reset the per-stratum frontier to UINT32_MAX
-     * (not-set sentinel) based on pre-seeded EDB delta presence.
-     * UINT32_MAX ensures `iter > UINT32_MAX` is always false, forcing full
-     * re-evaluation of strata with pre-seeded deltas.
-     *
-     * Issue #107: Selective frontier reset based on pre-seeded delta check.
-     * Reset frontiers ONLY for strata that have pre-seeded EDB deltas.
-     * Preserve frontiers for transitively-affected strata (no direct EDB delta).
-     *
-     * Safety: Transitively-affected strata receive new facts from upstream via
-     * delta propagation, but convergence still occurs within previous frontier
-     * bounds. Semi-naive evaluation processes deltas incrementally: iteration i
-     * only derives from deltas at iteration i-1. If a stratum converged at
-     * iteration F (no new facts at F+1+), subsequent upstream facts flow through
-     * iterations 0..F, unlikely to require F+1+ unless graph topology changes.
-     * Test coverage (test_delta_propagation test 3) validates correctness for
-     * cyclic multi-iteration patterns. CSPA benchmark confirms safety. */
-    if (affected_mask != UINT64_MAX) {
-        for (uint32_t si = 0; si < plan->stratum_count && si < MAX_STRATA;
-            si++) {
-            if (col_affected_mask_contains(affected_mask, si)) {
-                /* Issue #107: Selective rule frontier reset based on pre-seeded delta presence.
-                 * Reset frontier for strata that have pre-seeded EDB deltas.
-                 * Preserve frontier for transitively-affected strata (no direct EDB delta).
-                 *
-                 * Safety: Transitively-affected strata receive new facts from upstream
-                 * strata, but in the presence of pre-seeded deltas, fact propagation
-                 * still converges within previous frontier bounds. The pre-seeded delta
-                 * check already limits EDB propagation (delta from [base_nrows, nrows)).
-                 *
-                 * Test coverage: test_delta_propagation validates cyclic correctness. */
-                if (stratum_has_preseeded_delta(&plan->strata[si], sess)) {
-                    sess->frontier_ops->reset_stratum_frontier(sess, si,
-                        sess->outer_epoch);
-                    /* Issue #317: Reset per-worker progress for this stratum
-                     * so stale reports from the previous epoch do not block
-                     * convergence detection in col_eval_stratum_multiworker. */
-                    wl_frontier_progress_reset_stratum(&sess->progress, si,
-                        sess->outer_epoch);
-                }
-                /* Else: stratum affected but no pre-seeded delta → KEEP frontier */
-            }
-        }
-        /* Phase 4 (US-4-004) + Issue #107: Selective rule frontier reset.
-         * Use col_compute_affected_rules bitmask to identify rules needing
-         * re-evaluation. For each affected rule, check if its stratum has
-         * pre-seeded EDB delta before resetting the frontier.
-         *
-         * Reset when:
-         *   1. Rule is affected (bit set in affected_rules)
-         *   2. Rule's stratum is affected (bit set in affected_mask)
-         *   3. Stratum HAS pre-seeded EDB delta
-         *
-         * Preserve when:
-         *   1. Rule's stratum affected but NO pre-seeded delta (transitively affected only)
-         *   2. Frontier skip can still fire for iterations beyond previous convergence point
-         *
-         * Performance: Frontier skip on transitively-affected strata reduces iterations
-         * for IDB-only derivations, improving speedup from frontier skip optimization. */
-        uint64_t affected_rules
-            = col_compute_affected_rules(session, sess->last_inserted_relation);
-        for (uint32_t ri = 0; ri < MAX_RULES; ri++) {
-            if (!col_affected_mask_contains(affected_rules, ri))
-                continue;
-            uint32_t si = rule_index_to_stratum_index(plan, ri);
-            if (si == UINT32_MAX)
-                continue;
-            if (!col_affected_mask_contains(affected_mask, si))
-                continue;
-            if (stratum_has_preseeded_delta(&plan->strata[si], sess)) {
-                sess->frontier_ops->reset_rule_frontier(sess, ri,
-                    sess->outer_epoch);
-            }
-            /* Else: rule's stratum affected but no pre-seeded delta → KEEP frontier */
-        }
-    } else {
-        /* Full re-evaluation (non-incremental call): reset all stratum and
-         * rule frontiers to (current_epoch, UINT32_MAX) so no stale frontier
-         * can skip required iterations after clearing IDB state. */
-        for (uint32_t si = 0; si < plan->stratum_count && si < MAX_STRATA;
-            si++) {
-            sess->frontier_ops->reset_stratum_frontier(sess, si,
-                sess->outer_epoch);
-        }
-        for (uint32_t ri = 0; ri < MAX_RULES; ri++) {
-            sess->frontier_ops->reset_rule_frontier(sess, ri,
-                sess->outer_epoch);
-        }
-    }
+    /* Every stratum evaluates in full from here: the incremental case left
+     * above.  Differential operators serve a step that evaluates part of the
+     * plan (see col_should_activate_diff), and a step may have left them on;
+     * every stratum and rule frontier is reset to (current_epoch, UINT32_MAX)
+     * so no stale frontier can skip iterations the evaluation needs. */
+    sess->diff_operators_active = false;
+    session_reset_frontiers(plan, sess);
 
     /* Issue #361: Use TDD parallel evaluation in snapshot when workers are
-     * available and facts have been loaded (initial non-incremental eval).
-     * col_eval_stratum_tdd falls back to single-threaded when W<=1.
-     * Issue #413: Enable TDD for initial snapshot (has_evaluated == false)
-     * OR incremental evaluation (last_inserted_relation != NULL). */
-    bool snapshot_tdd_eligible = (affected_mask == UINT64_MAX
-        && sess->num_workers > 1
-        && ((!sess->pending_full_input_eval
-        && sess->last_inserted_relation != NULL)
-        || !sess->has_evaluated));
+     * available and facts have been loaded (initial evaluation).
+     * col_eval_stratum_tdd falls back to single-threaded when W<=1. */
+    bool snapshot_tdd_eligible = sess->num_workers > 1 && !sess->has_evaluated;
     sess->tdd_decision_tracking_active = true;
     if (tdd_profile_active)
-        wl_columnar_session_profile_begin(plan, affected_mask,
+        wl_columnar_session_profile_begin(plan, UINT64_MAX,
             sess->num_workers, false);
     for (uint32_t si = 0; si < plan->stratum_count; si++) {
-        if (!col_affected_mask_contains(affected_mask, si))
-            continue;
         wl_columnar_session_tdd_decision_t tdd_decision =
             wl_columnar_session_tdd_plan_stratum(&plan->strata[si], sess,
                 snapshot_tdd_eligible);
@@ -6320,12 +6259,6 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
             free((void *)pre_saved);
         }
 
-        /* Issue #2114: on the incremental route a non-recursive stratum's
-         * rows landed on top of the ones its heads held. */
-        if (rc == 0 && incremental_route
-            && !plan->strata[si].is_recursive)
-            rc = session_consolidate_stratum_heads(&plan->strata[si], sess);
-
         if (rc != 0) {
             if (wl_columnar_session_has_retained_cleanup(sess)) {
                 sess->tdd_decision_tracking_active = false;
@@ -6360,6 +6293,7 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
     }
     sess->tdd_decision_tracking_active = false;
 
+evaluated:;
     /*
      * Cut here: after evaluation, before compaction, above the bookkeeping.
      *
@@ -6369,13 +6303,16 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
      * the session claiming this pass succeeded.
      *
      * What makes a stop here safe for the retry is narrower than "nothing is
-     * committed".  Plenty is: a drained step's whole commit block, the $d$
-     * pre-seed, and col_session_clear_idb_rows, which wipes the IDB rows.  The
-     * wipe is the sharp edge -- a retry that took the stable fast path would
-     * publish an empty model as a complete success.  It cannot, because
-     * clear_idb_rows is only reached when pending_full_input_eval or
-     * pending_input_change is set, nothing between that guard and this cutoff
-     * writes either one, and both disqualify the fast path.
+     * committed".  Plenty is: a drained step's whole commit block, the heads
+     * session_snapshot_insert brought up to date, and
+     * col_session_clear_idb_rows, which wipes the IDB rows.  The wipe is the
+     * sharp edge -- a retry that took the stable fast path would publish an
+     * empty model as a complete success.  It cannot, because clear_idb_rows
+     * is only reached when pending_full_input_eval or pending_input_change is
+     * set, nothing between that guard and this cutoff writes either one, and
+     * both disqualify the fast path.  The insert route leaves the same flags
+     * set, so a retry runs it again from the same appended rows, and finds
+     * nothing the heads do not already hold.
      *
      * Before compaction, which is where this differs from the step path.  That
      * one cuts after compaction because both its shapes carry a resume token
@@ -6403,9 +6340,10 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
      * Not because the sample would publish something a stopped pass should not:
      * on any route where a stratum evaluated, eval_serial.c and eval.c have
      * sampled the coordinator already and the STORED/TEMPORARY high-water marks
-     * are raised above this point.  (The exceptions are an affected_mask that
-     * excludes every stratum, and a plan with no strata at all: the loop body
-     * never runs and the sample below would have been this pass's first.)
+     * are raised above this point.  (The exceptions are the insert route,
+     * which evaluates through bound slice runs rather than those stratum
+     * evaluators, and a plan with no strata at all: there the sample below
+     * may be this pass's first.)
      * Omitting it is inert either way -- the gauges are absolute, so the next
      * sample recomputes them, and a gauge one pass old costs
      * col_session_reclaim_quiescent at most a missed eviction of recomputable
@@ -6431,7 +6369,6 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
     /* Reset after successful eval so next plain snapshot runs all strata. */
     session_retraction_cleanup(sess);
     sess->last_inserted_relation = NULL;
-    sess->delta_seeded = false;
     sess->pending_input_change = false;
     sess->pending_full_input_eval = false;
     sess->has_evaluated = true;

@@ -26,6 +26,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef WL_SESSION_TEST_HOOKS
+int (*wl_columnar_eval_tdd_insert_test_after_merge)(
+    const wl_plan_stratum_t *sp);
+#endif
+
 /* A private copy of @src's rows with @src's schema and without delta
  * timestamps: what an instance's DELTA read and a returned head delta are. */
 static int
@@ -315,6 +320,13 @@ wl_columnar_eval_tdd_insert_stratum(wl_col_session_t *sess,
             cur[ri] = next[ri];
             next[ri] = NULL;
         }
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_eval_tdd_insert_test_after_merge) {
+            rc = wl_columnar_eval_tdd_insert_test_after_merge(sp);
+            if (rc != 0)
+                goto done;
+        }
+#endif
         if (!any || !sp->is_recursive)
             break;
     }

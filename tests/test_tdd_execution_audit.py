@@ -233,7 +233,7 @@ class AuditTests(unittest.TestCase):
             frames = ["TDD snapshot begin " + s for s in proc.stderr.split("TDD snapshot begin ")[1:]]
             self.assertEqual(len(frames), 3)
             rows = [audit.parse_strata(s, 8, require_full=False) for s in frames]
-            self.assertEqual([[r["idx"] for r in snapshot] for snapshot in rows], [[0, 1, 2], [0, 2], []])
+            self.assertEqual([[r["idx"] for r in snapshot] for snapshot in rows], [[0, 1, 2], [0, 1, 2], []])
             for option in ("--audit-error", "--audit-partial"):
                 proc = subprocess.run([binary, option], env=env, capture_output=True,
                                       text=True, timeout=30, check=True, encoding="utf-8")
