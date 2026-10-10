@@ -9308,6 +9308,19 @@ wl_columnar_relation_bulk_append_retire(
 {
     if (!record || !record->ready) return EINVAL;
     if (!record->active) return rc;
+    if (record->compact) {
+        col_columns_free(record->compact_retired.merge_columns, record->ncols);
+        record->compact_retired.merge_columns = NULL;
+        if (record->published && record->compact_retired.ledger_pending) {
+            /* Primary and merge buffers are retired below before credit. */
+            col_columns_free(record->old_columns, record->ncols);
+            record->old_columns = NULL;
+            free(record->old_timestamps); record->old_timestamps = NULL;
+            wl_columnar_relation_ledger_apply_exclusive(record->dst,
+                record->ledger_timestamps, &record->ledger_prepared);
+            record->compact_retired.ledger_pending = false;
+        }
+    }
     free(record->lengths); record->lengths = NULL;
     free(record->prepared_types); record->prepared_types = NULL;
     if (record->prepared_schema_ok) {
@@ -9428,6 +9441,7 @@ wl_columnar_relation_bulk_append_controlled(
     /* No live token or physical owner survives a retired attempt. Install the
      * active phase before bounded reset so a stop has a durable disposition. */
     record->active = true;
+    record->compact = false;
     record->published = false;
     record->dst = dst;
     record->journal = false;
@@ -9898,6 +9912,342 @@ wl_columnar_relation_append_all_if_empty(col_rel_t *dst,
 
 /* ---- compaction ---------------------------------------------------------- */
 
+int
+wl_columnar_relation_compact_controlled(
+    wl_columnar_relation_bulk_append_t *record, col_rel_t *dst,
+    wl_evaluation_control_t *control)
+{
+    if (!record || !record->ready || !dst || !control) return EINVAL;
+    if (record->active) return EBUSY;
+    int rc = wl_evaluation_control_charge(control, 96);
+    if (rc) return rc;
+    if (record->writer.owner || record->descriptor_writer.owner
+        || record->sources.descriptor_count || record->sources.owner_count
+        || record->prepared_columns || record->old_columns
+        || record->prepared_timestamps || record->old_timestamps
+        || record->transaction_active || record->scratch.bytes
+        || record->metadata_pending.bytes || record->old_metadata.bytes
+        || record->previous.bytes || record->prepared_schema_ok
+        || record->old_schema_ok) return EINVAL;
+    record->compact = true;
+    record->active = true;
+    record->published = false;
+    record->dst = dst;
+    record->journal = false;
+    record->growth = false;
+    record->ncols = 0;
+    record->compact_retired.merge_columns = NULL;
+    record->compact_retired.ledger_pending = false;
+    record->transaction_active = false;
+    record->initialized_tokens = 0;
+    record->pending.growth = false;
+    rc = wl_columnar_relation_work_tail(control, 96);
+    if (rc) goto done;
+    wl_columnar_memory_reservation_t *tokens[5] = {
+        &record->scratch, &record->metadata_pending, &record->old_metadata,
+        &record->previous, &record->pending.fresh
+    };
+    for (uint32_t i = 0; i < 5; i++) {
+        rc = wl_evaluation_control_charge(control, 128);
+        if (rc) goto done;
+        wl_columnar_memory_reservation_init(tokens[i]);
+        record->initialized_tokens++;
+        rc = wl_columnar_relation_work_tail(control, 128);
+        if (rc) goto done;
+    }
+    /* Preserve the raw zero-arity no-op without requiring a writer against
+     * existing readers. Shape is observed under the original source group. */
+    rc = wl_columnar_relation_source_group_acquire_controlled(&record->sources,
+            dst, NULL, control);
+    if (rc) goto done;
+    rc = wl_evaluation_control_charge(control, 16);
+    if (rc) goto done;
+    record->ncols = dst->ncols;
+    rc = wl_columnar_relation_work_tail(control, 16);
+    if (rc || !record->ncols) goto done;
+    rc = wl_columnar_relation_source_group_drain(&record->sources, 0);
+    if (rc) goto done;
+    rc = wl_columnar_relation_writer_acquire_controlled(&dst->descriptor_access,
+            &record->descriptor_writer, control);
+    if (rc) goto done;
+    rc = wl_evaluation_control_charge(control, 32);
+    if (rc) goto done;
+    if (dst->storage_owner != dst || dst->arena_owned || dst->pool_owned
+        || dst->col_shared || dst->compound_count
+        || dst->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        || dst->inline_physical_offset || dst->retract_backup_columns
+        || col_rel_storage_alias_borrow_count(dst)) {
+        rc = ENOTSUP; goto done;
+    }
+    rc = wl_columnar_relation_work_tail(control, 32);
+    if (rc) goto done;
+    rc = wl_columnar_relation_writer_acquire_controlled(&dst->source_access,
+            &record->writer, control);
+    if (rc) goto done;
+    rc = wl_evaluation_control_charge(control, 64);
+    if (rc) goto done;
+    record->ncols = dst->ncols;
+    if (!dst->ncols) goto done; /* Raw zero-arity compaction is a no-op. */
+    if (!col_rel_timestamp_shape_valid(dst) || dst->nrows > dst->capacity
+        || (dst->nrows && !dst->columns)
+        || (dst->columns && dst->columns == dst->merge_columns)) {
+        rc = EINVAL; goto done;
+    }
+    bool shrink = dst->nrows && dst->capacity > (uint64_t)dst->nrows * 4u;
+    bool empty = !dst->nrows;
+    record->new_capacity = empty ? 0 : dst->capacity;
+    if (shrink) {
+        if (dst->memory_governor && !dst->retained_reserved_bytes) {
+            rc = EBUSY; goto done;
+        }
+        record->new_capacity = dst->nrows > UINT32_MAX / 2u
+            ? UINT32_MAX : dst->nrows * 2u;
+        if (record->new_capacity < COL_REL_INIT_CAP)
+            record->new_capacity = COL_REL_INIT_CAP;
+    }
+    if ((shrink || (empty && (dst->columns || dst->timestamps)))
+        && (!wl_columnar_relation_generation_valid(dst->storage_generation)
+        || dst->storage_generation >=
+        WL_COLUMNAR_REL_GENERATION_INVALID - 1u)){
+        rc = EOVERFLOW; goto done;
+    }
+    rc = wl_columnar_relation_work_tail(control, 64);
+    if (rc) goto done;
+    for (uint32_t c = 0; c < dst->ncols; c++) {
+        rc = wl_evaluation_control_charge(control, 8);
+        if (rc) goto done;
+        if (dst->nrows && !dst->columns[c]) {
+            rc = EINVAL; goto done;
+        }
+        if (dst->merge_columns && !dst->merge_columns[c]) {
+            rc = EINVAL; goto done;
+        }
+        rc = wl_columnar_relation_work_tail(control, 8);
+        if (rc) goto done;
+    }
+    col_rel_payload_shape_t old_shape = {
+        .ncols = dst->ncols, .owned_columns = dst->columns ? dst->ncols : 0,
+        .column_capacity = dst->capacity,
+        .timestamp_capacity = dst->timestamp_capacity,
+        .merge_capacity = dst->merge_buf_cap,
+        .active_table = dst->columns != NULL,
+        .merge_table = dst->merge_columns != NULL,
+        .scratch = dst->row_scratch != NULL,
+    };
+    col_rel_payload_shape_t final_shape = old_shape;
+    final_shape.column_capacity = record->new_capacity;
+    final_shape.timestamp_capacity = !empty && dst->timestamps
+        ? record->new_capacity : 0;
+    final_shape.active_table = !empty && dst->columns;
+    final_shape.owned_columns = final_shape.active_table ? dst->ncols : 0;
+    final_shape.merge_capacity = 0;
+    final_shape.merge_table = false;
+    uint64_t lane_bytes, table_bytes, timestamp_bytes, incoming, before, after;
+    if (!col_rel_payload_shape_bytes(&final_shape, &record->final_bytes)
+        || !wl_columnar_memory_size_mul(record->new_capacity, sizeof(int64_t),
+        &lane_bytes)
+        || !wl_columnar_memory_size_mul(dst->ncols, sizeof(int64_t *),
+        &table_bytes)
+        || !wl_columnar_memory_size_mul(final_shape.timestamp_capacity,
+        sizeof(col_delta_timestamp_t), &timestamp_bytes)
+        || !col_rel_payload_grid_bytes(dst->ncols, dst->ncols,
+        record->new_capacity, true, &incoming)
+        || !wl_columnar_memory_size_add(incoming, timestamp_bytes, &incoming)
+        || !wl_columnar_memory_size_mul((uint64_t)dst->capacity
+        + dst->merge_buf_cap, (uint64_t)dst->ncols * sizeof(int64_t), &before)
+        || !wl_columnar_memory_size_mul(record->new_capacity,
+        (uint64_t)dst->ncols * sizeof(int64_t), &after)
+        || lane_bytes > SIZE_MAX || table_bytes > SIZE_MAX
+        || timestamp_bytes > SIZE_MAX) {
+        rc = EOVERFLOW; goto done;
+    }
+    if (shrink) {
+        rc = wl_evaluation_control_charge(control, 128);
+        if (rc) goto done;
+        if (dst->memory_governor) {
+            wl_columnar_memory_admission_status_t status;
+            rc = wl_columnar_memory_governor_begin_growth_controlled(
+                &dst->retained_reservation, incoming, &status, control);
+            if (rc) goto done;
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED) {
+                /* Optional overlap was never admitted. Match raw batch
+                 * compaction: keep the entire existing payload, including
+                 * merge buffers, and do not latch a fatal budget denial. */
+                wl_columnar_relation_bulk_checkpoint(control, 7, record);
+                rc = wl_columnar_relation_work_tail(control, 0);
+                goto done;
+            }
+            if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+                && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+                rc = status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                    ? EOVERFLOW : EINVAL;
+                goto done;
+            }
+            record->pending.growth = true;
+            record->pending.incoming_bytes = incoming;
+            record->transaction_active = true;
+        }
+        rc = wl_columnar_relation_prepare_growth_controlled(dst, &old_shape,
+                record->new_capacity, lane_bytes, table_bytes, timestamp_bytes,
+                false, &record->prepared_columns, &record->prepared_timestamps,
+                control);
+        if (rc == ENOMEM) {
+            /* Raw compaction treats an allocator refusal as best effort. */
+            col_columns_free(record->prepared_columns, dst->ncols);
+            record->prepared_columns = NULL;
+            free(record->prepared_timestamps);
+            record->prepared_timestamps = NULL;
+            if (record->transaction_active) {
+                if (!record->pending.growth ||
+                    !wl_columnar_memory_rollback_growth(
+                        &dst->retained_reservation)) {
+                    rc = EINVAL; goto done;
+                }
+                record->pending.growth = false;
+                record->transaction_active = false;
+            }
+            shrink = false;
+            record->new_capacity = dst->capacity;
+            final_shape.column_capacity = dst->capacity;
+            final_shape.timestamp_capacity = dst->timestamp_capacity;
+            if (!col_rel_payload_shape_bytes(&final_shape, &record->final_bytes)
+                || !wl_columnar_memory_size_mul(dst->timestamp_capacity,
+                sizeof(col_delta_timestamp_t), &timestamp_bytes)
+                || !wl_columnar_memory_size_mul(dst->capacity,
+                (uint64_t)dst->ncols * sizeof(int64_t), &after)){
+                rc = EOVERFLOW; goto done;
+            }
+            rc = 0;
+        }
+        if (rc) goto done;
+    }
+    record->ledger_timestamps = timestamp_bytes;
+    rc = wl_columnar_relation_ledger_prepare_exclusive(dst, before, after,
+            timestamp_bytes, &record->ledger_prepared, control);
+    if (rc) goto done;
+    rc = wl_evaluation_control_charge(control, 128);
+    if (rc) goto done;
+    if (record->pending.growth && (dst->retained_reservation.identity
+        != &dst->retained_reservation
+        || atomic_load_explicit(&dst->retained_reservation.state,
+        memory_order_acquire) != WL_COLUMNAR_MEMORY_RESERVATION_REPLACING
+        || incoming > UINT64_MAX - dst->retained_reserved_bytes)) {
+        rc = EINVAL; goto done;
+    }
+    rc = wl_columnar_relation_work_tail(control, 128);
+    if (rc) goto done;
+    if (record->pending.growth) {
+        bool committed = false;
+        rc = wl_columnar_memory_governor_commit_growth_controlled(
+            &dst->retained_reservation, &committed, control);
+        if (rc || !committed) {
+            if (!rc) {
+                rc = EINVAL;
+            }
+            goto done;
+        }
+        dst->retained_reserved_bytes += incoming;
+        record->pending.growth = false;
+        record->transaction_active = false;
+    }
+    record->published = true;
+    record->growth = true; /* Retire actual old aggregate before downsize. */
+    record->compact_retired.ledger_pending = true;
+    record->compact_retired.merge_columns = dst->merge_columns;
+    dst->merge_columns = NULL; dst->merge_buf_cap = 0;
+    if (shrink || empty) {
+        record->old_columns = dst->columns;
+        record->old_timestamps = dst->timestamps;
+        dst->columns = record->prepared_columns;
+        dst->timestamps = record->prepared_timestamps;
+        record->prepared_columns = NULL; record->prepared_timestamps = NULL;
+        dst->capacity = record->new_capacity;
+        dst->timestamp_capacity = timestamp_bytes ? record->new_capacity : 0;
+        if (shrink || record->old_columns || record->old_timestamps)
+            wl_columnar_relation_touch_storage(dst);
+    }
+    if (dst->sorted_nrows > dst->nrows) dst->sorted_nrows = dst->nrows;
+    if (dst->base_nrows > dst->nrows) dst->base_nrows = dst->nrows;
+done:
+    return wl_columnar_relation_bulk_append_retire(record, rc);
+}
+
+int
+wl_columnar_relation_combined_reader_controlled(col_rel_t *rel,
+    wl_columnar_source_access_reader_t *reader,
+    wl_evaluation_control_t *control)
+{
+    if (!rel || !reader || !control || reader->owner || reader->secondary_owner
+        || reader->identity || reader->thread_valid) return EINVAL;
+    wl_columnar_source_access_gate_t *descriptor = &rel->descriptor_access;
+    uint64_t observed = atomic_load_explicit(&descriptor->state,
+            memory_order_relaxed);
+    for (;;) {
+        int rc = wl_evaluation_control_charge(control, 8);
+        if (rc) return rc;
+        if (observed >= WL_COLUMNAR_SOURCE_ACCESS_WRITER - 1u) return EBUSY;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_relation_test_before_reader_cas)
+            wl_columnar_relation_test_before_reader_cas(control, descriptor,
+                observed);
+#endif
+#ifdef _MSC_VER
+        bool acquired =
+            atomic_compare_exchange_weak_explicit(&descriptor->state,
+#else
+        bool acquired =
+            atomic_compare_exchange_strong_explicit(&descriptor->state,
+#endif
+                &observed, observed + 1u, memory_order_acquire,
+                memory_order_relaxed);
+        if (acquired) reader->secondary_owner = descriptor;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_relation_test_after_reader_cas)
+            wl_columnar_relation_test_after_reader_cas(control, descriptor,
+                acquired);
+#endif
+        rc = wl_columnar_relation_work_tail(control, 8);
+        if (rc) return rc; /* Actual descriptor-only disposition stays live. */
+        if (acquired) break;
+    }
+    int rc = wl_evaluation_control_charge(control, 16);
+    if (rc) return rc;
+    if (rel->storage_owner != rel ||
+        !rel->storage_owner_identity) return ENOTSUP;
+    rc = wl_columnar_relation_work_tail(control, 16);
+    if (rc) return rc;
+    wl_columnar_source_access_gate_t *source = &rel->source_access;
+    observed = atomic_load_explicit(&source->state, memory_order_relaxed);
+    for (;;) {
+        rc = wl_evaluation_control_charge(control, 16);
+        if (rc) return rc;
+        if (observed >= WL_COLUMNAR_SOURCE_ACCESS_WRITER - 1u) return EBUSY;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_relation_test_before_reader_cas)
+            wl_columnar_relation_test_before_reader_cas(control, source,
+                observed);
+#endif
+#ifdef _MSC_VER
+        bool acquired = atomic_compare_exchange_weak_explicit(&source->state,
+#else
+        bool acquired = atomic_compare_exchange_strong_explicit(&source->state,
+#endif
+                &observed, observed + 1u, memory_order_acquire,
+                memory_order_relaxed);
+        if (acquired) {
+            wl_columnar_source_access_reader_initialize(source, reader, false);
+            reader->secondary_owner = descriptor;
+        }
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_relation_test_after_reader_cas)
+            wl_columnar_relation_test_after_reader_cas(control, source,
+                acquired);
+#endif
+        rc = wl_columnar_relation_work_tail(control, 16);
+        if (rc || acquired) return rc;
+    }
+}
+
 /* Calculate the compacted shape without mutating the relation. */
 static bool
 col_rel_compaction_shape(const col_rel_t *r, uint32_t *out_capacity,
@@ -9906,7 +10256,7 @@ col_rel_compaction_shape(const col_rel_t *r, uint32_t *out_capacity,
     uint32_t tight;
 
     if (!r || !col_rel_timestamp_shape_valid(r) || r->nrows == 0
-        || r->capacity <= (uint64_t)r->nrows * 4)
+        || r->capacity <= (uint64_t) r->nrows * 4)
         return false;
     tight = r->nrows * 2;
     if (tight < r->nrows)
@@ -10042,7 +10392,7 @@ col_rel_compact_impl(col_rel_t *r,
         bool growth_started = false;
         uint64_t reservation_state;
 
-        (void)col_rel_compaction_shape(r, &tight, NULL);
+        (void) col_rel_compaction_shape(r, &tight, NULL);
         if (!col_rel_compaction_incoming_bytes(r, tight, &incoming_bytes)) {
             rc = EOVERFLOW;
             goto compact_done;

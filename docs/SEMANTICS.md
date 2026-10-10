@@ -892,19 +892,19 @@ call.
 
 | field | written by | read by | verdict |
 |---|---|---|---|
-| `last_inserted_relation` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create`, `session_note_inserted_input` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `session_snapshot_insert` | PRESERVE |
-| `pending_input_change` | `col_session_create_internal`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
-| `pending_full_input_eval` | `col_session_insert`, `col_session_remove`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
-| `has_evaluated` | `col_session_snapshot_impl`, `col_session_step_impl` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
-| `snapshot_stable_valid` | `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl` | PRESERVE |
-| `delta_seeded` | `insert_clone_prepare`, `tdd_worker_subpass_fn` | `col_eval_relation_plan`, `col_op_variable`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_filter_op_controlled`, `wl_columnar_join_op_controlled`, `wl_columnar_join_select_right`, `wl_columnar_merge_consolidate_controlled`, `wl_columnar_ops_map_controlled`, `wl_columnar_ops_reduce_controlled` | PRESERVE |
+| `last_inserted_relation` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create`, `session_note_inserted_input`, `wl_columnar_session_serial_attempt` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `session_snapshot_insert` | PRESERVE |
+| `pending_input_change` | `col_session_create_internal`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_serial_attempt` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
+| `pending_full_input_eval` | `col_session_insert`, `col_session_remove`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_serial_attempt` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
+| `has_evaluated` | `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_attempt` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_preflight` | PRESERVE |
+| `snapshot_stable_valid` | `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_serial_attempt` | `col_session_snapshot_impl` | PRESERVE |
+| `delta_seeded` | `insert_clone_prepare`, `tdd_worker_subpass_fn` | `col_eval_relation_plan`, `col_op_variable`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_filter_op_controlled`, `wl_columnar_join_op_controlled`, `wl_columnar_join_select_right`, `wl_columnar_merge_consolidate_controlled`, `wl_columnar_ops_map_controlled`, `wl_columnar_ops_reduce_controlled`, `wl_columnar_session_serial_preflight` | PRESERVE |
 | `last_removed_relation` | `col_session_remove_incremental`, `col_worker_session_create`, `session_retraction_cleanup` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
-| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup` | `col_eval_relation_plan`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_filter_op_controlled`, `wl_columnar_join_op_controlled`, `wl_columnar_join_select_right`, `wl_columnar_merge_consolidate_controlled`, `wl_columnar_ops_map_controlled`, `wl_columnar_ops_reduce_controlled` | PRESERVE |
-| `plain_step_completion_pending` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create` | `col_session_insert`, `col_session_insert_incremental`, `col_session_make_compound`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE -- with `plain_step_completion_phase` this is the resume token |
+| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup` | `col_eval_relation_plan`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_filter_op_controlled`, `wl_columnar_join_op_controlled`, `wl_columnar_join_select_right`, `wl_columnar_merge_consolidate_controlled`, `wl_columnar_ops_map_controlled`, `wl_columnar_ops_reduce_controlled`, `wl_columnar_session_serial_preflight` | PRESERVE |
+| `plain_step_completion_pending` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create` | `col_session_insert`, `col_session_insert_incremental`, `col_session_make_compound`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion`, `wl_columnar_session_serial_preflight` | PRESERVE -- with `plain_step_completion_phase` this is the resume token |
 | `plain_step_completion_phase` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE |
 | `plain_step_completion_step_context` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl` | PRESERVE |
 | `plain_step_completion_active` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_snapshot_impl`, `col_session_step_impl` | **COMMIT** on the step path -- a re-entrancy latch, not progress. While it stays set beside `plain_step_completion_pending`, the entry guard of both `col_session_step_impl` and `col_session_snapshot_impl` returns `EBUSY` above every line that would clear it. The snapshot path never writes it, so the snapshot cutoff has nothing to perform here. |
-| `col_rel_t::base_nrows` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_reset_rows_locked`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `tdd_empty_relation_candidate`, `tdd_seed_bdx_coordinator_idb`, `wl_columnar_eval_serial_canonicalize_aggregate_locked`, `wl_columnar_relation_new_private_controlled`, `wl_retraction_restore` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_mutable_image_validate`, `col_session_remove`, `col_session_remove_incremental`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `session_seed_shadow_plan_remove`, `session_snapshot_insert`, `wl_columnar_eval_delta_observer_begin`, `wl_columnar_relation_new_private_controlled`, `wl_retraction_stage_prepare` | PRESERVE -- the insert route (`session_snapshot_insert`) takes rows `[base_nrows, nrows)` of the inserted relation as the rows an incremental insert appended, so committing the bookkeeping's `base_nrows = nrows` on a stopped attempt would make the retry find no inserted rows and leave the heads without them. That is the whole verified consequence; see the note below before adding another |
+| `col_rel_t::base_nrows` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_reset_rows_locked`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `tdd_empty_relation_candidate`, `tdd_seed_bdx_coordinator_idb`, `wl_columnar_eval_serial_canonicalize_aggregate_locked`, `wl_columnar_relation_compact_controlled`, `wl_columnar_relation_new_private_controlled`, `wl_columnar_session_serial_attempt`, `wl_retraction_restore` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_mutable_image_validate`, `col_session_remove`, `col_session_remove_incremental`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `session_seed_shadow_plan_remove`, `session_snapshot_insert`, `wl_columnar_eval_delta_observer_begin`, `wl_columnar_relation_compact_controlled`, `wl_columnar_relation_new_private_controlled`, `wl_retraction_stage_prepare` | PRESERVE -- the insert route (`session_snapshot_insert`) takes rows `[base_nrows, nrows)` of the inserted relation as the rows an incremental insert appended, so committing the bookkeeping's `base_nrows = nrows` on a stopped attempt would make the retry find no inserted rows and leave the heads without them. That is the whole verified consequence; see the note below before adding another |
 
 Two non-field actions sit in the same region and need their own verdicts.
 `col_session_reclaim_quiescent` is **COMMIT**: the step cutoff's unwind calls
@@ -948,3 +948,56 @@ the last was wrong about consequence, because `col_session_emit_snapshot`
 iterates `row < r->nrows` and never mentions the field. The row above therefore
 names the one consequence that was read out of the observer's own condition,
 and a new claim about this field belongs in a test before it belongs here.
+
+
+### Controlled initial serial attempts
+
+`wl_columnar_session_serial_attempt` handles initial W1 nonrecursive backend
+STEP and SNAPSHOT for the admitted VARIABLE/MAP/CONSOLIDATE pipeline.
+Generated plans keep their actual stratum flags and default managed arena and
+pool objects. Controlled operators allocate governed heap images. This lane
+registers missing canonical heads and supports a supplied immutable legacy plan
+with several head occurrences in one nonrecursive stratum. Other controlled
+lanes and the installed facade remain outside this production unit.
+
+`serial_completion` retains the borrowed plan, origin, phase and next consumed
+rule/stratum. Canonical append or registry installation advances the cursor
+before cleanup. A stop after an earlier head therefore preserves canonical
+progress; retry finishes cleanup and continues without appending that head
+again. Input mutation is excluded while completion is pending; existing valid
+zero-row no-ops remain valid. Compaction and base-row bookkeeping run with real
+original-address writers in the retained evaluator frame. Registry credit moves
+retain RESERVED state and dispose physical retired arrays before their credit.
+Optional compaction replacement credit DENIED keeps the existing payload and
+completes housekeeping successfully, matching raw best-effort admission. This
+disposition comes from the actual governor verdict and never changes an unrelated
+fatal budget-denial latch. Work stops, overflow, invalid authority and refused
+mandatory cleanup still fail the attempt; an admitted growth transaction remains
+owned by its original frame record until physical and credit retirement succeed.
+
+SNAPSHOT pins every selected distinct head, including empty heads. The current
+cohort limit is 64 distinct heads; 65 is rejected before canonical mutation.
+Repeated immutable plan occurrences have no separate occurrence limit.
+Preparation resolves every occurrence by deterministic byte comparisons against
+cohort representatives, including mismatch and terminating NUL visits. It counts
+and checks occurrence, candidate, byte, row and cell work before publication.
+Callbacks receive the actual occurrence's name pointer in legacy plan order.
+
+The first nonempty row is gathered into the canonical row scratch with charged
+cell visits before cutoff, including real width 300 gathers. All remaining
+ENGINE comparisons, row gathers and tuple/span actions are prepaid in bounded
+admission groups in the same attempt. The terminal exception can span the
+entire finite admitted output batch; it has no refund or accounting reset.
+After the final cutoff no poll, fallible allocation, registry lookup or authority
+acquisition occurs. Cancellation requested by the first callback completes that
+batch successfully and remains sticky for the next attempt. A positive cleanup
+refusal after delivery preserves the consumed disposition; cleanup retry emits
+no duplicate callbacks.
+
+Output storage is the canonical scratch and a phase-exclusive union in the
+actual retained final evaluator frame. Compile-time assertions preserve that
+frame's original physical size and alignment. Registry workspace overlaps only
+retired stack bytes while the candidate result and outer reservation remain
+live. Output overlaps evaluator payload only after every prior owner retires.
+Mode and readiness live outside the overwritten payload. No full-output cell
+image or additional output heap credit is allocated.

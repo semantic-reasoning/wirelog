@@ -1976,6 +1976,16 @@ enum wl_columnar_plain_step_completion_phase {
 
 typedef struct wl_columnar_eval_stack_cleanup_frame
     wl_columnar_eval_stack_cleanup_frame_t;
+/* Scalar continuation only. Original-address ownership stays in the frame.
+ * Mode and readiness deliberately live outside the phase-exclusive payload. */
+typedef struct wl_columnar_serial_completion {
+    const wl_plan_t *plan;
+    wl_columnar_eval_stack_cleanup_frame_t *frame, *mode_frame;
+    uint32_t stratum, relation, compact, bookkeeping;
+    uint32_t phase, mode;
+    uint64_t stored_bytes;
+    bool pending, active, snapshot, payload_ready;
+} wl_columnar_serial_completion_t;
 struct wl_columnar_retained_eval_entry;
 struct wl_columnar_kfusion_cohort;
 typedef struct wl_columnar_eval_tdd_run wl_columnar_eval_tdd_run_t;
@@ -2030,6 +2040,7 @@ typedef struct wl_col_session_t {
      * Unlike total_iterations, this remains true when a pass converges
      * without performing a fixpoint iteration. */
     bool has_evaluated;
+    wl_columnar_serial_completion_t serial_completion;
     bool plain_step_completion_pending;
     bool plain_step_completion_active;
     bool plain_step_completion_step_context;
@@ -3625,6 +3636,38 @@ typedef struct {
     col_rel_t *dst;
     uint64_t prior_identity, prior_generation;
     bool journal;
+    bool compact;
+    wl_columnar_relation_payload_transaction_t pending;
+    wl_columnar_memory_reservation_t metadata_pending, old_metadata;
+    wl_columnar_memory_reservation_t previous, scratch;
+    uint64_t *lengths;
+    wirelog_column_type_t *prepared_types;
+    struct ArrowSchema prepared_schema;
+    union {
+        struct ArrowSchema old_schema;
+        struct {
+            int64_t **merge_columns;
+            uint64_t ledger_before, ledger_after;
+            bool ledger_pending;
+        } compact_retired;
+    };
+    int64_t **prepared_columns, **old_columns;
+    col_delta_timestamp_t *prepared_timestamps, *old_timestamps;
+    wl_columnar_mem_ledger_exclusive_prepared_t ledger_prepared;
+    uint64_t metadata_bytes, final_bytes, ledger_timestamps;
+    uint32_t ncols, base, count, new_capacity, owned_columns,
+        initialized_tokens;
+    bool growth, transaction_active, prepared_schema_ok, old_schema_ok;
+    bool metadata_committed, published, active, ready;
+} wl_columnar_relation_bulk_append_t;
+/* Immutable ABI-local layout witness for the original bulk payload. New
+ * phase flags/overlays must fit its original padding on every compiler. */
+typedef struct wl_columnar_relation_bulk_append_original {
+    wl_columnar_relation_source_group_t sources;
+    wl_columnar_source_access_writer_t descriptor_writer, writer;
+    col_rel_t *dst;
+    uint64_t prior_identity, prior_generation;
+    bool journal;
     wl_columnar_relation_payload_transaction_t pending;
     wl_columnar_memory_reservation_t metadata_pending, old_metadata;
     wl_columnar_memory_reservation_t previous, scratch;
@@ -3639,7 +3682,13 @@ typedef struct {
         initialized_tokens;
     bool growth, transaction_active, prepared_schema_ok, old_schema_ok;
     bool metadata_committed, published, active, ready;
-} wl_columnar_relation_bulk_append_t;
+} wl_columnar_relation_bulk_append_original_t;
+_Static_assert(sizeof(wl_columnar_relation_bulk_append_t)
+    == sizeof(wl_columnar_relation_bulk_append_original_t),
+    "compaction must fit original bulk payload");
+_Static_assert(_Alignof(wl_columnar_relation_bulk_append_t)
+    == _Alignof(wl_columnar_relation_bulk_append_original_t),
+    "compaction must preserve original bulk alignment");
 wl_columnar_relation_bulk_append_t *
 wl_columnar_eval_stack_cleanup_bulk_append(
     wl_columnar_eval_stack_cleanup_frame_t *);
@@ -3651,6 +3700,9 @@ int wl_columnar_relation_bulk_append_controlled(
     wl_evaluation_control_t *);
 int wl_columnar_relation_bulk_append_retire(
     wl_columnar_relation_bulk_append_t *, int);
+int wl_columnar_relation_compact_controlled(
+    wl_columnar_relation_bulk_append_t *, col_rel_t *,
+    wl_evaluation_control_t *);
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_relation_test_bulk_checkpoint)(
     wl_evaluation_control_t *, int, wl_columnar_relation_bulk_append_t *);
@@ -3942,6 +3994,58 @@ struct wl_columnar_session_hash_registry_image {
     wl_columnar_memory_reservation_t rels_reservation;
     wl_columnar_memory_reservation_t expected_rels_reservation;
 };
+
+/* Registry storage overlays only the drained evaluator stack. The candidate
+ * result and the frame's outer physical reservation remain at their addresses. */
+typedef struct wl_columnar_session_hash_controlled_registry {
+    wl_columnar_session_hash_registry_image_t image;
+    wl_columnar_memory_reservation_t old_rels, old_hash;
+    col_rel_t **retired_rels;
+    uint32_t *retired_head, *retired_next;
+    uint32_t initialized_tokens;
+    bool ready, published;
+} wl_columnar_session_hash_controlled_registry_t;
+
+#define WL_COLUMNAR_SERIAL_OUTPUT_COHORT 64u
+#define WL_COLUMNAR_SERIAL_FRAME_EVALUATION 0u
+#define WL_COLUMNAR_SERIAL_FRAME_REGISTRY 1u
+#define WL_COLUMNAR_SERIAL_FRAME_OUTPUT 2u
+typedef struct wl_columnar_serial_output_slot {
+    wl_columnar_source_access_reader_t reader;
+    col_rel_t *relation;
+    const char *name;
+} wl_columnar_serial_output_slot_t;
+typedef struct wl_columnar_serial_output {
+    wl_columnar_serial_output_slot_t slots[WL_COLUMNAR_SERIAL_OUTPUT_COHORT];
+    uint64_t future_work, byte_visits, candidate_visits, occurrences;
+    uint64_t rows, cells;
+    uint32_t initialized, count, first_slot;
+    bool first_gathered, consumed;
+    int64_t zero_arity;
+} wl_columnar_serial_output_t;
+int wl_columnar_session_hash_registry_controlled(
+    wl_columnar_session_hash_controlled_registry_t *, wl_col_session_t *,
+    col_rel_t *, wl_evaluation_control_t *);
+int wl_columnar_session_hash_registry_retire(
+    wl_columnar_session_hash_controlled_registry_t *, int);
+int wl_columnar_eval_stack_cleanup_registry(
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_columnar_session_hash_controlled_registry_t **,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_stack_cleanup_output(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_serial_output_t **,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_stack_cleanup_retained(wl_col_session_t *);
+int wl_columnar_eval_stack_cleanup_retained_drain(wl_col_session_t *);
+int wl_columnar_eval_stack_cleanup_resume(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t **, wl_evaluation_control_t *);
+int wl_columnar_relation_combined_reader_controlled(col_rel_t *,
+    wl_columnar_source_access_reader_t *, wl_evaluation_control_t *);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_session_test_serial_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint64_t,
+    wl_columnar_serial_output_t *);
+#endif
 
 int
 wl_columnar_session_hash_registry_image_prepare(wl_col_session_t *session,

@@ -441,8 +441,8 @@ def main() -> int:
         # And emptying a column outright must fail, not pass with less to check.
         row_edit("an emptied column fails",
                  "| `col_session_insert`, `col_session_remove`,"
-                 " `col_session_snapshot_impl`,"
-                 " `col_session_step_impl`, `session_note_inserted_input` |",
+                 " `col_session_snapshot_impl`, `col_session_step_impl`,"
+                 " `session_note_inserted_input`, `wl_columnar_session_serial_attempt` |",
                  "| — |")
 
         # The two fail-closed guards are wired to main(), not merely present.

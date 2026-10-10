@@ -246,18 +246,62 @@ eval_stack_drain_to_session(eval_stack_t *s, wl_col_session_t *sess)
 
 /* Persistent cleanup ownership. Every evaluator caller uses this boundary
  * except K-Fusion, which still drains an unframed stack; see #1648. */
-struct wl_columnar_eval_stack_cleanup_frame {
-    wl_col_session_t *session;
-    wl_columnar_eval_stack_cleanup_frame_t *next;
+typedef struct wl_columnar_eval_stack_original_payload {
     eval_stack_t stack;
     eval_entry_t result;
     wl_columnar_relation_source_group_t join_sources;
     wl_columnar_relation_private_batch_t reduce_batch;
     wl_columnar_consolidate_record_t consolidate;
-    wl_columnar_relation_bulk_append_t bulk_append;
+    wl_columnar_relation_bulk_append_original_t bulk_append;
+} wl_columnar_eval_stack_original_payload_t;
+struct wl_columnar_eval_stack_cleanup_frame {
+    wl_col_session_t *session;
+    wl_columnar_eval_stack_cleanup_frame_t *next;
+    union {
+        struct {
+            union {
+                eval_stack_t stack;
+                wl_columnar_session_hash_controlled_registry_t registry;
+            };
+            eval_entry_t result;
+            wl_columnar_relation_source_group_t join_sources;
+            wl_columnar_relation_private_batch_t reduce_batch;
+            wl_columnar_consolidate_record_t consolidate;
+            wl_columnar_relation_bulk_append_t bulk_append;
+        };
+        wl_columnar_serial_output_t output;
+        wl_columnar_eval_stack_original_payload_t original_payload;
+    };
     wl_columnar_memory_reservation_t reservation;
     wl_columnar_memory_governor_ref_t *governor;
 };
+typedef struct wl_columnar_eval_stack_original_frame {
+    wl_col_session_t *session;
+    wl_columnar_eval_stack_cleanup_frame_t *next;
+    wl_columnar_eval_stack_original_payload_t payload;
+    wl_columnar_memory_reservation_t reservation;
+    wl_columnar_memory_governor_ref_t *governor;
+} wl_columnar_eval_stack_original_frame_t;
+_Static_assert(sizeof(wl_columnar_session_hash_controlled_registry_t)
+    <= sizeof(eval_stack_t), "registry must fit retired original stack");
+_Static_assert(sizeof(wl_columnar_serial_output_t)
+    <= sizeof(wl_columnar_eval_stack_original_payload_t),
+    "output must fit retired original evaluator payload");
+_Static_assert(sizeof(struct wl_columnar_eval_stack_cleanup_frame)
+    == sizeof(wl_columnar_eval_stack_original_frame_t),
+    "phase overlays must preserve original frame size");
+_Static_assert(_Alignof(struct wl_columnar_eval_stack_cleanup_frame)
+    == _Alignof(wl_columnar_eval_stack_original_frame_t),
+    "phase overlays must preserve original frame alignment");
+
+static uint32_t
+wl_columnar_eval_stack_cleanup_mode(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    wl_columnar_serial_completion_t *state = &frame->session->serial_completion;
+    return state->mode_frame == frame ? state->mode
+        : WL_COLUMNAR_SERIAL_FRAME_EVALUATION;
+}
 
 #ifdef WL_SESSION_TEST_HOOKS
 void (*wl_columnar_eval_stack_test_constructor_checkpoint)(
@@ -582,8 +626,11 @@ static void
 wl_columnar_eval_stack_cleanup_continuations(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
 {
+    uint32_t mode = wl_columnar_eval_stack_cleanup_mode(frame);
+    if (mode == WL_COLUMNAR_SERIAL_FRAME_OUTPUT) return;
     if (frame->result.kind == WL_COLUMNAR_EVAL_ENTRY_CONTINUATION)
         (void)eval_entry_dispose(&frame->result);
+    if (mode == WL_COLUMNAR_SERIAL_FRAME_REGISTRY) return;
     for (uint32_t i = 0; i < frame->stack.top; i++)
         if (frame->stack.items[i].kind == WL_COLUMNAR_EVAL_ENTRY_CONTINUATION)
             (void)eval_entry_dispose(&frame->stack.items[i]);
@@ -593,6 +640,30 @@ static int
 wl_columnar_eval_stack_cleanup_dispose(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
 {
+    uint32_t mode = wl_columnar_eval_stack_cleanup_mode(frame);
+    if (mode == WL_COLUMNAR_SERIAL_FRAME_OUTPUT) {
+        if (!frame->session->serial_completion.payload_ready) return 0;
+        int rc = 0;
+        for (uint32_t i = 0; i < frame->output.initialized; i++) {
+            wl_columnar_source_access_reader_t *reader =
+                &frame->output.slots[i].reader;
+            int release = 0;
+            if (reader->owner) release = col_rel_source_reader_release(reader);
+            else if (reader->secondary_owner) {
+                release = wl_columnar_source_access_gate_reader_release(
+                    reader->secondary_owner);
+                if (!release) reader->secondary_owner = NULL;
+            }
+            if (!rc) rc = release;
+        }
+        return rc;
+    }
+    if (mode == WL_COLUMNAR_SERIAL_FRAME_REGISTRY) {
+        int rc = frame->session->serial_completion.payload_ready
+            ? wl_columnar_session_hash_registry_retire(&frame->registry, 0) : 0;
+        if (rc) return rc;
+        return eval_entry_dispose(&frame->result);
+    }
     int result = wl_columnar_relation_bulk_append_retire(&frame->bulk_append,
             0);
     if (result || frame->bulk_append.active) return result ? result : EINVAL;
@@ -623,6 +694,15 @@ static int
 wl_columnar_eval_stack_cleanup_free(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
 {
+    /* Retaining the already retired last frame creates no second overlap.
+     * Its actual physical admission remains charged until final retirement. */
+    if (frame->session->serial_completion.frame == frame) return 0;
+    if (frame->session->serial_completion.mode_frame == frame) {
+        frame->session->serial_completion.mode_frame = NULL;
+        frame->session->serial_completion.mode =
+            WL_COLUMNAR_SERIAL_FRAME_EVALUATION;
+        frame->session->serial_completion.payload_ready = false;
+    }
     wl_columnar_memory_reservation_t reservation;
     wl_columnar_memory_governor_ref_t *governor = frame->governor;
     wl_columnar_memory_reservation_init(&reservation);
@@ -681,6 +761,8 @@ wl_columnar_eval_stack_cleanup_retry(wl_col_session_t *sess)
     /* Drain ALL source dependencies before attempting ANY pending image. */
     for (wl_columnar_eval_stack_cleanup_frame_t *frame = sess->cleanup_pending;
         frame; frame = frame->next){
+        if (wl_columnar_eval_stack_cleanup_mode(frame)
+            != WL_COLUMNAR_SERIAL_FRAME_EVALUATION) continue;
         int rc = wl_columnar_relation_source_group_drain(&frame->join_sources,
                 0);
         if (!result) result = rc;
@@ -702,4 +784,136 @@ wl_columnar_eval_stack_cleanup_retry(wl_col_session_t *sess)
         }
     }
     return result;
+}
+
+static int
+wl_columnar_eval_stack_cleanup_clear_payload(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, void *payload, size_t bytes,
+    uint32_t mode, wl_evaluation_control_t *control)
+{
+    wl_columnar_serial_completion_t *state = &frame->session->serial_completion;
+    state->mode_frame = frame;
+    state->mode = mode;
+    state->payload_ready = false;
+    for (size_t at = 0; at < bytes;) {
+        size_t n = bytes - at;
+        if (n > 128) n = 128;
+        int rc = wl_evaluation_control_charge(control, n);
+        if (rc) return rc;
+        memset((char *)payload + at, 0, n);
+        at += n;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return rc;
+    }
+    state->payload_ready = true;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_cleanup_registry(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_session_hash_controlled_registry_t **out,
+    wl_evaluation_control_t *control)
+{
+    if (!frame || !out || !control) return EINVAL;
+    int rc = wl_columnar_relation_bulk_append_retire(&frame->bulk_append, 0);
+    if (!rc && frame->bulk_append.active) rc = EBUSY;
+    if (!rc) rc =
+            wl_columnar_relation_private_batch_retire(&frame->reduce_batch,
+                0);
+    if (!rc && !wl_columnar_relation_private_batch_disposable(
+            &frame->reduce_batch)) rc = EBUSY;
+    if (!rc) rc = wl_columnar_relation_consolidate_retire(&frame->consolidate,
+                0);
+    if (!rc) rc = wl_columnar_relation_source_group_drain(&frame->join_sources,
+                0);
+    if (!rc) rc = eval_stack_drain(&frame->stack);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_cleanup_clear_payload(frame, &frame->registry,
+            sizeof(frame->registry), WL_COLUMNAR_SERIAL_FRAME_REGISTRY,
+            control);
+    if (!rc) *out = &frame->registry;
+    return rc;
+}
+
+int
+wl_columnar_eval_stack_cleanup_output(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_serial_output_t **out, wl_evaluation_control_t *control)
+{
+    if (!frame || !out || !control) return EINVAL;
+    int rc = wl_columnar_eval_stack_cleanup_dispose(frame);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_cleanup_clear_payload(frame, &frame->output,
+            sizeof(frame->output), WL_COLUMNAR_SERIAL_FRAME_OUTPUT, control);
+    if (!rc) *out = &frame->output;
+    return rc;
+}
+
+int
+wl_columnar_eval_stack_cleanup_retained(wl_col_session_t *sess)
+{
+    if (!sess || !sess->serial_completion.frame) return 0;
+    wl_columnar_eval_stack_cleanup_frame_t *frame =
+        sess->serial_completion.frame;
+    if (sess->cleanup_active || sess->cleanup_pending) return EBUSY;
+    int rc = wl_columnar_eval_stack_cleanup_dispose(frame);
+    if (rc) return rc;
+    sess->serial_completion.frame = NULL;
+    rc = wl_columnar_eval_stack_cleanup_free(frame);
+    if (rc) sess->serial_completion.frame = frame;
+    return rc;
+}
+
+int
+wl_columnar_eval_stack_cleanup_retained_drain(wl_col_session_t *sess)
+{
+    return sess && sess->serial_completion.frame
+        ? wl_columnar_eval_stack_cleanup_dispose(sess->serial_completion.frame)
+        : 0;
+}
+
+int
+wl_columnar_eval_stack_cleanup_resume(wl_col_session_t *sess,
+    wl_columnar_eval_stack_cleanup_frame_t **out,
+    wl_evaluation_control_t *control)
+{
+    if (!sess || !out || !control || sess->cleanup_active
+        || sess->cleanup_pending ||
+        !sess->serial_completion.frame) return EBUSY;
+    wl_columnar_eval_stack_cleanup_frame_t *frame =
+        sess->serial_completion.frame;
+    int rc = wl_columnar_eval_stack_cleanup_dispose(frame);
+    if (rc) return rc;
+    /* OUTPUT with readiness false is the safe discard disposition while the
+     * wholly retired evaluator payload is initialized in bounded slices. */
+    rc = wl_columnar_eval_stack_cleanup_clear_payload(frame,
+            &frame->original_payload, sizeof(frame->original_payload),
+            WL_COLUMNAR_SERIAL_FRAME_OUTPUT, control);
+    if (rc) return rc;
+    wl_columnar_memory_reservation_t *tokens[3] = {
+        &frame->consolidate.sequence.metadata_admission,
+        &frame->consolidate.sequence.workspace.admission,
+        &frame->consolidate.merge_admission
+    };
+    for (uint32_t i = 0; i < 3; i++) {
+        rc = wl_evaluation_control_charge(control, 128);
+        if (rc) return rc;
+        wl_columnar_memory_reservation_init(tokens[i]);
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(control, 32);
+    if (rc) return rc;
+    frame->reduce_batch.ready = true;
+    frame->consolidate.ready = true;
+    frame->bulk_append.ready = true;
+    sess->serial_completion.mode = WL_COLUMNAR_SERIAL_FRAME_EVALUATION;
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) return rc;
+    frame->next = sess->cleanup_active;
+    sess->cleanup_active = frame;
+    sess->cleanup_active_count++;
+    *out = frame;
+    return 0;
 }

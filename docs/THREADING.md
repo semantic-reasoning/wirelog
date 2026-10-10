@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **313**). The earlier audit sections
+match the script's count (currently **324**). The earlier audit sections
 retain their historical per-section counts.
 
 Format: `file:function[#N]` | field | operation | order | justification.
@@ -1517,3 +1517,40 @@ See the [evaluation-control contract](SEMANTICS.md#evaluation-control-foundation
 for prospective checkpoint coverage and the publication cutoff. The future
 256-unit quantum excludes host callbacks, synchronous runtime calls and mandatory
 cleanup/drain; it is not a return-time guarantee or existing engine enforcement.
+
+
+### Controlled serial completion and frame phases
+
+The owning session serializes `serial_completion` and its borrowed plan and
+cursors. Canonical consumption is recorded before frame cleanup. The retained
+frame remains charged through evaluation, registry publication, compaction and
+output. Its physical size/alignment equal the original frame by independent
+original-layout static assertions. Registry mode overlays retired stack bytes;
+output mode overlays payload only after all source/private/bulk/result owners
+retire. Mode/readiness are session scalars outside that payload, so partial
+bounded initialization cannot reinterpret live owners.
+
+`wl_columnar_relation_combined_reader_controlled` installs the descriptor-only
+partial disposition in the final original-address output token before its tail
+poll. Source admission initializes that same token and retains the descriptor
+owner. Output pins include empty selected heads and remain through all callbacks.
+Checked retirement preserves original tokens on refusal; a consumed output batch
+is never delivered again on cleanup retry. Session operation admission excludes
+mutation during retained completion; callbacks also encounter genuine relation
+reader exclusion. No authority token is copied into another address.
+
+### Controlled serial publication atomics (11 rows)
+
+| Anchor (file:function[#N]) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `relation.c:wl_columnar_relation_compact_controlled` | retained_reservation.state | `atomic_load_explicit` | acquire | Validate original growth credit under the canonical writer before publication |
+| `relation.c:wl_columnar_relation_combined_reader_controlled` | descriptor.state | `atomic_load_explicit` | relaxed | Initial descriptor reader admission observation |
+| `relation.c:wl_columnar_relation_combined_reader_controlled#2` | descriptor.state | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | MSVC descriptor reader admission; retry every failed CAS |
+| `relation.c:wl_columnar_relation_combined_reader_controlled#3` | descriptor.state | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | Descriptor reader admission before source shape access |
+| `relation.c:wl_columnar_relation_combined_reader_controlled#4` | source.state | `atomic_load_explicit` | relaxed | Initial source reader admission observation |
+| `relation.c:wl_columnar_relation_combined_reader_controlled#5` | source.state | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | MSVC source reader admission; preserve original descriptor disposition |
+| `relation.c:wl_columnar_relation_combined_reader_controlled#6` | source.state | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | Source reader admission into the final original token |
+| `session_hash.c:wl_columnar_session_hash_controlled_token_retire` | token.state | `atomic_load_explicit` | acquire | Select checked RESERVED rollback or COMMITTED release after physical disposal |
+| `session_hash.c:wl_columnar_session_hash_controlled_move_valid` | destination.state | `atomic_load_explicit` | acquire | Verify the exclusive original destination token is inert before cutoff |
+| `session_hash.c:wl_columnar_session_hash_controlled_move_valid#2` | source.state | `atomic_load_explicit` | acquire | Verify original source token permits the planned publication move |
+| `session_hash.c:wl_columnar_session_hash_controlled_move` | source.state | `atomic_load_explicit` | relaxed | Exclusive prevalidated source disposition selects fixed terminal move |

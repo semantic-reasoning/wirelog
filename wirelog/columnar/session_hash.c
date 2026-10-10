@@ -552,3 +552,326 @@ wl_columnar_session_hash_registry_image_publish(
     session_reservation_release(&image->expected_rels_reservation);
     memset(image, 0, sizeof(*image));
 }
+
+static int
+wl_columnar_session_hash_controlled_token_retire(
+    wl_columnar_memory_reservation_t *token)
+{
+    uint64_t state = atomic_load_explicit(&token->state, memory_order_acquire);
+    if (state == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+        || state == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED) return 0;
+    bool released = state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        ? wl_columnar_memory_rollback(token) :
+        wl_columnar_memory_release(token);
+    return released ? 0 : EINVAL;
+}
+
+int
+wl_columnar_session_hash_registry_retire(
+    wl_columnar_session_hash_controlled_registry_t *record, int rc)
+{
+    if (!record || !record->ready) return rc;
+    wl_columnar_session_hash_registry_image_t *image = &record->image;
+    free(image->rels); image->rels = NULL;
+    free(image->hash_head); image->hash_head = NULL;
+    free(image->hash_next); image->hash_next = NULL;
+    free(image->expected_rel_contents); image->expected_rel_contents = NULL;
+    free(record->retired_rels); record->retired_rels = NULL;
+    free(record->retired_head); record->retired_head = NULL;
+    free(record->retired_next); record->retired_next = NULL;
+    wl_columnar_memory_reservation_t *tokens[5] = {
+        &image->rels_reservation, &image->hash_reservation,
+        &image->expected_rels_reservation, &record->old_rels, &record->old_hash
+    };
+    for (uint32_t i = 0; i < record->initialized_tokens; i++) {
+        int retire =
+            wl_columnar_session_hash_controlled_token_retire(tokens[i]);
+        if (retire) rc = retire;
+    }
+    return rc;
+}
+
+static int
+wl_columnar_session_hash_controlled_admit(wl_col_session_t *sess,
+    uint64_t bytes, wl_columnar_memory_reservation_t *token,
+    wl_evaluation_control_t *control)
+{
+    if (!sess->memory_governor) return 0;
+    wl_columnar_memory_admission_status_t status;
+    int rc = wl_columnar_memory_governor_reserve_checked_controlled(
+        wl_columnar_memory_governor_ref_get(sess->memory_governor), bytes,
+        token, &status, control);
+    if (rc) return rc;
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+        || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) return 0;
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+        sess->memory_budget_denied = true;
+    return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+        : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : EINVAL;
+}
+
+static int
+wl_columnar_session_hash_controlled_equal(const char *left, const char *right,
+    bool *equal, wl_evaluation_control_t *control)
+{
+    *equal = false;
+    if (!left || !right) return EINVAL;
+    for (size_t i = 0;; i++) {
+        int rc = wl_evaluation_control_charge(control, 8);
+        if (rc) return rc;
+        unsigned char a = (unsigned char)left[i], b = (unsigned char)right[i];
+        bool done = a != b || !a;
+        *equal = a == b;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc || done) return rc;
+        if (i == SIZE_MAX - 1u) return EOVERFLOW;
+    }
+}
+
+static bool
+wl_columnar_session_hash_controlled_move_valid(
+    wl_columnar_memory_reservation_t *destination,
+    wl_columnar_memory_reservation_t *source)
+{
+    uint64_t ds = atomic_load_explicit(&destination->state,
+            memory_order_acquire);
+    uint64_t ss = atomic_load_explicit(&source->state, memory_order_acquire);
+    return destination->identity == destination && source->identity == source
+           && (ds == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+           || ds == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED)
+           && (ss == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+           || ss == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED
+           || ss == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+           || ss == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+}
+
+static void
+wl_columnar_session_hash_controlled_move(
+    wl_columnar_memory_reservation_t *destination,
+    wl_columnar_memory_reservation_t *source)
+{
+    uint64_t state = atomic_load_explicit(&source->state, memory_order_relaxed);
+    if (state != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        && state != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED) return;
+    bool moved = wl_columnar_memory_reservation_move(destination, source);
+    assert(moved);
+    (void)moved;
+}
+
+int
+wl_columnar_session_hash_registry_controlled(
+    wl_columnar_session_hash_controlled_registry_t *record,
+    wl_col_session_t *sess,
+    col_rel_t *candidate, wl_evaluation_control_t *control)
+{
+    if (!record || !sess || !candidate || !candidate->name || !control)
+        return EINVAL;
+    wl_columnar_session_hash_registry_image_t *image = &record->image;
+    record->ready = true;
+    wl_columnar_memory_reservation_t *tokens[5] = {
+        &image->rels_reservation, &image->hash_reservation,
+        &image->expected_rels_reservation, &record->old_rels, &record->old_hash
+    };
+    int rc = 0;
+    for (uint32_t i = 0; i < 5; i++) {
+        rc = wl_evaluation_control_charge(control, 128);
+        if (rc) goto done;
+        wl_columnar_memory_reservation_init(tokens[i]);
+        record->initialized_tokens++;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto done;
+    }
+    image->session = sess;
+    image->expected_rels = sess->rels;
+    image->expected_nrels = sess->nrels;
+    image->expected_rel_cap = sess->rel_cap;
+    image->expected_hash_head = sess->rel_hash_head;
+    image->expected_hash_next = sess->rel_hash_next;
+    image->expected_hash_nbuckets = sess->rel_hash_nbuckets;
+    image->expected_hash_chain_cap = sess->rel_hash_chain_cap;
+    uint32_t slot = UINT32_MAX;
+    for (uint32_t i = 0; i < sess->nrels; i++) {
+        rc = wl_evaluation_control_charge(control, 8);
+        if (rc) goto done;
+        col_rel_t *existing = sess->rels[i];
+        if (!existing && slot == UINT32_MAX) slot = i;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto done;
+        if (existing) {
+            bool equal;
+            rc = wl_columnar_session_hash_controlled_equal(existing->name,
+                    candidate->name, &equal, control);
+            if (rc) goto done;
+            if (equal) {
+                rc = EEXIST; goto done;
+            }
+        }
+    }
+    if (slot == UINT32_MAX) slot = sess->nrels;
+    if (slot == UINT32_MAX) {
+        rc = EOVERFLOW; goto done;
+    }
+    image->nrels = sess->nrels + (slot == sess->nrels);
+    image->rel_cap = sess->rel_cap > image->nrels
+        ? sess->rel_cap : image->nrels;
+    uint64_t rel_bytes, expected_bytes;
+    if (!wl_columnar_memory_size_mul(image->rel_cap, sizeof(*image->rels),
+        &rel_bytes)
+        || !wl_columnar_memory_size_mul(sess->nrels,
+        sizeof(*image->expected_rel_contents), &expected_bytes)
+        || rel_bytes > SIZE_MAX || expected_bytes > SIZE_MAX) {
+        rc = EOVERFLOW; goto done;
+    }
+    rc = wl_columnar_session_hash_controlled_admit(sess, rel_bytes,
+            &image->rels_reservation, control);
+    if (rc) goto done;
+    if (expected_bytes) rc = wl_columnar_session_hash_controlled_admit(sess,
+                expected_bytes, &image->expected_rels_reservation, control);
+    if (rc) goto done;
+    rc = wl_evaluation_control_charge(control, 2);
+    if (rc) goto done;
+    image->rels = malloc((size_t)rel_bytes);
+    if (expected_bytes) image->expected_rel_contents = malloc(
+            (size_t)expected_bytes);
+    if (!image->rels || (expected_bytes && !image->expected_rel_contents)) {
+        rc = ENOMEM; goto done;
+    }
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto done;
+    for (uint32_t i = 0; i < image->rel_cap; i++) {
+        rc = wl_evaluation_control_charge(control, 8);
+        if (rc) goto done;
+        col_rel_t *rel = i < sess->nrels ? sess->rels[i] : NULL;
+        image->rels[i] = i == slot ? candidate : rel;
+        if (i < sess->nrels) image->expected_rel_contents[i] = rel;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto done;
+    }
+    if (image->nrels > UINT32_MAX / 2u) {
+        rc = EOVERFLOW; goto done;
+    }
+    uint32_t buckets = 16;
+    while (buckets < image->nrels * 2u) {
+        rc = wl_evaluation_control_charge(control, 4);
+        if (rc) goto done;
+        if (buckets > UINT32_MAX / 2u) {
+            rc = EOVERFLOW; goto done;
+        }
+        buckets *= 2u;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto done;
+    }
+    uint64_t head_bytes, next_bytes, hash_bytes;
+    if (!wl_columnar_memory_size_mul(buckets, sizeof(*image->hash_head),
+        &head_bytes)
+        || !wl_columnar_memory_size_mul(image->nrels,
+        sizeof(*image->hash_next), &next_bytes)
+        || !wl_columnar_memory_size_add(head_bytes, next_bytes, &hash_bytes)
+        || head_bytes > SIZE_MAX || next_bytes > SIZE_MAX) {
+        rc = EOVERFLOW; goto done;
+    }
+    rc = wl_columnar_session_hash_controlled_admit(sess, hash_bytes,
+            &image->hash_reservation, control);
+    if (rc) goto done;
+    rc = wl_evaluation_control_charge(control, 2);
+    if (rc) goto done;
+    image->hash_head = malloc((size_t)head_bytes);
+    image->hash_next = malloc((size_t)next_bytes);
+    if (!image->hash_head || !image->hash_next) {
+        rc = ENOMEM; goto done;
+    }
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto done;
+    for (uint32_t i = 0; i < buckets; i++) {
+        rc = wl_evaluation_control_charge(control, 2);
+        if (rc) goto done;
+        image->hash_head[i] = UINT32_MAX;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto done;
+    }
+    for (uint32_t i = 0; i < image->nrels; i++) {
+        rc = wl_evaluation_control_charge(control, 8);
+        if (rc) goto done;
+        col_rel_t *rel = image->rels[i];
+        image->hash_next[i] = UINT32_MAX;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto done;
+        if (!rel) continue;
+        uint64_t h = 14695981039346656037ULL;
+        for (size_t pos = 0;; pos++) {
+            rc = wl_evaluation_control_charge(control, 8);
+            if (rc) goto done;
+            unsigned char value = (unsigned char)rel->name[pos];
+            if (value) {
+                h ^= value; h *= 1099511628211ULL;
+            }
+            rc = wl_evaluation_control_charge(control, 0);
+            if (rc) goto done;
+            if (!value) break;
+            if (pos == SIZE_MAX - 1u) {
+                rc = EOVERFLOW; goto done;
+            }
+        }
+        rc = wl_evaluation_control_charge(control, 8);
+        if (rc) goto done;
+        uint32_t bucket = (uint32_t)(h & (buckets - 1u));
+        image->hash_next[i] = image->hash_head[bucket];
+        image->hash_head[bucket] = i;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto done;
+    }
+    image->hash_nbuckets = buckets;
+    image->hash_chain_cap = image->nrels;
+    for (uint32_t i = 0; i < image->expected_nrels; i++) {
+        rc = wl_evaluation_control_charge(control, 4);
+        if (rc) goto done;
+        if (sess->rels[i] != image->expected_rel_contents[i]) {
+            rc = EBUSY; goto done;
+        }
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto done;
+    }
+    rc = wl_evaluation_control_charge(control, 128);
+    if (rc) goto done;
+    if (sess->rels != image->expected_rels
+        || sess->nrels != image->expected_nrels
+        || sess->rel_cap != image->expected_rel_cap
+        || sess->rel_hash_head != image->expected_hash_head
+        || sess->rel_hash_next != image->expected_hash_next
+        || sess->rel_hash_nbuckets != image->expected_hash_nbuckets
+        || sess->rel_hash_chain_cap != image->expected_hash_chain_cap
+        || !wl_columnar_session_hash_controlled_move_valid(&record->old_rels,
+        &sess->rels_reservation)
+        || !wl_columnar_session_hash_controlled_move_valid(&record->old_hash,
+        &sess->rel_hash_reservation)
+        || !wl_columnar_session_hash_controlled_move_valid(&record->old_rels,
+        &image->rels_reservation)
+        || !wl_columnar_session_hash_controlled_move_valid(&record->old_hash,
+        &image->hash_reservation)) {
+        rc = EBUSY; goto done;
+    }
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto done;
+    /* Exclusive, prevalidated original tokens; RESERVED registry credit is
+     * moved as RESERVED. No governor commitment or poll follows this cutoff. */
+    wl_columnar_session_hash_controlled_move(&record->old_rels,
+        &sess->rels_reservation);
+    wl_columnar_session_hash_controlled_move(&record->old_hash,
+        &sess->rel_hash_reservation);
+    wl_columnar_session_hash_controlled_move(&sess->rels_reservation,
+        &image->rels_reservation);
+    wl_columnar_session_hash_controlled_move(&sess->rel_hash_reservation,
+        &image->hash_reservation);
+    record->retired_rels = sess->rels;
+    record->retired_head = sess->rel_hash_head;
+    record->retired_next = sess->rel_hash_next;
+    sess->rels = image->rels; image->rels = NULL;
+    sess->nrels = image->nrels; sess->rel_cap = image->rel_cap;
+    sess->rel_hash_head = image->hash_head; image->hash_head = NULL;
+    sess->rel_hash_next = image->hash_next; image->hash_next = NULL;
+    sess->rel_hash_nbuckets = image->hash_nbuckets;
+    sess->rel_hash_chain_cap = image->hash_chain_cap;
+    record->published = true;
+done:
+    return wl_columnar_session_hash_registry_retire(record, rc);
+}

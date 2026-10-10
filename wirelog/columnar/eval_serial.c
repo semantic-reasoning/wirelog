@@ -264,16 +264,21 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
     if (control) {
         int preflight = wl_evaluation_control_charge(control, 16);
         if (preflight) return preflight;
-        if (recursive || sess->eval_arena) return ENOTSUP;
+        if (recursive || (sess->eval_arena && !sess->serial_completion.pending))
+            return ENOTSUP;
         preflight = wl_columnar_join_controlled_lookup(sess, rp->name,
                 &controlled_target, control);
         if (preflight) return preflight;
-        if (!controlled_target) return ENOTSUP;
+        if (!controlled_target &&
+            !sess->serial_completion.pending) return ENOTSUP;
     }
     wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
-    int rc = wl_columnar_eval_stack_cleanup_begin(sess, &frame);
+    int rc = sess->serial_completion.pending && sess->serial_completion.frame
+        ? wl_columnar_eval_stack_cleanup_resume(sess, &frame, control)
+        : wl_columnar_eval_stack_cleanup_begin(sess, &frame);
     if (rc != 0)
         return rc;
+    if (sess->serial_completion.pending) sess->serial_completion.frame = frame;
     eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame);
     eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(frame);
     rc = col_eval_relation_plan(rp, stack, sess);
@@ -308,7 +313,7 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
         if (!record || !sources) {
             rc = EINVAL; goto done;
         }
-        if (result->owned) {
+        if (result->owned || !target) {
             if (stack->top >= COL_STACK_MAX) {
                 rc = ENOMEM; goto done;
             }
@@ -323,9 +328,10 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
             rc = wl_columnar_relation_source_group_acquire_controlled(sources,
                     result->rel, NULL, control);
             if (!rc) rc =
-                    wl_columnar_relation_new_like_held_controlled("$publish",
-                        result->rel, sess->memory_governor, &candidate->rel,
-                        control);
+                    wl_columnar_relation_new_like_held_controlled(
+                    target ? "$publish" : rp->name,
+                    result->rel, sess->memory_governor, &candidate->rel,
+                    control);
             rc = wl_columnar_relation_source_group_drain(sources, rc);
             if (rc) goto done;
             rc = wl_columnar_relation_bulk_append_controlled(record,
@@ -343,8 +349,25 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
             rc = wl_evaluation_control_charge(control, 0);
             if (rc) goto done;
         }
-        rc = wl_columnar_relation_bulk_append_controlled(record, target,
-                result->rel, control);
+        if (target) {
+            rc = wl_columnar_relation_bulk_append_controlled(record, target,
+                    result->rel, control);
+            if (sess->serial_completion.pending && (record->published || !rc))
+                sess->serial_completion.relation++;
+        } else {
+            wl_columnar_session_hash_controlled_registry_t *registry = NULL;
+            rc = wl_columnar_eval_stack_cleanup_registry(frame, &registry,
+                    control);
+            if (!rc) rc = wl_columnar_session_hash_registry_controlled(registry,
+                        sess, result->rel, control);
+            if (registry && registry->published) {
+                /* Actual registry ownership transfer and consumed cursor precede
+                * any possible frame/result disposal. Staging did not consume. */
+                result->rel = NULL;
+                result->owned = false;
+                sess->serial_completion.relation++;
+            }
+        }
         goto done;
     }
     if (target) {
@@ -470,6 +493,52 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         return readiness_rc;
 
     if (!sp->is_recursive) {
+        if (sess->serial_completion.pending) {
+            wl_evaluation_control_t *control = sess->base.evaluation_control;
+            sess->current_iteration = 0;
+            while (sess->serial_completion.relation < sp->relation_count) {
+                int rc = wl_evaluation_control_charge(control, 16);
+                if (rc) return rc;
+                const wl_plan_relation_t *rp =
+                    &sp->relations[sess->serial_completion.relation];
+                rc = wl_evaluation_control_charge(control, 0);
+                if (rc) return rc;
+                uint32_t before = sess->serial_completion.relation;
+                rc = wl_columnar_eval_serial_framed_relation(rp, sess, false);
+                if (rc) return rc;
+                if (before == sess->serial_completion.relation)
+                    sess->serial_completion.relation++; /* Genuine empty success. */
+            }
+            /* Entry preflight proved seed/cache/pool occupancy absent. Heap
+             * operators keep the ordinary arena and pool objects untouched. */
+            uint32_t rule_base = 0;
+            for (uint32_t si = 0; si < stratum_idx; si++) {
+                int rc = wl_evaluation_control_charge(control, 8);
+                if (rc) return rc;
+                if (sess->plan->strata[si].relation_count >
+                    UINT32_MAX - rule_base)
+                    return EOVERFLOW;
+                rule_base += sess->plan->strata[si].relation_count;
+                rc = wl_evaluation_control_charge(control, 0);
+                if (rc) return rc;
+            }
+            for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+                int rc = wl_evaluation_control_charge(control, 16);
+                if (rc) return rc;
+                if (rule_base <= UINT32_MAX - ri && rule_base + ri < MAX_RULES)
+                    sess->frontier_ops->reset_rule_frontier(sess,
+                        rule_base + ri,
+                        sess->outer_epoch);
+                rc = wl_evaluation_control_charge(control, 0);
+                if (rc) return rc;
+            }
+            int rc = wl_evaluation_control_charge(control, 16);
+            if (rc) return rc;
+            sess->frontier_ops->record_stratum_convergence(sess, stratum_idx,
+                sess->outer_epoch, UINT32_MAX);
+            sess->eval_stratum_heads_final = true;
+            return wl_evaluation_control_charge(control, 0);
+        }
         /* Issue #914: a non-recursive stratum is always the base case. The
          * recursive-stratum loop leaves sess->current_iteration > 0 and never
          * resets it, which would wrongly trigger the base-case EDB VARIABLE
