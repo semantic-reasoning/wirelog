@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **324**). The earlier audit sections
+match the script's count (currently **326**). The earlier audit sections
 retain their historical per-section counts.
 
 Format: `file:function[#N]` | field | operation | order | justification.
@@ -1554,3 +1554,13 @@ reader exclusion. No authority token is copied into another address.
 | `session_hash.c:wl_columnar_session_hash_controlled_move_valid` | destination.state | `atomic_load_explicit` | acquire | Verify the exclusive original destination token is inert before cutoff |
 | `session_hash.c:wl_columnar_session_hash_controlled_move_valid#2` | source.state | `atomic_load_explicit` | acquire | Verify original source token permits the planned publication move |
 | `session_hash.c:wl_columnar_session_hash_controlled_move` | source.state | `atomic_load_explicit` | relaxed | Exclusive prevalidated source disposition selects fixed terminal move |
+
+| `relation.c:wl_columnar_relation_reset_token_valid` | token.state | `atomic_load_explicit` | acquire | Validate original retained reset credit without retiring or changing its physical allocation |
+| `relation.c:wl_columnar_relation_reset_token_valid#2` | token.owner_bits | `atomic_load_explicit` | acquire | Confirm the canonical self-owner of the committed reset credit under genuine descriptor and storage writers |
+
+Dirty full-input serial reevaluation preflights every distinct IDB reset target
+with original frame writers before the first logical reset. RESET retains all
+physical storage and credit. Its consumed cursor advances before checked writer
+release, so a positive release refusal retains authority and cannot replay the
+reset. Frontier cursors advance before their charged tails. The phase-exclusive
+frame layout retains its original size and alignment assertions.

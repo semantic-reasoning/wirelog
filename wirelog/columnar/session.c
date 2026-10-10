@@ -5277,12 +5277,64 @@ wl_columnar_session_serial_equal(const char *left, const char *right,
 }
 
 static int
+wl_columnar_session_serial_prior_occurrence(wl_col_session_t *sess,
+    uint32_t stratum, uint32_t relation, bool *prior)
+{
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    const char *name = sess->plan->strata[stratum].relations[relation].name;
+    *prior = false;
+    for (uint32_t si = 0; si <= stratum; si++) {
+        uint32_t end = si ==
+            stratum ? relation : sess->plan->strata[si].relation_count;
+        for (uint32_t ri = 0; ri < end; ri++) {
+            int rc = wl_evaluation_control_charge(control, 16);
+            if (rc) return rc;
+            bool equal;
+            rc = wl_columnar_session_serial_equal(name,
+                    sess->plan->strata[si].relations[ri].name, &equal, NULL,
+                    control, NULL);
+            if (rc) return rc;
+            if (equal) {
+                *prior = true; return 0;
+            }
+        }
+        int rc = wl_evaluation_control_charge(control, 8);
+        if (rc) return rc;
+    }
+    return wl_evaluation_control_charge(control, 0);
+}
+
+static int
+wl_columnar_session_serial_reset_target(wl_col_session_t *sess,
+    uint32_t si, uint32_t ri, col_rel_t **target)
+{
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    const char *name = sess->plan->strata[si].relations[ri].name;
+    *target = NULL;
+    bool prior;
+    int rc = wl_columnar_session_serial_prior_occurrence(sess, si, ri, &prior);
+    if (rc || prior) return rc;
+    for (uint32_t i = 0; i < sess->plan->edb_count; i++) {
+        bool equal;
+        rc = wl_columnar_session_serial_equal(name,
+                sess->plan->edb_relations[i],
+                &equal, NULL, control, NULL);
+        if (rc) return rc;
+        if (equal) return ENOTSUP; /* Host rule-head inputs require seed restore. */
+    }
+    rc = wl_columnar_join_controlled_lookup(sess, name, target, control);
+    return rc ? rc : *target ? 0 : EINVAL;
+}
+
+static int
 wl_columnar_session_serial_preflight(wl_col_session_t *sess)
 {
     wl_evaluation_control_t *control = sess->base.evaluation_control;
     int rc = wl_evaluation_control_charge(control, 128);
     if (rc) return rc;
-    if (!sess->plan || sess->has_evaluated || sess->num_workers > 1
+    if (!sess->plan || (sess->has_evaluated
+        && (!sess->pending_input_change || !sess->pending_full_input_eval
+        || sess->last_removed_relation)) || sess->num_workers > 1
         || sess->delta_cb || sess->delta_observer || sess->delta_seeded
         || sess->retraction_seeded || sess->retraction_right_pass
         || sess->diff_operators_active || sess->tdd_input_run
@@ -5369,6 +5421,24 @@ wl_columnar_session_serial_preflight(wl_col_session_t *sess)
         }
         rc = wl_columnar_session_serial_tail(control, 1, i, NULL);
         if (rc) break;
+    }
+    /* Every distinct reset target is attested under real original writers
+     * before any head is logically reset. Registry scan above proves absence
+     * of actual private seed/delta descriptors, not just route flags. */
+    if (!rc && sess->has_evaluated) {
+        for (uint32_t si = 0; !rc && si < sess->plan->stratum_count; si++) {
+            rc = wl_evaluation_control_charge(control, 8);
+            for (uint32_t ri = 0;
+                !rc && ri < sess->plan->strata[si].relation_count; ri++) {
+                col_rel_t *target = NULL;
+                rc = wl_columnar_session_serial_reset_target(sess, si, ri,
+                        &target);
+                if (!rc && target) rc = wl_columnar_relation_reset_controlled(
+                        wl_columnar_eval_stack_cleanup_bulk_append(
+                            preflight_frame),
+                        target, false, control);
+            }
+        }
     }
     if (preflight_frame) {
         if (!rc) sess->serial_completion.frame = preflight_frame;
@@ -5590,9 +5660,70 @@ wl_columnar_session_serial_attempt(wl_col_session_t *sess, bool snapshot,
         state->plan = sess->plan;
         state->snapshot = snapshot;
         state->pending = true;
-        state->phase = 1;
+        state->phase = sess->has_evaluated ? 6 : 1;
     }
     state->active = true;
+    if (state->phase == 6) {
+        while (state->reset_stratum < sess->plan->stratum_count) {
+            const wl_plan_stratum_t *sp =
+                &sess->plan->strata[state->reset_stratum];
+            while (state->reset_relation < sp->relation_count) {
+                col_rel_t *target = NULL;
+                rc = wl_columnar_session_serial_reset_target(sess,
+                        state->reset_stratum, state->reset_relation, &target);
+                if (rc) goto done;
+                if (!target) {
+                    state->reset_relation++; continue;
+                }
+                wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+                rc = wl_columnar_eval_stack_cleanup_resume(sess, &frame,
+                        control);
+                if (rc) goto done;
+                wl_columnar_relation_bulk_append_t *record =
+                    wl_columnar_eval_stack_cleanup_bulk_append(frame);
+                rc = wl_columnar_relation_reset_controlled(record, target, true,
+                        control);
+                if (record->published || !rc) state->reset_relation++;
+                int cleanup = wl_columnar_eval_stack_cleanup_finish(&frame);
+                if (cleanup) rc = cleanup;
+                if (rc) goto done;
+                rc = wl_columnar_session_serial_tail(control, 8,
+                        state->reset_relation, NULL);
+                if (rc) goto done;
+            }
+            rc = wl_evaluation_control_charge(control, 8);
+            if (rc) goto done;
+            state->reset_stratum++;
+            state->reset_relation = 0;
+            rc = wl_columnar_session_serial_tail(control, 8, 0, NULL);
+            if (rc) goto done;
+        }
+        state->phase = 7;
+    }
+    if (state->phase == 7) {
+        while (state->frontier_stratum < sess->plan->stratum_count
+            && state->frontier_stratum < MAX_STRATA) {
+            rc = wl_evaluation_control_charge(control, 16);
+            if (rc) goto done;
+            sess->frontier_ops->reset_stratum_frontier(sess,
+                state->frontier_stratum, sess->outer_epoch);
+            state->frontier_stratum++;
+            rc = wl_columnar_session_serial_tail(control, 9,
+                    state->frontier_stratum, NULL);
+            if (rc) goto done;
+        }
+        while (state->frontier_rule < MAX_RULES) {
+            rc = wl_evaluation_control_charge(control, 16);
+            if (rc) goto done;
+            sess->frontier_ops->reset_rule_frontier(sess,
+                state->frontier_rule, sess->outer_epoch);
+            state->frontier_rule++;
+            rc = wl_columnar_session_serial_tail(control, 10,
+                    state->frontier_rule, NULL);
+            if (rc) goto done;
+        }
+        state->phase = 1;
+    }
     if (state->phase == 1) {
         while (state->stratum < sess->plan->stratum_count) {
             rc = col_eval_stratum(&sess->plan->strata[state->stratum], sess,
@@ -5709,7 +5840,8 @@ col_session_step_impl(wl_session_t *session)
 {
     wl_col_session_t *sess = COL_SESSION(session);
     if (sess->base.evaluation_control
-        && (sess->serial_completion.pending || !sess->has_evaluated))
+        && (sess->serial_completion.pending || !sess->has_evaluated
+        || (sess->pending_input_change && sess->pending_full_input_eval)))
         return wl_columnar_session_serial_attempt(sess, false, NULL, NULL);
     wl_columnar_session_budget_denial_clear(sess);
     if (sess->plain_step_completion_pending
@@ -6396,7 +6528,8 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
 
     wl_col_session_t *sess = COL_SESSION(session);
     if (sess->base.evaluation_control
-        && (sess->serial_completion.pending || !sess->has_evaluated))
+        && (sess->serial_completion.pending || !sess->has_evaluated
+        || (sess->pending_input_change && sess->pending_full_input_eval)))
         return wl_columnar_session_serial_attempt(sess, true, callback,
                    user_data);
     wl_columnar_session_budget_denial_clear(sess);

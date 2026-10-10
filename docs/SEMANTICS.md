@@ -893,18 +893,18 @@ call.
 | field | written by | read by | verdict |
 |---|---|---|---|
 | `last_inserted_relation` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create`, `session_note_inserted_input`, `wl_columnar_session_serial_attempt` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `session_snapshot_insert` | PRESERVE |
-| `pending_input_change` | `col_session_create_internal`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_serial_attempt` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
-| `pending_full_input_eval` | `col_session_insert`, `col_session_remove`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_serial_attempt` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
-| `has_evaluated` | `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_attempt` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_preflight` | PRESERVE |
+| `pending_input_change` | `col_session_create_internal`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_serial_attempt` | `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_preflight` | PRESERVE |
+| `pending_full_input_eval` | `col_session_insert`, `col_session_remove`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_serial_attempt` | `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_preflight` | PRESERVE |
+| `has_evaluated` | `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_attempt` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_attempt`, `wl_columnar_session_serial_preflight` | PRESERVE |
 | `snapshot_stable_valid` | `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_serial_attempt` | `col_session_snapshot_impl` | PRESERVE |
 | `delta_seeded` | `insert_clone_prepare`, `tdd_worker_subpass_fn` | `col_eval_relation_plan`, `col_op_variable`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_filter_op_controlled`, `wl_columnar_join_op_controlled`, `wl_columnar_join_select_right`, `wl_columnar_merge_consolidate_controlled`, `wl_columnar_ops_map_controlled`, `wl_columnar_ops_reduce_controlled`, `wl_columnar_session_serial_preflight` | PRESERVE |
-| `last_removed_relation` | `col_session_remove_incremental`, `col_worker_session_create`, `session_retraction_cleanup` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
+| `last_removed_relation` | `col_session_remove_incremental`, `col_worker_session_create`, `session_retraction_cleanup` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_preflight` | PRESERVE |
 | `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup` | `col_eval_relation_plan`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_filter_op_controlled`, `wl_columnar_join_op_controlled`, `wl_columnar_join_select_right`, `wl_columnar_merge_consolidate_controlled`, `wl_columnar_ops_map_controlled`, `wl_columnar_ops_reduce_controlled`, `wl_columnar_session_serial_preflight` | PRESERVE |
 | `plain_step_completion_pending` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create` | `col_session_insert`, `col_session_insert_incremental`, `col_session_make_compound`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion`, `wl_columnar_session_serial_preflight` | PRESERVE -- with `plain_step_completion_phase` this is the resume token |
 | `plain_step_completion_phase` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE |
 | `plain_step_completion_step_context` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl` | PRESERVE |
 | `plain_step_completion_active` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_snapshot_impl`, `col_session_step_impl` | **COMMIT** on the step path -- a re-entrancy latch, not progress. While it stays set beside `plain_step_completion_pending`, the entry guard of both `col_session_step_impl` and `col_session_snapshot_impl` returns `EBUSY` above every line that would clear it. The snapshot path never writes it, so the snapshot cutoff has nothing to perform here. |
-| `col_rel_t::base_nrows` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_reset_rows_locked`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `tdd_empty_relation_candidate`, `tdd_seed_bdx_coordinator_idb`, `wl_columnar_eval_serial_canonicalize_aggregate_locked`, `wl_columnar_relation_compact_controlled`, `wl_columnar_relation_new_private_controlled`, `wl_columnar_session_serial_attempt`, `wl_retraction_restore` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_mutable_image_validate`, `col_session_remove`, `col_session_remove_incremental`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `session_seed_shadow_plan_remove`, `session_snapshot_insert`, `wl_columnar_eval_delta_observer_begin`, `wl_columnar_relation_compact_controlled`, `wl_columnar_relation_new_private_controlled`, `wl_retraction_stage_prepare` | PRESERVE -- the insert route (`session_snapshot_insert`) takes rows `[base_nrows, nrows)` of the inserted relation as the rows an incremental insert appended, so committing the bookkeeping's `base_nrows = nrows` on a stopped attempt would make the retry find no inserted rows and leave the heads without them. That is the whole verified consequence; see the note below before adding another |
+| `col_rel_t::base_nrows` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_reset_rows_locked`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `tdd_empty_relation_candidate`, `tdd_seed_bdx_coordinator_idb`, `wl_columnar_eval_serial_canonicalize_aggregate_locked`, `wl_columnar_relation_compact_controlled`, `wl_columnar_relation_new_private_controlled`, `wl_columnar_relation_reset_controlled`, `wl_columnar_session_serial_attempt`, `wl_retraction_restore` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_mutable_image_validate`, `col_session_remove`, `col_session_remove_incremental`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `session_seed_shadow_plan_remove`, `session_snapshot_insert`, `wl_columnar_eval_delta_observer_begin`, `wl_columnar_relation_compact_controlled`, `wl_columnar_relation_new_private_controlled`, `wl_columnar_relation_reset_controlled`, `wl_retraction_stage_prepare` | PRESERVE -- the insert route (`session_snapshot_insert`) takes rows `[base_nrows, nrows)` of the inserted relation as the rows an incremental insert appended, so committing the bookkeeping's `base_nrows = nrows` on a stopped attempt would make the retry find no inserted rows and leave the heads without them. That is the whole verified consequence; see the note below before adding another |
 
 Two non-field actions sit in the same region and need their own verdicts.
 `col_session_reclaim_quiescent` is **COMMIT**: the step cutoff's unwind calls
@@ -950,9 +950,9 @@ names the one consequence that was read out of the observer's own condition,
 and a new claim about this field belongs in a test before it belongs here.
 
 
-### Controlled initial serial attempts
+### Controlled serial full-input attempts
 
-`wl_columnar_session_serial_attempt` handles initial W1 nonrecursive backend
+`wl_columnar_session_serial_attempt` handles initial and dirty full-input W1 nonrecursive backend
 STEP and SNAPSHOT for the admitted VARIABLE/MAP/CONSOLIDATE pipeline.
 Generated plans keep their actual stratum flags and default managed arena and
 pool objects. Controlled operators allocate governed heap images. This lane
@@ -974,6 +974,25 @@ disposition comes from the actual governor verdict and never changes an unrelate
 fatal budget-denial latch. Work stops, overflow, invalid authority and refused
 mandatory cleanup still fail the attempt; an admitted growth transaction remains
 owned by its original frame record until physical and credit retirement succeed.
+
+After a successful first evaluation, a normal nonincremental EDB insertion
+selects this same lane before raw IDB clear or frontier preparation. Preflight
+checks every distinct reset target under its original descriptor and storage
+writers before changing any head. Seed shadows, timestamps, dedup state and
+unsupported representations refuse this selected entry before reset. Each
+admitted flat head keeps its columns, merge buffers, scratch, metadata, credits
+and physical ledger footprint. Only fixed row/run counters and replacement
+generations change. The explicit RESET disposition prevents generic append
+cleanup from treating that logical publication as growth or credit downsizing.
+
+The consumed reset occurrence advances before checked writer retirement. A
+refused retirement keeps the original frame and authority; retry finishes
+cleanup without touching that head's generation twice. Bounded prior-occurrence
+comparisons reset repeated head names once. After all heads reset, scalar
+stratum and rule frontier cursors advance before their tails, then the existing
+rule/stratum continuation rederives outputs. Input markers and origin stay
+pending until final completion. This lane does not qualify stable output-only,
+incremental, seed restoration or recursive evaluation.
 
 SNAPSHOT pins every selected distinct head, including empty heads. The current
 cohort limit is 64 distinct heads; 65 is rejected before canonical mutation.

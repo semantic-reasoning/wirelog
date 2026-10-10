@@ -1983,6 +1983,7 @@ typedef struct wl_columnar_serial_completion {
     wl_columnar_eval_stack_cleanup_frame_t *frame, *mode_frame;
     uint32_t stratum, relation, compact, bookkeeping;
     uint32_t phase, mode;
+    uint32_t reset_stratum, reset_relation, frontier_stratum, frontier_rule;
     uint64_t stored_bytes;
     bool pending, active, snapshot, payload_ready;
 } wl_columnar_serial_completion_t;
@@ -3637,6 +3638,7 @@ typedef struct {
     uint64_t prior_identity, prior_generation;
     bool journal;
     bool compact;
+    bool reset;
     wl_columnar_relation_payload_transaction_t pending;
     wl_columnar_memory_reservation_t metadata_pending, old_metadata;
     wl_columnar_memory_reservation_t previous, scratch;
@@ -3702,6 +3704,9 @@ int wl_columnar_relation_bulk_append_retire(
     wl_columnar_relation_bulk_append_t *, int);
 int wl_columnar_relation_compact_controlled(
     wl_columnar_relation_bulk_append_t *, col_rel_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_relation_reset_controlled(
+    wl_columnar_relation_bulk_append_t *, col_rel_t *, bool,
     wl_evaluation_control_t *);
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_relation_test_bulk_checkpoint)(

@@ -15990,6 +15990,238 @@ test_serial_compact_and_registry_hole(void)
         "serial attempt: real compact empty/zeroarity/tight/shrink/wide300 twins and registry-hole replacement passed");
 }
 
+static wl_columnar_source_access_writer_t *serial_reset_fault_writer;
+static uintptr_t serial_reset_fault_identity;
+static unsigned serial_reset_mode, serial_reset_seen[2];
+static col_rel_t *serial_reset_heads[2];
+static int64_t **serial_reset_columns[2];
+static uint64_t serial_reset_credit[2], serial_reset_storage[2];
+static void
+serial_reset_checkpoint(wl_evaluation_control_t *control, int phase,
+    wl_columnar_relation_bulk_append_t *record)
+{
+    if (!record->reset || (phase != 8 && phase != 9)) return;
+    unsigned slot = record->dst == serial_reset_heads[0] ? 0 : 1;
+    CHECK(record->dst == serial_reset_heads[slot]);
+    if (phase == 8 && ((serial_reset_mode == 1 && !slot)
+        || (serial_reset_mode == 7 && slot)))
+        wl_evaluation_control_request_cancel(control);
+    if (phase != 9) return;
+    col_rel_t *head = record->dst;
+    CHECK(record->published && record->active && !record->growth
+        && !record->transaction_active && head->nrows == 0 &&
+        head->base_nrows == 0
+        && head->columns == serial_reset_columns[slot]
+        && head->retained_reserved_bytes == serial_reset_credit[slot]
+        && head->storage_generation == serial_reset_storage[slot] + 1u);
+    serial_reset_seen[slot]++;
+    if (serial_reset_mode == 2 && !slot) {
+        serial_reset_fault_writer = &record->writer;
+        serial_reset_fault_identity = record->writer.identity;
+        CHECK(serial_reset_fault_identity ==
+            (uintptr_t)serial_reset_fault_writer);
+        record->writer.identity = 0; /* Labeled original-writer validation refusal. */
+    }
+}
+static void
+serial_repeat_after_plan(wl_col_session_t *sess, eval_stack_t *stack,
+    eval_entry_t *entry)
+{
+    (void)stack; CHECK(entry->rel);
+    if (++serial_plan_visits == 2) {
+        CHECK(session_find_rel(sess, "H0")->nrows == 6);
+        wl_evaluation_control_request_cancel(sess->base.evaluation_control);
+    }
+}
+static uint64_t
+serial_repeat_trial(uint32_t width, bool snapshot, uint64_t limit,
+    unsigned mode, bool supplied)
+{
+    wirelog_program_t *program = NULL;
+    wl_plan_t *generated = serial_generated(width, 2, !supplied, &program);
+    wl_plan_relation_t rules[3]; uint32_t count = 0;
+    for (uint32_t si = 0; si < generated->stratum_count; si++)
+        for (uint32_t ri = 0; ri < generated->strata[si].relation_count; ri++)
+            rules[count++] = generated->strata[si].relations[ri];
+    CHECK(count == 2);
+    if (strcmp(rules[0].name, "H0")) {
+        wl_plan_relation_t swap = rules[0]; rules[0] = rules[1];
+        rules[1] = swap;
+    }
+    rules[2] = rules[0];
+    const wl_plan_stratum_t stratum = {.is_recursive = false,
+                                       .is_monotone = true,
+                                       .relations = rules, .relation_count = 3};
+    wl_plan_t legacy = *generated; legacy.strata = &stratum;
+    legacy.stratum_count = 1;
+    const wl_plan_t *plan = supplied ? &legacy : generated;
+    wl_col_session_t *sess = serial_create(plan, width, 3, 0),
+        *raw = serial_create(plan, width, 3, 0);
+    wl_evaluation_control_t *control = serial_attach(sess, 0);
+    serial_capture_t initial = {.rows = 3, .width = width},
+            initial_raw = initial;
+    CHECK(wl_backend_columnar()->session_snapshot(&sess->base, serial_capture,
+        &initial) == 0);
+    CHECK(wl_backend_columnar()->session_snapshot(&raw->base, serial_capture,
+        &initial_raw) == 0);
+    CHECK(initial.count == initial_raw.count &&
+        initial.digest == initial_raw.digest);
+    int64_t *data = malloc((size_t)width * 3u * sizeof(*data)); CHECK(data);
+    for (uint64_t i = 0; i < (uint64_t)width * 3u;
+        i++) data[i] = (int64_t)width * 3 + i;
+    CHECK(wl_backend_columnar()->session_insert(&sess->base, "S", data, 3,
+        width) == 0);
+    CHECK(wl_backend_columnar()->session_insert(&raw->base, "S", data, 3,
+        width) == 0);
+    free(data);
+    CHECK(sess->has_evaluated && sess->pending_input_change &&
+        sess->pending_full_input_eval
+        && session_find_rel(sess, "S")->nrows == 6);
+    wl_arena_t *arena = sess->eval_arena; delta_pool_t *pool = sess->delta_pool;
+    for (unsigned i = 0; i < 2; i++) {
+        serial_reset_heads[i] = session_find_rel(sess, i ? "H1" : "H0");
+        serial_reset_columns[i] = serial_reset_heads[i]->columns;
+        serial_reset_credit[i] = serial_reset_heads[i]->retained_reserved_bytes;
+        serial_reset_storage[i] = serial_reset_heads[i]->storage_generation;
+        serial_reset_seen[i] = 0;
+    }
+    CHECK(wl_evaluation_control_reset(control) == 0);
+    CHECK(wl_evaluation_control_configure(control, limit) == 0);
+    serial_reset_mode = mode; serial_plan_visits = 0;
+    serial_stop_seen = 0; serial_stop_at = mode == 10 ? 128 : 0;
+    serial_stop_phase = mode == 3 ? 8 : mode == 4 ? 10 : mode == 10 ? 5 : 0;
+    serial_overflow = false;
+    wl_columnar_relation_test_bulk_checkpoint = serial_reset_checkpoint;
+    wl_columnar_session_test_serial_checkpoint = serial_checkpoint;
+    if (mode ==
+        5) wl_columnar_eval_serial_test_after_plan = serial_repeat_after_plan;
+    if (mode == 6) CHECK(col_rel_source_reader_acquire(serial_reset_heads[1],
+            &join_retained_reader) == 0);
+    serial_capture_t got = {.rows = 6, .width = width, .session = sess,
+                            .cancel_first = mode == 11},
+                                reference = {.rows = 6, .width = width};
+    int expected = mode == 2 ? EINVAL : mode == 6 ? EBUSY
+        : mode == 12 ? WL_EVALUATION_CONTROL_WORK_LIMIT
+        : mode && mode != 11 ? WL_EVALUATION_CONTROL_CANCELLED : 0;
+    int result = snapshot ? wl_backend_columnar()->session_snapshot(&sess->base,
+            serial_capture,
+            &got) : wl_backend_columnar()->session_step(&sess->base);
+    CHECK(result == expected);
+    wl_evaluation_control_report_t report;
+    CHECK(wl_evaluation_control_report(control,
+        &report) == 0 && report.result == expected);
+    wl_columnar_session_test_serial_checkpoint = NULL;
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    if (mode == 6) {
+        CHECK(!serial_reset_seen[0] && !serial_reset_seen[1]);
+        CHECK(col_rel_source_reader_release(&join_retained_reader) == 0);
+    }
+    if (expected) {
+        CHECK(!got.count && sess->pending_input_change &&
+            sess->pending_full_input_eval);
+        if (mode == 2) {
+            CHECK(sess->serial_completion.reset_relation == 1 &&
+                sess->cleanup_pending
+                && serial_reset_seen[0] == 1);
+            serial_reset_fault_writer->identity = serial_reset_fault_identity;
+        }
+        serial_reset_mode = 0;
+        CHECK(wl_evaluation_control_reset(control) == 0);
+        CHECK(wl_evaluation_control_configure(control, 0) == 0);
+        CHECK((snapshot ? wl_backend_columnar()->session_snapshot(&sess->base,
+            serial_capture,
+            &got) : wl_backend_columnar()->session_step(&sess->base)) == 0);
+    }
+    wl_columnar_relation_test_bulk_checkpoint = NULL;
+    CHECK(serial_reset_seen[0] == 1 && serial_reset_seen[1] == 1);
+    CHECK((snapshot ? wl_backend_columnar()->session_snapshot(&raw->base,
+        serial_capture,
+        &reference) : wl_backend_columnar()->session_step(&raw->base)) == 0);
+    CHECK(got.count == reference.count && got.digest == reference.digest);
+    for (unsigned i = 0; i < 2; i++) {
+        col_rel_t *head = session_find_rel(sess, i ? "H1" : "H0"),
+            *twin = session_find_rel(raw, i ? "H1" : "H0");
+        CHECK(head->nrows == twin->nrows &&
+            head->nrows == (supplied && !i ? 12u : 6u));
+        payload_equal(head, twin, 0);
+    }
+    CHECK(sess->eval_arena == arena && sess->delta_pool == pool
+        && !sess->serial_completion.pending && !sess->serial_completion.frame
+        && !sess->pending_input_change && !sess->pending_full_input_eval
+        && !sess->cleanup_pending && !sess->cleanup_reserved_bytes);
+    if (mode == 11) {
+        got.count = 0;
+        CHECK(wl_backend_columnar()->session_snapshot(&sess->base,
+            serial_capture,
+            &got) == WL_EVALUATION_CONTROL_CANCELLED && !got.count);
+    }
+    serial_destroy(sess); serial_destroy(raw); wl_plan_free(generated);
+    wirelog_program_free(program);
+    return report.consumed;
+}
+static void
+serial_repeat_unsupported(unsigned mode)
+{
+    wirelog_program_t *program = NULL;
+    wl_plan_t *plan = serial_generated(2, 2, true, &program);
+    wl_col_session_t *sess = serial_create(plan, 2, 3, 0);
+    wl_evaluation_control_t *control = serial_attach(sess, 0);
+    serial_capture_t capture = {.rows = 3, .width = 2};
+    CHECK(wl_backend_columnar()->session_snapshot(&sess->base,
+        serial_capture, &capture) == 0);
+    const int64_t rows[] = {6, 7, 8, 9, 10, 11};
+    CHECK(wl_backend_columnar()->session_insert(&sess->base, "S", rows, 3,
+        2) == 0);
+    col_rel_t *first = session_find_rel(sess, "H0"),
+        *later = session_find_rel(sess, "H1");
+    if (mode == 0) {
+        /* Genuine host insertion into IDB creates the seed shadow. */
+        CHECK(wl_backend_columnar()->session_insert(&sess->base, "H1", rows, 1,
+            2) == 0);
+    } else if (mode == 1) {
+        CHECK(col_rel_enable_timestamps(later) == 0);
+    } else {
+        wl_columnar_eval_dedup_set_insert(later, UINT64_C(123));
+        CHECK(later->dedup_slots && later->dedup_reserved_bytes);
+    }
+    uint32_t first_rows = first->nrows, later_rows = later->nrows;
+    uint64_t first_generation = first->storage_generation,
+        later_generation = later->storage_generation;
+    int64_t **first_columns = first->columns, **later_columns = later->columns;
+    uint64_t first_credit = first->retained_reserved_bytes,
+        later_credit = later->retained_reserved_bytes;
+    CHECK(wl_evaluation_control_reset(control) == 0);
+    capture.count = 0;
+    CHECK(wl_backend_columnar()->session_snapshot(&sess->base,
+        serial_capture, &capture) == ENOTSUP);
+    CHECK(!capture.count && first->nrows == first_rows &&
+        later->nrows == later_rows
+        && first->storage_generation == first_generation
+        && later->storage_generation == later_generation
+        && first->columns == first_columns && later->columns == later_columns
+        && first->retained_reserved_bytes == first_credit
+        && later->retained_reserved_bytes == later_credit
+        && sess->pending_input_change && sess->pending_full_input_eval
+        && !sess->serial_completion.pending && !sess->cleanup_pending);
+    serial_destroy(sess); wl_plan_free(plan); wirelog_program_free(program);
+}
+static void
+test_serial_repeat_attempts(void)
+{
+    serial_repeat_trial(2, false, 0, 0, false);
+    uint64_t cost = serial_repeat_trial(2, true, 0, 0, false);
+    CHECK(serial_repeat_trial(2, true, cost, 0, false) == cost);
+    serial_repeat_trial(2, true, cost - 1, 12, false);
+    for (unsigned mode = 1; mode <= 7;
+        mode++) serial_repeat_trial(2, true, 0, mode, false);
+    serial_repeat_trial(2, true, 0, 5, true);
+    serial_repeat_trial(300, true, 0, 10, false);
+    serial_repeat_trial(300, true, 0, 11, false);
+    for (unsigned mode = 0; mode < 3; mode++) serial_repeat_unsupported(mode);
+    puts(
+        "serial repeat: genuine second full EDB insertion STEP/SNAPSHOT, original reset/credit/writer cleanup, frontier/later-head stops and width300 output passed");
+}
+
 int
 main(void)
 {
@@ -16209,6 +16441,7 @@ main(void)
     test_serial_occurrences_and_cohort();
     test_serial_output_budget();
     test_serial_optional_compaction_denial();
+    test_serial_repeat_attempts();
     test_serial_output_ownership();
     test_serial_compact_and_registry_hole();
     puts("evaluation_work: OK");
