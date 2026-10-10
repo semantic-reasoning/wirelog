@@ -308,6 +308,8 @@ wl_columnar_eval_stack_cleanup_mode(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
 {
     wl_columnar_serial_completion_t *state = &frame->session->serial_completion;
+    if (state->mode == WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT)
+        return WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT;
     return state->mode_frame == frame ? state->mode
         : WL_COLUMNAR_SERIAL_FRAME_EVALUATION;
 }
@@ -328,6 +330,8 @@ wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
     uint64_t bytes;
     wl_evaluation_control_t *control =
         sess ? sess->base.evaluation_control : NULL;
+    if (sess && sess->serial_completion.mode ==
+        WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT) return EBUSY;
     int admission = control ? wl_evaluation_control_charge(control, 32) : 0;
     if (admission) return admission;
     if (!sess || !out || *out)
@@ -639,6 +643,7 @@ wl_columnar_eval_stack_workspace_clear(
     int rc = wl_columnar_eval_stack_workspace_retire(frame);
     if (rc) return rc;
     wl_columnar_serial_completion_t *state = &frame->session->serial_completion;
+    if (state->mode == WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT) return EBUSY;
     if (state->mode_frame && state->mode_frame != frame) return EBUSY;
     state->mode_frame = frame;
     state->mode = WL_COLUMNAR_SERIAL_FRAME_WORKSPACE_INITIALIZING;
@@ -756,22 +761,11 @@ wl_columnar_eval_stack_cleanup_dispose(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
 {
     uint32_t mode = wl_columnar_eval_stack_cleanup_mode(frame);
+    if (mode == WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT) return EBUSY;
     if (mode == WL_COLUMNAR_SERIAL_FRAME_OUTPUT) {
         if (!frame->session->serial_completion.payload_ready) return 0;
-        int rc = 0;
-        for (uint32_t i = 0; i < frame->output.initialized; i++) {
-            wl_columnar_source_access_reader_t *reader =
-                &frame->output.slots[i].reader;
-            int release = 0;
-            if (reader->owner) release = col_rel_source_reader_release(reader);
-            else if (reader->secondary_owner) {
-                release = wl_columnar_source_access_gate_reader_release(
-                    reader->secondary_owner);
-                if (!release) reader->secondary_owner = NULL;
-            }
-            if (!rc) rc = release;
-        }
-        return rc;
+        return wl_columnar_session_serial_output_drain(frame->session,
+                   &frame->output.journal);
     }
     if (mode == WL_COLUMNAR_SERIAL_FRAME_REGISTRY) {
         int rc = frame->session->serial_completion.payload_ready
@@ -811,6 +805,8 @@ wl_columnar_eval_stack_cleanup_free(
 {
     /* Retaining the already retired last frame creates no second overlap.
      * Its actual physical admission remains charged until final retirement. */
+    if (frame->session->serial_completion.mode ==
+        WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT) return EBUSY;
     if (frame->session->serial_completion.frame == frame) return 0;
     if (frame->session->serial_completion.mode_frame == frame) {
         frame->session->serial_completion.mode_frame = NULL;
@@ -908,6 +904,7 @@ wl_columnar_eval_stack_cleanup_clear_payload(
     uint32_t mode, wl_evaluation_control_t *control)
 {
     wl_columnar_serial_completion_t *state = &frame->session->serial_completion;
+    if (state->mode == WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT) return EBUSY;
     state->mode_frame = frame;
     state->mode = mode;
     state->payload_ready = false;
@@ -965,10 +962,29 @@ wl_columnar_eval_stack_cleanup_output(
     return rc;
 }
 
+bool
+wl_columnar_eval_stack_output_journal_owned(wl_col_session_t *sess,
+    const wl_columnar_serial_completion_t *journal)
+{
+    if (!sess || !journal) return false;
+    wl_columnar_serial_completion_t *state = &sess->serial_completion;
+    if (state->mode == WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT)
+        return journal == state;
+    if (state->mode != WL_COLUMNAR_SERIAL_FRAME_OUTPUT
+        || !state->payload_ready || !state->frame
+        || state->mode_frame != state->frame) return false;
+    return state->frame->session == sess
+           && journal == &state->frame->output.journal;
+}
+
 int
 wl_columnar_eval_stack_cleanup_retained(wl_col_session_t *sess)
 {
-    if (!sess || !sess->serial_completion.frame) return 0;
+    if (!sess) return 0;
+    if (sess->serial_completion.mode == WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT)
+        return wl_columnar_session_serial_output_drain(sess,
+                   &sess->serial_completion);
+    if (!sess->serial_completion.frame) return 0;
     wl_columnar_eval_stack_cleanup_frame_t *frame =
         sess->serial_completion.frame;
     if (sess->cleanup_active || sess->cleanup_pending) return EBUSY;
@@ -983,6 +999,10 @@ wl_columnar_eval_stack_cleanup_retained(wl_col_session_t *sess)
 int
 wl_columnar_eval_stack_cleanup_retained_drain(wl_col_session_t *sess)
 {
+    if (sess && sess->serial_completion.mode ==
+        WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT)
+        return wl_columnar_session_serial_output_drain(sess,
+                   &sess->serial_completion);
     return sess && sess->serial_completion.frame
         ? wl_columnar_eval_stack_cleanup_dispose(sess->serial_completion.frame)
         : 0;
@@ -993,7 +1013,8 @@ wl_columnar_eval_stack_cleanup_resume(wl_col_session_t *sess,
     wl_columnar_eval_stack_cleanup_frame_t **out,
     wl_evaluation_control_t *control)
 {
-    if (!sess || !out || !control || sess->cleanup_active
+    if (!sess || !out || !control || sess->serial_completion.mode ==
+        WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT || sess->cleanup_active
         || sess->cleanup_pending ||
         !sess->serial_completion.frame) return EBUSY;
     wl_columnar_eval_stack_cleanup_frame_t *frame =

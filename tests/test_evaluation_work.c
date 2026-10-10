@@ -15187,10 +15187,10 @@ serial_checkpoint(wl_evaluation_control_t *c, unsigned phase, uint64_t progress,
     wl_evaluation_control_report_t report;
     if (output && phase == 5) {
         CHECK(progress > 0 && progress <= 300);
-        col_rel_t *first = output->slots[output->first_slot].relation;
+        col_rel_t *first = output->journal.output_partial;
         CHECK(first->row_scratch[progress - 1] ==
             first->columns[progress - 1][0]);
-        CHECK(first->ncols == 300 && output->rows > 0);
+        CHECK(first->ncols == 300 && output->journal.output_rows > 0);
     }
     /* Record actual admitted work at the reached checkpoint; active reports
      * are not available, so exact-limit cases derive from healthy runs. */
@@ -15569,6 +15569,433 @@ serial_occurrence_capture(const char *name, const int64_t *row, uint32_t width,
     CHECK(name == capture->rules[occurrence].name);
     serial_capture(name, row, width, &capture->capture);
 }
+static unsigned serial_output_mode, serial_output_seen,
+    serial_output_admissions;
+static wl_columnar_serial_completion_t *serial_output_fault_journal;
+static uintptr_t serial_output_fault_identity;
+static void
+serial_output_journal_checkpoint(wl_evaluation_control_t *c, unsigned phase,
+    uint64_t progress, wl_columnar_serial_output_t *output)
+{
+    wl_columnar_serial_completion_t *j = output ? &output->journal
+        : serial_session->serial_completion.mode ==
+        WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT ?
+        &serial_session->serial_completion : NULL;
+    if (!j || serial_output_seen) return;
+    if (serial_output_mode == 3u && phase == 5u && progress == 256u) {
+        col_rel_t *head = j->output_partial;
+        CHECK(head && head->ncols == 300u && head->nrows == 3u
+            && head->row_scratch[255] == head->columns[255][0]);
+        serial_output_seen++;
+        wl_evaluation_control_request_cancel(c);
+    } else if (serial_output_mode >= 6u && serial_output_mode <= 8u
+        && phase == 7u) {
+        CHECK(j->output_identity == (uintptr_t)j && j->pending
+            && j->output_acquire_stratum == serial_session->plan->stratum_count
+            && !j->output_acquire_relation && !j->output_partial);
+        for (unsigned h = 0; h < 2u; h++) {
+            col_rel_t *head = session_find_rel(serial_session, h ? "H1" : "H0");
+            CHECK(atomic_load(&head->descriptor_access.state) == 1u
+                && atomic_load(&head->source_access.state) == 1u);
+        }
+        serial_output_fault_journal = j;
+        serial_output_fault_identity = j->output_identity;
+        j->output_identity = 0; /* Deliberate original journal validation fault. */
+        serial_output_seen++;
+        if (serial_output_mode == 7u) wl_evaluation_control_request_cancel(c);
+        if (serial_output_mode == 8u)
+            CHECK(wl_evaluation_control_charge(c, UINT64_MAX) == EOVERFLOW);
+    } else if (serial_output_mode == 9u && phase == 4u
+        && j->output_acquire_stratum >= 64u) {
+        col_rel_t *first = session_find_rel(serial_session, "H0");
+        CHECK(j->pending && j->output_identity == (uintptr_t)j
+            && atomic_load(&first->descriptor_access.state) == 1u
+            && atomic_load(&first->source_access.state) == 1u);
+        serial_output_seen++;
+        wl_evaluation_control_request_cancel(c);
+    }
+}
+static void
+serial_output_journal_after_cas(wl_evaluation_control_t *c,
+    wl_columnar_source_access_gate_t *gate, bool acquired)
+{
+    (void)c;
+    col_rel_t *head = session_find_rel(serial_session, "H1");
+    if (!acquired || serial_output_seen ||
+        gate != &head->descriptor_access) return;
+    wl_columnar_serial_completion_t *j = &serial_session->serial_completion;
+    col_rel_t *first = session_find_rel(serial_session, "H0");
+    CHECK(j->mode == WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT
+        && j->output_partial == head
+        && (j->phase & WL_COLUMNAR_SERIAL_OUTPUT_DESCRIPTOR)
+        && !(j->phase & WL_COLUMNAR_SERIAL_OUTPUT_SOURCE)
+        && atomic_load(&head->descriptor_access.state) == 2u
+        && atomic_load(&head->source_access.state) ==
+        WL_COLUMNAR_SOURCE_ACCESS_WRITER
+        && atomic_load(&first->descriptor_access.state) == 1u
+        && atomic_load(&first->source_access.state) == 1u);
+    serial_output_seen++;
+}
+static void
+serial_output_journal_admission(wl_evaluation_control_t *c,
+    wl_columnar_memory_governor_t *g, bool growth, bool acquired)
+{
+    if (g != serial_peak_governor) return;
+    serial_output_admissions++;
+    serial_peak(c, g, growth, acquired);
+}
+static void
+serial_output_journal_capture(const char *name, const int64_t *row,
+    uint32_t width, void *data)
+{
+    serial_capture_t *capture = data;
+    if (!capture->count) {
+        CHECK(serial_session->serial_completion.mode ==
+            WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT
+            && serial_session->serial_completion.pending
+            && serial_session->serial_completion.active);
+        CHECK(wl_backend_columnar()->session_step(&serial_session->base) ==
+            EBUSY);
+        CHECK(wl_backend_columnar()->session_snapshot(&serial_session->base,
+            serial_capture, capture) == EBUSY);
+        CHECK(wl_backend_columnar()->session_insert(&serial_session->base,
+            "S", row, 1, width) == EBUSY);
+    }
+    serial_capture(name, row, width, data);
+}
+static const char *serial_output_legacy_names[4];
+static unsigned serial_output_replay_phase, serial_output_replay_seen;
+static void
+serial_output_replay_checkpoint(wl_evaluation_control_t *c, unsigned phase,
+    uint64_t progress, wl_columnar_serial_output_t *output)
+{
+    (void)output;
+    if (phase != serial_output_replay_phase || progress != 258u) return;
+    wl_columnar_serial_completion_t *j = &serial_session->serial_completion;
+    CHECK(j->pending && j->output_acquire_stratum
+        == serial_session->plan->stratum_count && !j->output_partial
+        && !(j->phase & WL_COLUMNAR_SERIAL_OUTPUT_FIRST_GATHERED));
+    if (phase == 8u) {
+        col_rel_t *a = session_find_rel(serial_session,
+                serial_output_legacy_names[0]),
+            *b = session_find_rel(serial_session,
+                serial_output_legacy_names[1]);
+        CHECK(a && b && atomic_load(&a->descriptor_access.state) == 2u
+            && atomic_load(&a->source_access.state) == 2u
+            && atomic_load(&b->descriptor_access.state) == 1u
+            && atomic_load(&b->source_access.state) == 1u);
+    } else CHECK(!serial_session->nrels && !j->output_rows);
+    serial_output_replay_seen++;
+    wl_evaluation_control_request_cancel(c);
+}
+static void
+serial_output_legacy_checkpoint(wl_evaluation_control_t *c, unsigned phase,
+    uint64_t progress, wl_columnar_serial_output_t *output)
+{
+    (void)c; (void)progress; (void)output;
+    if (phase != 7u) return;
+    wl_columnar_serial_completion_t *j = &serial_session->serial_completion;
+    col_rel_t *a = session_find_rel(serial_session,
+            serial_output_legacy_names[0]),
+        *b = session_find_rel(serial_session, serial_output_legacy_names[1]);
+    CHECK(j->mode == WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT && j->pending
+        && j->output_identity == (uintptr_t)j && j->output_acquire_stratum
+        == serial_session->plan->stratum_count
+        && !j->output_acquire_relation && !j->output_partial);
+    CHECK(a && b && a->nrows == 6u && !b->nrows
+        && !session_find_rel(serial_session, serial_output_legacy_names[3]));
+    CHECK(atomic_load(&a->descriptor_access.state) == 2u
+        && atomic_load(&a->source_access.state) == 2u
+        && atomic_load(&b->descriptor_access.state) == 1u
+        && atomic_load(&b->source_access.state) == 1u);
+    serial_output_seen++;
+}
+static void
+test_serial_output_legacy_journal(void)
+{
+    wirelog_program_t *program = NULL;
+    wl_plan_t *generated = serial_generated(2, 2, false, &program);
+    const wl_plan_relation_t *prototype = &generated->strata[0].relations[0];
+    CHECK(prototype->op_count == 3u);
+    wl_plan_relation_t rules[4]; wl_plan_op_t empty_ops[3];
+    memcpy(empty_ops, prototype->ops, sizeof(empty_ops));
+    empty_ops[0].delta_mode = WL_DELTA_FORCE_EMPTY;
+    char *names[4];
+    for (unsigned i = 0; i < 4u; i++) {
+        names[i] = malloc(701u); CHECK(names[i]);
+        memset(names[i], 'a', 700u); names[i][700] = 0;
+        names[i][699] = i == 1u ? 'B' : i == 3u ? 'M' : 'A';
+        serial_output_legacy_names[i] = names[i];
+        rules[i] = *prototype; rules[i].name = names[i];
+        rules[i].delta_name = NULL;
+    }
+    rules[1].ops = empty_ops;
+    rules[3].ops = NULL; rules[3].op_count = 0;
+    const wl_plan_stratum_t stratum = {.stratum_id = 300, .is_recursive = false,
+                                       .is_monotone = true, .relations = rules,
+                                       .relation_count = 4};
+    wl_plan_stratum_t strata[301] = {0};
+    for (unsigned i = 0; i < 300u; i++) {
+        strata[i].stratum_id = i; strata[i].is_monotone = true;
+    }
+    strata[300] = stratum;
+    wl_plan_t supplied = *generated; supplied.strata = strata;
+    supplied.stratum_count = 301;
+    wl_col_session_t *sess = serial_create(&supplied, 2, 3, 0),
+        *raw = serial_create(&supplied, 2, 3, 0);
+    wl_plan_relation_t emitted[] = {rules[0], rules[2]};
+    serial_occurrence_capture_t got = {.capture = {.rows = 3, .width = 2},
+                                       .rules = emitted, .occurrences = 2,
+                                       .rows_per_head = 6}, twin = got;
+    /* These are immutable supplied legacy routes, not retagged generator
+     * admission proofs. Actual raw evaluation constructs A/B and leaves the
+     * zero-operator missing head absent before control is attached. */
+    CHECK(wl_backend_columnar()->session_snapshot(&sess->base,
+        serial_occurrence_capture, &got) == 0);
+    CHECK(wl_backend_columnar()->session_snapshot(&raw->base,
+        serial_occurrence_capture, &twin) == 0);
+    CHECK(got.capture.count == 12u && got.capture.count == twin.capture.count
+        && got.capture.digest == twin.capture.digest);
+    CHECK(names[0] != names[2] && !strcmp(names[0], names[2]));
+    wl_evaluation_control_t *c = serial_attach(sess, 0); (void)c;
+    got.capture = (serial_capture_t){.rows = 3, .width = 2};
+    twin.capture = got.capture;
+    serial_session = sess; serial_output_seen = 0;
+    serial_output_replay_phase = 8u; serial_output_replay_seen = 0;
+    wl_columnar_session_test_serial_checkpoint =
+        serial_output_replay_checkpoint;
+    CHECK(wl_backend_columnar()->session_snapshot(&sess->base,
+        serial_occurrence_capture, &got) == WL_EVALUATION_CONTROL_CANCELLED);
+    wl_columnar_session_test_serial_checkpoint = NULL;
+    CHECK(serial_output_replay_seen == 1u && !got.capture.count
+        && !sess->serial_completion.pending && !sess->cleanup_pending);
+    for (uint32_t i = 0; i < sess->nrels; i++) CHECK(
+            !atomic_load(&sess->rels[i]->descriptor_access.state)
+            && !atomic_load(&sess->rels[i]->source_access.state));
+    CHECK(wl_evaluation_control_reset(c) == 0);
+    wl_columnar_session_test_serial_checkpoint =
+        serial_output_legacy_checkpoint;
+    CHECK(wl_backend_columnar()->session_snapshot(&sess->base,
+        serial_occurrence_capture, &got) == 0);
+    wl_columnar_session_test_serial_checkpoint = NULL;
+    CHECK(serial_output_seen == 1u);
+    CHECK(wl_backend_columnar()->session_snapshot(&raw->base,
+        serial_occurrence_capture, &twin) == 0);
+    CHECK(got.capture.count == 12u && got.capture.count == twin.capture.count
+        && got.capture.digest == twin.capture.digest &&
+        !sess->serial_completion.pending);
+    for (uint32_t i = 0; i < sess->nrels; i++) CHECK(
+            !atomic_load(&sess->rels[i]->descriptor_access.state)
+            && !atomic_load(&sess->rels[i]->source_access.state));
+    serial_destroy(sess); serial_destroy(raw);
+    /* A separate immutable supplied no-op plan genuinely has no EDB or IDB
+     * registry candidates. The second replay must still charge and poll each
+     * absent occurrence even though controlled lookup has no candidate loop. */
+    wl_plan_relation_t missing[300];
+    for (unsigned i = 0; i < 300u; i++) missing[i] = rules[3];
+    wl_plan_stratum_t missing_stratum = {.is_monotone = true,
+                                         .relations = missing,
+                                         .relation_count = 300};
+    wl_plan_t missing_plan = *generated;
+    missing_plan.edb_count = 0; missing_plan.strata = &missing_stratum;
+    missing_plan.stratum_count = 1;
+    wl_session_t *missing_base = NULL, *missing_raw_base = NULL;
+    CHECK(wl_session_create(wl_backend_columnar(), &missing_plan, 1,
+        &missing_base) == 0);
+    CHECK(wl_session_create(wl_backend_columnar(), &missing_plan, 1,
+        &missing_raw_base) == 0);
+    sess = COL_SESSION(missing_base); raw = COL_SESSION(missing_raw_base);
+    serial_capture_t absent = {.rows = 1, .width = 2}, absent_twin = absent;
+    CHECK(wl_backend_columnar()->session_snapshot(missing_base,
+        serial_capture, &absent) == 0);
+    CHECK(wl_backend_columnar()->session_snapshot(missing_raw_base,
+        serial_capture, &absent_twin) == 0);
+    CHECK(!sess->nrels && !raw->nrels && !absent.count && !absent_twin.count);
+    c = serial_attach(sess, 0); serial_session = sess;
+    serial_output_replay_phase = 9u; serial_output_replay_seen = 0;
+    wl_columnar_session_test_serial_checkpoint =
+        serial_output_replay_checkpoint;
+    CHECK(wl_backend_columnar()->session_snapshot(missing_base,
+        serial_capture, &absent) == WL_EVALUATION_CONTROL_CANCELLED);
+    wl_columnar_session_test_serial_checkpoint = NULL;
+    CHECK(serial_output_replay_seen == 1u && !absent.count
+        && !sess->serial_completion.pending && !sess->cleanup_pending);
+    CHECK(wl_evaluation_control_reset(c) == 0);
+    CHECK(wl_backend_columnar()->session_snapshot(missing_base,
+        serial_capture, &absent) == 0);
+    CHECK(wl_backend_columnar()->session_snapshot(missing_raw_base,
+        serial_capture, &absent_twin) == 0);
+    CHECK(!sess->nrels && !absent.count && !absent_twin.count
+        && !sess->serial_completion.pending);
+    serial_destroy(sess); serial_destroy(raw);
+    for (unsigned i = 0; i < 4u; i++) free(names[i]);
+    wl_plan_free(generated); wirelog_program_free(program);
+    puts(
+        "stable output journal: legacy A/B/A empty/missing order and second replay empty-prefix/no-registry stops, real drain/raw retry passed");
+}
+
+static void
+test_serial_stable_output_journal(void)
+{
+    wirelog_program_t *program = NULL;
+    wl_plan_t *plan = serial_generated(300, 2, false, &program);
+    /* Build both ordinary default models with real enforcing governors, then
+     * tighten usable bytes only outside all attempts/leases to actual retained
+     * physical usage. No existing credit, mode or payload is changed. */
+    wl_col_session_t *sess = serial_create(plan, 300, 3, UINT64_MAX / 2u);
+    wl_session_options_t options; wl_session_options_init(&options);
+    options.memory_governor = sess->memory_governor;
+    wl_session_t *raw_base = NULL;
+    CHECK(wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &raw_base) == 0);
+    wl_col_session_t *raw = COL_SESSION(raw_base);
+    CHECK(raw->eval_arena && raw->delta_pool && !raw->has_evaluated
+        && raw->memory_governor == sess->memory_governor);
+    int64_t input[900];
+    for (unsigned i = 0; i < 900u; i++) input[i] = i;
+    CHECK(wl_backend_columnar()->session_insert(raw_base, "S", input, 3,
+        300) == 0);
+    serial_capture_t initial = {.rows = 3, .width = 300},
+            initial_twin = initial;
+    CHECK(wl_backend_columnar()->session_snapshot(&sess->base, serial_capture,
+        &initial) == 0);
+    CHECK(wl_backend_columnar()->session_snapshot(&raw->base, serial_capture,
+        &initial_twin) == 0);
+    CHECK(initial.count == initial_twin.count &&
+        initial.digest == initial_twin.digest
+        && sess->snapshot_stable_valid && !sess->serial_completion.frame);
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(sess->memory_governor),
+        *raw_g = wl_columnar_memory_governor_ref_get(raw->memory_governor);
+    uint64_t baseline = string_reserved(sess->memory_governor),
+        raw_baseline = string_reserved(raw->memory_governor);
+    CHECK(g == raw_g && baseline == raw_baseline &&
+        g->mode == WL_COLUMNAR_MEMORY_MODE_ENFORCING
+        && raw_g->mode == WL_COLUMNAR_MEMORY_MODE_ENFORCING);
+    uint64_t budget = atomic_load(&g->usable_bytes),
+        raw_budget = atomic_load(&raw_g->usable_bytes);
+    atomic_store(&g->usable_bytes, baseline);
+    atomic_store(&raw_g->usable_bytes, raw_baseline);
+    wl_evaluation_control_t *c = serial_attach(sess, 0);
+    col_rel_t *heads[2] = {session_find_rel(sess, "H0"),
+                           session_find_rel(sess, "H1")};
+    uint64_t views[2] = {heads[0]->view_generation, heads[1]->view_generation};
+    uint64_t credits[2] = {heads[0]->retained_reserved_bytes,
+                           heads[1]->retained_reserved_bytes};
+    int64_t **columns[2] = {heads[0]->columns, heads[1]->columns};
+    struct ArrowSchema **schemas[2] = {heads[0]->schema.children,
+                                       heads[1]->schema.children};
+    uint64_t exact = 0;
+    serial_session = sess;
+    for (unsigned lane = 0; lane < 9u; lane++) {
+        CHECK(wl_evaluation_control_reset(c) == 0);
+        CHECK(wl_evaluation_control_configure(c, lane == 1u ? exact
+            : lane == 2u ? exact - 1u : 0) == 0);
+        serial_output_mode = lane; serial_output_seen = 0;
+        serial_output_admissions = 0;
+        serial_peak_governor = g; serial_peak_bytes = baseline;
+        wl_columnar_memory_governor_test_after_total_cas =
+            serial_output_journal_admission;
+        wl_columnar_session_test_serial_checkpoint =
+            serial_output_journal_checkpoint;
+        wl_columnar_source_access_writer_t writer = {0};
+        col_rel_t *later = session_find_rel(sess, "H1");
+        if (lane == 5u) {
+            CHECK(col_rel_source_writer_acquire(later, &writer) == 0);
+            wl_columnar_relation_test_after_reader_cas =
+                serial_output_journal_after_cas;
+        }
+        serial_capture_t got = {.rows = 3, .width = 300, .session = sess,
+                                .check_pins = true, .cancel_first = lane == 4u},
+                                    twin = {.rows = 3, .width = 300};
+        int expected = lane == 2u ? WL_EVALUATION_CONTROL_WORK_LIMIT
+            : lane == 3u ? WL_EVALUATION_CONTROL_CANCELLED
+            : lane == 5u ? EBUSY : lane == 6u || lane == 7u ? EINVAL
+            : lane == 8u ? EOVERFLOW : 0;
+        CHECK(wl_backend_columnar()->session_snapshot(&sess->base,
+            serial_output_journal_capture, &got) == expected);
+        wl_columnar_memory_governor_test_after_total_cas = NULL;
+        wl_columnar_session_test_serial_checkpoint = NULL;
+        wl_columnar_relation_test_after_reader_cas = NULL;
+        CHECK(!serial_output_admissions && serial_peak_bytes == baseline
+            && string_reserved(sess->memory_governor) == baseline
+            && !sess->cleanup_reserved_bytes && !sess->cleanup_pending);
+        wl_evaluation_control_report_t report;
+        CHECK(wl_evaluation_control_report(c,
+            &report) == 0 && report.result == expected);
+        if (!lane) {
+            exact = report.consumed; CHECK(exact > 300u * 8u);
+        }
+        if (lane == 1u) CHECK(report.consumed == exact);
+        if (lane == 2u || lane == 3u || lane == 5u || lane == 7u || lane == 8u)
+            CHECK(!got.count);
+        if (lane == 3u || lane >= 5u) CHECK(serial_output_seen == 1u);
+        if (lane == 5u) {
+            CHECK(atomic_load(&later->descriptor_access.state) == 1u
+                && atomic_load(&later->source_access.state) ==
+                WL_COLUMNAR_SOURCE_ACCESS_WRITER);
+            CHECK(wl_columnar_source_access_writer_release(&writer) == 0);
+        }
+        if (lane >= 6u) {
+            CHECK(serial_output_fault_journal == &sess->serial_completion
+                && sess->serial_completion.pending &&
+                !sess->serial_completion.active
+                && !sess->serial_completion.output_release_stratum
+                && !sess->serial_completion.output_release_relation);
+            CHECK((sess->serial_completion.phase &
+                WL_COLUMNAR_SERIAL_OUTPUT_CONSUMED)
+                == (lane == 6u ? WL_COLUMNAR_SERIAL_OUTPUT_CONSUMED : 0u));
+            for (unsigned h = 0; h < 2u; h++) {
+                col_rel_t *head = session_find_rel(sess, h ? "H1" : "H0");
+                CHECK(atomic_load(&head->descriptor_access.state) == 1u
+                    && atomic_load(&head->source_access.state) == 1u);
+            }
+            if (lane == 8u) CHECK(report.execution_status == EOVERFLOW);
+            if (lane ==
+                7u) CHECK(report.stop_reason ==
+                    WL_EVALUATION_CONTROL_CANCELLED);
+            serial_output_fault_journal->output_identity =
+                serial_output_fault_identity;
+        }
+        if (lane == 4u) {
+            serial_capture_t stopped = {.rows = 3, .width = 300};
+            CHECK(got.count == 6u);
+            CHECK(wl_backend_columnar()->session_snapshot(&sess->base,
+                serial_capture,
+                &stopped) == WL_EVALUATION_CONTROL_CANCELLED && !stopped.count);
+        }
+        if (expected) {
+            CHECK(wl_evaluation_control_reset(c) == 0);
+            CHECK(wl_evaluation_control_configure(c, 0) == 0);
+            CHECK(wl_backend_columnar()->session_snapshot(&sess->base,
+                serial_capture, &got) == 0);
+        }
+        CHECK(wl_backend_columnar()->session_snapshot(&raw->base,
+            serial_capture, &twin) == 0);
+        CHECK(got.count == twin.count && got.digest == twin.digest &&
+            got.count == 6u
+            && !sess->serial_completion.pending &&
+            !sess->serial_completion.frame
+            && !sess->cleanup_reserved_bytes &&
+            string_reserved(raw->memory_governor) == raw_baseline);
+        for (unsigned h = 0; h < 2u;
+            h++) CHECK(heads[h]->view_generation == views[h]
+                && heads[h]->retained_reserved_bytes == credits[h] &&
+                heads[h]->columns == columns[h]
+                && heads[h]->schema.children == schemas[h] &&
+                heads[h]->nrows == 3u);
+        for (uint32_t i = 0; i < sess->nrels; i++) CHECK(
+                !atomic_load(&sess->rels[i]->descriptor_access.state)
+                && !atomic_load(&sess->rels[i]->source_access.state));
+    }
+    atomic_store(&g->usable_bytes, budget);
+    atomic_store(&raw_g->usable_bytes, raw_budget);
+    serial_destroy(sess); serial_destroy(raw); wl_plan_free(plan);
+    wirelog_program_free(program);
+    puts(
+        "stable output journal: real enforcing retained-budget/no allocation, width300/exact/prepaid stops, later writer and original identity/consumed cleanup-only retry passed");
+}
+
 static void
 test_serial_occurrences_and_cohort(void)
 {
@@ -15611,38 +16038,65 @@ test_serial_occurrences_and_cohort(void)
     serial_destroy(sess); serial_destroy(raw);
     for (unsigned i = 0; i < OCCURRENCES; i++) free(names[i]);
     wl_plan_free(generated); wirelog_program_free(program);
-    for (unsigned heads = 64; heads <= 65; heads++) {
+    const unsigned head_counts[] = {64, 65, 129};
+    for (unsigned trial = 0; trial < 3; trial++) {
+        unsigned heads = head_counts[trial];
         generated = serial_generated(2, heads, false, &program);
         sess = serial_create(generated, 2, 2, 0);
-        wl_evaluation_control_t *control = serial_attach(sess, 0);
-        uint64_t baseline = string_reserved(sess->memory_governor);
-        serial_capture_t capture = {.rows = 2, .width = 2};
+        raw = serial_create(generated, 2, 2, 0);
+        serial_attach(sess, 0);
+        serial_capture_t capture = {.rows = 2, .width = 2}, twin = capture;
         CHECK(wl_backend_columnar()->session_snapshot(&sess->base,
-            serial_capture, &capture) == (heads == 64 ? 0 : ENOTSUP));
-        if (heads == 65) CHECK(!capture.count &&
-                !sess->serial_completion.pending
-                && !sess->serial_completion.frame && !sess->cleanup_pending
-                && sess->nrels == generated->edb_count
-                && string_reserved(sess->memory_governor) == baseline);
-        else {
-            CHECK(capture.count == 128 && sess->rel_cap > 16);
-            CHECK(sess->rels_reservation.identity == &sess->rels_reservation
-                && atomic_load(&sess->rels_reservation.state)
-                == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED);
-            bool collision = false;
-            for (uint32_t i = 0; i < sess->nrels; i++) {
-                CHECK(session_find_rel(sess,
-                    sess->rels[i]->name) == sess->rels[i]);
-                if (sess->rel_hash_next[i] != UINT32_MAX) collision = true;
-            }
-            CHECK(collision);
+            serial_capture, &capture) == 0);
+        CHECK(wl_backend_columnar()->session_snapshot(&raw->base,
+            serial_capture, &twin) == 0);
+        CHECK(capture.count == 2u * heads && capture.count == twin.count
+            && capture.digest == twin.digest && sess->rel_cap > 16);
+        CHECK(sess->rels_reservation.identity == &sess->rels_reservation
+            && atomic_load(&sess->rels_reservation.state)
+            == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED);
+        bool collision = false;
+        for (uint32_t i = 0; i < sess->nrels; i++) {
+            CHECK(session_find_rel(sess, sess->rels[i]->name) == sess->rels[i]);
+            CHECK(!atomic_load(&sess->rels[i]->descriptor_access.state)
+                && !atomic_load(&sess->rels[i]->source_access.state));
+            if (sess->rel_hash_next[i] != UINT32_MAX) collision = true;
         }
-        (void)control;
-        serial_destroy(sess); wl_plan_free(generated);
+        CHECK(collision && !sess->serial_completion.pending
+            && !sess->serial_completion.frame);
+        int64_t inserted[] = {4, 5};
+        CHECK(wl_backend_columnar()->session_insert(&sess->base, "S", inserted,
+            1, 2) == 0);
+        CHECK(wl_backend_columnar()->session_insert(&raw->base, "S", inserted,
+            1, 2) == 0);
+        capture = (serial_capture_t){.rows = 3, .width = 2}; twin = capture;
+        if (heads == 129u) {
+            serial_session = sess; serial_output_mode = 9u;
+            serial_output_seen = 0;
+            wl_columnar_session_test_serial_checkpoint =
+                serial_output_journal_checkpoint;
+            CHECK(wl_backend_columnar()->session_snapshot(&sess->base,
+                serial_capture, &capture) == WL_EVALUATION_CONTROL_CANCELLED);
+            wl_columnar_session_test_serial_checkpoint = NULL;
+            CHECK(serial_output_seen == 1u && !capture.count);
+            CHECK(wl_evaluation_control_reset(sess->base.evaluation_control) ==
+                0);
+        }
+        CHECK(wl_backend_columnar()->session_snapshot(&sess->base,
+            serial_capture, &capture) == 0);
+        CHECK(wl_backend_columnar()->session_snapshot(&raw->base,
+            serial_capture, &twin) == 0);
+        CHECK(capture.count == 3u * heads && capture.count == twin.count
+            && capture.digest == twin.digest);
+        for (uint32_t i = 0; i < sess->nrels; i++) {
+            CHECK(!atomic_load(&sess->rels[i]->descriptor_access.state)
+                && !atomic_load(&sess->rels[i]->source_access.state));
+        }
+        serial_destroy(sess); serial_destroy(raw); wl_plan_free(generated);
         wirelog_program_free(program);
     }
     puts(
-        "serial attempt: supplied immutable A/B/A independent long-name occurrence pointers,66 occurrences/two heads and64/65 distinct-head preflight passed");
+        "serial attempt: supplied immutable A/B/A independent long-name occurrence pointers,66 occurrences/two heads and64/65/129 generated initial/dirty output journals passed");
 }
 
 static void
@@ -15827,9 +16281,16 @@ test_serial_optional_compaction_denial(void)
         "serial attempt: actual optional overlap DENIED preserves payload/credit/latch and completes raw/control STEP/SNAPSHOT, with cancellation/overflow retry passed");
 }
 
-static wl_columnar_source_access_reader_t *serial_original_reader;
+static wl_columnar_serial_completion_t *serial_original_journal;
 static uintptr_t serial_original_identity;
 static unsigned serial_ownership_seen;
+static void
+serial_output_track(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress, wl_columnar_serial_output_t *output)
+{
+    (void)control; (void)phase; (void)progress;
+    if (output) serial_original_journal = &output->journal;
+}
 static void
 serial_partial_reader_stop(wl_evaluation_control_t *control,
     wl_columnar_source_access_gate_t *gate, bool acquired)
@@ -15842,6 +16303,12 @@ serial_partial_reader_stop(wl_evaluation_control_t *control,
     if (!head || gate != &head->descriptor_access) return;
     CHECK(atomic_load(&head->descriptor_access.state) == 1
         && !atomic_load(&head->source_access.state));
+    CHECK(serial_original_journal &&
+        serial_original_journal->output_partial == head
+        && (serial_original_journal->phase &
+        WL_COLUMNAR_SERIAL_OUTPUT_DESCRIPTOR)
+        && !(serial_original_journal->phase &
+        WL_COLUMNAR_SERIAL_OUTPUT_SOURCE));
     serial_ownership_seen++;
     wl_evaluation_control_request_cancel(control);
 }
@@ -15851,17 +16318,19 @@ serial_output_identity_fault(wl_evaluation_control_t *control, unsigned phase,
 {
     (void)control; (void)progress;
     if (phase != 7 || !output) return;
-    CHECK(output->count == 2 && output->initialized == 2);
-    for (unsigned i = 0; i < output->count; i++) {
-        CHECK(output->slots[i].reader.owner ==
-            &output->slots[i].relation->source_access
-            && output->slots[i].reader.secondary_owner
-            == &output->slots[i].relation->descriptor_access);
+    serial_original_journal = &output->journal;
+    CHECK(serial_original_journal->output_acquire_stratum ==
+        serial_session->plan->stratum_count
+        && !serial_original_journal->output_acquire_relation
+        && !serial_original_journal->output_partial);
+    for (unsigned i = 0; i < 2; i++) {
+        col_rel_t *head = session_find_rel(serial_session, i ? "H1" : "H0");
+        CHECK(head && atomic_load(&head->descriptor_access.state) == 1
+            && atomic_load(&head->source_access.state) == 1);
     }
-    serial_original_reader = &output->slots[0].reader;
-    serial_original_identity = serial_original_reader->identity;
-    CHECK(serial_original_identity == (uintptr_t)serial_original_reader);
-    serial_original_reader->identity = 0; /* Labeled original-token validation fault. */
+    serial_original_identity = serial_original_journal->output_identity;
+    CHECK(serial_original_identity == (uintptr_t)serial_original_journal);
+    serial_original_journal->output_identity = 0; /* Original journal validation fault. */
     serial_ownership_seen++;
 }
 static void
@@ -15873,10 +16342,13 @@ test_serial_output_ownership(void)
         wl_col_session_t *sess = serial_create(plan, 2, lane == 2 ? 0 : 3, 0);
         wl_evaluation_control_t *c = serial_attach(sess, 0);
         serial_session = sess; serial_ownership_seen = 0;
+        serial_original_journal = NULL;
         serial_capture_t got = {.rows = 3, .width = 2};
-        if (!lane) wl_columnar_relation_test_after_reader_cas =
+        if (!lane) {
+            wl_columnar_relation_test_after_reader_cas =
                 serial_partial_reader_stop;
-        else wl_columnar_session_test_serial_checkpoint =
+            wl_columnar_session_test_serial_checkpoint = serial_output_track;
+        }else wl_columnar_session_test_serial_checkpoint =
                 serial_output_identity_fault;
         int expected = lane ? EINVAL : WL_EVALUATION_CONTROL_CANCELLED;
         CHECK(wl_backend_columnar()->session_snapshot(&sess->base,
@@ -15892,9 +16364,17 @@ test_serial_output_ownership(void)
         } else {
             CHECK(got.count == (lane == 2 ? 0u : 6u));
             CHECK(sess->serial_completion.phase == 5
-                && serial_original_reader->owner
-                && serial_original_reader->secondary_owner);
-            serial_original_reader->identity = serial_original_identity;
+                && serial_original_journal->pending
+                && (serial_original_journal->phase &
+                WL_COLUMNAR_SERIAL_OUTPUT_CONSUMED)
+                && !serial_original_journal->output_release_stratum
+                && !serial_original_journal->output_release_relation);
+            for (unsigned i = 0; i < 2; i++) {
+                col_rel_t *head = session_find_rel(sess, i ? "H1" : "H0");
+                CHECK(atomic_load(&head->descriptor_access.state) == 1
+                    && atomic_load(&head->source_access.state) == 1);
+            }
+            serial_original_journal->output_identity = serial_original_identity;
         }
         uint64_t delivered = got.count;
         CHECK(wl_evaluation_control_reset(c) == 0);
@@ -15906,7 +16386,7 @@ test_serial_output_ownership(void)
         serial_destroy(sess); wl_plan_free(plan); wirelog_program_free(program);
     }
     puts(
-        "serial attempt: original descriptor-only stop, combined-token consumed cleanup fault and empty selected-head pins passed");
+        "serial attempt: original descriptor-only stop, original journal consumed cleanup validation fault and empty selected-head pins passed");
 }
 
 static wl_columnar_relation_bulk_append_t *serial_compact_record;
@@ -19817,6 +20297,8 @@ main(void)
     test_serial_rule_continuation();
     test_serial_occurrences_and_cohort();
     test_serial_output_budget();
+    test_serial_stable_output_journal();
+    test_serial_output_legacy_journal();
     test_serial_optional_compaction_denial();
     test_serial_repeat_attempts();
     test_serial_filtered_attempts();

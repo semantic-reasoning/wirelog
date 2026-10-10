@@ -6258,6 +6258,44 @@ void (*wl_columnar_relation_test_single_before_cleanup)(
     wl_columnar_relation_mutation_single_t *);
 #endif
 
+/* The journal owns actual gate counts, not a synthetic reader token. Record
+ * successful admission in its original slot before a hook or tail can stop. */
+int
+wl_columnar_relation_count_reader_controlled(
+    wl_columnar_source_access_gate_t *gate, uint32_t *held, uint32_t bit,
+    uint64_t work, wl_evaluation_control_t *control)
+{
+    if (!gate || !held || !bit || (*held & bit) || !control) return EINVAL;
+    uint64_t observed = atomic_load_explicit(&gate->state,
+            memory_order_relaxed);
+    for (;;) {
+        int rc = wl_evaluation_control_charge(control, work);
+        if (rc) return rc;
+        if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER) return EBUSY;
+        if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER - 1u)
+            return EOVERFLOW;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_relation_test_before_reader_cas)
+            wl_columnar_relation_test_before_reader_cas(control, gate,
+                observed);
+#endif
+#ifdef _MSC_VER
+        bool acquired = atomic_compare_exchange_weak_explicit(&gate->state,
+#else
+        bool acquired = atomic_compare_exchange_strong_explicit(&gate->state,
+#endif
+                &observed, observed + 1u, memory_order_acquire,
+                memory_order_relaxed);
+        if (acquired) *held |= bit;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_relation_test_after_reader_cas)
+            wl_columnar_relation_test_after_reader_cas(control, gate, acquired);
+#endif
+        rc = wl_columnar_relation_work_tail(control, work);
+        if (rc || acquired) return rc;
+    }
+}
+
 int
 wl_columnar_relation_reader_acquire_controlled(
     wl_columnar_source_access_gate_t *gate,
@@ -6340,7 +6378,7 @@ wl_columnar_relation_writer_acquire_controlled(
             memory_order_relaxed);
 #endif
     if (!acquired) {
-        (void)wl_columnar_relation_work_tail(control, 1);
+        (void) wl_columnar_relation_work_tail(control, 1);
         return EBUSY;
     }
     wl_columnar_source_access_writer_initialize(gate, token);
@@ -16787,7 +16825,8 @@ wl_columnar_relation_pool_reuse_controlled(wl_col_session_t *sess,
     int rc = wl_evaluation_control_charge(c, 64);
     if (rc) return rc;
     if (!pool || !c) return EINVAL;
-    if (sess->cleanup_pending || sess->cleanup_active
+    if (sess->serial_completion.mode == WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT
+        || sess->cleanup_pending || sess->cleanup_active
         || sess->cleanup_pending_count || sess->cleanup_active_count
         || sess->cleanup_reserved_bytes || sess->serial_completion.frame
         || sess->serial_completion.mode_frame || sess->serial_completion.pending

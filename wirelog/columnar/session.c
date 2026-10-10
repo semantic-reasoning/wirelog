@@ -5266,7 +5266,6 @@ wl_columnar_session_serial_equal(const char *left, const char *right,
         *equal = a == b;
         if (future && !wl_columnar_memory_size_add(*future, 8, future))
             return EOVERFLOW;
-        if (output && control) output->byte_visits++;
         if (control) {
             rc = wl_columnar_session_serial_tail(control, 4, pos + 1u, output);
             if (rc) return rc;
@@ -5357,8 +5356,7 @@ wl_columnar_session_serial_preflight(wl_col_session_t *sess)
     /* No automatic authority token: each admitted registry descriptor is
      * acquired in an original-address cleanup-frame group before shape reads
      * during evaluation/publication. Scalar route flags exclude active caches. */
-    const char *names[WL_COLUMNAR_SERIAL_OUTPUT_COHORT];
-    uint32_t distinct = 0;
+    bool has_heads = false;
     for (uint32_t si = 0; si < sess->plan->stratum_count; si++) {
         const wl_plan_stratum_t *sp = &sess->plan->strata[si];
         rc = wl_evaluation_control_charge(control, 16);
@@ -5423,25 +5421,11 @@ wl_columnar_session_serial_preflight(wl_col_session_t *sess)
                 return ENOTSUP;
             rc = wl_columnar_session_serial_tail(control, 1, ri, NULL);
             if (rc) return rc;
-            bool found = false;
-            for (uint32_t i = 0; i < distinct; i++) {
-                bool equal;
-                rc = wl_columnar_session_serial_equal(names[i], rp->name,
-                        &equal, NULL, control, NULL);
-                if (rc) return rc;
-                if (equal) {
-                    found = true; break;
-                }
-            }
-            if (!found) {
-                if (distinct ==
-                    WL_COLUMNAR_SERIAL_OUTPUT_COHORT) return ENOTSUP;
-                names[distinct++] = rp->name;
-            }
+            has_heads = true;
         }
     }
     wl_columnar_eval_stack_cleanup_frame_t *preflight_frame = NULL;
-    if (distinct || sess->nrels) {
+    if (has_heads || sess->nrels) {
         rc = wl_columnar_eval_stack_cleanup_begin(sess, &preflight_frame);
         if (rc) return rc;
     }
@@ -5499,30 +5483,281 @@ wl_columnar_session_serial_preflight(wl_col_session_t *sess)
     return rc;
 }
 
-static int
-wl_columnar_session_serial_select(wl_columnar_serial_output_t *output,
-    const char *name, uint32_t *slot, wl_evaluation_control_t *control)
+/* Pure replay uses exactly the selection order counted before publication.
+ * Neither mandatory retirement nor terminal delivery can lazily build hashes. */
+static col_rel_t *
+wl_columnar_session_serial_output_lookup(wl_col_session_t *sess,
+    const char *name)
 {
-    *slot = output->count;
-    for (uint32_t i = 0; i < output->count; i++) {
-        int rc = control ? wl_evaluation_control_charge(control, 8) : 0;
-        if (rc) return rc;
-        if (control) {
-            if (!wl_columnar_memory_size_add(output->future_work, 8,
-                &output->future_work)) return EOVERFLOW;
-            output->candidate_visits++;
-            rc = wl_columnar_session_serial_tail(control, 4, i, output);
-            if (rc) return rc;
-        }
-        bool equal;
-        rc = wl_columnar_session_serial_equal(name, output->slots[i].name,
-                &equal, control ? &output->future_work : NULL, control,
-                control ? output : NULL);
-        if (rc) return rc;
-        if (equal) {
-            *slot = i; return 0;
+    if (!name) return NULL;
+    for (uint32_t i = 0; i < sess->nrels; i++) {
+        col_rel_t *rel = sess->rels[i];
+        if (!rel || !rel->name) continue;
+        size_t pos = 0;
+        for (;;) {
+            unsigned char a = (unsigned char)name[pos];
+            unsigned char b = (unsigned char)rel->name[pos];
+            if (a != b) break;
+            if (!a) return rel;
+            pos++;
         }
     }
+    return NULL;
+}
+
+static int
+wl_columnar_session_serial_output_lookup_counted(wl_col_session_t *sess,
+    const char *name, col_rel_t **out, wl_columnar_serial_completion_t *journal,
+    wl_columnar_serial_output_t *diagnostic)
+{
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    *out = NULL;
+    if (!name) return EINVAL;
+    for (uint32_t i = 0; i < sess->nrels; i++) {
+        int rc = wl_evaluation_control_charge(control, 8);
+        if (rc) return rc;
+        if (!wl_columnar_memory_size_add(journal->stored_bytes, 8,
+            &journal->stored_bytes)) return EOVERFLOW;
+        col_rel_t *rel = sess->rels[i];
+        rc = wl_columnar_session_serial_tail(control, 4, i, diagnostic);
+        if (rc) return rc;
+        if (!rel || !rel->name) continue;
+        bool equal;
+        rc = wl_columnar_session_serial_equal(name, rel->name, &equal,
+                &journal->stored_bytes, control, diagnostic);
+        if (rc) return rc;
+        if (equal) {
+            *out = rel; return 0;
+        }
+    }
+    return 0;
+}
+
+static void
+wl_columnar_session_serial_output_advance(const wl_plan_t *plan,
+    uint32_t *stratum, uint32_t *relation)
+{
+    (*relation)++;
+    if (*stratum < plan->stratum_count
+        && *relation >= plan->strata[*stratum].relation_count) {
+        (*stratum)++;
+        *relation = 0;
+    }
+}
+
+int
+wl_columnar_session_serial_output_drain(wl_col_session_t *sess,
+    wl_columnar_serial_completion_t *journal)
+{
+    if (!sess || !journal) return EINVAL;
+    if (!journal->pending) return 0;
+    if (!wl_columnar_eval_stack_output_journal_owned(sess, journal)
+        || journal->mode != WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT
+        || journal->output_identity != (uintptr_t)journal
+        || journal->plan != sess->plan || !sess->serial_completion.pending)
+        return EINVAL;
+    /* Mandatory checked retirement owns only the admitted prefix and actual
+     * partial pair. Successful decrements are durable before the next step. */
+    for (;;) {
+        if (journal->phase & WL_COLUMNAR_SERIAL_OUTPUT_CURRENT) {
+            col_rel_t *rel = journal->output_partial;
+            if (!rel) return EINVAL;
+            if (journal->phase & WL_COLUMNAR_SERIAL_OUTPUT_SOURCE) {
+                int rc = wl_columnar_source_access_gate_reader_release(
+                    &rel->source_access);
+                if (rc) return rc;
+                journal->phase &= ~WL_COLUMNAR_SERIAL_OUTPUT_SOURCE;
+            }
+            if (journal->phase & WL_COLUMNAR_SERIAL_OUTPUT_DESCRIPTOR) {
+                int rc = wl_columnar_source_access_gate_reader_release(
+                    &rel->descriptor_access);
+                if (rc) return rc;
+                journal->phase &= ~WL_COLUMNAR_SERIAL_OUTPUT_DESCRIPTOR;
+            }
+            bool replay = (journal->phase &
+                WL_COLUMNAR_SERIAL_OUTPUT_RELEASING) != 0;
+            journal->phase &= ~(WL_COLUMNAR_SERIAL_OUTPUT_CURRENT
+                | WL_COLUMNAR_SERIAL_OUTPUT_RELEASING);
+            journal->output_partial = NULL;
+            if (replay) wl_columnar_session_serial_output_advance(journal->plan,
+                    &journal->output_release_stratum,
+                    &journal->output_release_relation);
+        }
+        if (journal->output_release_stratum == journal->output_acquire_stratum
+            && journal->output_release_relation ==
+            journal->output_acquire_relation) break;
+        uint32_t si = journal->output_release_stratum;
+        uint32_t ri = journal->output_release_relation;
+        if (si >= journal->plan->stratum_count) return EINVAL;
+        if (!journal->plan->strata[si].relation_count) {
+            journal->output_release_stratum++;
+            journal->output_release_relation = 0;
+            continue;
+        }
+        if (ri >= journal->plan->strata[si].relation_count) return EINVAL;
+        col_rel_t *rel = wl_columnar_session_serial_output_lookup(sess,
+                journal->plan->strata[si].relations[ri].name);
+        if (!rel) {
+            wl_columnar_session_serial_output_advance(journal->plan,
+                &journal->output_release_stratum,
+                &journal->output_release_relation);
+            continue;
+        }
+        journal->output_partial = rel;
+        journal->phase |= WL_COLUMNAR_SERIAL_OUTPUT_CURRENT
+            | WL_COLUMNAR_SERIAL_OUTPUT_RELEASING
+            | WL_COLUMNAR_SERIAL_OUTPUT_DESCRIPTOR
+            | WL_COLUMNAR_SERIAL_OUTPUT_SOURCE;
+    }
+    journal->output_partial = NULL;
+    journal->pending = false;
+    return 0;
+}
+
+static int
+wl_columnar_session_serial_output_prepare_journal(wl_col_session_t *sess,
+    wl_columnar_serial_completion_t *journal,
+    wl_columnar_serial_output_t *diagnostic)
+{
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    if (!wl_columnar_eval_stack_output_journal_owned(sess,
+        journal)) return EINVAL;
+    journal->plan = sess->plan;
+    journal->output_identity = (uintptr_t)journal;
+    journal->mode = WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT;
+    journal->pending = true;
+    for (uint32_t si = 0; si < sess->plan->stratum_count; si++) {
+        const wl_plan_stratum_t *sp = &sess->plan->strata[si];
+        int rc = wl_evaluation_control_charge(control, 8);
+        if (rc) return rc;
+        if (!wl_columnar_memory_size_add(journal->stored_bytes, 8,
+            &journal->stored_bytes)) return EOVERFLOW;
+        if (sp->relation_count && !sp->relations) return EINVAL;
+        rc = wl_columnar_session_serial_tail(control, 4, si, diagnostic);
+        if (rc) return rc;
+        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+            journal->output_acquire_stratum = si;
+            journal->output_acquire_relation = ri;
+            col_rel_t *rel = NULL;
+            rc = wl_evaluation_control_charge(control, 32);
+            if (rc) return rc;
+            if (!wl_columnar_memory_size_add(journal->stored_bytes, 32,
+                &journal->stored_bytes)) return EOVERFLOW;
+            rc = wl_columnar_session_serial_output_lookup_counted(sess,
+                    sp->relations[ri].name, &rel, journal, diagnostic);
+            if (rc) return rc;
+            if (rel) {
+                journal->output_partial = rel;
+                journal->phase |= WL_COLUMNAR_SERIAL_OUTPUT_CURRENT;
+                rc = wl_columnar_relation_count_reader_controlled(
+                    &rel->descriptor_access, &journal->phase,
+                    WL_COLUMNAR_SERIAL_OUTPUT_DESCRIPTOR, 8, control);
+                if (rc) return rc;
+                rc = wl_evaluation_control_charge(control, 16);
+                if (rc) return rc;
+                if (rel->storage_owner != rel || !rel->storage_owner_identity)
+                    return ENOTSUP;
+                rc = wl_columnar_session_serial_tail(control, 4, ri,
+                        diagnostic);
+                if (rc) return rc;
+                rc = wl_columnar_relation_count_reader_controlled(
+                    &rel->source_access, &journal->phase,
+                    WL_COLUMNAR_SERIAL_OUTPUT_SOURCE, 16, control);
+                if (rc) return rc;
+                rc = wl_evaluation_control_charge(control, 32);
+                if (rc) return rc;
+                if (rel->nrows > rel->capacity || rel->arena_owned
+                    || rel->col_shared || rel->compound_kind !=
+                    WIRELOG_COMPOUND_KIND_NONE || rel->compound_count
+                    || rel->inline_physical_offset
+                    || (rel->ncols && !rel->row_scratch)
+                    || (rel->nrows && rel->ncols &&
+                    !rel->columns)) return ENOTSUP;
+                rc = wl_columnar_session_serial_tail(control, 4, ri,
+                        diagnostic);
+                if (rc) return rc;
+                for (uint32_t c = 0; c < rel->ncols; c++) {
+                    rc = wl_evaluation_control_charge(control, 8);
+                    if (rc) return rc;
+                    if (rel->nrows && !rel->columns[c]) return EINVAL;
+                    rc = wl_columnar_session_serial_tail(control, 4, c,
+                            diagnostic);
+                    if (rc) return rc;
+                }
+                uint64_t cells;
+                if (!wl_columnar_memory_size_mul(rel->nrows, rel->ncols, &cells)
+                    || !wl_columnar_memory_size_add(journal->output_rows,
+                    rel->nrows, &journal->output_rows)
+                    || !wl_columnar_memory_size_add(journal->output_cells,
+                    cells, &journal->output_cells)) return EOVERFLOW;
+                journal->phase &= ~(WL_COLUMNAR_SERIAL_OUTPUT_CURRENT
+                    | WL_COLUMNAR_SERIAL_OUTPUT_DESCRIPTOR
+                    | WL_COLUMNAR_SERIAL_OUTPUT_SOURCE);
+                journal->output_partial = NULL;
+            }
+            wl_columnar_session_serial_output_advance(sess->plan,
+                &journal->output_acquire_stratum,
+                &journal->output_acquire_relation);
+        }
+        /* Empty strata have no occurrence or authority to retain. */
+        if (!sp->relation_count) {
+            journal->output_acquire_stratum = si + 1u;
+            journal->output_acquire_relation = 0;
+        }
+    }
+    /* One charged replay identifies the first real tuple. Its lookup costs
+     * are forward preparation only; the terminal replay was counted above. */
+    for (uint32_t si = 0; si < sess->plan->stratum_count; si++) {
+        int rc = wl_evaluation_control_charge(control, 8);
+        if (rc) return rc;
+        rc = wl_columnar_session_serial_tail(control, 8, si + 1u, diagnostic);
+        if (rc) return rc;
+        const wl_plan_stratum_t *sp = &sess->plan->strata[si];
+        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+            rc = wl_evaluation_control_charge(control, 32);
+            if (rc) return rc;
+            rc = wl_columnar_session_serial_tail(control, 9, ri + 1u,
+                    diagnostic);
+            if (rc) return rc;
+            col_rel_t *first = NULL;
+            rc = wl_columnar_join_controlled_lookup(sess,
+                    sp->relations[ri].name, &first, control);
+            if (rc) return rc;
+            if (!first || !first->nrows) continue;
+            journal->output_partial = first;
+            for (uint32_t c = 0; c < first->ncols; c++) {
+                rc = wl_evaluation_control_charge(control, 8);
+                if (rc) return rc;
+                first->row_scratch[c] = first->columns[c][0];
+                rc = wl_columnar_session_serial_tail(control, 5, c + 1u,
+                        diagnostic);
+                if (rc) return rc;
+            }
+            journal->phase |= WL_COLUMNAR_SERIAL_OUTPUT_FIRST_GATHERED;
+            journal->output_cells -= first->ncols;
+            goto gathered;
+        }
+    }
+gathered:
+    journal->output_partial = NULL;
+    uint64_t gather_work, tuple_work;
+    if (!wl_columnar_memory_size_mul(journal->output_cells, 8, &gather_work)
+        || !wl_columnar_memory_size_mul(journal->output_rows, 32, &tuple_work)
+        || !wl_columnar_memory_size_add(journal->stored_bytes, gather_work,
+        &journal->stored_bytes)
+        || !wl_columnar_memory_size_add(journal->stored_bytes, tuple_work,
+        &journal->stored_bytes)) return EOVERFLOW;
+    for (uint64_t admitted = 0; admitted < journal->stored_bytes;) {
+        uint64_t work = journal->stored_bytes - admitted;
+        if (work > WL_EVALUATION_CONTROL_QUANTUM)
+            work = WL_EVALUATION_CONTROL_QUANTUM;
+        int rc = wl_evaluation_control_charge(control, work);
+        if (rc) return rc;
+        admitted += work;
+        rc = wl_columnar_session_serial_tail(control, 6, admitted, diagnostic);
+        if (rc) return rc;
+    }
+    journal->payload_ready = true;
     return 0;
 }
 
@@ -5530,164 +5765,101 @@ static int
 wl_columnar_session_serial_output_prepare(wl_col_session_t *sess,
     wl_columnar_serial_output_t **out)
 {
-    wl_evaluation_control_t *control = sess->base.evaluation_control;
     int rc =
         wl_columnar_eval_stack_cleanup_output(sess->serial_completion.frame,
-            out, control);
-    if (rc) return rc;
-    wl_columnar_serial_output_t *output = *out;
-    output->first_slot = WL_COLUMNAR_SERIAL_OUTPUT_COHORT;
-    /* Resolve every occurrence before publication. Empty heads are genuinely
-     * pinned too; no postcutoff mismatch can invent a no-output disposition. */
-    for (uint32_t si = 0; si < sess->plan->stratum_count; si++) {
-        const wl_plan_stratum_t *sp = &sess->plan->strata[si];
-        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
-            const char *name = sp->relations[ri].name;
-            col_rel_t *rel = NULL;
-            rc = wl_columnar_join_controlled_lookup(sess, name, &rel, control);
-            if (rc) return rc;
-            if (!rel) return EINVAL;
-            bool found = false;
-            for (uint32_t i = 0; i < output->count; i++) {
-                rc = wl_evaluation_control_charge(control, 8);
-                if (rc) return rc;
-                found = output->slots[i].relation == rel;
-                rc = wl_columnar_session_serial_tail(control, 4, i, output);
-                if (rc) return rc;
-                if (found) break;
-            }
-            if (found) continue;
-            if (output->count ==
-                WL_COLUMNAR_SERIAL_OUTPUT_COHORT) return ENOTSUP;
-            wl_columnar_serial_output_slot_t *slot =
-                &output->slots[output->count];
-            slot->relation = rel; slot->name = name;
-            output->initialized = output->count + 1u;
-            rc = wl_columnar_relation_combined_reader_controlled(rel,
-                    &slot->reader, control);
-            if (rc) return rc;
-            rc = wl_evaluation_control_charge(control, 32);
-            if (rc) return rc;
-            if (rel->nrows > rel->capacity || rel->arena_owned ||
-                rel->col_shared
-                || rel->compound_kind != WIRELOG_COMPOUND_KIND_NONE
-                || rel->compound_count || rel->inline_physical_offset
-                || (rel->ncols && !rel->row_scratch)
-                || (rel->nrows && rel->ncols && !rel->columns)) return EINVAL;
-            rc = wl_columnar_session_serial_tail(control, 4, output->count,
-                    output);
-            if (rc) return rc;
-            for (uint32_t c = 0; c < rel->ncols; c++) {
-                rc = wl_evaluation_control_charge(control, 8);
-                if (rc) return rc;
-                if (rel->nrows && !rel->columns[c]) return EINVAL;
-                rc = wl_columnar_session_serial_tail(control, 4, c, output);
-                if (rc) return rc;
-            }
-            output->count++;
-        }
-    }
-    for (uint32_t si = 0; si < sess->plan->stratum_count; si++) {
-        const wl_plan_stratum_t *sp = &sess->plan->strata[si];
-        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
-            rc = wl_evaluation_control_charge(control, 32);
-            if (rc) return rc;
-            output->occurrences++;
-            if (!wl_columnar_memory_size_add(output->future_work, 32,
-                &output->future_work)) return EOVERFLOW;
-            rc = wl_columnar_session_serial_tail(control, 4, ri, output);
-            if (rc) return rc;
-            uint32_t slot;
-            rc = wl_columnar_session_serial_select(output,
-                    sp->relations[ri].name, &slot, control);
-            if (rc) return rc;
-            if (slot == output->count) return EINVAL;
-            col_rel_t *rel = output->slots[slot].relation;
-            uint64_t cells;
-            if (!wl_columnar_memory_size_mul(rel->nrows, rel->ncols, &cells)
-                || !wl_columnar_memory_size_add(output->rows, rel->nrows,
-                &output->rows)
-                || !wl_columnar_memory_size_add(output->cells, cells,
-                &output->cells)) return EOVERFLOW;
-            if (rel->nrows &&
-                output->first_slot == WL_COLUMNAR_SERIAL_OUTPUT_COHORT)
-                output->first_slot = slot;
-        }
-    }
-    if (output->first_slot != WL_COLUMNAR_SERIAL_OUTPUT_COHORT) {
-        col_rel_t *first = output->slots[output->first_slot].relation;
-        for (uint32_t c = 0; c < first->ncols; c++) {
-            rc = wl_evaluation_control_charge(control, 8);
-            if (rc) return rc;
-            first->row_scratch[c] = first->columns[c][0];
-            rc = wl_columnar_session_serial_tail(control, 5, c + 1u, output);
-            if (rc) return rc;
-        }
-        output->first_gathered = true;
-        output->cells -= first->ncols;
-    }
-    uint64_t gather_work, tuple_work;
-    if (!wl_columnar_memory_size_mul(output->cells, 8, &gather_work)
-        || !wl_columnar_memory_size_mul(output->rows, 32, &tuple_work)
-        || !wl_columnar_memory_size_add(output->future_work, gather_work,
-        &output->future_work)
-        || !wl_columnar_memory_size_add(output->future_work, tuple_work,
-        &output->future_work)) return EOVERFLOW;
-    for (uint64_t admitted = 0; admitted < output->future_work;) {
-        uint64_t work = output->future_work - admitted;
-        if (work > WL_EVALUATION_CONTROL_QUANTUM)
-            work = WL_EVALUATION_CONTROL_QUANTUM;
-        rc = wl_evaluation_control_charge(control, work);
-        if (rc) return rc;
-        admitted += work;
-        rc = wl_columnar_session_serial_tail(control, 6, admitted, output);
-        if (rc) return rc;
-    }
-    return 0;
+            out, sess->base.evaluation_control);
+    return rc ? rc : wl_columnar_session_serial_output_prepare_journal(sess,
+               &(*out)->journal, *out);
 }
 
 static void
 wl_columnar_session_serial_output_deliver(wl_col_session_t *sess,
-    wl_columnar_serial_output_t *output, wirelog_on_tuple_fn callback,
+    wl_columnar_serial_completion_t *journal, wirelog_on_tuple_fn callback,
     void *user_data)
 {
-    bool first = output->first_gathered;
+    bool first = (journal->phase & WL_COLUMNAR_SERIAL_OUTPUT_FIRST_GATHERED) !=
+        0;
+    int64_t zero_arity = 0;
     for (uint32_t si = 0; si < sess->plan->stratum_count; si++) {
         const wl_plan_stratum_t *sp = &sess->plan->strata[si];
         for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
             const char *name = sp->relations[ri].name;
-            uint32_t slot = output->count;
-            /* Exact preparation slot/byte order, with no fallible helper or
-            * negative poll in this fully prepaid terminal ENGINE region. */
-            for (uint32_t i = 0; i < output->count; i++) {
-                const char *representative = output->slots[i].name;
-                size_t pos = 0;
-                for (;;) {
-                    unsigned char a = (unsigned char)name[pos];
-                    unsigned char b = (unsigned char)representative[pos];
-                    if (a != b || !a) {
-                        if (a == b) slot = i;
-                        break;
-                    }
-                    pos++;
-                }
-                if (slot != output->count) break;
-            }
-            if (slot == output->count) continue; /* Prevalidated disposition. */
-            col_rel_t *rel = output->slots[slot].relation;
+            col_rel_t *rel = wl_columnar_session_serial_output_lookup(sess,
+                    name);
+            if (!rel) continue;
             for (uint32_t row = 0; row < rel->nrows; row++) {
                 if (!first) {
                     for (uint32_t c = 0; c < rel->ncols; c++)
                         rel->row_scratch[c] = rel->columns[c][row];
                 }
                 first = false;
-                callback(name,
-                    rel->ncols ? rel->row_scratch : &output->zero_arity,
+                callback(name, rel->ncols ? rel->row_scratch : &zero_arity,
                     rel->ncols, user_data);
             }
         }
     }
-    output->consumed = true;
+    journal->phase |= WL_COLUMNAR_SERIAL_OUTPUT_CONSUMED;
+}
+
+static bool
+wl_columnar_session_serial_stable(const wl_col_session_t *sess)
+{
+    return sess->snapshot_stable_valid && !sess->pending_input_change
+           && !sess->pending_full_input_eval && !sess->last_inserted_relation
+           && !sess->last_removed_relation && !sess->delta_seeded
+           && !sess->retraction_seeded;
+}
+
+static int
+wl_columnar_session_serial_stable_output(wl_col_session_t *sess,
+    wirelog_on_tuple_fn callback, void *user_data)
+{
+    wl_columnar_serial_completion_t *journal = &sess->serial_completion;
+    if (journal->active) return EBUSY;
+    if (journal->mode == WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT
+        && journal->pending) {
+        bool consumed = (journal->phase & WL_COLUMNAR_SERIAL_OUTPUT_CONSUMED) !=
+            0;
+        int rc = wl_columnar_session_serial_output_drain(sess, journal);
+        if (rc) return rc;
+        memset(journal, 0, sizeof(*journal));
+        if (consumed) return 0;
+    }
+    if (!callback || !wl_columnar_session_serial_stable(sess)) return EBUSY;
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    int rc = wl_evaluation_control_charge(control, 128);
+    if (rc) return rc;
+    if (!sess->plan || journal->pending || journal->frame || journal->mode_frame
+        || sess->cleanup_active || sess->cleanup_pending || sess->coordinator
+        || sess->num_workers > 1 || sess->delta_cb || sess->delta_observer
+        || sess->delta_publish_active || sess->diff_operators_active
+        || sess->tdd_input_run || sess->tdd_subpass_active
+        || sess->tdd_outbound_only_active || sess->plain_step_completion_pending
+        || sess->join_output_shared_count || sess->join_batch_bytes)
+        return ENOTSUP;
+    for (uint32_t si = 0; si < sess->plan->stratum_count; si++) {
+        rc = wl_evaluation_control_charge(control, 16);
+        if (rc) return rc;
+        const wl_plan_stratum_t *sp = &sess->plan->strata[si];
+        if (sp->is_recursive || (sp->relation_count && !sp->relations))
+            return ENOTSUP;
+        rc = wl_columnar_session_serial_tail(control, 1, si, NULL);
+        if (rc) return rc;
+    }
+    memset(journal, 0, sizeof(*journal));
+    journal->mode = WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT;
+    journal->pending = true;
+    journal->active = true;
+    journal->snapshot = true;
+    rc = wl_columnar_session_serial_output_prepare_journal(sess, journal, NULL);
+    if (!rc) rc = wl_columnar_session_serial_tail(control, 7, 0, NULL);
+    if (!rc) wl_columnar_session_serial_output_deliver(sess, journal, callback,
+            user_data);
+    int cleanup = wl_columnar_session_serial_output_drain(sess, journal);
+    if (cleanup > 0 && rc <= 0) rc = cleanup;
+    journal->active = false;
+    if (!cleanup) memset(journal, 0, sizeof(*journal));
+    return rc;
 }
 
 static int
@@ -5696,6 +5868,7 @@ wl_columnar_session_serial_attempt(wl_col_session_t *sess, bool snapshot,
 {
     wl_columnar_serial_completion_t *state = &sess->serial_completion;
     wl_evaluation_control_t *control = sess->base.evaluation_control;
+    if (state->mode == WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT) return EBUSY;
     if (state->active || (state->pending
         && (state->snapshot != snapshot || state->plan != sess->plan)))
         return EBUSY;
@@ -5865,7 +6038,8 @@ wl_columnar_session_serial_attempt(wl_col_session_t *sess, bool snapshot,
         sess->has_evaluated = true;
         sess->snapshot_stable_valid = true;
         state->phase = 5;
-        if (output) wl_columnar_session_serial_output_deliver(sess, output,
+        if (output) wl_columnar_session_serial_output_deliver(sess,
+                &output->journal,
                 callback, user_data);
     }
     if (state->phase == 5) {
@@ -5886,6 +6060,12 @@ static int
 col_session_step_impl(wl_session_t *session)
 {
     wl_col_session_t *sess = COL_SESSION(session);
+    if (sess->serial_completion.mode ==
+        WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT) {
+        if (sess->serial_completion.active || !(sess->serial_completion.phase
+            & WL_COLUMNAR_SERIAL_OUTPUT_CONSUMED)) return EBUSY;
+        return wl_columnar_session_serial_stable_output(sess, NULL, NULL);
+    }
     if (sess->base.evaluation_control
         && (sess->serial_completion.pending || !sess->has_evaluated
         || (sess->pending_input_change && sess->pending_full_input_eval)))
@@ -6497,7 +6677,10 @@ wl_columnar_session_has_retained_cleanup(const wl_col_session_t *sess)
     if (!sess)
         return false;
     if (sess->cleanup_active || sess->cleanup_pending || sess->delta_rollback
-        || sess->serial_completion.frame)
+        || (sess->serial_completion.mode ==
+        WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT
+            ? sess->serial_completion.pending : sess->serial_completion.frame !=
+        NULL))
         return true;
     if (!sess->coordinator) {
         for (uint32_t w = 0; w < sess->tdd_workers_count; w++) {
@@ -6574,6 +6757,12 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
         return EINVAL;
 
     wl_col_session_t *sess = COL_SESSION(session);
+    if (sess->serial_completion.mode == WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT
+        || (sess->base.evaluation_control
+        && !sess->serial_completion.pending
+        && wl_columnar_session_serial_stable(sess)))
+        return wl_columnar_session_serial_stable_output(sess, callback,
+                   user_data);
     if (sess->base.evaluation_control
         && (sess->serial_completion.pending || !sess->has_evaluated
         || (sess->pending_input_change && sess->pending_full_input_eval)))

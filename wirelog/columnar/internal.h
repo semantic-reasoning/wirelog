@@ -1978,7 +1978,7 @@ typedef struct wl_columnar_eval_stack_cleanup_frame
     wl_columnar_eval_stack_cleanup_frame_t;
 /* Scalar continuation only. Original-address ownership stays in the frame.
  * Mode and readiness deliberately live outside the phase-exclusive payload. */
-typedef struct wl_columnar_serial_completion {
+typedef struct wl_columnar_session_serial_completion_original {
     const wl_plan_t *plan;
     wl_columnar_eval_stack_cleanup_frame_t *frame, *mode_frame;
     uint32_t stratum, relation, compact, bookkeeping;
@@ -1986,7 +1986,38 @@ typedef struct wl_columnar_serial_completion {
     uint32_t reset_stratum, reset_relation, frontier_stratum, frontier_rule;
     uint64_t stored_bytes;
     bool pending, active, snapshot, payload_ready;
+} wl_columnar_session_serial_completion_original_t;
+typedef struct wl_columnar_serial_completion {
+    const wl_plan_t *plan;
+    union {
+        struct {
+            wl_columnar_eval_stack_cleanup_frame_t *frame, *mode_frame;
+            uint32_t stratum, relation, compact, bookkeeping;
+        };
+        struct {
+            uintptr_t output_identity;
+            col_rel_t *output_partial;
+            uint32_t output_acquire_stratum, output_acquire_relation;
+            uint32_t output_release_stratum, output_release_relation;
+        };
+    };
+    uint32_t phase, mode;
+    union {
+        struct {
+            uint32_t reset_stratum, reset_relation;
+            uint32_t frontier_stratum, frontier_rule;
+        };
+        struct { uint64_t output_rows, output_cells; };
+    };
+    uint64_t stored_bytes;
+    bool pending, active, snapshot, payload_ready;
 } wl_columnar_serial_completion_t;
+_Static_assert(sizeof(wl_columnar_serial_completion_t)
+    == sizeof(wl_columnar_session_serial_completion_original_t),
+    "inline output must preserve the original completion size");
+_Static_assert(_Alignof(wl_columnar_serial_completion_t)
+    == _Alignof(wl_columnar_session_serial_completion_original_t),
+    "inline output must preserve the original completion alignment");
 struct wl_columnar_retained_eval_entry;
 struct wl_columnar_kfusion_cohort;
 typedef struct wl_columnar_eval_tdd_run wl_columnar_eval_tdd_run_t;
@@ -4103,25 +4134,28 @@ typedef struct wl_columnar_session_hash_controlled_registry {
     bool ready, published;
 } wl_columnar_session_hash_controlled_registry_t;
 
-#define WL_COLUMNAR_SERIAL_OUTPUT_COHORT 64u
 #define WL_COLUMNAR_SERIAL_FRAME_EVALUATION 0u
 #define WL_COLUMNAR_SERIAL_FRAME_REGISTRY 1u
 #define WL_COLUMNAR_SERIAL_FRAME_OUTPUT 2u
 #define WL_COLUMNAR_SERIAL_FRAME_OPERATOR 3u
 #define WL_COLUMNAR_SERIAL_FRAME_WORKSPACE_INITIALIZING 4u
-typedef struct wl_columnar_serial_output_slot {
-    wl_columnar_source_access_reader_t reader;
-    col_rel_t *relation;
-    const char *name;
-} wl_columnar_serial_output_slot_t;
+#define WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT 5u
+#define WL_COLUMNAR_SERIAL_OUTPUT_CURRENT 1u
+#define WL_COLUMNAR_SERIAL_OUTPUT_DESCRIPTOR 2u
+#define WL_COLUMNAR_SERIAL_OUTPUT_SOURCE 4u
+#define WL_COLUMNAR_SERIAL_OUTPUT_RELEASING 8u
+#define WL_COLUMNAR_SERIAL_OUTPUT_FIRST_GATHERED 16u
+#define WL_COLUMNAR_SERIAL_OUTPUT_CONSUMED 32u
 typedef struct wl_columnar_serial_output {
-    wl_columnar_serial_output_slot_t slots[WL_COLUMNAR_SERIAL_OUTPUT_COHORT];
-    uint64_t future_work, byte_visits, candidate_visits, occurrences;
-    uint64_t rows, cells;
-    uint32_t initialized, count, first_slot;
-    bool first_gathered, consumed;
-    int64_t zero_arity;
+    wl_columnar_serial_completion_t journal;
 } wl_columnar_serial_output_t;
+int wl_columnar_session_serial_output_drain(wl_col_session_t *,
+    wl_columnar_serial_completion_t *);
+bool wl_columnar_eval_stack_output_journal_owned(wl_col_session_t *,
+    const wl_columnar_serial_completion_t *);
+int wl_columnar_relation_count_reader_controlled(
+    wl_columnar_source_access_gate_t *, uint32_t *, uint32_t,
+    uint64_t, wl_evaluation_control_t *);
 int wl_columnar_session_hash_registry_controlled(
     wl_columnar_session_hash_controlled_registry_t *, wl_col_session_t *,
     col_rel_t *, wl_evaluation_control_t *);

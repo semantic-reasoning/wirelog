@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **331**). The earlier audit sections
+match the script's count (currently **334**). The earlier audit sections
 retain their historical per-section counts.
 
 Format: `file:function[#N]` | field | operation | order | justification.
@@ -834,6 +834,9 @@ checks under exclusive ownership do not imply an acquire publication edge.
 | `relation.c:wl_columnar_relation_publish_retained_controlled#2` | `previous_out->state` | `atomic_load_explicit` | `acquire` | Acquire actual old/new reservation states before validated owner-transfer publication; no detached token copy. |
 | `relation.c:wl_columnar_relation_publish_retained_controlled#3` | `previous_out->state` | `atomic_load_explicit` | `acquire` | Acquire actual old/new reservation states before validated owner-transfer publication; no detached token copy. |
 | `relation.c:wl_columnar_relation_publish_payload_controlled` | `previous_out->state` | `atomic_load_explicit` | `acquire` | Acquire actual previous payload reservation state before publication/retirement of the old physical payload. |
+| `relation.c:wl_columnar_relation_count_reader_controlled` | `gate->state` | `atomic_load_explicit` | `relaxed` | Initial observed gate count for bounded controlled admission; successful acquire CAS supplies publication synchronization. |
+| `relation.c:wl_columnar_relation_count_reader_controlled#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | `acquire`/`relaxed` | MSVC acquires a real reader count; each retry is charged and the held subphase is recorded before hook/tail stop. |
+| `relation.c:wl_columnar_relation_count_reader_controlled#3` | `gate->state` | `atomic_compare_exchange_strong_explicit` | `acquire`/`relaxed` | Non-MSVC acquires a real reader count with the same charged retry and original journal disposition. |
 | `relation.c:wl_columnar_relation_reader_acquire_controlled` | `gate->state` | `atomic_load_explicit` | `relaxed` | Observe gate then acquire reader authority by bounded CAS; relaxed failed CAS carries only retry state, not payload authority. |
 | `relation.c:wl_columnar_relation_reader_acquire_controlled#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | `acquire`/`relaxed` | Observe gate then acquire reader authority by bounded CAS; relaxed failed CAS carries only retry state, not payload authority. |
 | `relation.c:wl_columnar_relation_reader_acquire_controlled#3` | `gate->state` | `atomic_compare_exchange_strong_explicit` | `acquire`/`relaxed` | Observe gate then acquire reader authority by bounded CAS; relaxed failed CAS carries only retry state, not payload authority. |

@@ -892,15 +892,15 @@ call.
 
 | field | written by | read by | verdict |
 |---|---|---|---|
-| `last_inserted_relation` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create`, `session_note_inserted_input`, `wl_columnar_session_serial_attempt` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `session_snapshot_insert` | PRESERVE |
-| `pending_input_change` | `col_session_create_internal`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_serial_attempt` | `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_preflight` | PRESERVE |
-| `pending_full_input_eval` | `col_session_insert`, `col_session_remove`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_serial_attempt` | `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_preflight` | PRESERVE |
+| `last_inserted_relation` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create`, `session_note_inserted_input`, `wl_columnar_session_serial_attempt` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `session_snapshot_insert`, `wl_columnar_session_serial_stable` | PRESERVE |
+| `pending_input_change` | `col_session_create_internal`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_serial_attempt` | `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_preflight`, `wl_columnar_session_serial_stable` | PRESERVE |
+| `pending_full_input_eval` | `col_session_insert`, `col_session_remove`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_serial_attempt` | `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_preflight`, `wl_columnar_session_serial_stable` | PRESERVE |
 | `has_evaluated` | `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_attempt` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_attempt`, `wl_columnar_session_serial_preflight` | PRESERVE |
-| `snapshot_stable_valid` | `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_serial_attempt` | `col_session_snapshot_impl` | PRESERVE |
-| `delta_seeded` | `insert_clone_prepare`, `tdd_worker_subpass_fn` | `col_eval_relation_plan`, `col_op_variable`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_filter_op_controlled`, `wl_columnar_join_op_controlled`, `wl_columnar_join_select_right`, `wl_columnar_merge_consolidate_controlled`, `wl_columnar_ops_map_controlled`, `wl_columnar_ops_reduce_controlled`, `wl_columnar_session_serial_preflight` | PRESERVE |
-| `last_removed_relation` | `col_session_remove_incremental`, `col_worker_session_create`, `session_retraction_cleanup` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_preflight` | PRESERVE |
-| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup` | `col_eval_relation_plan`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_filter_op_controlled`, `wl_columnar_join_op_controlled`, `wl_columnar_join_select_right`, `wl_columnar_merge_consolidate_controlled`, `wl_columnar_ops_map_controlled`, `wl_columnar_ops_reduce_controlled`, `wl_columnar_session_serial_preflight` | PRESERVE |
-| `plain_step_completion_pending` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create` | `col_session_insert`, `col_session_insert_incremental`, `col_session_make_compound`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion`, `wl_columnar_session_serial_preflight` | PRESERVE -- with `plain_step_completion_phase` this is the resume token |
+| `snapshot_stable_valid` | `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_serial_attempt` | `col_session_snapshot_impl`, `wl_columnar_session_serial_stable` | PRESERVE |
+| `delta_seeded` | `insert_clone_prepare`, `tdd_worker_subpass_fn` | `col_eval_relation_plan`, `col_op_variable`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_filter_op_controlled`, `wl_columnar_join_op_controlled`, `wl_columnar_join_select_right`, `wl_columnar_merge_consolidate_controlled`, `wl_columnar_ops_map_controlled`, `wl_columnar_ops_reduce_controlled`, `wl_columnar_session_serial_preflight`, `wl_columnar_session_serial_stable` | PRESERVE |
+| `last_removed_relation` | `col_session_remove_incremental`, `col_worker_session_create`, `session_retraction_cleanup` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_preflight`, `wl_columnar_session_serial_stable` | PRESERVE |
+| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup` | `col_eval_relation_plan`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_filter_op_controlled`, `wl_columnar_join_op_controlled`, `wl_columnar_join_select_right`, `wl_columnar_merge_consolidate_controlled`, `wl_columnar_ops_map_controlled`, `wl_columnar_ops_reduce_controlled`, `wl_columnar_session_serial_preflight`, `wl_columnar_session_serial_stable` | PRESERVE |
+| `plain_step_completion_pending` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create` | `col_session_insert`, `col_session_insert_incremental`, `col_session_make_compound`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion`, `wl_columnar_session_serial_preflight`, `wl_columnar_session_serial_stable_output` | PRESERVE -- with `plain_step_completion_phase` this is the resume token |
 | `plain_step_completion_phase` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE |
 | `plain_step_completion_step_context` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl` | PRESERVE |
 | `plain_step_completion_active` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_snapshot_impl`, `col_session_step_impl` | **COMMIT** on the step path -- a re-entrancy latch, not progress. While it stays set beside `plain_step_completion_pending`, the entry guard of both `col_session_step_impl` and `col_session_snapshot_impl` returns `EBUSY` above every line that would clear it. The snapshot path never writes it, so the snapshot cutoff has nothing to perform here. |
@@ -1024,27 +1024,51 @@ count greater than one is malformed. Owned sorted prefixes use the same range
 kernels; borrowed single ranges retain their full-input behavior. Typed helper
 coverage does not establish a generated MAP output schema.
 
-SNAPSHOT pins every selected distinct head, including empty heads. The current
-cohort limit is 64 distinct heads; 65 is rejected before canonical mutation.
-Repeated immutable plan occurrences have no separate occurrence limit.
-Preparation resolves every occurrence by deterministic byte comparisons against
-cohort representatives, including mismatch and terminating NUL visits. It counts
-and checks occurrence, candidate, byte, row and cell work before publication.
-Callbacks receive the actual occurrence's name pointer in legacy plan order.
+SNAPSHOT retains real descriptor and storage gate counts for each selected
+immutable plan occurrence, including empty heads and independently allocated
+A/B/A names. An original-address prefix journal records each successful count
+before a stop can be observed. There is no fixed distinct-head or occurrence
+limit. Missing heads retain the raw no-output disposition. Preparation counts
+exact linear registry selection and name comparison work, including mismatch
+and terminating NUL visits, plus occurrence, row and cell actions. Callbacks
+receive the actual occurrence's name pointer in legacy plan order.
+
+First-row preparation replays the immutable plan with its own preinspection
+charge and poll for every stratum and occurrence, including empty strata and
+missing heads with no registry candidates. These forward visits are separate
+from the prepaid terminal replay.
+
+Stable ordinary SNAPSHOT stores this journal in phase-exclusive bytes of the
+existing session completion record and allocates no evaluator frame or output
+heap storage. Its complete size and alignment are checked against the original
+record. Initial and dirty evaluating publication stores the journal in the
+retired final evaluator frame. The same enforcing shared governor retains all
+existing physical credits throughout preparation, delivery and cleanup.
+
+Partial acquisition and retirement have separate durable subphases. Mandatory
+cleanup releases only the actual partial pair and completed prefix, recording
+each real decrement before the next release. Original journal validation
+refusal retains the exact authority for serialized repair and retry. A consumed
+postcallback journal retries cleanup only. Positive initiating errors remain
+primary; positive cleanup failures replace nonpositive statuses. Session
+mutation and callback reentry are refused while this journal is pending.
+Borrowed plan bytes and unselected registry names remain externally serialized;
+selected gate counts do not freeze arbitrary external writes.
 
 The first nonempty row is gathered into the canonical row scratch with charged
 cell visits before cutoff, including real width 300 gathers. All remaining
 ENGINE comparisons, row gathers and tuple/span actions are prepaid in bounded
 admission groups in the same attempt. The terminal exception can span the
 entire finite admitted output batch; it has no refund or accounting reset.
-After the final cutoff no poll, fallible allocation, registry lookup or authority
-acquisition occurs. Cancellation requested by the first callback completes that
+After the final cutoff pure linear registry/name selection replays its fully
+prepaid order. No poll, fallible lookup, lazy hash construction, allocation or
+authority acquisition occurs. Cancellation requested by the first callback completes that
 batch successfully and remains sticky for the next attempt. A positive cleanup
 refusal after delivery preserves the consumed disposition; cleanup retry emits
 no duplicate callbacks.
 
-Output storage is the canonical scratch and a phase-exclusive union in the
-actual retained final evaluator frame. Compile-time assertions preserve that
+Evaluating output storage is the canonical scratch and a phase-exclusive union
+in the actual retained final evaluator frame. Compile-time assertions preserve that
 frame's original physical size and alignment. Registry workspace overlaps only
 retired stack bytes while the candidate result and outer reservation remain
 live. Output overlaps evaluator payload only after every prior owner retires.
