@@ -5374,7 +5374,21 @@ wl_columnar_session_serial_preflight(wl_col_session_t *sess)
                 && rp->ops[1].op == WL_PLAN_OP_FILTER
                 && rp->ops[2].op == WL_PLAN_OP_MAP
                 && rp->ops[3].op == WL_PLAN_OP_CONSOLIDATE;
-            if (!rp->name || !rp->ops || (!plain && !filtered)
+            if (rp->ops && (rp->op_count == 3 || rp->op_count == 4)
+                && rp->ops[1].op == WL_PLAN_OP_JOIN) {
+                rc = wl_evaluation_control_charge(control, 32);
+                if (rc) return rc;
+            }
+            bool joined = rp->ops && (rp->op_count == 3 || rp->op_count == 4)
+                && rp->ops[1].op == WL_PLAN_OP_JOIN
+                && (rp->ops[1].delta_mode == WL_DELTA_AUTO
+                || rp->ops[1].delta_mode == WL_DELTA_FORCE_FULL)
+                && !rp->ops[1].materialized &&
+                !rp->ops[1].right_filter_expr.size
+                && (rp->op_count == 3 ? rp->ops[2].op == WL_PLAN_OP_CONSOLIDATE
+                    : rp->ops[2].op == WL_PLAN_OP_MAP
+                && rp->ops[3].op == WL_PLAN_OP_CONSOLIDATE);
+            if (!rp->name || !rp->ops || (!plain && !filtered && !joined)
                 || rp->ops[0].op != WL_PLAN_OP_VARIABLE
                 || (rp->ops[0].delta_mode != WL_DELTA_AUTO
                 && rp->ops[0].delta_mode != WL_DELTA_FORCE_FULL))

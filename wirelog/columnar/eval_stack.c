@@ -685,6 +685,18 @@ wl_columnar_eval_stack_cleanup_operator_preparation_owner(
     *out = &frame->preparation;
     return 0;
 }
+wl_columnar_expr_operator_preparation_t *
+wl_columnar_eval_stack_cleanup_operator_preparation(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    return frame && frame->session && frame->session->cleanup_active == frame
+           && wl_columnar_eval_stack_cleanup_mode(frame) ==
+           WL_COLUMNAR_SERIAL_FRAME_OPERATOR
+           && frame->session->serial_completion.payload_ready &&
+           frame->preparation.ready
+        ? &frame->preparation : NULL;
+}
+
 int
 wl_columnar_eval_stack_cleanup_consolidate_prepare(
     wl_columnar_eval_stack_cleanup_frame_t *frame,

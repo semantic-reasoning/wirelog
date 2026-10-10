@@ -1431,6 +1431,43 @@ wl_columnar_join_controlled_pair(const wl_plan_op_t *op,
     return limit ? EOVERFLOW : tail;
 }
 
+static int
+wl_columnar_join_controlled_select_right(const wl_plan_op_t *op,
+    wl_col_session_t *sess, col_rel_t *full,
+    wl_columnar_relation_source_group_t *group,
+    wl_evaluation_control_t *control)
+{
+    if (op->delta_mode == WL_DELTA_FORCE_FULL || !full) return 0;
+    if (sess->current_iteration || sess->delta_observer) return ENOTSUP;
+    char name[256];
+    int rc = wl_evaluation_control_charge(control, 8);
+    if (rc) return rc;
+    name[0] = '$'; name[1] = 'd'; name[2] = '$';
+    size_t pos = 3;
+    while (pos < sizeof(name) - 1u) {
+        rc = wl_evaluation_control_charge(control, 2);
+        if (rc) return rc;
+        char value = op->right_relation[pos - 3u]; name[pos++] = value;
+        rc = wl_columnar_join_controlled_tail(control);
+        if (rc) return rc;
+        if (!value) break;
+    }
+    name[pos] = '\0';
+    col_rel_t *delta = NULL;
+    rc = wl_columnar_join_controlled_lookup(sess, name, &delta, control);
+    if (rc) return rc;
+    rc = wl_columnar_relation_source_group_acquire_controlled(group, full,
+            delta, control);
+    if (!rc) rc = wl_columnar_join_controlled_shape(full, control);
+    if (!rc && delta) rc = wl_columnar_join_controlled_shape(delta, control);
+    if (!rc) rc = wl_evaluation_control_charge(control, 8);
+    if (!rc && delta && delta->nrows &&
+        delta->nrows < full->nrows) rc = ENOTSUP;
+    if (!rc) rc = wl_columnar_join_controlled_tail(control);
+    /* Selection's two-slot cohort must really retire before the input pair. */
+    return wl_columnar_relation_source_group_drain(group, rc);
+}
+
 /* First explicit controlled strategy: ordinary full-right Cartesian/hash JOIN.
  * Private B1 rows cannot escape before the single operator journal cutoff. */
 static int
@@ -1444,7 +1481,8 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
         || sess->delta_seeded || sess->retraction_seeded
         || sess->retraction_right_pass || sess->join_batch_bytes
         || sess->join_output_shared_count || op->right_filter_expr.size
-        || op->materialized || op->delta_mode != WL_DELTA_FORCE_FULL
+        || op->materialized || (op->delta_mode != WL_DELTA_FORCE_FULL
+        && op->delta_mode != WL_DELTA_AUTO)
         || !sess->memory_governor)
         return ENOTSUP;
     wl_columnar_relation_source_group_t *group;
@@ -1464,9 +1502,8 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     uint32_t slot = stack->top - 1;
     col_rel_t *left = stack->items[slot].rel, *right = NULL, *out = NULL;
     eval_entry_t left_entry = {0};
-    wl_columnar_memory_reservation_t scratch_admission;
-    wl_columnar_memory_reservation_init(&scratch_admission);
-    bool scratch_held = false, popped = false, committed = false;
+    wl_columnar_expr_operator_preparation_t *preparation = NULL;
+    bool popped = false, committed = false;
     uint32_t *lk = NULL, *rk = NULL, *head = NULL, *next = NULL;
     wirelog_column_type_t *types = NULL;
     int64_t *tuple = NULL;
@@ -1479,6 +1516,9 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     rc = wl_columnar_join_controlled_lookup(sess, op->right_relation, &right,
             control);
     if (rc) return rc;
+    rc = wl_columnar_join_controlled_select_right(op, sess, right, group,
+            control);
+    if (rc) goto cleanup;
 #ifdef WL_PROFILE
     uint64_t profile_start = right ? now_ns() : 0;
     if (right) sess->profile.join_calls++;
@@ -1542,11 +1582,14 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
         || total > SIZE_MAX) {
         rc = EOVERFLOW; goto cleanup;
     }
+    rc = wl_columnar_eval_stack_cleanup_operator_preparation_owner(sess, stack,
+            &preparation, control);
+    if (rc) goto cleanup;
     if (total) {
         wl_columnar_memory_admission_status_t status;
         rc = wl_columnar_memory_governor_reserve_checked_controlled(
             wl_columnar_memory_governor_ref_get(sess->memory_governor),
-            total, &scratch_admission, &status, control);
+            total, &preparation->scratch, &status, control);
         if (rc) goto cleanup;
         if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
@@ -1556,7 +1599,7 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
             if (rc == ENOSPC) sess->memory_budget_denied = true;
             goto cleanup;
         }
-        scratch_held = true;
+        wl_columnar_join_controlled_checkpoint(control, 15, total, group, left);
         rc = wl_evaluation_control_charge(control, 1); if (rc) goto cleanup;
 #ifdef WL_TEST_JOIN_CACHE_HOOK
         if (kc && wl_columnar_join_test_fail_next_key_scratch_alloc) {
@@ -1565,10 +1608,19 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
         }
 #endif
         scratch = malloc((size_t)total);
+        preparation->scratch_payload = scratch;
         if (!scratch) {
             rc = ENOMEM; goto cleanup;
         }
         rc = wl_columnar_join_controlled_tail(control); if (rc) goto cleanup;
+        bool accepted;
+        rc =
+            wl_columnar_memory_governor_commit_controlled(&preparation->scratch,
+                scratch, &accepted, control);
+        if (rc) goto cleanup;
+        if (!accepted) {
+            rc = ENOMEM; goto cleanup;
+        }
         char *pos = scratch;
         lk = (uint32_t *)pos; rk = lk + kc; pos += keys_bytes;
         tuple = (int64_t *)pos; pos += row_bytes;
@@ -1701,6 +1753,11 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
                 if (rc) goto cleanup;
                 if (!match) break;
             }
+            /* This witness follows the completed key comparisons. */
+            wl_columnar_join_controlled_checkpoint(control, 16, candidates,
+                group, left);
+            rc = wl_columnar_join_controlled_tail(control);
+            if (rc) goto cleanup;
             if (match) {
                 rc = wl_columnar_join_controlled_pair(op, left, lr, right, rr,
                         width, tuple, record, sess, control);
@@ -1718,11 +1775,9 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_columnar_join_controlled_checkpoint(control, 13, 0, group, left);
     rc = wl_columnar_relation_private_append_batch_end_controlled(record);
     if (rc) goto cleanup;
-    free(scratch); scratch = NULL;
-    if (scratch_held) {
-        if (!wl_columnar_memory_release(&scratch_admission)) abort();
-        scratch_held = false;
-    }
+    rc = wl_columnar_expr_operator_retire(preparation, 0, false, control);
+    if (rc) goto cleanup;
+    scratch = NULL;
     wl_columnar_join_controlled_checkpoint(control, 6, 0, group, left);
     int reader_cleanup =
         wl_columnar_relation_source_group_release_readers(group, 0);
@@ -1776,9 +1831,9 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     return 0;
 cleanup:
     rc = wl_columnar_relation_private_batch_retire(record, rc);
-    free(scratch);
-    if (scratch_held &&
-        !wl_columnar_memory_release(&scratch_admission)) abort();
+    int preparation_rc = preparation
+        ? wl_columnar_expr_operator_retire(preparation, rc, true, control) : rc;
+    if (rc <= 0) rc = preparation_rc;
     int cleanup_rc = wl_columnar_relation_source_group_drain(group, rc);
     if (cleanup_rc > 0 && rc <= 0) rc = cleanup_rc;
     /* Refused pins or committed cleanup exception keep all real images owned

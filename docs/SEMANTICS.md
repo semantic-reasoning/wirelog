@@ -954,7 +954,9 @@ and a new claim about this field belongs in a test before it belongs here.
 
 `wl_columnar_session_serial_attempt` handles initial and dirty full-input W1 nonrecursive backend
 STEP and SNAPSHOT for the admitted VARIABLE/MAP/CONSOLIDATE and
-VARIABLE/FILTER/MAP/CONSOLIDATE pipelines.
+VARIABLE/FILTER/MAP/CONSOLIDATE pipelines, and genuine generated
+VARIABLE/JOIN/CONSOLIDATE or VARIABLE/JOIN/MAP/CONSOLIDATE pipelines.
+Pure projections keep actual JOIN fusion; expression projections keep MAP.
 Generated plans keep their actual stratum flags and default managed arena and
 pool objects. Controlled operators allocate governed heap images. This lane
 registers missing canonical heads and supports a supplied immutable legacy plan
@@ -1040,3 +1042,38 @@ owners; physical instructions/owners/scratch are freed and nulled before actual
 RESERVED rollback or COMMITTED release. Refused credit keeps its original slot
 and prefix index until true disposal; positive cleanup errors retain precedence.
 Legacy raw compiled disposal is not used for this mandatory mode.
+
+The ordinary generated JOIN lane admits AUTO full-right selection through the
+original full/delta source pair. It drains that pair before acquiring the actual
+left/right pair; absent, empty, equal and larger deltas use the full right input.
+Strict positive smaller deltas remain an outstanding selected-lane gap, as do
+seeded, differential, cached, materialized and batch JOIN paths. The legacy
+256-byte truncated delta name is gathered with finite charged byte visits.
+
+JOIN scratch keeps the existing hash/key/type/tuple allocation and byte count.
+Its original preparation token reserves before allocation and commits after the
+physical pointer is stored in the frame. Healthy retirement is charged; failed
+execution or pending disposal uses the same checked mandatory drain without new
+work admission. Physical scratch is freed and nulled before original RESERVED
+rollback or COMMITTED release; refusal retains the token and frame. Positive
+primary errors remain primary while mandatory cleanup still runs. JOIN, MAP and
+CONS reuse the original private record only after real source and writer drain,
+with a fresh acquisition nonce. Generated product and keyed collision tests
+include completed unequal comparisons before cancellation and zero output.
+
+An actually compacted empty canonical head has capacity zero and no active
+column grid. The controlled bulk publisher admits this destination only when
+its row count is also zero under real destination writers. Positive incoming
+rows use the existing governed growth transaction to build all new lanes before
+copying. Retained scratch and auxiliary credit remain owned; zero capacity does
+not imply zero total retained bytes. Other missing tables or lanes remain
+malformed. The selected owned CONS cap of 10000 and general typed producers
+remain outstanding full-task work. FLOAT-key signed-zero equality is tested
+with a genuine fused INT64 projection; no implicit MAP payload is typed proof.
+
+The existing TEMPORARY ledger gauge is captured during prepublication
+bookkeeping while the final attempt frame is live. It remains that attribution
+snapshot after terminal frame retirement. Actual ownership cleanup is attested
+by the original frame pointer, cleanup reservation, source authority and governor
+usage; a nonzero historical TEMPORARY gauge does not assert a live reservation.
+The stored payload gauge includes the actual retained column pointer table.

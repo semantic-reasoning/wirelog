@@ -4316,10 +4316,14 @@ test_controlled_join_keyed_first(void)
             /* Entry guard40 + name/entry22 + grouped inputs98 + shape34,
              * arithmetic64 + bucket doubling11 + scratch16 + keys13 + types2,
              * fresh ctor161 + type BUILD186 + ledger56 + durable writer admission,
-             * bucket zero2048 + build1539 + empty probes1026 + outer513 + final116. */
+             * bucket zero2048 + build1539 + empty probes1026 + outer513 + final116.
+             * Original workspace clear sizeof(record), token init288, scratch
+             * ordinary commit4 and healthy zero-prefix retirement160. */
             CHECK(cost == 40 + 22 + 98 + 34 + 64 + 11 + 16 + 13 + 2
                 + 161 + 186 + 56 + private_writer_begin_cost() + 2048 + 1539
-                + 1026 + 513 + 116 + 96 + 64);
+                + 1026 + 513 + 116 + 96 + 64
+                + sizeof(wl_columnar_consolidate_record_t) + 3u*96u + 4u
+                + 96u + 64u);
         }
         CHECK(join_dispatch(raw, reference, &op, NULL) == 0);
         CHECK(join_output(frame)->nrows == (empty ? 0u : 9u));
@@ -5005,11 +5009,14 @@ test_controlled_join_empty_right_visits(void)
         retry(c, 0); CHECK(join_dispatch(sess, frame, &op, c) == 0);
         uint64_t cost = finish(c, 0);
         /* Fixed entry/group/shape/scratch, actual type and constructor widths,
-        * BUILD schema, one L request, B1 admission,513 visits and final116. */
+         * BUILD schema, one L request, B1 admission,513 visits and final116.
+         * Original workspace clear, token init288, commit4 and retire160. */
         CHECK(cost == 40 + 22 + 98 + 33 + 64 + 16 + (zero ? 1u : 2u)
             + constructor_cost("$join", zero ? 1u : 2u, COL_REL_INIT_CAP, false)
             + (zero ? 169u : 186u) + 56 + private_writer_begin_cost()
-            + 513 + 116 + 96 + 64);
+            + 513 + 116 + 96 + 64
+            + sizeof(wl_columnar_consolidate_record_t) + 3u*96u + 4u
+            + 96u + 64u);
         CHECK(join_dispatch(raw, reference, &op, NULL) == 0);
         join_multiset_equal(join_output(frame), join_output(reference));
         CHECK(!join_output(frame)->nrows &&
@@ -16512,6 +16519,605 @@ test_serial_filtered_attempts(void)
         "serial filtered: genuine generated AUTO FILTER/MAP/CONS initial/repeat raw twins, compiled/growth/retirement stops and original checked cleanup passed");
 }
 
+/* Genuine immutable generated JOIN callers, including original scratch owner. */
+static wl_col_session_t *joined_session;
+static bool joined_keyed;
+static int joined_last_consolidate;
+static unsigned joined_mode, joined_seen, joined_builds, joined_probes,
+    joined_candidates, joined_compared, joined_drained, joined_map_seen;
+static wl_columnar_relation_private_batch_t *joined_batch;
+static uint64_t joined_nonce;
+static wl_columnar_expr_operator_preparation_t *joined_fault_record;
+static wl_columnar_memory_reservation_t *joined_fault_token;
+static const void *joined_identity;
+static wl_evaluation_control_t *joined_control;
+static wl_columnar_relation_bulk_append_t *joined_regrowth;
+static wl_columnar_memory_reservation_t *joined_regrowth_token;
+static const void *joined_regrowth_identity;
+static unsigned joined_copied;
+static void
+joined_bulk(wl_evaluation_control_t *c, int phase,
+    wl_columnar_relation_bulk_append_t *r)
+{
+    if (phase != 4 || !r->dst || strcmp(r->dst->name, "H") || r->dst->capacity
+        || r->dst->nrows || r->dst->columns || joined_seen) return;
+    CHECK(r->active && r->growth && !r->published && r->transaction_active
+        && r->writer.owner && r->descriptor_writer.owner && r->count == 1);
+    joined_regrowth = r;
+    if (joined_mode == 9) {
+        joined_seen++; wl_evaluation_control_request_cancel(c);
+    } else if (joined_mode == 12) {
+        joined_regrowth_token =
+            r->pending.growth ? &r->dst->retained_reservation :
+            &r->pending.fresh;
+        CHECK(joined_regrowth_token->identity == joined_regrowth_token
+            && atomic_load(&joined_regrowth_token->state) ==
+            (r->pending.growth ? WL_COLUMNAR_MEMORY_RESERVATION_REPLACING :
+            WL_COLUMNAR_MEMORY_RESERVATION_RESERVED));
+        joined_regrowth_identity = joined_regrowth_token->identity;
+        joined_regrowth_token->identity = NULL; /* Real original transaction authority fault. */
+        joined_seen++;
+    }
+}
+static void
+joined_copy(wl_evaluation_control_t *c, uint64_t work)
+{
+    CHECK(work <= WL_EVALUATION_CONTROL_QUANTUM);
+    if (!joined_regrowth || !joined_regrowth->active ||
+        !joined_regrowth->prepared_columns
+        || work != 1 || joined_copied) return;
+    /* prepare_growth publishes columns_out only after all allocations. The
+     * next one-cell tail follows the actual first incoming source copy. */
+    CHECK(joined_regrowth->prepared_columns[0][0] == 1000001
+        && joined_regrowth->dst->columns == NULL &&
+        !joined_regrowth->dst->nrows);
+    joined_copied++;
+    if (joined_mode == 10) {
+        joined_seen++; wl_evaluation_control_request_cancel(c);
+    }
+}
+static void
+joined_cutoff(wl_evaluation_control_t *c,
+    wl_columnar_memory_reservation_t *token, unsigned phase)
+{
+    if (joined_mode != 11 || joined_seen || !joined_regrowth
+        || phase != WL_COLUMNAR_MEMORY_GOVERNOR_COMMIT_CUTOFF) return;
+    wl_columnar_relation_bulk_append_t *r = joined_regrowth;
+    if (token !=
+        (r->pending.growth ? &r->dst->retained_reservation :
+        &r->pending.fresh)) return;
+    CHECK(r->transaction_active && !r->published && r->prepared_columns
+        && !r->dst->columns && !r->dst->nrows && joined_copied);
+    joined_seen++; wl_evaluation_control_request_cancel(c);
+}
+static void
+joined_capture(const char *name, const int64_t *row, uint32_t width, void *data)
+{
+    serial_capture_t *capture = data;
+    CHECK(name && row && width == capture->width);
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++)
+        capture->digest = capture->digest * UINT64_C(1099511628211) ^ *p;
+    for (uint32_t c = 0; c < width; c++)
+        capture->digest = capture->digest *
+            UINT64_C(1099511628211) ^ (uint64_t)row[c];
+    capture->count++;
+}
+static void
+joined_fault(wl_columnar_expr_operator_preparation_t *r)
+{
+    CHECK(r && r == wl_columnar_eval_stack_cleanup_operator_preparation(
+            joined_session->cleanup_active) && r->scratch.bytes);
+    joined_fault_record = r; joined_fault_token = &r->scratch;
+    joined_identity = joined_fault_token->identity;
+    CHECK(joined_identity == joined_fault_token);
+    joined_fault_token->identity = NULL; /* Original scalar identity fault only. */
+    joined_seen++;
+}
+static void
+joined_retire(wl_columnar_expr_operator_preparation_t *r, int phase)
+{
+    if (joined_mode == 5 && !joined_seen && phase == 4 && r->scratch.bytes) {
+        CHECK(!r->scratch_payload && atomic_load(&r->scratch.state) ==
+            WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+        joined_fault(r);
+    }
+}
+static void
+joined_checkpoint(wl_evaluation_control_t *c, int phase, uint64_t progress,
+    wl_columnar_relation_source_group_t *group, col_rel_t *left)
+{
+    (void)left;
+    if (phase == 3) joined_builds++;
+    if (phase == 4) joined_probes++;
+    if (phase == 5) joined_candidates++;
+    if (phase == 16) joined_compared++;
+    if (phase == 13) {
+        joined_batch =
+            wl_columnar_eval_stack_cleanup_reduce_batch(
+            joined_session->cleanup_active);
+        CHECK(joined_batch && joined_batch->batch.active);
+        if (!joined_keyed) CHECK(joined_batch->batch.relation->nrows >= 9409
+                && joined_batch->batch.relation->capacity >=
+                joined_batch->batch.relation->nrows
+                && joined_batch->batch.relation->capacity > COL_REL_INIT_CAP);
+        joined_nonce = joined_batch->batch.single.lease.acquisition_nonce;
+        CHECK(joined_nonce &&
+            joined_batch->batch.single.descriptor.writer.identity ==
+            (uintptr_t)&joined_batch->batch.single.descriptor.writer);
+    }
+    if (phase == 14) {
+        CHECK(joined_batch &&
+            wl_columnar_relation_private_batch_disposable(joined_batch)
+            && !group->descriptor_count && !group->owner_count);
+        joined_drained++;
+    }
+    if (joined_seen) return;
+    if ((joined_mode == 1 || joined_mode == 2) && phase == 16 &&
+        progress == 257){
+        if (joined_mode == 2) {
+            wl_columnar_relation_private_batch_t *batch =
+                wl_columnar_eval_stack_cleanup_reduce_batch(
+                joined_session->cleanup_active);
+            CHECK(joined_builds && joined_probes && joined_candidates >= 257
+                && joined_compared >= 257 && batch &&
+                !batch->batch.relation->nrows);
+        }
+        joined_seen++; wl_evaluation_control_request_cancel(c);
+    }
+    if ((joined_mode == 3 || joined_mode == 4 || joined_mode == 6) &&
+        phase == 15){
+        wl_columnar_expr_operator_preparation_t *r =
+            wl_columnar_eval_stack_cleanup_operator_preparation(
+            joined_session->cleanup_active);
+        CHECK(r && !r->scratch_payload && atomic_load(&r->scratch.state) ==
+            WL_COLUMNAR_MEMORY_RESERVATION_RESERVED);
+        if (joined_mode == 6) joined_seen++;
+        else joined_fault(r);
+        if (joined_mode == 4) CHECK(wl_evaluation_control_charge(c,
+                UINT64_MAX) == EOVERFLOW);
+        else wl_evaluation_control_request_cancel(c);
+    }
+}
+static void
+joined_map(wl_evaluation_control_t *c, int phase, uint64_t progress,
+    wl_columnar_relation_source_group_t *group, col_rel_t *source)
+{
+    (void)c; (void)progress; (void)group;
+    if (phase == 1) {
+        CHECK(joined_drained && joined_batch ==
+            wl_columnar_eval_stack_cleanup_reduce_batch(
+                joined_session->cleanup_active)
+            && wl_columnar_relation_private_batch_disposable(joined_batch)
+            && source && source->storage_owner == source);
+    }
+    if (phase == 9) {
+        CHECK(joined_batch->batch.active &&
+            joined_batch->batch.single.lease.acquisition_nonce
+            != joined_nonce);
+        joined_nonce = joined_batch->batch.single.lease.acquisition_nonce;
+        joined_map_seen++;
+    }
+}
+static void
+joined_consolidate(wl_evaluation_control_t *c, int phase, uint64_t progress,
+    wl_columnar_consolidate_record_t *record, col_rel_t *r)
+{
+    (void)c; (void)progress; (void)record;
+    joined_last_consolidate = phase;
+    if (phase == 37 || phase == 40) {
+        CHECK(joined_drained && joined_batch ==
+            wl_columnar_eval_stack_cleanup_reduce_batch(
+                joined_session->cleanup_active)
+            && joined_batch->batch.single.lease.acquisition_nonce !=
+            joined_nonce
+            && col_rel_mutation_lease_validate(
+                &joined_batch->batch.single.lease, r) == 0);
+    }
+}
+static wl_col_session_t *
+joined_create(const wl_plan_t *plan)
+{
+    wl_session_t *base = NULL;
+    CHECK(wl_session_create(wl_backend_columnar(), plan, 1, &base) == 0);
+    wl_col_session_t *s = COL_SESSION(base);
+    CHECK(s->eval_arena && s->delta_pool && !s->has_evaluated &&
+        !session_find_rel(s, "H"));
+    return s;
+}
+static uint64_t
+joined_trial(bool expression, bool keyed, bool repeat, bool snapshot,
+    unsigned mode, uint64_t limit)
+{
+    wirelog_error_t e;
+    const char *text = keyed ?
+        ".decl L(x:int64,y:int64)\n.decl R(x:int64,z:int64)\n.decl H(x:int64,y:int64,z:int64)\nH(x,y,z):-L(x,y),R(x,z).\n"
+        : expression ?
+        ".decl L(x:int64)\n.decl R(y:int64)\n.decl H(x:int64,y:int64)\nH(x+1,y):-L(x),R(y).\n"
+        :
+        ".decl L(x:int64)\n.decl R(y:int64)\n.decl H(x:int64,y:int64)\nH(x,y):-L(x),R(y).\n";
+    wirelog_program_t *program = wirelog_parse_string(text, &e);
+    CHECK(program && e == WIRELOG_OK);
+    wl_plan_t *plan = NULL; CHECK(wl_plan_from_program(program, &plan) == 0);
+    CHECK(plan->stratum_count == 1 && !plan->strata[0].is_recursive
+        && plan->strata[0].relation_count == 1);
+    const wl_plan_relation_t *rp = &plan->strata[0].relations[0];
+    CHECK(rp->op_count == (expression ? 4u : 3u) &&
+        rp->ops[0].op == WL_PLAN_OP_VARIABLE
+        && rp->ops[0].delta_mode == WL_DELTA_AUTO &&
+        rp->ops[1].op == WL_PLAN_OP_JOIN
+        && rp->ops[1].delta_mode == WL_DELTA_AUTO
+        && rp->ops[rp->op_count - 1].op == WL_PLAN_OP_CONSOLIDATE);
+    CHECK(expression ? rp->ops[2].op == WL_PLAN_OP_MAP &&
+        rp->ops[2].map_expr_count
+        : rp->ops[1].project_count == (keyed ? 3u : 2u));
+    wl_col_session_t *s = joined_create(plan), *raw = joined_create(plan);
+    wl_evaluation_control_t *c = serial_attach(s, 0);
+    uint32_t width = keyed ? 2 : 1;
+    int64_t l[194], r[194];
+    col_rel_t *lr = session_find_rel(s, "L"); CHECK(lr);
+    int64_t key = 1;
+    for (uint32_t i = 0; i < 194; i++) {
+        if (keyed) {
+            while ((wl_columnar_hash_value(2166136261u, lr, 0,
+                key) & 255u) != 0) key++;
+            if (i < 97) {
+                l[2*i] = key++; l[2*i+1] = i;
+            }else {
+                r[2*(i-97)] = key++; r[2*(i-97)+1] = i;
+            }
+        } else if (i < 97) l[i] = i + 1;
+        else r[i-97] = i + 1;
+    }
+    CHECK(wl_backend_columnar()->session_insert(&s->base, "L", l, 97,
+        width) == 0
+        && wl_backend_columnar()->session_insert(&s->base, "R", r, 97,
+        width) == 0
+        && wl_backend_columnar()->session_insert(&raw->base, "L", l, 97,
+        width) == 0
+        && wl_backend_columnar()->session_insert(&raw->base, "R", r, 97,
+        width) == 0);
+    uint64_t empty_credit = 0;
+    if (repeat) {
+        CHECK(wl_backend_columnar()->session_step(&s->base) == 0
+            && wl_backend_columnar()->session_step(&raw->base) == 0);
+        if (keyed) {
+            col_rel_t *empty = session_find_rel(s, "H");
+            CHECK(empty && !empty->nrows && !empty->capacity && !empty->columns
+                && empty->column_types && empty->relation_identity
+                && empty->retained_reservation.identity ==
+                &empty->retained_reservation);
+            CHECK(!empty->merge_columns && !empty->timestamps &&
+                !empty->retract_backup_columns
+                && empty->retained_reserved_bytes == (empty->row_scratch ?
+                (uint64_t)empty->ncols*sizeof(int64_t) : 0));
+            empty_credit = empty->retained_reserved_bytes;
+            if (empty->retained_reserved_bytes) CHECK(atomic_load(
+                        &empty->retained_reservation.state)
+                    == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+        }
+        int64_t extra[2] = {1000001, 1000002};
+        CHECK(wl_backend_columnar()->session_insert(&s->base, "L", extra, 1,
+            width) == 0
+            && wl_backend_columnar()->session_insert(&s->base, "R", extra, 1,
+            width) == 0
+            && wl_backend_columnar()->session_insert(&raw->base, "L", extra, 1,
+            width) == 0
+            && wl_backend_columnar()->session_insert(&raw->base, "R", extra, 1,
+            width) == 0);
+    }
+    uint64_t retained_before = string_reserved(s->memory_governor);
+    wl_mem_ledger_snapshot_t joined_ledger_before;
+    wl_mem_ledger_snapshot(&s->mem_ledger, &joined_ledger_before);
+    CHECK(wl_evaluation_control_reset(c) == 0 &&
+        wl_evaluation_control_configure(c, limit) == 0);
+    joined_session = s; joined_control = c; joined_mode = mode;
+    joined_keyed = keyed;
+    joined_seen = joined_builds = joined_probes = joined_candidates =
+        joined_compared =
+        joined_drained = joined_map_seen = 0;
+    joined_batch = NULL; joined_fault_record = NULL; joined_fault_token = NULL;
+    joined_regrowth = NULL; joined_regrowth_token = NULL; joined_copied = 0;
+    wl_columnar_join_test_controlled_checkpoint = joined_checkpoint;
+    wl_columnar_expr_test_retirement_checkpoint = joined_retire;
+    wl_columnar_ops_map_test_controlled_checkpoint = joined_map;
+    wl_columnar_consolidate_test_checkpoint = joined_consolidate;
+    if (mode >= 9) {
+        CHECK(keyed && repeat);
+        wl_columnar_relation_test_bulk_checkpoint = joined_bulk;
+        wl_columnar_relation_test_work_checkpoint = joined_copy;
+        wl_columnar_memory_governor_test_checkpoint = joined_cutoff;
+    }
+    serial_capture_t got = {.width = keyed ? 3u : 2u},
+            ref = {.width = got.width};
+    int expected = mode == 4 ? EOVERFLOW : mode == 3 || mode == 5 ||
+        mode == 12 ? EINVAL
+        : (mode == 7 ||
+        mode ==
+        8) ? WL_EVALUATION_CONTROL_WORK_LIMIT : mode ?
+        WL_EVALUATION_CONTROL_CANCELLED : 0;
+    int rc = snapshot ? wl_backend_columnar()->session_snapshot(&s->base,
+            joined_capture, &got)
+        : wl_backend_columnar()->session_step(&s->base);
+    if (rc != expected) fprintf(stderr,
+            "joined diagnostic expression=%d keyed=%d repeat=%d snapshot=%d mode=%u rc=%d expected=%d candidates=%u compared=%u drained=%u\n",
+            expression, keyed, repeat, snapshot, mode, rc, expected,
+            joined_candidates, joined_compared, joined_drained);
+    if (rc != expected) fprintf(stderr, "joined last consolidate=%d\n",
+            joined_last_consolidate);
+    CHECK(rc == expected);
+    wl_evaluation_control_report_t report;
+    CHECK(wl_evaluation_control_report(c,
+        &report) == 0 && report.result == expected);
+    if (mode == 4) CHECK(report.execution_status == EOVERFLOW);
+    wl_columnar_join_test_controlled_checkpoint = NULL;
+    wl_columnar_expr_test_retirement_checkpoint = NULL;
+    wl_columnar_ops_map_test_controlled_checkpoint = NULL;
+    wl_columnar_consolidate_test_checkpoint = NULL;
+    if (mode >= 9) {
+        wl_columnar_relation_test_bulk_checkpoint = NULL;
+        wl_columnar_relation_test_work_checkpoint = checkpoint;
+        wl_columnar_memory_governor_test_checkpoint = NULL;
+    }
+    if (expected) {
+        if (mode >= 9) {
+            col_rel_t *empty = session_find_rel(s, "H");
+            CHECK(joined_seen == 1 && empty && !empty->nrows && !empty->capacity
+                && !empty->columns);
+            if (mode != 9) CHECK(joined_copied);
+            if (mode == 12) {
+                CHECK(s->cleanup_pending && joined_regrowth &&
+                    joined_regrowth->active
+                    && joined_regrowth->transaction_active &&
+                    joined_regrowth->writer.owner
+                    && joined_regrowth->descriptor_writer.owner &&
+                    !joined_regrowth->prepared_columns
+                    && joined_regrowth_token && !joined_regrowth_token->identity
+                    && string_reserved(s->memory_governor) > retained_before);
+                joined_regrowth_token->identity = joined_regrowth_identity;
+            } else CHECK(!s->cleanup_pending && s->serial_completion.frame
+                    && s->cleanup_reserved_bytes &&
+                    string_reserved(s->memory_governor)
+                    == retained_before + s->cleanup_reserved_bytes);
+        }
+        if (mode == 8) CHECK(joined_candidates > 0 && joined_candidates < 9409
+                && report.consumed <= limit);
+        CHECK(!got.count && s->pending_input_change &&
+            s->pending_full_input_eval);
+        if (joined_fault_token) {
+            CHECK(joined_seen == 1 && s->cleanup_pending && joined_fault_record
+                && !joined_fault_record->scratch_payload &&
+                joined_fault_token->bytes
+                && !joined_fault_token->identity &&
+                atomic_load(&joined_fault_token->state) ==
+                (mode ==
+                5 ? WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED :
+                WL_COLUMNAR_MEMORY_RESERVATION_RESERVED));
+            joined_fault_token->identity = joined_identity; /* Restore scalar only after real backend return. */
+        }
+        CHECK(wl_evaluation_control_reset(c) == 0 &&
+            wl_evaluation_control_configure(c, 0) == 0);
+        CHECK((snapshot ? wl_backend_columnar()->session_snapshot(&s->base,
+            joined_capture, &got)
+            : wl_backend_columnar()->session_step(&s->base)) == 0);
+    } else {
+        CHECK(joined_candidates ==
+            (keyed ? repeat ? 9410u : 9409u : repeat ? 9604u : 9409u)
+            && joined_compared == joined_candidates && joined_drained == 1);
+        if (expression) CHECK(joined_map_seen == 1);
+    }
+    CHECK((snapshot ? wl_backend_columnar()->session_snapshot(&raw->base,
+        joined_capture, &ref)
+        : wl_backend_columnar()->session_step(&raw->base)) == 0);
+    CHECK(got.count == ref.count && got.digest == ref.digest);
+    col_rel_t *head = session_find_rel(s, "H"),
+        *twin = session_find_rel(raw, "H");
+    CHECK(head && twin &&
+        head->nrows == (keyed ? repeat ? 1u : 0u : repeat ? 9604u : 9409u));
+    payload_equal(head, twin, 0);
+    if (keyed && repeat) {
+        CHECK(head->capacity && head->columns && !head->merge_columns &&
+            !head->timestamps
+            && !head->retract_backup_columns &&
+            head->retained_reservation.identity ==
+            &head->retained_reservation &&
+            atomic_load(&head->retained_reservation.state) ==
+            WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+        uint64_t grid = (uint64_t)head->ncols*(sizeof(int64_t *) +
+            (uint64_t)head->capacity*sizeof(int64_t));
+        CHECK(head->retained_reserved_bytes == grid + (head->row_scratch ?
+            (uint64_t)head->ncols*sizeof(int64_t) : 0)
+            && string_reserved(s->memory_governor) == retained_before +
+            head->retained_reserved_bytes - empty_credit);
+        wl_mem_ledger_snapshot_t after;
+        wl_mem_ledger_snapshot(&s->mem_ledger, &after);
+        /* Session-owned heads use the STORED retained-payload gauge,
+         * including their pointer tables; they carry no per-relation ledger. */
+
+        CHECK(!head->mem_ledger &&
+            after.current_bytes == joined_ledger_before.current_bytes
+            + head->retained_reserved_bytes - empty_credit
+            && after.subsys_bytes[WL_MEM_SUBSYS_STORED] ==
+            joined_ledger_before.subsys_bytes[WL_MEM_SUBSYS_STORED]
+            + head->retained_reserved_bytes - empty_credit
+            && after.subsys_bytes[WL_MEM_SUBSYS_TEMPORARY] ==
+            joined_ledger_before.subsys_bytes[WL_MEM_SUBSYS_TEMPORARY]);
+    }
+    source_unpinned(session_find_rel(s, "L"), session_find_rel(s, "L"));
+    source_unpinned(session_find_rel(s, "R"), session_find_rel(s, "R"));
+    CHECK(!s->cleanup_pending && !s->cleanup_reserved_bytes &&
+        !s->serial_completion.frame
+        && !s->serial_completion.pending
+        && !s->pending_input_change && !s->pending_full_input_eval);
+    serial_destroy(s); serial_destroy(raw); wl_plan_free(plan);
+    wirelog_program_free(program);
+    return report.consumed;
+}
+static void
+joined_float_key_twins(void)
+{
+    wirelog_error_t e;
+    wirelog_program_t *program = wirelog_parse_string(
+        ".decl L(x:float,y:int64)\n.decl R(x:float)\n.decl H(y:int64)\nH(y):-L(x,y),R(x).\n",
+        &e);
+    CHECK(program && e == WIRELOG_OK);
+    wl_plan_t *plan = NULL; CHECK(wl_plan_from_program(program, &plan) == 0);
+    CHECK(plan->stratum_count == 1 && !plan->strata[0].is_recursive);
+    const wl_plan_relation_t *rp = &plan->strata[0].relations[0];
+    CHECK(rp->op_count == 3 && rp->ops[0].op == WL_PLAN_OP_VARIABLE
+        && rp->ops[0].delta_mode == WL_DELTA_AUTO &&
+        rp->ops[1].op == WL_PLAN_OP_JOIN
+        && rp->ops[1].delta_mode == WL_DELTA_AUTO &&
+        rp->ops[1].project_count == 1
+        && rp->ops[1].key_count == 1 &&
+        rp->ops[2].op == WL_PLAN_OP_CONSOLIDATE);
+    wl_col_session_t *s = joined_create(plan), *raw = joined_create(plan);
+    serial_attach(s, 0);
+    CHECK(session_find_rel(s, "L")->column_types[0] == WIRELOG_TYPE_FLOAT
+        && session_find_rel(s, "R")->column_types[0] == WIRELOG_TYPE_FLOAT);
+    int64_t l[] = {0, 7, INT64_MIN, 8},
+        r[] = {INT64_MIN, INT64_C(4607182418800017408)};
+    CHECK(wl_backend_columnar()->session_insert(&s->base, "L", l, 2, 2) == 0
+        && wl_backend_columnar()->session_insert(&s->base, "R", r, 2, 1) == 0
+        && wl_backend_columnar()->session_insert(&raw->base, "L", l, 2, 2) == 0
+        && wl_backend_columnar()->session_insert(&raw->base, "R", r, 2,
+        1) == 0);
+    for (unsigned repeat = 0; repeat < 2; repeat++) {
+        if (repeat) {
+            int64_t extra[] = {r[1], 9};
+            CHECK(wl_backend_columnar()->session_insert(&s->base, "L", extra, 1,
+                2) == 0
+                && wl_backend_columnar()->session_insert(&raw->base, "L", extra,
+                1, 2) == 0
+                && wl_evaluation_control_reset(s->base.evaluation_control) ==
+                0);
+        }
+        serial_capture_t got = {.width = 1}, ref = {.width = 1};
+        CHECK(wl_backend_columnar()->session_snapshot(&s->base, joined_capture,
+            &got) == 0
+            && wl_backend_columnar()->session_snapshot(&raw->base,
+            joined_capture, &ref) == 0);
+        col_rel_t *head = session_find_rel(s, "H"),
+            *twin = session_find_rel(raw, "H");
+        CHECK(head && head->column_types &&
+            head->column_types[0] == WIRELOG_TYPE_INT64
+            && head->nrows == repeat + 2 && got.count == ref.count &&
+            got.digest == ref.digest);
+        payload_equal(head, twin, 0);
+    }
+    serial_destroy(s); serial_destroy(raw); wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+static void
+joined_auto_selection(void)
+{
+    wirelog_error_t e;
+    wirelog_program_t *program = wirelog_parse_string(
+        ".decl L(x:int64)\n.decl R(y:int64)\n.decl H(x:int64,y:int64)\nH(x,y):-L(x),R(y).\n",
+        &e);
+    CHECK(program && e == WIRELOG_OK);
+    wl_plan_t *plan = NULL; CHECK(wl_plan_from_program(program, &plan) == 0);
+    const wl_plan_relation_t *rp = &plan->strata[0].relations[0];
+    CHECK(rp->op_count == 3 && rp->ops[1].op == WL_PLAN_OP_JOIN
+        && rp->ops[1].delta_mode == WL_DELTA_AUTO &&
+        rp->ops[1].project_count == 2);
+    /* Actual framed generated caller selection; private delta descriptors are
+     * still excluded by the separate whole-session ordinary preflight. */
+    for (unsigned lane = 0; lane < 6; lane++) {
+        wl_col_session_t *s = join_session(), *raw = join_session();
+        publish_named(s, "L", 1, 2, 2); publish_named(raw, "L", 1, 2, 2);
+        if (lane != 5) {
+            publish_named(s, "R", 1, 3, 3); publish_named(raw, "R", 1, 3, 3);
+        }
+        col_rel_t *head = publish_named(s, "H", 2, 16, 0);
+        col_rel_t *twin = publish_named(raw, "H", 2, 16, 0);
+        if (lane && lane != 5) {
+            uint32_t rows = lane == 1 ? 0 : lane == 2 ? 3 : lane == 3 ? 4 : 1;
+            publish_named(s, "$d$R", 1, 4, rows);
+            publish_named(raw, "$d$R", 1, 4, rows);
+        }
+        uint64_t before = string_reserved(s->memory_governor);
+        wl_evaluation_control_t *c = control(0);
+        int expected = lane == 4 ? ENOTSUP : 0;
+        CHECK(publish_dispatch(s, rp, c) == expected); finish(c, expected);
+        if (expected) CHECK(!head->nrows &&
+                string_reserved(s->memory_governor) == before);
+        else {
+            CHECK(publish_dispatch(raw, rp,
+                NULL) == 0 && head->nrows == (lane == 5 ? 0u : 6u));
+            payload_equal(head, twin, 0);
+        }
+        for (uint32_t i = 0; i < s->nrels;
+            i++) if (s->rels[i]) source_unpinned(s->rels[i], s->rels[i]);
+        CHECK(!s->cleanup_pending && !s->cleanup_active);
+        release(c); join_session_destroy(s); join_session_destroy(raw);
+    }
+    wl_plan_free(plan); wirelog_program_free(program);
+}
+static void
+joined_malformed_grid_guards(void)
+{
+    for (unsigned mode = 0; mode < 3; mode++) {
+        wl_col_session_t *s = join_session();
+        col_rel_t *dst = relation(2, 4, 0, false, s->memory_governor),
+            *src = relation(2, 1, 1, false, s->memory_governor);
+        CHECK(col_rel_storage_owner_ensure_initialized(dst) == 0
+            && col_rel_storage_owner_ensure_initialized(src) == 0);
+        int64_t **table = dst->columns; int64_t *lane = table[1];
+        uint32_t capacity = dst->capacity;
+        uint64_t reserved = string_reserved(s->memory_governor);
+        /* Deliberate malformed shape before any leases, restored before free. */
+        if (mode == 0) dst->columns = NULL;
+        else if (mode == 1) table[1] = NULL;
+        else {
+            dst->capacity = 0; dst->nrows = 1;
+        }
+        wl_columnar_eval_stack_cleanup_frame_t *f = NULL;
+        CHECK(wl_columnar_eval_stack_cleanup_begin(s, &f) == 0);
+        wl_evaluation_control_t *c = control(0);
+        wl_columnar_relation_bulk_append_t *r =
+            wl_columnar_eval_stack_cleanup_bulk_append(f);
+        CHECK(wl_columnar_relation_bulk_append_controlled(r, dst, src,
+            c) == EINVAL);
+        finish(c, EINVAL);
+        CHECK(!r->published && !r->active && !r->transaction_active);
+        dst->columns = table; table[1] = lane; dst->capacity = capacity;
+        dst->nrows = 0;
+        source_unpinned(dst, dst); source_unpinned(src, src);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&f) == 0
+            && string_reserved(s->memory_governor) == reserved);
+        release(c); destroy(dst); destroy(src); join_session_destroy(s);
+    }
+}
+static void
+test_serial_joined_attempts(void)
+{
+    uint64_t cost = joined_trial(false, false, false, true, 0, 0);
+    CHECK(joined_trial(false, false, false, true, 0, 0) == cost);
+    CHECK(joined_trial(false, false, false, true, 0, cost) == cost);
+    joined_trial(false, false, false, true, 7, cost - 1);
+    joined_trial(false, false, false, false, 0, 0);
+    joined_trial(false, false, true, true, 0, 0);
+    joined_trial(false, false, true, false, 0, 0);
+    joined_trial(true, false, false, true, 0, 0);
+    joined_trial(true, false, false, false, 0, 0);
+    joined_trial(true, false, true, true, 0, 0);
+    joined_trial(true, false, true, false, 0, 0);
+    joined_trial(false, true, false, true, 0, 0);
+    uint64_t partial = joined_trial(false, false, false, true, 1, 0);
+    joined_trial(false, false, false, true, 8, partial - 1);
+    for (unsigned mode = 1; mode <= 6; mode++)
+        joined_trial(false, mode == 2, false, true, mode, 0);
+    joined_malformed_grid_guards();
+    joined_auto_selection();
+    joined_float_key_twins();
+    joined_trial(false, true, true, false, 0, 0);
+    joined_trial(false, true, true, true, 0, 0);
+    for (unsigned mode = 9; mode <= 12; mode++)
+        joined_trial(false, true, true, true, mode, 0);
+    puts(
+        "serial joined: genuine AUTO fused/expression product/keyed initial/dirty raw twins, completed unequal comparisons and original scratch lifecycle passed");
+}
+
 int
 main(void)
 {
@@ -16735,6 +17341,7 @@ main(void)
     test_serial_filtered_attempts();
     test_serial_output_ownership();
     test_serial_compact_and_registry_hole();
+    test_serial_joined_attempts();
     puts("evaluation_work: OK");
     return 0;
 }

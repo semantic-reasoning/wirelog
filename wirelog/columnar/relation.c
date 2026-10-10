@@ -9560,9 +9560,13 @@ wl_columnar_relation_bulk_append_controlled(
     record->count = src->nrows;
     install_types = !dst->column_types && src->column_types &&
         record->count != 0;
+    /* Real empty compaction retires the old grid. Existing growth constructs
+     * every new lane before copying; zero old rows never read that grid. These
+     * four fixed predicates remain inside the admitted 64-unit shape header. */
+    bool empty_grid = !dst->columns && !dst->capacity && !dst->nrows;
     if (!wl_columnar_relation_generation_valid(dst->view_generation)
         || dst->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
-        || (src->ncols && (!src->columns || !dst->columns))) {
+        || (src->ncols && (!src->columns || (!dst->columns && !empty_grid)))) {
         rc = EINVAL;
         goto done;
     }
@@ -9584,7 +9588,7 @@ wl_columnar_relation_bulk_append_controlled(
             ? dst->column_types[c] : WIRELOG_TYPE_INT64;
         wirelog_column_type_t st = src->column_types
             ? src->column_types[c] : WIRELOG_TYPE_INT64;
-        if (!src->columns[c] || !dst->columns[c]
+        if (!src->columns[c] || (dst->columns && !dst->columns[c])
             || ((dt == WIRELOG_TYPE_FLOAT || st == WIRELOG_TYPE_FLOAT)
             && dt != st && record->count != 0)) {
             rc = EINVAL;

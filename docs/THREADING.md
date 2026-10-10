@@ -1574,3 +1574,17 @@ charged; mandatory checked drain after failure or pending refusal performs no
 new work admission. All original move/release/rollback checks remain active.
 Physical scratch and compiled owners retire before their credits, with NULL
 payload and live token retained on refused credit retirement.
+
+Ordinary generated JOIN uses the same original preparation scratch token and
+physical payload field as FILTER/MAP, over retired consolidation bytes. Real
+checked commit follows physical pointer publication; checked retirement frees
+and nulls the pointer before original release or rollback. Failed authority
+validation retains that actual token and frame. AUTO right selection uses the
+existing two-descriptor/two-owner group, drains full/delta authority completely,
+then acquires the actual left/right pair. The serialized session contract
+prevents host mutation between those cohorts. No additional token or frame is
+allocated. Empty canonical regrowth keeps the existing bulk source readers and
+destination descriptor/storage writers, payload transaction and cutoff. Its
+only destination table exception is columns NULL with capacity and rows zero.
+The original retained scratch credit and pending growth/fresh token keep their
+existing atomic protocol; all inventory operation orders above remain unchanged.

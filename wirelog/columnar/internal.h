@@ -3735,6 +3735,9 @@ int wl_columnar_eval_stack_cleanup_operator_preparation_owner(
     wl_col_session_t *,
     eval_stack_t *, wl_columnar_expr_operator_preparation_t **,
     wl_evaluation_control_t *);
+wl_columnar_expr_operator_preparation_t *
+wl_columnar_eval_stack_cleanup_operator_preparation(
+    wl_columnar_eval_stack_cleanup_frame_t *);
 int wl_columnar_eval_stack_cleanup_consolidate_prepare(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_evaluation_control_t *);
 #ifdef WL_SESSION_TEST_HOOKS
