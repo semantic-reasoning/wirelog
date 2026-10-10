@@ -3755,14 +3755,64 @@ typedef enum {
     WL_COLUMNAR_CONSOLIDATE_RETIRED,
     WL_COLUMNAR_CONSOLIDATE_RESETTING
 } wl_columnar_consolidate_phase_t;
-typedef struct {
+/* Exclusive original sequence storage: payload pointers remain reachable
+ * through interrupted construction and original-address credit retirement. */
+typedef struct wl_columnar_merge_hash_record {
+    int64_t *values, *new_values, *unique, *new_unique, *row_scratch;
+    uint8_t *used, *new_used;
+    wl_columnar_memory_reservation_t admission;
+    col_rel_t *relation;
+    wl_columnar_relation_mutation_lease_t *lease;
+    wl_columnar_relation_mutation_set_t *set;
+    const int64_t *const *columns;
+    const uint32_t *types;
+    uint64_t nonce, identity, storage_generation, view_generation,
+        owner_identity, owner_generation, type_fingerprint;
+    size_t row_bytes, allocated_row_bytes;
+    uint32_t nrows, ncols, capacity, hash_capacity, unique_capacity,
+        unique_count;
+    bool admission_active, prepared;
+} wl_columnar_merge_hash_record_t;
+_Static_assert(sizeof(wl_columnar_merge_hash_record_t)
+    <= sizeof(wl_columnar_relation_radix_sequence_t),
+    "hash must fit original sequence storage");
+_Static_assert(_Alignof(wl_columnar_merge_hash_record_t)
+    <= _Alignof(wl_columnar_relation_radix_sequence_t),
+    "hash must fit original sequence alignment");
+/* Immutable old consolidation layout, also used by the complete-frame proof. */
+typedef struct wl_columnar_merge_consolidate_original_record {
     wl_columnar_relation_radix_sequence_t sequence;
     uint32_t *starts, *ends;
     wl_columnar_memory_reservation_t merge_admission;
     bool merge_admission_active;
     wl_columnar_consolidate_phase_t phase;
     bool ready;
+} wl_columnar_merge_consolidate_original_record_t;
+typedef enum {
+    WL_COLUMNAR_CONSOLIDATE_RADIX = 0,
+    WL_COLUMNAR_CONSOLIDATE_HASH,
+    WL_COLUMNAR_CONSOLIDATE_LANE_INITIALIZING
+} wl_columnar_merge_consolidate_lane_t;
+typedef struct {
+    union {
+        wl_columnar_relation_radix_sequence_t sequence;
+        wl_columnar_merge_hash_record_t hash;
+    };
+    uint32_t *starts, *ends;
+    wl_columnar_memory_reservation_t merge_admission;
+    bool merge_admission_active;
+    wl_columnar_consolidate_phase_t phase;
+    bool ready;
+    uint8_t lane; /* Outside every overwritten sequence byte. */
 } wl_columnar_consolidate_record_t;
+_Static_assert(sizeof(wl_columnar_consolidate_record_t)
+    == sizeof(wl_columnar_merge_consolidate_original_record_t),
+    "hash lane must preserve original consolidation size");
+_Static_assert(_Alignof(wl_columnar_consolidate_record_t)
+    == _Alignof(wl_columnar_merge_consolidate_original_record_t),
+    "hash lane must preserve original consolidation alignment");
+int wl_columnar_merge_hash_retire(wl_columnar_consolidate_record_t *, int,
+    wl_evaluation_control_t *);
 wl_columnar_consolidate_record_t *
 wl_columnar_eval_stack_cleanup_consolidate(
     wl_columnar_eval_stack_cleanup_frame_t *);

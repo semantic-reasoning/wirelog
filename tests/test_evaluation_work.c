@@ -17118,6 +17118,480 @@ test_serial_joined_attempts(void)
         "serial joined: genuine AUTO fused/expression product/keyed initial/dirty raw twins, completed unequal comparisons and original scratch lifecycle passed");
 }
 
+/* Large flat SET: actual original workspace lanes and unchanged generated plans. */
+static uint64_t large_set_stages[128];
+static int large_set_stop_stage;
+static uint64_t large_set_stop_progress;
+static unsigned large_set_mode, large_set_stopped;
+static wl_columnar_consolidate_record_t *large_set_fault_record;
+static wl_columnar_memory_reservation_t *large_set_fault_token;
+static const void *large_set_saved_identity;
+static uint64_t large_set_budget, large_set_original_budget,
+    large_set_high_water, large_set_expected_transient;
+static wl_columnar_relation_private_batch_t *large_set_private;
+static uint64_t large_set_prior_nonce;
+static bool large_set_generated;
+static wl_col_session_t *large_set_session;
+static void
+large_set_checkpoint(wl_evaluation_control_t *c, int stage, uint64_t progress,
+    wl_columnar_consolidate_record_t *record, col_rel_t *r)
+{
+    CHECK(stage >= 0 && stage < 128);
+    large_set_stages[stage]++;
+    if (c && r && r->memory_governor) {
+        uint64_t current = string_reserved(r->memory_governor);
+        if (current > large_set_high_water) large_set_high_water = current;
+    }
+    if (stage == 60 && c) {
+        wl_columnar_consolidate_record_t *actual =
+            wl_columnar_eval_stack_cleanup_consolidate(
+            large_set_session->cleanup_active);
+        CHECK(actual && actual->lane == WL_COLUMNAR_CONSOLIDATE_RADIX);
+        wl_columnar_radix_workspace_t *w = &actual->sequence.workspace;
+        CHECK(w->admission_active && w->admission.identity == &w->admission
+            && atomic_load(&w->admission.state) ==
+            WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+            && w->admission.bytes == (uint64_t)r->nrows * 18u + 262144u
+            && w->bucket_values == w->byte_values
+            && w->bucket_values == (void *)w->short_values && w->count16);
+    }
+    if (stage == 39 && large_set_generated) {
+        CHECK(large_set_private && r == large_set_private->batch.relation
+            && wl_columnar_relation_private_batch_disposable(
+                large_set_private));
+    }
+    if (stage == 98 && large_set_generated) {
+        CHECK(record->lane == WL_COLUMNAR_CONSOLIDATE_HASH
+            && record->hash.lease == &large_set_private->batch.single.lease
+            && record->hash.nonce != large_set_prior_nonce
+            && record->hash.nrows == large_set_expected_transient
+            && large_set_session->eval_arena && !r->arena_owned
+            && col_rel_mutation_lease_validate(record->hash.lease, r) == 0);
+    }
+    if (large_set_stopped) return;
+    if ((large_set_mode == 6 || large_set_mode == 7) && stage == 77 && c) {
+        CHECK(record->hash.values && record->hash.used && record->hash.unique
+            && atomic_load(&record->hash.admission.state)
+            == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED);
+        if (large_set_mode == 7) CHECK(wl_evaluation_control_charge(c,
+                UINT64_MAX) == EOVERFLOW);
+        else wl_evaluation_control_request_cancel(c);
+        return;
+    }
+    if (!c &&
+        !((large_set_mode == 6 || large_set_mode == 7) && stage == 99)) return;
+    if (large_set_mode == 8 && stage == 78) {
+        /* The real first allocation remains reachable when the second
+         * allocation returns ENOMEM under the original RESERVED token. */
+        wl_columnar_consolidate_test_fail_allocation = 1;
+        large_set_stopped++;
+    } else if ((large_set_mode == 4 || large_set_mode == 9) && stage == 78) {
+        wl_columnar_memory_governor_t *g =
+            wl_columnar_memory_governor_ref_get(r->memory_governor);
+        large_set_original_budget = atomic_load(&g->usable_bytes);
+        large_set_budget = wl_columnar_memory_reserved(g);
+        if (large_set_mode == 9) {
+            CHECK(large_set_budget <= UINT64_MAX - progress);
+            large_set_budget += progress;
+        }
+        CHECK(g->mode == WL_COLUMNAR_MEMORY_MODE_ENFORCING);
+        atomic_store(&g->usable_bytes, large_set_budget);
+        large_set_stopped++;
+    } else if ((large_set_mode == 2 || large_set_mode == 3 ||
+        large_set_mode == 6
+        || large_set_mode == 7) && stage == 99) {
+        CHECK(record->lane == WL_COLUMNAR_CONSOLIDATE_HASH
+            && record->hash.admission_active
+            && !record->hash.values && !record->hash.new_values
+            && !record->hash.used && !record->hash.new_used
+            && !record->hash.unique && !record->hash.new_unique
+            && !record->hash.row_scratch);
+        large_set_fault_record = record;
+        large_set_fault_token = &record->hash.admission;
+        CHECK(large_set_fault_token->identity == large_set_fault_token
+            && atomic_load(&large_set_fault_token->state)
+            == (large_set_mode >= 6 ? WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+            : WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED));
+        large_set_saved_identity = large_set_fault_token->identity;
+        large_set_fault_token->identity = NULL; /* Actual original scalar only. */
+        large_set_stopped++;
+        if (large_set_mode == 3) CHECK(wl_evaluation_control_charge(c,
+                UINT64_MAX) == EOVERFLOW);
+        else if (c) wl_evaluation_control_request_cancel(c);
+    } else if (large_set_mode == 1 && stage == large_set_stop_stage
+        && progress >= large_set_stop_progress) {
+        large_set_stopped++; wl_evaluation_control_request_cancel(c);
+    }
+}
+static void
+large_set_join(wl_evaluation_control_t *c, int stage, uint64_t progress,
+    wl_columnar_relation_source_group_t *group, col_rel_t *r)
+{
+    (void)c; (void)progress; (void)group; (void)r;
+    if (stage != 13) return;
+    large_set_private = wl_columnar_eval_stack_cleanup_reduce_batch(
+        large_set_session->cleanup_active);
+    CHECK(large_set_private && large_set_private->batch.active);
+    large_set_prior_nonce =
+        large_set_private->batch.single.lease.acquisition_nonce;
+}
+static void
+large_set_reset(unsigned mode)
+{
+    memset(large_set_stages, 0, sizeof(large_set_stages));
+    large_set_mode = mode; large_set_stopped = 0;
+    large_set_fault_record = NULL; large_set_fault_token = NULL;
+    large_set_generated = false; large_set_private = NULL;
+    large_set_prior_nonce = 0; large_set_high_water = 0;
+}
+static void
+large_set_rows(col_rel_t *r, uint32_t unique, unsigned schema)
+{
+    if (schema) {
+        wirelog_column_type_t types[2] = {
+            schema == 1 ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_STRING,
+            WIRELOG_TYPE_INT64
+        };
+        uint32_t nrows = r->nrows; r->nrows = 0;
+        CHECK(col_rel_set_column_types(r, types, r->ncols) == 0);
+        r->nrows = nrows;
+    }
+    for (uint32_t row = 0; row < r->nrows; row++) {
+        uint32_t value = unique - 1u - row % unique;
+        for (uint32_t col = 0; col < r->ncols; col++) {
+            /* Wide heap comparisons really traverse the common prefix. */
+            int64_t cell = col + 1u == r->ncols ? value : 0;
+            if (schema == 1 && col == 0) {
+                double v = row % 7u == 0 ? -0.0 : (double)value / 2.0;
+                memcpy(&cell, &v, sizeof(cell));
+            } else if (schema == 2 && col == 0) cell = value + 1u;
+            r->columns[col][row] = cell;
+        }
+    }
+}
+static uint64_t
+large_set_direct(uint32_t rows, uint32_t unique, uint32_t width,
+    unsigned schema, unsigned mode, uint64_t limit)
+{
+    wl_col_session_t *s = join_session(), *raw = join_session();
+    col_rel_t *source = relation(width, rows, rows, false, s->memory_governor);
+    col_rel_t *reference = relation(width, rows, rows, false,
+            raw->memory_governor);
+    wl_intern_t *symbols = NULL, *raw_symbols = NULL;
+    if (schema == 2) {
+        symbols = wl_intern_create(); raw_symbols = wl_intern_create();
+        CHECK(symbols && raw_symbols);
+        for (uint32_t id = 0; id <= unique; id++) {
+            char name[32]; snprintf(name, sizeof(name), "symbol-%u", id);
+            CHECK(wl_intern_put(symbols, name) == id
+                && wl_intern_put(raw_symbols, name) == id);
+        }
+        s->intern = symbols; raw->intern = raw_symbols;
+    }
+    large_set_rows(source, unique, schema);
+    large_set_rows(reference, unique, schema);
+    CHECK(session_add_rel(s, source) == 0 && session_add_rel(raw,
+        reference) == 0);
+    make_lazy(source);
+    uint64_t fingerprint = consolidate_source_hash(source);
+    uint64_t baseline = string_reserved(s->memory_governor);
+    wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(s);
+    wl_columnar_eval_stack_cleanup_frame_t *rf = filter_frame(raw);
+    wl_evaluation_control_t *c = control(limit);
+    large_set_reset(mode); large_set_session = s;
+    wl_columnar_consolidate_test_checkpoint = large_set_checkpoint;
+    int expected = mode == 3 || mode == 7 ? EOVERFLOW
+        : mode == 2 || mode == 6 ? EINVAL : mode == 4 ? ENOSPC
+        : mode == 8 ? ENOMEM : mode == 1 ? WL_EVALUATION_CONTROL_CANCELLED
+        : mode == 5 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0;
+    int rc = consolidate_dispatch(s, frame, c);
+    wl_columnar_consolidate_test_checkpoint = NULL;
+    if (rc != expected) fprintf(stderr,
+            "large SET direct rows=%u unique=%u width=%u schema=%u mode=%u rc=%d expected=%d\n",
+            rows, unique, width, schema, mode, rc, expected);
+    CHECK(rc == expected);
+    uint64_t consumed = finish(c, expected);
+    if (mode == 9) CHECK(large_set_stopped == 1
+            && large_set_high_water == large_set_budget && large_set_stages[85]
+            && large_set_stages[60]);
+    CHECK(consolidate_source_hash(source) == fingerprint);
+    if (mode == 4) {
+        CHECK(large_set_stopped && s->memory_budget_denied);
+        wl_columnar_memory_governor_t *g =
+            wl_columnar_memory_governor_ref_get(raw->memory_governor);
+        uint64_t old_budget = atomic_load(&g->usable_bytes);
+        atomic_store(&g->usable_bytes, large_set_budget);
+        /* Same real budget: raw also refuses its original maximum-overlap
+         * hash admission, independently of the controlled frame overhead. */
+        int raw_rc = consolidate_dispatch(raw, rf, NULL);
+        if (raw_rc != ENOSPC) fprintf(stderr,
+                "large SET real raw budget rc=%d budget=%llu\n",
+                raw_rc, (unsigned long long)large_set_budget);
+        CHECK(raw_rc == ENOSPC && raw->memory_budget_denied);
+        atomic_store(&g->usable_bytes, old_budget);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&rf) == 0);
+        rf = filter_frame(raw);
+        atomic_store(&wl_columnar_memory_governor_ref_get(s->memory_governor)
+            ->usable_bytes, large_set_original_budget);
+    }
+    if (mode == 1 || mode == 8) CHECK(large_set_stopped == 1);
+    if (mode == 8) CHECK(wl_columnar_consolidate_test_fail_allocation == -1);
+    if (mode == 2 || mode == 3 || mode == 6 || mode == 7) {
+        CHECK(large_set_stopped == 1 && large_set_fault_token
+            && large_set_fault_record->lane == WL_COLUMNAR_CONSOLIDATE_HASH
+            && large_set_fault_record->phase == WL_COLUMNAR_CONSOLIDATE_RETIRING
+            && large_set_fault_record->hash.admission_active
+            && !large_set_fault_record->hash.unique
+            && !large_set_fault_token->identity && large_set_fault_token->bytes
+            && atomic_load(&large_set_fault_token->state)
+            == (mode >= 6 ? WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+            : WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED));
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == EINVAL
+            && !frame && s->cleanup_pending);
+        /* Restore only saved scalar after the actual serialized return. */
+        large_set_fault_token->identity = large_set_saved_identity;
+        CHECK(wl_columnar_eval_stack_cleanup_retry(s) == 0 &&
+            !s->cleanup_pending
+            && string_reserved(s->memory_governor) == baseline);
+    } else CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+    if (mode && mode != 9) {
+        CHECK(string_reserved(s->memory_governor) == baseline);
+        frame = filter_frame(s); retry(c, 0); large_set_reset(0);
+        wl_columnar_consolidate_test_checkpoint = large_set_checkpoint;
+        CHECK(consolidate_dispatch(s, frame, c) == 0); finish(c, 0);
+        wl_columnar_consolidate_test_checkpoint = NULL;
+    } else {
+        /* Replay the same initial lazy-owner state for strict work equality;
+        * the successful source journal legitimately normalized the first. */
+        make_lazy(source);
+        frame = filter_frame(s); retry(c, 0); large_set_reset(0);
+        wl_columnar_consolidate_test_checkpoint = large_set_checkpoint;
+        CHECK(consolidate_dispatch(s, frame, c) == 0);
+        CHECK(finish(c, 0) == consumed);
+        wl_columnar_consolidate_test_checkpoint = NULL;
+    }
+    wl_columnar_memory_governor_t *raw_g =
+        wl_columnar_memory_governor_ref_get(raw->memory_governor);
+    uint64_t raw_budget = atomic_load(&raw_g->usable_bytes);
+    if (mode == 9) atomic_store(&raw_g->usable_bytes, large_set_budget);
+    CHECK(consolidate_dispatch(raw, rf, NULL) == 0);
+    col_rel_t *out = join_output(frame), *ref = join_output(rf);
+    CHECK(out->nrows == ref->nrows && out->ncols == ref->ncols);
+    for (uint32_t col = 0; col < width; col++)
+        for (uint32_t row = 0; row < out->nrows; row++)
+            CHECK(out->columns[col][row] == ref->columns[col][row]);
+    if (rows > 10000u) {
+        CHECK(large_set_stages[81] && large_set_stages[82] &&
+            large_set_stages[99]);
+        if (large_set_stages[85]) {
+            if (rows >= 50000u) CHECK(large_set_stages[60] &&
+                    large_set_stages[64]
+                    && large_set_stages[65] && large_set_stages[67]);
+            else CHECK(large_set_stages[8] && large_set_stages[13]);
+        } else CHECK(large_set_stages[94] && large_set_stages[96]);
+    }
+    source_unpinned(source, source);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0
+        && wl_columnar_eval_stack_cleanup_finish(&rf) == 0);
+    CHECK(string_reserved(s->memory_governor) == baseline);
+    if (mode == 9) {
+        atomic_store(&raw_g->usable_bytes, raw_budget);
+        atomic_store(&wl_columnar_memory_governor_ref_get(s->memory_governor)
+            ->usable_bytes, large_set_original_budget);
+    }
+    release(c); join_session_destroy(s); join_session_destroy(raw);
+    wl_intern_free(symbols); wl_intern_free(raw_symbols);
+    return consumed;
+}
+
+static uint64_t
+large_set_generated_trial(uint32_t side, bool duplicate, bool repeat,
+    bool snapshot, unsigned mode, uint64_t limit)
+{
+    wirelog_error_t error;
+    const char *text = duplicate ?
+        ".decl L(x:int64)\n.decl R(y:int64)\n.decl H(x:int64)\nH(x+0):-L(x),R(y).\n"
+        :
+        ".decl L(x:int64)\n.decl R(y:int64)\n.decl H(x:int64,y:int64)\nH(x,y):-L(x),R(y).\n";
+    wirelog_program_t *program = wirelog_parse_string(text, &error);
+    CHECK(program && error == WIRELOG_OK);
+    wl_plan_t *plan = NULL; CHECK(wl_plan_from_program(program, &plan) == 0);
+    CHECK(plan->stratum_count == 1 && !plan->strata[0].is_recursive);
+    const wl_plan_relation_t *rp = &plan->strata[0].relations[0];
+    CHECK(rp->op_count == (duplicate ? 4u : 3u)
+        && rp->ops[0].op == WL_PLAN_OP_VARIABLE
+        && rp->ops[0].delta_mode == WL_DELTA_AUTO
+        && rp->ops[1].op == WL_PLAN_OP_JOIN
+        && rp->ops[1].delta_mode == WL_DELTA_AUTO
+        && rp->ops[rp->op_count-1u].op == WL_PLAN_OP_CONSOLIDATE);
+    if (duplicate) CHECK(rp->ops[2].op == WL_PLAN_OP_MAP &&
+            rp->ops[2].map_expr_count);
+    else CHECK(rp->ops[1].project_count == 2);
+    wl_col_session_t *s = joined_create(plan), *raw = joined_create(plan);
+    wl_evaluation_control_t *c = serial_attach(s, 0);
+    int64_t *values = malloc((size_t)side * sizeof(*values)); CHECK(values);
+    for (uint32_t row = 0; row < side; row++) values[row] = side-row;
+    CHECK(wl_backend_columnar()->session_insert(&s->base, "L", values, side,
+        1) == 0
+        && wl_backend_columnar()->session_insert(&s->base, "R", values, side,
+        1) == 0
+        && wl_backend_columnar()->session_insert(&raw->base, "L", values, side,
+        1) == 0
+        && wl_backend_columnar()->session_insert(&raw->base, "R", values, side,
+        1) == 0);
+    free(values);
+    if (repeat) {
+        CHECK(wl_backend_columnar()->session_step(&s->base) == 0
+            && wl_backend_columnar()->session_step(&raw->base) == 0);
+        int64_t extra = side + 1u;
+        CHECK(wl_backend_columnar()->session_insert(&s->base, "L", &extra, 1,
+            1) == 0
+            && wl_backend_columnar()->session_insert(&raw->base, "L", &extra, 1,
+            1) == 0);
+    }
+    CHECK(wl_evaluation_control_reset(c) == 0
+        && wl_evaluation_control_configure(c, limit) == 0);
+    large_set_reset(mode); large_set_generated = true;
+    large_set_session = s;
+    large_set_expected_transient = (uint64_t)(side + (repeat ? 1u : 0u))*side;
+    wl_columnar_join_test_controlled_checkpoint = large_set_join;
+    /* Address exists when the real JOIN begins; the checkpoint discovers it. */
+    wl_columnar_consolidate_test_checkpoint = large_set_checkpoint;
+    serial_capture_t got = {.width = duplicate ? 1u : 2u}, ref = got;
+    int expected = mode == 1 ? WL_EVALUATION_CONTROL_CANCELLED
+        : mode == 5 ? WL_EVALUATION_CONTROL_WORK_LIMIT
+        : mode == 3 || mode == 7 ? EOVERFLOW
+        : mode == 2 || mode == 6 ? EINVAL : 0;
+    int rc = snapshot ? wl_backend_columnar()->session_snapshot(&s->base,
+            joined_capture,
+            &got) : wl_backend_columnar()->session_step(&s->base);
+    wl_columnar_consolidate_test_checkpoint = NULL;
+    if (rc != expected) fprintf(stderr,
+            "large SET generated side=%u duplicate=%u repeat=%u snapshot=%u mode=%u rc=%d expected=%d hash=%llu fallback=%llu k16=%llu\n",
+            side, duplicate, repeat, snapshot, mode, rc, expected,
+            (unsigned long long)large_set_stages[81],
+            (unsigned long long)large_set_stages[85],
+            (unsigned long long)large_set_stages[60]);
+    CHECK(rc == expected);
+    wl_evaluation_control_report_t report;
+    CHECK(wl_evaluation_control_report(c, &report) == 0);
+    uint64_t consumed = report.consumed;
+    CHECK(report.result == expected);
+    if (mode == 3 || mode == 7) CHECK(report.execution_status == EOVERFLOW);
+    if (mode == 5) CHECK(report.consumed <= limit);
+    if (mode == 2 || mode == 3 || mode == 6 || mode == 7) {
+        CHECK(large_set_stopped == 1 && s->cleanup_pending
+            && large_set_fault_record && large_set_fault_token
+            && large_set_fault_record->hash.admission_active
+            && !large_set_fault_record->hash.values
+            && !large_set_fault_record->hash.unique
+            && !large_set_fault_token->identity
+            && atomic_load(&large_set_fault_token->state)
+            == (mode >= 6 ? WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+            : WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED));
+        large_set_fault_token->identity = large_set_saved_identity;
+    }
+    if (mode) {
+        CHECK(!got.count && (!mode || report.result == expected));
+        if (mode == 1) CHECK(large_set_stopped == 1);
+        CHECK(wl_evaluation_control_reset(c) == 0
+            && wl_evaluation_control_configure(c, 0) == 0);
+        /* A late work stop can follow consumed canonical CONS. Preserve the
+         * actual reached-stage witnesses; retry may only publish that result. */
+        large_set_mode = 0; large_set_stopped = 0;
+        large_set_private = NULL; large_set_generated = true;
+        wl_columnar_consolidate_test_checkpoint = large_set_checkpoint;
+        CHECK(wl_backend_columnar()->session_snapshot(&s->base, joined_capture,
+            &got) == 0);
+        wl_columnar_consolidate_test_checkpoint = NULL;
+    } else if (!snapshot) CHECK(wl_backend_columnar()->session_snapshot(
+                &s->base,
+                joined_capture, &got) == 0);
+    CHECK(wl_backend_columnar()->session_snapshot(&raw->base, joined_capture,
+        &ref) == 0);
+    uint64_t rows = duplicate ? side + (repeat ? 1u : 0u)
+        : (uint64_t)(side + (repeat ? 1u : 0u))*side;
+    CHECK(got.count == rows && got.count == ref.count &&
+        got.digest == ref.digest);
+    if (!large_set_stages[81] || !large_set_stages[99]) fprintf(stderr,
+            "large SET generated reach side=%u duplicate=%u repeat=%u snapshot=%u mode=%u hash=%llu fallback=%llu k16=%llu rows=%llu\n",
+            side, duplicate, repeat, snapshot, mode,
+            (unsigned long long)large_set_stages[81],
+            (unsigned long long)large_set_stages[85],
+            (unsigned long long)large_set_stages[60],
+            (unsigned long long)got.count);
+    CHECK(large_set_stages[81] && large_set_stages[99]);
+    if (duplicate) CHECK(!large_set_stages[85] && large_set_stages[94]
+            && large_set_stages[96]);
+    else {
+        CHECK(large_set_stages[85]);
+        if (side >= 225u) CHECK(large_set_stages[60] && large_set_stages[64]
+                && large_set_stages[65] && large_set_stages[67]);
+        else CHECK(large_set_stages[8] && large_set_stages[13]);
+    }
+    CHECK(!s->serial_completion.frame && !s->cleanup_reserved_bytes
+        && !s->cleanup_pending && !s->cleanup_active);
+    source_unpinned(session_find_rel(s, "L"), session_find_rel(s, "L"));
+    source_unpinned(session_find_rel(s, "R"), session_find_rel(s, "R"));
+    wl_columnar_join_test_controlled_checkpoint = NULL;
+    serial_destroy(s); serial_destroy(raw);
+    wl_plan_free(plan); wirelog_program_free(program);
+    return consumed;
+}
+static void
+test_serial_large_set_attempts(void)
+{
+    /* 10,000 is retained in the old four-order matrix; these new orthogonal
+     * exact thresholds actually reach heuristic fallback and selected radix. */
+    uint64_t cost = large_set_direct(10001, 10001, 2, 0, 0, 0);
+    CHECK(large_set_direct(10001, 10001, 2, 0, 0, cost) == cost);
+    large_set_direct(10001, 10001, 2, 0, 5, cost-1u);
+    large_set_direct(49999, 49999, 1, 0, 0, 0);
+    large_set_direct(50000, 50000, 1, 0, 9, 0);
+    /* Enough rows for both actual hash growths without triggering heuristic. */
+    large_set_direct(20001, 5001, 1, 0, 0, 0);
+    CHECK(large_set_stages[86] && large_set_stages[87] && large_set_stages[89]
+        && large_set_stages[91] && large_set_stages[84]);
+    large_set_direct(10001, 7, 300, 0, 0, 0);
+    large_set_direct(10001, 7, 2, 1, 0, 0);
+    large_set_direct(10001, 7, 2, 2, 0, 0);
+    large_set_direct(10001, 7, 2, 0, 2, 0);
+    large_set_direct(10001, 10001, 2, 0, 2, 0);
+    large_set_direct(10001, 7, 2, 0, 3, 0);
+    large_set_direct(10001, 7, 2, 0, 4, 0);
+    large_set_direct(10001, 7, 2, 0, 6, 0);
+    large_set_direct(10001, 7, 2, 0, 7, 0);
+    large_set_direct(10001, 7, 2, 0, 8, 0);
+    /* Stop one reached action in each distinct loop. Retry uses the original
+     * canonical source and true mandatory drain, without a consumption refund. */
+    const int stages[] = {81, 84, 86, 87, 89, 91, 94, 96, 99};
+    for (unsigned i = 0; i < sizeof(stages)/sizeof(stages[0]); i++) {
+        large_set_stop_stage = stages[i]; large_set_stop_progress = 257;
+        if (stages[i] == 99) large_set_stop_progress = 0;
+        large_set_direct(20001, 5001, 1, 0, 1, 0);
+    }
+    large_set_stop_stage = 94; large_set_stop_progress = 257;
+    large_set_direct(10001, 7, 300, 0, 1, 0);
+    const int radix_stages[] = {62, 64, 65, 67};
+    for (unsigned i = 0; i < sizeof(radix_stages)/sizeof(radix_stages[0]);
+        i++) {
+        large_set_stop_stage = radix_stages[i]; large_set_stop_progress = 257;
+        large_set_direct(50000, 50000, 1, 0, 1, 0);
+    }
+    cost = large_set_generated_trial(101, false, false, true, 0, 0);
+    CHECK(large_set_generated_trial(101, false, false, true, 0, cost) == cost);
+    large_set_generated_trial(101, false, false, true, 5, cost-1u);
+    large_set_generated_trial(101, false, true, false, 0, 0);
+    large_set_generated_trial(225, false, false, false, 0, 0);
+    large_set_generated_trial(225, false, true, true, 0, 0);
+    large_set_generated_trial(101, true, false, true, 0, 0);
+    large_set_generated_trial(101, true, true, false, 0, 0);
+    large_set_generated_trial(101, true, false, true, 3, 0);
+    large_set_generated_trial(101, true, false, true, 7, 0);
+    fprintf(stderr,
+        "serial large SET: original hash/growth/heapsort and same-attempt k16, genuine unsorted AUTO product/duplicate initial/dirty raw twins passed\n");
+}
+
 int
 main(void)
 {
@@ -17342,6 +17816,7 @@ main(void)
     test_serial_output_ownership();
     test_serial_compact_and_registry_hole();
     test_serial_joined_attempts();
+    test_serial_large_set_attempts();
     puts("evaluation_work: OK");
     return 0;
 }

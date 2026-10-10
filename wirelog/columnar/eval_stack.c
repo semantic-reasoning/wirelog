@@ -251,7 +251,7 @@ typedef struct wl_columnar_eval_stack_original_payload {
     eval_entry_t result;
     wl_columnar_relation_source_group_t join_sources;
     wl_columnar_relation_private_batch_t reduce_batch;
-    wl_columnar_consolidate_record_t consolidate;
+    wl_columnar_merge_consolidate_original_record_t consolidate;
     wl_columnar_relation_bulk_append_original_t bulk_append;
 } wl_columnar_eval_stack_original_payload_t;
 struct wl_columnar_eval_stack_cleanup_frame {

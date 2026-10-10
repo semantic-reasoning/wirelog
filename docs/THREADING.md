@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **326**). The earlier audit sections
+match the script's count (currently **329**). The earlier audit sections
 retain their historical per-section counts.
 
 Format: `file:function[#N]` | field | operation | order | justification.
@@ -1588,3 +1588,20 @@ destination descriptor/storage writers, payload transaction and cutoff. Its
 only destination table exception is columns NULL with capacity and rows zero.
 The original retained scratch credit and pending growth/fresh token keep their
 existing atomic protocol; all inventory operation orders above remain unchanged.
+
+| `merge.c:wl_columnar_merge_hash_retire` | `h->admission.state` | `atomic_load_explicit` | `relaxed` | Exclusive original lane observes RESERVED versus COMMITTED after NULL physical payload; actual checked rollback/release still validates authority and refusal retains the original slot. |
+| `merge.c:wl_columnar_merge_hash_initialize` | `seq->metadata_admission.state` | `atomic_load` | `seq_cst (default)` | Validate the inactive original EMPTY sequence token before bounded exclusive overlay; initializing lane stays outside overwritten bytes. |
+| `merge.c:wl_columnar_merge_hash_initialize#2` | `w->admission.state` | `atomic_load` | `seq_cst (default)` | Validate the second inactive original EMPTY sequence token before reuse; no copied live token or new credit owner. |
+
+Large flat SET hash staging is an exclusive alternative over original sequence
+storage. The external lane byte and existing phase/readiness identify interrupted
+initialization and retained cleanup, independent of overwritten payload. The
+hash descriptor and complete frame retain immutable original sizeof/alignment
+witnesses. Current and new rehash/unique allocations coexist under the original
+maximum-overlap reservation and remain reachable until bounded copy completes.
+Hash heuristic fallback fully retires physical pointers and original credit
+before radix reuse; the same control consumption continues. k16 shares the one
+physical bucket through byte/short aliases, with a separate histogram. Checked
+retirement frees each allocation once and NULLs aliases before original credit.
+Healthy work is charged; mandatory checked drain after failure uses the existing
+cleanup exclusion, preserving positive primary errors and refused authority.

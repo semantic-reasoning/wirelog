@@ -1497,6 +1497,7 @@ wl_columnar_merge_consolidate_reset(wl_columnar_consolidate_record_t *record,
         && record->phase != WL_COLUMNAR_CONSOLIDATE_RETIRED) return EBUSY;
     int rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
     record->phase = WL_COLUMNAR_CONSOLIDATE_RESETTING;
+    record->lane = WL_COLUMNAR_CONSOLIDATE_LANE_INITIALIZING;
     rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
     for (size_t offset = 0;
         offset < offsetof(wl_columnar_consolidate_record_t, phase);){
@@ -1523,8 +1524,530 @@ wl_columnar_merge_consolidate_reset(wl_columnar_consolidate_record_t *record,
     record->merge_admission.identity = &record->merge_admission;
     atomic_store_explicit(&record->merge_admission.state,
         WL_COLUMNAR_MEMORY_RESERVATION_EMPTY, memory_order_relaxed);
+    record->lane = WL_COLUMNAR_CONSOLIDATE_RADIX;
     record->phase = WL_COLUMNAR_CONSOLIDATE_PREPARING;
     return wl_columnar_merge_consolidate_tail(c);
+}
+
+/* The tagged heuristic is separate from errno and control dispositions. */
+typedef enum {
+    WL_COLUMNAR_MERGE_HASH_COMPLETE = 0,
+    WL_COLUMNAR_MERGE_HASH_FALLBACK
+} wl_columnar_merge_hash_outcome_t;
+
+static int
+wl_columnar_merge_hash_step(wl_columnar_consolidate_record_t *record,
+    wl_evaluation_control_t *c, int stage, uint64_t progress)
+{
+    wl_columnar_relation_consolidate_checkpoint(c, stage, progress, record,
+        record->hash.relation);
+    return wl_columnar_merge_consolidate_tail(c);
+}
+
+int
+wl_columnar_merge_hash_retire(wl_columnar_consolidate_record_t *record,
+    int primary, wl_evaluation_control_t *c)
+{
+    if (!record || !record->ready ||
+        record->lane != WL_COLUMNAR_CONSOLIDATE_HASH)
+        return primary > 0 ? primary : EINVAL;
+    if (c) {
+        int rc = wl_evaluation_control_charge(c, 8);
+        if (rc) return primary > 0 ? primary : rc;
+    }
+    record->phase = WL_COLUMNAR_CONSOLIDATE_RETIRING;
+    wl_columnar_merge_hash_record_t *h = &record->hash;
+    /* Healthy disposal is engine work. Mandatory disposal never needs fresh
+     * admission, and every original payload is NULL before credit retirement. */
+#define WL_COLUMNAR_HASH_FREE(field) do { \
+            if (c) { int stop = wl_evaluation_control_charge(c, 8); \
+                     if (stop) return primary > 0 ? primary : stop; } \
+            free(h->field); h->field = NULL; \
+            if (c) { int stop = wl_columnar_merge_consolidate_tail(c); \
+                     if (stop) return primary > 0 ? primary : stop; } \
+} while (0)
+    WL_COLUMNAR_HASH_FREE(values);
+    WL_COLUMNAR_HASH_FREE(new_values);
+    WL_COLUMNAR_HASH_FREE(used);
+    WL_COLUMNAR_HASH_FREE(new_used);
+    WL_COLUMNAR_HASH_FREE(unique);
+    WL_COLUMNAR_HASH_FREE(new_unique);
+    WL_COLUMNAR_HASH_FREE(row_scratch);
+#undef WL_COLUMNAR_HASH_FREE
+    if (c) {
+        int rc = wl_evaluation_control_charge(c, 64);
+        if (rc) return primary > 0 ? primary : rc;
+    }
+    wl_columnar_relation_consolidate_checkpoint(c, 99, 0, record, h->relation);
+    if (c) {
+        int rc = wl_columnar_merge_consolidate_tail(c);
+        if (rc) return primary > 0 ? primary : rc;
+    }
+    if (h->admission_active) {
+        uint64_t state = atomic_load_explicit(&h->admission.state,
+                memory_order_relaxed);
+        bool released = state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+            ? wl_columnar_memory_release(&h->admission)
+            : state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+            && wl_columnar_memory_rollback(&h->admission);
+        if (!released) return primary > 0 ? primary : EINVAL;
+        h->admission_active = false;
+    }
+    record->phase = WL_COLUMNAR_CONSOLIDATE_RETIRED;
+    return primary;
+}
+
+static int
+wl_columnar_merge_hash_initialize(wl_columnar_consolidate_record_t *record,
+    wl_evaluation_control_t *c)
+{
+    int rc = wl_evaluation_control_charge(c, 128); if (rc) return rc;
+    wl_columnar_relation_radix_sequence_t *seq = &record->sequence;
+    wl_columnar_radix_workspace_t *w = &seq->workspace;
+    if (record->lane != WL_COLUMNAR_CONSOLIDATE_RADIX
+        || record->phase != WL_COLUMNAR_CONSOLIDATE_PREPARING
+        || seq->prepared || seq->consumed || seq->boundaries || seq->needs_sort
+        || seq->metadata_admission_active || w->admission_active
+        || w->perm_a || w->perm_b || w->bucket_values || w->byte_values
+        || w->short_values || w->count16 || w->temp_column
+        || w->insertion_rows || w->timestamps
+        || seq->metadata_admission.identity != &seq->metadata_admission
+        || w->admission.identity != &w->admission
+        || atomic_load(&seq->metadata_admission.state)
+        != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+        || atomic_load(&w->admission.state)
+        != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY) return EBUSY;
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    record->lane = WL_COLUMNAR_CONSOLIDATE_LANE_INITIALIZING;
+    for (size_t at = 0; at < sizeof(record->sequence);) {
+        size_t bytes = sizeof(record->sequence) - at;
+        if (bytes > 128u) bytes = 128u;
+        rc = wl_evaluation_control_charge(c, bytes); if (rc) return rc;
+        memset((char *)&record->sequence + at, 0, bytes); at += bytes;
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(c, 64); if (rc) return rc;
+    wl_columnar_memory_reservation_init(&record->hash.admission);
+    record->lane = WL_COLUMNAR_CONSOLIDATE_HASH;
+    return wl_columnar_merge_consolidate_tail(c);
+}
+
+static int
+wl_columnar_merge_hash_validate(wl_columnar_consolidate_record_t *record,
+    wl_evaluation_control_t *c)
+{
+    wl_columnar_merge_hash_record_t *h = &record->hash;
+    int rc = wl_evaluation_control_charge(c, 128); if (rc) return rc;
+    wl_columnar_relation_mutation_lease_t *lease = h->lease;
+    col_rel_t *r = h->relation;
+    if (!h->prepared || !r || !lease || lease->set != h->set
+        || !h->set || h->set->lease_count != 1 || h->set->leases != lease
+        || h->set->descriptor_count != 1 || h->set->owner_count != 1
+        || lease->acquisition_nonce != h->nonce || lease->owner != r
+        || lease->owner_identity != h->owner_identity
+        || lease->owner_generation != h->owner_generation
+        || col_rel_mutation_lease_validate(lease, r)) return EINVAL;
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    rc = wl_evaluation_control_charge(c, 128); if (rc) return rc;
+    if (r->relation_identity != h->identity
+        || r->storage_generation != h->storage_generation
+        || r->view_generation != h->view_generation
+        || r->columns != (int64_t **)h->columns || r->column_types != h->types
+        || r->nrows != h->nrows || r->ncols != h->ncols
+        || r->capacity != h->capacity || r->timestamps || r->col_shared
+        || r->arena_owned || r->nrows > r->capacity
+        || r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
+        return EINVAL;
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    uint64_t fingerprint;
+    rc = wl_columnar_relation_radix_type_fingerprint_controlled(r,
+            &fingerprint, c); if (rc) return rc;
+    return fingerprint == h->type_fingerprint ? 0 : EINVAL;
+}
+
+static int
+wl_columnar_merge_hash_prepare(wl_columnar_consolidate_record_t *record,
+    col_rel_t *r, wl_columnar_relation_mutation_lease_t *lease,
+    wl_evaluation_control_t *c)
+{
+    int rc = wl_columnar_merge_hash_initialize(record, c); if (rc) return rc;
+    wl_columnar_merge_hash_record_t *h = &record->hash;
+    rc = wl_evaluation_control_charge(c, 128); if (rc) return rc;
+    if (!r || !lease || !lease->set || lease->set->lease_count != 1
+        || lease->set->leases != lease || lease->set->descriptor_count != 1
+        || lease->set->owner_count != 1 || lease->owner != r
+        || col_rel_mutation_lease_validate(lease, r)
+        || !wl_columnar_relation_generation_valid(
+            r->view_generation)) return EINVAL;
+    if (r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
+        return EOVERFLOW;
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    rc = wl_evaluation_control_charge(c, 128); if (rc) return rc;
+    if (!col_op_consolidate_size_multiply(r->ncols, sizeof(int64_t),
+        &h->row_bytes)) return EOVERFLOW;
+    h->allocated_row_bytes = h->row_bytes ? h->row_bytes : sizeof(int64_t);
+    h->relation = r;
+    uint64_t max_ht_cap = 8192u, max_uniq_cap = 4096u;
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    while (max_ht_cap <= (uint64_t)r->nrows * 2u
+        && max_ht_cap <= UINT32_MAX / 2u) {
+        rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+        max_ht_cap *= 2u;
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    }
+    while (max_uniq_cap < r->nrows && max_uniq_cap <= UINT32_MAX / 2u) {
+        rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+        max_uniq_cap *= 2u;
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(c, 128); if (rc) return rc;
+    if (max_uniq_cap < r->nrows) return EOVERFLOW;
+    uint64_t ht_live = max_ht_cap + (max_ht_cap > 8192u ? max_ht_cap / 2u : 0u);
+    uint64_t unique_live = max_uniq_cap
+        + (max_uniq_cap > 4096u ? max_uniq_cap / 2u : 0u);
+    uint64_t bytes, scratch = 0;
+    if (ht_live < max_ht_cap || unique_live < max_uniq_cap
+        || !wl_columnar_memory_size_mul(ht_live, h->allocated_row_bytes, &bytes)
+        || !wl_columnar_memory_size_add(scratch, bytes, &scratch)
+        || !wl_columnar_memory_size_add(scratch, ht_live, &scratch)
+        || !wl_columnar_memory_size_mul(unique_live, h->allocated_row_bytes,
+        &bytes)
+        || !wl_columnar_memory_size_add(scratch, bytes, &scratch)
+        || (r->ncols > COL_STACK_MAX
+        && !wl_columnar_memory_size_add(scratch, h->row_bytes, &scratch))
+        || scratch > SIZE_MAX) return EOVERFLOW;
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    rc = wl_columnar_merge_hash_step(record, c, 78, scratch);
+    if (rc) return rc;
+    wl_columnar_memory_admission_status_t status;
+    rc = wl_columnar_memory_governor_reserve_checked_controlled(
+        wl_columnar_memory_governor_ref_get(r->memory_governor), scratch,
+        &h->admission, &status, c); if (rc) return rc;
+    if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+        && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+        if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+            r->memory_budget_denial_pending = true;
+        return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOMEM
+            : status ==
+               WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : EINVAL;
+    }
+    h->admission_active = true;
+    rc = wl_evaluation_control_charge(c, 128); if (rc) return rc;
+    h->relation = r; h->lease = lease; h->set = lease->set;
+    h->nonce = lease->acquisition_nonce; h->identity = r->relation_identity;
+    h->storage_generation = r->storage_generation;
+    h->view_generation = r->view_generation;
+    h->owner_identity = lease->owner_identity;
+    h->owner_generation = lease->owner_generation;
+    h->columns = (const int64_t *const *)r->columns; h->types = r->column_types;
+    h->nrows = r->nrows; h->ncols = r->ncols; h->capacity = r->capacity;
+    h->hash_capacity = 8192u; h->unique_capacity = 4096u;
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    rc = wl_columnar_relation_radix_type_fingerprint_controlled(r,
+            &h->type_fingerprint, c); if (rc) return rc;
+    rc = wl_columnar_relation_consolidate_allocate_controlled(
+        (void **)&h->values, 8192u * h->allocated_row_bytes, c);
+    if (rc) return rc;
+    rc = wl_columnar_relation_consolidate_allocate_controlled(
+        (void **)&h->used, 8192u, c); if (rc) return rc;
+    rc = wl_columnar_relation_consolidate_allocate_controlled(
+        (void **)&h->unique, 4096u * h->allocated_row_bytes, c);
+    if (rc) return rc;
+    if (r->ncols > COL_STACK_MAX) {
+        rc = wl_columnar_relation_consolidate_allocate_controlled(
+            (void **)&h->row_scratch, h->row_bytes, c); if (rc) return rc;
+    }
+    rc = wl_columnar_merge_hash_step(record, c, 77, scratch);
+    if (rc) return rc;
+    rc = wl_columnar_relation_consolidate_commit_controlled(&h->admission,
+            h->admission_active, h, c); if (rc) return rc;
+    rc = wl_columnar_merge_hash_step(record, c, 79, scratch);
+    if (rc) return rc;
+    for (uint32_t slot = 0; slot < h->hash_capacity; slot++) {
+        rc = wl_evaluation_control_charge(c, 1); if (rc) return rc;
+        h->used[slot] = 0;
+        rc = wl_columnar_merge_hash_step(record, c, 80, slot + 1u);
+        if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+    h->prepared = true;
+    rc = wl_columnar_merge_hash_validate(record, c); if (rc) return rc;
+    return wl_columnar_merge_hash_step(record, c, 98, h->nrows);
+}
+
+static int
+wl_columnar_merge_hash_cells(wl_columnar_consolidate_record_t *record,
+    const int64_t *row, uint32_t *hash, wl_evaluation_control_t *c,
+    uint64_t *visits)
+{
+    *hash = 2166136261u;
+    for (uint32_t col = 0; col < record->hash.ncols; col++) {
+        int rc = wl_evaluation_control_charge(c, 24); if (rc) return rc;
+        *hash = wl_columnar_hash_value(*hash, record->hash.relation, col,
+                row[col]);
+        rc = wl_columnar_merge_hash_step(record, c, 82, ++*visits);
+        if (rc) return rc;
+    }
+    return 0;
+}
+
+static int
+wl_columnar_merge_hash_copy(wl_columnar_consolidate_record_t *record,
+    int64_t *dst, const int64_t *src, uint32_t count,
+    wl_evaluation_control_t *c, int stage, uint64_t *visits)
+{
+    for (uint32_t col = 0; col < count; col++) {
+        int rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+        dst[col] = src[col];
+        rc = wl_columnar_merge_hash_step(record, c, stage, ++*visits);
+        if (rc) return rc;
+    }
+    return 0;
+}
+
+static int
+wl_columnar_merge_hash_compare(wl_columnar_consolidate_record_t *record,
+    const int64_t *left, const int64_t *right, int *cmp,
+    wl_evaluation_control_t *c, uint64_t *visits)
+{
+    col_rel_t *r = record->hash.relation;
+    for (uint32_t col = 0; col < r->ncols; col++) {
+        int rc = wl_evaluation_control_charge(c, 24); if (rc) return rc;
+        *cmp = r->column_types && r->column_types[col] == WIRELOG_TYPE_FLOAT
+            ? wl_columnar_float_compare_bits(left[col], right[col])
+            : (left[col] > right[col]) - (left[col] < right[col]);
+        rc = wl_columnar_merge_hash_step(record, c, 94, ++*visits);
+        if (rc) return rc;
+        if (*cmp) return 0;
+    }
+    *cmp = 0; return 0;
+}
+
+static int
+wl_columnar_merge_hash_swap(wl_columnar_consolidate_record_t *record,
+    uint32_t left, uint32_t right, wl_evaluation_control_t *c, uint64_t *visits)
+{
+    wl_columnar_merge_hash_record_t *h = &record->hash;
+    for (uint32_t col = 0; col < h->ncols; col++) {
+        int rc = wl_evaluation_control_charge(c, 24); if (rc) return rc;
+        size_t a = (size_t)left * h->ncols + col;
+        size_t b = (size_t)right * h->ncols + col;
+        int64_t v = h->unique[a]; h->unique[a] = h->unique[b]; h->unique[b] = v;
+        rc = wl_columnar_merge_hash_step(record, c, 95, ++*visits);
+        if (rc) return rc;
+    }
+    return 0;
+}
+
+static int
+wl_columnar_merge_hash_sift(wl_columnar_consolidate_record_t *record,
+    uint32_t root, uint32_t count, wl_evaluation_control_t *c,
+    uint64_t *compares, uint64_t *swaps)
+{
+    wl_columnar_merge_hash_record_t *h = &record->hash;
+    while (root < count / 2u) {
+        int rc = wl_evaluation_control_charge(c, 16); if (rc) return rc;
+        uint32_t child = root * 2u + 1u;
+        rc = wl_columnar_merge_hash_step(record, c, 93, child);
+        if (rc) return rc;
+        int cmp;
+        if (child + 1u < count) {
+            rc = wl_columnar_merge_hash_compare(record,
+                    h->unique + (size_t)child * h->ncols,
+                    h->unique + (size_t)(child + 1u) * h->ncols, &cmp, c,
+                    compares);
+            if (rc) return rc;
+            if (cmp < 0) child++;
+        }
+        rc = wl_columnar_merge_hash_compare(record,
+                h->unique + (size_t)root * h->ncols,
+                h->unique + (size_t)child * h->ncols, &cmp, c, compares);
+        if (rc) return rc;
+        if (cmp >= 0) return 0;
+        rc = wl_columnar_merge_hash_swap(record, root, child, c, swaps);
+        if (rc) return rc;
+        root = child;
+    }
+    return 0;
+}
+
+static int
+wl_columnar_merge_hash_execute(wl_columnar_consolidate_record_t *record,
+    wl_evaluation_control_t *c, wl_columnar_merge_hash_outcome_t *outcome)
+{
+    wl_columnar_merge_hash_record_t *h = &record->hash;
+    int rc = wl_columnar_merge_hash_validate(record, c); if (rc) return rc;
+    *outcome = WL_COLUMNAR_MERGE_HASH_COMPLETE;
+    int64_t local_row[COL_STACK_MAX];
+    int64_t *row = h->ncols > COL_STACK_MAX ? h->row_scratch : local_row;
+    uint64_t gathers = 0, hashes = 0, probes = 0, equalities = 0, copies = 0;
+    for (uint32_t r = 0; r < h->nrows; r++) {
+        rc = wl_evaluation_control_charge(c, 16); if (rc) return rc;
+        for (uint32_t col = 0; col < h->ncols; col++) {
+            rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+            row[col] = h->relation->columns[col][r];
+            rc = wl_columnar_merge_hash_step(record, c, 81, ++gathers);
+            if (rc) return rc;
+        }
+        uint32_t hash;
+        rc = wl_columnar_merge_hash_cells(record, row, &hash, c, &hashes);
+        if (rc) return rc;
+        uint32_t slot = hash & (h->hash_capacity - 1u);
+        bool found = false;
+        for (;;) {
+            rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+            bool used = h->used[slot] != 0;
+            rc = wl_columnar_merge_hash_step(record, c, 83, ++probes);
+            if (rc) return rc;
+            if (!used) break;
+            bool equal = true;
+            for (uint32_t col = 0; col < h->ncols; col++) {
+                rc = wl_evaluation_control_charge(c, 24); if (rc) return rc;
+                equal = wl_columnar_value_equal(h->relation, col,
+                        h->values[(size_t)slot * h->ncols + col], h->relation,
+                        col, row[col]);
+                rc = wl_columnar_merge_hash_step(record, c, 84, ++equalities);
+                if (rc) return rc;
+                if (!equal) break;
+            }
+            if (equal) {
+                found = true; break;
+            }
+            slot = (slot + 1u) & (h->hash_capacity - 1u);
+        }
+        if (found) continue;
+        if ((uint64_t)h->unique_count * 2u >= h->hash_capacity) {
+            rc = wl_evaluation_control_charge(c, 16); if (rc) return rc;
+            if (h->unique_count > h->nrows / 4u) {
+                *outcome = WL_COLUMNAR_MERGE_HASH_FALLBACK;
+                return wl_columnar_merge_hash_step(record, c, 85,
+                           h->unique_count);
+            }
+            uint32_t cap = h->hash_capacity * 2u;
+            rc = wl_columnar_relation_consolidate_allocate_controlled(
+                (void **)&h->new_values, (size_t)cap * h->allocated_row_bytes,
+                c);
+            if (rc) return rc;
+            rc = wl_columnar_relation_consolidate_allocate_controlled(
+                (void **)&h->new_used, cap, c); if (rc) return rc;
+            for (uint32_t s = 0; s < cap; s++) {
+                rc = wl_evaluation_control_charge(c, 1); if (rc) return rc;
+                h->new_used[s] = 0;
+                rc = wl_columnar_merge_hash_step(record, c, 86, s + 1u);
+                if (rc) return rc;
+            }
+            for (uint32_t s = 0; s < h->hash_capacity; s++) {
+                rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+                bool used = h->used[s] != 0;
+                rc = wl_columnar_merge_hash_step(record, c, 87, s + 1u);
+                if (rc) return rc;
+                if (!used) continue;
+                int64_t *src = h->values + (size_t)s * h->ncols;
+                uint32_t rh;
+                rc = wl_columnar_merge_hash_cells(record, src, &rh, c, &hashes);
+                if (rc) return rc;
+                uint32_t ns = rh & (cap - 1u);
+                for (;;) {
+                    rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+                    bool occupied = h->new_used[ns] != 0;
+                    rc = wl_columnar_merge_hash_step(record, c, 88, ++probes);
+                    if (rc) return rc;
+                    if (!occupied) break;
+                    ns = (ns + 1u) & (cap - 1u);
+                }
+                rc = wl_columnar_merge_hash_copy(record,
+                        h->new_values + (size_t)ns * h->ncols, src, h->ncols,
+                        c, 89, &copies); if (rc) return rc;
+                rc = wl_evaluation_control_charge(c, 1); if (rc) return rc;
+                h->new_used[ns] = 1;
+                rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+            }
+            rc = wl_evaluation_control_charge(c, 32); if (rc) return rc;
+            free(h->values); h->values = NULL;
+            free(h->used); h->used = NULL;
+            h->values = h->new_values; h->new_values = NULL;
+            h->used = h->new_used; h->new_used = NULL; h->hash_capacity = cap;
+            rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+            slot = hash & (cap - 1u);
+            for (;;) {
+                rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+                bool occupied = h->used[slot] != 0;
+                rc = wl_columnar_merge_hash_step(record, c, 88, ++probes);
+                if (rc) return rc;
+                if (!occupied) break;
+                slot = (slot + 1u) & (cap - 1u);
+            }
+        }
+        rc = wl_columnar_merge_hash_copy(record,
+                h->values + (size_t)slot * h->ncols, row, h->ncols, c, 90,
+                &copies);
+        if (rc) return rc;
+        rc = wl_evaluation_control_charge(c, 1); if (rc) return rc;
+        h->used[slot] = 1;
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+        if (h->unique_count >= h->unique_capacity) {
+            uint32_t cap = h->unique_capacity * 2u;
+            rc = wl_columnar_relation_consolidate_allocate_controlled(
+                (void **)&h->new_unique, (size_t)cap * h->allocated_row_bytes,
+                c);
+            if (rc) return rc;
+            for (uint32_t r = 0; r < h->unique_count; r++) {
+                rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+                rc = wl_columnar_merge_hash_copy(record,
+                        h->new_unique + (size_t)r * h->ncols,
+                        h->unique + (size_t)r * h->ncols, h->ncols, c, 91,
+                        &copies);
+                if (rc) return rc;
+            }
+            rc = wl_evaluation_control_charge(c, 16); if (rc) return rc;
+            free(h->unique); h->unique = NULL;
+            h->unique = h->new_unique; h->new_unique = NULL;
+            h->unique_capacity = cap;
+            rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+        }
+        rc = wl_columnar_merge_hash_copy(record,
+                h->unique + (size_t)h->unique_count * h->ncols, row, h->ncols,
+                c, 92, &copies); if (rc) return rc;
+        rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+        h->unique_count++;
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    }
+    uint64_t compares = 0, swaps = 0;
+    for (uint32_t root = h->unique_count / 2u; root;) {
+        rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+        rc = wl_columnar_merge_hash_sift(record, --root, h->unique_count,
+                c, &compares, &swaps); if (rc) return rc;
+    }
+    for (uint32_t end = h->unique_count; end > 1u;) {
+        rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+        rc = wl_columnar_merge_hash_swap(record, 0, --end, c, &swaps);
+        if (rc) return rc;
+        rc = wl_columnar_merge_hash_sift(record, 0, end, c, &compares, &swaps);
+        if (rc) return rc;
+    }
+    rc = wl_columnar_merge_hash_validate(record, c); if (rc) return rc;
+    uint64_t writes = 0;
+    for (uint32_t r = 0; r < h->unique_count; r++) {
+        rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+        for (uint32_t col = 0; col < h->ncols; col++) {
+            rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+            h->relation->columns[col][r] = h->unique[(size_t)r * h->ncols +
+                    col];
+            rc = wl_columnar_merge_hash_step(record, c, 96, ++writes);
+            if (rc) return rc;
+        }
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    }
+    rc = wl_columnar_merge_hash_validate(record, c); if (rc) return rc;
+    rc = wl_evaluation_control_charge(c, 48); if (rc) return rc;
+    rc = wl_columnar_merge_hash_step(record, c, 97, h->unique_count);
+    if (rc) return rc;
+    col_rel_t *r = h->relation;
+    r->nrows = h->unique_count; r->sorted_nrows = h->unique_count;
+    r->run_count = 1; r->run_ends[0] = h->unique_count; r->view_generation++;
+    h->lease->set->published = true;
+    record->phase = WL_COLUMNAR_CONSOLIDATE_CONSUMED;
+    return 0;
 }
 
 static int
@@ -1719,7 +2242,7 @@ wl_columnar_merge_consolidate_controlled(eval_stack_t *stack,
         return wl_columnar_relation_source_group_drain(group, 0);
     }
     rc = wl_evaluation_control_charge(c, 32); if (rc) goto cleanup;
-    if (in->nrows > 1u && (in->nrows > 10000 || original->seg_count > 1
+    if (in->nrows > 1u && (original->seg_count > 1
         || (original->seg_boundaries && (original->seg_count != 1
         || original->seg_boundaries[0] ||
         original->seg_boundaries[1] != in->nrows))
@@ -1752,7 +2275,7 @@ wl_columnar_merge_consolidate_controlled(eval_stack_t *stack,
         rc = wl_columnar_merge_consolidate_owned_shape(out, c);
         if (rc) goto cleanup;
         rc = wl_evaluation_control_charge(c, 32); if (rc) goto cleanup;
-        if (out->nrows > 1u && (out->nrows > 10000 || result->seg_count > 1
+        if (out->nrows > 1u && (result->seg_count > 1
             || (result->seg_boundaries && (result->seg_count != 1
             || result->seg_boundaries[0]
             || result->seg_boundaries[1] != out->nrows))
@@ -1819,6 +2342,20 @@ wl_columnar_merge_consolidate_controlled(eval_stack_t *stack,
             c); if (rc) goto cleanup;
 prepare:;
     wl_columnar_relation_mutation_lease_t *lease = &writer->batch.single.lease;
+    if (out->nrows > 10000u) {
+        rc = wl_columnar_merge_hash_prepare(record, out, lease, c);
+        if (rc) goto cleanup;
+        wl_columnar_merge_hash_outcome_t outcome;
+        rc = wl_columnar_merge_hash_execute(record, c, &outcome);
+        if (rc) goto cleanup;
+        rc = wl_columnar_merge_hash_retire(record, 0, c);
+        if (rc) goto cleanup;
+        if (outcome == WL_COLUMNAR_MERGE_HASH_COMPLETE) goto owned_finish;
+        /* Actual physical and credit drain precedes reuse at original addresses.
+         * Continue the same attempt without resetting or refunding consumption. */
+        rc = wl_columnar_merge_consolidate_reset(record, c);
+        if (rc) goto cleanup;
+    }
     wl_columnar_memory_admission_status_t status;
     rc = wl_columnar_memory_governor_reserve_checked_controlled(
         wl_columnar_memory_governor_ref_get(out->memory_governor), 8,

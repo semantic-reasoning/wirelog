@@ -1067,8 +1067,8 @@ its row count is also zero under real destination writers. Positive incoming
 rows use the existing governed growth transaction to build all new lanes before
 copying. Retained scratch and auxiliary credit remain owned; zero capacity does
 not imply zero total retained bytes. Other missing tables or lanes remain
-malformed. The selected owned CONS cap of 10000 and general typed producers
-remain outstanding full-task work. FLOAT-key signed-zero equality is tested
+malformed. General typed producers remain outstanding full-task work.
+FLOAT-key signed-zero equality is tested
 with a genuine fused INT64 projection; no implicit MAP payload is typed proof.
 
 The existing TEMPORARY ledger gauge is captured during prepublication
@@ -1077,3 +1077,33 @@ snapshot after terminal frame retirement. Actual ownership cleanup is attested
 by the original frame pointer, cleanup reservation, source authority and governor
 usage; a nonzero historical TEMPORARY gauge does not assert a live reservation.
 The stored payload gauge includes the actual retained column pointer table.
+
+Full-flat ordinary SET consolidation now preserves the raw large-input policy:
+more than 10000 rows first use a typed hash table (initial 8192 slots and 4096
+unique rows). The original maximum simultaneous old/new hash and unique storage
+is admitted before allocation. At the real rehash decision only the raw unique
+count heuristic requests radix fallback; denial, overflow, allocation failure
+and refused cleanup remain positive errors. Cell gathers, hashing, collision
+checks, rehash/copy, staged heapsort and transient writeback are bounded charged
+work. Staging preserves the source until publication; a stopped private
+writeback is recomputed from the canonical source on retry.
+
+Hash ownership occupies an exclusive union over the original radix sequence.
+Its lane and record readiness are outside overwritten bytes, and immutable old
+record plus complete frame size/alignment witnesses prohibit frame growth.
+Physical pointers become durable before any fallible tail and are nulled before
+original-address RESERVED rollback or COMMITTED release. Refusal retains the
+actual lane, token and owner. Only complete physical and credit retirement allows
+bounded radix initialization under the same control, without reset or refund.
+Healthy hash retirement is charged; mandatory checked drain retains the existing
+cleanup exclusion and positive primary error precedence.
+
+The controlled full-range kernels select sorted zero-work, FLOAT/small insertion,
+integer/string k8 below 50000 and k16 from 50000 rows, with raw admission sizes
+17N and 18N+262144. The one physical bucket has byte/short aliases and the k16
+65536-entry histogram has separate physical ownership; retirement nulls every
+alias before credit. All histogram initialization/prefix, count/scatter and
+column gather/write loops are bounded. Genuine unsorted generated AUTO products
+and expression duplicate projections exercise this caller without plan retagging.
+Typed original-schema helper fixtures are separate from typed producer coverage.
+Sorted-prefix and multisegment SET remain subsequent full-task obligations.
