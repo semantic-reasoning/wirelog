@@ -1716,6 +1716,242 @@ fail:
     if (admitted && !wl_columnar_memory_rollback(&admission)) abort();
     return rc;
 }
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_expr_test_retirement_checkpoint)(
+    wl_columnar_expr_operator_preparation_t *, int);
+#endif
+static void
+wl_columnar_expr_retirement_checkpoint(
+    wl_columnar_expr_operator_preparation_t *r,
+    int phase)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_expr_test_retirement_checkpoint)
+        wl_columnar_expr_test_retirement_checkpoint(r, phase);
+#else
+    (void)r; (void)phase;
+#endif
+}
+static int
+wl_columnar_expr_checked_credit_retire(wl_columnar_memory_reservation_t *token)
+{
+    if (!token->bytes) return 0;
+    uint64_t state = atomic_load_explicit(&token->state, memory_order_acquire);
+    if (state == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+        || state == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED) return 0;
+    bool retired = state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        ? wl_columnar_memory_release(token)
+        : state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        && wl_columnar_memory_rollback(token);
+    return retired ? 0 : EINVAL;
+}
+static int
+wl_columnar_expr_checked_owner_retire(
+    wl_columnar_expr_operator_preparation_t *r,
+    wl_columnar_expr_compiled_t **slot)
+{
+    if (*slot) {
+        /* Only owners allocated by compile_checked enter this record. */
+        wl_columnar_expr_controlled_owner_t *owner =
+            (wl_columnar_expr_controlled_owner_t *)*slot;
+        uint64_t retired_state = atomic_load_explicit(
+            &r->retired_expression.state, memory_order_acquire);
+        if (retired_state != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+            && retired_state !=
+            WL_COLUMNAR_MEMORY_RESERVATION_RELEASED) return EBUSY;
+        wl_columnar_expr_retirement_checkpoint(r, 1);
+        if (owner->token.bytes && !wl_columnar_memory_reservation_move(
+                &r->retired_expression, &owner->token)) return EINVAL;
+        free(owner->compiled.instrs); owner->compiled.instrs = NULL;
+        free(owner); *slot = NULL;
+        wl_columnar_expr_retirement_checkpoint(r, 2);
+    }
+    return wl_columnar_expr_checked_credit_retire(&r->retired_expression);
+}
+int
+wl_columnar_expr_operator_retire(wl_columnar_expr_operator_preparation_t *r,
+    int rc, bool mandatory, wl_evaluation_control_t *control)
+{
+    if (!r || !r->ready) return rc > 0 ? rc : EINVAL;
+    /* Mandatory drain disables work admission, never identity/state checks. */
+    if (!mandatory) {
+        int stop = wl_evaluation_control_charge(control, 96);
+        if (stop) {
+            if (rc <= 0) rc = stop; mandatory = true;
+        }
+    }
+    int cleanup = wl_columnar_expr_checked_owner_retire(r, &r->current);
+    if (!cleanup) cleanup =
+            wl_columnar_expr_checked_credit_retire(&r->compile_admission);
+    if (!cleanup) cleanup = wl_columnar_expr_checked_owner_retire(r,
+                &r->single);
+    if (cleanup) return rc > 0 ? rc : cleanup;
+    if (!mandatory) {
+        int stop = wl_evaluation_control_charge(control, 0);
+        if (stop) {
+            if (rc <= 0) rc = stop; mandatory = true;
+        }
+    }
+    while (r->retiring < r->initialized) {
+        if (!mandatory) {
+            int stop = wl_evaluation_control_charge(control, 64);
+            if (stop) {
+                if (rc <= 0) rc = stop; mandatory = true;
+            }
+        }
+        cleanup = wl_columnar_expr_checked_owner_retire(r,
+                &r->expressions[r->retiring]);
+        if (cleanup) return rc > 0 ? rc : cleanup;
+        r->retiring++;
+        if (!mandatory) {
+            wl_columnar_expr_retirement_checkpoint(r, 3);
+            int stop = wl_evaluation_control_charge(control, 0);
+            if (stop) {
+                if (rc <= 0) rc = stop; mandatory = true;
+            }
+        }
+    }
+    if (!mandatory) {
+        int stop = wl_evaluation_control_charge(control, 64);
+        if (stop) {
+            if (rc <= 0) rc = stop; mandatory = true;
+        }
+    }
+    free(r->scratch_payload); r->scratch_payload = NULL;
+    r->expressions = NULL;
+    wl_columnar_expr_retirement_checkpoint(r, 4);
+    cleanup = wl_columnar_expr_checked_credit_retire(&r->scratch);
+    if (cleanup) return rc > 0 ? rc : cleanup;
+    r->initialized = r->retiring = 0;
+    if (!mandatory) {
+        int stop = wl_evaluation_control_charge(control, 0);
+        if (stop && rc <= 0) rc = stop;
+    }
+    return rc;
+}
+int
+wl_columnar_expr_compile_checked(const uint8_t *buf, uint32_t size,
+    wl_columnar_memory_governor_ref_t *governor, wl_col_session_t *sess,
+    wl_columnar_expr_compiled_t **out, bool *supported,
+    wl_columnar_expr_operator_preparation_t *record,
+    wl_evaluation_control_t *control)
+{
+    if (!out || !supported || !record || !record->ready || !control
+        || record->current || record->compile_admission.bytes) return EINVAL;
+    *out = NULL;
+    if (!buf || !size) {
+        *supported = false; return 0;
+    }
+    uint32_t count = 0, pos = 0;
+    expr_instr_t instruction;
+    int rc;
+    while (pos < size) {
+        rc = wl_columnar_expr_controlled_decode(buf, size, &pos, &instruction,
+                1, control);
+        if (rc == ENOTSUP) {
+            *supported = false; return 0;
+        }
+        if (rc) return rc;
+        if (count == UINT32_MAX) return EOVERFLOW;
+        count++;
+    }
+    uint64_t instr_bytes, total;
+    if (!wl_columnar_memory_size_mul(count, sizeof(expr_instr_t), &instr_bytes)
+        || !wl_columnar_memory_size_add(
+            sizeof(wl_columnar_expr_controlled_owner_t),
+            instr_bytes, &total) || total > SIZE_MAX) return EOVERFLOW;
+    wl_columnar_memory_reservation_t *admission = &record->compile_admission;
+    wl_columnar_expr_controlled_owner_t *owner = NULL;
+
+    rc = wl_evaluation_control_charge(control, 48);
+    if (rc) return rc;
+    wl_columnar_expr_controlled_checkpoint(control, 5, count, false);
+    if (governor) {
+        wl_columnar_memory_admission_status_t status;
+        rc = wl_columnar_memory_governor_reserve_checked_controlled(
+            wl_columnar_memory_governor_ref_get(governor), total, admission,
+            &status, control);
+        if (rc) return rc;
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED && sess)
+                sess->memory_budget_denied = true;
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status ==
+                   WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : ENOMEM;
+        }
+
+    }
+    wl_columnar_expr_retirement_checkpoint(record, 5);
+    rc = wl_evaluation_control_charge(control, 1);
+    if (rc) goto fail;
+    owner = wl_columnar_expr_controlled_malloc(sizeof(*owner));
+    if (!owner) {
+        rc = ENOMEM; goto fail;
+    }
+    record->current = &owner->compiled;
+    owner->compiled = (wl_columnar_expr_compiled_t){.ninstr = count,
+                                                    .intern =
+                                                        sess ? sess->intern :
+                                                        NULL};
+    wl_columnar_memory_reservation_init(&owner->token);
+    rc = wl_columnar_expr_controlled_tail(control);
+    if (rc) goto fail;
+    rc = wl_evaluation_control_charge(control, 1);
+    if (rc) goto fail;
+    owner->compiled.instrs =
+        wl_columnar_expr_controlled_malloc((size_t)instr_bytes);
+    if (!owner->compiled.instrs) {
+        rc = ENOMEM; goto fail;
+    }
+    rc = wl_columnar_expr_controlled_tail(control);
+    if (rc) goto fail;
+    wl_columnar_expr_retirement_checkpoint(record, 6);
+    pos = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        rc = wl_columnar_expr_controlled_decode(buf, size, &pos, &instruction,
+                2, control);
+        if (rc) goto fail;
+        rc = wl_evaluation_control_charge(control, 3);
+        if (rc) goto fail;
+        owner->compiled.instrs[i].op = instruction.op;
+        owner->compiled.instrs[i].iarg = instruction.iarg;
+        owner->compiled.instrs[i].larg = instruction.larg;
+        rc = wl_columnar_expr_controlled_tail(control);
+        if (rc) goto fail;
+    }
+    rc = wl_evaluation_control_charge(control, 32);
+    if (rc) goto fail;
+    if (admission->bytes) {
+        if (!wl_columnar_memory_reservation_move(&owner->token, admission)) {
+            rc = EINVAL; goto fail;
+        }
+
+        owner->compiled.reservation = &owner->token;
+        bool committed;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_expr_test_fail_commit) {
+            wl_columnar_expr_test_fail_commit = false;
+            rc = ENOMEM; goto fail;
+        }
+#endif
+        rc = wl_columnar_memory_governor_commit_controlled(&owner->token,
+                owner, &committed, control);
+        if (rc) goto fail;
+        if (!committed) {
+            rc = ENOMEM; goto fail;
+        }
+    }
+    wl_columnar_expr_controlled_checkpoint(control, 4, count, false);
+    rc = wl_columnar_expr_controlled_tail(control);
+    if (rc) goto fail;
+    *supported = true;
+    *out = &owner->compiled;
+    record->current = NULL;
+    return 0;
+fail:
+    return rc; /* Original current owner/admission remain in the frame. */
+}
 /* Published reverse strings are immutable under the caller's table lifetime.
  * Byte operations poll individually; no unbounded libc scan is hidden here. */
 static int

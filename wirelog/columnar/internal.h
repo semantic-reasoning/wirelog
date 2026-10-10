@@ -3715,6 +3715,33 @@ extern void (*wl_columnar_eval_serial_test_after_plan)(
     wl_col_session_t *, eval_stack_t *, eval_entry_t *);
 #endif
 
+typedef struct wl_columnar_expr_compiled wl_columnar_expr_compiled_t;
+typedef struct wl_columnar_expr_operator_preparation {
+    wl_columnar_memory_reservation_t scratch, compile_admission,
+        retired_expression;
+    void *scratch_payload;
+    wl_columnar_expr_compiled_t **expressions;
+    wl_columnar_expr_compiled_t *current, *single;
+    uint32_t initialized, retiring, initialized_tokens;
+    bool ready;
+} wl_columnar_expr_operator_preparation_t;
+int wl_columnar_expr_operator_retire(wl_columnar_expr_operator_preparation_t *,
+    int, bool, wl_evaluation_control_t *);
+int wl_columnar_expr_compile_checked(const uint8_t *, uint32_t,
+    wl_columnar_memory_governor_ref_t *, wl_col_session_t *,
+    wl_columnar_expr_compiled_t **, bool *,
+    wl_columnar_expr_operator_preparation_t *, wl_evaluation_control_t *);
+int wl_columnar_eval_stack_cleanup_operator_preparation_owner(
+    wl_col_session_t *,
+    eval_stack_t *, wl_columnar_expr_operator_preparation_t **,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_stack_cleanup_consolidate_prepare(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_evaluation_control_t *);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_expr_test_retirement_checkpoint)(
+    wl_columnar_expr_operator_preparation_t *, int);
+#endif
+
 typedef enum {
     WL_COLUMNAR_CONSOLIDATE_INERT = 0,
     WL_COLUMNAR_CONSOLIDATE_PREPARING,
@@ -4015,6 +4042,8 @@ typedef struct wl_columnar_session_hash_controlled_registry {
 #define WL_COLUMNAR_SERIAL_FRAME_EVALUATION 0u
 #define WL_COLUMNAR_SERIAL_FRAME_REGISTRY 1u
 #define WL_COLUMNAR_SERIAL_FRAME_OUTPUT 2u
+#define WL_COLUMNAR_SERIAL_FRAME_OPERATOR 3u
+#define WL_COLUMNAR_SERIAL_FRAME_WORKSPACE_INITIALIZING 4u
 typedef struct wl_columnar_serial_output_slot {
     wl_columnar_source_access_reader_t reader;
     col_rel_t *relation;
@@ -4187,7 +4216,6 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
 /* ======================================================================== */
 
 /* Checked expression arithmetic (columnar/arithmetic.c). */
-typedef struct wl_columnar_expr_compiled wl_columnar_expr_compiled_t;
 
 typedef struct {
     wl_intern_t *intern;

@@ -1658,6 +1658,10 @@ wl_columnar_merge_consolidate_controlled(eval_stack_t *stack,
     int rc = wl_columnar_eval_stack_cleanup_private_batch_owner(sess, stack,
             &writer, c);
     if (rc) return rc;
+    rc =
+        wl_columnar_eval_stack_cleanup_consolidate_prepare(sess->cleanup_active,
+            c);
+    if (rc) return rc;
     wl_columnar_consolidate_record_t *record =
         wl_columnar_eval_stack_cleanup_consolidate(sess->cleanup_active);
     if (!record || !record->ready) return EINVAL;

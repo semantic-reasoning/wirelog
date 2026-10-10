@@ -790,7 +790,6 @@ checks under exclusive ownership do not imply an acquire publication edge.
 | `eval_stack.c:wl_columnar_eval_stack_cleanup_begin#4` | `frame->consolidate.merge_admission.state` | `atomic_store_explicit` | `relaxed` | Relaxed EMPTY initialization of an exclusively constructed original embedded consolidation reservation; actual identity is set before frame publication. |
 | `eval_stack.c:wl_columnar_eval_stack_cleanup_begin#5` | `reservation.state` | `atomic_load` | `seq_cst (default)` | Local frame construction selects actual reservation rollback/release; no frame publication occurs before initialized embedded identities. |
 | `expr.c:wl_columnar_expr_compiled_free_controlled` | `token.state` | `atomic_load_explicit` | `acquire` | Observe published reservation state after physical compiled storage retirement to choose mandatory release or rollback. |
-| `filter.c:wl_columnar_filter_op_controlled` | `scratch.state` | `atomic_load_explicit` | `acquire` | Select mandatory scratch release/rollback after physical scratch disposal under the caller ownership. |
 | `mem_ledger.c:wl_columnar_mem_ledger_apply_exclusive` | `ledger->subsys_bytes[subsystem]` | `atomic_load_explicit` | `relaxed` | Prepared exclusive ledger request updates accounting/peak under external exclusivity; relaxed counters provide no payload publication edge. |
 | `mem_ledger.c:wl_columnar_mem_ledger_apply_exclusive#2` | `ledger->subsys_bytes[subsystem]` | `atomic_store_explicit` | `relaxed` | Prepared exclusive ledger request updates accounting/peak under external exclusivity; relaxed counters provide no payload publication edge. |
 | `mem_ledger.c:wl_columnar_mem_ledger_apply_exclusive#3` | `ledger->subsys_peak[subsystem]` | `atomic_load_explicit` | `relaxed` | Prepared exclusive ledger request updates accounting/peak under external exclusivity; relaxed counters provide no payload publication edge. |
@@ -825,7 +824,6 @@ checks under exclusive ownership do not imply an acquire publication edge.
 | `merge.c:wl_columnar_merge_consolidate_reset` | `record->sequence.metadata_admission.state` | `atomic_store_explicit` | `relaxed` | Exclusive durable reset initializes EMPTY at original embedded identity before preparing workspace; no acquire/publication edge. |
 | `merge.c:wl_columnar_merge_consolidate_reset#2` | `record->sequence.workspace.admission.state` | `atomic_store_explicit` | `relaxed` | Exclusive durable reset initializes EMPTY at original embedded identity before preparing workspace; no acquire/publication edge. |
 | `merge.c:wl_columnar_merge_consolidate_reset#3` | `record->merge_admission.state` | `atomic_store_explicit` | `relaxed` | Exclusive durable reset initializes EMPTY at original embedded identity before preparing workspace; no acquire/publication edge. |
-| `ops.c:wl_columnar_ops_map_controlled` | `scratch.state` | `atomic_load_explicit` | `acquire` | Observe scratch reservation publication before physical-free/mandatory credit retirement decision. |
 | `ops.c:wl_columnar_ops_reduce_controlled` | `scratch.state` | `atomic_load` | `seq_cst (default)` | Default seq_cst observes actual scratch state for retained cleanup/release/rollback; this is not a fake credit refund. |
 | `ops.c:wl_columnar_ops_reduce_controlled#2` | `scratch.state` | `atomic_load` | `seq_cst (default)` | Default seq_cst observes actual scratch state for retained cleanup/release/rollback; this is not a fake credit refund. |
 | `ops.c:wl_columnar_ops_reduce_controlled#3` | `scratch.state` | `atomic_load` | `seq_cst (default)` | Default seq_cst observes actual scratch state for retained cleanup/release/rollback; this is not a fake credit refund. |
@@ -1564,3 +1562,15 @@ physical storage and credit. Its consumed cursor advances before checked writer
 release, so a positive release refusal retains authority and cannot replay the
 reset. Frontier cursors advance before their charged tails. The phase-exclusive
 frame layout retains its original size and alignment assertions.
+
+| `expr.c:wl_columnar_expr_checked_credit_retire` | original token.state | `atomic_load_explicit` | acquire | Distinguish live RESERVED rollback, COMMITTED release and already disposed EMPTY/RELEASED history after physical retirement |
+| `expr.c:wl_columnar_expr_checked_owner_retire` | frame retired_expression.state | `atomic_load_explicit` | acquire | Admit actual checked move into the original EMPTY/RELEASED retirement slot before freeing the controlled compiled owner |
+
+FILTER and MAP use an original-address preparation record over retired
+consolidation workspace. External frame mode prevents disposal from interpreting
+an interrupted overlay as a consolidation record. Input, private result, source
+group and private batch stay in separate fields. Healthy prefix retirement is
+charged; mandatory checked drain after failure or pending refusal performs no
+new work admission. All original move/release/rollback checks remain active.
+Physical scratch and compiled owners retire before their credits, with NULL
+payload and live token retained on refused credit retirement.

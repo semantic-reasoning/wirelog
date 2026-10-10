@@ -953,7 +953,8 @@ and a new claim about this field belongs in a test before it belongs here.
 ### Controlled serial full-input attempts
 
 `wl_columnar_session_serial_attempt` handles initial and dirty full-input W1 nonrecursive backend
-STEP and SNAPSHOT for the admitted VARIABLE/MAP/CONSOLIDATE pipeline.
+STEP and SNAPSHOT for the admitted VARIABLE/MAP/CONSOLIDATE and
+VARIABLE/FILTER/MAP/CONSOLIDATE pipelines.
 Generated plans keep their actual stratum flags and default managed arena and
 pool objects. Controlled operators allocate governed heap images. This lane
 registers missing canonical heads and supports a supplied immutable legacy plan
@@ -1020,3 +1021,22 @@ retired stack bytes while the candidate result and outer reservation remain
 live. Output overlaps evaluator payload only after every prior owner retires.
 Mode and readiness live outside the overwritten payload. No full-output cell
 image or additional output heap credit is allocated.
+
+The generated four-op filtered lane preserves AUTO source selection and actual
+nonrecursive strata. FILTER and MAP drain their real source groups and retire
+the same original private batch before its next use. Their scratch and checked
+compiled-expression admission/retirement live in a phase-exclusive overlay of
+the original consolidation workspace; input and result fields never overlap it.
+Mode is outside the overwritten bytes, and exact old-frame size/alignment
+assertions remain in place. CONS initializes the workspace only after every
+prior preparation pointer and credit is truly disposed.
+
+Healthy preparation and prefix retirement are ordinary charged engine work,
+with finite tails. On any execution error or stop, or during pending disposal,
+the same checked record performs mandatory drain under the existing cleanup
+exclusion: no fresh charge, poll, allowance reset or refund. This is teardown,
+not continued operator evaluation. Real checked moves retain failed compiled
+owners; physical instructions/owners/scratch are freed and nulled before actual
+RESERVED rollback or COMMITTED release. Refused credit keeps its original slot
+and prefix index until true disposal; positive cleanup errors retain precedence.
+Legacy raw compiled disposal is not used for this mandatory mode.

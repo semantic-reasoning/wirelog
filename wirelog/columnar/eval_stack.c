@@ -266,7 +266,10 @@ struct wl_columnar_eval_stack_cleanup_frame {
             eval_entry_t result;
             wl_columnar_relation_source_group_t join_sources;
             wl_columnar_relation_private_batch_t reduce_batch;
-            wl_columnar_consolidate_record_t consolidate;
+            union {
+                wl_columnar_consolidate_record_t consolidate;
+                wl_columnar_expr_operator_preparation_t preparation;
+            };
             wl_columnar_relation_bulk_append_t bulk_append;
         };
         wl_columnar_serial_output_t output;
@@ -282,6 +285,12 @@ typedef struct wl_columnar_eval_stack_original_frame {
     wl_columnar_memory_reservation_t reservation;
     wl_columnar_memory_governor_ref_t *governor;
 } wl_columnar_eval_stack_original_frame_t;
+_Static_assert(sizeof(wl_columnar_expr_operator_preparation_t)
+    <= sizeof(wl_columnar_consolidate_record_t),
+    "operator must fit original workspace");
+_Static_assert(_Alignof(wl_columnar_expr_operator_preparation_t)
+    <= _Alignof(wl_columnar_consolidate_record_t),
+    "operator alignment must fit workspace");
 _Static_assert(sizeof(wl_columnar_session_hash_controlled_registry_t)
     <= sizeof(eval_stack_t), "registry must fit retired original stack");
 _Static_assert(sizeof(wl_columnar_serial_output_t)
@@ -603,8 +612,102 @@ wl_columnar_consolidate_record_t *
 wl_columnar_eval_stack_cleanup_consolidate(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
 {
-    return frame && frame->session && frame->consolidate.ready
+    return frame && frame->session
+           && wl_columnar_eval_stack_cleanup_mode(frame) ==
+           WL_COLUMNAR_SERIAL_FRAME_EVALUATION
+           && frame->consolidate.ready
         ? &frame->consolidate : NULL;
+}
+
+static int
+wl_columnar_eval_stack_workspace_retire(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    uint32_t mode = wl_columnar_eval_stack_cleanup_mode(frame);
+    if (mode == WL_COLUMNAR_SERIAL_FRAME_WORKSPACE_INITIALIZING) return 0;
+    if (mode == WL_COLUMNAR_SERIAL_FRAME_OPERATOR)
+        return frame->session->serial_completion.payload_ready
+               && frame->preparation.ready ? wl_columnar_expr_operator_retire(
+            &frame->preparation, 0, true, NULL) : 0;
+    return wl_columnar_relation_consolidate_retire(&frame->consolidate, 0);
+}
+static int
+wl_columnar_eval_stack_workspace_clear(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_evaluation_control_t *control)
+{
+    int rc = wl_columnar_eval_stack_workspace_retire(frame);
+    if (rc) return rc;
+    wl_columnar_serial_completion_t *state = &frame->session->serial_completion;
+    if (state->mode_frame && state->mode_frame != frame) return EBUSY;
+    state->mode_frame = frame;
+    state->mode = WL_COLUMNAR_SERIAL_FRAME_WORKSPACE_INITIALIZING;
+    state->payload_ready = false;
+    for (size_t at = 0; at < sizeof(frame->consolidate);) {
+        size_t n = sizeof(frame->consolidate) - at;
+        if (n > 128) n = 128;
+        rc = wl_evaluation_control_charge(control, n);
+        if (rc) return rc;
+        memset((char *)&frame->consolidate + at, 0, n); at += n;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return rc;
+    }
+    return 0;
+}
+int
+wl_columnar_eval_stack_cleanup_operator_preparation_owner(
+    wl_col_session_t *sess,
+    eval_stack_t *stack, wl_columnar_expr_operator_preparation_t **out,
+    wl_evaluation_control_t *control)
+{
+    if (!sess || !stack || !out || *out || !control) return EINVAL;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = sess->cleanup_active;
+    if (!frame || frame->session != sess ||
+        &frame->stack != stack) return EINVAL;
+    int rc = wl_columnar_eval_stack_workspace_clear(frame, control);
+    if (rc) return rc;
+    wl_columnar_memory_reservation_t *tokens[] = {&frame->preparation.scratch,
+                                                  &frame->preparation.
+                                                  compile_admission,
+                                                  &frame->preparation.
+                                                  retired_expression};
+    for (uint32_t i = 0; i < 3; i++) {
+        rc = wl_evaluation_control_charge(control, 96);
+        if (rc) return rc;
+        wl_columnar_memory_reservation_init(tokens[i]);
+        frame->preparation.initialized_tokens++;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return rc;
+    }
+    frame->preparation.ready = true;
+    sess->serial_completion.payload_ready = true;
+    sess->serial_completion.mode = WL_COLUMNAR_SERIAL_FRAME_OPERATOR;
+    *out = &frame->preparation;
+    return 0;
+}
+int
+wl_columnar_eval_stack_cleanup_consolidate_prepare(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_evaluation_control_t *control)
+{
+    if (!frame || !control) return EINVAL;
+    if (wl_columnar_eval_stack_cleanup_mode(frame) ==
+        WL_COLUMNAR_SERIAL_FRAME_EVALUATION)
+        return 0;
+    int rc = wl_columnar_eval_stack_workspace_clear(frame, control);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 192);
+    if (rc) return rc;
+    wl_columnar_memory_reservation_init(
+        &frame->consolidate.sequence.metadata_admission);
+    wl_columnar_memory_reservation_init(
+        &frame->consolidate.sequence.workspace.admission);
+    wl_columnar_memory_reservation_init(&frame->consolidate.merge_admission);
+    frame->consolidate.ready = true;
+    frame->session->serial_completion.payload_ready = true;
+    frame->session->serial_completion.mode =
+        WL_COLUMNAR_SERIAL_FRAME_EVALUATION;
+    return wl_evaluation_control_charge(control, 0);
 }
 
 wl_columnar_relation_bulk_append_t *
@@ -672,7 +775,7 @@ wl_columnar_eval_stack_cleanup_dispose(
     if (result != 0) return result;
     if (!wl_columnar_relation_private_batch_disposable(&frame->reduce_batch))
         return EINVAL;
-    result = wl_columnar_relation_consolidate_retire(&frame->consolidate, 0);
+    result = wl_columnar_eval_stack_workspace_retire(frame);
     if (result) return result;
     result = wl_columnar_relation_source_group_drain(&frame->join_sources, 0);
     if (result != 0)
@@ -761,8 +864,9 @@ wl_columnar_eval_stack_cleanup_retry(wl_col_session_t *sess)
     /* Drain ALL source dependencies before attempting ANY pending image. */
     for (wl_columnar_eval_stack_cleanup_frame_t *frame = sess->cleanup_pending;
         frame; frame = frame->next){
-        if (wl_columnar_eval_stack_cleanup_mode(frame)
-            != WL_COLUMNAR_SERIAL_FRAME_EVALUATION) continue;
+        uint32_t mode = wl_columnar_eval_stack_cleanup_mode(frame);
+        if (mode == WL_COLUMNAR_SERIAL_FRAME_OUTPUT
+            || mode == WL_COLUMNAR_SERIAL_FRAME_REGISTRY) continue;
         int rc = wl_columnar_relation_source_group_drain(&frame->join_sources,
                 0);
         if (!result) result = rc;
@@ -823,8 +927,7 @@ wl_columnar_eval_stack_cleanup_registry(
                 0);
     if (!rc && !wl_columnar_relation_private_batch_disposable(
             &frame->reduce_batch)) rc = EBUSY;
-    if (!rc) rc = wl_columnar_relation_consolidate_retire(&frame->consolidate,
-                0);
+    if (!rc) rc = wl_columnar_eval_stack_workspace_retire(frame);
     if (!rc) rc = wl_columnar_relation_source_group_drain(&frame->join_sources,
                 0);
     if (!rc) rc = eval_stack_drain(&frame->stack);

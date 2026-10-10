@@ -838,9 +838,8 @@ wl_columnar_filter_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     uint32_t slot = stack->top - 1;
     col_rel_t *source = stack->items[slot].rel, *out = NULL;
     eval_entry_t input = {0};
-    wl_columnar_memory_reservation_t scratch;
-    wl_columnar_memory_reservation_init(&scratch);
-    bool scratch_held = false, popped = false, committed = false;
+    wl_columnar_expr_operator_preparation_t *preparation = NULL;
+    bool popped = false, committed = false;
     int64_t dummy = 0, *tuple = NULL;
     simple_filter_cmp_t cmp = {0};
     wl_columnar_expr_compiled_t *compiled = NULL;
@@ -913,11 +912,14 @@ wl_columnar_filter_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
         || bytes > SIZE_MAX) {
         rc = EOVERFLOW; goto cleanup;
     }
+    rc = wl_columnar_eval_stack_cleanup_operator_preparation_owner(sess, stack,
+            &preparation, control);
+    if (rc) goto cleanup;
     if (bytes) {
         wl_columnar_memory_admission_status_t status;
         rc = wl_columnar_memory_governor_reserve_checked_controlled(
             wl_columnar_memory_governor_ref_get(sess->memory_governor), bytes,
-            &scratch, &status, control);
+            &preparation->scratch, &status, control);
         if (rc) goto cleanup;
         if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
@@ -927,7 +929,6 @@ wl_columnar_filter_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
             if (rc == ENOSPC) sess->memory_budget_denied = true;
             goto cleanup;
         }
-        scratch_held = true;
         rc = wl_evaluation_control_charge(control, 1);
         if (rc) goto cleanup;
 #ifdef WL_SESSION_TEST_HOOKS
@@ -937,6 +938,7 @@ wl_columnar_filter_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
         }
 #endif
         tuple = malloc((size_t)bytes);
+        preparation->scratch_payload = tuple;
         if (!tuple) {
             rc = ENOMEM; goto cleanup;
         }
@@ -949,7 +951,9 @@ wl_columnar_filter_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
             rc = ENOMEM; goto cleanup;
         }
 #endif
-        rc = wl_columnar_memory_governor_commit_controlled(&scratch, tuple,
+        rc =
+            wl_columnar_memory_governor_commit_controlled(&preparation->scratch,
+                tuple,
                 &accepted, control);
         if (rc) goto cleanup;
         if (!accepted) {
@@ -966,9 +970,11 @@ wl_columnar_filter_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
                                      .kind = WL_COLUMNAR_EVAL_ENTRY_RELATION};
     if (compiled_mode) {
         bool supported;
-        rc = wl_columnar_expr_compile_controlled(op->filter_expr.data,
-                op->filter_expr.size, sess->memory_governor, sess, &compiled,
-                &supported, control);
+        rc = wl_columnar_expr_compile_checked(op->filter_expr.data,
+                op->filter_expr.size, sess->memory_governor, sess,
+                &preparation->single,
+                &supported, preparation, control);
+        compiled = preparation->single;
         if (rc) goto cleanup;
         if (!supported) {
             rc = wl_columnar_expr_interpreter_supported_controlled(
@@ -1040,13 +1046,9 @@ wl_columnar_filter_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_columnar_filter_controlled_checkpoint(control, 9, 0, group, source);
     rc = wl_columnar_relation_private_append_batch_end_controlled(record);
     if (rc) goto cleanup;
-    wl_columnar_expr_compiled_free_controlled(compiled, control);
-    compiled = NULL;
-    free(tuple); tuple = NULL;
-    if (scratch_held) {
-        if (!wl_columnar_memory_release(&scratch)) abort();
-        scratch_held = false;
-    }
+    rc = wl_columnar_expr_operator_retire(preparation, 0, false, control);
+    if (rc) goto cleanup;
+    compiled = NULL; tuple = NULL;
     wl_columnar_filter_controlled_checkpoint(control, 5, 0, group, source);
     int reader_rc = wl_columnar_relation_source_group_release_readers(group, 0);
     wl_columnar_filter_controlled_checkpoint(control, 5, 1, group, source);
@@ -1098,17 +1100,10 @@ wl_columnar_filter_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     *private_output = (eval_entry_t){0};
     return 0;
 cleanup:
-    wl_columnar_expr_compiled_free_controlled(compiled, control);
     rc = wl_columnar_relation_private_batch_retire(record, rc);
-    free(tuple);
-    if (scratch_held) {
-        uint64_t state = atomic_load_explicit(&scratch.state,
-                memory_order_acquire);
-        bool released = state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
-            ? wl_columnar_memory_release(&scratch)
-            : wl_columnar_memory_rollback(&scratch);
-        if (!released) abort();
-    }
+    int preparation_rc = preparation
+        ? wl_columnar_expr_operator_retire(preparation, rc, true, control) : rc;
+    if (rc <= 0) rc = preparation_rc;
     int cleanup_rc = wl_columnar_relation_source_group_drain(group, rc);
     if (cleanup_rc > 0 && rc <= 0) rc = cleanup_rc;
     if (popped) {

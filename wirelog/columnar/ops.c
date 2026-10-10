@@ -357,13 +357,11 @@ wl_columnar_ops_map_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     uint32_t slot = stack->top - 1;
     col_rel_t *source = stack->items[slot].rel, *out = NULL;
     eval_entry_t input = {0};
-    wl_columnar_memory_reservation_t scratch;
-    wl_columnar_memory_reservation_init(&scratch);
-    bool scratch_held = false, popped = false, committed = false;
+    wl_columnar_expr_operator_preparation_t *preparation = NULL;
+    bool popped = false, committed = false;
     void *scratch_mem = NULL;
     int64_t *tuple = NULL, *row = NULL, inline_row[COL_STACK_MAX];
     wl_columnar_expr_compiled_t **expressions = NULL;
-    uint32_t initialized = 0;
     rc = wl_evaluation_control_charge(control, 16);
     if (rc) return rc;
     sess->memory_budget_denied = false;
@@ -416,10 +414,13 @@ wl_columnar_ops_map_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     }
     rc = wl_columnar_ops_map_controlled_tail(control);
     if (rc) goto cleanup;
+    rc = wl_columnar_eval_stack_cleanup_operator_preparation_owner(sess, stack,
+            &preparation, control);
+    if (rc) goto cleanup;
     wl_columnar_memory_admission_status_t status;
     rc = wl_columnar_memory_governor_reserve_checked_controlled(
         wl_columnar_memory_governor_ref_get(sess->memory_governor), bytes,
-        &scratch, &status, control);
+        &preparation->scratch, &status, control);
     if (rc) goto cleanup;
     if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
         && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
@@ -429,10 +430,10 @@ wl_columnar_ops_map_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
         if (rc == ENOSPC) sess->memory_budget_denied = true;
         goto cleanup;
     }
-    scratch_held = true;
     rc = wl_evaluation_control_charge(control, 1);
     if (rc) goto cleanup;
     scratch_mem = malloc((size_t)bytes);
+    preparation->scratch_payload = scratch_mem;
     if (!scratch_mem) {
         rc = ENOMEM; goto cleanup;
     }
@@ -441,10 +442,12 @@ wl_columnar_ops_map_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
         tuple_bytes) : inline_row;
     expressions = with_expressions ? (wl_columnar_expr_compiled_t **)
         ((char *)scratch_mem + tuple_bytes + row_bytes) : NULL;
+    preparation->expressions = expressions;
     rc = wl_columnar_ops_map_controlled_tail(control);
     if (rc) goto cleanup;
     bool accepted;
-    rc = wl_columnar_memory_governor_commit_controlled(&scratch, scratch_mem,
+    rc = wl_columnar_memory_governor_commit_controlled(&preparation->scratch,
+            scratch_mem,
             &accepted, control);
     if (rc) goto cleanup;
     if (!accepted) {
@@ -462,7 +465,7 @@ wl_columnar_ops_map_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
         for (uint32_t c = 0; c < pc; c++) {
             rc = wl_evaluation_control_charge(control, 1);
             if (rc) goto cleanup;
-            expressions[c] = NULL; initialized++;
+            expressions[c] = NULL; preparation->initialized++;
             wl_columnar_ops_map_controlled_checkpoint(control, 2, c + 1u, group,
                 source);
             rc = wl_columnar_ops_map_controlled_tail(control);
@@ -477,9 +480,9 @@ wl_columnar_ops_map_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
             if (rc) goto cleanup;
             if (!nonempty) continue;
             bool supported;
-            rc = wl_columnar_expr_compile_controlled(expr->data, expr->size,
+            rc = wl_columnar_expr_compile_checked(expr->data, expr->size,
                     sess->memory_governor, sess, &expressions[c], &supported,
-                    control);
+                    preparation, control);
             if (rc) goto cleanup;
             if (!supported) {
                 rc = wl_columnar_expr_interpreter_supported_controlled(
@@ -554,14 +557,9 @@ wl_columnar_ops_map_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_columnar_ops_map_controlled_checkpoint(control, 9, 0, group, source);
     rc = wl_columnar_relation_private_append_batch_end_controlled(record);
     if (rc) goto cleanup;
-    for (uint32_t c = 0; c < initialized; c++)
-        wl_columnar_expr_compiled_free_controlled(expressions[c], control);
-    initialized = 0;
-    free(scratch_mem); scratch_mem = NULL;
-    if (scratch_held) {
-        if (!wl_columnar_memory_release(&scratch)) abort();
-        scratch_held = false;
-    }
+    rc = wl_columnar_expr_operator_retire(preparation, 0, false, control);
+    if (rc) goto cleanup;
+    scratch_mem = NULL; expressions = NULL;
     wl_columnar_ops_map_controlled_checkpoint(control, 5, 0, group, source);
     int reader_rc = wl_columnar_relation_source_group_release_readers(group, 0);
     wl_columnar_ops_map_controlled_checkpoint(control, 5, 1, group, source);
@@ -613,17 +611,9 @@ wl_columnar_ops_map_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     return 0;
 cleanup:
     rc = wl_columnar_relation_private_batch_retire(record, rc);
-    for (uint32_t c = 0; c < initialized; c++)
-        wl_columnar_expr_compiled_free_controlled(expressions[c], control);
-    free(scratch_mem);
-    if (scratch_held) {
-        uint64_t state = atomic_load_explicit(&scratch.state,
-                memory_order_acquire);
-        bool released = state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
-            ? wl_columnar_memory_release(&scratch)
-            : wl_columnar_memory_rollback(&scratch);
-        if (!released) abort();
-    }
+    int preparation_rc = preparation
+        ? wl_columnar_expr_operator_retire(preparation, rc, true, control) : rc;
+    if (rc <= 0) rc = preparation_rc;
     int cleanup_rc = wl_columnar_relation_source_group_drain(group, rc);
     if (cleanup_rc > 0 && rc <= 0) rc = cleanup_rc;
     if (popped) {

@@ -442,7 +442,7 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
     }
 done:;
     int cleanup_rc = wl_columnar_eval_stack_cleanup_finish(&frame);
-    return cleanup_rc != 0 ? cleanup_rc : rc;
+    return control && rc > 0 ? rc : cleanup_rc != 0 ? cleanup_rc : rc;
 }
 
 /* Issue #2100: a rule head that also holds input -- inline facts or host
