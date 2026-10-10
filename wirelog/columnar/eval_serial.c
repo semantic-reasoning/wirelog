@@ -259,6 +259,17 @@ int
 wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
     wl_col_session_t *sess, bool recursive)
 {
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    col_rel_t *controlled_target = NULL;
+    if (control) {
+        int preflight = wl_evaluation_control_charge(control, 16);
+        if (preflight) return preflight;
+        if (recursive || sess->eval_arena) return ENOTSUP;
+        preflight = wl_columnar_join_controlled_lookup(sess, rp->name,
+                &controlled_target, control);
+        if (preflight) return preflight;
+        if (!controlled_target) return ENOTSUP;
+    }
     wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
     int rc = wl_columnar_eval_stack_cleanup_begin(sess, &frame);
     if (rc != 0)
@@ -266,8 +277,14 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
     eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame);
     eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(frame);
     rc = col_eval_relation_plan(rp, stack, sess);
-    if (rc == 0 && stack->top != 0)
-        *result = eval_stack_pop(stack);
+    if (rc == 0 && stack->top != 0) {
+        rc = control ? wl_evaluation_control_charge(control,
+                2u * sizeof(*result) + 8u) : 0;
+        if (!rc) {
+            *result = eval_stack_pop(stack);
+            if (control) memset(&stack->items[stack->top], 0, sizeof(*result));
+        }
+    }
 #ifdef WL_SESSION_TEST_HOOKS
     if (wl_columnar_eval_serial_test_after_plan)
         wl_columnar_eval_serial_test_after_plan(sess, stack, result);
@@ -281,7 +298,55 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
     rc = eval_stack_drain(stack);
     if (rc != 0 || !result->rel || (recursive && result->rel->nrows == 0))
         goto done;
-    col_rel_t *target = session_find_rel(sess, rp->name);
+    col_rel_t *target = control ? controlled_target : session_find_rel(sess,
+            rp->name);
+    if (control) {
+        wl_columnar_relation_bulk_append_t *record =
+            wl_columnar_eval_stack_cleanup_bulk_append(frame);
+        wl_columnar_relation_source_group_t *sources =
+            wl_columnar_eval_stack_cleanup_sources(frame);
+        if (!record || !sources) {
+            rc = EINVAL; goto done;
+        }
+        if (result->owned) {
+            if (stack->top >= COL_STACK_MAX) {
+                rc = ENOMEM; goto done;
+            }
+            rc = wl_evaluation_control_charge(control,
+                    sizeof(eval_entry_t) + 16u);
+            if (rc) goto done;
+            eval_entry_t *candidate = &stack->items[stack->top];
+            memset(candidate, 0, sizeof(*candidate));
+            candidate->kind = WL_COLUMNAR_EVAL_ENTRY_RELATION;
+            candidate->owned = true;
+            stack->top++;
+            rc = wl_columnar_relation_source_group_acquire_controlled(sources,
+                    result->rel, NULL, control);
+            if (!rc) rc =
+                    wl_columnar_relation_new_like_held_controlled("$publish",
+                        result->rel, sess->memory_governor, &candidate->rel,
+                        control);
+            rc = wl_columnar_relation_source_group_drain(sources, rc);
+            if (rc) goto done;
+            rc = wl_columnar_relation_bulk_append_controlled(record,
+                    candidate->rel, result->rel, control);
+            if (rc) goto done;
+            /* The original visible result must retire before canonical append.
+             * Both owners live in distinct real frame entries on refusal. */
+            rc = eval_entry_dispose(result);
+            if (rc) goto done;
+            rc = wl_evaluation_control_charge(control,
+                    2u * sizeof(*result) + 8u);
+            if (rc) goto done;
+            *result = eval_stack_pop(stack);
+            memset(&stack->items[stack->top], 0, sizeof(*result));
+            rc = wl_evaluation_control_charge(control, 0);
+            if (rc) goto done;
+        }
+        rc = wl_columnar_relation_bulk_append_controlled(record, target,
+                result->rel, control);
+        goto done;
+    }
     if (target) {
         if (result->owned) {
             /* Dispose the externally observable result before publication.

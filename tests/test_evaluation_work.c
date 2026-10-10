@@ -14415,10 +14415,750 @@ test_owned_consolidate_exact_work(void)
     }
 }
 
+/* Generated initial AUTO caller and genuine typed helper are distinct proofs. */
+static wl_plan_t *publish_plan;
+static wirelog_program_t *publish_program;
+static wl_col_session_t *publish_session;
+static col_rel_t *publish_target;
+static unsigned publish_mode, publish_seen, publish_commits;
+static wl_columnar_relation_bulk_append_t *publish_record;
+static col_rel_t *publish_result;
+static unsigned publish_payload_phase, publish_payload_seen,
+    publish_restore_seen;
+static bool publish_payload_overflow;
+
+static const wl_plan_relation_t *
+publish_generated_name(uint32_t width, const char *source_name)
+{
+    size_t capacity = (size_t)width * 160u + 256u + 2u * strlen(source_name),
+        used = 0;
+    char *text = malloc(capacity); CHECK(text);
+    for (unsigned decl = 0; decl < 2; decl++) {
+        used += snprintf(text + used, capacity - used, ".decl %s(",
+                decl ? "H" : source_name);
+        for (uint32_t c = 0; c < width; c++)
+            used += snprintf(text + used, capacity - used, "%sv%u: int64",
+                    c ? ", " : "", c);
+        used += snprintf(text + used, capacity - used, ")\n");
+    }
+    used += snprintf(text + used, capacity - used, "H(");
+    for (uint32_t c = 0; c < width; c++)
+        used += snprintf(text + used, capacity - used, "%sv%u", c ? ", " : "",
+                c);
+    used += snprintf(text + used, capacity - used, ") :- %s(", source_name);
+    for (uint32_t c = 0; c < width; c++)
+        used += snprintf(text + used, capacity - used, "%sv%u", c ? ", " : "",
+                c);
+    used += snprintf(text + used, capacity - used, ").\n");
+    CHECK(used < capacity);
+    wirelog_error_t error;
+    publish_program = wirelog_parse_string(text, &error); free(text);
+    CHECK(publish_program && error == WIRELOG_OK);
+    CHECK(wl_plan_from_program(publish_program, &publish_plan) == 0);
+    for (uint32_t st = 0; st < publish_plan->stratum_count; st++)
+        for (uint32_t r = 0; r < publish_plan->strata[st].relation_count; r++) {
+            const wl_plan_relation_t *rp =
+                &publish_plan->strata[st].relations[r];
+            if (strcmp(rp->name, "H")) continue;
+            CHECK(rp->op_count == 3 && rp->ops[0].op == WL_PLAN_OP_VARIABLE
+                && rp->ops[0].delta_mode == WL_DELTA_AUTO
+                && rp->ops[1].op == WL_PLAN_OP_MAP
+                && rp->ops[2].op == WL_PLAN_OP_CONSOLIDATE);
+            return rp;
+        }
+    CHECK(false); return NULL;
+}
+static const wl_plan_relation_t *
+publish_generated(uint32_t width)
+{
+    return publish_generated_name(width, "S");
+}
+static void
+publish_generated_free(void)
+{
+    wl_plan_free(publish_plan); wirelog_program_free(publish_program);
+    publish_plan = NULL; publish_program = NULL;
+}
+static col_rel_t *
+publish_named(wl_col_session_t *sess, const char *name, uint32_t width,
+    uint32_t capacity, uint32_t rows)
+{
+    col_rel_t *r = relation(width, capacity, rows, false,
+            sess->memory_governor);
+    CHECK(wl_columnar_relation_rename_checked(r, name) == 0);
+    CHECK(session_add_rel(sess, r) == 0); return r;
+}
+static void
+publish_after_plan(wl_col_session_t *sess, eval_stack_t *stack,
+    eval_entry_t *entry)
+{
+    CHECK(!stack->top && entry->rel && entry->owned &&
+        !entry->rel->column_types);
+    wl_columnar_relation_source_group_t *group =
+        wl_columnar_eval_stack_cleanup_sources(sess->cleanup_active);
+    CHECK(group && !group->descriptor_count && !group->owner_count);
+    publish_result = entry->rel;
+    if (publish_mode == 1) {
+        CHECK(col_rel_source_reader_acquire(entry->rel,
+            &join_retained_reader) == 0);
+        publish_seen++;
+    }
+}
+static void
+publish_reader_cancel(wl_evaluation_control_t *c,
+    wl_columnar_source_access_gate_t *gate, bool acquired)
+{
+    if (publish_mode != 5 || !acquired || !publish_result
+        || gate != &publish_result->descriptor_access) return;
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(
+        publish_session->cleanup_active);
+    eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(
+        publish_session->cleanup_active);
+    CHECK(stack->top == 1 && !stack->items[0].rel && stack->items[0].owned
+        && result->rel == publish_result && result->owned);
+    publish_seen++; wl_evaluation_control_request_cancel(c);
+}
+static void
+publish_bulk_hook(wl_evaluation_control_t *c, int phase,
+    wl_columnar_relation_bulk_append_t *record)
+{
+    if (phase == 5 && publish_payload_seen && record == publish_record) {
+        CHECK(record->pending.growth && record->transaction_active
+            && record->metadata_committed && !record->published
+            && atomic_load(&record->dst->retained_reservation.state) ==
+            WL_COLUMNAR_MEMORY_RESERVATION_REPLACING);
+        publish_restore_seen++;
+    }
+    if (phase == 1 && publish_mode == 3) {
+        CHECK(record->active && !record->published && record->metadata_committed
+            && record->prepared_schema_ok && record->prepared_types
+            && record->metadata_pending.identity == &record->metadata_pending
+            && atomic_load(&record->metadata_pending.state) ==
+            WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+            && !record->dst->column_types
+            && &record->metadata_pending != &record->dst->metadata_reservation);
+        publish_seen++; wl_evaluation_control_request_cancel(c);
+    }
+    if (phase == 2 && record->dst == publish_target) {
+        CHECK(record->published && !record->active);
+        publish_commits++;
+        if (publish_mode == 2) {
+            eval_entry_t *entry = wl_columnar_eval_stack_cleanup_result(
+                publish_session->cleanup_active);
+            CHECK(entry->rel && entry->owned && entry->rel != publish_target);
+            CHECK(col_rel_source_reader_acquire(entry->rel,
+                &join_retained_reader) == 0);
+            publish_record = record; publish_seen++;
+        }
+    }
+}
+static void
+publish_payload_stop(wl_evaluation_control_t *c,
+    wl_columnar_memory_reservation_t *token, unsigned phase)
+{
+    if (token != &publish_record->dst->retained_reservation
+        || phase != publish_payload_phase) return;
+    CHECK(publish_record->active && !publish_record->published
+        && publish_record->metadata_committed
+        && atomic_load(&publish_record->metadata_pending.state) ==
+        WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        && atomic_load(&token->state) ==
+        WL_COLUMNAR_MEMORY_RESERVATION_COMMITTING
+        && !publish_record->dst->column_types);
+    publish_payload_seen++;
+    if (publish_payload_overflow) CHECK(wl_evaluation_control_charge(c,
+            UINT64_MAX) == EOVERFLOW);
+    else wl_evaluation_control_request_cancel(c);
+}
+static int
+publish_dispatch(wl_col_session_t *sess, const wl_plan_relation_t *rp,
+    wl_evaluation_control_t *c)
+{
+    sess->base.evaluation_control = c;
+    int rc = wl_columnar_eval_serial_framed_relation(rp, sess, false);
+    sess->base.evaluation_control = NULL; return rc;
+}
+static void
+publish_hooks(wl_col_session_t *sess, col_rel_t *target, unsigned mode)
+{
+    publish_session = sess; publish_target = target; publish_mode = mode;
+    publish_seen = publish_commits = 0; publish_record = NULL;
+    publish_result = NULL;
+    wl_columnar_eval_serial_test_after_plan = publish_after_plan;
+    wl_columnar_relation_test_bulk_checkpoint = publish_bulk_hook;
+    if (mode ==
+        5) wl_columnar_relation_test_after_reader_cas = publish_reader_cancel;
+}
+static void
+publish_unhook(void)
+{
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    wl_columnar_relation_test_bulk_checkpoint = NULL;
+    wl_columnar_relation_test_after_reader_cas = NULL;
+}
+static void
+test_publish_generated_twins(void)
+{
+    const uint32_t rows[] = {0, 1, 2, 31, 32, 33, 513, 10000};
+    const uint32_t widths[] = {0, 2, 300};
+    for (unsigned wi = 0; wi < 3; wi++) {
+        const wl_plan_relation_t *rp = publish_generated(widths[wi]);
+        for (unsigned ri = 0; ri < 8; ri++) for (unsigned prefix =
+                0; prefix < 2;
+                prefix++){
+                wl_col_session_t *sess = join_session(), *raw = join_session();
+                publish_named(sess, "S", widths[wi], rows[ri] ? rows[ri] : 1,
+                    rows[ri]);
+                publish_named(raw, "S", widths[wi], rows[ri] ? rows[ri] : 1,
+                    rows[ri]);
+                col_rel_t *target = publish_named(sess, "H", widths[wi], 40,
+                        prefix ? 33 : 0);
+                col_rel_t *reference = publish_named(raw, "H", widths[wi], 40,
+                        prefix ? 33 : 0);
+                uint64_t identity = target->relation_identity;
+                wl_evaluation_control_t *c = control(0);
+                publish_hooks(sess, target, 0);
+                CHECK(publish_dispatch(sess, rp, c) == 0); finish(c, 0);
+                CHECK(publish_commits == (rows[ri] ? 1u : 0u));
+                publish_unhook();
+                CHECK(publish_dispatch(raw, rp, NULL) == 0);
+                CHECK(session_find_rel(sess,
+                    "H") == target && target->relation_identity == identity
+                    && target->nrows == reference->nrows &&
+                    !target->column_types);
+                payload_equal(target, reference, 0);
+                CHECK(!sess->cleanup_active && !sess->cleanup_pending);
+                release(c); join_session_destroy(sess);
+                join_session_destroy(raw);
+            }
+        publish_generated_free();
+    }
+    puts(
+        "serial publish: generated AUTO caller raw twins rows0..10000 widths0/2/300 passed");
+}
+static void
+test_publish_auto_selection(void)
+{
+    const wl_plan_relation_t *rp = publish_generated(2);
+    for (unsigned lane = 0; lane < 5; lane++) {
+        wl_col_session_t *sess = join_session();
+        publish_named(sess, "S", 2, 33, 33);
+        col_rel_t *target = publish_named(sess, "H", 2, 1, 0);
+        if (lane) publish_named(sess, "$d$S", 2, 40,
+                lane == 1 ? 0 : lane == 2 ? 33 : lane == 3 ? 40 : 1);
+        uint64_t baseline = string_reserved(sess->memory_governor);
+        wl_evaluation_control_t *c = control(0);
+        int expected = lane == 4 ? ENOTSUP : 0;
+        CHECK(publish_dispatch(sess, rp, c) == expected); finish(c, expected);
+        CHECK(target->nrows == (lane == 4 ? 0u : 33u));
+        if (lane ==
+            4) CHECK(string_reserved(sess->memory_governor) == baseline);
+        release(c); join_session_destroy(sess);
+    }
+    publish_generated_free();
+    puts(
+        "serial publish: AUTO absent/empty/equal/larger full and genuine smaller delta refusal passed");
+}
+static void
+test_publish_matching_declared_head(void)
+{
+    const wl_plan_relation_t *rp = publish_generated(2);
+    wl_col_session_t *sess = join_session(), *raw = join_session();
+    publish_named(sess, "S", 2, 33, 33);
+    publish_named(raw, "S", 2, 33, 33);
+    col_rel_t *head = publish_named(sess, "H", 2, 40, 3);
+    col_rel_t *reference = publish_named(raw, "H", 2, 40, 3);
+    const wirelog_column_type_t types[2] = {WIRELOG_TYPE_INT64,
+                                            WIRELOG_TYPE_INT64};
+    CHECK(col_rel_set_column_types(head, types, 2) == 0);
+    CHECK(col_rel_set_column_types(reference, types, 2) == 0);
+    const wirelog_column_type_t *original_types = head->column_types;
+    wl_evaluation_control_t *c = control(0);
+    publish_hooks(sess, head, 0);
+    CHECK(publish_dispatch(sess, rp, c) == 0); finish(c, 0);
+    publish_unhook(); CHECK(publish_dispatch(raw, rp, NULL) == 0);
+    CHECK(head->nrows == 36 && reference->nrows == 36
+        && head->column_types == original_types && publish_commits == 1);
+    payload_equal(head, reference, 0);
+    release(c); join_session_destroy(sess); join_session_destroy(raw);
+    publish_generated_free();
+    puts(
+        "serial publish: genuine predeclared INT64 canonical head with untyped generated MAP passed");
+}
+static void
+test_publish_refusal_recovery(void)
+{
+    const wl_plan_relation_t *rp = publish_generated(2);
+    for (unsigned mode = 1; mode <= 5; mode++) {
+        if (mode == 3) continue;
+        wl_col_session_t *sess = join_session();
+        publish_named(sess, "S", 2, 33, 33);
+        col_rel_t *target = publish_named(sess, "H", 2, 40, 1);
+        uint64_t hash = consolidate_source_hash(target),
+            view = target->view_generation;
+        uint64_t baseline = string_reserved(sess->memory_governor);
+        wl_evaluation_control_t *c = control(0);
+        publish_hooks(sess, target, mode);
+        if (mode == 4) CHECK(col_rel_source_reader_acquire(target,
+                &join_retained_reader) == 0);
+        int expected = mode == 5 ? WL_EVALUATION_CONTROL_CANCELLED : EBUSY;
+        CHECK(publish_dispatch(sess, rp, c) == expected); finish(c, expected);
+        if (mode == 5) CHECK(publish_seen == 1 && !join_retained_reader.owner);
+        else CHECK(join_retained_reader.owner);
+        if (mode == 2) {
+            CHECK(publish_seen == 1 && publish_commits == 1 &&
+                target->nrows == 34
+                && publish_record && publish_record->published &&
+                !publish_record->active
+                && sess->cleanup_pending_count == 1);
+            hash = consolidate_source_hash(target);
+            view = target->view_generation;
+        } else CHECK(consolidate_source_hash(target) == hash &&
+                target->view_generation == view);
+        if (mode !=
+            5) CHECK(col_rel_source_reader_release(&join_retained_reader) == 0);
+        unsigned commits = publish_commits;
+        CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0);
+        CHECK(consolidate_source_hash(target) == hash &&
+            target->view_generation == view
+            && publish_commits == commits && !sess->cleanup_pending);
+        publish_unhook();
+        if (mode != 2) {
+            CHECK(string_reserved(sess->memory_governor) == baseline);
+            retry(c, 0); CHECK(publish_dispatch(sess, rp, c) == 0);
+            finish(c, 0);
+            CHECK(target->nrows == 34);
+        }
+        release(c); join_session_destroy(sess);
+    }
+    publish_generated_free();
+    puts(
+        "serial publish: genuine result/target readers and consumed cleanup-only retry passed");
+}
+static void
+test_publish_exact_and_stops(void)
+{
+    const wl_plan_relation_t *rp = publish_generated(2);
+    uint64_t cost = 0;
+    for (unsigned trial = 0; trial < 3; trial++) {
+        wl_col_session_t *sess = join_session();
+        publish_named(sess, "S", 2, 513, 513);
+        col_rel_t *target = publish_named(sess, "H", 2, 600, 33);
+        uint64_t hash = consolidate_source_hash(target),
+            view = target->view_generation;
+        uint64_t baseline = string_reserved(sess->memory_governor);
+        wl_evaluation_control_t *c = control(trial == 0 ? 0 : trial ==
+                1 ? cost : cost - 1);
+        int expected = trial == 2 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0;
+        CHECK(publish_dispatch(sess, rp, c) == expected);
+        uint64_t used = finish(c, expected);
+        if (!trial) cost = used; else if (trial == 1) CHECK(used == cost);
+        if (trial == 2) {
+            CHECK(consolidate_source_hash(target) == hash &&
+                target->view_generation == view
+                && string_reserved(sess->memory_governor) == baseline);
+            retry(c, 0); CHECK(publish_dispatch(sess, rp, c) == 0);
+            finish(c, 0);
+        }
+        CHECK(target->nrows == 546); release(c); join_session_destroy(sess);
+    }
+    publish_generated_free();
+    puts(
+        "serial publish: complete caller exact limit and precommit fresh retry passed");
+}
+static void
+test_publish_typed_record(void)
+{
+    for (unsigned growth = 0; growth < 2; growth++) for (unsigned stop = 0;
+            stop < 5; stop++){
+            if (stop && !growth) continue;
+            wl_col_session_t *sess = join_session();
+            col_rel_t *source = relation(2, 33, 33, false,
+                    sess->memory_governor);
+            wirelog_column_type_t types[2] = {WIRELOG_TYPE_INT64,
+                                              WIRELOG_TYPE_INT64};
+            CHECK(col_rel_set_column_types(source, types, 2) == 0);
+            col_rel_t *target = relation(2, growth ? 1 : 40, 1, false,
+                    sess->memory_governor);
+            uint64_t hash = consolidate_source_hash(target),
+                view = target->view_generation;
+            uint64_t storage = target->storage_generation;
+            uint64_t metadata_reserved = target->metadata_reserved_bytes;
+            uint64_t metadata_state =
+                atomic_load(&target->metadata_reservation.state);
+            uint64_t metadata_owner =
+                atomic_load(&target->metadata_reservation.owner_bits);
+            uint64_t payload_reserved = target->retained_reserved_bytes;
+            const void *metadata_identity =
+                target->metadata_reservation.identity;
+            uint64_t baseline = string_reserved(sess->memory_governor);
+            wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+            wl_columnar_relation_bulk_append_t *record =
+                wl_columnar_eval_stack_cleanup_bulk_append(frame);
+            CHECK(record && record->ready && !record->active);
+            wl_evaluation_control_t *c = control(0);
+            publish_mode = stop == 1 ? 3 : 0;
+            publish_seen = 0; publish_target = NULL;
+            publish_record = record;
+            publish_payload_seen = publish_restore_seen = 0;
+            publish_payload_phase = stop ==
+                2 ? WL_COLUMNAR_MEMORY_GOVERNOR_COMMITTING
+            : WL_COLUMNAR_MEMORY_GOVERNOR_COMMIT_CUTOFF;
+            publish_payload_overflow = stop == 4;
+            if (stop >=
+                2) wl_columnar_memory_governor_test_checkpoint =
+                    publish_payload_stop;
+            wl_columnar_relation_test_bulk_checkpoint = publish_bulk_hook;
+            int expected = stop ==
+                4 ? EOVERFLOW : stop ? WL_EVALUATION_CONTROL_CANCELLED : 0;
+            CHECK(wl_columnar_relation_bulk_append_controlled(record, target,
+                source, c) == expected);
+            finish(c, expected);
+            wl_columnar_relation_test_bulk_checkpoint = NULL;
+            wl_columnar_memory_governor_test_checkpoint = NULL;
+            CHECK(!record->active && !record->scratch.bytes &&
+                !record->metadata_pending.bytes
+                && !record->lengths && !record->prepared_types &&
+                !record->prepared_schema_ok);
+            if (stop) CHECK(!record->published && (stop == 1 ? publish_seen == 1
+            : publish_payload_seen == 1 && publish_restore_seen == 1));
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+            if (stop) {
+                CHECK(consolidate_source_hash(target) == hash &&
+                    target->view_generation == view
+                    && target->storage_generation == storage &&
+                    !target->column_types
+                    && target->metadata_reserved_bytes == metadata_reserved
+                    && target->metadata_reservation.identity ==
+                    metadata_identity
+                    && atomic_load(&target->metadata_reservation.state) ==
+                    metadata_state
+                    && atomic_load(&target->metadata_reservation.owner_bits) ==
+                    metadata_owner
+                    && target->retained_reserved_bytes == payload_reserved
+                    && string_reserved(sess->memory_governor) == baseline);
+                retry(c, 0); frame = filter_frame(sess);
+                record = wl_columnar_eval_stack_cleanup_bulk_append(frame);
+                CHECK(wl_columnar_relation_bulk_append_controlled(record,
+                    target, source, c) == 0);
+                finish(c, 0);
+                CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+            }
+            CHECK(target->nrows == 34 && target->column_types
+                && target->column_types[0] == WIRELOG_TYPE_INT64);
+            payload_equal(target, source, 1);
+            release(c); destroy(source); destroy(target);
+            join_session_destroy(sess);
+        }
+    puts(
+        "serial publish: real typed record promotion growth/no-growth and preparatory commit stop passed");
+}
+
+static col_rel_t *publish_selection_source;
+static unsigned publish_selection_seen;
+static void
+publish_selection_cancel(wl_evaluation_control_t *c,
+    wl_columnar_source_access_gate_t *gate, bool acquired)
+{
+    if (!acquired ||
+        gate != &publish_selection_source->descriptor_access) return;
+    CHECK(publish_selection_seen == 0); publish_selection_seen++;
+    wl_evaluation_control_request_cancel(c);
+}
+static void
+test_publish_selection_authority(void)
+{
+    const wl_plan_relation_t *rp = publish_generated(2);
+    for (unsigned mode = 0; mode < 4; mode++) {
+        wl_col_session_t *sess = join_session();
+        col_rel_t *source = relation(2, 33, 33, false, sess->memory_governor);
+        CHECK(wl_columnar_relation_rename_checked(source, "S") == 0);
+        CHECK(col_rel_storage_owner_ensure_initialized(source) == 0);
+        col_rel_t *delta = relation(2, 33, 0, false, sess->memory_governor);
+        CHECK(wl_columnar_relation_rename_checked(delta, "$d$S") == 0);
+        if (mode == 3) CHECK(col_rel_install_shared_view(delta, source) == 0);
+        /* Alias is destroyed first by real session teardown. */
+        CHECK(session_add_rel(sess, delta) == 0);
+        CHECK(session_add_rel(sess, source) == 0);
+        col_rel_t *target = publish_named(sess, "H", 2, 1, 0);
+        uint64_t baseline = string_reserved(sess->memory_governor);
+        wl_evaluation_control_t *c = control(0);
+        wl_columnar_source_access_writer_t conflict = {0};
+        if (mode == 0 || mode == 1) CHECK(col_rel_source_writer_acquire(
+                    mode ? delta : source, &conflict) == 0);
+        if (mode == 2) {
+            publish_selection_source = source; publish_selection_seen = 0;
+            wl_columnar_relation_test_after_reader_cas =
+                publish_selection_cancel;
+        }
+        int expected = mode < 2 ? EBUSY : mode ==
+            2 ? WL_EVALUATION_CONTROL_CANCELLED : 0;
+        CHECK(publish_dispatch(sess, rp, c) == expected); finish(c, expected);
+        wl_columnar_relation_test_after_reader_cas = NULL;
+        if (mode <
+            2) CHECK(wl_columnar_source_access_writer_release(&conflict) == 0);
+        if (mode == 2) CHECK(publish_selection_seen == 1);
+        CHECK(!sess->cleanup_pending && !sess->cleanup_active);
+        if (mode != 3) {
+            CHECK(!target->nrows &&
+                string_reserved(sess->memory_governor) == baseline);
+            retry(c, 0); CHECK(publish_dispatch(sess, rp, c) == 0);
+            finish(c, 0);
+        } else CHECK(delta->storage_owner == source &&
+                col_rel_storage_alias_borrow_count(source) == 1);
+        CHECK(target->nrows == 33);
+        release(c); join_session_destroy(sess);
+    }
+    publish_generated_free();
+    char long_name[601]; memset(long_name, 'A', 600); long_name[600] = '\0';
+    char delta_name[256];
+    snprintf(delta_name, sizeof(delta_name), "$d$%s", long_name);
+    CHECK(strlen(delta_name) == 255 && !strncmp(delta_name, "$d$", 3));
+    rp = publish_generated_name(2, long_name);
+    wl_col_session_t *sess = join_session();
+    publish_named(sess, long_name, 2, 33, 33);
+    publish_named(sess, delta_name, 2, 1, 0);
+    col_rel_t *head = publish_named(sess, "H", 2, 1, 0);
+    wl_evaluation_control_t *c = control(0);
+    CHECK(publish_dispatch(sess, rp, c) == 0); finish(c, 0);
+    CHECK(head->nrows == 33); release(c); join_session_destroy(sess);
+    publish_generated_free();
+    puts(
+        "serial publish: AUTO real conflicting writers/first reader cancellation/shared owner and legacy255-byte name passed");
+}
+static unsigned publish_preparation_stage, publish_preparation_seen;
+static bool publish_preparation_overflow, publish_scratch_fault;
+static const void *publish_scratch_identity;
+static unsigned publish_reset_index;
+static void
+publish_prepare_stop(wl_evaluation_control_t *c, int phase, uint64_t progress)
+{
+    (void)progress;
+    if ((unsigned)phase != publish_preparation_stage ||
+        publish_preparation_seen) return;
+    CHECK(publish_record && publish_record->active && !publish_record->published
+        && publish_record->scratch.bytes && publish_record->lengths
+        && publish_record->metadata_pending.bytes &&
+        publish_record->prepared_types);
+    publish_preparation_seen++;
+    if (publish_scratch_fault) {
+        publish_scratch_identity = publish_record->scratch.identity;
+        CHECK(publish_scratch_identity == &publish_record->scratch);
+        publish_record->scratch.identity = NULL;
+    }
+    if (publish_preparation_overflow) CHECK(wl_evaluation_control_charge(c,
+            UINT64_MAX) == EOVERFLOW);
+    else wl_evaluation_control_request_cancel(c);
+}
+static void
+publish_reset_stop(wl_evaluation_control_t *c, int phase,
+    wl_columnar_relation_bulk_append_t *record)
+{
+    if (publish_reset_index ? phase != 6 ||
+        record->initialized_tokens != publish_reset_index
+        : phase != 3) return;
+    CHECK(record->active && !record->published && record->ready
+        && record->scratch.identity == &record->scratch
+        && !record->sources.descriptor_count && !record->writer.owner);
+    if (!publish_reset_index || publish_reset_index == 5)
+        CHECK(record->pending.fresh.identity == &record->pending.fresh);
+    publish_preparation_seen++; wl_evaluation_control_request_cancel(c);
+}
+static void
+publish_terminal_stop(wl_evaluation_control_t *c,
+    wl_columnar_memory_reservation_t *token, unsigned phase)
+{
+    if (token != &publish_record->metadata_pending
+        || phase != WL_COLUMNAR_MEMORY_GOVERNOR_COMMIT_CUTOFF) return;
+    CHECK(!publish_record->growth && !publish_record->published
+        && !publish_record->dst->column_types);
+    publish_preparation_seen++; wl_evaluation_control_request_cancel(c);
+}
+static void
+test_publish_preparation_lifetime(void)
+{
+    for (unsigned mode = 0; mode < 13; mode++) {
+        wl_col_session_t *sess = join_session();
+        col_rel_t *source = relation(2, 33, 33, false, sess->memory_governor);
+        const wirelog_column_type_t types[2] = {WIRELOG_TYPE_INT64,
+                                                WIRELOG_TYPE_INT64};
+        CHECK(col_rel_set_column_types(source, types, 2) == 0);
+        col_rel_t *target = relation(2, mode == 7 ? 40 : 1, 1, false,
+                sess->memory_governor);
+        char name[601]; memset(name, 'n', 600); name[600] = '\0';
+        const char *names[2] = {name, "second"};
+        CHECK(col_rel_set_schema(target, 2, names) == 0);
+        uint64_t hash = consolidate_source_hash(target),
+            view = target->view_generation;
+        uint64_t storage = target->storage_generation;
+        uint64_t baseline = string_reserved(sess->memory_governor);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(sess);
+        publish_record = wl_columnar_eval_stack_cleanup_bulk_append(frame);
+        wl_evaluation_control_t *c = control(0); publish_preparation_seen = 0;
+        publish_preparation_stage = mode < 4 ? mode + 1 : 1;
+        publish_preparation_overflow = mode == 4;
+        publish_scratch_fault = mode == 5;
+        publish_reset_index = mode >= 8 ? mode - 7 : 0;
+        if (mode == 6 ||
+            mode >=
+            8) wl_columnar_relation_test_bulk_checkpoint = publish_reset_stop;
+        else if (mode ==
+            7) wl_columnar_memory_governor_test_checkpoint =
+                publish_terminal_stop;
+        else wl_columnar_relation_test_metadata_checkpoint =
+                publish_prepare_stop;
+        int expected = mode == 5 ? EINVAL : mode ==
+            4 ? EOVERFLOW : WL_EVALUATION_CONTROL_CANCELLED;
+        CHECK(wl_columnar_relation_bulk_append_controlled(publish_record,
+            target, source, c) == expected);
+        finish(c, expected);
+        wl_columnar_relation_test_metadata_checkpoint = NULL;
+        wl_columnar_relation_test_bulk_checkpoint = NULL;
+        wl_columnar_memory_governor_test_checkpoint = NULL;
+        CHECK(publish_preparation_seen == 1 && !publish_record->published
+            && !publish_record->lengths && !publish_record->prepared_types
+            && !publish_record->prepared_schema_ok &&
+            !publish_record->prepared_columns);
+        CHECK(consolidate_source_hash(target) == hash &&
+            target->view_generation == view
+            && target->storage_generation == storage && !target->column_types);
+        if (mode == 5) {
+            CHECK(publish_record->active && publish_record->scratch.bytes
+                && !publish_record->scratch.identity &&
+                publish_record->writer.owner);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == EINVAL &&
+                !frame
+                && sess->cleanup_pending_count == 1);
+            /* Intentionally malformed authority, not healthy contention. Only
+             * the captured identity pointer is restored; no token copy/refund. */
+            publish_record->scratch.identity = publish_scratch_identity;
+            CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0);
+        } else CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+        CHECK(string_reserved(sess->memory_governor) == baseline);
+        retry(c, 0); frame = filter_frame(sess);
+        publish_record = wl_columnar_eval_stack_cleanup_bulk_append(frame);
+        max_chunk = 0; wl_columnar_relation_test_work_checkpoint = checkpoint;
+        CHECK(wl_columnar_relation_bulk_append_controlled(publish_record,
+            target, source, c) == 0);
+        CHECK(max_chunk <= WL_EVALUATION_CONTROL_QUANTUM && max_chunk >= 128);
+        wl_columnar_relation_test_work_checkpoint = NULL;
+        finish(c, 0); CHECK(target->nrows == 34 && target->column_types);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+        release(c); destroy(source); destroy(target);
+        join_session_destroy(sess);
+    }
+    puts(
+        "serial publish: durable scratch/partial schema/reset/terminal cutoff stops and labeled identity-validation fault passed");
+}
+
+static bool publish_old_copy_armed;
+static unsigned publish_old_copy_seen;
+static uint64_t publish_old_copy_units;
+static void
+publish_old_copy_work(wl_evaluation_control_t *c, uint64_t work)
+{
+    CHECK(work <= WL_EVALUATION_CONTROL_QUANTUM);
+    if (!publish_old_copy_armed ||
+        work != WL_EVALUATION_CONTROL_QUANTUM) return;
+    CHECK(publish_record && publish_record->dst == publish_target
+        && publish_record->active && !publish_record->published
+        && publish_record->base >= 513 && publish_record->count == 33
+        && publish_record->transaction_active &&
+        publish_record->pending.growth);
+    publish_old_copy_units += work; publish_old_copy_seen++;
+    publish_old_copy_armed = false; wl_evaluation_control_request_cancel(c);
+}
+static void
+publish_old_copy_start(wl_evaluation_control_t *c, int phase,
+    wl_columnar_relation_bulk_append_t *record)
+{
+    (void)c;
+    if (phase == 4 && record->dst == publish_target) {
+        CHECK(record->base >= 513 && record->count == 33 && record->growth);
+        publish_record = record; publish_old_copy_armed = true;
+    }
+}
+static void
+test_publish_old_head_and_negatives(void)
+{
+    const uint32_t widths[] = {2, 2, 300};
+    const uint32_t old_rows[] = {513, 10000, 513};
+    for (unsigned fixture = 0; fixture < 3; fixture++) {
+        const wl_plan_relation_t *rp = publish_generated(widths[fixture]);
+        wl_col_session_t *sess = join_session(), *raw = join_session();
+        publish_named(sess, "S", widths[fixture], 33, 33);
+        publish_named(raw, "S", widths[fixture], 33, 33);
+        col_rel_t *head = publish_named(sess, "H", widths[fixture],
+                old_rows[fixture], old_rows[fixture]);
+        col_rel_t *reference = publish_named(raw, "H", widths[fixture],
+                old_rows[fixture], old_rows[fixture]);
+        uint64_t hash = consolidate_source_hash(head),
+            view = head->view_generation;
+        uint64_t storage = head->storage_generation,
+            identity = head->relation_identity;
+        uint64_t baseline = string_reserved(sess->memory_governor);
+        wl_evaluation_control_t *c = control(0);
+        publish_target = head; publish_record = NULL;
+        publish_old_copy_seen = 0; publish_old_copy_units = 0;
+        publish_old_copy_armed = false;
+        wl_columnar_relation_test_bulk_checkpoint = publish_old_copy_start;
+        wl_columnar_relation_test_work_checkpoint = publish_old_copy_work;
+        CHECK(publish_dispatch(sess, rp, c) == WL_EVALUATION_CONTROL_CANCELLED);
+        finish(c, WL_EVALUATION_CONTROL_CANCELLED);
+        wl_columnar_relation_test_bulk_checkpoint = NULL;
+        wl_columnar_relation_test_work_checkpoint = NULL;
+        CHECK(publish_old_copy_seen == 1 && publish_old_copy_units == 256
+            && consolidate_source_hash(head) == hash &&
+            head->view_generation == view
+            && head->storage_generation == storage &&
+            head->relation_identity == identity
+            && string_reserved(sess->memory_governor) == baseline &&
+            !sess->cleanup_pending);
+        retry(c, 0); CHECK(publish_dispatch(sess, rp, c) == 0); finish(c, 0);
+        CHECK(publish_dispatch(raw, rp, NULL) == 0);
+        CHECK(head->nrows == old_rows[fixture] + 33 &&
+            reference->nrows == head->nrows);
+        payload_equal(head, reference, 0);
+        release(c); join_session_destroy(sess); join_session_destroy(raw);
+        publish_generated_free();
+    }
+    const wl_plan_relation_t *rp = publish_generated(2);
+    wl_col_session_t *sess = join_session();
+    publish_named(sess, "S", 2, 33, 33);
+    uint64_t baseline = string_reserved(sess->memory_governor);
+    wl_evaluation_control_t *c = control(0);
+    CHECK(publish_dispatch(sess, rp, c) == ENOTSUP); finish(c, ENOTSUP);
+    CHECK(!session_find_rel(sess,
+        "H") && string_reserved(sess->memory_governor) == baseline);
+    col_rel_t *head = publish_named(sess, "H", 2, 33, 33);
+    col_rel_t *owner = relation(2, 33, 33, false, sess->memory_governor);
+    CHECK(col_rel_install_shared_view(head, owner) == 0);
+    CHECK(session_add_rel(sess, owner) == 0);
+    uint64_t hash = consolidate_source_hash(head), view = head->view_generation;
+    baseline = string_reserved(sess->memory_governor);
+    retry(c, 0); CHECK(publish_dispatch(sess, rp, c) == ENOTSUP);
+    finish(c, ENOTSUP);
+    CHECK(consolidate_source_hash(head) == hash && head->view_generation == view
+        && string_reserved(sess->memory_governor) == baseline &&
+        !sess->cleanup_pending);
+    release(c); join_session_destroy(sess); publish_generated_free();
+    puts(
+        "serial publish: actual old canonical513/10000/wide growth-copy stop, fresh raw retry and missing/alias head negatives passed");
+}
+
 int
 main(void)
 {
     hmac_required_startup();
+    test_publish_generated_twins();
+    test_publish_auto_selection();
+    test_publish_matching_declared_head();
+    test_publish_refusal_recovery();
+    test_publish_exact_and_stops();
+    test_publish_typed_record();
+    test_publish_selection_authority();
+    test_publish_preparation_lifetime();
+    test_publish_old_head_and_negatives();
     test_owned_consolidate_actual_twins();
     test_owned_consolidate_lifecycle();
     test_owned_consolidate_exact_work();

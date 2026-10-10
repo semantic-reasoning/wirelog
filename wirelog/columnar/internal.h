@@ -3612,6 +3612,52 @@ typedef struct wl_columnar_relation_radix_sequence {
     bool consumed;
 } wl_columnar_relation_radix_sequence_t;
 
+/* One append attempt. Original token addresses survive mandatory cleanup.
+ * METADATA_COMMITTED is preparatory; published is canonical and consumed. */
+typedef struct {
+    wl_columnar_memory_reservation_t fresh;
+    uint64_t incoming_bytes;
+    bool growth;
+} wl_columnar_relation_payload_transaction_t;
+typedef struct {
+    wl_columnar_relation_source_group_t sources;
+    wl_columnar_source_access_writer_t descriptor_writer, writer;
+    col_rel_t *dst;
+    uint64_t prior_identity, prior_generation;
+    bool journal;
+    wl_columnar_relation_payload_transaction_t pending;
+    wl_columnar_memory_reservation_t metadata_pending, old_metadata;
+    wl_columnar_memory_reservation_t previous, scratch;
+    uint64_t *lengths;
+    wirelog_column_type_t *prepared_types;
+    struct ArrowSchema prepared_schema, old_schema;
+    int64_t **prepared_columns, **old_columns;
+    col_delta_timestamp_t *prepared_timestamps, *old_timestamps;
+    wl_columnar_mem_ledger_exclusive_prepared_t ledger_prepared;
+    uint64_t metadata_bytes, final_bytes, ledger_timestamps;
+    uint32_t ncols, base, count, new_capacity, owned_columns,
+        initialized_tokens;
+    bool growth, transaction_active, prepared_schema_ok, old_schema_ok;
+    bool metadata_committed, published, active, ready;
+} wl_columnar_relation_bulk_append_t;
+wl_columnar_relation_bulk_append_t *
+wl_columnar_eval_stack_cleanup_bulk_append(
+    wl_columnar_eval_stack_cleanup_frame_t *);
+wl_columnar_relation_source_group_t *
+wl_columnar_eval_stack_cleanup_sources(
+    wl_columnar_eval_stack_cleanup_frame_t *);
+int wl_columnar_relation_bulk_append_controlled(
+    wl_columnar_relation_bulk_append_t *, col_rel_t *, const col_rel_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_relation_bulk_append_retire(
+    wl_columnar_relation_bulk_append_t *, int);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_relation_test_bulk_checkpoint)(
+    wl_evaluation_control_t *, int, wl_columnar_relation_bulk_append_t *);
+extern void (*wl_columnar_eval_serial_test_after_plan)(
+    wl_col_session_t *, eval_stack_t *, eval_entry_t *);
+#endif
+
 typedef enum {
     WL_COLUMNAR_CONSOLIDATE_INERT = 0,
     WL_COLUMNAR_CONSOLIDATE_PREPARING,

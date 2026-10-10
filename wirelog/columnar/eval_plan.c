@@ -261,7 +261,8 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
             || sess->retraction_seeded || sess->retraction_right_pass
             || sess->join_batch_bytes || sess->join_output_shared_count
             || !sess->memory_governor
-            || op->delta_mode != WL_DELTA_FORCE_FULL)
+            || (op->delta_mode != WL_DELTA_FORCE_FULL
+            && !(owned_consolidate && op->delta_mode == WL_DELTA_AUTO)))
             return ENOTSUP;
         if (filter || map || pipeline || reduce || consolidate ||
             owned_consolidate) {

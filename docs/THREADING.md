@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **308**). The earlier audit sections
+match the script's count (currently **313**). The earlier audit sections
 retain their historical per-section counts.
 
 Format: `file:function[#N]` | field | operation | order | justification.
@@ -519,6 +519,24 @@ those slots and arena allocations are quiescent.
 | `source_access.h:wl_columnar_source_access_writer_release` | `gate->state` | `atomic_load_explicit` | acquire | Validate the writer state before terminal publication |
 | `source_access.h:wl_columnar_source_access_writer_release#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Publish writer payload completion and retry spurious failure |
 | `source_access.h:wl_columnar_source_access_writer_move` | `src->owner->state` | `atomic_load_explicit` | acquire | Confirm that the source token still holds WRITER before moving its address-bound ownership to another token |
+
+The serial publication frame retains original-address source readers,
+destination writers and preparatory/retired credit tokens until their genuine
+retirement succeeds. A preparatory metadata COMMITTED state is distinct from
+canonical publication. After the final controlled payload cutoff, fixed
+canonical stores run under both destination writers; mandatory physical
+retirement precedes credit return. A refused return retains those writers and
+the actual frame for cleanup retry. Forward append is never replayed by that
+retry. The schema length cache, scratch credit and partial schema readiness
+also belong to this frame, including cancellation during preparation.
+
+| Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `relation.c:wl_columnar_relation_bulk_retire_token` | `token->state` | `atomic_load_explicit` | acquire | Choose RESERVED rollback or preparatory COMMITTED release at the original token address after its physical image has been retired |
+| `relation.c:wl_columnar_relation_bulk_append_controlled` | `dst->retained_reservation.state` | `atomic_load_explicit` | acquire | Validate payload credit state under the destination writers before the terminal controlled commitment |
+| `relation.c:wl_columnar_relation_bulk_append_controlled#2` | `record->pending.fresh.state` | `atomic_load_explicit` | acquire | Validate the actual pending source token before fixed nonfailing credit movement after the final cutoff |
+| `relation.c:wl_columnar_relation_bulk_append_controlled#3` | `record->metadata_pending.state` | `atomic_load_explicit` | acquire | Revalidate preparatory COMMITTED metadata before the final payload commitment without treating it as canonical publication |
+| `relation.c:wl_columnar_relation_bulk_append_controlled#4` | `record->metadata_pending.owner_bits` | `atomic_load_explicit` | acquire | Verify preparatory metadata credit belongs to the actual destination while its original-address token remains separate from canonical metadata |
 
 ### 5.14 `wirelog/columnar/relation.c` and `session.c` — alias ownership and pool promotion (30 rows)
 

@@ -254,6 +254,7 @@ struct wl_columnar_eval_stack_cleanup_frame {
     wl_columnar_relation_source_group_t join_sources;
     wl_columnar_relation_private_batch_t reduce_batch;
     wl_columnar_consolidate_record_t consolidate;
+    wl_columnar_relation_bulk_append_t bulk_append;
     wl_columnar_memory_reservation_t reservation;
     wl_columnar_memory_governor_ref_t *governor;
 };
@@ -399,6 +400,7 @@ wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
     atomic_store_explicit(&frame->consolidate.merge_admission.state,
         WL_COLUMNAR_MEMORY_RESERVATION_EMPTY, memory_order_relaxed);
     frame->consolidate.ready = true;
+    frame->bulk_append.ready = true;
     if (control) {
         admission = wl_evaluation_control_charge(control, 0);
         if (admission) {
@@ -561,6 +563,21 @@ wl_columnar_eval_stack_cleanup_consolidate(
         ? &frame->consolidate : NULL;
 }
 
+wl_columnar_relation_bulk_append_t *
+wl_columnar_eval_stack_cleanup_bulk_append(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    return frame && frame->session && frame->bulk_append.ready
+        ? &frame->bulk_append : NULL;
+}
+
+wl_columnar_relation_source_group_t *
+wl_columnar_eval_stack_cleanup_sources(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    return frame && frame->session ? &frame->join_sources : NULL;
+}
+
 static void
 wl_columnar_eval_stack_cleanup_continuations(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
@@ -576,7 +593,10 @@ static int
 wl_columnar_eval_stack_cleanup_dispose(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
 {
-    int result = wl_columnar_relation_private_batch_retire(&frame->reduce_batch,
+    int result = wl_columnar_relation_bulk_append_retire(&frame->bulk_append,
+            0);
+    if (result || frame->bulk_append.active) return result ? result : EINVAL;
+    result = wl_columnar_relation_private_batch_retire(&frame->reduce_batch,
             0);
     if (result != 0) return result;
     if (!wl_columnar_relation_private_batch_disposable(&frame->reduce_batch))

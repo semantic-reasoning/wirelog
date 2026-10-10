@@ -716,6 +716,47 @@ addon/callback duration and mandatory cleanup/rollback/task drain are excluded
 from the unit-to-return bound. There is no millisecond deadline guarantee.
 Cleanup remains permitted after exhaustion so recovery can retain/release owners.
 
+#### Admitted initial serial relation publication
+
+The internal W1, nonrecursive, ordinary generated initial
+`VARIABLE(AUTO) -> MAP -> CONSOLIDATE` route supports an existing flat head.
+Full and delta descriptors and their storage owners are pinned by the actual
+frame source group before AUTO compares row counts. Missing, empty, equal or
+larger delta selects full; a positive smaller delta is temporarily rejected.
+The legacy 256-byte truncated delta name is retained. Selection pins drain
+before MAP can acquire its own source/private writer records.
+
+Publication stages a controlled `$publish` relation in a separate owning frame
+entry. The observable MAP result must be destroyed before appending to the
+canonical head; refused destruction retains both actual entries for mandatory
+cleanup. Source and destination metadata are read only under original-address
+descriptor and storage authority. Bulk append retains its pending payload,
+schema/type/length-cache images, scratch credit and retired credits in the
+frame. Preparation charges width visits, name characters, cell copies, growth
+and ledger preparation in bounded groups. The entry disposition check charges
+80 units; scalar reset charges 32, and each of five no-live credit-token
+initializations charges 128 units with explicit cutoffs. Token initialization
+includes its physical byte clearing, so the five slots never share one poll.
+Owning stack moves admit copy and inert-slot writes before changing ownership.
+
+A separately committed preparatory metadata token is reversible and does not
+install canonical schema or metadata credit. A later prepublication stop frees
+the prepared physical image before checked COMMITTED release, or RESERVED
+rollback. Growth rollback retains destination authority until its real credit
+restoration succeeds. The last successful controlled payload commitment, or
+the terminal metadata commitment for a no-growth promotion, is followed by
+fixed admitted canonical stores without another stop poll. The published
+witness distinguishes consumed canonical publication from preparation.
+Mandatory cleanup retry of a consumed record cannot append again. Fresh caller
+retry is proved only for stops before canonical publication; unused capacity
+tail bytes and monotonic governor peaks are not rollback promises.
+
+Generated MAP output remains implicit INT64. Genuine typed-source bulk-record
+fixtures separately cover schema promotion; they do not prove typed MAP
+propagation. New head registration, other delta modes, recursive/differential
+paths and whole attempt/multi-head recovery still require further integration.
+The public attached-control facade remains gated separately by #1823.
+
 ### Required recovery and publication contract (not implemented here)
 
 One external STEP or evaluating SNAPSHOT is one attempt, including an internal

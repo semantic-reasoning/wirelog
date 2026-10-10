@@ -112,7 +112,8 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
         int rc = wl_evaluation_control_charge(control, 16);
         if (rc)
             return rc;
-        if (op->delta_mode != WL_DELTA_FORCE_FULL)
+        if (op->delta_mode != WL_DELTA_FORCE_FULL
+            && op->delta_mode != WL_DELTA_AUTO)
             return ENOTSUP;
         if (stack->top >= COL_STACK_MAX)
             return ENOMEM;
@@ -123,6 +124,49 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
             return rc;
         if (!full)
             return ENOENT;
+        if (op->delta_mode == WL_DELTA_AUTO) {
+            if (sess->current_iteration || sess->retraction_seeded
+                || sess->retraction_right_pass || sess->delta_seeded
+                || sess->tdd_input_run || sess->tdd_subpass_active
+                || sess->tdd_outbound_only_active) return ENOTSUP;
+            /* Preserve snprintf's legacy 256-byte truncated spelling without
+             * performing an unbounded formatting scan. */
+            char delta_name[256];
+            rc = wl_evaluation_control_charge(control, 8);
+            if (rc) return rc;
+            delta_name[0] = '$'; delta_name[1] = 'd'; delta_name[2] = '$';
+            size_t pos = 3;
+            while (pos < sizeof(delta_name) - 1) {
+                rc = wl_evaluation_control_charge(control, 2);
+                if (rc) return rc;
+                char value = op->relation_name[pos - 3];
+                delta_name[pos++] = value;
+                rc = wl_evaluation_control_charge(control, 0);
+                if (rc) return rc;
+                if (!value) break;
+            }
+            delta_name[pos] = '\0';
+            col_rel_t *delta = NULL;
+            rc = wl_columnar_join_controlled_lookup(sess, delta_name, &delta,
+                    control);
+            if (rc) return rc;
+            wl_columnar_relation_source_group_t *group = NULL;
+            eval_entry_t *unused = NULL;
+            rc = wl_columnar_eval_stack_cleanup_join_owner(sess, stack,
+                    &group, &unused);
+            if (rc) return rc;
+            rc = wl_columnar_relation_source_group_acquire_controlled(group,
+                    full, delta, control);
+            if (!rc) {
+                rc = wl_evaluation_control_charge(control, 8);
+                if (!rc && delta && delta->nrows && delta->nrows < full->nrows)
+                    rc = ENOTSUP;
+                if (!rc) rc = wl_evaluation_control_charge(control, 0);
+            }
+            rc = wl_columnar_relation_source_group_drain(group, rc);
+            if (rc) return rc;
+            /* Selection readers must be gone before MAP's owner accessor. */
+        }
         rc = wl_evaluation_control_charge(control, 8);
         if (rc)
             return rc;
