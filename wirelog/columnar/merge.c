@@ -2136,8 +2136,7 @@ wl_columnar_merge_concat_controlled(eval_stack_t *stack, wl_col_session_t *sess,
     rc = wl_columnar_merge_consolidate_owned_shape(left, c); if (rc) goto done;
     rc = wl_columnar_merge_consolidate_owned_shape(right, c); if (rc) goto done;
     rc = wl_evaluation_control_charge(c, 64); if (rc) goto done;
-    if (left->ncols != right->ncols || left->column_types ||
-        right->column_types){
+    if (left->ncols != right->ncols){
         rc = ENOTSUP; goto done;
     }
     if (right->nrows > UINT32_MAX - left->nrows) {

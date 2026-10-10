@@ -73,8 +73,8 @@ wl_columnar_eval_plan_union_validate(const wl_plan_relation_t *plan,
 {
     if (!plan || !supported || !control) return EINVAL;
     *supported = false;
-    if (!plan->ops || plan->op_count < 5u) return 0;
-    uint32_t depth = 0, concatenations = 0;
+    if (!plan->ops || plan->op_count < 3u) return 0;
+    uint32_t depth = 0;
     bool branch = false;
     for (uint32_t i = 0; i < plan->op_count; i++) {
         int rc = wl_evaluation_control_charge(control, 48);
@@ -89,6 +89,7 @@ wl_columnar_eval_plan_union_validate(const wl_plan_relation_t *plan,
             break;
         case WL_PLAN_OP_FILTER:
         case WL_PLAN_OP_MAP:
+        case WL_PLAN_OP_REDUCE:
             if (!branch || !depth) return ENOTSUP;
             break;
         case WL_PLAN_OP_JOIN:
@@ -99,7 +100,7 @@ wl_columnar_eval_plan_union_validate(const wl_plan_relation_t *plan,
             break;
         case WL_PLAN_OP_CONCAT:
             if (!branch || depth < 2u) return ENOTSUP;
-            depth--; concatenations++; branch = false;
+            depth--; branch = false;
             break;
         case WL_PLAN_OP_CONSOLIDATE:
             if (!depth) return ENOTSUP;
@@ -112,7 +113,7 @@ wl_columnar_eval_plan_union_validate(const wl_plan_relation_t *plan,
         rc = wl_evaluation_control_charge(control, 0);
         if (rc) return rc;
     }
-    if (depth != 1u || !concatenations
+    if (depth != 1u
         || plan->ops[plan->op_count - 1u].op != WL_PLAN_OP_CONSOLIDATE)
         return ENOTSUP;
     *supported = true;
@@ -366,6 +367,15 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
             && rplan->ops[2].op == WL_PLAN_OP_REDUCE)) {
             rc = wl_columnar_eval_plan_aggregate_validate(rplan, control,
                     &aggregate_plan);
+            if (rc) return rc;
+        }
+        /* Preserve existing exact-route admission. Only a newly composed
+         * short stream needs the shared ordinary postfix traversal. */
+        if (!union_plan && !join && !filter && !map && !pipeline && !reduce
+            && !consolidate && !owned_consolidate && !filtered_consolidate
+            && !joined_consolidate && !aggregate_plan) {
+            rc = wl_columnar_eval_plan_union_validate(rplan, control,
+                    &union_plan);
             if (rc) return rc;
         }
         if (!union_plan && !join && !filter && !map && !pipeline && !reduce &&

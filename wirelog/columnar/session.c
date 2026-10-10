@@ -5408,6 +5408,12 @@ wl_columnar_session_serial_preflight(wl_col_session_t *sess)
                         &aggregate_plan);
                 if (rc) return rc;
             }
+            if (!plain && !filtered && !joined && !union_plan
+                && !aggregate_plan) {
+                rc = wl_columnar_eval_plan_union_validate(rp, control,
+                        &union_plan);
+                if (rc) return rc;
+            }
             if (!rp->name || !rp->ops ||
                 (!plain && !filtered && !joined && !union_plan &&
                 !aggregate_plan)

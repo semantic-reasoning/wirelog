@@ -10200,7 +10200,7 @@ wl_columnar_relation_reset_controlled(
     }
     rc = wl_columnar_relation_work_tail(control, 192);
     if (rc) goto done;
-    bool has_float = false;
+    bool needs_primitive_schema = false;
     for (uint32_t c = 0; c < rel->ncols; c++) {
         rc = wl_evaluation_control_charge(control, 16);
         if (rc) goto done;
@@ -10209,15 +10209,17 @@ wl_columnar_relation_reset_controlled(
             || (rel->col_names && !rel->col_names[c])
             || (rel->column_types &&
             rel->column_types[c] != WIRELOG_TYPE_INT64
-            && rel->column_types[c] != WIRELOG_TYPE_FLOAT)) {
+            && rel->column_types[c] != WIRELOG_TYPE_FLOAT
+            && rel->column_types[c] != WIRELOG_TYPE_STRING)) {
             rc = ENOTSUP; goto done;
         }
-        if (rel->column_types && rel->column_types[c] == WIRELOG_TYPE_FLOAT)
-            has_float = true;
+        if (rel->column_types && (rel->column_types[c] == WIRELOG_TYPE_FLOAT
+            || rel->column_types[c] == WIRELOG_TYPE_STRING))
+            needs_primitive_schema = true;
         rc = wl_columnar_relation_work_tail(control, 16);
         if (rc) goto done;
     }
-    if (has_float) {
+    if (needs_primitive_schema) {
         rc = wl_evaluation_control_charge(control, 48);
         if (rc) goto done;
         if (!rel->schema_ok || !rel->schema.release || !rel->schema.format

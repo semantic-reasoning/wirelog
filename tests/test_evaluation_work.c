@@ -19076,6 +19076,529 @@ test_serial_generated_reduce(void)
         "serial REDUCE: genuine AUTO aggregate typed owned CONS initial/dirty raw twins and exact allowance passed\n");
 }
 
+static void
+composed_concat_type_trial(unsigned left_kind, unsigned right_kind,
+    uint32_t left_rows, uint32_t right_rows, unsigned invalid, int expected)
+{
+    wl_col_session_t *s = join_session(), *raw = join_session();
+    col_rel_t *inputs[2], *references[2];
+    unsigned kinds[] = {left_kind, right_kind};
+    uint32_t rows[] = {left_rows, right_rows};
+    for (unsigned i = 0; i < 2u; i++) {
+        inputs[i] = relation(2, 2, 0, false, s->memory_governor);
+        references[i] = relation(2, 2, 0, false, raw->memory_governor);
+        if (kinds[i]) {
+            wirelog_column_type_t types[] = {WIRELOG_TYPE_INT64,
+                                             kinds[i] ==
+                                             1u ? WIRELOG_TYPE_STRING :
+                                             kinds[i] == 2u
+                ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_INT64};
+            CHECK(col_rel_set_column_types(inputs[i], types, 2) == 0
+                && col_rel_set_column_types(references[i], types, 2) == 0);
+        }
+        inputs[i]->columns[0][0] = references[i]->columns[0][0] = 0;
+        inputs[i]->columns[1][0] = references[i]->columns[1][0] =
+            invalid == i + 1u ? INT64_C(0x7ff8000000000001)
+            : kinds[i] == 2u ? wl_columnar_float_to_bits(1.5 + i) : 7 + i;
+        /* Install type metadata on a genuinely empty helper input, then
+         * populate it before any reader/writer lease is acquired. */
+        inputs[i]->nrows = references[i]->nrows = rows[i];
+    }
+    uint64_t baseline = string_reserved(s->memory_governor);
+    wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(s),
+        *rf = filter_frame(raw);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame),
+        *rs = wl_columnar_eval_stack_cleanup_stack(rf);
+    for (unsigned i = 0; i < 2u; i++) CHECK(eval_stack_push(stack, inputs[i],
+            false) == 0 && eval_stack_push(rs, references[i], false) == 0);
+    wl_evaluation_control_t *c = control(0);
+    int rc = wl_columnar_merge_concat_controlled(stack, s, c);
+    int reference_rc = col_op_concat(rs, raw);
+    if (rc != reference_rc || rc != expected) fprintf(stderr,
+            "CONCAT types=%u/%u rows=%u/%u invalid=%u rc=%d raw=%d expected=%d\n",
+            left_kind, right_kind, left_rows, right_rows, invalid,
+            rc, reference_rc, expected);
+    CHECK(rc == reference_rc && rc == expected);
+    if (!rc) {
+        col_rel_t *out = stack->items[0].rel, *ref = rs->items[0].rel;
+        filter_equal(out, ref);
+        CHECK(!!out->column_types == !!ref->column_types);
+        if (out->column_types) CHECK(out->column_types[0] ==
+                ref->column_types[0]
+                && out->column_types[1] == ref->column_types[1]);
+        CHECK(out->schema_ok == ref->schema_ok && out->nrows == left_rows
+            + right_rows && stack->items[0].seg_count == 2u);
+    }
+    finish(c, rc); release(c);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0
+        && wl_columnar_eval_stack_cleanup_finish(&rf) == 0
+        && string_reserved(s->memory_governor) == baseline);
+    for (unsigned i = 0; i < 2u; i++) {
+        CHECK(inputs[i]->nrows == rows[i] && references[i]->nrows == rows[i]
+            && inputs[i]->columns[1][0] == references[i]->columns[1][0]);
+        source_unpinned(inputs[i], inputs[i]);
+        CHECK(col_rel_destroy_checked(inputs[i]) == 0
+            && col_rel_destroy_checked(references[i]) == 0);
+    }
+    join_session_destroy(s); join_session_destroy(raw);
+}
+static void
+composed_concat_type_policy(void)
+{
+    composed_concat_type_trial(0, 1, 1, 1, 0, 0);
+    composed_concat_type_trial(1, 0, 1, 1, 0, 0);
+    composed_concat_type_trial(2, 2, 1, 1, 0, 0);
+    composed_concat_type_trial(2, 3, 1, 1, 0, EINVAL);
+    composed_concat_type_trial(3, 2, 1, 1, 0, EINVAL);
+    composed_concat_type_trial(2, 3, 1, 0, 0, 0);
+    composed_concat_type_trial(2, 3, 0, 1, 0, EINVAL);
+    composed_concat_type_trial(3, 2, 1, 0, 0, 0);
+    composed_concat_type_trial(3, 2, 0, 1, 0, EINVAL);
+    composed_concat_type_trial(2, 3, 0, 0, 0, 0);
+    composed_concat_type_trial(2, 2, 1, 1, 1, EINVAL);
+    composed_concat_type_trial(2, 2, 1, 1, 2, EINVAL);
+    composed_concat_type_trial(2, 2, 0, 0, 2, 0);
+}
+
+static wl_col_session_t *composed_session;
+static unsigned composed_mode, composed_stopped, composed_reduce_seen,
+    composed_concat_seen, composed_string_seen;
+static wl_columnar_source_access_reader_t composed_reader;
+static col_rel_t *composed_refused;
+static void
+composed_reduce_checkpoint(wl_evaluation_control_t *c, int stage,
+    uint64_t progress, wl_columnar_relation_private_batch_t *record,
+    col_rel_t *source)
+{
+    (void)record;
+    if (stage == 3) {
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(
+            composed_session->cleanup_active);
+        CHECK(stack->top && stack->items[stack->top - 1u].rel == source);
+        wl_columnar_expr_operator_preparation_t *prep =
+            wl_columnar_eval_stack_cleanup_operator_preparation(
+            composed_session->cleanup_active);
+        CHECK(prep && prep->scratch_payload);
+        composed_reduce_seen++;
+    }
+    if (stage == 9 && progress == 256u) composed_string_seen++;
+    if (!composed_stopped && ((composed_mode == 1u && stage == 3)
+        || (composed_mode == 2u && stage == 9 && progress == 256u))) {
+        composed_stopped++;
+        wl_evaluation_control_request_cancel(c);
+    }
+}
+static void
+composed_concat_checkpoint(wl_evaluation_control_t *c, int stage,
+    uint64_t progress, wl_columnar_consolidate_record_t *record, col_rel_t *r)
+{
+    (void)record;
+    if (stage == 113 || stage == 114) {
+        CHECK(r && r->column_types && r->schema_ok
+            && r->schema.children[1]->format[0] ==
+            (r->column_types[1] == WIRELOG_TYPE_FLOAT ? 'g' : 'l'));
+        composed_concat_seen++;
+    }
+    if (stage == 115 && progress == 0u && composed_mode == 5u
+        && !composed_reader.owner) {
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(
+            composed_session->cleanup_active);
+        CHECK(stack->top >= 2u && stack->items[stack->top - 2u].owned);
+        composed_refused = stack->items[stack->top - 2u].rel;
+        CHECK(col_rel_source_reader_acquire(composed_refused,
+            &composed_reader) == 0);
+    }
+    if (!composed_stopped && ((composed_mode == 3u && stage == 113)
+        || (composed_mode == 4u && stage == 116 && progress == 1u))) {
+        if (stage == 116) {
+            eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(
+                composed_session->cleanup_active);
+            CHECK(stack->top >= 2u && !stack->items[stack->top - 2u].rel
+                && stack->items[stack->top - 1u].rel);
+        }
+        composed_stopped++;
+        wl_evaluation_control_request_cancel(c);
+    }
+}
+static wl_columnar_relation_bulk_append_t *composed_fault_record;
+static uintptr_t composed_writer_identity;
+static void
+composed_bulk_checkpoint(wl_evaluation_control_t *c, int stage,
+    wl_columnar_relation_bulk_append_t *record)
+{
+    if (stage != 3 || record->reset || composed_stopped
+        || composed_mode != 6u || !record->dst
+        || strcmp(record->dst->name, "$concat")) return;
+    CHECK(record->active && !record->writer.owner
+        && !record->descriptor_writer.owner && record->dst->column_types);
+    composed_stopped++;
+    wl_evaluation_control_request_cancel(c);
+}
+static void
+composed_bulk_work(wl_evaluation_control_t *c, uint64_t work)
+{
+    if (work != 32u || composed_stopped || composed_mode < 7u
+        || composed_mode > 8u || !composed_session->cleanup_active) return;
+    wl_columnar_relation_bulk_append_t *record =
+        wl_columnar_eval_stack_cleanup_bulk_append(
+        composed_session->cleanup_active);
+    if (!record || !record->active || record->reset || !record->dst
+        || strcmp(record->dst->name, "$concat") || !record->writer.owner
+        || !record->descriptor_writer.owner) return;
+    CHECK(record->ncols == 2u && record->dst->column_types);
+    composed_stopped++;
+    composed_fault_record = record;
+    composed_writer_identity = record->writer.identity;
+    CHECK(composed_writer_identity == (uintptr_t)&record->writer);
+    record->writer.identity = 0; /* Original held writer scalar only. */
+    if (composed_mode == 7u)
+        CHECK(wl_evaluation_control_charge(c, UINT64_MAX) == EOVERFLOW);
+    else wl_evaluation_control_request_cancel(c);
+}
+static uint64_t
+composed_generated_trial(unsigned kind, bool repeat, bool snapshot,
+    unsigned mode, uint64_t limit, int expected)
+{
+    const char *texts[] = {
+        ".decl A(g:int64,v:int64)\n.decl B(g:int64,v:int64)\n.decl H(g:int64,v:int64)\nH(g,SUM(v)):-A(g,v).\nH(g,COUNT(v)):-B(g,v).\n",
+        ".decl A(g:int64,v:float)\n.decl B(g:int64,v:float)\n.decl H(g:int64,v:float)\nH(g,SUM(v)):-A(g,v).\nH(g,min(v)):-B(g,v).\n",
+        ".decl A(g:symbol,v:symbol)\n.decl B(g:symbol,v:symbol)\n.decl H(g:symbol,v:symbol)\nH(g,min(v)):-A(g,v).\nH(g,max(v)):-B(g,v).\n",
+        ".decl A(g:int64,v:int64)\n.decl B(g:int64)\n.decl H(g:int64,v:int64)\nH(g,SUM(v)):-A(g,v),B(g).\n",
+        ".decl A(g:symbol,v:symbol,marker:float)\n.decl B(g:symbol,v:symbol,marker:float)\n.decl H(g:symbol,v:symbol)\nH(g,min(v)):-A(g,v,marker).\nH(g,max(v)):-B(g,v,marker).\n"
+    };
+    CHECK(kind < 5u);
+    bool symbolic = kind == 2u || kind == 4u;
+    uint32_t width = kind == 4u ? 3u : 2u;
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(texts[kind], &error);
+    CHECK(program && error == WIRELOG_OK);
+    wl_plan_t *plan = NULL; CHECK(wl_plan_from_program(program, &plan) == 0);
+    CHECK(plan->stratum_count == 1u && !plan->strata[0].is_recursive
+        && plan->strata[0].relation_count == 1u);
+    const wl_plan_relation_t *rp = &plan->strata[0].relations[0];
+    CHECK(rp->ops[0].op == WL_PLAN_OP_VARIABLE
+        && rp->ops[0].delta_mode == WL_DELTA_AUTO
+        && rp->ops[rp->op_count - 1u].op == WL_PLAN_OP_CONSOLIDATE);
+    if (kind == 3u) CHECK(rp->op_count == 4u
+            && rp->ops[1].op == WL_PLAN_OP_JOIN
+            && rp->ops[1].delta_mode == WL_DELTA_AUTO
+            && rp->ops[2].op == WL_PLAN_OP_REDUCE);
+    else CHECK(rp->op_count == 6u && rp->ops[1].op == WL_PLAN_OP_REDUCE
+            && rp->ops[2].op == WL_PLAN_OP_VARIABLE
+            && rp->ops[2].delta_mode == WL_DELTA_AUTO
+            && rp->ops[3].op == WL_PLAN_OP_REDUCE
+            && rp->ops[4].op == WL_PLAN_OP_CONCAT);
+    wl_col_session_t *s = joined_create(plan), *raw = joined_create(plan);
+    wl_evaluation_control_t *c = serial_attach(s, 0);
+    int64_t a[18], b[18];
+    char long_a[602], long_b[602], long_zero[602];
+    memset(long_a, 'q', 600); memcpy(long_b, long_a, 600);
+    memcpy(long_zero, long_a, 600);
+    long_a[600] = 'a'; long_b[600] = 'b'; long_zero[600] = '0';
+    long_a[601] = long_b[601] = long_zero[601] = '\0';
+    int64_t group = symbolic ? wl_intern_put(s->intern, "group") : 0;
+    int64_t min_id = 0, max_id = 0;
+    if (symbolic) {
+        CHECK(s->intern == raw->intern && rp->ops[1].agg_operand_type
+            == WL_PLAN_AGG_OPERAND_STRING);
+        max_id = wl_intern_put(s->intern, long_b);
+        min_id = wl_intern_put(s->intern, long_a);
+        CHECK(max_id >= 0 && min_id > max_id); /* Adversarial intern order. */
+    }
+    for (uint32_t row = 0; row < 6u; row++) {
+        a[width * row] = b[width * row] = symbolic ? group : row % 2u;
+        a[width * row + 1u] = b[width * row + 1u] = symbolic
+            ? row % 2u ? min_id : max_id
+            : kind == 1u ? wl_columnar_float_to_bits((double)row / 2.0)
+            : (int64_t)row + 1;
+        if (kind == 4u) a[width * row + 2u] = b[width * row + 2u]
+                    = wl_columnar_float_to_bits(0.5);
+        if (symbolic && row == 5u) a[width * row + 1u] = b[width * row + 1u]
+                    = INT64_MAX - 7; /* Real legacy uninterned value; interned wins. */
+    }
+    if (kind == 4u) {
+        for (unsigned side = 0; side < 2u; side++) {
+            const char *name = side ? "B" : "A";
+            col_rel_t *source = session_find_rel(s, name),
+                *reference = session_find_rel(raw, name);
+            CHECK(source->column_types && reference->column_types);
+            CHECK(source->column_types[0] == WIRELOG_TYPE_STRING
+                && source->column_types[1] == WIRELOG_TYPE_STRING
+                && source->column_types[2] == WIRELOG_TYPE_FLOAT
+                && reference->column_types[0] == WIRELOG_TYPE_STRING
+                && reference->column_types[1] == WIRELOG_TYPE_STRING
+                && reference->column_types[2] == WIRELOG_TYPE_FLOAT);
+            CHECK(source->schema.children[0]->format[0] == 'l'
+                && source->schema.children[1]->format[0] == 'l'
+                && source->schema.children[2]->format[0] == 'g');
+        }
+    }
+    int64_t keys[] = {0, 1};
+    CHECK(wl_backend_columnar()->session_insert(&s->base, "A", a, 6, width) == 0
+        && wl_backend_columnar()->session_insert(&raw->base, "A", a, 6,
+        width) == 0);
+    CHECK(wl_backend_columnar()->session_insert(&s->base, "B",
+        kind == 3u ? keys : b, kind == 3u ? 2u : 6u,
+        kind == 3u ? 1u : width) == 0
+        && wl_backend_columnar()->session_insert(&raw->base, "B",
+        kind == 3u ? keys : b, kind == 3u ? 2u : 6u,
+        kind == 3u ? 1u : width) == 0);
+    if (repeat) {
+        CHECK(wl_backend_columnar()->session_step(&s->base) == 0
+            && wl_backend_columnar()->session_step(&raw->base) == 0);
+        int64_t extra[] = {symbolic ? group : 0,
+                           symbolic ? wl_intern_put(s->intern, long_zero)
+                          : kind == 1u ? wl_columnar_float_to_bits(7.5) : 7,
+                           wl_columnar_float_to_bits(0.5)};
+        if (symbolic) min_id = extra[1];
+        CHECK(wl_backend_columnar()->session_insert(&s->base, "A", extra, 1,
+            width) == 0 && wl_backend_columnar()->session_insert(&raw->base,
+            "A",
+            extra, 1, width) == 0);
+    }
+    CHECK(wl_evaluation_control_reset(c) == 0
+        && wl_evaluation_control_configure(c, limit) == 0);
+    composed_session = s; composed_mode = mode; composed_stopped = 0;
+    composed_reduce_seen = composed_concat_seen = composed_string_seen = 0;
+    composed_refused = NULL; composed_fault_record = NULL; composed_reader =
+        (wl_columnar_source_access_reader_t){0};
+    wl_columnar_ops_reduce_test_checkpoint = composed_reduce_checkpoint;
+    wl_columnar_consolidate_test_checkpoint = composed_concat_checkpoint;
+    wl_columnar_relation_test_bulk_checkpoint = composed_bulk_checkpoint;
+    wl_columnar_relation_test_work_checkpoint = composed_bulk_work;
+    serial_capture_t got = {.width = 2}, ref = got;
+    int rc = snapshot ? wl_backend_columnar()->session_snapshot(&s->base,
+            joined_capture,
+            &got) : wl_backend_columnar()->session_step(&s->base);
+    wl_columnar_ops_reduce_test_checkpoint = NULL;
+    wl_columnar_consolidate_test_checkpoint = NULL;
+    wl_columnar_relation_test_bulk_checkpoint = NULL;
+    wl_columnar_relation_test_work_checkpoint = NULL;
+    if (rc != expected) fprintf(stderr,
+            "composed kind=%u repeat=%u snapshot=%u mode=%u rc=%d expected=%d\n",
+            kind, repeat, snapshot, mode, rc, expected);
+    CHECK(rc == expected);
+    wl_evaluation_control_report_t report;
+    CHECK(wl_evaluation_control_report(c, &report) == 0
+        && report.result == expected);
+    uint64_t cost = report.consumed;
+    if (mode >= 7u) {
+        CHECK(composed_fault_record && composed_fault_record->active
+            && composed_fault_record->writer.owner
+            && !composed_fault_record->writer.identity && s->cleanup_pending
+            && !s->cleanup_active && wl_columnar_eval_stack_cleanup_bulk_append(
+                s->cleanup_pending) == composed_fault_record);
+        eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(
+            s->cleanup_pending);
+        col_rel_t *candidate = composed_fault_record->dst;
+        CHECK(result->rel == candidate && result->owned && candidate->columns
+            && candidate->retained_reserved_bytes
+            && candidate->retained_reservation.identity
+            == &candidate->retained_reservation
+            && atomic_load(&candidate->retained_reservation.state)
+            == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+        if (mode == 7u) CHECK(report.execution_status == EOVERFLOW);
+        composed_fault_record->writer.identity = composed_writer_identity;
+        CHECK(wl_columnar_eval_stack_cleanup_retry(s) == 0
+            && !s->cleanup_pending);
+    }
+    if (mode == 5u) {
+        CHECK(composed_reader.owner && composed_refused && s->cleanup_pending);
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(
+            s->cleanup_pending);
+        CHECK(stack->top >= 2u && stack->items[stack->top - 2u].rel
+            == composed_refused && stack->items[stack->top - 2u].owned);
+        CHECK(col_rel_source_reader_release(&composed_reader) == 0
+            && wl_columnar_eval_stack_cleanup_retry(s) == 0
+            && !s->cleanup_pending);
+    }
+    if (expected) {
+        CHECK(!got.count && (!mode || mode == 5u || composed_stopped));
+        composed_mode = 0;
+        CHECK(wl_evaluation_control_reset(c) == 0
+            && wl_evaluation_control_configure(c, 0) == 0);
+        wl_columnar_ops_reduce_test_checkpoint = composed_reduce_checkpoint;
+        wl_columnar_consolidate_test_checkpoint = composed_concat_checkpoint;
+        CHECK(wl_backend_columnar()->session_snapshot(&s->base, joined_capture,
+            &got) == 0);
+        wl_columnar_ops_reduce_test_checkpoint = NULL;
+        wl_columnar_consolidate_test_checkpoint = NULL;
+    } else if (!snapshot) CHECK(wl_backend_columnar()->session_snapshot(
+                &s->base, joined_capture, &got) == 0);
+    CHECK(wl_backend_columnar()->session_snapshot(&raw->base, joined_capture,
+        &ref) == 0 && got.count == ref.count && got.digest == ref.digest);
+    col_rel_t *head = session_find_rel(s, "H");
+    filter_equal(head, session_find_rel(raw, "H"));
+    CHECK(composed_reduce_seen && (kind == 3u || composed_concat_seen));
+    if (!head->column_types || head->column_types[1] !=
+        (kind == 1u ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_INT64)) {
+        col_rel_t *reference = session_find_rel(raw, "H");
+        fprintf(stderr,
+            "composed schema kind=%u repeat=%u snapshot=%u types=%d rawtypes=%d\n",
+            kind, repeat, snapshot,
+            head->column_types ? (int)head->column_types[1] : -1,
+            reference->column_types ? (int)reference->column_types[1] : -1);
+    }
+    CHECK(head->column_types && head->column_types[1] ==
+        (kind == 1u ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_INT64));
+    if (symbolic) {
+        CHECK(head->column_types[0] == (kind == 4u ? WIRELOG_TYPE_STRING
+            : WIRELOG_TYPE_INT64) &&
+            head->schema.children[0]->format[0] == 'l');
+        CHECK(composed_string_seen && head->nrows == 2u
+            && head->schema.children[1]->format[0] == 'l');
+        CHECK((head->columns[1][0] == min_id && head->columns[1][1] == max_id)
+            || (head->columns[1][1] == min_id &&
+            head->columns[1][0] == max_id));
+    }
+    CHECK(!s->serial_completion.frame && !s->cleanup_reserved_bytes
+        && !s->cleanup_pending && !s->cleanup_active);
+    source_unpinned(session_find_rel(s, "A"), session_find_rel(s, "A"));
+    source_unpinned(session_find_rel(s, "B"), session_find_rel(s, "B"));
+    serial_destroy(s); serial_destroy(raw); wl_plan_free(plan);
+    wirelog_program_free(program);
+    return cost;
+}
+static void
+composed_string_reset_trial(unsigned mode)
+{
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(
+        ".decl A(g:symbol,v:symbol,marker:float)\n.decl H(g:symbol,v:symbol)\nH(g,min(v)):-A(g,v,marker).\n",
+        &error);
+    CHECK(program && error == WIRELOG_OK);
+    wl_plan_t *plan = NULL; CHECK(wl_plan_from_program(program, &plan) == 0);
+    CHECK(plan->stratum_count == 1u && plan->strata[0].relation_count == 1u
+        && !plan->strata[0].is_recursive);
+    const wl_plan_relation_t *rp = &plan->strata[0].relations[0];
+    CHECK(rp->op_count == 3u && rp->ops[0].op == WL_PLAN_OP_VARIABLE
+        && rp->ops[0].delta_mode == WL_DELTA_AUTO
+        && rp->ops[1].op == WL_PLAN_OP_REDUCE
+        && rp->ops[1].agg_operand_type == WL_PLAN_AGG_OPERAND_STRING
+        && rp->ops[2].op == WL_PLAN_OP_CONSOLIDATE);
+    wl_col_session_t *s = joined_create(plan), *raw = joined_create(plan);
+    wl_evaluation_control_t *c = serial_attach(s, 0);
+    col_rel_t *source = session_find_rel(s, "A");
+    CHECK(source->column_types && source->column_types[0] == WIRELOG_TYPE_STRING
+        && source->column_types[1] == WIRELOG_TYPE_STRING
+        && source->column_types[2] == WIRELOG_TYPE_FLOAT);
+    int64_t group = wl_intern_put(s->intern, "group"),
+        value = wl_intern_put(s->intern, "z-value");
+    int64_t data[] = {group, value, wl_columnar_float_to_bits(0.5)};
+    CHECK(wl_backend_columnar()->session_insert(&s->base, "A", data, 1, 3) == 0
+        && wl_backend_columnar()->session_insert(&raw->base, "A", data, 1,
+        3) == 0 && wl_backend_columnar()->session_step(&s->base) == 0
+        && wl_backend_columnar()->session_step(&raw->base) == 0);
+    col_rel_t *head = session_find_rel(s, "H");
+    CHECK(head->column_types[0] == WIRELOG_TYPE_STRING
+        && head->column_types[1] == WIRELOG_TYPE_INT64);
+    int64_t **columns = head->columns;
+    wirelog_column_type_t *types = head->column_types;
+    struct ArrowSchema *child = head->schema.children[0];
+    const char *format = child->format;
+    uint64_t storage = head->storage_generation, view = head->view_generation,
+        retained = head->retained_reserved_bytes,
+        metadata = head->metadata_reserved_bytes,
+        fingerprint = consolidate_source_hash(head);
+    data[1] = wl_intern_put(s->intern, "a-value");
+    CHECK(wl_backend_columnar()->session_insert(&s->base, "A", data, 1, 3) == 0
+        && wl_backend_columnar()->session_insert(&raw->base, "A", data, 1,
+        3) == 0 && wl_evaluation_control_reset(c) == 0);
+    reduced_session = s; reduced_reset_mode = mode;
+    reduced_reset_seen[0] = reduced_reset_seen[1] = 0;
+    reduced_reset_writer = NULL; reduced_reset_identity = 0;
+    wl_columnar_source_access_reader_t reader = {0};
+    if (mode == 6u) CHECK(col_rel_source_reader_acquire(head, &reader) == 0);
+    if (mode == 7u) child->format = "";
+    if (mode == 8u) types[0] = (wirelog_column_type_t)UINT32_MAX;
+    wl_columnar_relation_test_work_checkpoint = reduced_reset_work;
+    wl_columnar_relation_test_bulk_checkpoint = reduced_reset_bulk;
+    serial_capture_t got = {.width = 2}, ref = got;
+    int rc = wl_backend_columnar()->session_snapshot(&s->base, joined_capture,
+            &got);
+    wl_columnar_relation_test_work_checkpoint = NULL;
+    wl_columnar_relation_test_bulk_checkpoint = NULL;
+    int expected = mode == 2u ? EOVERFLOW : mode == 6u ? EBUSY
+        : mode == 7u ? EINVAL : mode == 8u ? ENOTSUP
+        : mode == 3u || mode == 5u ? EINVAL : WL_EVALUATION_CONTROL_CANCELLED;
+    if (rc != expected) fprintf(stderr,
+            "STRING reset mode=%u rc=%d expected=%d\n", mode, rc, expected);
+    CHECK(rc == expected && !got.count && head->columns == columns
+        && head->column_types == types
+        && head->retained_reserved_bytes == retained
+        && head->metadata_reserved_bytes == metadata);
+    wl_evaluation_control_report_t report;
+    CHECK(wl_evaluation_control_report(c, &report) == 0
+        && report.result == expected);
+    if (mode == 2u) CHECK(report.execution_status == EOVERFLOW);
+    if (mode == 5u) CHECK(!head->nrows &&
+            head->storage_generation == storage + 1u
+            && s->serial_completion.reset_relation == 1u);
+    else CHECK(head->nrows == 1u && head->storage_generation == storage
+            && head->view_generation == view
+            && consolidate_source_hash(head) == fingerprint);
+    if (reduced_reset_writer) {
+        CHECK(reduced_reset_writer->owner && !reduced_reset_writer->identity
+            && s->cleanup_pending && !s->cleanup_active
+            && &wl_columnar_eval_stack_cleanup_bulk_append(
+                s->cleanup_pending)->writer == reduced_reset_writer);
+        reduced_reset_writer->identity = reduced_reset_identity;
+    }
+    if (mode == 6u) CHECK(col_rel_source_reader_release(&reader) == 0);
+    if (mode == 7u) child->format = format;
+    if (mode == 8u) types[0] = WIRELOG_TYPE_STRING;
+    CHECK(wl_columnar_eval_stack_cleanup_retry(s) == 0 && !s->cleanup_pending
+        && wl_evaluation_control_reset(c) == 0);
+    CHECK(wl_backend_columnar()->session_snapshot(&s->base, joined_capture,
+        &got) == 0 && wl_backend_columnar()->session_snapshot(&raw->base,
+        joined_capture, &ref) == 0 && got.count == ref.count
+        && got.digest == ref.digest);
+    filter_equal(head, session_find_rel(raw, "H"));
+    CHECK(head->column_types[0] == WIRELOG_TYPE_STRING
+        && head->column_types[1] == WIRELOG_TYPE_INT64 && head->nrows == 1u
+        && head->columns[1][0] == data[1]
+        && !s->serial_completion.frame && !s->cleanup_reserved_bytes
+        && !s->cleanup_active && !s->cleanup_pending);
+    source_unpinned(head, head); source_unpinned(source, source);
+    serial_destroy(s); serial_destroy(raw); wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+static void
+test_serial_composed_aggregates(void)
+{
+    composed_concat_type_policy();
+    for (unsigned mode = 1; mode <= 8u;
+        mode++) composed_string_reset_trial(mode);
+    for (unsigned kind = 0; kind < 4u; kind++)
+        for (unsigned repeat = 0; repeat < 2u; repeat++)
+            for (unsigned snapshot = 0; snapshot < 2u; snapshot++)
+                composed_generated_trial(kind, repeat, snapshot, 0, 0, 0);
+    composed_generated_trial(4, false, true, 0, 0, 0);
+    composed_generated_trial(4, true, true, 0, 0, 0);
+    composed_generated_trial(4, true, true, 2, 0,
+        WL_EVALUATION_CONTROL_CANCELLED);
+    composed_generated_trial(3, false, true, 1, 0,
+        WL_EVALUATION_CONTROL_CANCELLED);
+    composed_generated_trial(2, false, true, 2, 0,
+        WL_EVALUATION_CONTROL_CANCELLED);
+    composed_generated_trial(1, false, true, 3, 0,
+        WL_EVALUATION_CONTROL_CANCELLED);
+    composed_generated_trial(1, false, true, 4, 0,
+        WL_EVALUATION_CONTROL_CANCELLED);
+    composed_generated_trial(1, false, true, 5, 0, EBUSY);
+    composed_generated_trial(4, false, true, 6, 0,
+        WL_EVALUATION_CONTROL_CANCELLED);
+    composed_generated_trial(4, false, true, 7, 0, EOVERFLOW);
+    composed_generated_trial(4, false, true, 8, 0, EINVAL);
+    uint64_t cost = composed_generated_trial(0, false, true, 0, 0, 0);
+    CHECK(composed_generated_trial(0, false, true, 0, 0, 0) == cost);
+    CHECK(composed_generated_trial(0, false, true, 0, cost, 0) == cost);
+    composed_generated_trial(0, false, true, 0, cost - 1u,
+        WL_EVALUATION_CONTROL_WORK_LIMIT);
+    fprintf(stderr,
+        "composed aggregates: generated typed union/JOIN and STRING dirty raw twins passed\n");
+}
+
 int
 main(void)
 {
@@ -19303,6 +19826,7 @@ main(void)
     test_serial_large_set_attempts();
     test_serial_segmented_attempts();
     test_serial_generated_reduce();
+    test_serial_composed_aggregates();
     puts("evaluation_work: OK");
     return 0;
 }

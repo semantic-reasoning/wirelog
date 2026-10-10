@@ -1156,8 +1156,8 @@ stops or refusal retain the actual RESERVED or COMMITTED token for checked
 drain. Physical pointers are NULL before credit retirement, and a refused
 original token retains its actual frame slot and writers.
 
-Dirty FLOAT heads retain their grid, type/schema storage and credits during
-reset. Primitive schema validation runs under the original reset writers;
+Dirty FLOAT and STRING grouping lanes retain their grid, type/schema storage
+and credits during reset. Primitive schema validation runs under the original reset writers;
 preflight checks all targets before any logical reset. Publishing reset keeps
 the existing replacement generation event and advances the consumed cursor
 before cleanup. Positive execution errors survive real cleanup refusal;
@@ -1165,3 +1165,40 @@ positive cleanup errors replace success or negative stops. Input destruction
 uses the existing physical cleanup exclusion, with polls immediately before
 and after the disposer. This selected aggregate route does not complete the
 remaining full-task execution lanes listed above.
+
+### Controlled ordinary aggregate compositions
+
+New ordinary postfix compositions use the shared charged plan traversal:
+VARIABLE, FILTER, MAP, ordinary JOIN, REDUCE, CONCAT and final CONSOLIDATE.
+Existing exact routes retain their admission trajectory. Each new operator
+visit admits 48 units before inspecting the immutable plan and then polls.
+Recursive, seeded, differential, batched, materialized and LFTJ contexts remain
+outstanding coverage; this grammar does not enable those dispatch paths.
+
+Completed branches stay in their original stack entries. Typed CONCAT uses
+the existing held new-like constructor and bulk records, with the original
+left metadata and raw initial capacity. Before another operator reuses the
+preparation/consolidation workspace or private writer, every previous owner
+must be genuinely retired. Stops after one input disposal retain the remaining
+input and candidate for checked frame drain; retry starts from canonical inputs.
+Physical input and Arrow destruction keep the documented cleanup exclusion,
+with polling immediately before and after successful disposal.
+
+CONCAT preserves raw integer-family compatibility and FLOAT bit validation.
+A nonempty FLOAT/non-FLOAT append fails with EINVAL. An empty source keeps the
+raw early return after width/representation checks, so it does not introduce a
+new FLOAT mismatch check. Empty left and nonempty right still use the left
+constructor metadata when applying the normal append rule. Original refused
+writers and payload credit remain reachable; positive execution errors keep
+precedence while mandatory checked cleanup runs.
+
+STRING MIN/MAX compare actual interned values lexically, charging two byte
+visits before each comparison and polling after it. Mixed legacy uninterned
+IDs retain the raw preference for an interned value and numeric fallback when
+neither ID resolves. STRING aggregate values retain the raw INT64 metadata and
+physical Arrow `l`; STRING operand comparison does not change that schema.
+Grouping columns preserve actual source metadata. An all-symbol declaration
+alone does not establish physical STRING metadata in the default backend.
+A genuine source containing a declared FLOAT lane installs its complete lane
+metadata and supplies the tested STRING grouping lineage through REDUCE,
+typed CONCAT and dirty reset, without post-producer retagging.
