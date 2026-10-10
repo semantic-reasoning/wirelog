@@ -1142,10 +1142,15 @@ col_rel_row_copy_in(col_rel_t *r, uint32_t row, const int64_t *src)
     return rc;
 }
 
-/* Copy count consecutive rows in with the same per-cell validation and float
- * normalization as col_rel_row_copy_in_raw().  The column and type tables are
- * read once: cell stores cannot change them, and rereading them for every
- * cell made the wide-batch loop slower and sensitive to code placement. */
+/* Copy count consecutive rows in with the per-cell validation and float
+ * normalization of col_rel_row_copy_in_raw().  Each FLOAT cell is checked as
+ * it is stored, so a failure can leave earlier cells of the batch written
+ * past nrows: callers that need an all-or-nothing batch validate it first, as
+ * col_rel_append_rows_atomic() does.  Checking in the store loop instead of a
+ * separate column-by-column pass keeps a wide all-FLOAT batch to one pass over
+ * its input.  The column and type tables are read once: cell stores cannot
+ * change them, and rereading them for every cell made the wide-batch loop
+ * slower and sensitive to code placement. */
 static inline int
 col_rel_rows_copy_in_raw(col_rel_t *r, uint32_t row, const int64_t *src,
     uint32_t count)
@@ -1167,24 +1172,17 @@ col_rel_rows_copy_in_raw(col_rel_t *r, uint32_t row, const int64_t *src,
     for (uint32_t c = 0; c < ncols; c++)
         if (columns[c] == NULL)
             return EINVAL;
-    for (uint32_t c = 0; types && c < ncols; c++) {
-        if (types[c] != WIRELOG_TYPE_FLOAT)
-            continue;
-        for (uint32_t i = 0; i < count; i++) {
-            int64_t value = 0;
-            memcpy(&value, &src[(size_t)i * ncols + c], sizeof(value));
-            if (!wl_columnar_float_bits_valid(value))
-                return EINVAL;
-        }
-    }
     for (uint32_t i = 0; i < count; i++) {
         const int64_t *in = src + (size_t)i * ncols;
         for (uint32_t c = 0; c < ncols; c++) {
             int64_t value = 0;
             memcpy(&value, &in[c], sizeof(value));
-            if (types && types[c] == WIRELOG_TYPE_FLOAT
-                && wl_columnar_float_bits_zero(value))
-                value = 0;
+            if (types && types[c] == WIRELOG_TYPE_FLOAT) {
+                if (!wl_columnar_float_bits_valid(value))
+                    return EINVAL;
+                if (wl_columnar_float_bits_zero(value))
+                    value = 0;
+            }
             memcpy(&columns[c][row + i], &value, sizeof(value));
         }
     }
