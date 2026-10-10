@@ -17123,6 +17123,7 @@ static uint64_t large_set_stages[128];
 static int large_set_stop_stage;
 static uint64_t large_set_stop_progress;
 static unsigned large_set_mode, large_set_stopped;
+static unsigned large_set_upper_passes;
 static wl_columnar_consolidate_record_t *large_set_fault_record;
 static wl_columnar_memory_reservation_t *large_set_fault_token;
 static const void *large_set_saved_identity;
@@ -17138,6 +17139,10 @@ large_set_checkpoint(wl_evaluation_control_t *c, int stage, uint64_t progress,
 {
     CHECK(stage >= 0 && stage < 128);
     large_set_stages[stage]++;
+    if (stage == 68) {
+        CHECK(progress >= 1u && progress <= 4u);
+        large_set_upper_passes |= 1u << (progress - 1u);
+    }
     if (c && r && r->memory_governor) {
         uint64_t current = string_reserved(r->memory_governor);
         if (current > large_set_high_water) large_set_high_water = current;
@@ -17240,6 +17245,7 @@ large_set_reset(unsigned mode)
 {
     memset(large_set_stages, 0, sizeof(large_set_stages));
     large_set_mode = mode; large_set_stopped = 0;
+    large_set_upper_passes = 0;
     large_set_fault_record = NULL; large_set_fault_token = NULL;
     large_set_generated = false; large_set_private = NULL;
     large_set_prior_nonce = 0; large_set_high_water = 0;
@@ -17261,6 +17267,14 @@ large_set_rows(col_rel_t *r, uint32_t unique, unsigned schema)
         for (uint32_t col = 0; col < r->ncols; col++) {
             /* Wide heap comparisons really traverse the common prefix. */
             int64_t cell = col + 1u == r->ncols ? value : 0;
+            if (!schema && r->nrows == 50000u && unique == 50000u
+                && col + 1u == r->ncols) {
+                uint64_t key = (uint64_t)value * UINT64_C(0x9e3779b97f4a7c15)
+                    ^ UINT64_C(0xd1b54a32d192ed03);
+                memcpy(&cell, &key, sizeof(cell));
+                if (!value) cell = INT64_MIN;
+                else if (value == 1u) cell = INT64_MAX;
+            }
             if (schema == 1 && col == 0) {
                 double v = row % 7u == 0 ? -0.0 : (double)value / 2.0;
                 memcpy(&cell, &v, sizeof(cell));
@@ -17548,6 +17562,7 @@ test_serial_large_set_attempts(void)
     large_set_direct(10001, 10001, 2, 0, 5, cost-1u);
     large_set_direct(49999, 49999, 1, 0, 0, 0);
     large_set_direct(50000, 50000, 1, 0, 9, 0);
+    CHECK(large_set_upper_passes == 15u);
     /* Enough rows for both actual hash growths without triggering heuristic. */
     large_set_direct(20001, 5001, 1, 0, 0, 0);
     CHECK(large_set_stages[86] && large_set_stages[87] && large_set_stages[89]
@@ -17590,6 +17605,642 @@ test_serial_large_set_attempts(void)
     large_set_generated_trial(101, true, false, true, 7, 0);
     fprintf(stderr,
         "serial large SET: original hash/growth/heapsort and same-attempt k16, genuine unsorted AUTO product/duplicate initial/dirty raw twins passed\n");
+}
+
+/* Genuine UNION plans and original segment workspace, no opcode retagging. */
+static uint64_t segmented_stages[128];
+static int segmented_stop_stage;
+static uint64_t segmented_stop_progress;
+static unsigned segmented_mode, segmented_stopped;
+static wl_col_session_t *segmented_session;
+static wl_columnar_source_access_reader_t segmented_reader;
+static eval_entry_t *segmented_refused_entry;
+static wl_columnar_eval_stack_cleanup_frame_t *segmented_refused_frame;
+static bool segmented_refusal_observed;
+static col_rel_t *segmented_refused_relation, *segmented_candidate;
+static wl_columnar_consolidate_record_t *segmented_fault_record;
+static wl_columnar_memory_reservation_t *segmented_fault_token;
+static const void *segmented_identity;
+static uint64_t segmented_sort_bytes, segmented_merge_bytes, segmented_peak;
+static uint64_t segmented_budget;
+static col_rel_t *segmented_pool_slot;
+static uint64_t segmented_pool_identity;
+static bool segmented_pool_reused, segmented_same_source;
+static void
+segmented_checkpoint(wl_evaluation_control_t *c, int stage, uint64_t progress,
+    wl_columnar_consolidate_record_t *record, col_rel_t *r)
+{
+    CHECK(stage >= 0 && stage < 128); segmented_stages[stage]++;
+    if (c && r && r->memory_governor) {
+        uint64_t bytes = string_reserved(r->memory_governor);
+        if (bytes > segmented_peak) segmented_peak = bytes;
+    }
+    if (stage == 104) {
+        CHECK(record && record->lane == WL_COLUMNAR_CONSOLIDATE_RADIX_MERGE
+            && record->starts &&
+            record->ends == record->starts + record->sequence.seg_count);
+        segmented_sort_bytes = record->sequence.workspace.admission.bytes;
+        segmented_merge_bytes = record->merge_admission.bytes;
+    }
+    if (stage == 113 && r && segmented_pool_slot == r) {
+        CHECK(r->pool_owned && r->relation_identity);
+        if (!segmented_pool_identity) segmented_pool_identity =
+                r->relation_identity;
+        else if (r->relation_identity !=
+            segmented_pool_identity) segmented_pool_reused = true;
+    }
+    if (segmented_stopped) return;
+    if (segmented_mode == 6u && stage == 121) {
+        CHECK(progress == 3u && r->nrows == 110u && r->ncols == 2u
+            && !record->merge_admission_active && !record->sequence.prepared);
+        segmented_budget = string_reserved(r->memory_governor)
+            + (4u * 4u + 3u) + 17u * 69u
+            + (8u * 3u + 8u * 2u * 110u + 8u + 12u * 3u);
+        atomic_store(&wl_columnar_memory_governor_ref_get(
+                r->memory_governor)->usable_bytes,
+            segmented_budget);
+        segmented_stopped++;
+    }
+    if (segmented_mode == 2 && stage == 115 && progress == 0u
+        && wl_columnar_eval_stack_cleanup_stack(
+            segmented_session->cleanup_active)->items[0].rel->pool_owned){
+        segmented_refused_frame = segmented_session->cleanup_active;
+        eval_stack_t *stack =
+            wl_columnar_eval_stack_cleanup_stack(segmented_refused_frame);
+        segmented_refused_entry = &stack->items[stack->top - 2u];
+        segmented_refused_relation = segmented_refused_entry->rel;
+        segmented_candidate = wl_columnar_eval_stack_cleanup_result(
+            segmented_session->cleanup_active)->rel;
+        CHECK(col_rel_source_reader_acquire(segmented_refused_relation,
+            &segmented_reader) == 0);
+        segmented_stopped++;
+    } else if ((segmented_mode == 3 || segmented_mode == 4) && stage == 32) {
+        CHECK(record && record->lane == WL_COLUMNAR_CONSOLIDATE_RADIX_MERGE);
+        segmented_fault_record = record;
+        segmented_fault_token = segmented_mode == 3 ? &record->merge_admission
+            : &record->sequence.workspace.admission;
+        CHECK(atomic_load(&segmented_fault_token->state)
+            == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+        segmented_identity = segmented_fault_token->identity;
+        segmented_fault_token->identity = NULL;
+        segmented_stopped++;
+        if (c) wl_evaluation_control_request_cancel(c);
+    } else if (segmented_mode == 1 && stage == segmented_stop_stage
+        && progress >= segmented_stop_progress) {
+        CHECK(c); segmented_stopped++; wl_evaluation_control_request_cancel(c);
+    }
+}
+static void
+segmented_copy_checkpoint(wl_evaluation_control_t *c, uint64_t work)
+{
+    if (segmented_mode != 7u || segmented_stopped || work != 41u) return;
+    wl_columnar_relation_bulk_append_t *record =
+        wl_columnar_eval_stack_cleanup_bulk_append(
+        segmented_session->cleanup_active);
+    if (!record || !record->active || !record->dst || record->count != 41u
+        || strcmp(record->dst->name,
+        "$concat") || record->base || record->published) return;
+    col_rel_t *src =
+        wl_columnar_eval_stack_cleanup_stack(
+        segmented_session->cleanup_active)->items[0].rel;
+    int64_t **columns =
+        record->growth ? record->prepared_columns : record->dst->columns;
+    bool copied = columns && columns[0]
+        && !memcmp(columns[0], src->columns[0], 41u * sizeof(int64_t));
+    if (!copied || record->dst->nrows || !record->sources.owners[0].held)
+        fprintf(stderr,
+            "segmented copy copied=%u nrows=%u held=%u committed=%u\n",
+            copied, record->dst->nrows, record->sources.owners[0].held,
+            record->sources.committed);
+    CHECK(copied && !record->dst->nrows && record->sources.owner_count == 1u
+        && record->sources.owners[0].held && !record->sources.committed);
+    segmented_stopped++; wl_evaluation_control_request_cancel(c);
+}
+static void
+segmented_reset(unsigned mode)
+{
+    memset(segmented_stages, 0, sizeof(segmented_stages));
+    segmented_mode = mode; segmented_stopped = 0; segmented_peak = 0;
+    segmented_sort_bytes = 0; segmented_merge_bytes = 0;
+    segmented_fault_token = NULL; segmented_fault_record = NULL;
+    segmented_refused_entry = NULL; segmented_refused_relation = NULL;
+    segmented_candidate = NULL; segmented_refused_frame = NULL;
+    segmented_refusal_observed = false;
+    CHECK(!segmented_reader.owner);
+}
+static void
+segmented_after_plan(wl_col_session_t *s, eval_stack_t *stack,
+    eval_entry_t *result)
+{
+    CHECK(s == segmented_session && segmented_mode == 2u && segmented_stopped
+        && stack->top == 2u &&
+        segmented_refused_entry->rel == segmented_refused_relation
+        && segmented_refused_entry->owned &&
+        result->rel == segmented_candidate && result->owned);
+    segmented_refusal_observed = true;
+}
+static uint64_t
+segmented_generated_trial(unsigned branches, bool repeat, bool snapshot,
+    bool empty, unsigned mode, uint64_t limit)
+{
+    const char *text = branches == 2u
+        ?
+        ".decl A(x:int64)\n.decl B(x:int64)\n.decl H(x:int64)\nH(x):-A(x).\nH(x):-B(x).\n"
+        :
+        ".decl A(x:int64)\n.decl B(x:int64)\n.decl C(x:int64)\n.decl H(x:int64)\nH(x):-A(x).\nH(x):-B(x).\nH(x):-C(x).\n";
+    if (segmented_same_source) text =
+            ".decl A(x:int64)\n.decl B(x:int64)\n.decl H(x:int64)\nH(x):-A(x).\nH(x):-A(x),x>=0.\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(text, &error);
+    CHECK(program && error == WIRELOG_OK);
+    wl_plan_t *plan = NULL; CHECK(wl_plan_from_program(program, &plan) == 0);
+    CHECK(plan->stratum_count == 1u && !plan->strata[0].is_recursive);
+    const wl_plan_relation_t *rp = &plan->strata[0].relations[0];
+    CHECK(rp->op_count ==
+        (segmented_same_source ? 7u : branches == 2u ? 6u : 9u)
+        && rp->ops[rp->op_count - 1u].op == WL_PLAN_OP_CONSOLIDATE);
+    unsigned concats = 0, variables = 0;
+    for (uint32_t i = 0; i < rp->op_count; i++) {
+        if (rp->ops[i].op == WL_PLAN_OP_CONCAT) concats++;
+        if (rp->ops[i].op == WL_PLAN_OP_VARIABLE) {
+            CHECK(rp->ops[i].delta_mode == WL_DELTA_AUTO); variables++;
+        }
+    }
+    CHECK(concats == branches - 1u && variables == branches);
+    wl_col_session_t *s = joined_create(plan), *raw = joined_create(plan);
+    wl_evaluation_control_t *c = serial_attach(s, 0);
+    const char *names[] = {"A", "B", "C"};
+    for (unsigned b = 0; b < branches; b++) {
+        uint32_t count = empty && b == 0u ? 0u : 41u + b * 5u;
+        int64_t data[64];
+        for (uint32_t i = 0; i < count; i++) data[i] = count - i + b * 3u;
+        CHECK(wl_backend_columnar()->session_insert(&s->base, names[b], data,
+            count, 1) == 0
+            && wl_backend_columnar()->session_insert(&raw->base, names[b], data,
+            count, 1) == 0);
+    }
+    segmented_pool_slot = (col_rel_t *)s->delta_pool->slab;
+    segmented_pool_identity = 0; segmented_pool_reused = false;
+    uint32_t retired_slots = 0;
+    unsigned char *retired_image = NULL;
+    uint64_t retired_credit = 0;
+    if (repeat) {
+        segmented_reset(0); segmented_session = s;
+        wl_columnar_consolidate_test_checkpoint = segmented_checkpoint;
+        CHECK(wl_backend_columnar()->session_step(&s->base) == 0);
+        wl_columnar_consolidate_test_checkpoint = NULL;
+        CHECK(wl_backend_columnar()->session_step(&raw->base) == 0);
+        retired_slots = s->delta_pool->slot_used;
+        CHECK(retired_slots == branches - 1u && segmented_pool_identity
+            && !segmented_pool_slot->relation_identity);
+        retired_image = malloc(retired_slots * s->delta_pool->slot_size);
+        CHECK(retired_image);
+        memcpy(retired_image, s->delta_pool->slab,
+            retired_slots * s->delta_pool->slot_size);
+        int64_t extra[] = {91, -7};
+        CHECK(wl_backend_columnar()->session_insert(&s->base, "A", extra, 2,
+            1) == 0
+            && wl_backend_columnar()->session_insert(&raw->base, "A", extra, 2,
+            1) == 0);
+    }
+    CHECK(wl_evaluation_control_reset(c) == 0 &&
+        wl_evaluation_control_configure(c, limit) == 0);
+    segmented_reset(mode); segmented_session = s;
+    if (mode ==
+        2u) wl_columnar_eval_serial_test_after_plan = segmented_after_plan;
+    wl_columnar_consolidate_test_checkpoint = segmented_checkpoint;
+    if (mode ==
+        7u) wl_columnar_relation_test_work_checkpoint =
+            segmented_copy_checkpoint;
+    serial_capture_t got = {.width = 1}, ref = got;
+    int expected = (mode == 1u || mode == 7u) ? WL_EVALUATION_CONTROL_CANCELLED
+        : mode >= 2u &&
+        mode <= 4u ? EBUSY : mode == 5u ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0;
+    if (mode == 3u || mode == 4u) expected = EINVAL;
+    retired_credit = string_reserved(s->memory_governor);
+    int rc = snapshot ? wl_backend_columnar()->session_snapshot(&s->base,
+            joined_capture, &got)
+        : wl_backend_columnar()->session_step(&s->base);
+    wl_columnar_consolidate_test_checkpoint = NULL;
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    wl_columnar_relation_test_work_checkpoint = NULL;
+    if (rc != expected) fprintf(stderr,
+            "segmented generated branches=%u repeat=%u empty=%u mode=%u rc=%d expected=%d pool_used=%u concat=%llu aggregate=%llu entry=%llu sources=%llu\n",
+            branches, repeat, empty, mode, rc, expected,
+            s->delta_pool->slot_used,
+            (unsigned long long)segmented_stages[113],
+            (unsigned long long)segmented_stages[104],
+            (unsigned long long)segmented_stages[117],
+            (unsigned long long)segmented_stages[118]);
+    CHECK(rc == expected);
+    if (repeat && mode == 1u &&
+        (segmented_stop_stage == 122 || segmented_stop_stage == 123)){
+        CHECK(s->delta_pool->slot_used == retired_slots
+            && !memcmp(retired_image, s->delta_pool->slab,
+            retired_slots * s->delta_pool->slot_size)
+            && string_reserved(s->memory_governor) == retired_credit);
+    }
+
+    wl_evaluation_control_report_t report;
+    CHECK(wl_evaluation_control_report(c,
+        &report) == 0 && report.result == expected);
+    uint64_t consumed = report.consumed;
+    if (mode) {
+        CHECK(!got.count);
+        if (mode == 2u) {
+            CHECK(segmented_stopped && segmented_refusal_observed &&
+                s->cleanup_pending
+                && segmented_refused_entry->rel == segmented_refused_relation
+                && segmented_refused_entry->owned
+                && !wl_columnar_eval_stack_cleanup_result(
+                    segmented_refused_frame)->rel);
+            uint32_t held_slots = s->delta_pool->slot_used;
+            uint64_t held_credit = string_reserved(s->memory_governor);
+            CHECK(segmented_refused_relation->pool_owned
+                && wl_evaluation_control_reset(c) == 0 &&
+                wl_evaluation_control_configure(c, 0) == 0);
+            CHECK(wl_backend_columnar()->session_snapshot(&s->base,
+                joined_capture, &got) == EBUSY
+                && !got.count && s->cleanup_pending
+                && s->delta_pool->slot_used == held_slots
+                && string_reserved(s->memory_governor) == held_credit);
+            CHECK(col_rel_source_reader_release(&segmented_reader) == 0);
+        } else if (mode == 3u || mode == 4u) {
+            CHECK(s->cleanup_pending && segmented_fault_record
+                && !segmented_fault_record->starts &&
+                !segmented_fault_record->ends
+                && !segmented_fault_record->sequence.workspace.perm_a
+                && !segmented_fault_record->sequence.workspace.bucket_values
+                && !segmented_fault_token->identity
+                && atomic_load(&segmented_fault_token->state) ==
+                WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+            segmented_fault_token->identity = segmented_identity;
+        }
+        CHECK(wl_evaluation_control_reset(c) == 0 &&
+            wl_evaluation_control_configure(c, 0) == 0);
+        segmented_mode = 0;
+        wl_columnar_consolidate_test_checkpoint = segmented_checkpoint;
+        CHECK(wl_backend_columnar()->session_snapshot(&s->base, joined_capture,
+            &got) == 0);
+        wl_columnar_consolidate_test_checkpoint = NULL;
+    } else if (!snapshot) CHECK(wl_backend_columnar()->session_snapshot(
+                &s->base, joined_capture, &got) == 0);
+    CHECK(wl_backend_columnar()->session_snapshot(&raw->base, joined_capture,
+        &ref) == 0);
+    CHECK(got.count == ref.count && got.digest == ref.digest);
+    CHECK(segmented_stages[113] && segmented_stages[114] &&
+        segmented_stages[116]
+        && segmented_stages[104] && segmented_stages[102]
+        && segmented_stages[112] &&
+        (branches == 2u ? segmented_stages[109] : segmented_stages[108]));
+    CHECK(!s->serial_completion.frame && !s->cleanup_reserved_bytes
+        && !s->cleanup_pending && !s->cleanup_active);
+    for (unsigned b = 0; b < branches; b++)
+        source_unpinned(session_find_rel(s, names[b]),
+            session_find_rel(s, names[b]));
+    if (repeat) CHECK(segmented_pool_reused &&
+            segmented_stages[122] >= retired_slots
+            && segmented_stages[123]);
+    free(retired_image); segmented_pool_slot = NULL;
+    serial_destroy(s); serial_destroy(raw); wl_plan_free(plan);
+    wirelog_program_free(program);
+    return consumed;
+}
+static void
+segmented_direct(bool prefix, unsigned schema, bool large, bool budget)
+{
+    wl_col_session_t *s = join_session(), *raw = join_session();
+    uint32_t rows = large ? 12003u : 110u, width = 2u;
+    col_rel_t *source = relation(width, rows, rows, false, s->memory_governor);
+    col_rel_t *reference = relation(width, rows, rows, false,
+            raw->memory_governor);
+    large_set_rows(source, large ? rows : 27u, schema);
+    large_set_rows(reference, large ? rows : 27u, schema);
+    wl_intern_t *symbols = NULL, *raw_symbols = NULL;
+    if (schema == 2u) {
+        symbols = wl_intern_create(); raw_symbols = wl_intern_create();
+        CHECK(symbols && raw_symbols);
+        for (uint32_t i = 0; i < 28u; i++) {
+            char name[24]; snprintf(name, sizeof(name), "seg-symbol-%u", i);
+            CHECK(wl_intern_put(symbols,
+                name) == i && wl_intern_put(raw_symbols, name) == i);
+        }
+        s->intern = symbols; raw->intern = raw_symbols;
+    }
+    if (prefix) {
+        for (uint32_t row = 0; row < 90u; row++) {
+            source->columns[0][row] = reference->columns[0][row] = 0;
+            source->columns[1][row] = reference->columns[1][row] = row;
+        }
+        for (uint32_t row = 90u; row < rows; row++) {
+            source->columns[0][row] = reference->columns[0][row] = 0;
+            source->columns[1][row] = reference->columns[1][row] = rows - row;
+        }
+        source->sorted_nrows = reference->sorted_nrows = 90u;
+    } else {
+        CHECK(session_add_rel(s, source) == 0 && session_add_rel(raw,
+            reference) == 0);
+    }
+    uint64_t baseline = string_reserved(s->memory_governor);
+    uint64_t fingerprint = consolidate_source_hash(source);
+    wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(s),
+        *rf = filter_frame(raw);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame),
+        *rs = wl_columnar_eval_stack_cleanup_stack(rf);
+    CHECK(eval_stack_push(stack, source, prefix) == 0 && eval_stack_push(rs,
+        reference, prefix) == 0);
+    if (!prefix) {
+        for (unsigned twin = 0; twin < 2u; twin++) {
+            eval_entry_t *entry = &(twin ? rs : stack)->items[0];
+            entry->seg_count = 3;
+            entry->seg_boundaries = malloc(4u * sizeof(uint32_t));
+            CHECK(entry->seg_boundaries);
+            entry->seg_boundaries[0] = 0;
+            entry->seg_boundaries[1] = large ? 6000u : 41u;
+            entry->seg_boundaries[2] = entry->seg_boundaries[1];
+            entry->seg_boundaries[3] = rows;
+        }
+    }
+    wl_evaluation_control_t *c = control(0);
+    segmented_reset(0); segmented_session = s;
+    if (prefix) {
+        wl_columnar_relation_private_batch_t *writer =
+            wl_columnar_eval_stack_cleanup_reduce_batch(frame);
+        CHECK(writer &&
+            wl_columnar_relation_private_append_batch_begin_controlled(writer,
+            source, c) == 0
+            && wl_columnar_relation_private_append_batch_end_controlled(
+                writer) == 0);
+    }
+    uint64_t original_budget =
+        atomic_load(&wl_columnar_memory_governor_ref_get(
+                s->memory_governor)->usable_bytes);
+    uint64_t raw_budget =
+        atomic_load(&wl_columnar_memory_governor_ref_get(
+                raw->memory_governor)->usable_bytes);
+    /* Budget mode is admitted by the real pre-sequence checkpoint below. */
+    segmented_mode = budget ? 6u : 0u;
+    wl_columnar_consolidate_test_checkpoint = segmented_checkpoint;
+    s->base.evaluation_control = c;
+    int rc = col_op_consolidate(stack, s);
+    s->base.evaluation_control = NULL;
+    wl_columnar_consolidate_test_checkpoint = NULL;
+    if (rc) fprintf(stderr,
+            "segmented direct prefix=%u schema=%u large=%u budget=%u rc=%d\n",
+            prefix, schema, large, budget, rc);
+    CHECK(rc == 0); finish(c, 0);
+    if (budget) CHECK(segmented_stopped == 1u &&
+            segmented_peak == segmented_budget
+            && segmented_budget <
+            segmented_peak + 17u * rows - segmented_sort_bytes);
+    if (budget) atomic_store(&wl_columnar_memory_governor_ref_get(
+                raw->memory_governor)->usable_bytes,
+            atomic_load(&wl_columnar_memory_governor_ref_get(
+                s->memory_governor)->usable_bytes));
+    CHECK(col_op_consolidate(rs, raw) == 0);
+    col_rel_t *out = join_output(frame), *ref = join_output(rf);
+    CHECK(out->nrows == ref->nrows && out->ncols == ref->ncols);
+    for (uint32_t col = 0; col < width; col++)
+        for (uint32_t row = 0; row < out->nrows;
+            row++) CHECK(out->columns[col][row] == ref->columns[col][row]);
+    if (large) CHECK(segmented_stages[81] && segmented_stages[85] &&
+            segmented_stages[108]);
+    if (prefix) CHECK(segmented_sort_bytes == 8u * 2u * 21u
+            && segmented_merge_bytes == 8u * 2u + 8u * width * rows + 8u);
+    else if (!schema ||
+        schema ==
+        2u) CHECK(segmented_sort_bytes == 17u * (large ? 6003u : 69u));
+    else CHECK(segmented_sort_bytes == 8u * width * 70u);
+    if (!prefix) CHECK(consolidate_source_hash(source) == fingerprint);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0
+        && wl_columnar_eval_stack_cleanup_finish(&rf) == 0);
+    if (!prefix) CHECK(string_reserved(s->memory_governor) == baseline);
+    atomic_store(&wl_columnar_memory_governor_ref_get(
+            s->memory_governor)->usable_bytes, original_budget);
+    atomic_store(&wl_columnar_memory_governor_ref_get(
+            raw->memory_governor)->usable_bytes, raw_budget);
+    release(c); join_session_destroy(s); join_session_destroy(raw);
+    wl_intern_free(symbols); wl_intern_free(raw_symbols);
+}
+
+static void
+segmented_null_boundaries(void)
+{
+    wl_col_session_t *s = join_session(), *raw = join_session();
+    col_rel_t *source = relation(2, 7, 7, false, s->memory_governor),
+        *reference = relation(2, 7, 7, false, raw->memory_governor);
+    CHECK(session_add_rel(s, source) == 0 && session_add_rel(raw,
+        reference) == 0);
+    uint64_t baseline = string_reserved(s->memory_governor),
+        fingerprint = consolidate_source_hash(source);
+    wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(s),
+        *rf = filter_frame(raw);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame),
+        *rs = wl_columnar_eval_stack_cleanup_stack(rf);
+    CHECK(eval_stack_push(stack, source, false) == 0 && eval_stack_push(stack,
+        source, false) == 0);
+    stack->items[0].seg_count = 2; /* Deliberately malformed, no raw equivalence claim. */
+    wl_evaluation_control_t *c = control(0);
+    CHECK(wl_columnar_merge_concat_controlled(stack, s, c) == EINVAL
+        && stack->top == 2u &&
+        !wl_columnar_eval_stack_cleanup_result(frame)->rel);
+    finish(c, EINVAL); release(c);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+    frame = filter_frame(s);
+    stack = wl_columnar_eval_stack_cleanup_stack(frame);
+    CHECK(eval_stack_push(stack, source, false) == 0 && eval_stack_push(stack,
+        source, false) == 0);
+    stack->items[0].seg_count = 1; c = control(0);
+    segmented_reset(0); segmented_session = s;
+    wl_columnar_consolidate_test_checkpoint = segmented_checkpoint;
+    int concat_rc = wl_columnar_merge_concat_controlled(stack, s, c);
+    wl_columnar_consolidate_test_checkpoint = NULL;
+    if (concat_rc) fprintf(stderr,
+            "segmented NULL count1 concat rc=%d entry=%llu sources=%llu boundary=%llu disposed=%llu\n",
+            concat_rc, (unsigned long long)segmented_stages[117],
+            (unsigned long long)segmented_stages[118],
+            (unsigned long long)segmented_stages[113],
+            (unsigned long long)segmented_stages[116]);
+    CHECK(concat_rc == 0);
+    finish(c, 0); release(c);
+    CHECK(eval_stack_push(rs, reference, false) == 0 && eval_stack_push(rs,
+        reference, false) == 0);
+    rs->items[0].seg_count = 1;
+    CHECK(col_op_concat(rs, raw) == 0);
+    col_rel_t *out = stack->items[0].rel, *ref = rs->items[0].rel;
+    CHECK(out->nrows == ref->nrows && out->ncols == ref->ncols
+        && stack->items[0].seg_count == 2u);
+    for (uint32_t col = 0; col < out->ncols; col++)
+        for (uint32_t row = 0; row < out->nrows;
+            row++) CHECK(out->columns[col][row] == ref->columns[col][row]);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0
+        && wl_columnar_eval_stack_cleanup_finish(&rf) == 0
+        && consolidate_source_hash(source) == fingerprint
+        && string_reserved(s->memory_governor) == baseline);
+    join_session_destroy(s); join_session_destroy(raw);
+}
+
+static void
+segmented_wide_generated(void)
+{
+    char text[32768]; size_t offset = 0;
+    const char *names[] = {"A", "B", "H"};
+    for (unsigned i = 0; i < 3u; i++) {
+        offset += snprintf(text + offset, sizeof(text) - offset, ".decl %s(",
+                names[i]);
+        for (unsigned col = 0; col < 300u; col++)
+            offset += snprintf(text + offset, sizeof(text) - offset,
+                    "%sx%u:int64", col ? "," : "", col);
+        offset += snprintf(text + offset, sizeof(text) - offset, ")\n");
+    }
+    for (unsigned i = 0; i < 2u; i++) {
+        offset += snprintf(text + offset, sizeof(text) - offset, "H(");
+        for (unsigned col = 0; col < 300u; col++)
+            offset += snprintf(text + offset, sizeof(text) - offset, "%sx%u",
+                    col ? "," : "", col);
+        offset += snprintf(text + offset, sizeof(text) - offset, "):-%s(",
+                names[i]);
+        for (unsigned col = 0; col < 300u; col++)
+            offset += snprintf(text + offset, sizeof(text) - offset, "%sx%u",
+                    col ? "," : "", col);
+        offset += snprintf(text + offset, sizeof(text) - offset, ").\n");
+    }
+    CHECK(offset < sizeof(text));
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(text, &error);
+    CHECK(program && error == WIRELOG_OK);
+    wl_plan_t *plan = NULL; CHECK(wl_plan_from_program(program, &plan) == 0);
+    const wl_plan_relation_t *rp = &plan->strata[0].relations[0];
+    CHECK(!plan->strata[0].is_recursive && rp->op_count == 6u
+        && rp->ops[0].delta_mode == WL_DELTA_AUTO
+        && rp->ops[4].op == WL_PLAN_OP_CONCAT);
+    wl_col_session_t *s = joined_create(plan), *raw = joined_create(plan);
+    wl_evaluation_control_t *c = serial_attach(s, 0);
+    int64_t data[600]; for (unsigned i = 0; i < 600u; i++) data[i] = i % 300u;
+    for (unsigned i = 0; i < 2u; i++) {
+        CHECK(wl_backend_columnar()->session_insert(&s->base, names[i], data, 2,
+            300) == 0
+            && wl_backend_columnar()->session_insert(&raw->base, names[i], data,
+            2, 300) == 0);
+    }
+    for (unsigned attempt = 0; attempt < 2u; attempt++) {
+        if (attempt) {
+            data[0] = -1;
+            CHECK(wl_backend_columnar()->session_insert(&s->base, "A", data, 1,
+                300) == 0
+                && wl_backend_columnar()->session_insert(&raw->base, "A", data,
+                1, 300) == 0);
+        }
+        CHECK(wl_evaluation_control_reset(c) == 0);
+        serial_capture_t got = {.width = 300}, ref = got;
+        CHECK(wl_backend_columnar()->session_snapshot(&s->base, joined_capture,
+            &got) == 0
+            && wl_backend_columnar()->session_snapshot(&raw->base,
+            joined_capture, &ref) == 0
+            && got.count == ref.count && got.digest == ref.digest);
+        CHECK(!s->serial_completion.frame && !s->cleanup_pending &&
+            !s->cleanup_reserved_bytes);
+    }
+    serial_destroy(s); serial_destroy(raw); wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
+static void
+segmented_pool_validation(void)
+{
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(
+        ".decl A(x:int64)\n.decl B(x:int64)\n.decl H(x:int64)\nH(x):-A(x).\nH(x):-B(x).\n",
+        &error);
+    CHECK(program && error == WIRELOG_OK);
+    wl_plan_t *plan = NULL; CHECK(wl_plan_from_program(program, &plan) == 0);
+    wl_col_session_t *s = joined_create(plan);
+    col_rel_t *like = session_find_rel(s, "A"), *slots[2];
+    for (unsigned i = 0; i < 2u; i++) {
+        slots[i] = wl_columnar_relation_pool_new_like_governed(s->delta_pool,
+                "$pool-validation", like, s->memory_governor);
+        CHECK(slots[i]);
+    }
+    wl_evaluation_control_t *c = control(0);
+    uint64_t baseline = string_reserved(s->memory_governor);
+    CHECK(wl_columnar_relation_pool_reuse_controlled(s, c) == ENOTSUP
+        && s->delta_pool->slot_used == 2u &&
+        string_reserved(s->memory_governor) == baseline);
+    for (unsigned i = 0; i < 2u;
+        i++) CHECK(col_rel_destroy_checked(slots[i]) == 0);
+    baseline = string_reserved(s->memory_governor);
+    /* Validation faults alter no ownership; restore only the saved scalar. */
+    const void *identity = slots[0]->retained_reservation.identity;
+    slots[0]->retained_reservation.identity = NULL;
+    CHECK(wl_columnar_relation_pool_reuse_controlled(s,
+        c) == ENOTSUP && s->delta_pool->slot_used == 2u);
+    slots[0]->retained_reservation.identity = identity;
+    s->delta_pool->arena_used = 1;
+    CHECK(wl_columnar_relation_pool_reuse_controlled(s,
+        c) == ENOTSUP && s->delta_pool->slot_used == 2u);
+    s->delta_pool->arena_used = 0;
+    col_rel_t *registered = s->rels[0]; s->rels[0] = slots[0];
+    CHECK(wl_columnar_relation_pool_reuse_controlled(s,
+        c) == ENOTSUP && s->delta_pool->slot_used == 2u);
+    s->rels[0] = registered;
+    slots[0]->deferred_relation_session = s;
+    CHECK(wl_columnar_relation_pool_reuse_controlled(s,
+        c) == ENOTSUP && s->delta_pool->slot_used == 2u);
+    slots[0]->deferred_relation_session = NULL;
+    CHECK(wl_columnar_relation_pool_reuse_controlled(s, c) == 0
+        && !s->delta_pool->slot_used &&
+        string_reserved(s->memory_governor) == baseline);
+    finish(c, 0); release(c); serial_destroy(s); wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
+static void
+test_serial_segmented_attempts(void)
+{
+    segmented_null_boundaries();
+    segmented_pool_validation();
+    segmented_wide_generated();
+    segmented_same_source = true;
+    segmented_generated_trial(2, false, true, false, 0, 0);
+    segmented_same_source = false;
+    segmented_generated_trial(2, false, true, false, 7, 0);
+    CHECK(segmented_stopped);
+
+    segmented_direct(true, 0, false, false);
+    segmented_direct(false, 0, false, true);
+    segmented_direct(false, 1, false, false);
+    segmented_direct(false, 2, false, false);
+    segmented_direct(false, 0, true, false);
+    uint64_t cost = segmented_generated_trial(2, false, true, false, 0, 0);
+    CHECK(segmented_generated_trial(2, false, true, false, 0, cost) == cost);
+    segmented_generated_trial(2, false, true, false, 5, cost - 1u);
+    segmented_generated_trial(3, false, false, false, 0, 0);
+    segmented_generated_trial(2, true, false, true, 0, 0);
+    segmented_generated_trial(3, true, true, false, 0, 0);
+    uint64_t dirty_cost = segmented_generated_trial(3, true, true, false, 0, 0);
+    CHECK(segmented_generated_trial(3, true, true, false, 0,
+        dirty_cost) == dirty_cost);
+    segmented_generated_trial(3, true, true, false, 5, dirty_cost - 1u);
+    for (int stage = 122; stage <= 123; stage++) {
+        segmented_stop_stage = stage;
+        segmented_stop_progress = stage == 122 ? 2u : 0u;
+        segmented_generated_trial(3, true, true, false, 1, 0);
+        CHECK(segmented_stopped);
+    }
+
+    int stops[] = {113, 114, 115, 116, 100, 101, 102, 103, 106, 107, 108, 110,
+                   111, 112};
+    for (unsigned i = 0; i < sizeof(stops)/sizeof(stops[0]); i++) {
+        segmented_stop_stage = stops[i]; segmented_stop_progress = 1;
+        if (stops[i] == 115) segmented_stop_progress = 0;
+        segmented_generated_trial(3, false, true, false, 1, 0);
+        CHECK(segmented_stopped);
+    }
+    segmented_generated_trial(3, false, true, false, 2, 0);
+    segmented_generated_trial(3, false, true, false, 3, 0);
+    segmented_generated_trial(3, false, true, false, 4, 0);
+    fprintf(stderr,
+        "serial segmented: genuine AUTO UNION initial/dirty raw twins and original segment/aggregate lifecycle passed\n");
 }
 
 int
@@ -17817,6 +18468,7 @@ main(void)
     test_serial_compact_and_registry_hole();
     test_serial_joined_attempts();
     test_serial_large_set_attempts();
+    test_serial_segmented_attempts();
     puts("evaluation_work: OK");
     return 0;
 }

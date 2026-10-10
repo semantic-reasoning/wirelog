@@ -16509,7 +16509,8 @@ wl_columnar_relation_consolidate_retire(
         record->phase = WL_COLUMNAR_CONSOLIDATE_RETIRED;
         return primary;
     }
-    if (record->lane != WL_COLUMNAR_CONSOLIDATE_RADIX)
+    if (record->lane != WL_COLUMNAR_CONSOLIDATE_RADIX
+        && record->lane != WL_COLUMNAR_CONSOLIDATE_RADIX_MERGE)
         return primary > 0 ? primary : EINVAL;
     record->phase = WL_COLUMNAR_CONSOLIDATE_RETIRING;
     wl_columnar_relation_radix_sequence_t *seq = &record->sequence;
@@ -16524,7 +16525,9 @@ wl_columnar_relation_consolidate_retire(
     free(w->count16); w->count16 = NULL;
     free(w->insertion_rows); w->insertion_rows = NULL;
     free(record->starts); record->starts = NULL;
-    free(record->ends); record->ends = NULL;
+    if (record->lane != WL_COLUMNAR_CONSOLIDATE_RADIX_MERGE)
+        free(record->ends);
+    record->ends = NULL;
     wl_columnar_memory_reservation_t *tokens[3] = {
         &seq->metadata_admission, &w->admission, &record->merge_admission
     };
@@ -16569,6 +16572,122 @@ wl_columnar_relation_consolidate_step(wl_evaluation_control_t *c,
     wl_columnar_relation_consolidate_checkpoint(c, stage, progress, NULL, r);
     return wl_evaluation_control_charge(c, 0);
 }
+/* Only a quiescent new attempt may reuse successful checked-destroy slots.
+ * This validates descriptor headers, never destroys payload or returns credit. */
+int
+wl_columnar_relation_pool_reuse_controlled(wl_col_session_t *sess,
+    wl_evaluation_control_t *c)
+{
+    delta_pool_t *pool = sess->delta_pool;
+    int rc = wl_evaluation_control_charge(c, 64);
+    if (rc) return rc;
+    if (!pool || !c) return EINVAL;
+    if (sess->cleanup_pending || sess->cleanup_active
+        || sess->cleanup_pending_count || sess->cleanup_active_count
+        || sess->cleanup_reserved_bytes || sess->serial_completion.frame
+        || sess->serial_completion.mode_frame || sess->serial_completion.pending
+        || sess->serial_completion.active || sess->source_leases
+        || sess->coordinator || sess->deferred_relations
+        || sess->deferred_relation_count || pool->arena_used) return ENOTSUP;
+    char *slab = pool->slab;
+    size_t stride = pool->slot_size;
+    uint32_t used = pool->slot_used, cap = pool->slot_cap;
+#ifdef _MSC_VER
+    const size_t alignment = __alignof(col_rel_t);
+#else
+    const size_t alignment = _Alignof(col_rel_t);
+#endif
+    if (used > cap || stride < sizeof(col_rel_t) || !slab
+        || (uintptr_t)slab % alignment
+        || stride % alignment) return EINVAL;
+    if (cap && stride > SIZE_MAX / cap) return EOVERFLOW;
+    size_t bytes = stride * cap, live_bytes = stride * used;
+    uintptr_t first = (uintptr_t)slab;
+    if (bytes > UINTPTR_MAX - first) return EOVERFLOW;
+    rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
+    if (sess->nrels && !sess->rels) return EINVAL;
+    for (uint32_t i = 0; i < sess->nrels; i++) {
+        rc = wl_evaluation_control_charge(c, 16); if (rc) return rc;
+        uintptr_t address = (uintptr_t)sess->rels[i];
+        if (address >= first && address - first < live_bytes) return ENOTSUP;
+        rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
+    }
+    for (uint32_t i = 0; i < used; i++) {
+        col_rel_t *r = (col_rel_t *)(slab + stride * i);
+        rc = wl_evaluation_control_charge(c, 96); if (rc) return rc;
+        if (!r->pool_owned || r->relation_identity
+            || r->view_generation != WL_COLUMNAR_REL_GENERATION_INVALID
+            || r->storage_generation != WL_COLUMNAR_REL_GENERATION_INVALID
+            || r->storage_owner || r->storage_owner_identity
+            || r->storage_owner_generation || r->deferred_relation_next
+            || r->deferred_relation_session
+            || atomic_load_explicit(&r->storage_alias_borrows,
+            memory_order_acquire)
+            || atomic_load_explicit(&r->source_access.state,
+            memory_order_acquire)
+            != WL_COLUMNAR_SOURCE_ACCESS_WRITER
+            || atomic_load_explicit(&r->descriptor_access.state,
+            memory_order_acquire)
+            != WL_COLUMNAR_SOURCE_ACCESS_WRITER) return ENOTSUP;
+        rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
+        rc = wl_evaluation_control_charge(c, 128); if (rc) return rc;
+        if (r->name || r->ncols || r->columns || r->column_types || r->nrows
+            || r->capacity || r->col_names || r->schema_ok || r->sorted_nrows
+            || r->merge_columns || r->merge_buf_cap || r->base_nrows
+            || r->timestamps || r->timestamp_capacity || r->arena_owned
+            || r->mem_ledger || r->memory_governor || r->row_scratch
+            || r->schema.format || r->schema.name || r->schema.metadata
+            || r->schema.flags || r->schema.n_children || r->schema.children
+            || r->schema.dictionary || r->schema.release ||
+            r->schema.private_data
+            || r->descriptor_reserved_bytes || r->metadata_reserved_bytes
+            || r->pool_name_reserved_bytes || r->dedup_reserved_bytes
+            || r->retained_reserved_bytes || r->memory_budget_denial_pending
+            || r->ledger_ts_bytes) return ENOTSUP;
+        rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
+        rc = wl_evaluation_control_charge(c, 96); if (rc) return rc;
+        if (r->retract_backup_columns || r->retract_backup_timestamps
+            || r->retract_backup_timestamp_capacity || r->retract_backup_nrows
+            || r->retract_backup_base_nrows || r->retract_backup_capacity
+            || r->retract_backup_sorted_nrows || r->col_shared || r->run_count
+            || r->retract_backup_run_count || r->dedup_slots || r->dedup_cap
+            || r->dedup_count || r->has_graph_column || r->graph_col_idx
+            || r->compound_kind || r->compound_count || r->compound_arity_map
+            || r->compound_arity_len || r->inline_physical_offset
+            || r->declared_ncols) return ENOTSUP;
+        for (uint32_t j = 0; j < COL_MAX_RUNS; j++) {
+            if (r->run_ends[j] || r->retract_backup_run_ends[j]) return ENOTSUP;
+        }
+
+        rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
+        const wl_columnar_memory_reservation_t *tokens[5] = {
+            &r->descriptor_reservation, &r->metadata_reservation,
+            &r->pool_name_reservation, &r->dedup_reservation,
+            &r->retained_reservation
+        };
+        for (uint32_t j = 0; j < 5u; j++) {
+            rc = wl_evaluation_control_charge(c, 32); if (rc) return rc;
+            const wl_columnar_memory_reservation_t *t = tokens[j];
+            if (t->governor || t->bytes || t->replacement_bytes
+                || t->transition_kind || t->identity != (j == 4u ? t : NULL)
+                || atomic_load_explicit(&t->owner_bits, memory_order_acquire)
+                || atomic_load_explicit(&t->state, memory_order_acquire)
+                != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY) return ENOTSUP;
+            rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
+        }
+        rc = wl_columnar_relation_consolidate_step(c, 122, i + 1u, r);
+        if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(c, 32); if (rc) return rc;
+    if (pool != sess->delta_pool || pool->slab != slab
+        || pool->slot_size != stride || pool->slot_cap != cap
+        || pool->slot_used != used || pool->arena_used) return EINVAL;
+    rc = wl_columnar_relation_consolidate_step(c, 123, used, NULL);
+    if (rc) return rc;
+    pool->slot_used = 0;
+    return 0;
+}
+
 int
 wl_columnar_relation_consolidate_allocate_controlled(void **pointer,
     size_t bytes,
@@ -16695,6 +16814,7 @@ wl_columnar_relation_consolidate_sorted(col_rel_t *r, uint32_t start,
     uint32_t count, bool *sorted, wl_evaluation_control_t *c)
 {
     uint64_t visits = 0; *sorted = true;
+    if (count <= 1u) return 0;
     for (uint32_t row = start + 1u; row < start + count; row++) {
         int rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
         int cmp;
@@ -16813,12 +16933,211 @@ wl_columnar_relation_radix_workspace_prepare_with_lease_controlled(col_rel_t *r,
     w->prepared_has_types = r->column_types != NULL;
     return wl_evaluation_control_charge(c, 0);
 }
+static int
+wl_columnar_relation_segment_sequence_prepare(col_rel_t *r,
+    const uint32_t *bounds, uint32_t count,
+    wl_columnar_relation_radix_sequence_t *seq,
+    wl_columnar_relation_mutation_lease_t *lease, wl_evaluation_control_t *c)
+{
+    int rc = wl_evaluation_control_charge(c, 128); if (rc) return rc;
+    if (!r || !bounds || !seq || !lease || !c || count < 2u
+        || count == UINT32_MAX || r->nrows > r->capacity || r->timestamps
+        || r->arena_owned || r->col_shared || seq->identity || seq->prepared
+        || seq->consumed || seq->boundaries || seq->needs_sort
+        || seq->metadata_admission_active || seq->workspace.admission_active
+        || !wl_columnar_relation_consolidate_reservation_empty(
+            &seq->metadata_admission)
+        || !wl_columnar_relation_consolidate_reservation_empty(
+            &seq->workspace.admission)
+        || wl_columnar_relation_consolidate_lease_validate(lease,
+        r)) return EINVAL;
+    const wl_columnar_radix_workspace_t *inert = &seq->workspace;
+    if (!(inert && !inert->perm_a && !inert->perm_b && !inert->bucket_values
+        && !inert->byte_values && !inert->short_values && !inert->count16
+        && !inert->temp_column && !inert->insertion_rows && !inert->timestamps
+        && !inert->timestamp_capacity && !inert->k8_capacity &&
+        !inert->k16_capacity
+        && !inert->insertion_capacity && !inert->insertion_bytes
+        && !inert->prepared_relation && !inert->prepared_identity
+        && !inert->prepared_view_generation &&
+        !inert->prepared_storage_generation
+        && !inert->prepared_type_fingerprint && !inert->prepared_start
+        && !inert->prepared_count && !inert->prepared_nrows &&
+        !inert->prepared_ncols
+        && !inert->prepared_capacity && !inert->prepared_timestamp_capacity
+        && !inert->prepared_has_timestamps && !inert->prepared_has_types
+        && !inert->admission_active
+        )) return EINVAL;
+    /* Inert accepts initialized original EMPTY tokens as well as zero ones. */
+    rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
+    bool has_float = false;
+    for (uint32_t col = 0; col < r->ncols; col++) {
+        rc = wl_evaluation_control_charge(c, 16); if (rc) return rc;
+        uint32_t type =
+            r->column_types ? r->column_types[col] : WIRELOG_TYPE_INT64;
+        if (!r->columns || !r->columns[col] || (type != WIRELOG_TYPE_INT64
+            && type != WIRELOG_TYPE_FLOAT &&
+            type != WIRELOG_TYPE_STRING)) return EINVAL;
+        has_float |= type == WIRELOG_TYPE_FLOAT;
+        rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(c, 32); if (rc) return rc;
+    if (bounds[0] || bounds[count] != r->nrows) return EINVAL;
+    uint64_t metadata, boundary_bytes;
+    if (!wl_columnar_memory_size_mul((uint64_t)count + 1u, 4u, &boundary_bytes)
+        || !wl_columnar_memory_size_add(boundary_bytes, count, &metadata)
+        || boundary_bytes > SIZE_MAX || metadata > SIZE_MAX) return EOVERFLOW;
+    rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
+    uint32_t unsorted = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        rc = wl_evaluation_control_charge(c, 16); if (rc) return rc;
+        if (bounds[i] > bounds[i + 1u] ||
+            bounds[i + 1u] > r->nrows) return EINVAL;
+        bool sorted;
+        rc = wl_columnar_relation_consolidate_sorted(r, bounds[i],
+                bounds[i + 1u] - bounds[i], &sorted, c); if (rc) return rc;
+        unsorted += !sorted;
+        rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(c, 32); if (rc) return rc;
+    if ((uint64_t)unsorted + 1u >= WL_COLUMNAR_REL_GENERATION_INVALID
+        || r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID
+        - ((uint64_t)unsorted + 1u)) return EOVERFLOW;
+    rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
+    rc = wl_columnar_relation_consolidate_reserve(r, metadata,
+            &seq->metadata_admission, &seq->metadata_admission_active, c);
+    if (rc) return rc;
+    rc =
+        wl_columnar_relation_consolidate_allocate_controlled(
+        (void **)&seq->boundaries,
+        (size_t)boundary_bytes, c); if (rc) return rc;
+    rc =
+        wl_columnar_relation_consolidate_allocate_controlled(
+        (void **)&seq->needs_sort,
+        count, c); if (rc) return rc;
+    uint32_t k8 = 0, k16 = 0, insertion = 0;
+    for (uint32_t i = 0; i <= count; i++) {
+        rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+        seq->boundaries[i] = bounds[i];
+        rc = wl_columnar_relation_consolidate_step(c, 100, (uint64_t)i + 1u, r);
+        if (rc) return rc;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        bool sorted;
+        uint32_t n = bounds[i + 1u] - bounds[i];
+        rc = wl_columnar_relation_consolidate_sorted(r, bounds[i], n, &sorted,
+                c);
+        if (rc) return rc;
+        rc = wl_evaluation_control_charge(c, 24); if (rc) return rc;
+        seq->needs_sort[i] = !sorted;
+        if (!sorted && n && r->ncols) {
+            if (has_float || n <= 32u) {
+                if (n > insertion) insertion = n;
+            }else if (n >= 50000u) {
+                if (n > k16) k16 = n;
+            }else if (n > k8) k8 = n;
+        }
+        rc = wl_columnar_relation_consolidate_step(c, 101, (uint64_t)i + 1u, r);
+        if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(c, 16); if (rc) return rc;
+    seq->seg_count = count; seq->needs_sort_count = unsorted;
+    rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
+    rc =
+        wl_columnar_relation_consolidate_commit_controlled(
+        &seq->metadata_admission,
+        seq->metadata_admission_active, seq, c); if (rc) return rc;
+    uint64_t p = k8 > k16 ? k8 : k16;
+    uint64_t bucket = k8 > (uint64_t)k16 * 2u ? k8 : (uint64_t)k16 * 2u;
+    uint64_t bytes, inserted = 0;
+    rc = wl_evaluation_control_charge(c, 64); if (rc) return rc;
+    if (!wl_columnar_memory_size_mul(p, 16u, &bytes)
+        || !wl_columnar_memory_size_add(bytes, bucket, &bytes)
+        || (k16 && !wl_columnar_memory_size_add(bytes, 262144u, &bytes))
+        || (insertion && (!wl_columnar_memory_size_mul((uint64_t)insertion + 1u,
+        r->ncols, &inserted) || !wl_columnar_memory_size_mul(inserted, 8u,
+        &inserted)))
+        || !wl_columnar_memory_size_add(bytes, inserted,
+        &bytes) || bytes > SIZE_MAX)
+        return EOVERFLOW;
+    rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
+    wl_columnar_radix_workspace_t *w = &seq->workspace;
+    rc = wl_columnar_relation_consolidate_reserve(r, bytes, &w->admission,
+            &w->admission_active, c); if (rc) return rc;
+    if (p) {
+        rc =
+            wl_columnar_relation_consolidate_allocate_controlled(
+            (void **)&w->perm_a,
+            (size_t)p * 4u, c); if (rc) return rc;
+        rc =
+            wl_columnar_relation_consolidate_allocate_controlled(
+            (void **)&w->perm_b,
+            (size_t)p * 4u, c); if (rc) return rc;
+        rc =
+            wl_columnar_relation_consolidate_allocate_controlled(
+            (void **)&w->temp_column,
+            (size_t)p * 8u, c); if (rc) return rc;
+        rc =
+            wl_columnar_relation_consolidate_allocate_controlled(
+            &w->bucket_values,
+            (size_t)bucket, c); if (rc) return rc;
+        rc = wl_evaluation_control_charge(c, 16); if (rc) return rc;
+        w->byte_values = w->bucket_values; w->short_values = w->bucket_values;
+        w->k8_capacity = k8; w->k16_capacity = k16;
+        rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
+    }
+    if (k16) {
+        rc =
+            wl_columnar_relation_consolidate_allocate_controlled(
+            (void **)&w->count16,
+            262144u, c); if (rc) return rc;
+    }
+    if (inserted) {
+        rc =
+            wl_columnar_relation_consolidate_allocate_controlled(
+            (void **)&w->insertion_rows,
+            (size_t)inserted, c); if (rc) return rc;
+        rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+        w->insertion_bytes = (size_t)inserted;
+        w->insertion_capacity = insertion;
+        rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
+    }
+    rc = wl_columnar_relation_consolidate_commit_controlled(&w->admission,
+            w->admission_active, w, c); if (rc) return rc;
+    uint64_t hash;
+    rc = wl_columnar_relation_radix_type_fingerprint_controlled(r, &hash, c);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(c, 192); if (rc) return rc;
+    w->prepared_relation = r; w->prepared_identity = r->relation_identity;
+    w->prepared_view_generation = r->view_generation;
+    w->prepared_storage_generation = r->storage_generation;
+    w->prepared_type_fingerprint = hash; w->prepared_start = 0;
+    w->prepared_count = r->nrows; w->prepared_nrows = r->nrows;
+    w->prepared_ncols = r->ncols; w->prepared_capacity = r->capacity;
+    w->prepared_has_types = r->column_types != NULL;
+    seq->set = lease->set; seq->lease = lease; seq->relation = r;
+    seq->owner = lease->owner;
+    seq->acquisition_nonce = lease->acquisition_nonce;
+    seq->relation_identity = r->relation_identity;
+    seq->relation_generation = r->storage_generation;
+    seq->owner_identity = lease->owner_identity;
+    seq->owner_generation = lease->owner_generation;
+    seq->view_generation = r->view_generation; seq->type_fingerprint = hash;
+    seq->columns = (const int64_t *const *)r->columns;
+    seq->column_types = r->column_types;
+    seq->nrows = r->nrows; seq->ncols = r->ncols; seq->capacity = r->capacity;
+    seq->identity = (uintptr_t)seq; seq->prepared = true;
+    return wl_evaluation_control_charge(c, 0);
+}
+
 int
 wl_columnar_relation_radix_sequence_prepare_with_lease_controlled(col_rel_t *r,
     const uint32_t *bounds, uint32_t seg_count,
     wl_columnar_relation_radix_sequence_t *seq,
     wl_columnar_relation_mutation_lease_t *lease, wl_evaluation_control_t *c)
 {
+    if (seg_count > 1u) return wl_columnar_relation_segment_sequence_prepare(r,
+                   bounds, seg_count, seq, lease, c);
     int rc = wl_evaluation_control_charge(c, 128); if (rc) return rc;
     if (!r || !bounds || !seq || !lease || !c || seg_count != 1
         || bounds[0] || bounds[1] != r->nrows
@@ -16899,11 +17218,12 @@ wl_columnar_relation_radix_sequence_prepare_with_lease_controlled(col_rel_t *r,
 
 static int
 wl_columnar_relation_consolidate_insertion(col_rel_t *r,
-    wl_columnar_radix_workspace_t *w, wl_evaluation_control_t *c)
+    wl_columnar_radix_workspace_t *w, uint32_t start, uint32_t count,
+    wl_evaluation_control_t *c)
 {
     uint64_t compares = 0, gathers = 0, shifts = 0, writes = 0;
     int64_t *saved = w->insertion_rows;
-    for (uint32_t row = 1; row < r->nrows; row++) {
+    for (uint32_t row = start + 1u; row < start + count; row++) {
         int rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
         for (uint32_t col = 0; col < r->ncols; col++) {
             rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
@@ -16912,7 +17232,7 @@ wl_columnar_relation_consolidate_insertion(col_rel_t *r,
             if (rc) return rc;
         }
         uint32_t dst = row;
-        while (dst) {
+        while (dst > start) {
             int cmp;
             rc = wl_columnar_relation_consolidate_compare(r, dst - 1u, 0,
                     saved, &cmp, c, &compares); if (rc) return rc;
@@ -16940,14 +17260,15 @@ wl_columnar_relation_consolidate_insertion(col_rel_t *r,
 
 static int
 wl_columnar_relation_consolidate_k8(col_rel_t *r,
-    wl_columnar_radix_workspace_t *w, wl_evaluation_control_t *c)
+    wl_columnar_radix_workspace_t *w, uint32_t start, uint32_t count,
+    wl_evaluation_control_t *c)
 {
     uint32_t histogram[256];
     uint32_t *current = w->perm_a, *next = w->perm_b;
     uint64_t visits = 0, gathers = 0, writes = 0;
-    for (uint32_t row = 0; row < r->nrows; row++) {
+    for (uint32_t row = 0; row < count; row++) {
         int rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
-        current[row] = row;
+        current[row] = start + row;
         rc = wl_columnar_relation_consolidate_step(c, 8, row + 1u, r);
         if (rc) return rc;
     }
@@ -16960,7 +17281,7 @@ wl_columnar_relation_consolidate_k8(col_rel_t *r,
             bool uniform = true;
             uint8_t first = 0;
             rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
-            for (uint32_t row = 0; row < r->nrows; row++) {
+            for (uint32_t row = 0; row < count; row++) {
                 rc = wl_evaluation_control_charge(c, 24); if (rc) return rc;
                 uint8_t value =
                     (uint8_t)((uint64_t)r->columns[column][current[row]] >>
@@ -16979,7 +17300,7 @@ wl_columnar_relation_consolidate_k8(col_rel_t *r,
                 rc = wl_columnar_relation_consolidate_step(c, 10, bucket + 1u,
                         r); if (rc) return rc;
             }
-            for (uint32_t row = 0; row < r->nrows; row++) {
+            for (uint32_t row = 0; row < count; row++) {
                 rc = wl_evaluation_control_charge(c, 12); if (rc) return rc;
                 histogram[w->byte_values[row]]++;
                 rc = wl_columnar_relation_consolidate_step(c, 11, row + 1u, r);
@@ -16993,7 +17314,7 @@ wl_columnar_relation_consolidate_k8(col_rel_t *r,
                 rc = wl_columnar_relation_consolidate_step(c, 12, bucket + 1u,
                         r); if (rc) return rc;
             }
-            for (uint32_t row = 0; row < r->nrows; row++) {
+            for (uint32_t row = 0; row < count; row++) {
                 rc = wl_evaluation_control_charge(c, 16); if (rc) return rc;
                 next[histogram[w->byte_values[row]]++] = current[row];
                 rc = wl_columnar_relation_consolidate_step(c, 13, row + 1u, r);
@@ -17005,15 +17326,15 @@ wl_columnar_relation_consolidate_k8(col_rel_t *r,
         }
     }
     for (uint32_t col = 0; col < r->ncols; col++) {
-        for (uint32_t row = 0; row < r->nrows; row++) {
+        for (uint32_t row = 0; row < count; row++) {
             int rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
             w->temp_column[row] = r->columns[col][current[row]];
             rc = wl_columnar_relation_consolidate_step(c, 14, ++gathers, r);
             if (rc) return rc;
         }
-        for (uint32_t row = 0; row < r->nrows; row++) {
+        for (uint32_t row = 0; row < count; row++) {
             int rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
-            r->columns[col][row] = w->temp_column[row];
+            r->columns[col][start + row] = w->temp_column[row];
             rc = wl_columnar_relation_consolidate_step(c, 15, ++writes, r);
             if (rc) return rc;
         }
@@ -17023,14 +17344,15 @@ wl_columnar_relation_consolidate_k8(col_rel_t *r,
 
 static int
 wl_columnar_relation_consolidate_k16(col_rel_t *r,
-    wl_columnar_radix_workspace_t *w, wl_evaluation_control_t *c)
+    wl_columnar_radix_workspace_t *w, uint32_t start, uint32_t count,
+    wl_evaluation_control_t *c)
 {
     uint32_t *histogram = w->count16;
     uint32_t *current = w->perm_a, *next = w->perm_b;
     uint64_t visits = 0, gathers = 0, writes = 0;
-    for (uint32_t row = 0; row < r->nrows; row++) {
+    for (uint32_t row = 0; row < count; row++) {
         int rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
-        current[row] = row;
+        current[row] = start + row;
         rc = wl_columnar_relation_consolidate_step(c, 60, row + 1u, r);
         if (rc) return rc;
     }
@@ -17043,7 +17365,7 @@ wl_columnar_relation_consolidate_k16(col_rel_t *r,
             bool uniform = true;
             uint16_t first = 0;
             rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
-            for (uint32_t row = 0; row < r->nrows; row++) {
+            for (uint32_t row = 0; row < count; row++) {
                 rc = wl_evaluation_control_charge(c, 24); if (rc) return rc;
                 uint16_t value =
                     (uint16_t)((uint64_t)r->columns[column][current[row]] >>
@@ -17056,13 +17378,15 @@ wl_columnar_relation_consolidate_k16(col_rel_t *r,
                 if (rc) return rc;
             }
             if (uniform) continue;
+            rc = wl_columnar_relation_consolidate_step(c, 68, pass + 1u, r);
+            if (rc) return rc;
             for (unsigned bucket = 0; bucket < 65536; bucket++) {
                 rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
                 histogram[bucket] = 0;
                 rc = wl_columnar_relation_consolidate_step(c, 62, bucket + 1u,
                         r); if (rc) return rc;
             }
-            for (uint32_t row = 0; row < r->nrows; row++) {
+            for (uint32_t row = 0; row < count; row++) {
                 rc = wl_evaluation_control_charge(c, 12); if (rc) return rc;
                 histogram[w->short_values[row]]++;
                 rc = wl_columnar_relation_consolidate_step(c, 63, row + 1u, r);
@@ -17076,7 +17400,7 @@ wl_columnar_relation_consolidate_k16(col_rel_t *r,
                 rc = wl_columnar_relation_consolidate_step(c, 64, bucket + 1u,
                         r); if (rc) return rc;
             }
-            for (uint32_t row = 0; row < r->nrows; row++) {
+            for (uint32_t row = 0; row < count; row++) {
                 rc = wl_evaluation_control_charge(c, 16); if (rc) return rc;
                 next[histogram[w->short_values[row]]++] = current[row];
                 rc = wl_columnar_relation_consolidate_step(c, 65, row + 1u, r);
@@ -17088,18 +17412,139 @@ wl_columnar_relation_consolidate_k16(col_rel_t *r,
         }
     }
     for (uint32_t col = 0; col < r->ncols; col++) {
-        for (uint32_t row = 0; row < r->nrows; row++) {
+        for (uint32_t row = 0; row < count; row++) {
             int rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
             w->temp_column[row] = r->columns[col][current[row]];
             rc = wl_columnar_relation_consolidate_step(c, 66, ++gathers, r);
             if (rc) return rc;
         }
-        for (uint32_t row = 0; row < r->nrows; row++) {
+        for (uint32_t row = 0; row < count; row++) {
             int rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
-            r->columns[col][row] = w->temp_column[row];
+            r->columns[col][start + row] = w->temp_column[row];
             rc = wl_columnar_relation_consolidate_step(c, 67, ++writes, r);
             if (rc) return rc;
         }
+    }
+    return 0;
+}
+
+static int
+wl_columnar_relation_segment_sequence_execute(
+    wl_columnar_relation_radix_sequence_t *seq,
+    wl_columnar_relation_mutation_lease_t *lease, wl_evaluation_control_t *c)
+{
+    int rc = wl_evaluation_control_charge(c, 128); if (rc) return rc;
+    if (!seq || !lease || seq->identity != (uintptr_t)seq || !seq->prepared
+        || seq->consumed || seq->lease != lease || seq->set != lease->set
+        || seq->acquisition_nonce != lease->acquisition_nonce || !seq->relation
+        || seq->relation != lease->relation || seq->seg_count < 2u
+        || !seq->boundaries || !seq->needs_sort
+        || seq->needs_sort_count > seq->seg_count
+        || wl_columnar_relation_consolidate_lease_validate(lease,
+        seq->relation))
+        return EINVAL;
+    col_rel_t *r = seq->relation;
+    wl_columnar_radix_workspace_t *w = &seq->workspace;
+    if (r->relation_identity != seq->relation_identity
+        || r->storage_generation != seq->relation_generation
+        || r->view_generation != seq->view_generation ||
+        lease->owner != seq->owner
+        || lease->owner_identity != seq->owner_identity
+        || lease->owner_generation != seq->owner_generation
+        || r->columns != (int64_t **)seq->columns ||
+        r->column_types != seq->column_types
+        || r->timestamps || r->col_shared || r->arena_owned || seq->timestamps
+        || r->nrows != seq->nrows || r->ncols != seq->ncols
+        || r->capacity != seq->capacity || r->nrows > r->capacity
+        || seq->boundaries[0] || seq->boundaries[seq->seg_count] != r->nrows
+        || r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID
+        - ((uint64_t)seq->needs_sort_count + 1u)) return EINVAL;
+    rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
+    uint64_t hash;
+    rc = wl_columnar_relation_radix_type_fingerprint_controlled(r, &hash, c);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(c, 96); if (rc) return rc;
+    if (hash != seq->type_fingerprint || hash != w->prepared_type_fingerprint
+        || w->prepared_relation != r ||
+        w->prepared_identity != r->relation_identity
+        || w->prepared_view_generation != r->view_generation
+        || w->prepared_storage_generation != r->storage_generation
+        || w->prepared_start || w->prepared_count != r->nrows
+        || w->prepared_nrows != r->nrows || w->prepared_ncols != r->ncols
+        || w->prepared_capacity != r->capacity
+        || w->prepared_has_types != (r->column_types != NULL)
+        || w->prepared_has_timestamps || w->timestamps
+        || w->byte_values != w->bucket_values
+        || (void *)w->short_values != w->bucket_values) return EINVAL;
+    rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
+    bool has_float = false;
+    for (uint32_t col = 0; col < r->ncols; col++) {
+        rc = wl_evaluation_control_charge(c, 16); if (rc) return rc;
+        if (!r->columns || !r->columns[col]) return EINVAL;
+        uint32_t type =
+            r->column_types ? r->column_types[col] : WIRELOG_TYPE_INT64;
+        if (type != WIRELOG_TYPE_INT64 && type != WIRELOG_TYPE_FLOAT
+            && type != WIRELOG_TYPE_STRING) return EINVAL;
+        has_float |= type == WIRELOG_TYPE_FLOAT;
+        rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
+    }
+    uint32_t sorts = 0;
+    for (uint32_t i = 0; i < seq->seg_count; i++) {
+        rc = wl_evaluation_control_charge(c, 32); if (rc) return rc;
+        uint32_t start = seq->boundaries[i], end = seq->boundaries[i + 1u];
+        if (start > end || end > r->nrows ||
+            seq->needs_sort[i] > 1u) return EINVAL;
+        uint32_t count = end - start;
+        if (seq->needs_sort[i]) {
+            if (count <= 1u) return EINVAL;
+            sorts++;
+            if (r->ncols && (has_float || count <= 32u)) {
+                uint64_t bytes;
+                if (!wl_columnar_memory_size_mul((uint64_t)count + 1u, r->ncols,
+                    &bytes)
+                    || !wl_columnar_memory_size_mul(bytes, 8u, &bytes)
+                    || !w->insertion_rows || w->insertion_capacity < count
+                    || w->insertion_bytes < bytes) return EINVAL;
+            } else if (r->ncols && (!w->perm_a || !w->perm_b || !w->temp_column
+                || !w->bucket_values || (count >= 50000u
+                    ? (!w->count16 || w->k16_capacity < count)
+                    : w->k8_capacity < count))) return EINVAL;
+        }
+        rc = wl_columnar_relation_consolidate_step(c, 102, (uint64_t)i + 1u, r);
+        if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(c, 16); if (rc) return rc;
+    if (sorts != seq->needs_sort_count) return EINVAL;
+    seq->consumed = true;
+    rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
+    uint64_t generation = seq->view_generation;
+    for (uint32_t i = 0; i < seq->seg_count; i++) {
+        rc = wl_evaluation_control_charge(c, 32); if (rc) return rc;
+        if (r->view_generation != generation
+            || wl_columnar_relation_consolidate_lease_validate(lease,
+            r)) return EINVAL;
+        uint32_t start = seq->boundaries[i],
+            count = seq->boundaries[i + 1u] - start;
+        bool needed = seq->needs_sort[i];
+        rc = wl_columnar_relation_consolidate_step(c, 103, (uint64_t)i + 1u, r);
+        if (rc) return rc;
+        if (!needed) continue;
+        if (r->ncols) {
+            rc = has_float || count <= 32u
+                ? wl_columnar_relation_consolidate_insertion(r, w, start, count,
+                    c)
+                : count >= 50000u ? wl_columnar_relation_consolidate_k16(r, w,
+                    start, count, c)
+                : wl_columnar_relation_consolidate_k8(r, w, start, count, c);
+            if (rc) return rc;
+        }
+        rc = wl_evaluation_control_charge(c, 64); if (rc) return rc;
+        if (r->view_generation != generation
+            || wl_columnar_relation_consolidate_lease_validate(lease,
+            r)) return EINVAL;
+        rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
+        r->view_generation++; generation++;
+        lease->set->published = true;
     }
     return 0;
 }
@@ -17109,6 +17554,9 @@ wl_columnar_relation_radix_sequence_execute_with_lease_controlled(
     wl_columnar_relation_radix_sequence_t *seq,
     wl_columnar_relation_mutation_lease_t *lease, wl_evaluation_control_t *c)
 {
+    if (seq &&
+        seq->seg_count >
+        1u) return wl_columnar_relation_segment_sequence_execute(seq, lease, c);
     int rc = wl_evaluation_control_charge(c, 128); if (rc) return rc;
     if (!seq || !lease || seq->identity != (uintptr_t)seq || !seq->prepared
         || seq->consumed || seq->lease != lease || seq->set != lease->set
@@ -17189,10 +17637,11 @@ wl_columnar_relation_radix_sequence_execute_with_lease_controlled(
     rc = wl_evaluation_control_charge(c, 0); if (rc) return rc;
     if (!seq->needs_sort_count) return 0;
     if (r->ncols) {
-        rc = insertion ? wl_columnar_relation_consolidate_insertion(r, w, c)
+        rc = insertion ? wl_columnar_relation_consolidate_insertion(r, w, 0,
+                r->nrows, c)
             : r->nrows >= 50000u
-            ? wl_columnar_relation_consolidate_k16(r, w, c)
-            : wl_columnar_relation_consolidate_k8(r, w, c);
+            ? wl_columnar_relation_consolidate_k16(r, w, 0, r->nrows, c)
+            : wl_columnar_relation_consolidate_k8(r, w, 0, r->nrows, c);
         if (rc) return rc;
     }
     rc = wl_evaluation_control_charge(c, 32); if (rc) return rc;

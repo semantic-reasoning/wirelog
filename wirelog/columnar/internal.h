@@ -3791,7 +3791,8 @@ typedef struct wl_columnar_merge_consolidate_original_record {
 typedef enum {
     WL_COLUMNAR_CONSOLIDATE_RADIX = 0,
     WL_COLUMNAR_CONSOLIDATE_HASH,
-    WL_COLUMNAR_CONSOLIDATE_LANE_INITIALIZING
+    WL_COLUMNAR_CONSOLIDATE_LANE_INITIALIZING,
+    WL_COLUMNAR_CONSOLIDATE_RADIX_MERGE
 } wl_columnar_merge_consolidate_lane_t;
 typedef struct {
     union {
@@ -3813,6 +3814,12 @@ _Static_assert(_Alignof(wl_columnar_consolidate_record_t)
     "hash lane must preserve original consolidation alignment");
 int wl_columnar_merge_hash_retire(wl_columnar_consolidate_record_t *, int,
     wl_evaluation_control_t *);
+int wl_columnar_relation_pool_reuse_controlled(wl_col_session_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_merge_concat_controlled(eval_stack_t *, wl_col_session_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_plan_union_validate(const wl_plan_relation_t *,
+    wl_evaluation_control_t *, bool *);
 wl_columnar_consolidate_record_t *
 wl_columnar_eval_stack_cleanup_consolidate(
     wl_columnar_eval_stack_cleanup_frame_t *);

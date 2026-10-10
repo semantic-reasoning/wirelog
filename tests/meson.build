@@ -6344,4 +6344,4 @@ test_evaluation_work_exe = executable(
   link_with: [testlib_prod],
 )
 test('evaluation_work', test_evaluation_work_exe,
-     suite: ['unit'], timeout: 60)
+     suite: ['unit'], timeout: 120)

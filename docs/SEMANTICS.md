@@ -904,7 +904,7 @@ call.
 | `plain_step_completion_phase` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE |
 | `plain_step_completion_step_context` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl` | PRESERVE |
 | `plain_step_completion_active` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_snapshot_impl`, `col_session_step_impl` | **COMMIT** on the step path -- a re-entrancy latch, not progress. While it stays set beside `plain_step_completion_pending`, the entry guard of both `col_session_step_impl` and `col_session_snapshot_impl` returns `EBUSY` above every line that would clear it. The snapshot path never writes it, so the snapshot cutoff has nothing to perform here. |
-| `col_rel_t::base_nrows` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_reset_rows_locked`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `tdd_empty_relation_candidate`, `tdd_seed_bdx_coordinator_idb`, `wl_columnar_eval_serial_canonicalize_aggregate_locked`, `wl_columnar_relation_compact_controlled`, `wl_columnar_relation_new_private_controlled`, `wl_columnar_relation_reset_controlled`, `wl_columnar_session_serial_attempt`, `wl_retraction_restore` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_mutable_image_validate`, `col_session_remove`, `col_session_remove_incremental`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `session_seed_shadow_plan_remove`, `session_snapshot_insert`, `wl_columnar_eval_delta_observer_begin`, `wl_columnar_relation_compact_controlled`, `wl_columnar_relation_new_private_controlled`, `wl_columnar_relation_reset_controlled`, `wl_retraction_stage_prepare` | PRESERVE -- the insert route (`session_snapshot_insert`) takes rows `[base_nrows, nrows)` of the inserted relation as the rows an incremental insert appended, so committing the bookkeeping's `base_nrows = nrows` on a stopped attempt would make the retry find no inserted rows and leave the heads without them. That is the whole verified consequence; see the note below before adding another |
+| `col_rel_t::base_nrows` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_reset_rows_locked`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `tdd_empty_relation_candidate`, `tdd_seed_bdx_coordinator_idb`, `wl_columnar_eval_serial_canonicalize_aggregate_locked`, `wl_columnar_relation_compact_controlled`, `wl_columnar_relation_new_private_controlled`, `wl_columnar_relation_reset_controlled`, `wl_columnar_session_serial_attempt`, `wl_retraction_restore` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_mutable_image_validate`, `col_session_remove`, `col_session_remove_incremental`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `session_seed_shadow_plan_remove`, `session_snapshot_insert`, `wl_columnar_eval_delta_observer_begin`, `wl_columnar_relation_compact_controlled`, `wl_columnar_relation_new_private_controlled`, `wl_columnar_relation_pool_reuse_controlled`, `wl_columnar_relation_reset_controlled`, `wl_retraction_stage_prepare` | PRESERVE -- the insert route (`session_snapshot_insert`) takes rows `[base_nrows, nrows)` of the inserted relation as the rows an incremental insert appended, so committing the bookkeeping's `base_nrows = nrows` on a stopped attempt would make the retry find no inserted rows and leave the heads without them. That is the whole verified consequence; see the note below before adding another |
 
 Two non-field actions sit in the same region and need their own verdicts.
 `col_session_reclaim_quiescent` is **COMMIT**: the step cutoff's unwind calls
@@ -957,8 +957,16 @@ STEP and SNAPSHOT for the admitted VARIABLE/MAP/CONSOLIDATE and
 VARIABLE/FILTER/MAP/CONSOLIDATE pipelines, and genuine generated
 VARIABLE/JOIN/CONSOLIDATE or VARIABLE/JOIN/MAP/CONSOLIDATE pipelines.
 Pure projections keep actual JOIN fusion; expression projections keep MAP.
+Genuine generated UNION plans use their VARIABLE/MAP branches followed by
+CONCAT and CONSOLIDATE, including initial and dirty full-input attempts.
 Generated plans keep their actual stratum flags and default managed arena and
-pool objects. Controlled operators allocate governed heap images. This lane
+pool objects. Controlled operators allocate governed heap payloads. CONCAT retains the raw
+pool descriptor and capacity policy; new-attempt reuse validates every used
+slot as a successful checked-destruction tombstone in charged fixed headers.
+Terminal gates, original inactive token identities, absent physical payload and
+registry exclusion must all hold before the final scalar slot counter write.
+Pending cleanup, live references, malformed slots and nonempty arena refuse
+reuse without changing pool bytes or credits. This lane
 registers missing canonical heads and supports a supplied immutable legacy plan
 with several head occurrences in one nonrecursive stratum. Other controlled
 lanes and the installed facade remain outside this production unit.
@@ -996,6 +1004,25 @@ stratum and rule frontier cursors advance before their tails, then the existing
 rule/stratum continuation rederives outputs. Input markers and origin stay
 pending until final completion. This lane does not qualify stable output-only,
 incremental, seed restoration or recursive evaluation.
+
+CONCAT keeps original input entries and its candidate reachable in the evaluator
+frame. Its source group, append transaction and private writer retire before
+input disposal. Each checked disposer has a poll immediately before and after
+successful return. Physical relation destruction remains the existing cleanup
+exclusion: width-dependent buffers, Arrow schemas and dedup structures are not
+bounded to 256 actions or represented as precise executed work. Cancellation
+can therefore wait for one destructor. A held reader refuses retirement; a
+stop after one consumed input retains the candidate and remaining entries for
+real cleanup and retry, with no callback or recreated input.
+
+Segment-aware SET sorts only unsorted ranges, preserves raw hash-first and
+maximum-segment scratch selection, and merges through an original aggregate
+allocation. Metadata, reusable per-range sort workspace and aggregate buffers
+coexist under real admission; no whole-input flatten is introduced. A NULL
+boundary pointer with count zero or one denotes one range. A NULL pointer with
+count greater than one is malformed. Owned sorted prefixes use the same range
+kernels; borrowed single ranges retain their full-input behavior. Typed helper
+coverage does not establish a generated MAP output schema.
 
 SNAPSHOT pins every selected distinct head, including empty heads. The current
 cohort limit is 64 distinct heads; 65 is rejected before canonical mutation.

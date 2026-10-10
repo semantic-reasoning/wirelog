@@ -40,6 +40,58 @@ _Static_assert(WL_PLAN_OP_K_FUSION == WL_PLAN_OP__BACKEND_START,
  * Evaluate all operators for one relation plan using the eval stack.
  * On success, the top of stack holds the result relation (owned).
  */
+int
+wl_columnar_eval_plan_union_validate(const wl_plan_relation_t *plan,
+    wl_evaluation_control_t *control, bool *supported)
+{
+    if (!plan || !supported || !control) return EINVAL;
+    *supported = false;
+    if (!plan->ops || plan->op_count < 5u) return 0;
+    uint32_t depth = 0, concatenations = 0;
+    bool branch = false;
+    for (uint32_t i = 0; i < plan->op_count; i++) {
+        int rc = wl_evaluation_control_charge(control, 48);
+        if (rc) return rc;
+        const wl_plan_op_t *op = &plan->ops[i];
+        switch (op->op) {
+        case WL_PLAN_OP_VARIABLE:
+            if (branch || depth == COL_STACK_MAX || !op->relation_name
+                || (op->delta_mode != WL_DELTA_AUTO
+                && op->delta_mode != WL_DELTA_FORCE_FULL)) return ENOTSUP;
+            depth++; branch = true;
+            break;
+        case WL_PLAN_OP_FILTER:
+        case WL_PLAN_OP_MAP:
+            if (!branch || !depth) return ENOTSUP;
+            break;
+        case WL_PLAN_OP_JOIN:
+            if (!branch || !depth || op->materialized
+                || op->right_filter_expr.size
+                || (op->delta_mode != WL_DELTA_AUTO
+                && op->delta_mode != WL_DELTA_FORCE_FULL)) return ENOTSUP;
+            break;
+        case WL_PLAN_OP_CONCAT:
+            if (!branch || depth < 2u) return ENOTSUP;
+            depth--; concatenations++; branch = false;
+            break;
+        case WL_PLAN_OP_CONSOLIDATE:
+            if (!depth) return ENOTSUP;
+            break;
+        default: return ENOTSUP;
+        }
+        /* A completed first child remains below the next VARIABLE. */
+        if (i + 1u < plan->op_count
+            && plan->ops[i + 1u].op == WL_PLAN_OP_VARIABLE) branch = false;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return rc;
+    }
+    if (depth != 1u || !concatenations
+        || plan->ops[plan->op_count - 1u].op != WL_PLAN_OP_CONSOLIDATE)
+        return ENOTSUP;
+    *supported = true;
+    return 0;
+}
+
 static int
 wl_columnar_eval_plan_body(const wl_plan_relation_t *rplan, eval_stack_t *stack,
     wl_col_session_t *sess)
@@ -181,7 +233,9 @@ ordinary_join:
             rc = wl_columnar_antijoin_op(op, stack, sess);
             break;
         case WL_PLAN_OP_CONCAT:
-            rc = col_op_concat(stack, sess);
+            rc = sess->base.evaluation_control
+                ? wl_columnar_merge_concat_controlled(stack, sess,
+                    sess->base.evaluation_control) : col_op_concat(stack, sess);
             break;
         case WL_PLAN_OP_CONSOLIDATE:
             rc = sess->diff_operators_active
@@ -272,7 +326,14 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
             WL_PLAN_OP_CONSOLIDATE
                 : rplan->ops[2].op == WL_PLAN_OP_MAP
             && rplan->ops[3].op == WL_PLAN_OP_CONSOLIDATE);
-        if (!join && !filter && !map && !pipeline && !reduce && !consolidate
+        bool union_plan = false;
+        if (rplan->op_count >= 5u) {
+            rc = wl_columnar_eval_plan_union_validate(rplan, control,
+                    &union_plan);
+            if (rc) return rc;
+        }
+        if (!union_plan && !join && !filter && !map && !pipeline && !reduce &&
+            !consolidate
             && !owned_consolidate && !filtered_consolidate &&
             !joined_consolidate)
             return ENOTSUP;
@@ -285,11 +346,12 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
             || !sess->memory_governor
             || (op->delta_mode != WL_DELTA_FORCE_FULL
             && !((owned_consolidate || filtered_consolidate ||
-            joined_consolidate)
+            joined_consolidate || union_plan)
             && op->delta_mode == WL_DELTA_AUTO)))
             return ENOTSUP;
         if (filter || map || pipeline || reduce || consolidate ||
-            owned_consolidate || filtered_consolidate || joined_consolidate) {
+            owned_consolidate || filtered_consolidate || joined_consolidate ||
+            union_plan) {
             rc = wl_evaluation_control_charge(control,
                     filtered_consolidate ||
                     joined_consolidate ? 40u : pipeline ||

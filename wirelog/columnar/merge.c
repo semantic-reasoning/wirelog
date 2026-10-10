@@ -2097,6 +2097,179 @@ wl_columnar_merge_consolidate_owned_shape(col_rel_t *r,
     return wl_columnar_merge_consolidate_shape(r, c);
 }
 
+int
+wl_columnar_merge_concat_controlled(eval_stack_t *stack, wl_col_session_t *sess,
+    wl_evaluation_control_t *c)
+{
+    if (!stack || !sess || !c) return EINVAL;
+    int rc = wl_evaluation_control_charge(c, 32); if (rc) return rc;
+    wl_columnar_relation_consolidate_checkpoint(c, 117, stack->top, NULL, NULL);
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    if (stack->top < 2u) return wl_columnar_merge_consolidate_tail(c);
+    if (stack->top > COL_STACK_MAX) return EINVAL;
+    wl_columnar_relation_private_batch_t *writer = NULL;
+    rc = wl_columnar_eval_stack_cleanup_private_batch_owner(sess, stack,
+            &writer, c);
+    if (rc) return rc;
+    wl_columnar_relation_source_group_t *group;
+    eval_entry_t *result;
+    rc = wl_columnar_eval_stack_cleanup_join_owner(sess, stack, &group,
+            &result);
+    if (rc) return rc;
+    wl_columnar_relation_bulk_append_t *bulk =
+        wl_columnar_eval_stack_cleanup_bulk_append(
+        sess->cleanup_active);
+    if (!bulk || bulk->active) return EBUSY;
+    uint32_t top = stack->top;
+    eval_entry_t *a = &stack->items[top - 2u], *b = &stack->items[top - 1u];
+    if (a->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION
+        || b->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION || !a->rel || !b->rel
+        || a->is_delta || b->is_delta || a->continuation || b->continuation
+        || (a->rel == b->rel && (a->owned || b->owned))) return EINVAL;
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    col_rel_t *left = a->rel, *right = b->rel, *out = NULL;
+    rc = wl_columnar_relation_source_group_acquire_controlled(group, left,
+            right, c);
+    if (rc) goto done;
+    wl_columnar_relation_consolidate_checkpoint(c, 118, 0, NULL, left);
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto done;
+    rc = wl_columnar_merge_consolidate_owned_shape(left, c); if (rc) goto done;
+    rc = wl_columnar_merge_consolidate_owned_shape(right, c); if (rc) goto done;
+    rc = wl_evaluation_control_charge(c, 64); if (rc) goto done;
+    if (left->ncols != right->ncols || left->column_types ||
+        right->column_types){
+        rc = ENOTSUP; goto done;
+    }
+    if (right->nrows > UINT32_MAX - left->nrows) {
+        rc = EOVERFLOW; goto done;
+    }
+    uint32_t rows = left->nrows + right->nrows;
+    uint32_t left_count = a->seg_boundaries ? a->seg_count : 1u;
+    uint32_t right_count = b->seg_boundaries ? b->seg_count : 1u;
+    if ((!a->seg_boundaries && a->seg_count > 1u)
+        || (!b->seg_boundaries && b->seg_count > 1u)
+        || !left_count || !right_count) {
+        rc = EINVAL; goto done;
+    }
+    if (right_count > UINT32_MAX - left_count) {
+        rc = EOVERFLOW; goto done;
+    }
+    uint32_t count = left_count + right_count;
+    uint64_t bytes;
+    if (!wl_columnar_memory_size_mul((uint64_t)count + 1u, 4u, &bytes)
+        || bytes > SIZE_MAX) {
+        rc = EOVERFLOW; goto done;
+    }
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto done;
+    eval_entry_t *inputs[2] = {a, b};
+    for (unsigned side = 0; side < 2u; side++) {
+        eval_entry_t *entry = inputs[side];
+        uint32_t n = side ? right_count : left_count;
+        if (entry->seg_boundaries) {
+            rc = wl_evaluation_control_charge(c, 16); if (rc) goto done;
+            if (entry->seg_boundaries[0]
+                || entry->seg_boundaries[n] != entry->rel->nrows) {
+                rc = EINVAL; goto done;
+            }
+            rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto done;
+            for (uint32_t i = 0; i < n; i++) {
+                rc = wl_evaluation_control_charge(c, 16); if (rc) goto done;
+                if (entry->seg_boundaries[i] > entry->seg_boundaries[i + 1u]
+                    || entry->seg_boundaries[i + 1u] > entry->rel->nrows) {
+                    rc = EINVAL; goto done;
+                }
+                rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto done;
+            }
+        }
+    }
+    rc = wl_columnar_relation_pool_new_like_held_controlled(&out,
+            sess->delta_pool,
+            "$concat", left, sess->memory_governor, c);
+    if (out) *result = (eval_entry_t){.rel = out, .owned = true,
+                                      .kind = WL_COLUMNAR_EVAL_ENTRY_RELATION};
+    if (rc) goto done;
+    rc = wl_evaluation_control_charge(c, 8); if (rc) goto done;
+    result->seg_boundaries =
+        wl_columnar_merge_concat_boundaries_alloc((size_t)bytes);
+    if (!result->seg_boundaries) {
+        rc = ENOMEM; goto done;
+    }
+    result->seg_count = count;
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto done;
+    for (unsigned side = 0; side < 2u; side++) {
+        eval_entry_t *entry = inputs[side];
+        uint32_t n = side ? right_count : left_count;
+        uint32_t offset = side ? left->nrows : 0u;
+        uint32_t base = side ? left_count : 0u;
+        for (uint32_t i = 0; i <= n; i++) {
+            rc = wl_evaluation_control_charge(c, 16); if (rc) goto done;
+            uint32_t boundary = entry->seg_boundaries ? entry->seg_boundaries[i]
+                : i ? entry->rel->nrows : 0u;
+            result->seg_boundaries[base + i] = offset + boundary;
+            wl_columnar_relation_consolidate_checkpoint(c, 113,
+                (uint64_t)base + i + 1u, NULL, out);
+            rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto done;
+        }
+    }
+    rc = wl_columnar_relation_source_group_drain(group, 0); if (rc) goto done;
+    rc = wl_columnar_relation_bulk_append_controlled(bulk, out, left, c);
+    if (rc) goto done;
+    wl_columnar_relation_consolidate_checkpoint(c, 114, out->nrows, NULL, out);
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto done;
+    rc = wl_columnar_relation_bulk_append_controlled(bulk, out, right, c);
+    if (rc) goto done;
+    rc = wl_evaluation_control_charge(c, 96); if (rc) goto done;
+    if (bulk->active || group->descriptor_count || group->owner_count
+        || !wl_columnar_relation_private_batch_disposable(writer)
+        || stack->top != top || a->rel != left || b->rel != right
+        || result->rel != out || !result->owned || out->nrows != rows
+        || result->seg_count != count ||
+        result->seg_boundaries[count] != rows){
+        rc = EINVAL; goto done;
+    }
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto done;
+    for (unsigned i = 0; i < 2u; i++) {
+        rc = wl_evaluation_control_charge(c, 16); if (rc) goto done;
+        wl_columnar_relation_consolidate_checkpoint(c, 115, i, NULL, out);
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto done;
+        /* Existing checked physical cleanup exclusion: arbitrary width/Arrow/
+         * dedup teardown is not a prepaid bounded forward region. */
+        rc = eval_entry_dispose(inputs[i]); if (rc) goto done;
+        /* Successful disposal consumes borrowed entries too; the legacy
+         * disposer retains their non-owning pointer for its other callers. */
+        inputs[i]->rel = NULL;
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto done;
+        wl_columnar_relation_consolidate_checkpoint(c, 116, (uint64_t)i + 1u,
+            NULL, out);
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto done;
+    }
+    rc = wl_columnar_relation_private_append_batch_begin_controlled(writer, out,
+            c);
+    if (rc) goto done;
+    rc = wl_columnar_relation_private_append_batch_end_controlled(writer);
+    if (rc) goto done;
+    rc = wl_evaluation_control_charge(c, 3u * sizeof(*result) + 8u);
+    if (rc) goto done;
+    if (stack->top != top || a->rel || b->rel || a->owned || b->owned
+        || !wl_columnar_relation_private_batch_disposable(writer)) {
+        rc = EINVAL; goto done;
+    }
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto done;
+    *a = *result; *result = (eval_entry_t){0}; *b = (eval_entry_t){0};
+    stack->top = top - 1u;
+    return 0;
+done:
+    if (rc == ENOMEM && out && out->memory_budget_denial_pending) {
+        sess->memory_budget_denied = true; rc = ENOSPC;
+    }
+    rc = wl_columnar_relation_bulk_append_retire(bulk, rc);
+    rc = wl_columnar_relation_private_batch_retire(writer, rc);
+    int cleanup = wl_columnar_relation_source_group_drain(group, rc);
+    if (rc <= 0 && cleanup > 0) rc = cleanup;
+    /* Actual inputs and candidate stay in original slots for frame drain. */
+    return rc;
+}
+
 static int
 wl_columnar_merge_consolidate_dedup(wl_columnar_consolidate_record_t *record,
     wl_columnar_relation_private_batch_t *writer, col_rel_t *r,
@@ -2161,6 +2334,231 @@ wl_columnar_merge_consolidate_dedup(wl_columnar_consolidate_record_t *record,
     r->run_count = 1; r->run_ends[0] = kept;
     r->view_generation++;
     lease->set->published = true;
+    return 0;
+}
+
+typedef struct wl_columnar_merge_segment_heap_entry {
+    uint32_t segment, cursor, end;
+} wl_columnar_merge_segment_heap_entry_t;
+_Static_assert(sizeof(wl_columnar_merge_segment_heap_entry_t) == 12u,
+    "segment heap must preserve raw admission");
+
+static int
+wl_columnar_merge_segment_compare(wl_columnar_consolidate_record_t *record,
+    col_rel_t *r, uint32_t left, uint32_t right, const int64_t *saved,
+    int *cmp, wl_evaluation_control_t *c)
+{
+    for (uint32_t col = 0; col < r->ncols; col++) {
+        int rc = wl_evaluation_control_charge(c, 24); if (rc) return rc;
+        int64_t a = r->columns[col][left],
+            b = saved ? saved[col] : r->columns[col][right];
+        *cmp = r->column_types && r->column_types[col] == WIRELOG_TYPE_FLOAT
+            ? wl_columnar_float_compare_bits(a, b) : (a > b) - (a < b);
+        wl_columnar_relation_consolidate_checkpoint(c, 106, (uint64_t)col + 1u,
+            record, r);
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+        if (*cmp) return 0;
+    }
+    *cmp = 0; return 0;
+}
+
+static int
+wl_columnar_merge_segment_sift(wl_columnar_consolidate_record_t *record,
+    col_rel_t *r, wl_columnar_merge_segment_heap_entry_t *heap,
+    uint32_t parent, uint32_t size, wl_evaluation_control_t *c)
+{
+    while (parent < size / 2u) {
+        int rc = wl_evaluation_control_charge(c, 16); if (rc) return rc;
+        uint32_t child = parent * 2u + 1u;
+        if (child >= size) break;
+        int cmp;
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+        if (child + 1u < size) {
+            rc = wl_columnar_merge_segment_compare(record, r,
+                    heap[child + 1u].cursor,
+                    heap[child].cursor, NULL, &cmp, c); if (rc) return rc;
+            if (cmp < 0) child++;
+        }
+        rc = wl_columnar_merge_segment_compare(record, r, heap[parent].cursor,
+                heap[child].cursor, NULL, &cmp, c); if (rc) return rc;
+        if (cmp <= 0) break;
+        rc = wl_evaluation_control_charge(c, 3u * sizeof(*heap) + 8u);
+        if (rc) return rc;
+        wl_columnar_merge_segment_heap_entry_t swap = heap[parent];
+        heap[parent] = heap[child]; heap[child] = swap; parent = child;
+        wl_columnar_relation_consolidate_checkpoint(c, 107, parent, record, r);
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    }
+    return 0;
+}
+
+static int
+wl_columnar_merge_segment_allocate(wl_columnar_consolidate_record_t *record,
+    col_rel_t *r, wl_evaluation_control_t *c)
+{
+    uint32_t count = record->sequence.seg_count;
+    int rc = wl_evaluation_control_charge(c, 64); if (rc) return rc;
+    uint64_t cells, merged, bytes,
+        heap = count >= 3u ? (uint64_t)count * 12u : 0u;
+    if (count < 2u || !wl_columnar_memory_size_mul(r->nrows, r->ncols, &cells)
+        || !wl_columnar_memory_size_mul(cells, 8u, &merged)
+        || !wl_columnar_memory_size_add(merged, 8u, &merged)
+        || !wl_columnar_memory_size_add((uint64_t)count * 8u, merged, &bytes)
+        || !wl_columnar_memory_size_add(bytes, heap,
+        &bytes) || bytes > SIZE_MAX)
+        return EOVERFLOW;
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    wl_columnar_memory_admission_status_t status;
+    rc = wl_columnar_memory_governor_reserve_checked_controlled(
+        wl_columnar_memory_governor_ref_get(r->memory_governor), bytes,
+        &record->merge_admission, &status, c); if (rc) return rc;
+    if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+        && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+        if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+            r->memory_budget_denial_pending = true;
+        return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+            : status ==
+               WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : EINVAL;
+    }
+    /* Install alias disposition before publishing any physical pointer. */
+    record->merge_admission_active = true;
+    rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+    record->lane = WL_COLUMNAR_CONSOLIDATE_RADIX_MERGE;
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    rc =
+        wl_columnar_relation_consolidate_allocate_controlled(
+        (void **)&record->starts,
+        (size_t)bytes, c); if (rc) return rc;
+    rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+    record->ends = record->starts + count;
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    rc =
+        wl_columnar_relation_consolidate_commit_controlled(
+        &record->merge_admission,
+        record->merge_admission_active, record, c); if (rc) return rc;
+    wl_columnar_relation_consolidate_checkpoint(c, 104, bytes, record, r);
+    return wl_columnar_merge_consolidate_tail(c);
+}
+
+static int
+wl_columnar_merge_segment_finish(wl_columnar_consolidate_record_t *record,
+    wl_columnar_relation_private_batch_t *writer, col_rel_t *r,
+    wl_evaluation_control_t *c)
+{
+    wl_columnar_relation_radix_sequence_t *seq = &record->sequence;
+    uint32_t count = seq->seg_count;
+    int rc = wl_evaluation_control_charge(c, 96); if (rc) return rc;
+    uint64_t generation = seq->view_generation + seq->needs_sort_count;
+    wl_columnar_relation_mutation_lease_t *lease = &writer->batch.single.lease;
+    if (record->lane != WL_COLUMNAR_CONSOLIDATE_RADIX_MERGE || count < 2u
+        || record->phase != WL_COLUMNAR_CONSOLIDATE_CONSUMED || !seq->consumed
+        || !record->starts || record->ends != record->starts + count
+        || !record->merge_admission_active || writer->batch.relation != r
+        || writer->phase != WL_COLUMNAR_RELATION_PRIVATE_HELD
+        || r->view_generation != generation || r->nrows != seq->nrows
+        || r->columns != (int64_t **)seq->columns || r->ncols != seq->ncols
+        || r->storage_generation != seq->relation_generation
+        || col_rel_mutation_lease_validate(lease, r)) return EINVAL;
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    int64_t *merged = (int64_t *)(record->starts + (size_t)count * 2u);
+    wl_columnar_merge_segment_heap_entry_t local_heap[2];
+    wl_columnar_merge_segment_heap_entry_t *heap = count < 3u ? local_heap
+        : (wl_columnar_merge_segment_heap_entry_t *)((char *)merged
+        + (size_t)r->nrows * r->ncols * 8u + 8u);
+    for (uint32_t i = 0; i < count; i++) {
+        rc = wl_evaluation_control_charge(c, 24); if (rc) return rc;
+        uint32_t start = seq->boundaries[i], end = seq->boundaries[i + 1u];
+        uint32_t kept = start < end ? start + 1u : end;
+        record->starts[i] = start;
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+        for (uint32_t row = kept; row < end; row++) {
+            int cmp;
+            rc = wl_columnar_merge_segment_compare(record, r, kept - 1u, row,
+                    NULL, &cmp, c); if (rc) return rc;
+            if (!cmp) continue;
+            for (uint32_t col = 0; col < r->ncols; col++) {
+                rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+                r->columns[col][kept] = r->columns[col][row];
+                wl_columnar_relation_consolidate_checkpoint(c, 105, col + 1u,
+                    record, r);
+                rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+            }
+            rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+            kept++;
+            rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+        }
+        rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+        record->ends[i] = kept;
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    }
+    uint32_t size = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        rc = wl_evaluation_control_charge(c, sizeof(*heap) + 16u);
+        if (rc) return rc;
+        if (record->starts[i] < record->ends[i]) {
+            heap[size++] = (wl_columnar_merge_segment_heap_entry_t){i,
+                                                                    record->
+                                                                    starts[i],
+                                                                    record->ends
+                                                                    [i]};
+        }
+        wl_columnar_relation_consolidate_checkpoint(c, count >= 3u ? 108 : 109,
+            (uint64_t)i + 1u, record, r);
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    }
+    for (uint32_t i = size / 2u; i;) {
+        rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+        i--;
+        rc = wl_columnar_merge_segment_sift(record, r, heap, i, size, c);
+        if (rc) return rc;
+    }
+    uint32_t output = 0;
+    while (size) {
+        int cmp = 1;
+        if (output) {
+            rc = wl_columnar_merge_segment_compare(record, r, heap[0].cursor,
+                    0, merged + (size_t)(output - 1u) * r->ncols, &cmp, c);
+            if (rc) return rc;
+        }
+        if (cmp) {
+            for (uint32_t col = 0; col < r->ncols; col++) {
+                rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+                merged[(size_t)output * r->ncols +
+                    col] = r->columns[col][heap[0].cursor];
+                wl_columnar_relation_consolidate_checkpoint(c, 110, col + 1u,
+                    record, r);
+                rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+            }
+            rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+            output++;
+            rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+        }
+        rc = wl_evaluation_control_charge(c, sizeof(*heap) + 16u);
+        if (rc) return rc;
+        heap[0].cursor++;
+        if (heap[0].cursor == heap[0].end) heap[0] = heap[--size];
+        wl_columnar_relation_consolidate_checkpoint(c, 111, output, record, r);
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+        if (size) {
+            rc = wl_columnar_merge_segment_sift(record, r, heap, 0, size, c);
+            if (rc) return rc;
+        }
+    }
+    for (uint32_t row = 0; row < output; row++)
+        for (uint32_t col = 0; col < r->ncols; col++) {
+            rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+            r->columns[col][row] = merged[(size_t)row * r->ncols + col];
+            wl_columnar_relation_consolidate_checkpoint(c, 112,
+                (uint64_t)row * r->ncols + col + 1u, record, r);
+            rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+        }
+    rc = wl_evaluation_control_charge(c, 64); if (rc) return rc;
+    if (r->view_generation != generation || r->nrows != seq->nrows
+        || col_rel_mutation_lease_validate(lease, r)) return EINVAL;
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    r->nrows = output; r->sorted_nrows = output;
+    r->run_count = 1; r->run_ends[0] = output;
+    r->view_generation++; lease->set->published = true;
     return 0;
 }
 
@@ -2242,12 +2640,17 @@ wl_columnar_merge_consolidate_controlled(eval_stack_t *stack,
         return wl_columnar_relation_source_group_drain(group, 0);
     }
     rc = wl_evaluation_control_charge(c, 32); if (rc) goto cleanup;
-    if (in->nrows > 1u && (original->seg_count > 1
-        || (original->seg_boundaries && (original->seg_count != 1
-        || original->seg_boundaries[0] ||
-        original->seg_boundaries[1] != in->nrows))
-        || (in->sorted_nrows && in->sorted_nrows < in->nrows))) {
-        rc = ENOTSUP; goto cleanup;
+    if ((!segments && segment_count > 1u) || (segments && !segment_count)
+        || (segments &&
+        (segments[0] || segments[segment_count] != in->nrows))) {
+        rc = EINVAL; goto cleanup;
+    }
+    for (uint32_t i = 0; segments && i < segment_count; i++) {
+        rc = wl_evaluation_control_charge(c, 16); if (rc) goto cleanup;
+        if (segments[i] > segments[i + 1u] || segments[i + 1u] > in->nrows) {
+            rc = EINVAL; goto cleanup;
+        }
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto cleanup;
     }
     rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto cleanup;
     if (owned) {
@@ -2275,12 +2678,9 @@ wl_columnar_merge_consolidate_controlled(eval_stack_t *stack,
         rc = wl_columnar_merge_consolidate_owned_shape(out, c);
         if (rc) goto cleanup;
         rc = wl_evaluation_control_charge(c, 32); if (rc) goto cleanup;
-        if (out->nrows > 1u && (result->seg_count > 1
-            || (result->seg_boundaries && (result->seg_count != 1
-            || result->seg_boundaries[0]
-            || result->seg_boundaries[1] != out->nrows))
-            || (out->sorted_nrows && out->sorted_nrows < out->nrows))) {
-            rc = ENOTSUP; goto cleanup;
+        if (result->seg_boundaries != segments ||
+            result->seg_count != segment_count) {
+            rc = EINVAL; goto cleanup;
         }
         rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto cleanup;
         if (out->nrows <= 1u) {
@@ -2356,6 +2756,25 @@ prepare:;
         rc = wl_columnar_merge_consolidate_reset(record, c);
         if (rc) goto cleanup;
     }
+    uint32_t local_bounds[3] = {0, out->nrows, out->nrows};
+    const uint32_t *sort_bounds = local_bounds;
+    uint32_t sort_count = 1;
+    if (segments && segment_count >= 2u) {
+        sort_bounds = segments; sort_count = segment_count;
+    } else if (owned && out->sorted_nrows && out->sorted_nrows < out->nrows) {
+        local_bounds[1] = out->sorted_nrows; sort_count = 2;
+    }
+    if (sort_count > 1u) {
+        wl_columnar_relation_consolidate_checkpoint(c, 121, sort_count, record,
+            out);
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto cleanup;
+        rc = wl_columnar_relation_radix_sequence_prepare_with_lease_controlled(
+            out, sort_bounds, sort_count, &record->sequence, lease, c);
+        if (rc) goto cleanup;
+        rc = wl_columnar_merge_segment_allocate(record, out, c);
+        if (rc) goto cleanup;
+        goto prepared;
+    }
     wl_columnar_memory_admission_status_t status;
     rc = wl_columnar_memory_governor_reserve_checked_controlled(
         wl_columnar_memory_governor_ref_get(out->memory_governor), 8,
@@ -2391,6 +2810,7 @@ prepare:;
     wl_columnar_relation_consolidate_checkpoint(c, 37, 0, record, out);
     rc = wl_columnar_relation_radix_sequence_prepare_with_lease_controlled(
         out, bounds, 1, &record->sequence, lease, c); if (rc) goto cleanup;
+prepared:
     rc = wl_evaluation_control_charge(c, 8); if (rc) goto cleanup;
     record->phase = WL_COLUMNAR_CONSOLIDATE_PREPARED;
     rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto cleanup;
@@ -2409,7 +2829,9 @@ prepare:;
     wl_columnar_relation_consolidate_checkpoint(c, 31, out->view_generation,
         record, out);
     rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto cleanup;
-    rc = wl_columnar_merge_consolidate_dedup(record, writer, out, c);
+    rc = record->sequence.seg_count > 1u
+        ? wl_columnar_merge_segment_finish(record, writer, out, c)
+        : wl_columnar_merge_consolidate_dedup(record, writer, out, c);
     if (rc) goto cleanup;
     wl_columnar_relation_consolidate_checkpoint(c, 32, out->view_generation,
         record, out);

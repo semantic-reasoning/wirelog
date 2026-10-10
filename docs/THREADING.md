@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **329**). The earlier audit sections
+match the script's count (currently **334**). The earlier audit sections
 retain their historical per-section counts.
 
 Format: `file:function[#N]` | field | operation | order | justification.
@@ -284,6 +284,11 @@ throughput by 2-10x.
 |---|---|---|---|---|
 | `io_adapter.c:init_mutex` | `s_mutex_init_ok` | `atomic_store` | `seq_cst` (default) | One-shot mutex-init publish; the bare API used here gives sequential consistency which is the strongest order and safe for an init publisher |
 | `io_adapter.c:ensure_builtins` | `s_mutex_init_ok` | `atomic_load` | `seq_cst` (default) | Pairs with the init publish; gates all later mutex operations |
+| `relation.c:wl_columnar_relation_pool_reuse_controlled` | `r->storage_alias_borrows` | `atomic_load_explicit` | `acquire` | Quiescent successful checked-destroy tombstone validation before logical pool reuse |
+| `relation.c:wl_columnar_relation_pool_reuse_controlled#2` | `r->source_access.state` | `atomic_load_explicit` | `acquire` | Quiescent successful checked-destroy tombstone validation before logical pool reuse |
+| `relation.c:wl_columnar_relation_pool_reuse_controlled#3` | `r->descriptor_access.state` | `atomic_load_explicit` | `acquire` | Quiescent successful checked-destroy tombstone validation before logical pool reuse |
+| `relation.c:wl_columnar_relation_pool_reuse_controlled#4` | `t->owner_bits` | `atomic_load_explicit` | `acquire` | Quiescent successful checked-destroy tombstone validation before logical pool reuse |
+| `relation.c:wl_columnar_relation_pool_reuse_controlled#5` | `t->state` | `atomic_load_explicit` | `acquire` | Quiescent successful checked-destroy tombstone validation before logical pool reuse |
 | `relation.c:col_rel_new_identity` | `wl_next_relation_identity` | `atomic_load_explicit` | `relaxed` | Read the candidate identity before the non-wrapping CAS reservation loop; the counter only has to hand out distinct values, no other memory is published through it |
 | `relation.c:col_rel_new_identity#2` | `wl_next_relation_identity` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Reserve a unique relation identity and retry with the observed value after a lost race; uniqueness comes from the RMW, not from ordering |
 | `relation.c:col_rel_test_set_next_identity` | `wl_next_relation_identity` | `atomic_store_explicit` | `relaxed` | Test-only seam for selecting the terminal allocator state; production allocation is not concurrent with this reset |
@@ -1605,3 +1610,20 @@ physical bucket through byte/short aliases, with a separate histogram. Checked
 retirement frees each allocation once and NULLs aliases before original credit.
 Healthy work is charged; mandatory checked drain after failure uses the existing
 cleanup exclusion, preserving positive primary errors and refused authority.
+
+### Controlled CONCAT and segment SET ownership
+
+The externally serialized W1 attempt retains original input entries, result,
+source group, private writer, bulk transaction, sequence and aggregate tokens
+in the unchanged evaluator frame. Aggregate starts/ends are aliases of one
+allocation only in the explicit segment merge lane; retirement clears both
+pointers after freeing the base and before credit release. Source and private
+authority retire before checked input destruction. Physical width, Arrow and
+dedup destruction remains a cleanup exclusion with polls before and after each
+disposer, so cancellation latency can include one destructor. A refused reader
+keeps the original entry reachable; it does not authorize pool reuse.
+
+New-attempt pool reuse observes exact terminal gate states and inactive original
+token identity after pending cleanup has finished. A bounded registry scan and
+fixed descriptor headers precede one charged, polled counter cutoff. It changes
+neither slab bytes nor arena counters and creates no token or reader authority.

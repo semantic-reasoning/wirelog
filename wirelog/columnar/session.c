@@ -5344,10 +5344,14 @@ wl_columnar_session_serial_preflight(wl_col_session_t *sess)
         || sess->arr_count || sess->darr_count || sess->filt_arr_count
         || sess->diff_arr_count || sess->sarr_count || sess->filt_cache_count
         || sess->mat_cache.count || sess->mat_cache.active_pins
-        || (sess->delta_pool && sess->delta_pool->slot_used)
         || sess->frontier_ops != &col_frontier_epoch_ops
         || !sess->memory_governor || sess->cleanup_active
         || sess->coordinator) return ENOTSUP;
+    if (sess->delta_pool && (sess->delta_pool->slot_used
+        || sess->delta_pool->arena_used)) {
+        rc = wl_columnar_relation_pool_reuse_controlled(sess, control);
+        if (rc) return rc;
+    }
     rc = wl_columnar_session_serial_tail(control, 1, 0, NULL);
     if (rc) return rc;
     /* No automatic authority token: each admitted registry descriptor is
@@ -5388,7 +5392,14 @@ wl_columnar_session_serial_preflight(wl_col_session_t *sess)
                 && (rp->op_count == 3 ? rp->ops[2].op == WL_PLAN_OP_CONSOLIDATE
                     : rp->ops[2].op == WL_PLAN_OP_MAP
                 && rp->ops[3].op == WL_PLAN_OP_CONSOLIDATE);
-            if (!rp->name || !rp->ops || (!plain && !filtered && !joined)
+            bool union_plan = false;
+            if (rp->ops && rp->op_count >= 5u) {
+                rc = wl_columnar_eval_plan_union_validate(rp, control,
+                        &union_plan);
+                if (rc) return rc;
+            }
+            if (!rp->name || !rp->ops ||
+                (!plain && !filtered && !joined && !union_plan)
                 || rp->ops[0].op != WL_PLAN_OP_VARIABLE
                 || (rp->ops[0].delta_mode != WL_DELTA_AUTO
                 && rp->ops[0].delta_mode != WL_DELTA_FORCE_FULL))
