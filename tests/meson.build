@@ -692,6 +692,18 @@ test('bench_flowlog_tdd_bdx_json_nofusion', bench_flowlog_json_py3,
      suite: 'bench',
      timeout: 90)
 
+# Issue #2114: a snapshot after an incremental insert must equal a fresh
+# full evaluation on CSPA, for disjoint and for overlapping inserts.  One
+# run evaluates CSPA several times, and the sanitizer legs run it in a
+# debug build beside other tests, hence the long timeout.
+test('bench_flowlog_cspa_incremental_model', bench_flowlog_json_py3,
+     args: [files('check_bench_cspa_incremental.py')[0],
+            bench_flowlog.full_path(),
+            meson.project_source_root() / 'bench/data/cspa', '4'],
+     depends: bench_flowlog,
+     suite: 'bench',
+     timeout: 900)
+
 # Issue #287: logger env parser tests (pure function; no env mutation).
 test_log_parse_exe = executable(
   'test_log_parse',
