@@ -19,6 +19,7 @@
 #include "../wirelog/wirelog.h"
 #include "plan_fixture.h"
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -427,6 +428,395 @@ test_plan_op_abi_values(void)
 }
 
 /* ----------------------------------------------------------------
+ * Issue #2118: EDB partition metadata
+ *
+ * tdd_init_workers_hybrid hash-partitions the EDB an EXCHANGE names, by
+ * edb_key_col_idxs, for the whole stratum.  That is sound only when the
+ * keys are that EDB's own columns and every relation of the stratum that
+ * reads the EDB names it with the same keys and reads it once.  These
+ * tests check that invariant over plans built with and without the
+ * planning passes, and pin the metadata of a few programs.
+ * ---------------------------------------------------------------- */
+
+static wl_plan_t *
+make_plan_raw(const char *src)
+{
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    if (!prog)
+        return NULL;
+    wl_plan_t *plan = NULL;
+    if (wl_plan_from_program(prog, &plan) != 0) {
+        wirelog_program_free(prog);
+        return NULL;
+    }
+    plan_fixture_hold(prog);
+    return plan;
+}
+
+static const wl_plan_op_exchange_t *
+exchange_meta(const wl_plan_relation_t *rel)
+{
+    for (uint32_t i = 0; i < rel->op_count; i++) {
+        if (rel->ops[i].op == WL_PLAN_OP_EXCHANGE)
+            return (const wl_plan_op_exchange_t *)rel->ops[i].opaque_data;
+    }
+    return NULL;
+}
+
+static uint32_t
+ops_read_count(const wl_plan_op_t *ops, uint32_t n, const char *name)
+{
+    uint32_t refs = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (ops[i].op == WL_PLAN_OP_K_FUSION && ops[i].opaque_data) {
+            const wl_plan_op_k_fusion_t *kf
+                = (const wl_plan_op_k_fusion_t *)ops[i].opaque_data;
+            refs += ops_read_count(kf->k_ops[0], kf->k_op_counts[0], name);
+            continue;
+        }
+        if (ops[i].relation_name && strcmp(ops[i].relation_name, name) == 0)
+            refs++;
+        if (ops[i].right_relation && strcmp(ops[i].right_relation, name) == 0)
+            refs++;
+        if (ops[i].op == WL_PLAN_OP_LFTJ && ops[i].opaque_data) {
+            const wl_plan_op_lftj_t *lftj
+                = (const wl_plan_op_lftj_t *)ops[i].opaque_data;
+            for (uint32_t q = 0; q < lftj->k; q++) {
+                if (strcmp(lftj->rel_names[q], name) == 0)
+                    refs++;
+            }
+        }
+    }
+    return refs;
+}
+
+/* True when `ops` (or a fused relation's first sequence) uses `name` as
+ * the right operand of a semijoin or antijoin, which needs all its rows. */
+static bool
+ops_filter_by(const wl_plan_op_t *ops, uint32_t n, const char *name)
+{
+    for (uint32_t i = 0; i < n; i++) {
+        if (ops[i].op == WL_PLAN_OP_K_FUSION && ops[i].opaque_data) {
+            const wl_plan_op_k_fusion_t *kf
+                = (const wl_plan_op_k_fusion_t *)ops[i].opaque_data;
+            if (ops_filter_by(kf->k_ops[0], kf->k_op_counts[0], name))
+                return true;
+            continue;
+        }
+        if ((ops[i].op == WL_PLAN_OP_SEMIJOIN
+            || ops[i].op == WL_PLAN_OP_ANTIJOIN)
+            && ops[i].right_relation
+            && strcmp(ops[i].right_relation, name) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* NULL when every named EDB partition is sound, else what is wrong. */
+static const char *
+edb_partition_violation(const wl_plan_t *plan)
+{
+    for (uint32_t s = 0; s < plan->stratum_count; s++) {
+        const wl_plan_stratum_t *st = &plan->strata[s];
+        if (!st->is_recursive)
+            continue;
+        for (uint32_t r = 0; r < st->relation_count; r++) {
+            const wl_plan_op_exchange_t *m = exchange_meta(&st->relations[r]);
+            if (!m || !m->edb_rel_name)
+                continue;
+            uint32_t width = WL_PLAN_WIDTH_UNDECLARED;
+            for (uint32_t e = 0; e < plan->edb_count; e++) {
+                if (strcmp(plan->edb_relations[e], m->edb_rel_name) == 0)
+                    width = plan->edb_declared_width[e];
+            }
+            if (width == WL_PLAN_WIDTH_UNDECLARED)
+                return "named relation is not a declared EDB";
+            if (m->edb_key_col_count == 0 || !m->edb_key_col_idxs)
+                return "named EDB has no partition key";
+            for (uint32_t k = 0; k < m->edb_key_col_count; k++) {
+                if (m->edb_key_col_idxs[k] >= width)
+                    return "EDB partition key outside the EDB";
+            }
+            for (uint32_t r2 = 0; r2 < st->relation_count; r2++) {
+                const wl_plan_relation_t *other = &st->relations[r2];
+                uint32_t refs = ops_read_count(other->ops, other->op_count,
+                        m->edb_rel_name);
+                if (refs == 0)
+                    continue;
+                if (ops_filter_by(other->ops, other->op_count,
+                    m->edb_rel_name))
+                    return "partitioned EDB filters by semijoin or antijoin";
+                const wl_plan_op_exchange_t *om = exchange_meta(other);
+                if (refs != 1 || !om || !om->edb_rel_name
+                    || strcmp(om->edb_rel_name, m->edb_rel_name) != 0
+                    || om->edb_key_col_count != m->edb_key_col_count
+                    || memcmp(om->edb_key_col_idxs, m->edb_key_col_idxs,
+                    m->edb_key_col_count * sizeof(uint32_t)) != 0)
+                    return "stratum reads the partitioned EDB elsewhere";
+            }
+        }
+    }
+    return NULL;
+}
+
+#define DECL_EFA                                                         \
+        ".decl e(x: int64, y: int64)\n.decl f(x: int64, y: int64)\n" \
+        ".decl a(x: int64, y: int64)\na(x, y) :- f(x, y).\n"
+
+static const char *const edb_partition_programs[] = {
+    DECL_EFA "a(x, z) :- e(x, y), a(y, w), a(w, z).\n",
+    DECL_EFA "a(x, z) :- e(x, y), f(y, w), a(w, z).\n",
+    DECL_EFA "a(x, z) :- a(x, y), e(y, w), a(w, z).\n",
+    DECL_EFA "a(x, z) :- a(x, y), e(y, w), f(w, z).\n",
+    DECL_EFA "a(x, z) :- a(x, y), a(y, w), e(w, z).\n",
+    DECL_EFA "a(x, z) :- e(y, x), a(y, w), e(w, z).\n",
+    DECL_EFA "a(x, z) :- e(x, y), a(y, z).\n",
+    ".decl e(x: int64, y: int64)\n.decl n(x: int64, y: int64)\n"
+    ".decl a(x: int64, y: int64)\n"
+    "a(x, y) :- e(x, y), !n(x, y).\na(x, y) :- e(y, x).\n"
+    "a(x, z) :- a(x, y), a(y, z).\n",
+    DECL_EFA ".decl b(x: int64, y: int64)\n"
+    "a(x, z) :- e(x, y), a(y, z).\nb(x, y) :- a(y, x).\n"
+    "b(x, z) :- e(z, x), b(z, y).\na(x, y) :- b(x, y).\n",
+    DECL_EFA ".decl g(x: int64, y: int64)\n.decl b(x: int64, y: int64)\n"
+    "a(x, y) :- e(x, y), b(x, y).\n"
+    "b(u, v) :- g(u, v), b(v, u).\nb(u, v) :- a(u, v).\n",
+    ".decl addressOf(v: int64, o: int64)\n.decl assign(v1: int64, v2: int64)\n"
+    ".decl load(v1: int64, v2: int64)\n.decl store(v1: int64, v2: int64)\n"
+    ".decl pointsTo(v: int64, o: int64)\n"
+    "pointsTo(v, o) :- addressOf(v, o).\n"
+    "pointsTo(v1, o) :- assign(v1, v2), pointsTo(v2, o).\n"
+    "pointsTo(v1, o) :- load(v1, v2), pointsTo(v2, p), pointsTo(p, o).\n"
+    "pointsTo(v1, o) :- store(v1, v2), pointsTo(v1, p), "
+    "pointsTo(v2, o).\n",
+};
+
+static void
+test_plan_edb_partition_invariant(void)
+{
+    TEST("EDB partition metadata is sound with and without passes (#2118)");
+    size_t n = sizeof(edb_partition_programs)
+        / sizeof(edb_partition_programs[0]);
+    for (size_t i = 0; i < n; i++) {
+        for (int passes = 0; passes <= 1; passes++) {
+            wl_plan_t *plan = passes ? make_plan(edb_partition_programs[i])
+                : make_plan_raw(edb_partition_programs[i]);
+            ASSERT(plan != NULL, "plan generation failed");
+            const char *why = edb_partition_violation(plan);
+            if (why) {
+                printf("program %zu passes=%d: ", i, passes);
+                wl_plan_free(plan);
+                FAIL(why);
+                return;
+            }
+            wl_plan_free(plan);
+        }
+    }
+    PASS();
+}
+
+/* The metadata of relation `name` in the first recursive stratum. */
+static const wl_plan_op_exchange_t *
+recursive_exchange(const wl_plan_t *plan, const char *name)
+{
+    for (uint32_t s = 0; s < plan->stratum_count; s++) {
+        const wl_plan_stratum_t *st = &plan->strata[s];
+        if (!st->is_recursive)
+            continue;
+        for (uint32_t r = 0; r < st->relation_count; r++) {
+            if (strcmp(st->relations[r].name, name) == 0)
+                return exchange_meta(&st->relations[r]);
+        }
+    }
+    return NULL;
+}
+
+static bool
+edb_meta_is(const wl_plan_op_exchange_t *m, const char *name, uint32_t key)
+{
+    if (!m)
+        return false;
+    if (!name)
+        return m->edb_rel_name == NULL;
+    return m->edb_rel_name && strcmp(m->edb_rel_name, name) == 0
+           && m->edb_key_col_count == 1 && m->edb_key_col_idxs[0] == key;
+}
+
+static void
+test_plan_edb_partition_exact(void)
+{
+    TEST("EDB partition metadata of known programs (#2118)");
+    for (int passes = 0; passes <= 1; passes++) {
+        wl_plan_t *(*build)(const char *) = passes ? make_plan : make_plan_raw;
+
+        /* The EDB joined with the IDB through an intermediate result is
+         * replicated, and so is the base-rule EDB. */
+        wl_plan_t *plan = build(edb_partition_programs[0]);
+        ASSERT(plan, "plan e,a,a");
+        ASSERT(edb_meta_is(recursive_exchange(plan, "a"), NULL, 0),
+            "e,a,a partitions no EDB");
+        wl_plan_free(plan);
+
+        plan = build(edb_partition_programs[1]);
+        ASSERT(plan, "plan e,f,a");
+        ASSERT(edb_meta_is(recursive_exchange(plan, "a"), NULL, 0),
+            "e,f,a partitions no EDB");
+        wl_plan_free(plan);
+
+        /* Linear recursion: e is the join's direct left operand. */
+        plan = build(edb_partition_programs[6]);
+        ASSERT(plan, "plan linear");
+        ASSERT(edb_meta_is(recursive_exchange(plan, "a"), "e", 1),
+            "linear e,a co-partitions e by column 1");
+        wl_plan_free(plan);
+
+        /* a and b would partition e by different columns. */
+        plan = build(edb_partition_programs[8]);
+        ASSERT(plan, "plan mutual");
+        ASSERT(edb_meta_is(recursive_exchange(plan, "a"), NULL, 0)
+            && edb_meta_is(recursive_exchange(plan, "b"), NULL, 0),
+            "mutual recursion over e partitions no EDB");
+        wl_plan_free(plan);
+
+        /* a joins e with b on (x, y), but b is partitioned by (v, u):
+         * e stays replicated.  No join reads a itself, so a has no
+         * EXCHANGE.  b's own join with g is aligned. */
+        plan = build(edb_partition_programs[9]);
+        ASSERT(plan, "plan key order");
+        const wl_plan_op_exchange_t *mb = recursive_exchange(plan, "b");
+        ASSERT(!recursive_exchange(plan, "a") && mb && mb->edb_rel_name
+            && strcmp(mb->edb_rel_name, "g") == 0
+            && mb->key_col_count == 2 && mb->key_col_idxs[0] == 1
+            && mb->key_col_idxs[1] == 0,
+            "a over e misaligned with b stays replicated; b names g");
+        wl_plan_free(plan);
+    }
+
+    /* The CSPA K1 recogniser in eval_tdd_plan.c matches memoryAlias by
+     * edb_key_col_idxs == {0} with no EDB name. */
+    wl_plan_t *plan = make_plan(
+        ".decl assign(x: int32, y: int32)\n"
+        ".decl dereference(x: int32, y: int32)\n"
+        ".decl valueFlow(x: int32, y: int32)\n"
+        ".decl memoryAlias(x: int32, y: int32)\n"
+        ".decl valueAlias(x: int32, y: int32)\n"
+        "valueFlow(y, x) :- assign(y, x).\n"
+        "valueFlow(x, x) :- assign(x, _).\n"
+        "valueFlow(x, x) :- assign(_, x).\n"
+        "memoryAlias(x, x) :- assign(_, x).\n"
+        "memoryAlias(x, x) :- assign(x, _).\n"
+        "valueFlow(x, y) :- valueFlow(x, z), valueFlow(z, y).\n"
+        "valueFlow(x, y) :- assign(x, z), memoryAlias(z, y).\n"
+        "memoryAlias(x, w) :- dereference(y, x), valueAlias(y, z), "
+        "dereference(z, w).\n"
+        "valueAlias(x, y) :- valueFlow(z, x), valueFlow(z, y).\n"
+        "valueAlias(x, y) :- valueFlow(z, x), memoryAlias(z, w), "
+        "valueFlow(w, y).\n");
+    ASSERT(plan, "plan cspa");
+    const wl_plan_op_exchange_t *ma = recursive_exchange(plan, "memoryAlias");
+    ASSERT(ma && ma->edb_key_col_count == 1 && ma->edb_key_col_idxs
+        && ma->edb_key_col_idxs[0] == 0 && !ma->edb_rel_name,
+        "memoryAlias keeps ek {0} with no EDB name");
+    wl_plan_free(plan);
+    PASS();
+}
+
+/* ----------------------------------------------------------------
+ * Issue #2118: IDB EXCHANGE keys
+ *
+ * The EXCHANGE key partitions its relation's rows, so every key must be
+ * a column of that relation.  Keys taken from an earlier join's result or
+ * from another relation's columns ran past the relation's width and made
+ * snapshots fail with EINVAL at two or more workers.
+ * ---------------------------------------------------------------- */
+
+static const char *const idb_key_programs[] = {
+    ".decl e0(c0: int64, c1: int64)\n"
+    ".decl a(c0: int64, c1: int64, c2: int64)\n"
+    ".decl b(c0: int64, c1: int64)\n"
+    "a(x2, x0, x0) :- e0(x0, x1), e0(x1, x2), !e0(x2, x1).\n"
+    "b(x2, x0) :- a(x0, x1, 2), a(y1, x2, x1), !e0(y1, x2).\n"
+    "a(x2, x0, x2) :- b(x0, x1), e0(x2, x1).\n",
+    ".decl e0(c0: int64, c1: int64)\n.decl e1(c0: int64)\n"
+    ".decl e2(c0: int64, c1: int64)\n.decl a(c0: int64, c1: int64)\n"
+    ".decl b(c0: int64)\n"
+    "a(x2, x0) :- e2(x0, x1), e1(x2), x0 < x1.\n"
+    "a(x3, x3) :- e1(x1), e1(x2), e2(x2, x3).\n"
+    "b(x2) :- e1(x0), e2(x2, x1), !e0(x0, x2).\n"
+    "b(x2) :- b(x1), a(x2, x1), x2 < x1.\n"
+    "a(x1, x2) :- e0(x0, x1), b(x1), e1(x2), !e2(x0, x0).\n",
+    DECL_EFA ".decl g(x: int64, y: int64)\n.decl b(x: int64, y: int64)\n"
+    "a(x, z) :- a(x, y), b(y, z).\nb(x, y) :- a(x, y).\n"
+    "b(v0, v3) :- b(v1, v0), e(v1, v2), g(v3, v2).\n",
+};
+
+/* NULL when every EXCHANGE key is a column of its relation. */
+static const char *
+idb_key_violation(const wl_plan_t *plan, const wirelog_program_t *prog)
+{
+    for (uint32_t s = 0; s < plan->stratum_count; s++) {
+        const wl_plan_stratum_t *st = &plan->strata[s];
+        if (!st->is_recursive)
+            continue;
+        for (uint32_t r = 0; r < st->relation_count; r++) {
+            const wl_plan_op_exchange_t *m = exchange_meta(&st->relations[r]);
+            if (!m)
+                continue;
+            const wirelog_schema_t *schema = wirelog_program_get_schema(prog,
+                    st->relations[r].name);
+            if (!schema)
+                return "relation has no schema";
+            if (m->key_col_count == 0)
+                return "EXCHANGE without a key";
+            for (uint32_t k = 0; k < m->key_col_count; k++) {
+                if (m->key_col_idxs[k] >= schema->column_count)
+                    return "EXCHANGE key outside its relation";
+            }
+        }
+    }
+    return NULL;
+}
+
+static void
+test_plan_idb_key_invariant(void)
+{
+    TEST("IDB EXCHANGE keys are columns of their relation (#2118)");
+    const char *const *lists[] = { edb_partition_programs, idb_key_programs };
+    size_t counts[] = {
+        sizeof(edb_partition_programs) / sizeof(edb_partition_programs[0]),
+        sizeof(idb_key_programs) / sizeof(idb_key_programs[0]),
+    };
+    for (size_t l = 0; l < 2; l++) {
+        for (size_t i = 0; i < counts[l]; i++) {
+            for (int passes = 0; passes <= 1; passes++) {
+                wirelog_error_t err;
+                wirelog_program_t *prog = wirelog_parse_string(lists[l][i],
+                        &err);
+                ASSERT(prog != NULL, "parse failed");
+                if (passes) {
+                    wl_fusion_apply(prog, NULL);
+                    wl_jpp_apply(prog, NULL);
+                    wl_sip_apply(prog, NULL);
+                }
+                wl_plan_t *plan = NULL;
+                ASSERT(wl_plan_from_program(prog, &plan) == 0,
+                    "plan generation failed");
+                plan_fixture_hold(prog);
+                const char *why = idb_key_violation(plan, prog);
+                wl_plan_free(plan);
+                if (why) {
+                    printf("list %zu program %zu passes=%d: ", l, i, passes);
+                    FAIL(why);
+                    return;
+                }
+            }
+        }
+    }
+    PASS();
+}
+
+/* ----------------------------------------------------------------
  * Main
  * ---------------------------------------------------------------- */
 
@@ -441,6 +831,9 @@ main(void)
     test_plan_exchange_key_metadata();
     test_plan_multi_join_exchange();
     test_plan_exchange_cleanup();
+    test_plan_edb_partition_invariant();
+    test_plan_edb_partition_exact();
+    test_plan_idb_key_invariant();
 
     printf("\n%d tests: %d passed, %d failed\n", test_count, pass_count,
         fail_count);
