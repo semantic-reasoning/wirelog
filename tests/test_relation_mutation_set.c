@@ -795,6 +795,81 @@ public_batch_copy_tests(void)
     assert(col_rel_destroy_checked(r) == 0);
 }
 
+/* A wide all-FLOAT batch is validated as a whole before any mutation: the
+ * copy checks each cell only as it stores it, so a non-finite value in the
+ * very last cell must still leave the relation unchanged.  -0.0 is still
+ * normalized in every column, including when the input aliases the
+ * relation's own column storage and is staged in scratch first. */
+static void
+public_float_batch_tests(void)
+{
+    enum { COLS = 32, ROWS = 256 };
+    wirelog_column_type_t types[COLS];
+    for (uint32_t c = 0; c < COLS; c++)
+        types[c] = WIRELOG_TYPE_FLOAT;
+    col_rel_t *r = col_rel_new_auto("public_float_batch", COLS);
+    assert(r && col_rel_set_column_types(r, types, COLS) == 0);
+    static int64_t rows[ROWS][COLS];
+    for (uint32_t i = 0; i < ROWS; i++) {
+        for (uint32_t c = 0; c < COLS; c++) {
+            double value = (i + c) % 5u == 0u ? -0.0 : (double)i + c * 0.5;
+            memcpy(&rows[i][c], &value, sizeof(value));
+        }
+    }
+    bool denied = true;
+    assert(col_rel_append_rows_atomic(r, &rows[0][0], ROWS, COLS, &denied)
+        == 0 && !denied && r->nrows == ROWS);
+    for (uint32_t i = 0; i < ROWS; i++) {
+        for (uint32_t c = 0; c < COLS; c++) {
+            int64_t expect = (i + c) % 5u == 0u ? 0 : rows[i][c];
+            assert(r->columns[c][i] == expect);
+        }
+    }
+    const int64_t bad[2] = { (int64_t)UINT64_C(0x7ff8000000000000),
+                             (int64_t)UINT64_C(0xfff0000000000000) };
+    for (int b = 0; b < 2; b++) {
+        int64_t saved = rows[ROWS - 1][COLS - 1];
+        rows[ROWS - 1][COLS - 1] = bad[b];
+        uint64_t view = r->view_generation;
+        assert(col_rel_append_rows_atomic(r, &rows[0][0], ROWS, COLS, &denied)
+            == EINVAL && !denied);
+        assert(r->nrows == ROWS && r->view_generation == view);
+        rows[ROWS - 1][COLS - 1] = saved;
+    }
+    assert(col_rel_destroy_checked(r) == 0);
+
+    /* The same batch read from column 0 of the destination itself. */
+    enum { CELLS = ROWS * COLS };
+    r = col_rel_new_auto("public_float_batch_alias", COLS);
+    assert(r && col_rel_set_column_types(r, types, COLS) == 0);
+    assert(col_rel_reserve_capacity_admitted(r, CELLS + ROWS, NULL) == 0
+        && r->capacity >= CELLS + ROWS);
+    int64_t *alias = r->columns[0];
+    static int64_t snapshot[CELLS];
+    memcpy(alias, &rows[0][0], sizeof(snapshot));
+    memcpy(snapshot, alias, sizeof(snapshot));
+    assert(col_rel_append_rows_atomic(r, alias, ROWS, COLS, &denied) == 0
+        && !denied && r->nrows == ROWS);
+    for (uint32_t i = 0; i < ROWS; i++) {
+        for (uint32_t c = 0; c < COLS; c++) {
+            int64_t in = snapshot[(size_t)i * COLS + c];
+            assert(r->columns[c][i]
+                == ((i + c) % 5u == 0u ? 0 : in));
+        }
+    }
+    for (int b = 0; b < 2; b++) {
+        alias = r->columns[0];
+        alias[CELLS - 1] = bad[b];
+        memcpy(snapshot, alias, sizeof(snapshot));
+        uint64_t view = r->view_generation;
+        assert(col_rel_append_rows_atomic(r, alias, ROWS, COLS, &denied)
+            == EINVAL && !denied);
+        assert(r->nrows == ROWS && r->view_generation == view
+            && memcmp(r->columns[0], snapshot, sizeof(snapshot)) == 0);
+    }
+    assert(col_rel_destroy_checked(r) == 0);
+}
+
 static void
 filter_batch_tests(void)
 {
@@ -1381,6 +1456,7 @@ main(void)
     metadata_final_access_test();
     append_batch_tests();
     public_batch_copy_tests();
+    public_float_batch_tests();
     filter_batch_tests();
     filter_op_batch_tests();
     join_batch_tests();
