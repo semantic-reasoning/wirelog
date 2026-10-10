@@ -70,8 +70,10 @@ class PortfolioResultTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertIn("identity", portfolio.validate_bench_json(parsed, "cspa-fast", 8, 5) or "")
 
+    OVERLAP = "cspa_incr_overlap\t10\t2\t9.0\t3.0\t3.00\t120\t120\t00000000000000ff\t00000000000000ff\t3100\tOK"
+
     def test_rejects_cspa_nonfinite_tsv_fields(self) -> None:
-        valid = "cspa_incr\t1\t10\t9\t0.1\t2\t5\t100\t110\t4\t5\t3000\tOK"
+        valid = "cspa_incr\t1\t10\t9\t0.1\t2\t5\t100\t110\t4\t5\t3000\tOK\n" + self.OVERLAP
         parsed, error = portfolio.parse_cspa_incremental_tsv(valid)
         self.assertIsNone(error)
         self.assertEqual(parsed["tuples_after"], 110)
@@ -82,6 +84,45 @@ class PortfolioResultTests(unittest.TestCase):
         parsed, error = portfolio.parse_cspa_incremental_tsv(valid + "\n" + valid)
         self.assertIsNone(parsed)
         self.assertIn("one cspa_incr", error or "")
+
+    def test_cspa_overlap_row_is_required_and_checked(self) -> None:
+        incr = "cspa_incr\t1\t10\t9\t0.1\t2\t5\t100\t110\t4\t5\t3000\tOK"
+        parsed, error = portfolio.parse_cspa_incremental_tsv(incr + "\n" + self.OVERLAP)
+        self.assertIsNone(error)
+        self.assertEqual(parsed["overlap"]["tuples_incr"], 120)
+        self.assertEqual(parsed["overlap"]["held_rows"], 2)
+        summary = portfolio.summarize_bench(parsed)
+        self.assertEqual(summary["overlap_speedup"], 3.0)
+        self.assertEqual(summary["overlap_reeval_ms"], 3.0)
+
+        parsed, error = portfolio.parse_cspa_incremental_tsv(incr)
+        self.assertIsNone(parsed)
+        self.assertIn("missing cspa_incr_overlap", error or "")
+
+        parsed, error = portfolio.parse_cspa_incremental_tsv(
+            incr + "\n" + self.OVERLAP + "\n" + self.OVERLAP
+        )
+        self.assertIsNone(parsed)
+        self.assertIn("one cspa_incr_overlap", error or "")
+
+        # A slow overlap row is reported, not gated.
+        slow = self.OVERLAP.replace("\t3.00\t", "\t0.50\t")
+        parsed, error = portfolio.parse_cspa_incremental_tsv(incr + "\n" + slow)
+        self.assertIsNone(error)
+        self.assertEqual(parsed["overlap"]["speedup"], 0.5)
+
+        for bad, needle in (
+            (self.OVERLAP.replace("\tOK", "\tFAIL"), "status"),
+            (self.OVERLAP.replace("\t120\t120\t", "\t120\t119\t"), "tuple count"),
+            (self.OVERLAP.replace("ff\t3100", "fe\t3100"), "hash"),
+            (self.OVERLAP.replace("00000000000000ff\t0", "xyz\t0"), "hash"),
+            (self.OVERLAP.replace("\t9.0\t", "\tinf\t"), "finite"),
+            (self.OVERLAP.replace("\t3100\t", "\t"), "fields"),
+        ):
+            with self.subTest(needle=needle):
+                parsed, error = portfolio.parse_cspa_incremental_tsv(incr + "\n" + bad)
+                self.assertIsNone(parsed)
+                self.assertIn(needle, error or "")
 
     def test_parses_standard_tsv_emitted_despite_json_request(self) -> None:
         header = "workload\tnodes\tedges\tworkers\trepeat\tmin_ms\tmedian_ms\tmax_ms\tpeak_rss_kb\ttuples\titerations\tstatus"

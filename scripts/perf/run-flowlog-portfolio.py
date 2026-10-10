@@ -385,9 +385,71 @@ def parse_cspa_incremental_tsv(stdout: str) -> tuple[dict[str, Any] | None, str 
         ):
             if not math.isfinite(parsed[name]) or parsed[name] < 0:
                 return None, f"cspa_incr field {name} is not a finite nonnegative number"
+        overlap, error = parse_cspa_overlap_tsv(stdout)
+        if error is not None:
+            return None, error
+        parsed["overlap"] = overlap
         return parsed, None
 
     return None, "missing cspa_incr TSV row"
+
+
+def parse_cspa_hash(value: str) -> str:
+    if len(value) != 16 or any(c not in "0123456789abcdef" for c in value):
+        raise ValueError(f"tuple hash {value!r} is not 16 lowercase hex digits")
+    return value
+
+
+def parse_cspa_overlap_tsv(stdout: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Issue #2114: the overlapping-insert row is a correctness check.
+
+    The bench holds back part of the real assign rows, inserts them after a
+    first snapshot, and compares the second snapshot with a fresh full
+    evaluation by tuple count and an order-independent tuple hash. A
+    differing count or hash fails the row. Its speedup is reported but not
+    gated.
+    """
+    columns = [
+        ("workload", str),
+        ("facts", parse_int),
+        ("held_rows", parse_int),
+        ("full_ms", parse_float),
+        ("reeval_ms", parse_float),
+        ("speedup", parse_float),
+        ("tuples_full", parse_int),
+        ("tuples_incr", parse_int),
+        ("hash_full", parse_cspa_hash),
+        ("hash_incr", parse_cspa_hash),
+        ("peak_rss_kb", parse_int),
+        ("bench_status", str),
+    ]
+    rows = [line for line in stdout.splitlines() if line.startswith("cspa_incr_overlap\t")]
+    if not rows:
+        return None, "missing cspa_incr_overlap TSV row"
+    if len(rows) > 1:
+        return None, f"expected one cspa_incr_overlap TSV row, found {len(rows)}"
+    fields = rows[0].split("\t")
+    if len(fields) != len(columns):
+        return None, f"cspa_incr_overlap row has {len(fields)} fields, expected {len(columns)}"
+    parsed: dict[str, Any] = {}
+    try:
+        for (name, converter), value in zip(columns, fields, strict=True):
+            parsed[name] = converter(value)
+    except ValueError as exc:
+        return None, f"invalid cspa_incr_overlap field: {exc}"
+    if parsed["bench_status"] != "OK":
+        return None, "cspa_incr_overlap row has unexpected status"
+    for name in ("facts", "held_rows", "tuples_full", "tuples_incr", "peak_rss_kb"):
+        if parsed[name] < 0:
+            return None, f"cspa_incr_overlap field {name} is negative"
+    for name in ("full_ms", "reeval_ms", "speedup"):
+        if not math.isfinite(parsed[name]) or parsed[name] < 0:
+            return None, f"cspa_incr_overlap field {name} is not a finite nonnegative number"
+    if parsed["tuples_incr"] != parsed["tuples_full"]:
+        return None, "cspa_incr_overlap tuple count differs from full evaluation"
+    if parsed["hash_incr"] != parsed["hash_full"]:
+        return None, "cspa_incr_overlap tuple hash differs from full evaluation"
+    return parsed, None
 
 
 def parse_bench_output(
@@ -457,6 +519,7 @@ def summarize_bench(parsed: dict[str, Any] | None) -> dict[str, Any]:
         return {}
     if parsed.get("workload") == "cspa_incr":
         reeval_ms = parsed.get("reeval_ms")
+        overlap = parsed.get("overlap") or {}
         return {
             "bench_workload": parsed.get("workload"),
             "tuples": parsed.get("tuples_after"),
@@ -465,6 +528,8 @@ def summarize_bench(parsed: dict[str, Any] | None) -> dict[str, Any]:
             "median_ms": reeval_ms,
             "reeval_ms": reeval_ms,
             "speedup": parsed.get("speedup"),
+            "overlap_reeval_ms": overlap.get("reeval_ms"),
+            "overlap_speedup": overlap.get("speedup"),
         }
     wall = parsed.get("wall_time_ms")
     median_ms = wall.get("median") if isinstance(wall, dict) else None

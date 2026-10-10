@@ -338,6 +338,42 @@ count_tuple_cb(const char *relation, const int64_t *row, uint32_t ncols,
     ctx->count++;
 }
 
+/*
+ * Issue #2114: an order-independent digest of a snapshot. Each tuple is
+ * hashed with its relation name and the per-tuple hashes are summed, so
+ * two snapshots that emit the same tuples in a different order agree.
+ */
+struct hash_ctx {
+    int64_t count;
+    uint64_t sum;
+};
+
+static uint64_t
+bench_mix64(uint64_t x)
+{
+    x ^= x >> 30;
+    x *= UINT64_C(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x *= UINT64_C(0x94d049bb133111eb);
+    x ^= x >> 31;
+    return x;
+}
+
+static void
+hash_tuple_cb(const char *relation, const int64_t *row, uint32_t ncols,
+    void *user_data)
+{
+    struct hash_ctx *ctx = (struct hash_ctx *)user_data;
+    uint64_t h = UINT64_C(0xcbf29ce484222325);
+    for (const char *c = relation; *c; c++)
+        h = (h ^ (uint64_t)(unsigned char)*c) * UINT64_C(0x100000001b3);
+    h = bench_mix64(h ^ ncols);
+    for (uint32_t i = 0; i < ncols; i++)
+        h = bench_mix64(h ^ (uint64_t)row[i]);
+    ctx->sum += h;
+    ctx->count++;
+}
+
 /* ----------------------------------------------------------------
  * Pipeline with counting
  * ---------------------------------------------------------------- */
@@ -1172,6 +1208,116 @@ run_tdd_bdx_workload(const char *data_path, uint32_t workers, int repeat)
     return status_ok ? 0 : -1;
 }
 
+struct cspa_batch {
+    const char *relation;
+    const int64_t *rows;
+    int32_t count;
+};
+
+/* Issue #2114: insert `first` into a fresh session and snapshot it. When
+ * `second` is non-empty, insert it next and snapshot again. The digest and
+ * time are those of the last snapshot. */
+static int
+cspa_session_digest(wl_plan_t *plan, uint32_t workers,
+    const struct cspa_batch *first, uint32_t nfirst,
+    const struct cspa_batch *second, uint32_t nsecond, struct hash_ctx *out,
+    double *out_ms)
+{
+    wl_session_t *sess = NULL;
+    int rc = wl_session_create(wl_backend_columnar(), plan, workers, &sess);
+    if (rc != 0)
+        return rc;
+    for (uint32_t i = 0; i < nfirst && rc == 0; i++)
+        rc = col_session_insert_incremental(sess, first[i].relation,
+                first[i].rows, (uint32_t)first[i].count, 2);
+    struct hash_ctx ctx = { 0 };
+    bench_time_t t0 = bench_time_now();
+    if (rc == 0)
+        rc = wl_session_snapshot(sess, hash_tuple_cb, &ctx);
+    bench_time_t t1 = bench_time_now();
+    if (nsecond > 0) {
+        for (uint32_t i = 0; i < nsecond && rc == 0; i++)
+            rc = col_session_insert_incremental(sess, second[i].relation,
+                    second[i].rows, (uint32_t)second[i].count, 2);
+        memset(&ctx, 0, sizeof(ctx));
+        t0 = bench_time_now();
+        if (rc == 0)
+            rc = wl_session_snapshot(sess, hash_tuple_cb, &ctx);
+        t1 = bench_time_now();
+    }
+    wl_session_destroy(sess);
+    *out = ctx;
+    *out_ms = bench_time_diff_ms(t0, t1);
+    return rc;
+}
+
+/* Issue #2114: hold back the last 20% of the real assign rows, insert them
+ * after a first snapshot, and compare the second snapshot of every repeat
+ * with `full`, a fresh full evaluation over every row that took `full_ms`.
+ * The held rows join existing ones, unlike the offset rows of cspa_incr.
+ * Speedup is reported, not gated; a differing tuple count or digest fails
+ * the row, which then shows the first repeat that differed. */
+static int
+run_cspa_overlap_row(wl_plan_t *plan, uint32_t workers, int repeat,
+    const int64_t *assign_data, int32_t assign_count,
+    const int64_t *deref_data, int32_t deref_count,
+    const struct hash_ctx *full, double full_ms)
+{
+    int32_t held = assign_count / 5;
+    if (held < 1)
+        held = 1;
+    int32_t kept = assign_count - held;
+    const struct cspa_batch first[] = {
+        { "assign", assign_data, kept },
+        { "dereference", deref_data, deref_count },
+    };
+    const struct cspa_batch second[] = {
+        { "assign", assign_data + (size_t)kept * 2, held },
+    };
+
+    double *reeval_times = (double *)malloc(sizeof(double) * (size_t)repeat);
+    struct hash_ctx shown = { 0 };
+    int status_ok = reeval_times != NULL;
+    int same = 1;
+    for (int r = 0; status_ok && r < repeat; r++) {
+        struct hash_ctx incr = { 0 };
+        if (cspa_session_digest(plan, workers, first, 2, second, 1, &incr,
+            &reeval_times[r])
+            != 0) {
+            status_ok = 0;
+        } else if (same) {
+            shown = incr;
+            same = incr.count == full->count && incr.sum == full->sum;
+        }
+    }
+
+    int64_t peak_rss = bench_peak_rss_kb();
+    if (status_ok) {
+        qsort(reeval_times, (size_t)repeat, sizeof(double), bench_cmp_double);
+        double reeval_ms = reeval_times[repeat / 2];
+        double speedup = (reeval_ms > 0.0) ? full_ms / reeval_ms : 0.0;
+        printf("# cspa_incr_overlap columns: workload facts held_rows "
+            "full_ms reeval_ms speedup tuples_full tuples_incr hash_full "
+            "hash_incr peak_rss_kb status\n");
+        printf("cspa_incr_overlap\t%d\t%d\t%.1f\t%.1f\t%.2f\t%" PRId64
+            "\t%" PRId64 "\t%016" PRIx64 "\t%016" PRIx64 "\t%" PRId64
+            "\t%s\n",
+            assign_count + deref_count, held, full_ms, reeval_ms, speedup,
+            full->count, shown.count, full->sum, shown.sum, peak_rss,
+            same ? "OK" : "FAIL");
+        fprintf(stderr,
+            "cspa_incr_overlap: full=%.1fms reeval=%.1fms speedup=%.2fx "
+            "tuples=%lld/%lld %s\n",
+            full_ms, reeval_ms, speedup, (long long)full->count,
+            (long long)shown.count, same ? "match" : "MISMATCH");
+    } else {
+        printf("cspa_incr_overlap\t%d\t%d\t-\t-\t-\t-\t-\t-\t-\t-\tFAIL\n",
+            assign_count + deref_count, held);
+    }
+    free(reeval_times);
+    return status_ok && same ? 0 : -1;
+}
+
 static int
 run_cspa_incremental_workload(const char *data_dir, uint32_t workers,
     int repeat)
@@ -1333,7 +1479,6 @@ run_cspa_incremental_workload(const char *data_dir, uint32_t workers,
         return -1;
     }
 
-    int64_t initial_tuples = 0;
     int64_t reeval_tuples = 0;
     uint32_t initial_iters = 0;
     uint32_t reeval_iters = 0;
@@ -1370,7 +1515,26 @@ run_cspa_incremental_workload(const char *data_dir, uint32_t workers,
         return -1;
     }
 
-    for (int r = 0; r < repeat; r++) {
+    /* Issue #2114: every repeat's re-evaluated model must equal a fresh full
+     * evaluation over the same rows, and every initial snapshot must hold
+     * as many tuples as the baseline pipeline, which loads the facts from
+     * the program text instead.  The first repeat that differs is shown and
+     * fails the row. */
+    const struct cspa_batch with_new[] = {
+        { "assign", assign_data, assign_count },
+        { "dereference", deref_data, deref_count },
+        { "assign", new_assign, new_count },
+    };
+    struct hash_ctx after_ref = { 0 };
+    struct hash_ctx initial_ref = { 0 };
+    double after_ref_ms = 0.0;
+    int first_bad = -1;
+    if (cspa_session_digest(plan, workers, with_new, 3, NULL, 0, &after_ref,
+        &after_ref_ms)
+        != 0)
+        status_ok = 0;
+
+    for (int r = 0; status_ok && r < repeat; r++) {
         /* Create a fresh session for each repeat */
         wl_session_t *sess = NULL;
         rc = wl_session_create(wl_backend_columnar(), plan, workers, &sess);
@@ -1392,9 +1556,9 @@ run_cspa_incremental_workload(const char *data_dir, uint32_t workers,
         }
 
         /* Initial evaluation (full, frontier not yet set) */
-        struct count_ctx ctx1 = { 0 };
+        struct hash_ctx ctx1 = { 0 };
         bench_time_t t0 = bench_time_now();
-        rc = wl_session_snapshot(sess, count_tuple_cb, &ctx1);
+        rc = wl_session_snapshot(sess, hash_tuple_cb, &ctx1);
         bench_time_t t1 = bench_time_now();
         initial_times[r] = bench_time_diff_ms(t0, t1);
         if (rc != 0) {
@@ -1402,8 +1566,17 @@ run_cspa_incremental_workload(const char *data_dir, uint32_t workers,
             status_ok = 0;
             break;
         }
-        initial_tuples = ctx1.count;
-        (void)initial_tuples;
+        if (r == 0)
+            initial_ref = ctx1;
+        int initial_same = ctx1.count == baseline_tuples
+            && ctx1.count == initial_ref.count && ctx1.sum == initial_ref.sum;
+        if (first_bad < 0 && !initial_same) {
+            first_bad = r;
+            fprintf(stderr,
+                "cspa_incr: initial snapshot of repeat %d holds %lld tuples, "
+                "baseline %lld\n",
+                r, (long long)ctx1.count, (long long)baseline_tuples);
+        }
         initial_iters = col_session_get_iteration_count(sess);
         (void)initial_iters;
 
@@ -1420,9 +1593,9 @@ run_cspa_incremental_workload(const char *data_dir, uint32_t workers,
         }
 
         /* Incremental re-evaluation: frontier skip active for converged strata */
-        struct count_ctx ctx2 = { 0 };
+        struct hash_ctx ctx2 = { 0 };
         bench_time_t tr0 = bench_time_now();
-        rc = wl_session_snapshot(sess, count_tuple_cb, &ctx2);
+        rc = wl_session_snapshot(sess, hash_tuple_cb, &ctx2);
         bench_time_t tr1 = bench_time_now();
         reeval_times[r] = bench_time_diff_ms(tr0, tr1);
         if (rc != 0) {
@@ -1430,10 +1603,31 @@ run_cspa_incremental_workload(const char *data_dir, uint32_t workers,
             status_ok = 0;
             break;
         }
-        reeval_tuples = ctx2.count;
+        if (first_bad < 0 || first_bad == r)
+            reeval_tuples = ctx2.count;
+        if (first_bad < 0
+            && (ctx2.count != after_ref.count || ctx2.sum != after_ref.sum)) {
+            first_bad = r;
+            fprintf(stderr,
+                "cspa_incr: model of repeat %d differs from full "
+                "evaluation (tuples %lld vs %lld)\n",
+                r, (long long)ctx2.count, (long long)after_ref.count);
+        }
         reeval_iters = col_session_get_iteration_count(sess);
 
         wl_session_destroy(sess);
+    }
+
+    int model_ok = first_bad < 0;
+
+    /* The overlap row's full reference is the initial snapshot: a fresh
+     * evaluation over every assign and dereference row. */
+    int overlap_rc = -1;
+    if (status_ok) {
+        qsort(initial_times, (size_t)repeat, sizeof(double), bench_cmp_double);
+        overlap_rc = run_cspa_overlap_row(plan, workers, repeat, assign_data,
+                assign_count, deref_data, deref_count, &initial_ref,
+                initial_times[repeat / 2]);
     }
 
     wl_plan_free(plan);
@@ -1455,7 +1649,9 @@ run_cspa_incremental_workload(const char *data_dir, uint32_t workers,
         double insert_ms = insert_times[repeat / 2];
         double reeval_ms = reeval_times[repeat / 2];
         double speedup = (reeval_ms > 0.0) ? baseline_ms / reeval_ms : 0.0;
-        const char *status = (speedup >= 2.0) ? "OK" : "SLOW";
+        const char *status = !model_ok ? "FAIL"
+            : (speedup >= 2.0) ? "OK"
+            : "SLOW";
 
         /* Print custom incremental header on first line */
         printf("# cspa_incr columns: workload facts baseline_ms initial_ms "
@@ -1483,7 +1679,7 @@ run_cspa_incremental_workload(const char *data_dir, uint32_t workers,
     free(initial_times);
     free(insert_times);
     free(reeval_times);
-    return status_ok ? 0 : -1;
+    return status_ok && model_ok && overlap_rc == 0 ? 0 : -1;
 }
 
 /* ----------------------------------------------------------------
