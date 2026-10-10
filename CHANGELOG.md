@@ -78,6 +78,22 @@ All notable changes to wirelog are documented in this file.
   beside `a(x0, x3) :- a(x0, x1), h(x1, x2), a(x3, x2).`.  The `tdd-bdx`
   benchmark on 5000 edges takes about 126 ms instead of 100 ms at eight
   workers as a result.
+  The key each relation of such a stratum is partitioned by had the same
+  flaw: it was taken from the last join reading a relation of the
+  stratum, so it could address an earlier join's result or another
+  relation's columns and run past the relation's width, failing with
+  `EINVAL` at two or more workers -- for example with `b(v0, v3) :- b(v1,
+  v0), e(v1, v2), g(v3, v2).` beside `a(x, z) :- a(x, y), b(y, z).`, and,
+  with the passes applied, for a three-column relation keyed by a
+  two-column one.  The key is now the columns a join of the stratum reads
+  the relation by where the relation is a direct operand; a relation no
+  join reads that way gets no EXCHANGE, and a strategy that partitions it
+  uses the runtime's default key, its first column.  A relation whose
+  own rules contain no join still gets no EXCHANGE either, so a stratum
+  can now be left without any: with `b(x, y) :- a(x, y), x < y.` beside
+  `a(x, z) :- b(x, y), b(y, z).`, no join reads `a`, `b`'s rule joins
+  nothing, and the stratum falls back from the TDD strategies to the
+  non-TDD evaluator; before, it ran under the bdx strategy.
 
 - **The required heap correctness check watches the moved compaction
   code** (#2084): `perf-suite-required.yml` fired only on
