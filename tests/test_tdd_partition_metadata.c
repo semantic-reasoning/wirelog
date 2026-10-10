@@ -276,6 +276,33 @@ static const struct test_case cases[] = {
       "a(x2, x2) :- e2(0, x1), e1(x1, x2, y1).\n"
       "a(x0, x3) :- a(x0, x1), e2(x1, x2), a(x3, x2).\n",
       60, 20, 3, 1u },
+    /* The relation's EXCHANGE key came from another relation's columns
+     * or from an earlier join's result, past the relation's own width:
+     * EINVAL at W >= 2, with and without the passes. */
+    { "key_from_wider_relation",
+      ".decl e0(c0: int64, c1: int64)\n"
+      ".decl a(c0: int64, c1: int64, c2: int64)\n"
+      ".decl b(c0: int64, c1: int64)\n"
+      "a(x2, x0, x0) :- e0(x0, x1), e0(x1, x2), !e0(x2, x1).\n"
+      "b(x2, x0) :- a(x0, x1, 2), a(y1, x2, x1), !e0(y1, x2).\n"
+      "a(x2, x0, x2) :- b(x0, x1), e0(x2, x1).\n",
+      80, 25, 1, 3u },
+    { "key_on_unary_relation",
+      ".decl e0(c0: int64, c1: int64)\n.decl e1(c0: int64)\n"
+      ".decl e2(c0: int64, c1: int64)\n.decl a(c0: int64, c1: int64)\n"
+      ".decl b(c0: int64)\n"
+      "a(x2, x0) :- e2(x0, x1), e1(x2), x0 < x1.\n"
+      "a(x3, x3) :- e1(x1), e1(x2), e2(x2, x3).\n"
+      "b(x2) :- e1(x0), e2(x2, x1), !e0(x0, x2).\n"
+      "b(x2) :- b(x1), a(x2, x1), x2 < x1.\n"
+      "a(x1, x2) :- e0(x0, x1), b(x1), e1(x2), !e2(x0, x0).\n",
+      80, 25, 1, 3u },
+    { "key_from_earlier_join",
+      DECL_EFA ".decl g(x: int64, y: int64)\n.decl b(x: int64, y: int64)\n"
+      "a(x, y) :- f(x, y).\na(x, z) :- a(x, y), b(y, z).\n"
+      "b(x, y) :- a(x, y).\n"
+      "b(v0, v3) :- b(v1, v0), e(v1, v2), g(v3, v2).\n",
+      60, 20, 1, 1u },
     { "andersen",
       ".decl addressOf(v: int64, o: int64)\n.decl assign(v1: int64, v2: int64)\n"
       ".decl load(v1: int64, v2: int64)\n.decl store(v1: int64, v2: int64)\n"

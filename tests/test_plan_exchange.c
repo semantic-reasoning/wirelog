@@ -680,16 +680,15 @@ test_plan_edb_partition_exact(void)
         wl_plan_free(plan);
 
         /* a joins e with b on (x, y), but b is partitioned by (v, u):
-         * e stays replicated.  b's own join with g is aligned. */
+         * e stays replicated.  No join reads a itself, so a has no
+         * EXCHANGE.  b's own join with g is aligned. */
         plan = build(edb_partition_programs[9]);
         ASSERT(plan, "plan key order");
-        const wl_plan_op_exchange_t *ma = recursive_exchange(plan, "a");
         const wl_plan_op_exchange_t *mb = recursive_exchange(plan, "b");
-        ASSERT(ma && !ma->edb_rel_name && mb && mb->edb_rel_name
+        ASSERT(!recursive_exchange(plan, "a") && mb && mb->edb_rel_name
             && strcmp(mb->edb_rel_name, "g") == 0
             && mb->key_col_count == 2 && mb->key_col_idxs[0] == 1
-            && mb->key_col_idxs[1] == 0 && ma->key_col_count == 2
-            && ma->key_col_idxs[0] == 0 && ma->key_col_idxs[1] == 1,
+            && mb->key_col_idxs[1] == 0,
             "a over e misaligned with b stays replicated; b names g");
         wl_plan_free(plan);
     }
@@ -724,6 +723,100 @@ test_plan_edb_partition_exact(void)
 }
 
 /* ----------------------------------------------------------------
+ * Issue #2118: IDB EXCHANGE keys
+ *
+ * The EXCHANGE key partitions its relation's rows, so every key must be
+ * a column of that relation.  Keys taken from an earlier join's result or
+ * from another relation's columns ran past the relation's width and made
+ * snapshots fail with EINVAL at two or more workers.
+ * ---------------------------------------------------------------- */
+
+static const char *const idb_key_programs[] = {
+    ".decl e0(c0: int64, c1: int64)\n"
+    ".decl a(c0: int64, c1: int64, c2: int64)\n"
+    ".decl b(c0: int64, c1: int64)\n"
+    "a(x2, x0, x0) :- e0(x0, x1), e0(x1, x2), !e0(x2, x1).\n"
+    "b(x2, x0) :- a(x0, x1, 2), a(y1, x2, x1), !e0(y1, x2).\n"
+    "a(x2, x0, x2) :- b(x0, x1), e0(x2, x1).\n",
+    ".decl e0(c0: int64, c1: int64)\n.decl e1(c0: int64)\n"
+    ".decl e2(c0: int64, c1: int64)\n.decl a(c0: int64, c1: int64)\n"
+    ".decl b(c0: int64)\n"
+    "a(x2, x0) :- e2(x0, x1), e1(x2), x0 < x1.\n"
+    "a(x3, x3) :- e1(x1), e1(x2), e2(x2, x3).\n"
+    "b(x2) :- e1(x0), e2(x2, x1), !e0(x0, x2).\n"
+    "b(x2) :- b(x1), a(x2, x1), x2 < x1.\n"
+    "a(x1, x2) :- e0(x0, x1), b(x1), e1(x2), !e2(x0, x0).\n",
+    DECL_EFA ".decl g(x: int64, y: int64)\n.decl b(x: int64, y: int64)\n"
+    "a(x, z) :- a(x, y), b(y, z).\nb(x, y) :- a(x, y).\n"
+    "b(v0, v3) :- b(v1, v0), e(v1, v2), g(v3, v2).\n",
+};
+
+/* NULL when every EXCHANGE key is a column of its relation. */
+static const char *
+idb_key_violation(const wl_plan_t *plan, const wirelog_program_t *prog)
+{
+    for (uint32_t s = 0; s < plan->stratum_count; s++) {
+        const wl_plan_stratum_t *st = &plan->strata[s];
+        if (!st->is_recursive)
+            continue;
+        for (uint32_t r = 0; r < st->relation_count; r++) {
+            const wl_plan_op_exchange_t *m = exchange_meta(&st->relations[r]);
+            if (!m)
+                continue;
+            const wirelog_schema_t *schema = wirelog_program_get_schema(prog,
+                    st->relations[r].name);
+            if (!schema)
+                return "relation has no schema";
+            if (m->key_col_count == 0)
+                return "EXCHANGE without a key";
+            for (uint32_t k = 0; k < m->key_col_count; k++) {
+                if (m->key_col_idxs[k] >= schema->column_count)
+                    return "EXCHANGE key outside its relation";
+            }
+        }
+    }
+    return NULL;
+}
+
+static void
+test_plan_idb_key_invariant(void)
+{
+    TEST("IDB EXCHANGE keys are columns of their relation (#2118)");
+    const char *const *lists[] = { edb_partition_programs, idb_key_programs };
+    size_t counts[] = {
+        sizeof(edb_partition_programs) / sizeof(edb_partition_programs[0]),
+        sizeof(idb_key_programs) / sizeof(idb_key_programs[0]),
+    };
+    for (size_t l = 0; l < 2; l++) {
+        for (size_t i = 0; i < counts[l]; i++) {
+            for (int passes = 0; passes <= 1; passes++) {
+                wirelog_error_t err;
+                wirelog_program_t *prog = wirelog_parse_string(lists[l][i],
+                        &err);
+                ASSERT(prog != NULL, "parse failed");
+                if (passes) {
+                    wl_fusion_apply(prog, NULL);
+                    wl_jpp_apply(prog, NULL);
+                    wl_sip_apply(prog, NULL);
+                }
+                wl_plan_t *plan = NULL;
+                ASSERT(wl_plan_from_program(prog, &plan) == 0,
+                    "plan generation failed");
+                plan_fixture_hold(prog);
+                const char *why = idb_key_violation(plan, prog);
+                wl_plan_free(plan);
+                if (why) {
+                    printf("list %zu program %zu passes=%d: ", l, i, passes);
+                    FAIL(why);
+                    return;
+                }
+            }
+        }
+    }
+    PASS();
+}
+
+/* ----------------------------------------------------------------
  * Main
  * ---------------------------------------------------------------- */
 
@@ -740,6 +833,7 @@ main(void)
     test_plan_exchange_cleanup();
     test_plan_edb_partition_invariant();
     test_plan_edb_partition_exact();
+    test_plan_idb_key_invariant();
 
     printf("\n%d tests: %d passed, %d failed\n", test_count, pass_count,
         fail_count);
