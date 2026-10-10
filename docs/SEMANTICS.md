@@ -1133,4 +1133,35 @@ alias before credit. All histogram initialization/prefix, count/scatter and
 column gather/write loops are bounded. Genuine unsorted generated AUTO products
 and expression duplicate projections exercise this caller without plan retagging.
 Typed original-schema helper fixtures are separate from typed producer coverage.
-Sorted-prefix and multisegment SET remain subsequent full-task obligations.
+Sorted-prefix and multisegment SET use the same controlled range kernels and
+original frame authorities. Remaining full-task obligations include generated
+typed routes beyond the selected producers, general delta/reset and recursive
+evaluation, differential observers, batch/pipeline execution and LFTJ.
+
+### Controlled ordinary aggregate evaluation
+
+The selected generated W1 routes are AUTO VARIABLE/REDUCE/CONSOLIDATE and
+VARIABLE/FILTER/REDUCE/CONSOLIDATE. Real REDUCE produces typed owned output,
+including FLOAT SUM/MIN/MAX/AVG; this does not establish typed MAP output.
+The original input stays in its frame entry while the original source group
+pins its descriptor and storage. Scratch and one checked compiled expression
+use the existing operator preparation record. Eight-aligned scratch regions
+precede the type array, preserving the raw scratch sum without padding.
+
+Empty private output metadata uses the original bulk record and its descriptor
+and storage writers. Name lengths are rescanned in bounded passes without a
+governed length cache. Partial schema children remain reachable before every
+fallible tail. Accepted metadata commitment precedes logical installation;
+stops or refusal retain the actual RESERVED or COMMITTED token for checked
+drain. Physical pointers are NULL before credit retirement, and a refused
+original token retains its actual frame slot and writers.
+
+Dirty FLOAT heads retain their grid, type/schema storage and credits during
+reset. Primitive schema validation runs under the original reset writers;
+preflight checks all targets before any logical reset. Publishing reset keeps
+the existing replacement generation event and advances the consumed cursor
+before cleanup. Positive execution errors survive real cleanup refusal;
+positive cleanup errors replace success or negative stops. Input destruction
+uses the existing physical cleanup exclusion, with polls immediately before
+and after the disposer. This selected aggregate route does not complete the
+remaining full-task execution lanes listed above.

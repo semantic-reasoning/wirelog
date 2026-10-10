@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **334**). The earlier audit sections
+match the script's count (currently **331**). The earlier audit sections
 retain their historical per-section counts.
 
 Format: `file:function[#N]` | field | operation | order | justification.
@@ -829,9 +829,6 @@ checks under exclusive ownership do not imply an acquire publication edge.
 | `merge.c:wl_columnar_merge_consolidate_reset` | `record->sequence.metadata_admission.state` | `atomic_store_explicit` | `relaxed` | Exclusive durable reset initializes EMPTY at original embedded identity before preparing workspace; no acquire/publication edge. |
 | `merge.c:wl_columnar_merge_consolidate_reset#2` | `record->sequence.workspace.admission.state` | `atomic_store_explicit` | `relaxed` | Exclusive durable reset initializes EMPTY at original embedded identity before preparing workspace; no acquire/publication edge. |
 | `merge.c:wl_columnar_merge_consolidate_reset#3` | `record->merge_admission.state` | `atomic_store_explicit` | `relaxed` | Exclusive durable reset initializes EMPTY at original embedded identity before preparing workspace; no acquire/publication edge. |
-| `ops.c:wl_columnar_ops_reduce_controlled` | `scratch.state` | `atomic_load` | `seq_cst (default)` | Default seq_cst observes actual scratch state for retained cleanup/release/rollback; this is not a fake credit refund. |
-| `ops.c:wl_columnar_ops_reduce_controlled#2` | `scratch.state` | `atomic_load` | `seq_cst (default)` | Default seq_cst observes actual scratch state for retained cleanup/release/rollback; this is not a fake credit refund. |
-| `ops.c:wl_columnar_ops_reduce_controlled#3` | `scratch.state` | `atomic_load` | `seq_cst (default)` | Default seq_cst observes actual scratch state for retained cleanup/release/rollback; this is not a fake credit refund. |
 | `relation.c:wl_columnar_relation_retire_payload_credit_known` | `r->retained_reservation.state` | `atomic_load_explicit` | `acquire` | Acquire retained payload credit state before checked mandatory retirement of physically retired storage. |
 | `relation.c:wl_columnar_relation_publish_retained_controlled` | `r->retained_reservation.state` | `atomic_load_explicit` | `acquire` | Acquire actual old/new reservation states before validated owner-transfer publication; no detached token copy. |
 | `relation.c:wl_columnar_relation_publish_retained_controlled#2` | `previous_out->state` | `atomic_load_explicit` | `acquire` | Acquire actual old/new reservation states before validated owner-transfer publication; no detached token copy. |
@@ -1627,3 +1624,21 @@ New-attempt pool reuse observes exact terminal gate states and inactive original
 token identity after pending cleanup has finished. A bounded registry scan and
 fixed descriptor headers precede one charged, polled counter cutoff. It changes
 neither slab bytes nor arena counters and creates no token or reader authority.
+
+### Controlled REDUCE ownership
+
+Ordinary REDUCE keeps its source in the original input slot and its scratch and
+compiled expression in the existing operator preparation record. The source
+group remains live through grouping; the private producer writer finishes
+before CONS acquires a fresh nonce. The separate original bulk record owns
+partial prepared schema, old metadata, and their original credit tokens.
+Metadata commitment and logical installation remain distinct, so accepted
+COMMITTED credit is released after physical cleanup even on a prelogical stop.
+No live token or owning Arrow schema is copied into an automatic cleanup image.
+
+Healthy preparation retirement is charged; mandatory checked drain retains the
+existing cleanup exclusion and all identity/state checks. A refusal retains
+the real frame and original authority. Dirty primitive FLOAT reset validates
+schema under both original writers without allocating or releasing payload.
+Its caller always finishes cleanup, preserves an existing positive primary,
+and consumes a published reset cursor before a possible cleanup refusal.

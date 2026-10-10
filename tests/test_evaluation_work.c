@@ -18243,6 +18243,839 @@ test_serial_segmented_attempts(void)
         "serial segmented: genuine AUTO UNION initial/dirty raw twins and original segment/aggregate lifecycle passed\n");
 }
 
+static wl_col_session_t *reduced_session;
+static unsigned reduced_rows_seen, reduced_compiled_seen, reduced_cons_seen;
+static unsigned reduced_interpreted_seen;
+static unsigned reduced_offset_passes, reduced_offset_stopped,
+    reduced_offset_started;
+static bool reduced_offset_cancel;
+static wl_col_session_t *reduced_offset_session;
+static void
+reduced_offset_checkpoint(wl_evaluation_control_t *c, int stage,
+    uint64_t progress, wl_columnar_consolidate_record_t *record, col_rel_t *r)
+{
+    (void)r;
+    if (!record && (stage == 60 || stage == 68)) record =
+            wl_columnar_eval_stack_cleanup_consolidate(
+            reduced_offset_session->cleanup_active);
+    if (stage == 104) CHECK(record->sequence.workspace.admission.bytes
+            == UINT64_C(18) * 50000u + 262144u + 8u * (11u + 1u)
+            && record->sequence.workspace.k16_capacity == 50000u
+            && record->sequence.workspace.insertion_capacity == 11u);
+    if (stage == 60 && progress == 1u) {
+        CHECK(record->sequence.workspace.perm_a[0] == 11u);
+        reduced_offset_started++;
+    }
+    if (stage == 60 && progress == 50000u)
+        CHECK(record->sequence.workspace.perm_a[49999] == 50010u);
+    if (stage != 68) return;
+    CHECK(record && reduced_offset_started == 1u
+        && record->sequence.seg_count == 2u
+        && record->sequence.boundaries[1] == 11u
+        && record->sequence.boundaries[2] == 50011u
+        && progress >= 1u && progress <= 4u);
+    reduced_offset_passes |= 1u << (progress - 1u);
+    if (reduced_offset_cancel && !reduced_offset_stopped && progress == 3u) {
+        reduced_offset_stopped++; wl_evaluation_control_request_cancel(c);
+    }
+}
+static void
+reduced_offset_entry(eval_stack_t *stack, col_rel_t *source)
+{
+    CHECK(eval_stack_push(stack, source, false) == 0);
+    stack->items[0].seg_count = 2;
+    stack->items[0].seg_boundaries = malloc(3u * sizeof(uint32_t));
+    CHECK(stack->items[0].seg_boundaries);
+    stack->items[0].seg_boundaries[0] = 0;
+    stack->items[0].seg_boundaries[1] = 11;
+    stack->items[0].seg_boundaries[2] = 50011;
+}
+static void
+reduced_segmented_offset(void)
+{
+    for (unsigned stop = 0; stop < 2; stop++) {
+        wl_col_session_t *s = join_session(), *raw = join_session();
+        col_rel_t *source = relation(1, 50011, 50011, false,
+                s->memory_governor), *reference = relation(1, 50011, 50011,
+                false, raw->memory_governor);
+        CHECK(session_add_rel(s, source) == 0 && session_add_rel(raw,
+            reference) == 0);
+        uint64_t upper_first = 0; bool upper_different = false;
+        for (uint32_t row = 0; row < 50011; row++) {
+            uint64_t value = row < 11 ? 10u - row : 50010u - row;
+            uint64_t bits = value * UINT64_C(0x9e3779b97f4a7c15)
+                ^ UINT64_C(0xd1b54a32d192ed03);
+            int64_t cell; memcpy(&cell, &bits, sizeof(cell));
+            if (!value) cell = INT64_MIN;
+            else if (value == 1) cell = INT64_MAX;
+            source->columns[0][row] = reference->columns[0][row] = cell;
+            if (row == 11) upper_first = bits >> 32;
+            else if (row > 11 &&
+                (bits >> 32) != upper_first) upper_different = true;
+        }
+        CHECK(upper_different);
+        uint64_t baseline = string_reserved(s->memory_governor);
+        uint64_t fingerprint = consolidate_source_hash(source);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(s),
+            *rf = filter_frame(raw);
+        reduced_offset_entry(wl_columnar_eval_stack_cleanup_stack(frame),
+            source);
+        reduced_offset_entry(wl_columnar_eval_stack_cleanup_stack(rf),
+            reference);
+        wl_evaluation_control_t *c = control(0);
+        reduced_offset_session = s;
+        reduced_offset_passes = reduced_offset_stopped =
+            reduced_offset_started = 0;
+        reduced_offset_cancel = stop != 0;
+        wl_columnar_consolidate_test_checkpoint = reduced_offset_checkpoint;
+        s->base.evaluation_control = c;
+        int rc = col_op_consolidate(wl_columnar_eval_stack_cleanup_stack(frame),
+                s);
+        s->base.evaluation_control = NULL;
+        wl_columnar_consolidate_test_checkpoint = NULL;
+        CHECK(rc == (stop ? WL_EVALUATION_CONTROL_CANCELLED : 0));
+        finish(c, rc); release(c);
+        if (stop) {
+            CHECK(reduced_offset_stopped && reduced_offset_passes == 7u
+                && consolidate_source_hash(source) == fingerprint);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0
+                && string_reserved(s->memory_governor) == baseline);
+            frame = filter_frame(s);
+            reduced_offset_entry(wl_columnar_eval_stack_cleanup_stack(frame),
+                source);
+            c = control(0); reduced_offset_cancel = false;
+            reduced_offset_passes = reduced_offset_started = 0;
+            wl_columnar_consolidate_test_checkpoint = reduced_offset_checkpoint;
+            s->base.evaluation_control = c;
+            rc = col_op_consolidate(wl_columnar_eval_stack_cleanup_stack(frame),
+                    s);
+            s->base.evaluation_control = NULL;
+            wl_columnar_consolidate_test_checkpoint = NULL;
+            CHECK(rc == 0); finish(c, 0); release(c);
+        }
+        CHECK(reduced_offset_passes == 15u
+            && col_op_consolidate(wl_columnar_eval_stack_cleanup_stack(rf),
+            raw) == 0);
+        filter_equal(join_output(frame), join_output(rf));
+        CHECK(consolidate_source_hash(source) == fingerprint);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0
+            && wl_columnar_eval_stack_cleanup_finish(&rf) == 0
+            && string_reserved(s->memory_governor) == baseline);
+        join_session_destroy(s); join_session_destroy(raw);
+    }
+}
+static bool reduced_floating, reduced_filtered;
+static uintptr_t reduced_private_nonce;
+static unsigned reduced_fault_mode;
+static wl_columnar_memory_reservation_t *reduced_fault_token;
+static const void *reduced_fault_identity;
+static wl_columnar_expr_operator_preparation_t *reduced_fault_preparation;
+static wl_columnar_relation_bulk_append_t *reduced_fault_metadata;
+static wl_columnar_source_access_reader_t reduced_input_reader;
+static col_rel_t *reduced_refused_input;
+static void
+reduced_fault_retire(wl_columnar_expr_operator_preparation_t *r, int phase)
+{
+    if (reduced_fault_token) return;
+    if ((reduced_fault_mode == 1u && phase == 6)
+        || (reduced_fault_mode == 2u && phase == 2)
+        || (reduced_fault_mode == 3u && phase == 4 && r->scratch.bytes)) {
+        reduced_fault_preparation = r;
+        reduced_fault_token = reduced_fault_mode == 1u ? &r->compile_admission
+            : reduced_fault_mode == 2u ? &r->retired_expression : &r->scratch;
+        reduced_fault_identity = reduced_fault_token->identity;
+        CHECK(reduced_fault_identity == reduced_fault_token);
+        if (reduced_fault_mode == 1u) CHECK(r->current
+                && atomic_load(&reduced_fault_token->state)
+                == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED);
+        else CHECK(atomic_load(&reduced_fault_token->state)
+                == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+        if (reduced_fault_mode == 2u) CHECK(!r->current && !r->single);
+        if (reduced_fault_mode == 3u) CHECK(!r->scratch_payload);
+        reduced_fault_token->identity = NULL; /* Deliberate original-token identity fault. */
+    }
+}
+static void
+reduced_fault_schema(wl_evaluation_control_t *c, int phase, uint64_t progress)
+{
+    (void)progress;
+    if (phase != 5 || reduced_fault_token || reduced_fault_mode < 4u
+        || reduced_fault_mode > 5u) return;
+    wl_columnar_relation_bulk_append_t *r =
+        wl_columnar_eval_stack_cleanup_bulk_append(
+        reduced_session->cleanup_active);
+    if (!r || !r->active || !r->metadata_committed || r->published) return;
+    reduced_fault_metadata = r; reduced_fault_token = &r->metadata_pending;
+    reduced_fault_identity = reduced_fault_token->identity;
+    CHECK(reduced_fault_identity == reduced_fault_token && r->prepared_schema_ok
+        && atomic_load(&reduced_fault_token->state)
+        == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+    reduced_fault_token->identity = NULL; /* Actual accepted metadata credit remains original. */
+    if (reduced_fault_mode == 5u)
+        CHECK(wl_evaluation_control_charge(c, UINT64_MAX) == EOVERFLOW);
+    else wl_evaluation_control_request_cancel(c);
+}
+static unsigned reduced_reset_mode, reduced_reset_seen[2];
+static wl_columnar_source_access_writer_t *reduced_reset_writer;
+static uintptr_t reduced_reset_identity;
+static void
+reduced_reset_work(wl_evaluation_control_t *c, uint64_t work)
+{
+    if (!reduced_session->cleanup_active || work != 48u) return;
+    wl_columnar_relation_bulk_append_t *record =
+        wl_columnar_eval_stack_cleanup_bulk_append(
+        reduced_session->cleanup_active);
+    if (!record || !record->active || !record->reset) return;
+    CHECK(record->dst == session_find_rel(reduced_session, "H")
+        && record->descriptor_writer.owner && record->writer.owner);
+    unsigned phase = reduced_session->serial_completion.phase == 6u;
+    reduced_reset_seen[phase]++;
+    if (reduced_reset_writer) return;
+    if ((!phase && reduced_reset_seen[0] == 2u
+        && reduced_reset_mode >= 1u && reduced_reset_mode <= 3u)
+        || (phase && reduced_reset_seen[1] == 2u && reduced_reset_mode == 4u)) {
+        if (reduced_reset_mode == 2u || reduced_reset_mode == 3u) {
+            reduced_reset_writer = &record->writer;
+            reduced_reset_identity = record->writer.identity;
+            CHECK(reduced_reset_identity == (uintptr_t)reduced_reset_writer);
+            record->writer.identity = 0; /* Deliberately malformed original authority. */
+        }
+        if (reduced_reset_mode == 2u)
+            CHECK(wl_evaluation_control_charge(c, UINT64_MAX) == EOVERFLOW);
+        else wl_evaluation_control_request_cancel(c);
+    }
+}
+static void
+reduced_reset_bulk(wl_evaluation_control_t *c, int stage,
+    wl_columnar_relation_bulk_append_t *record)
+{
+    if (stage != 9 || !record->reset || reduced_reset_mode != 5u) return;
+    CHECK(record->published && record->dst->nrows == 0
+        && !reduced_reset_writer);
+    reduced_reset_writer = &record->writer;
+    reduced_reset_identity = record->writer.identity;
+    CHECK(reduced_reset_identity == (uintptr_t)reduced_reset_writer);
+    record->writer.identity = 0; /* Postpublication original-writer refusal. */
+    wl_evaluation_control_request_cancel(c);
+}
+static void
+reduced_typed_reset_trial(unsigned mode)
+{
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(
+        ".decl S(g:int64,v:float)\n.decl H(g:int64,v:float)\nH(g,SUM(v)):-S(g,v).\n",
+        &error);
+    CHECK(program && error == WIRELOG_OK);
+    wl_plan_t *plan = NULL; CHECK(wl_plan_from_program(program, &plan) == 0);
+    wl_col_session_t *s = joined_create(plan), *raw = joined_create(plan);
+    wl_evaluation_control_t *c = serial_attach(s, 0);
+    int64_t data[12];
+    for (uint32_t row = 0; row < 6; row++) {
+        data[2u * row] = row % 3;
+        data[2u * row + 1u] = wl_columnar_float_to_bits((double)row / 2.0);
+    }
+    CHECK(wl_backend_columnar()->session_insert(&s->base, "S", data, 6, 2) == 0
+        && wl_backend_columnar()->session_insert(&raw->base, "S", data, 6,
+        2) == 0
+        && wl_backend_columnar()->session_step(&s->base) == 0
+        && wl_backend_columnar()->session_step(&raw->base) == 0);
+    col_rel_t *head = session_find_rel(s, "H");
+    int64_t **columns = head->columns;
+    wirelog_column_type_t *types = head->column_types;
+    struct ArrowSchema **children = head->schema.children;
+    struct ArrowSchema *child = children[1];
+    void (*release_child)(struct ArrowSchema *) = child->release;
+    const char *format = child->format;
+    int64_t child_count = head->schema.n_children;
+    uint64_t storage = head->storage_generation, view = head->view_generation;
+    uint64_t retained = head->retained_reserved_bytes,
+        metadata = head->metadata_reserved_bytes;
+    uint64_t fingerprint = consolidate_source_hash(head);
+    int64_t extra[] = {3, wl_columnar_float_to_bits(7.5)};
+    CHECK(wl_backend_columnar()->session_insert(&s->base, "S", extra, 1, 2) == 0
+        && wl_backend_columnar()->session_insert(&raw->base, "S", extra, 1,
+        2) == 0
+        && wl_evaluation_control_reset(c) == 0);
+    reduced_session = s; reduced_reset_mode = mode;
+    reduced_reset_seen[0] = reduced_reset_seen[1] = 0;
+    reduced_reset_writer = NULL; reduced_reset_identity = 0;
+    wl_columnar_source_access_reader_t reader = {0};
+    if (mode == 6u) CHECK(col_rel_source_reader_acquire(head, &reader) == 0);
+    if (mode == 7u) head->schema_ok = false;
+    if (mode == 8u) head->schema.children = NULL;
+    if (mode == 9u) children[1] = NULL;
+    if (mode == 10u) child->release = NULL;
+    if (mode == 11u) child->format = ""; /* Short malformed primitive spelling. */
+    if (mode == 12u) head->schema.n_children = 1;
+    if (mode == 13u) types[1] = (wirelog_column_type_t)UINT32_MAX;
+    wl_columnar_relation_test_work_checkpoint = reduced_reset_work;
+    wl_columnar_relation_test_bulk_checkpoint = reduced_reset_bulk;
+    serial_capture_t got = {.width = 2}, ref = got;
+    int rc = wl_backend_columnar()->session_snapshot(&s->base, joined_capture,
+            &got);
+    wl_columnar_relation_test_work_checkpoint = NULL;
+    wl_columnar_relation_test_bulk_checkpoint = NULL;
+    int expected = mode == 2u ? EOVERFLOW : mode == 6u ? EBUSY
+        : mode == 13u ? ENOTSUP : mode >= 3u && mode != 4u ? EINVAL
+        : WL_EVALUATION_CONTROL_CANCELLED;
+    CHECK(rc == expected && !got.count);
+    wl_evaluation_control_report_t report;
+    CHECK(wl_evaluation_control_report(c,
+        &report) == 0 && report.result == expected);
+    if (mode == 2u) CHECK(report.execution_status == EOVERFLOW);
+    CHECK(head->columns == columns && head->column_types == types
+        && head->retained_reserved_bytes == retained
+        && head->metadata_reserved_bytes == metadata);
+    if (mode == 5u) CHECK(head->nrows == 0 &&
+            head->storage_generation == storage + 1u
+            && s->serial_completion.reset_relation == 1u);
+    else CHECK(head->nrows == 3 && head->storage_generation == storage
+            && head->view_generation == view &&
+            consolidate_source_hash(head) == fingerprint);
+    if (reduced_reset_writer) {
+        CHECK(reduced_reset_writer->owner && reduced_reset_writer->identity == 0
+            && s->cleanup_pending && !s->cleanup_active
+            && &wl_columnar_eval_stack_cleanup_bulk_append(
+                s->cleanup_pending)->writer
+            == reduced_reset_writer);
+        reduced_reset_writer->identity = reduced_reset_identity;
+    }
+    if (mode == 6u) CHECK(col_rel_source_reader_release(&reader) == 0);
+    if (mode == 7u) head->schema_ok = true;
+    if (mode == 8u) head->schema.children = children;
+    if (mode == 9u) children[1] = child;
+    if (mode == 10u) child->release = release_child;
+    if (mode == 11u) child->format = format;
+    if (mode == 12u) head->schema.n_children = child_count;
+    if (mode == 13u) types[1] = WIRELOG_TYPE_FLOAT;
+    CHECK(wl_columnar_eval_stack_cleanup_retry(s) == 0 && !s->cleanup_pending
+        && wl_evaluation_control_reset(c) == 0);
+    CHECK(wl_backend_columnar()->session_snapshot(&s->base, joined_capture,
+        &got) == 0
+        && wl_backend_columnar()->session_snapshot(&raw->base, joined_capture,
+        &ref) == 0
+        && got.count == ref.count && got.digest == ref.digest);
+    filter_equal(head, session_find_rel(raw, "H"));
+    CHECK(!s->serial_completion.frame && !s->cleanup_reserved_bytes
+        && !s->cleanup_pending && !s->cleanup_active);
+    source_unpinned(head, head);
+    serial_destroy(s); serial_destroy(raw); wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+static void
+reduced_operator_checkpoint(wl_evaluation_control_t *c, int stage,
+    uint64_t progress, wl_columnar_relation_private_batch_t *record,
+    col_rel_t *source)
+{
+    (void)c; (void)progress;
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(
+        reduced_session->cleanup_active);
+    if (stage == 13) {
+        CHECK(stack->top && !stack->items[stack->top - 1u].rel);
+        return;
+    }
+    if (stage == 10 && reduced_fault_mode == 6u &&
+        !reduced_input_reader.owner) {
+        CHECK(reduced_filtered && stack->items[stack->top - 1u].owned
+            && wl_columnar_relation_private_batch_disposable(record));
+        reduced_refused_input = source;
+        CHECK(col_rel_source_reader_acquire(source,
+            &reduced_input_reader) == 0);
+    }
+    CHECK(stack->top && source == stack->items[stack->top - 1u].rel);
+    if (reduced_filtered) CHECK(source != session_find_rel(reduced_session, "S")
+            && stack->items[stack->top - 1u].owned);
+    else CHECK(source == session_find_rel(reduced_session, "S"));
+    if (stage == 3) {
+        wl_columnar_expr_operator_preparation_t *prep =
+            wl_columnar_eval_stack_cleanup_operator_preparation(
+            reduced_session->cleanup_active);
+        CHECK(prep && prep->scratch_payload);
+        if (reduced_floating) CHECK(!prep->single);
+        else {
+            CHECK(prep->single); reduced_compiled_seen++;
+        }
+        reduced_rows_seen++;
+    }
+    if (stage == 11) {
+        CHECK(record->batch.active && record->batch.relation->column_types
+            && record->batch.relation->column_types[1]
+            == (reduced_floating ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_INT64));
+        reduced_private_nonce = record->batch.single.lease.acquisition_nonce;
+    }
+}
+static void
+reduced_expression_checkpoint(wl_evaluation_control_t *c, int stage,
+    uint64_t progress, bool failed)
+{
+    (void)c; (void)progress; (void)failed;
+    if (stage == 3 && reduced_floating) {
+        wl_columnar_expr_operator_preparation_t *prep =
+            wl_columnar_eval_stack_cleanup_operator_preparation(
+            reduced_session->cleanup_active);
+        CHECK(prep && !prep->single && prep->scratch_payload);
+        reduced_interpreted_seen++;
+    }
+}
+static void
+reduced_cons_checkpoint(wl_evaluation_control_t *c, int stage,
+    uint64_t progress, wl_columnar_consolidate_record_t *record, col_rel_t *r)
+{
+    (void)c; (void)progress;
+    if (stage == 25) {
+        CHECK(r->column_types && r->column_types[1]
+            == (reduced_floating ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_INT64));
+        CHECK(!wl_columnar_eval_stack_cleanup_operator_preparation(
+                reduced_session->cleanup_active));
+        reduced_cons_seen++;
+    }
+    if (stage == 31) {
+        CHECK(reduced_private_nonce && record->sequence.lease
+            && record->sequence.lease->acquisition_nonce !=
+            reduced_private_nonce);
+    }
+}
+static uint64_t
+reduced_generated_trial(unsigned kind, bool repeat, bool snapshot,
+    uint32_t rows, uint64_t limit, int expected)
+{
+    const char *texts[] = {
+        ".decl S(g:int64,v:int64)\n.decl H(g:int64,v:int64)\nH(g,COUNT(v)):-S(g,v).\n",
+        ".decl S(g:int64,v:int64)\n.decl H(g:int64,v:int64)\nH(g,SUM(v)):-S(g,v).\n",
+        ".decl S(g:int64,v:float)\n.decl H(g:int64,v:float)\nH(g,SUM(v)):-S(g,v).\n",
+        ".decl S(g:int64,v:float)\n.decl H(g:int64,v:float)\nH(g,min(v)):-S(g,v).\n",
+        ".decl S(g:int64,v:float)\n.decl H(g:int64,v:float)\nH(g,max(v)):-S(g,v).\n",
+        ".decl S(g:int64,v:float)\n.decl H(g:int64,v:float)\nH(g,AVG(v)):-S(g,v).\n",
+        ".decl S(g:int64,v:int64)\n.decl H(g:int64,v:int64)\nH(g,SUM(v*2)):-S(g,v),v>0.\n"
+    };
+    CHECK(kind < sizeof(texts) / sizeof(texts[0]));
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(texts[kind], &error);
+    CHECK(program && error == WIRELOG_OK);
+    wl_plan_t *plan = NULL; CHECK(wl_plan_from_program(program, &plan) == 0);
+    CHECK(plan->stratum_count == 1u && !plan->strata[0].is_recursive
+        && plan->strata[0].relation_count == 1u);
+    const wl_plan_relation_t *rp = &plan->strata[0].relations[0];
+    uint32_t reduce = kind == 6u ? 2u : 1u;
+    CHECK(rp->op_count == reduce + 2u && rp->ops[0].op == WL_PLAN_OP_VARIABLE
+        && rp->ops[0].delta_mode == WL_DELTA_AUTO
+        && rp->ops[reduce].op == WL_PLAN_OP_REDUCE
+        && rp->ops[reduce + 1u].op == WL_PLAN_OP_CONSOLIDATE
+        && rp->ops[reduce].agg_expr.size);
+    if (kind == 6u) CHECK(rp->ops[1].op == WL_PLAN_OP_FILTER);
+    reduced_floating = kind >= 2u && kind <= 5u;
+    reduced_filtered = kind == 6u;
+    CHECK((rp->ops[reduce].agg_operand_type == WL_PLAN_AGG_OPERAND_FLOAT)
+        == reduced_floating);
+    wl_col_session_t *sess = joined_create(plan), *raw = joined_create(plan);
+    wl_evaluation_control_t *control = serial_attach(sess, 0);
+    int64_t data[128]; CHECK(rows <= 64u);
+    for (uint32_t row = 0; row < rows; row++) {
+        data[2u * row] = row % 3u;
+        data[2u * row + 1u] = reduced_floating
+            ? wl_columnar_float_to_bits((double)((int32_t)row - 5) / 2.0)
+            : (int64_t)row - 5;
+    }
+    CHECK(wl_backend_columnar()->session_insert(&sess->base, "S", data, rows,
+        2) == 0 && wl_backend_columnar()->session_insert(&raw->base, "S", data,
+        rows, 2) == 0);
+    col_rel_t *source = session_find_rel(sess, "S");
+    CHECK(source && (reduced_floating ? source->column_types
+        && source->column_types[1] == WIRELOG_TYPE_FLOAT
+        : !source->column_types ||
+        source->column_types[1] == WIRELOG_TYPE_INT64));
+    if (repeat) {
+        CHECK(wl_backend_columnar()->session_step(&sess->base) == 0
+            && wl_backend_columnar()->session_step(&raw->base) == 0);
+        int64_t extra[] = {3, reduced_floating ? wl_columnar_float_to_bits(7.5)
+            : 7};
+        CHECK(wl_backend_columnar()->session_insert(&sess->base, "S", extra,
+            1, 2) == 0 && wl_backend_columnar()->session_insert(&raw->base, "S",
+            extra, 1, 2) == 0);
+    }
+    CHECK(wl_evaluation_control_reset(control) == 0
+        && wl_evaluation_control_configure(control, limit) == 0);
+    reduced_session = sess;
+    reduced_rows_seen = reduced_compiled_seen = reduced_cons_seen = 0;
+    reduced_interpreted_seen = 0;
+    reduced_private_nonce = 0;
+    reduced_fault_token = NULL; reduced_fault_preparation = NULL;
+    reduced_fault_metadata = NULL;
+    wl_columnar_ops_reduce_test_checkpoint = reduced_operator_checkpoint;
+    wl_columnar_expr_test_controlled_checkpoint = reduced_expression_checkpoint;
+    wl_columnar_consolidate_test_checkpoint = reduced_cons_checkpoint;
+    wl_columnar_expr_test_retirement_checkpoint = reduced_fault_retire;
+    wl_columnar_relation_test_metadata_checkpoint = reduced_fault_schema;
+    serial_capture_t got = {.width = 2}, ref = got;
+    int rc = snapshot ? wl_backend_columnar()->session_snapshot(&sess->base,
+            joined_capture,
+            &got) : wl_backend_columnar()->session_step(&sess->base);
+    wl_columnar_ops_reduce_test_checkpoint = NULL;
+    wl_columnar_expr_test_controlled_checkpoint = NULL;
+    wl_columnar_consolidate_test_checkpoint = NULL;
+    wl_columnar_expr_test_retirement_checkpoint = NULL;
+    wl_columnar_relation_test_metadata_checkpoint = NULL;
+    if (rc != expected) fprintf(stderr,
+            "generated REDUCE kind=%u repeat=%u snapshot=%u rows=%u rc=%d expected=%d\n",
+            kind, repeat, snapshot, rows, rc, expected);
+    CHECK(rc == expected);
+    wl_evaluation_control_report_t report;
+    CHECK(wl_evaluation_control_report(control, &report) == 0
+        && report.result == expected);
+    uint64_t cost = report.consumed;
+    if (reduced_fault_mode == 6u) {
+        CHECK(reduced_input_reader.owner && reduced_refused_input
+            && sess->cleanup_pending && !sess->cleanup_active);
+        eval_stack_t *retained =
+            wl_columnar_eval_stack_cleanup_stack(sess->cleanup_pending);
+        CHECK(retained->top &&
+            retained->items[retained->top - 1u].rel == reduced_refused_input
+            && retained->items[retained->top - 1u].owned);
+        CHECK(col_rel_source_reader_release(&reduced_input_reader) == 0
+            && wl_columnar_eval_stack_cleanup_retry(sess) == 0 &&
+            !sess->cleanup_pending);
+        reduced_fault_mode = 0; /* The real reader is no longer held on retry. */
+    } else if (reduced_fault_mode) {
+        CHECK(reduced_fault_token && reduced_fault_token->identity == NULL
+            && sess->cleanup_pending && !sess->cleanup_active);
+        if (reduced_fault_mode == 1u) CHECK(reduced_fault_preparation
+                && !reduced_fault_preparation->current
+                && atomic_load(&reduced_fault_token->state)
+                == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED);
+        if (reduced_fault_mode == 2u) CHECK(!reduced_fault_preparation->single
+                && !reduced_fault_preparation->current);
+        if (reduced_fault_mode ==
+            3u) CHECK(!reduced_fault_preparation->scratch_payload);
+        if (reduced_fault_mode >= 4u) CHECK(reduced_fault_metadata
+                && !reduced_fault_metadata->prepared_schema_ok
+                && !reduced_fault_metadata->prepared_types
+                && reduced_fault_metadata->metadata_committed
+                && atomic_load(&reduced_fault_token->state)
+                == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+        if (reduced_fault_mode ==
+            5u) CHECK(report.execution_status == EOVERFLOW);
+        reduced_fault_token->identity = reduced_fault_identity;
+        CHECK(wl_columnar_eval_stack_cleanup_retry(sess) == 0
+            && !sess->cleanup_pending);
+    }
+    if (expected) {
+        CHECK(!got.count && wl_evaluation_control_reset(control) == 0
+            && wl_evaluation_control_configure(control, 0) == 0);
+        wl_columnar_ops_reduce_test_checkpoint = reduced_operator_checkpoint;
+        wl_columnar_expr_test_controlled_checkpoint =
+            reduced_expression_checkpoint;
+        wl_columnar_consolidate_test_checkpoint = reduced_cons_checkpoint;
+        CHECK(wl_backend_columnar()->session_snapshot(&sess->base,
+            joined_capture, &got) == 0);
+        wl_columnar_ops_reduce_test_checkpoint = NULL;
+        wl_columnar_expr_test_controlled_checkpoint = NULL;
+        wl_columnar_consolidate_test_checkpoint = NULL;
+    } else if (!snapshot) CHECK(wl_backend_columnar()->session_snapshot(
+                &sess->base, joined_capture, &got) == 0);
+    CHECK(wl_backend_columnar()->session_snapshot(&raw->base, joined_capture,
+        &ref) == 0 && got.count == ref.count && got.digest == ref.digest);
+    col_rel_t *head = session_find_rel(sess, "H"),
+        *reference = session_find_rel(raw, "H");
+    CHECK(head && reference && head->column_types && reference->column_types
+        && head->column_types[1] == reference->column_types[1]
+        && head->column_types[1]
+        == (reduced_floating ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_INT64));
+    filter_equal(head, reference);
+    CHECK(reduced_cons_seen && (!rows || reduced_rows_seen)
+        && (!rows || (reduced_floating ? reduced_interpreted_seen
+            : reduced_compiled_seen)));
+    CHECK(!sess->serial_completion.frame && !sess->cleanup_reserved_bytes
+        && !sess->cleanup_pending && !sess->cleanup_active);
+    source_unpinned(source, source);
+    serial_destroy(sess); serial_destroy(raw);
+    wl_plan_free(plan); wirelog_program_free(program);
+    return cost;
+}
+static unsigned reduced_wide_mode, reduced_wide_stopped, reduced_wide_rows,
+    reduced_wide_collisions, reduced_wide_matches, reduced_wide_growth;
+static uint64_t reduced_wide_peak, reduced_wide_budget;
+static void
+reduced_wide_memory(void)
+{
+    uint64_t current = string_reserved(reduced_session->memory_governor);
+    if (reduced_wide_mode == 0u && current > reduced_wide_peak)
+        reduced_wide_peak = current;
+    if (reduced_wide_mode == 6u) CHECK(current <= reduced_wide_budget);
+}
+static void reduced_wide_work(wl_evaluation_control_t *c, uint64_t work)
+{
+    (void)c; (void)work; reduced_wide_memory();
+}
+static void reduced_wide_cons(wl_evaluation_control_t *c, int stage,
+    uint64_t progress, wl_columnar_consolidate_record_t *record,
+    col_rel_t *source)
+{
+    (void)c; (void)stage; (void)progress; (void)record; (void)source;
+    reduced_wide_memory();
+}
+static void reduced_wide_expr(wl_evaluation_control_t *c, int stage,
+    uint64_t progress, bool failed)
+{
+    (void)c; (void)stage; (void)progress; (void)failed; reduced_wide_memory();
+}
+static void
+reduced_wide_observe(wl_evaluation_control_t *c, int stage, uint64_t progress,
+    wl_columnar_relation_private_batch_t *record, col_rel_t *source)
+{
+    reduced_wide_memory();
+    if (stage == 1) {
+        struct { uint64_t hash; uint32_t row; } group;
+        uint64_t expected = 300u * sizeof(int64_t) * 2u
+            + 300u * sizeof(wirelog_column_type_t)
+            + 1024u * (sizeof(group) + sizeof(double) + sizeof(uint64_t));
+        wl_columnar_expr_operator_preparation_t *prep =
+            wl_columnar_eval_stack_cleanup_operator_preparation(
+            reduced_session->cleanup_active);
+        CHECK(prep && prep->scratch_payload && prep->scratch.bytes == expected);
+    }
+    if (stage == 3 && progress == 300u) reduced_wide_rows++;
+    if (stage == 5 && progress > 1u) reduced_wide_collisions++;
+    if (stage == 6 && progress == 299u) reduced_wide_matches++;
+    if (stage == 11) {
+        CHECK(record->batch.active && record->batch.relation->nrows == 129u
+            && record->batch.relation->capacity >= 256u);
+        reduced_wide_growth++;
+    }
+    if (stage == 13) {
+        eval_stack_t *stack =
+            wl_columnar_eval_stack_cleanup_stack(
+            reduced_session->cleanup_active);
+        CHECK(!source && stack->top && !stack->items[stack->top - 1u].rel
+            && !wl_columnar_eval_stack_cleanup_sources(
+                reduced_session->cleanup_active)->owner_count);
+    }
+    if (!c || reduced_wide_stopped) return;
+    if ((reduced_wide_mode == 1u && stage == 1 && progress >= 128u)
+        || (reduced_wide_mode == 2u && stage == 3 && progress == 256u)
+        || (reduced_wide_mode == 3u && stage == 5 && progress > 1u)
+        || (reduced_wide_mode == 5u && stage == 13)) {
+        reduced_wide_stopped++; wl_evaluation_control_request_cancel(c);
+    }
+}
+static void
+reduced_wide_schema(wl_evaluation_control_t *c, int stage, uint64_t progress)
+{
+    reduced_wide_memory();
+    if (reduced_wide_mode == 4u && !reduced_wide_stopped && stage == 3
+        && progress == 256u) {
+        wl_columnar_relation_bulk_append_t *record =
+            wl_columnar_eval_stack_cleanup_bulk_append(
+            reduced_session->cleanup_active);
+        if (!record->active || !record->prepared_schema_ok) return;
+        CHECK(record->prepared_schema.n_children == 256
+            && record->prepared_schema.children[255]); /* Original partial child ownership. */
+        reduced_wide_stopped++; wl_evaluation_control_request_cancel(c);
+    }
+}
+static void
+reduced_wide_trial(unsigned mode)
+{
+    char text[32768]; size_t offset = 0;
+    const char *names[] = {"S", "H"};
+    for (unsigned n = 0; n < 2u; n++) {
+        offset += snprintf(text + offset, sizeof(text) - offset, ".decl %s(",
+                names[n]);
+        for (unsigned col = 0; col < 300u;
+            col++) offset += snprintf(text + offset,
+                    sizeof(text) - offset, "%sx%u:int64", col ? "," : "", col);
+        offset += snprintf(text + offset, sizeof(text) - offset, ")\n");
+    }
+    offset += snprintf(text + offset, sizeof(text) - offset, "H(");
+    for (unsigned col = 0; col < 299u; col++) offset += snprintf(text + offset,
+                sizeof(text) - offset, "%sx%u", col ? "," : "", col);
+    offset += snprintf(text + offset, sizeof(text) - offset, ",SUM(x299)):-S(");
+    for (unsigned col = 0; col < 300u; col++) offset += snprintf(text + offset,
+                sizeof(text) - offset, "%sx%u", col ? "," : "", col);
+    offset += snprintf(text + offset, sizeof(text) - offset, ").\n");
+    CHECK(offset < sizeof(text));
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(text, &error);
+    CHECK(program && error == WIRELOG_OK);
+    wl_plan_t *plan = NULL; CHECK(wl_plan_from_program(program, &plan) == 0);
+    const wl_plan_relation_t *rp = &plan->strata[0].relations[0];
+    CHECK(plan->stratum_count == 1u && !plan->strata[0].is_recursive
+        && rp->op_count == 3u && rp->ops[0].delta_mode == WL_DELTA_AUTO
+        && rp->ops[1].op == WL_PLAN_OP_REDUCE &&
+        rp->ops[1].group_by_count == 299u
+        && rp->ops[1].aggregate_index == 299u &&
+        rp->ops[2].op == WL_PLAN_OP_CONSOLIDATE);
+    wl_col_session_t *s, *raw;
+    if (mode == 0u || mode == 6u) {
+        uint64_t budget = mode == 6u ? reduced_wide_budget : UINT64_MAX / 2u;
+        wl_columnar_memory_resolution_t resolution = {
+            .budget_bytes = budget, .usable_bytes = budget,
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+        };
+        wl_col_session_t **sessions[] = {&s, &raw};
+        for (unsigned i = 0; i < 2u; i++) {
+            wl_columnar_memory_governor_ref_t *governor =
+                wl_columnar_memory_governor_ref_create(&resolution);
+            CHECK(governor);
+            wl_session_options_t options; wl_session_options_init(&options);
+            options.memory_governor = governor;
+            wl_session_t *base = NULL;
+            CHECK(wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+                &options, &base) == 0);
+            wl_columnar_memory_governor_ref_release(governor);
+            *sessions[i] = COL_SESSION(base);
+            CHECK((*sessions[i])->eval_arena && (*sessions[i])->delta_pool
+                && !(*sessions[i])->has_evaluated &&
+                !session_find_rel(*sessions[i], "H"));
+        }
+    } else {
+        s = joined_create(plan); raw = joined_create(plan);
+    }
+    wl_evaluation_control_t *c = serial_attach(s, 0);
+    int64_t *data = calloc(257u * 300u, sizeof(int64_t)); CHECK(data);
+    for (unsigned row = 0; row < 257u; row++) {
+        data[300u * row] = (int64_t)(row / 2u) * 1024;
+        data[300u * row + 299u] = row % 17u;
+    }
+    CHECK(wl_backend_columnar()->session_insert(&s->base, "S", data, 257,
+        300) == 0
+        && wl_backend_columnar()->session_insert(&raw->base, "S", data, 257,
+        300) == 0);
+    free(data);
+    reduced_session = s; reduced_wide_mode = mode;
+    if (mode == 0u) reduced_wide_peak = 0;
+    uint64_t old_budget =
+        atomic_load(&wl_columnar_memory_governor_ref_get(
+                s->memory_governor)->usable_bytes);
+    uint64_t raw_budget =
+        atomic_load(&wl_columnar_memory_governor_ref_get(
+                raw->memory_governor)->usable_bytes);
+    if (mode == 6u) {
+        CHECK(reduced_wide_budget > string_reserved(s->memory_governor));
+        CHECK(wl_columnar_memory_governor_ref_get(s->memory_governor)->mode
+            == WL_COLUMNAR_MEMORY_MODE_ENFORCING
+            && wl_columnar_memory_governor_ref_get(raw->memory_governor)->mode
+            == WL_COLUMNAR_MEMORY_MODE_ENFORCING);
+        atomic_store(&wl_columnar_memory_governor_ref_get(
+                s->memory_governor)->usable_bytes, reduced_wide_budget);
+        atomic_store(&wl_columnar_memory_governor_ref_get(
+                raw->memory_governor)->usable_bytes, reduced_wide_budget);
+    }
+    reduced_wide_stopped = reduced_wide_rows = reduced_wide_collisions = 0;
+    reduced_wide_matches = reduced_wide_growth = 0;
+    wl_columnar_ops_reduce_test_checkpoint = reduced_wide_observe;
+    wl_columnar_relation_test_metadata_checkpoint = reduced_wide_schema;
+    wl_columnar_relation_test_work_checkpoint = reduced_wide_work;
+    wl_columnar_consolidate_test_checkpoint = reduced_wide_cons;
+    wl_columnar_expr_test_controlled_checkpoint = reduced_wide_expr;
+    serial_capture_t got = {.width = 300}, ref = got;
+    int rc = wl_backend_columnar()->session_snapshot(&s->base, joined_capture,
+            &got);
+    wl_columnar_ops_reduce_test_checkpoint = NULL;
+    wl_columnar_relation_test_metadata_checkpoint = NULL;
+    wl_columnar_relation_test_work_checkpoint = NULL;
+    wl_columnar_consolidate_test_checkpoint = NULL;
+    wl_columnar_expr_test_controlled_checkpoint = NULL;
+    CHECK(rc == (mode && mode != 6u ? WL_EVALUATION_CONTROL_CANCELLED : 0));
+    if (mode && mode != 6u) {
+        CHECK(reduced_wide_stopped && !got.count &&
+            wl_evaluation_control_reset(c) == 0);
+        wl_columnar_ops_reduce_test_checkpoint = reduced_wide_observe;
+        CHECK(wl_backend_columnar()->session_snapshot(&s->base, joined_capture,
+            &got) == 0);
+        wl_columnar_ops_reduce_test_checkpoint = NULL;
+    }
+    CHECK(reduced_wide_rows && reduced_wide_collisions && reduced_wide_matches
+        && reduced_wide_growth &&
+        wl_backend_columnar()->session_snapshot(&raw->base,
+        joined_capture,
+        &ref) == 0 && got.count == ref.count && got.digest == ref.digest);
+    filter_equal(session_find_rel(s, "H"), session_find_rel(raw, "H"));
+    CHECK(!s->serial_completion.frame && !s->cleanup_pending &&
+        !s->cleanup_reserved_bytes);
+    if (mode == 0u) reduced_wide_budget = reduced_wide_peak;
+    if (mode == 6u) {
+        CHECK(!s->memory_budget_denied && !raw->memory_budget_denied);
+    }
+    atomic_store(&wl_columnar_memory_governor_ref_get(
+            s->memory_governor)->usable_bytes, old_budget);
+    atomic_store(&wl_columnar_memory_governor_ref_get(
+            raw->memory_governor)->usable_bytes, raw_budget);
+    source_unpinned(session_find_rel(s, "S"), session_find_rel(s, "S"));
+    serial_destroy(s); serial_destroy(raw); wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+static void
+reduced_generated_overflow(void)
+{
+    for (unsigned floating = 0; floating < 2; floating++) {
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(floating
+            ?
+                ".decl S(g:int64,v:float)\n.decl H(g:int64,v:float)\nH(g,SUM(v)):-S(g,v).\n"
+            :
+                ".decl S(g:int64,v:int64)\n.decl H(g:int64,v:int64)\nH(g,SUM(v)):-S(g,v).\n",
+                &error);
+        CHECK(program && error == WIRELOG_OK);
+        wl_plan_t *plan = NULL;
+        CHECK(wl_plan_from_program(program, &plan) == 0);
+        CHECK(plan->strata[0].relations[0].op_count == 3u
+            && plan->strata[0].relations[0].ops[1].op == WL_PLAN_OP_REDUCE);
+        wl_col_session_t *s = joined_create(plan), *raw = joined_create(plan);
+        wl_evaluation_control_t *c = serial_attach(s, 0);
+        int64_t huge =
+            floating ? wl_columnar_float_to_bits(0x1.fffffffffffffp1023)
+            : INT64_MAX;
+        int64_t data[] = {0, huge, 0, floating ? huge : 1};
+        CHECK(wl_backend_columnar()->session_insert(&s->base, "S", data, 2,
+            2) == 0
+            && wl_backend_columnar()->session_insert(&raw->base, "S", data, 2,
+            2) == 0);
+        serial_capture_t got = {.width = 2}, ref = got;
+        CHECK(wl_backend_columnar()->session_snapshot(&s->base, joined_capture,
+            &got) == ERANGE
+            && wl_backend_columnar()->session_snapshot(&raw->base,
+            joined_capture, &ref) == ERANGE
+            && !got.count && !ref.count);
+        wl_evaluation_control_report_t report;
+        CHECK(wl_evaluation_control_report(c, &report) == 0
+            && report.result == ERANGE && report.execution_status == ERANGE);
+        CHECK(!s->cleanup_pending && !s->cleanup_active);
+        serial_destroy(s); serial_destroy(raw); wl_plan_free(plan);
+        wirelog_program_free(program);
+    }
+}
+static void
+test_serial_generated_reduce(void)
+{
+    reduced_segmented_offset();
+    for (unsigned mode = 1; mode <= 13; mode++) reduced_typed_reset_trial(mode);
+    for (unsigned kind = 0; kind < 6u; kind++)
+        for (unsigned repeat = 0; repeat < 2u; repeat++)
+            for (unsigned snapshot = 0; snapshot < 2u; snapshot++)
+                reduced_generated_trial(kind, repeat, snapshot, 19, 0, 0);
+    reduced_generated_trial(6, false, true, 19, 0, 0);
+    reduced_generated_trial(2, false, true, 0, 0, 0);
+    reduced_generated_trial(2, true, true, 0, 0, 0);
+    for (unsigned mode = 1; mode <= 5; mode++) {
+        reduced_fault_mode = mode;
+        reduced_generated_trial(mode >= 4 ? 2u : 1u, false, true, 19, 0,
+            mode == 5 ? EOVERFLOW : EINVAL);
+    }
+    reduced_fault_mode = 0;
+    reduced_fault_mode = 6;
+    reduced_generated_trial(6, false, true, 19, 0, EBUSY);
+    reduced_fault_mode = 0;
+    for (unsigned mode = 0; mode <= 6; mode++) reduced_wide_trial(mode);
+    reduced_generated_overflow();
+    uint64_t cost = reduced_generated_trial(1, false, true, 19, 0, 0);
+    CHECK(reduced_generated_trial(1, false, true, 19, 0, 0) == cost);
+    CHECK(reduced_generated_trial(1, false, true, 19, cost, 0) == cost);
+    reduced_generated_trial(1, false, true, 19, cost - 1u,
+        WL_EVALUATION_CONTROL_WORK_LIMIT);
+    fprintf(stderr,
+        "serial REDUCE: genuine AUTO aggregate typed owned CONS initial/dirty raw twins and exact allowance passed\n");
+}
+
 int
 main(void)
 {
@@ -18469,6 +19302,7 @@ main(void)
     test_serial_joined_attempts();
     test_serial_large_set_attempts();
     test_serial_segmented_attempts();
+    test_serial_generated_reduce();
     puts("evaluation_work: OK");
     return 0;
 }

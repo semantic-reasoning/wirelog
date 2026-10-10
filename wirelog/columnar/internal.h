@@ -3697,6 +3697,9 @@ wl_columnar_eval_stack_cleanup_bulk_append(
 wl_columnar_relation_source_group_t *
 wl_columnar_eval_stack_cleanup_sources(
     wl_columnar_eval_stack_cleanup_frame_t *);
+int wl_columnar_relation_private_types_controlled(
+    wl_columnar_relation_bulk_append_t *, col_rel_t *,
+    const wirelog_column_type_t *, wl_evaluation_control_t *);
 int wl_columnar_relation_bulk_append_controlled(
     wl_columnar_relation_bulk_append_t *, col_rel_t *, const col_rel_t *,
     wl_evaluation_control_t *);
@@ -3818,6 +3821,8 @@ int wl_columnar_relation_pool_reuse_controlled(wl_col_session_t *,
     wl_evaluation_control_t *);
 int wl_columnar_merge_concat_controlled(eval_stack_t *, wl_col_session_t *,
     wl_evaluation_control_t *);
+int wl_columnar_eval_plan_aggregate_validate(const wl_plan_relation_t *,
+    wl_evaluation_control_t *, bool *);
 int wl_columnar_eval_plan_union_validate(const wl_plan_relation_t *,
     wl_evaluation_control_t *, bool *);
 wl_columnar_consolidate_record_t *

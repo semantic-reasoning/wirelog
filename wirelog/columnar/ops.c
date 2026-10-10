@@ -1019,17 +1019,19 @@ wl_columnar_ops_reduce_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     int rc = wl_columnar_eval_stack_cleanup_join_owner(sess, stack, &group,
             &private_output);
     if (rc) return rc;
-    wl_columnar_relation_private_batch_t *record =
-        wl_columnar_eval_stack_cleanup_reduce_batch(sess->cleanup_active);
-    if (!record || !stack->top || stack->top > COL_STACK_MAX
+    wl_columnar_relation_private_batch_t *record = NULL;
+    rc = wl_columnar_eval_stack_cleanup_private_batch_owner(sess, stack,
+            &record, control);
+    if (rc) return rc;
+    if (!stack->top || stack->top > COL_STACK_MAX
         || stack->items[stack->top - 1].kind != WL_COLUMNAR_EVAL_ENTRY_RELATION
         || !stack->items[stack->top - 1].rel) return EINVAL;
     uint32_t slot = stack->top - 1;
     col_rel_t *source = stack->items[slot].rel, *out = NULL;
-    eval_entry_t input = {0};
-    wl_columnar_memory_reservation_t scratch;
-    wl_columnar_memory_reservation_init(&scratch);
-    bool held = false, popped = false, committed = false;
+    wl_columnar_expr_operator_preparation_t *preparation = NULL;
+    wl_columnar_relation_bulk_append_t *metadata =
+        wl_columnar_eval_stack_cleanup_bulk_append(sess->cleanup_active);
+    if (!metadata) return EINVAL;
     void *memory = NULL;
     wl_columnar_expr_compiled_t *expression = NULL;
     uint32_t gc = op->group_by_count, ocols = 0, cap = 1, agg_index = 0;
@@ -1053,7 +1055,7 @@ wl_columnar_ops_reduce_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
         || (source->nrows && !source->ncols && gc)) {
         rc = EINVAL; goto cleanup;
     }
-    if (source->timestamps || source->arena_owned
+    if (source->timestamps
         || source->compound_kind != WIRELOG_COMPOUND_KIND_NONE
         || source->compound_count || source->inline_physical_offset
         || source->compound_arity_map || source->compound_arity_len) {
@@ -1106,20 +1108,17 @@ wl_columnar_ops_reduce_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
         || bytes > SIZE_MAX) {
         rc = EOVERFLOW; goto cleanup;
     }
-    /* Each typed region needs its natural alignment. Pad the schema region to
-     * int64 alignment; all following sizes are already multiples of eight. */
-    uint64_t padding = (8u - type_bytes % 8u) % 8u;
-    if (!wl_columnar_memory_size_add(bytes, padding, &bytes)
-        || bytes > SIZE_MAX) {
-        rc = EOVERFLOW; goto cleanup;
-    }
-    type_bytes += padding;
+    /* Eight-aligned regions precede the type array, preserving the exact raw
+     * scratch sum without controlled-only alignment padding. */
     rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto cleanup;
+    rc = wl_columnar_eval_stack_cleanup_operator_preparation_owner(sess, stack,
+            &preparation, control);
     if (rc) goto cleanup;
     wl_columnar_memory_admission_status_t status;
     rc = wl_columnar_memory_governor_reserve_checked_controlled(
         wl_columnar_memory_governor_ref_get(sess->memory_governor), bytes,
-        &scratch, &status, control);
+        &preparation->scratch, &status, control);
     if (rc) goto cleanup;
     if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
         && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
@@ -1129,7 +1128,6 @@ wl_columnar_ops_reduce_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
         if (rc == ENOSPC) sess->memory_budget_denied = true;
         goto cleanup;
     }
-    held = true;
     rc = wl_evaluation_control_charge(control, 1);
     if (rc) goto cleanup;
 #ifdef WL_SESSION_TEST_HOOKS
@@ -1139,14 +1137,16 @@ wl_columnar_ops_reduce_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     } else
 #endif
     memory = malloc((size_t)bytes);
+    preparation->scratch_payload = memory;
     if (!memory) {
         rc = ENOMEM; goto cleanup;
     }
-    types = memory; tuple = (int64_t *)((char *)memory + type_bytes);
-    row = row_bytes ? (int64_t *)((char *)tuple + tuple_bytes) : inline_row;
-    groups = (reduce_group_slot_t *)((char *)tuple + tuple_bytes + row_bytes);
+    tuple = memory;
+    row = row_bytes ? (int64_t *)((char *)memory + tuple_bytes) : inline_row;
+    groups = (reduce_group_slot_t *)((char *)memory + tuple_bytes + row_bytes);
     sums = (double *)((char *)groups + group_bytes);
     counts = (uint64_t *)((char *)sums + sum_bytes);
+    types = (wirelog_column_type_t *)((char *)counts + count_bytes);
     rc = wl_evaluation_control_charge(control, 0);
     if (rc) goto cleanup;
     bool accepted;
@@ -1156,7 +1156,8 @@ wl_columnar_ops_reduce_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
         rc = ENOMEM; goto cleanup;
     }
 #endif
-    rc = wl_columnar_memory_governor_commit_controlled(&scratch, memory,
+    rc = wl_columnar_memory_governor_commit_controlled(&preparation->scratch,
+            memory,
             &accepted, control);
     if (rc) goto cleanup;
     if (!accepted) {
@@ -1175,9 +1176,6 @@ wl_columnar_ops_reduce_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
         rc = wl_evaluation_control_charge(control, 0);
         if (rc) goto cleanup;
     }
-    rc = eval_stack_pop_relation(stack, &input);
-    if (rc) goto cleanup;
-    popped = true;
     uint32_t capacity = source->nrows < COL_REL_INIT_CAP
         ? source->nrows : COL_REL_INIT_CAP;
     rc = wl_columnar_relation_new_auto_governed_controlled("$reduce", ocols,
@@ -1198,14 +1196,16 @@ wl_columnar_ops_reduce_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
         if (rc) goto cleanup;
     }
     types[agg_index] = float_agg ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_INT64;
-    rc = wl_columnar_relation_join_types_controlled(out, types, control);
+    rc = wl_columnar_relation_private_types_controlled(metadata, out, types,
+            control);
     if (rc) goto cleanup;
     bool has_expr = op->agg_expr.data && op->agg_expr.size;
     if (has_expr) {
         bool supported;
-        rc = wl_columnar_expr_compile_controlled(op->agg_expr.data,
-                op->agg_expr.size, sess->memory_governor, sess, &expression,
-                &supported, control);
+        rc = wl_columnar_expr_compile_checked(op->agg_expr.data,
+                op->agg_expr.size, sess->memory_governor, sess,
+                &preparation->single, &supported, preparation, control);
+        expression = preparation->single;
         if (rc) goto cleanup;
         /* COUNT still prepares its expression but never executes/classifies
          * an unsupported interpreter arm as a new runtime error. */
@@ -1405,11 +1405,9 @@ wl_columnar_ops_reduce_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     if (rc) goto cleanup;
     rc = wl_columnar_relation_private_append_batch_end_controlled(record);
     if (rc) goto cleanup;
-    wl_columnar_expr_compiled_free_controlled(expression, control);
-    expression = NULL;
-    free(memory); memory = NULL;
-    if (!wl_columnar_memory_release(&scratch)) abort();
-    held = false;
+    rc = wl_columnar_expr_operator_retire(preparation, 0, false, control);
+    if (rc) goto cleanup;
+    expression = NULL; memory = NULL;
     rc = wl_columnar_relation_source_group_release_readers(group, 0);
     if (rc) goto cleanup;
     rc = wl_evaluation_control_charge(control, 16);
@@ -1420,7 +1418,8 @@ wl_columnar_ops_reduce_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     if (rc) goto cleanup;
     rc = wl_evaluation_control_charge(control, 16);
     if (rc) goto cleanup;
-    if (stack->top != slot || slot >= COL_STACK_MAX
+    if (stack->top != slot + 1u || slot >= COL_STACK_MAX
+        || stack->items[slot].rel != source
         || private_output->rel != out || !private_output->owned) {
         rc = EBUSY; goto cleanup;
     }
@@ -1431,11 +1430,21 @@ wl_columnar_ops_reduce_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_columnar_ops_reduce_checkpoint(control, 10, 0, record, source);
     rc = wl_evaluation_control_charge(control, 0);
     if (rc) goto cleanup;
-    wl_columnar_relation_source_group_commit(group); committed = true;
+    wl_columnar_relation_source_group_commit(group);
     rc = wl_columnar_relation_source_group_drain(group, 0);
     if (rc) goto cleanup;
     wl_columnar_ops_reduce_checkpoint(NULL, 12, 0, record, source);
-    rc = eval_entry_dispose(&input);
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto cleanup;
+    rc = eval_entry_dispose(&stack->items[slot]);
+    if (rc) goto cleanup;
+    stack->items[slot].rel = NULL;
+    wl_columnar_ops_reduce_checkpoint(control, 13, 0, record, NULL);
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto cleanup;
+    rc = wl_evaluation_control_charge(control, 16);
+    if (rc) goto cleanup;
+    rc = wl_evaluation_control_charge(control, 0);
     if (rc) goto cleanup;
     stack->items[slot] = (eval_entry_t){.rel = out, .owned = true,
                                         .kind =
@@ -1446,37 +1455,37 @@ wl_columnar_ops_reduce_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
 cleanup:
     if (out && out->memory_budget_denial_pending)
         sess->memory_budget_denied = true;
-    rc = wl_columnar_relation_private_batch_retire(record, rc);
-    wl_columnar_expr_compiled_free_controlled(expression, control);
-    free(memory);
-    if (held ||
-        atomic_load(&scratch.state) == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
-        || atomic_load(&scratch.state) ==
-        WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED) {
-        uint64_t state = atomic_load(&scratch.state);
-        bool released = state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
-            ? wl_columnar_memory_release(&scratch) :
-            wl_columnar_memory_rollback(&scratch);
-        if (!released) abort();
+    bool cleanup_ready = true;
+    int cleanup = wl_columnar_relation_bulk_append_retire(metadata, 0);
+    if (cleanup) {
+        cleanup_ready = false;
+        if (rc <= 0) rc = cleanup;
     }
-    rc = wl_columnar_relation_source_group_drain(group, rc);
-    if (popped) {
-        if (committed || group->descriptor_count || group->owner_count) {
-            stack->items[slot] = input; stack->top = slot + 1u;
-        } else {
-            int cleanup = eval_entry_dispose(&input);
-            if (cleanup) {
-                stack->items[slot] = input; stack->top = slot + 1u;
-                if (rc <= 0) rc = cleanup;
-            }
-            if (record->phase == WL_COLUMNAR_RELATION_PRIVATE_INERT
-                || record->phase == WL_COLUMNAR_RELATION_PRIVATE_RETIRED
-                || record->phase == WL_COLUMNAR_RELATION_PRIVATE_RESETTING) {
-                cleanup = eval_entry_dispose(private_output);
-                if (cleanup > 0 && rc <= 0) rc = cleanup;
-            }
+    cleanup = wl_columnar_relation_private_batch_retire(record, 0);
+    if (cleanup) {
+        cleanup_ready = false;
+        if (rc <= 0) rc = cleanup;
+    }
+    if (preparation) {
+        cleanup = wl_columnar_expr_operator_retire(preparation, 0, true, NULL);
+        if (cleanup) {
+            cleanup_ready = false;
+            if (rc <= 0) rc = cleanup;
         }
     }
+    cleanup = wl_columnar_relation_source_group_drain(group, 0);
+    if (cleanup) {
+        cleanup_ready = false;
+        if (rc <= 0) rc = cleanup;
+    }
+    if (cleanup_ready && !metadata->active
+        && (record->phase == WL_COLUMNAR_RELATION_PRIVATE_INERT
+        || record->phase == WL_COLUMNAR_RELATION_PRIVATE_RETIRED
+        || record->phase == WL_COLUMNAR_RELATION_PRIVATE_RESETTING)) {
+        cleanup = eval_entry_dispose(private_output);
+        if (cleanup > 0 && rc <= 0) rc = cleanup;
+    }
+    /* Original input and result owners remain in the frame on refusal. */
     if (rc == ENOSPC) sess->memory_budget_denied = true;
     return rc;
 }

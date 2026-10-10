@@ -5398,8 +5398,19 @@ wl_columnar_session_serial_preflight(wl_col_session_t *sess)
                         &union_plan);
                 if (rc) return rc;
             }
+            bool aggregate_plan = false;
+            if (rp->ops && ((rp->op_count == 3u
+                && rp->ops[1].op == WL_PLAN_OP_REDUCE)
+                || (rp->op_count == 4u
+                && rp->ops[1].op == WL_PLAN_OP_FILTER
+                && rp->ops[2].op == WL_PLAN_OP_REDUCE))) {
+                rc = wl_columnar_eval_plan_aggregate_validate(rp, control,
+                        &aggregate_plan);
+                if (rc) return rc;
+            }
             if (!rp->name || !rp->ops ||
-                (!plain && !filtered && !joined && !union_plan)
+                (!plain && !filtered && !joined && !union_plan &&
+                !aggregate_plan)
                 || rp->ops[0].op != WL_PLAN_OP_VARIABLE
                 || (rp->ops[0].delta_mode != WL_DELTA_AUTO
                 && rp->ops[0].delta_mode != WL_DELTA_FORCE_FULL))
@@ -5473,10 +5484,10 @@ wl_columnar_session_serial_preflight(wl_col_session_t *sess)
     if (preflight_frame) {
         if (!rc) sess->serial_completion.frame = preflight_frame;
         int cleanup = wl_columnar_eval_stack_cleanup_finish(&preflight_frame);
-        if (cleanup) rc = cleanup;
+        if (cleanup > 0 && rc <= 0) rc = cleanup;
         if (rc && sess->serial_completion.frame && !sess->cleanup_pending) {
             cleanup = wl_columnar_eval_stack_cleanup_retained(sess);
-            if (cleanup) rc = cleanup;
+            if (cleanup > 0 && rc <= 0) rc = cleanup;
         }
     }
     return rc;
@@ -5715,7 +5726,7 @@ wl_columnar_session_serial_attempt(wl_col_session_t *sess, bool snapshot,
                         control);
                 if (record->published || !rc) state->reset_relation++;
                 int cleanup = wl_columnar_eval_stack_cleanup_finish(&frame);
-                if (cleanup) rc = cleanup;
+                if (cleanup > 0 && rc <= 0) rc = cleanup;
                 if (rc) goto done;
                 rc = wl_columnar_session_serial_tail(control, 8,
                         state->reset_relation, NULL);
@@ -5859,7 +5870,7 @@ wl_columnar_session_serial_attempt(wl_col_session_t *sess, bool snapshot,
 done:
     if (rc && state->frame && !sess->cleanup_pending && !sess->cleanup_active) {
         int cleanup = wl_columnar_eval_stack_cleanup_retained_drain(sess);
-        if (cleanup) rc = cleanup;
+        if (cleanup > 0 && rc <= 0) rc = cleanup;
     }
     state->active = false;
     return rc;

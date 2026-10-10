@@ -41,6 +41,33 @@ _Static_assert(WL_PLAN_OP_K_FUSION == WL_PLAN_OP__BACKEND_START,
  * On success, the top of stack holds the result relation (owned).
  */
 int
+wl_columnar_eval_plan_aggregate_validate(const wl_plan_relation_t *plan,
+    wl_evaluation_control_t *control, bool *supported)
+{
+    if (!plan || !supported || !control) return EINVAL;
+    *supported = false;
+    if (!plan->ops || (plan->op_count != 3u && plan->op_count != 4u)) return 0;
+    for (uint32_t i = 0; i < plan->op_count; i++) {
+        int rc = wl_evaluation_control_charge(control, 48);
+        if (rc) return rc;
+        const wl_plan_op_t *op = &plan->ops[i];
+        if (i == 0) {
+            if (op->op != WL_PLAN_OP_VARIABLE || !op->relation_name
+                || (op->delta_mode != WL_DELTA_AUTO
+                && op->delta_mode != WL_DELTA_FORCE_FULL)) return ENOTSUP;
+        } else if (i + 1u == plan->op_count) {
+            if (op->op != WL_PLAN_OP_CONSOLIDATE) return ENOTSUP;
+        } else if (i + 2u == plan->op_count) {
+            if (op->op != WL_PLAN_OP_REDUCE) return ENOTSUP;
+        } else if (op->op != WL_PLAN_OP_FILTER) return ENOTSUP;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return rc;
+    }
+    *supported = true;
+    return 0;
+}
+
+int
 wl_columnar_eval_plan_union_validate(const wl_plan_relation_t *plan,
     wl_evaluation_control_t *control, bool *supported)
 {
@@ -332,10 +359,19 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
                     &union_plan);
             if (rc) return rc;
         }
+        bool aggregate_plan = false;
+        if ((rplan->op_count == 3u && rplan->ops[1].op == WL_PLAN_OP_REDUCE)
+            || (rplan->op_count == 4u
+            && rplan->ops[1].op == WL_PLAN_OP_FILTER
+            && rplan->ops[2].op == WL_PLAN_OP_REDUCE)) {
+            rc = wl_columnar_eval_plan_aggregate_validate(rplan, control,
+                    &aggregate_plan);
+            if (rc) return rc;
+        }
         if (!union_plan && !join && !filter && !map && !pipeline && !reduce &&
             !consolidate
             && !owned_consolidate && !filtered_consolidate &&
-            !joined_consolidate)
+            !joined_consolidate && !aggregate_plan)
             return ENOTSUP;
         const wl_plan_op_t *op = &rplan->ops[0];
         if (sess->num_workers > 1 || sess->diff_operators_active
@@ -346,12 +382,12 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
             || !sess->memory_governor
             || (op->delta_mode != WL_DELTA_FORCE_FULL
             && !((owned_consolidate || filtered_consolidate ||
-            joined_consolidate || union_plan)
+            joined_consolidate || union_plan || aggregate_plan)
             && op->delta_mode == WL_DELTA_AUTO)))
             return ENOTSUP;
         if (filter || map || pipeline || reduce || consolidate ||
             owned_consolidate || filtered_consolidate || joined_consolidate ||
-            union_plan) {
+            union_plan || aggregate_plan) {
             rc = wl_evaluation_control_charge(control,
                     filtered_consolidate ||
                     joined_consolidate ? 40u : pipeline ||
