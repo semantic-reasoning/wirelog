@@ -3,7 +3,6 @@
 #include "../wirelog/thread.h"
 #include <assert.h>
 #include <errno.h>
-#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -203,14 +202,14 @@ overlapping_storage_tests(void)
     root_init(&root, 33);
     wl_columnar_relation_mutation_role_t role = { &root,
                                                   WL_COLUMNAR_RELATION_PAYLOAD_MUTATION };
-    _Alignas(max_align_t) unsigned char shared[
-        sizeof(wl_columnar_relation_mutation_lease_t)
-        + sizeof(wl_columnar_relation_mutation_initialization_t)] = {0};
+    union {
+        wl_columnar_relation_mutation_lease_t lease;
+        wl_columnar_relation_mutation_initialization_t initialization;
+    } shared;
+    memset(&shared, 0, sizeof(shared));
     assert(col_rel_mutation_set_acquire(&f.set, &role, 1,
-        f.descriptors, 4, f.owners, 8,
-        (wl_columnar_relation_mutation_lease_t *)shared, 1,
-        (wl_columnar_relation_mutation_initialization_t *)shared, 1)
-        == EINVAL);
+        f.descriptors, 4, f.owners, 8, &shared.lease, 1,
+        &shared.initialization, 1) == EINVAL);
     assert(col_rel_mutation_set_acquire(&f.set, &role, 1,
         (wl_columnar_relation_mutation_descriptor_t *)f.owners, 4, f.owners, 8,
         f.leases, 4, f.initializations, 4) == EINVAL);
