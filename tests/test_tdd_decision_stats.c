@@ -161,8 +161,8 @@ run_snapshot_frames(void)
         wl_plan_free(plan);
         return 1;
     }
-    /* These independent SCCs can execute in any order. Choose r,s,t to
-     * deliberately exercise a hole in the affected mask (indices 0 and 2). */
+    /* These independent SCCs can execute in any order. Fix them as r,s,t so
+     * the audit frames list strata in a known order. */
     const char *names[] = { "r", "s", "t" };
     wl_plan_stratum_t *strata = (wl_plan_stratum_t *)plan->strata;
     for (uint32_t i = 0; i < 3; i++) {
@@ -189,10 +189,13 @@ run_snapshot_frames(void)
         rc = wl_session_insert(sess, "b", first, 1, 2);
     if (rc == 0)
         rc = wl_session_snapshot(sess, count_cb, &ctx);
-    /* Use the incremental insert route without a delta callback, so the
-     * snapshot does not fall back to a full evaluation (#1030, #2108). */
+    /* The second snapshot evaluates every stratum (a plain insert asks for
+     * a full evaluation); the third reads the stable model and evaluates
+     * none.  An incremental insert would take the insert route instead,
+     * which evaluates through bound slice runs and prints no stratum frame
+     * (#2114). */
     if (rc == 0)
-        rc = col_session_insert_incremental(sess, "a", second, 1, 2);
+        rc = wl_session_insert(sess, "a", second, 1, 2);
     if (rc == 0)
         rc = wl_session_snapshot(sess, count_cb, &ctx);
     if (rc == 0)

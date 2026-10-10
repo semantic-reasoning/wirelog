@@ -30,29 +30,29 @@ static int pass_count = 0;
 static int fail_count = 0;
 
 #define TEST(name)                                      \
-    do {                                                \
-        test_count++;                                   \
-        printf("TEST %d: %s ... ", test_count, (name)); \
-    } while (0)
+        do {                                                \
+            test_count++;                                   \
+            printf("TEST %d: %s ... ", test_count, (name)); \
+        } while (0)
 
 #define PASS()            \
-    do {                  \
-        pass_count++;     \
-        printf("PASS\n"); \
-    } while (0)
+        do {                  \
+            pass_count++;     \
+            printf("PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                    \
-    do {                             \
-        fail_count++;                \
-        printf("FAIL: %s\n", (msg)); \
-        return;                      \
-    } while (0)
+        do {                             \
+            fail_count++;                \
+            printf("FAIL: %s\n", (msg)); \
+            return;                      \
+        } while (0)
 
 #define ASSERT(cond, msg) \
-    do {                  \
-        if (!(cond))      \
+        do {                  \
+            if (!(cond))      \
             FAIL(msg);    \
-    } while (0)
+        } while (0)
 
 /* ----------------------------------------------------------------
  * Helpers
@@ -74,7 +74,7 @@ struct rel_ctx {
 
 static void
 count_cb(const char *relation, const int64_t *row, uint32_t ncols,
-         void *user_data)
+    void *user_data)
 {
     struct rel_ctx *ctx = (struct rel_ctx *)user_data;
     if (relation && ctx->target && strcmp(relation, ctx->target) == 0)
@@ -88,7 +88,7 @@ count_cb(const char *relation, const int64_t *row, uint32_t ncols,
  * wirelog_program_free. */
 static int
 make_tc_session(const char *src, wl_session_t **out_sess, wl_plan_t **out_plan,
-                wirelog_program_t **out_prog)
+    wirelog_program_t **out_prog)
 {
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(src, &err);
@@ -134,10 +134,10 @@ test_skip_within_same_epoch(void)
     TEST("skip fires within same insertion epoch");
 
     const char *src = ".decl edge(x: int32, y: int32)\n"
-                      "edge(1, 2). edge(2, 3). edge(3, 4).\n"
-                      ".decl tc(x: int32, y: int32)\n"
-                      "tc(x, y) :- edge(x, y).\n"
-                      "tc(x, z) :- tc(x, y), edge(y, z).\n";
+        "edge(1, 2). edge(2, 3). edge(3, 4).\n"
+        ".decl tc(x: int32, y: int32)\n"
+        "tc(x, y) :- edge(x, y).\n"
+        "tc(x, z) :- tc(x, y), edge(y, z).\n";
 
     wl_session_t *sess = NULL;
     wl_plan_t *plan = NULL;
@@ -160,20 +160,20 @@ test_skip_within_same_epoch(void)
     rc = col_session_get_frontier(sess, 0, &f0);
     ASSERT(rc == 0, "get_frontier stratum 0 failed");
     ASSERT(f0.outer_epoch == 0,
-           "frontier outer_epoch should be 0 after first snap");
+        "frontier outer_epoch should be 0 after first snap");
     ASSERT(f0.iteration != UINT32_MAX,
-           "frontier iteration should be finite after convergence");
+        "frontier iteration should be finite after convergence");
 
     printf("(epoch=%u iter=%u tc=%" PRId64 ") ", f0.outer_epoch, f0.iteration,
-           ctx1.count);
+        ctx1.count);
 
     /* Second snapshot with NO insertion — same epoch, skip should fire
-     * for iterations beyond f0.iteration.  Result must be identical. */
+    * for iterations beyond f0.iteration.  Result must be identical. */
     struct rel_ctx ctx2 = { "tc", 0 };
     rc = wl_session_snapshot(sess, count_cb, &ctx2);
     ASSERT(rc == 0, "second snapshot failed");
     ASSERT(ctx2.count == ctx1.count,
-           "second snapshot (same epoch) must return same tuple count");
+        "second snapshot (same epoch) must return same tuple count");
 
     wl_session_destroy(sess);
     wl_plan_free(plan);
@@ -198,10 +198,10 @@ test_skip_does_not_fire_across_epochs(void)
     TEST("skip does not fire across epoch boundaries");
 
     const char *src = ".decl edge(x: int32, y: int32)\n"
-                      "edge(1, 2). edge(2, 3).\n"
-                      ".decl tc(x: int32, y: int32)\n"
-                      "tc(x, y) :- edge(x, y).\n"
-                      "tc(x, z) :- tc(x, y), edge(y, z).\n";
+        "edge(1, 2). edge(2, 3).\n"
+        ".decl tc(x: int32, y: int32)\n"
+        "tc(x, y) :- edge(x, y).\n"
+        "tc(x, z) :- tc(x, y), edge(y, z).\n";
 
     wl_session_t *sess = NULL;
     wl_plan_t *plan = NULL;
@@ -222,7 +222,7 @@ test_skip_does_not_fire_across_epochs(void)
     rc = col_session_get_frontier(sess, 0, &f0_before);
     ASSERT(rc == 0, "get_frontier before insert failed");
     ASSERT(f0_before.outer_epoch == 0,
-           "frontier epoch should be 0 before insert");
+        "frontier epoch should be 0 before insert");
 
     /* Insert edge(3,4) — bumps outer_epoch on affected strata */
     int64_t e34[2] = { 3, 4 };
@@ -237,12 +237,12 @@ test_skip_does_not_fire_across_epochs(void)
     ASSERT(rc == 0, "second snapshot failed");
 
     printf("(epoch0_tc=%" PRId64 " epoch1_tc=%" PRId64 ") ", ctx1.count,
-           ctx2.count);
+        ctx2.count);
 
     ASSERT(ctx2.count == 6, "after crossing epoch boundary tc must include new "
-                            "tuples (expected 6)");
+        "tuples (expected 6)");
     ASSERT(ctx2.count > ctx1.count,
-           "new epoch must produce more tuples than previous epoch");
+        "new epoch must produce more tuples than previous epoch");
 
     wl_session_destroy(sess);
     wl_plan_free(plan);
@@ -254,8 +254,9 @@ test_skip_does_not_fire_across_epochs(void)
  * Test 3: Convergence recorded with correct (outer_epoch, iteration) pairs
  *
  * After two sequential inserts (two epoch increments), verify that the
- * frontier stores the epoch value matching the most recent snapshot and
- * a finite iteration number, confirming 2D tracking is working end-to-end.
+ * frontier stores the epoch value matching the most recent snapshot: a
+ * finite iteration after the first, full evaluation, and the reset
+ * sentinel after each incremental snapshot (Issue #2114).
  * ================================================================ */
 static void
 test_convergence_recorded_with_2d_pairs(void)
@@ -263,10 +264,10 @@ test_convergence_recorded_with_2d_pairs(void)
     TEST("convergence recorded with (outer_epoch, iteration) pairs");
 
     const char *src = ".decl edge(x: int32, y: int32)\n"
-                      "edge(1, 2).\n"
-                      ".decl tc(x: int32, y: int32)\n"
-                      "tc(x, y) :- edge(x, y).\n"
-                      "tc(x, z) :- tc(x, y), edge(y, z).\n";
+        "edge(1, 2).\n"
+        ".decl tc(x: int32, y: int32)\n"
+        "tc(x, y) :- edge(x, y).\n"
+        "tc(x, z) :- tc(x, y), edge(y, z).\n";
 
     wl_session_t *sess = NULL;
     wl_plan_t *plan = NULL;
@@ -285,9 +286,9 @@ test_convergence_recorded_with_2d_pairs(void)
     rc = col_session_get_frontier(sess, 0, &f_epoch0);
     ASSERT(rc == 0, "get_frontier epoch0 failed");
     ASSERT(f_epoch0.outer_epoch == 0,
-           "frontier outer_epoch must be 0 after first snapshot");
+        "frontier outer_epoch must be 0 after first snapshot");
     ASSERT(f_epoch0.iteration != UINT32_MAX,
-           "frontier iteration must be finite after convergence (epoch 0)");
+        "frontier iteration must be finite after convergence (epoch 0)");
 
     /* Insert edge(2,3) → new epoch */
     int64_t e23[2] = { 2, 3 };
@@ -302,11 +303,14 @@ test_convergence_recorded_with_2d_pairs(void)
     rc = col_session_get_frontier(sess, 0, &f_epoch1);
     ASSERT(rc == 0, "get_frontier epoch1 failed");
     ASSERT(f_epoch1.outer_epoch == 1,
-           "frontier outer_epoch must be 1 after second snapshot");
-    ASSERT(f_epoch1.iteration != UINT32_MAX,
-           "frontier iteration must be finite after convergence (epoch 1)");
+        "frontier outer_epoch must be 1 after second snapshot");
+    /* Issue #2114: a snapshot after an incremental insert evaluates no
+     * semi-naive iteration, so it resets the frontier to the not-set
+     * sentinel and no later evaluation skips an iteration on its account. */
+    ASSERT(f_epoch1.iteration == UINT32_MAX,
+        "frontier must be reset after an incremental snapshot (epoch 1)");
     ASSERT(f_epoch1.outer_epoch > f_epoch0.outer_epoch,
-           "frontier epoch must increment across insertions");
+        "frontier epoch must increment across insertions");
 
     /* Insert edge(3,4) → epoch 2 */
     int64_t e34[2] = { 3, 4 };
@@ -322,14 +326,17 @@ test_convergence_recorded_with_2d_pairs(void)
     rc = col_session_get_frontier(sess, 0, &f_epoch2);
     ASSERT(rc == 0, "get_frontier epoch2 failed");
     ASSERT(f_epoch2.outer_epoch == 2,
-           "frontier outer_epoch must be 2 after third snapshot");
-    ASSERT(f_epoch2.iteration != UINT32_MAX,
-           "frontier iteration must be finite after convergence (epoch 2)");
+        "frontier outer_epoch must be 2 after third snapshot");
+    /* Issue #2114: a snapshot after an incremental insert evaluates no
+     * semi-naive iteration, so it resets the frontier to the not-set
+     * sentinel and no later evaluation skips an iteration on its account. */
+    ASSERT(f_epoch2.iteration == UINT32_MAX,
+        "frontier must be reset after an incremental snapshot (epoch 2)");
 
     printf("(e0=(%u,%u) e1=(%u,%u) e2=(%u,%u) tc=%" PRId64 ") ",
-           f_epoch0.outer_epoch, f_epoch0.iteration, f_epoch1.outer_epoch,
-           f_epoch1.iteration, f_epoch2.outer_epoch, f_epoch2.iteration,
-           ctx3.count);
+        f_epoch0.outer_epoch, f_epoch0.iteration, f_epoch1.outer_epoch,
+        f_epoch1.iteration, f_epoch2.outer_epoch, f_epoch2.iteration,
+        ctx3.count);
 
     ASSERT(ctx3.count == 6, "expected 6 TC tuples for 1->2->3->4 chain");
 

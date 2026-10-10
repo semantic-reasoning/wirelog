@@ -2111,8 +2111,10 @@ typedef struct wl_col_session_t {
         int replay_rc;
     } tdd_audit;
     /* Phase 4: tracks which relation was just inserted via
-     * col_session_insert_incremental, enables affected-stratum skip
-     * optimization. Session-owned canonical relation name; base and
+     * col_session_insert_incremental, so a step with a delta callback can
+     * evaluate only the strata it affects and a snapshot can bring them up
+     * to date from its appended rows (#2114).  Session-owned canonical
+     * relation name; base and
      * compound-side relations remain registered while input work is pending,
      * so the pointer stays valid until a successful step/snapshot clears it.
      * NULL when no incremental insert preceded the current step (all strata
@@ -2147,11 +2149,14 @@ typedef struct wl_col_session_t {
      * bulk removal.  The temporary delta is discarded before generic session
      * budget inspection can see it. */
     bool remove_staging_budget_denied;
-    /* Delta-seeded incremental evaluation (issue #83).
-     * When true, EDB delta relations have been pre-seeded into the session
-     * before re-evaluation. FORCE_DELTA at iteration 0 pushes empty (not full)
-     * for relations without a pre-seeded delta, enabling delta-only propagation
-     * instead of full re-derivation. Cleared after eval completes. */
+    /* Delta-seeded evaluation (issue #83).
+     * When true, FORCE_DELTA at iteration 0 pushes empty (not full) for
+     * relations without a delta, so evaluation propagates deltas only.
+     * tdd_worker_subpass_fn sets it on a worker clone for an outbound-only
+     * differential sub-pass and restores it afterwards.  The snapshot
+     * pre-seed of `$d$` EDB deltas that set it on the coordinator was
+     * replaced in #2114 by wl_columnar_eval_tdd_insert_stratum, which clears
+     * it on its own worker clone. */
     bool delta_seeded;
     /* Multi-worker support (issue #99).
      * Stored from col_session_create num_workers parameter as a maximum worker
@@ -4203,6 +4208,12 @@ int wl_columnar_eval_tdd_insert_stratum(wl_col_session_t *sess,
     const wl_plan_stratum_t *sp, const char *const *changed,
     col_rel_t *const *changed_delta, uint32_t nchanged,
     col_rel_t **head_delta);
+#ifdef WL_SESSION_TEST_HOOKS
+/* Called after each round's merge, with the heads already updated; a
+ * non-zero return fails the stratum there. */
+extern int (*wl_columnar_eval_tdd_insert_test_after_merge)(
+    const wl_plan_stratum_t *sp);
+#endif
 
 typedef struct {
     uint32_t total_segments;
@@ -4245,11 +4256,6 @@ void
 wl_columnar_delta_events_clear(wl_col_session_t *sess);
 void
 wl_columnar_delta_events_publish(wl_col_session_t *sess);
-bool
-stratum_has_preseeded_delta(const wl_plan_stratum_t *sp,
-    wl_col_session_t *sess);
-uint32_t
-rule_index_to_stratum_index(const wl_plan_t *plan, uint32_t rule_id);
 /* Normalize a relation through an admitted private candidate.
  * Refusal retains the original target and any pending candidate cleanup. */
 int

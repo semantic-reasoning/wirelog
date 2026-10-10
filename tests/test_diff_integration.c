@@ -544,12 +544,16 @@ test_guard_false_full_mask(void)
      * = full_mask for a 2-stratum program.
      * Issue #275: Removed full_mask guard, so diff_operators_active can now be true.
      * Verify that delta-seeded incremental path produces correct results. */
+    /* Issue #2114: a snapshot no longer evaluates an incremental insert
+     * stratum by stratum; a step with a delta callback is where the update
+     * turns differential operators on. */
+    wl_session_set_delta_cb(sess, noop_delta_cb, NULL);
     int64_t new_edge[2] = { 3, 4 };
     rc = col_session_insert_incremental(sess, "edge", new_edge, 1, 2);
     ASSERT(rc == 0, "incremental insert failed");
 
-    rc = wl_session_snapshot(sess, noop_cb, NULL);
-    ASSERT(rc == 0, "snapshot after insert failed");
+    rc = wl_session_step(sess);
+    ASSERT(rc == 0, "step after insert failed");
 
     printf("(diff_active=%d) ", (int)cs->diff_operators_active);
     /* After Issue #275: diff_operators_active should be true (guard removed) */
@@ -581,12 +585,16 @@ test_guard_false_when_disabled_regardless_of_mask(void)
     rc = wl_session_snapshot(sess, noop_cb, NULL);
     ASSERT(rc == 0, "initial snapshot failed");
 
+    /* Issue #2114: a snapshot no longer evaluates an incremental insert
+     * stratum by stratum; a step with a delta callback is where the update
+     * turns differential operators on. */
+    wl_session_set_delta_cb(sess, noop_delta_cb, NULL);
     int64_t new_edge[2] = { 3, 4 };
     rc = col_session_insert_incremental(sess, "edge", new_edge, 1, 2);
     ASSERT(rc == 0, "incremental insert failed");
 
-    rc = wl_session_snapshot(sess, noop_cb, NULL);
-    ASSERT(rc == 0, "snapshot after insert failed");
+    rc = wl_session_step(sess);
+    ASSERT(rc == 0, "step after insert failed");
 
     ASSERT(cs->diff_operators_active == false,
         "guard must be false when diff_enabled=false");
@@ -616,12 +624,16 @@ test_guard_single_stratum(void)
     rc = wl_session_snapshot(sess, noop_cb, NULL);
     ASSERT(rc == 0, "initial snapshot failed");
 
+    /* Issue #2114: a snapshot no longer evaluates an incremental insert
+     * stratum by stratum; a step with a delta callback is where the update
+     * turns differential operators on. */
+    wl_session_set_delta_cb(sess, noop_delta_cb, NULL);
     int64_t new_input[1] = { 99 };
     rc = col_session_insert_incremental(sess, "input", new_input, 1, 1);
     ASSERT(rc == 0, "incremental insert failed");
 
-    rc = wl_session_snapshot(sess, noop_cb, NULL);
-    ASSERT(rc == 0, "snapshot after insert failed");
+    rc = wl_session_step(sess);
+    ASSERT(rc == 0, "step after insert failed");
 
     printf("(diff_active=%d nstrata=%u) ",
         (int)cs->diff_operators_active, cs->plan->stratum_count);
