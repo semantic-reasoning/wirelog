@@ -72,7 +72,7 @@ def evidence_path(value, home, sources):
 
 def git(source, *args):
     result = subprocess.run(['git', '-C', str(source), *args], capture_output=True,
-                            text=True, check=False)
+                            text=True, encoding='utf-8', check=False)
     if result.returncode != 0:
         raise RunError(f'git {" ".join(args)} failed in {source}: {result.stderr.strip()}')
     return result.stdout.strip()
