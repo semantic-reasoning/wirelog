@@ -115,6 +115,7 @@ wl_columnar_lftj_join_typed_governed(const wl_lftj_input_t *inputs,
     wl_columnar_memory_governor_ref_t *governor);
 
 #ifdef WL_TEST_LFTJ_ADMISSION_HOOKS
+size_t wl_columnar_lftj_test_iterator_size(void);
 typedef struct {
     bool fail_iters_pending;
     bool fail_iters_consumed;

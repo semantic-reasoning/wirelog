@@ -1160,7 +1160,8 @@ Typed original-schema helper fixtures are separate from typed producer coverage.
 Sorted-prefix and multisegment SET use the same controlled range kernels and
 original frame authorities. Remaining full-task obligations include generated
 typed routes beyond the selected producers, general delta/reset and recursive
-evaluation, differential observers, broader batch/pipeline execution and LFTJ.
+evaluation, differential observers, broader batch/pipeline execution and
+LFTJ contexts beyond the selected ordinary first-op route.
 
 ### Controlled ordinary aggregate evaluation
 
@@ -1193,11 +1194,14 @@ remaining full-task execution lanes listed above.
 ### Controlled ordinary aggregate compositions
 
 New ordinary postfix compositions use the shared charged plan traversal:
-VARIABLE, FILTER, MAP, ordinary JOIN, REDUCE, CONCAT and final CONSOLIDATE.
+VARIABLE, first-op LFTJ, FILTER, MAP, ordinary JOIN, SEMIJOIN, ANTIJOIN,
+REDUCE, CONCAT and final CONSOLIDATE.
 Existing exact routes retain their admission trajectory. Each new operator
 visit admits 48 units before inspecting the immutable plan and then polls.
-Recursive, seeded, differential, batched, materialized and LFTJ contexts remain
-outstanding coverage; this grammar does not enable those dispatch paths.
+Recursive, seeded, differential and general materialized contexts remain
+outstanding coverage. Selected ordinary batch/pipeline and first-op LFTJ
+lifecycles are described below; this grammar does not enable their recursive
+or differential counterparts.
 
 Completed branches stay in their original stack entries. Typed CONCAT uses
 the existing held new-like constructor and bulk records, with the original
@@ -1341,3 +1345,48 @@ frame; positive initiating errors keep precedence. Source and private authoritie
 retire before checked input disposal, with polls immediately before and after
 each healthy disposer. Physical width, Arrow and dedup destruction is excluded
 from bounded forward work, so cancellation delay can include one destructor.
+
+
+### Controlled ordinary first-op LFTJ
+
+A generated first LFTJ followed by projection MAP and CONSOLIDATE uses the same
+ordinary W1 initial/dirty evaluation, canonical publication and output journal.
+The shared postfix grammar treats LFTJ as a stack-producing branch, with its
+actual named inputs and key columns validated under the current control. This
+route preserves the default arena and pool. Generated projection MAP still
+produces its raw implicit INT64 schema; a declared FLOAT source alone does not
+establish a typed MAP result.
+
+Outer scratch, sorted-cache preparation and inner kernel owners occupy the
+original frame workspace. The complete frame and completion sizes and
+alignments remain unchanged. Real dynamic probe and reader slots retain their
+allocation addresses. All named sources are acquired before any cache build;
+cache pins remain through actual kernel and sink use. Fresh signed-order cache
+construction and the separate typed eight-pass inner sort preserve raw
+allocation and overlap policy. Only genuine cache ENOMEM or EBUSY selects an
+owned input copy; work stops, overflow and authority refusal propagate.
+
+Gathering, radix count/prefix/scatter, iterator seek/range comparisons, visited
+product candidates and per-column engine sink work are admitted and polled.
+Output starts at raw capacity0 and grows through the original exact-capacity
+bulk transaction after actual private writer retirement; a fresh original
+private epoch is then acquired. The first row publication cutoff and the
+final stack transport cutoff are distinct. A work limit after row publication
+may retain that consumed private row for checked disposal without a canonical
+callback. Retrying the ordinary caller uses its original canonical cursor.
+
+Healthy retirement is charged work. Mandatory failure cleanup uses the
+existing checked exclusion without fresh charge, reset or refund. Physical
+buffers are freed and NULL before original RESERVED rollback or COMMITTED
+release. A refused original token, descriptor reader or cache pin remains
+reachable; positive initiating errors retain precedence over cleanup refusal.
+The ordinary caller may retain its actually retired completion frame and
+original credit for retry, then retires both after successful completion.
+Libc allocator/realloc execution and existing checked relation destruction
+remain explicit cancellation-delay exclusions; their internal work is not
+claimed as precisely metered engine telemetry.
+
+This selected ordinary route does not enable recursive delta/timestamp,
+seeded/differential observer or general batched/materialized LFTJ contexts.
+Those routes and complete issue-wide checkpoint coverage remain required
+before #1821 closure.

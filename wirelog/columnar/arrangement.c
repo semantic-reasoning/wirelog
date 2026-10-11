@@ -2805,6 +2805,46 @@ sarr_release(col_sorted_arr_t *sarr)
     sarr->sorted = NULL;
 }
 
+#ifdef WL_TEST_LFTJ_ADMISSION_HOOKS
+#if defined(_MSC_VER)
+#define WL_COLUMNAR_ARRANGEMENT_LFTJ_TLS __declspec(thread)
+#else
+#define WL_COLUMNAR_ARRANGEMENT_LFTJ_TLS _Thread_local
+#endif
+static WL_COLUMNAR_ARRANGEMENT_LFTJ_TLS bool
+wl_columnar_arrangement_sorted_fail_pending,
+wl_columnar_arrangement_sorted_fail_consumed;
+void
+wl_columnar_arrangement_sorted_test_fail_next_allocation(void)
+{
+    wl_columnar_arrangement_sorted_fail_pending = true;
+    wl_columnar_arrangement_sorted_fail_consumed = false;
+}
+bool
+wl_columnar_arrangement_sorted_test_allocation_failure_consumed(void)
+{
+    return wl_columnar_arrangement_sorted_fail_consumed;
+}
+void
+wl_columnar_arrangement_sorted_test_clear_allocation_failure(void)
+{
+    wl_columnar_arrangement_sorted_fail_pending = false;
+    wl_columnar_arrangement_sorted_fail_consumed = false;
+}
+#endif
+static int64_t *
+wl_columnar_arrangement_sorted_allocate(size_t bytes)
+{
+#ifdef WL_TEST_LFTJ_ADMISSION_HOOKS
+    if (wl_columnar_arrangement_sorted_fail_pending) {
+        wl_columnar_arrangement_sorted_fail_pending = false;
+        wl_columnar_arrangement_sorted_fail_consumed = true;
+        return NULL;
+    }
+#endif
+    return malloc(bytes);
+}
+
 static int
 sarr_build(col_sorted_arr_t *sarr, const col_rel_t *rel, uint32_t key_col)
 {
@@ -2834,7 +2874,7 @@ sarr_build(col_sorted_arr_t *sarr, const col_rel_t *rel, uint32_t key_col)
     }
 
     size_t bytes = (size_t)rel->nrows * rel->ncols * sizeof(int64_t);
-    fresh.sorted = (int64_t *)malloc(bytes);
+    fresh.sorted = wl_columnar_arrangement_sorted_allocate(bytes);
     if (!fresh.sorted)
         return ENOMEM;
     if (fresh.ledger) {
@@ -3712,4 +3752,277 @@ col_diff_arr_entries_clone(const col_diff_arr_entry_t *src, uint32_t count,
     *out_entries = cloned;
     *out_cap = count;
     return 0;
+}
+
+/* Distinct controlled probe contract: the embedded reader owns the descriptor
+ * gate, while the separately allocated original reader owns the storage gate.
+ * Neither live token is copied into another slot. */
+static int
+wl_columnar_arrangement_sorted_pair_ready(col_sorted_arrangement_probe_t *probe,
+    wl_columnar_source_access_reader_t *reader, const col_rel_t *source)
+{
+    col_rel_t *owner = NULL;
+    if (!probe || !reader || !source
+        || col_rel_storage_owner_resolve(source, &owner) != 0
+        || probe->source_reader.owner != &source->descriptor_access
+        || probe->source_reader.secondary_owner
+        || probe->source_reader.identity != (uintptr_t)&probe->source_reader
+        || !wl_columnar_source_access_reader_thread_equal(&probe->source_reader)
+        || reader->owner != &owner->source_access || reader->secondary_owner
+        || reader->identity != (uintptr_t)reader
+        || !wl_columnar_source_access_reader_thread_equal(
+            reader)) return EINVAL;
+    return 0;
+}
+
+int
+wl_columnar_arrangement_sorted_probe_release_controlled(
+    col_sorted_arrangement_probe_t *probe,
+    wl_columnar_source_access_reader_t *reader, const col_rel_t *source,
+    wl_evaluation_control_t *control)
+{
+    if (!probe || !reader) return EINVAL;
+    if (probe->active && (probe->identity != (uintptr_t)probe
+        || !probe->entry || !probe->session || probe->source != source
+        || probe->arr != &probe->entry->sarr || !probe->arr->pin_count
+        || probe->arr->pin_count > probe->session->sarr_active_pins))
+        return EINVAL;
+    /* Tokens themselves retain the actual release subphase after refusal. */
+    int rc = 0;
+    if (reader->owner) {
+        rc = wl_columnar_relation_single_reader_release_controlled(reader,
+                control);
+        if (rc) return rc;
+    }
+    if (probe->source_reader.owner) {
+        rc = wl_columnar_relation_single_reader_release_controlled(
+            &probe->source_reader, control);
+        if (rc) return rc;
+    }
+    if (control) {
+        rc = wl_evaluation_control_charge(control, 32 + sizeof(*probe));
+        if (rc) return rc;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    if (probe->active) {
+        probe->arr->pin_count--;
+        probe->session->sarr_active_pins--;
+        if (!probe->arr->pin_count && probe->arr->rebuild_deferred) {
+            probe->arr->rebuild_deferred = false;
+            probe->arr->indexed_rows = probe->arr->nrows = 0;
+            memset(&probe->arr->source_snapshot, 0,
+                sizeof(probe->arr->source_snapshot));
+        }
+    }
+    memset(probe, 0, sizeof(*probe));
+    return control ? wl_evaluation_control_charge(control, 0) : 0;
+}
+
+static int
+wl_columnar_arrangement_sorted_name_equal(wl_columnar_lftj_record_t *record,
+    const char *a, const char *b, bool *equal)
+{
+    *equal = false;
+    if (!a || !b) return 0;
+    for (size_t i = 0;; i++) {
+        int rc = wl_columnar_lftj_work(record, 2); if (rc) return rc;
+        char av = a[i], bv = b[i];
+        rc = wl_columnar_lftj_tail(record, 2, i + 1u); if (rc) return rc;
+        if (av != bv) return 0;
+        if (!av) {
+            *equal = true; return 0;
+        }
+    }
+}
+
+static void
+wl_columnar_arrangement_sorted_discard_fresh(wl_columnar_lftj_record_t *record)
+{
+    free(record->radix_temp); record->radix_temp = NULL;
+    record->sort_bytes = 0;
+    free(record->cache_fresh.sorted); record->cache_fresh.sorted = NULL;
+    if (record->cache_ledger_installed) {
+        wl_mem_ledger_free(record->cache_fresh.ledger,
+            WL_MEM_SUBSYS_ARRANGEMENT, record->cache_fresh.ledger_bytes);
+        record->cache_fresh.ledger_bytes = 0;
+        record->cache_ledger_installed = false;
+    }
+    free(record->cache_name); record->cache_name = NULL;
+}
+
+int
+wl_columnar_arrangement_sorted_acquire_controlled(
+    wl_columnar_lftj_record_t *record, uint32_t input, uint32_t key_col)
+{
+    if (!record || !record->ready || input >= record->reader_count
+        || !record->probes || !record->readers || !record->relations)
+        return EINVAL;
+    col_sorted_arrangement_probe_t *probe = &record->probes[input];
+    wl_columnar_source_access_reader_t *reader = &record->readers[input];
+    col_rel_t *source = record->relations[input];
+    wl_col_session_t *session = record->session;
+    int rc = wl_columnar_lftj_work(record, 32); if (rc) return rc;
+    rc = wl_columnar_arrangement_sorted_pair_ready(probe, reader, source);
+    if (rc) return rc;
+    if (key_col >= source->ncols || probe->active || probe->identity)
+        return EINVAL;
+    rc = wl_columnar_lftj_tail(record, 2, input + 1u); if (rc) return rc;
+    record->cache_entry = NULL;
+    for (uint32_t i = 0; i < session->sarr_count; i++) {
+        rc = wl_columnar_lftj_work(record, 8); if (rc) return rc;
+        col_sorted_arr_entry_t *entry = &session->sarr_entries[i];
+        bool key_equal = entry->key_col == key_col;
+        rc = wl_columnar_lftj_tail(record, 2, i + 1u); if (rc) return rc;
+        if (key_equal) {
+            bool equal;
+            rc = wl_columnar_arrangement_sorted_name_equal(record,
+                    entry->rel_name, source->name, &equal);
+            if (rc) return rc;
+            if (equal) {
+                record->cache_entry = entry; break;
+            }
+        }
+    }
+    col_relation_snapshot_t snapshot = wl_columnar_relation_snapshot(source);
+    col_sorted_arr_entry_t *entry = record->cache_entry;
+    bool fresh = entry && !entry->sarr.rebuild_deferred
+        && entry->sarr.indexed_rows == source->nrows
+        && wl_columnar_relation_snapshot_equal(entry->sarr.source_snapshot,
+            snapshot);
+    if (!fresh && entry && entry->sarr.pin_count) {
+        rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+        entry->sarr.rebuild_deferred = true;
+        return EBUSY;
+    }
+    if (!entry) {
+        if (session->sarr_count == UINT32_MAX) return EOVERFLOW;
+        if (session->sarr_count >= session->sarr_cap) {
+            if (session->sarr_active_pins) return EBUSY;
+            uint32_t capacity = session->sarr_cap ? session->sarr_cap * 2u : 4u;
+            if (capacity < session->sarr_cap) return EOVERFLOW;
+            uint64_t bytes;
+            if (!wl_columnar_memory_size_mul(capacity,
+                sizeof(col_sorted_arr_entry_t), &bytes) || bytes > SIZE_MAX)
+                return EOVERFLOW;
+            /* Actual libc relocation is an admitted allocator boundary,
+             * not an unmetered engine copy disguised as one checkpoint. */
+            for (uint64_t at = 0; at < bytes;) {
+                uint64_t n = bytes - at; if (n > 128u) n = 128u;
+                rc = wl_columnar_lftj_work(record, n); if (rc) return rc;
+                at += n;
+                rc = wl_columnar_lftj_tail(record, 2, at); if (rc) return rc;
+            }
+            rc = wl_columnar_lftj_work(record, 16); if (rc) return rc;
+            record->registry_old = session->sarr_entries;
+            record->registry_new = realloc(session->sarr_entries,
+                    (size_t)bytes);
+            if (!record->registry_new) {
+                record->registry_old = NULL; return ENOMEM;
+            }
+            session->sarr_entries = record->registry_new;
+            session->sarr_cap = capacity;
+            record->registry_new = record->registry_old = NULL;
+            rc = wl_columnar_lftj_tail(record, 2, capacity); if (rc) return rc;
+        }
+        entry = &session->sarr_entries[session->sarr_count];
+        record->cache_entry = entry;
+        uint64_t length = 0;
+        do {
+            rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+            char value = source->name[length++];
+            rc = wl_columnar_lftj_tail(record, 2, length); if (rc) return rc;
+            if (!value) break;
+        } while (length < SIZE_MAX);
+        if (!length || length == SIZE_MAX) return EOVERFLOW;
+        rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+        record->cache_name = malloc((size_t)length);
+        if (!record->cache_name) return ENOMEM;
+        rc = wl_columnar_lftj_tail(record, 2, length); if (rc) goto discard;
+        for (uint64_t i = 0; i < length; i++) {
+            rc = wl_columnar_lftj_work(record, 1); if (rc) goto discard;
+            record->cache_name[i] = source->name[i];
+            rc = wl_columnar_lftj_tail(record, 2, i + 1u); if (rc) goto discard;
+        }
+    }
+    if (!fresh) {
+        rc = wl_columnar_lftj_work(record, sizeof(record->cache_fresh));
+        if (rc) goto discard;
+        memset(&record->cache_fresh, 0, sizeof(record->cache_fresh));
+        record->cache_fresh.ncols = source->ncols;
+        record->cache_fresh.key_col = key_col;
+        record->cache_fresh.ledger = &session->mem_ledger;
+        rc = wl_columnar_lftj_tail(record, 3, 0); if (rc) goto discard;
+        if (source->nrows) {
+            uint64_t cells, bytes;
+            if (!wl_columnar_memory_size_mul(source->nrows, source->ncols,
+                &cells) || !wl_columnar_memory_size_mul(cells,
+                sizeof(int64_t), &bytes) || bytes > SIZE_MAX){
+                rc = EOVERFLOW; goto discard;
+            }
+            rc = wl_columnar_lftj_work(record, 1); if (rc) goto discard;
+            record->cache_fresh.sorted =
+                wl_columnar_arrangement_sorted_allocate((size_t)bytes);
+            if (!record->cache_fresh.sorted) {
+                rc = ENOMEM; goto discard;
+            }
+            wl_mem_ledger_alloc(record->cache_fresh.ledger,
+                WL_MEM_SUBSYS_ARRANGEMENT, bytes);
+            record->cache_fresh.ledger_bytes = bytes;
+            record->cache_ledger_installed = true;
+            rc = wl_columnar_lftj_tail(record, 3, 0); if (rc) goto discard;
+            for (uint32_t row = 0; row < source->nrows; row++)
+                for (uint32_t col = 0; col < source->ncols; col++) {
+                    rc = wl_columnar_lftj_work(record, 1); if (rc) goto discard;
+                    record->cache_fresh.sorted[(size_t)row * source->ncols +
+                        col]
+                        = col_rel_get(source, row, col);
+                    rc = wl_columnar_lftj_tail(record, 3,
+                            (uint64_t)row * source->ncols + col + 1u);
+                    if (rc) goto discard;
+                }
+            rc = wl_columnar_relation_radix_rows_controlled(
+                record->cache_fresh.sorted, source->nrows, source->ncols,
+                key_col, WIRELOG_TYPE_INT64, record);
+            if (rc) goto discard;
+        }
+        record->cache_fresh.nrows = source->nrows;
+        record->cache_fresh.indexed_rows = source->nrows;
+        record->cache_fresh.source_snapshot = snapshot;
+    }
+    if (session->sarr_active_pins == UINT32_MAX
+        || (fresh && entry->sarr.pin_count == UINT32_MAX)) {
+        rc = EOVERFLOW; goto discard;
+    }
+    /* Last admitted cutoff: installs cache and exact probe atomically with
+     * respect to the serialized caller. No fallible tail follows this block. */
+    rc = wl_columnar_lftj_work(record, 96); if (rc) goto discard;
+    rc = wl_columnar_lftj_tail(record, 2, input + 1u); if (rc) goto discard;
+    if (!fresh) {
+        bool new_entry = record->cache_name != NULL;
+        record->cache_old = new_entry ? NULL : entry->sarr.sorted;
+        record->old_ledger_bytes = new_entry ? 0 : entry->sarr.ledger_bytes;
+        if (new_entry) {
+            memset(entry, 0, sizeof(*entry));
+            entry->rel_name = record->cache_name; record->cache_name = NULL;
+            entry->key_col = key_col;
+        }
+        entry->sarr = record->cache_fresh;
+        record->cache_fresh.sorted = NULL;
+        record->cache_fresh.ledger_bytes = 0;
+        record->cache_ledger_installed = false;
+        free(record->cache_old); record->cache_old = NULL;
+        if (record->old_ledger_bytes)
+            wl_mem_ledger_free(&session->mem_ledger,
+                WL_MEM_SUBSYS_ARRANGEMENT, record->old_ledger_bytes);
+        record->old_ledger_bytes = 0;
+        if (new_entry) session->sarr_count++;
+    }
+    entry->sarr.pin_count++; session->sarr_active_pins++;
+    probe->entry = entry; probe->arr = &entry->sarr; probe->session = session;
+    probe->source = source; probe->source_snapshot = snapshot;
+    probe->identity = (uintptr_t)probe; probe->active = true;
+    return 0;
+discard:
+    wl_columnar_arrangement_sorted_discard_fresh(record);
+    return rc;
 }

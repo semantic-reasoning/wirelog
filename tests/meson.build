@@ -6356,3 +6356,13 @@ test_evaluation_membership_exe = executable(
 )
 test('evaluation_membership', test_evaluation_membership_exe,
      suite: ['unit'], timeout: 120)
+
+test_evaluation_lftj_exe = executable(
+  'test_evaluation_lftj', files('test_evaluation_lftj.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_TEST_LFTJ_ADMISSION_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('evaluation_lftj', test_evaluation_lftj_exe,
+     suite: ['unit'], timeout: 120)

@@ -24,6 +24,7 @@
 #include "columnar/source_access.h"
 #include "columnar/memory_governor.h"
 #include "columnar/continuation.h"
+#include "columnar/lftj.h"
 #include "columnar/kfusion_adaptive.h"
 #include "columnar/progress.h"
 #include "session.h"
@@ -661,6 +662,13 @@ typedef struct {
     wl_columnar_relation_mutation_initialization_t initialization;
 } wl_columnar_relation_mutation_single_t;
 
+int wl_columnar_relation_single_reader_release_controlled(
+    wl_columnar_source_access_reader_t *, wl_evaluation_control_t *);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_relation_test_after_single_reader_release)(
+    wl_evaluation_control_t *, wl_columnar_source_access_reader_t *,
+    wl_columnar_source_access_gate_t *);
+#endif
 int wl_columnar_relation_reader_acquire_controlled(
     wl_columnar_source_access_gate_t *,
     wl_columnar_source_access_reader_t *, wl_evaluation_control_t *);
@@ -3769,6 +3777,66 @@ typedef struct wl_columnar_expr_operator_preparation {
     bool ready;
 } wl_columnar_expr_operator_preparation_t;
 
+/* Original LFTJ outer/cache/kernel ownership. All dynamic reader and probe
+ * slots retain their allocation addresses until checked retirement succeeds. */
+typedef struct wl_columnar_lftj_record {
+    wl_columnar_memory_reservation_t outer, inner;
+    wl_col_session_t *session;
+    wl_evaluation_control_t *control;
+    wl_lftj_input_t *inputs;
+    col_sorted_arrangement_probe_t *probes;
+    col_rel_t **relations;
+    wl_columnar_source_access_reader_t *readers;
+    bool *cache_backed;
+    uint32_t *ncols, *compact_offsets, *binary_offsets;
+    void *iters;
+    int64_t *row, *binary_row, *radix_temp;
+    uint32_t *ranges;
+    col_sorted_arr_t cache_fresh;
+    col_sorted_arr_entry_t *cache_entry, *registry_old, *registry_new;
+    char *cache_name;
+    int64_t *cache_old;
+    uint64_t old_ledger_bytes, sort_bytes, kernel_visits;
+    uint32_t k, reader_count, input_count, iter_count, retiring,
+        initialized_tokens;
+    uint32_t binary_cols, compact_cols, cache_key, cache_capacity, phase;
+    wirelog_column_type_t key_type;
+    bool ready, cache_ledger_installed;
+} wl_columnar_lftj_record_t;
+int wl_columnar_lftj_record_retire(wl_columnar_lftj_record_t *, int, bool);
+int wl_columnar_arrangement_sorted_probe_release_controlled(
+    col_sorted_arrangement_probe_t *, wl_columnar_source_access_reader_t *,
+    const col_rel_t *, wl_evaluation_control_t *);
+int wl_columnar_arrangement_sorted_acquire_controlled(
+    wl_columnar_lftj_record_t *, uint32_t, uint32_t);
+int wl_columnar_lftj_reserve(wl_columnar_lftj_record_t *,
+    wl_columnar_memory_reservation_t *, uint64_t);
+int wl_columnar_lftj_commit(wl_columnar_lftj_record_t *,
+    wl_columnar_memory_reservation_t *, const void *);
+int wl_columnar_lftj_kernel_controlled(wl_columnar_lftj_record_t *,
+    int (*)(const int64_t *, uint32_t, void *), void *);
+
+int wl_columnar_eval_stack_cleanup_lftj_owner(wl_col_session_t *,
+    eval_stack_t *,
+    wl_columnar_lftj_record_t **, wl_evaluation_control_t *);
+wl_columnar_lftj_record_t *wl_columnar_eval_stack_cleanup_lftj(
+    wl_columnar_eval_stack_cleanup_frame_t *);
+
+int wl_columnar_relation_radix_rows_controlled(int64_t *, uint32_t,
+    uint32_t, uint32_t, wirelog_column_type_t, wl_columnar_lftj_record_t *);
+int wl_columnar_lftj_work(wl_columnar_lftj_record_t *, uint64_t);
+int wl_columnar_lftj_tail(wl_columnar_lftj_record_t *, int, uint64_t);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_lftj_test_checkpoint)(
+    wl_columnar_lftj_record_t *, int, uint64_t);
+#endif
+
+#ifdef WL_TEST_LFTJ_ADMISSION_HOOKS
+void wl_columnar_arrangement_sorted_test_fail_next_allocation(void);
+bool wl_columnar_arrangement_sorted_test_allocation_failure_consumed(void);
+void wl_columnar_arrangement_sorted_test_clear_allocation_failure(void);
+#endif
+
 /* Phase-exclusive membership scratch. Every credit stays at this original
  * address until its physical arrays have been retired. Source and private
  * writers remain in the enclosing evaluator frame. */
@@ -4289,6 +4357,7 @@ typedef struct wl_columnar_session_hash_controlled_registry {
 #define WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT 5u
 #define WL_COLUMNAR_SERIAL_FRAME_BATCH 6u
 #define WL_COLUMNAR_SERIAL_FRAME_MEMBERSHIP 7u
+#define WL_COLUMNAR_SERIAL_FRAME_LFTJ 8u
 #define WL_COLUMNAR_SERIAL_OUTPUT_CURRENT 1u
 #define WL_COLUMNAR_SERIAL_OUTPUT_DESCRIPTOR 2u
 #define WL_COLUMNAR_SERIAL_OUTPUT_SOURCE 4u

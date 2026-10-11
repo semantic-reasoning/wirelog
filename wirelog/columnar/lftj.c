@@ -85,6 +85,12 @@ typedef struct {
     uint32_t pos;     /* current iterator position (nrows = at-end)   */
     wirelog_column_type_t key_type;
 } lftj_iter_t;
+#ifdef WL_TEST_LFTJ_ADMISSION_HOOKS
+size_t wl_columnar_lftj_test_iterator_size(void)
+{
+    return sizeof(lftj_iter_t);
+}
+#endif
 
 /* Current key at iterator position (undefined when at-end). */
 static inline int64_t
@@ -507,4 +513,375 @@ wl_lftj_join(const wl_lftj_input_t *inputs, uint32_t k, wl_lftj_result_fn cb,
 {
     return wl_columnar_lftj_join_typed(inputs, WIRELOG_TYPE_INT64, k, cb,
                user);
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_lftj_test_checkpoint)(
+    wl_columnar_lftj_record_t *, int, uint64_t);
+#endif
+
+int
+wl_columnar_lftj_work(wl_columnar_lftj_record_t *record, uint64_t work)
+{
+    return record && record->ready && record->control
+        ? wl_evaluation_control_charge(record->control, work) : EINVAL;
+}
+
+int
+wl_columnar_lftj_tail(wl_columnar_lftj_record_t *record, int stage,
+    uint64_t progress)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_lftj_test_checkpoint)
+        wl_columnar_lftj_test_checkpoint(record, stage, progress);
+#else
+    (void)stage; (void)progress;
+#endif
+    return wl_columnar_lftj_work(record, 0);
+}
+
+int
+wl_columnar_lftj_reserve(wl_columnar_lftj_record_t *record,
+    wl_columnar_memory_reservation_t *token, uint64_t bytes)
+{
+    if (!record || !record->session || !record->session->memory_governor)
+        return EINVAL;
+    wl_columnar_memory_admission_status_t status;
+    int rc = wl_columnar_memory_governor_reserve_checked_controlled(
+        wl_columnar_memory_governor_ref_get(record->session->memory_governor),
+        bytes, token, &status, record->control);
+    if (rc) return rc;
+    return status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+           || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY ? 0
+        : status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+        : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : EINVAL;
+}
+
+int
+wl_columnar_lftj_commit(wl_columnar_lftj_record_t *record,
+    wl_columnar_memory_reservation_t *token, const void *payload)
+{
+    bool accepted = false;
+    int rc = wl_columnar_memory_governor_commit_controlled(token, payload,
+            &accepted, record->control);
+    return rc ? rc : accepted ? 0 : EINVAL;
+}
+
+static int
+wl_columnar_lftj_credit_retire(wl_columnar_memory_reservation_t *token)
+{
+    if (token->identity != token) return EINVAL;
+    uint64_t state = atomic_load_explicit(&token->state, memory_order_acquire);
+    if (state == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+        || state == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED) return 0;
+    bool accepted = state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        ? wl_columnar_memory_release(token)
+        : state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        && wl_columnar_memory_rollback(token);
+    return accepted ? 0 : EINVAL;
+}
+
+/* Every owner remains reachable after refusal. Only successful physical
+ * retirement clears its pointer; a failed original credit stays in the record.
+ * Error cleanup is the checked mandatory drain, without a fresh allowance. */
+int
+wl_columnar_lftj_record_retire(wl_columnar_lftj_record_t *record, int primary,
+    bool mandatory)
+{
+    if (!record || !record->ready) return EINVAL;
+#define WL_LFTJ_RETIRE_STEP(work) do { \
+            int step_rc = mandatory ? 0 : wl_columnar_lftj_work(record, (work)); \
+            if (step_rc) return primary > 0 ? primary : step_rc; \
+} while (0)
+#define WL_LFTJ_RETIRE_TAIL(stage, progress) do { \
+            int step_rc = mandatory ? 0 : wl_columnar_lftj_tail(record, stage, \
+                    progress); \
+            if (step_rc) return primary > 0 ? primary : step_rc; \
+} while (0)
+    lftj_iter_t *iters = record->iters;
+    while (record->retiring < record->iter_count) {
+        WL_LFTJ_RETIRE_STEP(1);
+        free(iters[record->retiring].sorted);
+        iters[record->retiring].sorted = NULL;
+        record->retiring++;
+        WL_LFTJ_RETIRE_TAIL(11, record->retiring);
+    }
+    WL_LFTJ_RETIRE_STEP(96);
+    free(record->radix_temp); record->radix_temp = NULL;
+    record->sort_bytes = 0;
+    free(record->row); record->row = NULL;
+    free(record->ranges); record->ranges = NULL;
+    free(record->iters); record->iters = NULL;
+    int rc = wl_columnar_lftj_credit_retire(&record->inner);
+    if (rc) return primary > 0 ? primary : rc;
+    WL_LFTJ_RETIRE_TAIL(11, 0);
+    WL_LFTJ_RETIRE_STEP(1);
+    free(record->cache_fresh.sorted); record->cache_fresh.sorted = NULL;
+    if (record->cache_ledger_installed) {
+        wl_mem_ledger_free(record->cache_fresh.ledger,
+            WL_MEM_SUBSYS_ARRANGEMENT, record->cache_fresh.ledger_bytes);
+        record->cache_fresh.ledger_bytes = 0;
+        record->cache_ledger_installed = false;
+    }
+    free(record->cache_name); record->cache_name = NULL;
+    /* Registry pending storage contains only unpinned raw metadata, no live
+     * token. It is distinct from the session's published registry. */
+    free(record->registry_new); record->registry_new = NULL;
+    free(record->cache_old); record->cache_old = NULL;
+    if (record->old_ledger_bytes) {
+        wl_mem_ledger_free(&record->session->mem_ledger,
+            WL_MEM_SUBSYS_ARRANGEMENT, record->old_ledger_bytes);
+        record->old_ledger_bytes = 0;
+    }
+    WL_LFTJ_RETIRE_TAIL(11, 0);
+    for (uint32_t i = 0; i < record->reader_count; i++) {
+        WL_LFTJ_RETIRE_STEP(32);
+        rc = wl_columnar_arrangement_sorted_probe_release_controlled(
+            &record->probes[i], &record->readers[i], record->relations[i],
+            mandatory ? NULL : record->control);
+        if (rc) return primary > 0 ? primary : rc;
+        WL_LFTJ_RETIRE_TAIL(11, i + 1u);
+    }
+    for (uint32_t i = 0; i < record->input_count; i++) {
+        WL_LFTJ_RETIRE_STEP(1);
+        if (!record->cache_backed[i]) free((void *)record->inputs[i].data);
+        record->inputs[i].data = NULL;
+        WL_LFTJ_RETIRE_TAIL(11, i + 1u);
+    }
+    WL_LFTJ_RETIRE_STEP(96);
+    free(record->binary_row); record->binary_row = NULL;
+    free(record->inputs); record->inputs = NULL;
+    free(record->probes); record->probes = NULL;
+    free(record->relations); record->relations = NULL;
+    free(record->readers); record->readers = NULL;
+    free(record->cache_backed); record->cache_backed = NULL;
+    free(record->ncols); record->ncols = NULL;
+    free(record->compact_offsets); record->compact_offsets = NULL;
+    free(record->binary_offsets); record->binary_offsets = NULL;
+    /* Cleared scalar prefixes prevent replay through retired array storage. */
+    record->reader_count = record->input_count = record->iter_count = 0;
+    record->retiring = 0;
+    rc = wl_columnar_lftj_credit_retire(&record->outer);
+    if (rc) return primary > 0 ? primary : rc;
+    WL_LFTJ_RETIRE_TAIL(11, 0);
+#undef WL_LFTJ_RETIRE_STEP
+#undef WL_LFTJ_RETIRE_TAIL
+    return primary;
+}
+
+static int
+wl_columnar_lftj_seek_controlled(wl_columnar_lftj_record_t *record,
+    lftj_iter_t *it, int64_t key)
+{
+    uint32_t lo = it->pos, hi = it->nrows;
+    while (lo < hi) {
+        int rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+        uint32_t mid = lo + (hi - lo) / 2u;
+        if (lftj_compare_key(it,
+            it->sorted[(size_t)mid * it->ncols + it->key_col], key) < 0)
+            lo = mid + 1u;
+        else hi = mid;
+        it->pos = lo;
+        rc = wl_columnar_lftj_tail(record, 7, mid + 1u); if (rc) return rc;
+    }
+    it->pos = lo;
+    return 0;
+}
+
+static int
+wl_columnar_lftj_range_controlled(wl_columnar_lftj_record_t *record,
+    const lftj_iter_t *it, int64_t key, uint32_t *lo, uint32_t *hi)
+{
+    *lo = it->pos;
+    uint32_t left = it->pos, right = it->nrows;
+    while (left < right) {
+        int rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+        uint32_t mid = left + (right - left) / 2u;
+        if (lftj_compare_key(it,
+            it->sorted[(size_t)mid * it->ncols + it->key_col], key) <= 0)
+            left = mid + 1u;
+        else right = mid;
+        rc = wl_columnar_lftj_tail(record, 8, mid + 1u); if (rc) return rc;
+    }
+    *hi = left;
+    return 0;
+}
+
+static int
+wl_columnar_lftj_product_controlled(wl_columnar_lftj_record_t *record,
+    uint32_t depth, uint32_t offset, int64_t key,
+    int (*emit)(const int64_t *, uint32_t, void *), void *user)
+{
+    int rc = wl_columnar_lftj_work(record, 8); if (rc) return rc;
+    if (depth == record->k) {
+        if (record->kernel_visits == UINT64_MAX) return EOVERFLOW;
+        record->kernel_visits++;
+        rc = wl_columnar_lftj_tail(record, 9, record->kernel_visits);
+        if (rc) return rc;
+        return emit(record->row, record->compact_cols, user);
+    }
+    lftj_iter_t *iters = record->iters, *it = &iters[depth];
+    uint32_t lo = record->ranges[(size_t)depth * 2u];
+    uint32_t hi = record->ranges[(size_t)depth * 2u + 1u];
+    if (!depth) record->row[0] = key;
+    rc = wl_columnar_lftj_tail(record, 9, depth); if (rc) return rc;
+    for (uint32_t row = lo; row < hi; row++) {
+        uint32_t at = offset;
+        for (uint32_t col = 0; col < it->ncols; col++) {
+            rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+            if (col != it->key_col)
+                record->row[at++] = it->sorted[(size_t)row * it->ncols + col];
+            rc = wl_columnar_lftj_tail(record, 9,
+                    (uint64_t)row * it->ncols + col + 1u); if (rc) return rc;
+        }
+        rc = wl_columnar_lftj_product_controlled(record, depth + 1u, at,
+                key, emit, user); if (rc) return rc;
+    }
+    return 0;
+}
+
+int
+wl_columnar_lftj_kernel_controlled(wl_columnar_lftj_record_t *record,
+    int (*emit)(const int64_t *, uint32_t, void *), void *user)
+{
+    if (!record || !record->ready || !emit || !record->inputs
+        || record->k < 2u || record->k > WL_LFTJ_MAX_K) return EINVAL;
+    uint32_t k = record->k, total_cols = 1;
+    uint64_t bytes = 0, scratch = 0;
+    for (uint32_t i = 0; i < k; i++) {
+        int rc = wl_columnar_lftj_work(record, 24); if (rc) return rc;
+        const wl_lftj_input_t *input = &record->inputs[i];
+        if (!input->ncols || input->key_col >= input->ncols
+            || (input->nrows && !input->data)
+            || total_cols > UINT32_MAX - (input->ncols - 1u)) return EINVAL;
+        total_cols += input->ncols - 1u;
+        if (!wl_columnar_memory_size_mul(input->nrows, input->ncols, &bytes)
+            || !wl_columnar_memory_size_mul(bytes, 2u * sizeof(int64_t), &bytes)
+            || !wl_columnar_memory_size_add(scratch, bytes, &scratch))
+            return EOVERFLOW;
+        rc = wl_columnar_lftj_tail(record, 6, i + 1u); if (rc) return rc;
+    }
+    if (!wl_columnar_memory_size_mul(k, sizeof(lftj_iter_t), &bytes)
+        || !wl_columnar_memory_size_add(scratch, bytes, &scratch)
+        || !wl_columnar_memory_size_mul(total_cols, sizeof(int64_t), &bytes)
+        || !wl_columnar_memory_size_add(scratch, bytes, &scratch)
+        || !wl_columnar_memory_size_mul(k, 2u * sizeof(uint32_t), &bytes)
+        || !wl_columnar_memory_size_add(scratch, bytes, &scratch))
+        return EOVERFLOW;
+    int rc = wl_columnar_lftj_reserve(record, &record->inner, scratch);
+    if (rc) return rc;
+    rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+#ifdef WL_TEST_LFTJ_ADMISSION_HOOKS
+    if (lftj_test_hook_state.fail_iters_pending) {
+        lftj_test_hook_state.fail_iters_pending = false;
+        lftj_test_hook_state.fail_iters_consumed = true;
+        record->iters = NULL;
+    } else
+#endif
+    record->iters = malloc((size_t)k * sizeof(lftj_iter_t));
+    if (!record->iters) return ENOMEM;
+    rc = wl_columnar_lftj_tail(record, 6, 0); if (rc) return rc;
+    for (size_t at = 0; at < (size_t)k * sizeof(lftj_iter_t);) {
+        size_t n = (size_t)k * sizeof(lftj_iter_t) - at;
+        if (n > 128u) n = 128u;
+        rc = wl_columnar_lftj_work(record, n); if (rc) return rc;
+        memset((char *)record->iters + at, 0, n); at += n;
+        rc = wl_columnar_lftj_tail(record, 6, at); if (rc) return rc;
+    }
+    rc = wl_columnar_lftj_commit(record, &record->inner, record->iters);
+    if (rc) return rc;
+    lftj_iter_t *iters = record->iters;
+    for (uint32_t i = 0; i < k; i++) {
+        const wl_lftj_input_t *input = &record->inputs[i];
+        rc = wl_columnar_lftj_work(record, 16); if (rc) return rc;
+        lftj_iter_t *it = &iters[i];
+        it->nrows = input->nrows; it->ncols = input->ncols;
+        it->key_col = input->key_col; it->key_type = record->key_type;
+        it->pos = 0; record->iter_count = i + 1u;
+        rc = wl_columnar_lftj_tail(record, 6, i + 1u); if (rc) return rc;
+        if (record->key_type == WIRELOG_TYPE_FLOAT)
+            for (uint32_t row = 0; row < input->nrows; row++) {
+                rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+                if (!wl_columnar_float_bits_valid(input->data[
+                        (size_t)row * input->ncols +
+                        input->key_col])) return EINVAL;
+                rc = wl_columnar_lftj_tail(record, 6, row + 1u);
+                if (rc) return rc;
+            }
+        if (!input->nrows) continue;
+        uint64_t cells;
+        if (!wl_columnar_memory_size_mul(input->nrows, input->ncols, &cells)
+            || !wl_columnar_memory_size_mul(cells, sizeof(int64_t), &bytes)
+            || bytes > SIZE_MAX) return EOVERFLOW;
+        rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+        it->sorted = malloc((size_t)bytes);
+        if (!it->sorted) return ENOMEM;
+        rc = wl_columnar_lftj_tail(record, 6, 0); if (rc) return rc;
+        for (uint64_t cell = 0; cell < cells; cell++) {
+            rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+            it->sorted[cell] = input->data[cell];
+            rc = wl_columnar_lftj_tail(record, 6, cell + 1u); if (rc) return rc;
+        }
+        rc = wl_columnar_relation_radix_rows_controlled(it->sorted,
+                it->nrows, it->ncols, it->key_col, it->key_type, record);
+        if (rc) return rc;
+    }
+    /* Raw sorts every input before taking this early empty-input exit. */
+    for (uint32_t i = 0; i < k; i++) {
+        rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+        bool empty = lftj_at_end(&iters[i]);
+        rc = wl_columnar_lftj_tail(record, 6, i + 1u); if (rc) return rc;
+        if (empty) return 0;
+    }
+    record->compact_cols = total_cols;
+    rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+    record->row = malloc((size_t)total_cols * sizeof(int64_t));
+    if (!record->row) return ENOMEM;
+    rc = wl_columnar_lftj_tail(record, 6, 0); if (rc) return rc;
+    rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+    record->ranges = malloc((size_t)2u * k * sizeof(uint32_t));
+    if (!record->ranges) return ENOMEM;
+    rc = wl_columnar_lftj_tail(record, 6, 0); if (rc) return rc;
+    for (;;) {
+        rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+        int64_t key = lftj_key(&iters[0]);
+        rc = wl_columnar_lftj_tail(record, 7, 0); if (rc) return rc;
+        for (uint32_t i = 1; i < k; i++) {
+            rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+            int64_t candidate = lftj_key(&iters[i]);
+            if (lftj_compare_key(&iters[i], candidate,
+                key) > 0) key = candidate;
+            rc = wl_columnar_lftj_tail(record, 7, i + 1u); if (rc) return rc;
+        }
+        bool restart = false;
+        for (uint32_t i = 0; i < k; i++) {
+            rc = wl_columnar_lftj_seek_controlled(record, &iters[i], key);
+            if (rc) return rc;
+            rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+            bool end = lftj_at_end(&iters[i]);
+            int comparison = end ? 0 : lftj_compare_key(&iters[i],
+                    lftj_key(&iters[i]), key);
+            rc = wl_columnar_lftj_tail(record, 7, i + 1u); if (rc) return rc;
+            if (end) return 0;
+            if (comparison > 0) {
+                restart = true; break;
+            }
+        }
+        if (restart) continue;
+        for (uint32_t i = 0; i < k; i++) {
+            rc = wl_columnar_lftj_range_controlled(record, &iters[i], key,
+                    &record->ranges[(size_t)i * 2u],
+                    &record->ranges[(size_t)i * 2u + 1u]);
+            if (rc) return rc;
+        }
+        rc = wl_columnar_lftj_product_controlled(record, 0, 1, key, emit, user);
+        if (rc) return rc;
+        for (uint32_t i = 0; i < k; i++) {
+            rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+            iters[i].pos = record->ranges[(size_t)i * 2u + 1u];
+            bool end = lftj_at_end(&iters[i]);
+            rc = wl_columnar_lftj_tail(record, 7, i + 1u); if (rc) return rc;
+            if (end) return 0;
+        }
+    }
 }

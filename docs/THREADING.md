@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **340**). The earlier audit sections
+match the script's count (currently **344**). The earlier audit sections
 retain their historical per-section counts.
 
 Format: `file:function[#N]` | field | operation | order | justification.
@@ -1673,3 +1673,21 @@ retirement. The membership output ends its actual private epoch before input
 disposal and CONS acquires its next genuine epoch. Original key/hash/row tokens
 are never copied; physical pointers are NULL before refused original retirement,
 and retry drains the exact retained address before any new attempt.
+
+
+### Controlled LFTJ original reservation and reader retirement (4 rows)
+
+| Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `lftj.c:wl_columnar_lftj_credit_retire` | `token->state` | `atomic_load_explicit` | `acquire` | Classify original COMMITTED release or RESERVED rollback after physical retirement; validation refusal retains that original token |
+| `relation.c:wl_columnar_relation_single_reader_release_controlled` | `gate->state` | `atomic_load_explicit` | `acquire` | Read the original gate after charged token and thread validation |
+| `relation.c:wl_columnar_relation_single_reader_release_controlled#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | `release / relaxed failure` | MSVC decrement is admitted and polled per attempt; successful original slot clearance precedes a fallible tail |
+| `relation.c:wl_columnar_relation_single_reader_release_controlled#3` | `gate->state` | `atomic_compare_exchange_strong_explicit` | `release / relaxed failure` | Other-platform decrement preserves the same original gate and terminal slot protocol |
+
+LFTJ keeps the descriptor reader in the original probe and the storage reader
+in its separately allocated original reader slot. Releasing storage does not
+relocate or restore a live token. A stop after either successful decrement sees
+that slot already terminal; the remaining descriptor and cache pin stay
+reachable. Pin bookkeeping consumes its original probe before a fallible tail,
+so mandatory checked retry cannot decrement a gate or pin twice. Cache registry
+relocation refuses while any actual pin is active.

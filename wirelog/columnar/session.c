@@ -5343,7 +5343,8 @@ wl_columnar_session_serial_preflight(wl_col_session_t *sess)
         || sess->plain_step_completion_pending || sess->source_leases
         || (sess->arr_count && !sess->join_batch_bytes)
         || sess->darr_count || sess->filt_arr_count
-        || sess->diff_arr_count || sess->sarr_count || sess->filt_cache_count
+        || sess->diff_arr_count || sess->sarr_active_pins ||
+        sess->filt_cache_count
         || sess->mat_cache.count || sess->mat_cache.active_pins
         || sess->frontier_ops != &col_frontier_epoch_ops
         || !sess->memory_governor || sess->cleanup_active
@@ -5393,7 +5394,9 @@ wl_columnar_session_serial_preflight(wl_col_session_t *sess)
                     : rp->ops[2].op == WL_PLAN_OP_MAP
                 && rp->ops[3].op == WL_PLAN_OP_CONSOLIDATE);
             bool union_plan = false;
-            if (rp->ops && rp->op_count >= 5u) {
+            bool lftj_plan = rp->ops && rp->op_count
+                && rp->ops[0].op == WL_PLAN_OP_LFTJ;
+            if (rp->ops && (rp->op_count >= 5u || lftj_plan)) {
                 rc = wl_columnar_eval_plan_union_validate(rp, control,
                         &union_plan);
                 if (rc) return rc;
@@ -5417,7 +5420,8 @@ wl_columnar_session_serial_preflight(wl_col_session_t *sess)
             if (!rp->name || !rp->ops ||
                 (!plain && !filtered && !joined && !union_plan &&
                 !aggregate_plan)
-                || rp->ops[0].op != WL_PLAN_OP_VARIABLE
+                || (rp->ops[0].op != WL_PLAN_OP_VARIABLE
+                && !(lftj_plan && union_plan))
                 || (rp->ops[0].delta_mode != WL_DELTA_AUTO
                 && rp->ops[0].delta_mode != WL_DELTA_FORCE_FULL))
                 return ENOTSUP;

@@ -2235,9 +2235,279 @@ lftj_binary_cb(const int64_t *row, uint32_t lftj_ncols, void *user)
  * on repeated calls (the sort inside wl_lftj_join degrades to O(N) when the
  * input is already sorted).  Pushes binary-join-compatible result onto stack.
  */
+typedef struct {
+    wl_columnar_lftj_record_t *record;
+    wl_columnar_relation_private_batch_t *writer;
+    wl_columnar_relation_bulk_append_t *bulk;
+    const wl_plan_op_lftj_t *meta;
+    col_rel_t *out;
+} wl_columnar_ops_lftj_sink_t;
+
+/* Lazy metadata initialization uses the existing original source-group slots.
+* Their healthy readers are discharged through the bounded SINGLE helper;
+* the remaining checked journal/writer drain is fixed two-role bookkeeping. */
+static int
+wl_columnar_ops_lftj_initialize_source(wl_columnar_lftj_record_t *record,
+    wl_columnar_relation_source_group_t *group, col_rel_t *source)
+{
+    int rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+    bool initialized = source->storage_owner != NULL;
+    rc = wl_columnar_lftj_tail(record, 2, 0); if (rc || initialized) return rc;
+    rc = wl_columnar_relation_source_group_acquire_controlled(group, source,
+            NULL, record->control); if (rc) return rc;
+    rc = wl_columnar_lftj_work(record, 8); if (rc) return rc;
+    wl_columnar_relation_source_group_commit(group);
+    rc = wl_columnar_lftj_tail(record, 2, 0); if (rc) return rc;
+    for (uint32_t i = 0; i < group->owner_count; i++) {
+        if (!group->owners[i].held) continue;
+        rc = wl_columnar_relation_single_reader_release_controlled(
+            &group->owners[i].reader, record->control);
+        if (!group->owners[i].reader.owner) group->owners[i].held = false;
+        if (rc) return rc;
+    }
+    for (uint32_t i = 0; i < group->descriptor_count; i++) {
+        if (!group->descriptors[i].reader_held) continue;
+        rc = wl_columnar_relation_single_reader_release_controlled(
+            &group->descriptors[i].reader, record->control);
+        if (!group->descriptors[i].reader.owner)
+            group->descriptors[i].reader_held = false;
+        if (rc) return rc;
+    }
+    rc = wl_columnar_lftj_work(record, 96); if (rc) return rc;
+    rc = wl_columnar_relation_source_group_drain(group, 0); if (rc) return rc;
+    return wl_columnar_lftj_tail(record, 2, 0);
+}
+
+static int
+wl_columnar_ops_lftj_zero(wl_columnar_lftj_record_t *record, void *data,
+    size_t bytes)
+{
+    for (size_t at = 0; at < bytes;) {
+        size_t n = bytes - at; if (n > 128u) n = 128u;
+        int rc = wl_columnar_lftj_work(record, n); if (rc) return rc;
+        memset((char *)data + at, 0, n); at += n;
+        rc = wl_columnar_lftj_tail(record, 1, at); if (rc) return rc;
+    }
+    return 0;
+}
+
+static int
+wl_columnar_ops_lftj_emit(const int64_t *row, uint32_t compact_cols, void *user)
+{
+    wl_columnar_ops_lftj_sink_t *sink = user;
+    wl_columnar_lftj_record_t *record = sink->record;
+    if (compact_cols != record->compact_cols) return EINVAL;
+    for (uint32_t input = 0; input < record->k; input++) {
+        uint32_t key = sink->meta->key_cols[input];
+        uint32_t compact = record->compact_offsets[input];
+        uint32_t binary = record->binary_offsets[input];
+        for (uint32_t col = 0; col < record->ncols[input]; col++) {
+            int rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+            record->binary_row[binary + col] = col == key ? row[0]
+                : row[compact + col - (col > key ? 1u : 0u)];
+            rc = wl_columnar_lftj_tail(record, 10, binary + col + 1u);
+            if (rc) return rc;
+        }
+    }
+    if (sink->out->nrows == sink->out->capacity) {
+        if (sink->out->nrows == UINT32_MAX) return EOVERFLOW;
+        uint32_t capacity = sink->out->capacity;
+        uint32_t wanted = capacity ? capacity <= UINT32_MAX / 2u
+            ? capacity * 2u : UINT32_MAX : COL_REL_INIT_CAP;
+        int rc = wl_columnar_lftj_work(record, 96); if (rc) return rc;
+        rc = wl_columnar_relation_private_append_batch_end_controlled(
+            sink->writer); if (rc) return rc;
+        rc = wl_columnar_lftj_tail(record, 10, sink->out->nrows);
+        if (rc) return rc;
+        bool denied = false;
+        rc = wl_columnar_relation_bulk_reserve_exact_controlled(sink->bulk,
+                sink->out, wanted, &denied, record->control);
+        if (rc) return rc == ENOMEM && denied ? ENOSPC : rc;
+        if (sink->bulk->active) return EINVAL;
+        rc = wl_columnar_relation_private_append_batch_begin_controlled(
+            sink->writer, sink->out, record->control); if (rc) return rc;
+    }
+    int rc = wl_columnar_relation_private_append_batch_row_controlled(
+        sink->writer, record->binary_row, record->control);
+    return rc ? rc : wl_columnar_lftj_tail(record, 10, sink->out->nrows);
+}
+
+static int
+wl_columnar_ops_lftj_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *session)
+{
+    if (!op || !stack || !session || !op->opaque_data) return EINVAL;
+    const wl_plan_op_lftj_t *meta = op->opaque_data;
+    uint32_t k = meta->k;
+    if (k < 2u || k > WL_LFTJ_MAX_K || !meta->rel_names || !meta->key_cols)
+        return EINVAL;
+    wl_evaluation_control_t *control = session->base.evaluation_control;
+    wl_columnar_lftj_record_t *record = NULL;
+    wl_columnar_relation_source_group_t *group = NULL;
+    eval_entry_t *result = NULL;
+    wl_columnar_relation_private_batch_t *writer = NULL;
+    int rc = wl_columnar_eval_stack_cleanup_join_owner(session, stack,
+            &group, &result); if (rc) return rc;
+    rc = wl_columnar_eval_stack_cleanup_private_batch_owner(session, stack,
+            &writer, control); if (rc) return rc;
+    rc = wl_columnar_eval_stack_cleanup_lftj_owner(session, stack,
+            &record, control); if (rc) return rc;
+    record->k = k;
+    uint64_t scratch = 0, bytes;
+    if (!wl_columnar_memory_size_mul(k,
+        sizeof(wl_lftj_input_t) + sizeof(col_sorted_arrangement_probe_t)
+        + sizeof(col_rel_t *) + sizeof(wl_columnar_source_access_reader_t)
+        + sizeof(bool) + 3u * sizeof(uint32_t), &scratch)) return EOVERFLOW;
+    for (uint32_t i = 0; i < k; i++) {
+        rc = wl_columnar_lftj_work(record, 16); if (rc) return rc;
+        col_rel_t *source = NULL;
+        rc = wl_columnar_join_controlled_lookup(session, meta->rel_names[i],
+                &source, control); if (rc) return rc;
+        if (!source || meta->key_cols[i] >= source->ncols)
+            return source ? EINVAL : ENOENT;
+        if (!wl_columnar_memory_size_mul(source->nrows, source->ncols, &bytes)
+            || !wl_columnar_memory_size_mul(bytes, sizeof(int64_t), &bytes)
+            || !wl_columnar_memory_size_add(scratch, bytes, &scratch)
+            || !wl_columnar_memory_size_mul(source->ncols, sizeof(int64_t),
+            &bytes)
+            || !wl_columnar_memory_size_add(scratch, bytes, &scratch))
+            return EOVERFLOW;
+        rc = wl_columnar_lftj_tail(record, 1, i + 1u); if (rc) return rc;
+    }
+    rc = wl_columnar_lftj_reserve(record, &record->outer, scratch);
+    if (rc) return rc;
+#define WL_COLUMNAR_OPS_LFTJ_ALLOC(field, type, zero) do { \
+            rc = wl_columnar_lftj_work(record, 1); if (rc) return rc; \
+            record->field = malloc((size_t)k * sizeof(type)); \
+            if (!record->field) return ENOMEM; \
+            rc = wl_columnar_lftj_tail(record, 1, 0); if (rc) return rc; \
+            if (zero) { rc = wl_columnar_ops_lftj_zero(record, record->field, \
+                                (size_t)k * sizeof(type)); if (rc) return rc; } \
+} while (0)
+    WL_COLUMNAR_OPS_LFTJ_ALLOC(inputs, wl_lftj_input_t, true);
+    WL_COLUMNAR_OPS_LFTJ_ALLOC(probes, col_sorted_arrangement_probe_t, true);
+    WL_COLUMNAR_OPS_LFTJ_ALLOC(relations, col_rel_t *, true);
+    WL_COLUMNAR_OPS_LFTJ_ALLOC(readers, wl_columnar_source_access_reader_t,
+        true);
+    WL_COLUMNAR_OPS_LFTJ_ALLOC(cache_backed, bool, true);
+    WL_COLUMNAR_OPS_LFTJ_ALLOC(ncols, uint32_t, false);
+    WL_COLUMNAR_OPS_LFTJ_ALLOC(compact_offsets, uint32_t, false);
+    WL_COLUMNAR_OPS_LFTJ_ALLOC(binary_offsets, uint32_t, false);
+#undef WL_COLUMNAR_OPS_LFTJ_ALLOC
+    rc = wl_columnar_lftj_commit(record, &record->outer, record->inputs);
+    if (rc) return rc;
+    uint32_t binary_cols = 0, non_key_cols = 0;
+    for (uint32_t i = 0; i < k; i++) {
+        rc = wl_columnar_lftj_work(record, 16); if (rc) return rc;
+        col_rel_t *source = NULL;
+        rc = wl_columnar_join_controlled_lookup(session, meta->rel_names[i],
+                &source, control); if (rc) return rc;
+        if (!source || meta->key_cols[i] >= source->ncols)
+            return source ? EINVAL : ENOENT;
+        record->relations[i] = source; record->reader_count = i + 1u;
+        rc = wl_columnar_lftj_tail(record, 2, i + 1u); if (rc) return rc;
+        rc = wl_columnar_ops_lftj_initialize_source(record, group, source);
+        if (rc) return rc;
+        rc = wl_columnar_relation_reader_acquire_controlled(
+            &source->descriptor_access, &record->probes[i].source_reader,
+            control); if (rc) return rc;
+        rc = wl_columnar_lftj_work(record, 6); if (rc) return rc;
+        col_rel_t *owner = NULL;
+        rc = col_rel_storage_owner_resolve(source, &owner); if (rc) return rc;
+        rc = wl_columnar_lftj_tail(record, 2, i + 1u); if (rc) return rc;
+        rc =
+            wl_columnar_relation_reader_acquire_controlled(
+            &owner->source_access,
+            &record->readers[i], control); if (rc) return rc;
+        rc = wl_columnar_lftj_work(record, 16); if (rc) return rc;
+        wirelog_column_type_t type = source->column_types
+            ? source->column_types[meta->key_cols[i]] : WIRELOG_TYPE_INT64;
+        if (!i) record->key_type = type;
+        else if (type != record->key_type) return EINVAL;
+        rc = wl_columnar_lftj_tail(record, 2, i + 1u); if (rc) return rc;
+    }
+    for (uint32_t i = 0; i < k; i++) {
+        col_rel_t *source = record->relations[i];
+        uint32_t key = meta->key_cols[i];
+        int cache = wl_columnar_arrangement_sorted_acquire_controlled(record,
+                i, key);
+        if (!cache) {
+            rc = wl_columnar_lftj_work(record, 16); if (rc) return rc;
+            record->inputs[i].data = record->probes[i].arr->sorted;
+            record->inputs[i].nrows = record->probes[i].arr->nrows;
+            record->cache_backed[i] = true;
+            record->input_count = i + 1u;
+        } else if (cache == ENOMEM || cache == EBUSY) {
+            if (!wl_columnar_memory_size_mul(source->nrows, source->ncols,
+                &bytes)
+                || !wl_columnar_memory_size_mul(bytes, sizeof(int64_t), &bytes)
+                || bytes > SIZE_MAX) return EOVERFLOW;
+            rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+            record->inputs[i].data = malloc((size_t)bytes);
+            if (!record->inputs[i].data) return ENOMEM;
+            record->input_count = i + 1u;
+            rc = wl_columnar_lftj_tail(record, 12, 0); if (rc) return rc;
+            int64_t *flat = (int64_t *)record->inputs[i].data;
+            for (uint32_t row = 0; row < source->nrows; row++)
+                for (uint32_t col = 0; col < source->ncols; col++) {
+                    rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+                    flat[(size_t)row * source->ncols + col]
+                        = col_rel_get(source, row, col);
+                    rc = wl_columnar_lftj_tail(record, 12,
+                            (uint64_t)row * source->ncols + col + 1u);
+                    if (rc) return rc;
+                }
+            record->inputs[i].nrows = source->nrows;
+        } else return cache;
+        rc = wl_columnar_lftj_work(record, 24); if (rc) return rc;
+        if (binary_cols > UINT32_MAX - source->ncols
+            || non_key_cols > UINT32_MAX - (source->ncols - 1u)
+            || non_key_cols + source->ncols - 1u == UINT32_MAX)
+            return EOVERFLOW;
+        record->inputs[i].ncols = source->ncols;
+        record->inputs[i].key_col = key;
+        record->ncols[i] = source->ncols;
+        record->binary_offsets[i] = binary_cols;
+        record->compact_offsets[i] = 1u + non_key_cols;
+        binary_cols += source->ncols; non_key_cols += source->ncols - 1u;
+        rc = wl_columnar_lftj_tail(record, 2, i + 1u); if (rc) return rc;
+    }
+    record->binary_cols = binary_cols;
+    col_rel_t *out = NULL;
+    rc = wl_columnar_relation_new_auto_governed_controlled("$lftj", binary_cols,
+            0, false, session->memory_governor, &out, control);
+    if (rc) return rc;
+    result->rel = out; result->owned = true;
+    result->kind = WL_COLUMNAR_EVAL_ENTRY_RELATION;
+    rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+    record->binary_row = malloc((size_t)(binary_cols ? binary_cols : 1u)
+            * sizeof(int64_t));
+    if (!record->binary_row) return ENOMEM;
+    rc = wl_columnar_lftj_tail(record, 10, 0); if (rc) return rc;
+    rc = wl_columnar_relation_private_append_batch_begin_controlled(writer,
+            out, control); if (rc) return rc;
+    wl_columnar_ops_lftj_sink_t sink = {
+        record, writer,
+        wl_columnar_eval_stack_cleanup_bulk_append(session->cleanup_active),
+        meta, out
+    };
+    rc = wl_columnar_lftj_kernel_controlled(record, wl_columnar_ops_lftj_emit,
+            &sink); if (rc) return rc;
+    rc = wl_columnar_lftj_work(record, 96); if (rc) return rc;
+    rc = wl_columnar_relation_private_append_batch_end_controlled(writer);
+    if (rc) return rc;
+    rc = wl_columnar_lftj_tail(record, 11, 0); if (rc) return rc;
+    rc = wl_columnar_lftj_record_retire(record, 0, false); if (rc) return rc;
+    rc = wl_columnar_lftj_work(record, 64); if (rc) return rc;
+    rc = eval_stack_repush_entry(stack, result); if (rc) return rc;
+    return wl_columnar_lftj_tail(record, 10, out->nrows);
+}
+
 int
 col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
 {
+    if (sess && sess->base.evaluation_control)
+        return wl_columnar_ops_lftj_controlled(op, stack, sess);
     if (!op || !stack || !sess)
         return EINVAL;
     if (!op->opaque_data)

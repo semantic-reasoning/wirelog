@@ -271,6 +271,7 @@ struct wl_columnar_eval_stack_cleanup_frame {
                 wl_columnar_expr_operator_preparation_t preparation;
                 wl_columnar_join_batch_record_t join_batch;
                 wl_columnar_join_membership_record_t membership;
+                wl_columnar_lftj_record_t lftj;
             };
             wl_columnar_relation_bulk_append_t bulk_append;
         };
@@ -293,6 +294,12 @@ _Static_assert(sizeof(wl_columnar_expr_operator_preparation_t)
 _Static_assert(_Alignof(wl_columnar_expr_operator_preparation_t)
     <= _Alignof(wl_columnar_consolidate_record_t),
     "operator alignment must fit workspace");
+_Static_assert(sizeof(wl_columnar_lftj_record_t)
+    <= sizeof(wl_columnar_consolidate_record_t),
+    "LFTJ must fit original workspace");
+_Static_assert(_Alignof(wl_columnar_lftj_record_t)
+    <= _Alignof(wl_columnar_consolidate_record_t),
+    "LFTJ alignment must fit original workspace");
 _Static_assert(sizeof(wl_columnar_join_membership_record_t)
     <= sizeof(wl_columnar_consolidate_record_t),
     "membership must fit original workspace");
@@ -703,6 +710,10 @@ wl_columnar_eval_stack_workspace_retire(
 {
     uint32_t mode = wl_columnar_eval_stack_cleanup_mode(frame);
     if (mode == WL_COLUMNAR_SERIAL_FRAME_WORKSPACE_INITIALIZING) return 0;
+    if (mode == WL_COLUMNAR_SERIAL_FRAME_LFTJ)
+        return frame->session->serial_completion.payload_ready
+               && frame->lftj.ready
+            ? wl_columnar_lftj_record_retire(&frame->lftj, 0, true) : 0;
     if (mode == WL_COLUMNAR_SERIAL_FRAME_MEMBERSHIP)
         return frame->session->serial_completion.payload_ready
                && frame->membership.ready
@@ -780,6 +791,50 @@ wl_columnar_eval_stack_cleanup_join_batch(
            && frame->session->serial_completion.payload_ready &&
            frame->join_batch.ready
         ? &frame->join_batch : NULL;
+}
+
+int
+wl_columnar_eval_stack_cleanup_lftj_owner(wl_col_session_t *session,
+    eval_stack_t *stack, wl_columnar_lftj_record_t **out,
+    wl_evaluation_control_t *control)
+{
+    if (!session || !stack || !out || *out || !control) return EINVAL;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = session->cleanup_active;
+    if (!frame || frame->session != session || &frame->stack != stack)
+        return EINVAL;
+    int rc = wl_columnar_eval_stack_workspace_clear(frame, control);
+    if (rc) return rc;
+    wl_columnar_memory_reservation_t *tokens[] = {
+        &frame->lftj.outer, &frame->lftj.inner
+    };
+    for (uint32_t i = 0; i < 2u; i++) {
+        rc = wl_evaluation_control_charge(control, 96);
+        if (rc) return rc;
+        wl_columnar_memory_reservation_init(tokens[i]);
+        frame->lftj.initialized_tokens++;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(control, 24);
+    if (rc) return rc;
+    frame->lftj.session = session;
+    frame->lftj.control = control;
+    frame->lftj.ready = true;
+    session->serial_completion.payload_ready = true;
+    session->serial_completion.mode = WL_COLUMNAR_SERIAL_FRAME_LFTJ;
+    *out = &frame->lftj;
+    return wl_evaluation_control_charge(control, 0);
+}
+
+wl_columnar_lftj_record_t *
+wl_columnar_eval_stack_cleanup_lftj(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    return frame && frame->session
+           && wl_columnar_eval_stack_cleanup_mode(frame)
+           == WL_COLUMNAR_SERIAL_FRAME_LFTJ
+           && frame->session->serial_completion.payload_ready
+           && frame->lftj.ready ? &frame->lftj : NULL;
 }
 
 int

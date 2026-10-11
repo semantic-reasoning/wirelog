@@ -87,6 +87,23 @@ wl_columnar_eval_plan_union_validate(const wl_plan_relation_t *plan,
                 && op->delta_mode != WL_DELTA_FORCE_FULL)) return ENOTSUP;
             depth++; branch = true;
             break;
+        case WL_PLAN_OP_LFTJ: {
+            if (branch || depth == COL_STACK_MAX || !op->opaque_data
+                || (op->delta_mode != WL_DELTA_AUTO
+                && op->delta_mode != WL_DELTA_FORCE_FULL)) return ENOTSUP;
+            const wl_plan_op_lftj_t *meta = op->opaque_data;
+            if (meta->k < 2u || meta->k > WL_LFTJ_MAX_K
+                || !meta->rel_names || !meta->key_cols) return EINVAL;
+            for (uint32_t input = 0; input < meta->k; input++) {
+                rc = wl_evaluation_control_charge(control, 8);
+                if (rc) return rc;
+                if (!meta->rel_names[input]) return EINVAL;
+                rc = wl_evaluation_control_charge(control, 0);
+                if (rc) return rc;
+            }
+            depth++; branch = true;
+            break;
+        }
         case WL_PLAN_OP_FILTER:
         case WL_PLAN_OP_MAP:
         case WL_PLAN_OP_REDUCE:
@@ -115,7 +132,8 @@ wl_columnar_eval_plan_union_validate(const wl_plan_relation_t *plan,
         }
         /* A completed first child remains below the next VARIABLE. */
         if (i + 1u < plan->op_count
-            && plan->ops[i + 1u].op == WL_PLAN_OP_VARIABLE) branch = false;
+            && (plan->ops[i + 1u].op == WL_PLAN_OP_VARIABLE
+            || plan->ops[i + 1u].op == WL_PLAN_OP_LFTJ)) branch = false;
         rc = wl_evaluation_control_charge(control, 0);
         if (rc) return rc;
     }

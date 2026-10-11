@@ -6296,6 +6296,62 @@ wl_columnar_relation_count_reader_controlled(
     }
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_relation_test_after_single_reader_release)(
+    wl_evaluation_control_t *, wl_columnar_source_access_reader_t *,
+    wl_columnar_source_access_gate_t *);
+#endif
+
+/* SINGLE original gate only. Terminalize the original slot before the CAS
+ * tail so a stopped storage release cannot be replayed as a held authority. */
+int
+wl_columnar_relation_single_reader_release_controlled(
+    wl_columnar_source_access_reader_t *token, wl_evaluation_control_t *control)
+{
+    if (!control) {
+        if (!token || token->secondary_owner) return EINVAL;
+        return wl_columnar_source_access_reader_release(token);
+    }
+    int rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+    if (!token || token->identity != (uintptr_t) token || !token->owner
+        || token->secondary_owner
+        || (!token->transferable
+        && !wl_columnar_source_access_reader_thread_equal(token))
+        || (token->transferable && token->thread_valid)) return EINVAL;
+    wl_columnar_source_access_gate_t *gate = token->owner;
+    rc = wl_columnar_relation_work_tail(control, 16); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 1); if (rc) return rc;
+    uint64_t observed = atomic_load_explicit(&gate->state,
+            memory_order_acquire);
+    rc = wl_columnar_relation_work_tail(control, 1); if (rc) return rc;
+    for (;;) {
+        rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+        if (!observed || observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+            return EINVAL;
+#ifdef _MSC_VER
+        bool released = atomic_compare_exchange_weak_explicit(&gate->state,
+                &observed, observed - 1u, memory_order_release,
+                memory_order_relaxed);
+#else
+        bool released = atomic_compare_exchange_strong_explicit(&gate->state,
+                &observed, observed - 1u, memory_order_release,
+                memory_order_relaxed);
+#endif
+        if (released) {
+            token->owner = NULL; token->secondary_owner = NULL;
+            token->identity = 0; token->thread_valid = false;
+            token->transferable = false;
+#ifdef WL_SESSION_TEST_HOOKS
+            if (wl_columnar_relation_test_after_single_reader_release)
+                wl_columnar_relation_test_after_single_reader_release(control,
+                    token, gate);
+#endif
+        }
+        rc = wl_columnar_relation_work_tail(control, 16);
+        if (rc || released) return rc;
+    }
+}
+
 int
 wl_columnar_relation_reader_acquire_controlled(
     wl_columnar_source_access_gate_t *gate,
@@ -6378,7 +6434,7 @@ wl_columnar_relation_writer_acquire_controlled(
             memory_order_relaxed);
 #endif
     if (!acquired) {
-        (void) wl_columnar_relation_work_tail(control, 1);
+        (void)wl_columnar_relation_work_tail(control, 1);
         return EBUSY;
     }
     wl_columnar_source_access_writer_initialize(gate, token);
@@ -15476,6 +15532,77 @@ wl_columnar_relation_radix_sort_rows_by_key_typed(int64_t *data,
 
     free(tmp);
     return 0;
+}
+
+/* Same eight stable row-major passes as the raw sorter. The caller's original
+* record owns scratch throughout interrupted gather/scatter and retirement. */
+int
+wl_columnar_relation_radix_rows_controlled(int64_t *data, uint32_t nrows,
+    uint32_t ncols, uint32_t key_col, wirelog_column_type_t key_type,
+    wl_columnar_lftj_record_t *record)
+{
+    if (!record || !record->ready || !record->control) return EINVAL;
+    if (!data || !ncols || nrows <= 1u || key_col >= ncols) return 0;
+    if (record->radix_temp) return EBUSY;
+    uint64_t cells, bytes;
+    if (!wl_columnar_memory_size_mul(nrows, ncols, &cells)
+        || !wl_columnar_memory_size_mul(cells, sizeof(int64_t), &bytes)
+        || bytes > SIZE_MAX) return EOVERFLOW;
+    int rc = wl_columnar_lftj_work(record, 1);
+    if (rc) return rc;
+    record->radix_temp = malloc((size_t)bytes);
+    if (!record->radix_temp) return ENOMEM;
+    record->sort_bytes = bytes;
+    rc = wl_columnar_lftj_tail(record, 4, 0);
+    if (rc) return rc;
+    int64_t *src = data, *dst = record->radix_temp;
+    uint32_t count[256], prefix[256];
+    for (uint32_t pass = 0; pass < 8u; pass++) {
+        for (uint32_t i = 0; i < 256u; i++) {
+            rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+            count[i] = 0;
+            rc = wl_columnar_lftj_tail(record, 4, i + 1u); if (rc) return rc;
+        }
+        for (uint32_t row = 0; row < nrows; row++) {
+            rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+            uint64_t raw = (uint64_t)src[(size_t)row * ncols + key_col];
+            uint64_t ordered = key_type == WIRELOG_TYPE_FLOAT
+                ? ((raw & UINT64_C(0x8000000000000000)) ? ~raw
+                    : raw ^ UINT64_C(0x8000000000000000)) : raw;
+            uint8_t byte = (uint8_t)(ordered >> (pass * 8u));
+            if (pass == 7u && key_type != WIRELOG_TYPE_FLOAT) byte ^= 0x80u;
+            count[byte]++;
+            rc = wl_columnar_lftj_tail(record, 4, row + 1u); if (rc) return rc;
+        }
+        for (uint32_t i = 0; i < 256u; i++) {
+            rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+            prefix[i] = i ? prefix[i - 1u] + count[i - 1u] : 0;
+            rc = wl_columnar_lftj_tail(record, 4, i + 1u); if (rc) return rc;
+        }
+        for (uint32_t row = 0; row < nrows; row++) {
+            rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+            uint64_t raw = (uint64_t)src[(size_t)row * ncols + key_col];
+            uint64_t ordered = key_type == WIRELOG_TYPE_FLOAT
+                ? ((raw & UINT64_C(0x8000000000000000)) ? ~raw
+                    : raw ^ UINT64_C(0x8000000000000000)) : raw;
+            uint8_t byte = (uint8_t)(ordered >> (pass * 8u));
+            if (pass == 7u && key_type != WIRELOG_TYPE_FLOAT) byte ^= 0x80u;
+            uint32_t out = prefix[byte]++;
+            rc = wl_columnar_lftj_tail(record, 5, row + 1u); if (rc) return rc;
+            for (uint32_t col = 0; col < ncols; col++) {
+                rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+                dst[(size_t)out * ncols + col] = src[(size_t)row * ncols + col];
+                rc = wl_columnar_lftj_tail(record, 5,
+                        (uint64_t)row * ncols + col + 1u); if (rc) return rc;
+            }
+        }
+        int64_t *swap = src; src = dst; dst = swap;
+    }
+    /* Eight swaps return to data; there is no hidden whole-buffer copy. */
+    rc = wl_columnar_lftj_work(record, 1); if (rc) return rc;
+    free(record->radix_temp); record->radix_temp = NULL;
+    record->sort_bytes = 0;
+    return wl_columnar_lftj_tail(record, 11, 1);
 }
 
 int
