@@ -5569,17 +5569,9 @@ col_session_set_delta_cb(wl_session_t *session, wirelog_on_delta_fn callback,
     wl_col_session_t *sess = COL_SESSION(session);
     sess->delta_cb = callback;
     sess->delta_data = user_data;
-    /* Issue #2108: an insert made with a callback installed is staged for an
-     * incremental evaluation, and unless an insert into a second relation
-     * already asked for a full one, only the callback told a snapshot to
-     * re-evaluate in full instead (#1030).  Clearing it left that insert,
-     * and any removal staged beside it, to a snapshot's incremental route,
-     * which ignores the removal and emits the rows of the strata below the
-     * inserted relation again; keep the full re-evaluation the callback
-     * promised. */
-    if (!callback && sess->last_inserted_relation != NULL
-        && sess->has_evaluated)
-        sess->pending_full_input_eval = true;
+    /* Issue #2121: clearing the callback sets no routing flag.  The next
+     * snapshot chooses its route from what is staged, as it does for a
+     * session that never had a callback (#2114). */
     if (!callback) {
         if (sess->delta_publish_active)
             sess->delta_publish_cancelled = true;
@@ -5944,16 +5936,6 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
         && tdd_profile[0] != '0';
     uint32_t tdd_profile_evaluated = 0;
 
-    /* K-fusion's pre-seeded delta expansion is designed for step-style
-     * outbound evaluation.  On the snapshot route it can suppress the EDB
-     * base segment before the newly inserted delta reaches a fused recursive
-     * relation (#1030).  A delta callback makes inserts incremental, but a
-     * snapshot still promises the complete current model; fall back to the
-     * already-correct full evaluation path for that combination. */
-    if (sess->delta_cb != NULL && sess->last_inserted_relation != NULL
-        && sess->has_evaluated)
-        sess->pending_full_input_eval = true;
-
     /* Reset profiling counters for this evaluation pass */
     col_session_reset_snapshot_profile(sess);
 
@@ -6008,7 +5990,11 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
      * brought up to date with occurrence-bound instances
      * (session_snapshot_insert).  A staged removal and an insert into a rule
      * head are not insertions those can evaluate, so either makes this a
-     * full re-evaluation. */
+     * full re-evaluation.  Issue #2121: whether a delta callback is
+     * installed plays no part in this choice.  This function calls no delta
+     * callback on either route -- a refused plain step drained above resumes
+     * without the delta observer -- and both run the bookkeeping below
+     * `evaluated`. */
     if (sess->has_evaluated && !sess->pending_full_input_eval
         && sess->last_inserted_relation != NULL
         && (sess->last_removed_relation != NULL
