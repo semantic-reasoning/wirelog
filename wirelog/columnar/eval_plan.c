@@ -98,6 +98,12 @@ wl_columnar_eval_plan_union_validate(const wl_plan_relation_t *plan,
                 || (op->delta_mode != WL_DELTA_AUTO
                 && op->delta_mode != WL_DELTA_FORCE_FULL)) return ENOTSUP;
             break;
+        case WL_PLAN_OP_SEMIJOIN:
+        case WL_PLAN_OP_ANTIJOIN:
+            if (!branch || !depth
+                || (op->delta_mode != WL_DELTA_AUTO
+                && op->delta_mode != WL_DELTA_FORCE_FULL)) return ENOTSUP;
+            break;
         case WL_PLAN_OP_CONCAT:
             if (!branch || depth < 2u) return ENOTSUP;
             depth--; branch = false;

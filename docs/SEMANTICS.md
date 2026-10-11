@@ -897,9 +897,9 @@ call.
 | `pending_full_input_eval` | `col_session_insert`, `col_session_remove`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_serial_attempt` | `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_preflight`, `wl_columnar_session_serial_stable` | PRESERVE |
 | `has_evaluated` | `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_attempt` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_attempt`, `wl_columnar_session_serial_preflight` | PRESERVE |
 | `snapshot_stable_valid` | `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_serial_attempt` | `col_session_snapshot_impl`, `wl_columnar_session_serial_stable` | PRESERVE |
-| `delta_seeded` | `insert_clone_prepare`, `tdd_worker_subpass_fn` | `col_eval_relation_plan`, `col_op_variable`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_filter_op_controlled`, `wl_columnar_join_op_controlled`, `wl_columnar_join_select_right`, `wl_columnar_merge_consolidate_controlled`, `wl_columnar_ops_map_controlled`, `wl_columnar_ops_reduce_controlled`, `wl_columnar_session_serial_preflight`, `wl_columnar_session_serial_stable` | PRESERVE |
+| `delta_seeded` | `insert_clone_prepare`, `tdd_worker_subpass_fn` | `col_eval_relation_plan`, `col_op_variable`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_filter_op_controlled`, `wl_columnar_join_membership_controlled`, `wl_columnar_join_op_controlled`, `wl_columnar_join_select_right`, `wl_columnar_merge_consolidate_controlled`, `wl_columnar_ops_map_controlled`, `wl_columnar_ops_reduce_controlled`, `wl_columnar_session_serial_preflight`, `wl_columnar_session_serial_stable` | PRESERVE |
 | `last_removed_relation` | `col_session_remove_incremental`, `col_worker_session_create`, `session_retraction_cleanup` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_preflight`, `wl_columnar_session_serial_stable` | PRESERVE |
-| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup` | `col_eval_relation_plan`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_filter_op_controlled`, `wl_columnar_join_op_controlled`, `wl_columnar_join_select_right`, `wl_columnar_merge_consolidate_controlled`, `wl_columnar_ops_map_controlled`, `wl_columnar_ops_reduce_controlled`, `wl_columnar_session_serial_preflight`, `wl_columnar_session_serial_stable` | PRESERVE |
+| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup` | `col_eval_relation_plan`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_filter_op_controlled`, `wl_columnar_join_membership_controlled`, `wl_columnar_join_op_controlled`, `wl_columnar_join_select_right`, `wl_columnar_merge_consolidate_controlled`, `wl_columnar_ops_map_controlled`, `wl_columnar_ops_reduce_controlled`, `wl_columnar_session_serial_preflight`, `wl_columnar_session_serial_stable` | PRESERVE |
 | `plain_step_completion_pending` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create` | `col_session_insert`, `col_session_insert_incremental`, `col_session_make_compound`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion`, `wl_columnar_session_serial_preflight`, `wl_columnar_session_serial_stable_output` | PRESERVE -- with `plain_step_completion_phase` this is the resume token |
 | `plain_step_completion_phase` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE |
 | `plain_step_completion_step_context` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl` | PRESERVE |
@@ -1302,3 +1302,42 @@ the actual embedded frame address after the active-frame list detaches it.
 Existing pipeline exclusions, creator admission order and strict fallback rules
 remain in force. This selected ordinary route does not cover recursive,
 differential, LFTJ or general materialized pipeline execution.
+
+### Controlled ordinary membership JOINs
+
+The shared ordinary postfix grammar admits SEMIJOIN and ANTIJOIN among
+VARIABLE, ordinary JOIN, FILTER, MAP, REDUCE and CONCAT before CONSOLIDATE.
+Genuine generated SIP chains retain their actual AUTO operators, key positions
+and head projections. Initial and dirty W1 full-input STEP and SNAPSHOT use
+the existing canonical publication and consumed cleanup cursor. Recursive,
+delta, timestamp, differential and LFTJ admission remains separate work.
+
+Membership construction retains the raw allocation order and capacity policy.
+The original frame workspace holds three original reservations: both key arrays
+share one credit, hash heads/links share another, and the row buffer has its own.
+SEMIJOIN creates projected metadata and its row buffer before hash construction;
+ANTIJOIN creates its new-like output before the hash and allocates its row buffer
+after hash construction. Projected-schema temporary bytes retain their raw
+ungoverned allocation policy. A missing right relation preserves the original
+left entry for both operators, including its ownership and delta flag. A present
+empty right relation follows each operator's actual membership semantics.
+
+Bucket clearing, right-row insertion, left probes, completed unequal comparisons
+and projected output gathers are charged before work and polled independently
+of emitted rows. Uncached right filters run before membership scratch begins.
+They use the raw automatic row buffer for widths up to32 and governed heap
+scratch for larger widths, gathering every column even for a simple predicate.
+The original expression preparation owns compiled state; unsupported compiled
+expressions use the bounded intern-only interpreter without extension calls.
+A semantic failed result rejects the row, while nonzero execution/control errors
+propagate. A successful scalar result such as invalid-ID strlen returning-1
+retains raw truth-value semantics; it is not a failed-expression surrogate.
+
+Healthy retirement is charged. Mandatory checked drain after stop or refusal
+uses the existing cleanup exclusion without new polls, charges or control reset.
+Each physical allocation is freed and its original pointer cleared before credit
+release or rollback. A refused original authority remains reachable in that
+frame; positive initiating errors keep precedence. Source and private authorities
+retire before checked input disposal, with polls immediately before and after
+each healthy disposer. Physical width, Arrow and dedup destruction is excluded
+from bounded forward work, so cancellation delay can include one destructor.

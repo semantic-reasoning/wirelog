@@ -6345,3 +6345,14 @@ test_evaluation_work_exe = executable(
 )
 test('evaluation_work', test_evaluation_work_exe,
      suite: ['unit'], timeout: 120)
+
+# #1821 ordinary membership production callers, internal test hooks only.
+test_evaluation_membership_exe = executable(
+  'test_evaluation_membership', files('test_evaluation_membership.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('evaluation_membership', test_evaluation_membership_exe,
+     suite: ['unit'], timeout: 120)

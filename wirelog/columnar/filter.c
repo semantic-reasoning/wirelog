@@ -1591,6 +1591,160 @@ wl_columnar_filter_next_pow2(uint32_t n)
 
 /* --- Right-child filter helper ------------------------------------------- */
 
+int
+wl_columnar_filter_right_controlled(const wl_plan_expr_buffer_t *expression,
+    col_rel_t *source, eval_stack_t *stack, wl_col_session_t *sess,
+    eval_entry_t *result, wl_columnar_relation_private_batch_t *writer,
+    wl_evaluation_control_t *control)
+{
+    if (!expression || (expression->size && !expression->data) || !source
+        || !stack || !sess || !result || result->rel || !writer || !control)
+        return EINVAL;
+    wl_columnar_expr_operator_preparation_t *preparation = NULL;
+    int rc = wl_columnar_eval_stack_cleanup_operator_preparation_owner(sess,
+            stack, &preparation, control);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 16);
+    if (rc) goto cleanup;
+    result->kind = WL_COLUMNAR_EVAL_ENTRY_RELATION;
+    result->owned = true;
+    rc = wl_columnar_relation_pool_new_like_held_controlled(&result->rel,
+            sess->delta_pool, "$rfilter", source,
+            sess->memory_governor ? sess->memory_governor :
+            source->memory_governor,
+            control);
+    if (rc) goto cleanup;
+    int64_t automatic_row[COL_STACK_MAX];
+    int64_t *row = automatic_row;
+    if (source->ncols > COL_STACK_MAX) {
+        uint64_t bytes;
+        rc = wl_evaluation_control_charge(control, 16);
+        if (rc) goto cleanup;
+        if (!wl_columnar_memory_size_mul(source->ncols, sizeof(*row), &bytes)
+            || bytes > SIZE_MAX) {
+            rc = EOVERFLOW;
+            goto cleanup;
+        }
+        wl_columnar_memory_admission_status_t status;
+        rc = wl_columnar_memory_governor_reserve_checked_controlled(
+            wl_columnar_memory_governor_ref_get(sess->memory_governor), bytes,
+            &preparation->scratch, &status, control);
+        if (rc) goto cleanup;
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                  ? EOVERFLOW : ENOMEM;
+            if (rc == ENOSPC) sess->memory_budget_denied = true;
+            goto cleanup;
+        }
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc) goto cleanup;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_filter_test_fail_next_scratch_alloc) {
+            wl_columnar_filter_test_fail_next_scratch_alloc = false;
+            rc = ENOMEM;
+            goto cleanup;
+        }
+#endif
+        preparation->scratch_payload = malloc((size_t)bytes);
+        if (!preparation->scratch_payload) {
+            rc = ENOMEM;
+            goto cleanup;
+        }
+        row = preparation->scratch_payload;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto cleanup;
+        bool accepted = false;
+        rc = wl_columnar_memory_governor_commit_controlled(
+            &preparation->scratch, row, &accepted, control);
+        if (rc) goto cleanup;
+        if (!accepted) {
+            rc = ENOMEM;
+            goto cleanup;
+        }
+    }
+    simple_filter_cmp_t comparison;
+    rc = wl_columnar_filter_controlled_decode(expression->data,
+            expression->size, &comparison, control);
+    bool simple = rc == 0;
+    if (rc == ENOTSUP) rc = 0;
+    if (rc) goto cleanup;
+    if (!simple) {
+        bool supported = false;
+        rc = wl_columnar_expr_compile_checked(expression->data,
+                expression->size, sess->memory_governor, sess,
+                &preparation->single, &supported, preparation, control);
+        if (rc) goto cleanup;
+        if (!supported) {
+            rc = wl_columnar_expr_interpreter_supported_controlled(
+                expression->data, expression->size, &supported, control);
+            if (rc) goto cleanup;
+            if (!supported) {
+                rc = ENOTSUP;
+                goto cleanup;
+            }
+        }
+    }
+    rc = wl_columnar_relation_private_append_batch_begin_controlled(writer,
+            result->rel, control);
+    if (rc) goto cleanup;
+    wl_columnar_relation_source_group_t *sources =
+        wl_columnar_eval_stack_cleanup_sources(sess->cleanup_active);
+    for (uint32_t r = 0; r < source->nrows; r++) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc) goto cleanup;
+        /* Raw right filters gather every lane, including simple predicates. */
+        for (uint32_t c = 0; c < source->ncols; c++) {
+            rc = wl_evaluation_control_charge(control, 1);
+            if (rc) goto cleanup;
+            row[c] = source->columns[c][r];
+            wl_columnar_filter_controlled_checkpoint(control, 4, c + 1u,
+                sources, source);
+            rc = wl_evaluation_control_charge(control, 0);
+            if (rc) goto cleanup;
+        }
+        bool pass;
+        if (simple) {
+            rc = wl_evaluation_control_charge(control, 16);
+            if (rc) goto cleanup;
+            pass = col_filter_cmp_row(row, source->ncols, &comparison) != 0;
+        } else {
+            int64_t value = 0;
+            bool failed = false;
+            wl_columnar_expr_status_t status = WL_COLUMNAR_EXPR_OK;
+            rc = preparation->single
+                ? wl_columnar_expr_eval_compiled_controlled(
+                preparation->single, row, source->ncols, &value, &failed,
+                control)
+                : wl_columnar_expr_eval_interpreter_controlled(
+                expression->data, expression->size, row, source->ncols,
+                &value, &failed, sess, &status, false, false, control);
+            if (rc) goto cleanup;
+            /* Raw intern-only evaluation is fail-closed for semantic errors.
+             * Actual engine/control status is the separate nonzero rc above. */
+            pass = !failed && value != 0;
+        }
+        wl_columnar_filter_controlled_checkpoint(control, 3, r + 1u,
+            sources, source);
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto cleanup;
+        if (pass) {
+            rc = wl_columnar_relation_private_append_batch_row_controlled(
+                writer, row, control);
+            if (rc) goto cleanup;
+        }
+    }
+    rc = wl_columnar_relation_private_append_batch_end_controlled(writer);
+    if (rc) goto cleanup;
+    return wl_columnar_expr_operator_retire(preparation, 0, false, control);
+cleanup:
+    rc = wl_columnar_relation_private_batch_retire(writer, rc);
+    int cleanup = preparation
+        ? wl_columnar_expr_operator_retire(preparation, rc, true, NULL) : rc;
+    return rc > 0 ? rc : cleanup;
+}
+
 /**
  * fill_filtered_rel: apply a serialized filter expression to @rel, appending
  * passing rows into the already-allocated (empty) relation @out.

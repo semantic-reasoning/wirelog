@@ -270,6 +270,7 @@ struct wl_columnar_eval_stack_cleanup_frame {
                 wl_columnar_consolidate_record_t consolidate;
                 wl_columnar_expr_operator_preparation_t preparation;
                 wl_columnar_join_batch_record_t join_batch;
+                wl_columnar_join_membership_record_t membership;
             };
             wl_columnar_relation_bulk_append_t bulk_append;
         };
@@ -292,6 +293,12 @@ _Static_assert(sizeof(wl_columnar_expr_operator_preparation_t)
 _Static_assert(_Alignof(wl_columnar_expr_operator_preparation_t)
     <= _Alignof(wl_columnar_consolidate_record_t),
     "operator alignment must fit workspace");
+_Static_assert(sizeof(wl_columnar_join_membership_record_t)
+    <= sizeof(wl_columnar_consolidate_record_t),
+    "membership must fit original workspace");
+_Static_assert(_Alignof(wl_columnar_join_membership_record_t)
+    <= _Alignof(wl_columnar_consolidate_record_t),
+    "membership alignment must fit original workspace");
 _Static_assert(sizeof(wl_columnar_session_hash_controlled_registry_t)
     <= sizeof(eval_stack_t), "registry must fit retired original stack");
 _Static_assert(sizeof(wl_columnar_serial_output_t)
@@ -696,6 +703,11 @@ wl_columnar_eval_stack_workspace_retire(
 {
     uint32_t mode = wl_columnar_eval_stack_cleanup_mode(frame);
     if (mode == WL_COLUMNAR_SERIAL_FRAME_WORKSPACE_INITIALIZING) return 0;
+    if (mode == WL_COLUMNAR_SERIAL_FRAME_MEMBERSHIP)
+        return frame->session->serial_completion.payload_ready
+               && frame->membership.ready
+            ? wl_columnar_join_membership_retire(&frame->membership,
+                   0, true, NULL) : 0;
     if (mode == WL_COLUMNAR_SERIAL_FRAME_BATCH)
         return frame->session->serial_completion.payload_ready &&
                frame->join_batch.ready
@@ -768,6 +780,51 @@ wl_columnar_eval_stack_cleanup_join_batch(
            && frame->session->serial_completion.payload_ready &&
            frame->join_batch.ready
         ? &frame->join_batch : NULL;
+}
+
+int
+wl_columnar_eval_stack_cleanup_membership_owner(wl_col_session_t *session,
+    eval_stack_t *stack, wl_columnar_join_membership_record_t **out,
+    wl_evaluation_control_t *control)
+{
+    if (!session || !stack || !out || *out || !control) return EINVAL;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = session->cleanup_active;
+    if (!frame || frame->session != session || &frame->stack != stack)
+        return EINVAL;
+    int rc = wl_columnar_eval_stack_workspace_clear(frame, control);
+    if (rc) return rc;
+    wl_columnar_memory_reservation_t *tokens[] = {
+        &frame->membership.keys, &frame->membership.hash,
+        &frame->membership.row
+    };
+    for (uint32_t i = 0; i < 3u; i++) {
+        rc = wl_evaluation_control_charge(control, 96);
+        if (rc) return rc;
+        wl_columnar_memory_reservation_init(tokens[i]);
+        frame->membership.initialized_tokens++;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(control, 24);
+    if (rc) return rc;
+    frame->membership.session = session;
+    frame->membership.control = control;
+    frame->membership.ready = true;
+    session->serial_completion.payload_ready = true;
+    session->serial_completion.mode = WL_COLUMNAR_SERIAL_FRAME_MEMBERSHIP;
+    *out = &frame->membership;
+    return wl_evaluation_control_charge(control, 0);
+}
+
+wl_columnar_join_membership_record_t *
+wl_columnar_eval_stack_cleanup_membership(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    return frame && frame->session
+           && wl_columnar_eval_stack_cleanup_mode(frame)
+           == WL_COLUMNAR_SERIAL_FRAME_MEMBERSHIP
+           && frame->session->serial_completion.payload_ready
+           && frame->membership.ready ? &frame->membership : NULL;
 }
 
 wl_columnar_eval_stack_cleanup_frame_t *

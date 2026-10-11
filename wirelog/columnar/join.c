@@ -27,6 +27,9 @@
 
 #include "../wirelog-internal.h"
 
+static int wl_columnar_join_membership_controlled(const wl_plan_op_t *,
+    eval_stack_t *, wl_col_session_t *, bool, wl_evaluation_control_t *);
+
 #include <errno.h>
 #include <ctype.h>
 #include <limits.h>
@@ -3033,6 +3036,9 @@ int
 wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
 {
+    if (sess && sess->base.evaluation_control)
+        return wl_columnar_join_membership_controlled(op, stack, sess, true,
+                   sess->base.evaluation_control);
     /* out and its copies remain private until push; right_filtered is the
      * uncached operation-owned fallback. Antijoin completes its synchronous
      * probes before cleanup, and no filtered relation is transferred to cache. */
@@ -3271,6 +3277,9 @@ int
 wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
 {
+    if (sess && sess->base.evaluation_control)
+        return wl_columnar_join_membership_controlled(op, stack, sess, false,
+                   sess->base.evaluation_control);
     /* out and its copies remain private until push; right_filtered is the
      * uncached operation-owned fallback. Semijoin completes its synchronous
      * probes before cleanup, and no filtered relation is transferred to cache. */
@@ -4583,6 +4592,555 @@ int
 col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
 {
     return wl_columnar_join_op(op, stack, sess);
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_join_membership_test_checkpoint)(
+    wl_columnar_join_membership_record_t *, int, uint64_t);
+#endif
+
+static void
+wl_columnar_join_membership_checkpoint(
+    wl_columnar_join_membership_record_t *record, int stage, uint64_t progress)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_join_membership_test_checkpoint)
+        wl_columnar_join_membership_test_checkpoint(record, stage, progress);
+#else
+    (void)record;
+    (void)stage;
+    (void)progress;
+#endif
+}
+
+static int
+wl_columnar_join_membership_credit_retire(
+    wl_columnar_memory_reservation_t *token)
+{
+    if (token->identity != token) return EINVAL;
+    uint64_t state = atomic_load_explicit(&token->state, memory_order_acquire);
+    if (state == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+        || state == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED) {
+        wl_columnar_memory_reservation_init(token);
+        return 0;
+    }
+    bool accepted = state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        ? wl_columnar_memory_release(token)
+        : state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        && wl_columnar_memory_rollback(token);
+    if (!accepted) return EINVAL;
+    wl_columnar_memory_reservation_init(token);
+    return 0;
+}
+
+int
+wl_columnar_join_membership_retire(
+    wl_columnar_join_membership_record_t *record, int primary,
+    bool mandatory, wl_evaluation_control_t *control)
+{
+    if (!record || !record->ready || record->initialized_tokens != 3u)
+        return primary > 0 ? primary : EINVAL;
+    wl_columnar_memory_reservation_t *tokens[] = {
+        &record->keys, &record->hash, &record->row
+    };
+    for (uint32_t i = 0; i < 3u; i++) {
+        int rc = mandatory ? 0 : wl_evaluation_control_charge(control, 96);
+        if (!rc && !mandatory) rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return primary > 0 ? primary : rc;
+        if (i == 0u) {
+            free(record->left_keys);
+            record->left_keys = NULL;
+            free(record->right_keys);
+            record->right_keys = NULL;
+            free(record->types_payload);
+            record->types_payload = NULL;
+        } else if (i == 1u) {
+            free(record->heads);
+            record->heads = NULL;
+            free(record->next);
+            record->next = NULL;
+        } else {
+            free(record->row_payload);
+            record->row_payload = NULL;
+        }
+        wl_columnar_join_membership_checkpoint(record, (int)i + 1, 0);
+        rc = wl_columnar_join_membership_credit_retire(tokens[i]);
+        if (rc) return primary > 0 ? primary : rc;
+        if (!mandatory) {
+            rc = wl_evaluation_control_charge(control, 0);
+            if (rc) return primary > 0 ? primary : rc;
+        }
+    }
+    return primary;
+}
+
+static int
+wl_columnar_join_membership_reserve(
+    wl_columnar_join_membership_record_t *record,
+    wl_columnar_memory_reservation_t *token,
+    wl_columnar_memory_governor_ref_t *governor, uint64_t bytes)
+{
+    wl_columnar_memory_admission_status_t status;
+    int rc = wl_columnar_memory_governor_reserve_checked_controlled(
+        wl_columnar_memory_governor_ref_get(governor), bytes, token,
+        &status, record->control);
+    if (rc) return rc;
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+        || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) return 0;
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED) {
+        record->session->memory_budget_denied = true;
+        return ENOSPC;
+    }
+    return status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+        ? EOVERFLOW : ENOMEM;
+}
+
+static int
+wl_columnar_join_membership_commit(
+    wl_columnar_join_membership_record_t *record,
+    wl_columnar_memory_reservation_t *token, const void *payload)
+{
+    bool accepted = false;
+    int rc = wl_columnar_memory_governor_commit_controlled(token, payload,
+            &accepted, record->control);
+    return rc ? rc : accepted ? 0 : ENOMEM;
+}
+
+static int
+wl_columnar_join_membership_keys(
+    wl_columnar_join_membership_record_t *record,
+    wl_columnar_memory_governor_ref_t *governor, uint32_t count)
+{
+    if (!count) return 0;
+    uint64_t bytes;
+    if (!wl_columnar_memory_size_mul(count, 2u * sizeof(uint32_t), &bytes)
+        || bytes > SIZE_MAX) return EOVERFLOW;
+    int rc = wl_columnar_join_membership_reserve(record, &record->keys,
+            governor, bytes);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(record->control, 1);
+    if (rc) return rc;
+    record->left_keys = malloc((size_t)bytes / 2u);
+    if (!record->left_keys) return ENOMEM;
+#ifdef WL_TEST_JOIN_CACHE_HOOK
+    if (wl_columnar_join_test_fail_next_key_scratch_alloc) {
+        wl_columnar_join_test_fail_next_key_scratch_alloc = false;
+        return ENOMEM;
+    }
+#endif
+    rc = wl_evaluation_control_charge(record->control, 0);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(record->control, 1);
+    if (rc) return rc;
+    record->right_keys = malloc((size_t)bytes / 2u);
+    if (!record->right_keys) return ENOMEM;
+    rc = wl_evaluation_control_charge(record->control, 0);
+    if (rc) return rc;
+    return wl_columnar_join_membership_commit(record, &record->keys,
+               record->left_keys);
+}
+
+static int
+wl_columnar_join_membership_hash_allocate(
+    wl_columnar_join_membership_record_t *record,
+    wl_columnar_memory_governor_ref_t *governor, uint32_t buckets,
+    uint64_t next_count)
+{
+    uint64_t heads, next, bytes;
+    if (!wl_columnar_memory_size_mul(buckets, sizeof(uint32_t), &heads)
+        || !wl_columnar_memory_size_mul(next_count, sizeof(uint32_t), &next)
+        || !wl_columnar_memory_size_add(heads, next, &bytes)
+        || heads > SIZE_MAX || next > SIZE_MAX) return EOVERFLOW;
+    int rc = wl_columnar_join_membership_reserve(record, &record->hash,
+            governor, bytes);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(record->control, 1);
+    if (rc) return rc;
+    record->heads = malloc((size_t)heads);
+    if (!record->heads) return ENOMEM;
+    rc = wl_evaluation_control_charge(record->control, 0);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(record->control, 1);
+    if (rc) return rc;
+    record->next = malloc((size_t)next);
+    if (!record->next) return ENOMEM;
+    rc = wl_evaluation_control_charge(record->control, 0);
+    if (rc) return rc;
+    return wl_columnar_join_membership_commit(record, &record->hash,
+               record->heads);
+}
+
+static int
+wl_columnar_join_membership_row_allocate(
+    wl_columnar_join_membership_record_t *record,
+    wl_columnar_memory_governor_ref_t *governor, uint32_t width)
+{
+    uint64_t bytes;
+    if (!wl_columnar_memory_size_mul(width ? width : 1u,
+        sizeof(int64_t), &bytes) || bytes > SIZE_MAX) return EOVERFLOW;
+    int rc = wl_columnar_join_membership_reserve(record, &record->row,
+            governor, bytes);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(record->control, 1);
+    if (rc) return rc;
+    record->row_payload = malloc((size_t)bytes);
+    if (!record->row_payload) return ENOMEM;
+    rc = wl_evaluation_control_charge(record->control, 0);
+    if (rc) return rc;
+    return wl_columnar_join_membership_commit(record, &record->row,
+               record->row_payload);
+}
+
+static int
+wl_columnar_join_membership_controlled(const wl_plan_op_t *op,
+    eval_stack_t *stack, wl_col_session_t *sess, bool anti,
+    wl_evaluation_control_t *control)
+{
+    if (!op || !stack || !sess || !control) return EINVAL;
+    if (sess->num_workers > 1 || sess->diff_operators_active
+        || sess->tdd_input_run || sess->tdd_subpass_active
+        || sess->tdd_outbound_only_active || sess->current_iteration
+        || sess->delta_seeded || sess->retraction_seeded
+        || sess->retraction_right_pass || sess->delta_observer
+        || !sess->memory_governor) return ENOTSUP;
+    wl_columnar_relation_source_group_t *sources = NULL;
+    eval_entry_t *result = NULL;
+    int rc = wl_columnar_eval_stack_cleanup_join_owner(sess, stack,
+            &sources, &result);
+    if (rc) return rc;
+    wl_columnar_relation_private_batch_t *writer = NULL;
+    rc = wl_columnar_eval_stack_cleanup_private_batch_owner(sess, stack,
+            &writer, control);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 32);
+    if (rc) return rc;
+    if (!stack->top || stack->top > COL_STACK_MAX
+        || stack->items[stack->top - 1u].kind
+        != WL_COLUMNAR_EVAL_ENTRY_RELATION
+        || !stack->items[stack->top - 1u].rel) return EINVAL;
+    uint32_t slot = stack->top - 1u;
+    col_rel_t *left = stack->items[slot].rel;
+    col_rel_t *right = NULL;
+    bool filtered = false;
+    wl_columnar_join_membership_record_t *record = NULL;
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) return rc;
+    rc = wl_columnar_join_controlled_lookup(sess, op->right_relation,
+            &right, control);
+    if (rc || !right) return rc;
+    if (stack->items[slot].is_delta) return ENOTSUP;
+    if (op->right_filter_expr.size && stack->top == COL_STACK_MAX)
+        return ENOMEM;
+    if (!anti && op->project_count && !op->project_indices) return EINVAL;
+    if (op->right_filter_expr.size) {
+        rc = wl_columnar_relation_source_group_acquire_controlled(sources,
+                right, NULL, control);
+        if (rc) goto cleanup;
+        rc = wl_columnar_join_controlled_shape(right, control);
+        if (rc) goto cleanup;
+        rc = wl_columnar_filter_right_controlled(&op->right_filter_expr,
+                right, stack, sess, result, writer, control);
+        if (rc) goto cleanup;
+        rc = wl_evaluation_control_charge(control, 64);
+        if (!rc) rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto cleanup;
+        rc = wl_columnar_relation_source_group_release_readers(sources, 0);
+        if (rc) goto cleanup;
+        rc = wl_columnar_relation_source_group_validate_writers(sources);
+        if (rc) goto cleanup;
+        rc = wl_evaluation_control_charge(control, 84);
+        if (!rc) rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto cleanup;
+        wl_columnar_relation_source_group_commit(sources);
+        rc = wl_columnar_relation_source_group_drain(sources, 0);
+        if (rc) goto cleanup;
+        stack->items[stack->top++] = *result;
+        *result = (eval_entry_t){0};
+        right = stack->items[slot + 1u].rel;
+        filtered = true;
+        writer = NULL;
+        rc = wl_columnar_eval_stack_cleanup_private_batch_owner(sess,
+                stack, &writer, control);
+        if (rc) goto cleanup;
+    }
+    rc = wl_columnar_relation_source_group_acquire_controlled(sources,
+            left, right, control);
+    if (rc) goto cleanup;
+    rc = wl_columnar_join_controlled_shape(left, control);
+    if (!rc) rc = wl_columnar_join_controlled_shape(right, control);
+    if (rc) goto cleanup;
+    rc = wl_columnar_eval_stack_cleanup_membership_owner(sess, stack,
+            &record, control);
+    if (rc) goto cleanup;
+    record->right_filter_slot = filtered ? slot + 1u : COL_STACK_MAX;
+    wl_columnar_memory_governor_ref_t *governor =
+        wl_columnar_join_output_governor(sess, left, right);
+    uint32_t kc = op->key_count;
+    rc = wl_evaluation_control_charge(control, 32);
+    if (rc) goto cleanup;
+    if (kc && ((!left->ncols && left->nrows)
+        || (!right->ncols && right->nrows))) {
+        rc = EINVAL;
+        goto cleanup;
+    }
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto cleanup;
+    rc = wl_columnar_join_membership_keys(record, governor, kc);
+    if (rc) goto cleanup;
+    for (uint32_t k = 0; k < kc; k++) {
+        rc = wl_columnar_join_controlled_key(left,
+                op->left_keys ? op->left_keys[k] : NULL,
+                &record->left_keys[k], control);
+        if (!rc) rc = wl_columnar_join_controlled_key(right,
+                    op->right_keys ? op->right_keys[k] : NULL,
+                    &record->right_keys[k], control);
+        if (rc) goto cleanup;
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc) goto cleanup;
+        wirelog_column_type_t lt = left->column_types
+            ? left->column_types[record->left_keys[k]] : WIRELOG_TYPE_INT64;
+        wirelog_column_type_t rt = right->column_types
+            ? right->column_types[record->right_keys[k]] : WIRELOG_TYPE_INT64;
+        if ((lt == WIRELOG_TYPE_FLOAT) != (rt == WIRELOG_TYPE_FLOAT)) {
+            rc = EINVAL;
+            goto cleanup;
+        }
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto cleanup;
+    }
+    uint32_t width = anti || !op->project_count
+        ? left->ncols : op->project_count;
+    rc = wl_evaluation_control_charge(control, 16);
+    if (rc) goto cleanup;
+    result->kind = WL_COLUMNAR_EVAL_ENTRY_RELATION;
+    result->owned = true;
+    if (anti) {
+        rc = wl_columnar_relation_new_like_held_controlled("$antijoin",
+                left, governor, &result->rel, control);
+    } else {
+        rc = wl_columnar_relation_new_auto_governed_controlled("$semijoin",
+                width, COL_REL_INIT_CAP, false, governor, &result->rel,
+                control);
+    }
+    if (rc) goto cleanup;
+    col_rel_t *out = result->rel;
+    if (!anti) {
+        uint64_t bytes;
+        rc = wl_evaluation_control_charge(control, 16);
+        if (rc) goto cleanup;
+        if (!wl_columnar_memory_size_mul(width,
+            sizeof(*record->types_payload), &bytes) || bytes > SIZE_MAX) {
+            rc = EOVERFLOW;
+            goto cleanup;
+        }
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc) goto cleanup;
+        record->types_payload = malloc((size_t)bytes);
+        if (bytes && !record->types_payload) {
+            rc = ENOMEM;
+            goto cleanup;
+        }
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto cleanup;
+        for (uint32_t c = 0; c < width; c++) {
+            rc = wl_evaluation_control_charge(control, 2);
+            if (rc) goto cleanup;
+            uint32_t index = op->project_count ? op->project_indices[c] : c;
+            record->types_payload[c] = index < left->ncols && left->column_types
+                ? left->column_types[index] : WIRELOG_TYPE_INT64;
+            rc = wl_evaluation_control_charge(control, 0);
+            if (rc) goto cleanup;
+        }
+        wl_columnar_relation_bulk_append_t *bulk =
+            wl_columnar_eval_stack_cleanup_bulk_append(sess->cleanup_active);
+        rc = wl_columnar_relation_private_types_controlled(bulk, out,
+                record->types_payload, control);
+        if (rc) goto cleanup;
+        rc = wl_evaluation_control_charge(control, 1);
+        if (!rc) rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto cleanup;
+        free(record->types_payload);
+        record->types_payload = NULL;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto cleanup;
+    }
+    rc = wl_evaluation_control_charge(control, 16);
+    if (rc) goto cleanup;
+    uint64_t ledger_bytes;
+    if (!wl_columnar_memory_size_mul(width, out->capacity, &ledger_bytes)
+        || !wl_columnar_memory_size_mul(ledger_bytes, sizeof(int64_t),
+        &ledger_bytes)){
+        rc = EOVERFLOW;
+        goto cleanup;
+    }
+    wl_columnar_mem_ledger_exclusive_request_t ledger_request = {
+        .subsystem = WL_MEM_SUBSYS_RELATION, .bytes = ledger_bytes,
+        .allocate = true
+    };
+    wl_columnar_mem_ledger_exclusive_prepared_t ledger_prepared;
+    rc = wl_columnar_mem_ledger_prepare_exclusive_controlled(&sess->mem_ledger,
+            &ledger_request, ledger_bytes ? 1u : 0u, &ledger_prepared, control);
+    if (!rc) rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto cleanup;
+    wl_columnar_mem_ledger_apply_exclusive(&ledger_prepared);
+    out->mem_ledger = &sess->mem_ledger;
+    uint32_t buckets = 0;
+    if (!anti) {
+        rc = wl_columnar_join_membership_row_allocate(record, governor, width);
+        if (rc) goto cleanup;
+    }
+    rc = wl_evaluation_control_charge(control, 16);
+    if (rc) goto cleanup;
+    rc = col_join_bucket_count(right->nrows, &buckets);
+    if (!rc) rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto cleanup;
+    rc = wl_columnar_join_membership_hash_allocate(record, governor, buckets,
+            anti ? (uint64_t)right->nrows + 1u
+        : right->nrows ? right->nrows : 1u);
+    if (rc) goto cleanup;
+    for (uint32_t b = 0; b < buckets; b++) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc) goto cleanup;
+        record->heads[b] = 0;
+        wl_columnar_join_membership_checkpoint(record, 7, b + 1u);
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto cleanup;
+    }
+    for (uint32_t rr = 0; rr < right->nrows; rr++) {
+        uint32_t hash;
+        rc = wl_columnar_join_controlled_hash(right, rr, record->right_keys,
+                kc, &hash, control);
+        if (rc) goto cleanup;
+        rc = wl_evaluation_control_charge(control, 2);
+        if (rc) goto cleanup;
+        hash &= buckets - 1u;
+        record->next[rr] = record->heads[hash];
+        record->heads[hash] = rr + 1u;
+        wl_columnar_join_membership_checkpoint(record, 8, rr + 1u);
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto cleanup;
+    }
+    if (anti) {
+        rc = wl_columnar_join_membership_row_allocate(record, governor, width);
+        if (rc) goto cleanup;
+    }
+    rc = wl_columnar_relation_private_append_batch_begin_controlled(writer,
+            out, control);
+    if (rc) goto cleanup;
+    uint64_t candidates = 0;
+    for (uint32_t lr = 0; lr < left->nrows; lr++) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc) goto cleanup;
+        wl_columnar_join_membership_checkpoint(record, 9, lr + 1u);
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto cleanup;
+        uint32_t hash;
+        rc = wl_columnar_join_controlled_hash(left, lr, record->left_keys,
+                kc, &hash, control);
+        if (rc) goto cleanup;
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc) goto cleanup;
+        uint32_t chain = record->heads[hash & (buckets - 1u)];
+        bool found = false;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto cleanup;
+        while (chain && !found) {
+            rc = wl_evaluation_control_charge(control, 1);
+            if (rc) goto cleanup;
+            uint32_t rr = chain - 1u;
+            bool match = true;
+            wl_columnar_join_membership_checkpoint(record, 10, candidates + 1u);
+            rc = wl_evaluation_control_charge(control, 0);
+            if (rc) goto cleanup;
+            for (uint32_t k = 0; k < kc; k++) {
+                rc = wl_evaluation_control_charge(control, 1);
+                if (rc) goto cleanup;
+                match = wl_columnar_value_equal(left, record->left_keys[k],
+                        left->columns[record->left_keys[k]][lr], right,
+                        record->right_keys[k],
+                        right->columns[record->right_keys[k]][rr]);
+                rc = wl_evaluation_control_charge(control, 0);
+                if (rc) goto cleanup;
+                if (!match) break;
+            }
+            wl_columnar_join_membership_checkpoint(record, 11, ++candidates);
+            rc = wl_evaluation_control_charge(control, 0);
+            if (rc) goto cleanup;
+            rc = wl_evaluation_control_charge(control, 1);
+            if (rc) goto cleanup;
+            found = match;
+            chain = record->next[rr];
+            rc = wl_evaluation_control_charge(control, 0);
+            if (rc) goto cleanup;
+        }
+        if (found == anti) continue;
+        for (uint32_t c = 0; c < width; c++) {
+            rc = wl_evaluation_control_charge(control, 2);
+            if (rc) goto cleanup;
+            uint32_t index = !anti && op->project_count
+                ? op->project_indices[c] : c;
+            record->row_payload[c] = index < left->ncols
+                ? left->columns[index][lr] : 0;
+            rc = wl_evaluation_control_charge(control, 0);
+            if (rc) goto cleanup;
+        }
+        rc = wl_columnar_relation_private_append_batch_row_controlled(writer,
+                record->row_payload, control);
+        if (rc) goto cleanup;
+        wl_columnar_join_membership_checkpoint(record, 12, lr + 1u);
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto cleanup;
+    }
+    wl_columnar_join_membership_checkpoint(record, 13, 0);
+    rc = wl_columnar_relation_private_append_batch_end_controlled(writer);
+    if (rc) goto cleanup;
+    wl_columnar_join_membership_checkpoint(record, 14, 0);
+    rc = wl_columnar_join_membership_retire(record, 0, false, control);
+    if (rc) goto cleanup;
+    rc = wl_columnar_relation_source_group_release_readers(sources, 0);
+    if (rc) goto cleanup;
+    rc = wl_evaluation_control_charge(control, 64);
+    if (!rc &&
+        !wl_columnar_relation_private_batch_disposable(writer)) rc = EINVAL;
+    if (!rc) rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto cleanup;
+    rc = wl_columnar_relation_source_group_validate_writers(sources);
+    if (rc) goto cleanup;
+    rc = wl_evaluation_control_charge(control, 84);
+    if (!rc) rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto cleanup;
+    wl_columnar_relation_source_group_commit(sources);
+    rc = wl_columnar_relation_source_group_drain(sources, 0);
+    if (rc) goto cleanup;
+    for (uint32_t count = filtered ? 2u : 1u; count > 0; count--) {
+        rc = wl_evaluation_control_charge(control, 64);
+        if (!rc) rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto cleanup;
+        rc = eval_entry_dispose(&stack->items[slot + count - 1u]);
+        if (rc) goto cleanup;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto cleanup;
+    }
+    rc = wl_evaluation_control_charge(control, 64);
+    if (!rc) rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto cleanup;
+    stack->items[slot] = *result;
+    stack->top = slot + 1u;
+    *result = (eval_entry_t){0};
+    return 0;
+cleanup:
+    if (writer) rc = wl_columnar_relation_private_batch_retire(writer, rc);
+    wl_columnar_relation_bulk_append_t *bulk =
+        wl_columnar_eval_stack_cleanup_bulk_append(sess->cleanup_active);
+    int cleanup = bulk ? wl_columnar_relation_bulk_append_retire(bulk, rc) : rc;
+    if (rc <= 0) rc = cleanup;
+    if (record) {
+        cleanup = wl_columnar_join_membership_retire(record, rc, true, NULL);
+        if (rc <= 0) rc = cleanup;
+    }
+    cleanup = wl_columnar_relation_source_group_drain(sources, rc);
+    if (rc <= 0) rc = cleanup;
+    return wl_columnar_join_memory_error(sess, rc);
 }
 
 int

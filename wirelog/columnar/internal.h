@@ -3768,6 +3768,36 @@ typedef struct wl_columnar_expr_operator_preparation {
     uint32_t initialized, retiring, initialized_tokens;
     bool ready;
 } wl_columnar_expr_operator_preparation_t;
+
+/* Phase-exclusive membership scratch. Every credit stays at this original
+ * address until its physical arrays have been retired. Source and private
+ * writers remain in the enclosing evaluator frame. */
+typedef struct wl_columnar_join_membership_record {
+    wl_columnar_memory_reservation_t keys, hash, row;
+    wl_col_session_t *session;
+    wl_evaluation_control_t *control;
+    uint32_t *left_keys, *right_keys, *heads, *next;
+    int64_t *row_payload;
+    /* Raw projected-schema temporary is ungoverned; retain its real owner
+     * without introducing a credit or overlapping row/hash allocation. */
+    wirelog_column_type_t *types_payload;
+    uint32_t initialized_tokens;
+    uint32_t right_filter_slot;
+    uint32_t phase;
+    bool ready;
+} wl_columnar_join_membership_record_t;
+int wl_columnar_join_membership_retire(wl_columnar_join_membership_record_t *,
+    int, bool, wl_evaluation_control_t *);
+int wl_columnar_eval_stack_cleanup_membership_owner(wl_col_session_t *,
+    eval_stack_t *, wl_columnar_join_membership_record_t **,
+    wl_evaluation_control_t *);
+wl_columnar_join_membership_record_t *
+wl_columnar_eval_stack_cleanup_membership(
+    wl_columnar_eval_stack_cleanup_frame_t *);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_join_membership_test_checkpoint)(
+    wl_columnar_join_membership_record_t *, int, uint64_t);
+#endif
 int wl_columnar_expr_operator_retire(wl_columnar_expr_operator_preparation_t *,
     int, bool, wl_evaluation_control_t *);
 int wl_columnar_expr_compile_checked(const uint8_t *, uint32_t,
@@ -4258,6 +4288,7 @@ typedef struct wl_columnar_session_hash_controlled_registry {
 #define WL_COLUMNAR_SERIAL_FRAME_WORKSPACE_INITIALIZING 4u
 #define WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT 5u
 #define WL_COLUMNAR_SERIAL_FRAME_BATCH 6u
+#define WL_COLUMNAR_SERIAL_FRAME_MEMBERSHIP 7u
 #define WL_COLUMNAR_SERIAL_OUTPUT_CURRENT 1u
 #define WL_COLUMNAR_SERIAL_OUTPUT_DESCRIPTOR 2u
 #define WL_COLUMNAR_SERIAL_OUTPUT_SOURCE 4u
@@ -4689,6 +4720,9 @@ wl_columnar_relation_new_like_held_controlled(const char *name,
 int
 wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess);
+int wl_columnar_filter_right_controlled(const wl_plan_expr_buffer_t *,
+    col_rel_t *, eval_stack_t *, wl_col_session_t *, eval_entry_t *,
+    wl_columnar_relation_private_batch_t *, wl_evaluation_control_t *);
 int
 wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess);

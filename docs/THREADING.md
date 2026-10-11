@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **339**). The earlier audit sections
+match the script's count (currently **340**). The earlier audit sections
 retain their historical per-section counts.
 
 Format: `file:function[#N]` | field | operation | order | justification.
@@ -1656,3 +1656,20 @@ and consumes a published reset cursor before a possible cleanup refusal.
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
 | `join_batch.c:wl_columnar_join_batch_credit_retire` | `token.state` | `atomic_load_explicit` | `acquire` | Select original checked batch credit rollback/release after physical disposal |
+
+### 5.24 `wirelog/columnar/join.c` — checked membership credit retirement (1 row)
+
+| Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `join.c:wl_columnar_join_membership_credit_retire` | `token->state` | `atomic_load_explicit` | `acquire` | Select original COMMITTED release or RESERVED rollback after physical buffers are freed and NULL; a validation refusal retains the original token |
+
+The membership journal overlays only retired preparation/consolidation bytes.
+External frame mode and readiness identify partial initialization before any
+consumer reads this overlay; complete frame and completion layouts are unchanged.
+Persistent inputs, source reader group, private output writer and bulk schema
+transaction remain in their original separate fields. A right-filter result
+becomes a real owned stack entry only after expression/private/source authority
+retirement. The membership output ends its actual private epoch before input
+disposal and CONS acquires its next genuine epoch. Original key/hash/row tokens
+are never copied; physical pointers are NULL before refused original retirement,
+and retry drains the exact retained address before any new attempt.
