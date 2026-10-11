@@ -12,21 +12,24 @@
  * the inserted relation through another head emitted its earlier rows a
  * second time, and an aggregate over the inserted relation was computed
  * over the delta alone and kept beside the old result.  Such a snapshot now
- * deduplicates the heads of the non-recursive strata it evaluates, and
- * evaluates in full when a reached stratum aggregates or negates, or a
- * non-recursive one joins.
+ * brings the reached strata up to date through the insert route
+ * (session_snapshot_insert), and evaluates in full instead in the cases
+ * here where a reached stratum aggregates or negates, a removal was made
+ * after the last evaluation, or the inserted relation is a rule head.
  *
  * Each case loads 7 and 8, reads them with a snapshot, adds 9 the same way
  * -- some also remove e(7) before or after it, without a delta callback --
  * and requires the exact model from the next two snapshots, in a session
- * created with one worker and with four.
+ * created with one worker and with four.  Issue #2119: each case also
+ * requires the first of those snapshots to take the insert route or not, as
+ * its route field says, and the second not to take it.
  */
 
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L /* setenv */
 #endif
 
-#include "../wirelog/columnar/columnar_nanoarrow.h"
+#include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
 #include "../wirelog/session_facts.h"
@@ -85,6 +88,7 @@ typedef struct {
     int64_t want[MAX_ROWS][2];      /* its rows after e(9), each once */
     uint32_t nwant;
     int remove7; /* 1: remove e(7) before adding 9; 2: after; 0: neither */
+    bool route;  /* the first snapshot after 9 takes the insert route */
 } case_t;
 
 #define F_DECL ".decl __compound_f_1(handle: int64, arg0: int64)\n"
@@ -97,7 +101,7 @@ static const case_t CASES[] = {
     { "plain rule over a rule head", false,
       ".decl e(x: int64)\n.decl r(x: int64)\n.decl n(k: int64, c: int64)\n"
       "r(x) :- e(x).\nn(x, x) :- r(x).\n",
-      "n", { { 7, 7 }, { 8, 8 }, { 9, 9 } }, 3 },
+      "n", { { 7, 7 }, { 8, 8 }, { 9, 9 } }, 3, 0, true },
     { "count over the inserted relation", false,
       ".decl e(x: int64)\n.decl n(k: int64, c: int64)\n"
       "n(x, count(x)) :- e(x).\n",
@@ -111,7 +115,8 @@ static const case_t CASES[] = {
       "edge(9, 10). edge(10, 11).\n"
       "r(x) :- e(x).\n"
       "reach(x) :- r(x).\nreach(y) :- reach(x), edge(x, y).\n",
-      "reach", { { 7, 0 }, { 8, 0 }, { 9, 0 }, { 10, 0 }, { 11, 0 } }, 5 },
+      "reach", { { 7, 0 }, { 8, 0 }, { 9, 0 }, { 10, 0 }, { 11, 0 } }, 5, 0,
+      true },
     { "negation of the inserted relation", false,
       ".decl e(x: int64)\n.decl s(x: int64)\n.decl p(x: int64)\n"
       "s(7). s(8). s(9). s(10).\n"
@@ -120,7 +125,7 @@ static const case_t CASES[] = {
     { "plain rule over a compound", true,
       F_DECL ".decl r(x: int64)\n.decl m(k: int64, c: int64)\n"
       "r(A) :- __compound_f_1(H, A).\nm(A, A) :- r(A).\n",
-      "m", { { 7, 7 }, { 8, 8 }, { 9, 9 } }, 3 },
+      "m", { { 7, 7 }, { 8, 8 }, { 9, 9 } }, 3, 0, true },
     { "sum over a compound", true,
       F_DECL ".decl r(x: int64)\n.decl n(k: int64)\n"
       "r(A) :- __compound_f_1(H, A).\nn(sum(A)) :- r(A).\n",
@@ -128,16 +133,16 @@ static const case_t CASES[] = {
     { "self-join of a compound", true,
       F_DECL ".decl m(a: int64, b: int64)\n"
       "m(A, B) :- __compound_f_1(H, A), __compound_f_1(G, B), A < B.\n",
-      "m", { { 7, 8 }, { 7, 9 }, { 8, 9 } }, 3 },
+      "m", { { 7, 8 }, { 7, 9 }, { 8, 9 } }, 3, 0, true },
     { "join of a rule head with its own input", true,
       F_DECL ".decl r(x: int64)\n.decl m(a: int64, b: int64)\n"
       "r(A) :- __compound_f_1(H, A).\n"
       "m(A, B) :- r(A), __compound_f_1(G, B), A > B.\n",
-      "m", { { 8, 7 }, { 9, 7 }, { 9, 8 } }, 3 },
+      "m", { { 8, 7 }, { 9, 7 }, { 9, 8 } }, 3, 0, true },
     { "self-join of the inserted relation", false,
       ".decl e(x: int64)\n.decl m(a: int64, b: int64)\n"
       "m(x, y) :- e(x), e(y), x < y.\n",
-      "m", { { 7, 8 }, { 7, 9 }, { 8, 9 } }, 3 },
+      "m", { { 7, 8 }, { 7, 9 }, { 8, 9 } }, 3, 0, true },
     { "recursion negating the inserted relation", false,
       ".decl e(x: int64)\n.decl edge(a: int64, b: int64)\n"
       ".decl reach(x: int64)\n"
@@ -152,6 +157,10 @@ static const case_t CASES[] = {
       ".decl e(x: int64)\n.decl r(x: int64)\n.decl n(k: int64, c: int64)\n"
       "r(x) :- e(x).\nn(x, x) :- r(x).\n",
       "n", { { 8, 8 }, { 9, 9 } }, 2, 2 },
+    { "insert into a rule head", false,
+      ".decl s(x: int64)\n.decl e(x: int64)\n.decl n(k: int64, c: int64)\n"
+      "s(1).\ne(2).\ne(x) :- s(x).\nn(x, x) :- e(x).\n",
+      "n", { { 1, 1 }, { 2, 2 }, { 7, 7 }, { 8, 8 }, { 9, 9 } }, 5 },
 };
 
 /* Remove e(7) with the plain, callback-free removal. */
@@ -177,6 +186,21 @@ add(wl_session_t *s, const case_t *c, int64_t v, bool incremental)
 }
 
 static char message[256];
+
+/* Require the insert route to have been taken since @before as often as
+ * @c's route field says: once, or not at all. */
+static const char *
+expect_route(const case_t *c, uint32_t before, const char *when)
+{
+    uint32_t taken = wl_columnar_session_test_insert_route_taken - before;
+    uint32_t want = c->route ? 1u : 0u;
+
+    if (taken == want)
+        return NULL;
+    snprintf(message, sizeof(message), "%s: insert route taken %u times, "
+        "want %u", when, taken, want);
+    return message;
+}
 
 /* Snapshot and require exactly the case's rows, each once. */
 static const char *
@@ -220,6 +244,7 @@ run_case(const case_t *c, uint32_t workers)
     wl_plan_t *plan = NULL;
     wl_session_t *s = NULL;
     const char *why = NULL;
+    uint32_t route0;
 
     tests_run++;
     printf("  [%d] %s (%u worker%s)", tests_run, c->name, workers,
@@ -254,6 +279,7 @@ run_case(const case_t *c, uint32_t workers)
         why = "remove";
         goto done;
     }
+    route0 = wl_columnar_session_test_insert_route_taken;
     if (add(s, c, 9, true) != 0) {
         why = "incremental insert";
         goto done;
@@ -262,9 +288,12 @@ run_case(const case_t *c, uint32_t workers)
         why = "remove";
         goto done;
     }
-    if ((why = expect(s, c, "first snapshot")) != NULL)
+    if ((why = expect(s, c, "first snapshot")) != NULL
+        || (why = expect_route(c, route0, "first snapshot")) != NULL)
         goto done;
-    why = expect(s, c, "second snapshot");
+    if ((why = expect(s, c, "second snapshot")) != NULL)
+        goto done;
+    why = expect_route(c, route0, "second snapshot");
 done:
     if (s)
         wl_session_destroy(s);

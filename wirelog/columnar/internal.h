@@ -3515,6 +3515,8 @@ session_remove_rel(wl_col_session_t *sess, const char *name);
 #ifdef WL_SESSION_TEST_HOOKS
 int wl_columnar_session_test_register_retraction(wl_col_session_t *sess,
     col_rel_t *relation, bool publish);
+/* Calls of session_snapshot_insert() that returned 0 (Issue #2119). */
+extern uint32_t wl_columnar_session_test_insert_route_taken;
 #endif
 
 /* ======================================================================== */
