@@ -399,11 +399,11 @@ def main() -> int:
         # The attribution check, read column: a function that exists, is
         # uniquely defined, and never touches the field beside it.
         row_edit("a real function that never reads the field fails",
-                 "| `col_eval_stratum_tdd_recursive`, `col_session_set_delta_cb`,"
+                 "| `col_eval_stratum_tdd_recursive`,"
                  " `col_session_snapshot_impl`, `col_session_step_impl`,"
                  " `session_note_inserted_input`, `session_snapshot_insert` |",
                  "| `arr_build_full`, `col_eval_stratum_tdd_recursive`,"
-                 " `col_session_set_delta_cb`, `col_session_snapshot_impl`,"
+                 " `col_session_snapshot_impl`,"
                  " `col_session_step_impl`, `session_note_inserted_input`,"
                  " `session_snapshot_insert` |")
 
@@ -411,9 +411,9 @@ def main() -> int:
         # `return True` at this level either.
         row_edit("a real function that never writes the field fails",
                  "| `col_session_insert`, `col_session_remove`,"
-                 " `col_session_set_delta_cb`, `col_session_snapshot_impl`,",
+                 " `col_session_snapshot_impl`,",
                  "| `arr_build_full`, `col_session_insert`,"
-                 " `col_session_remove`, `col_session_set_delta_cb`,"
+                 " `col_session_remove`,"
                  " `col_session_snapshot_impl`,")
 
         # The qualifier on `col_rel_t::base_nrows` is load-bearing:
@@ -441,7 +441,7 @@ def main() -> int:
         # And emptying a column outright must fail, not pass with less to check.
         row_edit("an emptied column fails",
                  "| `col_session_insert`, `col_session_remove`,"
-                 " `col_session_set_delta_cb`, `col_session_snapshot_impl`,"
+                 " `col_session_snapshot_impl`,"
                  " `col_session_step_impl`, `session_note_inserted_input` |",
                  "| — |")
 
@@ -507,10 +507,10 @@ def main() -> int:
         # Dropping a reader must fail for the same reason dropping a writer
         # does; the read direction was implemented but unasserted.
         row_edit("a dropped reader fails",
-                 "| `col_eval_stratum_tdd_recursive`, `col_session_set_delta_cb`,"
+                 "| `col_eval_stratum_tdd_recursive`,"
                  " `col_session_snapshot_impl`, `col_session_step_impl`,"
                  " `session_note_inserted_input`, `session_snapshot_insert` |",
-                 "| `col_eval_stratum_tdd_recursive`, `col_session_set_delta_cb`,"
+                 "| `col_eval_stratum_tdd_recursive`,"
                  " `col_session_snapshot_impl`, `col_session_step_impl`,"
                  " `session_note_inserted_input` |")
 

@@ -824,8 +824,12 @@ incremental insert reached on top of the rows the last one had left, reading
 the seeded delta in every iteration. That route lost rows and is gone. After
 an incremental insert, `session_snapshot_insert` now brings the reached strata
 up to date with occurrence-bound instances
-(`wl_columnar_eval_tdd_insert_stratum`) and registers no `$d$` relation; any
-other evaluation clears the derived rows and evaluates every stratum in full.
+(`wl_columnar_eval_tdd_insert_stratum`) and registers no `$d$` relation,
+whether or not a delta callback is installed (#2121); any other evaluation
+clears the derived rows and evaluates every stratum in full. A snapshot fires
+no delta events on either route, including when it first drains a refused
+plain step, which resumes without the delta observer; and a later step does
+not report the rows the snapshot derived.
 A stop between those heads' update and the bookkeeping leaves
 `last_inserted_relation`, `pending_input_change` and every `base_nrows` as
 they were, so a retry runs the insert route again from the same appended rows
@@ -847,10 +851,10 @@ call.
 
 | field | written by | read by | verdict |
 |---|---|---|---|
-| `last_inserted_relation` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create`, `session_note_inserted_input` | `col_eval_stratum_tdd_recursive`, `col_session_set_delta_cb`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `session_snapshot_insert` | PRESERVE |
+| `last_inserted_relation` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create`, `session_note_inserted_input` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `session_snapshot_insert` | PRESERVE |
 | `pending_input_change` | `col_session_create_internal`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
-| `pending_full_input_eval` | `col_session_insert`, `col_session_remove`, `col_session_set_delta_cb`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
-| `has_evaluated` | `col_session_snapshot_impl`, `col_session_step_impl` | `col_eval_stratum_tdd_recursive`, `col_session_set_delta_cb`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
+| `pending_full_input_eval` | `col_session_insert`, `col_session_remove`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
+| `has_evaluated` | `col_session_snapshot_impl`, `col_session_step_impl` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
 | `snapshot_stable_valid` | `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl` | PRESERVE |
 | `delta_seeded` | `tdd_worker_subpass_fn`, `wl_columnar_eval_tdd_insert_stratum` | `col_op_variable`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert` | PRESERVE |
 | `last_removed_relation` | `col_session_remove_incremental`, `col_worker_session_create`, `session_retraction_cleanup` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |

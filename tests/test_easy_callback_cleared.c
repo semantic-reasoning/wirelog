@@ -7,18 +7,21 @@
  *
  * With a delta callback installed, inserts and removals are staged for an
  * incremental evaluation.  A snapshot taken with the callback installed
- * re-evaluates in full, because its incremental route does not promise the
- * complete model.  Clearing the callback before that snapshot sent it down
- * the incremental route anyway: it ignored a staged removal, so `r(8)`
+ * re-evaluated in full, because its incremental route then did not promise
+ * the complete model.  Clearing the callback before that snapshot sent it
+ * down the incremental route anyway: it ignored a staged removal, so `r(8)`
  * survived it, and the strata below the inserted relation emitted their
- * earlier rows again, so `n(7,1)` appeared twice.
+ * earlier rows again, so `n(7,1)` appeared twice.  Since #2114 that route
+ * is the insert route, and a staged removal makes a snapshot evaluate in
+ * full whether or not a callback is installed (#2121).
  *
  * Each case stages changes with a callback installed, clears it, and
  * requires the same model from the next snapshots as a session that never
  * had a callback, after a load read by a snapshot or by a step, in a
- * session opened with one worker and with four.  Only the load can use
- * the four workers: the full re-evaluation after the callback is cleared
- * runs serially.
+ * session opened with one worker and with four.  Only the load uses the
+ * four workers: the snapshots after the callback is cleared evaluate on
+ * one thread here, because a snapshot partitions only its first
+ * evaluation and the insert route runs serially.
  */
 
 #ifndef _POSIX_C_SOURCE
