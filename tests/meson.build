@@ -3240,6 +3240,23 @@ test_tdd_insert_stratum_exe = executable(
 
 test('tdd_insert_stratum', test_tdd_insert_stratum_exe)
 
+test_tdd_insert_oracle_exe = executable(
+  'test_tdd_insert_oracle',
+  files('test_tdd_insert_oracle.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+
+# 166 runs, each creating its own sessions.  Measured on the dev host at
+# 2.1s run directly and 21s under `meson test` (35s with address,undefined):
+# MALLOC_PERTURB_, which meson sets, makes glibc scrub every session's
+# arenas.  Take an explicit override, as the other allocation-heavy cases
+# here do, rather than the 30s default.
+test('tdd_insert_oracle', test_tdd_insert_oracle_exe,
+     env: ['WIRELOG_TEST_BENCH_DIR=' + meson.project_source_root() / 'bench'],
+     timeout: 120)
+
 bench_incremental_frontier_exe = executable(
   'bench_incremental_frontier',
   files('bench_incremental_frontier.c'),
