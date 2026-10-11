@@ -4106,10 +4106,21 @@ typedef struct {
 } wl_columnar_consolidate_record_t;
 /* Suffix radix retires completely before row/compaction preparation. Lane
  * readiness remains outside every overwritten original token byte. */
+typedef struct wl_columnar_eval_serial_aggregate_scratch {
+    wl_columnar_memory_reservation_t admission;
+    void *groups;
+    col_rel_t *relation;
+    const wl_plan_agg_spec_t *spec;
+    uint64_t bytes;
+    uint32_t map_cap, old_nrows, output_rows, row;
+    bool admission_active, changed, metadata_set, finalized;
+    bool dedup_disposed, ready;
+} wl_columnar_eval_serial_aggregate_scratch_t;
 typedef struct wl_columnar_merge_incremental_scratch {
     union {
         wl_columnar_relation_radix_sequence_t sort;
         wl_columnar_relation_terminal_sequence_t terminal;
+        wl_columnar_eval_serial_aggregate_scratch_t aggregate;
         struct {
             col_row_buf_t row;
             int64_t *compacted;
@@ -4122,6 +4133,18 @@ typedef struct wl_columnar_merge_incremental_scratch {
     uint8_t lane;
     bool ready;
 } wl_columnar_merge_incremental_scratch_t;
+int wl_columnar_eval_serial_aggregate_retire(
+    wl_columnar_merge_incremental_authority_t *,
+    wl_columnar_eval_serial_aggregate_scratch_t *, int);
+#ifdef WL_SESSION_TEST_HOOKS
+const wl_columnar_eval_serial_aggregate_scratch_t *
+wl_columnar_eval_stack_test_aggregate_scratch(wl_col_session_t *);
+#endif
+int wl_columnar_eval_serial_canonicalize_aggregate_controlled(col_rel_t *,
+    const wl_plan_agg_spec_t *, wl_col_session_t *, wl_evaluation_control_t *);
+int wl_columnar_eval_dedup_retire_checked(col_rel_t *, bool *, int);
+int wl_columnar_ops_reduce_better(wirelog_agg_fn_t, wl_plan_agg_operand_t,
+    const wl_intern_t *, int64_t, int64_t, bool *, wl_evaluation_control_t *);
 /* Phase-exclusive promotion bookkeeping. Actual writer/lease authority stays
  * in the original incremental region and descriptor credit in original BULK;
  * these pointers and dispositions never contain copied tokens. */

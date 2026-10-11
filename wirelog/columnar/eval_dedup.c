@@ -107,6 +107,37 @@ wl_columnar_eval_dedup_set_clear(col_rel_t *r)
     r->dedup_reserved_bytes = 0;
 }
 
+/* Mandatory retirement of the original table. The physical disposition is
+ * durable even when the original accounting authority refuses retirement. */
+int
+wl_columnar_eval_dedup_retire_checked(col_rel_t *r, bool *disposed, int primary)
+{
+    if (!r || !disposed)
+        return primary > 0 ? primary : EINVAL;
+    if (!*disposed) {
+        free(r->dedup_slots);
+        r->dedup_slots = NULL;
+        r->dedup_cap = 0;
+        r->dedup_count = 0;
+        *disposed = true;
+    }
+    if (r->dedup_reserved_bytes) {
+        wl_columnar_memory_reservation_t *token = &r->dedup_reservation;
+        if (!r->memory_governor || token->identity != (uintptr_t)token
+            || token->bytes != r->dedup_reserved_bytes
+            || token->governor != wl_columnar_memory_governor_ref_get(
+                r->memory_governor)
+            || atomic_load_explicit(&token->state, memory_order_acquire)
+            != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+            || atomic_load_explicit(&token->owner_bits, memory_order_acquire)
+            != (uintptr_t)r
+            || !wl_columnar_memory_release(token))
+            return primary > 0 ? primary : EBUSY;
+        r->dedup_reserved_bytes = 0;
+    }
+    return primary;
+}
+
 static int
 wl_dedup_admission_rc(col_rel_t *r,
     wl_columnar_memory_admission_status_t status)

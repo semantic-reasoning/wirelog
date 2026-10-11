@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **376**). The earlier audit sections
+match the script's count (currently **382**). The earlier audit sections
 retain their historical per-section counts.
 
 Format: `file:function[#N]` | field | operation | order | justification.
@@ -1732,3 +1732,14 @@ held authority; the two relaxed gauge reads observe serialized sampling state.
 | `session.c:wl_columnar_session_mem_sample_controlled` | `sess->mem_ledger.subsys_bytes[WL_MEM_SUBSYS_STORED]` | `atomic_load_explicit` | `relaxed` | Actual cache transaction/promotion forward+reverse original credit snapshots acquire, checked removal credit acquire, read-only sampling pin observations relaxed under serialized ownership. |
 | `session.c:wl_columnar_session_mem_sample_controlled#2` | `sess->mem_ledger.subsys_bytes[WL_MEM_SUBSYS_TEMPORARY]` | `atomic_load_explicit` | `relaxed` | Actual cache transaction/promotion forward+reverse original credit snapshots acquire, checked removal credit acquire, read-only sampling pin observations relaxed under serialized ownership. |
 | `session_hash.c:wl_columnar_session_hash_retire_checked` | `token->state` | `atomic_load_explicit` | `acquire` | Actual original hash state acquire AFTER physicalarrayNULL, before real rollback/release; refused identity retains pending credit. |
+
+### 5.25 Ordinary recursive final aggregate original credits (6 rows)
+
+| Anchor (file:function[#N]) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `eval_dedup.c:wl_columnar_eval_dedup_retire_checked` | `token->state` | `atomic_load_explicit` | acquire | Validate original COMMITTED credit after physical dedup retirement; refusal retains credit and writer. |
+| `eval_dedup.c:wl_columnar_eval_dedup_retire_checked#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Confirm original relation ownership before checked credit release. |
+| `eval_serial.c:wl_columnar_eval_serial_aggregate_retire` | `token->state` | `atomic_load_explicit` | acquire | Validate original RESERVED group credit after physical groups free and NULL. |
+| `eval_serial.c:wl_columnar_eval_serial_canonicalize_aggregate_controlled` | `dedup->state` | `atomic_load_explicit` | acquire | Validate original dedup reservation readiness before canonical mutation. |
+| `eval_serial.c:wl_columnar_eval_serial_canonicalize_aggregate_controlled#2` | `dedup->owner_bits` | `atomic_load_explicit` | acquire | Confirm original dedup relation owner before mutation. |
+| `eval_serial.c:wl_columnar_eval_serial_canonicalize_aggregate_controlled#3` | `record->admission.state` | `atomic_load_explicit` | acquire | Journal actual original group reservation disposition after partial controlled admission. |

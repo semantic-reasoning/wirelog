@@ -785,6 +785,54 @@ col_group_hash(const col_rel_t *rel, uint32_t row, uint32_t group_by_count,
     return hash ? hash : 1;
 }
 
+int
+wl_columnar_eval_serial_aggregate_retire(
+    wl_columnar_merge_incremental_authority_t *authority,
+    wl_columnar_eval_serial_aggregate_scratch_t *record, int primary)
+{
+    if (!record || !record->ready)
+        return primary > 0 ? primary : EINVAL;
+    col_rel_t *rel = record->relation;
+    if (record->changed && !record->metadata_set) {
+        int cleanup = authority && authority->active
+            && authority->source == rel
+            ? col_rel_mutation_lease_validate(&authority->leases[0], rel)
+            : EINVAL;
+        if (cleanup) return primary > 0 ? primary : cleanup;
+        if (rel->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
+            return primary > 0 ? primary : EOVERFLOW;
+        if (record->finalized) rel->nrows = record->output_rows;
+        rel->sorted_nrows = record->finalized ? record->output_rows : 0;
+        rel->base_nrows = record->finalized ? record->output_rows : 0;
+        rel->run_count = 0;
+        memset(rel->run_ends, 0, sizeof(rel->run_ends));
+        wl_columnar_relation_touch_view(rel);
+        authority->set.published = true;
+        record->metadata_set = true;
+    }
+    if (record->changed) {
+        int cleanup = wl_columnar_eval_dedup_retire_checked(rel,
+                &record->dedup_disposed, primary);
+        if (rel->dedup_reserved_bytes) return cleanup;
+        if (cleanup > 0 && primary <= 0) return cleanup;
+    }
+    free(record->groups);
+    record->groups = NULL;
+    if (record->admission_active) {
+        wl_columnar_memory_reservation_t *token = &record->admission;
+        if (!rel || !rel->memory_governor || token->identity != token
+            || token->bytes != record->bytes
+            || token->governor != wl_columnar_memory_governor_ref_get(
+                rel->memory_governor)
+            || atomic_load_explicit(&token->state, memory_order_acquire)
+            != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+            || !wl_columnar_memory_rollback(token))
+            return primary > 0 ? primary : EBUSY;
+        record->admission_active = false;
+    }
+    return primary;
+}
+
 static int
 wl_columnar_eval_serial_canonicalize_aggregate_locked(col_rel_t *rel,
     const wl_plan_agg_spec_t *spec, const wl_intern_t *intern)
@@ -917,6 +965,278 @@ wl_columnar_eval_serial_canonicalize_aggregate(col_rel_t *rel,
     return rc != 0 ? rc : release_rc;
 }
 
+int
+wl_columnar_eval_serial_canonicalize_aggregate_controlled(col_rel_t *rel,
+    const wl_plan_agg_spec_t *spec, wl_col_session_t *sess,
+    wl_evaluation_control_t *control)
+{
+    if (!sess || !control) return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 16);
+    if (rc) return rc;
+    if (!rel || !spec || !spec->has_spec)
+        return wl_evaluation_control_charge(control, 0);
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) return rc;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    wl_columnar_merge_incremental_authority_t *authority = NULL;
+    wl_columnar_merge_incremental_scratch_t *scratch = NULL;
+    rc = wl_columnar_eval_stack_cleanup_acquire(sess, &frame, control);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_cleanup_incremental_owner(sess, frame,
+            &authority, &scratch, control);
+    if (rc) goto done;
+    rc = wl_columnar_relation_incremental_acquire(authority, rel, NULL,
+            control);
+    if (rc) goto done;
+    rc = wl_evaluation_control_charge(control, 32);
+    if (rc) goto done;
+    if (authority->leases[0].owner != rel
+        || col_rel_storage_alias_borrow_count(rel)) {
+        rc = EBUSY; goto done;
+    }
+    if (rel->nrows < 2) goto done;
+    uint32_t gc = spec->group_by_count;
+    uint32_t aggregate = spec->aggregate_index < rel->ncols
+        ? spec->aggregate_index : gc;
+    if (rel->ncols <= gc || rel->nrows > rel->capacity
+        || !rel->columns || (rel->timestamps
+        && rel->timestamp_capacity < rel->nrows)) {
+        rc = EINVAL; goto done;
+    }
+    if (spec->fn != WIRELOG_AGG_MIN && spec->fn != WIRELOG_AGG_MAX) {
+        rc = ENOTSUP; goto done;
+    }
+    if (rel->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u) {
+        rc = EOVERFLOW; goto done;
+    }
+    if ((!rel->dedup_cap && (rel->dedup_slots || rel->dedup_count))
+        || (rel->dedup_cap && (!rel->dedup_slots
+        || (rel->dedup_cap & (rel->dedup_cap - 1u))))
+        || rel->dedup_count > rel->dedup_cap) {
+        rc = EINVAL; goto done;
+    }
+    wl_columnar_memory_reservation_t *dedup = &rel->dedup_reservation;
+    uint64_t dedup_state = atomic_load_explicit(&dedup->state,
+            memory_order_acquire);
+    if (rel->dedup_reserved_bytes) {
+        if (!rel->memory_governor || dedup->identity != dedup
+            || rel->dedup_reserved_bytes
+            != (uint64_t)rel->dedup_cap * sizeof(uint64_t)
+            || dedup->bytes != rel->dedup_reserved_bytes
+            || dedup->governor != wl_columnar_memory_governor_ref_get(
+                rel->memory_governor)
+            || dedup_state != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+            || atomic_load_explicit(&dedup->owner_bits, memory_order_acquire)
+            != (uintptr_t)rel) {
+            rc = EBUSY; goto done;
+        }
+    } else if ((rel->dedup_cap && rel->memory_governor)
+        || (dedup_state != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+        && dedup_state != WL_COLUMNAR_MEMORY_RESERVATION_RELEASED)) {
+        rc = EBUSY; goto done;
+    }
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto done;
+    for (uint32_t c = 0; c < rel->ncols; c++) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc) goto done;
+        if (!rel->columns[c]) {
+            rc = EINVAL; goto done;
+        }
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto done;
+    }
+    /* The old scratch is inert; lane2 remains safe throughout partial clear. */
+    scratch->lane = 2;
+    for (size_t at = 0; at < sizeof(scratch->aggregate);) {
+        size_t n = sizeof(scratch->aggregate) - at;
+        if (n > 128) n = 128;
+        rc = wl_evaluation_control_charge(control, n);
+        if (rc) goto done;
+        memset((char *)&scratch->aggregate + at, 0, n);
+        at += n;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto done;
+    }
+    rc = wl_evaluation_control_charge(control, 96);
+    if (rc) goto done;
+    wl_columnar_eval_serial_aggregate_scratch_t *record = &scratch->aggregate;
+    wl_columnar_memory_reservation_init(&record->admission);
+    record->relation = rel;
+    record->spec = spec;
+    record->old_nrows = rel->nrows;
+    record->ready = true;
+    scratch->lane = 5;
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto done;
+    record->map_cap = 1;
+    uint64_t desired = (uint64_t)rel->nrows * 2u;
+    while ((uint64_t)record->map_cap < desired) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc) goto done;
+        if (record->map_cap > UINT32_MAX / 2u) {
+            rc = ENOMEM; goto done;
+        }
+        record->map_cap <<= 1;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto done;
+    }
+    rc = wl_evaluation_control_charge(control, 8);
+    if (rc) goto done;
+    if (!wl_columnar_memory_size_mul(record->map_cap,
+        sizeof(col_group_slot_t), &record->bytes)) {
+        rc = EOVERFLOW; goto done;
+    }
+    if (record->bytes > SIZE_MAX) {
+        rc = ENOMEM; goto done;
+    }
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto done;
+    if (rel->memory_governor) {
+        wl_columnar_memory_admission_status_t status;
+        rc = wl_columnar_memory_governor_reserve_checked_controlled(
+            wl_columnar_memory_governor_ref_get(rel->memory_governor),
+            record->bytes, &record->admission, &status, control);
+        uint64_t state = atomic_load_explicit(&record->admission.state,
+                memory_order_acquire);
+        record->admission_active = record->admission.governor != NULL
+            && state != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+            && state != WL_COLUMNAR_MEMORY_RESERVATION_RELEASED;
+        if (rc) goto done;
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            rc = status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : ENOMEM;
+            if (rc == ENOSPC) sess->memory_budget_denied = true;
+            goto done;
+        }
+    }
+    rc = wl_evaluation_control_charge(control, 1);
+    if (rc) goto done;
+    record->groups = malloc((size_t)record->bytes);
+    if (!record->groups) {
+        rc = ENOMEM; goto done;
+    }
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto done;
+    for (size_t at = 0; at < (size_t)record->bytes;) {
+        size_t n = (size_t)record->bytes - at;
+        if (n > 128) n = 128;
+        rc = wl_evaluation_control_charge(control, n);
+        if (rc) goto done;
+        memset((char *)record->groups + at, 0, n);
+        at += n;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto done;
+    }
+    col_group_slot_t *groups = record->groups;
+    uint32_t mask = record->map_cap - 1;
+    uint64_t hashed = 0, probed = 0, winners = 0, copied = 0;
+    for (; record->row < record->old_nrows; record->row++) {
+        uint32_t row = record->row, found = UINT32_MAX;
+        uint64_t hash = UINT64_C(1469598103934665603);
+        rc = wl_evaluation_control_charge(control, 8);
+        if (rc) goto done;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto done;
+        for (uint32_t c = 0; c < gc; c++) {
+            rc = wl_evaluation_control_charge(control, 8);
+            if (rc) goto done;
+            uint32_t col = c >= aggregate ? c + 1 : c;
+            hash ^= (uint64_t)rel->columns[col][row];
+            hash *= UINT64_C(1099511628211);
+            wl_columnar_relation_consolidate_checkpoint(control, 140,
+                ++hashed, NULL, rel);
+            rc = wl_evaluation_control_charge(control, 0);
+            if (rc) goto done;
+        }
+        if (!hash) hash = 1;
+        uint32_t slot = (uint32_t)hash & mask;
+        for (;;) {
+            rc = wl_evaluation_control_charge(control, 8);
+            if (rc) goto done;
+            bool occupied = groups[slot].hash != 0;
+            uint32_t keep = groups[slot].row;
+            bool equal = occupied && groups[slot].hash == hash;
+            wl_columnar_relation_consolidate_checkpoint(control, 141,
+                ++probed, NULL, rel);
+            rc = wl_evaluation_control_charge(control, 0);
+            if (rc) goto done;
+            if (!occupied) break;
+            for (uint32_t c = 0; equal && c < gc; c++) {
+                rc = wl_evaluation_control_charge(control, 8);
+                if (rc) goto done;
+                uint32_t col = c >= aggregate ? c + 1 : c;
+                equal = rel->columns[col][keep] == rel->columns[col][row];
+                rc = wl_evaluation_control_charge(control, 0);
+                if (rc) goto done;
+            }
+            if (equal) {
+                found = keep; break;
+            }
+            slot = (slot + 1) & mask;
+        }
+        if (found != UINT32_MAX) {
+            bool better = false;
+            rc = wl_columnar_ops_reduce_better(spec->fn, spec->operand_type,
+                    sess->intern, rel->columns[aggregate][row],
+                    rel->columns[aggregate][found], &better, control);
+            if (rc) goto done;
+            if (better) {
+                rc = wl_evaluation_control_charge(control, 16);
+                if (rc) goto done;
+                record->changed = true;
+                rel->columns[aggregate][found] = rel->columns[aggregate][row];
+                if (rel->timestamps)
+                    rel->timestamps[found] = rel->timestamps[row];
+                wl_columnar_relation_consolidate_checkpoint(control, 142,
+                    ++winners, NULL, rel);
+                rc = wl_evaluation_control_charge(control, 0);
+                if (rc) goto done;
+            }
+            continue;
+        }
+        if (record->output_rows != row) {
+            for (uint32_t c = 0; c < rel->ncols; c++) {
+                rc = wl_evaluation_control_charge(control, 8);
+                if (rc) goto done;
+                record->changed = true;
+                rel->columns[c][record->output_rows] = rel->columns[c][row];
+                wl_columnar_relation_consolidate_checkpoint(control, 143,
+                    ++copied, NULL, rel);
+                rc = wl_evaluation_control_charge(control, 0);
+                if (rc) goto done;
+            }
+            if (rel->timestamps) {
+                rc = wl_evaluation_control_charge(control, 8);
+                if (rc) goto done;
+                record->changed = true;
+                rel->timestamps[record->output_rows] = rel->timestamps[row];
+                rc = wl_evaluation_control_charge(control, 0);
+                if (rc) goto done;
+            }
+        }
+        rc = wl_evaluation_control_charge(control, 8);
+        if (rc) goto done;
+        groups[slot].hash = hash;
+        groups[slot].row = record->output_rows++;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto done;
+    }
+    rc = wl_evaluation_control_charge(control, 32);
+    if (rc) goto done;
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto done;
+    record->changed |= record->output_rows != record->old_nrows;
+    record->finalized = true;
+done:
+    {
+        int cleanup = wl_columnar_eval_stack_cleanup_finish(&frame);
+        return cleanup && rc <= 0 ? cleanup : rc;
+    }
+}
+
 #ifdef WL_SESSION_TEST_HOOKS
 void (*wl_columnar_eval_serial_test_before_aggregate)(wl_col_session_t *,
     col_rel_t *);
@@ -926,6 +1246,34 @@ int
 wl_columnar_eval_serial_canonicalize_aggregates(const wl_plan_stratum_t *sp,
     wl_col_session_t *sess)
 {
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    if (control) {
+        for (uint32_t i = 0; i < sp->relation_count; i++) {
+            int rc = wl_evaluation_control_charge(control, 16);
+            if (rc) return rc;
+            const wl_plan_relation_t *rp = &sp->relations[i];
+            bool selected = rp->recursive_agg.has_spec;
+            rc = wl_evaluation_control_charge(control, 0);
+            if (rc) return rc;
+            if (!selected) continue;
+            col_rel_t *rel = NULL;
+            rc = wl_columnar_join_controlled_lookup(sess, rp->name, &rel,
+                    control);
+            if (rc) return rc;
+#ifdef WL_SESSION_TEST_HOOKS
+            if (wl_columnar_eval_serial_test_before_aggregate)
+                wl_columnar_eval_serial_test_before_aggregate(sess, rel);
+#endif
+            rc = wl_columnar_eval_serial_canonicalize_aggregate_controlled(
+                rel, &rp->recursive_agg, sess, control);
+            if (rc) return rc;
+            uint32_t family = 0, cursor = 0;
+            rc = wl_columnar_arrangement_invalidate_controlled(sess,
+                    rp->name, &family, &cursor, control);
+            if (rc) return rc;
+        }
+        return 0;
+    }
     /*
      * Reading the recorded specification rather than looking for a REDUCE in
      * rp->ops is the whole of #975: rewrite_multiway_delta() replaces a fused
@@ -1464,6 +1812,8 @@ wl_columnar_eval_serial_recursive_controlled(const wl_plan_stratum_t *sp,
         if (!ran || next_outer) continue;
         if (!any_outer) converged = true;
     }
+    rc = wl_columnar_eval_serial_canonicalize_aggregates(sp, sess);
+    if (rc) goto fail;
     for (uint32_t i = 0; i < sp->relation_count; i++) {
         rc = wl_evaluation_control_charge(control, 32); if (rc) goto fail;
         if (record->rule_id_base <= UINT32_MAX - i

@@ -7,6 +7,8 @@
 #include "../wirelog/passes/sip.h"
 #include "../wirelog/wirelog.h"
 #include <stdio.h>
+extern void (*wl_columnar_eval_serial_test_before_aggregate)(
+    wl_col_session_t *, col_rel_t *);
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, \
                                       __LINE__, #x); exit(1); } } while (0)
 
@@ -3178,6 +3180,7 @@ static void original_generated_stopped_retry(void)
             && plan->strata[0].is_recursive &&
             plan->strata[0].relation_count == 1);
         const wl_plan_relation_t *rp = &plan->strata[0].relations[0];
+
         const wl_plan_op_type_t shape[7] = {WL_PLAN_OP_VARIABLE, WL_PLAN_OP_MAP,
                                             WL_PLAN_OP_VARIABLE,
                                             WL_PLAN_OP_JOIN, WL_PLAN_OP_CONCAT,
@@ -3413,90 +3416,831 @@ static void original_empty_forced_delta(void)
     destroy(s);
 }
 
-static void original_generated_aggregate_refusal(void)
+static void original_final_aggregate(void)
 {
-    const char *text = ".decl edge(x:int32,y:int32)\n.decl L(x:int32,v:int32)\n"
+    wl_plan_t plan = {0};
+    wl_session_t *base = NULL;
+    CHECK(wl_session_create(wl_backend_columnar(), &plan, 1, &base) == 0);
+    wl_col_session_t *s = COL_SESSION(base);
+    col_rel_t *head = NULL, *raw = NULL;
+    CHECK(wl_columnar_relation_new_auto_governed("H", 3, 64, true,
+        s->memory_governor, &head) == 0);
+    CHECK(wl_columnar_relation_new_auto_governed("R", 3, 64, true,
+        s->memory_governor, &raw) == 0);
+    const int64_t rows[][3] = {{1, 8, 10}, {1, 3, 10}, {2, 5, 20},
+                               {1, 1, 10}};
+    for (uint32_t i = 0; i < 4; i++) {
+        CHECK(col_rel_append_row(head, rows[i]) == 0
+            && col_rel_append_row(raw, rows[i]) == 0);
+        head->timestamps[i].iteration = raw->timestamps[i].iteration = i + 5;
+    }
+    CHECK(session_add_rel(s, head) == 0 && session_add_rel(s, raw) == 0);
+    wl_columnar_eval_dedup_set_init_from_rel(head);
+    wl_columnar_eval_dedup_set_init_from_rel(raw);
+    CHECK(head->dedup_reserved_bytes && head->dedup_slots);
+    wl_plan_agg_spec_t spec = {.has_spec = true, .fn = WIRELOG_AGG_MIN,
+                               .operand_type = WL_PLAN_AGG_OPERAND_SCALAR,
+                               .group_by_count = 2,
+                               .aggregate_index = 1};
+    wl_plan_relation_t rp = {.name = "R", .recursive_agg = spec};
+    wl_plan_stratum_t sp = {.relation_count = 1, .relations = &rp};
+    CHECK(wl_columnar_eval_serial_canonicalize_aggregates(&sp, s) == 0);
+    wl_evaluation_control_t *c = NULL;
+    CHECK(wl_evaluation_control_create(0, &c) == 0
+        && wl_evaluation_control_attach(c, s->base.operation_admission) == 0);
+    s->base.evaluation_control = c;
+    uint64_t view = head->view_generation, storage = head->storage_generation;
+    CHECK(wl_evaluation_control_begin(c, s->base.operation_admission) == 0);
+    CHECK(wl_columnar_eval_serial_canonicalize_aggregate_controlled(head,
+        &spec, s, c) == 0);
+    CHECK(wl_evaluation_control_finish(c, s->base.operation_admission, 0, 0)
+        == 0);
+    CHECK(head->nrows == 2 && head->sorted_nrows == 2
+        && head->base_nrows == 2 && !head->run_count
+        && !head->dedup_slots && !head->dedup_reserved_bytes
+        && head->view_generation == view + 1
+        && head->storage_generation == storage
+        && !s->cleanup_pending && !s->serial_completion.frame
+        && !s->cleanup_reserved_bytes);
+    for (uint32_t i = 0; i < head->nrows; i++) {
+        for (uint32_t j = 0; j < head->ncols; j++)
+            CHECK(head->columns[j][i] == raw->columns[j][i]);
+        CHECK(head->timestamps[i].iteration == raw->timestamps[i].iteration);
+    }
+    CHECK(head->columns[0][0] == 1 && head->columns[1][0] == 1
+        && head->columns[2][0] == 10 && head->columns[0][1] == 2
+        && head->columns[1][1] == 5 && head->columns[2][1] == 20
+        && head->timestamps[0].iteration == 8);
+    destroy(s);
+}
+
+static wl_col_session_t *aggregate_session;
+static col_rel_t *aggregate_head;
+static uint64_t aggregate_before_view;
+static uint32_t aggregate_historical_rows, aggregate_timestamp_sources,
+    aggregate_join_sources;
+static int aggregate_stop_stage;
+static bool aggregate_stop_reached;
+static void aggregate_before(wl_col_session_t *s, col_rel_t *r)
+{
+    if (s != aggregate_session) return;
+    CHECK(r && r->ncols == 2 && strcmp(r->name, "L") == 0);
+    aggregate_head = r;
+    aggregate_before_view = r->view_generation;
+    aggregate_historical_rows = r->nrows;
+}
+static void aggregate_reduce_source(wl_evaluation_control_t *c, int stage,
+    uint64_t progress, wl_columnar_relation_private_batch_t *record,
+    col_rel_t *source)
+{
+    (void)progress; (void)record;
+    if (!aggregate_session || c != aggregate_session->base.evaluation_control
+        || stage != 2 || !source) return;
+    if (source->name && !strcmp(source->name, "$join")) {
+        CHECK(!source->timestamps && atomic_load_explicit(
+                &source->descriptor_access.state, memory_order_acquire) > 0);
+        aggregate_join_sources++;
+    }
+    if (!source->timestamps) return;
+    CHECK(source->timestamp_capacity >= source->nrows
+        && atomic_load_explicit(&source->descriptor_access.state,
+        memory_order_acquire) > 0);
+    aggregate_timestamp_sources++;
+}
+static void aggregate_partial_stop(wl_evaluation_control_t *c, int stage,
+    uint64_t progress, wl_columnar_consolidate_record_t *record,
+    col_rel_t *source)
+{
+    if (!aggregate_session || source != aggregate_head
+        || stage != aggregate_stop_stage || progress != 1) return;
+    CHECK(c == aggregate_session->base.evaluation_control && !record
+        && !aggregate_stop_reached && source->view_generation
+        == aggregate_before_view
+        && atomic_load_explicit(&source->descriptor_access.state,
+        memory_order_acquire) == WL_COLUMNAR_SOURCE_ACCESS_WRITER);
+    aggregate_stop_reached = true;
+    wl_evaluation_control_request_cancel(c);
+}
+static void aggregate_capture(const char *name, const int64_t *row,
+    uint32_t width, void *data)
+{
+    wl_recursive_capture_t *out = data;
+    CHECK(name && strcmp(name, "L") == 0 && row && width == 2);
+    for (uint32_t i = 0; i < width; i++)
+        out->digest = out->digest * UINT64_C(1099511628211) ^ (uint64_t)row[i];
+    out->count++;
+}
+
+static void original_generated_aggregate_variable(void)
+{
+    const char *text = ".decl E(x:int32,v:int32)\n.decl L(x:int32,v:int32)\n"
+        "L(x,min(v)):-E(x,v).\nL(x,min(v)):-L(x,v).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(text, &error);
+    CHECK(program && error == WIRELOG_OK);
+    wl_fusion_apply(program, NULL); wl_jpp_apply(program, NULL);
+    wl_sip_apply(program, NULL);
+    wl_plan_t *plan = NULL;
+    CHECK(wl_plan_from_program(program, &plan) == 0
+        && plan->stratum_count == 1 && plan->strata[0].is_recursive
+        && plan->strata[0].relation_count == 1);
+    const wl_plan_relation_t *rp = &plan->strata[0].relations[0];
+    const wl_plan_op_type_t shape[] = {WL_PLAN_OP_VARIABLE, WL_PLAN_OP_REDUCE,
+                                       WL_PLAN_OP_VARIABLE, WL_PLAN_OP_REDUCE,
+                                       WL_PLAN_OP_CONCAT,
+                                       WL_PLAN_OP_CONSOLIDATE};
+    if (rp->op_count != 6) {
+        fprintf(stderr, "aggregate self MIN actual ops=%u\n", rp->op_count);
+        for (uint32_t i = 0; i < rp->op_count; i++)
+            fprintf(stderr, "aggregate self opcode%u=%u\n", i, rp->ops[i].op);
+    }
+    CHECK(rp->recursive_agg.has_spec && rp->op_count == 6);
+    for (uint32_t i = 0; i < rp->op_count; i++)
+        CHECK(rp->ops[i].op == shape[i] &&
+            rp->ops[i].delta_mode == WL_DELTA_AUTO);
+    wl_session_t *base = NULL, *raw_base = NULL;
+    CHECK(wl_session_create(wl_backend_columnar(), plan, 1, &base) == 0
+        && wl_session_create(wl_backend_columnar(), plan, 1, &raw_base) == 0);
+    wl_col_session_t *s = COL_SESSION(base), *raw = COL_SESSION(raw_base);
+    int64_t values[] = {1, 8, 1, 3, 2, 5};
+    CHECK(wl_backend_columnar()->session_insert(base, "E", values, 3, 2) == 0
+        && wl_backend_columnar()->session_insert(raw_base, "E", values, 3,
+        2) == 0);
+    wl_evaluation_control_t *c = NULL;
+    CHECK(wl_evaluation_control_create(0, &c) == 0
+        && wl_evaluation_control_attach(c, s->base.operation_admission) == 0);
+    s->base.evaluation_control = c;
+    CHECK(!wl_columnar_ops_reduce_test_checkpoint);
+    aggregate_session = s; aggregate_timestamp_sources = 0;
+    wl_columnar_ops_reduce_test_checkpoint = aggregate_reduce_source;
+    CHECK(wl_backend_columnar()->session_step(base) == 0
+        && aggregate_timestamp_sources > 0);
+    wl_columnar_ops_reduce_test_checkpoint = NULL; aggregate_session = NULL;
+    CHECK(wl_backend_columnar()->session_step(raw_base) == 0);
+    col_rel_t *head = session_find_rel(s, "L"),
+        *twin = session_find_rel(raw, "L");
+    CHECK(head && twin && head->nrows == 2 && twin->nrows == 2);
+    for (uint32_t i = 0; i < 2; i++)
+        CHECK(head->columns[0][i] == i + 1
+            && head->columns[1][i] == (i ? 5 : 3)
+            && head->columns[0][i] == twin->columns[0][i]
+            && head->columns[1][i] == twin->columns[1][i]);
+    CHECK(!s->cleanup_pending && !s->recursive.active
+        && !s->serial_completion.frame && !s->cleanup_reserved_bytes);
+    destroy(s); destroy(raw); wl_plan_free(plan); wirelog_program_free(program);
+}
+
+static void original_generated_aggregate(void)
+{
+    const char *minimum =
+        ".decl edge(x:int32,y:int32)\n.decl L(x:int32,v:int32)\n"
         "L(x,min(x)):-edge(x,y).\nL(y,min(y)):-edge(x,y).\n"
         "L(x,min(v)):-L(y,v),edge(y,x).\n";
-    for (uint32_t dirty = 0; dirty < 2; dirty++) {
-        wirelog_error_t error;
-        wirelog_program_t *program = wirelog_parse_string(text, &error);
-        CHECK(program && error == WIRELOG_OK);
-        wl_fusion_apply(program, NULL); wl_jpp_apply(program, NULL);
-        wl_sip_apply(program, NULL);
-        wl_plan_t *plan = NULL;
-        CHECK(wl_plan_from_program(program, &plan) == 0
-            && plan->stratum_count == 1 && plan->strata[0].is_recursive
-            && plan->strata[0].relation_count == 1);
-        const wl_plan_relation_t *rp = &plan->strata[0].relations[0];
-        CHECK(rp->recursive_agg.has_spec && rp->op_count == 11);
-        const wl_plan_op_type_t shape[] = {WL_PLAN_OP_VARIABLE,
-                                           WL_PLAN_OP_REDUCE,
-                                           WL_PLAN_OP_VARIABLE,
-                                           WL_PLAN_OP_REDUCE,
-                                           WL_PLAN_OP_CONCAT,
-                                           WL_PLAN_OP_VARIABLE, WL_PLAN_OP_JOIN,
-                                           WL_PLAN_OP_REDUCE, WL_PLAN_OP_CONCAT,
-                                           WL_PLAN_OP_CONSOLIDATE,
-                                           WL_PLAN_OP_EXCHANGE};
-        for (uint32_t i = 0; i < 11; i++) CHECK(rp->ops[i].op == shape[i]
-                && rp->ops[i].delta_mode == WL_DELTA_AUTO);
-        wl_session_t *base = NULL, *raw_base = NULL;
-        CHECK(wl_session_create(wl_backend_columnar(), plan, 1, &base) == 0
-            && wl_session_create(wl_backend_columnar(), plan, 1,
-            &raw_base) == 0);
-        wl_col_session_t *s = COL_SESSION(base), *raw = COL_SESSION(raw_base);
-        int64_t edges[] = {1, 2, 2, 3};
-        CHECK(wl_backend_columnar()->session_insert(base, "edge", edges, 2,
-            2) == 0
-            && wl_backend_columnar()->session_insert(raw_base, "edge", edges, 2,
-            2) == 0);
-        if (dirty) {
-            CHECK(wl_backend_columnar()->session_step(base) == 0
-                && wl_backend_columnar()->session_step(raw_base) == 0);
-            int64_t next[] = {3, 4};
-            CHECK(wl_backend_columnar()->session_insert(base, "edge", next, 1,
+    const char *maximum =
+        ".decl edge(x:int32,y:int32)\n.decl L(x:int32,v:int32)\n"
+        "L(x,max(x)):-edge(x,y).\nL(y,max(y)):-edge(x,y).\n"
+        "L(x,max(v)):-L(y,v),edge(x,y).\n";
+    for (uint32_t max = 0; max < 2; max++)
+        for (uint32_t dirty = 0; dirty < 2; dirty++) {
+            const char *text = max ? maximum : minimum;
+            wirelog_error_t error;
+            wirelog_program_t *program = wirelog_parse_string(text, &error);
+            CHECK(program && error == WIRELOG_OK);
+            wl_fusion_apply(program, NULL); wl_jpp_apply(program, NULL);
+            wl_sip_apply(program, NULL);
+            wl_plan_t *plan = NULL;
+            CHECK(wl_plan_from_program(program, &plan) == 0
+                && plan->stratum_count == 1 && plan->strata[0].is_recursive
+                && plan->strata[0].relation_count == 1);
+            const wl_plan_relation_t *rp = &plan->strata[0].relations[0];
+            if (rp->op_count != 11u) {
+                fprintf(stderr,
+                    "aggregate generated max=%u spec=%u fn=%u ops=%u\n",
+                    max, rp->recursive_agg.has_spec, rp->recursive_agg.fn,
+                    rp->op_count);
+                for (uint32_t i = 0; i < rp->op_count; i++)
+                    fprintf(stderr, "aggregate opcode%u=%u mode=%u name=%s\n",
+                        i,
+                        rp->ops[i].op, rp->ops[i].delta_mode,
+                        rp->ops[i].relation_name ? rp->ops[i].relation_name :
+                        "");
+            }
+            CHECK(rp->recursive_agg.has_spec && rp->op_count == 11u
+                && rp->recursive_agg.fn ==
+                (max ? WIRELOG_AGG_MAX : WIRELOG_AGG_MIN));
+            const wl_plan_op_type_t shape[] = {WL_PLAN_OP_VARIABLE,
+                                               WL_PLAN_OP_REDUCE,
+                                               WL_PLAN_OP_VARIABLE,
+                                               WL_PLAN_OP_REDUCE,
+                                               WL_PLAN_OP_CONCAT,
+                                               WL_PLAN_OP_VARIABLE,
+                                               WL_PLAN_OP_JOIN,
+                                               WL_PLAN_OP_REDUCE,
+                                               WL_PLAN_OP_CONCAT,
+                                               WL_PLAN_OP_CONSOLIDATE,
+                                               WL_PLAN_OP_EXCHANGE};
+            for (uint32_t i = 0; i < rp->op_count; i++) {
+                wl_plan_op_type_t expected = i < 9 ? shape[i]
+                : i == rp->op_count - 2 ? WL_PLAN_OP_CONSOLIDATE
+                : WL_PLAN_OP_EXCHANGE;
+                CHECK(rp->ops[i].op == expected
+                    && rp->ops[i].delta_mode == WL_DELTA_AUTO);
+            }
+            wl_session_t *base = NULL, *raw_base = NULL;
+            const uint64_t budget = UINT64_C(129) * 1024u * 1024u;
+            for (unsigned twin_index = 0; twin_index < 2; twin_index++) {
+                wl_columnar_memory_resolution_t resolution = {
+                    .budget_bytes = budget, .usable_bytes = budget,
+                    .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+                };
+                wl_columnar_memory_governor_ref_t *governor =
+                    wl_columnar_memory_governor_ref_create(&resolution);
+                CHECK(governor);
+                wl_session_options_t options; wl_session_options_init(&options);
+                options.memory_governor = governor;
+                CHECK(wl_session_create_with_options(wl_backend_columnar(),
+                    plan,
+                    1, &options, twin_index ? &raw_base : &base) == 0);
+                wl_columnar_memory_governor_ref_release(governor);
+            }
+            wl_col_session_t *s = COL_SESSION(base),
+                *raw = COL_SESSION(raw_base);
+            int64_t edges[] = {1, 2, 2, 3};
+            CHECK(wl_backend_columnar()->session_insert(base, "edge", edges, 2,
                 2) == 0
-                && wl_backend_columnar()->session_insert(raw_base, "edge", next,
-                1, 2) == 0);
+                && wl_backend_columnar()->session_insert(raw_base, "edge",
+                edges, 2,
+                2) == 0);
+            wl_evaluation_control_t *c = NULL;
+            CHECK(wl_evaluation_control_create(0, &c) == 0
+                && wl_evaluation_control_attach(c,
+                s->base.operation_admission) == 0);
+            s->base.evaluation_control = c;
+            if (dirty) {
+                CHECK(wl_backend_columnar()->session_step(base) == 0
+                    && wl_backend_columnar()->session_step(raw_base) == 0);
+                int64_t next[] = {3, 4};
+                CHECK(wl_backend_columnar()->session_insert(base, "edge", next,
+                    1,
+                    2) == 0
+                    && wl_backend_columnar()->session_insert(raw_base, "edge",
+                    next,
+                    1, 2) == 0);
+            }
+            aggregate_session = s;
+            aggregate_head = NULL; aggregate_historical_rows = 0;
+            aggregate_timestamp_sources = 0; aggregate_stop_reached = false;
+            aggregate_join_sources = 0;
+            aggregate_stop_stage = !max && !dirty ? 143 : max &&
+                dirty ? 142 : 0;
+            CHECK(!wl_columnar_eval_serial_test_before_aggregate
+                && !wl_columnar_consolidate_test_checkpoint
+                && !wl_columnar_ops_reduce_test_checkpoint);
+            wl_columnar_eval_serial_test_before_aggregate = aggregate_before;
+            wl_columnar_consolidate_test_checkpoint = aggregate_partial_stop;
+            wl_columnar_ops_reduce_test_checkpoint = aggregate_reduce_source;
+            wl_recursive_capture_t got = {0}, twin = {0};
+            int rc = wl_backend_columnar()->session_snapshot(base,
+                    aggregate_capture, &got);
+            if (aggregate_stop_stage) {
+                if (rc != WL_EVALUATION_CONTROL_CANCELLED ||
+                    !aggregate_stop_reached
+                    || got.count || !aggregate_head
+                    || aggregate_head->view_generation !=
+                    aggregate_before_view + 1
+                    || aggregate_head->sorted_nrows ||
+                    aggregate_head->base_nrows
+                    || s->eval_stratum_heads_final || s->cleanup_pending
+                    || s->recursive.active || s->recursive.cleanup_pending)
+                    fprintf(stderr,
+                        "aggregate stop max=%d dirty=%d rc=%d reached=%d events=%llu view=%llu/%llu sorted=%u base=%u final=%d pending=%p recursive=%d/%d\n",
+                        max, dirty, rc, aggregate_stop_reached,
+                        (unsigned long long)got.count,
+                        (unsigned long long)(aggregate_head ?
+                        aggregate_head->view_generation : 0),
+                        (unsigned long long)aggregate_before_view,
+                        aggregate_head ? aggregate_head->sorted_nrows : 0,
+                        aggregate_head ? aggregate_head->base_nrows : 0,
+                        s->eval_stratum_heads_final, (void *)s->cleanup_pending,
+                        s->recursive.active, s->recursive.cleanup_pending);
+                CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED
+                    && aggregate_stop_reached && !got.count && aggregate_head
+                    && aggregate_head->view_generation ==
+                    aggregate_before_view + 1
+                    && !aggregate_head->sorted_nrows &&
+                    !aggregate_head->base_nrows
+                    && !aggregate_head->run_count &&
+                    !aggregate_head->dedup_slots
+                    && !aggregate_head->dedup_reserved_bytes
+                    && !s->eval_stratum_heads_final && !s->cleanup_pending
+                    && !s->recursive.active && !s->recursive.cleanup_pending
+                    && atomic_load_explicit(
+                        &aggregate_head->descriptor_access.state,
+                        memory_order_acquire) == 0);
+                aggregate_stop_stage = 0;
+                CHECK(wl_evaluation_control_reset(c) == 0);
+                rc = wl_backend_columnar()->session_snapshot(base,
+                        aggregate_capture, &got);
+            }
+            CHECK(rc == 0 && aggregate_historical_rows > (dirty ? 4u : 3u)
+                && aggregate_join_sources > 0);
+            wl_columnar_eval_serial_test_before_aggregate = NULL;
+            wl_columnar_consolidate_test_checkpoint = NULL;
+            wl_columnar_ops_reduce_test_checkpoint = NULL;
+            aggregate_session = NULL;
+            col_rel_t *head = session_find_rel(s, "L");
+            CHECK(head && head->nrows == (dirty ? 4u : 3u)
+                && !s->recursive.active && !s->cleanup_pending
+                && !s->serial_completion.frame && !s->cleanup_reserved_bytes);
+            CHECK(wl_backend_columnar()->session_snapshot(raw_base,
+                aggregate_capture, &twin) == 0 && got.count == twin.count
+                && got.digest == twin.digest);
+            col_rel_t *raw_head = session_find_rel(raw, "L");
+            CHECK(raw_head && raw_head->nrows == (dirty?4u:3u));
+            for (uint32_t row = 0; row < raw_head->nrows; row++)
+                CHECK(raw_head->columns[0][row] == row+1 &&
+                    raw_head->columns[1][row] == (max ? (dirty ? 4 : 3) : 1));
+            CHECK(head->nrows == raw_head->nrows);
+            for (uint32_t row = 0; row < head->nrows; row++)
+                for (uint32_t col = 0; col < head->ncols; col++)
+                    CHECK(head->columns[col][row] ==
+                        raw_head->columns[col][row]);
+            wl_columnar_memory_governor_t *governor =
+                wl_columnar_memory_governor_ref_get(s->memory_governor);
+            wl_columnar_memory_governor_t *raw_governor =
+                wl_columnar_memory_governor_ref_get(raw->memory_governor);
+            CHECK(governor->mode == WL_COLUMNAR_MEMORY_MODE_ENFORCING
+                && raw_governor->mode == WL_COLUMNAR_MEMORY_MODE_ENFORCING
+                && governor->budget_bytes == budget &&
+                raw_governor->budget_bytes == budget
+                && wl_columnar_memory_reserved(governor) <= budget
+                && wl_columnar_memory_reserved(raw_governor) <= budget);
+            destroy(s); destroy(raw); wl_plan_free(plan);
+            wirelog_program_free(program);
         }
-        col_rel_t *head = session_find_rel(s, "L");
-        uint64_t view = head ? head->view_generation : 0;
-        uint64_t storage = head ? head->storage_generation : 0;
-        uint32_t rows = head ? head->nrows : 0;
-        uint32_t registry = s->nrels, pool_used = s->delta_pool->slot_used;
-        uint64_t reserved = wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(s->memory_governor));
+}
+
+static const wl_columnar_eval_serial_aggregate_scratch_t *
+    aggregate_fault_scratch;
+static wl_columnar_memory_reservation_t *aggregate_fault_token;
+static const void *aggregate_fault_identity;
+static unsigned aggregate_fault_mode, aggregate_fault_seen;
+static void aggregate_reservation_capture(wl_evaluation_control_t *c,
+    wl_columnar_memory_reservation_t *token, unsigned phase)
+{
+    if (!aggregate_session || c != aggregate_session->base.evaluation_control
+        || phase != WL_COLUMNAR_MEMORY_GOVERNOR_RESERVED) return;
+    const wl_columnar_eval_serial_aggregate_scratch_t *record =
+        wl_columnar_eval_stack_test_aggregate_scratch(aggregate_session);
+    if (record && token == &record->admission) {
+        CHECK(!aggregate_fault_token && token->identity == token);
+        aggregate_fault_token = token;
+    }
+}
+static void aggregate_original_fault(wl_evaluation_control_t *c, int stage,
+    uint64_t progress, wl_columnar_consolidate_record_t *unused, col_rel_t *rel)
+{
+    if (!aggregate_session || rel != aggregate_head || stage != 142
+        || progress != 1) return;
+    CHECK(!unused && !aggregate_fault_seen);
+    aggregate_fault_scratch = wl_columnar_eval_stack_test_aggregate_scratch(
+        aggregate_session);
+    CHECK(aggregate_fault_scratch && aggregate_fault_scratch->groups
+        && aggregate_fault_scratch->changed &&
+        !aggregate_fault_scratch->metadata_set
+        && aggregate_fault_token == &aggregate_fault_scratch->admission
+        && atomic_load(&aggregate_fault_token->state)
+        == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED);
+    if (aggregate_fault_mode & 2u) {
+        aggregate_fault_token = &rel->dedup_reservation;
+        CHECK(rel->dedup_slots && rel->dedup_reserved_bytes
+            && atomic_load(&aggregate_fault_token->state)
+            == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+    }
+    aggregate_fault_identity = aggregate_fault_token->identity;
+    CHECK(aggregate_fault_identity == aggregate_fault_token);
+    aggregate_fault_token->identity = NULL;
+    aggregate_fault_seen++;
+    if (aggregate_fault_mode & 1u)
+        CHECK(wl_evaluation_control_charge(c, UINT64_MAX) == EOVERFLOW);
+    else wl_evaluation_control_request_cancel(c);
+}
+static void original_aggregate_authority_faults(void)
+{
+    for (unsigned mode = 0; mode < 4; mode++) {
+        wl_plan_t plan = {0}; wl_session_t *base = NULL;
+        CHECK(wl_session_create(wl_backend_columnar(), &plan, 1, &base) == 0);
+        wl_col_session_t *s = COL_SESSION(base);
+        col_rel_t *head = NULL, *raw = NULL;
+        CHECK(wl_columnar_relation_new_auto_governed("H", 2, 64, false,
+            s->memory_governor, &head) == 0
+            && wl_columnar_relation_new_auto_governed("R", 2, 64, false,
+            s->memory_governor, &raw) == 0);
+        int64_t rows[][2] = {{1, 8}, {1, 3}, {2, 5}};
+        for (uint32_t i = 0; i < 3; i++)
+            CHECK(col_rel_append_row(head, rows[i]) == 0
+                && col_rel_append_row(raw, rows[i]) == 0);
+        CHECK(session_add_rel(s, head) == 0 && session_add_rel(s, raw) == 0);
+        wl_columnar_eval_dedup_set_init_from_rel(head);
+        wl_plan_agg_spec_t spec = {.has_spec = true, .fn = WIRELOG_AGG_MIN,
+                                   .operand_type = WL_PLAN_AGG_OPERAND_SCALAR,
+                                   .group_by_count = 1,
+                                   .aggregate_index = 1};
+        wl_plan_relation_t rp = {.name = "R", .recursive_agg = spec};
+        wl_plan_stratum_t sp = {.relation_count = 1, .relations = &rp};
+        CHECK(wl_columnar_eval_serial_canonicalize_aggregates(&sp, s) == 0);
         wl_evaluation_control_t *c = NULL;
         CHECK(wl_evaluation_control_create(0, &c) == 0
             && wl_evaluation_control_attach(c,
             s->base.operation_admission) == 0);
         s->base.evaluation_control = c;
-        CHECK(wl_backend_columnar()->session_step(base) == ENOTSUP);
-        CHECK(session_find_rel(s, "L") == head && s->nrels == registry
-            && s->delta_pool->slot_used == pool_used && !s->recursive.active
-            && !s->cleanup_pending && !s->serial_completion.frame
-            && reserved == wl_columnar_memory_reserved(
-                wl_columnar_memory_governor_ref_get(s->memory_governor)));
-        if (head) {
-            CHECK(head->nrows == rows && head->view_generation == view
-                && head->storage_generation == storage);
-            for (uint32_t row = 0; row < rows; row++)
-                CHECK(head->columns[0][row] == row+1 &&
-                    head->columns[1][row] == 1);
+        CHECK(!wl_columnar_eval_stack_test_aggregate_scratch(s));
+        aggregate_session = s; aggregate_head = head;
+        aggregate_fault_mode = mode;
+        aggregate_fault_scratch = NULL; aggregate_fault_token = NULL;
+        aggregate_fault_seen = 0;
+        CHECK(!wl_columnar_memory_governor_test_checkpoint
+            && !wl_columnar_consolidate_test_checkpoint);
+        wl_columnar_memory_governor_test_checkpoint =
+            aggregate_reservation_capture;
+        wl_columnar_consolidate_test_checkpoint = aggregate_original_fault;
+        uint64_t view = head->view_generation;
+        CHECK(wl_evaluation_control_begin(c, s->base.operation_admission) == 0);
+        int rc = wl_columnar_eval_serial_canonicalize_aggregate_controlled(head,
+                &spec, s, c);
+        wl_columnar_memory_governor_test_checkpoint = NULL;
+        wl_columnar_consolidate_test_checkpoint = NULL;
+        CHECK(rc == ((mode & 1u) ? EOVERFLOW : EBUSY)
+            && aggregate_fault_seen == 1 && s->cleanup_pending
+            && s->serial_completion.mode_frame == s->cleanup_pending
+            && s->serial_completion.mode == WL_COLUMNAR_SERIAL_FRAME_INCREMENTAL
+            && s->serial_completion.payload_ready
+            && !wl_columnar_eval_stack_test_aggregate_scratch(s)
+            && aggregate_fault_scratch->ready &&
+            aggregate_fault_scratch->metadata_set
+            && head->view_generation == view + 1 && !head->sorted_nrows
+            && !head->base_nrows && !head->dedup_slots
+            && aggregate_fault_token->identity == NULL
+            && atomic_load(&head->descriptor_access.state)
+            == WL_COLUMNAR_SOURCE_ACCESS_WRITER);
+        if (mode & 2u)
+            CHECK(aggregate_fault_scratch->groups &&
+                head->dedup_reserved_bytes);
+        else CHECK(!aggregate_fault_scratch->groups
+                && aggregate_fault_scratch->admission_active
+                && !head->dedup_reserved_bytes);
+        CHECK(wl_evaluation_control_finish(c, s->base.operation_admission, rc,
+            rc) == rc);
+        wl_evaluation_control_report_t report;
+        CHECK(wl_evaluation_control_report(c, &report) == 0
+            && report.result == rc && report.execution_status == rc);
+        aggregate_fault_token->identity = aggregate_fault_identity;
+        CHECK(wl_columnar_eval_stack_cleanup_retry(s) == 0 &&
+            !s->cleanup_pending
+            && !s->serial_completion.frame && !s->cleanup_reserved_bytes
+            && !head->dedup_reserved_bytes
+            && !atomic_load(&head->descriptor_access.state));
+        aggregate_fault_scratch = NULL; aggregate_fault_token = NULL;
+        aggregate_session = NULL; aggregate_head = NULL;
+        CHECK(wl_evaluation_control_reset(c) == 0
+            && wl_evaluation_control_begin(c,
+            s->base.operation_admission) == 0);
+        CHECK(wl_columnar_eval_serial_canonicalize_aggregate_controlled(head,
+            &spec, s, c) == 0
+            && wl_evaluation_control_finish(c, s->base.operation_admission, 0,
+            0) == 0
+            && head->nrows == raw->nrows);
+        for (uint32_t i = 0; i < head->nrows; i++)
+            for (uint32_t j = 0; j < 2; j++)
+                CHECK(head->columns[j][i] == raw->columns[j][i]);
+        destroy(s);
+    }
+}
+
+static unsigned aggregate_bounded_mode;
+static uint64_t aggregate_rejected_visits, aggregate_bounded_seen;
+static void aggregate_bounded_checkpoint(wl_evaluation_control_t *c, int stage,
+    uint64_t progress, wl_columnar_consolidate_record_t *unused, col_rel_t *rel)
+{
+    if (rel != aggregate_head || !aggregate_session) return;
+    const wl_columnar_eval_serial_aggregate_scratch_t *record =
+        wl_columnar_eval_stack_test_aggregate_scratch(aggregate_session);
+    CHECK(!unused && record && record->groups && record->relation == rel);
+    if (!aggregate_bounded_mode && stage == 141) {
+        /* All unique keys are multiples of the actual1024 bucket extent;
+         * odd FNV multiplication preserves equal low bits. Each row visits
+         * its preceding occupied chain and then one terminating empty slot. */
+        CHECK(record->map_cap == 1024 && record->row < 300);
+        uint64_t preceding = (uint64_t)record->row * (record->row + 1u) / 2u;
+        CHECK(progress > preceding && progress - preceding <= record->row + 1u);
+        if (progress - preceding <= record->row) aggregate_rejected_visits++;
+        if (aggregate_rejected_visits != 257) return;
+    } else if (aggregate_bounded_mode == 1 && stage == 140) {
+        if (progress != 257) return;
+        CHECK(record->row == 1 && rel->ncols == 257);
+    } else return;
+    CHECK(!aggregate_bounded_seen);
+    aggregate_bounded_seen = progress;
+    wl_evaluation_control_request_cancel(c);
+}
+static void aggregate_string_checkpoint(wl_evaluation_control_t *c, int stage,
+    uint64_t progress, wl_columnar_relation_private_batch_t *record,
+    col_rel_t *rel)
+{
+    if (!aggregate_session || c != aggregate_session->base.evaluation_control
+        || stage != 9 || progress != 257) return;
+    CHECK(!record && !rel && !aggregate_bounded_seen
+        && wl_columnar_eval_stack_test_aggregate_scratch(aggregate_session));
+    aggregate_bounded_seen = progress;
+    wl_evaluation_control_request_cancel(c);
+}
+static void original_aggregate_bounded_loops(void)
+{
+    for (unsigned mode = 0; mode < 3; mode++) {
+        wl_plan_t plan = {0}; wl_session_t *base = NULL;
+        CHECK(wl_session_create(wl_backend_columnar(), &plan, 1, &base) == 0);
+        wl_col_session_t *s = COL_SESSION(base);
+        uint32_t width = mode == 1 ? 257 : 2, count = mode ? 2 : 300;
+        col_rel_t *head = NULL, *raw = NULL;
+        CHECK(wl_columnar_relation_new_auto_governed("H", width, count, false,
+            s->memory_governor, &head) == 0
+            && wl_columnar_relation_new_auto_governed("R", width, count, false,
+            s->memory_governor, &raw) == 0);
+        int64_t row[257] = {0};
+        int64_t ids[2] = {0};
+        if (mode == 2) {
+            CHECK(!s->intern); s->intern = wl_intern_create(); CHECK(s->intern);
+            char value[302]; memset(value, 'x', 300); value[301] = 0;
+            value[300] = 'z'; ids[0] = wl_intern_put(s->intern, value);
+            value[300] = 'a'; ids[1] = wl_intern_put(s->intern, value);
+            CHECK(ids[0] >= 0 && ids[1] >= 0 && ids[0] != ids[1]);
         }
-        CHECK(wl_backend_columnar()->session_step(raw_base) == 0);
-        col_rel_t *raw_head = session_find_rel(raw, "L");
-        CHECK(raw_head && raw_head->nrows == (dirty?4u:3u));
-        for (uint32_t row = 0; row < raw_head->nrows; row++)
-            CHECK(raw_head->columns[0][row] == row+1 &&
-                raw_head->columns[1][row] == 1);
-        destroy(s); destroy(raw); wl_plan_free(plan);
-        wirelog_program_free(program);
+        for (uint32_t i = 0; i < count; i++) {
+            if (!mode) {
+                row[0] = (int64_t)i * 1024; row[1] = i + 1;
+            }else if (mode == 1) {
+                for (uint32_t j = 0; j < width; j++) row[j] = j;
+                row[256] = i ? 3 : 8;
+            } else {
+                row[0] = 1; row[1] = ids[i];
+            }
+            CHECK(col_rel_append_row(head, row) == 0 && col_rel_append_row(raw,
+                row) == 0);
+        }
+        CHECK(session_add_rel(s, head) == 0 && session_add_rel(s, raw) == 0);
+        wl_plan_agg_spec_t spec = {.has_spec = true, .fn = WIRELOG_AGG_MIN,
+                                   .operand_type = mode ==
+                                       2 ? WL_PLAN_AGG_OPERAND_STRING
+                : WL_PLAN_AGG_OPERAND_SCALAR,
+                                   .group_by_count = width - 1,
+                                   .aggregate_index = width - 1};
+        wl_plan_relation_t rp = {.name = "R", .recursive_agg = spec};
+        wl_plan_stratum_t sp = {.relation_count = 1, .relations = &rp};
+        CHECK(wl_columnar_eval_serial_canonicalize_aggregates(&sp, s) == 0);
+        wl_evaluation_control_t *c = NULL;
+        CHECK(wl_evaluation_control_create(0, &c) == 0
+            && wl_evaluation_control_attach(c,
+            s->base.operation_admission) == 0);
+        s->base.evaluation_control = c;
+        aggregate_session = s; aggregate_head = head;
+        aggregate_bounded_mode = mode;
+        aggregate_rejected_visits = aggregate_bounded_seen = 0;
+        CHECK(!wl_columnar_consolidate_test_checkpoint &&
+            !wl_columnar_ops_reduce_test_checkpoint);
+        wl_columnar_consolidate_test_checkpoint = aggregate_bounded_checkpoint;
+        if (mode ==
+            2) wl_columnar_ops_reduce_test_checkpoint =
+                aggregate_string_checkpoint;
+        CHECK(wl_evaluation_control_begin(c, s->base.operation_admission) == 0);
+        int rc = wl_columnar_eval_serial_canonicalize_aggregate_controlled(head,
+                &spec, s, c);
+        wl_columnar_consolidate_test_checkpoint = NULL;
+        wl_columnar_ops_reduce_test_checkpoint = NULL;
+        CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED && aggregate_bounded_seen
+            && (mode || aggregate_rejected_visits == 257)
+            && !s->cleanup_pending && !s->serial_completion.frame
+            && !s->cleanup_reserved_bytes &&
+            !atomic_load(&head->descriptor_access.state));
+        CHECK(wl_evaluation_control_finish(c, s->base.operation_admission, rc,
+            rc) == rc);
+        aggregate_session = NULL; aggregate_head = NULL;
+        CHECK(wl_evaluation_control_reset(c) == 0
+            && wl_evaluation_control_begin(c, s->base.operation_admission) == 0
+            && wl_columnar_eval_serial_canonicalize_aggregate_controlled(head,
+            &spec, s, c) == 0
+            && wl_evaluation_control_finish(c, s->base.operation_admission, 0,
+            0) == 0
+            && head->nrows == raw->nrows);
+        for (uint32_t i = 0; i < head->nrows; i++)
+            for (uint32_t j = 0; j < width; j++)
+                CHECK(head->columns[j][i] == raw->columns[j][i]);
+        if (mode == 2) {
+            wl_intern_free(s->intern); s->intern = NULL;
+        }
+        destroy(s);
     }
 }
 
 static wl_col_session_t *scc_session;
+static void original_aggregate_exact_boundaries(void)
+{
+    /* Layout-only witnesses mirror actual original payload and hash slot;
+    * no live authority object is constructed or copied by these types. */
+    typedef struct {
+        eval_stack_t stack; eval_entry_t result;
+        wl_columnar_relation_source_group_t sources;
+        wl_columnar_relation_private_batch_t private_batch;
+        wl_columnar_merge_consolidate_original_record_t consolidate;
+        wl_columnar_relation_bulk_append_original_t bulk;
+    } original_payload_layout;
+    typedef struct { uint64_t hash; uint32_t row; } group_slot_layout;
+    const uint64_t T = sizeof(original_payload_layout)
+        + sizeof(wl_columnar_merge_incremental_authority_t)
+        + sizeof(wl_columnar_merge_incremental_scratch_t)
+        + sizeof(wl_columnar_eval_serial_aggregate_scratch_t)
+        + 4 * sizeof(group_slot_layout) + 907;
+    const uint64_t P = T + 96, F = P + 32;
+    const uint64_t limits[] = {F, F, F - 1, P, P - 1};
+    for (unsigned trial = 0; trial < 5; trial++) {
+        wl_plan_t plan = {0}; wl_session_t *base = NULL;
+        CHECK(wl_session_create(wl_backend_columnar(), &plan, 1, &base) == 0);
+        wl_col_session_t *s = COL_SESSION(base);
+        col_rel_t *head = NULL, *raw = NULL;
+        CHECK(wl_columnar_relation_new_auto_governed("H", 2, 64, false,
+            s->memory_governor, &head) == 0
+            && wl_columnar_relation_new_auto_governed("R", 2, 64, false,
+            s->memory_governor, &raw) == 0);
+        int64_t rows[][2] = {{1, 7}, {1, 3}};
+        CHECK(col_rel_append_row(head, rows[0]) == 0
+            && col_rel_append_row(head, rows[1]) == 0
+            && col_rel_append_row(raw, rows[0]) == 0
+            && col_rel_append_row(raw, rows[1]) == 0
+            && session_add_rel(s, raw) == 0
+            && session_add_rel(s, head) == 0
+            && head->storage_owner == head && !head->dedup_reserved_bytes);
+        wl_plan_agg_spec_t raw_spec = {.has_spec = true, .fn = WIRELOG_AGG_MIN,
+                                       .operand_type =
+                                           WL_PLAN_AGG_OPERAND_SCALAR,
+                                       .group_by_count = 1,
+                                       .aggregate_index = 1};
+        wl_plan_relation_t raw_rp = {.name = "R", .recursive_agg = raw_spec};
+        wl_plan_stratum_t raw_sp = {.relation_count = 1, .relations = &raw_rp};
+        CHECK(wl_columnar_eval_serial_canonicalize_aggregates(&raw_sp, s) == 0);
+        wl_evaluation_control_t *c = NULL;
+        CHECK(wl_evaluation_control_create(0, &c) == 0
+            && wl_evaluation_control_attach(c,
+            s->base.operation_admission) == 0);
+        s->base.evaluation_control = c;
+        s->serial_completion.pending = true; s->serial_completion.plan = &plan;
+        CHECK(wl_evaluation_control_begin(c, s->base.operation_admission) == 0);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+        CHECK(wl_columnar_eval_stack_cleanup_acquire(s, &frame, c) == 0);
+        wl_columnar_eval_stack_cleanup_frame_t *original = frame;
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0
+            && !s->cleanup_active && !s->cleanup_pending
+            && s->serial_completion.frame == original
+            && s->serial_completion.mode == WL_COLUMNAR_SERIAL_FRAME_RETIRED);
+        uint64_t credit = s->cleanup_reserved_bytes;
+        CHECK(wl_evaluation_control_finish(c, s->base.operation_admission, 0,
+            0) == 0
+            && wl_evaluation_control_configure(c, limits[trial]) == 0
+            && wl_evaluation_control_begin(c,
+            s->base.operation_admission) == 0);
+        wl_plan_agg_spec_t spec = {.has_spec = true, .fn = WIRELOG_AGG_MIN,
+                                   .operand_type = WL_PLAN_AGG_OPERAND_SCALAR,
+                                   .group_by_count = 1,
+                                   .aggregate_index = 1};
+        uint64_t view = head->view_generation;
+        int rc = wl_columnar_eval_serial_canonicalize_aggregate_controlled(head,
+                &spec, s, c);
+        int expected = trial < 2 ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT;
+        CHECK(wl_evaluation_control_finish(c, s->base.operation_admission, rc,
+            rc) == rc);
+        wl_evaluation_control_report_t report;
+        CHECK(wl_evaluation_control_report(c, &report) == 0);
+        uint64_t consumed = trial < 2 ? F : trial == 4 ? T + 80 : P;
+        if (rc != expected || report.consumed != consumed)
+            fprintf(stderr,
+                "aggregate exact trial=%u rc=%d expected=%d consumed=%llu expected_work=%llu T=%llu P=%llu F=%llu\n",
+                trial, rc, expected, (unsigned long long)report.consumed,
+                (unsigned long long)consumed, (unsigned long long)T,
+                (unsigned long long)P, (unsigned long long)F);
+        CHECK(rc == expected && report.consumed == consumed
+            && !s->cleanup_active && !s->cleanup_pending
+            && s->serial_completion.frame == original
+            && s->cleanup_reserved_bytes == credit
+            && s->serial_completion.mode == WL_COLUMNAR_SERIAL_FRAME_RETIRED
+            && !atomic_load(&head->descriptor_access.state));
+        CHECK(head->nrows == (trial < 2 ? 1u : 2u)
+            && head->columns[1][0] == (trial == 4 ? 7 : 3)
+            && head->view_generation == view + (trial != 4)
+            && head->sorted_nrows == (trial < 2 ? 1u : 0u)
+            && head->base_nrows == (trial < 2 ? 1u : 0u));
+        if (trial >= 2) {
+            CHECK(wl_evaluation_control_configure(c, 0) == 0
+                && wl_evaluation_control_begin(c,
+                s->base.operation_admission) == 0
+                && wl_columnar_eval_serial_canonicalize_aggregate_controlled(
+                    head,
+                    &spec, s, c) == 0
+                && wl_evaluation_control_finish(c, s->base.operation_admission,
+                0, 0) == 0
+                && head->nrows == 1 && head->columns[0][0] == 1
+                && head->columns[1][0] == 3);
+        }
+        CHECK(head->nrows == raw->nrows
+            && head->columns[0][0] == raw->columns[0][0]
+            && head->columns[1][0] == raw->columns[1][0]);
+        CHECK(wl_columnar_eval_stack_cleanup_retained(s) == 0
+            && !s->serial_completion.frame && !s->cleanup_reserved_bytes);
+        s->serial_completion.pending = false;
+        destroy(s);
+    }
+}
+/* Supplied original-head policy helpers, distinct from generated schema. */
+static void original_aggregate_contract_edges(void)
+{
+    for (unsigned mode = 0; mode < 6; mode++) {
+        wl_plan_t plan = {0}; wl_session_t *base = NULL;
+        CHECK(wl_session_create(wl_backend_columnar(), &plan, 1, &base) == 0);
+        wl_col_session_t *s = COL_SESSION(base);
+        uint32_t width = mode ? 1 : 0;
+        col_rel_t *head = NULL, *raw = NULL;
+        CHECK(wl_columnar_relation_new_auto_governed("H", width, 64, false,
+            s->memory_governor, &head) == 0
+            && wl_columnar_relation_new_auto_governed("R", width, 64, false,
+            s->memory_governor, &raw) == 0);
+        int64_t values[] = {8, 3};
+        if (mode == 3) {
+            double a = -1.0, b = -2.0;
+            memcpy(&values[0], &a, sizeof(a));
+            memcpy(&values[1], &b, sizeof(b));
+            CHECK(values[0] < values[1]); /* raw signed-bits final policy */
+        }
+        uint32_t count = !mode ? 0 : mode == 1 ? 1 : 2;
+        for (uint32_t i = 0; i < count; i++)
+            CHECK(col_rel_append_row(head, &values[i]) == 0
+                && col_rel_append_row(raw, &values[i]) == 0);
+        CHECK(session_add_rel(s, head) == 0 && session_add_rel(s, raw) == 0);
+        wl_plan_agg_spec_t spec = {.has_spec = true, .fn = WIRELOG_AGG_MIN,
+                                   .operand_type = mode ==
+                                       3 ? WL_PLAN_AGG_OPERAND_FLOAT
+                : WL_PLAN_AGG_OPERAND_SCALAR,
+                                   .group_by_count = mode == 4 ? 1 : 0,
+                                   .aggregate_index = UINT32_MAX};
+        if (mode == 5) spec.fn = WIRELOG_AGG_COUNT;
+        wl_plan_relation_t rp = {.name = "R", .recursive_agg = spec};
+        wl_plan_stratum_t sp = {.relation_count = 1, .relations = &rp};
+        if (mode < 5) CHECK(wl_columnar_eval_serial_canonicalize_aggregates(
+                    &sp, s) == (mode == 4 ? EINVAL : 0));
+        wl_evaluation_control_t *c = NULL;
+        CHECK(wl_evaluation_control_create(0, &c) == 0
+            && wl_evaluation_control_attach(c,
+            s->base.operation_admission) == 0);
+        s->base.evaluation_control = c;
+        wl_columnar_source_access_reader_t reader = {0};
+        if (mode == 2) CHECK(wl_columnar_source_access_reader_acquire(
+                    &head->descriptor_access, &reader) == 0);
+        uint64_t view = head->view_generation;
+        CHECK(wl_evaluation_control_begin(c, s->base.operation_admission) == 0);
+        int rc = wl_columnar_eval_serial_canonicalize_aggregate_controlled(head,
+                &spec, s, c);
+        int expected = mode == 5 ? ENOTSUP : mode == 4 ? EINVAL
+            : mode == 2 ? EBUSY : 0;
+        if (rc != expected || s->cleanup_pending || s->serial_completion.frame
+            || s->cleanup_reserved_bytes)
+            fprintf(stderr,
+                "aggregate edge mode=%u rc=%d expected=%d pending=%p frame=%p credit=%llu\n",
+                mode, rc, expected, (void *)s->cleanup_pending,
+                (void *)s->serial_completion.frame,
+                (unsigned long long)s->cleanup_reserved_bytes);
+        CHECK(rc == expected && !s->cleanup_pending &&
+            !s->serial_completion.frame
+            && !s->cleanup_reserved_bytes
+            && (mode != 2 || (head->nrows == 2 && head->view_generation == view
+            && head->columns[0][0] == 8 && head->columns[0][1] == 3)));
+        CHECK(wl_evaluation_control_finish(c, s->base.operation_admission, rc,
+            rc) == rc);
+        if (mode == 2) {
+            CHECK(wl_columnar_source_access_reader_release(&reader) == 0
+                && wl_evaluation_control_reset(c) == 0
+                && wl_evaluation_control_begin(c,
+                s->base.operation_admission) == 0
+                && wl_columnar_eval_serial_canonicalize_aggregate_controlled(
+                    head,
+                    &spec, s, c) == 0
+                && wl_evaluation_control_finish(c, s->base.operation_admission,
+                0, 0) == 0);
+        }
+        if (mode < 4) {
+            CHECK(head->nrows == raw->nrows);
+            if (head->nrows) CHECK(head->columns[0][0] == raw->columns[0][0]);
+            if (mode == 3) CHECK(head->nrows == 1 &&
+                    head->columns[0][0] == values[0]);
+        }
+        destroy(s);
+    }
+}
 static wl_columnar_source_access_reader_t scc_reader;
 static uint32_t scc_visits;
 static void scc_after_plan(wl_col_session_t *sess, eval_stack_t *stack,
@@ -3659,10 +4403,16 @@ int main(void)
     original_generated_rule_body(false);
     original_generated_rule_body(true);
     original_generated_backend();
-    original_generated_aggregate_refusal();
+    original_final_aggregate();
+    original_generated_aggregate();
+    original_generated_aggregate_variable();
+    original_aggregate_authority_faults();
+    original_aggregate_bounded_loops();
+    original_aggregate_contract_edges();
+    original_aggregate_exact_boundaries();
     original_generated_multiple_heads();
     puts(
-        "recursive R2 aggregate refusal/multirun copy-back257/two-head terminal retry OK");
+        "recursive aggregate MIN/MAX canonicalization/exact cutoffs/original faults/bounded257 retry OK");
     original_generated_terminal_reader();
     original_generated_stopped_retry();
     original_canonical_schema();

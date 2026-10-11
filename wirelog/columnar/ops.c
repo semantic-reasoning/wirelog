@@ -1060,7 +1060,7 @@ wl_columnar_ops_reduce_checkpoint(wl_evaluation_control_t *control,
 #endif
 }
 
-static int
+int
 wl_columnar_ops_reduce_better(wirelog_agg_fn_t fn, wl_plan_agg_operand_t domain,
     const wl_intern_t *intern, int64_t candidate, int64_t current, bool *better,
     wl_evaluation_control_t *control)
@@ -1102,11 +1102,26 @@ static int
 wl_columnar_ops_reduce_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess, wl_evaluation_control_t *control)
 {
+    const wl_columnar_eval_serial_recursive_record_t *recursive =
+        &sess->recursive;
+    const wl_columnar_serial_completion_t *completion =
+        &sess->serial_completion;
+    bool ordinary_recursive = recursive->active && recursive->ready
+        && recursive->phase == 2 && recursive->plan == sess->plan
+        && sess->plan && recursive->stratum_index < sess->plan->stratum_count
+        && recursive->stratum ==
+        &sess->plan->strata[recursive->stratum_index]
+        && completion->pending && completion->plan == sess->plan
+        && completion->stratum == recursive->stratum_index
+        && completion->frame == sess->cleanup_active
+        && sess->cleanup_active && !sess->diff_enabled
+        && control == sess->base.evaluation_control;
     if (sess->num_workers > 1 || sess->diff_operators_active
         || sess->tdd_input_run || sess->tdd_subpass_active
         || sess->tdd_outbound_only_active || sess->delta_seeded
         || sess->retraction_seeded || sess->retraction_right_pass
-        || sess->current_iteration || sess->delta_observer
+        || (sess->current_iteration && !ordinary_recursive)
+        || sess->delta_observer
         || !sess->memory_governor) return ENOTSUP;
     wl_columnar_relation_source_group_t *group;
     eval_entry_t *private_output;
@@ -1149,11 +1164,17 @@ wl_columnar_ops_reduce_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
         || (source->nrows && !source->ncols && gc)) {
         rc = EINVAL; goto cleanup;
     }
-    if (source->timestamps
+    if ((source->timestamps && !ordinary_recursive)
         || source->compound_kind != WIRELOG_COMPOUND_KIND_NONE
         || source->compound_count || source->inline_physical_offset
         || source->compound_arity_map || source->compound_arity_len) {
         rc = ENOTSUP; goto cleanup;
+    }
+    /* Raw ordinary REDUCE reads value columns and emits no timestamps. Its
+     * recursive input may retain timestamps under this real source group. */
+    if ((source->timestamps && source->timestamp_capacity < source->nrows)
+        || (!source->timestamps && source->timestamp_capacity)) {
+        rc = EINVAL; goto cleanup;
     }
     if (gc == UINT32_MAX) {
         rc = EOVERFLOW; goto cleanup;

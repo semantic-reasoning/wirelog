@@ -4068,6 +4068,7 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
 * retired. A refused release leaves that exact token and lane pending. */
 static int
 wl_columnar_merge_incremental_scratch_retire(
+    wl_columnar_merge_incremental_authority_t *authority,
     wl_columnar_merge_incremental_scratch_t *scratch, int primary)
 {
     if (!scratch || !scratch->ready)
@@ -4123,6 +4124,16 @@ wl_columnar_merge_incremental_scratch_retire(
             if (cleanup) return primary > 0 ? primary : cleanup;
         }
         scratch->lane = 0;
+    } else if (scratch->lane == 5) {
+        int cleanup = wl_columnar_eval_serial_aggregate_retire(authority,
+                &scratch->aggregate, primary);
+        if (scratch->aggregate.admission_active
+            || (scratch->aggregate.changed
+            && (!scratch->aggregate.metadata_set
+            || scratch->aggregate.relation->dedup_reserved_bytes)))
+            return cleanup;
+        scratch->lane = 0;
+        return cleanup;
     } else if (scratch->lane != 0 && scratch->lane != 2)
         return primary > 0 ? primary : EINVAL;
     return primary;
@@ -4158,7 +4169,8 @@ wl_columnar_merge_incremental_scratch_rows(
 {
     int rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
     rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
-    rc = wl_columnar_merge_incremental_scratch_retire(scratch, 0);
+    if (scratch->lane == 5) return EBUSY;
+    rc = wl_columnar_merge_incremental_scratch_retire(NULL, scratch, 0);
     if (rc) return rc;
     rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
     scratch->lane = 2;
@@ -4367,7 +4379,8 @@ wl_columnar_merge_incremental_complete_storage(
     rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
     /* Healthy forward retirement has admitted readiness. Physical frees use
      * the existing exclusion; original refused credit still blocks overlay. */
-    rc = wl_columnar_merge_incremental_scratch_retire(scratch, 0);
+    if (scratch->lane == 5) return EBUSY;
+    rc = wl_columnar_merge_incremental_scratch_retire(NULL, scratch, 0);
     if (rc) return rc;
     rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
     scratch->lane = 2;
@@ -4408,7 +4421,7 @@ wl_columnar_merge_incremental_retire(
         }
         authority->delta_rolled_back = true;
     }
-    rc = wl_columnar_merge_incremental_scratch_retire(scratch, rc);
+    rc = wl_columnar_merge_incremental_scratch_retire(authority, scratch, rc);
     if (scratch && scratch->ready && scratch->lane != 0
         && scratch->lane != 2) return rc;
     return wl_columnar_relation_incremental_finish(authority, rc);

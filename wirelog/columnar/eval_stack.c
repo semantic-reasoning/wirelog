@@ -883,6 +883,23 @@ wl_columnar_eval_stack_cleanup_compound_gc(wl_col_session_t *session,
     return wl_evaluation_control_charge(control, 0);
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+const wl_columnar_eval_serial_aggregate_scratch_t *
+wl_columnar_eval_stack_test_aggregate_scratch(wl_col_session_t *session)
+{
+    if (!session || !session->cleanup_active) return NULL;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = session->cleanup_active;
+    if (frame != session->serial_completion.mode_frame
+        || session->serial_completion.mode !=
+        WL_COLUMNAR_SERIAL_FRAME_INCREMENTAL
+        || !session->serial_completion.payload_ready) return NULL;
+    if (frame->session != session || !frame->incremental_scratch.ready
+        || frame->incremental_scratch.lane != 5) return NULL;
+    if (!frame->incremental_scratch.aggregate.ready) return NULL;
+    return &frame->incremental_scratch.aggregate;
+}
+#endif
+
 int
 wl_columnar_eval_stack_cleanup_incremental_owner(wl_col_session_t *session,
     wl_columnar_eval_stack_cleanup_frame_t *frame,

@@ -904,7 +904,7 @@ call.
 | `plain_step_completion_phase` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE |
 | `plain_step_completion_step_context` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl` | PRESERVE |
 | `plain_step_completion_active` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_snapshot_impl`, `col_session_step_impl` | **COMMIT** on the step path -- a re-entrancy latch, not progress. While it stays set beside `plain_step_completion_pending`, the entry guard of both `col_session_step_impl` and `col_session_snapshot_impl` returns `EBUSY` above every line that would clear it. The snapshot path never writes it, so the snapshot cutoff has nothing to perform here. |
-| `col_rel_t::base_nrows` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_reset_rows_locked`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `tdd_empty_relation_candidate`, `tdd_seed_bdx_coordinator_idb`, `wl_columnar_eval_serial_canonicalize_aggregate_locked`, `wl_columnar_relation_compact_controlled`, `wl_columnar_relation_new_private_controlled`, `wl_columnar_relation_reset_controlled`, `wl_columnar_session_serial_attempt`, `wl_retraction_restore` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_mutable_image_validate`, `col_session_remove`, `col_session_remove_incremental`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `session_seed_shadow_plan_remove`, `session_snapshot_insert`, `wl_columnar_eval_delta_observer_begin`, `wl_columnar_relation_compact_controlled`, `wl_columnar_relation_descriptor_handoff`, `wl_columnar_relation_descriptor_registry_validate`, `wl_columnar_relation_new_private_controlled`, `wl_columnar_relation_pool_reuse_controlled`, `wl_columnar_relation_pool_sample_controlled`, `wl_columnar_relation_reset_controlled`, `wl_retraction_stage_prepare` | PRESERVE -- the insert route (`session_snapshot_insert`) takes rows `[base_nrows, nrows)` of the inserted relation as the rows an incremental insert appended, so committing the bookkeeping's `base_nrows = nrows` on a stopped attempt would make the retry find no inserted rows and leave the heads without them. That is the whole verified consequence; see the note below before adding another |
+| `col_rel_t::base_nrows` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_reset_rows_locked`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `tdd_empty_relation_candidate`, `tdd_seed_bdx_coordinator_idb`, `wl_columnar_eval_serial_aggregate_retire`, `wl_columnar_eval_serial_canonicalize_aggregate_locked`, `wl_columnar_relation_compact_controlled`, `wl_columnar_relation_new_private_controlled`, `wl_columnar_relation_reset_controlled`, `wl_columnar_session_serial_attempt`, `wl_retraction_restore` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_mutable_image_validate`, `col_session_remove`, `col_session_remove_incremental`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `session_seed_shadow_plan_remove`, `session_snapshot_insert`, `wl_columnar_eval_delta_observer_begin`, `wl_columnar_relation_compact_controlled`, `wl_columnar_relation_descriptor_handoff`, `wl_columnar_relation_descriptor_registry_validate`, `wl_columnar_relation_new_private_controlled`, `wl_columnar_relation_pool_reuse_controlled`, `wl_columnar_relation_pool_sample_controlled`, `wl_columnar_relation_reset_controlled`, `wl_retraction_stage_prepare` | PRESERVE -- the insert route (`session_snapshot_insert`) takes rows `[base_nrows, nrows)` of the inserted relation as the rows an incremental insert appended, so committing the bookkeeping's `base_nrows = nrows` on a stopped attempt would make the retry find no inserted rows and leave the heads without them. That is the whole verified consequence; see the note below before adding another |
 
 Two non-field actions sit in the same region and need their own verdicts.
 `col_session_reclaim_quiescent` is **COMMIT**: the step cutoff's unwind calls
@@ -1400,9 +1400,29 @@ heads and dirty EDB insertion use the same evaluation control for preparation,
 fixed-point work and publication. This does not enable default differential
 evaluation, delta observers or signed retractions.
 
-Recursive aggregate metadata is temporarily refused before head registration
-or reset: controlled final MIN/MAX domination remains required before full
-#1821 closure. Per-rule REDUCE does not establish that final aggregate policy.
+Ordinary recursive MIN/MAX metadata is canonicalized after fixed-point work
+and before heads-final publication. Genuine generated initial and dirty
+VAR/REDUCE bodies accept their real timestamp-bearing inputs. Generated
+VAR/JOIN/REDUCE bodies preserve the raw timestamp-free JOIN input to REDUCE
+and the timestamp-free per-rule REDUCE result. Other
+aggregate functions remain unsupported on this final recursive route.
+
+Final dominance uses the original incremental writer and a phase-exclusive
+group record in the original cleanup workspace. One exact-size RESERVED group
+allocation is zeroed in charged slices; hashing, occupied collisions, group
+columns, string bytes and original cell copies are admitted before inspection
+or mutation. The raw no-control allocator and ordering stay unchanged. Final
+non-STRING comparison uses the raw signed integer bits policy, including FLOAT;
+STRING compares actual interned strings and retains the raw missing-ID policy.
+
+In-place partial changes are recorded before the first store. A stop invalidates
+sorted/base/run metadata and touches the view once before the original writer
+can retire. It does not undo physical cells. Genuine production retry rebuilds
+the canonical result from the input relations. Group and dedup physical buffers
+are freed and made NULL before their original RESERVED or COMMITTED credit is
+retired; a refusal retains the original frame and writer for checked drain.
+Final hash/column work remains charged. Physical cleanup is the existing
+mandatory exclusion, with no new work admission or control reset.
 
 A session-owned stratum record retains the original delta-array and snapshot
 reservation while each rule uses the original 3864-byte cleanup frame. The

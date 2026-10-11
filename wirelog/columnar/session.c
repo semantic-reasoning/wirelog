@@ -6238,7 +6238,7 @@ wl_columnar_session_serial_preflight(wl_col_session_t *sess, bool *recursive)
         || !sess->memory_governor || sess->cleanup_active
         || sess->coordinator) return ENOTSUP;
     if (sess->plan->stratum_count && !sess->plan->strata) return EINVAL;
-    /* Reject all final aggregate metadata before pool reuse or head reset. */
+    /* Validate final aggregate metadata before pool reuse or head reset. */
     for (uint32_t si = 0; si < sess->plan->stratum_count; si++) {
         rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
         const wl_plan_stratum_t *sp = &sess->plan->strata[si];
@@ -6246,7 +6246,10 @@ wl_columnar_session_serial_preflight(wl_col_session_t *sess, bool *recursive)
         if (!sp->is_recursive) continue;
         for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
             rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
-            if (sp->relations[ri].recursive_agg.has_spec) return ENOTSUP;
+            const wl_plan_agg_spec_t *spec =
+                &sp->relations[ri].recursive_agg;
+            if (spec->has_spec && spec->fn != WIRELOG_AGG_MIN
+                && spec->fn != WIRELOG_AGG_MAX) return ENOTSUP;
             rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
         }
         rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;

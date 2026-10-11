@@ -165,9 +165,9 @@ wl_columnar_eval_plan_recursive_validate(const wl_plan_relation_t *plan,
 {
     if (!plan || !control || !supported) return EINVAL;
     *supported = false;
-    /* Final metadata-driven MIN/MAX domination is not yet controlled.
-     * Refuse before head registration or any recursive payload mutation. */
-    if (plan->recursive_agg.has_spec) return ENOTSUP;
+    if (plan->recursive_agg.has_spec
+        && plan->recursive_agg.fn != WIRELOG_AGG_MIN
+        && plan->recursive_agg.fn != WIRELOG_AGG_MAX) return ENOTSUP;
     return wl_columnar_eval_plan_union_validate_body(plan, control, supported,
                true);
 }
