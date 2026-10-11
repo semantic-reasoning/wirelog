@@ -13,6 +13,7 @@
 #define _DEFAULT_SOURCE 1
 #endif
 
+#define WL_SESSION_TEST_HOOKS 1
 #include "../wirelog/backend.h"
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/columnar/join_batch.h"
@@ -3433,6 +3434,407 @@ test_env_parse(void)
         FAIL("knob parsing");
 }
 
+static wl_columnar_relation_bulk_append_t *wl_test_batch_publication_record;
+static uintptr_t wl_test_batch_writer_identity;
+static void
+wl_test_batch_publication_fault(wl_columnar_relation_bulk_append_t *record)
+{
+    if (wl_test_batch_publication_record) return;
+    if (!record->published || !record->writer.owner) return;
+    wl_test_batch_publication_record = record;
+    wl_test_batch_writer_identity = record->writer.identity;
+    record->writer.identity = 0;
+}
+
+static wl_columnar_relation_private_batch_t *wl_test_batch_original_writer;
+static uint64_t wl_test_batch_initial_nonce;
+static bool wl_test_batch_renewed, wl_test_batch_clamped, wl_test_batch_short;
+static uint64_t wl_test_batch_budget, wl_test_batch_peak,
+    wl_test_batch_create_peak;
+static void
+wl_test_batch_creation_credit(wl_evaluation_control_t *control,
+    wl_columnar_memory_governor_t *governor, bool admitted, bool overflow)
+{
+    (void)control;
+    if (admitted && !overflow) {
+        uint64_t bytes = wl_columnar_memory_reserved(governor);
+        if (bytes >
+            wl_test_batch_create_peak) wl_test_batch_create_peak = bytes;
+    }
+}
+static void
+wl_test_batch_growth_checkpoint(wl_columnar_join_batch_record_t *record,
+    int stage, uint64_t progress)
+{
+    if (stage != 3 && stage != 4) return;
+    uint64_t usage = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(record->session->memory_governor));
+    if (usage > wl_test_batch_peak) wl_test_batch_peak = usage;
+    if (stage == 4 && progress == 64
+        && col_join_batch_scratch_capacity(record->continuation) == 64)
+        wl_test_batch_short = true;
+    wl_columnar_relation_private_batch_t *writer =
+        wl_columnar_eval_stack_cleanup_reduce_batch(
+        record->session->cleanup_active);
+    if (stage == 3 && writer) {
+        uint64_t nonce = writer->batch.single.lease.acquisition_nonce;
+        if (!wl_test_batch_original_writer) {
+            wl_test_batch_original_writer = writer;
+            wl_test_batch_initial_nonce = nonce;
+        } else if (writer == wl_test_batch_original_writer
+            && writer->batch.relation->capacity > COL_REL_INIT_CAP
+            && nonce > wl_test_batch_initial_nonce
+            && !wl_columnar_eval_stack_cleanup_bulk_append(
+                record->session->cleanup_active)->active)
+            wl_test_batch_renewed = true;
+    }
+    if (stage == 4 &&
+        col_join_batch_scratch_capacity(record->continuation) == 150
+        && writer && writer->phase == WL_COLUMNAR_RELATION_PRIVATE_RETIRED)
+        wl_test_batch_clamped = true;
+}
+
+static wl_columnar_eval_stack_cleanup_frame_t *wl_test_batch_growth_frame;
+static unsigned wl_test_batch_growth_fault_mode;
+static wl_columnar_relation_bulk_append_t *wl_test_batch_growth_pending;
+static const void *wl_test_batch_growth_identity;
+static void
+wl_test_batch_growth_work(wl_evaluation_control_t *control, uint64_t work)
+{
+    (void)work;
+    if (wl_test_batch_growth_pending || !wl_test_batch_growth_frame) return;
+    wl_columnar_relation_bulk_append_t *bulk =
+        wl_columnar_eval_stack_cleanup_bulk_append(wl_test_batch_growth_frame);
+    if (!bulk->active || !bulk->exact_capacity || !bulk->transaction_active
+        || !bulk->pending.growth || !bulk->prepared_columns || bulk->count != 1)
+        return;
+    wl_test_batch_growth_pending = bulk;
+    if (wl_test_batch_growth_fault_mode == 5) {
+        wl_columnar_memory_reservation_t *token =
+            &bulk->dst->retained_reservation;
+        wl_test_batch_growth_identity = token->identity;
+        token->identity = NULL;
+        (void)wl_evaluation_control_charge(control, UINT64_MAX);
+    } else wl_evaluation_control_request_cancel(control);
+}
+
+static bool
+wl_test_batch_budget_raw_twin(const wl_plan_t *plan,
+    const col_rel_t *controlled,
+    unsigned mode)
+{
+    wl_session_t *base = NULL;
+    if (wl_session_create(wl_backend_columnar(), plan, 1, &base)) return false;
+    wl_col_session_t *session = COL_SESSION(base);
+    int64_t rows[40];
+    for (unsigned row = 0; row < 20; row++) {
+        rows[2 * row] = 1; rows[2 * row + 1] = row;
+    }
+    int rc = wl_backend_columnar()->session_insert(base, "A", rows, 20, 2);
+    if (!rc) rc = wl_backend_columnar()->session_insert(base, "B", rows, 20, 2);
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(session->memory_governor);
+    if (mode != 6) {
+        governor->budget_bytes = wl_test_batch_budget;
+        governor->mode = mode == 3 ? WL_COLUMNAR_MEMORY_MODE_ADVISORY
+            : WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+        atomic_store(&governor->usable_bytes,
+            mode == 3 ? UINT64_MAX : wl_test_batch_budget);
+    }
+    session->join_batch_bytes = mode == 6 ? 1 : 2400;
+    session->join_batch_strict = mode == 6;
+    col_rel_t *head = NULL;
+    wl_columnar_continuation_t *continuation = NULL;
+    if (!rc) rc = wl_columnar_relation_new_auto_governed("$joined", 2,
+                mode == 6 ? 64 : 512,
+                false, session->memory_governor, &head);
+    const wirelog_column_type_t types[] = {WIRELOG_TYPE_INT64,
+                                           WIRELOG_TYPE_INT64};
+    if (!rc) rc = col_rel_set_column_types(head, types, 2);
+    const uint32_t key = 0;
+    if (!rc) rc = col_join_batch_producer_create(session,
+                &plan->strata[0].relations[0].ops[1],
+                session_find_rel(session, "A"),
+                false, &key, &key, 1, session->join_batch_bytes, &continuation);
+    if (mode == 6) {
+        bool good = rc == ENOTSUP && !continuation && head && !head->nrows
+            && session->arr_count == 1 && !session->arr_entries[0].pin_count;
+        wl_columnar_continuation_destroy(continuation); col_rel_destroy(head);
+        wl_session_destroy(base); return good;
+    }
+    if (!rc) rc = col_join_batch_run_to_relation(continuation, session, head);
+    bool actual[400] = {0}, expected[400] = {0};
+    bool good = !rc && head && head->nrows == 400 && controlled->nrows == 400;
+    for (unsigned row = 0; good && row < 400; row++) {
+        int64_t a = controlled->columns[0][row],
+            b = controlled->columns[1][row];
+        int64_t x = head->columns[0][row], y = head->columns[1][row];
+        if (a < 0 || a >= 20 || b < 0 || b >= 20
+            || x < 0 || x >= 20 || y < 0 || y >= 20
+            || actual[a*20+b] || expected[x*20+y]) good = false;
+        else actual[a*20+b] = expected[x*20+y] = true;
+    }
+    if (!good) fprintf(stderr, "batch budget raw mode=%u rc=%d rows=%u\n",
+            mode, rc, head ? head->nrows : 0);
+    wl_columnar_continuation_destroy(continuation);
+    col_rel_destroy(head);
+    wl_session_destroy(base);
+    return good;
+}
+
+static void
+test_controlled_original_continuation(unsigned mode)
+{
+    bool growth = mode != 0;
+    TEST(mode ==
+        6 ?
+        "strict subrow creator refusal retains actual original authorities for checked drain"
+        : mode ==
+        4 ?
+        "prepared scratch growth stop: real drain and original continuation retry"
+        : mode ==
+        5 ?
+        "scratch growth overflow plus original credit refusal: physical-before-credit"
+        : mode ==
+        2 ?
+        "real enforcing budget: denied scratch grow, short batches and same-control resume"
+        : mode ==
+        3 ? "same actual advisory budget: scratch growth and retained rows"
+        : growth ? "exact scratch growth/clamp and original writer fresh nonce"
+        :
+        "same controlled continuation: committed writer refusal and real resume");
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(
+        ".decl A(k:int64,v:int64)\n.decl B(k:int64,w:int64)\n"
+        ".decl H(v:int64,w:int64)\nH(v,w):-A(k,v),B(k,w).\n", &error);
+    wl_plan_t *plan = NULL;
+    wl_session_t *base = NULL;
+    wl_evaluation_control_t *control = NULL;
+    if (!program || wl_plan_from_program(program, &plan)
+        || wl_session_create(wl_backend_columnar(), plan, 1, &base)) {
+        FAIL("generated fixture construction"); return;
+    }
+    wl_col_session_t *session = COL_SESSION(base);
+    int64_t rows[40];
+    for (unsigned row = 0; row < 20; row++) {
+        rows[2 * row] = 1; rows[2 * row + 1] = row;
+    }
+    int rc = wl_backend_columnar()->session_insert(base, "A", rows, 20, 2);
+    if (!rc) rc = wl_backend_columnar()->session_insert(base, "B", rows, 20, 2);
+    uint64_t original_usage = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(session->memory_governor));
+    if (!rc && (mode == 2 || mode == 3)) {
+        wl_columnar_memory_governor_t *governor =
+            wl_columnar_memory_governor_ref_get(session->memory_governor);
+        governor->budget_bytes = wl_test_batch_budget;
+        atomic_store(&governor->usable_bytes,
+            mode == 3 ? UINT64_MAX : wl_test_batch_budget);
+        if (mode == 3) governor->mode = WL_COLUMNAR_MEMORY_MODE_ADVISORY;
+    }
+    if (!rc) rc = wl_evaluation_control_create(0, &control);
+    if (!rc) rc = wl_evaluation_control_attach(control,
+                base->operation_admission);
+    if (!rc) rc = wl_evaluation_control_begin(control,
+                base->operation_admission);
+    session->base.evaluation_control = control;
+    session->join_batch_bytes = mode == 6 ? 1 : growth ? 2400 : 160;
+    session->join_batch_strict = mode == 6;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    if (!rc) rc = wl_columnar_eval_stack_cleanup_begin(session, &frame);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame);
+    wl_columnar_relation_private_batch_t *writer = NULL;
+    wl_columnar_relation_source_group_t *group = NULL;
+    eval_entry_t *scratch = NULL;
+    if (!rc) rc = wl_columnar_eval_stack_cleanup_join_owner(session, stack,
+                &group, &scratch);
+    if (!rc) rc = wl_columnar_eval_stack_cleanup_private_batch_owner(session,
+                stack, &writer, control);
+    wl_columnar_join_batch_record_t *record = NULL;
+    if (!rc) rc = wl_columnar_eval_stack_cleanup_join_batch_owner(session,
+                stack, &record, control);
+    if (!rc) {
+        stack->top = 1; stack->items[0] = (eval_entry_t){0};
+        record->output = &stack->items[0];
+        rc = wl_columnar_relation_new_auto_governed_controlled("$joined", 2,
+                (mode == 2 || mode == 3) ? 512 : COL_REL_INIT_CAP, false,
+                session->memory_governor,
+                &record->output->rel, control);
+        if (record->output->rel) {
+            record->output->owned = true;
+            record->output->kind = WL_COLUMNAR_EVAL_ENTRY_RELATION;
+        }
+    }
+    if (!rc) {
+        record->types = malloc(2 * sizeof(*record->types));
+        if (!record->types) rc = ENOMEM;
+        else record->types[0] = record->types[1] = WIRELOG_TYPE_INT64;
+    }
+    col_rel_t *left = session_find_rel(session, "A"),
+        *right = session_find_rel(session, "B");
+    if (!rc) rc = wl_columnar_relation_source_group_acquire_controlled(group,
+                left, right, control);
+    const wl_plan_op_t *op = &plan->strata[0].relations[0].ops[1];
+    if (!rc) rc = wl_columnar_relation_private_types_controlled(
+            wl_columnar_eval_stack_cleanup_bulk_append(frame),
+            record->output->rel,
+            record->types, control);
+    wl_test_batch_create_peak = 0;
+    if (!mode) wl_columnar_memory_governor_test_after_total_cas =
+            wl_test_batch_creation_credit;
+    if (!rc) rc = wl_columnar_join_batch_create_controlled(record, op, left,
+                right);
+    wl_columnar_memory_governor_test_after_total_cas = NULL;
+    if (!rc && !mode) {
+        uint64_t present, future;
+        if (!col_rel_retained_bytes_for(record->output->rel,
+            record->output->rel->capacity, &present)
+            || !col_rel_retained_bytes_for(record->output->rel, 512,
+            &future)) rc = EINVAL;
+        else {
+            /* Actual independent fresh-session budget derives from the live
+             * original objects, replacing only final-output capacity64 by512.
+             * It is set before that new attempt, never after admission. */
+            /* Original live key, constructor cache and schema overlap
+             * credits are included by actual admitted peak observations. */
+            wl_test_batch_budget = wl_test_batch_create_peak + future - present;
+        }
+    }
+    wl_test_batch_peak = 0; wl_test_batch_short = false;
+    wl_test_batch_publication_record = NULL;
+    wl_test_batch_original_writer = NULL; wl_test_batch_initial_nonce = 0;
+    wl_test_batch_renewed = wl_test_batch_clamped = false;
+    wl_columnar_join_batch_test_checkpoint = wl_test_batch_growth_checkpoint;
+    if (mode == 6 && rc == ENOTSUP) {
+        if (!record->producer || record->continuation || !scratch->owned
+            || !scratch->rel || record->output->rel->nrows
+            || session->arr_entries[0].pin_count != 1
+            || wl_columnar_join_batch_record_retire(record, 0)
+            || session->arr_entries[0].pin_count) FAIL(
+                "strict subrow authority drain");
+        else if (!wl_test_batch_budget_raw_twin(plan, record->output->rel,
+            mode))
+            FAIL("strict subrow fresh raw creator twin");
+        else PASS();
+    } else if (!rc && mode >= 4) {
+        wl_test_batch_growth_frame = frame;
+        wl_test_batch_growth_fault_mode = mode;
+        wl_test_batch_growth_pending = NULL;
+        wl_columnar_relation_test_work_checkpoint = wl_test_batch_growth_work;
+        rc = wl_columnar_join_batch_publish_controlled(record);
+        wl_columnar_relation_test_work_checkpoint = NULL;
+        wl_test_batch_growth_frame = NULL;
+        int expected = mode == 5 ? EOVERFLOW : WL_EVALUATION_CONTROL_CANCELLED;
+        int cleanup = wl_test_batch_growth_pending
+            ? wl_columnar_relation_bulk_append_retire(
+            wl_test_batch_growth_pending, 0) : EINVAL;
+        bool good = rc == expected && wl_test_batch_growth_pending
+            && wl_columnar_continuation_cursor(
+            record->continuation)->sequence == 0
+            && !record->output->rel->nrows;
+        if (mode == 5) {
+            good = good && cleanup == EINVAL &&
+                wl_test_batch_growth_pending->active
+                && wl_test_batch_growth_pending->transaction_active
+                && !wl_test_batch_growth_pending->prepared_columns
+                && !wl_test_batch_growth_pending->dst->retained_reservation.
+                identity;
+            /* Serialized publish has returned; restore only its saved scalar. */
+            wl_test_batch_growth_pending->dst->retained_reservation.identity =
+                wl_test_batch_growth_identity;
+            cleanup =
+                wl_columnar_relation_bulk_append_retire(
+                wl_test_batch_growth_pending, 0);
+        }
+        good = good && !cleanup;
+        (void)wl_evaluation_control_finish(control, base->operation_admission,
+            rc > 0 ? rc : 0, mode == 5 ? EINVAL : 0);
+        wl_evaluation_control_report_t report;
+        good = good && wl_evaluation_control_report(control, &report) == 0
+            && report.result == expected &&
+            (mode != 5 || report.execution_status == EOVERFLOW);
+        int resume = wl_evaluation_control_reset(control);
+        if (!resume) resume = wl_evaluation_control_begin(control,
+                    base->operation_admission);
+        if (!resume) resume = wl_columnar_join_batch_run_controlled(record);
+        if (!good || resume || record->output->rel->nrows != 400
+            || session->arr_entries[0].pin_count)
+            FAIL("prepared growth original authority/continuation retry");
+        else PASS();
+        rc = resume;
+    } else if (!rc) {
+        session->join_output_limit = 1;
+        wl_columnar_relation_test_bulk_publication_checkpoint =
+            wl_test_batch_publication_fault;
+        rc = wl_columnar_join_batch_publish_controlled(record);
+        wl_columnar_relation_test_bulk_publication_checkpoint = NULL;
+        if (rc != EOVERFLOW || !wl_test_batch_publication_record
+            || !wl_test_batch_publication_record->active
+            || wl_columnar_continuation_cursor(
+                record->continuation)->sequence != 1
+            || record->output->rel->nrows != (mode == 2 ? 64u
+                : col_join_batch_rows_per_batch(record->continuation))) {
+            FAIL(
+                "durable sink fault did not retain original writer and advance cursor");
+        } else {
+            wl_test_batch_publication_record->writer.identity =
+                wl_test_batch_writer_identity;
+            session->join_output_limit = 0;
+            int resume =
+                wl_columnar_relation_bulk_append_retire(
+                wl_test_batch_publication_record, 0);
+            if (!resume) resume =
+                    wl_columnar_join_batch_publish_controlled(record);
+            if (!resume &&
+                wl_columnar_continuation_cursor(
+                    record->continuation)->sequence != 2) resume = EINVAL;
+            if (!resume) resume =
+                    wl_columnar_join_batch_publish_controlled(record);
+            if (!resume &&
+                wl_columnar_continuation_cursor(
+                    record->continuation)->sequence != 3) resume = EINVAL;
+            if (!resume) resume = wl_columnar_join_batch_run_controlled(record);
+            if (resume || record->output->rel->nrows != 400
+                || session->arr_entries[0].pin_count
+                || (growth && mode != 2 &&
+                (!wl_test_batch_renewed || !wl_test_batch_clamped))
+                || (mode == 2 && (!wl_test_batch_short || wl_test_batch_renewed
+                || wl_test_batch_peak > wl_test_batch_budget))
+                || (mode == 3 && wl_test_batch_peak <= wl_test_batch_budget)
+                || (mode >= 2 && !wl_test_batch_budget_raw_twin(plan,
+                record->output->rel, mode)))
+                FAIL(
+                    "same-control resume lost rows or original growth witness");
+            else PASS();
+        }
+    } else {
+        fprintf(stderr,
+            "controlled fixture mode=%u create rc=%d budget=%llu usage=%llu\n",
+            mode, rc, (unsigned long long)wl_test_batch_budget,
+            (unsigned long long)wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(session->memory_governor)));
+        FAIL("controlled producer construction");
+    }
+    if (wl_test_batch_publication_record &&
+        wl_test_batch_publication_record->writer.owner)
+        wl_test_batch_publication_record->writer.identity =
+            wl_test_batch_writer_identity;
+    wl_columnar_join_batch_test_checkpoint = NULL;
+    int cleanup = frame ? wl_columnar_eval_stack_cleanup_finish(&frame) : 0;
+    uint64_t cache_credit = 0;
+    for (uint32_t i = 0; i < session->arr_count; i++)
+        cache_credit += session->arr_entries[i].arr.reservation.bytes;
+    if (cleanup || session->cleanup_pending || session->cleanup_reserved_bytes
+        || wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            session->memory_governor)) != original_usage + cache_credit)
+        FAIL(
+            "original frame/payload retirement did not restore actual retained cache baseline");
+    (void)wl_evaluation_control_finish(control, base->operation_admission,
+        rc > 0 ? rc : 0, cleanup);
+    (void)wl_evaluation_control_detach(control, base->operation_admission);
+    base->evaluation_control = NULL; wl_evaluation_control_release(control);
+    wl_session_destroy(base); wl_plan_free(plan); wirelog_program_free(program);
+}
+
 int
 main(void)
 {
@@ -3470,6 +3872,13 @@ main(void)
     test_sink_prepare_resize_failure();
     test_cross_key_collision_boundary();
     test_env_parse();
+    test_controlled_original_continuation(0);
+    test_controlled_original_continuation(1);
+    test_controlled_original_continuation(2);
+    test_controlled_original_continuation(3);
+    test_controlled_original_continuation(4);
+    test_controlled_original_continuation(5);
+    test_controlled_original_continuation(6);
     printf("\n  %d tests: %d passed, %d failed\n", tests_run, tests_passed,
         tests_failed);
     return tests_failed > 0 ? 1 : 0;

@@ -99,6 +99,14 @@ col_join_batch_producer_create(wl_col_session_t *sess,
  * continuation.  An emitted batch can be shorter: since #1481 the scratch
  * grows on demand, and a grow the governor refuses is answered with a short
  * batch rather than a failed produce. */
+int wl_columnar_join_batch_create_controlled(wl_columnar_join_batch_record_t *,
+    const wl_plan_op_t *, const col_rel_t *, const col_rel_t *);
+int wl_columnar_join_batch_run_controlled(wl_columnar_join_batch_record_t *);
+int wl_columnar_join_batch_publish_controlled(
+    wl_columnar_join_batch_record_t *);
+int wl_columnar_join_batch_probe_controlled(wl_columnar_join_batch_record_t *,
+    const wl_plan_op_t *, const col_rel_t *, const col_rel_t *,
+    wl_columnar_relation_private_batch_t *);
 uint32_t
 col_join_batch_rows_per_batch(const wl_columnar_continuation_t *cont);
 

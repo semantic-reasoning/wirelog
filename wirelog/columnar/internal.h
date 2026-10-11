@@ -3670,6 +3670,8 @@ typedef struct {
     bool journal;
     bool compact;
     bool reset;
+    bool exact_capacity;
+    uint8_t exact_phase;
     wl_columnar_relation_payload_transaction_t pending;
     wl_columnar_memory_reservation_t metadata_pending, old_metadata;
     wl_columnar_memory_reservation_t previous, scratch;
@@ -3728,6 +3730,9 @@ wl_columnar_eval_stack_cleanup_bulk_append(
 wl_columnar_relation_source_group_t *
 wl_columnar_eval_stack_cleanup_sources(
     wl_columnar_eval_stack_cleanup_frame_t *);
+int wl_columnar_relation_bulk_reserve_exact_controlled(
+    wl_columnar_relation_bulk_append_t *, col_rel_t *, uint32_t, bool *,
+    wl_evaluation_control_t *);
 int wl_columnar_relation_private_types_controlled(
     wl_columnar_relation_bulk_append_t *, col_rel_t *,
     const wirelog_column_type_t *, wl_evaluation_control_t *);
@@ -3745,6 +3750,8 @@ int wl_columnar_relation_reset_controlled(
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_relation_test_bulk_checkpoint)(
     wl_evaluation_control_t *, int, wl_columnar_relation_bulk_append_t *);
+extern void (*wl_columnar_relation_test_bulk_publication_checkpoint)(
+    wl_columnar_relation_bulk_append_t *);
 extern void (*wl_columnar_eval_serial_test_after_plan)(
     wl_col_session_t *, eval_stack_t *, eval_entry_t *);
 #endif
@@ -3846,6 +3853,86 @@ _Static_assert(sizeof(wl_columnar_consolidate_record_t)
 _Static_assert(_Alignof(wl_columnar_consolidate_record_t)
     == _Alignof(wl_columnar_merge_consolidate_original_record_t),
     "hash lane must preserve original consolidation alignment");
+/* Phase-exclusive primary arrangement preparation and JOIN batch retirement.
+ * All reservations remain at their original addresses; registry entry tokens
+ * stay in the old/new arrays until their checked transport is complete. */
+typedef struct wl_columnar_join_batch_record {
+    wl_columnar_memory_reservation_t pending, retired, descriptor;
+    wl_col_session_t *session;
+    wl_evaluation_control_t *control;
+    void *producer, *continuation;
+    eval_entry_t *output;
+    wirelog_column_type_t *types;
+    uint32_t *left_keys, *right_keys;
+    col_arr_entry_t *entry;
+    union {
+        struct {
+            col_arr_entry_t *old_entries, *new_entries;
+            char *name;
+            uint32_t *keys;
+            uint32_t capacity, cursor, count, slot;
+            uint8_t transport;
+        } registry;
+        struct {
+            uint64_t *head, *old_head;
+            uint32_t *next, *old_next;
+            uint64_t bytes, ledger_before;
+            uint32_t buckets, capacity, cursor, row, key, hash;
+            bool credit_installed;
+        } build;
+        struct {
+            col_arrangement_pin_t pin;
+            col_relation_snapshot_t left, right;
+            uint32_t row, candidate;
+        } probe;
+    };
+    uint32_t phase, initialized_tokens;
+    int reason;
+    bool ready, committed, descriptor_committed;
+} wl_columnar_join_batch_record_t;
+_Static_assert(sizeof(wl_columnar_join_batch_record_t)
+    <= sizeof(wl_columnar_consolidate_record_t),
+    "batch lifecycle must fit original workspace");
+_Static_assert(_Alignof(wl_columnar_join_batch_record_t)
+    <= _Alignof(wl_columnar_consolidate_record_t),
+    "batch lifecycle must preserve workspace alignment");
+enum {
+    WL_COLUMNAR_JOIN_BATCH_INERT = 0,
+    WL_COLUMNAR_JOIN_BATCH_REGISTRY,
+    WL_COLUMNAR_JOIN_BATCH_BUILD,
+    WL_COLUMNAR_JOIN_BATCH_PRODUCER,
+    WL_COLUMNAR_JOIN_BATCH_PROBE
+};
+int wl_columnar_join_controlled_key(const col_rel_t *, const char *, uint32_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_join_batch_record_retire(wl_columnar_join_batch_record_t *,
+    int);
+void wl_columnar_join_batch_checkpoint(wl_columnar_join_batch_record_t *,
+    int, uint64_t);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_join_batch_test_checkpoint)(
+    wl_columnar_join_batch_record_t *, int, uint64_t);
+#endif
+int wl_columnar_eval_stack_cleanup_join_batch_owner(wl_col_session_t *,
+    eval_stack_t *, wl_columnar_join_batch_record_t **,
+    wl_evaluation_control_t *);
+wl_columnar_join_batch_record_t *wl_columnar_eval_stack_cleanup_join_batch(
+    wl_columnar_eval_stack_cleanup_frame_t *);
+int wl_columnar_arrangement_pending_evict_controlled(
+    wl_columnar_join_batch_record_t *);
+int wl_columnar_arrangement_pin_retire_controlled(
+    wl_columnar_join_batch_record_t *,
+    col_arrangement_pin_t *, int, bool);
+int wl_columnar_arrangement_primary_controlled(
+    wl_columnar_join_batch_record_t *,
+    const col_rel_t *, const char *, const uint32_t *, uint32_t,
+    col_arr_entry_t **);
+int wl_columnar_arrangement_registry_grow_controlled(
+    wl_columnar_join_batch_record_t *, uint32_t);
+int wl_columnar_arrangement_record_retire(wl_columnar_join_batch_record_t *,
+    int);
+int wl_columnar_arrangement_build_controlled(wl_columnar_join_batch_record_t *,
+    col_arr_entry_t *, const col_rel_t *);
 int wl_columnar_merge_hash_retire(wl_columnar_consolidate_record_t *, int,
     wl_evaluation_control_t *);
 int wl_columnar_relation_pool_reuse_controlled(wl_col_session_t *,
@@ -4140,6 +4227,7 @@ typedef struct wl_columnar_session_hash_controlled_registry {
 #define WL_COLUMNAR_SERIAL_FRAME_OPERATOR 3u
 #define WL_COLUMNAR_SERIAL_FRAME_WORKSPACE_INITIALIZING 4u
 #define WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT 5u
+#define WL_COLUMNAR_SERIAL_FRAME_BATCH 6u
 #define WL_COLUMNAR_SERIAL_OUTPUT_CURRENT 1u
 #define WL_COLUMNAR_SERIAL_OUTPUT_DESCRIPTOR 2u
 #define WL_COLUMNAR_SERIAL_OUTPUT_SOURCE 4u

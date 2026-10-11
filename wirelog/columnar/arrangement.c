@@ -745,6 +745,400 @@ arr_build_full(col_arrangement_t *arr, const col_rel_t *rel)
     return rc;
 }
 
+/* The batch record owns every not-yet-installed buffer and credit.  This
+ * mandatory checked drain performs no new forward admission after a stop. */
+static int
+wl_columnar_arrangement_cleanup_result(int primary, int cleanup)
+{
+    return primary > 0 || !cleanup ? primary : cleanup;
+}
+static int
+wl_columnar_arrangement_credit_retire(wl_columnar_memory_reservation_t *token)
+{
+    if (token->identity != token) return EINVAL;
+    uint64_t state = atomic_load_explicit(&token->state, memory_order_acquire);
+    if (state == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+        || state == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED) {
+        wl_columnar_memory_reservation_init(token); return 0;
+    }
+    bool accepted = state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        ? wl_columnar_memory_release(token)
+        : state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        && wl_columnar_memory_rollback(token);
+    if (!accepted) return EINVAL;
+    wl_columnar_memory_reservation_init(token);
+    return 0;
+}
+static int
+wl_columnar_arrangement_registry_retire(wl_columnar_join_batch_record_t *record,
+    int primary)
+{
+    if (!record->registry.new_entries) {
+        record->phase = WL_COLUMNAR_JOIN_BATCH_INERT; return primary;
+    }
+    /* Only actual successful moves are reversed.  A failed reverse or owner
+     * transfer keeps both original arrays and this exact subphase reachable. */
+    for (;;) {
+        if (record->registry.transport == 2u ||
+            record->registry.transport == 3u){
+            col_arr_entry_t *old = &record->registry.old_entries[
+                record->registry.cursor];
+            col_arr_entry_t *fresh = &record->registry.new_entries[
+                record->registry.cursor];
+            if (!wl_columnar_memory_reservation_move(&old->arr.reservation,
+                &fresh->arr.reservation))
+                return wl_columnar_arrangement_cleanup_result(primary, EINVAL);
+            record->registry.transport = 1u;
+            if (!wl_columnar_memory_transfer(&old->arr.reservation,
+                &old->arr)){
+                record->registry.transport = 4u;
+                return wl_columnar_arrangement_cleanup_result(primary, EINVAL);
+            }
+        } else if (record->registry.transport == 4u) {
+            col_arr_entry_t *old = &record->registry.old_entries[
+                record->registry.cursor];
+            if (!wl_columnar_memory_transfer(&old->arr.reservation, &old->arr))
+                return wl_columnar_arrangement_cleanup_result(primary, EINVAL);
+        }
+        record->registry.transport = 0;
+        if (!record->registry.cursor) break;
+        record->registry.cursor--;
+        col_arr_entry_t *fresh = &record->registry.new_entries[
+            record->registry.cursor];
+        uint64_t state = atomic_load_explicit(&fresh->arr.reservation.state,
+                memory_order_acquire);
+        if (state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+            || state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED)
+            record->registry.transport = 2u;
+    }
+    free(record->registry.new_entries); record->registry.new_entries = NULL;
+    record->registry.old_entries = NULL;
+    record->phase = WL_COLUMNAR_JOIN_BATCH_INERT;
+    return primary;
+}
+static int
+wl_columnar_arrangement_registry_copy(void *dst, const void *src, size_t bytes,
+    wl_evaluation_control_t *control)
+{
+    for (size_t at = 0; at < bytes;) {
+        size_t count = bytes - at; if (count > 128u) count = 128u;
+        int rc = wl_evaluation_control_charge(control, count);
+        if (rc) return rc;
+        memcpy((char *)dst + at, (const char *)src + at, count); at += count;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    return 0;
+}
+int
+wl_columnar_arrangement_registry_grow_controlled(
+    wl_columnar_join_batch_record_t *record, uint32_t capacity)
+{
+    if (!record || !record->ready || !record->session || !record->control
+        || record->phase != WL_COLUMNAR_JOIN_BATCH_INERT) return EINVAL;
+    wl_col_session_t *session = record->session;
+    wl_evaluation_control_t *control = record->control;
+    if (capacity <= session->arr_cap || capacity < session->arr_count
+        || (uint64_t)capacity * sizeof(col_arr_entry_t) >
+        SIZE_MAX) return EINVAL;
+    for (uint32_t i = 0; i < session->arr_count; i++) {
+        int rc = wl_evaluation_control_charge(control, 1); if (rc) return rc;
+        if (session->arr_entries[i].pin_count) return EBUSY;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    int rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
+    memset(&record->registry, 0, sizeof(record->registry));
+    record->registry.capacity = capacity;
+    record->registry.count = session->arr_count;
+    record->registry.old_entries = session->arr_entries;
+    record->phase = WL_COLUMNAR_JOIN_BATCH_REGISTRY;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+    rc = wl_evaluation_control_charge(control, 1); if (rc) goto done;
+    record->registry.new_entries = malloc((size_t)capacity
+            * sizeof(col_arr_entry_t));
+    if (!record->registry.new_entries) {
+        rc = ENOMEM; goto done;
+    }
+    rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+    for (size_t at = 0; at < (size_t)capacity * sizeof(col_arr_entry_t);) {
+        size_t count = (size_t)capacity * sizeof(col_arr_entry_t) - at;
+        if (count > 128u) count = 128u;
+        rc = wl_evaluation_control_charge(control, count); if (rc) goto done;
+        memset((char *)record->registry.new_entries + at, 0, count);
+        at += count;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+    }
+    const size_t offset = offsetof(col_arr_entry_t, arr)
+        + offsetof(col_arrangement_t, reservation);
+    const size_t end = offset + sizeof(wl_columnar_memory_reservation_t);
+    for (; record->registry.cursor < session->arr_count;
+        record->registry.cursor++){
+        col_arr_entry_t *old = &record->registry.old_entries[
+            record->registry.cursor];
+        col_arr_entry_t *fresh = &record->registry.new_entries[
+            record->registry.cursor];
+        rc = wl_evaluation_control_charge(control, 96); if (rc) goto done;
+        wl_columnar_memory_reservation_init(&fresh->arr.reservation);
+        uint64_t state = atomic_load_explicit(&old->arr.reservation.state,
+                memory_order_acquire);
+        if (old->arr.reservation.identity != &old->arr.reservation
+            || (state != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+            && state != WL_COLUMNAR_MEMORY_RESERVATION_RELEASED
+            && state != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+            && state != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED)) {
+            rc = EINVAL; goto done;
+        }
+        rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+        rc = wl_columnar_arrangement_registry_copy(fresh, old, offset, control);
+        if (rc) goto done;
+        rc = wl_columnar_arrangement_registry_copy((char *)fresh + end,
+                (char *)old + end, sizeof(*old) - end, control);
+        if (rc) goto done;
+        record->registry.transport = 1u;
+        if (state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+            || state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED) {
+            rc = wl_evaluation_control_charge(control, 96); if (rc) goto done;
+            if (!wl_columnar_memory_reservation_move(&fresh->arr.reservation,
+                &old->arr.reservation)) {
+                rc = EINVAL; goto done;
+            }
+            record->registry.transport = 2u;
+            wl_columnar_join_batch_checkpoint(record, 9,
+                record->registry.cursor);
+            rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+            rc = wl_evaluation_control_charge(control, 96); if (rc) goto done;
+            if (!wl_columnar_memory_transfer(&fresh->arr.reservation,
+                &fresh->arr)) {
+                rc = EINVAL; goto done;
+            }
+            record->registry.transport = 3u;
+            wl_columnar_join_batch_checkpoint(record, 10,
+                record->registry.cursor);
+            rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+        }
+        record->registry.transport = 0;
+    }
+    rc = wl_evaluation_control_charge(control, 16); if (rc) goto done;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+    session->arr_entries = record->registry.new_entries;
+    session->arr_cap = capacity;
+    record->registry.new_entries = NULL;
+    free(record->registry.old_entries); record->registry.old_entries = NULL;
+    record->phase = WL_COLUMNAR_JOIN_BATCH_INERT;
+    return 0;
+done:
+    return wl_columnar_arrangement_registry_retire(record, rc);
+}
+int
+wl_columnar_arrangement_record_retire(wl_columnar_join_batch_record_t *record,
+    int primary)
+{
+    if (!record || !record->ready) return primary > 0 ? primary : EINVAL;
+    if (record->phase == WL_COLUMNAR_JOIN_BATCH_INERT) return primary;
+    if (record->phase == WL_COLUMNAR_JOIN_BATCH_REGISTRY)
+        return wl_columnar_arrangement_registry_retire(record, primary);
+    if (record->phase != WL_COLUMNAR_JOIN_BATCH_BUILD)
+        return wl_columnar_arrangement_cleanup_result(primary, EBUSY);
+    col_arrangement_t *arr = record->entry ? &record->entry->arr : NULL;
+    if (!arr) return wl_columnar_arrangement_cleanup_result(primary, EINVAL);
+    if (!record->committed && record->build.credit_installed) {
+        if (!wl_columnar_memory_reservation_move(&record->pending,
+            &arr->reservation))
+            return wl_columnar_arrangement_cleanup_result(primary, EINVAL);
+        record->build.credit_installed = false;
+    }
+    if (!record->committed && record->retired.bytes) {
+        if (!wl_columnar_memory_reservation_move(&arr->reservation,
+            &record->retired))
+            return wl_columnar_arrangement_cleanup_result(primary, EINVAL);
+    }
+    free(record->build.head); record->build.head = NULL;
+    free(record->build.next); record->build.next = NULL;
+    free(record->build.old_head); record->build.old_head = NULL;
+    free(record->build.old_next); record->build.old_next = NULL;
+    int rc = wl_columnar_arrangement_credit_retire(&record->pending);
+    primary = wl_columnar_arrangement_cleanup_result(primary, rc);
+    rc = wl_columnar_arrangement_credit_retire(&record->retired);
+    primary = wl_columnar_arrangement_cleanup_result(primary, rc);
+    if (!rc && !record->pending.bytes && !record->retired.bytes) {
+        wl_columnar_memory_reservation_init(&record->pending);
+        wl_columnar_memory_reservation_init(&record->retired);
+        record->phase = WL_COLUMNAR_JOIN_BATCH_INERT;
+        record->committed = false;
+    }
+    return primary;
+}
+static int
+wl_columnar_arrangement_build_tail(wl_columnar_join_batch_record_t *record)
+{
+    return wl_evaluation_control_charge(record->control, 0);
+}
+int
+wl_columnar_arrangement_build_controlled(
+    wl_columnar_join_batch_record_t *record,
+    col_arr_entry_t *entry, const col_rel_t *rel)
+{
+    if (!record || !record->ready || !record->control || !entry || !rel
+        || record->phase != WL_COLUMNAR_JOIN_BATCH_INERT) return EINVAL;
+    wl_evaluation_control_t *control = record->control;
+    int rc = wl_evaluation_control_charge(control, 64);
+    if (rc) return rc;
+    col_arrangement_t *arr = &entry->arr;
+    if (entry->pin_count) return EBUSY;
+    if (rel->nrows > UINT32_MAX / 2u) return ENOMEM;
+    uint32_t buckets = arr_next_pow2(rel->nrows ? rel->nrows * 2u : 16u);
+    if (!buckets) return ENOMEM;
+    uint32_t capacity = arr->ht_cap;
+    if (rel->nrows > capacity) {
+        uint32_t doubled = capacity > UINT32_MAX / 2u
+            ? UINT32_MAX : capacity * 2u;
+        capacity = rel->nrows > doubled ? rel->nrows : doubled;
+        if (capacity < 16u) capacity = 16u;
+    }
+    uint64_t head_bytes, next_bytes, bytes;
+    if (!wl_columnar_memory_size_mul(buckets, sizeof(uint64_t), &head_bytes)
+        || !wl_columnar_memory_size_mul(capacity, sizeof(uint32_t), &next_bytes)
+        || !wl_columnar_memory_size_add(head_bytes, next_bytes, &bytes)
+        || head_bytes > SIZE_MAX || next_bytes > SIZE_MAX) return ENOMEM;
+    rc = wl_columnar_arrangement_build_tail(record); if (rc) return rc;
+    memset(&record->build, 0, sizeof(record->build));
+    record->phase = WL_COLUMNAR_JOIN_BATCH_BUILD; record->entry = entry;
+    record->build.buckets = buckets; record->build.capacity = capacity;
+    record->build.bytes = bytes;
+    record->build.ledger_before = arr_ledger_bytes(arr);
+    bool changed = buckets != arr->nbuckets || capacity != arr->ht_cap;
+    if (changed && arr->memory_governor) {
+        wl_columnar_memory_admission_status_t status;
+        rc = wl_columnar_memory_governor_reserve_checked_controlled(
+            wl_columnar_memory_governor_ref_get(arr->memory_governor), bytes,
+            &record->pending, &status, control);
+        if (rc) goto done;
+        if (status > WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                record->session->memory_budget_denied = true;
+            rc = ENOMEM; goto done;
+        }
+        bool accepted;
+        rc = wl_columnar_memory_governor_commit_controlled(&record->pending,
+                arr, &accepted, control);
+        if (rc) goto done;
+        if (!accepted) {
+            rc = EINVAL; goto done;
+        }
+    }
+    if (buckets != arr->nbuckets) {
+        rc = wl_evaluation_control_charge(control, 1); if (rc) goto done;
+        record->build.head = malloc((size_t)head_bytes);
+        if (!record->build.head) {
+            rc = ENOMEM; goto done;
+        }
+        rc = wl_columnar_arrangement_build_tail(record); if (rc) goto done;
+        for (uint64_t at = 0; at < head_bytes;) {
+            uint64_t n = head_bytes - at; if (n > 128u) n = 128u;
+            rc = wl_evaluation_control_charge(control, n); if (rc) goto done;
+            memset((char *)record->build.head + at, 0, (size_t)n); at += n;
+            wl_columnar_join_batch_checkpoint(record, 1, at);
+            rc = wl_columnar_arrangement_build_tail(record); if (rc) goto done;
+        }
+    }
+    if (capacity != arr->ht_cap) {
+        rc = wl_evaluation_control_charge(control, 1); if (rc) goto done;
+        record->build.next = malloc((size_t)next_bytes);
+        if (!record->build.next) {
+            rc = ENOMEM; goto done;
+        }
+        rc = wl_columnar_arrangement_build_tail(record); if (rc) goto done;
+    }
+    rc = wl_evaluation_control_charge(control, 192); if (rc) goto done;
+    rc = wl_columnar_arrangement_build_tail(record); if (rc) goto done;
+    if (changed && arr->memory_governor && bytes != arr->reserved_bytes) {
+        if (arr->reserved_bytes && !wl_columnar_memory_reservation_move(
+                &record->retired, &arr->reservation)) {
+            rc = EINVAL; goto done;
+        }
+        if (!wl_columnar_memory_reservation_move(&arr->reservation,
+            &record->pending)){
+            rc = EINVAL; goto done;
+        }
+        record->build.credit_installed = true;
+    }
+    /* All fallible transport precedes this scalar physical installation. */
+    arr_entry_mark_unbuilt(entry);
+    if (record->build.head) {
+        record->build.old_head = arr->ht_head;
+        arr->ht_head = record->build.head; record->build.head = NULL;
+        arr->nbuckets = buckets;
+    }
+    if (record->build.next) {
+        record->build.old_next = arr->ht_next;
+        arr->ht_next = record->build.next; record->build.next = NULL;
+        arr->ht_cap = capacity;
+    }
+    if (changed && arr->memory_governor) arr->reserved_bytes = bytes;
+    record->committed = true;
+    arr_ledger_sync(arr, record->build.ledger_before);
+    record->session->arr_total_bytes -= entry->mem_bytes;
+    entry->mem_bytes = (size_t)bytes;
+    record->session->arr_total_bytes += entry->mem_bytes;
+    free(record->build.old_head); record->build.old_head = NULL;
+    free(record->build.old_next); record->build.old_next = NULL;
+    rc = wl_columnar_arrangement_credit_retire(&record->retired);
+    if (rc) goto done;
+    rc = wl_columnar_arrangement_credit_retire(&record->pending);
+    if (rc) goto done;
+    rc = wl_evaluation_control_charge(control, 8); if (rc) goto done;
+    rc = wl_columnar_arrangement_build_tail(record); if (rc) goto done;
+    if (arr->generation == UINT32_MAX) {
+        for (uint32_t b = 0; b < buckets; b++) {
+            rc = wl_evaluation_control_charge(control, 1); if (rc) goto done;
+            arr->ht_head[b] = 0;
+            rc = wl_columnar_arrangement_build_tail(record); if (rc) goto done;
+        }
+        arr->generation = 1;
+    } else {
+        arr->generation++; if (!arr->generation) arr->generation = 1;
+    }
+    for (uint32_t row = 0; row < rel->nrows; row++) {
+        rc = wl_evaluation_control_charge(control, 1); if (rc) goto done;
+        uint32_t hash = (uint32_t)UINT64_C(14695981039346656037);
+        rc = wl_columnar_arrangement_build_tail(record); if (rc) goto done;
+        for (uint32_t k = 0; k < arr->key_count; k++) {
+            rc = wl_evaluation_control_charge(control, 1); if (rc) goto done;
+            uint32_t col = arr->key_cols[k];
+            if (col >= rel->ncols || !rel->columns || !rel->columns[col]) {
+                rc = EINVAL; goto done;
+            }
+            uint64_t value = wl_columnar_value_key(rel, col,
+                    rel->columns[col][row]);
+            rc = wl_columnar_arrangement_build_tail(record); if (rc) goto done;
+            for (uint32_t byte = 0; byte < 8u; byte++) {
+                rc = wl_evaluation_control_charge(control, 1);
+                if (rc) goto done;
+                hash ^= (uint32_t)(value & 255u); hash *= 435u; value >>= 8;
+                rc = wl_columnar_arrangement_build_tail(record);
+                if (rc) goto done;
+            }
+        }
+        uint32_t bucket = hash & (buckets - 1u);
+        rc = wl_evaluation_control_charge(control, 3); if (rc) goto done;
+        uint64_t head = arr->ht_head[bucket];
+        arr->ht_next[row] = ARR_HEAD_GENERATION(head) == arr->generation
+            ? ARR_HEAD_ROW(head) : UINT32_MAX;
+        arr->ht_head[bucket] = ARR_MAKE_HEAD(arr->generation, row);
+        record->build.row = row + 1u;
+        wl_columnar_join_batch_checkpoint(record, 2, row + 1u);
+        rc = wl_columnar_arrangement_build_tail(record); if (rc) goto done;
+    }
+    rc = wl_evaluation_control_charge(control, 16); if (rc) goto done;
+    rc = wl_columnar_arrangement_build_tail(record); if (rc) goto done;
+    arr->indexed_rows = rel->nrows;
+    entry->source_snapshot = wl_columnar_relation_snapshot(rel);
+    entry->rebuild_deferred = false;
+    entry->lru_clock = ++record->session->arr_clock;
+    rc = 0;
+done:
+    return wl_columnar_arrangement_record_retire(record, rc);
+}
+
 /* ======================================================================== */
 /* Arrangement Cache LRU Eviction (Issue #216)                              */
 /* ======================================================================== */
@@ -808,6 +1202,289 @@ col_arr_cache_evict_lru(wl_col_session_t *cs, size_t target_bytes)
     }
 }
 
+static int
+wl_columnar_arrangement_evict_controlled(
+    wl_columnar_join_batch_record_t *record,
+    size_t target)
+{
+    wl_col_session_t *session = record->session;
+    wl_evaluation_control_t *control = record->control;
+    for (;;) {
+        int rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+        bool finished = session->arr_total_bytes <= target;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (finished) return 0;
+        uint32_t victim = UINT32_MAX;
+        uint64_t minimum = UINT64_MAX;
+        for (uint32_t i = 0; i < session->arr_count; i++) {
+            rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+            col_arr_entry_t *entry = &session->arr_entries[i];
+            if (entry->mem_bytes) {
+                if (entry->pin_count) entry->evict_deferred = true;
+                else if (arr_entry_unbuilt(entry)) victim = i;
+                else if (entry->lru_clock < minimum) {
+                    minimum = entry->lru_clock; victim = i;
+                }
+            }
+            rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+            if (victim == i && arr_entry_unbuilt(entry)) break;
+        }
+        if (victim == UINT32_MAX) return 0;
+        rc = wl_evaluation_control_charge(control, 192); if (rc) return rc;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        col_arr_entry_t *entry = &session->arr_entries[victim];
+        col_arrangement_t *arr = &entry->arr;
+        memset(&record->build, 0, sizeof(record->build));
+        record->phase = WL_COLUMNAR_JOIN_BATCH_BUILD; record->entry = entry;
+        if (arr->reserved_bytes && !wl_columnar_memory_reservation_move(
+                &record->retired, &arr->reservation))
+            return wl_columnar_arrangement_record_retire(record, EINVAL);
+        record->committed = true;
+        record->build.old_head = arr->ht_head;
+        record->build.old_next = arr->ht_next;
+        uint64_t before = arr_ledger_bytes(arr);
+        arr->ht_head = NULL; arr->ht_next = NULL;
+        arr->nbuckets = 0; arr->ht_cap = 0; arr->generation = 0;
+        arr->reserved_bytes = 0;
+        arr_entry_mark_unbuilt(entry); arr_ledger_sync(arr, before);
+        session->arr_total_bytes -= entry->mem_bytes;
+        entry->mem_bytes = 0; entry->evict_deferred = false;
+        rc = wl_columnar_arrangement_record_retire(record, 0);
+        if (rc) return rc;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+}
+int
+wl_columnar_arrangement_pin_retire_controlled(
+    wl_columnar_join_batch_record_t *record,
+    col_arrangement_pin_t *pin, int primary, bool mandatory)
+{
+    if (!record || !record->ready || !pin || !record->session)
+        return wl_columnar_arrangement_cleanup_result(primary, EINVAL);
+    if (!pin->active) return primary;
+    wl_col_session_t *session = record->session;
+    uintptr_t base = (uintptr_t)session->arr_entries;
+    uintptr_t address = (uintptr_t)pin->entry;
+    uint64_t bytes = (uint64_t)session->arr_count * sizeof(col_arr_entry_t);
+    int rc = mandatory ? 0 : wl_evaluation_control_charge(record->control, 96);
+    if (rc) return wl_columnar_arrangement_cleanup_result(primary, rc);
+    if (!session->arr_entries || bytes > UINTPTR_MAX - base || address < base
+        || address >= base + bytes || (address - base) % sizeof(col_arr_entry_t)
+        || pin->session != session || pin->arr != &pin->entry->arr
+        || !pin->entry->pin_count)
+        return wl_columnar_arrangement_cleanup_result(primary, EINVAL);
+    if (!mandatory) {
+        rc = wl_evaluation_control_charge(record->control, 0);
+        if (rc) return wl_columnar_arrangement_cleanup_result(primary, rc);
+    }
+    col_arr_entry_t *entry = pin->entry;
+    entry->pin_count--;
+    if (!entry->pin_count && entry->rebuild_deferred) {
+        arr_entry_mark_unbuilt(entry); entry->rebuild_deferred = false;
+    }
+    bool evict = !entry->pin_count && entry->evict_deferred;
+    memset(pin, 0, sizeof(*pin));
+    if (!mandatory) {
+        rc = wl_evaluation_control_charge(record->control, 0);
+        if (rc) return wl_columnar_arrangement_cleanup_result(primary, rc);
+        if (evict) {
+            rc = wl_columnar_arrangement_evict_controlled(record,
+                    session->arr_cache_limit_bytes / 4u * 3u);
+            if (rc) return wl_columnar_arrangement_cleanup_result(primary, rc);
+            entry->evict_deferred = false;
+        }
+    }
+    return primary;
+}
+int
+wl_columnar_arrangement_pending_evict_controlled(
+    wl_columnar_join_batch_record_t *record)
+{
+    if (!record || !record->ready || !record->session) return EINVAL;
+    bool pending = false;
+    for (uint32_t i = 0; i < record->session->arr_count; i++) {
+        int rc = wl_evaluation_control_charge(record->control, 1);
+        if (rc) return rc;
+        pending = pending || record->session->arr_entries[i].evict_deferred;
+        rc = wl_evaluation_control_charge(record->control, 0);
+        if (rc) return rc;
+    }
+    return pending ? wl_columnar_arrangement_evict_controlled(record,
+               record->session->arr_cache_limit_bytes / 4u * 3u) : 0;
+}
+static int
+wl_columnar_arrangement_name_equal_controlled(const char *a, const char *b,
+    bool *equal, wl_evaluation_control_t *control)
+{
+    *equal = false;
+    if (!a || !b) return 0;
+    for (size_t i = 0;; i++) {
+        int rc = wl_evaluation_control_charge(control, 1); if (rc) return rc;
+        char av = a[i], bv = b[i];
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (av != bv) return 0;
+        if (!av) {
+            *equal = true; return 0;
+        }
+    }
+}
+int
+wl_columnar_arrangement_primary_controlled(
+    wl_columnar_join_batch_record_t *record,
+    const col_rel_t *source, const char *name, const uint32_t *keys,
+    uint32_t key_count, col_arr_entry_t **out)
+{
+    if (!record || !record->ready || !record->session || !record->control
+        || record->phase != WL_COLUMNAR_JOIN_BATCH_INERT || !source || !name
+        || !keys || !key_count || !out || *out) return EINVAL;
+    wl_col_session_t *session = record->session;
+    wl_evaluation_control_t *control = record->control;
+    int rc;
+    for (uint32_t k = 0; k < key_count; k++) {
+        rc = wl_evaluation_control_charge(control, 1); if (rc) return rc;
+        if (keys[k] >= source->ncols) return ENOENT;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    for (uint32_t i = 0; i < session->arr_count; i++) {
+        rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+        col_arr_entry_t *entry = &session->arr_entries[i];
+        bool match = entry->key_count == key_count;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (!match) continue;
+        rc = wl_columnar_arrangement_name_equal_controlled(entry->rel_name,
+                name, &match, control); if (rc) return rc;
+        if (!match) continue;
+        for (uint32_t k = 0; k < key_count; k++) {
+            rc = wl_evaluation_control_charge(control, 1); if (rc) return rc;
+            match = entry->key_cols && entry->key_cols[k] == keys[k];
+            rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+            if (!match) break;
+        }
+        if (!match) continue;
+        rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+        bool fresh = wl_columnar_relation_snapshot_equal(entry->source_snapshot,
+                wl_columnar_relation_snapshot(source)) &&
+            !arr_entry_unbuilt(entry)
+            && entry->arr.indexed_rows == source->nrows &&
+            !entry->rebuild_deferred;
+        if (!fresh && entry->pin_count) {
+            entry->rebuild_deferred = true; return EBUSY;
+        }
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (!fresh) {
+            rc = wl_columnar_arrangement_build_controlled(record, entry,
+                    source);
+            if (rc) return rc;
+        }
+        rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        entry->lru_clock = ++session->arr_clock; *out = entry; return 0;
+    }
+    if (session->arr_count >= COL_ARR_CACHE_MAX
+        || session->arr_total_bytes >= session->arr_cache_limit_bytes) {
+        rc = wl_columnar_arrangement_evict_controlled(record,
+                session->arr_cache_limit_bytes / 4u * 3u);
+        if (rc) return rc;
+    }
+    uint32_t slot = session->arr_count;
+    for (uint32_t i = 0; i < session->arr_count; i++) {
+        rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+        bool reusable = !session->arr_entries[i].mem_bytes
+            && !session->arr_entries[i].pin_count;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (reusable) {
+            slot = i; break;
+        }
+    }
+    if (slot == session->arr_count && slot >= session->arr_cap) {
+        uint32_t capacity = session->arr_cap ? session->arr_cap * 2u : 8u;
+        if (capacity < session->arr_cap) return ENOMEM;
+        rc = wl_columnar_arrangement_registry_grow_controlled(record, capacity);
+        if (rc) return rc;
+    }
+    /* Staged name/key ownership remains in the original registry overlay. */
+    rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
+    memset(&record->registry, 0, sizeof(record->registry));
+    record->registry.slot = slot;
+    record->phase = WL_COLUMNAR_JOIN_BATCH_REGISTRY;
+    size_t length = 0;
+    for (;;) {
+        rc = wl_evaluation_control_charge(control, 1); if (rc) goto create_done;
+        char byte = name[length];
+        if (length == SIZE_MAX) {
+            rc = EOVERFLOW; goto create_done;
+        }
+        length++;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) goto create_done;
+        if (!byte) break;
+    }
+    rc = wl_evaluation_control_charge(control, 1); if (rc) goto create_done;
+    record->registry.name = malloc(length);
+    if (!record->registry.name) {
+        rc = ENOMEM; goto create_done;
+    }
+    rc = wl_evaluation_control_charge(control, 0); if (rc) goto create_done;
+    rc = wl_columnar_arrangement_registry_copy(record->registry.name, name,
+            length, control); if (rc) goto create_done;
+    if ((uint64_t)key_count * sizeof(uint32_t) > SIZE_MAX) {
+        rc = ENOMEM; goto create_done;
+    }
+    rc = wl_evaluation_control_charge(control, 1); if (rc) goto create_done;
+    record->registry.keys = malloc((size_t)key_count * sizeof(uint32_t));
+    if (!record->registry.keys) {
+        rc = ENOMEM; goto create_done;
+    }
+    rc = wl_evaluation_control_charge(control, 0); if (rc) goto create_done;
+    rc = wl_columnar_arrangement_registry_copy(record->registry.keys, keys,
+            (size_t)key_count * sizeof(uint32_t), control);
+    if (rc) goto create_done;
+    rc = wl_evaluation_control_charge(control, 256); if (rc) goto create_done;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) goto create_done;
+    col_arr_entry_t *entry = &session->arr_entries[slot];
+    bool appended = slot == session->arr_count;
+    if (!appended) {
+        uint64_t state = atomic_load_explicit(&entry->arr.reservation.state,
+                memory_order_acquire);
+        if (entry->arr.ht_head || entry->arr.ht_next ||
+            entry->arr.reserved_bytes
+            || entry->arr.reservation.identity != &entry->arr.reservation
+            || (state != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+            && state != WL_COLUMNAR_MEMORY_RESERVATION_RELEASED)) {
+            rc = EINVAL; goto create_done;
+        }
+        free(entry->rel_name); free(entry->key_cols);
+        wl_columnar_memory_governor_ref_release(entry->arr.memory_governor);
+        entry->arr.memory_governor = NULL;
+    }
+    memset(entry, 0, sizeof(*entry));
+    wl_columnar_memory_reservation_init(&entry->arr.reservation);
+    entry->rel_name = record->registry.name; record->registry.name = NULL;
+    entry->key_cols = record->registry.keys; record->registry.keys = NULL;
+    entry->key_count = key_count; entry->arr.key_cols = entry->key_cols;
+    entry->arr.key_count = key_count; entry->arr.ledger = &session->mem_ledger;
+    col_arr_attach_memory_governor(&entry->arr, session->memory_governor);
+    if (slot == session->arr_count) session->arr_count++;
+    record->phase = WL_COLUMNAR_JOIN_BATCH_INERT;
+    rc = wl_columnar_arrangement_build_controlled(record, entry, source);
+    if (rc) {
+        if (rc == ENOMEM && appended && !entry->mem_bytes
+            && record->phase == WL_COLUMNAR_JOIN_BATCH_INERT) {
+            free(entry->rel_name); entry->rel_name = NULL;
+            free(entry->key_cols); entry->key_cols = NULL;
+            wl_columnar_memory_governor_ref_release(entry->arr.memory_governor);
+            entry->arr.memory_governor = NULL;
+            session->arr_count--;
+        }
+        return rc;
+    }
+    *out = entry; return 0;
+create_done:
+    free(record->registry.name); record->registry.name = NULL;
+    free(record->registry.keys); record->registry.keys = NULL;
+    record->phase = WL_COLUMNAR_JOIN_BATCH_INERT;
+    return rc;
+}
+
 static col_arr_entry_t *
 col_arr_entry_for_arr(wl_col_session_t *cs, const col_arrangement_t *arr)
 {
@@ -846,6 +1523,11 @@ col_session_get_arrangement_for_source(wl_col_session_t *cs, col_rel_t *rel,
     if (!cs || !rel || !rel_name || !key_cols || key_count == 0 || !out_arr)
         return EINVAL;
     *out_arr = NULL;
+    wl_columnar_join_batch_record_t *pending =
+        wl_columnar_eval_stack_cleanup_join_batch(cs->cleanup_active
+            ? cs->cleanup_active : cs->cleanup_pending);
+    if (pending && (pending->phase == WL_COLUMNAR_JOIN_BATCH_REGISTRY
+        || pending->phase == WL_COLUMNAR_JOIN_BATCH_BUILD)) return EBUSY;
     if (!arr_key_cols_valid(rel, key_cols, key_count))
         return ENOENT;
 

@@ -2,6 +2,7 @@
 
 #include "columnar/continuation.h"
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -27,6 +28,19 @@ wl_columnar_continuation_create(
     continuation->producer = *producer;
     continuation->cursor = *initial_cursor;
     return continuation;
+}
+
+int
+wl_columnar_continuation_detach_producer(
+    wl_columnar_continuation_t *continuation,
+    void *original)
+{
+    if (!continuation ||
+        continuation->producer.context != original) return EINVAL;
+    continuation->producer.context = NULL;
+    continuation->producer.destroy = NULL;
+    continuation->producer.cancel = NULL;
+    return 0;
 }
 
 void

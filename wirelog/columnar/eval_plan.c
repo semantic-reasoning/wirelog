@@ -226,8 +226,21 @@ normal_eval:
             break;
         case WL_PLAN_OP_JOIN:
             if (sess->base.evaluation_control
-                && (sess->diff_operators_active || sess->join_batch_bytes))
+                && sess->diff_operators_active)
                 return ENOTSUP;
+            if (sess->base.evaluation_control && sess->join_batch_bytes) {
+                rc = wl_evaluation_control_charge(sess->base.evaluation_control,
+                        96);
+                if (!rc) rc = wl_evaluation_control_charge(
+                        sess->base.evaluation_control, 0);
+                if (rc) return rc;
+                if (i + 1u < rplan->op_count) {
+                    col_join_batch_record_fallback(sess,
+                        COL_JOIN_BATCH_EXCLUDED_PIPELINE);
+                    if (sess->join_batch_strict) return ENOTSUP;
+                }
+                goto ordinary_join;
+            }
             if (!sess->diff_operators_active && sess->join_batch_bytes > 0) {
                 uint32_t next_index = i;
                 int pipeline_rc = wl_columnar_join_pipeline_try_eval(rplan, i,
@@ -388,7 +401,9 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
             || sess->tdd_input_run || sess->tdd_subpass_active
             || sess->tdd_outbound_only_active || sess->delta_seeded
             || sess->retraction_seeded || sess->retraction_right_pass
-            || sess->join_batch_bytes || sess->join_output_shared_count
+            || (sess->join_batch_bytes && (!joined_consolidate
+            || rplan->op_count != 3u || !rplan->ops[1].key_count))
+            || sess->join_output_shared_count
             || !sess->memory_governor
             || (op->delta_mode != WL_DELTA_FORCE_FULL
             && !((owned_consolidate || filtered_consolidate ||

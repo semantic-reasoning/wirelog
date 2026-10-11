@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **334**). The earlier audit sections
+match the script's count (currently **339**). The earlier audit sections
 retain their historical per-section counts.
 
 Format: `file:function[#N]` | field | operation | order | justification.
@@ -407,7 +407,7 @@ and direct non-atomic payload reads require external synchronization.
 | `memory_governor.c:wl_columnar_memory_reservation_move#6` | `source->owner_bits` | `atomic_store_explicit` | `relaxed` | Clear the source owner after ownership has moved |
 | `memory_governor.c:wl_columnar_memory_reservation_move#7` | `source->state` | `atomic_store_explicit` | `release` | Publish the empty source state after clearing its ownership |
 
-### 5.9 `wirelog/columnar/arrangement.c` — reservation relocation (5 rows)
+### 5.9 `wirelog/columnar/arrangement.c` — reservation relocation (9 rows)
 
 Arrangement registry entries embed non-copyable memory reservations. These
 loads validate the reservation state before moving or publishing a token;
@@ -420,6 +420,11 @@ the relocation paths preserve identity and transfer ownership explicitly.
 | `arrangement.c:arr_entry_relocate#2` | `dst->arr.reservation.state` | `atomic_load_explicit` | `acquire` | Revalidate the moved token before transferring its owner |
 | `arrangement.c:filt_arr_entry_relocate` | `src->arr.reservation.state` | `atomic_load_explicit` | `acquire` | Validate the filtered source token before relocation |
 | `arrangement.c:filt_arr_entry_relocate#2` | `dst->arr.reservation.state` | `atomic_load_explicit` | `acquire` | Revalidate the moved filtered token before owner transfer |
+
+| `arrangement.c:wl_columnar_arrangement_credit_retire` | `token.state` | `atomic_load_explicit` | `acquire` | Select checked original RESERVED rollback/COMMITTED release after physical retirement |
+| `arrangement.c:wl_columnar_arrangement_registry_retire` | `fresh.arr.reservation.state` | `atomic_load_explicit` | `acquire` | Recover original relocated credit disposition at retained new-array slot before checked restoration |
+| `arrangement.c:wl_columnar_arrangement_registry_grow_controlled` | `old.arr.reservation.state` | `atomic_load_explicit` | `acquire` | Validate original registry token disposition before actual checked relocation |
+| `arrangement.c:wl_columnar_arrangement_primary_controlled` | `entry.arr.reservation.state` | `atomic_load_explicit` | `acquire` | Verify reusable tombstone has original EMPTY/RELEASED credit before replacement |
 
 ### 5.10 `wirelog/arena/compound_arena.c` — mutation gate and GC holds (7 rows)
 
@@ -1645,3 +1650,9 @@ the real frame and original authority. Dirty primitive FLOAT reset validates
 schema under both original writers without allocating or releasing payload.
 Its caller always finishes cleanup, preserves an existing positive primary,
 and consumes a published reset cursor before a possible cleanup refusal.
+
+### 5.23 `wirelog/columnar/join_batch.c` — checked batch credit retirement (1 row)
+
+| Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `join_batch.c:wl_columnar_join_batch_credit_retire` | `token.state` | `atomic_load_explicit` | `acquire` | Select original checked batch credit rollback/release after physical disposal |

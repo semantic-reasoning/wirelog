@@ -2571,9 +2571,20 @@ wl_columnar_merge_consolidate_controlled(eval_stack_t *stack,
         || sess->tdd_subpass_active || sess->tdd_outbound_only_active
         || sess->delta_seeded || sess->retraction_seeded ||
         sess->retraction_right_pass
-        || sess->join_batch_bytes || sess->join_output_shared_count
+        || sess->join_output_shared_count
         || sess->current_iteration || sess->delta_observer ||
         !sess->memory_governor) return ENOTSUP;
+    if (sess->join_batch_bytes) {
+        int admission = wl_evaluation_control_charge(c, 64);
+        if (admission) return admission;
+        wl_columnar_join_batch_record_t *batch =
+            wl_columnar_eval_stack_cleanup_join_batch(sess->cleanup_active);
+        if (batch && (batch->phase != WL_COLUMNAR_JOIN_BATCH_INERT
+            || batch->producer || batch->continuation || batch->left_keys
+            || batch->right_keys || batch->types)) return EBUSY;
+        admission = wl_evaluation_control_charge(c, 0);
+        if (admission) return admission;
+    }
     wl_columnar_relation_private_batch_t *writer = NULL;
     int rc = wl_columnar_eval_stack_cleanup_private_batch_owner(sess, stack,
             &writer, c);

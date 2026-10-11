@@ -5338,9 +5338,10 @@ wl_columnar_session_serial_preflight(wl_col_session_t *sess)
         || sess->retraction_seeded || sess->retraction_right_pass
         || sess->diff_operators_active || sess->tdd_input_run
         || sess->tdd_subpass_active || sess->tdd_outbound_only_active
-        || sess->join_batch_bytes || sess->join_output_shared_count
+        || sess->join_output_shared_count
         || sess->plain_step_completion_pending || sess->source_leases
-        || sess->arr_count || sess->darr_count || sess->filt_arr_count
+        || (sess->arr_count && !sess->join_batch_bytes)
+        || sess->darr_count || sess->filt_arr_count
         || sess->diff_arr_count || sess->sarr_count || sess->filt_cache_count
         || sess->mat_cache.count || sess->mat_cache.active_pins
         || sess->frontier_ops != &col_frontier_epoch_ops
@@ -5419,6 +5420,8 @@ wl_columnar_session_serial_preflight(wl_col_session_t *sess)
                 || (rp->ops[0].delta_mode != WL_DELTA_AUTO
                 && rp->ops[0].delta_mode != WL_DELTA_FORCE_FULL))
                 return ENOTSUP;
+            if (sess->join_batch_bytes && (!joined || rp->op_count != 3u
+                || !rp->ops[1].key_count)) return ENOTSUP;
             rc = wl_columnar_session_serial_tail(control, 1, ri, NULL);
             if (rc) return rc;
             has_heads = true;
@@ -5835,7 +5838,7 @@ wl_columnar_session_serial_stable_output(wl_col_session_t *sess,
         || sess->delta_publish_active || sess->diff_operators_active
         || sess->tdd_input_run || sess->tdd_subpass_active
         || sess->tdd_outbound_only_active || sess->plain_step_completion_pending
-        || sess->join_output_shared_count || sess->join_batch_bytes)
+        || sess->join_output_shared_count)
         return ENOTSUP;
     for (uint32_t si = 0; si < sess->plan->stratum_count; si++) {
         rc = wl_evaluation_control_charge(control, 16);

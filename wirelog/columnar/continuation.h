@@ -101,6 +101,10 @@ typedef struct {
 } wl_columnar_continuation_sink_t;
 
 typedef struct wl_columnar_continuation wl_columnar_continuation_t;
+/* Checked detachment permits original-record producer retirement before the
+ * shell is physically freed; the shell allocation formula stays unchanged. */
+int wl_columnar_continuation_detach_producer(wl_columnar_continuation_t *,
+    void *);
 
 wl_columnar_continuation_t *
 wl_columnar_continuation_create(

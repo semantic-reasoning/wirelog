@@ -1296,7 +1296,7 @@ wl_columnar_join_controlled_char(const char *name, size_t pos, char *value,
     wl_columnar_join_controlled_checkpoint(control, 11, pos + 1u, NULL, NULL);
     return wl_columnar_join_controlled_tail(control);
 }
-static int
+int
 wl_columnar_join_controlled_key(const col_rel_t *r, const char *name,
     uint32_t *key, wl_evaluation_control_t *control)
 {
@@ -1468,6 +1468,129 @@ wl_columnar_join_controlled_select_right(const wl_plan_op_t *op,
     return wl_columnar_relation_source_group_drain(group, rc);
 }
 
+static int
+wl_columnar_join_batch_operator_controlled(const wl_plan_op_t *op,
+    eval_stack_t *stack, wl_col_session_t *session, const col_rel_t *left,
+    const col_rel_t *right, uint32_t width,
+    wl_columnar_relation_source_group_t *sources,
+    wl_columnar_relation_private_batch_t *writer,
+    wl_evaluation_control_t *control)
+{
+    if (stack->top >= COL_STACK_MAX || !stack->top) return EOVERFLOW;
+    uint32_t left_slot = stack->top - 1u, output_slot = stack->top;
+    wl_columnar_join_batch_record_t *record = NULL;
+    int rc = wl_columnar_eval_stack_cleanup_join_batch_owner(session, stack,
+            &record, control);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 32);
+    if (rc) return rc;
+    stack->items[output_slot] = (eval_entry_t){0};
+    stack->top++;
+    record->output = &stack->items[output_slot];
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto done;
+    rc = wl_columnar_relation_new_auto_governed_controlled("$join", width,
+            COL_REL_INIT_CAP, false, session->memory_governor,
+            &record->output->rel, control);
+    if (record->output->rel) {
+        record->output->owned = true;
+        record->output->kind = WL_COLUMNAR_EVAL_ENTRY_RELATION;
+    }
+    if (rc) goto done;
+    uint64_t bytes;
+    if (!wl_columnar_memory_size_mul(width, sizeof(*record->types), &bytes)
+        || bytes > SIZE_MAX) {
+        rc = EOVERFLOW; goto done;
+    }
+    rc = wl_evaluation_control_charge(control, 1);
+    if (rc) goto done;
+    record->types = bytes ? malloc((size_t)bytes) : NULL;
+    if (bytes && !record->types) {
+        rc = ENOMEM; goto done;
+    }
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto done;
+    for (uint32_t column = 0; column < width; column++) {
+        rc = wl_evaluation_control_charge(control, 2);
+        if (rc) goto done;
+        uint32_t index = op->project_count && op->project_indices
+            ? op->project_indices[column] : column;
+        record->types[column] = index < left->ncols
+            ? (left->column_types ? left->column_types[index] :
+            WIRELOG_TYPE_INT64)
+            : index - left->ncols < right->ncols
+            ? (right->column_types ? right->column_types[index - left->ncols]
+                : WIRELOG_TYPE_INT64) : WIRELOG_TYPE_INT64;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto done;
+    }
+    wl_columnar_relation_bulk_append_t *bulk =
+        wl_columnar_eval_stack_cleanup_bulk_append(session->cleanup_active);
+    rc = wl_columnar_relation_private_types_controlled(bulk,
+            record->output->rel, record->types, control);
+    if (rc) goto done;
+    rc = wl_columnar_join_batch_create_controlled(record, op, left, right);
+    if (rc == ENOTSUP && !session->join_batch_strict && record->producer) {
+        rc = wl_evaluation_control_charge(control, 96);
+        if (!rc) rc = wl_evaluation_control_charge(control, 0);
+        if (rc) goto done;
+        col_join_batch_record_fallback(session,
+            COL_JOIN_BATCH_EXCLUDED_ROW_TOO_LARGE);
+        rc = wl_columnar_join_batch_probe_controlled(record, op, left, right,
+                writer);
+    } else {
+        if (rc) goto done;
+        rc = wl_columnar_join_batch_run_controlled(record);
+    }
+    if (rc) goto done;
+    rc = wl_columnar_relation_bulk_append_retire(bulk, 0);
+    if (rc) goto done;
+    rc = wl_columnar_relation_private_batch_retire(writer, 0);
+    if (rc) goto done;
+    rc = wl_columnar_relation_source_group_release_readers(sources, 0);
+    if (rc) goto done;
+    rc = wl_evaluation_control_charge(control, 96);
+    if (!rc) rc = wl_columnar_relation_source_group_validate_writers(sources);
+    if (!rc) rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto done;
+    wl_columnar_relation_source_group_commit(sources);
+    rc = wl_columnar_relation_source_group_drain(sources, 0);
+    if (rc) goto done;
+    eval_entry_t *scratch =
+        wl_columnar_eval_stack_cleanup_result(session->cleanup_active);
+    rc = wl_evaluation_control_charge(control, 1);
+    if (!rc) rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto done;
+    rc = eval_entry_dispose(scratch);
+    if (rc) goto done;
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto done;
+    /* A real final-output epoch supplies the exact owned CONS provenance.
+     * The saved original writer is retired directly on a failed acquisition;
+     * frame.result remains the sole scratch owner and is now empty. */
+    rc = wl_columnar_relation_private_append_batch_begin_controlled(writer,
+            stack->items[output_slot].rel, control);
+    if (!rc) {
+        wl_columnar_join_batch_checkpoint(record, 6, 0);
+        rc = wl_evaluation_control_charge(control, 0);
+    }
+    if (!rc) rc =
+            wl_columnar_relation_private_append_batch_end_controlled(writer);
+    if (rc) goto done;
+    rc = wl_evaluation_control_charge(control, 96);
+    if (!rc) rc = wl_evaluation_control_charge(control, 0);
+    if (rc) goto done;
+    rc = eval_entry_dispose(&stack->items[left_slot]);
+    if (rc) goto done;
+    stack->items[left_slot] = stack->items[output_slot];
+    stack->items[output_slot] = (eval_entry_t){0};
+    stack->top = output_slot;
+    return 0;
+done:
+    rc = wl_columnar_relation_private_batch_retire(writer, rc);
+    return wl_columnar_join_memory_error(session, rc);
+}
+
 /* First explicit controlled strategy: ordinary full-right Cartesian/hash JOIN.
  * Private B1 rows cannot escape before the single operator journal cutoff. */
 static int
@@ -1479,7 +1602,7 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
         || sess->diff_operators_active || sess->tdd_input_run
         || sess->tdd_subpass_active || sess->tdd_outbound_only_active
         || sess->delta_seeded || sess->retraction_seeded
-        || sess->retraction_right_pass || sess->join_batch_bytes
+        || sess->retraction_right_pass
         || sess->join_output_shared_count || op->right_filter_expr.size
         || op->materialized || (op->delta_mode != WL_DELTA_FORCE_FULL
         && op->delta_mode != WL_DELTA_AUTO)
@@ -1551,6 +1674,10 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     }
     if (empty_zero) kc = 0;
     rc = wl_columnar_join_controlled_tail(control); if (rc) goto cleanup;
+    if (sess->join_batch_bytes && right && right->nrows && left->nrows && kc) {
+        return wl_columnar_join_batch_operator_controlled(op, stack, sess,
+                   left, right, width, group, record, control);
+    }
     uint32_t buckets = 0;
     if (kc) {
         if (right->nrows > UINT32_MAX / 2u) {

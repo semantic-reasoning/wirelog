@@ -1226,3 +1226,43 @@ alone does not establish physical STRING metadata in the default backend.
 A genuine source containing a declared FLOAT lane installs its complete lane
 metadata and supplies the tested STRING grouping lineage through REDUCE,
 typed CONCAT and dirty reset, without post-producer retagging.
+
+
+### Controlled ordinary keyed JOIN batches
+
+The ordinary generated VARIABLE → keyed JOIN → CONSOLIDATE route supports
+configured batches through the original cleanup frame. Its primary arrangement
+lookup, registry transport, hash construction and producer comparisons charge
+work before inspection. Empty buckets and rejected chain candidates still poll.
+The arrangement, producer, continuation and scratch keep their original memory
+policy and descriptor sizes; the preparation workspace holds their exclusive
+phase record. FILTER/MAP pipeline and recursive or differential batches remain
+outstanding execution lanes.
+
+Scratch is owned by the original result entry while the producer borrows it.
+The final output stays in an existing stack slot. Scratch private writers retire
+before bulk publication acquires its readers and writers. Exact scratch growth
+keeps the raw capacity clamp and reacquires the original private writer with a
+fresh nonce. A fully drained allocation denial may produce a short batch;
+work stops and authority refusals retain their actual error.
+
+A committed sink batch advances the continuation cursor once, including a
+subsequent cleanup refusal. Checked retirement frees and nulls physical payload
+before releasing its original credit. Refused authority stays reachable for
+mandatory cleanup; a positive initiating error retains precedence. Final output
+passes through a genuine private-writer begin/end before owned CONSOLIDATE.
+The existing mandatory physical-destruction exclusion applies to stopped cleanup.
+
+A non-strict subrow budget falls back only after the actual creator reaches its
+row-size rejection. It retains a real primary pin while retiring the producer,
+scratch and descriptor, then probes that same primary arrangement with charged
+hashing, comparisons and row publication. It does not create a second hash table
+or reset the evaluation control. Strict and downstream pipeline policies retain
+the raw refusal and fallback rules.
+
+
+The existing injected no-arrangement probe-bundle tests remain raw-only
+regression evidence. A valid controlled primary cache miss creates a bounded
+persistent primary; it does not reach that raw ENOENT seam. Malformed key,
+memory, authority and work failures keep their actual errors. Actual
+filtered/delta/materialized/LFTJ fallback coverage remains outstanding.

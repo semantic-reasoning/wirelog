@@ -269,6 +269,7 @@ struct wl_columnar_eval_stack_cleanup_frame {
             union {
                 wl_columnar_consolidate_record_t consolidate;
                 wl_columnar_expr_operator_preparation_t preparation;
+                wl_columnar_join_batch_record_t join_batch;
             };
             wl_columnar_relation_bulk_append_t bulk_append;
         };
@@ -629,6 +630,10 @@ wl_columnar_eval_stack_workspace_retire(
 {
     uint32_t mode = wl_columnar_eval_stack_cleanup_mode(frame);
     if (mode == WL_COLUMNAR_SERIAL_FRAME_WORKSPACE_INITIALIZING) return 0;
+    if (mode == WL_COLUMNAR_SERIAL_FRAME_BATCH)
+        return frame->session->serial_completion.payload_ready &&
+               frame->join_batch.ready
+            ? wl_columnar_join_batch_record_retire(&frame->join_batch, 0) : 0;
     if (mode == WL_COLUMNAR_SERIAL_FRAME_OPERATOR)
         return frame->session->serial_completion.payload_ready
                && frame->preparation.ready ? wl_columnar_expr_operator_retire(
@@ -659,6 +664,46 @@ wl_columnar_eval_stack_workspace_clear(
     }
     return 0;
 }
+int
+wl_columnar_eval_stack_cleanup_join_batch_owner(wl_col_session_t *session,
+    eval_stack_t *stack, wl_columnar_join_batch_record_t **out,
+    wl_evaluation_control_t *control)
+{
+    if (!session || !stack || !out || *out || !control) return EINVAL;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = session->cleanup_active;
+    if (!frame || frame->session != session || &frame->stack != stack)
+        return EINVAL;
+    int rc = wl_columnar_eval_stack_workspace_clear(frame, control);
+    if (rc) return rc;
+    wl_columnar_memory_reservation_t *tokens[] = {&frame->join_batch.pending,
+                                                  &frame->join_batch.retired,
+                                                  &frame->join_batch.descriptor};
+    for (uint32_t i = 0; i < 3u; i++) {
+        rc = wl_evaluation_control_charge(control, 96); if (rc) return rc;
+        wl_columnar_memory_reservation_init(tokens[i]);
+        frame->join_batch.initialized_tokens++;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(control, 24); if (rc) return rc;
+    frame->join_batch.session = session; frame->join_batch.control = control;
+    frame->join_batch.ready = true;
+    session->serial_completion.payload_ready = true;
+    session->serial_completion.mode = WL_COLUMNAR_SERIAL_FRAME_BATCH;
+    *out = &frame->join_batch;
+    return wl_evaluation_control_charge(control, 0);
+}
+wl_columnar_join_batch_record_t *
+wl_columnar_eval_stack_cleanup_join_batch(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    return frame && frame->session
+           && wl_columnar_eval_stack_cleanup_mode(frame) ==
+           WL_COLUMNAR_SERIAL_FRAME_BATCH
+           && frame->session->serial_completion.payload_ready &&
+           frame->join_batch.ready
+        ? &frame->join_batch : NULL;
+}
+
 int
 wl_columnar_eval_stack_cleanup_operator_preparation_owner(
     wl_col_session_t *sess,
