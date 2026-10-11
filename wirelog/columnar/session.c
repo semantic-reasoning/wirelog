@@ -2587,6 +2587,14 @@ session_snapshot_insert_admitted(const wl_plan_t *plan, uint64_t mask)
     return true;
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+/* Issue #2119: calls of session_snapshot_insert() that returned 0, counted
+ * by the snapshotting thread.  A later cutoff, compaction or emit failure in
+ * the same snapshot does not undo the count, and the retry counts again.
+ * Plain, not atomic: the tests that read it snapshot from one thread. */
+uint32_t wl_columnar_session_test_insert_route_taken;
+#endif
+
 /*
  * session_snapshot_insert: Bring the strata an incremental insert reaches up
  * to date without re-deriving what their heads hold (Issue #2114).
@@ -6010,6 +6018,9 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
         && sess->last_inserted_relation != NULL) {
         int insert_rc = session_snapshot_insert(session, plan);
         if (insert_rc == 0) {
+#ifdef WL_SESSION_TEST_HOOKS
+            wl_columnar_session_test_insert_route_taken++;
+#endif
             /* The insert route bypasses the stratum evaluators, which keep
              * the frontiers; reset them as a full evaluation does. */
             sess->diff_operators_active = false;

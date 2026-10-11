@@ -18,7 +18,10 @@
  * Each case evaluates a program over its old rows with a snapshot, adds the
  * new rows the incremental way, and requires every relation of the next two
  * snapshots to equal a fresh evaluation over old and new rows together, in
- * sessions created with one worker and with four.
+ * sessions created with one worker and with four.  Issue #2119: the first of
+ * those snapshots must take the insert route and the second must not; a
+ * staged removal must keep the snapshot off it, and the injected failures
+ * must be injected into a route that ran.
  */
 
 #ifndef _POSIX_C_SOURCE
@@ -87,6 +90,19 @@ typedef struct {
 } model_t;
 
 static char message[256];
+
+/* Require the insert route to have been taken @want times since @before. */
+static const char *
+expect_route(uint32_t before, uint32_t want, const char *when)
+{
+    uint32_t taken = wl_columnar_session_test_insert_route_taken - before;
+
+    if (taken == want)
+        return NULL;
+    snprintf(message, sizeof(message), "%s: insert route taken %u times, "
+        "want %u", when, taken, want);
+    return message;
+}
 
 static void
 collect(const char *relation, const int64_t *row, uint32_t ncols,
@@ -207,6 +223,7 @@ run_case(const case_t *c, uint32_t workers)
     model_t *got = calloc(1, sizeof(*got));
     model_t *want = calloc(1, sizeof(*want));
     const char *why = NULL;
+    uint32_t route0;
 
     if (!got || !want) {
         why = "memory";
@@ -244,18 +261,22 @@ run_case(const case_t *c, uint32_t workers)
             goto done;
         }
     }
+    route0 = wl_columnar_session_test_insert_route_taken;
     if (add_rows(s, &c->new_rows, true, c->compound) != 0) {
         why = "incremental insert";
         goto done;
     }
     for (int round = 0; round < 2 && !why; round++) {
+        const char *when = round == 0 ? "first snapshot after"
+            : "second snapshot after";
         memset(got, 0, sizeof(*got));
         if (wl_session_snapshot(s, collect, got) != 0) {
             why = "snapshot after the insert failed";
             break;
         }
-        why = same_model(got, want, round == 0 ? "first snapshot after"
-                : "second snapshot after");
+        why = same_model(got, want, when);
+        if (!why)
+            why = expect_route(route0, 1, when);
     }
 done:
     if (s)
@@ -271,6 +292,7 @@ done:
 
 #define F_DECL ".decl __compound_f_2(handle: int64, a0: int64, a1: int64)\n"
 
+/* Monotone, aggregate-free programs: each must take the insert route. */
 static const case_t CASES[] = {
     /* Shape A: the changed atom precedes the recursive one. */
     { "right-recursive closure (shape A)", false,
@@ -353,6 +375,7 @@ staged_removal_then_insert(uint32_t workers)
     model_t *got = calloc(1, sizeof(*got));
     model_t *want = calloc(1, sizeof(*want));
     const char *why = NULL;
+    uint32_t route0;
 
     if (!got || !want || open_session(src, workers, &oplan, &oracle) != 0
         || add_rows(oracle, &kept_rows, false, false) != 0
@@ -370,6 +393,7 @@ staged_removal_then_insert(uint32_t workers)
         goto done;
     }
     wl_session_set_delta_cb(s, NULL, NULL);
+    route0 = wl_columnar_session_test_insert_route_taken;
     if (add_rows(s, &new_rows, true, false) != 0) {
         why = "incremental insert";
         goto done;
@@ -380,6 +404,8 @@ staged_removal_then_insert(uint32_t workers)
         goto done;
     }
     why = same_model(got, want, "snapshot after the removal and insert");
+    if (!why)
+        why = expect_route(route0, 0, "snapshot after the removal and insert");
 done:
     if (s)
         wl_session_destroy(s);
@@ -397,11 +423,13 @@ done:
  * the same snapshot; any other failure is returned, and the session keeps
  * asking for a full evaluation, so the next snapshot is right. */
 static int inject_rc;
+static uint32_t merge_calls;
 
 static int
 fail_after_merge(const wl_plan_stratum_t *sp)
 {
     (void)sp;
+    merge_calls++;
     return inject_rc;
 }
 
@@ -422,6 +450,7 @@ failure_after_update(int rc_injected, uint32_t workers)
     model_t *got = calloc(1, sizeof(*got));
     model_t *want = calloc(1, sizeof(*want));
     const char *why = NULL;
+    uint32_t route0;
     int rc;
 
     if (!got || !want || open_session(c.src, workers, &oplan, &oracle) != 0
@@ -436,10 +465,16 @@ failure_after_update(int rc_injected, uint32_t workers)
         goto done;
     }
     inject_rc = rc_injected;
+    merge_calls = 0;
+    route0 = wl_columnar_session_test_insert_route_taken;
     wl_columnar_eval_tdd_insert_test_after_merge = fail_after_merge;
     memset(got, 0, sizeof(*got));
     rc = wl_session_snapshot(s, collect, got);
     wl_columnar_eval_tdd_insert_test_after_merge = NULL;
+    if (merge_calls == 0) {
+        why = "the insert route did not run, so nothing was injected";
+        goto done;
+    }
     if (rc_injected == EINVAL) {
         /* Redone in full within the same snapshot. */
         if (rc != 0) {
@@ -447,6 +482,8 @@ failure_after_update(int rc_injected, uint32_t workers)
             goto done;
         }
         why = same_model(got, want, "snapshot with the refusal");
+        if (!why)
+            why = expect_route(route0, 0, "snapshot with the refusal");
         goto done;
     }
     if (rc != rc_injected || !COL_SESSION(s)->pending_full_input_eval) {
@@ -459,6 +496,8 @@ failure_after_update(int rc_injected, uint32_t workers)
         goto done;
     }
     why = same_model(got, want, "retry after the failure");
+    if (!why)
+        why = expect_route(route0, 0, "retry after the failure");
 done:
     wl_columnar_eval_tdd_insert_test_after_merge = NULL;
     if (s)
