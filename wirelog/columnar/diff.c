@@ -358,6 +358,19 @@ int
 col_op_exchange(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
 {
+    wl_evaluation_control_t *control =
+        sess ? sess->base.evaluation_control : NULL;
+    if (control) {
+        int rc = wl_evaluation_control_charge(control, 16);
+        if (rc) return rc;
+        if (!op || !op->opaque_data) return EINVAL;
+        const wl_plan_op_exchange_t *meta = op->opaque_data;
+        /* The raw W1 boundary precedes parallel stack/key validation. */
+        bool single = meta->num_workers <= 1;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return rc;
+        return single ? 0 : ENOTSUP;
+    }
     if (!op->opaque_data)
         return EINVAL;
 

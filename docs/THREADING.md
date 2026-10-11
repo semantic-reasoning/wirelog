@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **344**). The earlier audit sections
+match the script's count (currently **376**). The earlier audit sections
 retain their historical per-section counts.
 
 Format: `file:function[#N]` | field | operation | order | justification.
@@ -1691,3 +1691,44 @@ that slot already terminal; the remaining descriptor and cache pin stay
 reachable. Pin bookkeeping consumes its original probe before a fallible tail,
 so mandatory checked retry cannot decrement a gate or pin twice. Cache registry
 relocation refuses while any actual pin is active.
+
+### 5.24 Ordinary recursive original-authority lifecycle (32 rows)
+
+Bounded recursive preparation, sampling and cleanup retain their original
+reservation and gate slots across stops. These observations validate actual
+held authority; the two relaxed gauge reads observe serialized sampling state.
+
+| Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `compound_arena.c:wl_arena_compound_arena_gc_step` | `arena->access_gate` | `atomic_compare_exchange_weak_explicit` | `acquire`/`relaxed` | Original mutation gate bounded weakCAS acquire/relaxed plus heldcount/gate acquire snapshots under exact original GC token; no raw identity copies. |
+| `compound_arena.c:wl_arena_compound_arena_gc_step#2` | `arena->gc_hold_count` | `atomic_load_explicit` | `acquire` | Original mutation gate bounded weakCAS acquire/relaxed plus heldcount/gate acquire snapshots under exact original GC token; no raw identity copies. |
+| `compound_arena.c:wl_arena_compound_arena_gc_step#3` | `arena->access_gate` | `atomic_load_explicit` | `acquire` | Original mutation gate bounded weakCAS acquire/relaxed plus heldcount/gate acquire snapshots under exact original GC token; no raw identity copies. |
+| `eval_stack.c:wl_columnar_eval_stack_cleanup_credit_terminal` | `token->state` | `atomic_load_explicit` | `acquire` | Original terminal credit acquire and retained idle original state/owner acquire, mode-first frame disposition. |
+| `eval_stack.c:wl_columnar_eval_stack_cleanup_idle` | `token->state` | `atomic_load_explicit` | `acquire` | Original terminal credit acquire and retained idle original state/owner acquire, mode-first frame disposition. |
+| `eval_stack.c:wl_columnar_eval_stack_cleanup_idle#2` | `token->owner_bits` | `atomic_load_explicit` | `acquire` | Original terminal credit acquire and retained idle original state/owner acquire, mode-first frame disposition. |
+| `memory_governor.c:wl_columnar_memory_governor_transfer_controlled` | `token->state` | `atomic_load_explicit` | `acquire` | Controlled original transfer state acquire, transition weakCAS acq_rel/acquire, actual owner/state publication release. |
+| `memory_governor.c:wl_columnar_memory_governor_transfer_controlled#2` | `token->state` | `atomic_compare_exchange_weak_explicit` | `acq_rel`/`acquire` | Controlled original transfer state acquire, transition weakCAS acq_rel/acquire, actual owner/state publication release. |
+| `memory_governor.c:wl_columnar_memory_governor_transfer_controlled#3` | `token->owner_bits` | `atomic_store_explicit` | `release` | Controlled original transfer state acquire, transition weakCAS acq_rel/acquire, actual owner/state publication release. |
+| `memory_governor.c:wl_columnar_memory_governor_transfer_controlled#4` | `token->state` | `atomic_store_explicit` | `release` | Controlled original transfer state acquire, transition weakCAS acq_rel/acquire, actual owner/state publication release. |
+| `merge.c:wl_columnar_merge_incremental_scratch_retire` | `tokens[i]->state` | `atomic_load_explicit` | `acquire` | Original scratch/compaction credit readiness under address-stable ownership. |
+| `merge.c:wl_columnar_merge_incremental_scratch_retire#2` | `scratch->compaction_admission.state` | `atomic_load_explicit` | `acquire` | Original scratch/compaction credit readiness under address-stable ownership. |
+| `merge.c:wl_columnar_merge_incremental_compact` | `scratch->compaction_admission.state` | `atomic_load_explicit` | `acquire` | Original scratch/compaction credit readiness under address-stable ownership. |
+| `relation.c:wl_columnar_relation_single_writer_release_controlled` | `gate->state` | `atomic_load_explicit` | `acquire` | Bounded original SINGLE writer load acquire and platform release/relaxed CAS; held physical-shape/tombstone gate/alias/credit original state snapshots acquire. |
+| `relation.c:wl_columnar_relation_single_writer_release_controlled#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | `release`/`relaxed` | Bounded original SINGLE writer load acquire and platform release/relaxed CAS; held physical-shape/tombstone gate/alias/credit original state snapshots acquire. |
+| `relation.c:wl_columnar_relation_single_writer_release_controlled#3` | `gate->state` | `atomic_compare_exchange_strong_explicit` | `release`/`relaxed` | Bounded original SINGLE writer load acquire and platform release/relaxed CAS; held physical-shape/tombstone gate/alias/credit original state snapshots acquire. |
+| `relation.c:wl_columnar_relation_transport_bytes_controlled` | `r->descriptor_access.state` | `atomic_load_explicit` | `acquire` | Bounded original SINGLE writer load acquire and platform release/relaxed CAS; held physical-shape/tombstone gate/alias/credit original state snapshots acquire. |
+| `relation.c:wl_columnar_relation_transport_bytes_controlled#2` | `held->owner->source_access.state` | `atomic_load_explicit` | `acquire` | Bounded original SINGLE writer load acquire and platform release/relaxed CAS; held physical-shape/tombstone gate/alias/credit original state snapshots acquire. |
+| `relation.c:wl_columnar_relation_pool_sample_controlled` | `r->storage_alias_borrows` | `atomic_load_explicit` | `acquire` | Bounded original SINGLE writer load acquire and platform release/relaxed CAS; held physical-shape/tombstone gate/alias/credit original state snapshots acquire. |
+| `relation.c:wl_columnar_relation_pool_sample_controlled#2` | `r->source_access.state` | `atomic_load_explicit` | `acquire` | Bounded original SINGLE writer load acquire and platform release/relaxed CAS; held physical-shape/tombstone gate/alias/credit original state snapshots acquire. |
+| `relation.c:wl_columnar_relation_pool_sample_controlled#3` | `r->descriptor_access.state` | `atomic_load_explicit` | `acquire` | Bounded original SINGLE writer load acquire and platform release/relaxed CAS; held physical-shape/tombstone gate/alias/credit original state snapshots acquire. |
+| `relation.c:wl_columnar_relation_pool_sample_controlled#4` | `t->owner_bits` | `atomic_load_explicit` | `acquire` | Bounded original SINGLE writer load acquire and platform release/relaxed CAS; held physical-shape/tombstone gate/alias/credit original state snapshots acquire. |
+| `relation.c:wl_columnar_relation_pool_sample_controlled#5` | `t->state` | `atomic_load_explicit` | `acquire` | Bounded original SINGLE writer load acquire and platform release/relaxed CAS; held physical-shape/tombstone gate/alias/credit original state snapshots acquire. |
+| `session.c:wl_columnar_session_invalidate_caches_controlled` | `token->state` | `atomic_load_explicit` | `acquire` | Actual cache transaction/promotion forward+reverse original credit snapshots acquire, checked removal credit acquire, read-only sampling pin observations relaxed under serialized ownership. |
+| `session.c:wl_columnar_session_promotion_move_credits` | `source_token->state` | `atomic_load_explicit` | `acquire` | Actual cache transaction/promotion forward+reverse original credit snapshots acquire, checked removal credit acquire, read-only sampling pin observations relaxed under serialized ownership. |
+| `session.c:wl_columnar_session_promotion_move_credits#2` | `source_token->owner_bits` | `atomic_load_explicit` | `acquire` | Actual cache transaction/promotion forward+reverse original credit snapshots acquire, checked removal credit acquire, read-only sampling pin observations relaxed under serialized ownership. |
+| `session.c:wl_columnar_session_promotion_reverse_payload` | `source->descriptor_access.state` | `atomic_load_explicit` | `acquire` | Actual cache transaction/promotion forward+reverse original credit snapshots acquire, checked removal credit acquire, read-only sampling pin observations relaxed under serialized ownership. |
+| `session.c:wl_columnar_session_promotion_reverse_payload#2` | `source->source_access.state` | `atomic_load_explicit` | `acquire` | Actual cache transaction/promotion forward+reverse original credit snapshots acquire, checked removal credit acquire, read-only sampling pin observations relaxed under serialized ownership. |
+| `session.c:wl_columnar_session_recursive_removal_drain` | `token->state` | `atomic_load_explicit` | `acquire` | Actual cache transaction/promotion forward+reverse original credit snapshots acquire, checked removal credit acquire, read-only sampling pin observations relaxed under serialized ownership. |
+| `session.c:wl_columnar_session_mem_sample_controlled` | `sess->mem_ledger.subsys_bytes[WL_MEM_SUBSYS_STORED]` | `atomic_load_explicit` | `relaxed` | Actual cache transaction/promotion forward+reverse original credit snapshots acquire, checked removal credit acquire, read-only sampling pin observations relaxed under serialized ownership. |
+| `session.c:wl_columnar_session_mem_sample_controlled#2` | `sess->mem_ledger.subsys_bytes[WL_MEM_SUBSYS_TEMPORARY]` | `atomic_load_explicit` | `relaxed` | Actual cache transaction/promotion forward+reverse original credit snapshots acquire, checked removal credit acquire, read-only sampling pin observations relaxed under serialized ownership. |
+| `session_hash.c:wl_columnar_session_hash_retire_checked` | `token->state` | `atomic_load_explicit` | `acquire` | Actual original hash state acquire AFTER physicalarrayNULL, before real rollback/release; refused identity retains pending credit. |

@@ -143,6 +143,33 @@ session_rels_release(wl_columnar_memory_reservation_t *reservation)
         abort();
 }
 
+/* Geometry alone grants no relation authority. Promotion and reverse also
+ * validate the actual journal entry and original held mutation lease. */
+int
+wl_columnar_session_recursive_pool_extent(wl_col_session_t *sess,
+    uint64_t *extent, uint32_t *slots)
+{
+    if (!sess || !extent || !slots) return EINVAL;
+    delta_pool_t *pool = sess->delta_pool;
+    wl_columnar_eval_serial_recursive_record_t *r = &sess->recursive;
+    if (!pool || !pool->slab || pool->slot_size < sizeof(col_rel_t)
+        || pool->slot_size % _Alignof(col_rel_t)
+        || (uintptr_t)pool->slab % _Alignof(col_rel_t)
+        || pool->slot_used > pool->slot_cap) return EINVAL;
+    *slots = pool->slot_used;
+    if (r->reset_active) {
+        if (!r->active || !r->ready || r->reset_pool != pool
+            || r->reset_slab != pool->slab || r->reset_stride != pool->slot_size
+            || pool->slot_used || r->reset_high_water > pool->slot_cap)
+            return EINVAL;
+        *slots = r->reset_high_water;
+    }
+    if (!wl_columnar_memory_size_mul(*slots, pool->slot_size, extent)
+        || *extent > SIZE_MAX || *extent > UINTPTR_MAX - (uintptr_t)pool->slab)
+        return EINVAL;
+    return 0;
+}
+
 static void
 session_invalidate_relation_caches(wl_col_session_t *sess, const char *name)
 {
@@ -195,6 +222,110 @@ session_invalidate_relation_caches(wl_col_session_t *sess, const char *name)
         out++;
     }
     sess->filt_cache_count = out;
+}
+
+static int
+wl_columnar_session_name_equal_controlled(const char *a, const char *b,
+    bool *equal, wl_evaluation_control_t *control)
+{
+    *equal = false;
+    if (!a || !b) return 0;
+    for (size_t i = 0;; i++) {
+        int rc = wl_evaluation_control_charge(control, 2); if (rc) return rc;
+        char av = a[i], bv = b[i];
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (av != bv) return 0;
+        if (!av) {
+            *equal = true; return 0;
+        }
+    }
+}
+
+static int
+wl_columnar_session_invalidate_caches_controlled(wl_col_session_t *sess,
+    wl_evaluation_control_t *control)
+{
+    wl_columnar_eval_serial_recursive_record_t *r = &sess->recursive;
+    int rc;
+    if (r->phase != WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_REMOVAL
+        || !r->removal_name) return EINVAL;
+    if (r->removal_family < 4) {
+        rc = wl_columnar_arrangement_invalidate_controlled(sess,
+                r->removal_name,
+                &r->removal_family, &r->removal_cursor, control);
+        if (rc) return rc;
+    }
+    if (r->removal_family == 4) {
+        rc = wl_columnar_cache_mat_retire_controlled(&sess->mat_cache,
+                &r->removal_cursor, true, control); if (rc) return rc;
+        r->removal_family = 5; r->removal_cursor = 0;
+    }
+    if (r->removal_family == 5) {
+        rc = wl_columnar_cache_mat_retire_controlled(&sess->mat_cache,
+                &r->removal_cursor, false, control); if (rc) return rc;
+        r->removal_family = 6; r->removal_cursor = 0;
+    }
+    if (r->removal_family != 6) return EINVAL;
+    while (r->removal_cursor < sess->filt_cache_count) {
+        rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        col_filt_cache_entry_t *e = &sess->filt_cache[r->removal_cursor];
+        bool match = e->evict_deferred && !e->rel_name &&
+            e->metadata_reservation;
+        if (!match) {
+            rc = wl_columnar_session_name_equal_controlled(e->rel_name,
+                    r->removal_name, &match, control); if (rc) return rc;
+        }
+        if (!match) {
+            r->removal_cursor++; continue;
+        }
+        bool compact = !sess->filt_cache_active_pins;
+        uint64_t bytes = 0;
+        if (compact && (!wl_columnar_memory_size_mul(
+                sess->filt_cache_count - r->removal_cursor - 1u, sizeof(*e),
+                &bytes)
+            || bytes > SIZE_MAX)) return EOVERFLOW;
+        for (uint64_t at = 0; at < bytes;) {
+            uint64_t n = bytes - at; if (n > 256) n = 256;
+            rc = wl_evaluation_control_charge(control, n); if (rc) return rc;
+            at += n;
+            rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        }
+        rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (e->pin_count) {
+            e->evict_deferred = true; r->removal_cursor++; continue;
+        }
+        if (e->filtered) {
+            rc = col_rel_destroy_checked(e->filtered); if (rc) return rc;
+            e->filtered = NULL;
+        }
+        e->source_nrows = 0; e->source_snapshot = (col_relation_snapshot_t){0};
+        if (compact) {
+            e->evict_deferred = true;
+            free(e->rel_name); e->rel_name = NULL;
+            free(e->filter_data); e->filter_data = NULL;
+            wl_columnar_memory_reservation_t *token = e->metadata_reservation;
+            if (token) {
+                if (token->identity != token) return EINVAL;
+                uint64_t state = atomic_load_explicit(&token->state,
+                        memory_order_acquire);
+                bool ok = state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+                    ? wl_columnar_memory_rollback(token)
+                    : state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+                    ? wl_columnar_memory_release(token)
+                    : state == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+                    || state == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED;
+                if (!ok) return EINVAL;
+                free(token); e->metadata_reservation = NULL;
+            }
+            memset(e, 0, sizeof(*e));
+            memmove(e, e + 1, (size_t)bytes); sess->filt_cache_count--;
+        } else r->removal_cursor++;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    r->removal_family = 7; r->removal_cursor = 0;
+    return 0;
 }
 
 int
@@ -1017,6 +1148,8 @@ wl_columnar_session_cleanup_ready(wl_col_session_t *sess)
      * active plus pending cleanup is rejected by the cleanup primitive. */
     int rc = sess->cleanup_pending
         ? wl_columnar_eval_stack_cleanup_retry(sess) : 0;
+    if (rc == 0 && sess->recursive.cleanup_pending)
+        rc = wl_columnar_eval_serial_recursive_retire(sess, 0, NULL);
     return rc != 0 ? rc : wl_columnar_eval_delta_rollback_retry(sess);
 }
 
@@ -1426,6 +1559,507 @@ session_pool_rel_move_name(col_rel_t *dst, col_rel_t *src,
     dst->pool_name_reserved_bytes = src->pool_name_reserved_bytes;
     src->pool_name_reserved_bytes = 0;
     return true;
+}
+
+static wl_columnar_memory_reservation_t *
+wl_columnar_session_promotion_credit(col_rel_t *r, unsigned slot,
+    uint64_t **bytes)
+{
+    switch (slot) {
+    case 0: *bytes = &r->metadata_reserved_bytes;
+        return &r->metadata_reservation;
+    case 1: *bytes = &r->retained_reserved_bytes;
+        return &r->retained_reservation;
+    case 2: *bytes = &r->pool_name_reserved_bytes;
+        return &r->pool_name_reservation;
+    case 3: *bytes = &r->dedup_reserved_bytes; return &r->dedup_reservation;
+    default: *bytes = NULL; return NULL;
+    }
+}
+
+/* Reversal operates only on consumed original transitions. It retains both
+ * descriptors and the original source writers on any real refusal. */
+static int
+wl_columnar_session_promotion_reverse_credits(
+    wl_columnar_session_promotion_scratch_t *state, col_rel_t *candidate)
+{
+    if (!state->source || !candidate || (state->payload_owned
+        && !(state->reversing && state->tombstone &&
+        state->phase == 10))) return EINVAL;
+    if (state->owner_transferred) {
+        uint64_t *bytes;
+        wl_columnar_memory_reservation_t *token =
+            wl_columnar_session_promotion_credit(state->source,
+                state->move_index, &bytes);
+        bool transferred = false;
+        int rc = wl_columnar_memory_governor_transfer_controlled(token,
+                state->source, &transferred, NULL);
+        if (rc || !transferred) return rc > 0 ? rc : EINVAL;
+        state->owner_transferred = false;
+    }
+    for (unsigned i = 4; i > 0; i--) {
+        unsigned slot = i - 1u;
+        if (!(state->moved_mask & (1u << slot))) continue;
+        uint64_t *source_bytes, *candidate_bytes;
+        wl_columnar_memory_reservation_t *source_token =
+            wl_columnar_session_promotion_credit(state->source, slot,
+                &source_bytes);
+        wl_columnar_memory_reservation_t *candidate_token =
+            wl_columnar_session_promotion_credit(candidate, slot,
+                &candidate_bytes);
+        bool transferred = false;
+        int rc =
+            wl_columnar_memory_governor_transfer_controlled(candidate_token,
+                state->source, &transferred, NULL);
+        if (rc || !transferred) return rc > 0 ? rc : EINVAL;
+        if (!wl_columnar_memory_reservation_move(source_token, candidate_token))
+            return EINVAL;
+        *source_bytes = *candidate_bytes; *candidate_bytes = 0;
+        state->moved_mask &= (uint8_t) ~(1u << slot);
+    }
+    state->move_index = 0;
+    return 0;
+}
+
+int
+wl_columnar_session_promotion_move_credits(
+    wl_columnar_merge_incremental_authority_t *authority,
+    wl_columnar_session_promotion_scratch_t *state, eval_entry_t *result,
+    wl_evaluation_control_t *control)
+{
+    if (!authority || !state || !result || !control || !state->ready
+        || !state->descriptor_ready || !result->rel) return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 128); if (rc) return rc;
+    col_rel_t *source = authority->source, *candidate = result->rel;
+    if (!authority->active ||
+        (authority->phase != 1 && authority->phase != 2) || !source
+        || authority->delta || !source->pool_owned
+        || authority->set.leases != authority->leases
+        || authority->set.lease_count != 1
+        || col_rel_mutation_lease_validate(&authority->leases[0], source)
+        || source->storage_owner != source || !source->memory_governor
+        || source->memory_governor != state->governor
+        || state->payload_owned || state->tombstone || state->reversing)
+        return EINVAL;
+    state->source = source; state->source_had_governor = true;
+    state->source_had_scratch = source->row_scratch != NULL;
+    authority->phase = 2;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    while (state->move_index < 4) {
+        unsigned slot = state->move_index;
+        uint64_t *source_bytes, *candidate_bytes;
+        wl_columnar_memory_reservation_t *source_token =
+            wl_columnar_session_promotion_credit(source, slot, &source_bytes);
+        wl_columnar_memory_reservation_t *candidate_token =
+            wl_columnar_session_promotion_credit(candidate, slot,
+                &candidate_bytes);
+        rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+        if (*source_bytes) {
+            if (*candidate_bytes || source_token->identity != source_token
+                || source_token->bytes != *source_bytes
+                || source_token->replacement_bytes
+                || source_token->governor
+                != wl_columnar_memory_governor_ref_get(state->governor)
+                || atomic_load_explicit(&source_token->state,
+                memory_order_acquire)
+                != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+                || atomic_load_explicit(&source_token->owner_bits,
+                memory_order_acquire)
+                != (uintptr_t)(state->owner_transferred ? candidate : source))
+                return EINVAL;
+        }
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (*source_bytes) {
+            if (!state->owner_transferred) {
+                rc =
+                    wl_columnar_memory_governor_transfer_controlled(
+                    source_token,
+                    candidate, &state->owner_transferred, control);
+                if (rc) return rc;
+                if (!state->owner_transferred) return EINVAL;
+            }
+            rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
+            rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+            if (!wl_columnar_memory_reservation_move(candidate_token,
+                source_token))
+                return EINVAL;
+            *candidate_bytes = *source_bytes; *source_bytes = 0;
+            state->moved_mask |= (uint8_t)(1u << slot);
+            state->owner_transferred = false;
+        }
+        state->move_index++;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    return 0;
+}
+
+/* These exact scalar/pointer ranges omit every reservation and every atomic
+ * gate/alias field. Retained credit bytes are also excluded: their original
+ * source slot has already been consumed by the preceding checked move. */
+#ifdef WL_SESSION_TEST_HOOKS
+WL_COLUMNAR_SESSION_PROMOTION_TEST_THREAD_LOCAL void (*
+wl_columnar_session_test_promotion_checkpoint)(
+    wl_evaluation_control_t *, wl_columnar_session_promotion_scratch_t *,
+    eval_entry_t *);
+#endif
+static size_t
+wl_columnar_session_promotion_payload_region(unsigned region, size_t *offset)
+{
+    switch (region) {
+    case 0: *offset = 0; return offsetof(col_rel_t, descriptor_reservation);
+    case 1: *offset = offsetof(col_rel_t, memory_budget_denial_pending);
+        return offsetof(col_rel_t, retained_reservation) - *offset;
+    case 2: *offset = offsetof(col_rel_t, ledger_ts_bytes);
+        return offsetof(col_rel_t, storage_alias_borrows) - *offset;
+    default: *offset = 0; return 0;
+    }
+}
+
+int
+wl_columnar_session_promotion_stage_payload(
+    wl_columnar_merge_incremental_authority_t *authority,
+    wl_columnar_session_promotion_scratch_t *state, eval_entry_t *result,
+    wl_evaluation_control_t *control)
+{
+    if (!authority || !state || !result || !control || !state->ready
+        || !result->rel || !state->source) return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 128); if (rc) return rc;
+    col_rel_t *source = state->source, *candidate = result->rel;
+    if (!authority->active || authority->source != source || authority->delta
+        || authority->set.leases != authority->leases
+        || authority->set.lease_count != 1 || state->move_index != 4
+        || state->owner_transferred || state->payload_owned || state->tombstone
+        || !state->descriptor_ready || state->reversing
+        || (state->phase != 5 && state->phase != 6 && state->phase != 7)
+        || col_rel_mutation_lease_validate(&authority->leases[0], source))
+        return EINVAL;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    if (state->phase == 7) return 0;
+    if (state->phase == 5) {
+        rc = wl_evaluation_control_charge(control, 1); if (rc) return rc;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        /* The full named descriptor credit remains unchanged. Only its
+         * allocator duplicate physical name is disposed here. */
+        free(candidate->name); candidate->name = NULL;
+        state->phase = 6; state->cursor = 0;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    size_t prefix = 0;
+    for (unsigned region = 0; region < 3; region++) {
+        size_t offset,
+            length = wl_columnar_session_promotion_payload_region(region,
+                &offset);
+        while (state->cursor < prefix + length) {
+            size_t position = state->cursor - prefix;
+            size_t n = length - position; if (n > 128) n = 128;
+            rc = wl_evaluation_control_charge(control, 2u * n);
+            if (rc) return rc;
+            memcpy((char *)candidate + offset + position,
+                (const char *)source + offset + position, n);
+            state->cursor += n;
+#ifdef WL_SESSION_TEST_HOOKS
+            if (wl_columnar_session_test_promotion_checkpoint)
+                wl_columnar_session_test_promotion_checkpoint(control, state,
+                    result);
+#endif
+            rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        }
+        prefix += length;
+    }
+    state->phase = 7;
+    return 0;
+}
+
+int
+wl_columnar_session_promotion_publish_payload(
+    wl_col_session_t *session,
+    wl_columnar_merge_incremental_authority_t *authority,
+    wl_columnar_session_promotion_scratch_t *state, eval_entry_t *result,
+    wl_evaluation_control_t *control)
+{
+    if (!session || !authority || !state || !result || !control || !state->ready
+        || !result->rel || !state->source) return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 192); if (rc) return rc;
+    col_rel_t *source = state->source, *candidate = result->rel;
+    wl_columnar_eval_serial_recursive_record_t *journal = &session->recursive;
+    delta_pool_t *pool = session->delta_pool;
+    uint64_t extent; uint32_t slots;
+    if (!journal->active || !journal->ready || !journal->delta_rels
+        || journal->relation >= journal->relation_count
+        || journal->delta_rels[journal->relation] != source
+        || wl_columnar_session_recursive_pool_extent(session, &extent, &slots)
+        || (uintptr_t)source < (uintptr_t)pool->slab
+        || (uintptr_t)source - (uintptr_t)pool->slab >= extent
+        || ((uintptr_t)source - (uintptr_t)pool->slab) % pool->slot_size)
+        return EINVAL;
+    uint32_t source_slot = (uint32_t)(((uintptr_t)source -
+        (uintptr_t)pool->slab) / pool->slot_size);
+    if (!authority->active || authority->source != source || authority->delta
+        || authority->set.leases != authority->leases ||
+        authority->set.lease_count != 1
+        || authority->set.descriptor_count != 1 ||
+        authority->set.owner_count != 1
+        || authority->set.descriptors_acquired != 1 ||
+        authority->set.owners_acquired != 1
+        || authority->descriptors[0].relation != source ||
+        authority->owners[0].owner != source
+        || state->phase != 7 || state->move_index != 4 ||
+        !state->source_had_governor
+        || state->owner_transferred || state->payload_owned || state->tombstone
+        || state->reversing || !state->descriptor_ready ||
+        !state->governor_retained
+        || source->deferred_relation_next || source->deferred_relation_session
+        || col_rel_mutation_lease_validate(&authority->leases[0],
+        source)) return EINVAL;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    size_t terminal_work = 128 + 2 * sizeof(wl_columnar_source_access_writer_t);
+    for (unsigned region = 0; region < 3; region++) {
+        size_t offset,
+            length = wl_columnar_session_promotion_payload_region(region,
+                &offset);
+        terminal_work += length;
+        for (size_t at = 0; at < length;) {
+            size_t n = length - at; if (n > 128) n = 128;
+            rc = wl_evaluation_control_charge(control, 2u * n);
+            if (rc) return rc;
+            if (memcmp((const char *)candidate + offset + at,
+                (const char *)source + offset + at, n)) return EINVAL;
+            at += n;
+            rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        }
+    }
+    /* Admit the complete fixed ownership cutoff before its first store.
+     * There are no polls or fallible credit operations inside this terminal
+     * scalar transport; payload staging above already ran bounded. */
+    for (size_t at = 0; at < terminal_work;) {
+        size_t n = terminal_work - at; if (n > 128) n = 128;
+        rc = wl_evaluation_control_charge(control, n); if (rc) return rc;
+        at += n;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    for (unsigned region = 0; region < 3; region++) {
+        size_t offset,
+            length = wl_columnar_session_promotion_payload_region(region,
+                &offset);
+        memset((char *)source + offset, 0, length);
+    }
+    candidate->memory_governor = state->governor;
+    candidate->pool_owned = false;
+    candidate->deferred_relation_next = NULL;
+    candidate->deferred_relation_session = NULL;
+    candidate->storage_owner = candidate;
+    candidate->storage_owner_identity = candidate->relation_identity;
+    candidate->storage_owner_generation = candidate->storage_generation;
+    source->pool_owned = true;
+    source->view_generation = source->storage_generation =
+        WL_COLUMNAR_REL_GENERATION_INVALID;
+    source->deferred_relation_next = NULL;
+    source->deferred_relation_session = NULL;
+    /* These original writer slots terminalize only after the actual closed
+     * tombstone exists; no gate is released or decremented through an alias. */
+    memset(&authority->descriptors[0].writer, 0,
+        sizeof(authority->descriptors[0].writer));
+    memset(&authority->owners[0].writer, 0,
+        sizeof(authority->owners[0].writer));
+    authority->set.published = true; authority->consumed = true;
+    state->payload_owned = true; state->tombstone = true; state->phase = 8;
+    wl_columnar_memory_governor_ref_release(state->governor);
+    /* The previous per-relation cursor is dead at this handoff; phase3 binds
+     * it to the checked source pool slot until publication or true reversal.
+     * Candidate ownership moves once, without copying any reservation. */
+    journal->delta_rels[journal->relation] = candidate;
+    journal->cursor = source_slot;
+    journal->phase = WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_PROMOTED;
+    result->rel = NULL; result->owned = false;
+    state->descriptor_moved = state->descriptor_committed =
+        state->descriptor_ready = false;
+    state->governor_retained = state->payload_owned = state->tombstone = false;
+    state->moved_mask = state->move_index = state->phase = 0;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_test_promotion_checkpoint)
+        wl_columnar_session_test_promotion_checkpoint(control, state, result);
+#endif
+    return wl_evaluation_control_charge(control, 0);
+}
+
+static bool
+wl_columnar_session_promotion_writer_inert(
+    const wl_columnar_source_access_writer_t *writer)
+{
+    return !writer->owner && !writer->secondary_owner && !writer->identity &&
+           !writer->thread_valid;
+}
+
+/* This acquisition exists only in mandatory failed-prepublication reverse.
+ * The stale source lease is never interpreted as candidate authority. */
+static int
+wl_columnar_session_promotion_reverse_payload(wl_col_session_t *session,
+    wl_columnar_merge_incremental_authority_t *authority,
+    wl_columnar_session_promotion_scratch_t *state, eval_entry_t *result)
+{
+    wl_columnar_eval_serial_recursive_record_t *journal = &session->recursive;
+    col_rel_t *candidate = result->rel, *source = state->source;
+    if (!journal->active || !journal->ready || !journal->delta_rels
+        || journal->relation >= journal->relation_count || !state->reversing
+        || !authority->ready || !candidate || !source
+        || (journal->phase != WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_REGISTRY_FAILED
+        && journal->phase !=
+        WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_ROLLBACK_RESTORED)) return EINVAL;
+    wl_columnar_source_access_writer_t *descriptor =
+        &authority->descriptors[0].writer;
+    wl_columnar_source_access_writer_t *owner = &authority->owners[0].writer;
+    int rc;
+    if (state->phase == 8 || state->phase == 9) {
+        if (journal->delta_rels[journal->relation] != candidate
+            || journal->phase !=
+            WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_REGISTRY_FAILED
+            || !state->payload_owned || !state->tombstone) return EINVAL;
+        if (!descriptor->owner) {
+            if (!wl_columnar_session_promotion_writer_inert(
+                    descriptor)) return EINVAL;
+            authority->descriptors[0].relation = candidate;
+            rc = wl_columnar_relation_writer_acquire_controlled(
+                &candidate->descriptor_access, descriptor, NULL);
+            if (descriptor->owner) {
+                state->phase = 9; authority->active = true;
+            }
+            if (rc) return rc;
+        }
+        rc = wl_columnar_source_access_writer_validate(descriptor,
+                &candidate->descriptor_access);
+        if (rc) return rc;
+        if (candidate->storage_owner != candidate || candidate->pool_owned
+            || !candidate->memory_governor || !candidate->relation_identity
+            || candidate->storage_owner_identity != candidate->relation_identity
+            || candidate->storage_owner_generation !=
+            candidate->storage_generation)
+            return EINVAL;
+        if (!owner->owner) {
+            if (!wl_columnar_session_promotion_writer_inert(
+                    owner)) return EINVAL;
+            authority->owners[0].owner = candidate;
+            rc =
+                wl_columnar_relation_writer_acquire_controlled(
+                &candidate->source_access, owner, NULL);
+            if (owner->owner) state->phase = 10;
+            if (rc) return rc;
+        }
+        rc = wl_columnar_source_access_writer_validate(owner,
+                &candidate->source_access);
+        if (rc) return rc;
+        state->governor = candidate->memory_governor;
+        state->governor_retained = true;
+        state->descriptor_moved = state->descriptor_committed =
+            state->descriptor_ready = true;
+        state->descriptor_bytes = candidate->descriptor_reserved_bytes;
+        state->source_had_governor = true;
+        state->source_had_scratch = candidate->row_scratch != NULL;
+        state->move_index = 4; state->moved_mask = 0;
+        for (unsigned slot = 0; slot < 4; slot++) {
+            uint64_t *bytes;
+            (void)wl_columnar_session_promotion_credit(candidate, slot, &bytes);
+            if (*bytes) state->moved_mask |= (uint8_t)(1u << slot);
+        }
+    }
+    if (state->phase == 10) {
+        rc = wl_columnar_source_access_writer_validate(descriptor,
+                &candidate->descriptor_access);
+        if (!rc) rc = wl_columnar_source_access_writer_validate(owner,
+                    &candidate->source_access);
+        if (rc) return rc;
+        if (!source->pool_owned || source->relation_identity ||
+            source->storage_owner
+            || source->name || source->columns || source->timestamps
+            || atomic_load_explicit(&source->descriptor_access.state,
+            memory_order_acquire)
+            != WL_COLUMNAR_SOURCE_ACCESS_WRITER
+            || atomic_load_explicit(&source->source_access.state,
+            memory_order_acquire)
+            != WL_COLUMNAR_SOURCE_ACCESS_WRITER) return EINVAL;
+        rc = wl_columnar_session_promotion_reverse_credits(state, candidate);
+        if (rc) return rc;
+        /* The original source reference is restored before physical ownership
+         * returns. Candidate keeps its separately retained descriptor reference. */
+        wl_columnar_memory_governor_ref_retain(state->governor);
+        for (unsigned region = 0; region < 3; region++) {
+            size_t offset,
+                length = wl_columnar_session_promotion_payload_region(region,
+                    &offset);
+            memcpy((char *)source + offset, (const char *)candidate + offset,
+                length);
+            memset((char *)candidate + offset, 0, length);
+        }
+        source->pool_owned = true; source->storage_owner = source;
+        source->storage_owner_identity = source->relation_identity;
+        source->storage_owner_generation = source->storage_generation;
+        source->deferred_relation_next = NULL;
+        source->deferred_relation_session = NULL;
+        wl_columnar_source_access_gate_init(&source->source_access);
+        wl_columnar_source_access_gate_init(&source->descriptor_access);
+        /* Consume the single durable payload owner before any real candidate
+         * gate/credit retirement can refuse after physical restoration. */
+        journal->delta_rels[journal->relation] = source;
+        journal->phase = WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_ROLLBACK_RESTORED;
+        state->payload_owned = false; state->tombstone = false;
+        state->phase = 11;
+    }
+    if (state->phase != 11) return EINVAL;
+    if (owner->owner) {
+        rc = wl_columnar_source_access_writer_release(owner); if (rc) return rc;
+    } else if (!wl_columnar_session_promotion_writer_inert(
+            owner)) return EINVAL;
+    if (descriptor->owner) {
+        rc = wl_columnar_source_access_writer_release(descriptor);
+        if (rc) return rc;
+    } else if (!wl_columnar_session_promotion_writer_inert(
+            descriptor)) return EINVAL;
+    state->phase = 5; /* Descriptor-only cleanup, no source aliases remain. */
+    return 0;
+}
+
+int
+wl_columnar_session_promotion_retire(wl_col_session_t *session,
+    wl_columnar_merge_incremental_authority_t *authority,
+    wl_columnar_session_promotion_scratch_t *state,
+    wl_columnar_relation_bulk_append_t *bulk, eval_entry_t *result, int primary)
+{
+    if (state->reversing && state->phase >= 8) {
+        int cleanup = wl_columnar_session_promotion_reverse_payload(session,
+                authority, state, result);
+        if (cleanup) return primary > 0 ? primary : cleanup;
+    }
+    if (!state->payload_owned && state->phase >= 6 && result->rel) {
+        /* Staged aliases have never owned source physical payload. Clear
+         * them in mandatory checked retirement before candidate disposal. */
+        for (unsigned region = 0; region < 3; region++) {
+            size_t offset,
+                length = wl_columnar_session_promotion_payload_region(region,
+                    &offset);
+            memset((char *)result->rel + offset, 0, length);
+        }
+        state->reversing = true;
+    }
+    if (!state->payload_owned &&
+        (state->moved_mask || state->owner_transferred)){
+        int cleanup = wl_columnar_session_promotion_reverse_credits(state,
+                result->rel);
+        if (cleanup) return primary > 0 ? primary : cleanup;
+    }
+    int rc = wl_columnar_relation_descriptor_retire(bulk, state, result,
+            primary);
+    /* A refused original descriptor move or credit keeps the true pair alive.
+     * Positive primary is preserved even when the remaining state is pending. */
+    if (state->phase || state->descriptor_moved || state->governor_retained
+        || state->moved_mask || state->owner_transferred || state->payload_owned
+        || bulk->scratch.bytes || result->rel)
+        return rc > 0 ? rc : EINVAL;
+    if (state->reversing && !authority->set.identity) {
+        /* No stale source lease is passed to generic finish in rollback mode.
+         * Candidate tokens, physical descriptor and credit are all terminal. */
+        memset(authority, 0, sizeof(*authority)); authority->ready = true;
+        return rc;
+    }
+    return wl_columnar_relation_incremental_finish(authority, rc);
 }
 
 static void
@@ -2018,6 +2652,142 @@ session_remove_rel(wl_col_session_t *sess, const char *name)
         }
     }
     return ENOENT;
+}
+
+int
+wl_columnar_session_recursive_removal_drain(wl_col_session_t *sess, int primary)
+{
+    wl_columnar_eval_serial_recursive_record_t *r = &sess->recursive;
+    if (r->phase != WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_REMOVAL) return primary;
+    if (r->removal_family == 8) {
+        int rc = wl_columnar_session_source_lease_release(r->removal_lease);
+        if (rc) {
+            r->cleanup_pending = true; return primary > 0 ? primary : rc;
+        }
+        r->removal_lease = NULL;
+        rc = wl_columnar_session_hash_retire_checked(sess);
+        if (rc) {
+            r->cleanup_pending = true; return primary > 0 ? primary : rc;
+        }
+    } else if (r->removal_family == 6 &&
+        r->removal_cursor < sess->filt_cache_count){
+        col_filt_cache_entry_t *e = &sess->filt_cache[r->removal_cursor];
+        if (e->evict_deferred && !e->rel_name && e->metadata_reservation) {
+            uint64_t bytes;
+            if (sess->filt_cache_active_pins || e->pin_count || e->filtered
+                || e->filter_data || !wl_columnar_memory_size_mul(
+                    sess->filt_cache_count - r->removal_cursor - 1u,
+                    sizeof(*e), &bytes) || bytes > SIZE_MAX) {
+                r->cleanup_pending = true;
+                return primary > 0 ? primary : EINVAL;
+            }
+            wl_columnar_memory_reservation_t *token = e->metadata_reservation;
+            if (token->identity != token) {
+                r->cleanup_pending = true;
+                return primary > 0 ? primary : EINVAL;
+            }
+            uint64_t state = atomic_load_explicit(&token->state,
+                    memory_order_acquire);
+            bool ok = state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+                ? wl_columnar_memory_rollback(token)
+                : state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+                ? wl_columnar_memory_release(token)
+                : state == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+                || state == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED;
+            if (!ok) {
+                r->cleanup_pending = true;
+                return primary > 0 ? primary : EINVAL;
+            }
+            free(token); e->metadata_reservation = NULL;
+            /* Finish the same exact compaction admitted before physical
+             * key/result retirement. Pending serialization preserves count
+             * and cursor; this is no new selection or fresh admission. */
+            memset(e, 0, sizeof(*e)); memmove(e, e + 1, (size_t)bytes);
+            sess->filt_cache_count--;
+        }
+    }
+    r->removal_lease = NULL; r->removal_name = NULL;
+    r->removal_slot = r->removal_family = r->removal_cursor = 0;
+    r->reset_active = false; r->phase = 2; r->cleanup_pending = false;
+    return primary;
+}
+
+int
+wl_columnar_session_remove_controlled(wl_col_session_t *sess, const char *name,
+    wl_evaluation_control_t *control)
+{
+    if (!sess || !name || !control) return EINVAL;
+    wl_columnar_eval_serial_recursive_record_t *r = &sess->recursive;
+    wl_columnar_serial_completion_t *completion = &sess->serial_completion;
+    bool terminal = sess->plan && sess->plan->strata && completion->pending
+        && completion->plan == sess->plan
+        && completion->phase == WL_COLUMNAR_SERIAL_PHASE_RECURSIVE_TERMINAL
+        && completion->stratum < sess->plan->stratum_count
+        && sess->plan->strata[completion->stratum].is_recursive
+        && sess->eval_stratum_heads_final;
+    if ((!r->active || !r->ready) && !terminal) return EBUSY;
+    if ((!r->active && (r->delta_rels || r->snap || r->reservation.governor
+        || r->reservation.bytes
+        || (r->phase != WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_REMOVAL
+        && (r->reset_pool || r->reset_slab
+        || r->reset_stride || r->reset_high_water))))
+        || (r->phase != WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_REMOVAL &&
+        r->reset_active)
+        || sess->cleanup_active || sess->cleanup_pending)
+        return EBUSY;
+    int idle = wl_columnar_eval_stack_cleanup_idle(sess, control);
+    if (idle) return idle;
+    if (r->phase == WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_REMOVAL)
+        return r->removal_family == 8
+            ? wl_columnar_session_recursive_removal_drain(sess, 0) : EBUSY;
+    if ((r->phase != 2 && !(terminal && !r->active && !r->phase))
+        || r->reset_pool || r->reset_slab
+        || r->reset_stride || r->reset_high_water) return EBUSY;
+    uint32_t selected = UINT32_MAX;
+    for (uint32_t i = 0; i < sess->nrels; i++) {
+        int rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (!sess->rels[i]) continue;
+        bool equal;
+        rc = wl_columnar_session_name_equal_controlled(sess->rels[i]->name,
+                name, &equal, control); if (rc) return rc;
+        if (equal) {
+            selected = i; break;
+        }
+    }
+    if (selected == UINT32_MAX) return ENOENT;
+    int rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    r->phase = WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_REMOVAL;
+    r->removal_name = sess->rels[selected]->name;
+    r->removal_slot = selected; r->removal_lease = NULL;
+    r->removal_family = r->removal_cursor = 0;
+    rc = wl_columnar_session_invalidate_caches_controlled(sess, control);
+    if (rc) return rc;
+    col_rel_t *relation = sess->rels[selected];
+    wl_columnar_session_source_lease_t **slot = &sess->source_leases;
+    while (*slot) {
+        rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if ((*slot)->borrower == relation) break;
+        slot = &(*slot)->next;
+    }
+    rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    r->removal_lease = *slot;
+    if (*slot) {
+        *slot = r->removal_lease->next; r->removal_lease->next = NULL;
+    }
+    rc = col_rel_destroy_checked(relation);
+    if (rc) {
+        wl_columnar_session_source_lease_restore(sess, r->removal_lease);
+        r->removal_lease = NULL;
+        wl_columnar_session_recursive_removal_drain(sess, 0);
+        return EBUSY;
+    }
+    sess->rels[selected] = NULL;
+    r->removal_name = NULL; r->removal_family = 8;
+    return wl_columnar_session_recursive_removal_drain(sess, 0);
 }
 
 typedef struct wl_columnar_session_tdd_decision {
@@ -2843,6 +3613,105 @@ col_session_mem_sample(wl_col_session_t *sess)
         temporary);
 }
 
+int
+wl_columnar_session_mem_sample_controlled(wl_col_session_t *sess,
+    wl_evaluation_control_t *control)
+{
+    int rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
+    if (!sess || !control || sess->coordinator || sess->num_workers > 1
+        || (sess->nrels && !sess->rels) || sess->cleanup_pending) return EINVAL;
+    uint32_t nrels = sess->nrels;
+    delta_pool_t *pool = sess->delta_pool;
+    uint32_t used = pool && pool->slab ? pool->slot_used : 0;
+    uint64_t stored = 0, temporary = 0;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    rc = wl_columnar_eval_stack_cleanup_acquire(sess, &frame, control);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 16);
+    if (rc) goto done;
+    temporary = sess->cleanup_reserved_bytes;
+    temporary = sess->delta_rollback_reserved_bytes > UINT64_MAX - temporary
+        ? UINT64_MAX : temporary + sess->delta_rollback_reserved_bytes;
+    temporary = sess->delta_observer_reserved_bytes > UINT64_MAX - temporary
+        ? UINT64_MAX : temporary + sess->delta_observer_reserved_bytes;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+    wl_columnar_relation_source_group_t *group =
+        wl_columnar_eval_stack_cleanup_sources(frame);
+    if (!group) {
+        rc = EINVAL; goto done;
+    }
+    for (uint32_t family = 0; family < 2; family++) {
+        uint32_t count = family ? used : nrels;
+        for (uint32_t i = 0; i < count; i++) {
+            rc = wl_evaluation_control_charge(control, 8); if (rc) goto done;
+            col_rel_t *r = NULL;
+            if (!family) r = sess->rels[i];
+            rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+            bool dead = false; uint64_t bytes = 0;
+            if (family) {
+                rc = wl_columnar_relation_pool_sample_controlled(sess, i,
+                        &r, &dead, &bytes, control);
+                if (rc) goto done;
+            }
+            if (!r) continue;
+            if (!dead) {
+                rc = wl_columnar_relation_source_group_acquire_controlled(group,
+                        r, NULL, control);
+                if (!rc) rc =
+                        wl_columnar_relation_transport_bytes_controlled(sess,
+                            frame,
+                            r, &bytes, control);
+                if (!rc) rc =
+                        wl_columnar_relation_source_group_finish_controlled(
+                        group, control);
+                if (rc) goto done;
+            }
+            rc = wl_evaluation_control_charge(control, 16); if (rc) goto done;
+            uint64_t *sum = family ? &temporary : &stored;
+            *sum = bytes > UINT64_MAX - *sum ? UINT64_MAX : *sum + bytes;
+            wl_columnar_relation_consolidate_checkpoint(control,
+                family ? 125 : 124, i + 1u, NULL, r);
+            rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+        }
+    }
+done:
+    {
+        int cleanup = wl_columnar_eval_stack_cleanup_finish(&frame);
+        if (cleanup && rc <= 0) rc = cleanup;
+    }
+    if (rc) return rc;
+    /* W1 coordinator ledger writes are serialized through this cutoff.
+     * Convert target gauges into exact deltas and use the existing finite
+     * exclusive apply; raw shared set_gauge's CAS retries are not wrapped. */
+    rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+    uint64_t old_stored =
+        atomic_load_explicit(
+        &sess->mem_ledger.subsys_bytes[WL_MEM_SUBSYS_STORED],
+        memory_order_relaxed);
+    uint64_t old_temporary =
+        atomic_load_explicit(
+        &sess->mem_ledger.subsys_bytes[WL_MEM_SUBSYS_TEMPORARY],
+        memory_order_relaxed);
+    wl_columnar_mem_ledger_exclusive_request_t requests[2] = {
+        {WL_MEM_SUBSYS_STORED,
+         stored >= old_stored ? stored-old_stored : old_stored-stored,
+         stored >= old_stored},
+        {WL_MEM_SUBSYS_TEMPORARY,
+         temporary >=
+         old_temporary ? temporary-old_temporary : old_temporary-temporary,
+         temporary >= old_temporary},
+    };
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    wl_columnar_mem_ledger_exclusive_prepared_t prepared = {0};
+    rc = wl_columnar_mem_ledger_prepare_exclusive_controlled(&sess->mem_ledger,
+            requests, 2, &prepared, control);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    wl_columnar_mem_ledger_apply_exclusive(&prepared);
+    return 0;
+}
+
 void
 col_session_mem_note_worker(wl_col_session_t *coordinator,
     const wl_col_session_t *worker)
@@ -3023,6 +3892,7 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
     wl_columnar_memory_reservation_init(&sess->rel_hash_reservation);
     wl_columnar_memory_reservation_init(&sess->rels_reservation);
     wl_columnar_memory_reservation_init(&sess->delta_queue_ring_reservation);
+    wl_columnar_memory_reservation_init(&sess->recursive.reservation);
 
     sess->frontier_ops = &col_frontier_epoch_ops;
 
@@ -3661,6 +4531,8 @@ col_session_destroy(wl_session_t *session)
         cleanup_rc = wl_columnar_eval_delta_rollback_discard(sess);
     if (cleanup_rc == 0)
         cleanup_rc = wl_columnar_eval_delta_observer_discard(sess);
+    if (cleanup_rc == 0 && sess->recursive.active)
+        cleanup_rc = wl_columnar_eval_serial_recursive_retire(sess, 0, NULL);
     if (cleanup_rc != 0) {
         fputs("wirelog: evaluator cleanup failed during session destroy\n",
             stderr);
@@ -3823,6 +4695,19 @@ col_worker_session_create(wl_col_session_t *coordinator,
     if (out_worker->teardown_started || out_worker->tdd_input_run
         || coordinator->tdd_input_run)
         return EBUSY;
+    /* The shallow clone below may copy inert scalar metadata, never an
+     * original-address recursive owner. Reject before the assignment. */
+    if (coordinator->recursive.active || coordinator->recursive.cleanup_pending
+        || coordinator->recursive.delta_rels || coordinator->recursive.snap
+        || coordinator->recursive.reservation.governor
+        || coordinator->recursive.reservation.bytes
+        || coordinator->recursive.reservation.replacement_bytes
+        || out_worker->recursive.active || out_worker->recursive.cleanup_pending
+        || out_worker->recursive.delta_rels || out_worker->recursive.snap
+        || out_worker->recursive.reservation.governor
+        || out_worker->recursive.reservation.bytes
+        || out_worker->recursive.reservation.replacement_bytes)
+        return EBUSY;
 
     /* #1661: the worker registry is heap-only, and this is the one registry
      * population path that does not go through session_add_rel -- so it also
@@ -3854,6 +4739,8 @@ col_worker_session_create(wl_col_session_t *coordinator,
     /* Step 1: Bitwise copy — copies all value fields (frontiers,
      * counters, booleans, plan pointer, frontier_ops). */
     *out_worker = *coordinator;
+    memset(&out_worker->recursive, 0, sizeof(out_worker->recursive));
+    wl_columnar_memory_reservation_init(&out_worker->recursive.reservation);
 
     /* Step 2: Set identity fields */
     out_worker->worker_id = worker_id;
@@ -5327,8 +6214,9 @@ wl_columnar_session_serial_reset_target(wl_col_session_t *sess,
 }
 
 static int
-wl_columnar_session_serial_preflight(wl_col_session_t *sess)
+wl_columnar_session_serial_preflight(wl_col_session_t *sess, bool *recursive)
 {
+    *recursive = false;
     wl_evaluation_control_t *control = sess->base.evaluation_control;
     int rc = wl_evaluation_control_charge(control, 128);
     if (rc) return rc;
@@ -5349,6 +6237,20 @@ wl_columnar_session_serial_preflight(wl_col_session_t *sess)
         || sess->frontier_ops != &col_frontier_epoch_ops
         || !sess->memory_governor || sess->cleanup_active
         || sess->coordinator) return ENOTSUP;
+    if (sess->plan->stratum_count && !sess->plan->strata) return EINVAL;
+    /* Reject all final aggregate metadata before pool reuse or head reset. */
+    for (uint32_t si = 0; si < sess->plan->stratum_count; si++) {
+        rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+        const wl_plan_stratum_t *sp = &sess->plan->strata[si];
+        if (sp->relation_count && !sp->relations) return EINVAL;
+        if (!sp->is_recursive) continue;
+        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+            rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+            if (sp->relations[ri].recursive_agg.has_spec) return ENOTSUP;
+            rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        }
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
     if (sess->delta_pool && (sess->delta_pool->slot_used
         || sess->delta_pool->arena_used)) {
         rc = wl_columnar_relation_pool_reuse_controlled(sess, control);
@@ -5364,10 +6266,30 @@ wl_columnar_session_serial_preflight(wl_col_session_t *sess)
         const wl_plan_stratum_t *sp = &sess->plan->strata[si];
         rc = wl_evaluation_control_charge(control, 16);
         if (rc) return rc;
-        if (sp->is_recursive || (sp->relation_count && !sp->relations))
+        if (sp->relation_count && !sp->relations)
             return ENOTSUP;
         rc = wl_columnar_session_serial_tail(control, 1, si, NULL);
         if (rc) return rc;
+        if (sp->is_recursive) {
+            *recursive = true;
+            if (sess->diff_enabled || sess->delta_rollback
+                || sess->rotation_ops != &col_rotation_standard_ops)
+                return ENOTSUP;
+            for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+                rc = wl_evaluation_control_charge(control, 32);
+                if (rc) return rc;
+                const wl_plan_relation_t *rp = &sp->relations[ri];
+                bool supported = false;
+                rc = wl_columnar_eval_plan_recursive_validate(rp, control,
+                        &supported);
+                if (rc) return rc;
+                if (!supported || !rp->name || !rp->delta_name) return ENOTSUP;
+                rc = wl_columnar_session_serial_tail(control, 1, ri, NULL);
+                if (rc) return rc;
+                has_heads = true;
+            }
+            continue;
+        }
         for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
             const wl_plan_relation_t *rp = &sp->relations[ri];
             rc = wl_evaluation_control_charge(control, 32);
@@ -5890,12 +6812,13 @@ wl_columnar_session_serial_attempt(wl_col_session_t *sess, bool snapshot,
     int rc = wl_columnar_eval_stack_cleanup_retry(sess);
     if (rc) return rc;
     if (!state->pending) {
-        rc = wl_columnar_session_serial_preflight(sess);
+        bool recursive = false;
+        rc = wl_columnar_session_serial_preflight(sess, &recursive);
         if (rc) return rc;
         state->plan = sess->plan;
         state->snapshot = snapshot;
         state->pending = true;
-        state->phase = sess->has_evaluated ? 6 : 1;
+        state->phase = sess->has_evaluated ? 6 : recursive ? 7 : 1;
     }
     state->active = true;
     if (state->phase == 6) {
@@ -5959,11 +6882,19 @@ wl_columnar_session_serial_attempt(wl_col_session_t *sess, bool snapshot,
         }
         state->phase = 1;
     }
-    if (state->phase == 1) {
+    if (state->phase == 1
+        || state->phase == WL_COLUMNAR_SERIAL_PHASE_RECURSIVE_TERMINAL) {
         while (state->stratum < sess->plan->stratum_count) {
             rc = col_eval_stratum(&sess->plan->strata[state->stratum], sess,
                     state->stratum);
             if (rc) goto done;
+            if (state->phase == WL_COLUMNAR_SERIAL_PHASE_RECURSIVE_TERMINAL) {
+                rc = wl_evaluation_control_charge(control, 32);
+                if (!rc) rc = wl_evaluation_control_charge(control, 0);
+                if (rc) goto done;
+                state->phase = 1; state->compact = 0;
+                state->reset_stratum = state->reset_relation = 0;
+            }
             state->stratum++;
             state->relation = 0;
         }

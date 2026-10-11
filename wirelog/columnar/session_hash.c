@@ -257,6 +257,43 @@ session_rel_free_hash(wl_col_session_t *sess)
     sess->rel_hash_chain_cap = 0;
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+WL_COLUMNAR_SESSION_HASH_TEST_THREAD_LOCAL void
+(*wl_columnar_session_hash_test_retirement_checkpoint)(wl_col_session_t *,
+    wl_columnar_memory_reservation_t *);
+WL_COLUMNAR_SESSION_HASH_TEST_THREAD_LOCAL void
+(*wl_columnar_session_hash_test_registry_retirement_checkpoint)(
+    wl_columnar_session_hash_controlled_registry_t *);
+#endif
+
+int
+wl_columnar_session_hash_retire_checked(wl_col_session_t *sess)
+{
+    if (!sess) return EINVAL;
+    /* Mandatory retirement: pointers become inert before original credit
+     * can refuse. A retry never frees the same physical arrays twice. */
+    free(sess->rel_hash_head); sess->rel_hash_head = NULL;
+    free(sess->rel_hash_next); sess->rel_hash_next = NULL;
+    sess->rel_hash_nbuckets = sess->rel_hash_chain_cap = 0;
+    wl_columnar_memory_reservation_t *token = &sess->rel_hash_reservation;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_hash_test_retirement_checkpoint)
+        wl_columnar_session_hash_test_retirement_checkpoint(sess, token);
+#endif
+    uint64_t state = atomic_load_explicit(&token->state, memory_order_acquire);
+    if (token->identity != token) return EINVAL;
+    if (state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED)
+        return wl_columnar_memory_rollback(token) ? 0 : EINVAL;
+    if (state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED)
+        return wl_columnar_memory_release(token) ? 0 : EINVAL;
+    /* RELEASED retains historical bytes/governor scalars; those are not
+     * live credit and must not cause a second retirement. */
+    return state == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED
+           || (state == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+           && !token->bytes && !token->governor && !token->replacement_bytes)
+        ? 0 : EINVAL;
+}
+
 #ifdef WL_TEST_OWNER_PUBLICATION
 static wl_col_session_t *wl_columnar_session_hash_fail_image_session;
 static bool wl_columnar_session_hash_fail_image_hit;
@@ -579,6 +616,10 @@ wl_columnar_session_hash_registry_retire(
     free(record->retired_rels); record->retired_rels = NULL;
     free(record->retired_head); record->retired_head = NULL;
     free(record->retired_next); record->retired_next = NULL;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_hash_test_registry_retirement_checkpoint)
+        wl_columnar_session_hash_test_registry_retirement_checkpoint(record);
+#endif
     wl_columnar_memory_reservation_t *tokens[5] = {
         &image->rels_reservation, &image->hash_reservation,
         &image->expected_rels_reservation, &record->old_rels, &record->old_hash

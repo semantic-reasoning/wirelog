@@ -1133,6 +1133,62 @@ wl_columnar_memory_governor_commit_growth_controlled(
                control);
 }
 
+int
+wl_columnar_memory_governor_transfer_controlled(
+    wl_columnar_memory_reservation_t *token, const void *owner,
+    bool *transferred, wl_evaluation_control_t *control)
+{
+    if (!transferred)
+        return EINVAL;
+    *transferred = false;
+    if (!control) {
+        *transferred = wl_columnar_memory_transfer(token, owner);
+        return 0;
+    }
+    int rc = wl_evaluation_control_charge(control, 2);
+    if (rc)
+        return rc;
+    if (!reservation_identity_valid(token)) {
+        rc = wl_columnar_memory_governor_tail(control, 2);
+        return rc > 0 ? rc : 0;
+    }
+    uint64_t from = atomic_load_explicit(&token->state, memory_order_acquire);
+    if (from != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        && from != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED) {
+        rc = wl_columnar_memory_governor_tail(control, 2);
+        return rc > 0 ? rc : 0;
+    }
+    rc = wl_columnar_memory_governor_tail(control, 2);
+    if (rc)
+        return rc;
+    for (;;) {
+        /* Admit the claim and all fixed terminal stores together. Nothing
+         * fallible may leave the original token in TRANSFERRING. */
+        rc = wl_evaluation_control_charge(control, 4);
+        if (rc)
+            return rc;
+        uint64_t expected = from;
+        if (atomic_compare_exchange_weak_explicit(&token->state, &expected,
+            WL_COLUMNAR_MEMORY_RESERVATION_TRANSFERRING,
+            memory_order_acq_rel, memory_order_acquire)) {
+            atomic_store_explicit(&token->owner_bits,
+                (uint64_t)(uintptr_t)owner, memory_order_release);
+            atomic_store_explicit(&token->state, from, memory_order_release);
+            *transferred = true;
+            WL_COLUMNAR_MEMORY_GOVERNOR_TEST_POINT(control, token,
+                WL_COLUMNAR_MEMORY_GOVERNOR_ADMITTED);
+            return wl_columnar_memory_governor_tail(control, 4);
+        }
+        if (expected != from) {
+            rc = wl_columnar_memory_governor_tail(control, 4);
+            return rc > 0 ? rc : 0;
+        }
+        rc = wl_columnar_memory_governor_tail(control, 4);
+        if (rc)
+            return rc;
+    }
+}
+
 static wl_columnar_memory_admission_status_t
 reserve_internal(wl_columnar_memory_governor_t *governor,
     uint64_t bytes, wl_columnar_memory_reservation_t *reservation)

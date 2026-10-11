@@ -2572,7 +2572,9 @@ wl_columnar_merge_consolidate_controlled(eval_stack_t *stack,
         || sess->delta_seeded || sess->retraction_seeded ||
         sess->retraction_right_pass
         || sess->join_output_shared_count
-        || sess->current_iteration || sess->delta_observer ||
+        || (sess->current_iteration && !(sess->recursive.active
+        && sess->recursive.ready && !sess->diff_enabled)) ||
+        sess->delta_observer ||
         !sess->memory_governor) return ENOTSUP;
     if (sess->join_batch_bytes) {
         int admission = wl_evaluation_control_charge(c, 64);
@@ -4059,6 +4061,660 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
     if (out_fast_path)
         *out_fast_path = 0;
     return 0;
+}
+
+/* The original scratch lane is reachable through every stopped disposer.
+* Physical pointers become NULL before the corresponding original credit is
+* retired. A refused release leaves that exact token and lane pending. */
+static int
+wl_columnar_merge_incremental_scratch_retire(
+    wl_columnar_merge_incremental_scratch_t *scratch, int primary)
+{
+    if (!scratch || !scratch->ready)
+        return primary > 0 ? primary : EINVAL;
+    if (scratch->lane == 1) {
+        wl_columnar_relation_radix_sequence_t *seq = &scratch->sort;
+        wl_columnar_radix_workspace_t *w = &seq->workspace;
+        free(seq->boundaries); seq->boundaries = NULL;
+        free(seq->needs_sort); seq->needs_sort = NULL;
+        free(w->perm_a); w->perm_a = NULL;
+        free(w->perm_b); w->perm_b = NULL;
+        free(w->temp_column); w->temp_column = NULL;
+        free(w->bucket_values); w->bucket_values = NULL;
+        w->byte_values = NULL; w->short_values = NULL;
+        free(w->count16); w->count16 = NULL;
+        free(w->insertion_rows); w->insertion_rows = NULL;
+        free(w->timestamps); w->timestamps = NULL;
+        wl_columnar_memory_reservation_t *tokens[2] = {
+            &seq->metadata_admission, &w->admission
+        };
+        bool *flags[2] = {&seq->metadata_admission_active,
+                          &w->admission_active};
+        for (unsigned i = 0; i < 2; i++) {
+            if (!*flags[i]) continue;
+            uint64_t state = atomic_load_explicit(&tokens[i]->state,
+                    memory_order_acquire);
+            bool retired = state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+                ? wl_columnar_memory_release(tokens[i])
+                : state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+                && wl_columnar_memory_rollback(tokens[i]);
+            if (!retired) return primary > 0 ? primary : EINVAL;
+            *flags[i] = false;
+        }
+        scratch->lane = 0;
+    } else if (scratch->lane == 3) {
+        col_row_buf_release(&scratch->row);
+        free(scratch->compacted); scratch->compacted = NULL;
+        if (scratch->admission_active) {
+            uint64_t state = atomic_load_explicit(
+                &scratch->compaction_admission.state, memory_order_acquire);
+            bool retired = state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+                ? wl_columnar_memory_release(&scratch->compaction_admission)
+                : state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+                && wl_columnar_memory_rollback(&scratch->compaction_admission);
+            if (!retired) return primary > 0 ? primary : EINVAL;
+            scratch->admission_active = false;
+        }
+        scratch->lane = 0;
+    } else if (scratch->lane == 4) {
+        if (scratch->terminal.armed) {
+            int cleanup = wl_columnar_relation_terminal_sequence_finish(
+                &scratch->terminal);
+            if (cleanup) return primary > 0 ? primary : cleanup;
+        }
+        scratch->lane = 0;
+    } else if (scratch->lane != 0 && scratch->lane != 2)
+        return primary > 0 ? primary : EINVAL;
+    return primary;
+}
+
+static int
+wl_columnar_merge_incremental_compare(const col_rel_t *rel,
+    uint32_t left, uint32_t right, const int64_t *flat, int *out,
+    wl_evaluation_control_t *control)
+{
+    *out = 0;
+    for (uint32_t c = 0; c < rel->ncols; c++) {
+        int rc = wl_evaluation_control_charge(control, 24);
+        if (rc) return rc;
+        int64_t a = rel->columns[c][left];
+        int64_t b = flat ? flat[c] : rel->columns[c][right];
+        int cmp = rel->column_types
+            && rel->column_types[c] == WIRELOG_TYPE_FLOAT
+            ? wl_columnar_float_compare_bits(a, b) : (a > b) - (a < b);
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return rc;
+        if (cmp) {
+            *out = cmp; return 0;
+        }
+    }
+    return 0;
+}
+
+static int
+wl_columnar_merge_incremental_scratch_rows(
+    wl_columnar_merge_incremental_scratch_t *scratch,
+    uint32_t ncols, bool row_needed, wl_evaluation_control_t *control)
+{
+    int rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    rc = wl_columnar_merge_incremental_scratch_retire(scratch, 0);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    scratch->lane = 2;
+    for (size_t at = 0; at < offsetof(wl_columnar_merge_incremental_scratch_t,
+        lane);){
+        size_t n = offsetof(wl_columnar_merge_incremental_scratch_t, lane) - at;
+        if (n > 128) n = 128;
+        rc = wl_evaluation_control_charge(control, n); if (rc) return rc;
+        memset((char *)scratch + at, 0, n); at += n;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(control, 96); if (rc) return rc;
+    wl_columnar_memory_reservation_init(&scratch->compaction_admission);
+    scratch->lane = 3;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    if (!row_needed) return 0;
+    uint64_t bytes;
+    rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+    if (!wl_columnar_memory_size_mul(ncols, sizeof(int64_t), &bytes)
+        || bytes > SIZE_MAX) return EOVERFLOW;
+    if (ncols <= COL_STACK_MAX) scratch->row.ptr = scratch->row.stack;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    if (ncols <= COL_STACK_MAX) return 0;
+    /* Raw wide row scratch is an uncredited heap allocation. */
+    rc = wl_evaluation_control_charge(control, 1); if (rc) return rc;
+    scratch->row.ptr = malloc((size_t)bytes);
+    if (!scratch->row.ptr) return ENOMEM;
+    return wl_evaluation_control_charge(control, 0);
+}
+
+static int
+wl_columnar_merge_incremental_compact_prepare(col_rel_t *rel, uint32_t rows,
+    wl_columnar_merge_incremental_scratch_t *scratch,
+    wl_evaluation_control_t *control)
+{
+    int rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+    if (!scratch || !scratch->ready || scratch->lane != 3
+        || scratch->compacted || scratch->admission_active) return EINVAL;
+    uint64_t bytes;
+    if (!wl_columnar_memory_size_mul(rows, rel->ncols, &bytes)
+        || !wl_columnar_memory_size_mul(bytes, sizeof(int64_t), &bytes)
+        || bytes > SIZE_MAX) return EOVERFLOW;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    if (rel->memory_governor && bytes) {
+        wl_columnar_memory_admission_status_t status;
+        rc = wl_columnar_memory_governor_reserve_checked_controlled(
+            wl_columnar_memory_governor_ref_get(rel->memory_governor), bytes,
+            &scratch->compaction_admission, &status, control);
+        scratch->admission_active = scratch->compaction_admission.governor !=
+            NULL;
+        if (rc) return rc;
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                rel->memory_budget_denial_pending = true;
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOMEM
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : EINVAL;
+        }
+    }
+    rc = wl_evaluation_control_charge(control, 1); if (rc) return rc;
+    scratch->compacted = malloc((size_t)bytes);
+    if (!scratch->compacted) return ENOMEM;
+    scratch->capacity = rows;
+    return wl_evaluation_control_charge(control, 0);
+}
+
+static int
+wl_columnar_merge_incremental_sift(col_rel_t *rel,
+    wl_columnar_merge_incremental_scratch_t *scratch,
+    uint32_t parent, uint32_t size, wl_evaluation_control_t *control)
+{
+    while (2u * parent + 1u < size) {
+        int rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+        uint32_t child = 2u * parent + 1u;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        int cmp;
+        if (child + 1u < size) {
+            rc = wl_columnar_merge_incremental_compare(rel,
+                    scratch->positions[child + 1u], scratch->positions[child],
+                    NULL, &cmp, control);
+            if (rc) return rc;
+            if (cmp < 0) child++;
+        }
+        rc = wl_columnar_merge_incremental_compare(rel,
+                scratch->positions[parent], scratch->positions[child], NULL,
+                &cmp, control);
+        if (rc) return rc;
+        if (cmp <= 0) break;
+        rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+        uint32_t position = scratch->positions[parent],
+            end = scratch->ends[parent];
+        scratch->positions[parent] = scratch->positions[child];
+        scratch->ends[parent] = scratch->ends[child];
+        scratch->positions[child] = position; scratch->ends[child] = end;
+        parent = child;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    return 0;
+}
+
+static int
+wl_columnar_merge_incremental_compact(col_rel_t *rel,
+    wl_columnar_merge_incremental_scratch_t *scratch,
+    wl_evaluation_control_t *control)
+{
+    int rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+    if (rel->run_count < 2 || rel->run_count > COL_MAX_RUNS
+        || !scratch->compacted
+        || rel->run_ends[rel->run_count - 1] > scratch->capacity) return EINVAL;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    wl_columnar_relation_consolidate_checkpoint(control, 125, rel->run_count,
+        NULL, rel);
+    uint32_t size = 0, start = 0;
+    for (uint32_t run = 0; run < rel->run_count; run++) {
+        rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+        uint32_t end = rel->run_ends[run];
+        if (start > end || end > rel->nrows) return EINVAL;
+        if (start < end) {
+            scratch->positions[size] = start;
+            scratch->ends[size++] = end;
+        }
+        start = end;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    for (uint32_t i = size / 2u; i > 0; i--) {
+        rc = wl_columnar_merge_incremental_sift(rel, scratch, i - 1u, size,
+                control); if (rc) return rc;
+    }
+    uint32_t out = 0;
+    while (size) {
+        rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+        uint32_t row = scratch->positions[0];
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        int cmp = 1;
+        if (out) {
+            rc = wl_columnar_merge_incremental_compare(rel, row, 0,
+                    scratch->compacted + (size_t)(out - 1u) * rel->ncols,
+                    &cmp, control); if (rc) return rc;
+        }
+        if (cmp) {
+            for (uint32_t c = 0; c < rel->ncols; c++) {
+                rc = wl_evaluation_control_charge(control, 8);
+                if (rc) return rc;
+                scratch->compacted[(size_t)out * rel->ncols + c] =
+                    rel->columns[c][row];
+                rc = wl_evaluation_control_charge(control, 0);
+                if (rc) return rc;
+            }
+            out++;
+        }
+        rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+        scratch->positions[0]++;
+        if (scratch->positions[0] >= scratch->ends[0]) {
+            size--;
+            scratch->positions[0] = scratch->positions[size];
+            scratch->ends[0] = scratch->ends[size];
+        }
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (size) {
+            rc = wl_columnar_merge_incremental_sift(rel, scratch, 0, size,
+                    control); if (rc) return rc;
+        }
+    }
+    for (uint32_t row = 0; row < out; row++)
+        for (uint32_t c = 0; c < rel->ncols; c++) {
+            rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+            rel->columns[c][row] = scratch->compacted[(size_t)row * rel->ncols +
+                    c];
+            wl_columnar_relation_consolidate_checkpoint(control, 126,
+                (uint64_t)row * rel->ncols + c + 1u, NULL, rel);
+            rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        }
+    rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    free(scratch->compacted); scratch->compacted = NULL;
+    if (scratch->admission_active) {
+        uint64_t state =
+            atomic_load_explicit(&scratch->compaction_admission.state,
+                memory_order_acquire);
+        bool retired = state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+            ? wl_columnar_memory_rollback(&scratch->compaction_admission)
+            : state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+            && wl_columnar_memory_release(&scratch->compaction_admission);
+        if (!retired) return EINVAL;
+        scratch->admission_active = false;
+    }
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+    rel->nrows = out; wl_columnar_relation_touch_view(rel);
+    rel->sorted_nrows = out; rel->run_count = 1; rel->run_ends[0] = out;
+    scratch->output_rows = out;
+    return wl_evaluation_control_charge(control, 0);
+}
+
+int
+wl_columnar_merge_incremental_complete_storage(
+    wl_columnar_merge_incremental_authority_t *authority,
+    wl_columnar_merge_incremental_scratch_t *scratch,
+    wl_columnar_relation_bulk_append_t *bulk, bool swap,
+    wl_evaluation_control_t *control)
+{
+    if (!authority || !scratch || !bulk || !control || !scratch->ready)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    /* Healthy forward retirement has admitted readiness. Physical frees use
+     * the existing exclusion; original refused credit still blocks overlay. */
+    rc = wl_columnar_merge_incremental_scratch_retire(scratch, 0);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    scratch->lane = 2;
+    for (size_t at = 0; at < sizeof(scratch->terminal);) {
+        size_t n = sizeof(scratch->terminal) - at;
+        if (n > 128u) n = 128u;
+        rc = wl_evaluation_control_charge(control, n); if (rc) return rc;
+        memset((char *)&scratch->terminal + at, 0, n); at += n;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    scratch->lane = 4;
+    return wl_columnar_relation_incremental_terminal(bulk, authority,
+               &scratch->terminal, swap, control);
+}
+
+int
+wl_columnar_merge_incremental_retire(
+    wl_columnar_merge_incremental_authority_t *authority,
+    wl_columnar_merge_incremental_scratch_t *scratch, int primary)
+{
+    int rc = primary;
+    if (authority && authority->ready && authority->active
+        && authority->phase == 2u && !authority->consumed
+        && !authority->delta_rolled_back && authority->delta) {
+        col_rel_t *delta = authority->delta;
+        int cleanup = authority->set.lease_count == 2u
+            && authority->set.leases == authority->leases
+            ? col_rel_mutation_lease_validate(&authority->leases[1],
+                delta) : EINVAL;
+        if (cleanup) return primary > 0 ? primary : cleanup;
+        if (delta->nrows != authority->delta_initial_nrows) {
+            if (delta->view_generation >=
+                WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
+                return primary > 0 ? primary : EOVERFLOW;
+            delta->nrows = authority->delta_initial_nrows;
+            wl_columnar_relation_touch_view(delta);
+            authority->set.published = true;
+        }
+        authority->delta_rolled_back = true;
+    }
+    rc = wl_columnar_merge_incremental_scratch_retire(scratch, rc);
+    if (scratch && scratch->ready && scratch->lane != 0
+        && scratch->lane != 2) return rc;
+    return wl_columnar_relation_incremental_finish(authority, rc);
+}
+
+static int
+wl_columnar_merge_incremental_move(col_rel_t *rel, uint32_t to, uint32_t from,
+    wl_evaluation_control_t *control)
+{
+    if (to == from) return 0;
+    for (uint32_t col = 0; col < rel->ncols; col++) {
+        int rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+        rel->columns[col][to] = rel->columns[col][from];
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    return 0;
+}
+
+static int
+wl_columnar_merge_incremental_emit(
+    wl_columnar_merge_incremental_authority_t *authority,
+    wl_columnar_merge_incremental_scratch_t *scratch, int64_t **columns,
+    uint32_t row, wl_evaluation_control_t *control)
+{
+    if (!authority->delta) return 0;
+    for (uint32_t col = 0; col < authority->source->ncols; col++) {
+        int rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+        scratch->row.ptr[col] = columns[col][row];
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    bool committed = false;
+    return wl_columnar_relation_incremental_append_row(authority, 1,
+               scratch->row.ptr, &committed, control);
+}
+
+/* Production adaptive algorithm; the caller owns its original frame and bulk.
+* Automatic variables below are scalar cursors, never lifetime authorities. */
+int
+wl_columnar_merge_incremental_controlled(
+    wl_columnar_merge_incremental_authority_t *authority,
+    wl_columnar_merge_incremental_scratch_t *scratch,
+    wl_columnar_relation_bulk_append_t *bulk, col_rel_t *rel,
+    uint32_t old_nrows, col_rel_t *delta, int *out_fast,
+    wl_evaluation_control_t *control)
+{
+    if (!authority || !scratch || !bulk || !rel || !control || rel == delta)
+        return EINVAL;
+    int rc = wl_columnar_relation_incremental_acquire(authority, rel, delta,
+            control);
+    if (rc) {
+        return rc;
+    }
+    rc = wl_evaluation_control_charge(control, 128); if (rc) goto done;
+    if (!scratch->ready || scratch->lane || bulk->active
+        || rel->run_count > COL_MAX_RUNS || rel->nrows > rel->capacity
+        || (delta &&
+        (delta->ncols != rel->ncols || delta->nrows > delta->capacity))){
+        rc = EINVAL; goto done;
+    }
+    authority->old_nrows = old_nrows;
+    authority->nrows = rel->nrows;
+    authority->delta_initial_nrows = delta ? delta->nrows : 0;
+    authority->delta_rolled_back = false; authority->consumed = false;
+    authority->phase = 2u;
+    rel->memory_budget_denial_pending = false;
+    if (delta) delta->memory_budget_denial_pending = false;
+    rc = col_op_consolidate_incremental_delta_generation_preflight(rel,
+            old_nrows);
+    if (rc) goto done;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+    for (uint32_t target = 0; target < (delta ? 2u : 1u); target++) {
+        col_rel_t *r = target ? delta : rel;
+        for (uint32_t col = 0; col < r->ncols; col++) {
+            rc = wl_evaluation_control_charge(control, 8); if (rc) goto done;
+            if (r->nrows && (!r->columns || !r->columns[col])) {
+                rc = EINVAL; goto done;
+            }
+            bool floating = r->column_types &&
+                r->column_types[col] == WIRELOG_TYPE_FLOAT;
+            rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+            if (!floating) continue;
+            for (uint32_t row = 0; row < r->nrows; row++) {
+                rc = wl_evaluation_control_charge(control, 8);
+                if (rc) goto done;
+                if (!wl_columnar_float_bits_valid(r->columns[col][row])) {
+                    rc = EINVAL; goto done;
+                }
+                rc = wl_evaluation_control_charge(control, 0);
+                if (rc) goto done;
+            }
+        }
+    }
+    if (!rel->nrows || old_nrows >= rel->nrows) {
+        if (out_fast) *out_fast = 1;
+        authority->consumed = true; goto done;
+    }
+    uint32_t count = rel->nrows - old_nrows;
+    if (delta) {
+        rc = wl_evaluation_control_charge(control, 16); if (rc) goto done;
+        if (delta->view_generation >=
+            WL_COLUMNAR_REL_GENERATION_INVALID - 1u - count){
+            rc = EOVERFLOW; goto done;
+        }
+        rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+        rc = wl_columnar_relation_incremental_reserve_rows(bulk, delta,
+                authority, 1, count, false, control); if (rc) goto done;
+    }
+    rc = wl_evaluation_control_charge(control, 96); if (rc) goto done;
+    scratch->lane = 1u;
+    wl_columnar_memory_reservation_init(&scratch->sort.workspace.admission);
+    rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+    rc = wl_columnar_relation_incremental_radix_prepare(rel, old_nrows, count,
+            &scratch->sort.workspace, &authority->leases[0], control);
+    if (rc) goto done;
+    rc = wl_columnar_relation_incremental_radix_execute(rel, old_nrows, count,
+            &scratch->sort.workspace, authority, 0, bulk, control);
+    if (rc) goto done;
+    rc = wl_evaluation_control_charge(control, 64); if (rc) goto done;
+    authority->set.published = true;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+    uint32_t unique = 1;
+    for (uint32_t row = 1; row < count; row++) {
+        int cmp;
+        rc = wl_columnar_merge_incremental_compare(rel, old_nrows + row - 1u,
+                old_nrows + row, NULL, &cmp, control); if (rc) goto done;
+        if (cmp) {
+            rc = wl_columnar_merge_incremental_move(rel, old_nrows + unique,
+                    old_nrows + row, control); if (rc) goto done;
+            unique++;
+        }
+        rc = wl_evaluation_control_charge(control, 4); if (rc) goto done;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+    }
+    authority->unique_rows = unique;
+    rc = wl_evaluation_control_charge(control, 32); if (rc) goto done;
+    if (!rel->run_count || rel->run_ends[rel->run_count - 1u] != old_nrows) {
+        rel->run_count = old_nrows ? 1u : 0u;
+        if (old_nrows) rel->run_ends[0] = old_nrows;
+    }
+    bool fast = !old_nrows;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+    if (old_nrows) {
+        fast = true;
+        for (uint32_t run = 0; run < rel->run_count && fast; run++) {
+            rc = wl_evaluation_control_charge(control, 8); if (rc) goto done;
+            uint32_t end = rel->run_ends[run];
+            rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+            if (end) {
+                int cmp;
+                rc = wl_columnar_merge_incremental_compare(rel, end - 1u,
+                        old_nrows, NULL, &cmp, control); if (rc) goto done;
+                fast = cmp < 0;
+            }
+        }
+    }
+    bool small = !fast && unique <= old_nrows / 16u && rel->run_count;
+    if (rel->col_shared && (!fast || rel->run_count >= COL_MAX_RUNS)) {
+        rc = wl_columnar_relation_incremental_reserve_rows(bulk, rel,
+                authority, 0, 0, true, control); if (rc) goto done;
+    }
+    if (fast || small) {
+        rc = wl_columnar_merge_incremental_scratch_rows(scratch, rel->ncols,
+                delta != NULL, control); if (rc) goto done;
+        uint32_t novel = 0;
+        for (uint32_t row = 0; row < unique; row++) {
+            bool found = false;
+            if (small) {
+                for (uint32_t run = 0; run < rel->run_count && !found; run++) {
+                    rc = wl_evaluation_control_charge(control, 16);
+                    if (rc) goto done;
+                    uint32_t lo = run ? rel->run_ends[run - 1u] : 0u;
+                    uint32_t hi = rel->run_ends[run];
+                    rc = wl_evaluation_control_charge(control, 0);
+                    if (rc) goto done;
+                    while (lo < hi) {
+                        uint32_t mid = lo + (hi - lo) / 2u;
+                        int cmp;
+                        rc = wl_columnar_merge_incremental_compare(rel, mid,
+                                old_nrows + row, NULL, &cmp, control);
+                        if (rc) goto done;
+                        if (!cmp) {
+                            found = true; break;
+                        }
+                        rc = wl_evaluation_control_charge(control, 8);
+                        if (rc) goto done;
+                        if (cmp < 0) lo = mid + 1u; else hi = mid;
+                        rc = wl_evaluation_control_charge(control, 0);
+                        if (rc) goto done;
+                    }
+                }
+            }
+            if (!found) {
+                rc = wl_columnar_merge_incremental_move(rel, old_nrows + novel,
+                        old_nrows + row, control); if (rc) goto done;
+                rc = wl_columnar_merge_incremental_emit(authority, scratch,
+                        rel->columns, old_nrows + novel, control);
+                if (rc) goto done;
+                novel++;
+            }
+            rc = wl_evaluation_control_charge(control, 4); if (rc) goto done;
+            rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+        }
+        /* Raw row scratch retires before compaction scratch admission. */
+        rc = wl_evaluation_control_charge(control, 16); if (rc) goto done;
+        col_row_buf_release(&scratch->row);
+        rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+        bool compact = novel && rel->run_count >= COL_MAX_RUNS;
+        if (compact) {
+            rc = wl_columnar_merge_incremental_compact_prepare(rel,
+                    old_nrows + novel, scratch, control); if (rc) goto done;
+        }
+        rc = wl_evaluation_control_charge(control, 32); if (rc) goto done;
+        rel->nrows = old_nrows + novel; wl_columnar_relation_touch_view(rel);
+        if (novel && !compact) rel->run_ends[rel->run_count++] = rel->nrows;
+        if (novel && compact &&
+            fast) rel->run_ends[rel->run_count - 1u] = rel->nrows;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+        if (compact) {
+            rc = wl_columnar_merge_incremental_compact(rel, scratch, control);
+            if (rc) goto done;
+            if (small) {
+                uint32_t prefix = rel->nrows;
+                for (uint32_t row = 0; row < novel; row++) {
+                    rc = wl_columnar_merge_incremental_move(rel, prefix + row,
+                            old_nrows + row, control); if (rc) goto done;
+                }
+                rc = wl_evaluation_control_charge(control, 16);
+                if (rc) goto done;
+                rel->nrows = prefix + novel;
+                wl_columnar_relation_touch_view(rel);
+                rel->run_ends[rel->run_count++] = rel->nrows;
+                rc = wl_evaluation_control_charge(control, 0);
+                if (rc) goto done;
+            }
+        }
+        rel->sorted_nrows = rel->nrows;
+    } else {
+        uint32_t max_rows = old_nrows + unique;
+        if (rel->merge_buf_cap < max_rows) {
+            uint32_t cap = max_rows > rel->merge_buf_cap * 2u
+                ? max_rows : rel->merge_buf_cap * 2u;
+            if (cap < max_rows) cap = max_rows;
+            rc = wl_columnar_relation_incremental_reserve_grid(bulk, rel,
+                    authority, 0, cap, control); if (rc) goto done;
+        }
+        rc = wl_columnar_merge_incremental_scratch_rows(scratch, rel->ncols,
+                true, control); if (rc) goto done;
+        if (rel->run_count > 1u) {
+            rc = wl_columnar_merge_incremental_compact_prepare(rel, rel->nrows,
+                    scratch, control); if (rc) goto done;
+            rc = wl_columnar_merge_incremental_compact(rel, scratch, control);
+            if (rc) goto done;
+            uint32_t prefix = rel->nrows;
+            for (uint32_t row = 0; row < unique; row++) {
+                rc = wl_columnar_merge_incremental_move(rel, prefix + row,
+                        old_nrows + row, control); if (rc) goto done;
+            }
+            old_nrows = prefix;
+            rc = wl_evaluation_control_charge(control, 16); if (rc) goto done;
+            rel->nrows = prefix + unique; wl_columnar_relation_touch_view(rel);
+            rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+        }
+        uint32_t oi = 0, di = 0, out = 0;
+        while (oi < old_nrows || di < unique) {
+            int cmp = oi >= old_nrows ? 1 : di >= unique ? -1 : 0;
+            if (oi < old_nrows && di < unique) {
+                rc = wl_columnar_merge_incremental_compare(rel, oi,
+                        old_nrows + di, NULL, &cmp, control); if (rc) goto done;
+            }
+            uint32_t from = cmp <= 0 ? oi : old_nrows + di;
+            for (uint32_t col = 0; col < rel->ncols; col++) {
+                rc = wl_evaluation_control_charge(control, 8);
+                if (rc) goto done;
+                rel->merge_columns[col][out] = rel->columns[col][from];
+                rc = wl_evaluation_control_charge(control, 0);
+                if (rc) goto done;
+            }
+            if (cmp > 0) {
+                rc = wl_columnar_merge_incremental_emit(authority, scratch,
+                        rel->merge_columns, out, control); if (rc) goto done;
+            }
+            rc = wl_evaluation_control_charge(control, 16); if (rc) goto done;
+            if (cmp <= 0) oi++;
+            if (cmp >= 0) di++;
+            out++;
+            rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+        }
+        rc = wl_columnar_merge_incremental_complete_storage(authority,
+                scratch, bulk, true, control); if (rc) goto done;
+        rc = wl_evaluation_control_charge(control, 32); if (rc) goto done;
+        rel->nrows = out; wl_columnar_relation_touch_view(rel);
+        rel->sorted_nrows = out; rel->run_count = 1u; rel->run_ends[0] = out;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+    }
+    if (fast || small) {
+        rc = wl_columnar_merge_incremental_complete_storage(authority,
+                scratch, bulk, false, control); if (rc) goto done;
+    }
+    rc = wl_evaluation_control_charge(control, 16); if (rc) goto done;
+    if (out_fast) *out_fast = fast ? 1 : 0;
+    authority->consumed = true;
+    rc = wl_evaluation_control_charge(control, 0);
+done:
+    rc = wl_columnar_relation_bulk_append_retire(bulk, rc);
+    if (bulk->active) return rc > 0 ? rc : EINVAL;
+    return wl_columnar_merge_incremental_retire(authority, scratch, rc);
 }
 
 int

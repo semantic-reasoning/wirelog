@@ -153,6 +153,21 @@ typedef struct {
     uintptr_t identity;
 } wl_compound_arena_mutation_t;
 
+/* Original-address GC authority and scalar scan journal. The evaluator
+ * initializes this only in its retired workspace, never by moving a token. */
+typedef struct {
+    wl_compound_arena_mutation_t mutation;
+    wl_compound_arena_t *arena;
+    wl_compound_gen_t *generation;
+    uint32_t epoch, count, cursor, reclaimed, result, phase;
+    bool ready, consumed;
+} wl_arena_compound_arena_gc_record_t;
+
+int wl_arena_compound_arena_gc_step(wl_arena_compound_arena_gc_record_t *,
+    wl_compound_arena_t *, wl_evaluation_control_t *);
+int wl_arena_compound_arena_gc_retire(wl_arena_compound_arena_gc_record_t *,
+    int, wl_evaluation_control_t *);
+
 typedef struct {
     wl_compound_arena_t *arena;
     uintptr_t identity;

@@ -851,6 +851,113 @@ wl_compound_arena_gc_epoch_boundary(wl_compound_arena_t *arena)
     return result;
 }
 
+/* Caller-owned record, initialized before entry, holds the actual mutation
+* token throughout every preparatory stop and consumed epoch transition. */
+int
+wl_arena_compound_arena_gc_step(wl_arena_compound_arena_gc_record_t *r,
+    wl_compound_arena_t *arena, wl_evaluation_control_t *control)
+{
+    int rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+    if (!r || !control || !r->ready || r->phase != 1
+        || r->mutation.arena || r->mutation.identity || r->consumed
+        || r->arena || r->generation || r->cursor || r->count || r->reclaimed)
+        return EINVAL;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    if (!arena) {
+        r->result = UINT32_MAX; r->consumed = true; r->phase = 4;
+        return 0;
+    }
+    for (;;) {
+        rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+        uint64_t expected = 0;
+        bool acquired =
+            atomic_compare_exchange_weak_explicit(&arena->access_gate,
+                &expected, WL_COMPOUND_GATE_WRITER, memory_order_acquire,
+                memory_order_relaxed);
+        if (acquired) {
+            r->arena = arena; r->mutation.arena = arena;
+            r->mutation.identity = (uintptr_t)&r->mutation; r->phase = 2;
+        } else if (expected) {
+            r->result = arena->current_epoch; r->consumed = true; r->phase = 4;
+        }
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc || r->consumed) return rc;
+        if (acquired) break;
+    }
+    rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+    uint64_t held = atomic_load_explicit(&arena->gc_hold_count,
+            memory_order_acquire);
+    if (held || arena->current_epoch >= arena->max_epochs || arena->frozen) {
+        r->result = held ? arena->current_epoch
+            : arena->current_epoch >=
+            arena->max_epochs ? 0 : arena->current_epoch;
+        r->consumed = true; r->phase = 4;
+        if (!held && arena->current_epoch >= arena->max_epochs)
+            WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
+                "lifecycle event=gc_skip_saturated current_epoch=%u max_epochs=%u",
+                arena->current_epoch, arena->max_epochs);
+        else if (!held && arena->frozen)
+            WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
+                "lifecycle event=gc_skip_frozen current_epoch=%u",
+                arena->current_epoch);
+        return wl_evaluation_control_charge(control, 0);
+    }
+    if (!arena->gens ||
+        arena->max_epochs > WL_COMPOUND_EPOCH_MAX + 1u) return EINVAL;
+    wl_compound_gen_t *gen = &arena->gens[arena->current_epoch];
+    if (gen->entry_count > gen->entry_cap || gen->used > gen->capacity
+        || (gen->entry_count &&
+        (!gen->multiplicity || !gen->entry_offsets))) return EINVAL;
+    r->epoch = arena->current_epoch; r->generation = gen;
+    r->count = gen->entry_count; r->phase = 3;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    while (r->cursor < r->count) {
+        rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+        if (gen->multiplicity[r->cursor] <= 0) r->reclaimed++;
+        r->cursor++;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+    if (r->mutation.identity != (uintptr_t)&r->mutation
+        || r->mutation.arena != arena || arena->current_epoch != r->epoch
+        || gen != &arena->gens[r->epoch] || gen->entry_count != r->count
+        || atomic_load_explicit(&arena->access_gate, memory_order_acquire)
+        != WL_COMPOUND_GATE_WRITER) return EINVAL;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    gen->used = 0; gen->entry_count = 0;
+    arena->current_epoch = r->epoch + 1 < arena->max_epochs
+        ? r->epoch + 1 : arena->max_epochs;
+    r->result = r->reclaimed; r->consumed = true; r->phase = 4;
+    WL_LOG(WL_LOG_SEC_ARENA, WL_LOG_INFO,
+        "gc_epoch_boundary(epoch=%u, freed_handles=%u, remaining=%" PRIu64 ")",
+        r->epoch, r->reclaimed, arena->live_handles);
+    if (arena->current_epoch + 5u >= arena->max_epochs)
+        WL_LOG(WL_LOG_SEC_ARENA, WL_LOG_WARN,
+            "epoch nearing saturation (current=%u, max=%u)",
+            arena->current_epoch, arena->max_epochs);
+    return wl_evaluation_control_charge(control, 0);
+}
+
+int
+wl_arena_compound_arena_gc_retire(wl_arena_compound_arena_gc_record_t *r,
+    int primary, wl_evaluation_control_t *control)
+{
+    if (!r || !r->ready || r->phase < 1 || r->phase > 5
+        || (r->mutation.arena && r->mutation.arena != r->arena))
+        return primary > 0 ? primary : EINVAL;
+    if (control) {
+        int rc = wl_evaluation_control_charge(control, 16);
+        if (!rc) rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return primary > 0 ? primary : rc;
+    }
+    if (r->mutation.arena && !wl_compound_arena_mutation_end(&r->mutation))
+        return primary > 0 ? primary : EINVAL;
+    if (r->mutation.identity) return primary > 0 ? primary : EINVAL;
+    r->phase = 5;
+    int rc = control ? wl_evaluation_control_charge(control, 0) : 0;
+    return primary > 0 ? primary : rc ? rc : primary;
+}
+
 int
 wl_arena_compound_arena_gc_epoch_boundary_checked(wl_compound_arena_t *arena,
     uint32_t *reclaimed)

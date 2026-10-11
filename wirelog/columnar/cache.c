@@ -234,6 +234,117 @@ col_mat_cache_clear(col_mat_cache_t *cache)
     }
 }
 
+/* Only the entry scan is engine work. Compaction preserves the raw ordered
+ * memmove, with its exact byte extent admitted before the library call. */
+int
+wl_columnar_cache_mat_retire_controlled(col_mat_cache_t *cache,
+    uint32_t *cursor, bool release_epoch, wl_evaluation_control_t *control)
+{
+    if (!cache || !cursor || !control || *cursor > cache->count) return EINVAL;
+    while (*cursor < cache->count) {
+        int rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        col_mat_entry_t *entry = &cache->entries[*cursor];
+        uint32_t epoch = release_epoch ? entry->epoch_pin_count : 0;
+        if (entry->pin_count < epoch ||
+            cache->active_pins < epoch) return EINVAL;
+        uint32_t remaining = entry->pin_count - epoch;
+        bool remove = !remaining &&
+            (!release_epoch || entry->eviction_deferred);
+        uint64_t bytes = 0;
+        if (remove && (!wl_columnar_memory_size_mul(
+                cache->count - *cursor - 1u, sizeof(*entry), &bytes)
+            || bytes > SIZE_MAX || cache->total_bytes < entry->mem_bytes))
+            return EOVERFLOW;
+        for (uint64_t at = 0; at < bytes;) {
+            uint64_t n = bytes - at; if (n > 256) n = 256;
+            rc = wl_evaluation_control_charge(control, n); if (rc) return rc;
+            at += n;
+            rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        }
+        rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (release_epoch) {
+            entry->pin_count = remaining; cache->active_pins -= epoch;
+            entry->epoch_pin_count = 0; entry->pin_epoch = 0;
+        }
+        if (remove) {
+            /* Existing checked physical destructor is the explicit cleanup
+             * exclusion. Refusal preserves this exact entry/result owner. */
+            entry->eviction_deferred = true;
+            if (entry->owns_result && entry->result) {
+                rc = col_rel_destroy_checked(entry->result);
+                if (rc) return rc;
+            }
+            entry->result = NULL;
+            if (cache->ledger && entry->ledger_bytes)
+                wl_mem_ledger_free(cache->ledger, WL_MEM_SUBSYS_CACHE,
+                    entry->ledger_bytes);
+            cache->total_bytes -= entry->mem_bytes;
+            memset(entry, 0, sizeof(*entry));
+            memmove(entry, entry + 1, (size_t)bytes);
+            cache->count--;
+        } else {
+            if (!release_epoch) entry->eviction_deferred = true;
+            (*cursor)++;
+        }
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    if (release_epoch) {
+        cache->pin_epoch++;
+        if (!cache->pin_epoch) cache->pin_epoch++;
+    }
+    return 0;
+}
+
+int
+wl_columnar_cache_mat_evict_controlled(col_mat_cache_t *cache,
+    size_t target, wl_evaluation_control_t *control)
+{
+    if (!cache || !control) return EINVAL;
+    while (cache->total_bytes > target && cache->count) {
+        uint32_t selected = UINT32_MAX;
+        for (uint32_t i = 0; i < cache->count; i++) {
+            int rc = wl_evaluation_control_charge(control, 16);
+            if (rc) return rc;
+            rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+            col_mat_entry_t *e = &cache->entries[i];
+            if (!e->result || e->eviction_deferred || e->pin_count) continue;
+            if (selected == UINT32_MAX
+                || e->lru_clock <
+                cache->entries[selected].lru_clock) selected = i;
+        }
+        if (selected == UINT32_MAX) return 0;
+        uint64_t bytes;
+        if (!wl_columnar_memory_size_mul(cache->count - selected - 1u,
+            sizeof(*cache->entries),
+            &bytes) || bytes > SIZE_MAX) return EOVERFLOW;
+        for (uint64_t at = 0; at < bytes;) {
+            uint64_t n = bytes - at; if (n > 256) n = 256;
+            int rc = wl_evaluation_control_charge(control, n);
+            if (rc) return rc;
+            at += n;
+            rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        }
+        int rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        col_mat_entry_t *e = &cache->entries[selected];
+        if (cache->total_bytes < e->mem_bytes) return EINVAL;
+        if (e->owns_result && e->result) {
+            rc = col_rel_destroy_checked(e->result); if (rc) return rc;
+        }
+        e->result = NULL;
+        if (cache->ledger && e->ledger_bytes)
+            wl_mem_ledger_free(cache->ledger, WL_MEM_SUBSYS_CACHE,
+                e->ledger_bytes);
+        cache->total_bytes -= e->mem_bytes;
+        memset(e, 0, sizeof(*e)); memmove(e, e + 1, (size_t)bytes);
+        cache->count--;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    return 0;
+}
+
 void
 col_mat_cache_release_pins(col_mat_cache_t *cache)
 {

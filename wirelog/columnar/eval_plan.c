@@ -67,9 +67,9 @@ wl_columnar_eval_plan_aggregate_validate(const wl_plan_relation_t *plan,
     return 0;
 }
 
-int
-wl_columnar_eval_plan_union_validate(const wl_plan_relation_t *plan,
-    wl_evaluation_control_t *control, bool *supported)
+static int
+wl_columnar_eval_plan_union_validate_body(const wl_plan_relation_t *plan,
+    wl_evaluation_control_t *control, bool *supported, bool recursive)
 {
     if (!plan || !supported || !control) return EINVAL;
     *supported = false;
@@ -128,6 +128,11 @@ wl_columnar_eval_plan_union_validate(const wl_plan_relation_t *plan,
         case WL_PLAN_OP_CONSOLIDATE:
             if (!depth) return ENOTSUP;
             break;
+        case WL_PLAN_OP_EXCHANGE:
+            if (!recursive || depth != 1u || !i || i + 1u != plan->op_count
+                || plan->ops[i - 1u].op != WL_PLAN_OP_CONSOLIDATE)
+                return ENOTSUP;
+            break;
         default: return ENOTSUP;
         }
         /* A completed first child remains below the next VARIABLE. */
@@ -138,10 +143,113 @@ wl_columnar_eval_plan_union_validate(const wl_plan_relation_t *plan,
         if (rc) return rc;
     }
     if (depth != 1u
-        || plan->ops[plan->op_count - 1u].op != WL_PLAN_OP_CONSOLIDATE)
+        || (plan->ops[plan->op_count - 1u].op != WL_PLAN_OP_CONSOLIDATE
+        && !(recursive &&
+        plan->ops[plan->op_count - 1u].op == WL_PLAN_OP_EXCHANGE)))
         return ENOTSUP;
     *supported = true;
     return 0;
+}
+
+int
+wl_columnar_eval_plan_union_validate(const wl_plan_relation_t *plan,
+    wl_evaluation_control_t *control, bool *supported)
+{
+    return wl_columnar_eval_plan_union_validate_body(plan, control, supported,
+               false);
+}
+
+int
+wl_columnar_eval_plan_recursive_validate(const wl_plan_relation_t *plan,
+    wl_evaluation_control_t *control, bool *supported)
+{
+    if (!plan || !control || !supported) return EINVAL;
+    *supported = false;
+    /* Final metadata-driven MIN/MAX domination is not yet controlled.
+     * Refuse before head registration or any recursive payload mutation. */
+    if (plan->recursive_agg.has_spec) return ENOTSUP;
+    return wl_columnar_eval_plan_union_validate_body(plan, control, supported,
+               true);
+}
+
+static int
+wl_columnar_eval_plan_recursive_base_skip(const wl_plan_relation_t *plan,
+    uint32_t index, eval_stack_t *stack, wl_col_session_t *session,
+    bool *skipped)
+{
+    wl_evaluation_control_t *control = session->base.evaluation_control;
+    const wl_plan_op_t *op = &plan->ops[index];
+    *skipped = false;
+    if (index + 1u < plan->op_count &&
+        (plan->ops[index + 1u].op == WL_PLAN_OP_JOIN
+        || plan->ops[index + 1u].op == WL_PLAN_OP_SEMIJOIN
+        || plan->ops[index + 1u].op == WL_PLAN_OP_ANTIJOIN)) return 0;
+    char name[256];
+    int rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+    name[0] = '$'; name[1] = 'd'; name[2] = '$';
+    size_t pos = 3;
+    while (pos < sizeof(name) - 1u) {
+        rc = wl_evaluation_control_charge(control, 2); if (rc) return rc;
+        char value = op->relation_name[pos - 3u]; name[pos++] = value;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (!value) break;
+    }
+    name[pos] = '\0';
+    col_rel_t *delta = NULL;
+    rc = wl_columnar_join_controlled_lookup(session, name, &delta, control);
+    if (rc) return rc;
+    wl_columnar_relation_source_group_t *group = NULL;
+    eval_entry_t *result = NULL;
+    rc = wl_columnar_eval_stack_cleanup_join_owner(session, stack, &group,
+            &result);
+    if (rc) return rc;
+    if (delta) {
+        rc = wl_columnar_relation_source_group_acquire_controlled(group, delta,
+                NULL, control);
+        if (!rc) rc = wl_evaluation_control_charge(control, 8);
+        bool nonempty = !rc && delta->nrows;
+        if (!rc) rc = wl_evaluation_control_charge(control, 0);
+        rc = wl_columnar_relation_source_group_drain(group, rc);
+        if (rc || nonempty) return rc;
+    }
+    for (uint32_t i = 0; i < plan->op_count; i++) {
+        rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+        const wl_plan_op_t *candidate = &plan->ops[i];
+        bool join = candidate->op == WL_PLAN_OP_JOIN
+            || candidate->op == WL_PLAN_OP_SEMIJOIN ||
+            candidate->op == WL_PLAN_OP_ANTIJOIN;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (!join || !candidate->right_relation) continue;
+        for (size_t at = 0;; at++) {
+            rc = wl_evaluation_control_charge(control, 2); if (rc) return rc;
+            unsigned char a = candidate->right_relation[at],
+                b = op->relation_name[at];
+            rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+            if (a != b) break;
+            if (!a) return 0;
+            if (at == SIZE_MAX - 1u) return EOVERFLOW;
+        }
+    }
+    col_rel_t *full = NULL;
+    rc = wl_columnar_join_controlled_lookup(session, op->relation_name, &full,
+            control);
+    if (rc || !full) return rc;
+    rc = wl_columnar_relation_source_group_acquire_controlled(group, full, NULL,
+            control);
+    if (!rc) rc =
+            wl_columnar_relation_pool_new_like_held_controlled(&result->rel,
+                session->delta_pool, "$base_skip", full,
+                session->memory_governor, control);
+    if (result->rel) result->owned = true;
+    rc = wl_columnar_relation_source_group_drain(group, rc);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    rc = eval_stack_push(stack, result->rel, true);
+    if (!rc) {
+        result->rel = NULL; result->owned = false; *skipped = true;
+    }
+    return rc;
 }
 
 static int
@@ -172,6 +280,14 @@ wl_columnar_eval_plan_body(const wl_plan_relation_t *rplan, eval_stack_t *stack,
         if (!sess->tdd_input_run && op->op == WL_PLAN_OP_VARIABLE
             && sess->current_iteration > 0
             && op->delta_mode == WL_DELTA_AUTO && op->relation_name) {
+            if (sess->base.evaluation_control && sess->recursive.active) {
+                bool skipped;
+                rc = wl_columnar_eval_plan_recursive_base_skip(rplan, i,
+                        stack, sess, &skipped);
+                if (rc) return rc;
+                if (skipped) continue;
+                goto normal_eval;
+            }
             /* Look ahead: base-case VARIABLE is followed by MAP (not JOIN). */
             bool next_is_join = (i + 1 < rplan->op_count
                 && (rplan->ops[i + 1].op == WL_PLAN_OP_JOIN
@@ -342,8 +458,9 @@ ordinary_join:
             assert(0 && "unknown plan op type in columnar eval dispatch");
             break;
         }
-        if (rc != 0)
+        if (rc != 0) {
             return rc;
+        }
     }
     return 0;
 }
@@ -412,7 +529,10 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
         }
         bool union_plan = false;
         if (rplan->op_count >= 5u) {
-            rc = wl_columnar_eval_plan_union_validate(rplan, control,
+            rc = sess->recursive.active && sess->recursive.ready
+                ? wl_columnar_eval_plan_recursive_validate(rplan, control,
+                    &union_plan)
+                : wl_columnar_eval_plan_union_validate(rplan, control,
                     &union_plan);
             if (rc) return rc;
         }
@@ -464,7 +584,9 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
                     consolidate ? 24u : 16u);
             if (rc)
                 return rc;
-            if (sess->current_iteration || sess->delta_observer)
+            if ((sess->current_iteration && !(sess->recursive.active
+                && sess->recursive.ready && !sess->diff_enabled
+                && !sess->diff_operators_active)) || sess->delta_observer)
                 return ENOTSUP;
             if (stack->top >= COL_STACK_MAX)
                 return ENOMEM;
@@ -557,6 +679,81 @@ retraction_rel_name(const char *rel, char *buf, size_t sz)
  * WHOLE K_FUSION op to an empty relation when live_count == 0. Neither can
  * reproduce the whole-sub-pass break this function enables.
  */
+int
+wl_columnar_eval_plan_empty_forced_delta(const wl_plan_relation_t *rp,
+    wl_col_session_t *sess, uint32_t iteration, bool *empty,
+    wl_evaluation_control_t *control)
+{
+    if (!rp || !sess || !empty || !control || (rp->op_count && !rp->ops))
+        return EINVAL;
+    *empty = false;
+    int rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+    if (sess->delta_seeded || sess->retraction_seeded) return ENOTSUP;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    if (!iteration) return 0;
+    for (uint32_t i = 0; i < rp->op_count; i++) {
+        rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+        bool concat = rp->ops[i].op == WL_PLAN_OP_CONCAT;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (concat) return 0;
+    }
+    for (uint32_t i = 0; i < rp->op_count; i++) {
+        rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+        const wl_plan_op_t *op = &rp->ops[i];
+        const char *name = op->delta_mode != WL_DELTA_FORCE_DELTA ? NULL
+            : op->op == WL_PLAN_OP_VARIABLE ? op->relation_name
+            : op->op == WL_PLAN_OP_JOIN || op->op == WL_PLAN_OP_SEMIJOIN
+                ? op->right_relation : NULL;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (!name) continue;
+        char delta_name[256];
+        rc = wl_evaluation_control_charge(control, 4); if (rc) return rc;
+        delta_name[0] = '$'; delta_name[1] = 'd'; delta_name[2] = '$';
+        uint32_t length = 0;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        while (length < sizeof(delta_name) - 4u) {
+            rc = wl_evaluation_control_charge(control, 2); if (rc) return rc;
+            char ch = name[length];
+            if (ch) delta_name[3u + length++] = ch;
+            rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+            if (!ch) break;
+        }
+        rc = wl_evaluation_control_charge(control, 1); if (rc) return rc;
+        delta_name[3u + length] = 0;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        col_rel_t *delta = NULL;
+        rc = wl_columnar_join_controlled_lookup(sess, delta_name, &delta,
+                control);
+        if (rc) return rc;
+        if (!delta) {
+            *empty = true; return 0;
+        }
+        wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+        rc = wl_columnar_eval_stack_cleanup_begin(sess, &frame);
+        if (rc) return rc;
+        wl_columnar_relation_source_group_t *group =
+            wl_columnar_eval_stack_cleanup_sources(frame);
+        if (!group) rc = EINVAL;
+        else rc = wl_columnar_relation_source_group_acquire_controlled(group,
+                    delta, NULL, control);
+        bool absent_rows = false;
+        if (!rc) {
+            rc = wl_evaluation_control_charge(control, 8);
+            if (!rc) {
+                absent_rows = delta->nrows == 0;
+                rc = wl_evaluation_control_charge(control, 0);
+            }
+        }
+        int cleanup = wl_columnar_eval_stack_cleanup_finish(&frame);
+        if (cleanup && rc <= 0) rc = cleanup;
+        if (rc) return rc;
+        if (absent_rows) {
+            *empty = true; return 0;
+        }
+    }
+    return 0;
+}
+
 bool
 has_empty_forced_delta(const wl_plan_relation_t *rp, wl_col_session_t *sess,
     uint32_t iteration)

@@ -2433,6 +2433,7 @@ col_arrangement_find_next(const col_arrangement_t *arr, uint32_t row_idx)
 
 static void sarr_release(col_sorted_arr_t *sarr);
 static void sarr_mark_deferred(col_sorted_arr_t *sarr);
+static uint64_t diff_entry_next_generation(uint64_t generation);
 
 void
 col_session_invalidate_arrangements(wl_session_t *sess, const char *rel_name)
@@ -2488,6 +2489,96 @@ col_session_invalidate_arrangements(wl_session_t *sess, const char *rel_name)
                 diff_entry_reset(entry);
         }
     }
+}
+
+int
+wl_columnar_arrangement_invalidate_controlled(wl_col_session_t *cs,
+    const char *name, uint32_t *family, uint32_t *cursor,
+    wl_evaluation_control_t *control)
+{
+    if (!cs || !name || !family || !cursor || !control || *family > 4)
+        return EINVAL;
+    while (*family < 4) {
+        uint32_t count = *family == 0 ? cs->arr_count
+            : *family == 1 ? cs->sarr_count
+            : *family == 2 ? cs->filt_arr_count : cs->diff_arr_count;
+        if (*cursor > count) return EINVAL;
+        while (*cursor < count) {
+            int rc = wl_evaluation_control_charge(control, 16);
+            if (rc) return rc;
+            rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+            const char *entry_name = *family ==
+                0 ? cs->arr_entries[*cursor].rel_name
+                : *family == 1 ? cs->sarr_entries[*cursor].rel_name
+                : *family == 2 ? cs->filt_arr_entries[*cursor].rel_name
+                : cs->diff_arr_entries[*cursor].rel_name;
+            bool equal = false;
+            if (entry_name) {
+                rc = wl_columnar_arrangement_name_equal_controlled(entry_name,
+                        name, &equal, control); if (rc) return rc;
+            }
+            if (equal) {
+                rc = wl_evaluation_control_charge(control, 32);
+                if (rc) return rc;
+                rc = wl_evaluation_control_charge(control, 0);
+                if (rc) return rc;
+                if (*family == 0) {
+                    col_arr_entry_t *e = &cs->arr_entries[*cursor];
+                    if (e->pin_count) e->rebuild_deferred = true;
+                    else arr_entry_mark_unbuilt(e);
+                } else if (*family == 1) {
+                    col_sorted_arr_t *a = &cs->sarr_entries[*cursor].sarr;
+                    if (a->pin_count) sarr_mark_deferred(a);
+                    else {
+                        sarr_release(a); a->nrows = a->indexed_rows = 0;
+                        a->source_snapshot = (col_relation_snapshot_t){0};
+                    }
+                } else if (*family == 2) {
+                    cs->filt_arr_entries[*cursor].arr.indexed_rows = 0;
+                } else {
+                    col_diff_arr_entry_t *e = &cs->diff_arr_entries[*cursor];
+                    if (e->pin_count || e->transaction_pending ||
+                        e->generation == UINT64_MAX)
+                        e->invalidation_deferred = true;
+                    else {
+                        col_diff_arrangement_t *a = e->diff_arr;
+                        if (!a) return EINVAL;
+                        /* Poison freshness before a partially cleared hash
+                         * can return. Same entry is retained on a work stop. */
+                        a->source_snapshot = (col_relation_snapshot_t){0};
+                        a->base_nrows = a->current_nrows = a->indexed_rows = 0;
+                        void *arrays[] = {a->ht_head, a->ht_next};
+                        size_t widths[] = {sizeof(*a->ht_head),
+                                           sizeof(*a->ht_next)};
+                        uint32_t counts[] = {a->nbuckets, a->ht_cap};
+                        for (unsigned lane = 0; lane < 2; lane++) {
+                            uint64_t bytes;
+                            if (!wl_columnar_memory_size_mul(counts[lane],
+                                widths[lane], &bytes)
+                                || bytes > SIZE_MAX ||
+                                (bytes && !arrays[lane])) return EINVAL;
+                            for (uint64_t at = 0; at < bytes;) {
+                                size_t n = bytes - at >
+                                    128 ? 128 : (size_t)(bytes - at);
+                                rc = wl_evaluation_control_charge(control, n);
+                                if (rc) return rc;
+                                memset((char *)arrays[lane] + at, 0, n);
+                                at += n;
+                                rc = wl_evaluation_control_charge(control, 0);
+                                if (rc) return rc;
+                            }
+                        }
+                        e->generation =
+                            diff_entry_next_generation(e->generation);
+                    }
+                }
+            }
+            (*cursor)++;
+            rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        }
+        (*family)++; *cursor = 0;
+    }
+    return 0;
 }
 
 /* ======================================================================== */

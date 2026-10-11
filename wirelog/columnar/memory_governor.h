@@ -179,6 +179,12 @@ int wl_columnar_memory_governor_begin_growth_controlled(
 int wl_columnar_memory_governor_commit_controlled(
     wl_columnar_memory_reservation_t *, const void *, bool *,
     wl_evaluation_control_t *);
+/* Owner transfer changes no reserved-byte total. Unlike admission outputs,
+ * transferred remains authoritative after a tail stop: true means the
+ * original token already belongs to the new owner and must not be replayed. */
+int wl_columnar_memory_governor_transfer_controlled(
+    wl_columnar_memory_reservation_t *, const void *, bool *,
+    wl_evaluation_control_t *);
 int wl_columnar_memory_governor_commit_growth_controlled(
     wl_columnar_memory_reservation_t *, bool *, wl_evaluation_control_t *);
 

@@ -1367,19 +1367,21 @@ wl_columnar_join_controlled_key(const col_rel_t *r, const char *name,
     }
     return 0;
 }
-int
-wl_columnar_join_controlled_shape(const col_rel_t *r,
-    wl_evaluation_control_t *control)
+static int
+wl_columnar_join_controlled_shape_mode(const col_rel_t *r,
+    bool recursive, wl_evaluation_control_t *control)
 {
     int rc = wl_evaluation_control_charge(control, 16);
     if (rc) return rc;
     if (!r || r->nrows > r->capacity || (r->nrows && r->ncols && !r->columns))
         return EINVAL;
-    if (r->timestamps || r->arena_owned
+    if ((r->timestamps && !recursive) || r->arena_owned
         || r->compound_kind != WIRELOG_COMPOUND_KIND_NONE
         || r->compound_count || r->inline_physical_offset
         || r->compound_arity_map || r->compound_arity_len)
         return ENOTSUP;
+    if (recursive && ((r->timestamps && r->timestamp_capacity < r->nrows)
+        || (!r->timestamps && r->timestamp_capacity))) return EINVAL;
     rc = wl_columnar_join_controlled_tail(control);
     if (rc) return rc;
     for (uint32_t c = 0; r->nrows && c < r->ncols; c++) {
@@ -1391,6 +1393,13 @@ wl_columnar_join_controlled_shape(const col_rel_t *r,
     }
     return 0;
 }
+int
+wl_columnar_join_controlled_shape(const col_rel_t *r,
+    wl_evaluation_control_t *control)
+{
+    return wl_columnar_join_controlled_shape_mode(r, false, control);
+}
+
 static int
 wl_columnar_join_controlled_hash(const col_rel_t *r, uint32_t row,
     const uint32_t *keys, uint32_t count, uint32_t *hash,
@@ -1468,6 +1477,44 @@ wl_columnar_join_controlled_select_right(const wl_plan_op_t *op,
         delta->nrows < full->nrows) rc = ENOTSUP;
     if (!rc) rc = wl_columnar_join_controlled_tail(control);
     /* Selection's two-slot cohort must really retire before the input pair. */
+    return wl_columnar_relation_source_group_drain(group, rc);
+}
+
+/* Ordinary recursive AUTO follows the raw left-delta/right-delta heuristic.
+ * The selection cohort actually retires before acquiring the input pair. */
+static int
+wl_columnar_join_recursive_select_right(const wl_plan_op_t *op,
+    wl_col_session_t *sess, col_rel_t **right, bool left_delta,
+    bool *used_delta,
+    wl_columnar_relation_source_group_t *group,
+    wl_evaluation_control_t *control)
+{
+    if (op->delta_mode == WL_DELTA_FORCE_FULL || !*right ||
+        left_delta) return 0;
+    char name[256];
+    int rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+    name[0] = '$'; name[1] = 'd'; name[2] = '$';
+    size_t pos = 3;
+    while (pos < sizeof(name) - 1u) {
+        rc = wl_evaluation_control_charge(control, 2); if (rc) return rc;
+        char value = op->right_relation[pos - 3u]; name[pos++] = value;
+        rc = wl_columnar_join_controlled_tail(control); if (rc) return rc;
+        if (!value) break;
+    }
+    name[pos] = '\0';
+    col_rel_t *delta = NULL;
+    rc = wl_columnar_join_controlled_lookup(sess, name, &delta, control);
+    if (rc) return rc;
+    rc = wl_columnar_relation_source_group_acquire_controlled(group, *right,
+            delta, control);
+    if (!rc) rc = wl_columnar_join_controlled_shape_mode(*right, true, control);
+    if (!rc && delta) rc = wl_columnar_join_controlled_shape_mode(delta, true,
+                control);
+    if (!rc) rc = wl_evaluation_control_charge(control, 8);
+    if (!rc && delta && delta->nrows && delta->nrows < (*right)->nrows) {
+        *right = delta; *used_delta = true;
+    }
+    if (!rc) rc = wl_columnar_join_controlled_tail(control);
     return wl_columnar_relation_source_group_drain(group, rc);
 }
 
@@ -1624,7 +1671,11 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
         || stack->items[stack->top - 1].kind != WL_COLUMNAR_EVAL_ENTRY_RELATION
         || !stack->items[stack->top - 1].rel)
         return EINVAL;
-    if (stack->items[stack->top - 1].is_delta) return ENOTSUP;
+    bool recursive = sess->recursive.active && sess->recursive.ready;
+    if (recursive &&
+        (sess->diff_enabled || sess->join_batch_bytes)) return ENOTSUP;
+    if (stack->items[stack->top - 1].is_delta && !recursive) return ENOTSUP;
+    bool used_right_delta = false;
     uint32_t slot = stack->top - 1;
     col_rel_t *left = stack->items[slot].rel, *right = NULL, *out = NULL;
     eval_entry_t left_entry = {0};
@@ -1642,7 +1693,9 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     rc = wl_columnar_join_controlled_lookup(sess, op->right_relation, &right,
             control);
     if (rc) return rc;
-    rc = wl_columnar_join_controlled_select_right(op, sess, right, group,
+    rc = recursive ? wl_columnar_join_recursive_select_right(op, sess, &right,
+            stack->items[slot].is_delta, &used_right_delta, group, control)
+        : wl_columnar_join_controlled_select_right(op, sess, right, group,
             control);
     if (rc) goto cleanup;
 #ifdef WL_PROFILE
@@ -1654,10 +1707,10 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_columnar_join_controlled_checkpoint(control, 1, group->descriptor_count,
         group, left);
     if (rc) goto cleanup;
-    rc = wl_columnar_join_controlled_shape(left, control);
+    rc = wl_columnar_join_controlled_shape_mode(left, recursive, control);
     if (rc) goto cleanup;
     if (right) {
-        rc = wl_columnar_join_controlled_shape(right, control);
+        rc = wl_columnar_join_controlled_shape_mode(right, recursive, control);
         if (rc) goto cleanup;
     }
     rc = wl_evaluation_control_charge(control, 64);
@@ -1954,6 +2007,9 @@ wl_columnar_join_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     rc = eval_entry_dispose(&left_entry);
     if (rc) goto cleanup;
     stack->items[slot] = (eval_entry_t){.rel = out, .owned = true,
+                                        .is_delta = right && !projected
+                                            && (left_entry.is_delta ||
+                                            used_right_delta),
                                         .kind =
                                             WL_COLUMNAR_EVAL_ENTRY_RELATION};
     stack->top = slot + 1u;

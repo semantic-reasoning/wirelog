@@ -27,6 +27,733 @@
 static col_frontier_t
 col_frontier_compute(const col_rel_t *rel);
 
+int
+wl_columnar_eval_serial_recursive_pool_reset(wl_col_session_t *sess,
+    wl_evaluation_control_t *control)
+{
+    if (!sess || !control) return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
+    rc = wl_columnar_eval_stack_cleanup_idle(sess, control); if (rc) return rc;
+    wl_columnar_eval_serial_recursive_record_t *r = &sess->recursive;
+    if (!r->active || !r->ready || r->phase != 2 || r->reset_active
+        || !r->delta_rels || sess->cleanup_pending
+        || sess->mat_cache.active_pins || sess->filt_cache_active_pins)
+        return EBUSY;
+    uint64_t extent; uint32_t slots;
+    rc = wl_columnar_session_recursive_pool_extent(sess, &extent, &slots);
+    if (rc) return rc;
+    delta_pool_t *pool = sess->delta_pool;
+    if ((sess->arr_count && !sess->arr_entries)
+        || (sess->sarr_count && !sess->sarr_entries)
+        || (sess->diff_arr_count && !sess->diff_arr_entries)
+        || (sess->darr_count && !sess->darr_entries)) return EINVAL;
+    for (uint32_t i = 0; i < sess->arr_count; i++) {
+        rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+        if (sess->arr_entries[i].pin_count) return EBUSY;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    for (uint32_t i = 0; i < sess->sarr_count; i++) {
+        rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+        if (sess->sarr_entries[i].sarr.pin_count) return EBUSY;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    for (uint32_t i = 0; i < sess->diff_arr_count; i++) {
+        rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+        if (sess->diff_arr_entries[i].pin_count
+            || sess->diff_arr_entries[i].transaction_pending) return EBUSY;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    for (uint32_t i = 0; i < sess->darr_count; i++) {
+        rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+        if (sess->darr_entries[i].pin_count) return EBUSY;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    uint64_t capacity_extent;
+    if (!wl_columnar_memory_size_mul(pool->slot_cap, pool->slot_size,
+        &capacity_extent)
+        || capacity_extent > SIZE_MAX
+        || capacity_extent > UINTPTR_MAX - (uintptr_t)pool->slab) return EINVAL;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    for (uint32_t i = 0; i < r->relation_count; i++) {
+        rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+        col_rel_t *delta = r->delta_rels[i];
+        uintptr_t address = (uintptr_t)delta;
+        bool in_slab = delta && address >= (uintptr_t)pool->slab
+            && address - (uintptr_t)pool->slab < extent;
+        if (in_slab && (address - (uintptr_t)pool->slab) % pool->slot_size)
+            return EINVAL;
+        /* Membership is checked by address, without reading a relation
+         * payload through an unheld alias. Unused slab slots are not live
+         * journal owners; actual heap entries have separate lifetimes. */
+        if (delta && address >= (uintptr_t)pool->slab
+            && address - (uintptr_t)pool->slab < capacity_extent && !in_slab)
+            return EINVAL;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (!in_slab) continue;
+        for (uint32_t j = 0; j < i; j++) {
+            rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+            if (r->delta_rels[j] == delta) return EINVAL;
+            rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        }
+    }
+    rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    r->reset_pool = pool; r->reset_slab = pool->slab;
+    r->reset_stride = pool->slot_size; r->reset_high_water = slots;
+    delta_pool_reset(pool);
+    r->reset_active = true;
+    return wl_evaluation_control_charge(control, 0);
+}
+
+int
+wl_columnar_eval_serial_recursive_pool_barrier(wl_col_session_t *sess,
+    wl_evaluation_control_t *control)
+{
+    if (!sess || !control) return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+    rc = wl_columnar_eval_stack_cleanup_idle(sess, control); if (rc) return rc;
+    wl_columnar_eval_serial_recursive_record_t *r = &sess->recursive;
+    if (!r->active || !r->ready || !r->delta_rels
+        || sess->cleanup_pending) return EBUSY;
+    if (!r->reset_active) return wl_evaluation_control_charge(control, 0);
+    uint64_t extent; uint32_t slots;
+    rc = wl_columnar_session_recursive_pool_extent(sess, &extent, &slots);
+    if (rc) return rc;
+    for (uint32_t i = 0; i < r->relation_count; i++) {
+        rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+        if (r->delta_rels[i]) return EBUSY;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    r->reset_active = false; r->reset_pool = NULL; r->reset_slab = NULL;
+    r->reset_stride = 0; r->reset_high_water = 0;
+    return wl_evaluation_control_charge(control, 0);
+}
+
+/* The ordinary subpass uses the raw cache/sample/reset/rotation/GC order.
+ * A failed nonterminal subpass is abandoned through the original owners;
+ * this helper never resets an allowance or replays a consumed GC record. */
+int
+wl_columnar_eval_serial_recursive_boundary(wl_col_session_t *sess,
+    wl_evaluation_control_t *control)
+{
+    if (!sess || !control) return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+    if (!sess->recursive.active || !sess->recursive.ready
+        || sess->recursive.phase != 2 || sess->recursive.reset_active
+        || sess->coordinator || sess->num_workers != 1
+        || sess->rotation_ops != &col_rotation_standard_ops
+        || sess->delta_observer || sess->delta_rollback)
+        return ENOTSUP;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    uint32_t cursor = 0;
+    rc = wl_columnar_cache_mat_retire_controlled(&sess->mat_cache, &cursor,
+            true, control); if (rc) return rc;
+    if (sess->cache_evict_threshold) {
+        rc = wl_columnar_cache_mat_evict_controlled(&sess->mat_cache,
+                sess->cache_evict_threshold, control);
+    } else {
+        cursor = 0;
+        rc = wl_columnar_cache_mat_retire_controlled(&sess->mat_cache, &cursor,
+                false, control);
+    }
+    if (rc) return rc;
+    rc = wl_columnar_session_mem_sample_controlled(sess, control);
+    if (rc) return rc;
+    rc = wl_columnar_eval_serial_recursive_pool_reset(sess, control);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_cleanup_idle(sess, control); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+    if (!sess->recursive.reset_active || sess->cleanup_pending
+        || sess->rotation_ops != &col_rotation_standard_ops) return EBUSY;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    /* STANDARD is a fixed used-counter reset; backing allocation and its
+     * original credit remain. Compound collection is separately controlled. */
+    sess->rotation_ops->rotate_eval_arena(sess);
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    if (!sess->compound_arena) return 0;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    wl_arena_compound_arena_gc_record_t *gc = NULL;
+    rc = wl_columnar_eval_stack_cleanup_acquire(sess, &frame, control);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_cleanup_compound_gc(sess, frame, &gc, control);
+    if (!rc) rc = wl_arena_compound_arena_gc_step(gc, sess->compound_arena,
+                control);
+    if (gc) rc = wl_arena_compound_arena_gc_retire(gc, rc, rc ? NULL : control);
+    int cleanup = wl_columnar_eval_stack_cleanup_finish(&frame);
+    return cleanup && rc <= 0 ? cleanup : rc;
+}
+
+/* Persistent stratum payload uses its original session reservation. A rule
+* frame may retain registered deltas, so callers drain that frame first. */
+int
+wl_columnar_eval_serial_recursive_retire(wl_col_session_t *sess, int primary,
+    wl_evaluation_control_t *control)
+{
+    if (!sess) return primary > 0 ? primary : EINVAL;
+    wl_columnar_eval_serial_recursive_record_t *record = &sess->recursive;
+    if (!record->active) {
+        /* A terminal registered sweep can outlive private delta/snap owners.
+         * Its original consumed removal authority is still real cleanup. */
+        if (sess->serial_completion.pending
+            && sess->serial_completion.phase ==
+            WL_COLUMNAR_SERIAL_PHASE_RECURSIVE_TERMINAL
+            && record->phase == WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_REMOVAL)
+            return wl_columnar_session_recursive_removal_drain(sess, primary);
+        return primary;
+    }
+    int idle = wl_columnar_eval_stack_cleanup_idle(sess, NULL);
+    if (idle) {
+        record->cleanup_pending = true;
+        return primary > 0 ? primary : idle;
+    }
+    int rc = primary;
+    if (record->phase == WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_REMOVAL) {
+        rc = wl_columnar_session_recursive_removal_drain(sess, rc);
+        if (record->phase == WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_REMOVAL)
+            return rc;
+    }
+    if (record->phase == WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_REGISTERED) {
+        if (!record->delta_rels || record->relation >= record->relation_count)
+            return rc > 0 ? rc : EINVAL;
+        col_rel_t *registered = record->delta_rels[record->relation];
+        if (!registered || registered->pool_owned)
+            return rc > 0 ? rc : EINVAL;
+        /* This slot is a borrowed cleanup reference after actual registry
+         * publication. Its original name credit is the only pending owner. */
+        if (registered->pool_name_reserved_bytes
+            && !wl_columnar_memory_release(
+                &registered->pool_name_reservation)){
+            record->cleanup_pending = true;
+            return rc > 0 ? rc : EINVAL;
+        }
+        registered->pool_name_reserved_bytes = 0;
+        record->delta_rels[record->relation] = NULL;
+        record->phase = 2;
+    }
+    if (!record->delta_rels)
+        record->retirement_cursor = record->relation_count;
+    while (record->retirement_cursor < record->relation_count) {
+        if (control && !rc) {
+            rc = wl_evaluation_control_charge(control, 8);
+            if (!rc) rc = wl_evaluation_control_charge(control, 0);
+        }
+        uint32_t index = record->retirement_cursor;
+        col_rel_t *delta =
+            record->delta_rels ? record->delta_rels[index] : NULL;
+        if (delta) {
+            /* Existing checked physical disposal exclusion. No charged
+             * width-loop claim is made for relation/Arrow destruction. */
+            int cleanup = col_rel_destroy_checked(delta);
+            if (cleanup) {
+                record->cleanup_pending = true;
+                return rc > 0 ? rc : cleanup;
+            }
+            record->delta_rels[index] = NULL;
+        }
+        record->retirement_cursor++;
+        if (control && !rc) rc = wl_evaluation_control_charge(control, 0);
+        /* Once a work stop occurs, the rest is mandatory checked disposal;
+        * it does not admit fresh work or reset/refund consumed control. */
+    }
+    free(record->snap); record->snap = NULL;
+    free(record->delta_rels); record->delta_rels = NULL;
+    if ((record->reservation.governor || record->reservation.bytes)
+        && !wl_columnar_memory_rollback(&record->reservation)) {
+        record->cleanup_pending = true;
+        return rc > 0 ? rc : EINVAL;
+    }
+    /* Successful rollback retains diagnostic scalar bytes in the token.
+     * Only now, after physical NULL and actual credited terminal state, may
+     * the original slot be initialized for a future host invocation. */
+    wl_columnar_memory_reservation_init(&record->reservation);
+    sess->diff_operators_active = record->saved_diff_operators_active;
+    record->active = false; record->ready = false;
+    record->cleanup_pending = false; record->phase = 0;
+    record->plan = NULL; record->stratum = NULL;
+    record->relation_count = 0; record->retirement_cursor = 0;
+    record->reset_active = false; record->reset_pool = NULL;
+    record->reset_slab = NULL;
+    record->reset_stride = 0; record->reset_high_water = 0;
+    return rc;
+}
+
+int
+wl_columnar_eval_serial_recursive_begin(wl_col_session_t *sess,
+    const wl_plan_t *plan, uint32_t stratum_index,
+    wl_evaluation_control_t *control)
+{
+    if (!sess || !plan || !control) return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 32);
+    if (rc) return rc;
+    wl_columnar_eval_serial_recursive_record_t *record = &sess->recursive;
+    if (record->active || record->cleanup_pending || record->delta_rels
+        || record->snap || record->reservation.bytes
+        || record->reservation.governor || record->reservation.replacement_bytes
+        || record->reset_active || record->reset_pool || record->reset_slab
+        || record->reset_stride || record->reset_high_water)
+        return EBUSY;
+    if (stratum_index >= plan->stratum_count || !plan->strata) return EINVAL;
+    const wl_plan_stratum_t *stratum = &plan->strata[stratum_index];
+    if (!stratum->is_recursive || !stratum->relation_count ||
+        !stratum->relations)
+        return EINVAL;
+    uint64_t pointers, snapshots, bytes;
+    if (!wl_columnar_memory_size_mul(stratum->relation_count,
+        sizeof(col_rel_t *), &pointers)
+        || !wl_columnar_memory_size_mul(stratum->relation_count,
+        sizeof(uint32_t), &snapshots)
+        || !wl_columnar_memory_size_add(pointers, snapshots, &bytes)
+        || pointers > SIZE_MAX || snapshots > SIZE_MAX) return EOVERFLOW;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
+    record->plan = plan; record->stratum = stratum;
+    record->stratum_index = stratum_index;
+    record->relation_count = stratum->relation_count;
+    record->iteration = record->subpass = record->relation = record->cursor = 0;
+    record->retirement_cursor = record->rule_id_base =
+        record->effective_iteration = 0;
+    record->saved_diff_operators_active = sess->diff_operators_active;
+    record->active = true; record->ready = false; record->phase = 1;
+    record->canonical_consumed = false; record->cleanup_pending = false;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) goto fail;
+    if (sess->memory_governor) {
+        wl_columnar_memory_admission_status_t status;
+        rc = wl_columnar_memory_governor_reserve_checked_controlled(
+            wl_columnar_memory_governor_ref_get(sess->memory_governor), bytes,
+            &record->reservation, &status, control);
+        if (rc) goto fail;
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                sess->memory_budget_denied = true;
+            rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status ==
+                WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : ENOMEM;
+            goto fail;
+        }
+    }
+    rc = wl_evaluation_control_charge(control, 1); if (rc) goto fail;
+    record->delta_rels = calloc(record->relation_count, sizeof(col_rel_t *));
+    if (!record->delta_rels) {
+        rc = ENOMEM; goto fail;
+    }
+    rc = wl_evaluation_control_charge(control, 0); if (rc) goto fail;
+    rc = wl_evaluation_control_charge(control, 1); if (rc) goto fail;
+    record->snap = malloc((size_t)snapshots);
+    if (!record->snap) {
+        rc = ENOMEM; goto fail;
+    }
+    rc = wl_evaluation_control_charge(control, 0); if (rc) goto fail;
+    record->ready = true; record->phase = 2;
+    return 0;
+fail:
+    return wl_columnar_eval_serial_recursive_retire(sess, rc, NULL);
+}
+
+int
+wl_columnar_eval_serial_recursive_clone(wl_col_session_t *sess,
+    col_rel_t *source,
+    const char *name, uint32_t index, wl_evaluation_control_t *control)
+{
+    if (!sess || !source || !name || !control) return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+    wl_columnar_eval_serial_recursive_record_t *record = &sess->recursive;
+    if (!record->active || !record->ready || !record->delta_rels
+        || index >= record->relation_count ||
+        record->delta_rels[index]) return EINVAL;
+    if (record->reset_active) return EBUSY;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    rc = wl_columnar_eval_stack_cleanup_acquire(sess, &frame, control);
+    if (rc) return rc;
+    wl_columnar_merge_incremental_authority_t *authority = NULL;
+    wl_columnar_merge_incremental_scratch_t *scratch = NULL;
+    rc = wl_columnar_eval_stack_cleanup_incremental_owner(sess, frame,
+            &authority, &scratch, control); if (rc) goto done;
+    eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(frame);
+    wl_columnar_relation_bulk_append_t *bulk =
+        wl_columnar_eval_stack_cleanup_bulk_append(frame);
+    rc = wl_columnar_relation_incremental_acquire(authority, source, NULL,
+            control);
+    if (rc) goto done;
+    wl_columnar_memory_governor_ref_t *governor = sess->memory_governor
+        ? sess->memory_governor : source->memory_governor;
+    rc = wl_columnar_relation_pool_new_like_held_controlled(&result->rel,
+            sess->delta_pool, name, source, governor, control);
+    if (result->rel) result->owned = true;
+    if (rc) goto done;
+    rc = wl_columnar_merge_incremental_retire(authority, scratch, 0);
+    if (rc) goto done;
+    if (!result->rel->capacity) {
+        rc = wl_columnar_relation_incremental_acquire(authority, result->rel,
+                NULL, control); if (rc) goto done;
+        rc = wl_columnar_relation_incremental_reserve_rows(bulk, result->rel,
+                authority, 0, COL_REL_INIT_CAP, false, control);
+        if (rc) goto done;
+        rc = wl_columnar_merge_incremental_retire(authority, scratch, 0);
+        if (rc) goto done;
+    }
+    rc = wl_columnar_relation_incremental_acquire(authority, result->rel,
+            NULL, control); if (rc) goto done;
+    rc = wl_columnar_relation_incremental_timestamps(bulk, authority, 0,
+            control);
+    if (rc) goto done;
+    rc = wl_columnar_merge_incremental_retire(authority, scratch, 0);
+    if (rc) goto done;
+    rc = wl_evaluation_control_charge(control, 64); if (rc) goto done;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+    /* Physical owner moves once at the checked scalar cutoff. No stopped
+     * frame may retain a duplicate owning alias to this original local slot. */
+    record->delta_rels[index] = result->rel;
+    result->rel = NULL; result->owned = false;
+done:
+    {
+        int cleanup = wl_columnar_eval_stack_cleanup_finish(&frame);
+        return cleanup && rc <= 0 ? cleanup : rc;
+    }
+}
+
+int
+wl_columnar_eval_serial_recursive_snapshot(wl_col_session_t *sess,
+    uint32_t index, wl_evaluation_control_t *control)
+{
+    if (!sess || !control) return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+    wl_columnar_eval_serial_recursive_record_t *r = &sess->recursive;
+    if (!r->active || !r->ready || r->phase != 2 || !r->stratum
+        || !r->snap || index >= r->relation_count) return EINVAL;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    col_rel_t *head = NULL;
+    rc = wl_columnar_join_controlled_lookup(sess,
+            r->stratum->relations[index].name, &head, control);
+    if (rc) return rc;
+    if (!head) return ENOENT;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    rc = wl_columnar_eval_stack_cleanup_acquire(sess, &frame, control);
+    if (rc) return rc;
+    wl_columnar_relation_source_group_t *group =
+        wl_columnar_eval_stack_cleanup_sources(frame);
+    if (!group) rc = EINVAL;
+    else rc = wl_columnar_relation_source_group_acquire_controlled(group, head,
+                NULL, control);
+    if (!rc) {
+        rc = wl_evaluation_control_charge(control, 16);
+        if (!rc) {
+            r->snap[index] = head->nrows;
+            rc = wl_evaluation_control_charge(control, 0);
+        }
+    }
+    int cleanup = wl_columnar_eval_stack_cleanup_finish(&frame);
+    return cleanup && rc <= 0 ? cleanup : rc;
+}
+
+int
+wl_columnar_eval_serial_recursive_register_head(wl_col_session_t *sess,
+    const char *name, wl_evaluation_control_t *control)
+{
+    if (!sess || !name || !control || sess->recursive.active) return EINVAL;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    int rc = wl_columnar_eval_stack_cleanup_acquire(sess, &frame, control);
+    if (rc) return rc;
+    wl_columnar_merge_incremental_authority_t *authority = NULL;
+    wl_columnar_session_promotion_scratch_t *state = NULL;
+    wl_columnar_session_hash_controlled_registry_t *registry = NULL;
+    rc = wl_columnar_eval_stack_cleanup_promotion_owner(sess, frame,
+            &authority, &state, control); if (rc) goto done;
+    eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(frame);
+    wl_columnar_relation_bulk_append_t *bulk =
+        wl_columnar_eval_stack_cleanup_bulk_append(frame);
+    rc = wl_columnar_relation_descriptor_prepare(bulk, state, result,
+            name, sess->memory_governor, control); if (rc) goto done;
+    rc = wl_columnar_relation_descriptor_handoff(bulk, state, result,
+            wl_columnar_eval_stack_cleanup_stack(frame), control);
+    if (rc) goto done;
+    rc = wl_columnar_eval_stack_cleanup_descriptor_registry(frame, &registry,
+            control); if (rc) goto done;
+    rc = wl_columnar_session_hash_registry_controlled(registry, sess,
+            result->rel, control);
+    /* Actual publication survives a positive old-image cleanup refusal. */
+    wl_columnar_eval_stack_cleanup_descriptor_published(frame);
+done:
+    {
+        int cleanup = wl_columnar_eval_stack_cleanup_finish(&frame);
+        return cleanup && rc <= 0 ? cleanup : rc;
+    }
+}
+
+int
+wl_columnar_eval_serial_recursive_register_delta(wl_col_session_t *sess,
+    uint32_t index, wl_evaluation_control_t *control)
+{
+    if (!sess || !control) return EINVAL;
+    wl_columnar_eval_serial_recursive_record_t *record = &sess->recursive;
+    int rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+    if (!record->active || !record->ready || record->phase != 2
+        || !record->delta_rels || index >= record->relation_count
+        || !record->delta_rels[index] || !record->delta_rels[index]->pool_owned)
+        return EINVAL;
+    col_rel_t *source = record->delta_rels[index];
+    record->relation = index;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    rc = wl_columnar_eval_stack_cleanup_acquire(sess, &frame, control);
+    if (rc) return rc;
+    wl_columnar_merge_incremental_authority_t *authority = NULL;
+    wl_columnar_session_promotion_scratch_t *state = NULL;
+    rc = wl_columnar_eval_stack_cleanup_promotion_owner(sess, frame,
+            &authority, &state, control); if (rc) goto done;
+    eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(frame);
+    wl_columnar_relation_bulk_append_t *bulk =
+        wl_columnar_eval_stack_cleanup_bulk_append(frame);
+    rc = wl_columnar_relation_incremental_acquire(authority, source, NULL,
+            control);
+    if (rc) goto done;
+    rc = wl_columnar_relation_descriptor_prepare(bulk, state, result,
+            source->name, sess->memory_governor, control); if (rc) goto done;
+    rc = wl_columnar_session_promotion_move_credits(authority, state, result,
+            control);
+    if (rc) goto done;
+    rc = wl_columnar_session_promotion_stage_payload(authority, state, result,
+            control);
+    if (rc) goto done;
+    rc = wl_columnar_session_promotion_publish_payload(sess, authority, state,
+            result, control);
+    if (record->phase == WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_PROMOTED)
+        return wl_columnar_eval_serial_recursive_register_promoted(sess, index,
+                   &frame, control, rc);
+done:
+    {
+        int cleanup = wl_columnar_eval_stack_cleanup_finish(&frame);
+        return cleanup && rc <= 0 ? cleanup : rc;
+    }
+}
+
+int
+wl_columnar_eval_serial_recursive_register_promoted(wl_col_session_t *sess,
+    uint32_t index, wl_columnar_eval_stack_cleanup_frame_t **handle,
+    wl_evaluation_control_t *control, int primary)
+{
+    if (!sess || !handle || !*handle || !control) return EINVAL;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = *handle;
+    wl_columnar_eval_serial_recursive_record_t *record = &sess->recursive;
+    if (!record->active || !record->ready || !record->delta_rels
+        || index >= record->relation_count || record->relation != index
+        || !record->delta_rels[index]
+        || record->phase != WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_PROMOTED
+        || sess->cleanup_active != frame ||
+        sess->serial_completion.mode_frame != frame
+        || sess->serial_completion.mode != WL_COLUMNAR_SERIAL_FRAME_PROMOTION
+        || !sess->serial_completion.payload_ready) return EINVAL;
+    int rc = 0;
+    wl_columnar_session_hash_controlled_registry_t *registry = NULL;
+    rc = wl_columnar_eval_stack_cleanup_registry(frame, &registry, control);
+    if (!rc) rc = wl_columnar_session_hash_registry_controlled(registry,
+                sess, record->delta_rels[index], control);
+    return wl_columnar_eval_serial_recursive_register_finish(sess, index,
+               handle, registry, rc, primary);
+}
+
+int
+wl_columnar_eval_serial_recursive_register_finish(wl_col_session_t *sess,
+    uint32_t index, wl_columnar_eval_stack_cleanup_frame_t **handle,
+    wl_columnar_session_hash_controlled_registry_t *registry, int rc,
+    int primary)
+{
+    if (!sess || !handle || !*handle || sess->cleanup_active != *handle
+        || sess->serial_completion.mode_frame != *handle
+        || sess->serial_completion.mode ==
+        WL_COLUMNAR_SERIAL_FRAME_DESCRIPTOR_REGISTRY
+        || (registry &&
+        sess->serial_completion.mode != WL_COLUMNAR_SERIAL_FRAME_REGISTRY))
+        return EINVAL;
+    wl_columnar_eval_serial_recursive_record_t *record = &sess->recursive;
+    if (!record->active || !record->ready || !record->delta_rels
+        || index >= record->relation_count || record->relation != index
+        || !record->delta_rels[index]
+        || record->phase != WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_PROMOTED
+        || !wl_columnar_eval_stack_cleanup_registry_matches(*handle, registry))
+        return EINVAL;
+    if (registry && registry->published) {
+        /* Registry owns the descriptor now. Keep only a borrowed name
+         * retirement reference; no retry can roll it back or insert twice. */
+        record->canonical_consumed = true;
+        record->phase = WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_REGISTERED;
+    } else if (sess->serial_completion.mode ==
+        WL_COLUMNAR_SERIAL_FRAME_REGISTRY){
+        record->phase = WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_REGISTRY_FAILED;
+    }
+    if (primary > 0 || (!rc && primary)) rc = primary;
+    {
+        int cleanup = wl_columnar_eval_stack_cleanup_finish(handle);
+        if (cleanup && rc <= 0) rc = cleanup;
+    }
+    if (record->phase == WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_ROLLBACK_RESTORED
+        && !sess->cleanup_pending) record->phase = 2;
+    if (record->phase == WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_REGISTERED) {
+        col_rel_t *registered = record->delta_rels[index];
+        if (registered->pool_name_reserved_bytes
+            && !wl_columnar_memory_release(
+                &registered->pool_name_reservation)){
+            record->cleanup_pending = true;
+            return rc > 0 ? rc : EINVAL;
+        }
+        registered->pool_name_reserved_bytes = 0;
+        record->delta_rels[index] = NULL;
+        record->phase = 2;
+    }
+    return rc;
+}
+
+/* Initial IDB sorting preserves every row and timestamp. It does not perform
+ * the incremental merge's timestamp retirement or duplicate compaction. */
+int
+wl_columnar_eval_serial_recursive_initial_sort(wl_col_session_t *sess,
+    col_rel_t *source, wl_evaluation_control_t *control)
+{
+    if (!sess || !source || !control) return EINVAL;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    int rc = wl_columnar_eval_stack_cleanup_acquire(sess, &frame, control);
+    if (rc) return rc;
+    wl_columnar_merge_incremental_authority_t *authority = NULL;
+    wl_columnar_merge_incremental_scratch_t *scratch = NULL;
+    rc = wl_columnar_eval_stack_cleanup_incremental_owner(sess, frame,
+            &authority, &scratch, control); if (rc) goto done;
+    rc = wl_columnar_relation_incremental_acquire(authority, source, NULL,
+            control); if (rc) goto done;
+    rc = wl_evaluation_control_charge(control, 16); if (rc) goto done;
+    uint32_t count = source->nrows;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+    if (count <= 1u) goto done;
+    rc = wl_evaluation_control_charge(control, 96); if (rc) goto done;
+    scratch->lane = 1u;
+    wl_columnar_memory_reservation_init(&scratch->sort.workspace.admission);
+    rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+    rc = wl_columnar_relation_incremental_radix_prepare(source, 0, count,
+            &scratch->sort.workspace, &authority->leases[0], control);
+    if (rc) goto done;
+    rc = wl_columnar_relation_incremental_radix_execute(source, 0, count,
+            &scratch->sort.workspace, authority, 0,
+            wl_columnar_eval_stack_cleanup_bulk_append(frame), control);
+    if (rc) goto done;
+    rc = wl_evaluation_control_charge(control, 16); if (rc) goto done;
+    source->sorted_nrows = count;
+    authority->set.published = true;
+    rc = wl_evaluation_control_charge(control, 0);
+done:
+    {
+        int cleanup = wl_columnar_eval_stack_cleanup_finish(&frame);
+        return cleanup && rc <= 0 ? cleanup : rc;
+    }
+}
+
+/* Frontier and net multiplicity scans retain the same original reader group
+ * until every visited timestamp has been admitted. Raw chooses the minimum
+ * timestamp within a relation; the stratum caller folds those frontiers. */
+int
+wl_columnar_eval_serial_recursive_frontier(wl_col_session_t *sess,
+    col_rel_t *source, col_frontier_t *out, int64_t *net,
+    wl_evaluation_control_t *control)
+{
+    if (!sess || !source || !out || !net || !control) return EINVAL;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    int rc = wl_columnar_eval_stack_cleanup_acquire(sess, &frame, control);
+    if (rc) return rc;
+    wl_columnar_relation_source_group_t *group =
+        wl_columnar_eval_stack_cleanup_sources(frame);
+    if (!group) {
+        rc = EINVAL; goto done;
+    }
+    rc = wl_columnar_relation_source_group_acquire_controlled(group,
+            source, NULL, control); if (rc) goto done;
+    rc = wl_evaluation_control_charge(control, 32); if (rc) goto done;
+    uint32_t count = source->nrows;
+    if (count > source->capacity || (source->timestamps
+        && source->timestamp_capacity < count)) {
+        rc = EINVAL; goto done;
+    }
+    col_frontier_t frontier = {0, 0};
+    int64_t sum = 0;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+    if (source->timestamps) for (uint32_t row = 0; row < count; row++) {
+            rc = wl_evaluation_control_charge(control, 16); if (rc) goto done;
+            const col_delta_timestamp_t *ts = &source->timestamps[row];
+            if (!row || ts->iteration < frontier.iteration
+                || (ts->iteration == frontier.iteration &&
+                ts->stratum < frontier.stratum)){
+                frontier.iteration = ts->iteration;
+                frontier.stratum = ts->stratum;
+            }
+            if ((ts->multiplicity > 0 && sum > INT64_MAX - ts->multiplicity)
+                || (ts->multiplicity < 0 &&
+                sum < INT64_MIN - ts->multiplicity)){
+                rc = EOVERFLOW; goto done;
+            }
+            sum += ts->multiplicity;
+            rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
+        }
+    rc = wl_evaluation_control_charge(control, 16); if (rc) goto done;
+    *out = frontier; *net = sum;
+    rc = wl_evaluation_control_charge(control, 0);
+done:
+    {
+        int cleanup = wl_columnar_eval_stack_cleanup_finish(&frame);
+        return cleanup && rc <= 0 ? cleanup : rc;
+    }
+}
+
+/* Canonical prefix and private delta retain separate original authorities.
+ * Each storage transition retires before acquiring the next genuine epoch. */
+int
+wl_columnar_eval_serial_recursive_consolidate(wl_col_session_t *sess,
+    col_rel_t *source, uint32_t index, uint32_t old_rows, int *fast,
+    wl_evaluation_control_t *control)
+{
+    if (!sess || !source || !control || !fast) return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+    wl_columnar_eval_serial_recursive_record_t *record = &sess->recursive;
+    if (!record->active || !record->ready || record->phase != 2
+        || !record->delta_rels || !record->stratum
+        || index >= record->relation_count || old_rows > source->nrows
+        || record->delta_rels[index]) return EINVAL;
+    rc = wl_columnar_eval_serial_recursive_clone(sess, source,
+            record->stratum->relations[index].delta_name, index, control);
+    if (rc) return rc;
+    col_rel_t *delta = record->delta_rels[index];
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    rc = wl_columnar_eval_stack_cleanup_acquire(sess, &frame, control);
+    if (rc) return rc;
+    wl_columnar_merge_incremental_authority_t *authority = NULL;
+    wl_columnar_merge_incremental_scratch_t *scratch = NULL;
+    rc = wl_columnar_eval_stack_cleanup_incremental_owner(sess, frame,
+            &authority, &scratch, control); if (rc) goto done;
+    wl_columnar_relation_bulk_append_t *bulk =
+        wl_columnar_eval_stack_cleanup_bulk_append(frame);
+    rc = wl_columnar_merge_incremental_controlled(authority, scratch, bulk,
+            source, old_rows, delta, fast, control);
+    if (rc) goto done;
+    if (delta->nrows) {
+        rc = wl_columnar_relation_incremental_acquire(authority, delta, NULL,
+                control);
+        if (rc) goto done;
+        rc = wl_columnar_relation_incremental_stamp(authority, 0,
+                record->effective_iteration, record->stratum_index, control);
+        if (rc) goto done;
+        rc = wl_columnar_merge_incremental_retire(authority, scratch, 0);
+        if (rc) goto done;
+        rc = wl_columnar_relation_incremental_acquire(authority, source, NULL,
+                control);
+        if (rc) goto done;
+        rc = wl_columnar_relation_incremental_timestamps(bulk, authority, 0,
+                control);
+    }
+done:
+    {
+        int cleanup = wl_columnar_eval_stack_cleanup_finish(&frame);
+        return cleanup && rc <= 0 ? cleanup : rc;
+    }
+}
+
 static bool
 col_reduce_output_group_equal(const col_rel_t *rel, uint32_t a, uint32_t b,
     uint32_t group_by_count, uint32_t aggregate_index)
@@ -264,7 +991,10 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
     if (control) {
         int preflight = wl_evaluation_control_charge(control, 16);
         if (preflight) return preflight;
-        if (recursive || (sess->eval_arena && !sess->serial_completion.pending))
+        if (recursive ? (!sess->recursive.active || !sess->recursive.ready
+            || sess->recursive.phase != 2 || sess->diff_enabled
+            || sess->diff_operators_active || sess->tdd_subpass_active)
+            : (sess->eval_arena && !sess->serial_completion.pending))
             return ENOTSUP;
         preflight = wl_columnar_join_controlled_lookup(sess, rp->name,
                 &controlled_target, control);
@@ -273,9 +1003,7 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
             !sess->serial_completion.pending) return ENOTSUP;
     }
     wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
-    int rc = sess->serial_completion.pending && sess->serial_completion.frame
-        ? wl_columnar_eval_stack_cleanup_resume(sess, &frame, control)
-        : wl_columnar_eval_stack_cleanup_begin(sess, &frame);
+    int rc = wl_columnar_eval_stack_cleanup_acquire(sess, &frame, control);
     if (rc != 0)
         return rc;
     if (sess->serial_completion.pending) sess->serial_completion.frame = frame;
@@ -350,8 +1078,22 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
             if (rc) goto done;
         }
         if (target) {
+            if (recursive) {
+                rc = wl_columnar_relation_canonical_schema_controlled(record,
+                        target, result->rel, control);
+                if (rc) goto done;
+                /* A consumed schema is not a consumed row append. Retire its
+                 * publication witness before append's first admission. */
+                rc = wl_evaluation_control_charge(control, 16);
+                if (rc) goto done;
+                record->published = false;
+                rc = wl_evaluation_control_charge(control, 0);
+                if (rc) goto done;
+            }
             rc = wl_columnar_relation_bulk_append_controlled(record, target,
                     result->rel, control);
+            if (recursive && (record->published || !rc))
+                sess->recursive.canonical_consumed = true;
             if (sess->serial_completion.pending && (record->published || !rc))
                 sess->serial_completion.relation++;
         } else {
@@ -479,10 +1221,433 @@ wl_columnar_eval_consolidate_input_heads(const wl_plan_stratum_t *sp,
  *
  * Returns 0 on success, non-zero on error.
  */
+static int wl_columnar_eval_serial_recursive_terminal(const wl_plan_stratum_t *,
+    wl_col_session_t *, uint32_t);
+
+/* Ordinary W1 fixed-point evaluation keeps only scalar local progress. All
+ * allocation, rule, source and delta authority lives at its original durable
+ * session/frame address. A nonterminal failure abandons those owners and a
+ * later host attempt starts the raw baseline again. */
+static int
+wl_columnar_eval_serial_recursive_controlled(const wl_plan_stratum_t *sp,
+    wl_col_session_t *sess, uint32_t stratum_idx)
+{
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    wl_columnar_serial_completion_t *completion = &sess->serial_completion;
+    int rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
+    if (!control || !completion->pending || completion->plan != sess->plan
+        || completion->stratum != stratum_idx || !sp->is_recursive
+        || !sp->relation_count || !sp->relations || sess->diff_enabled
+        || sess->diff_operators_active || sess->delta_observer ||
+        sess->delta_rollback
+        || sess->delta_cb || sess->coordinator || sess->num_workers != 1
+        || sess->darr_count || sess->rotation_ops != &col_rotation_standard_ops
+        || sess->frontier_ops != &col_frontier_epoch_ops) return ENOTSUP;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    for (uint32_t i = 0; i < sp->relation_count; i++) {
+        rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+        bool supported = false;
+        rc = wl_columnar_eval_plan_recursive_validate(&sp->relations[i],
+                control,
+                &supported); if (rc) return rc;
+        if (!supported || !sp->relations[i].name ||
+            !sp->relations[i].delta_name)
+            return ENOTSUP;
+    }
+    /* Validate every head before registering even the first absent head. */
+    for (uint32_t i = 0; i < sp->relation_count; i++) {
+        rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+        col_rel_t *existing = NULL;
+        rc = wl_columnar_join_controlled_lookup(sess, sp->relations[i].name,
+                &existing, control); if (rc) return rc;
+        if (!existing) {
+            rc = wl_columnar_eval_serial_recursive_register_head(sess,
+                    sp->relations[i].name, control); if (rc) return rc;
+        }
+    }
+    rc = wl_columnar_eval_serial_recursive_begin(sess, sess->plan, stratum_idx,
+            control);
+    if (rc) return rc;
+    wl_columnar_eval_serial_recursive_record_t *record = &sess->recursive;
+    for (uint32_t i = 0; i < sp->relation_count; i++) {
+        rc = wl_evaluation_control_charge(control, 16); if (rc) goto fail;
+        col_rel_t *head = NULL;
+        rc = wl_columnar_join_controlled_lookup(sess, sp->relations[i].name,
+                &head, control); if (rc) goto fail;
+        if (!head) {
+            rc = ENOENT; goto fail;
+        }
+        rc = wl_columnar_eval_serial_recursive_initial_sort(sess, head,
+                control);
+        if (rc) goto fail;
+    }
+    uint32_t rule_base = 0;
+    for (uint32_t si = 0; si < stratum_idx; si++) {
+        rc = wl_evaluation_control_charge(control, 8); if (rc) goto fail;
+        if (sess->plan->strata[si].relation_count > UINT32_MAX - rule_base) {
+            rc = EOVERFLOW; goto fail;
+        }
+        rule_base += sess->plan->strata[si].relation_count;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) goto fail;
+    }
+    rc = wl_evaluation_control_charge(control, 32); if (rc) goto fail;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) goto fail;
+    record->rule_id_base = rule_base > MAX_RULES ? MAX_RULES : rule_base;
+    sess->frontier_ops->init_stratum(sess, stratum_idx);
+    uint32_t final_iteration = 0;
+    col_frontier_t stratum_frontier = {0, 0};
+    bool converged = false;
+    for (uint32_t outer = 0; outer < MAX_ITERATIONS && !converged; outer++) {
+        rc = wl_evaluation_control_charge(control, 16); if (rc) goto fail;
+        bool any_outer = false, ran = false, next_outer = false;
+        for (uint32_t sub = 0; sub < EVAL_STRIDE; sub++) {
+            rc = wl_evaluation_control_charge(control, 32); if (rc) goto fail;
+            uint32_t iteration = outer * EVAL_STRIDE + sub;
+            record->iteration = outer; record->subpass = sub;
+            record->effective_iteration = iteration;
+            sess->current_iteration = iteration;
+            sess->diff_operators_active = false;
+            bool skip = sess->frontier_ops->should_skip_iteration(sess,
+                    stratum_idx, iteration);
+            rc = wl_evaluation_control_charge(control, 0); if (rc) goto fail;
+            if (skip) continue;
+            ran = true;
+            /* This route does not produce a delta-arrangement cache. Never
+             * hide a reached raw cache-free loop behind a scalar admission. */
+            if (sess->darr_count) {
+                rc = ENOTSUP; goto fail;
+            }
+            for (uint32_t i = 0; i < sp->relation_count; i++) {
+                rc = wl_evaluation_control_charge(control, 16);
+                if (rc) goto fail;
+                if (record->delta_rels[i]) {
+                    rc = wl_columnar_eval_serial_recursive_register_delta(sess,
+                            i, control);
+                    if (rc) goto fail;
+                }
+                rc = wl_evaluation_control_charge(control, 0);
+                if (rc) goto fail;
+            }
+            rc = wl_columnar_eval_serial_recursive_pool_barrier(sess, control);
+            if (rc) goto fail;
+            for (uint32_t i = 0; i < sp->relation_count; i++) {
+                rc = wl_evaluation_control_charge(control, 8);
+                if (rc) goto fail;
+                rc = wl_columnar_eval_serial_recursive_snapshot(sess, i,
+                        control);
+                if (rc) goto fail;
+            }
+            if (iteration) {
+                bool net_zero = true, forced_empty = true;
+                for (uint32_t i = 0; i < sp->relation_count; i++) {
+                    rc = wl_evaluation_control_charge(control, 16);
+                    if (rc) goto fail;
+                    col_rel_t *delta = NULL;
+                    rc = wl_columnar_join_controlled_lookup(sess,
+                            sp->relations[i].delta_name, &delta, control);
+                    if (rc) goto fail;
+                    if (delta) {
+                        col_frontier_t frontier; int64_t net;
+                        rc = wl_columnar_eval_serial_recursive_frontier(sess,
+                                delta,
+                                &frontier, &net, control); if (rc) goto fail;
+                        if (net) net_zero = false;
+                    }
+                    bool empty = false;
+                    rc =
+                        wl_columnar_eval_plan_empty_forced_delta(
+                        &sp->relations[i],
+                        sess, iteration, &empty, control);
+                    if (rc) goto fail;
+                    if (!empty) forced_empty = false;
+                }
+                if (net_zero || forced_empty) {
+                    next_outer = true; break;
+                }
+            }
+            for (uint32_t i = 0; i < sp->relation_count; i++) {
+                rc = wl_evaluation_control_charge(control, 32);
+                if (rc) goto fail;
+                bool skip_rule = record->rule_id_base <= UINT32_MAX - i
+                    && record->rule_id_base + i < MAX_RULES
+                    && sess->frontier_ops->should_skip_rule(sess,
+                        record->rule_id_base + i, iteration);
+                bool empty = false;
+                rc = wl_columnar_eval_plan_empty_forced_delta(&sp->relations[i],
+                        sess, iteration, &empty, control); if (rc) goto fail;
+                if (skip_rule || empty) continue;
+                rc = wl_evaluation_control_charge(control, 16);
+                if (rc) goto fail;
+                rc = wl_evaluation_control_charge(control, 0);
+                if (rc) goto fail;
+                completion->relation = i;
+                rc = wl_columnar_eval_serial_framed_relation(&sp->relations[i],
+                        sess, true);
+                if (rc) goto fail;
+            }
+            for (uint32_t i = 0; i < sp->relation_count; i++) {
+                rc = wl_evaluation_control_charge(control, 16);
+                if (rc) goto fail;
+                int removed = wl_columnar_session_remove_controlled(sess,
+                        sp->relations[i].delta_name, control);
+                if (removed && removed != ENOENT && removed != EBUSY) {
+                    rc = removed; goto fail;
+                }
+                if (record->phase ==
+                    WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_REMOVAL){
+                    rc = removed ? removed : EBUSY; goto fail;
+                }
+            }
+            bool any_new = false;
+            for (uint32_t i = 0; i < sp->relation_count; i++) {
+                rc = wl_evaluation_control_charge(control, 16);
+                if (rc) goto fail;
+                uint32_t old_rows = record->snap[i];
+                rc = wl_columnar_eval_serial_recursive_snapshot(sess, i,
+                        control);
+                if (rc) goto fail;
+                uint32_t new_rows = record->snap[i];
+                rc = wl_evaluation_control_charge(control, 16);
+                if (rc) goto fail;
+                rc = wl_evaluation_control_charge(control, 0);
+                if (rc) goto fail;
+                record->snap[i] = old_rows;
+                if (new_rows <= old_rows) continue;
+                col_rel_t *head = NULL;
+                rc = wl_columnar_join_controlled_lookup(sess,
+                        sp->relations[i].name, &head, control);
+                if (rc) goto fail;
+                if (!head) {
+                    rc = ENOENT; goto fail;
+                }
+                int fast = 0;
+                rc = wl_columnar_eval_serial_recursive_consolidate(sess, head,
+                        i,
+                        old_rows, &fast, control);
+                /* Sorting may precede a later error: preserve actual raw
+                 * invalidation without hiding its entry/name work. */
+                uint32_t family = 0, cursor = 0;
+                if (!rc) rc =
+                        wl_columnar_arrangement_invalidate_controlled(sess,
+                            sp->relations[i].name, &family, &cursor, control);
+                if (rc) goto fail;
+                col_rel_t *delta = record->delta_rels[i];
+                col_frontier_t frontier; int64_t net;
+                rc = wl_columnar_eval_serial_recursive_frontier(sess, delta,
+                        &frontier, &net, control); if (rc) goto fail;
+                if (net) {
+                    any_new = true;
+                    if (frontier.iteration > stratum_frontier.iteration
+                        || (frontier.iteration == stratum_frontier.iteration
+                        && frontier.stratum > stratum_frontier.stratum))
+                        stratum_frontier = frontier;
+                } else {
+                    rc = wl_columnar_eval_stack_cleanup_idle(sess, control);
+                    if (rc) goto fail;
+                    rc = wl_evaluation_control_charge(control, 32);
+                    if (rc) goto fail;
+                    rc = wl_evaluation_control_charge(control, 0);
+                    if (rc) goto fail;
+                    rc = col_rel_destroy_checked(delta); if (rc) goto fail;
+                    record->delta_rels[i] = NULL;
+                    rc = wl_evaluation_control_charge(control, 0);
+                    if (rc) goto fail;
+                }
+            }
+            rc = wl_columnar_eval_serial_recursive_boundary(sess, control);
+            if (rc) goto fail;
+            if (!any_new) {
+                converged = true; break;
+            }
+            any_outer = true; final_iteration = iteration;
+        }
+        if (!ran || next_outer) continue;
+        if (!any_outer) converged = true;
+    }
+    for (uint32_t i = 0; i < sp->relation_count; i++) {
+        rc = wl_evaluation_control_charge(control, 32); if (rc) goto fail;
+        if (record->rule_id_base <= UINT32_MAX - i
+            && record->rule_id_base + i < MAX_RULES)
+            sess->frontier_ops->record_rule_convergence(sess,
+                record->rule_id_base + i,
+                sess->outer_epoch, final_iteration);
+        rc = wl_evaluation_control_charge(control, 0); if (rc) goto fail;
+    }
+    rc = wl_evaluation_control_charge(control, 64); if (rc) goto fail;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) goto fail;
+    sess->diff_operators_active = record->saved_diff_operators_active;
+    sess->total_iterations = final_iteration;
+    sess->frontier_ops->record_stratum_convergence(sess, stratum_idx,
+        sess->outer_epoch, stratum_frontier.iteration);
+    sess->eval_stratum_heads_final = true;
+    completion->phase = WL_COLUMNAR_SERIAL_PHASE_RECURSIVE_TERMINAL;
+    completion->relation = completion->compact = completion->reset_stratum = 0;
+    completion->reset_relation = UINT32_MAX;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    return wl_columnar_eval_serial_recursive_terminal(sp, sess, stratum_idx);
+fail:
+    return wl_columnar_eval_serial_recursive_retire(sess, rc, NULL);
+}
+
+/* Canonical completion is independent of this bounded cleanup lane. The
+ * external stage remains valid after local delta/snapshot owners retire. */
+static int
+wl_columnar_eval_serial_recursive_terminal(const wl_plan_stratum_t *sp,
+    wl_col_session_t *sess, uint32_t stratum_idx)
+{
+    wl_columnar_serial_completion_t *state = &sess->serial_completion;
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    int rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
+    if (!control || !sess->plan || !sess->plan->strata || !state->pending
+        || state->plan != sess->plan || state->stratum != stratum_idx
+        || stratum_idx >= sess->plan->stratum_count
+        || sp != &sess->plan->strata[stratum_idx] || !sp->is_recursive
+        || !sess->eval_stratum_heads_final || sess->diff_enabled
+        || sess->coordinator || sess->rotation_ops != &col_rotation_standard_ops
+        || state->relation > sp->relation_count || state->compact > 6)
+        return EINVAL;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    rc = wl_columnar_session_cleanup_ready(sess); if (rc) return rc;
+    if (sess->recursive.active && sess->recursive.reset_active) {
+        rc = wl_columnar_eval_serial_recursive_pool_barrier(sess, control);
+        if (rc) return rc;
+    }
+    /* A new eligible sweep resets only its prior diagnostic. Already
+     * completed teardown stages are never reset when revisiting a refusal. */
+    rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    if (state->reset_relation < state->relation)
+        state->relation = state->reset_relation;
+    state->reset_stratum = 0; state->reset_relation = UINT32_MAX;
+    while (state->relation < sp->relation_count) {
+        rc = wl_evaluation_control_charge(control, 32);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+        uint32_t index = state->relation;
+        const char *name = sp->relations[index].delta_name;
+        if (!name) return EINVAL;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+        /* The following scalar cursor/error disposition is prepaid before
+         * actual removal, including a successful physical destruction. */
+        rc = wl_evaluation_control_charge(control, 16);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+        int removed = wl_columnar_session_remove_controlled(sess, name,
+                control);
+        bool consumed = sess->recursive.phase ==
+            WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_REMOVAL
+            && sess->recursive.removal_family == 8;
+        if (removed && removed != ENOENT && removed != EBUSY) {
+            if (consumed) state->relation++;
+            return state->reset_stratum ? (int)state->reset_stratum : removed;
+        }
+        if (removed == EBUSY) {
+            if (!state->reset_stratum) state->reset_stratum = EBUSY;
+            if (state->reset_relation ==
+                UINT32_MAX) state->reset_relation = index;
+        }
+        state->relation++;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+    }
+    if (!state->compact) {
+        rc = wl_evaluation_control_charge(control, 16);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+        state->compact = 1;
+    }
+    if (state->compact == 1) {
+        /* Disposal remains checked even after a negative tail. Its success
+         * does not consume the external registered-sweep cursor. */
+        rc = wl_evaluation_control_charge(control, 16);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+        rc = wl_columnar_eval_serial_recursive_retire(sess, 0, control);
+        if (!sess->recursive.active && !sess->recursive.cleanup_pending)
+            state->compact = 2;
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+    }
+    if (state->compact == 2) {
+        rc = wl_evaluation_control_charge(control, 16);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+        rc = wl_columnar_session_mem_sample_controlled(sess, control);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+        state->compact = 3;
+    }
+    if (state->compact == 3) {
+        rc = wl_columnar_eval_stack_cleanup_idle(sess, control);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+        if (sess->recursive.active || sess->recursive.cleanup_pending
+            || sess->mat_cache.active_pins || sess->filt_cache_active_pins)
+            return EBUSY;
+        /* Every remaining used slot must be an actual retired tombstone
+         * before the raw two-counter reset. No capacity-based authority. */
+        uint32_t used = sess->delta_pool ? sess->delta_pool->slot_used : 0;
+        for (uint32_t i = 0; i < used; i++) {
+            col_rel_t *slot = NULL; bool dead = false; uint64_t bytes;
+            rc = wl_columnar_relation_pool_sample_controlled(sess, i, &slot,
+                    &dead, &bytes, control);
+            if (rc) return state->reset_stratum ? (int)state->reset_stratum :
+                       rc;
+            if (!dead || bytes) return EBUSY;
+        }
+        rc = wl_evaluation_control_charge(control, 32);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+        delta_pool_reset(sess->delta_pool); state->compact = 4;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+    }
+    if (state->compact == 4) {
+        rc = wl_columnar_eval_stack_cleanup_idle(sess, control);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+        rc = wl_evaluation_control_charge(control, 32);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+        sess->rotation_ops->rotate_eval_arena(sess); state->compact = 5;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+    }
+    if (state->compact == 5) {
+        rc = wl_evaluation_control_charge(control, 16);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+        uint32_t cursor = 0;
+        rc = wl_columnar_cache_mat_retire_controlled(&sess->mat_cache, &cursor,
+                true, control);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+        cursor = 0;
+        rc = wl_columnar_cache_mat_retire_controlled(&sess->mat_cache, &cursor,
+                false, control);
+        if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+        state->compact = 6;
+    }
+    rc = wl_evaluation_control_charge(control, 16);
+    if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc) return state->reset_stratum ? (int)state->reset_stratum : rc;
+    if (state->reset_relation !=
+        UINT32_MAX) state->relation = state->reset_relation;
+    return (int)state->reset_stratum;
+}
+
 int
 col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t stratum_idx)
 {
+    if (sess->serial_completion.pending
+        && sess->serial_completion.phase ==
+        WL_COLUMNAR_SERIAL_PHASE_RECURSIVE_TERMINAL)
+        return wl_columnar_eval_serial_recursive_terminal(sp, sess,
+                   stratum_idx);
     /* Cleared here so every exit below reports "heads not final" unless one
      * of the two completion points is reached. */
     sess->eval_stratum_heads_final = false;
@@ -491,6 +1656,11 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     int readiness_rc = wl_columnar_session_cleanup_ready(sess);
     if (readiness_rc != 0)
         return readiness_rc;
+
+    if (sp->is_recursive && sess->base.evaluation_control
+        && sess->serial_completion.pending)
+        return wl_columnar_eval_serial_recursive_controlled(sp, sess,
+                   stratum_idx);
 
     if (!sp->is_recursive) {
         if (sess->serial_completion.pending) {

@@ -103,6 +103,89 @@ wl_columnar_ops_push_empty(eval_stack_t *stack, wl_col_session_t *sess,
     return rc;
 }
 
+static int
+wl_columnar_ops_recursive_variable(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess, wl_evaluation_control_t *control)
+{
+    if (!sess->recursive.ready || !op->relation_name) return EINVAL;
+    if (sess->diff_enabled || sess->delta_seeded || sess->retraction_seeded
+        || sess->retraction_right_pass || sess->tdd_input_run
+        || sess->tdd_subpass_active || sess->tdd_outbound_only_active)
+        return ENOTSUP;
+    if (op->delta_mode != WL_DELTA_AUTO && op->delta_mode != WL_DELTA_FORCE_FULL
+        && op->delta_mode != WL_DELTA_FORCE_DELTA
+        && op->delta_mode != WL_DELTA_FORCE_EMPTY
+        && op->delta_mode != WL_DELTA_FORCE_EMPTY_AFTER_SEED) return ENOTSUP;
+    if (stack->top >= COL_STACK_MAX) return ENOMEM;
+    col_rel_t *full = NULL, *delta = NULL;
+    int rc = wl_columnar_join_controlled_lookup(sess, op->relation_name,
+            &full, control); if (rc) return rc;
+    if (!full) return ENOENT;
+    if (op->delta_mode == WL_DELTA_FORCE_FULL)
+        return eval_stack_push_delta(stack, full, false, false);
+    char name[256];
+    rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+    name[0] = '$'; name[1] = 'd'; name[2] = '$';
+    size_t pos = 3;
+    while (pos < sizeof(name) - 1u) {
+        rc = wl_evaluation_control_charge(control, 2); if (rc) return rc;
+        char value = op->relation_name[pos - 3u]; name[pos++] = value;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (!value) break;
+    }
+    name[pos] = '\0';
+    rc = wl_columnar_join_controlled_lookup(sess, name, &delta, control);
+    if (rc) return rc;
+    wl_columnar_relation_source_group_t *group = NULL;
+    eval_entry_t *result = NULL;
+    rc = wl_columnar_eval_stack_cleanup_join_owner(sess, stack, &group,
+            &result);
+    if (rc) return rc;
+    rc = wl_columnar_relation_source_group_acquire_controlled(group, full,
+            delta, control);
+    if (rc) return wl_columnar_relation_source_group_drain(group, rc);
+    rc = wl_evaluation_control_charge(control, 16);
+    bool empty = false, is_delta = false;
+    col_rel_t *selected = full;
+    if (!rc) {
+        empty = op->delta_mode == WL_DELTA_FORCE_EMPTY;
+        if (op->delta_mode == WL_DELTA_FORCE_DELTA) {
+            if (delta && delta->nrows) {
+                selected = delta; is_delta = true;
+            }else if (sess->current_iteration) {
+                empty = true; is_delta = true;
+            }
+        } else if (!empty && delta && delta->nrows &&
+            delta->nrows < full->nrows) {
+            selected = delta; is_delta = true;
+        }
+        rc = wl_evaluation_control_charge(control, 0);
+    }
+    if (!rc && empty) {
+        wl_columnar_memory_governor_ref_t *governor = sess->memory_governor
+            ? sess->memory_governor : full->memory_governor;
+        rc = wl_columnar_relation_pool_new_like_held_controlled(&result->rel,
+                sess->delta_pool, is_delta ? "$empty_delta" : "$empty_skip",
+                full, governor, control);
+        if (result->rel) result->owned = true;
+    }
+    if (!rc) {
+        rc = wl_evaluation_control_charge(control, 64);
+        if (!rc) rc = wl_evaluation_control_charge(control, 0);
+    }
+    rc = wl_columnar_relation_source_group_drain(group, rc);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    if (empty) {
+        rc = eval_stack_push_delta(stack, result->rel, true, is_delta);
+        if (!rc) {
+            result->rel = NULL; result->owned = false;
+        }
+    } else rc = eval_stack_push_delta(stack, selected, false, is_delta);
+    return rc;
+}
+
 int
 col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
@@ -112,6 +195,8 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
         int rc = wl_evaluation_control_charge(control, 16);
         if (rc)
             return rc;
+        if (sess->recursive.active)
+            return wl_columnar_ops_recursive_variable(op, stack, sess, control);
         if (op->delta_mode != WL_DELTA_FORCE_FULL
             && op->delta_mode != WL_DELTA_AUTO)
             return ENOTSUP;
@@ -340,7 +425,9 @@ wl_columnar_ops_map_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
         || sess->tdd_input_run || sess->tdd_subpass_active
         || sess->tdd_outbound_only_active || sess->delta_seeded
         || sess->retraction_seeded || sess->retraction_right_pass
-        || sess->current_iteration || sess->delta_observer
+        || (sess->current_iteration && !(sess->recursive.active
+        && sess->recursive.ready && !sess->diff_enabled)) ||
+        sess->delta_observer
         || !sess->memory_governor) return ENOTSUP;
     wl_columnar_relation_source_group_t *group;
     eval_entry_t *private_output;

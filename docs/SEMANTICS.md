@@ -897,14 +897,14 @@ call.
 | `pending_full_input_eval` | `col_session_insert`, `col_session_remove`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_serial_attempt` | `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_preflight`, `wl_columnar_session_serial_stable` | PRESERVE |
 | `has_evaluated` | `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_attempt` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_attempt`, `wl_columnar_session_serial_preflight` | PRESERVE |
 | `snapshot_stable_valid` | `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_serial_attempt` | `col_session_snapshot_impl`, `wl_columnar_session_serial_stable` | PRESERVE |
-| `delta_seeded` | `insert_clone_prepare`, `tdd_worker_subpass_fn` | `col_eval_relation_plan`, `col_op_variable`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_filter_op_controlled`, `wl_columnar_join_membership_controlled`, `wl_columnar_join_op_controlled`, `wl_columnar_join_select_right`, `wl_columnar_merge_consolidate_controlled`, `wl_columnar_ops_map_controlled`, `wl_columnar_ops_reduce_controlled`, `wl_columnar_session_serial_preflight`, `wl_columnar_session_serial_stable` | PRESERVE |
+| `delta_seeded` | `insert_clone_prepare`, `tdd_worker_subpass_fn` | `col_eval_relation_plan`, `col_op_variable`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_eval_plan_empty_forced_delta`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_filter_op_controlled`, `wl_columnar_join_membership_controlled`, `wl_columnar_join_op_controlled`, `wl_columnar_join_select_right`, `wl_columnar_merge_consolidate_controlled`, `wl_columnar_ops_map_controlled`, `wl_columnar_ops_recursive_variable`, `wl_columnar_ops_reduce_controlled`, `wl_columnar_session_serial_preflight`, `wl_columnar_session_serial_stable` | PRESERVE |
 | `last_removed_relation` | `col_session_remove_incremental`, `col_worker_session_create`, `session_retraction_cleanup` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_serial_preflight`, `wl_columnar_session_serial_stable` | PRESERVE |
-| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup` | `col_eval_relation_plan`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_filter_op_controlled`, `wl_columnar_join_membership_controlled`, `wl_columnar_join_op_controlled`, `wl_columnar_join_select_right`, `wl_columnar_merge_consolidate_controlled`, `wl_columnar_ops_map_controlled`, `wl_columnar_ops_reduce_controlled`, `wl_columnar_session_serial_preflight`, `wl_columnar_session_serial_stable` | PRESERVE |
+| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup` | `col_eval_relation_plan`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_eval_plan_empty_forced_delta`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_filter_op_controlled`, `wl_columnar_join_membership_controlled`, `wl_columnar_join_op_controlled`, `wl_columnar_join_select_right`, `wl_columnar_merge_consolidate_controlled`, `wl_columnar_ops_map_controlled`, `wl_columnar_ops_recursive_variable`, `wl_columnar_ops_reduce_controlled`, `wl_columnar_session_serial_preflight`, `wl_columnar_session_serial_stable` | PRESERVE |
 | `plain_step_completion_pending` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create` | `col_session_insert`, `col_session_insert_incremental`, `col_session_make_compound`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion`, `wl_columnar_session_serial_preflight`, `wl_columnar_session_serial_stable_output` | PRESERVE -- with `plain_step_completion_phase` this is the resume token |
 | `plain_step_completion_phase` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE |
 | `plain_step_completion_step_context` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl` | PRESERVE |
 | `plain_step_completion_active` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_snapshot_impl`, `col_session_step_impl` | **COMMIT** on the step path -- a re-entrancy latch, not progress. While it stays set beside `plain_step_completion_pending`, the entry guard of both `col_session_step_impl` and `col_session_snapshot_impl` returns `EBUSY` above every line that would clear it. The snapshot path never writes it, so the snapshot cutoff has nothing to perform here. |
-| `col_rel_t::base_nrows` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_reset_rows_locked`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `tdd_empty_relation_candidate`, `tdd_seed_bdx_coordinator_idb`, `wl_columnar_eval_serial_canonicalize_aggregate_locked`, `wl_columnar_relation_compact_controlled`, `wl_columnar_relation_new_private_controlled`, `wl_columnar_relation_reset_controlled`, `wl_columnar_session_serial_attempt`, `wl_retraction_restore` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_mutable_image_validate`, `col_session_remove`, `col_session_remove_incremental`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `session_seed_shadow_plan_remove`, `session_snapshot_insert`, `wl_columnar_eval_delta_observer_begin`, `wl_columnar_relation_compact_controlled`, `wl_columnar_relation_new_private_controlled`, `wl_columnar_relation_pool_reuse_controlled`, `wl_columnar_relation_reset_controlled`, `wl_retraction_stage_prepare` | PRESERVE -- the insert route (`session_snapshot_insert`) takes rows `[base_nrows, nrows)` of the inserted relation as the rows an incremental insert appended, so committing the bookkeeping's `base_nrows = nrows` on a stopped attempt would make the retry find no inserted rows and leave the heads without them. That is the whole verified consequence; see the note below before adding another |
+| `col_rel_t::base_nrows` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_reset_rows_locked`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `tdd_empty_relation_candidate`, `tdd_seed_bdx_coordinator_idb`, `wl_columnar_eval_serial_canonicalize_aggregate_locked`, `wl_columnar_relation_compact_controlled`, `wl_columnar_relation_new_private_controlled`, `wl_columnar_relation_reset_controlled`, `wl_columnar_session_serial_attempt`, `wl_retraction_restore` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_mutable_image_validate`, `col_session_remove`, `col_session_remove_incremental`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `session_seed_shadow_plan_remove`, `session_snapshot_insert`, `wl_columnar_eval_delta_observer_begin`, `wl_columnar_relation_compact_controlled`, `wl_columnar_relation_descriptor_handoff`, `wl_columnar_relation_descriptor_registry_validate`, `wl_columnar_relation_new_private_controlled`, `wl_columnar_relation_pool_reuse_controlled`, `wl_columnar_relation_pool_sample_controlled`, `wl_columnar_relation_reset_controlled`, `wl_retraction_stage_prepare` | PRESERVE -- the insert route (`session_snapshot_insert`) takes rows `[base_nrows, nrows)` of the inserted relation as the rows an incremental insert appended, so committing the bookkeeping's `base_nrows = nrows` on a stopped attempt would make the retry find no inserted rows and leave the heads without them. That is the whole verified consequence; see the note below before adding another |
 
 Two non-field actions sit in the same region and need their own verdicts.
 `col_session_reclaim_quiescent` is **COMMIT**: the step cutoff's unwind calls
@@ -1390,3 +1390,49 @@ This selected ordinary route does not enable recursive delta/timestamp,
 seeded/differential observer or general batched/materialized LFTJ contexts.
 Those routes and complete issue-wide checkpoint coverage remain required
 before #1821 closure.
+
+### Ordinary recursive controlled evaluation
+
+The W1 ordinary recursive backend supports the genuine generated AUTO
+VARIABLE/MAP/VARIABLE/JOIN/CONCAT/CONSOLIDATE/EXCHANGE route when
+`WIRELOG_DIFF_ENABLED=0` is selected before session creation. Initial absent
+heads and dirty EDB insertion use the same evaluation control for preparation,
+fixed-point work and publication. This does not enable default differential
+evaluation, delta observers or signed retractions.
+
+Recursive aggregate metadata is temporarily refused before head registration
+or reset: controlled final MIN/MAX domination remains required before full
+#1821 closure. Per-rule REDUCE does not establish that final aggregate policy.
+
+A session-owned stratum record retains the original delta-array and snapshot
+reservation while each rule uses the original 3864-byte cleanup frame. The
+additional 168-byte session record belongs to the existing session allocation;
+no second cleanup frame is allocated. Incremental merge, timestamp clone and
+assignment, pool promotion, registry transport, physical sampling and compound
+GC retain original-address authority across stops. Physical buffers are freed
+and made NULL before their original credit is retired. A positive initiating
+error wins a cleanup refusal; mandatory checked drain performs no new work
+admission and never resets or refunds the evaluation control.
+
+Healthy loops admit bounded chunks before inspecting rows, names, registry
+slots, cache entries or GC entries. Actual relation/Arrow/dedup destruction
+remains an explicit physical cleanup exclusion: poll before each disposer and
+immediately after successful return. Its width-dependent destructor can delay
+cancellation, and is not reported as precisely metered executed work. Existing
+cache array moves admit their actual finite extent before the library call.
+
+A nonterminal stop drains private stratum owners and a fresh host attempt
+recomputes from iteration zero; partial canonical mutations are not physically
+undone. After canonical convergence, the external terminal phase preserves
+heads-final and frontier even if a real reader prevents delta removal. Retry
+continues cleanup and publication without replaying consumed rules. Original
+terminal stage cursors survive stratum-owner retirement and stop after sampling,
+pool reset or arena rotation. Terminal cleanup does not add a compound GC
+operation where the raw route has none.
+
+Sampled memory gauges describe their actual sampling point, including the
+retained cleanup frame at that point. They are not a promise of zero temporary
+attribution after later physical teardown. Original frame, bulk and completion
+size/alignment witnesses and genuine initial/dirty raw twins are required for
+this route. Default differential recursion and its unchanged retry/snapshot
+fixtures remain separate mandatory work before full issue closure.

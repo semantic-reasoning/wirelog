@@ -664,7 +664,18 @@ typedef struct {
 
 int wl_columnar_relation_single_reader_release_controlled(
     wl_columnar_source_access_reader_t *, wl_evaluation_control_t *);
+int wl_columnar_relation_single_writer_release_controlled(
+    wl_columnar_source_access_writer_t *, wl_evaluation_control_t *);
 #ifdef WL_SESSION_TEST_HOOKS
+#ifdef _MSC_VER
+extern __declspec(thread) void (*
+wl_columnar_relation_test_after_single_writer_release)(
+#else
+extern _Thread_local void (*
+wl_columnar_relation_test_after_single_writer_release)(
+#endif
+    wl_evaluation_control_t *, wl_columnar_source_access_writer_t *,
+    wl_columnar_source_access_gate_t *);
 extern void (*wl_columnar_relation_test_after_single_reader_release)(
     wl_evaluation_control_t *, wl_columnar_source_access_reader_t *,
     wl_columnar_source_access_gate_t *);
@@ -718,6 +729,8 @@ void wl_columnar_relation_source_group_commit(
     wl_columnar_relation_source_group_t *);
 int wl_columnar_relation_source_group_drain(
     wl_columnar_relation_source_group_t *, int);
+int wl_columnar_relation_source_group_finish_controlled(
+    wl_columnar_relation_source_group_t *, wl_evaluation_control_t *);
 
 int col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
     const wl_columnar_relation_mutation_role_t *roles, size_t role_count,
@@ -2028,6 +2041,76 @@ _Static_assert(_Alignof(wl_columnar_serial_completion_t)
     "inline output must preserve the original completion alignment");
 struct wl_columnar_retained_eval_entry;
 struct wl_columnar_kfusion_cohort;
+/* Recursive stratum payload outlives each rule frame. The reservation stays
+ * at this original session address; delta slots remain owned until an actual
+ * registry transfer or checked disposal consumes them. */
+typedef struct wl_columnar_eval_serial_recursive_record {
+    wl_columnar_memory_reservation_t reservation;
+    const wl_plan_t *plan;
+    const wl_plan_stratum_t *stratum;
+    col_rel_t **delta_rels;
+    uint32_t *snap;
+    uint32_t stratum_index, relation_count;
+    uint32_t iteration, subpass, relation, cursor, retirement_cursor;
+    uint32_t rule_id_base, effective_iteration;
+    uint8_t phase;
+    bool active, ready, cleanup_pending, canonical_consumed;
+    bool saved_diff_operators_active;
+    union {
+        struct {
+            delta_pool_t *reset_pool;
+            char *reset_slab;
+            size_t reset_stride;
+            uint32_t reset_high_water;
+            bool reset_active;
+        };
+        struct {
+            wl_columnar_session_source_lease_t *removal_lease;
+            const char *removal_name;
+            uint32_t removal_slot, removal_family, removal_cursor;
+        };
+    };
+} wl_columnar_eval_serial_recursive_record_t;
+int wl_columnar_session_recursive_pool_extent(struct wl_col_session_t *,
+    uint64_t *, uint32_t *);
+int wl_columnar_eval_serial_recursive_pool_reset(struct wl_col_session_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_serial_recursive_pool_barrier(struct wl_col_session_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_serial_recursive_boundary(struct wl_col_session_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_serial_recursive_snapshot(struct wl_col_session_t *,
+    uint32_t, wl_evaluation_control_t *);
+#define WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_REGISTRY_FAILED 4u
+#define WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_PROMOTED 3u
+#define WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_ROLLBACK_RESTORED 5u
+#define WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_REGISTERED 6u
+#define WL_COLUMNAR_EVAL_SERIAL_RECURSIVE_REMOVAL 7u
+/* External completion phase survives local stratum-owner retirement. */
+#define WL_COLUMNAR_SERIAL_PHASE_RECURSIVE_TERMINAL 8u
+int wl_columnar_eval_serial_recursive_begin(struct wl_col_session_t *,
+    const wl_plan_t *, uint32_t, wl_evaluation_control_t *);
+int wl_columnar_eval_serial_recursive_retire(struct wl_col_session_t *, int,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_serial_recursive_clone(struct wl_col_session_t *,
+    col_rel_t *, const char *, uint32_t, wl_evaluation_control_t *);
+int wl_columnar_eval_serial_recursive_register_head(struct wl_col_session_t *,
+    const char *, wl_evaluation_control_t *);
+int wl_columnar_eval_serial_recursive_register_delta(struct wl_col_session_t *,
+    uint32_t, wl_evaluation_control_t *);
+int wl_columnar_eval_serial_recursive_register_promoted(
+    struct wl_col_session_t *,
+    uint32_t, wl_columnar_eval_stack_cleanup_frame_t **,
+    wl_evaluation_control_t *, int);
+
+int wl_columnar_eval_serial_recursive_consolidate(struct wl_col_session_t *,
+    col_rel_t *, uint32_t, uint32_t, int *, wl_evaluation_control_t *);
+int wl_columnar_eval_serial_recursive_initial_sort(struct wl_col_session_t *,
+    col_rel_t *, wl_evaluation_control_t *);
+int wl_columnar_eval_serial_recursive_frontier(struct wl_col_session_t *,
+    col_rel_t *, col_frontier_t *, int64_t *, wl_evaluation_control_t *);
+int wl_columnar_eval_plan_empty_forced_delta(const wl_plan_relation_t *,
+    struct wl_col_session_t *, uint32_t, bool *, wl_evaluation_control_t *);
 typedef struct wl_columnar_eval_tdd_run wl_columnar_eval_tdd_run_t;
 typedef struct wl_columnar_tdd_owner_lifetime {
     uint32_t worker_count;
@@ -2081,6 +2164,7 @@ typedef struct wl_col_session_t {
      * without performing a fixpoint iteration. */
     bool has_evaluated;
     wl_columnar_serial_completion_t serial_completion;
+    wl_columnar_eval_serial_recursive_record_t recursive;
     bool plain_step_completion_pending;
     bool plain_step_completion_active;
     bool plain_step_completion_step_context;
@@ -2754,6 +2838,11 @@ col_rel_timestamp_ledger_bytes(const col_rel_t *r);
  */
 uint64_t
 col_rel_transport_bytes(const col_rel_t *r);
+int wl_columnar_relation_transport_bytes_controlled(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, col_rel_t *, uint64_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_relation_pool_sample_controlled(wl_col_session_t *, uint32_t,
+    col_rel_t **, bool *, uint64_t *, wl_evaluation_control_t *);
 void
 col_rel_ledger_reconcile(col_rel_t *r, uint64_t before_bytes);
 void
@@ -2979,6 +3068,40 @@ typedef struct {
     wl_columnar_relation_private_phase_t phase;
     bool ready;
 } wl_columnar_relation_private_batch_t;
+/* Incremental consolidation starts only after the rule's source group and
+ * private result epoch retire. Both original mutation roles remain durable
+ * in that same phase-exclusive frame region. */
+typedef struct wl_columnar_merge_incremental_authority {
+    wl_columnar_relation_mutation_set_t set;
+    wl_columnar_relation_mutation_role_t roles[2];
+    wl_columnar_relation_mutation_descriptor_t descriptors[2];
+    wl_columnar_relation_mutation_owner_t owners[4];
+    wl_columnar_relation_mutation_lease_t leases[2];
+    wl_columnar_relation_mutation_initialization_t initializations[2];
+    col_rel_t *source, *delta;
+    uint32_t old_nrows, delta_initial_nrows, nrows, unique_rows;
+    uint32_t cursor, initialized_bytes;
+    uint8_t phase;
+    bool ready, active, consumed, delta_rolled_back;
+} wl_columnar_merge_incremental_authority_t;
+int wl_columnar_relation_incremental_acquire(
+    wl_columnar_merge_incremental_authority_t *, col_rel_t *, col_rel_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_relation_incremental_stamp(
+    wl_columnar_merge_incremental_authority_t *, size_t, uint32_t, uint32_t,
+    wl_evaluation_control_t *);
+int wl_columnar_relation_incremental_finish(
+    wl_columnar_merge_incremental_authority_t *, int);
+typedef struct wl_columnar_merge_incremental_original_region {
+    wl_columnar_relation_source_group_t sources;
+    wl_columnar_relation_private_batch_t private_batch;
+} wl_columnar_merge_incremental_original_region_t;
+_Static_assert(sizeof(wl_columnar_merge_incremental_authority_t)
+    <= sizeof(wl_columnar_merge_incremental_original_region_t),
+    "incremental authority must fit retired original source/private region");
+_Static_assert(_Alignof(wl_columnar_merge_incremental_authority_t)
+    <= _Alignof(wl_columnar_merge_incremental_original_region_t),
+    "incremental authority must preserve original region alignment");
 /* The frame-owned private writer is shared by controlled MAP/FILTER/REDUCE/JOIN.
  * Forward lookup rejects terminal RESETTING; disposal alone may skip its prefix. */
 bool wl_columnar_relation_private_batch_disposable(
@@ -3673,7 +3796,16 @@ typedef struct {
     bool growth;
 } wl_columnar_relation_payload_transaction_t;
 typedef struct {
-    wl_columnar_relation_source_group_t sources;
+    union {
+        wl_columnar_relation_source_group_t sources;
+        struct {
+            wl_columnar_merge_incremental_authority_t *authority;
+            wl_columnar_relation_mutation_lease_t *lease;
+            bool *old_shared;
+            uint64_t metadata_after;
+            bool old_arena, metadata_retire;
+        } borrowed;
+    };
     wl_columnar_source_access_writer_t descriptor_writer, writer;
     col_rel_t *dst;
     uint64_t prior_identity, prior_generation;
@@ -3682,11 +3814,13 @@ typedef struct {
     bool reset;
     bool exact_capacity;
     uint8_t exact_phase;
+    uint8_t borrowed_mode; /* Outside the overwritten source-group bytes. */
+    bool schema_install; /* Mutually exclusive with types/length-cache modes. */
     wl_columnar_relation_payload_transaction_t pending;
     wl_columnar_memory_reservation_t metadata_pending, old_metadata;
     wl_columnar_memory_reservation_t previous, scratch;
-    uint64_t *lengths;
-    wirelog_column_type_t *prepared_types;
+    union { uint64_t *lengths; int64_t *prepared_row_scratch; };
+    union { wirelog_column_type_t *prepared_types; char **prepared_names; };
     struct ArrowSchema prepared_schema;
     union {
         struct ArrowSchema old_schema;
@@ -3740,12 +3874,35 @@ wl_columnar_eval_stack_cleanup_bulk_append(
 wl_columnar_relation_source_group_t *
 wl_columnar_eval_stack_cleanup_sources(
     wl_columnar_eval_stack_cleanup_frame_t *);
+int wl_columnar_relation_incremental_terminal(
+    wl_columnar_relation_bulk_append_t *,
+    wl_columnar_merge_incremental_authority_t *,
+    wl_columnar_relation_terminal_sequence_t *, bool,
+    wl_evaluation_control_t *);
+int wl_columnar_relation_incremental_timestamps(
+    wl_columnar_relation_bulk_append_t *,
+    wl_columnar_merge_incremental_authority_t *, uint32_t,
+    wl_evaluation_control_t *);
+int wl_columnar_relation_incremental_append_row(
+    wl_columnar_merge_incremental_authority_t *, uint32_t, const int64_t *,
+    bool *, wl_evaluation_control_t *);
+int wl_columnar_relation_incremental_reserve_grid(
+    wl_columnar_relation_bulk_append_t *, col_rel_t *,
+    wl_columnar_merge_incremental_authority_t *, uint32_t, uint32_t,
+    wl_evaluation_control_t *);
+int wl_columnar_relation_incremental_reserve_rows(
+    wl_columnar_relation_bulk_append_t *, col_rel_t *,
+    wl_columnar_merge_incremental_authority_t *, uint32_t, uint32_t, bool,
+    wl_evaluation_control_t *);
 int wl_columnar_relation_bulk_reserve_exact_controlled(
     wl_columnar_relation_bulk_append_t *, col_rel_t *, uint32_t, bool *,
     wl_evaluation_control_t *);
 int wl_columnar_relation_private_types_controlled(
     wl_columnar_relation_bulk_append_t *, col_rel_t *,
     const wirelog_column_type_t *, wl_evaluation_control_t *);
+int wl_columnar_relation_canonical_schema_controlled(
+    wl_columnar_relation_bulk_append_t *, col_rel_t *, col_rel_t *,
+    wl_evaluation_control_t *);
 int wl_columnar_relation_bulk_append_controlled(
     wl_columnar_relation_bulk_append_t *, col_rel_t *, const col_rel_t *,
     wl_evaluation_control_t *);
@@ -3947,6 +4104,120 @@ typedef struct {
     bool ready;
     uint8_t lane; /* Outside every overwritten sequence byte. */
 } wl_columnar_consolidate_record_t;
+/* Suffix radix retires completely before row/compaction preparation. Lane
+ * readiness remains outside every overwritten original token byte. */
+typedef struct wl_columnar_merge_incremental_scratch {
+    union {
+        wl_columnar_relation_radix_sequence_t sort;
+        wl_columnar_relation_terminal_sequence_t terminal;
+        struct {
+            col_row_buf_t row;
+            int64_t *compacted;
+            wl_columnar_memory_reservation_t compaction_admission;
+            uint32_t positions[COL_MAX_RUNS], ends[COL_MAX_RUNS];
+            uint32_t capacity, initialized_positions, output_rows;
+            bool admission_active;
+        };
+    };
+    uint8_t lane;
+    bool ready;
+} wl_columnar_merge_incremental_scratch_t;
+/* Phase-exclusive promotion bookkeeping. Actual writer/lease authority stays
+ * in the original incremental region and descriptor credit in original BULK;
+ * these pointers and dispositions never contain copied tokens. */
+typedef struct wl_columnar_session_promotion_scratch {
+    col_rel_t *source;
+    wl_columnar_memory_governor_ref_t *governor;
+    uint64_t descriptor_bytes, name_bytes;
+    size_t cursor;
+    uint8_t phase, initialized_tokens, move_index, moved_mask;
+    bool ready, descriptor_moved, descriptor_committed, descriptor_ready;
+    bool governor_retained, source_had_governor, source_had_scratch;
+    bool owner_transferred, payload_owned, tombstone, reversing;
+} wl_columnar_session_promotion_scratch_t;
+#define WL_COLUMNAR_SESSION_PROMOTION_CANONICAL_DESCRIPTOR 12u
+#ifdef WL_SESSION_TEST_HOOKS
+#ifdef _MSC_VER
+#define WL_COLUMNAR_SESSION_PROMOTION_TEST_THREAD_LOCAL __declspec(thread)
+#else
+#define WL_COLUMNAR_SESSION_PROMOTION_TEST_THREAD_LOCAL _Thread_local
+#endif
+extern WL_COLUMNAR_SESSION_PROMOTION_TEST_THREAD_LOCAL void (*
+wl_columnar_session_test_promotion_checkpoint)(
+    wl_evaluation_control_t *, wl_columnar_session_promotion_scratch_t *,
+    eval_entry_t *);
+#endif
+int wl_columnar_relation_descriptor_prepare(
+    wl_columnar_relation_bulk_append_t *,
+    wl_columnar_session_promotion_scratch_t *,
+    eval_entry_t *, const char *, wl_columnar_memory_governor_ref_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_relation_descriptor_retire(
+    wl_columnar_relation_bulk_append_t *,
+    wl_columnar_session_promotion_scratch_t *,
+    eval_entry_t *, int);
+int wl_columnar_relation_descriptor_registry_validate(
+    wl_columnar_relation_bulk_append_t *, const col_rel_t *,
+    wl_evaluation_control_t *);
+void wl_columnar_eval_stack_cleanup_descriptor_published(
+    wl_columnar_eval_stack_cleanup_frame_t *);
+int wl_columnar_relation_descriptor_handoff(
+    wl_columnar_relation_bulk_append_t *,
+    wl_columnar_session_promotion_scratch_t *,
+    eval_entry_t *, eval_stack_t *, wl_evaluation_control_t *);
+int wl_columnar_session_promotion_retire(
+    wl_col_session_t *, wl_columnar_merge_incremental_authority_t *,
+    wl_columnar_session_promotion_scratch_t *,
+    wl_columnar_relation_bulk_append_t *,
+    eval_entry_t *, int);
+int wl_columnar_session_promotion_move_credits(
+    wl_columnar_merge_incremental_authority_t *,
+    wl_columnar_session_promotion_scratch_t *, eval_entry_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_session_promotion_stage_payload(
+    wl_columnar_merge_incremental_authority_t *,
+    wl_columnar_session_promotion_scratch_t *, eval_entry_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_session_promotion_publish_payload(
+    wl_col_session_t *, wl_columnar_merge_incremental_authority_t *,
+    wl_columnar_session_promotion_scratch_t *, eval_entry_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_stack_cleanup_promotion_owner(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_columnar_merge_incremental_authority_t **,
+    wl_columnar_session_promotion_scratch_t **, wl_evaluation_control_t *);
+int wl_columnar_eval_stack_cleanup_promotion_rollback_owner(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_columnar_merge_incremental_authority_t **,
+    wl_columnar_session_promotion_scratch_t **);
+_Static_assert(sizeof(wl_columnar_session_promotion_scratch_t)
+    <= sizeof(wl_columnar_consolidate_record_t),
+    "promotion bookkeeping must fit original workspace");
+_Static_assert(_Alignof(wl_columnar_session_promotion_scratch_t)
+    <= _Alignof(wl_columnar_consolidate_record_t),
+    "promotion alignment must fit original workspace");
+int wl_columnar_merge_incremental_controlled(
+    wl_columnar_merge_incremental_authority_t *,
+    wl_columnar_merge_incremental_scratch_t *,
+    wl_columnar_relation_bulk_append_t *,
+    col_rel_t *, uint32_t, col_rel_t *, int *, wl_evaluation_control_t *);
+int wl_columnar_merge_incremental_complete_storage(
+    wl_columnar_merge_incremental_authority_t *,
+    wl_columnar_merge_incremental_scratch_t *,
+    wl_columnar_relation_bulk_append_t *, bool, wl_evaluation_control_t *);
+int wl_columnar_merge_incremental_retire(
+    wl_columnar_merge_incremental_authority_t *,
+    wl_columnar_merge_incremental_scratch_t *, int);
+int wl_columnar_eval_stack_cleanup_incremental_owner(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_columnar_merge_incremental_authority_t **,
+    wl_columnar_merge_incremental_scratch_t **, wl_evaluation_control_t *);
+_Static_assert(sizeof(wl_columnar_merge_incremental_scratch_t)
+    <= sizeof(wl_columnar_consolidate_record_t),
+    "incremental scratch must fit original workspace");
+_Static_assert(_Alignof(wl_columnar_merge_incremental_scratch_t)
+    <= _Alignof(wl_columnar_consolidate_record_t),
+    "incremental scratch must preserve original workspace alignment");
 _Static_assert(sizeof(wl_columnar_consolidate_record_t)
     == sizeof(wl_columnar_merge_consolidate_original_record_t),
     "hash lane must preserve original consolidation size");
@@ -4071,6 +4342,8 @@ int wl_columnar_eval_plan_aggregate_validate(const wl_plan_relation_t *,
     wl_evaluation_control_t *, bool *);
 int wl_columnar_eval_plan_union_validate(const wl_plan_relation_t *,
     wl_evaluation_control_t *, bool *);
+int wl_columnar_eval_plan_recursive_validate(const wl_plan_relation_t *,
+    wl_evaluation_control_t *, bool *);
 wl_columnar_consolidate_record_t *
 wl_columnar_eval_stack_cleanup_consolidate(
     wl_columnar_eval_stack_cleanup_frame_t *);
@@ -4086,6 +4359,13 @@ int wl_columnar_relation_pool_new_like_held_controlled(col_rel_t **,
     wl_columnar_memory_governor_ref_t *, wl_evaluation_control_t *);
 void wl_columnar_relation_consolidate_checkpoint(wl_evaluation_control_t *,
     int, uint64_t, wl_columnar_consolidate_record_t *, col_rel_t *);
+int wl_columnar_relation_incremental_radix_prepare(col_rel_t *, uint32_t,
+    uint32_t, wl_columnar_radix_workspace_t *,
+    wl_columnar_relation_mutation_lease_t *, wl_evaluation_control_t *);
+int wl_columnar_relation_incremental_radix_execute(col_rel_t *, uint32_t,
+    uint32_t, wl_columnar_radix_workspace_t *,
+    wl_columnar_merge_incremental_authority_t *, uint32_t,
+    wl_columnar_relation_bulk_append_t *, wl_evaluation_control_t *);
 int wl_columnar_relation_radix_workspace_prepare_with_lease_controlled(
     col_rel_t *,
     uint32_t, uint32_t, wl_columnar_radix_workspace_t *,
@@ -4188,6 +4468,12 @@ uint64_t
 col_mat_cache_key_content(const col_rel_t *rel);
 void
 col_mat_cache_clear(col_mat_cache_t *cache);
+int wl_columnar_cache_mat_retire_controlled(col_mat_cache_t *, uint32_t *,
+    bool, wl_evaluation_control_t *);
+int wl_columnar_cache_mat_evict_controlled(col_mat_cache_t *, size_t,
+    wl_evaluation_control_t *);
+int wl_columnar_arrangement_invalidate_controlled(wl_col_session_t *,
+    const char *, uint32_t *, uint32_t *, wl_evaluation_control_t *);
 void
 col_mat_cache_evict_until(col_mat_cache_t *cache, size_t target_bytes);
 col_rel_t *
@@ -4256,6 +4542,8 @@ col_mat_cache_reclaim_entry(col_mat_cache_t *cache, uint32_t index,
  */
 void
 col_session_mem_sample(wl_col_session_t *sess);
+int wl_columnar_session_mem_sample_controlled(wl_col_session_t *,
+    wl_evaluation_control_t *);
 
 /*
  * col_session_mem_note_worker:
@@ -4311,6 +4599,20 @@ int
 session_rel_hash_remove(wl_col_session_t *sess, uint32_t idx);
 void
 session_rel_free_hash(wl_col_session_t *sess);
+int wl_columnar_session_hash_retire_checked(wl_col_session_t *sess);
+#ifdef WL_SESSION_TEST_HOOKS
+#ifdef _MSC_VER
+#define WL_COLUMNAR_SESSION_HASH_TEST_THREAD_LOCAL __declspec(thread)
+#else
+#define WL_COLUMNAR_SESSION_HASH_TEST_THREAD_LOCAL _Thread_local
+#endif
+extern WL_COLUMNAR_SESSION_HASH_TEST_THREAD_LOCAL void
+(*wl_columnar_session_hash_test_retirement_checkpoint)(wl_col_session_t *,
+    wl_columnar_memory_reservation_t *);
+#endif
+int wl_columnar_session_recursive_removal_drain(wl_col_session_t *, int);
+int wl_columnar_session_remove_controlled(wl_col_session_t *, const char *,
+    wl_evaluation_control_t *);
 
 /* Private relation-registry image used by owner publication.  Preparation
  * copies the current registry and builds its complete hash off to the side;
@@ -4348,6 +4650,11 @@ typedef struct wl_columnar_session_hash_controlled_registry {
     uint32_t initialized_tokens;
     bool ready, published;
 } wl_columnar_session_hash_controlled_registry_t;
+#ifdef WL_SESSION_TEST_HOOKS
+extern WL_COLUMNAR_SESSION_HASH_TEST_THREAD_LOCAL void
+(*wl_columnar_session_hash_test_registry_retirement_checkpoint)(
+    wl_columnar_session_hash_controlled_registry_t *);
+#endif
 
 #define WL_COLUMNAR_SERIAL_FRAME_EVALUATION 0u
 #define WL_COLUMNAR_SERIAL_FRAME_REGISTRY 1u
@@ -4358,6 +4665,16 @@ typedef struct wl_columnar_session_hash_controlled_registry {
 #define WL_COLUMNAR_SERIAL_FRAME_BATCH 6u
 #define WL_COLUMNAR_SERIAL_FRAME_MEMBERSHIP 7u
 #define WL_COLUMNAR_SERIAL_FRAME_LFTJ 8u
+#define WL_COLUMNAR_SERIAL_FRAME_INCREMENTAL 9u
+#define WL_COLUMNAR_SERIAL_FRAME_INCREMENTAL_INITIALIZING 10u
+#define WL_COLUMNAR_SERIAL_FRAME_PROMOTION 11u
+#define WL_COLUMNAR_SERIAL_FRAME_PROMOTION_INITIALIZING 12u
+#define WL_COLUMNAR_SERIAL_FRAME_DESCRIPTOR_REGISTRY 13u
+#define WL_COLUMNAR_SERIAL_FRAME_RETIRED 14u
+#define WL_COLUMNAR_SERIAL_FRAME_COMPOUND_GC 15u
+int wl_columnar_eval_stack_cleanup_compound_gc(
+    wl_col_session_t *, wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_arena_compound_arena_gc_record_t **, wl_evaluation_control_t *);
 #define WL_COLUMNAR_SERIAL_OUTPUT_CURRENT 1u
 #define WL_COLUMNAR_SERIAL_OUTPUT_DESCRIPTOR 2u
 #define WL_COLUMNAR_SERIAL_OUTPUT_SOURCE 4u
@@ -4374,18 +4691,32 @@ bool wl_columnar_eval_stack_output_journal_owned(wl_col_session_t *,
 int wl_columnar_relation_count_reader_controlled(
     wl_columnar_source_access_gate_t *, uint32_t *, uint32_t,
     uint64_t, wl_evaluation_control_t *);
+int wl_columnar_eval_serial_recursive_register_finish(wl_col_session_t *,
+    uint32_t, wl_columnar_eval_stack_cleanup_frame_t **,
+    wl_columnar_session_hash_controlled_registry_t *, int, int);
 int wl_columnar_session_hash_registry_controlled(
     wl_columnar_session_hash_controlled_registry_t *, wl_col_session_t *,
     col_rel_t *, wl_evaluation_control_t *);
 int wl_columnar_session_hash_registry_retire(
     wl_columnar_session_hash_controlled_registry_t *, int);
+bool wl_columnar_eval_stack_cleanup_registry_matches(
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    const wl_columnar_session_hash_controlled_registry_t *);
 int wl_columnar_eval_stack_cleanup_registry(
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_columnar_session_hash_controlled_registry_t **,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_stack_cleanup_descriptor_registry(
     wl_columnar_eval_stack_cleanup_frame_t *,
     wl_columnar_session_hash_controlled_registry_t **,
     wl_evaluation_control_t *);
 int wl_columnar_eval_stack_cleanup_output(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_serial_output_t **,
     wl_evaluation_control_t *);
+int wl_columnar_eval_stack_cleanup_idle(wl_col_session_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_stack_cleanup_acquire(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t **, wl_evaluation_control_t *);
 int wl_columnar_eval_stack_cleanup_retained(wl_col_session_t *);
 int wl_columnar_eval_stack_cleanup_retained_drain(wl_col_session_t *);
 int wl_columnar_eval_stack_cleanup_resume(wl_col_session_t *,
