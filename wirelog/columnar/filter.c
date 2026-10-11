@@ -837,7 +837,9 @@ wl_columnar_filter_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
         || !stack->items[stack->top - 1].rel) return EINVAL;
     uint32_t slot = stack->top - 1;
     col_rel_t *source = stack->items[slot].rel, *out = NULL;
-    eval_entry_t input = {0};
+    eval_entry_t local_input = {0}, *input = &local_input;
+    eval_entry_t *pipeline_input =
+        wl_columnar_eval_stack_cleanup_pipeline_input(sess, stack);
     wl_columnar_expr_operator_preparation_t *preparation = NULL;
     bool popped = false, committed = false;
     int64_t dummy = 0, *tuple = NULL;
@@ -960,8 +962,13 @@ wl_columnar_filter_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
             rc = ENOMEM; goto cleanup;
         }
     }
-    rc = eval_stack_pop_relation(stack, &input);
-    if (rc) goto cleanup;
+    if (pipeline_input) {
+        input = pipeline_input;
+        stack->top--;
+    } else {
+        rc = eval_stack_pop_relation(stack, input);
+        if (rc) goto cleanup;
+    }
     popped = true;
     rc = wl_columnar_relation_new_like_held_controlled("$filter", source,
             sess->memory_governor, &out, control);
@@ -1090,8 +1097,8 @@ wl_columnar_filter_op_controlled(const wl_plan_op_t *op, eval_stack_t *stack,
     rc = wl_columnar_relation_source_group_drain(group, 0);
     if (rc) goto cleanup;
     wl_columnar_filter_controlled_checkpoint(NULL, 10, 0, group, source);
-    bool is_delta = input.is_delta;
-    rc = eval_entry_dispose(&input);
+    bool is_delta = input->is_delta;
+    rc = eval_entry_dispose(input);
     if (rc) goto cleanup;
     stack->items[slot] = (eval_entry_t){.rel = out, .owned = true,
                                         .kind = WL_COLUMNAR_EVAL_ENTRY_RELATION,
@@ -1108,13 +1115,13 @@ cleanup:
     if (cleanup_rc > 0 && rc <= 0) rc = cleanup_rc;
     if (popped) {
         if (committed || group->descriptor_count || group->owner_count) {
-            if (input.rel || input.seg_boundaries) {
-                stack->items[slot] = input; stack->top = slot + 1u;
+            if (input->rel || input->seg_boundaries) {
+                stack->items[slot] = *input; stack->top = slot + 1u;
             }
         } else {
-            cleanup_rc = eval_entry_dispose(&input);
+            cleanup_rc = eval_entry_dispose(input);
             if (cleanup_rc) {
-                stack->items[slot] = input; stack->top = slot + 1u;
+                stack->items[slot] = *input; stack->top = slot + 1u;
                 if (rc <= 0) rc = cleanup_rc;
             }
             if (wl_columnar_relation_private_batch_disposable(record)) {

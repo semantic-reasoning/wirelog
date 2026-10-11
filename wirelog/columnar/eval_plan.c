@@ -234,6 +234,19 @@ normal_eval:
                 if (!rc) rc = wl_evaluation_control_charge(
                         sess->base.evaluation_control, 0);
                 if (rc) return rc;
+                if (i + 1u < rplan->op_count
+                    && rplan->ops[i + 1u].op != WL_PLAN_OP_CONSOLIDATE) {
+                    uint32_t next_index = i;
+                    int pipeline_rc =
+                        wl_columnar_join_pipeline_try_eval_controlled(rplan,
+                            i, stack, sess, &next_index,
+                            sess->base.evaluation_control);
+                    if (pipeline_rc == 1) {
+                        i = next_index;
+                        continue;
+                    }
+                    if (pipeline_rc) return pipeline_rc;
+                }
                 if (i + 1u < rplan->op_count) {
                     col_join_batch_record_fallback(sess,
                         COL_JOIN_BATCH_EXCLUDED_PIPELINE);
@@ -367,6 +380,12 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
             WL_PLAN_OP_CONSOLIDATE
                 : rplan->ops[2].op == WL_PLAN_OP_MAP
             && rplan->ops[3].op == WL_PLAN_OP_CONSOLIDATE);
+        bool batched_pipeline = false;
+        if (sess->join_batch_bytes && rplan->op_count >= 4u) {
+            rc = wl_columnar_join_pipeline_plan_validate_controlled(rplan,
+                    sess, control, &batched_pipeline);
+            if (rc) return rc;
+        }
         bool union_plan = false;
         if (rplan->op_count >= 5u) {
             rc = wl_columnar_eval_plan_union_validate(rplan, control,
@@ -401,8 +420,9 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
             || sess->tdd_input_run || sess->tdd_subpass_active
             || sess->tdd_outbound_only_active || sess->delta_seeded
             || sess->retraction_seeded || sess->retraction_right_pass
-            || (sess->join_batch_bytes && (!joined_consolidate
-            || rplan->op_count != 3u || !rplan->ops[1].key_count))
+            || (sess->join_batch_bytes && !batched_pipeline
+            && (!joined_consolidate || rplan->op_count != 3u
+            || !rplan->ops[1].key_count))
             || sess->join_output_shared_count
             || !sess->memory_governor
             || (op->delta_mode != WL_DELTA_FORCE_FULL

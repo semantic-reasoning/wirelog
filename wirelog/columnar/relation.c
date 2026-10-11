@@ -8789,6 +8789,62 @@ wl_columnar_relation_private_append_batch_end_controlled(
 }
 
 int
+wl_columnar_relation_private_touch_view_controlled(
+    wl_columnar_relation_private_batch_t *record,
+    wl_evaluation_control_t *control, bool *published)
+{
+    if (!record || !record->ready || !control || !published
+        || record->phase != WL_COLUMNAR_RELATION_PRIVATE_HELD) return EINVAL;
+    col_rel_append_batch_t *batch = &record->batch;
+    wl_columnar_relation_mutation_single_t *single = &batch->single;
+    int rc = wl_evaluation_control_charge(control, 32);
+    if (rc) return rc;
+    col_rel_t *r = batch->relation;
+    if (!r || !batch->active || *published || single->set.published
+        || batch->controlled_row_committed
+        || single->set.identity != (uintptr_t)&single->set
+        || single->set.roles != &single->role
+        || single->set.descriptors != &single->descriptor
+        || single->set.owners != single->owners
+        || single->set.leases != &single->lease
+        || single->set.initializations != &single->initialization
+        || single->lease.identity != (uintptr_t)&single->lease
+        || single->lease.set != &single->set
+        || single->lease.relation != r || single->descriptor.relation != r
+        || single->set.descriptor_count != 1
+        || single->set.lease_count != 1 || single->set.owner_count != 1
+        || single->set.initialization_count || single->owners[0].owner != r
+        || !col_rel_mutation_writer_inert(&single->owners[1].writer)
+        || single->lease.owner_slot || single->lease.self_owner_slot
+        || single->lease.owner != r) return EINVAL;
+    rc = col_rel_mutation_lease_validate(&single->lease, r);
+    int stop = wl_columnar_relation_work_tail(control, 32);
+    if (!rc) rc = stop;
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 48);
+    if (rc) return rc;
+    if (r->nrows > r->capacity || r->storage_owner != r || r->col_shared
+        || r->arena_owned || r->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        || (r->capacity && r->ncols && !r->columns)) return EINVAL;
+    if (r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
+        return EOVERFLOW;
+    rc = wl_columnar_relation_work_tail(control, 48);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 16);
+    if (rc) return rc;
+    wl_columnar_relation_private_checkpoint(control, record, 8, 0);
+    rc = wl_columnar_relation_work_tail(control, 16);
+    if (rc) return rc;
+    /* Constant scalar cutoff: record consumption before any fallible end. */
+    wl_columnar_relation_touch_view(r);
+    single->set.published = true;
+    batch->controlled_row_committed = true;
+    *published = true;
+    wl_columnar_relation_private_checkpoint(control, record, 9, 0);
+    return 0;
+}
+
+int
 wl_columnar_relation_private_cell_controlled(
     wl_columnar_relation_private_batch_t *record, uint32_t row, uint32_t col,
     int64_t value, wl_evaluation_control_t *control)

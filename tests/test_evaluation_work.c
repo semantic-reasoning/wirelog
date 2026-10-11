@@ -2,6 +2,7 @@
 #define WL_TEST_RELATION_RESIZE_HOOK 1
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/columnar/join_batch.h"
+#include "../wirelog/columnar/join_pipeline.h"
 #include <stdio.h>
 #include <limits.h>
 #include <math.h>
@@ -20765,10 +20766,773 @@ test_serial_batched_generated(void)
         "generated batch JOIN: initial/dirty twins, collision stops, held-pin rebuilds and empty/strict guards passed");
 }
 
+static unsigned pipelined_seen_stage, pipelined_seen_phase;
+static uint64_t pipelined_seen_progress, pipelined_sequence;
+static unsigned pipelined_empty_touches;
+static uint64_t pipelined_empty_view, pipelined_empty_storage;
+static bool pipelined_fault_touch;
+static wl_columnar_source_access_writer_t *pipelined_fault_writer;
+static uintptr_t pipelined_fault_identity;
+static unsigned pipelined_stop_stage;
+static wl_columnar_expr_operator_preparation_t *pipelined_fault_preparation;
+static const void *pipelined_scratch_identity;
+static wl_col_session_t *pipelined_session;
+static wl_columnar_source_access_reader_t pipelined_held_reader;
+static void
+pipelined_retirement(wl_columnar_expr_operator_preparation_t *preparation,
+    int phase)
+{
+    if (pipelined_stop_stage != 4 || pipelined_fault_preparation || phase != 4
+        || !preparation->scratch.bytes) return;
+    wl_columnar_join_batch_record_t *record =
+        wl_columnar_eval_stack_cleanup_join_batch(
+        pipelined_session->cleanup_active);
+    CHECK(record &&
+        record->pipeline.stage == WL_COLUMNAR_JOIN_PIPELINE_STAGE_TRANSFORM
+        && preparation == &record->pipeline.preparation
+        && !preparation->scratch_payload
+        && preparation->scratch.identity == &preparation->scratch
+        && atomic_load(&preparation->scratch.state)
+        == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+    pipelined_fault_preparation = preparation;
+    pipelined_scratch_identity = preparation->scratch.identity;
+    preparation->scratch.identity = NULL;
+}
+static void
+pipelined_map_fault(wl_evaluation_control_t *control, int stage,
+    uint64_t progress, wl_columnar_relation_source_group_t *group,
+    col_rel_t *source)
+{
+    (void)control; (void)progress; (void)group; (void)source;
+    if (pipelined_stop_stage != 6 || stage != 3 ||
+        pipelined_fault_writer) return;
+    wl_columnar_relation_private_batch_t *writer =
+        wl_columnar_eval_stack_cleanup_pipeline_private_batch(
+        pipelined_session->cleanup_active);
+    CHECK(writer && writer->phase == WL_COLUMNAR_RELATION_PRIVATE_HELD
+        && writer->batch.active);
+    pipelined_fault_writer = &writer->batch.single.owners[0].writer;
+    CHECK(pipelined_fault_writer->owner && pipelined_fault_writer->identity
+        == (uintptr_t)pipelined_fault_writer);
+    pipelined_fault_identity = pipelined_fault_writer->identity;
+    pipelined_fault_writer->identity = 0;
+}
+static void
+pipelined_private_checkpoint(wl_evaluation_control_t *control,
+    wl_columnar_relation_private_batch_t *record, int stage, uint64_t progress)
+{
+    (void)control; (void)progress;
+    if (stage == 8) {
+        CHECK(record->batch.active && !record->batch.relation->nrows);
+        pipelined_empty_view = record->batch.relation->view_generation;
+        pipelined_empty_storage = record->batch.relation->storage_generation;
+    } else if (stage == 9) {
+        CHECK(record->batch.active && record->batch.single.set.published
+            && record->batch.controlled_row_committed
+            && !record->batch.relation->nrows
+            && record->batch.relation->view_generation ==
+            pipelined_empty_view + 1u
+            && record->batch.relation->storage_generation ==
+            pipelined_empty_storage);
+        pipelined_empty_touches++;
+        if (pipelined_fault_touch && !pipelined_fault_writer) {
+            pipelined_fault_writer = &record->batch.single.owners[0].writer;
+            CHECK(pipelined_fault_writer->owner &&
+                pipelined_fault_writer->identity
+                == (uintptr_t)pipelined_fault_writer);
+            pipelined_fault_identity = pipelined_fault_writer->identity;
+            pipelined_fault_writer->identity = 0;
+        }
+    }
+}
+static void
+pipelined_checkpoint(wl_columnar_join_batch_record_t *record, int stage,
+    uint64_t progress)
+{
+    pipelined_seen_stage = stage;
+    pipelined_seen_phase = record->phase;
+    pipelined_seen_progress = progress;
+    if (stage == 15) pipelined_sequence = progress;
+    if (pipelined_stop_stage == 5 && stage == 14
+        && progress == record->pipeline.map_index &&
+        !pipelined_held_reader.owner){
+        CHECK(col_rel_source_reader_acquire(record->output->rel,
+            &pipelined_held_reader) == 0);
+    }
+    if (pipelined_stop_stage == 14 && stage == 14) {
+        CHECK(record->pipeline.scratch_moved && record->pipeline.stage
+            == WL_COLUMNAR_JOIN_PIPELINE_STAGE_TRANSFORM);
+        pipelined_stop_stage = 0;
+        wl_evaluation_control_request_cancel(record->control);
+    }
+}
+
+static void
+test_pipelined_empty_touch_boundary(void)
+{
+    /* Existing original private acquisition plus touch-only scalar cutoff:
+     * owner96, source-derived private begin, identity32/shape48/stores16. */
+    const uint64_t exact = 96u + private_writer_begin_cost() + 32u + 48u + 16u;
+    for (unsigned mode = 0; mode < 7; mode++) {
+        wl_col_session_t *session = join_session();
+        wl_columnar_eval_stack_cleanup_frame_t *frame = filter_frame(session);
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame);
+        wl_evaluation_control_t *c = control(mode == 1 ? exact
+            : mode == 2 ? exact - 1u : 0);
+        session->base.evaluation_control = c;
+        wl_columnar_relation_private_batch_t *writer = NULL;
+        CHECK(wl_columnar_eval_stack_cleanup_private_batch_owner(session,
+            stack, &writer, c) == 0);
+        eval_entry_t *owner = wl_columnar_eval_stack_cleanup_result(frame);
+        owner->rel = relation(2, 64, 0, false, session->memory_governor);
+        owner->owned = true;
+        if (mode ==
+            4) owner->rel->view_generation =
+                WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+        uint64_t view = owner->rel->view_generation;
+        uint64_t storage = owner->rel->storage_generation;
+        int64_t **columns = owner->rel->columns;
+        uint64_t credit = string_reserved(session->memory_governor);
+        CHECK(wl_columnar_relation_private_append_batch_begin_controlled(writer,
+            owner->rel, c) == 0);
+        bool published = false;
+        uintptr_t identity = writer->batch.single.owners[0].writer.identity;
+        if (mode >= 5) writer->batch.single.owners[0].writer.identity = 0;
+        if (mode == 3 || mode == 6) wl_evaluation_control_request_cancel(c);
+        int expected = mode == 2 ? WL_EVALUATION_CONTROL_WORK_LIMIT
+            : mode == 3 || mode == 6 ? WL_EVALUATION_CONTROL_CANCELLED
+            : mode == 4 ? EOVERFLOW : mode == 5 ? EINVAL : 0;
+        int rc = wl_columnar_relation_private_touch_view_controlled(writer, c,
+                &published);
+        CHECK(rc == expected && published == !expected
+            && writer->batch.controlled_row_committed == !expected
+            && writer->batch.single.set.published == !expected
+            && owner->rel->view_generation == view + !expected
+            && owner->rel->storage_generation == storage
+            && owner->rel->columns == columns && !owner->rel->nrows
+            && string_reserved(session->memory_governor) == credit);
+        int cleanup = wl_columnar_relation_private_batch_retire(writer, rc);
+        if (mode >= 5) {
+            CHECK(cleanup == EINVAL
+                && writer->phase == WL_COLUMNAR_RELATION_PRIVATE_RETIRING
+                && writer->batch.single.owners[0].writer.owner
+                && !writer->batch.single.owners[0].writer.identity);
+            /* The helper and checked disposer have returned; restore only
+             * the original saved scalar, then perform true mandatory drain. */
+            writer->batch.single.owners[0].writer.identity = identity;
+            CHECK(wl_columnar_relation_private_batch_retire(writer, 0) == 0);
+            expected = EINVAL;
+        } else CHECK(cleanup == expected);
+        uint64_t consumed = finish(c, expected);
+        if (mode < 2) CHECK(consumed == exact);
+        if (mode == 2) CHECK(consumed == exact - 16u);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0);
+        session->base.evaluation_control = NULL;
+        release(c); join_session_destroy(session);
+    }
+}
+
+static void
+test_pipelined_consumed_touch_resume(void)
+{
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(
+        ".decl A(k:int64,v:int64)\n.decl B(k:int64,w:int64)\n"
+        ".decl H(v:int64,w:int64)\nH(v,w):-A(k,v),B(k,w),v>0.\n", &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && error == WIRELOG_OK && wl_plan_from_program(program,
+        &plan) == 0);
+    const wl_plan_relation_t *rule = &plan->strata[0].relations[0];
+    CHECK(rule->op_count == 5 && rule->ops[1].op == WL_PLAN_OP_JOIN
+        && rule->ops[2].op == WL_PLAN_OP_FILTER &&
+        rule->ops[3].op == WL_PLAN_OP_MAP);
+    wl_col_session_t *session = join_session();
+    col_rel_t *left = relation(2, 30, 30, false, session->memory_governor);
+    col_rel_t *right = relation(2, 2, 2, false, session->memory_governor);
+    free(left->name); left->name = strdup("A");
+    free(right->name); right->name = strdup("B");
+    CHECK(left->name && right->name && session_add_rel(session, left) == 0
+        && session_add_rel(session, right) == 0);
+    for (uint32_t row = 0; row < 30; row++) {
+        left->columns[0][row] = row % 2u + 1u;
+        left->columns[1][row] = -(int64_t)row - 1;
+    }
+    right->columns[0][0] = 1; right->columns[0][1] = 2;
+    session->join_batch_bytes = 224;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = join_frame(session, left,
+            false);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame);
+    wl_evaluation_control_t *c = control(0);
+    session->base.evaluation_control = c;
+    pipelined_fault_touch = true; pipelined_fault_writer = NULL;
+    pipelined_empty_touches = 0;
+    wl_columnar_relation_test_private_checkpoint = pipelined_private_checkpoint;
+    uint32_t next;
+    CHECK(wl_columnar_join_pipeline_try_eval_controlled(rule, 1, stack,
+        session, &next, c) == EINVAL);
+    wl_columnar_join_batch_record_t *record =
+        wl_columnar_eval_stack_cleanup_join_batch(frame);
+    CHECK(record && pipelined_fault_writer && !pipelined_fault_writer->identity
+        && record->committed && record->pipeline.published
+        && wl_columnar_continuation_cursor(record->continuation)->sequence == 1u
+        && pipelined_empty_touches == 1u && !record->output->rel->nrows);
+    uint64_t first_view = record->output->rel->view_generation;
+    /* Serialized helper has returned: restore only the original saved scalar.
+     * Same control and original continuation consume the retained batch once. */
+    pipelined_fault_writer->identity = pipelined_fault_identity;
+    pipelined_fault_touch = false;
+    while (!wl_columnar_continuation_is_done(record->continuation))
+        CHECK(wl_columnar_join_pipeline_publish_controlled(record) == 0);
+    CHECK(pipelined_empty_touches >= 3u
+        && wl_columnar_continuation_cursor(record->continuation)->sequence
+        == pipelined_empty_touches
+        && record->output->rel->view_generation
+        == first_view + pipelined_empty_touches - 1u
+        && !record->output->rel->nrows);
+    wl_columnar_relation_test_private_checkpoint = NULL;
+    CHECK(wl_columnar_join_batch_record_retire(record, 0) == 0);
+    finish(c, 0);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0
+        && !session->cleanup_pending && !session->cleanup_reserved_bytes
+        && !session->arr_entries[0].pin_count);
+    source_unpinned(left, left); source_unpinned(right, right);
+    session->base.evaluation_control = NULL;
+    release(c); join_session_destroy(session);
+    wl_plan_free(plan); wirelog_program_free(program);
+}
+
+static uint64_t pipelined_budget_peak;
+static unsigned pipelined_growths;
+static uint32_t pipelined_last_capacity;
+static void
+pipelined_credit(wl_evaluation_control_t *control,
+    wl_columnar_memory_governor_t *governor, bool admitted, bool overflow)
+{
+    (void)control;
+    if (admitted && !overflow) {
+        uint64_t bytes = wl_columnar_memory_reserved(governor);
+        if (bytes > pipelined_budget_peak) pipelined_budget_peak = bytes;
+    }
+}
+static void
+pipelined_wide_checkpoint(wl_columnar_join_batch_record_t *record, int stage,
+    uint64_t progress)
+{
+    (void)progress;
+    if (stage != 14) return;
+    CHECK(record->pipeline.scratch_moved && record->output->rel->ncols == 70u);
+    wl_columnar_eval_stack_cleanup_frame_t *frame =
+        wl_columnar_eval_stack_cleanup_join_batch_frame(record);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame);
+    CHECK(stack);
+    col_rel_t *scratch = stack->items[record->pipeline.scratch_slot].rel;
+    CHECK(scratch && scratch->ncols == 73u
+        && record->output->rel->capacity >=
+        record->pipeline.pending_begin + scratch->nrows);
+    if (record->output->rel->capacity > pipelined_last_capacity) {
+        if (pipelined_last_capacity) pipelined_growths++;
+        pipelined_last_capacity = record->output->rel->capacity;
+    }
+}
+static void
+test_pipelined_wide_enforcing(void)
+{
+    char text[32000]; size_t used = 0;
+    used += snprintf(text + used, sizeof(text) - used, ".decl A(k:int64");
+    for (unsigned c = 0; c < 70; c++)
+        used += snprintf(text + used, sizeof(text) - used, ",v%u:int64", c);
+    used += snprintf(text + used, sizeof(text) - used,
+            ")\n.decl B(k:int64,w:int64)\n.decl H(");
+    for (unsigned c = 0; c < 70; c++)
+        used += snprintf(text + used, sizeof(text) - used, "%sx%u:int64",
+                c ? "," : "", c);
+    used += snprintf(text + used, sizeof(text) - used, ")\nH(");
+    for (unsigned c = 0; c < 70; c++)
+        used += snprintf(text + used, sizeof(text) - used, "%sv%u",
+                c ? "," : "", c);
+    used += snprintf(text + used, sizeof(text) - used, "):-A(k");
+    for (unsigned c = 0; c < 70; c++)
+        used += snprintf(text + used, sizeof(text) - used, ",v%u", c);
+    used += snprintf(text + used, sizeof(text) - used, "),B(k,w),v0>0.\n");
+    CHECK(used < sizeof(text));
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(text, &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && error == WIRELOG_OK && wl_plan_from_program(program,
+        &plan) == 0);
+    const wl_plan_relation_t *rule = &plan->strata[0].relations[0];
+    CHECK(rule->op_count == 5u && rule->ops[0].delta_mode == WL_DELTA_AUTO
+        && rule->ops[1].op == WL_PLAN_OP_JOIN && !rule->ops[1].project_count
+        && rule->ops[2].op == WL_PLAN_OP_FILTER
+        && rule->ops[3].op == WL_PLAN_OP_MAP &&
+        rule->ops[3].project_count == 70u
+        && rule->ops[4].op == WL_PLAN_OP_CONSOLIDATE);
+    uint64_t enforcing_budget = 0;
+    for (unsigned trial = 0; trial < 2; trial++) {
+        wl_col_session_t *session = joined_create(plan),
+            *raw = joined_create(plan);
+        session->join_batch_bytes = raw->join_batch_bytes = 8192;
+        wl_evaluation_control_t *control = serial_attach(session, 0);
+        int64_t *left = malloc(257u * 71u * sizeof(*left)); CHECK(left);
+        for (unsigned row = 0; row < 257; row++) {
+            left[row * 71u] = 1;
+            for (unsigned c = 0; c < 70;
+                c++) left[row * 71u + c + 1u] = row + c + 1u;
+        }
+        int64_t right[] = {1, 9};
+        wl_col_session_t *twins[] = {session, raw};
+        for (unsigned t = 0; t < 2; t++) {
+            CHECK(wl_backend_columnar()->session_insert(&twins[t]->base, "A",
+                left, 257, 71) == 0
+                && wl_backend_columnar()->session_insert(&twins[t]->base, "B",
+                right, 1, 2) == 0);
+            if (trial) {
+                wl_columnar_memory_governor_t *g =
+                    wl_columnar_memory_governor_ref_get(
+                    twins[t]->memory_governor);
+                CHECK(enforcing_budget > wl_columnar_memory_reserved(g));
+                g->mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+                g->budget_bytes = enforcing_budget;
+                atomic_store(&g->usable_bytes, enforcing_budget);
+            }
+        }
+        pipelined_budget_peak = 0; pipelined_growths = 0;
+        pipelined_last_capacity = 0;
+        wl_columnar_memory_governor_test_after_total_cas = pipelined_credit;
+        wl_columnar_join_batch_test_checkpoint = pipelined_wide_checkpoint;
+        for (unsigned attempt = 0; attempt < 2; attempt++) {
+            serial_capture_t got = {.width = 70}, reference = got;
+            CHECK(wl_backend_columnar()->session_snapshot(&session->base,
+                joined_capture, &got) == 0
+                && wl_backend_columnar()->session_snapshot(&raw->base,
+                joined_capture, &reference) == 0
+                && got.count == reference.count &&
+                got.digest == reference.digest);
+            filter_equal(session_find_rel(session, "H"),
+                session_find_rel(raw, "H"));
+            CHECK(pipelined_growths >= 2u && !session->serial_completion.frame
+                && !session->cleanup_reserved_bytes && !session->cleanup_pending
+                && !session->arr_entries[0].pin_count);
+            if (!attempt) {
+                left[1] = 1000;
+                CHECK(wl_backend_columnar()->session_insert(&session->base, "A",
+                    left, 1, 71) == 0
+                    && wl_backend_columnar()->session_insert(&raw->base, "A",
+                    left, 1, 71) == 0
+                    && wl_evaluation_control_reset(control) == 0);
+            }
+        }
+        wl_columnar_memory_governor_test_after_total_cas = NULL;
+        wl_columnar_join_batch_test_checkpoint = NULL;
+        if (!trial) enforcing_budget = pipelined_budget_peak;
+        else CHECK(pipelined_budget_peak <= enforcing_budget);
+        free(left); serial_destroy(session); serial_destroy(raw);
+    }
+    wl_plan_free(plan); wirelog_program_free(program);
+}
+
+static unsigned pipelined_rejected_visits;
+static bool pipelined_rejected_stop;
+static void
+pipelined_rejected_checkpoint(wl_evaluation_control_t *control, int stage,
+    uint64_t progress, wl_columnar_relation_source_group_t *group,
+    col_rel_t *source)
+{
+    (void)progress;
+    if (stage != 3) return;
+    wl_columnar_join_batch_record_t *record =
+        wl_columnar_eval_stack_cleanup_join_batch(
+        pipelined_session->cleanup_active);
+    CHECK(record && record->pipeline.stage_index == 2u
+        && record->pipeline.preparation.single
+        && group == &wl_columnar_eval_stack_cleanup_bulk_append(
+            pipelined_session->cleanup_active)->sources
+        && source->ncols == 4u && group->descriptor_count);
+    if (++pipelined_rejected_visits == 257u && pipelined_rejected_stop)
+        wl_evaluation_control_request_cancel(control);
+}
+static void
+test_pipelined_legacy_rejected_stop(void)
+{
+    static const char *const keys[] = {"col0"};
+    static const uint32_t projection[] = {1, 3};
+    static uint8_t false_expr[] = {WL_PLAN_EXPR_BOOL, 0};
+    static uint8_t true_expr[] = {WL_PLAN_EXPR_BOOL, 1};
+    const wl_plan_op_t ops[] = {
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "A",
+         .delta_mode = WL_DELTA_AUTO},
+        {.op = WL_PLAN_OP_JOIN, .right_relation = "B",
+         .delta_mode = WL_DELTA_AUTO,
+         .key_count = 1, .left_keys = keys, .right_keys = keys},
+        {.op = WL_PLAN_OP_FILTER,
+         .filter_expr = {false_expr, sizeof(false_expr)}},
+        {.op = WL_PLAN_OP_FILTER,
+         .filter_expr = {true_expr, sizeof(true_expr)}},
+        {.op = WL_PLAN_OP_MAP, .project_count = 2,
+         .project_indices = projection},
+        {.op = WL_PLAN_OP_CONSOLIDATE}
+    };
+    const wl_plan_relation_t rule = {.name = "H", .ops = ops, .op_count = 6};
+    const wl_plan_stratum_t stratum = {.relations = &rule, .relation_count = 1};
+    static const char *const inputs[] = {"A", "B"};
+    static const uint32_t input_widths[] = {2, 2};
+    const wl_plan_t plan = {.strata = &stratum, .stratum_count = 1,
+                            .edb_relations = inputs, .edb_count = 2,
+                            .edb_declared_width = input_widths};
+    wl_col_session_t *session = joined_create(&plan),
+        *raw = joined_create(&plan);
+    session->join_batch_bytes = raw->join_batch_bytes = 8192;
+    wl_evaluation_control_t *control = serial_attach(session, 0);
+    int64_t left[600], right[] = {1, 9};
+    for (unsigned row = 0; row < 300; row++) {
+        left[row * 2u] = 1; left[row * 2u + 1u] = row + 1;
+    }
+    wl_col_session_t *twins[] = {session, raw};
+    for (unsigned t = 0; t < 2; t++) CHECK(
+            wl_backend_columnar()->session_insert(&twins[t]->base, "A", left,
+            300, 2) == 0
+            && wl_backend_columnar()->session_insert(&twins[t]->base, "B",
+            right, 1, 2) == 0);
+    pipelined_session = session; pipelined_rejected_visits = 0;
+    pipelined_rejected_stop = true;
+    wl_columnar_filter_test_controlled_checkpoint =
+        pipelined_rejected_checkpoint;
+    serial_capture_t got = {.width = 2}, reference = got;
+    CHECK(wl_backend_columnar()->session_snapshot(&session->base,
+        joined_capture, &got)
+        == WL_EVALUATION_CONTROL_CANCELLED && !got.count
+        && pipelined_rejected_visits == 257u);
+    wl_columnar_filter_test_controlled_checkpoint = NULL;
+    CHECK(wl_columnar_eval_stack_cleanup_retry(session) == 0 &&
+        !session->cleanup_pending
+        && wl_evaluation_control_reset(control) == 0);
+    CHECK(wl_backend_columnar()->session_snapshot(&session->base,
+        joined_capture, &got) == 0
+        && wl_backend_columnar()->session_snapshot(&raw->base, joined_capture,
+        &reference) == 0
+        && !got.count && !reference.count);
+    filter_equal(session_find_rel(session, "H"), session_find_rel(raw, "H"));
+    CHECK(!session->serial_completion.frame && !session->cleanup_reserved_bytes
+        && !session->cleanup_pending && !session->arr_entries[0].pin_count);
+    source_unpinned(session_find_rel(session, "A"),
+        session_find_rel(session, "A"));
+    source_unpinned(session_find_rel(session, "B"),
+        session_find_rel(session, "B"));
+    serial_destroy(session); serial_destroy(raw);
+}
+
+static uint64_t pipelined_cost_view;
+static void
+pipelined_cost_checkpoint(wl_columnar_join_batch_record_t *record, int stage,
+    uint64_t progress)
+{
+    (void)progress;
+    if (stage == 14) pipelined_cost_view = record->output->rel->view_generation;
+}
+static void
+test_pipelined_production_exact_work(void)
+{
+    static const char *const keys[] = {"col0"};
+    static const uint32_t join_projection[] = {1, 3}, map_projection[] = {0};
+    static uint8_t rejected[] = {WL_PLAN_EXPR_BOOL, 0};
+    const wl_plan_op_t ops[] = {
+        {.op = WL_PLAN_OP_JOIN, .right_relation = "B", .key_count = 1,
+         .left_keys = keys, .right_keys = keys, .project_count = 2,
+         .project_indices = join_projection},
+        {.op = WL_PLAN_OP_FILTER, .filter_expr = {rejected, sizeof(rejected)}},
+        {.op = WL_PLAN_OP_MAP, .project_count = 1,
+         .project_indices = map_projection}
+    };
+    const wl_plan_relation_t plan = {.ops = ops, .op_count = 3};
+    uint64_t producer_bytes = 0;
+    /* Literal source trajectory from serial-pipelined-exact-cost-intake-r2:
+     * original owners/create/reserve/compiled FILTER/zero-row MAP/sink/tail.
+     * D is physical initialized producer size, never observed work rebasing. */
+    uint64_t common = sizeof(wl_columnar_consolidate_record_t)
+        + sizeof(((wl_columnar_join_batch_record_t *)0)->pipeline)
+        + sizeof(wl_columnar_memory_reservation_t)
+        + 2u * sizeof(wl_columnar_expr_operator_preparation_t);
+    for (unsigned trial = 0; trial < 5; trial++) {
+        wl_col_session_t *session = join_session();
+        col_rel_t *left = relation(2, 1, 1, false, session->memory_governor);
+        col_rel_t *right = relation(2, 1, 1, false, session->memory_governor);
+        free(left->name); left->name = strdup("A");
+        free(right->name); right->name = strdup("B");
+        left->columns[0][0] = right->columns[0][0] = 1;
+        left->columns[1][0] = 7; right->columns[1][0] = 9;
+        const uint32_t key = 0;
+        CHECK(left->name && right->name && session_add_rel(session, left) == 0
+            && session_add_rel(session, right) == 0
+            && col_rel_storage_owner_ensure_initialized(left) == 0
+            && col_rel_storage_owner_ensure_initialized(right) == 0
+            && col_session_get_arrangement(&session->base, "B", &key, 1));
+        uint64_t baseline = string_reserved(session->memory_governor);
+        uint64_t full = 7570u + common + producer_bytes + 5u *
+            private_writer_begin_cost();
+        uint64_t cutoff = 7186u + common + producer_bytes + 4u *
+            private_writer_begin_cost();
+        session->join_batch_bytes = 160;
+        /* The caller owns its original frame before this operator attempt. */
+        wl_columnar_eval_stack_cleanup_frame_t *frame = join_frame(session,
+                left, false);
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame);
+        wl_evaluation_control_t *c = control(!trial ? 0 : trial ==
+                3 ? cutoff - 1u
+            : trial == 4 ? full - 1u : full);
+        session->base.evaluation_control = c;
+        pipelined_empty_touches = 0; pipelined_cost_view = 0;
+        wl_columnar_join_batch_test_checkpoint = pipelined_cost_checkpoint;
+        wl_columnar_relation_test_private_checkpoint =
+            pipelined_private_checkpoint;
+        uint32_t next = UINT32_MAX;
+        int rc = wl_columnar_join_pipeline_try_eval_controlled(&plan, 0, stack,
+                session, &next, c);
+        wl_columnar_join_batch_record_t *record =
+            wl_columnar_eval_stack_cleanup_join_batch(frame);
+        CHECK(record);
+        if (!trial) {
+            producer_bytes = record->initialized_tokens;
+            full += producer_bytes; cutoff += producer_bytes;
+        }
+        int expected = trial >= 3 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0;
+        uint64_t consumed = finish(c, expected);
+        if (rc != (expected ? expected : 1) || consumed !=
+            (trial == 3 ? cutoff - 16u : trial == 4 ? full - 96u : full))
+            fprintf(stderr,
+                "pipeline exact trial=%u rc=%d consumed=%llu full=%llu cutoff=%llu\n",
+                trial, rc, (unsigned long long)consumed,
+                (unsigned long long)full, (unsigned long long)cutoff);
+        CHECK(producer_bytes && record->initialized_tokens == producer_bytes
+            && rc == (expected ? expected : 1)
+            && consumed ==
+            (trial == 3 ? cutoff - 16u : trial == 4 ? full - 96u : full));
+        if (trial == 3) CHECK(record->producer && record->continuation
+                && !record->committed && !pipelined_empty_touches
+                && wl_columnar_continuation_cursor(
+                    record->continuation)->sequence == 0u
+                && record->output->rel->view_generation == pipelined_cost_view);
+        else if (trial == 4) CHECK(!record->producer && !record->continuation
+                && pipelined_empty_touches == 1u && stack->items[0].rel == left
+                && record->output->owned &&
+                record->output->rel->view_generation ==
+                pipelined_cost_view + 1u);
+        else CHECK(next == 2u && stack->top == 1u && stack->items[0].owned
+                && stack->items[0].rel->ncols == 1u &&
+                !stack->items[0].rel->nrows
+                && pipelined_empty_touches == 1u);
+        wl_columnar_join_batch_test_checkpoint = NULL;
+        wl_columnar_relation_test_private_checkpoint = NULL;
+        wl_columnar_filter_test_controlled_checkpoint = NULL;
+        wl_columnar_ops_map_test_controlled_checkpoint = NULL;
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0
+            && !session->cleanup_pending && !session->cleanup_reserved_bytes
+            && !session->arr_entries[0].pin_count
+            && string_reserved(session->memory_governor) == baseline);
+        if (expected) {
+            /* Previous original frame is truly drained before a new attempt. */
+            session->base.evaluation_control = NULL;
+            frame = join_frame(session, left, false);
+            stack = wl_columnar_eval_stack_cleanup_stack(frame);
+            retry(c, 0);
+            session->base.evaluation_control = c;
+            CHECK(wl_columnar_join_pipeline_try_eval_controlled(&plan, 0, stack,
+                session, &next, c) == 1 && stack->top == 1u
+                && stack->items[0].owned && stack->items[0].rel->ncols == 1u
+                && !stack->items[0].rel->nrows);
+            CHECK(finish(c, 0) == full
+                && wl_columnar_eval_stack_cleanup_finish(&frame) == 0
+                && string_reserved(session->memory_governor) == baseline);
+        }
+        session->base.evaluation_control = NULL;
+        release(c); join_session_destroy(session);
+    }
+    wl_col_session_t *raw = join_session();
+    col_rel_t *left = relation(2, 1, 1, false, raw->memory_governor);
+    col_rel_t *right = relation(2, 1, 1, false, raw->memory_governor);
+    free(left->name); left->name = strdup("A");
+    free(right->name); right->name = strdup("B");
+    left->columns[0][0] = right->columns[0][0] = 1;
+    left->columns[1][0] = 7; right->columns[1][0] = 9;
+    CHECK(left->name && right->name && session_add_rel(raw, left) == 0
+        && session_add_rel(raw, right) == 0);
+    raw->join_batch_bytes = 160;
+    eval_stack_t stack = {0};
+    CHECK(eval_stack_push(&stack, left, false) == 0);
+    uint32_t next;
+    CHECK(wl_columnar_join_pipeline_try_eval(&plan, 0, &stack, raw, &next) == 1
+        && next == 2u && stack.top == 1u && stack.items[0].owned
+        && stack.items[0].rel->ncols == 1u && !stack.items[0].rel->nrows);
+    CHECK(eval_stack_drain(&stack) == 0); join_session_destroy(raw);
+}
+
+static void
+test_serial_pipelined_generated(void)
+{
+    for (unsigned kind = 0; kind < 7; kind++) {
+        bool expression = kind == 1 || kind == 6, rejected = kind == 2;
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(expression
+            ? ".decl A(k:int64,v:int64)\n.decl B(k:int64,w:int64)\n"
+                ".decl H(x:int64,w:int64)\nH(v+1,w):-A(k,v),B(k,w),v>0.\n"
+            : ".decl A(k:int64,v:int64)\n.decl B(k:int64,w:int64)\n"
+                ".decl H(v:int64,w:int64)\nH(v,w):-A(k,v),B(k,w),v>0.\n",
+                &error);
+        CHECK(program && error == WIRELOG_OK);
+        wl_plan_t *plan = NULL;
+        CHECK(wl_plan_from_program(program, &plan) == 0);
+        const wl_plan_relation_t *rule = &plan->strata[0].relations[0];
+        CHECK(plan->stratum_count == 1 && !plan->strata[0].is_recursive
+            && rule->op_count == 5
+            && rule->ops[0].op == WL_PLAN_OP_VARIABLE
+            && rule->ops[0].delta_mode == WL_DELTA_AUTO
+            && rule->ops[1].op == WL_PLAN_OP_JOIN
+            && rule->ops[1].delta_mode == WL_DELTA_AUTO
+            && rule->ops[1].key_count == 1 && !rule->ops[1].project_count
+            && rule->ops[2].op == WL_PLAN_OP_FILTER
+            && rule->ops[3].op == WL_PLAN_OP_MAP
+            && rule->ops[3].project_count == 2
+            && rule->ops[4].op == WL_PLAN_OP_CONSOLIDATE);
+        for (unsigned snapshot = 0; snapshot < 2; snapshot++) {
+            if (kind >= 3 && !snapshot) continue;
+            wl_col_session_t *session = joined_create(plan),
+                *raw = joined_create(plan);
+            session->join_batch_bytes = raw->join_batch_bytes = 224;
+            wl_evaluation_control_t *control = serial_attach(session, 0);
+            pipelined_session = session;
+            pipelined_stop_stage = kind == 3 ? 14 : kind == 4 ? 4 : kind ==
+                5 ? 5 : kind == 6 ? 6 : 0;
+            pipelined_fault_writer = NULL;
+            wl_columnar_ops_map_test_controlled_checkpoint =
+                pipelined_map_fault;
+            memset(&pipelined_held_reader, 0, sizeof(pipelined_held_reader));
+            pipelined_fault_preparation = NULL;
+            wl_columnar_expr_test_retirement_checkpoint = pipelined_retirement;
+            wl_columnar_join_batch_test_checkpoint = pipelined_checkpoint;
+            wl_columnar_relation_test_private_checkpoint =
+                pipelined_private_checkpoint;
+            pipelined_empty_touches = 0; pipelined_sequence = 0;
+            CHECK(!session_find_rel(session, "H") && !session_find_rel(raw,
+                "H"));
+            int64_t left[60] = {1, 7, 1, -1, 2, 8}, right[] = {1, 9, 2, 10};
+            if (kind == 6) left[1] = INT64_MAX;
+            if (rejected) for (unsigned row = 0; row < 30; row++) {
+                    left[2u * row] = row % 2u + 1u;
+                    left[2u * row + 1u] = -(int64_t)row - 1;
+                }
+            for (unsigned attempt = 0; attempt < 2; attempt++) {
+                wl_col_session_t *twins[] = {session, raw};
+                for (unsigned t = 0; t < 2; t++) {
+                    CHECK(wl_backend_columnar()->session_insert(&twins[t]->base,
+                        "A", left, attempt ? 1 : rejected ? 30 : 3, 2) == 0);
+                    if (!attempt) CHECK(wl_backend_columnar()->session_insert(
+                                &twins[t]->base, "B", right, 2, 2) == 0);
+                }
+                serial_capture_t capture = {.width = 2}, twin = capture;
+                int rc = snapshot ? wl_backend_columnar()->session_snapshot(
+                    &session->base, joined_capture, &capture)
+                    : wl_backend_columnar()->session_step(&session->base);
+                if (!attempt && kind >= 3) {
+                    int expected = kind == 3 ? WL_EVALUATION_CONTROL_CANCELLED
+                        : kind == 5 ? EBUSY : kind == 6 ? ERANGE : EINVAL;
+                    CHECK(rc == expected && !capture.count);
+                    wl_evaluation_control_report_t report;
+                    CHECK(wl_evaluation_control_report(control, &report) == 0
+                        && report.result == expected);
+                    if (kind == 4) {
+                        CHECK(pipelined_fault_preparation &&
+                            session->cleanup_pending
+                            && !pipelined_fault_preparation->scratch_payload
+                            && !pipelined_fault_preparation->scratch.identity
+                            && pipelined_fault_preparation->scratch.bytes);
+                        pipelined_fault_preparation->scratch.identity =
+                            pipelined_scratch_identity;
+                    }
+                    if (kind == 6) {
+                        CHECK(report.execution_status == ERANGE &&
+                            pipelined_fault_writer
+                            && pipelined_fault_writer->owner &&
+                            !pipelined_fault_writer->identity
+                            && session->cleanup_pending);
+                        pipelined_fault_writer->identity =
+                            pipelined_fault_identity;
+                        serial_capture_t rejected_raw = {.width = 2};
+                        CHECK(wl_backend_columnar()->session_snapshot(
+                                &raw->base,
+                                joined_capture,
+                                &rejected_raw) == ERANGE &&
+                            !rejected_raw.count);
+                    }
+                    if (kind == 5) CHECK(pipelined_held_reader.owner
+                            && session->cleanup_pending
+                            && col_rel_source_reader_release(
+                                &pipelined_held_reader) == 0);
+                    pipelined_stop_stage = 0;
+                    CHECK(wl_columnar_eval_stack_cleanup_retry(session) == 0
+                        && !session->cleanup_pending
+                        && wl_evaluation_control_reset(control) == 0);
+                    if (kind == 6) {
+                        /* Both failed attempts have returned and real authorities drained.
+                         * Correct the input value in this fixture before the fresh retry. */
+                        source_unpinned(session_find_rel(session, "A"),
+                            session_find_rel(session, "A"));
+                        source_unpinned(session_find_rel(raw, "A"),
+                            session_find_rel(raw, "A"));
+                        session_find_rel(session, "A")->columns[1][0] = 7;
+                        session_find_rel(raw, "A")->columns[1][0] = 7;
+                        wl_columnar_relation_touch_view(session_find_rel(
+                                session, "A"));
+                        wl_columnar_relation_touch_view(session_find_rel(raw,
+                            "A"));
+                        left[1] = 7;
+                    }
+                    rc = wl_backend_columnar()->session_snapshot(&session->base,
+                            joined_capture, &capture);
+                }
+                if (rc) fprintf(stderr,
+                        "pipeline initial expression=%u snapshot=%u attempt=%u rc=%d\n",
+                        expression, snapshot, attempt, rc);
+                if (rc) fprintf(stderr,
+                        "last checkpoint stage=%u phase=%u progress=%llu\n",
+                        pipelined_seen_stage, pipelined_seen_phase,
+                        (unsigned long long)pipelined_seen_progress);
+                CHECK(rc == 0);
+                CHECK((snapshot ? wl_backend_columnar()->session_snapshot(
+                        &raw->base, joined_capture, &twin)
+                    : wl_backend_columnar()->session_step(&raw->base)) == 0);
+                filter_equal(session_find_rel(session, "H"),
+                    session_find_rel(raw, "H"));
+                CHECK(!session->serial_completion.frame &&
+                    !session->cleanup_pending);
+                if (snapshot) CHECK(capture.count == twin.count &&
+                        capture.digest == twin.digest);
+                if (rejected) CHECK(!session_find_rel(session, "H")->nrows
+                        && pipelined_empty_touches >= 3u &&
+                        pipelined_sequence >= 3u);
+            }
+            wl_columnar_join_batch_test_checkpoint = NULL;
+            wl_columnar_relation_test_private_checkpoint = NULL;
+            wl_columnar_expr_test_retirement_checkpoint = NULL;
+            wl_columnar_ops_map_test_controlled_checkpoint = NULL;
+            serial_destroy(session); serial_destroy(raw);
+        }
+        wl_plan_free(plan); wirelog_program_free(program);
+    }
+    puts(
+        "generated pipeline: initial/dirty projection/expression STEP/SNAPSHOT raw twins passed");
+}
+
 int
 main(void)
 {
     hmac_required_startup();
+    test_pipelined_empty_touch_boundary();
+    test_pipelined_consumed_touch_resume();
+    test_serial_pipelined_generated();
+    test_pipelined_wide_enforcing();
+    test_pipelined_legacy_rejected_stop();
+    test_pipelined_production_exact_work();
+    printf(
+        "controlled pipeline: exact/cutoff, consumed resume, rejected stop and enforcing twins passed\n");
     test_publish_generated_twins();
     test_publish_auto_selection();
     test_publish_matching_declared_head();

@@ -1160,7 +1160,7 @@ Typed original-schema helper fixtures are separate from typed producer coverage.
 Sorted-prefix and multisegment SET use the same controlled range kernels and
 original frame authorities. Remaining full-task obligations include generated
 typed routes beyond the selected producers, general delta/reset and recursive
-evaluation, differential observers, batch/pipeline execution and LFTJ.
+evaluation, differential observers, broader batch/pipeline execution and LFTJ.
 
 ### Controlled ordinary aggregate evaluation
 
@@ -1236,8 +1236,8 @@ lookup, registry transport, hash construction and producer comparisons charge
 work before inspection. Empty buckets and rejected chain candidates still poll.
 The arrangement, producer, continuation and scratch keep their original memory
 policy and descriptor sizes; the preparation workspace holds their exclusive
-phase record. FILTER/MAP pipeline and recursive or differential batches remain
-outstanding execution lanes.
+phase record. Ordinary keyed FILTER/MAP continuations use that same workspace;
+recursive or differential batches remain outstanding execution lanes.
 
 Scratch is owned by the original result entry while the producer borrows it.
 The final output stays in an existing stack slot. Scratch private writers retire
@@ -1266,3 +1266,39 @@ regression evidence. A valid controlled primary cache miss creates a bounded
 persistent primary; it does not reach that raw ENOENT seam. Malformed key,
 memory, authority and work failures keep their actual errors. Actual
 filtered/delta/materialized/LFTJ fallback coverage remains outstanding.
+
+
+### Controlled keyed FILTER/MAP continuations
+
+A genuine ordinary keyed JOIN followed by row-local FILTERs and a numeric MAP
+uses the original batch continuation and relation sink. Producer scratch retains
+its JOIN width and types; final output uses the MAP width. The original registry,
+build and probe workspace is retired before its pipeline preparation overlay is
+initialized. Complete frame, producer and continuation sizes remain unchanged.
+
+The producer borrows scratch from the original result entry. During a transform,
+its sole owner moves to an existing spare stack slot; the stage input borrows that
+relation while the result entry owns only a new FILTER or MAP output. Persistent
+JOIN source authorities remain separate from each stage's original bulk source
+group. Stage readers, writers and expression preparation drain before another
+stage or bulk publication reuses their original records. Healthy physical
+retirement has charged readiness and polls around checked destruction; width,
+Arrow and dedup destruction retain the documented physical cleanup exclusion.
+Stopped or refused cleanup does not add new polls or charges.
+
+Final output reserves space for the producer's input batch before FILTER runs,
+including when every row rejects. Exact reserve keeps the raw capacity policy
+and does not change row count. A zero-row transform publishes a real view touch
+under its original private writer. Fixed scalar admission and the last poll precede
+the touch; original set, batch and sink consumption flags are stored before any
+fallible retirement. No dummy row or RETIRED phase supplies this publication.
+Rows, schema, storage generation, payload and credits stay unchanged at that touch.
+
+A post-publication refusal advances the original continuation cursor once. The
+next call first drains retained original stage authority and scratch ownership;
+it does not transform, append or touch that consumed batch again. A positive
+initiating execution error keeps precedence over cleanup refusal. Cleanup uses
+the actual embedded frame address after the active-frame list detaches it.
+Existing pipeline exclusions, creator admission order and strict fallback rules
+remain in force. This selected ordinary route does not cover recursive,
+differential, LFTJ or general materialized pipeline execution.

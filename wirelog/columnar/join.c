@@ -1364,7 +1364,7 @@ wl_columnar_join_controlled_key(const col_rel_t *r, const char *name,
     }
     return 0;
 }
-static int
+int
 wl_columnar_join_controlled_shape(const col_rel_t *r,
     wl_evaluation_control_t *control)
 {

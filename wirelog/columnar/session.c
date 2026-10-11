@@ -10,6 +10,7 @@
 
 #include "columnar/compound_side.h"
 #include "columnar/internal.h"
+#include "columnar/join_pipeline.h"
 #include "wirelog/util/log.h"
 
 #include "../wirelog-internal.h"
@@ -5421,7 +5422,14 @@ wl_columnar_session_serial_preflight(wl_col_session_t *sess)
                 && rp->ops[0].delta_mode != WL_DELTA_FORCE_FULL))
                 return ENOTSUP;
             if (sess->join_batch_bytes && (!joined || rp->op_count != 3u
-                || !rp->ops[1].key_count)) return ENOTSUP;
+                || !rp->ops[1].key_count)) {
+                if (rp->op_count < 4u) return ENOTSUP;
+                bool batched_pipeline = false;
+                rc = wl_columnar_join_pipeline_plan_validate_controlled(rp,
+                        sess, control, &batched_pipeline);
+                if (rc) return rc;
+                if (!batched_pipeline) return ENOTSUP;
+            }
             rc = wl_columnar_session_serial_tail(control, 1, ri, NULL);
             if (rc) return rc;
             has_heads = true;

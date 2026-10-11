@@ -140,9 +140,17 @@ wl_columnar_join_batch_record_retire(wl_columnar_join_batch_record_t *record,
     int primary)
 {
     if (!record || !record->ready) return primary > 0 ? primary : EINVAL;
+    if (record->phase == WL_COLUMNAR_JOIN_BATCH_PIPELINE
+        || record->phase == WL_COLUMNAR_JOIN_BATCH_PIPELINE_INITIALIZING) {
+        int stage = wl_columnar_join_pipeline_stage_retire(record, 0);
+        if (stage) return primary > 0 ? primary : stage;
+    }
     int cleanup = wl_columnar_arrangement_record_retire(record, 0);
     if (record->phase == WL_COLUMNAR_JOIN_BATCH_PRODUCER
-        || record->phase == WL_COLUMNAR_JOIN_BATCH_PROBE) cleanup = 0;
+        || record->phase == WL_COLUMNAR_JOIN_BATCH_PROBE
+        || record->phase == WL_COLUMNAR_JOIN_BATCH_PIPELINE
+        || record->phase == WL_COLUMNAR_JOIN_BATCH_PIPELINE_INITIALIZING)
+        cleanup = 0;
     if (cleanup) return primary > 0 ? primary : cleanup;
     if (record->phase == WL_COLUMNAR_JOIN_BATCH_PROBE) {
         cleanup = wl_columnar_arrangement_pin_retire_controlled(record,
@@ -860,14 +868,15 @@ fail:
     return rc;
 }
 
-int
-wl_columnar_join_batch_create_controlled(
+static int
+wl_columnar_join_batch_create_shape(
     wl_columnar_join_batch_record_t *record,
-    const wl_plan_op_t *op, const col_rel_t *left, const col_rel_t *right)
+    const wl_plan_op_t *op, const col_rel_t *left, const col_rel_t *right,
+    uint32_t width)
 {
     if (!record || !record->ready || !record->control || !record->session
-        || !op || !left || !right || !op->key_count || !record->output
-        || !record->output->rel || record->producer || record->continuation)
+        || !op || !left || !right || !op->key_count
+        || record->producer || record->continuation)
         return EINVAL;
     wl_col_session_t *session = record->session;
     wl_evaluation_control_t *control = record->control;
@@ -1001,7 +1010,7 @@ wl_columnar_join_batch_create_controlled(
     eval_entry_t *owner =
         wl_columnar_eval_stack_cleanup_result(session->cleanup_active);
     rc = wl_columnar_relation_new_auto_governed_controlled("$join_batch",
-            record->output->rel->ncols, COL_REL_INIT_CAP, false, governor,
+            width, COL_REL_INIT_CAP, false, governor,
             &owner->rel, control); if (rc) goto failed;
     owner->owned = true; owner->kind = WL_COLUMNAR_EVAL_ENTRY_RELATION;
     producer->batch = owner->rel;
@@ -1050,6 +1059,26 @@ wl_columnar_join_batch_create_controlled(
     return 0;
 failed:
     return rc;
+}
+
+int
+wl_columnar_join_batch_create_controlled(
+    wl_columnar_join_batch_record_t *record,
+    const wl_plan_op_t *op, const col_rel_t *left, const col_rel_t *right)
+{
+    if (!record || !record->output || !record->output->rel) return EINVAL;
+    return wl_columnar_join_batch_create_shape(record, op, left, right,
+               record->output->rel->ncols);
+}
+
+int
+wl_columnar_join_batch_create_pipeline_controlled(
+    wl_columnar_join_batch_record_t *record,
+    const wl_plan_op_t *op, const col_rel_t *left, const col_rel_t *right,
+    uint32_t width)
+{
+    if (!record || !record->output || record->output->rel) return EINVAL;
+    return wl_columnar_join_batch_create_shape(record, op, left, right, width);
 }
 
 static wl_columnar_continuation_status_t

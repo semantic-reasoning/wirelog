@@ -2988,6 +2988,8 @@ int wl_columnar_relation_private_append_batch_row_controlled(
     wl_evaluation_control_t *);
 int wl_columnar_relation_private_append_batch_end_controlled(
     wl_columnar_relation_private_batch_t *);
+int wl_columnar_relation_private_touch_view_controlled(
+    wl_columnar_relation_private_batch_t *, wl_evaluation_control_t *, bool *);
 int wl_columnar_relation_private_cell_controlled(
     wl_columnar_relation_private_batch_t *, uint32_t, uint32_t, int64_t,
     wl_evaluation_control_t *);
@@ -3885,6 +3887,14 @@ typedef struct wl_columnar_join_batch_record {
             col_relation_snapshot_t left, right;
             uint32_t row, candidate;
         } probe;
+        struct {
+            wl_columnar_expr_operator_preparation_t preparation;
+            const wl_plan_relation_t *plan;
+            uint32_t first_filter, map_index, stage_index;
+            uint32_t left_slot, scratch_slot, stage_slot, pending_begin;
+            uint32_t stage;
+            bool ready, begun, scratch_moved, published;
+        } pipeline;
     };
     uint32_t phase, initialized_tokens;
     int reason;
@@ -3901,9 +3911,26 @@ enum {
     WL_COLUMNAR_JOIN_BATCH_REGISTRY,
     WL_COLUMNAR_JOIN_BATCH_BUILD,
     WL_COLUMNAR_JOIN_BATCH_PRODUCER,
-    WL_COLUMNAR_JOIN_BATCH_PROBE
+    WL_COLUMNAR_JOIN_BATCH_PROBE,
+    WL_COLUMNAR_JOIN_BATCH_PIPELINE_INITIALIZING,
+    WL_COLUMNAR_JOIN_BATCH_PIPELINE
 };
+enum {
+    WL_COLUMNAR_JOIN_PIPELINE_STAGE_INERT = 0,
+    WL_COLUMNAR_JOIN_PIPELINE_STAGE_TRANSFORM,
+    WL_COLUMNAR_JOIN_PIPELINE_STAGE_APPEND,
+    WL_COLUMNAR_JOIN_PIPELINE_STAGE_COMMITTED
+};
+eval_entry_t *wl_columnar_eval_stack_cleanup_pipeline_input(wl_col_session_t *,
+    eval_stack_t *);
+wl_columnar_relation_private_batch_t *
+wl_columnar_eval_stack_cleanup_pipeline_private_batch(
+    wl_columnar_eval_stack_cleanup_frame_t *);
+int wl_columnar_join_pipeline_stage_retire(wl_columnar_join_batch_record_t *,
+    int);
 int wl_columnar_join_controlled_key(const col_rel_t *, const char *, uint32_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_join_controlled_shape(const col_rel_t *,
     wl_evaluation_control_t *);
 int wl_columnar_join_batch_record_retire(wl_columnar_join_batch_record_t *,
     int);
@@ -3913,6 +3940,9 @@ void wl_columnar_join_batch_checkpoint(wl_columnar_join_batch_record_t *,
 extern void (*wl_columnar_join_batch_test_checkpoint)(
     wl_columnar_join_batch_record_t *, int, uint64_t);
 #endif
+wl_columnar_eval_stack_cleanup_frame_t *
+wl_columnar_eval_stack_cleanup_join_batch_frame(
+    wl_columnar_join_batch_record_t *);
 int wl_columnar_eval_stack_cleanup_join_batch_owner(wl_col_session_t *,
     eval_stack_t *, wl_columnar_join_batch_record_t **,
     wl_evaluation_control_t *);

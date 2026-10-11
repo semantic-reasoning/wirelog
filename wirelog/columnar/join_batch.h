@@ -101,6 +101,9 @@ col_join_batch_producer_create(wl_col_session_t *sess,
  * batch rather than a failed produce. */
 int wl_columnar_join_batch_create_controlled(wl_columnar_join_batch_record_t *,
     const wl_plan_op_t *, const col_rel_t *, const col_rel_t *);
+int wl_columnar_join_batch_create_pipeline_controlled(
+    wl_columnar_join_batch_record_t *, const wl_plan_op_t *, const col_rel_t *,
+    const col_rel_t *, uint32_t);
 int wl_columnar_join_batch_run_controlled(wl_columnar_join_batch_record_t *);
 int wl_columnar_join_batch_publish_controlled(
     wl_columnar_join_batch_record_t *);

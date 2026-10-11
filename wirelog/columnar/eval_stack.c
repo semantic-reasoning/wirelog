@@ -549,6 +549,53 @@ wl_columnar_eval_stack_cleanup_result(
     return frame ? &frame->result : NULL;
 }
 
+static wl_columnar_join_batch_record_t *
+wl_columnar_eval_stack_pipeline_stage(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    wl_columnar_join_batch_record_t *batch =
+        wl_columnar_eval_stack_cleanup_join_batch(frame);
+    return batch && batch->phase == WL_COLUMNAR_JOIN_BATCH_PIPELINE
+           && batch->pipeline.ready
+           && batch->pipeline.stage == WL_COLUMNAR_JOIN_PIPELINE_STAGE_TRANSFORM
+        ? batch : NULL;
+}
+
+eval_entry_t *
+wl_columnar_eval_stack_cleanup_pipeline_input(wl_col_session_t *session,
+    eval_stack_t *stack)
+{
+    if (!session || !stack || !session->cleanup_active) return NULL;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = session->cleanup_active;
+    wl_columnar_join_batch_record_t *batch =
+        wl_columnar_eval_stack_pipeline_stage(frame);
+    if (!batch || frame->session != session || &frame->stack != stack
+        || batch->pipeline.stage_slot >= COL_STACK_MAX
+        || stack->top != batch->pipeline.stage_slot + 1u) return NULL;
+    return &stack->items[batch->pipeline.stage_slot];
+}
+
+wl_columnar_relation_private_batch_t *
+wl_columnar_eval_stack_cleanup_pipeline_private_batch(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    wl_columnar_join_batch_record_t *record =
+        wl_columnar_eval_stack_cleanup_join_batch(frame);
+    if (!record || record->phase != WL_COLUMNAR_JOIN_BATCH_PIPELINE
+        || !record->pipeline.ready || !frame->reduce_batch.ready) return NULL;
+    wl_columnar_relation_private_batch_t *writer = &frame->reduce_batch;
+    if (wl_columnar_relation_private_batch_disposable(writer)) return writer;
+    col_rel_t *relation = writer->batch.relation;
+    bool result = frame->result.owned && frame->result.rel == relation;
+    bool output = record->output && record->output->owned
+        && record->output->rel == relation;
+    bool scratch = record->pipeline.scratch_moved
+        && record->pipeline.scratch_slot < COL_STACK_MAX
+        && frame->stack.items[record->pipeline.scratch_slot].owned
+        && frame->stack.items[record->pipeline.scratch_slot].rel == relation;
+    return result || output || scratch ? writer : NULL;
+}
+
 int
 wl_columnar_eval_stack_cleanup_join_owner(wl_col_session_t *sess,
     eval_stack_t *stack, wl_columnar_relation_source_group_t **group,
@@ -557,6 +604,21 @@ wl_columnar_eval_stack_cleanup_join_owner(wl_col_session_t *sess,
     if (!sess || !stack || !group || !result || !sess->cleanup_active)
         return EINVAL;
     wl_columnar_eval_stack_cleanup_frame_t *frame = sess->cleanup_active;
+    wl_columnar_join_batch_record_t *stage =
+        wl_columnar_eval_stack_pipeline_stage(frame);
+    if (stage) {
+        if (&frame->stack != stack || frame->session != sess
+            || frame->result.rel || frame->result.continuation
+            || frame->result.seg_boundaries || frame->result.owned
+            || frame->bulk_append.active
+            || frame->bulk_append.sources.descriptor_count
+            || frame->bulk_append.sources.owner_count
+            || !wl_columnar_eval_stack_cleanup_pipeline_input(sess, stack))
+            return EBUSY;
+        *group = &frame->bulk_append.sources;
+        *result = &frame->result;
+        return 0;
+    }
     if (&frame->stack != stack || frame->session != sess
         || frame->result.rel || frame->result.continuation
         || frame->result.seg_boundaries || frame->result.owned
@@ -579,10 +641,14 @@ wl_columnar_eval_stack_cleanup_private_batch_owner(wl_col_session_t *sess,
     wl_columnar_eval_stack_cleanup_frame_t *frame = sess->cleanup_active;
     if (!frame || frame->session != sess || &frame->stack != stack)
         return EINVAL;
+    bool pipeline = wl_columnar_eval_stack_pipeline_stage(frame) != NULL;
     if (frame->result.rel || frame->result.continuation
         || frame->result.seg_boundaries || frame->result.owned
-        || frame->join_sources.descriptor_count
-        || frame->join_sources.owner_count) return EBUSY;
+        || (pipeline ? frame->bulk_append.active
+        || frame->bulk_append.sources.descriptor_count
+        || frame->bulk_append.sources.owner_count
+            : frame->join_sources.descriptor_count
+        || frame->join_sources.owner_count)) return EBUSY;
     wl_columnar_relation_private_batch_t *candidate = &frame->reduce_batch;
     if (!candidate->ready) return EINVAL;
     if (candidate->phase == WL_COLUMNAR_RELATION_PRIVATE_INSTALLING
@@ -704,6 +770,19 @@ wl_columnar_eval_stack_cleanup_join_batch(
         ? &frame->join_batch : NULL;
 }
 
+wl_columnar_eval_stack_cleanup_frame_t *
+wl_columnar_eval_stack_cleanup_join_batch_frame(
+    wl_columnar_join_batch_record_t *record)
+{
+    if (!record || !record->ready || !record->session) return NULL;
+    wl_columnar_eval_stack_cleanup_frame_t *frame =
+        (wl_columnar_eval_stack_cleanup_frame_t *)((char *)record
+        - offsetof(wl_columnar_eval_stack_cleanup_frame_t, join_batch));
+    return frame->session == record->session
+           && wl_columnar_eval_stack_cleanup_join_batch(frame) == record
+        ? frame : NULL;
+}
+
 int
 wl_columnar_eval_stack_cleanup_operator_preparation_owner(
     wl_col_session_t *sess,
@@ -714,6 +793,41 @@ wl_columnar_eval_stack_cleanup_operator_preparation_owner(
     wl_columnar_eval_stack_cleanup_frame_t *frame = sess->cleanup_active;
     if (!frame || frame->session != sess ||
         &frame->stack != stack) return EINVAL;
+    wl_columnar_join_batch_record_t *stage =
+        wl_columnar_eval_stack_pipeline_stage(frame);
+    if (stage) {
+        wl_columnar_expr_operator_preparation_t *preparation =
+            &stage->pipeline.preparation;
+        int rc = preparation->ready
+            ? wl_columnar_expr_operator_retire(preparation, 0, false, control)
+            : 0;
+        if (rc) return rc;
+        preparation->ready = false;
+        for (size_t at = 0; at < sizeof(*preparation);) {
+            size_t count = sizeof(*preparation) - at;
+            if (count > 128u) count = 128u;
+            rc = wl_evaluation_control_charge(control, count);
+            if (rc) return rc;
+            memset((char *)preparation + at, 0, count); at += count;
+            rc = wl_evaluation_control_charge(control, 0);
+            if (rc) return rc;
+        }
+        wl_columnar_memory_reservation_t *tokens[] = {
+            &preparation->scratch, &preparation->compile_admission,
+            &preparation->retired_expression
+        };
+        for (uint32_t i = 0; i < 3u; i++) {
+            rc = wl_evaluation_control_charge(control, 96);
+            if (rc) return rc;
+            wl_columnar_memory_reservation_init(tokens[i]);
+            preparation->initialized_tokens++;
+            rc = wl_evaluation_control_charge(control, 0);
+            if (rc) return rc;
+        }
+        preparation->ready = true;
+        *out = preparation;
+        return 0;
+    }
     int rc = wl_columnar_eval_stack_workspace_clear(frame, control);
     if (rc) return rc;
     wl_columnar_memory_reservation_t *tokens[] = {&frame->preparation.scratch,
@@ -739,6 +853,11 @@ wl_columnar_expr_operator_preparation_t *
 wl_columnar_eval_stack_cleanup_operator_preparation(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
 {
+    wl_columnar_join_batch_record_t *stage =
+        wl_columnar_eval_stack_pipeline_stage(frame);
+    if (stage && frame->session->cleanup_active == frame
+        && stage->pipeline.preparation.ready)
+        return &stage->pipeline.preparation;
     return frame && frame->session && frame->session->cleanup_active == frame
            && wl_columnar_eval_stack_cleanup_mode(frame) ==
            WL_COLUMNAR_SERIAL_FRAME_OPERATOR
