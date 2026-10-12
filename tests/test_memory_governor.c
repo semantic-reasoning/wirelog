@@ -8,6 +8,8 @@
 #include "../wirelog/columnar/memory_governor.h"
 #include "wirelog/thread.h"
 
+#include <errno.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -910,6 +912,738 @@ test_growth_races(void)
     return 0;
 }
 
+#define WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(x) do { if (!(x)) { fprintf(stderr, \
+                                                                  "controlled governor:%d: %s\n", \
+                                                                  __LINE__, #x); \
+                                                              exit(1); \
+                                                  } } while (0)
+static int controlled_owner;
+static uint64_t controlled_work, controlled_cancel_at;
+static unsigned controlled_phase, controlled_hits;
+static int controlled_fault;
+static void
+controlled_work_point(wl_evaluation_control_t *c, uint64_t work)
+{
+    (void)c;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(work <= WL_EVALUATION_CONTROL_QUANTUM);
+    controlled_work += work;
+    if (controlled_cancel_at && controlled_work >= controlled_cancel_at)
+        wl_evaluation_control_request_cancel(c);
+}
+static void
+controlled_point(wl_evaluation_control_t *c,
+    wl_columnar_memory_reservation_t *token, unsigned phase)
+{
+    (void)token;
+    if (phase != controlled_phase)
+        return;
+    controlled_hits++;
+    if (controlled_fault == 1)
+        wl_evaluation_control_request_cancel(c);
+    else if (controlled_fault == 2)
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_charge(c,
+            UINT64_MAX) == EOVERFLOW);
+}
+static wl_evaluation_control_t *
+controlled_begin(uint64_t limit)
+{
+    wl_evaluation_control_t *c = NULL;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_create(limit,
+        &c) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_attach(c,
+        &controlled_owner) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_begin(c,
+        &controlled_owner) == 0);
+    controlled_work = 0; controlled_hits = 0; controlled_cancel_at = 0;
+    return c;
+}
+static uint64_t
+controlled_end(wl_evaluation_control_t *c, int rc)
+{
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_finish(c,
+        &controlled_owner, rc > 0 ? rc : 0, 0) == rc);
+    wl_evaluation_control_report_t report;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_report(c,
+        &report) == 0 && report.result == rc);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_detach(c,
+        &controlled_owner) == 0);
+    wl_evaluation_control_release(c);
+    return report.consumed;
+}
+static void
+controlled_token_equal(wl_columnar_memory_reservation_t *token,
+    const wl_columnar_memory_reservation_t *prior)
+{
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(token->governor == prior->governor &&
+        token->bytes == prior->bytes
+        && token->replacement_bytes == prior->replacement_bytes
+        && token->transition_kind == prior->transition_kind
+        && atomic_load_explicit(&token->state,
+        memory_order_relaxed) == atomic_load_explicit(&prior->state,
+        memory_order_relaxed)
+        && atomic_load_explicit(&token->owner_bits,
+        memory_order_relaxed) == atomic_load_explicit(&prior->owner_bits,
+        memory_order_relaxed)
+        && token->identity == token);
+}
+static void
+controlled_governor(wl_columnar_memory_governor_t *g, uint64_t limit)
+{
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = limit, .usable_bytes = limit,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ADVISORY,
+    };
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_governor_init(g,
+        &resolution) == 0);
+}
+static void
+test_controlled_reserve_lifecycle(void)
+{
+    TEST("controlled fresh/released stop lifecycle and exact work");
+    wl_columnar_memory_governor_t g; controlled_governor(&g, 1024);
+    for (int released = 0; released < 2; released++) {
+        wl_columnar_memory_reservation_t token;
+        wl_columnar_memory_reservation_init(&token);
+        if (released) {
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                wl_columnar_memory_reserve_checked(&g, 17,
+                &token) == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_commit(&token,
+                &controlled_owner));
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_release(
+                    &token));
+        }
+        wl_columnar_memory_reservation_t prior = token; /* snapshot only, never an operation token */
+        const unsigned phases[] = {WL_COLUMNAR_MEMORY_GOVERNOR_VALIDATED,
+                                   WL_COLUMNAR_MEMORY_GOVERNOR_CLAIMED,
+                                   WL_COLUMNAR_MEMORY_GOVERNOR_SNAPSHOT,
+                                   WL_COLUMNAR_MEMORY_GOVERNOR_PREPARED,
+                                   WL_COLUMNAR_MEMORY_GOVERNOR_ADMITTED,
+                                   WL_COLUMNAR_MEMORY_GOVERNOR_RESERVED};
+        for (int fault = 1; fault <= 2; fault++)
+            for (unsigned i = 0; i < sizeof(phases) / sizeof(phases[0]); i++) {
+                controlled_phase = phases[i]; controlled_fault = fault;
+                wl_evaluation_control_t *c = controlled_begin(0);
+                wl_columnar_memory_admission_status_t status;
+                int rc =
+                    wl_columnar_memory_governor_reserve_checked_controlled(&g,
+                        31,
+                        &token, &status, c);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc ==
+                    (fault == 1 ? WL_EVALUATION_CONTROL_CANCELLED : EOVERFLOW));
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_hits == 1 &&
+                    wl_columnar_memory_reserved(&g) == 0);
+                controlled_token_equal(&token, &prior);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(c, rc) > 0);
+            }
+        controlled_phase = 0; controlled_fault = 0;
+        uint64_t cost = released ? 16 : 15;
+        wl_evaluation_control_t *c = controlled_begin(cost - 1);
+        wl_columnar_memory_admission_status_t status;
+        int rc = wl_columnar_memory_governor_reserve_checked_controlled(&g, 31,
+                &token, &status, c);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc ==
+            WL_EVALUATION_CONTROL_WORK_LIMIT);
+        controlled_token_equal(&token, &prior);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(&g) == 0);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(c, rc) == cost - 1);
+        c = controlled_begin(cost);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+            wl_columnar_memory_governor_reserve_checked_controlled(&g, 31,
+            &token, &status, c) == 0
+            && status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(c,
+            0) == cost && controlled_work == cost);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_rollback(&token));
+    }
+    PASS();
+}
+
+static wl_columnar_memory_reservation_t independent;
+static uint64_t competition_base;
+static unsigned competition_count;
+static bool competition_stop;
+static void
+controlled_before_total(wl_evaluation_control_t *c,
+    wl_columnar_memory_governor_t *g, uint64_t expected, bool overflow)
+{
+    (void)c; WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(!overflow);
+    uint64_t amount = expected == competition_base + 1 ? 2 : 1;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve_checked(g,
+        amount, &independent)
+        == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(g) !=
+        expected);
+}
+static void
+controlled_after_total(wl_evaluation_control_t *c,
+    wl_columnar_memory_governor_t *g, bool success, bool overflow)
+{
+    (void)g; WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(!success && !overflow);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_rollback(
+            &independent));
+    if (++competition_count == 300) {
+        wl_columnar_memory_governor_test_before_total_cas = NULL;
+        wl_columnar_memory_governor_test_after_total_cas = NULL;
+        if (competition_stop) wl_evaluation_control_request_cancel(c);
+    }
+}
+static void
+test_controlled_contention(void)
+{
+    TEST("controlled 300 genuine shared-credit CAS failures");
+    wl_columnar_memory_governor_t g; controlled_governor(&g, 1024);
+    wl_columnar_memory_reservation_t held, token;
+    wl_columnar_memory_reservation_init(&held);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(&g, 32,
+        &held)); competition_base = 32;
+    for (int stop = 0; stop < 2; stop++) {
+        wl_columnar_memory_reservation_init(&token);
+        wl_columnar_memory_reservation_init(&independent);
+        competition_count = 0; competition_stop = stop != 0;
+        wl_columnar_memory_governor_test_before_total_cas =
+            controlled_before_total;
+        wl_columnar_memory_governor_test_after_total_cas =
+            controlled_after_total;
+        wl_evaluation_control_t *c = controlled_begin(0);
+        wl_columnar_memory_admission_status_t status;
+        int rc = wl_columnar_memory_governor_reserve_checked_controlled(&g, 16,
+                &token, &status, c);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(competition_count == 300);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc ==
+            (stop ? WL_EVALUATION_CONTROL_CANCELLED : 0));
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(c,
+            rc) == (stop ? 313u : 316u));
+        if (!stop) WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                wl_columnar_memory_rollback(&token));
+        else WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(atomic_load_explicit(
+                    &token.state, memory_order_relaxed) ==
+                WL_COLUMNAR_MEMORY_RESERVATION_EMPTY);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(&g) ==
+            32);
+    }
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_rollback(&held));
+    PASS();
+}
+
+static void
+test_controlled_growth_and_commit(void)
+{
+    TEST("controlled full-footprint growth and physical-credit commit cutoff");
+    wl_columnar_memory_governor_t g; controlled_governor(&g, 1024);
+    wl_columnar_memory_reservation_t old, fresh;
+    wl_columnar_memory_reservation_init(&old);
+    wl_columnar_memory_reservation_init(&fresh);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(&g, 32, &old));
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_commit(&old, NULL));
+    wl_evaluation_control_t *c = controlled_begin(19);
+    wl_columnar_memory_admission_status_t status;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_governor_reserve_growth_controlled(&g, 32, 48,
+        &fresh, &status, c) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(status ==
+        WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY &&
+        wl_columnar_memory_reserved(&g) == 80);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(c, 0) == 19);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_rollback(&fresh));
+    for (int growth = 0; growth < 2; growth++) {
+        wl_columnar_memory_reservation_t *token = growth ? &old : &fresh;
+        if (!growth) WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                wl_columnar_memory_reserve(&g, 16, token));
+        const unsigned phases[] = {WL_COLUMNAR_MEMORY_GOVERNOR_COMMITTING,
+                                   WL_COLUMNAR_MEMORY_GOVERNOR_COMMIT_CUTOFF};
+        if (growth) {
+            wl_columnar_memory_reservation_t prior = old;
+            const unsigned admit_phases[] =
+            {WL_COLUMNAR_MEMORY_GOVERNOR_CLAIMED,
+             WL_COLUMNAR_MEMORY_GOVERNOR_SNAPSHOT,
+             WL_COLUMNAR_MEMORY_GOVERNOR_ADMITTED,
+             WL_COLUMNAR_MEMORY_GOVERNOR_RESERVED};
+            for (unsigned i = 0; i < 4; i++) {
+                controlled_phase = admit_phases[i]; controlled_fault = 1;
+                c = controlled_begin(0);
+                int rc =
+                    wl_columnar_memory_governor_begin_growth_controlled(&old,
+                        16, &status, c);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc ==
+                    WL_EVALUATION_CONTROL_CANCELLED && controlled_hits == 1);
+                controlled_token_equal(&old, &prior);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(
+                        &g) == 32);
+                controlled_end(c, rc);
+            }
+            controlled_phase = 0; controlled_fault = 0;
+            c = controlled_begin(15);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                wl_columnar_memory_governor_begin_growth_controlled(&old, 16,
+                &status, c) == 0);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(c, 0) == 15);
+        }
+        void *physical = malloc(16);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(physical); memset(physical, 0x5a, 16);
+        wl_columnar_memory_reservation_t prior = *token;
+        uint64_t credit = wl_columnar_memory_reserved(&g);
+        for (unsigned i = 0; i < 2; i++) {
+            controlled_phase = phases[i]; controlled_fault = 1;
+            c = controlled_begin(0); bool committed;
+            int rc =
+                growth ?
+                wl_columnar_memory_governor_commit_growth_controlled(token,
+                    &committed, c)
+                : wl_columnar_memory_governor_commit_controlled(token, NULL,
+                    &committed, c);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc ==
+                WL_EVALUATION_CONTROL_CANCELLED && controlled_hits == 1);
+            controlled_token_equal(token, &prior);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(((unsigned char *)physical)[0] ==
+                0x5a && wl_columnar_memory_reserved(&g) == credit);
+            controlled_end(c, rc);
+        }
+        controlled_phase = 0; controlled_fault = 0;
+        c = controlled_begin(growth ? 9 : 4); bool committed;
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK((growth ?
+            wl_columnar_memory_governor_commit_growth_controlled(token,
+            &committed, c)
+            : wl_columnar_memory_governor_commit_controlled(token, NULL,
+            &committed, c)) == 0 && committed);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(c,
+            0) == (growth ? 9 : 4));
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(atomic_load_explicit(
+                &token->owner_bits, memory_order_relaxed) == 0);                                                /* real ownerNULL compatibility */
+        free(physical);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_release(token));
+    }
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(&g) == 0);
+    PASS();
+}
+
+static void
+test_controlled_verdict_precedence(void)
+{
+    TEST(
+        "controlled typed verdicts retain negative stop, positive accounting overrides");
+    for (unsigned which = 0; which < 5; which++)
+        for (int fault = 1; fault <= 2; fault++) {
+            wl_columnar_memory_governor_t g;
+            controlled_governor(&g, which == 1 ? UINT64_MAX : 64);
+            wl_columnar_memory_reservation_t held, token;
+            wl_columnar_memory_reservation_init(&held);
+            wl_columnar_memory_reservation_init(&token);
+            uint64_t held_bytes = which == 1 ? UINT64_MAX - 1 : 64;
+            if (which < 2)
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(&g,
+                    held_bytes, &held));
+            if (which == 2) {
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(&g,
+                    16, &token));
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_commit(
+                        &token, NULL));
+            }
+            wl_columnar_memory_reservation_t prior = token;
+            uint64_t credit = wl_columnar_memory_reserved(&g);
+            controlled_phase = WL_COLUMNAR_MEMORY_GOVERNOR_VERDICT;
+            controlled_fault = fault;
+            wl_evaluation_control_t *c = controlled_begin(0);
+            wl_columnar_memory_admission_status_t status;
+            bool committed = true;
+            int rc;
+            if (which < 3)
+                rc = wl_columnar_memory_governor_reserve_checked_controlled(&g,
+                        which == 1 ? 2 : 16, &token, &status, c);
+            else if (which == 3)
+                rc = wl_columnar_memory_governor_begin_growth_controlled(&token,
+                        16, &status, c);
+            else
+                rc = wl_columnar_memory_governor_commit_controlled(&token, NULL,
+                        &committed, c);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_hits == 1);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(&g) ==
+                credit);
+            if (fault == 2) {
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc == EOVERFLOW);
+                controlled_token_equal(&token, &prior);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(c, rc) > 0);
+            } else {
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc == 0);
+                if (which < 2) {
+                    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(status ==
+                        (which == 0 ? WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                        : WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW));
+                    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(token.governor == &g &&
+                        token.bytes == (which == 1 ? 2u : 16u)
+                        && atomic_load_explicit(&token.state,
+                        memory_order_relaxed) ==
+                        WL_COLUMNAR_MEMORY_RESERVATION_RELEASED);
+                } else {
+                    if (which ==
+                        4) WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(!committed);
+                    else WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(status ==
+                            WL_COLUMNAR_MEMORY_ADMISSION_INVALID);
+                    controlled_token_equal(&token, &prior);
+                }
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(c,
+                    WL_EVALUATION_CONTROL_CANCELLED) > 0);
+            }
+            if (which <
+                2) WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                    wl_columnar_memory_rollback(&held));
+            if (which ==
+                2) WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_release(
+                        &token));
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(&g) ==
+                0);
+        }
+    controlled_phase = 0; controlled_fault = 0;
+    PASS();
+}
+
+static unsigned overflow_attempts;
+static void
+controlled_overflow_retry(wl_evaluation_control_t *c,
+    wl_columnar_memory_governor_t *g, uint64_t expected, bool overflow)
+{
+    (void)c;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(overflow && expected == UINT64_MAX - 1);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_rollback(
+            &independent));
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(g) == 0);
+}
+static void
+controlled_overflow_after(wl_evaluation_control_t *c,
+    wl_columnar_memory_governor_t *g, bool success, bool overflow)
+{
+    (void)c; (void)g;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(!success && overflow);
+    overflow_attempts++;
+    wl_columnar_memory_governor_test_before_total_cas = NULL;
+    wl_columnar_memory_governor_test_after_total_cas = NULL;
+}
+static void
+test_controlled_overflow_retry_and_boundaries(void)
+{
+    TEST("controlled real overflow CAS retry and retained exact cutoffs");
+    controlled_phase = 0; controlled_fault = 0;
+    wl_columnar_memory_governor_t g; controlled_governor(&g, UINT64_MAX);
+    wl_columnar_memory_reservation_t token;
+    wl_columnar_memory_reservation_init(&token);
+    wl_columnar_memory_reservation_init(&independent);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(&g,
+        UINT64_MAX - 1, &independent));
+    wl_columnar_memory_governor_test_before_total_cas =
+        controlled_overflow_retry;
+    wl_columnar_memory_governor_test_after_total_cas =
+        controlled_overflow_after;
+    overflow_attempts = 0;
+    wl_evaluation_control_t *c = controlled_begin(16);
+    wl_columnar_memory_admission_status_t status;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_governor_reserve_checked_controlled(
+            &g, 2, &token, &status, c) == 0 && overflow_attempts == 1);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(status ==
+        WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(c, 0) == 16);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_rollback(&token));
+    for (int growth = 0; growth < 2; growth++) {
+        wl_columnar_memory_reservation_init(&token);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(&g, 16,
+            &token));
+        if (growth) {
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_commit(&token,
+                NULL));
+            wl_columnar_memory_reservation_t prior = token;
+            c = controlled_begin(14);
+            int rc = wl_columnar_memory_governor_begin_growth_controlled(&token,
+                    16, &status, c);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc ==
+                WL_EVALUATION_CONTROL_WORK_LIMIT);
+            controlled_token_equal(&token, &prior);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(&g) ==
+                16);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(c, rc) == 12);
+            c = controlled_begin(15);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                wl_columnar_memory_governor_begin_growth_controlled(
+                    &token, 16, &status, c) == 0);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(c, 0) == 15);
+        }
+        wl_columnar_memory_reservation_t prior = token;
+        void *physical = malloc(16);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(physical);
+        memset(physical, 0x6b, 16);
+        uint64_t credit = wl_columnar_memory_reserved(&g);
+        uint64_t cost = growth ? 9 : 4;
+        c = controlled_begin(cost - 1); bool committed;
+        int rc =
+            growth ?
+            wl_columnar_memory_governor_commit_growth_controlled(&token,
+                &committed, c)
+            : wl_columnar_memory_governor_commit_controlled(&token, NULL,
+                &committed, c);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc ==
+            WL_EVALUATION_CONTROL_WORK_LIMIT);
+        controlled_token_equal(&token, &prior);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(&g) ==
+            credit
+            && ((unsigned char *)physical)[0] == 0x6b);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(c,
+            rc) == (growth ? 5u : 2u));
+        /* Stopped commit backs a live unpublished image until its actual free. */
+        free(physical);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(growth ?
+            wl_columnar_memory_rollback_growth(&token)
+            : wl_columnar_memory_rollback(&token));
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(&g) ==
+            (growth ? 16u : 0u));
+        if (growth) WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                wl_columnar_memory_release(&token));
+    }
+    PASS();
+}
+
+static void
+test_controlled_all_region_boundaries(void)
+{
+    TEST(
+        "every controlled region refusal and tail preserves original authority");
+    const uint64_t regions[5][7] = {
+        {3, 1, 5, 4, 1, 1, 0}, {3, 1, 1, 5, 4, 1, 1},
+        {2, 1, 5, 3, 1, 3, 0}, {1, 1, 2, 0, 0, 0, 0},
+        {1, 1, 3, 4, 0, 0, 0},
+    };
+    const uint64_t totals[] = {15, 16, 15, 4, 9};
+    controlled_phase = 0; controlled_fault = 0;
+    for (unsigned kind = 0; kind < 5; kind++) {
+        for (unsigned cancel = 0; cancel < 2; cancel++) {
+            for (uint64_t boundary = 0; boundary <= totals[kind]; boundary++) {
+                uint64_t prefix = 0;
+                bool endpoint = boundary == 0;
+                for (unsigned i = 0; i < 7 && regions[kind][i]; i++) {
+                    if (prefix + regions[kind][i] > boundary)
+                        break;
+                    prefix += regions[kind][i];
+                    endpoint = prefix == boundary;
+                }
+                if ((!cancel && (boundary == 0 || boundary == totals[kind])) ||
+                    (cancel && !endpoint))
+                    continue;
+                wl_columnar_memory_governor_t g;
+                controlled_governor(&g, 128);
+                wl_columnar_memory_reservation_t token, held;
+                wl_columnar_memory_reservation_init(&token);
+                wl_columnar_memory_reservation_init(&held);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(&g,
+                    7, &held));
+                if (kind) {
+                    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                        wl_columnar_memory_reserve(&g, 16, &token));
+                    if (kind != 3)
+                        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                            wl_columnar_memory_commit(&token,
+                            &controlled_owner));
+                    if (kind == 1)
+                        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                            wl_columnar_memory_release(&token));
+                    if (kind == 4)
+                        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                            wl_columnar_memory_begin_growth(&token,
+                            8) == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY);
+                }
+                wl_columnar_memory_reservation_t prior = token;
+                uint64_t credit = wl_columnar_memory_reserved(&g);
+                wl_evaluation_control_t *c =
+                    controlled_begin(cancel ? 0 : boundary);
+                if (cancel) {
+                    if (boundary == 0)
+                        wl_evaluation_control_request_cancel(c);
+                    else
+                        controlled_cancel_at = boundary;
+                }
+                wl_columnar_memory_admission_status_t status;
+                bool committed = false;
+                int rc;
+                if (kind < 2)
+                    rc =
+                        wl_columnar_memory_governor_reserve_checked_controlled(
+                        &g, 16, &token, &status, c);
+                else if (kind == 2)
+                    rc =
+                        wl_columnar_memory_governor_begin_growth_controlled(
+                        &token, 8, &status, c);
+                else if (kind == 3)
+                    rc = wl_columnar_memory_governor_commit_controlled(&token,
+                            NULL, &committed, c);
+                else
+                    rc =
+                        wl_columnar_memory_governor_commit_growth_controlled(
+                        &token, &committed, c);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc ==
+                    (cancel ? WL_EVALUATION_CONTROL_CANCELLED :
+                    WL_EVALUATION_CONTROL_WORK_LIMIT));
+                controlled_token_equal(&token, &prior);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(
+                        &g) == credit);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(c,
+                    rc) == prefix && controlled_work == prefix);
+                if (kind == 4)
+                    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                        wl_columnar_memory_rollback_growth(&token));
+                if (kind == 2 || kind == 4)
+                    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                        wl_columnar_memory_release(&token));
+                if (kind == 3)
+                    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                        wl_columnar_memory_rollback(&token));
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(
+                        &g) == 7);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_rollback(
+                        &held));
+            }
+        }
+    }
+    PASS();
+}
+
+static void
+test_controlled_raw_admission_twins(void)
+{
+    TEST(
+        "controlled/raw reserve twins retain typed state and advisory semantics");
+    const uint64_t requests[] = {0, 0, 8, 65, UINT64_MAX};
+    const uint64_t old_bytes[] = {8, 0, 8, 8, 8};
+    for (unsigned delegate = 0; delegate < 2; delegate++)
+        for (unsigned enforcing = 0; enforcing < 2; enforcing++)
+            for (unsigned released = 0; released < 2; released++)
+                for (unsigned growth = 0; growth < 2; growth++)
+                    for (unsigned request = 0; request < 5; request++) {
+                        wl_columnar_memory_governor_t g[2];
+                        wl_columnar_memory_reservation_t token[2], held[2];
+                        for (unsigned i = 0; i < 2; i++) {
+                            controlled_governor(&g[i], 64);
+                            if (enforcing)
+                                g[i].mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+                            wl_columnar_memory_reservation_init(&token[i]);
+                            wl_columnar_memory_reservation_init(&held[i]);
+                            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                                wl_columnar_memory_reserve(&g[i], 16,
+                                &held[i]));
+                            if (released) {
+                                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                                    wl_columnar_memory_reserve(&g[i], 7,
+                                    &token[i]));
+                                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                                    wl_columnar_memory_rollback(&token[i]));
+                            }
+                        }
+                        controlled_phase = 0; controlled_fault = 0;
+                        wl_evaluation_control_t *c =
+                            delegate ? NULL : controlled_begin(0);
+                        wl_columnar_memory_admission_status_t raw = growth
+                        ? wl_columnar_memory_reserve_growth(&g[0],
+                                old_bytes[request], requests[request],
+                                &token[0])
+                        : wl_columnar_memory_reserve_checked(&g[0],
+                                requests[request], &token[0]);
+                        wl_columnar_memory_admission_status_t actual;
+                        int rc = growth
+                        ? wl_columnar_memory_governor_reserve_growth_controlled(
+                            &g[1], old_bytes[request], requests[request],
+                            &token[1], &actual, c)
+                        : wl_columnar_memory_governor_reserve_checked_controlled
+                                (&g[1], requests[request], &token[1], &actual,
+                                c);
+                        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc == 0 &&
+                            actual == raw);
+                        if (c) controlled_end(c, 0);
+                        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(token[0].bytes ==
+                            token[1].bytes &&
+                            token[0].replacement_bytes ==
+                            token[1].replacement_bytes &&
+                            token[0].transition_kind ==
+                            token[1].transition_kind);
+                        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK((token[0].governor ==
+                            NULL) == (token[1].governor == NULL));
+                        for (unsigned i = 0; i < 2; i++)
+                            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                                token[i].identity == &token[i]);
+                        uint64_t state = atomic_load_explicit(&token[0].state,
+                                memory_order_relaxed);
+                        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(state ==
+                            atomic_load_explicit(&token[1].state,
+                            memory_order_relaxed));
+                        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(atomic_load_explicit(
+                                &token[0].owner_bits, memory_order_relaxed) ==
+                            atomic_load_explicit(&token[1].owner_bits,
+                            memory_order_relaxed));
+                        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                            wl_columnar_memory_reserved(&g[0]) ==
+                            wl_columnar_memory_reserved(&g[1]));
+                        for (unsigned i = 0; i < 2; i++) {
+                            if (state ==
+                                WL_COLUMNAR_MEMORY_RESERVATION_RESERVED)
+                                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                                    wl_columnar_memory_rollback(&token[i]));
+                            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                                wl_columnar_memory_rollback(&held[i]));
+                            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                                wl_columnar_memory_reserved(&g[i]) == 0);
+                        }
+                    }
+    PASS();
+}
+
+static void
+test_controlled_copied_authority(void)
+{
+    TEST("copied token and missing output never acquire authority");
+    wl_columnar_memory_governor_t g;
+    controlled_governor(&g, 64);
+    wl_columnar_memory_reservation_t token;
+    wl_columnar_memory_reservation_init(&token);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(&g, 16,
+        &token));
+    wl_columnar_memory_reservation_t copy = token;
+    controlled_phase = 0; controlled_fault = 0;
+    for (unsigned kind = 0; kind < 5; kind++) {
+        wl_evaluation_control_t *c = controlled_begin(0);
+        wl_columnar_memory_admission_status_t status;
+        bool committed = true;
+        int rc;
+        if (kind == 0)
+            rc = wl_columnar_memory_governor_reserve_checked_controlled(&g, 8,
+                    &copy, &status, c);
+        else if (kind == 1)
+            rc = wl_columnar_memory_governor_reserve_growth_controlled(&g, 0, 8,
+                    &copy, &status, c);
+        else if (kind == 2)
+            rc = wl_columnar_memory_governor_begin_growth_controlled(&copy, 8,
+                    &status, c);
+        else if (kind == 3)
+            rc = wl_columnar_memory_governor_commit_controlled(&copy, NULL,
+                    &committed, c);
+        else
+            rc = wl_columnar_memory_governor_commit_growth_controlled(&copy,
+                    &committed, c);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc == 0);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(kind < 3 ? status ==
+            WL_COLUMNAR_MEMORY_ADMISSION_INVALID : !committed);
+        const uint64_t costs[] = {3, 4, 2, 1, 1};
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(c, 0) == costs[kind]);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(copy.identity == &token &&
+            copy.bytes == 16 &&
+            atomic_load_explicit(&copy.state,
+            memory_order_relaxed) == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(&g) ==
+            16);
+    }
+    wl_evaluation_control_t *c = controlled_begin(0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_governor_reserve_checked_controlled(&g, 8, &copy,
+        NULL, c) == EINVAL);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(c, EINVAL) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_rollback(&token));
+    PASS();
+}
+
 int
 main(void)
 {
@@ -927,6 +1661,20 @@ main(void)
     test_replacement_reservation();
     test_growth_reservation();
     test_growth_races();
+    wl_columnar_memory_governor_test_work_checkpoint = controlled_work_point;
+    wl_columnar_memory_governor_test_checkpoint = controlled_point;
+    test_controlled_reserve_lifecycle();
+    test_controlled_contention();
+    test_controlled_growth_and_commit();
+    test_controlled_verdict_precedence();
+    test_controlled_overflow_retry_and_boundaries();
+    test_controlled_all_region_boundaries();
+    test_controlled_raw_admission_twins();
+    test_controlled_copied_authority();
+    wl_columnar_memory_governor_test_work_checkpoint = NULL;
+    wl_columnar_memory_governor_test_checkpoint = NULL;
+    wl_columnar_memory_governor_test_before_total_cas = NULL;
+    wl_columnar_memory_governor_test_after_total_cas = NULL;
     printf("\nPassed %d/%d; Failed %d\n",
         tests_run - tests_failed, tests_run, tests_failed);
     return tests_failed == 0 ? 0 : 1;
