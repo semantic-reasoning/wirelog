@@ -5,6 +5,7 @@
 #include "../wirelog/passes/jpp.h"
 #include "../wirelog/passes/sip.h"
 #include "../wirelog/wirelog.h"
+#include <stdarg.h>
 #include <stdio.h>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, \
                                       __LINE__, #x); exit(1); } } while (0)
@@ -456,18 +457,33 @@ static void right_filter_result(const eval_stack_t *stack, bool anti,
         CHECK(out->columns[1][0] == (mode >= 3 && anti ? 9 : 7));
     }
 }
+static void wl_membership_append(char *text, size_t capacity, size_t *at,
+    const char *format, ...)
+{
+    CHECK(*at < capacity);
+    size_t remaining = capacity - *at;
+    va_list args;
+    va_start(args, format);
+    int written = vsnprintf(text + *at, remaining, format, args);
+    va_end(args);
+    CHECK(written >= 0);
+    CHECK((size_t)written < remaining);
+    *at += (size_t)written;
+}
+
 static void right_filter(bool anti, uint32_t width, unsigned mode, bool stop)
 {
-    char text[4096]; size_t at = snprintf(text, sizeof(text),
-            ".decl A(k:int64,v:int64)\n.decl B(");
+    char text[4096]; size_t at = 0;
+    wl_membership_append(text, sizeof(text), &at,
+        ".decl A(k:int64,v:int64)\n.decl B(");
     for (uint32_t i = 0; i < width; i++)
-        at += snprintf(text + at, sizeof(text) - at, "%sb%u:int64",
-                i ? "," : "", i);
-    at += snprintf(text + at, sizeof(text) - at,
-            ")\n.decl H(v:int64)\nH(v):-A(k,v),B(");
+        wl_membership_append(text, sizeof(text), &at, "%sb%u:int64",
+            i ? "," : "", i);
+    wl_membership_append(text, sizeof(text), &at,
+        ")\n.decl H(v:int64)\nH(v):-A(k,v),B(");
     for (uint32_t i = 0; i < width; i++)
-        at += snprintf(text + at, sizeof(text) - at, "%sx%u", i ? "," : "", i);
-    at += snprintf(text + at, sizeof(text) - at, ").\n");
+        wl_membership_append(text, sizeof(text), &at, "%sx%u", i ? "," : "", i);
+    wl_membership_append(text, sizeof(text), &at, ").\n");
     CHECK(at < sizeof(text));
     wirelog_error_t error;
     wirelog_program_t *program = wirelog_parse_string(text, &error);
