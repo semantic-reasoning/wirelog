@@ -729,6 +729,26 @@ These operations are excluded from the production library.
 
 The complete source audit now contains **228 atomic call sites**.
 
+### 5.22 `wirelog/columnar/eval_tdd_insert.c` — insertion round counter (4 rows)
+
+Issue #2122: the tasks of one insertion round take the round's runs from a
+shared counter and stop early once any task has failed.  Apart from shared
+state that synchronises itself -- such as the reader gates of the inputs,
+the intern table, the memory governor, the relation identity counter and
+the mutation-set counter -- a run writes only its own clone and its own
+output bags.  The coordinator reads those after `wl_workqueue_wait_all()`
+or `wl_workqueue_drain()`, which order the tasks' writes before the
+coordinator's reads.
+
+| Anchor (file:function[#N]) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `eval_tdd_insert.c:insert_task_fn` | `round->stop` | `atomic_load_explicit` | acquire | Stop taking runs once another task of the round has failed; a run already taken still finishes |
+| `eval_tdd_insert.c:insert_task_fn#2` | `round->next` | `atomic_fetch_add_explicit` | relaxed | Take the next run index; each index goes to exactly one task, and the runs themselves are published by the workqueue barrier |
+| `eval_tdd_insert.c:insert_task_fn#3` | `round->stop` | `atomic_store_explicit` | release | Tell the other tasks to stop after this task's run failed; the failure code itself is read after the barrier |
+| `eval_tdd_insert.c:wl_columnar_eval_tdd_insert_stratum` | `round.stop` | `atomic_store_explicit` | release | Stop the tasks already submitted when a later submit fails, before the coordinator drains the queue |
+
+The complete source audit now contains **232 atomic call sites**.
+
 ---
 
 ## 6. Lock-free SPSC delta queue

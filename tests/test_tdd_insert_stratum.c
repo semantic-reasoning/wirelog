@@ -19,9 +19,19 @@
  * Each case evaluates a program over its old rows, appends the new ones,
  * runs the stratum, and requires the heads to equal a fresh evaluation over
  * old and new rows together, and the returned head deltas to be exactly the
- * rows that evaluation adds -- in sessions created with one worker and with
- * four.
+ * rows that evaluation adds -- in sessions created with one, four and eight
+ * workers.
+ *
+ * Issue #2122: a session with more than one worker runs a round's instances
+ * on that many clones at once, each instance split into ranges of its
+ * leading input.  The cases below that set WIRELOG_TDD_MIN_ROWS_PER_WORKER=1
+ * make the small inputs here split, and check through test hooks that a
+ * round really ran on two clones at the same time.
  */
+
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L /* setenv */
+#endif
 
 #include "../wirelog/backend.h"
 #include "../wirelog/columnar/internal.h"
@@ -35,6 +45,28 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+
+#ifdef _WIN32
+static int
+wl_test_setenv_(const char *name, const char *value, int overwrite)
+{
+    (void)overwrite;
+    return _putenv_s(name, value ? value : "");
+}
+
+static int
+wl_test_unsetenv_(const char *name)
+{
+    return _putenv_s(name, "");
+}
+
+#  define setenv wl_test_setenv_
+#  define unsetenv wl_test_unsetenv_
+#endif
+
+extern int (*wl_columnar_eval_test_bound_slice_after_eval)(
+    wl_columnar_eval_tdd_run_t *);
 
 static int tests_run = 0;
 static int tests_passed = 0;
@@ -84,6 +116,9 @@ noop_tuple(const char *relation, const int64_t *row, uint32_t ncols,
     (void)user_data;
 }
 
+/* Issue #2122: extensions every session opened below holds, or NULL. */
+static wirelog_extension_snapshot_t *case_extensions;
+
 static int
 open_session(const char *src, uint32_t workers, wl_plan_t **plan,
     wl_session_t **sess)
@@ -98,7 +133,8 @@ open_session(const char *src, uint32_t workers, wl_plan_t **plan,
     plan_fixture_hold(prog);
     if (wl_plan_from_program(prog, plan) != 0)
         return -1;
-    return wl_session_create(wl_backend_columnar(), *plan, workers, sess);
+    return wl_session_create_with_snapshot(wl_backend_columnar(), *plan,
+               workers, case_extensions, sess);
 }
 
 static int
@@ -202,6 +238,10 @@ find_relation(const wl_plan_t *plan, const char *name, uint32_t *si_out,
  * clone that does not inherit them: each one makes the bound runner refuse. */
 static bool flags_on_coordinator;
 
+/* When non-zero, the stratum call must fail with exactly this code; the
+ * heads are then not compared. */
+static int expect_rc;
+
 static const char *
 run_case(const case_t *c, uint32_t workers)
 {
@@ -296,6 +336,14 @@ run_case(const case_t *c, uint32_t workers)
                 why = "the coordinator's own flags were changed";
                 goto done;
             }
+        }
+        if (expect_rc) {
+            if (rc != expect_rc) {
+                snprintf(message, sizeof(message),
+                    "insert_stratum rc %d, want %d", rc, expect_rc);
+                why = message;
+            }
+            goto done;
         }
         if (rc != 0) {
             snprintf(message, sizeof(message), "insert_stratum rc %d", rc);
@@ -535,10 +583,180 @@ done:
     return why;
 }
 
+/* Issue #2122: what the executor reported about its rounds. */
+static uint32_t max_tasks;
+static bool split_seen;
+static wl_atomic_u64 arrivals;
+static wl_atomic_u64 rendezvous_timeouts;
+static wl_atomic_u64 rendezvous_met;
+static wl_atomic_u64 runs_seen;
+static uint64_t fail_on_run;
+static int fail_with;
+
+static void
+record_round(const wl_plan_stratum_t *sp, uint32_t units, uint32_t pieces,
+    uint32_t tasks)
+{
+    (void)sp;
+    if (tasks > max_tasks)
+        max_tasks = tasks;
+    if (pieces > units)
+        split_seen = true;
+    atomic_store_explicit(&arrivals, 0, memory_order_relaxed);
+}
+
+/* The first piece each task of a round with two or more tasks runs waits,
+ * up to five seconds, until a second task has reached its own first piece:
+ * then two tasks are inside the round at once. */
+static void
+rendezvous(uint32_t task, uint32_t tasks, bool first_piece)
+{
+    (void)task;
+    if (tasks < 2 || !first_piece)
+        return;
+    atomic_fetch_add_explicit(&arrivals, 1, memory_order_relaxed);
+    time_t start = time(NULL);
+    while (atomic_load_explicit(&arrivals, memory_order_relaxed) < 2) {
+        if (time(NULL) - start > 5) {
+            atomic_fetch_add_explicit(&rendezvous_timeouts, 1,
+                memory_order_relaxed);
+            return;
+        }
+    }
+    atomic_fetch_add_explicit(&rendezvous_met, 1, memory_order_relaxed);
+}
+
+static int
+fail_nth_run(wl_columnar_eval_tdd_run_t *run)
+{
+    (void)run;
+    uint64_t n = atomic_fetch_add_explicit(&runs_seen, 1,
+            memory_order_relaxed) + 1;
+    return n == fail_on_run ? fail_with : 0;
+}
+
+static void
+reset_round_records(void)
+{
+    max_tasks = 0;
+    split_seen = false;
+    atomic_store_explicit(&arrivals, 0, memory_order_relaxed);
+    atomic_store_explicit(&rendezvous_timeouts, 0, memory_order_relaxed);
+    atomic_store_explicit(&rendezvous_met, 0, memory_order_relaxed);
+}
+
+/* With one row per worker, every case splits its leading inputs; a session
+ * with four or eight workers runs its rounds on that many clones at once,
+ * and one with a single worker runs them on one. */
+static const char *
+rounds_use_workers(const case_t *c, uint32_t workers)
+{
+    const char *why;
+    reset_round_records();
+    wl_columnar_eval_tdd_insert_test_round = record_round;
+    wl_columnar_eval_tdd_insert_test_piece_start = rendezvous;
+    why = run_case(c, workers);
+    wl_columnar_eval_tdd_insert_test_round = NULL;
+    wl_columnar_eval_tdd_insert_test_piece_start = NULL;
+    if (why)
+        return why;
+    if (atomic_load_explicit(&rendezvous_timeouts, memory_order_relaxed))
+        return "a task waited five seconds for a second one";
+    if (workers == 1)
+        return max_tasks == 1 ? NULL : "one worker ran more than one task";
+    if (max_tasks < 2 || max_tasks > workers) {
+        snprintf(message, sizeof(message), "%u tasks with %u workers",
+            max_tasks, workers);
+        return message;
+    }
+    if (!split_seen)
+        return "no instance was split into ranges";
+    if (!atomic_load_explicit(&rendezvous_met, memory_order_relaxed))
+        return "no two tasks ran at once";
+    return NULL;
+}
+
+/* A failure in one run fails the stratum with that code, whichever clone
+ * met it, and every clone is torn down. */
+static const char *
+failure_propagates(const case_t *c, uint32_t workers, int code)
+{
+    const char *why;
+    atomic_store_explicit(&runs_seen, 0, memory_order_relaxed);
+    fail_on_run = 3;
+    fail_with = code;
+    wl_columnar_eval_test_bound_slice_after_eval = fail_nth_run;
+    expect_rc = code;
+    why = run_case(c, workers);
+    expect_rc = 0;
+    wl_columnar_eval_test_bound_slice_after_eval = NULL;
+    if (!why && atomic_load_explicit(&runs_seen, memory_order_relaxed) < 3)
+        return "fewer than three runs";
+    return why;
+}
+
+static int
+identity_call(const wirelog_extension_value_t *args, uint32_t nargs,
+    wirelog_extension_value_t *result, void *user_data)
+{
+    (void)nargs;
+    (void)user_data;
+    *result = args[0];
+    return 0;
+}
+
+/* A session whose extensions include a callback not declared thread-safe
+ * runs every round on one clone; one whose callbacks all are runs them on
+ * several.  The programs here call no extension: the choice is made from
+ * what the session holds. */
+static const char *
+rounds_follow_callback_policy(uint32_t policy, uint32_t workers)
+{
+    uint32_t types[] = { WIRELOG_EXTENSION_VALUE_INT64 };
+    wirelog_extension_descriptor_t descriptor = {
+        WIRELOG_EXTENSION_ABI_VERSION, sizeof(descriptor), "test.identity",
+        1, types, WIRELOG_EXTENSION_VALUE_INT64, identity_call, NULL, NULL
+    };
+    descriptor.callback_policy = policy;
+    const char *why = NULL;
+    wirelog_extension_registry_t *registry
+        = wirelog_extension_registry_create();
+    if (!registry)
+        return "registry_create";
+    if (wirelog_extension_register(registry, &descriptor) != 0) {
+        wirelog_extension_registry_destroy(registry);
+        return "register";
+    }
+    case_extensions = wirelog_extension_snapshot_acquire(registry);
+    if (!case_extensions)
+        why = "snapshot_acquire";
+    else
+        why = rounds_use_workers(&CASES[5],
+                policy & WIRELOG_EXTENSION_CALLBACK_THREAD_SAFE ? workers : 1);
+    /* rounds_use_workers checked the tasks against the workers it was
+     * given; a refused policy must also leave a session with @workers
+     * workers on one task. */
+    if (!why && !(policy & WIRELOG_EXTENSION_CALLBACK_THREAD_SAFE)) {
+        reset_round_records();
+        wl_columnar_eval_tdd_insert_test_round = record_round;
+        why = run_case(&CASES[5], workers);
+        wl_columnar_eval_tdd_insert_test_round = NULL;
+        if (!why && max_tasks != 1)
+            why = "a callback not declared thread-safe ran on two tasks";
+    }
+    if (case_extensions)
+        wirelog_extension_snapshot_release(case_extensions);
+    case_extensions = NULL;
+    if (wirelog_extension_unregister(registry, "test.identity") != 0
+        || wirelog_extension_registry_destroy(registry) != 0)
+        why = why ? why : "registry teardown";
+    return why;
+}
+
 int
 main(void)
 {
-    static const uint32_t workers[] = { 1, 4 };
+    static const uint32_t workers[] = { 1, 4, 8 };
 
     printf("test_tdd_insert_stratum (Issue #2114)\n");
     for (uint32_t w = 0; w < sizeof(workers) / sizeof(workers[0]); w++) {
@@ -593,6 +811,69 @@ main(void)
             printf(" ... PASS\n");
         }
     }
+    /* Issue #2122: the rounds of a session with several workers. */
+    if (setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1", 1) != 0) {
+        printf("setenv failed\n");
+        return 1;
+    }
+    for (uint32_t w = 0; w < sizeof(workers) / sizeof(workers[0]); w++) {
+        for (uint32_t i = 0; i < sizeof(CASES) / sizeof(CASES[0]); i++) {
+            const char *why;
+            tests_run++;
+            printf("  [%d] %s, split rounds (%u worker%s)", tests_run,
+                CASES[i].name, workers[w], workers[w] == 1 ? "" : "s");
+            why = rounds_use_workers(&CASES[i], workers[w]);
+            if (why) {
+                FAIL(why);
+                continue;
+            }
+            tests_passed++;
+            printf(" ... PASS\n");
+        }
+        flags_on_coordinator = true;
+        tests_run++;
+        printf("  [%d] split rounds, coordinator flags set (%u worker%s)",
+            tests_run, workers[w], workers[w] == 1 ? "" : "s");
+        const char *why = rounds_use_workers(&CASES[5], workers[w]);
+        flags_on_coordinator = false;
+        if (why) {
+            FAIL(why);
+        } else {
+            tests_passed++;
+            printf(" ... PASS\n");
+        }
+        static const uint32_t policies[] = {
+            0, WIRELOG_EXTENSION_CALLBACK_THREAD_SAFE
+        };
+        for (uint32_t k = 0; k < 2; k++) {
+            tests_run++;
+            printf("  [%d] an extension %sdeclared thread-safe "
+                "(%u worker%s)", tests_run, policies[k] ? "" : "not ",
+                workers[w], workers[w] == 1 ? "" : "s");
+            why = rounds_follow_callback_policy(policies[k], workers[w]);
+            if (why) {
+                FAIL(why);
+            } else {
+                tests_passed++;
+                printf(" ... PASS\n");
+            }
+        }
+        static const int codes[] = { EIO, ENOMEM };
+        for (uint32_t k = 0; k < 2; k++) {
+            tests_run++;
+            printf("  [%d] a run failing with %s fails the stratum "
+                "(%u worker%s)", tests_run, codes[k] == EIO ? "EIO"
+                : "ENOMEM", workers[w], workers[w] == 1 ? "" : "s");
+            why = failure_propagates(&CASES[5], workers[w], codes[k]);
+            if (why) {
+                FAIL(why);
+            } else {
+                tests_passed++;
+                printf(" ... PASS\n");
+            }
+        }
+    }
+    unsetenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER");
     printf("%d run, %d passed, %d failed\n", tests_run, tests_passed,
         tests_failed);
     return tests_failed ? 1 : 0;

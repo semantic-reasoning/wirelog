@@ -722,6 +722,253 @@ done:
     fixture_close(&f);
 }
 
+/* Issue #2122: rows [@begin, @end) of @src, as a private relation with
+ * @src's name and schema: one range of an instance's leading input. */
+static col_rel_t *
+range_of(const col_rel_t *src, uint32_t begin, uint32_t end)
+{
+    col_rel_t *copy = NULL;
+    if (col_rel_deep_copy(src, &copy, NULL) != 0 || !copy)
+        return NULL;
+    copy->nrows = 0;
+    copy->base_nrows = 0;
+    copy->sorted_nrows = 0;
+    for (uint32_t r = begin; r < end; r++) {
+        if (col_rel_append_row(copy, col_rel_row(src, r)) != 0) {
+            col_rel_destroy(copy);
+            return NULL;
+        }
+    }
+    return copy;
+}
+
+/* When set, the leading input carries this partition instead of the
+ * run's own. */
+static const void *range_input_partition;
+/* When set, every other input claims range 1 of 2, with no partition. */
+static bool range_others_ranged;
+
+/* Run instance @s of @m with its leading read bound to range @k of @count
+ * of the relation it would otherwise read (the delta when the leading read
+ * is the driver), and append what it derives to @out.  @partition marks
+ * the leading input; @run_index and @run_count are what the run is told,
+ * which a refusal case sets apart from the input's own. */
+static int
+run_range(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
+    const wl_columnar_eval_tdd_plan_manifest_t *m, uint32_t s,
+    col_rel_t *delta, uint32_t k, uint32_t count, uint32_t run_index,
+    uint32_t run_count, rows_t *out)
+{
+    static int partition_token;
+    const wl_columnar_eval_tdd_plan_slice_t *slice = &m->slices[s];
+    wl_columnar_eval_tdd_input_t inputs[8];
+    wl_col_session_t worker;
+    wl_columnar_eval_tdd_run_t run;
+    col_rel_t *result = NULL, *range = NULL;
+    int rc;
+
+    if (slice->read_count > 8)
+        return E2BIG;
+    for (uint32_t r = 0; r < slice->read_count; r++) {
+        const wl_columnar_eval_tdd_plan_read_t *read =
+            &m->reads[slice->read_start + r];
+        col_rel_t *rel = read->kind == WL_COLUMNAR_EVAL_TDD_PLAN_DELTA
+            ? delta : session_find_rel(coord, read->relation_name);
+        if (!rel)
+            return ENOENT;
+        if (read->op_index == slice->start) {
+            uint32_t n = rel->nrows;
+            range = range_of(rel, (uint32_t)((uint64_t)n * k / count),
+                    (uint32_t)((uint64_t)n * (k + 1) / count));
+            if (!range)
+                return ENOMEM;
+            inputs[r] = capture(read, range);
+            inputs[r].partition = range_input_partition
+                ? range_input_partition : &partition_token;
+            inputs[r].worker_index = k;
+            inputs[r].worker_count = count;
+        } else {
+            inputs[r] = capture(read, rel);
+            if (range_others_ranged) {
+                inputs[r].worker_index = 1;
+                inputs[r].worker_count = 2;
+            }
+        }
+    }
+    memset(&worker, 0, sizeof(worker));
+    rc = col_worker_session_create(coord, 0, NULL, 0, &worker);
+    if (rc != 0) {
+        col_rel_destroy(range);
+        return rc;
+    }
+    memset(&run, 0, sizeof(run));
+    rc = wl_columnar_eval_tdd_run_bound_slice_begin(&worker, sp, m, s,
+            &snapshot_token, &partition_token, run_index, run_count, inputs,
+            slice->read_count, &run);
+    if (rc == 0)
+        rc = wl_columnar_eval_tdd_run_bound_slice_finish(&run, &result);
+    if (rc == 0 && result && out) {
+        out->ncols = result->ncols;
+        for (uint32_t i = 0; i < result->nrows && out->count < MAX_ROWS; i++) {
+            for (uint32_t c = 0; c < result->ncols && c < MAX_COLS; c++)
+                out->row[out->count][c] = result->columns[c][i];
+            out->count++;
+        }
+    }
+    if (result)
+        col_rel_destroy(result);
+    col_rel_destroy(range);
+    int destroy_rc = col_worker_session_destroy(&worker);
+    return rc != 0 ? rc : destroy_rc;
+}
+
+/* Issue #2122: an instance's output is a bag over the rows of its leading
+ * input, so running it once per range of that input, DELTA or FULL, and
+ * pooling the outputs gives exactly the rows of one unsplit run. */
+static void
+test_leading_ranges(void)
+{
+    static const data_t data[] = {
+        { "e", 2, 6, { { 1, 2 }, { 2, 3 }, { 3, 4 }, { 2, 5 }, { 5, 6 },
+                       { 4, 2 } } },
+    };
+    static const data_t added = { "e", 2, 3, { { 2, 3 }, { 5, 6 },
+                                               { 4, 2 } } };
+    static const uint32_t counts[] = { 2, 3, 4 };
+    fixture_t f;
+    uint32_t si, ri;
+    wl_columnar_eval_tdd_plan_manifest_t m;
+    const char *const set[] = { "e" };
+    bool have_manifest = false;
+    col_rel_t *de = NULL;
+    rows_t whole, pooled;
+
+    BEGIN("ranges of the leading input pool to the unsplit run");
+    CHECK(fixture_open(&f,
+        ".decl e(x: int64, y: int64)\n.decl m(x: int64, z: int64)\n"
+        "m(x, z) :- e(x, y), e(y, z), x != z.\n", false, data, 1));
+    if (!find_relation(f.plan, "m", &si, &ri)
+        || wl_columnar_eval_tdd_plan_insert_bindings(&f.plan->strata[si], ri,
+        set, 1, true, &m) != 0 || m.slice_count != 2) {
+        FAIL("bindings");
+        goto done;
+    }
+    have_manifest = true;
+    wl_col_session_t *coord = COL_SESSION(f.session);
+    const wl_plan_stratum_t *sp = &f.plan->strata[si];
+    de = delta_of(coord, "e", &added);
+    if (!de) {
+        FAIL("delta");
+        goto done;
+    }
+    /* Slice 0 leads with its DELTA driver, slice 1 with a FULL read. */
+    for (uint32_t s = 0; s < m.slice_count; s++) {
+        memset(&whole, 0, sizeof(whole));
+        if (run_instance(coord, sp, &m, s, de, &whole) != 0
+            || whole.count == 0) {
+            FAIL("the unsplit run");
+            goto done;
+        }
+        int64_t want[MAX_ROWS][MAX_COLS];
+        for (uint32_t i = 0; i < whole.count; i++)
+            memcpy(want[i], whole.row[i], sizeof(want[i]));
+        for (uint32_t c = 0; c < sizeof(counts) / sizeof(counts[0]); c++) {
+            memset(&pooled, 0, sizeof(pooled));
+            for (uint32_t k = 0; k < counts[c]; k++) {
+                int rc = run_range(coord, sp, &m, s, de, k, counts[c], k,
+                        counts[c], &pooled);
+                if (rc != 0) {
+                    snprintf(message, sizeof(message),
+                        "instance %u, range %u of %u: rc %d", s, k,
+                        counts[c], rc);
+                    FAIL(message);
+                    goto done;
+                }
+            }
+            CHECK(same_rows(&pooled, (const int64_t (*)[MAX_COLS]) want,
+                whole.count, whole.ncols));
+        }
+    }
+    tests_passed++;
+    printf(" ... PASS\n");
+done:
+    col_rel_destroy(de);
+    if (have_manifest)
+        wl_columnar_eval_tdd_plan_bindings_free(&m);
+    fixture_close(&f);
+}
+
+/* Issue #2122: only the leading read may carry the run's partition, and it
+ * must carry the run's range index and count. */
+static void
+test_range_refusals(void)
+{
+    static const data_t data[] = {
+        { "e", 2, 3, { { 1, 2 }, { 2, 3 }, { 3, 4 } } },
+    };
+    static const data_t added = { "e", 2, 1, { { 2, 3 } } };
+    fixture_t f;
+    uint32_t si, ri;
+    wl_columnar_eval_tdd_plan_manifest_t m;
+    const char *const set[] = { "e" };
+    bool have_manifest = false;
+    col_rel_t *de = NULL;
+
+    BEGIN("a range on the wrong read or with the wrong index is refused");
+    CHECK(fixture_open(&f,
+        ".decl e(x: int64, y: int64)\n.decl m(x: int64, z: int64)\n"
+        "m(x, z) :- e(x, y), e(y, z).\n", false, data, 1));
+    if (!find_relation(f.plan, "m", &si, &ri)
+        || wl_columnar_eval_tdd_plan_insert_bindings(&f.plan->strata[si], ri,
+        set, 1, true, &m) != 0 || m.slice_count != 2) {
+        FAIL("bindings");
+        goto done;
+    }
+    have_manifest = true;
+    wl_col_session_t *coord = COL_SESSION(f.session);
+    const wl_plan_stratum_t *sp = &f.plan->strata[si];
+    de = delta_of(coord, "e", &added);
+    if (!de) {
+        FAIL("delta");
+        goto done;
+    }
+    /* The run is told range 1 of 2 while its leading input is range 0. */
+    if (run_range(coord, sp, &m, 0, de, 0, 2, 1, 2, NULL) != EINVAL) {
+        FAIL("a leading range with another index was not refused");
+        goto done;
+    }
+    /* The run is told 3 ranges while its leading input is one of 2. */
+    if (run_range(coord, sp, &m, 1, de, 0, 2, 0, 3, NULL) != EINVAL) {
+        FAIL("a leading range with another count was not refused");
+        goto done;
+    }
+    /* The leading input belongs to another partition than the run. */
+    static int other_partition;
+    range_input_partition = &other_partition;
+    int other_rc = run_range(coord, sp, &m, 0, de, 0, 2, 0, 2, NULL);
+    range_input_partition = NULL;
+    if (other_rc != EINVAL) {
+        FAIL("a leading range of another partition was not refused");
+        goto done;
+    }
+    /* An input other than the leading one claims a range of its own. */
+    range_others_ranged = true;
+    other_rc = run_range(coord, sp, &m, 0, de, 0, 2, 0, 2, NULL);
+    range_others_ranged = false;
+    if (other_rc != EINVAL) {
+        FAIL("a range on an input other than the leading one was not "
+            "refused");
+        goto done;
+    }
+    tests_passed++;
+    printf(" ... PASS\n");
+done:
+    col_rel_destroy(de);
+    if (have_manifest)
+        wl_columnar_eval_tdd_plan_bindings_free(&m);
+    fixture_close(&f);
+}
+
 int
 main(void)
 {
@@ -733,6 +980,8 @@ main(void)
     test_timestamped_head();
     test_runner_accepts_every_instance();
     test_refused_inputs();
+    test_leading_ranges();
+    test_range_refusals();
     printf("%d run, %d passed, %d failed\n", tests_run, tests_passed,
         tests_failed);
     return tests_failed ? 1 : 0;

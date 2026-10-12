@@ -955,10 +955,14 @@ wl_columnar_eval_tdd_plan_bind_slots(wl_col_session_t *worker,
  * #1984 forms, which bind only the verified CSPA shapes, an insertion
  * instance may come from any rule wl_columnar_eval_tdd_plan_insert_bindings()
  * accepts, so this accepts any relation name and width, expressions in MAP,
- * FILTER and a JOIN's right operand, and a serial run on one worker with no
+ * FILTER and a JOIN's right operand, and a run on one worker with no
  * partition.  It refuses nothing that the binder admits: the operators it
  * rejects are the ones the binder already refuses, so whatever admission
- * accepts, this runs. */
+ * accepts, this runs.
+ * Issue #2122: a run may instead cover one range of its leading input, the
+ * VARIABLE at the slice's start, DELTA or FULL: that input then carries the
+ * run's partition, range index and range count, and every other input
+ * carries no partition and range 0 of 1. */
 static int
 wl_columnar_eval_tdd_plan_prepare_insert(wl_col_session_t *worker,
     const wl_plan_stratum_t *sp,
@@ -1029,13 +1033,16 @@ wl_columnar_eval_tdd_plan_prepare_insert(wl_col_session_t *worker,
             || read->kind != kind || in->snapshot != snapshot
             || !wl_columnar_eval_tdd_plan_input_matches(in, true))
             return EINVAL;
-        if (delta) {
-            if (op->op == WL_PLAN_OP_SEMIJOIN || in->partition != partition
+        if (delta && op->op == WL_PLAN_OP_SEMIJOIN)
+            return EINVAL;
+        drivers += delta;
+        if (i == slice->start) {
+            if (in->partition != partition
                 || in->worker_index != worker_index
                 || in->worker_count != worker_count)
                 return EINVAL;
-            drivers++;
-        } else if (in->partition) {
+        } else if (in->partition || in->worker_index != 0
+            || in->worker_count != 1) {
             return EINVAL;
         }
     }

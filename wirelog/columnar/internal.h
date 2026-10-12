@@ -4205,7 +4205,13 @@ int wl_columnar_eval_tdd_plan_insert_bindings(const wl_plan_stratum_t *sp,
  * timestamps, or is NULL when it gained none.  Every manifest is built
  * before anything is mutated, so ENOTSUP from the binder leaves the session
  * unchanged; any later failure may leave heads partly updated, and the
- * caller must then re-evaluate in full. */
+ * caller must then re-evaluate in full.
+ * Issue #2122: with sess->num_workers > 1 a round's instances run on up to
+ * that many worker clones at once, each instance possibly split into ranges
+ * of its leading input; the round's outputs are merged after every clone
+ * is done, in an unspecified order.  A session whose extension snapshot
+ * holds a callback not declared thread-safe runs every round on one clone.
+ * The first failure of a round, in clone order, is returned. */
 int wl_columnar_eval_tdd_insert_stratum(wl_col_session_t *sess,
     const wl_plan_stratum_t *sp, const char *const *changed,
     col_rel_t *const *changed_delta, uint32_t nchanged,
@@ -4215,6 +4221,16 @@ int wl_columnar_eval_tdd_insert_stratum(wl_col_session_t *sess,
  * non-zero return fails the stratum there. */
 extern int (*wl_columnar_eval_tdd_insert_test_after_merge)(
     const wl_plan_stratum_t *sp);
+/* Issue #2122: called on the coordinator after each round's barrier, before
+ * its merge, with the round's instances, the runs they were split into and
+ * the tasks that ran them. */
+extern void (*wl_columnar_eval_tdd_insert_test_round)(
+    const wl_plan_stratum_t *sp, uint32_t units, uint32_t pieces,
+    uint32_t tasks);
+/* Issue #2122: called by a task before each run it takes, on the thread
+ * running it; @first_piece is set for the task's first run of the round. */
+extern void (*wl_columnar_eval_tdd_insert_test_piece_start)(uint32_t task,
+    uint32_t tasks, bool first_piece);
 #endif
 
 typedef struct {
