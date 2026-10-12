@@ -1,0 +1,5 @@
+scope=full
+trace_setup=0
+trace_build=0
+trace_test=0
+portfolio=1

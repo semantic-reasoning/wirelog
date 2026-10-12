@@ -1,0 +1,13 @@
+requested_affinity=0
+affinity=0-19
+kernel=Linux 7.2.8-arch1-2 x86_64 GNU/Linux
+cpu_model=Intel(R) Core(TM) i5-14600
+loadavg=1.03 0.87 0.43 1/553 691
+cpuset=0-19
+governor=performance
+cur_freq=800276
+min_freq=800000
+max_freq=5200000
+cpuinfo_cur_freq=unavailable
+psi_cpu=some avg10=0.00 avg60=0.01 avg300=0.30 total=5761860106;full avg10=0.00 avg60=0.00 avg300=0.00 total=0;
+cpu_stat=usage_usec=281207690 user_usec=277985628 system_usec=3222062 nice_usec=0 core_sched.force_idle_usec=0 nr_periods=0 nr_throttled=0 throttled_usec=0 nr_bursts=0 burst_usec=0

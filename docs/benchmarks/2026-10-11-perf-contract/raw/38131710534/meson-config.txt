@@ -1,0 +1,196 @@
+Core properties:
+  Source dir /workspace
+  Build dir  /workspace/build-perf-nightly
+
+Global build options:
+  
+  Core options                   Current Value                    Possible Values                  Description                                                  
+  --------------                 -------------                    ---------------                  -----------                                                  
+  auto_features                  auto                             [enabled, disabled, auto]        Override value of all 'auto' features                        
+  backend                        ninja                            [ninja, vs, vs2010, vs2012,      Backend to use                                               
+                                                                   vs2013, vs2015, vs2017, vs2019,                                                              
+                                                                   vs2022, vs2026, xcode, none]                                                                 
+  genvslite                      vs2022                           [vs2022, vs2026]                 Setup multiple buildtype-suffixed ninja-backend build        
+                                                                                                   directories, and a [builddir]_vs containing a Visual Studio  
+                                                                                                   meta-backend with multiple configurations that calls into    
+                                                                                                   them                                                         
+  buildtype                      release                          [plain, debug, debugoptimized,   Build type to use                                            
+                                                                   release, minsize, custom]                                                                    
+  debug                          false                            [True, False]                    Enable debug symbols and other information                   
+  default_library                shared                           [shared, static, both]           Default library type                                         
+  default_both_libraries         shared                           [shared, static, auto]           Default library type for both_libraries                      
+  install_umask                  0022                             [>= 0, <= 511]                   Default umask to apply on permissions of installed files     
+  layout                         mirror                           [mirror, flat]                   Build directory layout                                       
+  optimization                   s                                [plain, 0, g, 1, 2, 3, s]        Optimization level                                           
+  prefer_static                  false                            [True, False]                    Whether to try static linking before shared linking          
+  strip                          false                            [True, False]                    Strip targets on install                                     
+  unity                          off                              [on, off, subprojects]           Unity build                                                  
+  unity_size                     4                                [>= 2]                           Unity block size                                             
+  warning_level                  1                                [0, 1, 2, 3, everything]         Compiler warning level to use                                
+  werror                         false                            [True, False]                    Treat warnings as errors                                     
+  wrap_mode                      default                          [default, nofallback,            Wrap mode                                                    
+                                                                   nodownload, forcefallback,                                                                   
+                                                                   nopromote]                                                                                   
+  force_fallback_for             []                                                                Force fallback for those subprojects                         
+  vsenv                          false                            [True, False]                    Activate Visual Studio environment                           
+  os2_emxomf                     false                            [True, False]                    Use OMF format on OS/2                                       
+  pkg_config_path                []                                                                List of additional paths for pkg-config to search            
+  cmake_prefix_path              []                                                                List of additional prefixes for cmake to search              
+  
+  Backend options                Current Value                    Possible Values                  Description                                                  
+  -----------------              -------------                    ---------------                  -----------                                                  
+  backend_max_links              0                                [>= 0]                           Maximum number of linker processes to run or 0 for no limit  
+  
+  Base options                   Current Value                    Possible Values                  Description                                                  
+  --------------                 -------------                    ---------------                  -----------                                                  
+  b_colorout                     always                           [auto, always, never]            Use colored output                                           
+  b_asneeded                     true                             [True, False]                    Use -Wl,--as-needed when linking                             
+  b_lto                          true                             [True, False]                    Use link time optimization                                   
+  b_thinlto_cache_dir                                                                              Directory to store ThinLTO cache objects                     
+  b_coverage                     false                            [True, False]                    Enable coverage tracking.                                    
+  b_lto_threads                  0                                []                               Use multiple threads for Link Time Optimization              
+  b_pch                          true                             [True, False]                    Use precompiled headers                                      
+  b_pgo                          off                              [off, generate, use]             Use profile guided optimization                              
+  b_pie                          false                            [True, False]                    Build executables as position independent                    
+  b_ndebug                       false                            [true, false, if-release]        Disable asserts                                              
+  b_staticpic                    true                             [True, False]                    Build static libraries as position independent               
+  b_thinlto_cache                false                            [True, False]                    Use LLVM ThinLTO caching for faster incremental builds       
+  b_sanitize                     [none]                                                            Code sanitizer to use                                        
+  b_lundef                       true                             [True, False]                    Use -Wl,--no-undefined when linking                          
+  
+  Compiler options               Current Value                    Possible Values                  Description                                                  
+  ------------------             -------------                    ---------------                  -----------                                                  
+  c_args                         []                                                                Extra arguments passed to the c compiler                     
+  c_link_args                    []                                                                Extra arguments passed to the c linker                       
+  c_std                          none                             [none, c89, c99, c11, c17, c18,  c language standard to use                                   
+                                                                   c2x, c23, c2y, gnu89, gnu99,                                                                 
+                                                                   gnu11, gnu17, gnu18, gnu2x,                                                                  
+                                                                   gnu23, gnu2y]                                                                                
+  cpp_args                       []                                                                Extra arguments passed to the cpp compiler                   
+  cpp_link_args                  []                                                                Extra arguments passed to the cpp linker                     
+  cpp_std                        none                             [none, c++98, c++03, c++11,      cpp language standard to use                                 
+                                                                   c++14, c++17, c++1z, c++2a,                                                                  
+                                                                   c++20, c++23, c++26, gnu++98,                                                                
+                                                                   gnu++03, gnu++11, gnu++14,                                                                   
+                                                                   gnu++17, gnu++1z, gnu++2a,                                                                   
+                                                                   gnu++20, gnu++23, gnu++26]                                                                   
+  cpp_eh                         default                          [none, default, a, s, sc]        C++ exception handling type.                                 
+  cpp_rtti                       true                             [True, False]                    Enable RTTI                                                  
+  cpp_debugstl                   false                            [True, False]                    STL debug mode                                               
+  cpp_importstd                  false                            [false, true]                    Use #import std.                                             
+  
+  pkgconfig module options       Current Value                    Possible Values                  Description                                                  
+  --------------------------     -------------                    ---------------                  -----------                                                  
+  pkgconfig.relocatable          false                            [True, False]                    Generate pkgconfig files as relocatable                      
+  
+  Directories                    Current Value                    Possible Values                  Description                                                  
+  -------------                  -------------                    ---------------                  -----------                                                  
+  prefix                         /usr/local                                                        Installation prefix                                          
+  bindir                         bin                                                               Executable directory                                         
+  datadir                        share                                                             Data file directory                                          
+  includedir                     include                                                           Header file directory                                        
+  infodir                        share/info                                                        Info page directory                                          
+  libdir                         lib/x86_64-linux-gnu                                              Library directory                                            
+  licensedir                                                                                       Licenses directory                                           
+  libexecdir                     libexec                                                           Library executable directory                                 
+  localedir                      share/locale                                                      Locale data directory                                        
+  localstatedir                  /var/local                                                        Localstate data directory                                    
+  mandir                         share/man                                                         Manual page directory                                        
+  sbindir                        sbin                                                              System executable directory                                  
+  sharedstatedir                 /var/local/lib                                                    Architecture-independent data directory                      
+  sysconfdir                     etc                                                               Sysconf data directory                                       
+  
+  Testing options                Current Value                    Possible Values                  Description                                                  
+  -----------------              -------------                    ---------------                  -----------                                                  
+  errorlogs                      true                             [True, False]                    Whether to print the logs from failing tests                 
+  stdsplit                       true                             [True, False]                    Split stdout and stderr in test logs                         
+  
+  Project options                Current Value                    Possible Values                  Description                                                  
+  -----------------              -------------                    ---------------                  -----------                                                  
+  android                        false                            [True, False]                    Build for Android (NDK cross-compile, Issue #464). When true:
+                                                                                                   excludes wirelog_cli, adds -Wl,-z,max-page-size=16384 on     
+                                                                                                   aarch64 for 16 KB page compatibility (Android 14+). Symbol   
+                                                                                                   visibility remains hidden -- WIRELOG_API on public headers   
+                                                                                                   already covers Android exports. Use with meson --cross-file  
+                                                                                                   cross/android-arm64.ini (or android-x86_64.ini).             
+  crc32_variant                  ethernet                         [ethernet, castagnoli]           Default CRC-32 variant: ethernet (standard) or castagnoli    
+                                                                                                   (iSCSI)                                                      
+  documentation                  false                            [True, False]                    Build documentation (not yet implemented)                    
+  embedded                       false                            [True, False]                    Enable embedded mode (minimal dependencies, smaller binary)  
+  enable_fuzz                    false                            [True, False]                    Build parser fuzz target and corpus smoke test when using    
+                                                                                                   Clang/libFuzzer (Issue #743)                                 
+  io_plugin_dlopen               disabled                         [disabled, enabled]              Enable optional CLI plugin loader via dlopen (Issue #461).   
+                                                                                                   Excluded from Android/iOS.                                   
+  ios                            false                            [True, False]                    Build for iOS. Disables executable targets and plugin        
+                                                                                                   loading, and applies Apple iOS target flags.                 
+  ipc                            disabled                         [disabled, enabled]              Enable Arrow IPC support (for data serialization and network 
+                                                                                                   transport)                                                   
+  mbedTLS                        disabled                         [disabled, enabled, auto]        Use system-installed mbedTLS for cryptographic functions.    
+                                                                                                   auto=enabled if found, else disabled. Enabling links         
+                                                                                                   Apache-2.0 mbedTLS and brings cryptography into the build    
+                                                                                                   (see docs/SECURITY_MODEL.md): the artifact then carries ECCN 
+                                                                                                   5D002.c.1 under U.S. EAR; downstream redistributors are      
+                                                                                                   responsible for any export filings under their own           
+                                                                                                   jurisdiction. Default-disabled builds carry no cryptographic 
+                                                                                                   code (EAR99).                                                
+  mbedTLS_prefix                                                                                   Explicit single-prefix metadata-free mbedTLS installation to 
+                                                                                                   use after pkg-config/CMake discovery fails (native builds    
+                                                                                                   only).                                                       
+  tests                          true                             [True, False]                    Build and run tests                                          
+  threads                        native                           [native, posix]                  Threading backend: native (auto-detect C11/POSIX) or posix   
+                                                                                                   (force pthreads, required for TSan)                          
+  wirelog_log_max_level          error                            [error, warn, info, debug,       Compile-time ceiling for WL_LOG() (Issue #287). Set to       
+                                                                   trace]                          "error" in release for zero-cost disabled                    
+                                                                                                   TRACE/DEBUG/INFO/WARN sites.                                 
+
+Subproject nanoarrow:
+  
+  Project options                Current Value                    Possible Values                  Description                                                  
+  -----------------              -------------                    ---------------                  -----------                                                  
+  apps                           disabled                         [enabled, disabled, auto]        Build utility applications                                   
+  benchmarks                     auto                             [enabled, disabled, auto]        Build benchmarks                                             
+  cuda                           auto                             [enabled, disabled, auto]        Build CUDA libraries                                         
+  device                         disabled                         [enabled, disabled, auto]        Build device libraries                                       
+  integration_tests              auto                             [enabled, disabled, auto]        Build cross-implementation Arrow integration tests           
+  ipc                            disabled                         [enabled, disabled, auto]        Build IPC libraries                                          
+  ipc_with_lz4                   auto                             [enabled, disabled, auto]        Build IPC libraries with LZ4 compression support             
+  ipc_with_zstd                  auto                             [enabled, disabled, auto]        Build IPC libraries with ZSTD compression support            
+  metal                          auto                             [enabled, disabled, auto]        Build Apple metal libraries                                  
+  namespace                                                                                        A prefix for exported symbols                                
+  testing                        disabled                         [enabled, disabled, auto]        Build testing libraries                                      
+  tests                          disabled                         [enabled, disabled, auto]        Build tests                                                  
+  tests_with_arrow               auto                             [enabled, disabled, auto]        Build tests with Arrow                                       
+
+Subproject xxhash:
+  
+  Project options                Current Value                    Possible Values                  Description                                                  
+  -----------------              -------------                    ---------------                  -----------                                                  
+  32-endjmp                      false                            [True, False]                    Switch multi-branch finalization stage of XXH32 by a single  
+                                                                                                   jump                                                         
+  cli                            true                             [True, False]                    Build the CLI                                                
+  cpu-little-endian              auto                             [enabled, disabled, auto]        Force endianness                                             
+  dispatch                       false                            [True, False]                    See DISPATCH=1 for information about xxh_x86dispatch.c       
+  force-align-check              auto                             [enabled, disabled, auto]        Use a faster direct read path when input is aligned          
+  force-memory-access            default                          [default, attribute, unaligned-  See XXH_FORCE_MEMORY_ACCESS                                  
+                                                                   reads, byteshift]                                                                            
+  inline-all                     false                            [True, False]                    Make all functions inline                                    
+  inline-hints                   auto                             [enabled, disabled, auto]        See XXH_NO_INLINE_HINTS                                      
+  long-long                      true                             [True, False]                    Include compilation of algorithms relying on 64-bit types    
+  namespace                                                                                        Prefixes all symbols with the value of XXH_NAMESPACE         
+  prefetch                       true                             [True, False]                    Disable prefetching. XXH3 only                               
+  prefetch-dist                  0                                []                               Select prefetching distance. XXH3 only                       
+  vector                         default                          [default, scalar, sse2, avx2,    Manually select a vector instruction set                     
+                                                                   avx512, neon, vsx]                                                                           
+  xxh3                           true                             [True, False]                    Removes symbols related to XXH3 (both 64 & 128 bits) from    
+                                                                                                   generated binary                                             
+
+The following option(s) have a different value than the build type default:
+
+                Current  Default
+                -------  -------
+  optimization  s        3
+
+Currently set option augments:
+nanoarrow:c_std      c99       
+nanoarrow:warning_level2         
+nanoarrow:cpp_std    c++20     

@@ -1,0 +1,35 @@
+commit=1fa011f2ba20b4cebba76d1159fe723f7ddfee10
+checkout_commit=1fa011f2ba20b4cebba76d1159fe723f7ddfee10
+source_tree=d83082b517343671e311b55ffe2b1e1cab8fa2b3
+run=37767055232 attempt=1
+runner=atlas-perf os=Linux arch=X64
+runner_labels=self-hosted,Linux,X64,perf
+mode=nightly strict_CRDT_CSPA=true governor_eligibility=required
+WIRELOG_PERF_GATE=1 WIRELOG_PERF_REQUIRE=1
+requested_affinity=0
+pid 24420's current affinity list: 0-19
+kernel=Linux 7.2.8-arch1-2 x86_64 GNU/Linux
+cpu_model=Intel(R) Core(TM) i5-14600
+boot_id=6b3a86b2-5199-4da6-a667-32fd17095c13
+loadavg=1.09 1.30 0.88 1/434 24430
+[/sys/fs/cgroup/cpuset.cpus.effective]
+0-19
+[/sys/fs/cgroup/cpu.stat]
+usage_usec 2716347883
+user_usec 2020603940
+system_usec 695743942
+nice_usec 30784
+core_sched.force_idle_usec 0
+nr_periods 0
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+[/proc/pressure/cpu]
+some avg10=0.00 avg60=0.00 avg300=0.25 total=43537313
+full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+governor=performance
+scaling_cur_freq=2223810
+scaling_min_freq=800000
+scaling_max_freq=5200000
+cpuinfo_cur_freq=unavailable

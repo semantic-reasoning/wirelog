@@ -1,5 +1,68 @@
 # Dedicated Linux perf-nightly calibration evidence
 
+## Authoritative timing decision: provisioned profile
+
+For #2022, choose the provisioned dedicated Linux `perf` runner and strict
+release/ERROR profile described below as the authoritative CRDT/CSPA timing
+contract. Retain the historical **38,120 ms CRDT** and **2,050 ms CSPA** median
+limits, correctness checks and **3% CoV** ceiling. The latest two scheduled
+acquisitions demonstrate that this profile can meet both limits; eligible
+misses remain failures under the same contract.
+
+The [retained October 7–11 evidence](benchmarks/2026-10-11-perf-contract/README.md)
+contains all five consecutive scheduled acquisitions after the October 7 smoke
+observation below: three CSPA misses, then two strict passes. It records exact
+source/tree, resolved build and compiler, image, kernel/CPU, captured input
+hashes, affinity command, governor/frequency/load/pressure endpoints, nine raw
+samples, CoV and statuses. The manifest links complete upstream artifacts and
+checksums the byte-identical strict evidence subset committed here.
+
+| Run / UTC date | CRDT median / CoV | CSPA median / CoV | Strict verdict |
+| --- | ---: | ---: | --- |
+| [37608652791](https://github.com/semantic-reasoning/wirelog/actions/runs/37608652791) / October 7 | 23677.9 ms / 0.223% | 2087.4 ms / 0.290% | Eligible CSPA miss |
+| [37767055232](https://github.com/semantic-reasoning/wirelog/actions/runs/37767055232) / October 8 | 23293.7 ms / 0.180% | 2072.2 ms / 0.323% | Eligible CSPA miss |
+| [37920791985](https://github.com/semantic-reasoning/wirelog/actions/runs/37920791985) / October 9 | 23718.2 ms / 0.205% | 2091.6 ms / 0.405% | Eligible CSPA miss |
+| [38043972940](https://github.com/semantic-reasoning/wirelog/actions/runs/38043972940) / October 10 | 23340.0 ms / 0.156% | 1990.0 ms / 0.148% | Eligible strict pass |
+| [38131710534](https://github.com/semantic-reasoning/wirelog/actions/runs/38131710534) / October 11 | 22651.4 ms / 0.219% | 1941.9 ms / 0.136% | Eligible strict pass |
+
+The October 10/11 executions are separate, serialized latest-main acquisitions
+on `atlas-perf`, Intel Core i5-14600, the same immutable local image and GCC
+15.2.0 profile. Both have governor `performance`, endpoint PSI at most 0.95%,
+load1 at most 4.44 against 20 allowed CPUs, and unchanged zero throttled time.
+They repeat the operational contract across different source revisions and
+kernels (7.2.8-arch1-2 and 7.2.9-arch1-1); they are not controlled same-source
+confirmation. Endpoint snapshots do not establish continuous frequency/load
+stability. The workflow uses `--num-processes 1` and the Linux concurrency
+group `wirelog-perf-linux`; the recorded strict blocks ran sequentially.
+
+Both complete workflows still failed in other scopes. These strict passes
+resolve the timing-profile decision, not full-nightly correctness, TRACE,
+portfolio or DOOP acceptance. Keep the preceding CSPA misses and future
+eligible failures visible; do not rerun until green or enlarge limits to absorb
+them.
+
+### Issue #2022 acceptance accounting
+
+- **Timing contract:** use the provisioned `perf` release/ERROR conditions
+  below, capable of meeting the historical targets, with correctness and CoV
+  checks active. No new runner-specific threshold is derived.
+- **Provenance and repetition:** the retained acquisitions include the exact
+  measured inputs and nine samples. October 10/11 independently repeat the
+  latest-main execution contract; source/kernel differences limit causal
+  comparisons, as specified above.
+- **Historical CRDT drift:** the severe shared-runner drift remains unresolved
+  experimentally. Exclude those samples from target derivation and regression
+  attribution. Adopting the provisioned profile does not retroactively make
+  shared-runner observations eligible. Any future use of them still requires
+  serialized repeated measurements and frequency/load evidence resolving the
+  drift first.
+- **Hotspot attribution:** the documented, separately verified GNU `gprof`
+  alternative below works without a kernel-matching `perf` binary. Instrumented
+  timings are excluded from gate evidence; no new hotspot attribution is made.
+- **#1913 separation:** keep its source optimization and throughput acceptance
+  separate. These acquisitions identify no regression owner and authorize no
+  admission optimization or change to #1913's thresholds.
+
 ## Current execution contract
 
 Issue [#2022](https://github.com/semantic-reasoning/wirelog/issues/2022)
@@ -90,7 +153,7 @@ does not enforce equality of the two affinities, kernels or CPU identities;
 review their provenance separately. Endpoint frequency/governor/load/PSI
 observations do not prove continuous stability during all nine samples.
 
-## Latest measured observation: 2026-10-07
+## Prior strict smoke observation: 2026-10-07
 
 [Run 37577651576, attempt 1](https://github.com/semantic-reasoning/wirelog/actions/runs/37577651576)
 retains [artifact perf-suite-linux-37577651576-1](https://github.com/semantic-reasoning/wirelog/actions/runs/37577651576/artifacts/11463174732).
@@ -147,7 +210,7 @@ b83fba0709b37259cd6ad00bfe3434abc3df3fec3dbccd3f5eedf273e9c921dc  crdt/Remove_in
 c37127cbcf42cebb04296869cf16b029d60992706c98377e4536d3c9e5b06185  cspa/dereference.csv
 ```
 
-### Prior observations and unresolved decision
+### Earlier observations
 
 These independent main observations are retained as context, not frozen-source
 comparisons or evidence assigning a hot path's ownership. Both prior runs used
@@ -165,11 +228,10 @@ works; it does not resolve the performance miss. Historical high-drift
 shared-runner samples are excluded from deriving current limits; their drift
 has not been experimentally eliminated by this observation.
 
-**#2022 remains open.** Its provisioned-profile versus separately reviewed
-measured-target decision is unresolved because the latest eligible acquisition
-misses CSPA. This documentation establishes the current execution and evidence
-contract; it does not claim all issue acceptance criteria passed or close the
-issue. [#1913](https://github.com/semantic-reasoning/wirelog/issues/1913)
+The provisioned-profile decision and later repeat acquisitions are recorded
+at the start of this document. This October 7 miss remains an eligible measured
+failure under that contract; the subsequent passes do not erase it.
+[#1913](https://github.com/semantic-reasoning/wirelog/issues/1913)
 retains its throughput acceptance, and optimization candidates in
 [#2098](https://github.com/semantic-reasoning/wirelog/issues/2098) remain
 explicitly deferred. This change implements no optimization or relaxed gate.

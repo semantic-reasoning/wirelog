@@ -1,0 +1,50 @@
+Log of Meson test suite run on 2026-10-08T11:00:44.477759
+
+Inherited environment: UV_CACHE_DIR=/home/perf/tmp/uv-cache HOSTNAME=atlas PWD=/workspace WIRELOG_NINJA_REAL=/home/perf/tmp/meson-venv/bin/ninja PERF_STRICT_SMOKE=false HOME=/home/perf LANG=C.UTF-8 VIRTUAL_ENV=/opt/wirelog-venv TMPDIR=/home/perf/tmp SHLVL=1 PORTFOLIO_REPEAT=1 PORTFOLIO_WORKERS=1 PORTFOLIO_TIER=readme-full LC_ALL=C.UTF-8 PATH=/home/perf/tmp/meson-venv/bin:/opt/wirelog-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin NINJA=/workspace/.github/actions/setup-meson/ninja-cap.py _=/usr/bin/taskset WIRELOG_PERF_GATE=1 WIRELOG_PERF_REQUIRE=1 
+
+==================================== 1/2 =====================================
+test:         perf - wirelog:crdt_perf_gate
+start time:   11:00:44
+duration:     233.05s
+result:       exit status 0
+command:      ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1 WIRELOG_CRDT_DATA_DIR=/workspace/bench/data/crdt MESON_TEST_ITERATION=1 LD_LIBRARY_PATH=/workspace/build-perf-nightly/subprojects/xxHash-0.8.4:/workspace/build-perf-nightly/subprojects/nanoarrow MSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1:print_stacktrace=1 UBSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1:print_stacktrace=1 MALLOC_PERTURB_=31 /workspace/build-perf-nightly/tests/test_crdt_perf_gate
+----------------------------------- stdout -----------------------------------
+test_crdt_perf_gate OK
+----------------------------------- stderr -----------------------------------
+test_crdt_perf_gate: raw_ms = 23337.2 23322.7 23263.8 23293.7 23385.5 23252.8 23323.4 23268.5 23261.8
+test_crdt_perf_gate: trials=9 workers=1
+  data_dir   = /workspace/bench/data/crdt
+  warmup_ms  = 23341.0
+  aggregate  = 2152328 (diagnostic only)
+  result     = 104851 (expected 104851)
+  iterations = 14148
+  mean_ms    = 23301.0
+  stdev_ms   = 41.86 (CoV 0.180%)
+  median_ms  = 23293.7 (target 38120)
+==============================================================================
+
+==================================== 2/2 =====================================
+test:         perf - wirelog:cspa_w1_gate
+start time:   11:04:37
+duration:     20.75s
+result:       exit status 1
+command:      ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1 MALLOC_PERTURB_=41 MESON_TEST_ITERATION=1 LD_LIBRARY_PATH=/workspace/build-perf-nightly/subprojects/xxHash-0.8.4:/workspace/build-perf-nightly/subprojects/nanoarrow MSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1:print_stacktrace=1 WIRELOG_CSPA_DATA_DIR=/workspace/bench/data/cspa UBSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1:print_stacktrace=1 /workspace/build-perf-nightly/tests/test_cspa_perf_gate
+----------------------------------- stderr -----------------------------------
+test_cspa_perf_gate: raw_ms = 2072.2 2087.0 2076.6 2068.6 2080.7 2063.6 2071.3 2074.9 2068.2
+test_cspa_perf_gate: trials=9 workers=1
+  data_dir   = /workspace/bench/data/cspa
+  tuples     = 20381/20,381
+  iterations = 6/6
+  mean_ms    = 2073.7
+  stdev_ms   = 6.69 (CoV 0.323%)
+  median_ms  = 2072.2 (target 2050)
+test_cspa_perf_gate: FAIL: median 2072.2 ms exceeds target 2050 ms (regression)
+==============================================================================
+
+
+Summary of Failures:
+
+2/2 perf - wirelog:cspa_w1_gate   FAIL            20.75s   exit status 1
+
+Ok:                1   
+Fail:              1   

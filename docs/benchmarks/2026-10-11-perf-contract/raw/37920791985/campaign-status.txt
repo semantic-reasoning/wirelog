@@ -1,0 +1,4 @@
+acquisition_status=complete
+evidence_eligibility=eligible
+performance_verdict=fail
+meson_exit=1

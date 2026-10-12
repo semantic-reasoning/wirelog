@@ -12,9 +12,11 @@ The July measurements and 38,120 ms target provenance below remain historical
 records. For the current dedicated Linux runner, local image, strict ERROR
 build profile, endpoint eligibility and latest-main observations, see
 [perf-nightly calibration evidence](PERF_NIGHTLY_CALIBRATION.md). That document
-separates acquisition, host eligibility and performance verdicts; the latest
-2026-10-07 run passes CRDT but misses CSPA. Issue #2022 remains open pending
-its provisioned-profile versus measured-target decision. Neither these records
+separates acquisition, host eligibility and performance verdicts. Issue #2022
+chooses the provisioned release/ERROR contract with the historical limits;
+the October 10/11 acquisitions pass both strict gates, while earlier eligible
+CSPA misses remain recorded. These latest-main repeats use different sources
+and kernels and do not establish source-caused regressions. Neither these records
 nor the newer diagnostic aggregate establish a replacement correctness gold.
 
 ## Correctness boundary

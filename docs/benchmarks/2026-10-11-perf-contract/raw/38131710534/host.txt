@@ -1,0 +1,35 @@
+commit=e08eca8c27a120acf97940098fd296d84146694e
+checkout_commit=e08eca8c27a120acf97940098fd296d84146694e
+source_tree=2b51cf0bb41007d013be5672e3b1465d5c988aa5
+run=38131710534 attempt=1
+runner=atlas-perf os=Linux arch=X64
+runner_labels=self-hosted,Linux,X64,perf
+mode=nightly strict_CRDT_CSPA=true governor_eligibility=required
+WIRELOG_PERF_GATE=1 WIRELOG_PERF_REQUIRE=1
+requested_affinity=0
+pid 7056's current affinity list: 0-19
+kernel=Linux 7.2.9-arch1-1 x86_64 GNU/Linux
+cpu_model=Intel(R) Core(TM) i5-14600
+boot_id=13294565-7197-443f-bea2-62c3e5d3e55f
+loadavg=1.08 1.18 0.86 1/430 7066
+[/sys/fs/cgroup/cpuset.cpus.effective]
+0-19
+[/sys/fs/cgroup/cpu.stat]
+usage_usec 958870744
+user_usec 818494496
+system_usec 140376248
+nice_usec 0
+core_sched.force_idle_usec 0
+nr_periods 0
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+[/proc/pressure/cpu]
+some avg10=0.00 avg60=0.00 avg300=0.31 total=10954820
+full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+governor=performance
+scaling_cur_freq=800000
+scaling_min_freq=800000
+scaling_max_freq=5200000
+cpuinfo_cur_freq=unavailable
