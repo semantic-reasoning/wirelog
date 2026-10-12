@@ -1213,14 +1213,15 @@ typedef struct {
     col_rel_t *out; /* destination relation                     */
     int rc;         /* first error code encountered; 0 = ok    */
     wl_columnar_memory_governor_ref_t *governor;
+    col_rel_append_batch_t *batch; /* held lease on out (#2072)       */
 } lftj_binary_ctx_t;
 
 /*
  * lftj_binary_cb: output callback for col_op_lftj.
  *
  * Converts compact LFTJ output to binary-join-compatible format and appends
- * the result to ctx->out.  Sets ctx->rc on allocation failure (subsequent
- * calls are no-ops).
+ * the result to ctx->out through ctx->batch.  Sets ctx->rc on allocation
+ * failure (subsequent calls are no-ops).
  */
 static void
 lftj_binary_cb(const int64_t *row, uint32_t lftj_ncols, void *user)
@@ -1255,7 +1256,7 @@ lftj_binary_cb(const int64_t *row, uint32_t lftj_ncols, void *user)
         return;
     }
 #endif
-    int rc = col_rel_append_row(ctx->out, ctx->tmp);
+    int rc = col_rel_append_batch_row(ctx->batch, ctx->tmp);
 #ifdef WL_TEST_LFTJ_ADMISSION_HOOKS
     lftj_test_after_output_append(ctx->governor);
 #endif
@@ -1453,6 +1454,15 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                 rc = ENOMEM;
             goto cleanup_arrays;
         }
+        /* The callback runs on this thread and appends every output row
+        * under one held lease.  out is not one of the join's inputs. */
+        col_rel_append_batch_t lftj_batch = { 0 };
+        rc = col_rel_append_batch_begin(&lftj_batch, out);
+        if (rc != 0) {
+            free(tmp);
+            col_rel_destroy(out);
+            goto cleanup_arrays;
+        }
 
         lftj_binary_ctx_t ctx = { k,
                                   ncols,
@@ -1463,13 +1473,17 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                                   tmp,
                                   out,
                                   0,
-                                  sess->memory_governor };
+                                  sess->memory_governor,
+                                  &lftj_batch };
 
         rc = wl_columnar_lftj_join_typed_governed(inputs, key_type, k,
                 lftj_binary_cb, &ctx,
                 sess ? sess->memory_governor : NULL);
         if (rc == 0)
             rc = ctx.rc;
+        int end_rc = col_rel_append_batch_end(&lftj_batch, rc == 0);
+        if (rc == 0)
+            rc = end_rc;
 
         free(tmp);
         if (rc != 0) {
