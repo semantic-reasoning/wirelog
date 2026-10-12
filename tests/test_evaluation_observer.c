@@ -4,6 +4,7 @@
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/wirelog.h"
 #include "../wirelog/session.h"
+#include <stdarg.h>
 #include <stdio.h>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, \
                                       __LINE__, #x); exit(1); } } while (0)
@@ -2900,6 +2901,19 @@ static void seed_append_copy_stop(wl_evaluation_control_t *control, int phase,
     seed_append_cancelled++;
     wl_evaluation_control_request_cancel(control);
 }
+static void wl_observer_append(char *buffer, size_t capacity, size_t *offset,
+    const char *format, ...)
+{
+    CHECK(*offset < capacity);
+    size_t remaining = capacity - *offset;
+    va_list args;
+    va_start(args, format);
+    int written = vsnprintf(buffer + *offset, remaining, format, args);
+    va_end(args);
+    CHECK(written >= 0 && (size_t)written < remaining);
+    *offset += (size_t)written;
+}
+
 static void original_seed_gather(void)
 {
     for (unsigned scenario = 0; scenario < 9; scenario++) {
@@ -2907,23 +2921,23 @@ static void original_seed_gather(void)
             scenario == 8) ? 300 : scenario == 4 ? 0 : 1;
         uint32_t count = scenario == 4 ? 2 : 1;
         char text[32768]; size_t at = 0;
-        at += (size_t)snprintf(text + at, sizeof(text) - at, ".decl A(");
+        wl_observer_append(text, sizeof(text), &at, ".decl A(");
         for (uint32_t c = 0; c < width; c++)
-            at += (size_t)snprintf(text + at, sizeof(text) - at, "%sc%u:int64",
-                    c ? "," : "", c);
-        at += (size_t)snprintf(text + at, sizeof(text) - at, ")\n.decl H(");
+            wl_observer_append(text, sizeof(text), &at, "%sc%u:int64",
+                c ? "," : "", c);
+        wl_observer_append(text, sizeof(text), &at, ")\n.decl H(");
         for (uint32_t c = 0; c < width; c++)
-            at += (size_t)snprintf(text + at, sizeof(text) - at, "%sc%u:int64",
-                    c ? "," : "", c);
-        at += (size_t)snprintf(text + at, sizeof(text) - at, ")\nH(");
+            wl_observer_append(text, sizeof(text), &at, "%sc%u:int64",
+                c ? "," : "", c);
+        wl_observer_append(text, sizeof(text), &at, ")\nH(");
         for (uint32_t c = 0; c < width; c++)
-            at += (size_t)snprintf(text + at, sizeof(text) - at, "%sx%u",
-                    c ? "," : "", c);
-        at += (size_t)snprintf(text + at, sizeof(text) - at, "):-A(");
+            wl_observer_append(text, sizeof(text), &at, "%sx%u",
+                c ? "," : "", c);
+        wl_observer_append(text, sizeof(text), &at, "):-A(");
         for (uint32_t c = 0; c < width; c++)
-            at += (size_t)snprintf(text + at, sizeof(text) - at, "%sx%u",
-                    c ? "," : "", c);
-        at += (size_t)snprintf(text + at, sizeof(text) - at, ").\n");
+            wl_observer_append(text, sizeof(text), &at, "%sx%u",
+                c ? "," : "", c);
+        wl_observer_append(text, sizeof(text), &at, ").\n");
         CHECK(at < sizeof(text));
         wirelog_error_t error;
         wirelog_program_t *program = wirelog_parse_string(text, &error);

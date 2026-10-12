@@ -20722,13 +20722,13 @@ test_serial_batched_generated(void)
             if (controlled_retry || raw_retry || capture.count != twin.count
                 || capture.digest != twin.digest || session->cleanup_pending
                 || session->serial_completion.frame) fprintf(stderr,
-                    "held batch rebuild=%u snapshot=%u controlled=%d raw=%d rows=%llu/%llu digest=%llu/%llu pending=%u frame=%p\n",
+                    "held batch rebuild=%u snapshot=%u controlled=%d raw=%d rows=%llu/%llu digest=%llu/%llu pending=%p frame=%p\n",
                     rebuild, snapshot, controlled_retry, raw_retry,
                     (unsigned long long)capture.count,
                     (unsigned long long)twin.count,
                     (unsigned long long)capture.digest,
                     (unsigned long long)twin.digest,
-                    session->cleanup_pending,
+                    (void *)session->cleanup_pending,
                     (void *)session->serial_completion.frame);
             CHECK(!controlled_retry && !raw_retry && capture.count == twin.count
                 && capture.digest == twin.digest && !session->cleanup_pending
