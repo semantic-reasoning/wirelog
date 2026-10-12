@@ -18,7 +18,7 @@
  * Each case evaluates a program over its old rows with a snapshot, adds the
  * new rows the incremental way, and requires every relation of the next two
  * snapshots to equal a fresh evaluation over old and new rows together, in
- * sessions created with one worker and with four.  Issue #2119: the first of
+ * sessions created with one, four and eight workers.  Issue #2119: the first of
  * those snapshots must take the insert route and the second must not; a
  * staged removal must keep the snapshot off it, and the injected failures
  * must be injected into a route that ran.
@@ -514,7 +514,7 @@ done:
 int
 main(void)
 {
-    static const uint32_t workers[] = { 1, 4 };
+    static const uint32_t workers[] = { 1, 4, 8 };
 
     printf("test_incremental_snapshot_recursive (Issue #2114)\n");
     if (setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1", 1) != 0) {

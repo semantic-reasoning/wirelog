@@ -510,6 +510,23 @@ wirelog_extension_snapshot_find(const wirelog_extension_snapshot_t *snapshot,
     return NULL;
 }
 
+/* Issue #2122: does every extension in @snapshot declare a thread-safe
+ * callback?  True for a NULL or empty snapshot.  A snapshot's entries do
+ * not change after it is acquired, so this takes no lock. */
+bool
+wl_extension_snapshot_all_thread_safe(
+    const wirelog_extension_snapshot_t *snapshot)
+{
+    if (!snapshot)
+        return true;
+    for (size_t i = 0; i < snapshot->count; i++) {
+        if (!(snapshot->entries[i]->descriptor.callback_policy
+            & WIRELOG_EXTENSION_CALLBACK_THREAD_SAFE))
+            return false;
+    }
+    return true;
+}
+
 /* A callback lease keeps the entry alive independently of its snapshot.  A
  * callback may release its last snapshot reference or unregister itself, so
  * the evaluator cannot rely on the snapshot remaining alive until invoke()

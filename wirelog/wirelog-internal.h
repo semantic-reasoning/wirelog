@@ -56,6 +56,12 @@ wl_extension_callback_lease_acquire(
 void
 wl_extension_callback_lease_release(void *lease);
 
+/* Issue #2122: true when every extension in @snapshot declares a
+ * thread-safe callback, and for a NULL or empty snapshot. */
+bool
+wl_extension_snapshot_all_thread_safe(
+    const wirelog_extension_snapshot_t *snapshot);
+
 /* ======================================================================== */
 /* String Utilities (Pure C11)                                             */
 /* ======================================================================== */
