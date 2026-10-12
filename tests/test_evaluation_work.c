@@ -127,7 +127,7 @@ payload_equal(col_rel_t *dst, col_rel_t *src, uint32_t base)
 static void
 test_exact_and_denied(uint32_t width, uint32_t rows, bool timestamps)
 {
-    uint64_t cost = width + (uint64_t)width * rows
+    uint64_t cost = 2 + width + (uint64_t)width * rows
         + (timestamps ? (uint64_t)rows * 5 : 0);
     col_rel_t *src = relation(width, rows, rows, timestamps, NULL);
     col_rel_t *dst = relation(width, rows + 1, 1, timestamps, NULL);
@@ -169,10 +169,10 @@ test_cancel_and_retained(void)
             memory_order_relaxed);
     uint64_t generation = dst->view_generation;
     wl_evaluation_control_t *c = control(0);
-    cancel_at = 258; /* Metadata 2 + first real copy chunk 256. */
+    cancel_at = 260; /* Gates 2 + metadata 2 + first copy chunk 256. */
     CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c)
         == WL_EVALUATION_CONTROL_CANCELLED);
-    CHECK(finish(c, WL_EVALUATION_CONTROL_CANCELLED) == 258);
+    CHECK(finish(c, WL_EVALUATION_CONTROL_CANCELLED) == 260);
     CHECK(max_chunk == 256 && dst->nrows == 1);
     CHECK(dst->view_generation == generation);
     CHECK(dst->columns[0][0] == 0 && dst->columns[1][0] == 10000);
@@ -185,7 +185,7 @@ test_cancel_and_retained(void)
     released(src); released(dst);
     retry(c, 0);
     /* Last timestamp chunk also has a tail poll before publication. */
-    cancel_at = 2 + 600 + 1500;
+    cancel_at = 2 + 2 + 600 + 1500;
     CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c)
         == WL_EVALUATION_CONTROL_CANCELLED);
     CHECK(finish(c, WL_EVALUATION_CONTROL_CANCELLED) == cancel_at);
@@ -197,7 +197,7 @@ test_cancel_and_retained(void)
         && dst->timestamps[0].multiplicity == 0);
     retry(c, 0);
     CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c) == 0);
-    CHECK(finish(c, 0) == 2102);
+    CHECK(finish(c, 0) == 2104);
     payload_equal(dst, src, 1);
     CHECK(atomic_load_explicit(&governor->reserved_bytes,
         memory_order_relaxed) == retained);
@@ -211,9 +211,9 @@ static void
 test_same_owner_and_null(void)
 {
     col_rel_t *r = relation(1, 8, 3, true, NULL);
-    wl_evaluation_control_t *c = control(19);
+    wl_evaluation_control_t *c = control(20);
     CHECK(wl_columnar_relation_append_all_controlled(r, r, NULL, c) == 0);
-    CHECK(finish(c, 0) == 19 && r->nrows == 6);
+    CHECK(finish(c, 0) == 20 && r->nrows == 6);
     for (uint32_t row = 0; row < 3; row++) {
         CHECK(r->columns[0][row] == row);
         CHECK(r->columns[0][row + 3] == r->columns[0][row]);
@@ -242,9 +242,9 @@ test_types(void)
     src->nrows = 2; dst->nrows = 1;
     src->columns[0][0] = INT64_MIN; /* binary64 negative zero */
     src->columns[0][1] = wl_columnar_float_to_bits(2.5);
-    wl_evaluation_control_t *c = control(7); /* type+validation+copy+normalize */
+    wl_evaluation_control_t *c = control(9); /* gates+type+validation+copy+normalize */
     CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c) == 0);
-    CHECK(finish(c, 0) == 7);
+    CHECK(finish(c, 0) == 9);
     CHECK(dst->columns[0][1] == 0 && dst->columns[0][2] == src->columns[0][1]);
     dst->nrows = 1;
     uint64_t generation = dst->view_generation;
@@ -254,7 +254,7 @@ test_types(void)
         retry(c, 0);
         CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
             c) == EINVAL);
-        CHECK(finish(c, EINVAL) == 2);
+        CHECK(finish(c, EINVAL) == 4);
         CHECK(dst->nrows == 1 && dst->view_generation == generation);
         released(src); released(dst);
     }
@@ -266,7 +266,7 @@ test_types(void)
     retry(c, 0);
     CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
         c) == EINVAL);
-    CHECK(finish(c, EINVAL) == 1);
+    CHECK(finish(c, EINVAL) == 3);
     CHECK(dst->nrows == 1 && dst->view_generation == generation);
     release(c); destroy(dst); destroy(src);
 }
@@ -280,15 +280,15 @@ test_integer_family_and_empty(void)
     dst->nrows = 0;
     CHECK(col_rel_set_column_types(dst, &integer, 1) == 0);
     dst->nrows = 1;
-    wl_evaluation_control_t *c = control(2);
+    wl_evaluation_control_t *c = control(4);
     CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c) == 0);
-    CHECK(finish(c, 0) == 2);
+    CHECK(finish(c, 0) == 4);
     payload_equal(dst, src, 1);
     src->nrows = 0;
     uint64_t generation = dst->view_generation;
-    retry(c, 1);
+    retry(c, 3);
     CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c) == 0);
-    CHECK(finish(c, 0) == 1 && dst->view_generation == generation);
+    CHECK(finish(c, 0) == 3 && dst->view_generation == generation);
     retry(c, 0);
     wl_evaluation_control_request_cancel(c);
     CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c)
@@ -297,9 +297,9 @@ test_integer_family_and_empty(void)
     release(c); destroy(dst); destroy(src);
     src = relation(0, 3, 2, false, NULL);
     dst = relation(0, 3, 1, false, NULL);
-    c = control(1);
+    c = control(2);
     CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c) == 0);
-    CHECK(finish(c, 0) == 0 && dst->nrows == 3);
+    CHECK(finish(c, 0) == 2 && dst->nrows == 3);
     release(c); destroy(dst); destroy(src);
 }
 
@@ -313,7 +313,7 @@ test_real_alias_and_gate(void)
     wl_evaluation_control_t *c = control(0);
     CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
         c) == ENOTSUP);
-    CHECK(finish(c, ENOTSUP) == 0 && dst->nrows == 1);
+    CHECK(finish(c, ENOTSUP) == 2 && dst->nrows == 1);
     retry(c, 0);
     CHECK(wl_columnar_relation_append_all_controlled(alias, src, NULL,
         c) == ENOTSUP);
@@ -325,7 +325,7 @@ test_real_alias_and_gate(void)
     retry(c, 0);
     CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
         c) == EBUSY);
-    CHECK(finish(c, EBUSY) == 0);
+    CHECK(finish(c, EBUSY) == 2);
     /* Failed destination admission must retire the already acquired source. */
     released(src);
     CHECK(wl_columnar_source_access_reader_release(&token) == 0);
@@ -334,7 +334,7 @@ test_real_alias_and_gate(void)
     retry(c, 0);
     CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
         c) == EINVAL);
-    CHECK(finish(c, EINVAL) == 0);
+    CHECK(finish(c, EINVAL) == 2);
     src->nrows = 2;
     release(c); destroy(dst); destroy(src);
 }
@@ -373,7 +373,7 @@ test_rejected_shapes(void)
     wl_evaluation_control_t *c = control(0);
     CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
         c) == ENOTSUP);
-    CHECK(finish(c, ENOTSUP) == 0 && dst->nrows == 1);
+    CHECK(finish(c, ENOTSUP) == 2 && dst->nrows == 1);
     src->nrows = 1;
     dst->compound_arity_len = UINT32_MAX;
     retry(c, 0);
@@ -392,7 +392,7 @@ test_rejected_shapes(void)
     retry(c, 0);
     CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
         c) == EOVERFLOW);
-    CHECK(finish(c, EOVERFLOW) == 0);
+    CHECK(finish(c, EOVERFLOW) == 2);
     dst->nrows = 1;
     wirelog_column_type_t type = WIRELOG_TYPE_INT64;
     src->nrows = 0;
@@ -401,7 +401,7 @@ test_rejected_shapes(void)
     retry(c, 0);
     CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
         c) == ENOTSUP);
-    CHECK(finish(c, ENOTSUP) == 0);
+    CHECK(finish(c, ENOTSUP) == 2);
     released(src); released(dst);
     release(c); destroy(dst); destroy(src);
 }
@@ -443,7 +443,7 @@ test_raw_parity(bool typed, bool source_ts, bool destination_ts)
         wl_columnar_memory_governor_ref_get(dst->memory_governor);
     uint64_t reserved = atomic_load_explicit(&governor->reserved_bytes,
             memory_order_relaxed);
-    uint64_t cost = 1 + 3 + (typed ? 6 : 0)
+    uint64_t cost = 2 + 1 + 3 + (typed ? 6 : 0)
         + (source_ts && destination_ts ? 15 : 0);
     wl_evaluation_control_t *c = control(cost);
     CHECK(col_rel_append_all(raw, src, NULL) == 0);
@@ -471,10 +471,235 @@ test_raw_parity(bool typed, bool source_ts, bool destination_ts)
     release(c); destroy(raw); destroy(dst); destroy(src);
 }
 
+static wl_columnar_source_access_reader_t peer;
+static wl_columnar_source_access_reader_t *active_reader;
+static unsigned cas_calls, cas_failed, cas_succeeded;
+
+static uint64_t
+gate_state(wl_columnar_source_access_gate_t *gate)
+{
+    return atomic_load_explicit(&gate->state, memory_order_acquire);
+}
+
+static void
+before_reader(wl_evaluation_control_t *c,
+    wl_columnar_source_access_gate_t *gate, uint64_t observed)
+{
+    (void)c;
+    if (cas_calls++ == 0) {
+        CHECK(observed == 0);
+        CHECK(wl_columnar_source_access_reader_acquire(gate, &peer) == 0);
+    }
+}
+
+static void
+after_reader(wl_evaluation_control_t *c,
+    wl_columnar_source_access_gate_t *gate, bool acquired)
+{
+    (void)c;
+    if (acquired) {
+        cas_succeeded++;
+        CHECK(active_reader->owner == gate);
+        CHECK(active_reader->identity == (uintptr_t)active_reader);
+        CHECK(active_reader->thread_valid && !active_reader->transferable);
+        CHECK(gate_state(gate) == 2);
+    } else {
+        cas_failed++;
+        CHECK(!active_reader->owner && !active_reader->identity);
+    }
+}
+
+static void
+test_gate_retry(unsigned mode)
+{
+    wl_columnar_source_access_gate_t gate;
+    wl_columnar_source_access_reader_t token = { 0 };
+    wl_columnar_source_access_gate_init(&gate);
+    wl_evaluation_control_t *c = control(mode == 1 ? 1 : 2);
+    active_reader = &token;
+    cas_calls = cas_failed = cas_succeeded = 0;
+    wl_columnar_relation_test_before_reader_cas = before_reader;
+    wl_columnar_relation_test_after_reader_cas = after_reader;
+    if (mode >= 2)
+        cancel_at = mode == 2 ? 1 : 2;
+    int expected = mode == 0 ? 0 : mode == 1
+        ? WL_EVALUATION_CONTROL_WORK_LIMIT : WL_EVALUATION_CONTROL_CANCELLED;
+    CHECK(wl_columnar_relation_reader_acquire_controlled(&gate, &token, c)
+        == expected);
+    wl_columnar_relation_test_before_reader_cas = NULL;
+    wl_columnar_relation_test_after_reader_cas = NULL;
+    bool second_round = mode == 0 || mode == 3;
+    CHECK(finish(c, expected) == (second_round ? 2 : 1));
+    CHECK(seen == (second_round ? 2 : 1) && max_chunk == 1);
+    CHECK(cas_failed == 1 && cas_succeeded == (second_round ? 1 : 0));
+    CHECK(cas_calls == (second_round ? 2 : 1));
+    if (mode == 0)
+        CHECK(wl_columnar_source_access_reader_release(&token) == 0);
+    CHECK(!token.owner && !token.secondary_owner && !token.identity
+        && !token.thread_valid && !token.transferable);
+    CHECK(peer.owner == &gate && gate_state(&gate) == 1);
+    CHECK(wl_columnar_source_access_reader_release(&peer) == 0);
+    CHECK(gate_state(&gate) == 0);
+    retry(c, 1);
+    CHECK(wl_columnar_relation_reader_acquire_controlled(&gate, &token, c)
+        == 0);
+    CHECK(finish(c, 0) == 1 && gate_state(&gate) == 1);
+    CHECK(wl_columnar_source_access_reader_release(&token) == 0);
+    active_reader = NULL;
+    release(c);
+}
+
+static void
+test_gate_stops_and_raw(void)
+{
+    wl_columnar_source_access_gate_t gate;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    wl_columnar_source_access_writer_t writer = { 0 };
+    wl_columnar_source_access_gate_init(&gate);
+    wl_evaluation_control_t *c = control(1);
+    for (unsigned kind = 0; kind < 2; kind++) {
+        if (kind)
+            retry(c, 1);
+        cancel_at = 1;
+        int rc = kind
+            ? wl_columnar_relation_writer_acquire_controlled(&gate, &writer, c)
+            : wl_columnar_relation_reader_acquire_controlled(&gate, &reader, c);
+        CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(finish(c, rc) == 1 && seen == 1 && gate_state(&gate) == 0);
+        CHECK(!reader.owner && !reader.identity && !reader.secondary_owner
+            && !reader.thread_valid && !reader.transferable);
+        CHECK(!writer.owner && !writer.identity && !writer.secondary_owner
+            && !writer.thread_valid);
+    }
+    retry(c, 1);
+    CHECK(wl_evaluation_control_charge(c, 1) == 0);
+    CHECK(wl_columnar_relation_reader_acquire_controlled(&gate, &reader, c)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT) == 1);
+    CHECK(seen == 0 && gate_state(&gate) == 0 && !reader.owner);
+    retry(c, 0);
+    wl_evaluation_control_request_cancel(c);
+    CHECK(wl_columnar_relation_writer_acquire_controlled(&gate, &writer, c)
+        == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(finish(c, WL_EVALUATION_CONTROL_CANCELLED) == 0);
+    CHECK(gate_state(&gate) == 0 && !writer.owner);
+    retry(c, 0);
+    CHECK(wl_columnar_relation_reader_acquire_controlled(NULL, &reader, c)
+        == EINVAL);
+    CHECK(wl_columnar_relation_writer_acquire_controlled(&gate, NULL, c)
+        == EINVAL);
+    CHECK(wl_columnar_relation_reader_acquire_controlled(&gate, &reader, NULL)
+        == 0);
+    wl_columnar_source_access_reader_t copied_reader = reader;
+    CHECK(wl_columnar_source_access_reader_release(&copied_reader) == EINVAL);
+    CHECK(wl_columnar_relation_reader_acquire_controlled(&gate, &copied_reader,
+        c) == EINVAL);
+    CHECK(gate_state(&gate) == 1 && reader.thread_valid &&
+        !reader.transferable);
+    CHECK(wl_columnar_source_access_reader_release(&reader) == 0);
+    CHECK(wl_columnar_source_access_reader_acquire_transferable(&gate, &reader)
+        == 0);
+    CHECK(reader.transferable && !reader.thread_valid
+        && reader.identity == (uintptr_t)&reader && !reader.secondary_owner);
+    CHECK(wl_columnar_source_access_reader_release(&reader) == 0);
+    CHECK(wl_columnar_relation_writer_acquire_controlled(&gate, &writer, NULL)
+        == 0);
+    wl_columnar_source_access_writer_t copied_writer = writer;
+    CHECK(wl_columnar_source_access_writer_release(&copied_writer) == EINVAL);
+    CHECK(wl_columnar_relation_writer_acquire_controlled(&gate, &copied_writer,
+        c) == EINVAL);
+    CHECK(writer.thread_valid && writer.identity == (uintptr_t)&writer);
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0);
+    CHECK(finish(c, EINVAL) == 0 && seen == 0 && gate_state(&gate) == 0);
+    release(c);
+}
+
+static void
+before_writer(wl_evaluation_control_t *c,
+    wl_columnar_source_access_gate_t *gate)
+{
+    (void)c;
+    CHECK(wl_columnar_source_access_reader_acquire(gate, &peer) == 0);
+}
+
+static void
+test_gate_busy_and_overflow(void)
+{
+    wl_columnar_source_access_gate_t gate;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    wl_columnar_source_access_writer_t writer = { 0 }, held = { 0 };
+    wl_columnar_source_access_gate_init(&gate);
+    wl_evaluation_control_t *c = control(1);
+    wl_columnar_relation_test_before_writer_cas = before_writer;
+    cancel_at = 1; /* The established busy verdict precedes this tail stop. */
+    CHECK(wl_columnar_relation_writer_acquire_controlled(&gate, &writer, c)
+        == EBUSY);
+    wl_columnar_relation_test_before_writer_cas = NULL;
+    CHECK(finish(c, EBUSY) == 1 && gate_state(&gate) == 1 && !writer.owner);
+    CHECK(wl_columnar_source_access_reader_release(&peer) == 0);
+    CHECK(wl_columnar_source_access_writer_acquire(&gate, &held) == 0);
+    retry(c, 1);
+    cancel_at = 1;
+    CHECK(wl_columnar_relation_reader_acquire_controlled(&gate, &reader, c)
+        == EBUSY);
+    CHECK(finish(c, EBUSY) == 1 && !reader.owner);
+    CHECK(gate_state(&gate) == WL_COLUMNAR_SOURCE_ACCESS_WRITER);
+    CHECK(wl_columnar_source_access_writer_release(&held) == 0);
+    /* Synthetic numeric boundary, not a claim to create this many readers. */
+    atomic_store_explicit(&gate.state, WL_COLUMNAR_SOURCE_ACCESS_WRITER - 1u,
+        memory_order_relaxed);
+    retry(c, 1);
+    cancel_at = 1;
+    CHECK(wl_columnar_relation_reader_acquire_controlled(&gate, &reader, c)
+        == EOVERFLOW);
+    CHECK(finish(c, EOVERFLOW) == 1 && !reader.owner);
+    CHECK(gate_state(&gate) == WL_COLUMNAR_SOURCE_ACCESS_WRITER - 1u);
+    wl_columnar_source_access_gate_init(&gate);
+    release(c);
+}
+
+static void
+test_append_gate_stops(void)
+{
+    col_rel_t *src = relation(1, 3, 2, false, NULL);
+    col_rel_t *dst = relation(1, 3, 1, false, NULL);
+    uint64_t view = dst->view_generation;
+    uint64_t retained = dst->retained_reservation.bytes;
+    wl_evaluation_control_t *c = control(0);
+    for (unsigned stop = 1; stop <= 2; stop++) {
+        if (stop > 1)
+            retry(c, 0);
+        cancel_at = stop;
+        CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c)
+            == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(finish(c, WL_EVALUATION_CONTROL_CANCELLED) == stop);
+        CHECK(dst->nrows == 1 && dst->view_generation == view);
+        CHECK(dst->columns[0][0] == 0 && src->nrows == 2);
+        CHECK(dst->retained_reservation.bytes == retained);
+        released(src); released(dst);
+    }
+    retry(c, 1); /* Source reader held, destination writer charge refused. */
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT) == 1);
+    CHECK(dst->nrows == 1 && dst->view_generation == view);
+    CHECK(dst->retained_reservation.bytes == retained);
+    released(src); released(dst);
+    retry(c, 5); /* Two gates, one metadata lane, two copied cells. */
+    CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c) == 0);
+    CHECK(finish(c, 0) == 5 && dst->nrows == 3);
+    release(c); destroy(dst); destroy(src);
+}
+
 int
 main(void)
 {
     wl_columnar_relation_test_work_checkpoint = checkpoint;
+    for (unsigned mode = 0; mode < 4; mode++)
+        test_gate_retry(mode);
+    test_gate_stops_and_raw();
+    test_gate_busy_and_overflow();
+    test_append_gate_stops();
     test_exact_and_denied(2, 300, false);
     test_exact_and_denied(300, 2, false);
     test_exact_and_denied(1, 103, true);

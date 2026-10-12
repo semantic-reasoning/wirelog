@@ -531,6 +531,11 @@ concurrent alias removals cannot underflow the count.
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
+| `relation.c:wl_columnar_relation_reader_acquire_controlled#3` | `gate->state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | One strong gate attempt per admitted round; the MSVC weak-named shim is strong. Successful authority is initialized before the cancellation tail; reader failures require a new charged round |
+| `relation.c:wl_columnar_relation_reader_acquire_controlled#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | One strong gate attempt per admitted round; the MSVC weak-named shim is strong. Successful authority is initialized before the cancellation tail; reader failures require a new charged round |
+| `relation.c:wl_columnar_relation_reader_acquire_controlled` | `gate->state` | `atomic_load_explicit` | acquire | Snapshot reader state only after admitting the first gate round; pairs with prior owner release |
+| `relation.c:wl_columnar_relation_writer_acquire_controlled#2` | `gate->state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | One strong gate attempt per admitted round; the MSVC weak-named shim is strong. Successful authority is initialized before the cancellation tail; reader failures require a new charged round |
+| `relation.c:wl_columnar_relation_writer_acquire_controlled` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | One strong gate attempt per admitted round; the MSVC weak-named shim is strong. Successful authority is initialized before the cancellation tail; reader failures require a new charged round |
 | `relation.c:col_rel_storage_owner_init` | `storage_alias_borrows` | `atomic_store_explicit` | relaxed | Initialize the empty count before the relation is published |
 | `relation.c:col_rel_storage_alias_borrow_count` | `storage_alias_borrows` | `atomic_load_explicit` | acquire | Read policy/accounting state after owner-gate admission or at a stable test boundary |
 | `relation.c:col_rel_storage_alias_borrow_acquire` | `storage_alias_borrows` | `atomic_load_explicit` | relaxed | Read the candidate count before the checked increment CAS loop |

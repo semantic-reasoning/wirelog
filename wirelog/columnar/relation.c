@@ -6123,6 +6123,12 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
 }
 
 #ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_relation_test_before_reader_cas)(
+    wl_evaluation_control_t *, wl_columnar_source_access_gate_t *, uint64_t);
+void (*wl_columnar_relation_test_after_reader_cas)(
+    wl_evaluation_control_t *, wl_columnar_source_access_gate_t *, bool);
+void (*wl_columnar_relation_test_before_writer_cas)(
+    wl_evaluation_control_t *, wl_columnar_source_access_gate_t *);
 void (*wl_columnar_relation_test_work_checkpoint)(
     wl_evaluation_control_t *control, uint64_t work);
 #endif
@@ -6138,6 +6144,106 @@ wl_columnar_relation_work_tail(wl_evaluation_control_t *control, uint64_t work)
     (void)work;
 #endif
     return wl_evaluation_control_charge(control, 0);
+}
+
+/* Each admitted forward gate round has at most one strong CAS.
+ * Mandatory token release remains outside the forward work metric. */
+int
+wl_columnar_relation_reader_acquire_controlled(
+    wl_columnar_source_access_gate_t *gate,
+    wl_columnar_source_access_reader_t *token, wl_evaluation_control_t *control)
+{
+    if (!control)
+        return wl_columnar_source_access_reader_acquire(gate, token);
+    if (!gate || !token || token->owner || token->secondary_owner
+        || token->identity || token->thread_valid || token->transferable)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 1);
+    if (rc)
+        return rc;
+    uint64_t observed = atomic_load_explicit(&gate->state,
+            memory_order_acquire);
+    for (;;) {
+        if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER) {
+            rc = wl_columnar_relation_work_tail(control, 1);
+            return rc > 0 ? rc : EBUSY;
+        }
+        if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER - 1u) {
+            rc = wl_columnar_relation_work_tail(control, 1);
+            return rc > 0 ? rc : EOVERFLOW;
+        }
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_relation_test_before_reader_cas)
+            wl_columnar_relation_test_before_reader_cas(control, gate,
+                observed);
+#endif
+#ifdef _MSC_VER
+        bool acquired = atomic_compare_exchange_weak_explicit(&gate->state,
+                &observed, observed + 1u, memory_order_acquire,
+                memory_order_relaxed);
+#else
+        bool acquired = atomic_compare_exchange_strong_explicit(&gate->state,
+                &observed, observed + 1u, memory_order_acquire,
+                memory_order_relaxed);
+#endif
+        if (acquired)
+            wl_columnar_source_access_reader_initialize(gate, token, false);
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_relation_test_after_reader_cas)
+            wl_columnar_relation_test_after_reader_cas(control, gate, acquired);
+#endif
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc && acquired) {
+            int cleanup = wl_columnar_source_access_reader_release(token);
+            return cleanup ? cleanup : rc;
+        }
+        if (rc || acquired)
+            return rc;
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc)
+            return rc;
+    }
+}
+
+int
+wl_columnar_relation_writer_acquire_controlled(
+    wl_columnar_source_access_gate_t *gate,
+    wl_columnar_source_access_writer_t *token, wl_evaluation_control_t *control)
+{
+    if (!control)
+        return wl_columnar_source_access_writer_acquire(gate, token);
+    if (!gate || !token || token->owner || token->secondary_owner
+        || token->identity || token->thread_valid)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 1);
+    if (rc)
+        return rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_before_writer_cas)
+        wl_columnar_relation_test_before_writer_cas(control, gate);
+#endif
+    uint64_t expected = 0;
+#ifdef _MSC_VER
+    bool acquired = atomic_compare_exchange_weak_explicit(&gate->state,
+            &expected, WL_COLUMNAR_SOURCE_ACCESS_WRITER, memory_order_acquire,
+            memory_order_relaxed);
+#else
+    bool acquired = atomic_compare_exchange_strong_explicit(&gate->state,
+            &expected, WL_COLUMNAR_SOURCE_ACCESS_WRITER, memory_order_acquire,
+            memory_order_relaxed);
+#endif
+    if (!acquired) {
+        rc = wl_columnar_relation_work_tail(control, 1);
+        return rc > 0 ? rc : EBUSY;
+    }
+    wl_columnar_source_access_writer_initialize(gate, token);
+    rc = wl_columnar_relation_work_tail(control, 1);
+    if (rc) {
+        int cleanup = wl_columnar_source_access_writer_release(token);
+        if (cleanup)
+            rc = cleanup;
+    }
+    return rc;
 }
 
 int
@@ -6180,14 +6286,14 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
     if (src_owner != src || dst_owner != dst)
         return ENOTSUP;
     if (src_owner != dst_owner) {
-        rc = wl_columnar_source_access_reader_acquire(
-            &src_owner->source_access, &reader);
+        rc = wl_columnar_relation_reader_acquire_controlled(
+            &src_owner->source_access, &reader, control);
         if (rc != 0)
             return rc;
         read_held = true;
     }
-    rc = wl_columnar_source_access_writer_acquire(
-        &dst_owner->source_access, &writer);
+    rc = wl_columnar_relation_writer_acquire_controlled(
+        &dst_owner->source_access, &writer, control);
     if (rc != 0)
         goto done;
     write_held = true;
